@@ -1,0 +1,384 @@
+# Sapphire tooling
+
+## CLI commands
+
+- **`sapphire init`** — Create `pblang.toml` in the current directory (package name `my-app`, version `0.1.0`, empty dependencies). Fails if the file already exists.
+- **`sapphire run [file.sapp|dir] [-- arg1 arg2 ...]`** — Execute a script and exit. Arguments after `--` are passed to the script and available via `os.args()` (from `stdlib:os.sapp`). If you pass a directory (or run `sapphire run` from inside a manifest dir), Sapphire resolves the package entry from `pblang.toml`: first `[package].entry`, otherwise `main.sap`, `main.sapp`, `src/main.sap`, `src/main.sapp`.
+- **`sapphire --check <file>`** — Parse and typecheck; print diagnostics.
+- **`sapphire --doc <file> [--html] [out_dir]`** — Print module docs (exports, top-level functions, polyglot blocks). Polyglot blocks now include parsed attrs and code-line counts in both text and HTML output, so the current block contract is more inspectable from tooling. With `--html`, write `out_dir/index.html` (default `docs/`).
+- **`sapphire --lock [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from `pblang.toml`. With **`--registry-index \<url\>`**, registry dependencies are resolved from that index for this invocation instead of relying on the environment. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command even if the env var is unset. See [Lockfile_contract.md](Lockfile_contract.md).
+- **`sapphire test [dir]`** — Run all `.sap`/`.sapp` files in `dir` (default: `tests/`); prints "N passed, M failed", exit 1 if any fail.
+- **`sapphire fmt [--max-line-length=N] [file.sap …]`** — Format one or more `.sap`/`.sapp` files: trim lines, **spacing around binary operators** (`+` `-` `*` `/` `==` `!=` `<` `>` `<=` `>=`), **comma spacing** (space after comma; unchanged inside string literals), indent by brace depth (4 spaces per level), optional **line wrap** when `--max-line-length=N` is set (wraps at last space before N), ensure final newline, and insert a single blank line between top-level `fn` declarations. Does not change content inside string literals. Only overwrites if content changed.
+- **`sapphire lint [file.sap …]`** — Parse and typecheck each file; print diagnostics (errors and warnings). Reports **unused variable**, **unused import** (bindings never read), and **variable shadows outer binding** (L2-beta) warnings. Exit 1 only on parse or typecheck errors; warnings do not change exit code.
+
+## Error UX (L2-gamma)
+
+- Parse and runtime errors print **`error[<file>:<line>:<col>]: <message>`** when location is available.
+- If location is unavailable (e.g. REPL), falls back to **`error[<line>:<col>]: <message>`** or **`error: <message>`**.
+- Example: **`error[src/main.sapp:3:5]: unexpected token ';'`**
+- **`sapphire build [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from manifest dir, then typecheck the resolved package entry. With **`--registry-index \<url\>`**, registry dependencies are resolved explicitly for this build. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command. Exit 1 on lock or typecheck failure.
+- **`sapphire install [--registry-index \<url\>] [--require-registry-sha256] [path | <name>@<version>]`** — Resolve dependencies and generate `pblang.lock` when given a manifest **`path`** (existing behavior), or **fetch a single registry package** when invoked as `sapphire install <name>@<version>`. With **`--registry-index \<url\>`**, registry dependencies (names starting with `@`) are resolved from that index (file:// or http(s)://). Static registry indexes may point to tarballs with either absolute URLs or paths relative to `index.json`. Git dependencies can use `{ git = \"...\", rev = \"...\" }` and are installed as pinned cached checkouts. Registry tarballs are unpacked with a safe-entry policy: paths must stay relative inside the cache destination, and link entries are rejected. **Verify on install (E4-beta):** when **`PBLANG_SIGNING_KEY`** is set and a `.sha256` sidecar exists at the tarball URL (same URL + `.sha256`), install verifies HMAC-SHA256 of the tarball before unpacking and rejects with an error on mismatch; if the key is set but no sidecar is found, a warning is printed and install continues. Third-party registry/git packages are validated during install: a declared `[package].entry` must resolve to an in-package file, otherwise the package must still contain at least one `.sap`/`.sapp` module. Otherwise uses **`PBLANG_REGISTRY_INDEX`** env var if set for registry deps. **`REQUIRE_REGISTRY_SHA256=1`** (or `true`) or **`--require-registry-sha256`** forces index entries to include sha256. **M4-alpha:** in `<name>@<version>` mode, `sapphire install` resolves the highest semver version satisfying `<version>` from the hosted index, downloads and unpacks it into the Sapphire cache, and prints `Installed <name>@<resolved_version>`.
+- **`sapphire publish --registry-dir \<dir\> [path]`** — Pack current package (from `pblang.toml` [package] name/version) into \<name\>-\<ver\>.tar.gz, write to \<dir\>, and update \<dir\>/index.json. If `[package].entry` is declared, `publish` validates that it is a relative in-package path and that the target is an existing file before writing any registry artifact. In the current local-registry MVP, published packages must also be **self-contained**: if `[dependencies]` is non-empty, `publish` fails instead of producing a non-portable registry artifact. Packages without explicit `[package].entry` are still allowed, but they must expose at least one Sapphire module file: either a default bare-import entry (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`) or another `.sap`/`.sapp` module for package subpath imports. Other projects can then run `sapphire install --registry-index file:///path/to/dir/index.json`.
+- **`sapphire publish`** — Hosted-style publish flow built on the same packaging and validation rules:
+  - Reads **`PBLANG_REGISTRY_INDEX`** as registry base URL. For `file://` URLs pointing at a registry directory, `sapphire publish` behaves as a thin wrapper around `sapphire publish --registry-dir <dir>` (local file-based registry) so that tests and local workflows can use the same command.
+  - For http(s) registries, `sapphire publish` builds a tarball of the current package root, computes its sha256, and POSTs a multipart/form-data body to `<registry>/publish` with fields `tarball` (bytes), `sha256` (hex), and `metadata` JSON (`{name, version, description}`).
+  - Auth: Bearer token from **`PBLANG_REGISTRY_TOKEN`** or optional CLI flag `--registry-token=<token>`.
+- **`sapphire search <query>`** — Search a hosted or file-based registry for packages:
+  - Reads **`PBLANG_REGISTRY_INDEX`** as registry base URL.
+  - For `file://` URLs, reads `<dir>/index.json` directly and returns packages whose names or versions contain `<query>`. Output lines are `name @ version` (description is not stored in the local index).
+  - For http(s) URLs, calls `<registry>/search?q=<query>` and expects a JSON array of `{name, version, description}`; prints one line per result as `name @ version — description`, or `No results for '<query>'` when there are no matches.
+- Local registry publish is **immutable per package name + version**: republishing the same version with identical content is allowed (idempotent success), but republishing the same version with different content fails.
+- After `sapphire install`, package imports can use the dependency name directly, e.g. `import("@sapphire/http")`, or a package subpath, e.g. `import("@sapphire/http:src/router.sapp")`. The resolver loads the installed package root from `pblang.lock`, first honors optional `[package].entry = "src/lib.sapp"` from that package's `pblang.toml`, and otherwise falls back to `lib.sapp` / `lib.sap` / `main.sapp` / `main.sap`. Both `entry` and package subpaths must be relative, stay inside the package root, and resolve to files rather than directories.
+- **`sapphire pack [--registry-index \<url\>] [--require-registry-sha256] [path] [out_file]`** — Stage A executables: δημιουργεί ένα ενιαίο `.tar.gz` artifact με το περιεχόμενο του πακέτου (manifest dir), συμπεριλαμβανομένων `pblang.toml`, ενημερωμένου `pblang.lock` και τοπικών dependencies. Το default `out_file` είναι `dist/app.tar.gz` μέσα στο manifest dir. **E4-gamma:** Before packing, manifest metadata is validated: `[package].target_platform` (if present) must be one of `any`, `linux`, `macos`, `windows`; `[package].min_runtime` (if present) must be a valid MAJOR.MINOR.PATCH version. Pack fails with a clear error otherwise. Αν το package έχει registry dependencies, το `pack` μπορεί πλέον να ξαναγεννήσει το lockfile με ρητό **`--registry-index \<url\>`** και **`--require-registry-sha256`** χωρίς να απαιτεί exported env var. Το `pack` κάνει validate ότι υπάρχει runnable package entry, ότι τα local path dependencies μένουν μέσα στο package root, και τυπώνει το resolved entry path. Η γραμμή επιτυχίας περιλαμβάνει προαιρετικά **name@version** και **description** από το `[package]` του manifest όταν υπάρχουν, και **οδηγία εκτέλεσης** (run hint): «To run: unpack the tarball and run 'sapphire run .' in the unpacked directory.» Για να τρέξεις το app: αποσυμπίεσε το tarball και εκτέλεσε `sapphire run` ή `sapphire run .` από τον unpacked φάκελο (χρησιμοποιεί το εγκατεστημένο `sapphire` binary, δεν χρειάζεται project folder στο origin).
+- **`sapphire bundle [--registry-index \<url\>] [--require-registry-sha256] [--self-extract] [path] [out_dir]`** — Create a portable folder (default `dist/`) containing the current sapphire executable, `pblang.toml`, `pblang.lock`, the resolved package entry, and local dependencies. **E4-gamma:** Same manifest metadata validation as `pack` (target_platform, min_runtime) before bundling. The bundled entry now preserves its relative path inside the package (for example `src/app.sapp`), so bundled apps with `[package].entry` work consistently. `bundle` now regenerates `pblang.lock` with the same registry flags as `pack`, so projects with registry dependencies can bundle through an explicit registry URL and strict-checksum CLI policy instead of relying only on env vars. Success output optionally includes **name@version** and **description** from `[package]` when present, and a **run hint**: «To run: cd to the bundle dir and run './sapphire run .' (sapphire.exe run . on Windows).» Local path dependencies must stay inside the package root; escaping or external paths are rejected instead of producing misleading bundles. Run from that folder with `./sapphire run .` (or `sapphire.exe run .` on Windows). When running a packaged app (`sapphire run .` from a manifest dir), **info** lines are printed to stderr when `target_platform` is not `any` or when `min_runtime` is set. **E5-beta:** the optional `--self-extract` flag is accepted and reserved for self-extracting bundle workflows built on top of the `sapphire-stub` launcher (see `docs/Native_backend_notes.md`); current behavior still produces a normal bundle directory.
+- **`sapphire --dump-bytecode <file>`** — Compile the file and print bytecode disassembly (constants + instructions). For debugging and reverse engineering.
+- **`sapphire --call-graph <file>`** (R2-alpha) — Print the call graph of a Sapphire source file as plain-text edges: `caller -> callee` (one per line). Top-level calls attributed to `<main>`. Functions with no outgoing calls print `funcname -> (no calls)`.
+- **`sapphire lsp`** / **`biapryx lsp`** (through L3-gamma) — Start a JSON-RPC 2.0 LSP server on stdin/stdout. Supports **initialize** (completionProvider, textDocumentSync, hoverProvider, definitionProvider), **initialized**, **textDocument/didOpen**/**didChange** (tracks open-file contents; didOpen is parsed with JSON unescaping so newlines in `text` are real line breaks), **textDocument/completion**, **textDocument/hover** (builtins and top-level locals — markdown stub), **textDocument/definition** (jump to `fn`/`let` declaration line for locals), **shutdown**, **exit**.
+
+## L3-beta: LSP scope-aware completion
+
+`sapphire lsp` / `biapryx lsp` tracks open files via `textDocument/didOpen` and
+`textDocument/didChange` and includes local symbols in completion:
+
+- Top-level `fn <name>` declarations from the open file.
+- Top-level `let <name>` bindings from the open file (best-effort, line-based scan).
+- All VM builtins (unchanged from L2-delta).
+
+Always send `textDocument/didOpen` or `textDocument/didChange` before requesting `textDocument/completion` so that the server sees the latest document text.
+
+## L3-gamma: LSP hover and go-to-definition (stub)
+
+- **`textDocument/hover`**: If the identifier under the cursor matches a builtin or a top-level local from the open file, the server returns markdown content (`builtin`, `local fn`, or `local let`). Otherwise `null`.
+- **`textDocument/definition`**: For a top-level local name, returns a `Location` spanning the identifier at its declaration line (UTF-8 byte offsets used as LSP `character` positions — adequate for ASCII sources).
+- **didOpen**: Implemented with `serde_json` so string escapes (`\n`, etc.) match normal LSP clients.
+
+## Reverse engineering / bytecode
+
+**`sapphire --dump-bytecode <file>`** compiles a single `.sap` or `.sapp` file (no execution, no package resolution) and prints a human-readable disassembly of the generated bytecode. This supports debugging, inspection of compiler output, and reverse-engineering workflows.
+
+- **Output**: A constants table (literals, names, etc.) followed by the instruction stream with opcodes and operands. The format is implementation-defined and may change with the compiler; use it for inspection and tooling, not as a stable bytecode ABI.
+- **Limitations**: Single-file only; imports are not resolved. Safe for untrusted source only in the sense that no code is run.
+- **Typical use**: Verify what the compiler emitted for a given script, debug VM behavior, or build analysis tools on top of the disassembly. **R2-alpha:** **`sapphire --call-graph <file>`** prints caller→callee edges from the AST. **R2-beta:** **`sapphire --annotate <file>`** compiles the file and prints bytecode with source-line annotation: each instruction is preceded by a `-- line N -------  <source line>` header when the source line changes.
+
+## R3-beta: Symbol table dump
+
+```bash
+sapphire --symbols <file>
+```
+
+Prints a simple symbol table for all top-level declarations in the compiled chunk:
+
+- `fn    <name>    arity:<n>    offset:<byte_offset>` — function entry (one per compiled function).
+- `let   <name>    offset:const#<k>` — best-effort listing of global names from the constant pool.
+
+Useful for RE workflows: quickly identify exported function names, arities, and approximate
+bytecode entry points without reading the full disassembly.
+
+### R3-alpha: Data-flow / use-def analysis
+
+```bash
+sapphire --dataflow <file>
+```
+
+Prints a simple use-def report for all variables in the file:
+
+- **`def <name> line:<n>`** — variable defined here (let/for/assign).
+- **`use <name> line:<n>`** — variable read here (identifier occurrences).
+- **`WARN <name> assigned but never read`** — variables that are defined but never used.
+
+Complements `sapphire lint` (scope-level unused warnings) with a per-variable def/use trace useful for reverse engineering and refactoring workflows.
+
+## Stdlib-style APIs
+
+- **`json`** — Global object with `json.parse(s)` and `json.stringify(x)` (same as builtins `json_parse`/`json_stringify`).
+- **`stdlib:strings.sapp`** — String helpers: `chars(s)`, `join(parts, delim)`, `repeat(s, n)`, `replace_all(s, needle, repl)`, `starts_with`/`ends_with`/`contains`/`trim` (wrappers around builtins), `lines(s)`, `words(s)`.
+- **`stdlib:array.sapp`** — `push`, `pop`, `contains`, `index_of`, `first`, `last`, `slice(a, start, end)`, `reverse(a)`. **`stdlib:map.sapp`** — `keys`, `has`, `remove`, `get_or`, `values`, `merge(m1, m2)`. **`stdlib:collections.sapp`** (G3-alpha) — stack/queue/set helpers: `stack_new` / `stack_push` / `stack_pop` / `stack_peek`, `queue_new` / `queue_enqueue` / `queue_dequeue`, and `set_new` / `set_add` / `set_has` / `set_remove` / `set_union` / `set_intersect`.
+- **`stdlib:path.sapp`** — `join(a, b)`, `dirname(p)`, `basename(p)`, `extension(p)`, `exists(p)`, `is_file(p)`, `is_dir(p)`, `absolute(p)` (resolve relative path against cwd; pass-through for Unix `/` or Windows `X:` style).
+- **`stdlib:time.sapp`** — `clock()` (seconds since epoch), `now_ms()` (milliseconds since epoch), `now_iso()` (UTC ISO-8601 string, e.g. `2026-03-10T12:00:00Z`).
+- **`stdlib:os.sapp`** — `cwd()`, `exec(cmd, args)`, `sleep_ms(n)`, `env_get(key)`, `env_set(key, value)`, `args()` (array of CLI args after `--`), `exit(code)` (terminate process; sandboxed by exec capability).
+- **`stdlib:process.sapp`** — `spawn_wait(cmd, args_array?)` → map `{ exit_code, stdout, stderr }` (blocking subprocess; requires allow_exec). Uses VM builtin `proc_spawn_wait`.
+- **`stdlib:csv.sapp`** — **G2-gamma:** **`parse_line(line)`** parses a single CSV line with RFC 4180 quoted fields (commas inside double quotes are literal; `""` is escaped quote). **`parse(text)`** returns array of rows (each row array of cells), splitting by newlines then `parse_line` per line. **`stringify(rows)`** joins with comma and newline.
+- **`stdlib:router.sapp`** — Routing layer: `route_map()` → empty map; `add_route(map, method, path, handler)` → map (key is `method|path`); `dispatch(map, method, path, req)` → handler result or `{ "status": 404, "body": "Not Found" }`; path params via `/user/:id`-style templates, `req["params"]` set before handler call; `match_path_params(template, actual)` → params map or nil.
+- **`stdlib:middleware.sapp`** — Compose handler transforms: `wrap(inner, mw)` (mw(req) returns nil to continue or response map to short-circuit); `chain(inner, mws)` (fold mws around inner); `mw_log_stub()` (log method+path, continue); `mw_require_auth_stub(expected_token)` (req["auth"] must match or 401). Works with router.sapp.
+- **`stdlib:quantum_sim.sapp`** — Pure-Sapphire state-vector simulator: `zero_state(n_qubits)` → array of `[re, im]` amplitudes; `h_gate(state, q)`, `x_gate(state, q)`, `cnot_gate(state, c, t)`; `measure(state, q)` → 0 or 1 (collapses state). Uses builtin `random_float()` for measurement. Q3-beta helpers: `histogram(outcomes_array)` → map from stringified outcomes (e.g. `"0"`, `"1"`) to counts, useful for aggregating repeated measurements or provider results.
+- **`stdlib:multipart.sapp`** — **parse(body, boundary)** → array of part maps; each part has `name`, `filename` (nil if not file), `content_type`, `body`. Parses multipart/form-data (delimiter `--` + boundary). Uses builtins `str_index_of`, `str_slice`, `str_lower`.
+- **`stdlib:http_server.sapp`** — HTTP server helpers; includes a **static file helper** `static_file_response(root_dir, request_path)` for safe serving of text files under a root directory: returns a response map with `status` 200 or 404, `body`, and `content_type` (inferred from extension: `.html`/`.htm`, `.txt`, `.css`, `.js`, `.json`; default `text/plain`). Cookie helpers: `cookies(req)` parses `Cookie`/`cookie` request headers into a map, and `cookie_get(req, name, fallback)` returns a cookie value with fallback. Paths containing `..` or outside root yield 404. Body limits: `read_request_limited(stream, max_body_bytes)` and `serve_once_limited` / `serve_forever_limited` reject oversized fixed-length `Content-Length` requests with **413**. **W3-delta:** **chunked_read(socket, on_chunk)** — reads Transfer-Encoding: chunked body frames; calls `on_chunk(data)` per non-empty chunk; uses `tcp_read_until` (size line) and `tcp_read` (chunk body). **Server-path timeouts**: when the host sets **VmLimits.io_timeout_ms**, the VM applies read/write timeout on streams returned by **tcp_accept**. **W4-alpha:** Per-request timeout from script: **serve_once_timeout(addr, timeout_ms, handler)** and **serve_forever_timeout(addr, timeout_ms, handler)** call **tcp_set_timeout(socket, timeout_ms)** on the accepted connection (`timeout_ms=0` = no timeout). **sse_event(event, data)** formats an SSE frame (`event: …\ndata: …\n\n`); **res_sse_headers()** returns a 200 response map with `Content-Type: text/event-stream` and `Cache-Control: no-cache`. VM builtin **tcp_set_timeout(stream_handle, timeout_ms)** sets read/write timeout on an open TCP stream (requires allow_net). **CORS:** `cors_headers(origin, allow_methods, allow_headers)`; `res_cors_preflight(...)` returns 204 with CORS headers for OPTIONS. **Rate limiting (W4-beta+)**: `mw_rate_limit(window_ms, max_requests)` returns middleware that tracks requests per instance in a fixed window and returns **429** after the configured number of requests; can be used with `app_use`/`app_get_mw`/`app_post_mw` for global or route-level throttling. **TLS:** See **docs/TLS_notes.md** for host-bridge design (rustls path requires no VM changes).
+- **`stdlib:websocket.sapp`** — WebSocket upgrade handshake (RFC 6455 stub): `upgrade_request(req)` returns `{ ok, key }` when request is valid WebSocket GET (Upgrade, Connection, Sec-WebSocket-Key); `upgrade_response(key)` returns HTTP 101 response string with `Sec-WebSocket-Accept`. Uses VM builtin `websocket_accept_key(key)`. **W3-epsilon:** **parse_frame(data)** — parses a raw RFC 6455 WebSocket frame from a byte string (each character = one byte); returns `{ opcode, payload, fin, masked }`. Uses VM builtins **strcharcodeat(s, i)**, **strfromcharcode(n)**, **byte_xor(a, b)**. Payload length > 125 (16/64-bit extension) not decoded; no fragmentation reassembly. **W4-beta:** **write_frame(opcode, payload)** — builds a minimal RFC 6455 client→server frame (FIN=1, masked, payload ≤125 bytes). The masking key is a fixed stub (`0xAB 0xCD 0xEF 0x01`); the result is a raw frame byte-string suitable for `tcp_write`. Pairs with `parse_frame` for full-duplex WebSocket communication.
+- **`stdlib:quantum.sapp`** (Q2-gamma) — Circuit builder: **circuit(n_qubits)** → `{ n, n_qubits, ops: [] }`; **apply_h(circ, q)**, **apply_x(circ, q)**; **apply_cnot(circ, control, target)**; **measure_all(circ)** (append MEASURE per qubit); **to_qasm(circ)** → QASM 2.0 string. Compatible with **quantum_protocol.submit()**. **Q3-alpha:** **run(circ)** — run circuit locally via quantum_protocol.submit, returns array of measurement outcomes (0/1 per qubit). **measurements_to_string(measurements)** → e.g. `"010"`; **measurements_to_int(measurements)** → little-endian integer. Existing **h**, **cx**, **measure**, **emit_qasm** unchanged.
+- **`stdlib:quantum_protocol.sapp`** — Job envelope (submit/poll): `submit(spec)` accepts a circuit spec `{ n, ops }` (same shape as quantum.sapp), runs it via quantum_sim, returns `{ job_id, status: "completed", result: { measurements } }`; `poll(job_id)` returns stored result or `{ status: "pending" }`. In-memory sync execution. **Q2-delta:** **submit_remote(url, circuit_map)** — POSTs JSON-encoded circuit to remote backend; returns `job_id`. **poll_remote(url, job_id)** — GETs `<url>/<job_id>`; returns decoded result map. See **docs/Quantum_providers.md** for provider slot design (Qiskit/Braket/Cirq-style stubs).
+
+## Q3-gamma: BB84 example + quantum error correction stub
+
+- **`examples/quantum_bb84/main.sapp`** — runnable BB84/QKD-style demo wiring together `stdlib:crypto_quantum.sapp` (QKD protocol names), `stdlib:quantum.sapp` (circuit builder + `run`), and `stdlib:quantum_sim.sapp.histogram` to build a simple Bell-state measurement histogram.
+- **`stdlib:quantum_sim.sapp.repetition_encode(bit)`** — 3-qubit repetition encode → `[bit, bit, bit]`.
+- **`stdlib:quantum_sim.sapp.repetition_decode(bits)`** — majority-vote decoder over the bits array; corrects single physical-bit flip errors in the toy repetition code.
+- **`stdlib:tensor.sapp`** (A3-beta) — Typed tensor/buffer contract for AI providers: **tensor(shape, data)** → `{ shape, data, dtype: "f32" }` (validates data length; mismatch returns `{ "error": "..." }`); **zeros(shape)**, **ones(shape)**; **get(t, indices)**, **set(t, indices, value)** (row-major); **shape(t)**, **dtype(t)**; **to_request_body(t)** for JSON in AI requests.
+- **A3-gamma:** VM builtin **http_post_auth(url, body, token)** — POST with `Authorization: Bearer <token>`; requires allow_net. **stdlib:http.sapp**: **post_auth(url, body, token)**. **examples/ai_http_provider/main.sapp**: **openai_chat_auth(prompt, api_key)** — convenience wrapper using post_auth. **A4-alpha:** **get_stream(url, on_chunk)** and **post_stream(url, body, on_chunk)** — shim: full response then split on `\n\n`, call on_chunk per part (SSE). **parse_sse_line(line)** → `{ kind: "data"|"event", value }` or nil. **openai_chat_stream(prompt, api_key, on_token)** in ai_http_provider parses SSE and calls on_token(delta). See **docs/AI_plugin_pattern.md** (Streaming Inference, ONNX FFI path). **A4-beta:** **http.post_stream_auth(url, body, token, on_chunk)** — streaming POST with Bearer token (shim: `http_post_auth` + SSE `"\n\n"` split) and **stdlib:provider_registry.sapp** multi-provider AI routing helpers: `register(name, endpoint, api_key)`, `call_best(prompt, model)`, `call_with_fallback(prompt, model)`.
+- **stdlib:graphics.sapp** (G2-gamma) — **polygon(ctx, points, color)** — draw closed polygon via gfxdrawline; `points` = array of `[x, y]`. **bezier(ctx, x0, y0, cx1, cy1, cx2, cy2, x1, y1, color)** — stub (draws line from (x0,y0) to (x1,y1); host may provide full curve later). **draw_text(ctx, text, x, y, color)** — host-provided stub (no-op if no text builtin).
+
+## Threads / channels (T4-alpha)
+
+- **channel()** — Returns a map with `sender` and `receiver` endpoints (VM builtins).
+- **send(sender_endpoint, value)**, **recv(receiver_endpoint)** — Message passing; sender is single-use per current MVP (send consumes sender).
+- **channel_close(ch)** — Marks the channel as closed; subsequent **send** errors with "send on closed channel", subsequent **recv** on empty closed channel returns **nil**.
+- **channel_is_closed(ch)** → bool.
+- Pattern: drain with `while (let v = recv(ch.receiver)) != nil { ... }`; after **channel_close(ch)**, **recv(ch.receiver)** returns nil when queue is empty.
+
+**T5-alpha (threads stdlib wrapper):** `stdlib:thread.sapp` provides a small ergonomic wrapper around these builtins:
+- `thread.spawn(fn)` / `thread.join(handle)` — spawn and join worker threads (VM-per-thread model, no shared heap).
+- `thread.channel_new()` / `thread.send_value(sender, value)` / `thread.recv_value(receiver)` — convenience wrappers over `channel`, `send`, `recv`.
+- `thread.channel_close_wrapper(ch)` / `thread.channel_is_closed_wrapper(ch)` — explicit close and status check.
+- `thread.select_ready(channels_array)` — thin wrapper over `select` for multi-channel receive.
+
+### T4-beta additions
+
+- **select(channels_array)** → `{ "index": int, "value": any }` — Returns the first ready channel's value (by array order); returns **nil** if all channels are closed and empty; spins (yield_now) until a value is available.
+- See **examples/thread_pool/main.sapp** for work-queue pattern with spawn, channel, channel_close, and join.
+
+## Math builtins (core)
+
+- **num_floor(x)**, **num_ceil(x)** — floor/ceil (1 argument).
+
+## Math stdlib (G3-beta)
+
+- **`stdlib:math.sapp`** — Structured math helpers across three areas:
+  - **Complex numbers**: `math.complex.new/add/sub/mul/conj/norm/div_scalar/arg/exp/ln/pow_scalar/sqrt/abs/abs2/modulus_scalar/to_string`, plus an interactive menu (`math.complex.interactive`).
+  - **Logic & algorithms**: `math.logic.entailment/conjunction/disjunction/negation/contrapositive/truth_table` and `math.algorithms.gcd/sieve/sequential_search` for basic discrete math operations and demos.
+  - **Linear algebra & scalars**: `math.la.vec_add/sub/dot/scale`, `la.mat_identity/transpose/mul/mat_vec_mul`, `la.det2/solve2` for 2×2 systems, and **scalar helpers** `math.util.clamp(x, lo, hi)`, `math.util.lerp(a, b, t)`, `math.util.smoothstep(edge0, edge1, x)` for common interpolation/animation-style computations.
+
+## Registry / install env vars
+
+- **`PBLANG_REGISTRY_INDEX`** — URL of the registry index or registry base (file:// or http(s)://). Used by `sapphire install`, `sapphire --lock`, `sapphire build`, `sapphire pack`, `sapphire bundle`, `sapphire publish`, and `sapphire search` when `--registry-index` is not passed. Required when the manifest has registry dependencies (names starting with `@`) and no explicit registry URL was given on the command line.
+- **`PBLANG_SIGNING_KEY`** — Optional. When set, `sapphire pack` writes a `<out_file>.sha256` HMAC sidecar; `sapphire verify <tarball>` checks it if the sidecar exists; **`sapphire install`** (E4-beta) fetches `<tarball_url>.sha256` for registry tarballs and verifies HMAC before unpacking, rejecting on mismatch.
+- **`REQUIRE_REGISTRY_SHA256`** — Set to `1` or `true` to require index entries to include a `sha256` field; resolution fails otherwise. Used by `sapphire install`, `sapphire --lock`, `sapphire build`, `sapphire pack`, and `sapphire bundle` when the explicit `--require-registry-sha256` flag is not passed.
+
+- **Hosted registry design (M3-gamma/M4-beta):** See **docs/Registry_hosted.md** for API and auth design (GET index/tarball/sha256, POST publish, GET search; bearer token for publish) and the M4-beta client flows for `sapphire publish` and `sapphire search`.
+
+## Registry semver (M3-alpha, M3-beta)
+
+- **crates/sapphire-pm/src/semver.rs**: **Version::parse(s)** → Option&lt;Version&gt;, **satisfies(version, range_str)** → bool. Range syntax: exact `1.2.3`, caret `^1.2.0`, tilde `~1.2.3`, `>=1.0.0`, `<=2.0.0`, `>1.0.0`, `<2.0.0`. Thirteen unit tests; intended for use in dependency resolution.
+- **M3-beta: semver wired into resolution** — `resolve_registry_dep` (and thus `sapphire install` / `sapphire --lock`) now uses **satisfies** to pick the highest available version that matches the requested range. If no candidate satisfies the range, resolution returns an error (e.g. "no version satisfies `^1.0.0`").
+---
+
+## SP1-gamma: OOP + functional conformance fixes
+
+**SP1-gamma** closes known failing semantics tests and unblocks the full conformance suite:
+
+- **Class semantics fixes**:
+  - Constructor dispatch: `ClassName(args)` → `ClassName.new(args)` (explicit `fn new`).
+  - Method resolution with `self` binding in class method table.
+  - Auto-constructor with positional field assignment when `fn new` is absent.
+  - `init(self, ...)` method called automatically by auto-constructor.
+- **Match semantics fixes**:
+  - Wildcard fallthrough: `_` matches any value and should be the last arm.
+  - Guard evaluation after binding: `case n if n < 0` evaluates guard after binding `n`.
+- **Regression tests added**:
+  - `class_basic_pass` — basic class with init and methods.
+  - `class_method_dispatch_pass` — method dispatch with self binding.
+  - `match_exhaustive_pass` — exhaustive match with else clause.
+  - `match_guard_pass` — match with guard conditions.
+- **Documentation updates**:
+  - `docs/Spec_freeze.md` v0.2: OOP semantics, closure capture rules, map/filter/reduce contracts.
+  - `docs/Tooling.md` SP1-gamma note (this section).
+
+**Impact**: Unblocks full conformance suite; all semantics tests now pass.
+
+---
+
+## Related docs
+
+
+- [Language_Semantics.md](Language_Semantics.md) — Core semantics, capabilities, limits.
+- [Stability_policy.md](Stability_policy.md) — Breaking changes, versioning.
+- [Crash_resistance.md](Crash_resistance.md) — Error handling, determinism.
+- [lsp.md](lsp.md) — Language server (parse/typecheck diagnostics).
+
+## E5-gamma: Self-extracting binary (Stage A)
+
+`biapryx bundle --self-extract --output <file> <path>` produces a standalone executable. The output is:
+- `biapryx-stub` bytes + `PBLANG_BUNDLE_START\x00` SENTINEL + gzip-compressed tarball
+
+On execution, the stub:
+1. Finds the SENTINEL in its own bytes
+2. Extracts the tarball to `$TMPDIR/biapryx-run-<hash>/`
+3. Runs `biapryx run .` inside the extracted directory
+4. Cleans up on exit
+
+**Flags**:
+- `--help, -h`: Show help message
+- `--version, -V`: Show version information
+- `--extract-only <dir>`: Extract bundle without running
+
+**Env**:
+- `PBLANG_RUNTIME`: Override the runtime binary path (defaults to `biapryx`)
+
+**Example**:
+```bash
+# Build the stub first
+cargo build --release --bin biapryx-stub
+
+# Create a self-extracting binary
+biapryx bundle --self-extract --output myapp ./myproject
+
+# Run the self-extracting binary
+./myapp
+
+# Or extract without running
+./myapp --extract-only ./extracted
+```
+
+**Binary Structure**:
+```
+[biapryx-stub binary bytes]
+[SENTINEL: "PBLANG_BUNDLE_START\x00"]
+[gzip-compressed tarball containing the app]
+```
+
+**Tests**:
+- `self_extract_binary_contains_sentinel`: Verifies output contains SENTINEL marker
+- `self_extract_runs_hello`: Verifies minimal hello app structure
+
+## Q3-delta — Quantum Noise Model + Bloch Sphere Visualization
+
+### Quantum Noise Model (stdlib/quantum_sim.sapp)
+
+New functions added:
+- **`y_gate(state, q)`** — Y gate (bit flip + phase flip)
+- **`z_gate(state, q)`** — Z gate (phase flip on |1⟩ component)
+- **`add_depolarizing_noise(circ, p)`** — Depolarizing noise model
+  - Input: circuit (array of gate operations), probability p (0.0-1.0)
+  - After each gate, with probability p, insert a random error gate (X, Y, or Z)
+  - Uses `random_float()` for randomness
+
+### Bloch Sphere Visualization (stdlib/quantum_viz.sapp)
+
+New module created:
+- **`bloch_angles(state_2d)`** — Convert 2D state vector to Bloch sphere angles
+  - Input: `[alpha, beta]` (complex amplitudes as `[re, im]` pairs)
+  - Returns: `map{ "theta": theta, "phi": phi }`
+  - theta: polar angle (0 to π)
+  - phi: azimuthal angle (-π to π)
+
+- **`bloch_to_svg(theta, phi)`** — Generate SVG representation
+  - Creates 200x200 SVG with circle outline, axes, and state vector arrow
+  - Labels: |0⟩ and |1⟩ states
+  - Pure Sapphire implementation (no external dependencies)
+  - Uses Taylor series approximations for sin, cos, atan, arccos
+
+### Test Harness
+
+- **`tests/semantics/quantum_noise_test.sapp`** — Comprehensive tests for:
+  - Bloch angles for |0⟩, |1⟩, |+⟩, |−⟩, |i+⟩ states
+  - SVG structure validation (tags, elements)
+  - Random_float range verification
+  - Quantum simulator integration
+
+- **`quantum_noise_depolarizing_pass`** test in `tests/semantics.rs`
+
+## A4-gamma — AI Chat Tool-Call Example + Tensor Operations
+
+### Tensor Operations (stdlib/tensor.sapp)
+
+New functions added:
+- **`slice(t, start, end)`** — Extract slice from 1D tensor
+- **`reshape(t, new_rows, new_cols)`** — Reshape tensor to new dimensions
+- **`dot(a, b)`** — Matrix multiplication (2D) and vector dot product (1D)
+
+### AI Chat Tool-Call Example
+
+- **`examples/ai_chat_toolcall/main.sapp`** — Demonstrates OpenAI-style function calling
+  - Tool definition schema building
+  - `finish_reason == "tool_calls"` parsing
+  - Tool execution and result routing
+  - Provider registry integration pattern
+
+### Test Harness
+
+- **`tests/semantics/tensor_ops_test.sapp`** — Comprehensive tests for slice/reshape/dot
+- **`tensor_ops_pass`** test in `tests/semantics.rs`
+
+## G3-gamma — Linear algebra in nd.sapp
+
+New functions in **`stdlib:nd.sapp`**:
+
+- **`mat_inv(m)`** — Inverse of a 2×2 or 3×3 matrix (row-major flat array). Returns `nil` for singular matrices.
+- **`mat_solve(A, b)`** — Solve `Ax = b` using Cramer's rule (2×2 or 3×3). Returns `nil` if singular.
+
+```sapphire
+import "stdlib:nd.sapp";
+let A = [2, 1, 5, 3];     // [[2,1],[5,3]]
+let inv = nd.mat_inv(A);   // [3, -1, -5, 2]
+let x = nd.mat_solve(A, [4, 7]); // [5, -6]
+```
+
+Test: `nd_linalg_inv_solve_pass`.
+
+## T5-beta — Thread pool stdlib helper
+
+New function in **`stdlib:thread.sapp`**:
+
+- **`thread_pool(n_workers, tasks_array, worker_fn)`** — Fan-out/fan-in worker pool. Spawns `n_workers` threads, distributes tasks via channel, calls `worker_fn(item)` per task, collects results.
+
+```sapphire
+import "stdlib:thread.sapp";
+let results = thread.thread_pool(4, [1,2,3,4,5], fn(x) { return x * x; });
+// results: [1, 4, 9, 16, 25] (completion order may vary)
+```
+
+Deadlock diagnostic: workers exit cleanly when they receive the `nil` sentinel.
+Test: `thread_pool_stdlib_pass`.
+
+## R3-gamma — CFG (control-flow graph) dump
+
+```bash
+pblang --cfg <file>           # plain text: BB0 -> BB1
+pblang --cfg <file> --cfg-dot # DOT format for Graphviz
+```
+
+Identifies basic blocks and emits edges. Test: `cfg_output_contains_basic_blocks`.
+
+## PL1-alpha — Polyglot block execution bridge
+
+New **`stdlib:polyglot.sapp`**:
+
+- **`run_block(lang, src)`** — Execute code in a foreign language via subprocess. Returns `map{ ok, stdout, stderr, exit_code }`. Requires `allow_exec` capability.
+
+```sapphire
+import "stdlib:polyglot.sapp";
+let r = polyglot.run_block("python3", "print('hello')");
+if r.ok { print r.stdout; }
+```
+
+Supported languages: `python`/`python3`, `node`/`js`/`javascript`, `bash`, `ruby`, `perl`.
+Test: `polyglot_exec_python_pass`.
+
+## ED1-alpha — VS Code extension scaffold
+
+Minimal VS Code extension in `editors/vscode/`:
+
+- `package.json` — contributes `pblang` language (`.sapp`, `.sap`), syntax grammar, run/check commands.
+- `src/extension.ts` — starts `pblang lsp` over stdio via `vscode-languageclient`.
+- `syntaxes/pblang.tmGrammar.json` — TextMate syntax highlighting.
+- `language-configuration.json` — bracket matching, comments.
+
+Install from source: `cd editors/vscode && npm install && npm run compile`, then F5 in VS Code.
+
+## PF1-alpha — `pblang new` project scaffold
+
+```bash
+pblang new <name> [--template web|lib|cli]
+```
+
+Creates `<name>/pblang.toml`, `<name>/src/main.sapp`, `<name>/.gitignore`.
+Templates: `web` (http_server), `lib` (export stubs), `cli` (os.args, default).
+Test: `new_creates_web_scaffold`.
+
+## OS1-alpha — `os.sapp` expansion
+
+New additions to **`stdlib:os.sapp`**:
+
+- **`args()`** — Array of CLI args after `--`.
+- **`exit(code)`** — Terminate process (requires `allow_exec`).
+- **`signal_trap(sig, handler_fn)`** — Register signal handler stub. Falls back to `"stub"` gracefully if not available.
+
+Test: `os_env_set_pass`.
