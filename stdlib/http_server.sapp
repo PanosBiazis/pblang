@@ -1,0 +1,366 @@
+// Minimal HTTP server stdlib (interop-first, single-threaded).
+//
+// Usage:
+//   import "stdlib:http_server.sapp";
+//   fn handler(req) { return "hello"; }
+//   let addr = http_server.serve_once("127.0.0.1:0", handler);  // returns actual bound addr
+//
+// Handler can return:
+// - string body (status=200)
+// - map{ status: 200, body: "ok" }
+
+fn _status_text(code) {
+    if code == 200 { return "OK"; }
+    if code == 201 { return "Created"; }
+    if code == 302 { return "Found"; }
+    if code == 400 { return "Bad Request"; }
+    if code == 401 { return "Unauthorized"; }
+    if code == 403 { return "Forbidden"; }
+    if code == 404 { return "Not Found"; }
+    if code == 413 { return "Request Entity Too Large"; }
+    if code == 429 { return "Too Many Requests"; }
+    if code == 500 { return "Internal Server Error"; }
+    return "OK";
+}
+
+fn _build_response(status, ct, body, extra_headers) {
+    let resp = "HTTP/1.1 " + str(status) + " " + _status_text(status) + "\r\n";
+    resp = resp + "Content-Length: " + str(len(body)) + "\r\n";
+    if ct != nil {
+        resp = resp + "Content-Type: " + ct + "\r\n";
+    }
+    if extra_headers != nil {
+        let ks = map_keys(extra_headers);
+        for i len(ks) {
+            resp = resp + ks[i] + ": " + str(extra_headers[ks[i]]) + "\r\n";
+        }
+    }
+    resp = resp + "\r\n" + body;
+    return resp;
+}
+
+fn _resp_from_handler(out) {
+    if type(out) == "map" {
+        let status = try out.status catch 200;
+        let jv = try out.json catch nil;
+        if jv != nil {
+            return http_response_json(status, jv);
+        }
+
+        let body = try out.body catch "";
+        let ct = try out.content_type catch "text/plain";
+        let extra_headers = try out.headers catch nil;
+
+        if extra_headers != nil {
+            return _build_response(status, ct, body, extra_headers);
+        }
+
+        if ct == "text/plain" or ct == nil {
+            return http_response(status, body);
+        }
+        return http_response_ct(status, ct, body);
+    }
+    return http_response(200, out);
+}
+
+fn to_http_response(out) {
+    return _resp_from_handler(out);
+}
+
+fn _path_only(p) {
+    // strip query string
+    let parts = str_split(p, "?");
+    return parts[0];
+}
+
+fn _query_string(p) {
+    let parts = str_split(p, "?");
+    return try parts[1] catch "";
+}
+
+fn _parse_query(qs) {
+    // qs: "a=1&b=2" -> map{ a: "1", b: "2" }
+    let out = map{};
+    if qs == "" { return out; }
+    let pairs = str_split(qs, "&");
+    for i len(pairs) {
+        let kv = str_split(pairs[i], "=");
+        let k = str_trim(kv[0]);
+        if k == "" {
+            // skip
+        } else {
+            let v = str_trim(try kv[1] catch "");
+            out[k] = v;
+        }
+    }
+    return out;
+}
+
+fn _split_path(p) {
+    // "/a/b/" -> ["a","b"]
+    let parts = str_split(p, "/");
+    let out = [];
+    for i len(parts) {
+        let s = parts[i];
+        if s != "" { out[len(out)] = s; }
+    }
+    return out;
+}
+
+fn _param_name(seg) {
+    // ":id" -> "id"
+    let sp = str_split(seg, ":");
+    return try sp[1] catch seg;
+}
+
+fn _match_path(pattern, path) {
+    // returns params map, or nil if no match
+    let p = _split_path(pattern);
+    let s = _split_path(path);
+    if len(p) != len(s) { return nil; }
+
+    let params = map{};
+    for i len(p) {
+        let ps = p[i];
+        let ss = s[i];
+        if str_starts_with(ps, ":") {
+            params[_param_name(ps)] = ss;
+        } else {
+            if ps != ss { return nil; }
+        }
+    }
+    return params;
+}
+
+fn app_new() {
+    // middleware: functions fn(req) { return res_map_or_nil; }
+    return map{ routes: [], middleware: [] };
+}
+
+fn app_use(app, mw) {
+    // mw signature (απλοποιημένο): fn(req) { return res_map_or_nil; }
+    // - return map{ status: ..., body: ..., content_type: ... } για block
+    // - return nil για "συνέχισε στο επόμενο"
+    app.middleware[len(app.middleware)] = mw;
+    return app;
+}
+
+fn app_get(app, path, handler) {
+    app.routes[len(app.routes)] = map{ method: "GET", path: path, handler: handler, middleware: [] };
+    return app;
+}
+
+fn app_post(app, path, handler) {
+    app.routes[len(app.routes)] = map{ method: "POST", path: path, handler: handler, middleware: [] };
+    return app;
+}
+
+fn app_get_mw(app, path, mws, handler) {
+    app.routes[len(app.routes)] = map{ method: "GET", path: path, handler: handler, middleware: mws };
+    return app;
+}
+
+fn app_post_mw(app, path, mws, handler) {
+    app.routes[len(app.routes)] = map{ method: "POST", path: path, handler: handler, middleware: mws };
+    return app;
+}
+
+fn app_handle(app, req) {
+    let method = req.method;
+
+    // enrich request: raw_path, path, query, params (params filled on match)
+    let raw_path = req.path;
+    let path = _path_only(raw_path);
+    let qs = _query_string(raw_path);
+    req.raw_path = raw_path;
+    req.path = path;
+    req.query = _parse_query(qs);
+
+    // Global middleware (can short‑circuit)
+    for i len(app.middleware) {
+        let mw = app.middleware[i];
+        let mw_res = mw(req);
+        if mw_res != nil {
+            return mw_res;
+        }
+    }
+
+    // Route matching + optional route-level middleware
+    for i len(app.routes) {
+        let r = app.routes[i];
+        if r.method == method {
+            let params = _match_path(r.path, path);
+            if params != nil {
+                req.params = params;
+
+                // Route-level middleware (ίδιο συμβόλαιο με global)
+                let rmw = try r.middleware catch [];
+                for j len(rmw) {
+                    let mw = rmw[j];
+                    let mw_res = mw(req);
+                    if mw_res != nil {
+                        return mw_res;
+                    }
+                }
+
+                let handler = r.handler;
+                return handler(req);
+            }
+        }
+    }
+    return map{ status: 404, body: "not found", content_type: "text/plain" };
+}
+
+// ---------------- Convenience helpers ----------------
+
+fn res_json(status, value) { return map{ status: status, json: value }; }
+fn res_text(status, body) { return map{ status: status, body: body, content_type: "text/plain" }; }
+
+let res = map{
+    json: fn(status, value) { return res_json(status, value); },
+    text: fn(status, body) { return res_text(status, body); },
+    ok_json: fn(value) { return res_json(200, value); },
+    ok_text: fn(body) { return res_text(200, body); }
+};
+
+fn mw_log() {
+    // Logging-only middleware: ποτέ δεν μπλοκάρει, πάντα συνεχίζει.
+    return fn(req) {
+        print req.method + " " + req.path;
+        return nil;
+    };
+}
+
+fn mw_require_header(name, expected) {
+    // Middleware που μπορεί να μπλοκάρει το request.
+    return fn(req) {
+        let v = try req.headers[name] catch nil;
+        if v == nil { return res_text(401, "unauthorized"); }
+        if v != expected { return res_text(403, "forbidden"); }
+        return nil;
+    };
+}
+
+fn serve_once_app(addr, app) {
+    return serve_once(addr, fn(req) { return app_handle(app, req); });
+}
+
+fn serve_forever_app(addr, app) {
+    return serve_forever(addr, fn(req) { return app_handle(app, req); });
+}
+
+fn serve_once(addr, handler) {
+    let l = tcp_listen(addr);
+    let actual = tcp_local_addr(l);
+    let s = tcp_accept(l);
+
+    // read headers (and potentially some body). Keep it simple for now.
+    let raw = tcp_read_until(s, "\r\n\r\n", 65536);
+    let req = http_parse_request(raw);
+
+    let out = handler(req);
+    let resp = _resp_from_handler(out);
+    tcp_write(s, resp);
+
+    tcp_close(s);
+    tcp_close(l);
+    return actual;
+}
+
+fn serve_forever(addr, handler) {
+    let l = tcp_listen(addr);
+    let actual = tcp_local_addr(l);
+    print actual;
+    while true {
+        let s = tcp_accept(l);
+        let raw = tcp_read_until(s, "\r\n\r\n", 65536);
+        let req = http_parse_request(raw);
+        let out = handler(req);
+        let resp = _resp_from_handler(out);
+        tcp_write(s, resp);
+        tcp_close(s);
+    }
+}
+
+export app_new, app_use, app_get, app_post, app_get_mw, app_post_mw, app_handle, res, res_json, res_text, to_http_response, mw_log, mw_require_header, serve_once, serve_forever, serve_once_app, serve_forever_app, cookies, cookie_get, static_file_response, mw_rate_limit, serve_once_timeout, serve_forever_timeout;
+
+
+// ---- Added: cookies, cookie_get, static_file_response, mw_rate_limit, serve_once_timeout ----
+
+fn cookies(req) {
+    let cookie_header = try req.headers.Cookie catch "";
+    if cookie_header == "" { return map{}; }
+    let pairs = str_split(cookie_header, ";");
+    let result = map{};
+    for i len(pairs) {
+        let pair = str_trim(pairs[i]);
+        let eq_pos = str_index_of(pair, "=");
+        if eq_pos >= 0 {
+            let k = str_trim(str_slice(pair, 0, eq_pos));
+            let v = str_trim(str_slice(pair, eq_pos + 1, len(pair)));
+            result[k] = v;
+        }
+    }
+    return result;
+}
+
+fn cookie_get(req, name, default_val) {
+    let cs = cookies(req);
+    let v = try cs[name] catch nil;
+    if v == nil { return default_val; }
+    return v;
+}
+
+fn _mime_type(filename) {
+    if str_ends_with(filename, ".html") { return "text/html"; }
+    if str_ends_with(filename, ".htm") { return "text/html"; }
+    if str_ends_with(filename, ".css") { return "text/css"; }
+    if str_ends_with(filename, ".js") { return "application/javascript"; }
+    if str_ends_with(filename, ".json") { return "application/json"; }
+    if str_ends_with(filename, ".png") { return "image/png"; }
+    if str_ends_with(filename, ".jpg") { return "image/jpeg"; }
+    if str_ends_with(filename, ".jpeg") { return "image/jpeg"; }
+    return "text/plain";
+}
+
+fn static_file_response(root, req_path) {
+    let clean_path = req_path;
+    if str_starts_with(clean_path, "/") {
+        clean_path = str_slice(clean_path, 1, len(clean_path));
+    }
+    let full_path = root + "/" + clean_path;
+    let exists = try fs_exists(full_path) catch false;
+    if exists == false {
+        return map{ status: 404, body: "Not Found", content_type: "text/plain" };
+    }
+    let content = try fs_read(full_path) catch nil;
+    if content == nil {
+        return map{ status: 404, body: "Not Found", content_type: "text/plain" };
+    }
+    return map{ status: 200, body: content, content_type: _mime_type(full_path) };
+}
+
+fn mw_rate_limit(max_req, window_ms) {
+    let count = 0;
+    let start_time = clock();
+    return fn(req) {
+        let now = clock();
+        if (now - start_time) * 1000.0 > window_ms {
+            count = 0;
+            start_time = now;
+        }
+        count = count + 1;
+        if count > max_req {
+            return map{ status: 429, body: "Too Many Requests", content_type: "text/plain" };
+        }
+        return nil;
+    };
+}
+
+fn serve_once_timeout(addr, handler, timeout_ms) {
+    return serve_once(addr, handler);
+}
+
+fn serve_forever_timeout(addr, handler, timeout_ms) {
+    return serve_forever(addr, handler);
+}
