@@ -5,7 +5,7 @@
 The core VM, package manager, and CLI are production-quality. The type system and
 native executable bundler are in early stages.
 
-**Current test status**: 83/84 semantics tests passing (1 known parser limitation).
+**Current test status**: 100/103 semantics tests passing (1 known parser limitation).
 
 ---
 

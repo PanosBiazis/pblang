@@ -136,11 +136,25 @@ pub struct SearchResult {
 // ──────────────────────────────────────────────────────────────
 
 /// Fetch bytes from URL (file:// or http(s)://).
+/// Fetch bytes from a URL.
+///
+/// Supports `file://` (absolute local paths) and `http(s)://`.
+///
+/// BUG FIX: The original implementation called `trim_start_matches('/')` which
+/// stripped ALL leading slashes from absolute paths, turning `/tmp/foo/index.json`
+/// into the relative path `tmp/foo/index.json`. This caused all file:// registry
+/// tests to fail. Now the path is preserved verbatim after the `file://` prefix.
 pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
     if let Some(path) = url.strip_prefix("file://") {
-        let path = path.trim_start_matches('/');
+        // On Unix: file:///tmp/foo → strip "file://" → "/tmp/foo" (absolute, correct)
+        // On Unix: file://tmp/foo  → strip "file://" → "tmp/foo"  (relative, user intent)
+        // On Windows: file:///C:/foo → strip "file://" → "/C:/foo" → trim ONE slash → "C:/foo"
         #[cfg(windows)]
-        let path = path.strip_prefix("?/").unwrap_or(path);
+        let path = {
+            let p = path.trim_start_matches('/');
+            p.strip_prefix("?/").unwrap_or(p)
+        };
+        // NOTE: On non-Windows we do NOT strip the leading slash — the path is absolute.
         return std::fs::read(path).map_err(|e| format!("read file {}: {e}", path));
     }
     let resp = ureq::get(url)
@@ -516,9 +530,7 @@ pub fn resolve_import(
                                     // FIX #9: Stale lockfile must be an error, not a silent
                                     // fallback. A mismatch means pblang.toml changed after
                                     // the lock was generated — run `pblang install` first.
-                                    return Err(format!(
-                                        "pblang.lock is out of date (manifest has changed).                                          Run `pblang install` to regenerate the lockfile."
-                                    ));
+                                    return Err("pblang.lock is out of date (manifest has changed). Run `pblang install` to regenerate the lockfile.".to_string());
                                 }
                                 if let Some(dep) = lock.dependencies.get(pkg) {
                                     dep_root = canonicalize_existing(Path::new(&dep.path));

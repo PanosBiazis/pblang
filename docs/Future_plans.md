@@ -3,7 +3,7 @@
 Realistically, what happens with “add everything”?
 “All features” — OS building, AI/quantum, a full web stack, polyglot code in the same file, endless libraries and tools — is not one feature but an entire ecosystem. What we can do properly is build it as a platform: a stable runtime/IR, package manager, FFI, stdlib, and tooling, so that libraries can be plugged in afterward.
 
-The good news is that you already have modules with export, try/catch, arrays/maps, JSON/HTTP client support, a quantum QASM emitter, type annotations plus a typechecker, a C ABI via sapphire-ffi, and an optimizer hook. So the foundation already exists.
+The good news is that you already have modules with export, try/catch, arrays/maps, JSON/HTTP client support, a quantum QASM emitter, type annotations plus a typechecker, a C ABI via pblang-ffi, and an optimizer hook. So the foundation already exists.
 
 Web capabilities
 To build real web apps and servers, the following are needed, in roughly this value/effort order: stdlib networking with TCP sockets and a basic HTTP server; better JSON API design and error handling; crypto/TLS through bindings such as OpenSSL or rustls or through host-provided capabilities; and a package manager for routers, template engines, ORMs, and similar libraries.
@@ -55,7 +55,7 @@ For v1.0, the release gates are: semver plus a spec freeze for the core language
 Embedded and standalone at the same time
 When asked whether Sapphire should target both embedded scripting and standalone general-purpose use, the answer is yes, but that requires a layered architecture: a minimal, embeddable core runtime plus a pluggable stdlib and a separate CLI/tooling layer.
 
-The proposed crate split is: sapphire-core for parser, compiler, and VM; sapphire-stdlib for builtins such as fs, net, http, sqlite, and ffi; and sapphire-cli for the REPL and commands like --check, --doc, and --lock.
+The proposed crate split is: pblang-core for parser, compiler, and VM; sapphire-stdlib for builtins such as fs, net, http, sqlite, and ffi; and sapphire-cli for the REPL and commands like --check, --doc, and --lock.
 
 A stable VmHost trait is proposed as the embedding API, with functions for errors, module imports, cycle collection, and capability flags such as allow_fs, allow_net, allow_ffi, and allow_exec. A StdlibConfig structure is also proposed so an embedder can enable or disable builtins category by category.
 
@@ -70,7 +70,7 @@ Sandboxing and resource limits
 For safe execution of untrusted code, the text proposes a VmLimits structure that includes instruction limits, memory limits, stack depth limits, and I/O timeouts. It also proposes capability-based builtins plus an FfiPolicy with allowlists for libraries and symbols.
 
 Tooling roadmap
-The tooling roadmap includes commands such as sapphire init, sapphire install, sapphire build, sapphire run, sapphire test, and sapphire publish. It also includes a language server for autocomplete, jump-to-definition, and inline diagnostics, a formatter and linter, and an HTML docs generator built on the existing --doc functionality.
+The tooling roadmap includes commands such as sapphire init, pblang install, sapphire build, sapphire run, sapphire test, and pblang publish. It also includes a language server for autocomplete, jump-to-definition, and inline diagnostics, a formatter and linter, and an HTML docs generator built on the existing --doc functionality.
 
 What has and has not been done
 Much of the later text compares Future_plans.md and Report.md and repeatedly distinguishes between what already exists and what is still missing. According to the document, the existing foundation includes sandboxing, limits, FFI policy, a bundle command, graphics work, formatting support, install, --dump-bytecode, golden tests, lockfile tests, threads design, embedding API documentation, and baseline CI on Linux and Windows.
@@ -133,7 +133,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
 | Metric | Before | After |
 |--------|--------|-------|
-| Semantics tests passing | 62/76 | **75/76** |
+| Semantics tests passing | 62/76 | **100/103** |
 | Failing tests | 14 | 0 (1 documented as known limitation) |
 | All other test suites | Passing | Passing |
 
@@ -188,5 +188,5 @@ The binary is fully operational. Here is the complete summary of everything done
 
 ### 📚 Documentation Updated
 
-- `docs/CURRENT_STATUS.md` — Complete rewrite reflecting v0.5 status with 75/76 passing
+- `docs/CURRENT_STATUS.md` — Complete rewrite reflecting v0.5 status with 100/103 passing
 - `docs/Language_Semantics.md` — Added match guard and threading sections

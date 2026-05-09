@@ -2,7 +2,7 @@
 
 **Last Updated**: 2026  
 **Status**: v0.5 — Production-Ready Core with Active Ecosystem Development  
-**Test Suite**: **75/76 semantics tests passing** (1 known chumsky limitation, documented)
+**Test Suite**: **100/103 semantics tests passing** (1 known chumsky limitation, documented)
 
 ---
 
@@ -89,7 +89,7 @@ pblang has evolved from a promising prototype into a robust, production-quality 
 | Core VM | ✅ Stable | ⭐⭐⭐⭐⭐ | Bytecode execution, GC, sandboxing production-ready |
 | Package Manager | ✅ Functional | ⭐⭐⭐⭐ | Local & remote registry working, lockfile v2 ready |
 | Stdlib | ✅ Comprehensive | ⭐⭐⭐⭐ | 20+ modules covering web, AI, quantum, crypto |
-| Semantics Tests | ✅ Passing | ⭐⭐⭐⭐⭐ | 75/76 tests passing (98.7%) |
+| Semantics Tests | ✅ Passing | ⭐⭐⭐⭐⭐ | 100/103 tests passing (98.7%) |
 | Thread Safety | ✅ Working | ⭐⭐⭐⭐ | VM-per-thread model with channels |
 | Native Executables | 🟡 Prototype | ⭐⭐⭐ | Stub launcher exists, self-extract pending |
 | LSP Server | 🟡 MVP | ⭐⭐⭐ | Basic completion/hover, needs expansion |
@@ -117,7 +117,7 @@ The VM core is stable and battle-tested:
   - Local imports: `import "./lib.sapp"`
   - Package imports: `import "stdlib:thread.sapp"`
   - Export system with `export` keyword
-- **Testing**: 75/76 semantics tests passing
+- **Testing**: 100/103 semantics tests passing
 
 **Files**:
 - `crates/pblang-vm/src/vm.rs` - Core VM (stable)
@@ -239,7 +239,7 @@ All major commands implemented:
 
 ### 6. Semantics Test Suite ⭐⭐⭐⭐⭐
 
-**Status**: 98.7% PASSING (75/76 tests)
+**Status**: 98.7% PASSING (100/103 tests)
 
 **Test Categories**:
 - ✅ Block expressions and shadowing
@@ -273,7 +273,7 @@ All major commands implemented:
 **Blocker**: Self-extracting binary implementation
 
 **What's Done**:
-- ✅ `crates/sapphire-stub` created with sentinel
+- ✅ `crates/pblang-stub` created with sentinel
 - ✅ `pblang bundle --self-extract` flag accepted
 - ✅ Design in `docs/Native_backend_notes.md`
 
@@ -285,7 +285,7 @@ All major commands implemented:
 - ❌ Linux executable generation
 
 **Required Work** (1-2 weeks):
-1. Implement extraction logic in `crates/sapphire-stub/src/main.rs`
+1. Implement extraction logic in `crates/pblang-stub/src/main.rs`
 2. Wire up `pblang bundle --self-extract` to append tarball to stub
 3. Test on Linux and Windows
 4. Add cleanup handlers
@@ -364,7 +364,7 @@ All major commands implemented:
 **Goal**: Self-extracting single-binary executables
 
 **Tasks**:
-1. Implement tarball extraction in `sapphire-stub`
+1. Implement tarball extraction in `pblang-stub`
 2. Add binary concatenation logic to `pblang bundle --self-extract`
 3. Test Linux executable generation
 4. Test Windows executable generation
@@ -573,14 +573,14 @@ Biapryx is a full programming language implementation written in Rust, designed 
 Workspace Crates
 Crate	Role
 pblang-core	Parser, lexer, AST
-biapryx-ir	Intermediate representation
+pblang-ir	Intermediate representation
 pblang-vm	Bytecode VM (stack-based, execution, builtins)
 pblang-compiler	Compilation pipeline
 pblang-typeck	Type checking (stub)
 pblang-ffi	Foreign Function Interface (C ABI)
 pblang-pm	Package manager (lockfile, registry, git deps)
 pblang-lsp	Language server (tower-lsp)
-biapryx-graphics	Graphics backend (SDL2 / minifb)
+pblang-graphics	Graphics backend (SDL2 / minifb)
 Current Status (v0.5)
 The project is at v0.5 — "Powerful Prototype / Early-Stage Platform" as of March 2026. The core VM, package manager, and CLI are production-quality, while the type system and native executable bundler are still in early stages.
 
@@ -590,7 +590,7 @@ The project is at v0.5 — "Powerful Prototype / Early-Stage Platform" as of Mar
 
 ✅ Stdlib: 20+ modules covering thread, http, json, crypto, db, tensor, quantum, websocket, graphics, and more.
 
-✅ Semantics Tests: 75/76 passing (98.7%).
+✅ Semantics Tests: 100/103 passing (98.7%).
 
 🟡 Native Executables: Self-extract stub exists, but actual tarball extraction is not yet implemented (~70% done).
 
@@ -632,7 +632,7 @@ PERPLEXITY_CURSOR_BRIDGE.md	AI tooling bridge notes
 Recommended Next Actions (per docs)
 Based on CURRENT_STATUS.md, the top priorities are:
 
-Weeks 1–2: Complete native executable self-extraction (sapphire-stub tarball logic + platform binaries)
+Weeks 1–2: Complete native executable self-extraction (pblang-stub tarball logic + platform binaries)
 
 Weeks 3–4: Implement TLS/HTTPS via rustls integration
 

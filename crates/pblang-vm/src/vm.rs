@@ -391,25 +391,20 @@ impl StdlibConfig {
     }
 }
 
-/// FFI policy for sandboxing: allowlist libraries and/or symbols. Forbid by default when set.
-#[derive(Debug, Clone)]
+/// FFI policy for sandboxing: allowlist libraries and/or symbols.
+///
+/// Default is `allow_all: false` — all FFI calls are denied unless explicitly permitted
+/// via `allowed_libs` and `allowed_symbols`. This is the secure default (principle of
+/// least privilege). Set `allow_all: true` only for trusted embedding contexts.
+#[derive(Debug, Clone, Default)]
 pub struct FfiPolicy {
     /// If true, allow any library path and any symbol (no allowlist check).
+    /// Defaults to `false` — secure by default.
     pub allow_all: bool,
     /// Allowed library paths (e.g. "./safe.dll"). Checked on ffi_load when allow_all is false.
     pub allowed_libs: HashSet<String>,
     /// Allowed symbol names (e.g. "add", "multiply"). Checked on ffi_call when allow_all is false.
     pub allowed_symbols: HashSet<String>,
-}
-
-impl Default for FfiPolicy {
-    fn default() -> Self {
-        Self {
-            allow_all: false,  // Secure default: deny all unless explicitly allowed
-            allowed_libs: HashSet::new(),
-            allowed_symbols: HashSet::new(),
-        }
-    }
 }
 
 /// Resource limits for sandboxing (anti-infinite-loop, stack overflow, IO, memory).
@@ -729,35 +724,26 @@ impl VM {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| _host.err("now_iso(): system time before UNIX_EPOCH".into()))?;
             let secs = now.as_secs();
-            // Compute UTC datetime components from Unix timestamp
+            // FIX: Replaced O(years) year-by-year loop with O(1) Gregorian formula.
+            // The old implementation would be slow for timestamps far in the future.
             let s_in_day = secs % 86400;
-            let days = secs / 86400;
             let hours = s_in_day / 3600;
             let minutes = (s_in_day % 3600) / 60;
             let seconds = s_in_day % 60;
-            // Days since epoch (1970-01-01). Simple Gregorian calendar calculation.
-            let mut y = 1970u64;
-            let mut d = days;
-            loop {
-                let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
-                let days_in_year = if leap { 366 } else { 365 };
-                if d < days_in_year { break; }
-                d -= days_in_year;
-                y += 1;
-            }
-            let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
-            let month_days: &[u64] = if leap {
-                &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            } else {
-                &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            };
-            let mut month = 1u64;
-            for &md in month_days {
-                if d < md { break; }
-                d -= md;
-                month += 1;
-            }
-            let day = d + 1;
+
+            // Algorithm: civil_from_days (Howard Hinnant, public domain).
+            // Computes (year, month, day) from a Unix day count in O(1).
+            let z: i64 = (secs / 86400) as i64 + 719468;
+            let era: i64 = if z >= 0 { z } else { z - 146096 } / 146097;
+            let doe = (z - era * 146097) as u64;           // day of era [0, 146096]
+            let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365; // year of era [0, 399]
+            let y = yoe as i64 + era * 400;
+            let doy = doe - (365*yoe + yoe/4 - yoe/100);  // day of year [0, 365]
+            let mp = (5*doy + 2) / 153;                    // month of year [0, 11]
+            let day = doy - (153*mp + 2)/5 + 1;            // day [1, 31]
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if month <= 2 { y + 1 } else { y };
+            let (y, month, day) = (y as u64, month, day);
             let iso = format!(
                 "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
                 y, month, day, hours, minutes, seconds
@@ -983,7 +969,7 @@ impl VM {
             }
             // BUG FIX #15: Strip trailing '\n'/'\r\n' so comparisons like `if input == "yes"` work
             // as expected (same as Python/Ruby readline behavior).
-            let s = s.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+            let s = s.trim_end_matches(['\n', '\r']).to_string();
             Ok(alloc_string(s))
         }
 
@@ -1364,12 +1350,11 @@ impl VM {
             let cmd = args[0]
                 .as_str()
                 .map_err(|m| host.err(format!("exec(): {m}")))?;
-            // Reject strings containing shell metacharacters / whitespace to prevent injection.
-            // Reject strings with shell metacharacters or whitespace (injection prevention)
+            // Reject strings containing shell metacharacters or whitespace (injection prevention):
             let blocked: &[char] = &[';', '&', '|', '$', '`', '>', '<', '!', '{', '}', '(', ')', '\'', '"', '\\', '*', '?', '[', ']', '#', '~'];
             if cmd.chars().any(|c| c.is_whitespace() || blocked.contains(&c)) {
                 return Err(host.err(
-                    "exec(): command contains shell metacharacters or whitespace.                      Use proc_spawn_wait(cmd, args_array) instead to avoid shell injection.".into()
+                    "exec(): command contains shell metacharacters or whitespace — use proc_spawn_wait(cmd, args_array) instead.".into()
                 ));
             }
             let status = std::process::Command::new(cmd)

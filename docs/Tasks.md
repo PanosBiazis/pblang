@@ -9,7 +9,7 @@ steps, stable core.
 **Current priority order:**
 TLS/HTTPS → E5 Executables → Match Guard Fix → LSP → Cranelift JIT → Registry → RE → Spec → Editor → Framework/OS
 
-**Current status**: 83/84 semantics tests passing (1 known parser limitation: match guard separator)
+**Current status**: 100/103 semantics tests passing (1 known parser limitation: match guard separator)
 
 ---
 
