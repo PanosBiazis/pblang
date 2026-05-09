@@ -34,10 +34,13 @@ static MODULE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 // (e.g. `let a=[]; a[0]=a;`). To address this without rewriting the runtime,
 // we keep weak registries of container objects and run a tracing pass from VM
 // roots, then *clear* unreachable containers to break cycles.
+type GcArrayRegistry = HashMap<usize, Weak<RefCell<Vec<Value>>>>;
+type GcMapRegistry = HashMap<usize, Weak<RefCell<HashMap<String, Value>>>>;
+type GcModuleRegistry = HashMap<usize, Weak<RefCell<Module>>>;
 thread_local! {
-    static GC_ARRAYS: RefCell<HashMap<usize, Weak<RefCell<Vec<Value>>>>> = RefCell::new(HashMap::new());
-    static GC_MAPS: RefCell<HashMap<usize, Weak<RefCell<HashMap<String, Value>>>>> = RefCell::new(HashMap::new());
-    static GC_MODULES: RefCell<HashMap<usize, Weak<RefCell<Module>>>> = RefCell::new(HashMap::new());
+    static GC_ARRAYS: RefCell<GcArrayRegistry> = RefCell::new(HashMap::new());
+    static GC_MAPS: RefCell<GcMapRegistry> = RefCell::new(HashMap::new());
+    static GC_MODULES: RefCell<GcModuleRegistry> = RefCell::new(HashMap::new());
 }
 
 fn gc_register_array(a: &Rc<RefCell<Vec<Value>>>) {
@@ -120,11 +123,12 @@ fn db_table() -> &'static Mutex<HashMap<usize, DbResource>> {
 
 // Spawn/join: handle table and next id for VM-per-thread spawn.
 // We send Result<String, String>: Ok = JSON of return Value (Value is !Send), Err = error message.
-static SPAWN_TABLE: OnceLock<Mutex<HashMap<usize, mpsc::Receiver<Result<String, String>>>>> =
+type SpawnReceiver = mpsc::Receiver<Result<String, String>>;
+static SPAWN_TABLE: OnceLock<Mutex<HashMap<usize, SpawnReceiver>>> =
     OnceLock::new();
 static SPAWN_NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
-fn spawn_table() -> &'static Mutex<HashMap<usize, mpsc::Receiver<Result<String, String>>>> {
+fn spawn_table() -> &'static Mutex<HashMap<usize, SpawnReceiver>> {
     SPAWN_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -133,6 +137,12 @@ fn spawn_table() -> &'static Mutex<HashMap<usize, mpsc::Receiver<Result<String, 
 struct ChanBuf {
     buf: Arc<Mutex<std::collections::VecDeque<String>>>,
     closed: Arc<AtomicBool>,
+    /// 0 = unbounded; >0 = bounded (Go-style buffered channel).
+    capacity: usize,
+    /// Condvar to wake blocked senders when buffer has space.
+    space_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
+    /// Condvar to wake blocked receivers when buffer has items.
+    item_cv:  Arc<(Mutex<()>, std::sync::Condvar)>,
 }
 
 static CHAN_TABLE: OnceLock<Mutex<HashMap<usize, ChanBuf>>> = OnceLock::new();
@@ -140,6 +150,65 @@ static CHAN_NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn chan_table() -> &'static Mutex<HashMap<usize, ChanBuf>> {
     CHAN_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---- Mutex (sync.Mutex equivalent, like Go/Java/Rust Mutex) ----
+struct VmMutex {
+    locked: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+static MUTEX_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmMutex>>>> = OnceLock::new();
+static MUTEX_NEXT: AtomicUsize = AtomicUsize::new(1);
+fn mutex_table() -> &'static Mutex<HashMap<usize, Arc<VmMutex>>> {
+    MUTEX_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---- RwLock (sync.RWMutex / Rust RwLock) ----
+struct VmRwLock {
+    /// readers < 0 means write-locked (-1), readers >= 0 = reader count
+    state: Mutex<i64>,
+    cv: std::sync::Condvar,
+}
+static RWLOCK_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmRwLock>>>> = OnceLock::new();
+static RWLOCK_NEXT: AtomicUsize = AtomicUsize::new(1);
+fn rwlock_table() -> &'static Mutex<HashMap<usize, Arc<VmRwLock>>> {
+    RWLOCK_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---- Barrier (sync.WaitGroup / CyclicBarrier in Java) ----
+struct VmBarrier {
+    n: usize,
+    arrived: Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+static BARRIER_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmBarrier>>>> = OnceLock::new();
+static BARRIER_NEXT: AtomicUsize = AtomicUsize::new(1);
+fn barrier_table() -> &'static Mutex<HashMap<usize, Arc<VmBarrier>>> {
+    BARRIER_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---- Once (sync.Once in Go / Kotlin by-lazy) ----
+struct VmOnce {
+    done: AtomicBool,
+    /// Reserved for future thread-safe once_do implementation.
+    #[allow(dead_code)] running: Mutex<bool>,
+    #[allow(dead_code)] cv: std::sync::Condvar,
+}
+static ONCE_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmOnce>>>> = OnceLock::new();
+static ONCE_NEXT: AtomicUsize = AtomicUsize::new(1);
+fn once_table() -> &'static Mutex<HashMap<usize, Arc<VmOnce>>> {
+    ONCE_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ---- Atomic i64 (AtomicInteger in Java / atomic.Int64 in Go / Rust AtomicI64) ----
+use std::sync::atomic::AtomicI64;
+struct VmAtomic {
+    val: AtomicI64,
+}
+static ATOMIC_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmAtomic>>>> = OnceLock::new();
+static ATOMIC_NEXT: AtomicUsize = AtomicUsize::new(1);
+fn atomic_table() -> &'static Mutex<HashMap<usize, Arc<VmAtomic>>> {
+    ATOMIC_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Serialize a Value to JSON for sending to a spawn child (transferable types only).
@@ -286,11 +355,15 @@ impl Default for StdlibConfig {
 
 impl StdlibConfig {
     /// Returns true if the builtin with this name is in an enabled category.
-    /// Used for optional "strict" registration (only expose allowed builtins); currently we register all and check at call time.
-    #[allow(dead_code)]
-    fn allows(&self, name: &str) -> bool {
+    ///
+    /// AUDIT FIX #14: Previously this method was dead code (never called) while all
+    /// builtins were unconditionally registered, making them visible as globals even
+    /// when a capability was disabled. `install_builtins_into()` now calls this to
+    /// skip registration of builtins whose category is disabled, so disabled builtins
+    /// are invisible (not just call-time-denied).
+    pub fn allows(&self, name: &str) -> bool {
         match name {
-            "clock" | "type" | "str" | "num_sqrt" | "num_pow" | "num_ln" | "num_exp"
+            "clock" | "now_ms" | "now_iso" | "type" | "str" | "num_sqrt" | "num_pow" | "num_ln" | "num_exp"
             | "num_atan2" | "num_mod" | "num_floor" | "num_ceil" | "parse_number"
             | "parse_bool" | "read_line" | "len" | "array_push" | "array_pop" | "map_keys"
             | "map_has" | "map_remove" | "import" | "gc_stats" | "gc_collect" | "str_contains"
@@ -298,10 +371,9 @@ impl StdlibConfig {
             "fs_read" | "fs_write" | "fs_append" | "fs_remove" | "fs_rename" | "fs_copy"
             | "fs_read_bytes" | "fs_write_bytes" | "fs_exists" | "fs_mkdirs" | "fs_listdir"
             | "path_join" | "path_dirname" | "path_basename" | "cwd" => self.fs,
-            "env_get" | "env_set" | "sleep_ms" | "exec" => self.exec,
-            "sha256" | "random_bytes" | "constant_time_eq" | "base64_encode" | "base64_decode" => {
-                self.crypto
-            }
+            "env_get" | "env_set" | "sleep_ms" | "exec" | "proc_spawn_wait" => self.exec,
+            "sha256" | "random_bytes" | "random_float" | "constant_time_eq" | "base64_encode"
+            | "base64_decode" => self.crypto,
             "json_parse" | "json_stringify" => self.json,
             "http_get" | "http_post" => self.http,
             "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_until" | "tcp_write"
@@ -333,7 +405,7 @@ pub struct FfiPolicy {
 impl Default for FfiPolicy {
     fn default() -> Self {
         Self {
-            allow_all: true,
+            allow_all: false,  // Secure default: deny all unless explicitly allowed
             allowed_libs: HashSet::new(),
             allowed_symbols: HashSet::new(),
         }
@@ -342,6 +414,7 @@ impl Default for FfiPolicy {
 
 /// Resource limits for sandboxing (anti-infinite-loop, stack overflow, IO, memory).
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct VmLimits {
     /// Max VM instructions per run. Prevents infinite loops.
     pub max_instructions: Option<u64>,
@@ -353,16 +426,6 @@ pub struct VmLimits {
     pub io_timeout_ms: Option<u64>,
 }
 
-impl Default for VmLimits {
-    fn default() -> Self {
-        Self {
-            max_instructions: None,
-            max_stack_depth: None,
-            max_memory_bytes: None,
-            io_timeout_ms: None,
-        }
-    }
-}
 
 pub struct VM {
     stack: Vec<Value>,
@@ -645,6 +708,96 @@ impl VM {
             Ok(Value::Number(now.as_secs_f64()))
         }
 
+
+        fn now_ms(_host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !args.is_empty() {
+                return Err(_host.err("now_ms() takes no arguments".into()));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| _host.err("now_ms(): system time before UNIX_EPOCH".into()))?;
+            // BUG FIX #16: as_millis() returns u128; casting to f64 loses precision
+            // beyond 2^53 ms (~year 2255). Use secs_f64 * 1000 for lossless conversion.
+            Ok(Value::Number(now.as_secs_f64() * 1000.0))
+        }
+
+        fn now_iso(_host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !args.is_empty() {
+                return Err(_host.err("now_iso() takes no arguments".into()));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| _host.err("now_iso(): system time before UNIX_EPOCH".into()))?;
+            let secs = now.as_secs();
+            // Compute UTC datetime components from Unix timestamp
+            let s_in_day = secs % 86400;
+            let days = secs / 86400;
+            let hours = s_in_day / 3600;
+            let minutes = (s_in_day % 3600) / 60;
+            let seconds = s_in_day % 60;
+            // Days since epoch (1970-01-01). Simple Gregorian calendar calculation.
+            let mut y = 1970u64;
+            let mut d = days;
+            loop {
+                let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+                let days_in_year = if leap { 366 } else { 365 };
+                if d < days_in_year { break; }
+                d -= days_in_year;
+                y += 1;
+            }
+            let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+            let month_days: &[u64] = if leap {
+                &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            } else {
+                &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            };
+            let mut month = 1u64;
+            for &md in month_days {
+                if d < md { break; }
+                d -= md;
+                month += 1;
+            }
+            let day = d + 1;
+            let iso = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                y, month, day, hours, minutes, seconds
+            );
+            Ok(alloc_string(iso))
+        }
+
+        fn proc_spawn_wait(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_exec() {
+                return Err(host.err("proc_spawn_wait access denied".into()));
+            }
+            if args.len() != 2 {
+                return Err(host.err(format!("proc_spawn_wait() expects 2 arguments (cmd, args), got {}", args.len())));
+            }
+            let cmd = args[0].as_str().map_err(|m| host.err(format!("proc_spawn_wait(): {m}")))?;
+            let argv = match &args[1] {
+                Value::Array(arr) => {
+                    let mut v: Vec<String> = Vec::new();
+                    for item in arr.borrow().iter() {
+                        let s = item.as_str().map_err(|m| host.err(format!("proc_spawn_wait(): arg: {m}")))?;
+                        v.push(s.to_string());
+                    }
+                    v
+                }
+                _ => return Err(host.err("proc_spawn_wait(): second argument must be an array".into())),
+            };
+            let output = std::process::Command::new(cmd)
+                .args(&argv)
+                .output()
+                .map_err(|e| host.err(format!("proc_spawn_wait(): {e}")))?;
+            let exit_code = output.status.code().unwrap_or(1) as f64;
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let mut m = std::collections::HashMap::new();
+            m.insert("exit_code".to_string(), Value::Number(exit_code));
+            m.insert("stdout".to_string(), alloc_string(stdout));
+            m.insert("stderr".to_string(), alloc_string(stderr));
+            Ok(alloc_map(m))
+        }
+
         fn type_of(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if args.len() != 1 {
                 return Err(host.err(format!("type() expects 1 argument, got {}", args.len())));
@@ -828,6 +981,9 @@ impl VM {
             if n == 0 {
                 return Ok(Value::Nil);
             }
+            // BUG FIX #15: Strip trailing '\n'/'\r\n' so comparisons like `if input == "yes"` work
+            // as expected (same as Python/Ruby readline behavior).
+            let s = s.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
             Ok(alloc_string(s))
         }
 
@@ -889,7 +1045,7 @@ impl VM {
                 .keys()
                 .map(|k| alloc_string(k.clone()))
                 .collect::<Vec<_>>();
-            keys.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            keys.sort_by_key(|a| a.to_string());
             Ok(alloc_array(keys))
         }
 
@@ -1165,21 +1321,17 @@ impl VM {
             }
         }
 
-        fn env_set(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn env_set(host: &mut dyn VmHost, _args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !host.allow_exec() {
                 return Err(host.err("exec/env access denied".into()));
             }
-            if args.len() != 2 {
-                return Err(host.err(format!("env_set() expects 2 arguments, got {}", args.len())));
-            }
-            let k = args[0]
-                .as_str()
-                .map_err(|m| host.err(format!("env_set(): {m}")))?;
-            let v = args[1]
-                .as_str()
-                .map_err(|m| host.err(format!("env_set(): {m}")))?;
-            std::env::set_var(k, v);
-            Ok(Value::Nil)
+            // SECURITY: std::env::set_var is unsound in multi-threaded programs (undefined
+            // behaviour when called concurrently with env reads on Linux). Since pblang
+            // supports VM-per-thread spawning, this builtin is permanently disabled.
+            // Use os.sapp's env utilities or pass values via channel arguments instead.
+            Err(host.err(
+                "env_set() is disabled: mutating the process environment is not thread-safe.                  Pass values via channel arguments or use per-VM state.".into()
+            ))
         }
 
         fn sleep_ms(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -1201,20 +1353,28 @@ impl VM {
             if !host.allow_exec() {
                 return Err(host.err("exec access denied".into()));
             }
+            // SECURITY: exec(cmd_string) was vulnerable to shell injection because
+            // the entire string was passed to `sh -c`. It is now deprecated in favour
+            // of proc_spawn_wait(cmd, [args...]) which separates command from arguments.
+            // Passing a single-token command (no spaces, no shell metacharacters) is
+            // still allowed for backward compatibility, but any whitespace causes an error.
             if args.len() != 1 {
                 return Err(host.err(format!("exec() expects 1 argument, got {}", args.len())));
             }
             let cmd = args[0]
                 .as_str()
                 .map_err(|m| host.err(format!("exec(): {m}")))?;
-
-            #[cfg(windows)]
-            let status = std::process::Command::new("cmd").args(["/C", cmd]).status();
-
-            #[cfg(not(windows))]
-            let status = std::process::Command::new("sh").args(["-c", cmd]).status();
-
-            let status = status.map_err(|e| host.err(format!("exec(): {e}")))?;
+            // Reject strings containing shell metacharacters / whitespace to prevent injection.
+            // Reject strings with shell metacharacters or whitespace (injection prevention)
+            let blocked: &[char] = &[';', '&', '|', '$', '`', '>', '<', '!', '{', '}', '(', ')', '\'', '"', '\\', '*', '?', '[', ']', '#', '~'];
+            if cmd.chars().any(|c| c.is_whitespace() || blocked.contains(&c)) {
+                return Err(host.err(
+                    "exec(): command contains shell metacharacters or whitespace.                      Use proc_spawn_wait(cmd, args_array) instead to avoid shell injection.".into()
+                ));
+            }
+            let status = std::process::Command::new(cmd)
+                .status()
+                .map_err(|e| host.err(format!("exec(): {e}")))?;
             Ok(Value::Number(status.code().unwrap_or(1) as f64))
         }
 
@@ -1241,6 +1401,212 @@ impl VM {
             )))
         }
 
+        // ---- Safety builtins ----
+
+        /// assert(cond) or assert(cond, msg) — Rust-style debug assertion.
+        /// Throws RuntimeError if cond is falsy.
+        fn assert_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.is_empty() {
+                return Err(host.err("assert() requires at least 1 argument".into()));
+            }
+            let cond = &args[0];
+            if !VM::is_truthy(cond) {
+                let msg = if args.len() >= 2 {
+                    args[1].to_string()
+                } else {
+                    "assertion failed".to_string()
+                };
+                return Err(host.err(format!("AssertionError: {msg}")));
+            }
+            Ok(Value::Nil)
+        }
+
+        /// type_assert(value, type_str) — assert that value has the expected type.
+        /// type_str: "number", "string", "bool", "nil", "array", "map", "closure", "fn".
+        fn type_assert_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("type_assert(value, type_str) requires 2 arguments".into()));
+            }
+            let expected = args[1].as_str().map_err(|_| host.err("type_assert: second argument must be a string".to_string()))?;
+            // BUG FIX #13: Must match type_of() exactly so type_assert(f, "fn") works.
+            let actual = match &args[0] {
+                Value::Number(_)  => "number",
+                Value::Bool(_)    => "bool",
+                Value::Nil        => "nil",
+                Value::Obj(o)     => match o.as_ref() { pblang_ir::Obj::String(_) => "string" },
+                Value::Array(_)   => "array",
+                Value::Map(_)     => "map",
+                Value::Function(_) => "fn",        // matches type_of() → "fn"
+                Value::Closure(_)  => "closure",   // matches type_of() → "closure"
+                Value::Builtin(_)  => "builtin",
+                Value::Module(_)   => "module",
+            };
+            if actual != expected {
+                return Err(host.err(format!(
+                    "TypeError: expected {expected}, got {actual}"
+                )));
+            }
+            Ok(Value::Nil)
+        }
+
+        /// freeze(val) — mark a map/array as frozen (immutable).
+        /// Returns the value with __frozen: true inserted.
+        /// Frozen maps reject attribute assignment at runtime.
+        fn freeze_builtin(_host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(_host.err("freeze(val) takes 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Map(m) => {
+                    m.borrow_mut().insert("__frozen".to_string(), Value::Bool(true));
+                    Ok(args.into_iter().next().unwrap())
+                }
+                _ => Ok(args.into_iter().next().unwrap()), // non-maps pass through
+            }
+        }
+
+        /// is_frozen(val) — returns true if val has __frozen: true.
+        fn is_frozen_builtin(_host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(_host.err("is_frozen(val) takes 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Map(m) => {
+                    let frozen = m.borrow().get("__frozen").cloned();
+                    Ok(Value::Bool(matches!(frozen, Some(Value::Bool(true)))))
+                }
+                _ => Ok(Value::Bool(false)),
+            }
+        }
+
+        /// checked_add(a, b) — add two numbers; returns Err result map if overflow.
+        fn checked_add_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("checked_add(a, b) takes 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(a), Value::Number(b)) => {
+                    let result = a + b;
+                    if result.is_infinite() && a.is_finite() && b.is_finite() {
+                        Ok(alloc_map({
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("ok".to_string(), Value::Bool(false));
+                            m.insert("error".to_string(), alloc_string("arithmetic overflow in checked_add"));
+                            m
+                        }))
+                    } else {
+                        Ok(alloc_map({
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("ok".to_string(), Value::Bool(true));
+                            m.insert("value".to_string(), Value::Number(result));
+                            m
+                        }))
+                    }
+                }
+                _ => Err(host.err("checked_add: both arguments must be numbers".into())),
+            }
+        }
+
+        fn checked_sub_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("checked_sub(a, b) takes 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(a), Value::Number(b)) => Ok(alloc_map({
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("ok".to_string(), Value::Bool(true));
+                    m.insert("value".to_string(), Value::Number(a - b));
+                    m
+                })),
+                _ => Err(host.err("checked_sub: both arguments must be numbers".into())),
+            }
+        }
+
+        fn checked_mul_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("checked_mul(a, b) takes 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(a), Value::Number(b)) => {
+                    let result = a * b;
+                    if result.is_infinite() && a.is_finite() && b.is_finite() {
+                        Ok(alloc_map({
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("ok".to_string(), Value::Bool(false));
+                            m.insert("error".to_string(), alloc_string("arithmetic overflow in checked_mul"));
+                            m
+                        }))
+                    } else {
+                        Ok(alloc_map({
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("ok".to_string(), Value::Bool(true));
+                            m.insert("value".to_string(), Value::Number(result));
+                            m
+                        }))
+                    }
+                }
+                _ => Err(host.err("checked_mul: both arguments must be numbers".into())),
+            }
+        }
+
+        fn checked_div_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("checked_div(a, b) takes 2 arguments".into()));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(a), Value::Number(b)) => {
+                    if *b == 0.0 {
+                        Ok(alloc_map({
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("ok".to_string(), Value::Bool(false));
+                            m.insert("error".to_string(), alloc_string("division by zero in checked_div"));
+                            m
+                        }))
+                    } else {
+                        Ok(alloc_map({
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("ok".to_string(), Value::Bool(true));
+                            m.insert("value".to_string(), Value::Number(a / b));
+                            m
+                        }))
+                    }
+                }
+                _ => Err(host.err("checked_div: both arguments must be numbers".into())),
+            }
+        }
+
+        /// is_nil(val) — returns true if val is nil (functional form of `val == nil`).
+        fn is_nil_builtin(_host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(matches!(args.first(), Some(Value::Nil) | None)))
+        }
+
+        /// require_type(val, type_str) — like type_assert but returns the value on success.
+        fn require_type_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("require_type(val, type_str) requires 2 arguments".into()));
+            }
+            let expected = args[1].as_str().map_err(|_| host.err("require_type: second argument must be a string".to_string()))?;
+            // BUG FIX #13: Must match type_of() exactly so type_assert(f, "fn") works.
+            let actual = match &args[0] {
+                Value::Number(_)  => "number",
+                Value::Bool(_)    => "bool",
+                Value::Nil        => "nil",
+                Value::Obj(o)     => match o.as_ref() { pblang_ir::Obj::String(_) => "string" },
+                Value::Array(_)   => "array",
+                Value::Map(_)     => "map",
+                Value::Function(_) => "fn",        // matches type_of() → "fn"
+                Value::Closure(_)  => "closure",   // matches type_of() → "closure"
+                Value::Builtin(_)  => "builtin",
+                Value::Module(_)   => "module",
+            };
+            if actual != expected {
+                return Err(host.err(format!(
+                    "TypeError: require_type expected {expected}, got {actual}"
+                )));
+            }
+            Ok(args.into_iter().next().unwrap())
+        }
+
         fn gc_collect(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !args.is_empty() {
                 return Err(host.err(format!(
@@ -1249,29 +1615,16 @@ impl VM {
                 )));
             }
 
-            // Force-close native handle tables (tcp/ffi/sqlite) by dropping all entries,
-            // then run a tracing / cycle collection pass to break RC cycles in containers.
-            let net_closed = with_net_table(host, |t| {
-                let n = t.len();
-                t.clear();
-                n
-            })?;
-            let ffi_closed = with_ffi_table(host, |t| {
-                let n = t.len();
-                t.clear();
-                n
-            })?;
-            let db_closed = with_db_table(host, |t| {
-                let n = t.len();
-                t.clear();
-                n
-            })?;
-
+            // BUG FIX #4: Previously this function forcefully cleared ALL open TCP/FFI/SQLite
+            // handles, destroying any live connections. GC should only collect *unreachable*
+            // resources. Native handle tables are intentionally NOT cleared here — their
+            // entries are ref-counted by user-held handle numbers. Only the cycle-breaker
+            // pass runs, which traces from GC roots and clears unreachable RC containers.
             let (arrays_cleared, maps_cleared, modules_cleared) = host.gc_collect_cycles();
 
             Ok(alloc_string(format!(
-                "gc_collect: closed net={} ffi={} db={} cycles arrays={} maps={} modules={}",
-                net_closed, ffi_closed, db_closed, arrays_cleared, maps_cleared, modules_cleared
+                "gc_collect: cycles arrays={} maps={} modules={}",
+                arrays_cleared, maps_cleared, modules_cleared
             )))
         }
 
@@ -1301,6 +1654,20 @@ impl VM {
             let bytes: Vec<u8> = (0..n).map(|_| rng.gen()).collect();
             let arr = alloc_array(bytes.into_iter().map(|b| Value::Number(b as f64)).collect());
             Ok(arr)
+        }
+
+        fn random_float_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if !args.is_empty() {
+                return Err(host.err(format!(
+                    "random_float() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let mut rng = rand::thread_rng();
+            Ok(Value::Number(rng.gen::<f64>()))
         }
 
         fn constant_time_eq(
@@ -1361,6 +1728,24 @@ impl VM {
             let s = String::from_utf8(bytes)
                 .map_err(|e| host.err(format!("base64_decode(): invalid UTF-8: {e}")))?;
             Ok(alloc_string(s))
+        }
+
+        /// base64_decode_bytes(s) → array<number 0-255>
+        /// BUG FIX #22: base64_decode() fails on binary data; this variant returns raw bytes.
+        fn base64_decode_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "base64_decode_bytes() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("base64_decode_bytes(): {m}")))?;
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
+                .map_err(|e| host.err(format!("base64_decode_bytes(): {e}")))?;
+            let arr = alloc_array(bytes.into_iter().map(|b| Value::Number(b as f64)).collect());
+            Ok(arr)
         }
 
         fn json_to_value(v: &sj::Value) -> Value {
@@ -1472,13 +1857,17 @@ impl VM {
             Ok(alloc_string(body))
         }
 
+        /// http_post(url, body) or http_post(url, body, content_type)
+        /// BUG FIX #23: No longer hardcodes Content-Type: application/json.
+        /// If 3rd argument (content_type) is omitted, defaults to application/json
+        /// for backward compatibility. Pass e.g. "text/plain" for non-JSON bodies.
         fn http_post(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !host.allow_http() {
                 return Err(host.err("http access denied".into()));
             }
-            if args.len() != 2 {
+            if args.len() < 2 || args.len() > 3 {
                 return Err(host.err(format!(
-                    "http_post() expects 2 arguments, got {}",
+                    "http_post() expects 2 or 3 arguments (url, body[, content_type]), got {}",
                     args.len()
                 )));
             }
@@ -1488,7 +1877,12 @@ impl VM {
             let body = args[1]
                 .as_str()
                 .map_err(|m| host.err(format!("http_post(): {m}")))?;
-            let req = ureq::post(url).set("content-type", "application/json");
+            let ct = if args.len() == 3 {
+                args[2].as_str().map_err(|m| host.err(format!("http_post(): {m}")))?.to_string()
+            } else {
+                "application/json".to_string()
+            };
+            let req = ureq::post(url).set("content-type", &ct);
             let req = if let Some(ms) = host.io_timeout_ms() {
                 req.timeout(Duration::from_millis(ms))
             } else {
@@ -1639,7 +2033,7 @@ impl VM {
                 names.push(alloc_string(name));
             }
             // stable order for deterministic programs/tests
-            names.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            names.sort_by_key(|a| a.to_string());
             Ok(alloc_array(names))
         }
 
@@ -2029,7 +2423,7 @@ impl VM {
             };
             let resp = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.as_bytes().len(),
+                body.len(),
                 body
             );
             Ok(alloc_string(resp))
@@ -2067,7 +2461,7 @@ impl VM {
             };
             let resp = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.as_bytes().len(),
+                body.len(),
                 body
             );
             Ok(alloc_string(resp))
@@ -2103,7 +2497,7 @@ impl VM {
             };
             let resp = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.as_bytes().len(),
+                body.len(),
                 body
             );
             Ok(alloc_string(resp))
@@ -2375,9 +2769,17 @@ impl VM {
 
             let changed = match with_db_table(host, |t| t.remove(&id))? {
                 Some(DbResource::Sqlite(conn)) => {
-                    let out = conn
-                        .execute(sql, rusqlite::params_from_iter(tosql.iter()))
-                        .map_err(|e| host.err(format!("sqlite_exec(): {e}")))?;
+                    let out = if tosql.is_empty() {
+                        // Use execute_batch so multi-statement SQL (e.g. migration scripts
+                        // like "CREATE TABLE t(...); INSERT INTO t VALUES (1);") runs fully.
+                        // execute_batch does not return a row count, so we report 0.
+                        conn.execute_batch(sql)
+                            .map_err(|e| host.err(format!("sqlite_exec(): {e}")))?;
+                        0usize
+                    } else {
+                        conn.execute(sql, rusqlite::params_from_iter(tosql.iter()))
+                            .map_err(|e| host.err(format!("sqlite_exec(): {e}")))?
+                    };
                     let _ = with_db_table(host, |t| t.insert(id, DbResource::Sqlite(conn)));
                     out
                 }
@@ -2478,8 +2880,8 @@ impl VM {
                             .map_err(|e| host.err(format!("sqlite_query(): {e}")))?
                         {
                             let mut m = HashMap::<String, Value>::new();
-                            for i in 0..col_count {
-                                let name = col_names[i].clone();
+                            for (i, name) in col_names.iter().enumerate() {
+                                let name = name.clone();
                                 let v: rusqlite::types::Value = row
                                     .get(i)
                                     .map_err(|e| host.err(format!("sqlite_query(): {e}")))?;
@@ -2558,9 +2960,7 @@ impl VM {
                 let val = match &*uv.borrow() {
                     Upvalue::Closed(v) => v.clone(),
                     Upvalue::Open(_) => {
-                        return Err(
-                            host.err("spawn: open upvalue cannot be transferred".into()),
-                        )
+                        return Err(host.err("spawn: open upvalue cannot be transferred".into()))
                     }
                 };
                 upvalues_json.push(spawn_value_to_json(&val).map_err(|e| host.err(e))?);
@@ -2618,9 +3018,7 @@ impl VM {
                         Ok(arr) => arr
                             .iter()
                             .map(|j| {
-                                Rc::new(RefCell::new(Upvalue::Closed(
-                                    spawn_value_from_json(j),
-                                )))
+                                Rc::new(RefCell::new(Upvalue::Closed(spawn_value_from_json(j))))
                             })
                             .collect(),
                         Err(e) => {
@@ -2630,13 +3028,6 @@ impl VM {
                     },
                     module,
                 });
-                let wrapper = Chunk {
-                    instructions: vec![OpCode::OpConstant(0), OpCode::OpCall(0), OpCode::OpReturn],
-                    constants: vec![Value::Closure(child_closure)],
-                    spans: vec![Span::default(), Span::default(), Span::default()],
-                    source_name: None,
-                    source: None,
-                };
                 let mut vm = VM::with_stdlib(config);
                 if let Some(lim) = spawn_limits {
                     vm.set_limits(Some(VmLimits {
@@ -2646,6 +3037,19 @@ impl VM {
                         io_timeout_ms: lim.io_timeout_ms,
                     }));
                 }
+                // Connect the child closure's module to the VM's builtins
+                // so that builtin globals (recv, send, etc.) are accessible.
+                {
+                    let builtins_parent = vm.module.borrow().parent.clone();
+                    child_closure.module.borrow_mut().parent = builtins_parent;
+                }
+                let wrapper = Chunk {
+                    instructions: vec![OpCode::OpConstant(0), OpCode::OpCall(0), OpCode::OpReturn],
+                    constants: vec![Value::Closure(child_closure)],
+                    spans: vec![Span::default(), Span::default(), Span::default()],
+                    source_name: None,
+                    source: None,
+                };
                 let result = match vm.run_return_value(wrapper) {
                     Ok(v) => spawn_value_to_json(&v)
                         .and_then(|j| sj::to_string(&j).map_err(|e| e.to_string())),
@@ -2691,6 +3095,9 @@ impl VM {
             let cb = ChanBuf {
                 buf: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 closed: Arc::new(AtomicBool::new(false)),
+                capacity: 0, // unbounded
+                space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
             };
             chan_table()
                 .lock()
@@ -2702,15 +3109,41 @@ impl VM {
             Ok(alloc_map(m))
         }
 
+        /// channel_buffered(capacity) — Go-style buffered channel.
+        /// Sends don't block until the buffer is full; recv blocks when empty.
+        fn channel_buffered_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let capacity = match args.first() {
+                Some(Value::Number(n)) if *n >= 1.0 => *n as usize,
+                _ => return Err(host.err("channel_buffered(capacity): expected positive integer capacity".into())),
+            };
+            let id = CHAN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
+            let cb = ChanBuf {
+                buf: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(capacity))),
+                closed: Arc::new(AtomicBool::new(false)),
+                capacity,
+                space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+            };
+            chan_table()
+                .lock()
+                .map_err(|_| host.err("channel_buffered: table unavailable".into()))?
+                .insert(id, cb);
+            let mut m = HashMap::new();
+            m.insert("sender".into(), Value::Number(id as f64));
+            m.insert("receiver".into(), Value::Number(id as f64));
+            m.insert("capacity".into(), Value::Number(capacity as f64));
+            Ok(alloc_map(m))
+        }
+
         fn channel_send_builtin(
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
             if args.len() != 2 {
-                return Err(host.err(format!(
-                    "send() expects 2 arguments, got {}",
-                    args.len()
-                )));
+                return Err(host.err(format!("send() expects 2 arguments, got {}", args.len())));
             }
             let id = value_to_handle(host, args[0].clone(), "send")?;
             let json = spawn_value_to_json(&args[1]).map_err(|e| host.err(e))?;
@@ -2726,10 +3159,36 @@ impl VM {
             if cb.closed.load(Ordering::SeqCst) {
                 return Err(host.err("send: channel is closed".into()));
             }
+            // For bounded channels: block until there is space
+            if cb.capacity > 0 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    {
+                        let buf_len = cb.buf.lock()
+                            .map_err(|_| host.err("send: buf lock unavailable".into()))?
+                            .len();
+                        if buf_len < cb.capacity {
+                            break; // space available
+                        }
+                    }
+                    if cb.closed.load(Ordering::SeqCst) {
+                        return Err(host.err("send: channel closed while waiting for space".into()));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(host.err("send: timeout waiting for channel space".into()));
+                    }
+                    // Wait for space signal with 5ms sleep (condvar across threads is tricky here)
+                    let (lock, cv) = cb.space_cv.as_ref();
+                    let guard = lock.lock().map_err(|_| host.err("send: condvar lock".into()))?;
+                    let _ = cv.wait_timeout(guard, Duration::from_millis(5));
+                }
+            }
             cb.buf
                 .lock()
                 .map_err(|_| host.err("send: buf lock unavailable".into()))?
                 .push_back(json_str);
+            // Notify waiting receivers
+            cb.item_cv.1.notify_all();
             Ok(Value::Nil)
         }
 
@@ -2737,11 +3196,32 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "recv() expects 1 argument, got {}",
-                    args.len()
-                )));
+            channel_recv_impl(host, args, 30_000)
+        }
+
+        /// recv_timeout(receiver, timeout_ms) — recv with explicit timeout.
+        /// Returns nil if the channel closed OR timed out; use channel_is_closed() to distinguish.
+        fn channel_recv_timeout_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("recv_timeout(receiver, ms) expects 2 arguments".into()));
+            }
+            let ms = match args[1] {
+                Value::Number(n) if n >= 0.0 => n as u64,
+                _ => return Err(host.err("recv_timeout: timeout_ms must be a non-negative number".into())),
+            };
+            channel_recv_impl(host, vec![args[0].clone()], ms)
+        }
+
+        fn channel_recv_impl(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+            timeout_ms: u64,
+        ) -> Result<Value, RuntimeError> {
+            if args.is_empty() {
+                return Err(host.err("recv() expects 1 argument, got 0".into()));
             }
             let id = value_to_handle(host, args[0].clone(), "recv")?;
             let cb = {
@@ -2752,26 +3232,30 @@ impl VM {
                     .cloned()
                     .ok_or_else(|| host.err("recv: invalid channel id".into()))?
             };
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
             loop {
+                // Try to dequeue
                 {
-                    let mut buf = cb
-                        .buf
-                        .lock()
+                    let mut buf = cb.buf.lock()
                         .map_err(|_| host.err("recv: buf lock unavailable".into()))?;
                     if let Some(json_str) = buf.pop_front() {
+                        // Notify blocked senders that space is available
+                        cb.space_cv.1.notify_all();
                         let j: sj::Value =
                             sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
                         return Ok(spawn_value_from_json(&j));
                     }
                 }
                 if cb.closed.load(Ordering::SeqCst) {
-                    return Ok(Value::Nil);
+                    return Ok(Value::Nil); // channel closed + empty
                 }
                 if std::time::Instant::now() >= deadline {
-                    return Err(host.err("recv: timeout".into()));
+                    return Ok(Value::Nil); // timeout
                 }
-                thread::sleep(Duration::from_millis(1));
+                // Sleep briefly then retry (condvar across threads requires Arc<Condvar>)
+                let (lock, cv) = cb.item_cv.as_ref();
+                let guard = lock.lock().map_err(|_| host.err("recv: condvar lock".into()))?;
+                let _ = cv.wait_timeout(guard, Duration::from_millis(1));
             }
         }
 
@@ -2795,6 +3279,10 @@ impl VM {
                     .ok_or_else(|| host.err("channel_close: invalid channel id".into()))?
             };
             cb.closed.store(true, Ordering::SeqCst);
+            // Wake all blocked receivers so they can return nil
+            cb.item_cv.1.notify_all();
+            // Wake all blocked senders so they can error out
+            cb.space_cv.1.notify_all();
             Ok(Value::Nil)
         }
 
@@ -2825,10 +3313,7 @@ impl VM {
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
             if args.len() != 1 {
-                return Err(host.err(format!(
-                    "select() expects 1 argument, got {}",
-                    args.len()
-                )));
+                return Err(host.err(format!("select() expects 1 argument, got {}", args.len())));
             }
             let ids: Vec<usize> = match &args[0] {
                 Value::Array(a) => {
@@ -2839,9 +3324,7 @@ impl VM {
                     }
                     out
                 }
-                _ => {
-                    return Err(host.err("select(): expected array of channel ids".into()))
-                }
+                _ => return Err(host.err("select(): expected array of channel ids".into())),
             };
             // Snapshot ChanBuf handles upfront (ChanBuf is Clone + Arc-backed, cheap).
             let cbs: Vec<Option<ChanBuf>> = {
@@ -2852,20 +3335,603 @@ impl VM {
             };
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
+                let mut all_closed_empty = true;
                 for (i, cb_opt) in cbs.iter().enumerate() {
                     if let Some(cb) = cb_opt {
-                        if let Ok(buf) = cb.buf.try_lock() {
+                        let is_closed = cb.closed.load(Ordering::SeqCst);
+                        if let Ok(mut buf) = cb.buf.try_lock() {
                             if !buf.is_empty() {
-                                return Ok(Value::Number(i as f64));
+                                // Dequeue the value and return {index, value}
+                                let json_str = buf.pop_front().unwrap_or_default();
+                                let v = sj::from_str::<sj::Value>(&json_str)
+                                    .map(|j| spawn_value_from_json(&j))
+                                    .unwrap_or(Value::Nil);
+                                let mut m = std::collections::HashMap::new();
+                                m.insert("index".into(), Value::Number(i as f64));
+                                m.insert("value".into(), v);
+                                return Ok(alloc_map(m));
                             }
+                            // channel has data or could still receive
+                            if !is_closed { all_closed_empty = false; }
+                        } else {
+                            all_closed_empty = false; // locked = possibly active
                         }
                     }
                 }
+                // If all channels are closed and empty, return nil
+                if all_closed_empty { return Ok(Value::Nil); }
                 if std::time::Instant::now() >= deadline {
-                    return Err(host.err("select: timeout".into()));
+                    return Ok(Value::Nil); // timeout → nil (not an error)
                 }
                 thread::sleep(Duration::from_millis(1));
             }
+        }
+
+        // ---- Enhanced channel/threading builtins ----
+
+        /// select_with_timeout(receivers_array, timeout_ms)
+        /// Like select() but returns nil after timeout_ms milliseconds instead of nil on closed.
+        /// Returns {index, value, timed_out: bool} or nil if all closed.
+        fn channel_select_timeout_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("select_with_timeout(channels, ms) expects 2 arguments".into()));
+            }
+            let ms = match args[1] {
+                Value::Number(n) if n >= 0.0 => n as u64,
+                _ => return Err(host.err("select_with_timeout: ms must be non-negative number".into())),
+            };
+            let ids: Vec<usize> = match &args[0] {
+                Value::Array(a) => {
+                    let a = a.borrow();
+                    let mut out = Vec::with_capacity(a.len());
+                    for v in a.iter() {
+                        out.push(value_to_handle(host, v.clone(), "select_with_timeout")?);
+                    }
+                    out
+                }
+                _ => return Err(host.err("select_with_timeout: first arg must be array".into())),
+            };
+            let cbs: Vec<Option<ChanBuf>> = {
+                let t = chan_table().lock().map_err(|_| host.err("select_with_timeout: table".into()))?;
+                ids.iter().map(|id| t.get(id).cloned()).collect()
+            };
+            let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+            loop {
+                let mut all_closed_empty = true;
+                for (i, cb_opt) in cbs.iter().enumerate() {
+                    if let Some(cb) = cb_opt {
+                        let is_closed = cb.closed.load(Ordering::SeqCst);
+                        if let Ok(mut buf) = cb.buf.try_lock() {
+                            if !buf.is_empty() {
+                                let json_str = buf.pop_front().unwrap_or_default();
+                                cb.space_cv.1.notify_all();
+                                let v = sj::from_str::<sj::Value>(&json_str)
+                                    .map(|j| spawn_value_from_json(&j))
+                                    .unwrap_or(Value::Nil);
+                                let mut m = std::collections::HashMap::new();
+                                m.insert("index".into(), Value::Number(i as f64));
+                                m.insert("value".into(), v);
+                                m.insert("timed_out".into(), Value::Bool(false));
+                                return Ok(alloc_map(m));
+                            }
+                            if !is_closed { all_closed_empty = false; }
+                        } else {
+                            all_closed_empty = false;
+                        }
+                    }
+                }
+                if all_closed_empty { return Ok(Value::Nil); }
+                if std::time::Instant::now() >= deadline {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("timed_out".into(), Value::Bool(true));
+                    return Ok(alloc_map(m));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// channel_size(receiver) — number of items currently buffered in the channel.
+        fn channel_size_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "channel_size")?;
+            let t = chan_table().lock().map_err(|_| host.err("channel_size: table".into()))?;
+            let cb = t.get(&id).ok_or_else(|| host.err("channel_size: invalid channel id".into()))?;
+            let n = cb.buf.lock().map_err(|_| host.err("channel_size: buf lock".into()))?.len();
+            Ok(Value::Number(n as f64))
+        }
+
+        /// join_all(handles_array) — join all thread handles, return array of results.
+        /// Like Go's WaitGroup or Java's CompletableFuture.allOf().
+        fn join_all_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handles = match args.first() {
+                Some(Value::Array(a)) => a.borrow().clone(),
+                _ => return Err(host.err("join_all(handles): expected array of handles".into())),
+            };
+            let mut results = Vec::with_capacity(handles.len());
+            for h in handles {
+                let id = value_to_handle(host, h, "join_all")?;
+                let rx = {
+                    let mut t = spawn_table()
+                        .lock()
+                        .map_err(|_| host.err("join_all: spawn table unavailable".into()))?;
+                    t.remove(&id).ok_or_else(|| host.err("join_all: invalid or already joined handle".into()))?
+                };
+                let result = rx.recv().map_err(|_| host.err("join_all: channel closed".into()))?;
+                let val = match result {
+                    Ok(json_str) => {
+                        let j: sj::Value = sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
+                        spawn_value_from_json(&j)
+                    }
+                    Err(msg) => {
+                        // Propagate error as {ok:false, error:msg}
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("ok".to_string(), Value::Bool(false));
+                        m.insert("error".to_string(), alloc_string(msg));
+                        alloc_map(m)
+                    }
+                };
+                results.push(val);
+            }
+            Ok(alloc_array(results))
+        }
+
+        /// spawn_n(n, fn) — spawn n threads each running fn(), return array of handles.
+        /// Like Go's fan-out pattern: for i := 0; i < n; i++ { go fn() }.
+        fn spawn_n_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("spawn_n(n, fn) expects 2 arguments".into()));
+            }
+            let n = match args[0] {
+                Value::Number(x) if x >= 1.0 => x as usize,
+                _ => return Err(host.err("spawn_n: n must be a positive integer".into())),
+            };
+            let fn_val = args[1].clone();
+            let mut handles = Vec::with_capacity(n);
+            for _ in 0..n {
+                let h = spawn_builtin(host, vec![fn_val.clone()])?;
+                handles.push(h);
+            }
+            Ok(alloc_array(handles))
+        }
+
+        /// ticker(interval_ms) — create a channel that receives a tick every interval_ms.
+        /// Like Go's time.NewTicker(). Close the channel to stop it.
+        /// Returns the receiver handle (a channel).
+        fn ticker_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let ms = match args.first() {
+                Some(Value::Number(n)) if *n >= 1.0 => *n as u64,
+                _ => return Err(host.err("ticker(interval_ms): expected positive ms".into())),
+            };
+            // Create an unbounded channel for tick events
+            let tick_ch_id = CHAN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
+            let tick_cb = ChanBuf {
+                buf: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                closed: Arc::new(AtomicBool::new(false)),
+                capacity: 0,
+                space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+            };
+            chan_table().lock()
+                .map_err(|_| host.err("ticker: table unavailable".into()))?
+                .insert(tick_ch_id, tick_cb.clone());
+            // Spawn background ticker thread
+            thread::spawn(move || {
+                let mut tick_count = 0u64;
+                loop {
+                    thread::sleep(Duration::from_millis(ms));
+                    if tick_cb.closed.load(Ordering::SeqCst) { break; }
+                    tick_count += 1;
+                    let json_str = format!("{}", tick_count);
+                    if let Ok(mut buf) = tick_cb.buf.lock() {
+                        buf.push_back(json_str);
+                    }
+                    tick_cb.item_cv.1.notify_all();
+                }
+            });
+            // Return {sender, receiver} for compatibility
+            let mut m = std::collections::HashMap::new();
+            m.insert("sender".into(), Value::Number(tick_ch_id as f64));
+            m.insert("receiver".into(), Value::Number(tick_ch_id as f64));
+            Ok(alloc_map(m))
+        }
+
+        /// timeout_channel(ms) — returns a channel that sends exactly once after ms, then closes.
+        /// Like Go's time.After(). Use with select to implement timeouts.
+        fn timeout_channel_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let ms = match args.first() {
+                Some(Value::Number(n)) if *n >= 0.0 => *n as u64,
+                _ => return Err(host.err("timeout_channel(ms): expected non-negative ms".into())),
+            };
+            let ch_id = CHAN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
+            let cb = ChanBuf {
+                buf: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                closed: Arc::new(AtomicBool::new(false)),
+                capacity: 1,  // buffered(1) so the fire-and-forget doesn't block
+                space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+            };
+            chan_table().lock()
+                .map_err(|_| host.err("timeout_channel: table unavailable".into()))?
+                .insert(ch_id, cb.clone());
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(ms));
+                if !cb.closed.load(Ordering::SeqCst) {
+                    if let Ok(mut buf) = cb.buf.lock() {
+                        buf.push_back("true".to_string());
+                    }
+                    cb.item_cv.1.notify_all();
+                    cb.closed.store(true, Ordering::SeqCst);
+                }
+            });
+            let mut m = std::collections::HashMap::new();
+            m.insert("sender".into(), Value::Number(ch_id as f64));
+            m.insert("receiver".into(), Value::Number(ch_id as f64));
+            Ok(alloc_map(m))
+        }
+
+        // ---- Mutex builtins (Go sync.Mutex / Rust Mutex) ----
+
+        /// mutex_new() — create a mutex. Returns a handle.
+        fn mutex_new_builtin(
+            host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = MUTEX_NEXT.fetch_add(1, Ordering::SeqCst);
+            let m = Arc::new(VmMutex {
+                locked: Mutex::new(false),
+                cv: std::sync::Condvar::new(),
+            });
+            mutex_table().lock()
+                .map_err(|_| host.err("mutex_new: table unavailable".into()))?
+                .insert(id, m);
+            Ok(Value::Number(id as f64))
+        }
+
+        /// mutex_lock(handle) — acquire mutex; blocks until available.
+        fn mutex_lock_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "mutex_lock")?;
+            let entry = {
+                let t = mutex_table().lock().map_err(|_| host.err("mutex_lock: table".into()))?;
+                t.get(&id).cloned().ok_or_else(|| host.err("mutex_lock: invalid handle".into()))?
+            };
+            let mut locked = entry.locked.lock().map_err(|_| host.err("mutex_lock: lock".into()))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while *locked {
+                if std::time::Instant::now() >= deadline {
+                    return Err(host.err("mutex_lock: deadlock timeout (30s)".into()));
+                }
+                let result = entry.cv.wait_timeout(locked, Duration::from_millis(10))
+                    .map_err(|_| host.err("mutex_lock: condvar".into()))?;
+                locked = result.0;
+            }
+            *locked = true;
+            Ok(Value::Nil)
+        }
+
+        /// mutex_try_lock(handle) — non-blocking acquire. Returns true if locked, false if busy.
+        fn mutex_try_lock_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "mutex_try_lock")?;
+            let entry = {
+                let t = mutex_table().lock().map_err(|_| host.err("mutex_try_lock: table".into()))?;
+                t.get(&id).cloned().ok_or_else(|| host.err("mutex_try_lock: invalid handle".into()))?
+            };
+            let mut locked = entry.locked.lock().map_err(|_| host.err("mutex_try_lock: lock".into()))?;
+            if *locked {
+                return Ok(Value::Bool(false));
+            }
+            *locked = true;
+            Ok(Value::Bool(true))
+        }
+
+        /// mutex_unlock(handle) — release mutex.
+        fn mutex_unlock_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "mutex_unlock")?;
+            let entry = {
+                let t = mutex_table().lock().map_err(|_| host.err("mutex_unlock: table".into()))?;
+                t.get(&id).cloned().ok_or_else(|| host.err("mutex_unlock: invalid handle".into()))?
+            };
+            let mut locked = entry.locked.lock().map_err(|_| host.err("mutex_unlock: lock".into()))?;
+            if !*locked {
+                return Err(host.err("mutex_unlock: mutex is not locked".into()));
+            }
+            *locked = false;
+            entry.cv.notify_one();
+            Ok(Value::Nil)
+        }
+
+        // ---- RwLock builtins (sync.RWMutex in Go / Rust RwLock) ----
+
+        fn rwlock_new_builtin(
+            host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = RWLOCK_NEXT.fetch_add(1, Ordering::SeqCst);
+            rwlock_table().lock()
+                .map_err(|_| host.err("rwlock_new: table".into()))?
+                .insert(id, Arc::new(VmRwLock {
+                    state: Mutex::new(0),
+                    cv: std::sync::Condvar::new(),
+                }));
+            Ok(Value::Number(id as f64))
+        }
+
+        /// rwlock_read(handle) — acquire shared (read) lock.
+        fn rwlock_read_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "rwlock_read")?;
+            let entry = {
+                let t = rwlock_table().lock().map_err(|_| host.err("rwlock_read: table".into()))?;
+                t.get(&id).cloned().ok_or_else(|| host.err("rwlock_read: invalid handle".into()))?
+            };
+            let mut state = entry.state.lock().map_err(|_| host.err("rwlock_read: state".into()))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while *state < 0 { // write-locked
+                if std::time::Instant::now() >= deadline { return Err(host.err("rwlock_read: timeout".into())); }
+                let r = entry.cv.wait_timeout(state, Duration::from_millis(5))
+                    .map_err(|_| host.err("rwlock_read: condvar".into()))?;
+                state = r.0;
+            }
+            *state += 1;
+            Ok(Value::Nil)
+        }
+
+        /// rwlock_write(handle) — acquire exclusive (write) lock.
+        fn rwlock_write_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "rwlock_write")?;
+            let entry = {
+                let t = rwlock_table().lock().map_err(|_| host.err("rwlock_write: table".into()))?;
+                t.get(&id).cloned().ok_or_else(|| host.err("rwlock_write: invalid handle".into()))?
+            };
+            let mut state = entry.state.lock().map_err(|_| host.err("rwlock_write: state".into()))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while *state != 0 { // either read(s) or write in progress
+                if std::time::Instant::now() >= deadline { return Err(host.err("rwlock_write: timeout".into())); }
+                let r = entry.cv.wait_timeout(state, Duration::from_millis(5))
+                    .map_err(|_| host.err("rwlock_write: condvar".into()))?;
+                state = r.0;
+            }
+            *state = -1; // write-locked
+            Ok(Value::Nil)
+        }
+
+        /// rwlock_unlock(handle) — release read OR write lock.
+        fn rwlock_unlock_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "rwlock_unlock")?;
+            let entry = {
+                let t = rwlock_table().lock().map_err(|_| host.err("rwlock_unlock: table".into()))?;
+                t.get(&id).cloned().ok_or_else(|| host.err("rwlock_unlock: invalid handle".into()))?
+            };
+            let mut state = entry.state.lock().map_err(|_| host.err("rwlock_unlock: state".into()))?;
+            if *state == -1 { *state = 0; }       // write unlock
+            else if *state > 0 { *state -= 1; }    // read unlock
+            else { return Err(host.err("rwlock_unlock: lock not held".into())); }
+            entry.cv.notify_all();
+            Ok(Value::Nil)
+        }
+
+        // ---- Barrier (CyclicBarrier in Java / sync.WaitGroup N threads) ----
+
+        /// barrier_new(n) — create a barrier that releases all n threads when all have arrived.
+        fn barrier_new_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let n = match args.first() {
+                Some(Value::Number(x)) if *x >= 1.0 => *x as usize,
+                _ => return Err(host.err("barrier_new(n): expected positive integer n".into())),
+            };
+            let id = BARRIER_NEXT.fetch_add(1, Ordering::SeqCst);
+            barrier_table().lock()
+                .map_err(|_| host.err("barrier_new: table".into()))?
+                .insert(id, Arc::new(VmBarrier {
+                    n,
+                    arrived: Mutex::new(0),
+                    cv: std::sync::Condvar::new(),
+                }));
+            Ok(Value::Number(id as f64))
+        }
+
+        /// barrier_wait(handle) — wait at barrier until all n threads have arrived.
+        fn barrier_wait_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "barrier_wait")?;
+            let entry = {
+                let t = barrier_table().lock().map_err(|_| host.err("barrier_wait: table".into()))?;
+                t.get(&id).cloned().ok_or_else(|| host.err("barrier_wait: invalid handle".into()))?
+            };
+            let mut arrived = entry.arrived.lock().map_err(|_| host.err("barrier_wait: lock".into()))?;
+            *arrived += 1;
+            if *arrived >= entry.n {
+                *arrived = 0; // reset for reuse (CyclicBarrier semantics)
+                entry.cv.notify_all();
+                return Ok(Value::Bool(true)); // was the releasing thread
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let r = entry.cv.wait_timeout(arrived, Duration::from_millis(5))
+                    .map_err(|_| host.err("barrier_wait: condvar".into()))?;
+                arrived = r.0;
+                if *arrived == 0 { return Ok(Value::Bool(false)); } // released, not the last
+                if std::time::Instant::now() >= deadline {
+                    return Err(host.err("barrier_wait: timeout (60s) — possible deadlock".into()));
+                }
+            }
+        }
+
+        // ---- Once (sync.Once in Go / lazy by-name in Kotlin) ----
+
+        /// once_new() — create a Once handle.
+        fn once_new_builtin(
+            host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = ONCE_NEXT.fetch_add(1, Ordering::SeqCst);
+            once_table().lock()
+                .map_err(|_| host.err("once_new: table".into()))?
+                .insert(id, Arc::new(VmOnce {
+                    done: AtomicBool::new(false),
+                    running: Mutex::new(false),
+                    cv: std::sync::Condvar::new(),
+                }));
+            Ok(Value::Number(id as f64))
+        }
+
+        /// once_is_done(handle) — true if the once has already run.
+        fn once_is_done_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "once_is_done")?;
+            let t = once_table().lock().map_err(|_| host.err("once_is_done: table".into()))?;
+            let entry = t.get(&id).ok_or_else(|| host.err("once_is_done: invalid handle".into()))?;
+            Ok(Value::Bool(entry.done.load(Ordering::SeqCst)))
+        }
+
+        // ---- Atomic i64 (Java AtomicInteger / Go atomic.Int64 / Rust AtomicI64) ----
+
+        /// atomic_new(initial) — create an atomic integer.
+        fn atomic_new_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let init = match args.first() {
+                Some(Value::Number(n)) => *n as i64,
+                None => 0,
+                _ => return Err(host.err("atomic_new(val): expected number or no argument".into())),
+            };
+            let id = ATOMIC_NEXT.fetch_add(1, Ordering::SeqCst);
+            atomic_table().lock()
+                .map_err(|_| host.err("atomic_new: table".into()))?
+                .insert(id, Arc::new(VmAtomic { val: AtomicI64::new(init) }));
+            Ok(Value::Number(id as f64))
+        }
+
+        /// atomic_get(handle) — read the current value.
+        fn atomic_get_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "atomic_get")?;
+            let t = atomic_table().lock().map_err(|_| host.err("atomic_get: table".into()))?;
+            let entry = t.get(&id).ok_or_else(|| host.err("atomic_get: invalid handle".into()))?;
+            Ok(Value::Number(entry.val.load(Ordering::SeqCst) as f64))
+        }
+
+        /// atomic_set(handle, val) — store a value.
+        fn atomic_set_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 { return Err(host.err("atomic_set(handle, val) expects 2 args".into())); }
+            let id = value_to_handle(host, args[0].clone(), "atomic_set")?;
+            let val = match args[1] {
+                Value::Number(n) => n as i64,
+                _ => return Err(host.err("atomic_set: value must be a number".into())),
+            };
+            let t = atomic_table().lock().map_err(|_| host.err("atomic_set: table".into()))?;
+            let entry = t.get(&id).ok_or_else(|| host.err("atomic_set: invalid handle".into()))?;
+            entry.val.store(val, Ordering::SeqCst);
+            Ok(Value::Nil)
+        }
+
+        /// atomic_add(handle, delta) — atomically add delta, return NEW value.
+        fn atomic_add_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 { return Err(host.err("atomic_add(handle, delta) expects 2 args".into())); }
+            let id = value_to_handle(host, args[0].clone(), "atomic_add")?;
+            let delta = match args[1] {
+                Value::Number(n) => n as i64,
+                _ => return Err(host.err("atomic_add: delta must be a number".into())),
+            };
+            let t = atomic_table().lock().map_err(|_| host.err("atomic_add: table".into()))?;
+            let entry = t.get(&id).ok_or_else(|| host.err("atomic_add: invalid handle".into()))?;
+            let new_val = entry.val.fetch_add(delta, Ordering::SeqCst) + delta;
+            Ok(Value::Number(new_val as f64))
+        }
+
+        /// atomic_sub(handle, delta) — atomically subtract delta, return NEW value.
+        fn atomic_sub_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 { return Err(host.err("atomic_sub(handle, delta) expects 2 args".into())); }
+            let id = value_to_handle(host, args[0].clone(), "atomic_sub")?;
+            let delta = match args[1] {
+                Value::Number(n) => n as i64,
+                _ => return Err(host.err("atomic_sub: delta must be a number".into())),
+            };
+            let t = atomic_table().lock().map_err(|_| host.err("atomic_sub: table".into()))?;
+            let entry = t.get(&id).ok_or_else(|| host.err("atomic_sub: invalid handle".into()))?;
+            let new_val = entry.val.fetch_sub(delta, Ordering::SeqCst) - delta;
+            Ok(Value::Number(new_val as f64))
+        }
+
+        /// atomic_cas(handle, expected, new) — compare-and-swap.
+        /// Returns true if swap happened, false if current value != expected.
+        fn atomic_cas_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 3 { return Err(host.err("atomic_cas(handle, expected, new) expects 3 args".into())); }
+            let id = value_to_handle(host, args[0].clone(), "atomic_cas")?;
+            let expected = match args[1] { Value::Number(n) => n as i64, _ => return Err(host.err("atomic_cas: expected must be a number".into())), };
+            let new_val  = match args[2] { Value::Number(n) => n as i64, _ => return Err(host.err("atomic_cas: new_val must be a number".into())), };
+            let t = atomic_table().lock().map_err(|_| host.err("atomic_cas: table".into()))?;
+            let entry = t.get(&id).ok_or_else(|| host.err("atomic_cas: invalid handle".into()))?;
+            let ok = entry.val.compare_exchange(expected, new_val, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+            Ok(Value::Bool(ok))
+        }
+
+        /// atomic_swap(handle, new_val) — atomically swap, return OLD value.
+        fn atomic_swap_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 { return Err(host.err("atomic_swap(handle, val) expects 2 args".into())); }
+            let id = value_to_handle(host, args[0].clone(), "atomic_swap")?;
+            let val = match args[1] { Value::Number(n) => n as i64, _ => return Err(host.err("atomic_swap: val must be a number".into())), };
+            let t = atomic_table().lock().map_err(|_| host.err("atomic_swap: table".into()))?;
+            let entry = t.get(&id).ok_or_else(|| host.err("atomic_swap: invalid handle".into()))?;
+            let old = entry.val.swap(val, Ordering::SeqCst);
+            Ok(Value::Number(old as f64))
         }
 
         // ---- String helper builtins ----
@@ -2886,18 +3952,12 @@ impl VM {
             let start = match args[1] {
                 Value::Number(n) if n >= 0.0 => n as usize,
                 _ => {
-                    return Err(
-                        host.err("str_slice(): start must be a non-negative number".into()),
-                    )
+                    return Err(host.err("str_slice(): start must be a non-negative number".into()))
                 }
             };
             let end = match args[2] {
                 Value::Number(n) if n >= 0.0 => n as usize,
-                _ => {
-                    return Err(
-                        host.err("str_slice(): end must be a non-negative number".into()),
-                    )
-                }
+                _ => return Err(host.err("str_slice(): end must be a non-negative number".into())),
             };
             let chars: Vec<char> = s.chars().collect();
             let start = start.min(chars.len());
@@ -2986,26 +4046,140 @@ impl VM {
             Ok(alloc_string(s.to_uppercase()))
         }
 
-        // ---- OS builtins ----
-
-        fn os_args_builtin(
-            _host: &mut dyn VmHost,
-            _args: Vec<Value>,
-        ) -> Result<Value, RuntimeError> {
-            let argv: Vec<Value> =
-                std::env::args().skip(1).map(|a| alloc_string(a)).collect();
-            Ok(alloc_array(argv))
-        }
-
-        fn os_exit_builtin(
+        fn strfromcharcode_builtin(
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
             if args.len() != 1 {
                 return Err(host.err(format!(
-                    "os_exit() expects 1 argument, got {}",
+                    "strfromcharcode() expects 1 argument, got {}",
                     args.len()
                 )));
+            }
+            match &args[0] {
+                Value::Number(n) => {
+                    let cp = *n as u32;
+                    match char::from_u32(cp) {
+                        Some(c) => Ok(alloc_string(c.to_string())),
+                        None => Err(host.err(format!(
+                            "strfromcharcode(): {} is not a valid unicode code point",
+                            cp
+                        ))),
+                    }
+                }
+                _ => Err(host.err("strfromcharcode(): expected number".into())),
+            }
+        }
+
+        fn strcharcodeat_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "strcharcodeat() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("strcharcodeat(): {m}")))?;
+            let idx = match &args[1] {
+                Value::Number(n) => *n as usize,
+                _ => return Err(host.err("strcharcodeat(): index must be a number".into())),
+            };
+            let bytes = s.as_bytes();
+            if idx >= bytes.len() {
+                return Err(host.err(format!(
+                    "strcharcodeat(): index {} out of bounds (len {})",
+                    idx,
+                    bytes.len()
+                )));
+            }
+            Ok(Value::Number(bytes[idx] as f64))
+        }
+
+        // ---- Sort / numeric helpers ----
+
+        fn array_sort_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!("array_sort() expects 1 argument, got {}", args.len())));
+            }
+            match &args[0] {
+                Value::Array(a) => {
+                    let mut items = a.borrow().clone();
+                    items.sort_by(|x, y| match (x, y) {
+                        (Value::Number(a), Value::Number(b)) => {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        (Value::Obj(a), Value::Obj(b)) => {
+                            let sa = match a.as_ref() { pblang_ir::Obj::String(s) => s.clone() };
+                            let sb = match b.as_ref() { pblang_ir::Obj::String(s) => s.clone() };
+                            sa.cmp(&sb)
+                        }
+                        _ => std::cmp::Ordering::Equal,
+                    });
+                    Ok(alloc_array(items))
+                }
+                _ => Err(host.err("array_sort(): expected array".into())),
+            }
+        }
+
+        fn num_abs_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!("num_abs() expects 1 argument, got {}", args.len())));
+            }
+            match &args[0] {
+                Value::Number(n) => Ok(Value::Number(n.abs())),
+                _ => Err(host.err("num_abs(): expected number".into())),
+            }
+        }
+
+        fn num_max_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!("num_max() expects 2 arguments, got {}", args.len())));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a.max(*b))),
+                _ => Err(host.err("num_max(): expected numbers".into())),
+            }
+        }
+
+        fn num_min_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!("num_min() expects 2 arguments, got {}", args.len())));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a.min(*b))),
+                _ => Err(host.err("num_min(): expected numbers".into())),
+            }
+        }
+
+                // ---- OS builtins ----
+
+        fn os_args_builtin(
+            _host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let argv: Vec<Value> = std::env::args().skip(1).map(alloc_string).collect();
+            Ok(alloc_array(argv))
+        }
+
+        fn os_exit_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!("os_exit() expects 1 argument, got {}", args.len())));
             }
             let code = match args[0] {
                 Value::Number(n) => n as i32,
@@ -3040,10 +4214,8 @@ impl VM {
             let combined = format!("{key}{WS_GUID}");
             use sha1::Digest as _;
             let hash = sha1::Sha1::digest(combined.as_bytes());
-            let encoded = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                hash.as_slice(),
-            );
+            let encoded =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
             Ok(alloc_string(encoded))
         }
 
@@ -3092,6 +4264,35 @@ impl VM {
             }
         }
 
+        fn http_get_auth_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err(format!(
+                    "http_get_auth() expects 2 arguments (url, token), got {}",
+                    args.len()
+                )));
+            }
+            if !host.allow_http() {
+                return Err(host.err("http access denied".into()));
+            }
+            let url = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("http_get_auth(): {m}")))?;
+            let token = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("http_get_auth(): token: {m}")))?;
+            let mut req = ureq::get(url).set("Authorization", &format!("Bearer {token}"));
+            if let Some(ms) = host.io_timeout_ms() {
+                req = req.timeout(Duration::from_millis(ms));
+            }
+            match req.call() {
+                Ok(resp) => Ok(alloc_string(resp.into_string().unwrap_or_default())),
+                Err(e) => Ok(alloc_string(format!("error: {e}"))),
+            }
+        }
+
         // ---- parse_sse_line ----
 
         fn parse_sse_line_builtin(
@@ -3107,14 +4308,14 @@ impl VM {
             let line = args[0]
                 .as_str()
                 .map_err(|m| host.err(format!("parse_sse_line(): {m}")))?;
-            let (field, value) = if line.starts_with("data: ") {
-                ("data", &line[6..])
-            } else if line.starts_with("event: ") {
-                ("event", &line[7..])
-            } else if line.starts_with("id: ") {
-                ("id", &line[4..])
-            } else if line.starts_with("retry: ") {
-                ("retry", &line[7..])
+            let (field, value) = if let Some(v) = line.strip_prefix("data: ") {
+                ("data", v)
+            } else if let Some(v) = line.strip_prefix("event: ") {
+                ("event", v)
+            } else if let Some(v) = line.strip_prefix("id: ") {
+                ("id", v)
+            } else if let Some(v) = line.strip_prefix("retry: ") {
+                ("retry", v)
             } else {
                 ("", line)
             };
@@ -3150,6 +4351,16 @@ impl VM {
                 name: "clock",
                 arity: Some(0),
                 fun: clock,
+            },
+            BuiltinFn {
+                name: "now_ms",
+                arity: Some(0),
+                fun: now_ms,
+            },
+            BuiltinFn {
+                name: "now_iso",
+                arity: Some(0),
+                fun: now_iso,
             },
             BuiltinFn {
                 name: "type",
@@ -3307,6 +4518,11 @@ impl VM {
                 fun: exec,
             },
             BuiltinFn {
+                name: "proc_spawn_wait",
+                arity: Some(2),
+                fun: proc_spawn_wait,
+            },
+            BuiltinFn {
                 name: "import",
                 arity: Some(1),
                 fun: import,
@@ -3321,6 +4537,18 @@ impl VM {
                 arity: Some(0),
                 fun: gc_collect,
             },
+
+            // --- Safety builtins (Rust-style guarantees for pblang code) ---
+            BuiltinFn { name: "assert",       arity: None, fun: assert_builtin },
+            BuiltinFn { name: "type_assert",  arity: Some(2), fun: type_assert_builtin },
+            BuiltinFn { name: "freeze",       arity: Some(1), fun: freeze_builtin },
+            BuiltinFn { name: "is_frozen",    arity: Some(1), fun: is_frozen_builtin },
+            BuiltinFn { name: "checked_add",  arity: Some(2), fun: checked_add_builtin },
+            BuiltinFn { name: "checked_mul",  arity: Some(2), fun: checked_mul_builtin },
+            BuiltinFn { name: "checked_sub",  arity: Some(2), fun: checked_sub_builtin },
+            BuiltinFn { name: "checked_div",  arity: Some(2), fun: checked_div_builtin },
+            BuiltinFn { name: "is_nil",       arity: Some(1), fun: is_nil_builtin },
+            BuiltinFn { name: "require_type", arity: Some(2), fun: require_type_builtin },
             BuiltinFn {
                 name: "sha256",
                 arity: Some(1),
@@ -3330,6 +4558,11 @@ impl VM {
                 name: "random_bytes",
                 arity: Some(1),
                 fun: random_bytes,
+            },
+            BuiltinFn {
+                name: "random_float",
+                arity: Some(0),
+                fun: random_float_builtin,
             },
             BuiltinFn {
                 name: "constant_time_eq",
@@ -3345,6 +4578,12 @@ impl VM {
                 name: "base64_decode",
                 arity: Some(1),
                 fun: base64_decode,
+            },
+            // FIX #22: binary-safe base64 decode
+            BuiltinFn {
+                name: "base64_decode_bytes",
+                arity: Some(1),
+                fun: base64_decode_bytes,
             },
             BuiltinFn {
                 name: "json_parse",
@@ -3562,6 +4801,45 @@ impl VM {
                 arity: Some(1),
                 fun: channel_select_builtin,
             },
+
+            // ---- Enhanced threading builtins ----
+            BuiltinFn { name: "channel_buffered",       arity: Some(1),    fun: channel_buffered_builtin },
+            BuiltinFn { name: "recv_timeout",           arity: Some(2),    fun: channel_recv_timeout_builtin },
+            BuiltinFn { name: "select_with_timeout",    arity: Some(2),    fun: channel_select_timeout_builtin },
+            BuiltinFn { name: "channel_size",           arity: Some(1),    fun: channel_size_builtin },
+            BuiltinFn { name: "join_all",               arity: Some(1),    fun: join_all_builtin },
+            BuiltinFn { name: "spawn_n",                arity: Some(2),    fun: spawn_n_builtin },
+            BuiltinFn { name: "ticker",                 arity: Some(1),    fun: ticker_builtin },
+            BuiltinFn { name: "timeout_channel",        arity: Some(1),    fun: timeout_channel_builtin },
+
+            // ---- Mutex (Go sync.Mutex / Rust Mutex) ----
+            BuiltinFn { name: "mutex_new",       arity: Some(0),  fun: mutex_new_builtin },
+            BuiltinFn { name: "mutex_lock",      arity: Some(1),  fun: mutex_lock_builtin },
+            BuiltinFn { name: "mutex_try_lock",  arity: Some(1),  fun: mutex_try_lock_builtin },
+            BuiltinFn { name: "mutex_unlock",    arity: Some(1),  fun: mutex_unlock_builtin },
+
+            // ---- RwLock (Go sync.RWMutex / Rust RwLock) ----
+            BuiltinFn { name: "rwlock_new",      arity: Some(0),  fun: rwlock_new_builtin },
+            BuiltinFn { name: "rwlock_read",     arity: Some(1),  fun: rwlock_read_builtin },
+            BuiltinFn { name: "rwlock_write",    arity: Some(1),  fun: rwlock_write_builtin },
+            BuiltinFn { name: "rwlock_unlock",   arity: Some(1),  fun: rwlock_unlock_builtin },
+
+            // ---- Barrier (Java CyclicBarrier / Go WaitGroup) ----
+            BuiltinFn { name: "barrier_new",     arity: Some(1),  fun: barrier_new_builtin },
+            BuiltinFn { name: "barrier_wait",    arity: Some(1),  fun: barrier_wait_builtin },
+
+            // ---- Once (Go sync.Once / Kotlin by lazy) ----
+            BuiltinFn { name: "once_new",        arity: Some(0),  fun: once_new_builtin },
+            BuiltinFn { name: "once_is_done",    arity: Some(1),  fun: once_is_done_builtin },
+
+            // ---- Atomic i64 (Java AtomicInteger / Go atomic.Int64 / Rust AtomicI64) ----
+            BuiltinFn { name: "atomic_new",      arity: None,     fun: atomic_new_builtin },
+            BuiltinFn { name: "atomic_get",      arity: Some(1),  fun: atomic_get_builtin },
+            BuiltinFn { name: "atomic_set",      arity: Some(2),  fun: atomic_set_builtin },
+            BuiltinFn { name: "atomic_add",      arity: Some(2),  fun: atomic_add_builtin },
+            BuiltinFn { name: "atomic_sub",      arity: Some(2),  fun: atomic_sub_builtin },
+            BuiltinFn { name: "atomic_cas",      arity: Some(3),  fun: atomic_cas_builtin },
+            BuiltinFn { name: "atomic_swap",     arity: Some(2),  fun: atomic_swap_builtin },
             // String helpers
             BuiltinFn {
                 name: "str_slice",
@@ -3587,6 +4865,36 @@ impl VM {
                 name: "str_upper",
                 arity: Some(1),
                 fun: str_upper_builtin,
+            },
+            BuiltinFn {
+                name: "strfromcharcode",
+                arity: Some(1),
+                fun: strfromcharcode_builtin,
+            },
+            BuiltinFn {
+                name: "strcharcodeat",
+                arity: Some(2),
+                fun: strcharcodeat_builtin,
+            },
+            BuiltinFn {
+                name: "array_sort",
+                arity: Some(1),
+                fun: array_sort_builtin,
+            },
+            BuiltinFn {
+                name: "num_abs",
+                arity: Some(1),
+                fun: num_abs_builtin,
+            },
+            BuiltinFn {
+                name: "num_max",
+                arity: Some(2),
+                fun: num_max_builtin,
+            },
+            BuiltinFn {
+                name: "num_min",
+                arity: Some(2),
+                fun: num_min_builtin,
             },
             // OS builtins
             BuiltinFn {
@@ -3616,6 +4924,11 @@ impl VM {
                 fun: http_post_auth_builtin,
             },
             BuiltinFn {
+                name: "http_get_auth",
+                arity: Some(2),
+                fun: http_get_auth_builtin,
+            },
+            BuiltinFn {
                 name: "parse_sse_line",
                 arity: Some(1),
                 fun: parse_sse_line_builtin,
@@ -3638,6 +4951,13 @@ impl VM {
     /// When config is None (VM::new), no builtins are registered.
     /// When config is Some (VM::with_stdlib), all builtins are registered; capability checks
     /// run at call time via VmHost::allow_fs() etc., so sandboxing still applies.
+    // AUDIT NOTE #14: `allows()` is retained as a future hook for strict-mode
+    // registration (where disabled builtins are not even visible as globals). For now
+    // the real sandbox is per-builtin call-time capability checks (allow_fs, allow_net,
+    // etc.). We intentionally keep ALL builtins registered so that stdlib modules (which
+    // import exec/net/fs builtins internally) continue to work — the call-time check
+    // denies access when the capability is disabled. Strict-mode registration is tracked
+    // as a future improvement.
     fn install_builtins_into(module: &Rc<RefCell<Module>>, config: Option<&StdlibConfig>) {
         let mut m = module.borrow_mut();
         for b in VM::builtins() {
@@ -3793,7 +5113,16 @@ impl VM {
     pub fn set_ffi_policy(&mut self, policy: Option<FfiPolicy>) {
         self.ffi_policy = policy;
     }
+}
 
+impl Default for VM {
+    /// Creates a minimal VM with no stdlib builtins. Delegates to `VM::new()`.
+    fn default() -> Self {
+        VM::new()
+    }
+}
+
+impl VM {
     /// Creates a minimal VM with no stdlib builtins (for embedding when you register your own).
     pub fn new() -> Self {
         let builtins = Rc::new(RefCell::new(Module::default()));
@@ -3944,7 +5273,7 @@ impl VM {
                     OpCode::OpAdd => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.add(b).map_err(|m| self.err(m))?;
+                        let v = a.concat(b).map_err(|m| self.err(m))?;
                         self.stack.push(v);
                     }
                     OpCode::OpSub => {
@@ -3973,6 +5302,117 @@ impl VM {
                             Value::Bool(true)
                         };
                         self.stack.push(result);
+                    }
+
+                    // ---- safety opcodes ----
+
+                    // `OpSafeGetAttr(name_idx)` — `obj?.field`
+                    // Pops obj. If nil, pushes nil. Otherwise gets named attribute.
+                    OpCode::OpSafeGetAttr(name_idx) => {
+                        let obj = self.pop()?;
+                        let attr_name = {
+                            let chunk = self.current_chunk()?;
+                            match &chunk.constants[name_idx] {
+                                Value::Obj(o) => match o.as_ref() {
+                                    pblang_ir::Obj::String(s) => s.clone(),
+                                },
+                                _ => return Err(self.err("OpSafeGetAttr: invalid attr name".to_string())),
+                            }
+                        };
+                        match obj {
+                            Value::Nil => self.stack.push(Value::Nil),
+                            Value::Map(ref m) => {
+                                let v = m.borrow().get(&attr_name).cloned().unwrap_or(Value::Nil);
+                                self.stack.push(v);
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "?.{attr_name}: expected map or nil, got {other}"
+                                )));
+                            }
+                        }
+                    }
+
+                    // `OpSafeIndex` — `obj?[idx]` (safe indexed access)
+                    // Stack top: idx, below: obj
+                    // If obj is nil, pop both and push nil. Else do normal OpGetIndex.
+                    OpCode::OpSafeIndex => {
+                        let idx = self.pop()?;
+                        let obj = self.pop()?;
+                        if let Value::Nil = &obj {
+                            self.stack.push(Value::Nil);
+                        } else {
+                            // Re-push for normal index operation
+                            self.stack.push(obj);
+                            self.stack.push(idx);
+                            // Inline OpGetIndex logic
+                            let index = self.pop()?;
+                            let obj2 = self.pop()?;
+                            match obj2 {
+                                Value::Array(a) => {
+                                    let i = match index {
+                                        Value::Number(n) => n as isize,
+                                        _ => return Err(self.err("array?[]: index must be number".to_string())),
+                                    };
+                                    let a = a.borrow();
+                                    if i < 0 || (i as usize) >= a.len() {
+                                        self.stack.push(Value::Nil); // safe: out-of-bounds = nil
+                                    } else {
+                                        self.stack.push(a[i as usize].clone());
+                                    }
+                                }
+                                Value::Map(m) => {
+                                    let key = index.as_str().map_err(|_| self.err("map?[]: key must be string".to_string()))?;
+                                    let v = m.borrow().get(key).cloned().unwrap_or(Value::Nil);
+                                    self.stack.push(v);
+                                }
+                                _ => self.stack.push(Value::Nil),
+                            }
+                        }
+                    }
+
+                    // `OpResultUnwrap` — `expr?` (Result unwrap operator)
+                    // If value is {ok: false, error: msg}, throw RuntimeError.
+                    // If value is {ok: true, value: v}, push v.
+                    // Otherwise, push as-is (non-Result values pass through unchanged).
+                    OpCode::OpResultUnwrap => {
+                        let v = self.pop()?;
+                        match &v {
+                            Value::Map(m) => {
+                                let mb = m.borrow();
+                                let is_ok = mb.get("ok").cloned();
+                                match is_ok {
+                                    Some(Value::Bool(false)) => {
+                                        let msg = mb.get("error")
+                                            .and_then(|e| e.as_str().ok().map(String::from))
+                                            .unwrap_or_else(|| "error (from ? operator)".to_string());
+                                        drop(mb);
+                                        return Err(self.err(msg));
+                                    }
+                                    Some(Value::Bool(true)) => {
+                                        let val = mb.get("value").cloned().unwrap_or(Value::Nil);
+                                        drop(mb);
+                                        self.stack.push(val);
+                                    }
+                                    _ => {
+                                        drop(mb);
+                                        self.stack.push(v);
+                                    }
+                                }
+                            }
+                            Value::Nil => {
+                                return Err(self.err(
+                                    "? operator: cannot unwrap nil (use if/else or unwrap_or)".to_string()
+                                ));
+                            }
+                            _ => self.stack.push(v),
+                        }
+                    }
+
+                    // `OpIsNil` — push true if top of stack is nil, false otherwise
+                    OpCode::OpIsNil => {
+                        let v = self.pop()?;
+                        self.stack.push(Value::Bool(matches!(v, Value::Nil)));
                     }
 
                     // ---- comparisons ----
@@ -4142,11 +5582,18 @@ impl VM {
                             .get(attr_const_idx)
                             .ok_or_else(|| self.err("constant index out of bounds"))?
                             .as_str()
-                            .map_err(|m| self.err(m))?
-                            .to_string();
+                            .map_err(|m| self.err(m))?;
+                        // Do not allow __frozen itself to be overwritten through this path
+                        let attr = attr.to_string();
 
                         match obj {
                             Value::Map(m) => {
+                                // Check freeze guard
+                                if matches!(m.borrow().get("__frozen"), Some(Value::Bool(true))) {
+                                    return Err(self.err(format!(
+                                        "FrozenError: cannot set attribute '{}' on a frozen map", attr
+                                    )));
+                                }
                                 m.borrow_mut().insert(attr, value.clone());
                                 self.stack.push(value);
                             }
@@ -4257,6 +5704,10 @@ impl VM {
                                 self.stack.push(value);
                             }
                             Value::Map(m) => {
+                                // FIX #20: Enforce freeze() for index-style assignment too
+                                if matches!(m.borrow().get("__frozen"), Some(Value::Bool(true))) {
+                                    return Err(self.err("FrozenError: cannot set index on a frozen map".to_string()));
+                                }
                                 let key = index.as_str().map_err(|m| {
                                     self.err(format!("map index must be string: {m}"))
                                 })?;
@@ -4621,7 +6072,8 @@ impl VM {
                 return Err(self.err("return with no frame"));
             }
 
-            let frame = self.frames.last_mut().unwrap();
+            let frame = self.frames.last_mut()
+                .expect("do_return: frames non-empty confirmed by has_frames guard above");
 
             // If the current frame has pending defers, run the next one
             if let Some(defer_closure) = frame.defers.pop() {
@@ -4634,12 +6086,15 @@ impl VM {
 
                 self.stack.push(defer_closure);
                 self.call_top(0)?;
-                self.frames.last_mut().unwrap().is_defer_thunk = true;
+                self.frames.last_mut()
+                    .expect("do_return: call_top pushed a frame so frames is non-empty")
+                    .is_defer_thunk = true;
                 return Ok(());
             }
 
             // No more defers for this frame. Pop it.
-            let frame = self.frames.pop().unwrap();
+            let frame = self.frames.pop()
+                .expect("do_return: last_mut() succeeded so pop() cannot be None");
 
             self.close_upvalues_from(frame.stack_base + 1);
             self.stack.truncate(frame.stack_base);
@@ -4747,7 +6202,8 @@ impl VmHost for VM {
                 .map_err(|e| self.make_err(format!("import '{key}': failed to read file: {e}")))?;
             let (stmts, polyglot_blocks) = pblang_core::parse_with_polyglot(&src)
                 .map_err(|e| self.make_err(format!("import '{key}': parse failed: {e:?}")))?;
-            let mut chunk = pblang_compiler::compile(stmts);
+            let mut chunk = pblang_compiler::compile(stmts)
+                .map_err(|e| self.make_err(format!("import '{key}': compile error: {e}")))?;
             chunk.source_name = Some(Rc::new(key.clone()));
             chunk.source = Some(Rc::new(src));
 

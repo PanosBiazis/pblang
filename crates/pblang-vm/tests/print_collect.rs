@@ -10,7 +10,7 @@ fn prints_true_and_one() {
     "#;
 
     let stmts = parse(program).unwrap();
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).expect("compile failed");
 
     let mut vm = VM::with_stdlib(StdlibConfig::default());
     let out = vm.run_collect(chunk).unwrap();

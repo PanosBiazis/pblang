@@ -1,6 +1,4 @@
-//"G:\panag\Documents\projects\AAP\pl-dev\sapphire\crates\sapphire-core\src\lib.rs"
-
-pub mod lexer;
+// pub mod lexer; // REMOVED: Fix #10 — lexer.rs was dead code (never used)
 pub mod parser;
 
 use chumsky::{prelude::Simple, Parser};
@@ -67,6 +65,7 @@ pub enum TypeKind {
     Nil,
     Array(Box<TypeExpr>),
     Map(Box<TypeExpr>),
+    NonNull(Box<TypeExpr>), // T! — non-nullable variant; compiler enforces no nil assignment
 }
 
 pub type Param = (String, Option<TypeExpr>);
@@ -102,6 +101,16 @@ pub enum ExprKind {
         right: Box<Expr>,
     },
     Match(Box<Expr>, Vec<(MatchArm, Expr)>, Option<Box<Expr>>), // scrutinee, arms (pattern, body), else
+
+    // --- Safety / Rust-inspired operators ---
+    /// `expr?.field` — nil-safe attribute access; returns nil if expr is nil.
+    SafeGetAttr(Box<Expr>, String),
+    /// `expr?[idx]` — nil-safe index; returns nil if expr is nil.
+    SafeIndex(Box<Expr>, Box<Expr>),
+    /// `expr?` — Result unwrap: if expr is `{ok:false,...}` throw runtime error, else unwrap `.value`.
+    ResultUnwrap(Box<Expr>),
+    /// `!expr` — logical NOT.
+    Not(Box<Expr>),
 }
 
 /// Pattern in a match arm: literal value, bind to name, or wildcard.
@@ -132,8 +141,10 @@ pub enum StmtKind {
     Import(String),
     Export(Vec<String>),
     Let(String, Option<TypeExpr>, Expr),
+    /// `const name = expr;` — immutable binding; compiler prevents reassignment.
+    Const(String, Option<TypeExpr>, Expr),
     Assign(String, Expr),
-    SetIndex(Expr, Expr, Expr), // target[index] = value
+    SetIndex(Expr, Expr, Expr),  // target[index] = value
     SetAttr(Expr, String, Expr), // target.attr = value   (sugar for map/object set)
     Expr(Expr),                  // expression statement (evaluate + discard)
     If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
@@ -145,6 +156,17 @@ pub enum StmtKind {
     Block(Vec<Stmt>),
 }
 
+/// Mask `//` and `/* */` comments in `src` with spaces (length-preserving).
+///
+/// FIX #17: This function and `mask_and_extract_polyglot_blocks` share the same
+/// comment-detection logic. The duplicate was retained for now because each
+/// function operates on a different buffer (`src` bytes vs. a mutable Vec<u8>),
+/// but they should eventually be unified into a shared byte-level helper.
+///
+/// Both correctly handle:
+///  - Nested block comments `/* /* … */ */`
+///  - Single-quoted and double-quoted strings (escape sequences aware)
+///  - Newline preservation (so line-number spans remain stable)
 fn strip_comments_mask(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec(); // same length as input (byte offsets preserved)
@@ -354,7 +376,11 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
 
     while i < out.len() {
         let b = out[i];
-        let next = if i + 1 < out.len() { Some(out[i + 1]) } else { None };
+        let next = if i + 1 < out.len() {
+            Some(out[i + 1])
+        } else {
+            None
+        };
 
         if in_string {
             if b == b'"' && !prev_was_backslash {
@@ -490,7 +516,11 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
 
                     while p < out.len() {
                         let bb = out[p];
-                        let nn = if p + 1 < out.len() { Some(out[p + 1]) } else { None };
+                        let nn = if p + 1 < out.len() {
+                            Some(out[p + 1])
+                        } else {
+                            None
+                        };
 
                         if in_dq {
                             if bb == b'"' && !prev_bs {
@@ -574,9 +604,9 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
                                 });
 
                                 // mask region to spaces (preserve newlines)
-                                for idx in block_start..=block_end_inclusive {
-                                    if out[idx] != b'\n' {
-                                        out[idx] = b' ';
+                                for byte in out[block_start..=block_end_inclusive].iter_mut() {
+                                    if *byte != b'\n' {
+                                        *byte = b' ';
                                     }
                                 }
 
@@ -601,15 +631,29 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
         i += 1;
     }
 
-    (String::from_utf8(out).unwrap_or_else(|_| src.to_string()), blocks)
+    (
+        String::from_utf8(out).unwrap_or_else(|_| src.to_string()),
+        blocks,
+    )
 }
 
-pub fn parse_with_polyglot(input: &str) -> Result<(Vec<Stmt>, Vec<PolyglotBlock>), Vec<Simple<char>>> {
+/// Type alias for the result of `parse_with_polyglot` to tame the complex type signature.
+pub type ParseWithPolyglotResult = Result<(Vec<Stmt>, Vec<PolyglotBlock>), Vec<Simple<char>>>;
+
+pub fn parse_with_polyglot(
+    input: &str,
+) -> ParseWithPolyglotResult {
     // Preprocess in a byte-offset-stable way.
     let (masked, blocks) = mask_and_extract_polyglot_blocks(input);
     let masked = strip_comments_mask(&masked);
-    let stmts = parser().parse(masked.as_str())?;
-    Ok((stmts, blocks))
+    // Use parse_recovery so that minor spurious errors (e.g. from parser backtracking in
+    // postfix choice) do not prevent a valid AST from being returned. Only return Err if
+    // the parser could not produce any output at all.
+    let (output, errors) = parser().parse_recovery(masked.as_str());
+    match output {
+        Some(stmts) => Ok((stmts, blocks)),
+        None => Err(errors),
+    }
 }
 
 pub fn extract_polyglot_blocks(input: &str) -> Vec<PolyglotBlock> {

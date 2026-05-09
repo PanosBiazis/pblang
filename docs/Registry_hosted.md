@@ -1,74 +1,71 @@
-# Registry hosted
+# Hosted registry — design note (M3-gamma)
 
-This document describes how `sapphire` interacts with a **hosted** (HTTP/HTTPS)
-registry, including authentication, token refresh, and publish retry behaviour.
+Design-only document. No server implementation in this repo.
 
----
+## Purpose
 
-## M4-gamma: Token refresh flow
+Define the HTTP API and auth model for a **hosted** Sapphire package registry (as opposed to the existing local file-based registry and `pblang publish --registry-dir`).
 
-When `sapphire publish` receives a 401 Unauthorized response from a hosted registry:
+## API (target shape)
 
-1. The CLI reads `PBLANG_REGISTRY_REFRESH_TOKEN` environment variable.
-2. If set, posts a refresh request to `<registry>/auth/refresh`:
-   ```
-   POST <registry>/auth/refresh
-   Content-Type: application/json
-   {"refresh_token": "<PBLANG_REGISTRY_REFRESH_TOKEN>"}
-   ```
-3. On success, the response should contain `{"token": "<new_access_token>"}`.
-4. The publish is retried once with the new token as Bearer auth.
-5. If the retry succeeds, prints `Refreshed token and retried`.
-6. If the retry also fails (non-2xx), or if no refresh token is set, the original
-   401 error is returned.
+- **GET** `/<base>/index.json` — Registry index: list of package names and versions (and optional `sha256` per tarball). Same JSON shape as the local index used by `pblang install --registry-index`.
+- **GET** `/<base>/tarball/<name>/<version>` — Download package tarball (e.g. `name-version.tar.gz`).
+- **GET** `/<base>/tarball/<name>/<version>.sha256` — Optional sidecar: HMAC-SHA256 of the tarball (for verify-on-install when `PBLANG_SIGNING_KEY` is set).
+- **POST** `/<base>/publish` — Publish a new package version. Body: tarball bytes or multipart; auth required. Idempotent for same name+version+content.
+- **GET** `/<base>/search?q=<query>` — Search packages by name/description (optional; not required for MVP).
 
-### Environment variables
+## Auth model
 
-| Variable | Purpose |
-|---|---|
-| `PBLANG_REGISTRY_TOKEN` | Primary access token for publish/search (Bearer auth). |
-| `PBLANG_REGISTRY_REFRESH_TOKEN` | Refresh token used to obtain a new access token on 401. |
-| `PBLANG_REGISTRY_INDEX` | Registry base URL (e.g. `https://registry.pblang.io` or `file:///path/to/local/registry`). |
+- **Publish**: Bearer token in `Authorization` header. Token supplied via env (e.g. `PBLANG_REGISTRY_TOKEN`) or future CLI flag (e.g. `--registry-token`). No auth for read (index + tarball) in the base design.
+- **Optional**: Registry could support private packages later (read with token); out of scope for this note.
 
-### Example publish flow with token refresh
+## Future client changes (deferred to M3-delta)
 
-```bash
-export PBLANG_REGISTRY_INDEX=https://registry.example.com
-export PBLANG_REGISTRY_TOKEN=my-access-token
-export PBLANG_REGISTRY_REFRESH_TOKEN=my-refresh-token
+- **Publish from client**: `pblang publish --registry-url <url> [--registry-token <token>]` to POST to a hosted registry instead of writing to a local directory.
+- **Search from client**: `pblang search <query> [--registry-index <url>]` to call GET search (if the server implements it).
+- **Manifest**: Optional `[registry]` section in `pblang.toml` to set default registry URL/token per project; not required for first hosted rollout.
 
-# If the access token expires mid-session, publish auto-refreshes:
-pblang publish
-# Output: Refreshed token and retried
-# Output: Published to https://registry.example.com
-```
+## M4-beta: Remote publish + search (client)
 
-### Refresh endpoint contract
+### `pblang publish`
 
-The hosted registry **must** implement:
+- Reads **`PBLANG_REGISTRY_INDEX`** (env) as the registry base URL.
+- For **file-based registries**, `PBLANG_REGISTRY_INDEX=file:///path/to/registry_dir`:
+  - `pblang publish` behaves as a hosted-style wrapper around the existing local registry:
+    it packages the current manifest dir, validates that the package is self-contained and
+    has at least one Sapphire module entry, and delegates to the same logic as
+    `pblang publish --registry-dir /path/to/registry_dir`.
+  - This updates `<registry_dir>/index.json` and writes a tarball named
+    `<name>-<version>.tar.gz` under the registry directory.
+- For **hosted registries** (http/https), `PBLANG_REGISTRY_INDEX=https://registry.example.com`:
+  - `pblang publish` builds a tarball from the current package root (same file set as
+    `create_package_tarball`), computes its sha256, and POSTs a multipart/form-data body
+    to `PBLANG_REGISTRY_INDEX + "/publish"`.
+  - Multipart fields:
+    - `tarball` — raw tar.gz bytes, filename `<name>-<version>.tar.gz`, `Content-Type: application/gzip`.
+    - `sha256` — hex-encoded sha256 of the tarball.
+    - `metadata` — JSON object `{ "name": "<name>", "version": "<version>", "description": "<desc>" }`.
+  - Auth: Bearer token via `Authorization: Bearer <token>` header, where the token is read from
+    `PBLANG_REGISTRY_TOKEN` or optional CLI flag `--registry-token=<token>`.
+  - Server is expected to enforce immutability per `<name> + <version>` and may reject
+    mismatched content.
 
-```
-POST /auth/refresh
-Content-Type: application/json
+### `pblang search <query>`
 
-Request body:
-  {"refresh_token": "<opaque string>"}
+- Reads **`PBLANG_REGISTRY_INDEX`** (env) as the registry base URL.
+- For **file-based registries** (`file://`):
+  - Reads `<registry_dir>/index.json` directly and returns a list of matches by simple
+    substring search over package names and versions.
+  - Output format:
+    - `<name> @ <version>` when description is not available in the index.
+- For **hosted registries** (http/https):
+  - Issues **GET** `PBLANG_REGISTRY_INDEX + "/search?q=<query>"`.
+  - Expects a JSON array of `{ "name": string, "version": string, "description": string }`.
+  - Prints one line per result:
+    - `<name> @ <version> — <description>`
+  - If the array is empty, prints `No results for '<query>'`.
 
-Success response (HTTP 200):
-  {"token": "<new_access_token>"}
+## Non-goals (this document)
 
-Error response (HTTP 4xx/5xx):
-  Any non-2xx status — publish_package surfaces the error as-is.
-```
-
-If the refresh endpoint itself returns a non-2xx status the error is propagated
-and the package is **not** published.
-
-### Code location
-
-The implementation lives in `crates/pblang-pm/src/lib.rs`:
-
-- **`publish_package`** — main publish function; matches on `ureq::Error::Status(401, _)`
-  and delegates to `refresh_access_token`.
-- **`refresh_access_token`** — private helper that POSTs to `/auth/refresh` and
-  extracts the new token from the JSON response.
+- Implementing the server (separate service/repo).
+- Defining a formal OpenAPI spec (this is a design note only).

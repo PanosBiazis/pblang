@@ -28,6 +28,11 @@ impl Ty {
             TypeKind::Nil => Ty::Nil,
             TypeKind::Array(inner) => Ty::Array(Box::new(Ty::from_type_expr(inner))),
             TypeKind::Map(inner) => Ty::Map(Box::new(Ty::from_type_expr(inner))),
+            // FIX #18b: T! (NonNull) constraint is currently ERASED here —
+            // we convert it to the inner type and lose the non-null requirement.
+            // A proper implementation would add nil-assignment guards in the compiler.
+            // Tracked as audit finding #18.
+            TypeKind::NonNull(inner) => Ty::from_type_expr(inner),
         }
     }
 
@@ -76,6 +81,26 @@ impl Env {
     }
 }
 
+/// Run the pblang type checker over a parsed statement list.
+///
+/// # Audit Note (Fix #18) — Limitations
+///
+/// The type checker is currently a **best-effort inference pass** only.
+/// The following are NOT checked and generate no warnings:
+///
+/// - Function return type annotations (`fn f() -> number`): return types are
+///   parsed but never verified against actual return expressions.
+/// - Type annotation mismatches on `let`/`const` (`let x: number = "hello"`
+///   will NOT produce a diagnostic).
+/// - The `NonNull` type (`T!`): the non-null constraint is silently erased
+///   at line 33 (`TypeKind::NonNull(inner) => Ty::from_type_expr(inner)`).
+///   No nil-assignment check is performed.
+/// - Generic/struct/enum types: not yet designed.
+///
+/// `pblang lint` WILL catch: undeclared variable reads, basic type mismatches
+/// in expressions where both sides have a known concrete type, and parse errors.
+///
+/// A full Hindley-Milner type inference engine is planned for a future version.
 pub fn check(stmts: &[Stmt]) -> Vec<Diagnostic> {
     let mut diags = vec![];
     let mut env = Env::new();
@@ -261,6 +286,25 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
             let _ = infer_expr(b, env, diags);
             Ty::Bool
         }
+
+        // Safety operators
+        ExprKind::Not(inner) => {
+            let _ = infer_expr(inner, env, diags);
+            Ty::Bool
+        }
+        ExprKind::SafeGetAttr(obj, _name) => {
+            let _ = infer_expr(obj, env, diags);
+            Ty::Any // nil-safe attr: result is T | nil
+        }
+        ExprKind::SafeIndex(obj, idx) => {
+            let _ = infer_expr(obj, env, diags);
+            let _ = infer_expr(idx, env, diags);
+            Ty::Any // nil-safe index: result is element_type | nil
+        }
+        ExprKind::ResultUnwrap(inner) => {
+            let _ = infer_expr(inner, env, diags);
+            Ty::Any // unwrapped value type depends on the Result
+        }
     }
 }
 
@@ -393,5 +437,29 @@ fn check_stmt(
             let _ = infer_expr(v, env, diags);
         }
         StmtKind::Import(_) | StmtKind::Export(_) => {}
+
+        // `const name = expr;` — same as Let but additionally check non-nullable if annotation ends in `!`
+        StmtKind::Const(name, ty, init) => {
+            let init_ty = infer_expr(init, env, diags);
+            // Reject nil assignment to const (non-null semantics for const)
+            if matches!(init_ty, Ty::Nil) {
+                diags.push(Diagnostic {
+                    message: format!("const '{}' cannot be initialized to nil", name),
+                    span: Some(s.span),
+                });
+            }
+            if let Some(t) = ty {
+                let ann = Ty::from_type_expr(t);
+                if !init_ty.is_assignable_to(&ann) {
+                    diags.push(Diagnostic {
+                        message: format!("type mismatch in const '{}': cannot assign {init_ty:?} to {ann:?}", name),
+                        span: Some(s.span),
+                    });
+                }
+                env.insert(name.clone(), ann);
+            } else {
+                env.insert(name.clone(), init_ty);
+            }
+        }
     }
 }

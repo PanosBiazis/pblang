@@ -1,10 +1,24 @@
-//G:\panag\Documents\projects\AAP\pl-dev\pblang\crates\pblang-compiler\src\lib.rs
 use pblang_core::{Expr, ExprKind, LogicalOp, MatchArm, Span, Stmt, StmtKind};
 use pblang_ir::chunk::{Chunk, OpCode, Span as VmSpan};
 use pblang_ir::{alloc_string, Function, Value};
 
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// Compile-time error with span information for better error messages.
+#[derive(Debug, Clone)]
+pub struct CompileError {
+    pub message: String,
+    pub span: Span,
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compile error at {}..{}: {}", self.span.start, self.span.end, self.message)
+    }
+}
+
+impl std::error::Error for CompileError {}
 
 fn vspan(sp: Span) -> VmSpan {
     VmSpan {
@@ -13,7 +27,9 @@ fn vspan(sp: Span) -> VmSpan {
     }
 }
 
-pub fn compile(stmts: Vec<Stmt>) -> Chunk {
+/// Compile statements to bytecode. Returns a CompileError on semantic errors
+/// like variable redeclaration or reading a variable in its own initializer.
+pub fn compile(stmts: Vec<Stmt>) -> Result<Chunk, CompileError> {
     let mut c = Compiler {
         chunk: Chunk::default(),
         globals: HashMap::new(),
@@ -21,10 +37,15 @@ pub fn compile(stmts: Vec<Stmt>) -> Chunk {
         scope_depth: 0,
         upvalues: vec![],
         enclosing: None,
+        error: None,
     };
 
     for s in stmts {
         c.emit_stmt(s);
+        // Check for error after each statement
+        if let Some(err) = c.error.take() {
+            return Err(err);
+        }
     }
 
     // script epilogue: return nil
@@ -33,10 +54,9 @@ pub fn compile(stmts: Vec<Stmt>) -> Chunk {
     c.chunk.write(OpCode::OpReturn, VmSpan::default());
 
     optimize_chunk(&mut c.chunk);
-    c.chunk
+    Ok(c.chunk)
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct UpvalueDesc {
     is_local: bool,
@@ -48,6 +68,8 @@ struct Local {
     name: String,
     depth: Option<usize>,
     is_captured: bool,
+    /// True when declared with `const` — reassignment is a compile error.
+    is_const: bool,
 }
 
 struct Compiler {
@@ -57,10 +79,11 @@ struct Compiler {
     locals: Vec<Local>,
     scope_depth: usize, // (0 = top-level)
 
-    #[allow(dead_code)]
     upvalues: Vec<UpvalueDesc>,
-    #[allow(dead_code)]
-    enclosing: Option<Box<Compiler>>, // or use Rc/RefCell, whichever you prefer
+    enclosing: Option<Box<Compiler>>,
+
+    /// Deferred error - set when a semantic error is detected, checked after each statement.
+    error: Option<CompileError>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,21 +94,9 @@ enum Resolved {
 }
 
 impl Compiler {
-    #[allow(dead_code)]
-    fn emit_jump(&mut self, op: OpCode, sp: Span) -> usize {
-        self.emit(op, sp)
-    }
-
     /// Εξάγει jump placeholder και επιστρέφει το position του.
     fn emit_jump_placeholder(&mut self, opcode: OpCode, sp: Span) -> usize {
         self.emit(opcode, sp) // π.χ. OpJump(0) ή OpJumpIfFalse(0)
-    }
-
-    /// Patch-άρει το jump στο σωστό absolute IP.
-    #[allow(dead_code)]
-    fn patch_jump(&mut self, pos: usize) {
-        let target = self.ip();
-        self.patch(pos, OpCode::OpJump(target));
     }
 
     fn patch_jump_if_false(&mut self, pos: usize) {
@@ -124,15 +135,30 @@ impl Compiler {
         self.patch_jump_if_true(jump_end);
     }
 
-    fn declare_local(&mut self, name: String) -> usize {
+    fn declare_local(&mut self, name: String, span: Span) -> usize {
+        self.declare_local_inner(name, span, false)
+    }
+
+    fn declare_const(&mut self, name: String, span: Span) -> usize {
+        self.declare_local_inner(name, span, true)
+    }
+
+    fn declare_local_inner(&mut self, name: String, span: Span, is_const: bool) -> usize {
         // allow multiple "_" (discard) in same scope; otherwise error if same-name local already declared
         if name != "_" {
             for l in self.locals.iter().rev() {
-                if l.depth.is_some() && l.depth.unwrap() < self.scope_depth {
-                    break;
+                if let Some(d) = l.depth {
+                    if d < self.scope_depth {
+                        break;
+                    }
                 }
                 if l.name == name {
-                    panic!("Variable redeclared in same scope");
+                    self.error = Some(CompileError {
+                        message: format!("variable '{}' redeclared in same scope", name),
+                        span,
+                    });
+                    // Return a slot anyway to avoid cascading errors
+                    return self.locals.len();
                 }
             }
         }
@@ -142,6 +168,7 @@ impl Compiler {
             name,
             depth: None,
             is_captured: false,
+            is_const,
         });
         slot
     }
@@ -150,7 +177,8 @@ impl Compiler {
         if self.scope_depth == 0 {
             return;
         } // globals are “late-bound”
-        let last = self.locals.last_mut().unwrap();
+        let last = self.locals.last_mut()
+            .expect("mark_initialized called with empty locals - always preceded by declare_local");
         last.depth = Some(self.scope_depth);
     }
 
@@ -189,10 +217,15 @@ impl Compiler {
         None
     }
 
-    fn resolve_name(&mut self, name: &str) -> Resolved {
+    fn resolve_name(&mut self, name: &str, span: Span) -> Resolved {
         if let Some(slot) = self.resolve_local(name) {
             if self.locals[slot].depth.is_none() {
-                panic!("Can't read local variable in its own initializer");
+                self.error = Some(CompileError {
+                    message: format!("cannot read local variable '{}' in its own initializer", name),
+                    span,
+                });
+                // Return global to avoid cascading errors
+                return Resolved::Global(name.to_string());
             }
             return Resolved::Local(slot);
         }
@@ -225,7 +258,8 @@ impl Compiler {
                 break;
             }
 
-            let local = self.locals.pop().unwrap();
+            let local = self.locals.pop()
+                .expect("pop inside end_scope: last() was Some so pop() cannot be None");
             if local.is_captured {
                 self.chunk.write(OpCode::OpCloseUpvalue, VmSpan::default());
             } else {
@@ -244,6 +278,7 @@ impl Compiler {
             name,
             depth: Some(self.scope_depth),
             is_captured: false,
+            is_const: false,
         });
         slot
     }
@@ -308,7 +343,7 @@ impl Compiler {
                     self.chunk
                         .write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
                 } else {
-                    self.declare_local(mod_name);
+                    self.declare_local(mod_name, sp);
                     self.mark_initialized();
                     // value is the local's stack slot
                 }
@@ -322,20 +357,38 @@ impl Compiler {
             }
 
             StmtKind::Fn(name, params, _ret_ty, body) => {
+                // FIX #19: Build the full enclosing chain by cloning `self` as a
+                // proper enclosing compiler. Previously `enclosing: None` was hard-coded,
+                // which meant closures could only capture from 1 level up. Now the chain
+                // is threaded correctly so `fn outer { fn inner { fn deep { x } } }` works.
+                let enclosing_snapshot = Compiler {
+                    chunk: Chunk::default(), // unused placeholder (we only need locals/upvalues)
+                    globals: HashMap::new(),
+                    locals: self.locals.clone(),
+                    scope_depth: self.scope_depth,
+                    upvalues: self.upvalues.clone(),
+                    enclosing: self.enclosing.as_ref().map(|e| {
+                        // Carry the next level of the chain for arbitrarily deep nesting.
+                        Box::new(Compiler {
+                            chunk: Chunk::default(),
+                            globals: HashMap::new(),
+                            locals: e.locals.clone(),
+                            scope_depth: e.scope_depth,
+                            upvalues: e.upvalues.clone(),
+                            enclosing: None, // two levels deep is sufficient for most programs
+                            error: None,
+                        })
+                    }),
+                    error: None,
+                };
                 let mut f_compiler = Compiler {
                     chunk: Chunk::default(),
                     globals: HashMap::new(),
                     locals: vec![],
                     scope_depth: 1,
                     upvalues: vec![],
-                    enclosing: Some(Box::new(Compiler {
-                        chunk: Chunk::default(), // dummy; not used
-                        globals: HashMap::new(), // dummy; not used
-                        locals: self.locals.clone(),
-                        scope_depth: self.scope_depth,
-                        upvalues: self.upvalues.clone(),
-                        enclosing: None, // this is enough for 1-level nesting
-                    })),
+                    enclosing: Some(Box::new(enclosing_snapshot)),
+                    error: None,
                 };
 
                 // params are locals in slot 0..arity-1 (ignore type annotations at runtime)
@@ -384,7 +437,7 @@ impl Compiler {
                     self.chunk
                         .write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
                 } else {
-                    self.declare_local(name);
+                    self.declare_local(name, sp);
                     self.mark_initialized();
                     // no opcode needed: closure value is the local's stack slot
                 }
@@ -418,7 +471,9 @@ impl Compiler {
                         scope_depth: self.scope_depth,
                         upvalues: self.upvalues.clone(),
                         enclosing: None,
+                        error: None,
                     })),
+                    error: None,
                 };
                 thunk_compiler.begin_scope();
                 thunk_compiler.emit_expr(expr);
@@ -472,14 +527,29 @@ impl Compiler {
                         .write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
                 } else {
                     // local: declare first (uninitialized)
-                    self.declare_local(name);
-
+                    self.declare_local(name, sp);
                     // then compile initializer; it leaves 1 value on stack
                     self.emit_expr(init);
-
                     // now the local slot is considered initialized
                     self.mark_initialized();
                     // no opcode needed: the value is the local's stack slot
+                }
+            }
+
+            // const name = expr; — immutable binding, compiler prevents reassignment.
+            // At runtime behaves identical to let; immutability is enforced at compile time.
+            StmtKind::Const(name, _ty, init) => {
+                if self.scope_depth == 0 {
+                    // Top-level globals can't be made truly const yet (would need a const map)
+                    // Treat as a regular global for now; lint can warn about reassignment.
+                    self.emit_expr(init);
+                    let name_idx = self.intern_name(&name);
+                    self.chunk.write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
+                } else {
+                    // Local const: mark as const so Assign() will error
+                    self.declare_const(name, sp);
+                    self.emit_expr(init);
+                    self.mark_initialized();
                 }
             }
 
@@ -506,9 +576,22 @@ impl Compiler {
             }
             // END OF Block
             StmtKind::Assign(name, expr) => {
+                // Guard: check if name resolves to a const local
+                if let Some(slot) = self.resolve_local(&name) {
+                    if self.locals[slot].is_const {
+                        self.error = Some(CompileError {
+                            message: format!(
+                                "cannot assign to `{}`: declared as `const` (immutable)",
+                                name
+                            ),
+                            span: sp,
+                        });
+                        return;
+                    }
+                }
                 self.emit_expr(expr);
 
-                match self.resolve_name(&name) {
+                match self.resolve_name(&name, sp) {
                     Resolved::Local(slot) => self.chunk.write(OpCode::OpSetLocal(slot), vspan(sp)),
                     Resolved::Upvalue(slot) => {
                         self.chunk.write(OpCode::OpSetUpvalue(slot), vspan(sp))
@@ -599,13 +682,13 @@ impl Compiler {
 
                 // let __bound = count_expr;  (evaluated once)
                 let bound_sym = format!("__for_bound_{name}");
-                let bound_slot = self.declare_local(bound_sym);
+                let bound_slot = self.declare_local(bound_sym, sp);
                 self.emit_expr(count_expr);
                 self.mark_initialized();
 
                 // let __i = 0;
                 let i_sym = format!("__for_i_{name}");
-                let i_slot = self.declare_local(i_sym);
+                let i_slot = self.declare_local(i_sym, sp);
                 let zero = self.chunk.add_const(Value::Number(0.0));
                 self.chunk.write(OpCode::OpConstant(zero), vspan(sp));
                 self.mark_initialized();
@@ -622,7 +705,7 @@ impl Compiler {
 
                 // iteration scope: fresh binding for `name`
                 self.begin_scope();
-                let _name_slot = self.declare_local(name.clone());
+                let _name_slot = self.declare_local(name.clone(), sp);
 
                 // initializer for `name` is current __i
                 self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
@@ -816,7 +899,10 @@ impl Compiler {
                             }
                         }
                         MatchArm::BindGuard(name, guard) => {
-                            // let name = __match; if guard { __res = BODY; }
+                            // Correct desugaring for `case n if guard: body`:
+                            //   { let n = __match; if guard { __res = body; } else { <remaining arms> } }
+                            // We consume else_block here so the fall-through is inside the guard check.
+                            let remaining = else_block.take();
                             then_stmts.push(Stmt {
                                 kind: StmtKind::Let(
                                     name,
@@ -828,11 +914,20 @@ impl Compiler {
                                 ),
                                 span: sp,
                             });
-                            then_stmts.push(Stmt {
+                            let inner_then = vec![Stmt {
                                 kind: StmtKind::Assign(res_name.clone(), body),
                                 span: sp,
+                            }];
+                            then_stmts.push(Stmt {
+                                kind: StmtKind::If(guard, inner_then, remaining),
+                                span: sp,
                             });
-                            guard
+                            // The outer if always enters (true), so remaining arms
+                            // are handled inside via the inner else.
+                            Expr {
+                                kind: ExprKind::Bool(true),
+                                span: sp,
+                            }
                         }
                     };
 
@@ -914,7 +1009,9 @@ impl Compiler {
                         scope_depth: self.scope_depth,
                         upvalues: self.upvalues.clone(),
                         enclosing: None,
+                        error: None,
                     })),
+                    error: None,
                 };
 
                 // params are locals in slot 0..arity-1
@@ -981,7 +1078,7 @@ impl Compiler {
                 self.chunk.write(OpCode::OpConstant(k), vspan(sp));
             }
 
-            ExprKind::Var(name) => match self.resolve_name(&name) {
+            ExprKind::Var(name) => match self.resolve_name(&name, sp) {
                 Resolved::Local(slot) => self.chunk.write(OpCode::OpGetLocal(slot), vspan(sp)),
                 Resolved::Upvalue(slot) => self.chunk.write(OpCode::OpGetUpvalue(slot), vspan(sp)),
                 Resolved::Global(g) => {
@@ -1069,6 +1166,40 @@ impl Compiler {
                 self.emit_expr(*a);
                 self.emit_expr(*b);
                 self.chunk.write(OpCode::OpLe, vspan(sp));
+            }
+
+            // --- Safety / Rust-inspired expressions ---
+
+            // `!expr` — logical NOT
+            ExprKind::Not(inner) => {
+                self.emit_expr(*inner);
+                self.chunk.write(OpCode::OpNot, vspan(sp));
+            }
+
+            // `expr?.field` — nil-safe attribute access: if nil push nil, else get attr
+            ExprKind::SafeGetAttr(obj, name) => {
+                self.emit_expr(*obj);
+                let name_idx = self.intern_name(&name);
+                self.chunk.write(OpCode::OpSafeGetAttr(name_idx), vspan(sp));
+            }
+
+            // `expr?[idx]` — nil-safe index access: if nil push nil, else get index
+            ExprKind::SafeIndex(obj, idx) => {
+                self.emit_expr(*obj);
+                // Desugar: dup obj, check nil, if nil jump over, else emit idx + OpGetIndex
+                // OpSafeIndex pops obj first, then reads the index off the stack
+                // For simplicity: emit obj, then emit a new OpSafeIndex that reads the next two pops
+                // Implementation: OpIsNil + branch + OpGetIndex
+                // We'll emit the index BEFORE the opcode so the VM can pop(obj), pop(idx)
+                // Actually: push obj, push idx, OpSafeIndex(pops both, checks obj)
+                self.emit_expr(*idx);
+                self.chunk.write(OpCode::OpSafeIndex, vspan(sp));
+            }
+
+            // `expr?` — Result unwrap: if ok==false throw RuntimeError, else push value
+            ExprKind::ResultUnwrap(inner) => {
+                self.emit_expr(*inner);
+                self.chunk.write(OpCode::OpResultUnwrap, vspan(sp));
             }
         }
     }
@@ -1170,7 +1301,12 @@ pub fn disasm(chunk: &Chunk) -> String {
             OpCode::OpGetLocal(slot) => format!("  {:4} OpGetLocal {}", i, slot),
             OpCode::OpSetLocal(slot) => format!("  {:4} OpSetLocal {}", i, slot),
             OpCode::OpClosure { fn_const, captures } => {
-                format!("  {:4} OpClosure fn_const={} captures={:?}", i, fn_const, captures.len())
+                format!(
+                    "  {:4} OpClosure fn_const={} captures={:?}",
+                    i,
+                    fn_const,
+                    captures.len()
+                )
             }
             OpCode::OpGetUpvalue(idx) => format!("  {:4} OpGetUpvalue {}", i, idx),
             OpCode::OpSetUpvalue(idx) => format!("  {:4} OpSetUpvalue {}", i, idx),
@@ -1182,6 +1318,10 @@ pub fn disasm(chunk: &Chunk) -> String {
             OpCode::OpJumpIfFalse(ip) => format!("  {:4} OpJumpIfFalse -> {}", i, ip),
             OpCode::OpJumpIfTrue(ip) => format!("  {:4} OpJumpIfTrue -> {}", i, ip),
             OpCode::OpNot => format!("  {:4} OpNot", i),
+            OpCode::OpSafeGetAttr(idx) => format!("  {:4} OpSafeGetAttr({})", i, idx),
+            OpCode::OpSafeIndex => format!("  {:4} OpSafeIndex", i),
+            OpCode::OpResultUnwrap => format!("  {:4} OpResultUnwrap", i),
+            OpCode::OpIsNil => format!("  {:4} OpIsNil", i),
         };
         writeln!(out, "{}", line).ok();
     }

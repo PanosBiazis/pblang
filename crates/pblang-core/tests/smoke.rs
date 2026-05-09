@@ -4,14 +4,14 @@ use pblang_vm::{StdlibConfig, VM};
 
 fn run_ok(src: &str) {
     let stmts = parse(src).expect("parse failed");
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).expect("compile failed");
     let mut vm = VM::with_stdlib(StdlibConfig::default());
     vm.run(chunk).expect("vm run failed");
 }
 
 fn run_err(src: &str) -> String {
     let stmts = parse(src).expect("parse failed");
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).expect("compile failed");
     let mut vm = VM::with_stdlib(StdlibConfig::default());
     vm.run(chunk).expect_err("expected runtime error").message
 }

@@ -1,43 +1,43 @@
-# Sapphire tooling
+# pblang Tooling
 
 ## CLI commands
 
-- **`sapphire init`** — Create `pblang.toml` in the current directory (package name `my-app`, version `0.1.0`, empty dependencies). Fails if the file already exists.
-- **`sapphire run [file.sapp|dir] [-- arg1 arg2 ...]`** — Execute a script and exit. Arguments after `--` are passed to the script and available via `os.args()` (from `stdlib:os.sapp`). If you pass a directory (or run `sapphire run` from inside a manifest dir), Sapphire resolves the package entry from `pblang.toml`: first `[package].entry`, otherwise `main.sap`, `main.sapp`, `src/main.sap`, `src/main.sapp`.
-- **`sapphire --check <file>`** — Parse and typecheck; print diagnostics.
-- **`sapphire --doc <file> [--html] [out_dir]`** — Print module docs (exports, top-level functions, polyglot blocks). Polyglot blocks now include parsed attrs and code-line counts in both text and HTML output, so the current block contract is more inspectable from tooling. With `--html`, write `out_dir/index.html` (default `docs/`).
-- **`sapphire --lock [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from `pblang.toml`. With **`--registry-index \<url\>`**, registry dependencies are resolved from that index for this invocation instead of relying on the environment. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command even if the env var is unset. See [Lockfile_contract.md](Lockfile_contract.md).
-- **`sapphire test [dir]`** — Run all `.sap`/`.sapp` files in `dir` (default: `tests/`); prints "N passed, M failed", exit 1 if any fail.
-- **`sapphire fmt [--max-line-length=N] [file.sap …]`** — Format one or more `.sap`/`.sapp` files: trim lines, **spacing around binary operators** (`+` `-` `*` `/` `==` `!=` `<` `>` `<=` `>=`), **comma spacing** (space after comma; unchanged inside string literals), indent by brace depth (4 spaces per level), optional **line wrap** when `--max-line-length=N` is set (wraps at last space before N), ensure final newline, and insert a single blank line between top-level `fn` declarations. Does not change content inside string literals. Only overwrites if content changed.
-- **`sapphire lint [file.sap …]`** — Parse and typecheck each file; print diagnostics (errors and warnings). Reports **unused variable**, **unused import** (bindings never read), and **variable shadows outer binding** (L2-beta) warnings. Exit 1 only on parse or typecheck errors; warnings do not change exit code.
+- **`pblang init`** — Create `pblang.toml` in the current directory (package name `my-app`, version `0.1.0`, empty dependencies). Fails if the file already exists.
+- **`pblang run [file.sapp|dir] [-- arg1 arg2 ...]`** — Execute a script and exit. Arguments after `--` are passed to the script and available via `os.args()` (from `stdlib:os.sapp`). If you pass a directory (or run `pblang run` from inside a manifest dir), Sapphire resolves the package entry from `pblang.toml`: first `[package].entry`, otherwise `main.sap`, `main.sapp`, `src/main.sap`, `src/main.sapp`.
+- **`pblang --check <file>`** — Parse and typecheck; print diagnostics.
+- **`pblang --doc <file> [--html] [out_dir]`** — Print module docs (exports, top-level functions, polyglot blocks). Polyglot blocks now include parsed attrs and code-line counts in both text and HTML output, so the current block contract is more inspectable from tooling. With `--html`, write `out_dir/index.html` (default `docs/`).
+- **`pblang --lock [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from `pblang.toml`. With **`--registry-index \<url\>`**, registry dependencies are resolved from that index for this invocation instead of relying on the environment. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command even if the env var is unset. See [Lockfile_contract.md](Lockfile_contract.md).
+- **`pblang test [dir]`** — Run all `.sap`/`.sapp` files in `dir` (default: `tests/`); prints "N passed, M failed", exit 1 if any fail.
+- **`pblang fmt [--max-line-length=N] [file.sap …]`** — Format one or more `.sap`/`.sapp` files: trim lines, **spacing around binary operators** (`+` `-` `*` `/` `==` `!=` `<` `>` `<=` `>=`), **comma spacing** (space after comma; unchanged inside string literals), indent by brace depth (4 spaces per level), optional **line wrap** when `--max-line-length=N` is set (wraps at last space before N), ensure final newline, and insert a single blank line between top-level `fn` declarations. Does not change content inside string literals. Only overwrites if content changed.
+- **`pblang lint [file.sap …]`** — Parse and typecheck each file; print diagnostics (errors and warnings). Reports **unused variable**, **unused import** (bindings never read), and **variable shadows outer binding** (L2-beta) warnings. Exit 1 only on parse or typecheck errors; warnings do not change exit code.
 
 ## Error UX (L2-gamma)
 
 - Parse and runtime errors print **`error[<file>:<line>:<col>]: <message>`** when location is available.
 - If location is unavailable (e.g. REPL), falls back to **`error[<line>:<col>]: <message>`** or **`error: <message>`**.
 - Example: **`error[src/main.sapp:3:5]: unexpected token ';'`**
-- **`sapphire build [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from manifest dir, then typecheck the resolved package entry. With **`--registry-index \<url\>`**, registry dependencies are resolved explicitly for this build. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command. Exit 1 on lock or typecheck failure.
-- **`sapphire install [--registry-index \<url\>] [--require-registry-sha256] [path | <name>@<version>]`** — Resolve dependencies and generate `pblang.lock` when given a manifest **`path`** (existing behavior), or **fetch a single registry package** when invoked as `sapphire install <name>@<version>`. With **`--registry-index \<url\>`**, registry dependencies (names starting with `@`) are resolved from that index (file:// or http(s)://). Static registry indexes may point to tarballs with either absolute URLs or paths relative to `index.json`. Git dependencies can use `{ git = \"...\", rev = \"...\" }` and are installed as pinned cached checkouts. Registry tarballs are unpacked with a safe-entry policy: paths must stay relative inside the cache destination, and link entries are rejected. **Verify on install (E4-beta):** when **`PBLANG_SIGNING_KEY`** is set and a `.sha256` sidecar exists at the tarball URL (same URL + `.sha256`), install verifies HMAC-SHA256 of the tarball before unpacking and rejects with an error on mismatch; if the key is set but no sidecar is found, a warning is printed and install continues. Third-party registry/git packages are validated during install: a declared `[package].entry` must resolve to an in-package file, otherwise the package must still contain at least one `.sap`/`.sapp` module. Otherwise uses **`PBLANG_REGISTRY_INDEX`** env var if set for registry deps. **`REQUIRE_REGISTRY_SHA256=1`** (or `true`) or **`--require-registry-sha256`** forces index entries to include sha256. **M4-alpha:** in `<name>@<version>` mode, `sapphire install` resolves the highest semver version satisfying `<version>` from the hosted index, downloads and unpacks it into the Sapphire cache, and prints `Installed <name>@<resolved_version>`.
-- **`sapphire publish --registry-dir \<dir\> [path]`** — Pack current package (from `pblang.toml` [package] name/version) into \<name\>-\<ver\>.tar.gz, write to \<dir\>, and update \<dir\>/index.json. If `[package].entry` is declared, `publish` validates that it is a relative in-package path and that the target is an existing file before writing any registry artifact. In the current local-registry MVP, published packages must also be **self-contained**: if `[dependencies]` is non-empty, `publish` fails instead of producing a non-portable registry artifact. Packages without explicit `[package].entry` are still allowed, but they must expose at least one Sapphire module file: either a default bare-import entry (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`) or another `.sap`/`.sapp` module for package subpath imports. Other projects can then run `sapphire install --registry-index file:///path/to/dir/index.json`.
-- **`sapphire publish`** — Hosted-style publish flow built on the same packaging and validation rules:
-  - Reads **`PBLANG_REGISTRY_INDEX`** as registry base URL. For `file://` URLs pointing at a registry directory, `sapphire publish` behaves as a thin wrapper around `sapphire publish --registry-dir <dir>` (local file-based registry) so that tests and local workflows can use the same command.
-  - For http(s) registries, `sapphire publish` builds a tarball of the current package root, computes its sha256, and POSTs a multipart/form-data body to `<registry>/publish` with fields `tarball` (bytes), `sha256` (hex), and `metadata` JSON (`{name, version, description}`).
+- **`pblang build [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from manifest dir, then typecheck the resolved package entry. With **`--registry-index \<url\>`**, registry dependencies are resolved explicitly for this build. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command. Exit 1 on lock or typecheck failure.
+- **`pblang install [--registry-index \<url\>] [--require-registry-sha256] [path | <name>@<version>]`** — Resolve dependencies and generate `pblang.lock` when given a manifest **`path`** (existing behavior), or **fetch a single registry package** when invoked as `pblang install <name>@<version>`. With **`--registry-index \<url\>`**, registry dependencies (names starting with `@`) are resolved from that index (file:// or http(s)://). Static registry indexes may point to tarballs with either absolute URLs or paths relative to `index.json`. Git dependencies can use `{ git = \"...\", rev = \"...\" }` and are installed as pinned cached checkouts. Registry tarballs are unpacked with a safe-entry policy: paths must stay relative inside the cache destination, and link entries are rejected. **Verify on install (E4-beta):** when **`PBLANG_SIGNING_KEY`** is set and a `.sha256` sidecar exists at the tarball URL (same URL + `.sha256`), install verifies HMAC-SHA256 of the tarball before unpacking and rejects with an error on mismatch; if the key is set but no sidecar is found, a warning is printed and install continues. Third-party registry/git packages are validated during install: a declared `[package].entry` must resolve to an in-package file, otherwise the package must still contain at least one `.sap`/`.sapp` module. Otherwise uses **`PBLANG_REGISTRY_INDEX`** env var if set for registry deps. **`REQUIRE_REGISTRY_SHA256=1`** (or `true`) or **`--require-registry-sha256`** forces index entries to include sha256. **M4-alpha:** in `<name>@<version>` mode, `pblang install` resolves the highest semver version satisfying `<version>` from the hosted index, downloads and unpacks it into the Sapphire cache, and prints `Installed <name>@<resolved_version>`.
+- **`pblang publish --registry-dir \<dir\> [path]`** — Pack current package (from `pblang.toml` [package] name/version) into \<name\>-\<ver\>.tar.gz, write to \<dir\>, and update \<dir\>/index.json. If `[package].entry` is declared, `publish` validates that it is a relative in-package path and that the target is an existing file before writing any registry artifact. In the current local-registry MVP, published packages must also be **self-contained**: if `[dependencies]` is non-empty, `publish` fails instead of producing a non-portable registry artifact. Packages without explicit `[package].entry` are still allowed, but they must expose at least one Sapphire module file: either a default bare-import entry (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`) or another `.sap`/`.sapp` module for package subpath imports. Other projects can then run `pblang install --registry-index file:///path/to/dir/index.json`.
+- **`pblang publish`** — Hosted-style publish flow built on the same packaging and validation rules:
+  - Reads **`PBLANG_REGISTRY_INDEX`** as registry base URL. For `file://` URLs pointing at a registry directory, `pblang publish` behaves as a thin wrapper around `pblang publish --registry-dir <dir>` (local file-based registry) so that tests and local workflows can use the same command.
+  - For http(s) registries, `pblang publish` builds a tarball of the current package root, computes its sha256, and POSTs a multipart/form-data body to `<registry>/publish` with fields `tarball` (bytes), `sha256` (hex), and `metadata` JSON (`{name, version, description}`).
   - Auth: Bearer token from **`PBLANG_REGISTRY_TOKEN`** or optional CLI flag `--registry-token=<token>`.
-- **`sapphire search <query>`** — Search a hosted or file-based registry for packages:
+- **`pblang search <query>`** — Search a hosted or file-based registry for packages:
   - Reads **`PBLANG_REGISTRY_INDEX`** as registry base URL.
   - For `file://` URLs, reads `<dir>/index.json` directly and returns packages whose names or versions contain `<query>`. Output lines are `name @ version` (description is not stored in the local index).
   - For http(s) URLs, calls `<registry>/search?q=<query>` and expects a JSON array of `{name, version, description}`; prints one line per result as `name @ version — description`, or `No results for '<query>'` when there are no matches.
 - Local registry publish is **immutable per package name + version**: republishing the same version with identical content is allowed (idempotent success), but republishing the same version with different content fails.
-- After `sapphire install`, package imports can use the dependency name directly, e.g. `import("@sapphire/http")`, or a package subpath, e.g. `import("@sapphire/http:src/router.sapp")`. The resolver loads the installed package root from `pblang.lock`, first honors optional `[package].entry = "src/lib.sapp"` from that package's `pblang.toml`, and otherwise falls back to `lib.sapp` / `lib.sap` / `main.sapp` / `main.sap`. Both `entry` and package subpaths must be relative, stay inside the package root, and resolve to files rather than directories.
-- **`sapphire pack [--registry-index \<url\>] [--require-registry-sha256] [path] [out_file]`** — Stage A executables: δημιουργεί ένα ενιαίο `.tar.gz` artifact με το περιεχόμενο του πακέτου (manifest dir), συμπεριλαμβανομένων `pblang.toml`, ενημερωμένου `pblang.lock` και τοπικών dependencies. Το default `out_file` είναι `dist/app.tar.gz` μέσα στο manifest dir. **E4-gamma:** Before packing, manifest metadata is validated: `[package].target_platform` (if present) must be one of `any`, `linux`, `macos`, `windows`; `[package].min_runtime` (if present) must be a valid MAJOR.MINOR.PATCH version. Pack fails with a clear error otherwise. Αν το package έχει registry dependencies, το `pack` μπορεί πλέον να ξαναγεννήσει το lockfile με ρητό **`--registry-index \<url\>`** και **`--require-registry-sha256`** χωρίς να απαιτεί exported env var. Το `pack` κάνει validate ότι υπάρχει runnable package entry, ότι τα local path dependencies μένουν μέσα στο package root, και τυπώνει το resolved entry path. Η γραμμή επιτυχίας περιλαμβάνει προαιρετικά **name@version** και **description** από το `[package]` του manifest όταν υπάρχουν, και **οδηγία εκτέλεσης** (run hint): «To run: unpack the tarball and run 'sapphire run .' in the unpacked directory.» Για να τρέξεις το app: αποσυμπίεσε το tarball και εκτέλεσε `sapphire run` ή `sapphire run .` από τον unpacked φάκελο (χρησιμοποιεί το εγκατεστημένο `sapphire` binary, δεν χρειάζεται project folder στο origin).
-- **`sapphire bundle [--registry-index \<url\>] [--require-registry-sha256] [--self-extract] [path] [out_dir]`** — Create a portable folder (default `dist/`) containing the current sapphire executable, `pblang.toml`, `pblang.lock`, the resolved package entry, and local dependencies. **E4-gamma:** Same manifest metadata validation as `pack` (target_platform, min_runtime) before bundling. The bundled entry now preserves its relative path inside the package (for example `src/app.sapp`), so bundled apps with `[package].entry` work consistently. `bundle` now regenerates `pblang.lock` with the same registry flags as `pack`, so projects with registry dependencies can bundle through an explicit registry URL and strict-checksum CLI policy instead of relying only on env vars. Success output optionally includes **name@version** and **description** from `[package]` when present, and a **run hint**: «To run: cd to the bundle dir and run './sapphire run .' (sapphire.exe run . on Windows).» Local path dependencies must stay inside the package root; escaping or external paths are rejected instead of producing misleading bundles. Run from that folder with `./sapphire run .` (or `sapphire.exe run .` on Windows). When running a packaged app (`sapphire run .` from a manifest dir), **info** lines are printed to stderr when `target_platform` is not `any` or when `min_runtime` is set. **E5-beta:** the optional `--self-extract` flag is accepted and reserved for self-extracting bundle workflows built on top of the `sapphire-stub` launcher (see `docs/Native_backend_notes.md`); current behavior still produces a normal bundle directory.
-- **`sapphire --dump-bytecode <file>`** — Compile the file and print bytecode disassembly (constants + instructions). For debugging and reverse engineering.
-- **`sapphire --call-graph <file>`** (R2-alpha) — Print the call graph of a Sapphire source file as plain-text edges: `caller -> callee` (one per line). Top-level calls attributed to `<main>`. Functions with no outgoing calls print `funcname -> (no calls)`.
-- **`sapphire lsp`** / **`biapryx lsp`** (through L3-gamma) — Start a JSON-RPC 2.0 LSP server on stdin/stdout. Supports **initialize** (completionProvider, textDocumentSync, hoverProvider, definitionProvider), **initialized**, **textDocument/didOpen**/**didChange** (tracks open-file contents; didOpen is parsed with JSON unescaping so newlines in `text` are real line breaks), **textDocument/completion**, **textDocument/hover** (builtins and top-level locals — markdown stub), **textDocument/definition** (jump to `fn`/`let` declaration line for locals), **shutdown**, **exit**.
+- After `pblang install`, package imports can use the dependency name directly, e.g. `import("@sapphire/http")`, or a package subpath, e.g. `import("@sapphire/http:src/router.sapp")`. The resolver loads the installed package root from `pblang.lock`, first honors optional `[package].entry = "src/lib.sapp"` from that package's `pblang.toml`, and otherwise falls back to `lib.sapp` / `lib.sap` / `main.sapp` / `main.sap`. Both `entry` and package subpaths must be relative, stay inside the package root, and resolve to files rather than directories.
+- **`pblang pack [--registry-index \<url\>] [--require-registry-sha256] [path] [out_file]`** — Stage A executables: δημιουργεί ένα ενιαίο `.tar.gz` artifact με το περιεχόμενο του πακέτου (manifest dir), συμπεριλαμβανομένων `pblang.toml`, ενημερωμένου `pblang.lock` και τοπικών dependencies. Το default `out_file` είναι `dist/app.tar.gz` μέσα στο manifest dir. **E4-gamma:** Before packing, manifest metadata is validated: `[package].target_platform` (if present) must be one of `any`, `linux`, `macos`, `windows`; `[package].min_runtime` (if present) must be a valid MAJOR.MINOR.PATCH version. Pack fails with a clear error otherwise. Αν το package έχει registry dependencies, το `pack` μπορεί πλέον να ξαναγεννήσει το lockfile με ρητό **`--registry-index \<url\>`** και **`--require-registry-sha256`** χωρίς να απαιτεί exported env var. Το `pack` κάνει validate ότι υπάρχει runnable package entry, ότι τα local path dependencies μένουν μέσα στο package root, και τυπώνει το resolved entry path. Η γραμμή επιτυχίας περιλαμβάνει προαιρετικά **name@version** και **description** από το `[package]` του manifest όταν υπάρχουν, και **οδηγία εκτέλεσης** (run hint): «To run: unpack the tarball and run 'pblang run .' in the unpacked directory.» Για να τρέξεις το app: αποσυμπίεσε το tarball και εκτέλεσε `pblang run` ή `pblang run .` από τον unpacked φάκελο (χρησιμοποιεί το εγκατεστημένο `sapphire` binary, δεν χρειάζεται project folder στο origin).
+- **`pblang bundle [--registry-index \<url\>] [--require-registry-sha256] [--self-extract] [path] [out_dir]`** — Create a portable folder (default `dist/`) containing the current sapphire executable, `pblang.toml`, `pblang.lock`, the resolved package entry, and local dependencies. **E4-gamma:** Same manifest metadata validation as `pack` (target_platform, min_runtime) before bundling. The bundled entry now preserves its relative path inside the package (for example `src/app.sapp`), so bundled apps with `[package].entry` work consistently. `bundle` now regenerates `pblang.lock` with the same registry flags as `pack`, so projects with registry dependencies can bundle through an explicit registry URL and strict-checksum CLI policy instead of relying only on env vars. Success output optionally includes **name@version** and **description** from `[package]` when present, and a **run hint**: «To run: cd to the bundle dir and run './pblang run .' (sapphire.exe run . on Windows).» Local path dependencies must stay inside the package root; escaping or external paths are rejected instead of producing misleading bundles. Run from that folder with `./pblang run .` (or `sapphire.exe run .` on Windows). When running a packaged app (`pblang run .` from a manifest dir), **info** lines are printed to stderr when `target_platform` is not `any` or when `min_runtime` is set. **E5-beta:** the optional `--self-extract` flag is accepted and reserved for self-extracting bundle workflows built on top of the `sapphire-stub` launcher (see `docs/Native_backend_notes.md`); current behavior still produces a normal bundle directory.
+- **`pblang --dump-bytecode <file>`** — Compile the file and print bytecode disassembly (constants + instructions). For debugging and reverse engineering.
+- **`pblang --call-graph <file>`** (R2-alpha) — Print the call graph of a Sapphire source file as plain-text edges: `caller -> callee` (one per line). Top-level calls attributed to `<main>`. Functions with no outgoing calls print `funcname -> (no calls)`.
+- **`pblang lsp`** / **`pblang lsp`** (through L3-gamma) — Start a JSON-RPC 2.0 LSP server on stdin/stdout. Supports **initialize** (completionProvider, textDocumentSync, hoverProvider, definitionProvider), **initialized**, **textDocument/didOpen**/**didChange** (tracks open-file contents; didOpen is parsed with JSON unescaping so newlines in `text` are real line breaks), **textDocument/completion**, **textDocument/hover** (builtins and top-level locals — markdown stub), **textDocument/definition** (jump to `fn`/`let` declaration line for locals), **shutdown**, **exit**.
 
 ## L3-beta: LSP scope-aware completion
 
-`sapphire lsp` / `biapryx lsp` tracks open files via `textDocument/didOpen` and
+`pblang lsp` / `pblang lsp` tracks open files via `textDocument/didOpen` and
 `textDocument/didChange` and includes local symbols in completion:
 
 - Top-level `fn <name>` declarations from the open file.
@@ -54,16 +54,16 @@ Always send `textDocument/didOpen` or `textDocument/didChange` before requesting
 
 ## Reverse engineering / bytecode
 
-**`sapphire --dump-bytecode <file>`** compiles a single `.sap` or `.sapp` file (no execution, no package resolution) and prints a human-readable disassembly of the generated bytecode. This supports debugging, inspection of compiler output, and reverse-engineering workflows.
+**`pblang --dump-bytecode <file>`** compiles a single `.sap` or `.sapp` file (no execution, no package resolution) and prints a human-readable disassembly of the generated bytecode. This supports debugging, inspection of compiler output, and reverse-engineering workflows.
 
 - **Output**: A constants table (literals, names, etc.) followed by the instruction stream with opcodes and operands. The format is implementation-defined and may change with the compiler; use it for inspection and tooling, not as a stable bytecode ABI.
 - **Limitations**: Single-file only; imports are not resolved. Safe for untrusted source only in the sense that no code is run.
-- **Typical use**: Verify what the compiler emitted for a given script, debug VM behavior, or build analysis tools on top of the disassembly. **R2-alpha:** **`sapphire --call-graph <file>`** prints caller→callee edges from the AST. **R2-beta:** **`sapphire --annotate <file>`** compiles the file and prints bytecode with source-line annotation: each instruction is preceded by a `-- line N -------  <source line>` header when the source line changes.
+- **Typical use**: Verify what the compiler emitted for a given script, debug VM behavior, or build analysis tools on top of the disassembly. **R2-alpha:** **`pblang --call-graph <file>`** prints caller→callee edges from the AST. **R2-beta:** **`pblang --annotate <file>`** compiles the file and prints bytecode with source-line annotation: each instruction is preceded by a `-- line N -------  <source line>` header when the source line changes.
 
 ## R3-beta: Symbol table dump
 
 ```bash
-sapphire --symbols <file>
+pblang --symbols <file>
 ```
 
 Prints a simple symbol table for all top-level declarations in the compiled chunk:
@@ -77,7 +77,7 @@ bytecode entry points without reading the full disassembly.
 ### R3-alpha: Data-flow / use-def analysis
 
 ```bash
-sapphire --dataflow <file>
+pblang --dataflow <file>
 ```
 
 Prints a simple use-def report for all variables in the file:
@@ -86,7 +86,7 @@ Prints a simple use-def report for all variables in the file:
 - **`use <name> line:<n>`** — variable read here (identifier occurrences).
 - **`WARN <name> assigned but never read`** — variables that are defined but never used.
 
-Complements `sapphire lint` (scope-level unused warnings) with a per-variable def/use trace useful for reverse engineering and refactoring workflows.
+Complements `pblang lint` (scope-level unused warnings) with a per-variable def/use trace useful for reverse engineering and refactoring workflows.
 
 ## Stdlib-style APIs
 
@@ -148,16 +148,16 @@ Complements `sapphire lint` (scope-level unused warnings) with a per-variable de
 
 ## Registry / install env vars
 
-- **`PBLANG_REGISTRY_INDEX`** — URL of the registry index or registry base (file:// or http(s)://). Used by `sapphire install`, `sapphire --lock`, `sapphire build`, `sapphire pack`, `sapphire bundle`, `sapphire publish`, and `sapphire search` when `--registry-index` is not passed. Required when the manifest has registry dependencies (names starting with `@`) and no explicit registry URL was given on the command line.
-- **`PBLANG_SIGNING_KEY`** — Optional. When set, `sapphire pack` writes a `<out_file>.sha256` HMAC sidecar; `sapphire verify <tarball>` checks it if the sidecar exists; **`sapphire install`** (E4-beta) fetches `<tarball_url>.sha256` for registry tarballs and verifies HMAC before unpacking, rejecting on mismatch.
-- **`REQUIRE_REGISTRY_SHA256`** — Set to `1` or `true` to require index entries to include a `sha256` field; resolution fails otherwise. Used by `sapphire install`, `sapphire --lock`, `sapphire build`, `sapphire pack`, and `sapphire bundle` when the explicit `--require-registry-sha256` flag is not passed.
+- **`PBLANG_REGISTRY_INDEX`** — URL of the registry index or registry base (file:// or http(s)://). Used by `pblang install`, `pblang --lock`, `pblang build`, `pblang pack`, `pblang bundle`, `pblang publish`, and `pblang search` when `--registry-index` is not passed. Required when the manifest has registry dependencies (names starting with `@`) and no explicit registry URL was given on the command line.
+- **`PBLANG_SIGNING_KEY`** — Optional. When set, `pblang pack` writes a `<out_file>.sha256` HMAC sidecar; `pblang verify <tarball>` checks it if the sidecar exists; **`pblang install`** (E4-beta) fetches `<tarball_url>.sha256` for registry tarballs and verifies HMAC before unpacking, rejecting on mismatch.
+- **`REQUIRE_REGISTRY_SHA256`** — Set to `1` or `true` to require index entries to include a `sha256` field; resolution fails otherwise. Used by `pblang install`, `pblang --lock`, `pblang build`, `pblang pack`, and `pblang bundle` when the explicit `--require-registry-sha256` flag is not passed.
 
-- **Hosted registry design (M3-gamma/M4-beta):** See **docs/Registry_hosted.md** for API and auth design (GET index/tarball/sha256, POST publish, GET search; bearer token for publish) and the M4-beta client flows for `sapphire publish` and `sapphire search`.
+- **Hosted registry design (M3-gamma/M4-beta):** See **docs/Registry_hosted.md** for API and auth design (GET index/tarball/sha256, POST publish, GET search; bearer token for publish) and the M4-beta client flows for `pblang publish` and `pblang search`.
 
 ## Registry semver (M3-alpha, M3-beta)
 
 - **crates/sapphire-pm/src/semver.rs**: **Version::parse(s)** → Option&lt;Version&gt;, **satisfies(version, range_str)** → bool. Range syntax: exact `1.2.3`, caret `^1.2.0`, tilde `~1.2.3`, `>=1.0.0`, `<=2.0.0`, `>1.0.0`, `<2.0.0`. Thirteen unit tests; intended for use in dependency resolution.
-- **M3-beta: semver wired into resolution** — `resolve_registry_dep` (and thus `sapphire install` / `sapphire --lock`) now uses **satisfies** to pick the highest available version that matches the requested range. If no candidate satisfies the range, resolution returns an error (e.g. "no version satisfies `^1.0.0`").
+- **M3-beta: semver wired into resolution** — `resolve_registry_dep` (and thus `pblang install` / `pblang --lock`) now uses **satisfies** to pick the highest available version that matches the requested range. If no candidate satisfies the range, resolution returns an error (e.g. "no version satisfies `^1.0.0`").
 ---
 
 ## SP1-gamma: OOP + functional conformance fixes
@@ -193,192 +193,94 @@ Complements `sapphire lint` (scope-level unused warnings) with a per-variable de
 - [Crash_resistance.md](Crash_resistance.md) — Error handling, determinism.
 - [lsp.md](lsp.md) — Language server (parse/typecheck diagnostics).
 
-## E5-gamma: Self-extracting binary (Stage A)
+---
 
-`biapryx bundle --self-extract --output <file> <path>` produces a standalone executable. The output is:
-- `biapryx-stub` bytes + `PBLANG_BUNDLE_START\x00` SENTINEL + gzip-compressed tarball
+## G3-gamma: nd.sapp linear algebra
 
-On execution, the stub:
-1. Finds the SENTINEL in its own bytes
-2. Extracts the tarball to `$TMPDIR/biapryx-run-<hash>/`
-3. Runs `biapryx run .` inside the extracted directory
-4. Cleans up on exit
+`stdlib/nd.sapp` now includes matrix inverse and solve:
 
-**Flags**:
-- `--help, -h`: Show help message
-- `--version, -V`: Show version information
-- `--extract-only <dir>`: Extract bundle without running
+- **`nd.mat_inv(A)`** — 2×2 or 3×3 matrix inverse (flat row-major array). Returns `nil` for singular matrices.
+- **`nd.mat_solve(A, b)`** — Solve `Ax = b` via Cramer's rule (2×2 and 3×3). Returns solution array or `nil` if singular.
 
-**Env**:
-- `PBLANG_RUNTIME`: Override the runtime binary path (defaults to `biapryx`)
+**Tests**: `nd_linalg_inv_solve_pass` in `tests/semantics.rs`.
 
-**Example**:
-```bash
-# Build the stub first
-cargo build --release --bin biapryx-stub
+---
 
-# Create a self-extracting binary
-biapryx bundle --self-extract --output myapp ./myproject
+## T5-beta: thread_pool stdlib helper
 
-# Run the self-extracting binary
-./myapp
+`stdlib/thread.sapp` now includes `thread_pool`:
 
-# Or extract without running
-./myapp --extract-only ./extracted
-```
+- **`thread.thread_pool(n_workers, tasks_array, worker_fn)`** — Spawns n_workers, distributes tasks via channel, collects results.
 
-**Binary Structure**:
-```
-[biapryx-stub binary bytes]
-[SENTINEL: "PBLANG_BUNDLE_START\x00"]
-[gzip-compressed tarball containing the app]
-```
+**Note**: `worker_fn` is called in spawned threads. Due to pblang's VM-per-thread model, closures are **not transferable** between threads. Use factory functions that return closures over primitive (number/string) captures. See `docs/Language_Semantics.md` for threading patterns.
 
-**Tests**:
-- `self_extract_binary_contains_sentinel`: Verifies output contains SENTINEL marker
-- `self_extract_runs_hello`: Verifies minimal hello app structure
+**Tests**: `thread_pool_stdlib_pass` in `tests/semantics.rs` (smoke test for export).
 
-## Q3-delta — Quantum Noise Model + Bloch Sphere Visualization
+---
 
-### Quantum Noise Model (stdlib/quantum_sim.sapp)
+## A4-gamma: tensor operations
 
-New functions added:
-- **`y_gate(state, q)`** — Y gate (bit flip + phase flip)
-- **`z_gate(state, q)`** — Z gate (phase flip on |1⟩ component)
-- **`add_depolarizing_noise(circ, p)`** — Depolarizing noise model
-  - Input: circuit (array of gate operations), probability p (0.0-1.0)
-  - After each gate, with probability p, insert a random error gate (X, Y, or Z)
-  - Uses `random_float()` for randomness
+`stdlib/tensor.sapp` now includes:
 
-### Bloch Sphere Visualization (stdlib/quantum_viz.sapp)
+- **`tensor.slice(t, start, end)`** — Slice a 1D tensor from flat index `start` to `end` (exclusive).
+- **`tensor.reshape(t, new_shape)`** — Reshape tensor to new shape (same total elements).
+- **`tensor.dot(a, b)`** — Matrix product `[m×k] × [k×n] → [m×n]` in pure pblang.
 
-New module created:
-- **`bloch_angles(state_2d)`** — Convert 2D state vector to Bloch sphere angles
-  - Input: `[alpha, beta]` (complex amplitudes as `[re, im]` pairs)
-  - Returns: `map{ "theta": theta, "phi": phi }`
-  - theta: polar angle (0 to π)
-  - phi: azimuthal angle (-π to π)
+See `examples/ai_chat_toolcall/main.sapp` for an OpenAI tool-call request/response example.
 
-- **`bloch_to_svg(theta, phi)`** — Generate SVG representation
-  - Creates 200x200 SVG with circle outline, axes, and state vector arrow
-  - Labels: |0⟩ and |1⟩ states
-  - Pure Sapphire implementation (no external dependencies)
-  - Uses Taylor series approximations for sin, cos, atan, arccos
+**Tests**: `tensor_ops_pass` in `tests/semantics.rs`.
 
-### Test Harness
+---
 
-- **`tests/semantics/quantum_noise_test.sapp`** — Comprehensive tests for:
-  - Bloch angles for |0⟩, |1⟩, |+⟩, |−⟩, |i+⟩ states
-  - SVG structure validation (tags, elements)
-  - Random_float range verification
-  - Quantum simulator integration
+## Q3-delta: quantum noise model + Bloch sphere
 
-- **`quantum_noise_depolarizing_pass`** test in `tests/semantics.rs`
+`stdlib/quantum_sim.sapp` additions:
+- **`qsim.y_gate(state, q)`** — Y Pauli gate (bit flip + phase flip)
+- **`qsim.z_gate(state, q)`** — Z Pauli gate (phase flip on |1⟩)
+- **`qsim.add_depolarizing_noise(circ, p)`** — Add depolarizing noise (probability `p` of X/Y/Z error per gate)
 
-## A4-gamma — AI Chat Tool-Call Example + Tensor Operations
+`stdlib/quantum_viz.sapp` (new):
+- **`qviz.bloch_angles(state_2d)`** — Convert 2-qubit state vector to Bloch sphere angles `{theta, phi}`
+- **`qviz.bloch_to_svg(theta, phi)`** — Generate SVG string of Bloch sphere with state vector arrow
 
-### Tensor Operations (stdlib/tensor.sapp)
+**Tests**: `quantum_noise_depolarizing_pass` in `tests/semantics.rs`.
 
-New functions added:
-- **`slice(t, start, end)`** — Extract slice from 1D tensor
-- **`reshape(t, new_rows, new_cols)`** — Reshape tensor to new dimensions
-- **`dot(a, b)`** — Matrix multiplication (2D) and vector dot product (1D)
+---
 
-### AI Chat Tool-Call Example
+## W4-gamma: TLS stub (Stage A)
 
-- **`examples/ai_chat_toolcall/main.sapp`** — Demonstrates OpenAI-style function calling
-  - Tool definition schema building
-  - `finish_reason == "tool_calls"` parsing
-  - Tool execution and result routing
-  - Provider registry integration pattern
+`stdlib/tls.sapp` now exports the TLS API surface:
 
-### Test Harness
+- **`tls.listen_tls(addr, cert_path, key_path)`** — Stage A stub (returns error map until rustls is integrated)
+- **`tls.serve_once_tls(addr, cert_path, key_path, handler)`** — Stage A stub
+- **`tls.serve_forever_tls(addr, cert_path, key_path, handler)`** — Stage A stub
+- **`tls.wrap_tls(tcp_handle, cert_path, key_path)`** — Stage A stub
 
-- **`tests/semantics/tensor_ops_test.sapp`** — Comprehensive tests for slice/reshape/dot
-- **`tensor_ops_pass`** test in `tests/semantics.rs`
+**Workaround**: Use a reverse proxy (nginx, Caddy) for HTTPS termination until rustls integration is complete. See `docs/TLS_notes.md`.
 
-## G3-gamma — Linear algebra in nd.sapp
+**Tests**: `tls_stub_exports_pass` in `tests/semantics.rs`.
 
-New functions in **`stdlib:nd.sapp`**:
+---
 
-- **`mat_inv(m)`** — Inverse of a 2×2 or 3×3 matrix (row-major flat array). Returns `nil` for singular matrices.
-- **`mat_solve(A, b)`** — Solve `Ax = b` using Cramer's rule (2×2 or 3×3). Returns `nil` if singular.
+## PL1-alpha: Polyglot block execution bridge
 
-```sapphire
-import "stdlib:nd.sapp";
-let A = [2, 1, 5, 3];     // [[2,1],[5,3]]
-let inv = nd.mat_inv(A);   // [3, -1, -5, 2]
-let x = nd.mat_solve(A, [4, 7]); // [5, -6]
-```
+`stdlib/polyglot.sapp`:
+- **`polyglot.run_block(lang, src)`** — Execute code in Python/Node/Bash/Ruby/Perl via subprocess.
+  Returns `map{ ok, stdout, stderr, exit_code }`. Requires `allow_exec` capability.
 
-Test: `nd_linalg_inv_solve_pass`.
+Supported languages: `"python"`, `"python3"`, `"node"`, `"js"`, `"javascript"`, `"bash"`, `"ruby"`, `"perl"`.
 
-## T5-beta — Thread pool stdlib helper
+**Tests**: `polyglot_exec_python_pass` in `tests/semantics.rs` (skips gracefully if Python not found).
 
-New function in **`stdlib:thread.sapp`**:
+---
 
-- **`thread_pool(n_workers, tasks_array, worker_fn)`** — Fan-out/fan-in worker pool. Spawns `n_workers` threads, distributes tasks via channel, calls `worker_fn(item)` per task, collects results.
+## OS1-alpha: os.sapp expansion
 
-```sapphire
-import "stdlib:thread.sapp";
-let results = thread.thread_pool(4, [1,2,3,4,5], fn(x) { return x * x; });
-// results: [1, 4, 9, 16, 25] (completion order may vary)
-```
+`stdlib/os.sapp` additions:
+- **`os.env_set(key, val)`** — Set environment variable (requires `allow_exec` capability)
+- **`os.signal_trap(sig, handler_fn)`** — Register signal handler stub (SIGINT/SIGTERM)
+- **`os.args()`** — Returns CLI args array (passed after `--` in `pblang run script.sapp -- arg1 arg2`)
+- **`os.exit(code)`** — Terminate process with exit code
 
-Deadlock diagnostic: workers exit cleanly when they receive the `nil` sentinel.
-Test: `thread_pool_stdlib_pass`.
+**Tests**: `os_env_set_pass` in `tests/semantics.rs`.
 
-## R3-gamma — CFG (control-flow graph) dump
-
-```bash
-pblang --cfg <file>           # plain text: BB0 -> BB1
-pblang --cfg <file> --cfg-dot # DOT format for Graphviz
-```
-
-Identifies basic blocks and emits edges. Test: `cfg_output_contains_basic_blocks`.
-
-## PL1-alpha — Polyglot block execution bridge
-
-New **`stdlib:polyglot.sapp`**:
-
-- **`run_block(lang, src)`** — Execute code in a foreign language via subprocess. Returns `map{ ok, stdout, stderr, exit_code }`. Requires `allow_exec` capability.
-
-```sapphire
-import "stdlib:polyglot.sapp";
-let r = polyglot.run_block("python3", "print('hello')");
-if r.ok { print r.stdout; }
-```
-
-Supported languages: `python`/`python3`, `node`/`js`/`javascript`, `bash`, `ruby`, `perl`.
-Test: `polyglot_exec_python_pass`.
-
-## ED1-alpha — VS Code extension scaffold
-
-Minimal VS Code extension in `editors/vscode/`:
-
-- `package.json` — contributes `pblang` language (`.sapp`, `.sap`), syntax grammar, run/check commands.
-- `src/extension.ts` — starts `pblang lsp` over stdio via `vscode-languageclient`.
-- `syntaxes/pblang.tmGrammar.json` — TextMate syntax highlighting.
-- `language-configuration.json` — bracket matching, comments.
-
-Install from source: `cd editors/vscode && npm install && npm run compile`, then F5 in VS Code.
-
-## PF1-alpha — `pblang new` project scaffold
-
-```bash
-pblang new <name> [--template web|lib|cli]
-```
-
-Creates `<name>/pblang.toml`, `<name>/src/main.sapp`, `<name>/.gitignore`.
-Templates: `web` (http_server), `lib` (export stubs), `cli` (os.args, default).
-Test: `new_creates_web_scaffold`.
-
-## OS1-alpha — `os.sapp` expansion
-
-New additions to **`stdlib:os.sapp`**:
-
-- **`args()`** — Array of CLI args after `--`.
-- **`exit(code)`** — Terminate process (requires `allow_exec`).
-- **`signal_trap(sig, handler_fn)`** — Register signal handler stub. Falls back to `"stub"` gracefully if not available.
-
-Test: `os_env_set_pass`.
