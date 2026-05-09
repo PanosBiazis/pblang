@@ -12,7 +12,7 @@ artifacts.
 
 - Δεν υπάρχει ακόμη σταθερό **bytecode ABI** για "frozen" εκδόσεις· αλλαγές
   στο VM/IR μπορούν να σπάνε παλιά πακέτα.
-- Τα tools **`sapphire pack`** και **`sapphire bundle`** (E4) βασίζονται
+- Τα tools **`sapphire pack`** και **`pblang bundle`** (E4) βασίζονται
   σε ήδη εγκατεστημένο `sapphire` binary στο target μηχάνημα.
 - Δεν υπάρχει cross-platform abstraction για:
   - εύρεση/εκτέλεση προσωρινού extract directory,
@@ -218,6 +218,6 @@ features (closures, dynamic dispatch, import).
 
 ### Stage A — E5-beta implementation status
 
-- Προστέθηκε νέο crate `crates/biapryx-stub` με απλό launcher (`biapryx-stub`) που προορίζεται ως template για self-extracting binaries (περιέχει sentinel `BIAPRYX_BUNDLE_START\x00` και ελέγχει για embedded bundle).
+- Προστέθηκε νέο crate `crates/pblang-stub` με απλό launcher (`pblang-stub`) που προορίζεται ως template για self-extracting binaries (περιέχει sentinel `BIAPRYX_BUNDLE_START\x00` και ελέγχει για embedded bundle).
 - Το `biapryx bundle` δέχεται πλέον προαιρετικό flag **`--self-extract`** (E5-beta): το flag αναγνωρίζεται και κρατιέται για workflows self-extracting runner + bundle, χωρίς να αλλάζει το υπάρχον σχήμα εξόδου του `bundle`.
-- Το πραγματικό embed του stub template + bundle παραμένει σχεδιαστικό βήμα: απαιτεί χειροκίνητο build του `sapphire-stub` και αντιγραφή του παραγόμενου binary πάνω από το `stub_template.bin` (ή μελλοντικό εργαλείο που θα το αυτοματοποιεί).
+- Το πραγματικό embed του stub template + bundle παραμένει σχεδιαστικό βήμα: απαιτεί χειροκίνητο build του `pblang-stub` και αντιγραφή του παραγόμενου binary πάνω από το `stub_template.bin` (ή μελλοντικό εργαλείο που θα το αυτοματοποιεί).

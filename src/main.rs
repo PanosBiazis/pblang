@@ -680,7 +680,9 @@ fn strip_comments_mask(src: &str) -> String {
         i += 1;
     }
 
-    String::from_utf8(out).unwrap()
+    // SAFETY: We only push ASCII bytes in the fmt loop above.
+    // Use lossy conversion as a fallback rather than panicking.
+    String::from_utf8(out.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string())
 }
 
 fn line_col(src: &str, byte_idx: usize) -> (usize, usize) {
@@ -3252,7 +3254,7 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().unwrap();
+                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3272,7 +3274,7 @@ fn main() {
                     if let Some(e) = opt_final {
                         walk_expr(e, scope, warnings);
                     }
-                    let top = scope.pop().unwrap();
+                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3307,9 +3309,7 @@ fn main() {
                         }
                     }
                     let is_import = is_import_call(init);
-                    scope
-                        .last_mut()
-                        .unwrap()
+                    scope.last_mut().expect("lint walk: scope is non-empty (push before every nested scope)")
                         .insert(name.clone(), (s.span, is_import, false));
                     walk_expr(init, scope, warnings);
                 }
@@ -3339,7 +3339,7 @@ fn main() {
                     for s in then_b {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().unwrap();
+                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3355,7 +3355,7 @@ fn main() {
                         for s in else_stmts {
                             walk_stmt(s, scope, warnings);
                         }
-                        let top = scope.pop().unwrap();
+                        let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                         for (name, (sp, is_import, read)) in top {
                             if !read {
                                 let msg = if is_import {
@@ -3374,7 +3374,7 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().unwrap();
+                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3399,15 +3399,13 @@ fn main() {
                             }
                         }
                     }
-                    scope
-                        .last_mut()
-                        .unwrap()
+                    scope.last_mut().expect("lint walk: scope is non-empty (push before every nested scope)")
                         .insert(name.clone(), (s.span, false, false));
                     scope.push(std::collections::HashMap::new());
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().unwrap();
+                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (n, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3424,7 +3422,7 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().unwrap();
+                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3441,7 +3439,7 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().unwrap();
+                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3460,7 +3458,7 @@ fn main() {
         for s in stmts {
             walk_stmt(s, &mut scope, &mut warnings);
         }
-        let top = scope.pop().unwrap();
+        let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
         for (name, (sp, is_import, read)) in top {
             if !read {
                 let msg = if is_import {

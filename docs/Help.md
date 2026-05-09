@@ -18,10 +18,10 @@ Rewrite this file after every run to reflect the next batch.
 
 | Task | What landed |
 |------|-------------|
-| **M4-beta** | `crates/sapphire-pm/src/lib.rs`: `publish_package`, `search_registry`, `SearchResult`; `src/main.rs`: `sapphire publish` + `sapphire search <query>` subcommands; `tests/install_cli.rs`: `publish_and_search_roundtrip`; `docs/Registry_hosted.md` M4-beta section; `docs/Tooling.md` updated. |
+| **M4-beta** | `crates/pblang-pm/src/lib.rs`: `publish_package`, `search_registry`, `SearchResult`; `src/main.rs`: `pblang publish` + `pblang search <query>` subcommands; `tests/install_cli.rs`: `publish_and_search_roundtrip`; `docs/Registry_hosted.md` M4-beta section; `docs/Tooling.md` updated. |
 | **R3-beta** | `src/main.rs`: `sapphire --symbols <file>` symbol table dump (fn + let + bytecode offsets); `tests/symbols.rs`: `symbols_lists_function_names`; `Cargo.toml` [[test]] symbols; `docs/Tooling.md` R3-beta section. |
 | **SP1-beta** | `tests/semantics/numeric_edge_test.sapp` + `numeric_edge_cases_pass`; `tests/semantics.rs` updated; `docs/Spec_freeze.md` numeric edge cases section (Infinity/NaN/f64 limits); `docs/Tooling.md` SP1-beta note. |
-| **E5-beta** | `crates/sapphire-stub/` new crate; `sapphire bundle --self-extract`; `tests/pack.rs`; `docs/Native_backend_notes.md` Stage A status; `docs/Tooling.md` updated. |
+| **E5-beta** | `crates/pblang-stub/` new crate; `pblang bundle --self-extract`; `tests/pack.rs`; `docs/Native_backend_notes.md` Stage A status; `docs/Tooling.md` updated. |
 | **L3-beta** | LSP `open_files` map + scope-aware completion (didOpen/didChange + `collect_local_names`); `tests/lsp.rs`; `docs/Tooling.md` updated. |
 | **Q3-gamma** | `stdlib/quantum_sim.sapp`: `repetition_encode`, `repetition_decode`; `examples/quantum_bb84/main.sapp`; `tests/semantics/quantum_ecc_test.sapp` + `quantum_ecc_repetition_pass`; docs updated. |
 | **Q3-beta** | `stdlib/quantum_sim.sapp`: `histogram`; `tests/semantics/quantum_histogram_test.sapp`; docs updated. |
@@ -30,7 +30,7 @@ Rewrite this file after every run to reflect the next batch.
 | **W4-beta+** | `stdlib/http_server.sapp`: `mw_rate_limit`; test; docs updated. |
 | **W4-beta** | `stdlib/websocket.sapp`: `write_frame`; test; docs updated. |
 | **R3-alpha** | `sapphire --dataflow`; `tests/dataflow.rs`; docs updated. |
-| **M4-alpha** | `fetch_and_install_package`; `sapphire install <name>@<version>`; `tests/install_cli.rs`; docs updated. |
+| **M4-alpha** | `fetch_and_install_package`; `pblang install <name>@<version>`; `tests/install_cli.rs`; docs updated. |
 | **T5-alpha** | `stdlib/thread.sapp` wrapper; test; docs updated. |
 | **G3-alpha** | `stdlib/collections.sapp`; test; docs updated. |
 | **L3-alpha** | `sapphire fmt` blank line between `fn`; test; docs updated. |
@@ -86,7 +86,7 @@ First, locate the 2 failing class tests from batch 37. They are in `tests/semant
 `class_basic_test.sapp` and `class_method_test.sapp` or similar. Run the suite to confirm names.
 
 
-Common failure patterns to fix in `crates/sapphire-vm/src/vm.rs` and/or `crates/sapphire-compiler/src/`:
+Common failure patterns to fix in `crates/pblang-vm/src/vm.rs` and/or `crates/pblang-compiler/src/`:
 
 - **`auto_new` sugar / constructor dispatch:** if `MyClass(args)` isn't resolving to a constructor,
   add a `call_constructor` dispatch path that calls `fn new(...)` inside the class body.
@@ -467,11 +467,11 @@ stdlib/quantum_protocol.sapp (submit_remote/poll_remote)
 
 src/main.rs (--annotate, --call-graph, lsp, --dataflow, --symbols — existing)
 
-crates/sapphire-pm/src/semver.rs
+crates/pblang-pm/src/semver.rs
 
 stdlib/csv.sapp, stdlib/graphics.sapp (existing functions)
 
-crates/sapphire-pm PackageSection (target_platform, min_runtime, validate_manifest_metadata)
+crates/pblang-pm PackageSection (target_platform, min_runtime, validate_manifest_metadata)
 
 examples/thread_pool/main.sapp, examples/quantum_bb84/main.sapp
 
@@ -481,9 +481,9 @@ docs/Registry_MVP.md, docs/Native_backend_notes.md
 
 stdlib/provider_registry.sapp, stdlib/http_server.sapp, stdlib/math.sapp
 
-stdlib/quantum_sim.sapp (existing functions), crates/sapphire-stub/
+stdlib/quantum_sim.sapp (existing functions), crates/pblang-stub/
 
-crates/sapphire-pm/src/lib.rs (publish_package, search_registry — existing)
+crates/pblang-pm/src/lib.rs (publish_package, search_registry — existing)
 
 Done = tests pass + no unrelated file changes + Report.md + Tasks.md + Help.md updated.
 
@@ -494,10 +494,10 @@ No shared-heap threads; no AI/quantum as monolithic VM builtins; no syntax chang
 File Map
 Area	Key files
 Area	Key files
-VM core	crates/sapphire-vm/src/vm.rs, crates/sapphire-compiler/src/, crates/sapphire-ir/src/
+VM core	crates/pblang-vm/src/vm.rs, crates/pblang-compiler/src/, crates/pblang-ir/src/
 CLI entry	src/main.rs
-Package manager	crates/sapphire-pm/src/ (lib.rs, semver.rs)
-Stub launcher	crates/sapphire-stub/src/main.rs
+Package manager	crates/pblang-pm/src/ (lib.rs, semver.rs)
+Stub launcher	crates/pblang-stub/src/main.rs
 Stdlib	stdlib/*.sapp
 Tests (semantics)	tests/semantics/*.sapp + tests/semantics.rs
 Tests (other)	tests/lsp.rs, tests/annotate.rs, tests/call_graph.rs, tests/lint.rs, tests/pack.rs, tests/install_cli.rs, tests/dataflow.rs, tests/symbols.rs

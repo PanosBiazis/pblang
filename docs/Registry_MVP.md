@@ -67,7 +67,7 @@ Registry/git packages δεν θεωρούνται installable μόνο επει�
 ## Σειρά υλοποίησης (προτείνεται)
 
 1. **Lockfile v2 schema**: προσθήκη optional πεδίων (name, version, source, resolved/fetch_url) στο υπάρχον format· backward compatible (αν λείπουν, συμπεριφορά ως σήμερα).
-2. **Resolve registry entry**: στο sapphire-pm, όταν ένα dependency είναι registry-style (name + version), κάνε HTTP GET στο index, βρες tarball URL, κατέβασμα, unpack σε cache, υπολογισμός sha256, και εγγραφή στο lockfile με path = cache path.
+2. **Resolve registry entry**: στο pblang-pm, όταν ένα dependency είναι registry-style (name + version), κάνε HTTP GET στο index, βρες tarball URL, κατέβασμα, unpack σε cache, υπολογισμός sha256, και εγγραφή στο lockfile με path = cache path.
 3. **pblang install**: επέκταση ώστε να καλεί το (2) για κάθε registry dependency.
 4. **pblang publish**: Υλοποιήθηκε για **local registry dir** (tarball + index.json)· remote upload μελλοντικά.
 

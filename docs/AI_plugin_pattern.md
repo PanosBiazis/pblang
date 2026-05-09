@@ -19,7 +19,7 @@
 
 1. **Package root**: Sapphire module(s) που εκθέτουν συναρτήσεις (π.χ. `onnx.run(model_path, input_map)`).
 2. **Υλοποίηση**: Εither (α) το module καλεί builtins που ο host έχει παρασχεθεί (capability), ή (β) το module καλεί `ffi_load` σε συγκεκριμένη βιβλιοθήκη (που το package συμπεριλαμβάνει ή που εγκαθίσταται χωριστά) και στη συνέχεια `ffi_call`.
-3. **Registry**: Όταν υπάρχει registry, το πακέτο δημοσιεύεται εκεί· τα projects το προσθέτουν στο `pblang.toml` και κάνουν `sapphire install`.
+3. **Registry**: Όταν υπάρχει registry, το πακέτο δημοσιεύεται εκεί· τα projects το προσθέτουν στο `pblang.toml` και κάνουν `pblang install`.
 4. **Sandbox**: Σε sandbox mode το `allow_ffi` μπορεί να απενεργοποιείται· ο host αποφασίζει αν επιτρέπει AI plugins (μέσω FFI ή capability).
 
 ## Minimal runnable example
