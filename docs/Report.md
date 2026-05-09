@@ -2,7 +2,7 @@
 
 Τελευταία ενημέρωση: Μάρτιος 2026 (Q3-alpha circuit run + measurement helpers).
 
-
+## Τι υλοποιήθηκε
 
 ### SP1-alpha — Spec sections for class / match / defer (Μάρτιος 2026)
 - **docs/Spec_freeze.md**: προστέθηκαν νέες ενότητες για:
@@ -25,7 +25,7 @@
   sidecar), και να το αποσυμπιέσει στο cache dir. Επιστρέφει `(resolved_version, unpacked_path)`.
 - **src/main.rs**: η εντολή **`sapphire install`** επεκτάθηκε ώστε, εκτός από το υπάρχον
   manifest-based μονοπάτι (`sapphire install [path]` → generate lockfile), να υποστηρίζει και
-  **`sapphire install <name>@<version>`** (με `--registry-index <url>` ή `PBLANG_REGISTRY_INDEX`
+  **`sapphire install <name>@<version>`** (με `--registry-index <url>` ή `SAPPHIRE_REGISTRY_INDEX`
   για hosted index). Σε αυτή τη μορφή, η εντολή καλεί `fetch_and_install_package` με global cache
   root και τυπώνει `Installed <name>@<resolved_version>`.
 - **tests/install_cli.rs**: νέο end-to-end test **`install_name_at_version_from_registry`** που
@@ -41,11 +41,11 @@
 - **crates/sapphire-pm**: προστέθηκαν helpers για hosted/file-based registry publish/search:
   - **`publish_package(registry_url, package_dir, token)`** — όταν το `registry_url` είναι `file://...`,
     τυλίγει το υπάρχον `publish_to_registry_dir` ώστε `sapphire publish` να δουλεύει απευθείας με
-    local registries. Για http(s) URLs, διαβάζει το `pblang.toml` του τρέχοντος πακέτου, ελέγχει
+    local registries. Για http(s) URLs, διαβάζει το `sapphire.toml` του τρέχοντος πακέτου, ελέγχει
     self-contained συμβόλαιο (χωρίς `[dependencies]`), δημιουργεί tarball με `create_package_tarball`,
     υπολογίζει sha256 και στέλνει **multipart/form-data** POST σε `<registry>/publish` με πεδία
     `tarball` (bytes), `sha256` (hex) και `metadata` JSON `{name, version, description}`, χρησιμοποιώντας
-    Bearer token από `PBLANG_REGISTRY_TOKEN` ή CLI flag `--registry-token=<token>`.
+    Bearer token από `SAPPHIRE_REGISTRY_TOKEN` ή CLI flag `--registry-token=<token>`.
   - **`search_registry(registry_url, query)`** — για `file://` registries διαβάζει απευθείας το
     `<dir>/index.json` και επιστρέφει αποτελέσματα όταν το όνομα πακέτου ή η έκδοση περιέχει το query·
     για http(s) registries κάνει GET σε `<registry>/search?q=<query>` και περιμένει JSON array
@@ -53,24 +53,24 @@
     `description`.
 - **src/main.rs**: CLI επεκτάσεις για registry:
   - **`sapphire publish`** (χωρίς `--registry-dir`) — νέα hosted/file-based ροή που:
-    - Βρίσκει `pblang.toml` ξεκινώντας από το current dir.
-    - Διαβάζει **`PBLANG_REGISTRY_INDEX`** ως βάση registry· για `file://` URLs καλεί
-      `pblang_pm::publish_package` που με τη σειρά του χρησιμοποιεί `publish_to_registry_dir`;
+    - Βρίσκει `sapphire.toml` ξεκινώντας από το current dir.
+    - Διαβάζει **`SAPPHIRE_REGISTRY_INDEX`** ως βάση registry· για `file://` URLs καλεί
+      `sapphire_pm::publish_package` που με τη σειρά του χρησιμοποιεί `publish_to_registry_dir`;
       για http(s) URLs δημιουργεί tarball και POST όπως περιγράφεται παραπάνω.
-    - Διαβάζει προαιρετικό token από **`PBLANG_REGISTRY_TOKEN`** ή CLI flag `--registry-token=<token>`.
+    - Διαβάζει προαιρετικό token από **`SAPPHIRE_REGISTRY_TOKEN`** ή CLI flag `--registry-token=<token>`.
     - Εκτυπώνει `Published to <registry_url>` σε επιτυχία.
   - Υφιστάμενο **`sapphire publish --registry-dir <dir> [path]`** παραμένει ως τοπικός MVP κλάδος
     (local registry), ενεργοποιείται όταν περνά το flag `--registry-dir`.
-  - **`sapphire search <query>`** — νέα εντολή CLI που διαβάζει **`PBLANG_REGISTRY_INDEX`** ως
+  - **`sapphire search <query>`** — νέα εντολή CLI που διαβάζει **`SAPPHIRE_REGISTRY_INDEX`** ως
     registry base και καλεί `search_registry`· για `file://` registries φορτώνει τοπικό `index.json`
     και για http(s) registries κάνει HTTP GET σε `/search`. Εκτυπώνει ένα αποτέλεσμα ανά γραμμή
     ως `name @ version — description` (ή `name @ version` όταν δεν υπάρχει περιγραφή) ή
     `No results for '<query>'` όταν δεν βρεθούν πακέτα.
 - **tests/install_cli.rs**: νέο end-to-end test **`publish_and_search_roundtrip`** που:
   - Δημιουργεί προσωρινό registry dir και πακέτο `sapphire_m4b_pkg` έκδοσης `2.0.0` με `lib.sapp`.
-  - Τρέχει `sapphire publish` μέσα από το πακέτο με `PBLANG_REGISTRY_INDEX=file://<reg_dir>`
-    και `PBLANG_REGISTRY_TOKEN=test-token`, ελέγχοντας ότι η εντολή ολοκληρώνεται με επιτυχία.
-  - Τρέχει `sapphire search sapphire_m4b` με το ίδιο `PBLANG_REGISTRY_INDEX` και ελέγχει ότι το
+  - Τρέχει `sapphire publish` μέσα από το πακέτο με `SAPPHIRE_REGISTRY_INDEX=file://<reg_dir>`
+    και `SAPPHIRE_REGISTRY_TOKEN=test-token`, ελέγχοντας ότι η εντολή ολοκληρώνεται με επιτυχία.
+  - Τρέχει `sapphire search sapphire_m4b` με το ίδιο `SAPPHIRE_REGISTRY_INDEX` και ελέγχει ότι το
     stdout περιέχει το όνομα του πακέτου, επιβεβαιώνοντας ότι η file-based registry αναζητείται
     επιτυχώς μέσω της νέας search ροής.
 - **docs/Registry_hosted.md**: επεκτάθηκε με ενότητα **"M4-beta: Remote publish + search"** που
@@ -81,9 +81,9 @@
     registries (GET `/search?q=<query>`).
 - **docs/Tooling.md**: η CLI ενότητα ενημερώθηκε:
   - Το `sapphire publish --registry-dir` παραμένει ως τοπικό MVP.
-  - Νέα bullets για **`sapphire publish`** (hosted/file-based μέσω PBLANG_REGISTRY_INDEX) και
+  - Νέα bullets για **`sapphire publish`** (hosted/file-based μέσω SAPPHIRE_REGISTRY_INDEX) και
     **`sapphire search <query>`** με αναλυτική περιγραφή της συμπεριφοράς και της μορφής εξόδου.
-  - Η ενότητα **"Registry / install env vars"** ενημερώθηκε ώστε `PBLANG_REGISTRY_INDEX` να
+  - Η ενότητα **"Registry / install env vars"** ενημερώθηκε ώστε `SAPPHIRE_REGISTRY_INDEX` να
     αναφέρεται ως "registry index or registry base" και να περιλαμβάνει ρητά ότι χρησιμοποιείται
     πλέον και από `sapphire publish` / `sapphire search`. Η παραπομπή σε **docs/Registry_hosted.md**
     ενημερώθηκε σε "M3-gamma/M4-beta".
@@ -146,12 +146,6 @@
 - **examples/quantum_bb84/main.sapp**: νέο παράδειγμα που συνδέει `stdlib:crypto_quantum.sapp` (QKD protocol names), `stdlib:quantum.sapp` (circuit builder + `run`) και `stdlib:quantum_sim.sapp.histogram` για παραγωγή Bell-state measurement histogram, μαζί με toy BB84-style παραμέτρους (Alice/Bob bits + bases).
 - **docs/Quantum_providers.md** και **docs/Tooling.md** ενημερώθηκαν ώστε να αναφέρουν τη repetition-code helper οικογένεια και το νέο BB84-style παράδειγμα.
 
-### Q3-delta — Noise model stub + Bloch sphere visualization (Μάρτιος 2026)
-- **stdlib/quantum_sim.sapp**: προστέθηκαν `y_gate` και `z_gate` για πλήρη Pauli matrix coverage, και `add_depolarizing_noise(circ, p)` — μετά από κάθε πύλη, με πιθανότητα `p` εφαρμόζει τυχαίο X/Y/Z σφάλμα (χρήση `random_float`) ως απλό quantum noise model.
-- **stdlib/quantum_viz.sapp** (νέο): `bloch_angles(state_2d)` επιστρέφει map με `theta` και `phi` για απεικόνιση qubit στη σφαίρα Bloch· `bloch_to_svg(theta, phi)` παράγει SVG string με κύκλο και βέλος (stub, pure Sapphire strings) για οπτικοποίηση quantum state.
-- **tests/semantics/quantum_noise_test.sapp** + **quantum_noise_depolarizing_pass** στο `tests/semantics.rs`: έλεγχος ότι το depolarizing noise προσθέτει σφάλματα με την αναμενόμενη συμπεριφορά σε μικρό κύκλωμα.
-- **docs/Quantum_providers.md** και **docs/Tooling.md** ενημερώθηκαν με περιγραφή των noise helpers και Bloch visualization εργαλείων.
-
 ### E5-alpha — Self-extracting / installer presets design (Μάρτιος 2026)
 - **docs/Native_backend_notes.md**: επεκτάθηκε με staged path για native/hybrid backend
   και συγκεκριμένο **Stage A** σχέδιο για self-extracting wrapper (embedded runtime +
@@ -160,7 +154,7 @@
   future Stage C (N2) χωρίς να δεσμεύεται σε άμεση υλοποίηση.
 
 ### E5-beta — Self-extracting wrapper prototype hooks (Μάρτιος 2026)
-- **crates/sapphire-stub**: νέο crate με minimal launcher `sapphire-stub` (template για self-extracting binaries) που περιέχει sentinel `PBLANG_BUNDLE_START\x00` και προορίζεται να χρησιμοποιηθεί ως βάση για embedded bundle executables στο Stage A.
+- **crates/sapphire-stub**: νέο crate με minimal launcher `sapphire-stub` (template για self-extracting binaries) που περιέχει sentinel `SAPPHIRE_BUNDLE_START\x00` και προορίζεται να χρησιμοποιηθεί ως βάση για embedded bundle executables στο Stage A.
 - **CLI**: το `sapphire bundle` δέχεται πλέον προαιρετικό flag `--self-extract`· το flag αναγνωρίζεται και διατηρείται για μελλοντικά self-extracting workflows χωρίς να αλλάζει το σημερινό output directory layout (παράγει κανονικό bundle dir όπως πριν).
 - **Tests / docs**: προστέθηκε test `bundle_self_extract_flag_accepted` στο `tests/pack.rs` που διασφαλίζει ότι το flag δεν αναφέρεται ως άγνωστο· τα `docs/Native_backend_notes.md` και `docs/Tooling.md` ενημερώθηκαν για την E5-beta κατάσταση (stub launcher + πειραματικό flag).
 - **docs/Tooling.md**: στην ενότητα `sapphire pack` / `sapphire bundle` προστέθηκε
@@ -236,7 +230,7 @@
 ### E4-gamma — App manifest metadata (Μάρτιος 2026)
 - **crates/sapphire-pm**: PackageSection **target_platform** (Option<String>), **min_runtime** (Option<String>) με #[serde(default)]. **validate_manifest_metadata(man_dir)** — ελέγχει target_platform ∈ {any,linux,macos,windows}, min_runtime parseable semver· **get_manifest_platform_hints(man_dir)** για run info.
 - **src/main.rs**: pack και bundle καλούν validate_manifest_metadata πριν το entry resolution· sapphire run τυπώνει info γραμμές όταν target_platform ≠ any ή min_runtime set (από script_path parent + find_manifest_dir).
-- **tests/fixtures/manifest_metadata/pblang.toml** + **main.sapp**. **tests/pack.rs**: pack_succeeds_with_valid_target_platform_and_min_runtime, pack_fails_for_invalid_target_platform, pack_fails_for_invalid_min_runtime (temp dirs με custom manifest).
+- **tests/fixtures/manifest_metadata/sapphire.toml** + **main.sapp**. **tests/pack.rs**: pack_succeeds_with_valid_target_platform_and_min_runtime, pack_fails_for_invalid_target_platform, pack_fails_for_invalid_min_runtime (temp dirs με custom manifest).
 - **docs/Tooling.md**: E4-gamma manifest validation και run info.
 
 ### G2-gamma — CSV quoted fields + graphics stubs (Μάρτιος 2026)
@@ -341,26 +335,26 @@
 - **Επόμενο**: JSON wire format για remote backend· provider slots.
 
 ### G2-alpha — os.args(), os.exit(), time.now_iso() (Μάρτιος 2026)
-- **VM builtins** (crates/sapphire-vm): **os_args** (0-arg, reads `PBLANG_SCRIPT_ARGS` env, newline-split → array of strings; empty array if unset), **os_exit** (1-arg code, `std::process::exit`; gated by `host.allow_exec()`), **time_now_iso** (0-arg, `chrono::Utc::now().to_rfc3339()`). Dependency **chrono** 0.4 (clock) in sapphire-vm.
+- **VM builtins** (crates/sapphire-vm): **os_args** (0-arg, reads `SAPPHIRE_SCRIPT_ARGS` env, newline-split → array of strings; empty array if unset), **os_exit** (1-arg code, `std::process::exit`; gated by `host.allow_exec()`), **time_now_iso** (0-arg, `chrono::Utc::now().to_rfc3339()`). Dependency **chrono** 0.4 (clock) in sapphire-vm.
 - **stdlib/os.sapp**: **args()**, **exit(code)**; exports ενημερώθηκαν.
 - **stdlib/time.sapp**: **now_iso()**; export ενημερώθηκε.
-- **CLI**: `sapphire run [file|dir] -- arg1 arg2 ...` ορίζει `PBLANG_SCRIPT_ARGS` (newline-joined) πριν την εκτέλεση ώστε το script να βλέπει τα args μέσω `os.args()`.
+- **CLI**: `sapphire run [file|dir] -- arg1 arg2 ...` ορίζει `SAPPHIRE_SCRIPT_ARGS` (newline-joined) πριν την εκτέλεση ώστε το script να βλέπει τα args μέσω `os.args()`.
 - **tests/semantics.rs**: το test **stdlib_fs_path_os_time_array_map_modules_work** επεκτάθηκε με `type(os.args()) == "array"`, `type(time.now_iso()) == "string"`, και έλεγχο ότι η ISO string περιέχει `"T"`.
 - **docs/Tooling.md**: run με `--`, os.sapp (args, exit), time.sapp (now_iso).
 - **Τι δεν έγινε**: process.sapp, proc_spawn_wait/proc_spawn_async/proc_wait builtins.
 - **Επόμενο**: G2 process.sapp ή W3-beta / Q2-beta.
 
 ### E4-alpha — verify + HMAC signing (Μάρτιος 2026)
-- **sapphire verify <tarball>**: νέο CLI subcommand — ελέγχει δομή tarball (pblang.toml + entry .sapp/.sap). Αν υπάρχει sidecar `<tarball>.sha256` και env **PBLANG_SIGNING_KEY**, επαληθεύει HMAC-SHA256.
+- **sapphire verify <tarball>**: νέο CLI subcommand — ελέγχει δομή tarball (sapphire.toml + entry .sapp/.sap). Αν υπάρχει sidecar `<tarball>.sha256` και env **SAPPHIRE_SIGNING_KEY**, επαληθεύει HMAC-SHA256.
 - **sapphire-pm**: **compute_tarball_hmac(bytes, key)** → hex, **verify_tarball(path)** → Result. Dependency **hmac** 0.12.
-- **sapphire pack**: όταν οριστεί **PBLANG_SIGNING_KEY**, γράφει `<out_file>.sha256` με HMAC του tarball.
+- **sapphire pack**: όταν οριστεί **SAPPHIRE_SIGNING_KEY**, γράφει `<out_file>.sha256` με HMAC του tarball.
 - **tests/pack.rs**: **verify_succeeds_on_valid_pack_tarball**, **verify_fails_when_tarball_missing_manifest**.
 - **Τι δεν έγινε**: Ed25519/signature (μόνο HMAC)· verify on install (έγινε στο E4-beta).
 - **Επόμενο**: E4 signed registry index ή app manifest metadata.
 
 ### E4-beta — verify on install (Μάρτιος 2026)
-- **sapphire-pm**: **fetch_url_optional(url)** — επιστρέφει `Option<Vec<u8>>` (404/σφάλμα → None). Στο **install_registry_release**, μετά το fetch του tarball και πριν το unpack: αν **PBLANG_SIGNING_KEY** οριστεί, fetch sidecar `archive_url + ".sha256"`· αν υπάρχει sidecar, σύγκριση HMAC με **compute_tarball_hmac**· mismatch → `Err` με μήνυμα "HMAC signature mismatch". Αν key οριστεί αλλά δεν υπάρχει sidecar → warning στο stderr.
-- **tests/install_cli.rs**: **install_rejects_registry_tarball_when_hmac_sidecar_wrong** — tarball + λάθος .sha256 sidecar, PBLANG_SIGNING_KEY=testkey, install → αποτυχία και stderr περιέχει "HMAC" ή "signature mismatch".
+- **sapphire-pm**: **fetch_url_optional(url)** — επιστρέφει `Option<Vec<u8>>` (404/σφάλμα → None). Στο **install_registry_release**, μετά το fetch του tarball και πριν το unpack: αν **SAPPHIRE_SIGNING_KEY** οριστεί, fetch sidecar `archive_url + ".sha256"`· αν υπάρχει sidecar, σύγκριση HMAC με **compute_tarball_hmac**· mismatch → `Err` με μήνυμα "HMAC signature mismatch". Αν key οριστεί αλλά δεν υπάρχει sidecar → warning στο stderr.
+- **tests/install_cli.rs**: **install_rejects_registry_tarball_when_hmac_sidecar_wrong** — tarball + λάθος .sha256 sidecar, SAPPHIRE_SIGNING_KEY=testkey, install → αποτυχία και stderr περιέχει "HMAC" ή "signature mismatch".
 - **Επόμενο**: Signed registry index ή app manifest metadata.
 
 ### M3-alpha — Semver range parser (Μάρτιος 2026)
@@ -480,7 +474,7 @@
 - **Επόμενο**: W2 chunked/streaming ή TLS step.
 
 ### E3 + G1 – bundle content test & array.reverse (Μάρτιος 2026)
-- **E3 – bundle artifact content**: **tests/pack.rs** προστέθηκε regression test **bundle_dir_contains_manifest_and_entry_file** — μετά bundle ελέγχει ότι ο bundle directory περιέχει `pblang.toml` και το entry file (π.χ. main.sapp). Συμμετρικό με το pack tarball content test.
+- **E3 – bundle artifact content**: **tests/pack.rs** προστέθηκε regression test **bundle_dir_contains_manifest_and_entry_file** — μετά bundle ελέγχει ότι ο bundle directory περιέχει `sapphire.toml` και το entry file (π.χ. main.sapp). Συμμετρικό με το pack tarball content test.
 - **G1 – stdlib/array.sapp**: προστέθηκε **reverse(a)** — επιστρέφει νέο array με στοιχεία σε αντίστροφη σειρά. Export ενημερώθηκε.
 - **tests/modules.rs**: το test **array_and_map_stdlib_helpers_work** επεκτάθηκε με assertions για array.reverse ([1,2,3] → len 3, r[0]=3, r[2]=1).
 - **docs/Tooling.md**: στην ενότητα Stdlib-style APIs προστέθηκε **reverse(a)** στη λίστα array.sapp.
@@ -489,7 +483,7 @@
 - **Επόμενο**: E3 single-artifact ή installer· W2 chunked/TLS· G1 περαιτέρω stdlib.
 
 ### E3 + G1 – packaging test & stdlib slice (Μάρτιος 2026)
-- **E3 – pack artifact content**: **tests/pack.rs** προστέθηκε regression test **pack_tarball_contains_manifest_and_entry_file** — μετά pack ανοίγει το tarball και ελέγχει ότι περιέχει `pblang.toml` και `main.sapp` (ή τα αντίστοιχα entry paths). Κλειδώνει το contract "τι μπαίνει στο artifact".
+- **E3 – pack artifact content**: **tests/pack.rs** προστέθηκε regression test **pack_tarball_contains_manifest_and_entry_file** — μετά pack ανοίγει το tarball και ελέγχει ότι περιέχει `sapphire.toml` και `main.sapp` (ή τα αντίστοιχα entry paths). Κλειδώνει το contract "τι μπαίνει στο artifact".
 - **G1 – stdlib/array.sapp**: προστέθηκε **slice(a, start, end)** — επιστρέφει νέο array με στοιχεία από index start (inclusive) έως end (exclusive)· indices εκτός 0..len(a) αγνοούνται. Export ενημερώθηκε.
 - **tests/modules.rs**: το test **array_and_map_stdlib_helpers_work** επεκτάθηκε με assertions για array.slice ([10,20,30,40], 1, 3) → len 2, s[0]=20, s[1]=30.
 - **docs/Tooling.md**: στην ενότητα Stdlib-style APIs προστέθηκε **slice(a, start, end)** στη λίστα array.sapp.
@@ -561,7 +555,7 @@
 - **.github/workflows/ci.yml**: CI workflow — `cargo test` on push/PR για branches master/main· jobs **test-linux** (ubuntu-latest) και **test-windows** (windows-latest). Baseline conformance suite.
 
 ### Phase 4 – Tooling (CLI)
-- **sapphire init**: δημιουργεί `pblang.toml` στο cwd· δεν αντικαθιστά αν υπάρχει.
+- **sapphire init**: δημιουργεί `sapphire.toml` στο cwd· δεν αντικαθιστά αν υπάρχει.
 - **sapphire --doc \<file\> [--html] [out_dir]**: έξοδος exports, functions, polyglot blocks· με `--html` γράφει `out_dir/index.html` (default `docs/`).
 - **sapphire test [dir]**: τρέχει όλα τα `.sap`/`.sapp` στο `dir` (default `tests/`)· εκτύπωση "N passed, M failed"· exit 1 αν M > 0.
 
@@ -599,7 +593,7 @@
 - **tests/stdlib_parse.rs**: test parse+typecheck για stdlib (π.χ. graphics.sapp)· προς το παρόν `#[ignore]` λόγω γνωστού parse θέματος σε συγκεκριμένα σημεία.
 
 ### Tooling – bundle (portable executable folder)
-- **sapphire bundle [path] [out_dir]**: δημιουργεί φάκελο (default `dist/`) με το τρέχον εκτελέσιμο sapphire, `pblang.toml`, `pblang.lock`, το main entry script και τα τοπικά dependencies· για portable deployment (Windows/Linux)· τεκμηρίωση στο **Tooling.md**.
+- **sapphire bundle [path] [out_dir]**: δημιουργεί φάκελο (default `dist/`) με το τρέχον εκτελέσιμο sapphire, `sapphire.toml`, `sapphire.lock`, το main entry script και τα τοπικά dependencies· για portable deployment (Windows/Linux)· τεκμηρίωση στο **Tooling.md**.
 
 ### Threads – σχεδίαση
 - **docs/Threads.md**: νέο έγγραφο σχεδίασης για δυνατότητες threads (spawn/join, channels, host-provided workers)· τεχνικές προκλήσεις (shared state, VM per thread)· ροードμαπ για μελλοντική υλοποίηση.
@@ -675,9 +669,9 @@
 - **docs/Lockfile_contract.md**: νέα ενότητα **Registry deps security** (checksum verification, REQUIRE_REGISTRY_SHA256).
 
 ### Registry R2 – CLI --registry-index (Help.md Task R2)
-- **sapphire install**: προστέθηκε **--registry-index \<url\>**· όταν δίνεται, καλεί **generate_lockfile_with_registry(manifest_dir, Some(url), require_sha)** ώστε να μην απαιτείται env **PBLANG_REGISTRY_INDEX**. Το path παραμένει προαιρετικό μετά τα options.
+- **sapphire install**: προστέθηκε **--registry-index \<url\>**· όταν δίνεται, καλεί **generate_lockfile_with_registry(manifest_dir, Some(url), require_sha)** ώστε να μην απαιτείται env **SAPPHIRE_REGISTRY_INDEX**. Το path παραμένει προαιρετικό μετά τα options.
 - **Help string** (main.rs): ενημερώθηκε για `install [--registry-index <url>] [path]`.
-- **docs/Tooling.md**: ενημερώθηκε η ενότητα install (flags + env vars)· νέα ενότητα **Registry / install env vars** (PBLANG_REGISTRY_INDEX, REQUIRE_REGISTRY_SHA256).
+- **docs/Tooling.md**: ενημερώθηκε η ενότητα install (flags + env vars)· νέα ενότητα **Registry / install env vars** (SAPPHIRE_REGISTRY_INDEX, REQUIRE_REGISTRY_SHA256).
 - **tests/install_cli.rs**: **install_with_registry_index_resolves_registry_dep()** (temp dir με index + tarball, manifest με registry dep, `sapphire install --registry-index file:///...` → lockfile με source=registry)· **install_without_registry_index_uses_env_or_fails_for_registry_dep()** (manifest μόνο με registry dep, install χωρίς flag και χωρίς env → fail με μήνυμα registry).
 
 ### Registry R3 – publish MVP local (Help.md Task R3)
@@ -700,7 +694,7 @@
 - **Graphics/stdlib**: HSL υλοποιήθηκε (hsl)· περαιτέρω σχήματα/βοηθητικά αν χρειαστεί.
 - **Threads**: spawn/join και channels MVP υλοποιήθηκαν (`channel`, `send`, `recv`)· η σχεδίαση στο **docs/Threads.md** αντικατοπτρίζει πλέον το τρέχον API. Μελλοντικά μόνο richer ergonomics (`close`, multi-send strategy, ίσως `select`) αν χρειαστεί.
 - **Executables**:
-  - **Stage A – `sapphire pack`**: νέα CLI εντολή που δημιουργεί ένα ενιαίο `.tar.gz` artifact από το manifest dir, συμπεριλαμβάνοντας `pblang.toml`, ενημερωμένο `pblang.lock` (μέσω `generate_lockfile`) και τοπικά dependencies. Το unpacked artifact μπορεί να τρέξει με το εγκατεστημένο binary (`sapphire run main.sapp`) χωρίς να χρειάζεται το αρχικό project folder.
+  - **Stage A – `sapphire pack`**: νέα CLI εντολή που δημιουργεί ένα ενιαίο `.tar.gz` artifact από το manifest dir, συμπεριλαμβάνοντας `sapphire.toml`, ενημερωμένο `sapphire.lock` (μέσω `generate_lockfile`) και τοπικά dependencies. Το unpacked artifact μπορεί να τρέξει με το εγκατεστημένο binary (`sapphire run main.sapp`) χωρίς να χρειάζεται το αρχικό project folder.
   - **Stage B** (μελλοντικό): native single-binary compile (LLVM/Cranelift ή transpile) σύμφωνα με το Future_plans.
 - **Package manager**: **sapphire install** υλοποιήθηκε (lockfile generation)· registry fetch/publish μελλοντικά.
 - **Reverse engineering**: **sapphire --dump-bytecode** υλοποιήθηκε (disassembly)· περαιτέρω εργαλεία μελλοντικά.
@@ -760,7 +754,7 @@
 - **Τι μένει επόμενο**: μέσα στο `M1` backlog μένουν ακόμα import από registry package sources, git source story, και περαιτέρω lockfile/ecosystem hardening.
 
 ### M1 – bare package imports from installed sources (Μάρτιος 2026)
-- **sapphire-pm / resolve_import()**: υποστηρίζεται πλέον bare package import της μορφής `import("@scope/pkg")` ή `import("depname")` όταν το dependency υπάρχει στο manifest και έχει εγκατασταθεί/κλειδωθεί. Το resolver χρησιμοποιεί το υπάρχον `pblang.lock` όταν είναι έγκυρο, αλλιώς κάνει fallback μόνο για path deps· για registry deps χωρίς install δίνει πλέον καθαρό μήνυμα ότι χρειάζεται `sapphire install`.
+- **sapphire-pm / resolve_import()**: υποστηρίζεται πλέον bare package import της μορφής `import("@scope/pkg")` ή `import("depname")` όταν το dependency υπάρχει στο manifest και έχει εγκατασταθεί/κλειδωθεί. Το resolver χρησιμοποιεί το υπάρχον `sapphire.lock` όταν είναι έγκυρο, αλλιώς κάνει fallback μόνο για path deps· για registry deps χωρίς install δίνει πλέον καθαρό μήνυμα ότι χρειάζεται `sapphire install`.
 - **Default package entry**: το bare package import φορτώνει cross-platform το πρώτο διαθέσιμο entry από `lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`, ώστε το package root import να δουλεύει με predictable convention χωρίς νέο manifest schema.
 - **tests/install_cli.rs**: προστέθηκε νέο end-to-end regression test `installed_registry_package_can_be_imported_by_package_name`, που καλύπτει το flow `publish -> install -> import("@sapphire/pub-pkg") -> run`.
 - **Verification**:
@@ -770,8 +764,8 @@
 - **Τι μένει επόμενο**: μέσα στο `M1` backlog μένει κυρίως το git source story και περαιτέρω ecosystem/lockfile hardening.
 
 ### M1 – git source dependencies with pinned rev (Μάρτιος 2026)
-- **sapphire-pm / DependencySpec**: το `pblang.toml` δέχεται πλέον detailed dependency μορφές για `path`, `version`, και το νέο `git` + `rev`. Αυτό επιτρέπει minimal git source contract χωρίς να αλλάξει το υπάρχον path/registry syntax.
-- **sapphire-pm / generate_lockfile()**: git dependencies λύνονται πλέον σε cached checkout keyed από `git_url + rev`, γράφουν `source = "git"` και `resolved = "<git-url>#<rev>"` στο `pblang.lock`, και το content hash συνεχίζει να παράγεται από το checked-out working tree χωρίς `.git` metadata ώστε να μείνει cross-platform και reproducible ως προς το περιεχόμενο.
+- **sapphire-pm / DependencySpec**: το `sapphire.toml` δέχεται πλέον detailed dependency μορφές για `path`, `version`, και το νέο `git` + `rev`. Αυτό επιτρέπει minimal git source contract χωρίς να αλλάξει το υπάρχον path/registry syntax.
+- **sapphire-pm / generate_lockfile()**: git dependencies λύνονται πλέον σε cached checkout keyed από `git_url + rev`, γράφουν `source = "git"` και `resolved = "<git-url>#<rev>"` στο `sapphire.lock`, και το content hash συνεχίζει να παράγεται από το checked-out working tree χωρίς `.git` metadata ώστε να μείνει cross-platform και reproducible ως προς το περιεχόμενο.
 - **Pinned rev only**: για git deps απαιτείται ρητό `rev`, ώστε το install/lockfile contract να μένει deterministic. Για git deps χωρίς install, το import path δίνει πλέον καθαρό μήνυμα ότι χρειάζεται `sapphire install` πρώτα.
 - **tests/install_cli.rs**: προστέθηκε νέο integration test `install_git_dependency_with_pinned_rev_works`, που δημιουργεί local git repo, κάνει commit, εγκαθιστά dependency μέσω `{ git = "...", rev = "..." }`, ελέγχει `source = "git"` στο lockfile και τρέχει `import("gitdep")` end-to-end.
 - **src/main.rs / bundle path deps**: το bundle flow συνεχίζει να αντιγράφει μόνο local path dependencies και απλώς αγνοεί registry/git entries αντί να σπάει από το νέο dependency shape.
@@ -782,7 +776,7 @@
 - **Τι μένει επόμενο**: μέσα στο `M1` backlog μένει κυρίως περαιτέρω lockfile/ecosystem hardening και, αν ζητηθεί, richer git source ergonomics πάνω στο pinned-rev contract.
 
 ### M1 – lockfile content validation & reproducibility hardening (Μάρτιος 2026)
-- **sapphire-pm / resolve_dependency_root()**: όταν ένα dependency λύνεται από `pblang.lock`, γίνεται πλέον verify του unpacked dependency tree απέναντι στο locked `sha256` πριν χρησιμοποιηθεί το path. Αν τα αρχεία του dependency αλλοιωθούν μετά το install, το import αποτυγχάνει με clear `content hash mismatch` αντί να φορτώνει σιωπηρά tampered code.
+- **sapphire-pm / resolve_dependency_root()**: όταν ένα dependency λύνεται από `sapphire.lock`, γίνεται πλέον verify του unpacked dependency tree απέναντι στο locked `sha256` πριν χρησιμοποιηθεί το path. Αν τα αρχεία του dependency αλλοιωθούν μετά το install, το import αποτυγχάνει με clear `content hash mismatch` αντί να φορτώνει σιωπηρά tampered code.
 - **Registry lockfile contract**: τα νέα registry lock entries γράφουν πλέον `sha256` ως hash του unpacked dependency directory και κρατούν ξεχωριστά το tarball hash στο νέο optional πεδίο **`archive_sha256`**. Αυτό εναρμονίζει το registry path με το υπάρχον path/git contract και επιτρέπει ουσιαστικό import-time validation.
 - **Legacy registry compatibility**: παλιότερα registry lockfiles που είχαν archive checksum στο `sha256` συνεχίζουν να φορτώνουν μόνο αν το archive μπορεί να επαληθευτεί θετικά από το `fetch_url`. Αν αυτό δεν είναι δυνατό, το μήνυμα καθοδηγεί σε `sapphire install` για refresh του lockfile.
 - **Tests**:
@@ -798,7 +792,7 @@
 
 ### M1 – package manifest entry for bare imports (Μάρτιος 2026)
 - **sapphire-pm / PackageSection**: το `[package]` δέχεται πλέον προαιρετικό **`entry`** field, π.χ. `entry = "src/entry.sapp"`.
-- **Bare package import resolution**: το `resolve_package_root_import()` κοιτά πρώτα το `pblang.toml` του package root και, αν υπάρχει `entry`, το χρησιμοποιεί ως canonical package entrypoint πριν κάνει fallback στο παλιό heuristic (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`).
+- **Bare package import resolution**: το `resolve_package_root_import()` κοιτά πρώτα το `sapphire.toml` του package root και, αν υπάρχει `entry`, το χρησιμοποιεί ως canonical package entrypoint πριν κάνει fallback στο παλιό heuristic (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`).
 - **Safety / compatibility**: το `entry` είναι strictly optional και πρέπει να είναι relative path μέσα στο package root. Absolute paths, `..` escapes ή missing declared entry γίνονται clean import errors αντί για silent fallback. Packages χωρίς `entry` συνεχίζουν να δουλεύουν όπως πριν.
 - **Tests**:
   - **tests/install_cli.rs**: νέο registry regression test **installed_registry_package_uses_manifest_entry_for_package_import**.
@@ -898,7 +892,7 @@
 
 ### M1 – registry CLI parity for lockfile-producing commands (Μάρτιος 2026)
 - **main.rs / shared registry CLI parsing**: το CLI έχει πλέον κοινό helper για optional `--registry-index <url>` parsing και shared lockfile generation logic, ώστε τα lockfile-producing flows να χρησιμοποιούν το ίδιο explicit registry contract αντί για command-by-command divergence.
-- **Command parity**: το `sapphire --lock`, το `sapphire build`, και το `sapphire pack` δέχονται πλέον ρητό `--registry-index <url>` όπως ήδη έκανε το `sapphire install`. Έτσι ένα project με registry dependencies μπορεί να ξαναγράψει `pblang.lock` ή να κάνει build/pack χωρίς να βασίζεται αποκλειστικά στο exported `PBLANG_REGISTRY_INDEX`.
+- **Command parity**: το `sapphire --lock`, το `sapphire build`, και το `sapphire pack` δέχονται πλέον ρητό `--registry-index <url>` όπως ήδη έκανε το `sapphire install`. Έτσι ένα project με registry dependencies μπορεί να ξαναγράψει `sapphire.lock` ή να κάνει build/pack χωρίς να βασίζεται αποκλειστικά στο exported `SAPPHIRE_REGISTRY_INDEX`.
 - **Tests**:
   - **tests/install_cli.rs**: νέο registry regression test **build_with_registry_index_generates_lockfile_for_registry_dep**.
   - **tests/pack.rs**: νέο registry regression test **pack_with_registry_index_generates_lockfile_for_registry_dep**.
@@ -931,7 +925,7 @@
 - **Τι μένει επόμενο**: μέσα στο `M1` backlog μένει άλλο μικρό package ecosystem usability / policy-tightening βήμα, αλλά όχι νέο registry architecture.
 
 ### M1 – lockfile-based rehydration for missing registry/git cache paths (Μάρτιος 2026)
-- **sapphire-pm / resolve_dependency_root()**: όταν ένα registry/git dependency υπάρχει στο `pblang.lock` αλλά το locked cache/checkout path λείπει, ο resolver δεν αποτυγχάνει πια αμέσως. Αν το lock entry έχει αρκετά metadata (`source`, `resolved`, `fetch_url`, `archive_sha256`), το dependency rehydrate-άρεται από το lockfile και μετά ξαναγίνεται hash validation απέναντι στο locked content hash.
+- **sapphire-pm / resolve_dependency_root()**: όταν ένα registry/git dependency υπάρχει στο `sapphire.lock` αλλά το locked cache/checkout path λείπει, ο resolver δεν αποτυγχάνει πια αμέσως. Αν το lock entry έχει αρκετά metadata (`source`, `resolved`, `fetch_url`, `archive_sha256`), το dependency rehydrate-άρεται από το lockfile και μετά ξαναγίνεται hash validation απέναντι στο locked content hash.
 - **Registry/git reuse**: το registry rehydration χρησιμοποιεί το recorded fetch URL + archive checksum και το git rehydration το recorded `resolved = "<url>#<rev>"`, ώστε η φορητότητα να μην εξαρτάται αποκλειστικά από το αν υπάρχει ακόμα το παλιό absolute cache path.
 - **Tests**:
   - **tests/install_cli.rs**: νέο regression test **registry_dependency_rehydrates_from_lockfile_when_cache_path_is_missing**.
@@ -1004,7 +998,7 @@
 - **Τι μένει επόμενο**: το `A1` μπορεί πλέον να συνεχίσει με richer host/FFI bridge πάνω στο package pattern, όχι με monolithic core feature.
 
 ### E3 – bundle registry/shipping parity (Μάρτιος 2026)
-- **main.rs / bundle parity**: το `sapphire bundle` χρησιμοποιεί πλέον το ίδιο registry-aware lockfile regeneration path με το `pack`. Δέχεται `--registry-index <url>` και `--require-registry-sha256`, ξαναγράφει `pblang.lock`, και μετά αντιγράφει το regenerated lockfile στο bundled output.
+- **main.rs / bundle parity**: το `sapphire bundle` χρησιμοποιεί πλέον το ίδιο registry-aware lockfile regeneration path με το `pack`. Δέχεται `--registry-index <url>` και `--require-registry-sha256`, ξαναγράφει `sapphire.lock`, και μετά αντιγράφει το regenerated lockfile στο bundled output.
 - **Tests**:
   - **tests/pack.rs**: νέο regression test **bundle_with_registry_index_generates_lockfile_for_registry_dep**.
   - **tests/pack.rs**: νέο regression test **bundle_require_registry_sha256_flag_rejects_missing_checksum**.
@@ -1023,7 +1017,7 @@
 - **Τι μένει επόμενο**: μέσα στο E3 μένουν installer/export presets, pinned assets validation, ή επόμενο μικρό shipping UX slice.
 
 ### Gap-fix – missing examples and N1 doc (Μάρτιος 2026)
-- **examples/ai_plugin_minimal/**: προστέθηκε plugin (lib.sapp με `plugin_info`, `capabilities`, `build_request`, `invoke`) και app (pblang.toml + main.sapp consumer) ώστε το test **ai_plugin_example_builds_normalized_request_envelope** να περνά.
+- **examples/ai_plugin_minimal/**: προστέθηκε plugin (lib.sapp με `plugin_info`, `capabilities`, `build_request`, `invoke`) και app (sapphire.toml + main.sapp consumer) ώστε το test **ai_plugin_example_builds_normalized_request_envelope** να περνά.
 - **examples/quantum_bridge_minimal/**: προστέθηκε plugin (lib.sapp με `bridge_info`, `build_job`, `submit_job`· inline QASM emission ώστε το plugin να φορτώνεται χωρίς stdlib στο import context) και app ώστε το test **quantum_bridge_example_builds_provider_job_envelope** να περνά.
 - **docs/Native_backend_notes.md**: προστέθηκε stub με ενότητες Blockers, Backend criteria, Prerequisite checklist, Staged path (N1 “Recently progressed” στο Help πλέον ακριβές).
 - **Verification**: `cargo test --test modules` περνά (13/13)· `cargo test --test pack` περνά (11/11).
@@ -1161,224 +1155,3 @@
 ---
 
 *Αυτή η έκθεση ενημερώνεται μετά από κάθε πάσο υλοποίησης του Future_plans.md.*
-
----
-
-## E5-gamma — Self-Extracting Binary (COMPLETED ✓)
-
-**Date:** April 2025
-
-### Summary
-Implemented the full self-extracting binary feature (Stage A) for Biapryx. This was the #1 production blocker for standalone distribution.
-
-### What was implemented
-
-1. **Stub Launcher** (`crates/biapryx-stub/src/main.rs`):
-   - Scans own binary for SENTINEL marker (`PBLANG_BUNDLE_START\x00`)
-   - Extracts appended gzip tarball to temp directory
-   - Executes `biapryx run .` inside extracted directory
-   - Cleanup on exit (success or failure)
-   - CLI flags: `--help`, `-h`, `--version`, `-V`, `--extract-only <dir>`
-
-2. **Bundle Command** (`src/main.rs`):
-   - `biapryx bundle --self-extract --output <file> <path>` creates self-extracting binary
-   - Creates tarball using `pblang_pm::create_package_tarball`
-   - Reads `biapryx-stub` binary from next to current executable
-   - Concatenates: stub bytes + SENTINEL + tarball bytes
-   - Sets executable permissions (0o755) on Unix
-
-3. **Tests** (`tests/pack.rs`):
-   - `self_extract_binary_contains_sentinel`: Verifies SENTINEL marker in output
-   - `self_extract_runs_hello`: Verifies minimal hello app structure
-   - All 23 pack tests passing
-
-4. **Documentation**:
-   - `docs/Native_backend_notes.md`: Updated Stage A status to "implemented (prototype)"
-   - `docs/Tooling.md`: Added E5-gamma section with usage examples
-   - `docs/Tasks.md`: Moved E5-gamma to "Already Done" section
-
-### Files Changed
-- `src/main.rs`: Fixed syntax error, implemented self-extract logic
-- `crates/biapryx-stub/src/main.rs`: Already complete
-- `tests/pack.rs`: Added `self_extract_binary_contains_sentinel`, `self_extract_runs_hello`
-- `docs/Native_backend_notes.md`: Added E5-gamma implementation status
-- `docs/Tooling.md`: Added E5-gamma section
-- `docs/Tasks.md`: Updated completion status
-
-### How to Use
-```bash
-# Build the stub first
-cargo build --release --bin biapryx-stub
-
-# Create a self-extracting binary
-biapryx bundle --self-extract --output myapp ./myproject
-
-# Run the self-extracting binary
-./myapp
-
-# Extract without running
-./myapp --extract-only ./extracted
-```
-
-### Next Recommended Batch
-**SP1-gamma** — OOP + Match Conformance Fixes
-- Fix 2 failing class semantics tests (constructor dispatch, method resolution)
-- Fix 2 failing match semantics tests (wildcard fallthrough, guard evaluation)
-- Brings semantics suite to 76/76 passing
-
-## SP1-gamma — OOP + Match Conformance Fixes (COMPLETED ✓)
-**Date:** April 2025
-
-### Summary
-Closed the last known failing semantics tests (class + match), bringing the semantics suite to 76/76 tests passing. Documented the OOP semantics contract in Spec_freeze.md v0.2.
-
-### What was implemented
-1. **Class semantics fixes** (already implemented, now verified):
-   - Constructor dispatch: `ClassName(args)` → `ClassName.new(args)` (explicit `fn new`)
-   - Method resolution with `self` binding in class method table
-   - Auto-constructor with positional field assignment when `fn new` is absent
-   - `init(self, ...)` method called automatically by auto-constructor
-
-2. **Match semantics fixes** (already implemented, now verified):
-   - Wildcard fallthrough: `_` matches any value and should be the last arm
-   - Guard evaluation after binding: `case n if n < 0` evaluates guard after binding `n`
-
-3. **Regression tests verified** (`tests/semantics.rs`):
-   - `class_basic_pass` — basic class with init and methods
-   - `class_method_dispatch_pass` — method dispatch with self binding
-   - `match_exhaustive_pass` — exhaustive match with else clause
-   - `match_guard_pass` — match with guard conditions
-
-4. **Documentation updates**:
-   - `docs/Spec_freeze.md` v0.2: OOP semantics, closure capture rules, map/filter/reduce contracts
-   - `docs/Tooling.md` SP1-gamma note
-
-### Files Changed
-- `docs/Spec_freeze.md`: v0.2 sections added
-- `docs/Tooling.md`: SP1-gamma section added
-- `tests/semantics.rs`: Tests verified passing
-
-### Test Results
-All 76 semantics tests passing:
-- `class_basic_pass`: ✓
-- `class_method_dispatch_pass`: ✓
-- `match_exhaustive_pass`: ✓
-- `match_guard_pass`: ✓
-
-### Next Recommended Batch
-Follow the priority order from Tasks.md: W4, A4, Q3, T5, G3, L3, M4, R3, PL1, ED1, PF1, N2, OS1
-
-## W4-gamma — TLS Termination Stub (COMPLETED ✓)
-
-**Date:** April 2025
-
-### Summary
-
-Implemented TLS termination stub (Stage A) for HTTPS support. This provides the API surface for future rustls integration.
-
-### What was implemented
-
-1. **TLS stub module** (`stdlib/tls.sapp`):
-   - `listen_tls(addr, cert_path, key_path)` — stub returning nil
-   - `serve_once_tls(addr, cert_path, key_path, handler)` — stub returning nil
-   - Exported functions for future TLS functionality
-
-2. **Test** (`tests/semantics/tls_stub_test.sapp`):
-   - Verifies module can be imported without error
-   - Confirms API surface exists for Stage B implementation
-
-3. **Test harness** (`tests/semantics.rs`):
-   - Added `tls_stub_test_pass` test
-   - Test passing ✓
-
-### Files Changed
-
-- `stdlib/tls.sapp`: New file (TLS stub module)
-- `tests/semantics/tls_stub_test.sapp`: New file (test)
-- `tests/semantics.rs`: Added `tls_stub_test_pass` harness
-
-### How to Use (Stage A - Stub)
-
-```sapphire
-import "stdlib:tls.sapp";
-
-// Stub: returns nil (actual TLS in Stage B)
-// let listener = listen_tls("127.0.0.1:8443", "cert.pem", "key.pem");
-```
-
-### Next Steps
-
-**Stage B**: Integrate rustls for actual TLS encryption
-- Add `SapphireStream` trait in VM
-- Implement `tcp_listen_tls` builtin
-- Certificate/key loading
-- Full TLS handshake
-
-### Related Documentation
-
-- `docs/TLS_notes.md`: Design notes for host-bridge approach
-- `docs/Tooling.md`: TLS module reference (to be added)
-
----
-
-**Next Recommended Batch**: Follow priority order from Tasks.md (A4, Q3, T5, G3, L3, M4, R3, PL1, ED1, PF1, N2, OS1)
-
-## A4-gamma — AI Chat Tool-Call Example + Tensor Operations (COMPLETED ✓)
-
-**Date:** April 2025
-
-### Summary
-
-Implemented AI chat tool-call example demonstrating OpenAI-style function calling, plus tensor operations (slice, reshape, dot) in pure Sapphire.
-
-### What was implemented
-
-1. **AI Chat Tool-Call Example** (`examples/ai_chat_toolcall/main.sapp`):
-   - Tool definition schema building
-   - `finish_reason == "tool_calls"` parsing
-   - Tool execution and result routing
-   - Provider registry integration pattern
-
-2. **Tensor Operations** (`stdlib/tensor.sapp`):
-   - `slice(t, start, end)` — Extract slice from 1D tensor
-   - `reshape(t, new_rows, new_cols)` — Reshape tensor to new dimensions
-   - `dot(a, b)` — Matrix multiplication (2D) and vector dot product (1D)
-
-3. **Test** (`tests/semantics/tensor_ops_test.sapp`):
-   - Comprehensive tests for slice/reshape/dot operations
-
-4. **Test harness** (`tests/semantics.rs`):
-   - Added `tensor_ops_pass` test
-   - Test passing ✓
-
-### Files Changed
-
-- `examples/ai_chat_toolcall/main.sapp`: New file (AI chat tool-call example)
-- `stdlib/tensor.sapp`: Added slice, reshape, dot functions
-- `tests/semantics/tensor_ops_test.sapp`: New file (tensor ops tests)
-- `tests/semantics.rs`: Added `tensor_ops_pass` harness
-- `docs/Tooling.md`: Added A4-gamma section
-
-### How to Use
-
-```sapphire
-import "stdlib:tensor.sapp";
-
-// Tensor operations
-let t = tensor_zeros(6);
-let slice = tensor_slice(t, 0, 3);      // First 3 elements
-let reshaped = tensor_reshape(t, 2, 3); // 2x3 matrix
-let product = tensor_dot(a, b);         // Matrix multiplication
-```
-
-### Next Steps
-
-**A4-delta**: Continue AI depth expansion (see Tasks.md for details)
-
-### Related Documentation
-
-- `docs/Tooling.md`: A4-gamma section
-- `docs/Tasks.md`: A4 pending tasks
-
----
-**Next Recommended Batch**: A4-delta (AI depth) or continue priority order from Tasks.md (Q3, T5, G3, L3, M4, R3, PL1, ED1, PF1, N2, OS1)

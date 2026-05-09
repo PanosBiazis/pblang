@@ -4,7 +4,7 @@ use pblang_vm::{StdlibConfig, VM};
 
 fn run(src: &str) -> Result<(), String> {
     let stmts = parse(src).map_err(|e| format!("parse error: {e:?}"))?;
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).map_err(|e| format!("compile error: {e}"))?;
     let mut vm = VM::with_stdlib(StdlibConfig::default());
     vm.run(chunk).map_err(|e| e.message)
 }

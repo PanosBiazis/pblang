@@ -1,4 +1,4 @@
-# Sapphire language semantics (v0.1)
+# Biapryx language semantics (v0.1)
 
 Stability snapshot for core semantics. Used as reference for conformance and compatibility.
 
@@ -32,7 +32,38 @@ Any other character (including unescaped `"`) ends or starts the string. The par
 - **Arrays**: index by number (0-based). Out-of-range or non-integer index is a runtime error.
 - **Maps**: index by string key. Missing key returns `nil` (no error). Attribute access `obj.key` is equivalent to `obj["key"]`.
 
-## Error model
+## Method-call sugar
+
+- `obj:method(a, b)` desugars to a method call where `obj` is passed as the first argument (`self`).
+- If `obj.__class` exists, method lookup happens on `obj.__class`, so class-backed objects dispatch through their class method map.
+- If `obj.__class` is missing, lookup falls back to the method stored directly on `obj` itself.
+- There is no implicit global class lookup for unrelated plain maps.
+
+## Match expressions and guards
+
+- **Basic match**: `match expr { case pat: body; ... else: body }`
+- **Guarded match**: `case pat if guard # body` (use `#` as separator with guards)
+  - The `#` separator is unambiguous (unlike `:` which conflicts with `obj:method()` postfix)
+  - Alternative: `case pat if guard then body` using the `then` keyword
+  - Both `:` and `#`/`then` are accepted by the parser
+- **Wildcard**: `case _: body` matches any value
+- **Bind**: `case n: body` binds the scrutinee to `n` in the body
+- **Guard**: `case n if n > 0 # body` — guard is any truthy expression
+- **No exhaustiveness check**: non-matching match returns `nil`
+
+## Threading patterns
+
+- **Spawning**: closures passed to `spawn()` must have **closed upvalues** (not open stack vars)
+- **Wrong**: `let x = 5; spawn(fn() { use(x); })` — `x` is an open upvalue (top-level global)
+- **Right**: `fn make_fn(x) { return fn() { use(x); }; } let f = make_fn(5); spawn(f)`
+  — `make_fn` returns before `spawn`, closing the upvalue
+- **Channels**: `channel()` returns `{sender: id, receiver: id}`
+  - `send(ch.sender, value)` — send on sender handle
+  - `recv(ch.receiver)` — block-receive on receiver handle
+  - `channel_close(ch.sender)` — close sender handle
+  - `channel_is_closed(ch.sender)` — check if closed
+  - `select([ch_a.receiver, ch_b.receiver])` — returns `{index, value}` or `nil`
+
 
 - **Runtime error**: a `RuntimeError` value with message, optional span/source, and stack trace. Thrown by builtins and VM (e.g. type mismatch, undefined global, capability denied).
 - **Exception handling**: `try { ... } catch e { ... }` catches runtime errors; `e` is the error value. `defer { ... }` runs on scope exit (LIFO).

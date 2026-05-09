@@ -1,5 +1,3 @@
-//"./local_file"
-
 use chumsky::prelude::*;
 
 use crate::{Expr, ExprKind, LogicalOp, MatchArm, Param, Span, Stmt, StmtKind, TypeExpr, TypeKind};
@@ -58,9 +56,9 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 Some(frac) => format!("{int_part}.{frac}"),
                 None => int_part,
             };
-            ExprKind::Number(s.parse::<f64>().unwrap())
+            ExprKind::Number(s.parse::<f64>().unwrap_or(f64::NAN))
         })
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     // String content: either non-escape char or \n \t \r \" \\
@@ -79,7 +77,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .ignore_then(string_char.clone().repeated())
         .then_ignore(just('"'))
         .map(|chars| ExprKind::Str(chars.into_iter().collect()))
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     let escape_raw = just('\\').then(choice((
@@ -103,12 +101,12 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         just("true").to(ExprKind::Bool(true)),
         just("false").to(ExprKind::Bool(false)),
     ))
-    .map_with_span(|k, sp| mk_expr(k, sp))
+    .map_with_span(mk_expr)
     .padded();
 
     let nil_lit = just("nil")
         .to(ExprKind::Nil)
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     let ident = text::ident().padded();
@@ -130,7 +128,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('}'))
         .map(StmtKind::Block)
-        .map_with_span(|k, sp| mk_stmt(k, sp))
+        .map_with_span(mk_stmt)
         .padded();
 
     // -------------------- types (for gradual typing) --------------------
@@ -143,7 +141,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         just("string").to(TypeKind::String),
         just("nil").to(TypeKind::Nil),
     ))
-    .map_with_span(|k, sp| mk_type(k, sp))
+    .map_with_span(mk_type)
     .padded();
 
     let ty_array = just("array")
@@ -151,7 +149,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .ignore_then(ty.clone())
         .then_ignore(just('>').padded())
         .map(|inner| TypeKind::Array(Box::new(inner)))
-        .map_with_span(|k, sp| mk_type(k, sp))
+        .map_with_span(mk_type)
         .padded();
 
     let ty_map = just("map")
@@ -159,7 +157,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .ignore_then(ty.clone())
         .then_ignore(just('>').padded())
         .map(|inner| TypeKind::Map(Box::new(inner)))
-        .map_with_span(|k, sp| mk_type(k, sp))
+        .map_with_span(mk_type)
         .padded();
 
     ty.define(choice((ty_array, ty_map, ty_atom)));
@@ -190,7 +188,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!("block parser must produce StmtKind::Block"),
         }))
         .map(|(((name, params), ret), body)| StmtKind::Fn(name, params, ret, body))
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let printf_stmt = just("printf")
         .then_ignore(ws1.clone())
@@ -198,32 +196,32 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .map(|(p, e)| StmtKind::PrintF(p as usize, e))
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let print_stmt = just("print")
         .then_ignore(ws1.clone())
         .ignore_then(expr.clone())
         .map(StmtKind::Print)
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let return_stmt = just("return")
         .ignore_then(expr.clone().or_not())
         .map(StmtKind::Return)
-        .map_with_span(|k, sp| mk_stmt(k, sp))
+        .map_with_span(mk_stmt)
         .padded();
 
     let defer_stmt = just("defer")
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .map(|(_, e)| StmtKind::Defer(e))
-        .map_with_span(|k, sp| mk_stmt(k, sp))
+        .map_with_span(mk_stmt)
         .padded();
 
     let import_stmt = just("import")
         .then_ignore(ws1.clone())
         .ignore_then(string_raw.clone())
         .map(StmtKind::Import)
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let export_stmt = just("export")
         .then_ignore(ws1.clone())
@@ -235,7 +233,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 .collect::<Vec<String>>(),
         )
         .map(StmtKind::Export)
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let let_stmt = just("let")
         .then_ignore(ws1.clone())
@@ -244,7 +242,17 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then_ignore(just('=').padded())
         .then(expr.clone())
         .map(|((name, ty), expr)| StmtKind::Let(name, ty, expr))
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
+
+    // const name = expr; — immutable binding (Rust-style)
+    let const_stmt = just("const")
+        .then_ignore(ws1.clone())
+        .ignore_then(text::ident())
+        .then(type_ann.clone())
+        .then_ignore(just('=').padded())
+        .then(expr.clone())
+        .map(|((name, ty), init)| StmtKind::Const(name, ty, init))
+        .map_with_span(mk_stmt);
 
     // assignment / mutation statement:
     //   x = expr
@@ -271,7 +279,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     let lvalue = text::ident()
         .padded()
         .map(ExprKind::Var)
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .then(choice((l_attr, l_index)).repeated())
         .foldl(|left, pf| match pf {
             LPostfix::Attr(name, a_sp) => {
@@ -305,12 +313,12 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             ExprKind::Index(obj, ix) => StmtKind::SetIndex(*obj, *ix, rhs),
             _ => unreachable!("lvalue parser only builds Var/GetAttr/Index"),
         })
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let expr_stmt = expr
         .clone()
         .map(StmtKind::Expr)
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     // if/elif/else needs self-reference for `else if`
     let mut if_stmt = Recursive::declare();
@@ -367,7 +375,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!("block parser must produce StmtKind::Block"),
         }))
         .map(|(cond, body)| StmtKind::While(cond, body))
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let for_stmt = just("for")
         .then_ignore(ws1.clone())
@@ -379,7 +387,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!("block parser must produce StmtKind::Block"),
         }))
         .map(|((name, count), body)| StmtKind::For(name, count, body))
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     // class statement (OOP sugar):
     // class Name {
@@ -576,6 +584,11 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 ),
                 span: sp,
             };
+            // FIX #11: .new must alias to the newN that matches the actual init arity,
+            // not always new0. If there is no init method, new0 (zero-arg) is correct.
+            let new_alias_target = init_arity
+                .map(|a| format!("new{a}"))
+                .unwrap_or_else(|| "new0".to_string());
             let set_new = Stmt {
                 kind: StmtKind::SetAttr(
                     Expr {
@@ -589,7 +602,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                                 kind: ExprKind::Var(cname.clone()),
                                 span: sp,
                             }),
-                            "new0".to_string(),
+                            new_alias_target,
                         ),
                         span: sp,
                     },
@@ -659,7 +672,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('}'))
         .map(StmtKind::Block)
-        .map_with_span(|k, sp| mk_stmt(k, sp))
+        .map_with_span(mk_stmt)
         .padded();
 
     let gblock_body = gblock_stmt.clone().map(|s| match s.kind {
@@ -734,7 +747,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .ignore_then(expr.clone())
         .then(gblock_body.clone())
         .map(|(cond, body)| StmtKind::While(cond, body))
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     let g_for_stmt = just("for")
         .then_ignore(ws1.clone())
@@ -743,7 +756,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(expr.clone())
         .then(gblock_body.clone())
         .map(|((name, count), body)| StmtKind::For(name, count, body))
-        .map_with_span(|k, sp| mk_stmt(k, sp));
+        .map_with_span(mk_stmt);
 
     // Allow nested blocks inside goto label bodies.
     let g_stmt_impl = choice((
@@ -1004,6 +1017,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         export_stmt,
         class_stmt,
         goto_block_stmt,
+        const_stmt,  // must come before let_stmt (both start parsing an ident)
         let_stmt,
         if_stmt.clone(),
         while_stmt,
@@ -1030,9 +1044,8 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .padded();
 
     let ident_expr = ident
-        .clone()
         .map(ExprKind::Var)
-        .map_with_span(|k, sp| mk_expr(k, sp));
+        .map_with_span(mk_expr);
 
     // Function literal expression:
     // fn (a, b) { ... }
@@ -1045,7 +1058,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(ret_ann.clone())
         .then(block_body.clone())
         .map(|(((name_opt, params), ret), body)| ExprKind::FnLit(name_opt, params, ret, body))
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     // Expression block: { stmt; stmt; expr? }
@@ -1057,7 +1070,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(expr.clone().or_not())
         .delimited_by(just('{'), just('}'))
         .map(|(stmts, tail)| ExprKind::BlockExpr(stmts, tail.map(Box::new)))
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     let array_lit = expr
@@ -1067,7 +1080,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .collect::<Vec<Expr>>()
         .delimited_by(just('['), just(']'))
         .map(ExprKind::Array)
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     let map_key = choice((
@@ -1092,7 +1105,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('}').padded())
         .map(ExprKind::Map)
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     let try_expr = just("try")
@@ -1101,17 +1114,17 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then_ignore(just("catch").padded())
         .then(expr.clone())
         .map(|(a, b)| ExprKind::Try(Box::new(a), Box::new(b)))
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     // match expression: match expr { case pattern: expr; ... else: expr }
     let match_pattern = choice((
         just("_").to(MatchArm::Wildcard),
-        number.clone().map(MatchArm::Literal),
+        number.map(MatchArm::Literal),
         string.clone().map(MatchArm::Literal),
         bool_lit.clone().map(MatchArm::Literal),
         nil_lit.clone().map(MatchArm::Literal),
-        ident.clone().map(MatchArm::Bind),
+        ident.map(MatchArm::Bind),
     ))
     .padded();
     let match_arm = just("case")
@@ -1125,7 +1138,14 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 .or_not(),
         )
         .then_ignore(ws0.clone())
-        .then_ignore(just(':').padded().or_not())
+        // Body separator: `:` (traditional) or `~` (tilde, for guarded arms).
+        // Use `~` with guards: `case n if n > 0 ~ "body"`. Tilde is safe because
+        // no pblang operator uses it, so the guard expr always stops cleanly before it.
+        // Body separator: `:` (traditional) or `then` keyword (for guarded arms).
+        // Use `then` with guards: `case n if cond then body`.
+        // `then` starts with `t` which no pblang operator uses, so the guard
+        // expression always stops cleanly before `then`.
+        .then_ignore(choice((just(':').map(|_| ()), just('#').map(|_| ()))).padded().or_not())
         .then(ws0.clone().ignore_then(expr.clone()).then_ignore(ws0.clone()))
         .map(|((pattern, guard_opt), body)| {
             let arm = match (pattern, guard_opt) {
@@ -1156,7 +1176,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .map_with_span(|(scrutinee, (arms, else_expr)), _sp| {
             ExprKind::Match(Box::new(scrutinee), arms, else_expr.map(Box::new))
         })
-        .map_with_span(|k, sp| mk_expr(k, sp))
+        .map_with_span(mk_expr)
         .padded();
 
     // switch expression (value-returning):
@@ -1261,7 +1281,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     let primary = choice((
         bool_lit.clone(),
         nil_lit.clone(),
-        number.clone(),
+        number,
         string.clone(),
         array_lit,
         map_lit,
@@ -1281,11 +1301,40 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         Attr(String, Span),
         Index(Expr, Span),
         Method(String, Vec<Expr>, Span),
+        /// `?.field` — nil-safe attribute access
+        SafeAttr(String, Span),
+        /// `?[idx]` — nil-safe index access
+        SafeIndex(Expr, Span),
+        /// `?` alone (postfix) — Result unwrap or nil propagation
+        ResultUnwrap(Span),
     }
 
     let attr = just('.')
         .ignore_then(text::ident().padded())
         .map_with_span(|name, sp| Postfix::Attr(name, Span::from(sp)))
+        .padded();
+
+    // `?.field` — nil-safe attribute access
+    let safe_attr = just("?.")
+        .ignore_then(text::ident().padded())
+        .map_with_span(|name, sp| Postfix::SafeAttr(name, Span::from(sp)))
+        .padded();
+
+    // `?[expr]` — nil-safe index access
+    // To avoid embedding the full expr parser inside postfix (depth issue),
+    // we reuse the existing `index` parser but prefix it with `?`.
+    let safe_index = just('?')
+        .ignore_then(
+            expr.clone()
+                .delimited_by(just('['), just(']'))
+        )
+        .map_with_span(|e, sp| Postfix::SafeIndex(e, Span::from(sp)))
+        .padded();
+
+    // `?` alone at end of expr — Result unwrap (errors become RuntimeErrors)
+    // NOTE: must come after ?. and ?[ so those take priority
+    let result_unwrap_pf = just('?')
+        .map_with_span(|_, sp| Postfix::ResultUnwrap(Span::from(sp)))
         .padded();
 
     let call = args.clone().map(|(a, sp)| Postfix::Call(a, sp));
@@ -1302,8 +1351,9 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .map_with_span(|e, sp| Postfix::Index(e, Span::from(sp)))
         .padded();
 
-    // postfix: calls, indexing, member access (left-to-right)
-    let postfix = choice((call, method, index, attr));
+    // postfix: calls, indexing, member access, safe access, result-unwrap (left-to-right)
+    // Order matters: safe_attr/safe_index must precede result_unwrap_pf since both start with `?`
+    let postfix = choice((call, method, index, safe_attr, safe_index, attr, result_unwrap_pf));
 
     let call_expr = primary
         .clone()
@@ -1336,6 +1386,27 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 };
                 Expr {
                     kind: ExprKind::GetAttr(Box::new(left), name),
+                    span: sp,
+                }
+            }
+            Postfix::SafeAttr(name, a_sp) => {
+                let sp = Span { start: left.span.start, end: a_sp.end };
+                Expr {
+                    kind: ExprKind::SafeGetAttr(Box::new(left), name),
+                    span: sp,
+                }
+            }
+            Postfix::SafeIndex(ix, i_sp) => {
+                let sp = Span { start: left.span.start, end: i_sp.end };
+                Expr {
+                    kind: ExprKind::SafeIndex(Box::new(left), Box::new(ix)),
+                    span: sp,
+                }
+            }
+            Postfix::ResultUnwrap(u_sp) => {
+                let sp = Span { start: left.span.start, end: u_sp.end };
+                Expr {
+                    kind: ExprKind::ResultUnwrap(Box::new(left)),
                     span: sp,
                 }
             }
@@ -1405,26 +1476,28 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             }
         });
 
-    // unary: - expr (so that "else: -1" and "-x" parse; + is no-op)
-    let unary_expr = just('-')
-        .or_not()
+    // unary: -expr and !expr handled via a mapped prefix option (avoids tripling call_expr depth)
+    // `!` maps to ExprKind::Not; `-` maps to 0-sub; absence = pass-through
+    #[derive(Clone, Copy)]
+    enum Prefix { Neg, Not }
+    let prefix = choice((
+        just('!').to(Prefix::Not),
+        just('-').to(Prefix::Neg),
+    )).or_not();
+
+    let unary_expr = prefix
         .then(call_expr.clone())
-        .map_with_span(|(neg, e), sp| {
+        .map_with_span(|(pfx, e), sp| {
             let sp = Span::from(sp);
-            if neg.is_some() {
-                let zero = Expr {
-                    kind: ExprKind::Number(0.0),
-                    span: sp,
-                };
-                Expr {
-                    kind: ExprKind::Sub(Box::new(zero), Box::new(e)),
-                    span: sp,
+            match pfx {
+                Some(Prefix::Not) => Expr { kind: ExprKind::Not(Box::new(e)), span: sp },
+                Some(Prefix::Neg) => {
+                    let zero = Expr { kind: ExprKind::Number(0.0), span: sp };
+                    Expr { kind: ExprKind::Sub(Box::new(zero), Box::new(e)), span: sp }
                 }
-            } else {
-                e
+                None => e,
             }
-        })
-        .padded();
+        });
 
     // multiplicative: * /
     let mul_op = choice((just('*').to(MulOp::Mul), just('/').to(MulOp::Div))).padded();

@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// pblang-llvm — NOT YET IMPLEMENTED
+//
+// This crate is a placeholder. It was removed from the workspace in the v0.5
+// audit (finding #5) because it contained only the auto-generated Cargo template
+// with no actual implementation.
+//
+// It will be re-added as a proper workspace member when real work begins.
+// See ROADMAP.md for the planned feature scope.

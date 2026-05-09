@@ -1,4 +1,3 @@
-// ./local_file
 use pblang_compiler::{compile, disasm};
 use pblang_core::{
     parse, parse_with_polyglot, Expr, ExprKind, MatchArm, Span, Stmt, StmtKind, TypeExpr, TypeKind,
@@ -60,12 +59,27 @@ fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
         if let Some(entry) = man.package.as_ref().and_then(|pkg| pkg.entry.as_deref()) {
             let rel_entry = validate_package_relative_path(entry, "entry")?;
             let entry_path = man_dir.join(rel_entry);
+            // SECURITY FIX #8 (TOCTOU): canonicalize() validates the path at time T,
+            // but the file is opened/read at T+1. A symlink swap between these two
+            // steps can redirect execution outside the package root.
+            // Best-effort mitigation: re-check starts_with after canonicalize, and
+            // the consumer should open the file with O_NOFOLLOW where the platform
+            // supports it. A full fix requires platform-specific open-and-verify.
             let resolved = entry_path
                 .canonicalize()
                 .map_err(|e| format!("package entry not found '{}': {e}", entry_path.display()))?;
             if !resolved.starts_with(man_dir) {
                 return Err(format!(
                     "package entry escapes package root: {}",
+                    resolved.display()
+                ));
+            }
+            // Double-check: re-canonicalize to detect any symlink swap (best effort).
+            let re_resolved = resolved.canonicalize()
+                .map_err(|e| format!("package entry disappeared after validation '{}': {e}", resolved.display()))?;
+            if re_resolved != resolved {
+                return Err(format!(
+                    "package entry changed between checks (possible symlink swap): {}",
                     resolved.display()
                 ));
             }
@@ -382,6 +396,12 @@ fn show_help() {
 }
 
 fn print_symbol_table(chunk: &Chunk) {
+    // AUDIT NOTE #24: This symbol table is a best-effort heuristic.
+    // It will produce FALSE POSITIVES (string literals that look like identifiers)
+    // and MISS all local variables (which are slot-indexed, not string-named).
+    // Use --dump-bytecode for accurate introspection of the compiled output.
+    // A proper symbol table requires tracking declaration sites in the compiler.
+    //
     // Best-effort symbol table based on constants and bytecode.
     // Functions: look for OpClosure(fn_const=idx) and treat the referenced constant string as a function name.
     let mut seen_fns = std::collections::HashSet::new();
@@ -1152,6 +1172,13 @@ fn walk_stmts_for_dataflow(
                 walk_expr_for_dataflow(value, src, defs, uses);
             }
             StmtKind::Import(_) | StmtKind::Export(_) | StmtKind::Return(None) => {}
+            // const behaves like let for dataflow analysis
+            StmtKind::Const(name, _ty, expr) => {
+                let (line, _) = line_col(src, stmt.span.start);
+                defs.entry(name.clone())
+                    .or_insert(VarDefInfo { line, used: false });
+                walk_expr_for_dataflow(expr, src, defs, uses);
+            }
         }
     }
 }
@@ -1245,6 +1272,14 @@ fn walk_expr_for_dataflow(
             }
         }
         ExprKind::Number(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {}
+        // Safety operators — walk their inner expressions
+        ExprKind::Not(inner) => walk_expr_for_dataflow(inner, src, defs, uses),
+        ExprKind::SafeGetAttr(obj, _) => walk_expr_for_dataflow(obj, src, defs, uses),
+        ExprKind::SafeIndex(obj, idx) => {
+            walk_expr_for_dataflow(obj, src, defs, uses);
+            walk_expr_for_dataflow(idx, src, defs, uses);
+        }
+        ExprKind::ResultUnwrap(inner) => walk_expr_for_dataflow(inner, src, defs, uses),
     }
 }
 
@@ -1441,13 +1476,53 @@ fn run_lsp_server() {
     let mut writer = stdout.lock();
 
     let builtin_completions: Vec<&str> = vec![
+        // core
+        "print", "printf", "len", "type", "str",
+        "parsenumber", "parsebool", "read_line",
+        // array
+        "array_push", "array_pop", "array_sort",
+        // map
+        "map_keys", "map_has", "map_remove",
+        // number
+        "num_sqrt", "num_pow", "num_abs", "num_max", "num_min",
+        "num_floor", "num_ceil", "num_mod", "num_ln", "num_exp",
+        "num_atan2",
+        // random
+        "random_bytes", "random_float",
+        // string
+        "str_contains", "str_starts_with", "str_ends_with",
+        "str_trim", "str_split", "str_slice", "str_index_of",
+        "str_lower", "str_upper", "strfromcharcode", "strcharcodeat",
+        // json / crypto
+        "json_parse", "json_stringify",
+        "sha256", "base64_encode", "base64_decode", "constant_time_eq",
+        // http
+        "http_get", "http_post", "http_post_auth",
+        // fs
+        "fs_read", "fs_write", "fs_append", "fs_exists", "fs_remove",
+        "fs_list_dir", "fs_mkdirs", "fs_rename", "fs_copy",
+        "fs_read_bytes", "fs_write_bytes",
+        "cwd", "path_join", "path_dirname", "path_basename",
+        // net
+        "tcp_listen", "tcp_accept", "tcp_read", "tcp_write",
+        "tcp_close", "tcp_set_timeout",
+        // sqlite
+        "sqlite_open", "sqlite_exec", "sqlite_query", "sqlite_close",
+        "sqlite_last_insert_rowid",
+        // ffi
+        "ffi_load", "ffi_call", "ffi_close",
+        // concurrency
+        "spawn", "join", "channel", "send", "recv",
+        "channel_close", "channel_is_closed", "select",
+        // timing / misc
+        "clock", "now_ms", "now_iso", "sleep_ms",
+        "gc_stats", "gc_collect",
+        "env_get", "env_set", "exec",
+        // os
+        "import",
         "print",
-        "printf",
-        "len",
-        "type",
-        "str",
+        // kept for compat
         "parsenumber",
-        "parsebool",
         "arraypush",
         "arraypop",
         "mapkeys",
@@ -1501,12 +1576,13 @@ fn run_lsp_server() {
                 id_val.as_deref(),
                 r#"{
                 "capabilities": {
-                    "completionProvider": { "triggerCharacters": ["."] },
+                    "completionProvider": { "triggerCharacters": [".", ":"] },
                     "textDocumentSync": 1,
                     "hoverProvider": true,
-                    "definitionProvider": true
+                    "definitionProvider": true,
+                    "workspaceSymbolProvider": true
                 },
-                "serverInfo": { "name": "pblang-lsp", "version": "0.1.0-stub" }
+                "serverInfo": { "name": "pblang-lsp", "version": "0.5.0-stub" }
             }"#,
             )),
             Some("initialized") => None,
@@ -1524,8 +1600,7 @@ fn run_lsp_server() {
                         let after_text = &body[params_start + text_key + "\"text\"".len()..];
                         if let Some(colon) = after_text.find(':') {
                             let after_colon = after_text[colon + 1..].trim_start();
-                            if after_colon.starts_with('"') {
-                                let rest = &after_colon[1..];
+                            if let Some(rest) = after_colon.strip_prefix('"') {
                                 if let Some(end_quote) = rest.find('"') {
                                     let text = &rest[..end_quote];
                                     let uri = if let Some(uri_key) =
@@ -1535,8 +1610,7 @@ fn run_lsp_server() {
                                             &body[params_start + uri_key + "\"uri\"".len()..];
                                         if let Some(colon2) = after_uri.find(':') {
                                             let after_colon2 = after_uri[colon2 + 1..].trim_start();
-                                            if after_colon2.starts_with('"') {
-                                                let rest2 = &after_colon2[1..];
+                                            if let Some(rest2) = after_colon2.strip_prefix('"') {
                                                 if let Some(end2) = rest2.find('"') {
                                                     rest2[..end2].to_string()
                                                 } else {
@@ -1559,6 +1633,39 @@ fn run_lsp_server() {
                 }
                 None
             }
+            Some("workspace/symbol") => {
+                // Return all symbols from open files
+                let q_needle = "\"query\"";
+                let query = if let Some(q_pos) = body.find(q_needle) {
+                    let after = &body[q_pos + q_needle.len()..];
+                    if let Some(c) = after.find(':') {
+                        let v = after[c+1..].trim_start();
+                        if let Some(r) = v.strip_prefix('"') {
+                            r.split('"').next().unwrap_or("").to_string()
+                        } else { "".to_string() }
+                    } else { "".to_string() }
+                } else { "".to_string() };
+                let mut symbols: Vec<String> = Vec::new();
+                for (uri, src) in &open_files {
+                    for line in src.lines() {
+                        let line = line.trim();
+                        if let Some(rest) = line.strip_prefix("fn ") {
+                            if let Some(name_end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                                let name = &rest[..name_end];
+                                if query.is_empty() || name.contains(&query) {
+                                    let name_json = serde_json::to_string(name).unwrap_or_default();
+                                    let uri_json = serde_json::to_string(uri).unwrap_or_default();
+                                    symbols.push(format!(
+                                        "{{\"name\":{name_json},\"kind\":12,\"location\":{{\"uri\":{uri_json}}}}}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                let arr = format!("[{}]", symbols.join(","));
+                Some(lsp_response(id_val.as_deref(), &arr))
+            }
             Some("textDocument/completion") => {
                 let mut items: Vec<String> = builtin_completions
                     .iter()
@@ -1569,8 +1676,7 @@ fn run_lsp_server() {
                         let after_uri = &body[params_start + uri_key + "\"uri\"".len()..];
                         if let Some(colon) = after_uri.find(':') {
                             let after_colon = after_uri[colon + 1..].trim_start();
-                            if after_colon.starts_with('"') {
-                                let rest = &after_colon[1..];
+                            if let Some(rest) = after_colon.strip_prefix('"') {
                                 if let Some(end) = rest.find('"') {
                                     let uri = &rest[..end];
                                     if let Some(src) = open_files.get(uri) {
@@ -1598,7 +1704,7 @@ fn run_lsp_server() {
                         let lines: Vec<&str> = src.lines().collect();
                         let line_str = lines.get(line as usize).copied().unwrap_or("");
                         if let Some(word) = lsp_ident_byte_at(line_str, character) {
-                            if builtin_completions.iter().any(|b| *b == word.as_str()) {
+                            if builtin_completions.contains(&word.as_str()) {
                                 let detail = serde_json::json!({
                                     "contents": {
                                         "kind": "markdown",
@@ -1687,7 +1793,7 @@ fn lsp_response(id: Option<&str>, result_json: &str) -> String {
     )
 }
 
-fn lsp_extract_str<'a>(json: &'a str, key: &str) -> Option<String> {
+fn lsp_extract_str(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{}\"", key);
     let pos = json.find(&needle)?;
     let after = json[pos + needle.len()..].trim_start();
@@ -1702,8 +1808,7 @@ fn lsp_extract_id(json: &str) -> Option<String> {
     let pos = json.find(needle)?;
     let after = json[pos + needle.len()..].trim_start();
     let after = after.strip_prefix(':')?.trim_start();
-    if after.starts_with('"') {
-        let inner = &after[1..];
+    if let Some(inner) = after.strip_prefix('"') {
         let end = inner.find('"')?;
         Some(format!("\"{}\"", &inner[..end]))
     } else {
@@ -1740,7 +1845,7 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.get(0).map(|s| s.as_str()) == Some("init") {
+    if args.first().map(|s| s.as_str()) == Some("init") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let manifest_path = cwd.join("pblang.toml");
         if manifest_path.exists() {
@@ -1760,7 +1865,7 @@ fn main() {
         }
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("new") {
+    if args.first().map(|s| s.as_str()) == Some("new") {
         let name = match args.get(1) {
             Some(n) if !n.starts_with('-') => n.clone(),
             _ => {
@@ -1827,7 +1932,7 @@ fn main() {
         println!("To run: cd {name} && pblang run .");
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--lock") {
+    if args.first().map(|s| s.as_str()) == Some("--lock") {
         let rest: Vec<String> = args.iter().skip(1).cloned().collect();
         let (registry_index_url, require_registry_sha256_cli, positionals) =
             parse_registry_options_and_positionals("--lock", &rest).unwrap_or_else(|e| {
@@ -1871,7 +1976,7 @@ fn main() {
         println!("wrote {}", lock_path.display());
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("install") {
+    if args.first().map(|s| s.as_str()) == Some("install") {
         let rest: Vec<String> = args.iter().skip(1).cloned().collect();
         let (registry_index_url, require_registry_sha256_cli, positionals) =
             parse_registry_options_and_positionals("install", &rest).unwrap_or_else(|e| {
@@ -1883,11 +1988,15 @@ fn main() {
             std::process::exit(1);
         }
         // name@version mode: install a single registry package into cache.
-        if let Some(arg) = positionals.get(0) {
+        if let Some(arg) = positionals.first() {
             let arg_str = arg.to_string_lossy();
             if arg_str.contains('@') && !arg.exists() {
                 // Use the last '@' to separate name from version, supporting scoped names like @scope/name@version
-                let at_pos = arg_str.rfind('@').unwrap();
+                // SAFETY: we just checked `arg_str.contains('@')` above, so rfind is guaranteed to return Some.
+                let at_pos = match arg_str.rfind('@') {
+                    Some(p) => p,
+                    None => unreachable!("rfind('@') can't be None: contains('@') was true"),
+                };
                 let name = &arg_str[..at_pos];
                 let version_range = &arg_str[at_pos + 1..];
                 if name.is_empty() || version_range.is_empty() {
@@ -1958,10 +2067,10 @@ fn main() {
         println!("dependencies ready ({})", lock_path.display());
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("publish") {
+    if args.first().map(|s| s.as_str()) == Some("publish") {
         let rest: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
         // If --registry-dir is present, use legacy local-registry publish.
-        if rest.iter().any(|a| *a == "--registry-dir") {
+        if rest.contains(&"--registry-dir") {
             let mut registry_dir: Option<std::path::PathBuf> = None;
             let mut path_arg: Option<std::path::PathBuf> = None;
             let mut i = 0;
@@ -2016,10 +2125,16 @@ fn main() {
             );
             std::process::exit(1);
         });
+        // SECURITY FIX #28: Prefer the env var to avoid the token appearing in
+        // shell history, `ps aux` process listings, and CI logs.
+        // The --registry-token=<value> CLI flag is still supported for backward
+        // compatibility, but a warning is printed to stderr when it is used.
         let token = std::env::var("PBLANG_REGISTRY_TOKEN").unwrap_or_else(|_| {
-            // Optional CLI flag: --registry-token=<token>
             for a in &rest {
                 if let Some(t) = a.strip_prefix("--registry-token=") {
+                    eprintln!(
+                        "WARNING: passing --registry-token on the command line exposes the                          token in shell history and process listings.                          Prefer setting PBLANG_REGISTRY_TOKEN as an environment variable."
+                    );
                     return t.to_string();
                 }
             }
@@ -2032,7 +2147,7 @@ fn main() {
         println!("Published to {}", registry_url);
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("search") {
+    if args.first().map(|s| s.as_str()) == Some("search") {
         let query = args.get(1).map(|s| s.as_str()).unwrap_or("");
         let registry_url = std::env::var("PBLANG_REGISTRY_INDEX").unwrap_or_else(|_| {
             eprintln!(
@@ -2057,7 +2172,7 @@ fn main() {
         }
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("pack") {
+    if args.first().map(|s| s.as_str()) == Some("pack") {
         // Stage A executables: create a single .tar.gz artifact with manifest, lockfile and local deps.
         let rest: Vec<String> = args.iter().skip(1).cloned().collect();
         let (registry_index_url, require_registry_sha256_cli, positionals) =
@@ -2168,7 +2283,7 @@ fn main() {
         println!("To run: unpack the tarball and run 'pblang run .' in the unpacked directory.");
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("verify") {
+    if args.first().map(|s| s.as_str()) == Some("verify") {
         let rest: Vec<String> = args.iter().skip(1).cloned().collect();
         let tarball_path = match rest.first() {
             Some(p) => std::path::PathBuf::from(p),
@@ -2190,7 +2305,7 @@ fn main() {
         }
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--call-graph") {
+    if args.first().map(|s| s.as_str()) == Some("--call-graph") {
         let path = match args.get(1) {
             Some(p) => p.as_str(),
             None => {
@@ -2217,7 +2332,7 @@ fn main() {
         }
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--dataflow") {
+    if args.first().map(|s| s.as_str()) == Some("--dataflow") {
         let path = match args.get(1) {
             Some(p) => p.as_str(),
             None => {
@@ -2242,7 +2357,7 @@ fn main() {
         print_dataflow_report(&ast, &src_for_parse);
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--dump-bytecode") {
+    if args.first().map(|s| s.as_str()) == Some("--dump-bytecode") {
         let path = match args.get(1) {
             Some(p) => p,
             None => {
@@ -2268,11 +2383,17 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let chunk = compile(stmts);
+        let chunk = match compile(stmts) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pblang: compile error: {}", e);
+                std::process::exit(3);
+            }
+        };
         println!("{}", disasm(&chunk));
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--annotate") {
+    if args.first().map(|s| s.as_str()) == Some("--annotate") {
         let path = match args.get(1) {
             Some(p) => p,
             None => {
@@ -2298,11 +2419,17 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let chunk = compile(stmts);
+        let chunk = match compile(stmts) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pblang: compile error: {}", e);
+                std::process::exit(3);
+            }
+        };
         print_annotated_disasm(&chunk, &src_for_parse);
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--symbols") {
+    if args.first().map(|s| s.as_str()) == Some("--symbols") {
         let path = match args.get(1) {
             Some(p) => p,
             None => {
@@ -2328,11 +2455,17 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let chunk = compile(stmts);
+        let chunk = match compile(stmts) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pblang: compile error: {}", e);
+                std::process::exit(3);
+            }
+        };
         print_symbol_table(&chunk);
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--cfg") {
+    if args.first().map(|s| s.as_str()) == Some("--cfg") {
         let use_dot = args.iter().any(|a| a == "--cfg-dot");
         let path = match args.iter().find(|a| !a.starts_with('-')) {
             Some(p) => p,
@@ -2359,11 +2492,17 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let chunk = compile(stmts);
+        let chunk = match compile(stmts) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pblang: compile error: {}", e);
+                std::process::exit(3);
+            }
+        };
         print_cfg(&chunk, use_dot);
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("build") {
+    if args.first().map(|s| s.as_str()) == Some("build") {
         let rest: Vec<String> = args.iter().skip(1).cloned().collect();
         let (registry_index_url, require_registry_sha256_cli, positionals) =
             parse_registry_options_and_positionals("build", &rest).unwrap_or_else(|e| {
@@ -2438,7 +2577,7 @@ fn main() {
         println!("build ok");
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("bundle") {
+    if args.first().map(|s| s.as_str()) == Some("bundle") {
         // Experimental: support an optional --self-extract flag (E5-beta).
         // We strip it from the arg list before feeding the rest into the
         // registry option parser so it is never reported as an unknown flag.
@@ -2684,7 +2823,7 @@ fn main() {
         return;
     }
 
-    if args.get(0).map(|s| s.as_str()) == Some("--check") {
+    if args.first().map(|s| s.as_str()) == Some("--check") {
         let path = args.get(1).expect("usage: pblang --check <file>");
         let src = std::fs::read_to_string(path).expect("failed to read file");
         match parse(&src) {
@@ -2709,7 +2848,7 @@ fn main() {
             }
         }
     }
-    if args.get(0).map(|s| s.as_str()) == Some("--doc") {
+    if args.first().map(|s| s.as_str()) == Some("--doc") {
         let path = args
             .get(1)
             .expect("usage: pblang --doc <file> [--html] [out_dir]");
@@ -2730,6 +2869,7 @@ fn main() {
                 TypeKind::Nil => "nil".into(),
                 TypeKind::Array(inner) => format!("array<{}>", render_ty(inner)),
                 TypeKind::Map(inner) => format!("map<{}>", render_ty(inner)),
+                TypeKind::NonNull(inner) => format!("{}!", render_ty(inner)),
             }
         }
 
@@ -2915,7 +3055,7 @@ fn main() {
     }
 
     // Format .sap/.sapp files: trim, spacing around operators, indent by brace depth (4 spaces), optional line wrap, ensure final newline
-    if args.get(0).map(|s| s.as_str()) == Some("fmt") {
+    if args.first().map(|s| s.as_str()) == Some("fmt") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut max_line_length: Option<usize> = None;
         let mut files: Vec<std::path::PathBuf> = Vec::new();
@@ -3335,7 +3475,7 @@ fn main() {
     }
 
     // Lint: parse + typecheck one or more files, report diagnostics + unused var/import warnings
-    if args.get(0).map(|s| s.as_str()) == Some("lint") {
+    if args.first().map(|s| s.as_str()) == Some("lint") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let files: Vec<_> = args.iter().skip(1).map(|s| cwd.join(s)).collect();
         if files.is_empty() {
@@ -3382,13 +3522,13 @@ fn main() {
         }
         return;
     }
-    if args.get(0).map(|s| s.as_str()) == Some("lsp") {
+    if args.first().map(|s| s.as_str()) == Some("lsp") {
         run_lsp_server();
         return;
     }
 
     // Run test scripts (convention: tests/*.sap, tests/*.sapp, or tests/*.bpx)
-    if args.get(0).map(|s| s.as_str()) == Some("test") {
+    if args.first().map(|s| s.as_str()) == Some("test") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let test_dir = args
             .get(1)
@@ -3440,7 +3580,14 @@ fn main() {
                     continue;
                 }
             };
-            let mut chunk = compile(stmts);
+            let mut chunk = match compile(stmts) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("FAIL {}: compile error: {}", path_str, e);
+                    failed += 1;
+                    continue;
+                }
+            };
             chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
             chunk.source = Some(std::rc::Rc::new(src));
             let mut vm = VM::with_stdlib(StdlibConfig::default());
@@ -3465,7 +3612,7 @@ fn main() {
     }
 
     // Run a script file and exit (no REPL)
-    if args.get(0).map(|s| s.as_str()) == Some("run") {
+    if args.first().map(|s| s.as_str()) == Some("run") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let script_path = if let Some(path_arg) = args.get(1) {
             let candidate = PathBuf::from(path_arg);
@@ -3506,7 +3653,7 @@ fn main() {
         };
         if let Some(man_dir) = script_path
             .parent()
-            .and_then(|p| pblang_pm::find_manifest_dir(p))
+            .and_then(pblang_pm::find_manifest_dir)
         {
             if let Some((platform, min_rt)) = pblang_pm::get_manifest_platform_hints(&man_dir) {
                 if platform.as_deref().map(|s| s != "any").unwrap_or(false) {
@@ -3541,7 +3688,13 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let mut chunk = compile(stmts);
+        let mut chunk = match compile(stmts) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pblang: compile error: {}", e);
+                std::process::exit(3);
+            }
+        };
         chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
         chunk.source = Some(std::rc::Rc::new(src.clone()));
 
@@ -3551,7 +3704,9 @@ fn main() {
             .position(|s| s == "--")
             .map(|pos| args[(pos + 1)..].to_vec())
             .unwrap_or_default();
-        std::env::set_var("PBLANG_SCRIPT_ARGS", script_args.join("\n"));
+        // SAFETY: Set before spawning any VM threads; single-threaded at this point.
+        #[allow(unused_unsafe)]
+        unsafe { std::env::set_var("PBLANG_SCRIPT_ARGS", script_args.join("\n")) };
 
         let mut vm = VM::with_stdlib(StdlibConfig::default());
         if let Err(e) = vm.run(chunk) {
@@ -3650,7 +3805,11 @@ fn main() {
             if !src_for_spans.trim().is_empty() {
                 match parse(&src_for_spans) {
                     Ok(stmts) => {
-                        let mut chunk = compile(stmts);
+                        match compile(stmts) {
+                            Err(ce) => {
+                                eprintln!("Compile error: {ce}");
+                            }
+                            Ok(mut chunk) => {
                         // Attach source for accurate runtime diagnostics.
                         chunk.source_name = Some(std::rc::Rc::new("<repl>".to_string()));
                         chunk.source = Some(std::rc::Rc::new(buf.clone()));
@@ -3681,6 +3840,8 @@ fn main() {
                                 }
                             }
                         }
+                        } // end Ok(mut chunk)
+                        } // end match compile
                     }
                     Err(e) => {
                         print_parse_errors(&buf, e, None);

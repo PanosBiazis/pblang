@@ -183,11 +183,48 @@ pub fn parse_registry_index(json: &[u8]) -> Result<RegistryIndex, String> {
 }
 
 /// Unpack .tar.gz bytes into dest_dir.
+///
+/// SECURITY FIX #7: Uses entry-by-entry unpacking with path validation to prevent
+/// "Zip Slip" path traversal attacks where a malicious tarball contains entries
+/// with `../` components that would escape dest_dir.
 pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest_dir).map_err(|e| format!("create_dir_all: {e}"))?;
+    use std::path::Component;
+    let dest_dir = std::fs::canonicalize(dest_dir)
+        .or_else(|_| {
+            std::fs::create_dir_all(dest_dir)
+                .map_err(|e| format!("create_dir_all: {e}"))?;
+            std::fs::canonicalize(dest_dir).map_err(|e| format!("canonicalize dest: {e}"))
+        })
+        .map_err(|e: String| e)?;
+
     let dec = flate2::read::GzDecoder::new(tar_gz);
     let mut archive = tar::Archive::new(dec);
-    archive.unpack(dest_dir).map_err(|e| format!("tar unpack: {e}"))?;
+
+    for entry in archive.entries().map_err(|e| format!("tar entries: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+        let entry_path = entry.path().map_err(|e| format!("tar path: {e}"))?;
+
+        // Validate: reject any path that would escape dest_dir
+        for component in entry_path.components() {
+            match component {
+                Component::ParentDir => {
+                    return Err(format!(
+                        "SECURITY: tarball entry '{}' contains '..', rejected (Zip Slip)",
+                        entry_path.display()
+                    ));
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(format!(
+                        "SECURITY: tarball entry '{}' is absolute, rejected",
+                        entry_path.display()
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        entry.unpack_in(&dest_dir).map_err(|e| format!("tar unpack entry: {e}"))?;
+    }
     Ok(())
 }
 
@@ -341,21 +378,15 @@ pub fn generate_lockfile_with_registry(
                     name
                 ));
             }
-            if let Some(git_url) = spec.git() {
-                // Git dep — stub: record as path dep pointing to cache
-                let stub_path = cache_root_path.join(format!("{}-git", name.replace('/', "_")));
-                deps.insert(
-                    name.clone(),
-                    LockedDep {
-                        path: stub_path.to_string_lossy().to_string(),
-                        sha256: String::new(),
-                        name: Some(name.clone()),
-                        version: None,
-                        source: Some("git".to_string()),
-                        resolved: Some(git_url.to_string()),
-                        fetch_url: None,
-                    },
-                );
+            if let Some(_git_url) = spec.git() {
+                // AUDIT NOTE #21: Git dependencies are NOT yet implemented.
+                // Recording a stub with an empty SHA256 provides no integrity
+                // guarantee. We now return an error instead of silently creating
+                // a lockfile entry that looks like a real resolved dependency.
+                return Err(format!(
+                    "dependency {:?} specifies a git URL but git dependencies are not                      yet supported. Use a local path dependency or a registry package.",
+                    name
+                ));
             } else {
                 let index_url = registry_index_url.ok_or_else(|| {
                     format!(
@@ -420,9 +451,9 @@ fn hash_dir(root: &Path) -> Result<String, String> {
     let mut h = Sha256::new();
     for (rel, bytes) in entries {
         h.update(rel.as_bytes());
-        h.update(&[0u8]);
+        h.update([0u8]);
         h.update(&bytes);
-        h.update(&[0u8]);
+        h.update([0u8]);
     }
     Ok(hex::encode(h.finalize()))
 }
@@ -479,11 +510,22 @@ pub fn resolve_import(
             if lock_path.is_file() {
                 if let Ok(lock_bytes) = std::fs::read(&lock_path) {
                     if let Ok(lock_str) = std::str::from_utf8(&lock_bytes) {
-                        if let Ok(lock) = parse_lockfile(lock_str) {
-                            if lock.manifest_sha256 == man_sha {
+                        match parse_lockfile(lock_str) {
+                            Ok(lock) => {
+                                if lock.manifest_sha256 != man_sha {
+                                    // FIX #9: Stale lockfile must be an error, not a silent
+                                    // fallback. A mismatch means pblang.toml changed after
+                                    // the lock was generated — run `pblang install` first.
+                                    return Err(format!(
+                                        "pblang.lock is out of date (manifest has changed).                                          Run `pblang install` to regenerate the lockfile."
+                                    ));
+                                }
                                 if let Some(dep) = lock.dependencies.get(pkg) {
                                     dep_root = canonicalize_existing(Path::new(&dep.path));
                                 }
+                            }
+                            Err(e) => {
+                                return Err(format!("failed to parse pblang.lock: {e}"));
                             }
                         }
                     }
@@ -808,7 +850,7 @@ pub fn compute_tarball_hmac(bytes: &[u8], key: &[u8]) -> String {
 
     let mut outer = Sha256::new();
     outer.update(&opad);
-    outer.update(&inner_hash);
+    outer.update(inner_hash);
     hex::encode(outer.finalize())
 }
 
@@ -887,12 +929,12 @@ fn canonicalize_existing(p: &Path) -> Option<PathBuf> {
 fn base64_encode(data: &[u8]) -> String {
     use std::fmt::Write;
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
         let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
         let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        let _ = write!(out, "{}{}{}{}", 
+        let _ = write!(out, "{}{}{}{}",
             CHARS[b0 >> 2] as char,
             CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char,
             if chunk.len() > 1 { CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' },
@@ -1153,7 +1195,9 @@ version = "0.1.0"
         // validate the env-var contract that the retry path depends on.
 
         // Verify that the refresh token env var can be set and read.
-        std::env::set_var("PBLANG_REGISTRY_REFRESH_TOKEN", "test-refresh-token-123");
+        // SAFETY: unit test, single-threaded context for this assertion.
+        #[allow(unused_unsafe)]
+        unsafe { std::env::set_var("PBLANG_REGISTRY_REFRESH_TOKEN", "test-refresh-token-123") };
         let token = std::env::var("PBLANG_REGISTRY_REFRESH_TOKEN").unwrap_or_default();
         assert_eq!(
             token, "test-refresh-token-123",

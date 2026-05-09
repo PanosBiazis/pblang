@@ -1,4 +1,73 @@
-# Biapryx/Sapphire - Current Status & Next Steps
+# pblang (Biapryx) — Current Status
+
+**Last Updated**: 2026  
+**Status**: v0.5 — Production-Ready Core with Active Ecosystem Development  
+**Test Suite**: **75/76 semantics tests passing** (1 known chumsky limitation, documented)
+
+---
+
+## ✅ What Works (Production-Ready)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Core VM | ✅ Stable | Bytecode, GC, sandboxing, error handling |
+| Package Manager | ✅ Functional | Lockfile, semver, file/hosted registry, HMAC verify |
+| Stdlib | ✅ 34+ modules | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor |
+| Threading | ✅ Working | VM-per-thread, channels, select, thread pool |
+| CLI Tooling | ✅ Complete | run, test, fmt, lint, build, install, publish, search |
+| Type Checker | ✅ Basic | Inference for primitives, arrays, maps |
+| LSP Server | 🟡 MVP | Completions, hover stubs, definition stubs |
+| Native Executables | 🟡 Prototype | `bundle` + `pack` work; self-extract stub exists |
+| TLS/HTTPS | ⚠️ Design | rustls integration pending |
+
+## ✅ Test Results
+
+```
+cargo test --test semantics
+test result: ok. 75 passed; 0 failed; 1 ignored
+```
+
+The 1 ignored test (`match_guard_pass`) documents a chumsky 0.8 parser limitation:
+- Match arm guards with comparison operators and body separator `:` conflict because  
+  the method-call postfix `obj:method()` consumes `:` before the separator parser runs.
+- The `parse_recovery` mode then skips any alternative separator we add.
+- Fix requires either a different parser combinator library or restructuring the guard
+  expression to use a dedicated `guard_expr` variant without method-call postfix.
+- **Workaround**: Use `case n then body` (tilde `#` or `then` keyword) as separator,
+  defined at the top-level expression scope. Or wrap guards in helper functions.
+
+## 🚀 Key Improvements Since v0.4
+
+1. **Spawned thread builtins** — Child VMs now inherit the parent VM's builtins module
+   via parent chain, so `recv`, `send`, `channel`, etc. work inside spawned closures
+2. **`select()` now returns `{index, value}`** — Previously returned just index number
+3. **channel_close/is_closed** — Now correctly accept sender handle numbers
+4. **New builtins**: `strfromcharcode`, `strcharcodeat` for byte-level string ops
+5. **stdlib/websocket.sapp** — Full `write_frame(opcode, payload)` implementation
+6. **stdlib/http.sapp** — Added `parse_sse_line`, `post_auth`
+7. **stdlib/quantum.sapp** — Added `to_qasm`, `measurements_to_string`, `measurements_to_int`,
+   `apply_h`, `apply_cnot`, `measure_all`, `n_qubits` key on circuit objects
+8. **stdlib/provider_registry.sapp** — Added `call_best`, `call_with_fallback`
+9. **stdlib/collections.sapp** — Added `set_union`, `set_intersect`; queue is now array-based
+10. **stdlib/math.sapp** — Added `util.clamp`, `util.lerp`, `util.smoothstep`
+11. **stdlib/http_server.sapp** — Added `sse_event`, `res_sse_headers`
+12. **stdlib/thread.sapp** — Fixed `channel_close_wrapper`/`channel_is_closed_wrapper`
+
+## 🔴 Critical Gaps (Production Blockers)
+
+| Issue | Priority | Effort |
+|-------|----------|--------|
+| No TLS/HTTPS | HIGH | 1-2 weeks (rustls integration) |
+| Match guard body separator ambiguity | MEDIUM | Parser rewrite or alt-separator doc |
+| Type system stub | LOW | Months (full HM type inference) |
+
+## 📋 Recommended Next Steps
+
+1. **TLS/HTTPS** (W4-gamma) — Most important production blocker
+2. **Self-extracting binary** (E5-gamma) — Stage A: sentinel stub + tarball append
+3. **LSP improvements** (L3-delta) — Workspace symbols, semantic tokens
+4. **OOP conformance** (SP1-gamma) — Class constructor/method dispatch edge cases
+5. **nd.sapp linear algebra** (G3-gamma) — Matrix inverse, solve
 
 **Last Updated**: March 2026  
 **Status**: Production-Ready Core with Active Ecosystem Development  
@@ -8,7 +77,7 @@
 
 ## 📊 Executive Summary
 
-Biapryx/Sapphire has evolved from a promising prototype into a robust, production-quality core runtime with an expanding ecosystem. The language successfully balances two distinct use cases:
+pblang has evolved from a promising prototype into a robust, production-quality core runtime with an expanding ecosystem. The language successfully balances two distinct use cases:
 
 1. **Embedded Scripting**: Secure, sandboxed scripting for applications/games/tools
 2. **Standalone General-Purpose**: Full-featured programming language with package ecosystem
@@ -51,9 +120,9 @@ The VM core is stable and battle-tested:
 - **Testing**: 75/76 semantics tests passing
 
 **Files**:
-- `crates/biapryx-vm/src/vm.rs` - Core VM (stable)
-- `crates/biapryx-core/src/parser.rs` - Parser (stable)
-- `crates/biapryx-compiler/src/lib.rs` - Compiler (stable)
+- `crates/pblang-vm/src/vm.rs` - Core VM (stable)
+- `crates/pblang-core/src/parser.rs` - Parser (stable)
+- `crates/pblang-compiler/src/lib.rs` - Compiler (stable)
 
 ### 2. Package Manager ⭐⭐⭐⭐
 
@@ -61,18 +130,18 @@ The VM core is stable and battle-tested:
 
 Sapphire has a working package ecosystem:
 
-- **Lockfile Generation**: `pblang.lock` with full dependency graph
+- **Lockfile Generation**: `sapphire.lock` with full dependency graph
 - **Semver Resolution**: Proper version range resolution
 - **Remote Registry**:
-  - `sapphire install @sapphire/http@1.2.0` - ✅ Working
-  - `sapphire publish` - ✅ Working (file:// and http(s)://)
-  - `sapphire search <query>` - ✅ Working
+  - `pblang install @sapphire/http@1.2.0` - ✅ Working
+  - `pblang publish` - ✅ Working (file:// and http(s)://)
+  - `pblang search <query>` - ✅ Working
 - **Lockfile v2**: Extended schema with `name`, `version`, `source`, `resolved`, `fetch_url`
 - **SHA256 Verification**: Package integrity verification
 - **HMAC Support**: Optional package signing
 
 **Files**:
-- `crates/biapryx-pm/src/lib.rs` - Package manager core
+- `crates/pblang-pm/src/lib.rs` - Package manager core
 - `src/main.rs` - CLI commands (install, publish, search)
 - `docs/Registry_MVP.md` - Registry design
 - `docs/Registry_hosted.md` - Hosted registry API
@@ -153,10 +222,10 @@ All major commands implemented:
 | `sapphire run` | ✅ | Execute .sap/.sapp files |
 | `sapphire check` | ✅ | Parse + typecheck without execution |
 | `sapphire test` | ✅ | Run test suite |
-| `sapphire install` | ✅ | Install dependencies or packages |
-| `sapphire publish` | ✅ | Publish to registry |
-| `sapphire search` | ✅ | Search packages |
-| `sapphire bundle` | 🟡 | Package app (self-extract pending) |
+| `pblang install` | ✅ | Install dependencies or packages |
+| `pblang publish` | ✅ | Publish to registry |
+| `pblang search` | ✅ | Search packages |
+| `pblang bundle` | 🟡 | Package app (self-extract pending) |
 | `sapphire doc` | ✅ | Generate documentation |
 | `sapphire fmt` | ✅ | Format source code |
 | `sapphire lint` | ✅ | Lint source code |
@@ -205,7 +274,7 @@ All major commands implemented:
 
 **What's Done**:
 - ✅ `crates/sapphire-stub` created with sentinel
-- ✅ `sapphire bundle --self-extract` flag accepted
+- ✅ `pblang bundle --self-extract` flag accepted
 - ✅ Design in `docs/Native_backend_notes.md`
 
 **What's Missing**:
@@ -217,7 +286,7 @@ All major commands implemented:
 
 **Required Work** (1-2 weeks):
 1. Implement extraction logic in `crates/sapphire-stub/src/main.rs`
-2. Wire up `sapphire bundle --self-extract` to append tarball to stub
+2. Wire up `pblang bundle --self-extract` to append tarball to stub
 3. Test on Linux and Windows
 4. Add cleanup handlers
 
@@ -240,7 +309,7 @@ All major commands implemented:
 - ❌ `stdlib/tls.sapp` wrapper
 
 **Required Work** (1-2 weeks):
-1. Add `rustls` dependency to `crates/biapryx-vm/Cargo.toml`
+1. Add `rustls` dependency to `crates/pblang-vm/Cargo.toml`
 2. Implement `SapphireStream` trait
 3. Add `tcp_listen_tls` builtin
 4. Modify `tcp_accept` to handle TLS streams
@@ -252,7 +321,7 @@ All major commands implemented:
 **Blocker**: Major implementation effort
 
 **What's Done**:
-- ✅ `crates/biapryx-typeck` crate created
+- ✅ `crates/pblang-typeck` crate created
 - ✅ Type annotation syntax in parser
 
 **What's Missing**:
@@ -296,12 +365,12 @@ All major commands implemented:
 
 **Tasks**:
 1. Implement tarball extraction in `sapphire-stub`
-2. Add binary concatenation logic to `sapphire bundle --self-extract`
+2. Add binary concatenation logic to `pblang bundle --self-extract`
 3. Test Linux executable generation
 4. Test Windows executable generation
 5. Add cleanup handlers for temp directories
 
-**Deliverable**: `sapphire bundle --self-extract --output myapp` produces working `myapp` executable
+**Deliverable**: `pblang bundle --self-extract --output myapp` produces working `myapp` executable
 
 ### Week 3-4: TLS/HTTPS Support (W4) - HIGH PRIORITY
 
@@ -480,15 +549,15 @@ cargo run -- doc examples/
 Here is a full breakdown of your BiaPryx project and the last commit.
 
 Last Commit — c41faebf
-This commit is titled "Initial commit" and was pushed on April 4, 2026 at 09:30 UTC by you (PanosBiazis). It is a very large commit: +13,285 additions / −4,688 deletions across 30 files, totalling 17,973 changes. It was essentially a major restructuring — most files were renamed (moved into crate-level paths), and several new Cargo.toml manifests were added for freshly split crates (biapryx-compiler, biapryx-core, biapryx-ffi).
+This commit is titled "Initial commit" and was pushed on April 4, 2026 at 09:30 UTC by you (PanosBiazis). It is a very large commit: +13,285 additions / −4,688 deletions across 30 files, totalling 17,973 changes. It was essentially a major restructuring — most files were renamed (moved into crate-level paths), and several new Cargo.toml manifests were added for freshly split crates (pblang-compiler, pblang-core, pblang-ffi).
 
 Key changes in this commit:
 
-Workspace refactor: Crates moved/renamed under crates/ (e.g. biapryx-core, biapryx-compiler, biapryx-ffi got new Cargo.toml files).
+Workspace refactor: Crates moved/renamed under crates/ (e.g. pblang-core, pblang-compiler, pblang-ffi got new Cargo.toml files).
 
-crates/biapryx-core/src/parser.rs: Biggest single change — 2,965 line diff (1,506 additions, 1,459 deletions), indicating a major parser rewrite or refactor.
+crates/pblang-core/src/parser.rs: Biggest single change — 2,965 line diff (1,506 additions, 1,459 deletions), indicating a major parser rewrite or refactor.
 
-crates/biapryx-pm/src/lib.rs: Package manager got a 359-line change (208 additions, 151 deletions).
+crates/pblang-pm/src/lib.rs: Package manager got a 359-line change (208 additions, 151 deletions).
 
 .vscode/launch.json: Debug configurations were heavily updated (129 additions, 187 deletions).
 
@@ -496,21 +565,21 @@ crates/biapryx-pm/src/lib.rs: Package manager got a 359-line change (208 additio
 
 PERPLEXITY_CONTEXT.md and README.md: Both updated with minor content changes.
 
-pblang.toml: Renamed from a previous config, small change.
+biapryx.toml: Renamed from a previous config, small change.
 
 Project Overview — BiaPryx
 Biapryx is a full programming language implementation written in Rust, designed for both embedded scripting (sandboxed, capability-controlled) and standalone general-purpose use. It is a Cargo workspace with 9+ specialized crates.
 
 Workspace Crates
 Crate	Role
-biapryx-core	Parser, lexer, AST
+pblang-core	Parser, lexer, AST
 biapryx-ir	Intermediate representation
-biapryx-vm	Bytecode VM (stack-based, execution, builtins)
-biapryx-compiler	Compilation pipeline
-biapryx-typeck	Type checking (stub)
-biapryx-ffi	Foreign Function Interface (C ABI)
-biapryx-pm	Package manager (lockfile, registry, git deps)
-biapryx-lsp	Language server (tower-lsp)
+pblang-vm	Bytecode VM (stack-based, execution, builtins)
+pblang-compiler	Compilation pipeline
+pblang-typeck	Type checking (stub)
+pblang-ffi	Foreign Function Interface (C ABI)
+pblang-pm	Package manager (lockfile, registry, git deps)
+pblang-lsp	Language server (tower-lsp)
 biapryx-graphics	Graphics backend (SDL2 / minifb)
 Current Status (v0.5)
 The project is at v0.5 — "Powerful Prototype / Early-Stage Platform" as of March 2026. The core VM, package manager, and CLI are production-quality, while the type system and native executable bundler are still in early stages.
@@ -575,7 +644,7 @@ Prepared using GPT-5.4 Thinking
 
 Summary
 
-I successfully completed the Q3-delta task for the Biapryx/Sapphire programming language project using extensive multi-agent coordination via MCP server tools. Here's what was accomplished:
+I successfully completed the Q3-delta task for the pblang programming language project using extensive multi-agent coordination via MCP server tools. Here's what was accomplished:
 
 ### ✅ **Q3-delta Implementation Complete**
 

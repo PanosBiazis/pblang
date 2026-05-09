@@ -135,20 +135,70 @@ package manager για OS-level installs.
   - `biapryx util make-zip-installer`,
   - `biapryx util make-appimage`.
 
-### Stage C — Hybrid / native backend (N2+)
+### Stage C — Hybrid / Native Backend (N2 research spike)
 
-Αυτό το στάδιο μεταφέρεται κυρίως στο N2 backlog, αλλά το αναφέρουμε εδώ για
-συνέχεια:
+**Goal**: Eventually eliminate the embedded `pblang` runtime from distributed apps
+by compiling pblang bytecode directly to native machine code.
 
-- Stage C1: self-extracting wrapper βελτιστοποιημένος (μικρότερο runtime,
-  shared lib, κ.λπ.).
-- Stage C2: transpile-to-C ή direct LLVM backend που παράγει native binaries
-  χωρίς embedded VM (ή με minimal VM).
-- Stage C3: no-std / freestanding mode, OS-level targets.
+#### IR → LLVM IR Mapping (Top 10 VM Opcodes)
 
-Η υλοποίηση αυτών είναι εκτός πεδίου του E5, αλλά το Stage A design πρέπει να
-είναι **συμβατό** με την ιδέα ότι αργότερα μπορεί να αντικατασταθεί το
-embedded `biapryx` με native-compiled runtime.
+| VM OpCode | LLVM IR Equivalent | Notes |
+|-----------|-------------------|-------|
+| `OpConstant(idx)` | `alloca` + `store` / constant | Load value from constants pool |
+| `OpAdd` / `OpSub` | `fadd` / `fsub` (f64) | pblang uses f64 for all numbers |
+| `OpMul` / `OpDiv` | `fmul` / `fdiv` (f64) | |
+| `OpCall(argc)` | `call` / indirect call | Dynamic dispatch through closure/function pointer |
+| `OpGetGlobal` / `OpSetGlobal` | Global variable ptr | Module globals map to LLVM globals |
+| `OpGetLocal` / `OpSetLocal` | Stack frame slot | Locals → LLVM `alloca` in function prologue |
+| `OpJump` / `OpJumpIfFalse` | `br` / `cond_br` | Absolute IP → LLVM basic block labels |
+| `OpReturn` | `ret` | Requires proper value boxing/unboxing |
+| `OpClosure` | `malloc` + function pointer | Most complex: upvalue capture |
+| `OpMakeArray` / `OpMakeMap` | `malloc` + struct init | GC-managed heap allocation |
+
+#### Key Blockers
+
+1. **Dynamic typing / Value boxing**: pblang's `Value` enum (Number/Bool/Nil/Obj/Array/Map/Closure)
+   requires all values to carry type tags. In LLVM IR, this maps to tagged unions with
+   pointer indirection — similar to how Lua/YARV implement values.
+
+2. **Closures / upvalues**: `OpClosure` generates heap-allocated `Closure` structs with
+   upvalue capture lists. Each upvalue is either an open stack reference or a closed heap
+   value. LLVM equivalent requires environment structs (GEP + load/store chains).
+
+3. **Dynamic dispatch**: Method calls (`obj:method()`) desugar into `try obj.__class catch obj`
+   + attribute lookup. LLVM implementation needs inline caches or vtable-like dispatch.
+
+4. **Garbage Collection**: RC + cycle-breaking GC. LLVM IR has no built-in GC; options:
+   - Continue using RC (reference count in alloca'd value headers)
+   - Shadow stack GC pass (GCRoot intrinsics)
+   - Boehm conservative GC
+
+5. **Module system**: `import()` is dynamic/runtime. Compile-time AOT compilation
+   requires static module resolution or a runtime stub for dynamic imports.
+
+#### Recommended Approach: Cranelift (Not LLVM)
+
+**Cranelift** (used by Wasmtime, Rust's `cranelift-codegen`) is preferred over full LLVM for pblang's Stage C:
+
+- **Simpler API**: Cranelift IR is closer to pblang's stack VM than LLVM's SSA form
+- **Rust-native**: No C++ FFI binding required (pure Rust crate `cranelift-codegen`)
+- **Faster compile times**: Cranelift is designed for JIT; Stage C can start as a JIT
+- **Incremental path**: Start with JIT-style hot-path compilation, then AOT
+
+**Estimated effort**: 3-6 months part-time for a working Cranelift JIT covering the
+top 20 opcodes. Full AOT compilation with GC and closures: 6-12 months.
+
+**Prerequisite**: Spec freeze + conformance suite (to validate the native backend
+produces identical semantics to the bytecode interpreter).
+
+#### Stage C Status
+
+Currently: **Research spike only** (N2-alpha). No code changes required at this stage.
+
+Next action: Once Stage A (self-extracting wrapper) is stable, begin Cranelift integration
+by implementing a `pblang-cranelift` crate that compiles individual `Function` chunks to
+native code for numeric-intensive hot paths, falling back to the bytecode VM for dynamic
+features (closures, dynamic dispatch, import).
 
 ---
 
@@ -168,114 +218,6 @@ embedded `biapryx` με native-compiled runtime.
 
 ### Stage A — E5-beta implementation status
 
-- Προστέθηκε νέο crate `crates/biapryx-stub` με απλό launcher (`biapryx-stub`) που προορίζεται ως template για self-extracting binaries (περιέχει sentinel `PBLANG_BUNDLE_START\x00` και ελέγχει για embedded bundle).
+- Προστέθηκε νέο crate `crates/biapryx-stub` με απλό launcher (`biapryx-stub`) που προορίζεται ως template για self-extracting binaries (περιέχει sentinel `BIAPRYX_BUNDLE_START\x00` και ελέγχει για embedded bundle).
 - Το `biapryx bundle` δέχεται πλέον προαιρετικό flag **`--self-extract`** (E5-beta): το flag αναγνωρίζεται και κρατιέται για workflows self-extracting runner + bundle, χωρίς να αλλάζει το υπάρχον σχήμα εξόδου του `bundle`.
 - Το πραγματικό embed του stub template + bundle παραμένει σχεδιαστικό βήμα: απαιτεί χειροκίνητο build του `sapphire-stub` και αντιγραφή του παραγόμενου binary πάνω από το `stub_template.bin` (ή μελλοντικό εργαλείο που θα το αυτοματοποιεί).
-
----
-
-## Stage A — E5-gamma implementation status (COMPLETED)
-
-**Status:** `implemented (prototype)` — April 2025
-
-### Implementation Details
-
-The self-extracting binary feature is now fully implemented:
-
-1. **Stub Implementation** (`crates/biapryx-stub/src/main.rs`):
-   - Scans own binary for SENTINEL marker (`PBLANG_BUNDLE_START\x00`)
-   - Extracts the appended gzip tarball to `$TMPDIR/biapryx-run-<hash>/`
-   - Executes `biapryx run .` inside that directory
-   - Cleanup temp dir on exit (registered cleanup handler)
-   - CLI flags: `--help`, `--version`, `--extract-only <dir>`
-
-2. **Bundle Command** (`src/main.rs`):
-   - `biapryx bundle --self-extract --output <file> <path>` creates a self-extracting binary
-   - After creating bundle tarball, appends SENTINEL + tarball after stub binary bytes
-   - Sets output file executable bit on Unix
-   - Requires `biapryx-stub` binary to be built alongside `biapryx`
-
-3. **Tests** (`tests/pack.rs`):
-   - `self_extract_binary_contains_sentinel` — verifies output file contains SENTINEL sequence
-   - `self_extract_runs_hello` — verifies minimal hello app can be bundled and contains correct structure
-
-### Usage Example
-
-```bash
-# Build the stub first
-cargo build --release --bin biapryx-stub
-
-# Create a self-extracting binary
-biapryx bundle --self-extract --output myapp ./myproject
-
-# Run the self-extracting binary
-./myapp
-
-# Or extract without running
-./myapp --extract-only ./extracted
-```
-
-### Binary Structure
-
-```
-[biapryx-stub binary bytes]
-[SENTINEL: "PBLANG_BUNDLE_START\x00"]
-[gzip-compressed tarball containing the app]
-```
-
-### Next Steps (Stage B)
-
-- Installer presets for deb/zip/AppImage/NSIS
-- Multi-arch bundles
-- Auto-update mechanism
-
-## Stage C — IR-to-Native mapping (N2-alpha research spike)
-
-This section documents the path from the current bytecode VM to native code emission.
-**No code changes required** — this is a research spike for future planning.
-
-### IR → LLVM IR mapping for the 10 most common VM opcodes
-
-| VM Opcode | LLVM IR equivalent | Notes |
-|-----------|-------------------|-------|
-| `Push(const)` | `store <const>, %slot` | Load constant from pool |
-| `Pop` | — | Discard top; no IR needed |
-| `Add/Sub/Mul/Div` | `fadd/fsub/fmul/fdiv double` | pblang numbers are f64 |
-| `Jump(target)` | `br label %BBn` | Unconditional branch |
-| `JumpIfFalse(target)` | `br i1 <cond>, label %true, label %false` | Needs truthiness check |
-| `Call(arity)` | `call <ret> @fn(args...)` | Dynamic dispatch for closures |
-| `Return` | `ret <value>` | May need GC value wrapping |
-| `GetGlobal(name)` | `load %module_globals[name]` | Via pointer to module |
-| `SetGlobal(name)` | `store <value>, %module_globals[name]` | |
-| `Index` | `call @rt_index(<obj>, <key>)` | Runtime helper needed |
-
-### Key blockers
-
-1. **Closures/upvalues** — Need heap-allocated closure structs `{fn_ptr, env_ptr}`. Effort: HIGH.
-2. **Dynamic dispatch** — `Call` on runtime value needs vtable/indirect call. Effort: HIGH.
-3. **GC integration** — LLVM must annotate GC roots (`gc "statepoint"` or shadow stack). Effort: MEDIUM.
-4. **Value type** — All values are `Value` enum; native code needs NaN-boxing or tagged pointers. Recommended: NaN-boxing (used by LuaJIT, JavaScriptCore).
-
-### Cranelift vs LLVM
-
-| Criterion | Cranelift | LLVM |
-|-----------|-----------|------|
-| Compile speed | Fast (incremental) | Slow (full pipeline) |
-| Output quality | Good (JIT) | Best (AOT) |
-| Rust integration | Native (`cranelift` crate) | Via `inkwell`/`llvm-sys` |
-| GC support | Manual root tracking | `gc "statepoint"` built-in |
-| Recommendation | JIT / fast startup | Release AOT builds |
-
-**Recommendation**: Start with Cranelift for JIT, add LLVM backend for release builds.
-
-### Estimated effort
-
-| Stage | Effort |
-|-------|--------|
-| C1: Arithmetic + branches | 2–4 weeks |
-| C2: Functions + closures | 4–8 weeks |
-| C3: Full value type + GC | 8–16 weeks |
-| C4: Stdlib interop | 4–8 weeks |
-| C5: Production-ready | 8–16 weeks |
-
-**Total**: 6–12 months of focused engineering for a production-quality native backend.

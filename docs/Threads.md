@@ -1,6 +1,6 @@
 # Threads – Σχεδίαση και μελλοντική υλοποίηση
 
-Τελευταία ενημέρωση: Φεβρουάριος 2025.
+Τελευταία ενημέρωση: Μάρτιος 2026.
 
 ## Στόχος
 
@@ -11,8 +11,11 @@
 
 ## Τρέχουσα κατάσταση
 
-- Το VM και ο runtime είναι **single-threaded**. Τα builtins (sleep_ms, tcplisten, κ.λπ.) τρέχουν στο ίδιο thread.
-- Το Rust runtime χρησιμοποιεί `thread_local!` και `std::thread` εσωτερικά (π.χ. σε tests, LSP), αλλά η γλώσσα Sapphire δεν εκθέτει threads στο script.
+- Το Sapphire εκθέτει πλέον **`spawn(fn)`**, **`join(handle)`**, **`channel()`**, **`send(sender, value)`**, **`recv(receiver)`**.
+- Το runtime παραμένει **VM-per-thread**: κάθε spawned task τρέχει σε νέο OS thread με δικό του VM.
+- Τα values μεταφέρονται με serialize/deep-copy semantics. Δεν υπάρχει shared RC heap ανάμεσα σε parent/child VMs.
+- Τα channel endpoints είναι ξεχωριστά **sender/receiver** values και χρησιμοποιούνται μαζί με τα builtins `send` / `recv`.
+- Το τρέχον channel MVP είναι **single-send per sender endpoint**: το `send(sender, value)` καταναλώνει το sender handle και έτσι το `recv(receiver)` μπορεί να δει σωστά closed-channel κατάσταση ως `nil`.
 
 ## Προτεινόμενο API (μελλοντικά)
 
@@ -32,10 +35,16 @@ let result = join(h);  // block μέχρι να τελειώσει, επιστρ
 
 ```sapphire
 let ch = channel();
-spawn(fn() {
-    ch.send(42);
-});
-let x = ch.recv();  // block
+{
+    let tx = ch.sender;
+    let rx = ch.receiver;
+    let h = spawn(fn() {
+        send(tx, 42);
+        return nil;
+    });
+    join(h);
+    let x = recv(rx);  // block
+}
 ```
 
 ### Επιλογή C: Host-provided workers
@@ -58,13 +67,13 @@ let x = ch.recv();  // block
 
 ### Τι μπορεί να μεταφερθεί (transferable values)
 
-- **Ασφαλή για μεταφορά** (deep copy ή serialize): numbers, bools, strings, nil. Arrays και maps μπορούν να μεταφερθούν με **deep copy** (αντίγραφο δέντρου τιμών χωρίς shared references) ώστε το child VM να δει αντίγραφα, όχι τα ίδια RC αντικείμενα.
-- **Μη μεταφερτά απευθείας**: handles (tcp/sqlite/ffi), closures με upvalues σε άλλο VM, module references. Για δεδομένα: serialize (π.χ. json_stringify) και στο child json_parse.
+- **Ασφαλή για μεταφορά** (deep copy ή serialize): numbers, bools, strings, nil. Arrays και maps μεταφέρονται ως αντίγραφα ώστε το child VM να δει δικά του δεδομένα, όχι shared RC references. Τα thread channel endpoint values μεταφέρονται επίσης με ασφαλές tagged representation.
+- **Μη μεταφερτά απευθείας**: handles (tcp/sqlite/ffi), module references, builtins/functions ως values που εξαρτώνται από runtime identity άλλου VM. Για δεδομένα: serialize (π.χ. json_stringify) και στο child json_parse.
 
 ### Σημασιολογία errors
 
 - **spawn(fn)**: Αν η fn πέσει σε runtime error, το parent το βλέπει όταν καλεί **join(handle)**. Το join επιστρέφει είτε την return value της fn είτε error value (π.χ. RuntimeError).
-- **channel send/recv**: recv block· αν το channel κλείσει, recv μπορεί να επιστρέφει nil ή "closed" value. Timeouts (αν προστεθούν) via limits ή host.
+- **channel send/recv**: `send(sender, value)` καταναλώνει το sender endpoint του MVP. Το `recv(receiver)` block-άρει. Αν το channel κλείσει και δεν υπάρχουν άλλα μηνύματα, επιστρέφει `nil`.
 
 ### Sandbox & limits
 
@@ -77,10 +86,11 @@ let x = ch.recv();  // block
 
 ## Ροードμαπ
 
-- **Σχεδίαση**: Αυτό το έγγραφο.
-- **Επόμενο βήμα**: Απόφαση για API (spawn/join vs channels vs host-only).
-- **Υλοποίηση**: Νέο builtin `spawn(fn)` που τρέχει τη fn σε νέο OS thread με δικό του VM (ή shared VM με mutex), και `join(handle)` που επιστρέφει την τιμή. Απαιτεί αλλαγές σε vm.rs και σε value passing μεταξύ threads (serialization ή shared heap με locks).
-- **Ασφάλεια**: Σε sandbox mode, `spawn` μπορεί να απενεργοποιείται (allow_spawn: bool).
+- **Done**: `spawn/join` MVP.
+- **Done**: `channel()` + `send(sender, value)` + `recv(receiver)` MVP.
+- **Done**: transferable capture path για spawned closures, μόνο για safe serialized values.
+- **Done**: regression tests για value return, error propagation, inherited limits, closed-channel behavior, deterministic send/recv, non-transferable rejection.
+- **Επόμενο βήμα**: richer channel ergonomics (`close`, multiple sends per endpoint, πιθανό `select`) μόνο αν χρειαστεί, χωρίς shared heap model.
 
 ## Σχετικά
 

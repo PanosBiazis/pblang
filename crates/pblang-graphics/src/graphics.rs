@@ -52,7 +52,7 @@ fn color_from_value(host: &mut dyn VmHost, v: &Value, what: &str) -> Result<u32,
     }
     let comp = |i: usize, name: &str| -> Result<u8, RuntimeError> {
         match arr[i] {
-            Value::Number(n) if n.is_finite() && n >= 0.0 && n <= 255.0 => Ok(n as u8),
+            Value::Number(n) if n.is_finite() && (0.0..=255.0).contains(&n) => Ok(n as u8),
             _ => Err(host.err(format!("{what}: {name} must be 0..255"))),
         }
     };
@@ -318,21 +318,25 @@ pub fn gfxdrawline(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
         });
     }
     with_window_mut(host, id, "gfxdrawline", |gw| {
-        draw_line_bresenham(&mut gw.buf, gw.w, gw.h, x1, y1, x2, y2, c);
+        draw_line_bresenham(&mut gw.buf, gw.w, gw.h, LineParams { x1, y1, x2, y2, color: c });
         Ok(Value::Nil)
     })
+}
+
+/// Parameters for Bresenham line drawing — groups coordinates to stay under the argument limit.
+struct LineParams {
+    x1: i64, y1: i64,
+    x2: i64, y2: i64,
+    color: u32,
 }
 
 fn draw_line_bresenham(
     buf: &mut [u32],
     w: usize,
     h: usize,
-    x1: i64,
-    y1: i64,
-    x2: i64,
-    y2: i64,
-    color: u32,
+    params: LineParams,
 ) {
+    let LineParams { x1, y1, x2, y2, color } = params;
     let mut x = x1;
     let mut y = y1;
     let dx = (x2 - x1).abs();

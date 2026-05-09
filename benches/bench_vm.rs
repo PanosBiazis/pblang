@@ -12,7 +12,7 @@ fn bench_arithmetic_loop(c: &mut Criterion) {
         print x;
     "#;
     let stmts = parse(src).expect("parse failed");
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).expect("compile failed");
 
     c.bench_function("vm/arithmetic_loop", |b| {
         b.iter(|| {
@@ -30,7 +30,7 @@ fn bench_function_calls(c: &mut Criterion) {
         print x;
     "#;
     let stmts = parse(src).expect("parse failed");
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).expect("compile failed");
 
     c.bench_function("vm/function_calls", |b| {
         b.iter(|| {
@@ -47,7 +47,7 @@ fn bench_string_concat(c: &mut Criterion) {
         print len(s);
     "#;
     let stmts = parse(src).expect("parse failed");
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).expect("compile failed");
 
     c.bench_function("vm/string_concat", |b| {
         b.iter(|| {
@@ -69,7 +69,7 @@ fn bench_json_roundtrip(c: &mut Criterion) {
         print len(json_stringify(x));
     "#;
     let stmts = parse(src).expect("parse failed");
-    let chunk = compile(stmts);
+    let chunk = compile(stmts).expect("compile failed");
 
     c.bench_function("vm/json_roundtrip", |b| {
         b.iter(|| {
@@ -87,4 +87,3 @@ criterion_group!(
     bench_json_roundtrip
 );
 criterion_main!(benches);
-

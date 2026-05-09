@@ -126,13 +126,23 @@ impl Backend {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
+    // FIX #6 (audit): LSP capabilities advertised here now accurately reflect what is
+    // implemented. Previously the README claimed completions/hover/go-to-definition
+    // but all three were unimplemented. This server currently provides:
+    //   ✅ textDocumentSync (FULL) — document open/change/close tracking
+    //   ✅ publishDiagnostics — parse errors + basic type-check warnings
+    //   ❌ completions — planned for v0.7
+    //   ❌ hover — planned for v0.7
+    //   ❌ go-to-definition — planned for v0.7
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                // Explicitly advertise false until implemented (v0.7 target)
                 definition_provider: Some(OneOf::Left(false)),
+                hover_provider: None,
                 completion_provider: None,
                 ..ServerCapabilities::default()
             },

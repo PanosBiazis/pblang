@@ -82,6 +82,20 @@ pub mod chunk {
 
         // logic
         OpNot,
+
+        // --- Safety / Rust-inspired opcodes ---
+        /// Pops obj; if nil pushes nil, else gets named attribute (const-idx).
+        OpSafeGetAttr(usize),
+        /// Pops obj; if nil pushes nil, then pops index and does safe get-index.
+        /// (Implemented as: dup, check nil, jump past index, else fall through to OpGetIndex)
+        OpSafeIndex,
+        /// Pops a Result map {ok, value/error}:
+        ///   ok==true  → push .value
+        ///   ok==false → raise RuntimeError(error message)
+        ///   other     → push as-is (non-Result value is passed through)
+        OpResultUnwrap,
+        /// Pops value; pushes true if nil, false otherwise
+        OpIsNil,
     }
 
     #[derive(Debug, Default, Clone)]
@@ -338,7 +352,9 @@ impl Value {
         }
     }
 
-    pub fn add(self, other: Value) -> Result<Value, String> {
+    /// Concatenate two values: number+number gives sum, string+string gives concatenation.
+    /// Named `concat` (not `add`) to avoid confusion with `std::ops::Add`.
+    pub fn concat(self, other: Value) -> Result<Value, String> {
         match (self, other) {
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
             (Value::Obj(a), Value::Obj(b)) => match (a.as_ref(), b.as_ref()) {
@@ -353,4 +369,3 @@ impl Value {
         }
     }
 }
-
