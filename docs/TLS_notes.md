@@ -36,7 +36,23 @@ This requires a thin Rust crate `sapphire-tls` that exposes a C ABI.
   the same handle type in the VM
 - `tcp_listen_tls(addr, cert_pem, key_pem)` builtin stub (sandboxed by net cap)
 
-## Status: Research / Design — not implemented
+## Status: **Stage B — Implemented**
+
+As of v0.5, the TLS builtins are fully implemented using `rustls`:
+
+- `tcp_listen_tls(addr, cert_pem_path, key_pem_path)` — creates a TLS server listener
+- `tcp_connect_tls(host, port)` — creates a TLS client connection (uses permissive cert verifier for prototyping)
+- `tcp_wrap_tls(handle, cert_path, key_path)` — upgrades an existing plain TCP stream to TLS server mode
+
+The `stdlib/tls.sapp` wrapper provides a high-level API that gracefully falls back to error maps
+when builtins are unavailable.
+
+### Production Note
+
+The TLS client (`tcp_connect_tls`) currently uses a **permissive certificate verifier** that accepts
+any certificate. This is suitable for development and internal tools, but for production deployments
+connecting to external servers, you should use a reverse proxy with proper cert verification or
+add webpki-roots support.
 
 ---
 

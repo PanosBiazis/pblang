@@ -1,0 +1,708 @@
+// stdlib/compiler/parser.sapp — pblang recursive-descent parser written IN pblang.
+//
+// Self-hosting milestone 2/4:
+//   Tokenizer ✅ → Parser ✅ → Type Checker → Compiler → Full Bootstrap
+//
+// Parses pblang tokens into an AST (Abstract Syntax Tree). This parser
+// implements a subset of the full pblang grammar sufficient to parse itself
+// and other pblang source files.
+//
+// Grammar (subset):
+//   program    = stmt*
+//   stmt       = let_stmt | const_stmt | fn_decl | return_stmt | if_stmt
+//              | while_stmt | for_stmt | expr_stmt | import_stmt | export_stmt
+//   let_stmt   = "let" ident [":" type] "=" expr ";"
+//   const_stmt = "const" ident [":" type] "=" expr ";"
+//   fn_decl    = "fn" ident "(" params? ")" [":" type] block
+//   return_stmt= "return" [expr] ";"
+//   if_stmt    = "if" expr block ("elif" expr block)* ["else" block]
+//   while_stmt = "while" expr block
+//   for_stmt   = "for" ident expr block  |  "for" ident "in" expr block
+//   expr_stmt  = expr ";"
+//   import_stmt= "import" "(" string ")" ";"
+//   export_stmt= "export" ident ("," ident)* ";"
+//   block      = "{" stmt* "}"
+//   expr       = assignment
+//   assignment = ident "=" assignment | logical_or
+//   logical_or = logical_and ("||" logical_and)*
+//   logical_and= equality ("&&" equality)*
+//   equality   = comparison (("==" | "!=") comparison)*
+//   comparison = term (("<" | ">" | "<=" | ">=") term)*
+//   term       = factor (("+" | "-") factor)*
+//   factor     = unary (("*" | "/" | "%") unary)*
+//   unary      = ("-" | "!") unary | call
+//   call       = primary ("(" args? ")")*
+//   primary    = number | string | ident | "true" | "false" | "nil"
+//              | "(" expr ")" | array_lit | map_lit | fn_lit
+//   array_lit  = "[" (expr ("," expr)*)? "]"
+//   map_lit    = "map" "{" (ident ":" expr ("," ident ":" expr)*)? "}"
+//
+// Usage:
+//   let tok = import("stdlib/compiler/tokenizer.sapp");
+//   let par = import("stdlib/compiler/parser.sapp");
+//   let tokens = tok.tokenize(source);
+//   let ast = par.parse(tokens);
+
+// ── AST Node constructors ─────────────────────────────────────────────────────
+
+fn make_node(kind, extra) {
+    let node = map{ kind: kind };
+    if extra != nil {
+        for k in map_keys(extra) {
+            node[k] = extra[k];
+        }
+    }
+    return node;
+}
+
+fn stmt_let(name, value, type_ann) {
+    return make_node("let", map{ name: name, value: value, type: type_ann });
+}
+fn stmt_const(name, value, type_ann) {
+    return make_node("const", map{ name: name, value: value, type: type_ann });
+}
+fn stmt_return(value) {
+    return make_node("return", map{ value: value });
+}
+fn stmt_if(cond, then_block, elifs, else_block) {
+    return make_node("if", map{ cond: cond, then: then_block, elifs: elifs, else: else_block });
+}
+fn stmt_while(cond, body) {
+    return make_node("while", map{ cond: cond, body: body });
+}
+fn stmt_for(varname, end_expr, body) {
+    return make_node("for", map{ name: varname, end: end_expr, body: body });
+}
+fn stmt_forin(varname, iterable, body) {
+    return make_node("for_in", map{ name: varname, iter: iterable, body: body });
+}
+fn stmt_import(path) {
+    return make_node("import", map{ path: path });
+}
+fn stmt_export(names) {
+    return make_node("export", map{ names: names });
+}
+fn stmt_expr(expr) {
+    return make_node("expr_stmt", map{ expr: expr });
+}
+fn stmt_fn(name, params, body, return_type) {
+    return make_node("fn", map{ name: name, params: params, body: body, ret: return_type });
+}
+fn stmt_block(stmts) {
+    return make_node("block", map{ stmts: stmts });
+}
+
+fn expr_number(val) {
+    return make_node("number", map{ value: val });
+}
+fn expr_string(val) {
+    return make_node("string", map{ value: val });
+}
+fn expr_ident(name) {
+    return make_node("ident", map{ name: name });
+}
+fn expr_bool(val) {
+    return make_node("bool", map{ value: val });
+}
+fn expr_nil() {
+    return make_node("nil", map{});
+}
+fn expr_binary(op, left, right) {
+    return make_node("binary", map{ op: op, left: left, right: right });
+}
+fn expr_unary(op, operand) {
+    return make_node("unary", map{ op: op, operand: operand });
+}
+fn expr_call(func, args) {
+    return make_node("call", map{ func: func, args: args });
+}
+fn expr_array(items) {
+    return make_node("array", map{ items: items });
+}
+fn expr_map(entries) {
+    return make_node("map", map{ entries: entries });
+}
+fn expr_assign(name, value) {
+    return make_node("assign", map{ name: name, value: value });
+}
+fn expr_fnlit(params, body) {
+    return make_node("fn_lit", map{ params: params, body: body });
+}
+
+// ── Parser state ──────────────────────────────────────────────────────────────
+
+let tokens = [];
+let pos = 0;
+let errors = [];
+
+fn current() {
+    if pos < len(tokens) { return tokens[pos]; }
+    return map{ kind: "eof", text: "", line: 1, col: 1 };
+}
+
+fn peek(offset) {
+    let idx = pos + offset;
+    if idx < len(tokens) { return tokens[idx]; }
+    return map{ kind: "eof", text: "", line: 1, col: 1 };
+}
+
+fn advance() {
+    let t = current();
+    pos = pos + 1;
+    return t;
+}
+
+fn expect(kind, text) {
+    let t = current();
+    if t.kind == kind and (text == nil or t.text == text) {
+        return advance();
+    }
+    let msg = "Expected " + kind;
+    if text != nil { msg = msg + " '" + text + "'"; }
+    msg = msg + " but got " + t.kind + " '" + t.text + "'";
+    msg = msg + " at line " + str(t.line) + ":" + str(t.col);
+    push(errors, msg);
+    return nil;
+}
+
+fn match_token(kind, text) {
+    let t = current();
+    if t.kind == kind and (text == nil or t.text == text) {
+        advance();
+        return true;
+    }
+    return false;
+}
+
+fn is_at_end() {
+    return current().kind == "eof";
+}
+
+// ── Main parser entry ─────────────────────────────────────────────────────────
+
+fn parse(token_list) {
+    tokens = token_list;
+    pos = 0;
+    errors = [];
+
+    let stmts = [];
+    while not is_at_end() {
+        let s = parse_stmt();
+        if s != nil {
+            push(stmts, s);
+        }
+    }
+    return map{ stmts: stmts, errors: errors };
+}
+
+// ── Statement parsers ─────────────────────────────────────────────────────────
+
+fn parse_stmt() {
+    let t = current();
+
+    if t.kind == "keyword" {
+        if t.text == "let" { return parse_let(); }
+        if t.text == "const" { return parse_const(); }
+        if t.text == "fn" { return parse_fn_decl(); }
+        if t.text == "return" { return parse_return(); }
+        if t.text == "if" { return parse_if(); }
+        if t.text == "while" { return parse_while(); }
+        if t.text == "for" { return parse_for(); }
+        if t.text == "import" { return parse_import(); }
+        if t.text == "export" { return parse_export(); }
+    }
+
+    if t.kind == "ident" and peek(1).kind == "operator" and peek(1).text == "=" {
+        return parse_assignment();
+    }
+
+    return parse_expr_stmt();
+}
+
+fn parse_let() {
+    advance(); // skip 'let'
+    let name_token = expect("ident", nil);
+    if name_token == nil { return nil; }
+    let name = name_token.text;
+
+    // Optional type annotation
+    let ty = nil;
+    if match_token("operator", ":") {
+        ty = parse_type();
+    }
+
+    expect("operator", "=");
+    let value = parse_expr();
+    if match_token("punct", ";") { /* consume */ }
+    return stmt_let(name, value, ty);
+}
+
+fn parse_const() {
+    advance(); // skip 'const'
+    let name_token = expect("ident", nil);
+    if name_token == nil { return nil; }
+    let name = name_token.text;
+
+    let ty = nil;
+    if match_token("operator", ":") {
+        ty = parse_type();
+    }
+
+    expect("operator", "=");
+    let value = parse_expr();
+    if match_token("punct", ";") { /* consume */ }
+    return stmt_const(name, value, ty);
+}
+
+fn parse_fn_decl() {
+    advance(); // skip 'fn'
+    let name_token = expect("ident", nil);
+    if name_token == nil { return nil; }
+    let name = name_token.text;
+
+    expect("punct", "(");
+    let params = [];
+    if not match_token("punct", ")") {
+        while true {
+            let pname = expect("ident", nil);
+            if pname == nil { break; }
+            let ptype = nil;
+            if match_token("operator", ":") {
+                ptype = parse_type();
+            }
+            push(params, map{ name: pname.text, type: ptype });
+            if not match_token("punct", ",") { break; }
+        }
+        expect("punct", ")");
+    }
+
+    let ret_type = nil;
+    if match_token("operator", ":") {
+        ret_type = parse_type();
+    }
+
+    let body = parse_block();
+    return stmt_fn(name, params, body, ret_type);
+}
+
+fn parse_return() {
+    advance(); // skip 'return'
+    let value = nil;
+    if not match_token("punct", ";") {
+        value = parse_expr();
+    }
+    return stmt_return(value);
+}
+
+fn parse_if() {
+    advance(); // skip 'if'
+    let cond = parse_expr();
+    let then_block = parse_block();
+
+    let elifs = [];
+    while match_token("keyword", "elif") {
+        let elif_cond = parse_expr();
+        let elif_body = parse_block();
+        push(elifs, map{ cond: elif_cond, body: elif_body });
+    }
+
+    let else_block = nil;
+    if match_token("keyword", "else") {
+        else_block = parse_block();
+    }
+
+    return stmt_if(cond, then_block, elifs, else_block);
+}
+
+fn parse_while() {
+    advance(); // skip 'while'
+    let cond = parse_expr();
+    let body = parse_block();
+    return stmt_while(cond, body);
+}
+
+fn parse_for() {
+    advance(); // skip 'for'
+    let varname = expect("ident", nil);
+    if varname == nil { return nil; }
+
+    if match_token("keyword", "in") {
+        // for x in expr { }
+        let iterable = parse_expr();
+        let body = parse_block();
+        return stmt_forin(varname.text, iterable, body);
+    } else {
+        // for i N { }
+        let end_expr = parse_expr();
+        let body = parse_block();
+        return stmt_for(varname.text, end_expr, body);
+    }
+}
+
+fn parse_import() {
+    advance(); // skip 'import'
+    expect("punct", "(");
+    let path_token = expect("string", nil);
+    if path_token == nil { return nil; }
+    expect("punct", ")");
+    if match_token("punct", ";") { /* consume */ }
+    return stmt_import(path_token.text);
+}
+
+fn parse_export() {
+    advance(); // skip 'export'
+    let names = [];
+    while true {
+        let n = expect("ident", nil);
+        if n == nil { break; }
+        push(names, n.text);
+        if not match_token("punct", ",") { break; }
+    }
+    if match_token("punct", ";") { /* consume */ }
+    return stmt_export(names);
+}
+
+fn parse_assignment() {
+    let name_token = expect("ident", nil);
+    if name_token == nil { return nil; }
+    expect("operator", "=");
+    let value = parse_expr();
+    if match_token("punct", ";") { /* consume */ }
+    return stmt_expr(expr_assign(name_token.text, value));
+}
+
+fn parse_expr_stmt() {
+    let e = parse_expr();
+    if match_token("punct", ";") { /* consume */ }
+    return stmt_expr(e);
+}
+
+fn parse_block() {
+    expect("punct", "{");
+    let stmts = [];
+    while not is_at_end() and current().text != "}" {
+        let s = parse_stmt();
+        if s != nil {
+            push(stmts, s);
+        }
+    }
+    expect("punct", "}");
+    return stmt_block(stmts);
+}
+
+// ── Expression parser (Pratt parser / precedence climbing) ────────────────────
+
+fn parse_expr() {
+    return parse_assignment_expr();
+}
+
+fn parse_assignment_expr() {
+    // Check for assignment: ident = expr
+    if current().kind == "ident" and peek(1).kind == "operator" and peek(1).text == "=" {
+        let name_token = advance();
+        advance(); // skip =
+        let value = parse_or();
+        return expr_assign(name_token.text, value);
+    }
+    return parse_or();
+}
+
+fn parse_or() {
+    let left = parse_and();
+    while match_token("operator", "||") {
+        let right = parse_and();
+        left = expr_binary("or", left, right);
+    }
+    return left;
+}
+
+fn parse_and() {
+    let left = parse_equality();
+    while match_token("operator", "&&") {
+        let right = parse_equality();
+        left = expr_binary("and", left, right);
+    }
+    return left;
+}
+
+fn parse_equality() {
+    let left = parse_comparison();
+    while current().kind == "operator" and (current().text == "==" or current().text == "!=") {
+        let op = advance().text;
+        let right = parse_comparison();
+        left = expr_binary(op, left, right);
+    }
+    return left;
+}
+
+fn parse_comparison() {
+    let left = parse_term();
+    while current().kind == "operator"
+          and (current().text == "<" or current().text == ">"
+               or current().text == "<=" or current().text == ">=") {
+        let op = advance().text;
+        let right = parse_term();
+        left = expr_binary(op, left, right);
+    }
+    return left;
+}
+
+fn parse_term() {
+    let left = parse_factor();
+    while current().kind == "operator" and (current().text == "+" or current().text == "-") {
+        let op = advance().text;
+        let right = parse_factor();
+        left = expr_binary(op, left, right);
+    }
+    return left;
+}
+
+fn parse_factor() {
+    let left = parse_unary();
+    while current().kind == "operator"
+          and (current().text == "*" or current().text == "/" or current().text == "%") {
+        let op = advance().text;
+        let right = parse_unary();
+        left = expr_binary(op, left, right);
+    }
+    return left;
+}
+
+fn parse_unary() {
+    if current().kind == "operator" and (current().text == "-" or current().text == "!") {
+        let op = advance().text;
+        let operand = parse_unary();
+        return expr_unary(op, operand);
+    }
+    return parse_call();
+}
+
+fn parse_call() {
+    let expr = parse_primary();
+    while match_token("punct", "(") {
+        let args = [];
+        if not match_token("punct", ")") {
+            while true {
+                push(args, parse_expr());
+                if not match_token("punct", ",") { break; }
+            }
+            expect("punct", ")");
+        }
+        expr = expr_call(expr, args);
+    }
+    return expr;
+}
+
+fn parse_primary() {
+    let t = current();
+
+    if t.kind == "number" {
+        advance();
+        return expr_number(t.text);
+    }
+    if t.kind == "string" {
+        advance();
+        return expr_string(t.text);
+    }
+    if t.kind == "ident" {
+        advance();
+        return expr_ident(t.text);
+    }
+    if t.kind == "keyword" {
+        if t.text == "true" { advance(); return expr_bool(true); }
+        if t.text == "false" { advance(); return expr_bool(false); }
+        if t.text == "nil" { advance(); return expr_nil(); }
+        if t.text == "fn" {
+            advance();
+            expect("punct", "(");
+            let params = [];
+            if not match_token("punct", ")") {
+                while true {
+                    let pn = expect("ident", nil);
+                    if pn == nil { break; }
+                    push(params, pn.text);
+                    if not match_token("punct", ",") { break; }
+                }
+                expect("punct", ")");
+            }
+            let body = parse_block();
+            return expr_fnlit(params, body);
+        }
+    }
+    if t.kind == "punct" {
+        if t.text == "(" {
+            advance();
+            let e = parse_expr();
+            expect("punct", ")");
+            return e;
+        }
+        if t.text == "[" {
+            advance();
+            let items = [];
+            if not match_token("punct", "]") {
+                while true {
+                    push(items, parse_expr());
+                    if not match_token("punct", ",") { break; }
+                }
+                expect("punct", "]");
+            }
+            return expr_array(items);
+        }
+    }
+    if t.kind == "keyword" and t.text == "map" {
+        advance();
+        expect("punct", "{");
+        let entries = [];
+        if not match_token("punct", "}") {
+            while true {
+                let key_token = expect("ident", nil);
+                if key_token == nil { break; }
+                if match_token("operator", ":") {
+                    let val = parse_expr();
+                    push(entries, map{ key: key_token.text, value: val });
+                } else {
+                    push(entries, map{ key: key_token.text, value: expr_ident(key_token.text) });
+                }
+                if not match_token("punct", ",") { break; }
+            }
+            expect("punct", "}");
+        }
+        return expr_map(entries);
+    }
+
+    push(errors, "Unexpected token: " + t.kind + " '" + t.text + "' at " + str(t.line) + ":" + str(t.col));
+    return expr_nil();
+}
+
+fn parse_type() {
+    let t = current();
+    if t.kind == "ident" {
+        advance();
+        return t.text;
+    }
+    if t.kind == "punct" and t.text == "[" {
+        advance();
+        let inner = parse_type();
+        expect("punct", "]");
+        return "array<" + inner + ">";
+    }
+    return "any";
+}
+
+// ── Utility: print AST for debugging ──────────────────────────────────────────
+
+fn print_ast(node, indent) {
+    if indent == nil { indent = 0; }
+    let pad = "";
+    for i in 0 to indent { pad = pad + "  "; }
+
+    if node == nil {
+        print(pad + "nil");
+        return;
+    }
+
+    if node.kind == nil {
+        print(pad + "<no kind>");
+        return;
+    }
+
+    print(pad + node.kind);
+
+    if node.kind == "number" { print(pad + "  " + node.value); }
+    if node.kind == "string" { print(pad + "  \"" + node.value + "\""); }
+    if node.kind == "ident" { print(pad + "  " + node.name); }
+    if node.kind == "bool" { print(pad + "  " + str(node.value)); }
+
+    if node.kind == "binary" {
+        print(pad + "  op: " + node.op);
+        print_ast(node.left, indent + 1);
+        print_ast(node.right, indent + 1);
+    }
+
+    if node.kind == "unary" {
+        print(pad + "  op: " + node.op);
+        print_ast(node.operand, indent + 1);
+    }
+
+    if node.kind == "call" {
+        print_ast(node.func, indent + 1);
+        print(pad + "  args:");
+        for a in node.args {
+            print_ast(a, indent + 2);
+        }
+    }
+
+    if node.kind == "let" or node.kind == "const" {
+        print(pad + "  name: " + node.name);
+        print_ast(node.value, indent + 1);
+    }
+
+    if node.kind == "fn" {
+        print(pad + "  name: " + node.name);
+        print(pad + "  params:");
+        for p in node.params {
+            if type(p) == "map" {
+                print(pad + "    " + p.name);
+            } else {
+                print(pad + "    " + p);
+            }
+        }
+        print_ast(node.body, indent + 1);
+    }
+
+    if node.kind == "if" {
+        print(pad + "  cond:");
+        print_ast(node.cond, indent + 1);
+        print(pad + "  then:");
+        print_ast(node.then, indent + 1);
+    }
+
+    if node.kind == "block" {
+        for s in node.stmts {
+            print_ast(s, indent + 1);
+        }
+    }
+
+    if node.kind == "return" {
+        if node.value != nil {
+            print_ast(node.value, indent + 1);
+        }
+    }
+
+    if node.kind == "array" {
+        for item in node.items {
+            print_ast(item, indent + 1);
+        }
+    }
+
+    if node.kind == "assign" {
+        print(pad + "  name: " + node.name);
+        print_ast(node.value, indent + 1);
+    }
+}
+
+// ── Self-test: parse this file itself ─────────────────────────────────────────
+
+fn self_test() {
+    let src = fsread(import("__FILE__")); // won't work in practice, illustrative
+    let tok_mod = import("stdlib/compiler/tokenizer.sapp");
+    let tokens = tok_mod.tokenize("fn add(a, b) { return a + b; } let x = add(1, 2);");
+    let result = parse(tokens);
+    if len(result.errors) > 0 {
+        for e in result.errors {
+            print("ERROR: " + e);
+        }
+    } else {
+        print("Self-test: parsed successfully, " + str(len(result.stmts)) + " statements");
+        for s in result.stmts {
+            print_ast(s, 0);
+        }
+    }
+    return result;
+}
+
+export parse, print_ast, self_test;
+export make_node, stmt_let, stmt_const, stmt_return, stmt_if, stmt_while;
+export stmt_for, stmt_forin, stmt_import, stmt_export, stmt_expr, stmt_fn, stmt_block;
+export expr_number, expr_string, expr_ident, expr_bool, expr_nil;
+export expr_binary, expr_unary, expr_call, expr_array, expr_map, expr_assign;

@@ -284,3 +284,50 @@ Supported languages: `"python"`, `"python3"`, `"node"`, `"js"`, `"javascript"`, 
 
 **Tests**: `os_env_set_pass` in `tests/semantics.rs`.
 
+---
+
+## L4-alpha: LSP semantic tokens + hover
+
+The LSP server (`pblang-lsp`) now advertises and implements two additional
+capabilities alongside the existing `publishDiagnostics` support.
+
+### `textDocument/semanticTokens/full`
+
+A byte-level source scanner walks the document without requiring a full AST
+parse.  It handles nested block comments and escape sequences inside strings,
+then delta-encodes the result according to the LSP specification.
+
+| Index | Token type  | What is classified |
+|-------|-------------|--------------------|
+| 0     | `keyword`   | `let`, `const`, `fn`, `if`, `else`, `while`, `for`, `return`, `match`, `case`, `import`, `export`, `try`, `catch`, `defer`, `in`, `nil`, `true`, `false`, `and`, `or`, `not` |
+| 1     | `function`  | The identifier immediately after a `fn` keyword |
+| 2     | `variable`  | The identifier immediately after `let`, `const`, or `for` (the loop binder) |
+| 3     | `string`    | `"..."` double-quoted string literals (single-line only) |
+| 4     | `number`    | Integer and float literals (`42`, `3.14`) |
+| 5–8   | `comment`, `operator`, `type`, `parameter` | Registered in the legend for future use; **not emitted** in this version |
+
+The lookahead flags (`next_is_fn`, `next_is_var`) are preserved across
+whitespace and comments, so constructs like `fn   /* doc */ name` and
+`let\n  x` classify correctly.  Any punctuation (parentheses, braces,
+operators) resets the flags.
+
+### `textDocument/hover`
+
+When the cursor rests on an identifier the server looks it up in three places
+in priority order:
+
+1. **Built-in function signatures** — 22 built-ins are recognised, including
+   `len`, `print`, `array_push`, `map_keys`, `json_parse`, `http_get`,
+   `tcp_listen_tls`, `spawn`, `channel`, `send`, `recv`, and others.
+2. **Locally-defined functions** — top-level `fn` declarations in the current
+   file.  The signature is reconstructed from the parsed AST, including
+   parameter types and return type when annotated.
+   Format: `` fn name(param: type, …) -> return_type ``
+3. **Import module names** — `import "stdlib/math"` binds the name `math`;
+   hovering over `math` shows `` import "stdlib/math" ``.
+
+All hover responses are rendered as Markdown fenced code blocks.
+
+> **Deferred to v0.7**: completions, go-to-definition, and hover for nested
+> function bodies.
+

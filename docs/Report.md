@@ -1155,3 +1155,66 @@
 ---
 
 *Αυτή η έκθεση ενημερώνεται μετά από κάθε πάσο υλοποίησης του Future_plans.md.*
+
+## v0.5.4 — Bit-Level Optimization & Enhanced Stdlib (2026)
+
+### Compiler Optimizations
+- **String Constant Folding**: Compile-time string concatenation (`"hello " + "world"` → `"hello world"`)
+- **Peephole Optimizer**: Removes redundant instruction pairs (`Dup`+`Pop`, `Not`+`Not`)
+- **Jump Threading Enhancement**: Multi-pass resolution of jump chains
+
+### New Stdlib Modules
+| Module | Functions | Description |
+|--------|-----------|-------------|
+| `bitops.sapp` | 26 | Bitwise AND/OR/XOR/NOT, shifts, popcount, CLZ/CTZ, bit test/set/clear/toggle, rotations (rotl/rotr), bswap32, binary/hex conversion |
+| `compression.sapp` | 7 | Gzip, Zstd, Brotli compress/decompress + auto-detection |
+| `serialization.sapp` | 10 | JSON pretty/validate, TOML/YAML parse/stringify, CSV parse/stringify, XML escape/unescape |
+
+### Bug Fixes
+- Fixed `pblang-cranelift` compilation: added missing `min_arity`, `defaults`, `is_vararg` fields
+- Fixed `params_not_implemented_yet_should_error` test → `params_and_locals_work` (locals now implemented)
+
+### Test Results
+- **143/143 semantics tests passing, 0 failing, 3 ignored**
+- All workspace tests passing (200+ total)
+
+## v0.5.4 — Comprehensive Stdlib & Self-Hosting (2026)
+
+### New Stdlib Modules (7 modules, 90+ functions)
+| Module | Functions | Description |
+|--------|-----------|-------------|
+| `bitops.sapp` | 26 | Bitwise AND/OR/XOR/NOT, shifts, popcount, CLZ/CTZ, rotations, byte swap, binary/hex |
+| `compression.sapp` | 7 | Gzip, Zstd, Brotli compress/decompress + auto-detect |
+| `serialization.sapp` | 10 | JSON, TOML, YAML, CSV, XML encode/decode |
+| `registry_server.sapp` | 7 | Hosted package registry HTTP server |
+| `compiler/codegen.sapp` | 16 | Self-hosting bytecode code generator (full compiler pipeline) |
+| `benchmark.sapp` | 8 | run(), time(), warmup(), compare(), bench_once(), bench_many(), bench_compare(), bench_all() |
+
+### Compiler Optimizations
+- **String constant folding**: `"a" + "b"` → `"ab"` at compile time
+- **Peephole optimizer**: Removes redundant Dup+Pop, Not+Not pairs
+- **Jump threading**: Multi-pass jump-to-jump resolution
+
+### Self-Hosting Compiler Progress
+| Component | Status | Lines |
+|-----------|--------|-------|
+| Tokenizer | ✅ Complete | 232 |
+| Parser | ✅ Complete | 708 |
+| Code Generator | ✅ Complete | 303 |
+| Type Checker | 🟡 Next | — |
+
+### Bug Fixes
+- Fixed pblang-cranelift: missing min_arity/defaults/is_vararg fields
+- Fixed params_not_implemented_yet → params_and_locals_work (locals implemented)
+- Fixed benchmark.sapp: restored backward-compatible API with proper pblang syntax
+- Fixed all stdlib modules: proper map{}/len()/array_push() syntax
+
+### Test Results
+- **143/143 semantics tests passing, 0 failing, 3 ignored**
+- All workspace test suites passing (AI 8/8, VM 21/21, PM 8/8, etc.)
+- **200+ total tests passing across all crates**
+
+### Project Scale
+- **96 stdlib modules** (16,935 lines of pblang)
+- **16 crates** (24,249 lines of Rust)
+- **41,184 total lines of code**

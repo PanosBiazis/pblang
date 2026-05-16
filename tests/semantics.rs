@@ -1,7 +1,7 @@
 use pblang_vm::Value;
 
 mod common;
-use common::{run_collect, run_collect_with_config, run_err};
+use common::{run_collect, run_collect_with_config, run_err, run_err_with_config};
 use pblang_core::parse;
 use pblang_vm::StdlibConfig;
 
@@ -307,7 +307,7 @@ fn http_static_file_response_serves_text_file_under_root() {
     assert_eq!(out.len(), 3);
     assert_eq!(out[0], Value::Number(200.0));
     assert_eq!(out[1].as_str().expect("body"), "hello");
-    assert_eq!(out[2].as_str().expect("content_type"), "text/plain");
+    assert_eq!(out[2].as_str().expect("content_type"), "text/plain; charset=utf-8");
 }
 
 #[test]
@@ -1570,27 +1570,31 @@ fn match_exhaustive_pass() {
     );
 }
 
-#[ignore = "Match guard body separator conflicts with chumsky parse_recovery: \
-   guard expression extension errors cause recovery to consume separator tokens. \
-   Guards work correctly at compile/runtime when parse() (strict) is used, \
-   but parse_recovery (used for REPL/error reporting) consumes the separator. \
-   Fix requires restructuring the guard expr parser to use a guard_expr variant \
-   that does not generate extension errors, or switching to a different parser library."]
+#[ignore = "SP1-gamma known chumsky 0.8 limitation: cmp_op.padded() inside \
+   .repeated() generates a cascade of recovery errors when it encounters `~` or `#` \
+   (the guard body separator). parse_recovery() then returns None for the entire \
+   source instead of a partial AST. Root cause: chumsky 0.8 has no per-parser \
+   recovery-boundary mechanism that prevents the cascade. Fix requires either: \
+   (a) migrating to chumsky 0.9+ with its improved recovery model, or \
+   (b) a hand-written match-arm pre-processor. The BindGuard AST node, compiler, \
+   and VM are fully implemented and correct -- only the parser path is blocked. \
+   Guarded arms ARE parseable with the strict parser() when the source is clean, \
+   but parse_with_polyglot uses parse_recovery as the primary path."]
 #[test]
 fn match_guard_pass() {
     // Match guard test: verify BindGuard arms dispatch correctly.
-    // Guards use `#` as body separator to avoid the method-call `:` ambiguity.
+    // Guards use `~` as body separator (safe: not the first char of any pblang operator).
     // The compiler correctly handles BindGuard(name, guard_expr) arms via
     // desugaring into nested if/else chains.
     let out = run_collect(
         r#"
         fn classify(n) {
             let result = match n {
-                case n if n < 0 # "negative";
+                case n if n < 0 ~ "negative";
                 else: match n {
-                    case n if n == 0 # "zero";
+                    case n if n == 0 ~ "zero";
                     else: match n {
-                        case n if n >= 10 # "large positive";
+                        case n if n >= 10 ~ "large positive";
                         else: "small positive";
                     };
                 };
@@ -1787,6 +1791,62 @@ fn sort_and_numeric_builtins_pass() {
         "expected sort_and_numeric_builtins_pass, got: {:?}", out);
 }
 
+/// N2-beta: verify Cranelift JIT compiles and executes fibonacci correctly.
+#[test]
+fn cranelift_jit_fib_pass() {
+    use pblang_cranelift::{JitCache, JitResult};
+    use pblang_ir::chunk::{Chunk, OpCode, Span};
+    use pblang_ir::{Function, Value as PV};
+
+    // Build the fibonacci bytecode (same as what the compiler produces for
+    //   fn fib(n) { if n <= 1 { return n; } return fib(n-1) + fib(n-2); })
+    let mut chunk = Chunk::default();
+    let sp = Span::default();
+    let c1 = chunk.add_const(PV::Number(1.0));
+    let cfib = chunk.add_const(pblang_ir::alloc_string("fib"));
+    let c2 = chunk.add_const(PV::Number(2.0));
+    chunk.write(OpCode::OpGetLocal(0), sp);
+    chunk.write(OpCode::OpConstant(c1), sp);
+    chunk.write(OpCode::OpLe, sp);
+    chunk.write(OpCode::OpJumpIfFalse(6), sp);
+    chunk.write(OpCode::OpGetLocal(0), sp);
+    chunk.write(OpCode::OpReturn, sp);
+    chunk.write(OpCode::OpGetGlobal(cfib), sp);
+    chunk.write(OpCode::OpGetLocal(0), sp);
+    chunk.write(OpCode::OpConstant(c1), sp);
+    chunk.write(OpCode::OpSub, sp);
+    chunk.write(OpCode::OpCall(1), sp);
+    chunk.write(OpCode::OpGetGlobal(cfib), sp);
+    chunk.write(OpCode::OpGetLocal(0), sp);
+    chunk.write(OpCode::OpConstant(c2), sp);
+    chunk.write(OpCode::OpSub, sp);
+    chunk.write(OpCode::OpCall(1), sp);
+    chunk.write(OpCode::OpAdd, sp);
+    chunk.write(OpCode::OpReturn, sp);
+
+    let func = Function { name: Some("fib".into()), arity: 1, min_arity: 1, defaults: vec![], is_vararg: false, chunk };
+    let mut cache = JitCache::new().expect("JitCache::new");
+
+    match cache.compile("fib", &func) {
+        JitResult::Compiled(fp) => {
+            let cases = [
+                (0.0f64, 0.0f64), (1.0, 1.0), (2.0, 1.0),
+                (5.0, 5.0), (10.0, 55.0), (20.0, 6765.0),
+            ];
+            for (n, expected) in cases {
+                let got = unsafe { fp(&n as *const f64, 1) };
+                assert_eq!(
+                    got, expected,
+                    "JIT fib({n}) expected {expected} got {got}"
+                );
+            }
+        }
+        JitResult::NotEligible(r) => {
+            panic!("Cranelift JIT should compile fibonacci but got NotEligible: {r}");
+        }
+    }
+}
+
 /// Helper macro: load a .sapp test file from tests/semantics/, run it, assert last output equals test name.
 macro_rules! sapp_test {
     ($fn_name:ident, $file:literal, $expected:literal) => {
@@ -1809,10 +1869,30 @@ macro_rules! sapp_test {
 sapp_test!(result_stdlib_pass,   "result_stdlib_test.sapp",   "result_stdlib_pass");
 sapp_test!(option_stdlib_pass,   "option_stdlib_test.sapp",   "option_stdlib_pass");
 sapp_test!(iter_stdlib_pass,     "iter_stdlib_test.sapp",     "iter_stdlib_pass");
-sapp_test!(validate_stdlib_pass,            "validate_stdlib_test.sapp",            "validate_stdlib_pass");
-sapp_test!(cache_stdlib_pass,               "cache_stdlib_test.sapp",               "cache_stdlib_pass");
-sapp_test!(event_stdlib_pass,               "event_stdlib_test.sapp",               "event_stdlib_pass");
-sapp_test!(uuid_stdlib_pass,                "uuid_stdlib_test.sapp",                "uuid_stdlib_pass");
+sapp_test!(validate_stdlib_pass, "validate_stdlib_test.sapp", "validate_stdlib_pass");
+sapp_test!(cache_stdlib_pass,    "cache_stdlib_test.sapp",    "cache_stdlib_pass");
+sapp_test!(event_stdlib_pass,    "event_stdlib_test.sapp",    "event_stdlib_pass");
+sapp_test!(uuid_stdlib_pass,     "uuid_stdlib_test.sapp",     "uuid_stdlib_pass");
+sapp_test!(logger_stdlib_pass,   "logger_stdlib_test.sapp",   "logger_stdlib_pass");
+sapp_test!(assert_stdlib_pass,   "assert_stdlib_test.sapp",   "assert_stdlib_pass");
+sapp_test!(pipe_stdlib_pass,     "pipe_stdlib_test.sapp",     "pipe_stdlib_pass");
+sapp_test!(regex_stdlib_pass,    "regex_stdlib_test.sapp",    "regex_stdlib_pass");
+sapp_test!(config_stdlib_pass,   "config_stdlib_test.sapp",   "config_stdlib_pass");
+sapp_test!(signal_stdlib_pass,   "signal_stdlib_test.sapp",   "signal_stdlib_pass");
+sapp_test!(map_extended_pass,    "map_extended_test.sapp",    "map_extended_pass");
+sapp_test!(new_builtins_pass,       "new_builtins_test.sapp",       "new_builtins_pass");
+sapp_test!(new_language_features_pass, "new_language_features_test.sapp", "new_language_features_pass");
+sapp_test!(core_builtins_pass,        "core_builtins_test.sapp",         "core_builtins_pass");
+sapp_test!(algo_stdlib_pass,         "algo_stdlib_test.sapp",           "algo_stdlib_pass");
+sapp_test!(stat_stdlib_pass,         "stat_stdlib_test.sapp",           "stat_stdlib_pass");
+sapp_test!(format_stdlib_pass,       "format_stdlib_test.sapp",         "format_stdlib_pass");
+
+// ---- Runtime memory safety builtins ----
+sapp_test!(
+    memory_safety_builtins_pass,
+    "memory_safety_builtins_test.sapp",
+    "memory_safety_builtins_pass"
+);
 
 // ---- Thread safety & concurrency tests ----
 sapp_test!(atomic_builtins_pass,            "atomic_builtins_test.sapp",            "atomic_builtins_pass");
@@ -1825,4 +1905,134 @@ sapp_test!(pipeline_pass,                   "pipeline_test.sapp",               
 sapp_test!(promise_pass,                    "promise_test.sapp",                    "promise_pass");
 sapp_test!(waitgroup_pass,                  "waitgroup_test.sapp",                  "waitgroup_pass");
 sapp_test!(actor_pass,                      "actor_test.sapp",                      "actor_pass");
+
+// ─── New stdlib module tests (added in comprehensive audit fix) ───────────────
+sapp_test!(fs_stdlib_pass,       "fs_stdlib_test.sapp",       "fs stdlib tests passed");
+sapp_test!(testing_stdlib_pass,  "testing_stdlib_test.sapp",  "testing stdlib tests passed");
+sapp_test!(orm_stdlib_pass,      "orm_test.sapp",              "ORM tests passed");
+sapp_test!(env_stdlib_pass,      "env_stdlib_test.sapp",       "env stdlib tests passed");
+sapp_test!(log_stdlib_pass,      "log_stdlib_test.sapp",       "log stdlib tests passed");
+
+// ─── OOP, Data Types, Algorithms ─────────────────────────────────────────────
+sapp_test!(class_stdlib_pass,      "class_stdlib_test.sapp",      "class stdlib tests passed");
+sapp_test!(struct_stdlib_pass,     "struct_stdlib_test.sapp",     "struct stdlib tests passed");
+sapp_test!(enum_stdlib_pass,       "enum_stdlib_test.sapp",       "enum stdlib tests passed");
+sapp_test!(graph_stdlib_pass,      "graph_stdlib_test.sapp",      "graph stdlib tests passed");
+
+// ─── Error handling, security, utilities ─────────────────────────────────────
+sapp_test!(try_catch_defer_pass,   "try_catch_defer_test.sapp",   "try_catch_defer_pass");
+sapp_test!(jwt_stdlib_pass,        "jwt_stdlib_test.sapp",        "jwt_stdlib_pass");
+sapp_test!(template_stdlib_pass,   "template_stdlib_test.sapp",   "template_stdlib_pass");
+sapp_test!(benchmark_stdlib_pass,  "benchmark_stdlib_test.sapp",  "benchmark_stdlib_pass");
+sapp_test!(crypto_advanced_pass,   "crypto_advanced_test.sapp",   "crypto_advanced_pass");
+
+// ─── Core language feature tests ───────────────────────────────────────────────
+sapp_test!(augmented_assignment_pass, "augmented_assignment_test.sapp", "augmented_assignment_pass");
+sapp_test!(default_params_pass,       "default_params_test.sapp",       "default_params_pass");
+sapp_test!(variadic_pass,             "variadic_test.sapp",             "variadic_pass");
+sapp_test!(destructuring_pass,        "destructuring_test.sapp",        "destructuring_pass");
+
+// ─── New stdlib: AI, Data Science, Systems, Patterns ─────────────────────────
+sapp_test!(dataframe_stdlib_pass,  "dataframe_test.sapp",         "dataframe_stdlib_pass");
+sapp_test!(systems_stdlib_pass,    "systems_test.sapp",           "systems_stdlib_pass");
+sapp_test!(state_machine_pass,     "state_machine_test.sapp",     "state_machine_pass");
+sapp_test!(ecs_stdlib_pass,        "ecs_test.sapp",               "ecs_stdlib_pass");
 sapp_test!(structured_concurrency_pass,     "structured_concurrency_test.sapp",     "structured_concurrency_pass");
+
+#[test]
+fn for_in_array_pass() {
+    let out = run_collect(r#"
+        let sum = 0;
+        let arr = [10, 20, 30, 40];
+        for x in arr {
+            sum = sum + x;
+        }
+        print sum;
+    "#);
+    assert_eq!(out, vec![Value::Number(100.0)]);
+}
+
+#[test]
+fn for_in_map_kv_pass() {
+    let out = run_collect(r#"
+        let m = map{ a: 1, b: 2, c: 3 };
+        let total = 0;
+        for k, v in m {
+            total = total + v;
+        }
+        print total;
+    "#);
+    assert_eq!(out, vec![Value::Number(6.0)]);
+}
+
+#[test]
+fn capability_denial_fs_blocked() {
+    let config = StdlibConfig { fs: false, ..StdlibConfig::default() };
+    let err = run_err_with_config(config, r#"fs_read("any_file.txt");"#);
+    assert!(
+        err.message.contains("access denied") || err.message.contains("denied"),
+        "expected access denied, got: {:?}", err
+    );
+}
+
+#[test]
+fn capability_denial_exec_blocked() {
+    let config = StdlibConfig { exec: false, ..StdlibConfig::default() };
+    let err = run_err_with_config(config, r#"exec("echo hi");"#);
+    assert!(
+        err.message.contains("access denied") || err.message.contains("denied"),
+        "expected access denied, got: {:?}", err
+    );
+}
+
+#[test]
+fn vm_limits_instruction_count_fires() {
+    use pblang_vm::{VmLimits, VM};
+    use pblang_compiler::compile;
+    let src = "let i = 0; while i < 1000000 { i = i + 1; }";
+    let (stmts, _) = pblang_core::parse_with_polyglot(src).unwrap();
+    let chunk = compile(stmts).unwrap();
+    let mut vm = VM::with_stdlib(StdlibConfig::default());
+    vm.set_limits(Some(VmLimits {
+        max_instructions: Some(100),
+        ..Default::default()
+    }));
+    let result = vm.run_collect(chunk);
+    assert!(result.is_err(), "should have hit instruction limit");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("instruction limit") || err.message.contains("limit"),
+        "expected instruction limit error, got: {:?}", err
+    );
+}
+
+#[test]
+fn vm_limits_stack_depth_fires() {
+    use pblang_vm::{VmLimits, VM};
+    use pblang_compiler::compile;
+    // Infinite recursion should hit stack depth limit
+    let src = "fn recurse() { return recurse(); } recurse();";
+    let (stmts, _) = pblang_core::parse_with_polyglot(src).unwrap();
+    let chunk = compile(stmts).unwrap();
+    let mut vm = VM::with_stdlib(StdlibConfig::default());
+    vm.set_limits(Some(VmLimits {
+        max_stack_depth: Some(10),
+        ..Default::default()
+    }));
+    let result = vm.run_collect(chunk);
+    assert!(result.is_err(), "should have hit stack depth limit");
+}
+
+#[test]
+fn for_in_count_words_pass() {
+    let out = run_collect(r#"
+        let words = ["hello", "world", "foo"];
+        let count = 0;
+        for word in words {
+            count = count + len(word);
+        }
+        print count;
+    "#);
+    assert_eq!(out, vec![Value::Number(13.0)]);
+}
+

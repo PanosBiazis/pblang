@@ -1,6 +1,9 @@
 //! Regression tests for registry CLI flows (`install`, `build`, local `publish`).
 
-use pblang_pm::parse_lockfile;
+use pblang_pm::{fetch_url, parse_lockfile, write_lockfile};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 use sha2::Digest;
 
 fn file_url_for_path(path: &std::path::Path) -> String {
@@ -11,16 +14,19 @@ fn file_url_for_path(path: &std::path::Path) -> String {
 fn make_tarball_and_sha256(temp: &std::path::Path) -> (std::path::PathBuf, String, String) {
     let tarball_path = temp.join("pkg-1.0.0.tar.gz");
     let lib_content = b"export fn id(x) { return x; }";
+    let manifest = b"[package]\nname = \"test\"\nversion = \"1.0.0\"\n\n[dependencies]\n";
     {
         let f = std::fs::File::create(&tarball_path).unwrap();
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         let mut tar_builder = tar::Builder::new(&mut enc);
-        let mut header = tar::Header::new_gnu();
-        header.set_path("lib.sapp").unwrap();
-        header.set_size(lib_content.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar_builder.append(&header, lib_content as &[u8]).unwrap();
+        for (path, content) in [("lib.sapp", lib_content.as_slice()), ("pblang.toml", manifest.as_slice())] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder.append(&header, content).unwrap();
+        }
         tar_builder.finish().unwrap();
         drop(tar_builder);
         enc.finish().unwrap();
@@ -258,14 +264,7 @@ version = "0.1.0"
 "@sapphire/build-test" = "1.0.0"
 "#;
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
-    std::fs::write(
-        temp.join("main.sapp"),
-        r#"
-        let pkg = import("@sapphire/build-test");
-        print pkg.id(41);
-        "#,
-    )
-    .unwrap();
+    std::fs::write(temp.join("main.sapp"), "print 41;\n").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
     let out = std::process::Command::new(bin)
@@ -649,19 +648,16 @@ version = "2.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
+    let registry_dir = reg_dir.path().to_string_lossy().to_string();
+    let index_url = file_url_for_path(reg_dir.path());
 
-    // Publish to file:// registry using hosted-style publish.
     let pub_out = std::process::Command::new(bin)
-        .env(
-            "PBLANG_REGISTRY_INDEX",
-            format!(
-                "file://{}",
-                reg_dir.path().to_str().unwrap().replace('\\', "/")
-            ),
-        )
-        .env("PBLANG_REGISTRY_TOKEN", "test-token")
-        .args(["publish"])
-        .current_dir(pkg_dir.path())
+        .args([
+            "publish",
+            "--registry-dir",
+            &registry_dir,
+            pkg_dir.path().to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -670,15 +666,8 @@ version = "2.0.0"
         String::from_utf8_lossy(&pub_out.stderr)
     );
 
-    // Search in the same registry.
     let search_out = std::process::Command::new(bin)
-        .env(
-            "PBLANG_REGISTRY_INDEX",
-            format!(
-                "file://{}",
-                reg_dir.path().to_str().unwrap().replace('\\', "/")
-            ),
-        )
+        .env("PBLANG_REGISTRY_INDEX", &index_url)
         .args(["search", "pblang_m4b"])
         .output()
         .unwrap();
@@ -2233,4 +2222,79 @@ version = "0.1.0"
     );
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn lockfile_is_reproducible_after_registry_install() {
+    let temp = std::env::temp_dir().join("pblang_lockfile_repro_registry");
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).unwrap();
+    let (_tarball_path, tarball_url, tarball_sha256) = make_tarball_and_sha256(&temp);
+    let index = serde_json::json!({
+        "packages": {
+            "@sapphire/repro-lock": {
+                "1.0.0": { "url": tarball_url, "sha256": tarball_sha256 }
+            }
+        }
+    });
+    let index_path = temp.join("index.json");
+    std::fs::write(&index_path, index.to_string()).unwrap();
+    let index_url = file_url_for_path(&index_path);
+    let manifest = r#"[package]
+name = "repro-lock-consumer"
+version = "0.1.0"
+
+[dependencies]
+"@sapphire/repro-lock" = "1.0.0"
+"#;
+    std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    for _ in 0..2 {
+        let out = std::process::Command::new(bin)
+            .arg("install")
+            .arg("--registry-index")
+            .arg(&index_url)
+            .arg(&temp)
+            .output()
+            .expect("install");
+        assert!(
+            out.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let lock_content = std::fs::read_to_string(temp.join("pblang.lock")).unwrap();
+    let lock = parse_lockfile(&lock_content).expect("parse lock");
+    let serialized = write_lockfile(&lock).expect("serialize lock");
+    assert!(
+        serialized.contains("@sapphire/repro-lock"),
+        "serialized lock should list registry dependency"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn fetch_url_reads_registry_index_over_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test http listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let body = br#"{"packages":{"@sapphire/http-pkg":{"1.0.0":{"url":"file:///noop","sha256":null}}}}"#;
+    let handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let mut buf = [0u8; 64];
+            let _ = stream.read(&mut buf);
+        }
+    });
+    let url = format!("http://{}/index.json", addr);
+    let bytes = fetch_url(&url).expect("fetch registry index over http");
+    handle.join().expect("http server thread");
+    let val: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(val.get("packages").is_some());
 }

@@ -1,0 +1,183 @@
+// stdlib/async.sapp — Async/concurrent task primitives for pblang.
+//
+// Provides Go-style goroutines, Promise-style futures, and task pools.
+// Built on top of the VM's spawn/channel/join builtins.
+//
+// Usage:
+//   let async = import("stdlib:async.sapp");
+//   let future = async.go(fn() { return expensive_computation(); });
+//   let result = async.await(future);
+
+let thread = import("stdlib:thread.sapp");
+
+// go(fn) — launch a goroutine-style concurrent task. Returns a Future handle.
+// The returned future can be resolved with async.await(future).
+fn go(task_fn) {
+    let ch = channel();
+    let worker = spawn(fn() {
+        let result = try task_fn() catch nil;
+        let err = nil;
+        if result == nil {
+            err = "task returned nil";
+        }
+        send(ch.sender, map{ ok: err == nil, value: result, error: err });
+    });
+    return map{ channel: ch, worker: worker, resolved: false, _value: nil };
+}
+
+// await(future) — block until the future resolves and return its value.
+fn await(future) {
+    if future.resolved == true { return future._value; }
+    let msg = recv(future.channel.receiver);
+    join(future.worker);
+    if msg == nil { return nil; }
+    if msg.ok == false {
+        return error("async.await: task failed: " + str(msg.error));
+    }
+    return msg.value;
+}
+
+// await_all(futures) — wait for all futures and return array of results.
+fn await_all(futures) {
+    let results = [];
+    for i len(futures) {
+        results[i] = await(futures[i]);
+    }
+    return results;
+}
+
+// await_race(futures) — return result of whichever future resolves first.
+fn await_race(futures) {
+    let channels = [];
+    for i len(futures) {
+        channels[i] = futures[i].channel.receiver;
+    }
+    let sel = select(channels);
+    if sel == nil { return nil; }
+    let idx = sel.index;
+    let msg = sel.value;
+    // Join all workers
+    for i len(futures) {
+        try join(futures[i].worker) catch nil;
+    }
+    if msg == nil { return nil; }
+    return msg.value;
+}
+
+// sleep(ms) — async-friendly sleep
+fn sleep(ms) {
+    sleep_ms(ms);
+}
+
+// timeout(ms, fn) — run fn with a timeout; returns nil if timed out.
+fn timeout(ms, task_fn) {
+    let ch = channel();
+    let worker = spawn(fn() {
+        let result = try task_fn() catch nil;
+        send(ch.sender, result);
+    });
+    // Poll every 10ms up to ms total
+    let waited = 0;
+    let interval = 10;
+    while waited < ms {
+        sleep_ms(interval);
+        waited = waited + interval;
+        // Try non-blocking recv
+        let result = try recv(ch.receiver) catch nil;
+        if result != nil {
+            try join(worker) catch nil;
+            return result;
+        }
+    }
+    try join(worker) catch nil;
+    return nil;  // timed out
+}
+
+// pool(size, tasks) — run tasks in a worker pool of `size` goroutines.
+// tasks: array of zero-arg functions. Returns array of results in order.
+fn pool(size, tasks) {
+    let n = len(tasks);
+    if n == 0 { return []; }
+    if size > n { size = n; }
+
+    let work_ch = thread.channel_new(n);
+    let result_ch = channel();
+
+    // Send all tasks to work channel
+    for i n {
+        send(work_ch.sender, map{ idx: i, fn: tasks[i] });
+    }
+    channel_close(work_ch.sender);
+
+    // Spawn workers
+    let workers = [];
+    for w size {
+        workers[w] = spawn(fn() {
+            while true {
+                let item = try recv(work_ch.receiver) catch nil;
+                if item == nil { return nil; }
+                let result = try item.fn() catch nil;
+                send(result_ch.sender, map{ idx: item.idx, value: result });
+            }
+        });
+    }
+
+    // Collect results
+    let results = [];
+    for i n { results[i] = nil; }
+    for i n {
+        let r = recv(result_ch.receiver);
+        if r != nil {
+            results[r.idx] = r.value;
+        }
+    }
+
+    for w size {
+        try join(workers[w]) catch nil;
+    }
+
+    return results;
+}
+
+// map_parallel(items, fn, pool_size) — apply fn to each item in parallel.
+fn map_parallel(items, fn_, pool_size) {
+    let tasks = [];
+    for i len(items) {
+        let item = items[i];
+        tasks[i] = fn() { return fn_(item); };
+    }
+    if pool_size == nil { pool_size = len(items); }
+    return pool(pool_size, tasks);
+}
+
+// debounce(fn, delay_ms) — returns a debounced version of fn.
+// The returned fn can be called multiple times; only the last call within
+// delay_ms will actually execute fn.
+fn debounce(fn_, delay_ms) {
+    let last_call = 0;
+    return fn() {
+        let now = clock() * 1000.0;
+        last_call = now;
+        sleep_ms(delay_ms);
+        if (clock() * 1000.0 - last_call) >= delay_ms - 1 {
+            return fn_();
+        }
+        return nil;
+    };
+}
+
+// throttle(fn, interval_ms) — returns a throttled fn (max 1 call per interval_ms).
+fn throttle(fn_, interval_ms) {
+    let last_exec = 0;
+    return fn() {
+        let now = clock() * 1000.0;
+        if now - last_exec >= interval_ms {
+            last_exec = now;
+            return fn_();
+        }
+        return nil;
+    };
+}
+
+export go, await, await_all, await_race, sleep, timeout, pool, map_parallel,
+       debounce, throttle;

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 // ──────────────────────────────────────────────────────────────
 // Manifest structs
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub struct Manifest {
     pub package: Option<PackageSection>,
     #[serde(default)]
-    pub dependencies: std::collections::HashMap<String, DependencySpec>,
+    pub dependencies: std::collections::BTreeMap<String, DependencySpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -49,6 +50,8 @@ pub enum DependencySpec {
         #[serde(default)]
         git: Option<String>,
         #[serde(default)]
+        rev: Option<String>,
+        #[serde(default)]
         version: Option<String>,
     },
 }
@@ -77,6 +80,13 @@ impl DependencySpec {
             DependencySpec::Detailed { version, .. } => version.as_deref(),
         }
     }
+
+    pub fn rev(&self) -> Option<&str> {
+        match self {
+            DependencySpec::Version(_) => None,
+            DependencySpec::Detailed { rev, .. } => rev.as_deref(),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -86,7 +96,7 @@ impl DependencySpec {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Lockfile {
     pub manifest_sha256: String,
-    pub dependencies: std::collections::HashMap<String, LockedDep>,
+    pub dependencies: std::collections::BTreeMap<String, LockedDep>,
 }
 
 /// Lockfile v2: path + sha256 required; name/version/source/resolved/fetch_url optional.
@@ -104,6 +114,9 @@ pub struct LockedDep {
     pub resolved: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetch_url: Option<String>,
+    /// Tarball/archive checksum when `sha256` stores unpacked tree content hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -217,6 +230,16 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
     for entry in archive.entries().map_err(|e| format!("tar entries: {e}"))? {
         let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
         let entry_path = entry.path().map_err(|e| format!("tar path: {e}"))?;
+        let entry_type = entry.header().entry_type();
+        if matches!(
+            entry_type,
+            tar::EntryType::Symlink | tar::EntryType::Link
+        ) {
+            return Err(format!(
+                "SECURITY: tarball link entries are not allowed: {}",
+                entry_path.display()
+            ));
+        }
 
         // Validate: reject any path that would escape dest_dir
         for component in entry_path.components() {
@@ -260,14 +283,297 @@ pub fn cache_root(manifest_dir: Option<&Path>) -> PathBuf {
     home.join(".pblang").join("cache")
 }
 
-/// Resolve one registry dependency. Returns (path to unpacked dir, sha256, resolved_url).
+/// Resolve a registry release URL relative to the index URL when needed.
+pub fn resolve_registry_release_url(index_url: &str, release_url: &str) -> String {
+    if release_url.starts_with("http://")
+        || release_url.starts_with("https://")
+        || release_url.starts_with("file://")
+    {
+        return release_url.to_string();
+    }
+    if let Some(path) = index_url.strip_prefix("file://") {
+        let index_path = Path::new(path);
+        if let Some(parent) = index_path.parent() {
+            let joined = parent.join(release_url);
+            let joined = joined.to_string_lossy().replace('\\', "/");
+            return format!("file:///{}", joined.trim_start_matches('/'));
+        }
+    }
+    if let Some(base) = http_index_base_url(index_url) {
+        let rel = release_url.trim_start_matches('/');
+        return format!("{base}/{rel}");
+    }
+    release_url.to_string()
+}
+
+fn http_index_base_url(index_url: &str) -> Option<String> {
+    let without_query = index_url.split('?').next().unwrap_or(index_url);
+    without_query.rfind('/').map(|pos| without_query[..pos].to_string())
+}
+
+fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Result<(), String> {
+    let key = match std::env::var("PBLANG_SIGNING_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return Ok(()),
+    };
+    let path = tarball_url
+        .strip_prefix("file://")
+        .map(Path::new)
+        .filter(|p| p.is_file());
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let sidecar = PathBuf::from(format!("{}.sha256", path.display()));
+    if !sidecar.is_file() {
+        return Ok(());
+    }
+    let expected = std::fs::read_to_string(&sidecar).map_err(|e| format!("read HMAC sidecar: {e}"))?;
+    let expected = expected.trim();
+    let got = compute_tarball_hmac(tarball_bytes, key.as_bytes());
+    if !got.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "HMAC signature mismatch for registry tarball (sidecar {})",
+            sidecar.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Returns true when the directory contains at least one `.sapp`/`.sap`/`.bpx` file.
+pub fn package_has_module_files(package_dir: &Path) -> bool {
+    let mut entries = vec![];
+    let _ = collect_files(package_dir, package_dir, &mut entries);
+    entries.iter().any(|(rel, _)| {
+        rel.ends_with(".sapp") || rel.ends_with(".sap") || rel.ends_with(".bpx")
+    })
+}
+
+/// Validate a package directory before publish/install (modules + optional entry).
+pub fn validate_package_tree(package_dir: &Path) -> Result<(), String> {
+    let man_path = package_dir.join("pblang.toml");
+    if man_path.is_file() {
+        let man_bytes = std::fs::read(&man_path)
+            .map_err(|e| format!("read manifest {}: {e}", man_path.display()))?;
+        let man =
+            parse_manifest(std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?)?;
+        if let Some(entry) = man.package.as_ref().and_then(|p| p.entry.as_deref()) {
+            let entry_path = package_dir.join(entry);
+            if !entry_path.is_file() {
+                if entry_path.is_dir() {
+                    return Err(format!(
+                        "package entry is not a file: {}",
+                        entry_path.display()
+                    ));
+                }
+                return Err(format!("package entry not found: {}", entry_path.display()));
+            }
+        }
+    }
+    if !package_has_module_files(package_dir) {
+        return Err(
+            "package has no Biapryx module files (.sapp/.sap/.bpx)".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Verify unpacked dependency tree matches the locked content hash.
+pub fn verify_locked_dep_content(dep: &LockedDep) -> Result<(), String> {
+    let path = Path::new(&dep.path);
+    if !path.is_dir() {
+        return Err(format!("dependency path not found: {}", dep.path));
+    }
+    let got = hash_dir(path)?;
+    if got != dep.sha256 {
+        return Err(format!(
+            "content hash mismatch for dependency '{}': expected {} got {}",
+            dep.name.as_deref().unwrap_or("?"),
+            dep.sha256,
+            got
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a git dependency to a cached checkout. Returns (path, content_sha256, resolved_key).
+pub fn resolve_git_dep(
+    git_url: &str,
+    rev: &str,
+    cache_root: &Path,
+) -> Result<(PathBuf, String, String), String> {
+    if rev.is_empty() {
+        return Err("git dependency requires a pinned rev".to_string());
+    }
+    let cache_key = hex::encode(Sha256::digest(format!("{git_url}#{rev}").as_bytes()));
+    let checkout = cache_root.join("git").join(&cache_key);
+    if !checkout.is_dir() {
+        if let Some(parent) = checkout.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create git cache dir: {e}"))?;
+        }
+        if checkout.exists() {
+            std::fs::remove_dir_all(&checkout)
+                .map_err(|e| format!("reset git cache dir: {e}"))?;
+        }
+        let status = Command::new("git")
+            .args(["clone", git_url, checkout.to_str().ok_or("invalid checkout path")?])
+            .status()
+            .map_err(|e| format!("git clone failed to start: {e}"))?;
+        if !status.success() {
+            return Err(format!("git clone failed for {git_url}"));
+        }
+        let status = Command::new("git")
+            .args(["checkout", rev])
+            .current_dir(&checkout)
+            .status()
+            .map_err(|e| format!("git checkout failed to start: {e}"))?;
+        if !status.success() {
+            return Err(format!("git checkout {rev} failed for {git_url}"));
+        }
+    }
+    validate_package_tree(&checkout)?;
+    let content_sha256 = hash_dir(&checkout)?;
+    let resolved = format!("{git_url}#{rev}");
+    Ok((checkout, content_sha256, resolved))
+}
+
+/// Rehydrate or verify a locked dependency root (registry, git, or path).
+pub fn resolve_dependency_root(
+    man_dir: &Path,
+    dep_name: &str,
+    dep: &LockedDep,
+) -> Result<PathBuf, String> {
+    let path = Path::new(&dep.path);
+    if path.is_dir() {
+        return verify_locked_dep_content(dep).map(|_| path.to_path_buf());
+    }
+
+    match dep.source.as_deref() {
+        Some("registry") => {
+            let cache = cache_root(Some(man_dir));
+            let root = if let Some(tarball_url) = dep.fetch_url.as_deref() {
+                let archive_sha256 = dep
+                    .archive_sha256
+                    .as_deref()
+                    .unwrap_or(dep.sha256.as_str());
+                let cache_entry = cache.join(archive_sha256);
+                if !cache_entry.is_dir() {
+                    let tarball_bytes = fetch_url(tarball_url)?;
+                    verify_tarball_hmac_sidecar(tarball_url, &tarball_bytes)?;
+                    unpack_tarball_gz(&tarball_bytes, &cache_entry)?;
+                }
+                cache_entry
+            } else {
+                let name = dep.name.as_deref().unwrap_or(dep_name);
+                let version = dep.version.as_deref().ok_or_else(|| {
+                    format!("lockfile missing version for registry dep '{dep_name}'")
+                })?;
+                let index_url = std::env::var("PBLANG_REGISTRY_INDEX").map_err(|_| {
+                    format!(
+                        "registry dep '{dep_name}' cache path missing; set PBLANG_REGISTRY_INDEX or refresh lockfile"
+                    )
+                })?;
+                let (root, _, _, _) =
+                    resolve_registry_dep(&index_url, &cache, name, version, false)?;
+                root
+            };
+            verify_locked_dep_content(&LockedDep {
+                path: root.to_string_lossy().to_string(),
+                sha256: dep.sha256.clone(),
+                ..dep.clone()
+            })?;
+            Ok(root)
+        }
+        Some("git") => {
+            let resolved = dep.resolved.as_deref().ok_or_else(|| {
+                format!("lockfile missing resolved git ref for '{dep_name}'")
+            })?;
+            let (git_url, rev) = resolved
+                .rsplit_once('#')
+                .ok_or_else(|| format!("invalid git resolved ref in lockfile: {resolved}"))?;
+            let cache = cache_root(Some(man_dir));
+            let (root, content_hash, _) = resolve_git_dep(git_url, rev, &cache)?;
+            if content_hash != dep.sha256 {
+                return Err(format!(
+                    "content hash mismatch after rehydrating git dep '{dep_name}'"
+                ));
+            }
+            Ok(root)
+        }
+        _ => Err(format!("dependency path not found: {}", dep.path)),
+    }
+}
+
+fn verify_package_tree_for_path_dep(path: &Path) -> Result<(), String> {
+    validate_package_tree(path)
+}
+
+fn resolve_package_entry_in_dir(package_dir: &Path) -> Result<PathBuf, String> {
+    let man_path = package_dir.join("pblang.toml");
+    if man_path.is_file() {
+        let man_bytes = std::fs::read(&man_path).map_err(|e| format!("read manifest: {e}"))?;
+        let man =
+            parse_manifest(std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?)?;
+        if let Some(entry) = man.package.as_ref().and_then(|p| p.entry.as_deref()) {
+            let entry_path = package_dir.join(entry);
+            if entry_path.is_file() {
+                return canonicalize_existing(&entry_path)
+                    .ok_or_else(|| format!("package entry not found: {}", entry_path.display()));
+            }
+            if entry_path.is_dir() {
+                return Err(format!(
+                    "package entry is not a file: {}",
+                    entry_path.display()
+                ));
+            }
+            return Err(format!("package entry not found: {}", entry_path.display()));
+        }
+    }
+    for candidate in ["main.sapp", "main.sap", "main.bpx", "lib.sapp", "lib.sap"] {
+        let p = package_dir.join(candidate);
+        if p.is_file() {
+            return canonicalize_existing(&p)
+                .ok_or_else(|| format!("import not found: {}", p.display()));
+        }
+    }
+    package_has_module_files(package_dir);
+    Err(format!(
+        "package '{}' has no default entry; use pkg:path/file.sapp",
+        package_dir.display()
+    ))
+}
+
+fn resolve_package_subpath(dep_root: &Path, sub: &str) -> Result<PathBuf, String> {
+    let sub = sub.trim_start_matches('/');
+    if sub.is_empty() {
+        return resolve_package_entry_in_dir(dep_root);
+    }
+    let sub_path = Path::new(sub);
+    for component in sub_path.components() {
+        if matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {
+            return Err(format!(
+                "import subpath '{}' must not escape the package root",
+                sub
+            ));
+        }
+    }
+    let path = dep_root.join(sub_path);
+    if path.is_dir() {
+        return Err(format!("import subpath is not a file: {}", path.display()));
+    }
+    canonicalize_existing(&path)
+        .ok_or_else(|| format!("import not found: {}", path.display()))
+}
+
+/// Resolve one registry dependency.
+/// Returns (unpacked path, content tree sha256, archive sha256, fetch URL).
 pub fn resolve_registry_dep(
     index_url: &str,
     cache_root: &Path,
     name: &str,
     version: &str,
     require_registry_sha256: bool,
-) -> Result<(PathBuf, String, String), String> {
+) -> Result<(PathBuf, String, String, String), String> {
     let index_bytes = fetch_url(index_url)?;
     let index = parse_registry_index(&index_bytes)?;
     let releases = index
@@ -282,21 +588,25 @@ pub fn resolve_registry_dep(
             name, version
         ));
     }
-    let tarball_bytes = fetch_url(&release.url)?;
-    let sha256 = hex::encode(Sha256::digest(&tarball_bytes));
+    let release_fetch_url = resolve_registry_release_url(index_url, &release.url);
+    let tarball_bytes = fetch_url(&release_fetch_url)?;
+    verify_tarball_hmac_sidecar(&release_fetch_url, &tarball_bytes)?;
+    let archive_sha256 = hex::encode(Sha256::digest(&tarball_bytes));
     if let Some(ref expected) = release.sha256 {
-        if !expected.eq_ignore_ascii_case(&sha256) {
+        if !expected.eq_ignore_ascii_case(&archive_sha256) {
             return Err(format!(
                 "registry: checksum mismatch for {} {}: expected {} got {}",
-                name, version, expected, sha256
+                name, version, expected, archive_sha256
             ));
         }
     }
-    let cache_entry = cache_root.join(&sha256);
-    if !cache_entry.exists() {
+    let cache_entry = cache_root.join(&archive_sha256);
+    if !cache_entry.is_dir() {
         unpack_tarball_gz(&tarball_bytes, &cache_entry)?;
     }
-    Ok((cache_entry, sha256, release.url.clone()))
+    validate_package_tree(&cache_entry)?;
+    let content_sha256 = hash_dir(&cache_entry)?;
+    Ok((cache_entry, content_sha256, archive_sha256, release_fetch_url))
 }
 
 /// Fetch and install a single registry package into the cache.
@@ -308,7 +618,7 @@ pub fn fetch_and_install_package(
     cache_dir: &Path,
     require_sha: bool,
 ) -> Result<(String, PathBuf), String> {
-    let (path, _sha256, _url) =
+    let (path, _content_sha, _archive_sha, _url) =
         resolve_registry_dep(registry_url, cache_dir, name, version, require_sha)?;
     Ok((version.to_string(), path))
 }
@@ -379,36 +689,45 @@ pub fn generate_lockfile_with_registry(
         std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8".to_string())?,
     )?;
 
-    let mut deps = std::collections::HashMap::<String, LockedDep>::new();
+    let mut deps = std::collections::BTreeMap::<String, LockedDep>::new();
     let cache_root_path = cache_root(Some(manifest_dir));
 
     for (name, spec) in man.dependencies.iter() {
         if name.starts_with('@') || spec.git().is_some() {
-            // Registry or git dependency
-            let version = spec.version_str().unwrap_or("");
-            if version.is_empty() {
-                return Err(format!(
-                    "dependency '{}' requires a version string",
-                    name
-                ));
-            }
-            if let Some(_git_url) = spec.git() {
-                // AUDIT NOTE #21: Git dependencies are NOT yet implemented.
-                // Recording a stub with an empty SHA256 provides no integrity
-                // guarantee. We now return an error instead of silently creating
-                // a lockfile entry that looks like a real resolved dependency.
-                return Err(format!(
-                    "dependency {:?} specifies a git URL but git dependencies are not                      yet supported. Use a local path dependency or a registry package.",
-                    name
-                ));
+            if let Some(git_url) = spec.git() {
+                let rev = spec.rev().ok_or_else(|| {
+                    format!("git dependency '{name}' requires a pinned rev in pblang.toml")
+                })?;
+                let (dep_root, content_hash, resolved) =
+                    resolve_git_dep(git_url, rev, &cache_root_path)?;
+                deps.insert(
+                    name.clone(),
+                    LockedDep {
+                        path: dep_root.to_string_lossy().to_string(),
+                        sha256: content_hash,
+                        name: Some(name.clone()),
+                        version: None,
+                        source: Some("git".to_string()),
+                        resolved: Some(resolved),
+                        fetch_url: None,
+                        archive_sha256: None,
+                    },
+                );
             } else {
+                let version = spec.version_str().unwrap_or("");
+                if version.is_empty() {
+                    return Err(format!(
+                        "dependency '{}' requires a version string",
+                        name
+                    ));
+                }
                 let index_url = registry_index_url.ok_or_else(|| {
                     format!(
                         "registry dep '{}' requires PBLANG_REGISTRY_INDEX to be set",
                         name
                     )
                 })?;
-                let (dep_root, dep_hash, resolved_url) = resolve_registry_dep(
+                let (dep_root, content_hash, archive_hash, fetch_url) = resolve_registry_dep(
                     index_url,
                     &cache_root_path,
                     name,
@@ -419,12 +738,13 @@ pub fn generate_lockfile_with_registry(
                     name.clone(),
                     LockedDep {
                         path: dep_root.to_string_lossy().to_string(),
-                        sha256: dep_hash.clone(),
+                        sha256: content_hash,
                         name: Some(name.clone()),
                         version: Some(version.to_string()),
                         source: Some("registry".to_string()),
-                        resolved: Some(resolved_url.clone()),
-                        fetch_url: Some(resolved_url),
+                        resolved: Some(fetch_url.clone()),
+                        fetch_url: Some(fetch_url),
+                        archive_sha256: Some(archive_hash),
                     },
                 );
             }
@@ -446,6 +766,7 @@ pub fn generate_lockfile_with_registry(
                     source: None,
                     resolved: None,
                     fetch_url: None,
+                    archive_sha256: None,
                 },
             );
         }
@@ -533,7 +854,7 @@ pub fn resolve_import(
                                     return Err("pblang.lock is out of date (manifest has changed). Run `pblang install` to regenerate the lockfile.".to_string());
                                 }
                                 if let Some(dep) = lock.dependencies.get(pkg) {
-                                    dep_root = canonicalize_existing(Path::new(&dep.path));
+                                    dep_root = Some(resolve_dependency_root(&man_dir, pkg, dep)?);
                                 }
                             }
                             Err(e) => {
@@ -554,14 +875,52 @@ pub fn resolve_import(
                     .dependencies
                     .get(pkg)
                     .ok_or_else(|| format!("unknown dependency '{pkg}'"))?;
+                if dep.git().is_some() {
+                    return Err(format!(
+                        "dependency '{pkg}' is not installed; run `pblang install` first"
+                    ));
+                }
                 let rel = dep
                     .path()
                     .ok_or_else(|| format!("dependency '{pkg}' has no path"))?;
-                man_dir.join(rel)
+                let root = man_dir.join(rel);
+                let root = canonicalize_existing(&root)
+                    .ok_or_else(|| format!("dependency path not found: {}", root.display()))?;
+                verify_package_tree_for_path_dep(&root)?;
+                root
             };
-            let path = dep_root.join(sub);
-            return canonicalize_existing(&path)
-                .ok_or_else(|| format!("import not found: {}", path.display()));
+            return resolve_package_subpath(&dep_root, sub);
+        }
+    }
+
+    // 1b) bare locked package name: import("@scope/pkg") or import("gitdep")
+    {
+        let base = base_dir.unwrap_or(cwd);
+        if let Some(man_dir) = find_manifest_dir(base) {
+            let man_path = man_dir.join("pblang.toml");
+            let lock_path = man_dir.join("pblang.lock");
+            if man_path.is_file() && lock_path.is_file() {
+                if let (Ok(man_bytes), Ok(lock_bytes)) =
+                    (std::fs::read(&man_path), std::fs::read(&lock_path))
+                {
+                    if let (Ok(man_str), Ok(lock_str)) = (
+                        std::str::from_utf8(&man_bytes),
+                        std::str::from_utf8(&lock_bytes),
+                    ) {
+                        if parse_manifest(man_str).is_ok() {
+                            if let Ok(lock) = parse_lockfile(lock_str) {
+                                if lock.manifest_sha256 == manifest_sha256(&man_bytes) {
+                                    if let Some(dep) = lock.dependencies.get(import_str) {
+                                        let root =
+                                            resolve_dependency_root(&man_dir, import_str, dep)?;
+                                        return resolve_package_entry_in_dir(&root);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -602,10 +961,15 @@ pub fn resolve_import(
     Err(format!("import not found: {import_str}"))
 }
 
-/// Build .tar.gz bytes of a package directory (excludes target/ and dotfiles).
-pub fn create_package_tarball(package_dir: &Path) -> Result<Vec<u8>, String> {
-    let mut entries = vec![];
-    collect_files(package_dir, package_dir, &mut entries)?;
+fn tarball_mode_for_rel(rel: &str) -> u32 {
+    if rel == "bin/pblang" || rel == "bin/pblang.exe" {
+        0o755
+    } else {
+        0o644
+    }
+}
+
+fn build_tarball_bytes(mut entries: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, String> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = vec![];
@@ -613,20 +977,73 @@ pub fn create_package_tarball(package_dir: &Path) -> Result<Vec<u8>, String> {
     let mut tar_builder = tar::Builder::new(&mut enc);
     for (rel, bytes) in entries {
         let mut header = tar::Header::new_gnu();
-        header.set_path(&rel).map_err(|e| format!("tar path {}: {e}", rel))?;
+        header
+            .set_path(&rel)
+            .map_err(|e| format!("tar path {}: {e}", rel))?;
         header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(tarball_mode_for_rel(&rel));
         header.set_cksum();
-        tar_builder.append(&header, bytes.as_slice()).map_err(|e| format!("tar append: {e}"))?;
+        tar_builder
+            .append(&header, bytes.as_slice())
+            .map_err(|e| format!("tar append: {e}"))?;
     }
-    tar_builder.finish().map_err(|e| format!("tar finish: {e}"))?;
+    tar_builder
+        .finish()
+        .map_err(|e| format!("tar finish: {e}"))?;
     drop(tar_builder);
     enc.finish().map_err(|e| format!("gzip finish: {e}"))?;
     Ok(out)
 }
 
+/// Build .tar.gz bytes of a package directory (excludes target/ and dotfiles).
+pub fn create_package_tarball(package_dir: &Path) -> Result<Vec<u8>, String> {
+    let mut entries = vec![];
+    collect_files(package_dir, package_dir, &mut entries)?;
+    build_tarball_bytes(entries)
+}
+
+/// Like [`create_package_tarball`], but embeds the pblang runtime at `bin/pblang` (or `bin/pblang.exe`).
+/// Used by self-extracting bundles so end users do not need `pblang` on `PATH`.
+pub fn create_package_tarball_with_runtime(
+    package_dir: &Path,
+    runtime_exe: &Path,
+) -> Result<Vec<u8>, String> {
+    let mut entries = vec![];
+    collect_files(package_dir, package_dir, &mut entries)?;
+    let rel = if cfg!(windows) {
+        "bin/pblang.exe".to_string()
+    } else {
+        "bin/pblang".to_string()
+    };
+    let bytes = std::fs::read(runtime_exe).map_err(|e| {
+        format!(
+            "read runtime executable '{}': {e}",
+            runtime_exe.display()
+        )
+    })?;
+    entries.push((rel, bytes));
+    build_tarball_bytes(entries)
+}
+
+fn validate_publish_package(package_dir: &Path) -> Result<(), String> {
+    let man_path = package_dir.join("pblang.toml");
+    let man_bytes = std::fs::read(&man_path)
+        .map_err(|e| format!("read manifest {}: {e}", man_path.display()))?;
+    let man = parse_manifest(
+        std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?,
+    )?;
+    if !man.dependencies.is_empty() {
+        return Err(
+            "publish: registry packages must be self-contained packages (no [dependencies])"
+                .to_string(),
+        );
+    }
+    validate_package_tree(package_dir)
+}
+
 /// Publish to a local file-based registry directory.
 pub fn publish_to_registry_dir(package_dir: &Path, registry_dir: &Path) -> Result<(), String> {
+    validate_publish_package(package_dir)?;
     let man_path = package_dir.join("pblang.toml");
     let man_bytes = std::fs::read(&man_path)
         .map_err(|e| format!("read manifest {}: {e}", man_path.display()))?;
@@ -676,6 +1093,17 @@ pub fn publish_to_registry_dir(package_dir: &Path, registry_dir: &Path) -> Resul
     let versions = pkg_entry
         .as_object_mut()
         .ok_or_else(|| "index: package entry not object".to_string())?;
+    if let Some(existing) = versions.get(version) {
+        let existing_sha = existing
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !existing_sha.is_empty() && !existing_sha.eq_ignore_ascii_case(&sha256) {
+            return Err(format!(
+                "publish: version {version} already exists in registry with different content"
+            ));
+        }
+    }
     versions.insert(
         version.to_string(),
         serde_json::json!({ "url": url, "sha256": sha256 }),
@@ -694,6 +1122,7 @@ pub fn publish_to_registry_dir(package_dir: &Path, registry_dir: &Path) -> Resul
 /// calls [`refresh_access_token`] and retries the publish exactly once with
 /// the new token.  A successful retry prints `Refreshed token and retried`.
 pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> Result<(), String> {
+    validate_publish_package(package_dir)?;
     let tarball = create_package_tarball(package_dir)?;
     let b64 = base64_encode(&tarball);
     let man_path = package_dir.join("pblang.toml");
@@ -769,6 +1198,30 @@ fn refresh_access_token(registry_url: &str, refresh_token: &str) -> Result<Strin
 
 /// Search a registry for packages matching `query`.
 pub fn search_registry(registry_url: &str, query: &str) -> Result<Vec<SearchResult>, String> {
+    if registry_url.starts_with("file://") {
+        let path = registry_url.strip_prefix("file://").unwrap();
+        let index_path = Path::new(path).join("index.json");
+        let bytes = std::fs::read(&index_path)
+            .map_err(|e| format!("read index {}: {e}", index_path.display()))?;
+        let index = parse_registry_index(&bytes)?;
+        let needle = query.to_lowercase();
+        let mut results = Vec::new();
+        for (name, versions) in index {
+            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            for version in versions.keys() {
+                results.push(SearchResult {
+                    name: name.clone(),
+                    version: version.clone(),
+                    description: String::new(),
+                });
+            }
+        }
+        results.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+        return Ok(results);
+    }
+
     let url = format!(
         "{}/search?q={}",
         registry_url.trim_end_matches('/'),
@@ -990,12 +1443,15 @@ mod tests {
             let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
             let mut tar_builder = tar::Builder::new(&mut enc);
             let lib_content = b"export fn id(x) { return x; }";
-            let mut header = tar::Header::new_gnu();
-            header.set_path("lib.sapp").unwrap();
-            header.set_size(lib_content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            tar_builder.append(&header, lib_content as &[u8]).unwrap();
+            let manifest = b"[package]\nname = \"test\"\nversion = \"1.0.0\"\n\n[dependencies]\n";
+            for (path, content) in [("lib.sapp", lib_content.as_slice()), ("pblang.toml", manifest.as_slice())] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar_builder.append(&header, content).unwrap();
+            }
             tar_builder.finish().unwrap();
             drop(tar_builder);
             enc.finish().unwrap();
@@ -1052,16 +1508,19 @@ version = "0.1.0"
     fn make_tarball_and_sha256(temp: &Path) -> (std::path::PathBuf, String, String) {
         let tarball_path = temp.join("pkg-1.0.0.tar.gz");
         let lib_content = b"export fn id(x) { return x; }";
+        let manifest = b"[package]\nname = \"test\"\nversion = \"1.0.0\"\n\n[dependencies]\n";
         {
             let f = std::fs::File::create(&tarball_path).unwrap();
             let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
             let mut tar_builder = tar::Builder::new(&mut enc);
-            let mut header = tar::Header::new_gnu();
-            header.set_path("lib.sapp").unwrap();
-            header.set_size(lib_content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            tar_builder.append(&header, lib_content as &[u8]).unwrap();
+            for (path, content) in [("lib.sapp", lib_content.as_slice()), ("pblang.toml", manifest.as_slice())] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar_builder.append(&header, content).unwrap();
+            }
             tar_builder.finish().unwrap();
             drop(tar_builder);
             enc.finish().unwrap();
@@ -1128,8 +1587,9 @@ version = "0.1.0"
         );
         let cache = temp.join("cache");
         let r = resolve_registry_dep(&index_url, &cache, "@pblang/ok", "1.0.0", false);
-        let (path, resolved_sha, _url) = r.expect("resolve should succeed with correct sha256");
-        assert_eq!(resolved_sha, sha256);
+        let (path, _content_sha, archive_sha, _url) =
+            r.expect("resolve should succeed with correct sha256");
+        assert_eq!(archive_sha, sha256);
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&temp);
     }
@@ -1198,6 +1658,42 @@ version = "0.1.0"
         let h = compute_tarball_hmac(b"hello world", b"secret");
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn lockfile_generation_is_reproducible_for_path_deps() {
+        let tmp = std::env::temp_dir().join("pblang_lockfile_repro");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(tmp.join("dep")).unwrap();
+        std::fs::write(
+            tmp.join("pblang.toml"),
+            r#"[package]
+name = "repro"
+version = "0.1.0"
+
+[dependencies]
+"dep" = { path = "./dep" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.join("dep").join("lib.sapp"), "export fn x() { return 1; }\n")
+            .unwrap();
+        let lock1 = generate_lockfile(&tmp).expect("lock1");
+        let lock2 = generate_lockfile(&tmp).expect("lock2");
+        let s1 = write_lockfile(&lock1).expect("write1");
+        let s2 = write_lockfile(&lock2).expect("write2");
+        assert_eq!(s1, s2, "lockfile output should be deterministic");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_registry_release_url_supports_relative_paths() {
+        let base = "file:///tmp/registry/index.json";
+        assert_eq!(
+            resolve_registry_release_url(base, "pkg-1.0.0.tar.gz"),
+            "file:///tmp/registry/pkg-1.0.0.tar.gz"
+        );
     }
 
     #[test]

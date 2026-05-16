@@ -1,4 +1,5 @@
 use pblang_compiler::{compile, disasm};
+
 use pblang_core::{
     parse, parse_with_polyglot, Expr, ExprKind, MatchArm, Span, Stmt, StmtKind, TypeExpr, TypeKind,
 };
@@ -75,8 +76,12 @@ fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
                 ));
             }
             // Double-check: re-canonicalize to detect any symlink swap (best effort).
-            let re_resolved = resolved.canonicalize()
-                .map_err(|e| format!("package entry disappeared after validation '{}': {e}", resolved.display()))?;
+            let re_resolved = resolved.canonicalize().map_err(|e| {
+                format!(
+                    "package entry disappeared after validation '{}': {e}",
+                    resolved.display()
+                )
+            })?;
             if re_resolved != resolved {
                 return Err(format!(
                     "package entry changed between checks (possible symlink swap): {}",
@@ -252,7 +257,7 @@ fn show_help() {
     println!("  pblang --dump-bytecode <file>   Compile file and print bytecode (disassembly) for debugging / reverse engineering");
     println!("  pblang --annotate <file>   Compile file and print annotated bytecode (source line + instruction side-by-side)");
     println!("  pblang --symbols <file>    Print a simple symbol table for top-level functions and globals (name, arity, bytecode offset)");
-    println!("  pblang lsp             Start JSON-RPC LSP server on stdin/stdout (experimental, L2-delta stub)");
+    println!("  pblang lsp             Start LSP server on stdin/stdout (parse/typecheck diagnostics, hover, goto-def)");
     println!();
 
     println!("Language quick tour (examples):");
@@ -971,6 +976,14 @@ fn walk_stmts_for_cg(stmts: &[Stmt], graph: &mut CallGraph, current_fn: &mut Str
                 collect_calls_from_expr(count, graph, current_fn);
                 walk_stmts_for_cg(body, graph, current_fn);
             }
+            StmtKind::ForIn(_, col, body) => {
+                collect_calls_from_expr(col, graph, current_fn);
+                walk_stmts_for_cg(body, graph, current_fn);
+            }
+            StmtKind::ForInKV(_, _, col, body) => {
+                collect_calls_from_expr(col, graph, current_fn);
+                walk_stmts_for_cg(body, graph, current_fn);
+            }
             StmtKind::Print(e) | StmtKind::PrintF(_, e) => {
                 graph
                     .entry(current_fn.clone())
@@ -1140,6 +1153,22 @@ fn walk_stmts_for_dataflow(
                 walk_expr_for_dataflow(count_expr, src, defs, uses);
                 walk_stmts_for_dataflow(body, src, defs, uses);
             }
+            StmtKind::ForIn(var, col_expr, body) => {
+                let (line, _) = line_col(src, stmt.span.start);
+                defs.entry(var.clone())
+                    .or_insert(VarDefInfo { line, used: false });
+                walk_expr_for_dataflow(col_expr, src, defs, uses);
+                walk_stmts_for_dataflow(body, src, defs, uses);
+            }
+            StmtKind::ForInKV(k, v, col_expr, body) => {
+                let (line, _) = line_col(src, stmt.span.start);
+                defs.entry(k.clone())
+                    .or_insert(VarDefInfo { line, used: false });
+                defs.entry(v.clone())
+                    .or_insert(VarDefInfo { line, used: false });
+                walk_expr_for_dataflow(col_expr, src, defs, uses);
+                walk_stmts_for_dataflow(body, src, defs, uses);
+            }
             StmtKind::Expr(e)
             | StmtKind::Print(e)
             | StmtKind::PrintF(_, e)
@@ -1161,7 +1190,7 @@ fn walk_stmts_for_dataflow(
             StmtKind::Fn(_, _params, _ret, body) => {
                 walk_stmts_for_dataflow(body, src, defs, uses);
             }
-            StmtKind::Block(body) => {
+            StmtKind::Block(body) | StmtKind::Seq(body) => {
                 walk_stmts_for_dataflow(body, src, defs, uses);
             }
             StmtKind::SetIndex(target, index, value) => {
@@ -1180,6 +1209,14 @@ fn walk_stmts_for_dataflow(
                 defs.entry(name.clone())
                     .or_insert(VarDefInfo { line, used: false });
                 walk_expr_for_dataflow(expr, src, defs, uses);
+            }
+            // New control flow
+            StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Throw(e) => {
+                walk_expr_for_dataflow(e, src, defs, uses);
+            }
+            StmtKind::Loop(body) => {
+                walk_stmts_for_dataflow(body, src, defs, uses);
             }
         }
     }
@@ -1232,6 +1269,11 @@ fn walk_expr_for_dataflow(
                 walk_expr_for_dataflow(t, src, defs, uses);
             }
         }
+        ExprKind::IfExpr(cond, then_br, else_br) => {
+            walk_expr_for_dataflow(cond, src, defs, uses);
+            walk_expr_for_dataflow(then_br, src, defs, uses);
+            walk_expr_for_dataflow(else_br, src, defs, uses);
+        }
         ExprKind::Add(l, r)
         | ExprKind::Sub(l, r)
         | ExprKind::Mul(l, r)
@@ -1282,6 +1324,18 @@ fn walk_expr_for_dataflow(
             walk_expr_for_dataflow(idx, src, defs, uses);
         }
         ExprKind::ResultUnwrap(inner) => walk_expr_for_dataflow(inner, src, defs, uses),
+        // New expression kinds
+        ExprKind::NullCoalesce(a, b) | ExprKind::Pow(a, b) | ExprKind::Mod(a, b) => {
+            walk_expr_for_dataflow(a, src, defs, uses);
+            walk_expr_for_dataflow(b, src, defs, uses);
+        }
+        ExprKind::FString(parts) => {
+            for part in parts {
+                if let pblang_core::FStringPart::Interp(e) = part {
+                    walk_expr_for_dataflow(e, src, defs, uses);
+                }
+            }
+        }
     }
 }
 
@@ -1317,509 +1371,7 @@ fn print_annotated_disasm(chunk: &Chunk, src: &str) {
     }
 }
 
-// ── LSP server (L3-beta: scope-aware completion) ────────────────────────
-
-#[derive(Clone)]
-struct LocalDecl {
-    name: String,
-    line: u32,
-    col: u32,
-    is_fn: bool,
-}
-
-fn take_ident_prefix(s: &str) -> Option<&str> {
-    let mut end = 0usize;
-    for (i, ch) in s.char_indices() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            end = i + ch.len_utf8();
-        } else if end > 0 {
-            break;
-        } else {
-            return None;
-        }
-    }
-    if end == 0 {
-        return None;
-    }
-    Some(&s[..end])
-}
-
-fn collect_local_decls(src: &str) -> Vec<LocalDecl> {
-    let mut out = Vec::new();
-    for (line_idx, line) in src.lines().enumerate() {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if let Some(rel) = trimmed.find("fn ") {
-            let after_fn = indent + rel + 3;
-            let rest_slice = &line[after_fn..];
-            let dt = rest_slice.trim_start();
-            let name_start = after_fn + (rest_slice.len() - dt.len());
-            if let Some(name) = take_ident_prefix(dt) {
-                out.push(LocalDecl {
-                    name: name.to_string(),
-                    line: line_idx as u32,
-                    col: name_start as u32,
-                    is_fn: true,
-                });
-            }
-        }
-        if let Some(rel) = trimmed.find("let ") {
-            let after_let = indent + rel + 4;
-            let rest_slice = &line[after_let..];
-            let dt = rest_slice.trim_start();
-            let name_start = after_let + (rest_slice.len() - dt.len());
-            if let Some(name) = take_ident_prefix(dt) {
-                out.push(LocalDecl {
-                    name: name.to_string(),
-                    line: line_idx as u32,
-                    col: name_start as u32,
-                    is_fn: false,
-                });
-            }
-        }
-    }
-    out
-}
-
-fn collect_local_names(src: &str) -> Vec<String> {
-    use std::collections::HashSet;
-    let set: HashSet<String> = collect_local_decls(src)
-        .into_iter()
-        .map(|d| d.name)
-        .collect();
-    let mut names: Vec<String> = set.into_iter().collect();
-    names.sort();
-    names
-}
-
-fn lsp_ident_byte_at(line: &str, character: u32) -> Option<String> {
-    let bytes = line.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let col = (character as usize).min(bytes.len());
-    let mut idx = col;
-    if idx >= bytes.len() {
-        idx = bytes.len() - 1;
-    } else if idx > 0 && !bytes[idx].is_ascii_alphanumeric() && bytes[idx] != b'_' {
-        idx -= 1;
-    }
-    if !(bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_') {
-        return None;
-    }
-    let mut start = idx;
-    while start > 0 {
-        let b = bytes[start - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
-    let mut end = idx + 1;
-    while end < bytes.len() {
-        let b = bytes[end];
-        if b.is_ascii_alphanumeric() || b == b'_' {
-            end += 1;
-        } else {
-            break;
-        }
-    }
-    line.get(start..end).map(|s| s.to_string())
-}
-
-fn lsp_parse_td_position(body: &str) -> Option<(String, u32, u32)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let params = v.get("params")?;
-    let uri = params
-        .get("textDocument")?
-        .get("uri")?
-        .as_str()?
-        .to_string();
-    let pos = params.get("position")?;
-    let line = u32::try_from(pos.get("line")?.as_u64()?).ok()?;
-    let character = u32::try_from(pos.get("character")?.as_u64()?).ok()?;
-    Some((uri, line, character))
-}
-
-fn lsp_did_open_uri_and_text(body: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let td = v.get("params")?.get("textDocument")?;
-    let uri = td.get("uri")?.as_str()?.to_string();
-    let text = td.get("text")?.as_str()?.to_string();
-    Some((uri, text))
-}
-
-fn lsp_did_change_uri_and_text(body: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let params = v.get("params")?;
-    let uri = params
-        .get("textDocument")?
-        .get("uri")?
-        .as_str()?
-        .to_string();
-    let text = params
-        .get("contentChanges")?
-        .as_array()?
-        .first()?
-        .get("text")?
-        .as_str()?
-        .to_string();
-    Some((uri, text))
-}
-
-fn run_lsp_server() {
-    use std::collections::HashMap;
-    use std::io::{BufRead, BufReader, Read, Write};
-
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = stdout.lock();
-
-    let builtin_completions: Vec<&str> = vec![
-        // core
-        "print", "printf", "len", "type", "str",
-        "parsenumber", "parsebool", "read_line",
-        // array
-        "array_push", "array_pop", "array_sort",
-        // map
-        "map_keys", "map_has", "map_remove",
-        // number
-        "num_sqrt", "num_pow", "num_abs", "num_max", "num_min",
-        "num_floor", "num_ceil", "num_mod", "num_ln", "num_exp",
-        "num_atan2",
-        // random
-        "random_bytes", "random_float",
-        // string
-        "str_contains", "str_starts_with", "str_ends_with",
-        "str_trim", "str_split", "str_slice", "str_index_of",
-        "str_lower", "str_upper", "strfromcharcode", "strcharcodeat",
-        // json / crypto
-        "json_parse", "json_stringify",
-        "sha256", "base64_encode", "base64_decode", "constant_time_eq",
-        // http
-        "http_get", "http_post", "http_post_auth",
-        // fs
-        "fs_read", "fs_write", "fs_append", "fs_exists", "fs_remove",
-        "fs_list_dir", "fs_mkdirs", "fs_rename", "fs_copy",
-        "fs_read_bytes", "fs_write_bytes",
-        "cwd", "path_join", "path_dirname", "path_basename",
-        // net
-        "tcp_listen", "tcp_accept", "tcp_read", "tcp_write",
-        "tcp_close", "tcp_set_timeout",
-        // sqlite
-        "sqlite_open", "sqlite_exec", "sqlite_query", "sqlite_close",
-        "sqlite_last_insert_rowid",
-        // ffi
-        "ffi_load", "ffi_call", "ffi_close",
-        // concurrency
-        "spawn", "join", "channel", "send", "recv",
-        "channel_close", "channel_is_closed", "select",
-        // timing / misc
-        "clock", "now_ms", "now_iso", "sleep_ms",
-        "gc_stats", "gc_collect",
-        "env_get", "env_set", "exec",
-        // os
-        "import",
-        "print",
-        // kept for compat
-        "parsenumber",
-        "arraypush",
-        "arraypop",
-        "mapkeys",
-        "maphas",
-        "mapremove",
-        "jsonparse",
-        "jsonstringify",
-        "httpget",
-        "httppost",
-        "fsread",
-        "fswrite",
-        "fsexists",
-        "fsmkdirs",
-        "fslistdir",
-        "sha256",
-        "base64encode",
-        "base64decode",
-        "clock",
-        "randombytes",
-        "import",
-        "export",
-    ];
-
-    let mut open_files: HashMap<String, String> = HashMap::new();
-
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).unwrap_or(0) == 0 {
-            break;
-        }
-        let header = header.trim().to_string();
-        if header.is_empty() {
-            continue;
-        }
-        let content_length: usize = if let Some(rest) = header.strip_prefix("Content-Length: ") {
-            rest.trim().parse().unwrap_or(0)
-        } else {
-            continue;
-        };
-        let mut blank = String::new();
-        let _ = reader.read_line(&mut blank);
-        let mut body_bytes = vec![0u8; content_length];
-        if reader.read_exact(&mut body_bytes).is_err() {
-            break;
-        }
-        let body = String::from_utf8_lossy(&body_bytes).to_string();
-        let method = lsp_extract_str(&body, "method");
-        let id_val = lsp_extract_id(&body);
-        let response: Option<String> = match method.as_deref() {
-            Some("initialize") => Some(lsp_response(
-                id_val.as_deref(),
-                r#"{
-                "capabilities": {
-                    "completionProvider": { "triggerCharacters": [".", ":"] },
-                    "textDocumentSync": 1,
-                    "hoverProvider": true,
-                    "definitionProvider": true,
-                    "workspaceSymbolProvider": true
-                },
-                "serverInfo": { "name": "pblang-lsp", "version": "0.5.0-stub" }
-            }"#,
-            )),
-            Some("initialized") => None,
-            Some("textDocument/didOpen") => {
-                if let Some((uri, text)) = lsp_did_open_uri_and_text(&body) {
-                    open_files.insert(uri, text);
-                }
-                None
-            }
-            Some("textDocument/didChange") => {
-                if let Some((uri, text)) = lsp_did_change_uri_and_text(&body) {
-                    open_files.insert(uri, text);
-                } else if let Some(params_start) = body.find("\"params\"") {
-                    if let Some(text_key) = body[params_start..].rfind("\"text\"") {
-                        let after_text = &body[params_start + text_key + "\"text\"".len()..];
-                        if let Some(colon) = after_text.find(':') {
-                            let after_colon = after_text[colon + 1..].trim_start();
-                            if let Some(rest) = after_colon.strip_prefix('"') {
-                                if let Some(end_quote) = rest.find('"') {
-                                    let text = &rest[..end_quote];
-                                    let uri = if let Some(uri_key) =
-                                        body[params_start..].find("\"uri\"")
-                                    {
-                                        let after_uri =
-                                            &body[params_start + uri_key + "\"uri\"".len()..];
-                                        if let Some(colon2) = after_uri.find(':') {
-                                            let after_colon2 = after_uri[colon2 + 1..].trim_start();
-                                            if let Some(rest2) = after_colon2.strip_prefix('"') {
-                                                if let Some(end2) = rest2.find('"') {
-                                                    rest2[..end2].to_string()
-                                                } else {
-                                                    "".to_string()
-                                                }
-                                            } else {
-                                                "".to_string()
-                                            }
-                                        } else {
-                                            "".to_string()
-                                        }
-                                    } else {
-                                        "".to_string()
-                                    };
-                                    open_files.insert(uri, text.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            Some("workspace/symbol") => {
-                // Return all symbols from open files
-                let q_needle = "\"query\"";
-                let query = if let Some(q_pos) = body.find(q_needle) {
-                    let after = &body[q_pos + q_needle.len()..];
-                    if let Some(c) = after.find(':') {
-                        let v = after[c+1..].trim_start();
-                        if let Some(r) = v.strip_prefix('"') {
-                            r.split('"').next().unwrap_or("").to_string()
-                        } else { "".to_string() }
-                    } else { "".to_string() }
-                } else { "".to_string() };
-                let mut symbols: Vec<String> = Vec::new();
-                for (uri, src) in &open_files {
-                    for line in src.lines() {
-                        let line = line.trim();
-                        if let Some(rest) = line.strip_prefix("fn ") {
-                            if let Some(name_end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
-                                let name = &rest[..name_end];
-                                if query.is_empty() || name.contains(&query) {
-                                    let name_json = serde_json::to_string(name).unwrap_or_default();
-                                    let uri_json = serde_json::to_string(uri).unwrap_or_default();
-                                    symbols.push(format!(
-                                        "{{\"name\":{name_json},\"kind\":12,\"location\":{{\"uri\":{uri_json}}}}}"
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                let arr = format!("[{}]", symbols.join(","));
-                Some(lsp_response(id_val.as_deref(), &arr))
-            }
-            Some("textDocument/completion") => {
-                let mut items: Vec<String> = builtin_completions
-                    .iter()
-                    .map(|name| format!(r#"{{"label":"{}","kind":3,"detail":"builtin"}}"#, name))
-                    .collect();
-                if let Some(params_start) = body.find("\"params\"") {
-                    if let Some(uri_key) = body[params_start..].find("\"uri\"") {
-                        let after_uri = &body[params_start + uri_key + "\"uri\"".len()..];
-                        if let Some(colon) = after_uri.find(':') {
-                            let after_colon = after_uri[colon + 1..].trim_start();
-                            if let Some(rest) = after_colon.strip_prefix('"') {
-                                if let Some(end) = rest.find('"') {
-                                    let uri = &rest[..end];
-                                    if let Some(src) = open_files.get(uri) {
-                                        for name in collect_local_names(src) {
-                                            items.push(format!(
-                                                r#"{{"label":"{}","kind":3,"detail":"local"}}"#,
-                                                name
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let items_json = format!("[{}]", items.join(","));
-                Some(lsp_response(
-                    id_val.as_deref(),
-                    &format!(r#"{{"isIncomplete":false,"items":{}}}"#, items_json),
-                ))
-            }
-            Some("textDocument/hover") => {
-                let resp = if let Some((uri, line, character)) = lsp_parse_td_position(&body) {
-                    if let Some(src) = open_files.get(&uri) {
-                        let lines: Vec<&str> = src.lines().collect();
-                        let line_str = lines.get(line as usize).copied().unwrap_or("");
-                        if let Some(word) = lsp_ident_byte_at(line_str, character) {
-                            if builtin_completions.contains(&word.as_str()) {
-                                let detail = serde_json::json!({
-                                    "contents": {
-                                        "kind": "markdown",
-                                        "value": format!("`{}` — **builtin**", word)
-                                    }
-                                });
-                                Some(lsp_response(id_val.as_deref(), &detail.to_string()))
-                            } else {
-                                let decl = collect_local_decls(src)
-                                    .into_iter()
-                                    .find(|d| d.name == word);
-                                if let Some(d) = decl {
-                                    let kind = if d.is_fn { "local fn" } else { "local let" };
-                                    let detail = serde_json::json!({
-                                        "contents": {
-                                            "kind": "markdown",
-                                            "value": format!("`{}` — **{}**", word, kind)
-                                        }
-                                    });
-                                    Some(lsp_response(id_val.as_deref(), &detail.to_string()))
-                                } else {
-                                    Some(lsp_response(id_val.as_deref(), "null"))
-                                }
-                            }
-                        } else {
-                            Some(lsp_response(id_val.as_deref(), "null"))
-                        }
-                    } else {
-                        Some(lsp_response(id_val.as_deref(), "null"))
-                    }
-                } else {
-                    Some(lsp_response(id_val.as_deref(), "null"))
-                };
-                resp
-            }
-            Some("textDocument/definition") => {
-                let resp = if let Some((uri, line, character)) = lsp_parse_td_position(&body) {
-                    if let Some(src) = open_files.get(&uri) {
-                        let lines: Vec<&str> = src.lines().collect();
-                        let line_str = lines.get(line as usize).copied().unwrap_or("");
-                        if let Some(word) = lsp_ident_byte_at(line_str, character) {
-                            let decl = collect_local_decls(src)
-                                .into_iter()
-                                .find(|d| d.name == word);
-                            if let Some(d) = decl {
-                                let name_len = d.name.len() as u32;
-                                let detail = serde_json::json!([{
-                                    "uri": uri,
-                                    "range": {
-                                        "start": { "line": d.line, "character": d.col },
-                                        "end": { "line": d.line, "character": d.col + name_len }
-                                    }
-                                }]);
-                                Some(lsp_response(id_val.as_deref(), &detail.to_string()))
-                            } else {
-                                Some(lsp_response(id_val.as_deref(), "null"))
-                            }
-                        } else {
-                            Some(lsp_response(id_val.as_deref(), "null"))
-                        }
-                    } else {
-                        Some(lsp_response(id_val.as_deref(), "null"))
-                    }
-                } else {
-                    Some(lsp_response(id_val.as_deref(), "null"))
-                };
-                resp
-            }
-            Some("shutdown") => Some(lsp_response(id_val.as_deref(), "null")),
-            Some("exit") => break,
-            _ => None,
-        };
-        if let Some(resp) = response {
-            let msg = format!("Content-Length: {}\r\n\r\n{}", resp.len(), resp);
-            let _ = writer.write_all(msg.as_bytes());
-            let _ = writer.flush();
-        }
-    }
-}
-
-fn lsp_response(id: Option<&str>, result_json: &str) -> String {
-    let id_part = id.unwrap_or("null");
-    format!(
-        r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#,
-        id_part, result_json
-    )
-}
-
-fn lsp_extract_str(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\"", key);
-    let pos = json.find(&needle)?;
-    let after = json[pos + needle.len()..].trim_start();
-    let after = after.strip_prefix(':')?.trim_start();
-    let after = after.strip_prefix('"')?;
-    let end = after.find('"')?;
-    Some(after[..end].to_string())
-}
-
-fn lsp_extract_id(json: &str) -> Option<String> {
-    let needle = "\"id\"";
-    let pos = json.find(needle)?;
-    let after = json[pos + needle.len()..].trim_start();
-    let after = after.strip_prefix(':')?.trim_start();
-    if let Some(inner) = after.strip_prefix('"') {
-        let end = inner.find('"')?;
-        Some(format!("\"{}\"", &inner[..end]))
-    } else {
-        let end = after
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after.len());
-        Some(after[..end].to_string())
-    }
-}
+// LSP: see `pblang lsp` → `pblang_lsp::run_stdio_server()` (tower-lsp + parse/typecheck).
 
 const DEFAULT_MANIFEST: &str = r#"[package]
 name = "my-app"
@@ -2657,8 +2209,85 @@ fn main() {
                 man_dir.join(exe_name)
             };
 
-            // Create tarball of the package
-            let tarball_bytes = pblang_pm::create_package_tarball(&man_dir).unwrap_or_else(|e| {
+            // Find current pblang executable (to embed as bin/pblang in the tarball)
+            let current_exe = std::env::current_exe().expect("cannot read current executable path");
+
+            // Create a temp staging directory that includes:
+            //   - all package files (source, manifest, lockfile)
+            //   - bin/pblang (or bin/pblang.exe) — the embedded runtime
+            let staging = std::env::temp_dir().join(format!(
+                "pblang-self-extract-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&staging).unwrap_or_else(|e| {
+                eprintln!(
+                    "pblang bundle --self-extract: cannot create staging dir: {}",
+                    e
+                );
+                std::process::exit(1);
+            });
+
+            // Copy package files into staging
+            for entry in walkdir::WalkDir::new(&man_dir)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| {
+                    let name = e.file_name().to_string_lossy();
+                    if e.file_type().is_dir() {
+                        name != "target" && name != ".git" && !name.starts_with('.')
+                    } else {
+                        true
+                    }
+                })
+            {
+                let entry = entry.unwrap_or_else(|e| {
+                    eprintln!("pblang bundle --self-extract: walk error: {}", e);
+                    std::process::exit(1);
+                });
+                let rel = entry.path().strip_prefix(&man_dir).unwrap();
+                let dest = staging.join(rel);
+                if entry.file_type().is_dir() {
+                    let _ = std::fs::create_dir_all(&dest);
+                } else if entry.file_type().is_file() {
+                    if let Some(parent) = dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::copy(entry.path(), &dest);
+                }
+            }
+
+            // Embed pblang runtime at bin/pblang
+            let bin_dir = staging.join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap_or_else(|e| {
+                eprintln!("pblang bundle --self-extract: cannot create bin dir: {}", e);
+                std::process::exit(1);
+            });
+            let runtime_name = if cfg!(target_os = "windows") {
+                "pblang.exe"
+            } else {
+                "pblang"
+            };
+            let dest_runtime = bin_dir.join(runtime_name);
+            std::fs::copy(&current_exe, &dest_runtime).unwrap_or_else(|e| {
+                eprintln!(
+                    "pblang bundle --self-extract: failed to copy runtime to {}: {}",
+                    dest_runtime.display(),
+                    e
+                );
+                std::process::exit(1);
+            });
+
+            // Also copy pblang.toml if present
+            let man_toml = man_dir.join("pblang.toml");
+            if man_toml.is_file() {
+                let _ = std::fs::copy(&man_toml, staging.join("pblang.toml"));
+            }
+
+            // Create tarball of the staging directory (package + embedded runtime)
+            let tarball_bytes = pblang_pm::create_package_tarball(&staging).unwrap_or_else(|e| {
                 eprintln!(
                     "pblang bundle --self-extract: failed to create tarball: {}",
                     e
@@ -2666,8 +2295,10 @@ fn main() {
                 std::process::exit(1);
             });
 
+            // Clean up staging
+            let _ = std::fs::remove_dir_all(&staging);
+
             // Find pblang-stub binary (look next to current executable)
-            let current_exe = std::env::current_exe().expect("cannot read current executable path");
             let stub_path = current_exe
                 .parent()
                 .expect("cannot find parent directory of executable")
@@ -2722,7 +2353,10 @@ fn main() {
             }
 
             println!("Created self-extracting binary: {}", output_path.display());
-            println!("To run: {}", output_path.display());
+            println!(
+                "To run: {} (includes embedded pblang runtime; no separate install required)",
+                output_path.display()
+            );
             return;
         }
 
@@ -2870,7 +2504,12 @@ fn main() {
                 TypeKind::String => "string".into(),
                 TypeKind::Nil => "nil".into(),
                 TypeKind::Array(inner) => format!("array<{}>", render_ty(inner)),
-                TypeKind::Map(inner) => format!("map<{}>", render_ty(inner)),
+                TypeKind::Map(k, v) => format!("map<{}, {}>", render_ty(k), render_ty(v)),
+                TypeKind::Option(inner) => format!("{}?", render_ty(inner)),
+                TypeKind::Result(ok, err) => {
+                    format!("result<{}, {}>", render_ty(ok), render_ty(err))
+                }
+                TypeKind::Generic(name) => name.clone(),
                 TypeKind::NonNull(inner) => format!("{}!", render_ty(inner)),
             }
         }
@@ -2908,9 +2547,9 @@ fn main() {
                         StmtKind::Fn(name, params, ret, _body) => {
                             let ps = params
                                 .iter()
-                                .map(|(n, t)| match t {
-                                    Some(t) => format!("{n}: {}", render_ty(t)),
-                                    None => n.clone(),
+                                .map(|p| match &p.ty {
+                                    Some(t) => format!("{}: {}", p.name, render_ty(t)),
+                                    None => p.name.clone(),
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", ");
@@ -3057,6 +2696,84 @@ fn main() {
     }
 
     // Format .sap/.sapp files: trim, spacing around operators, indent by brace depth (4 spaces), optional line wrap, ensure final newline
+
+    // ── pblang serve — Start IDE backend server ────────────────────────
+    if args.first().map(|s| s.as_str()) == Some("serve") {
+        let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8090);
+        println!("pblang IDE Server starting on http://localhost:{}", port);
+        println!("Open editors/ide/index.html in your browser");
+
+        let listener =
+            std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap_or_else(|e| {
+                eprintln!("Cannot bind to port {}: {}", port, e);
+                std::process::exit(1);
+            });
+
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                use std::io::{Read, Write};
+                let mut buffer = [0u8; 8192];
+                if let Ok(n) = stream.read(&mut buffer) {
+                    let request = String::from_utf8_lossy(&buffer[..n]);
+
+                    if request.starts_with("POST /run") {
+                        // Extract JSON body
+                        let body_start = request.find("\r\n\r\n").unwrap_or(0) + 4;
+                        let body = &request[body_start..];
+
+                        let mut output = String::new();
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+                            if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
+                                // Parse, compile, run
+                                match pblang_core::parse_with_polyglot(code) {
+                                    Ok((stmts, _)) => match pblang_compiler::compile(stmts) {
+                                        Ok(chunk) => {
+                                            let mut vm = pblang_vm::VM::with_stdlib(
+                                                pblang_vm::StdlibConfig::default(),
+                                            );
+                                            match vm.run_collect(chunk) {
+                                                Ok(values) => {
+                                                    for v in values {
+                                                        output.push_str(&format!("{}\n", v));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    output = format!("Runtime error: {}", e.message)
+                                                }
+                                            }
+                                        }
+                                        Err(e) => output = format!("Compile error: {}", e),
+                                    },
+                                    Err(e) => output = format!("Parse error: {:?}", e),
+                                }
+                            }
+                        }
+
+                        let json_resp = serde_json::json!({"output": output.trim()});
+                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request.starts_with("OPTIONS") {
+                        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n";
+                        let _ = stream.write_all(response.as_bytes());
+                    } else {
+                        // Serve IDE HTML for GET /
+                        let html = include_str!("../editors/ide/index.html");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            html.len(), html
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if args.first().map(|s| s.as_str()) == Some("fmt") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut max_line_length: Option<usize> = None;
@@ -3254,7 +2971,9 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                    let top = scope
+                        .pop()
+                        .expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3274,7 +2993,9 @@ fn main() {
                     if let Some(e) = opt_final {
                         walk_expr(e, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                    let top = scope
+                        .pop()
+                        .expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3309,7 +3030,9 @@ fn main() {
                         }
                     }
                     let is_import = is_import_call(init);
-                    scope.last_mut().expect("lint walk: scope is non-empty (push before every nested scope)")
+                    scope
+                        .last_mut()
+                        .expect("lint walk: scope is non-empty (push before every nested scope)")
                         .insert(name.clone(), (s.span, is_import, false));
                     walk_expr(init, scope, warnings);
                 }
@@ -3339,7 +3062,9 @@ fn main() {
                     for s in then_b {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                    let top = scope
+                        .pop()
+                        .expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3355,7 +3080,9 @@ fn main() {
                         for s in else_stmts {
                             walk_stmt(s, scope, warnings);
                         }
-                        let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                        let top = scope
+                            .pop()
+                            .expect("scope stack underflow: push/pop mismatch in lint walk");
                         for (name, (sp, is_import, read)) in top {
                             if !read {
                                 let msg = if is_import {
@@ -3374,7 +3101,9 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                    let top = scope
+                        .pop()
+                        .expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3399,13 +3128,65 @@ fn main() {
                             }
                         }
                     }
-                    scope.last_mut().expect("lint walk: scope is non-empty (push before every nested scope)")
+                    scope
+                        .last_mut()
+                        .expect("lint walk: scope is non-empty (push before every nested scope)")
                         .insert(name.clone(), (s.span, false, false));
                     scope.push(std::collections::HashMap::new());
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                    let top = scope
+                        .pop()
+                        .expect("scope stack underflow: push/pop mismatch in lint walk");
+                    for (n, (sp, is_import, read)) in top {
+                        if !read {
+                            let msg = if is_import {
+                                format!("unused import: `{}`", n)
+                            } else {
+                                format!("unused variable: `{}`", n)
+                            };
+                            warnings.push((sp, msg));
+                        }
+                    }
+                }
+                StmtKind::ForIn(name, col, body) => {
+                    walk_expr(col, scope, warnings);
+                    scope.push(std::collections::HashMap::new());
+                    scope
+                        .last_mut()
+                        .expect("lint walk: scope non-empty")
+                        .insert(name.clone(), (s.span, false, false));
+                    for st in body {
+                        walk_stmt(st, scope, warnings);
+                    }
+                    let top = scope.pop().expect("scope stack underflow");
+                    for (n, (sp, is_import, read)) in top {
+                        if !read {
+                            let msg = if is_import {
+                                format!("unused import: `{}`", n)
+                            } else {
+                                format!("unused variable: `{}`", n)
+                            };
+                            warnings.push((sp, msg));
+                        }
+                    }
+                }
+                StmtKind::ForInKV(k, v, col, body) => {
+                    walk_expr(col, scope, warnings);
+                    scope.push(std::collections::HashMap::new());
+                    scope
+                        .last_mut()
+                        .expect("lint walk: scope non-empty")
+                        .insert(k.clone(), (s.span, false, false));
+                    scope
+                        .last_mut()
+                        .expect("lint walk: scope non-empty")
+                        .insert(v.clone(), (s.span, false, false));
+                    for st in body {
+                        walk_stmt(st, scope, warnings);
+                    }
+                    let top = scope.pop().expect("scope stack underflow");
                     for (n, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3422,7 +3203,9 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                    let top = scope
+                        .pop()
+                        .expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3439,7 +3222,9 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+                    let top = scope
+                        .pop()
+                        .expect("scope stack underflow: push/pop mismatch in lint walk");
                     for (name, (sp, is_import, read)) in top {
                         if !read {
                             let msg = if is_import {
@@ -3458,7 +3243,9 @@ fn main() {
         for s in stmts {
             walk_stmt(s, &mut scope, &mut warnings);
         }
-        let top = scope.pop().expect("scope stack underflow: push/pop mismatch in lint walk");
+        let top = scope
+            .pop()
+            .expect("scope stack underflow: push/pop mismatch in lint walk");
         for (name, (sp, is_import, read)) in top {
             if !read {
                 let msg = if is_import {
@@ -3521,7 +3308,11 @@ fn main() {
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("lsp") {
-        run_lsp_server();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for pblang lsp")
+            .block_on(pblang_lsp::run_stdio_server());
         return;
     }
 
@@ -3649,10 +3440,7 @@ fn main() {
                 std::process::exit(1);
             })
         };
-        if let Some(man_dir) = script_path
-            .parent()
-            .and_then(pblang_pm::find_manifest_dir)
-        {
+        if let Some(man_dir) = script_path.parent().and_then(pblang_pm::find_manifest_dir) {
             if let Some((platform, min_rt)) = pblang_pm::get_manifest_platform_hints(&man_dir) {
                 if platform.as_deref().map(|s| s != "any").unwrap_or(false) {
                     eprintln!(
@@ -3704,7 +3492,9 @@ fn main() {
             .unwrap_or_default();
         // SAFETY: Set before spawning any VM threads; single-threaded at this point.
         #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("PBLANG_SCRIPT_ARGS", script_args.join("\n")) };
+        unsafe {
+            std::env::set_var("PBLANG_SCRIPT_ARGS", script_args.join("\n"))
+        };
 
         let mut vm = VM::with_stdlib(StdlibConfig::default());
         if let Err(e) = vm.run(chunk) {
@@ -3733,6 +3523,293 @@ fn main() {
             }
             std::process::exit(1);
         }
+        return;
+    }
+
+    // Compile a .sapp file to C and optionally to a native binary
+    if args.first().map(|s| s.as_str()) == Some("compile") {
+        if args.len() < 2 {
+            eprintln!("usage: pblang compile <file.sapp> [--out <name>] [--cc <compiler>] [--opt <level>]");
+            eprintln!("  Transpiles pblang source to C99, then compiles to a native binary.");
+            eprintln!("  --out <name>   Output binary name (default: a.out / a.exe)");
+            eprintln!("  --cc <compiler> C compiler to use (default: gcc, fallback: clang, cc)");
+            eprintln!("  --opt <level>  Optimization level 0-3 (default: 2)");
+            eprintln!("  --keep-c        Keep the intermediate .c file");
+            std::process::exit(1);
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let script_path = {
+            let candidate = PathBuf::from(&args[1]);
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                cwd.join(&candidate)
+            }
+        };
+        let script_path = script_path.canonicalize().unwrap_or_else(|e| {
+            eprintln!("pblang compile: cannot find '{}': {e}", args[1]);
+            std::process::exit(1);
+        });
+        let src = match std::fs::read_to_string(&script_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "pblang compile: failed to read '{}': {e}",
+                    script_path.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        let src_for_parse = strip_comments_mask(&src);
+        let stmts = match parse(&src_for_parse) {
+            Ok(s) => s,
+            Err(errs) => {
+                print_parse_errors(&src_for_parse, errs, Some(&script_path.to_string_lossy()));
+                std::process::exit(2);
+            }
+        };
+
+        let default_out = if cfg!(windows) { "a.exe" } else { "a.out" };
+        let out_name = args
+            .iter()
+            .position(|a| a == "--out")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+            .unwrap_or(default_out);
+        let keep_c = args.iter().any(|a| a == "--keep-c");
+        let opt_level = args
+            .iter()
+            .position(|a| a == "--opt")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(2);
+        let use_llvm = args.iter().any(|a| a == "--llvm");
+
+        if use_llvm {
+            // LLVM IR path: transpile to .ll, compile with clang
+            let _ir_opts = pblang_ctranspiler::TranspileOptions::default();
+            match pblang_llvm::compile_to_native(stmts, out_name, opt_level) {
+                Ok(()) => {
+                    eprintln!(
+                        "LLVM-compiled '{}' → '{}' (via LLVM IR, O{opt_level})",
+                        script_path.display(),
+                        out_name
+                    );
+                }
+                Err(e) => {
+                    eprintln!("pblang compile --llvm: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+
+        // C transpiler path (default)
+        let transpile_opts = pblang_ctranspiler::TranspileOptions {
+            embed_runtime: true,
+            source_maps: false,
+            opt_level,
+        };
+        let output = pblang_ctranspiler::transpile(stmts, &transpile_opts);
+        if !output.warnings.is_empty() {
+            for w in &output.warnings {
+                eprintln!("warning: {w}");
+            }
+        }
+
+        let c_path = script_path.with_extension("c");
+        std::fs::write(&c_path, &output.c_source).unwrap_or_else(|e| {
+            eprintln!("pblang compile: cannot write '{}': {e}", c_path.display());
+            std::process::exit(1);
+        });
+
+        let cc = args
+            .iter()
+            .position(|a| a == "--cc")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| {
+                for c in &["gcc", "clang", "cc"] {
+                    if std::process::Command::new(c)
+                        .arg("--version")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok()
+                    {
+                        return c.to_string();
+                    }
+                }
+                "gcc".to_string()
+            });
+
+        let opt_flag = format!("-O{opt_level}");
+        let status = std::process::Command::new(&cc)
+            .arg(&c_path)
+            .arg("-o")
+            .arg(out_name)
+            .arg(&opt_flag)
+            .arg("-std=c99")
+            .arg("-lm")
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("pblang compile: failed to run '{cc}': {e}");
+                std::process::exit(1);
+            });
+
+        if !status.success() {
+            eprintln!("pblang compile: C compilation failed");
+            if !keep_c {
+                let _ = std::fs::remove_file(&c_path);
+            }
+            std::process::exit(1);
+        }
+
+        eprintln!(
+            "Compiled '{}' → '{}' (via C99, O{opt_level})",
+            script_path.display(),
+            out_name
+        );
+        if !keep_c {
+            let _ = std::fs::remove_file(&c_path);
+        } else {
+            eprintln!("  C source kept at '{}'", c_path.display());
+        }
+        return;
+    }
+
+    // Extract and build polyglot blocks from a .sapp file
+    if args.first().map(|s| s.as_str()) == Some("build-polyglot") {
+        if args.len() < 2 {
+            eprintln!("usage: pblang build-polyglot <file.sapp> [--out-dir <dir>]");
+            eprintln!("  Extracts @lang {{ }} polyglot blocks from source and builds them.");
+            eprintln!(
+                "  --out-dir <dir>  Output directory for built artifacts (default: ./polyglot-out)"
+            );
+            std::process::exit(1);
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let script_path = {
+            let candidate = PathBuf::from(&args[1]);
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                cwd.join(&candidate)
+            }
+        };
+        let script_path = script_path.canonicalize().unwrap_or_else(|e| {
+            eprintln!("build-polyglot: cannot find '{}': {e}", args[1]);
+            std::process::exit(1);
+        });
+        let out_dir = args
+            .iter()
+            .position(|a| a == "--out-dir")
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.join("polyglot-out"));
+        std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| {
+            eprintln!("build-polyglot: cannot create '{}': {e}", out_dir.display());
+            std::process::exit(1);
+        });
+
+        let src = std::fs::read_to_string(&script_path).unwrap_or_else(|e| {
+            eprintln!(
+                "build-polyglot: cannot read '{}': {e}",
+                script_path.display()
+            );
+            std::process::exit(1);
+        });
+
+        let blocks = pblang_core::extract_polyglot_blocks(&src);
+        if blocks.is_empty() {
+            eprintln!(
+                "build-polyglot: no polyglot blocks found in '{}'",
+                script_path.display()
+            );
+            eprintln!("  Use @lang {{ }} syntax to embed foreign code: @python {{ print('hi') }}");
+            return;
+        }
+
+        eprintln!("Found {} polyglot block(s):", blocks.len());
+        for b in &blocks {
+            let name = b.name.as_deref().unwrap_or("unnamed");
+            let out_file = out_dir.join(format!(
+                "{}_{}.{}",
+                script_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                name,
+                match b.lang.as_str() {
+                    "python" | "py" => "py",
+                    "rust" | "rs" => "rs",
+                    "js" | "javascript" => "js",
+                    "bash" | "sh" => "sh",
+                    "ruby" | "rb" => "rb",
+                    "lua" => "lua",
+                    other => other,
+                }
+            ));
+            std::fs::write(&out_file, &b.code).unwrap_or_else(|e| {
+                eprintln!("build-polyglot: cannot write '{}': {e}", out_file.display());
+                std::process::exit(1);
+            });
+            eprintln!("  @{} {} → {}", b.lang, name, out_file.display());
+
+            // Attempt to compile if possible
+            if b.lang == "rust" || b.lang == "rs" {
+                let out_so = out_dir.join(format!("lib{}.so", name));
+                let status = std::process::Command::new("rustc")
+                    .arg(&out_file)
+                    .arg("--crate-type")
+                    .arg("cdylib")
+                    .arg("-o")
+                    .arg(&out_so)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => eprintln!("    → compiled {}", out_so.display()),
+                    _ => eprintln!("    (rustc not available, keeping source)"),
+                }
+            }
+
+            if b.lang == "python" || b.lang == "py" {
+                // Python: compile to .pyc
+                let status = std::process::Command::new("python3")
+                    .arg("-m")
+                    .arg("py_compile")
+                    .arg(&out_file)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => eprintln!("    → compiled .pyc"),
+                    _ => { /* py_compile not critical */ }
+                }
+            }
+        }
+
+        // Write manifest
+        let manifest = out_dir.join("polyglot.toml");
+        let mut toml = String::from("[polyglot]\n");
+        toml.push_str(&format!("source = \"{}\"\n", script_path.display()));
+        toml.push_str(&format!("blocks = {}\n", blocks.len()));
+        toml.push_str("\n[[blocks]]\n");
+        for b in &blocks {
+            let name = b.name.as_deref().unwrap_or("unnamed");
+            toml.push_str(&format!("lang = \"{}\"\n", b.lang));
+            toml.push_str(&format!("name = \"{}\"\n", name));
+            toml.push_str(&format!("lines = {}\n", b.code.lines().count()));
+            toml.push_str("\n[[blocks]]\n");
+        }
+        // Remove trailing [[blocks]]
+        if toml.ends_with("[[blocks]]\n") {
+            toml = toml[..toml.len() - "[[blocks]]\n".len()].to_string();
+        }
+        std::fs::write(&manifest, toml).unwrap();
+        eprintln!("Manifest: {}", manifest.display());
+        eprintln!(
+            "Done. {} blocks extracted to '{}'",
+            blocks.len(),
+            out_dir.display()
+        );
         return;
     }
 
@@ -3808,37 +3885,42 @@ fn main() {
                                 eprintln!("Compile error: {ce}");
                             }
                             Ok(mut chunk) => {
-                        // Attach source for accurate runtime diagnostics.
-                        chunk.source_name = Some(std::rc::Rc::new("<repl>".to_string()));
-                        chunk.source = Some(std::rc::Rc::new(buf.clone()));
-                        if let Err(e) = vm.run(chunk) {
-                            let src = e.source.as_deref().unwrap_or(&buf);
-                            let src_name = e.source_name.as_deref().unwrap_or("<repl>");
-                            if let Some(sp) = e.span {
-                                let (ln, col) = line_col(src, sp.start);
-                                eprintln!("Runtime error at {src_name}:{ln}:{col}: {}", e.message);
-                                let line = get_line(src, ln);
-                                eprintln!("{line}");
-                                eprintln!("{}^", " ".repeat(col.saturating_sub(1)));
-                            } else {
-                                eprintln!("Runtime error ({src_name}): {}", e.message);
-                            }
-
-                            if !e.stack.is_empty() {
-                                eprintln!("Stack trace:");
-                                for frame in &e.stack {
-                                    let fname = frame.function.as_deref().unwrap_or("<anonymous>");
-                                    let fsrc = frame.source_name.as_deref().unwrap_or("<repl>");
-                                    if let Some(fsp) = frame.span {
-                                        let (ln, col) = line_col(src, fsp.start);
-                                        eprintln!("  at {fname} ({fsrc}:{ln}:{col})");
+                                // Attach source for accurate runtime diagnostics.
+                                chunk.source_name = Some(std::rc::Rc::new("<repl>".to_string()));
+                                chunk.source = Some(std::rc::Rc::new(buf.clone()));
+                                if let Err(e) = vm.run(chunk) {
+                                    let src = e.source.as_deref().unwrap_or(&buf);
+                                    let src_name = e.source_name.as_deref().unwrap_or("<repl>");
+                                    if let Some(sp) = e.span {
+                                        let (ln, col) = line_col(src, sp.start);
+                                        eprintln!(
+                                            "Runtime error at {src_name}:{ln}:{col}: {}",
+                                            e.message
+                                        );
+                                        let line = get_line(src, ln);
+                                        eprintln!("{line}");
+                                        eprintln!("{}^", " ".repeat(col.saturating_sub(1)));
                                     } else {
-                                        eprintln!("  at {fname} ({fsrc})");
+                                        eprintln!("Runtime error ({src_name}): {}", e.message);
+                                    }
+
+                                    if !e.stack.is_empty() {
+                                        eprintln!("Stack trace:");
+                                        for frame in &e.stack {
+                                            let fname =
+                                                frame.function.as_deref().unwrap_or("<anonymous>");
+                                            let fsrc =
+                                                frame.source_name.as_deref().unwrap_or("<repl>");
+                                            if let Some(fsp) = frame.span {
+                                                let (ln, col) = line_col(src, fsp.start);
+                                                eprintln!("  at {fname} ({fsrc}:{ln}:{col})");
+                                            } else {
+                                                eprintln!("  at {fname} ({fsrc})");
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
-                        } // end Ok(mut chunk)
+                            } // end Ok(mut chunk)
                         } // end match compile
                     }
                     Err(e) => {

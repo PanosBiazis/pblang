@@ -64,11 +64,36 @@ pub enum TypeKind {
     String,
     Nil,
     Array(Box<TypeExpr>),
-    Map(Box<TypeExpr>),
-    NonNull(Box<TypeExpr>), // T! — non-nullable variant; compiler enforces no nil assignment
+    /// map<K, V> — key and value type parameters.
+    Map(Box<TypeExpr>, Box<TypeExpr>),
+    /// T? — optional / nullable type (T | nil).
+    Option(Box<TypeExpr>),
+    /// result<T, E> — success (T) or error (E).
+    Result(Box<TypeExpr>, Box<TypeExpr>),
+    /// Generic type parameter name (e.g. T, K, V) — placeholder for monomorphisation.
+    Generic(String),
+    /// T! — non-nullable variant; compiler enforces no nil assignment.
+    NonNull(Box<TypeExpr>),
 }
 
-pub type Param = (String, Option<TypeExpr>);
+/// A function parameter definition (name, optional type annotation, optional default value).
+/// - name: the parameter name
+/// - ty: optional type annotation (e.g. `: number`)
+/// - default: optional default expression (e.g. `= 42`), used when arg is not provided
+/// - is_vararg: if true, this is the `...name` rest parameter (must be last)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub ty: Option<TypeExpr>,
+    pub default: Option<Expr>,
+    pub is_vararg: bool,
+}
+
+impl Param {
+    pub fn simple(name: String, ty: Option<TypeExpr>) -> Self {
+        Param { name, ty, default: None, is_vararg: false }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
@@ -111,6 +136,26 @@ pub enum ExprKind {
     ResultUnwrap(Box<Expr>),
     /// `!expr` — logical NOT.
     Not(Box<Expr>),
+    /// `a ?? b` — null coalescing: if a is nil, evaluate b, otherwise a.
+    NullCoalesce(Box<Expr>, Box<Expr>),
+    /// `f"Hello {name}"` — f-string interpolation: Vec of (literal, optional expr).
+    /// Each part is either a literal string segment or an interpolated expression.
+    FString(Vec<FStringPart>),
+    /// `a ** b` — exponentiation (a^b), sugar for num_pow(a, b).
+    Pow(Box<Expr>, Box<Expr>),
+    /// `a % b` — modulo, sugar for num_mod(a, b).
+    Mod(Box<Expr>, Box<Expr>),
+    /// `if cond { then } else { else }` — expression-level conditional.
+    IfExpr(Box<Expr>, Box<Expr>, Box<Expr>),
+}
+
+/// Part of an f-string interpolation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStringPart {
+    /// A literal string segment (not interpolated).
+    Literal(String),
+    /// An interpolated expression `{expr}`.
+    Interp(Box<Expr>),
 }
 
 /// Pattern in a match arm: literal value, bind to name, or wildcard.
@@ -150,10 +195,26 @@ pub enum StmtKind {
     If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
     While(Expr, Vec<Stmt>),
     For(String, Expr, Vec<Stmt>),
+    /// `for x in expr { body }` — iterate over array elements or map keys
+    ForIn(String, Expr, Vec<Stmt>),
+    /// `for k, v in expr { body }` — iterate over map key-value pairs
+    ForInKV(String, String, Expr, Vec<Stmt>),
+    /// `loop { body }` — infinite loop; requires `break` to exit
+    Loop(Vec<Stmt>),
+    /// `break;` — exit the nearest enclosing loop
+    Break,
+    /// `continue;` — jump to the next iteration of the nearest enclosing loop
+    Continue,
+    /// `throw expr;` — raise a runtime error with the given value/message
+    Throw(Expr),
     Fn(String, Vec<Param>, Option<TypeExpr>, Vec<Stmt>),
     Return(Option<Expr>),
     Defer(Expr), // run expr when leaving current scope (function return)
     Block(Vec<Stmt>),
+    /// Flat sequence of statements at the SAME scope level (no new scope).
+    /// Used by destructuring desugaring: let [a,b]=arr expands to multiple
+    /// `let` statements that must be visible in the enclosing scope.
+    Seq(Vec<Stmt>),
 }
 
 /// Mask `//` and `/* */` comments in `src` with spaces (length-preserving).
@@ -646,13 +707,24 @@ pub fn parse_with_polyglot(
     // Preprocess in a byte-offset-stable way.
     let (masked, blocks) = mask_and_extract_polyglot_blocks(input);
     let masked = strip_comments_mask(&masked);
-    // Use parse_recovery so that minor spurious errors (e.g. from parser backtracking in
-    // postfix choice) do not prevent a valid AST from being returned. Only return Err if
-    // the parser could not produce any output at all.
-    let (output, errors) = parser().parse_recovery(masked.as_str());
-    match output {
-        Some(stmts) => Ok((stmts, blocks)),
-        None => Err(errors),
+
+    // SP1-gamma fix: prefer strict parser().parse() over parse_recovery().
+    // parse_recovery() consumes unexpected characters (like guard separators `~`/`#`)
+    // as error-recovery tokens, preventing valid guard expressions from parsing.
+    // The strict parser stops cleanly at separators and returns the correct AST.
+    // We only fall back to parse_recovery when strict parsing completely fails,
+    // to keep REPL partial-AST behaviour for incomplete input.
+    match parser().parse(masked.as_str()) {
+        Ok(stmts) => Ok((stmts, blocks)),
+        Err(_strict_errs) => {
+            // Strict parse failed. Try recovery to get a partial AST for IDE/REPL.
+            let (output, _recovery_errs) = parser().parse_recovery(masked.as_str());
+            match output {
+                Some(stmts) => Ok((stmts, blocks)),
+                // Both strict and recovery failed: return strict errors (cleaner messages).
+                None => Err(_strict_errs),
+            }
+        }
     }
 }
 
