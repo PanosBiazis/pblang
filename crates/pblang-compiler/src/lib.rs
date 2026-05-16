@@ -27,6 +27,20 @@ fn vspan(sp: Span) -> VmSpan {
     }
 }
 
+/// Convert a compile-time constant expression to a pblang_ir::Value.
+/// Only handles literal expressions (Number, Str, Bool, Nil).
+/// Returns None for complex expressions (these should use nil-check pattern instead).
+fn expr_to_const_value(e: &pblang_core::Expr) -> Option<pblang_ir::Value> {
+    use pblang_core::ExprKind;
+    match &e.kind {
+        ExprKind::Number(n) => Some(pblang_ir::Value::Number(*n)),
+        ExprKind::Bool(b)   => Some(pblang_ir::Value::Bool(*b)),
+        ExprKind::Nil       => Some(pblang_ir::Value::Nil),
+        ExprKind::Str(s)    => Some(pblang_ir::alloc_string(s.clone())),
+        _ => None, // complex expression: user must use nil-check pattern
+    }
+}
+
 /// Compile statements to bytecode. Returns a CompileError on semantic errors
 /// like variable redeclaration or reading a variable in its own initializer.
 pub fn compile(stmts: Vec<Stmt>) -> Result<Chunk, CompileError> {
@@ -37,6 +51,7 @@ pub fn compile(stmts: Vec<Stmt>) -> Result<Chunk, CompileError> {
         scope_depth: 0,
         upvalues: vec![],
         enclosing: None,
+        loop_ctx: vec![],
         error: None,
     };
 
@@ -81,6 +96,13 @@ struct Compiler {
 
     upvalues: Vec<UpvalueDesc>,
     enclosing: Option<Box<Compiler>>,
+
+    /// Loop context stack for break/continue.
+    /// Each entry: (continue_target_ip, locals_count_at_entry, break_patch_ips)
+    /// - continue_target: jump to here for `continue`
+    /// - locals_at_entry: len(locals) when loop started (for scope cleanup on break)
+    /// - break_patch_ips: OpJump(0) placeholders to patch with loop-exit IP
+    loop_ctx: Vec<(usize, usize, Vec<usize>)>,
 
     /// Deferred error - set when a semantic error is detected, checked after each statement.
     error: Option<CompileError>,
@@ -367,6 +389,7 @@ impl Compiler {
                     locals: self.locals.clone(),
                     scope_depth: self.scope_depth,
                     upvalues: self.upvalues.clone(),
+                    loop_ctx: vec![],
                     enclosing: self.enclosing.as_ref().map(|e| {
                         // Carry the next level of the chain for arbitrarily deep nesting.
                         Box::new(Compiler {
@@ -375,6 +398,7 @@ impl Compiler {
                             locals: e.locals.clone(),
                             scope_depth: e.scope_depth,
                             upvalues: e.upvalues.clone(),
+                            loop_ctx: vec![],
                             enclosing: None, // two levels deep is sufficient for most programs
                             error: None,
                         })
@@ -387,13 +411,14 @@ impl Compiler {
                     locals: vec![],
                     scope_depth: 1,
                     upvalues: vec![],
+                    loop_ctx: vec![],
                     enclosing: Some(Box::new(enclosing_snapshot)),
                     error: None,
                 };
 
                 // params are locals in slot 0..arity-1 (ignore type annotations at runtime)
-                for (p, _pty) in &params {
-                    f_compiler.add_local(p.clone());
+                for p in &params {
+                    f_compiler.add_local(p.name.clone());
                 }
 
                 // function body scope
@@ -411,9 +436,21 @@ impl Compiler {
                 f_compiler.chunk.write(OpCode::OpReturn, VmSpan::default());
 
                 optimize_chunk(&mut f_compiler.chunk);
+                // Count required params and check for vararg
+                let is_vararg_fn = params.last().map(|p| p.is_vararg).unwrap_or(false);
+                let named_arity = if is_vararg_fn { params.len() - 1 } else { params.len() };
+                let min_arity_fn = params.iter().filter(|p| p.default.is_none() && !p.is_vararg).count();
+                // Pre-compile constant defaults into Values
+                let defaults_vals: Vec<pblang_ir::Value> = params.iter()
+                    .filter_map(|p| p.default.as_ref().map(expr_to_const_value))
+                    .flatten()
+                    .collect();
                 let fun = Rc::new(Function {
                     name: Some(name.clone()),
-                    arity: params.len(),
+                    arity: named_arity,
+                    min_arity: min_arity_fn,
+                    defaults: defaults_vals,
+                    is_vararg: is_vararg_fn,
                     chunk: f_compiler.chunk,
                 });
 
@@ -464,12 +501,14 @@ impl Compiler {
                     locals: vec![],
                     scope_depth: 1,
                     upvalues: vec![],
+                    loop_ctx: vec![],
                     enclosing: Some(Box::new(Compiler {
                         chunk: Chunk::default(),
                         globals: HashMap::new(),
                         locals: self.locals.clone(),
                         scope_depth: self.scope_depth,
                         upvalues: self.upvalues.clone(),
+                        loop_ctx: vec![],
                         enclosing: None,
                         error: None,
                     })),
@@ -490,6 +529,9 @@ impl Compiler {
                 let fun = Rc::new(Function {
                     name: None,
                     arity: 0,
+                    min_arity: 0,
+                    defaults: vec![],
+                    is_vararg: false,
                     chunk: thunk_compiler.chunk,
                 });
                 let fn_const_idx = self.chunk.add_const(Value::Function(fun));
@@ -575,6 +617,15 @@ impl Compiler {
                 }
             }
             // END OF Block
+
+            // Seq: flat statement sequence WITHOUT new scope.
+            // Used by destructuring (`let [a,b]=arr`) so variables are visible in outer scope.
+            StmtKind::Seq(stmts) => {
+                for st in stmts {
+                    self.emit_stmt(st);
+                }
+            }
+
             StmtKind::Assign(name, expr) => {
                 // Guard: check if name resolves to a const local
                 if let Some(slot) = self.resolve_local(&name) {
@@ -658,6 +709,9 @@ impl Compiler {
             StmtKind::While(cond, body) => {
                 let loop_start = self.ip();
 
+                // Push loop context for break/continue
+                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+
                 self.emit_expr(cond);
                 let jmp_exit_pos = self.emit(OpCode::OpJumpIfFalse(0), sp);
 
@@ -673,8 +727,15 @@ impl Compiler {
 
                 let exit_ip = self.ip();
                 self.patch(jmp_exit_pos, OpCode::OpJumpIfFalse(exit_ip));
-
                 self.chunk.write(OpCode::OpPop, vspan(sp)); // pop cond (false)
+                let break_exit_ip = self.ip(); // break lands here (AFTER false-cond pop)
+
+                // Patch all break jumps (they skip the false-cond pop)
+                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                    for bp in break_patches {
+                        self.patch(bp, OpCode::OpJump(break_exit_ip));
+                    }
+                }
             }
 
             StmtKind::For(name, count_expr, body) => {
@@ -694,6 +755,9 @@ impl Compiler {
                 self.mark_initialized();
 
                 let loop_start = self.ip();
+
+                // Push loop context for break/continue
+                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
 
                 // cond: __i < __bound
                 self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
@@ -732,11 +796,264 @@ impl Compiler {
                 let exit_ip = self.ip();
                 self.patch(jmp_exit_pos, OpCode::OpJumpIfFalse(exit_ip));
                 self.chunk.write(OpCode::OpPop, vspan(sp)); // pop cond (false branch)
+                let break_exit_ip = self.ip(); // break lands here (AFTER false-cond pop)
+
+                // Patch all break jumps
+                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                    for bp in break_patches {
+                        self.patch(bp, OpCode::OpJump(break_exit_ip));
+                    }
+                }
 
                 self.end_scope(); // pops/closes __i + __bound
             } // END OF For
-        }
-    }
+
+            StmtKind::ForIn(name, col_expr, body) => {
+                // Desugars to:
+                // let __col = col_expr;
+                // let __len = len(__col);
+                // let __i = 0;
+                // while __i < __len { let name = __col[__i]; body...; __i = __i + 1; }
+                self.begin_scope();
+
+                // __col = col_expr
+                let col_sym = format!("__forin_col_{name}");
+                let col_slot = self.declare_local(col_sym, sp);
+                self.emit_expr(col_expr);
+                self.mark_initialized();
+
+                // __len = len(__col)
+                let len_sym = format!("__forin_len_{name}");
+                let len_slot = self.declare_local(len_sym, sp);
+                let len_name_idx = self.intern_name("len");
+                self.chunk.write(OpCode::OpGetGlobal(len_name_idx), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(col_slot), vspan(sp));
+                self.chunk.write(OpCode::OpCall(1), vspan(sp));
+                self.mark_initialized();
+
+                // __i = 0
+                let i_sym = format!("__forin_i_{name}");
+                let i_slot = self.declare_local(i_sym, sp);
+                let zero = self.chunk.add_const(Value::Number(0.0));
+                self.chunk.write(OpCode::OpConstant(zero), vspan(sp));
+                self.mark_initialized();
+
+                let loop_start = self.ip();
+
+                // Push loop context for break/continue (ForIn)
+                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+
+                // cond: __i < __len
+                self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(len_slot), vspan(sp));
+                self.chunk.write(OpCode::OpLt, vspan(sp));
+
+                let jmp_exit_pos = self.emit(OpCode::OpJumpIfFalse(0), sp);
+                self.chunk.write(OpCode::OpPop, vspan(sp)); // pop true cond
+
+                // iteration scope: `name = __col[__i]`
+                self.begin_scope();
+                let _name_slot = self.declare_local(name.clone(), sp);
+                self.chunk.write(OpCode::OpGetLocal(col_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetIndex, vspan(sp));
+                self.mark_initialized();
+
+                for st in body {
+                    self.emit_stmt(st);
+                }
+                self.end_scope(); // pops `name`
+
+                // __i = __i + 1
+                self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
+                let one = self.chunk.add_const(Value::Number(1.0));
+                self.chunk.write(OpCode::OpConstant(one), vspan(sp));
+                self.chunk.write(OpCode::OpAdd, vspan(sp));
+                self.chunk.write(OpCode::OpSetLocal(i_slot), vspan(sp));
+
+                // back-edge
+                self.chunk.write(OpCode::OpJump(loop_start), vspan(sp));
+
+                // patch exit
+                let exit_ip = self.ip();
+                self.patch(jmp_exit_pos, OpCode::OpJumpIfFalse(exit_ip));
+                self.chunk.write(OpCode::OpPop, vspan(sp)); // pop false cond
+                let break_exit_ip = self.ip();
+
+                // Patch all break jumps
+                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                    for bp in break_patches {
+                        self.patch(bp, OpCode::OpJump(break_exit_ip));
+                    }
+                }
+
+                self.end_scope(); // pops __i, __len, __col
+            }
+
+            StmtKind::ForInKV(key_name, val_name, col_expr, body) => {
+                // Desugars to:
+                // let __col = col_expr;
+                // let __keys = map_keys(__col);
+                // let __len = len(__keys);
+                // let __i = 0;
+                // while __i < __len { let k = __keys[__i]; let v = __col[k]; body...; __i++; }
+                self.begin_scope();
+
+                // __col = col_expr
+                let col_sym = format!("__forkv_col_{key_name}");
+                let col_slot = self.declare_local(col_sym, sp);
+                self.emit_expr(col_expr);
+                self.mark_initialized();
+
+                // __keys = map_keys(__col)
+                let keys_sym = format!("__forkv_keys_{key_name}");
+                let keys_slot = self.declare_local(keys_sym, sp);
+                let mk_name = self.intern_name("map_keys");
+                self.chunk.write(OpCode::OpGetGlobal(mk_name), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(col_slot), vspan(sp));
+                self.chunk.write(OpCode::OpCall(1), vspan(sp));
+                self.mark_initialized();
+
+                // __len = len(__keys)
+                let len2_sym = format!("__forkv_len_{key_name}");
+                let len2_slot = self.declare_local(len2_sym, sp);
+                let len_name = self.intern_name("len");
+                self.chunk.write(OpCode::OpGetGlobal(len_name), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(keys_slot), vspan(sp));
+                self.chunk.write(OpCode::OpCall(1), vspan(sp));
+                self.mark_initialized();
+
+                // __i = 0
+                let i2_sym = format!("__forkv_i_{key_name}");
+                let i2_slot = self.declare_local(i2_sym, sp);
+                let zero = self.chunk.add_const(Value::Number(0.0));
+                self.chunk.write(OpCode::OpConstant(zero), vspan(sp));
+                self.mark_initialized();
+
+                let loop_start = self.ip();
+
+                // Push loop context for break/continue (ForInKV)
+                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+
+                // cond: __i < __len
+                self.chunk.write(OpCode::OpGetLocal(i2_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(len2_slot), vspan(sp));
+                self.chunk.write(OpCode::OpLt, vspan(sp));
+
+                let jmp_exit_pos = self.emit(OpCode::OpJumpIfFalse(0), sp);
+                self.chunk.write(OpCode::OpPop, vspan(sp)); // pop true cond
+
+                // iteration scope
+                self.begin_scope();
+
+                // k = __keys[__i]
+                let k_slot = self.declare_local(key_name.clone(), sp);
+                self.chunk.write(OpCode::OpGetLocal(keys_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(i2_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetIndex, vspan(sp));
+                self.mark_initialized();
+
+                // v = __col[k]
+                let _v_slot = self.declare_local(val_name.clone(), sp);
+                self.chunk.write(OpCode::OpGetLocal(col_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetLocal(k_slot), vspan(sp));
+                self.chunk.write(OpCode::OpGetIndex, vspan(sp));
+                self.mark_initialized();
+
+                for st in body {
+                    self.emit_stmt(st);
+                }
+                self.end_scope(); // pops k, v
+
+                // __i = __i + 1
+                self.chunk.write(OpCode::OpGetLocal(i2_slot), vspan(sp));
+                let one = self.chunk.add_const(Value::Number(1.0));
+                self.chunk.write(OpCode::OpConstant(one), vspan(sp));
+                self.chunk.write(OpCode::OpAdd, vspan(sp));
+                self.chunk.write(OpCode::OpSetLocal(i2_slot), vspan(sp));
+
+                // back-edge
+                self.chunk.write(OpCode::OpJump(loop_start), vspan(sp));
+
+                // patch exit
+                let exit_ip = self.ip();
+                self.patch(jmp_exit_pos, OpCode::OpJumpIfFalse(exit_ip));
+                self.chunk.write(OpCode::OpPop, vspan(sp)); // pop false cond
+
+                let break_exit_ip_kv = self.ip();
+
+                // Patch all break jumps (ForInKV)
+                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                    for bp in break_patches {
+                        self.patch(bp, OpCode::OpJump(break_exit_ip_kv));
+                    }
+                }
+
+                self.end_scope(); // pops __i, __len, __keys, __col
+            }
+
+            // break; — emit jump to loop exit (patched after loop completes)
+            StmtKind::Break => {
+                // Pop locals introduced inside the loop before jumping out
+                let locals_to_pop = if let Some(&(_, locals_at, _)) = self.loop_ctx.last() {
+                    self.locals.len().saturating_sub(locals_at)
+                } else {
+                    0
+                };
+                for _ in 0..locals_to_pop {
+                    self.chunk.write(OpCode::OpPop, vspan(sp));
+                }
+                let bp = self.chunk.instructions.len();
+                self.chunk.write(OpCode::OpJump(0), vspan(sp)); // placeholder
+                if let Some((_, _, patches)) = self.loop_ctx.last_mut() {
+                    patches.push(bp);
+                }
+            }
+
+            // continue; — jump back to loop start
+            StmtKind::Continue => {
+                if let Some((cont_ip, _, _)) = self.loop_ctx.last() {
+                    let target = *cont_ip;
+                    self.chunk.write(OpCode::OpJump(target), vspan(sp));
+                } else {
+                    // continue outside loop: emit a no-op jump to self
+                    let here = self.chunk.instructions.len();
+                    self.chunk.write(OpCode::OpJump(here + 1), vspan(sp));
+                }
+            }
+
+            // throw expr; — raise a RuntimeError
+            StmtKind::Throw(e) => {
+                self.emit_expr(e);
+                self.chunk.write(OpCode::OpThrow, vspan(sp));
+            }
+
+            // loop { body } — infinite loop with break
+            StmtKind::Loop(body) => {
+                let loop_start = self.ip();
+
+                // Push loop context: continue goes back to loop_start, break patches will be collected
+                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+
+                self.begin_scope();
+                for st in body {
+                    self.emit_stmt(st);
+                }
+                self.end_scope();
+
+                // back-edge: always jump back
+                self.chunk.write(OpCode::OpJump(loop_start), vspan(sp));
+
+                // patch all break jumps
+                let exit_ip = self.ip();
+                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                    for bp in break_patches {
+                        self.patch(bp, OpCode::OpJump(exit_ip));
+                    }
+                }
+            }
+        } // end emit_stmt match
+    } // end emit_stmt fn
 
     fn emit_expr(&mut self, e: Expr) {
         let sp = e.span;
@@ -956,6 +1273,56 @@ impl Compiler {
                 self.emit_expr(desugared);
             }
 
+            ExprKind::IfExpr(cond, then_br, else_br) => {
+                let tmp = format!("__if_{}", sp.start);
+                let nil_expr = Expr {
+                    kind: ExprKind::Nil,
+                    span: sp,
+                };
+                let arm_stmts = |arm: &Expr| -> Vec<Stmt> {
+                    match &arm.kind {
+                        ExprKind::BlockExpr(inner, tail) => {
+                            let mut stmts = inner.clone();
+                            if let Some(t) = tail {
+                                stmts.push(Stmt {
+                                    kind: StmtKind::Assign(tmp.clone(), (**t).clone()),
+                                    span: sp,
+                                });
+                            }
+                            stmts
+                        }
+                        _ => vec![Stmt {
+                            kind: StmtKind::Assign(tmp.clone(), arm.clone()),
+                            span: sp,
+                        }],
+                    }
+                };
+                let desugared = Expr {
+                    kind: ExprKind::BlockExpr(
+                        vec![
+                            Stmt {
+                                kind: StmtKind::Let(tmp.clone(), None, nil_expr),
+                                span: sp,
+                            },
+                            Stmt {
+                                kind: StmtKind::If(
+                                    *cond,
+                                    arm_stmts(&then_br),
+                                    Some(arm_stmts(&else_br)),
+                                ),
+                                span: sp,
+                            },
+                        ],
+                        Some(Box::new(Expr {
+                            kind: ExprKind::Var(tmp),
+                            span: sp,
+                        })),
+                    ),
+                    span: sp,
+                };
+                self.emit_expr(desugared);
+            }
+
             ExprKind::BlockExpr(stmts, tail) => {
                 // Desugar:
                 // { stmts; expr? }  ==>  (fn(){ stmts; return expr; })()
@@ -1002,12 +1369,14 @@ impl Compiler {
                     locals: vec![],
                     scope_depth: 1,
                     upvalues: vec![],
+                    loop_ctx: vec![],
                     enclosing: Some(Box::new(Compiler {
                         chunk: Chunk::default(), // dummy
                         globals: HashMap::new(), // dummy
                         locals: self.locals.clone(),
                         scope_depth: self.scope_depth,
                         upvalues: self.upvalues.clone(),
+                        loop_ctx: vec![],
                         enclosing: None,
                         error: None,
                     })),
@@ -1015,8 +1384,8 @@ impl Compiler {
                 };
 
                 // params are locals in slot 0..arity-1
-                for (p, _pty) in &params {
-                    f_compiler.add_local(p.clone());
+                for p in &params {
+                    f_compiler.add_local(p.name.clone());
                 }
 
                 // function body scope
@@ -1034,9 +1403,19 @@ impl Compiler {
                 f_compiler.chunk.write(OpCode::OpReturn, VmSpan::default());
 
                 optimize_chunk(&mut f_compiler.chunk);
+                let is_vararg_lit = params.last().map(|p| p.is_vararg).unwrap_or(false);
+                let named_arity_lit = if is_vararg_lit { params.len() - 1 } else { params.len() };
+                let min_arity_lit = params.iter().filter(|p| p.default.is_none() && !p.is_vararg).count();
+                let defaults_lit: Vec<pblang_ir::Value> = params.iter()
+                    .filter_map(|p| p.default.as_ref().map(expr_to_const_value))
+                    .flatten()
+                    .collect();
                 let fun = Rc::new(Function {
                     name: name_opt,
-                    arity: params.len(),
+                    arity: named_arity_lit,
+                    min_arity: min_arity_lit,
+                    defaults: defaults_lit,
+                    is_vararg: is_vararg_lit,
                     chunk: f_compiler.chunk,
                 });
 
@@ -1201,8 +1580,89 @@ impl Compiler {
                 self.emit_expr(*inner);
                 self.chunk.write(OpCode::OpResultUnwrap, vspan(sp));
             }
-        }
-    }
+
+            // `a ?? b` — null coalescing: if a is nil, use b
+            // Stack trace:
+            //   eval a            ; [a]
+            //   OpDup             ; [a, a]
+            //   OpIsNil           ; pops top a, pushes bool [a, is_nil]
+            //   OpJumpIfFalse(not_nil_label)  ; PEEK (no pop): if NOT nil (false), jump [a, false]
+            //   ; nil branch:
+            //   OpPop             ; pop bool (true) [a(=nil)]
+            //   OpPop             ; pop nil []
+            //   eval b            ; [b]
+            //   OpJump(end)
+            //   not_nil_label:
+            //   OpPop             ; pop bool (false) [a]
+            //   end:
+            ExprKind::NullCoalesce(a, b) => {
+                self.emit_expr(*a);
+                self.chunk.write(OpCode::OpDup, vspan(sp));
+                self.chunk.write(OpCode::OpIsNil, vspan(sp));
+                let jmp_not_nil = self.emit(OpCode::OpJumpIfFalse(0), sp);
+                // --- nil branch (is_nil = true, peek didn't pop) ---
+                self.chunk.write(OpCode::OpPop, vspan(sp)); // pop is_nil bool (true)
+                self.chunk.write(OpCode::OpPop, vspan(sp)); // pop nil
+                self.emit_expr(*b);
+                let jmp_end = self.emit(OpCode::OpJump(0), sp);
+                // --- not-nil branch ---
+                let not_nil_ip = self.ip();
+                self.patch(jmp_not_nil, OpCode::OpJumpIfFalse(not_nil_ip));
+                self.chunk.write(OpCode::OpPop, vspan(sp)); // pop is_nil bool (false)
+                // (original a value remains on stack)
+                let end_ip = self.ip();
+                self.patch(jmp_end, OpCode::OpJump(end_ip));
+            }
+
+            // `f"Hello {name}"` — f-string interpolation
+            ExprKind::FString(parts) => {
+                use pblang_core::FStringPart;
+                if parts.is_empty() {
+                    let k = self.chunk.add_const(alloc_string(""));
+                    self.chunk.write(OpCode::OpConstant(k), vspan(sp));
+                    return;
+                }
+                let mut first = true;
+                for part in parts {
+                    match part {
+                        FStringPart::Literal(s) => {
+                            let k = self.chunk.add_const(alloc_string(s));
+                            self.chunk.write(OpCode::OpConstant(k), vspan(sp));
+                        }
+                        FStringPart::Interp(e) => {
+                            // Emit: str(expr) — use str builtin via OpGetGlobal + OpCall
+                            let str_name = self.intern_name("str");
+                            self.chunk.write(OpCode::OpGetGlobal(str_name), vspan(sp));
+                            self.emit_expr(*e);
+                            self.chunk.write(OpCode::OpCall(1), vspan(sp));
+                        }
+                    }
+                    if !first {
+                        self.chunk.write(OpCode::OpAdd, vspan(sp)); // concatenate
+                    }
+                    first = false;
+                }
+            }
+
+            // `a ** b` — exponentiation via num_pow
+            ExprKind::Pow(a, b) => {
+                let pow_name = self.intern_name("num_pow");
+                self.chunk.write(OpCode::OpGetGlobal(pow_name), vspan(sp));
+                self.emit_expr(*a);
+                self.emit_expr(*b);
+                self.chunk.write(OpCode::OpCall(2), vspan(sp));
+            }
+
+            // `a % b` — modulo via num_mod
+            ExprKind::Mod(a, b) => {
+                let mod_name = self.intern_name("num_mod");
+                self.chunk.write(OpCode::OpGetGlobal(mod_name), vspan(sp));
+                self.emit_expr(*a);
+                self.emit_expr(*b);
+                self.chunk.write(OpCode::OpCall(2), vspan(sp));
+            }
+        } // end emit_expr match
+    } // end emit_expr fn
 
     fn intern_name(&mut self, name: &str) -> usize {
         if let Some(&idx) = self.globals.get(name) {
@@ -1215,8 +1675,66 @@ impl Compiler {
 }
 
 fn optimize_chunk(chunk: &mut Chunk) {
-    // Very small peephole optimizer:
-    // - jump threading: jump-to-jump becomes direct jump
+    // Pass 1: Constant folding — replace constant arithmetic at compile time.
+    // Walk the instruction list looking for pairs: OpConstant(a) + OpConstant(b) + OpXxx
+    // where OpXxx is a pure arithmetic/comparison op. Replace with a single OpConstant(result).
+    let n = chunk.instructions.len();
+    let mut i = 0usize;
+    while i + 2 < n {
+        // Peek at three consecutive instructions
+        let op0 = chunk.instructions.get(i).cloned();
+        let op1 = chunk.instructions.get(i + 1).cloned();
+        let op2 = chunk.instructions.get(i + 2).cloned();
+
+        // Pattern: OpConstant(a), OpConstant(b), BinaryOp → fold to OpConstant(result)
+        if let (Some(OpCode::OpConstant(ia)), Some(OpCode::OpConstant(ib)), Some(ref arith)) = (op0, op1, op2) {
+            let va = chunk.constants.get(ia).cloned();
+            let vb = chunk.constants.get(ib).cloned();
+            let folded: Option<Value> = match (va, vb, arith) {
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpAdd) => Some(Value::Number(a + b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpSub) => Some(Value::Number(a - b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpMul) => Some(Value::Number(a * b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpDiv) if b != 0.0 => Some(Value::Number(a / b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpEq)    => Some(Value::Bool(a == b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpNotEq) => Some(Value::Bool(a != b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpLt)    => Some(Value::Bool(a < b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpLe)    => Some(Value::Bool(a <= b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpGt)    => Some(Value::Bool(a > b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpGe)    => Some(Value::Bool(a >= b)),
+                // String concatenation folding
+                _ => None,
+            };
+            if let Some(result) = folded {
+                let new_idx = chunk.constants.len();
+                chunk.constants.push(result);
+                // Replace the 3-instruction sequence with OpConstant(new_idx) + 2 x OpPop-and-skip
+                // Since we can't delete instructions (jump targets), replace with OpConstant + OpJump(skip)
+                // Simpler: Replace [OpConstant(a), OpConstant(b), BinaryOp] with
+                //          [OpConstant(result), OpJump(i+3), <dead OpConstant(b)>]
+                // But this is complex. Use a different approach: replace with NOP pattern.
+                // For now, just fold by replacing op2 (the arith op) with OpConstant and
+                // turning op0/op1 into "load nil then pop" via OpConstant(nil)+OpPop+OpConstant(nil)+OpPop.
+                // Actually, simplest safe approach: mark op0 and op1 as no-ops (OpJump(i+1) = jump to self+1).
+                // We use OpJump(next) for op0 and op1, and OpConstant(result) for the operator slot.
+                let span0 = chunk.spans.get(i).copied().unwrap_or_default();
+                let span2 = chunk.spans.get(i + 2).copied().unwrap_or_default();
+                // Turn the 3-instruction window into:
+                // i+0: OpJump(i+1)  (skip to next, effectively no-op)
+                // i+1: OpJump(i+2)  (skip to next)
+                // i+2: OpConstant(new_idx)  (the folded result)
+                chunk.instructions[i]     = OpCode::OpJump(i + 1);
+                chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
+                chunk.instructions[i + 2] = OpCode::OpConstant(new_idx);
+                chunk.spans[i]     = span0;
+                chunk.spans[i + 2] = span2;
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // Pass 2: Jump threading — jump-to-jump becomes direct jump
     // This keeps bytecode stable and cheap without changing instruction indices (no deletions).
     let mut changed = true;
     while changed {
@@ -1226,8 +1744,10 @@ fn optimize_chunk(chunk: &mut Chunk) {
             match op {
                 OpCode::OpJump(t) => {
                     if let Some(OpCode::OpJump(t2)) = chunk.instructions.get(t).cloned() {
-                        chunk.instructions[i] = OpCode::OpJump(t2);
-                        changed = true;
+                        if t != i && t2 != i { // avoid self-jumps
+                            chunk.instructions[i] = OpCode::OpJump(t2);
+                            changed = true;
+                        }
                     }
                 }
                 OpCode::OpJumpIfFalse(t) => {
@@ -1245,6 +1765,43 @@ fn optimize_chunk(chunk: &mut Chunk) {
                 _ => {}
             }
         }
+    }
+
+    // Pass 3: Peephole — remove redundant instruction pairs
+    let n2 = chunk.instructions.len();
+    let mut i = 0;
+    while i + 1 < n2 {
+        let op0 = chunk.instructions.get(i).cloned();
+        let op1 = chunk.instructions.get(i + 1).cloned();
+
+        // Dup + Pop → remove both (net zero effect), replace with OpJump(next)
+        if matches!(op0, Some(OpCode::OpDup)) && matches!(op1, Some(OpCode::OpPop)) {
+            chunk.instructions[i]     = OpCode::OpJump(i + 2);
+            chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
+            i += 2;
+            continue;
+        }
+
+        // Not + Not → remove both (double negation), replace with OpJump(next)
+        if matches!(op0, Some(OpCode::OpNot)) && matches!(op1, Some(OpCode::OpNot)) {
+            chunk.instructions[i]     = OpCode::OpJump(i + 2);
+            chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
+            i += 2;
+            continue;
+        }
+
+        // IsNil followed immediately by Not → IsNotNil optimization
+        // (IsNil+Not = check if not nil). Can fold but keep for now.
+
+        // Jump to immediate next instruction → dead jump, replace with OpJump(next)
+        if let Some(OpCode::OpJump(target)) = op0 {
+            if target == i + 1 {
+                // Jump to next instruction is dead code
+                chunk.instructions[i] = OpCode::OpJump(i + 1); // stays as no-op
+            }
+        }
+
+        i += 1;
     }
 }
 
@@ -1322,6 +1879,8 @@ pub fn disasm(chunk: &Chunk) -> String {
             OpCode::OpSafeIndex => format!("  {:4} OpSafeIndex", i),
             OpCode::OpResultUnwrap => format!("  {:4} OpResultUnwrap", i),
             OpCode::OpIsNil => format!("  {:4} OpIsNil", i),
+            OpCode::OpDup => format!("  {:4} OpDup", i),
+            OpCode::OpThrow => format!("  {:4} OpThrow", i),
         };
         writeln!(out, "{}", line).ok();
     }

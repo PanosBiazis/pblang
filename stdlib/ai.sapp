@@ -1,0 +1,311 @@
+// stdlib/ai.sapp — AI/ML integration layer for pblang.
+//
+// Provides bridges to: ONNX Runtime, HTTP AI APIs (OpenAI, Ollama, Claude),
+// local inference via subprocess, embeddings, vector similarity, tokenization,
+// prompt engineering, RAG pipelines, and agent frameworks.
+//
+// Usage:
+//   let ai = import("stdlib:ai.sapp");
+//   let response = ai.chat("What is 2+2?", map{ model: "gpt-4", provider: "openai" });
+//   let embedding = ai.embed("Hello world", map{ model: "text-embedding-3-small" });
+//   let similar = ai.cosine_similarity(vec_a, vec_b);
+
+let http_client = import("stdlib:http_client.sapp");
+
+// ── Provider Configuration ────────────────────────────────────────────────────
+
+let _providers = map{};
+
+// register_provider(name, config) — register an AI API provider.
+// config: { base_url, api_key, model_default, headers }
+fn register_provider(name, config) {
+    _providers[name] = config;
+    return true;
+}
+
+// Auto-register from env vars if available
+fn _auto_register() {
+    let openai_key = env_get("OPENAI_API_KEY");
+    if openai_key != nil {
+        register_provider("openai", map{
+            base_url: "https://api.openai.com/v1",
+            api_key: openai_key,
+            model_default: "gpt-4o-mini"
+        });
+    }
+    let anthropic_key = env_get("ANTHROPIC_API_KEY");
+    if anthropic_key != nil {
+        register_provider("anthropic", map{
+            base_url: "https://api.anthropic.com/v1",
+            api_key: anthropic_key,
+            model_default: "claude-3-haiku-20240307"
+        });
+    }
+    let ollama_url = env_get("OLLAMA_URL");
+    if ollama_url == nil { ollama_url = "http://localhost:11434"; }
+    register_provider("ollama", map{
+        base_url: ollama_url,
+        api_key: nil,
+        model_default: "llama3.2"
+    });
+}
+_auto_register();
+
+// ── Chat Completion ───────────────────────────────────────────────────────────
+
+// chat(prompt, options) — send a chat completion request.
+// options: { provider, model, system_prompt, temperature, max_tokens, messages }
+fn chat(prompt, options) {
+    if options == nil { options = map{}; }
+    let provider_name = try options.provider catch "ollama";
+    let provider = try _providers[provider_name] catch nil;
+    if provider == nil {
+        return error("ai.chat: unknown provider '" + provider_name + "'. Register with ai.register_provider()");
+    }
+    let model = try options.model catch provider.model_default;
+    let temperature = try options.temperature catch 0.7;
+    let max_tokens = try options.max_tokens catch 2048;
+
+    // Build messages array
+    let messages = try options.messages catch nil;
+    if messages == nil {
+        messages = [];
+        let sys = try options.system_prompt catch nil;
+        if sys != nil {
+            messages[0] = map{ role: "system", content: sys };
+            messages[1] = map{ role: "user", content: prompt };
+        } else {
+            messages[0] = map{ role: "user", content: prompt };
+        }
+    }
+
+    if provider_name == "ollama" {
+        return _ollama_chat(provider, model, messages, temperature, max_tokens);
+    } else if provider_name == "openai" {
+        return _openai_chat(provider, model, messages, temperature, max_tokens);
+    } else if provider_name == "anthropic" {
+        return _anthropic_chat(provider, model, messages, temperature, max_tokens);
+    }
+    return error("ai.chat: provider not supported: " + provider_name);
+}
+
+fn _ollama_chat(provider, model, messages, temperature, max_tokens) {
+    let url = provider.base_url + "/api/chat";
+    let body = map{
+        model: model,
+        messages: messages,
+        options: map{ temperature: temperature, num_predict: max_tokens },
+        stream: false
+    };
+    let raw = try http_post(url, json_stringify(body)) catch nil;
+    if raw == nil { return map{ error: "ollama: connection failed" }; }
+    let resp = try json_parse(raw) catch nil;
+    if resp == nil { return map{ error: "ollama: invalid response" }; }
+    let content = try resp.message.content catch "";
+    return map{ content: content, model: model, provider: "ollama", raw: resp };
+}
+
+fn _openai_chat(provider, model, messages, temperature, max_tokens) {
+    let url = provider.base_url + "/chat/completions";
+    let body = json_stringify(map{
+        model: model,
+        messages: messages,
+        temperature: temperature,
+        max_tokens: max_tokens
+    });
+    let raw = try http_post_auth(url, body, "Bearer " + str(provider.api_key)) catch nil;
+    if raw == nil { return map{ error: "openai: connection failed" }; }
+    let resp = try json_parse(raw) catch nil;
+    if resp == nil { return map{ error: "openai: invalid response" }; }
+    let content = try resp.choices[0].message.content catch "";
+    return map{ content: content, model: model, provider: "openai", raw: resp };
+}
+
+fn _anthropic_chat(provider, model, messages, temperature, max_tokens) {
+    let url = provider.base_url + "/messages";
+    let body = json_stringify(map{
+        model: model,
+        messages: messages,
+        max_tokens: max_tokens
+    });
+    // Anthropic uses x-api-key header
+    let raw = try http_post_auth(url, body, provider.api_key) catch nil;
+    if raw == nil { return map{ error: "anthropic: connection failed" }; }
+    let resp = try json_parse(raw) catch nil;
+    if resp == nil { return map{ error: "anthropic: invalid response" }; }
+    let content = try resp.content[0].text catch "";
+    return map{ content: content, model: model, provider: "anthropic", raw: resp };
+}
+
+// ── Embeddings ────────────────────────────────────────────────────────────────
+
+// embed(text, options) — get embedding vector for text.
+// options: { provider, model }
+fn embed(text, options) {
+    if options == nil { options = map{}; }
+    let provider_name = try options.provider catch "ollama";
+    let provider = try _providers[provider_name] catch nil;
+    if provider == nil { return error("ai.embed: unknown provider"); }
+    let model = try options.model catch "nomic-embed-text";
+
+    if provider_name == "ollama" {
+        let url = provider.base_url + "/api/embeddings";
+        let body = json_stringify(map{ model: model, prompt: text });
+        let raw = try http_post(url, body) catch nil;
+        if raw == nil { return map{ error: "ollama embed failed" }; }
+        let resp = try json_parse(raw) catch nil;
+        return try resp.embedding catch [];
+    } else if provider_name == "openai" {
+        let url = provider.base_url + "/embeddings";
+        let body = json_stringify(map{ input: text, model: model });
+        let raw = try http_post_auth(url, body, "Bearer " + str(provider.api_key)) catch nil;
+        if raw == nil { return map{ error: "openai embed failed" }; }
+        let resp = try json_parse(raw) catch nil;
+        return try resp.data[0].embedding catch [];
+    }
+    return error("ai.embed: unsupported provider");
+}
+
+// ── Vector Math ───────────────────────────────────────────────────────────────
+
+// cosine_similarity(a, b) — compute cosine similarity between two vectors.
+fn cosine_similarity(a, b) {
+    if len(a) != len(b) { return error("ai.cosine_similarity: vectors must have same length"); }
+    let dot = 0.0;
+    let norm_a = 0.0;
+    let norm_b = 0.0;
+    for i len(a) {
+        dot = dot + a[i] * b[i];
+        norm_a = norm_a + a[i] * a[i];
+        norm_b = norm_b + b[i] * b[i];
+    }
+    let denom = num_sqrt(norm_a) * num_sqrt(norm_b);
+    if denom == 0.0 { return 0.0; }
+    return dot / denom;
+}
+
+// euclidean_distance(a, b) — L2 distance between two vectors.
+fn euclidean_distance(a, b) {
+    if len(a) != len(b) { return error("ai.euclidean_distance: vectors must have same length"); }
+    let sum = 0.0;
+    for i len(a) {
+        let d = a[i] - b[i];
+        sum = sum + d * d;
+    }
+    return num_sqrt(sum);
+}
+
+// ── RAG / Vector Store ────────────────────────────────────────────────────────
+
+// vector_store_new() — create an in-memory vector store.
+fn vector_store_new() {
+    return map{ documents: [], embeddings: [] };
+}
+
+// vector_store_add(store, doc, embedding) — add a document with its embedding.
+fn vector_store_add(store, doc, embedding) {
+    store.documents[len(store.documents)] = doc;
+    store.embeddings[len(store.embeddings)] = embedding;
+    return store;
+}
+
+// vector_store_search(store, query_embedding, top_k) — find most similar docs.
+fn vector_store_search(store, query_embedding, top_k) {
+    if top_k == nil { top_k = 5; }
+    let scores = [];
+    for i len(store.embeddings) {
+        let sim = cosine_similarity(query_embedding, store.embeddings[i]);
+        scores[i] = map{ index: i, score: sim, document: store.documents[i] };
+    }
+    // Sort by score descending (simple selection sort)
+    for i len(scores) {
+        for j i + 1 {
+            if j < len(scores) and scores[j].score > scores[i].score {
+                let tmp = scores[i];
+                scores[i] = scores[j];
+                scores[j] = tmp;
+            }
+        }
+    }
+    // Return top_k
+    let result = [];
+    let limit = top_k;
+    if limit > len(scores) { limit = len(scores); }
+    for i limit { result[i] = scores[i]; }
+    return result;
+}
+
+// ── Prompt Engineering ────────────────────────────────────────────────────────
+
+// prompt_template(template, vars) — fill a prompt template.
+fn prompt_template(template, vars) {
+    let result = template;
+    let keys = map_keys(vars);
+    for i len(keys) {
+        let k = keys[i];
+        result = str_replace_all(result, "{{" + k + "}}", str(vars[k]));
+    }
+    return result;
+}
+
+// chain_of_thought(question, options) — wrap in CoT prompting.
+fn chain_of_thought(question, options) {
+    let sys = "You are a careful reasoner. Think step by step before giving your final answer.";
+    let prompt = "Question: " + question + "\n\nLet's think step by step:";
+    if options == nil { options = map{}; }
+    options.system_prompt = sys;
+    return chat(prompt, options);
+}
+
+// ── Agent Framework ───────────────────────────────────────────────────────────
+
+// tool_call(response_text, tools_map) — parse and execute tool calls from AI response.
+// tools_map: map{ tool_name: fn(args_map) { ... } }
+fn tool_call(response_text, tools_map) {
+    // Simple tool call parsing: look for ```tool_call\n{...}\n```
+    if str_contains(response_text, "```tool_call") == false { return nil; }
+    let parts = str_split(response_text, "```tool_call");
+    if len(parts) < 2 { return nil; }
+    let json_part = str_split(parts[1], "```");
+    let call_json = str_trim(json_part[0]);
+    let call = try json_parse(call_json) catch nil;
+    if call == nil { return nil; }
+    let tool_name = try call.name catch nil;
+    let args = try call.arguments catch map{};
+    let tool_fn = try tools_map[tool_name] catch nil;
+    if tool_fn == nil { return map{ error: "unknown tool: " + str(tool_name) }; }
+    let result = try tool_fn(args) catch nil;
+    return map{ tool: tool_name, arguments: args, result: result };
+}
+
+// ── Local Model via Subprocess ────────────────────────────────────────────────
+
+// local_generate(model, prompt) — call Ollama generate endpoint (non-chat).
+fn local_generate(model, prompt) {
+    let url = "http://localhost:11434/api/generate";
+    let body = json_stringify(map{ model: model, prompt: prompt, stream: false });
+    let raw = try http_post(url, body) catch nil;
+    if raw == nil { return map{ error: "ollama not reachable" }; }
+    let resp = try json_parse(raw) catch nil;
+    return try resp.response catch "";
+}
+
+// list_models() — list locally available Ollama models.
+fn list_models() {
+    let url = "http://localhost:11434/api/tags";
+    let raw = try http_get(url) catch nil;
+    if raw == nil { return []; }
+    let resp = try json_parse(raw) catch nil;
+    if resp == nil { return []; }
+    let models = try resp.models catch [];
+    let names = [];
+    for i len(models) {
+        names[i] = try models[i].name catch "unknown";
+    }
+    return names;
+}
+
+export register_provider, chat, embed, cosine_similarity, euclidean_distance,
+       vector_store_new, vector_store_add, vector_store_search,
+       prompt_template, chain_of_thought, tool_call,
+       local_generate, list_models;

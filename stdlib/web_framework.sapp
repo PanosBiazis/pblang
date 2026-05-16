@@ -1,0 +1,209 @@
+// stdlib/web_framework.sapp — Full web framework combining routing, middleware, 
+// templating, sessions, CORS, static files, and JSON APIs.
+//
+// This is the "batteries-included" web framework for pblang, inspired by
+// Express.js, Flask, and Go's net/http.
+//
+// Usage:
+//   let web = import("stdlib:web_framework.sapp");
+//   let app = web.create_app(map{ port: 8080, static_dir: "./public" });
+//   web.get(app, "/", fn(ctx) { return ctx.json(map{ hello: "world" }); });
+//   web.get(app, "/users/:id", fn(ctx) { return ctx.text("User " + ctx.params.id); });
+//   web.post(app, "/api/data", fn(ctx) { return ctx.json(map{ received: ctx.body }); });
+//   web.use(app, web.cors());
+//   web.use(app, web.logger());
+//   web.listen(app);
+
+let server = import("stdlib:http_server.sapp");
+let tmpl = import("stdlib:template.sapp");
+
+// create_app(config) — create a web application.
+// config: { port, host, static_dir, view_dir, cors, session_secret }
+fn create_app(config) {
+    if config == nil { config = map{}; }
+    let app_instance = server.app_new();
+    return map{
+        _app: app_instance,
+        config: map{
+            port: try config.port catch 8080,
+            host: try config.host catch "127.0.0.1",
+            static_dir: try config.static_dir catch nil,
+            view_dir: try config.view_dir catch "./views",
+            session_secret: try config.session_secret catch nil
+        },
+        _middleware: [],
+        _error_handler: nil
+    };
+}
+
+// Context builder — wraps request with convenience methods.
+fn _make_context(req, app) {
+    return map{
+        request: req,
+        method: req.method,
+        path: req.path,
+        query: req.query,
+        params: try req.params catch map{},
+        headers: try req.headers catch map{},
+        body: try req.body catch "",
+        cookies: try server.cookies(req) catch map{},
+        
+        // Response helpers
+        json: fn(data) { return server.res.ok_json(data); },
+        text: fn(body) { return server.res.ok_text(body); },
+        html: fn(body) { return map{ status: 200, body: body, content_type: "text/html" }; },
+        status: fn(code) {
+            return map{
+                json: fn(data) { return server.res_json(code, data); },
+                text: fn(body) { return server.res_text(code, body); },
+                send: fn(body) { return map{ status: code, body: body }; }
+            };
+        },
+        redirect: fn(url) { return server.res.redirect(url); },
+        render: fn(template_name, data) {
+            let path = app.config.view_dir + "/" + template_name;
+            let content = try tmpl.render_file(path, data) catch nil;
+            if content == nil {
+                return map{ status: 500, body: "Template not found: " + template_name };
+            }
+            return map{ status: 200, body: content, content_type: "text/html" };
+        },
+        cookie: fn(name) {
+            let cs = try server.cookies(req) catch map{};
+            return try cs[name] catch nil;
+        }
+    };
+}
+
+// get(app, path, handler) — register a GET route.
+fn get(app, path, handler) {
+    server.app_get(app._app, path, fn(req) {
+        let ctx = _make_context(req, app);
+        return handler(ctx);
+    });
+    return app;
+}
+
+// post(app, path, handler) — register a POST route.
+fn post(app, path, handler) {
+    server.app_post(app._app, path, fn(req) {
+        let ctx = _make_context(req, app);
+        return handler(ctx);
+    });
+    return app;
+}
+
+// use(app, middleware_fn) — add global middleware.
+fn use(app, mw_fn) {
+    server.app_use(app._app, mw_fn);
+    return app;
+}
+
+// ── Built-in Middleware ───────────────────────────────────────────────────────
+
+// cors() — CORS middleware allowing all origins.
+fn cors() {
+    return fn(req) {
+        // For preflight OPTIONS requests
+        if req.method == "OPTIONS" {
+            return map{
+                status: 204,
+                body: "",
+                headers: map{
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,PATCH,OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+                    "Access-Control-Max-Age": "86400"
+                }
+            };
+        }
+        return nil;  // continue to next middleware/route
+    };
+}
+
+// logger() — request logging middleware.
+fn logger() { return server.mw_log(); }
+
+// rate_limit(max_req, window_ms) — rate limiting middleware.
+fn rate_limit(max_req, window_ms) {
+    return server.mw_rate_limit(max_req, window_ms);
+}
+
+// json_body() — middleware that parses JSON body.
+fn json_body() {
+    return fn(req) {
+        if req.body != nil and req.body != "" {
+            let parsed = try json_parse(req.body) catch nil;
+            if parsed != nil { req.json_body = parsed; }
+        }
+        return nil;
+    };
+}
+
+// auth_bearer(validator_fn) — Bearer token auth middleware.
+// validator_fn(token) should return true/false.
+fn auth_bearer(validator_fn) {
+    return fn(req) {
+        let auth_header = try req.headers.Authorization catch nil;
+        if auth_header == nil { auth_header = try req.headers.authorization catch nil; }
+        if auth_header == nil {
+            return server.res_json(401, map{ error: "unauthorized" });
+        }
+        let parts = str_split(auth_header, " ");
+        if len(parts) < 2 {
+            return server.res_json(401, map{ error: "invalid authorization header" });
+        }
+        let token = parts[1];
+        let valid = try validator_fn(token) catch false;
+        if valid == false {
+            return server.res_json(403, map{ error: "forbidden" });
+        }
+        req.auth_token = token;
+        return nil;
+    };
+}
+
+// static_files(dir) — serve static files from a directory.
+fn static_files(dir) {
+    return fn(req) {
+        if req.method != "GET" { return nil; }
+        let path = try req.path catch "/";
+        // Only handle /static/* or direct file paths
+        let response = server.static_file_response(dir, path);
+        if response.status == 200 { return response; }
+        return nil;  // not found in static dir, continue to routes
+    };
+}
+
+// ── Server Lifecycle ──────────────────────────────────────────────────────────
+
+// listen(app) — start the web server (blocking).
+fn listen(app) {
+    let addr = app.config.host + ":" + str(app.config.port);
+    print "🚀 Server listening on http://" + addr;
+    
+    // If static_dir is configured, add static file middleware
+    let static_dir = try app.config.static_dir catch nil;
+    if static_dir != nil {
+        server.app_use(app._app, static_files(static_dir));
+    }
+    
+    server.serve_forever_app(addr, app._app);
+}
+
+// listen_once(app) — serve one request then stop (for testing).
+fn listen_once(app) {
+    let addr = app.config.host + ":" + str(app.config.port);
+    return server.serve_once_app(addr, app._app);
+}
+
+// ── Error Handling ────────────────────────────────────────────────────────────
+
+// on_error(app, handler_fn) — set global error handler.
+fn on_error(app, handler_fn) {
+    app._error_handler = handler_fn;
+    return app;
+}
+
+export create_app, get, post, use, cors, logger, rate_limit,
+       json_body, auth_bearer, static_files, listen, listen_once, on_error;

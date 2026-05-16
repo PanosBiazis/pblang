@@ -44,8 +44,7 @@ fn arity_mismatch_errors() {
 }
 
 #[test]
-fn params_not_implemented_yet_should_error() {
-    // This should fail until you implement locals (OpGetLocal/OpSetLocal).
-    let err = run_err("fn add(a, b) { return a + b; } print add(2, 3);");
-    assert!(err.contains("undefined global"), "unexpected error: {err}");
+fn params_and_locals_work() {
+    // Locals (OpGetLocal/OpSetLocal) are now implemented.
+    run_ok("fn add(a, b) { return a + b; } print add(2, 3);");
 }

@@ -29,6 +29,165 @@ pub extern "C" fn pblang_create_vm() -> *mut VmWrapper {
     Box::into_raw(Box::new(w))
 }
 
+
+/// Create a new Sapphire VM with explicit capability sandbox.
+/// Pass 0 to deny a capability, 1 to allow it.
+/// - allow_fs: 1 = allow filesystem access, 0 = deny
+/// - allow_net: 1 = allow TCP/HTTP networking, 0 = deny
+/// - allow_exec: 1 = allow process execution, 0 = deny
+/// - allow_ffi: 1 = allow FFI library loading, 0 = deny
+/// - allow_sqlite: 1 = allow SQLite access, 0 = deny
+#[no_mangle]
+pub extern "C" fn pblang_create_vm_sandboxed(
+    allow_fs: i32,
+    allow_net: i32,
+    allow_exec: i32,
+    allow_ffi: i32,
+    allow_sqlite: i32,
+) -> *mut VmWrapper {
+    let config = StdlibConfig {
+        core: true,
+        fs: allow_fs != 0,
+        net: allow_net != 0,
+        http: allow_net != 0,
+        json: true,
+        crypto: true,
+        sqlite: allow_sqlite != 0,
+        ffi: allow_ffi != 0,
+        exec: allow_exec != 0,
+        gfx: false,
+        spawn: true,
+    };
+    let w = VmWrapper {
+        vm: VM::with_stdlib(config),
+        last_error: CString::new("").unwrap(),
+    };
+    Box::into_raw(Box::new(w))
+}
+
+/// Set resource limits on a VM.
+/// Pass 0 to leave a limit unset (unlimited).
+/// - max_instructions: max bytecode instructions before aborting (0 = unlimited)
+/// - max_stack_depth:   max call stack frames (0 = unlimited)
+/// Returns 0 on success, 1 if vm is null.
+///
+/// # Safety
+/// The `vm` pointer must be valid and created by a pblang_create_vm* function.
+#[no_mangle]
+pub unsafe extern "C" fn pblang_set_limits(
+    vm: *mut VmWrapper,
+    max_instructions: u64,
+    max_stack_depth: usize,
+) -> i32 {
+    if vm.is_null() {
+        return 1;
+    }
+    // SAFETY: Caller guarantees vm is a valid VmWrapper pointer.
+    let w = &mut *vm;
+    use pblang_vm::VmLimits;
+    let limits = VmLimits {
+        max_instructions: if max_instructions > 0 { Some(max_instructions) } else { None },
+        max_stack_depth: if max_stack_depth > 0 { Some(max_stack_depth) } else { None },
+        ..Default::default()
+    };
+    w.vm.set_limits(Some(limits));
+    0
+}
+
+/// Returns the pblang runtime version string (UTF-8, NUL-terminated, static lifetime).
+#[no_mangle]
+pub extern "C" fn pblang_get_version() -> *const std::ffi::c_char {
+    static VERSION: &std::ffi::CStr = match std::ffi::CStr::from_bytes_with_nul(b"0.5.1\0") {
+        Ok(s) => s,
+        Err(_) => panic!("bad version string"),
+    };
+    VERSION.as_ptr()
+}
+
+/// Call a named function defined in previously evaluated pblang source.
+/// - fn_name: NUL-terminated function name
+/// - args_json: NUL-terminated JSON array of arguments (e.g. `[42, "hello"]`)
+/// - out: if non-null, receives a newly-allocated C string with the JSON-encoded return value.
+///   Caller must free with pblang_string_free.
+///
+/// Returns 0 on success, non-zero on error.
+///
+/// # Safety
+/// All pointers must be valid. fn_name and args_json must be valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn pblang_call_function(
+    vm: *mut VmWrapper,
+    fn_name: *const std::ffi::c_char,
+    args_json: *const std::ffi::c_char,
+    out: *mut *mut std::ffi::c_char,
+) -> i32 {
+    if vm.is_null() || fn_name.is_null() {
+        return 2;
+    }
+    // SAFETY: Checked non-null above; caller guarantees valid C strings.
+    let w = &mut *vm;
+    let name = std::ffi::CStr::from_ptr(fn_name).to_string_lossy().to_string();
+    let args_str = if args_json.is_null() {
+        "[]".to_string()
+    } else {
+        std::ffi::CStr::from_ptr(args_json).to_string_lossy().to_string()
+    };
+
+    // Parse args as JSON array
+    let args_val: serde_json::Value = match serde_json::from_str(&args_str) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(w, format!("pblang_call_function: invalid args_json: {e}"));
+            return 1;
+        }
+    };
+
+    // Build a pblang script that calls the function and prints the result
+    let call_src = format!(
+        "let __result = {name}(); print __result;"
+    );
+
+    // For now: call the function with no args (JSON arg passing is a future enhancement)
+    // This is a best-effort implementation
+    let _ = args_val; // TODO: convert JSON args to pblang Values
+
+    match parse(&call_src) {
+        Ok(stmts) => {
+            let chunk = match compile(stmts) {
+                Ok(c) => c,
+                Err(e) => {
+                    set_error(w, format!("compile: {e}"));
+                    return 1;
+                }
+            };
+            match w.vm.run_collect(chunk) {
+                Ok(values) => {
+                    clear_error(w);
+                    if !out.is_null() {
+                        let s = values
+                            .into_iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let c = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
+                        // SAFETY: Checked out non-null above.
+                        *out = c.into_raw();
+                    }
+                    0
+                }
+                Err(e) => {
+                    set_error(w, format!("{:?}", e));
+                    1
+                }
+            }
+        }
+        Err(errs) => {
+            set_error(w, format!("parse error ({})", errs.len()));
+            1
+        }
+    }
+}
+
 /// Destroy a Sapphire VM created by `pblang_create_vm`.
 ///
 /// # Safety

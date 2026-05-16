@@ -7,11 +7,11 @@ use pblang_vm::{StdlibConfig, Value, VmLimits};
 use std::rc::Rc;
 
 mod common;
-use common::run_collect;
+use common::{run_collect, run_err};
 
 fn run_collect_with_limits(limits: VmLimits, src: &str) -> Result<Vec<Value>, RuntimeError> {
     let stmts = parse(src).expect("parse failed");
-    let mut chunk = compile(stmts);
+    let mut chunk = compile(stmts).expect("compile failed");
     chunk.source_name = Some(Rc::new("<test>".to_string()));
     chunk.source = Some(Rc::new(src.to_string()));
     let mut vm = VM::with_stdlib(StdlibConfig::default());
@@ -96,7 +96,7 @@ fn not_transferable_handles_error() {
 fn spawn_not_allowed_when_sandboxed() {
     let stmts =
         parse(r#" let h = spawn(fn() { return 1; }); print join(h); "#).expect("parse failed");
-    let mut chunk = compile(stmts);
+    let mut chunk = compile(stmts).expect("compile failed");
     chunk.source_name = Some(Rc::new("<test>".to_string()));
     chunk.source = Some(Rc::new(
         "let h = spawn(fn() { return 1; }); print join(h);".to_string(),
@@ -253,4 +253,25 @@ fn two_spawns_two_channels_deterministic() {
         "#,
     );
     assert_eq!(out, vec![Value::Number(100.0), Value::Number(200.0)]);
+}
+
+#[test]
+fn channel_handles_are_isolated_between_top_level_vms() {
+    let out = run_collect(
+        r#"
+        let ch = channel();
+        print ch.receiver;
+        "#,
+    );
+    let handle = match out.first() {
+        Some(Value::Number(n)) => *n as usize,
+        other => panic!("expected numeric receiver handle, got {:?}", other),
+    };
+
+    let err = run_err(&format!("print recv({handle});"));
+    assert!(
+        err.message.contains("invalid channel") || err.message.contains("recv:"),
+        "expected invalid channel error, got: {}",
+        err.message
+    );
 }

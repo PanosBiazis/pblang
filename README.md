@@ -2,7 +2,7 @@
 
 **A fast, secure, embeddable programming language built in Rust.**
 
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-83%2F84%20passing-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-0.5.1-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-135%2F135%20passing-brightgreen)]()
 
 pblang is a general-purpose programming language and bytecode VM designed for both **embedded scripting** (games, tools, applications) and **standalone development** (web servers, CLI tools, AI/quantum workflows). It features capability-based security, a built-in package manager, and a growing standard library of 34+ modules.
 
@@ -13,11 +13,11 @@ pblang is a general-purpose programming language and bytecode VM designed for bo
 - **Fast Stack-Based VM** — Compiled to efficient bytecode with RC + cycle-breaking GC
 - **Capability-Based Security** — Fine-grained sandboxing via `VmLimits`, `FfiPolicy`, and `StdlibConfig`
 - **Built-in Package Manager** — Semver resolution, local/remote registries, lockfiles, SHA256 verification
-- **34+ Standard Library Modules** — HTTP, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, and more
+- **68 Standard Library Modules** — HTTP, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, and more
 - **Concurrency** — VM-per-thread model with typed channels and multi-channel `select`
 - **Polyglot Blocks** — Embed Python, JavaScript, SQL, or any language directly in source files
 - **FFI** — Call C libraries directly with allowlist-based security
-- **LSP Server** — Editor support with diagnostics (parse + type errors); completions, hover, and go-to-definition are planned for v0.7
+- **LSP Server** — `pblang lsp` uses tower-lsp (`pblang-lsp`): parse + typecheck diagnostics, completions, hover, go-to-definition, workspace symbols
 - **CLI Toolchain** — `run`, `test`, `fmt`, `lint`, `build`, `bundle`, `publish`, and more
 - **Embeddable** — Drop into any Rust application with full control over capabilities
 - **Cross-Platform** — Linux, macOS, and Windows
@@ -224,7 +224,7 @@ Source (.sapp) → Parser (chumsky) → AST → Type Check → Compiler → Byte
 | `pblang install [name@version]` | Install dependencies |
 | `pblang publish` | Publish package to registry |
 | `pblang search <query>` | Search package registry |
-| `pblang bundle [--self-extract]` | Create portable distribution |
+| `pblang bundle [--self-extract]` | Portable folder, or single self-extract binary (embeds `pblang` runtime) |
 | `pblang pack [path]` | Create `.tar.gz` package archive |
 | `pblang verify <tarball>` | Verify package integrity |
 | `pblang lsp` | Start LSP server (stdin/stdout) |
@@ -312,6 +312,13 @@ pblang search "http server"          # Search packages
 | **System** | `fs`, `os`, `path`, `process`, `time`, `net` |
 | **Graphics** | `graphics` |
 | **Interop** | `ffi`, `polyglot`, `strings`, `array`, `map`, `ptr` |
+| **Testing** | `testing` |
+| **Async** | `async` |
+| **ORM** | `orm` |
+| **Logging** | `log` |
+| **Templating** | `template` |
+| **Auth** | `jwt` |
+| **Config** | `env` (`.env` loader) |
 
 ---
 

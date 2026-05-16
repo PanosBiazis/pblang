@@ -96,6 +96,13 @@ pub mod chunk {
         OpResultUnwrap,
         /// Pops value; pushes true if nil, false otherwise
         OpIsNil,
+        /// Duplicates the top of the value stack: push(peek())
+        OpDup,
+        /// Pops a value and raises it as a RuntimeError.
+        /// If the value is a string, uses it as the message.
+        /// If the value is a map with an "message" key, uses that.
+        /// Otherwise converts to string and uses as message.
+        OpThrow,
     }
 
     #[derive(Debug, Default, Clone)]
@@ -144,6 +151,8 @@ pub struct RuntimeError {
 
 pub trait VmHost {
     fn err(&self, msg: String) -> RuntimeError;
+    /// Downcast hook used by the VM for host-specific subsystems (concurrency handles, etc.).
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     fn import_module(&mut self, path: &str) -> Result<Value, RuntimeError>;
     /// Optional tracing/cycle collection hook. Default is a no-op.
     ///
@@ -194,6 +203,56 @@ pub trait VmHost {
     /// Limits to apply to the child VM when spawn is used. None = no limits in child.
     fn spawn_limits(&self) -> Option<VmLimits> {
         None
+    }
+
+    // Runtime memory-safety tracker (optional; the VM host implements these).
+
+    fn mem_allocate(&mut self, _value: Value, _is_mutable: bool) -> Result<f64, RuntimeError> {
+        Err(self.err("allocate: memory safety not supported by this host".into()))
+    }
+
+    fn mem_borrow_immutable(&mut self, _handle: f64) -> Result<f64, RuntimeError> {
+        Err(self.err("borrow_immutable: memory safety not supported by this host".into()))
+    }
+
+    fn mem_borrow_mutable(&mut self, _handle: f64) -> Result<f64, RuntimeError> {
+        Err(self.err("borrow_mutable: memory safety not supported by this host".into()))
+    }
+
+    fn mem_borrow_unique(&mut self, _handle: f64) -> Result<f64, RuntimeError> {
+        Err(self.err("borrow_unique: memory safety not supported by this host".into()))
+    }
+
+    fn mem_release_borrow_id(&mut self, _borrow_id: f64) -> Result<(), RuntimeError> {
+        Err(self.err("release_borrow: memory safety not supported by this host".into()))
+    }
+
+    fn mem_release_borrow_type(&mut self, _handle: f64, _borrow_type: u8) -> Result<(), RuntimeError> {
+        Err(self.err("release_borrow: memory safety not supported by this host".into()))
+    }
+
+    fn mem_load(&mut self, _handle: f64) -> Result<Value, RuntimeError> {
+        Err(self.err("load: memory safety not supported by this host".into()))
+    }
+
+    fn mem_store(&mut self, _handle: f64, _value: Value) -> Result<(), RuntimeError> {
+        Err(self.err("store: memory safety not supported by this host".into()))
+    }
+
+    fn mem_deallocate(&mut self, _handle: f64) -> Result<(), RuntimeError> {
+        Err(self.err("deallocate: memory safety not supported by this host".into()))
+    }
+
+    fn mem_push_lifetime(&mut self) -> Result<f64, RuntimeError> {
+        Err(self.err("push_lifetime: memory safety not supported by this host".into()))
+    }
+
+    fn mem_pop_lifetime(&mut self) -> Result<f64, RuntimeError> {
+        Err(self.err("pop_lifetime: memory safety not supported by this host".into()))
+    }
+
+    fn mem_stats(&self) -> Result<Value, RuntimeError> {
+        Err(self.err("memory_stats: memory safety not supported by this host".into()))
     }
 }
 
@@ -297,7 +356,22 @@ impl fmt::Display for Value {
 #[derive(Debug)]
 pub struct Function {
     pub name: Option<String>,
+    /// Total number of named parameters (required + optional).
     pub arity: usize,
+    /// Number of required parameters (those without default values).
+    /// Calls with fewer than min_arity args are a runtime error.
+    /// Calls with argc in [min_arity, arity] use defaults for missing args.
+    pub min_arity: usize,
+    /// Pre-compiled default values for optional parameters.
+    /// `defaults[i]` corresponds to parameter at index `min_arity + i`.
+    /// Only constant-expression defaults (numbers, strings, bools, nil) are stored here.
+    /// Complex defaults: fn foo(x, y = nil) { if y == nil { y = compute(); } }
+    pub defaults: Vec<Value>,
+    /// When true, the last parameter is a variadic "rest" parameter that
+    /// collects all extra arguments into an Array value.
+    /// E.g. fn sum(...args) — args receives all call arguments as an array.
+    pub is_vararg: bool,
+    /// The compiled bytecode of this function.
     pub chunk: Chunk,
 }
 

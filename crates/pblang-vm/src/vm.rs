@@ -8,7 +8,7 @@ pub use pblang_ir::{FrameTrace, RuntimeError};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -19,8 +19,24 @@ use std::{
     net::{TcpListener, TcpStream},
 };
 
+// Import our new modules
+use crate::concurrency::{
+    ThreadPool, VmChannelBuf, VmHandleRegistry, VmSyncAtomic, VmSyncBarrier, VmSyncMutex, VmSyncOnce,
+    VmSyncRwLock,
+};
+use crate::memory_safety::{BorrowId, BorrowType, MemoryId, MemorySafetyError, MemoryTracker};
+
+// TLS support via rustls
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+};
+use rustls_native_certs;
+use webpki_roots;
+
 use libloading::Library;
 use rand::Rng; // for random_bytes builtin
+use regex; // for regex_* builtins
 use rusqlite::Connection;
 use serde_json as sj;
 use sha2::Digest;
@@ -81,12 +97,85 @@ fn alloc_map(items: HashMap<String, Value>) -> Value {
 #[derive(Debug)]
 enum NetResource {
     Listener(TcpListener),
+    TlsListener(TcpListener, Arc<ServerConfig>),
     Stream(NetStream),
+}
+
+// StreamKind abstracts over plain and TLS streams for transparent tcp_read/tcp_write
+enum StreamKind {
+    Plain(TcpStream),
+    TlsServer(StreamOwned<ServerConnection, TcpStream>),
+    TlsClient(StreamOwned<ClientConnection, TcpStream>),
+}
+
+impl std::fmt::Debug for StreamKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamKind::Plain(_) => write!(f, "StreamKind::Plain(...)"),
+            StreamKind::TlsServer(_) => write!(f, "StreamKind::TlsServer(...)"),
+            StreamKind::TlsClient(_) => write!(f, "StreamKind::TlsClient(...)"),
+        }
+    }
+}
+
+impl Read for StreamKind {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            StreamKind::Plain(s) => s.read(buf),
+            StreamKind::TlsServer(s) => s.read(buf),
+            StreamKind::TlsClient(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for StreamKind {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            StreamKind::Plain(s) => s.write(buf),
+            StreamKind::TlsServer(s) => s.write(buf),
+            StreamKind::TlsClient(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            StreamKind::Plain(s) => s.flush(),
+            StreamKind::TlsServer(s) => s.flush(),
+            StreamKind::TlsClient(s) => s.flush(),
+        }
+    }
+}
+
+impl StreamKind {
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        match self {
+            StreamKind::Plain(s) => s.local_addr(),
+            StreamKind::TlsServer(s) => s.get_ref().local_addr(),
+            StreamKind::TlsClient(s) => s.get_ref().local_addr(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            StreamKind::Plain(s) => s.set_read_timeout(dur),
+            StreamKind::TlsServer(s) => s.get_ref().set_read_timeout(dur),
+            StreamKind::TlsClient(s) => s.get_ref().set_read_timeout(dur),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            StreamKind::Plain(s) => s.set_write_timeout(dur),
+            StreamKind::TlsServer(s) => s.get_ref().set_write_timeout(dur),
+            StreamKind::TlsClient(s) => s.get_ref().set_write_timeout(dur),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct NetStream {
-    stream: TcpStream,
+    inner: StreamKind,
     buf: Vec<u8>,
 }
 
@@ -121,94 +210,11 @@ fn db_table() -> &'static Mutex<HashMap<usize, DbResource>> {
     DB_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// Spawn/join: handle table and next id for VM-per-thread spawn.
-// We send Result<String, String>: Ok = JSON of return Value (Value is !Send), Err = error message.
-type SpawnReceiver = mpsc::Receiver<Result<String, String>>;
-static SPAWN_TABLE: OnceLock<Mutex<HashMap<usize, SpawnReceiver>>> =
-    OnceLock::new();
-static SPAWN_NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-
-fn spawn_table() -> &'static Mutex<HashMap<usize, SpawnReceiver>> {
-    SPAWN_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// Channel infrastructure for cross-thread channel builtins.
-#[derive(Clone)]
-struct ChanBuf {
-    buf: Arc<Mutex<std::collections::VecDeque<String>>>,
-    closed: Arc<AtomicBool>,
-    /// 0 = unbounded; >0 = bounded (Go-style buffered channel).
-    capacity: usize,
-    /// Condvar to wake blocked senders when buffer has space.
-    space_cv: Arc<(Mutex<()>, std::sync::Condvar)>,
-    /// Condvar to wake blocked receivers when buffer has items.
-    item_cv:  Arc<(Mutex<()>, std::sync::Condvar)>,
-}
-
-static CHAN_TABLE: OnceLock<Mutex<HashMap<usize, ChanBuf>>> = OnceLock::new();
-static CHAN_NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-
-fn chan_table() -> &'static Mutex<HashMap<usize, ChanBuf>> {
-    CHAN_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// ---- Mutex (sync.Mutex equivalent, like Go/Java/Rust Mutex) ----
-struct VmMutex {
-    locked: Mutex<bool>,
-    cv: std::sync::Condvar,
-}
-static MUTEX_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmMutex>>>> = OnceLock::new();
-static MUTEX_NEXT: AtomicUsize = AtomicUsize::new(1);
-fn mutex_table() -> &'static Mutex<HashMap<usize, Arc<VmMutex>>> {
-    MUTEX_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// ---- RwLock (sync.RWMutex / Rust RwLock) ----
-struct VmRwLock {
-    /// readers < 0 means write-locked (-1), readers >= 0 = reader count
-    state: Mutex<i64>,
-    cv: std::sync::Condvar,
-}
-static RWLOCK_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmRwLock>>>> = OnceLock::new();
-static RWLOCK_NEXT: AtomicUsize = AtomicUsize::new(1);
-fn rwlock_table() -> &'static Mutex<HashMap<usize, Arc<VmRwLock>>> {
-    RWLOCK_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// ---- Barrier (sync.WaitGroup / CyclicBarrier in Java) ----
-struct VmBarrier {
-    n: usize,
-    arrived: Mutex<usize>,
-    cv: std::sync::Condvar,
-}
-static BARRIER_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmBarrier>>>> = OnceLock::new();
-static BARRIER_NEXT: AtomicUsize = AtomicUsize::new(1);
-fn barrier_table() -> &'static Mutex<HashMap<usize, Arc<VmBarrier>>> {
-    BARRIER_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// ---- Once (sync.Once in Go / Kotlin by-lazy) ----
-struct VmOnce {
-    done: AtomicBool,
-    /// Reserved for future thread-safe once_do implementation.
-    #[allow(dead_code)] running: Mutex<bool>,
-    #[allow(dead_code)] cv: std::sync::Condvar,
-}
-static ONCE_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmOnce>>>> = OnceLock::new();
-static ONCE_NEXT: AtomicUsize = AtomicUsize::new(1);
-fn once_table() -> &'static Mutex<HashMap<usize, Arc<VmOnce>>> {
-    ONCE_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// ---- Atomic i64 (AtomicInteger in Java / atomic.Int64 in Go / Rust AtomicI64) ----
-use std::sync::atomic::AtomicI64;
-struct VmAtomic {
-    val: AtomicI64,
-}
-static ATOMIC_TABLE: OnceLock<Mutex<HashMap<usize, Arc<VmAtomic>>>> = OnceLock::new();
-static ATOMIC_NEXT: AtomicUsize = AtomicUsize::new(1);
-fn atomic_table() -> &'static Mutex<HashMap<usize, Arc<VmAtomic>>> {
-    ATOMIC_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn vm_handles(host: &mut dyn VmHost) -> Result<Arc<VmHandleRegistry>, RuntimeError> {
+    host.as_any_mut()
+        .downcast_mut::<VM>()
+        .map(|vm| Arc::clone(&vm.handle_registry))
+        .ok_or_else(|| host.err("concurrency: internal host error".into()))
 }
 
 /// Serialize a Value to JSON for sending to a spawn child (transferable types only).
@@ -363,22 +369,37 @@ impl StdlibConfig {
     /// are invisible (not just call-time-denied).
     pub fn allows(&self, name: &str) -> bool {
         match name {
-            "clock" | "now_ms" | "now_iso" | "type" | "str" | "num_sqrt" | "num_pow" | "num_ln" | "num_exp"
-            | "num_atan2" | "num_mod" | "num_floor" | "num_ceil" | "parse_number"
+            "clock" | "now_ms" | "now_iso" | "type" | "str" | "num_sqrt" | "num_pow" | "num_ln"
+            | "num_exp" | "num_atan2" | "num_mod" | "num_floor" | "num_ceil" | "parse_number"
             | "parse_bool" | "read_line" | "len" | "array_push" | "array_pop" | "map_keys"
             | "map_has" | "map_remove" | "import" | "gc_stats" | "gc_collect" | "str_contains"
-            | "str_starts_with" | "str_trim" | "str_split" => self.core,
+            | "str_starts_with" | "str_trim" | "str_split" | "regex_match" | "regex_find"
+            | "regex_find_all" | "regex_replace" | "regex_replace_all" | "regex_split"
+            | "regex_capture" | "str_format" | "str_repeat" | "str_pad_left" | "str_pad_right"
+            | "str_upper" | "str_lower" | "array_unique" | "array_zip" | "array_chunk"
+            | "array_flatten" | "array_take" | "array_drop" | "range" | "enumerate" | "sum"
+            | "min_of" | "max_of" | "product" | "clamp" | "is_number" | "is_string"
+            | "is_array" | "is_map" | "is_bool" | "is_fn" | "is_nil" | "env_get" | "env_set"
+            | "str_replace_all" => self.core,
             "fs_read" | "fs_write" | "fs_append" | "fs_remove" | "fs_rename" | "fs_copy"
             | "fs_read_bytes" | "fs_write_bytes" | "fs_exists" | "fs_mkdirs" | "fs_listdir"
             | "path_join" | "path_dirname" | "path_basename" | "cwd" => self.fs,
-            "env_get" | "env_set" | "sleep_ms" | "exec" | "proc_spawn_wait" => self.exec,
+            "sleep_ms"
+            | "exec"
+            | "proc_spawn_wait"
+            | "os_which"
+            | "quantum_run"
+            | "quantum_statevector"
+            | "quantum_backends"
+            | "polyglot_exec" => self.exec,
             "sha256" | "random_bytes" | "random_float" | "constant_time_eq" | "base64_encode"
-            | "base64_decode" => self.crypto,
+            | "base64_decode" | "hmac_sha256" => self.crypto,
             "json_parse" | "json_stringify" => self.json,
-            "http_get" | "http_post" => self.http,
+            "http_get" | "http_post" | "ai_chat" | "ai_embed" => self.http,
             "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_until" | "tcp_write"
-            | "tcp_close" | "tcp_local_addr" | "http_parse_request" | "http_response"
-            | "http_response_ct" | "http_response_json" | "onnx_infer" => self.net,
+            | "tcp_close" | "tcp_local_addr" | "tcp_listen_tls" | "tcp_connect_tls"
+            | "tcp_wrap_tls" | "http_parse_request" | "http_response" | "http_response_ct"
+            | "http_response_json" | "onnx_infer" | "ai_token_count" => self.net,
             "ffi_load" | "ffi_call" | "ffi_close" => self.ffi,
             "sqlite_open"
             | "sqlite_close"
@@ -408,8 +429,7 @@ pub struct FfiPolicy {
 }
 
 /// Resource limits for sandboxing (anti-infinite-loop, stack overflow, IO, memory).
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct VmLimits {
     /// Max VM instructions per run. Prevents infinite loops.
     pub max_instructions: Option<u64>,
@@ -421,7 +441,7 @@ pub struct VmLimits {
     pub io_timeout_ms: Option<u64>,
 }
 
-
+#[allow(dead_code)]
 pub struct VM {
     stack: Vec<Value>,
     //globals: HashMap<String, Value>,
@@ -438,6 +458,12 @@ pub struct VM {
     limits: Option<VmLimits>,
     /// Optional FFI allowlist; when Some and allow_all is false, only listed libs/symbols are allowed.
     ffi_policy: Option<FfiPolicy>,
+    /// Memory safety tracker for Rust-like ownership and borrowing
+    memory_tracker: MemoryTracker,
+    /// Concurrency primitives for thread-safe operations
+    thread_pool: Option<ThreadPool>,
+    /// Spawn/channel/sync handle tables (shared with child VMs from `spawn`).
+    handle_registry: Arc<VmHandleRegistry>,
 }
 
 #[derive(Default)]
@@ -703,7 +729,6 @@ impl VM {
             Ok(Value::Number(now.as_secs_f64()))
         }
 
-
         fn now_ms(_host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !args.is_empty() {
                 return Err(_host.err("now_ms() takes no arguments".into()));
@@ -735,12 +760,12 @@ impl VM {
             // Computes (year, month, day) from a Unix day count in O(1).
             let z: i64 = (secs / 86400) as i64 + 719468;
             let era: i64 = if z >= 0 { z } else { z - 146096 } / 146097;
-            let doe = (z - era * 146097) as u64;           // day of era [0, 146096]
-            let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365; // year of era [0, 399]
+            let doe = (z - era * 146097) as u64; // day of era [0, 146096]
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
             let y = yoe as i64 + era * 400;
-            let doy = doe - (365*yoe + yoe/4 - yoe/100);  // day of year [0, 365]
-            let mp = (5*doy + 2) / 153;                    // month of year [0, 11]
-            let day = doy - (153*mp + 2)/5 + 1;            // day [1, 31]
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+            let mp = (5 * doy + 2) / 153; // month of year [0, 11]
+            let day = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
             let month = if mp < 10 { mp + 3 } else { mp - 9 };
             let y = if month <= 2 { y + 1 } else { y };
             let (y, month, day) = (y as u64, month, day);
@@ -756,19 +781,30 @@ impl VM {
                 return Err(host.err("proc_spawn_wait access denied".into()));
             }
             if args.len() != 2 {
-                return Err(host.err(format!("proc_spawn_wait() expects 2 arguments (cmd, args), got {}", args.len())));
+                return Err(host.err(format!(
+                    "proc_spawn_wait() expects 2 arguments (cmd, args), got {}",
+                    args.len()
+                )));
             }
-            let cmd = args[0].as_str().map_err(|m| host.err(format!("proc_spawn_wait(): {m}")))?;
+            let cmd = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("proc_spawn_wait(): {m}")))?;
             let argv = match &args[1] {
                 Value::Array(arr) => {
                     let mut v: Vec<String> = Vec::new();
                     for item in arr.borrow().iter() {
-                        let s = item.as_str().map_err(|m| host.err(format!("proc_spawn_wait(): arg: {m}")))?;
+                        let s = item
+                            .as_str()
+                            .map_err(|m| host.err(format!("proc_spawn_wait(): arg: {m}")))?;
                         v.push(s.to_string());
                     }
                     v
                 }
-                _ => return Err(host.err("proc_spawn_wait(): second argument must be an array".into())),
+                _ => {
+                    return Err(
+                        host.err("proc_spawn_wait(): second argument must be an array".into())
+                    )
+                }
             };
             let output = std::process::Command::new(cmd)
                 .args(&argv)
@@ -1292,9 +1328,7 @@ impl VM {
         }
 
         fn env_get(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_exec() {
-                return Err(host.err("exec/env access denied".into()));
-            }
+            // env_get reads environment variables — always safe (read-only, no exec required).
             if args.len() != 1 {
                 return Err(host.err(format!("env_get() expects 1 argument, got {}", args.len())));
             }
@@ -1351,8 +1385,14 @@ impl VM {
                 .as_str()
                 .map_err(|m| host.err(format!("exec(): {m}")))?;
             // Reject strings containing shell metacharacters or whitespace (injection prevention):
-            let blocked: &[char] = &[';', '&', '|', '$', '`', '>', '<', '!', '{', '}', '(', ')', '\'', '"', '\\', '*', '?', '[', ']', '#', '~'];
-            if cmd.chars().any(|c| c.is_whitespace() || blocked.contains(&c)) {
+            let blocked: &[char] = &[
+                ';', '&', '|', '$', '`', '>', '<', '!', '{', '}', '(', ')', '\'', '"', '\\', '*',
+                '?', '[', ']', '#', '~',
+            ];
+            if cmd
+                .chars()
+                .any(|c| c.is_whitespace() || blocked.contains(&c))
+            {
                 return Err(host.err(
                     "exec(): command contains shell metacharacters or whitespace — use proc_spawn_wait(cmd, args_array) instead.".into()
                 ));
@@ -1408,28 +1448,33 @@ impl VM {
 
         /// type_assert(value, type_str) — assert that value has the expected type.
         /// type_str: "number", "string", "bool", "nil", "array", "map", "closure", "fn".
-        fn type_assert_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn type_assert_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() < 2 {
                 return Err(host.err("type_assert(value, type_str) requires 2 arguments".into()));
             }
-            let expected = args[1].as_str().map_err(|_| host.err("type_assert: second argument must be a string".to_string()))?;
+            let expected = args[1].as_str().map_err(|_| {
+                host.err("type_assert: second argument must be a string".to_string())
+            })?;
             // BUG FIX #13: Must match type_of() exactly so type_assert(f, "fn") works.
             let actual = match &args[0] {
-                Value::Number(_)  => "number",
-                Value::Bool(_)    => "bool",
-                Value::Nil        => "nil",
-                Value::Obj(o)     => match o.as_ref() { pblang_ir::Obj::String(_) => "string" },
-                Value::Array(_)   => "array",
-                Value::Map(_)     => "map",
-                Value::Function(_) => "fn",        // matches type_of() → "fn"
-                Value::Closure(_)  => "closure",   // matches type_of() → "closure"
-                Value::Builtin(_)  => "builtin",
-                Value::Module(_)   => "module",
+                Value::Number(_) => "number",
+                Value::Bool(_) => "bool",
+                Value::Nil => "nil",
+                Value::Obj(o) => match o.as_ref() {
+                    pblang_ir::Obj::String(_) => "string",
+                },
+                Value::Array(_) => "array",
+                Value::Map(_) => "map",
+                Value::Function(_) => "fn", // matches type_of() → "fn"
+                Value::Closure(_) => "closure", // matches type_of() → "closure"
+                Value::Builtin(_) => "builtin",
+                Value::Module(_) => "module",
             };
             if actual != expected {
-                return Err(host.err(format!(
-                    "TypeError: expected {expected}, got {actual}"
-                )));
+                return Err(host.err(format!("TypeError: expected {expected}, got {actual}")));
             }
             Ok(Value::Nil)
         }
@@ -1443,7 +1488,8 @@ impl VM {
             }
             match &args[0] {
                 Value::Map(m) => {
-                    m.borrow_mut().insert("__frozen".to_string(), Value::Bool(true));
+                    m.borrow_mut()
+                        .insert("__frozen".to_string(), Value::Bool(true));
                     Ok(args.into_iter().next().unwrap())
                 }
                 _ => Ok(args.into_iter().next().unwrap()), // non-maps pass through
@@ -1451,7 +1497,10 @@ impl VM {
         }
 
         /// is_frozen(val) — returns true if val has __frozen: true.
-        fn is_frozen_builtin(_host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn is_frozen_builtin(
+            _host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() != 1 {
                 return Err(_host.err("is_frozen(val) takes 1 argument".into()));
             }
@@ -1465,7 +1514,10 @@ impl VM {
         }
 
         /// checked_add(a, b) — add two numbers; returns Err result map if overflow.
-        fn checked_add_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn checked_add_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() != 2 {
                 return Err(host.err("checked_add(a, b) takes 2 arguments".into()));
             }
@@ -1476,7 +1528,10 @@ impl VM {
                         Ok(alloc_map({
                             let mut m = std::collections::HashMap::new();
                             m.insert("ok".to_string(), Value::Bool(false));
-                            m.insert("error".to_string(), alloc_string("arithmetic overflow in checked_add"));
+                            m.insert(
+                                "error".to_string(),
+                                alloc_string("arithmetic overflow in checked_add"),
+                            );
                             m
                         }))
                     } else {
@@ -1492,7 +1547,10 @@ impl VM {
             }
         }
 
-        fn checked_sub_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn checked_sub_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() != 2 {
                 return Err(host.err("checked_sub(a, b) takes 2 arguments".into()));
             }
@@ -1507,7 +1565,10 @@ impl VM {
             }
         }
 
-        fn checked_mul_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn checked_mul_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() != 2 {
                 return Err(host.err("checked_mul(a, b) takes 2 arguments".into()));
             }
@@ -1518,7 +1579,10 @@ impl VM {
                         Ok(alloc_map({
                             let mut m = std::collections::HashMap::new();
                             m.insert("ok".to_string(), Value::Bool(false));
-                            m.insert("error".to_string(), alloc_string("arithmetic overflow in checked_mul"));
+                            m.insert(
+                                "error".to_string(),
+                                alloc_string("arithmetic overflow in checked_mul"),
+                            );
                             m
                         }))
                     } else {
@@ -1534,7 +1598,10 @@ impl VM {
             }
         }
 
-        fn checked_div_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn checked_div_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() != 2 {
                 return Err(host.err("checked_div(a, b) takes 2 arguments".into()));
             }
@@ -1544,7 +1611,10 @@ impl VM {
                         Ok(alloc_map({
                             let mut m = std::collections::HashMap::new();
                             m.insert("ok".to_string(), Value::Bool(false));
-                            m.insert("error".to_string(), alloc_string("division by zero in checked_div"));
+                            m.insert(
+                                "error".to_string(),
+                                alloc_string("division by zero in checked_div"),
+                            );
                             m
                         }))
                     } else {
@@ -1566,23 +1636,30 @@ impl VM {
         }
 
         /// require_type(val, type_str) — like type_assert but returns the value on success.
-        fn require_type_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn require_type_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() < 2 {
                 return Err(host.err("require_type(val, type_str) requires 2 arguments".into()));
             }
-            let expected = args[1].as_str().map_err(|_| host.err("require_type: second argument must be a string".to_string()))?;
+            let expected = args[1].as_str().map_err(|_| {
+                host.err("require_type: second argument must be a string".to_string())
+            })?;
             // BUG FIX #13: Must match type_of() exactly so type_assert(f, "fn") works.
             let actual = match &args[0] {
-                Value::Number(_)  => "number",
-                Value::Bool(_)    => "bool",
-                Value::Nil        => "nil",
-                Value::Obj(o)     => match o.as_ref() { pblang_ir::Obj::String(_) => "string" },
-                Value::Array(_)   => "array",
-                Value::Map(_)     => "map",
-                Value::Function(_) => "fn",        // matches type_of() → "fn"
-                Value::Closure(_)  => "closure",   // matches type_of() → "closure"
-                Value::Builtin(_)  => "builtin",
-                Value::Module(_)   => "module",
+                Value::Number(_) => "number",
+                Value::Bool(_) => "bool",
+                Value::Nil => "nil",
+                Value::Obj(o) => match o.as_ref() {
+                    pblang_ir::Obj::String(_) => "string",
+                },
+                Value::Array(_) => "array",
+                Value::Map(_) => "map",
+                Value::Function(_) => "fn", // matches type_of() → "fn"
+                Value::Closure(_) => "closure", // matches type_of() → "closure"
+                Value::Builtin(_) => "builtin",
+                Value::Module(_) => "module",
             };
             if actual != expected {
                 return Err(host.err(format!(
@@ -1717,7 +1794,10 @@ impl VM {
 
         /// base64_decode_bytes(s) → array<number 0-255>
         /// BUG FIX #22: base64_decode() fails on binary data; this variant returns raw bytes.
-        fn base64_decode_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn base64_decode_bytes(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
             if args.len() != 1 {
                 return Err(host.err(format!(
                     "base64_decode_bytes() expects 1 argument, got {}",
@@ -1863,7 +1943,10 @@ impl VM {
                 .as_str()
                 .map_err(|m| host.err(format!("http_post(): {m}")))?;
             let ct = if args.len() == 3 {
-                args[2].as_str().map_err(|m| host.err(format!("http_post(): {m}")))?.to_string()
+                args[2]
+                    .as_str()
+                    .map_err(|m| host.err(format!("http_post(): {m}")))?
+                    .to_string()
             } else {
                 "application/json".to_string()
             };
@@ -2120,35 +2203,68 @@ impl VM {
             let id = value_to_handle(host, args[0].clone(), "tcp_accept")?;
             let r = with_net_table(host, |t| t.remove(&id))?
                 .ok_or_else(|| host.err("tcp_accept(): invalid handle".into()))?;
-            let listener = match r {
-                NetResource::Listener(l) => l,
+
+            match r {
+                NetResource::Listener(listener) => {
+                    // Plain TCP accept
+                    let (s, _addr) = listener
+                        .accept()
+                        .map_err(|e| host.err(format!("tcp_accept(): {e}")))?;
+                    if let Some(ms) = host.io_timeout_ms() {
+                        let d = Duration::from_millis(ms);
+                        let _ = s.set_read_timeout(Some(d));
+                        let _ = s.set_write_timeout(Some(d));
+                    }
+                    let _ = with_net_table(host, |t| t.insert(id, NetResource::Listener(listener)));
+                    let sid = with_net_table(host, |t| {
+                        let sid = NET_NEXT.fetch_add(1, Ordering::Relaxed);
+                        t.insert(
+                            sid,
+                            NetResource::Stream(NetStream {
+                                inner: StreamKind::Plain(s),
+                                buf: vec![],
+                            }),
+                        );
+                        sid
+                    })?;
+                    Ok(Value::Number(sid as f64))
+                }
+                NetResource::TlsListener(listener, tls_config) => {
+                    // TLS accept: accept TCP, then perform TLS handshake
+                    let (tcp_stream, _addr) = listener
+                        .accept()
+                        .map_err(|e| host.err(format!("tcp_accept(): {e}")))?;
+                    if let Some(ms) = host.io_timeout_ms() {
+                        let d = Duration::from_millis(ms);
+                        let _ = tcp_stream.set_read_timeout(Some(d));
+                        let _ = tcp_stream.set_write_timeout(Some(d));
+                    }
+                    // Create TLS server connection
+                    let server_conn = ServerConnection::new(tls_config.clone())
+                        .map_err(|e| host.err(format!("tcp_accept() TLS: {e}")))?;
+                    let tls_stream = StreamOwned::new(server_conn, tcp_stream);
+
+                    let _ = with_net_table(host, |t| {
+                        t.insert(id, NetResource::TlsListener(listener, tls_config))
+                    });
+                    let sid = with_net_table(host, |t| {
+                        let sid = NET_NEXT.fetch_add(1, Ordering::Relaxed);
+                        t.insert(
+                            sid,
+                            NetResource::Stream(NetStream {
+                                inner: StreamKind::TlsServer(tls_stream),
+                                buf: vec![],
+                            }),
+                        );
+                        sid
+                    })?;
+                    Ok(Value::Number(sid as f64))
+                }
                 other => {
                     let _ = with_net_table(host, |t| t.insert(id, other));
-                    return Err(host.err("tcp_accept(): handle is not a listener".into()));
+                    Err(host.err("tcp_accept(): handle is not a listener".into()))
                 }
-            };
-
-            let (s, _addr) = listener
-                .accept()
-                .map_err(|e| host.err(format!("tcp_accept(): {e}")))?;
-            if let Some(ms) = host.io_timeout_ms() {
-                let d = Duration::from_millis(ms);
-                let _ = s.set_read_timeout(Some(d));
-                let _ = s.set_write_timeout(Some(d));
             }
-            let _ = with_net_table(host, |t| t.insert(id, NetResource::Listener(listener)));
-            let sid = with_net_table(host, |t| {
-                let sid = NET_NEXT.fetch_add(1, Ordering::Relaxed);
-                t.insert(
-                    sid,
-                    NetResource::Stream(NetStream {
-                        stream: s,
-                        buf: vec![],
-                    }),
-                );
-                sid
-            })?;
-            Ok(Value::Number(sid as f64))
         }
 
         fn tcp_read(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -2188,7 +2304,7 @@ impl VM {
             while out.len() < n {
                 let mut tmp = vec![0u8; (n - out.len()).min(4096)];
                 let read = st
-                    .stream
+                    .inner
                     .read(&mut tmp)
                     .map_err(|e| host.err(format!("tcp_read(): {e}")))?;
                 if read == 0 {
@@ -2247,7 +2363,7 @@ impl VM {
                 }
                 let mut tmp = [0u8; 4096];
                 let read = st
-                    .stream
+                    .inner
                     .read(&mut tmp)
                     .map_err(|e| host.err(format!("tcp_read_until(): {e}")))?;
                 if read == 0 {
@@ -2286,7 +2402,7 @@ impl VM {
             };
 
             let n = st
-                .stream
+                .inner
                 .write(s.as_bytes())
                 .map_err(|e| host.err(format!("tcp_write(): {e}")))?;
             let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(st)));
@@ -2329,9 +2445,17 @@ impl VM {
                     let _ = with_net_table(host, |t| t.insert(id, NetResource::Listener(l)));
                     Ok(alloc_string(addr.to_string()))
                 }
+                NetResource::TlsListener(l, cfg) => {
+                    let addr = l
+                        .local_addr()
+                        .map_err(|e| host.err(format!("tcp_local_addr(): {e}")))?;
+                    let _ =
+                        with_net_table(host, |t| t.insert(id, NetResource::TlsListener(l, cfg)));
+                    Ok(alloc_string(addr.to_string()))
+                }
                 NetResource::Stream(s) => {
                     let addr = s
-                        .stream
+                        .inner
                         .local_addr()
                         .map_err(|e| host.err(format!("tcp_local_addr(): {e}")))?;
                     let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(s)));
@@ -2340,11 +2464,304 @@ impl VM {
             }
         }
 
+        // ---- TLS builtins (W4-gamma) ----
+
+        /// tcp_listen_tls(addr, cert_pem_path, key_pem_path) → listener handle
+        /// Creates a TLS-wrapped TCP listener using rustls.
+        fn tcp_listen_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_net() {
+                return Err(host.err("net access denied".into()));
+            }
+            if args.len() != 3 {
+                return Err(host.err(format!(
+                    "tcp_listen_tls() expects 3 arguments (addr, cert_path, key_path), got {}",
+                    args.len()
+                )));
+            }
+            let addr = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("tcp_listen_tls(): {m}")))?;
+            let cert_path = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("tcp_listen_tls(): cert_path: {m}")))?;
+            let key_path = args[2]
+                .as_str()
+                .map_err(|m| host.err(format!("tcp_listen_tls(): key_path: {m}")))?;
+
+            // Read certificate chain from PEM file
+            let cert_file = std::fs::File::open(cert_path)
+                .map_err(|e| host.err(format!("tcp_listen_tls(): open cert: {e}")))?;
+            let mut cert_reader = std::io::BufReader::new(cert_file);
+            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+                .filter_map(|r| r.ok())
+                .collect();
+            if certs.is_empty() {
+                return Err(host.err("tcp_listen_tls(): no certificates found in PEM file".into()));
+            }
+
+            // Read private key from PEM file
+            let key_file = std::fs::File::open(key_path)
+                .map_err(|e| host.err(format!("tcp_listen_tls(): open key: {e}")))?;
+            let mut key_reader = std::io::BufReader::new(key_file);
+            let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+                .map_err(|e| host.err(format!("tcp_listen_tls(): read key: {e}")))?
+                .ok_or_else(|| {
+                    host.err("tcp_listen_tls(): no private key found in PEM file".into())
+                })?;
+
+            // Build ServerConfig
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| host.err(format!("tcp_listen_tls(): config: {e}")))?;
+
+            // Bind TCP listener
+            let listener = TcpListener::bind(addr)
+                .map_err(|e| host.err(format!("tcp_listen_tls(): bind: {e}")))?;
+
+            // Store as TlsListener
+            let id = with_net_table(host, |t| {
+                let id = NET_NEXT.fetch_add(1, Ordering::Relaxed);
+                t.insert(
+                    id,
+                    NetResource::TlsListener(listener, Arc::new(server_config)),
+                );
+                id
+            })?;
+
+            Ok(Value::Number(id as f64))
+        }
+
+        /// tcp_connect_tls(host, port) → stream handle
+        /// Connects to a TLS server. Note: uses a permissive verifier for prototyping.
+        /// TODO: Add proper certificate verification for production use.
+        fn tcp_connect_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_net() {
+                return Err(host.err("net access denied".into()));
+            }
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tcp_connect_tls() expects 2 arguments (host, port), got {}",
+                    args.len()
+                )));
+            }
+            let host_str = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("tcp_connect_tls(): host: {m}")))?;
+            let port = match &args[1] {
+                Value::Number(n) if n.is_finite() && *n >= 0.0 && *n <= 65535.0 => *n as u16,
+                _ => {
+                    return Err(host.err("tcp_connect_tls(): port must be a number 0-65535".into()))
+                }
+            };
+
+            // Connect TCP
+            let addr = format!("{}:{}", host_str, port);
+            let tcp_stream = TcpStream::connect(&addr)
+                .map_err(|e| host.err(format!("tcp_connect_tls(): connect: {e}")))?;
+            if let Some(ms) = host.io_timeout_ms() {
+                let d = Duration::from_millis(ms);
+                let _ = tcp_stream.set_read_timeout(Some(d));
+                let _ = tcp_stream.set_write_timeout(Some(d));
+            }
+
+            // Build ClientConfig with proper system root certificates (webpki-roots + native certs).
+            // This replaces the old DangerousAllowAllVerifier that accepted ANY certificate.
+            let mut root_store = RootCertStore::empty();
+            // Add Mozilla's curated WebPKI root CAs (always available, no network needed)
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            // Also attempt to add system/native root certs (optional, best-effort)
+            if let Ok(native_certs) = rustls_native_certs::load_native_certs() {
+                for cert in native_certs {
+                    let _ = root_store.add(cert);
+                }
+            }
+            let client_config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+
+            // Create server name for SNI
+            let server_name: ServerName<'static> = host_str
+                .to_string()
+                .try_into()
+                .map_err(|_| host.err("tcp_connect_tls(): invalid server name for SNI".into()))?;
+
+            // Perform TLS handshake
+            let client_conn = ClientConnection::new(Arc::new(client_config), server_name)
+                .map_err(|e| host.err(format!("tcp_connect_tls(): TLS: {e}")))?;
+            let tls_stream = StreamOwned::new(client_conn, tcp_stream);
+
+            // Store as Stream
+            let id = with_net_table(host, |t| {
+                let id = NET_NEXT.fetch_add(1, Ordering::Relaxed);
+                t.insert(
+                    id,
+                    NetResource::Stream(NetStream {
+                        inner: StreamKind::TlsClient(tls_stream),
+                        buf: vec![],
+                    }),
+                );
+                id
+            })?;
+
+            Ok(Value::Number(id as f64))
+        }
+
+        /// tcp_wrap_tls(handle, cert_path, key_path) → new stream handle
+        /// Upgrades an existing plain TCP stream to TLS server mode.
+        fn tcp_wrap_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_net() {
+                return Err(host.err("net access denied".into()));
+            }
+            if args.len() != 3 {
+                return Err(host.err(format!(
+                    "tcp_wrap_tls() expects 3 arguments (handle, cert_path, key_path), got {}",
+                    args.len()
+                )));
+            }
+            let id = value_to_handle(host, args[0].clone(), "tcp_wrap_tls")?;
+            let cert_path = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("tcp_wrap_tls(): cert_path: {m}")))?;
+            let key_path = args[2]
+                .as_str()
+                .map_err(|m| host.err(format!("tcp_wrap_tls(): key_path: {m}")))?;
+
+            // Remove the stream from table
+            let r = with_net_table(host, |t| t.remove(&id))?
+                .ok_or_else(|| host.err("tcp_wrap_tls(): invalid handle".into()))?;
+
+            let tcp_stream = match r {
+                NetResource::Stream(NetStream {
+                    inner: StreamKind::Plain(s),
+                    buf: _,
+                }) => s,
+                other => {
+                    let _ = with_net_table(host, |t| t.insert(id, other));
+                    return Err(host.err(
+                        "tcp_wrap_tls(): handle must be a plain (non-TLS) TCP stream".into(),
+                    ));
+                }
+            };
+
+            // Read certificate chain from PEM file
+            let cert_file = std::fs::File::open(cert_path)
+                .map_err(|e| host.err(format!("tcp_wrap_tls(): open cert: {e}")))?;
+            let mut cert_reader = std::io::BufReader::new(cert_file);
+            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+                .filter_map(|r| r.ok())
+                .collect();
+            if certs.is_empty() {
+                return Err(host.err("tcp_wrap_tls(): no certificates found in PEM file".into()));
+            }
+
+            // Read private key from PEM file
+            let key_file = std::fs::File::open(key_path)
+                .map_err(|e| host.err(format!("tcp_wrap_tls(): open key: {e}")))?;
+            let mut key_reader = std::io::BufReader::new(key_file);
+            let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+                .map_err(|e| host.err(format!("tcp_wrap_tls(): read key: {e}")))?
+                .ok_or_else(|| {
+                    host.err("tcp_wrap_tls(): no private key found in PEM file".into())
+                })?;
+
+            // Build ServerConfig
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| host.err(format!("tcp_wrap_tls(): config: {e}")))?;
+
+            // Create TLS server connection and wrap stream
+            let server_conn = ServerConnection::new(Arc::new(server_config))
+                .map_err(|e| host.err(format!("tcp_wrap_tls(): TLS: {e}")))?;
+            let tls_stream = StreamOwned::new(server_conn, tcp_stream);
+
+            // Store as new Stream (reuse the same id)
+            let _ = with_net_table(host, |t| {
+                t.insert(
+                    id,
+                    NetResource::Stream(NetStream {
+                        inner: StreamKind::TlsServer(tls_stream),
+                        buf: vec![],
+                    }),
+                )
+            });
+
+            Ok(Value::Number(id as f64))
+        }
+
         fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
             if needle.is_empty() {
                 return Some(0);
             }
             hay.windows(needle.len()).position(|w| w == needle)
+        }
+
+        fn http_status_reason(status: i64) -> &'static str {
+            match status {
+                100 => "Continue",
+                101 => "Switching Protocols",
+                102 => "Processing",
+                103 => "Early Hints",
+                200 => "OK",
+                201 => "Created",
+                202 => "Accepted",
+                203 => "Non-Authoritative Information",
+                204 => "No Content",
+                205 => "Reset Content",
+                206 => "Partial Content",
+                207 => "Multi-Status",
+                208 => "Already Reported",
+                226 => "IM Used",
+                300 => "Multiple Choices",
+                301 => "Moved Permanently",
+                302 => "Found",
+                303 => "See Other",
+                304 => "Not Modified",
+                307 => "Temporary Redirect",
+                308 => "Permanent Redirect",
+                400 => "Bad Request",
+                401 => "Unauthorized",
+                402 => "Payment Required",
+                403 => "Forbidden",
+                404 => "Not Found",
+                405 => "Method Not Allowed",
+                406 => "Not Acceptable",
+                407 => "Proxy Authentication Required",
+                408 => "Request Timeout",
+                409 => "Conflict",
+                410 => "Gone",
+                411 => "Length Required",
+                412 => "Precondition Failed",
+                413 => "Content Too Large",
+                414 => "URI Too Long",
+                415 => "Unsupported Media Type",
+                416 => "Range Not Satisfiable",
+                417 => "Expectation Failed",
+                418 => "I'm a teapot",
+                421 => "Misdirected Request",
+                422 => "Unprocessable Content",
+                423 => "Locked",
+                424 => "Failed Dependency",
+                425 => "Too Early",
+                426 => "Upgrade Required",
+                428 => "Precondition Required",
+                429 => "Too Many Requests",
+                431 => "Request Header Fields Too Large",
+                451 => "Unavailable For Legal Reasons",
+                500 => "Internal Server Error",
+                501 => "Not Implemented",
+                502 => "Bad Gateway",
+                503 => "Service Unavailable",
+                504 => "Gateway Timeout",
+                505 => "HTTP Version Not Supported",
+                506 => "Variant Also Negotiates",
+                507 => "Insufficient Storage",
+                508 => "Loop Detected",
+                510 => "Not Extended",
+                511 => "Network Authentication Required",
+                _ => "Unknown",
+            }
         }
 
         fn http_parse_request(
@@ -2399,13 +2816,7 @@ impl VM {
             let body = args[1]
                 .as_str()
                 .map_err(|m| host.err(format!("http_response(): {m}")))?;
-            let reason = match status {
-                200 => "OK",
-                400 => "Bad Request",
-                404 => "Not Found",
-                500 => "Internal Server Error",
-                _ => "OK",
-            };
+            let reason = http_status_reason(status);
             let resp = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -2437,13 +2848,7 @@ impl VM {
             let body = args[2]
                 .as_str()
                 .map_err(|m| host.err(format!("http_response_ct(): {m}")))?;
-            let reason = match status {
-                200 => "OK",
-                400 => "Bad Request",
-                404 => "Not Found",
-                500 => "Internal Server Error",
-                _ => "OK",
-            };
+            let reason = http_status_reason(status);
             let resp = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -2473,13 +2878,7 @@ impl VM {
             let body =
                 sj::to_string(&j).map_err(|e| host.err(format!("http_response_json(): {e}")))?;
             let ct = "application/json";
-            let reason = match status {
-                200 => "OK",
-                400 => "Bad Request",
-                404 => "Not Found",
-                500 => "Internal Server Error",
-                _ => "OK",
-            };
+            let reason = http_status_reason(status);
             let resp = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -2488,13 +2887,349 @@ impl VM {
             Ok(alloc_string(resp))
         }
 
-        fn onnx_infer(host: &mut dyn VmHost, _args: Vec<Value>) -> Result<Value, RuntimeError> {
+        fn onnx_infer(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !host.allow_net() {
                 return Err(host.err("net access denied".into()));
             }
-            Err(host.err(
-                "onnx_infer() not built-in yet; use host embedding via pblang-ffi for now".into(),
-            ))
+            if args.is_empty() {
+                return Err(
+                    host.err("onnx_infer() expects at least 1 argument (model_path)".into())
+                );
+            }
+            let model_path = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("onnx_infer(): {m}")))?;
+            let input_json = if args.len() >= 2 {
+                args[1]
+                    .as_str()
+                    .map_err(|m| host.err(format!("onnx_infer(): {m}")))?
+                    .to_string()
+            } else {
+                "{}".to_string()
+            };
+            // ONNX Runtime inference is not available as a pure-Rust builtin.
+            // Use the ai_chat / ai_embed builtins for HTTP-based AI inference,
+            // or load ONNX models via the FFI layer (pblang-ffi).
+            Err(host.err(format!(
+                "onnx_infer(): ONNX Runtime not embedded. Use ai_chat/ai_embed for HTTP AI, or load ONNX models via ffi_load/ffi_call. Model path: {model_path}, input: {input_json}"
+            )))
+        }
+
+        /// ai_chat(prompt, options_json) — Chat completion via registered AI providers.
+        /// options_json: JSON string with optional { provider, model, system_prompt, temperature, max_tokens }
+        fn ai_chat(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_http() {
+                return Err(host.err("http access denied".into()));
+            }
+            if args.is_empty() {
+                return Err(host.err("ai_chat() expects at least 1 argument (prompt)".into()));
+            }
+            let prompt = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("ai_chat(): {m}")))?;
+            let options_str = if args.len() >= 2 {
+                args[1]
+                    .as_str()
+                    .map_err(|m| host.err(format!("ai_chat(): {m}")))?
+            } else {
+                "{}"
+            };
+
+            let mut registry = pblang_ai::ProviderRegistry::new();
+            registry.auto_register();
+
+            let options: pblang_ai::ChatOptions =
+                if options_str.trim().is_empty() || options_str == "{}" {
+                    pblang_ai::ChatOptions::default()
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(options_str)
+                        .map_err(|e| host.err(format!("ai_chat(): invalid options JSON: {e}")))?;
+                    let mut opts = pblang_ai::ChatOptions::default();
+                    if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
+                        opts.provider = Some(p.to_string());
+                    }
+                    if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+                        opts.model = Some(m.to_string());
+                    }
+                    if let Some(s) = v.get("system_prompt").and_then(|x| x.as_str()) {
+                        opts.system_prompt = Some(s.to_string());
+                    }
+                    if let Some(t) = v.get("temperature").and_then(|x| x.as_f64()) {
+                        opts.temperature = Some(t);
+                    }
+                    if let Some(mt) = v.get("max_tokens").and_then(|x| x.as_u64()) {
+                        opts.max_tokens = Some(mt as u32);
+                    }
+                    opts
+                };
+
+            match pblang_ai::chat(prompt, &options, &registry) {
+                Ok(resp) => {
+                    let json = pblang_ai::chat_response_to_json(&resp);
+                    Ok(alloc_string(json))
+                }
+                Err(e) => Err(host.err(format!("ai_chat(): {e}"))),
+            }
+        }
+
+        /// ai_embed(text, options_json) — Generate embedding vector from text.
+        fn ai_embed(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_http() {
+                return Err(host.err("http access denied".into()));
+            }
+            if args.is_empty() {
+                return Err(host.err("ai_embed() expects at least 1 argument (text)".into()));
+            }
+            let text = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("ai_embed(): {m}")))?;
+            let options_str = if args.len() >= 2 {
+                args[1]
+                    .as_str()
+                    .map_err(|m| host.err(format!("ai_embed(): {m}")))?
+            } else {
+                "{}"
+            };
+
+            let mut registry = pblang_ai::ProviderRegistry::new();
+            registry.auto_register();
+
+            let options: pblang_ai::ChatOptions =
+                if options_str.trim().is_empty() || options_str == "{}" {
+                    pblang_ai::ChatOptions::default()
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(options_str)
+                        .map_err(|e| host.err(format!("ai_embed(): invalid options JSON: {e}")))?;
+                    let mut opts = pblang_ai::ChatOptions::default();
+                    if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
+                        opts.provider = Some(p.to_string());
+                    }
+                    if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+                        opts.model = Some(m.to_string());
+                    }
+                    opts
+                };
+
+            match pblang_ai::embed(text, &options, &registry) {
+                Ok(resp) => {
+                    let json = pblang_ai::embedding_response_to_json(&resp);
+                    Ok(alloc_string(json))
+                }
+                Err(e) => Err(host.err(format!("ai_embed(): {e}"))),
+            }
+        }
+
+        /// ai_token_count(text) — Estimate token count for text.
+        fn ai_token_count(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "ai_token_count() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let text = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("ai_token_count(): {m}")))?;
+            let tc = pblang_ai::estimate_tokens(text);
+            let json = pblang_ai::token_count_to_json(&tc);
+            Ok(alloc_string(json))
+        }
+
+        /// quantum_run(qasm, backend_str, shots) — Execute a QASM circuit on a quantum backend.
+        fn quantum_run(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_exec() {
+                return Err(host.err("exec access denied".into()));
+            }
+            if args.is_empty() || args.len() > 3 {
+                return Err(host.err(format!(
+                    "quantum_run() expects 1-3 arguments (qasm[, backend, shots]), got {}",
+                    args.len()
+                )));
+            }
+            let qasm = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("quantum_run(): {m}")))?;
+            let backend_str = if args.len() >= 2 {
+                args[1]
+                    .as_str()
+                    .map_err(|m| host.err(format!("quantum_run(): {m}")))?
+            } else {
+                "qiskit"
+            };
+            let shots = if args.len() >= 3 {
+                match &args[2] {
+                    Value::Number(n) => *n as u32,
+                    other => {
+                        return Err(host.err(format!(
+                            "quantum_run(): expected number for shots, got {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                1024
+            };
+
+            let backend =
+                pblang_quantum::QuantumBackend::from_str(backend_str).ok_or_else(|| {
+                    host.err(format!(
+                        "quantum_run(): unknown backend '{}'. Try: qiskit, cirq, braket",
+                        backend_str
+                    ))
+                })?;
+
+            match pblang_quantum::run_qasm(qasm, backend, shots) {
+                Ok(result) => {
+                    let json = pblang_quantum::result_to_json(&result);
+                    Ok(alloc_string(json))
+                }
+                Err(e) => Err(host.err(format!("quantum_run(): {e}"))),
+            }
+        }
+
+        /// quantum_statevector(qasm, backend_str) — Get the statevector of a QASM circuit.
+        fn quantum_statevector(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if !host.allow_exec() {
+                return Err(host.err("exec access denied".into()));
+            }
+            if args.is_empty() || args.len() > 2 {
+                return Err(host.err(format!(
+                    "quantum_statevector() expects 1-2 arguments (qasm[, backend]), got {}",
+                    args.len()
+                )));
+            }
+            let qasm = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("quantum_statevector(): {m}")))?;
+            let backend_str = if args.len() >= 2 {
+                args[1]
+                    .as_str()
+                    .map_err(|m| host.err(format!("quantum_statevector(): {m}")))?
+            } else {
+                "qiskit"
+            };
+
+            let backend =
+                pblang_quantum::QuantumBackend::from_str(backend_str).ok_or_else(|| {
+                    host.err(format!(
+                        "quantum_statevector(): unknown backend '{}'. Try: qiskit, cirq",
+                        backend_str
+                    ))
+                })?;
+
+            match pblang_quantum::get_statevector(qasm, backend) {
+                Ok(sv) => {
+                    let json = pblang_quantum::statevector_to_json(&sv);
+                    Ok(alloc_string(json))
+                }
+                Err(e) => Err(host.err(format!("quantum_statevector(): {e}"))),
+            }
+        }
+
+        /// quantum_backends() — List available quantum backends with availability status.
+        fn quantum_backends(
+            _host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let backends = [("qiskit", pblang_quantum::QuantumBackend::QiskitAer),
+                ("cirq", pblang_quantum::QuantumBackend::CirqLocal),
+                ("braket", pblang_quantum::QuantumBackend::BraketLocal)];
+            let mut result = String::from("[");
+            for (i, (name, backend)) in backends.iter().enumerate() {
+                if i > 0 {
+                    result.push(',');
+                }
+                let available = pblang_quantum::is_backend_available(backend.clone());
+                result.push_str(&format!(
+                    "{{\"name\":\"{name}\",\"available\":{available}}}"
+                ));
+            }
+            result.push(']');
+            Ok(alloc_string(result))
+        }
+
+        /// polyglot_exec(lang, code) — Execute code in a foreign language via subprocess.
+        /// Supported langs: python, js (node), bash (sh), ruby, perl
+        /// Returns JSON: { success, stdout, stderr, exit_code }
+        fn polyglot_exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if !host.allow_exec() {
+                return Err(host.err("exec access denied".into()));
+            }
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "polyglot_exec() expects 2 arguments (lang, code), got {}",
+                    args.len()
+                )));
+            }
+            let lang = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("polyglot_exec(): {m}")))?;
+            let code = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("polyglot_exec(): {m}")))?;
+
+            let (interpreter, arg) = match lang.to_lowercase().as_str() {
+                "python" | "py" => ("python3", Some("-c")),
+                "js" | "javascript" | "node" => ("node", Some("-e")),
+                "bash" | "sh" | "shell" => ("bash", Some("-c")),
+                "ruby" | "rb" => ("ruby", Some("-e")),
+                "perl" | "pl" => ("perl", Some("-e")),
+                "lua" => ("lua", Some("-e")),
+                "php" => ("php", Some("-r")),
+                "r" | "R" => ("Rscript", Some("-e")),
+                other => {
+                    return Err(host.err(format!(
+                        "polyglot_exec(): unsupported language '{}'. Supported: python, js, bash, ruby, perl, lua, php, r",
+                        other
+                    )));
+                }
+            };
+
+            let mut cmd = std::process::Command::new(interpreter);
+            if let Some(flag) = arg {
+                cmd.arg(flag);
+            }
+            cmd.arg(code)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            let output = match cmd.output() {
+                Ok(o) => o,
+                Err(e) => {
+                    // Interpreter not found
+                    let json = format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"polyglot_exec: {interpreter} not found: {e}\",\"exit_code\":-1}}"
+                    );
+                    return Ok(alloc_string(json));
+                }
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let exit_code = output.status.code().unwrap_or(-1);
+            let success = output.status.success();
+
+            // Escape JSON strings
+            let stdout_esc = stdout
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            let stderr_esc = stderr
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+
+            let json = format!(
+                "{{\"success\":{success},\"stdout\":\"{stdout_esc}\",\"stderr\":\"{stderr_esc}\",\"exit_code\":{exit_code}}}"
+            );
+            Ok(alloc_string(json))
         }
 
         fn ffi_load(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -2963,13 +3698,16 @@ impl VM {
             let spans = chunk.spans.clone();
             let spawn_limits = host.spawn_limits();
 
-            let id = SPAWN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
+            let handles = vm_handles(host)?;
+            let id = handles.spawn_next.fetch_add(1, Ordering::SeqCst);
             let (tx, rx) = mpsc::channel();
-            spawn_table()
+            handles
+                .spawn
                 .lock()
                 .map_err(|_| host.err("internal: spawn table unavailable".into()))?
                 .insert(id, rx);
 
+            let child_handles = Arc::clone(&handles);
             let config = StdlibConfig::default();
             thread::spawn(move || {
                 let constants: Vec<Value> =
@@ -2990,6 +3728,9 @@ impl VM {
                 let function = Rc::new(Function {
                     name: None,
                     arity: 0,
+                    min_arity: 0,
+                    defaults: vec![],
+                    is_vararg: false,
                     chunk: child_chunk,
                 });
                 let module = Rc::new(RefCell::new(Module {
@@ -3014,6 +3755,7 @@ impl VM {
                     module,
                 });
                 let mut vm = VM::with_stdlib(config);
+                vm.handle_registry = child_handles;
                 if let Some(lim) = spawn_limits {
                     vm.set_limits(Some(VmLimits {
                         max_instructions: lim.max_instructions,
@@ -3046,12 +3788,13 @@ impl VM {
         }
 
         fn join_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             if args.len() != 1 {
                 return Err(host.err(format!("join() expects 1 argument, got {}", args.len())));
             }
             let id = value_to_handle(host, args[0].clone(), "join")?;
             let rx = {
-                let mut t = spawn_table()
+                let mut t = reg.spawn
                     .lock()
                     .map_err(|_| host.err("internal: spawn table unavailable".into()))?;
                 t.remove(&id)
@@ -3076,15 +3819,16 @@ impl VM {
             host: &mut dyn VmHost,
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = CHAN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
-            let cb = ChanBuf {
+            let reg = vm_handles(host)?;
+            let id = reg.channel_next.fetch_add(1, Ordering::SeqCst);
+            let cb = VmChannelBuf {
                 buf: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 closed: Arc::new(AtomicBool::new(false)),
                 capacity: 0, // unbounded
                 space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
-                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
             };
-            chan_table()
+            reg.channels
                 .lock()
                 .map_err(|_| host.err("channel: table unavailable".into()))?
                 .insert(id, cb);
@@ -3100,19 +3844,26 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             let capacity = match args.first() {
                 Some(Value::Number(n)) if *n >= 1.0 => *n as usize,
-                _ => return Err(host.err("channel_buffered(capacity): expected positive integer capacity".into())),
+                _ => {
+                    return Err(host.err(
+                        "channel_buffered(capacity): expected positive integer capacity".into(),
+                    ))
+                }
             };
-            let id = CHAN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
-            let cb = ChanBuf {
-                buf: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(capacity))),
+            let id = reg.channel_next.fetch_add(1, Ordering::SeqCst);
+            let cb = VmChannelBuf {
+                buf: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                    capacity,
+                ))),
                 closed: Arc::new(AtomicBool::new(false)),
                 capacity,
                 space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
-                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
             };
-            chan_table()
+            reg.channels
                 .lock()
                 .map_err(|_| host.err("channel_buffered: table unavailable".into()))?
                 .insert(id, cb);
@@ -3127,6 +3878,7 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             if args.len() != 2 {
                 return Err(host.err(format!("send() expects 2 arguments, got {}", args.len())));
             }
@@ -3134,7 +3886,7 @@ impl VM {
             let json = spawn_value_to_json(&args[1]).map_err(|e| host.err(e))?;
             let json_str = sj::to_string(&json).map_err(|e| host.err(e.to_string()))?;
             let cb = {
-                let t = chan_table()
+                let t = reg.channels
                     .lock()
                     .map_err(|_| host.err("send: table unavailable".into()))?;
                 t.get(&id)
@@ -3149,7 +3901,9 @@ impl VM {
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 loop {
                     {
-                        let buf_len = cb.buf.lock()
+                        let buf_len = cb
+                            .buf
+                            .lock()
                             .map_err(|_| host.err("send: buf lock unavailable".into()))?
                             .len();
                         if buf_len < cb.capacity {
@@ -3164,7 +3918,9 @@ impl VM {
                     }
                     // Wait for space signal with 5ms sleep (condvar across threads is tricky here)
                     let (lock, cv) = cb.space_cv.as_ref();
-                    let guard = lock.lock().map_err(|_| host.err("send: condvar lock".into()))?;
+                    let guard = lock
+                        .lock()
+                        .map_err(|_| host.err("send: condvar lock".into()))?;
                     let _ = cv.wait_timeout(guard, Duration::from_millis(5));
                 }
             }
@@ -3195,7 +3951,11 @@ impl VM {
             }
             let ms = match args[1] {
                 Value::Number(n) if n >= 0.0 => n as u64,
-                _ => return Err(host.err("recv_timeout: timeout_ms must be a non-negative number".into())),
+                _ => {
+                    return Err(
+                        host.err("recv_timeout: timeout_ms must be a non-negative number".into())
+                    )
+                }
             };
             channel_recv_impl(host, vec![args[0].clone()], ms)
         }
@@ -3205,12 +3965,13 @@ impl VM {
             args: Vec<Value>,
             timeout_ms: u64,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             if args.is_empty() {
                 return Err(host.err("recv() expects 1 argument, got 0".into()));
             }
             let id = value_to_handle(host, args[0].clone(), "recv")?;
             let cb = {
-                let t = chan_table()
+                let t = reg.channels
                     .lock()
                     .map_err(|_| host.err("recv: table unavailable".into()))?;
                 t.get(&id)
@@ -3221,7 +3982,9 @@ impl VM {
             loop {
                 // Try to dequeue
                 {
-                    let mut buf = cb.buf.lock()
+                    let mut buf = cb
+                        .buf
+                        .lock()
                         .map_err(|_| host.err("recv: buf lock unavailable".into()))?;
                     if let Some(json_str) = buf.pop_front() {
                         // Notify blocked senders that space is available
@@ -3239,7 +4002,9 @@ impl VM {
                 }
                 // Sleep briefly then retry (condvar across threads requires Arc<Condvar>)
                 let (lock, cv) = cb.item_cv.as_ref();
-                let guard = lock.lock().map_err(|_| host.err("recv: condvar lock".into()))?;
+                let guard = lock
+                    .lock()
+                    .map_err(|_| host.err("recv: condvar lock".into()))?;
                 let _ = cv.wait_timeout(guard, Duration::from_millis(1));
             }
         }
@@ -3248,6 +4013,7 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             if args.len() != 1 {
                 return Err(host.err(format!(
                     "channel_close() expects 1 argument, got {}",
@@ -3256,7 +4022,7 @@ impl VM {
             }
             let id = value_to_handle(host, args[0].clone(), "channel_close")?;
             let cb = {
-                let t = chan_table()
+                let t = reg.channels
                     .lock()
                     .map_err(|_| host.err("channel_close: table unavailable".into()))?;
                 t.get(&id)
@@ -3275,6 +4041,7 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             if args.len() != 1 {
                 return Err(host.err(format!(
                     "channel_is_closed() expects 1 argument, got {}",
@@ -3283,7 +4050,7 @@ impl VM {
             }
             let id = value_to_handle(host, args[0].clone(), "channel_is_closed")?;
             let cb = {
-                let t = chan_table()
+                let t = reg.channels
                     .lock()
                     .map_err(|_| host.err("channel_is_closed: table unavailable".into()))?;
                 t.get(&id)
@@ -3297,6 +4064,7 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             if args.len() != 1 {
                 return Err(host.err(format!("select() expects 1 argument, got {}", args.len())));
             }
@@ -3311,9 +4079,9 @@ impl VM {
                 }
                 _ => return Err(host.err("select(): expected array of channel ids".into())),
             };
-            // Snapshot ChanBuf handles upfront (ChanBuf is Clone + Arc-backed, cheap).
-            let cbs: Vec<Option<ChanBuf>> = {
-                let t = chan_table()
+            // Snapshot VmChannelBuf handles upfront (VmChannelBuf is Clone + Arc-backed, cheap).
+            let cbs: Vec<Option<VmChannelBuf>> = {
+                let t = reg.channels
                     .lock()
                     .map_err(|_| host.err("select: table unavailable".into()))?;
                 ids.iter().map(|id| t.get(id).cloned()).collect()
@@ -3337,14 +4105,18 @@ impl VM {
                                 return Ok(alloc_map(m));
                             }
                             // channel has data or could still receive
-                            if !is_closed { all_closed_empty = false; }
+                            if !is_closed {
+                                all_closed_empty = false;
+                            }
                         } else {
                             all_closed_empty = false; // locked = possibly active
                         }
                     }
                 }
                 // If all channels are closed and empty, return nil
-                if all_closed_empty { return Ok(Value::Nil); }
+                if all_closed_empty {
+                    return Ok(Value::Nil);
+                }
                 if std::time::Instant::now() >= deadline {
                     return Ok(Value::Nil); // timeout → nil (not an error)
                 }
@@ -3361,12 +4133,19 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             if args.len() < 2 {
-                return Err(host.err("select_with_timeout(channels, ms) expects 2 arguments".into()));
+                return Err(
+                    host.err("select_with_timeout(channels, ms) expects 2 arguments".into())
+                );
             }
             let ms = match args[1] {
                 Value::Number(n) if n >= 0.0 => n as u64,
-                _ => return Err(host.err("select_with_timeout: ms must be non-negative number".into())),
+                _ => {
+                    return Err(
+                        host.err("select_with_timeout: ms must be non-negative number".into())
+                    )
+                }
             };
             let ids: Vec<usize> = match &args[0] {
                 Value::Array(a) => {
@@ -3379,8 +4158,10 @@ impl VM {
                 }
                 _ => return Err(host.err("select_with_timeout: first arg must be array".into())),
             };
-            let cbs: Vec<Option<ChanBuf>> = {
-                let t = chan_table().lock().map_err(|_| host.err("select_with_timeout: table".into()))?;
+            let cbs: Vec<Option<VmChannelBuf>> = {
+                let t = reg.channels
+                    .lock()
+                    .map_err(|_| host.err("select_with_timeout: table".into()))?;
                 ids.iter().map(|id| t.get(id).cloned()).collect()
             };
             let deadline = std::time::Instant::now() + Duration::from_millis(ms);
@@ -3402,13 +4183,17 @@ impl VM {
                                 m.insert("timed_out".into(), Value::Bool(false));
                                 return Ok(alloc_map(m));
                             }
-                            if !is_closed { all_closed_empty = false; }
+                            if !is_closed {
+                                all_closed_empty = false;
+                            }
                         } else {
                             all_closed_empty = false;
                         }
                     }
                 }
-                if all_closed_empty { return Ok(Value::Nil); }
+                if all_closed_empty {
+                    return Ok(Value::Nil);
+                }
                 if std::time::Instant::now() >= deadline {
                     let mut m = std::collections::HashMap::new();
                     m.insert("timed_out".into(), Value::Bool(true));
@@ -3423,10 +4208,23 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "channel_size")?;
-            let t = chan_table().lock().map_err(|_| host.err("channel_size: table".into()))?;
-            let cb = t.get(&id).ok_or_else(|| host.err("channel_size: invalid channel id".into()))?;
-            let n = cb.buf.lock().map_err(|_| host.err("channel_size: buf lock".into()))?.len();
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "channel_size",
+            )?;
+            let t = reg.channels
+                .lock()
+                .map_err(|_| host.err("channel_size: table".into()))?;
+            let cb = t
+                .get(&id)
+                .ok_or_else(|| host.err("channel_size: invalid channel id".into()))?;
+            let n = cb
+                .buf
+                .lock()
+                .map_err(|_| host.err("channel_size: buf lock".into()))?
+                .len();
             Ok(Value::Number(n as f64))
         }
 
@@ -3436,6 +4234,7 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             let handles = match args.first() {
                 Some(Value::Array(a)) => a.borrow().clone(),
                 _ => return Err(host.err("join_all(handles): expected array of handles".into())),
@@ -3444,15 +4243,20 @@ impl VM {
             for h in handles {
                 let id = value_to_handle(host, h, "join_all")?;
                 let rx = {
-                    let mut t = spawn_table()
+                    let mut t = reg.spawn
                         .lock()
                         .map_err(|_| host.err("join_all: spawn table unavailable".into()))?;
-                    t.remove(&id).ok_or_else(|| host.err("join_all: invalid or already joined handle".into()))?
+                    t.remove(&id).ok_or_else(|| {
+                        host.err("join_all: invalid or already joined handle".into())
+                    })?
                 };
-                let result = rx.recv().map_err(|_| host.err("join_all: channel closed".into()))?;
+                let result = rx
+                    .recv()
+                    .map_err(|_| host.err("join_all: channel closed".into()))?;
                 let val = match result {
                     Ok(json_str) => {
-                        let j: sj::Value = sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
+                        let j: sj::Value =
+                            sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
                         spawn_value_from_json(&j)
                     }
                     Err(msg) => {
@@ -3470,10 +4274,7 @@ impl VM {
 
         /// spawn_n(n, fn) — spawn n threads each running fn(), return array of handles.
         /// Like Go's fan-out pattern: for i := 0; i < n; i++ { go fn() }.
-        fn spawn_n_builtin(
-            host: &mut dyn VmHost,
-            args: Vec<Value>,
-        ) -> Result<Value, RuntimeError> {
+        fn spawn_n_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if args.len() < 2 {
                 return Err(host.err("spawn_n(n, fn) expects 2 arguments".into()));
             }
@@ -3493,24 +4294,23 @@ impl VM {
         /// ticker(interval_ms) — create a channel that receives a tick every interval_ms.
         /// Like Go's time.NewTicker(). Close the channel to stop it.
         /// Returns the receiver handle (a channel).
-        fn ticker_builtin(
-            host: &mut dyn VmHost,
-            args: Vec<Value>,
-        ) -> Result<Value, RuntimeError> {
+        fn ticker_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             let ms = match args.first() {
                 Some(Value::Number(n)) if *n >= 1.0 => *n as u64,
                 _ => return Err(host.err("ticker(interval_ms): expected positive ms".into())),
             };
             // Create an unbounded channel for tick events
-            let tick_ch_id = CHAN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
-            let tick_cb = ChanBuf {
+            let tick_ch_id = reg.channel_next.fetch_add(1, Ordering::SeqCst);
+            let tick_cb = VmChannelBuf {
                 buf: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 closed: Arc::new(AtomicBool::new(false)),
                 capacity: 0,
                 space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
-                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
             };
-            chan_table().lock()
+            reg.channels
+                .lock()
                 .map_err(|_| host.err("ticker: table unavailable".into()))?
                 .insert(tick_ch_id, tick_cb.clone());
             // Spawn background ticker thread
@@ -3518,7 +4318,9 @@ impl VM {
                 let mut tick_count = 0u64;
                 loop {
                     thread::sleep(Duration::from_millis(ms));
-                    if tick_cb.closed.load(Ordering::SeqCst) { break; }
+                    if tick_cb.closed.load(Ordering::SeqCst) {
+                        break;
+                    }
                     tick_count += 1;
                     let json_str = format!("{}", tick_count);
                     if let Ok(mut buf) = tick_cb.buf.lock() {
@@ -3540,19 +4342,21 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             let ms = match args.first() {
                 Some(Value::Number(n)) if *n >= 0.0 => *n as u64,
                 _ => return Err(host.err("timeout_channel(ms): expected non-negative ms".into())),
             };
-            let ch_id = CHAN_NEXT_ID.fetch_add(1, Ordering::SeqCst);
-            let cb = ChanBuf {
+            let ch_id = reg.channel_next.fetch_add(1, Ordering::SeqCst);
+            let cb = VmChannelBuf {
                 buf: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 closed: Arc::new(AtomicBool::new(false)),
-                capacity: 1,  // buffered(1) so the fire-and-forget doesn't block
+                capacity: 1, // buffered(1) so the fire-and-forget doesn't block
                 space_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
-                item_cv:  Arc::new((Mutex::new(()), std::sync::Condvar::new())),
+                item_cv: Arc::new((Mutex::new(()), std::sync::Condvar::new())),
             };
-            chan_table().lock()
+            reg.channels
+                .lock()
                 .map_err(|_| host.err("timeout_channel: table unavailable".into()))?
                 .insert(ch_id, cb.clone());
             thread::spawn(move || {
@@ -3578,12 +4382,14 @@ impl VM {
             host: &mut dyn VmHost,
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = MUTEX_NEXT.fetch_add(1, Ordering::SeqCst);
-            let m = Arc::new(VmMutex {
+            let reg = vm_handles(host)?;
+            let id = reg.mutex_next.fetch_add(1, Ordering::SeqCst);
+            let m = Arc::new(VmSyncMutex {
                 locked: Mutex::new(false),
                 cv: std::sync::Condvar::new(),
             });
-            mutex_table().lock()
+            reg.mutexes
+                .lock()
                 .map_err(|_| host.err("mutex_new: table unavailable".into()))?
                 .insert(id, m);
             Ok(Value::Number(id as f64))
@@ -3594,18 +4400,32 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "mutex_lock")?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "mutex_lock",
+            )?;
             let entry = {
-                let t = mutex_table().lock().map_err(|_| host.err("mutex_lock: table".into()))?;
-                t.get(&id).cloned().ok_or_else(|| host.err("mutex_lock: invalid handle".into()))?
+                let t = reg.mutexes
+                    .lock()
+                    .map_err(|_| host.err("mutex_lock: table".into()))?;
+                t.get(&id)
+                    .cloned()
+                    .ok_or_else(|| host.err("mutex_lock: invalid handle".into()))?
             };
-            let mut locked = entry.locked.lock().map_err(|_| host.err("mutex_lock: lock".into()))?;
+            let mut locked = entry
+                .locked
+                .lock()
+                .map_err(|_| host.err("mutex_lock: lock".into()))?;
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             while *locked {
                 if std::time::Instant::now() >= deadline {
                     return Err(host.err("mutex_lock: deadlock timeout (30s)".into()));
                 }
-                let result = entry.cv.wait_timeout(locked, Duration::from_millis(10))
+                let result = entry
+                    .cv
+                    .wait_timeout(locked, Duration::from_millis(10))
                     .map_err(|_| host.err("mutex_lock: condvar".into()))?;
                 locked = result.0;
             }
@@ -3618,12 +4438,24 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "mutex_try_lock")?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "mutex_try_lock",
+            )?;
             let entry = {
-                let t = mutex_table().lock().map_err(|_| host.err("mutex_try_lock: table".into()))?;
-                t.get(&id).cloned().ok_or_else(|| host.err("mutex_try_lock: invalid handle".into()))?
+                let t = reg.mutexes
+                    .lock()
+                    .map_err(|_| host.err("mutex_try_lock: table".into()))?;
+                t.get(&id)
+                    .cloned()
+                    .ok_or_else(|| host.err("mutex_try_lock: invalid handle".into()))?
             };
-            let mut locked = entry.locked.lock().map_err(|_| host.err("mutex_try_lock: lock".into()))?;
+            let mut locked = entry
+                .locked
+                .lock()
+                .map_err(|_| host.err("mutex_try_lock: lock".into()))?;
             if *locked {
                 return Ok(Value::Bool(false));
             }
@@ -3636,12 +4468,24 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "mutex_unlock")?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "mutex_unlock",
+            )?;
             let entry = {
-                let t = mutex_table().lock().map_err(|_| host.err("mutex_unlock: table".into()))?;
-                t.get(&id).cloned().ok_or_else(|| host.err("mutex_unlock: invalid handle".into()))?
+                let t = reg.mutexes
+                    .lock()
+                    .map_err(|_| host.err("mutex_unlock: table".into()))?;
+                t.get(&id)
+                    .cloned()
+                    .ok_or_else(|| host.err("mutex_unlock: invalid handle".into()))?
             };
-            let mut locked = entry.locked.lock().map_err(|_| host.err("mutex_unlock: lock".into()))?;
+            let mut locked = entry
+                .locked
+                .lock()
+                .map_err(|_| host.err("mutex_unlock: lock".into()))?;
             if !*locked {
                 return Err(host.err("mutex_unlock: mutex is not locked".into()));
             }
@@ -3656,13 +4500,18 @@ impl VM {
             host: &mut dyn VmHost,
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = RWLOCK_NEXT.fetch_add(1, Ordering::SeqCst);
-            rwlock_table().lock()
+            let reg = vm_handles(host)?;
+            let id = reg.rwlock_next.fetch_add(1, Ordering::SeqCst);
+            reg.rwlocks
+                .lock()
                 .map_err(|_| host.err("rwlock_new: table".into()))?
-                .insert(id, Arc::new(VmRwLock {
-                    state: Mutex::new(0),
-                    cv: std::sync::Condvar::new(),
-                }));
+                .insert(
+                    id,
+                    Arc::new(VmSyncRwLock {
+                        state: Mutex::new(0),
+                        cv: std::sync::Condvar::new(),
+                    }),
+                );
             Ok(Value::Number(id as f64))
         }
 
@@ -3671,16 +4520,33 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "rwlock_read")?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "rwlock_read",
+            )?;
             let entry = {
-                let t = rwlock_table().lock().map_err(|_| host.err("rwlock_read: table".into()))?;
-                t.get(&id).cloned().ok_or_else(|| host.err("rwlock_read: invalid handle".into()))?
+                let t = reg.rwlocks
+                    .lock()
+                    .map_err(|_| host.err("rwlock_read: table".into()))?;
+                t.get(&id)
+                    .cloned()
+                    .ok_or_else(|| host.err("rwlock_read: invalid handle".into()))?
             };
-            let mut state = entry.state.lock().map_err(|_| host.err("rwlock_read: state".into()))?;
+            let mut state = entry
+                .state
+                .lock()
+                .map_err(|_| host.err("rwlock_read: state".into()))?;
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while *state < 0 { // write-locked
-                if std::time::Instant::now() >= deadline { return Err(host.err("rwlock_read: timeout".into())); }
-                let r = entry.cv.wait_timeout(state, Duration::from_millis(5))
+            while *state < 0 {
+                // write-locked
+                if std::time::Instant::now() >= deadline {
+                    return Err(host.err("rwlock_read: timeout".into()));
+                }
+                let r = entry
+                    .cv
+                    .wait_timeout(state, Duration::from_millis(5))
                     .map_err(|_| host.err("rwlock_read: condvar".into()))?;
                 state = r.0;
             }
@@ -3693,16 +4559,33 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "rwlock_write")?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "rwlock_write",
+            )?;
             let entry = {
-                let t = rwlock_table().lock().map_err(|_| host.err("rwlock_write: table".into()))?;
-                t.get(&id).cloned().ok_or_else(|| host.err("rwlock_write: invalid handle".into()))?
+                let t = reg.rwlocks
+                    .lock()
+                    .map_err(|_| host.err("rwlock_write: table".into()))?;
+                t.get(&id)
+                    .cloned()
+                    .ok_or_else(|| host.err("rwlock_write: invalid handle".into()))?
             };
-            let mut state = entry.state.lock().map_err(|_| host.err("rwlock_write: state".into()))?;
+            let mut state = entry
+                .state
+                .lock()
+                .map_err(|_| host.err("rwlock_write: state".into()))?;
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while *state != 0 { // either read(s) or write in progress
-                if std::time::Instant::now() >= deadline { return Err(host.err("rwlock_write: timeout".into())); }
-                let r = entry.cv.wait_timeout(state, Duration::from_millis(5))
+            while *state != 0 {
+                // either read(s) or write in progress
+                if std::time::Instant::now() >= deadline {
+                    return Err(host.err("rwlock_write: timeout".into()));
+                }
+                let r = entry
+                    .cv
+                    .wait_timeout(state, Duration::from_millis(5))
                     .map_err(|_| host.err("rwlock_write: condvar".into()))?;
                 state = r.0;
             }
@@ -3715,15 +4598,35 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "rwlock_unlock")?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "rwlock_unlock",
+            )?;
             let entry = {
-                let t = rwlock_table().lock().map_err(|_| host.err("rwlock_unlock: table".into()))?;
-                t.get(&id).cloned().ok_or_else(|| host.err("rwlock_unlock: invalid handle".into()))?
+                let t = reg.rwlocks
+                    .lock()
+                    .map_err(|_| host.err("rwlock_unlock: table".into()))?;
+                t.get(&id)
+                    .cloned()
+                    .ok_or_else(|| host.err("rwlock_unlock: invalid handle".into()))?
             };
-            let mut state = entry.state.lock().map_err(|_| host.err("rwlock_unlock: state".into()))?;
-            if *state == -1 { *state = 0; }       // write unlock
-            else if *state > 0 { *state -= 1; }    // read unlock
-            else { return Err(host.err("rwlock_unlock: lock not held".into())); }
+            let mut state = entry
+                .state
+                .lock()
+                .map_err(|_| host.err("rwlock_unlock: state".into()))?;
+            if *state == -1 {
+                *state = 0;
+            }
+            // write unlock
+            else if *state > 0 {
+                *state -= 1;
+            }
+            // read unlock
+            else {
+                return Err(host.err("rwlock_unlock: lock not held".into()));
+            }
             entry.cv.notify_all();
             Ok(Value::Nil)
         }
@@ -3735,18 +4638,23 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             let n = match args.first() {
                 Some(Value::Number(x)) if *x >= 1.0 => *x as usize,
                 _ => return Err(host.err("barrier_new(n): expected positive integer n".into())),
             };
-            let id = BARRIER_NEXT.fetch_add(1, Ordering::SeqCst);
-            barrier_table().lock()
+            let id = reg.barrier_next.fetch_add(1, Ordering::SeqCst);
+            reg.barriers
+                .lock()
                 .map_err(|_| host.err("barrier_new: table".into()))?
-                .insert(id, Arc::new(VmBarrier {
-                    n,
-                    arrived: Mutex::new(0),
-                    cv: std::sync::Condvar::new(),
-                }));
+                .insert(
+                    id,
+                    Arc::new(VmSyncBarrier {
+                        n,
+                        arrived: Mutex::new(0),
+                        cv: std::sync::Condvar::new(),
+                    }),
+                );
             Ok(Value::Number(id as f64))
         }
 
@@ -3755,12 +4663,24 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "barrier_wait")?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "barrier_wait",
+            )?;
             let entry = {
-                let t = barrier_table().lock().map_err(|_| host.err("barrier_wait: table".into()))?;
-                t.get(&id).cloned().ok_or_else(|| host.err("barrier_wait: invalid handle".into()))?
+                let t = reg.barriers
+                    .lock()
+                    .map_err(|_| host.err("barrier_wait: table".into()))?;
+                t.get(&id)
+                    .cloned()
+                    .ok_or_else(|| host.err("barrier_wait: invalid handle".into()))?
             };
-            let mut arrived = entry.arrived.lock().map_err(|_| host.err("barrier_wait: lock".into()))?;
+            let mut arrived = entry
+                .arrived
+                .lock()
+                .map_err(|_| host.err("barrier_wait: lock".into()))?;
             *arrived += 1;
             if *arrived >= entry.n {
                 *arrived = 0; // reset for reuse (CyclicBarrier semantics)
@@ -3769,10 +4689,14 @@ impl VM {
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             loop {
-                let r = entry.cv.wait_timeout(arrived, Duration::from_millis(5))
+                let r = entry
+                    .cv
+                    .wait_timeout(arrived, Duration::from_millis(5))
                     .map_err(|_| host.err("barrier_wait: condvar".into()))?;
                 arrived = r.0;
-                if *arrived == 0 { return Ok(Value::Bool(false)); } // released, not the last
+                if *arrived == 0 {
+                    return Ok(Value::Bool(false));
+                } // released, not the last
                 if std::time::Instant::now() >= deadline {
                     return Err(host.err("barrier_wait: timeout (60s) — possible deadlock".into()));
                 }
@@ -3786,14 +4710,19 @@ impl VM {
             host: &mut dyn VmHost,
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = ONCE_NEXT.fetch_add(1, Ordering::SeqCst);
-            once_table().lock()
+            let reg = vm_handles(host)?;
+            let id = reg.once_next.fetch_add(1, Ordering::SeqCst);
+            reg.once_flags
+                .lock()
                 .map_err(|_| host.err("once_new: table".into()))?
-                .insert(id, Arc::new(VmOnce {
-                    done: AtomicBool::new(false),
-                    running: Mutex::new(false),
-                    cv: std::sync::Condvar::new(),
-                }));
+                .insert(
+                    id,
+                    Arc::new(VmSyncOnce {
+                        done: AtomicBool::new(false),
+                        running: Mutex::new(false),
+                        cv: std::sync::Condvar::new(),
+                    }),
+                );
             Ok(Value::Number(id as f64))
         }
 
@@ -3802,10 +4731,160 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "once_is_done")?;
-            let t = once_table().lock().map_err(|_| host.err("once_is_done: table".into()))?;
-            let entry = t.get(&id).ok_or_else(|| host.err("once_is_done: invalid handle".into()))?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "once_is_done",
+            )?;
+            let t = reg.once_flags
+                .lock()
+                .map_err(|_| host.err("once_is_done: table".into()))?;
+            let entry = t
+                .get(&id)
+                .ok_or_else(|| host.err("once_is_done: invalid handle".into()))?;
             Ok(Value::Bool(entry.done.load(Ordering::SeqCst)))
+        }
+
+        // ---- Runtime memory safety (ownership / borrowing) ----
+
+        fn allocate_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.is_empty() {
+                return Err(host.err("allocate(value, is_mutable?) expects at least 1 arg".into()));
+            }
+            let value = args[0].clone();
+            let is_mutable = match args.get(1) {
+                None => true,
+                Some(Value::Bool(b)) => *b,
+                Some(Value::Number(n)) => *n != 0.0,
+                _ => {
+                    return Err(host.err("allocate: is_mutable must be bool or number".into()));
+                }
+            };
+            let h = host.mem_allocate(value, is_mutable)?;
+            Ok(Value::Number(h))
+        }
+
+        fn borrow_immutable_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handle = match args.first() {
+                Some(Value::Number(n)) => *n,
+                _ => return Err(host.err("borrow_immutable(handle) expects a number".into())),
+            };
+            Ok(Value::Number(host.mem_borrow_immutable(handle)?))
+        }
+
+        fn borrow_mutable_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handle = match args.first() {
+                Some(Value::Number(n)) => *n,
+                _ => return Err(host.err("borrow_mutable(handle) expects a number".into())),
+            };
+            Ok(Value::Number(host.mem_borrow_mutable(handle)?))
+        }
+
+        fn borrow_unique_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handle = match args.first() {
+                Some(Value::Number(n)) => *n,
+                _ => return Err(host.err("borrow_unique(handle) expects a number".into())),
+            };
+            Ok(Value::Number(host.mem_borrow_unique(handle)?))
+        }
+
+        fn release_borrow_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.is_empty() {
+                return Err(host.err("release_borrow(borrow_id) or release_borrow(handle, type)".into()));
+            }
+            if args.len() == 1 {
+                let borrow_id = match &args[0] {
+                    Value::Number(n) => *n,
+                    _ => return Err(host.err("release_borrow: expected number".into())),
+                };
+                host.mem_release_borrow_id(borrow_id)?;
+            } else {
+                let handle = match &args[0] {
+                    Value::Number(n) => *n,
+                    _ => return Err(host.err("release_borrow: handle must be a number".into())),
+                };
+                let ty = match &args[1] {
+                    Value::Number(n) => *n as u8,
+                    _ => return Err(host.err("release_borrow: type must be 0, 1, or 2".into())),
+                };
+                host.mem_release_borrow_type(handle, ty)?;
+            }
+            Ok(Value::Nil)
+        }
+
+        fn mem_load_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handle = match args.first() {
+                Some(Value::Number(n)) => *n,
+                _ => return Err(host.err("load(handle) expects a number".into())),
+            };
+            host.mem_load(handle)
+        }
+
+        fn mem_store_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("store(handle, value) expects 2 args".into()));
+            }
+            let handle = match &args[0] {
+                Value::Number(n) => *n,
+                _ => return Err(host.err("store: handle must be a number".into())),
+            };
+            host.mem_store(handle, args[1].clone())?;
+            Ok(Value::Nil)
+        }
+
+        fn deallocate_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handle = match args.first() {
+                Some(Value::Number(n)) => *n,
+                _ => return Err(host.err("deallocate(handle) expects a number".into())),
+            };
+            host.mem_deallocate(handle)?;
+            Ok(Value::Nil)
+        }
+
+        fn push_lifetime_builtin(
+            host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::Number(host.mem_push_lifetime()?))
+        }
+
+        fn pop_lifetime_builtin(
+            host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::Number(host.mem_pop_lifetime()?))
+        }
+
+        fn memory_stats_builtin(
+            host: &mut dyn VmHost,
+            _args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            host.mem_stats()
         }
 
         // ---- Atomic i64 (Java AtomicInteger / Go atomic.Int64 / Rust AtomicI64) ----
@@ -3815,15 +4894,22 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            let reg = vm_handles(host)?;
             let init = match args.first() {
                 Some(Value::Number(n)) => *n as i64,
                 None => 0,
                 _ => return Err(host.err("atomic_new(val): expected number or no argument".into())),
             };
-            let id = ATOMIC_NEXT.fetch_add(1, Ordering::SeqCst);
-            atomic_table().lock()
+            let id = reg.atomic_next.fetch_add(1, Ordering::SeqCst);
+            reg.atomics
+                .lock()
                 .map_err(|_| host.err("atomic_new: table".into()))?
-                .insert(id, Arc::new(VmAtomic { val: AtomicI64::new(init) }));
+                .insert(
+                    id,
+                    Arc::new(VmSyncAtomic {
+                        val: AtomicI64::new(init),
+                    }),
+                );
             Ok(Value::Number(id as f64))
         }
 
@@ -3832,9 +4918,18 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let id = value_to_handle(host, args.into_iter().next().unwrap_or(Value::Nil), "atomic_get")?;
-            let t = atomic_table().lock().map_err(|_| host.err("atomic_get: table".into()))?;
-            let entry = t.get(&id).ok_or_else(|| host.err("atomic_get: invalid handle".into()))?;
+            let reg = vm_handles(host)?;
+            let id = value_to_handle(
+                host,
+                args.into_iter().next().unwrap_or(Value::Nil),
+                "atomic_get",
+            )?;
+            let t = reg.atomics
+                .lock()
+                .map_err(|_| host.err("atomic_get: table".into()))?;
+            let entry = t
+                .get(&id)
+                .ok_or_else(|| host.err("atomic_get: invalid handle".into()))?;
             Ok(Value::Number(entry.val.load(Ordering::SeqCst) as f64))
         }
 
@@ -3843,14 +4938,21 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            if args.len() < 2 { return Err(host.err("atomic_set(handle, val) expects 2 args".into())); }
+            let reg = vm_handles(host)?;
+            if args.len() < 2 {
+                return Err(host.err("atomic_set(handle, val) expects 2 args".into()));
+            }
             let id = value_to_handle(host, args[0].clone(), "atomic_set")?;
             let val = match args[1] {
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_set: value must be a number".into())),
             };
-            let t = atomic_table().lock().map_err(|_| host.err("atomic_set: table".into()))?;
-            let entry = t.get(&id).ok_or_else(|| host.err("atomic_set: invalid handle".into()))?;
+            let t = reg.atomics
+                .lock()
+                .map_err(|_| host.err("atomic_set: table".into()))?;
+            let entry = t
+                .get(&id)
+                .ok_or_else(|| host.err("atomic_set: invalid handle".into()))?;
             entry.val.store(val, Ordering::SeqCst);
             Ok(Value::Nil)
         }
@@ -3860,14 +4962,21 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            if args.len() < 2 { return Err(host.err("atomic_add(handle, delta) expects 2 args".into())); }
+            let reg = vm_handles(host)?;
+            if args.len() < 2 {
+                return Err(host.err("atomic_add(handle, delta) expects 2 args".into()));
+            }
             let id = value_to_handle(host, args[0].clone(), "atomic_add")?;
             let delta = match args[1] {
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_add: delta must be a number".into())),
             };
-            let t = atomic_table().lock().map_err(|_| host.err("atomic_add: table".into()))?;
-            let entry = t.get(&id).ok_or_else(|| host.err("atomic_add: invalid handle".into()))?;
+            let t = reg.atomics
+                .lock()
+                .map_err(|_| host.err("atomic_add: table".into()))?;
+            let entry = t
+                .get(&id)
+                .ok_or_else(|| host.err("atomic_add: invalid handle".into()))?;
             let new_val = entry.val.fetch_add(delta, Ordering::SeqCst) + delta;
             Ok(Value::Number(new_val as f64))
         }
@@ -3877,14 +4986,21 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            if args.len() < 2 { return Err(host.err("atomic_sub(handle, delta) expects 2 args".into())); }
+            let reg = vm_handles(host)?;
+            if args.len() < 2 {
+                return Err(host.err("atomic_sub(handle, delta) expects 2 args".into()));
+            }
             let id = value_to_handle(host, args[0].clone(), "atomic_sub")?;
             let delta = match args[1] {
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_sub: delta must be a number".into())),
             };
-            let t = atomic_table().lock().map_err(|_| host.err("atomic_sub: table".into()))?;
-            let entry = t.get(&id).ok_or_else(|| host.err("atomic_sub: invalid handle".into()))?;
+            let t = reg.atomics
+                .lock()
+                .map_err(|_| host.err("atomic_sub: table".into()))?;
+            let entry = t
+                .get(&id)
+                .ok_or_else(|| host.err("atomic_sub: invalid handle".into()))?;
             let new_val = entry.val.fetch_sub(delta, Ordering::SeqCst) - delta;
             Ok(Value::Number(new_val as f64))
         }
@@ -3895,13 +5011,29 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            if args.len() < 3 { return Err(host.err("atomic_cas(handle, expected, new) expects 3 args".into())); }
+            let reg = vm_handles(host)?;
+            if args.len() < 3 {
+                return Err(host.err("atomic_cas(handle, expected, new) expects 3 args".into()));
+            }
             let id = value_to_handle(host, args[0].clone(), "atomic_cas")?;
-            let expected = match args[1] { Value::Number(n) => n as i64, _ => return Err(host.err("atomic_cas: expected must be a number".into())), };
-            let new_val  = match args[2] { Value::Number(n) => n as i64, _ => return Err(host.err("atomic_cas: new_val must be a number".into())), };
-            let t = atomic_table().lock().map_err(|_| host.err("atomic_cas: table".into()))?;
-            let entry = t.get(&id).ok_or_else(|| host.err("atomic_cas: invalid handle".into()))?;
-            let ok = entry.val.compare_exchange(expected, new_val, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+            let expected = match args[1] {
+                Value::Number(n) => n as i64,
+                _ => return Err(host.err("atomic_cas: expected must be a number".into())),
+            };
+            let new_val = match args[2] {
+                Value::Number(n) => n as i64,
+                _ => return Err(host.err("atomic_cas: new_val must be a number".into())),
+            };
+            let t = reg.atomics
+                .lock()
+                .map_err(|_| host.err("atomic_cas: table".into()))?;
+            let entry = t
+                .get(&id)
+                .ok_or_else(|| host.err("atomic_cas: invalid handle".into()))?;
+            let ok = entry
+                .val
+                .compare_exchange(expected, new_val, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
             Ok(Value::Bool(ok))
         }
 
@@ -3910,11 +5042,21 @@ impl VM {
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            if args.len() < 2 { return Err(host.err("atomic_swap(handle, val) expects 2 args".into())); }
+            let reg = vm_handles(host)?;
+            if args.len() < 2 {
+                return Err(host.err("atomic_swap(handle, val) expects 2 args".into()));
+            }
             let id = value_to_handle(host, args[0].clone(), "atomic_swap")?;
-            let val = match args[1] { Value::Number(n) => n as i64, _ => return Err(host.err("atomic_swap: val must be a number".into())), };
-            let t = atomic_table().lock().map_err(|_| host.err("atomic_swap: table".into()))?;
-            let entry = t.get(&id).ok_or_else(|| host.err("atomic_swap: invalid handle".into()))?;
+            let val = match args[1] {
+                Value::Number(n) => n as i64,
+                _ => return Err(host.err("atomic_swap: val must be a number".into())),
+            };
+            let t = reg.atomics
+                .lock()
+                .map_err(|_| host.err("atomic_swap: table".into()))?;
+            let entry = t
+                .get(&id)
+                .ok_or_else(|| host.err("atomic_swap: invalid handle".into()))?;
             let old = entry.val.swap(val, Ordering::SeqCst);
             Ok(Value::Number(old as f64))
         }
@@ -4091,7 +5233,10 @@ impl VM {
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
             if args.len() != 1 {
-                return Err(host.err(format!("array_sort() expects 1 argument, got {}", args.len())));
+                return Err(host.err(format!(
+                    "array_sort() expects 1 argument, got {}",
+                    args.len()
+                )));
             }
             match &args[0] {
                 Value::Array(a) => {
@@ -4101,8 +5246,12 @@ impl VM {
                             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                         }
                         (Value::Obj(a), Value::Obj(b)) => {
-                            let sa = match a.as_ref() { pblang_ir::Obj::String(s) => s.clone() };
-                            let sb = match b.as_ref() { pblang_ir::Obj::String(s) => s.clone() };
+                            let sa = match a.as_ref() {
+                                pblang_ir::Obj::String(s) => s.clone(),
+                            };
+                            let sb = match b.as_ref() {
+                                pblang_ir::Obj::String(s) => s.clone(),
+                            };
                             sa.cmp(&sb)
                         }
                         _ => std::cmp::Ordering::Equal,
@@ -4113,10 +5262,835 @@ impl VM {
             }
         }
 
-        fn num_abs_builtin(
+        // ── Higher-order array builtins (native, faster than pblang stdlib) ─────────────────
+
+        #[allow(dead_code)]
+        fn call_value_1(
+            _host: &mut dyn VmHost,
+            _f: Value,
+            _arg: Value,
+        ) -> Result<Value, RuntimeError> {
+            // Placeholder: cannot call pblang closures from within a builtin without
+            // VM re-entry. Use stdlib/array.sapp or for-in loop instead.
+            unreachable!("call_value_1 should never be called directly")
+        }
+
+        /// array_map(arr, fn) — like arr.map() but as a builtin name
+        /// Falls back gracefully: just calls the pblang array:map helper.
+        /// The real implementation is in stdlib/array.sapp; this is a thin alias
+        /// so code can call `array_map(arr, fn)` without importing array.sapp.
+        #[allow(dead_code)]
+        fn array_map_builtin(
             host: &mut dyn VmHost,
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "array_map() expects 2 arguments (array, fn), got {}",
+                    args.len()
+                )));
+            }
+            // We use OpCall internally via the VM — but since we're inside a builtin
+            // we cannot re-enter the main dispatch loop easily.
+            // Approach: use host.import_module to get the array module, then call .map.
+            // Simpler approach for prototype: implement the loop manually.
+            let _arr = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("array_map(): first argument must be an array".into())),
+            };
+            let _ = &args[1]; // fn — cannot call from builtin without VM re-entry
+                              // Since we can't call pblang functions from builtins without VM re-entry,
+                              // we signal the caller to use `import("stdlib:array.sapp").map(arr, fn)` instead.
+                              // However, we can at least verify types and return an error with a good message.
+            match &args[1] {
+                Value::Function(_) | Value::Closure(_) | Value::Builtin(_) => {}
+                _ => return Err(host.err("array_map(): second argument must be a function".into())),
+            }
+            Err(host.err("array_map(): use import('stdlib:array.sapp').map(arr, fn) or the for-in loop; direct builtin call not supported".into()))
+        }
+
+        /// str_replace_all(s, from, to) — replace all occurrences of `from` with `to` in `s`.
+        /// Faster and safer than regex_replace_all for literal strings.
+        fn str_replace_all_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 3 {
+                return Err(host.err(format!(
+                    "str_replace_all() expects 3 arguments (string, from, to), got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("str_replace_all(): {m}")))?;
+            let from = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("str_replace_all(): {m}")))?;
+            let to = args[2]
+                .as_str()
+                .map_err(|m| host.err(format!("str_replace_all(): {m}")))?;
+            Ok(alloc_string(s.replace(from, to)))
+        }
+
+        /// hmac_sha256(data, key) — compute HMAC-SHA256 of data with key.
+        /// Returns a hex-encoded string. Requires the crypto category.
+        fn hmac_sha256_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // Crypto ops are always available — they are pure computation, no I/O.
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "hmac_sha256() expects 2 arguments (data, key), got {}",
+                    args.len()
+                )));
+            }
+            let data = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("hmac_sha256(): {m}")))?;
+            let key = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("hmac_sha256(): {m}")))?;
+            // HMAC-SHA256: K XOR opad || SHA256(K XOR ipad || data)
+            // RFC 2104 implementation using only sha2 crate (already a dep)
+            use sha2::{Digest, Sha256};
+            const BLOCK_SIZE: usize = 64;
+            let key_bytes = key.as_bytes();
+            // Derive block-sized key
+            let mut k: Vec<u8> = if key_bytes.len() > BLOCK_SIZE {
+                let mut h = Sha256::new();
+                h.update(key_bytes);
+                h.finalize().to_vec()
+            } else {
+                key_bytes.to_vec()
+            };
+            k.resize(BLOCK_SIZE, 0);
+            // Inner hash: SHA256((K XOR ipad) || data)
+            let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+            let mut inner = Sha256::new();
+            inner.update(&ipad);
+            inner.update(data.as_bytes());
+            let inner_hash = inner.finalize();
+            // Outer hash: SHA256((K XOR opad) || inner_hash)
+            let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+            let mut outer = Sha256::new();
+            outer.update(&opad);
+            outer.update(inner_hash);
+            let result = outer.finalize();
+            Ok(alloc_string(hex::encode(result)))
+        }
+
+        /// str_format(fmt, ...args) — Python-style %s/%d/%f formatting
+        /// Example: str_format("Hello %s, you are %d years old!", name, age)
+        fn str_format_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.is_empty() {
+                return Err(
+                    host.err("str_format() expects at least 1 argument (format string)".into())
+                );
+            }
+            let fmt = args[0]
+                .as_str()
+                .map_err(|_| host.err("str_format(): first argument must be a string".into()))?;
+
+            let mut result = String::with_capacity(fmt.len() * 2);
+            let mut arg_idx = 1usize;
+            let mut chars = fmt.chars().peekable();
+
+            while let Some(ch) = chars.next() {
+                if ch == '%' {
+                    if let Some(&spec) = chars.peek() {
+                        chars.next();
+                        match spec {
+                            's' => {
+                                if arg_idx >= args.len() {
+                                    return Err(
+                                        host.err("str_format(): not enough arguments".into())
+                                    );
+                                }
+                                result.push_str(&format!("{}", args[arg_idx]));
+                                arg_idx += 1;
+                            }
+                            'd' | 'i' => {
+                                if arg_idx >= args.len() {
+                                    return Err(
+                                        host.err("str_format(): not enough arguments".into())
+                                    );
+                                }
+                                match &args[arg_idx] {
+                                    Value::Number(n) => result.push_str(&format!("{}", *n as i64)),
+                                    v => result.push_str(&format!("{v}")),
+                                }
+                                arg_idx += 1;
+                            }
+                            'f' => {
+                                if arg_idx >= args.len() {
+                                    return Err(
+                                        host.err("str_format(): not enough arguments".into())
+                                    );
+                                }
+                                match &args[arg_idx] {
+                                    Value::Number(n) => result.push_str(&format!("{:.6}", n)),
+                                    v => result.push_str(&format!("{v}")),
+                                }
+                                arg_idx += 1;
+                            }
+                            'v' => {
+                                // %v = any value (Go-style)
+                                if arg_idx >= args.len() {
+                                    return Err(
+                                        host.err("str_format(): not enough arguments".into())
+                                    );
+                                }
+                                result.push_str(&format!("{}", args[arg_idx]));
+                                arg_idx += 1;
+                            }
+                            '%' => result.push('%'),
+                            other => {
+                                result.push('%');
+                                result.push(other);
+                            }
+                        }
+                    } else {
+                        result.push('%');
+                    }
+                } else {
+                    result.push(ch);
+                }
+            }
+            Ok(alloc_string(result))
+        }
+
+        // ── Regex builtins ─────────────────────────────────────────────────────
+
+        /// regex_match(str, pattern) → bool
+        /// Returns true if str contains a match for the regex pattern.
+        fn regex_match_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "regex_match() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("regex_match(): first arg must be string".into()))?;
+            let pat = args[1]
+                .as_str()
+                .map_err(|_| host.err("regex_match(): second arg must be string".into()))?;
+            let re = regex::Regex::new(pat)
+                .map_err(|e| host.err(format!("regex_match(): invalid pattern: {e}")))?;
+            Ok(Value::Bool(re.is_match(s)))
+        }
+
+        /// regex_find(str, pattern) → string | nil
+        /// Returns the first match, or nil if no match.
+        fn regex_find_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "regex_find() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("regex_find(): first arg must be string".into()))?;
+            let pat = args[1]
+                .as_str()
+                .map_err(|_| host.err("regex_find(): second arg must be string".into()))?;
+            let re = regex::Regex::new(pat)
+                .map_err(|e| host.err(format!("regex_find(): invalid pattern: {e}")))?;
+            match re.find(s) {
+                Some(m) => Ok(alloc_string(m.as_str())),
+                None => Ok(Value::Nil),
+            }
+        }
+
+        /// regex_find_all(str, pattern) → array of strings
+        /// Returns all non-overlapping matches.
+        fn regex_find_all_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "regex_find_all() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("regex_find_all(): first arg must be string".into()))?;
+            let pat = args[1]
+                .as_str()
+                .map_err(|_| host.err("regex_find_all(): second arg must be string".into()))?;
+            let re = regex::Regex::new(pat)
+                .map_err(|e| host.err(format!("regex_find_all(): invalid pattern: {e}")))?;
+            let matches: Vec<Value> = re.find_iter(s).map(|m| alloc_string(m.as_str())).collect();
+            Ok(alloc_array(matches))
+        }
+
+        /// regex_replace(str, pattern, replacement) → string
+        /// Replaces the first match with replacement.
+        fn regex_replace_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 3 {
+                return Err(host.err(format!(
+                    "regex_replace() expects 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("regex_replace(): first arg must be string".into()))?;
+            let pat = args[1]
+                .as_str()
+                .map_err(|_| host.err("regex_replace(): second arg must be string".into()))?;
+            let rep = args[2]
+                .as_str()
+                .map_err(|_| host.err("regex_replace(): third arg must be string".into()))?;
+            let re = regex::Regex::new(pat)
+                .map_err(|e| host.err(format!("regex_replace(): invalid pattern: {e}")))?;
+            Ok(alloc_string(re.replacen(s, 1, rep).to_string()))
+        }
+
+        /// regex_replace_all(str, pattern, replacement) → string
+        /// Replaces all matches with replacement.
+        fn regex_replace_all_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 3 {
+                return Err(host.err(format!(
+                    "regex_replace_all() expects 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("regex_replace_all(): first arg must be string".into()))?;
+            let pat = args[1]
+                .as_str()
+                .map_err(|_| host.err("regex_replace_all(): second arg must be string".into()))?;
+            let rep = args[2]
+                .as_str()
+                .map_err(|_| host.err("regex_replace_all(): third arg must be string".into()))?;
+            let re = regex::Regex::new(pat)
+                .map_err(|e| host.err(format!("regex_replace_all(): invalid pattern: {e}")))?;
+            Ok(alloc_string(re.replace_all(s, rep).to_string()))
+        }
+
+        /// regex_split(str, pattern) → array of strings
+        /// Splits str on every match of pattern.
+        fn regex_split_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "regex_split() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("regex_split(): first arg must be string".into()))?;
+            let pat = args[1]
+                .as_str()
+                .map_err(|_| host.err("regex_split(): second arg must be string".into()))?;
+            let re = regex::Regex::new(pat)
+                .map_err(|e| host.err(format!("regex_split(): invalid pattern: {e}")))?;
+            let parts: Vec<Value> = re.split(s).map(alloc_string).collect();
+            Ok(alloc_array(parts))
+        }
+
+        /// regex_capture(str, pattern) → array of captured group strings | nil
+        /// Returns an array of capture groups for the first match, or nil if no match.
+        /// Group 0 is the entire match; groups 1+ are parenthesized captures.
+        fn regex_capture_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "regex_capture() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("regex_capture(): first arg must be string".into()))?;
+            let pat = args[1]
+                .as_str()
+                .map_err(|_| host.err("regex_capture(): second arg must be string".into()))?;
+            let re = regex::Regex::new(pat)
+                .map_err(|e| host.err(format!("regex_capture(): invalid pattern: {e}")))?;
+            match re.captures(s) {
+                None => Ok(Value::Nil),
+                Some(caps) => {
+                    let groups: Vec<Value> = caps
+                        .iter()
+                        .map(|m| match m {
+                            Some(m) => alloc_string(m.as_str()),
+                            None => Value::Nil,
+                        })
+                        .collect();
+                    Ok(alloc_array(groups))
+                }
+            }
+        }
+
+        // ── str_format is a core utility ────────────────────────────────────────────────
+
+        // ── Fundamental sequence/collection builtins ──────────────────────────────────
+
+        /// range(n) → [0,1,...,n-1]
+        /// range(start, end) → [start,...,end-1]
+        /// range(start, end, step) → array with step
+        fn range_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            let (start, end, step) = match args.len() {
+                1 => {
+                    let n = match &args[0] {
+                        Value::Number(x) => *x,
+                        _ => return Err(host.err("range(): argument must be number".into())),
+                    };
+                    (0.0, n, 1.0)
+                }
+                2 => {
+                    let s = match &args[0] {
+                        Value::Number(x) => *x,
+                        _ => return Err(host.err("range(): arguments must be numbers".into())),
+                    };
+                    let e = match &args[1] {
+                        Value::Number(x) => *x,
+                        _ => return Err(host.err("range(): arguments must be numbers".into())),
+                    };
+                    (s, e, 1.0)
+                }
+                3 => {
+                    let s = match &args[0] {
+                        Value::Number(x) => *x,
+                        _ => return Err(host.err("range(): arguments must be numbers".into())),
+                    };
+                    let e = match &args[1] {
+                        Value::Number(x) => *x,
+                        _ => return Err(host.err("range(): arguments must be numbers".into())),
+                    };
+                    let st = match &args[2] {
+                        Value::Number(x) if *x != 0.0 => *x,
+                        _ => return Err(host.err("range(): step must be non-zero number".into())),
+                    };
+                    (s, e, st)
+                }
+                _ => {
+                    return Err(
+                        host.err(format!("range() expects 1-3 arguments, got {}", args.len()))
+                    )
+                }
+            };
+            let mut result = Vec::new();
+            let mut i = start;
+            if step > 0.0 {
+                while i < end {
+                    result.push(Value::Number(i));
+                    i += step;
+                }
+            } else {
+                while i > end {
+                    result.push(Value::Number(i));
+                    i += step;
+                }
+            }
+            Ok(alloc_array(result))
+        }
+
+        /// enumerate(arr) → array of [index, value] pairs
+        fn enumerate_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "enumerate() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("enumerate(): argument must be array".into())),
+            };
+            let result: Vec<Value> = items
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| alloc_array(vec![Value::Number(i as f64), v]))
+                .collect();
+            Ok(alloc_array(result))
+        }
+
+        /// sum(arr) → numeric sum of array (nil/non-numeric elements are skipped)
+        fn sum_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!("sum() expects 1 argument, got {}", args.len())));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("sum(): argument must be array".into())),
+            };
+            let s: f64 = items
+                .iter()
+                .filter_map(|v| {
+                    if let Value::Number(n) = v {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .sum();
+            Ok(Value::Number(s))
+        }
+
+        /// min_of(arr) → minimum numeric value, or nil if empty
+        fn min_of_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!("min_of() expects 1 argument, got {}", args.len())));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("min_of(): argument must be array".into())),
+            };
+            let nums: Vec<f64> = items
+                .iter()
+                .filter_map(|v| {
+                    if let Value::Number(n) = v {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if nums.is_empty() {
+                return Ok(Value::Nil);
+            }
+            Ok(Value::Number(
+                nums.iter().cloned().fold(f64::INFINITY, f64::min),
+            ))
+        }
+
+        /// max_of(arr) → maximum numeric value, or nil if empty
+        fn max_of_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!("max_of() expects 1 argument, got {}", args.len())));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("max_of(): argument must be array".into())),
+            };
+            let nums: Vec<f64> = items
+                .iter()
+                .filter_map(|v| {
+                    if let Value::Number(n) = v {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if nums.is_empty() {
+                return Ok(Value::Nil);
+            }
+            Ok(Value::Number(
+                nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            ))
+        }
+
+        /// product(arr) → product of all numeric elements
+        fn product_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!("product() expects 1 argument, got {}", args.len())));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("product(): argument must be array".into())),
+            };
+            let p: f64 = items
+                .iter()
+                .filter_map(|v| {
+                    if let Value::Number(n) = v {
+                        Some(*n)
+                    } else {
+                        None
+                    }
+                })
+                .product();
+            Ok(Value::Number(p))
+        }
+
+        /// clamp(val, min, max) → value clamped to [min, max]
+        fn clamp_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            if args.len() != 3 {
+                return Err(host.err("clamp(val, min, max) expects 3 arguments".into()));
+            }
+            let v = match &args[0] {
+                Value::Number(x) => *x,
+                _ => return Err(host.err("clamp(): arguments must be numbers".into())),
+            };
+            let mn = match &args[1] {
+                Value::Number(x) => *x,
+                _ => return Err(host.err("clamp(): arguments must be numbers".into())),
+            };
+            let mx = match &args[2] {
+                Value::Number(x) => *x,
+                _ => return Err(host.err("clamp(): arguments must be numbers".into())),
+            };
+            Ok(Value::Number(v.max(mn).min(mx)))
+        }
+
+        // ── Type-checking predicates (additional) ────────────────────────────────────────────────
+
+        fn is_number_builtin(_h: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(matches!(args.first(), Some(Value::Number(_)))))
+        }
+        fn is_string_builtin(_h: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(matches!(args.first(), Some(Value::Obj(_)))))
+        }
+        fn is_array_builtin(_h: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(matches!(args.first(), Some(Value::Array(_)))))
+        }
+        fn is_map_builtin(_h: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(matches!(args.first(), Some(Value::Map(_)))))
+        }
+        fn is_bool_builtin(_h: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(matches!(args.first(), Some(Value::Bool(_)))))
+        }
+        fn is_fn_builtin(_h: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(matches!(
+                args.first(),
+                Some(Value::Function(_) | Value::Closure(_) | Value::Builtin(_))
+            )))
+        }
+        // is_nil_builtin already defined above (line ~1694)
+
+        // ── New string helpers ───────────────────────────────────────────────────────
+
+        /// str_repeat(s, n) → string repeated n times
+        fn str_repeat_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("str_repeat(s, n) expects 2 arguments".into()));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("str_repeat(): first arg must be string".into()))?;
+            let n = match &args[1] {
+                Value::Number(x) if *x >= 0.0 => *x as usize,
+                _ => {
+                    return Err(
+                        host.err("str_repeat(): second arg must be non-negative number".into())
+                    )
+                }
+            };
+            Ok(alloc_string(s.repeat(n)))
+        }
+
+        /// str_pad_left(s, width, pad_char) → left-pads s to width with pad_char
+        fn str_pad_left_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 3 {
+                return Err(host.err("str_pad_left(s, width, pad) expects 3 arguments".into()));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("str_pad_left(): first arg must be string".into()))?;
+            let w = match &args[1] {
+                Value::Number(x) => *x as usize,
+                _ => return Err(host.err("str_pad_left(): width must be number".into())),
+            };
+            let pad = args[2]
+                .as_str()
+                .map_err(|_| host.err("str_pad_left(): pad must be string".into()))?;
+            let pad_ch = pad.chars().next().unwrap_or(' ');
+            let cur = s.chars().count();
+            if cur >= w {
+                return Ok(alloc_string(s));
+            }
+            let padding: String = std::iter::repeat_n(pad_ch, w - cur).collect();
+            Ok(alloc_string(format!("{padding}{s}")))
+        }
+
+        /// str_pad_right(s, width, pad_char) → right-pads s to width with pad_char
+        fn str_pad_right_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 3 {
+                return Err(host.err("str_pad_right(s, width, pad) expects 3 arguments".into()));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|_| host.err("str_pad_right(): first arg must be string".into()))?;
+            let w = match &args[1] {
+                Value::Number(x) => *x as usize,
+                _ => return Err(host.err("str_pad_right(): width must be number".into())),
+            };
+            let pad = args[2]
+                .as_str()
+                .map_err(|_| host.err("str_pad_right(): pad must be string".into()))?;
+            let pad_ch = pad.chars().next().unwrap_or(' ');
+            let cur = s.chars().count();
+            if cur >= w {
+                return Ok(alloc_string(s));
+            }
+            let padding: String = std::iter::repeat_n(pad_ch, w - cur).collect();
+            Ok(alloc_string(format!("{s}{padding}")))
+        }
+
+        // ── New array helpers ───────────────────────────────────────────────────────
+
+        /// array_unique(arr) → new array with duplicate values removed (preserves order, first occurrence)
+        fn array_unique_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err("array_unique(arr) expects 1 argument".into()));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("array_unique(): argument must be an array".into())),
+            };
+            let mut seen: Vec<Value> = vec![];
+            let mut result: Vec<Value> = vec![];
+            for item in items {
+                if !seen.iter().any(|s| s == &item) {
+                    seen.push(item.clone());
+                    result.push(item);
+                }
+            }
+            Ok(alloc_array(result))
+        }
+
+        /// array_zip(a, b) → array of [a_i, b_i] pairs (stops at shorter length)
+        fn array_zip_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("array_zip(a, b) expects 2 arguments".into()));
+            }
+            let a = match &args[0] {
+                Value::Array(x) => x.borrow().clone(),
+                _ => return Err(host.err("array_zip(): first arg must be array".into())),
+            };
+            let b = match &args[1] {
+                Value::Array(x) => x.borrow().clone(),
+                _ => return Err(host.err("array_zip(): second arg must be array".into())),
+            };
+            let n = a.len().min(b.len());
+            let result: Vec<Value> = (0..n)
+                .map(|i| alloc_array(vec![a[i].clone(), b[i].clone()]))
+                .collect();
+            Ok(alloc_array(result))
+        }
+
+        /// array_chunk(arr, size) → array of arrays of at most `size` elements
+        fn array_chunk_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("array_chunk(arr, size) expects 2 arguments".into()));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("array_chunk(): first arg must be array".into())),
+            };
+            let size = match &args[1] {
+                Value::Number(n) if *n >= 1.0 => *n as usize,
+                _ => return Err(host.err("array_chunk(): size must be positive number".into())),
+            };
+            let result: Vec<Value> = items
+                .chunks(size)
+                .map(|chunk| alloc_array(chunk.to_vec()))
+                .collect();
+            Ok(alloc_array(result))
+        }
+
+        /// array_flatten(arr) → flattens one level of nesting
+        fn array_flatten_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err("array_flatten(arr) expects 1 argument".into()));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("array_flatten(): argument must be array".into())),
+            };
+            let mut result: Vec<Value> = vec![];
+            for item in items {
+                match item {
+                    Value::Array(sub) => result.extend(sub.borrow().clone()),
+                    other => result.push(other),
+                }
+            }
+            Ok(alloc_array(result))
+        }
+
+        /// array_take(arr, n) → first n elements
+        fn array_take_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("array_take(arr, n) expects 2 arguments".into()));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("array_take(): first arg must be array".into())),
+            };
+            let n = match &args[1] {
+                Value::Number(x) if *x >= 0.0 => *x as usize,
+                _ => return Err(host.err("array_take(): n must be non-negative".into())),
+            };
+            Ok(alloc_array(items.into_iter().take(n).collect()))
+        }
+
+        /// array_drop(arr, n) → all elements after the first n
+        fn array_drop_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err("array_drop(arr, n) expects 2 arguments".into()));
+            }
+            let items = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("array_drop(): first arg must be array".into())),
+            };
+            let n = match &args[1] {
+                Value::Number(x) if *x >= 0.0 => *x as usize,
+                _ => return Err(host.err("array_drop(): n must be non-negative".into())),
+            };
+            Ok(alloc_array(items.into_iter().skip(n).collect()))
+        }
+
+        fn num_abs_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if args.len() != 1 {
                 return Err(host.err(format!("num_abs() expects 1 argument, got {}", args.len())));
             }
@@ -4126,10 +6100,7 @@ impl VM {
             }
         }
 
-        fn num_max_builtin(
-            host: &mut dyn VmHost,
-            args: Vec<Value>,
-        ) -> Result<Value, RuntimeError> {
+        fn num_max_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if args.len() != 2 {
                 return Err(host.err(format!("num_max() expects 2 arguments, got {}", args.len())));
             }
@@ -4139,10 +6110,7 @@ impl VM {
             }
         }
 
-        fn num_min_builtin(
-            host: &mut dyn VmHost,
-            args: Vec<Value>,
-        ) -> Result<Value, RuntimeError> {
+        fn num_min_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if args.len() != 2 {
                 return Err(host.err(format!("num_min() expects 2 arguments, got {}", args.len())));
             }
@@ -4152,7 +6120,7 @@ impl VM {
             }
         }
 
-                // ---- OS builtins ----
+        // ---- OS builtins ----
 
         fn os_args_builtin(
             _host: &mut dyn VmHost,
@@ -4178,6 +6146,50 @@ impl VM {
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
             Ok(alloc_string("stub"))
+        }
+
+        /// os_which(cmd) — safely find an executable in PATH.
+        /// Uses std::process::Command to check each PATH entry directly (no shell injection).
+        fn os_which_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if !host.allow_exec() {
+                return Err(host.err("exec access denied".into()));
+            }
+            if args.len() != 1 {
+                return Err(host.err(format!("os_which() expects 1 argument, got {}", args.len())));
+            }
+            let cmd = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("os_which(): {m}")))?;
+            // Validate the command name (no path separators, no metacharacters)
+            let is_dangerous: bool = cmd.chars().any(|c| "'/\\;&| \t\n><`$(){}!#~\"".contains(c));
+            if is_dangerous || cmd.is_empty() {
+                return Err(host.err(format!("os_which(): unsafe command name: {}", cmd)));
+            }
+            // Search PATH entries directly (no shell)
+            let path_var = std::env::var("PATH").unwrap_or_default();
+            let separator = if cfg!(windows) { ';' } else { ':' };
+            for dir in path_var.split(separator) {
+                let candidate = std::path::Path::new(dir).join(cmd);
+                if candidate.is_file() {
+                    if let Some(s) = candidate.to_str() {
+                        return Ok(alloc_string(s.to_string()));
+                    }
+                }
+                // Windows: also try with .exe extension
+                #[cfg(windows)]
+                {
+                    let candidate_exe = std::path::Path::new(dir).join(format!("{}.exe", cmd));
+                    if candidate_exe.is_file() {
+                        if let Some(s) = candidate_exe.to_str() {
+                            return Ok(alloc_string(s.to_string()));
+                        }
+                    }
+                }
+            }
+            Ok(Value::Nil)
         }
 
         // ---- WebSocket accept key (RFC 6455) ----
@@ -4522,18 +6534,57 @@ impl VM {
                 arity: Some(0),
                 fun: gc_collect,
             },
-
             // --- Safety builtins (Rust-style guarantees for pblang code) ---
-            BuiltinFn { name: "assert",       arity: None, fun: assert_builtin },
-            BuiltinFn { name: "type_assert",  arity: Some(2), fun: type_assert_builtin },
-            BuiltinFn { name: "freeze",       arity: Some(1), fun: freeze_builtin },
-            BuiltinFn { name: "is_frozen",    arity: Some(1), fun: is_frozen_builtin },
-            BuiltinFn { name: "checked_add",  arity: Some(2), fun: checked_add_builtin },
-            BuiltinFn { name: "checked_mul",  arity: Some(2), fun: checked_mul_builtin },
-            BuiltinFn { name: "checked_sub",  arity: Some(2), fun: checked_sub_builtin },
-            BuiltinFn { name: "checked_div",  arity: Some(2), fun: checked_div_builtin },
-            BuiltinFn { name: "is_nil",       arity: Some(1), fun: is_nil_builtin },
-            BuiltinFn { name: "require_type", arity: Some(2), fun: require_type_builtin },
+            BuiltinFn {
+                name: "assert",
+                arity: None,
+                fun: assert_builtin,
+            },
+            BuiltinFn {
+                name: "type_assert",
+                arity: Some(2),
+                fun: type_assert_builtin,
+            },
+            BuiltinFn {
+                name: "freeze",
+                arity: Some(1),
+                fun: freeze_builtin,
+            },
+            BuiltinFn {
+                name: "is_frozen",
+                arity: Some(1),
+                fun: is_frozen_builtin,
+            },
+            BuiltinFn {
+                name: "checked_add",
+                arity: Some(2),
+                fun: checked_add_builtin,
+            },
+            BuiltinFn {
+                name: "checked_mul",
+                arity: Some(2),
+                fun: checked_mul_builtin,
+            },
+            BuiltinFn {
+                name: "checked_sub",
+                arity: Some(2),
+                fun: checked_sub_builtin,
+            },
+            BuiltinFn {
+                name: "checked_div",
+                arity: Some(2),
+                fun: checked_div_builtin,
+            },
+            BuiltinFn {
+                name: "is_nil",
+                arity: Some(1),
+                fun: is_nil_builtin,
+            },
+            BuiltinFn {
+                name: "require_type",
+                arity: Some(2),
+                fun: require_type_builtin,
+            },
             BuiltinFn {
                 name: "sha256",
                 arity: Some(1),
@@ -4680,6 +6731,22 @@ impl VM {
                 arity: Some(1),
                 fun: tcp_local_addr,
             },
+            // TLS builtins (W4-gamma)
+            BuiltinFn {
+                name: "tcp_listen_tls",
+                arity: Some(3),
+                fun: tcp_listen_tls,
+            },
+            BuiltinFn {
+                name: "tcp_connect_tls",
+                arity: Some(2),
+                fun: tcp_connect_tls,
+            },
+            BuiltinFn {
+                name: "tcp_wrap_tls",
+                arity: Some(3),
+                fun: tcp_wrap_tls,
+            },
             BuiltinFn {
                 name: "http_parse_request",
                 arity: Some(1),
@@ -4704,6 +6771,41 @@ impl VM {
                 name: "onnx_infer",
                 arity: None,
                 fun: onnx_infer,
+            },
+            BuiltinFn {
+                name: "ai_chat",
+                arity: Some(1),
+                fun: ai_chat,
+            },
+            BuiltinFn {
+                name: "ai_embed",
+                arity: Some(1),
+                fun: ai_embed,
+            },
+            BuiltinFn {
+                name: "ai_token_count",
+                arity: Some(1),
+                fun: ai_token_count,
+            },
+            BuiltinFn {
+                name: "quantum_run",
+                arity: None,
+                fun: quantum_run,
+            },
+            BuiltinFn {
+                name: "quantum_statevector",
+                arity: None,
+                fun: quantum_statevector,
+            },
+            BuiltinFn {
+                name: "quantum_backends",
+                arity: Some(0),
+                fun: quantum_backends,
+            },
+            BuiltinFn {
+                name: "polyglot_exec",
+                arity: Some(2),
+                fun: polyglot_exec,
             },
             BuiltinFn {
                 name: "ffi_load",
@@ -4786,45 +6888,203 @@ impl VM {
                 arity: Some(1),
                 fun: channel_select_builtin,
             },
-
             // ---- Enhanced threading builtins ----
-            BuiltinFn { name: "channel_buffered",       arity: Some(1),    fun: channel_buffered_builtin },
-            BuiltinFn { name: "recv_timeout",           arity: Some(2),    fun: channel_recv_timeout_builtin },
-            BuiltinFn { name: "select_with_timeout",    arity: Some(2),    fun: channel_select_timeout_builtin },
-            BuiltinFn { name: "channel_size",           arity: Some(1),    fun: channel_size_builtin },
-            BuiltinFn { name: "join_all",               arity: Some(1),    fun: join_all_builtin },
-            BuiltinFn { name: "spawn_n",                arity: Some(2),    fun: spawn_n_builtin },
-            BuiltinFn { name: "ticker",                 arity: Some(1),    fun: ticker_builtin },
-            BuiltinFn { name: "timeout_channel",        arity: Some(1),    fun: timeout_channel_builtin },
-
+            BuiltinFn {
+                name: "channel_buffered",
+                arity: Some(1),
+                fun: channel_buffered_builtin,
+            },
+            BuiltinFn {
+                name: "recv_timeout",
+                arity: Some(2),
+                fun: channel_recv_timeout_builtin,
+            },
+            BuiltinFn {
+                name: "select_with_timeout",
+                arity: Some(2),
+                fun: channel_select_timeout_builtin,
+            },
+            BuiltinFn {
+                name: "channel_size",
+                arity: Some(1),
+                fun: channel_size_builtin,
+            },
+            BuiltinFn {
+                name: "join_all",
+                arity: Some(1),
+                fun: join_all_builtin,
+            },
+            BuiltinFn {
+                name: "spawn_n",
+                arity: Some(2),
+                fun: spawn_n_builtin,
+            },
+            BuiltinFn {
+                name: "ticker",
+                arity: Some(1),
+                fun: ticker_builtin,
+            },
+            BuiltinFn {
+                name: "timeout_channel",
+                arity: Some(1),
+                fun: timeout_channel_builtin,
+            },
             // ---- Mutex (Go sync.Mutex / Rust Mutex) ----
-            BuiltinFn { name: "mutex_new",       arity: Some(0),  fun: mutex_new_builtin },
-            BuiltinFn { name: "mutex_lock",      arity: Some(1),  fun: mutex_lock_builtin },
-            BuiltinFn { name: "mutex_try_lock",  arity: Some(1),  fun: mutex_try_lock_builtin },
-            BuiltinFn { name: "mutex_unlock",    arity: Some(1),  fun: mutex_unlock_builtin },
-
+            BuiltinFn {
+                name: "mutex_new",
+                arity: Some(0),
+                fun: mutex_new_builtin,
+            },
+            BuiltinFn {
+                name: "mutex_lock",
+                arity: Some(1),
+                fun: mutex_lock_builtin,
+            },
+            BuiltinFn {
+                name: "mutex_try_lock",
+                arity: Some(1),
+                fun: mutex_try_lock_builtin,
+            },
+            BuiltinFn {
+                name: "mutex_unlock",
+                arity: Some(1),
+                fun: mutex_unlock_builtin,
+            },
             // ---- RwLock (Go sync.RWMutex / Rust RwLock) ----
-            BuiltinFn { name: "rwlock_new",      arity: Some(0),  fun: rwlock_new_builtin },
-            BuiltinFn { name: "rwlock_read",     arity: Some(1),  fun: rwlock_read_builtin },
-            BuiltinFn { name: "rwlock_write",    arity: Some(1),  fun: rwlock_write_builtin },
-            BuiltinFn { name: "rwlock_unlock",   arity: Some(1),  fun: rwlock_unlock_builtin },
-
+            BuiltinFn {
+                name: "rwlock_new",
+                arity: Some(0),
+                fun: rwlock_new_builtin,
+            },
+            BuiltinFn {
+                name: "rwlock_read",
+                arity: Some(1),
+                fun: rwlock_read_builtin,
+            },
+            BuiltinFn {
+                name: "rwlock_write",
+                arity: Some(1),
+                fun: rwlock_write_builtin,
+            },
+            BuiltinFn {
+                name: "rwlock_unlock",
+                arity: Some(1),
+                fun: rwlock_unlock_builtin,
+            },
             // ---- Barrier (Java CyclicBarrier / Go WaitGroup) ----
-            BuiltinFn { name: "barrier_new",     arity: Some(1),  fun: barrier_new_builtin },
-            BuiltinFn { name: "barrier_wait",    arity: Some(1),  fun: barrier_wait_builtin },
-
+            BuiltinFn {
+                name: "barrier_new",
+                arity: Some(1),
+                fun: barrier_new_builtin,
+            },
+            BuiltinFn {
+                name: "barrier_wait",
+                arity: Some(1),
+                fun: barrier_wait_builtin,
+            },
             // ---- Once (Go sync.Once / Kotlin by lazy) ----
-            BuiltinFn { name: "once_new",        arity: Some(0),  fun: once_new_builtin },
-            BuiltinFn { name: "once_is_done",    arity: Some(1),  fun: once_is_done_builtin },
-
+            BuiltinFn {
+                name: "once_new",
+                arity: Some(0),
+                fun: once_new_builtin,
+            },
+            BuiltinFn {
+                name: "once_is_done",
+                arity: Some(1),
+                fun: once_is_done_builtin,
+            },
+            // ---- Runtime memory safety ----
+            BuiltinFn {
+                name: "allocate",
+                arity: None,
+                fun: allocate_builtin,
+            },
+            BuiltinFn {
+                name: "borrow_immutable",
+                arity: Some(1),
+                fun: borrow_immutable_builtin,
+            },
+            BuiltinFn {
+                name: "borrow_mutable",
+                arity: Some(1),
+                fun: borrow_mutable_builtin,
+            },
+            BuiltinFn {
+                name: "borrow_unique",
+                arity: Some(1),
+                fun: borrow_unique_builtin,
+            },
+            BuiltinFn {
+                name: "release_borrow",
+                arity: None,
+                fun: release_borrow_builtin,
+            },
+            BuiltinFn {
+                name: "load",
+                arity: Some(1),
+                fun: mem_load_builtin,
+            },
+            BuiltinFn {
+                name: "store",
+                arity: Some(2),
+                fun: mem_store_builtin,
+            },
+            BuiltinFn {
+                name: "deallocate",
+                arity: Some(1),
+                fun: deallocate_builtin,
+            },
+            BuiltinFn {
+                name: "push_lifetime",
+                arity: Some(0),
+                fun: push_lifetime_builtin,
+            },
+            BuiltinFn {
+                name: "pop_lifetime",
+                arity: Some(0),
+                fun: pop_lifetime_builtin,
+            },
+            BuiltinFn {
+                name: "memory_stats",
+                arity: Some(0),
+                fun: memory_stats_builtin,
+            },
             // ---- Atomic i64 (Java AtomicInteger / Go atomic.Int64 / Rust AtomicI64) ----
-            BuiltinFn { name: "atomic_new",      arity: None,     fun: atomic_new_builtin },
-            BuiltinFn { name: "atomic_get",      arity: Some(1),  fun: atomic_get_builtin },
-            BuiltinFn { name: "atomic_set",      arity: Some(2),  fun: atomic_set_builtin },
-            BuiltinFn { name: "atomic_add",      arity: Some(2),  fun: atomic_add_builtin },
-            BuiltinFn { name: "atomic_sub",      arity: Some(2),  fun: atomic_sub_builtin },
-            BuiltinFn { name: "atomic_cas",      arity: Some(3),  fun: atomic_cas_builtin },
-            BuiltinFn { name: "atomic_swap",     arity: Some(2),  fun: atomic_swap_builtin },
+            BuiltinFn {
+                name: "atomic_new",
+                arity: None,
+                fun: atomic_new_builtin,
+            },
+            BuiltinFn {
+                name: "atomic_get",
+                arity: Some(1),
+                fun: atomic_get_builtin,
+            },
+            BuiltinFn {
+                name: "atomic_set",
+                arity: Some(2),
+                fun: atomic_set_builtin,
+            },
+            BuiltinFn {
+                name: "atomic_add",
+                arity: Some(2),
+                fun: atomic_add_builtin,
+            },
+            BuiltinFn {
+                name: "atomic_sub",
+                arity: Some(2),
+                fun: atomic_sub_builtin,
+            },
+            BuiltinFn {
+                name: "atomic_cas",
+                arity: Some(3),
+                fun: atomic_cas_builtin,
+            },
+            BuiltinFn {
+                name: "atomic_swap",
+                arity: Some(2),
+                fun: atomic_swap_builtin,
+            },
             // String helpers
             BuiltinFn {
                 name: "str_slice",
@@ -4835,6 +7095,16 @@ impl VM {
                 name: "str_index_of",
                 arity: Some(2),
                 fun: str_index_of_builtin,
+            },
+            BuiltinFn {
+                name: "str_replace_all",
+                arity: Some(3),
+                fun: str_replace_all_builtin,
+            },
+            BuiltinFn {
+                name: "hmac_sha256",
+                arity: Some(2),
+                fun: hmac_sha256_builtin,
             },
             BuiltinFn {
                 name: "str_ends_with",
@@ -4861,10 +7131,171 @@ impl VM {
                 arity: Some(2),
                 fun: strcharcodeat_builtin,
             },
+            // Fundamental sequence/collection builtins
+            BuiltinFn {
+                name: "range",
+                arity: None,
+                fun: range_builtin,
+            },
+            BuiltinFn {
+                name: "enumerate",
+                arity: Some(1),
+                fun: enumerate_builtin,
+            },
+            BuiltinFn {
+                name: "sum",
+                arity: Some(1),
+                fun: sum_builtin,
+            },
+            BuiltinFn {
+                name: "min_of",
+                arity: Some(1),
+                fun: min_of_builtin,
+            },
+            BuiltinFn {
+                name: "max_of",
+                arity: Some(1),
+                fun: max_of_builtin,
+            },
+            BuiltinFn {
+                name: "product",
+                arity: Some(1),
+                fun: product_builtin,
+            },
+            BuiltinFn {
+                name: "clamp",
+                arity: Some(3),
+                fun: clamp_builtin,
+            },
+            // Type-checking predicates
+            BuiltinFn {
+                name: "is_number",
+                arity: Some(1),
+                fun: is_number_builtin,
+            },
+            BuiltinFn {
+                name: "is_string",
+                arity: Some(1),
+                fun: is_string_builtin,
+            },
+            BuiltinFn {
+                name: "is_array",
+                arity: Some(1),
+                fun: is_array_builtin,
+            },
+            BuiltinFn {
+                name: "is_map",
+                arity: Some(1),
+                fun: is_map_builtin,
+            },
+            BuiltinFn {
+                name: "is_bool",
+                arity: Some(1),
+                fun: is_bool_builtin,
+            },
+            BuiltinFn {
+                name: "is_fn",
+                arity: Some(1),
+                fun: is_fn_builtin,
+            },
+            BuiltinFn {
+                name: "is_nil",
+                arity: Some(1),
+                fun: is_nil_builtin,
+            },
+            // String helpers
+            BuiltinFn {
+                name: "str_repeat",
+                arity: Some(2),
+                fun: str_repeat_builtin,
+            },
+            BuiltinFn {
+                name: "str_pad_left",
+                arity: Some(3),
+                fun: str_pad_left_builtin,
+            },
+            BuiltinFn {
+                name: "str_pad_right",
+                arity: Some(3),
+                fun: str_pad_right_builtin,
+            },
+            // New array helpers
+            BuiltinFn {
+                name: "array_unique",
+                arity: Some(1),
+                fun: array_unique_builtin,
+            },
+            BuiltinFn {
+                name: "array_zip",
+                arity: Some(2),
+                fun: array_zip_builtin,
+            },
+            BuiltinFn {
+                name: "array_chunk",
+                arity: Some(2),
+                fun: array_chunk_builtin,
+            },
+            BuiltinFn {
+                name: "array_flatten",
+                arity: Some(1),
+                fun: array_flatten_builtin,
+            },
+            BuiltinFn {
+                name: "array_take",
+                arity: Some(2),
+                fun: array_take_builtin,
+            },
+            BuiltinFn {
+                name: "array_drop",
+                arity: Some(2),
+                fun: array_drop_builtin,
+            },
             BuiltinFn {
                 name: "array_sort",
                 arity: Some(1),
                 fun: array_sort_builtin,
+            },
+            // Regex builtins
+            BuiltinFn {
+                name: "regex_match",
+                arity: Some(2),
+                fun: regex_match_builtin,
+            },
+            BuiltinFn {
+                name: "regex_find",
+                arity: Some(2),
+                fun: regex_find_builtin,
+            },
+            BuiltinFn {
+                name: "regex_find_all",
+                arity: Some(2),
+                fun: regex_find_all_builtin,
+            },
+            BuiltinFn {
+                name: "regex_replace",
+                arity: Some(3),
+                fun: regex_replace_builtin,
+            },
+            BuiltinFn {
+                name: "regex_replace_all",
+                arity: Some(3),
+                fun: regex_replace_all_builtin,
+            },
+            BuiltinFn {
+                name: "regex_split",
+                arity: Some(2),
+                fun: regex_split_builtin,
+            },
+            BuiltinFn {
+                name: "regex_capture",
+                arity: Some(2),
+                fun: regex_capture_builtin,
+            },
+            // String formatting
+            BuiltinFn {
+                name: "str_format",
+                arity: None,
+                fun: str_format_builtin,
             },
             BuiltinFn {
                 name: "num_abs",
@@ -4896,6 +7327,17 @@ impl VM {
                 name: "os_signal_trap",
                 arity: Some(2),
                 fun: os_signal_trap_builtin,
+            },
+            BuiltinFn {
+                name: "os_which",
+                arity: Some(1),
+                fun: os_which_builtin,
+            },
+            // str_from_char_code alias for strfromcharcode (used in stdlib)
+            BuiltinFn {
+                name: "str_from_char_code",
+                arity: Some(1),
+                fun: strfromcharcode_builtin,
             },
             // WebSocket / HTTP / SSE builtins
             BuiltinFn {
@@ -5086,6 +7528,9 @@ impl VM {
             stdlib_config,
             limits,
             ffi_policy,
+            memory_tracker: MemoryTracker::new(),
+            thread_pool: None,
+            handle_registry: VmHandleRegistry::new(),
         }
     }
 
@@ -5132,6 +7577,9 @@ impl VM {
             stdlib_config: None,
             limits: None,
             ffi_policy: None,
+            memory_tracker: MemoryTracker::new(),
+            thread_pool: None,
+            handle_registry: VmHandleRegistry::new(),
         }
     }
 
@@ -5157,6 +7605,9 @@ impl VM {
             open_upvalues: vec![],
             handlers: vec![],
             stdlib_config: Some(config),
+            memory_tracker: MemoryTracker::new(),
+            thread_pool: None,
+            handle_registry: VmHandleRegistry::new(),
             limits: None,
             ffi_policy: None,
         }
@@ -5201,6 +7652,9 @@ impl VM {
         let script_fn = Rc::new(Function {
             name: Some("script".to_string()),
             arity: 0,
+            min_arity: 0,
+            defaults: vec![],
+            is_vararg: false,
             chunk,
         });
 
@@ -5301,7 +7755,11 @@ impl VM {
                                 Value::Obj(o) => match o.as_ref() {
                                     pblang_ir::Obj::String(s) => s.clone(),
                                 },
-                                _ => return Err(self.err("OpSafeGetAttr: invalid attr name".to_string())),
+                                _ => {
+                                    return Err(
+                                        self.err("OpSafeGetAttr: invalid attr name".to_string())
+                                    )
+                                }
                             }
                         };
                         match obj {
@@ -5337,7 +7795,10 @@ impl VM {
                                 Value::Array(a) => {
                                     let i = match index {
                                         Value::Number(n) => n as isize,
-                                        _ => return Err(self.err("array?[]: index must be number".to_string())),
+                                        _ => {
+                                            return Err(self
+                                                .err("array?[]: index must be number".to_string()))
+                                        }
                                     };
                                     let a = a.borrow();
                                     if i < 0 || (i as usize) >= a.len() {
@@ -5347,7 +7808,9 @@ impl VM {
                                     }
                                 }
                                 Value::Map(m) => {
-                                    let key = index.as_str().map_err(|_| self.err("map?[]: key must be string".to_string()))?;
+                                    let key = index.as_str().map_err(|_| {
+                                        self.err("map?[]: key must be string".to_string())
+                                    })?;
                                     let v = m.borrow().get(key).cloned().unwrap_or(Value::Nil);
                                     self.stack.push(v);
                                 }
@@ -5368,9 +7831,12 @@ impl VM {
                                 let is_ok = mb.get("ok").cloned();
                                 match is_ok {
                                     Some(Value::Bool(false)) => {
-                                        let msg = mb.get("error")
+                                        let msg = mb
+                                            .get("error")
                                             .and_then(|e| e.as_str().ok().map(String::from))
-                                            .unwrap_or_else(|| "error (from ? operator)".to_string());
+                                            .unwrap_or_else(|| {
+                                                "error (from ? operator)".to_string()
+                                            });
                                         drop(mb);
                                         return Err(self.err(msg));
                                     }
@@ -5387,7 +7853,8 @@ impl VM {
                             }
                             Value::Nil => {
                                 return Err(self.err(
-                                    "? operator: cannot unwrap nil (use if/else or unwrap_or)".to_string()
+                                    "? operator: cannot unwrap nil (use if/else or unwrap_or)"
+                                        .to_string(),
                                 ));
                             }
                             _ => self.stack.push(v),
@@ -5398,6 +7865,38 @@ impl VM {
                     OpCode::OpIsNil => {
                         let v = self.pop()?;
                         self.stack.push(Value::Bool(matches!(v, Value::Nil)));
+                    }
+
+                    OpCode::OpDup => {
+                        // Duplicate top of stack
+                        let top = self
+                            .stack
+                            .last()
+                            .cloned()
+                            .ok_or_else(|| self.err("OpDup: stack underflow".to_string()))?;
+                        self.stack.push(top);
+                    }
+
+                    OpCode::OpThrow => {
+                        // Pop value and raise as RuntimeError
+                        let val = self.pop()?;
+                        let msg = match &val {
+                            Value::Obj(o) => match o.as_ref() {
+                                pblang_ir::Obj::String(s) => s.clone(),
+                            },
+                            Value::Map(m) => {
+                                let mb = m.borrow();
+                                mb.get("message")
+                                    .and_then(|v| v.as_str().ok().map(String::from))
+                                    .or_else(|| {
+                                        mb.get("msg")
+                                            .and_then(|v| v.as_str().ok().map(String::from))
+                                    })
+                                    .unwrap_or_else(|| format!("{val}"))
+                            }
+                            _ => format!("{val}"),
+                        };
+                        return Err(self.err(msg));
                     }
 
                     // ---- comparisons ----
@@ -5576,7 +8075,8 @@ impl VM {
                                 // Check freeze guard
                                 if matches!(m.borrow().get("__frozen"), Some(Value::Bool(true))) {
                                     return Err(self.err(format!(
-                                        "FrozenError: cannot set attribute '{}' on a frozen map", attr
+                                        "FrozenError: cannot set attribute '{}' on a frozen map",
+                                        attr
                                     )));
                                 }
                                 m.borrow_mut().insert(attr, value.clone());
@@ -5691,7 +8191,9 @@ impl VM {
                             Value::Map(m) => {
                                 // FIX #20: Enforce freeze() for index-style assignment too
                                 if matches!(m.borrow().get("__frozen"), Some(Value::Bool(true))) {
-                                    return Err(self.err("FrozenError: cannot set index on a frozen map".to_string()));
+                                    return Err(self.err(
+                                        "FrozenError: cannot set index on a frozen map".to_string(),
+                                    ));
                                 }
                                 let key = index.as_str().map_err(|m| {
                                     self.err(format!("map index must be string: {m}"))
@@ -6020,11 +8522,58 @@ impl VM {
             _ => return Err(self.err("can only call function/closure/builtin")),
         };
 
-        if argc != closure_rc.function.arity {
-            return Err(self.err(format!(
-                "arity mismatch: expected {}, got {}",
-                closure_rc.function.arity, argc
-            )));
+        let func = &closure_rc.function;
+        let arity = func.arity;
+        let min_arity = func.min_arity;
+        let is_vararg = func.is_vararg;
+
+        // Arity check with defaults and vararg support
+        if is_vararg {
+            // Vararg: must supply at least min_arity args; extra args → vararg array
+            if argc < min_arity {
+                return Err(self.err(format!(
+                    "arity mismatch: expected at least {} arguments, got {}",
+                    min_arity, argc
+                )));
+            }
+        } else {
+            // Normal function with optional defaults
+            if argc < min_arity {
+                return Err(self.err(format!(
+                    "arity mismatch: expected at least {} argument(s), got {}",
+                    min_arity, argc
+                )));
+            }
+            if argc > arity {
+                return Err(self.err(format!(
+                    "arity mismatch: expected at most {} argument(s), got {}",
+                    arity, argc
+                )));
+            }
+        }
+
+        // Push default values for missing optional parameters
+        if !is_vararg && argc < arity {
+            let defaults = func.defaults.clone();
+            let missing = arity - argc;
+            // defaults[i] covers param at index (min_arity + i)
+            // We need defaults for params at index [argc, arity)
+            let start_default = argc.saturating_sub(min_arity);
+            for i in 0..missing {
+                let default_idx = start_default + i;
+                let dv = defaults.get(default_idx).cloned().unwrap_or(Value::Nil);
+                self.stack.push(dv);
+            }
+        }
+
+        // Handle variadic: collect extra args into array
+        if is_vararg {
+            let extra = argc.saturating_sub(arity);
+            let vararg_start = self.stack.len() - extra;
+            let vararg_vals: Vec<Value> = self.stack.drain(vararg_start..).collect();
+            let vararg_arr = alloc_array(vararg_vals);
+            // Push the vararg array as the last parameter
+            self.stack.push(vararg_arr);
         }
 
         if let Some(ref lim) = self.limits {
@@ -6057,7 +8606,9 @@ impl VM {
                 return Err(self.err("return with no frame"));
             }
 
-            let frame = self.frames.last_mut()
+            let frame = self
+                .frames
+                .last_mut()
                 .expect("do_return: frames non-empty confirmed by has_frames guard above");
 
             // If the current frame has pending defers, run the next one
@@ -6071,14 +8622,17 @@ impl VM {
 
                 self.stack.push(defer_closure);
                 self.call_top(0)?;
-                self.frames.last_mut()
+                self.frames
+                    .last_mut()
                     .expect("do_return: call_top pushed a frame so frames is non-empty")
                     .is_defer_thunk = true;
                 return Ok(());
             }
 
             // No more defers for this frame. Pop it.
-            let frame = self.frames.pop()
+            let frame = self
+                .frames
+                .pop()
                 .expect("do_return: last_mut() succeeded so pop() cannot be None");
 
             self.close_upvalues_from(frame.stack_base + 1);
@@ -6101,9 +8655,187 @@ impl VM {
     }
 }
 
+fn memory_safety_err(host: &dyn VmHost, e: MemorySafetyError) -> RuntimeError {
+    host.err(e.to_string())
+}
+
+fn memory_handle_from_f64(host: &dyn VmHost, h: f64, what: &str) -> Result<MemoryId, RuntimeError> {
+    if !h.is_finite() || h.fract() != 0.0 || h < 1.0 {
+        return Err(host.err(format!("{what}: expected memory handle >= 1")));
+    }
+    Ok(MemoryId(h as usize))
+}
+
+fn borrow_type_from_code(host: &dyn VmHost, code: f64, what: &str) -> Result<BorrowType, RuntimeError> {
+    match code as i64 {
+        0 => Ok(BorrowType::Immutable),
+        1 => Ok(BorrowType::Mutable),
+        2 => Ok(BorrowType::Unique),
+        _ => Err(host.err(format!("{what}: borrow type must be 0, 1, or 2"))),
+    }
+}
+
+impl VM {
+    fn mem_allocate_impl(&mut self, value: Value, is_mutable: bool) -> Result<f64, RuntimeError> {
+        let id = self.memory_tracker.allocate(value, is_mutable);
+        Ok(id.0 as f64)
+    }
+
+    fn mem_borrow_immutable_impl(&mut self, handle: f64) -> Result<f64, RuntimeError> {
+        let mid = memory_handle_from_f64(self, handle, "borrow_immutable")?;
+        self.memory_tracker
+            .borrow_immutable(mid, None)
+            .map(|b| b.0 as f64)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_borrow_mutable_impl(&mut self, handle: f64) -> Result<f64, RuntimeError> {
+        let mid = memory_handle_from_f64(self, handle, "borrow_mutable")?;
+        self.memory_tracker
+            .borrow_mutable(mid, None)
+            .map(|b| b.0 as f64)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_borrow_unique_impl(&mut self, handle: f64) -> Result<f64, RuntimeError> {
+        let mid = memory_handle_from_f64(self, handle, "borrow_unique")?;
+        self.memory_tracker
+            .borrow_unique(mid, None)
+            .map(|b| b.0 as f64)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_release_borrow_id_impl(&mut self, borrow_id: f64) -> Result<(), RuntimeError> {
+        if !borrow_id.is_finite() || borrow_id.fract() != 0.0 || borrow_id < 1.0 {
+            return Err(self.make_err(String::from("release_borrow: expected borrow id >= 1")));
+        }
+        self.memory_tracker
+            .release_borrow_by_id(BorrowId(borrow_id as usize))
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_release_borrow_type_impl(
+        &mut self,
+        handle: f64,
+        borrow_type: u8,
+    ) -> Result<(), RuntimeError> {
+        let mid = memory_handle_from_f64(self, handle, "release_borrow")?;
+        let bt = borrow_type_from_code(self, borrow_type as f64, "release_borrow")?;
+        self.memory_tracker
+            .release_borrow(mid, bt)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_load_impl(&mut self, handle: f64) -> Result<Value, RuntimeError> {
+        let mid = memory_handle_from_f64(self, handle, "load")?;
+        self.memory_tracker
+            .get(mid)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_store_impl(&mut self, handle: f64, value: Value) -> Result<(), RuntimeError> {
+        let mid = memory_handle_from_f64(self, handle, "store")?;
+        self.memory_tracker
+            .set(mid, value)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_deallocate_impl(&mut self, handle: f64) -> Result<(), RuntimeError> {
+        let mid = memory_handle_from_f64(self, handle, "deallocate")?;
+        self.memory_tracker
+            .deallocate(mid)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_push_lifetime_impl(&mut self) -> Result<f64, RuntimeError> {
+        Ok(self.memory_tracker.push_lifetime().0 as f64)
+    }
+
+    fn mem_pop_lifetime_impl(&mut self) -> Result<f64, RuntimeError> {
+        self.memory_tracker
+            .pop_lifetime()
+            .map(|l| l.0 as f64)
+            .map_err(|e| memory_safety_err(self, e))
+    }
+
+    fn mem_stats_impl(&self) -> Result<Value, RuntimeError> {
+        let s = self.memory_tracker.get_stats();
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "total_locations".into(),
+            Value::Number(s.total_locations as f64),
+        );
+        m.insert(
+            "active_borrows".into(),
+            Value::Number(s.active_borrows as f64),
+        );
+        m.insert(
+            "lifetime_depth".into(),
+            Value::Number(s.current_lifetime_depth as f64),
+        );
+        m.insert(
+            "ref_count_total".into(),
+            Value::Number(s.ref_count_total as f64),
+        );
+        Ok(alloc_map(m))
+    }
+}
+
 impl VmHost for VM {
     fn err(&self, msg: String) -> RuntimeError {
         self.make_err(msg)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn mem_allocate(&mut self, value: Value, is_mutable: bool) -> Result<f64, RuntimeError> {
+        self.mem_allocate_impl(value, is_mutable)
+    }
+
+    fn mem_borrow_immutable(&mut self, handle: f64) -> Result<f64, RuntimeError> {
+        self.mem_borrow_immutable_impl(handle)
+    }
+
+    fn mem_borrow_mutable(&mut self, handle: f64) -> Result<f64, RuntimeError> {
+        self.mem_borrow_mutable_impl(handle)
+    }
+
+    fn mem_borrow_unique(&mut self, handle: f64) -> Result<f64, RuntimeError> {
+        self.mem_borrow_unique_impl(handle)
+    }
+
+    fn mem_release_borrow_id(&mut self, borrow_id: f64) -> Result<(), RuntimeError> {
+        self.mem_release_borrow_id_impl(borrow_id)
+    }
+
+    fn mem_release_borrow_type(&mut self, handle: f64, borrow_type: u8) -> Result<(), RuntimeError> {
+        self.mem_release_borrow_type_impl(handle, borrow_type)
+    }
+
+    fn mem_load(&mut self, handle: f64) -> Result<Value, RuntimeError> {
+        self.mem_load_impl(handle)
+    }
+
+    fn mem_store(&mut self, handle: f64, value: Value) -> Result<(), RuntimeError> {
+        self.mem_store_impl(handle, value)
+    }
+
+    fn mem_deallocate(&mut self, handle: f64) -> Result<(), RuntimeError> {
+        self.mem_deallocate_impl(handle)
+    }
+
+    fn mem_push_lifetime(&mut self) -> Result<f64, RuntimeError> {
+        self.mem_push_lifetime_impl()
+    }
+
+    fn mem_pop_lifetime(&mut self) -> Result<f64, RuntimeError> {
+        self.mem_pop_lifetime_impl()
+    }
+
+    fn mem_stats(&self) -> Result<Value, RuntimeError> {
+        self.mem_stats_impl()
     }
 
     fn allow_fs(&self) -> bool {

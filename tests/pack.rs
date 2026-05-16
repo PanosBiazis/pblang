@@ -1064,3 +1064,229 @@ version = "0.1.0"
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn self_extract_sentinel_in_stub_binary() {
+    // Verify the sentinel-search logic that pblang-stub uses.
+    //
+    // Synthesises a fake self-extracting binary:
+    //   [fake_stub_bytes] ++ [SENTINEL] ++ [real tarball bytes]
+    // then confirms:
+    //   (a) the sentinel is located at exactly the expected offset, and
+    //   (b) the bytes after the sentinel are a valid, unpackable tar.gz.
+    //
+    // This test does NOT require the pblang-stub binary to be present;
+    // it exercises the binary format that pblang-stub was built to consume.
+    const SENTINEL: &[u8] = b"PBLANG_BUNDLE_START\x00";
+
+    // Build a small real package and pack it into a tarball.
+    let proj = make_temp_project();
+    let tarball_path = proj.join("sentinel_test.tar.gz");
+
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let status = std::process::Command::new(bin)
+        .arg("pack")
+        .arg(&proj)
+        .arg(&tarball_path)
+        .status()
+        .expect("run pblang pack");
+    assert!(status.success(), "pack should succeed for sentinel test");
+
+    let tarball_bytes = std::fs::read(&tarball_path).expect("read tarball");
+
+    // Synthesise: [fake stub] ++ [SENTINEL] ++ [tarball]
+    let fake_stub: &[u8] = b"FAKE_STUB_ELF_BYTES_12345";
+    let mut synthetic: Vec<u8> = Vec::new();
+    synthetic.extend_from_slice(fake_stub);
+    synthetic.extend_from_slice(SENTINEL);
+    synthetic.extend_from_slice(&tarball_bytes);
+
+    // Reproduce the backward sentinel scan from find_bundle_offset().
+    let sentinel_len = SENTINEL.len();
+    let found_offset = (0..=(synthetic.len() - sentinel_len))
+        .rev()
+        .find(|&i| &synthetic[i..i + sentinel_len] == SENTINEL)
+        .map(|i| i + sentinel_len);
+
+    let expected_offset = fake_stub.len() + sentinel_len;
+    assert_eq!(
+        found_offset,
+        Some(expected_offset),
+        "sentinel scan should find bundle at fake_stub.len() + sentinel_len"
+    );
+
+    // Bytes after sentinel must form a valid, decompressible tar.gz.
+    let unpack_dir = std::env::temp_dir().join("pblang_sentinel_unpack");
+    let _ = std::fs::remove_dir_all(&unpack_dir);
+    std::fs::create_dir_all(&unpack_dir).unwrap();
+
+    let bundle_slice = &synthetic[expected_offset..];
+    let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bundle_slice));
+    let mut archive = tar::Archive::new(dec);
+    archive
+        .unpack(&unpack_dir)
+        .expect("bytes after sentinel must unpack as a valid tar.gz");
+
+    // Sanity: at least one entry was extracted.
+    let entries: Vec<_> = std::fs::read_dir(&unpack_dir)
+        .expect("read unpack dir")
+        .collect();
+    assert!(!entries.is_empty(), "unpacked bundle should contain files");
+
+    let _ = std::fs::remove_dir_all(&proj);
+    let _ = std::fs::remove_dir_all(&unpack_dir);
+}
+
+fn ensure_pblang_stub_built(pblang_bin: &std::path::Path) {
+    let stub_name = if cfg!(target_os = "windows") {
+        "pblang-stub.exe"
+    } else {
+        "pblang-stub"
+    };
+    let stub = pblang_bin
+        .parent()
+        .expect("pblang parent dir")
+        .join(stub_name);
+    if stub.is_file() {
+        return;
+    }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "-p", "pblang-stub", "--quiet"])
+        .status()
+        .expect("cargo build pblang-stub");
+    assert!(status.success(), "failed to build pblang-stub for self-extract tests");
+    assert!(
+        stub.is_file(),
+        "pblang-stub should exist at {} after build",
+        stub.display()
+    );
+}
+
+#[test]
+fn bundle_self_extract_produces_executable_with_sentinel() {
+    let proj = make_temp_project_with_manifest_entry("pblang_self_extract_e2e");
+    let out_exe = proj.join("myapp");
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
+    ensure_pblang_stub_built(bin);
+
+    let bundle = std::process::Command::new(bin)
+        .arg("bundle")
+        .arg("--self-extract")
+        .arg("--output")
+        .arg(&out_exe)
+        .arg(&proj)
+        .output()
+        .expect("run pblang bundle --self-extract");
+    assert!(
+        bundle.status.success(),
+        "bundle --self-extract failed: stderr={}",
+        String::from_utf8_lossy(&bundle.stderr)
+    );
+    assert!(out_exe.is_file(), "self-extract output should exist");
+
+    let bytes = std::fs::read(&out_exe).expect("read self-extract binary");
+    const SENTINEL: &[u8] = b"PBLANG_BUNDLE_START\x00";
+    assert!(
+        bytes.windows(SENTINEL.len()).any(|w| w == SENTINEL),
+        "self-extract binary should contain bundle sentinel"
+    );
+
+    let _ = std::fs::remove_dir_all(&proj);
+    let _ = std::fs::remove_file(&out_exe);
+}
+
+#[test]
+fn self_extract_runs_without_pblang_on_path() {
+    let proj = make_temp_project_with_manifest_entry("pblang_self_extract_run");
+    let out_exe = proj.join("runme");
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
+    ensure_pblang_stub_built(bin);
+
+    let bundle = std::process::Command::new(bin)
+        .arg("bundle")
+        .arg("--self-extract")
+        .arg("--output")
+        .arg(&out_exe)
+        .arg(&proj)
+        .output()
+        .expect("bundle --self-extract");
+    assert!(
+        bundle.status.success(),
+        "bundle --self-extract failed: {}",
+        String::from_utf8_lossy(&bundle.stderr)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // PATH must not provide pblang — only the embedded bin/pblang inside the bundle may run.
+    let output = std::process::Command::new(&out_exe)
+        .env_remove("PATH")
+        .output()
+        .expect("run self-extract binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("42"),
+        "self-extract app should print 42 without PATH pblang, stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&proj);
+    let _ = std::fs::remove_file(&out_exe);
+}
+
+#[test]
+fn self_extract_extract_only_includes_embedded_runtime() {
+    let proj = make_temp_project_with_manifest_entry("pblang_self_extract_extract_only");
+    let out_exe = proj.join("app.bin");
+    let extract_dir = proj.join("extracted");
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
+    ensure_pblang_stub_built(bin);
+
+    let bundle = std::process::Command::new(bin)
+        .arg("bundle")
+        .arg("--self-extract")
+        .arg("--output")
+        .arg(&out_exe)
+        .arg(&proj)
+        .output()
+        .expect("bundle --self-extract");
+    assert!(bundle.status.success());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let extract = std::process::Command::new(&out_exe)
+        .arg("--extract-only")
+        .arg(&extract_dir)
+        .output()
+        .expect("run --extract-only");
+    assert!(
+        extract.status.success(),
+        "--extract-only failed: {}",
+        String::from_utf8_lossy(&extract.stderr)
+    );
+
+    let runtime = if cfg!(target_os = "windows") {
+        extract_dir.join("bin").join("pblang.exe")
+    } else {
+        extract_dir.join("bin").join("pblang")
+    };
+    assert!(
+        runtime.is_file(),
+        "extracted bundle should include embedded runtime at {}",
+        runtime.display()
+    );
+    assert!(
+        extract_dir.join("src").join("app.sapp").is_file(),
+        "extracted bundle should include package entry"
+    );
+
+    let _ = std::fs::remove_dir_all(&proj);
+}

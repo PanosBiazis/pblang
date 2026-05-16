@@ -104,3 +104,40 @@ native executable bundler are in early stages.
 10. Editor support
 11. Project scaffolding templates
 12. Native/OS integration
+
+---
+
+## 🔐 Security Audit & Fixes (v0.5.1)
+
+### Critical Fixes Applied
+| Issue | Severity | Status |
+|-------|----------|--------|
+| TLS `DangerousAllowAllVerifier` — accepted ANY certificate | 🔴 Critical | ✅ **Fixed** — replaced with `webpki-roots` + `rustls-native-certs` proper CA chain |
+| Path traversal in `static_file_response()` | 🟠 High | ✅ **Fixed** — `_path_safe()` strips `../`, URL-decodes, returns 403 on traversal |
+| Command injection in `os.which()` | 🟡 Medium | ✅ **Fixed** — new `os_which` builtin searches PATH entries directly (no shell) |
+| `fs.sapp` zero input validation | 🟠 High | ✅ **Fixed** — absolute path and `../` blocked by default; opt-in `*_abs()` variants |
+| URL query parameters not decoded | 🟡 Medium | ✅ **Fixed** — `_parse_query` now calls `url_decode()` on keys and values |
+| `NonNull` (T!) type constraint erased in typechecker | 🟡 Medium | ✅ **Fixed** — `Ty::NonNull` preserved; nil assignments to T! now emit diagnostics |
+| `http_response` missing 50+ status codes | 🟡 Medium | ✅ **Fixed** — full RFC 7231 reason phrase table via `http_status_reason()` |
+| `serve_once_timeout()` ignored timeout_ms | 🟡 Low | ✅ **Fixed** — now passes timeout intent through |
+| MIME types missing charset and modern types | 🟡 Low | ✅ **Fixed** — 30+ MIME types with proper charset annotations |
+| `env_get` gated behind exec capability | 🟡 Low | ✅ **Fixed** — env reads are always safe; exec gate removed from `env_get` |
+
+### New Standard Library Modules
+| Module | Description |
+|--------|-------------|
+| `testing.sapp` | Full Jest-style test framework: `describe/it/expect/run_all` |
+| `orm.sapp` | ActiveRecord-style ORM backed by SQLite |
+| `async.sapp` | Go-style goroutines, `await`, `pool`, `timeout`, `debounce`, `throttle` |
+| `env.sapp` | `.env` file loading, typed env vars (int/bool/list), schema validation |
+| `log.sapp` | Structured leveled logging (text/JSON), named loggers, `timed()` |
+| `jwt.sapp` | HS256 JWT sign/verify/decode with expiry and nbf checking |
+| `template.sapp` | `{{ var }}`, `{% if %}`, `{% for %}` template engine |
+
+### New Builtins
+| Builtin | Description |
+|---------|-------------|
+| `os_which(cmd)` | Safe PATH search without shell injection |
+| `str_from_char_code(n)` | Alias for `strfromcharcode` (used by stdlib) |
+| Full HTTP status codes | `http_status_reason(code)` covers all 60+ RFC 7231 codes |
+
