@@ -1,17 +1,17 @@
-# Threads – Σχεδίαση και μελλοντική υλοποίηση
+# Threads – Σχεδίαση και υλοποίηση
 
 Τελευταία ενημέρωση: Μάρτιος 2026.
 
 ## Στόχος
 
-Να επιτρέπεται η εκτέλεση κώδικα Sapphire σε παράλληλα νήματα (threads) για:
+Να επιτρέπεται η εκτέλεση κώδικα pblang σε παράλληλα νήματα (threads) για:
 - I/O overlap (π.χ. HTTP requests ενώ τρέχει game loop)
 - CPU-bound tasks σε πολυπύρηνα συστήματα
 - Async-style concurrency (spawn, join, shared state με προσοχή)
 
 ## Τρέχουσα κατάσταση
 
-- Το Sapphire εκθέτει πλέον **`spawn(fn)`**, **`join(handle)`**, **`channel()`**, **`send(sender, value)`**, **`recv(receiver)`**.
+- Το pblang εκθέτει πλέον **`spawn(fn)`**, **`join(handle)`**, **`channel()`**, **`send(sender, value)`**, **`recv(receiver)`**.
 - Το runtime παραμένει **VM-per-thread**: κάθε spawned task τρέχει σε νέο OS thread με δικό του VM.
 - Τα values μεταφέρονται με serialize/deep-copy semantics. Δεν υπάρχει shared RC heap ανάμεσα σε parent/child VMs.
 - Τα channel endpoints είναι ξεχωριστά **sender/receiver** values και χρησιμοποιούνται μαζί με τα builtins `send` / `recv`.
@@ -49,7 +49,7 @@ let ch = channel();
 
 ### Επιλογή C: Host-provided workers
 
-Ο embedder παρέχει `spawn`/`join` ως capability (όπως allow_fs). Το VM δεν έχει built-in thread pool, αλλά ο host καλεί Sapphire chunks σε worker threads και συγχρονίζει.
+Ο embedder παρέχει `spawn`/`join` ως capability (όπως allow_fs). Το VM δεν έχει built-in thread pool, αλλά ο host καλεί pblang chunks σε worker threads και συγχρονίζει.
 
 ## Τεχνικές προκλήσεις
 
@@ -90,7 +90,7 @@ let ch = channel();
 - **Done**: `channel()` + `send(sender, value)` + `recv(receiver)` MVP.
 - **Done**: transferable capture path για spawned closures, μόνο για safe serialized values.
 - **Done**: regression tests για value return, error propagation, inherited limits, closed-channel behavior, deterministic send/recv, non-transferable rejection.
-- **Επόμενο βήμα**: richer channel ergonomics (`close`, multiple sends per endpoint, πιθανό `select`) μόνο αν χρειαστεί, χωρίς shared heap model.
+- **Επόμενο βήμα**: βελτίωση εργονομίας (`thread_pool` limitations για closure transfer, περισσότερα diagnostics, stronger timeout patterns) χωρίς shared heap model.
 
 ## Σχετικά
 

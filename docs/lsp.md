@@ -1,9 +1,16 @@
-## Sapphire LSP (language server)
+## pblang LSP (language server)
 
-This workspace includes a minimal LSP server that provides:
+This workspace includes the `pblang-lsp` server (tower-lsp) used by `pblang lsp`.
+
+Current capabilities:
 
 - parse diagnostics (syntax errors)
 - typecheck diagnostics (warnings) from `pblang-typeck`
+- completion (`textDocument/completion`)
+- hover (`textDocument/hover`)
+- go-to-definition (`textDocument/definition`)
+- workspace symbols (`workspace/symbol`)
+- semantic tokens (`textDocument/semanticTokens/full`)
 
 ### Build
 
@@ -27,4 +34,6 @@ for `*.sapp` files, and set the command to:
 ```
 
 The server uses `textDocumentSync: full`, so it expects the full document text on changes.
+
+For the full command/tooling matrix and examples, see `docs/Tooling.md`.
 

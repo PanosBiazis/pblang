@@ -1,9 +1,11 @@
 # pblang Tooling
 
+This document is the canonical tooling reference for current behavior. Historical milestone sections are kept for context but may reference older phase names.
+
 ## CLI commands
 
 - **`pblang init`** — Create `pblang.toml` in the current directory (package name `my-app`, version `0.1.0`, empty dependencies). Fails if the file already exists.
-- **`pblang run [file.sapp|dir] [-- arg1 arg2 ...]`** — Execute a script and exit. Arguments after `--` are passed to the script and available via `os.args()` (from `stdlib:os.sapp`). If you pass a directory (or run `pblang run` from inside a manifest dir), Sapphire resolves the package entry from `pblang.toml`: first `[package].entry`, otherwise `main.sap`, `main.sapp`, `src/main.sap`, `src/main.sapp`.
+- **`pblang run [file.sapp|dir] [-- arg1 arg2 ...]`** — Execute a script and exit. Arguments after `--` are passed to the script and available via `os.args()` (from `stdlib:os.sapp`). If you pass a directory (or run `pblang run` from inside a manifest dir), pblang resolves the package entry from `pblang.toml`: first `[package].entry`, otherwise `main.sap`, `main.sapp`, `src/main.sap`, `src/main.sapp`.
 - **`pblang --check <file>`** — Parse and typecheck; print diagnostics.
 - **`pblang --doc <file> [--html] [out_dir]`** — Print module docs (exports, top-level functions, polyglot blocks). Polyglot blocks now include parsed attrs and code-line counts in both text and HTML output, so the current block contract is more inspectable from tooling. With `--html`, write `out_dir/index.html` (default `docs/`).
 - **`pblang --lock [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from `pblang.toml`. With **`--registry-index \<url\>`**, registry dependencies are resolved from that index for this invocation instead of relying on the environment. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command even if the env var is unset. See [Lockfile_contract.md](Lockfile_contract.md).
@@ -18,7 +20,7 @@
 - Example: **`error[src/main.sapp:3:5]: unexpected token ';'`**
 - **`pblang build [--registry-index \<url\>] [--require-registry-sha256] [path]`** — Generate `pblang.lock` from manifest dir, then typecheck the resolved package entry. With **`--registry-index \<url\>`**, registry dependencies are resolved explicitly for this build. With **`--require-registry-sha256`**, strict checksum mode is enabled explicitly for this command. Exit 1 on lock or typecheck failure.
 - **`pblang install [--registry-index \<url\>] [--require-registry-sha256] [path | <name>@<version>]`** — Resolve dependencies and generate `pblang.lock` when given a manifest **`path`** (existing behavior), or **fetch a single registry package** when invoked as `pblang install <name>@<version>`. With **`--registry-index \<url\>`**, registry dependencies (names starting with `@`) are resolved from that index (file:// or http(s)://). Static registry indexes may point to tarballs with either absolute URLs or paths relative to `index.json`. Git dependencies can use `{ git = \"...\", rev = \"...\" }` and are installed as pinned cached checkouts. Registry tarballs are unpacked with a safe-entry policy: paths must stay relative inside the cache destination, and link entries are rejected. **Verify on install (E4-beta):** when **`PBLANG_SIGNING_KEY`** is set and a `.sha256` sidecar exists at the tarball URL (same URL + `.sha256`), install verifies HMAC-SHA256 of the tarball before unpacking and rejects with an error on mismatch; if the key is set but no sidecar is found, a warning is printed and install continues. Third-party registry/git packages are validated during install: a declared `[package].entry` must resolve to an in-package file, otherwise the package must still contain at least one `.sap`/`.sapp` module. Otherwise uses **`PBLANG_REGISTRY_INDEX`** env var if set for registry deps. **`REQUIRE_REGISTRY_SHA256=1`** (or `true`) or **`--require-registry-sha256`** forces index entries to include sha256. **M4-alpha:** in `<name>@<version>` mode, `pblang install` resolves the highest semver version satisfying `<version>` from the hosted index, downloads and unpacks it into the Sapphire cache, and prints `Installed <name>@<resolved_version>`.
-- **`pblang publish --registry-dir \<dir\> [path]`** — Pack current package (from `pblang.toml` [package] name/version) into \<name\>-\<ver\>.tar.gz, write to \<dir\>, and update \<dir\>/index.json. If `[package].entry` is declared, `publish` validates that it is a relative in-package path and that the target is an existing file before writing any registry artifact. In the current local-registry MVP, published packages must also be **self-contained**: if `[dependencies]` is non-empty, `publish` fails instead of producing a non-portable registry artifact. Packages without explicit `[package].entry` are still allowed, but they must expose at least one Sapphire module file: either a default bare-import entry (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`) or another `.sap`/`.sapp` module for package subpath imports. Other projects can then run `pblang install --registry-index file:///path/to/dir/index.json`.
+- **`pblang publish --registry-dir \<dir\> [path]`** — Pack current package (from `pblang.toml` [package] name/version) into \<name\>-\<ver\>.tar.gz, write to \<dir\>, and update \<dir\>/index.json. If `[package].entry` is declared, `publish` validates that it is a relative in-package path and that the target is an existing file before writing any registry artifact. In the current local-registry MVP, published packages must also be **self-contained**: if `[dependencies]` is non-empty, `publish` fails instead of producing a non-portable registry artifact. Packages without explicit `[package].entry` are still allowed, but they must expose at least one pblang module file: either a default bare-import entry (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`) or another `.sap`/`.sapp` module for package subpath imports. Other projects can then run `pblang install --registry-index file:///path/to/dir/index.json`.
 - **`pblang publish`** — Hosted-style publish flow built on the same packaging and validation rules:
   - Reads **`PBLANG_REGISTRY_INDEX`** as registry base URL. For `file://` URLs pointing at a registry directory, `pblang publish` behaves as a thin wrapper around `pblang publish --registry-dir <dir>` (local file-based registry) so that tests and local workflows can use the same command.
   - For http(s) registries, `pblang publish` builds a tarball of the current package root, computes its sha256, and POSTs a multipart/form-data body to `<registry>/publish` with fields `tarball` (bytes), `sha256` (hex), and `metadata` JSON (`{name, version, description}`).
@@ -30,14 +32,14 @@
 - Local registry publish is **immutable per package name + version**: republishing the same version with identical content is allowed (idempotent success), but republishing the same version with different content fails.
 - After `pblang install`, package imports can use the dependency name directly, e.g. `import("@sapphire/http")`, or a package subpath, e.g. `import("@sapphire/http:src/router.sapp")`. The resolver loads the installed package root from `pblang.lock`, first honors optional `[package].entry = "src/lib.sapp"` from that package's `pblang.toml`, and otherwise falls back to `lib.sapp` / `lib.sap` / `main.sapp` / `main.sap`. Both `entry` and package subpaths must be relative, stay inside the package root, and resolve to files rather than directories.
 - **`pblang pack [--registry-index \<url\>] [--require-registry-sha256] [path] [out_file]`** — Stage A executables: δημιουργεί ένα ενιαίο `.tar.gz` artifact με το περιεχόμενο του πακέτου (manifest dir), συμπεριλαμβανομένων `pblang.toml`, ενημερωμένου `pblang.lock` και τοπικών dependencies. Το default `out_file` είναι `dist/app.tar.gz` μέσα στο manifest dir. **E4-gamma:** Before packing, manifest metadata is validated: `[package].target_platform` (if present) must be one of `any`, `linux`, `macos`, `windows`; `[package].min_runtime` (if present) must be a valid MAJOR.MINOR.PATCH version. Pack fails with a clear error otherwise. Αν το package έχει registry dependencies, το `pack` μπορεί πλέον να ξαναγεννήσει το lockfile με ρητό **`--registry-index \<url\>`** και **`--require-registry-sha256`** χωρίς να απαιτεί exported env var. Το `pack` κάνει validate ότι υπάρχει runnable package entry, ότι τα local path dependencies μένουν μέσα στο package root, και τυπώνει το resolved entry path. Η γραμμή επιτυχίας περιλαμβάνει προαιρετικά **name@version** και **description** από το `[package]` του manifest όταν υπάρχουν, και **οδηγία εκτέλεσης** (run hint): «To run: unpack the tarball and run 'pblang run .' in the unpacked directory.» Για να τρέξεις το app: αποσυμπίεσε το tarball και εκτέλεσε `pblang run` ή `pblang run .` από τον unpacked φάκελο (χρησιμοποιεί το εγκατεστημένο `sapphire` binary, δεν χρειάζεται project folder στο origin).
-- **`pblang bundle [--registry-index \<url\>] [--require-registry-sha256] [--self-extract] [path] [out_dir]`** — Create a portable folder (default `dist/`) containing the current sapphire executable, `pblang.toml`, `pblang.lock`, the resolved package entry, and local dependencies. **E4-gamma:** Same manifest metadata validation as `pack` (target_platform, min_runtime) before bundling. The bundled entry now preserves its relative path inside the package (for example `src/app.sapp`), so bundled apps with `[package].entry` work consistently. `bundle` now regenerates `pblang.lock` with the same registry flags as `pack`, so projects with registry dependencies can bundle through an explicit registry URL and strict-checksum CLI policy instead of relying only on env vars. Success output optionally includes **name@version** and **description** from `[package]` when present, and a **run hint**: «To run: cd to the bundle dir and run './pblang run .' (sapphire.exe run . on Windows).» Local path dependencies must stay inside the package root; escaping or external paths are rejected instead of producing misleading bundles. Run from that folder with `./pblang run .` (or `sapphire.exe run .` on Windows). When running a packaged app (`pblang run .` from a manifest dir), **info** lines are printed to stderr when `target_platform` is not `any` or when `min_runtime` is set. **E5-beta:** the optional `--self-extract` flag is accepted and reserved for self-extracting bundle workflows built on top of the `pblang-stub` launcher (see `docs/Native_backend_notes.md`); current behavior still produces a normal bundle directory.
+- **`pblang bundle [--registry-index \<url\>] [--require-registry-sha256] [--self-extract] [path] [out_dir]`** — Create a portable folder (default `dist/`) containing the current `pblang` executable, `pblang.toml`, `pblang.lock`, the resolved package entry, and local dependencies. **E4-gamma:** Same manifest metadata validation as `pack` (target_platform, min_runtime) before bundling. The bundled entry now preserves its relative path inside the package (for example `src/app.sapp`), so bundled apps with `[package].entry` work consistently. `bundle` now regenerates `pblang.lock` with the same registry flags as `pack`, so projects with registry dependencies can bundle through an explicit registry URL and strict-checksum CLI policy instead of relying only on env vars. Success output optionally includes **name@version** and **description** from `[package]` when present, and a **run hint**: «To run: cd to the bundle dir and run './pblang run .' (`pblang.exe run .` on Windows).» Local path dependencies must stay inside the package root; escaping or external paths are rejected instead of producing misleading bundles. Run from that folder with `./pblang run .` (or `pblang.exe run .` on Windows). When running a packaged app (`pblang run .` from a manifest dir), **info** lines are printed to stderr when `target_platform` is not `any` or when `min_runtime` is set. **E5-beta:** the optional `--self-extract` flag is accepted and reserved for self-extracting bundle workflows built on top of the `pblang-stub` launcher (see `docs/Native_backend_notes.md`); current behavior still produces a normal bundle directory.
 - **`pblang --dump-bytecode <file>`** — Compile the file and print bytecode disassembly (constants + instructions). For debugging and reverse engineering.
-- **`pblang --call-graph <file>`** (R2-alpha) — Print the call graph of a Sapphire source file as plain-text edges: `caller -> callee` (one per line). Top-level calls attributed to `<main>`. Functions with no outgoing calls print `funcname -> (no calls)`.
+- **`pblang --call-graph <file>`** (R2-alpha) — Print the call graph of a pblang source file as plain-text edges: `caller -> callee` (one per line). Top-level calls attributed to `<main>`. Functions with no outgoing calls print `funcname -> (no calls)`.
 - **`pblang lsp`** / **`pblang lsp`** (through L3-gamma) — Start a JSON-RPC 2.0 LSP server on stdin/stdout. Supports **initialize** (completionProvider, textDocumentSync, hoverProvider, definitionProvider), **initialized**, **textDocument/didOpen**/**didChange** (tracks open-file contents; didOpen is parsed with JSON unescaping so newlines in `text` are real line breaks), **textDocument/completion**, **textDocument/hover** (builtins and top-level locals — markdown stub), **textDocument/definition** (jump to `fn`/`let` declaration line for locals), **shutdown**, **exit**.
 
 ## L3-beta: LSP scope-aware completion
 
-`pblang lsp` / `pblang lsp` tracks open files via `textDocument/didOpen` and
+`pblang lsp` tracks open files via `textDocument/didOpen` and
 `textDocument/didChange` and includes local symbols in completion:
 
 - Top-level `fn <name>` declarations from the open file.
@@ -181,7 +183,7 @@ Complements `pblang lint` (scope-level unused warnings) with a per-variable def/
   - `docs/Spec_freeze.md` v0.2: OOP semantics, closure capture rules, map/filter/reduce contracts.
   - `docs/Tooling.md` SP1-gamma note (this section).
 
-**Impact**: Unblocks full conformance suite; all semantics tests now pass.
+**Impact**: Keeps conformance suite broadly green, with known ignored parser/thread/env-policy cases documented in `docs/CURRENT_STATUS.md`.
 
 ---
 
@@ -247,16 +249,16 @@ See `examples/ai_chat_toolcall/main.sapp` for an OpenAI tool-call request/respon
 
 ---
 
-## W4-gamma: TLS stub (Stage A)
+## W4-gamma: TLS integration (implemented)
 
-`stdlib/tls.sapp` now exports the TLS API surface:
+`stdlib/tls.sapp` exports the TLS API surface and delegates to VM TLS builtins:
 
-- **`tls.listen_tls(addr, cert_path, key_path)`** — Stage A stub (returns error map until rustls is integrated)
-- **`tls.serve_once_tls(addr, cert_path, key_path, handler)`** — Stage A stub
-- **`tls.serve_forever_tls(addr, cert_path, key_path, handler)`** — Stage A stub
-- **`tls.wrap_tls(tcp_handle, cert_path, key_path)`** — Stage A stub
+- **`tls.listen_tls(addr, cert_path, key_path)`** — creates a TLS listener via `tcp_listen_tls`
+- **`tls.serve_once_tls(addr, cert_path, key_path, handler)`** — accepts and serves one TLS request
+- **`tls.serve_forever_tls(addr, cert_path, key_path, handler)`** — serves TLS requests in a loop
+- **`tls.wrap_tls(tcp_handle, cert_path, key_path)`** — upgrades a plain TCP stream to TLS server mode
 
-**Workaround**: Use a reverse proxy (nginx, Caddy) for HTTPS termination until rustls integration is complete. See `docs/TLS_notes.md`.
+TLS client verification uses trust roots from `webpki-roots` plus best-effort native roots. See `docs/TLS_notes.md`.
 
 **Tests**: `tls_stub_exports_pass` in `tests/semantics.rs`.
 
@@ -328,6 +330,5 @@ in priority order:
 
 All hover responses are rendered as Markdown fenced code blocks.
 
-> **Deferred to v0.7**: completions, go-to-definition, and hover for nested
-> function bodies.
+> LSP now includes completions, go-to-definition, and semantic tokens. Remaining work is deeper scope/type fidelity and cross-file intelligence.
 

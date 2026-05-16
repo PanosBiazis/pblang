@@ -3529,11 +3529,15 @@ fn main() {
     // Compile a .sapp file to C and optionally to a native binary
     if args.first().map(|s| s.as_str()) == Some("compile") {
         if args.len() < 2 {
-            eprintln!("usage: pblang compile <file.sapp> [--out <name>] [--cc <compiler>] [--opt <level>]");
-            eprintln!("  Transpiles pblang source to C99, then compiles to a native binary.");
+            eprintln!(
+                "usage: pblang compile <file.sapp> [--out <name>] [--cc <compiler>] [--opt <level>] [--llvm|--wasm]"
+            );
+            eprintln!("  Default: transpile pblang source to C99, then compile to a native binary.");
             eprintln!("  --out <name>   Output binary name (default: a.out / a.exe)");
             eprintln!("  --cc <compiler> C compiler to use (default: gcc, fallback: clang, cc)");
             eprintln!("  --opt <level>  Optimization level 0-3 (default: 2)");
+            eprintln!("  --llvm          Use LLVM backend for native compilation");
+            eprintln!("  --wasm          Emit WebAssembly text (.wat) instead of native binary");
             eprintln!("  --keep-c        Keep the intermediate .c file");
             std::process::exit(1);
         }
@@ -3584,24 +3588,57 @@ fn main() {
             .and_then(|s| s.parse::<u8>().ok())
             .unwrap_or(2);
         let use_llvm = args.iter().any(|a| a == "--llvm");
+        let use_wasm = args.iter().any(|a| a == "--wasm" || a == "--wat");
+
+        if use_wasm {
+            match pblang_wasm::compile_to_wat(stmts.clone()) {
+                Ok((wat, warnings)) => {
+                    for w in warnings {
+                        eprintln!("warning: {w}");
+                    }
+                    let out_path = args
+                        .iter()
+                        .position(|a| a == "--out")
+                        .and_then(|i| args.get(i + 1))
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| script_path.with_extension("wat"));
+                    std::fs::write(&out_path, wat).unwrap_or_else(|e| {
+                        eprintln!("pblang compile --wasm: cannot write '{}': {e}", out_path.display());
+                        std::process::exit(1);
+                    });
+                    eprintln!(
+                        "WASM-emitted '{}' -> '{}'",
+                        script_path.display(),
+                        out_path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("pblang compile --wasm: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
 
         if use_llvm {
-            // LLVM IR path: transpile to .ll, compile with clang
+            // LLVM IR path (with C transpiler fallback on backend errors)
             let _ir_opts = pblang_ctranspiler::TranspileOptions::default();
-            match pblang_llvm::compile_to_native(stmts, out_name, opt_level) {
+            match pblang_llvm::compile_to_native(stmts.clone(), out_name, opt_level) {
                 Ok(()) => {
                     eprintln!(
                         "LLVM-compiled '{}' → '{}' (via LLVM IR, O{opt_level})",
                         script_path.display(),
                         out_name
                     );
+                    return;
                 }
                 Err(e) => {
                     eprintln!("pblang compile --llvm: {e}");
-                    std::process::exit(1);
+                    eprintln!(
+                        "pblang compile --llvm: falling back to C99 backend for compatibility"
+                    );
                 }
             }
-            return;
         }
 
         // C transpiler path (default)

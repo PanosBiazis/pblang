@@ -2,9 +2,11 @@
 
 **Last Updated**: 2026  
 **Status**: v0.5.6 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 102 Stdlib Modules + 4 Self-Hosting Compiler Modules + Bit-Level Optimizations
-**Test Suite**: **144/144 semantics tests passing, 0 failing, 3 ignored** (all suites passing)
+**Test Suite**: semantics suite passing with known ignored cases (match-guard parser recovery limitation and environment/thread policy tests)
 
 ---
+
+Canonical status is the top summary and `Test Results` section in this file. Older milestone snapshots below are kept for historical context and may reflect prior counts/plans.
 
 ## 🤖 v0.5.6 AI Integration
 
@@ -135,7 +137,7 @@
 
 ```
 cargo test --test semantics
-test result: ok. 143 passed; 0 failed; 3 ignored
+test result: ok. 144 passed; 0 failed; 3 ignored
 ```
 
 The 1 ignored test (`match_guard_pass`) documents a chumsky 0.8 parser limitation:
@@ -204,12 +206,12 @@ pblang has evolved from a promising prototype into a robust, production-quality 
 | Core VM | ✅ Stable | ⭐⭐⭐⭐⭐ | Bytecode execution, GC, sandboxing production-ready |
 | Package Manager | ✅ Functional | ⭐⭐⭐⭐ | Local & remote registry working, lockfile v2 ready |
 | Stdlib | ✅ Comprehensive | ⭐⭐⭐⭐ | 20+ modules covering web, AI, quantum, crypto |
-| Semantics Tests | ✅ Passing | ⭐⭐⭐⭐⭐ | 100/103 tests passing (98.7%) |
+| Semantics Tests | ✅ Passing | ⭐⭐⭐⭐⭐ | 144/147 tests passing (3 ignored) |
 | Thread Safety | ✅ Working | ⭐⭐⭐⭐ | VM-per-thread model with channels |
 | Native Executables | ✅ Self-extract | ⭐⭐⭐ | `bundle --self-extract` embeds runtime; E2E on Linux |
 | LSP Server | ✅ Unified | ⭐⭐⭐ | tower-lsp via `pblang lsp`; diagnostics, completion, hover, goto-def, workspace symbols |
 | Type System | ⚠️ Stub | ⭐ | Crate exists but unimplemented |
-| TLS/HTTPS | ⚠️ Design | ⭐⭐ | Design complete, implementation pending |
+| TLS/HTTPS | ✅ Stable | ⭐⭐⭐⭐ | rustls wired (`tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls`) |
 
 ---
 
@@ -232,7 +234,7 @@ The VM core is stable and battle-tested:
   - Local imports: `import "./lib.sapp"`
   - Package imports: `import "stdlib:thread.sapp"`
   - Export system with `export` keyword
-- **Testing**: 100/103 semantics tests passing
+- **Testing**: 144/147 semantics tests passing (3 ignored)
 
 **Files**:
 - `crates/pblang-vm/src/vm.rs` - Core VM (stable)
@@ -393,10 +395,10 @@ All major commands implemented:
 - Windows CI for self-extract E2E
 - Optional: true single-file without temp extract (native compile backend)
 
-### 2. TLS/HTTPS Support (W4) - 30% Complete
+### 2. TLS/HTTPS Support (W4) - Implemented
 
 **Priority**: MEDIUM  
-**Blocker**: rustls integration
+**Blocker**: none (shipping; follow-up hardening only)
 
 **What's Done**:
 - ✅ Design in `docs/TLS_notes.md`
@@ -405,18 +407,13 @@ All major commands implemented:
 - ✅ `tcp_set_timeout()` builtin
 
 **What's Missing**:
-- ❌ `SapphireStream` trait (wraps TcpStream or rustls::StreamOwned)
-- ❌ `tcp_listen_tls(addr, cert_path, key_path)` builtin
-- ❌ rustls dependency
-- ❌ TLS handshake logic
-- ❌ `stdlib/tls.sapp` wrapper
+- ⏳ Expanded cross-platform cert-path test matrix
+- ⏳ More end-to-end TLS docs/examples for deployment presets
 
-**Required Work** (1-2 weeks):
-1. Add `rustls` dependency to `crates/pblang-vm/Cargo.toml`
-2. Implement `SapphireStream` trait
-3. Add `tcp_listen_tls` builtin
-4. Modify `tcp_accept` to handle TLS streams
-5. Test with self-signed certificates
+**Required Work** (follow-up):
+1. Keep certificate validation regression tests in CI
+2. Expand deployment playbooks (local certs, hosted certs, proxies)
+3. Document operational hardening defaults
 
 ### 3. Type System - 10% Complete
 
@@ -446,18 +443,18 @@ All major commands implemented:
 - `tcp_listen_tls(addr, cert_path, key_path)` — TLS server listener
 - `tcp_connect_tls(host, port)` — TLS client connection
 - `tcp_wrap_tls(handle, cert_path, key_path)` — upgrade plain TCP to TLS
-- Uses permissive cert verifier for clients (dev/internal use); recommend reverse proxy for prod
+- Client verification uses trust roots (`webpki-roots` + native roots where available)
 
 ### 2. Native Executables Incomplete - 🔴 HIGH (now #1 priority)
 
 **Impact**: Cannot distribute single-binary applications  
-**Workaround**: Distribute source + sapphire runtime  
+**Workaround**: Distribute source + `pblang` runtime  
 **Effort**: 1-2 weeks
 
 ### 3. No Type System - 🟢 MEDIUM
 
 **Impact**: Limited IDE support, no compile-time type safety  
-**Workaround**: Use `sapphire check` for syntax validation  
+**Workaround**: Use `pblang --check` for syntax/type diagnostics  
 **Effort**: 2-3 months
 
 ---
@@ -695,7 +692,7 @@ The project is at v0.5 — "Powerful Prototype / Early-Stage Platform" as of Mar
 
 ✅ Stdlib: 20+ modules covering thread, http, json, crypto, db, tensor, quantum, websocket, graphics, and more.
 
-✅ Semantics Tests: 100/103 passing (98.7%).
+✅ Semantics Tests: 144/147 passing (3 ignored).
 
 🟡 Native Executables: Self-extract stub exists, but actual tarball extraction is not yet implemented (~70% done).
 

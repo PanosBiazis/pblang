@@ -7,9 +7,9 @@ AI/Quantum/Web/Polyglot-ready, future-proof, no artificial limits, test-driven
 steps, stable core.
 
 **Current priority order:**
-TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard ✅ → LSP ✅ → Cranelift JIT ✅ → Registry ✅ → RE ✅ → Type System ✅ → Spec → Self-Hosting ✅ (tokenizer, parser, type_checker, codegen complete) → Editor → Framework/OS
+TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) → LSP ✅ → Cranelift JIT ✅ → Registry ✅ → RE ✅ → Type System ✅ → Spec → Self-Hosting ✅ (tokenizer, parser, type_checker, codegen complete) → Editor → Framework/OS
 
-**Current status**: 143/143 semantics tests passing, 0 failing, 3 ignored (3 ignored: match guard SP1, known chumsky 0.8 limitation)
+**Current status**: 144/147 semantics tests passing, 0 failing, 3 ignored (`match_guard_pass`, `thread_pool_stdlib_pass`, `os_env_set_pass`)
 
 ---
 

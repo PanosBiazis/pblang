@@ -1,7 +1,7 @@
-# TLS Notes — Sapphire Web Layer
+# TLS Notes — pblang Web Layer
 
 ## Goal
-Add HTTPS/TLS support to Sapphire's HTTP server without embedding a full TLS
+Add HTTPS/TLS support to pblang's HTTP server without embedding a full TLS
 stack inside the VM.
 
 ## Preferred approach: Host-bridge capability
@@ -15,19 +15,19 @@ builtins — no VM changes required.
 // Host side (Rust)
 use rustls::{ServerConfig, StreamOwned};
 let tls_stream = StreamOwned::new(server_conn, tcp_stream);
-// Wrap in SapphireStream trait and register as handle
+// Wrap in stream trait and register as handle
 ```
 
 ## Alternative: FFI plugin
-Load `rustls` or `openssl` as a FFI DLL from Sapphire script:
-```sapphire
+Load `rustls` or `openssl` as a FFI DLL from pblang script:
+```pblang
 let tls = ffi.load("sapphire_tls.dll");
 let s = tls.wrap_server(raw_socket, cert_path, key_path);
 ```
 This requires a thin Rust crate `sapphire-tls` that exposes a C ABI.
 
 ## Non-goals
-- No TLS handshake implemented in pure Sapphire
+- No TLS handshake implemented in pure pblang script
 - No OpenSSL bundled in the repo
 - No breaking changes to tcp_listen/tcp_accept
 
@@ -36,27 +36,26 @@ This requires a thin Rust crate `sapphire-tls` that exposes a C ABI.
   the same handle type in the VM
 - `tcp_listen_tls(addr, cert_pem, key_pem)` builtin stub (sandboxed by net cap)
 
-## Status: **Stage B — Implemented**
+## Status: Implemented (rustls)
 
-As of v0.5, the TLS builtins are fully implemented using `rustls`:
+As of v0.5, TLS builtins are implemented using `rustls`:
 
 - `tcp_listen_tls(addr, cert_pem_path, key_pem_path)` — creates a TLS server listener
-- `tcp_connect_tls(host, port)` — creates a TLS client connection (uses permissive cert verifier for prototyping)
+- `tcp_connect_tls(host, port)` — creates a TLS client connection (verifies certificates using `webpki-roots` + native roots)
 - `tcp_wrap_tls(handle, cert_path, key_path)` — upgrades an existing plain TCP stream to TLS server mode
 
 The `stdlib/tls.sapp` wrapper provides a high-level API that gracefully falls back to error maps
 when builtins are unavailable.
 
-### Production Note
+### Production note
 
-The TLS client (`tcp_connect_tls`) currently uses a **permissive certificate verifier** that accepts
-any certificate. This is suitable for development and internal tools, but for production deployments
-connecting to external servers, you should use a reverse proxy with proper cert verification or
-add webpki-roots support.
+TLS verification is enabled in the current runtime. For internet-facing deployments, still prefer
+standard operational hardening (certificate rotation, least-privilege network policy, reverse proxy
+termination where needed).
 
 ---
 
-## Stage A — Prototype (W4-gamma)
+## Historical: Stage A prototype notes (kept for context)
 
 ### API surface defined
 
@@ -70,9 +69,9 @@ stable TLS API surface for Stage A:
 | `serve_forever_tls` | `(addr, cert_path, key_path, handler)` | Accept connections in a loop, dispatch each to `handler` |
 | `wrap_tls` | `(tcp_handle, cert_path, key_path)` | Upgrade an existing plain TCP handle to TLS |
 
-### Stub behaviour
+### Original stub behaviour (historical)
 
-All four functions currently return an **error map** of the form:
+During Stage A these functions returned an **error map** of the form:
 
 ```pblang/stdlib/tls.sapp#L1-1
 map{ error: "TLS not yet implemented (Stage A stub)." }

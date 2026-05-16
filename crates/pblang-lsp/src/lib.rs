@@ -2,8 +2,8 @@
 
 use chumsky::error::SimpleReason;
 use chumsky::prelude::Simple;
-use pblang_core::StmtKind;
-use std::collections::HashMap;
+use pblang_core::{Span as PbSpan, Stmt, StmtKind};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result;
@@ -211,6 +211,98 @@ const BUILTINS: &[(&str, &str)] = &[
     ("import", "import(path) -> module"),
 ];
 
+#[derive(Clone, Debug)]
+struct SymbolEntry {
+    name: String,
+    span: PbSpan,
+    detail: String,
+    completion_kind: CompletionItemKind,
+}
+
+fn push_symbol(out: &mut Vec<SymbolEntry>, name: String, span: PbSpan, detail: String, kind: CompletionItemKind) {
+    if !name.is_empty() {
+        out.push(SymbolEntry {
+            name,
+            span,
+            detail,
+            completion_kind: kind,
+        });
+    }
+}
+
+fn collect_stmt_symbols(stmts: &[Stmt], out: &mut Vec<SymbolEntry>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Fn(name, params, _ret, body) => {
+                let ps: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                push_symbol(
+                    out,
+                    name.clone(),
+                    stmt.span,
+                    format!("fn {}({})", name, ps.join(", ")),
+                    CompletionItemKind::FUNCTION,
+                );
+                for p in params {
+                    push_symbol(
+                        out,
+                        p.name.clone(),
+                        stmt.span,
+                        format!("param {}", p.name),
+                        CompletionItemKind::VARIABLE,
+                    );
+                }
+                collect_stmt_symbols(body, out);
+            }
+            StmtKind::Let(name, _, _) | StmtKind::Const(name, _, _) => {
+                push_symbol(
+                    out,
+                    name.clone(),
+                    stmt.span,
+                    format!("let {}", name),
+                    CompletionItemKind::VARIABLE,
+                );
+            }
+            StmtKind::For(name, _, body) | StmtKind::ForIn(name, _, body) => {
+                push_symbol(
+                    out,
+                    name.clone(),
+                    stmt.span,
+                    format!("loop variable {}", name),
+                    CompletionItemKind::VARIABLE,
+                );
+                collect_stmt_symbols(body, out);
+            }
+            StmtKind::ForInKV(k, v, _, body) => {
+                push_symbol(
+                    out,
+                    k.clone(),
+                    stmt.span,
+                    format!("loop key {}", k),
+                    CompletionItemKind::VARIABLE,
+                );
+                push_symbol(
+                    out,
+                    v.clone(),
+                    stmt.span,
+                    format!("loop value {}", v),
+                    CompletionItemKind::VARIABLE,
+                );
+                collect_stmt_symbols(body, out);
+            }
+            StmtKind::If(_, then_body, else_body) => {
+                collect_stmt_symbols(then_body, out);
+                if let Some(else_body) = else_body {
+                    collect_stmt_symbols(else_body, out);
+                }
+            }
+            StmtKind::While(_, body) | StmtKind::Block(body) => {
+                collect_stmt_symbols(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Backend {
     async fn publish_diagnostics_for(&self, uri: Url, src: String) {
         let mut diags: Vec<Diagnostic> = vec![];
@@ -310,30 +402,13 @@ impl LanguageServer for Backend {
         }
 
         if let Ok((stmts, _)) = pblang_core::parse_with_polyglot(&src) {
-            for stmt in &stmts {
-                match &stmt.kind {
-                    StmtKind::Fn(name, params, _ret, _body) if name == &word => {
-                        let ps: Vec<String> = params
-                            .iter()
-                            .map(|p| format!("{}: {}", p.name, "any"))
-                            .collect();
-                        let sig = format!("fn {}({})", name, ps.join(", "));
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Scalar(MarkedString::String(sig)),
-                            range: None,
-                        }));
-                    }
-                    StmtKind::Let(name, _, _) | StmtKind::Const(name, _, _) if name == &word => {
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Scalar(MarkedString::String(format!(
-                                "let {}",
-                                name
-                            ))),
-                            range: None,
-                        }));
-                    }
-                    _ => {}
-                }
+            let mut symbols = Vec::new();
+            collect_stmt_symbols(&stmts, &mut symbols);
+            if let Some(sym) = symbols.iter().rev().find(|s| s.name == word) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(sym.detail.clone())),
+                    range: Some(range_from_span(&src, sym.span.start, sym.span.end)),
+                }));
             }
         }
         Ok(None)
@@ -355,24 +430,14 @@ impl LanguageServer for Backend {
         };
 
         if let Ok((stmts, _)) = pblang_core::parse_with_polyglot(&src) {
-            for stmt in &stmts {
-                match &stmt.kind {
-                    StmtKind::Fn(name, _, _, _) if name == &word => {
-                        let range = range_from_span(&src, stmt.span.start, stmt.span.end);
-                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: uri.clone(),
-                            range,
-                        })));
-                    }
-                    StmtKind::Let(name, _, _) | StmtKind::Const(name, _, _) if name == &word => {
-                        let range = range_from_span(&src, stmt.span.start, stmt.span.end);
-                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: uri.clone(),
-                            range,
-                        })));
-                    }
-                    _ => {}
-                }
+            let mut symbols = Vec::new();
+            collect_stmt_symbols(&stmts, &mut symbols);
+            if let Some(sym) = symbols.iter().rev().find(|s| s.name == word) {
+                let range = range_from_span(&src, sym.span.start, sym.span.end);
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: uri.clone(),
+                    range,
+                })));
             }
         }
         Ok(None)
@@ -407,26 +472,19 @@ impl LanguageServer for Backend {
         }
 
         if let Ok((stmts, _)) = pblang_core::parse_with_polyglot(&src) {
-            for stmt in &stmts {
-                match &stmt.kind {
-                    StmtKind::Fn(name, params, _ret, _body) => {
-                        let ps: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-                        items.push(CompletionItem {
-                            label: name.clone(),
-                            kind: Some(CompletionItemKind::FUNCTION),
-                            detail: Some(format!("fn {}({})", name, ps.join(", "))),
-                            ..CompletionItem::default()
-                        });
-                    }
-                    StmtKind::Let(name, _, _) | StmtKind::Const(name, _, _) => {
-                        items.push(CompletionItem {
-                            label: name.clone(),
-                            kind: Some(CompletionItemKind::VARIABLE),
-                            ..CompletionItem::default()
-                        });
-                    }
-                    _ => {}
+            let mut symbols = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            collect_stmt_symbols(&stmts, &mut symbols);
+            for sym in symbols {
+                if !seen.insert(sym.name.clone()) {
+                    continue;
                 }
+                items.push(CompletionItem {
+                    label: sym.name,
+                    kind: Some(sym.completion_kind),
+                    detail: Some(sym.detail),
+                    ..CompletionItem::default()
+                });
             }
         }
 

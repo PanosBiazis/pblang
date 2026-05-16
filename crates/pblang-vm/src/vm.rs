@@ -2533,8 +2533,8 @@ impl VM {
         }
 
         /// tcp_connect_tls(host, port) → stream handle
-        /// Connects to a TLS server. Note: uses a permissive verifier for prototyping.
-        /// TODO: Add proper certificate verification for production use.
+        /// Connects to a TLS server with certificate verification enabled.
+        /// Trust roots come from webpki-roots plus best-effort native/system roots.
         fn tcp_connect_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !host.allow_net() {
                 return Err(host.err("net access denied".into()));
@@ -6142,10 +6142,12 @@ impl VM {
         }
 
         fn os_signal_trap_builtin(
-            _host: &mut dyn VmHost,
+            host: &mut dyn VmHost,
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            Ok(alloc_string("stub"))
+            Err(host.err(
+                "os_signal_trap() is not implemented on this runtime target yet".into(),
+            ))
         }
 
         /// os_which(cmd) — safely find an executable in PATH.
@@ -6322,25 +6324,124 @@ impl VM {
             Ok(alloc_map(m))
         }
 
-        // ---- WebSocket frame stubs ----
+        // ---- WebSocket frame builtins ----
 
         fn ws_parse_frame_builtin(
-            _host: &mut dyn VmHost,
-            _args: Vec<Value>,
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "ws_parse_frame() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let frame = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("ws_parse_frame(): {m}")))?;
+            let codes: Vec<u32> = frame.chars().map(|c| c as u32).collect();
+            if codes.len() < 2 {
+                return Err(host.err("ws_parse_frame(): frame too short".into()));
+            }
+
+            let b0 = codes[0] as u8;
+            let b1 = codes[1] as u8;
+            let fin = if (b0 & 0x80) != 0 { 1.0 } else { 0.0 };
+            let opcode = (b0 & 0x0f) as f64;
+            let masked = (b1 & 0x80) != 0;
+            let payload_len = (b1 & 0x7f) as usize;
+            let mut idx = 2usize;
+
+            let mut masking_key = [0u8; 4];
+            if masked {
+                if codes.len() < idx + 4 {
+                    return Err(host.err("ws_parse_frame(): masked frame missing key".into()));
+                }
+                for i in 0..4 {
+                    masking_key[i] = codes[idx + i] as u8;
+                }
+                idx += 4;
+            }
+            if codes.len() < idx + payload_len {
+                return Err(host.err("ws_parse_frame(): truncated payload".into()));
+            }
+
+            let mut payload = String::with_capacity(payload_len);
+            for i in 0..payload_len {
+                let mut b = codes[idx + i] as u8;
+                if masked {
+                    b ^= masking_key[i % 4];
+                }
+                let ch = std::char::from_u32(b as u32)
+                    .ok_or_else(|| host.err("ws_parse_frame(): invalid payload byte".into()))?;
+                payload.push(ch);
+            }
+
             let mut m = HashMap::new();
-            m.insert("opcode".into(), Value::Number(1.0));
-            m.insert("payload".into(), alloc_string(""));
-            m.insert("fin".into(), Value::Bool(true));
-            m.insert("masked".into(), Value::Bool(false));
+            m.insert("opcode".into(), Value::Number(opcode));
+            m.insert("payload".into(), alloc_string(payload));
+            m.insert("fin".into(), Value::Number(fin));
+            m.insert("masked".into(), Value::Number(if masked { 1.0 } else { 0.0 }));
             Ok(alloc_map(m))
         }
 
         fn ws_write_frame_builtin(
-            _host: &mut dyn VmHost,
-            _args: Vec<Value>,
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            Ok(alloc_array(vec![]))
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "ws_write_frame() expects 2 arguments (opcode, payload), got {}",
+                    args.len()
+                )));
+            }
+            let opcode = match args[0] {
+                Value::Number(n) if n.is_finite() && n >= 0.0 && n <= 15.0 => n as u8,
+                _ => return Err(host.err("ws_write_frame(): opcode must be number 0-15".into())),
+            };
+            let payload = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("ws_write_frame(): payload: {m}")))?;
+            let payload_bytes: Vec<u8> = payload.chars().map(|c| (c as u32).min(255) as u8).collect();
+            if payload_bytes.len() > 125 {
+                return Err(host.err(
+                    "ws_write_frame(): payload >125 bytes is not implemented yet".into(),
+                ));
+            }
+
+            let mut rng = rand::thread_rng();
+            let mask_key = [
+                rand::Rng::gen::<u8>(&mut rng),
+                rand::Rng::gen::<u8>(&mut rng),
+                rand::Rng::gen::<u8>(&mut rng),
+                rand::Rng::gen::<u8>(&mut rng),
+            ];
+            let mut out = String::new();
+            let b0 = 0x80u8 | (opcode & 0x0f); // FIN=1
+            let b1 = 0x80u8 | (payload_bytes.len() as u8); // MASK=1
+            out.push(
+                std::char::from_u32(b0 as u32)
+                    .ok_or_else(|| host.err("ws_write_frame(): invalid header byte".into()))?,
+            );
+            out.push(
+                std::char::from_u32(b1 as u32)
+                    .ok_or_else(|| host.err("ws_write_frame(): invalid header byte".into()))?,
+            );
+            for b in mask_key {
+                out.push(
+                    std::char::from_u32(b as u32)
+                        .ok_or_else(|| host.err("ws_write_frame(): invalid mask byte".into()))?,
+                );
+            }
+            for (i, b) in payload_bytes.iter().enumerate() {
+                let masked_b = *b ^ mask_key[i % 4];
+                out.push(
+                    std::char::from_u32(masked_b as u32).ok_or_else(|| {
+                        host.err("ws_write_frame(): invalid masked payload byte".into())
+                    })?,
+                );
+            }
+            Ok(alloc_string(out))
         }
 
         let mut v: Vec<BuiltinFn> = vec![

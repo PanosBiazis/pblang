@@ -4,7 +4,7 @@ Design-only document. No server implementation in this repo.
 
 ## Purpose
 
-Define the HTTP API and auth model for a **hosted** Sapphire package registry (as opposed to the existing local file-based registry and `pblang publish --registry-dir`).
+Define the HTTP API and auth model for a **hosted** pblang package registry (as opposed to the existing local file-based registry and `pblang publish --registry-dir`).
 
 ## API (target shape)
 
@@ -33,7 +33,7 @@ Define the HTTP API and auth model for a **hosted** Sapphire package registry (a
 - For **file-based registries**, `PBLANG_REGISTRY_INDEX=file:///path/to/registry_dir`:
   - `pblang publish` behaves as a hosted-style wrapper around the existing local registry:
     it packages the current manifest dir, validates that the package is self-contained and
-    has at least one Sapphire module entry, and delegates to the same logic as
+    has at least one pblang module entry, and delegates to the same logic as
     `pblang publish --registry-dir /path/to/registry_dir`.
   - This updates `<registry_dir>/index.json` and writes a tarball named
     `<name>-<version>.tar.gz` under the registry directory.

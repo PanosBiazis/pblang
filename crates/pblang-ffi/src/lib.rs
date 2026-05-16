@@ -19,6 +19,64 @@ fn clear_error(w: &mut VmWrapper) {
     w.last_error = CString::new("").unwrap();
 }
 
+fn escape_pblang_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('"');
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_to_pblang_expr(v: &serde_json::Value) -> Result<String, String> {
+    match v {
+        serde_json::Value::Null => Ok("nil".to_string()),
+        serde_json::Value::Bool(b) => Ok(if *b { "true".to_string() } else { "false".to_string() }),
+        serde_json::Value::Number(n) => {
+            let s = n.to_string();
+            if s.eq_ignore_ascii_case("nan") || s.eq_ignore_ascii_case("inf") || s.eq_ignore_ascii_case("-inf") {
+                return Err("non-finite numbers are not supported in args_json".to_string());
+            }
+            Ok(s)
+        }
+        serde_json::Value::String(s) => Ok(escape_pblang_string(s)),
+        serde_json::Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&json_to_pblang_expr(item)?);
+            }
+            out.push(']');
+            Ok(out)
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = String::from("map{");
+            let mut first = true;
+            for (k, val) in map {
+                if !first {
+                    out.push_str(", ");
+                }
+                first = false;
+                out.push_str(&escape_pblang_string(k));
+                out.push_str(": ");
+                out.push_str(&json_to_pblang_expr(val)?);
+            }
+            out.push('}');
+            Ok(out)
+        }
+    }
+}
+
 /// Create a new Sapphire VM.
 #[no_mangle]
 pub extern "C" fn pblang_create_vm() -> *mut VmWrapper {
@@ -142,14 +200,44 @@ pub unsafe extern "C" fn pblang_call_function(
         }
     };
 
-    // Build a pblang script that calls the function and prints the result
-    let call_src = format!(
-        "let __result = {name}(); print __result;"
-    );
+    let args_arr = match args_val {
+        serde_json::Value::Array(a) => a,
+        _ => {
+            set_error(
+                w,
+                "pblang_call_function: args_json must be a JSON array, e.g. [1, \"x\"]",
+            );
+            return 1;
+        }
+    };
 
-    // For now: call the function with no args (JSON arg passing is a future enhancement)
-    // This is a best-effort implementation
-    let _ = args_val; // TODO: convert JSON args to pblang Values
+    // Reduce script-injection risk by constraining function selectors to simple identifiers
+    // (with optional module-style dots).
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.contains("..")
+    {
+        set_error(
+            w,
+            "pblang_call_function: fn_name must match [A-Za-z0-9_.] and not contain empty segments",
+        );
+        return 1;
+    }
+
+    let mut arg_exprs = Vec::with_capacity(args_arr.len());
+    for arg in &args_arr {
+        match json_to_pblang_expr(arg) {
+            Ok(expr) => arg_exprs.push(expr),
+            Err(e) => {
+                set_error(w, format!("pblang_call_function: invalid args_json value: {e}"));
+                return 1;
+            }
+        }
+    }
+    let call_src = format!("let __result = {name}({}); print __result;", arg_exprs.join(", "));
 
     match parse(&call_src) {
         Ok(stmts) => {

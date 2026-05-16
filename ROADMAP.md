@@ -5,23 +5,23 @@
 The core VM, package manager, and CLI are production-quality. The type system and
 native executable bundler are in early stages.
 
-**Current test status**: 100/103 semantics tests passing (1 known parser limitation).
+**Current test status**: semantics suite green except known ignored parser/thread/env cases (see `docs/CURRENT_STATUS.md` for latest exact counts).
 
 ---
 
 ## v0.6 — Executables & TLS (Target: +4 weeks)
 
-- [ ] Self-extracting native binaries (Linux + Windows) — E5-gamma
-- [ ] TLS/HTTPS builtins (`tcp_listen_tls`, `tcp_connect_tls`) via rustls — W4-gamma
-- [ ] `tcp_listen_tls` + `tcp_connect_tls` wired in VM; `stdlib/tls.sapp` upgraded
-- [ ] All 84 semantics tests passing (match guard separator fix)
+- [x] Self-extracting native binaries (Linux + Windows in progress) — E5-gamma
+- [x] TLS/HTTPS builtins (`tcp_listen_tls`, `tcp_connect_tls`) via rustls — W4-gamma
+- [x] `tcp_listen_tls` + `tcp_connect_tls` wired in VM; `stdlib/tls.sapp` upgraded
+- [ ] Semantics suite fully green with 0 ignored tests (match guard separator fix pending)
 - [ ] Performance benchmarks documented
 
 ## v0.7 — Language Maturity (Target: +8 weeks)
 
 - [ ] OOP: class constructor dispatch, method resolution with `self`
 - [ ] Match guard separator disambiguation (SP1-gamma — parser rewrite)
-- [ ] LSP: semantic tokens (`textDocument/semanticTokens/full`) + diagnostics streaming
+- [x] LSP: semantic tokens (`textDocument/semanticTokens/full`) + diagnostics streaming
 - [ ] `pblang new <name> --template web|lib|cli|ai|quantum` scaffolding templates
 - [ ] Thread pool stdlib with deadlock diagnostics
 - [ ] Cranelift JIT prototype for numeric hot paths (N2-beta)
@@ -59,11 +59,11 @@ native executable bundler are in early stages.
 
 - ✅ Core VM (bytecode, GC, sandboxing, error handling)
 - ✅ Package manager (lockfile, semver, SHA256, HMAC verify, registry)
-- ✅ 34+ stdlib modules (HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor)
+- ✅ 100+ stdlib modules (HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor, tooling)
 - ✅ Threading: VM-per-thread + channels + select + thread_pool
 - ✅ CLI toolchain: run, test, fmt, lint, build, install, publish, search, bundle
 - ✅ Type checker (basic inference for primitives, arrays, maps)
-- ✅ LSP server (completions, hover stubs, workspace symbols)
+- ✅ LSP server (diagnostics, completions, hover, go-to-definition, workspace symbols, semantic tokens)
 - ✅ Graphics backend (SDL2 / minifb)
 - ✅ Polyglot blocks (@python, @sql, @rust source extraction)
 - ✅ VS Code extension (syntax highlighting, tmGrammar)
