@@ -2,9 +2,9 @@
 
 **A fast, secure, embeddable programming language built in Rust.**
 
-[![Version](https://img.shields.io/badge/version-0.5.1-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-135%2F135%20passing-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-144%2F147%20passing%20(3%20ignored)-brightgreen)]()
 
-pblang is a general-purpose programming language and bytecode VM designed for both **embedded scripting** (games, tools, applications) and **standalone development** (web servers, CLI tools, AI/quantum workflows). It features capability-based security, a built-in package manager, and a growing standard library of 34+ modules.
+pblang is a general-purpose programming language and bytecode VM designed for both **embedded scripting** (games, tools, applications) and **standalone development** (web servers, CLI tools, AI/quantum workflows). It features capability-based security, a built-in package manager, and a growing standard library of 100+ modules.
 
 ---
 
@@ -13,7 +13,7 @@ pblang is a general-purpose programming language and bytecode VM designed for bo
 - **Fast Stack-Based VM** — Compiled to efficient bytecode with RC + cycle-breaking GC
 - **Capability-Based Security** — Fine-grained sandboxing via `VmLimits`, `FfiPolicy`, and `StdlibConfig`
 - **Built-in Package Manager** — Semver resolution, local/remote registries, lockfiles, SHA256 verification
-- **68 Standard Library Modules** — HTTP, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, and more
+- **100+ Standard Library Modules** — HTTP, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, AI, and more
 - **Concurrency** — VM-per-thread model with typed channels and multi-channel `select`
 - **Polyglot Blocks** — Embed Python, JavaScript, SQL, or any language directly in source files
 - **FFI** — Call C libraries directly with allowlist-based security
@@ -101,7 +101,11 @@ while x > 0 {
 }
 
 for i 10 {
-    print i;  // 0..9  // NOTE: for supports 0..N range only; for x in array planned for v0.7
+    print i;  // 0..9
+}
+
+for x in items {
+    print x;  // for-in iteration is supported
 }
 ```
 
@@ -193,8 +197,15 @@ pblang/
 │   ├── pblang-ffi/          # C ABI foreign function interface
 │   ├── pblang-pm/           # Package manager (registry, lockfile, semver)
 │   ├── pblang-lsp/          # Language Server Protocol implementation
-│   └── pblang-graphics/     # Graphics backend (SDL2 / minifb)
-├── stdlib/                  # 34+ standard library modules (.sapp)
+│   ├── pblang-graphics/     # Graphics backend (SDL2 / minifb)
+│   ├── pblang-cranelift/    # Cranelift JIT backend
+│   ├── pblang-ctranspiler/  # C transpiler backend
+│   ├── pblang-llvm/         # LLVM backend
+│   ├── pblang-wasm/         # WASM/WAT backend
+│   ├── pblang-ai/           # AI provider integration
+│   ├── pblang-quantum/      # Quantum bridge crate
+│   └── pblang-stub/         # Self-extracting bundle launcher
+├── stdlib/                  # 100+ standard library modules (.sapp)
 ├── tests/                   # Integration & semantics test suite
 ├── examples/                # Example projects
 ├── editors/vscode/          # VS Code extension
@@ -250,12 +261,17 @@ fn main() {
     let chunk = compile(ast);
 
     let config = StdlibConfig {
-        allow_fs: false,      // No filesystem access
-        allow_net: false,     // No network access
-        allow_http: false,    // No HTTP client
-        allow_ffi: false,     // No FFI
-        allow_exec: false,    // No process execution
-        allow_sqlite: false,  // No database access
+        core: true,
+        fs: false,       // No filesystem access
+        net: false,      // No network access
+        http: false,     // No HTTP client
+        json: true,
+        crypto: true,
+        sqlite: false,   // No database access
+        ffi: false,      // No FFI
+        exec: false,     // No process execution
+        gfx: false,
+        spawn: true,
     };
 
     let mut vm = VM::with_stdlib(config);
@@ -297,6 +313,18 @@ pblang install @pblang/http@1.2.0   # Install specific package
 pblang publish                       # Publish to registry
 pblang search "http server"          # Search packages
 ```
+
+---
+
+## 📘 How To Use pblang
+
+Start with:
+
+- [Usage Guide](docs/USAGE_GUIDE.md) — practical language and CLI walkthrough
+- [Tutorials](docs/TUTORIALS.md) — beginner mini-projects (CLI, HTTP API, concurrency)
+- [Language Semantics](docs/Language_Semantics.md) — detailed language rules
+- [Tooling](docs/Tooling.md) — full CLI/LSP/packaging reference
+- [Current Status](docs/CURRENT_STATUS.md) — current feature maturity and known limits
 
 ---
 

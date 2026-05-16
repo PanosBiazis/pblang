@@ -1,4 +1,7 @@
-# Sapphire – Έκθεση προόδου (Future_plans roadmap)
+# pblang – Έκθεση προόδου (historical roadmap report)
+
+> Historical note: this file preserves earlier Sapphire-era milestone notes.
+> Canonical current status is tracked in `docs/CURRENT_STATUS.md`, `docs/Tasks.md`, and `ROADMAP.md`.
 
 Τελευταία ενημέρωση: Μάρτιος 2026 (Q3-alpha circuit run + measurement helpers).
 

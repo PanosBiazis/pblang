@@ -928,8 +928,8 @@ fn web_routing_dispatch_and_path_params() {
         let res2 = router.dispatch(m, "GET", "/user/42", map{});
         print res2["status"];
         print res2["body"];
-        let notfound = router.dispatch(m, "GET", "/missing", map{});
-        print notfound["status"];
+        let missing_route = router.dispatch(m, "GET", "/missing", map{});
+        print missing_route["status"];
     "#;
     let out = run_collect(src);
     assert_eq!(out.len(), 5);

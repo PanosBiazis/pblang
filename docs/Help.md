@@ -1,7 +1,4 @@
-Έχω πλήρη εικόνα. Το commit af2771e ολοκλήρωσε M4-beta (remote publish + search), R3-beta (--symbols), και SP1-beta (numeric edge cases). Ιδού το νέο καθαρό Help.md:
-
-text
-# Help.md — Cursor AI Code-Change Reference for Sapphire
+# Help.md — Cursor AI Code-Change Reference for pblang
 
 
 This file tells Cursor AI **exactly which files to touch, what code to write/change,

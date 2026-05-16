@@ -1,11 +1,11 @@
 # Embedding API (v0.1)
 
-How to embed the Sapphire VM in a Rust application. For language semantics and limits, see [Language_Semantics.md](Language_Semantics.md).
+How to embed the pblang VM in a Rust application. For language semantics and limits, see [Language_Semantics.md](Language_Semantics.md).
 
 ## Creating a VM
 
 - **`VM::new()`** — Minimal VM with **no** builtins. Use when you register your own functions or load a custom stdlib.
-- **`VM::with_stdlib(config)`** — VM with standard builtins (fs, net, http, json, sqlite, ffi, exec, etc.) according to `StdlibConfig`. Use for scripting. Default config enables all capabilities except `allow_ffi` and `allow_exec` (both false by default).
+- **`VM::with_stdlib(config)`** — VM with standard builtins (fs, net, http, json, sqlite, ffi, exec, etc.) according to `StdlibConfig`. Use for scripting.
 
 ## Running code
 
@@ -17,12 +17,15 @@ How to embed the Sapphire VM in a Rust application. For language semantics and l
 
 Set **`StdlibConfig`** when creating the VM to disable categories of builtins:
 
-- `allow_fs` — filesystem and path
-- `allow_net` — TCP, HTTP server helpers
-- `allow_http` — HTTP client (get/post)
-- `allow_sqlite` — SQLite
-- `allow_ffi` — ffi_load, ffi_call, ffi_close (default **false**)
-- `allow_exec` — exec, env_get, env_set, sleep_ms (default **false**)
+- `fs` — filesystem and path
+- `net` — TCP, HTTP server helpers
+- `http` — HTTP client (get/post)
+- `sqlite` — SQLite
+- `ffi` — ffi_load, ffi_call, ffi_close
+- `exec` — process execution helpers
+- `core` — safe core builtins (includes `env_get`)
+
+`env_set` is intentionally disabled in current runtime policy and returns an error.
 
 If a script calls a disabled builtin, the VM returns `RuntimeError` (e.g. "fs access denied").
 
@@ -45,7 +48,7 @@ If a script calls a disabled builtin, the VM returns `RuntimeError` (e.g. "fs ac
 
 ## Resource lifecycle (handles)
 
-Builtins that open resources (TCP sockets, SQLite DBs, FFI handles) return a handle (e.g. a number or opaque value). The script is responsible for closing them (e.g. `tcp_close`, `sqlite_close`, `ffi_close`). **`defer`** in Sapphire runs cleanup on scope exit (LIFO), so recommend scripts use `defer { ... close(handle); }` for predictable cleanup. The host does not automatically close handles when the VM stops; any cleanup beyond script-driven close must be implemented by the host if needed.
+Builtins that open resources (TCP sockets, SQLite DBs, FFI handles) return a handle (e.g. a number or opaque value). The script is responsible for closing them (e.g. `tcp_close`, `sqlite_close`, `ffi_close`). **`defer`** in pblang runs cleanup on scope exit (LIFO), so recommend scripts use `defer { ... close(handle); }` for predictable cleanup. The host does not automatically close handles when the VM stops; any cleanup beyond script-driven close must be implemented by the host if needed.
 
 ## Module loading
 

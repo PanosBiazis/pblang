@@ -1,8 +1,8 @@
-# Sapphire memory model (v0.2)
+# pblang memory model (v0.2)
 
 ## What is “heap allocated” today
 
-Sapphire currently uses Rust `Rc`-based heap objects for runtime values:
+pblang currently uses Rust `Rc`-based heap objects for runtime values:
 
 - `Obj::String(String)` via `Rc<Obj>`
 - `Function`, `Closure` via `Rc<...>`
@@ -30,7 +30,7 @@ This means “ownership” is shared and lifetime is managed by reference counti
 
 ## Safety notes (buffer overflows, UBs)
 
-- The Sapphire runtime is written in **safe Rust** for the core VM/value stack, so classic buffer overflows
+- The pblang runtime is written in **safe Rust** for the core VM/value stack, so classic buffer overflows
   are not expected in normal execution.
 - The main safety “escape hatches” are:
   - **FFI** (`ffi_call`): calling the wrong symbol/signature can crash the process (this is inherent to C ABI interop).
@@ -56,7 +56,7 @@ We expose `gc_collect()` as a pragmatic “cleanup” builtin:
   unreachable `array` / `map` / `module` containers to break reference cycles (e.g. `a[0] = a`).
 
 This is not a full moving GC heap; it’s a safe, incremental way to eliminate the most common RC-cycle leaks
-while Sapphire still uses `Rc` for object lifetimes.
+while pblang still uses `Rc` for object lifetimes.
 
 ## Next step options
 
@@ -75,7 +75,7 @@ while Sapphire still uses `Rc` for object lifetimes.
 
 ## Decision for v0.x
 
-For Sapphire v0.x, we stick with **RC-first** (what the runtime already uses via `Rc`), while
+For pblang v0.x, we stick with **RC-first** (what the runtime already uses via `Rc`), while
 continuing to add allocation stats and invariants. We also ship an RC-cycle collector (`gc_collect()`)
 to break cycles in container graphs. Longer-term, we can move to a true **mark-sweep GC heap** once the
 object model grows further and needs predictable memory behavior under heavy workloads.

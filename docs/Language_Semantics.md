@@ -1,4 +1,4 @@
-# Biapryx language semantics (v0.1)
+# pblang language semantics (living spec snapshot)
 
 Stability snapshot for core semantics. Used as reference for conformance and compatibility.
 
@@ -96,10 +96,10 @@ Any other character (including unescaped `"`) ends or starts the string. The par
 ## Match expressions and guards
 
 - **Basic match**: `match expr { case pat: body; ... else: body }`
-- **Guarded match**: `case pat if guard # body` (use `#` as separator with guards)
+- **Guarded match**: `case pat if guard # body` (recommended separator with guards)
   - The `#` separator is unambiguous (unlike `:` which conflicts with `obj:method()` postfix)
   - Alternative: `case pat if guard then body` using the `then` keyword
-  - Both `:` and `#`/`then` are accepted by the parser
+  - `:` with guarded arms is currently parser-recovery-sensitive; use `#` or `then`
 - **Wildcard**: `case _: body` matches any value
 - **Bind**: `case n: body` binds the scrutinee to `n` in the body
 - **Guard**: `case n if n > 0 # body` — guard is any truthy expression
@@ -131,12 +131,15 @@ Any other character (including unescaped `"`) ends or starts the string. The par
 
 When the VM is created with `VM::with_stdlib(config)`, the host can disable categories of builtins:
 
-- **allow_fs**: filesystem and path builtins (e.g. `fs_read`, `fs_write`, `path_join`, `cwd`).
-- **allow_net**: TCP and HTTP server helpers (`tcp_listen`, `tcp_accept`, `http_parse_request`, etc.).
-- **allow_http**: HTTP client (`http_get`, `http_post`).
-- **allow_sqlite**: SQLite builtins.
-- **allow_ffi**: `ffi_load`, `ffi_call`, `ffi_close`.
-- **allow_exec**: `exec`, `env_get`, `env_set`, `sleep_ms`.
+- **`fs`**: filesystem and path builtins (e.g. `fs_read`, `fs_write`, `path_join`, `cwd`).
+- **`net`**: TCP and HTTP server helpers (`tcp_listen`, `tcp_accept`, `http_parse_request`, etc.).
+- **`http`**: HTTP client (`http_get`, `http_post`).
+- **`sqlite`**: SQLite builtins.
+- **`ffi`**: `ffi_load`, `ffi_call`, `ffi_close`.
+- **`exec`**: process execution helpers (e.g. `exec`, `sleep_ms`).
+- **`core`**: always-on safe core builtins including `env_get`.
+
+`env_set` is intentionally disabled in current runtime policy (thread-safety) and returns an error.
 
 If a script calls a builtin whose capability is disabled, the VM returns a runtime error (e.g. "fs access denied"). `VM::new()` creates a VM with **no** builtins (embedding-only).
 
@@ -153,7 +156,7 @@ These are optional; when not set, there is no limit (subject to host memory).
 
 ## Runtime memory safety (optional builtins)
 
-The VM exposes an **optional, runtime-only** borrow checker for explicit handles. This is **not** compile-time Rust-style ownership for ordinary Sapphire values (strings, arrays, maps still use RC + cycle GC). Use these builtins when you want structured allocate/borrow/release semantics in scripts or tests.
+The VM exposes an **optional, runtime-only** borrow checker for explicit handles. This is **not** compile-time Rust-style ownership for ordinary pblang values (strings, arrays, maps still use RC + cycle GC). Use these builtins when you want structured allocate/borrow/release semantics in scripts or tests.
 
 | Builtin | Description |
 |---------|-------------|
