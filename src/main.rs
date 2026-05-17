@@ -1,7 +1,8 @@
 use pblang_compiler::{compile, disasm};
 
 use pblang_core::{
-    parse, parse_with_polyglot, Expr, ExprKind, MatchArm, Span, Stmt, StmtKind, TypeExpr, TypeKind,
+    parse, parse_strict, parse_with_polyglot, Expr, ExprKind, MatchArm, Span, Stmt, StmtKind,
+    TypeExpr, TypeKind,
 };
 use pblang_ir::Chunk;
 use pblang_typeck::check as type_check;
@@ -10,7 +11,7 @@ use pblang_vm::{StdlibConfig, VmLimits, VM};
 use chumsky::error::SimpleReason;
 use chumsky::prelude::Simple;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 fn clear_terminal() {
@@ -50,6 +51,10 @@ fn validate_package_relative_path<'a>(path: &'a str, label: &str) -> Result<&'a 
 }
 
 fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
+    let package_root = man_dir
+        .canonicalize()
+        .unwrap_or_else(|_| man_dir.to_path_buf());
+
     let manifest_path = man_dir.join("pblang.toml");
     if manifest_path.is_file() {
         let man_bytes = std::fs::read(&manifest_path)
@@ -60,31 +65,34 @@ fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
         if let Some(entry) = man.package.as_ref().and_then(|pkg| pkg.entry.as_deref()) {
             let rel_entry = validate_package_relative_path(entry, "entry")?;
             let entry_path = man_dir.join(rel_entry);
-            // SECURITY FIX #8 (TOCTOU): canonicalize() validates the path at time T,
-            // but the file is opened/read at T+1. A symlink swap between these two
-            // steps can redirect execution outside the package root.
-            // Best-effort mitigation: re-check starts_with after canonicalize, and
-            // the consumer should open the file with O_NOFOLLOW where the platform
-            // supports it. A full fix requires platform-specific open-and-verify.
+            // Harden against symlink traversal inside the relative path.
+            // This cannot fully eliminate TOCTOU races without O_NOFOLLOW/openat,
+            // but it blocks package entries that traverse symlink components.
+            let mut walk = package_root.clone();
+            for comp in rel_entry.components() {
+                walk.push(comp);
+                let md = std::fs::symlink_metadata(&walk).map_err(|e| {
+                    format!("package entry component not found '{}': {e}", walk.display())
+                })?;
+                if md.file_type().is_symlink() {
+                    return Err(format!(
+                        "package entry '{}' must not include symlink components",
+                        entry
+                    ));
+                }
+            }
             let resolved = entry_path
                 .canonicalize()
                 .map_err(|e| format!("package entry not found '{}': {e}", entry_path.display()))?;
-            if !resolved.starts_with(man_dir) {
+            if !resolved.starts_with(&package_root) {
                 return Err(format!(
                     "package entry escapes package root: {}",
                     resolved.display()
                 ));
             }
-            // Double-check: re-canonicalize to detect any symlink swap (best effort).
-            let re_resolved = resolved.canonicalize().map_err(|e| {
-                format!(
-                    "package entry disappeared after validation '{}': {e}",
-                    resolved.display()
-                )
-            })?;
-            if re_resolved != resolved {
+            if !resolved.is_file() {
                 return Err(format!(
-                    "package entry changed between checks (possible symlink swap): {}",
+                    "package entry must be a file: {}",
                     resolved.display()
                 ));
             }
@@ -92,18 +100,60 @@ fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    man_dir.join("main.sap").canonicalize().ok()
-        .or_else(|| man_dir.join("main.sapp").canonicalize().ok())
-        .or_else(|| man_dir.join("main.bpx").canonicalize().ok())
-        .or_else(|| man_dir.join("src").join("main.sap").canonicalize().ok())
-        .or_else(|| man_dir.join("src").join("main.sapp").canonicalize().ok())
-        .or_else(|| man_dir.join("src").join("main.bpx").canonicalize().ok())
+    let candidate = [
+        man_dir.join("main.sap"),
+        man_dir.join("main.sapp"),
+        man_dir.join("main.bpx"),
+        man_dir.join("src").join("main.sap"),
+        man_dir.join("src").join("main.sapp"),
+        man_dir.join("src").join("main.bpx"),
+    ]
+    .into_iter()
+    .filter_map(|p| p.canonicalize().ok())
+    .find(|resolved| resolved.is_file() && resolved.starts_with(&package_root));
+
+    candidate
         .ok_or_else(|| {
             format!(
                 "no package entry found (expected [package].entry or main.sap/main.sapp/main.bpx/src/main.sap/src/main.sapp/src/main.bpx) in '{}'",
                 man_dir.display()
             )
         })
+}
+
+fn read_text_file_with_race_check(path: &Path) -> Result<String, String> {
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| format!("file not found '{}': {e}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open '{}': {e}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened_meta = file
+            .metadata()
+            .map_err(|e| format!("failed to stat opened file '{}': {e}", path.display()))?;
+        let resolved_meta = std::fs::metadata(&resolved)
+            .map_err(|e| format!("failed to stat resolved file '{}': {e}", resolved.display()))?;
+        if opened_meta.dev() != resolved_meta.dev() || opened_meta.ino() != resolved_meta.ino() {
+            return Err(format!(
+                "refusing to read '{}': file changed during validation",
+                path.display()
+            ));
+        }
+    }
+
+    let mut src = String::new();
+    file.read_to_string(&mut src)
+        .map_err(|e| format!("failed to read '{}': {e}", resolved.display()))?;
+    Ok(src)
+}
+
+fn read_package_entry_source(man_dir: &Path) -> Result<(PathBuf, String), String> {
+    let entry_path = resolve_package_entry(man_dir)?;
+    let src = read_text_file_with_race_check(&entry_path)?;
+    Ok((entry_path, src))
 }
 
 /// Loads [package] name, version, description from manifest for pack/bundle success output. Returns None if no manifest or parse error.
@@ -192,6 +242,95 @@ fn generate_lockfile_for_cli(
     }
 }
 
+fn escape_pblang_string_literal(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn run_manifest_validator_pblang_file(manifest_path: &Path) -> Result<serde_json::Value, String> {
+    let path_str = manifest_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_string();
+    let escaped_path = escape_pblang_string_literal(&path_str);
+    let src = format!(
+        "let mv = import(\"stdlib:manifest_validate.sapp\"); print json_stringify(mv.validate_manifest_file(\"{escaped_path}\"));"
+    );
+    let (stmts, _blocks) = parse_with_polyglot(&src)
+        .map_err(|errs| format!("parse pblang manifest validator snippet failed: {errs:?}"))?;
+    let mut chunk = compile(stmts)
+        .map_err(|e| format!("compile pblang manifest validator snippet failed: {e}"))?;
+    chunk.source = Some(std::rc::Rc::new(src.clone()));
+    let mut vm = VM::with_stdlib(StdlibConfig::default());
+    let out = vm
+        .run_collect(chunk)
+        .map_err(|e| format!("run pblang manifest validator snippet failed: {}", e.message))?;
+    let rendered = out
+        .last()
+        .ok_or_else(|| "pblang manifest validator produced no output".to_string())
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .map_err(|e| format!("pblang manifest validator output was not string: {e}"))
+        })?;
+    serde_json::from_str::<serde_json::Value>(&rendered)
+        .map_err(|e| format!("parse pblang manifest validator JSON output failed: {e}"))
+}
+
+fn strict_manifest_validator_enabled() -> bool {
+    std::env::var("PBLANG_STRICT_MANIFEST_VALIDATOR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn shadow_validate_manifest_with_pblang(man_dir: &Path, context: &str) -> Result<(), String> {
+    let manifest_path = man_dir.join("pblang.toml");
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let strict = strict_manifest_validator_enabled();
+    match run_manifest_validator_pblang_file(&manifest_path) {
+        Ok(v) => {
+            let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true);
+            if !ok {
+                let mut errs = Vec::<String>::new();
+                if let Some(arr) = v.get("errors").and_then(|x| x.as_array()) {
+                    for e in arr {
+                        if let Some(s) = e.as_str() {
+                            errs.push(s.to_string());
+                        }
+                    }
+                }
+                let msg = if errs.is_empty() {
+                    "pblang-side manifest validator reported invalid manifest".to_string()
+                } else {
+                    format!("pblang-side manifest validator: {}", errs.join("; "))
+                };
+                if strict {
+                    return Err(format!(
+                        "pblang {}: strict pblang manifest validation failed: {}",
+                        context, msg
+                    ));
+                }
+                eprintln!("pblang {}: warning: {}", context, msg);
+            }
+        }
+        Err(e) => {
+            if strict {
+                return Err(format!(
+                    "pblang {}: strict pblang manifest validation failed (validator unavailable): {}",
+                    context, e
+                ));
+            }
+            eprintln!("pblang {}: note: pblang-side manifest validator unavailable: {}", context, e);
+        }
+    }
+    Ok(())
+}
+
 fn parse_registry_options_and_positionals<'a>(
     command: &str,
     rest: &'a [String],
@@ -248,8 +387,10 @@ fn show_help() {
     println!("  pblang --lock [--registry-index <url>] [--require-registry-sha256] [path]  Generate pblang.lock from pblang.toml (path optional)");
     println!("  pblang build [--registry-index <url>] [--require-registry-sha256] [path]  Generate lockfile + typecheck main entry (main.sap/main.bpx or src/main.sap/src/main.bpx)");
     println!("  pblang install [--registry-index <url>] [--require-registry-sha256] [path | <name>@<version>]  Resolve deps and generate pblang.lock (manifest path) or install a single registry package into cache (name@version).");
+    println!("  pblang manifest-check [path]  Validate pblang.toml using pblang stdlib validator and print JSON report");
+    println!("  env PBLANG_STRICT_MANIFEST_VALIDATOR=1  Fail manifest-based commands when pblang-side validator reports errors");
     println!("  pblang publish --registry-dir <dir> [path]  Pack package into tarball and add to local registry index (file-based registry).");
-    println!("  pblang publish            Publish current package to hosted registry (PBLANG_REGISTRY_INDEX, optional PBLANG_REGISTRY_TOKEN or --registry-token=<token>).");
+    println!("  pblang publish            Publish current package to hosted registry (set PBLANG_REGISTRY_INDEX and PBLANG_REGISTRY_TOKEN env vars).");
     println!("  pblang search <query>     Search hosted or file-based registry for packages matching query (uses PBLANG_REGISTRY_INDEX).");
     println!("  pblang pack [--registry-index <url>] [--require-registry-sha256] [path] [out_file]  Create a single .tar.gz with manifest, lockfile and local deps (Stage A executable packaging)");
     println!("  pblang bundle [--registry-index <url>] [--require-registry-sha256] [path] [out_dir]  Create portable folder (default dist/) with executable + manifest + entry + deps");
@@ -404,7 +545,8 @@ fn show_help() {
 fn normalize_ide_source(src: &str) -> String {
     // IDE ergonomics: users often write JS/Python-style print("x");
     // Normalize simple line-based forms to pblang's print statement.
-    src.lines()
+    let mut normalized = src
+        .lines()
         .map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with("print(") && trimmed.ends_with(");") {
@@ -417,7 +559,11 @@ fn normalize_ide_source(src: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if src.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
 }
 
 fn format_ide_source(src: &str, max_line_length: Option<usize>) -> String {
@@ -426,6 +572,7 @@ fn format_ide_source(src: &str, max_line_length: Option<usize>) -> String {
     let mut out = String::new();
     let mut depth: i32 = 0;
     let mut in_string = false;
+    let mut in_single_string = false;
     let mut block_comment_depth = 0;
 
     for line in &lines {
@@ -447,25 +594,41 @@ fn format_ide_source(src: &str, max_line_length: Option<usize>) -> String {
                 if line_to_output.len() <= max_len {
                     out.push_str(&line_to_output);
                     out.push('\n');
+                    scan_line_for_braces(
+                        &line_to_output,
+                        &mut in_string,
+                        &mut in_single_string,
+                        &mut block_comment_depth,
+                        &mut depth,
+                    );
                     break;
                 }
                 let break_at = line_to_output[..max_len].rfind(' ').unwrap_or(max_len);
                 let break_at = if break_at == 0 { max_len } else { break_at };
                 let rest = line_to_output.split_off(break_at);
-                out.push_str(line_to_output.trim_end());
+                let emitted = line_to_output.trim_end().to_string();
+                out.push_str(&emitted);
                 out.push('\n');
+                scan_line_for_braces(
+                    &emitted,
+                    &mut in_string,
+                    &mut in_single_string,
+                    &mut block_comment_depth,
+                    &mut depth,
+                );
                 line_to_output = format!("{}{}", INDENT, rest.trim_start());
             }
         } else {
             out.push_str(&full_line);
             out.push('\n');
+            scan_line_for_braces(
+                &full_line,
+                &mut in_string,
+                &mut in_single_string,
+                &mut block_comment_depth,
+                &mut depth,
+            );
         }
-        scan_line_for_braces(
-            &trimmed,
-            &mut in_string,
-            &mut block_comment_depth,
-            &mut depth,
-        );
     }
 
     if !out.ends_with('\n') {
@@ -482,14 +645,14 @@ mod ide_source_tests {
     fn rewrites_print_call_style_lines() {
         let src = "print(\"Hello\");\nprint(1 + 2);\n";
         let got = normalize_ide_source(src);
-        assert_eq!(got, "print \"Hello\";\nprint 1 + 2;");
+        assert_eq!(got, "print \"Hello\";\nprint 1 + 2;\n");
     }
 
     #[test]
     fn keeps_statement_style_unchanged() {
         let src = "print \"Hello\";\nlet x = 1;\n";
         let got = normalize_ide_source(src);
-        assert_eq!(got, "print \"Hello\";\nlet x = 1;");
+        assert_eq!(got, "print \"Hello\";\nlet x = 1;\n");
     }
 
     #[test]
@@ -498,6 +661,14 @@ mod ide_source_tests {
         let got = format_ide_source(src, None);
         assert!(got.contains("fn x("));
         assert!(got.contains("\n    print 1;\n"));
+    }
+
+    #[test]
+    fn keeps_braces_inside_single_quoted_strings_from_affecting_indent() {
+        let src = "fn x(){\nlet s = '{';\nprint 1;\n}\n";
+        let got = format_ide_source(src, None);
+        assert!(got.contains("\n    print 1;\n"));
+        assert!(!got.contains("\n        print 1;\n"));
     }
 }
 
@@ -647,7 +818,8 @@ fn print_cfg(chunk: &Chunk, dot: bool) {
 
 fn scan_line_for_braces(
     line: &str,
-    in_string: &mut bool,
+    in_double_string: &mut bool,
+    in_single_string: &mut bool,
     block_comment_depth: &mut i32,
     brace_depth: &mut i32,
 ) {
@@ -657,10 +829,12 @@ fn scan_line_for_braces(
     while let Some(ch) = chars.next() {
         let next = chars.peek().copied();
 
-        // If we're in a string, only care about \" and closing "
-        if *in_string {
-            if ch == '"' && !prev_was_backslash {
-                *in_string = false;
+        // If we're in a string, only care about escapes and matching close quote.
+        if *in_double_string || *in_single_string {
+            if *in_double_string && ch == '"' && !prev_was_backslash {
+                *in_double_string = false;
+            } else if *in_single_string && ch == '\'' && !prev_was_backslash {
+                *in_single_string = false;
             }
             prev_was_backslash = ch == '\\' && !prev_was_backslash;
             continue;
@@ -695,7 +869,12 @@ fn scan_line_for_braces(
 
         // Not in string/comment: entering string
         if ch == '"' {
-            *in_string = true;
+            *in_double_string = true;
+            prev_was_backslash = false;
+            continue;
+        }
+        if ch == '\'' {
+            *in_single_string = true;
             prev_was_backslash = false;
             continue;
         }
@@ -713,20 +892,23 @@ fn strip_comments_mask(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec(); // same length as input (byte offsets preserved)
     let mut i = 0usize;
-    let mut in_string = false;
+    let mut in_double_string = false;
+    let mut in_single_string = false;
     let mut block_depth: i32 = 0;
 
     while i < out.len() {
         let b = out[i];
 
-        // Inside string: only care about escapes and closing "
-        if in_string {
+        // Inside string: only care about escapes and matching close quote.
+        if in_double_string || in_single_string {
             if b == b'\\' {
                 i = i.saturating_add(2);
                 continue;
             }
-            if b == b'"' {
-                in_string = false;
+            if in_double_string && b == b'"' {
+                in_double_string = false;
+            } else if in_single_string && b == b'\'' {
+                in_single_string = false;
             }
             i += 1;
             continue;
@@ -757,7 +939,12 @@ fn strip_comments_mask(src: &str) -> String {
 
         // Not in string/comment: entering string
         if b == b'"' {
-            in_string = true;
+            in_double_string = true;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_single_string = true;
             i += 1;
             continue;
         }
@@ -1482,20 +1669,71 @@ version = "0.1.0"
 "#;
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let src_root = src.canonicalize()?;
     std::fs::create_dir_all(dst)?;
-    for e in std::fs::read_dir(src)? {
-        let e = e?;
-        let ty = e.file_type()?;
-        let p = e.path();
-        let name = p.file_name().unwrap_or(std::ffi::OsStr::new(""));
-        let dest = dst.join(name);
-        if ty.is_dir() {
-            copy_dir_all(&p, &dest)?;
-        } else {
-            std::fs::copy(&p, &dest)?;
+    let dst_root = dst.to_path_buf();
+
+    fn copy_dir_all_inner(
+        src_root: &Path,
+        cur_src: &Path,
+        dst_root: &Path,
+        cur_dst: &Path,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(cur_dst)?;
+        for e in std::fs::read_dir(cur_src)? {
+            let e = e?;
+            let ty = e.file_type()?;
+            let src_path = e.path();
+            let src_name = e.file_name();
+            let dest_path = cur_dst.join(&src_name);
+            if !dest_path.starts_with(dst_root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to copy outside destination root: {}",
+                        dest_path.display()
+                    ),
+                ));
+            }
+            if ty.is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("refusing to copy symlink: {}", src_path.display()),
+                ));
+            }
+
+            let src_canon = src_path.canonicalize()?;
+            if !src_canon.starts_with(src_root) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing to copy path outside source root: {}",
+                        src_canon.display()
+                    ),
+                ));
+            }
+            if ty.is_dir() {
+                copy_dir_all_inner(src_root, &src_canon, dst_root, &dest_path)?;
+            } else if ty.is_file() {
+                std::fs::copy(&src_canon, &dest_path)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
+    copy_dir_all_inner(&src_root, &src_root, &dst_root, &dst_root)
+}
+
+fn write_http_response_with_local_cors(
+    stream: &mut std::net::TcpStream,
+    response: &str,
+    cors_origin: &str,
+) {
+    use std::io::Write;
+    let patched = response.replace(
+        "Access-Control-Allow-Origin: *",
+        &format!("Access-Control-Allow-Origin: {cors_origin}"),
+    );
+    let _ = stream.write_all(patched.as_bytes());
 }
 
 fn main() {
@@ -1601,6 +1839,40 @@ fn main() {
         println!("To run: cd {name} && pblang run .");
         return;
     }
+    if args.first().map(|s| s.as_str()) == Some("manifest-check") {
+        if args.len() > 2 {
+            eprintln!("pblang manifest-check: expected at most one [path] argument");
+            std::process::exit(1);
+        }
+        let start = args
+            .get(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let man_dir = pblang_pm::find_manifest_dir(&start).unwrap_or_else(|| {
+            eprintln!(
+                "pblang manifest-check: could not find pblang.toml from '{}'",
+                start.display()
+            );
+            std::process::exit(1);
+        });
+        let manifest_path = man_dir.join("pblang.toml");
+        let report = run_manifest_validator_pblang_file(&manifest_path).unwrap_or_else(|e| {
+            eprintln!("pblang manifest-check: {}", e);
+            std::process::exit(1);
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
+        );
+        if !report
+            .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().map(|s| s.as_str()) == Some("--lock") {
         let rest: Vec<String> = args.iter().skip(1).cloned().collect();
         let (registry_index_url, require_registry_sha256_cli, positionals) =
@@ -1621,6 +1893,10 @@ fn main() {
                 "pblang --lock: could not find pblang.toml from '{}'",
                 start.display()
             );
+            std::process::exit(1);
+        });
+        shadow_validate_manifest_with_pblang(&man_dir, "--lock").unwrap_or_else(|e| {
+            eprintln!("{}", e);
             std::process::exit(1);
         });
         let lock =
@@ -1714,6 +1990,10 @@ fn main() {
             );
             std::process::exit(1);
         });
+        shadow_validate_manifest_with_pblang(&man_dir, "install").unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        });
         let lock =
             generate_lockfile_for_cli(&man_dir, registry_index_url, require_registry_sha256_cli);
         let lock = lock.unwrap_or_else(|e| {
@@ -1771,6 +2051,10 @@ fn main() {
                 );
                 std::process::exit(1);
             });
+            shadow_validate_manifest_with_pblang(&man_dir, "publish").unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            });
             if let Err(e) = pblang_pm::publish_to_registry_dir(&man_dir, &registry_dir) {
                 eprintln!("pblang publish: {}", e);
                 std::process::exit(1);
@@ -1788,23 +2072,25 @@ fn main() {
             );
             std::process::exit(1);
         });
+        shadow_validate_manifest_with_pblang(&man_dir, "publish").unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        });
         let registry_url = std::env::var("PBLANG_REGISTRY_INDEX").unwrap_or_else(|_| {
             eprintln!(
                 "pblang publish: no registry configured (set PBLANG_REGISTRY_INDEX to registry base URL or file:// directory)"
             );
             std::process::exit(1);
         });
-        // SECURITY FIX #28: Prefer the env var to avoid the token appearing in
+        // SECURITY FIX #28: Require env var tokens to avoid leaking secrets in
         // shell history, `ps aux` process listings, and CI logs.
-        // The --registry-token=<value> CLI flag is still supported for backward
-        // compatibility, but a warning is printed to stderr when it is used.
         let token = std::env::var("PBLANG_REGISTRY_TOKEN").unwrap_or_else(|_| {
             for a in &rest {
-                if let Some(t) = a.strip_prefix("--registry-token=") {
+                if a.starts_with("--registry-token=") {
                     eprintln!(
-                        "WARNING: passing --registry-token on the command line exposes the                          token in shell history and process listings.                          Prefer setting PBLANG_REGISTRY_TOKEN as an environment variable."
+                        "pblang publish: --registry-token is disabled for security. Set PBLANG_REGISTRY_TOKEN in the environment."
                     );
-                    return t.to_string();
+                    std::process::exit(2);
                 }
             }
             String::new()
@@ -1862,6 +2148,10 @@ fn main() {
                 "pblang pack: could not find pblang.toml from '{}'",
                 start.display()
             );
+            std::process::exit(1);
+        });
+        shadow_validate_manifest_with_pblang(&man_dir, "pack").unwrap_or_else(|e| {
+            eprintln!("{}", e);
             std::process::exit(1);
         });
         // Ensure we have an up-to-date lockfile before packing.
@@ -1931,22 +2221,26 @@ fn main() {
         }
         println!("{}", msg);
         if let Ok(key) = std::env::var("PBLANG_SIGNING_KEY") {
-            let hmac_hex = pblang_pm::compute_tarball_hmac(&bytes, key.as_bytes());
-            let sidecar = out_path.parent().unwrap_or(std::path::Path::new(".")).join(
-                out_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-                    + ".sha256",
-            );
-            if let Err(e) = std::fs::write(&sidecar, hmac_hex) {
-                eprintln!(
-                    "pblang pack: failed to write HMAC sidecar {}: {}",
-                    sidecar.display(),
-                    e
-                );
+            if key.trim().is_empty() {
+                eprintln!("pblang pack: skipping signing because PBLANG_SIGNING_KEY is empty");
             } else {
-                println!("signed (HMAC sidecar {})", sidecar.display());
+                let hmac_hex = pblang_pm::compute_tarball_hmac(&bytes, key.as_bytes());
+                let sidecar = out_path.parent().unwrap_or(std::path::Path::new(".")).join(
+                    out_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                        + ".sha256",
+                );
+                if let Err(e) = std::fs::write(&sidecar, hmac_hex) {
+                    eprintln!(
+                        "pblang pack: failed to write HMAC sidecar {}: {}",
+                        sidecar.display(),
+                        e
+                    );
+                } else {
+                    println!("signed (HMAC sidecar {})", sidecar.display());
+                }
             }
         }
         println!("To run: unpack the tarball and run 'pblang run .' in the unpacked directory.");
@@ -1989,7 +2283,7 @@ fn main() {
             std::process::exit(1);
         });
         let src_for_parse = strip_comments_mask(&src);
-        match parse(&src_for_parse) {
+        match parse_strict(&src_for_parse) {
             Ok(ast) => {
                 let graph = build_call_graph(&ast, path);
                 print_call_graph(&graph);
@@ -2016,7 +2310,7 @@ fn main() {
             std::process::exit(1);
         });
         let src_for_parse = strip_comments_mask(&src);
-        let ast = match parse(&src_for_parse) {
+        let ast = match parse_strict(&src_for_parse) {
             Ok(ast) => ast,
             Err(errs) => {
                 print_parse_errors(&src_for_parse, errs, Some(path));
@@ -2045,7 +2339,7 @@ fn main() {
             std::process::exit(1);
         });
         let src_for_parse = strip_comments_mask(&src);
-        let stmts = match parse(&src_for_parse) {
+        let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
                 print_parse_errors(&src_for_parse, errs, Some(path));
@@ -2081,7 +2375,7 @@ fn main() {
             std::process::exit(1);
         });
         let src_for_parse = strip_comments_mask(&src);
-        let stmts = match parse(&src_for_parse) {
+        let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
                 print_parse_errors(&src_for_parse, errs, Some(path));
@@ -2117,7 +2411,7 @@ fn main() {
             std::process::exit(1);
         });
         let src_for_parse = strip_comments_mask(&src);
-        let stmts = match parse(&src_for_parse) {
+        let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
                 print_parse_errors(&src_for_parse, errs, path.as_str().into());
@@ -2154,7 +2448,7 @@ fn main() {
             std::process::exit(1);
         });
         let src_masked = strip_comments_mask(&src);
-        let stmts = match parse(&src_masked) {
+        let stmts = match parse_strict(&src_masked) {
             Ok(s) => s,
             Err(errs) => {
                 print_parse_errors(&src_masked, errs, path.as_str().into());
@@ -2193,6 +2487,10 @@ fn main() {
             );
             std::process::exit(1);
         });
+        shadow_validate_manifest_with_pblang(&man_dir, "build").unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        });
         let lock =
             generate_lockfile_for_cli(&man_dir, registry_index_url, require_registry_sha256_cli)
                 .unwrap_or_else(|e| {
@@ -2212,19 +2510,12 @@ fn main() {
             );
             std::process::exit(1);
         });
-        let entry_path = resolve_package_entry(&man_dir).unwrap_or_else(|e| {
+        let (entry_path, src) = read_package_entry_source(&man_dir).unwrap_or_else(|e| {
             eprintln!("pblang build: {}", e);
             std::process::exit(1);
         });
         let path_str = entry_path.to_string_lossy();
-        let src = match std::fs::read_to_string(&entry_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("pblang build: failed to read {}: {}", path_str, e);
-                std::process::exit(1);
-            }
-        };
-        match parse(&src) {
+        match parse_strict(&src) {
             Ok(stmts) => {
                 let diags = type_check(&stmts);
                 if !diags.is_empty() {
@@ -2287,6 +2578,10 @@ fn main() {
             );
             std::process::exit(1);
         });
+        shadow_validate_manifest_with_pblang(&man_dir, "bundle").unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        });
         let lock =
             generate_lockfile_for_cli(&man_dir, registry_index_url, require_registry_sha256_cli)
                 .unwrap_or_else(|e| {
@@ -2325,7 +2620,13 @@ fn main() {
             };
 
             // Find current pblang executable (to embed as bin/pblang in the tarball)
-            let current_exe = std::env::current_exe().expect("cannot read current executable path");
+            let current_exe = std::env::current_exe().unwrap_or_else(|e| {
+                eprintln!(
+                    "pblang bundle --self-extract: cannot read current executable path: {}",
+                    e
+                );
+                std::process::exit(1);
+            });
 
             // Create a temp staging directory that includes:
             //   - all package files (source, manifest, lockfile)
@@ -2362,7 +2663,13 @@ fn main() {
                     eprintln!("pblang bundle --self-extract: walk error: {}", e);
                     std::process::exit(1);
                 });
-                let rel = entry.path().strip_prefix(&man_dir).unwrap();
+                let rel = entry.path().strip_prefix(&man_dir).unwrap_or_else(|_| {
+                    eprintln!(
+                        "pblang bundle --self-extract: invalid path outside package root: {}",
+                        entry.path().display()
+                    );
+                    std::process::exit(1);
+                });
                 let dest = staging.join(rel);
                 if entry.file_type().is_dir() {
                     let _ = std::fs::create_dir_all(&dest);
@@ -2414,14 +2721,17 @@ fn main() {
             let _ = std::fs::remove_dir_all(&staging);
 
             // Find pblang-stub binary (look next to current executable)
-            let stub_path = current_exe
-                .parent()
-                .expect("cannot find parent directory of executable")
-                .join(if cfg!(target_os = "windows") {
-                    "pblang-stub.exe"
-                } else {
-                    "pblang-stub"
-                });
+            let Some(current_exe_parent) = current_exe.parent() else {
+                eprintln!(
+                    "pblang bundle --self-extract: cannot find parent directory of executable"
+                );
+                std::process::exit(1);
+            };
+            let stub_path = current_exe_parent.join(if cfg!(target_os = "windows") {
+                "pblang-stub.exe"
+            } else {
+                "pblang-stub"
+            });
 
             let stub_bytes = std::fs::read(&stub_path).unwrap_or_else(|e| {
                 eprintln!(
@@ -2575,9 +2885,18 @@ fn main() {
     }
 
     if args.first().map(|s| s.as_str()) == Some("--check") {
-        let path = args.get(1).expect("usage: pblang --check <file>");
-        let src = std::fs::read_to_string(path).expect("failed to read file");
-        match parse(&src) {
+        let Some(path) = args.get(1) else {
+            eprintln!("usage: pblang --check <file>");
+            std::process::exit(2);
+        };
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("pblang --check: failed to read '{}': {}", path, e);
+                std::process::exit(1);
+            }
+        };
+        match parse_strict(&src) {
             Ok(stmts) => {
                 let diags = type_check(&stmts);
                 if diags.is_empty() {
@@ -2600,16 +2919,23 @@ fn main() {
         }
     }
     if args.first().map(|s| s.as_str()) == Some("--doc") {
-        let path = args
-            .get(1)
-            .expect("usage: pblang --doc <file> [--html] [out_dir]");
+        let Some(path) = args.get(1) else {
+            eprintln!("usage: pblang --doc <file> [--html] [out_dir]");
+            std::process::exit(2);
+        };
         let html_mode = args.get(2).map(|s| s.as_str()) == Some("--html");
         let out_dir = if html_mode {
             args.get(3).map(String::as_str).unwrap_or("docs")
         } else {
             ""
         };
-        let src = std::fs::read_to_string(path).expect("failed to read file");
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("pblang --doc: failed to read '{}': {}", path, e);
+                std::process::exit(1);
+            }
+        };
 
         fn render_ty(t: &TypeExpr) -> String {
             match &t.kind {
@@ -2849,10 +3175,11 @@ fn main() {
         println!("Open editors/ide/index.html in your browser");
 
         let listener =
-            std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap_or_else(|e| {
+            std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap_or_else(|e| {
                 eprintln!("Cannot bind to port {}: {}", port, e);
                 std::process::exit(1);
             });
+        let cors_origin = format!("http://localhost:{port}");
         let ide_examples = [
             (
                 "hello_world",
@@ -2899,56 +3226,203 @@ fn main() {
             ("ide", "IDE Manual", "docs/IDE_MANUAL.md"),
             ("project", "Project Manual", "docs/PROJECT_MANUAL.md"),
         ];
+        let max_workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 16))
+            .unwrap_or(4);
+        let serve_pool = threadpool::ThreadPool::new(max_workers);
+        let max_inflight = max_workers * 8;
+        let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct InflightPermit {
+            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for InflightPermit {
+            fn drop(&mut self) {
+                self.counter
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        println!("pblang serve: concurrency limit set to {}", max_workers);
+        println!("pblang serve: inflight cap set to {}", max_inflight);
 
         for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                use std::io::{Read, Write};
-                let mut request_bytes: Vec<u8> = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let mut header_end: Option<usize> = None;
-                let mut content_length: usize = 0;
-                loop {
-                    match stream.read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            request_bytes.extend_from_slice(&chunk[..n]);
-                            if header_end.is_none() {
-                                if let Some(pos) =
-                                    request_bytes.windows(4).position(|w| w == b"\r\n\r\n")
-                                {
-                                    header_end = Some(pos + 4);
-                                    let header = String::from_utf8_lossy(&request_bytes[..pos + 4]);
-                                    for line in header.lines() {
-                                        let line_trimmed = line.trim();
-                                        if let Some(v) = line_trimmed.strip_prefix("Content-Length:")
+            match stream {
+                Ok(mut stream) => {
+                    let acquired = loop {
+                        let cur = inflight.load(std::sync::atomic::Ordering::Acquire);
+                        if cur >= max_inflight {
+                            break false;
+                        }
+                        if inflight
+                            .compare_exchange_weak(
+                                cur,
+                                cur + 1,
+                                std::sync::atomic::Ordering::AcqRel,
+                                std::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            break true;
+                        }
+                    };
+                    if !acquired {
+                        let resp_body = serde_json::json!({
+                            "ok": false,
+                            "error": "server busy; retry later"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nRetry-After: 1\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
+                        continue;
+                    }
+
+                    let cors_origin = cors_origin.clone();
+                    let inflight = inflight.clone();
+                    serve_pool.execute(move || {
+                        let _permit = InflightPermit { counter: inflight };
+                        for _req in 0..1 {
+                            use std::io::Read;
+                            const MAX_HEADER_BYTES: usize = 64 * 1024;
+                            const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+                            const READ_TIMEOUT_MS: u64 = 5_000;
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(
+                                READ_TIMEOUT_MS,
+                            )));
+                            let mut request_bytes: Vec<u8> = Vec::new();
+                            let mut chunk = [0u8; 4096];
+                            let mut header_end: Option<usize> = None;
+                            let mut content_length: usize = 0;
+                            let mut saw_content_length = false;
+                            let mut malformed_content_length = false;
+                            let mut header_too_large = false;
+                            let mut body_too_large = false;
+                            loop {
+                                match stream.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        request_bytes.extend_from_slice(&chunk[..n]);
+                                        if header_end.is_none()
+                                            && request_bytes.len() > MAX_HEADER_BYTES
                                         {
-                                            content_length = v.trim().parse::<usize>().unwrap_or(0);
+                                            header_too_large = true;
                                             break;
                                         }
-                                        let lower = line_trimmed.to_ascii_lowercase();
-                                        if let Some(v) = lower.strip_prefix("content-length:") {
-                                            content_length = v.trim().parse::<usize>().unwrap_or(0);
+                                        if header_end.is_none() {
+                                            if let Some(pos) =
+                                                request_bytes.windows(4).position(|w| w == b"\r\n\r\n")
+                                            {
+                                                header_end = Some(pos + 4);
+                                                let header =
+                                                    String::from_utf8_lossy(&request_bytes[..pos + 4]);
+                                                for line in header.lines() {
+                                                    let line_trimmed = line.trim();
+                                                    if let Some(v) =
+                                                        line_trimmed.strip_prefix("Content-Length:")
+                                                    {
+                                                        saw_content_length = true;
+                                                        match v.trim().parse::<usize>() {
+                                                            Ok(n) => content_length = n,
+                                                            Err(_) => {
+                                                                malformed_content_length = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                        break;
+                                                    }
+                                                    let lower = line_trimmed.to_ascii_lowercase();
+                                                    if let Some(v) =
+                                                        lower.strip_prefix("content-length:")
+                                                    {
+                                                        saw_content_length = true;
+                                                        match v.trim().parse::<usize>() {
+                                                            Ok(n) => content_length = n,
+                                                            Err(_) => {
+                                                                malformed_content_length = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                                if malformed_content_length {
+                                                    break;
+                                                }
+                                                if content_length > MAX_BODY_BYTES {
+                                                    body_too_large = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if let Some(h_end) = header_end {
+                                            if request_bytes.len() >= h_end + content_length {
+                                                break;
+                                            }
+                                        }
+                                        if request_bytes.len() > MAX_HEADER_BYTES + MAX_BODY_BYTES {
                                             break;
                                         }
                                     }
+                                    Err(_) => break,
                                 }
                             }
-                            if let Some(h_end) = header_end {
-                                if request_bytes.len() >= h_end + content_length {
-                                    break;
-                                }
-                            }
-                            if request_bytes.len() > 10 * 1024 * 1024 {
-                                // Hard stop to avoid unbounded reads.
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                            if !request_bytes.is_empty() {
+                    if header_too_large {
+                        let resp_body = serde_json::json!({
+                            "ok": false,
+                            "error": "request headers too large"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
+                        continue;
                     }
-                }
-                if !request_bytes.is_empty() {
+                    if malformed_content_length {
+                        let resp_body = serde_json::json!({
+                            "ok": false,
+                            "error": "invalid Content-Length header"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
+                        continue;
+                    }
+                    if body_too_large {
+                        let resp_body = serde_json::json!({
+                            "ok": false,
+                            "error": format!("request body too large (max {} bytes)", MAX_BODY_BYTES)
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
+                        continue;
+                    }
                     let request = String::from_utf8_lossy(&request_bytes);
                     let request_line = request.lines().next().unwrap_or("");
+                    if request_line.starts_with("POST ") && !saw_content_length {
+                        let resp_body = serde_json::json!({
+                            "ok": false,
+                            "error": "missing Content-Length for POST request"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 411 Length Required\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
+                        continue;
+                    }
                     let request_path = request_line.split_whitespace().nth(1).unwrap_or("/");
                     let body_start = request.find("\r\n\r\n").map(|n| n + 4).unwrap_or(request.len());
                     let body = &request[body_start..];
@@ -3107,7 +3581,7 @@ fn main() {
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                             resp_body.len(), resp_body
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                     } else if request.starts_with("POST /check") {
                         // Parse + typecheck only (no execution), for IDE diagnostics.
                         let mut json_resp = serde_json::json!({
@@ -3187,7 +3661,7 @@ fn main() {
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                             resp_body.len(), resp_body
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                     } else if request.starts_with("POST /format") {
                         let mut json_resp = serde_json::json!({
                             "ok": false,
@@ -3213,7 +3687,7 @@ fn main() {
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                             resp_body.len(), resp_body
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                     } else if request.starts_with("POST /normalize") {
                         let mut json_resp = serde_json::json!({
                             "ok": false,
@@ -3234,7 +3708,7 @@ fn main() {
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                             resp_body.len(), resp_body
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                     } else if request_path == "/examples" {
                         let mut arr = Vec::new();
                         for (id, title, rel_path) in ide_examples {
@@ -3254,7 +3728,7 @@ fn main() {
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                             resp_body.len(), resp_body
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                     } else if request_path.starts_with("/examples/") {
                         let id = request_path.trim_start_matches("/examples/").trim_end_matches('/');
                         let selected = ide_examples
@@ -3275,12 +3749,16 @@ fn main() {
                                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                                         resp_body.len(), resp_body
                                     );
-                                    let _ = stream.write_all(response.as_bytes());
+                                    write_http_response_with_local_cors(
+                                        &mut stream,
+                                        &response,
+                                        &cors_origin,
+                                    );
                                 }
                                 Err(e) => {
                                     let json_resp = serde_json::json!({
                                         "ok": false,
-                                        "error": format!("failed to read example '{}': {}", id, e)
+                                        "error": format!("failed to read selected example: {}", e)
                                     });
                                     let resp_body =
                                         serde_json::to_string(&json_resp).unwrap_or_default();
@@ -3288,20 +3766,24 @@ fn main() {
                                         "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                                         resp_body.len(), resp_body
                                     );
-                                    let _ = stream.write_all(response.as_bytes());
+                                    write_http_response_with_local_cors(
+                                        &mut stream,
+                                        &response,
+                                        &cors_origin,
+                                    );
                                 }
                             }
                         } else {
                             let json_resp = serde_json::json!({
                                 "ok": false,
-                                "error": format!("unknown example '{}'", id)
+                                "error": "unknown example id"
                             });
                             let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
                             let response = format!(
                                 "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                                 resp_body.len(), resp_body
                             );
-                            let _ = stream.write_all(response.as_bytes());
+                            write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                         }
                     } else if request_path.starts_with("/manual/") {
                         let id = request_path
@@ -3323,12 +3805,16 @@ fn main() {
                                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                                         resp_body.len(), resp_body
                                     );
-                                    let _ = stream.write_all(response.as_bytes());
+                                    write_http_response_with_local_cors(
+                                        &mut stream,
+                                        &response,
+                                        &cors_origin,
+                                    );
                                 }
                                 Err(e) => {
                                     let json_resp = serde_json::json!({
                                         "ok": false,
-                                        "error": format!("failed to read manual '{}': {}", id, e)
+                                        "error": format!("failed to read selected manual: {}", e)
                                     });
                                     let resp_body =
                                         serde_json::to_string(&json_resp).unwrap_or_default();
@@ -3336,20 +3822,24 @@ fn main() {
                                         "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                                         resp_body.len(), resp_body
                                     );
-                                    let _ = stream.write_all(response.as_bytes());
+                                    write_http_response_with_local_cors(
+                                        &mut stream,
+                                        &response,
+                                        &cors_origin,
+                                    );
                                 }
                             }
                         } else {
                             let json_resp = serde_json::json!({
                                 "ok": false,
-                                "error": format!("unknown manual '{}'", id)
+                                "error": "unknown manual id"
                             });
                             let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
                             let response = format!(
                                 "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                                 resp_body.len(), resp_body
                             );
-                            let _ = stream.write_all(response.as_bytes());
+                            write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                         }
                     } else if request.starts_with("GET /health") {
                         let json_resp = serde_json::json!({"ok": true, "service": "pblang-ide-backend"});
@@ -3358,10 +3848,10 @@ fn main() {
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                             resp_body.len(), resp_body
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                     } else if request.starts_with("OPTIONS") {
-                        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n";
-                        let _ = stream.write_all(response.as_bytes());
+                        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n";
+                        write_http_response_with_local_cors(&mut stream, response, &cors_origin);
                     } else {
                         // Serve IDE HTML for GET /
                         let html = include_str!("../editors/ide/index.html");
@@ -3369,8 +3859,14 @@ fn main() {
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
                             html.len(), html
                         );
-                        let _ = stream.write_all(response.as_bytes());
+                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                     }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("pblang serve: failed to accept connection: {}", e);
                 }
             }
         }
@@ -3405,7 +3901,7 @@ fn main() {
             if path
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e == "sap" || e == "sapp")
+                .map(|e| e == "sap" || e == "sapp" || e == "bpx")
                 .unwrap_or(false)
             {
                 match std::fs::read_to_string(&path) {
@@ -3413,6 +3909,9 @@ fn main() {
                         let lines: Vec<&str> = src.lines().collect();
                         let mut out = String::new();
                         let mut depth: i32 = 0;
+                        let mut in_string = false;
+                        let mut in_single_string = false;
+                        let mut block_comment_depth = 0;
                         let mut last_line_was_blank = false;
                         let mut seen_toplevel_fn = false;
                         for line in &lines {
@@ -3442,24 +3941,43 @@ fn main() {
                                     if line_to_output.len() <= max_len {
                                         out.push_str(&line_to_output);
                                         out.push('\n');
+                                        scan_line_for_braces(
+                                            &line_to_output,
+                                            &mut in_string,
+                                            &mut in_single_string,
+                                            &mut block_comment_depth,
+                                            &mut depth,
+                                        );
                                         break;
                                     }
                                     let break_at =
                                         line_to_output[..max_len].rfind(' ').unwrap_or(max_len);
                                     let break_at = if break_at == 0 { max_len } else { break_at };
                                     let rest = line_to_output.split_off(break_at);
-                                    out.push_str(line_to_output.trim_end());
+                                    let emitted = line_to_output.trim_end().to_string();
+                                    out.push_str(&emitted);
                                     out.push('\n');
+                                    scan_line_for_braces(
+                                        &emitted,
+                                        &mut in_string,
+                                        &mut in_single_string,
+                                        &mut block_comment_depth,
+                                        &mut depth,
+                                    );
                                     line_to_output = format!("{}{}", indent_str, rest.trim_start());
                                 }
                             } else {
                                 out.push_str(&full_line);
                                 out.push('\n');
+                                scan_line_for_braces(
+                                    &full_line,
+                                    &mut in_string,
+                                    &mut in_single_string,
+                                    &mut block_comment_depth,
+                                    &mut depth,
+                                );
                             }
                             last_line_was_blank = false;
-                            if trimmed.ends_with('{') {
-                                depth += 1;
-                            }
                         }
                         if !out.is_empty() && !out.ends_with('\n') {
                             out.push('\n');
@@ -3882,7 +4400,7 @@ fn main() {
                     continue;
                 }
             };
-            match parse(&src) {
+            match parse_strict(&src) {
                 Ok(stmts) => {
                     let diags = type_check(&stmts);
                     for d in &diags {
@@ -3911,11 +4429,14 @@ fn main() {
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("lsp") {
-        tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("tokio runtime for pblang lsp")
-            .block_on(pblang_lsp::run_stdio_server());
+            .unwrap_or_else(|e| {
+                eprintln!("pblang lsp: failed to initialize tokio runtime: {}", e);
+                std::process::exit(1);
+            });
+        rt.block_on(pblang_lsp::run_stdio_server());
         return;
     }
 
@@ -3961,7 +4482,7 @@ fn main() {
                 }
             };
             let src_for_parse = strip_comments_mask(&src);
-            let stmts = match parse(&src_for_parse) {
+            let stmts = match parse_strict(&src_for_parse) {
                 Ok(s) => s,
                 Err(errs) => {
                     eprintln!("FAIL {}: parse error", path_str);
@@ -4006,6 +4527,7 @@ fn main() {
     // Run a script file and exit (no REPL)
     if args.first().map(|s| s.as_str()) == Some("run") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut script_src_preloaded: Option<String> = None;
         let script_path = if let Some(path_arg) = args.get(1) {
             let candidate = PathBuf::from(path_arg);
             let candidate_abs = if candidate.is_absolute() {
@@ -4021,10 +4543,12 @@ fn main() {
                     );
                     std::process::exit(1);
                 });
-                resolve_package_entry(&man_dir).unwrap_or_else(|e| {
+                let (entry_path, src) = read_package_entry_source(&man_dir).unwrap_or_else(|e| {
                     eprintln!("pblang run: {}", e);
                     std::process::exit(1);
-                })
+                });
+                script_src_preloaded = Some(src);
+                entry_path
             } else {
                 candidate_abs.canonicalize().unwrap_or_else(|_| {
                     // When run from target/release, path is relative to repo root
@@ -4038,10 +4562,12 @@ fn main() {
                 eprintln!("usage: pblang run [file.sapp|file.bpx|dir]");
                 std::process::exit(1);
             });
-            resolve_package_entry(&man_dir).unwrap_or_else(|e| {
+            let (entry_path, src) = read_package_entry_source(&man_dir).unwrap_or_else(|e| {
                 eprintln!("pblang run: {}", e);
                 std::process::exit(1);
-            })
+            });
+            script_src_preloaded = Some(src);
+            entry_path
         };
         if let Some(man_dir) = script_path.parent().and_then(pblang_pm::find_manifest_dir) {
             if let Some((platform, min_rt)) = pblang_pm::get_manifest_platform_hints(&man_dir) {
@@ -4058,19 +4584,23 @@ fn main() {
         }
 
         let path_str = script_path.to_string_lossy().to_string();
-        let src = match std::fs::read_to_string(&script_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "pblang run: failed to read '{}': {}",
-                    script_path.display(),
-                    e
-                );
-                std::process::exit(1);
+        let src = if let Some(s) = script_src_preloaded {
+            s
+        } else {
+            match std::fs::read_to_string(&script_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "pblang run: failed to read '{}': {}",
+                        script_path.display(),
+                        e
+                    );
+                    std::process::exit(1);
+                }
             }
         };
         let src_for_parse = strip_comments_mask(&src);
-        let stmts = match parse(&src_for_parse) {
+        let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
                 print_parse_errors(&src_for_parse, errs, Some(&path_str));
@@ -4168,7 +4698,7 @@ fn main() {
             }
         };
         let src_for_parse = strip_comments_mask(&src);
-        let stmts = match parse(&src_for_parse) {
+        let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
                 print_parse_errors(&src_for_parse, errs, Some(&script_path.to_string_lossy()));
@@ -4466,6 +4996,7 @@ fn main() {
     let mut buf = String::new();
     let mut brace_depth: i32 = 0;
     let mut in_string = false;
+    let mut in_single_string = false;
     let mut block_comment_depth: i32 = 0;
 
     loop {
@@ -4514,12 +5045,13 @@ fn main() {
         scan_line_for_braces(
             trimmed_end,
             &mut in_string,
+            &mut in_single_string,
             &mut block_comment_depth,
             &mut brace_depth,
         );
 
         // Only attempt parse when braces balanced AND we're not inside a string.
-        if brace_depth <= 0 && !in_string && block_comment_depth == 0 {
+        if brace_depth <= 0 && !in_string && !in_single_string && block_comment_depth == 0 {
             // Keep byte offsets stable: never trim the string we parse/execute.
             let src_for_spans = strip_comments_mask(&buf);
             if !src_for_spans.trim().is_empty() {

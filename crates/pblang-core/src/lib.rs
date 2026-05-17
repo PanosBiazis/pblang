@@ -232,20 +232,23 @@ fn strip_comments_mask(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec(); // same length as input (byte offsets preserved)
     let mut i = 0usize;
-    let mut in_string = false;
+    let mut in_double_string = false;
+    let mut in_single_string = false;
     let mut block_depth: i32 = 0;
 
     while i < out.len() {
         let b = out[i];
 
-        // Inside string: only care about escapes and closing "
-        if in_string {
+        // Inside string: only care about escapes and matching close quote.
+        if in_double_string || in_single_string {
             if b == b'\\' {
                 i = i.saturating_add(2);
                 continue;
             }
-            if b == b'"' {
-                in_string = false;
+            if in_double_string && b == b'"' {
+                in_double_string = false;
+            } else if in_single_string && b == b'\'' {
+                in_single_string = false;
             }
             i += 1;
             continue;
@@ -276,7 +279,12 @@ fn strip_comments_mask(src: &str) -> String {
 
         // Not in string/comment
         if b == b'"' {
-            in_string = true;
+            in_double_string = true;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_single_string = true;
             i += 1;
             continue;
         }
@@ -305,7 +313,7 @@ fn strip_comments_mask(src: &str) -> String {
         i += 1;
     }
 
-    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+    String::from_utf8(out.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string())
 }
 
 fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
@@ -693,7 +701,7 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
     }
 
     (
-        String::from_utf8(out).unwrap_or_else(|_| src.to_string()),
+        String::from_utf8(out.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string()),
         blocks,
     )
 }
@@ -701,12 +709,24 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
 /// Type alias for the result of `parse_with_polyglot` to tame the complex type signature.
 pub type ParseWithPolyglotResult = Result<(Vec<Stmt>, Vec<PolyglotBlock>), Vec<Simple<char>>>;
 
+fn preprocess_for_parse(input: &str) -> (String, Vec<PolyglotBlock>) {
+    // Keep byte offsets stable by masking comments/polyglot blocks with spaces.
+    let (masked, blocks) = mask_and_extract_polyglot_blocks(input);
+    let masked = strip_comments_mask(&masked);
+    (masked, blocks)
+}
+
+pub fn parse_with_polyglot_strict(input: &str) -> ParseWithPolyglotResult {
+    let (masked, blocks) = preprocess_for_parse(input);
+    parser()
+        .parse(masked.as_str())
+        .map(|stmts| (stmts, blocks))
+}
+
 pub fn parse_with_polyglot(
     input: &str,
 ) -> ParseWithPolyglotResult {
-    // Preprocess in a byte-offset-stable way.
-    let (masked, blocks) = mask_and_extract_polyglot_blocks(input);
-    let masked = strip_comments_mask(&masked);
+    let (masked, blocks) = preprocess_for_parse(input);
 
     // SP1-gamma fix: prefer strict parser().parse() over parse_recovery().
     // parse_recovery() consumes unexpected characters (like guard separators `~`/`#`)
@@ -738,4 +758,8 @@ pub fn parse(input: &str) -> Result<Vec<Stmt>, Vec<Simple<char>>> {
     // - spans remain stable byte offsets
     // - both REPL input and imported module files can contain `//` or `/* */`
     parse_with_polyglot(input).map(|(stmts, _)| stmts)
+}
+
+pub fn parse_strict(input: &str) -> Result<Vec<Stmt>, Vec<Simple<char>>> {
+    parse_with_polyglot_strict(input).map(|(stmts, _)| stmts)
 }

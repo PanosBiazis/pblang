@@ -66,14 +66,9 @@ fn run_lsp_exchange(steps: &[(&str, Option<u32>)]) -> String {
     thread::spawn(move || {
         let mut buf = Vec::new();
         let mut collected = String::new();
-        loop {
-            match read_lsp_body(&mut stdout_pipe, &mut buf) {
-                Some(msg) => {
-                    collected.push_str(&msg);
-                    let _ = tx.send(collected.clone());
-                }
-                None => break,
-            }
+        while let Some(msg) = read_lsp_body(&mut stdout_pipe, &mut buf) {
+            collected.push_str(&msg);
+            let _ = tx.send(collected.clone());
         }
     });
 

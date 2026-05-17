@@ -53,6 +53,99 @@ fn version_flag_prints_package_version() {
     );
 }
 
+#[test]
+fn manifest_check_valid_manifest_succeeds() {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_manifest_check_ok");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(
+        tmp.join("pblang.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.sapp\"\n",
+    )
+    .expect("write manifest");
+
+    let output = Command::new(&bin)
+        .arg("manifest-check")
+        .arg(&tmp)
+        .output()
+        .expect("run pblang manifest-check");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "manifest-check should succeed: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("\"ok\": true"),
+        "expected ok=true JSON report, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn manifest_check_invalid_manifest_fails() {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_manifest_check_bad");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(
+        tmp.join("pblang.toml"),
+        "[package]\nname = \"demo\"\nversion = \"bad\"\n",
+    )
+    .expect("write manifest");
+
+    let output = Command::new(&bin)
+        .arg("manifest-check")
+        .arg(&tmp)
+        .output()
+        .expect("run pblang manifest-check bad");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "manifest-check should fail for invalid manifest"
+    );
+    assert!(
+        stdout.contains("\"ok\": false"),
+        "expected ok=false JSON report, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn lock_strict_manifest_validator_rejects_non_semver_version() {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_lock_strict_manifest_bad");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(
+        tmp.join("pblang.toml"),
+        "[package]\nname = \"demo\"\nversion = \"1\"\n",
+    )
+    .expect("write manifest");
+
+    let output = Command::new(&bin)
+        .arg("--lock")
+        .arg(&tmp)
+        .env("PBLANG_STRICT_MANIFEST_VALIDATOR", "1")
+        .output()
+        .expect("run pblang --lock with strict validator");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "--lock should fail when strict pblang validator rejects manifest"
+    );
+    assert!(
+        stderr.contains("strict pblang manifest validation failed"),
+        "expected strict validation failure message, got: {}",
+        stderr
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn pick_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port probe");
     listener.local_addr().expect("probe local addr").port()
@@ -92,6 +185,22 @@ fn http_post_json(port: u16, path: &str, body: &str) -> Result<String, String> {
     );
     stream
         .write_all(req.as_bytes())
+        .map_err(|e| format!("write req: {e}"))?;
+    let mut s = String::new();
+    stream
+        .read_to_string(&mut s)
+        .map_err(|e| format!("read resp: {e}"))?;
+    Ok(s)
+}
+
+fn http_send_raw(port: u16, request: &str) -> Result<String, String> {
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1200)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    stream
+        .write_all(request.as_bytes())
         .map_err(|e| format!("write req: {e}"))?;
     let mut s = String::new();
     stream
@@ -322,6 +431,157 @@ fn serve_accepts_large_json_body_for_check() {
         !resp.contains("invalid request body"),
         "large body should not be truncated/invalid: {}",
         resp
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_rejects_post_without_content_length() {
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut healthy = false;
+    while Instant::now() < deadline {
+        if let Ok(resp) = http_get(port, "/health") {
+            if resp.contains("\"ok\":true") {
+                healthy = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(healthy, "serve backend did not become healthy in time");
+
+    let raw = "POST /check HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"code\":\"print 1;\"}";
+    let resp = http_send_raw(port, raw).expect("POST /check without Content-Length");
+    assert!(
+        resp.contains("HTTP/1.1 411"),
+        "expected 411 Length Required, got: {}",
+        resp
+    );
+    assert!(
+        resp.contains("missing Content-Length"),
+        "expected missing Content-Length error body, got: {}",
+        resp
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_rejects_malformed_content_length() {
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut healthy = false;
+    while Instant::now() < deadline {
+        if let Ok(resp) = http_get(port, "/health") {
+            if resp.contains("\"ok\":true") {
+                healthy = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(healthy, "serve backend did not become healthy in time");
+
+    let raw = "POST /check HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: nope\r\nConnection: close\r\n\r\n{\"code\":\"print 1;\"}";
+    let resp = http_send_raw(port, raw).expect("POST /check with malformed Content-Length");
+    assert!(
+        resp.contains("HTTP/1.1 400"),
+        "expected 400 Bad Request, got: {}",
+        resp
+    );
+    assert!(
+        resp.contains("invalid Content-Length"),
+        "expected invalid Content-Length error body, got: {}",
+        resp
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_unknown_ids_do_not_reflect_user_input() {
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut healthy = false;
+    while Instant::now() < deadline {
+        if let Ok(resp) = http_get(port, "/health") {
+            if resp.contains("\"ok\":true") {
+                healthy = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(healthy, "serve backend did not become healthy in time");
+
+    let tricky = "evil%3Cscript%3Ealert(1)%3C/script%3E";
+    let ex_resp = http_get(port, &format!("/examples/{tricky}")).expect("GET unknown /examples/*");
+    assert!(
+        ex_resp.contains("HTTP/1.1 404"),
+        "expected 404 for unknown example id, got: {}",
+        ex_resp
+    );
+    assert!(
+        ex_resp.contains("unknown example id"),
+        "expected generic unknown example error, got: {}",
+        ex_resp
+    );
+    assert!(
+        !ex_resp.contains(tricky),
+        "response should not reflect unknown example id: {}",
+        ex_resp
+    );
+
+    let manual_resp = http_get(port, &format!("/manual/{tricky}")).expect("GET unknown /manual/*");
+    assert!(
+        manual_resp.contains("HTTP/1.1 404"),
+        "expected 404 for unknown manual id, got: {}",
+        manual_resp
+    );
+    assert!(
+        manual_resp.contains("unknown manual id"),
+        "expected generic unknown manual error, got: {}",
+        manual_resp
+    );
+    assert!(
+        !manual_resp.contains(tricky),
+        "response should not reflect unknown manual id: {}",
+        manual_resp
     );
 
     let _ = child.kill();

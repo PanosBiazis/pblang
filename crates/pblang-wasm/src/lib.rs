@@ -236,11 +236,8 @@ struct WasmCtx {
     module: WatModule,
     string_table: Vec<String>,
     string_offset: u32,
-    label_counter: u32,
-    local_counter: u32,
     current_fn: Option<String>,
     fn_return_types: HashMap<String, Option<WatType>>,
-    in_loop: bool,
     loop_start_label: Option<String>,
     loop_end_label: Option<String>,
     warnings: Vec<String>,
@@ -252,11 +249,8 @@ impl WasmCtx {
             module: WatModule::default(),
             string_table: Vec::new(),
             string_offset: 1024, // Start after null region
-            label_counter: 0,
-            local_counter: 0,
             current_fn: None,
             fn_return_types: HashMap::new(),
-            in_loop: false,
             loop_start_label: None,
             loop_end_label: None,
             warnings: Vec::new(),
@@ -286,16 +280,6 @@ impl WasmCtx {
         });
 
         ctx
-    }
-
-    fn fresh_label(&mut self) -> String {
-        self.label_counter += 1;
-        format!("$L{}", self.label_counter)
-    }
-
-    fn fresh_local(&mut self) -> String {
-        self.local_counter += 1;
-        format!("$local{}", self.local_counter)
     }
 
     fn intern_string(&mut self, s: &str) -> u32 {

@@ -220,10 +220,58 @@ fn main() {
 // ── Bundle extraction ─────────────────────────────────────────────────────────
 
 fn extract_bundle(tarball: &[u8], dest: &Path) {
+    let dest_root = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
     let gz = GzDecoder::new(std::io::Cursor::new(tarball));
     let mut archive = Archive::new(gz);
-    archive.unpack(dest).unwrap_or_else(|e| {
-        eprintln!("pblang-stub: failed to extract bundle: {e}");
+    let entries = archive.entries().unwrap_or_else(|e| {
+        eprintln!("pblang-stub: failed to read bundle entries: {e}");
         process::exit(1);
     });
+    for entry_res in entries {
+        let mut entry = entry_res.unwrap_or_else(|e| {
+            eprintln!("pblang-stub: failed to read a bundle entry: {e}");
+            process::exit(1);
+        });
+        let entry_path = entry
+            .path()
+            .map(|p| p.into_owned())
+            .unwrap_or_else(|e| {
+            eprintln!("pblang-stub: invalid entry path in bundle: {e}");
+            process::exit(1);
+        });
+        if entry_path.is_absolute()
+            || entry_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            eprintln!(
+                "pblang-stub: refusing to extract unsafe bundle path '{}'",
+                entry_path.display()
+            );
+            process::exit(1);
+        }
+        let entry_type = entry.header().entry_type();
+        if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
+            eprintln!(
+                "pblang-stub: refusing to extract link entry '{}'",
+                entry_path.display()
+            );
+            process::exit(1);
+        }
+        let target = dest_root.join(&entry_path);
+        if !target.starts_with(&dest_root) {
+            eprintln!(
+                "pblang-stub: refusing to extract outside target dir: '{}'",
+                entry_path.display()
+            );
+            process::exit(1);
+        }
+        entry.unpack_in(&dest_root).unwrap_or_else(|e| {
+            eprintln!(
+                "pblang-stub: failed to extract '{}': {e}",
+                entry_path.display()
+            );
+            process::exit(1);
+        });
+    }
 }

@@ -1105,8 +1105,7 @@ mod tests {
         assert!(Ty::Result(Box::new(Ty::Number), Box::new(Ty::String))
             .is_assignable_to(&Ty::Result(Box::new(Ty::Number), Box::new(Ty::String))));
         assert!(
-            Ty::Number.is_assignable_to(&Ty::Result(Box::new(Ty::Number), Box::new(Ty::String)))
-                == false
+            !Ty::Number.is_assignable_to(&Ty::Result(Box::new(Ty::Number), Box::new(Ty::String)))
         );
     }
 

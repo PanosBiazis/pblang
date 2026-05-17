@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 
 // ─────────────────────────────────────────────────────
 // Common types
@@ -67,14 +68,22 @@ impl QuantumBackend {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_name(s: &str) -> Option<Self> {
+        <Self as FromStr>::from_str(s).ok()
+    }
+}
+
+impl FromStr for QuantumBackend {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "qiskit" | "qiskit_aer" | "aer" => Some(QuantumBackend::QiskitAer),
-            "qiskit_ibmq" | "ibmq" | "ibm" => Some(QuantumBackend::QiskitIBMQ),
-            "braket" | "braket_local" => Some(QuantumBackend::BraketLocal),
-            "braket_aws" | "aws" => Some(QuantumBackend::BraketAws),
-            "cirq" | "cirq_local" => Some(QuantumBackend::CirqLocal),
-            _ => None,
+            "qiskit" | "qiskit_aer" | "aer" => Ok(QuantumBackend::QiskitAer),
+            "qiskit_ibmq" | "ibmq" | "ibm" => Ok(QuantumBackend::QiskitIBMQ),
+            "braket" | "braket_local" => Ok(QuantumBackend::BraketLocal),
+            "braket_aws" | "aws" => Ok(QuantumBackend::BraketAws),
+            "cirq" | "cirq_local" => Ok(QuantumBackend::CirqLocal),
+            _ => Err(()),
         }
     }
 }
@@ -398,10 +407,10 @@ mod tests {
 
     #[test]
     fn test_backend_from_str() {
-        assert!(QuantumBackend::from_str("qiskit").is_some());
-        assert!(QuantumBackend::from_str("cirq").is_some());
-        assert!(QuantumBackend::from_str("braket").is_some());
-        assert!(QuantumBackend::from_str("invalid").is_none());
+        assert!("qiskit".parse::<QuantumBackend>().is_ok());
+        assert!("cirq".parse::<QuantumBackend>().is_ok());
+        assert!("braket".parse::<QuantumBackend>().is_ok());
+        assert!("invalid".parse::<QuantumBackend>().is_err());
     }
 
     #[test]
@@ -427,7 +436,7 @@ measure q[0] -> c[0];"#;
         match result {
             Ok(r) => {
                 if r.success {
-                    assert!(r.counts.len() > 0);
+                    assert!(!r.counts.is_empty());
                     assert_eq!(r.shots, 1024);
                 }
                 // If Qiskit is not installed, that's OK in test

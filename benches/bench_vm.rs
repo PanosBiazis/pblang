@@ -57,7 +57,14 @@ fn bench_fib_jit(c: &mut Criterion) {
     chunk.write(OpCode::OpAdd, sp);
     chunk.write(OpCode::OpReturn, sp);
 
-    let func = Function { name: Some("fib".into()), arity: 1, chunk };
+    let func = Function {
+        name: Some("fib".into()),
+        arity: 1,
+        min_arity: 1,
+        defaults: Vec::new(),
+        is_vararg: false,
+        chunk,
+    };
     let mut cache = JitCache::new().expect("JitCache::new failed");
     let fn_ptr = match cache.compile("fib", &func) {
         JitResult::Compiled(fp) => fp,

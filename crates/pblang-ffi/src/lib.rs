@@ -127,6 +127,7 @@ pub extern "C" fn pblang_create_vm_sandboxed(
 /// Pass 0 to leave a limit unset (unlimited).
 /// - max_instructions: max bytecode instructions before aborting (0 = unlimited)
 /// - max_stack_depth:   max call stack frames (0 = unlimited)
+///
 /// Returns 0 on success, 1 if vm is null.
 ///
 /// # Safety
