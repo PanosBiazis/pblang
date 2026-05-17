@@ -280,10 +280,189 @@ fn run_manifest_validator_pblang_file(manifest_path: &Path) -> Result<serde_json
         .map_err(|e| format!("parse pblang manifest validator JSON output failed: {e}"))
 }
 
-fn strict_manifest_validator_enabled() -> bool {
-    std::env::var("PBLANG_STRICT_MANIFEST_VALIDATOR")
+fn run_manifest_parity_check(manifest_path: &Path) -> Result<serde_json::Value, String> {
+    let man_text = std::fs::read_to_string(manifest_path)
+        .map_err(|e| format!("read manifest '{}': {e}", manifest_path.display()))?;
+
+    let mut rust_errors = Vec::<String>::new();
+    let mut rust_dep_kinds = serde_json::Map::<String, serde_json::Value>::new();
+    let rust_package = match pblang_pm::parse_manifest(&man_text) {
+        Ok(man) => {
+            let pkg = man.package.unwrap_or_default();
+            let name = pkg.name.unwrap_or_default();
+            let version = pkg.version.unwrap_or_default();
+            let entry = pkg.entry.unwrap_or_default();
+            for (dep_name, spec) in &man.dependencies {
+                let kind = if spec.path().is_some() {
+                    "path"
+                } else if spec.git().is_some() {
+                    "git"
+                } else if spec.version_str().is_some() {
+                    "version"
+                } else {
+                    "unknown"
+                };
+                rust_dep_kinds.insert(dep_name.clone(), serde_json::Value::String(kind.to_string()));
+            }
+            if name.trim().is_empty() {
+                rust_errors.push("[package].name is required".to_string());
+            }
+            if version.trim().is_empty() {
+                rust_errors.push("[package].version is required".to_string());
+            }
+            serde_json::json!({
+                "name": name,
+                "version": version,
+                "entry": entry,
+            })
+        }
+        Err(e) => {
+            rust_errors.push(format!("rust parse_manifest error: {e}"));
+            serde_json::json!({
+                "name": "",
+                "version": "",
+                "entry": "",
+            })
+        }
+    };
+    let rust_ok = rust_errors.is_empty();
+
+    let pblang = run_manifest_validator_pblang_file(manifest_path)?;
+    let pblang_ok = pblang.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let pblang_package = pblang
+        .get("package")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let rust_name = rust_package
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rust_version = rust_package
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rust_entry = rust_package
+        .get("entry")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let p_name = pblang_package
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let p_version = pblang_package
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let p_entry = pblang_package
+        .get("entry")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut pblang_deps = serde_json::Map::<String, serde_json::Value>::new();
+    if let Some(items) = pblang.get("dependency_items").and_then(|v| v.as_array()) {
+        for item in items {
+            let Some(obj) = item.as_object() else { continue };
+            let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let kind = obj
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            pblang_deps.insert(name.to_string(), serde_json::Value::String(kind));
+        }
+    }
+
+    let mut parity_errors = Vec::<String>::new();
+    if rust_name != p_name {
+        parity_errors.push(format!(
+            "name mismatch: rust='{}' pblang='{}'",
+            rust_name, p_name
+        ));
+    }
+    if rust_version != p_version {
+        parity_errors.push(format!(
+            "version mismatch: rust='{}' pblang='{}'",
+            rust_version, p_version
+        ));
+    }
+    if rust_entry != p_entry {
+        parity_errors.push(format!(
+            "entry mismatch: rust='{}' pblang='{}'",
+            rust_entry, p_entry
+        ));
+    }
+    for (name, rust_kind_v) in &rust_dep_kinds {
+        let rust_kind = rust_kind_v.as_str().unwrap_or("unknown");
+        match pblang_deps.get(name).and_then(|v| v.as_str()) {
+            Some(pk) if pk == rust_kind => {}
+            Some(pk) => parity_errors.push(format!(
+                "dependency kind mismatch for '{}': rust='{}' pblang='{}'",
+                name, rust_kind, pk
+            )),
+            None => parity_errors.push(format!(
+                "dependency missing in pblang validator output: '{}'",
+                name
+            )),
+        }
+    }
+    for name in pblang_deps.keys() {
+        if !rust_dep_kinds.contains_key(name) {
+            parity_errors.push(format!(
+                "extra dependency in pblang validator output: '{}'",
+                name
+            ));
+        }
+    }
+    if !rust_ok {
+        parity_errors.push("rust manifest validation failed".to_string());
+    }
+    if !pblang_ok {
+        parity_errors.push("pblang manifest validation failed".to_string());
+    }
+
+    Ok(serde_json::json!({
+        "parity_ok": parity_errors.is_empty(),
+        "rust": {
+            "ok": rust_ok,
+            "errors": rust_errors,
+            "package": rust_package,
+            "dependencies": rust_dep_kinds,
+        },
+        "pblang": pblang,
+        "parity_errors": parity_errors,
+    }))
+}
+
+fn strict_manifest_validator_enabled(context: &str) -> bool {
+    let strict_global = std::env::var("PBLANG_STRICT_MANIFEST_VALIDATOR")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !strict_global {
+        return false;
+    }
+    let selector = std::env::var("PBLANG_STRICT_MANIFEST_VALIDATOR_COMMANDS")
+        .unwrap_or_default();
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return true;
+    }
+    if selector == "*" {
+        return true;
+    }
+    let ctx = context.trim().to_ascii_lowercase();
+    selector
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .any(|s| !s.is_empty() && s == ctx)
 }
 
 fn shadow_validate_manifest_with_pblang(man_dir: &Path, context: &str) -> Result<(), String> {
@@ -291,7 +470,7 @@ fn shadow_validate_manifest_with_pblang(man_dir: &Path, context: &str) -> Result
     if !manifest_path.is_file() {
         return Ok(());
     }
-    let strict = strict_manifest_validator_enabled();
+    let strict = strict_manifest_validator_enabled(context);
     match run_manifest_validator_pblang_file(&manifest_path) {
         Ok(v) => {
             let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true);
@@ -388,7 +567,9 @@ fn show_help() {
     println!("  pblang build [--registry-index <url>] [--require-registry-sha256] [path]  Generate lockfile + typecheck main entry (main.sap/main.bpx or src/main.sap/src/main.bpx)");
     println!("  pblang install [--registry-index <url>] [--require-registry-sha256] [path | <name>@<version>]  Resolve deps and generate pblang.lock (manifest path) or install a single registry package into cache (name@version).");
     println!("  pblang manifest-check [path]  Validate pblang.toml using pblang stdlib validator and print JSON report");
+    println!("  pblang manifest-parity [path]  Compare Rust and pblang manifest parsing/validation and print parity JSON report");
     println!("  env PBLANG_STRICT_MANIFEST_VALIDATOR=1  Fail manifest-based commands when pblang-side validator reports errors");
+    println!("  env PBLANG_STRICT_MANIFEST_VALIDATOR_COMMANDS=\"--lock,install,pack\"  Limit strict mode to specific commands");
     println!("  pblang publish --registry-dir <dir> [path]  Pack package into tarball and add to local registry index (file-based registry).");
     println!("  pblang publish            Publish current package to hosted registry (set PBLANG_REGISTRY_INDEX and PBLANG_REGISTRY_TOKEN env vars).");
     println!("  pblang search <query>     Search hosted or file-based registry for packages matching query (uses PBLANG_REGISTRY_INDEX).");
@@ -1866,6 +2047,40 @@ fn main() {
         );
         if !report
             .get("ok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().map(|s| s.as_str()) == Some("manifest-parity") {
+        if args.len() > 2 {
+            eprintln!("pblang manifest-parity: expected at most one [path] argument");
+            std::process::exit(1);
+        }
+        let start = args
+            .get(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let man_dir = pblang_pm::find_manifest_dir(&start).unwrap_or_else(|| {
+            eprintln!(
+                "pblang manifest-parity: could not find pblang.toml from '{}'",
+                start.display()
+            );
+            std::process::exit(1);
+        });
+        let manifest_path = man_dir.join("pblang.toml");
+        let report = run_manifest_parity_check(&manifest_path).unwrap_or_else(|e| {
+            eprintln!("pblang manifest-parity: {}", e);
+            std::process::exit(1);
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
+        );
+        if !report
+            .get("parity_ok")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {

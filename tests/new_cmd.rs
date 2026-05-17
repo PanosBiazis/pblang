@@ -146,6 +146,127 @@ fn lock_strict_manifest_validator_rejects_non_semver_version() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn lock_strict_manifest_validator_can_be_scoped_to_other_commands() {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_lock_strict_manifest_scoped");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(
+        tmp.join("pblang.toml"),
+        "[package]\nname = \"demo\"\nversion = \"1\"\n",
+    )
+    .expect("write manifest");
+
+    let output = Command::new(&bin)
+        .arg("--lock")
+        .arg(&tmp)
+        .env("PBLANG_STRICT_MANIFEST_VALIDATOR", "1")
+        .env("PBLANG_STRICT_MANIFEST_VALIDATOR_COMMANDS", "pack,bundle")
+        .output()
+        .expect("run pblang --lock with scoped strict validator");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "--lock should succeed when strict validation is scoped away from --lock: {}",
+        stderr
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn manifest_parity_valid_manifest_succeeds() {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_manifest_parity_ok");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(
+        tmp.join("pblang.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.sapp\"\n",
+    )
+    .expect("write manifest");
+
+    let output = Command::new(&bin)
+        .arg("manifest-parity")
+        .arg(&tmp)
+        .output()
+        .expect("run pblang manifest-parity");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "manifest-parity should succeed: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("\"parity_ok\": true"),
+        "expected parity_ok=true report, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn manifest_parity_invalid_manifest_fails() {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_manifest_parity_bad");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(
+        tmp.join("pblang.toml"),
+        "[package]\nname = \"demo\"\nversion = \"bad\"\n",
+    )
+    .expect("write manifest");
+
+    let output = Command::new(&bin)
+        .arg("manifest-parity")
+        .arg(&tmp)
+        .output()
+        .expect("run pblang manifest-parity bad");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "manifest-parity should fail for invalid manifest"
+    );
+    assert!(
+        stdout.contains("\"parity_ok\": false"),
+        "expected parity_ok=false report, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn manifest_parity_dependency_shapes_match() {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_manifest_parity_deps_ok");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::write(
+        tmp.join("pblang.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\n\"@scope/pkg\" = \"1.2.3\"\nlocal_dep = { path = \"vendor/local_dep\" }\ngit_dep = { git = \"https://example.com/repo.git\", rev = \"abc123\" }\n",
+    )
+    .expect("write manifest");
+
+    let output = Command::new(&bin)
+        .arg("manifest-parity")
+        .arg(&tmp)
+        .output()
+        .expect("run pblang manifest-parity deps");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "manifest-parity deps should succeed: stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("\"parity_ok\": true"),
+        "expected parity_ok=true for dependency shape parity, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn pick_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port probe");
     listener.local_addr().expect("probe local addr").port()
