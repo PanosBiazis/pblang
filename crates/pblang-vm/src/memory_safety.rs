@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
 
 /// Represents a unique identifier for each memory location
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,7 +181,7 @@ pub struct MemoryTracker {
     inner: Rc<RefCell<TrackerInner>>,
     /// Global state retained for backward compatibility with any external
     /// code that might read `global_state` (not used internally anymore).
-    global_state: Arc<RwLock<GlobalMemoryState>>,
+    global_state: Rc<RefCell<GlobalMemoryState>>,
 }
 
 #[derive(Debug, Default)]
@@ -220,7 +219,7 @@ impl MemoryTracker {
         };
         Self {
             inner: Rc::new(RefCell::new(inner)),
-            global_state: Arc::new(RwLock::new(GlobalMemoryState::default())),
+            global_state: Rc::new(RefCell::new(GlobalMemoryState::default())),
         }
     }
 
@@ -327,10 +326,7 @@ impl MemoryTracker {
 
         // Mirror into global_state for backward compatibility.
         {
-            let mut global = self
-                .global_state
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut global = self.global_state.borrow_mut();
             global.all_locations.insert(
                 memory_id,
                 MemoryLocation {
@@ -656,10 +652,7 @@ impl MemoryTracker {
 
         // Mirror into global_state for backward compatibility
         {
-            let mut global = self
-                .global_state
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut global = self.global_state.borrow_mut();
             if let Some(loc) = global.all_locations.get_mut(&memory_id) {
                 loc.value = new_value;
             }
@@ -697,10 +690,7 @@ impl MemoryTracker {
 
         // Mirror into global_state
         {
-            let mut global = self
-                .global_state
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut global = self.global_state.borrow_mut();
             global.all_locations.remove(&memory_id);
             global.ref_counts.remove(&memory_id);
         }
@@ -715,10 +705,7 @@ impl MemoryTracker {
     /// Get memory safety statistics for debugging.
     pub fn get_stats(&self) -> MemorySafetyStats {
         let inner = self.inner.borrow();
-        let global = self
-            .global_state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let global = self.global_state.borrow();
         MemorySafetyStats {
             total_locations: inner.owners.len(),
             active_borrows: inner.borrows.values().map(|v| v.len()).sum(),
@@ -887,6 +874,25 @@ pub struct MemorySafetyStats {
 /// Macro for safe memory operations. Converts `MemorySafetyError` into a
 /// `RuntimeError` with context. This replaces the previous version that
 /// called the non-existent `RuntimeError::new`.
+#[macro_export]
+macro_rules! safe_memory_op {
+    ($tracker:expr, $op:expr) => {{
+        let result = $op;
+        match result {
+            Ok(value) => value,
+            Err(e) => {
+                return Err(pblang_ir::RuntimeError {
+                    message: format!("Memory safety violation: {}", e),
+                    span: None,
+                    source_name: None,
+                    source: None,
+                    stack: vec![],
+                });
+            }
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,23 +914,4 @@ mod tests {
         let err = tracker.get(id).unwrap_err();
         assert!(matches!(err, MemorySafetyError::UseAfterMove(_)));
     }
-}
-
-#[macro_export]
-macro_rules! safe_memory_op {
-    ($tracker:expr, $op:expr) => {{
-        let result = $op;
-        match result {
-            Ok(value) => value,
-            Err(e) => {
-                return Err(pblang_ir::RuntimeError {
-                    message: format!("Memory safety violation: {}", e),
-                    span: None,
-                    source_name: None,
-                    source: None,
-                    stack: vec![],
-                });
-            }
-        }
-    }};
 }

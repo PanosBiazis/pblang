@@ -1,4 +1,4 @@
-use pblang_core::{parse, ExprKind, StmtKind};
+use pblang_core::{parse, parse_strict, ExprKind, StmtKind};
 
 #[test]
 fn parse_print_add() {
@@ -110,4 +110,12 @@ fn parse_if_while_for_shapes() {
         }
         _ => panic!("expected for"),
     }
+}
+
+#[test]
+fn parse_strict_rejects_invalid_source() {
+    assert!(
+        parse_strict("let x = ;").is_err(),
+        "strict parser should reject malformed input"
+    );
 }

@@ -25,8 +25,10 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub base_url: String,
+    #[serde(skip_serializing)]
     pub api_key: Option<String>,
     pub model_default: Option<String>,
+    #[serde(skip_serializing)]
     pub headers: Option<HashMap<String, String>>,
 }
 
@@ -649,11 +651,7 @@ pub fn embed(
         format!("{}/embeddings", provider.base_url.trim_end_matches('/'))
     };
 
-    let body = if provider_name == "ollama" {
-        serde_json::json!({"model": model, "input": text})
-    } else {
-        serde_json::json!({"model": model, "input": text})
-    };
+    let body = serde_json::json!({"model": model, "input": text});
 
     let result = http_post_json(&url, body, &headers, DEFAULT_TIMEOUT)?;
 

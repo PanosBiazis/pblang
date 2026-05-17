@@ -101,8 +101,10 @@ fn spawn_not_allowed_when_sandboxed() {
     chunk.source = Some(Rc::new(
         "let h = spawn(fn() { return 1; }); print join(h);".to_string(),
     ));
-    let mut config = StdlibConfig::default();
-    config.spawn = false;
+    let config = StdlibConfig {
+        spawn: false,
+        ..StdlibConfig::default()
+    };
     let mut vm = VM::with_stdlib(config);
     let result = vm.run_collect(chunk);
     let err = result.expect_err("expected spawn not allowed");

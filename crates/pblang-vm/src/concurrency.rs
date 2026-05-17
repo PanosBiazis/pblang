@@ -2,7 +2,9 @@
 // Implements safe concurrency primitives similar to Go, Rust, and Kotlin
 
 use pblang_ir::Value;
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -400,6 +402,10 @@ impl<T> SafeChannel<T> {
             .map_err(|e| format!("Channel len lock failed: {}", e))?;
         Ok(queue.len())
     }
+
+    pub fn is_empty(&self) -> Result<bool, String> {
+        self.len().map(|len| len == 0)
+    }
 }
 
 impl<T> std::fmt::Debug for SafeChannel<T> {
@@ -419,9 +425,12 @@ impl<T> std::fmt::Debug for SafeChannel<T> {
 ///
 /// Workers wait on a condition variable associated with the work queue
 /// mutex, which avoids both busy-waiting and the lost-wakeup problem.
+type Job = Box<dyn FnOnce() + Send>;
+type JobQueue = Arc<Mutex<VecDeque<Job>>>;
+
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    work_queue: Arc<Mutex<VecDeque<Box<dyn FnOnce() + Send>>>>,
+    work_queue: JobQueue,
     idle_workers: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
     #[allow(dead_code)]
@@ -493,7 +502,7 @@ impl ThreadPool {
 
     fn worker_loop(
         _id: usize,
-        work_queue: Arc<Mutex<VecDeque<Box<dyn FnOnce() + Send>>>>,
+        work_queue: JobQueue,
         idle_workers: Arc<Condvar>,
         shutdown: Arc<AtomicBool>,
     ) {
@@ -739,14 +748,14 @@ impl std::fmt::Debug for Barrier {
 /// Once flag for one-time initialization
 pub struct Once {
     initialized: AtomicBool,
-    value: Arc<Mutex<Option<Value>>>,
+    value: Rc<RefCell<Option<Value>>>,
 }
 
 impl Once {
     pub fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
-            value: Arc::new(Mutex::new(None)),
+            value: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -760,11 +769,7 @@ impl Once {
             .is_ok()
         {
             let value = f();
-            let mut guard = self
-                .value
-                .lock()
-                .map_err(|e| format!("Once lock failed: {}", e))?;
-            *guard = Some(value);
+            self.value.replace(Some(value));
             Ok(())
         } else {
             Err("Once already called".to_string())
@@ -772,7 +777,7 @@ impl Once {
     }
 
     pub fn get(&self) -> Option<Value> {
-        self.value.lock().ok().and_then(|guard| guard.clone())
+        self.value.borrow().clone()
     }
 }
 

@@ -1858,6 +1858,58 @@ fn polyglot_exec_python_pass() {
 }
 
 #[test]
+fn selfhost_frontend_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/selfhost_frontend_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read selfhost_frontend_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "selfhost_frontend_pass",
+        "expected selfhost_frontend_pass, got: {:?}", out
+    );
+}
+
+#[test]
+fn manifest_validate_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/manifest_validate_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read manifest_validate_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "manifest_validate_pass",
+        "expected manifest_validate_pass, got: {:?}", out
+    );
+}
+
+#[test]
+fn onnx_infer_bridge_returns_structured_result() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/onnx_infer_bridge_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read onnx_infer_bridge_test.sapp");
+    let cfg = StdlibConfig {
+        exec: true,
+        ..StdlibConfig::default()
+    };
+    let out = run_collect_with_config(cfg, &src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "onnx_infer_bridge_pass",
+        "expected onnx_infer_bridge_pass, got: {:?}", out
+    );
+}
+
+#[test]
 fn array_map_functional_pass() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/semantics/array_map_functional_test.sapp");
