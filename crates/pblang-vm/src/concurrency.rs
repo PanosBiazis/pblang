@@ -497,6 +497,10 @@ impl ThreadPool {
         idle_workers: Arc<Condvar>,
         shutdown: Arc<AtomicBool>,
     ) {
+        fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+            m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
         loop {
             // Acquire the queue lock and try to get work.
             // If no work is available, wait on the condition variable
@@ -504,7 +508,7 @@ impl ThreadPool {
             // the lost-wakeup problem because we hold the queue lock
             // while checking for both work and shutdown.
             let work = {
-                let mut queue = work_queue.lock().unwrap();
+                let mut queue = lock_recover(&work_queue);
                 loop {
                     if let Some(work) = queue.pop_front() {
                         break Some(work);
@@ -514,10 +518,13 @@ impl ThreadPool {
                     }
                     // Release the lock and wait. When we wake up,
                     // we re-check for work and shutdown.
-                    let result = idle_workers
-                        .wait_timeout(queue, Duration::from_secs(1))
-                        .unwrap();
-                    queue = result.0;
+                    match idle_workers.wait_timeout(queue, Duration::from_secs(1)) {
+                        Ok((next_queue, _)) => queue = next_queue,
+                        Err(poisoned) => {
+                            let (next_queue, _) = poisoned.into_inner();
+                            queue = next_queue;
+                        }
+                    }
                 }
             };
 
@@ -797,12 +804,15 @@ pub struct Timer {
 }
 
 impl Timer {
-    pub fn new(duration: Duration) -> Self {
-        let deadline = SystemTime::now()
+    fn now_millis() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + duration.as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    pub fn new(duration: Duration) -> Self {
+        let deadline = Self::now_millis().saturating_add(duration.as_millis() as u64);
 
         Self {
             deadline: Arc::new(AtomicU64::new(deadline)),
@@ -836,10 +846,7 @@ impl Timer {
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = Self::now_millis();
         now >= self.deadline.load(Ordering::SeqCst)
     }
 
@@ -856,10 +863,7 @@ impl Timer {
     /// Returns the remaining duration until the timer expires.
     /// Returns a zero duration if the timer has already expired.
     pub fn remaining(&self) -> Duration {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = Self::now_millis();
         let deadline_ms = self.deadline.load(Ordering::SeqCst);
         Duration::from_millis(deadline_ms.saturating_sub(now))
     }
@@ -926,9 +930,41 @@ impl std::fmt::Debug for ConcurrencyStats {
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::mpsc;
+use pblang_ir::chunk::{OpCode, Span};
 
 /// Spawn/join result channel: Ok = JSON return value, Err = error message.
-pub type SpawnJoinReceiver = mpsc::Receiver<Result<String, String>>;
+pub type SpawnJoinReceiver = mpsc::Receiver<Result<SpawnWireValue, String>>;
+
+/// Send-safe value representation used by spawn/join between VM threads.
+#[derive(Clone, Debug)]
+pub enum SpawnWireValue {
+    Nil,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<SpawnWireValue>),
+    Map(HashMap<String, SpawnWireValue>),
+    Function(Box<SpawnWireFunction>),
+    Closure(Box<SpawnWireClosure>),
+}
+
+#[derive(Clone, Debug)]
+pub struct SpawnWireFunction {
+    pub name: Option<String>,
+    pub arity: usize,
+    pub min_arity: usize,
+    pub defaults: Vec<SpawnWireValue>,
+    pub is_vararg: bool,
+    pub instructions: Vec<OpCode>,
+    pub spans: Vec<Span>,
+    pub constants: Vec<SpawnWireValue>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpawnWireClosure {
+    pub function: SpawnWireFunction,
+    pub upvalues: Vec<SpawnWireValue>,
+}
 
 /// Buffered channel backing store for VM builtins (values are JSON strings).
 #[derive(Clone)]

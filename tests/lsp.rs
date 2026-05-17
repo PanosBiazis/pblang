@@ -135,6 +135,12 @@ fn lsp_initialize_returns_completion_capability() {
         "expected completionProvider in initialize response, got:\n{}",
         stdout
     );
+    assert!(
+        stdout.contains(&format!(r#""version":"{}""#, env!("CARGO_PKG_VERSION"))),
+        "expected initialize response to include package version {}, got:\n{}",
+        env!("CARGO_PKG_VERSION"),
+        stdout
+    );
 }
 
 #[test]
@@ -235,6 +241,36 @@ fn lsp_definition_returns_location() {
     assert!(
         stdout.contains("file:///def.sapp") && stdout.contains("\"line\":0"),
         "expected definition Location on declaration line 0, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn lsp_completion_reflects_did_change_latest_text() {
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    let inited = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+    let did_open = lsp_did_open_json(
+        "file:///change.sapp",
+        "fn old_name() { return 1; }\nlet y = old_name();\n",
+    );
+    let did_change = r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///change.sapp","version":2},"contentChanges":[{"text":"fn new_name() { return 2; }\nlet y = new_name();\n"}]}}"#;
+    let comp = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///change.sapp"},"position":{"line":1,"character":12}}}"#;
+    let shutdown = r#"{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}"#;
+    let exit_n = r#"{"jsonrpc":"2.0","method":"exit","params":null}"#;
+
+    let stdout = run_lsp_exchange(&[
+        (init, Some(1)),
+        (inited, None),
+        (&did_open, None),
+        (did_change, None),
+        (comp, Some(2)),
+        (shutdown, Some(3)),
+        (exit_n, None),
+    ]);
+
+    assert!(
+        stdout.contains("new_name"),
+        "expected completion to use didChange latest document text, got:\n{}",
         stdout
     );
 }

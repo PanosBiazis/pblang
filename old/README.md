@@ -1,49 +1,49 @@
-# Biapryx
+# pblang (legacy snapshot)
 
-A scripting language implemented in Rust: parser, IR, bytecode VM, type checker, package manager, LSP, FFI, and graphics. Suitable for embedded scripting and standalone use, with a growing stdlib and tooling.
+Legacy quick context for pblang. This file is kept for historical reference; use the top-level `README.md` for the canonical, up-to-date guide.
 
 ## Quick start
 
 ```bash
 cargo build --release
-./target/release/biapryx run path/to/script.biapryx
+./target/release/pblang run path/to/script.sapp
 ```
 
-From a package directory (with `biapryx.toml`):
+From a package directory (with `pblang.toml`):
 
 ```bash
-biapryx install    # resolve dependencies, generate biapryx.lock
-biapryx run        # run package entry (main.biapryx or [package].entry)
-biapryx test       # run tests/*.biapryx and tests/*.biapryx
+pblang install    # resolve dependencies, generate pblang.lock
+pblang run        # run package entry (main.sapp or [package].entry)
+pblang test       # run tests/*.sap and tests/*.sapp
 ```
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
-| **biapryx-core** | Parser, lexer, AST |
-| **biapryx-ir** | Intermediate representation |
-| **biapryx-vm** | Bytecode VM (chunk, execution, builtins) |
-| **biapryx-compiler** | Compilation pipeline |
-| **biapryx-typeck** | Type checking |
-| **biapryx-ffi** | FFI layer |
-| **biapryx-pm** | Package manager (lockfile, registry, git deps) |
-| **biapryx-lsp** | Language server (tower-lsp) |
-| **biapryx-graphics** | Graphics (SDL2 / minifb), `.biapryx` examples |
+| **pblang-core** | Parser, lexer, AST |
+| **pblang-ir** | Intermediate representation |
+| **pblang-vm** | Bytecode VM (chunk, execution, builtins) |
+| **pblang-compiler** | Compilation pipeline |
+| **pblang-typeck** | Type checking |
+| **pblang-ffi** | FFI layer |
+| **pblang-pm** | Package manager (lockfile, registry, git deps) |
+| **pblang-lsp** | Language server (tower-lsp) |
+| **pblang-graphics** | Graphics (SDL2 / minifb), `.sapp` examples |
 
-Root `src/main.rs` is the CLI entrypoint. Config: **biapryx.toml** (workspace/package), **stdlib/** as path dependency.
+Root `src/main.rs` is the CLI entrypoint. Config: **pblang.toml** (workspace/package), **stdlib/** as path dependency.
 
 ## Commands (summary)
 
-- `biapryx run [file|dir]` — Execute script or package
-- `biapryx init` — Create biapryx.toml
-- `biapryx test [dir]` — Run test files
-- `biapryx build` — Lockfile + typecheck package entry
-- `biapryx fmt` — Format source (indent, operator/comma spacing, optional line length)
-- `biapryx lint` — Parse + typecheck
-- `biapryx --doc [--html]` — Module docs (exports, polyglot blocks)
-- `biapryx --lock` / `install` / `pack` / `bundle` / `publish` — Package and registry workflows
-- `biapryx --dump-bytecode <file>` — Bytecode disassembly
+- `pblang run [file|dir]` — Execute script or package
+- `pblang init` — Create `pblang.toml`
+- `pblang test [dir]` — Run test files
+- `pblang build` — Lockfile + typecheck package entry
+- `pblang fmt` — Format source
+- `pblang lint` — Parse + typecheck
+- `pblang --doc [--html]` — Module docs (exports, polyglot blocks)
+- `pblang --lock` / `install` / `pack` / `bundle` / `publish` — Package and registry workflows
+- `pblang --dump-bytecode <file>` — Bytecode disassembly
 
 ## Tests
 
@@ -61,7 +61,7 @@ Notable suites: `smoke`, `semantics`, `golden`, `sandbox`, `threads`, `modules`,
 - [docs/Language_Semantics.md](docs/Language_Semantics.md) — Syntax, semantics, errors
 - [docs/Embedding.md](docs/Embedding.md) — Embedding API (VmHost, capabilities, limits)
 - [docs/Report.md](docs/Report.md) — Progress report and history
-- [docs/Help.md](docs/Help.md) — Active backlog and task cards
-- [docs/Future_plans.md](docs/Future_plans.md) — Roadmap and vision
+- [docs/Help.md](docs/Help.md) — operator guidance
+- [docs/Tasks.md](docs/Tasks.md) — active backlog
 
 For feeding context into external tools (e.g. Perplexity), see [PERPLEXITY_CONTEXT.md](PERPLEXITY_CONTEXT.md).

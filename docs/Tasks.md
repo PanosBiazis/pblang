@@ -9,7 +9,7 @@ steps, stable core.
 **Current priority order:**
 TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) → LSP ✅ → Cranelift JIT ✅ → Registry ✅ → RE ✅ → Type System ✅ → Spec → Self-Hosting ✅ (tokenizer, parser, type_checker, codegen complete) → Editor → Framework/OS
 
-**Current status**: 144/147 semantics tests passing, 0 failing, 3 ignored (`match_guard_pass`, `thread_pool_stdlib_pass`, `os_env_set_pass`)
+**Current status**: 147/149 semantics tests passing, 0 failing, 2 ignored (`match_guard_pass`, `os_env_set_pass`)
 
 ---
 
@@ -22,6 +22,11 @@ TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) 
 - **N2-beta**: `crates/pblang-cranelift` Cranelift JIT — fibonacci(20)=6765 in native code, benchmark harness
 - **M4-gamma**: Registry 401-refresh flow verified (test passes)
 - **R3-gamma**: CFG dump tests verified (`pblang --cfg` works end-to-end)
+- **M4-gamma**: Hosted publish flow now has real 401→refresh→retry HTTP unit test in `pblang-pm`
+- **T5-delta**: `stdlib/thread.sapp` thread-pool now wraps task messages, preserving `nil` tasks and avoiding fixed-count receive hangs
+- **W4-gamma**: `stdlib/websocket.sapp` now supports parse/write for short + 16-bit + 64-bit frame lengths; added masked roundtrip + extended-length tests
+- **W4-delta**: Added websocket stream utilities `parse_frames`, `reassemble_fragments`, `parse_message` with continuation-frame (`FIN=0`, opcode `0`) reassembly test
+- **W4-epsilon**: VM builtins `websocket_write_frame` / `websocket_parse_frame` now support extended lengths and expose payload/frame metadata; fixed write builtin arity contract to 2 args
 - **New stdlib**: `logger.sapp`, `assert.sapp`, `pipe.sapp` (chain, compose, memoize, map/filter/reduce)
 - **Typechecker**: nil-safety warnings, division-by-zero detection, better type mismatch messages
 - **parse_with_polyglot**: now prefers strict `parse()` over recovery for cleaner error messages
@@ -90,9 +95,10 @@ TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) 
 
 ### M4 — Registry
 
-**M4-gamma** — Registry token refresh + publish retry (already in vm, needs test)
-- Verify `publish_package` 401-refresh flow works end-to-end
-- Add hosted registry documentation
+**M4-gamma** — Registry token refresh + publish retry ✅
+- End-to-end retry path verified with local HTTP test server:
+  first `/publish` returns 401, `/auth/refresh` returns new token, second `/publish` succeeds.
+- Hosted registry docs remain incremental work as API surface expands.
 
 
 ---

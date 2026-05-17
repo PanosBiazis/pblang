@@ -1,8 +1,8 @@
-# pblang (Biapryx) — Current Status
+# pblang — Current Status
 
 **Last Updated**: 2026  
 **Status**: v0.5.6 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 102 Stdlib Modules + 4 Self-Hosting Compiler Modules + Bit-Level Optimizations
-**Test Suite**: semantics suite passing with known ignored cases (match-guard parser recovery limitation and environment/thread policy tests)
+**Test Suite**: semantics suite passing with known ignored cases (match-guard parser recovery limitation and `env_set` safety policy)
 
 ---
 
@@ -137,10 +137,11 @@ Canonical status is the top summary and `Test Results` section in this file. Old
 
 ```
 cargo test --test semantics
-test result: ok. 144 passed; 0 failed; 3 ignored
+test result: ok. 147 passed; 0 failed; 2 ignored
 ```
 
-The 1 ignored test (`match_guard_pass`) documents a chumsky 0.8 parser limitation:
+Ignored tests are currently:
+- `match_guard_pass` — documents a chumsky 0.8 parser limitation:
 - Match arm guards with comparison operators and body separator `:` conflict because  
   the method-call postfix `obj:method()` consumes `:` before the separator parser runs.
 - The `parse_recovery` mode then skips any alternative separator we add.
@@ -148,6 +149,7 @@ The 1 ignored test (`match_guard_pass`) documents a chumsky 0.8 parser limitatio
   expression to use a dedicated `guard_expr` variant without method-call postfix.
 - **Workaround**: Use `case n then body` (tilde `#` or `then` keyword) as separator,
   defined at the top-level expression scope. Or wrap guards in helper functions.
+- `os_env_set_pass` — kept ignored because `env_set()` stays disabled in v0.5 security hardening (`std::env::set_var` is unsound in multi-threaded programs).
 
 ## 🚀 Key Improvements Since v0.4
 
@@ -168,6 +170,9 @@ The 1 ignored test (`match_guard_pass`) documents a chumsky 0.8 parser limitatio
 13. **stdlib/math.sapp** — Added `util.clamp`, `util.lerp`, `util.smoothstep`
 14. **stdlib/http_server.sapp** — Added `sse_event`, `res_sse_headers`
 15. **stdlib/thread.sapp** — Fixed `channel_close_wrapper`/`channel_is_closed_wrapper`
+16. **spawn capture reliability** — `spawn(...)` now snapshots open upvalues from the parent VM stack at spawn time, so common channel-capture closures work without unsafe transfer semantics
+17. **upvalue crash hardening** — stale/open upvalue access now uses bounds-safe fallback behavior (`nil`) instead of out-of-bounds panic in close/get/set paths
+18. **spawn/join closure wire format** — thread handoff now supports transferring function/closure values safely (when captures are transferable), unblocking parallel worker closures in `thread_pool`
 
 ## 🔴 Critical Gaps (Production Blockers)
 
@@ -186,9 +191,11 @@ The 1 ignored test (`match_guard_pass`) documents a chumsky 0.8 parser limitatio
 4. **nd.sapp linear algebra** (G3-gamma) — Matrix inverse, solve
 5. **Cranelift JIT** (N2-beta) — Native code compilation for hot paths
 
-**Last Updated**: March 2026  
-**Status**: v0.5.2 — Production-Ready Core with TLS + Security Hardening + Concurrency + Memory Safety + 50+ stdlib modules  
-**Maturity Level**: v0.5.2 - "Powerful Prototype / Early-Stage Platform"
+## Archived snapshot (legacy notes below)
+
+The sections below are preserved for historical traceability and may include
+older milestone wording or counts. Use the top summary and `Test Results`
+section as canonical current status.
 
 ---
 
@@ -206,7 +213,7 @@ pblang has evolved from a promising prototype into a robust, production-quality 
 | Core VM | ✅ Stable | ⭐⭐⭐⭐⭐ | Bytecode execution, GC, sandboxing production-ready |
 | Package Manager | ✅ Functional | ⭐⭐⭐⭐ | Local & remote registry working, lockfile v2 ready |
 | Stdlib | ✅ Comprehensive | ⭐⭐⭐⭐ | 20+ modules covering web, AI, quantum, crypto |
-| Semantics Tests | ✅ Passing | ⭐⭐⭐⭐⭐ | 144/147 tests passing (3 ignored) |
+| Semantics Tests | ✅ Passing | ⭐⭐⭐⭐⭐ | 147/149 tests passing (2 ignored) |
 | Thread Safety | ✅ Working | ⭐⭐⭐⭐ | VM-per-thread model with channels |
 | Native Executables | ✅ Self-extract | ⭐⭐⭐ | `bundle --self-extract` embeds runtime; E2E on Linux |
 | LSP Server | ✅ Unified | ⭐⭐⭐ | tower-lsp via `pblang lsp`; diagnostics, completion, hover, goto-def, workspace symbols |
@@ -234,7 +241,7 @@ The VM core is stable and battle-tested:
   - Local imports: `import "./lib.sapp"`
   - Package imports: `import "stdlib:thread.sapp"`
   - Export system with `export` keyword
-- **Testing**: 144/147 semantics tests passing (3 ignored)
+- **Testing**: 147/149 semantics tests passing (2 ignored)
 
 **Files**:
 - `crates/pblang-vm/src/vm.rs` - Core VM (stable)
@@ -644,153 +651,6 @@ cargo run -- doc examples/
 
 ---
 
-**Last Updated**: March 2026  
-**Next Review**: April 2026  
-**Status**: v0.5.2 — Active Development (Concurrency + Memory Safety + Async/Await)
-
-Here is a full breakdown of your BiaPryx project and the last commit.
-
-Last Commit — c41faebf
-This commit is titled "Initial commit" and was pushed on April 4, 2026 at 09:30 UTC by you (PanosBiazis). It is a very large commit: +13,285 additions / −4,688 deletions across 30 files, totalling 17,973 changes. It was essentially a major restructuring — most files were renamed (moved into crate-level paths), and several new Cargo.toml manifests were added for freshly split crates (pblang-compiler, pblang-core, pblang-ffi).
-
-Key changes in this commit:
-
-Workspace refactor: Crates moved/renamed under crates/ (e.g. pblang-core, pblang-compiler, pblang-ffi got new Cargo.toml files).
-
-crates/pblang-core/src/parser.rs: Biggest single change — 2,965 line diff (1,506 additions, 1,459 deletions), indicating a major parser rewrite or refactor.
-
-crates/pblang-pm/src/lib.rs: Package manager got a 359-line change (208 additions, 151 deletions).
-
-.vscode/launch.json: Debug configurations were heavily updated (129 additions, 187 deletions).
-
-.cursor/worktrees.json: New file added for Cursor editor worktree support.
-
-PERPLEXITY_CONTEXT.md and README.md: Both updated with minor content changes.
-
-biapryx.toml: Renamed from a previous config, small change.
-
-Project Overview — BiaPryx
-Biapryx is a full programming language implementation written in Rust, designed for both embedded scripting (sandboxed, capability-controlled) and standalone general-purpose use. It is a Cargo workspace with 9+ specialized crates.
-
-Workspace Crates
-Crate	Role
-pblang-core	Parser, lexer, AST
-pblang-ir	Intermediate representation
-pblang-vm	Bytecode VM (stack-based, execution, builtins)
-pblang-compiler	Compilation pipeline
-pblang-typeck	Type checking (prelude, generics, fn-literal bodies)
-pblang-ffi	Foreign Function Interface (C ABI)
-pblang-pm	Package manager (lockfile, registry, git deps)
-pblang-lsp	Language server (tower-lsp)
-pblang-graphics	Graphics backend (SDL2 / minifb)
-Current Status (v0.5)
-The project is at v0.5 — "Powerful Prototype / Early-Stage Platform" as of March 2026. The core VM, package manager, and CLI are production-quality, while the type system and native executable bundler are still in early stages.
-
-✅ Core VM: Bytecode execution, GC, capability-based sandboxing — 5/5 stars, production-ready.
-
-✅ Package Manager: Local & remote registry, lockfile v2, SHA256 verification — 4/5 stars.
-
-✅ Stdlib: 20+ modules covering thread, http, json, crypto, db, tensor, quantum, websocket, graphics, and more.
-
-✅ Semantics Tests: 144/147 passing (3 ignored).
-
-🟡 Native Executables: Self-extract stub exists, but actual tarball extraction is not yet implemented (~70% done).
-
-⚠️ TLS/HTTPS: Design complete, rustls integration pending (~30% done).
-
-⚠️ Type System: Crate exists but essentially a stub — no inference or checking yet.
-
-CLI Commands
-The root src/main.rs provides the full CLI. Key commands:
-
-biapryx run [file|dir] — Execute script or package
-
-biapryx test — Run test suite
-
-biapryx fmt / lint — Format and lint source
-
-biapryx install / publish / search — Package management
-
-biapryx --doc [--html] — Generate module documentation
-
-biapryx --dump-bytecode — Bytecode disassembly
-
-Docs Directory
-The docs/ folder is very extensive — 29 documentation files. Here are the most important ones:
-
-Doc File	Purpose
-CURRENT_STATUS.md	Full status by component, next steps, deployment readiness
-Future_plans.md	Long-term roadmap and vision (103 KB — very large)
-ROADMAP.md	Milestone roadmap
-Tooling.md	CLI, stdlib APIs, registry, bytecode reference (32 KB)
-Report.md	Progress report and history (158 KB — the largest doc)
-Tasks.md	Active backlog and task cards
-Language_Semantics.md	Syntax and semantics
-Embedding.md	Embedding API (VmHost, capabilities, limits)
-TLS_IMPLEMENTATION_GUIDE.md	Detailed TLS/HTTPS guide (22 KB)
-Registry_MVP.md	Package registry design
-Threads.md	Concurrency model
-PERPLEXITY_CURSOR_BRIDGE.md	AI tooling bridge notes
-Recommended Next Actions (per docs)
-Based on CURRENT_STATUS.md, the top priorities are:
-
-Weeks 1–2: Complete native executable self-extraction (pblang-stub tarball logic + platform binaries)
-
-Weeks 3–4: Implement TLS/HTTPS via rustls integration
-
-Weeks 5+: Expand LSP, improve error messages, add tensor ops, document embedding API
-
-Prepared using GPT-5.4 Thinking
-
-
-
-Summary
-
-I successfully completed the Q3-delta task for the pblang programming language project using extensive multi-agent coordination via MCP server tools. Here's what was accomplished:
-
-### ✅ **Q3-delta Implementation Complete**
-
-**Quantum Noise Model (`stdlib/quantum_sim.sapp`):**
-- Added `y_gate(state, q)` — Y Pauli gate (bit flip + phase flip)
-- Added `z_gate(state, q)` — Z Pauli gate (phase flip on |1⟩ component)
-- Added `add_depolarizing_noise(circ, p)` — Depolarizing noise model with random X/Y/Z errors
-
-**Bloch Sphere Visualization (`stdlib/quantum_viz.sapp`):**
-- `bloch_angles(state_2d)` — Converts state vector to Bloch sphere angles (θ, φ)
-- `bloch_to_svg(theta, phi)` — Pure Sapphire SVG generation with Taylor series math
-
-**Testing:**
-- Created comprehensive test suite in `tests/semantics/quantum_noise_test.sapp`
-- Added test harness `quantum_noise_depolarizing_pass` to `tests/semantics.rs`
-
-**Documentation:**
-- Updated `docs/Tooling.md` with Q3-delta section
-- Updated `docs/Tasks.md` to mark Q3-delta as complete
-- Updated `docs/Report.md` with progress details
-
-### 🔧 **Bug Fixes**
-- Fixed tensor.sapp `reshape` function signature (arity mismatch from previous A4-gamma task)
-- `tensor_ops_pass` test now passes
-
-### 🤝 **Multi-Agent Coordination**
-Utilized MCP server tools throughout:
-- `agent_fan_out` — Broadcast tasks to specialized agents
-- `agent_send` — Coordinated via topics (task-coordination, quantum-verification, etc.)
-- `spawn_agent` — Delegated documentation updates and code fixes
-- `ask_agents` — Requested verification assistance
-- `agent_inbox`/`agent_recent` — Monitored agent communications
-
-### ⏳ **Current Status**
-- **143/143 semantics tests:** ✅ PASSING
-- **Concurrency module:** ✅ COMPLETE (SafeMutex, SafeRwLock, SafeChannel, ThreadPool, Barrier, Once, Timer)
-- **Memory safety module:** ✅ COMPLETE (borrow checking, lifetime scoping, use-after-move, Drop cleanup)
-- **Async/await module:** ✅ COMPLETE (async_spawn, await, await_all, await_any, map, then)
-
-### 📋 **Next Steps**
-According to priority order:
-1. **E5-gamma** — Self-extracting binary enhancements (highest priority production blocker)
-2. **G3-gamma** — Matrix inverse & solve via Cramer's rule in `stdlib/nd.sapp`
-3. **L3-delta** — LSP semantic tokens and type-aware features
-4. **N2-beta** — Cranelift JIT for hot-path native compilation
-
-The multi-agent coordination system proved highly effective for parallel implementation, verification requests, and documentation updates. All agents successfully communicated via the bus and contributed to task completion.
+**Last Updated**: 2026  
+**Next Review**: rolling  
+**Status**: Historical snapshot section ends here; use the top summary as canonical.

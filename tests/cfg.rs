@@ -14,6 +14,16 @@ fn pblang_bin() -> std::path::PathBuf {
     p
 }
 
+fn require_pblang_bin() -> std::path::PathBuf {
+    let bin = pblang_bin();
+    assert!(
+        bin.exists(),
+        "pblang binary not found at {}. Build it first with `cargo build --bin pblang`.",
+        bin.display()
+    );
+    bin
+}
+
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -26,9 +36,8 @@ fn ensure_fixture(name: &str, content: &str) -> std::path::PathBuf {
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if !p.exists() {
-        std::fs::write(&p, content).expect("write fixture");
-    }
+    // Always refresh fixture content to avoid stale files masking regressions.
+    std::fs::write(&p, content).expect("write fixture");
     p
 }
 
@@ -45,11 +54,7 @@ if x > 0 {
 print "done";
 "#;
     let fixture = ensure_fixture("cfg_sample.sapp", src);
-    let bin = pblang_bin();
-    if !bin.exists() {
-        eprintln!("Skipping cfg test: pblang binary not found at {:?}", bin);
-        return;
-    }
+    let bin = require_pblang_bin();
 
     let output = Command::new(&bin)
         .arg("--cfg")
@@ -78,11 +83,7 @@ print "done";
 fn cfg_dot_output_is_digraph() {
     let src = "let a = 1;\nif a { print a; }\n";
     let fixture = ensure_fixture("cfg_dot_sample.sapp", src);
-    let bin = pblang_bin();
-    if !bin.exists() {
-        eprintln!("Skipping cfg dot test: pblang binary not found");
-        return;
-    }
+    let bin = require_pblang_bin();
 
     let output = Command::new(&bin)
         .arg("--cfg")
@@ -92,11 +93,17 @@ fn cfg_dot_output_is_digraph() {
         .expect("run pblang --cfg --cfg-dot");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() {
-        assert!(
-            stdout.contains("digraph CFG"),
-            "Expected digraph CFG in DOT output, got: {}",
-            stdout
-        );
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pblang --cfg --cfg-dot failed: stderr={}\nstdout={}",
+        stderr,
+        stdout
+    );
+    assert!(
+        stdout.contains("digraph CFG"),
+        "Expected digraph CFG in DOT output, got: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
 }

@@ -310,6 +310,7 @@ fn seed_builtin_prelude(env: &mut Env) {
     let str_ty = Ty::String;
     let bool_ty = Ty::Bool;
 
+    let fn0 = |ret: Ty| Ty::Fn(vec![], Box::new(ret));
     let fn1 = |ret: Ty| Ty::Fn(vec![any.clone()], Box::new(ret));
     let fn2 = |ret: Ty| Ty::Fn(vec![any.clone(), any.clone()], Box::new(ret));
     let fn2s_n = |ret: Ty| Ty::Fn(vec![str_ty.clone(), num.clone()], Box::new(ret));
@@ -320,6 +321,27 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("str", fn1(str_ty.clone())),
         ("type", fn1(str_ty.clone())),
         ("import", Ty::Fn(vec![str_ty.clone()], Box::new(any.clone()))),
+        // Concurrency builtins used directly by IDE examples/stdlib wrappers.
+        ("spawn", fn1(any.clone())),
+        ("join", fn1(any.clone())),
+        (
+            "channel",
+            Ty::Fn(
+                vec![],
+                Box::new(Ty::Map(Box::new(str_ty.clone()), Box::new(any.clone()))),
+            ),
+        ),
+        ("send", fn2(nil.clone())),
+        ("recv", fn1(any.clone())),
+        // JSON builtins used directly by stdlib/json.sapp and IDE examples.
+        ("json_parse", fn1(any.clone())),
+        ("json_stringify", fn1(str_ty.clone())),
+        ("read_line", fn0(str_ty.clone())),
+        ("parse_number", fn1(any.clone())),
+        ("parse_bool", fn1(any.clone())),
+        ("str_trim", fn1(str_ty.clone())),
+        ("str_split", fn2(Ty::Array(Box::new(str_ty.clone())))),
+        ("str_starts_with", fn2(bool_ty.clone())),
         ("array_push", fn2(nil.clone())),
         ("push", fn2(any.clone())),
         ("array_pop", fn1(any.clone())),
@@ -328,7 +350,9 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("map_keys", fn1(Ty::Array(Box::new(str_ty.clone())))),
         ("map_has", fn2(bool_ty.clone())),
         ("map_remove", fn2(nil.clone())),
-        ("clock", fn1(num.clone())),
+        ("clock", fn0(num.clone())),
+        ("now_iso", fn0(str_ty.clone())),
+        ("num_pow", fn2(num.clone())),
         ("parse", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
         ("compile", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
     ] {
@@ -1233,6 +1257,29 @@ mod tests {
         assert!(
             undeclared.is_empty(),
             "prelude builtins should be known: {:?}",
+            undeclared
+        );
+    }
+
+    #[test]
+    fn test_builtin_prelude_thread_and_json_helpers() {
+        let diags = typecheck_source(
+            r#"
+            let ch = channel();
+            spawn(fn() {
+                send(ch.sender, "hello");
+            });
+            let msg = recv(ch.receiver);
+            print json_stringify(msg);
+            "#,
+        );
+        let undeclared: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("not declared"))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "thread/json builtins should be known: {:?}",
             undeclared
         );
     }

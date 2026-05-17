@@ -327,7 +327,10 @@ impl MemoryTracker {
 
         // Mirror into global_state for backward compatibility.
         {
-            let mut global = self.global_state.write().unwrap();
+            let mut global = self
+                .global_state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             global.all_locations.insert(
                 memory_id,
                 MemoryLocation {
@@ -538,7 +541,10 @@ impl MemoryTracker {
             Some(m) => m,
             None => return Ok(()), // borrow already cleaned up (e.g. lifetime expired)
         };
-        let idx = found_idx.expect("idx must exist if mid found");
+        let idx = match found_idx {
+            Some(i) => i,
+            None => return Ok(()),
+        };
 
         // Remove the borrow entry
         if let Some(borrows) = inner.borrows.get_mut(&mid) {
@@ -650,7 +656,10 @@ impl MemoryTracker {
 
         // Mirror into global_state for backward compatibility
         {
-            let mut global = self.global_state.write().unwrap();
+            let mut global = self
+                .global_state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(loc) = global.all_locations.get_mut(&memory_id) {
                 loc.value = new_value;
             }
@@ -688,7 +697,10 @@ impl MemoryTracker {
 
         // Mirror into global_state
         {
-            let mut global = self.global_state.write().unwrap();
+            let mut global = self
+                .global_state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             global.all_locations.remove(&memory_id);
             global.ref_counts.remove(&memory_id);
         }
@@ -703,7 +715,10 @@ impl MemoryTracker {
     /// Get memory safety statistics for debugging.
     pub fn get_stats(&self) -> MemorySafetyStats {
         let inner = self.inner.borrow();
-        let global = self.global_state.read().unwrap();
+        let global = self
+            .global_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         MemorySafetyStats {
             total_locations: inner.owners.len(),
             active_borrows: inner.borrows.values().map(|v| v.len()).sum(),

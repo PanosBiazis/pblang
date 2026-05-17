@@ -16,7 +16,7 @@ Rewrite this file after every run to reflect the next batch.
 | Task | What landed |
 |------|-------------|
 | **M4-beta** | `crates/pblang-pm/src/lib.rs`: `publish_package`, `search_registry`, `SearchResult`; `src/main.rs`: `pblang publish` + `pblang search <query>` subcommands; `tests/install_cli.rs`: `publish_and_search_roundtrip`; `docs/Registry_hosted.md` M4-beta section; `docs/Tooling.md` updated. |
-| **R3-beta** | `src/main.rs`: `sapphire --symbols <file>` symbol table dump (fn + let + bytecode offsets); `tests/symbols.rs`: `symbols_lists_function_names`; `Cargo.toml` [[test]] symbols; `docs/Tooling.md` R3-beta section. |
+| **R3-beta** | `src/main.rs`: `pblang --symbols <file>` symbol table dump (fn + let + bytecode offsets); `tests/symbols.rs`: `symbols_lists_function_names`; `Cargo.toml` [[test]] symbols; `docs/Tooling.md` R3-beta section. |
 | **SP1-beta** | `tests/semantics/numeric_edge_test.sapp` + `numeric_edge_cases_pass`; `tests/semantics.rs` updated; `docs/Spec_freeze.md` numeric edge cases section (Infinity/NaN/f64 limits); `docs/Tooling.md` SP1-beta note. |
 | **E5-beta** | `crates/pblang-stub/` new crate; `pblang bundle --self-extract`; `tests/pack.rs`; `docs/Native_backend_notes.md` Stage A status; `docs/Tooling.md` updated. |
 | **L3-beta** | LSP `open_files` map + scope-aware completion (didOpen/didChange + `collect_local_names`); `tests/lsp.rs`; `docs/Tooling.md` updated. |
@@ -26,11 +26,11 @@ Rewrite this file after every run to reflect the next batch.
 | **A4-beta** | `stdlib/http.sapp`: `post_stream_auth`; `stdlib/provider_registry.sapp`; test; docs updated. |
 | **W4-beta+** | `stdlib/http_server.sapp`: `mw_rate_limit`; test; docs updated. |
 | **W4-beta** | `stdlib/websocket.sapp`: `write_frame`; test; docs updated. |
-| **R3-alpha** | `sapphire --dataflow`; `tests/dataflow.rs`; docs updated. |
+| **R3-alpha** | `pblang --dataflow`; `tests/dataflow.rs`; docs updated. |
 | **M4-alpha** | `fetch_and_install_package`; `pblang install <name>@<version>`; `tests/install_cli.rs`; docs updated. |
 | **T5-alpha** | `stdlib/thread.sapp` wrapper; test; docs updated. |
 | **G3-alpha** | `stdlib/collections.sapp`; test; docs updated. |
-| **L3-alpha** | `sapphire fmt` blank line between `fn`; test; docs updated. |
+| **L3-alpha** | `pblang fmt` blank line between `fn`; test; docs updated. |
 | **E5-alpha** | `docs/Native_backend_notes.md` Stage A+B design; cross-ref. |
 | **W4-alpha** | `tcp_set_timeout`; http_server timeout/SSE; `docs/TLS_notes.md`; test. |
 | **A4-alpha** | `get_stream`, `post_stream`, `parse_sse_line`; example; test. |

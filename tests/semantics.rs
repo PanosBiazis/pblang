@@ -1054,6 +1054,48 @@ fn websocket_upgrade_response_rfc6455() {
 }
 
 #[test]
+fn websocket_builtin_write_parse_short_pass() {
+    let src = r#"
+        let frame = websocket_write_frame(1, "Hi");
+        let parsed = websocket_parse_frame(frame);
+        print parsed["opcode"];
+        print parsed["payload"];
+        print parsed["fin"];
+        print parsed["masked"];
+        print parsed["payload_len"];
+    "#;
+    let out = run_collect(src);
+    assert_eq!(out.len(), 5);
+    assert_eq!(out[0], Value::Number(1.0));
+    assert_eq!(out[1].as_str().unwrap(), "Hi");
+    assert_eq!(out[2], Value::Number(1.0));
+    assert_eq!(out[3], Value::Number(1.0));
+    assert_eq!(out[4], Value::Number(2.0));
+}
+
+#[test]
+fn websocket_builtin_write_parse_extended_len_pass() {
+    let src = r#"
+        let payload = "";
+        let i = 0;
+        while i < 130 {
+            payload = payload + "x";
+            i = i + 1;
+        }
+        let frame = websocket_write_frame(1, payload);
+        let parsed = websocket_parse_frame(frame);
+        print len(frame);
+        print parsed["payload_len"];
+        print parsed["payload"] == payload;
+    "#;
+    let out = run_collect(src);
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0], Value::Number(138.0)); // 2 header + 2 ext len + 4 mask + 130 payload
+    assert_eq!(out[1], Value::Number(130.0));
+    assert_eq!(out[2], Value::Bool(true));
+}
+
+#[test]
 fn quantum_protocol_submit_and_poll() {
     let src = r#"
         import "stdlib:quantum_protocol.sapp";
@@ -1485,6 +1527,57 @@ fn websocket_write_frame_pass() {
 }
 
 #[test]
+fn websocket_roundtrip_masked_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/websocket_roundtrip_masked_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read websocket_roundtrip_masked_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "websocket_roundtrip_masked_pass",
+        "expected final print websocket_roundtrip_masked_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn websocket_extended_len_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/websocket_extended_len_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read websocket_extended_len_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "websocket_extended_len_pass",
+        "expected final print websocket_extended_len_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn websocket_fragment_reassembly_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/websocket_fragment_reassembly_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read websocket_fragment_reassembly_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "websocket_fragment_reassembly_pass",
+        "expected final print websocket_fragment_reassembly_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
 fn provider_registry_register_and_call_pass() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/semantics/provider_registry_test.sapp");
@@ -1497,6 +1590,23 @@ fn provider_registry_register_and_call_pass() {
     assert_eq!(
         got, "provider_registry_test: pass",
         "expected final print provider_registry_test: pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn provider_registry_round_robin_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/provider_registry_round_robin_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read provider_registry_round_robin_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "provider_registry_round_robin_test: pass",
+        "expected final print provider_registry_round_robin_test: pass, got: {:?}",
         out
     );
 }
@@ -1650,24 +1760,31 @@ fn tensor_ops_pass() {
     );
 }
 
-#[ignore = "thread_pool cannot pass closures between threads: Value::Closure is not    JSON-serializable in pblang's VM-per-thread model. thread_pool exists in thread.sapp    but worker_fn must be a non-closure value. Workaround: use raw spawn+channel pattern    with factory functions returning closures over primitive captures (numbers only)."]
 #[test]
 fn thread_pool_stdlib_pass() {
-    // Smoke test: verify thread.sapp exports thread_pool as a function
-    let out = run_collect(r#"
-        let thread = import("stdlib:thread.sapp");
-        if type(thread.thread_pool) == "closure" or type(thread.thread_pool) == "fn" {
-            print "thread_pool_exported: ok";
-        } else {
-            print "thread_pool_exported: type=" + type(thread.thread_pool);
-        }
-        print "thread_pool_stdlib_pass";
-    "#);
-    let got = out.last()
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/thread_pool_stdlib_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read thread_pool_stdlib_test.sapp");
+    let out = run_collect(&src);
+    let fail_markers: Vec<String> = out
+        .iter()
+        .filter_map(|v| v.as_str().ok().map(String::from))
+        .filter(|s| s.contains("FAIL"))
+        .collect();
+    assert!(
+        fail_markers.is_empty(),
+        "thread_pool_stdlib_test.sapp reported failures: {:?} (full output: {:?})",
+        fail_markers,
+        out
+    );
+    let got = out
+        .last()
         .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
         .unwrap_or_default();
-    assert_eq!(got, "thread_pool_stdlib_pass",
-        "expected thread_pool_stdlib_pass, got: {:?}", out);
+    assert_eq!(
+        got, "thread_pool_stdlib_pass",
+        "expected thread_pool_stdlib_pass, got: {:?}", out
+    );
 }
 
 #[test]
@@ -1901,6 +2018,9 @@ sapp_test!(rwlock_builtins_pass,            "rwlock_builtins_test.sapp",        
 sapp_test!(channel_buffered_pass,           "channel_buffered_test.sapp",           "channel_buffered_pass");
 sapp_test!(barrier_once_builtins_pass,      "barrier_once_builtins_test.sapp",      "barrier_once_builtins_pass");
 sapp_test!(thread_stdlib_enhanced_pass,     "thread_stdlib_enhanced_test.sapp",     "thread_stdlib_enhanced_pass");
+sapp_test!(thread_pool_resilience_pass,     "thread_pool_resilience_test.sapp",     "thread_pool_resilience_pass");
+sapp_test!(spawn_closure_transfer_pass,     "spawn_closure_transfer_test.sapp",     "spawn_closure_transfer_pass");
+sapp_test!(spawn_global_capture_pass,       "spawn_global_capture_test.sapp",       "spawn_global_capture_pass");
 sapp_test!(pipeline_pass,                   "pipeline_test.sapp",                   "pipeline_pass");
 sapp_test!(promise_pass,                    "promise_test.sapp",                    "promise_pass");
 sapp_test!(waitgroup_pass,                  "waitgroup_test.sapp",                  "waitgroup_pass");

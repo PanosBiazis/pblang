@@ -149,39 +149,73 @@ fn diag_from_parse(src: &str, e: &Simple<char>) -> Diagnostic {
     }
 }
 
+fn is_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn utf16_col_to_byte(line: &str, col_utf16: u32) -> usize {
+    let target = col_utf16 as usize;
+    let mut utf16_seen = 0usize;
+    for (idx, ch) in line.char_indices() {
+        if utf16_seen >= target {
+            return idx;
+        }
+        utf16_seen += ch.len_utf16();
+    }
+    line.len()
+}
+
+fn line_at(src: &str, line_idx: usize) -> Option<&str> {
+    src.split('\n').nth(line_idx)
+}
+
+fn char_at(line: &str, byte_idx: usize) -> Option<char> {
+    line.get(byte_idx..)?.chars().next()
+}
+
+fn prev_char_start(line: &str, byte_idx: usize) -> Option<usize> {
+    line.get(..byte_idx)?.char_indices().last().map(|(i, _)| i)
+}
+
 fn word_at_position(src: &str, pos: Position) -> Option<String> {
-    let lines: Vec<&str> = src.split('\n').collect();
-    let line_idx = pos.line as usize;
-    if line_idx >= lines.len() {
-        return None;
-    }
-    let line = lines[line_idx];
-    let col = pos.character as usize;
-    if col >= line.len() {
-        return None;
+    let line = line_at(src, pos.line as usize)?;
+    let mut byte = utf16_col_to_byte(line, pos.character).min(line.len());
+
+    // If cursor is at token boundary/end, allow selecting previous identifier char.
+    let probe = match char_at(line, byte) {
+        Some(ch) if is_ident_char(ch) => byte,
+        _ => {
+            let prev = prev_char_start(line, byte)?;
+            if is_ident_char(char_at(line, prev)?) {
+                prev
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let mut start = probe;
+    while let Some(prev) = prev_char_start(line, start) {
+        if let Some(ch) = char_at(line, prev) {
+            if is_ident_char(ch) {
+                start = prev;
+                continue;
+            }
+        }
+        break;
     }
 
-    let mut start = col;
-    while start > 0 {
-        let ch = line.chars().nth(start - 1).unwrap_or(' ');
-        if ch.is_alphanumeric() || ch == '_' {
-            start -= 1;
+    byte = probe;
+    while let Some(ch) = char_at(line, byte) {
+        if is_ident_char(ch) {
+            byte += ch.len_utf8();
         } else {
             break;
         }
     }
-    let mut end = col;
-    while end < line.len() {
-        let ch = line.chars().nth(end).unwrap_or(' ');
-        if ch.is_alphanumeric() || ch == '_' {
-            end += 1;
-        } else {
-            break;
-        }
-    }
 
-    if start < end {
-        Some(line[start..end].to_string())
+    if start < byte {
+        Some(line[start..byte].to_string())
     } else {
         None
     }
@@ -340,7 +374,7 @@ impl LanguageServer for Backend {
             },
             server_info: Some(ServerInfo {
                 name: "pblang-lsp".into(),
-                version: Some("0.5.7".into()),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
             }),
         })
     }

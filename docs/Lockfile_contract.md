@@ -40,3 +40,9 @@ To assert lockfile reproducibility in CI:
 3. Diff the new lockfile against the committed one (or compare a hash). If they differ, the lockfile was not reproducible (e.g. manifest or dependency contents changed, or non-determinism in generation).
 
 This gives a “lockfile reproducibility” test as suggested in the v0.3 roadmap.
+
+In this repository, an integration test target exists for this contract:
+
+```bash
+cargo test --test lockfile_repro
+```
