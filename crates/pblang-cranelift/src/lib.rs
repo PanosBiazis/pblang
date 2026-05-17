@@ -469,8 +469,8 @@ fn build_cranelift_fn(
                 let v = pop!()?;
                 let one  = builder.ins().f64const(1.0);
                 let zero = builder.ins().f64const(0.0);
-                let is_zero = builder.ins().fcmp(FloatCC::Equal, v, zero);
-                let result  = builder.ins().select(is_zero, one, zero);
+                let is_falsey = emit_is_falsey(&mut builder, v);
+                let result  = builder.ins().select(is_falsey, one, zero);
                 push!(result);
             }
 
@@ -539,8 +539,7 @@ fn build_cranelift_fn(
             }
             OpCode::OpJumpIfFalse(target) => {
                 let cond = pop!()?;
-                let zero = builder.ins().f64const(0.0);
-                let is_false = builder.ins().fcmp(FloatCC::Equal, cond, zero);
+                let is_false = emit_is_falsey(&mut builder, cond);
                 let target_bi = ip_to_block[*target];
                 let fall_bi = ip_to_block.get(ip + 1).copied().unwrap_or(n_blocks - 1);
                 builder.ins().brif(is_false, cl_blocks[target_bi], &[], cl_blocks[fall_bi], &[]);
@@ -548,11 +547,11 @@ fn build_cranelift_fn(
             }
             OpCode::OpJumpIfTrue(target) => {
                 let cond = pop!()?;
-                let zero = builder.ins().f64const(0.0);
-                let is_true = builder.ins().fcmp(FloatCC::NotEqual, cond, zero);
+                let is_false = emit_is_falsey(&mut builder, cond);
                 let target_bi = ip_to_block[*target];
                 let fall_bi = ip_to_block.get(ip + 1).copied().unwrap_or(n_blocks - 1);
-                builder.ins().brif(is_true, cl_blocks[target_bi], &[], cl_blocks[fall_bi], &[]);
+                // brif(condition, then, else): when falsey, fall through; otherwise jump.
+                builder.ins().brif(is_false, cl_blocks[fall_bi], &[], cl_blocks[target_bi], &[]);
                 terminated_blocks.insert(current_block_idx);
             }
 
@@ -606,6 +605,17 @@ fn emit_cmp_ns(
     stack.push(result);
     names.push(None);
     Ok(())
+}
+
+/// JIT falsey predicate aligned with VM semantics:
+/// - `0.0` is falsey
+/// - `NaN` (used for `nil`) is falsey
+/// - everything else is truthy
+fn emit_is_falsey(builder: &mut FunctionBuilder<'_>, v: ClValue) -> ClValue {
+    let zero = builder.ins().f64const(0.0);
+    let is_zero = builder.ins().fcmp(FloatCC::Equal, v, zero);
+    let is_nan = builder.ins().fcmp(FloatCC::Unordered, v, v);
+    builder.ins().bor(is_zero, is_nan)
 }
 
 // ── Trampoline: call a JIT function from Rust with pblang Value args ──────────────────
@@ -769,5 +779,106 @@ mod tests {
             is_jit_eligible(&func.chunk).is_err(),
             "function with OpPrint should NOT be JIT-eligible"
         );
+    }
+
+    #[test]
+    fn not_nil_returns_true() {
+        let mut chunk = Chunk::default();
+        let sp = pblang_ir::chunk::Span::default();
+        let c_nil = chunk.add_const(PV::Nil);
+        chunk.write(OpCode::OpConstant(c_nil), sp);
+        chunk.write(OpCode::OpNot, sp);
+        chunk.write(OpCode::OpReturn, sp);
+
+        let func = Function {
+            name: Some("not_nil".into()),
+            arity: 0,
+            min_arity: 0,
+            defaults: vec![],
+            is_vararg: false,
+            chunk,
+        };
+
+        let mut cache = JitCache::new().expect("JitCache::new");
+        match cache.compile("not_nil", &func) {
+            JitResult::Compiled(fp) => {
+                let result = unsafe { fp(std::ptr::null(), 0) };
+                assert_eq!(result, 1.0, "!nil should evaluate to true (1.0), got {result}");
+            }
+            JitResult::NotEligible(reason) => panic!("not_nil should be JIT-eligible: {reason}"),
+        }
+    }
+
+    #[test]
+    fn jump_if_false_treats_nil_as_falsey() {
+        let mut chunk = Chunk::default();
+        let sp = pblang_ir::chunk::Span::default();
+        let c_nil = chunk.add_const(PV::Nil);
+        let c_true_branch = chunk.add_const(PV::Number(1.0));
+        let c_false_branch = chunk.add_const(PV::Number(2.0));
+
+        chunk.write(OpCode::OpConstant(c_nil), sp);         // 0
+        chunk.write(OpCode::OpJumpIfFalse(4), sp);          // 1
+        chunk.write(OpCode::OpConstant(c_true_branch), sp); // 2
+        chunk.write(OpCode::OpReturn, sp);                  // 3
+        chunk.write(OpCode::OpConstant(c_false_branch), sp);// 4
+        chunk.write(OpCode::OpReturn, sp);                  // 5
+
+        let func = Function {
+            name: Some("nil_branch".into()),
+            arity: 0,
+            min_arity: 0,
+            defaults: vec![],
+            is_vararg: false,
+            chunk,
+        };
+
+        let mut cache = JitCache::new().expect("JitCache::new");
+        match cache.compile("nil_branch", &func) {
+            JitResult::Compiled(fp) => {
+                let result = unsafe { fp(std::ptr::null(), 0) };
+                assert_eq!(result, 2.0, "nil condition should take false branch, got {result}");
+            }
+            JitResult::NotEligible(reason) => panic!("nil_branch should be JIT-eligible: {reason}"),
+        }
+    }
+
+    #[test]
+    fn jump_if_true_treats_nil_as_falsey() {
+        let mut chunk = Chunk::default();
+        let sp = pblang_ir::chunk::Span::default();
+        let c_nil = chunk.add_const(PV::Nil);
+        let c_fallthrough = chunk.add_const(PV::Number(3.0));
+        let c_jump_target = chunk.add_const(PV::Number(4.0));
+
+        chunk.write(OpCode::OpConstant(c_nil), sp);         // 0
+        chunk.write(OpCode::OpJumpIfTrue(4), sp);           // 1
+        chunk.write(OpCode::OpConstant(c_fallthrough), sp); // 2
+        chunk.write(OpCode::OpReturn, sp);                  // 3
+        chunk.write(OpCode::OpConstant(c_jump_target), sp); // 4
+        chunk.write(OpCode::OpReturn, sp);                  // 5
+
+        let func = Function {
+            name: Some("nil_jump_if_true".into()),
+            arity: 0,
+            min_arity: 0,
+            defaults: vec![],
+            is_vararg: false,
+            chunk,
+        };
+
+        let mut cache = JitCache::new().expect("JitCache::new");
+        match cache.compile("nil_jump_if_true", &func) {
+            JitResult::Compiled(fp) => {
+                let result = unsafe { fp(std::ptr::null(), 0) };
+                assert_eq!(
+                    result, 3.0,
+                    "nil condition should not take JumpIfTrue target, got {result}"
+                );
+            }
+            JitResult::NotEligible(reason) => {
+                panic!("nil_jump_if_true should be JIT-eligible: {reason}")
+            }
+        }
     }
 }

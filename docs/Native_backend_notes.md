@@ -1,5 +1,8 @@
 # Native compile / backend research (N1 / E5)
 
+Terminology note: this document includes historical `biapryx` command names in
+older sections. Current CLI/runtime naming is `pblang`.
+
 Σημειώσεις για πιθανό native/hybrid compilation backend και για το E5
 batch (executables, self-extracting/installer presets). Αυτό το αρχείο είναι
 σχεδιαστικό — **καμία δέσμευση για άμεση υλοποίηση**· περιγράφει το staged
@@ -12,8 +15,8 @@ artifacts.
 
 - Δεν υπάρχει ακόμη σταθερό **bytecode ABI** για "frozen" εκδόσεις· αλλαγές
   στο VM/IR μπορούν να σπάνε παλιά πακέτα.
-- Τα tools **`sapphire pack`** και **`pblang bundle`** (E4) βασίζονται
-  σε ήδη εγκατεστημένο `sapphire` binary στο target μηχάνημα.
+- Τα tools **`pblang pack`** και **`pblang bundle`** (E4) βασίζονται
+  σε ήδη εγκατεστημένο `pblang` binary στο target μηχάνημα.
 - Δεν υπάρχει cross-platform abstraction για:
   - εύρεση/εκτέλεση προσωρινού extract directory,
   - ασφαλή χειρισμό self-extracting executables (π.χ. temp dirs, cleanup,

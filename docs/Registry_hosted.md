@@ -69,3 +69,12 @@ Define the HTTP API and auth model for a **hosted** pblang package registry (as 
 
 - Implementing the server (separate service/repo).
 - Defining a formal OpenAPI spec (this is a design note only).
+
+## Verification in this repo
+
+- Registry client flows should be validated with integration tests in `tests/install_cli.rs`.
+- Lockfile determinism and reproducibility are validated separately via:
+
+```bash
+cargo test --test lockfile_repro
+```

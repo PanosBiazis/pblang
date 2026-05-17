@@ -5,7 +5,7 @@ use pblang_core::{
 };
 use pblang_ir::Chunk;
 use pblang_typeck::check as type_check;
-use pblang_vm::{StdlibConfig, VM};
+use pblang_vm::{StdlibConfig, VmLimits, VM};
 
 use chumsky::error::SimpleReason;
 use chumsky::prelude::Simple;
@@ -258,6 +258,7 @@ fn show_help() {
     println!("  pblang --annotate <file>   Compile file and print annotated bytecode (source line + instruction side-by-side)");
     println!("  pblang --symbols <file>    Print a simple symbol table for top-level functions and globals (name, arity, bytecode offset)");
     println!("  pblang lsp             Start LSP server on stdin/stdout (parse/typecheck diagnostics, hover, goto-def)");
+    println!("  pblang serve [--port N]  Start local IDE backend server (default: 8090)");
     println!();
 
     println!("Language quick tour (examples):");
@@ -398,6 +399,106 @@ fn show_help() {
     println!("  #   polyglotblocks  -> array of blocks");
     println!("  #   polyglot        -> map {{ blocks, byname, bylang }}");
     println!("  # Use `pblang --doc <file>` to list detected polyglot blocks and spans.");
+}
+
+fn normalize_ide_source(src: &str) -> String {
+    // IDE ergonomics: users often write JS/Python-style print("x");
+    // Normalize simple line-based forms to pblang's print statement.
+    src.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("print(") && trimmed.ends_with(");") {
+                let indent_len = line.chars().take_while(|c| c.is_whitespace()).count();
+                let indent = &line[..indent_len];
+                let inner = &trimmed["print(".len()..trimmed.len() - 2];
+                format!("{indent}print {inner};")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_ide_source(src: &str, max_line_length: Option<usize>) -> String {
+    const INDENT: &str = "    ";
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = String::new();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut block_comment_depth = 0;
+
+    for line in &lines {
+        let mut trimmed = line.trim().to_string();
+        trimmed = fmt_normalize_operator_spacing(&trimmed);
+        trimmed = fmt_normalize_comma_spacing(&trimmed);
+        if trimmed.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if trimmed.starts_with('}') {
+            depth = depth.saturating_sub(1);
+        }
+        let indent_str: String = (0..depth.max(0) as usize).map(|_| INDENT).collect();
+        let full_line = format!("{indent_str}{trimmed}");
+        if let Some(max_len) = max_line_length {
+            let mut line_to_output = full_line;
+            while !line_to_output.is_empty() {
+                if line_to_output.len() <= max_len {
+                    out.push_str(&line_to_output);
+                    out.push('\n');
+                    break;
+                }
+                let break_at = line_to_output[..max_len].rfind(' ').unwrap_or(max_len);
+                let break_at = if break_at == 0 { max_len } else { break_at };
+                let rest = line_to_output.split_off(break_at);
+                out.push_str(line_to_output.trim_end());
+                out.push('\n');
+                line_to_output = format!("{}{}", INDENT, rest.trim_start());
+            }
+        } else {
+            out.push_str(&full_line);
+            out.push('\n');
+        }
+        scan_line_for_braces(
+            &trimmed,
+            &mut in_string,
+            &mut block_comment_depth,
+            &mut depth,
+        );
+    }
+
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod ide_source_tests {
+    use super::{format_ide_source, normalize_ide_source};
+
+    #[test]
+    fn rewrites_print_call_style_lines() {
+        let src = "print(\"Hello\");\nprint(1 + 2);\n";
+        let got = normalize_ide_source(src);
+        assert_eq!(got, "print \"Hello\";\nprint 1 + 2;");
+    }
+
+    #[test]
+    fn keeps_statement_style_unchanged() {
+        let src = "print \"Hello\";\nlet x = 1;\n";
+        let got = normalize_ide_source(src);
+        assert_eq!(got, "print \"Hello\";\nlet x = 1;");
+    }
+
+    #[test]
+    fn formats_simple_block_indentation() {
+        let src = "fn x(){\nprint 1;\n}\n";
+        let got = format_ide_source(src, None);
+        assert!(got.contains("fn x("));
+        assert!(got.contains("\n    print 1;\n"));
+    }
 }
 
 fn print_symbol_table(chunk: &Chunk) {
@@ -1399,6 +1500,20 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("--help") | Some("-h") | Some("help")
+    ) {
+        show_help();
+        return;
+    }
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("--version") | Some("-V") | Some("version")
+    ) {
+        println!("pblang {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.first().map(|s| s.as_str()) == Some("init") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let manifest_path = cwd.join("pblang.toml");
@@ -2699,7 +2814,37 @@ fn main() {
 
     // ── pblang serve — Start IDE backend server ────────────────────────
     if args.first().map(|s| s.as_str()) == Some("serve") {
-        let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8090);
+        let mut port: u16 = 8090;
+        let mut i = 1usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--port" | "-p" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("pblang serve: --port requires a value");
+                        eprintln!("usage: pblang serve [--port <1-65535>]");
+                        std::process::exit(2);
+                    }
+                    match args[i].parse::<u16>() {
+                        Ok(p) if p > 0 => port = p,
+                        _ => {
+                            eprintln!("pblang serve: invalid port '{}'", args[i]);
+                            eprintln!("usage: pblang serve [--port <1-65535>]");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                other => match other.parse::<u16>() {
+                    Ok(p) if p > 0 => port = p,
+                    _ => {
+                        eprintln!("pblang serve: unrecognized argument '{}'", other);
+                        eprintln!("usage: pblang serve [--port <1-65535>]");
+                        std::process::exit(2);
+                    }
+                },
+            }
+            i += 1;
+        }
         println!("pblang IDE Server starting on http://localhost:{}", port);
         println!("Open editors/ide/index.html in your browser");
 
@@ -2708,48 +2853,506 @@ fn main() {
                 eprintln!("Cannot bind to port {}: {}", port, e);
                 std::process::exit(1);
             });
+        let ide_examples = [
+            (
+                "hello_world",
+                "Hello World",
+                "examples/hello_world/main.sapp",
+            ),
+            ("tutorial_cli", "Tutorial: CLI", "examples/tutorial_cli/main.sapp"),
+            (
+                "tutorial_concurrency",
+                "Tutorial: Concurrency",
+                "examples/tutorial_concurrency/main.sapp",
+            ),
+            (
+                "tutorial_http",
+                "Tutorial: HTTP",
+                "examples/tutorial_http/main.sapp",
+            ),
+            (
+                "tutorial_user_input",
+                "Tutorial: User Input",
+                "examples/tutorial_user_input/main.sapp",
+            ),
+            ("thread_pool", "Thread Pool", "examples/thread_pool/main.sapp"),
+            ("web_server", "Web Server", "examples/web_server/main.sapp"),
+            ("orm_example", "ORM Example", "examples/orm_example/main.sapp"),
+            ("quantum_bb84", "Quantum BB84", "examples/quantum_bb84/main.sapp"),
+            (
+                "concurrent_tasks",
+                "Concurrent Tasks",
+                "examples/concurrent_tasks/main.sapp",
+            ),
+            (
+                "ai_http_provider",
+                "AI HTTP Provider",
+                "examples/ai_http_provider/main.sapp",
+            ),
+            (
+                "ai_chat_toolcall",
+                "AI Chat Toolcall",
+                "examples/ai_chat_toolcall/main.sapp",
+            ),
+        ];
+        let manual_docs = [
+            ("ide", "IDE Manual", "docs/IDE_MANUAL.md"),
+            ("project", "Project Manual", "docs/PROJECT_MANUAL.md"),
+        ];
 
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
                 use std::io::{Read, Write};
-                let mut buffer = [0u8; 8192];
-                if let Ok(n) = stream.read(&mut buffer) {
-                    let request = String::from_utf8_lossy(&buffer[..n]);
+                let mut request_bytes: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end: Option<usize> = None;
+                let mut content_length: usize = 0;
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            request_bytes.extend_from_slice(&chunk[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) =
+                                    request_bytes.windows(4).position(|w| w == b"\r\n\r\n")
+                                {
+                                    header_end = Some(pos + 4);
+                                    let header = String::from_utf8_lossy(&request_bytes[..pos + 4]);
+                                    for line in header.lines() {
+                                        let line_trimmed = line.trim();
+                                        if let Some(v) = line_trimmed.strip_prefix("Content-Length:")
+                                        {
+                                            content_length = v.trim().parse::<usize>().unwrap_or(0);
+                                            break;
+                                        }
+                                        let lower = line_trimmed.to_ascii_lowercase();
+                                        if let Some(v) = lower.strip_prefix("content-length:") {
+                                            content_length = v.trim().parse::<usize>().unwrap_or(0);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(h_end) = header_end {
+                                if request_bytes.len() >= h_end + content_length {
+                                    break;
+                                }
+                            }
+                            if request_bytes.len() > 10 * 1024 * 1024 {
+                                // Hard stop to avoid unbounded reads.
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !request_bytes.is_empty() {
+                    let request = String::from_utf8_lossy(&request_bytes);
+                    let request_line = request.lines().next().unwrap_or("");
+                    let request_path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                    let body_start = request.find("\r\n\r\n").map(|n| n + 4).unwrap_or(request.len());
+                    let body = &request[body_start..];
 
                     if request.starts_with("POST /run") {
-                        // Extract JSON body
-                        let body_start = request.find("\r\n\r\n").unwrap_or(0) + 4;
-                        let body = &request[body_start..];
-
-                        let mut output = String::new();
+                        let started = std::time::Instant::now();
+                        let mut json_resp = serde_json::json!({
+                            "ok": false,
+                            "stage": "request",
+                            "output": "",
+                            "diagnostics": [],
+                            "error": "invalid request body",
+                            "duration_ms": 0
+                        });
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
                             if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
-                                // Parse, compile, run
-                                match pblang_core::parse_with_polyglot(code) {
-                                    Ok((stmts, _)) => match pblang_compiler::compile(stmts) {
-                                        Ok(chunk) => {
-                                            let mut vm = pblang_vm::VM::with_stdlib(
-                                                pblang_vm::StdlibConfig::default(),
-                                            );
-                                            match vm.run_collect(chunk) {
-                                                Ok(values) => {
-                                                    for v in values {
-                                                        output.push_str(&format!("{}\n", v));
+                                let code = normalize_ide_source(code);
+                                let stdin_lines: Vec<String> = json
+                                    .get("stdin_lines")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                match pblang_core::parse_with_polyglot(&code) {
+                                    Ok((stmts, _)) => {
+                                        let type_diags = type_check(&stmts);
+                                        if !type_diags.is_empty() {
+                                            let diagnostics: Vec<serde_json::Value> = type_diags
+                                                .into_iter()
+                                                .map(|d| {
+                                                    if let Some(sp) = d.span {
+                                                        let (line, col) = line_col(&code, sp.start);
+                                                        serde_json::json!({
+                                                            "stage": "type",
+                                                            "message": d.message,
+                                                            "span": { "start": sp.start, "end": sp.end },
+                                                            "line": line,
+                                                            "col": col,
+                                                            "line_text": get_line(&code, line)
+                                                        })
+                                                    } else {
+                                                        serde_json::json!({
+                                                            "stage": "type",
+                                                            "message": d.message
+                                                        })
+                                                    }
+                                                })
+                                                .collect();
+                                            json_resp = serde_json::json!({
+                                                "ok": false,
+                                                "stage": "type",
+                                                "output": "",
+                                                "error": "Type error",
+                                                "diagnostics": diagnostics
+                                            });
+                                        } else {
+                                            match pblang_compiler::compile(stmts) {
+                                                Ok(chunk) => {
+                                                    let mut vm = pblang_vm::VM::with_stdlib(
+                                                        pblang_vm::StdlibConfig::default(),
+                                                    );
+                                                    vm.set_limits(Some(VmLimits {
+                                                        max_instructions: Some(5_000_000),
+                                                        max_stack_depth: Some(2048),
+                                                        max_memory_bytes: Some(64 * 1024 * 1024),
+                                                        io_timeout_ms: Some(5_000),
+                                                    }));
+                                                    if !stdin_lines.is_empty() {
+                                                        vm.set_stdin_lines(stdin_lines.clone());
+                                                    }
+                                                    match vm.run_collect(chunk) {
+                                                        Ok(values) => {
+                                                            let mut output = String::new();
+                                                            for v in values {
+                                                                output.push_str(&format!("{}\n", v));
+                                                            }
+                                                            json_resp = serde_json::json!({
+                                                                "ok": true,
+                                                                "stage": "ok",
+                                                                "output": output.trim(),
+                                                                "diagnostics": []
+                                                            });
+                                                        }
+                                                        Err(e) => {
+                                                            let mut diagnostics = Vec::new();
+                                                            if let Some(sp) = e.span {
+                                                                let (line, col) = line_col(&code, sp.start);
+                                                                diagnostics.push(serde_json::json!({
+                                                                    "stage": "runtime",
+                                                                    "message": e.message,
+                                                                    "span": { "start": sp.start, "end": sp.end },
+                                                                    "line": line,
+                                                                    "col": col,
+                                                                    "line_text": get_line(&code, line)
+                                                                }));
+                                                            }
+                                                            json_resp = serde_json::json!({
+                                                                "ok": false,
+                                                                "stage": "runtime",
+                                                                "output": "",
+                                                                "error": format!("Runtime error: {}", e.message),
+                                                                "diagnostics": diagnostics
+                                                            });
+                                                        }
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    output = format!("Runtime error: {}", e.message)
+                                                    json_resp = serde_json::json!({
+                                                        "ok": false,
+                                                        "stage": "compile",
+                                                        "output": "",
+                                                        "error": format!("Compile error: {}", e),
+                                                        "diagnostics": []
+                                                    });
                                                 }
                                             }
                                         }
-                                        Err(e) => output = format!("Compile error: {}", e),
-                                    },
-                                    Err(e) => output = format!("Parse error: {:?}", e),
+                                    }
+                                    Err(errs) => {
+                                        let diagnostics: Vec<serde_json::Value> = errs
+                                            .into_iter()
+                                            .map(|err| {
+                                                let sp = err.span();
+                                                let (line, col) = line_col(&code, sp.start);
+                                                serde_json::json!({
+                                                    "stage": "parse",
+                                                    "message": format_parse_error(&err),
+                                                    "span": { "start": sp.start, "end": sp.end },
+                                                    "line": line,
+                                                    "col": col,
+                                                    "line_text": get_line(&code, line)
+                                                })
+                                            })
+                                            .collect();
+                                        json_resp = serde_json::json!({
+                                            "ok": false,
+                                            "stage": "parse",
+                                            "output": "",
+                                            "error": "Parse error",
+                                            "diagnostics": diagnostics
+                                        });
+                                    }
                                 }
                             }
                         }
 
-                        let json_resp = serde_json::json!({"output": output.trim()});
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
+                        if let Some(obj) = json_resp.as_object_mut() {
+                            obj.insert("duration_ms".into(), serde_json::json!(elapsed_ms));
+                        }
+                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request.starts_with("POST /check") {
+                        // Parse + typecheck only (no execution), for IDE diagnostics.
+                        let mut json_resp = serde_json::json!({
+                            "ok": false,
+                            "stage": "request",
+                            "diagnostics": [],
+                            "error": "invalid request body"
+                        });
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+                            if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
+                                let code = normalize_ide_source(code);
+                                match pblang_core::parse_with_polyglot(&code) {
+                                    Ok((stmts, _)) => {
+                                        let diags = type_check(&stmts);
+                                        if diags.is_empty() {
+                                            json_resp = serde_json::json!({
+                                                "ok": true,
+                                                "stage": "ok",
+                                                "diagnostics": []
+                                            });
+                                        } else {
+                                            let diagnostics: Vec<serde_json::Value> = diags
+                                                .into_iter()
+                                                .map(|d| {
+                                                    if let Some(sp) = d.span {
+                                                        let (line, col) = line_col(&code, sp.start);
+                                                        serde_json::json!({
+                                                            "stage": "type",
+                                                            "message": d.message,
+                                                            "span": { "start": sp.start, "end": sp.end },
+                                                            "line": line,
+                                                            "col": col,
+                                                            "line_text": get_line(&code, line)
+                                                        })
+                                                    } else {
+                                                        serde_json::json!({
+                                                            "stage": "type",
+                                                            "message": d.message
+                                                        })
+                                                    }
+                                                })
+                                                .collect();
+                                            json_resp = serde_json::json!({
+                                                "ok": false,
+                                                "stage": "type",
+                                                "diagnostics": diagnostics
+                                            });
+                                        }
+                                    }
+                                    Err(errs) => {
+                                        let diagnostics: Vec<serde_json::Value> = errs
+                                            .into_iter()
+                                            .map(|err| {
+                                                let sp = err.span();
+                                                let (line, col) = line_col(&code, sp.start);
+                                                serde_json::json!({
+                                                    "stage": "parse",
+                                                    "message": format_parse_error(&err),
+                                                    "span": { "start": sp.start, "end": sp.end },
+                                                    "line": line,
+                                                    "col": col,
+                                                    "line_text": get_line(&code, line)
+                                                })
+                                            })
+                                            .collect();
+                                        json_resp = serde_json::json!({
+                                            "ok": false,
+                                            "stage": "parse",
+                                            "diagnostics": diagnostics
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request.starts_with("POST /format") {
+                        let mut json_resp = serde_json::json!({
+                            "ok": false,
+                            "error": "invalid request body",
+                            "code": ""
+                        });
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+                            if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
+                                let max_line_length = json
+                                    .get("max_line_length")
+                                    .and_then(|v| v.as_u64())
+                                    .and_then(|n| usize::try_from(n).ok());
+                                let normalized = normalize_ide_source(code);
+                                let formatted = format_ide_source(&normalized, max_line_length);
+                                json_resp = serde_json::json!({
+                                    "ok": true,
+                                    "code": formatted
+                                });
+                            }
+                        }
+                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request.starts_with("POST /normalize") {
+                        let mut json_resp = serde_json::json!({
+                            "ok": false,
+                            "error": "invalid request body",
+                            "code": ""
+                        });
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+                            if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
+                                let normalized = normalize_ide_source(code);
+                                json_resp = serde_json::json!({
+                                    "ok": true,
+                                    "code": normalized
+                                });
+                            }
+                        }
+                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request_path == "/examples" {
+                        let mut arr = Vec::new();
+                        for (id, title, rel_path) in ide_examples {
+                            if std::path::Path::new(rel_path).exists() {
+                                arr.push(serde_json::json!({
+                                    "id": id,
+                                    "title": title
+                                }));
+                            }
+                        }
+                        let json_resp = serde_json::json!({
+                            "ok": true,
+                            "examples": arr
+                        });
+                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(), resp_body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request_path.starts_with("/examples/") {
+                        let id = request_path.trim_start_matches("/examples/").trim_end_matches('/');
+                        let selected = ide_examples
+                            .iter()
+                            .find(|(example_id, _, _)| *example_id == id);
+                        if let Some((example_id, title, rel_path)) = selected {
+                            match std::fs::read_to_string(rel_path) {
+                                Ok(code) => {
+                                    let json_resp = serde_json::json!({
+                                        "ok": true,
+                                        "id": example_id,
+                                        "title": title,
+                                        "code": code
+                                    });
+                                    let resp_body =
+                                        serde_json::to_string(&json_resp).unwrap_or_default();
+                                    let response = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                                        resp_body.len(), resp_body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes());
+                                }
+                                Err(e) => {
+                                    let json_resp = serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("failed to read example '{}': {}", id, e)
+                                    });
+                                    let resp_body =
+                                        serde_json::to_string(&json_resp).unwrap_or_default();
+                                    let response = format!(
+                                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                                        resp_body.len(), resp_body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes());
+                                }
+                            }
+                        } else {
+                            let json_resp = serde_json::json!({
+                                "ok": false,
+                                "error": format!("unknown example '{}'", id)
+                            });
+                            let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                            let response = format!(
+                                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                                resp_body.len(), resp_body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                    } else if request_path.starts_with("/manual/") {
+                        let id = request_path
+                            .trim_start_matches("/manual/")
+                            .trim_end_matches('/');
+                        let selected = manual_docs.iter().find(|(doc_id, _, _)| *doc_id == id);
+                        if let Some((doc_id, title, rel_path)) = selected {
+                            match std::fs::read_to_string(rel_path) {
+                                Ok(content) => {
+                                    let json_resp = serde_json::json!({
+                                        "ok": true,
+                                        "id": doc_id,
+                                        "title": title,
+                                        "content": content
+                                    });
+                                    let resp_body =
+                                        serde_json::to_string(&json_resp).unwrap_or_default();
+                                    let response = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                                        resp_body.len(), resp_body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes());
+                                }
+                                Err(e) => {
+                                    let json_resp = serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("failed to read manual '{}': {}", id, e)
+                                    });
+                                    let resp_body =
+                                        serde_json::to_string(&json_resp).unwrap_or_default();
+                                    let response = format!(
+                                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                                        resp_body.len(), resp_body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes());
+                                }
+                            }
+                        } else {
+                            let json_resp = serde_json::json!({
+                                "ok": false,
+                                "error": format!("unknown manual '{}'", id)
+                            });
+                            let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
+                            let response = format!(
+                                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                                resp_body.len(), resp_body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                    } else if request.starts_with("GET /health") {
+                        let json_resp = serde_json::json!({"ok": true, "service": "pblang-ide-backend"});
                         let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
@@ -3589,6 +4192,11 @@ fn main() {
             .unwrap_or(2);
         let use_llvm = args.iter().any(|a| a == "--llvm");
         let use_wasm = args.iter().any(|a| a == "--wasm" || a == "--wat");
+
+        if use_llvm && use_wasm {
+            eprintln!("pblang compile: --llvm and --wasm are mutually exclusive; choose one backend");
+            std::process::exit(2);
+        }
 
         if use_wasm {
             match pblang_wasm::compile_to_wat(stmts.clone()) {

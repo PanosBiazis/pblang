@@ -232,6 +232,8 @@ pblang bundle --self-extract .
 ## 12) Next docs to read
 
 - `README.md` for project overview
+- `docs/PROJECT_MANUAL.md` for operational project workflows
+- `docs/IDE_MANUAL.md` for IDE workflows and shortcuts
 - `docs/Tooling.md` for complete CLI/tooling details
 - `docs/Language_Semantics.md` for language rules
 - `docs/CURRENT_STATUS.md` for latest implementation status

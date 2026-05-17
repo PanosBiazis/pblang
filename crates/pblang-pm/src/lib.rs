@@ -1432,6 +1432,14 @@ fn percent_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn installs_one_registry_dep_to_cache() {
@@ -1696,36 +1704,180 @@ version = "0.1.0"
         );
     }
 
+    fn read_http_request(stream: &mut TcpStream) -> (String, String, String, String) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let mut header_end = None;
+        loop {
+            let n = stream.read(&mut tmp).expect("read request bytes");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if header_end.is_none() {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = Some(pos + 4);
+                    break;
+                }
+            }
+        }
+
+        let header_end = header_end.expect("request header terminator");
+        let headers_raw = String::from_utf8(buf[..header_end].to_vec()).expect("utf8 header");
+        let mut lines = headers_raw.split("\r\n").filter(|l| !l.is_empty());
+        let request_line = lines.next().expect("request line").to_string();
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .expect("request path")
+            .to_string();
+        let auth = lines
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                if lower.starts_with("authorization:") {
+                    Some(line["Authorization:".len()..].trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let content_length = headers_raw
+            .lines()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                if lower.starts_with("content-length:") {
+                    line.split(':')
+                        .nth(1)
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut tmp).expect("read request body");
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        let body = String::from_utf8(body).expect("utf8 body");
+        (request_line, path, auth, body)
+    }
+
+    fn write_http_response(stream: &mut TcpStream, code: u16, body: &str) {
+        let reason = match code {
+            200 => "OK",
+            401 => "Unauthorized",
+            _ => "Error",
+        };
+        let resp = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            code,
+            reason,
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).expect("write response");
+        stream.flush().expect("flush response");
+    }
+
     #[test]
     fn publish_retries_on_401_with_refresh_token() {
-        // Unit test for the M4-gamma retry logic.
-        // Full 401->refresh->retry requires HTTP mock infrastructure; here we
-        // validate the env-var contract that the retry path depends on.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("server addr");
+        let publish_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
 
-        // Verify that the refresh token env var can be set and read.
-        // SAFETY: unit test, single-threaded context for this assertion.
+        let publish_calls_server = Arc::clone(&publish_calls);
+        let refresh_calls_server = Arc::clone(&refresh_calls);
+        let server = thread::spawn(move || {
+            listener
+                .set_nonblocking(false)
+                .expect("set blocking mode for test server");
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set read timeout");
+                let (_, path, auth, body) = read_http_request(&mut stream);
+                if path == "/publish" {
+                    let n = publish_calls_server.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        assert_eq!(
+                            auth, "Bearer stale-token",
+                            "first publish should use original token"
+                        );
+                        write_http_response(&mut stream, 401, r#"{"error":"unauthorized"}"#);
+                    } else {
+                        assert_eq!(
+                            auth, "Bearer refreshed-token",
+                            "retry publish should use refreshed token"
+                        );
+                        assert!(
+                            body.contains("\"name\":\"publish-test\""),
+                            "retry publish should contain package metadata"
+                        );
+                        write_http_response(&mut stream, 200, r#"{"ok":true}"#);
+                    }
+                } else if path == "/auth/refresh" {
+                    refresh_calls_server.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        body.contains("\"refresh_token\":\"refresh-token\""),
+                        "refresh endpoint should receive refresh token"
+                    );
+                    write_http_response(&mut stream, 200, r#"{"token":"refreshed-token"}"#);
+                } else {
+                    panic!("unexpected test request path: {path}");
+                }
+            }
+        });
+
+        let package_dir = std::env::temp_dir().join("pblang_publish_retry_pkg");
+        let _ = std::fs::remove_dir_all(&package_dir);
+        std::fs::create_dir_all(&package_dir).expect("create package dir");
+        std::fs::write(
+            package_dir.join("pblang.toml"),
+            r#"[package]
+name = "publish-test"
+version = "0.1.0"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(
+            package_dir.join("main.sapp"),
+            r#"print "publish retry test";"#,
+        )
+        .expect("write source");
+
+        // SAFETY: this test controls process env and restores it before exit.
         #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("PBLANG_REGISTRY_REFRESH_TOKEN", "test-refresh-token-123") };
-        let token = std::env::var("PBLANG_REGISTRY_REFRESH_TOKEN").unwrap_or_default();
+        unsafe {
+            std::env::set_var("PBLANG_REGISTRY_REFRESH_TOKEN", "refresh-token");
+        }
+        let registry_url = format!("http://{}", addr);
+        let result = publish_package(&registry_url, &package_dir, "stale-token");
+        // SAFETY: restore env mutation from this test.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var("PBLANG_REGISTRY_REFRESH_TOKEN");
+        }
+
+        assert!(result.is_ok(), "publish should succeed after retry: {result:?}");
         assert_eq!(
-            token, "test-refresh-token-123",
-            "refresh token env var should be readable"
+            publish_calls.load(Ordering::SeqCst),
+            2,
+            "expected publish endpoint to be hit twice (initial + retry)"
         );
-        std::env::remove_var("PBLANG_REGISTRY_REFRESH_TOKEN");
+        assert_eq!(
+            refresh_calls.load(Ordering::SeqCst),
+            1,
+            "expected exactly one token refresh request"
+        );
 
-        // After removal the var must be absent (empty via unwrap_or_default).
-        let missing = std::env::var("PBLANG_REGISTRY_REFRESH_TOKEN").unwrap_or_default();
-        assert!(missing.is_empty(), "token should be cleared after remove_var");
-
-        // Verify that compute_tarball_hmac still works (sanity-check helper used
-        // by the publish path to sign tarballs before sending).
-        let hmac = compute_tarball_hmac(b"payload", b"key");
-        assert_eq!(hmac.len(), 64, "HMAC hex must be 64 chars (SHA-256)");
-
-        // Design note: the full retry flow in publish_package handles the 401
-        // case when PBLANG_REGISTRY_REFRESH_TOKEN is set by POSTing to
-        // <registry>/auth/refresh and retrying with the returned token.
-        // The env-var contract validated above is the seam between publish_package
-        // and the calling process.
+        let _ = std::fs::remove_dir_all(&package_dir);
+        server.join().expect("join test server thread");
     }
 }

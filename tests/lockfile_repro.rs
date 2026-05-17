@@ -2,6 +2,17 @@
 //! must produce the same output.
 
 use pblang_pm::{generate_lockfile, generate_lockfile_with_registry, write_lockfile};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("{prefix}-{pid}-{ts}"))
+}
 
 #[test]
 fn lockfile_reproducibility_empty_deps() {
@@ -11,8 +22,8 @@ version = "0.1.0"
 
 [dependencies]
 "#;
-    let temp = std::env::temp_dir().join("biapryx-lockfile-repro-test");
-    let _ = std::fs::create_dir_all(&temp);
+    let temp = unique_temp_dir("pblang-lockfile-repro-test");
+    std::fs::create_dir_all(&temp).expect("create temp test dir");
     let manifest_path = temp.join("pblang.toml");
     std::fs::write(&manifest_path, manifest_content).expect("write manifest");
 
@@ -29,19 +40,19 @@ version = "0.1.0"
     assert_eq!(lock1.manifest_sha256, lock2.manifest_sha256);
 
     let _ = std::fs::remove_file(&manifest_path);
-    let _ = std::fs::remove_dir(&temp);
+    let _ = std::fs::remove_dir_all(&temp);
 }
 
 #[test]
 fn lockfile_reproducibility_registry_dependency() {
-    let base = std::env::temp_dir().join("biapryx-lockfile-repro-registry");
-    let _ = std::fs::create_dir_all(&base);
+    let base = unique_temp_dir("pblang-lockfile-repro-registry");
+    std::fs::create_dir_all(&base).expect("create base temp dir");
     let registry_dir = base.join("registry");
     let pkg = base.join("pkg");
     let consumer = base.join("consumer");
-    let _ = std::fs::create_dir_all(&registry_dir);
-    let _ = std::fs::create_dir_all(&pkg);
-    let _ = std::fs::create_dir_all(&consumer);
+    std::fs::create_dir_all(&registry_dir).expect("create registry dir");
+    std::fs::create_dir_all(&pkg).expect("create pkg dir");
+    std::fs::create_dir_all(&consumer).expect("create consumer dir");
 
     std::fs::write(
         pkg.join("pblang.toml"),
@@ -89,9 +100,9 @@ fn run_git(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
     std::process::Command::new("git")
         .args(args)
         .current_dir(repo)
-        .env("GIT_AUTHOR_NAME", "Sapphire Tests")
+        .env("GIT_AUTHOR_NAME", "pblang Tests")
         .env("GIT_AUTHOR_EMAIL", "tests@example.com")
-        .env("GIT_COMMITTER_NAME", "Sapphire Tests")
+        .env("GIT_COMMITTER_NAME", "pblang Tests")
         .env("GIT_COMMITTER_EMAIL", "tests@example.com")
         .output()
         .expect("run git command")
@@ -99,12 +110,12 @@ fn run_git(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn lockfile_reproducibility_git_dependency() {
-    let base = std::env::temp_dir().join("biapryx-lockfile-repro-git");
-    let _ = std::fs::create_dir_all(&base);
+    let base = unique_temp_dir("pblang-lockfile-repro-git");
+    std::fs::create_dir_all(&base).expect("create base temp dir");
     let repo = base.join("gitdep");
     let consumer = base.join("consumer");
-    let _ = std::fs::create_dir_all(&repo);
-    let _ = std::fs::create_dir_all(&consumer);
+    std::fs::create_dir_all(&repo).expect("create git repo dir");
+    std::fs::create_dir_all(&consumer).expect("create consumer dir");
 
     std::fs::write(
         repo.join("pblang.toml"),

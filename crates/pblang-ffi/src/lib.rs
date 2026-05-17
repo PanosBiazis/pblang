@@ -155,11 +155,9 @@ pub unsafe extern "C" fn pblang_set_limits(
 /// Returns the pblang runtime version string (UTF-8, NUL-terminated, static lifetime).
 #[no_mangle]
 pub extern "C" fn pblang_get_version() -> *const std::ffi::c_char {
-    static VERSION: &std::ffi::CStr = match std::ffi::CStr::from_bytes_with_nul(b"0.5.1\0") {
-        Ok(s) => s,
-        Err(_) => panic!("bad version string"),
-    };
-    VERSION.as_ptr()
+    // Compile-time package version with explicit NUL terminator.
+    static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+    VERSION.as_ptr() as *const std::ffi::c_char
 }
 
 /// Call a named function defined in previously evaluated pblang source.
@@ -378,4 +376,19 @@ pub unsafe extern "C" fn pblang_string_free(s: *mut c_char) {
     // SAFETY: Caller guarantees `s` was allocated by `CString::into_raw` in this crate
     // and has not been freed. We take ownership back and drop it.
     drop(CString::from_raw(s));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffi_version_matches_package_version() {
+        let ptr = pblang_get_version();
+        assert!(!ptr.is_null(), "pblang_get_version returned null");
+        let actual = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("version must be valid UTF-8");
+        assert_eq!(actual, env!("CARGO_PKG_VERSION"));
+    }
 }

@@ -21,8 +21,8 @@ use std::{
 
 // Import our new modules
 use crate::concurrency::{
-    ThreadPool, VmChannelBuf, VmHandleRegistry, VmSyncAtomic, VmSyncBarrier, VmSyncMutex, VmSyncOnce,
-    VmSyncRwLock,
+    SpawnWireClosure, SpawnWireFunction, SpawnWireValue, ThreadPool, VmChannelBuf, VmHandleRegistry,
+    VmSyncAtomic, VmSyncBarrier, VmSyncMutex, VmSyncOnce, VmSyncRwLock,
 };
 use crate::memory_safety::{BorrowId, BorrowType, MemoryId, MemorySafetyError, MemoryTracker};
 
@@ -268,6 +268,152 @@ fn spawn_value_from_json(v: &sj::Value) -> Value {
     }
 }
 
+fn spawn_function_to_wire(function: &Rc<Function>) -> Result<SpawnWireFunction, String> {
+    let defaults = function
+        .defaults
+        .iter()
+        .map(spawn_value_to_wire)
+        .collect::<Result<Vec<_>, _>>()?;
+    let constants = function
+        .chunk
+        .constants
+        .iter()
+        .map(spawn_value_to_wire)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SpawnWireFunction {
+        name: function.name.clone(),
+        arity: function.arity,
+        min_arity: function.min_arity,
+        defaults,
+        is_vararg: function.is_vararg,
+        instructions: function.chunk.instructions.clone(),
+        spans: function.chunk.spans.clone(),
+        constants,
+    })
+}
+
+fn spawn_closure_to_wire(closure: &Rc<Closure>) -> Result<SpawnWireClosure, String> {
+    let function = spawn_function_to_wire(&closure.function)?;
+    let mut upvalues = Vec::with_capacity(closure.upvalues.len());
+    for uv in &closure.upvalues {
+        let v = match &*uv.borrow() {
+            Upvalue::Closed(v) => v.clone(),
+            Upvalue::Open(_) => {
+                return Err(
+                    "spawn: closure transfer requires closed upvalues (open upvalue found)".into(),
+                );
+            }
+        };
+        upvalues.push(spawn_value_to_wire(&v)?);
+    }
+    Ok(SpawnWireClosure { function, upvalues })
+}
+
+/// Serialize a Value to a send-safe representation for spawn/join.
+fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
+    match v {
+        Value::Nil => Ok(SpawnWireValue::Nil),
+        Value::Bool(b) => Ok(SpawnWireValue::Bool(*b)),
+        Value::Number(n) => Ok(SpawnWireValue::Number(*n)),
+        Value::Obj(o) => match o.as_ref() {
+            Obj::String(s) => Ok(SpawnWireValue::String(s.clone())),
+        },
+        Value::Array(a) => {
+            let a = a.borrow();
+            let mut out = Vec::with_capacity(a.len());
+            for x in a.iter() {
+                out.push(spawn_value_to_wire(x)?);
+            }
+            Ok(SpawnWireValue::Array(out))
+        }
+        Value::Map(m) => {
+            let m = m.borrow();
+            let mut out = HashMap::with_capacity(m.len());
+            for (k, vv) in m.iter() {
+                out.insert(k.clone(), spawn_value_to_wire(vv)?);
+            }
+            Ok(SpawnWireValue::Map(out))
+        }
+        Value::Function(f) => Ok(SpawnWireValue::Function(Box::new(spawn_function_to_wire(f)?))),
+        Value::Closure(c) => Ok(SpawnWireValue::Closure(Box::new(spawn_closure_to_wire(c)?))),
+        _ => Err(
+            "spawn: value not transferable (unsupported: builtin/module/resource handle)".into(),
+        ),
+    }
+}
+
+fn spawn_function_from_wire(
+    f: &SpawnWireFunction,
+    module: Rc<RefCell<Module>>,
+) -> Result<Rc<Function>, String> {
+    let defaults = f
+        .defaults
+        .iter()
+        .map(|v| spawn_value_from_wire(v, module.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let constants = f
+        .constants
+        .iter()
+        .map(|v| spawn_value_from_wire(v, module.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Rc::new(Function {
+        name: f.name.clone(),
+        arity: f.arity,
+        min_arity: f.min_arity,
+        defaults,
+        is_vararg: f.is_vararg,
+        chunk: Chunk {
+            instructions: f.instructions.clone(),
+            spans: f.spans.clone(),
+            constants,
+            source_name: None,
+            source: None,
+        },
+    }))
+}
+
+fn spawn_closure_from_wire(
+    c: &SpawnWireClosure,
+    module: Rc<RefCell<Module>>,
+) -> Result<Rc<Closure>, String> {
+    let function = spawn_function_from_wire(&c.function, module.clone())?;
+    let mut upvalues = Vec::with_capacity(c.upvalues.len());
+    for v in &c.upvalues {
+        let vv = spawn_value_from_wire(v, module.clone())?;
+        upvalues.push(Rc::new(RefCell::new(Upvalue::Closed(vv))));
+    }
+    Ok(Rc::new(Closure {
+        function,
+        upvalues,
+        module,
+    }))
+}
+
+fn spawn_value_from_wire(v: &SpawnWireValue, module: Rc<RefCell<Module>>) -> Result<Value, String> {
+    match v {
+        SpawnWireValue::Nil => Ok(Value::Nil),
+        SpawnWireValue::Bool(b) => Ok(Value::Bool(*b)),
+        SpawnWireValue::Number(n) => Ok(Value::Number(*n)),
+        SpawnWireValue::String(s) => Ok(alloc_string(s.clone())),
+        SpawnWireValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(spawn_value_from_wire(item, module.clone())?);
+            }
+            Ok(alloc_array(out))
+        }
+        SpawnWireValue::Map(map) => {
+            let mut out = HashMap::with_capacity(map.len());
+            for (k, vv) in map {
+                out.insert(k.clone(), spawn_value_from_wire(vv, module.clone())?);
+            }
+            Ok(alloc_map(out))
+        }
+        SpawnWireValue::Function(f) => Ok(Value::Function(spawn_function_from_wire(f, module)?)),
+        SpawnWireValue::Closure(c) => Ok(Value::Closure(spawn_closure_from_wire(c, module)?)),
+    }
+}
+
 fn value_to_handle(host: &mut dyn VmHost, v: Value, what: &str) -> Result<usize, RuntimeError> {
     match v {
         Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n >= 1.0 => Ok(n as usize),
@@ -464,6 +610,8 @@ pub struct VM {
     thread_pool: Option<ThreadPool>,
     /// Spawn/channel/sync handle tables (shared with child VMs from `spawn`).
     handle_registry: Arc<VmHandleRegistry>,
+    /// Optional pre-seeded stdin lines (used by IDE / embeddings).
+    stdin_lines: std::collections::VecDeque<String>,
 }
 
 #[derive(Default)]
@@ -996,6 +1144,11 @@ impl VM {
                     args.len()
                 )));
             }
+            if let Some(vm) = host.as_any_mut().downcast_mut::<VM>() {
+                if let Some(seed) = vm.pop_stdin_line() {
+                    return Ok(alloc_string(seed));
+                }
+            }
             let mut s = String::new();
             let n = std::io::stdin()
                 .read_line(&mut s)
@@ -1490,9 +1643,9 @@ impl VM {
                 Value::Map(m) => {
                     m.borrow_mut()
                         .insert("__frozen".to_string(), Value::Bool(true));
-                    Ok(args.into_iter().next().unwrap())
+                    Ok(args[0].clone())
                 }
-                _ => Ok(args.into_iter().next().unwrap()), // non-maps pass through
+                _ => Ok(args[0].clone()), // non-maps pass through
             }
         }
 
@@ -1666,7 +1819,7 @@ impl VM {
                     "TypeError: require_type expected {expected}, got {actual}"
                 )));
             }
-            Ok(args.into_iter().next().unwrap())
+            Ok(args[0].clone())
         }
 
         fn gc_collect(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -3674,28 +3827,43 @@ impl VM {
                     )
                 }
             };
-            // Serialize closed upvalues; open upvalues (still on stack) cannot transfer.
-            let mut upvalues_json: Vec<sj::Value> = Vec::new();
+            // Serialize closure captures. Closed upvalues transfer directly.
+            // Open upvalues are snapshotted from the current VM stack at spawn time.
+            let mut upvalues_wire: Vec<SpawnWireValue> = Vec::new();
             for uv in &closure.upvalues {
                 let val = match &*uv.borrow() {
                     Upvalue::Closed(v) => v.clone(),
-                    Upvalue::Open(_) => {
-                        return Err(host.err("spawn: open upvalue cannot be transferred".into()))
+                    Upvalue::Open(i) => {
+                        let vm = match host.as_any_mut().downcast_mut::<VM>() {
+                            Some(vm) => vm,
+                            None => {
+                                return Err(host
+                                    .err("spawn: host does not support open-upvalue snapshot".into()))
+                            }
+                        };
+                        match vm.stack.get(*i).cloned() {
+                            Some(v) => v,
+                            None => return Err(host.err("spawn: open upvalue points outside stack".into())),
+                        }
                     }
                 };
-                upvalues_json.push(spawn_value_to_json(&val).map_err(|e| host.err(e))?);
+                upvalues_wire.push(spawn_value_to_wire(&val).map_err(|e| host.err(e))?);
             }
-            let upvalues_json_str =
-                sj::to_string(&upvalues_json).map_err(|e| host.err(e.to_string()))?;
-            let chunk = &closure.function.chunk;
-            let mut constants_json = Vec::new();
-            for c in &chunk.constants {
-                constants_json.push(spawn_value_to_json(c).map_err(|e| host.err(e))?);
-            }
-            let constants_json_str =
-                sj::to_string(&constants_json).map_err(|e| host.err(e.to_string()))?;
-            let instructions = chunk.instructions.clone();
-            let spans = chunk.spans.clone();
+            let root_wire = SpawnWireClosure {
+                function: spawn_function_to_wire(&closure.function).map_err(|e| host.err(e))?,
+                upvalues: upvalues_wire,
+            };
+            let module_globals_wire: HashMap<String, SpawnWireValue> = {
+                let globals = closure.module.borrow();
+                let mut out = HashMap::new();
+                for (k, v) in globals.globals.iter() {
+                    // Best-effort transfer: keep transferable globals only.
+                    if let Ok(wv) = spawn_value_to_wire(v) {
+                        out.insert(k.clone(), wv);
+                    }
+                }
+                out
+            };
             let spawn_limits = host.spawn_limits();
 
             let handles = vm_handles(host)?;
@@ -3710,50 +3878,11 @@ impl VM {
             let child_handles = Arc::clone(&handles);
             let config = StdlibConfig::default();
             thread::spawn(move || {
-                let constants: Vec<Value> =
-                    match sj::from_str::<Vec<sj::Value>>(&constants_json_str) {
-                        Ok(arr) => arr.iter().map(spawn_value_from_json).collect(),
-                        Err(e) => {
-                            let _ = tx.send(Err(e.to_string()));
-                            return;
-                        }
-                    };
-                let child_chunk = Chunk {
-                    instructions: instructions.clone(),
-                    spans: spans.clone(),
-                    constants,
-                    source_name: None,
-                    source: None,
-                };
-                let function = Rc::new(Function {
-                    name: None,
-                    arity: 0,
-                    min_arity: 0,
-                    defaults: vec![],
-                    is_vararg: false,
-                    chunk: child_chunk,
-                });
                 let module = Rc::new(RefCell::new(Module {
                     globals: HashMap::new(),
                     parent: None,
                     exports: HashMap::new(),
                 }));
-                let child_closure = Rc::new(Closure {
-                    function,
-                    upvalues: match sj::from_str::<Vec<sj::Value>>(&upvalues_json_str) {
-                        Ok(arr) => arr
-                            .iter()
-                            .map(|j| {
-                                Rc::new(RefCell::new(Upvalue::Closed(spawn_value_from_json(j))))
-                            })
-                            .collect(),
-                        Err(e) => {
-                            let _ = tx.send(Err(e.to_string()));
-                            return;
-                        }
-                    },
-                    module,
-                });
                 let mut vm = VM::with_stdlib(config);
                 vm.handle_registry = child_handles;
                 if let Some(lim) = spawn_limits {
@@ -3768,8 +3897,23 @@ impl VM {
                 // so that builtin globals (recv, send, etc.) are accessible.
                 {
                     let builtins_parent = vm.module.borrow().parent.clone();
-                    child_closure.module.borrow_mut().parent = builtins_parent;
+                    module.borrow_mut().parent = builtins_parent;
                 }
+                {
+                    let mut gm = module.borrow_mut();
+                    for (k, wv) in &module_globals_wire {
+                        if let Ok(v) = spawn_value_from_wire(wv, module.clone()) {
+                            gm.globals.insert(k.clone(), v);
+                        }
+                    }
+                }
+                let child_closure = match spawn_closure_from_wire(&root_wire, module) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                };
                 let wrapper = Chunk {
                     instructions: vec![OpCode::OpConstant(0), OpCode::OpCall(0), OpCode::OpReturn],
                     constants: vec![Value::Closure(child_closure)],
@@ -3778,8 +3922,7 @@ impl VM {
                     source: None,
                 };
                 let result = match vm.run_return_value(wrapper) {
-                    Ok(v) => spawn_value_to_json(&v)
-                        .and_then(|j| sj::to_string(&j).map_err(|e| e.to_string())),
+                    Ok(v) => spawn_value_to_wire(&v),
                     Err(e) => Err(e.message),
                 };
                 let _ = tx.send(result);
@@ -3804,10 +3947,13 @@ impl VM {
                 .recv()
                 .map_err(|_| host.err("join: channel closed (spawn failed?)".into()))?;
             match result {
-                Ok(json_str) => {
-                    let j: sj::Value =
-                        sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
-                    Ok(spawn_value_from_json(&j))
+                Ok(v) => {
+                    let module = host
+                        .as_any_mut()
+                        .downcast_mut::<VM>()
+                        .map(|vm| vm.module.clone())
+                        .unwrap_or_else(|| Rc::new(RefCell::new(Module::default())));
+                    spawn_value_from_wire(&v, module).map_err(|e| host.err(e))
                 }
                 Err(msg) => Err(host.err(msg)),
             }
@@ -4253,12 +4399,13 @@ impl VM {
                 let result = rx
                     .recv()
                     .map_err(|_| host.err("join_all: channel closed".into()))?;
+                let module = host
+                    .as_any_mut()
+                    .downcast_mut::<VM>()
+                    .map(|vm| vm.module.clone())
+                    .unwrap_or_else(|| Rc::new(RefCell::new(Module::default())));
                 let val = match result {
-                    Ok(json_str) => {
-                        let j: sj::Value =
-                            sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
-                        spawn_value_from_json(&j)
-                    }
+                    Ok(v) => spawn_value_from_wire(&v, module).map_err(|e| host.err(e))?,
                     Err(msg) => {
                         // Propagate error as {ok:false, error:msg}
                         let mut m = std::collections::HashMap::new();
@@ -6349,8 +6496,29 @@ impl VM {
             let fin = if (b0 & 0x80) != 0 { 1.0 } else { 0.0 };
             let opcode = (b0 & 0x0f) as f64;
             let masked = (b1 & 0x80) != 0;
-            let payload_len = (b1 & 0x7f) as usize;
+            let len_code = (b1 & 0x7f) as usize;
             let mut idx = 2usize;
+            let payload_len = if len_code <= 125 {
+                len_code
+            } else if len_code == 126 {
+                if codes.len() < idx + 2 {
+                    return Err(host.err("ws_parse_frame(): frame too short for 16-bit length".into()));
+                }
+                let n = ((codes[idx] as usize) << 8) | (codes[idx + 1] as usize);
+                idx += 2;
+                n
+            } else {
+                if codes.len() < idx + 8 {
+                    return Err(host.err("ws_parse_frame(): frame too short for 64-bit length".into()));
+                }
+                let mut n: u64 = 0;
+                for i in 0..8 {
+                    n = (n << 8) | (codes[idx + i] as u64);
+                }
+                idx += 8;
+                usize::try_from(n)
+                    .map_err(|_| host.err("ws_parse_frame(): payload too large for this runtime".into()))?
+            };
 
             let mut masking_key = [0u8; 4];
             if masked {
@@ -6382,6 +6550,9 @@ impl VM {
             m.insert("payload".into(), alloc_string(payload));
             m.insert("fin".into(), Value::Number(fin));
             m.insert("masked".into(), Value::Number(if masked { 1.0 } else { 0.0 }));
+            m.insert("payload_len".into(), Value::Number(payload_len as f64));
+            m.insert("frame_len".into(), Value::Number((idx + payload_len) as f64));
+            m.insert("next_index".into(), Value::Number((idx + payload_len) as f64));
             Ok(alloc_map(m))
         }
 
@@ -6403,11 +6574,6 @@ impl VM {
                 .as_str()
                 .map_err(|m| host.err(format!("ws_write_frame(): payload: {m}")))?;
             let payload_bytes: Vec<u8> = payload.chars().map(|c| (c as u32).min(255) as u8).collect();
-            if payload_bytes.len() > 125 {
-                return Err(host.err(
-                    "ws_write_frame(): payload >125 bytes is not implemented yet".into(),
-                ));
-            }
 
             let mut rng = rand::thread_rng();
             let mask_key = [
@@ -6418,7 +6584,21 @@ impl VM {
             ];
             let mut out = String::new();
             let b0 = 0x80u8 | (opcode & 0x0f); // FIN=1
-            let b1 = 0x80u8 | (payload_bytes.len() as u8); // MASK=1
+            let plen = payload_bytes.len();
+            let mut len_ext: Vec<u8> = Vec::new();
+            let b1 = if plen <= 125 {
+                0x80u8 | (plen as u8) // MASK=1 + short length
+            } else if plen <= 65_535 {
+                len_ext.push(((plen >> 8) & 0xff) as u8);
+                len_ext.push((plen & 0xff) as u8);
+                0x80u8 | 126u8
+            } else {
+                let plen64 = plen as u64;
+                for shift in (0..=56).rev().step_by(8) {
+                    len_ext.push(((plen64 >> shift) & 0xff) as u8);
+                }
+                0x80u8 | 127u8
+            };
             out.push(
                 std::char::from_u32(b0 as u32)
                     .ok_or_else(|| host.err("ws_write_frame(): invalid header byte".into()))?,
@@ -6427,6 +6607,12 @@ impl VM {
                 std::char::from_u32(b1 as u32)
                     .ok_or_else(|| host.err("ws_write_frame(): invalid header byte".into()))?,
             );
+            for b in len_ext {
+                out.push(
+                    std::char::from_u32(b as u32)
+                        .ok_or_else(|| host.err("ws_write_frame(): invalid extended length byte".into()))?,
+                );
+            }
             for b in mask_key {
                 out.push(
                     std::char::from_u32(b as u32)
@@ -7468,7 +7654,7 @@ impl VM {
             },
             BuiltinFn {
                 name: "websocket_write_frame",
-                arity: Some(3),
+                arity: Some(2),
                 fun: ws_write_frame_builtin,
             },
         ];
@@ -7582,11 +7768,10 @@ impl VM {
             };
             if should_close {
                 let uv = self.open_upvalues.remove(i);
-                let closed_val = self.stack[match *uv.borrow() {
-                    crate::Upvalue::Open(idx) => idx,
-                    _ => unreachable!(),
-                }]
-                .clone();
+                let closed_val = match *uv.borrow() {
+                    crate::Upvalue::Open(idx) => self.stack.get(idx).cloned().unwrap_or(Value::Nil),
+                    _ => Value::Nil,
+                };
                 *uv.borrow_mut() = crate::Upvalue::Closed(closed_val);
             } else {
                 i += 1;
@@ -7596,14 +7781,18 @@ impl VM {
 
     fn upvalue_get(&self, uv: &std::rc::Rc<std::cell::RefCell<crate::Upvalue>>) -> Value {
         match &*uv.borrow() {
-            crate::Upvalue::Open(i) => self.stack[*i].clone(),
+            crate::Upvalue::Open(i) => self.stack.get(*i).cloned().unwrap_or(Value::Nil),
             crate::Upvalue::Closed(v) => v.clone(),
         }
     }
 
     fn upvalue_set(&mut self, uv: &std::rc::Rc<std::cell::RefCell<crate::Upvalue>>, v: Value) {
         match &mut *uv.borrow_mut() {
-            crate::Upvalue::Open(i) => self.stack[*i] = v,
+            crate::Upvalue::Open(i) => {
+                if let Some(slot) = self.stack.get_mut(*i) {
+                    *slot = v;
+                }
+            }
             crate::Upvalue::Closed(slot) => *slot = v,
         }
     }
@@ -7632,6 +7821,7 @@ impl VM {
             memory_tracker: MemoryTracker::new(),
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
+            stdin_lines: std::collections::VecDeque::new(),
         }
     }
 
@@ -7681,6 +7871,7 @@ impl VM {
             memory_tracker: MemoryTracker::new(),
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
+            stdin_lines: std::collections::VecDeque::new(),
         }
     }
 
@@ -7711,7 +7902,17 @@ impl VM {
             handle_registry: VmHandleRegistry::new(),
             limits: None,
             ffi_policy: None,
+            stdin_lines: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Seed stdin lines consumed by `read_line()` before falling back to terminal stdin.
+    pub fn set_stdin_lines<I: IntoIterator<Item = String>>(&mut self, lines: I) {
+        self.stdin_lines = lines.into_iter().collect();
+    }
+
+    fn pop_stdin_line(&mut self) -> Option<String> {
+        self.stdin_lines.pop_front()
     }
 
     /// Normal run: prints to stdout (REPL behavior).

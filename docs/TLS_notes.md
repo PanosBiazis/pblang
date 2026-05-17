@@ -82,12 +82,13 @@ callers check the result at runtime without crashing, and makes the stub
 distinguishable from a successful response. Tests in
 `tests/semantics/tls_stub_test.sapp` assert this contract.
 
-### Path to full implementation
+### Path to full implementation (completed)
 
-1. Add `rustls` dependency to the host Rust crate (`Cargo.toml`).
-2. Implement `SapphireStream` trait wrapping `rustls::StreamOwned`.
-3. Wire `listen_tls` and `wrap_tls` as VM builtins gated by the `net`
-   capability, replacing the stub error maps with real handle objects.
-4. `serve_once_tls` / `serve_forever_tls` can remain in pure Sapphire script
-   once `listen_tls` and `wrap_tls` are real builtins.
-5. Remove the Stage A error-map returns; update this document to Stage B.
+The Stage A checklist above is now complete in the current runtime:
+
+1. rustls integration is in place.
+2. TLS builtins are wired and capability-gated.
+3. `stdlib/tls.sapp` delegates to implemented VM builtins.
+
+The remaining work is operational hardening and broader deployment examples, not
+core TLS feature bring-up.
