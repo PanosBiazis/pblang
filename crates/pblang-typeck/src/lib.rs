@@ -215,7 +215,10 @@ impl Ty {
             ),
             Ty::NonNull(inner) => Ty::NonNull(Box::new(inner.substitute_generics(subst))),
             Ty::Fn(params, ret) => Ty::Fn(
-                params.iter().map(|p| p.substitute_generics(subst)).collect(),
+                params
+                    .iter()
+                    .map(|p| p.substitute_generics(subst))
+                    .collect(),
                 Box::new(ret.substitute_generics(subst)),
             ),
             _ => self.clone(),
@@ -320,7 +323,10 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("len", fn1(num.clone())),
         ("str", fn1(str_ty.clone())),
         ("type", fn1(str_ty.clone())),
-        ("import", Ty::Fn(vec![str_ty.clone()], Box::new(any.clone()))),
+        (
+            "import",
+            Ty::Fn(vec![str_ty.clone()], Box::new(any.clone())),
+        ),
         // Concurrency builtins used directly by IDE examples/stdlib wrappers.
         ("spawn", fn1(any.clone())),
         ("join", fn1(any.clone())),
@@ -1246,9 +1252,8 @@ mod tests {
 
     #[test]
     fn test_builtin_prelude_import_and_print() {
-        let diags = typecheck_source(
-            "let m = import(\"stdlib/compiler/tokenizer.sapp\");\nprint len(m);",
-        );
+        let diags =
+            typecheck_source("let m = import(\"stdlib/compiler/tokenizer.sapp\");\nprint len(m);");
         let undeclared: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("not declared"))
@@ -1304,9 +1309,7 @@ mod tests {
 
     #[test]
     fn test_fn_lit_body_checked() {
-        let diags = typecheck_source(
-            "let f = fn(x: number) -> number { return x + \"oops\"; };",
-        );
+        let diags = typecheck_source("let f = fn(x: number) -> number { return x + \"oops\"; };");
         assert!(
             diags.iter().any(|d| d.message.contains("type mismatch")),
             "fn literal body should be type-checked: {:?}",

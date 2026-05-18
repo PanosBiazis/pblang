@@ -1,5 +1,5 @@
-use pblang_core::parse;
 use pblang_compiler::compile;
+use pblang_core::parse;
 use pblang_vm::{StdlibConfig, VM};
 
 fn run_ok(src: &str) {
