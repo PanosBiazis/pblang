@@ -14,7 +14,11 @@ pub struct CompileError {
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "compile error at {}..{}: {}", self.span.start, self.span.end, self.message)
+        write!(
+            f,
+            "compile error at {}..{}: {}",
+            self.span.start, self.span.end, self.message
+        )
     }
 }
 
@@ -34,9 +38,9 @@ fn expr_to_const_value(e: &pblang_core::Expr) -> Option<pblang_ir::Value> {
     use pblang_core::ExprKind;
     match &e.kind {
         ExprKind::Number(n) => Some(pblang_ir::Value::Number(*n)),
-        ExprKind::Bool(b)   => Some(pblang_ir::Value::Bool(*b)),
-        ExprKind::Nil       => Some(pblang_ir::Value::Nil),
-        ExprKind::Str(s)    => Some(pblang_ir::alloc_string(s.clone())),
+        ExprKind::Bool(b) => Some(pblang_ir::Value::Bool(*b)),
+        ExprKind::Nil => Some(pblang_ir::Value::Nil),
+        ExprKind::Str(s) => Some(pblang_ir::alloc_string(s.clone())),
         _ => None, // complex expression: user must use nil-check pattern
     }
 }
@@ -199,7 +203,9 @@ impl Compiler {
         if self.scope_depth == 0 {
             return;
         } // globals are “late-bound”
-        let last = self.locals.last_mut()
+        let last = self
+            .locals
+            .last_mut()
             .expect("mark_initialized called with empty locals - always preceded by declare_local");
         last.depth = Some(self.scope_depth);
     }
@@ -243,7 +249,10 @@ impl Compiler {
         if let Some(slot) = self.resolve_local(name) {
             if self.locals[slot].depth.is_none() {
                 self.error = Some(CompileError {
-                    message: format!("cannot read local variable '{}' in its own initializer", name),
+                    message: format!(
+                        "cannot read local variable '{}' in its own initializer",
+                        name
+                    ),
                     span,
                 });
                 // Return global to avoid cascading errors
@@ -280,7 +289,9 @@ impl Compiler {
                 break;
             }
 
-            let local = self.locals.pop()
+            let local = self
+                .locals
+                .pop()
                 .expect("pop inside end_scope: last() was Some so pop() cannot be None");
             if local.is_captured {
                 self.chunk.write(OpCode::OpCloseUpvalue, VmSpan::default());
@@ -438,10 +449,18 @@ impl Compiler {
                 optimize_chunk(&mut f_compiler.chunk);
                 // Count required params and check for vararg
                 let is_vararg_fn = params.last().map(|p| p.is_vararg).unwrap_or(false);
-                let named_arity = if is_vararg_fn { params.len() - 1 } else { params.len() };
-                let min_arity_fn = params.iter().filter(|p| p.default.is_none() && !p.is_vararg).count();
+                let named_arity = if is_vararg_fn {
+                    params.len() - 1
+                } else {
+                    params.len()
+                };
+                let min_arity_fn = params
+                    .iter()
+                    .filter(|p| p.default.is_none() && !p.is_vararg)
+                    .count();
                 // Pre-compile constant defaults into Values
-                let defaults_vals: Vec<pblang_ir::Value> = params.iter()
+                let defaults_vals: Vec<pblang_ir::Value> = params
+                    .iter()
                     .filter_map(|p| p.default.as_ref().map(expr_to_const_value))
                     .flatten()
                     .collect();
@@ -586,7 +605,8 @@ impl Compiler {
                     // Treat as a regular global for now; lint can warn about reassignment.
                     self.emit_expr(init);
                     let name_idx = self.intern_name(&name);
-                    self.chunk.write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
+                    self.chunk
+                        .write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
                 } else {
                     // Local const: mark as const so Assign() will error
                     self.declare_const(name, sp);
@@ -826,7 +846,8 @@ impl Compiler {
                 let len_sym = format!("__forin_len_{name}");
                 let len_slot = self.declare_local(len_sym, sp);
                 let len_name_idx = self.intern_name("len");
-                self.chunk.write(OpCode::OpGetGlobal(len_name_idx), vspan(sp));
+                self.chunk
+                    .write(OpCode::OpGetGlobal(len_name_idx), vspan(sp));
                 self.chunk.write(OpCode::OpGetLocal(col_slot), vspan(sp));
                 self.chunk.write(OpCode::OpCall(1), vspan(sp));
                 self.mark_initialized();
@@ -1404,9 +1425,17 @@ impl Compiler {
 
                 optimize_chunk(&mut f_compiler.chunk);
                 let is_vararg_lit = params.last().map(|p| p.is_vararg).unwrap_or(false);
-                let named_arity_lit = if is_vararg_lit { params.len() - 1 } else { params.len() };
-                let min_arity_lit = params.iter().filter(|p| p.default.is_none() && !p.is_vararg).count();
-                let defaults_lit: Vec<pblang_ir::Value> = params.iter()
+                let named_arity_lit = if is_vararg_lit {
+                    params.len() - 1
+                } else {
+                    params.len()
+                };
+                let min_arity_lit = params
+                    .iter()
+                    .filter(|p| p.default.is_none() && !p.is_vararg)
+                    .count();
+                let defaults_lit: Vec<pblang_ir::Value> = params
+                    .iter()
                     .filter_map(|p| p.default.as_ref().map(expr_to_const_value))
                     .flatten()
                     .collect();
@@ -1609,7 +1638,7 @@ impl Compiler {
                 let not_nil_ip = self.ip();
                 self.patch(jmp_not_nil, OpCode::OpJumpIfFalse(not_nil_ip));
                 self.chunk.write(OpCode::OpPop, vspan(sp)); // pop is_nil bool (false)
-                // (original a value remains on stack)
+                                                            // (original a value remains on stack)
                 let end_ip = self.ip();
                 self.patch(jmp_end, OpCode::OpJump(end_ip));
             }
@@ -1687,20 +1716,42 @@ fn optimize_chunk(chunk: &mut Chunk) {
         let op2 = chunk.instructions.get(i + 2).cloned();
 
         // Pattern: OpConstant(a), OpConstant(b), BinaryOp → fold to OpConstant(result)
-        if let (Some(OpCode::OpConstant(ia)), Some(OpCode::OpConstant(ib)), Some(ref arith)) = (op0, op1, op2) {
+        if let (Some(OpCode::OpConstant(ia)), Some(OpCode::OpConstant(ib)), Some(ref arith)) =
+            (op0, op1, op2)
+        {
             let va = chunk.constants.get(ia).cloned();
             let vb = chunk.constants.get(ib).cloned();
             let folded: Option<Value> = match (va, vb, arith) {
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpAdd) => Some(Value::Number(a + b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpSub) => Some(Value::Number(a - b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpMul) => Some(Value::Number(a * b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpDiv) if b != 0.0 => Some(Value::Number(a / b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpEq)    => Some(Value::Bool(a == b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpNotEq) => Some(Value::Bool(a != b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpLt)    => Some(Value::Bool(a < b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpLe)    => Some(Value::Bool(a <= b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpGt)    => Some(Value::Bool(a > b)),
-                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpGe)    => Some(Value::Bool(a >= b)),
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpAdd) => {
+                    Some(Value::Number(a + b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpSub) => {
+                    Some(Value::Number(a - b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpMul) => {
+                    Some(Value::Number(a * b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpDiv) if b != 0.0 => {
+                    Some(Value::Number(a / b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpEq) => {
+                    Some(Value::Bool(a == b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpNotEq) => {
+                    Some(Value::Bool(a != b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpLt) => {
+                    Some(Value::Bool(a < b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpLe) => {
+                    Some(Value::Bool(a <= b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpGt) => {
+                    Some(Value::Bool(a > b))
+                }
+                (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpGe) => {
+                    Some(Value::Bool(a >= b))
+                }
                 // String concatenation folding
                 _ => None,
             };
@@ -1722,10 +1773,10 @@ fn optimize_chunk(chunk: &mut Chunk) {
                 // i+0: OpJump(i+1)  (skip to next, effectively no-op)
                 // i+1: OpJump(i+2)  (skip to next)
                 // i+2: OpConstant(new_idx)  (the folded result)
-                chunk.instructions[i]     = OpCode::OpJump(i + 1);
+                chunk.instructions[i] = OpCode::OpJump(i + 1);
                 chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
                 chunk.instructions[i + 2] = OpCode::OpConstant(new_idx);
-                chunk.spans[i]     = span0;
+                chunk.spans[i] = span0;
                 chunk.spans[i + 2] = span2;
                 i += 3;
                 continue;
@@ -1744,7 +1795,8 @@ fn optimize_chunk(chunk: &mut Chunk) {
             match op {
                 OpCode::OpJump(t) => {
                     if let Some(OpCode::OpJump(t2)) = chunk.instructions.get(t).cloned() {
-                        if t != i && t2 != i { // avoid self-jumps
+                        if t != i && t2 != i {
+                            // avoid self-jumps
                             chunk.instructions[i] = OpCode::OpJump(t2);
                             changed = true;
                         }
@@ -1776,7 +1828,7 @@ fn optimize_chunk(chunk: &mut Chunk) {
 
         // Dup + Pop → remove both (net zero effect), replace with OpJump(next)
         if matches!(op0, Some(OpCode::OpDup)) && matches!(op1, Some(OpCode::OpPop)) {
-            chunk.instructions[i]     = OpCode::OpJump(i + 2);
+            chunk.instructions[i] = OpCode::OpJump(i + 2);
             chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
             i += 2;
             continue;
@@ -1784,7 +1836,7 @@ fn optimize_chunk(chunk: &mut Chunk) {
 
         // Not + Not → remove both (double negation), replace with OpJump(next)
         if matches!(op0, Some(OpCode::OpNot)) && matches!(op1, Some(OpCode::OpNot)) {
-            chunk.instructions[i]     = OpCode::OpJump(i + 2);
+            chunk.instructions[i] = OpCode::OpJump(i + 2);
             chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
             i += 2;
             continue;

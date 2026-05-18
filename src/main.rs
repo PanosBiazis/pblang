@@ -72,7 +72,10 @@ fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
             for comp in rel_entry.components() {
                 walk.push(comp);
                 let md = std::fs::symlink_metadata(&walk).map_err(|e| {
-                    format!("package entry component not found '{}': {e}", walk.display())
+                    format!(
+                        "package entry component not found '{}': {e}",
+                        walk.display()
+                    )
                 })?;
                 if md.file_type().is_symlink() {
                     return Err(format!(
@@ -265,9 +268,12 @@ fn run_manifest_validator_pblang_file(manifest_path: &Path) -> Result<serde_json
         .map_err(|e| format!("compile pblang manifest validator snippet failed: {e}"))?;
     chunk.source = Some(std::rc::Rc::new(src.clone()));
     let mut vm = VM::with_stdlib(StdlibConfig::default());
-    let out = vm
-        .run_collect(chunk)
-        .map_err(|e| format!("run pblang manifest validator snippet failed: {}", e.message))?;
+    let out = vm.run_collect(chunk).map_err(|e| {
+        format!(
+            "run pblang manifest validator snippet failed: {}",
+            e.message
+        )
+    })?;
     let rendered = out
         .last()
         .ok_or_else(|| "pblang manifest validator produced no output".to_string())
@@ -302,7 +308,10 @@ fn run_manifest_parity_check(manifest_path: &Path) -> Result<serde_json::Value, 
                 } else {
                     "unknown"
                 };
-                rust_dep_kinds.insert(dep_name.clone(), serde_json::Value::String(kind.to_string()));
+                rust_dep_kinds.insert(
+                    dep_name.clone(),
+                    serde_json::Value::String(kind.to_string()),
+                );
             }
             if name.trim().is_empty() {
                 rust_errors.push("[package].name is required".to_string());
@@ -368,7 +377,9 @@ fn run_manifest_parity_check(manifest_path: &Path) -> Result<serde_json::Value, 
     let mut pblang_deps = serde_json::Map::<String, serde_json::Value>::new();
     if let Some(items) = pblang.get("dependency_items").and_then(|v| v.as_array()) {
         for item in items {
-            let Some(obj) = item.as_object() else { continue };
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
             let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -449,8 +460,7 @@ fn strict_manifest_validator_enabled(context: &str) -> bool {
     if !strict_global {
         return false;
     }
-    let selector = std::env::var("PBLANG_STRICT_MANIFEST_VALIDATOR_COMMANDS")
-        .unwrap_or_default();
+    let selector = std::env::var("PBLANG_STRICT_MANIFEST_VALIDATOR_COMMANDS").unwrap_or_default();
     let selector = selector.trim();
     if selector.is_empty() {
         return true;
@@ -504,7 +514,10 @@ fn shadow_validate_manifest_with_pblang(man_dir: &Path, context: &str) -> Result
                     context, e
                 ));
             }
-            eprintln!("pblang {}: note: pblang-side manifest validator unavailable: {}", context, e);
+            eprintln!(
+                "pblang {}: note: pblang-side manifest validator unavailable: {}",
+                context, e
+            );
         }
     }
     Ok(())
@@ -923,10 +936,8 @@ fn print_cfg(chunk: &Chunk, dot: bool) {
                     leaders[i + 1] = true;
                 }
             }
-            OpCode::OpReturn => {
-                if i + 1 < n {
-                    leaders[i + 1] = true;
-                }
+            OpCode::OpReturn if i + 1 < n => {
+                leaders[i + 1] = true;
             }
             _ => {}
         }
@@ -2045,11 +2056,7 @@ fn main() {
             "{}",
             serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
         );
-        if !report
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if !report.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             std::process::exit(1);
         }
         return;
@@ -3401,7 +3408,11 @@ fn main() {
                 "Hello World",
                 "examples/hello_world/main.sapp",
             ),
-            ("tutorial_cli", "Tutorial: CLI", "examples/tutorial_cli/main.sapp"),
+            (
+                "tutorial_cli",
+                "Tutorial: CLI",
+                "examples/tutorial_cli/main.sapp",
+            ),
             (
                 "tutorial_concurrency",
                 "Tutorial: Concurrency",
@@ -3417,10 +3428,22 @@ fn main() {
                 "Tutorial: User Input",
                 "examples/tutorial_user_input/main.sapp",
             ),
-            ("thread_pool", "Thread Pool", "examples/thread_pool/main.sapp"),
+            (
+                "thread_pool",
+                "Thread Pool",
+                "examples/thread_pool/main.sapp",
+            ),
             ("web_server", "Web Server", "examples/web_server/main.sapp"),
-            ("orm_example", "ORM Example", "examples/orm_example/main.sapp"),
-            ("quantum_bb84", "Quantum BB84", "examples/quantum_bb84/main.sapp"),
+            (
+                "orm_example",
+                "ORM Example",
+                "examples/orm_example/main.sapp",
+            ),
+            (
+                "quantum_bb84",
+                "Quantum BB84",
+                "examples/quantum_bb84/main.sapp",
+            ),
             (
                 "concurrent_tasks",
                 "Concurrent Tasks",
@@ -4880,7 +4903,9 @@ fn main() {
             eprintln!(
                 "usage: pblang compile <file.sapp> [--out <name>] [--cc <compiler>] [--opt <level>] [--llvm|--wasm]"
             );
-            eprintln!("  Default: transpile pblang source to C99, then compile to a native binary.");
+            eprintln!(
+                "  Default: transpile pblang source to C99, then compile to a native binary."
+            );
             eprintln!("  --out <name>   Output binary name (default: a.out / a.exe)");
             eprintln!("  --cc <compiler> C compiler to use (default: gcc, fallback: clang, cc)");
             eprintln!("  --opt <level>  Optimization level 0-3 (default: 2)");
@@ -4939,7 +4964,9 @@ fn main() {
         let use_wasm = args.iter().any(|a| a == "--wasm" || a == "--wat");
 
         if use_llvm && use_wasm {
-            eprintln!("pblang compile: --llvm and --wasm are mutually exclusive; choose one backend");
+            eprintln!(
+                "pblang compile: --llvm and --wasm are mutually exclusive; choose one backend"
+            );
             std::process::exit(2);
         }
 
@@ -4956,7 +4983,10 @@ fn main() {
                         .map(PathBuf::from)
                         .unwrap_or_else(|| script_path.with_extension("wat"));
                     std::fs::write(&out_path, wat).unwrap_or_else(|e| {
-                        eprintln!("pblang compile --wasm: cannot write '{}': {e}", out_path.display());
+                        eprintln!(
+                            "pblang compile --wasm: cannot write '{}': {e}",
+                            out_path.display()
+                        );
                         std::process::exit(1);
                     });
                     eprintln!(

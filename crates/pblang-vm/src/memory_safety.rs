@@ -29,7 +29,7 @@ pub struct Borrow {
 pub enum BorrowType {
     Immutable, // &T
     Mutable,   // &mut T
-    Unique,     // &move T (consumes the original)
+    Unique,    // &move T (consumes the original)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,18 +72,10 @@ impl fmt::Display for MemorySafetyError {
                 )
             }
             MemorySafetyError::UseAfterMove(id) => {
-                write!(
-                    f,
-                    "Use after move: value at {:?} has been consumed",
-                    id
-                )
+                write!(f, "Use after move: value at {:?} has been consumed", id)
             }
             MemorySafetyError::LifetimeExpired(id) => {
-                write!(
-                    f,
-                    "Lifetime expired: value at {:?} is no longer valid",
-                    id
-                )
+                write!(f, "Lifetime expired: value at {:?} is no longer valid", id)
             }
             MemorySafetyError::AlreadyBorrowed(id) => {
                 write!(
@@ -105,11 +97,7 @@ impl fmt::Display for MemorySafetyError {
                 write!(f, "Cannot pop root lifetime")
             }
             MemorySafetyError::BorrowNotFound(id, bt) => {
-                write!(
-                    f,
-                    "No {:?} borrow found for memory location {:?}",
-                    bt, id
-                )
+                write!(f, "No {:?} borrow found for memory location {:?}", bt, id)
             }
         }
     }
@@ -248,10 +236,7 @@ impl MemoryTracker {
             return Err(MemorySafetyError::CannotPopRootLifetime);
         }
 
-        let expired = inner
-            .lifetime_stack
-            .pop()
-            .expect("just checked len > 1");
+        let expired = inner.lifetime_stack.pop().expect("just checked len > 1");
 
         // Mark all values allocated in this lifetime as expired.
         if let Some(ids) = inner.lifetime_values.remove(&expired) {
@@ -367,11 +352,7 @@ impl MemoryTracker {
             span,
         };
 
-        inner
-            .borrows
-            .entry(memory_id)
-            .or_default()
-            .push(borrow);
+        inner.borrows.entry(memory_id).or_default().push(borrow);
 
         if let Some(owner) = inner.owners.get_mut(&memory_id) {
             owner.is_borrowed = true;
@@ -402,11 +383,7 @@ impl MemoryTracker {
             span,
         };
 
-        inner
-            .borrows
-            .entry(memory_id)
-            .or_default()
-            .push(borrow);
+        inner.borrows.entry(memory_id).or_default().push(borrow);
 
         if let Some(owner) = inner.owners.get_mut(&memory_id) {
             owner.is_borrowed = true;
@@ -438,11 +415,7 @@ impl MemoryTracker {
             span,
         };
 
-        inner
-            .borrows
-            .entry(memory_id)
-            .or_default()
-            .push(borrow);
+        inner.borrows.entry(memory_id).or_default().push(borrow);
 
         if let Some(owner) = inner.owners.get_mut(&memory_id) {
             owner.is_consumed = true;
@@ -567,15 +540,22 @@ impl MemoryTracker {
     ) -> Result<(), MemorySafetyError> {
         let mut inner = self.inner.borrow_mut();
 
-        let borrows = inner
-            .borrows
-            .get_mut(&memory_id)
-            .ok_or(MemorySafetyError::BorrowNotFound(memory_id, borrow_type.clone()))?;
+        let borrows =
+            inner
+                .borrows
+                .get_mut(&memory_id)
+                .ok_or(MemorySafetyError::BorrowNotFound(
+                    memory_id,
+                    borrow_type.clone(),
+                ))?;
 
         let idx = borrows
             .iter()
             .position(|b| b.borrow_type == borrow_type)
-            .ok_or(MemorySafetyError::BorrowNotFound(memory_id, borrow_type.clone()))?;
+            .ok_or(MemorySafetyError::BorrowNotFound(
+                memory_id,
+                borrow_type.clone(),
+            ))?;
 
         borrows.remove(idx);
 
@@ -774,7 +754,11 @@ impl SafeValue {
     ///
     /// This does **not** create a borrow in the tracker — it merely
     /// wraps an existing borrow ID for Drop cleanup.
-    pub fn borrow_with_tracker(memory_id: MemoryId, borrow_id: BorrowId, tracker: &MemoryTracker) -> Self {
+    pub fn borrow_with_tracker(
+        memory_id: MemoryId,
+        borrow_id: BorrowId,
+        tracker: &MemoryTracker,
+    ) -> Self {
         Self {
             memory_id,
             borrow_type: BorrowType::Immutable,
@@ -784,7 +768,11 @@ impl SafeValue {
     }
 
     /// Create a mutable reference, associated with the given tracker.
-    pub fn borrow_mut_with_tracker(memory_id: MemoryId, borrow_id: BorrowId, tracker: &MemoryTracker) -> Self {
+    pub fn borrow_mut_with_tracker(
+        memory_id: MemoryId,
+        borrow_id: BorrowId,
+        tracker: &MemoryTracker,
+    ) -> Self {
         Self {
             memory_id,
             borrow_type: BorrowType::Mutable,

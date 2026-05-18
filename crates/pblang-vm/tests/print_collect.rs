@@ -1,6 +1,6 @@
-use pblang_core::parse;
 use pblang_compiler::compile;
-use pblang_vm::{StdlibConfig, VM, Value};
+use pblang_core::parse;
+use pblang_vm::{StdlibConfig, Value, VM};
 
 #[test]
 fn prints_true_and_one() {

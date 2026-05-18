@@ -5,10 +5,7 @@ use pblang_typeck::check as type_check;
 
 fn typecheck_source(src: &str) -> Vec<String> {
     let stmts = parse(src).expect("parse");
-    type_check(&stmts)
-        .into_iter()
-        .map(|d| d.message)
-        .collect()
+    type_check(&stmts).into_iter().map(|d| d.message).collect()
 }
 
 #[test]
@@ -65,8 +62,7 @@ fn generic_helper_call_typechecks() {
 fn compiler_stdlib_modules_parse() {
     for name in ["tokenizer", "typeck", "codegen", "parser"] {
         let path = format!("stdlib/compiler/{name}.sapp");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         parse(&src).unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
     }
 }

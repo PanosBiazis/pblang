@@ -124,10 +124,8 @@ pub struct LockedDep {
 // ──────────────────────────────────────────────────────────────
 
 /// Registry index: packages -> version -> { url, sha256 }.
-pub type RegistryIndex = std::collections::HashMap<
-    String,
-    std::collections::HashMap<String, RegistryRelease>,
->;
+pub type RegistryIndex =
+    std::collections::HashMap<String, std::collections::HashMap<String, RegistryRelease>>;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistryRelease {
@@ -174,7 +172,9 @@ pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
         .call()
         .map_err(|e| format!("GET {}: {e}", url))?;
     let mut bytes = vec![];
-    resp.into_reader().read_to_end(&mut bytes).map_err(|e| format!("read body: {e}"))?;
+    resp.into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read body: {e}"))?;
     Ok(bytes)
 }
 
@@ -201,7 +201,10 @@ pub fn parse_registry_index(json: &[u8]) -> Result<RegistryIndex, String> {
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| format!("index: release {}/{} missing 'url'", pkg_name, ver))?
                 .to_string();
-            let sha256 = release_obj.get("sha256").and_then(|s| s.as_str()).map(String::from);
+            let sha256 = release_obj
+                .get("sha256")
+                .and_then(|s| s.as_str())
+                .map(String::from);
             releases.insert(ver.clone(), RegistryRelease { url, sha256 });
         }
         index.insert(pkg_name.clone(), releases);
@@ -218,8 +221,7 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
     use std::path::Component;
     let dest_dir = std::fs::canonicalize(dest_dir)
         .or_else(|_| {
-            std::fs::create_dir_all(dest_dir)
-                .map_err(|e| format!("create_dir_all: {e}"))?;
+            std::fs::create_dir_all(dest_dir).map_err(|e| format!("create_dir_all: {e}"))?;
             std::fs::canonicalize(dest_dir).map_err(|e| format!("canonicalize dest: {e}"))
         })
         .map_err(|e: String| e)?;
@@ -231,10 +233,7 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
         let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
         let entry_path = entry.path().map_err(|e| format!("tar path: {e}"))?;
         let entry_type = entry.header().entry_type();
-        if matches!(
-            entry_type,
-            tar::EntryType::Symlink | tar::EntryType::Link
-        ) {
+        if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
             return Err(format!(
                 "SECURITY: tarball link entries are not allowed: {}",
                 entry_path.display()
@@ -260,7 +259,9 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
             }
         }
 
-        entry.unpack_in(&dest_dir).map_err(|e| format!("tar unpack entry: {e}"))?;
+        entry
+            .unpack_in(&dest_dir)
+            .map_err(|e| format!("tar unpack entry: {e}"))?;
     }
     Ok(())
 }
@@ -308,7 +309,9 @@ pub fn resolve_registry_release_url(index_url: &str, release_url: &str) -> Strin
 
 fn http_index_base_url(index_url: &str) -> Option<String> {
     let without_query = index_url.split('?').next().unwrap_or(index_url);
-    without_query.rfind('/').map(|pos| without_query[..pos].to_string())
+    without_query
+        .rfind('/')
+        .map(|pos| without_query[..pos].to_string())
 }
 
 fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Result<(), String> {
@@ -327,7 +330,8 @@ fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Resul
     if !sidecar.is_file() {
         return Ok(());
     }
-    let expected = std::fs::read_to_string(&sidecar).map_err(|e| format!("read HMAC sidecar: {e}"))?;
+    let expected =
+        std::fs::read_to_string(&sidecar).map_err(|e| format!("read HMAC sidecar: {e}"))?;
     let expected = expected.trim();
     let got = compute_tarball_hmac(tarball_bytes, key.as_bytes());
     if !got.eq_ignore_ascii_case(expected) {
@@ -343,9 +347,9 @@ fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Resul
 pub fn package_has_module_files(package_dir: &Path) -> bool {
     let mut entries = vec![];
     let _ = collect_files(package_dir, package_dir, &mut entries);
-    entries.iter().any(|(rel, _)| {
-        rel.ends_with(".sapp") || rel.ends_with(".sap") || rel.ends_with(".bpx")
-    })
+    entries
+        .iter()
+        .any(|(rel, _)| rel.ends_with(".sapp") || rel.ends_with(".sap") || rel.ends_with(".bpx"))
 }
 
 /// Validate a package directory before publish/install (modules + optional entry).
@@ -370,9 +374,7 @@ pub fn validate_package_tree(package_dir: &Path) -> Result<(), String> {
         }
     }
     if !package_has_module_files(package_dir) {
-        return Err(
-            "package has no Biapryx module files (.sapp/.sap/.bpx)".to_string(),
-        );
+        return Err("package has no Biapryx module files (.sapp/.sap/.bpx)".to_string());
     }
     Ok(())
 }
@@ -408,15 +410,17 @@ pub fn resolve_git_dep(
     let checkout = cache_root.join("git").join(&cache_key);
     if !checkout.is_dir() {
         if let Some(parent) = checkout.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create git cache dir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("create git cache dir: {e}"))?;
         }
         if checkout.exists() {
-            std::fs::remove_dir_all(&checkout)
-                .map_err(|e| format!("reset git cache dir: {e}"))?;
+            std::fs::remove_dir_all(&checkout).map_err(|e| format!("reset git cache dir: {e}"))?;
         }
         let status = Command::new("git")
-            .args(["clone", git_url, checkout.to_str().ok_or("invalid checkout path")?])
+            .args([
+                "clone",
+                git_url,
+                checkout.to_str().ok_or("invalid checkout path")?,
+            ])
             .status()
             .map_err(|e| format!("git clone failed to start: {e}"))?;
         if !status.success() {
@@ -452,10 +456,7 @@ pub fn resolve_dependency_root(
         Some("registry") => {
             let cache = cache_root(Some(man_dir));
             let root = if let Some(tarball_url) = dep.fetch_url.as_deref() {
-                let archive_sha256 = dep
-                    .archive_sha256
-                    .as_deref()
-                    .unwrap_or(dep.sha256.as_str());
+                let archive_sha256 = dep.archive_sha256.as_deref().unwrap_or(dep.sha256.as_str());
                 let cache_entry = cache.join(archive_sha256);
                 if !cache_entry.is_dir() {
                     let tarball_bytes = fetch_url(tarball_url)?;
@@ -485,9 +486,10 @@ pub fn resolve_dependency_root(
             Ok(root)
         }
         Some("git") => {
-            let resolved = dep.resolved.as_deref().ok_or_else(|| {
-                format!("lockfile missing resolved git ref for '{dep_name}'")
-            })?;
+            let resolved = dep
+                .resolved
+                .as_deref()
+                .ok_or_else(|| format!("lockfile missing resolved git ref for '{dep_name}'"))?;
             let (git_url, rev) = resolved
                 .rsplit_once('#')
                 .ok_or_else(|| format!("invalid git resolved ref in lockfile: {resolved}"))?;
@@ -550,7 +552,10 @@ fn resolve_package_subpath(dep_root: &Path, sub: &str) -> Result<PathBuf, String
     }
     let sub_path = Path::new(sub);
     for component in sub_path.components() {
-        if matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
             return Err(format!(
                 "import subpath '{}' must not escape the package root",
                 sub
@@ -561,8 +566,7 @@ fn resolve_package_subpath(dep_root: &Path, sub: &str) -> Result<PathBuf, String
     if path.is_dir() {
         return Err(format!("import subpath is not a file: {}", path.display()));
     }
-    canonicalize_existing(&path)
-        .ok_or_else(|| format!("import not found: {}", path.display()))
+    canonicalize_existing(&path).ok_or_else(|| format!("import not found: {}", path.display()))
 }
 
 /// Resolve one registry dependency.
@@ -606,7 +610,12 @@ pub fn resolve_registry_dep(
     }
     validate_package_tree(&cache_entry)?;
     let content_sha256 = hash_dir(&cache_entry)?;
-    Ok((cache_entry, content_sha256, archive_sha256, release_fetch_url))
+    Ok((
+        cache_entry,
+        content_sha256,
+        archive_sha256,
+        release_fetch_url,
+    ))
 }
 
 /// Fetch and install a single registry package into the cache.
@@ -716,10 +725,7 @@ pub fn generate_lockfile_with_registry(
             } else {
                 let version = spec.version_str().unwrap_or("");
                 if version.is_empty() {
-                    return Err(format!(
-                        "dependency '{}' requires a version string",
-                        name
-                    ));
+                    return Err(format!("dependency '{}' requires a version string", name));
                 }
                 let index_url = registry_index_url.ok_or_else(|| {
                     format!(
@@ -750,11 +756,20 @@ pub fn generate_lockfile_with_registry(
             }
         } else {
             let rel = spec.path().ok_or_else(|| {
-                format!("dependency '{}' has no path (and is not a registry/git dep)", name)
+                format!(
+                    "dependency '{}' has no path (and is not a registry/git dep)",
+                    name
+                )
             })?;
             let dep_root = manifest_dir.join(rel);
-            let dep_root = canonicalize_existing(&dep_root)
-                .ok_or_else(|| format!("dep '{}' path not found: {} ({})", name, rel, dep_root.display()))?;
+            let dep_root = canonicalize_existing(&dep_root).ok_or_else(|| {
+                format!(
+                    "dep '{}' path not found: {} ({})",
+                    name,
+                    rel,
+                    dep_root.display()
+                )
+            })?;
             let dep_hash = hash_dir(&dep_root)?;
             deps.insert(
                 name.clone(),
@@ -803,7 +818,9 @@ fn collect_files(root: &Path, cur: &Path, out: &mut Vec<(String, Vec<u8>)>) -> R
         if name == "target" || name.starts_with('.') {
             continue;
         }
-        let meta = ent.metadata().map_err(|e| format!("metadata '{}': {e}", p.display()))?;
+        let meta = ent
+            .metadata()
+            .map_err(|e| format!("metadata '{}': {e}", p.display()))?;
         if meta.is_dir() {
             collect_files(root, &p, out)?;
         } else if meta.is_file() {
@@ -812,8 +829,7 @@ fn collect_files(root: &Path, cur: &Path, out: &mut Vec<(String, Vec<u8>)>) -> R
                 .unwrap_or(&p)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let bytes =
-                std::fs::read(&p).map_err(|e| format!("read '{}': {e}", p.display()))?;
+            let bytes = std::fs::read(&p).map_err(|e| format!("read '{}': {e}", p.display()))?;
             out.push((rel, bytes));
         }
     }
@@ -829,7 +845,11 @@ pub fn resolve_import(
     if let Some((pkg, sub)) = import_str.split_once(':') {
         let is_windows_drive = cfg!(windows)
             && pkg.len() == 1
-            && pkg.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+            && pkg
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic())
+                .unwrap_or(false)
             && (sub.starts_with('/') || sub.starts_with('\\'));
         if !is_windows_drive {
             let base = base_dir.unwrap_or(cwd);
@@ -927,7 +947,8 @@ pub fn resolve_import(
     // 2) absolute or relative path
     let p = Path::new(import_str);
     if p.is_absolute() {
-        return canonicalize_existing(p).ok_or_else(|| format!("import not found: {}", p.display()));
+        return canonicalize_existing(p)
+            .ok_or_else(|| format!("import not found: {}", p.display()));
     }
 
     if let Some(base) = base_dir {
@@ -1015,12 +1036,8 @@ pub fn create_package_tarball_with_runtime(
     } else {
         "bin/pblang".to_string()
     };
-    let bytes = std::fs::read(runtime_exe).map_err(|e| {
-        format!(
-            "read runtime executable '{}': {e}",
-            runtime_exe.display()
-        )
-    })?;
+    let bytes = std::fs::read(runtime_exe)
+        .map_err(|e| format!("read runtime executable '{}': {e}", runtime_exe.display()))?;
     entries.push((rel, bytes));
     build_tarball_bytes(entries)
 }
@@ -1029,9 +1046,7 @@ fn validate_publish_package(package_dir: &Path) -> Result<(), String> {
     let man_path = package_dir.join("pblang.toml");
     let man_bytes = std::fs::read(&man_path)
         .map_err(|e| format!("read manifest {}: {e}", man_path.display()))?;
-    let man = parse_manifest(
-        std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?,
-    )?;
+    let man = parse_manifest(std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?)?;
     if !man.dependencies.is_empty() {
         return Err(
             "publish: registry packages must be self-contained packages (no [dependencies])"
@@ -1047,9 +1062,7 @@ pub fn publish_to_registry_dir(package_dir: &Path, registry_dir: &Path) -> Resul
     let man_path = package_dir.join("pblang.toml");
     let man_bytes = std::fs::read(&man_path)
         .map_err(|e| format!("read manifest {}: {e}", man_path.display()))?;
-    let man = parse_manifest(
-        std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?,
-    )?;
+    let man = parse_manifest(std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?)?;
     let name = man
         .package
         .as_ref()
@@ -1126,11 +1139,18 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
     let tarball = create_package_tarball(package_dir)?;
     let b64 = base64_encode(&tarball);
     let man_path = package_dir.join("pblang.toml");
-    let man_bytes = std::fs::read(&man_path)
-        .map_err(|e| format!("read manifest: {e}"))?;
+    let man_bytes = std::fs::read(&man_path).map_err(|e| format!("read manifest: {e}"))?;
     let man = parse_manifest(std::str::from_utf8(&man_bytes).map_err(|_| "utf8")?)?;
-    let name = man.package.as_ref().and_then(|p| p.name.as_deref()).unwrap_or("");
-    let version = man.package.as_ref().and_then(|p| p.version.as_deref()).unwrap_or("");
+    let name = man
+        .package
+        .as_ref()
+        .and_then(|p| p.name.as_deref())
+        .unwrap_or("");
+    let version = man
+        .package
+        .as_ref()
+        .and_then(|p| p.version.as_deref())
+        .unwrap_or("");
     let body = format!(r#"{{"name":"{name}","version":"{version}","tarball":"{b64}"}}"#);
     let url = format!("{}/publish", registry_url.trim_end_matches('/'));
 
@@ -1146,8 +1166,7 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(401, _)) => {
             // On 401: attempt a token refresh if PBLANG_REGISTRY_REFRESH_TOKEN is set.
-            let refresh_tok =
-                std::env::var("PBLANG_REGISTRY_REFRESH_TOKEN").unwrap_or_default();
+            let refresh_tok = std::env::var("PBLANG_REGISTRY_REFRESH_TOKEN").unwrap_or_default();
             if refresh_tok.is_empty() {
                 return Err(
                     "publish failed: 401 Unauthorized                      (set PBLANG_REGISTRY_REFRESH_TOKEN to enable auto-refresh)"
@@ -1159,8 +1178,7 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
             // Retry publish once with the refreshed token.
             let mut retry_req = ureq::post(&url);
             if !new_token.is_empty() {
-                retry_req =
-                    retry_req.set("Authorization", &format!("Bearer {new_token}"));
+                retry_req = retry_req.set("Authorization", &format!("Bearer {new_token}"));
             }
             retry_req
                 .set("Content-Type", "application/json")
@@ -1188,8 +1206,7 @@ fn refresh_access_token(registry_url: &str, refresh_token: &str) -> Result<Strin
         .into_string()
         .map_err(|e| format!("token refresh: read response body: {e}"))?;
     let val: serde_json::Value =
-        serde_json::from_str(&resp_str)
-            .map_err(|e| format!("token refresh: JSON parse: {e}"))?;
+        serde_json::from_str(&resp_str).map_err(|e| format!("token refresh: JSON parse: {e}"))?;
     val.get("token")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
@@ -1242,13 +1259,21 @@ pub fn search_registry(registry_url: &str, query: &str) -> Result<Vec<SearchResu
         .iter()
         .filter_map(|item| {
             let name = item.get("name")?.as_str()?.to_string();
-            let version = item.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let version = item
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let description = item
                 .get("description")
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(SearchResult { name, version, description })
+            Some(SearchResult {
+                name,
+                version,
+                description,
+            })
         })
         .collect();
     Ok(results)
@@ -1257,10 +1282,12 @@ pub fn search_registry(registry_url: &str, query: &str) -> Result<Vec<SearchResu
 /// Validate that [package] has name, version, and that target_platform / min_runtime are well-formed.
 pub fn validate_manifest_metadata(manifest_dir: &Path) -> Result<(), String> {
     let man_path = manifest_dir.join("pblang.toml");
-    let man_bytes = std::fs::read(&man_path)
-        .map_err(|e| format!("read manifest: {e}"))?;
+    let man_bytes = std::fs::read(&man_path).map_err(|e| format!("read manifest: {e}"))?;
     let man = parse_manifest(std::str::from_utf8(&man_bytes).map_err(|_| "utf8")?)?;
-    let pkg = man.package.as_ref().ok_or("manifest missing [package] section")?;
+    let pkg = man
+        .package
+        .as_ref()
+        .ok_or("manifest missing [package] section")?;
     if pkg.name.as_deref().unwrap_or("").is_empty() {
         return Err("[package] name is required".to_string());
     }
@@ -1322,11 +1349,12 @@ pub fn compute_tarball_hmac(bytes: &[u8], key: &[u8]) -> String {
 /// Verify a pack tarball: checks it contains pblang.toml and at least one .sapp/.sap file.
 /// If a .sha256 sidecar exists alongside the tarball and PBLANG_SIGNING_KEY is set, also verifies HMAC.
 pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
-    let bytes =
-        std::fs::read(tarball_path).map_err(|e| format!("read tarball: {e}"))?;
+    let bytes = std::fs::read(tarball_path).map_err(|e| format!("read tarball: {e}"))?;
     let dec = flate2::read::GzDecoder::new(&bytes[..]);
     let mut archive = tar::Archive::new(dec);
-    let entries = archive.entries().map_err(|e| format!("tarball entries: {e}"))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("tarball entries: {e}"))?;
     let mut has_manifest = false;
     let mut has_entry = false;
     for entry in entries {
@@ -1355,15 +1383,12 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
     );
     if sidecar.is_file() {
         if let Ok(key) = std::env::var("PBLANG_SIGNING_KEY") {
-            let expected = std::fs::read_to_string(&sidecar)
-                .map_err(|e| format!("read sidecar: {e}"))?;
+            let expected =
+                std::fs::read_to_string(&sidecar).map_err(|e| format!("read sidecar: {e}"))?;
             let expected = expected.trim();
             let got = compute_tarball_hmac(&bytes, key.as_bytes());
             if !got.eq_ignore_ascii_case(expected) {
-                return Err(format!(
-                    "HMAC mismatch: expected {} got {}",
-                    expected, got
-                ));
+                return Err(format!("HMAC mismatch: expected {} got {}", expected, got));
             }
         }
     }
@@ -1397,13 +1422,31 @@ fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        let _ = write!(out, "{}{}{}{}",
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
+        let _ = write!(
+            out,
+            "{}{}{}{}",
             CHARS[b0 >> 2] as char,
             CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char,
-            if chunk.len() > 1 { CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' },
-            if chunk.len() > 2 { CHARS[b2 & 0x3f] as char } else { '=' },
+            if chunk.len() > 1 {
+                CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+            } else {
+                '='
+            },
+            if chunk.len() > 2 {
+                CHARS[b2 & 0x3f] as char
+            } else {
+                '='
+            },
         );
     }
     out
@@ -1435,8 +1478,8 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use std::thread;
     use std::time::Duration;
@@ -1452,7 +1495,10 @@ mod tests {
             let mut tar_builder = tar::Builder::new(&mut enc);
             let lib_content = b"export fn id(x) { return x; }";
             let manifest = b"[package]\nname = \"test\"\nversion = \"1.0.0\"\n\n[dependencies]\n";
-            for (path, content) in [("lib.sapp", lib_content.as_slice()), ("pblang.toml", manifest.as_slice())] {
+            for (path, content) in [
+                ("lib.sapp", lib_content.as_slice()),
+                ("pblang.toml", manifest.as_slice()),
+            ] {
                 let mut header = tar::Header::new_gnu();
                 header.set_path(path).unwrap();
                 header.set_size(content.len() as u64);
@@ -1480,10 +1526,7 @@ mod tests {
         let index_path = temp.join("index.json");
         std::fs::write(&index_path, index.to_string()).unwrap();
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
-        let index_url = format!(
-            "file:///{}",
-            index_abs.to_string_lossy().replace('\\', "/")
-        );
+        let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
 
         let project_dir = std::env::temp_dir().join("pblang_registry_project");
         let _ = std::fs::create_dir_all(&project_dir);
@@ -1521,7 +1564,10 @@ version = "0.1.0"
             let f = std::fs::File::create(&tarball_path).unwrap();
             let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
             let mut tar_builder = tar::Builder::new(&mut enc);
-            for (path, content) in [("lib.sapp", lib_content.as_slice()), ("pblang.toml", manifest.as_slice())] {
+            for (path, content) in [
+                ("lib.sapp", lib_content.as_slice()),
+                ("pblang.toml", manifest.as_slice()),
+            ] {
                 let mut header = tar::Header::new_gnu();
                 header.set_path(path).unwrap();
                 header.set_size(content.len() as u64);
@@ -1558,10 +1604,7 @@ version = "0.1.0"
         let index_path = temp.join("index.json");
         std::fs::write(&index_path, index.to_string()).unwrap();
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
-        let index_url = format!(
-            "file:///{}",
-            index_abs.to_string_lossy().replace('\\', "/")
-        );
+        let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
         let cache = temp.join("cache");
         let r = resolve_registry_dep(&index_url, &cache, "@pblang/pkg", "1.0.0", false);
         assert!(r.is_err(), "expected checksum mismatch error");
@@ -1589,10 +1632,7 @@ version = "0.1.0"
         let index_path = temp.join("index.json");
         std::fs::write(&index_path, index.to_string()).unwrap();
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
-        let index_url = format!(
-            "file:///{}",
-            index_abs.to_string_lossy().replace('\\', "/")
-        );
+        let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
         let cache = temp.join("cache");
         let r = resolve_registry_dep(&index_url, &cache, "@pblang/ok", "1.0.0", false);
         let (path, _content_sha, archive_sha, _url) =
@@ -1617,10 +1657,7 @@ version = "0.1.0"
         let index_path = temp.join("index.json");
         std::fs::write(&index_path, index.to_string()).unwrap();
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
-        let index_url = format!(
-            "file:///{}",
-            index_abs.to_string_lossy().replace('\\', "/")
-        );
+        let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
         let cache = temp.join("cache");
         let r = resolve_registry_dep(&index_url, &cache, "@pblang/nosha", "1.0.0", true);
         assert!(r.is_err(), "expected sha256 required error");
@@ -1685,8 +1722,11 @@ version = "0.1.0"
 "#,
         )
         .unwrap();
-        std::fs::write(tmp.join("dep").join("lib.sapp"), "export fn x() { return 1; }\n")
-            .unwrap();
+        std::fs::write(
+            tmp.join("dep").join("lib.sapp"),
+            "export fn x() { return 1; }\n",
+        )
+        .unwrap();
         let lock1 = generate_lockfile(&tmp).expect("lock1");
         let lock2 = generate_lockfile(&tmp).expect("lock2");
         let s1 = write_lockfile(&lock1).expect("write1");
@@ -1865,7 +1905,10 @@ version = "0.1.0"
             std::env::remove_var("PBLANG_REGISTRY_REFRESH_TOKEN");
         }
 
-        assert!(result.is_ok(), "publish should succeed after retry: {result:?}");
+        assert!(
+            result.is_ok(),
+            "publish should succeed after retry: {result:?}"
+        );
         assert_eq!(
             publish_calls.load(Ordering::SeqCst),
             2,

@@ -91,7 +91,12 @@ pub struct Param {
 
 impl Param {
     pub fn simple(name: String, ty: Option<TypeExpr>) -> Self {
-        Param { name, ty, default: None, is_vararg: false }
+        Param {
+            name,
+            ty,
+            default: None,
+            is_vararg: false,
+        }
     }
 }
 
@@ -701,7 +706,8 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
     }
 
     (
-        String::from_utf8(out.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string()),
+        String::from_utf8(out.clone())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string()),
         blocks,
     )
 }
@@ -718,14 +724,10 @@ fn preprocess_for_parse(input: &str) -> (String, Vec<PolyglotBlock>) {
 
 pub fn parse_with_polyglot_strict(input: &str) -> ParseWithPolyglotResult {
     let (masked, blocks) = preprocess_for_parse(input);
-    parser()
-        .parse(masked.as_str())
-        .map(|stmts| (stmts, blocks))
+    parser().parse(masked.as_str()).map(|stmts| (stmts, blocks))
 }
 
-pub fn parse_with_polyglot(
-    input: &str,
-) -> ParseWithPolyglotResult {
+pub fn parse_with_polyglot(input: &str) -> ParseWithPolyglotResult {
     let (masked, blocks) = preprocess_for_parse(input);
 
     // SP1-gamma fix: prefer strict parser().parse() over parse_recovery().
