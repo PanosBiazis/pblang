@@ -694,10 +694,12 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> Result<f64, String> {
         return Ok(0.0);
     }
 
-    let (dot, mag_a, mag_b) = a.iter().zip(b.iter()).fold(
-        (0.0, 0.0, 0.0),
-        |(dot, ma, mb), (x, y)| (dot + x * y, ma + x * x, mb + y * y),
-    );
+    let (dot, mag_a, mag_b) = a
+        .iter()
+        .zip(b.iter())
+        .fold((0.0, 0.0, 0.0), |(dot, ma, mb), (x, y)| {
+            (dot + x * y, ma + x * x, mb + y * y)
+        });
 
     let denom = mag_a.sqrt() * mag_b.sqrt();
     if denom < 1e-12 {

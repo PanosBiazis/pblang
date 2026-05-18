@@ -203,7 +203,11 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     let ty_generic = text::ident()
         .padded()
         .try_map(|name: String, span| {
-            if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            if name
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
                 && name != "Any"
                 && name != "Number"
                 && name != "Bool"
@@ -212,7 +216,10 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             {
                 Ok(TypeKind::Generic(name))
             } else {
-                Err(Simple::custom(span, "expected a generic type parameter (uppercase identifier)"))
+                Err(Simple::custom(
+                    span,
+                    "expected a generic type parameter (uppercase identifier)",
+                ))
             }
         })
         .map_with_span(mk_type)
@@ -226,11 +233,9 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     ty.define(
         ty_inner
             .then(just('?').or_not())
-            .map(|(inner, opt): (TypeExpr, Option<_>)| {
-                match opt {
-                    Some(_) => TypeKind::Option(Box::new(inner)),
-                    None => inner.kind,
-                }
+            .map(|(inner, opt): (TypeExpr, Option<_>)| match opt {
+                Some(_) => TypeKind::Option(Box::new(inner)),
+                None => inner.kind,
             })
             .map_with_span(mk_type),
     );
@@ -2238,7 +2243,11 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                     span: sp,
                 };
                 Expr {
-                    kind: ExprKind::IfExpr(Box::new(cond), Box::new(then_block), Box::new(else_block)),
+                    kind: ExprKind::IfExpr(
+                        Box::new(cond),
+                        Box::new(then_block),
+                        Box::new(else_block),
+                    ),
                     span: sp,
                 }
             } else {

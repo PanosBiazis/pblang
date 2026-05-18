@@ -21,8 +21,8 @@ use std::{
 
 // Import our new modules
 use crate::concurrency::{
-    SpawnWireClosure, SpawnWireFunction, SpawnWireValue, ThreadPool, VmChannelBuf, VmHandleRegistry,
-    VmSyncAtomic, VmSyncBarrier, VmSyncMutex, VmSyncOnce, VmSyncRwLock,
+    SpawnWireClosure, SpawnWireFunction, SpawnWireValue, ThreadPool, VmChannelBuf,
+    VmHandleRegistry, VmSyncAtomic, VmSyncBarrier, VmSyncMutex, VmSyncOnce, VmSyncRwLock,
 };
 use crate::memory_safety::{BorrowId, BorrowType, MemoryId, MemorySafetyError, MemoryTracker};
 
@@ -334,7 +334,9 @@ fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
             }
             Ok(SpawnWireValue::Map(out))
         }
-        Value::Function(f) => Ok(SpawnWireValue::Function(Box::new(spawn_function_to_wire(f)?))),
+        Value::Function(f) => Ok(SpawnWireValue::Function(Box::new(spawn_function_to_wire(
+            f,
+        )?))),
         Value::Closure(c) => Ok(SpawnWireValue::Closure(Box::new(spawn_closure_to_wire(c)?))),
         _ => Err(
             "spawn: value not transferable (unsupported: builtin/module/resource handle)".into(),
@@ -2507,12 +2509,14 @@ impl VM {
                 if let Some(pos) = find_subslice(&st.buf, &delim) {
                     let end = (pos + delim.len()).min(st.buf.len());
                     let out = st.buf.drain(..end).collect::<Vec<u8>>();
-                    let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
+                    let _ =
+                        with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
                     return Ok(alloc_string(String::from_utf8_lossy(&out).to_string()));
                 }
                 if total >= max {
                     let out = st.buf.drain(..).collect::<Vec<u8>>();
-                    let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
+                    let _ =
+                        with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
                     return Ok(alloc_string(String::from_utf8_lossy(&out).to_string()));
                 }
                 let mut tmp = [0u8; 4096];
@@ -2522,7 +2526,8 @@ impl VM {
                     .map_err(|e| host.err(format!("tcp_read_until(): {e}")))?;
                 if read == 0 {
                     let out = st.buf.drain(..).collect::<Vec<u8>>();
-                    let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
+                    let _ =
+                        with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
                     return Ok(alloc_string(String::from_utf8_lossy(&out).to_string()));
                 }
                 st.buf.extend_from_slice(&tmp[..read]);
@@ -3060,9 +3065,8 @@ impl VM {
                 .map_err(|m| host.err(format!("onnx_infer(): {m}")))?;
             let input = if args.len() >= 2 {
                 match &args[1] {
-                    Value::Obj(_) | Value::Array(_) | Value::Map(_) => {
-                        value_to_json(&args[1]).map_err(|m| host.err(format!("onnx_infer(): {m}")))?
-                    }
+                    Value::Obj(_) | Value::Array(_) | Value::Map(_) => value_to_json(&args[1])
+                        .map_err(|m| host.err(format!("onnx_infer(): {m}")))?,
                     _ => {
                         let s = args[1]
                             .as_str()
@@ -3079,9 +3083,8 @@ impl VM {
             };
             let options = if args.len() >= 3 {
                 match &args[2] {
-                    Value::Obj(_) | Value::Array(_) | Value::Map(_) => {
-                        value_to_json(&args[2]).map_err(|m| host.err(format!("onnx_infer(): {m}")))?
-                    }
+                    Value::Obj(_) | Value::Array(_) | Value::Map(_) => value_to_json(&args[2])
+                        .map_err(|m| host.err(format!("onnx_infer(): {m}")))?,
                     _ => {
                         let s = args[2]
                             .as_str()
@@ -3215,9 +3218,9 @@ except Exception as e:
 
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
-                    stdin
-                        .write_all(payload.as_bytes())
-                        .map_err(|e| host.err(format!("onnx_infer(): write bridge payload: {e}")))?;
+                    stdin.write_all(payload.as_bytes()).map_err(|e| {
+                        host.err(format!("onnx_infer(): write bridge payload: {e}"))
+                    })?;
                 }
                 let output = child
                     .wait_with_output()
@@ -3467,9 +3470,11 @@ except Exception as e:
             _host: &mut dyn VmHost,
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            let backends = [("qiskit", pblang_quantum::QuantumBackend::QiskitAer),
+            let backends = [
+                ("qiskit", pblang_quantum::QuantumBackend::QiskitAer),
                 ("cirq", pblang_quantum::QuantumBackend::CirqLocal),
-                ("braket", pblang_quantum::QuantumBackend::BraketLocal)];
+                ("braket", pblang_quantum::QuantumBackend::BraketLocal),
+            ];
             let mut result = String::from("[");
             for (i, (name, backend)) in backends.iter().enumerate() {
                 if i > 0 {
@@ -4017,13 +4022,18 @@ except Exception as e:
                         let vm = match host.as_any_mut().downcast_mut::<VM>() {
                             Some(vm) => vm,
                             None => {
-                                return Err(host
-                                    .err("spawn: host does not support open-upvalue snapshot".into()))
+                                return Err(host.err(
+                                    "spawn: host does not support open-upvalue snapshot".into(),
+                                ))
                             }
                         };
                         match vm.stack.get(*i).cloned() {
                             Some(v) => v,
-                            None => return Err(host.err("spawn: open upvalue points outside stack".into())),
+                            None => {
+                                return Err(
+                                    host.err("spawn: open upvalue points outside stack".into())
+                                )
+                            }
                         }
                     }
                 };
@@ -4117,7 +4127,8 @@ except Exception as e:
             }
             let id = value_to_handle(host, args[0].clone(), "join")?;
             let rx = {
-                let mut t = reg.spawn
+                let mut t = reg
+                    .spawn
                     .lock()
                     .map_err(|_| host.err("internal: spawn table unavailable".into()))?;
                 t.remove(&id)
@@ -4212,7 +4223,8 @@ except Exception as e:
             let json = spawn_value_to_json(&args[1]).map_err(|e| host.err(e))?;
             let json_str = sj::to_string(&json).map_err(|e| host.err(e.to_string()))?;
             let cb = {
-                let t = reg.channels
+                let t = reg
+                    .channels
                     .lock()
                     .map_err(|_| host.err("send: table unavailable".into()))?;
                 t.get(&id)
@@ -4297,7 +4309,8 @@ except Exception as e:
             }
             let id = value_to_handle(host, args[0].clone(), "recv")?;
             let cb = {
-                let t = reg.channels
+                let t = reg
+                    .channels
                     .lock()
                     .map_err(|_| host.err("recv: table unavailable".into()))?;
                 t.get(&id)
@@ -4348,7 +4361,8 @@ except Exception as e:
             }
             let id = value_to_handle(host, args[0].clone(), "channel_close")?;
             let cb = {
-                let t = reg.channels
+                let t = reg
+                    .channels
                     .lock()
                     .map_err(|_| host.err("channel_close: table unavailable".into()))?;
                 t.get(&id)
@@ -4376,7 +4390,8 @@ except Exception as e:
             }
             let id = value_to_handle(host, args[0].clone(), "channel_is_closed")?;
             let cb = {
-                let t = reg.channels
+                let t = reg
+                    .channels
                     .lock()
                     .map_err(|_| host.err("channel_is_closed: table unavailable".into()))?;
                 t.get(&id)
@@ -4407,7 +4422,8 @@ except Exception as e:
             };
             // Snapshot VmChannelBuf handles upfront (VmChannelBuf is Clone + Arc-backed, cheap).
             let cbs: Vec<Option<VmChannelBuf>> = {
-                let t = reg.channels
+                let t = reg
+                    .channels
                     .lock()
                     .map_err(|_| host.err("select: table unavailable".into()))?;
                 ids.iter().map(|id| t.get(id).cloned()).collect()
@@ -4485,7 +4501,8 @@ except Exception as e:
                 _ => return Err(host.err("select_with_timeout: first arg must be array".into())),
             };
             let cbs: Vec<Option<VmChannelBuf>> = {
-                let t = reg.channels
+                let t = reg
+                    .channels
                     .lock()
                     .map_err(|_| host.err("select_with_timeout: table".into()))?;
                 ids.iter().map(|id| t.get(id).cloned()).collect()
@@ -4540,7 +4557,8 @@ except Exception as e:
                 args.into_iter().next().unwrap_or(Value::Nil),
                 "channel_size",
             )?;
-            let t = reg.channels
+            let t = reg
+                .channels
                 .lock()
                 .map_err(|_| host.err("channel_size: table".into()))?;
             let cb = t
@@ -4569,7 +4587,8 @@ except Exception as e:
             for h in handles {
                 let id = value_to_handle(host, h, "join_all")?;
                 let rx = {
-                    let mut t = reg.spawn
+                    let mut t = reg
+                        .spawn
                         .lock()
                         .map_err(|_| host.err("join_all: spawn table unavailable".into()))?;
                     t.remove(&id).ok_or_else(|| {
@@ -4734,7 +4753,8 @@ except Exception as e:
                 "mutex_lock",
             )?;
             let entry = {
-                let t = reg.mutexes
+                let t = reg
+                    .mutexes
                     .lock()
                     .map_err(|_| host.err("mutex_lock: table".into()))?;
                 t.get(&id)
@@ -4772,7 +4792,8 @@ except Exception as e:
                 "mutex_try_lock",
             )?;
             let entry = {
-                let t = reg.mutexes
+                let t = reg
+                    .mutexes
                     .lock()
                     .map_err(|_| host.err("mutex_try_lock: table".into()))?;
                 t.get(&id)
@@ -4802,7 +4823,8 @@ except Exception as e:
                 "mutex_unlock",
             )?;
             let entry = {
-                let t = reg.mutexes
+                let t = reg
+                    .mutexes
                     .lock()
                     .map_err(|_| host.err("mutex_unlock: table".into()))?;
                 t.get(&id)
@@ -4854,7 +4876,8 @@ except Exception as e:
                 "rwlock_read",
             )?;
             let entry = {
-                let t = reg.rwlocks
+                let t = reg
+                    .rwlocks
                     .lock()
                     .map_err(|_| host.err("rwlock_read: table".into()))?;
                 t.get(&id)
@@ -4893,7 +4916,8 @@ except Exception as e:
                 "rwlock_write",
             )?;
             let entry = {
-                let t = reg.rwlocks
+                let t = reg
+                    .rwlocks
                     .lock()
                     .map_err(|_| host.err("rwlock_write: table".into()))?;
                 t.get(&id)
@@ -4932,7 +4956,8 @@ except Exception as e:
                 "rwlock_unlock",
             )?;
             let entry = {
-                let t = reg.rwlocks
+                let t = reg
+                    .rwlocks
                     .lock()
                     .map_err(|_| host.err("rwlock_unlock: table".into()))?;
                 t.get(&id)
@@ -4997,7 +5022,8 @@ except Exception as e:
                 "barrier_wait",
             )?;
             let entry = {
-                let t = reg.barriers
+                let t = reg
+                    .barriers
                     .lock()
                     .map_err(|_| host.err("barrier_wait: table".into()))?;
                 t.get(&id)
@@ -5064,7 +5090,8 @@ except Exception as e:
                 args.into_iter().next().unwrap_or(Value::Nil),
                 "once_is_done",
             )?;
-            let t = reg.once_flags
+            let t = reg
+                .once_flags
                 .lock()
                 .map_err(|_| host.err("once_is_done: table".into()))?;
             let entry = t
@@ -5133,7 +5160,9 @@ except Exception as e:
             args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
             if args.is_empty() {
-                return Err(host.err("release_borrow(borrow_id) or release_borrow(handle, type)".into()));
+                return Err(
+                    host.err("release_borrow(borrow_id) or release_borrow(handle, type)".into())
+                );
             }
             if args.len() == 1 {
                 let borrow_id = match &args[0] {
@@ -5251,7 +5280,8 @@ except Exception as e:
                 args.into_iter().next().unwrap_or(Value::Nil),
                 "atomic_get",
             )?;
-            let t = reg.atomics
+            let t = reg
+                .atomics
                 .lock()
                 .map_err(|_| host.err("atomic_get: table".into()))?;
             let entry = t
@@ -5274,7 +5304,8 @@ except Exception as e:
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_set: value must be a number".into())),
             };
-            let t = reg.atomics
+            let t = reg
+                .atomics
                 .lock()
                 .map_err(|_| host.err("atomic_set: table".into()))?;
             let entry = t
@@ -5298,7 +5329,8 @@ except Exception as e:
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_add: delta must be a number".into())),
             };
-            let t = reg.atomics
+            let t = reg
+                .atomics
                 .lock()
                 .map_err(|_| host.err("atomic_add: table".into()))?;
             let entry = t
@@ -5322,7 +5354,8 @@ except Exception as e:
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_sub: delta must be a number".into())),
             };
-            let t = reg.atomics
+            let t = reg
+                .atomics
                 .lock()
                 .map_err(|_| host.err("atomic_sub: table".into()))?;
             let entry = t
@@ -5351,7 +5384,8 @@ except Exception as e:
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_cas: new_val must be a number".into())),
             };
-            let t = reg.atomics
+            let t = reg
+                .atomics
                 .lock()
                 .map_err(|_| host.err("atomic_cas: table".into()))?;
             let entry = t
@@ -5378,7 +5412,8 @@ except Exception as e:
                 Value::Number(n) => n as i64,
                 _ => return Err(host.err("atomic_swap: val must be a number".into())),
             };
-            let t = reg.atomics
+            let t = reg
+                .atomics
                 .lock()
                 .map_err(|_| host.err("atomic_swap: table".into()))?;
             let entry = t
@@ -6472,9 +6507,7 @@ except Exception as e:
             host: &mut dyn VmHost,
             _args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            Err(host.err(
-                "os_signal_trap() is not implemented on this runtime target yet".into(),
-            ))
+            Err(host.err("os_signal_trap() is not implemented on this runtime target yet".into()))
         }
 
         /// os_which(cmd) — safely find an executable in PATH.
@@ -6682,22 +6715,27 @@ except Exception as e:
                 len_code
             } else if len_code == 126 {
                 if codes.len() < idx + 2 {
-                    return Err(host.err("ws_parse_frame(): frame too short for 16-bit length".into()));
+                    return Err(
+                        host.err("ws_parse_frame(): frame too short for 16-bit length".into())
+                    );
                 }
                 let n = ((codes[idx] as usize) << 8) | (codes[idx + 1] as usize);
                 idx += 2;
                 n
             } else {
                 if codes.len() < idx + 8 {
-                    return Err(host.err("ws_parse_frame(): frame too short for 64-bit length".into()));
+                    return Err(
+                        host.err("ws_parse_frame(): frame too short for 64-bit length".into())
+                    );
                 }
                 let mut n: u64 = 0;
                 for i in 0..8 {
                     n = (n << 8) | (codes[idx + i] as u64);
                 }
                 idx += 8;
-                usize::try_from(n)
-                    .map_err(|_| host.err("ws_parse_frame(): payload too large for this runtime".into()))?
+                usize::try_from(n).map_err(|_| {
+                    host.err("ws_parse_frame(): payload too large for this runtime".into())
+                })?
             };
 
             let mut masking_key = [0u8; 4];
@@ -6729,10 +6767,19 @@ except Exception as e:
             m.insert("opcode".into(), Value::Number(opcode));
             m.insert("payload".into(), alloc_string(payload));
             m.insert("fin".into(), Value::Number(fin));
-            m.insert("masked".into(), Value::Number(if masked { 1.0 } else { 0.0 }));
+            m.insert(
+                "masked".into(),
+                Value::Number(if masked { 1.0 } else { 0.0 }),
+            );
             m.insert("payload_len".into(), Value::Number(payload_len as f64));
-            m.insert("frame_len".into(), Value::Number((idx + payload_len) as f64));
-            m.insert("next_index".into(), Value::Number((idx + payload_len) as f64));
+            m.insert(
+                "frame_len".into(),
+                Value::Number((idx + payload_len) as f64),
+            );
+            m.insert(
+                "next_index".into(),
+                Value::Number((idx + payload_len) as f64),
+            );
             Ok(alloc_map(m))
         }
 
@@ -6753,7 +6800,8 @@ except Exception as e:
             let payload = args[1]
                 .as_str()
                 .map_err(|m| host.err(format!("ws_write_frame(): payload: {m}")))?;
-            let payload_bytes: Vec<u8> = payload.chars().map(|c| (c as u32).min(255) as u8).collect();
+            let payload_bytes: Vec<u8> =
+                payload.chars().map(|c| (c as u32).min(255) as u8).collect();
 
             let mut rng = rand::thread_rng();
             let mask_key = [
@@ -6788,10 +6836,9 @@ except Exception as e:
                     .ok_or_else(|| host.err("ws_write_frame(): invalid header byte".into()))?,
             );
             for b in len_ext {
-                out.push(
-                    std::char::from_u32(b as u32)
-                        .ok_or_else(|| host.err("ws_write_frame(): invalid extended length byte".into()))?,
-                );
+                out.push(std::char::from_u32(b as u32).ok_or_else(|| {
+                    host.err("ws_write_frame(): invalid extended length byte".into())
+                })?);
             }
             for b in mask_key {
                 out.push(
@@ -6801,11 +6848,9 @@ except Exception as e:
             }
             for (i, b) in payload_bytes.iter().enumerate() {
                 let masked_b = *b ^ mask_key[i % 4];
-                out.push(
-                    std::char::from_u32(masked_b as u32).ok_or_else(|| {
-                        host.err("ws_write_frame(): invalid masked payload byte".into())
-                    })?,
-                );
+                out.push(std::char::from_u32(masked_b as u32).ok_or_else(|| {
+                    host.err("ws_write_frame(): invalid masked payload byte".into())
+                })?);
             }
             Ok(alloc_string(out))
         }
@@ -9148,7 +9193,11 @@ fn memory_handle_from_f64(host: &dyn VmHost, h: f64, what: &str) -> Result<Memor
     Ok(MemoryId(h as usize))
 }
 
-fn borrow_type_from_code(host: &dyn VmHost, code: f64, what: &str) -> Result<BorrowType, RuntimeError> {
+fn borrow_type_from_code(
+    host: &dyn VmHost,
+    code: f64,
+    what: &str,
+) -> Result<BorrowType, RuntimeError> {
     match code as i64 {
         0 => Ok(BorrowType::Immutable),
         1 => Ok(BorrowType::Mutable),
@@ -9292,7 +9341,11 @@ impl VmHost for VM {
         self.mem_release_borrow_id_impl(borrow_id)
     }
 
-    fn mem_release_borrow_type(&mut self, handle: f64, borrow_type: u8) -> Result<(), RuntimeError> {
+    fn mem_release_borrow_type(
+        &mut self,
+        handle: f64,
+        borrow_type: u8,
+    ) -> Result<(), RuntimeError> {
         self.mem_release_borrow_type_impl(handle, borrow_type)
     }
 

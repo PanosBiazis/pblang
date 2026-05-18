@@ -39,10 +39,17 @@ fn escape_pblang_string(input: &str) -> String {
 fn json_to_pblang_expr(v: &serde_json::Value) -> Result<String, String> {
     match v {
         serde_json::Value::Null => Ok("nil".to_string()),
-        serde_json::Value::Bool(b) => Ok(if *b { "true".to_string() } else { "false".to_string() }),
+        serde_json::Value::Bool(b) => Ok(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
         serde_json::Value::Number(n) => {
             let s = n.to_string();
-            if s.eq_ignore_ascii_case("nan") || s.eq_ignore_ascii_case("inf") || s.eq_ignore_ascii_case("-inf") {
+            if s.eq_ignore_ascii_case("nan")
+                || s.eq_ignore_ascii_case("inf")
+                || s.eq_ignore_ascii_case("-inf")
+            {
                 return Err("non-finite numbers are not supported in args_json".to_string());
             }
             Ok(s)
@@ -86,7 +93,6 @@ pub extern "C" fn pblang_create_vm() -> *mut VmWrapper {
     };
     Box::into_raw(Box::new(w))
 }
-
 
 /// Create a new Sapphire VM with explicit capability sandbox.
 /// Pass 0 to deny a capability, 1 to allow it.
@@ -145,8 +151,16 @@ pub unsafe extern "C" fn pblang_set_limits(
     let w = &mut *vm;
     use pblang_vm::VmLimits;
     let limits = VmLimits {
-        max_instructions: if max_instructions > 0 { Some(max_instructions) } else { None },
-        max_stack_depth: if max_stack_depth > 0 { Some(max_stack_depth) } else { None },
+        max_instructions: if max_instructions > 0 {
+            Some(max_instructions)
+        } else {
+            None
+        },
+        max_stack_depth: if max_stack_depth > 0 {
+            Some(max_stack_depth)
+        } else {
+            None
+        },
         ..Default::default()
     };
     w.vm.set_limits(Some(limits));
@@ -183,11 +197,15 @@ pub unsafe extern "C" fn pblang_call_function(
     }
     // SAFETY: Checked non-null above; caller guarantees valid C strings.
     let w = &mut *vm;
-    let name = std::ffi::CStr::from_ptr(fn_name).to_string_lossy().to_string();
+    let name = std::ffi::CStr::from_ptr(fn_name)
+        .to_string_lossy()
+        .to_string();
     let args_str = if args_json.is_null() {
         "[]".to_string()
     } else {
-        std::ffi::CStr::from_ptr(args_json).to_string_lossy().to_string()
+        std::ffi::CStr::from_ptr(args_json)
+            .to_string_lossy()
+            .to_string()
     };
 
     // Parse args as JSON array
@@ -231,12 +249,18 @@ pub unsafe extern "C" fn pblang_call_function(
         match json_to_pblang_expr(arg) {
             Ok(expr) => arg_exprs.push(expr),
             Err(e) => {
-                set_error(w, format!("pblang_call_function: invalid args_json value: {e}"));
+                set_error(
+                    w,
+                    format!("pblang_call_function: invalid args_json value: {e}"),
+                );
                 return 1;
             }
         }
     }
-    let call_src = format!("let __result = {name}({}); print __result;", arg_exprs.join(", "));
+    let call_src = format!(
+        "let __result = {name}({}); print __result;",
+        arg_exprs.join(", ")
+    );
 
     match parse(&call_src) {
         Ok(stmts) => {
@@ -316,7 +340,11 @@ pub unsafe extern "C" fn pblang_last_error(vm: *mut VmWrapper) -> *const c_char 
 /// - `source` must be a valid NUL-terminated C string.
 /// - If `out` is non-null, it must be a valid pointer to a `*mut c_char`.
 #[no_mangle]
-pub unsafe extern "C" fn pblang_eval(vm: *mut VmWrapper, source: *const c_char, out: *mut *mut c_char) -> i32 {
+pub unsafe extern "C" fn pblang_eval(
+    vm: *mut VmWrapper,
+    source: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
     if vm.is_null() || source.is_null() {
         return 2;
     }

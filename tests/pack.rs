@@ -961,8 +961,7 @@ fn pack_rejects_out_of_package_path_dependency() {
     );
 
     let _ = std::fs::remove_dir_all(&proj);
-    let _ =
-        std::fs::remove_dir_all(std::env::temp_dir().join("pblang_bundle_external_dep_shared"));
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("pblang_bundle_external_dep_shared"));
 }
 
 #[test]
@@ -990,8 +989,7 @@ fn bundle_rejects_out_of_package_path_dependency() {
     );
 
     let _ = std::fs::remove_dir_all(&proj);
-    let _ =
-        std::fs::remove_dir_all(std::env::temp_dir().join("pblang_bundle_external_dep_shared"));
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("pblang_bundle_external_dep_shared"));
 }
 
 #[test]
@@ -1154,7 +1152,10 @@ fn ensure_pblang_stub_built(pblang_bin: &std::path::Path) {
         .args(["build", "-p", "pblang-stub", "--quiet"])
         .status()
         .expect("cargo build pblang-stub");
-    assert!(status.success(), "failed to build pblang-stub for self-extract tests");
+    assert!(
+        status.success(),
+        "failed to build pblang-stub for self-extract tests"
+    );
     assert!(
         stub.is_file(),
         "pblang-stub should exist at {} after build",

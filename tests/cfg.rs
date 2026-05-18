@@ -10,7 +10,11 @@ fn pblang_bin() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target");
     p.push("debug");
-    p.push(if cfg!(windows) { "pblang.exe" } else { "pblang" });
+    p.push(if cfg!(windows) {
+        "pblang.exe"
+    } else {
+        "pblang"
+    });
     p
 }
 

@@ -729,10 +729,7 @@ impl std::fmt::Debug for Barrier {
         let state = self.state.lock().ok();
         f.debug_struct("Barrier")
             .field("n", &self.n)
-            .field(
-                "waiting",
-                &state.as_ref().map(|s| s.waiting).unwrap_or(0),
-            )
+            .field("waiting", &state.as_ref().map(|s| s.waiting).unwrap_or(0))
             .field(
                 "generation",
                 &state.as_ref().map(|s| s.generation).unwrap_or(0),
@@ -932,10 +929,10 @@ impl std::fmt::Debug for ConcurrencyStats {
 // VM handle registry (per-VM isolation; shared with spawned child VMs)
 // ---------------------------------------------------------------------------
 
+use pblang_ir::chunk::{OpCode, Span};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::mpsc;
-use pblang_ir::chunk::{OpCode, Span};
 
 /// Spawn/join result channel: Ok = JSON return value, Err = error message.
 pub type SpawnJoinReceiver = mpsc::Receiver<Result<SpawnWireValue, String>>;

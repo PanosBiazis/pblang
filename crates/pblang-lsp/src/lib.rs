@@ -101,10 +101,9 @@ fn fmt_parse_error(err: &Simple<char>) -> String {
     expected.sort();
     expected.dedup();
     let base = match err.reason() {
-        SimpleReason::Unclosed {
-            span: _,
-            delimiter,
-        } => format!("unclosed delimiter '{delimiter}'"),
+        SimpleReason::Unclosed { span: _, delimiter } => {
+            format!("unclosed delimiter '{delimiter}'")
+        }
         SimpleReason::Custom(msg) => msg.to_string(),
         SimpleReason::Unexpected => match (found, expected.is_empty()) {
             (Some(f), false) => format!("unexpected '{f}', expected one of: {:?}", expected),
@@ -253,7 +252,13 @@ struct SymbolEntry {
     completion_kind: CompletionItemKind,
 }
 
-fn push_symbol(out: &mut Vec<SymbolEntry>, name: String, span: PbSpan, detail: String, kind: CompletionItemKind) {
+fn push_symbol(
+    out: &mut Vec<SymbolEntry>,
+    name: String,
+    span: PbSpan,
+    detail: String,
+    kind: CompletionItemKind,
+) {
     if !name.is_empty() {
         out.push(SymbolEntry {
             name,
@@ -496,7 +501,8 @@ impl LanguageServer for Backend {
 
         for kw in &[
             "let", "const", "fn", "return", "if", "else", "while", "for", "in", "match", "case",
-            "import", "export", "true", "false", "nil", "and", "or", "not", "try", "catch", "defer",
+            "import", "export", "true", "false", "nil", "and", "or", "not", "try", "catch",
+            "defer",
         ] {
             items.push(CompletionItem {
                 label: kw.to_string(),
@@ -540,9 +546,7 @@ impl LanguageServer for Backend {
             for stmt in &stmts {
                 match &stmt.kind {
                     StmtKind::Fn(name, _, _, _) => {
-                        if !params.query.is_empty()
-                            && !name.to_lowercase().contains(&query_lower)
-                        {
+                        if !params.query.is_empty() && !name.to_lowercase().contains(&query_lower) {
                             continue;
                         }
                         symbols.push(SymbolInformation {
@@ -558,9 +562,7 @@ impl LanguageServer for Backend {
                         });
                     }
                     StmtKind::Let(name, _, _) | StmtKind::Const(name, _, _) => {
-                        if !params.query.is_empty()
-                            && !name.to_lowercase().contains(&query_lower)
-                        {
+                        if !params.query.is_empty() && !name.to_lowercase().contains(&query_lower) {
                             continue;
                         }
                         symbols.push(SymbolInformation {
@@ -598,6 +600,8 @@ mod tests {
     #[test]
     fn collect_diagnostics_valid_source() {
         let diags = collect_diagnostics("fn ok() { return 1; }");
-        assert!(diags.iter().all(|d| d.source == "pblang-typeck" || d.source == "pblang-parser"));
+        assert!(diags
+            .iter()
+            .all(|d| d.source == "pblang-typeck" || d.source == "pblang-parser"));
     }
 }
