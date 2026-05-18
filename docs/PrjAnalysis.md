@@ -101,3 +101,5 @@ This document is the current validation baseline for analysis claims against the
 
 - If new fixes are applied, update this file by moving items between sections rather than appending raw reports.
 - This validation was done against the GitHub repository state, not just historical reports.
+- Current branch: `devin/1779130661-analysis-v2-fixes`
+- Last updated: 2026-05-18
