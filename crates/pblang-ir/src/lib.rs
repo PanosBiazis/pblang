@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::fmt;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub mod chunk {
@@ -55,8 +55,8 @@ pub mod chunk {
         OpSetIndex,         // pops (obj, index, value), pushes value
 
         // error handling
-        OpTry(usize),  // push handler (absolute IP)
-        OpEndTry,      // pop handler
+        OpTry(usize), // push handler (absolute IP)
+        OpEndTry,     // pop handler
 
         // locals (slot indexes)
         OpGetLocal(usize),
@@ -227,7 +227,11 @@ pub trait VmHost {
         Err(self.err("release_borrow: memory safety not supported by this host".into()))
     }
 
-    fn mem_release_borrow_type(&mut self, _handle: f64, _borrow_type: u8) -> Result<(), RuntimeError> {
+    fn mem_release_borrow_type(
+        &mut self,
+        _handle: f64,
+        _borrow_type: u8,
+    ) -> Result<(), RuntimeError> {
         Err(self.err("release_borrow: memory safety not supported by this host".into()))
     }
 

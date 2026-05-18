@@ -38,7 +38,9 @@ pub(crate) fn create(
     title: &str,
 ) -> Result<Sdl2Window, RuntimeError> {
     let sdl = sdl2::init().map_err(|e| host.err(format!("sdl2 init: {e}")))?;
-    let video = sdl.video().map_err(|e| host.err(format!("sdl2 video: {e}")))?;
+    let video = sdl
+        .video()
+        .map_err(|e| host.err(format!("sdl2 video: {e}")))?;
     let window = video
         .window(title, width, height)
         .build()
@@ -222,7 +224,10 @@ impl Sdl2Window {
                 } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("keydown"));
-                    m.insert("key".into(), alloc_string(format!("{:?}", k).replace("Keycode::", "")));
+                    m.insert(
+                        "key".into(),
+                        alloc_string(format!("{:?}", k).replace("Keycode::", "")),
+                    );
                     out.push(alloc_map(m));
                 }
                 Event::KeyUp {
@@ -230,7 +235,10 @@ impl Sdl2Window {
                 } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("keyup"));
-                    m.insert("key".into(), alloc_string(format!("{:?}", k).replace("Keycode::", "")));
+                    m.insert(
+                        "key".into(),
+                        alloc_string(format!("{:?}", k).replace("Keycode::", "")),
+                    );
                     out.push(alloc_map(m));
                 }
                 Event::MouseMotion { x, y, .. } => {

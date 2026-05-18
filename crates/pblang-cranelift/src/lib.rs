@@ -72,7 +72,11 @@ pub struct JitCache {
 
 impl std::fmt::Debug for JitCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "JitCache {{ {} compiled functions }}", self.entries.len())
+        write!(
+            f,
+            "JitCache {{ {} compiled functions }}",
+            self.entries.len()
+        )
     }
 }
 
@@ -84,8 +88,8 @@ impl JitCache {
         let _ = flag_builder.set("opt_level", "speed");
         let flags = settings::Flags::new(flag_builder);
 
-        let isa_builder = cranelift_native::builder()
-            .map_err(|e| format!("Cranelift native ISA failed: {e}"))?;
+        let isa_builder =
+            cranelift_native::builder().map_err(|e| format!("Cranelift native ISA failed: {e}"))?;
         let isa = isa_builder
             .finish(flags)
             .map_err(|e| format!("Cranelift ISA finish failed: {e}"))?;
@@ -152,8 +156,15 @@ impl JitCache {
         ctx.func.signature = sig.clone();
 
         let mut builder_ctx = FunctionBuilderContext::new();
-        let result =
-            build_cranelift_fn(&mut ctx.func, &mut builder_ctx, &func.chunk, func_id, arity, &mut self.module, name);
+        let result = build_cranelift_fn(
+            &mut ctx.func,
+            &mut builder_ctx,
+            &func.chunk,
+            func_id,
+            arity,
+            &mut self.module,
+            name,
+        );
         result?;
 
         // Define and finalize
@@ -220,9 +231,7 @@ pub fn is_jit_eligible(chunk: &Chunk) -> Result<(), &'static str> {
             OpCode::OpMakeArray(_) | OpCode::OpMakeMap(_) => {
                 return Err("collection creation not JIT-able")
             }
-            OpCode::OpGetIndex | OpCode::OpSetIndex => {
-                return Err("index ops not JIT-able")
-            }
+            OpCode::OpGetIndex | OpCode::OpSetIndex => return Err("index ops not JIT-able"),
             OpCode::OpTry(_) | OpCode::OpEndTry => return Err("try/catch not JIT-able"),
             OpCode::OpGetUpvalue(_)
             | OpCode::OpSetUpvalue(_)
@@ -333,7 +342,10 @@ fn build_cranelift_fn(
     let mut ip_to_block: Vec<usize> = vec![0; chunk.instructions.len() + 1];
     for (bi, &leader) in leaders.iter().enumerate() {
         // All instructions until the next leader belong to block `bi`
-        let next = leaders.get(bi + 1).copied().unwrap_or(chunk.instructions.len());
+        let next = leaders
+            .get(bi + 1)
+            .copied()
+            .unwrap_or(chunk.instructions.len());
         for ip in leader..next {
             if ip < ip_to_block.len() {
                 ip_to_block[ip] = bi;
@@ -358,7 +370,9 @@ fn build_cranelift_fn(
 
     for (i, &var) in local_vars.iter().enumerate().take(arity) {
         let offset = (i * 8) as i32;
-        let val = builder.ins().load(types::F64, MemFlags::trusted(), args_ptr, offset);
+        let val = builder
+            .ins()
+            .load(types::F64, MemFlags::trusted(), args_ptr, offset);
         builder.def_var(var, val);
     }
 
@@ -396,17 +410,17 @@ fn build_cranelift_fn(
         // Switch to a new block if we've crossed a leader boundary
         let block_idx = ip_to_block[ip];
         if block_idx != current_block_idx {
-        // Emit a fall-through jump if the previous block didn't end with a terminator
-        if !terminated_blocks.contains(&current_block_idx) {
-            builder.ins().jump(cl_blocks[block_idx], &[]);
-            terminated_blocks.insert(current_block_idx);
+            // Emit a fall-through jump if the previous block didn't end with a terminator
+            if !terminated_blocks.contains(&current_block_idx) {
+                builder.ins().jump(cl_blocks[block_idx], &[]);
+                terminated_blocks.insert(current_block_idx);
+            }
+            current_block_idx = block_idx;
+            builder.switch_to_block(cl_blocks[current_block_idx]);
+            builder.seal_block(cl_blocks[current_block_idx]);
+            virtual_stack.clear();
+            name_stack.clear(); // clear parallel name tracking on block transition
         }
-        current_block_idx = block_idx;
-        builder.switch_to_block(cl_blocks[current_block_idx]);
-        builder.seal_block(cl_blocks[current_block_idx]);
-        virtual_stack.clear();
-        name_stack.clear(); // clear parallel name tracking on block transition
-    }
 
         match op {
             // ── Constants ──────────────────────────────────────────────
@@ -440,42 +454,78 @@ fn build_cranelift_fn(
 
             // ── Arithmetic ───────────────────────────────────────────────
             OpCode::OpAdd => {
-                let b = pop!()?; let a = pop!()? ;
+                let b = pop!()?;
+                let a = pop!()?;
                 push!(builder.ins().fadd(a, b));
             }
             OpCode::OpSub => {
-                let b = pop!()?; let a = pop!()? ;
+                let b = pop!()?;
+                let a = pop!()?;
                 push!(builder.ins().fsub(a, b));
             }
             OpCode::OpMul => {
-                let b = pop!()?; let a = pop!()? ;
+                let b = pop!()?;
+                let a = pop!()?;
                 push!(builder.ins().fmul(a, b));
             }
             OpCode::OpDiv => {
-                let b = pop!()?; let a = pop!()? ;
+                let b = pop!()?;
+                let a = pop!()?;
                 push!(builder.ins().fdiv(a, b));
             }
 
             // ── Comparisons: result is 1.0 (true) or 0.0 (false) ───────────────
-            OpCode::OpEq  => emit_cmp_ns(&mut builder, &mut virtual_stack, &mut name_stack, FloatCC::Equal)?,
-            OpCode::OpNotEq => emit_cmp_ns(&mut builder, &mut virtual_stack, &mut name_stack, FloatCC::NotEqual)?,
-            OpCode::OpGt => emit_cmp_ns(&mut builder, &mut virtual_stack, &mut name_stack, FloatCC::GreaterThan)?,
-            OpCode::OpGe => emit_cmp_ns(&mut builder, &mut virtual_stack, &mut name_stack, FloatCC::GreaterThanOrEqual)?,
-            OpCode::OpLt => emit_cmp_ns(&mut builder, &mut virtual_stack, &mut name_stack, FloatCC::LessThan)?,
-            OpCode::OpLe => emit_cmp_ns(&mut builder, &mut virtual_stack, &mut name_stack, FloatCC::LessThanOrEqual)?,
+            OpCode::OpEq => emit_cmp_ns(
+                &mut builder,
+                &mut virtual_stack,
+                &mut name_stack,
+                FloatCC::Equal,
+            )?,
+            OpCode::OpNotEq => emit_cmp_ns(
+                &mut builder,
+                &mut virtual_stack,
+                &mut name_stack,
+                FloatCC::NotEqual,
+            )?,
+            OpCode::OpGt => emit_cmp_ns(
+                &mut builder,
+                &mut virtual_stack,
+                &mut name_stack,
+                FloatCC::GreaterThan,
+            )?,
+            OpCode::OpGe => emit_cmp_ns(
+                &mut builder,
+                &mut virtual_stack,
+                &mut name_stack,
+                FloatCC::GreaterThanOrEqual,
+            )?,
+            OpCode::OpLt => emit_cmp_ns(
+                &mut builder,
+                &mut virtual_stack,
+                &mut name_stack,
+                FloatCC::LessThan,
+            )?,
+            OpCode::OpLe => emit_cmp_ns(
+                &mut builder,
+                &mut virtual_stack,
+                &mut name_stack,
+                FloatCC::LessThanOrEqual,
+            )?,
 
             // ── Not ───────────────────────────────────────────────────────────
             OpCode::OpNot => {
                 let v = pop!()?;
-                let one  = builder.ins().f64const(1.0);
+                let one = builder.ins().f64const(1.0);
                 let zero = builder.ins().f64const(0.0);
                 let is_falsey = emit_is_falsey(&mut builder, v);
-                let result  = builder.ins().select(is_falsey, one, zero);
+                let result = builder.ins().select(is_falsey, one, zero);
                 push!(result);
             }
 
             // ── Pop ────────────────────────────────────────────────────────────
-            OpCode::OpPop => { let _ = pop!(); }
+            OpCode::OpPop => {
+                let _ = pop!();
+            }
 
             // ── Globals: push function name marker ────────────────────────
             OpCode::OpGetGlobal(const_idx) => {
@@ -499,9 +549,14 @@ fn build_cranelift_fn(
 
                 // Pop nargs argument values and their name slots
                 let args: Vec<ClValue> = (0..nargs)
-                    .map(|_| { name_stack.pop(); virtual_stack.pop().unwrap() })
+                    .map(|_| {
+                        name_stack.pop();
+                        virtual_stack.pop().unwrap()
+                    })
                     .collect::<Vec<_>>()
-                    .into_iter().rev().collect(); // reverse to get left-to-right order
+                    .into_iter()
+                    .rev()
+                    .collect(); // reverse to get left-to-right order
 
                 // Pop the function reference placeholder + retrieve its name
                 let fn_name = name_stack.pop().flatten();
@@ -511,13 +566,12 @@ fn build_cranelift_fn(
                     // Self-recursive call → direct native call via JIT ABI
                     let byte_size = (nargs * 8) as u32;
                     let align = 3u8; // 2^3 = 8-byte align
-                    let slot = builder.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
+                    let slot =
+                        builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                             byte_size.max(8),
                             align,
-                        ),
-                    );
+                        ));
                     for (i, &arg_val) in args.iter().enumerate() {
                         builder.ins().stack_store(arg_val, slot, (i * 8) as i32);
                     }
@@ -542,7 +596,9 @@ fn build_cranelift_fn(
                 let is_false = emit_is_falsey(&mut builder, cond);
                 let target_bi = ip_to_block[*target];
                 let fall_bi = ip_to_block.get(ip + 1).copied().unwrap_or(n_blocks - 1);
-                builder.ins().brif(is_false, cl_blocks[target_bi], &[], cl_blocks[fall_bi], &[]);
+                builder
+                    .ins()
+                    .brif(is_false, cl_blocks[target_bi], &[], cl_blocks[fall_bi], &[]);
                 terminated_blocks.insert(current_block_idx);
             }
             OpCode::OpJumpIfTrue(target) => {
@@ -551,13 +607,17 @@ fn build_cranelift_fn(
                 let target_bi = ip_to_block[*target];
                 let fall_bi = ip_to_block.get(ip + 1).copied().unwrap_or(n_blocks - 1);
                 // brif(condition, then, else): when falsey, fall through; otherwise jump.
-                builder.ins().brif(is_false, cl_blocks[fall_bi], &[], cl_blocks[target_bi], &[]);
+                builder
+                    .ins()
+                    .brif(is_false, cl_blocks[fall_bi], &[], cl_blocks[target_bi], &[]);
                 terminated_blocks.insert(current_block_idx);
             }
 
             // ── Return ───────────────────────────────────────────────────────
             OpCode::OpReturn => {
-                let val = virtual_stack.pop().unwrap_or_else(|| builder.ins().f64const(0.0));
+                let val = virtual_stack
+                    .pop()
+                    .unwrap_or_else(|| builder.ins().f64const(0.0));
                 name_stack.pop();
                 builder.ins().return_(&[val]);
                 terminated_blocks.insert(current_block_idx);
@@ -565,7 +625,10 @@ fn build_cranelift_fn(
 
             // ── OpDup (null coalescing needs duplicate) ────────────────────
             OpCode::OpDup => {
-                let top = virtual_stack.last().cloned().ok_or("OpDup: stack underflow")?;
+                let top = virtual_stack
+                    .last()
+                    .cloned()
+                    .ok_or("OpDup: stack underflow")?;
                 let top_name = name_stack.last().cloned().unwrap_or(None);
                 virtual_stack.push(top);
                 name_stack.push(top_name);
@@ -625,10 +688,7 @@ fn emit_is_falsey(builder: &mut FunctionBuilder<'_>, v: ClValue) -> ClValue {
 /// Converts `Number` values to f64, calls the JIT function, and converts the
 /// f64 result back to a `PblangValue::Number`. Returns `None` if any argument
 /// is non-numeric (caller should fall back to the interpreter).
-pub fn call_jit(
-    fn_ptr: JitFn,
-    args: &[PblangValue],
-) -> Option<PblangValue> {
+pub fn call_jit(fn_ptr: JitFn, args: &[PblangValue]) -> Option<PblangValue> {
     let mut f64_args: Vec<f64> = Vec::with_capacity(args.len());
     for a in args {
         match a {
@@ -677,31 +737,31 @@ mod tests {
         let sp = pblang_ir::chunk::Span::default();
 
         // Block 0: condition check (n <= 1)
-        chunk.write(OpCode::OpGetLocal(0), sp);  // 0: push n
+        chunk.write(OpCode::OpGetLocal(0), sp); // 0: push n
         chunk.write(OpCode::OpConstant(c1), sp); // 1: push 1.0
-        chunk.write(OpCode::OpLe, sp);            // 2: push (n<=1)
-        // OpJumpIfFalse to instruction 6 (past early return)
+        chunk.write(OpCode::OpLe, sp); // 2: push (n<=1)
+                                       // OpJumpIfFalse to instruction 6 (past early return)
         chunk.write(OpCode::OpJumpIfFalse(6), sp); // 3
 
         // Block 1: early return (n <= 1 case)
-        chunk.write(OpCode::OpGetLocal(0), sp);  // 4: push n
-        chunk.write(OpCode::OpReturn, sp);        // 5: return n
+        chunk.write(OpCode::OpGetLocal(0), sp); // 4: push n
+        chunk.write(OpCode::OpReturn, sp); // 5: return n
 
         // Block 2: recursive case
         chunk.write(OpCode::OpGetGlobal(cfib), sp); // 6: push fib ref
-        chunk.write(OpCode::OpGetLocal(0), sp);     // 7: push n
-        chunk.write(OpCode::OpConstant(c1), sp);    // 8: push 1
-        chunk.write(OpCode::OpSub, sp);              // 9: n-1
-        chunk.write(OpCode::OpCall(1), sp);          // 10: fib(n-1)
+        chunk.write(OpCode::OpGetLocal(0), sp); // 7: push n
+        chunk.write(OpCode::OpConstant(c1), sp); // 8: push 1
+        chunk.write(OpCode::OpSub, sp); // 9: n-1
+        chunk.write(OpCode::OpCall(1), sp); // 10: fib(n-1)
 
         chunk.write(OpCode::OpGetGlobal(cfib), sp); // 11: push fib ref
-        chunk.write(OpCode::OpGetLocal(0), sp);     // 12: push n
-        chunk.write(OpCode::OpConstant(c2), sp);    // 13: push 2
-        chunk.write(OpCode::OpSub, sp);              // 14: n-2
-        chunk.write(OpCode::OpCall(1), sp);          // 15: fib(n-2)
+        chunk.write(OpCode::OpGetLocal(0), sp); // 12: push n
+        chunk.write(OpCode::OpConstant(c2), sp); // 13: push 2
+        chunk.write(OpCode::OpSub, sp); // 14: n-2
+        chunk.write(OpCode::OpCall(1), sp); // 15: fib(n-2)
 
-        chunk.write(OpCode::OpAdd, sp);              // 16: fib(n-1) + fib(n-2)
-        chunk.write(OpCode::OpReturn, sp);           // 17: return
+        chunk.write(OpCode::OpAdd, sp); // 16: fib(n-1) + fib(n-2)
+        chunk.write(OpCode::OpReturn, sp); // 17: return
 
         Function {
             name: Some("fib".to_string()),
@@ -732,7 +792,14 @@ mod tests {
         match result {
             JitResult::Compiled(fp) => {
                 // fib(0)=0, fib(1)=1, fib(2)=1, fib(3)=2, fib(5)=5, fib(10)=55
-                let cases = [(0.0, 0.0), (1.0, 1.0), (2.0, 1.0), (3.0, 2.0), (5.0, 5.0), (10.0, 55.0)];
+                let cases = [
+                    (0.0, 0.0),
+                    (1.0, 1.0),
+                    (2.0, 1.0),
+                    (3.0, 2.0),
+                    (5.0, 5.0),
+                    (10.0, 55.0),
+                ];
                 for (input, expected) in cases {
                     let result = unsafe { fp(&input as *const f64, 1) };
                     assert_eq!(
@@ -774,7 +841,14 @@ mod tests {
         chunk.write(OpCode::OpPrint, sp);
         chunk.write(OpCode::OpReturn, sp);
 
-        let func = Function { name: Some("not_jit".into()), arity: 0, min_arity: 0, defaults: vec![], is_vararg: false, chunk };
+        let func = Function {
+            name: Some("not_jit".into()),
+            arity: 0,
+            min_arity: 0,
+            defaults: vec![],
+            is_vararg: false,
+            chunk,
+        };
         assert!(
             is_jit_eligible(&func.chunk).is_err(),
             "function with OpPrint should NOT be JIT-eligible"
@@ -803,7 +877,10 @@ mod tests {
         match cache.compile("not_nil", &func) {
             JitResult::Compiled(fp) => {
                 let result = unsafe { fp(std::ptr::null(), 0) };
-                assert_eq!(result, 1.0, "!nil should evaluate to true (1.0), got {result}");
+                assert_eq!(
+                    result, 1.0,
+                    "!nil should evaluate to true (1.0), got {result}"
+                );
             }
             JitResult::NotEligible(reason) => panic!("not_nil should be JIT-eligible: {reason}"),
         }
@@ -817,12 +894,12 @@ mod tests {
         let c_true_branch = chunk.add_const(PV::Number(1.0));
         let c_false_branch = chunk.add_const(PV::Number(2.0));
 
-        chunk.write(OpCode::OpConstant(c_nil), sp);         // 0
-        chunk.write(OpCode::OpJumpIfFalse(4), sp);          // 1
+        chunk.write(OpCode::OpConstant(c_nil), sp); // 0
+        chunk.write(OpCode::OpJumpIfFalse(4), sp); // 1
         chunk.write(OpCode::OpConstant(c_true_branch), sp); // 2
-        chunk.write(OpCode::OpReturn, sp);                  // 3
-        chunk.write(OpCode::OpConstant(c_false_branch), sp);// 4
-        chunk.write(OpCode::OpReturn, sp);                  // 5
+        chunk.write(OpCode::OpReturn, sp); // 3
+        chunk.write(OpCode::OpConstant(c_false_branch), sp); // 4
+        chunk.write(OpCode::OpReturn, sp); // 5
 
         let func = Function {
             name: Some("nil_branch".into()),
@@ -837,7 +914,10 @@ mod tests {
         match cache.compile("nil_branch", &func) {
             JitResult::Compiled(fp) => {
                 let result = unsafe { fp(std::ptr::null(), 0) };
-                assert_eq!(result, 2.0, "nil condition should take false branch, got {result}");
+                assert_eq!(
+                    result, 2.0,
+                    "nil condition should take false branch, got {result}"
+                );
             }
             JitResult::NotEligible(reason) => panic!("nil_branch should be JIT-eligible: {reason}"),
         }
@@ -851,12 +931,12 @@ mod tests {
         let c_fallthrough = chunk.add_const(PV::Number(3.0));
         let c_jump_target = chunk.add_const(PV::Number(4.0));
 
-        chunk.write(OpCode::OpConstant(c_nil), sp);         // 0
-        chunk.write(OpCode::OpJumpIfTrue(4), sp);           // 1
+        chunk.write(OpCode::OpConstant(c_nil), sp); // 0
+        chunk.write(OpCode::OpJumpIfTrue(4), sp); // 1
         chunk.write(OpCode::OpConstant(c_fallthrough), sp); // 2
-        chunk.write(OpCode::OpReturn, sp);                  // 3
+        chunk.write(OpCode::OpReturn, sp); // 3
         chunk.write(OpCode::OpConstant(c_jump_target), sp); // 4
-        chunk.write(OpCode::OpReturn, sp);                  // 5
+        chunk.write(OpCode::OpReturn, sp); // 5
 
         let func = Function {
             name: Some("nil_jump_if_true".into()),

@@ -83,7 +83,9 @@ fn run_lsp_exchange(steps: &[(&str, Option<u32>)]) -> String {
                 if let Ok(s) = rx.try_recv() {
                     all_stdout = s;
                 }
-                if all_stdout.contains(&needle) && !all_stdout.contains(&format!("\"id\":{id},\"error\"")) {
+                if all_stdout.contains(&needle)
+                    && !all_stdout.contains(&format!("\"id\":{id},\"error\""))
+                {
                     // accept success responses; errors still count as received
                     if all_stdout.contains(&format!("\"id\":{id}")) {
                         break;

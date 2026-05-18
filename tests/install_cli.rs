@@ -1,10 +1,10 @@
 //! Regression tests for registry CLI flows (`install`, `build`, local `publish`).
 
 use pblang_pm::{fetch_url, parse_lockfile, write_lockfile};
+use sha2::Digest;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
-use sha2::Digest;
 
 fn file_url_for_path(path: &std::path::Path) -> String {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -19,7 +19,10 @@ fn make_tarball_and_sha256(temp: &std::path::Path) -> (std::path::PathBuf, Strin
         let f = std::fs::File::create(&tarball_path).unwrap();
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         let mut tar_builder = tar::Builder::new(&mut enc);
-        for (path, content) in [("lib.sapp", lib_content.as_slice()), ("pblang.toml", manifest.as_slice())] {
+        for (path, content) in [
+            ("lib.sapp", lib_content.as_slice()),
+            ("pblang.toml", manifest.as_slice()),
+        ] {
             let mut header = tar::Header::new_gnu();
             header.set_path(path).unwrap();
             header.set_size(content.len() as u64);
@@ -216,7 +219,9 @@ version = "0.1.0"
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
     // SAFETY: test-only; set before launching the child process.
     #[allow(unused_unsafe)]
-    unsafe { std::env::set_var("PBLANG_SIGNING_KEY", "testkey") };
+    unsafe {
+        std::env::set_var("PBLANG_SIGNING_KEY", "testkey")
+    };
     let bin = env!("CARGO_BIN_EXE_pblang");
     let out = std::process::Command::new(bin)
         .arg("install")
@@ -2279,7 +2284,8 @@ version = "0.1.0"
 fn fetch_url_reads_registry_index_over_http() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test http listener");
     let addr = listener.local_addr().expect("listener addr");
-    let body = br#"{"packages":{"@sapphire/http-pkg":{"1.0.0":{"url":"file:///noop","sha256":null}}}}"#;
+    let body =
+        br#"{"packages":{"@sapphire/http-pkg":{"1.0.0":{"url":"file:///noop","sha256":null}}}}"#;
     let handle = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let response = format!(

@@ -1,7 +1,7 @@
 //! Native graphics builtins: minifb backend with framebuffer, events (keyboard/mouse).
 
-use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 use minifb::{KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -141,15 +141,14 @@ pub fn gfxcreatewindow(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
 // --- gfxisopen(handle) -> bool
 pub fn gfxisopen(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "gfxisopen expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(host.err(format!("gfxisopen expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxisopen")?;
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
-        return crate::sdl2_backend::with_window_mut(host, id, "gfxisopen", |w| Ok(Value::Bool(w.is_open())));
+        return crate::sdl2_backend::with_window_mut(host, id, "gfxisopen", |w| {
+            Ok(Value::Bool(w.is_open()))
+        });
     }
     let open = with_window_mut(host, id, "gfxisopen", |gw| Ok(gw.win.is_open()))?;
     Ok(Value::Bool(open))
@@ -158,10 +157,7 @@ pub fn gfxisopen(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runti
 // --- gfxclose(handle)
 pub fn gfxclose(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "gfxclose expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(host.err(format!("gfxclose expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxclose")?;
     #[cfg(feature = "sdl2")]
@@ -178,10 +174,7 @@ pub fn gfxclose(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runtim
 // --- gfxsize(handle) -> map { "w": number, "h": number }
 pub fn gfxsize(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "gfxsize expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(host.err(format!("gfxsize expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxsize")?;
     #[cfg(feature = "sdl2")]
@@ -205,10 +198,7 @@ pub fn gfxsize(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runtime
 // --- gfxclear(handle, color)
 pub fn gfxclear(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 2 {
-        return Err(host.err(format!(
-            "gfxclear expects 2 arguments, got {}",
-            args.len()
-        )));
+        return Err(host.err(format!("gfxclear expects 2 arguments, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxclear")?;
     let c = color_from_value(host, &args[1], "gfxclear")?;
@@ -318,25 +308,39 @@ pub fn gfxdrawline(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
         });
     }
     with_window_mut(host, id, "gfxdrawline", |gw| {
-        draw_line_bresenham(&mut gw.buf, gw.w, gw.h, LineParams { x1, y1, x2, y2, color: c });
+        draw_line_bresenham(
+            &mut gw.buf,
+            gw.w,
+            gw.h,
+            LineParams {
+                x1,
+                y1,
+                x2,
+                y2,
+                color: c,
+            },
+        );
         Ok(Value::Nil)
     })
 }
 
 /// Parameters for Bresenham line drawing — groups coordinates to stay under the argument limit.
 struct LineParams {
-    x1: i64, y1: i64,
-    x2: i64, y2: i64,
+    x1: i64,
+    y1: i64,
+    x2: i64,
+    y2: i64,
     color: u32,
 }
 
-fn draw_line_bresenham(
-    buf: &mut [u32],
-    w: usize,
-    h: usize,
-    params: LineParams,
-) {
-    let LineParams { x1, y1, x2, y2, color } = params;
+fn draw_line_bresenham(buf: &mut [u32], w: usize, h: usize, params: LineParams) {
+    let LineParams {
+        x1,
+        y1,
+        x2,
+        y2,
+        color,
+    } = params;
     let mut x = x1;
     let mut y = y1;
     let dx = (x2 - x1).abs();
@@ -366,10 +370,7 @@ fn draw_line_bresenham(
 // --- gfxpresent(handle)
 pub fn gfxpresent(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "gfxpresent expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(host.err(format!("gfxpresent expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxpresent")?;
     #[cfg(feature = "sdl2")]
@@ -422,19 +423,19 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
         // Key down
         let keys = gw.win.get_keys_pressed(KeyRepeat::No);
         for k in keys {
-                let mut m = HashMap::new();
-                m.insert("type".into(), alloc_string("keydown"));
-                m.insert("key".into(), alloc_string(format!("{k:?}")));
-                out.push(alloc_map(m));
+            let mut m = HashMap::new();
+            m.insert("type".into(), alloc_string("keydown"));
+            m.insert("key".into(), alloc_string(format!("{k:?}")));
+            out.push(alloc_map(m));
         }
 
         // Key up
         let keys_up = gw.win.get_keys_released();
         for k in keys_up {
-                let mut m = HashMap::new();
-                m.insert("type".into(), alloc_string("keyup"));
-                m.insert("key".into(), alloc_string(format!("{k:?}")));
-                out.push(alloc_map(m));
+            let mut m = HashMap::new();
+            m.insert("type".into(), alloc_string("keyup"));
+            m.insert("key".into(), alloc_string(format!("{k:?}")));
+            out.push(alloc_map(m));
         }
 
         // Mouse move
