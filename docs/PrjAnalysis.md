@@ -51,6 +51,14 @@ This document is the current validation baseline for analysis claims against the
   - Removed redundant inline `<system>{sys}</system>` wrapping from user message.
   - System prompt is passed only via the top-level `body["system"]` field (Anthropic's recommended approach).
   - Eliminates injection risk from prompts containing `</system>`.
+- `strfromcharcode` / `str_from_char_code` added to typeck builtin prelude:
+  - `crates/pblang-typeck/src/lib.rs` (`seed_builtin_prelude`)
+  - Fixes `compiler_tokenizer_and_typeck_host_typecheck_clean` test (was failing because `stdlib/compiler/tokenizer.sapp` calls `strfromcharcode` which was not declared in the typeck context).
+  - All 5 typeck_compiler tests now pass.
+- Lint walk `.expect()` panics replaced with safe helpers:
+  - `src/main.rs` (`lint_unused_warnings`)
+  - 16 `.expect()` calls on scope stack `pop()` / `last_mut()` replaced with `pop_scope_and_report` helper and `if let` guards.
+  - Eliminates potential panics on internal invariant violations without losing lint accuracy.
 
 ## True but Not Fully Fixed (Large Refactor / Design Work)
 
@@ -84,9 +92,12 @@ This document is the current validation baseline for analysis claims against the
 - `Anthropic API key duplicated into headers`: **partially outdated** — `api_key` is only inserted once via `x-api-key` header in `chat_anthropic`; the `auto_register` stores it once in `provider.api_key`.
 - IDE server binds to `0.0.0.0`: **false** — it binds to `127.0.0.1`.
 - `from_utf8` fallback uses `src.to_string()`: **outdated** — now uses `from_utf8_lossy`.
+- `pblang-wasm` has no `--wasm` CLI command: **false** — `pblang compile --wasm` exists (emits `.wat` via `pblang_wasm::compile_to_wat`).
+- `cargo-audit` not in CI: **false** — CI already includes a `Security Audit` job (`cargo audit`).
+- `strfromcharcode` not available to typeck: **was true, now fixed** — added to `seed_builtin_prelude`; test passes.
+- `libtest_parse.rlib` and `doc_out/` still in repo: **outdated** — already removed; `.gitignore` covers both.
 
 ## Notes
 
-- Historical raw AI audit transcripts are preserved below for reference but should not be treated as current findings.
 - If new fixes are applied, update this file by moving items between sections rather than appending raw reports.
 - This validation was done against the GitHub repository state, not just historical reports.
