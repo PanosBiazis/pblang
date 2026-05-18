@@ -152,9 +152,7 @@ fn http_helpers_work() {
             Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(
                 "example".to_string()
             ))),
-            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(
-                "body".to_string()
-            ))),
+            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String("body".to_string()))),
         ]
     );
     let resp = out[4].as_str().expect("expected response string");
@@ -307,7 +305,10 @@ fn http_static_file_response_serves_text_file_under_root() {
     assert_eq!(out.len(), 3);
     assert_eq!(out[0], Value::Number(200.0));
     assert_eq!(out[1].as_str().expect("body"), "hello");
-    assert_eq!(out[2].as_str().expect("content_type"), "text/plain; charset=utf-8");
+    assert_eq!(
+        out[2].as_str().expect("content_type"),
+        "text/plain; charset=utf-8"
+    );
 }
 
 #[test]
@@ -1720,10 +1721,16 @@ fn match_guard_pass() {
     assert_eq!(
         out,
         vec![
-            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String("negative".to_string()))),
+            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(
+                "negative".to_string()
+            ))),
             Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String("zero".to_string()))),
-            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String("small positive".to_string()))),
-            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String("large positive".to_string()))),
+            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(
+                "small positive".to_string()
+            ))),
+            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(
+                "large positive".to_string()
+            ))),
         ]
     );
 }
@@ -1740,7 +1747,8 @@ fn nd_linalg_inv_solve_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "nd_linalg_inv_solve_pass",
-        "expected final print nd_linalg_inv_solve_pass, got: {:?}", out
+        "expected final print nd_linalg_inv_solve_pass, got: {:?}",
+        out
     );
 }
 
@@ -1756,7 +1764,8 @@ fn tensor_ops_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "tensor_ops_pass",
-        "expected final print tensor_ops_pass, got: {:?}", out
+        "expected final print tensor_ops_pass, got: {:?}",
+        out
     );
 }
 
@@ -1783,7 +1792,8 @@ fn thread_pool_stdlib_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "thread_pool_stdlib_pass",
-        "expected thread_pool_stdlib_pass, got: {:?}", out
+        "expected thread_pool_stdlib_pass, got: {:?}",
+        out
     );
 }
 
@@ -1799,7 +1809,8 @@ fn quantum_noise_depolarizing_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "quantum_noise_depolarizing_pass",
-        "expected final print quantum_noise_depolarizing_pass, got: {:?}", out
+        "expected final print quantum_noise_depolarizing_pass, got: {:?}",
+        out
     );
 }
 
@@ -1815,7 +1826,8 @@ fn tls_stub_exports_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "tls_stub_test: pass",
-        "expected final print tls_stub_test: pass, got: {:?}", out
+        "expected final print tls_stub_test: pass, got: {:?}",
+        out
     );
 }
 
@@ -1829,7 +1841,10 @@ fn os_env_set_pass() {
         .join("tests/semantics/os_signal_test.sapp");
     let src = std::fs::read_to_string(&path).expect("read os_signal_test.sapp");
     // env_set/env_get require exec capability
-    let cfg = StdlibConfig { exec: true, ..StdlibConfig::default() };
+    let cfg = StdlibConfig {
+        exec: true,
+        ..StdlibConfig::default()
+    };
     let out = run_collect_with_config(cfg, &src);
     let got = out
         .last()
@@ -1837,7 +1852,8 @@ fn os_env_set_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "os_env_set_pass",
-        "expected final print os_env_set_pass, got: {:?}", out
+        "expected final print os_env_set_pass, got: {:?}",
+        out
     );
 }
 
@@ -1853,7 +1869,8 @@ fn polyglot_exec_python_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "polyglot_exec_python_pass",
-        "expected final print polyglot_exec_python_pass, got: {:?}", out
+        "expected final print polyglot_exec_python_pass, got: {:?}",
+        out
     );
 }
 
@@ -1869,7 +1886,8 @@ fn selfhost_frontend_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "selfhost_frontend_pass",
-        "expected selfhost_frontend_pass, got: {:?}", out
+        "expected selfhost_frontend_pass, got: {:?}",
+        out
     );
 }
 
@@ -1885,7 +1903,8 @@ fn manifest_validate_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "manifest_validate_pass",
-        "expected manifest_validate_pass, got: {:?}", out
+        "expected manifest_validate_pass, got: {:?}",
+        out
     );
 }
 
@@ -1905,7 +1924,8 @@ fn onnx_infer_bridge_returns_structured_result() {
         .unwrap_or_default();
     assert_eq!(
         got, "onnx_infer_bridge_pass",
-        "expected onnx_infer_bridge_pass, got: {:?}", out
+        "expected onnx_infer_bridge_pass, got: {:?}",
+        out
     );
 }
 
@@ -1921,13 +1941,15 @@ fn array_map_functional_pass() {
         .unwrap_or_default();
     assert_eq!(
         got, "array_map_functional_pass",
-        "expected array_map_functional_pass, got: {:?}", out
+        "expected array_map_functional_pass, got: {:?}",
+        out
     );
 }
 
 #[test]
 fn sort_and_numeric_builtins_pass() {
-    let out = run_collect(r#"
+    let out = run_collect(
+        r#"
         // array_sort
         let sorted = array_sort([3, 1, 4, 1, 5, 9, 2, 6]);
         if sorted[0] != 1 or sorted[7] != 9 { print "FAIL sort numbers"; }
@@ -1952,12 +1974,17 @@ fn sort_and_numeric_builtins_pass() {
         if strcharcodeat("ABC", 2) != 67 { print "FAIL strcharcodeat C"; }
 
         print "sort_and_numeric_builtins_pass";
-    "#);
-    let got = out.last()
+    "#,
+    );
+    let got = out
+        .last()
         .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
         .unwrap_or_default();
-    assert_eq!(got, "sort_and_numeric_builtins_pass",
-        "expected sort_and_numeric_builtins_pass, got: {:?}", out);
+    assert_eq!(
+        got, "sort_and_numeric_builtins_pass",
+        "expected sort_and_numeric_builtins_pass, got: {:?}",
+        out
+    );
 }
 
 /// N2-beta: verify Cranelift JIT compiles and executes fibonacci correctly.
@@ -1993,21 +2020,29 @@ fn cranelift_jit_fib_pass() {
     chunk.write(OpCode::OpAdd, sp);
     chunk.write(OpCode::OpReturn, sp);
 
-    let func = Function { name: Some("fib".into()), arity: 1, min_arity: 1, defaults: vec![], is_vararg: false, chunk };
+    let func = Function {
+        name: Some("fib".into()),
+        arity: 1,
+        min_arity: 1,
+        defaults: vec![],
+        is_vararg: false,
+        chunk,
+    };
     let mut cache = JitCache::new().expect("JitCache::new");
 
     match cache.compile("fib", &func) {
         JitResult::Compiled(fp) => {
             let cases = [
-                (0.0f64, 0.0f64), (1.0, 1.0), (2.0, 1.0),
-                (5.0, 5.0), (10.0, 55.0), (20.0, 6765.0),
+                (0.0f64, 0.0f64),
+                (1.0, 1.0),
+                (2.0, 1.0),
+                (5.0, 5.0),
+                (10.0, 55.0),
+                (20.0, 6765.0),
             ];
             for (n, expected) in cases {
                 let got = unsafe { fp(&n as *const f64, 1) };
-                assert_eq!(
-                    got, expected,
-                    "JIT fib({n}) expected {expected} got {got}"
-                );
+                assert_eq!(got, expected, "JIT fib({n}) expected {expected} got {got}");
             }
         }
         JitResult::NotEligible(r) => {
@@ -2023,8 +2058,7 @@ macro_rules! sapp_test {
         fn $fn_name() {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join(concat!("tests/semantics/", $file));
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("read {}", $file));
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {}", $file));
             let out = run_collect(&src);
             let got = out
                 .last()
@@ -2035,26 +2069,106 @@ macro_rules! sapp_test {
     };
 }
 
-sapp_test!(result_stdlib_pass,   "result_stdlib_test.sapp",   "result_stdlib_pass");
-sapp_test!(option_stdlib_pass,   "option_stdlib_test.sapp",   "option_stdlib_pass");
-sapp_test!(iter_stdlib_pass,     "iter_stdlib_test.sapp",     "iter_stdlib_pass");
-sapp_test!(validate_stdlib_pass, "validate_stdlib_test.sapp", "validate_stdlib_pass");
-sapp_test!(cache_stdlib_pass,    "cache_stdlib_test.sapp",    "cache_stdlib_pass");
-sapp_test!(event_stdlib_pass,    "event_stdlib_test.sapp",    "event_stdlib_pass");
-sapp_test!(uuid_stdlib_pass,     "uuid_stdlib_test.sapp",     "uuid_stdlib_pass");
-sapp_test!(logger_stdlib_pass,   "logger_stdlib_test.sapp",   "logger_stdlib_pass");
-sapp_test!(assert_stdlib_pass,   "assert_stdlib_test.sapp",   "assert_stdlib_pass");
-sapp_test!(pipe_stdlib_pass,     "pipe_stdlib_test.sapp",     "pipe_stdlib_pass");
-sapp_test!(regex_stdlib_pass,    "regex_stdlib_test.sapp",    "regex_stdlib_pass");
-sapp_test!(config_stdlib_pass,   "config_stdlib_test.sapp",   "config_stdlib_pass");
-sapp_test!(signal_stdlib_pass,   "signal_stdlib_test.sapp",   "signal_stdlib_pass");
-sapp_test!(map_extended_pass,    "map_extended_test.sapp",    "map_extended_pass");
-sapp_test!(new_builtins_pass,       "new_builtins_test.sapp",       "new_builtins_pass");
-sapp_test!(new_language_features_pass, "new_language_features_test.sapp", "new_language_features_pass");
-sapp_test!(core_builtins_pass,        "core_builtins_test.sapp",         "core_builtins_pass");
-sapp_test!(algo_stdlib_pass,         "algo_stdlib_test.sapp",           "algo_stdlib_pass");
-sapp_test!(stat_stdlib_pass,         "stat_stdlib_test.sapp",           "stat_stdlib_pass");
-sapp_test!(format_stdlib_pass,       "format_stdlib_test.sapp",         "format_stdlib_pass");
+sapp_test!(
+    result_stdlib_pass,
+    "result_stdlib_test.sapp",
+    "result_stdlib_pass"
+);
+sapp_test!(
+    option_stdlib_pass,
+    "option_stdlib_test.sapp",
+    "option_stdlib_pass"
+);
+sapp_test!(
+    iter_stdlib_pass,
+    "iter_stdlib_test.sapp",
+    "iter_stdlib_pass"
+);
+sapp_test!(
+    validate_stdlib_pass,
+    "validate_stdlib_test.sapp",
+    "validate_stdlib_pass"
+);
+sapp_test!(
+    cache_stdlib_pass,
+    "cache_stdlib_test.sapp",
+    "cache_stdlib_pass"
+);
+sapp_test!(
+    event_stdlib_pass,
+    "event_stdlib_test.sapp",
+    "event_stdlib_pass"
+);
+sapp_test!(
+    uuid_stdlib_pass,
+    "uuid_stdlib_test.sapp",
+    "uuid_stdlib_pass"
+);
+sapp_test!(
+    logger_stdlib_pass,
+    "logger_stdlib_test.sapp",
+    "logger_stdlib_pass"
+);
+sapp_test!(
+    assert_stdlib_pass,
+    "assert_stdlib_test.sapp",
+    "assert_stdlib_pass"
+);
+sapp_test!(
+    pipe_stdlib_pass,
+    "pipe_stdlib_test.sapp",
+    "pipe_stdlib_pass"
+);
+sapp_test!(
+    regex_stdlib_pass,
+    "regex_stdlib_test.sapp",
+    "regex_stdlib_pass"
+);
+sapp_test!(
+    config_stdlib_pass,
+    "config_stdlib_test.sapp",
+    "config_stdlib_pass"
+);
+sapp_test!(
+    signal_stdlib_pass,
+    "signal_stdlib_test.sapp",
+    "signal_stdlib_pass"
+);
+sapp_test!(
+    map_extended_pass,
+    "map_extended_test.sapp",
+    "map_extended_pass"
+);
+sapp_test!(
+    new_builtins_pass,
+    "new_builtins_test.sapp",
+    "new_builtins_pass"
+);
+sapp_test!(
+    new_language_features_pass,
+    "new_language_features_test.sapp",
+    "new_language_features_pass"
+);
+sapp_test!(
+    core_builtins_pass,
+    "core_builtins_test.sapp",
+    "core_builtins_pass"
+);
+sapp_test!(
+    algo_stdlib_pass,
+    "algo_stdlib_test.sapp",
+    "algo_stdlib_pass"
+);
+sapp_test!(
+    stat_stdlib_pass,
+    "stat_stdlib_test.sapp",
+    "stat_stdlib_pass"
+);
+sapp_test!(
+    format_stdlib_pass,
+    "format_stdlib_test.sapp",
+    "format_stdlib_pass"
+);
 
 // ---- Runtime memory safety builtins ----
 sapp_test!(
@@ -2064,103 +2178,227 @@ sapp_test!(
 );
 
 // ---- Thread safety & concurrency tests ----
-sapp_test!(atomic_builtins_pass,            "atomic_builtins_test.sapp",            "atomic_builtins_pass");
-sapp_test!(mutex_builtins_pass,             "mutex_builtins_test.sapp",             "mutex_builtins_pass");
-sapp_test!(rwlock_builtins_pass,            "rwlock_builtins_test.sapp",            "rwlock_builtins_pass");
-sapp_test!(channel_buffered_pass,           "channel_buffered_test.sapp",           "channel_buffered_pass");
-sapp_test!(barrier_once_builtins_pass,      "barrier_once_builtins_test.sapp",      "barrier_once_builtins_pass");
-sapp_test!(thread_stdlib_enhanced_pass,     "thread_stdlib_enhanced_test.sapp",     "thread_stdlib_enhanced_pass");
-sapp_test!(thread_pool_resilience_pass,     "thread_pool_resilience_test.sapp",     "thread_pool_resilience_pass");
-sapp_test!(spawn_closure_transfer_pass,     "spawn_closure_transfer_test.sapp",     "spawn_closure_transfer_pass");
-sapp_test!(spawn_global_capture_pass,       "spawn_global_capture_test.sapp",       "spawn_global_capture_pass");
-sapp_test!(pipeline_pass,                   "pipeline_test.sapp",                   "pipeline_pass");
-sapp_test!(promise_pass,                    "promise_test.sapp",                    "promise_pass");
-sapp_test!(waitgroup_pass,                  "waitgroup_test.sapp",                  "waitgroup_pass");
-sapp_test!(actor_pass,                      "actor_test.sapp",                      "actor_pass");
+sapp_test!(
+    atomic_builtins_pass,
+    "atomic_builtins_test.sapp",
+    "atomic_builtins_pass"
+);
+sapp_test!(
+    mutex_builtins_pass,
+    "mutex_builtins_test.sapp",
+    "mutex_builtins_pass"
+);
+sapp_test!(
+    rwlock_builtins_pass,
+    "rwlock_builtins_test.sapp",
+    "rwlock_builtins_pass"
+);
+sapp_test!(
+    channel_buffered_pass,
+    "channel_buffered_test.sapp",
+    "channel_buffered_pass"
+);
+sapp_test!(
+    barrier_once_builtins_pass,
+    "barrier_once_builtins_test.sapp",
+    "barrier_once_builtins_pass"
+);
+sapp_test!(
+    thread_stdlib_enhanced_pass,
+    "thread_stdlib_enhanced_test.sapp",
+    "thread_stdlib_enhanced_pass"
+);
+sapp_test!(
+    thread_pool_resilience_pass,
+    "thread_pool_resilience_test.sapp",
+    "thread_pool_resilience_pass"
+);
+sapp_test!(
+    spawn_closure_transfer_pass,
+    "spawn_closure_transfer_test.sapp",
+    "spawn_closure_transfer_pass"
+);
+sapp_test!(
+    spawn_global_capture_pass,
+    "spawn_global_capture_test.sapp",
+    "spawn_global_capture_pass"
+);
+sapp_test!(pipeline_pass, "pipeline_test.sapp", "pipeline_pass");
+sapp_test!(promise_pass, "promise_test.sapp", "promise_pass");
+sapp_test!(waitgroup_pass, "waitgroup_test.sapp", "waitgroup_pass");
+sapp_test!(actor_pass, "actor_test.sapp", "actor_pass");
 
 // ─── New stdlib module tests (added in comprehensive audit fix) ───────────────
-sapp_test!(fs_stdlib_pass,       "fs_stdlib_test.sapp",       "fs stdlib tests passed");
-sapp_test!(testing_stdlib_pass,  "testing_stdlib_test.sapp",  "testing stdlib tests passed");
-sapp_test!(orm_stdlib_pass,      "orm_test.sapp",              "ORM tests passed");
-sapp_test!(env_stdlib_pass,      "env_stdlib_test.sapp",       "env stdlib tests passed");
-sapp_test!(log_stdlib_pass,      "log_stdlib_test.sapp",       "log stdlib tests passed");
+sapp_test!(
+    fs_stdlib_pass,
+    "fs_stdlib_test.sapp",
+    "fs stdlib tests passed"
+);
+sapp_test!(
+    testing_stdlib_pass,
+    "testing_stdlib_test.sapp",
+    "testing stdlib tests passed"
+);
+sapp_test!(orm_stdlib_pass, "orm_test.sapp", "ORM tests passed");
+sapp_test!(
+    env_stdlib_pass,
+    "env_stdlib_test.sapp",
+    "env stdlib tests passed"
+);
+sapp_test!(
+    log_stdlib_pass,
+    "log_stdlib_test.sapp",
+    "log stdlib tests passed"
+);
 
 // ─── OOP, Data Types, Algorithms ─────────────────────────────────────────────
-sapp_test!(class_stdlib_pass,      "class_stdlib_test.sapp",      "class stdlib tests passed");
-sapp_test!(struct_stdlib_pass,     "struct_stdlib_test.sapp",     "struct stdlib tests passed");
-sapp_test!(enum_stdlib_pass,       "enum_stdlib_test.sapp",       "enum stdlib tests passed");
-sapp_test!(graph_stdlib_pass,      "graph_stdlib_test.sapp",      "graph stdlib tests passed");
+sapp_test!(
+    class_stdlib_pass,
+    "class_stdlib_test.sapp",
+    "class stdlib tests passed"
+);
+sapp_test!(
+    struct_stdlib_pass,
+    "struct_stdlib_test.sapp",
+    "struct stdlib tests passed"
+);
+sapp_test!(
+    enum_stdlib_pass,
+    "enum_stdlib_test.sapp",
+    "enum stdlib tests passed"
+);
+sapp_test!(
+    graph_stdlib_pass,
+    "graph_stdlib_test.sapp",
+    "graph stdlib tests passed"
+);
 
 // ─── Error handling, security, utilities ─────────────────────────────────────
-sapp_test!(try_catch_defer_pass,   "try_catch_defer_test.sapp",   "try_catch_defer_pass");
-sapp_test!(jwt_stdlib_pass,        "jwt_stdlib_test.sapp",        "jwt_stdlib_pass");
-sapp_test!(template_stdlib_pass,   "template_stdlib_test.sapp",   "template_stdlib_pass");
-sapp_test!(benchmark_stdlib_pass,  "benchmark_stdlib_test.sapp",  "benchmark_stdlib_pass");
-sapp_test!(crypto_advanced_pass,   "crypto_advanced_test.sapp",   "crypto_advanced_pass");
+sapp_test!(
+    try_catch_defer_pass,
+    "try_catch_defer_test.sapp",
+    "try_catch_defer_pass"
+);
+sapp_test!(jwt_stdlib_pass, "jwt_stdlib_test.sapp", "jwt_stdlib_pass");
+sapp_test!(
+    template_stdlib_pass,
+    "template_stdlib_test.sapp",
+    "template_stdlib_pass"
+);
+sapp_test!(
+    benchmark_stdlib_pass,
+    "benchmark_stdlib_test.sapp",
+    "benchmark_stdlib_pass"
+);
+sapp_test!(
+    crypto_advanced_pass,
+    "crypto_advanced_test.sapp",
+    "crypto_advanced_pass"
+);
 
 // ─── Core language feature tests ───────────────────────────────────────────────
-sapp_test!(augmented_assignment_pass, "augmented_assignment_test.sapp", "augmented_assignment_pass");
-sapp_test!(default_params_pass,       "default_params_test.sapp",       "default_params_pass");
-sapp_test!(variadic_pass,             "variadic_test.sapp",             "variadic_pass");
-sapp_test!(destructuring_pass,        "destructuring_test.sapp",        "destructuring_pass");
+sapp_test!(
+    augmented_assignment_pass,
+    "augmented_assignment_test.sapp",
+    "augmented_assignment_pass"
+);
+sapp_test!(
+    default_params_pass,
+    "default_params_test.sapp",
+    "default_params_pass"
+);
+sapp_test!(variadic_pass, "variadic_test.sapp", "variadic_pass");
+sapp_test!(
+    destructuring_pass,
+    "destructuring_test.sapp",
+    "destructuring_pass"
+);
 
 // ─── New stdlib: AI, Data Science, Systems, Patterns ─────────────────────────
-sapp_test!(dataframe_stdlib_pass,  "dataframe_test.sapp",         "dataframe_stdlib_pass");
-sapp_test!(systems_stdlib_pass,    "systems_test.sapp",           "systems_stdlib_pass");
-sapp_test!(state_machine_pass,     "state_machine_test.sapp",     "state_machine_pass");
-sapp_test!(ecs_stdlib_pass,        "ecs_test.sapp",               "ecs_stdlib_pass");
-sapp_test!(structured_concurrency_pass,     "structured_concurrency_test.sapp",     "structured_concurrency_pass");
+sapp_test!(
+    dataframe_stdlib_pass,
+    "dataframe_test.sapp",
+    "dataframe_stdlib_pass"
+);
+sapp_test!(
+    systems_stdlib_pass,
+    "systems_test.sapp",
+    "systems_stdlib_pass"
+);
+sapp_test!(
+    state_machine_pass,
+    "state_machine_test.sapp",
+    "state_machine_pass"
+);
+sapp_test!(ecs_stdlib_pass, "ecs_test.sapp", "ecs_stdlib_pass");
+sapp_test!(
+    structured_concurrency_pass,
+    "structured_concurrency_test.sapp",
+    "structured_concurrency_pass"
+);
 
 #[test]
 fn for_in_array_pass() {
-    let out = run_collect(r#"
+    let out = run_collect(
+        r#"
         let sum = 0;
         let arr = [10, 20, 30, 40];
         for x in arr {
             sum = sum + x;
         }
         print sum;
-    "#);
+    "#,
+    );
     assert_eq!(out, vec![Value::Number(100.0)]);
 }
 
 #[test]
 fn for_in_map_kv_pass() {
-    let out = run_collect(r#"
+    let out = run_collect(
+        r#"
         let m = map{ a: 1, b: 2, c: 3 };
         let total = 0;
         for k, v in m {
             total = total + v;
         }
         print total;
-    "#);
+    "#,
+    );
     assert_eq!(out, vec![Value::Number(6.0)]);
 }
 
 #[test]
 fn capability_denial_fs_blocked() {
-    let config = StdlibConfig { fs: false, ..StdlibConfig::default() };
+    let config = StdlibConfig {
+        fs: false,
+        ..StdlibConfig::default()
+    };
     let err = run_err_with_config(config, r#"fs_read("any_file.txt");"#);
     assert!(
         err.message.contains("access denied") || err.message.contains("denied"),
-        "expected access denied, got: {:?}", err
+        "expected access denied, got: {:?}",
+        err
     );
 }
 
 #[test]
 fn capability_denial_exec_blocked() {
-    let config = StdlibConfig { exec: false, ..StdlibConfig::default() };
+    let config = StdlibConfig {
+        exec: false,
+        ..StdlibConfig::default()
+    };
     let err = run_err_with_config(config, r#"exec("echo hi");"#);
     assert!(
         err.message.contains("access denied") || err.message.contains("denied"),
-        "expected access denied, got: {:?}", err
+        "expected access denied, got: {:?}",
+        err
     );
 }
 
 #[test]
 fn vm_limits_instruction_count_fires() {
-    use pblang_vm::{VmLimits, VM};
     use pblang_compiler::compile;
+    use pblang_vm::{VmLimits, VM};
     let src = "let i = 0; while i < 1000000 { i = i + 1; }";
     let (stmts, _) = pblang_core::parse_with_polyglot(src).unwrap();
     let chunk = compile(stmts).unwrap();
@@ -2174,14 +2412,15 @@ fn vm_limits_instruction_count_fires() {
     let err = result.unwrap_err();
     assert!(
         err.message.contains("instruction limit") || err.message.contains("limit"),
-        "expected instruction limit error, got: {:?}", err
+        "expected instruction limit error, got: {:?}",
+        err
     );
 }
 
 #[test]
 fn vm_limits_stack_depth_fires() {
-    use pblang_vm::{VmLimits, VM};
     use pblang_compiler::compile;
+    use pblang_vm::{VmLimits, VM};
     // Infinite recursion should hit stack depth limit
     let src = "fn recurse() { return recurse(); } recurse();";
     let (stmts, _) = pblang_core::parse_with_polyglot(src).unwrap();
@@ -2197,14 +2436,15 @@ fn vm_limits_stack_depth_fires() {
 
 #[test]
 fn for_in_count_words_pass() {
-    let out = run_collect(r#"
+    let out = run_collect(
+        r#"
         let words = ["hello", "world", "foo"];
         let count = 0;
         for word in words {
             count = count + len(word);
         }
         print count;
-    "#);
+    "#,
+    );
     assert_eq!(out, vec![Value::Number(13.0)]);
 }
-

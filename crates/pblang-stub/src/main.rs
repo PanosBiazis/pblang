@@ -60,7 +60,11 @@ fn find_bundle_offset(exe: &[u8]) -> Option<usize> {
 /// Priority: (1) embedded `bin/pblang` inside the extracted bundle,
 /// (2) same directory as this stub executable, (3) `PATH`.
 fn find_pblang(stub_path: &Path, extract_dir: &Path) -> PathBuf {
-    let bin_name = if cfg!(windows) { "pblang.exe" } else { "pblang" };
+    let bin_name = if cfg!(windows) {
+        "pblang.exe"
+    } else {
+        "pblang"
+    };
     let bundled = extract_dir.join("bin").join(bin_name);
     if bundled.is_file() {
         return bundled;
@@ -112,7 +116,10 @@ fn main() {
     let exe_bytes = match std::fs::read(&exe_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("pblang-stub: cannot read executable '{}': {e}", exe_path.display());
+            eprintln!(
+                "pblang-stub: cannot read executable '{}': {e}",
+                exe_path.display()
+            );
             process::exit(1);
         }
     };
@@ -205,10 +212,7 @@ fn main() {
     }
 
     let status = cmd.status().unwrap_or_else(|e| {
-        eprintln!(
-            "pblang-stub: failed to run '{}': {e}",
-            pblang_bin.display()
-        );
+        eprintln!("pblang-stub: failed to run '{}': {e}", pblang_bin.display());
         process::exit(1);
     });
 
@@ -232,10 +236,7 @@ fn extract_bundle(tarball: &[u8], dest: &Path) {
             eprintln!("pblang-stub: failed to read a bundle entry: {e}");
             process::exit(1);
         });
-        let entry_path = entry
-            .path()
-            .map(|p| p.into_owned())
-            .unwrap_or_else(|e| {
+        let entry_path = entry.path().map(|p| p.into_owned()).unwrap_or_else(|e| {
             eprintln!("pblang-stub: invalid entry path in bundle: {e}");
             process::exit(1);
         });

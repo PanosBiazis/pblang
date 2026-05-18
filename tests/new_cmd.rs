@@ -3,7 +3,10 @@
 use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+};
 
 fn pblang_bin() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_pblang") {
