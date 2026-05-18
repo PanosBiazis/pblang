@@ -223,8 +223,7 @@ fn http_post_json(
     })
 }
 
-#[allow(dead_code)]
-fn http_get_json(
+pub fn http_get_json(
     url: &str,
     headers: &HashMap<String, String>,
     timeout: Duration,
@@ -433,12 +432,10 @@ fn chat_anthropic(
         }
         serde_json::Value::Array(anthropic_msgs)
     } else {
-        let mut msgs = Vec::new();
-        if let Some(ref sys) = options.system_prompt {
-            msgs.push(serde_json::json!({"role": "user", "content": format!("<system>{sys}</system>\n\n{prompt}")}));
-        } else {
-            msgs.push(serde_json::json!({"role": "user", "content": prompt}));
-        }
+        // System prompts are passed via the top-level "system" field below,
+        // not inlined into the user message (avoids injection risk from
+        // prompts containing "</system>").
+        let msgs = vec![serde_json::json!({"role": "user", "content": prompt})];
         serde_json::Value::Array(msgs)
     };
 
@@ -697,15 +694,10 @@ pub fn cosine_similarity(a: &[f64], b: &[f64]) -> Result<f64, String> {
         return Ok(0.0);
     }
 
-    let mut dot = 0.0;
-    let mut mag_a = 0.0;
-    let mut mag_b = 0.0;
-
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        mag_a += a[i] * a[i];
-        mag_b += b[i] * b[i];
-    }
+    let (dot, mag_a, mag_b) = a.iter().zip(b.iter()).fold(
+        (0.0, 0.0, 0.0),
+        |(dot, ma, mb), (x, y)| (dot + x * y, ma + x * x, mb + y * y),
+    );
 
     let denom = mag_a.sqrt() * mag_b.sqrt();
     if denom < 1e-12 {
