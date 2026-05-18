@@ -4264,6 +4264,24 @@ fn main() {
             false
         }
 
+        fn pop_scope_and_report(
+            scope: &mut Vec<std::collections::HashMap<String, (Span, bool, bool)>>,
+            warnings: &mut Vec<(Span, String)>,
+        ) {
+            if let Some(top) = scope.pop() {
+                for (name, (sp, is_import, read)) in top {
+                    if !read {
+                        let msg = if is_import {
+                            format!("unused import: `{}`", name)
+                        } else {
+                            format!("unused variable: `{}`", name)
+                        };
+                        warnings.push((sp, msg));
+                    }
+                }
+            }
+        }
+
         fn walk_expr(
             e: &Expr,
             scope: &mut Vec<std::collections::HashMap<String, (Span, bool, bool)>>,
@@ -4330,19 +4348,7 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope
-                        .pop()
-                        .expect("scope stack underflow: push/pop mismatch in lint walk");
-                    for (name, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", name)
-                            } else {
-                                format!("unused variable: `{}`", name)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 ExprKind::BlockExpr(stmts_in, opt_final) => {
                     scope.push(std::collections::HashMap::new());
@@ -4352,19 +4358,7 @@ fn main() {
                     if let Some(e) = opt_final {
                         walk_expr(e, scope, warnings);
                     }
-                    let top = scope
-                        .pop()
-                        .expect("scope stack underflow: push/pop mismatch in lint walk");
-                    for (name, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", name)
-                            } else {
-                                format!("unused variable: `{}`", name)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 _ => {}
             }
@@ -4389,10 +4383,9 @@ fn main() {
                         }
                     }
                     let is_import = is_import_call(init);
-                    scope
-                        .last_mut()
-                        .expect("lint walk: scope is non-empty (push before every nested scope)")
-                        .insert(name.clone(), (s.span, is_import, false));
+                    if let Some(top) = scope.last_mut() {
+                        top.insert(name.clone(), (s.span, is_import, false));
+                    }
                     walk_expr(init, scope, warnings);
                 }
                 StmtKind::Assign(name, rhs) => {
@@ -4421,37 +4414,13 @@ fn main() {
                     for s in then_b {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope
-                        .pop()
-                        .expect("scope stack underflow: push/pop mismatch in lint walk");
-                    for (name, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", name)
-                            } else {
-                                format!("unused variable: `{}`", name)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                     if let Some(else_stmts) = else_b {
                         scope.push(std::collections::HashMap::new());
                         for s in else_stmts {
                             walk_stmt(s, scope, warnings);
                         }
-                        let top = scope
-                            .pop()
-                            .expect("scope stack underflow: push/pop mismatch in lint walk");
-                        for (name, (sp, is_import, read)) in top {
-                            if !read {
-                                let msg = if is_import {
-                                    format!("unused import: `{}`", name)
-                                } else {
-                                    format!("unused variable: `{}`", name)
-                                };
-                                warnings.push((sp, msg));
-                            }
-                        }
+                        pop_scope_and_report(scope, warnings);
                     }
                 }
                 StmtKind::While(cond, body) => {
@@ -4460,19 +4429,7 @@ fn main() {
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope
-                        .pop()
-                        .expect("scope stack underflow: push/pop mismatch in lint walk");
-                    for (name, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", name)
-                            } else {
-                                format!("unused variable: `{}`", name)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 StmtKind::For(name, count, body) => {
                     walk_expr(count, scope, warnings);
@@ -4487,113 +4444,51 @@ fn main() {
                             }
                         }
                     }
-                    scope
-                        .last_mut()
-                        .expect("lint walk: scope is non-empty (push before every nested scope)")
-                        .insert(name.clone(), (s.span, false, false));
+                    if let Some(top) = scope.last_mut() {
+                        top.insert(name.clone(), (s.span, false, false));
+                    }
                     scope.push(std::collections::HashMap::new());
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope
-                        .pop()
-                        .expect("scope stack underflow: push/pop mismatch in lint walk");
-                    for (n, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", n)
-                            } else {
-                                format!("unused variable: `{}`", n)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 StmtKind::ForIn(name, col, body) => {
                     walk_expr(col, scope, warnings);
                     scope.push(std::collections::HashMap::new());
-                    scope
-                        .last_mut()
-                        .expect("lint walk: scope non-empty")
-                        .insert(name.clone(), (s.span, false, false));
+                    if let Some(top) = scope.last_mut() {
+                        top.insert(name.clone(), (s.span, false, false));
+                    }
                     for st in body {
                         walk_stmt(st, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow");
-                    for (n, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", n)
-                            } else {
-                                format!("unused variable: `{}`", n)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 StmtKind::ForInKV(k, v, col, body) => {
                     walk_expr(col, scope, warnings);
                     scope.push(std::collections::HashMap::new());
-                    scope
-                        .last_mut()
-                        .expect("lint walk: scope non-empty")
-                        .insert(k.clone(), (s.span, false, false));
-                    scope
-                        .last_mut()
-                        .expect("lint walk: scope non-empty")
-                        .insert(v.clone(), (s.span, false, false));
+                    if let Some(top) = scope.last_mut() {
+                        top.insert(k.clone(), (s.span, false, false));
+                        top.insert(v.clone(), (s.span, false, false));
+                    }
                     for st in body {
                         walk_stmt(st, scope, warnings);
                     }
-                    let top = scope.pop().expect("scope stack underflow");
-                    for (n, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", n)
-                            } else {
-                                format!("unused variable: `{}`", n)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 StmtKind::Fn(_name, _params, _ret, body) => {
                     scope.push(std::collections::HashMap::new());
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope
-                        .pop()
-                        .expect("scope stack underflow: push/pop mismatch in lint walk");
-                    for (name, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", name)
-                            } else {
-                                format!("unused variable: `{}`", name)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 StmtKind::Block(body) => {
                     scope.push(std::collections::HashMap::new());
                     for s in body {
                         walk_stmt(s, scope, warnings);
                     }
-                    let top = scope
-                        .pop()
-                        .expect("scope stack underflow: push/pop mismatch in lint walk");
-                    for (name, (sp, is_import, read)) in top {
-                        if !read {
-                            let msg = if is_import {
-                                format!("unused import: `{}`", name)
-                            } else {
-                                format!("unused variable: `{}`", name)
-                            };
-                            warnings.push((sp, msg));
-                        }
-                    }
+                    pop_scope_and_report(scope, warnings);
                 }
                 _ => {}
             }
@@ -4602,19 +4497,7 @@ fn main() {
         for s in stmts {
             walk_stmt(s, &mut scope, &mut warnings);
         }
-        let top = scope
-            .pop()
-            .expect("scope stack underflow: push/pop mismatch in lint walk");
-        for (name, (sp, is_import, read)) in top {
-            if !read {
-                let msg = if is_import {
-                    format!("unused import: `{}`", name)
-                } else {
-                    format!("unused variable: `{}`", name)
-                };
-                warnings.push((sp, msg));
-            }
-        }
+        pop_scope_and_report(&mut scope, &mut warnings);
         warnings
     }
 

@@ -352,6 +352,8 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("push", fn2(any.clone())),
         ("array_pop", fn1(any.clone())),
         ("strcharcodeat", fn2s_n(num.clone())),
+        ("strfromcharcode", fn1(str_ty.clone())),
+        ("str_from_char_code", fn1(str_ty.clone())),
         ("str_contains", fn2(bool_ty.clone())),
         ("map_keys", fn1(Ty::Array(Box::new(str_ty.clone())))),
         ("map_has", fn2(bool_ty.clone())),
