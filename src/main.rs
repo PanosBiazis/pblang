@@ -936,10 +936,8 @@ fn print_cfg(chunk: &Chunk, dot: bool) {
                     leaders[i + 1] = true;
                 }
             }
-            OpCode::OpReturn => {
-                if i + 1 < n {
-                    leaders[i + 1] = true;
-                }
+            OpCode::OpReturn if i + 1 < n => {
+                leaders[i + 1] = true;
             }
             _ => {}
         }
