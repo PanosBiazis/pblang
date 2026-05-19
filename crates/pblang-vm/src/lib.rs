@@ -1,6 +1,7 @@
 pub mod chunk;
 pub mod concurrency;
 pub mod memory_safety;
+pub mod signals;
 pub mod vm;
 
 pub use concurrency::{

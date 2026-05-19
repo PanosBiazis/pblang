@@ -59,6 +59,24 @@ This document is the current validation baseline for analysis claims against the
   - `src/main.rs` (`lint_unused_warnings`)
   - 16 `.expect()` calls on scope stack `pop()` / `last_mut()` replaced with `pop_scope_and_report` helper and `if let` guards.
   - Eliminates potential panics on internal invariant violations without losing lint accuracy.
+- `os_signal_trap()` is now a real OS signal trap (no longer a stub):
+  - `crates/pblang-vm/src/signals.rs` registers libc handlers on Unix (SIGINT/SIGTERM/SIGHUP/SIGUSR1/SIGUSR2) and `SetConsoleCtrlHandler` on Windows.
+  - Handlers only touch process-global atomic counters (async-signal-safe).
+  - New builtins: `os_signal_trap`, `os_signal_pending`, `os_signal_poll`, `os_signal_handler_get`.
+  - `stdlib/os.sapp` exposes `signal_trap`, `signal_pending`, `signal_poll`, `signal_dispatch` that poll counters and invoke the registered handler from regular bytecode context.
+- FFI gained a typed-signature call path:
+  - `ffi_call_typed(handle, symbol, sig, args)` accepts `i64`/`i32`/`f64`/`f32`/`bool`/`string`/`ptr`/`void` types in a `"a,b->c"` signature string.
+  - Up to four arguments, mixed types (e.g. `"string->i64"` for `strlen`, `"string,string->i64"` for `strcmp`, `"i64->s"` for things returning C strings).
+  - `stdlib/ffi.sapp` exposes `call_typed`, plus convenience helpers `call_str` and `call_int`.
+  - Still gated by the `ffi` capability and the existing symbol/library allowlist.
+- Native tensor builtins for fast numeric ops:
+  - 14 new builtins implemented in Rust (`tensor_add`, `tensor_sub`, `tensor_mul`, `tensor_scale`, `tensor_matmul`, `tensor_dot`, `tensor_relu`, `tensor_sigmoid`, `tensor_tanh`, `tensor_softmax`, `tensor_sum`, `tensor_mean`, `tensor_argmax`, `tensor_transpose2d`).
+  - `stdlib/tensor.sapp` now exposes `add`, `sub`, `mul`, `scale`, `relu`, `sigmoid`, `tanh_`, `softmax`, `sum_all`, `mean`, `argmax`, `transpose`, and routes `dot` through `tensor_dot`/`tensor_matmul` fast paths with the interpreter loops as fallback.
+- Quantum bridge enriched in `stdlib/crypto_quantum.sapp`:
+  - New gate set (`H`, `X`, `Y`, `Z`, `S`, `T`, `RX/RY/RZ`, `CX`, `CZ`, `SWAP`, `CCX`, `CCZ`, `CSWAP`).
+  - Circuit-builder API (`new_circuit`, `apply_gate`, `apply_rotation`, `measure`, `measure_all`, `circuit_to_json`).
+  - AI-bridge helper `circuit_features` produces feature maps suitable for ML-assisted transpilation/error-mitigation.
+- Strict-parse for batch compilation is in place — `pblang run`, `pblang compile`, and `pblang lint` already call `parse_strict` and report errors rather than silently recovering. The recovery parser remains used in LSP/IDE and `analyze` where partial AST is helpful.
 
 ## True but Not Fully Fixed (Large Refactor / Design Work)
 
@@ -67,8 +85,7 @@ This document is the current validation baseline for analysis claims against the
 - `src/main.rs` is still monolithic (~5,330 lines); modularization is substantial architectural work.
 - `crates/pblang-vm/src/vm.rs` is also monolithic (~9,454 lines); splitting into sub-modules (dispatch, builtins, stdlib, ffi) is recommended.
 - Some crates/features remain roadmap-partial by design (LLVM/Cranelift/WASM/AI/quantum depth and integration level).
-- `parse_with_polyglot` falls back to `parse_recovery()` when strict parsing fails, returning partial AST silently. This is intentional for REPL/IDE use but can mask malformed code in batch compilation.
-- `os_signal_trap()` builtin is registered but returns "not implemented" error at runtime.
+- `parse_with_polyglot` falls back to `parse_recovery()` when strict parsing fails — intentional for REPL/IDE/analyze paths only. Batch commands (`run`, `compile`, `lint`) call `parse_strict` and surface errors.
 - IDE server is single-threaded (uses `threadpool` for request handling but still one `TcpListener::incoming()` loop); full async migration to tokio is recommended.
 - Hand-rolled HTTP server in `pblang serve` — replacing with `axum` or `tiny_http` would reduce vulnerability surface.
 - CLI argument parsing is manual `if args.first() == Some(...)` chains; migration to `clap`/`argh` is recommended.

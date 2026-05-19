@@ -434,6 +434,218 @@ where
     Ok(f(&mut t))
 }
 
+/// Parse an FFI signature like `"i64,string -> i64"` into `(arg_types, ret_type)`.
+fn parse_ffi_sig(s: &str) -> Result<(Vec<String>, String), String> {
+    let parts: Vec<&str> = s.split("->").collect();
+    if parts.len() != 2 {
+        return Err(format!("signature must be of the form 'a,b->c', got '{s}'"));
+    }
+    let arg_part = parts[0].trim();
+    let ret_part = parts[1].trim();
+    let args: Vec<String> = if arg_part.is_empty() {
+        vec![]
+    } else {
+        arg_part.split(',').map(|s| s.trim().to_string()).collect()
+    };
+    if ret_part.is_empty() {
+        return Err("missing return type after '->'".into());
+    }
+    let ret = ret_part.to_string();
+    for a in &args {
+        if !matches!(
+            a.as_str(),
+            "i64" | "i32" | "f64" | "f32" | "bool" | "string" | "ptr"
+        ) {
+            return Err(format!("unknown arg type '{a}'"));
+        }
+    }
+    if !matches!(
+        ret.as_str(),
+        "i64" | "i32" | "f64" | "f32" | "bool" | "string" | "ptr" | "void"
+    ) {
+        return Err(format!("unknown ret type '{ret}'"));
+    }
+    Ok((args, ret))
+}
+
+/// Dispatch an FFI call given the parsed signature `key` like `"i,s->i"` and
+/// already-typed argument arrays. Returns the result as a pblang Value.
+///
+/// SAFETY: caller must guarantee that the dynamically loaded `sym` in `lib`
+/// matches the signature represented by `key`. Mismatch is undefined behavior
+/// in the underlying C library — this is no different from raw `libloading`.
+unsafe fn dispatch_ffi(
+    lib: &Library,
+    sym: &str,
+    key: &str,
+    a_i: &[i64; 4],
+    a_d: &[f64; 4],
+    a_s: &[*const libc::c_char; 4],
+) -> Result<Value, String> {
+    // We encode types as i=integer/bool/ptr, d=double, s=string, v=void.
+    // Supported shapes: explicit list keeps trampoline count bounded.
+    let bytes = sym.as_bytes();
+    let get_err = |e: libloading::Error| format!("{e}");
+    match key {
+        // 0-arg returns
+        "->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn() -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f() as f64))
+        }
+        "->d" => {
+            let f: libloading::Symbol<unsafe extern "C" fn() -> f64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f()))
+        }
+        "->s" => {
+            let f: libloading::Symbol<unsafe extern "C" fn() -> *const libc::c_char> =
+                lib.get(bytes).map_err(get_err)?;
+            let p = f();
+            Ok(c_str_to_value(p))
+        }
+        "->v" => {
+            let f: libloading::Symbol<unsafe extern "C" fn()> = lib.get(bytes).map_err(get_err)?;
+            f();
+            Ok(Value::Nil)
+        }
+        // 1-arg shapes
+        "i->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_i[0]) as f64))
+        }
+        "i->d" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64) -> f64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_i[0])))
+        }
+        "i->s" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64) -> *const libc::c_char> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(c_str_to_value(f(a_i[0])))
+        }
+        "i->v" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64)> =
+                lib.get(bytes).map_err(get_err)?;
+            f(a_i[0]);
+            Ok(Value::Nil)
+        }
+        "d->d" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_d[0])))
+        }
+        "d->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(f64) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_d[0]) as f64))
+        }
+        "s->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(*const libc::c_char) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_s[0]) as f64))
+        }
+        "s->s" => {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*const libc::c_char) -> *const libc::c_char,
+            > = lib.get(bytes).map_err(get_err)?;
+            Ok(c_str_to_value(f(a_s[0])))
+        }
+        "s->v" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(*const libc::c_char)> =
+                lib.get(bytes).map_err(get_err)?;
+            f(a_s[0]);
+            Ok(Value::Nil)
+        }
+        // 2-arg shapes
+        "i,i->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64, i64) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_i[0], a_i[1]) as f64))
+        }
+        "d,d->d" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_d[0], a_d[1])))
+        }
+        "s,s->i" => {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> i64,
+            > = lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_s[0], a_s[1]) as f64))
+        }
+        "s,s->s" => {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *const libc::c_char,
+                    *const libc::c_char,
+                ) -> *const libc::c_char,
+            > = lib.get(bytes).map_err(get_err)?;
+            Ok(c_str_to_value(f(a_s[0], a_s[1])))
+        }
+        "i,s->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64, *const libc::c_char) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_i[0], a_s[1]) as f64))
+        }
+        "s,i->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(*const libc::c_char, i64) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_s[0], a_i[1]) as f64))
+        }
+        // 3-arg uniform shapes
+        "i,i,i->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64, i64, i64) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_i[0], a_i[1], a_i[2]) as f64))
+        }
+        "d,d,d->d" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64) -> f64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_d[0], a_d[1], a_d[2])))
+        }
+        "s,s,s->i" => {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(
+                    *const libc::c_char,
+                    *const libc::c_char,
+                    *const libc::c_char,
+                ) -> i64,
+            > = lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(f(a_s[0], a_s[1], a_s[2]) as f64))
+        }
+        // 4-arg shapes
+        "i,i,i,i->i" => {
+            let f: libloading::Symbol<unsafe extern "C" fn(i64, i64, i64, i64) -> i64> =
+                lib.get(bytes).map_err(get_err)?;
+            Ok(Value::Number(
+                f(a_i[0], a_i[1], a_i[2], a_i[3]) as f64,
+            ))
+        }
+        other => Err(format!(
+            "ffi_call_typed: unsupported signature dispatch '{other}'. Supported shapes are listed in the docstring. \
+For unusual signatures, write a tiny C wrapper or use ffi_call (numeric)."
+        )),
+    }
+}
+
+/// Convert a possibly-null C string pointer into a pblang Value (Nil if null).
+fn c_str_to_value(p: *const libc::c_char) -> Value {
+    if p.is_null() {
+        Value::Nil
+    } else {
+        // SAFETY: caller (the FFI function) is responsible for returning a valid
+        // null-terminated UTF-8/ASCII C string. We copy it into a Rust String
+        // immediately so subsequent FFI calls cannot invalidate it.
+        let s = unsafe { std::ffi::CStr::from_ptr(p) };
+        match s.to_str() {
+            Ok(st) => alloc_string(st.to_string()),
+            Err(_) => alloc_string(String::from_utf8_lossy(s.to_bytes()).into_owned()),
+        }
+    }
+}
+
 fn with_db_table<F, R>(host: &mut dyn VmHost, f: F) -> Result<R, RuntimeError>
 where
     F: FnOnce(&mut HashMap<usize, DbResource>) -> R,
@@ -528,7 +740,10 @@ impl StdlibConfig {
             | "array_flatten" | "array_take" | "array_drop" | "range" | "enumerate" | "sum"
             | "min_of" | "max_of" | "product" | "clamp" | "is_number" | "is_string"
             | "is_array" | "is_map" | "is_bool" | "is_fn" | "is_nil" | "env_get" | "env_set"
-            | "str_replace_all" => self.core,
+            | "str_replace_all" | "tensor_add" | "tensor_sub" | "tensor_mul" | "tensor_scale"
+            | "tensor_matmul" | "tensor_dot" | "tensor_relu" | "tensor_sigmoid" | "tensor_tanh"
+            | "tensor_softmax" | "tensor_sum" | "tensor_mean" | "tensor_argmax"
+            | "tensor_transpose2d" => self.core,
             "fs_read" | "fs_write" | "fs_append" | "fs_remove" | "fs_rename" | "fs_copy"
             | "fs_read_bytes" | "fs_write_bytes" | "fs_exists" | "fs_mkdirs" | "fs_listdir"
             | "path_join" | "path_dirname" | "path_basename" | "cwd" => self.fs,
@@ -536,6 +751,10 @@ impl StdlibConfig {
             | "exec"
             | "proc_spawn_wait"
             | "os_which"
+            | "os_signal_trap"
+            | "os_signal_pending"
+            | "os_signal_poll"
+            | "os_signal_handler_get"
             | "quantum_run"
             | "quantum_statevector"
             | "quantum_backends"
@@ -549,7 +768,7 @@ impl StdlibConfig {
             | "tcp_wrap_tls" | "http_parse_request" | "http_response" | "http_response_ct"
             | "http_response_json" | "ai_token_count" => self.net,
             "onnx_infer" => self.exec,
-            "ffi_load" | "ffi_call" | "ffi_close" => self.ffi,
+            "ffi_load" | "ffi_call" | "ffi_close" | "ffi_call_typed" => self.ffi,
             "sqlite_open"
             | "sqlite_close"
             | "sqlite_exec"
@@ -615,6 +834,13 @@ pub struct VM {
     handle_registry: Arc<VmHandleRegistry>,
     /// Optional pre-seeded stdin lines (used by IDE / embeddings).
     stdin_lines: std::collections::VecDeque<String>,
+    /// Per-VM registry of OS signal handler closures, keyed by canonical name
+    /// (e.g. `"SIGINT"`). Populated by `os_signal_trap()` and consulted by
+    /// `os_signal_handler_get()`. Handlers are *not* invoked from the libc
+    /// signal handler — pblang programs explicitly drain pending counters via
+    /// `os_signal_poll()` / `os_signal_pending()` and call the handler from
+    /// regular bytecode context (see `stdlib/signal.sapp`).
+    signal_handlers: Rc<RefCell<HashMap<String, Value>>>,
 }
 
 #[derive(Default)]
@@ -3715,6 +3941,158 @@ except Exception as e:
             Ok(res)
         }
 
+        // ── FFI typed-signature call ──────────────────────────────────────────
+        //
+        // ffi_call_typed(handle, "symbol", "sig", [args...]) -> value
+        //
+        // The `sig` argument is a string of the form `"<arg-types>-><ret-type>"`,
+        // where each side is comma-separated. Supported types:
+        //   i64       — signed 64-bit integer (passed as `int64_t`)
+        //   i32       — signed 32-bit integer (passed as `int32_t`)
+        //   f64       — double (passed as `double`)
+        //   f32       — float (passed as `float`)
+        //   bool      — `int32_t` (1/0)
+        //   string    — `const char*` (UTF-8, null-terminated)
+        //   ptr       — opaque `*const c_void`, passed as the integer handle (i64)
+        //   void      — only valid for the return position (no value)
+        //
+        // For now we support the most common dispatch shapes used by C
+        // libraries: up to 4 arguments, with uniform-or-mixed types. We pick a
+        // statically-typed transmute per signature; longer / exotic signatures
+        // should still go through `ffi_call` (numeric) or an explicit binding
+        // crate.
+        fn ffi_call_typed_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if !host.allow_ffi() {
+                return Err(host.err("ffi access denied".into()));
+            }
+            if args.len() != 4 {
+                return Err(host.err(format!(
+                    "ffi_call_typed() expects 4 arguments (handle, symbol, sig, args_array), got {}",
+                    args.len()
+                )));
+            }
+            let sym = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("ffi_call_typed(): {m}")))?
+                .to_string();
+            if !host.ffi_allowed_symbol(&sym) {
+                return Err(host.err("ffi: symbol not in allowlist".into()));
+            }
+            let sig_str = args[2]
+                .as_str()
+                .map_err(|m| host.err(format!("ffi_call_typed(): {m}")))?
+                .to_string();
+            let id = value_to_handle(host, args[0].clone(), "ffi_call_typed")?;
+            let arr = match &args[3] {
+                Value::Array(a) => a.clone(),
+                _ => return Err(host.err("ffi_call_typed(): expected args array".into())),
+            };
+
+            // Parse signature.
+            let (arg_tys, ret_ty) =
+                parse_ffi_sig(&sig_str).map_err(|m| host.err(format!("ffi_call_typed(): {m}")))?;
+            let raw_args = arr.borrow().clone();
+            if raw_args.len() != arg_tys.len() {
+                return Err(host.err(format!(
+                    "ffi_call_typed(): signature expects {} args, got {}",
+                    arg_tys.len(),
+                    raw_args.len()
+                )));
+            }
+
+            // Convert pblang values into typed C arguments. Lifetimes for CStrings
+            // are held in `c_strings` for the duration of the call.
+            let mut c_strings: Vec<std::ffi::CString> = vec![];
+            let mut a_i64 = [0i64; 4];
+            let mut a_f64 = [0.0f64; 4];
+            let mut a_ptr = [std::ptr::null::<libc::c_char>(); 4];
+            let n = arg_tys.len();
+            if n > 4 {
+                return Err(host.err(
+                    "ffi_call_typed(): up to 4 arguments supported per call (use multiple smaller wrappers for more)".into(),
+                ));
+            }
+            for (i, ty) in arg_tys.iter().enumerate() {
+                let v = &raw_args[i];
+                match ty.as_str() {
+                    "i64" | "i32" | "bool" | "ptr" => {
+                        a_i64[i] = match v {
+                            Value::Number(n) => *n as i64,
+                            Value::Bool(b) => *b as i64,
+                            _ => {
+                                return Err(host.err(format!(
+                                    "ffi_call_typed(): arg[{i}] expected integer/bool/ptr"
+                                )))
+                            }
+                        };
+                    }
+                    "f64" | "f32" => {
+                        a_f64[i] = match v {
+                            Value::Number(n) => *n,
+                            _ => {
+                                return Err(
+                                    host.err(format!("ffi_call_typed(): arg[{i}] expected number"))
+                                )
+                            }
+                        };
+                    }
+                    "string" => {
+                        let s = v
+                            .as_str()
+                            .map_err(|m| host.err(format!("ffi_call_typed(): arg[{i}] {m}")))?;
+                        let c = std::ffi::CString::new(s).map_err(|_| {
+                            host.err(format!("ffi_call_typed(): arg[{i}] contained NUL byte"))
+                        })?;
+                        a_ptr[i] = c.as_ptr();
+                        c_strings.push(c);
+                    }
+                    _ => {
+                        return Err(
+                            host.err(format!("ffi_call_typed(): unsupported arg type '{ty}'"))
+                        )
+                    }
+                }
+            }
+
+            // Build a uniform signature string for dispatch: "i,s,i->i".
+            let abbrev = |t: &str| -> &'static str {
+                match t {
+                    "i64" | "i32" | "bool" | "ptr" => "i",
+                    "f64" | "f32" => "d",
+                    "string" => "s",
+                    "void" => "v",
+                    _ => "?",
+                }
+            };
+            let key: String = format!(
+                "{}->{}",
+                arg_tys
+                    .iter()
+                    .map(|t| abbrev(t))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                abbrev(&ret_ty)
+            );
+
+            let res = match with_ffi_table(host, |t| t.remove(&id))? {
+                Some(FfiResource::Library(lib)) => {
+                    let out_res = unsafe { dispatch_ffi(&lib, &sym, &key, &a_i64, &a_f64, &a_ptr) };
+                    let _ = with_ffi_table(host, |t| t.insert(id, FfiResource::Library(lib)));
+                    match out_res {
+                        Ok(v) => Ok(v),
+                        Err(e) => Err(host.err(format!("ffi_call_typed(): {e}"))),
+                    }
+                }
+                None => Err(host.err("ffi_call_typed(): invalid handle".into())),
+            }?;
+            // c_strings are dropped here, after the call returns.
+            drop(c_strings);
+            Ok(res)
+        }
+
         fn sqlite_open(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !host.allow_sqlite() {
                 return Err(host.err("sqlite access denied".into()));
@@ -6505,9 +6883,486 @@ except Exception as e:
 
         fn os_signal_trap_builtin(
             host: &mut dyn VmHost,
-            _args: Vec<Value>,
+            args: Vec<Value>,
         ) -> Result<Value, RuntimeError> {
-            Err(host.err("os_signal_trap() is not implemented on this runtime target yet".into()))
+            // os_signal_trap(name, handler_or_nil) -> map{ ok, signal, signum }
+            //
+            // Installs a real OS-level signal handler that increments a process-global
+            // pending counter. The handler closure (if provided) is stored in the
+            // per-VM signal registry and returned by os_signal_handler_get(name);
+            // pblang programs call os_signal_poll() from regular code to drain
+            // pending signals and dispatch handlers explicitly (async-signal-safety
+            // means we cannot call .sapp code directly from the libc handler).
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "os_signal_trap() expects 2 arguments (name, handler), got {}",
+                    args.len()
+                )));
+            }
+            let name = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("os_signal_trap(): {m}")))?
+                .to_string();
+            let handler = args[1].clone();
+            let signum = crate::signals::signal_number(&name).map_err(|e| host.err(e))?;
+            crate::signals::install(signum).map_err(|e| host.err(e))?;
+            // Stash handler in the VM-local registry, keyed by canonical signal name.
+            if let Some(vm) = host.as_any_mut().downcast_mut::<VM>() {
+                let key = name.trim().to_ascii_uppercase();
+                let key = if let Some(rest) = key.strip_prefix("SIG") {
+                    format!("SIG{rest}")
+                } else {
+                    format!("SIG{key}")
+                };
+                vm.signal_handlers.borrow_mut().insert(key, handler);
+            }
+            let mut m = HashMap::new();
+            m.insert("ok".into(), Value::Bool(true));
+            m.insert("signal".into(), alloc_string(name));
+            m.insert("signum".into(), Value::Number(signum as f64));
+            Ok(alloc_map(m))
+        }
+
+        fn os_signal_pending_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // os_signal_pending(name) -> number (drains pending count for name)
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "os_signal_pending() expects 1 argument (name), got {}",
+                    args.len()
+                )));
+            }
+            let name = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("os_signal_pending(): {m}")))?
+                .to_string();
+            let signum = crate::signals::signal_number(&name).map_err(|e| host.err(e))?;
+            let count = crate::signals::take_pending(signum);
+            Ok(Value::Number(count as f64))
+        }
+
+        fn os_signal_poll_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // os_signal_poll() -> map{ name -> pending_count } for every name with handler installed.
+            if !args.is_empty() {
+                return Err(host.err("os_signal_poll() takes no arguments".into()));
+            }
+            let names: Vec<String> = match host.as_any_mut().downcast_mut::<VM>() {
+                Some(vm) => vm.signal_handlers.borrow().keys().cloned().collect(),
+                None => vec![],
+            };
+            let mut out = HashMap::new();
+            for n in names {
+                if let Ok(num) = crate::signals::signal_number(&n) {
+                    let c = crate::signals::take_pending(num);
+                    if c > 0 {
+                        out.insert(n, Value::Number(c as f64));
+                    }
+                }
+            }
+            Ok(alloc_map(out))
+        }
+
+        // ── Native tensor builtins (fast paths for AI workloads) ─────────────
+        //
+        // Tensors are pblang maps of shape:
+        //     map{ "shape": [d0,d1,...], "data": [...flat row-major numbers], "dtype": "f32" }
+        // The native paths below operate directly on this shape and return a
+        // new tensor map. They mirror the helpers in stdlib/tensor.sapp but in
+        // Rust, so they are ~10-100x faster for sizable shapes.
+        fn tensor_get_shape_data(
+            host: &mut dyn VmHost,
+            v: &Value,
+            fname: &str,
+        ) -> Result<(Vec<usize>, Vec<f64>), RuntimeError> {
+            let m = match v {
+                Value::Map(m) => m.clone(),
+                _ => return Err(host.err(format!("{fname}(): expected tensor map, got {}", v))),
+            };
+            let m_ref = m.borrow();
+            let shape_v = m_ref
+                .get("shape")
+                .ok_or_else(|| host.err(format!("{fname}(): tensor missing 'shape'")))?
+                .clone();
+            let data_v = m_ref
+                .get("data")
+                .ok_or_else(|| host.err(format!("{fname}(): tensor missing 'data'")))?
+                .clone();
+            drop(m_ref);
+            let shape_arr = match shape_v {
+                Value::Array(a) => a,
+                _ => return Err(host.err(format!("{fname}(): 'shape' must be an array"))),
+            };
+            let data_arr = match data_v {
+                Value::Array(a) => a,
+                _ => return Err(host.err(format!("{fname}(): 'data' must be an array"))),
+            };
+            let shape: Vec<usize> = shape_arr
+                .borrow()
+                .iter()
+                .map(|v| match v {
+                    Value::Number(n) if *n >= 0.0 => Ok(*n as usize),
+                    _ => Err(host.err(format!(
+                        "{fname}(): shape entries must be non-negative numbers"
+                    ))),
+                })
+                .collect::<Result<_, _>>()?;
+            let data: Vec<f64> = data_arr
+                .borrow()
+                .iter()
+                .map(|v| match v {
+                    Value::Number(n) => Ok(*n),
+                    _ => Err(host.err(format!("{fname}(): data entries must be numbers"))),
+                })
+                .collect::<Result<_, _>>()?;
+            let expected: usize =
+                shape
+                    .iter()
+                    .product::<usize>()
+                    .max(if shape.is_empty() { 0 } else { 1 });
+            if data.len() != expected {
+                return Err(host.err(format!(
+                    "{fname}(): data length {} does not match shape size {}",
+                    data.len(),
+                    expected
+                )));
+            }
+            Ok((shape, data))
+        }
+
+        fn tensor_make(shape: Vec<usize>, data: Vec<f64>) -> Value {
+            let shape_v = alloc_array(shape.into_iter().map(|n| Value::Number(n as f64)).collect());
+            let data_v = alloc_array(data.into_iter().map(Value::Number).collect());
+            let mut m = HashMap::new();
+            m.insert("shape".into(), shape_v);
+            m.insert("data".into(), data_v);
+            m.insert("dtype".into(), alloc_string("f32"));
+            alloc_map(m)
+        }
+
+        fn tensor_add_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_add() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_add")?;
+            let (sb, db) = tensor_get_shape_data(host, &args[1], "tensor_add")?;
+            if sa != sb {
+                return Err(host.err(format!("tensor_add(): shape mismatch {:?} vs {:?}", sa, sb)));
+            }
+            let out: Vec<f64> = da.iter().zip(db.iter()).map(|(x, y)| x + y).collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_sub_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_sub() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_sub")?;
+            let (sb, db) = tensor_get_shape_data(host, &args[1], "tensor_sub")?;
+            if sa != sb {
+                return Err(host.err(format!("tensor_sub(): shape mismatch {:?} vs {:?}", sa, sb)));
+            }
+            let out: Vec<f64> = da.iter().zip(db.iter()).map(|(x, y)| x - y).collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_mul_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_mul() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_mul")?;
+            let (sb, db) = tensor_get_shape_data(host, &args[1], "tensor_mul")?;
+            if sa != sb {
+                return Err(host.err(format!("tensor_mul(): shape mismatch {:?} vs {:?}", sa, sb)));
+            }
+            let out: Vec<f64> = da.iter().zip(db.iter()).map(|(x, y)| x * y).collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_scale_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_scale() expects 2 arguments (tensor, scalar), got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_scale")?;
+            let k = match args[1] {
+                Value::Number(n) => n,
+                _ => return Err(host.err("tensor_scale(): scalar must be a number".into())),
+            };
+            let out: Vec<f64> = da.iter().map(|x| x * k).collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_matmul_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_matmul() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_matmul")?;
+            let (sb, db) = tensor_get_shape_data(host, &args[1], "tensor_matmul")?;
+            if sa.len() != 2 || sb.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_matmul(): both arguments must be 2D tensors, got {}D and {}D",
+                    sa.len(),
+                    sb.len()
+                )));
+            }
+            let (m, k1) = (sa[0], sa[1]);
+            let (k2, n) = (sb[0], sb[1]);
+            if k1 != k2 {
+                return Err(host.err(format!(
+                    "tensor_matmul(): inner dim mismatch ({m}x{k1}) * ({k2}x{n})"
+                )));
+            }
+            let k = k1;
+            let mut out = vec![0.0_f64; m * n];
+            // Naive ijk; OK for moderate sizes and avoids extra deps.
+            for i in 0..m {
+                for p in 0..k {
+                    let a_ip = da[i * k + p];
+                    let row_off = i * n;
+                    let b_row = p * n;
+                    for j in 0..n {
+                        out[row_off + j] += a_ip * db[b_row + j];
+                    }
+                }
+            }
+            Ok(tensor_make(vec![m, n], out))
+        }
+
+        fn tensor_dot_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_dot() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_dot")?;
+            let (sb, db) = tensor_get_shape_data(host, &args[1], "tensor_dot")?;
+            if sa.len() != 1 || sb.len() != 1 || sa[0] != sb[0] {
+                return Err(host.err(format!(
+                    "tensor_dot(): both arguments must be 1D vectors of equal length (got {:?} and {:?})",
+                    sa, sb
+                )));
+            }
+            let sum: f64 = da.iter().zip(db.iter()).map(|(x, y)| x * y).sum();
+            Ok(Value::Number(sum))
+        }
+
+        fn tensor_relu_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_relu() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_relu")?;
+            let out: Vec<f64> = da.iter().map(|x| if *x > 0.0 { *x } else { 0.0 }).collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_sigmoid_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_sigmoid() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_sigmoid")?;
+            let out: Vec<f64> = da.iter().map(|x| 1.0 / (1.0 + (-x).exp())).collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_tanh_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_tanh() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_tanh")?;
+            let out: Vec<f64> = da.iter().map(|x| x.tanh()).collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_softmax_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_softmax() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_softmax")?;
+            if sa.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_softmax(): only 1D vectors supported, got {}D",
+                    sa.len()
+                )));
+            }
+            let max = da.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = da.iter().map(|x| (x - max).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            let out: Vec<f64> = exps
+                .into_iter()
+                .map(|x| if sum > 0.0 { x / sum } else { 0.0 })
+                .collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_sum_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_sum() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (_sa, da) = tensor_get_shape_data(host, &args[0], "tensor_sum")?;
+            Ok(Value::Number(da.iter().sum::<f64>()))
+        }
+
+        fn tensor_mean_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_mean() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (_sa, da) = tensor_get_shape_data(host, &args[0], "tensor_mean")?;
+            if da.is_empty() {
+                return Ok(Value::Number(0.0));
+            }
+            let sum: f64 = da.iter().sum();
+            Ok(Value::Number(sum / da.len() as f64))
+        }
+
+        fn tensor_argmax_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_argmax() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (_sa, da) = tensor_get_shape_data(host, &args[0], "tensor_argmax")?;
+            let (mut idx, mut best) = (0usize, f64::NEG_INFINITY);
+            for (i, v) in da.iter().enumerate() {
+                if *v > best {
+                    best = *v;
+                    idx = i;
+                }
+            }
+            Ok(Value::Number(idx as f64))
+        }
+
+        fn tensor_transpose2d_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_transpose2d() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_transpose2d")?;
+            if sa.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_transpose2d(): only 2D tensors supported, got {}D",
+                    sa.len()
+                )));
+            }
+            let (m, n) = (sa[0], sa[1]);
+            let mut out = vec![0.0_f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    out[j * m + i] = da[i * n + j];
+                }
+            }
+            Ok(tensor_make(vec![n, m], out))
+        }
+
+        fn os_signal_handler_get_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // os_signal_handler_get(name) -> fn | nil
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "os_signal_handler_get() expects 1 argument (name), got {}",
+                    args.len()
+                )));
+            }
+            let name = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("os_signal_handler_get(): {m}")))?
+                .to_string();
+            let key = name.trim().to_ascii_uppercase();
+            let key = if let Some(rest) = key.strip_prefix("SIG") {
+                format!("SIG{rest}")
+            } else {
+                format!("SIG{key}")
+            };
+            if let Some(vm) = host.as_any_mut().downcast_mut::<VM>() {
+                if let Some(v) = vm.signal_handlers.borrow().get(&key) {
+                    return Ok(v.clone());
+                }
+            }
+            Ok(Value::Nil)
         }
 
         /// os_which(cmd) — safely find an executable in PATH.
@@ -7335,6 +8190,11 @@ except Exception as e:
                 fun: ffi_close,
             },
             BuiltinFn {
+                name: "ffi_call_typed",
+                arity: Some(4),
+                fun: ffi_call_typed_builtin,
+            },
+            BuiltinFn {
                 name: "sqlite_open",
                 arity: Some(1),
                 fun: sqlite_open,
@@ -7841,6 +8701,91 @@ except Exception as e:
                 fun: os_signal_trap_builtin,
             },
             BuiltinFn {
+                name: "os_signal_pending",
+                arity: Some(1),
+                fun: os_signal_pending_builtin,
+            },
+            BuiltinFn {
+                name: "os_signal_poll",
+                arity: Some(0),
+                fun: os_signal_poll_builtin,
+            },
+            BuiltinFn {
+                name: "os_signal_handler_get",
+                arity: Some(1),
+                fun: os_signal_handler_get_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_add",
+                arity: Some(2),
+                fun: tensor_add_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_sub",
+                arity: Some(2),
+                fun: tensor_sub_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_mul",
+                arity: Some(2),
+                fun: tensor_mul_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_scale",
+                arity: Some(2),
+                fun: tensor_scale_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_matmul",
+                arity: Some(2),
+                fun: tensor_matmul_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_dot",
+                arity: Some(2),
+                fun: tensor_dot_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_relu",
+                arity: Some(1),
+                fun: tensor_relu_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_sigmoid",
+                arity: Some(1),
+                fun: tensor_sigmoid_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_tanh",
+                arity: Some(1),
+                fun: tensor_tanh_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_softmax",
+                arity: Some(1),
+                fun: tensor_softmax_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_sum",
+                arity: Some(1),
+                fun: tensor_sum_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_mean",
+                arity: Some(1),
+                fun: tensor_mean_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_argmax",
+                arity: Some(1),
+                fun: tensor_argmax_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_transpose2d",
+                arity: Some(1),
+                fun: tensor_transpose2d_builtin,
+            },
+            BuiltinFn {
                 name: "os_which",
                 arity: Some(1),
                 fun: os_which_builtin,
@@ -8047,6 +8992,7 @@ except Exception as e:
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
             stdin_lines: std::collections::VecDeque::new(),
+            signal_handlers: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -8097,6 +9043,7 @@ impl VM {
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
             stdin_lines: std::collections::VecDeque::new(),
+            signal_handlers: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -8128,6 +9075,7 @@ impl VM {
             limits: None,
             ffi_policy: None,
             stdin_lines: std::collections::VecDeque::new(),
+            signal_handlers: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
