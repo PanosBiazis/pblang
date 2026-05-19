@@ -101,10 +101,7 @@ fn tensor_softmax_sums_to_one() {
     );
     assert_eq!(out.len(), 1);
     if let Value::Number(n) = &out[0] {
-        assert!(
-            (n - 1.0).abs() < 1e-9,
-            "softmax should sum to 1, got {n}"
-        );
+        assert!((n - 1.0).abs() < 1e-9, "softmax should sum to 1, got {n}");
     } else {
         panic!("expected number, got {:?}", out[0]);
     }

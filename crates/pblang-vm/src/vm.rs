@@ -729,21 +729,96 @@ impl StdlibConfig {
     /// are invisible (not just call-time-denied).
     pub fn allows(&self, name: &str) -> bool {
         match name {
-            "clock" | "now_ms" | "now_iso" | "type" | "str" | "num_sqrt" | "num_pow" | "num_ln"
-            | "num_exp" | "num_atan2" | "num_mod" | "num_floor" | "num_ceil" | "parse_number"
-            | "parse_bool" | "read_line" | "len" | "array_push" | "array_pop" | "map_keys"
-            | "map_has" | "map_remove" | "import" | "gc_stats" | "gc_collect" | "str_contains"
-            | "str_starts_with" | "str_trim" | "str_split" | "regex_match" | "regex_find"
-            | "regex_find_all" | "regex_replace" | "regex_replace_all" | "regex_split"
-            | "regex_capture" | "str_format" | "str_repeat" | "str_pad_left" | "str_pad_right"
-            | "str_upper" | "str_lower" | "array_unique" | "array_zip" | "array_chunk"
-            | "array_flatten" | "array_take" | "array_drop" | "range" | "enumerate" | "sum"
-            | "min_of" | "max_of" | "product" | "clamp" | "is_number" | "is_string"
-            | "is_array" | "is_map" | "is_bool" | "is_fn" | "is_nil" | "env_get" | "env_set"
-            | "str_replace_all" | "tensor_add" | "tensor_sub" | "tensor_mul" | "tensor_scale"
-            | "tensor_matmul" | "tensor_dot" | "tensor_relu" | "tensor_sigmoid" | "tensor_tanh"
-            | "tensor_softmax" | "tensor_sum" | "tensor_mean" | "tensor_argmax"
-            | "tensor_transpose2d" => self.core,
+            "clock"
+            | "now_ms"
+            | "now_iso"
+            | "type"
+            | "str"
+            | "num_sqrt"
+            | "num_pow"
+            | "num_ln"
+            | "num_exp"
+            | "num_atan2"
+            | "num_mod"
+            | "num_floor"
+            | "num_ceil"
+            | "parse_number"
+            | "parse_bool"
+            | "read_line"
+            | "len"
+            | "array_push"
+            | "array_pop"
+            | "map_keys"
+            | "map_has"
+            | "map_remove"
+            | "import"
+            | "gc_stats"
+            | "gc_collect"
+            | "str_contains"
+            | "str_starts_with"
+            | "str_trim"
+            | "str_split"
+            | "regex_match"
+            | "regex_find"
+            | "regex_find_all"
+            | "regex_replace"
+            | "regex_replace_all"
+            | "regex_split"
+            | "regex_capture"
+            | "str_format"
+            | "str_repeat"
+            | "str_pad_left"
+            | "str_pad_right"
+            | "str_upper"
+            | "str_lower"
+            | "array_unique"
+            | "array_zip"
+            | "array_chunk"
+            | "array_flatten"
+            | "array_take"
+            | "array_drop"
+            | "range"
+            | "enumerate"
+            | "sum"
+            | "min_of"
+            | "max_of"
+            | "product"
+            | "clamp"
+            | "is_number"
+            | "is_string"
+            | "is_array"
+            | "is_map"
+            | "is_bool"
+            | "is_fn"
+            | "is_nil"
+            | "env_get"
+            | "env_set"
+            | "str_replace_all"
+            | "tensor_add"
+            | "tensor_sub"
+            | "tensor_mul"
+            | "tensor_scale"
+            | "tensor_matmul"
+            | "tensor_dot"
+            | "tensor_relu"
+            | "tensor_sigmoid"
+            | "tensor_tanh"
+            | "tensor_softmax"
+            | "tensor_sum"
+            | "tensor_mean"
+            | "tensor_argmax"
+            | "tensor_transpose2d"
+            | "tensor_gelu"
+            | "tensor_leaky_relu"
+            | "tensor_log_softmax"
+            | "tensor_layer_norm"
+            | "tensor_batch_norm"
+            | "tensor_embedding_lookup"
+            | "tensor_cross_entropy"
+            | "tensor_conv2d"
+            | "tensor_maxpool2d"
+            | "tensor_avgpool2d"
+            | "quantum_simulate" => self.core,
             "fs_read" | "fs_write" | "fs_append" | "fs_remove" | "fs_rename" | "fs_copy"
             | "fs_read_bytes" | "fs_write_bytes" | "fs_exists" | "fs_mkdirs" | "fs_listdir"
             | "path_join" | "path_dirname" | "path_basename" | "cwd" => self.fs,
@@ -760,7 +835,8 @@ impl StdlibConfig {
             | "quantum_backends"
             | "polyglot_exec" => self.exec,
             "sha256" | "random_bytes" | "random_float" | "constant_time_eq" | "base64_encode"
-            | "base64_decode" | "hmac_sha256" => self.crypto,
+            | "base64_decode" | "hmac_sha256" | "hex_encode" | "hex_decode" | "url_encode"
+            | "url_decode" => self.crypto,
             "json_parse" | "json_stringify" => self.json,
             "http_get" | "http_post" | "ai_chat" | "ai_embed" => self.http,
             "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_until" | "tcp_write"
@@ -7336,6 +7412,1108 @@ except Exception as e:
             Ok(tensor_make(vec![n, m], out))
         }
 
+        // ── Native neural-network builtins ────────────────────────────────────
+        //
+        // These mirror the most common neural-net primitives so pblang code
+        // can build CNN / transformer training loops at near-native speed.
+        //
+        // Shape conventions:
+        //   * 2D conv inputs:  [N, C, H, W]  (batch, channels, height, width)
+        //   * 2D conv kernels: [Co, Ci, KH, KW]
+        //   * Pooling inputs:  [N, C, H, W]
+        //   * Layer/batch norm: last dim is the normalization axis for layer_norm,
+        //     first non-batch dim for batch_norm.
+        //   * Embedding table: [V, D]; indices: [N] (long-style integers).
+
+        fn tensor_gelu_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_gelu() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_gelu")?;
+            // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+            let c = (2.0_f64 / std::f64::consts::PI).sqrt();
+            let out: Vec<f64> = da
+                .iter()
+                .map(|&x| 0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh()))
+                .collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_leaky_relu_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.is_empty() || args.len() > 2 {
+                return Err(host.err(format!(
+                    "tensor_leaky_relu() expects 1 or 2 arguments (tensor, slope?), got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_leaky_relu")?;
+            let slope = if args.len() == 2 {
+                match &args[1] {
+                    Value::Number(n) => *n,
+                    _ => return Err(host.err("tensor_leaky_relu(): slope must be a number".into())),
+                }
+            } else {
+                0.01
+            };
+            let out: Vec<f64> = da
+                .iter()
+                .map(|&x| if x > 0.0 { x } else { slope * x })
+                .collect();
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_log_softmax_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "tensor_log_softmax() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_log_softmax")?;
+            // log-softmax over the last dim
+            let last_dim = *sa.last().unwrap_or(&0);
+            if last_dim == 0 {
+                return Err(host.err("tensor_log_softmax(): empty last dimension".into()));
+            }
+            let outer: usize = sa.iter().product::<usize>() / last_dim;
+            let mut out = vec![0.0_f64; da.len()];
+            for o in 0..outer {
+                let off = o * last_dim;
+                let m = da[off..off + last_dim]
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let mut sum = 0.0_f64;
+                for i in 0..last_dim {
+                    sum += (da[off + i] - m).exp();
+                }
+                let log_sum = m + sum.ln();
+                for i in 0..last_dim {
+                    out[off + i] = da[off + i] - log_sum;
+                }
+            }
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_layer_norm_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // tensor_layer_norm(x, eps?) — normalize over the last dim.
+            if args.is_empty() || args.len() > 2 {
+                return Err(host.err(format!(
+                    "tensor_layer_norm() expects 1 or 2 arguments (tensor, eps?), got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_layer_norm")?;
+            let eps = if args.len() == 2 {
+                match &args[1] {
+                    Value::Number(n) => *n,
+                    _ => return Err(host.err("tensor_layer_norm(): eps must be a number".into())),
+                }
+            } else {
+                1e-5
+            };
+            let last = *sa.last().unwrap_or(&0);
+            if last == 0 {
+                return Err(host.err("tensor_layer_norm(): empty last dim".into()));
+            }
+            let outer: usize = sa.iter().product::<usize>() / last;
+            let mut out = vec![0.0_f64; da.len()];
+            for o in 0..outer {
+                let off = o * last;
+                let mean = da[off..off + last].iter().sum::<f64>() / last as f64;
+                let var = da[off..off + last]
+                    .iter()
+                    .map(|v| (v - mean) * (v - mean))
+                    .sum::<f64>()
+                    / last as f64;
+                let inv = 1.0 / (var + eps).sqrt();
+                for i in 0..last {
+                    out[off + i] = (da[off + i] - mean) * inv;
+                }
+            }
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_batch_norm_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // tensor_batch_norm(x, eps?) — normalize over batch dim, per-channel.
+            // x shape: [N, C, ...] — the first dim is N, second is C; everything
+            // after is flattened.
+            if args.is_empty() || args.len() > 2 {
+                return Err(host.err(format!(
+                    "tensor_batch_norm() expects 1 or 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_batch_norm")?;
+            if sa.len() < 2 {
+                return Err(host.err(
+                    "tensor_batch_norm(): tensor must have at least 2 dims [N, C, ...]".into(),
+                ));
+            }
+            let eps = if args.len() == 2 {
+                match &args[1] {
+                    Value::Number(n) => *n,
+                    _ => return Err(host.err("tensor_batch_norm(): eps must be a number".into())),
+                }
+            } else {
+                1e-5
+            };
+            let n = sa[0];
+            let c = sa[1];
+            let spatial: usize = sa[2..].iter().product::<usize>().max(1);
+            // For each channel c, gather all N*spatial values and normalize.
+            let mut out = vec![0.0_f64; da.len()];
+            for ch in 0..c {
+                let total = n * spatial;
+                let mut mean = 0.0_f64;
+                for batch in 0..n {
+                    let base = batch * c * spatial + ch * spatial;
+                    for k in 0..spatial {
+                        mean += da[base + k];
+                    }
+                }
+                mean /= total as f64;
+                let mut var = 0.0_f64;
+                for batch in 0..n {
+                    let base = batch * c * spatial + ch * spatial;
+                    for k in 0..spatial {
+                        let d = da[base + k] - mean;
+                        var += d * d;
+                    }
+                }
+                var /= total as f64;
+                let inv = 1.0 / (var + eps).sqrt();
+                for batch in 0..n {
+                    let base = batch * c * spatial + ch * spatial;
+                    for k in 0..spatial {
+                        out[base + k] = (da[base + k] - mean) * inv;
+                    }
+                }
+            }
+            Ok(tensor_make(sa, out))
+        }
+
+        fn tensor_embedding_lookup_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // tensor_embedding_lookup(table, indices) -> tensor
+            // table shape: [V, D]; indices shape: [N] -> output shape [N, D]
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_embedding_lookup() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (st, dt) = tensor_get_shape_data(host, &args[0], "tensor_embedding_lookup")?;
+            if st.len() != 2 {
+                return Err(host.err("tensor_embedding_lookup(): table must be 2D [V, D]".into()));
+            }
+            let v = st[0];
+            let d = st[1];
+            // Indices: accept either a flat array or a tensor map with shape/data.
+            let idx_vals: Vec<i64> = match &args[1] {
+                Value::Array(a) => {
+                    a.borrow()
+                        .iter()
+                        .map(|x| match x {
+                            Value::Number(n) => Ok(*n as i64),
+                            _ => Err(host
+                                .err("tensor_embedding_lookup(): indices must be numbers".into())),
+                        })
+                        .collect::<Result<_, _>>()?
+                }
+                Value::Map(_) => {
+                    let (_si, di) =
+                        tensor_get_shape_data(host, &args[1], "tensor_embedding_lookup")?;
+                    di.iter().map(|n| *n as i64).collect()
+                }
+                _ => {
+                    return Err(host.err(
+                        "tensor_embedding_lookup(): indices must be an array or tensor".into(),
+                    ))
+                }
+            };
+            let n = idx_vals.len();
+            let mut out = vec![0.0_f64; n * d];
+            for (i, &ix) in idx_vals.iter().enumerate() {
+                if ix < 0 || (ix as usize) >= v {
+                    return Err(host.err(format!(
+                        "tensor_embedding_lookup(): index {} out of range [0, {})",
+                        ix, v
+                    )));
+                }
+                let src = (ix as usize) * d;
+                let dst = i * d;
+                out[dst..dst + d].copy_from_slice(&dt[src..src + d]);
+            }
+            Ok(tensor_make(vec![n, d], out))
+        }
+
+        fn tensor_cross_entropy_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // tensor_cross_entropy(logits, targets) -> scalar (mean loss).
+            // logits shape: [N, C]; targets: [N] integer labels (or one-hot [N, C]).
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "tensor_cross_entropy() expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sl, dl) = tensor_get_shape_data(host, &args[0], "tensor_cross_entropy")?;
+            if sl.len() != 2 {
+                return Err(host.err("tensor_cross_entropy(): logits must be 2D [N, C]".into()));
+            }
+            let n = sl[0];
+            let c = sl[1];
+
+            // Read targets — either int labels (Array of Numbers) or one-hot tensor.
+            let target_labels: Vec<usize> = match &args[1] {
+                Value::Array(a) => a
+                    .borrow()
+                    .iter()
+                    .map(|x| match x {
+                        Value::Number(num) => Ok(*num as usize),
+                        _ => Err(host
+                            .err("tensor_cross_entropy(): label entries must be numbers".into())),
+                    })
+                    .collect::<Result<_, _>>()?,
+                Value::Map(_) => {
+                    let (st, dt) = tensor_get_shape_data(host, &args[1], "tensor_cross_entropy")?;
+                    if st == vec![n] {
+                        dt.iter().map(|n| *n as usize).collect()
+                    } else if st == vec![n, c] {
+                        // one-hot: take argmax along last dim
+                        let mut labels = Vec::with_capacity(n);
+                        for row in 0..n {
+                            let off = row * c;
+                            let (mut best, mut idx) = (f64::NEG_INFINITY, 0);
+                            for j in 0..c {
+                                if dt[off + j] > best {
+                                    best = dt[off + j];
+                                    idx = j;
+                                }
+                            }
+                            labels.push(idx);
+                        }
+                        labels
+                    } else {
+                        return Err(host.err(format!(
+                            "tensor_cross_entropy(): targets shape {:?} doesn't match logits [N={},C={}]",
+                            st, n, c
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(
+                        host.err("tensor_cross_entropy(): targets must be array or tensor".into())
+                    )
+                }
+            };
+            if target_labels.len() != n {
+                return Err(host.err(format!(
+                    "tensor_cross_entropy(): targets length {} != N {}",
+                    target_labels.len(),
+                    n
+                )));
+            }
+            // Compute mean(-log_softmax(logits)[label])
+            let mut loss = 0.0_f64;
+            for (row, &label) in target_labels.iter().enumerate() {
+                let off = row * c;
+                let m = dl[off..off + c]
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let mut sum_exp = 0.0_f64;
+                for j in 0..c {
+                    sum_exp += (dl[off + j] - m).exp();
+                }
+                let log_z = m + sum_exp.ln();
+                if label >= c {
+                    return Err(host.err(format!(
+                        "tensor_cross_entropy(): label {} out of range [0,{})",
+                        label, c
+                    )));
+                }
+                loss += log_z - dl[off + label];
+            }
+            Ok(Value::Number(loss / n as f64))
+        }
+
+        fn tensor_conv2d_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // tensor_conv2d(x, kernel, stride?, padding?) -> tensor
+            // x: [N, Ci, H, W]; kernel: [Co, Ci, KH, KW]
+            // stride and padding default to 1 and 0; both are scalar (square).
+            if args.len() < 2 || args.len() > 4 {
+                return Err(host.err(format!(
+                    "tensor_conv2d() expects 2-4 arguments (x, kernel, stride?, padding?), got {}",
+                    args.len()
+                )));
+            }
+            let (sx, dx) = tensor_get_shape_data(host, &args[0], "tensor_conv2d")?;
+            let (sk, dk) = tensor_get_shape_data(host, &args[1], "tensor_conv2d")?;
+            if sx.len() != 4 || sk.len() != 4 {
+                return Err(host.err(
+                    "tensor_conv2d(): expected [N,Ci,H,W] input and [Co,Ci,KH,KW] kernel".into(),
+                ));
+            }
+            let stride = if args.len() >= 3 {
+                match &args[2] {
+                    Value::Number(n) => (*n as usize).max(1),
+                    _ => {
+                        return Err(
+                            host.err("tensor_conv2d(): stride must be a positive integer".into())
+                        )
+                    }
+                }
+            } else {
+                1
+            };
+            let padding = if args.len() >= 4 {
+                match &args[3] {
+                    Value::Number(n) => *n as usize,
+                    _ => {
+                        return Err(host
+                            .err("tensor_conv2d(): padding must be a non-negative integer".into()))
+                    }
+                }
+            } else {
+                0
+            };
+            let (n, ci, h, w) = (sx[0], sx[1], sx[2], sx[3]);
+            let (co, ci2, kh, kw) = (sk[0], sk[1], sk[2], sk[3]);
+            if ci != ci2 {
+                return Err(host.err(format!(
+                    "tensor_conv2d(): channel mismatch (Ci={} vs kernel Ci={})",
+                    ci, ci2
+                )));
+            }
+            // Output dims:
+            let h_padded = h + 2 * padding;
+            let w_padded = w + 2 * padding;
+            if h_padded < kh || w_padded < kw {
+                return Err(host.err("tensor_conv2d(): kernel larger than padded input".into()));
+            }
+            let oh = (h_padded - kh) / stride + 1;
+            let ow = (w_padded - kw) / stride + 1;
+            let mut out = vec![0.0_f64; n * co * oh * ow];
+            // Naive direct conv. Adequate for small/medium tensors; users wanting
+            // im2col can call tensor_matmul on a reshaped buffer.
+            for batch in 0..n {
+                for oc in 0..co {
+                    for oy in 0..oh {
+                        for ox in 0..ow {
+                            let mut acc = 0.0_f64;
+                            for ic in 0..ci {
+                                for ky in 0..kh {
+                                    for kx in 0..kw {
+                                        let iy = oy * stride + ky;
+                                        let ix = ox * stride + kx;
+                                        if iy < padding || ix < padding {
+                                            continue;
+                                        }
+                                        let iy_in = iy - padding;
+                                        let ix_in = ix - padding;
+                                        if iy_in >= h || ix_in >= w {
+                                            continue;
+                                        }
+                                        let x_idx =
+                                            batch * ci * h * w + ic * h * w + iy_in * w + ix_in;
+                                        let k_idx = oc * ci * kh * kw + ic * kh * kw + ky * kw + kx;
+                                        acc += dx[x_idx] * dk[k_idx];
+                                    }
+                                }
+                            }
+                            let o_idx = batch * co * oh * ow + oc * oh * ow + oy * ow + ox;
+                            out[o_idx] = acc;
+                        }
+                    }
+                }
+            }
+            Ok(tensor_make(vec![n, co, oh, ow], out))
+        }
+
+        fn tensor_maxpool2d_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            // tensor_maxpool2d(x, kernel_size, stride?) -> tensor
+            if args.len() < 2 || args.len() > 3 {
+                return Err(host.err(format!(
+                    "tensor_maxpool2d() expects 2 or 3 arguments (x, k, stride?), got {}",
+                    args.len()
+                )));
+            }
+            let (sx, dx) = tensor_get_shape_data(host, &args[0], "tensor_maxpool2d")?;
+            if sx.len() != 4 {
+                return Err(host.err("tensor_maxpool2d(): expected [N,C,H,W] tensor".into()));
+            }
+            let k = match &args[1] {
+                Value::Number(n) if *n as usize > 0 => *n as usize,
+                _ => {
+                    return Err(
+                        host.err("tensor_maxpool2d(): kernel size must be positive integer".into())
+                    )
+                }
+            };
+            let stride = if args.len() >= 3 {
+                match &args[2] {
+                    Value::Number(n) => (*n as usize).max(1),
+                    _ => {
+                        return Err(
+                            host.err("tensor_maxpool2d(): stride must be positive integer".into())
+                        )
+                    }
+                }
+            } else {
+                k
+            };
+            let (n, c, h, w) = (sx[0], sx[1], sx[2], sx[3]);
+            if h < k || w < k {
+                return Err(host.err("tensor_maxpool2d(): kernel larger than input".into()));
+            }
+            let oh = (h - k) / stride + 1;
+            let ow = (w - k) / stride + 1;
+            let mut out = vec![0.0_f64; n * c * oh * ow];
+            for batch in 0..n {
+                for ch in 0..c {
+                    for oy in 0..oh {
+                        for ox in 0..ow {
+                            let mut best = f64::NEG_INFINITY;
+                            for ky in 0..k {
+                                for kx in 0..k {
+                                    let iy = oy * stride + ky;
+                                    let ix = ox * stride + kx;
+                                    let idx = batch * c * h * w + ch * h * w + iy * w + ix;
+                                    if dx[idx] > best {
+                                        best = dx[idx];
+                                    }
+                                }
+                            }
+                            let o_idx = batch * c * oh * ow + ch * oh * ow + oy * ow + ox;
+                            out[o_idx] = best;
+                        }
+                    }
+                }
+            }
+            Ok(tensor_make(vec![n, c, oh, ow], out))
+        }
+
+        fn tensor_avgpool2d_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(host.err(format!(
+                    "tensor_avgpool2d() expects 2 or 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (sx, dx) = tensor_get_shape_data(host, &args[0], "tensor_avgpool2d")?;
+            if sx.len() != 4 {
+                return Err(host.err("tensor_avgpool2d(): expected [N,C,H,W] tensor".into()));
+            }
+            let k = match &args[1] {
+                Value::Number(n) if *n as usize > 0 => *n as usize,
+                _ => {
+                    return Err(
+                        host.err("tensor_avgpool2d(): kernel size must be positive integer".into())
+                    )
+                }
+            };
+            let stride = if args.len() >= 3 {
+                match &args[2] {
+                    Value::Number(n) => (*n as usize).max(1),
+                    _ => {
+                        return Err(
+                            host.err("tensor_avgpool2d(): stride must be positive integer".into())
+                        )
+                    }
+                }
+            } else {
+                k
+            };
+            let (n, c, h, w) = (sx[0], sx[1], sx[2], sx[3]);
+            if h < k || w < k {
+                return Err(host.err("tensor_avgpool2d(): kernel larger than input".into()));
+            }
+            let oh = (h - k) / stride + 1;
+            let ow = (w - k) / stride + 1;
+            let mut out = vec![0.0_f64; n * c * oh * ow];
+            let denom = (k * k) as f64;
+            for batch in 0..n {
+                for ch in 0..c {
+                    for oy in 0..oh {
+                        for ox in 0..ow {
+                            let mut acc = 0.0_f64;
+                            for ky in 0..k {
+                                for kx in 0..k {
+                                    let iy = oy * stride + ky;
+                                    let ix = ox * stride + kx;
+                                    let idx = batch * c * h * w + ch * h * w + iy * w + ix;
+                                    acc += dx[idx];
+                                }
+                            }
+                            let o_idx = batch * c * oh * ow + ch * oh * ow + oy * ow + ox;
+                            out[o_idx] = acc / denom;
+                        }
+                    }
+                }
+            }
+            Ok(tensor_make(vec![n, c, oh, ow], out))
+        }
+
+        // ── Native quantum statevector simulator ─────────────────────────────
+        // `quantum_simulate(circuit)` runs a circuit produced by
+        // `stdlib/crypto_quantum.sapp::new_circuit()/apply_gate()/...` against
+        // an actual complex statevector and returns the probability vector
+        // (real, summing to 1).
+        //
+        // Supported gates (case-insensitive): I, H, X, Y, Z, S, T, RX, RY, RZ,
+        // CX (CNOT), CZ, SWAP, CCX (Toffoli), CCZ, CSWAP (Fredkin).
+        // Circuit map shape: { "n_qubits": N, "ops": [ { "gate": "H", "qubits": [0] }, ... ] }
+        fn quantum_simulate_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "quantum_simulate() expects 1 argument (circuit), got {}",
+                    args.len()
+                )));
+            }
+            let circ = match &args[0] {
+                Value::Map(m) => m.clone(),
+                _ => return Err(host.err("quantum_simulate(): expected a circuit map".into())),
+            };
+            let (n_qubits, ops_v) = {
+                let r = circ.borrow();
+                let n = match r.get("n_qubits") {
+                    Some(Value::Number(n)) if *n >= 0.0 => *n as usize,
+                    _ => {
+                        return Err(host
+                            .err("quantum_simulate(): circuit missing 'n_qubits' number".into()))
+                    }
+                };
+                let ops = r
+                    .get("ops")
+                    .cloned()
+                    .ok_or_else(|| host.err("quantum_simulate(): circuit missing 'ops'".into()))?;
+                (n, ops)
+            };
+            if n_qubits > 20 {
+                return Err(host.err(format!(
+                    "quantum_simulate(): too many qubits ({}); max is 20",
+                    n_qubits
+                )));
+            }
+            let dim = 1usize << n_qubits;
+            // Statevector as (real, imag) pairs.
+            let mut state_re = vec![0.0_f64; dim];
+            let mut state_im = vec![0.0_f64; dim];
+            state_re[0] = 1.0;
+
+            let ops_arr = match ops_v {
+                Value::Array(a) => a,
+                _ => return Err(host.err("quantum_simulate(): 'ops' must be an array".into())),
+            };
+            for op_v in ops_arr.borrow().iter() {
+                let op_m = match op_v {
+                    Value::Map(m) => m.clone(),
+                    _ => return Err(host.err("quantum_simulate(): op entry must be a map".into())),
+                };
+                let r = op_m.borrow();
+                let gate_s = match r.get("gate") {
+                    Some(Value::Obj(o)) => match o.as_ref() {
+                        Obj::String(s) => s.to_uppercase(),
+                    },
+                    _ => {
+                        return Err(host.err("quantum_simulate(): op missing 'gate' string".into()))
+                    }
+                };
+                let qubits_v = r
+                    .get("qubits")
+                    .cloned()
+                    .ok_or_else(|| host.err("quantum_simulate(): op missing 'qubits'".into()))?;
+                let qubits: Vec<usize> = match qubits_v {
+                    Value::Array(a) => a
+                        .borrow()
+                        .iter()
+                        .map(|v| match v {
+                            Value::Number(n) if *n >= 0.0 => Ok(*n as usize),
+                            _ => Err(host.err(
+                                "quantum_simulate(): qubits must be non-negative integers".into(),
+                            )),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    _ => return Err(host.err("quantum_simulate(): qubits must be an array".into())),
+                };
+                let theta = match r.get("theta") {
+                    Some(Value::Number(n)) => Some(*n),
+                    _ => None,
+                };
+                drop(r);
+
+                for q in &qubits {
+                    if *q >= n_qubits {
+                        return Err(host.err(format!(
+                            "quantum_simulate(): qubit {} out of range [0,{})",
+                            q, n_qubits
+                        )));
+                    }
+                }
+
+                apply_quantum_gate(
+                    host,
+                    &gate_s,
+                    &qubits,
+                    theta,
+                    n_qubits,
+                    &mut state_re,
+                    &mut state_im,
+                )?;
+            }
+
+            // Return probabilities and the raw statevector real/imag parts.
+            let probs: Vec<f64> = state_re
+                .iter()
+                .zip(state_im.iter())
+                .map(|(r, i)| r * r + i * i)
+                .collect();
+            let mut out_map = HashMap::new();
+            out_map.insert(
+                "probs".into(),
+                alloc_array(probs.into_iter().map(Value::Number).collect()),
+            );
+            out_map.insert(
+                "real".into(),
+                alloc_array(state_re.into_iter().map(Value::Number).collect()),
+            );
+            out_map.insert(
+                "imag".into(),
+                alloc_array(state_im.into_iter().map(Value::Number).collect()),
+            );
+            out_map.insert("n_qubits".into(), Value::Number(n_qubits as f64));
+            Ok(alloc_map(out_map))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn apply_quantum_gate(
+            host: &mut dyn VmHost,
+            gate: &str,
+            qubits: &[usize],
+            theta: Option<f64>,
+            n: usize,
+            re: &mut [f64],
+            im: &mut [f64],
+        ) -> Result<(), RuntimeError> {
+            let dim = 1usize << n;
+            match gate {
+                "I" => Ok(()),
+                "X" | "Y" | "Z" | "H" | "S" | "T" => {
+                    if qubits.len() != 1 {
+                        return Err(host.err(format!("{gate}: expected 1 qubit")));
+                    }
+                    let q = qubits[0];
+                    apply_1q_gate(gate, q, n, re, im, None);
+                    Ok(())
+                }
+                "RX" | "RY" | "RZ" => {
+                    if qubits.len() != 1 {
+                        return Err(host.err(format!("{gate}: expected 1 qubit")));
+                    }
+                    let q = qubits[0];
+                    let t = theta
+                        .ok_or_else(|| host.err(format!("{gate}: missing 'theta' parameter")))?;
+                    apply_1q_gate(gate, q, n, re, im, Some(t));
+                    Ok(())
+                }
+                "CX" | "CNOT" => {
+                    if qubits.len() != 2 {
+                        return Err(host.err("CX: expected [control, target]".into()));
+                    }
+                    let (c, t) = (qubits[0], qubits[1]);
+                    apply_controlled(c, &[t], "X", n, re, im, None);
+                    Ok(())
+                }
+                "CZ" => {
+                    if qubits.len() != 2 {
+                        return Err(host.err("CZ: expected [control, target]".into()));
+                    }
+                    apply_controlled(qubits[0], &[qubits[1]], "Z", n, re, im, None);
+                    Ok(())
+                }
+                "SWAP" => {
+                    if qubits.len() != 2 {
+                        return Err(host.err("SWAP: expected 2 qubits".into()));
+                    }
+                    let (a, b) = (qubits[0], qubits[1]);
+                    for i in 0..dim {
+                        let ba = (i >> a) & 1;
+                        let bb = (i >> b) & 1;
+                        if ba == bb {
+                            continue;
+                        }
+                        let j = i ^ (1 << a) ^ (1 << b);
+                        if i < j {
+                            re.swap(i, j);
+                            im.swap(i, j);
+                        }
+                    }
+                    Ok(())
+                }
+                "CCX" | "TOFFOLI" => {
+                    if qubits.len() != 3 {
+                        return Err(host.err("CCX: expected 3 qubits".into()));
+                    }
+                    let (c1, c2, t) = (qubits[0], qubits[1], qubits[2]);
+                    for i in 0..dim {
+                        let b1 = (i >> c1) & 1;
+                        let b2 = (i >> c2) & 1;
+                        if b1 == 1 && b2 == 1 {
+                            let j = i ^ (1 << t);
+                            if i < j {
+                                re.swap(i, j);
+                                im.swap(i, j);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                "CCZ" => {
+                    if qubits.len() != 3 {
+                        return Err(host.err("CCZ: expected 3 qubits".into()));
+                    }
+                    let (a, b, c) = (qubits[0], qubits[1], qubits[2]);
+                    for i in 0..dim {
+                        if ((i >> a) & 1) == 1 && ((i >> b) & 1) == 1 && ((i >> c) & 1) == 1 {
+                            re[i] = -re[i];
+                            im[i] = -im[i];
+                        }
+                    }
+                    Ok(())
+                }
+                "CSWAP" | "FREDKIN" => {
+                    if qubits.len() != 3 {
+                        return Err(host.err("CSWAP: expected 3 qubits".into()));
+                    }
+                    let (c, a, b) = (qubits[0], qubits[1], qubits[2]);
+                    for i in 0..dim {
+                        if ((i >> c) & 1) != 1 {
+                            continue;
+                        }
+                        let ba = (i >> a) & 1;
+                        let bb = (i >> b) & 1;
+                        if ba == bb {
+                            continue;
+                        }
+                        let j = i ^ (1 << a) ^ (1 << b);
+                        if i < j {
+                            re.swap(i, j);
+                            im.swap(i, j);
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(host.err(format!("quantum_simulate(): unknown gate '{other}'"))),
+            }
+        }
+
+        fn apply_1q_gate(
+            gate: &str,
+            q: usize,
+            n: usize,
+            re: &mut [f64],
+            im: &mut [f64],
+            theta: Option<f64>,
+        ) {
+            let dim = 1usize << n;
+            // 2x2 matrix as ((m00r,m00i), (m01r,m01i), (m10r,m10i), (m11r,m11i))
+            let inv_sqrt2 = 1.0 / 2f64.sqrt();
+            let ((a_r, a_i), (b_r, b_i), (c_r, c_i), (d_r, d_i)) = match gate {
+                "X" => ((0.0, 0.0), (1.0, 0.0), (1.0, 0.0), (0.0, 0.0)),
+                "Y" => ((0.0, 0.0), (0.0, -1.0), (0.0, 1.0), (0.0, 0.0)),
+                "Z" => ((1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (-1.0, 0.0)),
+                "H" => (
+                    (inv_sqrt2, 0.0),
+                    (inv_sqrt2, 0.0),
+                    (inv_sqrt2, 0.0),
+                    (-inv_sqrt2, 0.0),
+                ),
+                "S" => ((1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 1.0)),
+                "T" => ((1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (inv_sqrt2, inv_sqrt2)),
+                "RX" => {
+                    let t = theta.unwrap_or(0.0);
+                    let cs = (t / 2.0).cos();
+                    let sn = (t / 2.0).sin();
+                    ((cs, 0.0), (0.0, -sn), (0.0, -sn), (cs, 0.0))
+                }
+                "RY" => {
+                    let t = theta.unwrap_or(0.0);
+                    let cs = (t / 2.0).cos();
+                    let sn = (t / 2.0).sin();
+                    ((cs, 0.0), (-sn, 0.0), (sn, 0.0), (cs, 0.0))
+                }
+                "RZ" => {
+                    let t = theta.unwrap_or(0.0);
+                    let cs = (t / 2.0).cos();
+                    let sn = (t / 2.0).sin();
+                    ((cs, -sn), (0.0, 0.0), (0.0, 0.0), (cs, sn))
+                }
+                _ => return,
+            };
+            for i in 0..dim {
+                if (i >> q) & 1 != 0 {
+                    continue;
+                }
+                let j = i | (1 << q);
+                // [i, j] = M * [old_i, old_j]
+                let (oi_r, oi_i) = (re[i], im[i]);
+                let (oj_r, oj_i) = (re[j], im[j]);
+                re[i] = a_r * oi_r - a_i * oi_i + b_r * oj_r - b_i * oj_i;
+                im[i] = a_r * oi_i + a_i * oi_r + b_r * oj_i + b_i * oj_r;
+                re[j] = c_r * oi_r - c_i * oi_i + d_r * oj_r - d_i * oj_i;
+                im[j] = c_r * oi_i + c_i * oi_r + d_r * oj_i + d_i * oj_r;
+            }
+        }
+
+        fn apply_controlled(
+            ctrl: usize,
+            targets: &[usize],
+            sub_gate: &str,
+            n: usize,
+            re: &mut [f64],
+            im: &mut [f64],
+            theta: Option<f64>,
+        ) {
+            let dim = 1usize << n;
+            // Only act when ctrl bit is set.
+            for i in 0..dim {
+                if (i >> ctrl) & 1 != 1 {
+                    continue;
+                }
+                // For 1-qubit sub-gates with a single target.
+                if targets.len() == 1 && (i >> targets[0]) & 1 == 0 {
+                    // Pair: (i, i | 1<<target)
+                    let j = i | (1 << targets[0]);
+                    if (j >> ctrl) & 1 != 1 {
+                        continue;
+                    }
+                    // Apply 1q matrix to (i, j).
+                    apply_pair_1q_inplace(sub_gate, i, j, re, im, theta);
+                }
+            }
+        }
+
+        fn apply_pair_1q_inplace(
+            gate: &str,
+            i: usize,
+            j: usize,
+            re: &mut [f64],
+            im: &mut [f64],
+            theta: Option<f64>,
+        ) {
+            let inv_sqrt2 = 1.0 / 2f64.sqrt();
+            let ((a_r, a_i), (b_r, b_i), (c_r, c_i), (d_r, d_i)) = match gate {
+                "X" => ((0.0, 0.0), (1.0, 0.0), (1.0, 0.0), (0.0, 0.0)),
+                "Y" => ((0.0, 0.0), (0.0, -1.0), (0.0, 1.0), (0.0, 0.0)),
+                "Z" => ((1.0, 0.0), (0.0, 0.0), (0.0, 0.0), (-1.0, 0.0)),
+                "H" => (
+                    (inv_sqrt2, 0.0),
+                    (inv_sqrt2, 0.0),
+                    (inv_sqrt2, 0.0),
+                    (-inv_sqrt2, 0.0),
+                ),
+                "RX" => {
+                    let t = theta.unwrap_or(0.0);
+                    let cs = (t / 2.0).cos();
+                    let sn = (t / 2.0).sin();
+                    ((cs, 0.0), (0.0, -sn), (0.0, -sn), (cs, 0.0))
+                }
+                "RY" => {
+                    let t = theta.unwrap_or(0.0);
+                    let cs = (t / 2.0).cos();
+                    let sn = (t / 2.0).sin();
+                    ((cs, 0.0), (-sn, 0.0), (sn, 0.0), (cs, 0.0))
+                }
+                "RZ" => {
+                    let t = theta.unwrap_or(0.0);
+                    let cs = (t / 2.0).cos();
+                    let sn = (t / 2.0).sin();
+                    ((cs, -sn), (0.0, 0.0), (0.0, 0.0), (cs, sn))
+                }
+                _ => return,
+            };
+            let (oi_r, oi_i) = (re[i], im[i]);
+            let (oj_r, oj_i) = (re[j], im[j]);
+            re[i] = a_r * oi_r - a_i * oi_i + b_r * oj_r - b_i * oj_i;
+            im[i] = a_r * oi_i + a_i * oi_r + b_r * oj_i + b_i * oj_r;
+            re[j] = c_r * oi_r - c_i * oi_i + d_r * oj_r - d_i * oj_i;
+            im[j] = c_r * oi_i + c_i * oi_r + d_r * oj_i + d_i * oj_r;
+        }
+
+        // ── Native encoding builtins (hex / url) ──────────────────────────────
+        fn hex_encode_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "hex_encode() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("hex_encode(): {m}")))?;
+            let mut out = String::with_capacity(s.len() * 2);
+            for b in s.as_bytes() {
+                out.push_str(&format!("{:02x}", b));
+            }
+            Ok(alloc_string(out))
+        }
+
+        fn hex_decode_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "hex_decode() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("hex_decode(): {m}")))?;
+            let s = s.trim();
+            if s.len() % 2 != 0 {
+                return Err(host.err("hex_decode(): odd-length hex string".into()));
+            }
+            let mut out = Vec::with_capacity(s.len() / 2);
+            let bytes = s.as_bytes();
+            for chunk in bytes.chunks(2) {
+                let h = (chunk[0] as char).to_digit(16).ok_or_else(|| {
+                    host.err(format!(
+                        "hex_decode(): invalid hex char '{}'",
+                        chunk[0] as char
+                    ))
+                })?;
+                let l = (chunk[1] as char).to_digit(16).ok_or_else(|| {
+                    host.err(format!(
+                        "hex_decode(): invalid hex char '{}'",
+                        chunk[1] as char
+                    ))
+                })?;
+                out.push(((h << 4) | l) as u8);
+            }
+            let s_out = String::from_utf8(out)
+                .map_err(|e| host.err(format!("hex_decode(): invalid UTF-8: {e}")))?;
+            Ok(alloc_string(s_out))
+        }
+
+        fn url_encode_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "url_encode() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("url_encode(): {m}")))?;
+            let mut out = String::with_capacity(s.len());
+            for b in s.as_bytes() {
+                let unreserved = matches!(*b,
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~');
+                if unreserved {
+                    out.push(*b as char);
+                } else {
+                    out.push_str(&format!("%{:02X}", b));
+                }
+            }
+            Ok(alloc_string(out))
+        }
+
+        fn url_decode_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 1 {
+                return Err(host.err(format!(
+                    "url_decode() expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let s = args[0]
+                .as_str()
+                .map_err(|m| host.err(format!("url_decode(): {m}")))?;
+            let bytes = s.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut i = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'+' => {
+                        out.push(b' ');
+                        i += 1;
+                    }
+                    b'%' => {
+                        if i + 2 >= bytes.len() {
+                            return Err(host.err("url_decode(): truncated escape sequence".into()));
+                        }
+                        let h = (bytes[i + 1] as char).to_digit(16).ok_or_else(|| {
+                            host.err(format!(
+                                "url_decode(): invalid escape char '{}'",
+                                bytes[i + 1] as char
+                            ))
+                        })?;
+                        let l = (bytes[i + 2] as char).to_digit(16).ok_or_else(|| {
+                            host.err(format!(
+                                "url_decode(): invalid escape char '{}'",
+                                bytes[i + 2] as char
+                            ))
+                        })?;
+                        out.push(((h << 4) | l) as u8);
+                        i += 3;
+                    }
+                    other => {
+                        out.push(other);
+                        i += 1;
+                    }
+                }
+            }
+            let s_out = String::from_utf8(out)
+                .map_err(|e| host.err(format!("url_decode(): invalid UTF-8: {e}")))?;
+            Ok(alloc_string(s_out))
+        }
+
         fn os_signal_handler_get_builtin(
             host: &mut dyn VmHost,
             args: Vec<Value>,
@@ -8784,6 +9962,81 @@ except Exception as e:
                 name: "tensor_transpose2d",
                 arity: Some(1),
                 fun: tensor_transpose2d_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_gelu",
+                arity: Some(1),
+                fun: tensor_gelu_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_leaky_relu",
+                arity: None, // 1 or 2
+                fun: tensor_leaky_relu_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_log_softmax",
+                arity: Some(1),
+                fun: tensor_log_softmax_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_layer_norm",
+                arity: None, // 1 or 2
+                fun: tensor_layer_norm_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_batch_norm",
+                arity: None, // 1 or 2
+                fun: tensor_batch_norm_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_embedding_lookup",
+                arity: Some(2),
+                fun: tensor_embedding_lookup_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_cross_entropy",
+                arity: Some(2),
+                fun: tensor_cross_entropy_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_conv2d",
+                arity: None, // 2-4
+                fun: tensor_conv2d_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_maxpool2d",
+                arity: None, // 2-3
+                fun: tensor_maxpool2d_builtin,
+            },
+            BuiltinFn {
+                name: "tensor_avgpool2d",
+                arity: None, // 2-3
+                fun: tensor_avgpool2d_builtin,
+            },
+            BuiltinFn {
+                name: "quantum_simulate",
+                arity: Some(1),
+                fun: quantum_simulate_builtin,
+            },
+            BuiltinFn {
+                name: "hex_encode",
+                arity: Some(1),
+                fun: hex_encode_builtin,
+            },
+            BuiltinFn {
+                name: "hex_decode",
+                arity: Some(1),
+                fun: hex_decode_builtin,
+            },
+            BuiltinFn {
+                name: "url_encode",
+                arity: Some(1),
+                fun: url_encode_builtin,
+            },
+            BuiltinFn {
+                name: "url_decode",
+                arity: Some(1),
+                fun: url_decode_builtin,
             },
             BuiltinFn {
                 name: "os_which",
