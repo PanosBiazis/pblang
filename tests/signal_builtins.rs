@@ -6,6 +6,7 @@
 //!   * `os_signal_handler_get` returns nil for unregistered signals
 //!   * `os_signal_pending` / `os_signal_poll` return zero-valued shapes when
 //!     no signal has been delivered yet
+//!
 //! These exercise the full FFI / registry round-trip without race conditions.
 
 #[allow(dead_code)]

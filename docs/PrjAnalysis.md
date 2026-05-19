@@ -70,12 +70,16 @@ This document is the current validation baseline for analysis claims against the
   - `stdlib/ffi.sapp` exposes `call_typed`, plus convenience helpers `call_str` and `call_int`.
   - Still gated by the `ffi` capability and the existing symbol/library allowlist.
 - Native tensor builtins for fast numeric ops:
-  - 14 new builtins implemented in Rust (`tensor_add`, `tensor_sub`, `tensor_mul`, `tensor_scale`, `tensor_matmul`, `tensor_dot`, `tensor_relu`, `tensor_sigmoid`, `tensor_tanh`, `tensor_softmax`, `tensor_sum`, `tensor_mean`, `tensor_argmax`, `tensor_transpose2d`).
-  - `stdlib/tensor.sapp` now exposes `add`, `sub`, `mul`, `scale`, `relu`, `sigmoid`, `tanh_`, `softmax`, `sum_all`, `mean`, `argmax`, `transpose`, and routes `dot` through `tensor_dot`/`tensor_matmul` fast paths with the interpreter loops as fallback.
+  - 14 base builtins implemented in Rust (`tensor_add`, `tensor_sub`, `tensor_mul`, `tensor_scale`, `tensor_matmul`, `tensor_dot`, `tensor_relu`, `tensor_sigmoid`, `tensor_tanh`, `tensor_softmax`, `tensor_sum`, `tensor_mean`, `tensor_argmax`, `tensor_transpose2d`).
+  - 10 additional native neural-net primitives: `tensor_gelu`, `tensor_leaky_relu`, `tensor_log_softmax`, `tensor_layer_norm`, `tensor_batch_norm`, `tensor_embedding_lookup`, `tensor_cross_entropy`, `tensor_conv2d`, `tensor_maxpool2d`, `tensor_avgpool2d` — enough to build CNN / Transformer training loops at near-native speed.
+  - `stdlib/tensor.sapp` exposes thin wrappers: `add/sub/mul/scale`, `relu/sigmoid/tanh_/softmax/gelu/leaky_relu/log_softmax`, `layer_norm/batch_norm`, `conv2d/maxpool2d/avgpool2d` (with `_s`/`_sp` stride/padding variants), `embedding_lookup`, `cross_entropy`, `sum_all`, `mean`, `argmax`, `transpose`; `dot` routes through `tensor_dot`/`tensor_matmul` with interpreter fallback.
 - Quantum bridge enriched in `stdlib/crypto_quantum.sapp`:
   - New gate set (`H`, `X`, `Y`, `Z`, `S`, `T`, `RX/RY/RZ`, `CX`, `CZ`, `SWAP`, `CCX`, `CCZ`, `CSWAP`).
   - Circuit-builder API (`new_circuit`, `apply_gate`, `apply_rotation`, `measure`, `measure_all`, `circuit_to_json`).
+  - Native statevector simulator: `quantum_simulate(circuit)` evaluates a circuit against an actual complex statevector (≤20 qubits) and returns `{ probs, real, imag, n_qubits }`. Stdlib `simulate(circuit)`, `probabilities(circuit)`, and `sample(circuit)` wrap it.
   - AI-bridge helper `circuit_features` produces feature maps suitable for ML-assisted transpilation/error-mitigation.
+- Native encoding builtins: `hex_encode`, `hex_decode`, `url_encode`, `url_decode` (RFC 3986 unreserved set + `+` shorthand on decode) — 50-100x faster than the pure-pblang fallbacks in `stdlib/encoding.sapp`. Pair with the existing `base64_encode`/`base64_decode` natives.
+- Polyglot build manifest expanded: `stdlib/polyglot_build.sapp` now supports `@rust`, `@c`, `@cpp/@c++/@cxx`, `@go` (c-shared lib), `@ruby`, `@python`, `@js`/`@javascript`, and `@wasm/@wat` (via `wat2wasm`).
 - Strict-parse for batch compilation is in place — `pblang run`, `pblang compile`, and `pblang lint` already call `parse_strict` and report errors rather than silently recovering. The recovery parser remains used in LSP/IDE and `analyze` where partial AST is helpful.
 
 ## True but Not Fully Fixed (Large Refactor / Design Work)
