@@ -471,6 +471,7 @@ impl Compiler {
                     defaults: defaults_vals,
                     is_vararg: is_vararg_fn,
                     chunk: f_compiler.chunk,
+                    param_types: None,
                 });
 
                 let fn_const_idx = self.chunk.add_const(Value::Function(fun));
@@ -552,6 +553,7 @@ impl Compiler {
                     defaults: vec![],
                     is_vararg: false,
                     chunk: thunk_compiler.chunk,
+                    param_types: None,
                 });
                 let fn_const_idx = self.chunk.add_const(Value::Function(fun));
                 let captures = thunk_compiler
@@ -1446,6 +1448,7 @@ impl Compiler {
                     defaults: defaults_lit,
                     is_vararg: is_vararg_lit,
                     chunk: f_compiler.chunk,
+                    param_types: None,
                 });
 
                 let fn_const_idx = self.chunk.add_const(Value::Function(fun));
@@ -1933,6 +1936,9 @@ pub fn disasm(chunk: &Chunk) -> String {
             OpCode::OpIsNil => format!("  {:4} OpIsNil", i),
             OpCode::OpDup => format!("  {:4} OpDup", i),
             OpCode::OpThrow => format!("  {:4} OpThrow", i),
+            OpCode::OpNegate => format!("  {:4} OpNegate", i),
+            OpCode::OpMod => format!("  {:4} OpMod", i),
+            OpCode::OpPow => format!("  {:4} OpPow", i),
         };
         writeln!(out, "{}", line).ok();
     }

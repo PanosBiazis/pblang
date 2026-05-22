@@ -121,6 +121,12 @@ Check [docs/Tasks.md](docs/Tasks.md) for the active backlog. Good first issues:
 - The parser uses the **chumsky** combinator library
 - Bytecode is a flat array of `OpCode` enums with absolute jump targets
 
+## Release Notes
+
+User-visible changes are summarised in [CHANGELOG.md](CHANGELOG.md). Add an
+`[Unreleased]` entry for any change that affects behaviour, the public API,
+the CLI, or the stdlib surface.
+
 ## Questions?
 
 - Check the `docs/` directory for design documents

@@ -11,7 +11,7 @@ use std::rc::Rc;
 fn run_fixture(sap_path: &Path) -> Result<String, String> {
     let src = fs::read_to_string(sap_path).map_err(|e| e.to_string())?;
     let stmts = parse(&src).map_err(|e| format!("parse error: {e:?}"))?;
-    let mut chunk = compile(stmts);
+    let mut chunk = compile(stmts).map_err(|e| format!("compile error: {e}"))?;
     let name = sap_path.to_string_lossy().to_string();
     chunk.source_name = Some(Rc::new(name));
     chunk.source = Some(Rc::new(src));

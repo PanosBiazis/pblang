@@ -712,6 +712,46 @@ impl MemoryTracker {
             .is_none_or(|o| o.is_lifetime_expired)
     }
 
+    /// Check whether a memory location allows mutable access.
+    ///
+    /// Returns Ok(()) if the value is allocated, mutable, not consumed,
+    /// not lifetime-expired, and has no active borrows. Used by the VM
+    /// bytecode loop to guard array/map mutations.
+    pub fn check_mutable_allowed(&self, memory_id: MemoryId) -> Result<(), MemorySafetyError> {
+        let inner = self.inner.borrow();
+
+        let owner = inner
+            .owners
+            .get(&memory_id)
+            .ok_or(MemorySafetyError::NotAllocated(memory_id))?;
+
+        if !owner.is_mutable {
+            return Err(MemorySafetyError::Immutable(memory_id));
+        }
+        if owner.is_consumed {
+            return Err(MemorySafetyError::UseAfterMove(memory_id));
+        }
+        if owner.is_lifetime_expired {
+            return Err(MemorySafetyError::LifetimeExpired(memory_id));
+        }
+        if let Some(borrows) = inner.borrows.get(&memory_id) {
+            if !borrows.is_empty() {
+                return Err(MemorySafetyError::AlreadyBorrowed(memory_id));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check whether a memory location has any active borrows (of any type).
+    pub fn is_borrowed(&self, memory_id: MemoryId) -> bool {
+        let inner = self.inner.borrow();
+        inner
+            .borrows
+            .get(&memory_id)
+            .is_some_and(|v| !v.is_empty())
+    }
+
     /// Return a reference-counted handle to the inner tracker, allowing
     /// `SafeValue` instances to clean up on Drop.
     pub(crate) fn inner_handle(&self) -> Rc<RefCell<TrackerInner>> {

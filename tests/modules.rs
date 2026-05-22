@@ -406,14 +406,14 @@ fn csv_stdlib_parse_and_stringify_work() {
     let src = r#"
         import "stdlib:csv.sapp";
         let text = "a,b\nc,d";
-        let rows = csv.parse(text);
+        let rows = csv.parse(text, ",", false);
         print len(rows);
         print rows[0][0];
         print rows[0][1];
         print len(rows[1]);
         print rows[1][0];
         print rows[1][1];
-        let back = csv.stringify(rows);
+        let back = csv.stringify(rows, ",", nil);
         print back;
     "#;
     let out = run_collect(src);
@@ -424,7 +424,9 @@ fn csv_stdlib_parse_and_stringify_work() {
     assert_eq!(out[3], Value::Number(2.0));
     assert_eq!(out[4].as_str().unwrap(), "c");
     assert_eq!(out[5].as_str().unwrap(), "d");
-    assert_eq!(out[6].as_str().unwrap(), "a,b\nc,d");
+    // csv.stringify terminates every row with a newline; plain fields are
+    // emitted unquoted (RFC 4180 — only quote when the field needs it).
+    assert_eq!(out[6].as_str().unwrap(), "a,b\nc,d\n");
 }
 
 #[test]

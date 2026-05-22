@@ -926,6 +926,271 @@ impl std::fmt::Debug for ConcurrencyStats {
 }
 
 // ---------------------------------------------------------------------------
+// VmThreadSupervisor — tracked VM threads with timeout monitoring
+// ---------------------------------------------------------------------------
+
+/// Tracks spawned VM threads with heartbeat monitoring and automatic cleanup.
+/// Inspired by Erlang's supervisor trees and Rust's JoinHandle.
+pub struct VmThreadSupervisor {
+    handles: Arc<Mutex<HashMap<usize, SupervisedThread>>>,
+    next_id: AtomicUsize,
+    stats: Arc<Mutex<SupervisorStats>>,
+}
+
+struct SupervisedThread {
+    deadline: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SupervisorStats {
+    pub spawned: u64,
+    pub completed: u64,
+    pub timed_out: u64,
+    pub killed: u64,
+    pub active: usize,
+}
+
+impl Default for VmThreadSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VmThreadSupervisor {
+    pub fn new() -> Self {
+        Self {
+            handles: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicUsize::new(1),
+            stats: Arc::new(Mutex::new(SupervisorStats::default())),
+        }
+    }
+
+    /// Spawn a new VM thread with a timeout. The given closure receives a
+    /// sender to report completion and should spawn the VM accordingly.
+    ///
+    /// Returns a unique thread ID that can be used with `check()`.
+    pub fn supervise<F>(&self, timeout_ms: u64, spawn_fn: F) -> usize
+    where
+        F: FnOnce() -> JoinHandle<Result<SpawnWireValue, String>> + Send + 'static,
+    {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let handle = spawn_fn();
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        self.stats.lock().unwrap().spawned += 1;
+
+        let handles = self.handles.clone();
+        let stats = self.stats.clone();
+        let deadline_for_monitor = deadline;
+
+        // Monitor: poll until join completes or deadline passes (cannot force-kill OS threads).
+        thread::spawn(move || {
+            while !handle.is_finished() {
+                if Instant::now() >= deadline_for_monitor {
+                    let mut h = handles.lock().unwrap();
+                    let mut s = stats.lock().unwrap();
+                    s.timed_out += 1;
+                    h.remove(&id);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let result = handle.join();
+            let mut h = handles.lock().unwrap();
+            let mut s = stats.lock().unwrap();
+            match &result {
+                Ok(Ok(_)) => s.completed += 1,
+                Ok(Err(_)) => s.completed += 1,
+                Err(_) => s.timed_out += 1,
+            }
+            h.remove(&id);
+        });
+
+        self.handles.lock().unwrap().insert(
+            id,
+            SupervisedThread { deadline },
+        );
+        id
+    }
+
+    /// Check if a supervised thread has timed out, and if so, remove it.
+    /// Returns `true` if the thread was found and still alive.
+    pub fn check(&self, id: usize) -> bool {
+        let mut handles = self.handles.lock().unwrap();
+        if let Some(t) = handles.get(&id) {
+            if Instant::now() >= t.deadline {
+                let mut s = self.stats.lock().unwrap();
+                s.timed_out += 1;
+                handles.remove(&id);
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Check all supervised threads, removing any that have timed out or finished.
+    pub fn check_all(&self) {
+        let mut handles = self.handles.lock().unwrap();
+        let now = Instant::now();
+        let timed_out: Vec<usize> = handles
+            .iter()
+            .filter(|(_, t)| now >= t.deadline)
+            .map(|(id, _)| *id)
+            .collect();
+        {
+            let mut s = self.stats.lock().unwrap();
+            s.timed_out += timed_out.len() as u64;
+        }
+        for id in timed_out {
+            handles.remove(&id);
+        }
+    }
+
+    /// Kill all supervised threads (marks them as timed out for cleanup).
+    pub fn kill_all(&self) {
+        let mut handles = self.handles.lock().unwrap();
+        let count = handles.len();
+        handles.clear();
+        let mut s = self.stats.lock().unwrap();
+        s.killed += count as u64;
+    }
+
+    /// Return a snapshot of supervision statistics.
+    pub fn stats(&self) -> SupervisorStats {
+        let s = self.stats.lock().unwrap();
+        let h = self.handles.lock().unwrap();
+        SupervisorStats {
+            spawned: s.spawned,
+            completed: s.completed,
+            timed_out: s.timed_out,
+            killed: s.killed,
+            active: h.len(),
+        }
+    }
+
+    /// Number of currently active supervised threads.
+    pub fn active_count(&self) -> usize {
+        self.handles.lock().unwrap().len()
+    }
+
+    /// Total threads ever spawned under this supervisor.
+    pub fn total_spawned(&self) -> u64 {
+        self.stats.lock().unwrap().spawned
+    }
+}
+
+impl std::fmt::Debug for VmThreadSupervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.stats();
+        f.debug_struct("VmThreadSupervisor")
+            .field("active", &s.active)
+            .field("spawned", &s.spawned)
+            .field("completed", &s.completed)
+            .field("timed_out", &s.timed_out)
+            .field("killed", &s.killed)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AtomicInteger — atomic integer wrapper for pblang Value
+// ---------------------------------------------------------------------------
+
+/// Atomic integer operations on pblang values, backed by AtomicI64.
+/// Provides CAS, increment, decrement, and exchange.
+pub struct AtomicInteger {
+    inner: AtomicI64,
+}
+
+impl AtomicInteger {
+    pub fn new(value: i64) -> Self {
+        Self {
+            inner: AtomicI64::new(value),
+        }
+    }
+
+    /// Load the current value.
+    pub fn load(&self) -> i64 {
+        self.inner.load(Ordering::SeqCst)
+    }
+
+    /// Store a new value.
+    pub fn store(&self, value: i64) {
+        self.inner.store(value, Ordering::SeqCst);
+    }
+
+    /// Compare-and-swap: if current == expected, set to new and return Ok(old).
+    /// Otherwise return Err(actual).
+    pub fn compare_exchange(&self, expected: i64, new: i64) -> Result<i64, i64> {
+        self.inner
+            .compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst)
+    }
+
+    /// Atomic fetch-and-add. Returns the previous value.
+    pub fn fetch_add(&self, delta: i64) -> i64 {
+        self.inner.fetch_add(delta, Ordering::SeqCst)
+    }
+
+    /// Atomic fetch-and-sub. Returns the previous value.
+    pub fn fetch_sub(&self, delta: i64) -> i64 {
+        self.inner.fetch_sub(delta, Ordering::SeqCst)
+    }
+
+    /// Atomic increment by 1. Returns the new value.
+    pub fn increment(&self) -> i64 {
+        self.inner.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Atomic decrement by 1. Returns the new value.
+    pub fn decrement(&self) -> i64 {
+        self.inner.fetch_sub(1, Ordering::SeqCst) - 1
+    }
+
+    /// Atomic exchange (swap). Returns the previous value.
+    pub fn swap(&self, value: i64) -> i64 {
+        self.inner.swap(value, Ordering::SeqCst)
+    }
+
+    /// Create from a pblang Value::Number (truncated to i64).
+    pub fn from_value(v: &Value) -> Self {
+        let n = match v {
+            Value::Number(n) => *n as i64,
+            Value::Bool(b) => {
+                if *b {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        Self::new(n)
+    }
+
+    /// Return the current value as a pblang Value::Number.
+    pub fn to_value(&self) -> Value {
+        Value::Number(self.load() as f64)
+    }
+}
+
+impl std::fmt::Debug for AtomicInteger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtomicInteger")
+            .field("value", &self.load())
+            .finish()
+    }
+}
+
+impl Clone for AtomicInteger {
+    fn clone(&self) -> Self {
+        Self {
+            inner: AtomicI64::new(self.load()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VM handle registry (per-VM isolation; shared with spawned child VMs)
 // ---------------------------------------------------------------------------
 
@@ -960,6 +1225,7 @@ pub struct SpawnWireFunction {
     pub instructions: Vec<OpCode>,
     pub spans: Vec<Span>,
     pub constants: Vec<SpawnWireValue>,
+    pub param_types: Option<Vec<pblang_ir::ParamType>>,
 }
 
 #[derive(Clone, Debug)]

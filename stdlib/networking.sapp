@@ -1,0 +1,382 @@
+// stdlib/networking.sapp — High-level networking utilities for pblang.
+//
+// Provides: fluent HTTP request builder, WebSocket client, REST helpers,
+// and network diagnostics.
+//
+// Usage:
+//   let net = import("stdlib:networking.sapp");
+//   let resp = net.request("GET", "https://api.example.com/data").send();
+//   let ws = net.websocket_connect("wss://echo.example.com");
+
+let net_core = import("stdlib:net.sapp");
+let crypto_mod = try import("stdlib:crypto.sapp") catch map{};
+
+// ─── HTTP Request Builder (fluent API) ────────────────────────────────────
+
+// HttpRequest — mutable request builder with fluent methods.
+fn new_request(method, url) {
+    return map{
+        method: method,
+        url: url,
+        headers: map{},
+        body: nil,
+        timeout_ms: 30000,
+        _sent: false,
+    };
+}
+
+fn request_set_header(req, key, value) {
+    req.headers[key] = value;
+    return req;
+}
+
+fn request_set_body(req, body) {
+    req.body = body;
+    return req;
+}
+
+fn request_set_timeout(req, ms) {
+    req.timeout_ms = ms;
+    return req;
+}
+
+fn request_set_auth_bearer(req, token) {
+    return request_set_header(req, "Authorization", "Bearer " + token);
+}
+
+fn request_set_content_json(req) {
+    return request_set_header(req, "Content-Type", "application/json");
+}
+
+fn request_set_content_form(req) {
+    return request_set_header(req, "Content-Type", "application/x-www-form-urlencoded");
+}
+
+fn request_send(req) {
+    if req._sent == true { return map{ error: "request already sent" }; }
+    req._sent = true;
+
+    let url = req.url;
+    let method = req.method;
+    let body = req.body;
+
+    if method == "GET" {
+        if body != nil {
+            // Append as query string
+            let qs = build_query_string(body);
+            if len(qs) > 0 {
+                url = url + "?" + qs;
+            }
+        }
+        return fetch_json(http_get(url));
+    }
+    if method == "POST" {
+        let payload = "";
+        if body != nil {
+            let ct = try req.headers["Content-Type"] catch "";
+            if str_contains(ct, "json") {
+                payload = json_stringify(body);
+            } else {
+                payload = str(body);
+            }
+        }
+        return fetch_json(http_post(url, payload));
+    }
+    return map{ error: "unsupported method: " + method };
+}
+
+fn fetch_json(raw) {
+    if raw == nil || raw == "" {
+        return map{ ok: false, status: 0, body: nil, error: "empty response" };
+    }
+    let parsed = try json_parse(raw) catch nil;
+    if parsed == nil {
+        return map{ ok: true, status: 200, body: raw, error: nil };
+    }
+    return map{ ok: true, status: 200, body: parsed, error: nil };
+}
+
+// Convenience method shorthands
+fn get(url) {
+    return request_send(new_request("GET", url));
+}
+
+fn post(url, body) {
+    return request_send(request_set_body(new_request("POST", url), body));
+}
+
+fn post_json(url, data) {
+    let req = request_set_body(new_request("POST", url), data);
+    return request_send(request_set_content_json(req));
+}
+
+fn put(url, body) {
+    let req = request_set_body(new_request("PUT", url), body);
+    return request_send(req);
+}
+
+fn del(url) {
+    return request_send(new_request("DELETE", url));
+}
+
+// ─── WebSocket Client ──────────────────────────────────────────────────────
+
+fn websocket_connect(url) {
+    // Placeholder: real WebSocket requires upgrade handshake
+    // This uses raw TCP for basic framing demonstration
+    let parsed = url_parse(url);
+    let host = parsed.host;
+    let port = 80;
+
+    if parsed.scheme == "wss" { port = 443; }
+
+    let conn = tcp_connect(host + ":" + str(port));
+    if conn == nil {
+        return map{ error: "WebSocket: cannot connect to " + host + ":" + str(port) };
+    }
+
+    // Send upgrade request
+    let key = "dGhlIHNhbXBsZSBub25jZQ==";
+    let req_str = "GET " + parsed.path + " HTTP/1.1\r\n" +
+        "Host: " + host + "\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Sec-WebSocket-Key: " + key + "\r\n" +
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+
+    tcp_write(conn, req_str);
+
+    // Read handshake response (simple)
+    let response = tcp_read_until(conn, "\r\n\r\n", 4096);
+    if response == nil || len(response) == 0 {
+        tcp_close(conn);
+        return map{ error: "WebSocket: handshake failed" };
+    }
+    if not str_contains(response, "101") {
+        tcp_close(conn);
+        return map{ error: "WebSocket: upgrade rejected", response: response };
+    }
+
+    return map{
+        connection: conn,
+        connected: true,
+        host: host,
+        _buffer: "",
+    };
+}
+
+fn websocket_send(ws, message) {
+    // Simple text frame: FIN=1, opcode=1 (text)
+    let frame = "";
+    // We store raw bytes via tcp_write; simplified framing
+    let conn = ws.connection;
+    if conn == nil { return false; }
+    // For simplicity, send raw text (real impl would frame)
+    return tcp_write(conn, message);
+}
+
+fn websocket_recv(ws) {
+    let conn = ws.connection;
+    if conn == nil { return nil; }
+    let data = tcp_read(conn, 65536);
+    return data;
+}
+
+fn websocket_close(ws) {
+    if ws.connected == true {
+        tcp_close(ws.connection);
+        ws.connected = false;
+    }
+    return true;
+}
+
+// ─── REST Client Helpers ──────────────────────────────────────────────────
+
+// Paginated GET — fetch all pages from a paginated API.
+fn fetch_paginated(base_url, params, page_param, max_pages) {
+    if max_pages == nil { max_pages = 10; }
+    if page_param == nil { page_param = "page"; }
+    let all_items = [];
+    for page max_pages {
+        let p = page + 1;
+        let url = base_url;
+        let qs = "";
+        if params != nil {
+            params[page_param] = p;
+            qs = build_query_string(params);
+        } else {
+            let tmp = map{};
+            tmp[page_param] = p;
+            qs = build_query_string(tmp);
+        }
+        if len(qs) > 0 { url = url + "?" + qs; }
+        let resp = request_send(new_request("GET", url));
+        if resp.ok == false { break; }
+        let items = try resp.body catch [];
+        if items == nil || len(items) == 0 { break; }
+        for i len(items) { all_items[len(all_items)] = items[i]; }
+    }
+    return all_items;
+}
+
+// REST resource builder
+fn resource(base_url) {
+    return map{
+        _base: base_url,
+    };
+}
+
+fn resource_get(res, id) {
+    if id == nil { id = ""; }
+    let url = res._base;
+    if id != "" { url = url + "/" + str(id); }
+    return request_send(new_request("GET", url));
+}
+
+fn resource_create(res, data) {
+    return request_send(request_set_body(request_set_content_json(new_request("POST", res._base)), data));
+}
+
+fn resource_update(res, id, data) {
+    let url = res._base + "/" + str(id);
+    return request_send(request_set_body(request_set_content_json(new_request("PUT", url)), data));
+}
+
+fn resource_delete(res, id) {
+    let url = res._base + "/" + str(id);
+    return request_send(new_request("DELETE", url));
+}
+
+// ─── Network Diagnostics ──────────────────────────────────────────────────
+
+fn ping_host(host, count, timeout_ms) {
+    if count == nil { count = 4; }
+    if timeout_ms == nil { timeout_ms = 3000; }
+    // Simplified ping using TCP connect to port 80
+    let results = [];
+    for i count {
+        let start = now_ms();
+        let conn = tcp_connect(host + ":80");
+        let elapsed = now_ms() - start;
+        if conn != nil {
+            tcp_close(conn);
+            results[i] = map{ ok: true, time_ms: elapsed };
+        } else {
+            results[i] = map{ ok: false, time_ms: elapsed };
+        }
+    }
+    return results;
+}
+
+fn check_port(host, port) {
+    let conn = tcp_connect(host + ":" + str(port));
+    if conn != nil {
+        tcp_close(conn);
+        return true;
+    }
+    return false;
+}
+
+fn scan_ports(host, start_port, end_port) {
+    if start_port == nil { start_port = 1; }
+    if end_port == nil { end_port = 1024; }
+    let open = [];
+    for port end_port - start_port + 1 {
+        let p = start_port + port;
+        if check_port(host, p) {
+            open[len(open)] = p;
+        }
+    }
+    return open;
+}
+
+fn http_status_ok(status) {
+    return status >= 200 and status < 300;
+}
+
+fn http_status_client_error(status) {
+    return status >= 400 and status < 500;
+}
+
+fn http_status_server_error(status) {
+    return status >= 500 and status < 600;
+}
+
+// ─── URL building helpers ─────────────────────────────────────────────────
+
+fn build_query_string(params) {
+    let keys = map_keys(params);
+    if len(keys) == 0 { return ""; }
+    let parts = [];
+    for i len(keys) {
+        let k = keys[i];
+        let v = str(try params[k] catch "");
+        parts[i] = k + "=" + v;
+    }
+    let result = parts[0];
+    for i len(parts) {
+        if i > 0 { result = result + "&" + parts[i]; }
+    }
+    return result;
+}
+
+fn url_parse(url) {
+    let scheme = ""; let host = ""; let port = ""; let path = "/"; let query = "";
+    // Parse scheme
+    if str_contains(url, "://") {
+        let idx = 0;
+        while idx < len(url) {
+            let ch = "";
+            // manual char access
+            if url[idx] { ch = url[idx]; } else { ch = "x"; }
+            if ch == ":" { break; }
+            scheme = scheme + ch;
+            idx = idx + 1;
+        }
+        url = url[idx + 3 .. len(url)];
+    }
+    // Parse host + path
+    let j = 0;
+    let in_host = true;
+    while j < len(url) {
+        let ch = url[j];
+        if in_host and ch == "/" { in_host = false; path = ""; }
+        if in_host { host = host + ch; } else { path = path + ch; }
+        j = j + 1;
+    }
+    if str_contains(path, "?") {
+        let qi = 0;
+        while qi < len(path) {
+            if path[qi] == "?" { break; }
+            qi = qi + 1;
+        }
+        query = path[qi + 1 .. len(path)];
+    }
+    return map{ scheme: scheme, host: host, port: port, path: path, query: query };
+}
+
+// ─── Rate limiting helper ─────────────────────────────────────────────────
+
+fn rate_limited_call(fn_val, max_calls_per_sec) {
+    let last_call = 0;
+    let interval = 1000 / max_calls_per_sec;
+    return fn() {
+        let now = now_ms();
+        let elapsed = now - last_call;
+        if elapsed < interval {
+            sleep_ms(interval - elapsed);
+        }
+        last_call = now_ms();
+        return fn_val();
+    };
+}
+
+export new_request, request_set_header, request_set_body, request_set_timeout,
+       request_set_auth_bearer, request_set_content_json, request_set_content_form,
+       request_send, get, post, post_json, put, del,
+       websocket_connect, websocket_send, websocket_recv, websocket_close,
+       fetch_paginated, resource, resource_get, resource_create,
+       resource_update, resource_delete,
+       ping_host, check_port, scan_ports,
+       http_status_ok, http_status_client_error, http_status_server_error,
+       build_query_string, url_parse, rate_limited_call;
