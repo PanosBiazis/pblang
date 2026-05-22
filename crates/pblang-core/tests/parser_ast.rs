@@ -119,3 +119,70 @@ fn parse_strict_rejects_invalid_source() {
         "strict parser should reject malformed input"
     );
 }
+
+#[test]
+fn parse_type_annotations_on_let_and_fn() {
+    let ast = parse("let x: number = 1; fn id(a: number) -> number { return a; }").unwrap();
+    assert_eq!(ast.len(), 2);
+    match &ast[0].kind {
+        StmtKind::Let(name, ty, init) => {
+            assert_eq!(name, "x");
+            assert!(ty.is_some());
+            assert!(matches!(init.kind, ExprKind::Number(n) if n == 1.0));
+        }
+        _ => panic!("expected typed let"),
+    }
+    match &ast[1].kind {
+        StmtKind::Fn(name, params, ret, _body) => {
+            assert_eq!(name, "id");
+            assert_eq!(params.len(), 1);
+            assert!(params[0].ty.is_some());
+            assert!(ret.is_some());
+        }
+        _ => panic!("expected typed fn"),
+    }
+}
+
+#[test]
+fn parse_else_if_is_sugared_as_else_with_single_if_stmt() {
+    let ast = parse("if false { print 1; } else if true { print 2; } else { print 3; }").unwrap();
+    assert_eq!(ast.len(), 1);
+
+    let top = &ast[0];
+    match &top.kind {
+        StmtKind::If(_cond, _then_body, else_body) => {
+            let else_body = else_body.as_ref().expect("expected else body");
+            assert_eq!(else_body.len(), 1, "expected else to contain a single stmt");
+            match &else_body[0].kind {
+                StmtKind::If(_, _, nested_else) => {
+                    assert!(nested_else.is_some(), "expected nested if to have else");
+                }
+                other => panic!("expected nested if stmt, got {other:?}"),
+            }
+        }
+        other => panic!("expected if stmt, got {other:?}"),
+    }
+
+    assert!(top.span.end > top.span.start, "expected non-empty span");
+}
+
+#[test]
+fn parse_elif_is_sugared_as_else_with_single_if_stmt() {
+    let ast = parse("if false { print 1; } elif true { print 2; } else { print 3; }").unwrap();
+    assert_eq!(ast.len(), 1);
+
+    let top = &ast[0];
+    match &top.kind {
+        StmtKind::If(_cond, _then_body, else_body) => {
+            let else_body = else_body.as_ref().expect("expected else body");
+            assert_eq!(else_body.len(), 1, "expected else to contain a single stmt");
+            match &else_body[0].kind {
+                StmtKind::If(_, _, nested_else) => {
+                    assert!(nested_else.is_some(), "expected nested if to have else");
+                }
+                other => panic!("expected nested if stmt, got {other:?}"),
+            }
+        }
+        other => panic!("expected if stmt, got {other:?}"),
+    }
+}

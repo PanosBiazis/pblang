@@ -2,7 +2,7 @@
 
 **A fast, secure, embeddable programming language built in Rust.**
 
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-144%2F147%20passing%20(3%20ignored)-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-0.5.7-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 
 pblang is a general-purpose programming language and bytecode VM designed for both **embedded scripting** (games, tools, applications) and **standalone development** (web servers, CLI tools, AI/quantum workflows). It features capability-based security, a built-in package manager, and a growing standard library of 100+ modules.
 
@@ -12,13 +12,21 @@ pblang is a general-purpose programming language and bytecode VM designed for bo
 
 - **Fast Stack-Based VM** — Compiled to efficient bytecode with RC + cycle-breaking GC
 - **Capability-Based Security** — Fine-grained sandboxing via `VmLimits`, `FfiPolicy`, and `StdlibConfig`
-- **Built-in Package Manager** — Semver resolution, local/remote registries, lockfiles, SHA256 verification
-- **100+ Standard Library Modules** — HTTP, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, AI, and more
-- **Concurrency** — VM-per-thread model with typed channels and multi-channel `select`
-- **Polyglot Blocks** — Embed Python, JavaScript, SQL, or any language directly in source files
+- **Runtime Memory Safety** — Per-VM `MemoryTracker` enforces Rust-like ownership, borrow, and lifetime rules at runtime (`allocate`, `borrow_immutable`, `borrow_mutable`, `borrow_unique`, `store`, `push_lifetime`)
+- **Concurrency Primitives** — VM-per-thread isolation with typed channels, `select`, mutex, rwlock, thread pool, barrier, once, timer, wait group, semaphore, circuit breaker, rate limiter
+- **Async / Await** — `async_spawn`, `await`, `await_all`, `await_any`, `map`, `then` built on the channel/thread runtime
+- **Multi-Backend Codegen** — Interpreter, Cranelift JIT + AOT, C99 transpiler, LLVM IR, and WebAssembly text — all consume the same IR
+- **Built-in Package Manager** — Semver resolution, local/remote registries, lockfiles, SHA256 + HMAC verification, token refresh
+- **100+ Standard Library Modules** — HTTP/HTTPS, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, AI, ORM, JWT, template, regex, and more
+- **AI / ML Integration** — `ai_chat`, `ai_embed`, `ai_token_count` with OpenAI / Anthropic / Ollama / custom providers; RAG helpers (`chunk_text`, `semantic_search`) in `pblang-ai`
+- **Quantum Computing Bridge** — `quantum_run`, `quantum_statevector`, `quantum_backends` via Qiskit / Cirq / Braket subprocess
+- **Polyglot Blocks** — Embed Python, JavaScript, SQL, Rust, Bash, etc. directly in source files; `polyglot_exec` for inline execution
 - **FFI** — Call C libraries directly with allowlist-based security
-- **LSP Server** — `pblang lsp` uses tower-lsp (`pblang-lsp`): parse + typecheck diagnostics, completions, hover, go-to-definition, workspace symbols
-- **CLI Toolchain** — `run`, `test`, `fmt`, `lint`, `build`, `bundle`, `publish`, and more
+- **TLS / HTTPS** — Production rustls + webpki-roots; `tcp_listen_tls`, `tcp_connect_tls`
+- **LSP Server** — `pblang lsp` (tower-lsp): diagnostics, completions, hover, goto-def, workspace symbols, semantic tokens
+- **CLI Toolchain** — `run`, `test`, `fmt`, `lint`, `build`, `bundle`, `publish`, `search`, `compile`, `pack`, `verify`, `lsp`, `--cfg`, `--symbols`, `--annotate`, `--dump-bytecode`
+- **Native Binaries** — `pblang bundle --self-extract` produces a single self-extracting executable
+- **Self-Hosting** — Tokenizer, parser, type checker, IR, optimizer, and codegen all available as `.sapp` modules under `stdlib/compiler/`
 - **Embeddable** — Drop into any Rust application with full control over capabilities
 - **Cross-Platform** — Linux, macOS, and Windows
 
@@ -185,38 +193,48 @@ join(worker);
 
 ## 🏗️ Architecture
 
+See [STRUCTURE.md](STRUCTURE.md) for the full crate map.
+
 ```
 pblang/
 ├── src/main.rs              # CLI entry point & REPL
-├── crates/
-│   ├── pblang-core/         # Lexer, parser, AST definitions
+├── crates/                  # 16 workspace crates
+│   ├── pblang-core/         # Lexer (logos), parser (chumsky), AST
 │   ├── pblang-ir/           # Intermediate representation & opcodes
-│   ├── pblang-vm/           # Bytecode VM, builtins, GC
-│   ├── pblang-compiler/     # AST → bytecode compilation + optimizer
-│   ├── pblang-typeck/       # Type checker (basic inference)
+│   ├── pblang-vm/           # Bytecode VM, builtins, GC, memory_safety, concurrency
+│   ├── pblang-compiler/     # AST → bytecode + optimizer
+│   ├── pblang-typeck/       # Type checker (inference + diagnostics)
 │   ├── pblang-ffi/          # C ABI foreign function interface
-│   ├── pblang-pm/           # Package manager (registry, lockfile, semver)
-│   ├── pblang-lsp/          # Language Server Protocol implementation
+│   ├── pblang-pm/           # Package manager (registry, lockfile, semver, HMAC)
+│   ├── pblang-lsp/          # Language Server Protocol (tower-lsp)
 │   ├── pblang-graphics/     # Graphics backend (SDL2 / minifb)
-│   ├── pblang-cranelift/    # Cranelift JIT backend
-│   ├── pblang-ctranspiler/  # C transpiler backend
-│   ├── pblang-llvm/         # LLVM backend
-│   ├── pblang-wasm/         # WASM/WAT backend
-│   ├── pblang-ai/           # AI provider integration
-│   ├── pblang-quantum/      # Quantum bridge crate
+│   ├── pblang-cranelift/    # Cranelift JIT + AOT object emission
+│   ├── pblang-ctranspiler/  # AST → C99 transpiler + runtime header
+│   ├── pblang-llvm/         # LLVM IR text emitter
+│   ├── pblang-wasm/         # WAT / WebAssembly backend
+│   ├── pblang-ai/           # AI / ML providers + RAG helpers
+│   ├── pblang-quantum/      # Qiskit / Cirq / Braket bridge
 │   └── pblang-stub/         # Self-extracting bundle launcher
 ├── stdlib/                  # 100+ standard library modules (.sapp)
-├── tests/                   # Integration & semantics test suite
+│   └── compiler/            # Self-hosting compiler in pblang itself
+├── tests/                   # Semantics + integration suites
 ├── examples/                # Example projects
 ├── editors/vscode/          # VS Code extension
-├── docs/                    # Design documents & specifications
-└── benches/                 # Performance benchmarks
+├── docs/                    # 28 design documents & specifications
+└── benches/                 # Criterion performance benchmarks
 ```
 
 ### Compilation Pipeline
 
 ```
-Source (.sapp) → Parser (chumsky) → AST → Type Check → Compiler → Bytecode (Chunk) → VM Execution
+Source (.sapp) → Parser (chumsky) → AST → Type Check (pblang-typeck)
+                                              ↓
+                                       Compiler (pblang-compiler) + optimizer
+                                              ↓
+                                       Bytecode (Chunk)
+                                       ╱       │        ╲
+                                  Interpreter  JIT     AOT backends
+                                  (pblang-vm) (cranelift) (cranelift/llvm/c99/wasm)
 ```
 
 ---
@@ -332,21 +350,21 @@ Start with:
 
 | Category | Modules |
 |----------|---------|
-| **Web** | `http`, `http_server`, `router`, `middleware`, `multipart`, `websocket`, `tls` |
-| **Data** | `json`, `csv`, `db` (SQLite), `collections` |
-| **Concurrency** | `thread` |
-| **Crypto** | `crypto`, `crypto_quantum` |
-| **Math/Science** | `math`, `tensor`, `nd`, `quantum`, `quantum_sim`, `quantum_viz`, `quantum_protocol` |
-| **System** | `fs`, `os`, `path`, `process`, `time`, `net` |
-| **Graphics** | `graphics` |
-| **Interop** | `ffi`, `polyglot`, `strings`, `array`, `map`, `ptr` |
-| **Testing** | `testing` |
-| **Async** | `async` |
-| **ORM** | `orm` |
-| **Logging** | `log` |
-| **Templating** | `template` |
-| **Auth** | `jwt` |
-| **Config** | `env` (`.env` loader) |
+| **Web** | `http`, `http_server`, `router`, `middleware`, `multipart`, `websocket`, `tls`, `networking_advanced` |
+| **Data** | `json`, `csv`, `db` (SQLite), `collections`, `data_structures`, `serialization` |
+| **Concurrency** | `thread`, `thread_pool`, `concurrency`, `async_await`, `event`, `signal`, `pipe` |
+| **Memory Safety** | `memory` (Rust-like ownership / borrow / lifetime helpers over VM builtins) |
+| **Crypto** | `crypto`, `crypto_quantum`, `jwt`, `uuid`, `bitops` |
+| **Math / Science** | `math`, `tensor`, `nd`, `algorithms_advanced`, `machine_learning`, `blockchain` |
+| **Quantum** | `quantum`, `quantum_sim`, `quantum_viz`, `quantum_protocol` |
+| **System** | `fs`, `os`, `path`, `process`, `time`, `net`, `env`, `systems` |
+| **Graphics & Imaging** | `graphics`, `image_processing`, `colors` |
+| **Interop** | `ffi`, `polyglot`, `strings`, `array`, `map`, `ptr`, `units` |
+| **AI / ML** | `ai`, `provider_registry` (`ai_chat`, `ai_embed`, RAG helpers via `pblang-ai`) |
+| **Tooling** | `testing`, `benchmark`, `logger`, `assert`, `validate`, `template`, `regex`, `docs_generator`, `profiler`, `debugger` |
+| **Package Manager** | `registry`, `registry_server` |
+| **Compression** | `compression` (gzip, zstd, brotli) |
+| **Self-Hosting** | `compiler/tokenizer`, `compiler/parser`, `compiler/typeck`, `compiler/ir`, `compiler/optimizer`, `compiler/codegen`, `compiler/bootstrap` |
 
 ---
 
@@ -376,7 +394,7 @@ cargo test -- --nocapture
 4. Run: `cargo test && cargo clippy`
 5. Submit a pull request
 
-See [docs/Tasks.md](docs/Tasks.md) for the active backlog and [docs/CURRENT_STATUS.md](docs/CURRENT_STATUS.md) for project status.
+See [docs/Tasks.md](docs/Tasks.md) for the active backlog, [docs/CURRENT_STATUS.md](docs/CURRENT_STATUS.md) for project status, and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ---
 

@@ -2027,6 +2027,7 @@ fn cranelift_jit_fib_pass() {
         defaults: vec![],
         is_vararg: false,
         chunk,
+        param_types: None,
     };
     let mut cache = JitCache::new().expect("JitCache::new");
 
@@ -2175,6 +2176,21 @@ sapp_test!(
     memory_safety_builtins_pass,
     "memory_safety_builtins_test.sapp",
     "memory_safety_builtins_pass"
+);
+sapp_test!(
+    memory_stdlib_pass,
+    "memory_stdlib_test.sapp",
+    "memory_stdlib_pass"
+);
+sapp_test!(
+    thread_pool_module_pass,
+    "thread_pool_module_test.sapp",
+    "thread_pool_module_pass"
+);
+sapp_test!(
+    build_stdlib_pass,
+    "build_stdlib_test.sapp",
+    "build_stdlib_pass"
 );
 
 // ---- Thread safety & concurrency tests ----

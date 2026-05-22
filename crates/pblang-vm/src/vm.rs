@@ -289,6 +289,7 @@ fn spawn_function_to_wire(function: &Rc<Function>) -> Result<SpawnWireFunction, 
         instructions: function.chunk.instructions.clone(),
         spans: function.chunk.spans.clone(),
         constants,
+        param_types: function.param_types.clone(),
     })
 }
 
@@ -371,6 +372,7 @@ fn spawn_function_from_wire(
             source_name: None,
             source: None,
         },
+        param_types: f.param_types.clone(),
     }))
 }
 
@@ -771,6 +773,8 @@ impl StdlibConfig {
             | "str_pad_right"
             | "str_upper"
             | "str_lower"
+            | "str_join"
+            | "platform"
             | "array_unique"
             | "array_zip"
             | "array_chunk"
@@ -904,6 +908,8 @@ pub struct VM {
     ffi_policy: Option<FfiPolicy>,
     /// Memory safety tracker for Rust-like ownership and borrowing
     memory_tracker: MemoryTracker,
+    /// Maps raw Rc pointers of tracked arrays/maps to their MemoryId for mutation checks.
+    object_memory_map: RefCell<HashMap<usize, MemoryId>>,
     /// Concurrency primitives for thread-safe operations
     thread_pool: Option<ThreadPool>,
     /// Spawn/channel/sync handle tables (shared with child VMs from `spawn`).
@@ -925,6 +931,29 @@ struct GcMarks {
     maps: HashSet<usize>,
     modules: HashSet<usize>,
     closures: HashSet<usize>,
+}
+
+/// Get a raw pointer-based hash key for array/map Values to track in object_memory_map.
+fn object_addr(v: &Value) -> Option<usize> {
+    match v {
+        Value::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+        Value::Map(m) => Some(Rc::as_ptr(m) as usize),
+        _ => None,
+    }
+}
+
+/// Track an array/map value in the object_memory_map for mutation safety checks.
+fn register_object_memory(vm: &VM, value: &Value, memory_id: MemoryId) {
+    if let Some(addr) = object_addr(value) {
+        vm.object_memory_map.borrow_mut().insert(addr, memory_id);
+    }
+}
+
+/// Unregister an object from the memory map when deallocated.
+fn unregister_object_memory(vm: &VM, value: &Value) {
+    if let Some(addr) = object_addr(value) {
+        vm.object_memory_map.borrow_mut().remove(&addr);
+    }
 }
 
 impl VM {
@@ -5697,6 +5726,118 @@ except Exception as e:
             host.mem_stats()
         }
 
+        // ---- User-facing memory safety builtins (memory_ prefix) ----
+
+        /// memory_alloc(value, is_mutable?) → memory_id
+        fn memory_alloc_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            allocate_builtin(host, args)
+        }
+
+        /// memory_borrow(memory_id, type) → borrow_id
+        /// type: 0 = immutable, 1 = mutable
+        fn memory_borrow_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("memory_borrow(handle, type) expects 2 args".into()));
+            }
+            let handle = match &args[0] {
+                Value::Number(n) => *n,
+                _ => return Err(host.err("memory_borrow: handle must be a number".into())),
+            };
+            let borrow_type = match &args[1] {
+                Value::Number(n) => *n as i64,
+                _ => {
+                    return Err(
+                        host.err("memory_borrow: type must be 0 (immutable) or 1 (mutable)".into())
+                    )
+                }
+            };
+            match borrow_type {
+                0 => Ok(Value::Number(host.mem_borrow_immutable(handle)?)),
+                1 => Ok(Value::Number(host.mem_borrow_mutable(handle)?)),
+                _ => {
+                    Err(host.err("memory_borrow: type must be 0 (immutable) or 1 (mutable)".into()))
+                }
+            }
+        }
+
+        /// memory_release(memory_id, borrow_id?) → nil
+        /// Release a borrow by borrow_id, or release first borrow on memory_id.
+        fn memory_release_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.is_empty() {
+                return Err(host.err("memory_release(borrow_id) or memory_release(handle, type) expects at least 1 arg".into()));
+            }
+            if args.len() == 1 {
+                // Release by borrow_id
+                let borrow_id = match &args[0] {
+                    Value::Number(n) => *n,
+                    _ => return Err(host.err("memory_release: borrow_id must be a number".into())),
+                };
+                host.mem_release_borrow_id(borrow_id)?;
+            } else {
+                // Release by handle + type
+                let handle = match &args[0] {
+                    Value::Number(n) => *n,
+                    _ => return Err(host.err("memory_release: handle must be a number".into())),
+                };
+                let ty = match &args[1] {
+                    Value::Number(n) => *n as u8,
+                    _ => return Err(host.err("memory_release: type must be 0, 1, or 2".into())),
+                };
+                host.mem_release_borrow_type(handle, ty)?;
+            }
+            Ok(Value::Nil)
+        }
+
+        /// memory_get(memory_id) → value
+        fn memory_get_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handle = match args.first() {
+                Some(Value::Number(n)) => *n,
+                _ => return Err(host.err("memory_get(handle) expects a number".into())),
+            };
+            host.mem_load(handle)
+        }
+
+        /// memory_set(memory_id, value) → nil
+        fn memory_set_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() < 2 {
+                return Err(host.err("memory_set(handle, value) expects 2 args".into()));
+            }
+            let handle = match &args[0] {
+                Value::Number(n) => *n,
+                _ => return Err(host.err("memory_set: handle must be a number".into())),
+            };
+            host.mem_store(handle, args[1].clone())?;
+            Ok(Value::Nil)
+        }
+
+        /// memory_free(memory_id) → nil
+        fn memory_free_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            let handle = match args.first() {
+                Some(Value::Number(n)) => *n,
+                _ => return Err(host.err("memory_free(handle) expects a number".into())),
+            };
+            host.mem_deallocate(handle)?;
+            Ok(Value::Nil)
+        }
+
         // ---- Atomic i64 (Java AtomicInteger / Go atomic.Int64 / Rust AtomicI64) ----
 
         /// atomic_new(initial) — create an atomic integer.
@@ -5987,6 +6128,40 @@ except Exception as e:
                 .as_str()
                 .map_err(|m| host.err(format!("str_upper(): {m}")))?;
             Ok(alloc_string(s.to_uppercase()))
+        }
+
+        fn str_join_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if args.len() != 2 {
+                return Err(host.err(format!(
+                    "str_join() expects 2 arguments (array, separator), got {}",
+                    args.len()
+                )));
+            }
+            let arr = match &args[0] {
+                Value::Array(a) => a.borrow().clone(),
+                _ => return Err(host.err("str_join(): first argument must be an array".into())),
+            };
+            let sep = args[1]
+                .as_str()
+                .map_err(|m| host.err(format!("str_join(): {m}")))?;
+            let parts: Vec<String> = arr
+                .iter()
+                .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_default())
+                .collect();
+            Ok(alloc_string(parts.join(sep)))
+        }
+
+        fn platform_builtin(
+            host: &mut dyn VmHost,
+            args: Vec<Value>,
+        ) -> Result<Value, RuntimeError> {
+            if !args.is_empty() {
+                return Err(host.err("platform() takes no arguments".into()));
+            }
+            Ok(alloc_string(std::env::consts::OS.to_string()))
         }
 
         fn strfromcharcode_builtin(
@@ -9207,6 +9382,41 @@ except Exception as e:
                 fun: str_split,
             },
             BuiltinFn {
+                name: "str_join",
+                arity: Some(2),
+                fun: str_join_builtin,
+            },
+            BuiltinFn {
+                name: "str_upper",
+                arity: Some(1),
+                fun: str_upper_builtin,
+            },
+            BuiltinFn {
+                name: "str_lower",
+                arity: Some(1),
+                fun: str_lower_builtin,
+            },
+            BuiltinFn {
+                name: "str_slice",
+                arity: Some(3),
+                fun: str_slice_builtin,
+            },
+            BuiltinFn {
+                name: "str_index_of",
+                arity: Some(2),
+                fun: str_index_of_builtin,
+            },
+            BuiltinFn {
+                name: "str_ends_with",
+                arity: Some(2),
+                fun: str_ends_with_builtin,
+            },
+            BuiltinFn {
+                name: "platform",
+                arity: Some(0),
+                fun: platform_builtin,
+            },
+            BuiltinFn {
                 name: "cwd",
                 arity: Some(0),
                 fun: cwd,
@@ -9598,6 +9808,36 @@ except Exception as e:
                 name: "memory_stats",
                 arity: Some(0),
                 fun: memory_stats_builtin,
+            },
+            BuiltinFn {
+                name: "memory_alloc",
+                arity: None,
+                fun: memory_alloc_builtin,
+            },
+            BuiltinFn {
+                name: "memory_borrow",
+                arity: Some(2),
+                fun: memory_borrow_builtin,
+            },
+            BuiltinFn {
+                name: "memory_release",
+                arity: None,
+                fun: memory_release_builtin,
+            },
+            BuiltinFn {
+                name: "memory_get",
+                arity: Some(1),
+                fun: memory_get_builtin,
+            },
+            BuiltinFn {
+                name: "memory_set",
+                arity: Some(2),
+                fun: memory_set_builtin,
+            },
+            BuiltinFn {
+                name: "memory_free",
+                arity: Some(1),
+                fun: memory_free_builtin,
             },
             // ---- Atomic i64 (Java AtomicInteger / Go atomic.Int64 / Rust AtomicI64) ----
             BuiltinFn {
@@ -10242,6 +10482,7 @@ except Exception as e:
             limits,
             ffi_policy,
             memory_tracker: MemoryTracker::new(),
+            object_memory_map: RefCell::new(HashMap::new()),
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
             stdin_lines: std::collections::VecDeque::new(),
@@ -10293,6 +10534,7 @@ impl VM {
             limits: None,
             ffi_policy: None,
             memory_tracker: MemoryTracker::new(),
+            object_memory_map: RefCell::new(HashMap::new()),
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
             stdin_lines: std::collections::VecDeque::new(),
@@ -10323,6 +10565,7 @@ impl VM {
             handlers: vec![],
             stdlib_config: Some(config),
             memory_tracker: MemoryTracker::new(),
+            object_memory_map: RefCell::new(HashMap::new()),
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
             limits: None,
@@ -10383,6 +10626,7 @@ impl VM {
             min_arity: 0,
             defaults: vec![],
             is_vararg: false,
+            param_types: None,
             chunk,
         });
 
@@ -10457,6 +10701,22 @@ impl VM {
                         let b = self.pop_number()?;
                         let a = self.pop_number()?;
                         self.stack.push(Value::Number(a / b));
+                    }
+
+                    // ---- extended arithmetic ----
+                    OpCode::OpNegate => {
+                        let a = self.pop_number()?;
+                        self.stack.push(Value::Number(-a));
+                    }
+                    OpCode::OpMod => {
+                        let b = self.pop_number()?;
+                        let a = self.pop_number()?;
+                        self.stack.push(Value::Number(a % b));
+                    }
+                    OpCode::OpPow => {
+                        let b = self.pop_number()?;
+                        let a = self.pop_number()?;
+                        self.stack.push(Value::Number(a.powf(b)));
                     }
 
                     // ---- logic ----
@@ -10800,6 +11060,17 @@ impl VM {
 
                         match obj {
                             Value::Map(m) => {
+                                // Check memory safety: refuse mutation if map is tracked and borrowed.
+                                if let Some(&mid) = self
+                                    .object_memory_map
+                                    .borrow()
+                                    .get(&(Rc::as_ptr(&m) as usize))
+                                {
+                                    if let Err(e) = self.memory_tracker.check_mutable_allowed(mid) {
+                                        return Err(self
+                                            .make_err(format!("Memory safety violation: {}", e)));
+                                    }
+                                }
                                 // Check freeze guard
                                 if matches!(m.borrow().get("__frozen"), Some(Value::Bool(true))) {
                                     return Err(self.err(format!(
@@ -10896,6 +11167,16 @@ impl VM {
                         let value = self.pop()?;
                         let index = self.pop()?;
                         let obj = self.pop()?;
+                        // Check memory safety before mutation.
+                        if let Some(addr) = object_addr(&obj) {
+                            if let Some(&mid) = self.object_memory_map.borrow().get(&addr) {
+                                if let Err(e) = self.memory_tracker.check_mutable_allowed(mid) {
+                                    return Err(
+                                        self.make_err(format!("Memory safety violation: {}", e))
+                                    );
+                                }
+                            }
+                        }
                         match obj {
                             Value::Array(a) => {
                                 let i = match index {
@@ -11409,7 +11690,9 @@ fn borrow_type_from_code(
 
 impl VM {
     fn mem_allocate_impl(&mut self, value: Value, is_mutable: bool) -> Result<f64, RuntimeError> {
-        let id = self.memory_tracker.allocate(value, is_mutable);
+        let id = self.memory_tracker.allocate(value.clone(), is_mutable);
+        // Track array/map objects for mutation safety checks in bytecode.
+        register_object_memory(self, &value, id);
         Ok(id.0 as f64)
     }
 
@@ -11467,6 +11750,12 @@ impl VM {
 
     fn mem_store_impl(&mut self, handle: f64, value: Value) -> Result<(), RuntimeError> {
         let mid = memory_handle_from_f64(self, handle, "store")?;
+        // Unregister old object mapping if it was an array/map.
+        if let Ok(old_val) = self.memory_tracker.get(mid) {
+            unregister_object_memory(self, &old_val);
+        }
+        // Register new object mapping for the replacement value.
+        register_object_memory(self, &value, mid);
         self.memory_tracker
             .set(mid, value)
             .map_err(|e| memory_safety_err(self, e))
@@ -11474,6 +11763,10 @@ impl VM {
 
     fn mem_deallocate_impl(&mut self, handle: f64) -> Result<(), RuntimeError> {
         let mid = memory_handle_from_f64(self, handle, "deallocate")?;
+        // Unregister object mapping before deallocation.
+        if let Ok(old_val) = self.memory_tracker.get(mid) {
+            unregister_object_memory(self, &old_val);
+        }
         self.memory_tracker
             .deallocate(mid)
             .map_err(|e| memory_safety_err(self, e))

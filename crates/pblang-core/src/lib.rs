@@ -233,7 +233,12 @@ pub enum StmtKind {
 ///  - Nested block comments `/* /* … */ */`
 ///  - Single-quoted and double-quoted strings (escape sequences aware)
 ///  - Newline preservation (so line-number spans remain stable)
-fn strip_comments_mask(src: &str) -> String {
+/// Replace every comment byte with a space while leaving string literals,
+/// newlines, and all other byte offsets untouched. Used by the CLI and the
+/// parser front-end so spans computed against the masked source still line up
+/// with the original text. Handles `//` line comments and nested `/* */`
+/// block comments.
+pub fn strip_comments_mask(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec(); // same length as input (byte offsets preserved)
     let mut i = 0usize;

@@ -5,7 +5,7 @@
 The core VM, package manager, and CLI are production-quality. The type system and
 native executable bundler are in early stages.
 
-**Current test status**: semantics suite green except known ignored parser/thread/env cases (see `docs/CURRENT_STATUS.md` for latest exact counts).
+**Current test status**: semantics suite **160 passed, 2 ignored** (see `docs/CURRENT_STATUS.md` for details).
 
 ---
 
