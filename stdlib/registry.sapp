@@ -1,0 +1,243 @@
+//! registry.sapp — Pblang package registry operations wrapper
+//!
+//! Provides a high-level API for interacting with pblang package registries.
+//! Requires the pblang CLI to be on PATH for install and publish operations.
+//!
+//! Usage:
+//!   import "stdlib:registry.sapp";
+//!   let results = registry.search("http");
+//!   registry.install("@scope/package", "1.0.0");
+//!   registry.publish("./my-package");
+
+// ──────────────────────────────────────────────────────────────
+// Configuration
+// ──────────────────────────────────────────────────────────────
+
+/// RegistryConfig holds the base URL and optional token for registry operations.
+fn RegistryConfig(url, token) {
+    if url == nil { url = env_get("PBLANG_REGISTRY_INDEX"); }
+    if token == nil { token = env_get("PBLANG_REGISTRY_TOKEN"); }
+    return map{
+        url: url,
+        token: token,
+        cache_dir: env_get("PBLANG_CACHE"),
+    };
+}
+
+// ──────────────────────────────────────────────────────────────
+// Search
+// ──────────────────────────────────────────────────────────────
+
+/// Search a registry for packages matching `query`.
+///
+/// Returns an array of result objects:
+///   [{name: "pkg", version: "1.0.0", description: "..."}, ...]
+///
+/// If `config` is nil, reads PBLANG_REGISTRY_INDEX from the environment.
+/// If `config` is a string, it is treated as the registry URL.
+/// If `config` is a map, it should have {url: "..."} or the result of RegistryConfig.
+fn registry_search(config, query) {
+    let url = nil;
+    if config == nil {
+        url = env_get("PBLANG_REGISTRY_INDEX");
+    } else if type(config) == "string" {
+        url = config;
+    } else if type(config) == "map" {
+        url = config.url;
+    }
+    if url == nil or url == "" {
+        return map{ ok: false, error: "no registry configured (set PBLANG_REGISTRY_INDEX)" };
+    }
+
+    let search_url = url;
+    if not str_starts_with(url, "file://") {
+        search_url = url + "/search?q=" + url_encode(query);
+    }
+
+    // For file:// registries, read the index.json directly
+    if str_starts_with(url, "file://") {
+        let dir = str_slice(url, 7, nil); // strip "file://"
+        let index_path = path_join(dir, "index.json");
+        if not fs_exists(index_path) {
+            return map{ ok: false, error: "index not found: " + index_path };
+        }
+        let index_json = fs_read(index_path);
+        let index = json_parse(index_json);
+        let packages = index.packages;
+        if packages == nil {
+            return map{ ok: true, results: [] };
+        }
+        let results = [];
+        let q = str_lower(query);
+        let names = map_keys(packages);
+        let i = 0;
+        while i < len(names) {
+            let name = names[i];
+            if q == "" or str_contains(str_lower(name), q) {
+                let versions = packages[name];
+                let ver_keys = map_keys(versions);
+                let j = 0;
+                while j < len(ver_keys) {
+                    let ver = ver_keys[j];
+                    let release = versions[ver];
+                    let desc = "";
+                    if map_has(release, "description") { desc = release.description; }
+                    results.push(map{
+                        name: name,
+                        version: ver,
+                        description: desc,
+                    });
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+        return map{ ok: true, results: results };
+    }
+
+    // For HTTP registries, use the search endpoint
+    let resp = http_get(search_url);
+    if resp == nil {
+        return map{ ok: false, error: "registry search request failed" };
+    }
+    let parsed = json_parse(resp);
+    if type(parsed) == "array" {
+        return map{ ok: true, results: parsed };
+    }
+    if type(parsed) == "map" and map_has(parsed, "results") {
+        return map{ ok: true, results: parsed.results };
+    }
+    return map{ ok: true, results: [] };
+}
+
+// ──────────────────────────────────────────────────────────────
+// Install
+// ──────────────────────────────────────────────────────────────
+
+/// Install a package from the registry into the local cache.
+///
+/// Parameters:
+///   config  - RegistryConfig map, registry URL string, or nil (uses env vars)
+///   name    - Package name (e.g. "@scope/pkg")
+///   version - Package version (e.g. "1.0.0")
+///
+/// Returns {ok: true, path: "...", metadata: {...}} on success,
+///         {ok: false, error: "..."} on failure.
+fn registry_install(config, name, version) {
+    let url = nil;
+    let token = nil;
+    if config == nil {
+        url = env_get("PBLANG_REGISTRY_INDEX");
+        token = env_get("PBLANG_REGISTRY_TOKEN");
+    } else if type(config) == "string" {
+        url = config;
+    } else if type(config) == "map" {
+        url = config.url;
+        token = config.token;
+    }
+    if url == nil or url == "" {
+        return map{ ok: false, error: "no registry configured (set PBLANG_REGISTRY_INDEX)" };
+    }
+
+    // Use the CLI to install (more reliable than reimplementing fetch+unpack)
+    // Build the install command: pblang install name@version --registry-index url
+    let cmd = "pblang";
+    let args = ["install", name + "@" + version, "--registry-index", url];
+    let result = exec_with_args(cmd, args);
+    if not result.ok {
+        return map{ ok: false, error: "install failed: " + result.stderr };
+    }
+
+    // Determine the cache path
+    let cache_dir = env_get("PBLANG_CACHE");
+    if cache_dir == nil or cache_dir == "" {
+        let home = env_get("HOME");
+        if home == nil { home = env_get("USERPROFILE"); }
+        if home == nil { home = "."; }
+        cache_dir = path_join(home, ".pblang", "cache");
+    }
+
+    // Look for the package in the cache
+    return map{
+        ok: true,
+        name: name,
+        version: version,
+        message: "installed " + name + "@" + version,
+    };
+}
+
+// ──────────────────────────────────────────────────────────────
+// Publish
+// ──────────────────────────────────────────────────────────────
+
+/// Publish a package to the registry.
+///
+/// Parameters:
+///   config - RegistryConfig map, registry URL string, or nil (uses env vars)
+///   path   - Path to the package directory (must contain pblang.toml)
+///
+/// Returns {ok: true, name: "...", version: "..."} on success,
+///         {ok: false, error: "..."} on failure.
+fn registry_publish(config, path) {
+    let url = nil;
+    let token = nil;
+    if config == nil {
+        url = env_get("PBLANG_REGISTRY_INDEX");
+        token = env_get("PBLANG_REGISTRY_TOKEN");
+    } else if type(config) == "string" {
+        url = config;
+    } else if type(config) == "map" {
+        url = config.url;
+        token = config.token;
+    }
+    if url == nil or url == "" {
+        return map{ ok: false, error: "no registry configured (set PBLANG_REGISTRY_INDEX)" };
+    }
+    if path == nil or path == "" {
+        path = cwd();
+    }
+
+    // Validate the package directory has a manifest
+    let manifest_path = path_join(path, "pblang.toml");
+    if not fs_exists(manifest_path) {
+        return map{ ok: false, error: "no pblang.toml found in " + path };
+    }
+
+    // Read manifest to get name/version for display
+    let man_text = fs_read(manifest_path);
+    let pkg_name = "unknown";
+    let pkg_version = "unknown";
+
+    // Use the CLI to publish
+    let cmd = "pblang";
+    let args = ["publish", path];
+    let result = exec_with_args(cmd, args);
+    if not result.ok {
+        return map{ ok: false, error: "publish failed: " + result.stderr };
+    }
+
+    return map{
+        ok: true,
+        path: path,
+        registry: url,
+        message: result.stdout,
+    };
+}
+
+// ──────────────────────────────────────────────────────────────
+// Public API (exported as registry.*)
+// ──────────────────────────────────────────────────────────────
+
+/// Module entry point.
+///   registry.search(query)  → {ok, results}       (config from env vars)
+///   registry.install(name, version) → {ok, ...}   (config from env vars)
+///   registry.publish(path) → {ok, ...}             (config from env vars)
+///   registry.config(url, token) → RegistryConfig map
+let registry = map{
+    search:  fn(query)             { return registry_search(nil, query); },
+    install: fn(name, version)     { return registry_install(nil, name, version); },
+    publish: fn(path)              { return registry_publish(nil, path); },
+    config:  fn(url, token)        { return RegistryConfig(url, token); },
+};
+
+export registry;

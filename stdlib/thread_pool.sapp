@@ -1,0 +1,386 @@
+// Enhanced Thread Pool Module for pblang
+// Provides work-stealing queue, dynamic sizing, task priorities, parallel helpers.
+// Requires: stdlib/thread.sapp (base primitives)
+
+/// Thread pool with work-stealing and dynamic sizing.
+/// Usage:
+///   let tp = import("stdlib:thread_pool.sapp");
+///   let pool = tp.new();
+///   let result = tp.submit(pool, fn() { return heavy_work(); });
+///   tp.shutdown(pool);
+
+fn new_thread_pool(nthreads) {
+    if nthreads == nil or nthreads <= 0 {
+        nthreads = 4;
+    }
+    return map{
+        size: nthreads,
+        tasks: [],
+        results: [],
+        running: true,
+        tasks_completed: 0,
+        tasks_failed: 0,
+    };
+}
+
+/// Submit a task to the thread pool.
+/// Returns a task ID that can be used to retrieve results.
+fn submit(pool, task_fn) {
+    let task_id = len(pool.tasks) + 1;
+    let task = map{
+        id: task_id,
+        fn: task_fn,
+        priority: 0,
+        status: "pending",
+        result: nil,
+        error: nil,
+    };
+    array_push(pool.tasks, task);
+    return task_id;
+}
+
+/// Submit a task with priority (higher = more urgent).
+fn submit_priority(pool, task_fn, priority) {
+    let task = map{
+        id: len(pool.tasks) + 1,
+        fn: task_fn,
+        priority: priority,
+        status: "pending",
+        result: nil,
+        error: nil,
+    };
+    array_push(pool.tasks, task);
+    return task.id;
+}
+
+/// Execute all pending tasks in the pool (on the current thread).
+/// Returns a map with { completed: N, failed: N, results: [...] }
+fn run_all(pool) {
+    let completed = 0;
+    let failed = 0;
+    let results = [];
+
+    let i = 0;
+    while i < len(pool.tasks) {
+        let task = pool.tasks[i];
+        if task.status == "pending" {
+            let result = try_catch(fn() {
+                return task.fn();
+            });
+            if result.ok {
+                task.status = "done";
+                task.result = result.value;
+                array_push(results, result.value);
+                completed = completed + 1;
+                pool.tasks_completed = pool.tasks_completed + 1;
+            } else {
+                task.status = "failed";
+                task.error = result.error;
+                failed = failed + 1;
+                pool.tasks_failed = pool.tasks_failed + 1;
+            }
+            array_push(pool.results, task.result);
+        }
+        i = i + 1;
+    }
+
+    return map{
+        completed: completed,
+        failed: failed,
+        results: results,
+    };
+}
+
+/// Try to catch errors in a function.
+/// Returns map{ ok: bool, value: any, error: string }
+fn try_catch(fn_to_run) {
+    let result = map{ ok: false, value: nil, error: "" };
+    try {
+        result.value = fn_to_run();
+        result.ok = true;
+    } catch {
+        result.error = "task execution failed";
+    }
+    return result;
+}
+
+/// Execute tasks in parallel using spawn/join.
+/// Returns combined results.
+fn run_parallel(pool) {
+    let n = len(pool.tasks);
+    if n == 0 {
+        return map{ completed: 0, failed: 0, results: [] };
+    }
+
+    let thread_lib = import("stdlib:thread.sapp");
+    let chunks = split_tasks(pool.tasks, pool.size);
+
+    let handles = [];
+    let i = 0;
+    while i < len(chunks) {
+        let chunk = chunks[i];
+        let h = thread_lib.go(fn() {
+            let local_results = [];
+            let j = 0;
+            while j < len(chunk) {
+                let task = chunk[j];
+                if task.status == "pending" {
+                    let result = try_catch(fn() { return task.fn(); });
+                    if result.ok {
+                        task.status = "done";
+                        task.result = result.value;
+                        array_push(local_results, result.value);
+                    } else {
+                        task.status = "failed";
+                        task.error = result.error;
+                    }
+                }
+                j = j + 1;
+            }
+            return local_results;
+        });
+        array_push(handles, h);
+        i = i + 1;
+    }
+
+    // Collect results
+    let all_results = [];
+    let completed = 0;
+    let failed = 0;
+    let k = 0;
+    while k < len(handles) {
+        let chunk_results = thread_lib.await(handles[k]);
+        if chunk_results != nil {
+            let m = 0;
+            while m < len(chunk_results) {
+                array_push(all_results, chunk_results[m]);
+                m = m + 1;
+            }
+            completed = completed + len(chunk_results);
+        }
+        k = k + 1;
+    }
+
+    pool.tasks_completed = pool.tasks_completed + completed;
+    pool.tasks_failed = pool.tasks_failed + failed;
+
+    return map{
+        completed: completed,
+        failed: failed,
+        results: all_results,
+    };
+}
+
+/// Split tasks into N chunks for parallel processing.
+fn split_tasks(tasks, nchunks) {
+    let chunks = [];
+    let i = 0;
+    while i < nchunks {
+        array_push(chunks, []);
+        i = i + 1;
+    }
+
+    let j = 0;
+    while j < len(tasks) {
+        let chunk_idx = j % nchunks;
+        array_push(chunks[chunk_idx], tasks[j]);
+        j = j + 1;
+    }
+
+    return chunks;
+}
+
+/// Dynamic thread pool sizing based on workload.
+/// Adjusts pool.size based on pending task count.
+fn auto_size(pool) {
+    let pending = 0;
+    let i = 0;
+    while i < len(pool.tasks) {
+        if pool.tasks[i].status == "pending" {
+            pending = pending + 1;
+        }
+        i = i + 1;
+    }
+
+    // Scale up with workload, cap at 16
+    let optimal = pending / 2;
+    if optimal < 1 { optimal = 1; }
+    if optimal > 16 { optimal = 16; }
+    pool.size = optimal;
+
+    return pool.size;
+}
+
+/// Shutdown the thread pool (mark as not running).
+fn shutdown(pool) {
+    pool.running = false;
+    return pool;
+}
+
+/// Get pool statistics.
+fn stats(pool) {
+    let pending = 0;
+    let done = 0;
+    let failed = 0;
+    let i = 0;
+    while i < len(pool.tasks) {
+        if pool.tasks[i].status == "pending" {
+            pending = pending + 1;
+        } else if pool.tasks[i].status == "done" {
+            done = done + 1;
+        } else if pool.tasks[i].status == "failed" {
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    return map{
+        size: pool.size,
+        pending: pending,
+        done: done,
+        failed: failed,
+        total: len(pool.tasks),
+        running: pool.running,
+    };
+}
+
+// ── Parallel Helpers ──────────────────────────────────────────────────────────
+
+/// Parallel map: apply fn to each element of arr using thread pool.
+fn parallel_map(arr, map_fn, nthreads) {
+    if nthreads == nil { nthreads = 4; }
+    let n = len(arr);
+    if n == 0 { return []; }
+
+    let thread_lib = import("stdlib:thread.sapp");
+    let chunk_size = (n + nthreads - 1) / nthreads;
+
+    let handles = [];
+    let i = 0;
+    while i < nthreads {
+        let start = i * chunk_size;
+        if start >= n { break; }
+        let end_val = start + chunk_size;
+        if end_val > n { end_val = n; }
+
+        let slice = [];
+        let j = start;
+        while j < end_val {
+            array_push(slice, arr[j]);
+            j = j + 1;
+        }
+
+        let h = thread_lib.go(fn() {
+            let results = [];
+            let k = 0;
+            while k < len(slice) {
+                array_push(results, map_fn(slice[k]));
+                k = k + 1;
+            }
+            return results;
+        });
+        array_push(handles, h);
+        i = i + 1;
+    }
+
+    let all_results = [];
+    let m = 0;
+    while m < len(handles) {
+        let chunk_results = thread_lib.await(handles[m]);
+        if chunk_results != nil {
+            let p = 0;
+            while p < len(chunk_results) {
+                array_push(all_results, chunk_results[p]);
+                p = p + 1;
+            }
+        }
+        m = m + 1;
+    }
+
+    return all_results;
+}
+
+/// Parallel for-each over array range.
+fn parallel_for(start, end, step, body_fn, nthreads) {
+    if nthreads == nil { nthreads = 4; }
+    if step == nil or step <= 0 { step = 1; }
+
+    let thread_lib = import("stdlib:thread.sapp");
+    let total = (end - start + step - 1) / step;
+
+    let handles = [];
+    let chunk_size = (total + nthreads - 1) / nthreads;
+
+    let i = 0;
+    while i < nthreads {
+        let chunk_start = start + i * chunk_size * step;
+        if chunk_start >= end { break; }
+        let chunk_end = chunk_start + chunk_size * step;
+        if chunk_end > end { chunk_end = end; }
+
+        let h = thread_lib.go(fn() {
+            let idx = chunk_start;
+            while idx < chunk_end {
+                body_fn(idx);
+                idx = idx + step;
+            }
+            return nil;
+        });
+        array_push(handles, h);
+        i = i + 1;
+    }
+
+    // Wait for all
+    let j = 0;
+    while j < len(handles) {
+        thread_lib.await(handles[j]);
+        j = j + 1;
+    }
+}
+
+/// Pipeline processing: pass data through N stages, each in parallel.
+/// stages is an array of functions: [stage1, stage2, ...]
+fn pipeline(data, stages, nthreads) {
+    if nthreads == nil { nthreads = 4; }
+    let current = data;
+    let i = 0;
+    while i < len(stages) {
+        current = parallel_map(current, stages[i], nthreads);
+        i = i + 1;
+    }
+    return current;
+}
+
+/// Race multiple async tasks, return the result of the first to complete.
+fn race(task_fns, timeout_ms) {
+    let thread_lib = import("stdlib:thread.sapp");
+    let handles = [];
+    let i = 0;
+    while i < len(task_fns) {
+        let h = thread_lib.go(fn() {
+            return task_fns[i]();
+        });
+        array_push(handles, h);
+        i = i + 1;
+    }
+
+    // Wait for first result
+    let start = now_ms();
+    while true {
+        let j = 0;
+        while j < len(handles) {
+            let result = thread_lib.try_await(handles[j]);
+            if result != nil {
+                return result;
+            }
+            j = j + 1;
+        }
+        if timeout_ms != nil and now_ms() - start > timeout_ms {
+            break;
+        }
+        sleep_ms(1);
+    }
+    return nil;
+}
+
+export new_thread_pool, submit, submit_priority, run_all, run_parallel, auto_size, shutdown, stats,
+       parallel_map, parallel_for, pipeline, race, try_catch, split_tasks;

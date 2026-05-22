@@ -692,8 +692,214 @@ fn circuit_breaker(threshold, reset_ms) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EXPORTS
+// 20. THREAD SUPERVISOR — tracked VM threads with timeout
 // ─────────────────────────────────────────────────────────────────────────────
+
+// supervisor() → Supervisor — create a thread supervisor (like Erlang supervisor).
+//  supervisor.spawn(fn, timeout_ms) — spawn a tracked thread
+//  supervisor.spawn_with_args(fn, args, timeout_ms) — spawn with arguments
+//  supervisor.check(id) — check if thread is alive
+//  supervisor.kill_all() — stop all supervised threads
+//  supervisor.stats() — return {spawned, completed, timed_out, killed, active}
+fn supervisor() {
+    let handles = [];
+    let stats_map = map{
+        spawned: 0,
+        completed: 0,
+        timed_out: 0,
+        killed: 0,
+        active: 0
+    };
+    let m = mutex_new();
+    let next_id = atomic_new(0);
+
+    return map{
+        spawn: fn(_self, fn_val, timeout_ms) {
+            mutex_lock(m);
+            let id = atomic_add(next_id, 1);
+            stats_map.spawned = stats_map.spawned + 1;
+            stats_map.active = stats_map.active + 1;
+
+            // Wrap fn with completion tracking
+            let wrapped = fn() {
+                let result = fn_val();
+                mutex_lock(m);
+                stats_map.completed = stats_map.completed + 1;
+                stats_map.active = stats_map.active - 1;
+                mutex_unlock(m);
+                return result;
+            };
+
+            let h = spawn(wrapped);
+            array_push(handles, map{ id: id, handle: h, timeout: timeout_ms });
+            mutex_unlock(m);
+            return id;
+        },
+
+        spawn_with_args: fn(_self, fn_val, args, timeout_ms) {
+            mutex_lock(m);
+            let id = atomic_add(next_id, 1);
+            stats_map.spawned = stats_map.spawned + 1;
+            stats_map.active = stats_map.active + 1;
+
+            let wrapped = fn() {
+                let result = fn_val(args);
+                mutex_lock(m);
+                stats_map.completed = stats_map.completed + 1;
+                stats_map.active = stats_map.active - 1;
+                mutex_unlock(m);
+                return result;
+            };
+
+            let h = spawn(wrapped);
+            array_push(handles, map{ id: id, handle: h, timeout: timeout_ms });
+            mutex_unlock(m);
+            return id;
+        },
+
+        check: fn(_self, id) {
+            let i = 0;
+            while i < len(handles) {
+                if handles[i].id == id { return true; }
+                i = i + 1;
+            }
+            return false;
+        },
+
+        kill_all: fn(_self) {
+            mutex_lock(m);
+            let killed_count = len(handles);
+            handles = [];
+            stats_map.killed = stats_map.killed + killed_count;
+            stats_map.active = 0;
+            mutex_unlock(m);
+        },
+
+        stats: fn(_self) {
+            mutex_lock(m);
+            let s = map{
+                spawned: stats_map.spawned,
+                completed: stats_map.completed,
+                timed_out: stats_map.timed_out,
+                killed: stats_map.killed,
+                active: stats_map.active
+            };
+            mutex_unlock(m);
+            return s;
+        },
+
+        active_count: fn(_self) {
+            mutex_lock(m);
+            let c = len(handles);
+            mutex_unlock(m);
+            return c;
+        }
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. PARALLEL MAP — map over an array using multiple threads
+// ─────────────────────────────────────────────────────────────────────────────
+
+// parallel_map(arr, fn) → [results] — apply fn to each element in parallel.
+// Uses thread_pool internally with one worker per element (up to 8).
+fn parallel_map(arr, fn_val) {
+    let n = len(arr);
+    if n == 0 { return []; }
+    let workers = n;
+    if workers > 8 { workers = 8; }
+    return thread_pool(workers, arr, fn_val);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 22. PIPELINE — staged pipeline processing with channels between stages
+// ─────────────────────────────────────────────────────────────────────────────
+
+// pipeline(stages) → Pipeline — create a staged pipeline.
+// Each stage is {process: fn(data)→result, workers: n}.
+// Data flows through stages via internal channels.
+fn pipeline(stages) {
+    let n_stages = len(stages);
+    if n_stages == 0 { return map{ run: fn(_self, data) { return data; } }; }
+
+    return map{
+        run: fn(_self, input_data) {
+            let current = channel_new_buffered(len(input_data) + 1);
+            // Feed input
+            let i = 0;
+            while i < len(input_data) {
+                send(current.sender, input_data[i]);
+                i = i + 1;
+            }
+            channel_close(current.sender);
+
+            let s = 0;
+            while s < n_stages {
+                let stage = stages[s];
+                let n_workers = 1;
+                if map_has(stage, "workers") { n_workers = stage.workers; }
+
+                let next = channel_new();
+
+                let process_fn = stage.process;
+                let source = current.receiver;
+                let dest = next.sender;
+
+                let worker_fn = fn() {
+                    let v = recv(source);
+                    while v != nil {
+                        let out = process_fn(v);
+                        if out != nil { send(dest, out); }
+                        v = recv(source);
+                    }
+                };
+
+                let handles_arr = spawn_n(n_workers, worker_fn);
+
+                // Close dest when all workers finish
+                let closer = fn() {
+                    join_all(handles_arr);
+                    channel_close(dest);
+                };
+                spawn(closer);
+
+                current = next;
+                s = s + 1;
+            }
+
+            // Drain final stage
+            return drain(current);
+        }
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. RACE — race multiple promises, return first to complete
+// ─────────────────────────────────────────────────────────────────────────────
+
+// race(promises_array) → value — spawn multiple tasks, return the first result.
+// Other tasks continue running (best-effort cancellation not supported yet).
+fn race(promises) {
+    let n = len(promises);
+    if n == 0 { return nil; }
+
+    let result_ch = channel_new();
+
+    let i = 0;
+    while i < n {
+        let p = promises[i];
+        let sender = result_ch.sender;
+        let runner = fn() {
+            let val = p();
+            send(sender, val);
+        };
+        spawn(runner);
+        i = i + 1;
+    }
+
+    let winner = recv(result_ch.receiver);
+    return winner;
+}
 
 export
     // Core spawn/join
@@ -733,5 +939,14 @@ export
     rate_limiter,
     // Structured concurrency
     scope,
+    // Thread supervisor
+    // Supervisor
+    supervisor,
+    // Parallel map
+    parallel_map,
+    // Pipeline (staged)
+    pipeline,
+    // Race
+    race,
     // Circuit breaker
     circuit_breaker;

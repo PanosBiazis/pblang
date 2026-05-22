@@ -793,3 +793,79 @@ impl TranspileCtx {
         out
     }
 }
+
+
+/// Transpile pblang source code string directly to self-contained C.
+///
+/// This is a convenience wrapper around parse + transpile.
+/// The generated C includes the embedded pblang runtime header.
+pub fn transpile_to_c(pblang_source: &str) -> Result<TranspileOutput, String> {
+    let stmts = pblang_core::parse_strict(pblang_source)
+        .map_err(|errs| format!("parse errors: {:?}", errs))?;
+    let opts = TranspileOptions {
+        embed_runtime: true,
+        source_maps: false,
+        opt_level: 2,
+    };
+    Ok(transpile(stmts, &opts))
+}
+
+/// Compile C source code to a native executable using the system C compiler.
+///
+/// Returns `Ok(())` on success, or `Err(message)` on failure.
+/// The output executable name is platform-appropriate (appends .exe on Windows).
+pub fn compile_from_c(c_source: &str, output_name: &str) -> Result<(), String> {
+    // Write C source to a temp file
+    let c_path = std::path::PathBuf::from(format!("{output_name}.c"));
+    std::fs::write(&c_path, c_source)
+        .map_err(|e| format!("write C source '{cpath}': {e}", cpath = c_path.display()))?;
+
+    // Find a C compiler
+    let cc = find_ctranspiler_cc()?;
+
+    let exe_name = if cfg!(target_os = "windows") {
+        format!("{output_name}.exe")
+    } else {
+        output_name.to_string()
+    };
+
+    let status = std::process::Command::new(&cc)
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&exe_name)
+        .arg("-O2")
+        .arg("-std=c99")
+        .arg("-lm")
+        .status()
+        .map_err(|e| format!("run C compiler '{cc}': {e}"))?;
+
+    // Clean up the .c file on success
+    if status.success() {
+        let _ = std::fs::remove_file(&c_path);
+        Ok(())
+    } else {
+        Err(format!("C compiler '{cc}' failed with exit code: {status}"))
+    }
+}
+
+/// Find an available C compiler for the transpiler.
+fn find_ctranspiler_cc() -> Result<String, String> {
+    for cc in &["gcc", "clang", "cc"] {
+        if std::process::Command::new(cc)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return Ok(cc.to_string());
+        }
+    }
+    Err("no C compiler found (tried gcc, clang, cc)".to_string())
+}
+
+/// Check if C compilation is available on this system.
+pub fn is_c_compiler_available() -> bool {
+    find_ctranspiler_cc().is_ok()
+}
+

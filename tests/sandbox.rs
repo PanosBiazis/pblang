@@ -65,8 +65,9 @@ fn proc_spawn_wait_sandbox_denied() {
     let result = run_with_config(config, r#"proc_spawn_wait("echo", []);"#);
     let err = result.expect_err("expected runtime error when exec is disabled");
     assert!(
-        err.message.contains("allow_exec") || err.message.contains("exec access denied"),
-        "expected allow_exec or exec access denied, got: {}",
+        err.message.contains("proc_spawn_wait access denied")
+            || err.message.contains("exec access denied"),
+        "expected exec-gated access denied, got: {}",
         err.message
     );
 }

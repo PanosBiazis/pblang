@@ -1,4 +1,5 @@
-//! pblang Language Server (tower-lsp): parse + typecheck diagnostics, hover, goto-def, completions.
+//! pblang Language Server (tower-lsp): parse + typecheck diagnostics, hover, goto-def,
+//! completions, document symbols, workspace symbols, and code actions.
 
 use chumsky::error::SimpleReason;
 use chumsky::prelude::Simple;
@@ -220,6 +221,164 @@ fn word_at_position(src: &str, pos: Position) -> Option<String> {
     }
 }
 
+/// Try to find the string literal at the given position (for import paths).
+fn string_at_position(src: &str, pos: Position) -> Option<String> {
+    let line = line_at(src, pos.line as usize)?;
+    let byte = utf16_col_to_byte(line, pos.character).min(line.len());
+
+    // Search left for opening quote
+    let mut start = byte;
+    let mut found_quote = false;
+    while start > 0 {
+        start -= 1;
+        if let Some(ch) = char_at(line, start) {
+            if ch == '"' || ch == '\'' {
+                found_quote = true;
+                break;
+            }
+        }
+    }
+    if !found_quote {
+        return None;
+    }
+
+    // Search right for closing quote
+    let mut end = start + 1;
+    while end < line.len() {
+        if let Some(ch) = char_at(line, end) {
+            if ch == '"' || ch == '\'' {
+                return Some(line[start + 1..end].to_string());
+            }
+        }
+        end += 1;
+    }
+    None
+}
+
+/// Map of known stdlib module paths to the functions they export.
+fn stdlib_exports() -> HashMap<&'static str, Vec<&'static str>> {
+    let mut m = HashMap::new();
+    m.insert(
+        "stdlib:json.sapp",
+        vec!["parse", "stringify", "validate", "pretty"],
+    );
+    m.insert(
+        "stdlib:http.sapp",
+        vec![
+            "get",
+            "post",
+            "get_json",
+            "post_json",
+            "post_auth",
+            "get_auth",
+            "post_json_auth",
+            "parse_sse_line",
+            "retry",
+            "build_query_string",
+            "get_with_params",
+            "parse_response_json",
+        ],
+    );
+    m.insert(
+        "stdlib:async.sapp",
+        vec![
+            "go",
+            "await",
+            "await_all",
+            "await_race",
+            "sleep",
+            "timeout",
+            "pool",
+            "map_parallel",
+            "debounce",
+            "throttle",
+        ],
+    );
+    m.insert(
+        "stdlib:math.sapp",
+        vec![
+            "abs", "sqrt", "pow", "sin", "cos", "tan", "log", "exp", "floor", "ceil", "round",
+        ],
+    );
+    m.insert(
+        "stdlib:strings.sapp",
+        vec![
+            "trim",
+            "split",
+            "join",
+            "replace",
+            "to_upper",
+            "to_lower",
+            "contains",
+            "starts_with",
+            "ends_with",
+        ],
+    );
+    m.insert(
+        "stdlib:fs.sapp",
+        vec![
+            "read", "write", "append", "exists", "delete", "list_dir", "mkdir",
+        ],
+    );
+    m.insert(
+        "stdlib:dataframe.sapp",
+        vec![
+            "from_rows",
+            "from_csv_string",
+            "from_csv",
+            "to_csv",
+            "nrows",
+            "ncols",
+            "head",
+            "tail",
+            "select_columns",
+            "filter",
+            "map_rows",
+            "sort_by",
+            "column",
+            "add_column",
+            "group_by",
+            "describe",
+            "join",
+            "unique",
+            "value_counts",
+        ],
+    );
+    m.insert(
+        "stdlib:csv.sapp",
+        vec!["parse", "stringify", "parse_file", "write_file"],
+    );
+    m.insert(
+        "stdlib:time.sapp",
+        vec!["now", "sleep_ms", "format", "parse_iso", "elapsed"],
+    );
+    m.insert(
+        "stdlib:log.sapp",
+        vec!["debug", "info", "warn", "error", "set_level"],
+    );
+    m.insert(
+        "stdlib:testing.sapp",
+        vec![
+            "assert",
+            "assert_eq",
+            "assert_ne",
+            "assert_throws",
+            "run_tests",
+        ],
+    );
+    m
+}
+
+/// Known functions from stdlib modules (module path -> function name).
+fn find_stdlib_export(name: &str) -> Option<&'static str> {
+    for (mod_path, exports) in stdlib_exports() {
+        if exports.contains(&name) {
+            return Some(mod_path);
+        }
+    }
+    None
+}
+
 const BUILTINS: &[(&str, &str)] = &[
     ("print", "print(value) -> nil"),
     ("len", "len(value) -> number"),
@@ -334,12 +493,98 @@ fn collect_stmt_symbols(stmts: &[Stmt], out: &mut Vec<SymbolEntry>) {
                     collect_stmt_symbols(else_body, out);
                 }
             }
-            StmtKind::While(_, body) | StmtKind::Block(body) => {
+            StmtKind::While(_, body) | StmtKind::Block(body) | StmtKind::Loop(body) => {
                 collect_stmt_symbols(body, out);
+            }
+            StmtKind::Seq(stmts) => {
+                collect_stmt_symbols(stmts, out);
             }
             _ => {}
         }
     }
+}
+
+/// Collect top-level document symbols from AST (not recursive into function bodies).
+#[allow(deprecated)]
+fn collect_document_symbols(stmts: &[Stmt], src: &str) -> Vec<DocumentSymbol> {
+    let mut symbols = Vec::new();
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Fn(name, params, _ret, _body) => {
+                let detail = format!(
+                    "fn {}({})",
+                    name,
+                    params
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                symbols.push(DocumentSymbol {
+                    name: name.clone(),
+                    detail: Some(detail),
+                    kind: SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    selection_range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    children: None,
+                });
+            }
+            StmtKind::Let(name, _, _) => {
+                symbols.push(DocumentSymbol {
+                    name: name.clone(),
+                    detail: Some(format!("let {}", name)),
+                    kind: SymbolKind::VARIABLE,
+                    tags: None,
+                    deprecated: None,
+                    range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    selection_range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    children: None,
+                });
+            }
+            StmtKind::Const(name, _, _) => {
+                symbols.push(DocumentSymbol {
+                    name: name.clone(),
+                    detail: Some(format!("const {}", name)),
+                    kind: SymbolKind::CONSTANT,
+                    tags: None,
+                    deprecated: None,
+                    range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    selection_range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    children: None,
+                });
+            }
+            StmtKind::Export(names) => {
+                // Group exports as a module-like symbol
+                let children: Vec<DocumentSymbol> = names
+                    .iter()
+                    .map(|n| DocumentSymbol {
+                        name: n.clone(),
+                        detail: Some("export".into()),
+                        kind: SymbolKind::PROPERTY,
+                        tags: None,
+                        deprecated: None,
+                        range: range_from_span(src, stmt.span.start, stmt.span.end),
+                        selection_range: range_from_span(src, stmt.span.start, stmt.span.end),
+                        children: None,
+                    })
+                    .collect();
+                symbols.push(DocumentSymbol {
+                    name: "exports".into(),
+                    detail: Some(format!("{} exports", names.len())),
+                    kind: SymbolKind::MODULE,
+                    tags: None,
+                    deprecated: None,
+                    range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    selection_range: range_from_span(src, stmt.span.start, stmt.span.end),
+                    children: Some(children),
+                });
+            }
+            _ => {}
+        }
+    }
+    symbols
 }
 
 impl Backend {
@@ -374,7 +619,9 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions::default()),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -388,7 +635,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(
                 MessageType::INFO,
-                "pblang LSP — diagnostics (parse+typeck), hover, goto-def, completions, workspace symbols",
+                "pblang LSP — diagnostics (parse+typeck), hover, goto-def, completions, doc symbols, workspace symbols, code actions",
             )
             .await;
     }
@@ -440,6 +687,17 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Check stdlib exports
+        if let Some(mod_path) = find_stdlib_export(&word) {
+            return Ok(Some(Hover {
+                contents: HoverContents::Scalar(MarkedString::String(format!(
+                    "{} (from {})",
+                    word, mod_path
+                ))),
+                range: None,
+            }));
+        }
+
         if let Ok((stmts, _)) = pblang_core::parse_with_polyglot(&src) {
             let mut symbols = Vec::new();
             collect_stmt_symbols(&stmts, &mut symbols);
@@ -463,10 +721,36 @@ impl LanguageServer for Backend {
             let docs = self.docs.lock().await;
             docs.get(&uri).cloned().unwrap_or_default()
         };
+
+        // First, check if cursor is on a string literal (import path navigation)
+        let line = line_at(&src, pos.line as usize).unwrap_or("");
+        // Check for import statement context
+        let line_trimmed = line.trim();
+        if line_trimmed.starts_with("import") {
+            if let Some(path) = string_at_position(&src, pos) {
+                // Resolve import path to a file URL
+                let resolved = resolve_import_path(&uri, &path);
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: resolved,
+                    range: Range {
+                        start: Position::new(0, 0),
+                        end: Position::new(0, 1),
+                    },
+                })));
+            }
+        }
+
         let word = match word_at_position(&src, pos) {
             Some(w) => w,
             None => return Ok(None),
         };
+
+        // Check builtins (no goto)
+        for &(name, _) in BUILTINS {
+            if name == word {
+                return Ok(None);
+            }
+        }
 
         if let Ok((stmts, _)) = pblang_core::parse_with_polyglot(&src) {
             let mut symbols = Vec::new();
@@ -479,6 +763,7 @@ impl LanguageServer for Backend {
                 })));
             }
         }
+
         Ok(None)
     }
 
@@ -499,10 +784,25 @@ impl LanguageServer for Backend {
             });
         }
 
+        // Add known stdlib exports
+        let mut seen_exports: HashSet<String> = HashSet::new();
+        for (_mod_path, exports) in stdlib_exports() {
+            for name in exports {
+                if seen_exports.insert(name.to_string()) {
+                    items.push(CompletionItem {
+                        label: name.to_string(),
+                        kind: Some(CompletionItemKind::FUNCTION),
+                        detail: Some(format!("(stdlib: {})", name)),
+                        ..CompletionItem::default()
+                    });
+                }
+            }
+        }
+
         for kw in &[
             "let", "const", "fn", "return", "if", "else", "while", "for", "in", "match", "case",
             "import", "export", "true", "false", "nil", "and", "or", "not", "try", "catch",
-            "defer",
+            "defer", "loop", "break", "continue", "throw",
         ] {
             items.push(CompletionItem {
                 label: kw.to_string(),
@@ -545,10 +845,19 @@ impl LanguageServer for Backend {
             };
             for stmt in &stmts {
                 match &stmt.kind {
-                    StmtKind::Fn(name, _, _, _) => {
+                    StmtKind::Fn(name, fn_params, _ret, _body) => {
                         if !params.query.is_empty() && !name.to_lowercase().contains(&query_lower) {
                             continue;
                         }
+                        let detail = format!(
+                            "fn {}({})",
+                            name,
+                            fn_params
+                                .iter()
+                                .map(|p| p.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
                         symbols.push(SymbolInformation {
                             name: name.clone(),
                             kind: SymbolKind::FUNCTION,
@@ -558,10 +867,10 @@ impl LanguageServer for Backend {
                                 uri: uri.clone(),
                                 range: range_from_span(src, stmt.span.start, stmt.span.end),
                             },
-                            container_name: None,
+                            container_name: Some(detail),
                         });
                     }
-                    StmtKind::Let(name, _, _) | StmtKind::Const(name, _, _) => {
+                    StmtKind::Let(name, _, _) => {
                         if !params.query.is_empty() && !name.to_lowercase().contains(&query_lower) {
                             continue;
                         }
@@ -577,12 +886,156 @@ impl LanguageServer for Backend {
                             container_name: None,
                         });
                     }
+                    StmtKind::Const(name, _, _) => {
+                        if !params.query.is_empty() && !name.to_lowercase().contains(&query_lower) {
+                            continue;
+                        }
+                        symbols.push(SymbolInformation {
+                            name: name.clone(),
+                            kind: SymbolKind::CONSTANT,
+                            tags: None,
+                            deprecated: None,
+                            location: Location {
+                                uri: uri.clone(),
+                                range: range_from_span(src, stmt.span.start, stmt.span.end),
+                            },
+                            container_name: None,
+                        });
+                    }
+                    StmtKind::Export(names) => {
+                        for n in names {
+                            if !params.query.is_empty() && !n.to_lowercase().contains(&query_lower)
+                            {
+                                continue;
+                            }
+                            symbols.push(SymbolInformation {
+                                name: n.clone(),
+                                kind: SymbolKind::PROPERTY,
+                                tags: None,
+                                deprecated: None,
+                                location: Location {
+                                    uri: uri.clone(),
+                                    range: range_from_span(src, stmt.span.start, stmt.span.end),
+                                },
+                                container_name: Some("export".into()),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
         }
         Ok(Some(symbols))
     }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let src = {
+            let docs = self.docs.lock().await;
+            docs.get(&uri).cloned().unwrap_or_default()
+        };
+        let Ok((stmts, _)) = pblang_core::parse_with_polyglot(&src) else {
+            return Ok(None);
+        };
+
+        let symbols = collect_document_symbols(&stmts, &src);
+        // Return as DocumentSymbol (hierarchical) variant
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let src = {
+            let docs = self.docs.lock().await;
+            docs.get(&uri).cloned().unwrap_or_default()
+        };
+
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+        // Process diagnostics for code actions
+        for diag in &params.context.diagnostics {
+            let msg = &diag.message;
+
+            // "unknown variable" or "undefined" → suggest importing from stdlib
+            if msg.contains("unknown") || msg.contains("undefined") || msg.contains("not defined") {
+                // Try to extract the variable name from the diagnostic range
+                let word = word_at_position(&src, diag.range.start);
+                if let Some(name) = word {
+                    if let Some(mod_path) = find_stdlib_export(&name) {
+                        let edit = TextEdit {
+                            range: Range {
+                                start: Position::new(0, 0),
+                                end: Position::new(0, 0),
+                            },
+                            new_text: format!("import \"{}\";\n", mod_path),
+                        };
+                        let changes = {
+                            let mut m = HashMap::new();
+                            m.insert(uri.clone(), vec![edit]);
+                            m
+                        };
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: format!("Add import for '{}' from {}", name, mod_path),
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            diagnostics: Some(vec![diag.clone()]),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(changes),
+                                ..WorkspaceEdit::default()
+                            }),
+                            is_preferred: Some(true),
+                            ..CodeAction::default()
+                        }));
+                    }
+                }
+            }
+
+            // Type mismatch suggestions
+            if msg.contains("type") && (msg.contains("mismatch") || msg.contains("expected")) {
+                let action = CodeAction {
+                    title: "[pblang] Review type annotation".into(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag.clone()]),
+                    ..CodeAction::default()
+                };
+                actions.push(CodeActionOrCommand::CodeAction(action));
+            }
+        }
+
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
+    }
+}
+
+/// Attempt to resolve an import path to a file URL.
+fn resolve_import_path(current_uri: &Url, import_path: &str) -> Url {
+    // Handle stdlib: prefix → look relative to the project
+    if import_path.starts_with("stdlib:") {
+        // We can't guess the exact file location without knowing the project root,
+        // but we try to construct a path relative to the current file.
+        if let Ok(current_path) = current_uri.to_file_path() {
+            let relative = import_path.strip_prefix("stdlib:").unwrap_or(import_path);
+            if let Some(parent) = current_path.parent() {
+                let resolved = parent.join("..").join("stdlib").join(relative);
+                return Url::from_file_path(resolved).unwrap_or_else(|_| current_uri.clone());
+            }
+        }
+    }
+
+    // Try relative to current file
+    if let Ok(current_path) = current_uri.to_file_path() {
+        if let Some(parent) = current_path.parent() {
+            let resolved = parent.join(import_path);
+            return Url::from_file_path(resolved).unwrap_or_else(|_| current_uri.clone());
+        }
+    }
+
+    current_uri.clone()
 }
 
 #[cfg(test)]
@@ -603,5 +1056,29 @@ mod tests {
         assert!(diags
             .iter()
             .all(|d| d.source == "pblang-typeck" || d.source == "pblang-parser"));
+    }
+
+    #[test]
+    fn document_symbols_basic() {
+        let src = "fn add(a, b) { return a + b; }\nlet x = 42;\nconst PI = 3.14;";
+        let (stmts, _) = pblang_core::parse_with_polyglot(src).unwrap();
+        let syms = collect_document_symbols(&stmts, src);
+        assert_eq!(syms.len(), 3);
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "add" && s.kind == SymbolKind::FUNCTION));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "x" && s.kind == SymbolKind::VARIABLE));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "PI" && s.kind == SymbolKind::CONSTANT));
+    }
+
+    #[test]
+    fn stdlib_exports_lookup() {
+        assert_eq!(find_stdlib_export("get_json"), Some("stdlib:http.sapp"));
+        assert_eq!(find_stdlib_export("go"), Some("stdlib:async.sapp"));
+        assert_eq!(find_stdlib_export("nonexistent"), None);
     }
 }

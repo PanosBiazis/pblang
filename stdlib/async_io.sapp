@@ -1,0 +1,338 @@
+// stdlib/async_io.sapp — Async I/O patterns for pblang.
+//
+// Provides: event loop (cooperative multitasking), file watcher, timer
+// utilities, deferred/promise pattern, and async I/O helpers.
+//
+// Usage:
+//   let aio = import("stdlib:async_io.sapp");
+//   let promise = aio.defer(fn() { return heavy_work(); });
+//   let result = aio.await(promise);
+//   aio.set_interval(fn() { log("tick"); }, 1000);
+
+let async_mod = try import("stdlib:async.sapp") catch map{};
+
+// ─── Deferred / Promise Pattern ────────────────────────────────────────────
+
+// Defer — a deferred computation that will produce a value.
+fn defer(fn_val) {
+    let ch = channel();
+    let handle = spawn(fn() {
+        let result = try fn_val() catch nil;
+        send(ch.sender, map{ ok: true, value: result });
+    });
+    return map{
+        _channel: ch,
+        _handle: handle,
+        resolved: false,
+        value: nil,
+    };
+}
+
+// await_promise(promise) — block until promise resolves and return value.
+fn await_promise(promise) {
+    if promise.resolved == true { return promise.value; }
+    let msg = recv(promise._channel.receiver);
+    join(promise._handle);
+    promise.resolved = true;
+    if msg == nil { return nil; }
+    promise.value = msg.value;
+    return msg.value;
+}
+
+// then(promise, callback) — chain a callback after promise resolves.
+fn then(promise, callback) {
+    return defer(fn() {
+        let val = await_promise(promise);
+        return callback(val);
+    });
+}
+
+// all(promises) — wait for all promises to resolve.
+fn all(promises) {
+    let results = [];
+    for i len(promises) {
+        results[i] = await_promise(promises[i]);
+    }
+    return results;
+}
+
+// race(promises) — return the first promise to resolve.
+fn race(promises) {
+    // Use select on all channels
+    let ch_list = [];
+    for i len(promises) {
+        ch_list[i] = promises[i]._channel.receiver;
+    }
+    let sel = select(ch_list);
+    if sel == nil { return nil; }
+    return sel.value;
+}
+
+// ─── Event Loop (cooperative multitasking) ─────────────────────────────────
+
+// Simple task queue — cooperative scheduler.
+fn create_event_loop() {
+    return map{
+        tasks: [],
+        running: false,
+        _next_id: 0,
+    };
+}
+
+fn event_loop_add_task(loop_handle, task_fn, interval_ms) {
+    loop_handle._next_id = loop_handle._next_id + 1;
+    let task = map{
+        id: loop_handle._next_id,
+        fn: task_fn,
+        interval_ms: interval_ms,
+        last_run: 0,
+        repeat: interval_ms != nil and interval_ms > 0,
+    };
+    loop_handle.tasks[len(loop_handle.tasks)] = task;
+    return task.id;
+}
+
+fn event_loop_remove_task(loop_handle, task_id) {
+    let new_tasks = [];
+    for i len(loop_handle.tasks) {
+        if loop_handle.tasks[i].id != task_id {
+            new_tasks[len(new_tasks)] = loop_handle.tasks[i];
+        }
+    }
+    loop_handle.tasks = new_tasks;
+    return true;
+}
+
+// run_event_loop(loop_handle, duration_ms) — run the event loop for N ms.
+fn run_event_loop(loop_handle, duration_ms) {
+    if duration_ms == nil { duration_ms = 1000; }
+    loop_handle.running = true;
+    let start = now_ms();
+    let elapsed = 0;
+
+    while elapsed < duration_ms and loop_handle.running == true {
+        // Execute tasks whose interval has elapsed
+        let now = now_ms();
+        for i len(loop_handle.tasks) {
+            let task = loop_handle.tasks[i];
+            let since_last = now - task.last_run;
+            if task.interval_ms == 0 or since_last >= task.interval_ms {
+                task.last_run = now;
+                try task.fn() catch nil;
+                if task.repeat == false {
+                    // One-shot: mark for removal
+                    task._remove = true;
+                }
+            }
+        }
+        // Clean up one-shot tasks
+        let new_tasks = [];
+        for i len(loop_handle.tasks) {
+            let task = loop_handle.tasks[i];
+            if task._remove != true {
+                new_tasks[len(new_tasks)] = task;
+            }
+        }
+        loop_handle.tasks = new_tasks;
+
+        // Yield
+        sleep_ms(10);
+        elapsed = now_ms() - start;
+    }
+    loop_handle.running = false;
+    return elapsed;
+}
+
+// ─── Timer Utilities ───────────────────────────────────────────────────────
+
+// set_timeout(callback, delay_ms) — execute callback once after delay.
+fn set_timeout(callback, delay_ms) {
+    return spawn(fn() {
+        sleep_ms(delay_ms);
+        try callback() catch nil;
+    });
+}
+
+// set_interval(callback, interval_ms) — repeat callback every N ms.
+// Returns a control object with a .stop() method.
+fn set_interval(callback, interval_ms) {
+    let running = true;
+    let handle = spawn(fn() {
+        while running == true {
+            sleep_ms(interval_ms);
+            if running == true {
+                try callback() catch nil;
+            }
+        }
+    });
+    return map{
+        _handle: handle,
+        stop: fn() { running = false; },
+        running: fn() { return running; },
+    };
+}
+
+// delay(ms) — return a promise that resolves after ms.
+fn delay(ms) {
+    return defer(fn() {
+        sleep_ms(ms);
+        return nil;
+    });
+}
+
+// timeout_promise(promise, ms) — race a promise against a timeout.
+fn timeout_promise(promise, ms) {
+    let timeout_result = delay(ms);
+    let result = race([promise, timeout_result]);
+    if result == nil {
+        return map{ ok: false, error: "timeout after " + str(ms) + "ms" };
+    }
+    return map{ ok: true, value: result.value };
+}
+
+// ─── File Watcher ──────────────────────────────────────────────────────────
+
+// watch_file(path, callback, interval_ms) — poll a file for changes.
+// Returns a watcher object with .stop() method.
+fn watch_file(path, callback, interval_ms) {
+    if interval_ms == nil { interval_ms = 500; }
+    let initial = try fs_read(path) catch nil;
+    let running = true;
+
+    let handle = spawn(fn() {
+        let last_content = initial;
+        while running == true {
+            sleep_ms(interval_ms);
+            if running == false { return nil; }
+            let current = try fs_read(path) catch nil;
+            if current != nil and current != last_content {
+                let old = last_content;
+                last_content = current;
+                try callback(map{
+                    path: path,
+                    previous: old,
+                    current: current,
+                }) catch nil;
+            }
+        }
+    });
+
+    return map{
+        _handle: handle,
+        stop: fn() { running = false; },
+        path: path,
+    };
+}
+
+// ─── Async Queue ───────────────────────────────────────────────────────────
+
+// create_async_queue() — create a producer-consumer queue.
+fn create_async_queue() {
+    let ch = channel();
+    return map{
+        _channel: ch,
+        push: fn(item) { send(ch.sender, item); },
+        pop: fn() { return recv(ch.receiver); },
+        close: fn() { channel_close(ch.sender); },
+    };
+}
+
+// ─── Retry with exponential backoff ────────────────────────────────────────
+
+// retry_backoff(fn_val, max_retries, base_delay_ms) — retry with exponential backoff.
+fn retry_backoff(fn_val, max_retries, base_delay_ms) {
+    if max_retries == nil { max_retries = 5; }
+    if base_delay_ms == nil { base_delay_ms = 100; }
+    for attempt max_retries {
+        let result = try fn_val() catch nil;
+        if result != nil {
+            if type(result) == "map" {
+                if try result.error catch nil == nil { return result; }
+            } else {
+                return result;
+            }
+        }
+        let delay_ms = base_delay_ms;
+        let i = 0;
+        while i < attempt {
+            delay_ms = delay_ms * 2;
+            i = i + 1;
+        }
+        sleep_ms(delay_ms);
+    }
+    return map{ error: "exhausted " + str(max_retries) + " retries" };
+}
+
+// ─── Batching ──────────────────────────────────────────────────────────────
+
+// batch_processor(process_fn, max_batch_size, max_wait_ms) — async batch processor.
+// Returns { push(item), flush(), close() } API.
+fn create_batch_processor(process_fn, max_batch_size, max_wait_ms) {
+    if max_batch_size == nil { max_batch_size = 50; }
+    if max_wait_ms == nil { max_wait_ms = 200; }
+    let ch = channel();
+    let running = true;
+
+    let handle = spawn(fn() {
+        let batch = [];
+        while running == true or len(batch) > 0 {
+            // Collect batch
+            let start = now_ms();
+            while len(batch) < max_batch_size and (now_ms() - start) < max_wait_ms {
+                let item = recv_timeout(ch.receiver, 10);
+                if item != nil { batch[len(batch)] = item; }
+            }
+            if len(batch) > 0 {
+                try process_fn(batch) catch nil;
+                batch = [];
+            }
+        }
+    });
+
+    return map{
+        _handle: handle,
+        _channel: ch,
+        push: fn(item) { send(ch.sender, item); },
+        close: fn() {
+            running = false;
+            channel_close(ch.sender);
+        },
+    };
+}
+
+// ─── Semaphore for async resource limiting ─────────────────────────────────
+
+fn create_semaphore(max_concurrent) {
+    if max_concurrent == nil { max_concurrent = 4; }
+    return map{
+        _count: 0,
+        _max: max_concurrent,
+        _wait_queue: channel(),
+    };
+}
+
+fn semaphore_acquire(sem) {
+    while sem._count >= sem._max {
+        // Wait for release signal
+        let _ = recv(sem._wait_queue.receiver);
+    }
+    sem._count = sem._count + 1;
+    return true;
+}
+
+fn semaphore_release(sem) {
+    if sem._count > 0 {
+        sem._count = sem._count - 1;
+    }
+    // Signal one waiter
+    send(sem._wait_queue.sender, true);
+    return true;
+}
+
+export defer, await_promise, then, all, race,
+       create_event_loop, event_loop_add_task, event_loop_remove_task, run_event_loop,
+       set_timeout, set_interval, delay, timeout_promise,
+       watch_file,
+       create_async_queue,
+       retry_backoff, create_batch_processor,
+       create_semaphore, semaphore_acquire, semaphore_release;

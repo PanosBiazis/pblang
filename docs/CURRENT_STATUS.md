@@ -1,7 +1,7 @@
 # pblang — Current Status
 
 **Last Updated**: 2026  
-**Status**: v0.5.6 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 102 Stdlib Modules + 4 Self-Hosting Compiler Modules + Bit-Level Optimizations
+**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 112 Stdlib Modules + Self-Hosting Compiler Pipeline + Multi-Backend Codegen
 **Test Suite**: semantics suite passing with known ignored cases (match-guard parser recovery limitation and `env_set` safety policy)
 
 ---
@@ -137,7 +137,7 @@ Canonical status is the top summary and `Test Results` section in this file. Old
 
 ```
 cargo test --test semantics
-test result: ok. 147 passed; 0 failed; 2 ignored
+test result: ok. 160 passed; 0 failed; 2 ignored
 ```
 
 Ignored tests are currently:

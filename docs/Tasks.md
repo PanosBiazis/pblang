@@ -9,7 +9,7 @@ steps, stable core.
 **Current priority order:**
 TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) → LSP ✅ → Cranelift JIT ✅ → Registry ✅ → RE ✅ → Type System ✅ → Spec → Self-Hosting ✅ (tokenizer, parser, type_checker, codegen complete) → Editor → Framework/OS
 
-**Current status**: 147/149 semantics tests passing, 0 failing, 2 ignored (`match_guard_pass`, `os_env_set_pass`)
+**Current status**: 160/162 semantics tests passing, 0 failing, 2 ignored (`match_guard_pass`, `os_env_set_pass`). Run `cargo test --test semantics` for the live count.
 
 ---
 

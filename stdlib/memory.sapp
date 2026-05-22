@@ -1,0 +1,266 @@
+// stdlib/memory.sapp — Memory Safety API for pblang programs
+//
+// This module provides a safe, ergonomic API around the VM's memory safety
+// builtins. It implements Rust-like ownership tracking, borrowing, and
+// lifetime management enforced at runtime by the VM.
+//
+// ## Borrow Rules
+//
+// The VM enforces the following borrow rules at runtime:
+// - Multiple immutable (&T) borrows can coexist.
+// - At most one mutable (&mut T) borrow at a time.
+// - No borrows (immutable or mutable) can coexist with a mutable borrow.
+// - Move (&move T) consumes the original value; further access is an error.
+// - Lifetime scopes: when a scope exits, all borrows and values created
+//   within it are invalidated.
+//
+// ## Builtins Used
+//
+//   memory_alloc(value, mutable?)    → memory_id (number)
+//   memory_borrow(memory_id, type)   → borrow_id (number)
+//   memory_release(memory_id, type?) → nil
+//   memory_get(memory_id)            → value
+//   memory_set(memory_id, value)     → nil
+//   memory_free(memory_id)           → nil
+//   memory_stats()                   → map{...}
+//
+// ## Usage (preferred: top-level convenience API)
+//
+//   import "stdlib:memory.sapp";
+//   let h = memory.box(42);                  // allocate mutable owned value
+//   let v = memory.read(h);                  // read value
+//   memory.write(h, 99);                     // write value
+//   let b = memory.borrow(h);                // immutable borrow
+//   memory.release(b);                       // release borrow by borrow_id
+//   memory.free(h);                          // deallocate
+//   let s = memory.stats();                  // get stats
+//
+// ## Usage (object-style: pass tracker as first arg)
+//
+//   let mt = memory.MemoryTracker();
+//   memory.MemoryTracker_alloc(mt, 42);      // method-style requires explicit self
+//
+// NOTE: Method-style `mt.alloc(42)` is not yet wired in the VM (pblang
+// methods do not implicitly bind `self`). Use the top-level helpers above
+// or pass `mt` explicitly as the first argument. See the convenience
+// section below for the canonical entry points.
+
+// ============================================================================
+// MemoryTracker — safe wrapper around VM memory builtins
+// ============================================================================
+
+// MemoryTracker provides ownership and borrowing for heap-allocated values.
+// It wraps the VM-level memory_* builtins with a consistent API.
+fn MemoryTracker() {
+    // Track allocated handles locally for the user's convenience
+    let handles = [];
+
+    // alloc(value, is_mutable=true) → memory_id
+    fn alloc(self, value) {
+        let id = memory_alloc(value, 1);
+        self.handles.push(id);
+        return id;
+    }
+
+    // alloc_immutable(value) → memory_id
+    fn alloc_immutable(self, value) {
+        let id = memory_alloc(value, 0);
+        self.handles.push(id);
+        return id;
+    }
+
+    // get(memory_id) → value — read the stored value
+    fn get(self, id) {
+        return memory_get(id);
+    }
+
+    // set(memory_id, value) — update the value (must be mutable & not borrowed)
+    fn set(self, id, value) {
+        memory_set(id, value);
+        return nil;
+    }
+
+    // borrow(memory_id) → borrow_id — create an immutable borrow
+    fn borrow(self, id) {
+        return memory_borrow(id, 0);
+    }
+
+    // borrow_mut(memory_id) → borrow_id — create a mutable (exclusive) borrow
+    fn borrow_mut(self, id) {
+        return memory_borrow(id, 1);
+    }
+
+    // release(borrow_id) — release a specific borrow by its ID
+    fn release(self, borrow_id) {
+        memory_release(borrow_id);
+        return nil;
+    }
+
+    // release_borrow(memory_id, type) — release a borrow by memory_id + type
+    fn release_borrow(self, id) {
+        memory_release(id, 0);
+        return nil;
+    }
+
+    // free(memory_id) — deallocate the memory (must not be borrowed)
+    fn free(self, id) {
+        memory_free(id);
+        return nil;
+    }
+
+    // stats() → map — get memory safety statistics
+    fn stats(self) {
+        return memory_stats();
+    }
+
+    // scope(closure) — execute inside a new lifetime scope
+    fn scope(self, body_fn) {
+        push_lifetime();
+        let result = try body_fn() catch nil;
+        pop_lifetime();
+        return result;
+    }
+
+    return map{
+        handles: handles,
+
+        alloc: alloc,
+        alloc_immutable: alloc_immutable,
+        get: get,
+        set: set,
+        borrow: borrow,
+        borrow_mut: borrow_mut,
+        release: release,
+        release_borrow: release_borrow,
+        free: free,
+        stats: stats,
+        scope: scope,
+    };
+}
+
+// ============================================================================
+// SafeRef — automatic borrow cleanup via scope-based resource management
+// ============================================================================
+
+// SafeRef wraps a borrow and auto-releases it when the scope exits.
+// Use this to ensure borrows are cleaned up even on early returns.
+//
+// Usage:
+//   let ref = SafeRef.acquire(mem, id, 0);  // immutable borrow
+//   // ... use it ...
+//   // borrow is automatically released when SafeRef goes out of scope
+fn SafeRef() {
+    // acquire(tracker, memory_id, type) → SafeRef
+    // type: 0 = immutable, 1 = mutable
+    fn acquire(self, tracker, memory_id, borrow_type) {
+        let bid = memory_borrow(memory_id, borrow_type);
+        self.borrow_id = bid;
+        self.memory_id = memory_id;
+        self.borrow_type = borrow_type;
+        self.released = 0;
+        return self;
+    }
+
+    // release(self) — manually release the borrow early
+    fn release(self) {
+        if self.released == 0 {
+            memory_release(self.borrow_id);
+            self.released = 1;
+        }
+        return nil;
+    }
+
+    // get(self, tracker) → value — read the borrowed value
+    fn get(self, tracker) {
+        return tracker.get(self.memory_id);
+    }
+
+    // set(self, tracker, value) — write through a mutable borrow
+    fn set(self, tracker, value) {
+        if self.borrow_type != 1 {
+            error("SafeRef.set: not a mutable borrow");
+        }
+        tracker.set(self.memory_id, value);
+        return nil;
+    }
+
+    return map{
+        borrow_id: 0,
+        memory_id: 0,
+        borrow_type: 0,
+        released: 0,
+
+        acquire: acquire,
+        release: release,
+        get: get,
+        set: set,
+    };
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+// box(value) — heap-allocate a mutable owned value, returns memory_id
+fn box(value) {
+    return memory_alloc(value, 1);
+}
+
+// box_immutable(value) — heap-allocate an immutable owned value
+fn box_immutable(value) {
+    return memory_alloc(value, 0);
+}
+
+// read(handle) → value — alias for memory_get
+fn read(handle) {
+    return memory_get(handle);
+}
+
+// write(handle, value) — alias for memory_set
+fn write(handle, value) {
+    memory_set(handle, value);
+    return nil;
+}
+
+// free(handle) — alias for memory_free
+fn free(handle) {
+    memory_free(handle);
+    return nil;
+}
+
+// borrow(handle) → borrow_id — alias for immutable borrow
+fn borrow(handle) {
+    return memory_borrow(handle, 0);
+}
+
+// borrow_mut(handle) → borrow_id — alias for mutable borrow
+fn borrow_mut(handle) {
+    return memory_borrow(handle, 1);
+}
+
+// release(borrow_id) — alias for memory_release
+fn release(borrow_id) {
+    memory_release(borrow_id);
+    return nil;
+}
+
+// stats() → map — get memory safety statistics
+fn stats() {
+    return memory_stats();
+}
+
+// ============================================================================
+// Lifetime Scope
+// ============================================================================
+
+// scope(body_fn) — execute a function inside a new lifetime scope.
+// All memory allocated within the scope is freed when it exits.
+fn scope(body_fn) {
+    push_lifetime();
+    let result = try body_fn() catch nil;
+    pop_lifetime();
+    return result;
+}
+
+export MemoryTracker, SafeRef;
+export box, box_immutable, read, write, free, borrow, borrow_mut, release, stats, scope;

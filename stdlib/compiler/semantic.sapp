@@ -1,0 +1,565 @@
+// stdlib/compiler/semantic.sapp — Semantic analysis pass for pblang
+//
+// Self-hosting milestone: semantic analysis and validation.
+//
+// Features:
+//   - Name resolution: resolve variable references to declarations
+//   - Scope analysis: track variable scopes, detect free variables
+//   - Export validation: check exported names are defined
+//   - Import resolution: resolve import paths
+//   - Symbol table builder: build complete symbol table for the program
+//
+// Usage:
+//   let sem = import("stdlib/compiler/semantic.sapp");
+//   let table = sem.analyze(ast);
+//   print sem.table_to_string(table);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Symbol table types
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn Symbol(name, kind, defined_line, scope_level) {
+    return map{
+        name: name,
+        kind: kind,       // "variable", "function", "parameter", "import"
+        defined_line: defined_line,
+        scope_level: scope_level,
+        references: [],   // list of line numbers where referenced
+        is_exported: false,
+        type_annotation: nil,
+    };
+}
+
+fn Scope(level, parent) {
+    return map{
+        level: level,
+        parent: parent,   // nil for global scope
+        symbols: map{},   // name → Symbol
+        children: [],
+    };
+}
+
+fn SymbolTable() {
+    return map{
+        global_scope: Scope(0, nil),
+        imports: [],      // [{path, resolved_module}]
+        exports: [],      // [{name, kind}]
+        diagnostics: [],
+        free_variables: [], // variables used but not defined in scope
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Scope management
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn scope_add_symbol(scope, sym) {
+    scope.symbols[sym.name] = sym;
+}
+
+fn scope_lookup(scope, name) {
+    // Walk up scope chain
+    let current = scope;
+    while current != nil {
+        let s = current.symbols[name];
+        if s != nil { return s; }
+        current = current.parent;
+    }
+    return nil;
+}
+
+fn scope_lookup_local(scope, name) {
+    // Only look in immediate scope (for shadowing detection)
+    return scope.symbols[name];
+}
+
+fn push_scope(table, current_scope) {
+    let level = current_scope.level + 1;
+    let new_scope = Scope(level, current_scope);
+    array_push(current_scope.children, new_scope);
+    return new_scope;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Diagnostics helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn add_diag(table, kind, message, line) {
+    array_push(table.diagnostics, map{
+        kind: kind,       // "error", "warning", "info"
+        message: message,
+        line: line,
+    });
+}
+
+fn add_info(table, message, line) {
+    add_diag(table, "info", message, line);
+}
+
+fn add_warning(table, message, line) {
+    add_diag(table, "warning", message, line);
+}
+
+fn add_error(table, message, line) {
+    add_diag(table, "error", message, line);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AST walking helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn walk_stmt(table, scope, stmt) {
+    if stmt == nil { return scope; }
+
+    let kind = stmt.kind;
+
+    // ── Import ──────────────────────────────────────────────────────────
+    if kind == "import" {
+        let path = stmt.path;
+        let sym = Symbol("<import>", "import", 0, scope.level);
+        sym.type_annotation = path;
+        scope_add_symbol(scope, sym);
+        array_push(table.imports, map{ path: path, resolved_module: nil });
+        return scope;
+    }
+
+    // ── Export ──────────────────────────────────────────────────────────
+    if kind == "export" {
+        let names = stmt.names;
+        if names != nil {
+            let i = 0;
+            while i < len(names) {
+                array_push(table.exports, map{ name: names[i], kind: "export" });
+                // Verify export refers to existing symbol (post-pass)
+                i = i + 1;
+            }
+        }
+        return scope;
+    }
+
+    // ── Let / Const ─────────────────────────────────────────────────────
+    if kind == "let" or kind == "const" {
+        let name = stmt.name;
+        let sym = Symbol(name, kind, 0, scope.level);
+        sym.type_annotation = stmt.type;
+        scope_add_symbol(scope, sym);
+
+        // Walk value expression
+        walk_expr(table, scope, stmt.value);
+        return scope;
+    }
+
+    // ── Function declaration ────────────────────────────────────────────
+    if kind == "fn" {
+        let name = stmt.name;
+        let sym = Symbol(name, "function", 0, scope.level);
+        scope_add_symbol(scope, sym);
+
+        // Create new scope for function body
+        let fn_scope = push_scope(table, scope);
+
+        // Add parameters to fn scope
+        let params = stmt.params;
+        if params != nil {
+            let pi = 0;
+            while pi < len(params) {
+                let p = params[pi];
+                let pname = "";
+                if type(p) == "map" {
+                    pname = p.name;
+                } else {
+                    pname = p;
+                }
+                let psym = Symbol(pname, "parameter", 0, fn_scope.level);
+                fn_scope.symbols[pname] = psym;
+                pi = pi + 1;
+            }
+        }
+
+        // Walk function body
+        let body = stmt.body;
+        if body != nil and body.kind == "block" {
+            walk_block(table, fn_scope, body);
+        }
+
+        return scope; // return to outer scope
+    }
+
+    // ── If ──────────────────────────────────────────────────────────────
+    if kind == "if" {
+        walk_expr(table, scope, stmt.cond);
+        let then_scope = push_scope(table, scope);
+        walk_block(table, then_scope, stmt.then);
+
+        // elif branches
+        let elifs = stmt.elifs;
+        if elifs != nil {
+            let ei = 0;
+            while ei < len(elifs) {
+                walk_expr(table, scope, elifs[ei].cond);
+                let elif_scope = push_scope(table, scope);
+                walk_block(table, elif_scope, elifs[ei].body);
+                ei = ei + 1;
+            }
+        }
+
+        if stmt.else != nil {
+            let else_scope = push_scope(table, scope);
+            walk_block(table, else_scope, stmt.else);
+        }
+        return scope;
+    }
+
+    // ── While ───────────────────────────────────────────────────────────
+    if kind == "while" {
+        walk_expr(table, scope, stmt.cond);
+        let while_scope = push_scope(table, scope);
+        walk_block(table, while_scope, stmt.body);
+        return scope;
+    }
+
+    // ── For / For-in ────────────────────────────────────────────────────
+    if kind == "for" {
+        walk_expr(table, scope, stmt.end);
+        let for_scope = push_scope(table, scope);
+        let fv = Symbol(stmt.name, "variable", 0, for_scope.level);
+        scope_add_symbol(for_scope, fv);
+        walk_block(table, for_scope, stmt.body);
+        return scope;
+    }
+
+    if kind == "for_in" {
+        walk_expr(table, scope, stmt.iter);
+        let for_scope = push_scope(table, scope);
+        let fv = Symbol(stmt.name, "variable", 0, for_scope.level);
+        scope_add_symbol(for_scope, fv);
+        walk_block(table, for_scope, stmt.body);
+        return scope;
+    }
+
+    // ── Return ──────────────────────────────────────────────────────────
+    if kind == "return" {
+        if stmt.value != nil {
+            walk_expr(table, scope, stmt.value);
+        }
+        return scope;
+    }
+
+    // ── Expr statement ──────────────────────────────────────────────────
+    if kind == "expr_stmt" {
+        walk_expr(table, scope, stmt.expr);
+        return scope;
+    }
+
+    return scope;
+}
+
+fn walk_block(table, scope, block) {
+    if block == nil { return scope; }
+    let stmts = block.stmts;
+    if stmts == nil { return scope; }
+
+    let i = 0;
+    while i < len(stmts) {
+        walk_stmt(table, scope, stmts[i]);
+        i = i + 1;
+    }
+    return scope;
+}
+
+fn walk_expr(table, scope, expr) {
+    if expr == nil { return; }
+
+    let kind = expr.kind;
+
+    if kind == "ident" {
+        let name = expr.name;
+        let sym = scope_lookup(scope, name);
+        if sym == nil {
+            // Free variable — used but not defined
+            let found = false;
+            let fi = 0;
+            while fi < len(table.free_variables) {
+                if table.free_variables[fi] == name { found = true; }
+                fi = fi + 1;
+            }
+            if not found {
+                array_push(table.free_variables, name);
+            }
+        }
+        return;
+    }
+
+    if kind == "binary" {
+        walk_expr(table, scope, expr.left);
+        walk_expr(table, scope, expr.right);
+        return;
+    }
+
+    if kind == "unary" {
+        walk_expr(table, scope, expr.operand);
+        return;
+    }
+
+    if kind == "call" {
+        walk_expr(table, scope, expr.func);
+        let args = expr.args;
+        if args != nil {
+            let ai = 0;
+            while ai < len(args) {
+                walk_expr(table, scope, args[ai]);
+                ai = ai + 1;
+            }
+        }
+        return;
+    }
+
+    if kind == "assign" {
+        let name = expr.name;
+        let sym = scope_lookup(scope, name);
+        if sym == nil {
+            add_warning(table, "assignment to undeclared variable '" + name + "'", 0);
+        }
+        walk_expr(table, scope, expr.value);
+        return;
+    }
+
+    if kind == "array" {
+        let items = expr.items;
+        if items != nil {
+            let ii = 0;
+            while ii < len(items) {
+                walk_expr(table, scope, items[ii]);
+                ii = ii + 1;
+            }
+        }
+        return;
+    }
+
+    if kind == "map" {
+        let entries = expr.entries;
+        if entries != nil {
+            let ei = 0;
+            while ei < len(entries) {
+                walk_expr(table, scope, entries[ei].key);
+                walk_expr(table, scope, entries[ei].value);
+                ei = ei + 1;
+            }
+        }
+        return;
+    }
+
+    if kind == "fn_lit" {
+        let fn_scope = push_scope(table, scope);
+        let params = expr.params;
+        if params != nil {
+            let pi = 0;
+            while pi < len(params) {
+                let pname = params[pi];
+                let psym = Symbol(pname, "parameter", 0, fn_scope.level);
+                scope_add_symbol(fn_scope, psym);
+                pi = pi + 1;
+            }
+        }
+        walk_block(table, fn_scope, expr.body);
+        return;
+    }
+
+    // literals: number, string, bool, nil — no walking needed
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Export validation
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn validate_exports(table) {
+    let ei = 0;
+    while ei < len(table.exports) {
+        let exp = table.exports[ei];
+        let sym = scope_lookup(table.global_scope, exp.name);
+        if sym == nil {
+            add_error(table, "exported name '" + exp.name + "' is not defined", 0);
+        } else {
+            sym.is_exported = true;
+        }
+        ei = ei + 1;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Main analysis entry point
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn analyze(ast) {
+    let table = SymbolTable();
+
+    if ast == nil {
+        add_error(table, "AST is nil", 0);
+        return table;
+    }
+
+    let stmts = ast.stmts;
+    if stmts == nil or len(stmts) == 0 {
+        add_warning(table, "AST has no statements", 0);
+        return table;
+    }
+
+    // First pass: walk all statements, build scope hierarchy
+    let scope = table.global_scope;
+    let i = 0;
+    while i < len(stmts) {
+        walk_stmt(table, scope, stmts[i]);
+        i = i + 1;
+    }
+
+    // Post-pass: validate exports
+    validate_exports(table);
+
+    return table;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Name resolution: find where a variable was declared
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn resolve_name(table, name) {
+    return scope_lookup(table.global_scope, name);
+}
+
+/// Resolve names from a specific scope upward.
+fn resolve_name_in_scope(scope, name) {
+    return scope_lookup(scope, name);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Scope analysis: find all free variables in a block/subtree
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn find_free_variables_in_block(table, scope, block) {
+    // Walk block with a fresh sub-table to capture free vars
+    let sub_table = SymbolTable();
+    // Copy the scope chain
+    sub_table.global_scope = scope;
+    walk_block(sub_table, scope, block);
+
+    return map{
+        block: block,
+        free_variables: sub_table.free_variables,
+        count: len(sub_table.free_variables),
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Symbol table utilities for debugging and display
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn scope_to_string(scope, indent) {
+    if indent == nil { indent = 0; }
+    let pad = "";
+    let pi = 0;
+    while pi < indent { pad = pad + "  "; pi = pi + 1; }
+
+    let out = pad + "scope level " + str(scope.level);
+    if len(scope.symbols) == 0 {
+        out = out + " (empty)";
+    }
+    out = out + "\n";
+
+    let keys = map_keys(scope.symbols);
+    let ki = 0;
+    while ki < len(keys) {
+        let sym = scope.symbols[keys[ki]];
+        let flags = "";
+        if sym.is_exported { flags = flags + " [exported]"; }
+        out = out + pad + "  " + sym.name + " : " + sym.kind + flags + "\n";
+        ki = ki + 1;
+    }
+
+    let ci = 0;
+    while ci < len(scope.children) {
+        out = out + scope_to_string(scope.children[ci], indent + 1);
+        ci = ci + 1;
+    }
+
+    return out;
+}
+
+fn table_to_string(table) {
+    let out = "═══ Symbol Table ═══\n";
+    out = out + "Diagnostics: " + str(len(table.diagnostics)) + "\n";
+    out = out + "Free variables: " + str(len(table.free_variables)) + "\n";
+    out = out + "Imports: " + str(len(table.imports)) + "\n";
+    out = out + "Exports: " + str(len(table.exports)) + "\n";
+
+    if len(table.diagnostics) > 0 {
+        out = out + "\n--- Diagnostics ---\n";
+        let di = 0;
+        while di < len(table.diagnostics) {
+            let d = table.diagnostics[di];
+            out = out + "  [" + d.kind + "] " + d.message + "\n";
+            di = di + 1;
+        }
+    }
+
+    out = out + "\n--- Scope Tree ---\n";
+    out = out + scope_to_string(table.global_scope, 0);
+
+    if len(table.free_variables) > 0 {
+        out = out + "\n--- Free Variables ---\n";
+        let fi = 0;
+        while fi < len(table.free_variables) {
+            out = out + "  " + table.free_variables[fi] + "\n";
+            fi = fi + 1;
+        }
+    }
+
+    return out;
+}
+
+/// Count total symbols in the table.
+fn table_symbol_count(table) {
+    fn count_scope(scope) {
+        let cnt = len(scope.symbols);
+        let ci = 0;
+        while ci < len(scope.children) {
+            cnt = cnt + count_scope(scope.children[ci]);
+            ci = ci + 1;
+        }
+        return cnt;
+    }
+    return count_scope(table.global_scope);
+}
+
+/// Get all exported symbols.
+fn table_exported_symbols(table) {
+    let result = [];
+    fn collect_exports(scope) {
+        let keys = map_keys(scope.symbols);
+        let ki = 0;
+        while ki < len(keys) {
+            let sym = scope.symbols[keys[ki]];
+            if sym.is_exported {
+                array_push(result, map{ name: sym.name, kind: sym.kind });
+            }
+            ki = ki + 1;
+        }
+        let ci = 0;
+        while ci < len(scope.children) {
+            collect_exports(scope.children[ci]);
+            ci = ci + 1;
+        }
+    }
+    collect_exports(table.global_scope);
+    return result;
+}
+
+export Symbol, Scope, SymbolTable;
+export scope_add_symbol, scope_lookup, scope_lookup_local, push_scope;
+export add_diag, add_info, add_warning, add_error;
+export walk_stmt, walk_block, walk_expr;
+export validate_exports;
+export analyze;
+export resolve_name, resolve_name_in_scope;
+export find_free_variables_in_block;
+export scope_to_string, table_to_string;
+export table_symbol_count, table_exported_symbols;

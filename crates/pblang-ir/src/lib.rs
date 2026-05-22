@@ -83,6 +83,11 @@ pub mod chunk {
         // logic
         OpNot,
 
+        // extended arithmetic
+        OpNegate, // arithmetic negation (unary minus)
+        OpMod,    // modulo (fmod for floats, irem for ints)
+        OpPow,    // power (pow for floats, fallback for ints)
+
         // --- Safety / Rust-inspired opcodes ---
         /// Pops obj; if nil pushes nil, else gets named attribute (const-idx).
         OpSafeGetAttr(usize),
@@ -377,6 +382,18 @@ pub struct Function {
     pub is_vararg: bool,
     /// The compiled bytecode of this function.
     pub chunk: Chunk,
+    /// Optional per-parameter type hints for JIT compilation.
+    /// `Some(vec![JitType::I64, JitType::F64, ...])` — one per parameter.
+    /// `None` means all parameters default to f64 (backward compatible).
+    pub param_types: Option<Vec<ParamType>>,
+}
+
+/// JIT type hint for a function parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamType {
+    F64,
+    I64,
+    Bool,
 }
 
 #[derive(Debug)]
@@ -445,5 +462,112 @@ impl Value {
             },
             _ => Err("type error: add expects (number, number) or (string, string)".into()),
         }
+    }
+}
+
+/// Serialize a compiled [`Chunk`] to the **PBCK** on-disk / embed format.
+///
+/// Layout: magic `PBCK`, instruction count, constant count, serialized constants,
+/// then serialized opcodes. Used by the CLI Cranelift AOT path and
+/// `pblang-cranelift` object emission.
+pub fn serialize_chunk_pbck(chunk: &Chunk) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + chunk.instructions.len() + chunk.constants.len() * 8);
+    out.extend_from_slice(b"PBCK");
+    out.extend_from_slice(&(chunk.instructions.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(chunk.constants.len() as u32).to_le_bytes());
+
+    for c in &chunk.constants {
+        match c {
+            Value::Number(v) => {
+                out.push(0);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Bool(b) => {
+                out.push(1);
+                out.push(u8::from(*b));
+            }
+            Value::Nil => out.push(2),
+            Value::Obj(o) => {
+                out.push(3);
+                let Obj::String(s) = o.as_ref();
+                let bytes = s.as_bytes();
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+            _ => out.push(2),
+        }
+    }
+
+    for op in &chunk.instructions {
+        match op {
+            OpCode::OpConstant(idx) => {
+                out.push(0);
+                out.extend_from_slice(&(*idx as u32).to_le_bytes());
+            }
+            OpCode::OpReturn => out.push(1),
+            OpCode::OpAdd => out.push(2),
+            OpCode::OpSub => out.push(3),
+            OpCode::OpMul => out.push(4),
+            OpCode::OpDiv => out.push(5),
+            OpCode::OpGetLocal(idx) => {
+                out.push(6);
+                out.extend_from_slice(&(*idx as u32).to_le_bytes());
+            }
+            OpCode::OpSetLocal(idx) => {
+                out.push(7);
+                out.extend_from_slice(&(*idx as u32).to_le_bytes());
+            }
+            OpCode::OpJump(off) => {
+                out.push(8);
+                out.extend_from_slice(&(*off as u32).to_le_bytes());
+            }
+            OpCode::OpJumpIfFalse(off) => {
+                out.push(9);
+                out.extend_from_slice(&(*off as u32).to_le_bytes());
+            }
+            OpCode::OpJumpIfTrue(off) => {
+                out.push(10);
+                out.extend_from_slice(&(*off as u32).to_le_bytes());
+            }
+            OpCode::OpEq => out.push(11),
+            OpCode::OpNotEq => out.push(12),
+            OpCode::OpGt => out.push(13),
+            OpCode::OpGe => out.push(14),
+            OpCode::OpLt => out.push(15),
+            OpCode::OpLe => out.push(16),
+            OpCode::OpNot => out.push(17),
+            OpCode::OpPop => out.push(18),
+            OpCode::OpCall(n) => {
+                out.push(19);
+                out.extend_from_slice(&(*n as u32).to_le_bytes());
+            }
+            OpCode::OpGetGlobal(idx) => {
+                out.push(20);
+                out.extend_from_slice(&(*idx as u32).to_le_bytes());
+            }
+            OpCode::OpPrint => out.push(21),
+            OpCode::OpDup => out.push(22),
+            _ => out.push(255),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod serialize_tests {
+    use super::*;
+    use chunk::Span;
+
+    #[test]
+    fn serialize_chunk_pbck_smoke() {
+        let mut chunk = Chunk::default();
+        let sp = Span::default();
+        let c = chunk.add_const(Value::Number(42.0));
+        chunk.write(OpCode::OpConstant(c), sp);
+        chunk.write(OpCode::OpReturn, sp);
+
+        let bytes = serialize_chunk_pbck(&chunk);
+        assert!(bytes.starts_with(b"PBCK"));
+        assert!(bytes.len() > 8);
     }
 }

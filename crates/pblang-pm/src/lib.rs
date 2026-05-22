@@ -99,6 +99,92 @@ pub struct Lockfile {
     pub dependencies: std::collections::BTreeMap<String, LockedDep>,
 }
 
+impl Lockfile {
+    /// Returns true if this lockfile uses the v2 format (has extended per-dep fields).
+    pub fn is_v2(&self) -> bool {
+        self.dependencies.values().any(|d| {
+            d.name.is_some()
+                || d.version.is_some()
+                || d.source.is_some()
+                || d.resolved.is_some()
+                || d.fetch_url.is_some()
+        })
+    }
+
+    /// Migrate a v1 lockfile (path+sha256 only) to v2 by enriching with
+    /// available metadata.  Path-only deps stay path-only; registry deps get
+    /// source="registry".
+    pub fn migrate_to_v2(&mut self, manifest_dir: &Path) -> Result<(), String> {
+        for (_name, dep) in self.dependencies.iter_mut() {
+            if dep.source.is_some() {
+                continue; // already v2
+            }
+            // Heuristic: if path looks like a cache entry (hash dir name), it's a registry dep.
+            let dep_path = Path::new(&dep.path);
+            if let Some(parent) = dep_path.parent() {
+                if parent.ends_with("cache") {
+                    dep.source = Some("registry".to_string());
+                }
+            }
+            // Try to extract name/version from the path
+            if let Some(fname) = dep_path.file_name().and_then(|n| n.to_str()) {
+                // Registry cache entries are named by archive sha256
+                if fname.len() == 64 && fname.chars().all(|c| c.is_ascii_hexdigit()) {
+                    dep.source = Some("registry".to_string());
+                }
+            }
+            // If the path is inside manifest dir, it's a local path dep
+            if dep_path.starts_with(manifest_dir) {
+                dep.source.get_or_insert_with(|| "path".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LockedDep {
+    /// Check if this entry has the extended v2 fields populated.
+    pub fn is_v2_entry(&self) -> bool {
+        self.name.is_some()
+            || self.version.is_some()
+            || self.source.is_some()
+            || self.resolved.is_some()
+            || self.fetch_url.is_some()
+    }
+
+    /// Set the v2 metadata fields on this lock entry.
+    pub fn set_v2_metadata(
+        &mut self,
+        name: Option<String>,
+        version: Option<String>,
+        source: Option<String>,
+        resolved: Option<String>,
+        fetch_url: Option<String>,
+    ) {
+        self.name = name;
+        self.version = version;
+        self.source = source;
+        self.resolved = resolved;
+        self.fetch_url = fetch_url;
+    }
+}
+
+/// Read a lockfile from disk and attempt v1→v2 migration if needed.
+/// Returns the lockfile and whether migration was performed.
+pub fn read_lockfile_with_migration(
+    lock_path: &Path,
+    manifest_dir: &Path,
+) -> Result<(Lockfile, bool), String> {
+    let toml_str = std::fs::read_to_string(lock_path)
+        .map_err(|e| format!("read lockfile '{}': {e}", lock_path.display()))?;
+    let mut lock = parse_lockfile(&toml_str)?;
+    if lock.is_v2() {
+        return Ok((lock, false));
+    }
+    lock.migrate_to_v2(manifest_dir)?;
+    Ok((lock, true))
+}
+
 /// Lockfile v2: path + sha256 required; name/version/source/resolved/fetch_url optional.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LockedDep {
@@ -123,15 +209,21 @@ pub struct LockedDep {
 // Registry types
 // ──────────────────────────────────────────────────────────────
 
-/// Registry index: packages -> version -> { url, sha256 }.
+/// Registry index: packages -> version -> { url, sha256, description, dependencies }.
 pub type RegistryIndex =
     std::collections::HashMap<String, std::collections::HashMap<String, RegistryRelease>>;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RegistryRelease {
     pub url: String,
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Human-readable description for the package.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Package dependencies as name -> version mapping.
+    #[serde(default)]
+    pub dependencies: std::collections::BTreeMap<String, String>,
 }
 
 /// Search result returned by `search_registry`.
@@ -140,6 +232,201 @@ pub struct SearchResult {
     pub name: String,
     pub version: String,
     pub description: String,
+}
+
+/// The source location of a registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrySource {
+    /// GitHub-hosted registry: owner/repo pair.
+    GitHub { owner: String, repo: String },
+    /// GitLab-hosted registry: optional custom host, owner, repo.
+    GitLab {
+        host: Option<String>,
+        owner: String,
+        repo: String,
+    },
+    /// Direct HTTP(S) registry URL.
+    DirectHttp { url: String },
+}
+
+impl RegistrySource {
+    /// Return the base URL for API calls.
+    pub fn base_url(&self) -> String {
+        match self {
+            RegistrySource::GitHub { owner, repo } => {
+                format!("https://api.github.com/repos/{owner}/{repo}/releases")
+            }
+            RegistrySource::GitLab { host, owner, repo } => {
+                let h = host.as_deref().unwrap_or("https://gitlab.com");
+                format!("{h}/api/v4/projects/{owner}%2F{repo}")
+            }
+            RegistrySource::DirectHttp { url } => url.clone(),
+        }
+    }
+
+    /// Construct from a URL string, attempting to detect the source type.
+    pub fn from_url(url: &str) -> Self {
+        if url.starts_with("file://") {
+            return RegistrySource::DirectHttp {
+                url: url.to_string(),
+            };
+        }
+        if let Some(rest) = url.strip_prefix("https://github.com/") {
+            let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+            if parts.len() >= 2 {
+                return RegistrySource::GitHub {
+                    owner: parts[0].to_string(),
+                    repo: parts[1].to_string(),
+                };
+            }
+        }
+        if let Some(rest) = url.strip_prefix("https://gitlab.com/") {
+            let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+            if parts.len() >= 2 {
+                return RegistrySource::GitLab {
+                    host: None,
+                    owner: parts[0].to_string(),
+                    repo: parts[1].to_string(),
+                };
+            }
+        }
+        RegistrySource::DirectHttp {
+            url: url.trim_end_matches('/').to_string(),
+        }
+    }
+}
+
+/// Structured package metadata as returned by a registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageMetadata {
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub dependencies: std::collections::BTreeMap<String, String>,
+    /// SHA-256 checksum of the package tarball.
+    #[serde(default)]
+    pub checksum: Option<String>,
+    /// URL to download the package tarball.
+    #[serde(default)]
+    pub download_url: Option<String>,
+}
+
+/// A client for interacting with a pblang package registry.
+pub struct RegistryClient {
+    base_url: String,
+    token: Option<String>,
+}
+
+impl RegistryClient {
+    /// Create a new `RegistryClient` for the given registry base URL.
+    pub fn new(base_url: String) -> Self {
+        RegistryClient {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: None,
+        }
+    }
+
+    /// Create a new `RegistryClient` with an auth token.
+    pub fn with_token(base_url: String, token: String) -> Self {
+        RegistryClient {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: Some(token),
+        }
+    }
+
+    /// Set or replace the auth token.
+    pub fn set_token(&mut self, token: String) {
+        self.token = Some(token);
+    }
+
+    /// Return the base URL of this client.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Fetch package metadata and tarball for a specific name and version.
+    ///
+    /// Returns `(PackageMetadata, tarball_bytes)` on success.
+    pub fn fetch(
+        &self,
+        package_name: &str,
+        version: &str,
+    ) -> Result<(PackageMetadata, Vec<u8>), String> {
+        let index_url = format!("{}/index.json", self.base_url);
+        let index_bytes = fetch_url(&index_url)?;
+        let index = parse_registry_index(&index_bytes)?;
+
+        let releases = index
+            .get(package_name)
+            .ok_or_else(|| format!("registry: package '{}' not in index", package_name))?;
+        let release = releases.get(version).ok_or_else(|| {
+            format!(
+                "registry: version {} not found for '{}'",
+                version, package_name
+            )
+        })?;
+
+        let release_fetch_url = resolve_registry_release_url(&index_url, &release.url);
+        let tarball_bytes = fetch_url(&release_fetch_url)?;
+
+        if let Some(ref expected) = release.sha256 {
+            let actual = hex::encode(Sha256::digest(&tarball_bytes));
+            if !expected.eq_ignore_ascii_case(&actual) {
+                return Err(format!(
+                    "registry: checksum mismatch for {} {}: expected {} got {}",
+                    package_name, version, expected, actual
+                ));
+            }
+        }
+
+        let metadata = PackageMetadata {
+            name: package_name.to_string(),
+            version: version.to_string(),
+            description: release.description.clone().unwrap_or_default(),
+            dependencies: release.dependencies.clone(),
+            checksum: release.sha256.clone(),
+            download_url: Some(release_fetch_url),
+        };
+
+        Ok((metadata, tarball_bytes))
+    }
+
+    /// Search the registry for packages matching `query`.
+    pub fn search(&self, query: &str) -> Result<Vec<SearchResult>, String> {
+        search_registry(&self.base_url, query)
+    }
+
+    /// Publish a package directory to this registry.
+    pub fn publish(&self, package_dir: &Path) -> Result<(), String> {
+        let token = self.token.as_deref().unwrap_or("");
+        publish_package(&self.base_url, package_dir, token)
+    }
+
+    /// Install a package into the local cache, returning the cache path and metadata.
+    pub fn install(
+        &self,
+        package_name: &str,
+        version: &str,
+        cache_dir: &Path,
+        _require_sha: bool,
+    ) -> Result<(PathBuf, PackageMetadata), String> {
+        let (metadata, tarball_bytes) = self.fetch(package_name, version)?;
+
+        let archive_sha256 = hex::encode(Sha256::digest(&tarball_bytes));
+        let cache_entry = cache_dir.join(&archive_sha256);
+        if !cache_entry.is_dir() {
+            unpack_tarball_gz(&tarball_bytes, &cache_entry)?;
+        }
+
+        validate_package_tree(&cache_entry)?;
+
+        let mut meta = metadata;
+        meta.checksum = Some(archive_sha256);
+
+        Ok((cache_entry, meta))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -205,7 +492,28 @@ pub fn parse_registry_index(json: &[u8]) -> Result<RegistryIndex, String> {
                 .get("sha256")
                 .and_then(|s| s.as_str())
                 .map(String::from);
-            releases.insert(ver.clone(), RegistryRelease { url, sha256 });
+            let description = release_obj
+                .get("description")
+                .and_then(|s| s.as_str())
+                .map(String::from);
+            let dependencies_val = release_obj.get("dependencies");
+            let dependencies: std::collections::BTreeMap<String, String> = dependencies_val
+                .and_then(|d| d.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            releases.insert(
+                ver.clone(),
+                RegistryRelease {
+                    url,
+                    sha256,
+                    description,
+                    dependencies,
+                },
+            );
         }
         index.insert(pkg_name.clone(), releases);
     }
