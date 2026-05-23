@@ -413,7 +413,7 @@ fn csv_stdlib_parse_and_stringify_work() {
         print len(rows[1]);
         print rows[1][0];
         print rows[1][1];
-        let back = csv.stringify(rows, ",", nil);
+        let back = csv.stringify(rows);
         print back;
     "#;
     let out = run_collect(src);
@@ -454,4 +454,72 @@ fn math_stdlib_complex_and_algorithms_work() {
             Value::Number(32.0)
         ]
     );
+}
+
+/// Verifies the stdlib's new optional-parameter ergonomics: a wide set of
+/// stdlib functions now declare default values in their signatures
+/// (`fn f(a, b = 10)`) instead of relying on caller-must-pass-nil
+/// workarounds. Callers can omit trailing args and get the documented
+/// defaults — this test would have failed at "arity mismatch" before the
+/// migration.
+#[test]
+fn stdlib_optional_params_omit_trailing_args() {
+    let src = r#"
+        import "stdlib:csv.sapp";
+        import "stdlib:ml.sapp";
+        import "stdlib:async_io.sapp";
+        import "stdlib:class.sapp";
+        import "stdlib:http_client.sapp";
+
+        // csv.parse: text only, delimiter defaults to ",", has_header to false
+        let rows = csv.parse("a,b\nc,d");
+        print len(rows);
+        print rows[0][1];
+
+        // csv.stringify: data only, delimiter "," and headers nil by default
+        print csv.stringify([["x","y"]]);
+
+        // ml.train_test_split: data only, test_ratio defaults to 0.2
+        let split = ml.train_test_split([1,2,3,4,5,6,7,8,9,10]);
+        print len(split.train) + len(split.test);
+
+        // ml.normalize_range: values only, range defaults to [0.0, 1.0]
+        let nr = ml.normalize_range([0.0, 5.0, 10.0]);
+        print nr[0];
+        print nr[2];
+
+        // async_io.create_semaphore: no args, max_concurrent defaults to 4
+        let s = async_io.create_semaphore();
+        print s._max;
+
+        // class.define: only name required, fields and methods default to nil
+        let cls = class.define("Tag");
+        print len(cls.__fields);
+
+        // http_client.new: no args, base_url "" and headers map{} by default
+        let c = http_client.new();
+        print c._base_url;
+
+        // graph.new defaults to directed=true; add_edge defaults weight to 1.0
+        import "stdlib:graph.sapp";
+        let g = graph.new();
+        print g.directed;
+        let g = graph.add_node(g, "a");
+        let g = graph.add_node(g, "b");
+        let g = graph.add_edge(g, "a", "b");
+        print g._edge_list[0].weight;
+    "#;
+    let out = run_collect(src);
+    assert_eq!(out.len(), 11);
+    assert_eq!(out[0], Value::Number(2.0));
+    assert_eq!(out[1].as_str().unwrap(), "b");
+    assert_eq!(out[2].as_str().unwrap(), "x,y\n");
+    assert_eq!(out[3], Value::Number(10.0));
+    assert_eq!(out[4], Value::Number(0.0));
+    assert_eq!(out[5], Value::Number(1.0));
+    assert_eq!(out[6], Value::Number(4.0));
+    assert_eq!(out[7], Value::Number(0.0));
+    assert_eq!(out[8].as_str().unwrap(), "");
+    assert_eq!(out[9], Value::Bool(true));
+    assert_eq!(out[10], Value::Number(1.0));
 }
