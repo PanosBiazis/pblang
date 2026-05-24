@@ -1240,6 +1240,60 @@ fn self_extract_runs_without_pblang_on_path() {
 }
 
 #[test]
+fn self_extract_with_dot_cwd_includes_package_files() {
+    // Regression: when `pblang bundle --self-extract .` was invoked with
+    // the manifest dir as `.`, the walkdir filter saw the root entry's
+    // `file_name() == "."` (because the path was relative), tripped the
+    // `!name.starts_with('.')` dotfile filter, and silently skipped the
+    // entire tree — producing a bundle with ONLY `pblang.toml` and
+    // `bin/pblang` (those were rescued by separate explicit copies).
+    // The resulting binary then failed at runtime with
+    // "package entry component not found 'main.sapp'".
+    //
+    // This test reproduces the failing path: cd into the project, run
+    // bundle with `.`, and confirm the produced binary actually runs and
+    // emits the expected output.
+    let proj = make_temp_project_with_manifest_entry("pblang_self_extract_dot_cwd");
+    let out_exe = proj.join("dot_app");
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
+    ensure_pblang_stub_built(bin);
+
+    let bundle = std::process::Command::new(bin)
+        .arg("bundle")
+        .arg("--self-extract")
+        .arg("--output")
+        .arg(&out_exe)
+        .arg(".") // <-- the relative path that used to break the walk
+        .current_dir(&proj)
+        .output()
+        .expect("bundle --self-extract .");
+    assert!(
+        bundle.status.success(),
+        "bundle --self-extract . failed: {}",
+        String::from_utf8_lossy(&bundle.stderr)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let output = std::process::Command::new(&out_exe)
+        .env_remove("PATH")
+        .output()
+        .expect("run self-extract binary built from `.`");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("42"),
+        "self-extract app built from `.` should print 42; stdout={stdout} stderr={stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
+#[test]
 fn self_extract_extract_only_includes_embedded_runtime() {
     let proj = make_temp_project_with_manifest_entry("pblang_self_extract_extract_only");
     let out_exe = proj.join("app.bin");

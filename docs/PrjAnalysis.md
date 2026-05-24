@@ -8,6 +8,9 @@ This document is the current validation baseline for analysis claims against the
 - Re-checked core claims from prior analysis dumps and this file.
 - Confirmed build health with `cargo check -q` (workspace).
 - Cross-referenced claims from GPT-5.4 Thinking, Deep Research, Gemini 3.1 Pro Thinking, and Claude Sonnet 4.6 analyses.
+- **2026-05-24 refresh:** re-verified after the chumsky 1.0 migration and SP1-gamma
+  match-guard fix; sections below updated to move resolved items into "True and
+  Fixed" and to drop the chumsky-0.8 claim that no longer holds.
 
 ## True and Fixed
 
@@ -81,21 +84,23 @@ This document is the current validation baseline for analysis claims against the
 - Native encoding builtins: `hex_encode`, `hex_decode`, `url_encode`, `url_decode` (RFC 3986 unreserved set + `+` shorthand on decode) — 50-100x faster than the pure-pblang fallbacks in `stdlib/encoding.sapp`. Pair with the existing `base64_encode`/`base64_decode` natives.
 - Polyglot build manifest expanded: `stdlib/polyglot_build.sapp` now supports `@rust`, `@c`, `@cpp/@c++/@cxx`, `@go` (c-shared lib), `@ruby`, `@python`, `@js`/`@javascript`, and `@wasm/@wat` (via `wat2wasm`).
 - Strict-parse for batch compilation is in place — `pblang run`, `pblang compile`, and `pblang lint` already call `parse_strict` and report errors rather than silently recovering. The recovery parser remains used in LSP/IDE and `analyze` where partial AST is helpful.
+- **chumsky 1.0.0-alpha.8 migration is complete** (was 0.8 in earlier baseline, briefly 0.9.3): workspace dep pinned to `=1.0.0-alpha.8`, `parser()` reshaped to `Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simple<'src, char>>>`, 70× `.map_with_span` → `.map_with(|_, e| … e.span().into_range())`, `text::ident/int/digits` mapped from `&str` back to `String`, `.foldl` argument order flipped, `Simple::custom` → `LabelError::expected_found`, `parse_recovery` → `parser().parse(...).into_output_errors()`. Owned `ParseError { message, span, found }` introduced at the `pblang-core` boundary (chumsky 1.0's `Simple` borrows from input). CLI + LSP diagnostics keep span-based underlining.
+- **SP1-gamma match-guard parser fixed** (`tests/semantics.rs::match_guard_pass` un-ignored). Two-part fix: (1) a restricted `guard_expr` sub-parser via `Recursive::declare()` that bottoms out at `<atom> [cmp_op <atom>]` using only `.or_not()` — avoids the chumsky `.padded().repeated()` cascade past the trailing `~`/`#` separator; (2) the guarded-arm prefix used `ws1.then_ignore(just("if"))` after `ident.padded()`, which required whitespace that padding had already consumed — switched to `just("if").padded()`.
+- **`crates/pblang-vm/src/vm.rs` split into submodules**: `vm.rs` is down from ~12,048 → 10,586 lines and now coexists with `crates/pblang-vm/src/vm/` containing `spawn_wire.rs`, `ffi_dispatch.rs`, `gc.rs`, `handles.rs`, `db.rs`, `net.rs`. Further extraction is still possible (instruction dispatch, builtins by category) but the file is no longer monolithic.
 
 ## True but Not Fully Fixed (Large Refactor / Design Work)
 
-- `resolve_package_entry` remains best-effort for TOCTOU resistance.
-  - Additional full guarantees require platform-specific open-and-verify (`openat` / `O_NOFOLLOW` style).
-- `src/main.rs` is still monolithic (~5,330 lines); modularization is substantial architectural work.
-- `crates/pblang-vm/src/vm.rs` is also monolithic (~9,454 lines); splitting into sub-modules (dispatch, builtins, stdlib, ffi) is recommended.
+- `resolve_package_entry` TOCTOU is now further hardened with `O_NOFOLLOW` on Unix in `read_text_file_with_race_check` (rejects symlink swaps between `canonicalize` and `open`). The dev/inode check remains as a second line of defence (covers non-symlink races like rename+replace). Full per-component `openat`/`O_PATH` chains or Linux's `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` are still an option if the threat model expands; current defence is two-deep.
+- `src/main.rs` is now ~5,999 lines (grew slightly when the clap migration added 21 subcommand wrappers + `legacy_dispatch`). Modularization into `src/cli/*.rs` modules is still substantial architectural work; the clap migration is a prerequisite that's now done.
+- `crates/pblang-vm/src/vm.rs` is now 10,163 lines (was 10,586 before string-builtins extraction). Submodules under `src/vm/`: `spawn_wire`, `ffi_dispatch`, `gc`, `handles`, `db`, `net`, **`strings` (new — 438 lines, 17 str_* builtins)**. Further extraction candidates: array builtins, map builtins, math builtins, and the main instruction dispatch.
+- **CLI argument parsing** — clap 4 is now wired as the top-level subcommand router for 21 commands (`init`, `new`, `manifest-check`, `manifest-parity`, `install`, `publish`, `search`, `fetch`, `pack`, `verify`, `build`, `bundle`, `transpile`, `lsp`, `serve`, `fmt`, `lint`, `test`, `run`, `compile`, `build-polyglot`). Per-subcommand flag parsing inside handlers is still manual; the legacy `if args.first() == Some(…)` chain is preserved as a fallback for top-level "flag-as-subcommand" forms (`--lock`, `--cfg`, `--check`, `--doc`, `--call-graph`, `--dataflow`, `--dump-bytecode`, `--annotate`, `--symbols`) that clap can't model without redesign.
+- **`pblang bundle --self-extract`** — the walkdir filter that dropped the entire package tree when invoked with a relative `.` path is fixed (`e.depth() != 0` exception for the root entry). Regression test in `tests/pack.rs::self_extract_with_dot_cwd_includes_package_files` covers this. Existing tests only used absolute paths so didn't catch it.
 - Some crates/features remain roadmap-partial by design (LLVM/Cranelift/WASM/AI/quantum depth and integration level).
-- `parse_with_polyglot` falls back to `parse_recovery()` when strict parsing fails — intentional for REPL/IDE/analyze paths only. Batch commands (`run`, `compile`, `lint`) call `parse_strict` and surface errors.
-- IDE server is single-threaded (uses `threadpool` for request handling but still one `TcpListener::incoming()` loop); full async migration to tokio is recommended.
-- Hand-rolled HTTP server in `pblang serve` — replacing with `axum` or `tiny_http` would reduce vulnerability surface.
-- CLI argument parsing is manual `if args.first() == Some(...)` chains; migration to `clap`/`argh` is recommended.
-- `pblang-ffi` is workspace member but not in main `[dependencies]` — not reachable from the binary.
-- `pblang-cranelift` is dev-only (only in `[dev-dependencies]`).
-- `chumsky` is pinned to 0.8 (old API); migration to 1.x would improve parser error messages.
+- `parse_with_polyglot` keeps a recovery-style fallback (chumsky 1.0 `parser().parse(...).into_output_errors()` after a failed strict parse) — intentional for REPL/IDE/analyze paths only. Batch commands (`run`, `compile`, `lint`) call `parse_strict` and surface errors.
+- IDE server is single-threaded (uses `threadpool` for request handling but still one `TcpListener::incoming()` loop); full async migration to tokio is recommended. **Ready for a fresh session** — bounded scope, IDE handler is ~200 lines of accept-loop + response writing.
+- Hand-rolled HTTP server in `pblang serve` — replacing with `axum` or `tiny_http` would reduce vulnerability surface. **Ready for a fresh session** — handlers span ~600 lines from line 4042 in `src/main.rs` with manual `HTTP/1.1 …\r\n…` response strings throughout.
+- `pblang-ffi` is intentionally a separate `cdylib` (see `crates/pblang-ffi/Cargo.toml`: `crate-type = ["cdylib"]`), not a binary dependency. It exposes a C ABI (`pblang_create_vm`, `pblang_call_function`, `pblang_eval`, `pblang_set_limits`, …) so **external** C/C++/Python/Go programs can embed pblang. The in-VM FFI direction (pblang code calling out to host C libraries) is a different surface in `crates/pblang-vm/src/vm/ffi_dispatch.rs`. Earlier reports flagged "not reachable from the binary" — that was a category error; the cdylib is reached by *consumers*, not by `pblang`. The build is verified (`cargo build -p pblang-ffi --lib`).
+- `pblang-cranelift` is now in `[dependencies]` (used for `host_target_triple()` in `src/main.rs`). Previously dev-only.
 
 ## Outdated / Incorrect Claims (Current Code)
 
@@ -122,5 +127,5 @@ This document is the current validation baseline for analysis claims against the
 
 - If new fixes are applied, update this file by moving items between sections rather than appending raw reports.
 - This validation was done against the GitHub repository state, not just historical reports.
-- Current branch: `devin/1779130661-analysis-v2-fixes`
-- Last updated: 2026-05-18
+- Current branch: `main`
+- Last updated: 2026-05-24 (chumsky 1.0 + SP1-gamma refresh)
