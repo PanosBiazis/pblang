@@ -7,10 +7,10 @@ pub use pblang_ir::{FrameTrace, RuntimeError};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -21,18 +21,16 @@ use std::{
 
 // Import our new modules
 use crate::concurrency::{
-    SpawnWireClosure, SpawnWireFunction, SpawnWireValue, ThreadPool, VmChannelBuf,
-    VmHandleRegistry, VmSyncAtomic, VmSyncBarrier, VmSyncMutex, VmSyncOnce, VmSyncRwLock,
+    SpawnWireClosure, SpawnWireValue, ThreadPool, VmChannelBuf, VmHandleRegistry, VmSyncAtomic,
+    VmSyncBarrier, VmSyncMutex, VmSyncOnce, VmSyncRwLock,
 };
+// SpawnWireFunction is now only referenced from inside vm/spawn_wire.rs.
 use crate::memory_safety::{BorrowId, BorrowType, MemoryId, MemorySafetyError, MemoryTracker};
 
-// TLS support via rustls
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{
-    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
-};
-use rustls_native_certs;
-use webpki_roots;
+// TLS types still referenced by `StreamKind` / `NetResource` defs in this
+// file. The TCP/TLS builtin closures moved to vm/net.rs and bring their own
+// rustls / webpki-roots / rustls-native-certs imports.
+use rustls::{ClientConnection, ServerConfig, ServerConnection, StreamOwned};
 
 use libloading::Library;
 use rand::Rng; // for random_bytes builtin
@@ -40,54 +38,50 @@ use regex; // for regex_* builtins
 use rusqlite::Connection;
 use serde_json as sj;
 use sha2::Digest;
+
+// Submodules of the VM. Each holds a self-contained slice of vm.rs that
+// could be reviewed independently — extracted to keep this file readable.
+mod db;
+mod ffi_dispatch;
+mod gc;
+mod handles;
+mod net;
+mod spawn_wire;
+
+use gc::{gc_register_array, gc_register_map, gc_register_module};
+use handles::{value_to_handle, vm_handles, with_ffi_table, FFI_NEXT};
+// db_table / ffi_table / net_table accessors are reached only via the
+// with_*_table wrappers; no need to import the raw fns here.
+// DB_NEXT/with_db_table → used by vm/db.rs directly.
+// NET_NEXT/with_net_table → used by vm/net.rs directly.
+
+use ffi_dispatch::{dispatch_ffi, parse_ffi_sig};
+// c_str_to_value is only used inside ffi_dispatch (by dispatch_ffi); it's
+// `pub(super)` there but we don't need to re-import it into the parent.
+use spawn_wire::{
+    spawn_closure_from_wire, spawn_function_to_wire, spawn_value_from_json, spawn_value_from_wire,
+    spawn_value_to_json, spawn_value_to_wire,
+};
+// spawn_function_from_wire / spawn_closure_to_wire are only called from inside
+// spawn_wire.rs (by spawn_value_from_wire / spawn_value_to_wire); no need to
+// re-import them here.
 static ARRAY_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static MAP_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static MODULE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
-// --- Tracing / cycle collection (mark & sweep over RC containers) ---
-//
-// Sapphire's runtime objects are mostly reference-counted. RC cycles can leak
-// (e.g. `let a=[]; a[0]=a;`). To address this without rewriting the runtime,
-// we keep weak registries of container objects and run a tracing pass from VM
-// roots, then *clear* unreachable containers to break cycles.
-type GcArrayRegistry = HashMap<usize, Weak<RefCell<Vec<Value>>>>;
-type GcMapRegistry = HashMap<usize, Weak<RefCell<HashMap<String, Value>>>>;
-type GcModuleRegistry = HashMap<usize, Weak<RefCell<Module>>>;
-thread_local! {
-    static GC_ARRAYS: RefCell<GcArrayRegistry> = RefCell::new(HashMap::new());
-    static GC_MAPS: RefCell<GcMapRegistry> = RefCell::new(HashMap::new());
-    static GC_MODULES: RefCell<GcModuleRegistry> = RefCell::new(HashMap::new());
-}
+// Container tracing / cycle collection moved to vm/gc.rs (imported above).
+// `alloc_array` / `alloc_map` / `import_module` register their new container
+// with the weak registries via `gc_register_*`. The mark-and-sweep entry
+// point is `VM::gc_collect_cycles_impl`, an `impl VM` block in vm/gc.rs.
 
-fn gc_register_array(a: &Rc<RefCell<Vec<Value>>>) {
-    let id = a.as_ptr() as usize;
-    GC_ARRAYS.with(|t| {
-        t.borrow_mut().insert(id, Rc::downgrade(a));
-    });
-}
-
-fn gc_register_map(m: &Rc<RefCell<HashMap<String, Value>>>) {
-    let id = m.as_ptr() as usize;
-    GC_MAPS.with(|t| {
-        t.borrow_mut().insert(id, Rc::downgrade(m));
-    });
-}
-
-fn gc_register_module(m: &Rc<RefCell<Module>>) {
-    let id = m.as_ptr() as usize;
-    GC_MODULES.with(|t| {
-        t.borrow_mut().insert(id, Rc::downgrade(m));
-    });
-}
-
-fn alloc_array(items: Vec<Value>) -> Value {
+pub(super) fn alloc_array(items: Vec<Value>) -> Value {
     ARRAY_ALLOCS.fetch_add(1, Ordering::Relaxed);
     let rc = Rc::new(RefCell::new(items));
     gc_register_array(&rc);
     Value::Array(rc)
 }
 
-fn alloc_map(items: HashMap<String, Value>) -> Value {
+pub(super) fn alloc_map(items: HashMap<String, Value>) -> Value {
     MAP_ALLOCS.fetch_add(1, Ordering::Relaxed);
     let rc = Rc::new(RefCell::new(items));
     gc_register_map(&rc);
@@ -95,14 +89,16 @@ fn alloc_map(items: HashMap<String, Value>) -> Value {
 }
 
 #[derive(Debug)]
-enum NetResource {
+pub(super) enum NetResource {
     Listener(TcpListener),
     TlsListener(TcpListener, Arc<ServerConfig>),
     Stream(Box<NetStream>),
 }
 
-// StreamKind abstracts over plain and TLS streams for transparent tcp_read/tcp_write
-enum StreamKind {
+// StreamKind abstracts over plain and TLS streams for transparent tcp_read/tcp_write.
+// `pub(super)` so the net-builtins submodule can name the variants when it
+// constructs / destructures Stream values.
+pub(super) enum StreamKind {
     Plain(TcpStream),
     TlsServer(StreamOwned<ServerConnection, TcpStream>),
     TlsClient(StreamOwned<ClientConnection, TcpStream>),
@@ -173,499 +169,31 @@ impl StreamKind {
     }
 }
 
+// `pub(super)` so the `NetResource::Stream(Box<NetStream>)` variant — which
+// is itself `pub(super)` — doesn't trip the "type is more private than the
+// item that references it" lint after the handles.rs extraction.
 #[derive(Debug)]
-struct NetStream {
+pub(super) struct NetStream {
     inner: StreamKind,
     buf: Vec<u8>,
 }
 
-static NET_TABLE: OnceLock<Mutex<HashMap<usize, NetResource>>> = OnceLock::new();
-static NET_NEXT: AtomicUsize = AtomicUsize::new(1);
-
-fn net_table() -> &'static Mutex<HashMap<usize, NetResource>> {
-    NET_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+// Resource enums live here because their variants reference platform /
+// library types (TcpListener, rustls config, Library, Connection) — those
+// imports stay with vm.rs. The static OnceLock tables, NEXT counters,
+// with_*_table helpers, value_to_handle, and vm_handles all moved to
+// vm/handles.rs (imported above).
+//
+// parse_ffi_sig + dispatch_ffi + c_str_to_value moved to vm/ffi_dispatch.rs.
 
 #[derive(Debug)]
-enum FfiResource {
+pub(super) enum FfiResource {
     Library(Library),
 }
 
-static FFI_TABLE: OnceLock<Mutex<HashMap<usize, FfiResource>>> = OnceLock::new();
-static FFI_NEXT: AtomicUsize = AtomicUsize::new(1);
-
-fn ffi_table() -> &'static Mutex<HashMap<usize, FfiResource>> {
-    FFI_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 #[derive(Debug)]
-enum DbResource {
+pub(super) enum DbResource {
     Sqlite(Connection),
-}
-
-static DB_TABLE: OnceLock<Mutex<HashMap<usize, DbResource>>> = OnceLock::new();
-static DB_NEXT: AtomicUsize = AtomicUsize::new(1);
-
-fn db_table() -> &'static Mutex<HashMap<usize, DbResource>> {
-    DB_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn vm_handles(host: &mut dyn VmHost) -> Result<Arc<VmHandleRegistry>, RuntimeError> {
-    host.as_any_mut()
-        .downcast_mut::<VM>()
-        .map(|vm| Arc::clone(&vm.handle_registry))
-        .ok_or_else(|| host.err("concurrency: internal host error".into()))
-}
-
-/// Serialize a Value to JSON for sending to a spawn child (transferable types only).
-fn spawn_value_to_json(v: &Value) -> Result<sj::Value, String> {
-    match v {
-        Value::Nil => Ok(sj::Value::Null),
-        Value::Bool(b) => Ok(sj::Value::Bool(*b)),
-        Value::Number(n) => Ok(sj::Number::from_f64(*n)
-            .map(sj::Value::Number)
-            .unwrap_or(sj::Value::Null)),
-        Value::Obj(o) => match o.as_ref() {
-            Obj::String(s) => Ok(sj::Value::String(s.clone())),
-        },
-        Value::Array(a) => {
-            let a = a.borrow();
-            let mut out = Vec::with_capacity(a.len());
-            for x in a.iter() {
-                out.push(spawn_value_to_json(x)?);
-            }
-            Ok(sj::Value::Array(out))
-        }
-        Value::Map(m) => {
-            let m = m.borrow();
-            let mut out = sj::Map::new();
-            for (k, vv) in m.iter() {
-                out.insert(k.clone(), spawn_value_to_json(vv)?);
-            }
-            Ok(sj::Value::Object(out))
-        }
-        _ => Err(
-            "spawn: value not transferable (use only numbers, bools, strings, arrays, maps)".into(),
-        ),
-    }
-}
-
-/// Deserialize JSON to Value (used in spawn child thread).
-fn spawn_value_from_json(v: &sj::Value) -> Value {
-    match v {
-        sj::Value::Null => Value::Nil,
-        sj::Value::Bool(b) => Value::Bool(*b),
-        sj::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(0.0)),
-        sj::Value::String(s) => alloc_string(s.clone()),
-        sj::Value::Array(items) => alloc_array(items.iter().map(spawn_value_from_json).collect()),
-        sj::Value::Object(map) => {
-            let mut out = HashMap::new();
-            for (k, vv) in map.iter() {
-                out.insert(k.clone(), spawn_value_from_json(vv));
-            }
-            alloc_map(out)
-        }
-    }
-}
-
-fn spawn_function_to_wire(function: &Rc<Function>) -> Result<SpawnWireFunction, String> {
-    let defaults = function
-        .defaults
-        .iter()
-        .map(spawn_value_to_wire)
-        .collect::<Result<Vec<_>, _>>()?;
-    let constants = function
-        .chunk
-        .constants
-        .iter()
-        .map(spawn_value_to_wire)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(SpawnWireFunction {
-        name: function.name.clone(),
-        arity: function.arity,
-        min_arity: function.min_arity,
-        defaults,
-        is_vararg: function.is_vararg,
-        instructions: function.chunk.instructions.clone(),
-        spans: function.chunk.spans.clone(),
-        constants,
-        param_types: function.param_types.clone(),
-    })
-}
-
-fn spawn_closure_to_wire(closure: &Rc<Closure>) -> Result<SpawnWireClosure, String> {
-    let function = spawn_function_to_wire(&closure.function)?;
-    let mut upvalues = Vec::with_capacity(closure.upvalues.len());
-    for uv in &closure.upvalues {
-        let v = match &*uv.borrow() {
-            Upvalue::Closed(v) => v.clone(),
-            Upvalue::Open(_) => {
-                return Err(
-                    "spawn: closure transfer requires closed upvalues (open upvalue found)".into(),
-                );
-            }
-        };
-        upvalues.push(spawn_value_to_wire(&v)?);
-    }
-    Ok(SpawnWireClosure { function, upvalues })
-}
-
-/// Serialize a Value to a send-safe representation for spawn/join.
-fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
-    match v {
-        Value::Nil => Ok(SpawnWireValue::Nil),
-        Value::Bool(b) => Ok(SpawnWireValue::Bool(*b)),
-        Value::Number(n) => Ok(SpawnWireValue::Number(*n)),
-        Value::Obj(o) => match o.as_ref() {
-            Obj::String(s) => Ok(SpawnWireValue::String(s.clone())),
-        },
-        Value::Array(a) => {
-            let a = a.borrow();
-            let mut out = Vec::with_capacity(a.len());
-            for x in a.iter() {
-                out.push(spawn_value_to_wire(x)?);
-            }
-            Ok(SpawnWireValue::Array(out))
-        }
-        Value::Map(m) => {
-            let m = m.borrow();
-            let mut out = HashMap::with_capacity(m.len());
-            for (k, vv) in m.iter() {
-                out.insert(k.clone(), spawn_value_to_wire(vv)?);
-            }
-            Ok(SpawnWireValue::Map(out))
-        }
-        Value::Function(f) => Ok(SpawnWireValue::Function(Box::new(spawn_function_to_wire(
-            f,
-        )?))),
-        Value::Closure(c) => Ok(SpawnWireValue::Closure(Box::new(spawn_closure_to_wire(c)?))),
-        _ => Err(
-            "spawn: value not transferable (unsupported: builtin/module/resource handle)".into(),
-        ),
-    }
-}
-
-fn spawn_function_from_wire(
-    f: &SpawnWireFunction,
-    module: Rc<RefCell<Module>>,
-) -> Result<Rc<Function>, String> {
-    let defaults = f
-        .defaults
-        .iter()
-        .map(|v| spawn_value_from_wire(v, module.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let constants = f
-        .constants
-        .iter()
-        .map(|v| spawn_value_from_wire(v, module.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Rc::new(Function {
-        name: f.name.clone(),
-        arity: f.arity,
-        min_arity: f.min_arity,
-        defaults,
-        is_vararg: f.is_vararg,
-        chunk: Chunk {
-            instructions: f.instructions.clone(),
-            spans: f.spans.clone(),
-            constants,
-            source_name: None,
-            source: None,
-        },
-        param_types: f.param_types.clone(),
-    }))
-}
-
-fn spawn_closure_from_wire(
-    c: &SpawnWireClosure,
-    module: Rc<RefCell<Module>>,
-) -> Result<Rc<Closure>, String> {
-    let function = spawn_function_from_wire(&c.function, module.clone())?;
-    let mut upvalues = Vec::with_capacity(c.upvalues.len());
-    for v in &c.upvalues {
-        let vv = spawn_value_from_wire(v, module.clone())?;
-        upvalues.push(Rc::new(RefCell::new(Upvalue::Closed(vv))));
-    }
-    Ok(Rc::new(Closure {
-        function,
-        upvalues,
-        module,
-    }))
-}
-
-fn spawn_value_from_wire(v: &SpawnWireValue, module: Rc<RefCell<Module>>) -> Result<Value, String> {
-    match v {
-        SpawnWireValue::Nil => Ok(Value::Nil),
-        SpawnWireValue::Bool(b) => Ok(Value::Bool(*b)),
-        SpawnWireValue::Number(n) => Ok(Value::Number(*n)),
-        SpawnWireValue::String(s) => Ok(alloc_string(s.clone())),
-        SpawnWireValue::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(spawn_value_from_wire(item, module.clone())?);
-            }
-            Ok(alloc_array(out))
-        }
-        SpawnWireValue::Map(map) => {
-            let mut out = HashMap::with_capacity(map.len());
-            for (k, vv) in map {
-                out.insert(k.clone(), spawn_value_from_wire(vv, module.clone())?);
-            }
-            Ok(alloc_map(out))
-        }
-        SpawnWireValue::Function(f) => Ok(Value::Function(spawn_function_from_wire(f, module)?)),
-        SpawnWireValue::Closure(c) => Ok(Value::Closure(spawn_closure_from_wire(c, module)?)),
-    }
-}
-
-fn value_to_handle(host: &mut dyn VmHost, v: Value, what: &str) -> Result<usize, RuntimeError> {
-    match v {
-        Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n >= 1.0 => Ok(n as usize),
-        _ => Err(host.err(format!("{what}: expected handle number"))),
-    }
-}
-
-// Safe table access: on Mutex poison return RuntimeError instead of panicking (crash resistance).
-fn with_ffi_table<F, R>(host: &mut dyn VmHost, f: F) -> Result<R, RuntimeError>
-where
-    F: FnOnce(&mut HashMap<usize, FfiResource>) -> R,
-{
-    let mut t = ffi_table()
-        .lock()
-        .map_err(|_| host.err("internal: ffi table unavailable".into()))?;
-    Ok(f(&mut t))
-}
-
-/// Parse an FFI signature like `"i64,string -> i64"` into `(arg_types, ret_type)`.
-fn parse_ffi_sig(s: &str) -> Result<(Vec<String>, String), String> {
-    let parts: Vec<&str> = s.split("->").collect();
-    if parts.len() != 2 {
-        return Err(format!("signature must be of the form 'a,b->c', got '{s}'"));
-    }
-    let arg_part = parts[0].trim();
-    let ret_part = parts[1].trim();
-    let args: Vec<String> = if arg_part.is_empty() {
-        vec![]
-    } else {
-        arg_part.split(',').map(|s| s.trim().to_string()).collect()
-    };
-    if ret_part.is_empty() {
-        return Err("missing return type after '->'".into());
-    }
-    let ret = ret_part.to_string();
-    for a in &args {
-        if !matches!(
-            a.as_str(),
-            "i64" | "i32" | "f64" | "f32" | "bool" | "string" | "ptr"
-        ) {
-            return Err(format!("unknown arg type '{a}'"));
-        }
-    }
-    if !matches!(
-        ret.as_str(),
-        "i64" | "i32" | "f64" | "f32" | "bool" | "string" | "ptr" | "void"
-    ) {
-        return Err(format!("unknown ret type '{ret}'"));
-    }
-    Ok((args, ret))
-}
-
-/// Dispatch an FFI call given the parsed signature `key` like `"i,s->i"` and
-/// already-typed argument arrays. Returns the result as a pblang Value.
-///
-/// SAFETY: caller must guarantee that the dynamically loaded `sym` in `lib`
-/// matches the signature represented by `key`. Mismatch is undefined behavior
-/// in the underlying C library — this is no different from raw `libloading`.
-unsafe fn dispatch_ffi(
-    lib: &Library,
-    sym: &str,
-    key: &str,
-    a_i: &[i64; 4],
-    a_d: &[f64; 4],
-    a_s: &[*const libc::c_char; 4],
-) -> Result<Value, String> {
-    // We encode types as i=integer/bool/ptr, d=double, s=string, v=void.
-    // Supported shapes: explicit list keeps trampoline count bounded.
-    let bytes = sym.as_bytes();
-    let get_err = |e: libloading::Error| format!("{e}");
-    match key {
-        // 0-arg returns
-        "->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn() -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f() as f64))
-        }
-        "->d" => {
-            let f: libloading::Symbol<unsafe extern "C" fn() -> f64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f()))
-        }
-        "->s" => {
-            let f: libloading::Symbol<unsafe extern "C" fn() -> *const libc::c_char> =
-                lib.get(bytes).map_err(get_err)?;
-            let p = f();
-            Ok(c_str_to_value(p))
-        }
-        "->v" => {
-            let f: libloading::Symbol<unsafe extern "C" fn()> = lib.get(bytes).map_err(get_err)?;
-            f();
-            Ok(Value::Nil)
-        }
-        // 1-arg shapes
-        "i->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_i[0]) as f64))
-        }
-        "i->d" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64) -> f64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_i[0])))
-        }
-        "i->s" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64) -> *const libc::c_char> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(c_str_to_value(f(a_i[0])))
-        }
-        "i->v" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64)> =
-                lib.get(bytes).map_err(get_err)?;
-            f(a_i[0]);
-            Ok(Value::Nil)
-        }
-        "d->d" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_d[0])))
-        }
-        "d->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(f64) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_d[0]) as f64))
-        }
-        "s->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(*const libc::c_char) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_s[0]) as f64))
-        }
-        "s->s" => {
-            let f: libloading::Symbol<
-                unsafe extern "C" fn(*const libc::c_char) -> *const libc::c_char,
-            > = lib.get(bytes).map_err(get_err)?;
-            Ok(c_str_to_value(f(a_s[0])))
-        }
-        "s->v" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(*const libc::c_char)> =
-                lib.get(bytes).map_err(get_err)?;
-            f(a_s[0]);
-            Ok(Value::Nil)
-        }
-        // 2-arg shapes
-        "i,i->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64, i64) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_i[0], a_i[1]) as f64))
-        }
-        "d,d->d" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_d[0], a_d[1])))
-        }
-        "s,s->i" => {
-            let f: libloading::Symbol<
-                unsafe extern "C" fn(*const libc::c_char, *const libc::c_char) -> i64,
-            > = lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_s[0], a_s[1]) as f64))
-        }
-        "s,s->s" => {
-            let f: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const libc::c_char,
-                    *const libc::c_char,
-                ) -> *const libc::c_char,
-            > = lib.get(bytes).map_err(get_err)?;
-            Ok(c_str_to_value(f(a_s[0], a_s[1])))
-        }
-        "i,s->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64, *const libc::c_char) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_i[0], a_s[1]) as f64))
-        }
-        "s,i->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(*const libc::c_char, i64) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_s[0], a_i[1]) as f64))
-        }
-        // 3-arg uniform shapes
-        "i,i,i->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64, i64, i64) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_i[0], a_i[1], a_i[2]) as f64))
-        }
-        "d,d,d->d" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64) -> f64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_d[0], a_d[1], a_d[2])))
-        }
-        "s,s,s->i" => {
-            let f: libloading::Symbol<
-                unsafe extern "C" fn(
-                    *const libc::c_char,
-                    *const libc::c_char,
-                    *const libc::c_char,
-                ) -> i64,
-            > = lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(f(a_s[0], a_s[1], a_s[2]) as f64))
-        }
-        // 4-arg shapes
-        "i,i,i,i->i" => {
-            let f: libloading::Symbol<unsafe extern "C" fn(i64, i64, i64, i64) -> i64> =
-                lib.get(bytes).map_err(get_err)?;
-            Ok(Value::Number(
-                f(a_i[0], a_i[1], a_i[2], a_i[3]) as f64,
-            ))
-        }
-        other => Err(format!(
-            "ffi_call_typed: unsupported signature dispatch '{other}'. Supported shapes are listed in the docstring. \
-For unusual signatures, write a tiny C wrapper or use ffi_call (numeric)."
-        )),
-    }
-}
-
-/// Convert a possibly-null C string pointer into a pblang Value (Nil if null).
-fn c_str_to_value(p: *const libc::c_char) -> Value {
-    if p.is_null() {
-        Value::Nil
-    } else {
-        // SAFETY: caller (the FFI function) is responsible for returning a valid
-        // null-terminated UTF-8/ASCII C string. We copy it into a Rust String
-        // immediately so subsequent FFI calls cannot invalidate it.
-        let s = unsafe { std::ffi::CStr::from_ptr(p) };
-        match s.to_str() {
-            Ok(st) => alloc_string(st.to_string()),
-            Err(_) => alloc_string(String::from_utf8_lossy(s.to_bytes()).into_owned()),
-        }
-    }
-}
-
-fn with_db_table<F, R>(host: &mut dyn VmHost, f: F) -> Result<R, RuntimeError>
-where
-    F: FnOnce(&mut HashMap<usize, DbResource>) -> R,
-{
-    let mut t = db_table()
-        .lock()
-        .map_err(|_| host.err("internal: db table unavailable".into()))?;
-    Ok(f(&mut t))
-}
-
-fn with_net_table<F, R>(host: &mut dyn VmHost, f: F) -> Result<R, RuntimeError>
-where
-    F: FnOnce(&mut HashMap<usize, NetResource>) -> R,
-{
-    let mut t = net_table()
-        .lock()
-        .map_err(|_| host.err("internal: net table unavailable".into()))?;
-    Ok(f(&mut t))
 }
 
 #[derive(Debug)]
@@ -925,13 +453,7 @@ pub struct VM {
     signal_handlers: Rc<RefCell<HashMap<String, Value>>>,
 }
 
-#[derive(Default)]
-struct GcMarks {
-    arrays: HashSet<usize>,
-    maps: HashSet<usize>,
-    modules: HashSet<usize>,
-    closures: HashSet<usize>,
-}
+// `GcMarks` moved to vm/gc.rs alongside the mark-and-sweep methods.
 
 /// Get a raw pointer-based hash key for array/map Values to track in object_memory_map.
 fn object_addr(v: &Value) -> Option<usize> {
@@ -1006,176 +528,8 @@ impl VM {
         (blocks_v, alloc_map(poly))
     }
 
-    fn gc_collect_cycles_impl(&mut self) -> (usize, usize, usize) {
-        let mut marks = GcMarks::default();
+    // GC methods (gc_collect_cycles_impl, gc_mark_*, gc_sweep_*) moved to vm/gc.rs
 
-        // --- roots: VM stack values ---
-        for v in self.stack.iter() {
-            self.gc_mark_value(v, &mut marks);
-        }
-
-        // --- roots: active call frames / closures ---
-        for f in self.frames.iter() {
-            self.gc_mark_closure(&f.closure, &mut marks);
-        }
-
-        // --- roots: closed upvalues (open upvalues point into stack) ---
-        for uv in self.open_upvalues.iter() {
-            if let Upvalue::Closed(v) = &*uv.borrow() {
-                self.gc_mark_value(v, &mut marks);
-            }
-        }
-
-        // --- roots: module chain and module cache ---
-        self.gc_mark_module(&self.module, &mut marks);
-        self.gc_mark_module(&self.builtins, &mut marks);
-        for m in self.module_cache.borrow().values() {
-            self.gc_mark_module(m, &mut marks);
-        }
-
-        // --- sweep: clear unreachable containers to break RC cycles ---
-        let arrays_cleared = self.gc_sweep_arrays(&marks.arrays);
-        let maps_cleared = self.gc_sweep_maps(&marks.maps);
-        let modules_cleared = self.gc_sweep_modules(&marks.modules);
-
-        (arrays_cleared, maps_cleared, modules_cleared)
-    }
-
-    fn gc_mark_closure(&self, c: &Rc<Closure>, marks: &mut GcMarks) {
-        let id = Rc::as_ptr(c) as usize;
-        if !marks.closures.insert(id) {
-            return;
-        }
-        self.gc_mark_module(&c.module, marks);
-        for uv in c.upvalues.iter() {
-            if let Upvalue::Closed(v) = &*uv.borrow() {
-                self.gc_mark_value(v, marks);
-            }
-        }
-    }
-
-    fn gc_mark_module(&self, m: &Rc<RefCell<Module>>, marks: &mut GcMarks) {
-        let id = Rc::as_ptr(m) as usize;
-        if !marks.modules.insert(id) {
-            return;
-        }
-        let mb = m.borrow();
-        for v in mb.globals.values() {
-            self.gc_mark_value(v, marks);
-        }
-        for v in mb.exports.values() {
-            self.gc_mark_value(v, marks);
-        }
-        if let Some(p) = mb.parent.clone() {
-            drop(mb);
-            self.gc_mark_module(&p, marks);
-        }
-    }
-
-    fn gc_mark_value(&self, v: &Value, marks: &mut GcMarks) {
-        match v {
-            Value::Array(a) => {
-                let id = Rc::as_ptr(a) as usize;
-                if !marks.arrays.insert(id) {
-                    return;
-                }
-                for it in a.borrow().iter() {
-                    self.gc_mark_value(it, marks);
-                }
-            }
-            Value::Map(m) => {
-                let id = Rc::as_ptr(m) as usize;
-                if !marks.maps.insert(id) {
-                    return;
-                }
-                for it in m.borrow().values() {
-                    self.gc_mark_value(it, marks);
-                }
-            }
-            Value::Module(m) => self.gc_mark_module(m, marks),
-            Value::Closure(c) => self.gc_mark_closure(c, marks),
-            // Functions don't directly reference runtime values; closures cover upvalues/module.
-            _ => {}
-        }
-    }
-
-    fn gc_sweep_arrays(&self, live: &HashSet<usize>) -> usize {
-        GC_ARRAYS.with(|tbl| {
-            let mut cleared = 0usize;
-            let mut t = tbl.borrow_mut();
-            let keys = t.keys().cloned().collect::<Vec<_>>();
-            for id in keys {
-                let Some(w) = t.get(&id).cloned() else {
-                    continue;
-                };
-                match w.upgrade() {
-                    Some(rc) => {
-                        if !live.contains(&id) {
-                            rc.borrow_mut().clear();
-                            cleared += 1;
-                        }
-                    }
-                    None => {
-                        t.remove(&id);
-                    }
-                }
-            }
-            cleared
-        })
-    }
-
-    fn gc_sweep_maps(&self, live: &HashSet<usize>) -> usize {
-        GC_MAPS.with(|tbl| {
-            let mut cleared = 0usize;
-            let mut t = tbl.borrow_mut();
-            let keys = t.keys().cloned().collect::<Vec<_>>();
-            for id in keys {
-                let Some(w) = t.get(&id).cloned() else {
-                    continue;
-                };
-                match w.upgrade() {
-                    Some(rc) => {
-                        if !live.contains(&id) {
-                            rc.borrow_mut().clear();
-                            cleared += 1;
-                        }
-                    }
-                    None => {
-                        t.remove(&id);
-                    }
-                }
-            }
-            cleared
-        })
-    }
-
-    fn gc_sweep_modules(&self, live: &HashSet<usize>) -> usize {
-        GC_MODULES.with(|tbl| {
-            let mut cleared = 0usize;
-            let mut t = tbl.borrow_mut();
-            let keys = t.keys().cloned().collect::<Vec<_>>();
-            for id in keys {
-                let Some(w) = t.get(&id).cloned() else {
-                    continue;
-                };
-                match w.upgrade() {
-                    Some(rc) => {
-                        if !live.contains(&id) {
-                            let mut m = rc.borrow_mut();
-                            m.globals.clear();
-                            m.exports.clear();
-                            m.parent = None;
-                            cleared += 1;
-                        }
-                    }
-                    None => {
-                        t.remove(&id);
-                    }
-                }
-            }
-            cleared
-        })
-    }
 
     fn get_global_from(module: &Rc<RefCell<Module>>, name: &str) -> Option<Value> {
         let mut cur = Some(module.clone());
@@ -2655,542 +2009,7 @@ impl VM {
             Ok(alloc_string(out))
         }
 
-        fn tcp_listen(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "tcp_listen() expects 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let addr = args[0]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_listen(): {m}")))?;
-            let l = TcpListener::bind(addr).map_err(|e| host.err(format!("tcp_listen(): {e}")))?;
-            let id = with_net_table(host, |t| {
-                let id = NET_NEXT.fetch_add(1, Ordering::Relaxed);
-                t.insert(id, NetResource::Listener(l));
-                id
-            })?;
-            Ok(Value::Number(id as f64))
-        }
-
-        fn tcp_accept(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "tcp_accept() expects 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "tcp_accept")?;
-            let r = with_net_table(host, |t| t.remove(&id))?
-                .ok_or_else(|| host.err("tcp_accept(): invalid handle".into()))?;
-
-            match r {
-                NetResource::Listener(listener) => {
-                    // Plain TCP accept
-                    let (s, _addr) = listener
-                        .accept()
-                        .map_err(|e| host.err(format!("tcp_accept(): {e}")))?;
-                    if let Some(ms) = host.io_timeout_ms() {
-                        let d = Duration::from_millis(ms);
-                        let _ = s.set_read_timeout(Some(d));
-                        let _ = s.set_write_timeout(Some(d));
-                    }
-                    let _ = with_net_table(host, |t| t.insert(id, NetResource::Listener(listener)));
-                    let sid = with_net_table(host, |t| {
-                        let sid = NET_NEXT.fetch_add(1, Ordering::Relaxed);
-                        t.insert(
-                            sid,
-                            NetResource::Stream(Box::new(NetStream {
-                                inner: StreamKind::Plain(s),
-                                buf: vec![],
-                            })),
-                        );
-                        sid
-                    })?;
-                    Ok(Value::Number(sid as f64))
-                }
-                NetResource::TlsListener(listener, tls_config) => {
-                    // TLS accept: accept TCP, then perform TLS handshake
-                    let (tcp_stream, _addr) = listener
-                        .accept()
-                        .map_err(|e| host.err(format!("tcp_accept(): {e}")))?;
-                    if let Some(ms) = host.io_timeout_ms() {
-                        let d = Duration::from_millis(ms);
-                        let _ = tcp_stream.set_read_timeout(Some(d));
-                        let _ = tcp_stream.set_write_timeout(Some(d));
-                    }
-                    // Create TLS server connection
-                    let server_conn = ServerConnection::new(tls_config.clone())
-                        .map_err(|e| host.err(format!("tcp_accept() TLS: {e}")))?;
-                    let tls_stream = StreamOwned::new(server_conn, tcp_stream);
-
-                    let _ = with_net_table(host, |t| {
-                        t.insert(id, NetResource::TlsListener(listener, tls_config))
-                    });
-                    let sid = with_net_table(host, |t| {
-                        let sid = NET_NEXT.fetch_add(1, Ordering::Relaxed);
-                        t.insert(
-                            sid,
-                            NetResource::Stream(Box::new(NetStream {
-                                inner: StreamKind::TlsServer(tls_stream),
-                                buf: vec![],
-                            })),
-                        );
-                        sid
-                    })?;
-                    Ok(Value::Number(sid as f64))
-                }
-                other => {
-                    let _ = with_net_table(host, |t| t.insert(id, other));
-                    Err(host.err("tcp_accept(): handle is not a listener".into()))
-                }
-            }
-        }
-
-        fn tcp_read(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 2 {
-                return Err(host.err(format!(
-                    "tcp_read() expects 2 arguments, got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "tcp_read")?;
-            let n = match &args[1] {
-                Value::Number(x) if x.is_finite() && *x >= 0.0 => *x as usize,
-                _ => return Err(host.err("tcp_read(): expected byte count number".into())),
-            };
-
-            let r = with_net_table(host, |t| t.remove(&id))?
-                .ok_or_else(|| host.err("tcp_read(): invalid handle".into()))?;
-            let mut st = match r {
-                NetResource::Stream(s) => *s,
-                other => {
-                    let _ = with_net_table(host, |t| t.insert(id, other));
-                    return Err(host.err("tcp_read(): handle is not a stream".into()));
-                }
-            };
-
-            // serve from buffer first
-            let mut out = Vec::<u8>::new();
-            if !st.buf.is_empty() {
-                let take = st.buf.len().min(n);
-                out.extend_from_slice(&st.buf[..take]);
-                st.buf.drain(..take);
-            }
-
-            while out.len() < n {
-                let mut tmp = vec![0u8; (n - out.len()).min(4096)];
-                let read = st
-                    .inner
-                    .read(&mut tmp)
-                    .map_err(|e| host.err(format!("tcp_read(): {e}")))?;
-                if read == 0 {
-                    break;
-                }
-                out.extend_from_slice(&tmp[..read]);
-            }
-
-            let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
-            Ok(alloc_string(String::from_utf8_lossy(&out).to_string()))
-        }
-
-        fn tcp_read_until(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 3 {
-                return Err(host.err(format!(
-                    "tcp_read_until() expects 3 arguments, got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "tcp_read_until")?;
-            let delim = args[1]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_read_until(): {m}")))?
-                .as_bytes()
-                .to_vec();
-            let max = match &args[2] {
-                Value::Number(x) if x.is_finite() && *x >= 0.0 => *x as usize,
-                _ => return Err(host.err("tcp_read_until(): expected max_bytes number".into())),
-            };
-
-            let r = with_net_table(host, |t| t.remove(&id))?
-                .ok_or_else(|| host.err("tcp_read_until(): invalid handle".into()))?;
-            let mut st = match r {
-                NetResource::Stream(s) => *s,
-                other => {
-                    let _ = with_net_table(host, |t| t.insert(id, other));
-                    return Err(host.err("tcp_read_until(): handle is not a stream".into()));
-                }
-            };
-
-            let mut total = 0usize;
-            loop {
-                if let Some(pos) = find_subslice(&st.buf, &delim) {
-                    let end = (pos + delim.len()).min(st.buf.len());
-                    let out = st.buf.drain(..end).collect::<Vec<u8>>();
-                    let _ =
-                        with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
-                    return Ok(alloc_string(String::from_utf8_lossy(&out).to_string()));
-                }
-                if total >= max {
-                    let out = st.buf.drain(..).collect::<Vec<u8>>();
-                    let _ =
-                        with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
-                    return Ok(alloc_string(String::from_utf8_lossy(&out).to_string()));
-                }
-                let mut tmp = [0u8; 4096];
-                let read = st
-                    .inner
-                    .read(&mut tmp)
-                    .map_err(|e| host.err(format!("tcp_read_until(): {e}")))?;
-                if read == 0 {
-                    let out = st.buf.drain(..).collect::<Vec<u8>>();
-                    let _ =
-                        with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
-                    return Ok(alloc_string(String::from_utf8_lossy(&out).to_string()));
-                }
-                st.buf.extend_from_slice(&tmp[..read]);
-                total += read;
-            }
-        }
-
-        fn tcp_write(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 2 {
-                return Err(host.err(format!(
-                    "tcp_write() expects 2 arguments, got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "tcp_write")?;
-            let s = args[1]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_write(): {m}")))?;
-
-            let r = with_net_table(host, |t| t.remove(&id))?
-                .ok_or_else(|| host.err("tcp_write(): invalid handle".into()))?;
-            let mut st = match r {
-                NetResource::Stream(s) => *s,
-                other => {
-                    let _ = with_net_table(host, |t| t.insert(id, other));
-                    return Err(host.err("tcp_write(): handle is not a stream".into()));
-                }
-            };
-
-            let n = st
-                .inner
-                .write(s.as_bytes())
-                .map_err(|e| host.err(format!("tcp_write(): {e}")))?;
-            let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
-            Ok(Value::Number(n as f64))
-        }
-
-        fn tcp_close(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "tcp_close() expects 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "tcp_close")?;
-            let _ = with_net_table(host, |t| t.remove(&id));
-            Ok(Value::Nil)
-        }
-
-        fn tcp_local_addr(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "tcp_local_addr() expects 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "tcp_local_addr")?;
-            let r = with_net_table(host, |t| t.remove(&id))?
-                .ok_or_else(|| host.err("tcp_local_addr(): invalid handle".into()))?;
-            match r {
-                NetResource::Listener(l) => {
-                    let addr = l
-                        .local_addr()
-                        .map_err(|e| host.err(format!("tcp_local_addr(): {e}")))?;
-                    let _ = with_net_table(host, |t| t.insert(id, NetResource::Listener(l)));
-                    Ok(alloc_string(addr.to_string()))
-                }
-                NetResource::TlsListener(l, cfg) => {
-                    let addr = l
-                        .local_addr()
-                        .map_err(|e| host.err(format!("tcp_local_addr(): {e}")))?;
-                    let _ =
-                        with_net_table(host, |t| t.insert(id, NetResource::TlsListener(l, cfg)));
-                    Ok(alloc_string(addr.to_string()))
-                }
-                NetResource::Stream(s) => {
-                    let addr = s
-                        .inner
-                        .local_addr()
-                        .map_err(|e| host.err(format!("tcp_local_addr(): {e}")))?;
-                    let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(s)));
-                    Ok(alloc_string(addr.to_string()))
-                }
-            }
-        }
-
-        // ---- TLS builtins (W4-gamma) ----
-
-        /// tcp_listen_tls(addr, cert_pem_path, key_pem_path) → listener handle
-        /// Creates a TLS-wrapped TCP listener using rustls.
-        fn tcp_listen_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 3 {
-                return Err(host.err(format!(
-                    "tcp_listen_tls() expects 3 arguments (addr, cert_path, key_path), got {}",
-                    args.len()
-                )));
-            }
-            let addr = args[0]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_listen_tls(): {m}")))?;
-            let cert_path = args[1]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_listen_tls(): cert_path: {m}")))?;
-            let key_path = args[2]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_listen_tls(): key_path: {m}")))?;
-
-            // Read certificate chain from PEM file
-            let cert_file = std::fs::File::open(cert_path)
-                .map_err(|e| host.err(format!("tcp_listen_tls(): open cert: {e}")))?;
-            let mut cert_reader = std::io::BufReader::new(cert_file);
-            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-                .filter_map(|r| r.ok())
-                .collect();
-            if certs.is_empty() {
-                return Err(host.err("tcp_listen_tls(): no certificates found in PEM file".into()));
-            }
-
-            // Read private key from PEM file
-            let key_file = std::fs::File::open(key_path)
-                .map_err(|e| host.err(format!("tcp_listen_tls(): open key: {e}")))?;
-            let mut key_reader = std::io::BufReader::new(key_file);
-            let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|e| host.err(format!("tcp_listen_tls(): read key: {e}")))?
-                .ok_or_else(|| {
-                    host.err("tcp_listen_tls(): no private key found in PEM file".into())
-                })?;
-
-            // Build ServerConfig
-            let server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .map_err(|e| host.err(format!("tcp_listen_tls(): config: {e}")))?;
-
-            // Bind TCP listener
-            let listener = TcpListener::bind(addr)
-                .map_err(|e| host.err(format!("tcp_listen_tls(): bind: {e}")))?;
-
-            // Store as TlsListener
-            let id = with_net_table(host, |t| {
-                let id = NET_NEXT.fetch_add(1, Ordering::Relaxed);
-                t.insert(
-                    id,
-                    NetResource::TlsListener(listener, Arc::new(server_config)),
-                );
-                id
-            })?;
-
-            Ok(Value::Number(id as f64))
-        }
-
-        /// tcp_connect_tls(host, port) → stream handle
-        /// Connects to a TLS server with certificate verification enabled.
-        /// Trust roots come from webpki-roots plus best-effort native/system roots.
-        fn tcp_connect_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 2 {
-                return Err(host.err(format!(
-                    "tcp_connect_tls() expects 2 arguments (host, port), got {}",
-                    args.len()
-                )));
-            }
-            let host_str = args[0]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_connect_tls(): host: {m}")))?;
-            let port = match &args[1] {
-                Value::Number(n) if n.is_finite() && *n >= 0.0 && *n <= 65535.0 => *n as u16,
-                _ => {
-                    return Err(host.err("tcp_connect_tls(): port must be a number 0-65535".into()))
-                }
-            };
-
-            // Connect TCP
-            let addr = format!("{}:{}", host_str, port);
-            let tcp_stream = TcpStream::connect(&addr)
-                .map_err(|e| host.err(format!("tcp_connect_tls(): connect: {e}")))?;
-            if let Some(ms) = host.io_timeout_ms() {
-                let d = Duration::from_millis(ms);
-                let _ = tcp_stream.set_read_timeout(Some(d));
-                let _ = tcp_stream.set_write_timeout(Some(d));
-            }
-
-            // Build ClientConfig with proper system root certificates (webpki-roots + native certs).
-            // This replaces the old DangerousAllowAllVerifier that accepted ANY certificate.
-            let mut root_store = RootCertStore::empty();
-            // Add Mozilla's curated WebPKI root CAs (always available, no network needed)
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            // Also attempt to add system/native root certs (optional, best-effort)
-            if let Ok(native_certs) = rustls_native_certs::load_native_certs() {
-                for cert in native_certs {
-                    let _ = root_store.add(cert);
-                }
-            }
-            let client_config = ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-
-            // Create server name for SNI
-            let server_name: ServerName<'static> = host_str
-                .to_string()
-                .try_into()
-                .map_err(|_| host.err("tcp_connect_tls(): invalid server name for SNI".into()))?;
-
-            // Perform TLS handshake
-            let client_conn = ClientConnection::new(Arc::new(client_config), server_name)
-                .map_err(|e| host.err(format!("tcp_connect_tls(): TLS: {e}")))?;
-            let tls_stream = StreamOwned::new(client_conn, tcp_stream);
-
-            // Store as Stream
-            let id = with_net_table(host, |t| {
-                let id = NET_NEXT.fetch_add(1, Ordering::Relaxed);
-                t.insert(
-                    id,
-                    NetResource::Stream(Box::new(NetStream {
-                        inner: StreamKind::TlsClient(tls_stream),
-                        buf: vec![],
-                    })),
-                );
-                id
-            })?;
-
-            Ok(Value::Number(id as f64))
-        }
-
-        /// tcp_wrap_tls(handle, cert_path, key_path) → new stream handle
-        /// Upgrades an existing plain TCP stream to TLS server mode.
-        fn tcp_wrap_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_net() {
-                return Err(host.err("net access denied".into()));
-            }
-            if args.len() != 3 {
-                return Err(host.err(format!(
-                    "tcp_wrap_tls() expects 3 arguments (handle, cert_path, key_path), got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "tcp_wrap_tls")?;
-            let cert_path = args[1]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_wrap_tls(): cert_path: {m}")))?;
-            let key_path = args[2]
-                .as_str()
-                .map_err(|m| host.err(format!("tcp_wrap_tls(): key_path: {m}")))?;
-
-            // Remove the stream from table
-            let r = with_net_table(host, |t| t.remove(&id))?
-                .ok_or_else(|| host.err("tcp_wrap_tls(): invalid handle".into()))?;
-
-            let tcp_stream = match r {
-                NetResource::Stream(st) => match st.inner {
-                    StreamKind::Plain(s) => s,
-                    _ => {
-                        let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(st)));
-                        return Err(host.err(
-                            "tcp_wrap_tls(): handle must be a plain (non-TLS) TCP stream".into(),
-                        ));
-                    }
-                },
-                other => {
-                    let _ = with_net_table(host, |t| t.insert(id, other));
-                    return Err(host.err(
-                        "tcp_wrap_tls(): handle must be a plain (non-TLS) TCP stream".into(),
-                    ));
-                }
-            };
-
-            // Read certificate chain from PEM file
-            let cert_file = std::fs::File::open(cert_path)
-                .map_err(|e| host.err(format!("tcp_wrap_tls(): open cert: {e}")))?;
-            let mut cert_reader = std::io::BufReader::new(cert_file);
-            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-                .filter_map(|r| r.ok())
-                .collect();
-            if certs.is_empty() {
-                return Err(host.err("tcp_wrap_tls(): no certificates found in PEM file".into()));
-            }
-
-            // Read private key from PEM file
-            let key_file = std::fs::File::open(key_path)
-                .map_err(|e| host.err(format!("tcp_wrap_tls(): open key: {e}")))?;
-            let mut key_reader = std::io::BufReader::new(key_file);
-            let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|e| host.err(format!("tcp_wrap_tls(): read key: {e}")))?
-                .ok_or_else(|| {
-                    host.err("tcp_wrap_tls(): no private key found in PEM file".into())
-                })?;
-
-            // Build ServerConfig
-            let server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .map_err(|e| host.err(format!("tcp_wrap_tls(): config: {e}")))?;
-
-            // Create TLS server connection and wrap stream
-            let server_conn = ServerConnection::new(Arc::new(server_config))
-                .map_err(|e| host.err(format!("tcp_wrap_tls(): TLS: {e}")))?;
-            let tls_stream = StreamOwned::new(server_conn, tcp_stream);
-
-            // Store as new Stream (reuse the same id)
-            let _ = with_net_table(host, |t| {
-                t.insert(
-                    id,
-                    NetResource::Stream(Box::new(NetStream {
-                        inner: StreamKind::TlsServer(tls_stream),
-                        buf: vec![],
-                    })),
-                )
-            });
-
-            Ok(Value::Number(id as f64))
-        }
-
-        fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-            if needle.is_empty() {
-                return Some(0);
-            }
-            hay.windows(needle.len()).position(|w| w == needle)
-        }
+        // tcp_* + tls + find_subslice moved to vm/net.rs (imported above).
 
         fn http_status_reason(status: i64) -> &'static str {
             match status {
@@ -3915,7 +2734,9 @@ except Exception as e:
                 .as_str()
                 .map_err(|m| host.err(format!("ffi_load(): {m}")))?;
             if !host.ffi_allowed_library(path) {
-                return Err(host.err("ffi: library not in allowlist".into()));
+                return Err(host.err(format!(
+                    "ffi_load: library {path:?} not in allowlist (set FfiPolicy.allowed_libs or allow_all=true)"
+                )));
             }
             let lib =
                 unsafe { Library::new(path) }.map_err(|e| host.err(format!("ffi_load(): {e}")))?;
@@ -3957,7 +2778,9 @@ except Exception as e:
                 .as_str()
                 .map_err(|m| host.err(format!("ffi_call(): {m}")))?;
             if !host.ffi_allowed_symbol(sym) {
-                return Err(host.err("ffi: symbol not in allowlist".into()));
+                return Err(host.err(format!(
+                    "ffi_call: symbol {sym:?} not in allowlist (set FfiPolicy.allowed_symbols or allow_all=true)"
+                )));
             }
             let id = value_to_handle(host, args[0].clone(), "ffi_call")?;
             let arr = match &args[2] {
@@ -4084,7 +2907,9 @@ except Exception as e:
                 .map_err(|m| host.err(format!("ffi_call_typed(): {m}")))?
                 .to_string();
             if !host.ffi_allowed_symbol(&sym) {
-                return Err(host.err("ffi: symbol not in allowlist".into()));
+                return Err(host.err(format!(
+                    "ffi_call_typed: symbol {sym:?} not in allowlist (set FfiPolicy.allowed_symbols or allow_all=true)"
+                )));
             }
             let sig_str = args[2]
                 .as_str()
@@ -4198,287 +3023,6 @@ except Exception as e:
             Ok(res)
         }
 
-        fn sqlite_open(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_sqlite() {
-                return Err(host.err("sqlite access denied".into()));
-            }
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "sqlite_open() expects 1 argument (path), got {}",
-                    args.len()
-                )));
-            }
-            let path = args[0]
-                .as_str()
-                .map_err(|m| host.err(format!("sqlite_open(): {m}")))?;
-            let conn =
-                Connection::open(path).map_err(|e| host.err(format!("sqlite_open(): {e}")))?;
-            let id = with_db_table(host, |t| {
-                let id = DB_NEXT.fetch_add(1, Ordering::Relaxed);
-                t.insert(id, DbResource::Sqlite(conn));
-                id
-            })?;
-            Ok(Value::Number(id as f64))
-        }
-
-        fn sqlite_close(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_sqlite() {
-                return Err(host.err("sqlite access denied".into()));
-            }
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "sqlite_close() expects 1 argument (handle), got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "sqlite_close")?;
-            let _ = with_db_table(host, |t| t.remove(&id));
-            Ok(Value::Nil)
-        }
-
-        fn sqlite_exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_sqlite() {
-                return Err(host.err("sqlite access denied".into()));
-            }
-            // sqlite_exec(handle, sql, params_array_or_nil) -> rows_changed
-            if args.len() != 3 {
-                return Err(host.err(format!(
-                    "sqlite_exec() expects 3 arguments (handle, sql, params), got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "sqlite_exec")?;
-            let sql = args[1]
-                .as_str()
-                .map_err(|m| host.err(format!("sqlite_exec(): {m}")))?;
-
-            let params_v: Vec<Value> = match &args[2] {
-                Value::Nil => vec![],
-                Value::Array(a) => a.borrow().clone(),
-                _ => return Err(host.err("sqlite_exec(): params must be array or nil".into())),
-            };
-
-            let mut tosql: Vec<rusqlite::types::Value> = Vec::with_capacity(params_v.len());
-            for v in params_v {
-                match v {
-                    Value::Nil => tosql.push(rusqlite::types::Value::Null),
-                    Value::Bool(b) => {
-                        tosql.push(rusqlite::types::Value::Integer(if b { 1 } else { 0 }))
-                    }
-                    Value::Number(n) => {
-                        if n.is_finite()
-                            && n.fract() == 0.0
-                            && n >= (i64::MIN as f64)
-                            && n <= (i64::MAX as f64)
-                        {
-                            tosql.push(rusqlite::types::Value::Integer(n as i64));
-                        } else {
-                            tosql.push(rusqlite::types::Value::Real(n));
-                        }
-                    }
-                    Value::Obj(o) => match o.as_ref() {
-                        Obj::String(s) => tosql.push(rusqlite::types::Value::Text(s.clone())),
-                    },
-                    Value::Array(a) => {
-                        // treat array<number 0..255> as BLOB
-                        let mut bytes: Vec<u8> = Vec::with_capacity(a.borrow().len());
-                        for it in a.borrow().iter() {
-                            match it {
-                                Value::Number(n)
-                                    if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 =>
-                                {
-                                    bytes.push(*n as u8);
-                                }
-                                _ => {
-                                    return Err(host.err(
-                                        "sqlite_exec(): blob params must be array of byte numbers 0..255"
-                                            .into(),
-                                    ))
-                                }
-                            }
-                        }
-                        tosql.push(rusqlite::types::Value::Blob(bytes));
-                    }
-                    _ => {
-                        return Err(host.err(
-                            "sqlite_exec(): params support number/bool/string/nil/blob-array only"
-                                .into(),
-                        ))
-                    }
-                }
-            }
-
-            let changed = match with_db_table(host, |t| t.remove(&id))? {
-                Some(DbResource::Sqlite(conn)) => {
-                    let out = if tosql.is_empty() {
-                        // Use execute_batch so multi-statement SQL (e.g. migration scripts
-                        // like "CREATE TABLE t(...); INSERT INTO t VALUES (1);") runs fully.
-                        // execute_batch does not return a row count, so we report 0.
-                        conn.execute_batch(sql)
-                            .map_err(|e| host.err(format!("sqlite_exec(): {e}")))?;
-                        0usize
-                    } else {
-                        conn.execute(sql, rusqlite::params_from_iter(tosql.iter()))
-                            .map_err(|e| host.err(format!("sqlite_exec(): {e}")))?
-                    };
-                    let _ = with_db_table(host, |t| t.insert(id, DbResource::Sqlite(conn)));
-                    out
-                }
-                None => return Err(host.err("sqlite_exec(): invalid handle".into())),
-            };
-            Ok(Value::Number(changed as f64))
-        }
-
-        fn sqlite_query(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-            if !host.allow_sqlite() {
-                return Err(host.err("sqlite access denied".into()));
-            }
-            // sqlite_query(handle, sql, params_array_or_nil) -> array<map{col: value}>
-            if args.len() != 3 {
-                return Err(host.err(format!(
-                    "sqlite_query() expects 3 arguments (handle, sql, params), got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "sqlite_query")?;
-            let sql = args[1]
-                .as_str()
-                .map_err(|m| host.err(format!("sqlite_query(): {m}")))?;
-
-            let params_v: Vec<Value> = match &args[2] {
-                Value::Nil => vec![],
-                Value::Array(a) => a.borrow().clone(),
-                _ => return Err(host.err("sqlite_query(): params must be array or nil".into())),
-            };
-
-            let mut tosql: Vec<rusqlite::types::Value> = Vec::with_capacity(params_v.len());
-            for v in params_v {
-                match v {
-                    Value::Nil => tosql.push(rusqlite::types::Value::Null),
-                    Value::Bool(b) => {
-                        tosql.push(rusqlite::types::Value::Integer(if b { 1 } else { 0 }))
-                    }
-                    Value::Number(n) => {
-                        if n.is_finite()
-                            && n.fract() == 0.0
-                            && n >= (i64::MIN as f64)
-                            && n <= (i64::MAX as f64)
-                        {
-                            tosql.push(rusqlite::types::Value::Integer(n as i64));
-                        } else {
-                            tosql.push(rusqlite::types::Value::Real(n));
-                        }
-                    }
-                    Value::Obj(o) => match o.as_ref() {
-                        Obj::String(s) => tosql.push(rusqlite::types::Value::Text(s.clone())),
-                    },
-                    Value::Array(a) => {
-                        let mut bytes: Vec<u8> = Vec::with_capacity(a.borrow().len());
-                        for it in a.borrow().iter() {
-                            match it {
-                                Value::Number(n)
-                                    if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 =>
-                                {
-                                    bytes.push(*n as u8);
-                                }
-                                _ => {
-                                    return Err(host.err(
-                                        "sqlite_query(): blob params must be array of byte numbers 0..255"
-                                            .into(),
-                                    ))
-                                }
-                            }
-                        }
-                        tosql.push(rusqlite::types::Value::Blob(bytes));
-                    }
-                    _ => {
-                        return Err(host.err(
-                            "sqlite_query(): params support number/bool/string/nil/blob-array only"
-                                .into(),
-                        ))
-                    }
-                }
-            }
-
-            let rows = match with_db_table(host, |t| t.remove(&id))? {
-                Some(DbResource::Sqlite(conn)) => {
-                    let out_rows = {
-                        let mut stmt = conn
-                            .prepare(sql)
-                            .map_err(|e| host.err(format!("sqlite_query(): {e}")))?;
-                        let col_count = stmt.column_count();
-                        let col_names = (0..col_count)
-                            .map(|i| stmt.column_name(i).unwrap_or("").to_string())
-                            .collect::<Vec<_>>();
-
-                        let mut out_rows: Vec<Value> = vec![];
-                        let mut rows = stmt
-                            .query(rusqlite::params_from_iter(tosql.iter()))
-                            .map_err(|e| host.err(format!("sqlite_query(): {e}")))?;
-
-                        while let Some(row) = rows
-                            .next()
-                            .map_err(|e| host.err(format!("sqlite_query(): {e}")))?
-                        {
-                            let mut m = HashMap::<String, Value>::new();
-                            for (i, name) in col_names.iter().enumerate() {
-                                let name = name.clone();
-                                let v: rusqlite::types::Value = row
-                                    .get(i)
-                                    .map_err(|e| host.err(format!("sqlite_query(): {e}")))?;
-                                let sv = match v {
-                                    rusqlite::types::Value::Null => Value::Nil,
-                                    rusqlite::types::Value::Integer(n) => Value::Number(n as f64),
-                                    rusqlite::types::Value::Real(n) => Value::Number(n),
-                                    rusqlite::types::Value::Text(s) => alloc_string(s),
-                                    rusqlite::types::Value::Blob(b) => {
-                                        let mut out = Vec::<Value>::with_capacity(b.len());
-                                        for byte in b {
-                                            out.push(Value::Number(byte as f64));
-                                        }
-                                        alloc_array(out)
-                                    }
-                                };
-                                m.insert(name, sv);
-                            }
-                            out_rows.push(alloc_map(m));
-                        }
-                        out_rows
-                    };
-
-                    let _ = with_db_table(host, |t| t.insert(id, DbResource::Sqlite(conn)));
-                    out_rows
-                }
-                None => return Err(host.err("sqlite_query(): invalid handle".into())),
-            };
-
-            Ok(alloc_array(rows))
-        }
-
-        fn sqlite_last_insert_rowid(
-            host: &mut dyn VmHost,
-            args: Vec<Value>,
-        ) -> Result<Value, RuntimeError> {
-            if !host.allow_sqlite() {
-                return Err(host.err("sqlite access denied".into()));
-            }
-            if args.len() != 1 {
-                return Err(host.err(format!(
-                    "sqlite_last_insert_rowid() expects 1 argument (handle), got {}",
-                    args.len()
-                )));
-            }
-            let id = value_to_handle(host, args[0].clone(), "sqlite_last_insert_rowid")?;
-            let rowid = match with_db_table(host, |t| t.remove(&id))? {
-                Some(DbResource::Sqlite(conn)) => {
-                    let rid = conn.last_insert_rowid();
-                    let _ = with_db_table(host, |t| t.insert(id, DbResource::Sqlite(conn)));
-                    rid
-                }
-                None => return Err(host.err("sqlite_last_insert_rowid(): invalid handle".into())),
-            };
-            Ok(Value::Number(rowid as f64))
-        }
 
         fn spawn_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
             if !host.allow_spawn() {
@@ -9454,53 +7998,53 @@ except Exception as e:
             BuiltinFn {
                 name: "tcp_listen",
                 arity: Some(1),
-                fun: tcp_listen,
+                fun: net::tcp_listen,
             },
             BuiltinFn {
                 name: "tcp_accept",
                 arity: Some(1),
-                fun: tcp_accept,
+                fun: net::tcp_accept,
             },
             BuiltinFn {
                 name: "tcp_read",
                 arity: Some(2),
-                fun: tcp_read,
+                fun: net::tcp_read,
             },
             BuiltinFn {
                 name: "tcp_read_until",
                 arity: Some(3),
-                fun: tcp_read_until,
+                fun: net::tcp_read_until,
             },
             BuiltinFn {
                 name: "tcp_write",
                 arity: Some(2),
-                fun: tcp_write,
+                fun: net::tcp_write,
             },
             BuiltinFn {
                 name: "tcp_close",
                 arity: Some(1),
-                fun: tcp_close,
+                fun: net::tcp_close,
             },
             BuiltinFn {
                 name: "tcp_local_addr",
                 arity: Some(1),
-                fun: tcp_local_addr,
+                fun: net::tcp_local_addr,
             },
             // TLS builtins (W4-gamma)
             BuiltinFn {
                 name: "tcp_listen_tls",
                 arity: Some(3),
-                fun: tcp_listen_tls,
+                fun: net::tcp_listen_tls,
             },
             BuiltinFn {
                 name: "tcp_connect_tls",
                 arity: Some(2),
-                fun: tcp_connect_tls,
+                fun: net::tcp_connect_tls,
             },
             BuiltinFn {
                 name: "tcp_wrap_tls",
                 arity: Some(3),
-                fun: tcp_wrap_tls,
+                fun: net::tcp_wrap_tls,
             },
             BuiltinFn {
                 name: "http_parse_request",
@@ -9585,27 +8129,27 @@ except Exception as e:
             BuiltinFn {
                 name: "sqlite_open",
                 arity: Some(1),
-                fun: sqlite_open,
+                fun: db::sqlite_open,
             },
             BuiltinFn {
                 name: "sqlite_close",
                 arity: Some(1),
-                fun: sqlite_close,
+                fun: db::sqlite_close,
             },
             BuiltinFn {
                 name: "sqlite_exec",
                 arity: Some(3),
-                fun: sqlite_exec,
+                fun: db::sqlite_exec,
             },
             BuiltinFn {
                 name: "sqlite_query",
                 arity: Some(3),
-                fun: sqlite_query,
+                fun: db::sqlite_query,
             },
             BuiltinFn {
                 name: "sqlite_last_insert_rowid",
                 arity: Some(1),
-                fun: sqlite_last_insert_rowid,
+                fun: db::sqlite_last_insert_rowid,
             },
             BuiltinFn {
                 name: "spawn",
@@ -11887,6 +10431,47 @@ impl VmHost for VM {
     }
     fn allow_exec(&self) -> bool {
         self.stdlib_config.as_ref().map(|c| c.exec).unwrap_or(false)
+    }
+
+    /// Library allowlist check. When no policy is set, behaves like the default
+    /// trait impl (allow all). When a policy is set, the path is canonicalised
+    /// (best-effort) so `./lib.so` and `lib.so` resolve to the same entry, and
+    /// matched against `policy.allowed_libs`. `policy.allow_all = true` bypasses
+    /// the check.
+    fn ffi_allowed_library(&self, path: &str) -> bool {
+        let policy = match self.ffi_policy.as_ref() {
+            Some(p) => p,
+            None => return true,
+        };
+        if policy.allow_all {
+            return true;
+        }
+        if policy.allowed_libs.contains(path) {
+            return true;
+        }
+        // Best-effort canonicalisation: try the resolved path too, so embedders
+        // can list either form. Falls back gracefully if the file doesn't exist
+        // yet (Library::new will give a clearer error in that case).
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            let canon_str = canon.to_string_lossy().to_string();
+            if policy.allowed_libs.contains(&canon_str) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Symbol allowlist check. When no policy is set, allow all. Otherwise the
+    /// symbol must appear in `policy.allowed_symbols` unless `allow_all = true`.
+    fn ffi_allowed_symbol(&self, symbol: &str) -> bool {
+        let policy = match self.ffi_policy.as_ref() {
+            Some(p) => p,
+            None => return true,
+        };
+        if policy.allow_all {
+            return true;
+        }
+        policy.allowed_symbols.contains(symbol)
     }
 
     fn io_timeout_ms(&self) -> Option<u64> {

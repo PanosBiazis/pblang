@@ -1681,16 +1681,6 @@ fn match_exhaustive_pass() {
     );
 }
 
-#[ignore = "SP1-gamma known chumsky 0.8 limitation: cmp_op.padded() inside \
-   .repeated() generates a cascade of recovery errors when it encounters `~` or `#` \
-   (the guard body separator). parse_recovery() then returns None for the entire \
-   source instead of a partial AST. Root cause: chumsky 0.8 has no per-parser \
-   recovery-boundary mechanism that prevents the cascade. Fix requires either: \
-   (a) migrating to chumsky 0.9+ with its improved recovery model, or \
-   (b) a hand-written match-arm pre-processor. The BindGuard AST node, compiler, \
-   and VM are fully implemented and correct -- only the parser path is blocked. \
-   Guarded arms ARE parseable with the strict parser() when the source is clean, \
-   but parse_with_polyglot uses parse_recovery as the primary path."]
 #[test]
 fn match_guard_pass() {
     // Match guard test: verify BindGuard arms dispatch correctly.

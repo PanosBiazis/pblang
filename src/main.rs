@@ -8,8 +8,7 @@ use pblang_ir::Chunk;
 use pblang_typeck::check as type_check;
 use pblang_vm::{StdlibConfig, VmLimits, VM};
 
-use chumsky::error::SimpleReason;
-use chumsky::prelude::Simple;
+use pblang_core::ParseError;
 
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1329,34 +1328,11 @@ fn underline_span(src: &str, sp: std::ops::Range<usize>) -> (usize, usize, Strin
     (ln1, col1, line, marker)
 }
 
-fn format_parse_error(err: &Simple<char>) -> String {
-    // Keep this robust across chumsky versions: prefer structured info when available,
-    // but fall back to Debug if needed.
-    let label = err.label();
-    let found = err.found();
-
-    let mut expected = err.expected().copied().flatten().collect::<Vec<char>>();
-    expected.sort();
-    expected.dedup();
-
-    let base = match err.reason() {
-        SimpleReason::Unclosed { span: _, delimiter } => {
-            format!("unclosed delimiter '{delimiter}'")
-        }
-        SimpleReason::Custom(msg) => msg.to_string(),
-        SimpleReason::Unexpected => match (found, expected.is_empty()) {
-            (Some(f), false) => format!("unexpected '{f}', expected one of: {:?}", expected),
-            (Some(f), true) => format!("unexpected '{f}'"),
-            (None, false) => format!("unexpected end of input, expected one of: {:?}", expected),
-            (None, true) => "parse error".to_string(),
-        },
-    };
-
-    if let Some(l) = label {
-        format!("{base} (while parsing {l})")
-    } else {
-        base
-    }
+fn format_parse_error(err: &ParseError) -> String {
+    // Chumsky 1.0's `Simple` no longer exposes `expected`/`reason` (those moved
+    // to `Rich`), so the message here is the short "unexpected char" line built
+    // by `errs_to_owned`; span/found are surfaced via `print_parse_errors`.
+    err.message.clone()
 }
 
 /// Normalize spacing around binary operators (outside string literals). Ensures one space
@@ -1504,19 +1480,18 @@ fn fmt_normalize_comma_spacing(line: &str) -> String {
     out
 }
 
-fn print_parse_errors(src: &str, errors: Vec<Simple<char>>, file: Option<&str>) {
+fn print_parse_errors(src: &str, errors: Vec<ParseError>, file: Option<&str>) {
     let max = 8usize;
     for (i, err) in errors.iter().take(max).enumerate() {
-        let sp = err.span();
-        let (ln, col, line, marker) = underline_span(src, sp);
         let msg = format_parse_error(err);
-        if let Some(path) = file {
-            eprintln!("error[{}:{}:{}]: {}", path, ln, col, msg);
-        } else {
-            eprintln!("error[{}:{}]: {}", ln, col, msg);
-        }
-        eprintln!("{line}");
-        eprintln!("{marker}");
+        let (ln, col, line, marker) = underline_span(src, err.span.clone());
+        let prefix = match file {
+            Some(path) => format!("error[{}:{}:{}]:", path, ln, col),
+            None => format!("error[{}:{}]:", ln, col),
+        };
+        eprintln!("{} {}", prefix, msg);
+        eprintln!("  | {}", line);
+        eprintln!("  | {}", marker);
 
         if i + 1 < errors.len().min(max) {
             eprintln!();
@@ -3749,7 +3724,18 @@ li { margin: 0.3em 0; }
         let max_workers = std::thread::available_parallelism()
             .map(|n| n.get().clamp(2, 16))
             .unwrap_or(4);
-        let serve_pool = threadpool::ThreadPool::new(max_workers);
+        // 8 MB stack per worker to match the main thread's default on Linux.
+        // pblang scripts that recurse deeply (parser, GC traversal, builtin
+        // dispatch on deeply-nested input) overflow the threadpool crate's
+        // default 2 MB worker stack — that's a known source of "thread
+        // '<unknown>' has overflowed its stack" on serve startup the moment
+        // any client connects. Bumping the stack costs ~6 MB × max_workers
+        // of address space and zero RSS until used.
+        let serve_pool = threadpool::Builder::new()
+            .num_threads(max_workers)
+            .thread_name("pblang-serve-worker".into())
+            .thread_stack_size(8 * 1024 * 1024)
+            .build();
         let max_inflight = max_workers * 8;
         let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         struct InflightPermit {
@@ -4068,15 +4054,14 @@ li { margin: 0.3em 0; }
                                     let diagnostics: Vec<serde_json::Value> = errs
                                         .into_iter()
                                         .map(|err| {
-                                            let sp = err.span();
-                                            let (line, col) = line_col(&code, sp.start);
+                                            let (ln, col) = line_col(&code, err.span.start);
                                             serde_json::json!({
                                                 "stage": "parse",
                                                 "message": format_parse_error(&err),
-                                                "span": { "start": sp.start, "end": sp.end },
-                                                "line": line,
+                                                "span": { "start": err.span.start, "end": err.span.end },
+                                                "line": ln,
                                                 "col": col,
-                                                "line_text": get_line(&code, line)
+                                                "line_text": get_line(&code, ln)
                                             })
                                         })
                                         .collect();
@@ -4155,15 +4140,14 @@ li { margin: 0.3em 0; }
                                     let diagnostics: Vec<serde_json::Value> = errs
                                         .into_iter()
                                         .map(|err| {
-                                            let sp = err.span();
-                                            let (line, col) = line_col(&code, sp.start);
+                                            let (ln, col) = line_col(&code, err.span.start);
                                             serde_json::json!({
                                                 "stage": "parse",
                                                 "message": format_parse_error(&err),
-                                                "span": { "start": sp.start, "end": sp.end },
-                                                "line": line,
+                                                "span": { "start": err.span.start, "end": err.span.end },
+                                                "line": ln,
                                                 "col": col,
-                                                "line_text": get_line(&code, line)
+                                                "line_text": get_line(&code, ln)
                                             })
                                         })
                                         .collect();

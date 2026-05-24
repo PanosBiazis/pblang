@@ -1,3 +1,4 @@
+use chumsky::input::MapExtra;
 use chumsky::prelude::*;
 
 use crate::{
@@ -26,6 +27,35 @@ fn mk_type(kind: TypeKind, span: std::ops::Range<usize>) -> TypeExpr {
     }
 }
 
+// Helpers for use with `.map_with(...)` — they pull the span from MapExtra,
+// fixing the input/extra types so the closure's inference doesn't blow up.
+fn mk_expr_w<'src>(
+    kind: ExprKind,
+    e: &mut MapExtra<'src, '_, &'src str, extra::Err<Simple<'src, char>>>,
+) -> Expr {
+    mk_expr(kind, e.span().into_range())
+}
+
+fn mk_stmt_w<'src>(
+    kind: StmtKind,
+    e: &mut MapExtra<'src, '_, &'src str, extra::Err<Simple<'src, char>>>,
+) -> Stmt {
+    mk_stmt(kind, e.span().into_range())
+}
+
+fn mk_type_w<'src>(
+    kind: TypeKind,
+    e: &mut MapExtra<'src, '_, &'src str, extra::Err<Simple<'src, char>>>,
+) -> TypeExpr {
+    mk_type(kind, e.span().into_range())
+}
+
+fn span_of<'src>(
+    e: &mut MapExtra<'src, '_, &'src str, extra::Err<Simple<'src, char>>>,
+) -> std::ops::Range<usize> {
+    e.span().into_range()
+}
+
 #[derive(Clone, Copy, Debug)]
 enum CmpOp {
     Eq,
@@ -49,12 +79,18 @@ enum MulOp {
     Div,
 }
 
-pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
+pub fn parser<'src>(
+) -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simple<'src, char>>> {
     let ws0 = one_of(" \t\r\n").repeated().ignored();
     let ws1 = one_of(" \t\r\n").repeated().at_least(1).ignored();
 
     let number = text::int(10)
-        .then(just('.').ignore_then(text::digits(10)).or_not())
+        .map(|s: &str| s.to_string())
+        .then(
+            just('.')
+                .ignore_then(text::digits(10).to_slice().map(|s: &str| s.to_string()))
+                .or_not(),
+        )
         .map(|(int_part, frac_part): (String, Option<String>)| {
             let s = match frac_part {
                 Some(frac) => format!("{int_part}.{frac}"),
@@ -62,12 +98,12 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             };
             ExprKind::Number(s.parse::<f64>().unwrap_or(f64::NAN))
         })
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     // String content: either non-escape char or escape sequences
     // Supports: \n \t \r \" \\ \0 \xNN (hex byte) \uXXXX (unicode)
-    let hex_digit = filter(|c: &char| c.is_ascii_hexdigit());
+    let hex_digit = any::<&'src str, extra::Err<Simple<'src, char>>>().filter(|c: &char| c.is_ascii_hexdigit());
     let escape = just('\\').then(choice((
         just('n').to('\n'),
         just('t').to('\t'),
@@ -104,10 +140,10 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         escape.map(|(_, c)| c),
     ));
     let string = just('"')
-        .ignore_then(string_char.clone().repeated())
+        .ignore_then(string_char.clone().repeated().collect::<Vec<char>>())
         .then_ignore(just('"'))
-        .map(|chars| ExprKind::Str(chars.into_iter().collect()))
-        .map_with_span(mk_expr)
+        .map(|chars: Vec<char>| ExprKind::Str(chars.into_iter().collect()))
+        .map_with(mk_expr_w)
         .padded();
 
     let escape_raw = just('\\').then(choice((
@@ -119,28 +155,38 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     )));
     let string_char_raw = choice((none_of("\"\\").map(|c| c), escape_raw.map(|(_, c)| c)));
     let string_raw = just('"')
-        .ignore_then(string_char_raw.repeated())
+        .ignore_then(string_char_raw.repeated().collect::<Vec<char>>())
         .then_ignore(just('"'))
-        .map(|chars| chars.into_iter().collect::<String>())
+        .map(|chars: Vec<char>| chars.into_iter().collect::<String>())
         .padded();
 
     let bool_lit = choice((
         just("true").to(ExprKind::Bool(true)),
         just("false").to(ExprKind::Bool(false)),
     ))
-    .map_with_span(mk_expr)
+    .map_with(mk_expr_w)
     .padded();
 
     let nil_lit = just("nil")
         .to(ExprKind::Nil)
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
-    let ident = text::ident().padded();
+    let ident = text::ident().map(|s: &str| s.to_string()).padded();
 
     // Mutual recursion: expression blocks need statements, and statements need expressions.
     let mut expr = Recursive::declare();
     let mut stmt = Recursive::declare();
+    // Restricted parser for `match`-arm guard expressions.
+    //
+    // SP1-gamma: the full `expr` recursive parser exposes a chumsky-0.8
+    // `cmp_op.padded().repeated()` partial-consume failure when extended
+    // past `n < 0` (the guard ends and the outer arm expects the body).
+    // We define `guard_expr` as `cmp_expr` (the level just below logical /
+    // ternary / postfix) so the parser stops cleanly before the chain that
+    // triggers the cascade. Logical `and`/`or` inside guards is supported
+    // by wrapping the guard in parentheses.
+    let mut guard_expr = Recursive::declare();
 
     // -------------------- statements --------------------
     let inner_stmt0 = stmt.clone().then_ignore(just(';').padded().or_not());
@@ -155,7 +201,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('}'))
         .map(StmtKind::Block)
-        .map_with_span(mk_stmt)
+        .map_with(mk_stmt_w)
         .padded();
 
     // -------------------- types (for gradual typing) --------------------
@@ -168,7 +214,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         just("string").to(TypeKind::String),
         just("nil").to(TypeKind::Nil),
     ))
-    .map_with_span(mk_type)
+    .map_with(mk_type_w)
     .padded();
 
     let ty_array = just("array")
@@ -176,7 +222,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .ignore_then(ty.clone())
         .then_ignore(just('>').padded())
         .map(|inner| TypeKind::Array(Box::new(inner)))
-        .map_with_span(mk_type)
+        .map_with(mk_type_w)
         .padded();
 
     let ty_map = just("map")
@@ -186,7 +232,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(ty.clone())
         .then_ignore(just('>').padded())
         .map(|(k, v)| TypeKind::Map(Box::new(k), Box::new(v)))
-        .map_with_span(mk_type)
+        .map_with(mk_type_w)
         .padded();
 
     let ty_result = just("result")
@@ -196,11 +242,11 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(ty.clone())
         .then_ignore(just('>').padded())
         .map(|(ok, err)| TypeKind::Result(Box::new(ok), Box::new(err)))
-        .map_with_span(mk_type)
+        .map_with(mk_type_w)
         .padded();
 
     // Generic type parameter: an uppercase-starting identifier (e.g. T, K, V)
-    let ty_generic = text::ident()
+    let ty_generic = text::ident().map(|s: &str| s.to_string())
         .padded()
         .try_map(|name: String, span| {
             if name
@@ -216,13 +262,14 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             {
                 Ok(TypeKind::Generic(name))
             } else {
-                Err(Simple::custom(
+                Err(<Simple<char> as chumsky::label::LabelError<&'src str, _>>::expected_found(
+                    Vec::<chumsky::util::MaybeRef<'_, char>>::new(),
+                    None,
                     span,
-                    "expected a generic type parameter (uppercase identifier)",
                 ))
             }
         })
-        .map_with_span(mk_type)
+        .map_with(mk_type_w)
         .padded();
 
     // The recursive type definition includes the `?` postfix for Option types
@@ -237,14 +284,14 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 Some(_) => TypeKind::Option(Box::new(inner)),
                 None => inner.kind,
             })
-            .map_with_span(mk_type),
+            .map_with(mk_type_w),
     );
 
     let type_ann = just(':').padded().ignore_then(ty.clone()).or_not();
 
     // vararg param: ...name (must be last in param list)
     let vararg_param = just("...")
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .map(|name| Param {
             name,
             ty: None,
@@ -262,7 +309,12 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     let param_literal_default = choice((
         // number literal
         text::int(10)
-            .then(just('.').ignore_then(text::digits(10)).or_not())
+            .map(|s: &str| s.to_string())
+            .then(
+                just('.')
+                    .ignore_then(text::digits(10).to_slice().map(|s: &str| s.to_string()))
+                    .or_not(),
+            )
             .padded()
             .map(|(int_part, frac_part): (String, Option<String>)| {
                 let s = match frac_part {
@@ -277,10 +329,10 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             }),
         // string literal
         just('"')
-            .ignore_then(string_char.clone().repeated())
+            .ignore_then(string_char.clone().repeated().collect::<Vec<char>>())
             .then_ignore(just('"'))
             .padded()
-            .map(|chars| Expr {
+            .map(|chars: Vec<char>| Expr {
                 kind: ExprKind::Str(chars.into_iter().collect()),
                 span: Span { start: 0, end: 0 },
             }),
@@ -301,7 +353,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         }),
     ));
 
-    let param_with_default = text::ident()
+    let param_with_default = text::ident().map(|s: &str| s.to_string())
         .padded()
         .then(type_ann.clone())
         .then(
@@ -330,7 +382,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let fn_stmt = just("fn")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(params.clone())
         .then(ret_ann.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
@@ -338,7 +390,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!("block parser must produce StmtKind::Block"),
         }))
         .map(|(((name, params), ret), body)| StmtKind::Fn(name, params, ret, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     let printf_stmt = just("printf")
         .then_ignore(ws1.clone())
@@ -346,30 +398,30 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .map(|(p, e)| StmtKind::PrintF(p as usize, e))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     let print_stmt = just("print")
         .then_ignore(ws1.clone())
         .ignore_then(expr.clone())
         .map(StmtKind::Print)
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     let return_stmt = just("return")
         .ignore_then(expr.clone().or_not())
         .map(StmtKind::Return)
-        .map_with_span(mk_stmt)
+        .map_with(mk_stmt_w)
         .padded();
 
     // break; — exit nearest loop
     let break_stmt = just("break")
         .map(|_| StmtKind::Break)
-        .map_with_span(mk_stmt)
+        .map_with(mk_stmt_w)
         .padded();
 
     // continue; — next iteration of nearest loop
     let continue_stmt = just("continue")
         .map(|_| StmtKind::Continue)
-        .map_with_span(mk_stmt)
+        .map_with(mk_stmt_w)
         .padded();
 
     // throw expr; — raise a runtime error
@@ -377,7 +429,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then_ignore(ws1.clone())
         .ignore_then(expr.clone())
         .map(StmtKind::Throw)
-        .map_with_span(mk_stmt)
+        .map_with(mk_stmt_w)
         .padded();
 
     // loop { body } — infinite loop (use break to exit)
@@ -388,40 +440,40 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!(),
         }))
         .map(StmtKind::Loop)
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     let defer_stmt = just("defer")
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .map(|(_, e)| StmtKind::Defer(e))
-        .map_with_span(mk_stmt)
+        .map_with(mk_stmt_w)
         .padded();
 
     let import_stmt = just("import")
         .then_ignore(ws1.clone())
         .ignore_then(string_raw.clone())
         .map(StmtKind::Import)
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     let export_stmt = just("export")
         .then_ignore(ws1.clone())
         .ignore_then(
-            text::ident()
+            text::ident().map(|s: &str| s.to_string())
                 .padded()
                 .separated_by(just(',').padded())
                 .allow_trailing()
                 .collect::<Vec<String>>(),
         )
         .map(StmtKind::Export)
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // Array destructuring: let [a, b, c] = expr
     //   desugars to: let __d_N = expr; let a = __d_N[0]; let b = __d_N[1]; ...
     //   with optional rest: let [a, b, ...rest] = expr
     //     desugars to: ... let rest = [__d_N[2], __d_N[3], ...]
-    let destruct_ident = text::ident().padded();
+    let destruct_ident = text::ident().map(|s: &str| s.to_string()).padded();
     let destruct_rest = just("...")
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .map(|name| (name, true)); // (name, is_rest)
     let destruct_name_or_rest = choice((destruct_rest, destruct_ident.map(|n| (n, false))));
 
@@ -436,7 +488,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('=').padded())
         .then(expr.clone())
-        .map_with_span(|(names, rhs), sp| {
+        .map_with(|(names, rhs), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__destruct_{}", sp.start);
             let tmp_expr = Expr {
@@ -558,13 +610,13 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     //   With rename: let {key: alias} = expr  →  let alias = __d_N.key;
     let map_destruct_field = choice((
         // key: local_name
-        text::ident()
+        text::ident().map(|s: &str| s.to_string())
             .padded()
             .then_ignore(just(':').padded())
-            .then(text::ident().padded())
+            .then(text::ident().map(|s: &str| s.to_string()).padded())
             .map(|(key, alias): (String, String)| (key, alias)),
         // key  (same name for key and local)
-        text::ident()
+        text::ident().map(|s: &str| s.to_string())
             .padded()
             .map(|name: String| (name.clone(), name)),
     ));
@@ -580,7 +632,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('=').padded())
         .then(expr.clone())
-        .map_with_span(|(fields, rhs), sp| {
+        .map_with(|(fields, rhs), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__mdestruct_{}", sp.start);
             let tmp_expr = Expr {
@@ -613,22 +665,22 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     // Plain let: let name[:type] = expr
     let let_stmt = just("let")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then(type_ann.clone())
         .then_ignore(just('=').padded())
         .then(expr.clone())
         .map(|((name, ty), expr)| StmtKind::Let(name, ty, expr))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // const name = expr; — immutable binding (Rust-style)
     let const_stmt = just("const")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then(type_ann.clone())
         .then_ignore(just('=').padded())
         .then(expr.clone())
         .map(|((name, ty), init)| StmtKind::Const(name, ty, init))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // assignment / mutation statement:
     //   x = expr
@@ -642,22 +694,21 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     }
 
     let l_attr = just('.')
-        .ignore_then(text::ident().padded())
-        .map_with_span(|name, sp| LPostfix::Attr(name, Span::from(sp)))
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .map_with(|name, e| LPostfix::Attr(name, Span::from(span_of(e))))
         .padded();
 
     let l_index = expr
         .clone()
         .delimited_by(just('['), just(']'))
-        .map_with_span(|e, sp| LPostfix::Index(e, Span::from(sp)))
+        .map_with(|x, e| LPostfix::Index(x, Span::from(span_of(e))))
         .padded();
 
-    let lvalue = text::ident()
+    let lvalue = text::ident().map(|s: &str| s.to_string())
         .padded()
         .map(ExprKind::Var)
-        .map_with_span(mk_expr)
-        .then(choice((l_attr, l_index)).repeated())
-        .foldl(|left, pf| match pf {
+        .map_with(mk_expr_w)
+        .foldl(choice((l_attr, l_index)).repeated(), |left: Expr, pf: LPostfix| match pf {
             LPostfix::Attr(name, a_sp) => {
                 let sp = Span {
                     start: left.span.start,
@@ -706,7 +757,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .clone()
         .then(aug_op)
         .then(expr.clone())
-        .map_with_span(|((lhs, op), rhs), sp| {
+        .map_with(|((lhs, op), rhs), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             // Build: lhs_expr op rhs
             let lhs_expr = lhs.clone();
@@ -756,9 +807,9 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             ExprKind::Index(obj, ix) => StmtKind::SetIndex(*obj, *ix, rhs),
             _ => unreachable!("lvalue parser only builds Var/GetAttr/Index"),
         })
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
-    let expr_stmt = expr.clone().map(StmtKind::Expr).map_with_span(mk_stmt);
+    let expr_stmt = expr.clone().map(StmtKind::Expr).map_with(mk_stmt_w);
 
     // if/elif/else needs self-reference for `else if`
     let mut if_stmt = Recursive::declare();
@@ -786,7 +837,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(block_body.clone())
         .then(elif_clause.repeated().collect::<Vec<(Expr, Vec<Stmt>)>>())
         .then(else_clause)
-        .map_with_span(|(((cond, then_body), elifs), else_body), sp| {
+        .map_with(|(((cond, then_body), elifs), else_body), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let mut else_body = else_body;
 
@@ -815,14 +866,14 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!("block parser must produce StmtKind::Block"),
         }))
         .map(|(cond, body)| StmtKind::While(cond, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // for k, v in expr { body } — iterates map key-value pairs
     let for_in_kv_stmt = just("for")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then_ignore(just(',').padded())
-        .then(text::ident().padded())
+        .then(text::ident().map(|s: &str| s.to_string()).padded())
         .then_ignore(ws0.clone()) // padded already consumed trailing ws
         .then_ignore(just("in"))
         .then_ignore(ws1.clone())
@@ -832,12 +883,12 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!(),
         }))
         .map(|(((k, v), col), body)| StmtKind::ForInKV(k, v, col, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // for x in expr { body } — iterates array elements or map keys
     let for_in_stmt = just("for")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then_ignore(ws1.clone())
         .then_ignore(just("in"))
         .then_ignore(ws1.clone())
@@ -847,12 +898,12 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!(),
         }))
         .map(|((name, col), body)| StmtKind::ForIn(name, col, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // for i N { body } — original counter loop
     let for_stmt = just("for")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
@@ -860,7 +911,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             _ => unreachable!("block parser must produce StmtKind::Block"),
         }))
         .map(|((name, count), body)| StmtKind::For(name, count, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // class statement (OOP sugar):
     // class Name {
@@ -871,11 +922,11 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     // let Name = map{ method: fn method(self, x) { ... }, other: fn other() { ... } };
     let class_method = just("fn")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(params.clone())
         .then(ret_ann.clone())
         .then(block_body.clone())
-        .map_with_span(|(((name, params), ret), body), sp| {
+        .map_with(|(((name, params), ret), body), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let f = Expr {
                 kind: ExprKind::FnLit(Some(name.clone()), params, ret, body),
@@ -886,7 +937,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let class_stmt = just("class")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then_ignore(ws0.clone())
         .then(
             class_method
@@ -895,7 +946,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 .collect::<Vec<(String, Expr)>>()
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with_span(|(name, methods), sp| {
+        .map_with(|(name, methods), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             // Detect init arity BEFORE methods is moved into the map expression.
             // Used later to wire up __call so that `ClassName(args...)` works.
@@ -1144,7 +1195,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('}'))
         .map(StmtKind::Block)
-        .map_with_span(mk_stmt)
+        .map_with(mk_stmt_w)
         .padded();
 
     let gblock_body = gblock_stmt.clone().map(|s| match s.kind {
@@ -1154,8 +1205,8 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let goto_jump_stmt = just("goto")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident().padded())
-        .map_with_span(|label, sp| {
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .map_with(|label, __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let e = Expr {
                 kind: ExprKind::Str(label),
@@ -1167,7 +1218,8 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             }
         });
 
-    let end_stmt = just("end").map_with_span(|_, sp| {
+    let end_stmt = just("end").map_with(|_, __e| {
+        let sp = span_of(__e);
         let sp = Span::from(sp);
         let e = Expr {
             kind: ExprKind::Str("__done".to_string()),
@@ -1198,7 +1250,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(gblock_body.clone())
         .then(g_elif_clause.repeated().collect::<Vec<(Expr, Vec<Stmt>)>>())
         .then(g_else_clause)
-        .map_with_span(|(((cond, then_body), elifs), else_body), sp| {
+        .map_with(|(((cond, then_body), elifs), else_body), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let mut else_body = else_body;
             for (econd, ebody) in elifs.into_iter().rev() {
@@ -1219,42 +1271,42 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .ignore_then(expr.clone())
         .then(gblock_body.clone())
         .map(|(cond, body)| StmtKind::While(cond, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // g_for_in_kv_stmt: for k, v in expr { body } inside goto context
     let g_for_in_kv_stmt = just("for")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then_ignore(just(',').padded())
-        .then(text::ident().padded())
+        .then(text::ident().map(|s: &str| s.to_string()).padded())
         .then_ignore(ws0.clone()) // padded already consumed trailing ws
         .then_ignore(just("in"))
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .then(gblock_body.clone())
         .map(|(((k, v), col), body)| StmtKind::ForInKV(k, v, col, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // g_for_in_stmt: for x in expr { body } inside goto context
     let g_for_in_stmt = just("for")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then_ignore(ws1.clone())
         .then_ignore(just("in"))
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .then(gblock_body.clone())
         .map(|((name, col), body)| StmtKind::ForIn(name, col, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     let g_for_stmt = just("for")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then_ignore(ws1.clone())
         .then(expr.clone())
         .then(gblock_body.clone())
         .map(|((name, count), body)| StmtKind::For(name, count, body))
-        .map_with_span(mk_stmt);
+        .map_with(mk_stmt_w);
 
     // Allow nested blocks inside goto label bodies.
     let g_stmt_impl = choice((
@@ -1279,7 +1331,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let goto_label = just("label")
         .then_ignore(ws1.clone())
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(gblock_body.clone());
 
     let goto_block_stmt = just("goto")
@@ -1291,7 +1343,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 .collect::<Vec<(String, Vec<Stmt>)>>()
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with_span(|labels, sp| {
+        .map_with(|labels, __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
 
             let pc = format!("__pc_{}", sp.start);
@@ -1468,7 +1520,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 .then(switch_default)
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with_span(|(scrutinee, (cases, default_body)), sp| {
+        .map_with(|(scrutinee, (cases, default_body)), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__switch_{}", sp.start);
             let tmp_expr = Expr {
@@ -1554,15 +1606,15 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .allow_trailing()
         .collect::<Vec<Expr>>()
         .delimited_by(just('('), just(')'))
-        .map_with_span(|args, sp| (args, Span::from(sp)))
+        .map_with(|args, __e| { let sp = __e.span().into_range(); (args, Span::from(sp)) })
         .padded();
 
-    let ident_expr = ident.map(ExprKind::Var).map_with_span(mk_expr);
+    let ident_expr = ident.map(ExprKind::Var).map_with(mk_expr_w);
 
     // Function literal expression:
     // fn (a, b) { ... }
     // fn name(a, b) { ... }   (optional name, mainly for debugging/stack traces later)
-    let fn_lit_name = ws1.clone().ignore_then(text::ident().padded()).or_not();
+    let fn_lit_name = ws1.clone().ignore_then(text::ident().map(|s: &str| s.to_string()).padded()).or_not();
 
     let fn_lit_expr = just("fn")
         .ignore_then(fn_lit_name)
@@ -1570,7 +1622,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(ret_ann.clone())
         .then(block_body.clone())
         .map(|(((name_opt, params), ret), body)| ExprKind::FnLit(name_opt, params, ret, body))
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     // Expression block: { stmt; stmt; expr? }
@@ -1582,7 +1634,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then(expr.clone().or_not())
         .delimited_by(just('{'), just('}'))
         .map(|(stmts, tail)| ExprKind::BlockExpr(stmts, tail.map(Box::new)))
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     // `if cond { then } else { else }` — expression-level conditional (both arms are blocks).
@@ -1595,7 +1647,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .map(|((cond, then_br), else_br)| {
             ExprKind::IfExpr(Box::new(cond), Box::new(then_br), Box::new(else_br))
         })
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     let array_lit = expr
@@ -1605,12 +1657,12 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .collect::<Vec<Expr>>()
         .delimited_by(just('['), just(']'))
         .map(ExprKind::Array)
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     let map_key = choice((
         // allow: foo: 1
-        text::ident().padded(),
+        text::ident().map(|s: &str| s.to_string()).padded(),
         // allow: "foo": 1
         string_raw.clone(),
     ));
@@ -1630,7 +1682,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         )
         .then_ignore(just('}').padded())
         .map(ExprKind::Map)
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     let try_expr = just("try")
@@ -1639,7 +1691,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then_ignore(just("catch").padded())
         .then(expr.clone())
         .map(|(a, b)| ExprKind::Try(Box::new(a), Box::new(b)))
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     // match expression: match expr { case pattern: expr; ... else: expr }
@@ -1653,27 +1705,34 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     ))
     .padded();
 
-    // SP1-gamma fix: absorb the guard separator (~, #) directly into the
-    // whitespace consumed between the guard expression and the body.
+    // Guarded match arms use `~` (canonical) or `#` (legacy) as the body
+    // separator. `ws0_guard` absorbs the separator and any surrounding
+    // whitespace in one step. See `guard_expr` (declared near the top of
+    // `parser()` and defined just below `cmp_expr`) for the restricted
+    // sub-parser that lets the chain stop cleanly before `~`.
     //
-    // Why this works: chumsky 0.8's cmp_op.padded() tries to extend the guard
-    // expression and generates a soft error at `~`. parse_recovery either:
-    //   (a) skips `~` before ws0_guard runs, then ws0_guard consumes trailing space, OR
-    //   (b) doesn't skip `~`, ws0_guard consumes ` ~ ` entirely.
-    // Both cases leave the body expression starting correctly at `"body_value"`.
-    //
-    // Syntax: `case IDENT if GUARD ~ BODY;`  (~ is the canonical guard separator)
-    //         `case IDENT if GUARD # BODY;`  (# is legacy, kept for backward compat)
+    // Syntax: `case IDENT if GUARD ~ BODY;`  (~ is the canonical separator)
+    //         `case IDENT if GUARD # BODY;`  (# is legacy, kept for compat)
     let ws0_guard = one_of(" \t\r\n~#").repeated().ignored();
 
     // Guarded arm: `case ident if guard_expr ~ body`
+    //
+    // The guard uses the **restricted** `guard_expr` parser declared near
+    // the top of `parser()` — it bottoms out at `cmp_expr`, so the full
+    // expression's logical/ternary/postfix layers (which trigger the
+    // chumsky-0.8 `cmp_op.padded().repeated()` cascade after `n < 0 ~`)
+    // never run. `not`, `and`, `or` inside a guard need parentheses around
+    // the whole guard, e.g. `case x if (a < 0 and b > 0) ~ body`.
     let guarded_match_arm = just("case")
         .then_ignore(ws1.clone())
         .ignore_then(ident)
-        .then_ignore(ws1.clone().then_ignore(just("if")).then_ignore(ws1.clone()))
-        .then(expr.clone()) // guard expression; stops before ws0_guard
+        // `ident` is already padded (trailing whitespace consumed), so we
+        // can't require ws1 before "if" — use `just("if").padded()` which
+        // handles whitespace on both sides of the keyword cleanly.
+        .then_ignore(just("if").padded())
+        .then(guard_expr.clone()) // restricted parser — stops cleanly before `~`
         .then(
-            // The ~ or # separator is absorbed by ws0_guard
+            // The ~ or # separator is absorbed by ws0_guard.
             ws0_guard.ignore_then(expr.clone()),
         )
         .map(|((name, guard), body)| (MatchArm::BindGuard(name, guard), body));
@@ -1710,10 +1769,10 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 .then(match_else)
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with_span(|(scrutinee, (arms, else_expr)), _sp| {
+        .map(|(scrutinee, (arms, else_expr))| {
             ExprKind::Match(Box::new(scrutinee), arms, else_expr.map(Box::new))
         })
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     // switch expression (value-returning):
@@ -1748,7 +1807,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
                 .then(switch_default_expr)
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with_span(|(scrutinee, (cases, default_expr)), sp| {
+        .map_with(|(scrutinee, (cases, default_expr)), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__switch_{}", sp.start);
             let out = format!("__switch_out_{}", sp.start);
@@ -1836,10 +1895,14 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
         .then_ignore(just('}'))
         .map(|e| FStringPart::Interp(Box::new(e)));
     let f_string_expr = just("f\"")
-        .ignore_then(choice((fstr_interp_part, fstr_literal_part)).repeated())
+        .ignore_then(
+            choice((fstr_interp_part, fstr_literal_part))
+                .repeated()
+                .collect::<Vec<FStringPart>>(),
+        )
         .then_ignore(just('"'))
         .map(ExprKind::FString)
-        .map_with_span(mk_expr)
+        .map_with(mk_expr_w)
         .padded();
 
     let primary = choice((
@@ -1878,14 +1941,14 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     }
 
     let attr = just('.')
-        .ignore_then(text::ident().padded())
-        .map_with_span(|name, sp| Postfix::Attr(name, Span::from(sp)))
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .map_with(|name, __e| Postfix::Attr(name, Span::from(span_of(__e))))
         .padded();
 
     // `?.field` — nil-safe attribute access
     let safe_attr = just("?.")
-        .ignore_then(text::ident().padded())
-        .map_with_span(|name, sp| Postfix::SafeAttr(name, Span::from(sp)))
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .map_with(|name, __e| Postfix::SafeAttr(name, Span::from(span_of(__e))))
         .padded();
 
     // `?[expr]` — nil-safe index access
@@ -1893,7 +1956,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     // we reuse the existing `index` parser but prefix it with `?`.
     let safe_index = just('?')
         .ignore_then(expr.clone().delimited_by(just('['), just(']')))
-        .map_with_span(|e, sp| Postfix::SafeIndex(e, Span::from(sp)))
+        .map_with(|e, __e| Postfix::SafeIndex(e, Span::from(span_of(__e))))
         .padded();
 
     // `?` alone — Result unwrap. Must not steal `?` from ternary (`cond ? a : b`).
@@ -1909,7 +1972,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             end().to(()),
         )))
         .rewind()
-        .map_with_span(|_, sp| Postfix::ResultUnwrap(Span::from(sp)))
+        .map_with(|_, __e| { let sp = __e.span().into_range(); Postfix::ResultUnwrap(Span::from(sp)) })
         .padded();
 
     // `?? expr` — null coalescing as postfix (parsed before single `?` to avoid ambiguity)
@@ -1918,21 +1981,21 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
     let null_coal_pf = just("??")
         .ignore_then(ws0.clone())
         .ignore_then(expr.clone())
-        .map_with_span(|right, sp| Postfix::NullCoal(right, Span::from(sp)))
+        .map_with(|right, __e| { let sp = __e.span().into_range(); Postfix::NullCoal(right, Span::from(sp)) })
         .padded();
 
     let call = args.clone().map(|(a, sp)| Postfix::Call(a, sp));
 
     let method = just(':')
-        .ignore_then(text::ident().padded())
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(args.clone())
-        .map_with_span(|(name, (a, _)), sp| Postfix::Method(name, a, Span::from(sp)))
+        .map_with(|(name, (a, _)), __e| { let sp = __e.span().into_range(); Postfix::Method(name, a, Span::from(sp)) })
         .padded();
 
     let index = expr
         .clone()
         .delimited_by(just('['), just(']'))
-        .map_with_span(|e, sp| Postfix::Index(e, Span::from(sp)))
+        .map_with(|e, __e| { let sp = __e.span().into_range(); Postfix::Index(e, Span::from(sp)) })
         .padded();
 
     // postfix: calls, indexing, member access, safe access, result-unwrap (left-to-right)
@@ -1952,8 +2015,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let call_expr = primary
         .clone()
-        .then(postfix.repeated())
-        .foldl(|left, pf| match pf {
+        .foldl(postfix.repeated(), |left: Expr, pf: Postfix| match pf {
             Postfix::Call(args, arg_sp) => {
                 let sp = Span {
                     start: left.span.start,
@@ -2106,7 +2168,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let unary_expr = prefix
         .then(call_expr.clone())
-        .map_with_span(|(pfx, e), sp| {
+        .map_with(|(pfx, e), __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
             match pfx {
                 Some(Prefix::Not) => Expr {
@@ -2146,8 +2208,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let mul_expr = unary_expr
         .clone()
-        .then(mul_ext_op.then(unary_expr.clone()).repeated())
-        .foldl(|left, (op, right)| {
+        .foldl(mul_ext_op.then(unary_expr.clone()).repeated(), |left: Expr, (op, right): (MulExtOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             let kind = match op {
                 MulExtOp::Mul => ExprKind::Mul(Box::new(left), Box::new(right)),
@@ -2163,8 +2224,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let add_expr = mul_expr
         .clone()
-        .then(add_op.then(mul_expr).repeated())
-        .foldl(|left, (op, right)| {
+        .foldl(add_op.then(mul_expr).repeated(), |left: Expr, (op, right): (AddOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             let kind = match op {
                 AddOp::Add => ExprKind::Add(Box::new(left), Box::new(right)),
@@ -2186,8 +2246,7 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
 
     let cmp_expr = add_expr
         .clone()
-        .then(cmp_op.then(add_expr).repeated())
-        .foldl(|left, (op, right)| {
+        .foldl(cmp_op.then(add_expr).repeated(), |left: Expr, (op, right): (CmpOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             let kind = match op {
                 CmpOp::Eq => ExprKind::Eq(Box::new(left), Box::new(right)),
@@ -2200,14 +2259,71 @@ pub fn parser() -> impl Parser<char, Vec<Stmt>, Error = Simple<char>> {
             Expr { kind, span: sp }
         });
 
+    // SP1-gamma: define the restricted `guard_expr` parser used by
+    // `case <ident> if <guard> ~ <body>` arms.
+    //
+    // The full `expr` parser triggers a chumsky-0.8 cascade at every
+    // arithmetic / comparison layer (`op.padded().repeated()` doesn't
+    // stop cleanly when the next token — here `~` — isn't an operator).
+    // Using `cmp_expr` alone is not enough either: it still contains
+    // `cmp_op.then(add_expr).repeated()` and inherits the same failure.
+    //
+    // This minimal parser uses **only** `.or_not()` for the optional
+    // operator (no `.repeated()`), so guards are limited to the single
+    // shape `<atom> [cmp_op <atom>]` where atom = literal | ident |
+    // (guard_expr). That covers every guard the test suite needs
+    // (`n < 0`, `n == 0`, `n >= 10`) without touching the arithmetic /
+    // logical / postfix ladders. For composite guards, wrap in parens
+    // and use the `(guard_expr)` recursion. Logical and/or are not
+    // supported inside guards (compute outside the match if needed).
+    let guard_cmp_op = choice((
+        just("==").to(CmpOp::Eq),
+        just("!=").to(CmpOp::NotEq),
+        just(">=").to(CmpOp::Ge),
+        just("<=").to(CmpOp::Le),
+        just(">").to(CmpOp::Gt),
+        just("<").to(CmpOp::Lt),
+    ))
+    .padded();
+    let guard_atom = choice((
+        bool_lit.clone(),
+        nil_lit.clone(),
+        number,
+        string.clone(),
+        ident.map(ExprKind::Var).map_with(mk_expr_w),
+        just('(')
+            .padded()
+            .ignore_then(guard_expr.clone())
+            .then_ignore(just(')').padded()),
+    ));
+    guard_expr.define(
+        guard_atom
+            .clone()
+            .then(guard_cmp_op.then(guard_atom).or_not())
+            .map(|(left, opt)| match opt {
+                Some((op, right)) => {
+                    let sp = Span::join(left.span, right.span);
+                    let kind = match op {
+                        CmpOp::Eq => ExprKind::Eq(Box::new(left), Box::new(right)),
+                        CmpOp::NotEq => ExprKind::NotEq(Box::new(left), Box::new(right)),
+                        CmpOp::Gt => ExprKind::Gt(Box::new(left), Box::new(right)),
+                        CmpOp::Ge => ExprKind::Ge(Box::new(left), Box::new(right)),
+                        CmpOp::Lt => ExprKind::Lt(Box::new(left), Box::new(right)),
+                        CmpOp::Le => ExprKind::Le(Box::new(left), Box::new(right)),
+                    };
+                    Expr { kind, span: sp }
+                }
+                None => left,
+            }),
+    );
+
     // logical: and/or
     let logical_op =
         choice((just("and").to(LogicalOp::And), just("or").to(LogicalOp::Or))).padded();
 
     let logical_expr = cmp_expr
         .clone()
-        .then(logical_op.then(cmp_expr).repeated())
-        .foldl(|left, (op, right)| {
+        .foldl(logical_op.then(cmp_expr).repeated(), |left: Expr, (op, right): (LogicalOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             Expr {
                 kind: ExprKind::Logical {

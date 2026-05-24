@@ -593,8 +593,31 @@ impl std::fmt::Debug for ThreadPool {
 // Atomic
 // ---------------------------------------------------------------------------
 
+/// Marker for types whose bit-pattern arithmetic on `AtomicU64` is meaningful.
+/// `fetch_add` is gated on this trait so callers can't accidentally use it on
+/// types like `f64` or raw pointers — the underlying op is integer addition on
+/// the bit pattern, which is nonsensical for floats and unsound for pointers.
+///
+/// # Safety
+/// Implementors must be 8 bytes and treat their bit pattern as an unsigned
+/// integer for the purposes of addition.
+pub unsafe trait AtomicAddable: Copy + 'static {}
+
+unsafe impl AtomicAddable for u64 {}
+unsafe impl AtomicAddable for i64 {}
+unsafe impl AtomicAddable for usize {} // 64-bit targets; assertion below catches 32-bit.
+
 /// Atomic operations wrapper with type safety.
 /// Only works with types that are the same size as u64 (8 bytes).
+///
+/// `load`, `store`, and `compare_exchange` work on any `Copy + 'static` type
+/// of the right size. `fetch_add` is restricted to types implementing
+/// `AtomicAddable` so a hypothetical `Atomic<f64>::fetch_add` (which would
+/// do integer addition on float bits — silently wrong) won't compile.
+///
+/// The 8-byte size requirement is enforced by a `const { assert! }` block
+/// in `new`, so `Atomic::<u32>::new(0)` fails at compile-time per
+/// monomorphisation — no runtime panic surface.
 pub struct Atomic<T: Copy + 'static> {
     value: AtomicU64,
     _phantom: std::marker::PhantomData<T>,
@@ -602,12 +625,15 @@ pub struct Atomic<T: Copy + 'static> {
 
 impl<T: Copy + 'static> Atomic<T> {
     pub fn new(value: T) -> Self {
-        // Compile-time assertion: T must be exactly 8 bytes
-        assert_eq!(
-            std::mem::size_of::<T>(),
-            8,
-            "Atomic<T> only supports types that are exactly 8 bytes (size_of::<u64>())"
-        );
+        // Compile-time size check: monomorphisations with the wrong T fail to
+        // compile rather than panic at runtime. Requires Rust 1.79+
+        // (inline const blocks); the workspace pins toolchain >= 1.79.
+        const {
+            assert!(
+                std::mem::size_of::<T>() == 8,
+                "Atomic<T> only supports types that are exactly 8 bytes (size_of::<u64>())"
+            );
+        }
         Self {
             value: AtomicU64::new(unsafe { std::mem::transmute_copy::<T, u64>(&value) }),
             _phantom: std::marker::PhantomData,
@@ -638,7 +664,12 @@ impl<T: Copy + 'static> Atomic<T> {
             }
         }
     }
+}
 
+impl<T: AtomicAddable> Atomic<T> {
+    /// Integer-only atomic add. Restricted via the `AtomicInteger` trait so
+    /// non-integer 8-byte types (e.g. `f64`) can't reach a nonsensical
+    /// bit-pattern fetch_add.
     pub fn fetch_add(&self, value: T) -> T {
         let raw: u64 = unsafe { std::mem::transmute_copy::<T, u64>(&value) };
         let prev_raw = self.value.fetch_add(raw, Ordering::SeqCst);
@@ -977,7 +1008,7 @@ impl VmThreadSupervisor {
         let handle = spawn_fn();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
-        self.stats.lock().unwrap().spawned += 1;
+        self.stats.lock().unwrap_or_else(|e| e.into_inner()).spawned += 1;
 
         let handles = self.handles.clone();
         let stats = self.stats.clone();
@@ -987,8 +1018,8 @@ impl VmThreadSupervisor {
         thread::spawn(move || {
             while !handle.is_finished() {
                 if Instant::now() >= deadline_for_monitor {
-                    let mut h = handles.lock().unwrap();
-                    let mut s = stats.lock().unwrap();
+                    let mut h = handles.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
                     s.timed_out += 1;
                     h.remove(&id);
                     return;
@@ -996,8 +1027,8 @@ impl VmThreadSupervisor {
                 thread::sleep(Duration::from_millis(10));
             }
             let result = handle.join();
-            let mut h = handles.lock().unwrap();
-            let mut s = stats.lock().unwrap();
+            let mut h = handles.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
             match &result {
                 Ok(Ok(_)) => s.completed += 1,
                 Ok(Err(_)) => s.completed += 1,
@@ -1006,7 +1037,7 @@ impl VmThreadSupervisor {
             h.remove(&id);
         });
 
-        self.handles.lock().unwrap().insert(
+        self.handles.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
             SupervisedThread { deadline },
         );
@@ -1016,10 +1047,10 @@ impl VmThreadSupervisor {
     /// Check if a supervised thread has timed out, and if so, remove it.
     /// Returns `true` if the thread was found and still alive.
     pub fn check(&self, id: usize) -> bool {
-        let mut handles = self.handles.lock().unwrap();
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = handles.get(&id) {
             if Instant::now() >= t.deadline {
-                let mut s = self.stats.lock().unwrap();
+                let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                 s.timed_out += 1;
                 handles.remove(&id);
                 return false;
@@ -1031,7 +1062,7 @@ impl VmThreadSupervisor {
 
     /// Check all supervised threads, removing any that have timed out or finished.
     pub fn check_all(&self) {
-        let mut handles = self.handles.lock().unwrap();
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let timed_out: Vec<usize> = handles
             .iter()
@@ -1039,7 +1070,7 @@ impl VmThreadSupervisor {
             .map(|(id, _)| *id)
             .collect();
         {
-            let mut s = self.stats.lock().unwrap();
+            let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
             s.timed_out += timed_out.len() as u64;
         }
         for id in timed_out {
@@ -1049,17 +1080,17 @@ impl VmThreadSupervisor {
 
     /// Kill all supervised threads (marks them as timed out for cleanup).
     pub fn kill_all(&self) {
-        let mut handles = self.handles.lock().unwrap();
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         let count = handles.len();
         handles.clear();
-        let mut s = self.stats.lock().unwrap();
+        let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         s.killed += count as u64;
     }
 
     /// Return a snapshot of supervision statistics.
     pub fn stats(&self) -> SupervisorStats {
-        let s = self.stats.lock().unwrap();
-        let h = self.handles.lock().unwrap();
+        let s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let h = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         SupervisorStats {
             spawned: s.spawned,
             completed: s.completed,
@@ -1071,12 +1102,12 @@ impl VmThreadSupervisor {
 
     /// Number of currently active supervised threads.
     pub fn active_count(&self) -> usize {
-        self.handles.lock().unwrap().len()
+        self.handles.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Total threads ever spawned under this supervisor.
     pub fn total_spawned(&self) -> u64 {
-        self.stats.lock().unwrap().spawned
+        self.stats.lock().unwrap_or_else(|e| e.into_inner()).spawned
     }
 }
 

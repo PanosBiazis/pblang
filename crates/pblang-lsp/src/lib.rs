@@ -1,9 +1,7 @@
 //! pblang Language Server (tower-lsp): parse + typecheck diagnostics, hover, goto-def,
 //! completions, document symbols, workspace symbols, and code actions.
 
-use chumsky::error::SimpleReason;
-use chumsky::prelude::Simple;
-use pblang_core::{Span as PbSpan, Stmt, StmtKind};
+use pblang_core::{ParseError, Span as PbSpan, Stmt, StmtKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -95,29 +93,11 @@ fn range_from_span(src: &str, start: usize, end: usize) -> Range {
     }
 }
 
-fn fmt_parse_error(err: &Simple<char>) -> String {
-    let label = err.label();
-    let found = err.found();
-    let mut expected = err.expected().copied().flatten().collect::<Vec<char>>();
-    expected.sort();
-    expected.dedup();
-    let base = match err.reason() {
-        SimpleReason::Unclosed { span: _, delimiter } => {
-            format!("unclosed delimiter '{delimiter}'")
-        }
-        SimpleReason::Custom(msg) => msg.to_string(),
-        SimpleReason::Unexpected => match (found, expected.is_empty()) {
-            (Some(f), false) => format!("unexpected '{f}', expected one of: {:?}", expected),
-            (Some(f), true) => format!("unexpected '{f}'"),
-            (None, false) => format!("unexpected end of input, expected one of: {:?}", expected),
-            (None, true) => "parse error".to_string(),
-        },
-    };
-    if let Some(l) = label {
-        format!("{base} (while parsing {l})")
-    } else {
-        base
-    }
+fn fmt_parse_error(err: &ParseError) -> String {
+    // Chumsky 1.0's `Simple` no longer exposes the rich label/expected/reason
+    // accessors that 0.9 did; we now ship the message verbatim from the
+    // pblang-core conversion.
+    err.message.clone()
 }
 
 fn diag_from_typeck(src: &str, d: pblang_typeck::Diagnostic) -> Diagnostic {
@@ -138,10 +118,9 @@ fn diag_from_typeck(src: &str, d: pblang_typeck::Diagnostic) -> Diagnostic {
     }
 }
 
-fn diag_from_parse(src: &str, e: &Simple<char>) -> Diagnostic {
-    let sp = e.span();
+fn diag_from_parse(src: &str, e: &ParseError) -> Diagnostic {
     Diagnostic {
-        range: range_from_span(src, sp.start, sp.end),
+        range: range_from_span(src, e.span.start, e.span.end),
         severity: Some(DiagnosticSeverity::ERROR),
         source: Some("pblang-parser".into()),
         message: fmt_parse_error(e),
