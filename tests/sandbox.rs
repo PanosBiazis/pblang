@@ -150,7 +150,43 @@ fn same_script_same_output_determinism() {
 }
 
 #[test]
+fn ffi_allowlist_restricts_libraries() {
+    // Loading any library when the policy has an empty allowed_libs must fail
+    // with the explicit "not in allowlist" error — not "library load failed"
+    // (which would mask a missing enforcement bug).
+    let mut vm = VM::with_stdlib(StdlibConfig {
+        ffi: true,
+        ..Default::default()
+    });
+    vm.set_ffi_policy(Some(FfiPolicy {
+        allow_all: false,
+        allowed_libs: HashSet::new(),
+        allowed_symbols: HashSet::new(),
+    }));
+    let stmts = parse(r#"ffi_load("./libnope.so");"#).expect("parse");
+    let chunk = compile(stmts).expect("compile");
+    let err = vm
+        .run(chunk)
+        .expect_err("ffi_load with empty allowlist must fail with allowlist error");
+    assert!(
+        err.message.contains("not in allowlist"),
+        "expected allowlist error naming the library, got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("libnope.so"),
+        "expected error to name the rejected library, got: {}",
+        err.message
+    );
+}
+
+#[test]
 fn ffi_allowlist_restricts_symbols() {
+    // Calling a symbol that isn't in the policy's allowed_symbols set must
+    // produce the explicit "not in allowlist" error naming the symbol —
+    // proving the allowlist check runs *before* the handle lookup (the handle
+    // is invalid here too, so a missing allowlist would be masked by a
+    // generic "invalid handle" error).
     let mut vm = VM::with_stdlib(StdlibConfig {
         ffi: true,
         ..Default::default()
@@ -162,14 +198,19 @@ fn ffi_allowlist_restricts_symbols() {
         allowed_libs: HashSet::new(),
         allowed_symbols: syms,
     }));
-    // Calling a disallowed symbol should error (symbol not in allowlist or invalid handle)
     let stmts = parse(r#"ffi_call(1, "forbidden_sym", []);"#).expect("parse");
     let chunk = compile(stmts).expect("compile");
-    let result = vm.run(chunk);
-    let err = result.expect_err("ffi_call with restrictive policy must fail");
+    let err = vm
+        .run(chunk)
+        .expect_err("ffi_call with restrictive policy must fail");
     assert!(
-        err.message.contains("symbol not in allowlist") || err.message.contains("invalid handle"),
-        "expected allowlist or handle error, got: {}",
+        err.message.contains("not in allowlist"),
+        "expected allowlist error, got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("forbidden_sym"),
+        "expected error to name the rejected symbol, got: {}",
         err.message
     );
 }

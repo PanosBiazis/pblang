@@ -717,8 +717,31 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
     )
 }
 
+/// Opaque parse-error type carried in `ParseWithPolyglotResult`.
+///
+/// Chumsky 1.0 made `Simple` borrow from the input (`Simple<'src, char>`),
+/// so we can no longer expose the raw chumsky error in a `'static` return
+/// type. We replace it with a small owned struct that captures the bits
+/// callers actually use — currently the byte-offset span, the offending
+/// character (if any), and a display message. (`Simple` in chumsky 1.0 no
+/// longer exposes `expected`/`reason`; richer diagnostics need `Rich`.)
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub message: String,
+    pub span: std::ops::Range<usize>,
+    pub found: Option<char>,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 /// Type alias for the result of `parse_with_polyglot` to tame the complex type signature.
-pub type ParseWithPolyglotResult = Result<(Vec<Stmt>, Vec<PolyglotBlock>), Vec<Simple<char>>>;
+pub type ParseWithPolyglotResult = Result<(Vec<Stmt>, Vec<PolyglotBlock>), Vec<ParseError>>;
 
 fn preprocess_for_parse(input: &str) -> (String, Vec<PolyglotBlock>) {
     // Keep byte offsets stable by masking comments/polyglot blocks with spaces.
@@ -727,9 +750,42 @@ fn preprocess_for_parse(input: &str) -> (String, Vec<PolyglotBlock>) {
     (masked, blocks)
 }
 
+fn errs_to_owned<'src>(errs: Vec<Simple<'src, char>>) -> Vec<ParseError> {
+    errs.into_iter()
+        .map(|e| {
+            let span = (*e.span()).into_range();
+            let found = e.found().copied();
+            let message = match found {
+                Some(c) => format!("unexpected character {:?} at byte {}", c, span.start),
+                None => format!("unexpected end of input at byte {}", span.start),
+            };
+            ParseError {
+                message,
+                span,
+                found,
+            }
+        })
+        .collect()
+}
+
 pub fn parse_with_polyglot_strict(input: &str) -> ParseWithPolyglotResult {
     let (masked, blocks) = preprocess_for_parse(input);
-    parser().parse(masked.as_str()).map(|stmts| (stmts, blocks))
+    let result: Result<Vec<Stmt>, Vec<ParseError>> = {
+        let parsed = parser().parse(masked.as_str());
+        let (out, errs) = parsed.into_output_errors();
+        if errs.is_empty() {
+            match out {
+                Some(stmts) => Ok(stmts),
+                None => Err(Vec::new()),
+            }
+        } else {
+            Err(errs_to_owned(errs))
+        }
+    };
+    match result {
+        Ok(stmts) => Ok((stmts, blocks)),
+        Err(errs) => Err(errs),
+    }
 }
 
 pub fn parse_with_polyglot(input: &str) -> ParseWithPolyglotResult {
@@ -739,19 +795,33 @@ pub fn parse_with_polyglot(input: &str) -> ParseWithPolyglotResult {
     // parse_recovery() consumes unexpected characters (like guard separators `~`/`#`)
     // as error-recovery tokens, preventing valid guard expressions from parsing.
     // The strict parser stops cleanly at separators and returns the correct AST.
-    // We only fall back to parse_recovery when strict parsing completely fails,
-    // to keep REPL partial-AST behaviour for incomplete input.
-    match parser().parse(masked.as_str()) {
-        Ok(stmts) => Ok((stmts, blocks)),
-        Err(_strict_errs) => {
+    // We only fall back to recovery via `into_output_errors` (chumsky 1.0 equivalent)
+    // when strict parsing completely fails, to keep REPL partial-AST behaviour.
+    //
+    // To keep the borrow checker happy under chumsky 1.0's borrowing `Simple<'src>`
+    // we consume the ParseResult inside a nested scope so the borrow ends before
+    // we return `masked`-independent owned errors.
+    let outcome: Result<Vec<Stmt>, Vec<ParseError>> = {
+        let parsed = parser().parse(masked.as_str());
+        let (strict_out, strict_errs) = parsed.into_output_errors();
+        if strict_errs.is_empty() {
+            match strict_out {
+                Some(stmts) => Ok(stmts),
+                None => Err(Vec::new()),
+            }
+        } else {
             // Strict parse failed. Try recovery to get a partial AST for IDE/REPL.
-            let (output, _recovery_errs) = parser().parse_recovery(masked.as_str());
+            let parsed2 = parser().parse(masked.as_str());
+            let (output, _recovery_errs) = parsed2.into_output_errors();
             match output {
-                Some(stmts) => Ok((stmts, blocks)),
-                // Both strict and recovery failed: return strict errors (cleaner messages).
-                None => Err(_strict_errs),
+                Some(stmts) => Ok(stmts),
+                None => Err(errs_to_owned(strict_errs)),
             }
         }
+    };
+    match outcome {
+        Ok(stmts) => Ok((stmts, blocks)),
+        Err(errs) => Err(errs),
     }
 }
 
@@ -760,13 +830,13 @@ pub fn extract_polyglot_blocks(input: &str) -> Vec<PolyglotBlock> {
     blocks
 }
 
-pub fn parse(input: &str) -> Result<Vec<Stmt>, Vec<Simple<char>>> {
+pub fn parse(input: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
     // NOTE: We mask comments with spaces (preserving length) so:
     // - spans remain stable byte offsets
     // - both REPL input and imported module files can contain `//` or `/* */`
     parse_with_polyglot(input).map(|(stmts, _)| stmts)
 }
 
-pub fn parse_strict(input: &str) -> Result<Vec<Stmt>, Vec<Simple<char>>> {
+pub fn parse_strict(input: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
     parse_with_polyglot_strict(input).map(|(stmts, _)| stmts)
 }
