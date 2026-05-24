@@ -1,3 +1,34 @@
+> **Status snapshot — last verified 2026-05-24.** This document is a
+> growing roadmap dump from many sessions; several "what's missing"
+> bullets below are now **done** and reading the body uncritically will
+> mislead. The current state of frequently-cited gaps:
+>
+> | Item the body still calls "missing" | Actual status (2026-05-24) |
+> |---|---|
+> | TLS / HTTPS (claimed "only plain TCP") | **Done.** `rustls` integrated; `tcp_listen_tls` / `tcp_connect_tls` / `tcp_wrap_tls` in `crates/pblang-vm/src/vm/net.rs`. |
+> | Type system (`pblang-typeck` "stub") | **Done.** `crates/pblang-typeck/src/lib.rs` is 1,342 lines of real checker; runs in `pblang lint`. |
+> | LSP completion / jump-to-def | **Done.** Completion, document symbols, workspace symbols, code actions in `crates/pblang-lsp`. |
+> | `chumsky` pinned to 0.8 / SP1-gamma match-guard cascade | **Done.** Migrated to `=1.0.0-alpha.8`; restricted `guard_expr` sub-parser fixed SP1-gamma; `match_guard_pass` un-ignored. |
+> | `vm.rs` monolith (12k+ lines) | **Partially done.** Down to 10,586 lines with six submodules under `crates/pblang-vm/src/vm/` (`spawn_wire`, `ffi_dispatch`, `gc`, `handles`, `db`, `net`). Further extraction still possible. |
+> | "7 failing semantics tests" / "30/37" / "54/54" / "75/...." | **Stale.** Current: 161 passing / 1 ignored (env_set security-audit) in semantics, +16 modules, +10 sandbox, +1 stdlib_parse. All four target suites green on chumsky 1.0. |
+> | Threads / spawn / join / channels "future work" | **Done.** VM-per-thread model, `SpawnWireValue` transferable types, channels, select — see `crates/pblang-vm/src/concurrency.rs` and `crates/pblang-vm/src/vm/spawn_wire.rs`. |
+> | Spec freeze / capability docs missing | **Done.** `docs/Spec_freeze.md`, `docs/Capability_model.md`, `docs/FFI_contract.md`, `docs/Embedding_lifecycle.md` exist. |
+> | "AI / quantum stubs" | **Largely done.** Native tensor kernels (14 base + 10 NN primitives in Rust), statevector quantum simulator (`quantum_simulate`), AI bridges (Ollama, Anthropic via `pblang-ai`). |
+>
+> What's still genuinely open from the body below:
+>
+> - **Native single-binary executable (Stage A)** — `pblang bundle` produces a portable folder; a real self-extracting / runtime-embedded single binary is still TODO.
+> - **Hosted registry (publish/fetch)** — local install + lockfile work; HTTP-backed registry endpoints don't yet.
+> - **`@rust` / `@python` / etc. polyglot blocks → compiled artifacts** — manifest exists in `stdlib/polyglot_build.sapp`; full build-time artifact pipeline still partial.
+> - **IDE-server → tokio**, **CLI → clap**, **`pblang serve` → axum/tiny_http**, **`pblang-ffi` wire-in** — listed in `docs/PrjAnalysis.md` under "True but Not Fully Fixed".
+> - **OS-development** (bare-metal kernel work) — see the architectural-impossibility analysis later in this document; remains intentionally out of scope.
+>
+> Treat the body below as historical context + roadmap *signals*, not a
+> live status list. For an authoritative status, run the workspace tests
+> and check `docs/PrjAnalysis.md`.
+>
+> ---
+
 βάλε όλες τις δυνατότητες και χαρακτηριστικά μπορείς να βάλεις σε αυτή την γλώσσα προγραμματισμου + έξτρα δυνατοτητες και χαρακτηριστικα + να ειναι future proofing και quantum/AI ready με AI και quantum και web δυνατότητες. Το ξέρω ότι σου είναι πάρα πολλά αλλά θέλω να γίνει οσον το δυνατόν η καλύτερη, βέλτιστη,πανισχυρη,εύκολη,έξυπνη γλώσσα προγραμματισμού που υπάρχει με πάρα πολλές βιβλιωθήκες και πολλά και διάφορα εργαλεία και να είναι έτοιμη σε βαθμό που να μπορείς να την χρησιμοποιησεις για να χτίσεις ένα λειτουργικό με αυτήν,την δυνατοτητα να μπορείς να χρησιμοποιησεις οποιαδηποτε γλώσσα προγραμματισμου θέλεις μάζι με τον κωδικά της στο ίδιο αρχείο
 
 Τι γίνεται ρεαλιστικά με το “βάλε τα όλα”
