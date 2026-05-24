@@ -508,9 +508,13 @@ fn stdlib_optional_params_omit_trailing_args() {
         let g = graph.add_node(g, "b");
         let g = graph.add_edge(g, "a", "b");
         print g._edge_list[0].weight;
+
+        // money.format: amount only, defaults currency="USD" and decimals=2.
+        import "stdlib:money.sapp";
+        print money.format(1);
     "#;
     let out = run_collect(src);
-    assert_eq!(out.len(), 11);
+    assert_eq!(out.len(), 12);
     assert_eq!(out[0], Value::Number(2.0));
     assert_eq!(out[1].as_str().unwrap(), "b");
     assert_eq!(out[2].as_str().unwrap(), "x,y\n");
@@ -522,4 +526,10 @@ fn stdlib_optional_params_omit_trailing_args() {
     assert_eq!(out[8].as_str().unwrap(), "");
     assert_eq!(out[9], Value::Bool(true));
     assert_eq!(out[10], Value::Number(1.0));
+    // money.format(1) → "USD 1.00" or similar (we just assert non-empty money string)
+    let money_str = out[11].as_str().unwrap();
+    assert!(
+        money_str.contains("USD") && money_str.contains("1"),
+        "expected money.format default to include USD and value, got {money_str:?}"
+    );
 }

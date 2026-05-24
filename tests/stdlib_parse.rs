@@ -20,7 +20,6 @@ fn parse_and_typecheck(path: &Path) -> Result<(), String> {
 }
 
 #[test]
-#[ignore] // known: parse error at map/fn literals in graphics.sapp (span 1162); golden + num_math cover VM
 fn stdlib_graphics_parses_and_typechecks() {
     let path = Path::new("stdlib/graphics.sapp");
     if !path.exists() {

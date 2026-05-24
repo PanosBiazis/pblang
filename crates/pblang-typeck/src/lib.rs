@@ -361,6 +361,27 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("clock", fn0(num.clone())),
         ("now_iso", fn0(str_ty.clone())),
         ("num_pow", fn2(num.clone())),
+        // Numeric builtins used throughout stdlib (math, graphics, colour).
+        ("num_floor", fn1(num.clone())),
+        ("num_ceil", fn1(num.clone())),
+        ("num_sqrt", fn1(num.clone())),
+        ("num_abs", fn1(num.clone())),
+        ("num_mod", fn2(num.clone())),
+        // Timing builtins used by async / IO stdlibs.
+        ("sleep_ms", fn1(nil.clone())),
+        ("now_ms", fn0(num.clone())),
+        // Graphics builtins (pblang-graphics crate) — typed loosely as the
+        // call surface is variadic and the VM does its own argument checking.
+        ("gfxcreatewindow", fn1(any.clone())),
+        ("gfxclose", fn1(nil.clone())),
+        ("gfxisopen", fn1(bool_ty.clone())),
+        ("gfxsize", fn1(any.clone())),
+        ("gfxclear", fn1(nil.clone())),
+        ("gfxdrawline", fn1(nil.clone())),
+        ("gfxdrawrect", fn1(nil.clone())),
+        ("gfxdrawpoint", fn1(nil.clone())),
+        ("gfxpresent", fn1(nil.clone())),
+        ("gfxpollevents", fn1(any.clone())),
         ("parse", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
         ("compile", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
     ] {
