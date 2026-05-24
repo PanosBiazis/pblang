@@ -10,8 +10,144 @@ use pblang_vm::{StdlibConfig, VmLimits, VM};
 
 use pblang_core::ParseError;
 
+use clap::{Parser, Subcommand};
+
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+
+/// Top-level pblang CLI parser. First-pass clap migration: this only routes
+/// to the right subcommand handler; per-subcommand flag parsing is unchanged
+/// and still done by the legacy dispatch chain in `legacy_dispatch`.
+#[derive(Parser, Debug)]
+#[command(
+    name = "pblang",
+    version,
+    about = "pblang: a fast, embeddable scripting language",
+    disable_help_flag = true,
+    disable_help_subcommand = true,
+    disable_version_flag = true,
+    arg_required_else_help = false,
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+/// Each variant carries the raw trailing args verbatim. clap is responsible
+/// for picking *which* subcommand was invoked (and providing --help / typo
+/// detection), but the actual flag parsing inside each handler is unchanged
+/// — every handler still receives `args` and does its own option parsing.
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Create pblang.toml in the current directory
+    Init {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Scaffold a new project: pblang new <name> [--template web|lib|cli]
+    New {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Validate pblang.toml using the pblang stdlib validator
+    #[command(name = "manifest-check")]
+    ManifestCheck {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Compare Rust and pblang manifest parsing/validation for parity
+    #[command(name = "manifest-parity")]
+    ManifestParity {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Resolve deps and (depending on form) install a package or generate pblang.lock
+    Install {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Publish a package to the registry
+    Publish {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Search the registry for packages
+    Search {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Fetch a package from the registry into the local cache
+    Fetch {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Pack a project into a distributable archive
+    Pack {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Verify a packaged archive
+    Verify {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Build the current package (generate lockfile + typecheck entry)
+    Build {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Bundle a project into a single executable artifact
+    Bundle {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Transpile a .sapp source file to C
+    Transpile {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Start the language server
+    Lsp {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run an HTTP server demo (legacy)
+    Serve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Format pblang source files
+    Fmt {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Lint pblang source files
+    Lint {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run all .sap/.sapp/.bpx files in the given directory
+    Test {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Execute a script or the current package entry point
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Compile a script to bytecode (.bpx)
+    Compile {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Extract and build embedded @lang polyglot blocks
+    #[command(name = "build-polyglot")]
+    BuildPolyglot {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
 
 fn clear_terminal() {
     print!("\x1B[2J\x1B[H\x1B[3J");
@@ -127,8 +263,34 @@ fn read_text_file_with_race_check(path: &Path) -> Result<String, String> {
     let resolved = path
         .canonicalize()
         .map_err(|e| format!("file not found '{}': {e}", path.display()))?;
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open '{}': {e}", path.display()))?;
+
+    // Open with O_NOFOLLOW on Unix so that an attacker who races between
+    // `canonicalize` and `open` cannot swap the resolved path for a
+    // symlink and force us to follow it elsewhere. The dev/ino check
+    // below remains as a second line of defence (catches non-symlink
+    // races like inode reuse via rename + replace).
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&resolved)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    format!(
+                        "refusing to open '{}': resolved path is a symlink (possible TOCTOU)",
+                        resolved.display()
+                    )
+                } else {
+                    format!("failed to open '{}': {e}", resolved.display())
+                }
+            })?
+    };
+
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(&resolved)
+        .map_err(|e| format!("failed to open '{}': {e}", resolved.display()))?;
 
     #[cfg(unix)]
     {
@@ -2035,6 +2197,136 @@ fn main() {
         println!("pblang {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+
+    // First-pass clap migration: try to route via clap as the top-level
+    // subcommand router. clap validates *which* subcommand was invoked
+    // (catching typos, providing --help). The actual per-flag parsing
+    // inside each handler is unchanged and still lives in `legacy_dispatch`.
+    //
+    // On any parse failure (e.g. legacy `--call-graph` / `--lock` / `--cfg`
+    // top-level "flag" subcommands, or any other shape clap doesn't model
+    // yet), we transparently fall through to the legacy chain so nothing
+    // regresses.
+    let argv: Vec<String> = std::env::args().collect();
+    match Cli::try_parse_from(&argv) {
+        Ok(cli) => match cli.command {
+            Some(Commands::Init { args }) => return handle_init(args),
+            Some(Commands::New { args }) => return handle_new(args),
+            Some(Commands::ManifestCheck { args }) => return handle_manifest_check(args),
+            Some(Commands::ManifestParity { args }) => return handle_manifest_parity(args),
+            Some(Commands::Install { args }) => return handle_install(args),
+            Some(Commands::Publish { args }) => return handle_publish(args),
+            Some(Commands::Search { args }) => return handle_search(args),
+            Some(Commands::Fetch { args }) => return handle_fetch(args),
+            Some(Commands::Pack { args }) => return handle_pack(args),
+            Some(Commands::Verify { args }) => return handle_verify(args),
+            Some(Commands::Build { args }) => return handle_build(args),
+            Some(Commands::Bundle { args }) => return handle_bundle(args),
+            Some(Commands::Transpile { args }) => return handle_transpile(args),
+            Some(Commands::Lsp { args }) => return handle_lsp(args),
+            Some(Commands::Serve { args }) => return handle_serve(args),
+            Some(Commands::Fmt { args }) => return handle_fmt(args),
+            Some(Commands::Lint { args }) => return handle_lint(args),
+            Some(Commands::Test { args }) => return handle_test(args),
+            Some(Commands::Run { args }) => return handle_run(args),
+            Some(Commands::Compile { args }) => return handle_compile(args),
+            Some(Commands::BuildPolyglot { args }) => return handle_build_polyglot(args),
+            // No subcommand given -> fall through to legacy (REPL path etc.).
+            None => {}
+        },
+        Err(_) => {
+            // Legacy/unmodeled invocation (e.g. `pblang --lock`, `pblang --cfg foo`,
+            // bare script path, etc.). Fall through to the legacy dispatch chain
+            // with the original args, unchanged.
+        }
+    }
+
+    legacy_dispatch(args);
+}
+
+/// Per-subcommand clap handler. The body is intentionally trivial: it
+/// reconstructs the legacy `args` vector (subcommand name + trailing args)
+/// and delegates to `legacy_dispatch`. This preserves every existing
+/// handler's flag parsing verbatim while still routing through clap.
+fn handle_init(args: Vec<String>) {
+    legacy_dispatch(prepend("init", args));
+}
+fn handle_new(args: Vec<String>) {
+    legacy_dispatch(prepend("new", args));
+}
+fn handle_manifest_check(args: Vec<String>) {
+    legacy_dispatch(prepend("manifest-check", args));
+}
+fn handle_manifest_parity(args: Vec<String>) {
+    legacy_dispatch(prepend("manifest-parity", args));
+}
+fn handle_install(args: Vec<String>) {
+    legacy_dispatch(prepend("install", args));
+}
+fn handle_publish(args: Vec<String>) {
+    legacy_dispatch(prepend("publish", args));
+}
+fn handle_search(args: Vec<String>) {
+    legacy_dispatch(prepend("search", args));
+}
+fn handle_fetch(args: Vec<String>) {
+    legacy_dispatch(prepend("fetch", args));
+}
+fn handle_pack(args: Vec<String>) {
+    legacy_dispatch(prepend("pack", args));
+}
+fn handle_verify(args: Vec<String>) {
+    legacy_dispatch(prepend("verify", args));
+}
+fn handle_build(args: Vec<String>) {
+    legacy_dispatch(prepend("build", args));
+}
+fn handle_bundle(args: Vec<String>) {
+    legacy_dispatch(prepend("bundle", args));
+}
+fn handle_transpile(args: Vec<String>) {
+    legacy_dispatch(prepend("transpile", args));
+}
+fn handle_lsp(args: Vec<String>) {
+    legacy_dispatch(prepend("lsp", args));
+}
+fn handle_serve(args: Vec<String>) {
+    legacy_dispatch(prepend("serve", args));
+}
+fn handle_fmt(args: Vec<String>) {
+    legacy_dispatch(prepend("fmt", args));
+}
+fn handle_lint(args: Vec<String>) {
+    legacy_dispatch(prepend("lint", args));
+}
+fn handle_test(args: Vec<String>) {
+    legacy_dispatch(prepend("test", args));
+}
+fn handle_run(args: Vec<String>) {
+    legacy_dispatch(prepend("run", args));
+}
+fn handle_compile(args: Vec<String>) {
+    legacy_dispatch(prepend("compile", args));
+}
+fn handle_build_polyglot(args: Vec<String>) {
+    legacy_dispatch(prepend("build-polyglot", args));
+}
+
+#[inline]
+fn prepend(name: &str, mut rest: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    out.push(name.to_string());
+    out.append(&mut rest);
+    out
+}
+
+/// Legacy top-level dispatch chain. This is the pre-clap CLI router; clap
+/// (in `main`) parses the subcommand and forwards here so the per-handler
+/// flag parsing inside each `if` branch is unchanged. It also still serves
+/// as the fallback path for invocations clap doesn't yet model (e.g.
+/// `pblang --lock`, `pblang --cfg <file>`, top-level `--check`, etc.) and
+/// as the entry point for the REPL when no subcommand was given.
+fn legacy_dispatch(args: Vec<String>) {
     if args.first().map(|s| s.as_str()) == Some("init") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let manifest_path = cwd.join("pblang.toml");
@@ -3020,6 +3312,14 @@ fn main() {
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| {
+                    // Always allow the root entry through. Otherwise, when the
+                    // user passes a relative path like `.`, walkdir reports
+                    // the root's `file_name()` as `"."` which starts with `.`
+                    // and the dotfile filter below would skip the entire
+                    // tree, silently producing an empty staging dir.
+                    if e.depth() == 0 {
+                        return true;
+                    }
                     let name = e.file_name().to_string_lossy();
                     if e.file_type().is_dir() {
                         name != "target" && name != ".git" && !name.starts_with('.')
@@ -3046,7 +3346,15 @@ fn main() {
                     if let Some(parent) = dest.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    let _ = std::fs::copy(entry.path(), &dest);
+                    if let Err(e) = std::fs::copy(entry.path(), &dest) {
+                        eprintln!(
+                            "pblang bundle --self-extract: failed to copy {} → {}: {}",
+                            entry.path().display(),
+                            dest.display(),
+                            e
+                        );
+                        std::process::exit(1);
+                    }
                 }
             }
 
