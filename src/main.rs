@@ -1,19 +1,29 @@
 use pblang_compiler::{compile, disasm};
 
 use pblang_core::{
-    parse, parse_strict, parse_with_polyglot, strip_comments_mask, Expr, ExprKind, MatchArm, Span,
-    Stmt, StmtKind, TypeExpr, TypeKind,
+    parse, parse_strict, parse_with_polyglot, strip_comments_mask, Expr, ExprKind, Span, Stmt,
+    StmtKind, TypeExpr, TypeKind,
 };
 use pblang_ir::Chunk;
 use pblang_typeck::check as type_check;
 use pblang_vm::{StdlibConfig, VmLimits, VM};
 
-use pblang_core::ParseError;
+// `pblang_core::ParseError` is now used only inside `cli::diag` (re-imported
+// there); main.rs receives it transparently through the helper functions.
 
 use clap::{Parser, Subcommand};
 
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+
+mod cli;
+use cli::call_graph::{build_call_graph, print_call_graph};
+use cli::dataflow::print_dataflow_report;
+use cli::diag::{format_parse_error, get_line, line_col, print_parse_errors, underline_span};
+use cli::fmt::{
+    fmt_normalize_comma_spacing, fmt_normalize_operator_spacing, format_ide_source,
+    normalize_ide_source, scan_line_for_braces,
+};
 
 /// Top-level pblang CLI parser. First-pass clap migration: this only routes
 /// to the right subcommand handler; per-subcommand flag parsing is unchanged
@@ -1087,148 +1097,8 @@ fn show_help() {
     println!("  # Use `pblang --doc <file>` to list detected polyglot blocks and spans.");
 }
 
-fn normalize_ide_source(src: &str) -> String {
-    // IDE ergonomics: users often write JS/Python-style print("x");
-    // Normalize simple line-based forms to pblang's print statement.
-    let mut normalized = src
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("print(") && trimmed.ends_with(");") {
-                let indent_len = line.chars().take_while(|c| c.is_whitespace()).count();
-                let indent = &line[..indent_len];
-                let inner = &trimmed["print(".len()..trimmed.len() - 2];
-                format!("{indent}print {inner};")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if src.ends_with('\n') {
-        normalized.push('\n');
-    }
-    normalized
-}
-
-fn format_ide_source(src: &str, max_line_length: Option<usize>) -> String {
-    const INDENT: &str = "    ";
-    let lines: Vec<&str> = src.lines().collect();
-    let mut out = String::new();
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut in_single_string = false;
-    let mut block_comment_depth = 0;
-
-    for line in &lines {
-        let mut trimmed = line.trim().to_string();
-        trimmed = fmt_normalize_operator_spacing(&trimmed);
-        trimmed = fmt_normalize_comma_spacing(&trimmed);
-        if trimmed.is_empty() {
-            out.push('\n');
-            continue;
-        }
-        // Separate each top-level function declaration with a blank line.
-        if depth == 0
-            && trimmed.starts_with("fn ")
-            && !out.is_empty()
-            && !out.ends_with("\n\n")
-        {
-            out.push('\n');
-        }
-        // A line that opens with '}' closes a block, so render the brace one
-        // level out. depth itself is advanced only by scan_line_for_braces
-        // below — decrementing it here as well would count the brace twice.
-        let render_depth = if trimmed.starts_with('}') {
-            (depth - 1).max(0)
-        } else {
-            depth.max(0)
-        };
-        let indent_str: String = (0..render_depth as usize).map(|_| INDENT).collect();
-        let full_line = format!("{indent_str}{trimmed}");
-        if let Some(max_len) = max_line_length {
-            let mut line_to_output = full_line;
-            while !line_to_output.is_empty() {
-                if line_to_output.len() <= max_len {
-                    out.push_str(&line_to_output);
-                    out.push('\n');
-                    scan_line_for_braces(
-                        &line_to_output,
-                        &mut in_string,
-                        &mut in_single_string,
-                        &mut block_comment_depth,
-                        &mut depth,
-                    );
-                    break;
-                }
-                let break_at = line_to_output[..max_len].rfind(' ').unwrap_or(max_len);
-                let break_at = if break_at == 0 { max_len } else { break_at };
-                let rest = line_to_output.split_off(break_at);
-                let emitted = line_to_output.trim_end().to_string();
-                out.push_str(&emitted);
-                out.push('\n');
-                scan_line_for_braces(
-                    &emitted,
-                    &mut in_string,
-                    &mut in_single_string,
-                    &mut block_comment_depth,
-                    &mut depth,
-                );
-                line_to_output = format!("{}{}", INDENT, rest.trim_start());
-            }
-        } else {
-            out.push_str(&full_line);
-            out.push('\n');
-            scan_line_for_braces(
-                &full_line,
-                &mut in_string,
-                &mut in_single_string,
-                &mut block_comment_depth,
-                &mut depth,
-            );
-        }
-    }
-
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
-#[cfg(test)]
-mod ide_source_tests {
-    use super::{format_ide_source, normalize_ide_source};
-
-    #[test]
-    fn rewrites_print_call_style_lines() {
-        let src = "print(\"Hello\");\nprint(1 + 2);\n";
-        let got = normalize_ide_source(src);
-        assert_eq!(got, "print \"Hello\";\nprint 1 + 2;\n");
-    }
-
-    #[test]
-    fn keeps_statement_style_unchanged() {
-        let src = "print \"Hello\";\nlet x = 1;\n";
-        let got = normalize_ide_source(src);
-        assert_eq!(got, "print \"Hello\";\nlet x = 1;\n");
-    }
-
-    #[test]
-    fn formats_simple_block_indentation() {
-        let src = "fn x(){\nprint 1;\n}\n";
-        let got = format_ide_source(src, None);
-        assert!(got.contains("fn x("));
-        assert!(got.contains("\n    print 1;\n"));
-    }
-
-    #[test]
-    fn keeps_braces_inside_single_quoted_strings_from_affecting_indent() {
-        let src = "fn x(){\nlet s = '{';\nprint 1;\n}\n";
-        let got = format_ide_source(src, None);
-        assert!(got.contains("\n    print 1;\n"));
-        assert!(!got.contains("\n        print 1;\n"));
-    }
-}
+// `normalize_ide_source`, `format_ide_source`, and their unit tests now live in
+// `cli::fmt` (imported above).
 
 fn print_symbol_table(chunk: &Chunk) {
     // AUDIT NOTE #24: This symbol table is a best-effort heuristic.
@@ -1372,705 +1242,19 @@ fn print_cfg(chunk: &Chunk, dot: bool) {
     }
 }
 
-fn scan_line_for_braces(
-    line: &str,
-    in_double_string: &mut bool,
-    in_single_string: &mut bool,
-    block_comment_depth: &mut i32,
-    brace_depth: &mut i32,
-) {
-    let mut chars = line.chars().peekable();
-    let mut prev_was_backslash = false;
-
-    while let Some(ch) = chars.next() {
-        let next = chars.peek().copied();
-
-        // If we're in a string, only care about escapes and matching close quote.
-        if *in_double_string || *in_single_string {
-            if *in_double_string && ch == '"' && !prev_was_backslash {
-                *in_double_string = false;
-            } else if *in_single_string && ch == '\'' && !prev_was_backslash {
-                *in_single_string = false;
-            }
-            prev_was_backslash = ch == '\\' && !prev_was_backslash;
-            continue;
-        }
-
-        // If we're in a block comment, look for nested /* and closing */
-        if *block_comment_depth > 0 {
-            if ch == '/' && next == Some('*') {
-                chars.next(); // consume '*'
-                *block_comment_depth += 1;
-                continue;
-            }
-            if ch == '*' && next == Some('/') {
-                chars.next(); // consume '/'
-                *block_comment_depth -= 1;
-                continue;
-            }
-            continue;
-        }
-
-        // Not in string/comment: detect start of line comment //
-        if ch == '/' && next == Some('/') {
-            break; // ignore rest of line
-        }
-
-        // Not in string/comment: detect start of block comment /*
-        if ch == '/' && next == Some('*') {
-            chars.next(); // consume '*'
-            *block_comment_depth += 1;
-            continue;
-        }
-
-        // Not in string/comment: entering string
-        if ch == '"' {
-            *in_double_string = true;
-            prev_was_backslash = false;
-            continue;
-        }
-        if ch == '\'' {
-            *in_single_string = true;
-            prev_was_backslash = false;
-            continue;
-        }
-
-        // Count braces only in normal code
-        match ch {
-            '{' => *brace_depth += 1,
-            '}' => *brace_depth -= 1,
-            _ => {}
-        }
-    }
-}
-
-// `strip_comments_mask` now lives in `pblang_core` (imported above) so the CLI
-// and the parser front-end share one comment-masking implementation.
-
-fn line_col(src: &str, byte_idx: usize) -> (usize, usize) {
-    let mut line = 1usize;
-    let mut col = 1usize;
-    for (i, ch) in src.char_indices() {
-        if i >= byte_idx {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-fn get_line(src: &str, line_no: usize) -> &str {
-    src.lines().nth(line_no.saturating_sub(1)).unwrap_or("")
-}
-
-fn underline_span(src: &str, sp: std::ops::Range<usize>) -> (usize, usize, String, String) {
-    let start = sp.start.min(src.len());
-    let end = sp.end.min(src.len()).max(start.saturating_add(1));
-
-    let (ln1, col1) = line_col(src, start);
-    let (ln2, col2) = line_col(src, end);
-
-    let line = get_line(src, ln1).to_string();
-
-    // If the span is on one line, draw ^^^ under the range.
-    // If it spans multiple lines, fall back to a single caret at the start.
-    let len = if ln1 == ln2 {
-        col2.saturating_sub(col1).max(1)
-    } else {
-        1
-    };
-
-    let marker = format!("{}{}", " ".repeat(col1.saturating_sub(1)), "^".repeat(len));
-
-    (ln1, col1, line, marker)
-}
-
-fn format_parse_error(err: &ParseError) -> String {
-    // Chumsky 1.0's `Simple` no longer exposes `expected`/`reason` (those moved
-    // to `Rich`), so the message here is the short "unexpected char" line built
-    // by `errs_to_owned`; span/found are surfaced via `print_parse_errors`.
-    err.message.clone()
-}
-
-/// Normalize spacing around binary operators (outside string literals). Ensures one space
-/// before and after + - * / == != < > <= >=. Does not change content inside "...".
-fn fmt_normalize_operator_spacing(line: &str) -> String {
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut i = 0;
-    let bytes = line.as_bytes();
-    let mut out = String::with_capacity(line.len() + 16);
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_string {
-            if escape_next {
-                escape_next = false;
-                out.push(c);
-            } else if c == '\\' {
-                escape_next = true;
-                out.push(c);
-            } else if c == '"' {
-                in_string = false;
-                out.push(c);
-            } else {
-                out.push(c);
-            }
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        let need_space_before = !out.is_empty()
-            && !out.ends_with(' ')
-            && !out.ends_with('(')
-            && !out.ends_with('[')
-            && !out.ends_with('=')
-            && !out.ends_with('!')
-            && !out.ends_with('<')
-            && !out.ends_with('>')
-            && !out.ends_with(',')
-            && !out.ends_with(';');
-        // Multi-char operators (longest first)
-        let (op_len, need_space_after) = if i + 2 <= bytes.len() {
-            let two = std::str::from_utf8(&bytes[i..i + 2]).unwrap_or("");
-            if two == "==" || two == "!=" || two == "<=" || two == ">=" {
-                (2, true)
-            } else {
-                (0, false)
-            }
-        } else {
-            (0, false)
-        };
-        let (op_len, need_space_after) = if op_len > 0 {
-            (op_len, need_space_after)
-        } else if matches!(c, '+' | '*' | '/' | '<' | '>') {
-            (1, true)
-        } else if c == '-' {
-            // Unary minus (-1): no space after if next is digit and we didn't add space before
-            let next_is_digit =
-                i + 1 < bytes.len() && matches!(bytes[i + 1] as char, '0'..='9' | '.');
-            let space_after = !next_is_digit || need_space_before;
-            (1, space_after)
-        } else {
-            out.push(c);
-            i += 1;
-            continue;
-        };
-        let prev_ok = out.ends_with(' ')
-            || out.is_empty()
-            || out.ends_with('(')
-            || out.ends_with('[')
-            || out.ends_with(',')
-            || out.ends_with(';');
-        if need_space_before && !prev_ok {
-            out.push(' ');
-        }
-        for j in 0..op_len {
-            out.push(bytes[i + j] as char);
-        }
-        i += op_len;
-        if need_space_after && i < bytes.len() {
-            let next = bytes[i] as char;
-            if next != ' '
-                && next != ')'
-                && next != ']'
-                && next != ';'
-                && next != ','
-                && next != '\n'
-            {
-                out.push(' ');
-            }
-        }
-    }
-    out
-}
-
-/// Ensure comma is followed by a single space when not inside string literals.
-fn fmt_normalize_comma_spacing(line: &str) -> String {
-    let mut in_string = false;
-    let mut escape_next = false;
-    let mut i = 0;
-    let bytes = line.as_bytes();
-    let mut out = String::with_capacity(line.len() + 8);
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_string {
-            if escape_next {
-                escape_next = false;
-                out.push(c);
-            } else if c == '\\' {
-                escape_next = true;
-                out.push(c);
-            } else if c == '"' {
-                in_string = false;
-                out.push(c);
-            } else {
-                out.push(c);
-            }
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if c == ',' {
-            out.push(c);
-            i += 1;
-            if i < bytes.len() {
-                let next = bytes[i] as char;
-                if next != ' ' && next != '\n' && next != '\r' {
-                    out.push(' ');
-                }
-            }
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-fn print_parse_errors(src: &str, errors: Vec<ParseError>, file: Option<&str>) {
-    let max = 8usize;
-    for (i, err) in errors.iter().take(max).enumerate() {
-        let msg = format_parse_error(err);
-        let (ln, col, line, marker) = underline_span(src, err.span.clone());
-        let prefix = match file {
-            Some(path) => format!("error[{}:{}:{}]:", path, ln, col),
-            None => format!("error[{}:{}]:", ln, col),
-        };
-        eprintln!("{} {}", prefix, msg);
-        eprintln!("  | {}", line);
-        eprintln!("  | {}", marker);
-
-        if i + 1 < errors.len().min(max) {
-            eprintln!();
-        }
-    }
-
-    if errors.len() > max {
-        eprintln!("(and {} more parse errors)", errors.len() - max);
-    }
-}
+// `scan_line_for_braces`, `line_col`, `get_line`, `underline_span`,
+// `format_parse_error`, `print_parse_errors`, `fmt_normalize_operator_spacing`,
+// and `fmt_normalize_comma_spacing` have moved to `cli::fmt` / `cli::diag`
+// (imported at the top of this file). `strip_comments_mask` lives in
+// `pblang_core`.
 
 // ── Call-graph (R2-alpha) ─────────────────────────────────────────────────
-
-/// Caller → set of callees (function names called inside that function).
-type CallGraph = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
-
-fn build_call_graph(ast: &[Stmt], _file: &str) -> CallGraph {
-    let mut graph: CallGraph = std::collections::BTreeMap::new();
-    let mut current_fn = "<main>".to_string();
-    graph.entry(current_fn.clone()).or_default();
-    walk_stmts_for_cg(ast, &mut graph, &mut current_fn);
-    graph
-}
-
-fn walk_stmts_for_cg(stmts: &[Stmt], graph: &mut CallGraph, current_fn: &mut String) {
-    for stmt in stmts {
-        match &stmt.kind {
-            StmtKind::Fn(name, _params, _ret, body) => {
-                let prev = current_fn.clone();
-                *current_fn = name.clone();
-                graph.entry(name.clone()).or_default();
-                walk_stmts_for_cg(body, graph, current_fn);
-                *current_fn = prev;
-            }
-            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-            StmtKind::Let(_, _, e) => {
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-            StmtKind::If(cond, then_branch, else_branch) => {
-                collect_calls_from_expr(cond, graph, current_fn);
-                walk_stmts_for_cg(then_branch, graph, current_fn);
-                if let Some(eb) = else_branch {
-                    walk_stmts_for_cg(eb, graph, current_fn);
-                }
-            }
-            StmtKind::While(cond, body) => {
-                collect_calls_from_expr(cond, graph, current_fn);
-                walk_stmts_for_cg(body, graph, current_fn);
-            }
-            StmtKind::For(_, count, body) => {
-                collect_calls_from_expr(count, graph, current_fn);
-                walk_stmts_for_cg(body, graph, current_fn);
-            }
-            StmtKind::ForIn(_, col, body) => {
-                collect_calls_from_expr(col, graph, current_fn);
-                walk_stmts_for_cg(body, graph, current_fn);
-            }
-            StmtKind::ForInKV(_, _, col, body) => {
-                collect_calls_from_expr(col, graph, current_fn);
-                walk_stmts_for_cg(body, graph, current_fn);
-            }
-            StmtKind::Print(e) | StmtKind::PrintF(_, e) => {
-                graph
-                    .entry(current_fn.clone())
-                    .or_default()
-                    .insert("print".to_string());
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-            StmtKind::Defer(e) => {
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_calls_from_expr(expr: &Expr, graph: &mut CallGraph, current_fn: &str) {
-    match &expr.kind {
-        ExprKind::Call(callee, args) => {
-            if let ExprKind::Var(name) = &callee.kind {
-                graph
-                    .entry(current_fn.to_string())
-                    .or_default()
-                    .insert(name.clone());
-            }
-            collect_calls_from_expr(callee, graph, current_fn);
-            for a in args {
-                collect_calls_from_expr(a, graph, current_fn);
-            }
-        }
-        ExprKind::Add(l, r)
-        | ExprKind::Sub(l, r)
-        | ExprKind::Mul(l, r)
-        | ExprKind::Div(l, r)
-        | ExprKind::Eq(l, r)
-        | ExprKind::NotEq(l, r)
-        | ExprKind::Gt(l, r)
-        | ExprKind::Ge(l, r)
-        | ExprKind::Lt(l, r)
-        | ExprKind::Le(l, r) => {
-            collect_calls_from_expr(l, graph, current_fn);
-            collect_calls_from_expr(r, graph, current_fn);
-        }
-        ExprKind::Logical { left, right, .. } => {
-            collect_calls_from_expr(left, graph, current_fn);
-            collect_calls_from_expr(right, graph, current_fn);
-        }
-        ExprKind::Index(obj, ix) => {
-            collect_calls_from_expr(obj, graph, current_fn);
-            collect_calls_from_expr(ix, graph, current_fn);
-        }
-        ExprKind::GetAttr(obj, _) => {
-            collect_calls_from_expr(obj, graph, current_fn);
-        }
-        ExprKind::Try(try_e, catch_e) => {
-            collect_calls_from_expr(try_e, graph, current_fn);
-            collect_calls_from_expr(catch_e, graph, current_fn);
-        }
-        ExprKind::FnLit(opt_name, _, _, body) => {
-            let mut inner = opt_name
-                .clone()
-                .unwrap_or_else(|| "<anonymous>".to_string());
-            graph.entry(inner.clone()).or_default();
-            walk_stmts_for_cg(body, graph, &mut inner);
-        }
-        ExprKind::BlockExpr(stmts, opt_e) => {
-            let mut block_ctx = current_fn.to_string();
-            walk_stmts_for_cg(stmts, graph, &mut block_ctx);
-            if let Some(e) = opt_e {
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-        }
-        ExprKind::Match(scrut, arms, else_e) => {
-            collect_calls_from_expr(scrut, graph, current_fn);
-            for (_arm, e) in arms {
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-            if let Some(e) = else_e {
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-        }
-        ExprKind::Array(exprs) => {
-            for e in exprs {
-                collect_calls_from_expr(e, graph, current_fn);
-            }
-        }
-        ExprKind::Map(pairs) => {
-            for (_, v) in pairs {
-                collect_calls_from_expr(v, graph, current_fn);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn print_call_graph(graph: &CallGraph) {
-    for (caller, callees) in graph {
-        if callees.is_empty() {
-            println!("{caller} -> (no calls)");
-        } else {
-            for callee in callees {
-                println!("{caller} -> {callee}");
-            }
-        }
-    }
-}
+//
+// Moved to `cli::call_graph` (imported above).
 
 // ── Data-flow / use-def analysis (R3-alpha) ────────────────────────────────
-
-#[derive(Default)]
-struct VarDefInfo {
-    line: usize,
-    used: bool,
-}
-
-fn print_dataflow_report(ast: &[Stmt], src: &str) {
-    use std::collections::BTreeMap;
-
-    let mut defs: BTreeMap<String, VarDefInfo> = BTreeMap::new();
-    let mut uses: Vec<(String, usize)> = Vec::new();
-
-    walk_stmts_for_dataflow(ast, src, &mut defs, &mut uses);
-
-    // Mark used flags.
-    for (name, use_line) in &uses {
-        if let Some(info) = defs.get_mut(name) {
-            info.used = true;
-        }
-        println!("use {} line:{}", name, use_line);
-    }
-
-    for (name, info) in &defs {
-        println!("def {} line:{}", name, info.line);
-    }
-
-    for (name, info) in &defs {
-        if !info.used {
-            println!("WARN {} assigned but never read", name);
-        }
-    }
-}
-
-fn walk_stmts_for_dataflow(
-    stmts: &[Stmt],
-    src: &str,
-    defs: &mut std::collections::BTreeMap<String, VarDefInfo>,
-    uses: &mut Vec<(String, usize)>,
-) {
-    for stmt in stmts {
-        match &stmt.kind {
-            StmtKind::Let(name, _ty, expr) => {
-                let (line, _) = line_col(src, stmt.span.start);
-                defs.entry(name.clone())
-                    .or_insert(VarDefInfo { line, used: false });
-                walk_expr_for_dataflow(expr, src, defs, uses);
-            }
-            StmtKind::Assign(name, expr) => {
-                // Treat assignment as a definition site as well.
-                let (line, _) = line_col(src, stmt.span.start);
-                defs.entry(name.clone())
-                    .or_insert(VarDefInfo { line, used: false });
-                walk_expr_for_dataflow(expr, src, defs, uses);
-            }
-            StmtKind::For(var, count_expr, body) => {
-                let (line, _) = line_col(src, stmt.span.start);
-                defs.entry(var.clone())
-                    .or_insert(VarDefInfo { line, used: false });
-                walk_expr_for_dataflow(count_expr, src, defs, uses);
-                walk_stmts_for_dataflow(body, src, defs, uses);
-            }
-            StmtKind::ForIn(var, col_expr, body) => {
-                let (line, _) = line_col(src, stmt.span.start);
-                defs.entry(var.clone())
-                    .or_insert(VarDefInfo { line, used: false });
-                walk_expr_for_dataflow(col_expr, src, defs, uses);
-                walk_stmts_for_dataflow(body, src, defs, uses);
-            }
-            StmtKind::ForInKV(k, v, col_expr, body) => {
-                let (line, _) = line_col(src, stmt.span.start);
-                defs.entry(k.clone())
-                    .or_insert(VarDefInfo { line, used: false });
-                defs.entry(v.clone())
-                    .or_insert(VarDefInfo { line, used: false });
-                walk_expr_for_dataflow(col_expr, src, defs, uses);
-                walk_stmts_for_dataflow(body, src, defs, uses);
-            }
-            StmtKind::Expr(e)
-            | StmtKind::Print(e)
-            | StmtKind::PrintF(_, e)
-            | StmtKind::Return(Some(e))
-            | StmtKind::Defer(e) => {
-                walk_expr_for_dataflow(e, src, defs, uses);
-            }
-            StmtKind::If(cond, then_branch, else_branch) => {
-                walk_expr_for_dataflow(cond, src, defs, uses);
-                walk_stmts_for_dataflow(then_branch, src, defs, uses);
-                if let Some(eb) = else_branch {
-                    walk_stmts_for_dataflow(eb, src, defs, uses);
-                }
-            }
-            StmtKind::While(cond, body) => {
-                walk_expr_for_dataflow(cond, src, defs, uses);
-                walk_stmts_for_dataflow(body, src, defs, uses);
-            }
-            StmtKind::Fn(_, _params, _ret, body) => {
-                walk_stmts_for_dataflow(body, src, defs, uses);
-            }
-            StmtKind::Block(body) | StmtKind::Seq(body) => {
-                walk_stmts_for_dataflow(body, src, defs, uses);
-            }
-            StmtKind::SetIndex(target, index, value) => {
-                walk_expr_for_dataflow(target, src, defs, uses);
-                walk_expr_for_dataflow(index, src, defs, uses);
-                walk_expr_for_dataflow(value, src, defs, uses);
-            }
-            StmtKind::SetAttr(target, _name, value) => {
-                walk_expr_for_dataflow(target, src, defs, uses);
-                walk_expr_for_dataflow(value, src, defs, uses);
-            }
-            StmtKind::Import(_) | StmtKind::Export(_) | StmtKind::Return(None) => {}
-            // const behaves like let for dataflow analysis
-            StmtKind::Const(name, _ty, expr) => {
-                let (line, _) = line_col(src, stmt.span.start);
-                defs.entry(name.clone())
-                    .or_insert(VarDefInfo { line, used: false });
-                walk_expr_for_dataflow(expr, src, defs, uses);
-            }
-            // New control flow
-            StmtKind::Break | StmtKind::Continue => {}
-            StmtKind::Throw(e) => {
-                walk_expr_for_dataflow(e, src, defs, uses);
-            }
-            StmtKind::Loop(body) => {
-                walk_stmts_for_dataflow(body, src, defs, uses);
-            }
-        }
-    }
-}
-
-fn walk_expr_for_dataflow(
-    expr: &Expr,
-    src: &str,
-    defs: &mut std::collections::BTreeMap<String, VarDefInfo>,
-    uses: &mut Vec<(String, usize)>,
-) {
-    match &expr.kind {
-        ExprKind::Var(name) => {
-            let (line, _) = line_col(src, expr.span.start);
-            uses.push((name.clone(), line));
-        }
-        ExprKind::Call(callee, args) => {
-            walk_expr_for_dataflow(callee, src, defs, uses);
-            for a in args {
-                walk_expr_for_dataflow(a, src, defs, uses);
-            }
-        }
-        ExprKind::GetAttr(target, _) => {
-            walk_expr_for_dataflow(target, src, defs, uses);
-        }
-        ExprKind::Index(target, index) => {
-            walk_expr_for_dataflow(target, src, defs, uses);
-            walk_expr_for_dataflow(index, src, defs, uses);
-        }
-        ExprKind::Array(items) => {
-            for e in items {
-                walk_expr_for_dataflow(e, src, defs, uses);
-            }
-        }
-        ExprKind::Map(entries) => {
-            for (_k, v) in entries {
-                walk_expr_for_dataflow(v, src, defs, uses);
-            }
-        }
-        ExprKind::Try(body, handler) => {
-            walk_expr_for_dataflow(body, src, defs, uses);
-            walk_expr_for_dataflow(handler, src, defs, uses);
-        }
-        ExprKind::FnLit(_name, _params, _ret, body) => {
-            walk_stmts_for_dataflow(body, src, defs, uses);
-        }
-        ExprKind::BlockExpr(body, tail) => {
-            walk_stmts_for_dataflow(body, src, defs, uses);
-            if let Some(t) = tail {
-                walk_expr_for_dataflow(t, src, defs, uses);
-            }
-        }
-        ExprKind::IfExpr(cond, then_br, else_br) => {
-            walk_expr_for_dataflow(cond, src, defs, uses);
-            walk_expr_for_dataflow(then_br, src, defs, uses);
-            walk_expr_for_dataflow(else_br, src, defs, uses);
-        }
-        ExprKind::Add(l, r)
-        | ExprKind::Sub(l, r)
-        | ExprKind::Mul(l, r)
-        | ExprKind::Div(l, r)
-        | ExprKind::Eq(l, r)
-        | ExprKind::NotEq(l, r)
-        | ExprKind::Gt(l, r)
-        | ExprKind::Ge(l, r)
-        | ExprKind::Lt(l, r)
-        | ExprKind::Le(l, r) => {
-            walk_expr_for_dataflow(l, src, defs, uses);
-            walk_expr_for_dataflow(r, src, defs, uses);
-        }
-        ExprKind::Logical { left, right, .. } => {
-            walk_expr_for_dataflow(left, src, defs, uses);
-            walk_expr_for_dataflow(right, src, defs, uses);
-        }
-        ExprKind::Match(scrutinee, arms, else_expr) => {
-            walk_expr_for_dataflow(scrutinee, src, defs, uses);
-            for (pat, body) in arms {
-                match pat {
-                    MatchArm::Literal(e) => walk_expr_for_dataflow(e, src, defs, uses),
-                    MatchArm::Bind(name) => {
-                        let (line, _) = line_col(src, expr.span.start);
-                        defs.entry(name.clone())
-                            .or_insert(VarDefInfo { line, used: false });
-                    }
-                    MatchArm::Wildcard => {}
-                    MatchArm::BindGuard(name, guard) => {
-                        let (line, _) = line_col(src, expr.span.start);
-                        defs.entry(name.clone())
-                            .or_insert(VarDefInfo { line, used: false });
-                        walk_expr_for_dataflow(guard, src, defs, uses);
-                    }
-                }
-                walk_expr_for_dataflow(body, src, defs, uses);
-            }
-            if let Some(e) = else_expr {
-                walk_expr_for_dataflow(e, src, defs, uses);
-            }
-        }
-        ExprKind::Number(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {}
-        // Safety operators — walk their inner expressions
-        ExprKind::Not(inner) => walk_expr_for_dataflow(inner, src, defs, uses),
-        ExprKind::SafeGetAttr(obj, _) => walk_expr_for_dataflow(obj, src, defs, uses),
-        ExprKind::SafeIndex(obj, idx) => {
-            walk_expr_for_dataflow(obj, src, defs, uses);
-            walk_expr_for_dataflow(idx, src, defs, uses);
-        }
-        ExprKind::ResultUnwrap(inner) => walk_expr_for_dataflow(inner, src, defs, uses),
-        // New expression kinds
-        ExprKind::NullCoalesce(a, b) | ExprKind::Pow(a, b) | ExprKind::Mod(a, b) => {
-            walk_expr_for_dataflow(a, src, defs, uses);
-            walk_expr_for_dataflow(b, src, defs, uses);
-        }
-        ExprKind::FString(parts) => {
-            for part in parts {
-                if let pblang_core::FStringPart::Interp(e) = part {
-                    walk_expr_for_dataflow(e, src, defs, uses);
-                }
-            }
-        }
-    }
-}
+//
+// Moved to `cli::dataflow` (imported above).
 
 // ── Annotated disassembly (R2-beta) ──────────────────────────────────────
 
@@ -2166,19 +1350,6 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
         Ok(())
     }
     copy_dir_all_inner(&src_root, &src_root, &dst_root, &dst_root)
-}
-
-fn write_http_response_with_local_cors(
-    stream: &mut std::net::TcpStream,
-    response: &str,
-    cors_origin: &str,
-) {
-    use std::io::Write;
-    let patched = response.replace(
-        "Access-Control-Allow-Origin: *",
-        &format!("Access-Control-Allow-Origin: {cors_origin}"),
-    );
-    let _ = stream.write_all(patched.as_bytes());
 }
 
 fn main() {
@@ -3961,13 +3132,54 @@ li { margin: 0.3em 0; }
         println!("pblang IDE Server starting on http://localhost:{}", port);
         println!("Open editors/ide/index.html in your browser");
 
-        let listener =
-            std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap_or_else(|e| {
-                eprintln!("Cannot bind to port {}: {}", port, e);
-                std::process::exit(1);
-            });
-        let cors_origin = format!("http://localhost:{port}");
-        let ide_examples = [
+        // ── pblang serve — axum-based IDE backend (D1+D2) ─────────────
+        //
+        // Migration from the hand-rolled HTTP loop on `std::net::TcpListener`
+        // (~720 lines) to axum on tokio. This addresses PrjAnalysis items
+        // D1 ("single-threaded; full async migration to tokio recommended")
+        // and D2 ("hand-rolled HTTP server — replacing with axum/tiny_http
+        // would reduce vulnerability surface").
+        //
+        // Endpoints preserved verbatim (paths, JSON shapes, status codes):
+        //   POST /run         — parse + typecheck + compile + execute
+        //   POST /check       — parse + typecheck only
+        //   POST /format      — format pblang source
+        //   POST /normalize   — normalize print(...) -> print ...
+        //   GET  /examples    — list bundled IDE examples
+        //   GET  /examples/:id — fetch one example's source
+        //   GET  /manual/:id  — fetch a bundled manual doc
+        //   GET  /health      — health probe
+        //   OPTIONS *         — CORS preflight (204)
+        //   GET  /            — IDE index.html (fallback for unknown paths)
+        //
+        // Security posture preserved:
+        //   - bind 127.0.0.1 only
+        //   - explicit CORS allowlist for http://localhost:<port>
+        //   - 10 MB request body cap (RequestBodyLimitLayer)
+        //   - default 8 KB hyper header cap (axum/hyper default)
+
+        use axum::{
+            body::Body,
+            extract::{Path as AxPath, State},
+            http::{header, HeaderValue, Method, Request, StatusCode},
+            middleware::{self, Next},
+            response::{IntoResponse, Response},
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::Arc;
+        use tower_http::cors::{AllowOrigin, CorsLayer};
+        use tower_http::limit::RequestBodyLimitLayer;
+
+        const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+        #[derive(Clone)]
+        struct ServeState {
+            ide_examples: &'static [(&'static str, &'static str, &'static str)],
+            manual_docs: &'static [(&'static str, &'static str, &'static str)],
+        }
+
+        static IDE_EXAMPLES: &[(&str, &str, &str)] = &[
             (
                 "hello_world",
                 "Hello World",
@@ -4025,663 +3237,512 @@ li { margin: 0.3em 0; }
                 "examples/ai_chat_toolcall/main.sapp",
             ),
         ];
-        let manual_docs = [
+        static MANUAL_DOCS: &[(&str, &str, &str)] = &[
             ("ide", "IDE Manual", "docs/IDE_MANUAL.md"),
             ("project", "Project Manual", "docs/PROJECT_MANUAL.md"),
         ];
-        let max_workers = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(2, 16))
-            .unwrap_or(4);
-        // 8 MB stack per worker to match the main thread's default on Linux.
-        // pblang scripts that recurse deeply (parser, GC traversal, builtin
-        // dispatch on deeply-nested input) overflow the threadpool crate's
-        // default 2 MB worker stack — that's a known source of "thread
-        // '<unknown>' has overflowed its stack" on serve startup the moment
-        // any client connects. Bumping the stack costs ~6 MB × max_workers
-        // of address space and zero RSS until used.
-        let serve_pool = threadpool::Builder::new()
-            .num_threads(max_workers)
-            .thread_name("pblang-serve-worker".into())
-            .thread_stack_size(8 * 1024 * 1024)
-            .build();
-        let max_inflight = max_workers * 8;
-        let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        struct InflightPermit {
-            counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        }
-        impl Drop for InflightPermit {
-            fn drop(&mut self) {
-                self.counter
-                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            }
-        }
-        println!("pblang serve: concurrency limit set to {}", max_workers);
-        println!("pblang serve: inflight cap set to {}", max_inflight);
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
-                    let acquired = loop {
-                        let cur = inflight.load(std::sync::atomic::Ordering::Acquire);
-                        if cur >= max_inflight {
-                            break false;
-                        }
-                        if inflight
-                            .compare_exchange_weak(
-                                cur,
-                                cur + 1,
-                                std::sync::atomic::Ordering::AcqRel,
-                                std::sync::atomic::Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            break true;
-                        }
-                    };
-                    if !acquired {
-                        let resp_body = serde_json::json!({
-                            "ok": false,
-                            "error": "server busy; retry later"
+        // JSON-body response wrapper that matches the legacy
+        // `Content-Type: application/json` + serialized body shape exactly.
+        fn json_with_status(status: StatusCode, body: serde_json::Value) -> Response {
+            let s = serde_json::to_string(&body).unwrap_or_default();
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/json")],
+                s,
+            )
+                .into_response()
+        }
+
+        async fn handle_run(Json(req): Json<serde_json::Value>) -> Response {
+            // Heavy CPU + I/O: parse, typecheck, compile, spin up a VM and run.
+            // Hop to a blocking thread so the async runtime stays responsive.
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let mut json_resp = serde_json::json!({
+                    "ok": false,
+                    "stage": "request",
+                    "output": "",
+                    "diagnostics": [],
+                    "error": "invalid request body",
+                    "duration_ms": 0
+                });
+                if let Some(code) = req.get("code").and_then(|c| c.as_str()) {
+                    let code = normalize_ide_source(code);
+                    let stdin_lines: Vec<String> = req
+                        .get("stdin_lines")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
                         })
-                        .to_string();
-                        let response = format!(
-                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nRetry-After: 1\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(),
-                        resp_body
-                    );
-                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                        continue;
-                    }
-
-                    let cors_origin = cors_origin.clone();
-                    let inflight = inflight.clone();
-                    serve_pool.execute(move || {
-                    let _permit = InflightPermit { counter: inflight };
-                    for _req in 0..1 {
-                        use std::io::Read;
-                        const MAX_HEADER_BYTES: usize = 64 * 1024;
-                        const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
-                        const READ_TIMEOUT_MS: u64 = 5_000;
-                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(
-                            READ_TIMEOUT_MS,
-                        )));
-                        let mut request_bytes: Vec<u8> = Vec::new();
-                        let mut chunk = [0u8; 4096];
-                        let mut header_end: Option<usize> = None;
-                        let mut content_length: usize = 0;
-                        let mut saw_content_length = false;
-                        let mut malformed_content_length = false;
-                        let mut header_too_large = false;
-                        let mut body_too_large = false;
-                        loop {
-                            match stream.read(&mut chunk) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    request_bytes.extend_from_slice(&chunk[..n]);
-                                    if header_end.is_none()
-                                        && request_bytes.len() > MAX_HEADER_BYTES
-                                    {
-                                        header_too_large = true;
-                                        break;
-                                    }
-                                    if header_end.is_none() {
-                                        if let Some(pos) =
-                                            request_bytes.windows(4).position(|w| w == b"\r\n\r\n")
-                                        {
-                                            header_end = Some(pos + 4);
-                                            let header =
-                                                String::from_utf8_lossy(&request_bytes[..pos + 4]);
-                                            for line in header.lines() {
-                                                let line_trimmed = line.trim();
-                                                if let Some(v) =
-                                                    line_trimmed.strip_prefix("Content-Length:")
-                                                {
-                                                    saw_content_length = true;
-                                                    match v.trim().parse::<usize>() {
-                                                        Ok(n) => content_length = n,
-                                                        Err(_) => {
-                                                            malformed_content_length = true;
-                                                            break;
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                                let lower = line_trimmed.to_ascii_lowercase();
-                                                if let Some(v) =
-                                                    lower.strip_prefix("content-length:")
-                                                {
-                                                    saw_content_length = true;
-                                                    match v.trim().parse::<usize>() {
-                                                        Ok(n) => content_length = n,
-                                                        Err(_) => {
-                                                            malformed_content_length = true;
-                                                            break;
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                            if malformed_content_length {
-                                                break;
-                                            }
-                                            if content_length > MAX_BODY_BYTES {
-                                                body_too_large = true;
-                                                break;
-                                            }
+                        .unwrap_or_default();
+                    match pblang_core::parse_with_polyglot(&code) {
+                        Ok((stmts, _)) => {
+                            let type_diags = type_check(&stmts);
+                            if !type_diags.is_empty() {
+                                let diagnostics: Vec<serde_json::Value> = type_diags
+                                    .into_iter()
+                                    .map(|d| {
+                                        if let Some(sp) = d.span {
+                                            let (line, col) = line_col(&code, sp.start);
+                                            serde_json::json!({
+                                                "stage": "type",
+                                                "message": d.message,
+                                                "span": { "start": sp.start, "end": sp.end },
+                                                "line": line,
+                                                "col": col,
+                                                "line_text": get_line(&code, line)
+                                            })
+                                        } else {
+                                            serde_json::json!({
+                                                "stage": "type",
+                                                "message": d.message
+                                            })
                                         }
-                                    }
-                                    if let Some(h_end) = header_end {
-                                        if request_bytes.len() >= h_end + content_length {
-                                            break;
+                                    })
+                                    .collect();
+                                json_resp = serde_json::json!({
+                                    "ok": false,
+                                    "stage": "type",
+                                    "output": "",
+                                    "error": "Type error",
+                                    "diagnostics": diagnostics
+                                });
+                            } else {
+                                match pblang_compiler::compile(stmts) {
+                                    Ok(chunk) => {
+                                        let mut vm = pblang_vm::VM::with_stdlib(
+                                            pblang_vm::StdlibConfig::default(),
+                                        );
+                                        vm.set_limits(Some(VmLimits {
+                                            max_instructions: Some(5_000_000),
+                                            max_stack_depth: Some(2048),
+                                            max_memory_bytes: Some(64 * 1024 * 1024),
+                                            io_timeout_ms: Some(5_000),
+                                        }));
+                                        if !stdin_lines.is_empty() {
+                                            vm.set_stdin_lines(stdin_lines.clone());
                                         }
-                                    }
-                                    if request_bytes.len() > MAX_HEADER_BYTES + MAX_BODY_BYTES {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if !request_bytes.is_empty() {
-                if header_too_large {
-                    let resp_body = serde_json::json!({
-                        "ok": false,
-                        "error": "request headers too large"
-                    })
-                    .to_string();
-                    let response = format!(
-                        "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                    continue;
-                }
-                if malformed_content_length {
-                    let resp_body = serde_json::json!({
-                        "ok": false,
-                        "error": "invalid Content-Length header"
-                    })
-                    .to_string();
-                    let response = format!(
-                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                    continue;
-                }
-                if body_too_large {
-                    let resp_body = serde_json::json!({
-                        "ok": false,
-                        "error": format!("request body too large (max {} bytes)", MAX_BODY_BYTES)
-                    })
-                    .to_string();
-                    let response = format!(
-                        "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                    continue;
-                }
-                let request = String::from_utf8_lossy(&request_bytes);
-                let request_line = request.lines().next().unwrap_or("");
-                if request_line.starts_with("POST ") && !saw_content_length {
-                    let resp_body = serde_json::json!({
-                        "ok": false,
-                        "error": "missing Content-Length for POST request"
-                    })
-                    .to_string();
-                    let response = format!(
-                        "HTTP/1.1 411 Length Required\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                    continue;
-                }
-                let request_path = request_line.split_whitespace().nth(1).unwrap_or("/");
-                let body_start = request.find("\r\n\r\n").map(|n| n + 4).unwrap_or(request.len());
-                let body = &request[body_start..];
-
-                if request.starts_with("POST /run") {
-                    let started = std::time::Instant::now();
-                    let mut json_resp = serde_json::json!({
-                        "ok": false,
-                        "stage": "request",
-                        "output": "",
-                        "diagnostics": [],
-                        "error": "invalid request body",
-                        "duration_ms": 0
-                    });
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
-                        if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
-                            let code = normalize_ide_source(code);
-                            let stdin_lines: Vec<String> = json
-                                .get("stdin_lines")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            match pblang_core::parse_with_polyglot(&code) {
-                                Ok((stmts, _)) => {
-                                    let type_diags = type_check(&stmts);
-                                    if !type_diags.is_empty() {
-                                        let diagnostics: Vec<serde_json::Value> = type_diags
-                                            .into_iter()
-                                            .map(|d| {
-                                                if let Some(sp) = d.span {
+                                        match vm.run_collect(chunk) {
+                                            Ok(values) => {
+                                                let mut output = String::new();
+                                                for v in values {
+                                                    output.push_str(&format!("{}\n", v));
+                                                }
+                                                json_resp = serde_json::json!({
+                                                    "ok": true,
+                                                    "stage": "ok",
+                                                    "output": output.trim(),
+                                                    "diagnostics": []
+                                                });
+                                            }
+                                            Err(e) => {
+                                                let mut diagnostics = Vec::new();
+                                                if let Some(sp) = e.span {
                                                     let (line, col) = line_col(&code, sp.start);
-                                                    serde_json::json!({
-                                                        "stage": "type",
-                                                        "message": d.message,
+                                                    diagnostics.push(serde_json::json!({
+                                                        "stage": "runtime",
+                                                        "message": e.message,
                                                         "span": { "start": sp.start, "end": sp.end },
                                                         "line": line,
                                                         "col": col,
                                                         "line_text": get_line(&code, line)
-                                                    })
-                                                } else {
-                                                    serde_json::json!({
-                                                        "stage": "type",
-                                                        "message": d.message
-                                                    })
+                                                    }));
                                                 }
-                                            })
-                                            .collect();
-                                        json_resp = serde_json::json!({
-                                            "ok": false,
-                                            "stage": "type",
-                                            "output": "",
-                                            "error": "Type error",
-                                            "diagnostics": diagnostics
-                                        });
-                                    } else {
-                                        match pblang_compiler::compile(stmts) {
-                                            Ok(chunk) => {
-                                                let mut vm = pblang_vm::VM::with_stdlib(
-                                                    pblang_vm::StdlibConfig::default(),
-                                                );
-                                                vm.set_limits(Some(VmLimits {
-                                                    max_instructions: Some(5_000_000),
-                                                    max_stack_depth: Some(2048),
-                                                    max_memory_bytes: Some(64 * 1024 * 1024),
-                                                    io_timeout_ms: Some(5_000),
-                                                }));
-                                                if !stdin_lines.is_empty() {
-                                                    vm.set_stdin_lines(stdin_lines.clone());
-                                                }
-                                                match vm.run_collect(chunk) {
-                                                    Ok(values) => {
-                                                        let mut output = String::new();
-                                                        for v in values {
-                                                            output.push_str(&format!("{}\n", v));
-                                                        }
-                                                        json_resp = serde_json::json!({
-                                                            "ok": true,
-                                                            "stage": "ok",
-                                                            "output": output.trim(),
-                                                            "diagnostics": []
-                                                        });
-                                                    }
-                                                    Err(e) => {
-                                                        let mut diagnostics = Vec::new();
-                                                        if let Some(sp) = e.span {
-                                                            let (line, col) = line_col(&code, sp.start);
-                                                            diagnostics.push(serde_json::json!({
-                                                                "stage": "runtime",
-                                                                "message": e.message,
-                                                                "span": { "start": sp.start, "end": sp.end },
-                                                                "line": line,
-                                                                "col": col,
-                                                                "line_text": get_line(&code, line)
-                                                            }));
-                                                        }
-                                                        json_resp = serde_json::json!({
-                                                            "ok": false,
-                                                            "stage": "runtime",
-                                                            "output": "",
-                                                            "error": format!("Runtime error: {}", e.message),
-                                                            "diagnostics": diagnostics
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
                                                 json_resp = serde_json::json!({
                                                     "ok": false,
-                                                    "stage": "compile",
+                                                    "stage": "runtime",
                                                     "output": "",
-                                                    "error": format!("Compile error: {}", e),
-                                                    "diagnostics": []
+                                                    "error": format!("Runtime error: {}", e.message),
+                                                    "diagnostics": diagnostics
                                                 });
                                             }
                                         }
                                     }
-                                }
-                                Err(errs) => {
-                                    let diagnostics: Vec<serde_json::Value> = errs
-                                        .into_iter()
-                                        .map(|err| {
-                                            let (ln, col) = line_col(&code, err.span.start);
-                                            serde_json::json!({
-                                                "stage": "parse",
-                                                "message": format_parse_error(&err),
-                                                "span": { "start": err.span.start, "end": err.span.end },
-                                                "line": ln,
-                                                "col": col,
-                                                "line_text": get_line(&code, ln)
-                                            })
-                                        })
-                                        .collect();
-                                    json_resp = serde_json::json!({
-                                        "ok": false,
-                                        "stage": "parse",
-                                        "output": "",
-                                        "error": "Parse error",
-                                        "diagnostics": diagnostics
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    let elapsed_ms = started.elapsed().as_millis() as u64;
-                    if let Some(obj) = json_resp.as_object_mut() {
-                        obj.insert("duration_ms".into(), serde_json::json!(elapsed_ms));
-                    }
-                    let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                } else if request.starts_with("POST /check") {
-                    // Parse + typecheck only (no execution), for IDE diagnostics.
-                    let mut json_resp = serde_json::json!({
-                        "ok": false,
-                        "stage": "request",
-                        "diagnostics": [],
-                        "error": "invalid request body"
-                    });
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
-                        if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
-                            let code = normalize_ide_source(code);
-                            match pblang_core::parse_with_polyglot(&code) {
-                                Ok((stmts, _)) => {
-                                    let diags = type_check(&stmts);
-                                    if diags.is_empty() {
-                                        json_resp = serde_json::json!({
-                                            "ok": true,
-                                            "stage": "ok",
-                                            "diagnostics": []
-                                        });
-                                    } else {
-                                        let diagnostics: Vec<serde_json::Value> = diags
-                                            .into_iter()
-                                            .map(|d| {
-                                                if let Some(sp) = d.span {
-                                                    let (line, col) = line_col(&code, sp.start);
-                                                    serde_json::json!({
-                                                        "stage": "type",
-                                                        "message": d.message,
-                                                        "span": { "start": sp.start, "end": sp.end },
-                                                        "line": line,
-                                                        "col": col,
-                                                        "line_text": get_line(&code, line)
-                                                    })
-                                                } else {
-                                                    serde_json::json!({
-                                                        "stage": "type",
-                                                        "message": d.message
-                                                    })
-                                                }
-                                            })
-                                            .collect();
+                                    Err(e) => {
                                         json_resp = serde_json::json!({
                                             "ok": false,
-                                            "stage": "type",
-                                            "diagnostics": diagnostics
+                                            "stage": "compile",
+                                            "output": "",
+                                            "error": format!("Compile error: {}", e),
+                                            "diagnostics": []
                                         });
                                     }
                                 }
-                                Err(errs) => {
-                                    let diagnostics: Vec<serde_json::Value> = errs
-                                        .into_iter()
-                                        .map(|err| {
-                                            let (ln, col) = line_col(&code, err.span.start);
-                                            serde_json::json!({
-                                                "stage": "parse",
-                                                "message": format_parse_error(&err),
-                                                "span": { "start": err.span.start, "end": err.span.end },
-                                                "line": ln,
-                                                "col": col,
-                                                "line_text": get_line(&code, ln)
-                                            })
-                                        })
-                                        .collect();
-                                    json_resp = serde_json::json!({
-                                        "ok": false,
+                            }
+                        }
+                        Err(errs) => {
+                            let diagnostics: Vec<serde_json::Value> = errs
+                                .into_iter()
+                                .map(|err| {
+                                    let (ln, col) = line_col(&code, err.span.start);
+                                    serde_json::json!({
                                         "stage": "parse",
-                                        "diagnostics": diagnostics
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                } else if request.starts_with("POST /format") {
-                    let mut json_resp = serde_json::json!({
-                        "ok": false,
-                        "error": "invalid request body",
-                        "code": ""
-                    });
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
-                        if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
-                            let max_line_length = json
-                                .get("max_line_length")
-                                .and_then(|v| v.as_u64())
-                                .and_then(|n| usize::try_from(n).ok());
-                            let normalized = normalize_ide_source(code);
-                            let formatted = format_ide_source(&normalized, max_line_length);
+                                        "message": format_parse_error(&err),
+                                        "span": { "start": err.span.start, "end": err.span.end },
+                                        "line": ln,
+                                        "col": col,
+                                        "line_text": get_line(&code, ln)
+                                    })
+                                })
+                                .collect();
                             json_resp = serde_json::json!({
-                                "ok": true,
-                                "code": formatted
+                                "ok": false,
+                                "stage": "parse",
+                                "output": "",
+                                "error": "Parse error",
+                                "diagnostics": diagnostics
                             });
                         }
                     }
-                    let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                } else if request.starts_with("POST /normalize") {
-                    let mut json_resp = serde_json::json!({
-                        "ok": false,
-                        "error": "invalid request body",
-                        "code": ""
-                    });
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
-                        if let Some(code) = json.get("code").and_then(|c| c.as_str()) {
-                            let normalized = normalize_ide_source(code);
-                            json_resp = serde_json::json!({
-                                "ok": true,
-                                "code": normalized
-                            });
-                        }
-                    }
-                    let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                } else if request_path == "/examples" {
-                    let mut arr = Vec::new();
-                    for (id, title, rel_path) in ide_examples {
-                        if std::path::Path::new(rel_path).exists() {
-                            arr.push(serde_json::json!({
-                                "id": id,
-                                "title": title
-                            }));
-                        }
-                    }
-                    let json_resp = serde_json::json!({
-                        "ok": true,
-                        "examples": arr
-                    });
-                    let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                } else if request_path.starts_with("/examples/") {
-                    let id = request_path.trim_start_matches("/examples/").trim_end_matches('/');
-                    let selected = ide_examples
-                        .iter()
-                        .find(|(example_id, _, _)| *example_id == id);
-                    if let Some((example_id, title, rel_path)) = selected {
-                        match std::fs::read_to_string(rel_path) {
-                            Ok(code) => {
-                                let json_resp = serde_json::json!({
-                                    "ok": true,
-                                    "id": example_id,
-                                    "title": title,
-                                    "code": code
-                                });
-                                let resp_body =
-                                    serde_json::to_string(&json_resp).unwrap_or_default();
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                                    resp_body.len(), resp_body
-                                );
-                                write_http_response_with_local_cors(
-                                    &mut stream,
-                                    &response,
-                                    &cors_origin,
-                                );
-                            }
-                            Err(e) => {
-                                let json_resp = serde_json::json!({
-                                    "ok": false,
-                                    "error": format!("failed to read selected example: {}", e)
-                                });
-                                let resp_body =
-                                    serde_json::to_string(&json_resp).unwrap_or_default();
-                                let response = format!(
-                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                                    resp_body.len(), resp_body
-                                );
-                                write_http_response_with_local_cors(
-                                    &mut stream,
-                                    &response,
-                                    &cors_origin,
-                                );
-                            }
-                        }
-                    } else {
-                        let json_resp = serde_json::json!({
-                            "ok": false,
-                            "error": "unknown example id"
-                        });
-                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                        let response = format!(
-                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                            resp_body.len(), resp_body
-                        );
-                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                    }
-                } else if request_path.starts_with("/manual/") {
-                    let id = request_path
-                        .trim_start_matches("/manual/")
-                        .trim_end_matches('/');
-                    let selected = manual_docs.iter().find(|(doc_id, _, _)| *doc_id == id);
-                    if let Some((doc_id, title, rel_path)) = selected {
-                        match std::fs::read_to_string(rel_path) {
-                            Ok(content) => {
-                                let json_resp = serde_json::json!({
-                                    "ok": true,
-                                    "id": doc_id,
-                                    "title": title,
-                                    "content": content
-                                });
-                                let resp_body =
-                                    serde_json::to_string(&json_resp).unwrap_or_default();
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                                    resp_body.len(), resp_body
-                                );
-                                write_http_response_with_local_cors(
-                                    &mut stream,
-                                    &response,
-                                    &cors_origin,
-                                );
-                            }
-                            Err(e) => {
-                                let json_resp = serde_json::json!({
-                                    "ok": false,
-                                    "error": format!("failed to read selected manual: {}", e)
-                                });
-                                let resp_body =
-                                    serde_json::to_string(&json_resp).unwrap_or_default();
-                                let response = format!(
-                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                                    resp_body.len(), resp_body
-                                );
-                                write_http_response_with_local_cors(
-                                    &mut stream,
-                                    &response,
-                                    &cors_origin,
-                                );
-                            }
-                        }
-                    } else {
-                        let json_resp = serde_json::json!({
-                            "ok": false,
-                            "error": "unknown manual id"
-                        });
-                        let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                        let response = format!(
-                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                            resp_body.len(), resp_body
-                        );
-                        write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                    }
-                } else if request.starts_with("GET /health") {
-                    let json_resp = serde_json::json!({"ok": true, "service": "pblang-ide-backend"});
-                    let resp_body = serde_json::to_string(&json_resp).unwrap_or_default();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        resp_body.len(), resp_body
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
-                } else if request.starts_with("OPTIONS") {
-                    let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n";
-                    write_http_response_with_local_cors(&mut stream, response, &cors_origin);
-                } else {
-                    // Serve IDE HTML for GET /
-                    let html = include_str!("../editors/ide/index.html");
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
-                        html.len(), html
-                    );
-                    write_http_response_with_local_cors(&mut stream, &response, &cors_origin);
                 }
-                        }
-                    }
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if let Some(obj) = json_resp.as_object_mut() {
+                    obj.insert("duration_ms".into(), serde_json::json!(elapsed_ms));
+                }
+                json_with_status(StatusCode::OK, json_resp)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                json_with_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"ok": false, "error": "internal server error"}),
+                )
+            })
+        }
+
+        async fn handle_check(Json(req): Json<serde_json::Value>) -> Response {
+            tokio::task::spawn_blocking(move || {
+                let mut json_resp = serde_json::json!({
+                    "ok": false,
+                    "stage": "request",
+                    "diagnostics": [],
+                    "error": "invalid request body"
                 });
+                if let Some(code) = req.get("code").and_then(|c| c.as_str()) {
+                    let code = normalize_ide_source(code);
+                    match pblang_core::parse_with_polyglot(&code) {
+                        Ok((stmts, _)) => {
+                            let diags = type_check(&stmts);
+                            if diags.is_empty() {
+                                json_resp = serde_json::json!({
+                                    "ok": true,
+                                    "stage": "ok",
+                                    "diagnostics": []
+                                });
+                            } else {
+                                let diagnostics: Vec<serde_json::Value> = diags
+                                    .into_iter()
+                                    .map(|d| {
+                                        if let Some(sp) = d.span {
+                                            let (line, col) = line_col(&code, sp.start);
+                                            serde_json::json!({
+                                                "stage": "type",
+                                                "message": d.message,
+                                                "span": { "start": sp.start, "end": sp.end },
+                                                "line": line,
+                                                "col": col,
+                                                "line_text": get_line(&code, line)
+                                            })
+                                        } else {
+                                            serde_json::json!({
+                                                "stage": "type",
+                                                "message": d.message
+                                            })
+                                        }
+                                    })
+                                    .collect();
+                                json_resp = serde_json::json!({
+                                    "ok": false,
+                                    "stage": "type",
+                                    "diagnostics": diagnostics
+                                });
+                            }
+                        }
+                        Err(errs) => {
+                            let diagnostics: Vec<serde_json::Value> = errs
+                                .into_iter()
+                                .map(|err| {
+                                    let (ln, col) = line_col(&code, err.span.start);
+                                    serde_json::json!({
+                                        "stage": "parse",
+                                        "message": format_parse_error(&err),
+                                        "span": { "start": err.span.start, "end": err.span.end },
+                                        "line": ln,
+                                        "col": col,
+                                        "line_text": get_line(&code, ln)
+                                    })
+                                })
+                                .collect();
+                            json_resp = serde_json::json!({
+                                "ok": false,
+                                "stage": "parse",
+                                "diagnostics": diagnostics
+                            });
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("pblang serve: failed to accept connection: {}", e);
+                json_with_status(StatusCode::OK, json_resp)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                json_with_status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"ok": false, "error": "internal server error"}),
+                )
+            })
+        }
+
+        async fn handle_format(Json(req): Json<serde_json::Value>) -> Response {
+            let mut json_resp = serde_json::json!({
+                "ok": false,
+                "error": "invalid request body",
+                "code": ""
+            });
+            if let Some(code) = req.get("code").and_then(|c| c.as_str()) {
+                let max_line_length = req
+                    .get("max_line_length")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| usize::try_from(n).ok());
+                let normalized = normalize_ide_source(code);
+                let formatted = format_ide_source(&normalized, max_line_length);
+                json_resp = serde_json::json!({
+                    "ok": true,
+                    "code": formatted
+                });
+            }
+            json_with_status(StatusCode::OK, json_resp)
+        }
+
+        async fn handle_normalize(Json(req): Json<serde_json::Value>) -> Response {
+            let mut json_resp = serde_json::json!({
+                "ok": false,
+                "error": "invalid request body",
+                "code": ""
+            });
+            if let Some(code) = req.get("code").and_then(|c| c.as_str()) {
+                let normalized = normalize_ide_source(code);
+                json_resp = serde_json::json!({
+                    "ok": true,
+                    "code": normalized
+                });
+            }
+            json_with_status(StatusCode::OK, json_resp)
+        }
+
+        async fn handle_examples_list(State(state): State<Arc<ServeState>>) -> Response {
+            let mut arr = Vec::new();
+            for (id, title, rel_path) in state.ide_examples {
+                if std::path::Path::new(rel_path).exists() {
+                    arr.push(serde_json::json!({
+                        "id": id,
+                        "title": title
+                    }));
                 }
             }
+            json_with_status(
+                StatusCode::OK,
+                serde_json::json!({ "ok": true, "examples": arr }),
+            )
         }
+
+        async fn handle_example_one(
+            State(state): State<Arc<ServeState>>,
+            AxPath(id): AxPath<String>,
+        ) -> Response {
+            let id = id.trim_end_matches('/');
+            // Multi-segment captures (e.g. /examples/foo/bar) must never echo
+            // user-controlled input back nor fall through to the IDE index.
+            if id.contains('/') {
+                return json_with_status(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({ "ok": false, "error": "unknown example id" }),
+                );
+            }
+            let selected = state
+                .ide_examples
+                .iter()
+                .find(|(example_id, _, _)| *example_id == id);
+            if let Some((example_id, title, rel_path)) = selected {
+                match std::fs::read_to_string(rel_path) {
+                    Ok(code) => json_with_status(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "id": example_id,
+                            "title": title,
+                            "code": code
+                        }),
+                    ),
+                    Err(e) => json_with_status(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("failed to read selected example: {}", e)
+                        }),
+                    ),
+                }
+            } else {
+                json_with_status(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({ "ok": false, "error": "unknown example id" }),
+                )
+            }
+        }
+
+        async fn handle_manual_one(
+            State(state): State<Arc<ServeState>>,
+            AxPath(id): AxPath<String>,
+        ) -> Response {
+            let id = id.trim_end_matches('/');
+            if id.contains('/') {
+                return json_with_status(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({ "ok": false, "error": "unknown manual id" }),
+                );
+            }
+            let selected = state.manual_docs.iter().find(|(doc_id, _, _)| *doc_id == id);
+            if let Some((doc_id, title, rel_path)) = selected {
+                match std::fs::read_to_string(rel_path) {
+                    Ok(content) => json_with_status(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "id": doc_id,
+                            "title": title,
+                            "content": content
+                        }),
+                    ),
+                    Err(e) => json_with_status(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("failed to read selected manual: {}", e)
+                        }),
+                    ),
+                }
+            } else {
+                json_with_status(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({ "ok": false, "error": "unknown manual id" }),
+                )
+            }
+        }
+
+        async fn handle_health() -> Response {
+            json_with_status(
+                StatusCode::OK,
+                serde_json::json!({"ok": true, "service": "pblang-ide-backend"}),
+            )
+        }
+
+        async fn handle_index() -> Response {
+            let html = include_str!("../editors/ide/index.html");
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html")],
+                html,
+            )
+                .into_response()
+        }
+
+        // Enforce explicit Content-Length on POST: the legacy hand-rolled
+        // server returned 411/400 for missing/invalid C-L; axum/hyper accepts
+        // chunked or empty by default, which broke
+        // serve_rejects_post_without_content_length and
+        // serve_rejects_malformed_content_length.
+        async fn require_content_length(req: Request<Body>, next: Next) -> Response {
+            if req.method() == Method::POST {
+                match req.headers().get(header::CONTENT_LENGTH) {
+                    None => {
+                        return json_with_status(
+                            StatusCode::LENGTH_REQUIRED,
+                            serde_json::json!({"ok": false, "error": "missing Content-Length"}),
+                        );
+                    }
+                    Some(v) => {
+                        let s = v.to_str().unwrap_or("");
+                        if s.parse::<u64>().is_err() {
+                            return json_with_status(
+                                StatusCode::BAD_REQUEST,
+                                serde_json::json!({"ok": false, "error": "invalid Content-Length"}),
+                            );
+                        }
+                    }
+                }
+            }
+            next.run(req).await
+        }
+
+        let state = Arc::new(ServeState {
+            ide_examples: IDE_EXAMPLES,
+            manual_docs: MANUAL_DOCS,
+        });
+
+        let cors_origin = format!("http://localhost:{port}");
+        let cors_origin_hv: HeaderValue = match cors_origin.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("pblang serve: invalid CORS origin '{}': {}", cors_origin, e);
+                std::process::exit(1);
+            }
+        };
+        let cors = CorsLayer::new()
+            .allow_origin(AllowOrigin::exact(cors_origin_hv))
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE]);
+
+        let app = Router::new()
+            .route("/", get(handle_index))
+            .route("/health", get(handle_health))
+            .route("/run", post(handle_run))
+            .route("/check", post(handle_check))
+            .route("/format", post(handle_format))
+            .route("/normalize", post(handle_normalize))
+            .route("/examples", get(handle_examples_list))
+            .route("/examples/*id", get(handle_example_one))
+            .route("/manual/*id", get(handle_manual_one))
+            .fallback(handle_index)
+            .layer(middleware::from_fn(require_content_length))
+            .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+            .layer(cors)
+            .with_state(state);
+
+        let bind_addr = format!("127.0.0.1:{}", port);
+        // 8 MB stack for both async workers and blocking-pool threads —
+        // matches the main thread's default on Linux. pblang scripts that
+        // recurse deeply (parser, GC traversal, deeply-nested input) overflow
+        // tokio's default 2 MB worker stack. This was a known source of
+        // "thread '<unknown>' has overflowed its stack" on `serve` the moment
+        // any client connected. Cost: ~6 MB × worker of address space, zero
+        // RSS until used.
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("pblang-serve-worker")
+            .thread_stack_size(8 * 1024 * 1024)
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("pblang serve: failed to build tokio runtime: {}", e);
+                std::process::exit(1);
+            }
+        };
+        rt.block_on(async move {
+            let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Cannot bind to port {}: {}", port, e);
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = axum::serve(listener, app).await {
+                eprintln!("pblang serve: server error: {}", e);
+                std::process::exit(1);
+            }
+        });
         return;
     }
 
