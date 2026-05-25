@@ -16,4 +16,6 @@ pub use pblang_ir::{
     BuiltinFn, Chunk, Closure, FrameTrace, Function, Module, Obj, ObjRef, RuntimeError, Upvalue,
     Value, VmHost,
 };
-pub use vm::{FfiPolicy, StdlibConfig, VmLimits, VM};
+pub use vm::{
+    bounded_json_parse, FfiPolicy, StdlibConfig, VmLimits, DEFAULT_MAX_EXTERNAL_JSON_BYTES, VM,
+};

@@ -112,6 +112,16 @@ Used endpoints:
 - `GET /health`
 - `GET /examples`
 - `GET /examples/<id>`
+- `GET /manual/<id>`
+- `GET /ws` — WebSocket upgrade. Sends one JSON object per text frame:
+  - `{"op": "ping"}` → `{"op": "pong", "ts_ms": <number>}`
+  - `{"op": "echo", "msg": "..."}` → `{"op": "echoed", "msg": "..."}`
+  - `{"op": "version"}` → `{"op": "version", "version": "...", "service": "pblang-ide-backend"}`
+  Useful for IDE liveness checks and bring-up without per-request TCP
+  handshake. `run` / `check` / `format` are intentionally **not** exposed
+  over WS yet — those are CPU-bound and stay on the POST endpoints. A
+  streaming wrapper that re-uses the same compile/run pipeline is on the
+  roadmap.
 
 Responses are JSON and include CORS support for browser access.
 

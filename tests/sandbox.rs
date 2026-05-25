@@ -97,6 +97,7 @@ fn instruction_limit_exceeded() {
         max_stack_depth: None,
         max_memory_bytes: None,
         io_timeout_ms: None,
+        max_external_json_bytes: None,
     }));
     let result = vm.run(chunk);
     let err = result.expect_err("expected instruction limit");
@@ -126,6 +127,7 @@ fn stack_depth_limit_exceeded() {
         max_stack_depth: Some(50),
         max_memory_bytes: None,
         io_timeout_ms: None,
+        max_external_json_bytes: None,
     }));
     let result = vm.run(chunk);
     let err = result.expect_err("expected stack depth limit");

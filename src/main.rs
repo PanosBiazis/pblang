@@ -924,8 +924,16 @@ fn show_help() {
 
     println!("CLI helpers (run without entering the REPL):");
     println!("  pblang init            Create pblang.toml in current directory");
-    println!("  pblang run [file.sapp|file.bpx|dir]  Execute a script, or run the package entry from a manifest dir/current dir");
-    println!("  pblang test [dir]       Run all .sap/.sapp/.bpx files in dir (default: tests)");
+    println!("  pblang run [file.sapp|file.bpx|dir] [--allow-*] [--deny-*] [--allow-all|--sandbox] [-- script-args...]");
+    println!("                          Execute a script, or run the package entry from a manifest dir/current dir.");
+    println!("                          Capability flags (all default to: fs+net+http+sqlite+spawn+gfx+core ON, exec+ffi OFF):");
+    println!("                            --allow-exec    Enable proc_spawn_wait / exec / polyglot_exec*");
+    println!("                            --allow-ffi     Enable ffi_load / ffi_call_typed / polyglot_compile_cached");
+    println!("                            --allow-all     Enable every capability (use only for trusted code)");
+    println!("                            --sandbox       Disable exec/ffi/net/fs/http/sqlite (paranoid mode)");
+    println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx)");
+    println!("                          Env-var equivalents: PBLANG_ALLOW_EXEC=1, PBLANG_ALLOW_FFI=1, PBLANG_ALLOW_ALL=1, PBLANG_SANDBOX=1, etc.");
+    println!("  pblang test [dir] [--allow-*]  Run all .sap/.sapp/.bpx files in dir (default: tests); accepts the same capability flags as `run`");
     println!("  pblang fmt [--max-line-length=N] [file.sap|file.bpx …] Format .sap/.sapp/.bpx (trim, operator spacing, indent 4 spaces, optional line wrap, final newline)");
     println!(
     "  pblang lint [file.sap|file.bpx …] Parse + typecheck files, report diagnostics (exit 1 if any)"
@@ -954,7 +962,7 @@ fn show_help() {
     println!("  pblang --annotate <file>   Compile file and print annotated bytecode (source line + instruction side-by-side)");
     println!("  pblang --symbols <file>    Print a simple symbol table for top-level functions and globals (name, arity, bytecode offset)");
     println!("  pblang lsp             Start LSP server on stdin/stdout (parse/typecheck diagnostics, hover, goto-def)");
-    println!("  pblang serve [--port N]  Start local IDE backend server (default: 8090)");
+    println!("  pblang serve [--port N] [--cert <pem> --key <pem>]  Start local IDE backend server (default: 8090, plaintext). Pass --cert + --key to enable HTTPS via rustls.");
     println!();
 
     println!("Language quick tour (examples):");
@@ -1484,11 +1492,312 @@ fn handle_build_polyglot(args: Vec<String>) {
 }
 
 #[inline]
+/// Pre-warm the polyglot cdylib cache for every `@lang { ... }` block found in
+/// the package source tree. Called from `pblang build --warm-polyglot`.
+///
+/// Walks `.sapp` / `.sap` / `.bpx` files under `man_dir`, runs
+/// `extract_polyglot_blocks` on each, filters to the 16 languages
+/// `polyglot.compile_cached` supports, and invokes the cache loader for each
+/// unique (lang, code) pair via a synthesized pblang bootstrap script that
+/// runs with `exec`+`ffi` capabilities granted.
+///
+/// Idempotent: blocks whose content-hash is already in the cache are no-ops
+/// (sub-millisecond). New blocks pay the per-toolchain cold-compile cost
+/// once, then subsequent runs of the user's code skip the subprocess entirely.
+fn warm_polyglot_cache(man_dir: &std::path::Path) {
+    const CACHEABLE_LANGS: &[&str] = &[
+        "rust", "rs", "c", "cpp", "c++", "cxx", "go", "pascal", "pas", "delphi", "freepascal",
+        "csharp", "cs", "c#", "fsharp", "fs", "fsx", "f#",
+        "zig", "d", "nim", "swift",
+        "haskell", "hs",
+        "fortran", "f90", "f95", "f03", "f08", "f",
+        "objc", "objective-c", "m",
+        "ocaml", "ml",
+        "java", "kotlin", "kt",
+    ];
+
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut walker = walkdir::WalkDir::new(man_dir).into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        // Skip target/ and .git/.
+        if entry.file_type().is_dir() {
+            let n = entry.file_name().to_string_lossy();
+            if n == "target" || n == ".git" || n == "node_modules" || n == "dist" {
+                walker.skip_current_dir();
+                continue;
+            }
+            continue;
+        }
+        let p = entry.path();
+        let ext_ok = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e == "sapp" || e == "sap" || e == "bpx")
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+        let src = match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        files_scanned += 1;
+        let extracted = pblang_core::extract_polyglot_blocks(&src);
+        for b in extracted {
+            if CACHEABLE_LANGS.contains(&b.lang.as_str()) {
+                blocks.push((b.lang, b.code));
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        println!(
+            "warm-polyglot: no cacheable @lang blocks found ({} file(s) scanned)",
+            files_scanned
+        );
+        return;
+    }
+
+    // Dedup by (lang, code) — same content compiles to the same cache key.
+    blocks.sort();
+    blocks.dedup();
+
+    println!(
+        "warm-polyglot: found {} unique @lang block(s) across {} file(s); warming cdylib cache...",
+        blocks.len(),
+        files_scanned
+    );
+
+    // Encode blocks as a JSON string the bootstrap script can parse. Using
+    // serde_json handles all escaping (quotes, backslashes, newlines, control
+    // characters) so the resulting pblang source is safe.
+    let payload: Vec<serde_json::Value> = blocks
+        .iter()
+        .map(|(l, c)| serde_json::json!({ "lang": l, "code": c }))
+        .collect();
+    let json = serde_json::to_string(&payload).unwrap_or_else(|e| {
+        eprintln!("warm-polyglot: failed to serialize blocks: {e}");
+        std::process::exit(1);
+    });
+
+    // pblang's string literals support double-quotes with backslash escapes,
+    // so we wrap the JSON in a raw-style "..." by escaping only \ and " and
+    // newlines. serde_json::to_string already returns a single-line valid
+    // JSON string, but its contents contain raw '"' characters that must be
+    // re-escaped for embedding inside a pblang `"..."` literal.
+    let json_lit = json
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+
+    // The bootstrap calls the native `polyglot_compile_cached` builtin
+    // directly instead of going through `stdlib/polyglot.sapp`. That stdlib
+    // import resolves only inside packages that declare a `stdlib` dep — but
+    // the build is happening in the *user's* package context where stdlib
+    // is not a declared dep. The native builtin is always in the global
+    // scope when `ffi=true` + `exec=true`, so it works from any context.
+    let script = format!(
+        r#"
+let raw = "{json_lit}";
+let blocks = json_parse(raw);
+let i = 0;
+let warmed = 0;
+let skipped = 0;
+while i < len(blocks) {{
+    let b = blocks[i];
+    let h = try polyglot_compile_cached(b.lang, b.code) catch -1;
+    if h == -1 {{
+        // compile_cached errored — usually a missing toolchain (e.g. rustc /
+        // dotnet not installed). Tally and continue with the next block.
+        skipped = skipped + 1;
+        print "  skipped " + b.lang + " (toolchain missing or compile error)";
+    }} else {{
+        warmed = warmed + 1;
+        try ffi_close(h) catch nil;
+        print "  warmed " + b.lang;
+    }}
+    i = i + 1;
+}}
+print "warm-polyglot: " + str(warmed) + " warmed, " + str(skipped) + " skipped";
+"#
+    );
+
+    // Run the bootstrap with exec+ffi capabilities granted. Failures
+    // (parse/compile/runtime) report and exit nonzero so CI catches them.
+    let src_for_parse = strip_comments_mask(&script);
+    let stmts = match parse_strict(&src_for_parse) {
+        Ok(s) => s,
+        Err(errs) => {
+            eprintln!("warm-polyglot: synthesized bootstrap script failed to parse:");
+            print_parse_errors(&src_for_parse, errs, Some("<warm-polyglot-bootstrap>"));
+            std::process::exit(2);
+        }
+    };
+    let mut chunk = match compile(stmts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warm-polyglot: synthesized bootstrap failed to compile: {}", e);
+            std::process::exit(3);
+        }
+    };
+    chunk.source = Some(std::rc::Rc::new(script.clone()));
+    let cfg = StdlibConfig {
+        exec: true,
+        ffi: true,
+        ..StdlibConfig::default()
+    };
+    let mut vm = VM::with_stdlib(cfg);
+    if let Err(e) = vm.run(chunk) {
+        eprintln!("warm-polyglot: bootstrap runtime error: {}", e.message);
+        std::process::exit(1);
+    }
+}
+
+/// Build an `axum_server::tls_rustls::RustlsConfig` with ALPN protocols set
+/// to `["h2", "http/1.1"]` so HTTPS clients can negotiate HTTP/2 (h2 first,
+/// http/1.1 fallback). Used by `pblang serve --cert ... --key ...`.
+///
+/// `axum_server::tls_rustls::RustlsConfig::from_pem_file` does not set ALPN,
+/// so without this helper the server only ever speaks h1 even when h2 is
+/// compiled in via `axum/http2`. We load the PEM files synchronously here
+/// (small files, called once at startup) and build a `rustls::ServerConfig`
+/// by hand.
+fn build_tls_config_with_alpn(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
+    use std::io::Cursor;
+
+    // Read & parse the cert chain. rustls-pemfile lives in axum-server's
+    // dep tree; we don't add it as a direct dep — instead we let rustls
+    // parse the PEM via its own helpers from raw bytes.
+    let cert_bytes = std::fs::read(cert_path)?;
+    let key_bytes = std::fs::read(key_path)?;
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut Cursor::new(cert_bytes))
+            .collect::<Result<_, _>>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no certificates found in PEM",
+        ));
+    }
+
+    // Accept any of: PKCS8, RSA, EC. rustls-pemfile dispatches on the PEM
+    // tag automatically via `private_key`.
+    let key = rustls_pemfile::private_key(&mut Cursor::new(key_bytes))?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key in PEM"))?;
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // ALPN: advertise h2 first (preferred), http/1.1 fallback. ALPN match
+    // is strictly textual; hyper-util's auto::Builder dispatches the right
+    // h1/h2 path based on what the client picked.
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        std::sync::Arc::new(server_config),
+    ))
+}
+
 fn prepend(name: &str, mut rest: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(rest.len() + 1);
     out.push(name.to_string());
     out.append(&mut rest);
     out
+}
+
+/// Strip `--allow-*` / `--deny-*` / `--allow-all` / `--sandbox` flags from
+/// `args` and return a corresponding `StdlibConfig`. The default config
+/// already enables fs / net / http / crypto / json / sqlite / gfx / spawn
+/// but denies exec and ffi (secure-by-default for embedded contexts).
+///
+/// Recognized flags (anywhere in `args`):
+///   --allow-exec, --allow-ffi, --allow-net, --allow-fs, --allow-http,
+///   --allow-sqlite, --allow-spawn, --allow-gfx
+///   --deny-exec, --deny-ffi, --deny-net, --deny-fs, --deny-http,
+///   --deny-sqlite, --deny-spawn, --deny-gfx
+///   --allow-all       — enable every capability (use only for trusted code)
+///   --sandbox         — disable exec/ffi/net/http/sqlite (paranoid mode)
+///
+/// Also consults env vars as fallback overrides (set any to "1"/"true"):
+///   PBLANG_ALLOW_EXEC, PBLANG_ALLOW_FFI, PBLANG_ALLOW_NET,
+///   PBLANG_ALLOW_FS, PBLANG_ALLOW_HTTP, PBLANG_ALLOW_SQLITE,
+///   PBLANG_ALLOW_SPAWN, PBLANG_ALLOW_GFX, PBLANG_ALLOW_ALL, PBLANG_SANDBOX
+///
+/// CLI flags take precedence over env vars; later flags override earlier ones.
+fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
+    let mut cfg = StdlibConfig::default();
+
+    fn env_on(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on"))
+            .unwrap_or(false)
+    }
+
+    // 1. Env-var pre-fill.
+    if env_on("PBLANG_ALLOW_EXEC") { cfg.exec = true; }
+    if env_on("PBLANG_ALLOW_FFI")  { cfg.ffi  = true; }
+    if env_on("PBLANG_ALLOW_NET")  { cfg.net  = true; }
+    if env_on("PBLANG_ALLOW_FS")   { cfg.fs   = true; }
+    if env_on("PBLANG_ALLOW_HTTP") { cfg.http = true; }
+    if env_on("PBLANG_ALLOW_SQLITE") { cfg.sqlite = true; }
+    if env_on("PBLANG_ALLOW_SPAWN")  { cfg.spawn  = true; }
+    if env_on("PBLANG_ALLOW_GFX")    { cfg.gfx    = true; }
+    if env_on("PBLANG_ALLOW_ALL") {
+        cfg.exec = true; cfg.ffi = true; cfg.net = true; cfg.fs = true;
+        cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true;
+    }
+    if env_on("PBLANG_SANDBOX") {
+        cfg.exec = false; cfg.ffi = false; cfg.net = false; cfg.fs = false;
+        cfg.http = false; cfg.sqlite = false;
+    }
+
+    // 2. CLI flag scan + strip.
+    args.retain(|a| {
+        match a.as_str() {
+            "--allow-exec"   => { cfg.exec = true;  false }
+            "--allow-ffi"    => { cfg.ffi = true;   false }
+            "--allow-net"    => { cfg.net = true;   false }
+            "--allow-fs"     => { cfg.fs = true;    false }
+            "--allow-http"   => { cfg.http = true;  false }
+            "--allow-sqlite" => { cfg.sqlite = true; false }
+            "--allow-spawn"  => { cfg.spawn = true; false }
+            "--allow-gfx"    => { cfg.gfx = true;   false }
+            "--deny-exec"    => { cfg.exec = false; false }
+            "--deny-ffi"     => { cfg.ffi = false;  false }
+            "--deny-net"     => { cfg.net = false;  false }
+            "--deny-fs"      => { cfg.fs = false;   false }
+            "--deny-http"    => { cfg.http = false; false }
+            "--deny-sqlite"  => { cfg.sqlite = false; false }
+            "--deny-spawn"   => { cfg.spawn = false; false }
+            "--deny-gfx"     => { cfg.gfx = false;  false }
+            "--allow-all" => {
+                cfg.exec = true; cfg.ffi = true; cfg.net = true; cfg.fs = true;
+                cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true;
+                false
+            }
+            "--sandbox" => {
+                cfg.exec = false; cfg.ffi = false; cfg.net = false; cfg.fs = false;
+                cfg.http = false; cfg.sqlite = false;
+                false
+            }
+            _ => true,
+        }
+    });
+
+    cfg
 }
 
 /// Legacy top-level dispatch chain. This is the pre-clap CLI router; clap
@@ -2298,7 +2607,11 @@ fn legacy_dispatch(args: Vec<String>) {
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("build") {
-        let rest: Vec<String> = args.iter().skip(1).cloned().collect();
+        // Strip the `--warm-polyglot` flag from rest before registry-options
+        // parsing so the existing positionals logic doesn't see it.
+        let mut rest: Vec<String> = args.iter().skip(1).cloned().collect();
+        let warm_polyglot = rest.iter().any(|a| a == "--warm-polyglot");
+        rest.retain(|a| a != "--warm-polyglot");
         let (registry_index_url, require_registry_sha256_cli, positionals) =
             parse_registry_options_and_positionals("build", &rest).unwrap_or_else(|e| {
                 eprintln!("{}", e);
@@ -2367,6 +2680,9 @@ fn legacy_dispatch(args: Vec<String>) {
             }
         }
         println!("build ok");
+        if warm_polyglot {
+            warm_polyglot_cache(&man_dir);
+        }
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("bundle") {
@@ -3099,6 +3415,8 @@ li { margin: 0.3em 0; }
     // ── pblang serve — Start IDE backend server ────────────────────────
     if args.first().map(|s| s.as_str()) == Some("serve") {
         let mut port: u16 = 8090;
+        let mut tls_cert: Option<std::path::PathBuf> = None;
+        let mut tls_key: Option<std::path::PathBuf> = None;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -3106,30 +3424,56 @@ li { margin: 0.3em 0; }
                     i += 1;
                     if i >= args.len() {
                         eprintln!("pblang serve: --port requires a value");
-                        eprintln!("usage: pblang serve [--port <1-65535>]");
+                        eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
                         std::process::exit(2);
                     }
                     match args[i].parse::<u16>() {
                         Ok(p) if p > 0 => port = p,
                         _ => {
                             eprintln!("pblang serve: invalid port '{}'", args[i]);
-                            eprintln!("usage: pblang serve [--port <1-65535>]");
+                            eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
                             std::process::exit(2);
                         }
                     }
+                }
+                "--cert" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("pblang serve: --cert requires a PEM file path");
+                        std::process::exit(2);
+                    }
+                    tls_cert = Some(std::path::PathBuf::from(&args[i]));
+                }
+                "--key" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("pblang serve: --key requires a PEM file path");
+                        std::process::exit(2);
+                    }
+                    tls_key = Some(std::path::PathBuf::from(&args[i]));
                 }
                 other => match other.parse::<u16>() {
                     Ok(p) if p > 0 => port = p,
                     _ => {
                         eprintln!("pblang serve: unrecognized argument '{}'", other);
-                        eprintln!("usage: pblang serve [--port <1-65535>]");
+                        eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
                         std::process::exit(2);
                     }
                 },
             }
             i += 1;
         }
-        println!("pblang IDE Server starting on http://localhost:{}", port);
+        // --cert and --key must be provided together or not at all.
+        let tls_pair = match (&tls_cert, &tls_key) {
+            (Some(c), Some(k)) => Some((c.clone(), k.clone())),
+            (None, None) => None,
+            _ => {
+                eprintln!("pblang serve: --cert and --key must be provided together");
+                std::process::exit(2);
+            }
+        };
+        let scheme = if tls_pair.is_some() { "https" } else { "http" };
+        println!("pblang IDE Server starting on {scheme}://localhost:{port}");
         println!("Open editors/ide/index.html in your browser");
 
         // ── pblang serve — axum-based IDE backend (D1+D2) ─────────────
@@ -3160,7 +3504,10 @@ li { margin: 0.3em 0; }
 
         use axum::{
             body::Body,
-            extract::{Path as AxPath, State},
+            extract::{
+                ws::{Message, WebSocket, WebSocketUpgrade},
+                Path as AxPath, State,
+            },
             http::{header, HeaderValue, Method, Request, StatusCode},
             middleware::{self, Next},
             response::{IntoResponse, Response},
@@ -3321,6 +3668,7 @@ li { margin: 0.3em 0; }
                                             max_stack_depth: Some(2048),
                                             max_memory_bytes: Some(64 * 1024 * 1024),
                                             io_timeout_ms: Some(5_000),
+                                            max_external_json_bytes: None,
                                         }));
                                         if !stdin_lines.is_empty() {
                                             vm.set_stdin_lines(stdin_lines.clone());
@@ -3638,6 +3986,104 @@ li { margin: 0.3em 0; }
             )
         }
 
+        // -----------------------------------------------------------------
+        // WebSocket endpoint (GET /ws)
+        //
+        // Persistent JSON-message channel for IDE integrations that want
+        // to avoid TCP handshake / re-auth per request. Protocol is one
+        // JSON object per WebSocket text frame:
+        //
+        //   client → server  {"op": "ping"}
+        //                    {"op": "echo", "msg": "..."}
+        //                    {"op": "version"}
+        //
+        //   server → client  {"op": "pong", "ts_ms": <number>}
+        //                    {"op": "echoed", "msg": "..."}
+        //                    {"op": "version", "version": "...", "service": "pblang-ide-backend"}
+        //                    {"ok": false, "error": "..."}        (on protocol error)
+        //
+        // The {run, check, format} ops are intentionally **not** exposed
+        // over WS yet — those handlers are CPU-bound and tightly coupled
+        // to the POST request shape (Json<Value> extractor, blocking
+        // pool hop). A streaming wrapper that re-uses the same compile/
+        // run pipeline is a follow-up; for now the WS endpoint is a
+        // low-cost liveness + IDE bring-up channel that proves the
+        // upgrade path works without re-architecting the handlers.
+        async fn handle_ws(ws: WebSocketUpgrade) -> Response {
+            ws.on_upgrade(ws_socket_loop)
+        }
+
+        async fn ws_socket_loop(mut socket: WebSocket) {
+            while let Some(msg) = socket.recv().await {
+                let Ok(msg) = msg else { break };
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Binary(_) => {
+                        let _ = socket
+                            .send(Message::Text(
+                                serde_json::json!({"ok": false, "error": "binary frames not supported; send JSON text"})
+                                    .to_string(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                    Message::Ping(p) => {
+                        let _ = socket.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => break,
+                };
+                let reply = ws_dispatch(&text);
+                if socket
+                    .send(Message::Text(reply.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+
+        fn ws_dispatch(text: &str) -> serde_json::Value {
+            let v: serde_json::Value = match serde_json::from_str(text) {
+                Ok(v) => v,
+                Err(e) => {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": format!("invalid JSON: {e}")
+                    });
+                }
+            };
+            let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
+            match op {
+                "ping" => {
+                    let ts_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    serde_json::json!({"op": "pong", "ts_ms": ts_ms})
+                }
+                "echo" => {
+                    let msg = v.get("msg").cloned().unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({"op": "echoed", "msg": msg})
+                }
+                "version" => serde_json::json!({
+                    "op": "version",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "service": "pblang-ide-backend",
+                }),
+                "" => serde_json::json!({
+                    "ok": false,
+                    "error": "missing op field; expected ping|echo|version"
+                }),
+                other => serde_json::json!({
+                    "ok": false,
+                    "error": format!("unknown op {other:?}; expected ping|echo|version")
+                }),
+            }
+        }
+
         async fn handle_index() -> Response {
             let html = include_str!("../editors/ide/index.html");
             (
@@ -3681,7 +4127,7 @@ li { margin: 0.3em 0; }
             manual_docs: MANUAL_DOCS,
         });
 
-        let cors_origin = format!("http://localhost:{port}");
+        let cors_origin = format!("{scheme}://localhost:{port}");
         let cors_origin_hv: HeaderValue = match cors_origin.parse() {
             Ok(v) => v,
             Err(e) => {
@@ -3697,6 +4143,7 @@ li { margin: 0.3em 0; }
         let app = Router::new()
             .route("/", get(handle_index))
             .route("/health", get(handle_health))
+            .route("/ws", get(handle_ws))
             .route("/run", post(handle_run))
             .route("/check", post(handle_check))
             .route("/format", post(handle_format))
@@ -3731,16 +4178,64 @@ li { margin: 0.3em 0; }
             }
         };
         rt.block_on(async move {
-            let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Cannot bind to port {}: {}", port, e);
-                    std::process::exit(1);
+            match tls_pair {
+                Some((cert_path, key_path)) => {
+                    // HTTPS path: axum-server + rustls. The cert/key PEMs are
+                    // loaded once at startup; we don't watch for file changes
+                    // (re-issue requires restarting the server).
+                    //
+                    // rustls 0.23 requires the caller to install a process-wide
+                    // CryptoProvider before any TLS operation. We use `ring`
+                    // (matching pblang-vm's choice). Errors here mean a
+                    // provider is already installed — that's fine; we ignore.
+                    let _ = rustls::crypto::ring::default_provider().install_default();
+                    let socket_addr: std::net::SocketAddr = match bind_addr.parse() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!("pblang serve: invalid bind addr {bind_addr}: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    // Build the rustls ServerConfig ourselves so we can
+                    // advertise ALPN protocols ["h2", "http/1.1"]. axum-
+                    // server's `from_pem_file` helper doesn't set ALPN, so
+                    // clients never negotiate h2 even though hyper-util's
+                    // auto::Builder can serve both protocols when the
+                    // `http2` feature is enabled on axum (which it is —
+                    // see Cargo.toml `axum = { features = ["ws", "http2"] }`).
+                    let tls_config = match build_tls_config_with_alpn(&cert_path, &key_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!(
+                                "pblang serve: failed to load TLS cert {} / key {}: {}",
+                                cert_path.display(),
+                                key_path.display(),
+                                e
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = axum_server::bind_rustls(socket_addr, tls_config)
+                        .serve(app.into_make_service())
+                        .await
+                    {
+                        eprintln!("pblang serve (TLS): server error: {}", e);
+                        std::process::exit(1);
+                    }
                 }
-            };
-            if let Err(e) = axum::serve(listener, app).await {
-                eprintln!("pblang serve: server error: {}", e);
-                std::process::exit(1);
+                None => {
+                    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("Cannot bind to port {}: {}", port, e);
+                            std::process::exit(1);
+                        }
+                    };
+                    if let Err(e) = axum::serve(listener, app).await {
+                        eprintln!("pblang serve: server error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
         });
         return;
@@ -4205,6 +4700,8 @@ li { margin: 0.3em 0; }
 
     // Run test scripts (convention: tests/*.sap, tests/*.sapp, or tests/*.bpx)
     if args.first().map(|s| s.as_str()) == Some("test") {
+        let mut args = args;
+        let stdlib_cfg = parse_capability_flags(&mut args);
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let test_dir = args
             .get(1)
@@ -4267,7 +4764,7 @@ li { margin: 0.3em 0; }
             chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
             chunk.source = Some(std::rc::Rc::new(src));
 
-            let mut vm = VM::with_stdlib(StdlibConfig::default());
+            let mut vm = VM::with_stdlib(stdlib_cfg.clone());
             match vm.run(chunk) {
                 Ok(()) => {
                     passed += 1;
@@ -4290,6 +4787,10 @@ li { margin: 0.3em 0; }
 
     // Run a script file and exit (no REPL)
     if args.first().map(|s| s.as_str()) == Some("run") {
+        // Pull capability flags out of args first so they don't interfere
+        // with the path/`--` script-args parsing below.
+        let mut args = args;
+        let stdlib_cfg = parse_capability_flags(&mut args);
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut script_src_preloaded: Option<String> = None;
         let script_path = if let Some(path_arg) = args.get(1) {
@@ -4393,7 +4894,7 @@ li { margin: 0.3em 0; }
             std::env::set_var("PBLANG_SCRIPT_ARGS", script_args.join("\n"))
         };
 
-        let mut vm = VM::with_stdlib(StdlibConfig::default());
+        let mut vm = VM::with_stdlib(stdlib_cfg);
         if let Err(e) = vm.run(chunk) {
             let src_ref = e.source.as_deref().unwrap_or(&src);
             let src_name = e.source_name.as_deref().unwrap_or(&path_str);
@@ -4933,7 +5434,11 @@ li { margin: 0.3em 0; }
         return;
     }
 
-    let mut vm = VM::with_stdlib(StdlibConfig::default());
+    // REPL also accepts capability flags so an interactive session can
+    // do FFI/polyglot work, e.g. `pblang --allow-exec --allow-ffi`.
+    let mut repl_args = args;
+    let repl_cfg = parse_capability_flags(&mut repl_args);
+    let mut vm = VM::with_stdlib(repl_cfg);
 
     println!("Welcome to Biapryx REPL!");
     println!("Type 'help' for commands.");
