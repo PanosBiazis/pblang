@@ -140,7 +140,7 @@ pub fn parser<'src>(
         escape.map(|(_, c)| c),
     ));
     let string = just('"')
-        .ignore_then(string_char.clone().repeated().collect::<Vec<char>>())
+        .ignore_then(string_char.repeated().collect::<Vec<char>>())
         .then_ignore(just('"'))
         .map(|chars: Vec<char>| ExprKind::Str(chars.into_iter().collect()))
         .map_with(mk_expr_w)
@@ -192,10 +192,10 @@ pub fn parser<'src>(
     let inner_stmt0 = stmt.clone().then_ignore(just(';').padded().or_not());
 
     let block_stmt = just('{')
-        .ignore_then(ws0.clone())
+        .ignore_then(ws0)
         .ignore_then(
             inner_stmt0
-                .then_ignore(ws0.clone())
+                .then_ignore(ws0)
                 .repeated()
                 .collect::<Vec<Stmt>>(),
         )
@@ -329,7 +329,7 @@ pub fn parser<'src>(
             }),
         // string literal
         just('"')
-            .ignore_then(string_char.clone().repeated().collect::<Vec<char>>())
+            .ignore_then(string_char.repeated().collect::<Vec<char>>())
             .then_ignore(just('"'))
             .padded()
             .map(|chars: Vec<char>| Expr {
@@ -381,7 +381,7 @@ pub fn parser<'src>(
     let ret_ann = just("->").padded().ignore_then(ty.clone()).or_not();
 
     let fn_stmt = just("fn")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(params.clone())
         .then(ret_ann.clone())
@@ -393,15 +393,15 @@ pub fn parser<'src>(
         .map_with(mk_stmt_w);
 
     let printf_stmt = just("printf")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::int(10).from_str::<i64>().unwrapped())
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .map(|(p, e)| StmtKind::PrintF(p as usize, e))
         .map_with(mk_stmt_w);
 
     let print_stmt = just("print")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .map(StmtKind::Print)
         .map_with(mk_stmt_w);
@@ -426,7 +426,7 @@ pub fn parser<'src>(
 
     // throw expr; — raise a runtime error
     let throw_stmt = just("throw")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .map(StmtKind::Throw)
         .map_with(mk_stmt_w)
@@ -434,7 +434,7 @@ pub fn parser<'src>(
 
     // loop { body } — infinite loop (use break to exit)
     let loop_stmt = just("loop")
-        .ignore_then(ws0.clone())
+        .ignore_then(ws0)
         .ignore_then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
             _ => unreachable!(),
@@ -443,20 +443,20 @@ pub fn parser<'src>(
         .map_with(mk_stmt_w);
 
     let defer_stmt = just("defer")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .map(|(_, e)| StmtKind::Defer(e))
         .map_with(mk_stmt_w)
         .padded();
 
     let import_stmt = just("import")
-        .then_ignore(ws1.clone())
-        .ignore_then(string_raw.clone())
+        .then_ignore(ws1)
+        .ignore_then(string_raw)
         .map(StmtKind::Import)
         .map_with(mk_stmt_w);
 
     let export_stmt = just("export")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(
             text::ident().map(|s: &str| s.to_string())
                 .padded()
@@ -478,7 +478,7 @@ pub fn parser<'src>(
     let destruct_name_or_rest = choice((destruct_rest, destruct_ident.map(|n| (n, false))));
 
     let array_destruct_stmt = just("let")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(
             destruct_name_or_rest
                 .separated_by(just(',').padded())
@@ -622,7 +622,7 @@ pub fn parser<'src>(
     ));
 
     let map_destruct_stmt = just("let")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(
             map_destruct_field
                 .separated_by(just(',').padded())
@@ -664,7 +664,7 @@ pub fn parser<'src>(
 
     // Plain let: let name[:type] = expr
     let let_stmt = just("let")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then(type_ann.clone())
         .then_ignore(just('=').padded())
@@ -674,7 +674,7 @@ pub fn parser<'src>(
 
     // const name = expr; — immutable binding (Rust-style)
     let const_stmt = just("const")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
         .then(type_ann.clone())
         .then_ignore(just('=').padded())
@@ -819,12 +819,12 @@ pub fn parser<'src>(
     });
 
     let elif_clause = just("elif")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(block_body.clone());
 
     let else_clause = just("else")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(choice((
             block_body.clone(),
             if_stmt.clone().map(|s| vec![s]),
@@ -832,7 +832,7 @@ pub fn parser<'src>(
         .or_not();
 
     let if_stmt_impl = just("if")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(block_body.clone())
         .then(elif_clause.repeated().collect::<Vec<(Expr, Vec<Stmt>)>>())
@@ -859,7 +859,7 @@ pub fn parser<'src>(
     if_stmt.define(if_stmt_impl);
 
     let while_stmt = just("while")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
@@ -870,13 +870,13 @@ pub fn parser<'src>(
 
     // for k, v in expr { body } — iterates map key-value pairs
     let for_in_kv_stmt = just("for")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then_ignore(just(',').padded())
         .then(text::ident().map(|s: &str| s.to_string()).padded())
-        .then_ignore(ws0.clone()) // padded already consumed trailing ws
+        .then_ignore(ws0) // padded already consumed trailing ws
         .then_ignore(just("in"))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
@@ -887,11 +887,11 @@ pub fn parser<'src>(
 
     // for x in expr { body } — iterates array elements or map keys
     let for_in_stmt = just("for")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then_ignore(just("in"))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
@@ -902,9 +902,9 @@ pub fn parser<'src>(
 
     // for i N { body } — original counter loop
     let for_stmt = just("for")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
@@ -921,7 +921,7 @@ pub fn parser<'src>(
     // Desugars to:
     // let Name = map{ method: fn method(self, x) { ... }, other: fn other() { ... } };
     let class_method = just("fn")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(params.clone())
         .then(ret_ann.clone())
@@ -936,9 +936,9 @@ pub fn parser<'src>(
         });
 
     let class_stmt = just("class")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .then(
             class_method
                 .then_ignore(just(';').padded().or_not())
@@ -1186,10 +1186,10 @@ pub fn parser<'src>(
 
     let g_inner_stmt0 = gstmt.clone().then_ignore(just(';').padded().or_not());
     let gblock_stmt = just('{')
-        .ignore_then(ws0.clone())
+        .ignore_then(ws0)
         .ignore_then(
             g_inner_stmt0
-                .then_ignore(ws0.clone())
+                .then_ignore(ws0)
                 .repeated()
                 .collect::<Vec<Stmt>>(),
         )
@@ -1204,7 +1204,7 @@ pub fn parser<'src>(
     });
 
     let goto_jump_stmt = just("goto")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .map_with(|label, __e| { let sp = __e.span().into_range();
             let sp = Span::from(sp);
@@ -1232,12 +1232,12 @@ pub fn parser<'src>(
     });
 
     let g_elif_clause = just("elif")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(gblock_body.clone());
 
     let g_else_clause = just("else")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(choice((
             gblock_body.clone(),
             if_stmt.clone().map(|s| vec![s]),
@@ -1245,7 +1245,7 @@ pub fn parser<'src>(
         .or_not();
 
     let g_if_stmt = just("if")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(gblock_body.clone())
         .then(g_elif_clause.repeated().collect::<Vec<(Expr, Vec<Stmt>)>>())
@@ -1267,7 +1267,7 @@ pub fn parser<'src>(
         });
 
     let g_while_stmt = just("while")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(gblock_body.clone())
         .map(|(cond, body)| StmtKind::While(cond, body))
@@ -1275,13 +1275,13 @@ pub fn parser<'src>(
 
     // g_for_in_kv_stmt: for k, v in expr { body } inside goto context
     let g_for_in_kv_stmt = just("for")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then_ignore(just(',').padded())
         .then(text::ident().map(|s: &str| s.to_string()).padded())
-        .then_ignore(ws0.clone()) // padded already consumed trailing ws
+        .then_ignore(ws0) // padded already consumed trailing ws
         .then_ignore(just("in"))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .then(gblock_body.clone())
         .map(|(((k, v), col), body)| StmtKind::ForInKV(k, v, col, body))
@@ -1289,20 +1289,20 @@ pub fn parser<'src>(
 
     // g_for_in_stmt: for x in expr { body } inside goto context
     let g_for_in_stmt = just("for")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then_ignore(just("in"))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .then(gblock_body.clone())
         .map(|((name, col), body)| StmtKind::ForIn(name, col, body))
         .map_with(mk_stmt_w);
 
     let g_for_stmt = just("for")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .then(expr.clone())
         .then(gblock_body.clone())
         .map(|((name, count), body)| StmtKind::For(name, count, body))
@@ -1330,12 +1330,12 @@ pub fn parser<'src>(
     gstmt.define(g_stmt_impl);
 
     let goto_label = just("label")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(gblock_body.clone());
 
     let goto_block_stmt = just("goto")
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .ignore_then(
             goto_label
                 .repeated()
@@ -1494,7 +1494,7 @@ pub fn parser<'src>(
     // Desugars to:
     // { let __switch_<sp.start> = expr; if __switch_.. == v { ... } else if ... else { ... } }
     let switch_case = just("case")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
@@ -1502,7 +1502,7 @@ pub fn parser<'src>(
         }));
 
     let switch_default = just("default")
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .ignore_then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
             _ => unreachable!("block parser must produce StmtKind::Block"),
@@ -1510,9 +1510,9 @@ pub fn parser<'src>(
         .or_not();
 
     let switch_stmt = just("switch")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .then(
             switch_case
                 .repeated()
@@ -1614,7 +1614,7 @@ pub fn parser<'src>(
     // Function literal expression:
     // fn (a, b) { ... }
     // fn name(a, b) { ... }   (optional name, mainly for debugging/stack traces later)
-    let fn_lit_name = ws1.clone().ignore_then(text::ident().map(|s: &str| s.to_string()).padded()).or_not();
+    let fn_lit_name = ws1.ignore_then(text::ident().map(|s: &str| s.to_string()).padded()).or_not();
 
     let fn_lit_expr = just("fn")
         .ignore_then(fn_lit_name)
@@ -1639,7 +1639,7 @@ pub fn parser<'src>(
 
     // `if cond { then } else { else }` — expression-level conditional (both arms are blocks).
     let if_expr = just("if")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then(block_expr.clone())
         .then_ignore(just("else").padded())
@@ -1664,7 +1664,7 @@ pub fn parser<'src>(
         // allow: foo: 1
         text::ident().map(|s: &str| s.to_string()).padded(),
         // allow: "foo": 1
-        string_raw.clone(),
+        string_raw,
     ));
 
     let map_pair = map_key
@@ -1686,7 +1686,7 @@ pub fn parser<'src>(
         .padded();
 
     let try_expr = just("try")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
         .then_ignore(just("catch").padded())
         .then(expr.clone())
@@ -1698,7 +1698,7 @@ pub fn parser<'src>(
     let match_pattern = choice((
         just("_").to(MatchArm::Wildcard),
         number.map(MatchArm::Literal),
-        string.clone().map(MatchArm::Literal),
+        string.map(MatchArm::Literal),
         bool_lit.clone().map(MatchArm::Literal),
         nil_lit.clone().map(MatchArm::Literal),
         ident.map(MatchArm::Bind),
@@ -1724,7 +1724,7 @@ pub fn parser<'src>(
     // never run. `not`, `and`, `or` inside a guard need parentheses around
     // the whole guard, e.g. `case x if (a < 0 and b > 0) ~ body`.
     let guarded_match_arm = just("case")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(ident)
         // `ident` is already padded (trailing whitespace consumed), so we
         // can't require ws1 before "if" — use `just("if").padded()` which
@@ -1739,28 +1739,28 @@ pub fn parser<'src>(
 
     // Unguarded arm: `case pattern : body` — mandatory `:` separator.
     let unguarded_match_arm = just("case")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(match_pattern)
         .then_ignore(just(':').padded())
         .then(
-            ws0.clone()
+            ws0
                 .ignore_then(expr.clone())
-                .then_ignore(ws0.clone()),
+                .then_ignore(ws0),
         );
 
     // match_arm = guarded (guard absorbed in ws) | unguarded (with `:`)
     let match_arm = choice((guarded_match_arm, unguarded_match_arm));
     let match_else = just("else")
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .then_ignore(just(':').padded().or_not())
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .ignore_then(expr.clone())
         .then_ignore(just(';').padded().or_not())
         .or_not();
     let match_expr = just("match")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .then(
             match_arm
                 .then_ignore(just(';').padded().or_not())
@@ -1784,22 +1784,22 @@ pub fn parser<'src>(
     //   __switch_out_..
     // }
     let switch_case_expr = just("case")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .then_ignore(just(':').padded().or_not())
         .then(expr.clone());
 
     let switch_default_expr = just("default")
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .then_ignore(just(':').padded().or_not())
         .ignore_then(expr.clone())
         .or_not();
 
     let switch_expr = just("switch")
-        .then_ignore(ws1.clone())
+        .then_ignore(ws1)
         .ignore_then(expr.clone())
-        .then_ignore(ws0.clone())
+        .then_ignore(ws0)
         .then(
             switch_case_expr
                 .repeated()
@@ -1910,7 +1910,7 @@ pub fn parser<'src>(
         nil_lit.clone(),
         number,
         f_string_expr,
-        string.clone(),
+        string,
         array_lit,
         map_lit,
         match_expr,
@@ -1962,7 +1962,7 @@ pub fn parser<'src>(
     // `?` alone — Result unwrap. Must not steal `?` from ternary (`cond ? a : b`).
     // After `?`, unwrap only when the next token is `.`, `[`, `)`, `,`, `;`, or EOF.
     let result_unwrap_pf = just('?')
-        .ignore_then(ws0.clone())
+        .ignore_then(ws0)
         .ignore_then(choice((
             just('.').to(()),
             just('[').to(()),
@@ -1979,7 +1979,7 @@ pub fn parser<'src>(
     // We define it as a postfix so it binds tighter than logical operators.
     // just("??") must come before result_unwrap_pf in choice to prevent consuming first ?
     let null_coal_pf = just("??")
-        .ignore_then(ws0.clone())
+        .ignore_then(ws0)
         .ignore_then(expr.clone())
         .map_with(|right, __e| { let sp = __e.span().into_range(); Postfix::NullCoal(right, Span::from(sp)) })
         .padded();
@@ -2289,7 +2289,7 @@ pub fn parser<'src>(
         bool_lit.clone(),
         nil_lit.clone(),
         number,
-        string.clone(),
+        string,
         ident.map(ExprKind::Var).map_with(mk_expr_w),
         just('(')
             .padded()

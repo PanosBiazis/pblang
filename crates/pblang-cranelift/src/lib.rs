@@ -197,6 +197,12 @@ impl JitCache {
         self.module.finalize_definitions()?;
 
         let raw_ptr = self.module.get_finalized_function(func_id);
+        // SAFETY: `get_finalized_function` returns a raw pointer to JIT'd
+        // machine code we just produced via Cranelift. The signature is
+        // built earlier in this function (one f64-array-in, one f64-out)
+        // and matches `JitFn` exactly by construction. Transmuting the
+        // raw pointer to the typed fn-pointer is the standard Cranelift
+        // JIT invocation pattern (mirrors `cranelift_jit::JITModule` docs).
         let fn_ptr: JitFn = unsafe { std::mem::transmute(raw_ptr) };
         self.entries.insert(name.to_string(), (func_id, fn_ptr));
         Ok(fn_ptr)
@@ -311,6 +317,10 @@ impl JitCache {
         // Collect function pointers
         for (name, fid) in &decls {
             let raw_ptr = self.module.get_finalized_function(*fid);
+            // SAFETY: Same contract as the single-function path above —
+            // every function in `decls` was declared with the JitFn
+            // signature, finalize_definitions() succeeded, and the raw
+            // pointer comes from the just-compiled JIT module.
             let fn_ptr: JitFn = unsafe { std::mem::transmute(raw_ptr) };
             self.entries.insert(name.clone(), (*fid, fn_ptr));
             compiled.insert(name.clone(), fn_ptr);
@@ -1071,6 +1081,12 @@ pub fn call_jit(fn_ptr: JitFn, args: &[PblangValue]) -> Option<PblangValue> {
             _ => return None, // non-numeric arg → fall back to interpreter
         }
     }
+    // SAFETY: `fn_ptr` is a JitFn produced by this module's compilation
+    // path (signature: `fn(*const f64, u32) -> f64`). The args slice is
+    // built locally above with `f64_args.len()` matching the count we
+    // pass — pointer is valid for `f64_args.len() * 8` bytes during the
+    // call. JIT'd code is execute-able in this process per Cranelift
+    // JITModule contract.
     let result = unsafe { fn_ptr(f64_args.as_ptr(), f64_args.len() as u32) };
     if result.is_nan() {
         Some(PblangValue::Nil)

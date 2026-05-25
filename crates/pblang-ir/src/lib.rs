@@ -210,6 +210,15 @@ pub trait VmHost {
         None
     }
 
+    /// Maximum byte length of JSON accepted from **external** ingress points
+    /// (FFI calls, AI provider responses, package registry index). Builtins
+    /// that parse JSON from untrusted external sources should consult this
+    /// cap. The `json_parse` builtin called from pblang code is *not* gated
+    /// by this — only external bytes are. Default 10 MB.
+    fn max_external_json_bytes(&self) -> usize {
+        10 * 1024 * 1024
+    }
+
     // Runtime memory-safety tracker (optional; the VM host implements these).
 
     fn mem_allocate(&mut self, _value: Value, _is_mutable: bool) -> Result<f64, RuntimeError> {

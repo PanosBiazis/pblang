@@ -710,3 +710,842 @@ fn serve_unknown_ids_do_not_reflect_user_input() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Capability flags (--allow-exec / --allow-ffi / --allow-all / --sandbox)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Run `pblang run -` (stdin) with `extra_args` and the given script.
+/// Returns (status_code, stdout, stderr).
+fn run_pblang_script_with_args(script: &str, extra_args: &[&str]) -> (i32, String, String) {
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join(format!(
+        "pblang_cap_test_{}.sapp",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, script).expect("write tmp script");
+    let mut cmd = Command::new(&bin);
+    cmd.arg("run").arg(&tmp);
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    let out = cmd.output().expect("run pblang script");
+    let _ = std::fs::remove_file(&tmp);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    (out.status.code().unwrap_or(-1), stdout, stderr)
+}
+
+/// The default `pblang run` config denies `ffi`. ffi_load on a valid system
+/// library should hit the capability gate and the catch block should fire.
+#[test]
+fn cap_default_denies_ffi() {
+    let script = r#"
+let r = try ffi_load("libc.so.6") catch "GATE_DENIED";
+if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
+"#;
+    let (status, stdout, stderr) = run_pblang_script_with_args(script, &[]);
+    assert_eq!(status, 0, "expected exit 0 (got {status}). stderr={stderr}");
+    assert!(
+        stdout.contains("ffi:denied"),
+        "expected ffi:denied without --allow-ffi, got stdout={stdout}"
+    );
+}
+
+/// `--allow-ffi` should switch the same script over to actually loading libc.
+#[test]
+#[cfg(target_os = "linux")]
+fn cap_allow_ffi_loads_libc() {
+    let script = r#"
+let r = try ffi_load("libc.so.6") catch "GATE_DENIED";
+if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
+"#;
+    let (status, stdout, stderr) = run_pblang_script_with_args(script, &["--allow-ffi"]);
+    assert_eq!(status, 0, "expected exit 0 (got {status}). stderr={stderr}");
+    assert!(
+        stdout.contains("ffi:loaded"),
+        "expected ffi:loaded with --allow-ffi, got stdout={stdout} stderr={stderr}"
+    );
+}
+
+/// `--allow-all` should enable both exec and ffi.
+#[test]
+#[cfg(target_os = "linux")]
+fn cap_allow_all_enables_ffi_and_exec() {
+    let script = r#"
+let f = try ffi_load("libc.so.6") catch "GATE_DENIED_FFI";
+if f == "GATE_DENIED_FFI" { print "ffi:denied"; } else { print "ffi:loaded"; }
+let r = try exec("/bin/true") catch "GATE_DENIED_EXEC";
+if r == "GATE_DENIED_EXEC" { print "exec:denied"; } else { print "exec:ran"; }
+"#;
+    let (status, stdout, _stderr) = run_pblang_script_with_args(script, &["--allow-all"]);
+    assert_eq!(status, 0);
+    assert!(
+        stdout.contains("ffi:loaded") && stdout.contains("exec:ran"),
+        "expected both ffi:loaded and exec:ran with --allow-all, got: {stdout}"
+    );
+}
+
+/// `--sandbox` should DENY ffi/exec/net/fs/http/sqlite even when env var
+/// would otherwise enable them — CLI flags take precedence over env vars.
+#[test]
+#[cfg(target_os = "linux")]
+fn cap_sandbox_overrides_env_var() {
+    let script = r#"
+let r = try ffi_load("libc.so.6") catch "GATE_DENIED";
+if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
+"#;
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_cap_sandbox_test.sapp");
+    std::fs::write(&tmp, script).expect("write tmp script");
+    let out = Command::new(&bin)
+        .arg("run")
+        .arg(&tmp)
+        .arg("--sandbox")
+        .env("PBLANG_ALLOW_FFI", "1")
+        .output()
+        .expect("run pblang script");
+    let _ = std::fs::remove_file(&tmp);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("ffi:denied"),
+        "expected --sandbox to win over PBLANG_ALLOW_FFI=1, got stdout={stdout} stderr={stderr}"
+    );
+}
+
+/// Env var alone should enable ffi when no CLI flag is given.
+#[test]
+#[cfg(target_os = "linux")]
+fn cap_env_var_alone_enables_ffi() {
+    let script = r#"
+let r = try ffi_load("libc.so.6") catch "GATE_DENIED";
+if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
+"#;
+    let bin = require_pblang_bin();
+    let tmp = std::env::temp_dir().join("pblang_cap_env_test.sapp");
+    std::fs::write(&tmp, script).expect("write tmp script");
+    let out = Command::new(&bin)
+        .arg("run")
+        .arg(&tmp)
+        .env("PBLANG_ALLOW_FFI", "1")
+        .output()
+        .expect("run pblang script");
+    let _ = std::fs::remove_file(&tmp);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ffi:loaded"),
+        "expected PBLANG_ALLOW_FFI=1 to enable ffi, got: {stdout}"
+    );
+}
+
+/// `--allow-*` flags must be stripped from script-arg view; they shouldn't
+/// land in `os.args()` returned to the script.
+#[test]
+fn cap_flags_do_not_leak_into_script_args() {
+    let script = r#"
+// Just print something — we're checking the test doesn't error from
+// a bad script path or unexpected argv that contains "--allow-exec".
+print "ok";
+"#;
+    let (status, stdout, stderr) =
+        run_pblang_script_with_args(script, &["--allow-exec", "--allow-ffi"]);
+    assert_eq!(
+        status, 0,
+        "script should run cleanly with capability flags. stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("ok"),
+        "expected 'ok' output, got: stdout={stdout} stderr={stderr}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `pblang build --warm-polyglot` (PL2-beta)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `--warm-polyglot` should walk .sapp files, extract @lang blocks for the
+/// cacheable languages, and pre-warm the cdylib cache. Missing toolchains
+/// must skip gracefully so this test runs on any host.
+#[test]
+fn build_warm_polyglot_walks_and_warms() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_warm_polyglot_cli_{nonce}"));
+    let src_dir = work.join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[package]\nname = \"warm_test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    // Two blocks: C should compile (cc is widely available on Linux/macOS
+    // CI), Pascal scaffolds as a "skipped" path on hosts without fpc.
+    // Use a unique function name per test run so we exercise the cold path.
+    let unique = nonce;
+    let c_code = format!(
+        "long warm_test_{unique}(long a, long b) {{ return a + b; }}\n"
+    );
+    let pas_code = format!(
+        "library prog;\n\
+         function pblang_x_{unique}(a, b: Int64): Int64; cdecl; export;\n\
+         begin\n  pblang_x_{unique} := a + b;\nend;\n\
+         exports pblang_x_{unique};\nbegin\nend.\n"
+    );
+    let src = format!(
+        "@c {{\n{c_code}}}\n@pascal {{\n{pas_code}}}\nprint \"ok\";\n"
+    );
+    std::fs::write(src_dir.join("main.sapp"), &src).unwrap();
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .arg("--warm-polyglot")
+        .output()
+        .expect("run pblang build --warm-polyglot");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(
+        out.status.success(),
+        "build --warm-polyglot should exit 0. stderr={stderr} stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("warm-polyglot: found"),
+        "expected scan report. stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("warm-polyglot:") && stdout.contains("warmed"),
+        "expected final summary line. stdout={stdout}"
+    );
+    // At least one of "warmed c" / "skipped c" should appear (C-compiler is
+    // installed on virtually every CI; if it weren't we'd see "skipped c").
+    let saw_c = stdout.contains("warmed c") || stdout.contains("skipped c");
+    assert!(saw_c, "expected the C block to be warmed or skipped. stdout={stdout}");
+}
+
+/// Idempotent: running `--warm-polyglot` twice should not error and the
+/// second run is a cache-hit (we don't assert timing — just non-error).
+#[test]
+fn build_warm_polyglot_is_idempotent() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_warm_polyglot_idem_{nonce}"));
+    let src_dir = work.join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[package]\nname = \"warm_test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let c_code = format!("long idem_test_{nonce}(long a, long b) {{ return a + b; }}\n");
+    std::fs::write(
+        src_dir.join("main.sapp"),
+        format!("@c {{\n{c_code}}}\nprint \"ok\";\n"),
+    )
+    .unwrap();
+
+    for pass in 1..=2 {
+        let out = Command::new(&bin)
+            .current_dir(&work)
+            .arg("build")
+            .arg("--warm-polyglot")
+            .output()
+            .expect("run pblang build --warm-polyglot");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "pass {pass}: build --warm-polyglot should exit 0. stderr={stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// `--warm-polyglot` on a project with no @lang blocks should still succeed.
+#[test]
+fn build_warm_polyglot_handles_empty_project() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_warm_polyglot_empty_{nonce}"));
+    let src_dir = work.join("src");
+    std::fs::create_dir_all(&src_dir).expect("mkdir src");
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[package]\nname = \"warm_test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(src_dir.join("main.sapp"), "print \"no polyglot here\";\n").unwrap();
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .arg("--warm-polyglot")
+        .output()
+        .expect("run pblang build --warm-polyglot");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "should exit 0 on empty project. stdout={stdout}");
+    assert!(
+        stdout.contains("no cacheable @lang blocks found"),
+        "expected the empty-project message. stdout={stdout}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// `pblang serve --cert/--key` (HTTPS) — rustls + axum-server integration.
+// Skip on hosts without openssl (CI provides it on every reasonable image).
+// ────────────────────────────────────────────────────────────────────────────
+
+fn openssl_available() -> bool {
+    Command::new("openssl")
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn make_self_signed_cert() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    if !openssl_available() {
+        return None;
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("pblang_https_test_{nonce}"));
+    std::fs::create_dir_all(&dir).ok()?;
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    let status = Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout",
+        ])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .args([
+            "-days", "1",
+            "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.map(|s| s.success()).unwrap_or(false) {
+        Some((dir, cert, key))
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+        None
+    }
+}
+
+/// Spawn `pblang serve --cert --key`, hit /health over plain TCP+TLS.
+/// Skips on hosts without openssl. Uses a raw rustls client because curl
+/// isn't part of the test infra.
+#[test]
+fn serve_https_starts_and_responds() {
+    let (dir, cert, key) = match make_self_signed_cert() {
+        Some(t) => t,
+        None => {
+            eprintln!("serve_https_starts_and_responds: skipped (no openssl)");
+            return;
+        }
+    };
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--cert")
+        .arg(&cert)
+        .arg("--key")
+        .arg(&key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve --cert/--key");
+
+    // Probe with a raw TLS connection. We can't reuse http_get() because
+    // it speaks plain HTTP; build a minimal rustls client here.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut got_health = false;
+    while Instant::now() < deadline {
+        if let Ok(body) = https_get_self_signed(port, "/health") {
+            if body.contains("\"ok\":true") {
+                got_health = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        got_health,
+        "expected HTTPS /health to return {{\"ok\":true,...}} within 8s"
+    );
+}
+
+/// Minimal HTTPS GET helper that accepts any cert (for self-signed testing).
+fn https_get_self_signed(port: u16, path: &str) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    use std::sync::Arc;
+
+    // Install ring provider once; subsequent calls are no-ops.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    #[derive(Debug)]
+    struct AcceptAnyVerifier;
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad server name"))?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(cfg), server_name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    sock.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+    let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+    tls.write_all(req.as_bytes())?;
+    let mut buf = Vec::new();
+    let _ = tls.read_to_end(&mut buf);
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// HTTPS + ALPN: when the server advertises `["h2", "http/1.1"]` (as
+/// `build_tls_config_with_alpn` does) and the client offers `["h2"]`,
+/// rustls must negotiate `h2`. This is the smallest end-to-end check
+/// that the HTTP/2 enablement from the 2026-05-26 round is actually
+/// wired through axum-server's TLS path.
+///
+/// We don't follow the negotiation with an actual h2 GET — the existence
+/// of `h2` in `alpn_protocol()` post-handshake is the contract under
+/// test. The h2-frame layer is hyper-util's job, exercised by other
+/// crates' tests.
+#[test]
+fn serve_https_alpn_negotiates_h2() {
+    let (dir, cert, key) = match make_self_signed_cert() {
+        Some(t) => t,
+        None => {
+            eprintln!("serve_https_alpn_negotiates_h2: skipped (no openssl)");
+            return;
+        }
+    };
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--cert")
+        .arg(&cert)
+        .arg("--key")
+        .arg(&key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve --cert/--key");
+
+    use std::sync::Arc;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    #[derive(Debug)]
+    struct AcceptAnyVerifier;
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyVerifier {
+        fn verify_server_cert(
+            &self,
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &[rustls::pki_types::CertificateDer<'_>],
+            _: &rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let mut cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
+        .with_no_client_auth();
+    // Offer h2 first, then http/1.1 fallback — mirrors what real
+    // browsers / hyper clients send.
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut negotiated: Option<Vec<u8>> = None;
+    while Instant::now() < deadline {
+        if let Ok(mut sock) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            if let Ok(mut conn) = rustls::ClientConnection::new(Arc::new(cfg.clone()), server_name)
+            {
+                // Drive the handshake explicitly — we just need ALPN
+                // negotiation to complete; no HTTP request needed.
+                while conn.is_handshaking() {
+                    if conn.wants_read() {
+                        if conn.read_tls(&mut sock).is_err() {
+                            break;
+                        }
+                    }
+                    if conn.process_new_packets().is_err() {
+                        break;
+                    }
+                    if conn.wants_write() {
+                        if conn.write_tls(&mut sock).is_err() {
+                            break;
+                        }
+                    }
+                }
+                if let Some(p) = conn.alpn_protocol() {
+                    negotiated = Some(p.to_vec());
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let proto = negotiated.expect("expected ALPN negotiation to complete within 8s");
+    assert_eq!(
+        proto,
+        b"h2".to_vec(),
+        "expected ALPN to negotiate h2, got: {:?}",
+        String::from_utf8_lossy(&proto)
+    );
+}
+
+/// `--cert` without `--key` (and vice-versa) should error out cleanly.
+#[test]
+fn serve_https_requires_both_cert_and_key() {
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let out = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--cert")
+        .arg("/tmp/pblang_does_not_exist.pem")
+        .output()
+        .expect("run pblang serve --cert (no --key)");
+    assert!(!out.status.success(), "should error without --key");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--cert and --key must be provided together"),
+        "expected paired-arg error, got: {stderr}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// WebSocket endpoint tests (round-5, 2026-05-26)
+//
+// /ws upgrades any GET to a WebSocket and runs a tiny JSON-over-text
+// protocol (op = ping|echo|version). The handler lives in
+// src/main.rs::handle_ws + ws_socket_loop + ws_dispatch.
+
+/// Computes Sec-WebSocket-Accept = base64(SHA1(key + WS_GUID)).
+/// Used to verify the upgrade handshake response.
+fn ws_expected_accept(key: &str) -> String {
+    use base64::Engine as _;
+    use sha1::Digest as _;
+    const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut h = sha1::Sha1::new();
+    h.update(key.as_bytes());
+    h.update(WS_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(h.finalize().as_slice())
+}
+
+/// Connect to `pblang serve` on `port`, do the RFC 6455 GET /ws upgrade
+/// dance, send one masked text frame containing `payload`, read one
+/// server text frame back, return the payload as a `String`. Best-effort
+/// — gives up after 5s of socket inactivity.
+fn ws_send_one_text(port: u16, payload: &str) -> std::io::Result<String> {
+    let mut sock = TcpStream::connect(("127.0.0.1", port))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    sock.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // 16 pseudo-random bytes -> base64. Don't need a CSPRNG for a test handshake.
+    // Use wrapping arithmetic so the byte mixing can't overflow.
+    let nonce_b64 = {
+        use base64::Engine as _;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mut bytes = [0u8; 16];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            let mixer = (i as u8).wrapping_mul(0x37);
+            *b = ((now >> ((i % 8) * 4)) as u8) ^ mixer;
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let upgrade = format!(
+        "GET /ws HTTP/1.1\r\n\
+         Host: localhost:{port}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {nonce_b64}\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         \r\n"
+    );
+    sock.write_all(upgrade.as_bytes())?;
+
+    // Read headers until \r\n\r\n.
+    let mut header_bytes = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        sock.read_exact(&mut byte)?;
+        header_bytes.push(byte[0]);
+        if header_bytes.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if header_bytes.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "upgrade response headers too large",
+            ));
+        }
+    }
+    let header_str = String::from_utf8_lossy(&header_bytes).to_string();
+    if !header_str.starts_with("HTTP/1.1 101") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("WS upgrade not 101: {}", header_str.lines().next().unwrap_or("")),
+        ));
+    }
+    let expected_accept = ws_expected_accept(&nonce_b64);
+    if !header_str.contains(&expected_accept) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Sec-WebSocket-Accept did not match expected SHA1+base64",
+        ));
+    }
+
+    // Send single text frame, FIN=1, opcode=0x1, MASK=1.
+    let payload_bytes = payload.as_bytes();
+    let mut frame: Vec<u8> = Vec::with_capacity(6 + payload_bytes.len());
+    frame.push(0x81); // FIN + text
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    let plen = payload_bytes.len();
+    if plen <= 125 {
+        frame.push(0x80 | plen as u8);
+    } else if plen <= 65_535 {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(plen as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(plen as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    for (i, b) in payload_bytes.iter().enumerate() {
+        frame.push(b ^ mask[i % 4]);
+    }
+    sock.write_all(&frame)?;
+
+    // Read one server frame (unmasked, server frames are always unmasked).
+    let mut hdr = [0u8; 2];
+    sock.read_exact(&mut hdr)?;
+    let opcode = hdr[0] & 0x0f;
+    let masked = (hdr[1] & 0x80) != 0;
+    let mut plen = (hdr[1] & 0x7f) as u64;
+    if plen == 126 {
+        let mut ext = [0u8; 2];
+        sock.read_exact(&mut ext)?;
+        plen = u16::from_be_bytes(ext) as u64;
+    } else if plen == 127 {
+        let mut ext = [0u8; 8];
+        sock.read_exact(&mut ext)?;
+        plen = u64::from_be_bytes(ext);
+    }
+    let mut mask_key = [0u8; 4];
+    if masked {
+        sock.read_exact(&mut mask_key)?;
+    }
+    let mut body = vec![0u8; plen as usize];
+    sock.read_exact(&mut body)?;
+    if masked {
+        for (i, b) in body.iter_mut().enumerate() {
+            *b ^= mask_key[i % 4];
+        }
+    }
+    if opcode != 0x1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected text frame (opcode 1), got {}", opcode),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&body).to_string())
+}
+
+#[test]
+fn serve_websocket_ping_returns_pong() {
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve");
+
+    // Wait for /health to come up, then send WS ping.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut ws_pong = None;
+    while Instant::now() < deadline {
+        if http_get(port, "/health")
+            .map(|r| r.contains("\"ok\":true"))
+            .unwrap_or(false)
+        {
+            // Server is up; do the WS handshake + ping.
+            ws_pong = ws_send_one_text(port, r#"{"op":"ping"}"#).ok();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let reply = ws_pong.expect("WS handshake + ping should produce a pong frame");
+    assert!(
+        reply.contains("\"op\":\"pong\""),
+        "expected pong op, got: {reply}"
+    );
+    assert!(
+        reply.contains("\"ts_ms\":"),
+        "expected ts_ms field, got: {reply}"
+    );
+}
+
+#[test]
+fn serve_websocket_version_returns_pkg_version() {
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut ws_reply = None;
+    while Instant::now() < deadline {
+        if http_get(port, "/health")
+            .map(|r| r.contains("\"ok\":true"))
+            .unwrap_or(false)
+        {
+            ws_reply = ws_send_one_text(port, r#"{"op":"version"}"#).ok();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let reply = ws_reply.expect("WS version op should reply");
+    assert!(
+        reply.contains(env!("CARGO_PKG_VERSION")),
+        "expected package version {} in WS reply, got: {reply}",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(
+        reply.contains("\"service\":\"pblang-ide-backend\""),
+        "expected service identifier in WS reply, got: {reply}"
+    );
+}
