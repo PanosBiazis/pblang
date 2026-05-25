@@ -233,6 +233,7 @@ pub enum StmtKind {
 ///  - Nested block comments `/* /* … */ */`
 ///  - Single-quoted and double-quoted strings (escape sequences aware)
 ///  - Newline preservation (so line-number spans remain stable)
+///
 /// Replace every comment byte with a space while leaving string literals,
 /// newlines, and all other byte offsets untouched. Used by the CLI and the
 /// parser front-end so spans computed against the masked source still line up

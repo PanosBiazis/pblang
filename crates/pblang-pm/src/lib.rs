@@ -465,8 +465,20 @@ pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Parse registry index JSON.
+/// Default cap on registry-index JSON payload size (10 MB). Bounds memory
+/// consumption when fetching from untrusted/networked registries.
+pub const MAX_REGISTRY_INDEX_BYTES: usize = 10 * 1024 * 1024;
+
+/// Parse registry index JSON. Bytes longer than `MAX_REGISTRY_INDEX_BYTES`
+/// are rejected before the parse to bound memory consumption.
 pub fn parse_registry_index(json: &[u8]) -> Result<RegistryIndex, String> {
+    if json.len() > MAX_REGISTRY_INDEX_BYTES {
+        return Err(format!(
+            "index JSON: payload of {} bytes exceeds cap of {} bytes",
+            json.len(),
+            MAX_REGISTRY_INDEX_BYTES
+        ));
+    }
     let root: serde_json::Value =
         serde_json::from_slice(json).map_err(|e| format!("index JSON: {e}"))?;
     let packages = root
@@ -1554,6 +1566,13 @@ pub fn search_registry(registry_url: &str, query: &str) -> Result<Vec<SearchResu
     );
     // Try fetching as a JSON array of {name, version, description}.
     let bytes = fetch_url(&url)?;
+    if bytes.len() > MAX_REGISTRY_INDEX_BYTES {
+        return Err(format!(
+            "search response: {} bytes exceeds cap of {} bytes",
+            bytes.len(),
+            MAX_REGISTRY_INDEX_BYTES
+        ));
+    }
     let val: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("search response JSON: {e}"))?;
     let arr = val.as_array().cloned().unwrap_or_else(|| {

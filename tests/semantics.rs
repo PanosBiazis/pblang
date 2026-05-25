@@ -1865,6 +1865,99 @@ fn polyglot_exec_python_pass() {
 }
 
 #[test]
+fn polyglot_native_pass() {
+    let cfg = pblang_vm::StdlibConfig {
+        exec: true,
+        ..pblang_vm::StdlibConfig::default()
+    };
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/polyglot_native_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read polyglot_native_test.sapp");
+    let out = run_collect_with_config(cfg, &src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "polyglot_native_pass",
+        "expected final print polyglot_native_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn polyglot_cached_pass() {
+    // Polyglot cdylib tests need exec + ffi capabilities. The default
+    // `StdlibConfig` denies both (secure default for embedded contexts),
+    // so we grant them explicitly here so the test actually exercises
+    // the compile_cached → ffi_call_typed roundtrip instead of silently
+    // hitting the "not available" skip branches.
+    let cfg = pblang_vm::StdlibConfig {
+        exec: true,
+        ffi: true,
+        ..pblang_vm::StdlibConfig::default()
+    };
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/polyglot_cached_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read polyglot_cached_test.sapp");
+    let out = run_collect_with_config(cfg, &src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "polyglot_cached_pass",
+        "expected final print polyglot_cached_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn polyglot_cdylib_per_lang_pass() {
+    let cfg = pblang_vm::StdlibConfig {
+        exec: true,
+        ffi: true,
+        ..pblang_vm::StdlibConfig::default()
+    };
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/polyglot_cdylib_per_lang_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read polyglot_cdylib_per_lang_test.sapp");
+    let out = run_collect_with_config(cfg, &src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "polyglot_cdylib_per_lang_pass",
+        "expected final print polyglot_cdylib_per_lang_pass, got: {:?}",
+        out
+    );
+    // Also assert that the harness actually saw something real (not all
+    // skipped). Find at least one "ok" line — proves the exec/ffi caps
+    // were granted and at least one toolchain was probed successfully.
+    let any_ok = out
+        .iter()
+        .any(|v| v.as_str().ok().map(|s| s.contains(": ok")).unwrap_or(false));
+    let any_compile_attempt = out
+        .iter()
+        .any(|v| v.as_str().ok().map(|s| s.contains("polyglot_cdylib_")).unwrap_or(false));
+    assert!(
+        any_compile_attempt,
+        "expected polyglot_cdylib_* trace lines in output, got: {:?}",
+        out
+    );
+    // any_ok may legitimately be false on a host with no compilers — but on
+    // CI we'd expect at least one toolchain to be present. Soft-warn rather
+    // than fail so dev boxes without C/rust still pass:
+    if !any_ok {
+        eprintln!(
+            "polyglot_cdylib_per_lang_pass: WARN no language ran ok — all toolchains were missing. \
+             That's legitimate on a stripped-down dev box but unexpected on CI."
+        );
+    }
+}
+
+#[test]
 fn selfhost_frontend_pass() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/semantics/selfhost_frontend_test.sapp");

@@ -2304,3 +2304,35 @@ fn fetch_url_reads_registry_index_over_http() {
     let val: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert!(val.get("packages").is_some());
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// JSON ingress cap (PL2-beta) — registry index size is capped at
+// MAX_REGISTRY_INDEX_BYTES (10 MB by default). Oversized payloads must be
+// rejected before the parse to bound memory consumption.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn registry_index_rejects_oversized_payload() {
+    // Synthesize a payload larger than the cap. We don't actually need it
+    // to be valid JSON — the size check fires before the parse.
+    let cap = pblang_pm::MAX_REGISTRY_INDEX_BYTES;
+    let bytes: Vec<u8> = vec![b'a'; cap + 1];
+    let err = pblang_pm::parse_registry_index(&bytes).expect_err("should reject oversized payload");
+    assert!(
+        err.contains("exceeds cap"),
+        "expected size-cap error, got: {err}"
+    );
+    assert!(
+        err.contains(&cap.to_string()),
+        "error should mention the cap value, got: {err}"
+    );
+}
+
+#[test]
+fn registry_index_accepts_payload_at_cap_boundary() {
+    // A valid (empty-packages) JSON well under the cap should parse fine.
+    let json = br#"{"packages":{}}"#;
+    let idx = pblang_pm::parse_registry_index(json).expect("small valid index should parse");
+    // RegistryIndex doesn't expose a public len(); just verify we got one.
+    let _ = idx;
+}

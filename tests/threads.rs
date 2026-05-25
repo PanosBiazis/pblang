@@ -54,6 +54,7 @@ fn spawned_vm_inherits_limits() {
         max_stack_depth: None,
         max_memory_bytes: None,
         io_timeout_ms: None,
+        max_external_json_bytes: None,
     };
     let result = run_collect_with_limits(
         limits,

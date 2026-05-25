@@ -194,6 +194,69 @@ remains capability-free. If you need per-VM env scratchpad semantics,
 use a `map{}` global or pass overrides through the `host.invoke_*` path
 instead.
 
+## Path-sandbox host contract
+
+The `fs` capability gates **which builtins** are callable
+(`fs_read`, `fs_write`, `fs_listdir`, …) — it **does not** gate **which
+paths** they may touch. When `fs: true`, the VM trusts whatever path the
+script supplies: there is no internal `..`-stripping, no chroot, no
+allowlist of permitted directories. `path_join` / `path_dirname` /
+`path_basename` are pure string operations on the path text. `fs_remove`
+will happily delete `/etc/passwd` if the host process has the OS
+permission to do so.
+
+> **The host is responsible for enforcing a path sandbox** when
+> `fs: true` is granted with broad filesystem permissions. The VM
+> guarantees only that no `fs_*` builtin runs while `fs: false`.
+
+This split is deliberate. It keeps the VM small and lets each embedder
+pick the right OS-level mechanism for its threat model. Recommended
+patterns, ranked by isolation strength:
+
+1. **OS sandbox (strongest).** Run the embedder inside `bubblewrap`,
+   `firejail`, `landlock`, `seccomp`, `chroot`, an unprivileged user
+   namespace, a Docker container with read-only mounts, or a Linux jail.
+   These intercept syscalls, so even an `fs_open("/etc/passwd")` from
+   within pblang can't escape.
+
+2. **Process drop-privileges + chroot.** Before calling `vm.run()`,
+   `chroot()` the host process into a scratch dir and `setuid()` to a
+   low-privilege user. The pblang VM inherits that view of the
+   filesystem; nothing outside the chroot is reachable.
+
+3. **Custom `VmHost` that wraps the fs builtins.** Provide a host that
+   intercepts `fs_*` calls at the trait boundary (or pre-validates paths
+   before delegating). See `Embedding.md` for the trait shape. This is
+   the right answer when you want allowlist semantics like "only `./data/**`
+   is writable" without an OS sandbox.
+
+4. **`fs: false` + explicit shim.** Keep `fs` denied; expose only the
+   narrow file operations the script actually needs through pblang
+   functions in your embedding (passed in as `Closure` values or
+   `VmHost::import_module`-resolved modules).
+
+The same logic applies, with different threat surfaces, to:
+
+* **`exec: true`** — `proc_spawn_wait(cmd, args)` will spawn any binary
+  the host process can execute. Either constrain `PATH`, use an OS
+  sandbox, or wrap the builtin via a custom `VmHost`.
+* **`http: true`** — `http_get`/`http_post` honour the system DNS resolver
+  and have no internal allowlist. To restrict outbound destinations, use
+  an outbound proxy or firewall.
+* **`net: true`** — `tcp_connect` is unrestricted. Same story.
+* **`ffi: true`** — `ffi_load("./lib.so")` will execute the library's
+  constructors **in the host process**, with the host process's full
+  privileges. `FfiPolicy::allow_all = false` plus an allowlist of vetted
+  libraries is the minimum bar; OS sandboxing is the belt-and-suspenders
+  layer.
+
+The TOCTOU window between path resolve and open is hardened at the VM
+level via `O_NOFOLLOW` on Unix (`read_text_file_with_race_check`), so a
+symlink swap mid-resolve is rejected with `ELOOP`. That covers the
+*resolve→open* race; it does **not** cover the larger question of
+"should the script be able to name this path in the first place" — that
+remains a host-contract responsibility.
+
 ## Audit checklist for embedders
 
 Before exposing a pblang VM to untrusted input, verify:
@@ -201,9 +264,14 @@ Before exposing a pblang VM to untrusted input, verify:
 * [ ] `StdlibConfig` is the minimum that lets the script do its job.
 * [ ] `VmLimits` are set, with all four fields populated.
 * [ ] If `ffi: true`, an `FfiPolicy` with `allow_all: false` is configured.
+* [ ] If `fs: true`, an **OS-level path sandbox** is in place (chroot,
+      bwrap, landlock, container, or a path-validating `VmHost`). See
+      "Path-sandbox host contract" above.
 * [ ] If `exec: true`, you've audited *which* binaries the script can spawn.
       (The deny convention is `<builtin_name> access denied`; check the
       message in `proc_spawn_wait_sandbox_denied` tests for the exact text.)
+* [ ] If `http: true` or `net: true`, you've decided whether outbound
+      connections need an egress proxy or firewall.
 * [ ] Errors from `vm.run()` are caught — never `unwrap()` in an embedding
       that processes untrusted input.
 
