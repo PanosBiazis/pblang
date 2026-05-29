@@ -121,6 +121,9 @@ pub extern "C" fn pblang_create_vm_sandboxed(
         exec: allow_exec != 0,
         gfx: false,
         spawn: true,
+        // Embedders that haven't opted into env reads shouldn't leak host secrets;
+        // tie it to the exec capability (the closest "host access" gate they set).
+        env: allow_exec != 0,
     };
     let w = VmWrapper {
         vm: VM::with_stdlib(config),

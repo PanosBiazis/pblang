@@ -209,6 +209,11 @@ pub fn parser<'src>(
 
     let ty_atom = choice((
         just("any").to(TypeKind::Any),
+        // `bigint`/`rational`/`decimal` must precede `number` etc. so they aren't
+        // shadowed; none is a prefix of another keyword.
+        just("bigint").to(TypeKind::BigInt),
+        just("rational").to(TypeKind::Rational),
+        just("decimal").to(TypeKind::Decimal),
         just("number").to(TypeKind::Number),
         just("bool").to(TypeKind::Bool),
         just("string").to(TypeKind::String),
@@ -406,20 +411,34 @@ pub fn parser<'src>(
         .map(StmtKind::Print)
         .map_with(mk_stmt_w);
 
-    let return_stmt = just("return")
-        .ignore_then(expr.clone().or_not())
+    // `return [<expr>];` — the optional return value must be separated
+    // from the keyword by whitespace. Without `ws1` between `return` and
+    // `expr`, `return -1;` parses as `return; -1;` because the expression
+    // parser doesn't engage on a leading `-` that's flush against the
+    // keyword. The `ws1` guard means `return;` (no value) still parses
+    // and `return -1;` correctly produces `Return(Some(-1))`.
+    // Use `text::keyword` so identifiers like `return_value` are not
+    // parsed as `return; _value;`. The `ws1.ignore_then(expr).or_not()`
+    // shape is kept so `return;` (no value) still parses and
+    // `return -1;` correctly produces `Return(Some(-1))`.
+    let return_stmt = text::keyword("return")
+        .ignore_then(ws1.ignore_then(expr.clone()).or_not())
         .map(StmtKind::Return)
         .map_with(mk_stmt_w)
         .padded();
 
-    // break; — exit nearest loop
-    let break_stmt = just("break")
+    // break; — exit nearest loop.
+    //
+    // Uses `text::keyword` (not `just`) so that identifiers like
+    // `break_at` are not parsed as `break` + `_at`. The same applies
+    // to `continue` and any other bare-keyword statement below.
+    let break_stmt = text::keyword("break")
         .map(|_| StmtKind::Break)
         .map_with(mk_stmt_w)
         .padded();
 
     // continue; — next iteration of nearest loop
-    let continue_stmt = just("continue")
+    let continue_stmt = text::keyword("continue")
         .map(|_| StmtKind::Continue)
         .map_with(mk_stmt_w)
         .padded();
@@ -885,7 +904,9 @@ pub fn parser<'src>(
         .map(|(((k, v), col), body)| StmtKind::ForInKV(k, v, col, body))
         .map_with(mk_stmt_w);
 
-    // for x in expr { body } — iterates array elements or map keys
+    // for x in expr { body }          — iterates array elements or map keys
+    // for i in START to END { body }   — inclusive integer range; desugars to
+    //                                    for i in range(START, END + 1) { body }
     let for_in_stmt = just("for")
         .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
@@ -893,11 +914,32 @@ pub fn parser<'src>(
         .then_ignore(just("in"))
         .then_ignore(ws1)
         .then(expr.clone())
+        .then(
+            text::keyword("to")
+                .padded()
+                .ignore_then(expr.clone())
+                .or_not(),
+        )
         .then(block_stmt.clone().map(|s| match s.kind {
             StmtKind::Block(body) => body,
             _ => unreachable!(),
         }))
-        .map(|((name, col), body)| StmtKind::ForIn(name, col, body))
+        .map(|(((name, start), maybe_end), body)| match maybe_end {
+            None => StmtKind::ForIn(name, start, body),
+            Some(end) => {
+                let sp = start.span.start..end.span.end;
+                let end_sp = end.span.start..end.span.end;
+                let one = mk_expr(ExprKind::Number(1.0), end_sp);
+                let end_inclusive =
+                    mk_expr(ExprKind::Add(Box::new(end), Box::new(one)), sp.clone());
+                let range_fn = mk_expr(ExprKind::Var("range".to_string()), sp.clone());
+                let range_call = mk_expr(
+                    ExprKind::Call(Box::new(range_fn), vec![start, end_inclusive]),
+                    sp,
+                );
+                StmtKind::ForIn(name, range_call, body)
+            }
+        })
         .map_with(mk_stmt_w);
 
     // for i N { body } — original counter loop
@@ -1168,6 +1210,171 @@ pub fn parser<'src>(
             }
         });
 
+    // struct declaration (typed-constructor sugar):
+    //   struct Point { x: number, y: number }
+    // Desugars to a typed constructor function `fn Point(x: number, y: number)`
+    // returning a tagged map `{ __struct: "Point", x, y }`. Because the
+    // constructor is a typed function, the type-checker validates construction
+    // calls (`Point(1, "two")` reports an argument-type mismatch) for free.
+    let struct_field = text::ident()
+        .map(|s: &str| s.to_string())
+        .padded()
+        .then_ignore(just(':').padded())
+        .then(ty.clone());
+
+    let struct_stmt = just("struct")
+        .then_ignore(ws1)
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .then_ignore(ws0)
+        .then(
+            struct_field
+                .separated_by(just(',').padded())
+                .allow_trailing()
+                .collect::<Vec<(String, TypeExpr)>>()
+                .delimited_by(just('{').padded(), just('}').padded()),
+        )
+        .map_with(|(name, fields), __e| {
+            let sp = Span::from(__e.span().into_range());
+            let params: Vec<Param> = fields
+                .iter()
+                .map(|(fname, fty)| Param {
+                    name: fname.clone(),
+                    ty: Some(fty.clone()),
+                    default: None,
+                    is_vararg: false,
+                })
+                .collect();
+            let mut entries: Vec<(String, Expr)> = Vec::with_capacity(fields.len() + 1);
+            entries.push((
+                "__struct".to_string(),
+                Expr { kind: ExprKind::Str(name.clone()), span: sp },
+            ));
+            for (fname, _) in &fields {
+                entries.push((
+                    fname.clone(),
+                    Expr { kind: ExprKind::Var(fname.clone()), span: sp },
+                ));
+            }
+            let ret_stmt = Stmt {
+                kind: StmtKind::Return(Some(Expr {
+                    kind: ExprKind::Map(entries),
+                    span: sp,
+                })),
+                span: sp,
+            };
+            Stmt {
+                kind: StmtKind::Fn(name, params, None, vec![ret_stmt]),
+                span: sp,
+            }
+        })
+        .boxed();
+
+    // enum declaration:
+    //   enum Color { Red, Green, Blue }
+    //   enum Shape { Circle(number), Rect(number, number) }
+    // Desugars to `let Name = map{ ... }`. Unit variants are tagged-map values
+    // (`Color.Red`); data variants are typed constructor functions
+    // (`Shape.Circle(5)`). Both carry `__enum`/`__variant`; data variants also
+    // carry a `values` array.
+    let enum_variant = text::ident()
+        .map(|s: &str| s.to_string())
+        .padded()
+        .then(
+            ty.clone()
+                .separated_by(just(',').padded())
+                .allow_trailing()
+                .collect::<Vec<TypeExpr>>()
+                .delimited_by(just('(').padded(), just(')').padded())
+                .or_not(),
+        );
+
+    let enum_stmt = just("enum")
+        .then_ignore(ws1)
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .then_ignore(ws0)
+        .then(
+            enum_variant
+                .separated_by(just(',').padded())
+                .allow_trailing()
+                .collect::<Vec<(String, Option<Vec<TypeExpr>>)>>()
+                .delimited_by(just('{').padded(), just('}').padded()),
+        )
+        .map_with(|(name, variants), __e| {
+            let sp = Span::from(__e.span().into_range());
+            let tag = |key: &str, val: String| {
+                (
+                    key.to_string(),
+                    Expr { kind: ExprKind::Str(val), span: sp },
+                )
+            };
+            let mut map_entries: Vec<(String, Expr)> = Vec::with_capacity(variants.len());
+            for (vname, payload) in &variants {
+                let entry = match payload {
+                    None => Expr {
+                        kind: ExprKind::Map(vec![
+                            tag("__enum", name.clone()),
+                            tag("__variant", vname.clone()),
+                        ]),
+                        span: sp,
+                    },
+                    Some(types) => {
+                        let params: Vec<Param> = types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| Param {
+                                name: format!("_{i}"),
+                                ty: Some(t.clone()),
+                                default: None,
+                                is_vararg: false,
+                            })
+                            .collect();
+                        let values_arr = Expr {
+                            kind: ExprKind::Array(
+                                (0..types.len())
+                                    .map(|i| Expr {
+                                        kind: ExprKind::Var(format!("_{i}")),
+                                        span: sp,
+                                    })
+                                    .collect(),
+                            ),
+                            span: sp,
+                        };
+                        let ret_map = Expr {
+                            kind: ExprKind::Map(vec![
+                                tag("__enum", name.clone()),
+                                tag("__variant", vname.clone()),
+                                ("values".to_string(), values_arr),
+                            ]),
+                            span: sp,
+                        };
+                        let ret_stmt = Stmt {
+                            kind: StmtKind::Return(Some(ret_map)),
+                            span: sp,
+                        };
+                        Expr {
+                            kind: ExprKind::FnLit(
+                                Some(format!("{name}_{vname}")),
+                                params,
+                                None,
+                                vec![ret_stmt],
+                            ),
+                            span: sp,
+                        }
+                    }
+                };
+                map_entries.push((vname.clone(), entry));
+            }
+            Stmt {
+                kind: StmtKind::Let(
+                    name,
+                    None,
+                    Expr { kind: ExprKind::Map(map_entries), span: sp },
+                ),
+                span: sp,
+            }
+        })
+        .boxed();
+
     // goto statement (structured, no VM architecture change):
     //
     // goto {
@@ -1287,7 +1494,7 @@ pub fn parser<'src>(
         .map(|(((k, v), col), body)| StmtKind::ForInKV(k, v, col, body))
         .map_with(mk_stmt_w);
 
-    // g_for_in_stmt: for x in expr { body } inside goto context
+    // g_for_in_stmt: for x in expr { body } / for i in A to B { body } inside goto context
     let g_for_in_stmt = just("for")
         .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()))
@@ -1295,8 +1502,29 @@ pub fn parser<'src>(
         .then_ignore(just("in"))
         .then_ignore(ws1)
         .then(expr.clone())
+        .then(
+            text::keyword("to")
+                .padded()
+                .ignore_then(expr.clone())
+                .or_not(),
+        )
         .then(gblock_body.clone())
-        .map(|((name, col), body)| StmtKind::ForIn(name, col, body))
+        .map(|(((name, start), maybe_end), body)| match maybe_end {
+            None => StmtKind::ForIn(name, start, body),
+            Some(end) => {
+                let sp = start.span.start..end.span.end;
+                let end_sp = end.span.start..end.span.end;
+                let one = mk_expr(ExprKind::Number(1.0), end_sp);
+                let end_inclusive =
+                    mk_expr(ExprKind::Add(Box::new(end), Box::new(one)), sp.clone());
+                let range_fn = mk_expr(ExprKind::Var("range".to_string()), sp.clone());
+                let range_call = mk_expr(
+                    ExprKind::Call(Box::new(range_fn), vec![start, end_inclusive]),
+                    sp,
+                );
+                StmtKind::ForIn(name, range_call, body)
+            }
+        })
         .map_with(mk_stmt_w);
 
     let g_for_stmt = just("for")
@@ -1573,6 +1801,8 @@ pub fn parser<'src>(
         import_stmt,
         export_stmt,
         class_stmt,
+        struct_stmt,
+        enum_stmt,
         goto_block_stmt,
     ));
 
@@ -1705,15 +1935,16 @@ pub fn parser<'src>(
     ))
     .padded();
 
-    // Guarded match arms use `~` (canonical) or `#` (legacy) as the body
-    // separator. `ws0_guard` absorbs the separator and any surrounding
-    // whitespace in one step. See `guard_expr` (declared near the top of
-    // `parser()` and defined just below `cmp_expr`) for the restricted
-    // sub-parser that lets the chain stop cleanly before `~`.
+    // Guarded match arms accept `:` (consistent with unguarded arms), or
+    // `~`/`#` as the body separator. `ws0_guard` absorbs the separator and any
+    // surrounding whitespace in one step. See `guard_expr` (declared near the
+    // top of `parser()` and defined just below `cmp_expr`) for the restricted
+    // sub-parser that lets the chain stop cleanly before the separator.
     //
-    // Syntax: `case IDENT if GUARD ~ BODY;`  (~ is the canonical separator)
-    //         `case IDENT if GUARD # BODY;`  (# is legacy, kept for compat)
-    let ws0_guard = one_of(" \t\r\n~#").repeated().ignored();
+    // Syntax: `case IDENT if GUARD : BODY;`  (`:` — preferred, matches unguarded arms)
+    //         `case IDENT if GUARD ~ BODY;`  (`~` — also accepted)
+    //         `case IDENT if GUARD # BODY;`  (`#` — legacy, kept for compat)
+    let ws0_guard = one_of(" \t\r\n~#:").repeated().ignored();
 
     // Guarded arm: `case ident if guard_expr ~ body`
     //
@@ -1929,6 +2160,8 @@ pub fn parser<'src>(
         Call(Vec<Expr>, Span),
         Attr(String, Span),
         Index(Expr, Span),
+        /// `[start? .. end?]` — half-open slice; either bound may be omitted.
+        Slice(Option<Expr>, Option<Expr>, Span),
         Method(String, Vec<Expr>, Span),
         /// `?.field` — nil-safe attribute access
         SafeAttr(String, Span),
@@ -1998,13 +2231,29 @@ pub fn parser<'src>(
         .map_with(|e, __e| { let sp = __e.span().into_range(); Postfix::Index(e, Span::from(sp)) })
         .padded();
 
+    // `[start? .. end?]` — slice. Must be tried before `index` so `[a..b]`
+    // isn't mis-parsed as a plain index of `a` (which then chokes on `..`).
+    let slice_index = expr
+        .clone()
+        .or_not()
+        .then_ignore(just("..").padded())
+        .then(expr.clone().or_not())
+        .delimited_by(just('['), just(']'))
+        .map_with(|(start, end), __e| {
+            let sp = __e.span().into_range();
+            Postfix::Slice(start, end, Span::from(sp))
+        })
+        .padded();
+
     // postfix: calls, indexing, member access, safe access, result-unwrap (left-to-right)
     // Order matters:
+    //   - slice_index must precede index (both open with `[`)
     //   - safe_attr/safe_index must precede result_unwrap_pf (both start with `?`)
     //   - null_coal_pf (??) must precede result_unwrap_pf (single ?) to avoid eating first ?
     let postfix = choice((
         call,
         method,
+        slice_index,
         index,
         safe_attr,
         safe_index,
@@ -2033,6 +2282,22 @@ pub fn parser<'src>(
                 };
                 Expr {
                     kind: ExprKind::Index(Box::new(left), Box::new(ix)),
+                    span: sp,
+                }
+            }
+            Postfix::Slice(start, end, s_sp) => {
+                // seq[a..b] desugars to slice(seq, a, b); an omitted bound
+                // becomes nil (the slice builtin reads nil as 0 / len).
+                let sp = Span {
+                    start: left.span.start,
+                    end: s_sp.end,
+                };
+                let nil_range = s_sp.start..s_sp.end;
+                let start_e = start.unwrap_or_else(|| mk_expr(ExprKind::Nil, nil_range.clone()));
+                let end_e = end.unwrap_or_else(|| mk_expr(ExprKind::Nil, nil_range.clone()));
+                let slice_fn = mk_expr(ExprKind::Var("slice".to_string()), nil_range.clone());
+                Expr {
+                    kind: ExprKind::Call(Box::new(slice_fn), vec![left, start_e, end_e]),
                     span: sp,
                 }
             }
@@ -2335,15 +2600,56 @@ pub fn parser<'src>(
             }
         });
 
+    // Pipeline: `x |> f`, `x |> f(a, b)`, `x |> f(a, _, b)`.
+    // Left-associative and looser than logical ops, so `a and b |> f` is
+    // `(a and b) |> f` and `x |> f |> g` is `g(f(x))`. The piped value is
+    // injected at the first `_` placeholder in the target call's arguments;
+    // with no placeholder it is prepended as the first argument (Elixir-style).
+    // A bare target `x |> f` becomes `f(x)`.
+    let pipe_expr = logical_expr.clone().foldl(
+        just("|>").padded().ignore_then(logical_expr.clone()).repeated(),
+        |left: Expr, right: Expr| {
+            let sp = Span::join(left.span, right.span);
+            match right.kind {
+                ExprKind::Call(callee, args) => {
+                    let mut new_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+                    let mut injected = false;
+                    for a in args {
+                        if !injected
+                            && matches!(&a.kind, ExprKind::Var(n) if n == "_")
+                        {
+                            new_args.push(left.clone());
+                            injected = true;
+                        } else {
+                            new_args.push(a);
+                        }
+                    }
+                    if !injected {
+                        new_args.insert(0, left.clone());
+                    }
+                    Expr {
+                        kind: ExprKind::Call(callee, new_args),
+                        span: sp,
+                    }
+                }
+                _ => Expr {
+                    kind: ExprKind::Call(Box::new(right), vec![left]),
+                    span: sp,
+                },
+            }
+        },
+    )
+    .boxed();
+
     // Ternary: `cond ? then : else` (desugars to IfExpr with block arms).
-    let expr_top = logical_expr
+    let expr_top = pipe_expr
         .clone()
         .then(
             just('?')
                 .padded()
-                .ignore_then(logical_expr.clone())
+                .ignore_then(pipe_expr.clone())
                 .then_ignore(just(':').padded())
-                .then(logical_expr.clone())
+                .then(pipe_expr.clone())
                 .map(|(then_e, else_e)| (then_e, else_e))
                 .or_not(),
         )

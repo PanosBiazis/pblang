@@ -31,6 +31,79 @@ use super::{alloc_array, alloc_map};
 // Scalar f64 ops
 // -------------------------------------------------------------------------
 
+/// `bigint(x)` — opt-in arbitrary-precision integer constructor.
+///
+/// Accepts a number (must be integral), a decimal string (lossless for values
+/// beyond f64's exact range, e.g. `bigint("12345678901234567890")`), or an
+/// existing bigint (identity). This is how the programmer chooses the
+/// highest-precision integer type when they want it; ordinary number literals
+/// stay unboxed f64 for speed.
+pub(super) fn bigint(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(host.err(format!("bigint() expects 1 argument, got {}", args.len())));
+    }
+    match &args[0] {
+        Value::Number(f) => pblang_ir::bigint_from_f64(*f).map_err(|m| host.err(m)),
+        Value::Obj(o) => match o.as_ref() {
+            pblang_ir::Obj::String(s) => pblang_ir::bigint_from_str(s).map_err(|m| host.err(m)),
+            pblang_ir::Obj::BigInt(_) => Ok(args[0].clone()),
+            pblang_ir::Obj::Rational(_) | pblang_ir::Obj::Decimal(_) => Err(host.err(
+                "bigint(): cannot convert a rational/decimal (it may be fractional)".into(),
+            )),
+        },
+        _ => Err(host.err("bigint(): expected a number or decimal string".into())),
+    }
+}
+
+/// `rational(x)` / `rational(num, den)` — opt-in exact rational constructor.
+///
+/// One arg: a number (its exact binary value), a string (`"1/3"`, `"0.1"` → 1/10
+/// exactly, or an integer), or an existing bigint/rational. Two args: an exact
+/// `num/den` fraction. This is the highest-precision type for non-integers; `1/3`
+/// is exact, never a rounded float. A rational reducing to an integer normalizes
+/// to a bigint.
+pub(super) fn rational(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    match args.len() {
+        1 => match &args[0] {
+            Value::Number(f) => pblang_ir::rational_from_f64(*f).map_err(|m| host.err(m)),
+            Value::Obj(o) => match o.as_ref() {
+                pblang_ir::Obj::String(s) => {
+                    pblang_ir::rational_from_str(s).map_err(|m| host.err(m))
+                }
+                // bigint/rational are already exact.
+                pblang_ir::Obj::BigInt(_) | pblang_ir::Obj::Rational(_) => Ok(args[0].clone()),
+                // a decimal is exactly a base-10 fraction → convert to rational.
+                pblang_ir::Obj::Decimal(d) => {
+                    pblang_ir::rational_from_str(&d.to_string()).map_err(|m| host.err(m))
+                }
+            },
+            _ => Err(host.err("rational(): expected a number or string".into())),
+        },
+        2 => {
+            let num = args[0]
+                .as_bigint_exact()
+                .ok_or_else(|| host.err("rational(): numerator must be an integer".into()))?;
+            let den = args[1]
+                .as_bigint_exact()
+                .ok_or_else(|| host.err("rational(): denominator must be an integer".into()))?;
+            pblang_ir::rational_from_parts(num, den).map_err(|m| host.err(m))
+        }
+        n => Err(host.err(format!("rational() expects 1 or 2 arguments, got {n}"))),
+    }
+}
+
+/// `decimal(x)` — opt-in arbitrary-precision base-10 decimal constructor.
+///
+/// From a string (`"3.14"`, `"0.1"`), a number (its shortest base-10 form), or a
+/// bigint/rational/decimal. Sums/products are exact; division rounds to a fixed
+/// scale — the money/display-friendly counterpart to the exact-fraction rational.
+pub(super) fn decimal(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(host.err(format!("decimal() expects 1 argument, got {}", args.len())));
+    }
+    pblang_ir::decimal_from_value(&args[0]).map_err(|m| host.err(m))
+}
+
 pub(super) fn num_sqrt(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!("num_sqrt() expects 1 argument, got {}", args.len())));
@@ -45,6 +118,13 @@ pub(super) fn num_sqrt(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
 pub(super) fn num_pow(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 2 {
         return Err(host.err(format!("num_pow() expects 2 arguments, got {}", args.len())));
+    }
+    // `**` desugars to num_pow; route through Value::arith so a bigint/rational
+    // base (e.g. `bigint(2) ** 100`, `rational("1/2") ** -2`) computes exactly.
+    if args[0].is_bigint() || args[0].is_rational() || args[0].is_decimal() || args[1].is_bigint() {
+        return args[0]
+            .arith(&args[1], pblang_ir::ArithOp::Pow)
+            .map_err(|m| host.err(m));
     }
     let a = match args[0] {
         Value::Number(n) => n,
@@ -100,6 +180,16 @@ pub(super) fn num_atan2(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
 pub(super) fn num_mod(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 2 {
         return Err(host.err(format!("num_mod() expects 2 arguments, got {}", args.len())));
+    }
+    // `%` desugars to num_mod; route bigint/rational operands through exact
+    // arithmetic (rationals report a clear "modulo not defined" error).
+    if [&args[0], &args[1]]
+        .iter()
+        .any(|a| a.is_bigint() || a.is_rational() || a.is_decimal())
+    {
+        return args[0]
+            .arith(&args[1], pblang_ir::ArithOp::Mod)
+            .map_err(|m| host.err(m));
     }
     let a = match args[0] {
         Value::Number(n) => n,

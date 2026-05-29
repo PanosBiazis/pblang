@@ -40,6 +40,42 @@ pub(super) fn base64_encode(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
     )))
 }
 
+/// `base64_encode_bytes(arr)` → string: base64 of a raw byte array (0..255).
+///
+/// Companion to `base64_decode_bytes`. Use this to serialize binary payloads
+/// (XOR ciphertext, nonces, hashes) that are not valid UTF-8 and therefore
+/// cannot pass through the string-based `base64_encode`.
+pub(super) fn base64_encode_bytes(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(host.err(format!(
+            "base64_encode_bytes() expects 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err(host.err("base64_encode_bytes(): expected a byte array".into())),
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(arr.borrow().len());
+    for v in arr.borrow().iter() {
+        match v {
+            Value::Number(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 => {
+                bytes.push(*n as u8);
+            }
+            _ => {
+                return Err(host.err("base64_encode_bytes(): expected byte numbers 0..255".into()))
+            }
+        }
+    }
+    Ok(alloc_string(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &bytes,
+    )))
+}
+
 pub(super) fn base64_decode(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(

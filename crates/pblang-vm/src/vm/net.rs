@@ -32,6 +32,7 @@ use rustls::{
 
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
+use super::errors::vm_cap;
 use super::handles::{value_to_handle, with_net_table, NET_NEXT};
 use super::{NetResource, NetStream, StreamKind};
 
@@ -47,7 +48,7 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 pub(super) fn tcp_listen(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_listen", "net"));
     }
     if args.len() != 1 {
         return Err(host.err(format!(
@@ -69,7 +70,7 @@ pub(super) fn tcp_listen(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
 
 pub(super) fn tcp_accept(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_accept", "net"));
     }
     if args.len() != 1 {
         return Err(host.err(format!(
@@ -144,7 +145,7 @@ pub(super) fn tcp_accept(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
 
 pub(super) fn tcp_read(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_read", "net"));
     }
     if args.len() != 2 {
         return Err(host.err(format!(
@@ -197,7 +198,7 @@ pub(super) fn tcp_read_until(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_read_until", "net"));
     }
     if args.len() != 3 {
         return Err(host.err(format!(
@@ -256,7 +257,7 @@ pub(super) fn tcp_read_until(
 
 pub(super) fn tcp_write(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_write", "net"));
     }
     if args.len() != 2 {
         return Err(host.err(format!(
@@ -289,7 +290,7 @@ pub(super) fn tcp_write(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
 
 pub(super) fn tcp_close(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_close", "net"));
     }
     if args.len() != 1 {
         return Err(host.err(format!(
@@ -307,7 +308,7 @@ pub(super) fn tcp_local_addr(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_local_addr", "net"));
     }
     if args.len() != 1 {
         return Err(host.err(format!(
@@ -353,7 +354,7 @@ pub(super) fn tcp_listen_tls(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_listen_tls", "net"));
     }
     if args.len() != 3 {
         return Err(host.err(format!(
@@ -416,7 +417,7 @@ pub(super) fn tcp_connect_tls(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_connect_tls", "net"));
     }
     if args.len() != 2 {
         return Err(host.err(format!(
@@ -484,7 +485,7 @@ pub(super) fn tcp_connect_tls(
 /// same handle id).
 pub(super) fn tcp_wrap_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "tcp_wrap_tls", "net"));
     }
     if args.len() != 3 {
         return Err(host.err(format!(

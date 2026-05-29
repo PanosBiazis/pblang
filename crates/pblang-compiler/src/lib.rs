@@ -102,11 +102,16 @@ struct Compiler {
     enclosing: Option<Box<Compiler>>,
 
     /// Loop context stack for break/continue.
-    /// Each entry: (continue_target_ip, locals_count_at_entry, break_patch_ips)
-    /// - continue_target: jump to here for `continue`
+    /// Each entry: (continue_target_ip, locals_count_at_entry, break_patch_ips, continue_patch_ips)
+    /// - continue_target: jump to here for `continue`. `usize::MAX` is a sentinel
+    ///   meaning "the continue target isn't known yet" — used by the index loops
+    ///   (For/ForIn/ForInKV) whose `continue` must land on the index-increment
+    ///   step that is emitted *after* the body. Those continues are forward-patched
+    ///   via `continue_patch_ips`. While/Loop use a real backward target (loop_start).
     /// - locals_at_entry: len(locals) when loop started (for scope cleanup on break)
     /// - break_patch_ips: OpJump(0) placeholders to patch with loop-exit IP
-    loop_ctx: Vec<(usize, usize, Vec<usize>)>,
+    /// - continue_patch_ips: OpJump(0) placeholders to patch with the increment IP
+    loop_ctx: Vec<(usize, usize, Vec<usize>, Vec<usize>)>,
 
     /// Deferred error - set when a semantic error is detected, checked after each statement.
     error: Option<CompileError>,
@@ -589,13 +594,16 @@ impl Compiler {
                     self.chunk
                         .write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
                 } else {
-                    // local: declare first (uninitialized)
-                    self.declare_local(name, sp);
-                    // then compile initializer; it leaves 1 value on stack
+                    // local: compile the initializer FIRST, then declare the
+                    // local over the value it leaves on the stack. Declaring
+                    // first would shadow an outer/param binding of the same
+                    // name with a not-yet-initialized slot, so `let n = f(n)`
+                    // resolved `n` to a global and failed. Emitting first lets
+                    // the initializer see the outer binding (clox semantics).
                     self.emit_expr(init);
-                    // now the local slot is considered initialized
+                    self.declare_local(name, sp);
+                    // the local slot is now the value the initializer produced
                     self.mark_initialized();
-                    // no opcode needed: the value is the local's stack slot
                 }
             }
 
@@ -610,9 +618,10 @@ impl Compiler {
                     self.chunk
                         .write(OpCode::OpDefineGlobal(name_idx), vspan(sp));
                 } else {
-                    // Local const: mark as const so Assign() will error
-                    self.declare_const(name, sp);
+                    // Local const: compile initializer first (see Let above),
+                    // then declare so it can shadow an outer binding correctly.
                     self.emit_expr(init);
+                    self.declare_const(name, sp);
                     self.mark_initialized();
                 }
             }
@@ -731,8 +740,10 @@ impl Compiler {
             StmtKind::While(cond, body) => {
                 let loop_start = self.ip();
 
-                // Push loop context for break/continue
-                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+                // Push loop context for break/continue. While's continue target
+                // is loop_start (re-evaluate the condition), which is correct.
+                self.loop_ctx
+                    .push((loop_start, self.locals.len(), vec![], vec![]));
 
                 self.emit_expr(cond);
                 let jmp_exit_pos = self.emit(OpCode::OpJumpIfFalse(0), sp);
@@ -753,7 +764,7 @@ impl Compiler {
                 let break_exit_ip = self.ip(); // break lands here (AFTER false-cond pop)
 
                 // Patch all break jumps (they skip the false-cond pop)
-                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                if let Some((_, _, break_patches, _)) = self.loop_ctx.pop() {
                     for bp in break_patches {
                         self.patch(bp, OpCode::OpJump(break_exit_ip));
                     }
@@ -778,8 +789,11 @@ impl Compiler {
 
                 let loop_start = self.ip();
 
-                // Push loop context for break/continue
-                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+                // Push loop context for break/continue. `continue` must land on
+                // the index-increment step (emitted after the body), so the
+                // continue target is forward-patched (usize::MAX sentinel).
+                self.loop_ctx
+                    .push((usize::MAX, self.locals.len(), vec![], vec![]));
 
                 // cond: __i < __bound
                 self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
@@ -804,7 +818,8 @@ impl Compiler {
 
                 self.end_scope(); // pops/closes `name` (OpCloseUpvalue if captured)
 
-                // __i = __i + 1
+                // continue lands here: __i = __i + 1
+                let continue_ip = self.ip();
                 self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
                 let one = self.chunk.add_const(Value::Number(1.0));
                 self.chunk.write(OpCode::OpConstant(one), vspan(sp));
@@ -820,10 +835,13 @@ impl Compiler {
                 self.chunk.write(OpCode::OpPop, vspan(sp)); // pop cond (false branch)
                 let break_exit_ip = self.ip(); // break lands here (AFTER false-cond pop)
 
-                // Patch all break jumps
-                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                // Patch all break and continue jumps
+                if let Some((_, _, break_patches, continue_patches)) = self.loop_ctx.pop() {
                     for bp in break_patches {
                         self.patch(bp, OpCode::OpJump(break_exit_ip));
+                    }
+                    for cp in continue_patches {
+                        self.patch(cp, OpCode::OpJump(continue_ip));
                     }
                 }
 
@@ -863,8 +881,11 @@ impl Compiler {
 
                 let loop_start = self.ip();
 
-                // Push loop context for break/continue (ForIn)
-                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+                // Push loop context for break/continue (ForIn). `continue` lands
+                // on the index-increment step emitted after the body, so it is
+                // forward-patched (usize::MAX sentinel).
+                self.loop_ctx
+                    .push((usize::MAX, self.locals.len(), vec![], vec![]));
 
                 // cond: __i < __len
                 self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
@@ -887,7 +908,8 @@ impl Compiler {
                 }
                 self.end_scope(); // pops `name`
 
-                // __i = __i + 1
+                // continue lands here: __i = __i + 1
+                let continue_ip = self.ip();
                 self.chunk.write(OpCode::OpGetLocal(i_slot), vspan(sp));
                 let one = self.chunk.add_const(Value::Number(1.0));
                 self.chunk.write(OpCode::OpConstant(one), vspan(sp));
@@ -903,10 +925,13 @@ impl Compiler {
                 self.chunk.write(OpCode::OpPop, vspan(sp)); // pop false cond
                 let break_exit_ip = self.ip();
 
-                // Patch all break jumps
-                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                // Patch all break and continue jumps
+                if let Some((_, _, break_patches, continue_patches)) = self.loop_ctx.pop() {
                     for bp in break_patches {
                         self.patch(bp, OpCode::OpJump(break_exit_ip));
+                    }
+                    for cp in continue_patches {
+                        self.patch(cp, OpCode::OpJump(continue_ip));
                     }
                 }
 
@@ -955,8 +980,10 @@ impl Compiler {
 
                 let loop_start = self.ip();
 
-                // Push loop context for break/continue (ForInKV)
-                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+                // Push loop context for break/continue (ForInKV). `continue`
+                // lands on the index-increment step, so it is forward-patched.
+                self.loop_ctx
+                    .push((usize::MAX, self.locals.len(), vec![], vec![]));
 
                 // cond: __i < __len
                 self.chunk.write(OpCode::OpGetLocal(i2_slot), vspan(sp));
@@ -988,7 +1015,8 @@ impl Compiler {
                 }
                 self.end_scope(); // pops k, v
 
-                // __i = __i + 1
+                // continue lands here: __i = __i + 1
+                let continue_ip_kv = self.ip();
                 self.chunk.write(OpCode::OpGetLocal(i2_slot), vspan(sp));
                 let one = self.chunk.add_const(Value::Number(1.0));
                 self.chunk.write(OpCode::OpConstant(one), vspan(sp));
@@ -1005,8 +1033,11 @@ impl Compiler {
 
                 let break_exit_ip_kv = self.ip();
 
-                // Patch all break jumps (ForInKV)
-                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                // Patch all break and continue jumps (ForInKV)
+                if let Some((_, _, break_patches, continue_patches)) = self.loop_ctx.pop() {
+                    for cp in continue_patches {
+                        self.patch(cp, OpCode::OpJump(continue_ip_kv));
+                    }
                     for bp in break_patches {
                         self.patch(bp, OpCode::OpJump(break_exit_ip_kv));
                     }
@@ -1018,7 +1049,7 @@ impl Compiler {
             // break; — emit jump to loop exit (patched after loop completes)
             StmtKind::Break => {
                 // Pop locals introduced inside the loop before jumping out
-                let locals_to_pop = if let Some(&(_, locals_at, _)) = self.loop_ctx.last() {
+                let locals_to_pop = if let Some(&(_, locals_at, _, _)) = self.loop_ctx.last() {
                     self.locals.len().saturating_sub(locals_at)
                 } else {
                     0
@@ -1028,20 +1059,54 @@ impl Compiler {
                 }
                 let bp = self.chunk.instructions.len();
                 self.chunk.write(OpCode::OpJump(0), vspan(sp)); // placeholder
-                if let Some((_, _, patches)) = self.loop_ctx.last_mut() {
+                if let Some((_, _, patches, _)) = self.loop_ctx.last_mut() {
                     patches.push(bp);
                 }
             }
 
-            // continue; — jump back to loop start
+            // continue; — advance to the next loop iteration.
+            //
+            // Must pop every local declared inside the loop body before
+            // jumping; otherwise those locals leak onto the stack across
+            // iterations and the compile-time slot tracker reads stale
+            // values from the prior iteration. Matches the break-codegen
+            // pop loop above. Without this, `let pos = i + N` after a
+            // `continue` returns the previous iteration's `pos`.
+            //
+            // The jump target depends on loop shape: While/Loop have a real
+            // backward target (loop_start, re-evaluating the condition). The
+            // index loops (For/ForIn/ForInKV) use the `usize::MAX` sentinel —
+            // their continue must land on the index-increment step emitted
+            // *after* the body, so we forward-patch via continue_patch_ips.
+            // Jumping to loop_start there would skip the increment and spin
+            // forever.
             StmtKind::Continue => {
-                if let Some((cont_ip, _, _)) = self.loop_ctx.last() {
-                    let target = *cont_ip;
-                    self.chunk.write(OpCode::OpJump(target), vspan(sp));
+                let locals_to_pop = if let Some(&(_, locals_at, _, _)) = self.loop_ctx.last() {
+                    self.locals.len().saturating_sub(locals_at)
                 } else {
-                    // continue outside loop: emit a no-op jump to self
-                    let here = self.chunk.instructions.len();
-                    self.chunk.write(OpCode::OpJump(here + 1), vspan(sp));
+                    0
+                };
+                for _ in 0..locals_to_pop {
+                    self.chunk.write(OpCode::OpPop, vspan(sp));
+                }
+                match self.loop_ctx.last().map(|(t, _, _, _)| *t) {
+                    Some(target) if target != usize::MAX => {
+                        // While/Loop: jump back to the condition/loop start.
+                        self.chunk.write(OpCode::OpJump(target), vspan(sp));
+                    }
+                    Some(_) => {
+                        // Index loop: forward-patch to the increment step.
+                        let pos = self.chunk.instructions.len();
+                        self.chunk.write(OpCode::OpJump(0), vspan(sp)); // placeholder
+                        if let Some((_, _, _, continue_patches)) = self.loop_ctx.last_mut() {
+                            continue_patches.push(pos);
+                        }
+                    }
+                    None => {
+                        // continue outside loop: emit a no-op jump to self
+                        let here = self.chunk.instructions.len();
+                        self.chunk.write(OpCode::OpJump(here + 1), vspan(sp));
+                    }
                 }
             }
 
@@ -1056,7 +1121,8 @@ impl Compiler {
                 let loop_start = self.ip();
 
                 // Push loop context: continue goes back to loop_start, break patches will be collected
-                self.loop_ctx.push((loop_start, self.locals.len(), vec![]));
+                self.loop_ctx
+                    .push((loop_start, self.locals.len(), vec![], vec![]));
 
                 self.begin_scope();
                 for st in body {
@@ -1069,7 +1135,7 @@ impl Compiler {
 
                 // patch all break jumps
                 let exit_ip = self.ip();
-                if let Some((_, _, break_patches)) = self.loop_ctx.pop() {
+                if let Some((_, _, break_patches, _)) = self.loop_ctx.pop() {
                     for bp in break_patches {
                         self.patch(bp, OpCode::OpJump(exit_ip));
                     }
@@ -1503,48 +1569,51 @@ impl Compiler {
                 self.chunk.write(OpCode::OpConstant(k), vspan(sp));
             }
 
-            ExprKind::Add(a, b) => {
-                if let (ExprKind::Number(x), ExprKind::Number(y)) = (a.kind.clone(), b.kind.clone())
-                {
-                    let k = self.chunk.add_const(Value::Number(x + y));
-                    self.chunk.write(OpCode::OpConstant(k), vspan(sp));
-                } else {
-                    self.emit_expr(*a);
-                    self.emit_expr(*b);
-                    self.chunk.write(OpCode::OpAdd, vspan(sp));
+            // Left-associative arithmetic chains are flattened iteratively so a
+            // very long flat chain (`1+1+1+…`, which the lexical nesting guard
+            // can't see — it has no brackets) compiles without O(depth) native
+            // recursion that would overflow the stack. Two prior O(n²)/overflow
+            // traps are gone: (1) the old per-node `(a.kind.clone(), b.kind.clone())`
+            // const-fold guard deep-cloned the whole left subtree at every level;
+            // (2) recursing down the left spine. The emitted bytecode is identical
+            // to the old recursive path, and the peephole pass in `optimize_chunk`
+            // still constant-folds literal pairs. Right operands use the normal
+            // recursive path — safe, since a deep *right* spine needs parentheses
+            // (`1+(1+(1+…)))`) and is already rejected by the bracket-depth guard.
+            kind @ (ExprKind::Add(..)
+            | ExprKind::Sub(..)
+            | ExprKind::Mul(..)
+            | ExprKind::Div(..)) => {
+                fn arith_op(k: &ExprKind) -> Option<OpCode> {
+                    match k {
+                        ExprKind::Add(..) => Some(OpCode::OpAdd),
+                        ExprKind::Sub(..) => Some(OpCode::OpSub),
+                        ExprKind::Mul(..) => Some(OpCode::OpMul),
+                        ExprKind::Div(..) => Some(OpCode::OpDiv),
+                        _ => None,
+                    }
                 }
-            }
-            ExprKind::Sub(a, b) => {
-                if let (ExprKind::Number(x), ExprKind::Number(y)) = (a.kind.clone(), b.kind.clone())
-                {
-                    let k = self.chunk.add_const(Value::Number(x - y));
-                    self.chunk.write(OpCode::OpConstant(k), vspan(sp));
-                } else {
-                    self.emit_expr(*a);
-                    self.emit_expr(*b);
-                    self.chunk.write(OpCode::OpSub, vspan(sp));
+                // Descend the left spine, recording (op, right_operand, op_span)
+                // outermost-first; `cur` ends at the deepest-left leaf.
+                let mut spine: Vec<(OpCode, Expr, Span)> = Vec::new();
+                let mut cur = Expr { kind, span: sp };
+                while let Some(op) = arith_op(&cur.kind) {
+                    let cur_span = cur.span;
+                    let (a, b) = match cur.kind {
+                        ExprKind::Add(a, b)
+                        | ExprKind::Sub(a, b)
+                        | ExprKind::Mul(a, b)
+                        | ExprKind::Div(a, b) => (a, b),
+                        _ => unreachable!("arith_op gated this match"),
+                    };
+                    spine.push((op, *b, cur_span));
+                    cur = *a;
                 }
-            }
-            ExprKind::Mul(a, b) => {
-                if let (ExprKind::Number(x), ExprKind::Number(y)) = (a.kind.clone(), b.kind.clone())
-                {
-                    let k = self.chunk.add_const(Value::Number(x * y));
-                    self.chunk.write(OpCode::OpConstant(k), vspan(sp));
-                } else {
-                    self.emit_expr(*a);
-                    self.emit_expr(*b);
-                    self.chunk.write(OpCode::OpMul, vspan(sp));
-                }
-            }
-            ExprKind::Div(a, b) => {
-                if let (ExprKind::Number(x), ExprKind::Number(y)) = (a.kind.clone(), b.kind.clone())
-                {
-                    let k = self.chunk.add_const(Value::Number(x / y));
-                    self.chunk.write(OpCode::OpConstant(k), vspan(sp));
-                } else {
-                    self.emit_expr(*a);
-                    self.emit_expr(*b);
-                    self.chunk.write(OpCode::OpDiv, vspan(sp));
+                self.emit_expr(cur);
+                // Replay innermost-first: emit each right operand then its op.
+                while let Some((op, right, opsp)) = spine.pop() {
+                    self.emit_expr(right);
+                    self.chunk.write(op, vspan(opsp));
                 }
             }
 
@@ -1872,6 +1941,9 @@ pub fn disasm(chunk: &Chunk) -> String {
             Value::Nil => "nil".into(),
             Value::Obj(o) => match o.as_ref() {
                 pblang_ir::Obj::String(s) => format!("{:?}", s.as_str()),
+                pblang_ir::Obj::BigInt(n) => format!("{n}n"),
+                pblang_ir::Obj::Rational(r) => format!("{r}"),
+                pblang_ir::Obj::Decimal(d) => format!("{d}"),
             },
             Value::Array(_) => "<array>".into(),
             Value::Map(_) => "<map>".into(),

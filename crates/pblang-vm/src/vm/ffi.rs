@@ -33,13 +33,14 @@ use libloading::Library;
 
 use pblang_ir::{RuntimeError, Value, VmHost};
 
+use super::errors::vm_cap;
 use super::ffi_dispatch::{dispatch_ffi, parse_ffi_sig};
 use super::handles::{value_to_handle, with_ffi_table, FFI_NEXT};
 use super::FfiResource;
 
 pub(super) fn ffi_load(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_ffi() {
-        return Err(host.err("ffi access denied".into()));
+        return Err(vm_cap!(host, "ffi_load", "ffi"));
     }
     if args.len() != 1 {
         return Err(host.err(format!(
@@ -73,7 +74,7 @@ pub(super) fn ffi_load(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
 
 pub(super) fn ffi_close(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_ffi() {
-        return Err(host.err("ffi access denied".into()));
+        return Err(vm_cap!(host, "ffi_close", "ffi"));
     }
     if args.len() != 1 {
         return Err(host.err(format!(
@@ -88,7 +89,7 @@ pub(super) fn ffi_close(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
 
 pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_ffi() {
-        return Err(host.err("ffi access denied".into()));
+        return Err(vm_cap!(host, "ffi_call", "ffi"));
     }
     // ffi_call(handle, "symbol", [args...]) -> number (f64)
     if args.len() != 3 {
@@ -227,7 +228,7 @@ pub(super) fn ffi_call_typed_builtin(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_ffi() {
-        return Err(host.err("ffi access denied".into()));
+        return Err(vm_cap!(host, "ffi_call_typed", "ffi"));
     }
     if args.len() != 4 {
         return Err(host.err(format!(

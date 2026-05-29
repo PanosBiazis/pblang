@@ -57,6 +57,11 @@ pub(super) fn value_to_json(v: &Value) -> Result<sj::Value, String> {
             .unwrap_or(sj::Value::Null),
         Value::Obj(o) => match o.as_ref() {
             Obj::String(s) => sj::Value::String(s.clone()),
+            // JSON numbers can't hold arbitrary precision, so emit a bigint as
+            // its exact decimal string and a rational as its "n/d" string.
+            Obj::BigInt(n) => sj::Value::String(n.to_string()),
+            Obj::Rational(r) => sj::Value::String(r.to_string()),
+            Obj::Decimal(d) => sj::Value::String(d.to_string()),
         },
         Value::Array(a) => {
             let a = a.borrow();

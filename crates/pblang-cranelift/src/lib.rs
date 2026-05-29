@@ -875,6 +875,7 @@ fn build_cranelift_fn(
                 let fn_name = match chunk.constants.get(*const_idx) {
                     Some(PblangValue::Obj(obj)) => match obj.as_ref() {
                         pblang_ir::Obj::String(s) => Some(s.clone()),
+                        _ => None,
                     },
                     _ => None,
                 };
