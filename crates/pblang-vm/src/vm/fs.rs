@@ -24,6 +24,7 @@ use std::time::Duration;
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
 use super::alloc_array;
+use super::errors::{vm_arity, vm_cap, vm_err};
 
 pub(super) fn to_sapp_path(p: &std::path::Path) -> String {
     p.to_string_lossy().replace('\\', "/")
@@ -31,14 +32,14 @@ pub(super) fn to_sapp_path(p: &std::path::Path) -> String {
 
 pub(super) fn fs_read(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_read", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!("fs_read() expects 1 argument, got {}", args.len())));
+        return Err(vm_arity!(host, "fs_read", 1, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_read(): {m}")))?
+        .map_err(|m| vm_err!(host, "fs_read", "{m}"))?
         .to_string();
     let s = if let Some(ms) = host.io_timeout_ms() {
         let (tx, rx) = mpsc::channel();
@@ -46,31 +47,28 @@ pub(super) fn fs_read(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, 
             let _ = tx.send(std::fs::read_to_string(&path));
         });
         rx.recv_timeout(Duration::from_millis(ms))
-            .map_err(|_| host.err("fs_read(): timeout".into()))?
-            .map_err(|e| host.err(format!("fs_read(): {e}")))?
+            .map_err(|_| vm_err!(host, "fs_read", "timeout"))?
+            .map_err(|e| vm_err!(host, "fs_read", "{e}"))?
     } else {
-        std::fs::read_to_string(&path).map_err(|e| host.err(format!("fs_read(): {e}")))?
+        std::fs::read_to_string(&path).map_err(|e| vm_err!(host, "fs_read", "{e}"))?
     };
     Ok(alloc_string(s))
 }
 
 pub(super) fn fs_write(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_write", "fs"));
     }
     if args.len() != 2 {
-        return Err(host.err(format!(
-            "fs_write() expects 2 arguments, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_write", 2, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_write(): {m}")))?
+        .map_err(|m| vm_err!(host, "fs_write", "{m}"))?
         .to_string();
     let contents = args[1]
         .as_str()
-        .map_err(|m| host.err(format!("fs_write(): {m}")))?
+        .map_err(|m| vm_err!(host, "fs_write", "{m}"))?
         .to_string();
     if let Some(ms) = host.io_timeout_ms() {
         let (tx, rx) = mpsc::channel();
@@ -78,113 +76,100 @@ pub(super) fn fs_write(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
             let _ = tx.send(std::fs::write(&path, &contents));
         });
         rx.recv_timeout(Duration::from_millis(ms))
-            .map_err(|_| host.err("fs_write(): timeout".into()))?
-            .map_err(|e| host.err(format!("fs_write(): {e}")))?
+            .map_err(|_| vm_err!(host, "fs_write", "timeout"))?
+            .map_err(|e| vm_err!(host, "fs_write", "{e}"))?
     } else {
-        std::fs::write(&path, &contents)
-            .map_err(|e| host.err(format!("fs_write(): {e}")))?
+        std::fs::write(&path, &contents).map_err(|e| vm_err!(host, "fs_write", "{e}"))?
     };
     Ok(Value::Nil)
 }
 
 pub(super) fn fs_append(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_append", "fs"));
     }
     if args.len() != 2 {
-        return Err(host.err(format!(
-            "fs_append() expects 2 arguments, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_append", 2, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_append(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_append", "{m}"))?;
     let contents = args[1]
         .as_str()
-        .map_err(|m| host.err(format!("fs_append(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_append", "{m}"))?;
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| host.err(format!("fs_append(): {e}")))?;
+        .map_err(|e| vm_err!(host, "fs_append", "{e}"))?;
     f.write_all(contents.as_bytes())
-        .map_err(|e| host.err(format!("fs_append(): {e}")))?;
+        .map_err(|e| vm_err!(host, "fs_append", "{e}"))?;
     Ok(Value::Nil)
 }
 
 pub(super) fn fs_remove(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_remove", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "fs_remove() expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_remove", 1, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_remove(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_remove", "{m}"))?;
     // try file, then dir
     if std::fs::remove_file(path).is_ok() {
         return Ok(Value::Nil);
     }
-    std::fs::remove_dir_all(path).map_err(|e| host.err(format!("fs_remove(): {e}")))?;
+    std::fs::remove_dir_all(path).map_err(|e| vm_err!(host, "fs_remove", "{e}"))?;
     Ok(Value::Nil)
 }
 
 pub(super) fn fs_rename(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_rename", "fs"));
     }
     if args.len() != 2 {
-        return Err(host.err(format!(
-            "fs_rename() expects 2 arguments, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_rename", 2, args.len()));
     }
     let from = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_rename(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_rename", "{m}"))?;
     let to = args[1]
         .as_str()
-        .map_err(|m| host.err(format!("fs_rename(): {m}")))?;
-    std::fs::rename(from, to).map_err(|e| host.err(format!("fs_rename(): {e}")))?;
+        .map_err(|m| vm_err!(host, "fs_rename", "{m}"))?;
+    std::fs::rename(from, to).map_err(|e| vm_err!(host, "fs_rename", "{e}"))?;
     Ok(Value::Nil)
 }
 
 pub(super) fn fs_copy(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_copy", "fs"));
     }
     if args.len() != 2 {
-        return Err(host.err(format!("fs_copy() expects 2 arguments, got {}", args.len())));
+        return Err(vm_arity!(host, "fs_copy", 2, args.len()));
     }
     let from = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_copy(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_copy", "{m}"))?;
     let to = args[1]
         .as_str()
-        .map_err(|m| host.err(format!("fs_copy(): {m}")))?;
-    std::fs::copy(from, to).map_err(|e| host.err(format!("fs_copy(): {e}")))?;
+        .map_err(|m| vm_err!(host, "fs_copy", "{m}"))?;
+    std::fs::copy(from, to).map_err(|e| vm_err!(host, "fs_copy", "{e}"))?;
     Ok(Value::Nil)
 }
 
 pub(super) fn fs_read_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_read_bytes", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "fs_read_bytes() expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_read_bytes", 1, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_read_bytes(): {m}")))?
+        .map_err(|m| vm_err!(host, "fs_read_bytes", "{m}"))?
         .to_string();
     let bytes = if let Some(ms) = host.io_timeout_ms() {
         let (tx, rx) = mpsc::channel();
@@ -192,10 +177,10 @@ pub(super) fn fs_read_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
             let _ = tx.send(std::fs::read(&path));
         });
         rx.recv_timeout(Duration::from_millis(ms))
-            .map_err(|_| host.err("fs_read_bytes(): timeout".into()))?
-            .map_err(|e| host.err(format!("fs_read_bytes(): {e}")))?
+            .map_err(|_| vm_err!(host, "fs_read_bytes", "timeout"))?
+            .map_err(|e| vm_err!(host, "fs_read_bytes", "{e}"))?
     } else {
-        std::fs::read(&path).map_err(|e| host.err(format!("fs_read_bytes(): {e}")))?
+        std::fs::read(&path).map_err(|e| vm_err!(host, "fs_read_bytes", "{e}"))?
     };
     let mut out: Vec<Value> = Vec::with_capacity(bytes.len());
     for b in bytes {
@@ -206,20 +191,17 @@ pub(super) fn fs_read_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
 
 pub(super) fn fs_write_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_write_bytes", "fs"));
     }
     if args.len() != 2 {
-        return Err(host.err(format!(
-            "fs_write_bytes() expects 2 arguments, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_write_bytes", 2, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_write_bytes(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_write_bytes", "{m}"))?;
     let arr = match &args[1] {
         Value::Array(a) => a.clone(),
-        _ => return Err(host.err("fs_write_bytes(): expected byte array".into())),
+        _ => return Err(vm_err!(host, "fs_write_bytes", "expected byte array")),
     };
     let mut bytes: Vec<u8> = Vec::with_capacity(arr.borrow().len());
     for v in arr.borrow().iter() {
@@ -230,9 +212,11 @@ pub(super) fn fs_write_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<
                 bytes.push(*n as u8);
             }
             _ => {
-                return Err(
-                    host.err("fs_write_bytes(): expected byte numbers 0..255".into())
-                )
+                return Err(vm_err!(
+                    host,
+                    "fs_write_bytes",
+                    "expected byte numbers 0..255"
+                ))
             }
         }
     }
@@ -243,11 +227,10 @@ pub(super) fn fs_write_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<
             let _ = tx.send(std::fs::write(&path, &bytes));
         });
         rx.recv_timeout(Duration::from_millis(ms))
-            .map_err(|_| host.err("fs_write_bytes(): timeout".into()))?
-            .map_err(|e| host.err(format!("fs_write_bytes(): {e}")))?
+            .map_err(|_| vm_err!(host, "fs_write_bytes", "timeout"))?
+            .map_err(|e| vm_err!(host, "fs_write_bytes", "{e}"))?
     } else {
-        std::fs::write(&path, &bytes)
-            .map_err(|e| host.err(format!("fs_write_bytes(): {e}")))?
+        std::fs::write(&path, &bytes).map_err(|e| vm_err!(host, "fs_write_bytes", "{e}"))?
     };
     Ok(Value::Nil)
 }
@@ -255,65 +238,56 @@ pub(super) fn fs_write_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<
 
 pub(super) fn cwd(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "cwd", "fs"));
     }
     if !args.is_empty() {
         return Err(host.err(format!("cwd() takes no arguments, got {}", args.len())));
     }
-    let p = std::env::current_dir().map_err(|e| host.err(format!("cwd(): {e}")))?;
+    let p = std::env::current_dir().map_err(|e| vm_err!(host, "cwd", "{e}"))?;
     Ok(alloc_string(to_sapp_path(&p)))
 }
 
 pub(super) fn fs_exists(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_exists", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "fs_exists() expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_exists", 1, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_exists(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_exists", "{m}"))?;
     Ok(Value::Bool(std::path::Path::new(path).exists()))
 }
 
 pub(super) fn fs_mkdirs(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_mkdirs", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "fs_mkdirs() expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_mkdirs", 1, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_mkdirs(): {m}")))?;
-    std::fs::create_dir_all(path).map_err(|e| host.err(format!("fs_mkdirs(): {e}")))?;
+        .map_err(|m| vm_err!(host, "fs_mkdirs", "{m}"))?;
+    std::fs::create_dir_all(path).map_err(|e| vm_err!(host, "fs_mkdirs", "{e}"))?;
     Ok(Value::Nil)
 }
 
 pub(super) fn fs_listdir(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "fs_listdir", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "fs_listdir() expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "fs_listdir", 1, args.len()));
     }
     let path = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("fs_listdir(): {m}")))?;
+        .map_err(|m| vm_err!(host, "fs_listdir", "{m}"))?;
     let mut names = vec![];
-    let rd = std::fs::read_dir(path).map_err(|e| host.err(format!("fs_listdir(): {e}")))?;
+    let rd = std::fs::read_dir(path).map_err(|e| vm_err!(host, "fs_listdir", "{e}"))?;
     for ent in rd {
-        let ent = ent.map_err(|e| host.err(format!("fs_listdir(): {e}")))?;
+        let ent = ent.map_err(|e| vm_err!(host, "fs_listdir", "{e}"))?;
         let name = ent.file_name().to_string_lossy().to_string();
         names.push(alloc_string(name));
     }
@@ -324,7 +298,7 @@ pub(super) fn fs_listdir(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
 
 pub(super) fn path_join(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "path_join", "fs"));
     }
     if args.len() < 2 {
         return Err(host.err(format!(
@@ -336,7 +310,7 @@ pub(super) fn path_join(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
     for a in args {
         let s = a
             .as_str()
-            .map_err(|m| host.err(format!("path_join(): {m}")))?;
+            .map_err(|m| vm_err!(host, "path_join", "{m}"))?;
         pb.push(s);
     }
     Ok(alloc_string(to_sapp_path(&pb)))
@@ -344,17 +318,14 @@ pub(super) fn path_join(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
 
 pub(super) fn path_dirname(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "path_dirname", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "path_dirname() expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "path_dirname", 1, args.len()));
     }
     let s = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("path_dirname(): {m}")))?;
+        .map_err(|m| vm_err!(host, "path_dirname", "{m}"))?;
     let p = std::path::Path::new(s);
     let out = p
         .parent()
@@ -365,17 +336,14 @@ pub(super) fn path_dirname(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
 
 pub(super) fn path_basename(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
-        return Err(host.err("fs access denied".into()));
+        return Err(vm_cap!(host, "path_basename", "fs"));
     }
     if args.len() != 1 {
-        return Err(host.err(format!(
-            "path_basename() expects 1 argument, got {}",
-            args.len()
-        )));
+        return Err(vm_arity!(host, "path_basename", 1, args.len()));
     }
     let s = args[0]
         .as_str()
-        .map_err(|m| host.err(format!("path_basename(): {m}")))?;
+        .map_err(|m| vm_err!(host, "path_basename", "{m}"))?;
     let p = std::path::Path::new(s);
     let out = p
         .file_name()

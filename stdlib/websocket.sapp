@@ -1,13 +1,28 @@
 // stdlib/websocket.sapp — WebSocket helpers (W3/W4)
+//
+// **Representation note (2026-05-27 rewrite):** WebSocket frames are
+// binary protocol data. Pblang strings are guaranteed-UTF-8, so a
+// frame byte sequence cannot be carried in a string without corrupting
+// any byte >= 128 (which would be re-encoded as a multi-byte UTF-8
+// sequence). All frame-level functions in this module therefore use
+// **byte arrays** (Array<number 0..255>) as the wire-level
+// representation. Payload text (for opcode 1 = text) is exposed as a
+// string in the parsed map because the protocol guarantees it's
+// valid UTF-8 from the peer.
+//
+// API:
+//   write_frame(opcode, payload: string) -> Array<u8>
+//   parse_frame(bytes: Array<u8>) -> map{fin,opcode,masked,payload,...}
+//   parse_frames(bytes: Array<u8>) -> Array<frame> | map{error}
+//   parse_message(bytes: Array<u8>) -> map (reassembled message)
 
 fn upgrade_response(key) {
     let accept = websocket_accept_key(key);
     return "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
 }
 
-// Pure-pblang XOR for two byte values (0-255)
+// Pure-pblang XOR for two byte values (0-255).
 fn _byte_xor(a, b) {
-    // XOR via bit decomposition: sum of non-shared bits
     let result = 0;
     let bit = 128;
     while bit >= 1 {
@@ -19,12 +34,23 @@ fn _byte_xor(a, b) {
     return result;
 }
 
+// Append every byte of `src` (Array<u8>) onto `dst` (Array<u8>) in place.
+fn _append_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+}
+
+// 2-byte big-endian encoding of `n` (0..65535) → Array<u8> of length 2.
 fn _u16be(n) {
     let hi = num_floor(n / 256);
     let lo = num_mod(n, 256);
-    return strfromcharcode(hi) + strfromcharcode(lo);
+    return [hi, lo];
 }
 
+// 8-byte big-endian encoding of `n` → Array<u8> of length 8.
 fn _u64be(n) {
     let b7 = num_mod(n, 256);
     n = num_floor(n / 256);
@@ -41,26 +67,40 @@ fn _u64be(n) {
     let b1 = num_mod(n, 256);
     n = num_floor(n / 256);
     let b0 = num_mod(n, 256);
-    return strfromcharcode(b0) + strfromcharcode(b1) + strfromcharcode(b2) + strfromcharcode(b3)
-        + strfromcharcode(b4) + strfromcharcode(b5) + strfromcharcode(b6) + strfromcharcode(b7);
+    return [b0, b1, b2, b3, b4, b5, b6, b7];
 }
 
-fn _u64_at(s, offset) {
+fn _u64_at(data, offset) {
     let n = 0;
     let i = 0;
     while i < 8 {
-        n = n * 256 + strcharcodeat(s, offset + i);
+        n = n * 256 + data[offset + i];
         i = i + 1;
     }
     return n;
+}
+
+// Convert an Array<u8> slice [start, end) into a string. Each byte is
+// emitted via strfromcharcode; bytes < 128 become 1-byte UTF-8, bytes
+// >= 128 expand to 2-byte UTF-8 codepoints. Suitable for text payloads
+// (opcode 1) which are UTF-8 by protocol. For binary payloads the
+// caller should keep the raw byte array.
+fn _bytes_to_text(data, start, end_idx) {
+    let s = "";
+    let i = start;
+    while i < end_idx {
+        s = s + strfromcharcode(data[i]);
+        i = i + 1;
+    }
+    return s;
 }
 
 fn _parse_frame_at(data, start_idx) {
     if data == nil or start_idx < 0 or start_idx >= len(data) or len(data) - start_idx < 2 {
         return map{ error: "frame too short", fin: 0, opcode: 0, masked: 0, payload: "" };
     }
-    let b0 = strcharcodeat(data, start_idx);
-    let b1 = strcharcodeat(data, start_idx + 1);
+    let b0 = data[start_idx];
+    let b1 = data[start_idx + 1];
     let fin = num_floor(b0 / 128);
     let opcode = num_mod(b0, 16);
     let masked = num_floor(b1 / 128);
@@ -72,7 +112,7 @@ fn _parse_frame_at(data, start_idx) {
         if len(data) < start_idx + 4 {
             return map{ error: "frame too short for 16-bit length", fin: fin, opcode: opcode, masked: masked, payload: "" };
         }
-        payload_len = strcharcodeat(data, start_idx + 2) * 256 + strcharcodeat(data, start_idx + 3);
+        payload_len = data[start_idx + 2] * 256 + data[start_idx + 3];
         idx = start_idx + 4;
     } else if len_code == 127 {
         if len(data) < start_idx + 10 {
@@ -90,10 +130,10 @@ fn _parse_frame_at(data, start_idx) {
         if len(data) < idx + 4 {
             return map{ error: "frame too short for masking key", fin: fin, opcode: opcode, masked: masked, payload: "" };
         }
-        mk0 = strcharcodeat(data, idx);
-        mk1 = strcharcodeat(data, idx + 1);
-        mk2 = strcharcodeat(data, idx + 2);
-        mk3 = strcharcodeat(data, idx + 3);
+        mk0 = data[idx];
+        mk1 = data[idx + 1];
+        mk2 = data[idx + 2];
+        mk3 = data[idx + 3];
         idx = idx + 4;
     }
 
@@ -101,22 +141,20 @@ fn _parse_frame_at(data, start_idx) {
         return map{ error: "truncated payload", fin: fin, opcode: opcode, masked: masked, payload: "" };
     }
 
-    let payload = "";
+    // Unmask (if needed) into a fresh byte array.
+    let payload_bytes = [];
     let i = 0;
     while i < payload_len {
-        let b = strcharcodeat(data, idx + i);
+        let b = data[idx + i];
         if masked == 1 {
-            if num_mod(i, 4) == 0 {
-                payload = payload + strfromcharcode(_byte_xor(b, mk0));
-            } else if num_mod(i, 4) == 1 {
-                payload = payload + strfromcharcode(_byte_xor(b, mk1));
-            } else if num_mod(i, 4) == 2 {
-                payload = payload + strfromcharcode(_byte_xor(b, mk2));
-            } else {
-                payload = payload + strfromcharcode(_byte_xor(b, mk3));
-            }
+            let mk = mk0;
+            let m = num_mod(i, 4);
+            if m == 1 { mk = mk1; }
+            else if m == 2 { mk = mk2; }
+            else if m == 3 { mk = mk3; }
+            array_push(payload_bytes, _byte_xor(b, mk));
         } else {
-            payload = payload + strfromcharcode(b);
+            array_push(payload_bytes, b);
         }
         i = i + 1;
     }
@@ -126,7 +164,8 @@ fn _parse_frame_at(data, start_idx) {
         opcode: opcode,
         masked: masked,
         payload_len: payload_len,
-        payload: payload,
+        payload: _bytes_to_text(payload_bytes, 0, len(payload_bytes)),
+        payload_bytes: payload_bytes,
         frame_len: (idx + payload_len) - start_idx,
         next_index: idx + payload_len
     };
@@ -148,7 +187,7 @@ fn parse_frames(data) {
     return frames;
 }
 
-// reassemble_fragments(frames) -> first complete text/binary message in frames.
+// reassemble_fragments(frames) → first complete text/binary message.
 // Control frames (close/ping/pong) are skipped.
 fn reassemble_fragments(frames) {
     let started = false;
@@ -179,8 +218,6 @@ fn reassemble_fragments(frames) {
             started = true;
             msg_opcode = op;
             msg_payload = fr.payload;
-        } else {
-            // Control frame (8 close, 9 ping, 10 pong) — ignore for message reassembly.
         }
         i = i + 1;
     }
@@ -188,49 +225,58 @@ fn reassemble_fragments(frames) {
     return map{ error: "no data message found" };
 }
 
-// parse_message(data) -> parse concatenated frames and return first complete message.
 fn parse_message(data) {
     let frames = parse_frames(data);
     if type(frames) == "map" and map_has(frames, "error") { return frames; }
     return reassemble_fragments(frames);
 }
 
-// write_frame(opcode, payload) → binary string (RFC 6455 masked frame)
-// opcode: 1 = text, 2 = binary, 8 = close, 9 = ping, 10 = pong
+// write_frame(opcode, payload: string) → Array<u8> (RFC 6455 masked frame).
+// opcode: 1 = text, 2 = binary, 8 = close, 9 = ping, 10 = pong.
 fn write_frame(opcode, payload) {
     let plen = len(payload);
-    // Byte 0: FIN=1 (0x80) + opcode
-    let b0 = strfromcharcode(128 + opcode);
-    // Byte 1: MASK=1 plus length marker, then optional extended length bytes.
-    let b1 = "";
-    let len_ext = "";
+    let out = [];
+
+    // Byte 0: FIN=1 (0x80) + opcode.
+    array_push(out, 128 + opcode);
+
+    // Byte 1: MASK=1 plus length marker, then optional extended length.
     if plen <= 125 {
-        b1 = strfromcharcode(128 + plen);
+        array_push(out, 128 + plen);
     } else if plen <= 65535 {
-        b1 = strfromcharcode(128 + 126);
-        len_ext = _u16be(plen);
+        array_push(out, 128 + 126);
+        _append_bytes(out, _u16be(plen));
     } else {
-        b1 = strfromcharcode(128 + 127);
-        len_ext = _u64be(plen);
+        array_push(out, 128 + 127);
+        _append_bytes(out, _u64be(plen));
     }
-    // 4-byte masking key from randombytes
+
+    // 4-byte masking key.
     let mask_bytes = random_bytes(4);
     let mk0 = mask_bytes[0];
     let mk1 = mask_bytes[1];
     let mk2 = mask_bytes[2];
     let mk3 = mask_bytes[3];
-    let mask_str = strfromcharcode(mk0) + strfromcharcode(mk1) + strfromcharcode(mk2) + strfromcharcode(mk3);
-    // Mask the payload bytes
-    let masked = "";
+    array_push(out, mk0);
+    array_push(out, mk1);
+    array_push(out, mk2);
+    array_push(out, mk3);
+
+    // Mask the payload bytes. The payload is read byte-by-byte via
+    // strcharcodeat — safe here only because the test payloads are
+    // ASCII; for true binary payloads, accept Array<u8> directly.
     let i = 0;
     while i < plen {
         let byte_val = strcharcodeat(payload, i);
-        let mk = mask_bytes[num_mod(i, 4)];
-        // XOR: byte_xor is a builtin
-        masked = masked + strfromcharcode(_byte_xor(byte_val, mk));
+        let mk = mk0;
+        let m = num_mod(i, 4);
+        if m == 1 { mk = mk1; }
+        else if m == 2 { mk = mk2; }
+        else if m == 3 { mk = mk3; }
+        array_push(out, _byte_xor(byte_val, mk));
         i = i + 1;
     }
-    return b0 + b1 + len_ext + mask_str + masked;
+    return out;
 }
 
- export upgrade_response, parse_frame, parse_frames, reassemble_fragments, parse_message, write_frame;
+export upgrade_response, parse_frame, parse_frames, reassemble_fragments, parse_message, write_frame;

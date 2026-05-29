@@ -77,9 +77,15 @@ pub(super) fn array_sort(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
                 (Value::Obj(a), Value::Obj(b)) => {
                     let sa = match a.as_ref() {
                         pblang_ir::Obj::String(s) => s.clone(),
+                        pblang_ir::Obj::BigInt(n) => n.to_string(),
+                        pblang_ir::Obj::Rational(r) => r.to_string(),
+                        pblang_ir::Obj::Decimal(d) => d.to_string(),
                     };
                     let sb = match b.as_ref() {
                         pblang_ir::Obj::String(s) => s.clone(),
+                        pblang_ir::Obj::BigInt(n) => n.to_string(),
+                        pblang_ir::Obj::Rational(r) => r.to_string(),
+                        pblang_ir::Obj::Decimal(d) => d.to_string(),
                     };
                     sa.cmp(&sb)
                 }

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
+use super::errors::vm_cap;
 use super::{alloc_array, alloc_map, VM};
 
 pub(super) fn os_args_builtin(
@@ -166,7 +167,7 @@ pub(super) fn os_which_builtin(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "os_which", "exec"));
     }
     if args.len() != 1 {
         return Err(host.err(format!("os_which() expects 1 argument, got {}", args.len())));

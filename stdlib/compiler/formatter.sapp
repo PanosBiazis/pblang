@@ -1,0 +1,421 @@
+// stdlib/compiler/formatter.sapp — Phase 0 self-hosted formatter
+//
+// PARTIAL port of the Rust `pblang fmt` implementation from
+// `src/cli/fmt.rs`. Today this module covers:
+//   - indentation pass: line trimming, brace-depth tracking through
+//     string and block-comment state, blank-line-between-top-level-fns
+//   - fmt_normalize_operator_spacing: space around + - * / == != < > <= >=
+//     with the same unary-minus rule as the Rust path
+//   - fmt_normalize_comma_spacing: single space after every comma
+//     (outside string literals)
+//   - --max-line-length word-wrap: when format_source is called with
+//     a non-nil max_line_length, lines longer than the cap are broken
+//     at the last space inside the cap (or hard-broken at the cap if
+//     no space is found) and the continuation is re-indented to the
+//     same depth as the wrapped line.
+//
+// With word-wrap landed the pblang formatter has feature parity with
+// the Rust path for ASCII source files. The remaining limitation is
+// **multi-byte UTF-8 characters in `max_line_length` mode**: the Rust
+// path uses byte indexing into `&str`, the pblang path uses char
+// indexing through `str_slice`, so the two diverge when a snippet
+// crosses the cap at a non-ASCII codepoint. The drift corpus is
+// ASCII-only; non-ASCII handling is a follow-up.
+//
+// The Rust CLI path stays the default. This module exists so the
+// differential test in `tests/fmt_drift.rs` can prove the formatter
+// logic stays in sync between Rust and pblang as the formatter
+// evolves — Layer 2 of `docs/Bootstrap_safety.md`. See PrjAnalysis.md
+// §9 for the Phase 0 roadmap.
+
+let INDENT = "    ";
+
+// char_at(s, i) → single-character string or "" past end.
+fn fmt_char_at(s, i) {
+    if i < 0 or i >= len(s) { return ""; }
+    return str_slice(s, i, i + 1);
+}
+
+// Walk one already-trimmed source line and update the four pieces of
+// cross-line state: are we inside a "..." literal, inside a '...'
+// literal, inside a `/* */` block (possibly nested), and the current
+// brace nesting depth. Mirrors `scan_line_for_braces` in
+// `src/cli/fmt.rs`.
+//
+// Returns a map{in_double, in_single, block_depth, depth} that the
+// caller threads through the next iteration. Pblang has no &mut, so
+// we return a fresh map.
+fn fmt_scan_line(line, in_double, in_single, block_depth, depth) {
+    let i = 0;
+    let n = len(line);
+    let prev_was_backslash = false;
+
+    while i < n {
+        let ch = fmt_char_at(line, i);
+        let next = fmt_char_at(line, i + 1);
+
+        if in_double or in_single {
+            if in_double and ch == "\"" and not prev_was_backslash {
+                in_double = false;
+            } else if in_single and ch == "'" and not prev_was_backslash {
+                in_single = false;
+            }
+            prev_was_backslash = (ch == "\\") and not prev_was_backslash;
+            i = i + 1;
+            continue;
+        }
+
+        if block_depth > 0 {
+            if ch == "/" and next == "*" {
+                block_depth = block_depth + 1;
+                i = i + 2;
+                continue;
+            }
+            if ch == "*" and next == "/" {
+                block_depth = block_depth - 1;
+                i = i + 2;
+                continue;
+            }
+            i = i + 1;
+            continue;
+        }
+
+        // Not in string/comment.
+        if ch == "/" and next == "/" {
+            // Line comment — ignore the rest of the line.
+            break;
+        }
+        if ch == "/" and next == "*" {
+            block_depth = block_depth + 1;
+            i = i + 2;
+            continue;
+        }
+        if ch == "\"" {
+            in_double = true;
+            prev_was_backslash = false;
+            i = i + 1;
+            continue;
+        }
+        if ch == "'" {
+            in_single = true;
+            prev_was_backslash = false;
+            i = i + 1;
+            continue;
+        }
+        if ch == "{" { depth = depth + 1; }
+        else if ch == "}" { depth = depth - 1; }
+        i = i + 1;
+    }
+
+    return map{
+        in_double: in_double,
+        in_single: in_single,
+        block_depth: block_depth,
+        depth: depth,
+    };
+}
+
+fn fmt_is_top_level_fn(trimmed) {
+    return str_starts_with(trimmed, "fn ") or str_starts_with(trimmed, "export fn ");
+}
+
+// True if char `c` is in `set` (a string of single chars). Pblang has
+// no char type; we compare via str_index_of on a one-char string.
+fn fmt_char_in(c, set) {
+    if c == "" { return false; }
+    return str_index_of(set, c) >= 0;
+}
+
+// True if `s` ends with any of the single-char strings in `chars`.
+fn fmt_ends_with_any(s, chars) {
+    if s == "" { return false; }
+    let last = str_slice(s, len(s) - 1, len(s));
+    return fmt_char_in(last, chars);
+}
+
+// True if `c` is an ASCII digit 0-9 or the decimal point '.'. Mirrors
+// the matches!(bytes[i] as char, '0'..='9' | '.') guard in the Rust
+// unary-minus check.
+fn fmt_is_digit_or_dot(c) {
+    return fmt_char_in(c, "0123456789.");
+}
+
+// Port of src/cli/fmt.rs::fmt_normalize_comma_spacing. Ensures a comma
+// is followed by exactly one space, except when the comma is inside a
+// "..." string literal (tracked with a one-state escape flag).
+fn fmt_normalize_comma_spacing(line) {
+    let in_string = false;
+    let escape_next = false;
+    let i = 0;
+    let n = len(line);
+    let out = "";
+
+    while i < n {
+        let c = str_slice(line, i, i + 1);
+        if in_string {
+            if escape_next {
+                escape_next = false;
+                out = out + c;
+            } else if c == "\\" {
+                escape_next = true;
+                out = out + c;
+            } else if c == "\"" {
+                in_string = false;
+                out = out + c;
+            } else {
+                out = out + c;
+            }
+        } else if c == "\"" {
+            in_string = true;
+            out = out + c;
+        } else if c == "," {
+            out = out + c;
+            if i + 1 < n {
+                let next = str_slice(line, i + 1, i + 2);
+                if next != " " and next != "\n" and next != "\r" {
+                    out = out + " ";
+                }
+            }
+        } else {
+            out = out + c;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Port of src/cli/fmt.rs::fmt_normalize_operator_spacing. Ensures one
+// space before and after `+ - * / == != < > <= >=` outside string
+// literals. The unary-minus rule (no space-after when followed by a
+// digit and there was no space-before) matches the Rust path exactly.
+fn fmt_normalize_operator_spacing(line) {
+    let in_string = false;
+    let escape_next = false;
+    let i = 0;
+    let n = len(line);
+    let out = "";
+
+    let pre_ok_chars = " ([=!<>,;";   // out ends with one of these → no leading space
+    let post_skip_chars = " )];,\n";  // next is one of these → no trailing space
+
+    while i < n {
+        let c = str_slice(line, i, i + 1);
+        let step = 1;
+
+        if in_string {
+            if escape_next {
+                escape_next = false;
+                out = out + c;
+            } else if c == "\\" {
+                escape_next = true;
+                out = out + c;
+            } else if c == "\"" {
+                in_string = false;
+                out = out + c;
+            } else {
+                out = out + c;
+            }
+        } else if c == "\"" {
+            in_string = true;
+            out = out + c;
+        } else {
+            // Decide whether this position starts an operator.
+            let op_len = 0;
+            let need_space_after = false;
+            if i + 2 <= n {
+                let two = str_slice(line, i, i + 2);
+                if two == "==" or two == "!=" or two == "<=" or two == ">=" {
+                    op_len = 2;
+                    need_space_after = true;
+                }
+            }
+            let need_space_before = out != "" and not fmt_ends_with_any(out, pre_ok_chars);
+
+            if op_len == 0 and (c == "+" or c == "*" or c == "/" or c == "<" or c == ">") {
+                op_len = 1;
+                need_space_after = true;
+            } else if op_len == 0 and c == "-" {
+                let next = "";
+                if i + 1 < n { next = str_slice(line, i + 1, i + 2); }
+                let next_is_digit = fmt_is_digit_or_dot(next);
+                let space_after = (not next_is_digit) or need_space_before;
+                op_len = 1;
+                need_space_after = space_after;
+            }
+
+            if op_len == 0 {
+                out = out + c;
+            } else {
+                let prev_ok = fmt_ends_with_any(out, pre_ok_chars) or out == "";
+                if need_space_before and (not prev_ok) {
+                    out = out + " ";
+                }
+                out = out + str_slice(line, i, i + op_len);
+                if need_space_after and (i + op_len) < n {
+                    let nxt = str_slice(line, i + op_len, i + op_len + 1);
+                    if not fmt_char_in(nxt, post_skip_chars) {
+                        out = out + " ";
+                    }
+                }
+                step = op_len;
+            }
+        }
+
+        i = i + step;
+    }
+    return out;
+}
+
+// Trim trailing ASCII whitespace from `s`. Pblang's `str_trim` strips
+// both ends; word-wrap needs a one-sided trim so the column count
+// before the soft break is correct.
+fn fmt_trim_end(s) {
+    let n = len(s);
+    let i = n;
+    while i > 0 {
+        let c = str_slice(s, i - 1, i);
+        if c == " " or c == "\t" or c == "\r" or c == "\n" {
+            i = i - 1;
+        } else {
+            return str_slice(s, 0, i);
+        }
+    }
+    return "";
+}
+
+// Symmetric: trim leading ASCII whitespace.
+fn fmt_trim_start(s) {
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        let c = str_slice(s, i, i + 1);
+        if c == " " or c == "\t" or c == "\r" or c == "\n" {
+            i = i + 1;
+        } else {
+            return str_slice(s, i, n);
+        }
+    }
+    return "";
+}
+
+// Largest index `i` such that `prefix[i] == needle` and `i < limit`,
+// or -1 if no such index exists in `s[0..limit]`. Mirrors the
+// `line_to_output[..max_len].rfind(' ')` call in src/cli/fmt.rs.
+fn fmt_rfind_in_prefix(s, needle, limit) {
+    let n = len(s);
+    if limit > n { limit = n; }
+    let i = limit;
+    while i > 0 {
+        if str_slice(s, i - 1, i) == needle {
+            return i - 1;
+        }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// format_source(src, max_line_length) → formatted source string.
+//
+// `max_line_length` is optional; pass `nil` for no wrap. With a cap,
+// long lines break at the last space inside the cap (or hard-break at
+// the cap if none exists), and continuations are re-indented to the
+// same depth as the wrapped line. Exactly mirrors the Rust word-wrap
+// path in `src/cli/fmt.rs`.
+fn format_source(src, max_line_length = nil) {
+    if src == nil { return ""; }
+    let lines = str_split(src, "\n");
+    // Mirror Rust's `str::lines()`: a trailing newline terminates the last
+    // line rather than introducing an empty one. `str_split` yields that
+    // extra empty element, so drop it to match the Rust formatter exactly.
+    if str_ends_with(src, "\n") and len(lines) > 0 {
+        lines = slice(lines, 0, len(lines) - 1);
+    }
+    let out = "";
+    let depth = 0;
+    let in_double = false;
+    let in_single = false;
+    let block_depth = 0;
+    let last_blank = false;
+    let seen_top_fn = false;
+
+    let i = 0;
+    while i < len(lines) {
+        let trimmed = str_trim(lines[i]);
+        trimmed = fmt_normalize_operator_spacing(trimmed);
+        trimmed = fmt_normalize_comma_spacing(trimmed);
+
+        if trimmed == "" {
+            out = out + "\n";
+            last_blank = true;
+        } else {
+            if depth == 0 and fmt_is_top_level_fn(trimmed) {
+                if seen_top_fn and not last_blank {
+                    out = out + "\n";
+                }
+                seen_top_fn = true;
+            }
+
+            let render_depth = depth;
+            if str_starts_with(trimmed, "}") and render_depth > 0 {
+                render_depth = render_depth - 1;
+            }
+            if render_depth < 0 { render_depth = 0; }
+
+            let indent_str = str_repeat(INDENT, render_depth);
+            let full_line = indent_str + trimmed;
+
+            if max_line_length == nil {
+                out = out + full_line + "\n";
+                let st = fmt_scan_line(full_line, in_double, in_single, block_depth, depth);
+                in_double = st.in_double;
+                in_single = st.in_single;
+                block_depth = st.block_depth;
+                depth = st.depth;
+            } else {
+                let line_to_output = full_line;
+                let done = false;
+                while not done {
+                    if len(line_to_output) <= max_line_length {
+                        out = out + line_to_output + "\n";
+                        let st = fmt_scan_line(line_to_output, in_double, in_single, block_depth, depth);
+                        in_double = st.in_double;
+                        in_single = st.in_single;
+                        block_depth = st.block_depth;
+                        depth = st.depth;
+                        done = true;
+                    } else {
+                        let break_at = fmt_rfind_in_prefix(line_to_output, " ", max_line_length);
+                        if break_at <= 0 { break_at = max_line_length; }
+                        // If the only space in the cap window is inside
+                        // the leading indent, splitting there would
+                        // produce a head that trims to "" and a tail
+                        // that re-indents to the same line — infinite
+                        // loop. Force a hard break at max_line_length.
+                        let head_for_check = str_slice(line_to_output, 0, break_at);
+                        if fmt_trim_end(head_for_check) == "" {
+                            break_at = max_line_length;
+                        }
+                        let rest = str_slice(line_to_output, break_at, len(line_to_output));
+                        let head = str_slice(line_to_output, 0, break_at);
+                        let emitted = fmt_trim_end(head);
+                        out = out + emitted + "\n";
+                        let st = fmt_scan_line(emitted, in_double, in_single, block_depth, depth);
+                        in_double = st.in_double;
+                        in_single = st.in_single;
+                        block_depth = st.block_depth;
+                        depth = st.depth;
+                        line_to_output = indent_str + fmt_trim_start(rest);
+                        if line_to_output == "" { done = true; }
+                    }
+                }
+            }
+            last_blank = false;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+export format_source, fmt_scan_line, fmt_is_top_level_fn, fmt_char_at;
+export fmt_normalize_operator_spacing, fmt_normalize_comma_spacing;
+export fmt_trim_end, fmt_trim_start, fmt_rfind_in_prefix;

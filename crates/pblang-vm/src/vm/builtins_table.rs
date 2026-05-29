@@ -55,6 +55,21 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         fun: runtime::str_,
     },
     BuiltinFn {
+        name: "bigint",
+        arity: Some(1),
+        fun: math::bigint,
+    },
+    BuiltinFn {
+        name: "rational",
+        arity: None, // 1 (number|string) or 2 (num, den)
+        fun: math::rational,
+    },
+    BuiltinFn {
+        name: "decimal",
+        arity: Some(1),
+        fun: math::decimal,
+    },
+    BuiltinFn {
         name: "num_sqrt",
         arity: Some(1),
         fun: math::num_sqrt,
@@ -115,12 +130,30 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         fun: runtime::len,
     },
     BuiltinFn {
+        name: "error",
+        arity: Some(1),
+        fun: runtime::error_builtin,
+    },
+    BuiltinFn {
         name: "array_push",
         arity: Some(2),
         fun: arrays::array_push,
     },
     BuiltinFn {
         name: "array_pop",
+        arity: Some(1),
+        fun: arrays::array_pop,
+    },
+    // Ergonomic global aliases: much of the stdlib calls bare `push`/`pop`
+    // (the array.sapp wrappers) without importing array.sapp. A user-defined
+    // local `fn push` still shadows these, so this is purely additive.
+    BuiltinFn {
+        name: "push",
+        arity: Some(2),
+        fun: arrays::array_push,
+    },
+    BuiltinFn {
+        name: "pop",
         arity: Some(1),
         fun: arrays::array_pop,
     },
@@ -306,6 +339,12 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         arity: Some(1),
         fun: encoding::base64_decode_bytes,
     },
+    // Binary-safe base64 encode (byte array in)
+    BuiltinFn {
+        name: "base64_encode_bytes",
+        arity: Some(1),
+        fun: encoding::base64_encode_bytes,
+    },
     BuiltinFn {
         name: "json_parse",
         arity: Some(1),
@@ -365,6 +404,12 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         name: "str_slice",
         arity: Some(3),
         fun: strings::str_slice,
+    },
+    // Polymorphic slice (string/array) backing the `seq[a..b]` syntax.
+    BuiltinFn {
+        name: "slice",
+        arity: Some(3),
+        fun: strings::slice,
     },
     BuiltinFn {
         name: "str_index_of",
@@ -915,6 +960,17 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         name: "strcharcodeat",
         arity: Some(2),
         fun: strings::strcharcodeat,
+    },
+    // Binary-safe string<->byte-array conversion
+    BuiltinFn {
+        name: "str_to_bytes",
+        arity: Some(1),
+        fun: strings::str_to_bytes,
+    },
+    BuiltinFn {
+        name: "bytes_to_str",
+        arity: Some(1),
+        fun: strings::bytes_to_str,
     },
     // Fundamental sequence/collection builtins
     BuiltinFn {

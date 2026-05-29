@@ -1,6 +1,6 @@
 use pblang_ir::chunk::{Chunk, OpCode, Span};
 use pblang_ir::{
-    alloc_string, BuiltinFn, Closure, Function, Module, Obj, Upvalue, Value,
+    alloc_string, ArithOp, BuiltinFn, Closure, Function, Module, Obj, Upvalue, Value,
     VmHost, VmLimits as IrVmLimits,
 };
 pub use pblang_ir::{FrameTrace, RuntimeError};
@@ -41,6 +41,7 @@ mod crypto;
 mod db;
 mod encoding;
 mod env;
+mod errors;
 mod ffi;
 mod ffi_dispatch;
 mod fs;
@@ -242,6 +243,9 @@ pub struct StdlibConfig {
     pub gfx: bool,
     /// If true, spawn/join builtins are available; if false, spawn returns "spawn not allowed".
     pub spawn: bool,
+    /// If true, `env_get` may read process environment variables; if false it is
+    /// denied (prevents secret exfiltration in a sandbox). Defaults to true.
+    pub env: bool,
 }
 
 impl Default for StdlibConfig {
@@ -258,6 +262,7 @@ impl Default for StdlibConfig {
             exec: false,
             gfx: true,
             spawn: true,
+            env: true,
         }
     }
 }
@@ -265,11 +270,15 @@ impl Default for StdlibConfig {
 impl StdlibConfig {
     /// Returns true if the builtin with this name is in an enabled category.
     ///
-    /// AUDIT FIX #14: Previously this method was dead code (never called) while all
-    /// builtins were unconditionally registered, making them visible as globals even
-    /// when a capability was disabled. `install_builtins_into()` now calls this to
-    /// skip registration of builtins whose category is disabled, so disabled builtins
-    /// are invisible (not just call-time-denied).
+    /// AUDIT NOTE #14: This is a *future hook* for strict-mode registration (where
+    /// disabled builtins are not even visible as globals). It is **not currently
+    /// wired** into `install_builtins_into` — the live sandbox is the per-builtin
+    /// **call-time** capability check (`allow_fs`/`allow_net`/`allow_exec`/`allow_env`/…),
+    /// plus registration-time gating for the `gfx` builtins (which lack a call-time
+    /// check). All other builtins stay registered so stdlib modules that import
+    /// them internally keep working; the call-time check denies access when the
+    /// capability is off. See `install_builtins_into` for the authoritative policy.
+    #[allow(dead_code)]
     pub fn allows(&self, name: &str) -> bool {
         match name {
             "clock"
@@ -734,8 +743,17 @@ impl VM {
     // as a future improvement.
     fn install_builtins_into(module: &Rc<RefCell<Module>>, config: Option<&StdlibConfig>) {
         let mut m = module.borrow_mut();
+        let gfx_allowed = config.map(|c| c.gfx).unwrap_or(false);
         for b in VM::builtins() {
-            if config.map(|_| true).unwrap_or(false) {
+            if config.is_some() {
+                // Most builtins are sandboxed by call-time capability checks
+                // (allow_fs/net/exec/…), so they stay registered. The graphics
+                // (`gfx*`) builtins are the exception — they have no call-time
+                // check — so the `gfx` capability is enforced at registration:
+                // when disabled, they are not visible at all.
+                if b.name.starts_with("gfx") && !gfx_allowed {
+                    continue;
+                }
                 m.globals.insert(b.name.to_string(), Value::Builtin(b));
             }
         }
@@ -1085,42 +1103,51 @@ impl VM {
                     }
 
                     // ---- arithmetic ----
+                    // Arithmetic routes through `Value::arith`, which keeps the
+                    // unboxed f64 fast path but transparently switches to
+                    // arbitrary-precision `BigInt` when an operand is a bigint.
                     OpCode::OpAdd => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.concat(b).map_err(|m| self.err(m))?;
+                        let v = a.arith(&b, ArithOp::Add).map_err(|m| self.err(m))?;
                         self.stack.push(v);
                     }
                     OpCode::OpSub => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Number(a - b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let v = a.arith(&b, ArithOp::Sub).map_err(|m| self.err(m))?;
+                        self.stack.push(v);
                     }
                     OpCode::OpMul => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Number(a * b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let v = a.arith(&b, ArithOp::Mul).map_err(|m| self.err(m))?;
+                        self.stack.push(v);
                     }
                     OpCode::OpDiv => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Number(a / b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let v = a.arith(&b, ArithOp::Div).map_err(|m| self.err(m))?;
+                        self.stack.push(v);
                     }
 
                     // ---- extended arithmetic ----
                     OpCode::OpNegate => {
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Number(-a));
+                        let a = self.pop()?;
+                        let v = a.negate().map_err(|m| self.err(m))?;
+                        self.stack.push(v);
                     }
                     OpCode::OpMod => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Number(a % b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let v = a.arith(&b, ArithOp::Mod).map_err(|m| self.err(m))?;
+                        self.stack.push(v);
                     }
                     OpCode::OpPow => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Number(a.powf(b)));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let v = a.arith(&b, ArithOp::Pow).map_err(|m| self.err(m))?;
+                        self.stack.push(v);
                     }
 
                     // ---- logic ----
@@ -1143,9 +1170,16 @@ impl VM {
                         let obj = self.pop()?;
                         let attr_name = {
                             let chunk = self.current_chunk()?;
-                            match &chunk.constants[name_idx] {
-                                Value::Obj(o) => match o.as_ref() {
+                            // Bounds-checked: a crafted/corrupt constant index must
+                            // not panic the VM (every sibling opcode uses `.get()`).
+                            match chunk.constants.get(name_idx) {
+                                Some(Value::Obj(o)) => match o.as_ref() {
                                     pblang_ir::Obj::String(s) => s.clone(),
+                                    _ => {
+                                        return Err(
+                                            self.err("OpSafeGetAttr: invalid attr name".to_string()),
+                                        )
+                                    }
                                 },
                                 _ => {
                                     return Err(
@@ -1206,6 +1240,30 @@ impl VM {
                                     let v = m.borrow().get(key).cloned().unwrap_or(Value::Nil);
                                     self.stack.push(v);
                                 }
+                                Value::Obj(o) => match o.as_ref() {
+                                    Obj::String(s) => {
+                                        let i = match index {
+                                            Value::Number(n) => n as isize,
+                                            _ => {
+                                                return Err(self.err(
+                                                    "string?[]: index must be number".to_string(),
+                                                ))
+                                            }
+                                        };
+                                        if i < 0 {
+                                            self.stack.push(Value::Nil);
+                                        } else {
+                                            match s.chars().nth(i as usize) {
+                                                Some(c) => {
+                                                    self.stack.push(alloc_string(c.to_string()))
+                                                }
+                                                None => self.stack.push(Value::Nil),
+                                            }
+                                        }
+                                    }
+                                    // bigint isn't indexable; nil-safe index yields nil.
+                                    _ => self.stack.push(Value::Nil),
+                                },
                                 _ => self.stack.push(Value::Nil),
                             }
                         }
@@ -1275,6 +1333,9 @@ impl VM {
                         let msg = match &val {
                             Value::Obj(o) => match o.as_ref() {
                                 pblang_ir::Obj::String(s) => s.clone(),
+                                pblang_ir::Obj::BigInt(n) => n.to_string(),
+                                pblang_ir::Obj::Rational(r) => r.to_string(),
+                                pblang_ir::Obj::Decimal(d) => d.to_string(),
                             },
                             Value::Map(m) => {
                                 let mb = m.borrow();
@@ -1302,25 +1363,40 @@ impl VM {
                         let a = self.pop()?;
                         self.stack.push(Value::Bool(a != b));
                     }
+                    // Ordering routes through `Value::num_cmp` (bigint-aware).
                     OpCode::OpGt => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Bool(a > b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let ord = a
+                            .num_cmp(&b)
+                            .ok_or_else(|| self.err("comparison expects numbers"))?;
+                        self.stack.push(Value::Bool(ord == std::cmp::Ordering::Greater));
                     }
                     OpCode::OpGe => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Bool(a >= b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let ord = a
+                            .num_cmp(&b)
+                            .ok_or_else(|| self.err("comparison expects numbers"))?;
+                        self.stack
+                            .push(Value::Bool(ord != std::cmp::Ordering::Less));
                     }
                     OpCode::OpLt => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Bool(a < b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let ord = a
+                            .num_cmp(&b)
+                            .ok_or_else(|| self.err("comparison expects numbers"))?;
+                        self.stack.push(Value::Bool(ord == std::cmp::Ordering::Less));
                     }
                     OpCode::OpLe => {
-                        let b = self.pop_number()?;
-                        let a = self.pop_number()?;
-                        self.stack.push(Value::Bool(a <= b));
+                        let b = self.pop()?;
+                        let a = self.pop()?;
+                        let ord = a
+                            .num_cmp(&b)
+                            .ok_or_else(|| self.err("comparison expects numbers"))?;
+                        self.stack
+                            .push(Value::Bool(ord != std::cmp::Ordering::Greater));
                     }
 
                     // ---- stack / io ----
@@ -1356,19 +1432,21 @@ impl VM {
                     }
 
                     OpCode::OpGetGlobal(name_const_idx) => {
+                        // Resolve the name as a borrowed &str — no per-access
+                        // String allocation. This is one of the hottest ops
+                        // (every builtin/function reference goes through it).
                         let c = self.current_chunk()?;
                         let name = c
                             .constants
                             .get(name_const_idx)
                             .ok_or_else(|| self.err("constant index out of bounds"))?
                             .as_str()
-                            .map_err(|m| self.err(m))?
-                            .to_string();
+                            .map_err(|m| self.err(m))?;
                         let frame = self
                             .frames
                             .last()
                             .ok_or_else(|| self.err("no current frame"))?;
-                        let v = Self::get_global_from(&frame.closure.module, &name)
+                        let v = Self::get_global_from(&frame.closure.module, name)
                             .ok_or_else(|| self.err(format!("undefined global '{name}'")))?;
                         self.stack.push(v);
                     }
@@ -1381,14 +1459,13 @@ impl VM {
                             .get(name_const_idx)
                             .ok_or_else(|| self.err("constant index out of bounds"))?
                             .as_str()
-                            .map_err(|m| self.err(m))?
-                            .to_string();
+                            .map_err(|m| self.err(m))?;
 
                         let frame = self
                             .frames
                             .last()
                             .ok_or_else(|| self.err("no current frame"))?;
-                        if !Self::set_global_in_chain(&frame.closure.module, &name, v) {
+                        if !Self::set_global_in_chain(&frame.closure.module, name, v) {
                             return Err(self.err(format!("undefined global '{name}'")));
                         }
                     }
@@ -1401,20 +1478,19 @@ impl VM {
                             .get(attr_const_idx)
                             .ok_or_else(|| self.err("constant index out of bounds"))?
                             .as_str()
-                            .map_err(|m| self.err(m))?
-                            .to_string();
+                            .map_err(|m| self.err(m))?;
 
                         match obj {
                             Value::Module(m) => {
                                 let v =
-                                    m.borrow().exports.get(&attr).cloned().ok_or_else(|| {
+                                    m.borrow().exports.get(attr).cloned().ok_or_else(|| {
                                         self.err(format!("undefined export '{attr}'"))
                                     })?;
                                 self.stack.push(v);
                             }
                             Value::Map(m) => {
                                 let v =
-                                    m.borrow().get(&attr).cloned().ok_or_else(|| {
+                                    m.borrow().get(attr).cloned().ok_or_else(|| {
                                         self.err(format!("undefined key '{attr}'"))
                                     })?;
                                 self.stack.push(v);
@@ -1563,7 +1639,38 @@ impl VM {
                                     })?;
                                 self.stack.push(v);
                             }
-                            _ => return Err(self.err("indexing only supported on arrays/maps")),
+                            // String indexing is char-indexed (consistent with
+                            // `len()` and `str_slice`): `s[i]` is the i-th
+                            // codepoint as a one-character string.
+                            Value::Obj(o) => match o.as_ref() {
+                                Obj::String(s) => {
+                                    let i = match index {
+                                        Value::Number(n) => n as isize,
+                                        _ => {
+                                            return Err(self.err("string index must be number"))
+                                        }
+                                    };
+                                    if i < 0 {
+                                        return Err(self.err("string index out of bounds"));
+                                    }
+                                    match s.chars().nth(i as usize) {
+                                        Some(c) => self.stack.push(alloc_string(c.to_string())),
+                                        None => {
+                                            return Err(self.err("string index out of bounds"))
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    return Err(
+                                        self.err("indexing only supported on strings/arrays/maps"),
+                                    )
+                                }
+                            },
+                            _ => {
+                                return Err(
+                                    self.err("indexing only supported on strings/arrays/maps")
+                                )
+                            }
                         }
                     }
 
@@ -1847,6 +1954,13 @@ impl VM {
 
             Value::Obj(o) => match o.as_ref() {
                 Obj::String(s) => !s.is_empty(),
+                // A bigint is truthy unless it is zero (Displays as exactly "0").
+                Obj::BigInt(n) => n.to_string() != "0",
+                // A rational object is always non-integer (zero normalizes to a
+                // bigint), hence always nonzero / truthy.
+                Obj::Rational(_) => true,
+                // A decimal is truthy unless its value is zero.
+                Obj::Decimal(d) => !d.is_zero(),
             },
 
             // Function / Closure values συνήθως θεωρούνται πάντα truthy
@@ -1861,13 +1975,6 @@ impl VM {
 
     fn pop(&mut self) -> Result<Value, RuntimeError> {
         self.stack.pop().ok_or_else(|| self.err("stack underflow"))
-    }
-
-    fn pop_number(&mut self) -> Result<f64, RuntimeError> {
-        match self.pop()? {
-            Value::Number(n) => Ok(n),
-            _ => Err(self.err("type error: expected number")),
-        }
     }
 
     fn current_chunk(&self) -> Result<&Chunk, RuntimeError> {
@@ -2208,6 +2315,24 @@ impl VM {
         );
         Ok(alloc_map(m))
     }
+
+    /// A one-line human-readable memory/resource report: cumulative allocation
+    /// counters (since VM start) plus the live memory-safety tracker. Surfaced
+    /// by `pblang run --mem-report`; mirrors what `stdlib/resources.sapp` builds
+    /// from `gc_stats()` + `memory_stats()`.
+    pub fn memory_report(&self) -> String {
+        let s = self.memory_tracker.get_stats();
+        let str_a = pblang_ir::string_alloc_count();
+        let arr_a = ARRAY_ALLOCS.load(Ordering::Relaxed);
+        let map_a = MAP_ALLOCS.load(Ordering::Relaxed);
+        let mod_a = MODULE_ALLOCS.load(Ordering::Relaxed);
+        format!(
+            "allocs(string={} array={} map={} module={} total={}) memory(locations={} active_borrows={} lifetime_depth={} ref_count={})",
+            str_a, arr_a, map_a, mod_a,
+            str_a + arr_a + map_a + mod_a,
+            s.total_locations, s.active_borrows, s.current_lifetime_depth, s.ref_count_total
+        )
+    }
 }
 
 impl VmHost for VM {
@@ -2291,6 +2416,11 @@ impl VmHost for VM {
     }
     fn allow_exec(&self) -> bool {
         self.stdlib_config.as_ref().map(|c| c.exec).unwrap_or(false)
+    }
+    fn allow_env(&self) -> bool {
+        // Default true (benign) when no config is set, matching the trait default;
+        // an explicit StdlibConfig (CLI/embedder) controls it.
+        self.stdlib_config.as_ref().map(|c| c.env).unwrap_or(true)
     }
 
     /// Library allowlist check. When no policy is set, behaves like the default

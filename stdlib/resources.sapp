@@ -1,0 +1,195 @@
+// stdlib/resources.sapp — memory & resource introspection for any pblang
+// program (its own or an embedding host project). Unifies the VM's allocation
+// counters (gc_stats), the memory-safety tracker (memory_stats), the GC
+// (gc_collect), and the clocks (now_ms/clock) into one snapshot/diff/capture
+// API, with live sampling, per-operation tracking, and a leak check.
+//
+//   let res = import("stdlib:resources.sapp");
+//   let s = res.snapshot();
+//   print res.format(s);
+//
+//   // live capture: snapshot after each step of a workload
+//   let timeline = res.live_capture(5, fn(i) { let a = []; });
+//   print res.summary(timeline).samples;   // 6 (baseline + 5)
+//
+//   // track one operation's allocation & time cost
+//   let t = res.track(fn() { let m = map{ a: 1, b: 2 }; return m; });
+//   print res.format_diff(t);
+
+fn _num(x) { if x == nil { return 0; } return x; }
+
+// Parse "key=val key=val ..." (tokens without "=" are ignored) into a map.
+fn _parse_kv(s) {
+    let m = map{};
+    let pairs = str_split(s, " ");
+    for i in 0 to len(pairs) - 1 {
+        let kv = str_split(pairs[i], "=");
+        if len(kv) == 2 { m[kv[0]] = parse_number(kv[1]); }
+    }
+    return m;
+}
+
+// snapshot() — a unified point-in-time view of memory + resources.
+fn snapshot() {
+    let gc = _parse_kv(gc_stats());
+    let mem = memory_stats();
+    let sa = _num(gc["string_allocs"]);
+    let aa = _num(gc["array_allocs"]);
+    let ma = _num(gc["map_allocs"]);
+    let mo = _num(gc["module_allocs"]);
+    return map{
+        ts_ms: now_ms(),
+        clock_s: clock(),
+        platform: platform(),
+        string_allocs: sa,
+        array_allocs: aa,
+        map_allocs: ma,
+        module_allocs: mo,
+        total_allocs: sa + aa + ma + mo,
+        total_locations: _num(mem["total_locations"]),
+        active_borrows: _num(mem["active_borrows"]),
+        lifetime_depth: _num(mem["lifetime_depth"]),
+        ref_count_total: _num(mem["ref_count_total"])
+    };
+}
+
+// diff(a, b) — metric deltas from snapshot a to snapshot b.
+fn diff(a, b) {
+    return map{
+        elapsed_ms: b["ts_ms"] - a["ts_ms"],
+        string_allocs: b["string_allocs"] - a["string_allocs"],
+        array_allocs: b["array_allocs"] - a["array_allocs"],
+        map_allocs: b["map_allocs"] - a["map_allocs"],
+        module_allocs: b["module_allocs"] - a["module_allocs"],
+        total_allocs: b["total_allocs"] - a["total_allocs"],
+        locations: b["total_locations"] - a["total_locations"],
+        borrows: b["active_borrows"] - a["active_borrows"],
+        ref_count: b["ref_count_total"] - a["ref_count_total"]
+    };
+}
+
+// gc() — force a cycle-collecting GC pass; returns what it reclaimed.
+fn gc() {
+    let r = _parse_kv(gc_collect());
+    return map{
+        arrays_cleared: _num(r["arrays"]),
+        maps_cleared: _num(r["maps"]),
+        modules_cleared: _num(r["modules"])
+    };
+}
+
+// measure(label, work_fn) — run work_fn(), returning a diff annotated with the
+// label and the function's return value. The allocation/time cost of one op.
+fn measure(label, work_fn) {
+    let before = snapshot();
+    let result = work_fn();
+    let after = snapshot();
+    let d = diff(before, after);
+    d["label"] = label;
+    d["result"] = result;
+    return d;
+}
+fn track(work_fn) { return measure("", work_fn); }
+
+// gc_measure(label, work_fn) — like measure, but GCs before and after so the
+// reading isolates this operation's net effect.
+fn gc_measure(label, work_fn) {
+    gc();
+    let before = snapshot();
+    let result = work_fn();
+    gc();
+    let after = snapshot();
+    let d = diff(before, after);
+    d["label"] = label;
+    d["result"] = result;
+    return d;
+}
+
+// live_capture(steps, work_fn) — snapshot a baseline, then run work_fn(i) and
+// snapshot after each step. Returns steps+1 snapshots (a timeline).
+fn live_capture(steps, work_fn) {
+    let timeline = [];
+    array_push(timeline, snapshot());
+    for i in 0 to steps - 1 {
+        work_fn(i);
+        array_push(timeline, snapshot());
+    }
+    return timeline;
+}
+
+// sample(steps, work_fn) — per-step diffs (the deltas between consecutive
+// snapshots of a live_capture run).
+fn sample(steps, work_fn) {
+    let tl = live_capture(steps, work_fn);
+    let deltas = [];
+    for i in 1 to len(tl) - 1 { array_push(deltas, diff(tl[i - 1], tl[i])); }
+    return deltas;
+}
+
+// summary(timeline) — aggregate stats over a live_capture timeline.
+fn summary(timeline) {
+    if len(timeline) == 0 { return map{ samples: 0 }; }
+    let first = timeline[0];
+    let last = timeline[len(timeline) - 1];
+    let peak_loc = first["total_locations"];
+    let peak_alloc = first["total_allocs"];
+    for s in timeline {
+        if s["total_locations"] > peak_loc { peak_loc = s["total_locations"]; }
+        if s["total_allocs"] > peak_alloc { peak_alloc = s["total_allocs"]; }
+    }
+    return map{
+        samples: len(timeline),
+        elapsed_ms: last["ts_ms"] - first["ts_ms"],
+        total_allocs_growth: last["total_allocs"] - first["total_allocs"],
+        locations_growth: last["total_locations"] - first["total_locations"],
+        peak_locations: peak_loc,
+        peak_total_allocs: peak_alloc
+    };
+}
+
+// leak_check(work_fn, rounds) — run work_fn(i) `rounds` times, GC between each,
+// and watch live `total_locations` (the memory-safety tracker, driven by the
+// box/free API in stdlib:memory.sapp). Monotonic growth across rounds after GC
+// is a strong leak signal. Returns the per-round samples and a verdict.
+fn leak_check(work_fn, rounds) {
+    let samples = [];
+    for i in 0 to rounds - 1 {
+        work_fn(i);
+        gc();
+        array_push(samples, snapshot()["total_locations"]);
+    }
+    let first = samples[0];
+    let last = samples[len(samples) - 1];
+    let growth = last - first;
+    return map{
+        rounds: rounds,
+        first_locations: first,
+        last_locations: last,
+        growth: growth,
+        leaking: growth > 0,
+        samples: samples
+    };
+}
+
+// Convenience clocks.
+fn time_ms() { return now_ms(); }
+fn time_s() { return clock(); }
+
+// Human-readable formatting.
+fn format(snap) {
+    return "[" + str(snap["platform"]) + "] allocs(str=" + str(snap["string_allocs"]) +
+        " arr=" + str(snap["array_allocs"]) + " map=" + str(snap["map_allocs"]) +
+        " mod=" + str(snap["module_allocs"]) + " total=" + str(snap["total_allocs"]) + ")" +
+        " mem(locations=" + str(snap["total_locations"]) +
+        " borrows=" + str(snap["active_borrows"]) +
+        " refs=" + str(snap["ref_count_total"]) + ")";
+}
+fn format_diff(d) {
+    return "delta " + str(d["elapsed_ms"]) + "ms allocs+" + str(d["total_allocs"]) +
+        " (str+" + str(d["string_allocs"]) + " arr+" + str(d["array_allocs"]) +
+        " map+" + str(d["map_allocs"]) + ") locations+" + str(d["locations"]) +
+        " refs+" + str(d["ref_count"]);
+}
+
+export snapshot, diff, gc, measure, track, gc_measure, live_capture, sample,
+       summary, leak_check, time_ms, time_s, format, format_diff;

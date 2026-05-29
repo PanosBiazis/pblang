@@ -33,6 +33,7 @@ use std::sync::atomic::Ordering;
 use libloading::Library;
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
+use super::errors::vm_cap;
 use super::handles::{with_ffi_table, FFI_NEXT};
 use super::FfiResource;
 
@@ -41,7 +42,7 @@ use super::FfiResource;
 /// Returns JSON: { success, stdout, stderr, exit_code }
 pub(super) fn polyglot_exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "polyglot_exec", "exec"));
     }
     if args.len() != 2 {
         return Err(host.err(format!(
@@ -160,7 +161,7 @@ pub(super) fn polyglot_exec_with_input(
 ) -> Result<Value, RuntimeError> {
     use std::io::Write;
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "polyglot_exec_with_input", "exec"));
     }
     if args.len() != 3 {
         return Err(host.err(format!(
@@ -261,7 +262,7 @@ pub(super) fn polyglot_exec_compiled(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "polyglot_exec_compiled", "exec"));
     }
     if args.len() != 2 {
         return Err(host.err(format!(
@@ -1183,7 +1184,7 @@ pub(super) fn polyglot_exec_compiled(
 /// instead of failing on missing toolchains.
 pub(super) fn polyglot_detect(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "polyglot_detect", "exec"));
     }
     if !args.is_empty() {
         return Err(host.err(format!(
@@ -1360,11 +1361,11 @@ pub(super) fn polyglot_compile_cached(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "polyglot_compile_cached", "exec"));
     }
     if !host.allow_ffi() {
         return Err(host.err(
-            "ffi access denied (polyglot_compile_cached returns an FFI handle)".into(),
+            "polyglot_compile_cached(): ffi access denied (polyglot_compile_cached returns an FFI handle)".into(),
         ));
     }
     if args.len() != 2 {

@@ -1,4 +1,14 @@
-//! Optional SDL2 backend: same gfx API, select with PBLANG_GFX=sdl2 and feature "sdl2".
+//! Optional SDL2 backend: same gfx API surface as the minifb backend.
+//!
+//! Selected at runtime when **both** of these are true:
+//!  - the crate was built with the `sdl2` cargo feature on, and
+//!  - `PBLANG_GFX=sdl2` is set in the environment.
+//!
+//! Each `gfx*` builtin in [`super::graphics`] checks [`use_sdl2`] and
+//! routes to a `sdl2_*` counterpart here. The handle-vending scheme is
+//! the same (an integer indexing the [`GFX_SDL2_WINDOWS`] thread-local);
+//! `Sdl2Window` adds a `Canvas` + `TextureCreator` so we can blit the
+//! `Vec<u32>` back-buffer through a streaming SDL texture every frame.
 
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 use sdl2::event::Event;

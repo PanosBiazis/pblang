@@ -87,3 +87,54 @@ fn error_output_includes_file_and_line() {
         stderr
     );
 }
+
+#[test]
+fn lint_reports_clippy_style_lints() {
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lint_clippy.sapp");
+    assert!(
+        fixture.exists(),
+        "fixture tests/fixtures/lint_clippy.sapp must exist"
+    );
+    let out = std::process::Command::new(bin)
+        .arg("lint")
+        .arg(&fixture)
+        .output()
+        .expect("run pblang lint");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for needle in [
+        "bool_comparison",
+        "eq_op",
+        "double_not",
+        "collapsible_if",
+        "while_true",
+        "self_assignment",
+        "help:",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "expected clippy lint `{}` in output, got:\n{}",
+            needle,
+            stderr
+        );
+    }
+}
+
+#[test]
+fn clippy_subcommand_is_lint_alias() {
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lint_clippy.sapp");
+    let out = std::process::Command::new(bin)
+        .arg("clippy")
+        .arg(&fixture)
+        .output()
+        .expect("run pblang clippy");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("eq_op") && stderr.contains("[correctness:"),
+        "`pblang clippy` should emit the same lints as `lint`, got:\n{}",
+        stderr
+    );
+}

@@ -1,4 +1,4 @@
-use pblang_core::{Expr, ExprKind, LogicalOp, Span, Stmt, StmtKind, TypeExpr, TypeKind};
+use pblang_core::{Expr, ExprKind, LogicalOp, Param, Span, Stmt, StmtKind, TypeExpr, TypeKind};
 
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
@@ -10,6 +10,12 @@ pub struct Diagnostic {
 pub enum Ty {
     Any,
     Number,
+    /// Arbitrary-precision integer (`bigint(x)`).
+    BigInt,
+    /// Exact arbitrary-precision rational (`rational(x)`).
+    Rational,
+    /// Arbitrary-precision base-10 decimal (`decimal(x)`).
+    Decimal,
     Bool,
     String,
     Nil,
@@ -25,6 +31,21 @@ pub enum Ty {
     Generic(String),
     /// NonNull(inner) — T! type: the inner type but nil assignment is a compile error.
     NonNull(Box<Ty>),
+    /// Struct(name, fields) — a `struct Name { f: T, ... }` instance. Fields are
+    /// stored in declaration order (with the implicit `__struct` tag) so that
+    /// field access (`p.x`) can be typed and unknown fields reported.
+    Struct(String, Vec<(String, Ty)>),
+    /// Enum(name, variants) — the namespace value bound by an `enum Name { ... }`
+    /// declaration. Each variant maps to its access type: `EnumInstance(name)` for
+    /// unit variants (`Color.Red`) and `Fn(params) -> EnumInstance(name)` for data
+    /// variants (`Shape.Circle`), so that variant access is checked and
+    /// data-variant calls are arg-checked.
+    Enum(String, Vec<(String, Ty)>),
+    /// EnumInstance(name) — a value of enum `name` (e.g. the result of `Color.Red`
+    /// or a `c: Color` parameter). Carries only the enum name; the variant set is
+    /// looked up in the checker's enum registry. Enables exhaustiveness checking
+    /// on `match instance.__variant { ... }`.
+    EnumInstance(String),
 }
 
 impl std::fmt::Display for Ty {
@@ -32,6 +53,9 @@ impl std::fmt::Display for Ty {
         match self {
             Ty::Any => write!(f, "any"),
             Ty::Number => write!(f, "number"),
+            Ty::BigInt => write!(f, "bigint"),
+            Ty::Rational => write!(f, "rational"),
+            Ty::Decimal => write!(f, "decimal"),
             Ty::Bool => write!(f, "bool"),
             Ty::String => write!(f, "string"),
             Ty::Nil => write!(f, "nil"),
@@ -45,15 +69,57 @@ impl std::fmt::Display for Ty {
             Ty::Result(ok, err) => write!(f, "result<{}, {}>", ok, err),
             Ty::Generic(name) => write!(f, "{}", name),
             Ty::NonNull(inner) => write!(f, "{}!", inner),
+            Ty::Struct(name, _) => write!(f, "{}", name),
+            Ty::Enum(name, _) => write!(f, "{}", name),
+            Ty::EnumInstance(name) => write!(f, "{}", name),
         }
     }
 }
 
 impl Ty {
+    /// True for any numeric type (the precision ladder: number ⊂ bigint ⊂
+    /// rational ⊂ decimal, plus `Any`/`Generic` which are gradual).
+    fn is_numeric(&self) -> bool {
+        matches!(
+            self,
+            Ty::Number | Ty::BigInt | Ty::Rational | Ty::Decimal | Ty::Any | Ty::Generic(_)
+        )
+    }
+
+    /// "Rank" within the precision ladder, for arithmetic result inference.
+    fn numeric_rank(&self) -> u8 {
+        match self {
+            Ty::Number => 1,
+            Ty::BigInt => 2,
+            Ty::Rational => 3,
+            Ty::Decimal => 4,
+            _ => 0,
+        }
+    }
+
+    /// Result type of an arithmetic op on two numeric operands: the higher-rank
+    /// type (mirrors the VM's promotion). `Any` propagates as `Any`.
+    fn numeric_widen(a: &Ty, b: &Ty) -> Ty {
+        if matches!(a, Ty::Any) || matches!(b, Ty::Any) || matches!(a, Ty::Generic(_)) || matches!(b, Ty::Generic(_)) {
+            return Ty::Any;
+        }
+        let (ra, rb) = (a.numeric_rank(), b.numeric_rank());
+        match ra.max(rb) {
+            1 => Ty::Number,
+            2 => Ty::BigInt,
+            3 => Ty::Rational,
+            4 => Ty::Decimal,
+            _ => Ty::Any,
+        }
+    }
+
     fn from_type_expr(t: &TypeExpr) -> Ty {
         match &t.kind {
             TypeKind::Any => Ty::Any,
             TypeKind::Number => Ty::Number,
+            TypeKind::BigInt => Ty::BigInt,
+            TypeKind::Rational => Ty::Rational,
+            TypeKind::Decimal => Ty::Decimal,
             TypeKind::Bool => Ty::Bool,
             TypeKind::String => Ty::String,
             TypeKind::Nil => Ty::Nil,
@@ -89,6 +155,9 @@ impl Ty {
             (a, b) if a == b => a.clone(),
             // Either is Any → Any
             (Ty::Any, _) | (_, Ty::Any) => Ty::Any,
+            // Two distinct numeric types widen up the precision ladder
+            // (e.g. an array of [bigint, number] has element type bigint).
+            (x, y) if x.numeric_rank() > 0 && y.numeric_rank() > 0 => Ty::numeric_widen(x, y),
             // One is Nil → Option of the other
             (Ty::Nil, other) | (other, Ty::Nil) => Ty::Option(Box::new(other.clone())),
             // Both NonNull → widen inner, preserve NonNull if result isn't Any
@@ -158,6 +227,10 @@ impl Ty {
             (_, Ty::Any) => true,
             // Any is assignable to everything (gradual typing)
             (Ty::Any, _) => true,
+            // The numeric types interoperate (the VM promotes/demotes between
+            // number/bigint/rational/decimal), so any numeric is assignable to
+            // any numeric. This still flags number↛string / bigint↛bool, etc.
+            (a, b) if a.numeric_rank() > 0 && b.numeric_rank() > 0 => true,
             // Identical types
             (a, b) if a == b => true,
             // Nil cannot be assigned to a NonNull type (T!)
@@ -179,6 +252,20 @@ impl Ty {
             (Ty::Map(ak, av), Ty::Map(bk, bv)) => {
                 ak.is_assignable_to(bk) && av.is_assignable_to(bv)
             }
+            // Structs: same-named structs are interchangeable, and a struct is
+            // structurally a map (and vice-versa, for the desugared constructor
+            // whose body returns a map literal).
+            (Ty::Struct(a, _), Ty::Struct(b, _)) => a == b,
+            (Ty::Struct(_, _), Ty::Map(_, _)) => true,
+            (Ty::Map(_, _), Ty::Struct(_, _)) => true,
+            // Enum namespaces are structurally maps too (same-named are equal).
+            (Ty::Enum(a, _), Ty::Enum(b, _)) => a == b,
+            (Ty::Enum(_, _), Ty::Map(_, _)) => true,
+            (Ty::Map(_, _), Ty::Enum(_, _)) => true,
+            // Enum instances: same-named are interchangeable; structurally maps.
+            (Ty::EnumInstance(a), Ty::EnumInstance(b)) => a == b,
+            (Ty::EnumInstance(_), Ty::Map(_, _)) => true,
+            (Ty::Map(_, _), Ty::EnumInstance(_)) => true,
             // Fn types: covariant in return, contravariant in params (simplified)
             (Ty::Fn(params_s, ret_s), Ty::Fn(params_d, ret_d)) => {
                 params_s.len() == params_d.len()
@@ -257,16 +344,183 @@ fn lev_distance(a: &str, b: &str) -> usize {
     prev[blen]
 }
 
+/// Detect the desugared struct-constructor pattern the parser emits for
+/// `struct Name { f: T, ... }`: a function whose body is a single
+/// `return { __struct: "Name", f, ... }`. Returns the matching `Ty::Struct`
+/// (fields taken from the constructor params, plus the implicit `__struct`
+/// tag), so constructor calls are typed as structs and field access can be
+/// checked. Returns `None` for ordinary functions.
+fn struct_ctor_return_ty(params: &[Param], body: &[Stmt]) -> Option<Ty> {
+    if body.len() != 1 {
+        return None;
+    }
+    let ret_expr = match &body[0].kind {
+        StmtKind::Return(Some(e)) => e,
+        _ => return None,
+    };
+    let entries = match &ret_expr.kind {
+        ExprKind::Map(entries) => entries,
+        _ => return None,
+    };
+    let mut struct_name: Option<String> = None;
+    for (k, v) in entries {
+        if k == "__struct" {
+            if let ExprKind::Str(s) = &v.kind {
+                struct_name = Some(s.clone());
+            }
+        }
+    }
+    let name = struct_name?;
+    let mut fields: Vec<(String, Ty)> = Vec::with_capacity(params.len() + 1);
+    fields.push(("__struct".to_string(), Ty::String));
+    for p in params {
+        fields.push((
+            p.name.clone(),
+            p.ty.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any),
+        ));
+    }
+    Some(Ty::Struct(name, fields))
+}
+
+/// First string-valued entry for `key` in a map literal's entry list.
+fn map_str_field(entries: &[(String, Expr)], key: &str) -> Option<String> {
+    for (k, v) in entries {
+        if k == key {
+            if let ExprKind::Str(s) = &v.kind {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Enum name carried by a data-variant constructor's body, i.e. a single
+/// `return { __enum: "Name", ... }`.
+fn fnlit_enum_name(body: &[Stmt]) -> Option<String> {
+    if body.len() != 1 {
+        return None;
+    }
+    let ret = match &body[0].kind {
+        StmtKind::Return(Some(e)) => e,
+        _ => return None,
+    };
+    let m = match &ret.kind {
+        ExprKind::Map(m) => m,
+        _ => return None,
+    };
+    map_str_field(m, "__enum")
+}
+
+/// Detect the desugared enum declaration the parser emits for
+/// `enum Name { Unit, Data(T), ... }`: a map whose every value is either a
+/// unit-variant map (`{ __enum: "Name", __variant: "V" }`) or a data-variant
+/// constructor (`fn(..) { return { __enum: "Name", __variant: "V", values } }`).
+/// Returns a `Ty::Enum` listing each variant's access type (unit → `Any`,
+/// data → `Fn(params) -> Any`). Returns `None` for ordinary map literals.
+fn enum_decl_ty(entries: &[(String, Expr)]) -> Option<Ty> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut enum_name: Option<String> = None;
+    let mut variants: Vec<(String, Ty)> = Vec::with_capacity(entries.len());
+    for (vname, val) in entries {
+        let (ename, vty) = match &val.kind {
+            ExprKind::Map(m) => {
+                let en = map_str_field(m, "__enum")?;
+                map_str_field(m, "__variant")?; // unit variant must carry __variant
+                let inst = Ty::EnumInstance(en.clone());
+                (en, inst)
+            }
+            ExprKind::FnLit(_, params, _, body) => {
+                let en = fnlit_enum_name(body)?;
+                let ptys = params
+                    .iter()
+                    .map(|p| p.ty.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any))
+                    .collect::<Vec<_>>();
+                let inst = Ty::EnumInstance(en.clone());
+                (en, Ty::Fn(ptys, Box::new(inst)))
+            }
+            _ => return None,
+        };
+        match &enum_name {
+            None => enum_name = Some(ename),
+            Some(e) if *e == ename => {}
+            Some(_) => return None, // mixed enum names → not a single enum decl
+        }
+        variants.push((vname.clone(), vty));
+    }
+    Some(Ty::Enum(enum_name?, variants))
+}
+
+/// Find the closest field name to `name` among `fields` (edit distance ≤ 3),
+/// for "did you mean?" diagnostics on unknown struct fields / enum variants.
+fn closest_field(fields: &[(String, Ty)], name: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    let mut best_dist = usize::MAX;
+    for (fname, _) in fields {
+        let dist = lev_distance(name, fname);
+        if dist < best_dist && dist <= 3 {
+            best_dist = dist;
+            best = Some(fname.clone());
+        }
+    }
+    best
+}
+
+/// Rewrite `Ty::Generic(name)` to `Ty::EnumInstance(name)` wherever `name` is a
+/// declared enum, recursing through containers. This is how a `: EnumName`
+/// annotation (parsed as a generic-looking uppercase type) becomes a real enum
+/// instance type for exhaustiveness checking.
+fn resolve_enum_names(ty: Ty, enums: &std::collections::HashMap<String, Vec<String>>) -> Ty {
+    match ty {
+        Ty::Generic(name) if enums.contains_key(&name) => Ty::EnumInstance(name),
+        Ty::Array(inner) => Ty::Array(Box::new(resolve_enum_names(*inner, enums))),
+        Ty::Map(k, v) => Ty::Map(
+            Box::new(resolve_enum_names(*k, enums)),
+            Box::new(resolve_enum_names(*v, enums)),
+        ),
+        Ty::Option(inner) => Ty::Option(Box::new(resolve_enum_names(*inner, enums))),
+        Ty::NonNull(inner) => Ty::NonNull(Box::new(resolve_enum_names(*inner, enums))),
+        Ty::Result(ok, err) => Ty::Result(
+            Box::new(resolve_enum_names(*ok, enums)),
+            Box::new(resolve_enum_names(*err, enums)),
+        ),
+        Ty::Fn(params, ret) => Ty::Fn(
+            params
+                .into_iter()
+                .map(|p| resolve_enum_names(p, enums))
+                .collect(),
+            Box::new(resolve_enum_names(*ret, enums)),
+        ),
+        other => other,
+    }
+}
+
 #[derive(Default)]
 struct Env {
     scopes: Vec<std::collections::HashMap<String, Ty>>,
+    /// Declared enums: name → variant names, for annotation resolution and
+    /// match-exhaustiveness checking.
+    enums: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Env {
     fn new() -> Self {
         Env {
             scopes: vec![std::collections::HashMap::new()],
+            enums: std::collections::HashMap::new(),
         }
+    }
+
+    /// Resolve a syntactic type annotation, mapping `: EnumName` to an enum
+    /// instance type when `EnumName` is a declared enum.
+    fn resolve_ty(&self, t: &TypeExpr) -> Ty {
+        resolve_enum_names(Ty::from_type_expr(t), &self.enums)
+    }
+
+    /// Register an enum's variant set (used for exhaustiveness checks).
+    fn register_enum(&mut self, name: String, variants: Vec<String>) {
+        self.enums.insert(name, variants);
     }
     fn push(&mut self) {
         self.scopes.push(std::collections::HashMap::new());
@@ -345,6 +599,11 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("read_line", fn0(str_ty.clone())),
         ("parse_number", fn1(any.clone())),
         ("parse_bool", fn1(any.clone())),
+        // Precision-ladder constructors return their first-class types so
+        // inference flows them (e.g. `let x = bigint(5)` types `x` as bigint).
+        ("bigint", Ty::Fn(vec![any.clone()], Box::new(Ty::BigInt))),
+        ("rational", Ty::Fn(vec![], Box::new(Ty::Rational))),
+        ("decimal", Ty::Fn(vec![any.clone()], Box::new(Ty::Decimal))),
         ("str_trim", fn1(str_ty.clone())),
         ("str_split", fn2(Ty::Array(Box::new(str_ty.clone())))),
         ("str_starts_with", fn2(bool_ty.clone())),
@@ -412,14 +671,34 @@ pub fn check(stmts: &[Stmt]) -> Vec<Diagnostic> {
     let mut env = Env::new();
     seed_builtin_prelude(&mut env);
 
-    // Hoist function signatures so forward references type-check (compiler modules).
+    // Hoist phase 1: register enum declarations (desugared to `let Name = map{...}`)
+    // first, so type annotations referencing them — `fn f(c: Color)` — resolve to
+    // enum-instance types, and variant access works regardless of order.
     for s in stmts {
-        if let StmtKind::Fn(name, params, ret, _) = &s.kind {
+        if let StmtKind::Let(name, None, init) = &s.kind {
+            if let ExprKind::Map(entries) = &init.kind {
+                if let Some(Ty::Enum(ename, variants)) = enum_decl_ty(entries) {
+                    env.register_enum(
+                        ename.clone(),
+                        variants.iter().map(|(n, _)| n.clone()).collect(),
+                    );
+                    env.insert(name.clone(), Ty::Enum(ename, variants));
+                }
+            }
+        }
+    }
+
+    // Hoist phase 2: function signatures (now enum-aware in their annotations).
+    for s in stmts {
+        if let StmtKind::Fn(name, params, ret, body) = &s.kind {
             let ps = params
                 .iter()
-                .map(|p| p.ty.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any))
+                .map(|p| p.ty.as_ref().map(|t| env.resolve_ty(t)).unwrap_or(Ty::Any))
                 .collect::<Vec<_>>();
-            let r = ret.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any);
+            // Struct constructors get a `Ty::Struct` return type (see
+            // `struct_ctor_return_ty`); ordinary functions use their annotation.
+            let r = struct_ctor_return_ty(params, body)
+                .unwrap_or_else(|| ret.as_ref().map(|t| env.resolve_ty(t)).unwrap_or(Ty::Any));
             env.insert(name.clone(), Ty::Fn(ps, Box::new(r)));
         }
     }
@@ -437,6 +716,56 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
     match &e.kind {
         ExprKind::Match(scrutinee, arms, else_expr) => {
             let _ = infer_expr(scrutinee, env, diags);
+
+            // Exhaustiveness: `match <enum-instance>.__variant { case "V": ... }`
+            // with no `else` and no catch-all arm must cover every variant.
+            if else_expr.is_none() {
+                let has_catch_all = arms.iter().any(|(a, _)| {
+                    matches!(
+                        a,
+                        pblang_core::MatchArm::Wildcard | pblang_core::MatchArm::Bind(_)
+                    )
+                });
+                if !has_catch_all {
+                    if let ExprKind::GetAttr(obj, attr) = &scrutinee.kind {
+                        if attr == "__variant" {
+                            // Re-infer the discriminant's owner without emitting
+                            // duplicate diagnostics.
+                            if let Ty::EnumInstance(ename) =
+                                infer_expr(obj, env, &mut Vec::new())
+                            {
+                                if let Some(all) = env.enums.get(&ename).cloned() {
+                                    let covered: std::collections::HashSet<&str> = arms
+                                        .iter()
+                                        .filter_map(|(a, _)| match a {
+                                            pblang_core::MatchArm::Literal(le) => match &le.kind {
+                                                ExprKind::Str(s) => Some(s.as_str()),
+                                                _ => None,
+                                            },
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    let missing: Vec<String> = all
+                                        .iter()
+                                        .filter(|v| !covered.contains(v.as_str()))
+                                        .cloned()
+                                        .collect();
+                                    if !missing.is_empty() {
+                                        diags.push(Diagnostic {
+                                            message: format!(
+                                                "non-exhaustive match on enum '{}': missing variant(s) {}",
+                                                ename,
+                                                missing.join(", ")
+                                            ),
+                                            span: Some(e.span),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let mut out_ty: Option<Ty> = None;
 
@@ -539,7 +868,51 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
             Ty::Map(_k, v) => *v,
             _ => Ty::Any,
         },
-        ExprKind::GetAttr(_obj, _name) => Ty::Any,
+        ExprKind::GetAttr(obj, name) => {
+            let obj_ty = infer_expr(obj, env, diags);
+            match &obj_ty {
+                Ty::Struct(sname, fields) => {
+                    match fields.iter().find(|(fname, _)| fname == name) {
+                        Some((_, fty)) => fty.clone(),
+                        None => {
+                            let mut msg = format!("no field '{}' on struct '{}'", name, sname);
+                            if let Some(s) = closest_field(fields, name) {
+                                msg.push_str(&format!(". Did you mean '{}'?", s));
+                            }
+                            diags.push(Diagnostic {
+                                message: msg,
+                                span: Some(e.span),
+                            });
+                            Ty::Any
+                        }
+                    }
+                }
+                Ty::Enum(ename, variants) => {
+                    match variants.iter().find(|(vname, _)| vname == name) {
+                        Some((_, vty)) => vty.clone(),
+                        None => {
+                            let mut msg = format!("no variant '{}' on enum '{}'", name, ename);
+                            if let Some(s) = closest_field(variants, name) {
+                                msg.push_str(&format!(". Did you mean '{}'?", s));
+                            }
+                            diags.push(Diagnostic {
+                                message: msg,
+                                span: Some(e.span),
+                            });
+                            Ty::Any
+                        }
+                    }
+                }
+                // Enum-instance access: the discriminant fields are well-known;
+                // payload fields are variant-dependent, so stay lenient (`any`).
+                Ty::EnumInstance(_) => match name.as_str() {
+                    "__variant" | "__enum" => Ty::String,
+                    "values" => Ty::Array(Box::new(Ty::Any)),
+                    _ => Ty::Any,
+                },
+                _ => Ty::Any,
+            }
+        }
         ExprKind::Call(callee, args) => {
             // Infer callee type to determine return type
             let callee_ty = infer_expr(callee, env, diags);
@@ -571,16 +944,14 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
         ExprKind::FnLit(_name, params, ret, body) => {
             let ps = params
                 .iter()
-                .map(|p| p.ty.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any))
+                .map(|p| p.ty.as_ref().map(|t| env.resolve_ty(t)).unwrap_or(Ty::Any))
                 .collect::<Vec<_>>();
-            let declared_ret = ret.as_ref().map(Ty::from_type_expr);
+            let declared_ret = ret.as_ref().map(|t| env.resolve_ty(t));
 
             env.push();
             for p in params {
-                env.insert(
-                    p.name.clone(),
-                    p.ty.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any),
-                );
+                let pty = p.ty.as_ref().map(|t| env.resolve_ty(t)).unwrap_or(Ty::Any);
+                env.insert(p.name.clone(), pty);
             }
             let mut fn_ret_stack = vec![declared_ret.clone()];
             for st in body {
@@ -620,7 +991,8 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
             let ta = infer_expr(a, env, diags);
             let tb = infer_expr(b, env, diags);
             match (&ta, &tb) {
-                (Ty::Number, Ty::Number) => Ty::Number,
+                // Numeric ladder: result is the higher-precision type.
+                (x, y) if x.is_numeric() && y.is_numeric() => Ty::numeric_widen(x, y),
                 (Ty::String, Ty::String) => Ty::String,
                 // Nil in addition is always wrong
                 (Ty::Nil, _) => {
@@ -657,9 +1029,9 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
                     message: "arithmetic on nil (left operand is nil)".into(),
                     span: Some(a.span),
                 });
-            } else if ta != Ty::Any && ta != Ty::Number {
+            } else if !ta.is_numeric() {
                 diags.push(Diagnostic {
-                    message: format!("expected number operands, got {}", ta),
+                    message: format!("expected numeric operands, got {}", ta),
                     span: Some(e.span),
                 });
             }
@@ -668,9 +1040,9 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
                     message: "arithmetic on nil (right operand is nil)".into(),
                     span: Some(b.span),
                 });
-            } else if tb != Ty::Any && tb != Ty::Number {
+            } else if !tb.is_numeric() {
                 diags.push(Diagnostic {
-                    message: format!("expected number operands, got {}", tb),
+                    message: format!("expected numeric operands, got {}", tb),
                     span: Some(e.span),
                 });
             }
@@ -685,7 +1057,12 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
                     }
                 }
             }
-            Ty::Number
+            // Result follows the precision ladder (number/bigint/rational/decimal).
+            if ta.is_numeric() && tb.is_numeric() {
+                Ty::numeric_widen(&ta, &tb)
+            } else {
+                Ty::Number
+            }
         }
         ExprKind::Eq(a, b)
         | ExprKind::NotEq(a, b)
@@ -779,7 +1156,7 @@ fn check_stmt(
         StmtKind::Let(name, ty, init) => {
             let init_ty = infer_expr(init, env, diags);
             if let Some(t) = ty {
-                let ann = Ty::from_type_expr(t);
+                let ann = env.resolve_ty(t);
                 // Check NonNull (T!) constraint explicitly
                 if matches!(&ann, Ty::NonNull(_)) && matches!(&init_ty, Ty::Nil) {
                     diags.push(Diagnostic {
@@ -797,7 +1174,24 @@ fn check_stmt(
                 }
                 env.insert(name.clone(), ann);
             } else {
-                env.insert(name.clone(), init_ty);
+                // An unannotated `let Name = map{...}` that matches the enum
+                // desugaring binds the richer `Ty::Enum` so variant access and
+                // data-variant calls are checked, and registers its variant set
+                // (covers non-top-level enums that the hoist pass didn't see).
+                let bound = match &init.kind {
+                    ExprKind::Map(entries) => match enum_decl_ty(entries) {
+                        Some(Ty::Enum(ename, variants)) => {
+                            env.register_enum(
+                                ename.clone(),
+                                variants.iter().map(|(n, _)| n.clone()).collect(),
+                            );
+                            Ty::Enum(ename, variants)
+                        }
+                        _ => init_ty,
+                    },
+                    _ => init_ty,
+                };
+                env.insert(name.clone(), bound);
             }
         }
         StmtKind::Assign(name, expr) => {
@@ -833,19 +1227,27 @@ fn check_stmt(
         StmtKind::Fn(name, params, ret, body) => {
             let ps = params
                 .iter()
-                .map(|p| p.ty.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any))
+                .map(|p| p.ty.as_ref().map(|t| env.resolve_ty(t)).unwrap_or(Ty::Any))
                 .collect::<Vec<_>>();
-            let r = ret.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any);
-            env.insert(name.clone(), Ty::Fn(ps.clone(), Box::new(r.clone())));
+            let struct_ret = struct_ctor_return_ty(params, body);
+            let declared_r = ret.as_ref().map(|t| env.resolve_ty(t)).unwrap_or(Ty::Any);
+            // The public signature exposes the struct type for callers; the body
+            // is checked against `Any` for constructors so the returned map
+            // literal isn't flagged as a Map→Struct mismatch.
+            let signature_ret = struct_ret.clone().unwrap_or_else(|| declared_r.clone());
+            env.insert(name.clone(), Ty::Fn(ps.clone(), Box::new(signature_ret)));
 
             env.push();
             for p in params {
-                env.insert(
-                    p.name.clone(),
-                    p.ty.as_ref().map(Ty::from_type_expr).unwrap_or(Ty::Any),
-                );
+                let pty = p.ty.as_ref().map(|t| env.resolve_ty(t)).unwrap_or(Ty::Any);
+                env.insert(p.name.clone(), pty);
             }
-            ret_stack.push(Some(r));
+            let body_ret = if struct_ret.is_some() {
+                Ty::Any
+            } else {
+                declared_r
+            };
+            ret_stack.push(Some(body_ret));
             for st in body {
                 check_stmt(st, env, ret_stack, diags);
             }
@@ -983,7 +1385,7 @@ fn check_stmt(
                 });
             }
             if let Some(t) = ty {
-                let ann = Ty::from_type_expr(t);
+                let ann = env.resolve_ty(t);
                 if !init_ty.is_assignable_to(&ann) {
                     diags.push(Diagnostic {
                         message: format!(
@@ -1185,6 +1587,331 @@ mod tests {
         assert!(
             !mismatch_diags.is_empty(),
             "expected argument type mismatch diagnostic"
+        );
+    }
+
+    #[test]
+    fn test_struct_construction_arg_type_mismatch() {
+        // `struct` desugars to a typed constructor function, so passing the
+        // wrong field type to the constructor is caught as an argument mismatch.
+        let diags = typecheck_source(
+            "struct Point { x: number, y: number }\nlet p = Point(1, \"two\")",
+        );
+        let mismatch: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            !mismatch.is_empty(),
+            "expected struct-construction argument mismatch, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_struct_construction_well_typed_ok() {
+        let diags = typecheck_source(
+            "struct Point { x: number, y: number }\nlet p = Point(1, 2)",
+        );
+        let mismatch: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            mismatch.is_empty(),
+            "well-typed struct construction should not warn: {:?}",
+            mismatch
+        );
+    }
+
+    #[test]
+    fn test_bigint_constructor_type_flows() {
+        // `bigint(x)` infers as bigint; assigning to a string annotation mismatches.
+        let diags = typecheck_source("let x = bigint(5)\nlet s: string = x");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("cannot assign bigint to string")),
+            "expected bigint->string mismatch, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_precision_type_annotations_ok() {
+        // `: bigint` / `: rational` / `: decimal` annotations parse and accept
+        // their constructor values without a mismatch.
+        let diags = typecheck_source(
+            "let a: bigint = bigint(5)\nlet r: rational = rational(\"1/3\")\nlet d: decimal = decimal(\"0.1\")",
+        );
+        let mism: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("cannot assign"))
+            .collect();
+        assert!(mism.is_empty(), "precision annotations should accept their values: {:?}", mism);
+    }
+
+    #[test]
+    fn test_decimal_annotation_rejects_string() {
+        let diags = typecheck_source("let d: decimal = \"hi\"");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("cannot assign string to decimal")),
+            "expected string->decimal mismatch, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_bigint_arithmetic_not_flagged_as_non_number() {
+        // bigint/decimal arithmetic must NOT raise "expected numeric operands".
+        let diags = typecheck_source(
+            "let t = bigint(2) ** 64\nlet u = decimal(\"1.5\") * decimal(\"2\")\nlet v = bigint(3) + bigint(4)",
+        );
+        let numeric_errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("expected numeric operands"))
+            .collect();
+        assert!(numeric_errs.is_empty(), "bigint/decimal arithmetic is numeric: {:?}", numeric_errs);
+    }
+
+    #[test]
+    fn test_struct_field_access_unknown_field() {
+        // Accessing a field the struct doesn't declare is a static error.
+        let diags = typecheck_source(
+            "struct Point { x: number, y: number }\nlet p = Point(1, 2)\nlet z = p.z",
+        );
+        let field_errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("no field") && d.message.contains("Point"))
+            .collect();
+        assert!(
+            !field_errs.is_empty(),
+            "expected unknown-field diagnostic, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_struct_field_access_known_field_ok() {
+        // Accessing declared fields is fine.
+        let diags = typecheck_source(
+            "struct Point { x: number, y: number }\nlet p = Point(1, 2)\nlet a = p.x\nlet b = p.y",
+        );
+        let field_errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("no field"))
+            .collect();
+        assert!(
+            field_errs.is_empty(),
+            "valid field access should not warn: {:?}",
+            field_errs
+        );
+    }
+
+    #[test]
+    fn test_struct_field_type_flows() {
+        // p.x is number, so assigning it to a string-annotated binding mismatches.
+        let diags = typecheck_source(
+            "struct Point { x: number, y: number }\nlet p = Point(1, 2)\nlet s: string = p.x",
+        );
+        let mismatch: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.message.contains("cannot assign")
+                    && d.message.contains("number")
+                    && d.message.contains("string")
+            })
+            .collect();
+        assert!(
+            !mismatch.is_empty(),
+            "field type should flow (number->string mismatch), got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_struct_internal_tag_field_ok() {
+        // The implicit __struct tag is a real (string) field, not an error.
+        let diags = typecheck_source(
+            "struct Point { x: number, y: number }\nlet p = Point(1, 2)\nlet t = p.__struct",
+        );
+        let field_errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("no field"))
+            .collect();
+        assert!(
+            field_errs.is_empty(),
+            "__struct tag access should be allowed: {:?}",
+            field_errs
+        );
+    }
+
+    #[test]
+    fn test_struct_field_did_you_mean() {
+        // Misspelled field gets a did-you-mean suggestion.
+        let diags = typecheck_source(
+            "struct Point { x: number, y: number }\nlet p = Point(1, 2)\nlet z = p.xx",
+        );
+        let suggest: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("no field") && d.message.contains("Did you mean 'x'"))
+            .collect();
+        assert!(
+            !suggest.is_empty(),
+            "expected did-you-mean suggestion, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_enum_unknown_variant() {
+        // Accessing a variant the enum doesn't declare is a static error.
+        let diags = typecheck_source("enum Color { Red, Green, Blue }\nlet c = Color.Purple");
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("no variant") && d.message.contains("Color"))
+            .collect();
+        assert!(
+            !errs.is_empty(),
+            "expected unknown-variant diagnostic, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_enum_known_variant_ok() {
+        let diags = typecheck_source(
+            "enum Color { Red, Green, Blue }\nlet a = Color.Red\nlet b = Color.Blue",
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("no variant"))
+            .collect();
+        assert!(errs.is_empty(), "valid variant access should not warn: {:?}", errs);
+    }
+
+    #[test]
+    fn test_enum_did_you_mean() {
+        let diags = typecheck_source("enum Color { Red, Green, Blue }\nlet c = Color.Rad");
+        let suggest: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("no variant") && d.message.contains("Did you mean 'Red'"))
+            .collect();
+        assert!(
+            !suggest.is_empty(),
+            "expected did-you-mean suggestion, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_enum_data_variant_arg_check() {
+        // Data variants are typed constructors: wrong arg type is caught.
+        let diags = typecheck_source(
+            "enum Shape { Empty, Circle(number) }\nlet c = Shape.Circle(\"x\")",
+        );
+        let mismatch: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            !mismatch.is_empty(),
+            "expected data-variant argument mismatch, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_enum_data_variant_ok() {
+        let diags = typecheck_source(
+            "enum Shape { Empty, Circle(number) }\nlet c = Shape.Circle(5)",
+        );
+        let mismatch: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            mismatch.is_empty(),
+            "well-typed data-variant construction should not warn: {:?}",
+            mismatch
+        );
+    }
+
+    #[test]
+    fn test_enum_match_non_exhaustive() {
+        // Annotated enum param: matching its discriminant without covering all
+        // variants (and no else/catch-all) is a static error.
+        let diags = typecheck_source(
+            "enum Color { Red, Green, Blue }\nfn f(c: Color) { return match c.__variant { case \"Red\": 1; case \"Green\": 2; }; }",
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("non-exhaustive") && d.message.contains("Blue"))
+            .collect();
+        assert!(
+            !errs.is_empty(),
+            "expected non-exhaustive match naming Blue, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_enum_match_exhaustive_ok() {
+        let diags = typecheck_source(
+            "enum Color { Red, Green, Blue }\nfn f(c: Color) { return match c.__variant { case \"Red\": 1; case \"Green\": 2; case \"Blue\": 3; }; }",
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("non-exhaustive"))
+            .collect();
+        assert!(errs.is_empty(), "exhaustive match should not warn: {:?}", errs);
+    }
+
+    #[test]
+    fn test_enum_match_else_is_exhaustive() {
+        let diags = typecheck_source(
+            "enum Color { Red, Green, Blue }\nfn f(c: Color) { return match c.__variant { case \"Red\": 1; else: 0 }; }",
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("non-exhaustive"))
+            .collect();
+        assert!(errs.is_empty(), "match with else is exhaustive: {:?}", errs);
+    }
+
+    #[test]
+    fn test_enum_match_let_bound_instance() {
+        // Inference path: a let-bound enum value is an instance, no annotation needed.
+        let diags = typecheck_source(
+            "enum Color { Red, Green, Blue }\nlet c = Color.Red\nlet r = match c.__variant { case \"Red\": 1; case \"Green\": 2; }",
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("non-exhaustive") && d.message.contains("Blue"))
+            .collect();
+        assert!(
+            !errs.is_empty(),
+            "expected non-exhaustive on let-bound enum, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_enum_match_unannotated_no_false_positive() {
+        // Unannotated param is `any` → enum unknown → no exhaustiveness check.
+        let diags = typecheck_source(
+            "enum Color { Red, Green, Blue }\nfn f(c) { return match c.__variant { case \"Red\": 1; }; }",
+        );
+        let errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("non-exhaustive"))
+            .collect();
+        assert!(
+            errs.is_empty(),
+            "unannotated scrutinee must not trigger exhaustiveness: {:?}",
+            errs
         );
     }
 

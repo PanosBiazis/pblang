@@ -11,7 +11,7 @@
 // Visibility: every item is `pub(super)` so vm.rs can reach them via
 // `fun: strings::str_contains` in the BuiltinFn table.
 
-use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
+use pblang_ir::{alloc_string, Obj, RuntimeError, Value, VmHost};
 
 use super::alloc_array;
 
@@ -119,6 +119,57 @@ pub(super) fn str_slice(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
     }
     let result: String = chars[start..end].iter().collect();
     Ok(alloc_string(result))
+}
+
+/// `slice(seq, start, end)` — polymorphic half-open slice for strings and
+/// arrays. Backs the `seq[a..b]` / `seq[a..]` / `seq[..b]` / `seq[..]` syntax;
+/// a `nil` bound means 0 (start) or len (end). Strings slice by codepoint
+/// (consistent with `len`/`str_slice`/string indexing); arrays slice by
+/// element. Out-of-range bounds clamp; `start >= end` yields empty.
+pub(super) fn slice(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 3 {
+        return Err(host.err(format!(
+            "slice() expects 3 arguments (seq, start, end), got {}",
+            args.len()
+        )));
+    }
+    let bound = |v: &Value, name: &str| -> Result<Option<usize>, RuntimeError> {
+        match v {
+            Value::Nil => Ok(None),
+            Value::Number(n) if n.is_finite() && *n >= 0.0 => Ok(Some(*n as usize)),
+            _ => Err(host.err(format!(
+                "slice(): {name} must be a non-negative number or nil"
+            ))),
+        }
+    };
+    let start_opt = bound(&args[1], "start")?;
+    let end_opt = bound(&args[2], "end")?;
+    match &args[0] {
+        Value::Obj(o) => match o.as_ref() {
+            Obj::String(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                let n = chars.len();
+                let start = start_opt.unwrap_or(0).min(n);
+                let end = end_opt.unwrap_or(n).min(n);
+                if start >= end {
+                    return Ok(alloc_string(String::new()));
+                }
+                Ok(alloc_string(chars[start..end].iter().collect::<String>()))
+            }
+            _ => Err(host.err("slice(): expected a string or array".into())),
+        },
+        Value::Array(a) => {
+            let a = a.borrow();
+            let n = a.len();
+            let start = start_opt.unwrap_or(0).min(n);
+            let end = end_opt.unwrap_or(n).min(n);
+            if start >= end {
+                return Ok(alloc_array(Vec::new()));
+            }
+            Ok(alloc_array(a[start..end].to_vec()))
+        }
+        _ => Err(host.err("slice(): expected a string or array".into())),
+    }
 }
 
 pub(super) fn str_index_of(
@@ -268,6 +319,59 @@ pub(super) fn strcharcodeat(
         )));
     }
     Ok(Value::Number(bytes[idx] as f64))
+}
+
+/// `str_to_bytes(s)` → array<number 0..255>: the raw UTF-8 bytes of `s`.
+///
+/// pblang strings are guaranteed UTF-8, so binary-aware code must work on
+/// byte arrays rather than codepoints. This is the inverse of `bytes_to_str`.
+pub(super) fn str_to_bytes(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(host.err(format!(
+            "str_to_bytes() expects 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let s = args[0]
+        .as_str()
+        .map_err(|m| host.err(format!("str_to_bytes(): {m}")))?;
+    Ok(alloc_array(
+        s.as_bytes().iter().map(|b| Value::Number(*b as f64)).collect(),
+    ))
+}
+
+/// `bytes_to_str(arr)` → string: decode an array of bytes (0..255) as UTF-8.
+///
+/// Errors if the bytes are not valid UTF-8. Inverse of `str_to_bytes`.
+pub(super) fn bytes_to_str(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(host.err(format!(
+            "bytes_to_str() expects 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err(host.err("bytes_to_str(): expected a byte array".into())),
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(arr.borrow().len());
+    for v in arr.borrow().iter() {
+        match v {
+            Value::Number(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 => {
+                bytes.push(*n as u8);
+            }
+            _ => return Err(host.err("bytes_to_str(): expected byte numbers 0..255".into())),
+        }
+    }
+    let s = String::from_utf8(bytes)
+        .map_err(|e| host.err(format!("bytes_to_str(): invalid UTF-8: {e}")))?;
+    Ok(alloc_string(s))
 }
 
 // -------------------------------------------------------------------------

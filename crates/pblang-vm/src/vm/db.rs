@@ -53,6 +53,13 @@ fn pblang_value_to_sqlite_param(
         }
         Value::Obj(o) => match o.as_ref() {
             Obj::String(s) => Ok(rusqlite::types::Value::Text(s.clone())),
+            // SQLite has no arbitrary-precision integer; bind a bigint as TEXT
+            // (its exact decimal) so no precision is lost.
+            Obj::BigInt(n) => Ok(rusqlite::types::Value::Text(n.to_string())),
+            // Likewise a rational binds as its exact "n/d" text, a decimal as
+            // its plain decimal text.
+            Obj::Rational(r) => Ok(rusqlite::types::Value::Text(r.to_string())),
+            Obj::Decimal(d) => Ok(rusqlite::types::Value::Text(d.to_string())),
         },
         Value::Array(a) => {
             // array<number 0..255> → BLOB

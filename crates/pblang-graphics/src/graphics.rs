@@ -1,4 +1,17 @@
-//! Native graphics builtins: minifb backend with framebuffer, events (keyboard/mouse).
+//! Native graphics builtins: minifb framebuffer backend + keyboard/mouse events.
+//!
+//! Every public `gfx*` function in this module is registered as a pblang
+//! builtin by [`gfx_builtins`]. The `GFX_WINDOWS` thread-local owns the
+//! native window handles; each pblang-visible *handle* is a small
+//! integer (the `GFX_NEXT` counter) so pblang code never sees a raw
+//! pointer. The `usize` is round-tripped through [`Value::Number`].
+//!
+//! Window state — back-buffer, last-known mouse position, button state
+//! — lives in the private `GfxWindow` struct. `gfx_present` blits the
+//! buffer to the window; `gfx_poll_events` snapshots the input state
+//! into a pblang map. When the `sdl2` feature is on and
+//! `PBLANG_GFX=sdl2` is set, each builtin delegates to the
+//! `sdl2_backend` module instead.
 
 use minifb::{KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
