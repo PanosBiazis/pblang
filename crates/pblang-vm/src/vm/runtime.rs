@@ -24,11 +24,12 @@ use std::sync::atomic::Ordering;
 
 use pblang_ir::{alloc_string, string_alloc_count, Obj, RuntimeError, Value, VmHost};
 
+use super::errors::vm_cap;
 use super::{alloc_map, ARRAY_ALLOCS, MAP_ALLOCS, MODULE_ALLOCS, VM};
 
 pub(super) fn proc_spawn_wait(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("proc_spawn_wait access denied".into()));
+        return Err(vm_cap!(host, "proc_spawn_wait", "exec"));
     }
     if args.len() != 2 {
         return Err(host.err(format!(
@@ -73,6 +74,23 @@ pub(super) fn str_(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
     Ok(alloc_string(args[0].to_string()))
 }
 
+/// `error(msg)` — raise a runtime error with `msg`. Always fails; never
+/// returns. Stdlib code uses `return error("…")` to signal failure (e.g.
+/// `result.unwrap` on an `Err`), and callers can intercept it with
+/// `try … catch …`. Distinct from `result.err(v)`, which *constructs* an
+/// error value rather than raising one.
+pub(super) fn error_builtin(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    let msg = if args.is_empty() {
+        "error".to_string()
+    } else {
+        args[0].to_string()
+    };
+    Err(host.err(msg))
+}
+
 pub(super) fn read_line(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !args.is_empty() {
         return Err(host.err(format!(
@@ -105,6 +123,7 @@ pub(super) fn len(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runt
     match &args[0] {
         Value::Obj(o) => match o.as_ref() {
             Obj::String(s) => Ok(Value::Number(s.chars().count() as f64)),
+            _ => Err(host.err("len() currently supports strings/arrays/maps only".into())),
         },
         Value::Array(a) => Ok(Value::Number(a.borrow().len() as f64)),
         Value::Map(m) => Ok(Value::Number(m.borrow().len() as f64)),
@@ -114,7 +133,7 @@ pub(super) fn len(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runt
 
 pub(super) fn exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "exec", "exec"));
     }
     // SECURITY: exec(cmd_string) was vulnerable to shell injection because
     // the entire string was passed to `sh -c`. It is now deprecated in favour

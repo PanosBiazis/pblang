@@ -140,12 +140,23 @@ pub(super) fn spawn_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
             let builtins_parent = vm.module.borrow().parent.clone();
             module.borrow_mut().parent = builtins_parent;
         }
+        // Hydrate transferred globals *before* taking the mutable
+        // borrow on `module`, because a global may itself be an
+        // imported Module whose rehydration needs to shared-borrow
+        // `module` to read its `parent` (the builtins chain). Holding
+        // a borrow_mut across spawn_value_from_wire would clash and
+        // panic at runtime.
+        let mut globals_hydrated: Vec<(String, Value)> =
+            Vec::with_capacity(module_globals_wire.len());
+        for (k, wv) in &module_globals_wire {
+            if let Ok(v) = spawn_value_from_wire(wv, module.clone()) {
+                globals_hydrated.push((k.clone(), v));
+            }
+        }
         {
             let mut gm = module.borrow_mut();
-            for (k, wv) in &module_globals_wire {
-                if let Ok(v) = spawn_value_from_wire(wv, module.clone()) {
-                    gm.globals.insert(k.clone(), v);
-                }
+            for (k, v) in globals_hydrated {
+                gm.globals.insert(k, v);
             }
         }
         let child_closure = match spawn_closure_from_wire(&root_wire, module) {

@@ -60,6 +60,12 @@ pub struct TypeExpr {
 pub enum TypeKind {
     Any,
     Number,
+    /// Arbitrary-precision integer (`bigint`).
+    BigInt,
+    /// Exact arbitrary-precision rational (`rational`).
+    Rational,
+    /// Arbitrary-precision base-10 decimal (`decimal`).
+    Decimal,
     Bool,
     String,
     Nil,
@@ -751,6 +757,57 @@ fn preprocess_for_parse(input: &str) -> (String, Vec<PolyglotBlock>) {
     (masked, blocks)
 }
 
+/// Maximum bracket/paren/brace nesting depth the parser will accept. Source that
+/// nests deeper is rejected up front with a clean `ParseError` instead of
+/// overflowing the recursive descent parser's native stack — a `(((…)))` /
+/// `[[[…]]]` / `{{{…}}}` "stack bomb" from an untrusted `.pb`/`.sapp` file would
+/// otherwise abort the whole process uncatchably. 512 is far above any realistic
+/// hand-written or generated nesting.
+pub const MAX_NESTING_DEPTH: usize = 512;
+
+/// Scan comment-masked source for the deepest bracket nesting, skipping string
+/// literals. Returns a `ParseError` at the first offending offset if the depth
+/// exceeds [`MAX_NESTING_DEPTH`]. O(n), iterative (no recursion of its own).
+fn check_nesting_depth(masked: &str) -> Option<ParseError> {
+    let mut depth: usize = 0;
+    let mut in_dq = false; // inside a "double-quoted" string
+    let mut in_sq = false; // inside a 'single-quoted' string
+    let mut escaped = false;
+    for (i, c) in masked.char_indices() {
+        if in_dq || in_sq {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if (in_dq && c == '"') || (in_sq && c == '\'') {
+                in_dq = false;
+                in_sq = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_dq = true,
+            '\'' => in_sq = true,
+            '(' | '[' | '{' => {
+                depth += 1;
+                if depth > MAX_NESTING_DEPTH {
+                    return Some(ParseError {
+                        message: format!(
+                            "nesting too deep (exceeds {} levels) at byte {}: refusing to parse to avoid a stack overflow",
+                            MAX_NESTING_DEPTH, i
+                        ),
+                        span: i..i,
+                        found: Some(c),
+                    });
+                }
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn errs_to_owned<'src>(errs: Vec<Simple<'src, char>>) -> Vec<ParseError> {
     errs.into_iter()
         .map(|e| {
@@ -771,6 +828,9 @@ fn errs_to_owned<'src>(errs: Vec<Simple<'src, char>>) -> Vec<ParseError> {
 
 pub fn parse_with_polyglot_strict(input: &str) -> ParseWithPolyglotResult {
     let (masked, blocks) = preprocess_for_parse(input);
+    if let Some(err) = check_nesting_depth(&masked) {
+        return Err(vec![err]);
+    }
     let result: Result<Vec<Stmt>, Vec<ParseError>> = {
         let parsed = parser().parse(masked.as_str());
         let (out, errs) = parsed.into_output_errors();
@@ -791,6 +851,9 @@ pub fn parse_with_polyglot_strict(input: &str) -> ParseWithPolyglotResult {
 
 pub fn parse_with_polyglot(input: &str) -> ParseWithPolyglotResult {
     let (masked, blocks) = preprocess_for_parse(input);
+    if let Some(err) = check_nesting_depth(&masked) {
+        return Err(vec![err]);
+    }
 
     // SP1-gamma fix: prefer strict parser().parse() over parse_recovery().
     // parse_recovery() consumes unexpected characters (like guard separators `~`/`#`)
@@ -840,4 +903,61 @@ pub fn parse(input: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
 
 pub fn parse_strict(input: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
     parse_with_polyglot_strict(input).map(|(stmts, _)| stmts)
+}
+
+#[cfg(test)]
+mod depth_guard_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_deeply_nested_parens_without_overflow() {
+        // A `(((…1…)))` bomb that would otherwise overflow the recursive parser.
+        let n = MAX_NESTING_DEPTH + 50;
+        let src = format!("let x = {}1{}", "(".repeat(n), ")".repeat(n));
+        let err = parse_strict(&src).expect_err("deep nesting must be rejected");
+        assert!(
+            err.iter().any(|e| e.message.contains("nesting too deep")),
+            "expected a nesting-depth error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_deeply_nested_brackets_and_braces() {
+        let n = MAX_NESTING_DEPTH + 10;
+        for (open, close) in [('[', ']'), ('{', '}')] {
+            let src = format!(
+                "let x = {}{}",
+                open.to_string().repeat(n),
+                close.to_string().repeat(n)
+            );
+            assert!(
+                parse_strict(&src)
+                    .err()
+                    .map(|es| es.iter().any(|e| e.message.contains("nesting too deep")))
+                    .unwrap_or(false),
+                "depth bomb with {}{} should be rejected",
+                open,
+                close
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_reasonable_nesting() {
+        // Realistic nesting (well under the limit) must still parse.
+        let n = 30;
+        let src = format!("let x = {}1{}", "(".repeat(n), ")".repeat(n));
+        assert!(parse_strict(&src).is_ok(), "shallow nesting must parse");
+    }
+
+    #[test]
+    fn brackets_inside_strings_do_not_count() {
+        // A string literal full of '(' must not trip the depth guard.
+        let src = format!("let s = \"{}\"", "(".repeat(MAX_NESTING_DEPTH + 100));
+        assert!(
+            parse_strict(&src).is_ok(),
+            "brackets inside a string literal must not count toward nesting depth"
+        );
+    }
 }

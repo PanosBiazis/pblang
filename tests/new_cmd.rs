@@ -1549,3 +1549,254 @@ fn serve_websocket_version_returns_pkg_version() {
         "expected service identifier in WS reply, got: {reply}"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// `pblang.toml [workspace]` — workspace-aware build
+// ──────────────────────────────────────────────────────────────────────
+
+/// Helper: scaffold a single pblang package at `dir` with a trivial
+/// `src/main.sapp` that type-checks.
+fn write_pkg(dir: &std::path::Path, name: &str) {
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir src");
+    std::fs::write(
+        dir.join("pblang.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src").join("main.sapp"), "print \"ok\";\n").unwrap();
+}
+
+#[test]
+fn workspace_build_walks_literal_members() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_ws_literal_{nonce}"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    // Virtual workspace: no [package] at the root, just [workspace].
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[workspace]\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .unwrap();
+    write_pkg(&work.join("alpha"), "alpha");
+    write_pkg(&work.join("beta"), "beta");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .output()
+        .expect("run pblang build");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(
+        out.status.success(),
+        "workspace build should succeed. stderr={stderr} stdout={stdout}"
+    );
+    assert!(stdout.contains("build ok [alpha]"), "stdout={stdout}");
+    assert!(stdout.contains("build ok [beta]"), "stdout={stdout}");
+    assert!(
+        stdout.contains("workspace build ok (2 packages)"),
+        "stdout={stdout}"
+    );
+    // Virtual workspace shouldn't print a "workspace root" line because
+    // there's no [package] at the root.
+    assert!(
+        !stdout.contains("workspace root"),
+        "virtual workspace should not build a root package. stdout={stdout}"
+    );
+}
+
+#[test]
+fn workspace_build_expands_trailing_star_pattern() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_ws_star_{nonce}"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .unwrap();
+    // Three valid members + one decoy dir without pblang.toml.
+    write_pkg(&work.join("crates").join("aaa"), "aaa");
+    write_pkg(&work.join("crates").join("bbb"), "bbb");
+    write_pkg(&work.join("crates").join("ccc"), "ccc");
+    std::fs::create_dir_all(work.join("crates").join("not_a_pkg")).unwrap();
+    std::fs::write(
+        work.join("crates").join("not_a_pkg").join("README.md"),
+        "ignore me",
+    )
+    .unwrap();
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .output()
+        .expect("run pblang build");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(
+        out.status.success(),
+        "wildcard workspace build should succeed. stderr={stderr} stdout={stdout}"
+    );
+    assert!(stdout.contains("build ok [crates/aaa]"), "stdout={stdout}");
+    assert!(stdout.contains("build ok [crates/bbb]"), "stdout={stdout}");
+    assert!(stdout.contains("build ok [crates/ccc]"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("not_a_pkg"),
+        "directories without pblang.toml should be skipped silently. stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("workspace build ok (3 packages)"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn workspace_build_honors_exclude() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_ws_exclude_{nonce}"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/skipme\"]\n",
+    )
+    .unwrap();
+    write_pkg(&work.join("crates").join("kept"), "kept");
+    write_pkg(&work.join("crates").join("skipme"), "skipme");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .output()
+        .expect("run pblang build");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stdout={stdout}");
+    assert!(stdout.contains("build ok [crates/kept]"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("[crates/skipme]"),
+        "excluded member should not be built. stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("workspace build ok (1 package)"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn workspace_build_hybrid_root_builds_both_root_and_members() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_ws_hybrid_{nonce}"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work.join("src")).unwrap();
+    // Hybrid: root is a package AND a workspace.
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"sub\"]\n",
+    )
+    .unwrap();
+    std::fs::write(work.join("src").join("main.sapp"), "print \"root\";\n").unwrap();
+    write_pkg(&work.join("sub"), "sub");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .output()
+        .expect("run pblang build");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stdout={stdout}");
+    assert!(
+        stdout.contains("build ok [workspace root]"),
+        "hybrid workspace should build the root package. stdout={stdout}"
+    );
+    assert!(stdout.contains("build ok [sub]"), "stdout={stdout}");
+    assert!(
+        stdout.contains("workspace build ok (2 packages)"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn workspace_build_missing_member_manifest_errors() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_ws_missing_{nonce}"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    // "ghost" is named as a literal member but no directory exists for it.
+    std::fs::write(
+        work.join("pblang.toml"),
+        "[workspace]\nmembers = [\"ghost\"]\n",
+    )
+    .unwrap();
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .output()
+        .expect("run pblang build");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(!out.status.success(), "stderr={stderr}");
+    assert!(
+        stderr.contains("ghost") && stderr.contains("pblang.toml"),
+        "error should name the missing member and its manifest. stderr={stderr}"
+    );
+}
+
+#[test]
+fn workspace_build_single_package_mode_unchanged() {
+    // No [workspace] section → single-package behavior, same stdout shape as
+    // pre-workspace pblang. Acts as a regression guard.
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_ws_solo_{nonce}"));
+    let _ = std::fs::remove_dir_all(&work);
+    write_pkg(&work, "solo");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("build")
+        .output()
+        .expect("run pblang build");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stdout={stdout}");
+    assert!(
+        stdout.trim() == "build ok",
+        "single-package build should print exactly 'build ok'. got: {stdout:?}"
+    );
+}

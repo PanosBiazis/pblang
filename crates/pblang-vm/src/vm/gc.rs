@@ -38,22 +38,28 @@ thread_local! {
     static GC_MODULES: RefCell<GcModuleRegistry> = RefCell::new(HashMap::new());
 }
 
+// NOTE on the id: the mark phase keys live objects by `Rc::as_ptr(..)` (a
+// pointer to the `RefCell<T>` allocation). Registration MUST use the same
+// pointer. Using the method form `x.as_ptr()` resolves to `RefCell::as_ptr`,
+// which returns a pointer to the *inner* value — offset from the RefCell by
+// the borrow flag — so it would never match the mark ids, and every live
+// container would be wrongly swept. Always use `Rc::as_ptr` here.
 pub(super) fn gc_register_array(a: &Rc<RefCell<Vec<Value>>>) {
-    let id = a.as_ptr() as usize;
+    let id = Rc::as_ptr(a) as usize;
     GC_ARRAYS.with(|t| {
         t.borrow_mut().insert(id, Rc::downgrade(a));
     });
 }
 
 pub(super) fn gc_register_map(m: &Rc<RefCell<HashMap<String, Value>>>) {
-    let id = m.as_ptr() as usize;
+    let id = Rc::as_ptr(m) as usize;
     GC_MAPS.with(|t| {
         t.borrow_mut().insert(id, Rc::downgrade(m));
     });
 }
 
 pub(super) fn gc_register_module(m: &Rc<RefCell<Module>>) {
-    let id = m.as_ptr() as usize;
+    let id = Rc::as_ptr(m) as usize;
     GC_MODULES.with(|t| {
         t.borrow_mut().insert(id, Rc::downgrade(m));
     });

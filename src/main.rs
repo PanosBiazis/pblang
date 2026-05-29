@@ -136,7 +136,15 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run all .sap/.sapp/.bpx files in the given directory
+    /// Clippy-style idiom/style lints (alias of `lint`)
+    Clippy {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Discover and run `fn test_*` functions inside .sap/.sapp/.bpx
+    /// files (cargo-test style); falls back to whole-file execution
+    /// for files that declare no `test_*` functions. Supports
+    /// `--filter <substr>` to run a subset.
     Test {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -248,15 +256,16 @@ fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    let candidate = [
-        man_dir.join("main.sap"),
-        man_dir.join("main.sapp"),
-        man_dir.join("main.bpx"),
-        man_dir.join("src").join("main.sap"),
-        man_dir.join("src").join("main.sapp"),
-        man_dir.join("src").join("main.bpx"),
-    ]
-    .into_iter()
+    let candidate = pblang_pm::MODULE_EXTENSIONS
+        .iter()
+        .flat_map(|ext| {
+            [
+                man_dir.join(format!("main.{ext}")),
+                man_dir.join("src").join(format!("main.{ext}")),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
     .filter_map(|p| p.canonicalize().ok())
     .find(|resolved| resolved.is_file() && resolved.starts_with(&package_root));
 
@@ -416,6 +425,67 @@ fn generate_lockfile_for_cli(
     }
 }
 
+/// Run the `pblang build` pipeline against one package directory: shadow-
+/// validate the manifest, regenerate `pblang.lock`, then parse + type-check
+/// the package entry. Returns `Err(exit_code)` on any failure with a message
+/// already printed to stderr — the caller does `std::process::exit(code)`.
+/// Workspace-walking callers pass `label = Some("crates/foo")` so error
+/// lines identify the failing member.
+fn build_one_package(
+    man_dir: &Path,
+    registry_index_url: Option<&str>,
+    require_registry_sha256_cli: bool,
+    label: Option<&str>,
+) -> Result<(), i32> {
+    let prefix: String = match label {
+        Some(l) => format!("pblang build [{}]", l),
+        None => "pblang build".into(),
+    };
+    if let Err(e) = shadow_validate_manifest_with_pblang(man_dir, "build") {
+        eprintln!("{}", e);
+        return Err(1);
+    }
+    let lock = generate_lockfile_for_cli(man_dir, registry_index_url, require_registry_sha256_cli)
+        .map_err(|e| {
+            eprintln!("{}: failed to generate lockfile: {}", prefix, e);
+            1i32
+        })?;
+    let lock_str = pblang_pm::write_lockfile(&lock).map_err(|e| {
+        eprintln!("{}: failed to serialize lockfile: {}", prefix, e);
+        1i32
+    })?;
+    let lock_path = man_dir.join("pblang.lock");
+    std::fs::write(&lock_path, lock_str).map_err(|e| {
+        eprintln!("{}: failed to write {}: {}", prefix, lock_path.display(), e);
+        1i32
+    })?;
+    let (entry_path, src) = read_package_entry_source(man_dir).map_err(|e| {
+        eprintln!("{}: {}", prefix, e);
+        1i32
+    })?;
+    let path_str = entry_path.to_string_lossy().into_owned();
+    match parse_strict(&src) {
+        Ok(stmts) => {
+            let diags = type_check(&stmts);
+            if !diags.is_empty() {
+                for d in diags {
+                    if let Some(sp) = d.span {
+                        eprintln!("{}:{}..{}: {}", path_str, sp.start, sp.end, d.message);
+                    } else {
+                        eprintln!("{}: {}", path_str, d.message);
+                    }
+                }
+                return Err(1);
+            }
+        }
+        Err(errs) => {
+            print_parse_errors(&src, errs, Some(&path_str));
+            return Err(2);
+        }
+    }
+    Ok(())
+}
+
 fn escape_pblang_string_literal(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -556,6 +626,68 @@ fn run_manifest_validator_pblang_file(manifest_path: &Path) -> Result<serde_json
         })?;
     serde_json::from_str::<serde_json::Value>(&rendered)
         .map_err(|e| format!("parse pblang manifest validator JSON output failed: {e}"))
+}
+
+/// Format `src` using the **self-hosted** formatter implemented in pblang
+/// (`stdlib/compiler/formatter.sapp::format_source`) instead of the Rust
+/// formatter. This is Phase 0 of the Rust→pblang migration: a real toolchain
+/// command (`pblang fmt --via-pblang`) running on the pblang implementation,
+/// kept honest by the `tests/fmt_drift.rs` differential test (Rust ≡ pblang).
+fn run_self_hosted_fmt(src: &str, max_line_length: Option<usize>) -> Result<String, String> {
+    let escaped = escape_pblang_string_literal(src);
+    let cap_arg = match max_line_length {
+        Some(n) => n.to_string(),
+        None => "nil".to_string(),
+    };
+    let driver = format!(
+        "let f = import(\"stdlib:compiler/formatter.sapp\"); print f.format_source(\"{escaped}\", {cap_arg});"
+    );
+    let (stmts, _blocks) = parse_with_polyglot(&driver)
+        .map_err(|errs| format!("parse self-hosted fmt driver failed: {errs:?}"))?;
+    let mut chunk =
+        compile(stmts).map_err(|e| format!("compile self-hosted fmt driver failed: {e}"))?;
+    chunk.source = Some(std::rc::Rc::new(driver.clone()));
+    let mut vm = VM::with_stdlib(StdlibConfig::default());
+    let out = vm
+        .run_collect(chunk)
+        .map_err(|e| format!("run self-hosted formatter failed: {}", e.message))?;
+    out.last()
+        .ok_or_else(|| "self-hosted formatter produced no output".to_string())
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .map_err(|e| format!("self-hosted formatter output was not a string: {e}"))
+        })
+}
+
+/// Analyze `src` using the **self-hosted** frontend implemented in pblang
+/// (`stdlib/compiler/selfhost_frontend.sapp`) rather than the Rust front end —
+/// a migration step toward self-hosting the `--check` path. Returns a one-line
+/// summary. The Rust `--check` remains the default until parity is proven.
+fn run_self_hosted_check(src: &str) -> Result<String, String> {
+    let escaped = escape_pblang_string_literal(src);
+    let driver = format!(
+        "let fe = import(\"stdlib:compiler/selfhost_frontend.sapp\"); \
+let r = fe.frontend_analyze(\"{escaped}\"); \
+if r.ok {{ print \"self-hosted check ok (stmts=\" + str(r.stmt_count) + \", tokens=\" + str(r.tokens_count) + \")\"; }} \
+else {{ print \"self-hosted check failed: \" + str(r.errors); }}"
+    );
+    let (stmts, _blocks) = parse_with_polyglot(&driver)
+        .map_err(|errs| format!("parse self-hosted check driver failed: {errs:?}"))?;
+    let mut chunk =
+        compile(stmts).map_err(|e| format!("compile self-hosted check driver failed: {e}"))?;
+    chunk.source = Some(std::rc::Rc::new(driver.clone()));
+    let mut vm = VM::with_stdlib(StdlibConfig::default());
+    let out = vm
+        .run_collect(chunk)
+        .map_err(|e| format!("run self-hosted check failed: {}", e.message))?;
+    out.last()
+        .ok_or_else(|| "self-hosted check produced no output".to_string())
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .map_err(|e| format!("self-hosted check output was not a string: {e}"))
+        })
 }
 
 fn run_manifest_parity_check(manifest_path: &Path) -> Result<serde_json::Value, String> {
@@ -931,14 +1063,16 @@ fn show_help() {
     println!("                            --allow-ffi     Enable ffi_load / ffi_call_typed / polyglot_compile_cached");
     println!("                            --allow-all     Enable every capability (use only for trusted code)");
     println!("                            --sandbox       Disable exec/ffi/net/fs/http/sqlite (paranoid mode)");
-    println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx)");
+    println!("                            --allow-env / --deny-env  Allow/deny env_get reading process env vars (default allow; --sandbox denies)");
+    println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx/env)");
     println!("                          Env-var equivalents: PBLANG_ALLOW_EXEC=1, PBLANG_ALLOW_FFI=1, PBLANG_ALLOW_ALL=1, PBLANG_SANDBOX=1, etc.");
-    println!("  pblang test [dir] [--allow-*]  Run all .sap/.sapp/.bpx files in dir (default: tests); accepts the same capability flags as `run`");
-    println!("  pblang fmt [--max-line-length=N] [file.sap|file.bpx …] Format .sap/.sapp/.bpx (trim, operator spacing, indent 4 spaces, optional line wrap, final newline)");
+    println!("  pblang test [dir] [--filter <substr>] [--allow-*]  Discover and run `fn test_*` functions in dir (default: tests); cargo-test style output. Files with no test_* fns are run wholesale. Accepts the same capability flags as `run`.");
+    println!("  pblang fmt [--max-line-length=N] [--via-pblang] [file.sap|file.bpx …] Format .sap/.sapp/.bpx (trim, operator spacing, indent 4 spaces, optional line wrap, final newline). --via-pblang formats via the self-hosted stdlib/compiler/formatter.sapp instead of the Rust formatter.");
     println!(
-    "  pblang lint [file.sap|file.bpx …] Parse + typecheck files, report diagnostics (exit 1 if any)"
+    "  pblang lint [file.sap|file.bpx …] Parse + typecheck files, report diagnostics (exit 1 if any), plus clippy-style idiom/style/correctness lints"
 );
-    println!("  pblang --check <file>  Parse + typecheck a file (prints diagnostics)");
+    println!("  pblang clippy [file …]   Alias of `lint` (clippy-style idiom lints: bool_comparison, eq_op, double_not, self_assignment, constant_condition, while_true, collapsible_if)");
+    println!("  pblang --check [--via-pblang] <file>  Parse + typecheck a file (prints diagnostics). --via-pblang runs the self-hosted pblang front-end (stdlib/compiler/selfhost_frontend.sapp) instead of the Rust one.");
     println!(
         "  pblang --doc <file> [--html]  Print module docs (exports, functions, polyglot blocks)"
     );
@@ -1134,14 +1268,15 @@ fn print_symbol_table(chunk: &Chunk) {
     // Globals: scan constant table for identifier-like strings.
     for (idx, v) in chunk.constants.iter().enumerate() {
         if let pblang_ir::Value::Obj(o) = v {
-            let pblang_ir::Obj::String(s) = o.as_ref();
-            if !s.is_empty()
-                && s.chars()
-                    .next()
-                    .map(|ch| ch.is_ascii_alphabetic() || ch == '_')
-                    .unwrap_or(false)
-            {
-                println!("let\t{}\toffset:const#{}", s, idx);
+            if let pblang_ir::Obj::String(s) = o.as_ref() {
+                if !s.is_empty()
+                    && s.chars()
+                        .next()
+                        .map(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                        .unwrap_or(false)
+                {
+                    println!("let\t{}\toffset:const#{}", s, idx);
+                }
             }
         }
     }
@@ -1360,7 +1495,33 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     copy_dir_all_inner(&src_root, &src_root, &dst_root, &dst_root)
 }
 
+/// Native stack reserved for the CLI worker thread. The recursive-descent parser
+/// and the AST-walking compiler/typechecker consume native stack proportional to
+/// source nesting; `pblang-core`'s lexical guard caps bracket nesting, but a long
+/// flat operator chain (`1+1+1+…`) still produces a deeply left-nested AST. A
+/// generous stack pushes the overflow threshold far beyond any realistic program
+/// (and the VM's `max_stack_depth` converts runaway *VM* recursion into a clean
+/// error). 256 MiB is virtual-reserve only — pages are committed lazily.
+const CLI_WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
+
 fn main() {
+    // Run the whole CLI on a large-stack worker so deeply-nested (but otherwise
+    // valid) source can't overflow the recursive front-end's native stack and
+    // abort the process uncatchably. Error exits inside the worker still call
+    // `std::process::exit`, which terminates the whole process as before.
+    let worker = std::thread::Builder::new()
+        .name("pblang-main".into())
+        .stack_size(CLI_WORKER_STACK_BYTES)
+        .spawn(run_cli)
+        .expect("failed to spawn pblang worker thread");
+    if worker.join().is_err() {
+        // The worker panicked; its message was already printed by the default
+        // hook. Mirror Rust's standard panic exit code.
+        std::process::exit(101);
+    }
+}
+
+fn run_cli() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -1406,6 +1567,7 @@ fn main() {
             Some(Commands::Serve { args }) => return handle_serve(args),
             Some(Commands::Fmt { args }) => return handle_fmt(args),
             Some(Commands::Lint { args }) => return handle_lint(args),
+            Some(Commands::Clippy { args }) => return handle_lint(args),
             Some(Commands::Test { args }) => return handle_test(args),
             Some(Commands::Run { args }) => return handle_run(args),
             Some(Commands::Compile { args }) => return handle_compile(args),
@@ -1537,7 +1699,7 @@ fn warm_polyglot_cache(man_dir: &std::path::Path) {
         let ext_ok = p
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e == "sapp" || e == "sap" || e == "bpx")
+            .map(pblang_pm::is_module_ext)
             .unwrap_or(false);
         if !ext_ok {
             continue;
@@ -1755,13 +1917,15 @@ fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     if env_on("PBLANG_ALLOW_SQLITE") { cfg.sqlite = true; }
     if env_on("PBLANG_ALLOW_SPAWN")  { cfg.spawn  = true; }
     if env_on("PBLANG_ALLOW_GFX")    { cfg.gfx    = true; }
+    if env_on("PBLANG_ALLOW_ENV")    { cfg.env    = true; }
+    if env_on("PBLANG_DENY_ENV")     { cfg.env    = false; }
     if env_on("PBLANG_ALLOW_ALL") {
         cfg.exec = true; cfg.ffi = true; cfg.net = true; cfg.fs = true;
-        cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true;
+        cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true; cfg.env = true;
     }
     if env_on("PBLANG_SANDBOX") {
         cfg.exec = false; cfg.ffi = false; cfg.net = false; cfg.fs = false;
-        cfg.http = false; cfg.sqlite = false;
+        cfg.http = false; cfg.sqlite = false; cfg.env = false;
     }
 
     // 2. CLI flag scan + strip.
@@ -1775,6 +1939,7 @@ fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             "--allow-sqlite" => { cfg.sqlite = true; false }
             "--allow-spawn"  => { cfg.spawn = true; false }
             "--allow-gfx"    => { cfg.gfx = true;   false }
+            "--allow-env"    => { cfg.env = true;   false }
             "--deny-exec"    => { cfg.exec = false; false }
             "--deny-ffi"     => { cfg.ffi = false;  false }
             "--deny-net"     => { cfg.net = false;  false }
@@ -1783,14 +1948,15 @@ fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             "--deny-sqlite"  => { cfg.sqlite = false; false }
             "--deny-spawn"   => { cfg.spawn = false; false }
             "--deny-gfx"     => { cfg.gfx = false;  false }
+            "--deny-env"     => { cfg.env = false;  false }
             "--allow-all" => {
                 cfg.exec = true; cfg.ffi = true; cfg.net = true; cfg.fs = true;
-                cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true;
+                cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true; cfg.env = true;
                 false
             }
             "--sandbox" => {
                 cfg.exec = false; cfg.ffi = false; cfg.net = false; cfg.fs = false;
-                cfg.http = false; cfg.sqlite = false;
+                cfg.http = false; cfg.sqlite = false; cfg.env = false;
                 false
             }
             _ => true,
@@ -2632,56 +2798,87 @@ fn legacy_dispatch(args: Vec<String>) {
             );
             std::process::exit(1);
         });
-        shadow_validate_manifest_with_pblang(&man_dir, "build").unwrap_or_else(|e| {
-            eprintln!("{}", e);
+
+        // Detect workspace shape: if `man_dir/pblang.toml` carries a
+        // `[workspace]` section, build every member (and the root too if
+        // it also has its own `[package]` section). Otherwise behave as
+        // before — single-package build.
+        let manifest_bytes = std::fs::read(man_dir.join("pblang.toml")).unwrap_or_else(|e| {
+            eprintln!("pblang build: failed to read pblang.toml: {}", e);
             std::process::exit(1);
         });
-        let lock =
-            generate_lockfile_for_cli(&man_dir, registry_index_url, require_registry_sha256_cli)
-                .unwrap_or_else(|e| {
-                    eprintln!("pblang build: failed to generate lockfile: {}", e);
-                    std::process::exit(1);
-                });
-        let lock_str = pblang_pm::write_lockfile(&lock).unwrap_or_else(|e| {
-            eprintln!("pblang build: failed to serialize lockfile: {}", e);
-            std::process::exit(1);
-        });
-        let lock_path = man_dir.join("pblang.lock");
-        std::fs::write(&lock_path, lock_str).unwrap_or_else(|e| {
-            eprintln!(
-                "pblang build: failed to write {}: {}",
-                lock_path.display(),
-                e
-            );
-            std::process::exit(1);
-        });
-        let (entry_path, src) = read_package_entry_source(&man_dir).unwrap_or_else(|e| {
+        let manifest_text = match std::str::from_utf8(&manifest_bytes) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                eprintln!("pblang build: pblang.toml is not valid UTF-8: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let parsed_manifest = pblang_pm::parse_manifest(&manifest_text).unwrap_or_else(|e| {
             eprintln!("pblang build: {}", e);
             std::process::exit(1);
         });
-        let path_str = entry_path.to_string_lossy();
-        match parse_strict(&src) {
-            Ok(stmts) => {
-                let diags = type_check(&stmts);
-                if !diags.is_empty() {
-                    for d in diags {
-                        if let Some(sp) = d.span {
-                            eprintln!("{}:{}..{}: {}", path_str, sp.start, sp.end, d.message);
-                        } else {
-                            eprintln!("{}: {}", path_str, d.message);
-                        }
-                    }
+
+        if let Some(ws) = parsed_manifest.workspace.as_ref() {
+            // Workspace mode.
+            let members =
+                pblang_pm::resolve_workspace_members(&man_dir, ws).unwrap_or_else(|e| {
+                    eprintln!("pblang build: {}", e);
                     std::process::exit(1);
+                });
+            // Hybrid root: also build the root package if it has its own
+            // [package] section. Pure-virtual workspace skips this.
+            let has_root_package = parsed_manifest.package.is_some();
+            if has_root_package {
+                if let Err(code) = build_one_package(
+                    &man_dir,
+                    registry_index_url,
+                    require_registry_sha256_cli,
+                    Some("workspace root"),
+                ) {
+                    std::process::exit(code);
                 }
+                println!("build ok [workspace root]");
             }
-            Err(errs) => {
-                print_parse_errors(&src, errs, Some(&path_str));
-                std::process::exit(2);
+            for m in &members {
+                let label = m
+                    .dir
+                    .strip_prefix(&man_dir)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| m.dir.display().to_string());
+                if let Err(code) = build_one_package(
+                    &m.dir,
+                    registry_index_url,
+                    require_registry_sha256_cli,
+                    Some(&label),
+                ) {
+                    std::process::exit(code);
+                }
+                println!("build ok [{}]", label);
             }
-        }
-        println!("build ok");
-        if warm_polyglot {
-            warm_polyglot_cache(&man_dir);
+            let total = members.len() + if has_root_package { 1 } else { 0 };
+            println!("workspace build ok ({} package{})", total, if total == 1 { "" } else { "s" });
+            if warm_polyglot {
+                // Pre-warm against the workspace root; polyglot blocks
+                // are scanned from this directory downwards, so members
+                // are covered transitively.
+                warm_polyglot_cache(&man_dir);
+            }
+        } else {
+            // Single-package mode (unchanged behavior).
+            if let Err(code) = build_one_package(
+                &man_dir,
+                registry_index_url,
+                require_registry_sha256_cli,
+                None,
+            ) {
+                std::process::exit(code);
+            }
+            println!("build ok");
+            if warm_polyglot {
+                warm_polyglot_cache(&man_dir);
+            }
         }
         return;
     }
@@ -3159,8 +3356,11 @@ fn legacy_dispatch(args: Vec<String>) {
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("--check") {
-        let Some(path) = args.get(1) else {
-            eprintln!("usage: pblang --check <file>");
+        let via_pblang = args
+            .iter()
+            .any(|a| a == "--via-pblang" || a == "--self-host");
+        let Some(path) = args.iter().skip(1).find(|a| !a.starts_with("--")) else {
+            eprintln!("usage: pblang --check [--via-pblang] <file>");
             std::process::exit(2);
         };
         let src = match std::fs::read_to_string(path) {
@@ -3170,6 +3370,19 @@ fn legacy_dispatch(args: Vec<String>) {
                 std::process::exit(1);
             }
         };
+        if via_pblang {
+            // Self-hosted front-end path (pblang checking pblang).
+            match run_self_hosted_check(&src) {
+                Ok(summary) => {
+                    println!("{summary}");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("pblang --check --via-pblang: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         match parse_strict(&src) {
             Ok(stmts) => {
                 let diags = type_check(&stmts);
@@ -3215,6 +3428,9 @@ fn legacy_dispatch(args: Vec<String>) {
             match &t.kind {
                 TypeKind::Any => "any".into(),
                 TypeKind::Number => "number".into(),
+                TypeKind::BigInt => "bigint".into(),
+                TypeKind::Rational => "rational".into(),
+                TypeKind::Decimal => "decimal".into(),
                 TypeKind::Bool => "bool".into(),
                 TypeKind::String => "string".into(),
                 TypeKind::Nil => "nil".into(),
@@ -4244,10 +4460,13 @@ li { margin: 0.3em 0; }
     if args.first().map(|s| s.as_str()) == Some("fmt") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut max_line_length: Option<usize> = None;
+        let mut via_pblang = false;
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         for a in args.iter().skip(1) {
             if let Some(rest) = a.strip_prefix("--max-line-length=") {
                 max_line_length = Some(rest.parse().unwrap_or(100));
+            } else if a.as_str() == "--via-pblang" || a.as_str() == "--self-host" {
+                via_pblang = true;
             } else if a.as_str() != "--max-line-length" {
                 files.push(cwd.join(a));
             }
@@ -4269,11 +4488,37 @@ li { margin: 0.3em 0; }
             if path
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e == "sap" || e == "sapp" || e == "bpx")
+                .map(pblang_pm::is_module_ext)
                 .unwrap_or(false)
             {
                 match std::fs::read_to_string(&path) {
                     Ok(src) => {
+                        // Self-hosting path: format via stdlib/compiler/formatter.sapp.
+                        if via_pblang {
+                            match run_self_hosted_fmt(&src, max_line_length) {
+                                Ok(out) => {
+                                    if out != src {
+                                        if let Err(e) = std::fs::write(&path, &out) {
+                                            eprintln!(
+                                                "pblang fmt --via-pblang: failed to write {}: {}",
+                                                path.display(),
+                                                e
+                                            );
+                                            std::process::exit(1);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "pblang fmt --via-pblang on {}: {}",
+                                        path.display(),
+                                        e
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
+                            continue;
+                        }
                         let lines: Vec<&str> = src.lines().collect();
                         let mut out = String::new();
                         let mut depth: i32 = 0;
@@ -4325,9 +4570,20 @@ li { margin: 0.3em 0; }
                                         );
                                         break;
                                     }
-                                    let break_at =
+                                    let break_at_raw =
                                         line_to_output[..max_len].rfind(' ').unwrap_or(max_len);
-                                    let break_at = if break_at == 0 { max_len } else { break_at };
+                                    // If the only space in the cap window is inside the leading
+                                    // indent, splitting at it produces a head that trims to empty
+                                    // and a tail that re-indents to the same line — infinite loop.
+                                    // Force a hard break at max_len in that case.
+                                    let head_blank = line_to_output[..break_at_raw]
+                                        .trim_end()
+                                        .is_empty();
+                                    let break_at = if break_at_raw == 0 || head_blank {
+                                        max_len
+                                    } else {
+                                        break_at_raw
+                                    };
                                     let rest = line_to_output.split_off(break_at);
                                     let emitted = line_to_output.trim_end().to_string();
                                     out.push_str(&emitted);
@@ -4673,6 +4929,21 @@ li { margin: 0.3em 0; }
                         for (sp, msg) in lint_unused_warnings(&stmts) {
                             eprintln!("{}:{}..{}: warning: {}", path_str, sp.start, sp.end, msg);
                         }
+                        // Clippy-style idiom/style/correctness lints.
+                        for d in pblang_lint::lint(&stmts) {
+                            eprintln!(
+                                "{}:{}..{}: warning: {} [{}: {}]",
+                                path_str,
+                                d.span.start,
+                                d.span.end,
+                                d.message,
+                                d.category.as_str(),
+                                d.name
+                            );
+                            if let Some(help) = &d.help {
+                                eprintln!("    help: {}", help);
+                            }
+                        }
                     }
                 }
                 Err(errs) => {
@@ -4702,13 +4973,33 @@ li { margin: 0.3em 0; }
     if args.first().map(|s| s.as_str()) == Some("test") {
         let mut args = args;
         let stdlib_cfg = parse_capability_flags(&mut args);
+
+        // --filter <substring>: only run tests whose `<file_stem>::<fn_name>`
+        // identifier contains this substring. Mirrors cargo's positional
+        // filter argument; accept both `--filter X` and `--filter=X`.
+        let mut filter: Option<String> = None;
+        let mut positional: Vec<String> = Vec::new();
+        let mut i = 1usize;
+        while i < args.len() {
+            let a = &args[i];
+            if let Some(rest) = a.strip_prefix("--filter=") {
+                filter = Some(rest.to_string());
+                i += 1;
+            } else if a == "--filter" && i + 1 < args.len() {
+                filter = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                positional.push(a.clone());
+                i += 1;
+            }
+        }
+
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let test_dir = args
-            .get(1)
+        let test_dir = positional
+            .first()
             .map(|s| cwd.join(s))
             .unwrap_or_else(|| cwd.join("tests"));
-        let mut passed = 0usize;
-        let mut failed = 0usize;
+
         let mut entries = match std::fs::read_dir(&test_dir) {
             Ok(e) => e,
             Err(e) => {
@@ -4725,60 +5016,223 @@ li { margin: 0.3em 0; }
         .filter(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
-                .map(|e| e == "sap" || e == "sapp" || e == "bpx")
+                .map(pblang_pm::is_module_ext)
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
         entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-        for path in entries {
+        // Plan the work first so we can print the cargo-style
+        // "running N tests" line before any test runs.
+        struct PlannedTest {
+            file_path: std::path::PathBuf,
+            file_src: String,
+            file_stmts: Vec<Stmt>,
+            // None = run the whole file as one test (legacy fallback).
+            // Some(name) = call `fn <name>()` after running the file.
+            fn_name: Option<String>,
+            id: String,
+        }
+        let mut plan: Vec<PlannedTest> = Vec::new();
+        let mut planning_failures: Vec<(String, String)> = Vec::new();
+
+        for path in &entries {
             let path_str = path.to_string_lossy().to_string();
-            let src = match std::fs::read_to_string(&path) {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("test")
+                .to_string();
+            let src = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("FAIL {}: {}", path_str, e);
-                    failed += 1;
+                    planning_failures
+                        .push((stem.clone(), format!("read {path_str}: {e}")));
                     continue;
                 }
             };
-            let src_for_parse = strip_comments_mask(&src);
-            let stmts = match parse_strict(&src_for_parse) {
+            let masked = strip_comments_mask(&src);
+            let stmts = match parse_strict(&masked) {
                 Ok(s) => s,
                 Err(errs) => {
-                    eprintln!("FAIL {}: parse error", path_str);
-                    for err in errs.iter().take(1) {
-                        eprintln!("  {}", format_parse_error(err));
-                    }
-                    failed += 1;
+                    let msg = errs
+                        .first()
+                        .map(format_parse_error)
+                        .unwrap_or_else(|| "parse error".into());
+                    planning_failures.push((stem.clone(), format!("parse: {msg}")));
                     continue;
                 }
             };
-            let mut chunk = match compile(stmts) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("FAIL {}: compile error: {}", path_str, e);
-                    failed += 1;
-                    continue;
-                }
-            };
-            chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
-            chunk.source = Some(std::rc::Rc::new(src));
 
-            let mut vm = VM::with_stdlib(stdlib_cfg.clone());
-            match vm.run(chunk) {
-                Ok(()) => {
-                    passed += 1;
-                    println!("ok {}", path_str);
+            // Discover top-level `fn test_*`. Backward-compat: if none,
+            // run the whole file as a single implicit test.
+            let test_fns: Vec<String> = stmts
+                .iter()
+                .filter_map(|st| match &st.kind {
+                    StmtKind::Fn(name, _, _, _) if name.starts_with("test_") => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if test_fns.is_empty() {
+                let id = stem.clone();
+                if filter.as_deref().map(|f| id.contains(f)).unwrap_or(true) {
+                    plan.push(PlannedTest {
+                        file_path: path.clone(),
+                        file_src: src,
+                        file_stmts: stmts,
+                        fn_name: None,
+                        id,
+                    });
                 }
-                Err(e) => {
-                    failed += 1;
-                    eprintln!("FAIL {}: {}", path_str, e.message);
+            } else {
+                // Stash the parsed+source state once per file; each
+                // test entry will re-clone what it needs. Cheap because
+                // `Stmt` is `Clone`.
+                for name in &test_fns {
+                    let id = format!("{stem}::{name}");
+                    if filter.as_deref().map(|f| id.contains(f)).unwrap_or(true) {
+                        plan.push(PlannedTest {
+                            file_path: path.clone(),
+                            file_src: src.clone(),
+                            file_stmts: stmts.clone(),
+                            fn_name: Some(name.clone()),
+                            id,
+                        });
+                    }
                 }
             }
         }
 
+        let total = plan.len();
         println!();
-        println!("{} passed, {} failed", passed, failed);
+        println!("running {} tests", total);
+
+        let mut passed = 0usize;
+        let mut failed = 0usize;
+        let mut failures: Vec<(String, String)> = Vec::new();
+
+        // Group consecutive entries by file so we only compile + load
+        // each file once, then call each discovered test fn on the
+        // already-loaded VM (test fns sit in the module's globals).
+        let mut idx = 0;
+        while idx < plan.len() {
+            let file_path = plan[idx].file_path.clone();
+            let file_src = plan[idx].file_src.clone();
+            let file_stmts = plan[idx].file_stmts.clone();
+
+            // Run the file once to register top-level fns into the VM's
+            // module globals.
+            let path_str = file_path.to_string_lossy().to_string();
+            let mut file_chunk = match compile(file_stmts) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Mark every planned test for this file as a failure.
+                    while idx < plan.len() && plan[idx].file_path == file_path {
+                        let id = plan[idx].id.clone();
+                        failed += 1;
+                        failures.push((id.clone(), format!("compile error: {e}")));
+                        println!("test {id} ... FAILED");
+                        idx += 1;
+                    }
+                    continue;
+                }
+            };
+            file_chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
+            file_chunk.source = Some(std::rc::Rc::new(file_src));
+
+            let mut vm = VM::with_stdlib(stdlib_cfg.clone());
+            let load_result = vm.run(file_chunk);
+
+            while idx < plan.len() && plan[idx].file_path == file_path {
+                let id = plan[idx].id.clone();
+                let fn_name = plan[idx].fn_name.clone();
+                idx += 1;
+
+                match (&load_result, &fn_name) {
+                    (Err(e), None) => {
+                        // Legacy whole-file test: file load IS the test.
+                        failed += 1;
+                        failures.push((id.clone(), e.message.clone()));
+                        println!("test {id} ... FAILED");
+                    }
+                    (Ok(()), None) => {
+                        passed += 1;
+                        println!("test {id} ... ok");
+                    }
+                    (Err(e), Some(_)) => {
+                        // File load failed; mark all fn-level tests for it as failed.
+                        failed += 1;
+                        failures
+                            .push((id.clone(), format!("file load error: {}", e.message)));
+                        println!("test {id} ... FAILED");
+                    }
+                    (Ok(()), Some(name)) => {
+                        // Synthesize a tiny chunk that calls `<name>()` on
+                        // the already-loaded VM, then returns nil.
+                        let mut call_chunk = pblang_ir::chunk::Chunk::default();
+                        let name_const =
+                            call_chunk.add_const(pblang_ir::alloc_string(name.clone()));
+                        let nil_const = call_chunk.add_const(pblang_ir::Value::Nil);
+                        let sp = pblang_ir::chunk::Span::default();
+                        call_chunk
+                            .write(pblang_ir::OpCode::OpGetGlobal(name_const), sp);
+                        call_chunk.write(pblang_ir::OpCode::OpCall(0), sp);
+                        call_chunk.write(pblang_ir::OpCode::OpPop, sp);
+                        call_chunk
+                            .write(pblang_ir::OpCode::OpConstant(nil_const), sp);
+                        call_chunk.write(pblang_ir::OpCode::OpReturn, sp);
+                        call_chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
+
+                        match vm.run(call_chunk) {
+                            Ok(()) => {
+                                passed += 1;
+                                println!("test {id} ... ok");
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                failures.push((id.clone(), e.message.clone()));
+                                println!("test {id} ... FAILED");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Surface planning-time failures (read error, parse error) after
+        // the run summary so they look like cargo's "could not compile"
+        // output.
+        for (id, msg) in &planning_failures {
+            failed += 1;
+            failures.push((id.clone(), msg.clone()));
+            println!("test {id} ... FAILED");
+        }
+
+        if !failures.is_empty() {
+            println!();
+            println!("failures:");
+            println!();
+            for (id, msg) in &failures {
+                println!("---- {id} stdout ----");
+                println!("{msg}");
+                println!();
+            }
+            println!("failures:");
+            for (id, _) in &failures {
+                println!("    {id}");
+            }
+        }
+
+        let filtered_out = 0usize;
+        println!();
+        let verdict = if failed == 0 { "ok" } else { "FAILED" };
+        println!(
+            "test result: {verdict}. {passed} passed; {failed} failed; \
+             0 ignored; 0 measured; {filtered_out} filtered out"
+        );
         if failed > 0 {
             std::process::exit(1);
         }
@@ -4791,6 +5245,11 @@ li { margin: 0.3em 0; }
         // with the path/`--` script-args parsing below.
         let mut args = args;
         let stdlib_cfg = parse_capability_flags(&mut args);
+        // `--mem-report`: after the program finishes, print a one-line memory /
+        // resource summary (allocation counters + live memory-safety tracker) to
+        // stderr. Works for any program — pblang's own or another project's.
+        let mem_report = args.iter().any(|a| a == "--mem-report");
+        args.retain(|a| a != "--mem-report");
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let mut script_src_preloaded: Option<String> = None;
         let script_path = if let Some(path_arg) = args.get(1) {
@@ -4895,6 +5354,18 @@ li { margin: 0.3em 0; }
         };
 
         let mut vm = VM::with_stdlib(stdlib_cfg);
+        // Trusted CLI execution leaves instruction/memory budgets unbounded (like
+        // `python file.py`), but a generous VM stack-depth cap converts runaway
+        // recursion into a catchable RuntimeError instead of an uncatchable native
+        // stack-overflow abort. The big worker stack (see `CLI_WORKER_STACK_BYTES`)
+        // sits well above this depth.
+        vm.set_limits(Some(VmLimits {
+            max_instructions: None,
+            max_stack_depth: Some(16_384),
+            max_memory_bytes: None,
+            io_timeout_ms: None,
+            max_external_json_bytes: None,
+        }));
         if let Err(e) = vm.run(chunk) {
             let src_ref = e.source.as_deref().unwrap_or(&src);
             let src_name = e.source_name.as_deref().unwrap_or(&path_str);
@@ -4920,6 +5391,9 @@ li { margin: 0.3em 0; }
                 }
             }
             std::process::exit(1);
+        }
+        if mem_report {
+            eprintln!("[mem-report] {}", vm.memory_report());
         }
         return;
     }

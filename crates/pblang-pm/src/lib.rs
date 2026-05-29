@@ -5,6 +5,31 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 // ──────────────────────────────────────────────────────────────
+// Recognized source/module file extensions
+// ──────────────────────────────────────────────────────────────
+
+/// File extensions (without the leading dot) that the toolchain treats as
+/// pblang modules/scripts. `.sapp`/`.sap` are the historical source
+/// extensions and `.bpx` the bytecode container; `.pbx`/`.pb`/`.bp` are
+/// additional accepted extensions.
+pub const MODULE_EXTENSIONS: &[&str] = &["sapp", "sap", "bpx", "pbx", "pb", "bp"];
+
+/// True if `ext` (an extension without the dot, e.g. from `Path::extension`)
+/// is a recognized pblang module extension.
+pub fn is_module_ext(ext: &str) -> bool {
+    MODULE_EXTENSIONS.contains(&ext)
+}
+
+/// True if `name` ends with a recognized `.<ext>` module suffix.
+pub fn has_module_extension(name: &str) -> bool {
+    MODULE_EXTENSIONS.iter().any(|ext| {
+        name.len() > ext.len() + 1
+            && name.ends_with(ext)
+            && name.as_bytes()[name.len() - ext.len() - 1] == b'.'
+    })
+}
+
+// ──────────────────────────────────────────────────────────────
 // Manifest structs
 // ──────────────────────────────────────────────────────────────
 
@@ -13,6 +38,36 @@ pub struct Manifest {
     pub package: Option<PackageSection>,
     #[serde(default)]
     pub dependencies: std::collections::BTreeMap<String, DependencySpec>,
+    /// Optional `[workspace]` section. When present, this manifest acts as a
+    /// workspace root and `members` lists the member package directories.
+    /// A manifest may carry both `[package]` and `[workspace]` (a "hybrid"
+    /// workspace where the root is itself a member) or only `[workspace]`
+    /// (a "virtual" workspace with no root package of its own).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSection>,
+}
+
+/// `[workspace]` table contents.
+///
+/// Members are path patterns relative to the workspace root. Each pattern is
+/// either a literal directory (e.g. `"tools/foo"`) or a trailing-`*` wildcard
+/// (e.g. `"crates/*"`) which expands to every immediate subdirectory of the
+/// stem that contains its own `pblang.toml`. `exclude` is consulted **after**
+/// expansion and uses the same syntax (literal or trailing-`*`); any member
+/// matched by an exclude pattern is dropped.
+///
+/// Glob expansion deliberately does **not** support arbitrary `**` or middle-
+/// segment wildcards. The two supported forms cover the Cargo-style layout
+/// that pblang workspaces actually need; richer globbing would pull in the
+/// `glob` crate for marginal value.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct WorkspaceSection {
+    /// Member path patterns (literal or trailing-`*`).
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Patterns to drop after member expansion.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -663,13 +718,13 @@ fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Resul
     Ok(())
 }
 
-/// Returns true when the directory contains at least one `.sapp`/`.sap`/`.bpx` file.
+/// Returns true when the directory contains at least one recognized module file.
 pub fn package_has_module_files(package_dir: &Path) -> bool {
     let mut entries = vec![];
     let _ = collect_files(package_dir, package_dir, &mut entries);
     entries
         .iter()
-        .any(|(rel, _)| rel.ends_with(".sapp") || rel.ends_with(".sap") || rel.ends_with(".bpx"))
+        .any(|(rel, _)| has_module_extension(rel))
 }
 
 /// Validate a package directory before publish/install (modules + optional entry).
@@ -851,7 +906,10 @@ fn resolve_package_entry_in_dir(package_dir: &Path) -> Result<PathBuf, String> {
             return Err(format!("package entry not found: {}", entry_path.display()));
         }
     }
-    for candidate in ["main.sapp", "main.sap", "main.bpx", "lib.sapp", "lib.sap"] {
+    for candidate in [
+        "main.sapp", "main.sap", "main.bpx", "main.pbx", "main.pb", "main.bp", "lib.sapp",
+        "lib.sap", "lib.pbx", "lib.pb", "lib.bp",
+    ] {
         let p = package_dir.join(candidate);
         if p.is_file() {
             return canonicalize_existing(&p)
@@ -990,6 +1048,154 @@ pub fn find_manifest_dir(start: &Path) -> Option<PathBuf> {
         cur = p.parent();
     }
     None
+}
+
+/// Walk up from `start` looking for a `pblang.toml` whose `[workspace]`
+/// section is present. Returns the directory containing that manifest, or
+/// `None` if no workspace root exists above `start`.
+///
+/// Used by workspace-aware commands to find the right root even when
+/// invoked from inside a member directory.
+pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(p) = cur {
+        let cand = p.join("pblang.toml");
+        if cand.is_file() {
+            if let Ok(bytes) = std::fs::read(&cand) {
+                if let Ok(s) = std::str::from_utf8(&bytes) {
+                    if let Ok(m) = parse_manifest(s) {
+                        if m.workspace.is_some() {
+                            return Some(p.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+        cur = p.parent();
+    }
+    None
+}
+
+/// One match returned by `resolve_workspace_members`: the absolute path of a
+/// member package directory plus the pattern that selected it (handy for
+/// error messages that want to point at the `members` entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceMember {
+    pub dir: PathBuf,
+    pub matched_pattern: String,
+}
+
+/// Expand `[workspace] members` / `exclude` patterns against `root` and
+/// return the resulting list of member directories.
+///
+/// Each pattern is one of:
+///   - Literal path (`"tools/foo"`): must point at a directory containing
+///     `pblang.toml`; missing or non-package paths are an error.
+///   - Trailing-`*` wildcard (`"crates/*"`): expands to every immediate
+///     subdir of the stem that contains its own `pblang.toml`. The stem
+///     itself must exist; non-package subdirs are silently skipped.
+///
+/// The output is sorted and de-duplicated by absolute path. Excludes are
+/// applied last, so a wildcard pull-in can be trimmed by an exclude.
+pub fn resolve_workspace_members(
+    root: &Path,
+    ws: &WorkspaceSection,
+) -> Result<Vec<WorkspaceMember>, String> {
+    let mut out: Vec<WorkspaceMember> = Vec::new();
+    for pat in &ws.members {
+        for dir in expand_member_pattern(root, pat, /* literal_must_have_manifest */ true)? {
+            out.push(WorkspaceMember {
+                dir,
+                matched_pattern: pat.clone(),
+            });
+        }
+    }
+    // Apply excludes: drop any member whose absolute dir matches an exclude
+    // pattern (literal or trailing-`*`).
+    if !ws.exclude.is_empty() {
+        let mut excluded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for pat in &ws.exclude {
+            for dir in expand_member_pattern(root, pat, /* literal_must_have_manifest */ false)? {
+                excluded.insert(dir);
+            }
+        }
+        out.retain(|m| !excluded.contains(&m.dir));
+    }
+    // De-dup by dir (keeps first-seen pattern as the attribution). Sort for
+    // determinism.
+    out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    out.dedup_by(|a, b| a.dir == b.dir);
+    Ok(out)
+}
+
+/// Expand a single member or exclude pattern relative to `root`. When
+/// `literal_must_have_manifest` is true, a literal path that doesn't have
+/// `pblang.toml` is an error (the usual `members` contract); excludes can
+/// reference paths that aren't packages, so they pass `false`.
+fn expand_member_pattern(
+    root: &Path,
+    pat: &str,
+    literal_must_have_manifest: bool,
+) -> Result<Vec<PathBuf>, String> {
+    // Reject path traversal — workspace members must stay under the root.
+    // We check the stripped pattern, then re-check after canonicalize below
+    // for symlink shenanigans.
+    if pat.split('/').any(|c| c == ".." || c.is_empty()) {
+        return Err(format!(
+            "workspace pattern '{}' contains empty or '..' segment",
+            pat
+        ));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(stem) = pat.strip_suffix("/*").or_else(|| {
+        if pat == "*" {
+            Some("")
+        } else {
+            None
+        }
+    }) {
+        // Wildcard: list immediate children of root/stem and keep those
+        // with pblang.toml.
+        let base = if stem.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(stem)
+        };
+        if !base.is_dir() {
+            return Err(format!(
+                "workspace pattern '{}' refers to non-existent directory '{}'",
+                pat,
+                base.display()
+            ));
+        }
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&base)
+            .map_err(|e| format!("workspace pattern '{}' read_dir failed: {}", pat, e))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.join("pblang.toml").is_file())
+            .collect();
+        entries.sort();
+        out.extend(entries);
+    } else {
+        // Literal.
+        let p = root.join(pat);
+        if literal_must_have_manifest && !p.join("pblang.toml").is_file() {
+            return Err(format!(
+                "workspace member '{}' has no pblang.toml at '{}'",
+                pat,
+                p.display()
+            ));
+        }
+        if p.is_dir() {
+            out.push(p);
+        } else if literal_must_have_manifest {
+            return Err(format!(
+                "workspace member '{}' is not a directory",
+                pat
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Generate lockfile (uses PBLANG_REGISTRY_INDEX env and REQUIRE_REGISTRY_SHA256).
@@ -1691,7 +1897,7 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
         if path_str.ends_with("pblang.toml") || path_str == "pblang.toml" {
             has_manifest = true;
         }
-        if path_str.ends_with(".sapp") || path_str.ends_with(".sap") || path_str.ends_with(".bpx") {
+        if has_module_extension(&path_str) {
             has_entry = true;
         }
     }
@@ -1810,6 +2016,21 @@ mod tests {
     };
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn module_extensions_recognized() {
+        for ext in ["sapp", "sap", "bpx", "pbx", "pb", "bp"] {
+            assert!(is_module_ext(ext), "ext {ext} should be recognized");
+            assert!(has_module_extension(&format!("main.{ext}")));
+        }
+        assert!(!is_module_ext("txt"));
+        assert!(!is_module_ext("rs"));
+        assert!(!has_module_extension("main.txt"));
+        // bare names and names that merely contain an ext substring must not match
+        assert!(!has_module_extension("pb"));
+        assert!(!has_module_extension("notapb"));
+        assert!(has_module_extension("a/b/c/thing.pb"));
+    }
 
     #[test]
     fn installs_one_registry_dep_to_cache() {

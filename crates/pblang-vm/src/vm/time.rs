@@ -19,6 +19,8 @@
 
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
+use super::errors::vm_cap;
+
 pub(super) fn clock(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !args.is_empty() {
         return Err(host.err("clock() takes no arguments".into()));
@@ -78,7 +80,7 @@ pub(super) fn now_iso(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, 
 
 pub(super) fn sleep_ms(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "sleep_ms", "exec"));
     }
     if args.len() != 1 {
         return Err(host.err(format!("sleep_ms() expects 1 argument, got {}", args.len())));

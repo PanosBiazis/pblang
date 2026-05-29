@@ -33,6 +33,7 @@ use sha1::Digest as _;
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
 use super::alloc_map;
+use super::errors::vm_cap;
 use super::json::value_to_json;
 
 // -------------------------------------------------------------------------
@@ -41,7 +42,7 @@ use super::json::value_to_json;
 
 pub(super) fn http_get(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_http() {
-        return Err(host.err("http access denied".into()));
+        return Err(vm_cap!(host, "http_get", "http"));
     }
     if args.len() != 1 {
         return Err(host.err(format!("http_get() expects 1 argument, got {}", args.len())));
@@ -70,7 +71,7 @@ pub(super) fn http_get(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
 /// for backward compatibility. Pass e.g. "text/plain" for non-JSON bodies.
 pub(super) fn http_post(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_http() {
-        return Err(host.err("http access denied".into()));
+        return Err(vm_cap!(host, "http_post", "http"));
     }
     if args.len() < 2 || args.len() > 3 {
         return Err(host.err(format!(
@@ -115,7 +116,7 @@ pub(super) fn http_get_auth(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
         )));
     }
     if !host.allow_http() {
-        return Err(host.err("http access denied".into()));
+        return Err(vm_cap!(host, "http_get_auth", "http"));
     }
     let url = args[0]
         .as_str()
@@ -141,7 +142,7 @@ pub(super) fn http_post_auth(host: &mut dyn VmHost, args: Vec<Value>) -> Result<
         )));
     }
     if !host.allow_http() {
-        return Err(host.err("http access denied".into()));
+        return Err(vm_cap!(host, "http_post_auth", "http"));
     }
     let url = args[0]
         .as_str()
@@ -249,7 +250,7 @@ pub(super) fn http_parse_request(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "http_parse_request", "net"));
     }
     if args.len() != 1 {
         return Err(host.err(format!(
@@ -310,7 +311,7 @@ pub(super) fn http_response_ct(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "http_response_ct", "net"));
     }
     if args.len() != 3 {
         return Err(host.err(format!(
@@ -342,7 +343,7 @@ pub(super) fn http_response_json(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
-        return Err(host.err("net access denied".into()));
+        return Err(vm_cap!(host, "http_response_json", "net"));
     }
     if args.len() != 2 {
         return Err(host.err(format!(

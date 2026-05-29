@@ -242,6 +242,26 @@ fn stdlib_exports() -> HashMap<&'static str, Vec<&'static str>> {
         vec!["parse", "stringify", "validate", "pretty"],
     );
     m.insert(
+        "stdlib:duration.sapp",
+        vec![
+            "millis", "seconds", "minutes", "hours", "days", "weeks", "add", "sub", "scale",
+            "negate", "abs_dur", "compare", "eq", "lt", "gt", "as_millis", "as_seconds",
+            "as_minutes", "as_hours", "as_days", "between", "parts", "humanize", "format_clock",
+            "parse",
+        ],
+    );
+    m.insert(
+        "stdlib:semver.sapp",
+        vec![
+            "parse", "valid", "format", "compare", "eq", "gt", "lt", "gte", "lte", "inc",
+            "satisfies",
+        ],
+    );
+    m.insert(
+        "stdlib:url.sapp",
+        vec!["parse", "build", "parse_query", "build_query"],
+    );
+    m.insert(
         "stdlib:http.sapp",
         vec![
             "get",

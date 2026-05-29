@@ -126,3 +126,62 @@ fn fmt_inserts_blank_line_between_toplevel_fns() {
     );
     let _ = std::fs::remove_file(&temp);
 }
+
+// Self-hosting: `fmt --via-pblang` (the stdlib/compiler/formatter.sapp path)
+// must produce byte-identical output to the Rust formatter.
+#[test]
+fn fmt_via_pblang_matches_rust_formatter() {
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let messy = "fn  add(a,b){\nlet   x=a+b ;\nreturn x*2 ;\n}\nlet r=add( 3,4 )\nprint r\n";
+
+    let rust_file = std::env::temp_dir().join("pblang_fmt_rust_parity.sap");
+    let pb_file = std::env::temp_dir().join("pblang_fmt_pb_parity.sap");
+    std::fs::write(&rust_file, messy).expect("write rust");
+    std::fs::write(&pb_file, messy).expect("write pb");
+
+    let rust_status = std::process::Command::new(bin)
+        .arg("fmt")
+        .arg(&rust_file)
+        .status()
+        .expect("run fmt");
+    let pb_status = std::process::Command::new(bin)
+        .arg("fmt")
+        .arg("--via-pblang")
+        .arg(&pb_file)
+        .status()
+        .expect("run fmt --via-pblang");
+    assert!(rust_status.success() && pb_status.success());
+
+    let rust_out = std::fs::read_to_string(&rust_file).expect("read rust");
+    let pb_out = std::fs::read_to_string(&pb_file).expect("read pb");
+    assert_eq!(
+        rust_out, pb_out,
+        "self-hosted formatter (--via-pblang) must match the Rust formatter"
+    );
+
+    let _ = std::fs::remove_file(&rust_file);
+    let _ = std::fs::remove_file(&pb_file);
+}
+
+// `pblang --check --via-pblang <file>` runs the self-hosted pblang front-end
+// (stdlib/compiler/selfhost_frontend.sapp) instead of the Rust parser/typecker.
+#[test]
+fn check_via_pblang_uses_self_hosted_frontend() {
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let file = std::env::temp_dir().join("pblang_selfhost_check.sap");
+    std::fs::write(&file, "let x = 1; let y = 2; print x + y;\n").expect("write");
+
+    let out = std::process::Command::new(bin)
+        .arg("--check")
+        .arg("--via-pblang")
+        .arg(&file)
+        .output()
+        .expect("run --check --via-pblang");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "self-hosted check should succeed: {stdout}");
+    assert!(
+        stdout.contains("self-hosted check ok"),
+        "expected self-hosted frontend output, got: {stdout}"
+    );
+    let _ = std::fs::remove_file(&file);
+}

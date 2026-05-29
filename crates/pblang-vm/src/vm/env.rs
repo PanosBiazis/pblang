@@ -2,8 +2,9 @@
 //!
 //! Free functions backing:
 //!
-//!   - `env_get(name)` → string | nil. Read-only; always available
-//!     (no capability gate).
+//!   - `env_get(name)` → string | nil. Read-only, gated on the `env` capability
+//!     (default on; disabled by `--sandbox`/`--deny-env`) so a sandbox can't
+//!     exfiltrate secrets such as `OPENAI_API_KEY`.
 //!   - `env_set(name, value)` — **permanently disabled**. `std::env::set_var`
 //!     is unsound in multi-threaded programs (undefined behaviour when
 //!     called concurrently with env reads on Linux), and pblang supports
@@ -18,7 +19,12 @@
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
 pub(super) fn env_get(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-    // env_get reads environment variables — always safe (read-only, no exec required).
+    // env_get reads environment variables. Read-only, but a sandboxed script with
+    // net/http but no env capability could otherwise exfiltrate secrets like
+    // OPENAI_API_KEY/AWS_* — so it is gated on the `env` capability (default on).
+    if !host.allow_env() {
+        return Err(host.err("env_get(): env access denied".into()));
+    }
     if args.len() != 1 {
         return Err(host.err(format!("env_get() expects 1 argument, got {}", args.len())));
     }

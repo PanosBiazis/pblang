@@ -23,12 +23,13 @@ use std::collections::HashMap;
 
 use pblang_ir::{alloc_string, Obj, RuntimeError, Value, VmHost};
 
+use super::errors::vm_cap;
 use super::{alloc_array, alloc_map};
 
 /// quantum_run(qasm, backend_str, shots) — Execute a QASM circuit on a quantum backend.
 pub(super) fn quantum_run(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "quantum_run", "exec"));
     }
     if args.is_empty() || args.len() > 3 {
         return Err(host.err(format!(
@@ -84,7 +85,7 @@ pub(super) fn quantum_statevector(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "quantum_statevector", "exec"));
     }
     if args.is_empty() || args.len() > 2 {
         return Err(host.err(format!(
@@ -204,6 +205,7 @@ pub(super) fn quantum_simulate_builtin(
         let gate_s = match r.get("gate") {
             Some(Value::Obj(o)) => match o.as_ref() {
                 Obj::String(s) => s.to_uppercase(),
+                _ => return Err(host.err("quantum_simulate(): 'gate' must be a string".into())),
             },
             _ => {
                 return Err(host.err("quantum_simulate(): op missing 'gate' string".into()))

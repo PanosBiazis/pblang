@@ -37,6 +37,11 @@ pub(super) fn spawn_value_to_json(v: &Value) -> Result<sj::Value, String> {
             .unwrap_or(sj::Value::Null)),
         Value::Obj(o) => match o.as_ref() {
             Obj::String(s) => Ok(sj::Value::String(s.clone())),
+            // Cross-thread transfer has no bigint/rational wire tag yet; send the
+            // exact decimal / "n/d" as a string (receiver sees a string).
+            Obj::BigInt(n) => Ok(sj::Value::String(n.to_string())),
+            Obj::Rational(r) => Ok(sj::Value::String(r.to_string())),
+            Obj::Decimal(d) => Ok(sj::Value::String(d.to_string())),
         },
         Value::Array(a) => {
             let a = a.borrow();
@@ -128,6 +133,9 @@ pub(super) fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
         Value::Number(n) => Ok(SpawnWireValue::Number(*n)),
         Value::Obj(o) => match o.as_ref() {
             Obj::String(s) => Ok(SpawnWireValue::String(s.clone())),
+            Obj::BigInt(n) => Ok(SpawnWireValue::String(n.to_string())),
+            Obj::Rational(r) => Ok(SpawnWireValue::String(r.to_string())),
+            Obj::Decimal(d) => Ok(SpawnWireValue::String(d.to_string())),
         },
         Value::Array(a) => {
             let a = a.borrow();
@@ -149,8 +157,30 @@ pub(super) fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
             f,
         )?))),
         Value::Closure(c) => Ok(SpawnWireValue::Closure(Box::new(spawn_closure_to_wire(c)?))),
+        Value::Module(m) => {
+            // Snapshot the module so the child can call `m.foo()` from
+            // a spawned closure. Transferable entries are copied; the
+            // rest (builtins, opaque resource handles) are dropped on
+            // a best-effort basis. Without this, a closure that
+            // captures `let thread = import(...)` silently loses the
+            // `thread` upvalue when crossing the spawn boundary.
+            let m = m.borrow();
+            let mut globals = HashMap::new();
+            for (k, v) in m.globals.iter() {
+                if let Ok(wv) = spawn_value_to_wire(v) {
+                    globals.insert(k.clone(), wv);
+                }
+            }
+            let mut exports = HashMap::new();
+            for (k, v) in m.exports.iter() {
+                if let Ok(wv) = spawn_value_to_wire(v) {
+                    exports.insert(k.clone(), wv);
+                }
+            }
+            Ok(SpawnWireValue::Module { globals, exports })
+        }
         _ => Err(
-            "spawn: value not transferable (unsupported: builtin/module/resource handle)".into(),
+            "spawn: value not transferable (unsupported: builtin/resource handle)".into(),
         ),
     }
 }
@@ -228,5 +258,47 @@ pub(super) fn spawn_value_from_wire(
         }
         SpawnWireValue::Function(f) => Ok(Value::Function(spawn_function_from_wire(f, module)?)),
         SpawnWireValue::Closure(c) => Ok(Value::Closure(spawn_closure_from_wire(c, module)?)),
+        SpawnWireValue::Module {
+            globals: g_wire,
+            exports: e_wire,
+        } => {
+            // Rehydrate the snapshot into a fresh Module in the child
+            // VM. We *must* set the new module's `parent` to the same
+            // builtins chain that the child's root module uses —
+            // otherwise the imported module's closures (which call
+            // `atomic_sub`, `channel_*`, `send`/`recv`, etc.) will fail
+            // global lookups in the child. The root module's `parent`
+            // was wired up to the VM's builtins by the spawn driver
+            // (see vm/spawn.rs around line 141); we piggy-back on it.
+            let builtins_parent = module.borrow().parent.clone();
+            let new_mod = Rc::new(RefCell::new(Module {
+                globals: HashMap::new(),
+                parent: builtins_parent,
+                exports: HashMap::new(),
+            }));
+            // Recursively hydrate the contained values into a Vec
+            // *before* taking the mutable borrow on `new_mod`, because
+            // a nested entry might itself be a Module that needs to
+            // read `new_mod.borrow().parent` (a shared borrow) — that
+            // would deadlock against an outer `new_mod.borrow_mut()`.
+            let mut globals_hydrated: Vec<(String, Value)> = Vec::with_capacity(g_wire.len());
+            for (k, vv) in g_wire {
+                globals_hydrated.push((k.clone(), spawn_value_from_wire(vv, new_mod.clone())?));
+            }
+            let mut exports_hydrated: Vec<(String, Value)> = Vec::with_capacity(e_wire.len());
+            for (k, vv) in e_wire {
+                exports_hydrated.push((k.clone(), spawn_value_from_wire(vv, new_mod.clone())?));
+            }
+            {
+                let mut m = new_mod.borrow_mut();
+                for (k, v) in globals_hydrated {
+                    m.globals.insert(k, v);
+                }
+                for (k, v) in exports_hydrated {
+                    m.exports.insert(k, v);
+                }
+            }
+            Ok(Value::Module(new_mod))
+        }
     }
 }

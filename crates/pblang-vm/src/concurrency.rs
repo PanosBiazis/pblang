@@ -1244,6 +1244,16 @@ pub enum SpawnWireValue {
     Map(HashMap<String, SpawnWireValue>),
     Function(Box<SpawnWireFunction>),
     Closure(Box<SpawnWireClosure>),
+    /// Snapshot of an imported module's globals + exports. Required so
+    /// that a spawned closure capturing `let m = import(...)` can still
+    /// call `m.foo()` from the child VM thread. Without this variant,
+    /// the closure-capture pass silently drops the module reference and
+    /// the child's `OpGetGlobal("m")` either fails or hangs depending
+    /// on how the lookup is structured downstream.
+    Module {
+        globals: HashMap<String, SpawnWireValue>,
+        exports: HashMap<String, SpawnWireValue>,
+    },
 }
 
 #[derive(Clone, Debug)]

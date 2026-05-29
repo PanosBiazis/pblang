@@ -22,11 +22,12 @@
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 use serde_json as sj;
 
+use super::errors::vm_cap;
 use super::json::{json_to_value, value_to_json};
 
 pub(super) fn onnx_infer(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
-        return Err(host.err("exec access denied".into()));
+        return Err(vm_cap!(host, "onnx_infer", "exec"));
     }
     if args.is_empty() {
         return Err(
@@ -226,7 +227,7 @@ except Exception as e:
 /// options_json: JSON string with optional { provider, model, system_prompt, temperature, max_tokens }
 pub(super) fn ai_chat(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_http() {
-        return Err(host.err("http access denied".into()));
+        return Err(vm_cap!(host, "ai_chat", "http"));
     }
     if args.is_empty() {
         return Err(host.err("ai_chat() expects at least 1 argument (prompt)".into()));
@@ -293,7 +294,7 @@ pub(super) fn ai_chat(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, 
 /// ai_embed(text, options_json) — Generate embedding vector from text.
 pub(super) fn ai_embed(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_http() {
-        return Err(host.err("http access denied".into()));
+        return Err(vm_cap!(host, "ai_embed", "http"));
     }
     if args.is_empty() {
         return Err(host.err("ai_embed() expects at least 1 argument (text)".into()));

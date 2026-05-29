@@ -18,6 +18,18 @@ fn block_shadowing_works() {
 }
 
 #[test]
+fn deep_left_nested_arithmetic_chain_compiles_iteratively() {
+    // Regression: a long flat `1+1+1+…` builds a deeply left-nested AST. Before
+    // the iterative left-spine emit (and the reference-based const-fold guard),
+    // compiling it was O(n²) AND recursed n deep — overflowing this test
+    // thread's default ~2 MB stack well before 20k. It must now compile+run here.
+    let n = 20_000usize;
+    let src = format!("let x = {};\nprint x;", vec!["1"; n].join("+"));
+    let out = run_collect(&src);
+    assert_eq!(out.last(), Some(&Value::Number(n as f64)));
+}
+
+#[test]
 fn for_loop_var_does_not_leak_outside_scope() {
     let err = run_err(
         r#"
@@ -556,6 +568,39 @@ fn numeric_edge_cases_pass() {
 }
 
 #[test]
+fn bigint_arbitrary_precision_pass() {
+    let src = include_str!("semantics/bigint_test.sapp");
+    let out = run_collect(src);
+    let last = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok())
+        .unwrap_or("");
+    assert_eq!(last, "bigint_pass", "bigint test failed; output: {:?}", out);
+}
+
+#[test]
+fn rational_exact_precision_pass() {
+    let src = include_str!("semantics/rational_test.sapp");
+    let out = run_collect(src);
+    let last = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok())
+        .unwrap_or("");
+    assert_eq!(last, "rational_pass", "rational test failed; output: {:?}", out);
+}
+
+#[test]
+fn decimal_arbitrary_precision_pass() {
+    let src = include_str!("semantics/decimal_test.sapp");
+    let out = run_collect(src);
+    let last = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok())
+        .unwrap_or("");
+    assert_eq!(last, "decimal_pass", "decimal test failed; output: {:?}", out);
+}
+
+#[test]
 fn io_fs_append_and_read_bytes_work() {
     let dir = std::env::temp_dir().join("pblang_tests_io");
     let _ = std::fs::create_dir_all(&dir);
@@ -715,6 +760,64 @@ fn match_expression_bind_and_wildcard() {
         "#,
     );
     assert_eq!(out, vec![Value::Number(2.0)]);
+}
+
+#[test]
+fn struct_construction_and_field_access() {
+    let out = run_collect(
+        r#"
+        struct Point { x: number, y: number }
+        let p = Point(3, 4);
+        print p.x;
+        print p.y;
+        print p.__struct;
+        "#,
+    );
+    let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
+    assert_eq!(out, vec![Value::Number(3.0), Value::Number(4.0), sv("Point")]);
+}
+
+#[test]
+fn enum_unit_and_data_variants() {
+    let out = run_collect(
+        r#"
+        enum Shape { Empty, Circle(number), Rect(number, number) }
+        print Shape.Empty.__variant;
+        let c = Shape.Circle(5);
+        print c.values[0];
+        let r = Shape.Rect(2, 3);
+        print r.values[1];
+        "#,
+    );
+    let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
+    assert_eq!(out, vec![sv("Empty"), Value::Number(5.0), Value::Number(3.0)]);
+}
+
+#[test]
+fn match_guard_accepts_colon_separator() {
+    // Guarded arms now accept `:` (consistent with unguarded arms), in
+    // addition to the legacy `~`/`#` separators.
+    let out = run_collect(
+        r#"
+        let n = 0 - 5;
+        print match n { case 0: "z"; case y if y < 0: "neg"; else: "s" };
+        print match 7 { case a if a < 0: "neg"; case b if b > 100: "big"; else: "small" };
+        "#,
+    );
+    let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
+    assert_eq!(out, vec![sv("neg"), sv("small")]);
+}
+
+#[test]
+fn match_guard_still_accepts_tilde_separator() {
+    let out = run_collect(
+        r#"
+        let n = 5;
+        print match n { case y if y < 0 ~ "neg"; else: "pos" };
+        "#,
+    );
+    let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
+    assert_eq!(out, vec![sv("pos")]);
 }
 
 #[test]
@@ -2464,6 +2567,230 @@ fn for_in_map_kv_pass() {
     "#,
     );
     assert_eq!(out, vec![Value::Number(6.0)]);
+}
+
+#[test]
+fn range_for_inclusive_iterates() {
+    let out = run_collect(
+        r#"
+        let s = 0;
+        for i in 0 to 4 { s = s + i; }
+        print s;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(10.0)]);
+}
+
+#[test]
+fn range_for_nonzero_start() {
+    let out = run_collect(
+        r#"
+        let s = 0;
+        for i in 2 to 5 { s = s + i; }
+        print s;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(14.0)]);
+}
+
+#[test]
+fn continue_in_count_for_advances_index() {
+    // Regression: `continue` used to jump before the index increment, so
+    // count-for spun forever. It must skip i==2 and sum the rest.
+    let out = run_collect(
+        r#"
+        let s = 0;
+        for i 5 { if i == 2 { continue; } s = s + i; }
+        print s;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(8.0)]);
+}
+
+#[test]
+fn continue_in_range_for_advances_index() {
+    let out = run_collect(
+        r#"
+        let s = 0;
+        for i in 0 to 4 { if i == 2 { continue; } s = s + i; }
+        print s;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(8.0)]);
+}
+
+#[test]
+fn continue_in_for_in_advances_index() {
+    let out = run_collect(
+        r#"
+        let s = 0;
+        for x in [0, 1, 2, 3, 4] { if x == 2 { continue; } s = s + x; }
+        print s;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(8.0)]);
+}
+
+#[test]
+fn string_indexing_returns_char() {
+    // Char-indexed (consistent with len()/str_slice): s[i] is the i-th
+    // codepoint as a one-character string, including multi-byte chars.
+    let out = run_collect(
+        r#"
+        let s = "héllo";
+        print s[0];
+        print s[1];
+        print s[4];
+    "#,
+    );
+    let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
+    assert_eq!(out, vec![sv("h"), sv("é"), sv("o")]);
+}
+
+#[test]
+fn string_indexing_out_of_bounds_errors() {
+    let err = run_err(r#"let s = "ab"; print s[5];"#);
+    assert!(
+        err.message.contains("out of bounds"),
+        "unexpected error: {:?}",
+        err
+    );
+}
+
+#[test]
+fn error_builtin_raises_runtime_error() {
+    let err = run_err(r#"print error("boom");"#);
+    assert!(err.message.contains("boom"), "unexpected error: {:?}", err);
+}
+
+#[test]
+fn error_builtin_is_catchable() {
+    let out = run_collect(
+        r#"
+        let r = try error("nope") catch "caught";
+        print r;
+    "#,
+    );
+    let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
+    assert_eq!(out, vec![sv("caught")]);
+}
+
+#[test]
+fn let_shadows_param_with_self_reference() {
+    // `let n = <expr using n>` must read the outer/param `n`, not the
+    // not-yet-initialized new local. Regression: this resolved to a global.
+    let out = run_collect(
+        r#"
+        fn f(n) {
+            let n = n * 2;
+            return n + 1;
+        }
+        print f(10);
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(21.0)]);
+}
+
+#[test]
+fn let_shadows_outer_local_with_self_reference() {
+    let out = run_collect(
+        r#"
+        let x = 5;
+        { let x = x + 10; print x; }
+        print x;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(15.0), Value::Number(5.0)]);
+}
+
+#[test]
+fn slice_string_bounds() {
+    let out = run_collect(
+        r#"
+        let s = "hello";
+        print s[1..4];
+        print s[..2];
+        print s[3..];
+        print s[..];
+    "#,
+    );
+    let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
+    assert_eq!(out, vec![sv("ell"), sv("he"), sv("lo"), sv("hello")]);
+}
+
+#[test]
+fn slice_array_bounds() {
+    let out = run_collect(
+        r#"
+        let a = [10, 20, 30, 40, 50];
+        let b = a[1..3];
+        print len(b);
+        print b[0];
+        print b[1];
+        let c = a[3..];
+        print len(c);
+        print c[1];
+    "#,
+    );
+    assert_eq!(
+        out,
+        vec![
+            Value::Number(2.0),
+            Value::Number(20.0),
+            Value::Number(30.0),
+            Value::Number(2.0),
+            Value::Number(50.0),
+        ]
+    );
+}
+
+#[test]
+fn pipeline_chains_unary_calls() {
+    // x |> f |> g  ==  g(f(x))
+    let out = run_collect(
+        r#"
+        fn inc(x) { return x + 1; }
+        fn dbl(x) { return x * 2; }
+        print 5 |> inc |> dbl;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(12.0)]);
+}
+
+#[test]
+fn pipeline_prepends_first_arg() {
+    // x |> f(a)  ==  f(x, a)
+    let out = run_collect(
+        r#"
+        fn add(a, b) { return a + b; }
+        print 10 |> add(5);
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(15.0)]);
+}
+
+#[test]
+fn pipeline_underscore_placeholder() {
+    // x |> f(a, _)  ==  f(a, x)   (placeholder controls injection position)
+    let out = run_collect(
+        r#"
+        fn sub(a, b) { return a - b; }
+        print 3 |> sub(10, _);
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(7.0)]);
+}
+
+#[test]
+fn pipeline_binds_looser_than_arithmetic() {
+    // a + b |> f  ==  f(a + b)
+    let out = run_collect(
+        r#"
+        fn neg(x) { return 0 - x; }
+        print 2 + 3 |> neg;
+    "#,
+    );
+    assert_eq!(out, vec![Value::Number(-5.0)]);
 }
 
 #[test]
