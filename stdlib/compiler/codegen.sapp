@@ -35,6 +35,13 @@ const OP_GET_INDEX = 27;
 const OP_SET_INDEX = 28;
 const OP_GET_ATTR = 29;
 const OP_SET_ATTR = 30;
+const OP_MOD = 31;
+const OP_LEN = 32;
+const OP_JUMP_IF_FALSE_PEEK = 33;   // short-circuit: jump if top is falsy, do NOT pop
+const OP_JUMP_IF_TRUE_PEEK = 34;    // short-circuit: jump if top is truthy, do NOT pop
+const OP_TRY = 35;                  // try/catch: operand is a {try_chunk, catch_chunk} constant
+const OP_JUMP_IF_NIL_PEEK = 36;     // jump if top is nil, do NOT pop
+const OP_JUMP_IF_NOT_NIL_PEEK = 37; // jump if top is not nil, do NOT pop
 
 // ── Chunk ───────────────────────────────────────────────────────────────
 fn Chunk() {
@@ -64,7 +71,64 @@ fn CodeGen() {
         globals: map{},     // name → constant_index
         locals: [],      // [{name, depth}]
         scope_depth: 0,
+        loops: [],       // stack of { breaks: [jump_idx...], continues: [jump_idx...] }
+        is_module: false, // true for the top-level/main chunk (module scoping)
+        next_slot: 0,     // monotonic local-slot counter (slots are never reused)
     };
+}
+
+// Is the current position the module's top level (top-level `let`/`const` here
+// become globals, visible to every function in the module)?
+fn _at_module_top(cg) { return cg.is_module and cg.scope_depth == 1; }
+
+// Local `let`/`const`: evaluate the value FIRST (so a same-named outer binding or
+// builtin in the initializer resolves correctly — e.g. `let len = len(source)`),
+// THEN declare the local and store into its slot.
+fn codegen_local_let(cg, node) {
+    if node.value != nil {
+        codegen_expr(cg, node.value);
+    } else {
+        let idx_nil = chunk_add_constant(cg.chunk, nil);
+        chunk_write_op(cg.chunk, OP_CONSTANT, idx_nil);
+    }
+    let slot = codegen_declare_local(cg, node.name);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
+}
+
+// Top-level `let`/`const`: evaluate the value and DEFINE it as a global.
+fn codegen_global_let(cg, node) {
+    if node.value != nil {
+        codegen_expr(cg, node.value);
+    } else {
+        let idx_nil = chunk_add_constant(cg.chunk, nil);
+        chunk_write_op(cg.chunk, OP_CONSTANT, idx_nil);
+    }
+    let name_idx = codegen_intern_global(cg, node.name);
+    chunk_write_op(cg.chunk, OP_DEFINE_GLOBAL, name_idx);
+}
+
+// ── Loop control (break/continue) bookkeeping ───────────────────────────
+fn _loop_push(cg) { array_push(cg.loops, map{ breaks: [], continues: [] }); }
+fn _loop_pop(cg) { return array_pop(cg.loops); }
+fn _loop_cur(cg) { return cg.loops[len(cg.loops) - 1]; }
+
+// Patch a list of placeholder JUMP instructions to `target`.
+fn _patch_all(cg, idxs, target) {
+    let i = 0;
+    while i < len(idxs) { cg.chunk.instructions[idxs[i]].operand = target; i = i + 1; }
+}
+
+fn codegen_break(cg) {
+    if len(cg.loops) == 0 { return; }
+    let idx = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP, 0);
+    array_push(_loop_cur(cg).breaks, idx);
+}
+fn codegen_continue(cg) {
+    if len(cg.loops) == 0 { return; }
+    let idx = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP, 0);
+    array_push(_loop_cur(cg).continues, idx);
 }
 
 /// Intern a global name string
@@ -93,19 +157,23 @@ fn codegen_end_scope(cg) {
     cg.scope_depth = cg.scope_depth - 1;
 }
 
-/// Declare a local variable
+/// Declare a local variable. Each gets a unique, never-reused slot so sibling
+/// scopes (e.g. two branches of an `if`, or successive blocks in a big function)
+/// can't alias the same runtime slot.
 fn codegen_declare_local(cg, name) {
-    array_push(cg.locals, map{name: name, depth: cg.scope_depth});
-    return len(cg.locals) - 1;
+    let slot = cg.next_slot;
+    cg.next_slot = cg.next_slot + 1;
+    array_push(cg.locals, map{name: name, depth: cg.scope_depth, slot: slot});
+    return slot;
 }
 
-/// Resolve a variable name → returns {kind: "global"|"local", index: number}
+/// Resolve a variable name → returns {kind: "global"|"local", index: slot}
 fn codegen_resolve(cg, name) {
     // Check locals (reverse order for shadowing)
     let i = len(cg.locals) - 1;
     while i >= 0 {
         if cg.locals[i].name == name {
-            return map{kind: "local", index: i};
+            return map{kind: "local", index: cg.locals[i].slot};
         }
         i = i - 1;
     }
@@ -121,7 +189,10 @@ fn codegen_literal(cg, node) {
     // node = map{kind: "number"|"string"|"bool"|"nil", value: ...}
     let kind = node.kind;
     if kind == "number" {
-        let idx = chunk_add_constant(cg.chunk, node.value);
+        // The tokenizer carries the numeric literal as its source text; intern
+        // it as a real number so arithmetic works (otherwise `1 + 2` would
+        // string-concat to "12").
+        let idx = chunk_add_constant(cg.chunk, parse_number(node.value));
         chunk_write_op(cg.chunk, OP_CONSTANT, idx);
         return;
     }
@@ -131,9 +202,8 @@ fn codegen_literal(cg, node) {
         return;
     }
     if kind == "bool" {
-        let val = 0;
-        if node.value { val = 1; }
-        let idx = chunk_add_constant(cg.chunk, val);
+        // Intern the real boolean (not 1/0) so `x == true` and friends work.
+        let idx = chunk_add_constant(cg.chunk, node.value);
         chunk_write_op(cg.chunk, OP_CONSTANT, idx);
         return;
     }
@@ -166,6 +236,7 @@ fn codegen_binary(cg, node) {
     if op == "-" { chunk_write_op(cg.chunk, OP_SUB, 0); return; }
     if op == "*" { chunk_write_op(cg.chunk, OP_MUL, 0); return; }
     if op == "/" { chunk_write_op(cg.chunk, OP_DIV, 0); return; }
+    if op == "%" { chunk_write_op(cg.chunk, OP_MOD, 0); return; }
     if op == "==" { chunk_write_op(cg.chunk, OP_EQ, 0); return; }
     if op == "!=" { chunk_write_op(cg.chunk, OP_NOT_EQ, 0); return; }
     if op == "<" { chunk_write_op(cg.chunk, OP_LT, 0); return; }
@@ -174,24 +245,196 @@ fn codegen_binary(cg, node) {
     if op == ">=" { chunk_write_op(cg.chunk, OP_GE, 0); return; }
 }
 
+/// Compile `try <body> catch <handler>`. The body and handler are each compiled
+/// into their own sub-chunk that SHARES the enclosing local slots (so they can
+/// read variables in scope); at runtime OP_TRY executes the body sub-chunk inside
+/// the interpreter's own pblang try/catch, falling back to the handler sub-chunk.
+fn _copy_locals(locals) {
+    let out = [];
+    let i = 0;
+    while i < len(locals) { array_push(out, locals[i]); i = i + 1; }
+    return out;
+}
+
+fn codegen_try(cg, node) {
+    let body_cg = CodeGen();
+    body_cg.locals = _copy_locals(cg.locals);
+    body_cg.scope_depth = cg.scope_depth;
+    codegen_expr(body_cg, node.body);
+    chunk_write_op(body_cg.chunk, OP_RETURN, 0);
+
+    let handler_cg = CodeGen();
+    handler_cg.locals = _copy_locals(cg.locals);
+    handler_cg.scope_depth = cg.scope_depth;
+    codegen_expr(handler_cg, node.handler);
+    chunk_write_op(handler_cg.chunk, OP_RETURN, 0);
+
+    let idx = chunk_add_constant(cg.chunk, map{ try_chunk: body_cg.chunk, catch_chunk: handler_cg.chunk });
+    chunk_write_op(cg.chunk, OP_TRY, idx);
+}
+
+/// Compile a block so that it leaves its VALUE on the stack (the value of its
+/// last statement if that is an expression statement, else nil). Used by the
+/// expression form of `if`.
+fn codegen_block_expr(cg, block) {
+    let stmts = block;
+    if is_map(block) { stmts = block.stmts; }
+
+    codegen_begin_scope(cg);
+    if len(stmts) == 0 {
+        let idx = chunk_add_constant(cg.chunk, nil);
+        chunk_write_op(cg.chunk, OP_CONSTANT, idx);
+    } else {
+        let i = 0;
+        while i < len(stmts) - 1 { codegen_stmt(cg, stmts[i]); i = i + 1; }
+        let last = stmts[len(stmts) - 1];
+        if is_map(last) and last.kind == "expr_stmt" {
+            codegen_expr(cg, last.expr);   // leave its value on the stack
+        } else {
+            codegen_stmt(cg, last);
+            let idx = chunk_add_constant(cg.chunk, nil);
+            chunk_write_op(cg.chunk, OP_CONSTANT, idx);
+        }
+    }
+    codegen_end_scope(cg);
+}
+
+/// `if <cond> { ... } else { ... }` as an expression — leaves the chosen branch's
+/// value on the stack. `else` may be another if-expr (else if) or a block.
+// match expression — desugars to: store scrutinee in a temp local, then an
+// if-else chain testing each arm in order. Literal arms compare with `==`; bind
+// arms copy the scrutinee into a named local (always match, unless guarded);
+// wildcard `_` always matches. The first matching arm's body is the result;
+// `else`/no-match yields the else body, or nil.
+fn codegen_match(cg, node) {
+    codegen_begin_scope(cg);   // temp + bound names live only inside the match
+    codegen_expr(cg, node["scrutinee"]);
+    let tmp = codegen_declare_local(cg, "__match_scrut");
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, tmp);
+
+    let end_jumps = [];   // JUMP-to-end instruction indices, patched at the end
+    let arms = node["arms"];
+    let ai = 0;
+    while ai < len(arms) {
+        let arm = arms[ai];
+        let pat = arm["pattern"];
+        let pt = pat["ptype"];
+        let next_jump = 0 - 1;   // conditional jump to the next arm (-1 = none)
+
+        if pt == "literal" {
+            chunk_write_op(cg.chunk, OP_GET_LOCAL, tmp);
+            codegen_expr(cg, pat["value"]);
+            chunk_write_op(cg.chunk, OP_EQ, 0);
+            next_jump = len(cg.chunk.instructions);
+            chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+        } else if pt == "bind" {
+            let bslot = codegen_declare_local(cg, pat["name"]);
+            chunk_write_op(cg.chunk, OP_GET_LOCAL, tmp);
+            chunk_write_op(cg.chunk, OP_SET_LOCAL, bslot);
+            if arm["guard"] != nil {
+                codegen_expr(cg, arm["guard"]);
+                next_jump = len(cg.chunk.instructions);
+                chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+            }
+        } else {
+            // wildcard "_" — always matches (a guard may still gate it)
+            if arm["guard"] != nil {
+                codegen_expr(cg, arm["guard"]);
+                next_jump = len(cg.chunk.instructions);
+                chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+            }
+        }
+
+        codegen_expr(cg, arm["body"]);
+        let ej = len(cg.chunk.instructions);
+        chunk_write_op(cg.chunk, OP_JUMP, 0);
+        array_push(end_jumps, ej);
+
+        if next_jump >= 0 {
+            cg.chunk.instructions[next_jump]["operand"] = len(cg.chunk.instructions);
+        }
+        ai = ai + 1;
+    }
+
+    let els = node["melse"];
+    if els == nil {
+        let idx = chunk_add_constant(cg.chunk, nil);
+        chunk_write_op(cg.chunk, OP_CONSTANT, idx);
+    } else {
+        codegen_expr(cg, els);
+    }
+
+    let ei = 0;
+    while ei < len(end_jumps) {
+        cg.chunk.instructions[end_jumps[ei]]["operand"] = len(cg.chunk.instructions);
+        ei = ei + 1;
+    }
+    codegen_end_scope(cg);
+}
+
+fn codegen_if_expr(cg, node) {
+    codegen_expr(cg, node["cond"]);
+    let else_jump = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+
+    codegen_block_expr(cg, node["then"]);
+    let end_jump = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP, 0);
+
+    cg.chunk.instructions[else_jump].operand = len(cg.chunk.instructions);
+    let els = node["else"];
+    if els == nil {
+        let idx = chunk_add_constant(cg.chunk, nil);
+        chunk_write_op(cg.chunk, OP_CONSTANT, idx);
+    } else if is_map(els) and els.kind == "if_expr" {
+        codegen_if_expr(cg, els);          // nested else-if
+    } else {
+        codegen_block_expr(cg, els);
+    }
+    cg.chunk.instructions[end_jump].operand = len(cg.chunk.instructions);
+}
+
+/// Short-circuit `and`/`or` via peek-jumps (the operand stays on the stack when
+/// the result is determined by the left side).
+fn codegen_logical(cg, node) {
+    codegen_expr(cg, node.left);
+    let jidx = len(cg.chunk.instructions);
+    if node.op == "and" {
+        chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE_PEEK, 0);
+    } else {
+        chunk_write_op(cg.chunk, OP_JUMP_IF_TRUE_PEEK, 0);
+    }
+    chunk_write_op(cg.chunk, OP_POP, 0);     // discard left; result is the right side
+    codegen_expr(cg, node.right);
+    cg.chunk.instructions[jidx].operand = len(cg.chunk.instructions);
+}
+
 /// Compile a function call
 fn codegen_call(cg, node) {
-    // node = map{kind: "call", name: "fn_name", args: [...]}
+    // Parser AST: call = { func: <expr>, args: [...] }. Args are pushed first,
+    // then the callee on top (the VM's OP_CALL pops the callee, then the args).
     let i = 0;
     while i < len(node.args) {
         codegen_expr(cg, node.args[i]);
         i = i + 1;
     }
 
-    // Parser AST: call = { func: <expr>, args: [...] }. The common case is an
-    // ident callee; resolve it by name.
-    let resolved = codegen_resolve(cg, node.func.name);
-    if resolved.kind == "local" {
-        chunk_write_op(cg.chunk, OP_GET_LOCAL, resolved.index);
+    // Callee. An ident is resolved by name (this also routes host builtins, which
+    // the VM recognizes on OP_GET_GLOBAL). Any other callable expression — a
+    // member `obj.f(...)`, an index `tbl[i](...)`, a parenthesized fn, a call
+    // result — is code-generated normally so its value lands on the stack.
+    let fn_node = node.func;
+    if fn_node.kind == "ident" {
+        let resolved = codegen_resolve(cg, fn_node.name);
+        if resolved.kind == "local" {
+            chunk_write_op(cg.chunk, OP_GET_LOCAL, resolved.index);
+        } else {
+            chunk_write_op(cg.chunk, OP_GET_GLOBAL, resolved.index);
+        }
     } else {
-        chunk_write_op(cg.chunk, OP_GET_GLOBAL, resolved.index);
+        codegen_expr(cg, fn_node);
     }
-    
+
     chunk_write_op(cg.chunk, OP_CALL, len(node.args));
 }
 
@@ -208,10 +451,12 @@ fn codegen_array(cg, node) {
 
 /// Compile a map literal
 fn codegen_map(cg, node) {
-    // node = map{kind: "map", entries: [{key, value}, ...]}
+    // Parser AST: map = { entries: [{ key: <string>, value: <expr> }, ...] }.
+    // The key is a literal name, so push it as a string constant (not codegen_expr).
     let i = 0;
     while i < len(node.entries) {
-        codegen_expr(cg, node.entries[i].key);
+        let key_idx = chunk_add_constant(cg.chunk, node.entries[i].key);
+        chunk_write_op(cg.chunk, OP_CONSTANT, key_idx);
         codegen_expr(cg, node.entries[i].value);
         i = i + 1;
     }
@@ -232,7 +477,8 @@ fn codegen_expr(cg, node) {
         return;
     }
     if kind == "binary" {
-        codegen_binary(cg, node);
+        if node.op == "and" or node.op == "or" { codegen_logical(cg, node); }
+        else { codegen_binary(cg, node); }
         return;
     }
     if kind == "call" {
@@ -247,11 +493,33 @@ fn codegen_expr(cg, node) {
         codegen_map(cg, node);
         return;
     }
-    if kind == "unary" and node.op == "-" {
-        let zero_idx = chunk_add_constant(cg.chunk, 0);
-        chunk_write_op(cg.chunk, OP_CONSTANT, zero_idx);
-        codegen_expr(cg, node.operand);   // parser AST: unary = { op, operand }
-        chunk_write_op(cg.chunk, OP_SUB, 0);
+    if kind == "fn_lit" {
+        codegen_fnlit(cg, node);
+        return;
+    }
+    if kind == "try" {
+        codegen_try(cg, node);
+        return;
+    }
+    if kind == "if_expr" {
+        codegen_if_expr(cg, node);
+        return;
+    }
+    if kind == "match" {
+        codegen_match(cg, node);
+        return;
+    }
+    if kind == "unary" {
+        // parser AST: unary = { op, operand }
+        if node.op == "-" {
+            let zero_idx = chunk_add_constant(cg.chunk, 0);
+            chunk_write_op(cg.chunk, OP_CONSTANT, zero_idx);
+            codegen_expr(cg, node.operand);
+            chunk_write_op(cg.chunk, OP_SUB, 0);
+        } else if node.op == "not" or node.op == "!" {
+            codegen_expr(cg, node.operand);
+            chunk_write_op(cg.chunk, OP_NOT, 0);
+        }
         return;
     }
     if kind == "index" {
@@ -264,6 +532,36 @@ fn codegen_expr(cg, node) {
         codegen_expr(cg, node.obj);
         let name_idx = chunk_add_constant(cg.chunk, node.name);
         chunk_write_op(cg.chunk, OP_GET_ATTR, name_idx);
+        return;
+    }
+    if kind == "coalesce" {
+        // a ?? b : a unless a is nil, else b (short-circuit, b not evaluated if a != nil)
+        codegen_expr(cg, node["left"]);
+        let jnn = len(cg.chunk.instructions);
+        chunk_write_op(cg.chunk, OP_JUMP_IF_NOT_NIL_PEEK, 0);
+        chunk_write_op(cg.chunk, OP_POP, 0);
+        codegen_expr(cg, node["right"]);
+        cg.chunk.instructions[jnn]["operand"] = len(cg.chunk.instructions);
+        return;
+    }
+    if kind == "opt_member" {
+        // a?.b : nil if a is nil, else a.b
+        codegen_expr(cg, node["obj"]);
+        let jn = len(cg.chunk.instructions);
+        chunk_write_op(cg.chunk, OP_JUMP_IF_NIL_PEEK, 0);
+        let nidx = chunk_add_constant(cg.chunk, node["name"]);
+        chunk_write_op(cg.chunk, OP_GET_ATTR, nidx);
+        cg.chunk.instructions[jn]["operand"] = len(cg.chunk.instructions);
+        return;
+    }
+    if kind == "opt_index" {
+        // a?[i] : nil if a is nil, else a[i]
+        codegen_expr(cg, node["obj"]);
+        let jn = len(cg.chunk.instructions);
+        chunk_write_op(cg.chunk, OP_JUMP_IF_NIL_PEEK, 0);
+        codegen_expr(cg, node["index"]);
+        chunk_write_op(cg.chunk, OP_GET_INDEX, 0);
+        cg.chunk.instructions[jn]["operand"] = len(cg.chunk.instructions);
         return;
     }
 }
@@ -306,33 +604,47 @@ fn codegen_return(cg, node) {
 
 /// Compile an if/else statement
 fn codegen_if(cg, node) {
-    // Parser AST (parser.sapp::stmt_if): { cond, then, elifs, else }.
-    // `then`/`else` are lists of statements; `else` is bracket-accessed
-    // because `else` is a keyword. (elif chains are not yet lowered here.)
+    // Parser AST (parser.sapp::stmt_if): { cond, then, elifs, else }, where
+    // `then`/`else`/elif bodies are block nodes. Lowered as a chain:
+    //   cond? then : (elif_cond? elif_body : ... : else). Each arm jumps to the
+    //   shared end after running. `else` is bracket-accessed (keyword).
+    let end_jumps = [];   // JUMP-to-end instruction indices to backpatch
+
+    // Primary `if`
     codegen_expr(cg, node["cond"]);
-
-    let jump_to_else_idx = len(cg.chunk.instructions);
-    chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0); // placeholder
-
+    let next_idx = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
     codegen_block(cg, node["then"]);
+    array_push(end_jumps, len(cg.chunk.instructions));
+    chunk_write_op(cg.chunk, OP_JUMP, 0);
+    cg.chunk.instructions[next_idx].operand = len(cg.chunk.instructions);
 
-    if node["else"] != nil {
-        let jump_over_else_idx = len(cg.chunk.instructions);
-        chunk_write_op(cg.chunk, OP_JUMP, 0); // placeholder
+    // `elif` arms
+    let elifs = node["elifs"];
+    if elifs != nil {
+        let i = 0;
+        while i < len(elifs) {
+            let e = elifs[i];
+            codegen_expr(cg, e["cond"]);
+            let n2 = len(cg.chunk.instructions);
+            chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+            codegen_block(cg, e["body"]);
+            array_push(end_jumps, len(cg.chunk.instructions));
+            chunk_write_op(cg.chunk, OP_JUMP, 0);
+            cg.chunk.instructions[n2].operand = len(cg.chunk.instructions);
+            i = i + 1;
+        }
+    }
 
-        // Patch jump to else
-        let else_start = len(cg.chunk.instructions);
-        cg.chunk.instructions[jump_to_else_idx].operand = else_start;
+    // `else`
+    if node["else"] != nil { codegen_block(cg, node["else"]); }
 
-        codegen_block(cg, node["else"]);
-        
-        // Patch jump over else
-        let after_else = len(cg.chunk.instructions);
-        cg.chunk.instructions[jump_over_else_idx].operand = after_else;
-    } else {
-        // Patch jump to after if
-        let after_if = len(cg.chunk.instructions);
-        cg.chunk.instructions[jump_to_else_idx].operand = after_if;
+    // Backpatch every arm's end-jump to here.
+    let endpos = len(cg.chunk.instructions);
+    let k = 0;
+    while k < len(end_jumps) {
+        cg.chunk.instructions[end_jumps[k]].operand = endpos;
+        k = k + 1;
     }
 }
 
@@ -345,13 +657,176 @@ fn codegen_while(cg, node) {
     
     let jump_exit_idx = len(cg.chunk.instructions);
     chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0); // placeholder
-    
+
+    _loop_push(cg);
     codegen_block(cg, node.body);
-    
+    let lc = _loop_pop(cg);
+    _patch_all(cg, lc.continues, loop_start);    // continue → re-check condition
+
     chunk_write_op(cg.chunk, OP_JUMP, loop_start);
-    
+
     let loop_end = len(cg.chunk.instructions);
     cg.chunk.instructions[jump_exit_idx].operand = loop_end;
+    _patch_all(cg, lc.breaks, loop_end);         // break → after loop
+}
+
+/// Compile a count loop `for <name> <end> { body }`, lowered to
+/// `name = 0; while name < end { body; name = name + 1; }` (name in 0..end-1).
+fn codegen_for(cg, node) {
+    let slot = codegen_declare_local(cg, node.name);
+    let zero_idx = chunk_add_constant(cg.chunk, 0);
+    chunk_write_op(cg.chunk, OP_CONSTANT, zero_idx);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
+
+    let loop_start = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, slot);
+    codegen_expr(cg, node.end);
+    chunk_write_op(cg.chunk, OP_LT, 0);
+    let exit_idx = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+
+    _loop_push(cg);
+    codegen_block(cg, node.body);
+    let lc = _loop_pop(cg);
+    _patch_all(cg, lc.continues, len(cg.chunk.instructions));   // continue → increment
+
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, slot);
+    let one_idx = chunk_add_constant(cg.chunk, 1);
+    chunk_write_op(cg.chunk, OP_CONSTANT, one_idx);
+    chunk_write_op(cg.chunk, OP_ADD, 0);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
+    chunk_write_op(cg.chunk, OP_JUMP, loop_start);
+
+    let loop_end = len(cg.chunk.instructions);
+    cg.chunk.instructions[exit_idx].operand = loop_end;
+    _patch_all(cg, lc.breaks, loop_end);
+}
+
+/// Compile `for <name> in <iter> { body }`, lowered to:
+///   __arr = iter; __i = 0; while __i < len(__arr) { name = __arr[__i]; body; __i = __i + 1; }
+fn codegen_for_in(cg, node) {
+    let arr_slot = codegen_declare_local(cg, "__forin_arr");
+    codegen_expr(cg, node.iter);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, arr_slot);
+
+    let idx_slot = codegen_declare_local(cg, "__forin_idx");
+    let zero_idx = chunk_add_constant(cg.chunk, 0);
+    chunk_write_op(cg.chunk, OP_CONSTANT, zero_idx);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, idx_slot);
+
+    let var_slot = codegen_declare_local(cg, node.name);
+
+    let loop_start = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, idx_slot);
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, arr_slot);
+    chunk_write_op(cg.chunk, OP_LEN, 0);
+    chunk_write_op(cg.chunk, OP_LT, 0);
+    let exit_idx = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+
+    // name = __arr[__i]
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, arr_slot);
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, idx_slot);
+    chunk_write_op(cg.chunk, OP_GET_INDEX, 0);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, var_slot);
+
+    _loop_push(cg);
+    codegen_block(cg, node.body);
+    let lc = _loop_pop(cg);
+    _patch_all(cg, lc.continues, len(cg.chunk.instructions));   // continue → increment
+
+    // __i = __i + 1
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, idx_slot);
+    let one_idx = chunk_add_constant(cg.chunk, 1);
+    chunk_write_op(cg.chunk, OP_CONSTANT, one_idx);
+    chunk_write_op(cg.chunk, OP_ADD, 0);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, idx_slot);
+    chunk_write_op(cg.chunk, OP_JUMP, loop_start);
+
+    let loop_end = len(cg.chunk.instructions);
+    cg.chunk.instructions[exit_idx].operand = loop_end;
+    _patch_all(cg, lc.breaks, loop_end);
+}
+
+/// Compile `for <name> in <start> to <end> { body }` (inclusive range), lowered
+/// to `name = start; while name <= end { body; name = name + 1; }`.
+fn codegen_for_range(cg, node) {
+    let slot = codegen_declare_local(cg, node.name);
+    codegen_expr(cg, node.start);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
+
+    let loop_start = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, slot);
+    codegen_expr(cg, node.end);
+    chunk_write_op(cg.chunk, OP_LE, 0);   // inclusive
+    let exit_idx = len(cg.chunk.instructions);
+    chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
+
+    _loop_push(cg);
+    codegen_block(cg, node.body);
+    let lc = _loop_pop(cg);
+    _patch_all(cg, lc.continues, len(cg.chunk.instructions));
+
+    chunk_write_op(cg.chunk, OP_GET_LOCAL, slot);
+    let one_idx = chunk_add_constant(cg.chunk, 1);
+    chunk_write_op(cg.chunk, OP_CONSTANT, one_idx);
+    chunk_write_op(cg.chunk, OP_ADD, 0);
+    chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
+    chunk_write_op(cg.chunk, OP_JUMP, loop_start);
+
+    let loop_end = len(cg.chunk.instructions);
+    cg.chunk.instructions[exit_idx].operand = loop_end;
+    _patch_all(cg, lc.breaks, loop_end);
+}
+
+// Fill omitted params (which arrive nil) with their default expression.
+fn codegen_fill_defaults(inner_cg, params, param_slots) {
+    let di = 0;
+    while di < len(params) {
+        let dflt = params[di]["default"];
+        if dflt != nil {
+            chunk_write_op(inner_cg.chunk, OP_GET_LOCAL, param_slots[di]);
+            let nidx = chunk_add_constant(inner_cg.chunk, nil);
+            chunk_write_op(inner_cg.chunk, OP_CONSTANT, nidx);
+            chunk_write_op(inner_cg.chunk, OP_EQ, 0);
+            let jf = len(inner_cg.chunk.instructions);
+            chunk_write_op(inner_cg.chunk, OP_JUMP_IF_FALSE, 0);
+            codegen_expr(inner_cg, dflt);
+            chunk_write_op(inner_cg.chunk, OP_SET_LOCAL, param_slots[di]);
+            inner_cg.chunk.instructions[jf]["operand"] = len(inner_cg.chunk.instructions);
+        }
+        di = di + 1;
+    }
+}
+
+/// Compile an anonymous function literal `fn(params) { body }`. Unlike a fn
+/// declaration, it leaves the closure VALUE on the operand stack (no global
+/// binding) so it can be used as a map value, call argument, etc. Its params
+/// are plain strings (parser.sapp::expr_fnlit), not {name,type,default} maps.
+fn codegen_fnlit(cg, node) {
+    let inner_cg = CodeGen();
+
+    let k = 0;
+    while k < len(node["params"]) {
+        codegen_declare_local(inner_cg, node["params"][k]);
+        k = k + 1;
+    }
+
+    codegen_block(inner_cg, node["body"]);
+
+    // Implicit return nil at end
+    if len(inner_cg.chunk.instructions) == 0 or
+       inner_cg.chunk.instructions[len(inner_cg.chunk.instructions) - 1].op != OP_RETURN {
+        let idx_nil = chunk_add_constant(inner_cg.chunk, nil);
+        chunk_write_op(inner_cg.chunk, OP_CONSTANT, idx_nil);
+        chunk_write_op(inner_cg.chunk, OP_RETURN, 0);
+    }
+
+    let fn_const_idx = chunk_add_constant(cg.chunk, map{
+        arity: len(node["params"]),
+        chunk: inner_cg.chunk,
+    });
+    chunk_write_op(cg.chunk, OP_CLOSURE, fn_const_idx);
 }
 
 /// Compile a function definition
@@ -359,12 +834,13 @@ fn codegen_fn(cg, node) {
     // node = map{kind: "fn", name: "myfn", params: [...], body: [...]}
     let inner_cg = CodeGen();
     
-    // Declare params as locals
+    let param_slots = [];
     let k = 0;
     while k < len(node.params) {
-        codegen_declare_local(inner_cg, node.params[k]);
+        array_push(param_slots, codegen_declare_local(inner_cg, node.params[k].name));
         k = k + 1;
     }
+    codegen_fill_defaults(inner_cg, node.params, param_slots);
     
     codegen_block(inner_cg, node.body);
     
@@ -383,15 +859,41 @@ fn codegen_fn(cg, node) {
     });
     
     chunk_write_op(cg.chunk, OP_CLOSURE, fn_const_idx);
-    
-    // Bind function name
+
+    // Bind function name as a global (DEFINE_GLOBAL consumes the closure value).
     let name_idx = codegen_intern_global(cg, node.name);
     chunk_write_op(cg.chunk, OP_DEFINE_GLOBAL, name_idx);
-    chunk_write_op(cg.chunk, OP_SET_GLOBAL, name_idx);
 }
 
 /// Compile an expression statement
 fn codegen_expr_stmt(cg, node) {
+    let e = node.expr;
+    // Assignment statement (parser wraps `x = v` as expr_stmt{ assign{name,value} }).
+    // Evaluate the value and store it; SET_* consumes the value, so no POP.
+    if is_map(e) and e.kind == "assign" {
+        codegen_expr(cg, e.value);
+        let r = codegen_resolve(cg, e.name);
+        if r.kind == "local" { chunk_write_op(cg.chunk, OP_SET_LOCAL, r.index); }
+        else { chunk_write_op(cg.chunk, OP_SET_GLOBAL, r.index); }
+        return;
+    }
+    // Index / member assignment: `a[i] = v` / `obj.k = v` (target is an index or
+    // member expression; the obj chain may itself be nested).
+    if is_map(e) and e.kind == "assign_to" {
+        let tgt = e.target;
+        if tgt.kind == "index" {
+            codegen_expr(cg, tgt.obj);
+            codegen_expr(cg, tgt.index);
+            codegen_expr(cg, e.value);
+            chunk_write_op(cg.chunk, OP_SET_INDEX, 0);
+        } else if tgt.kind == "member" {
+            codegen_expr(cg, tgt.obj);
+            codegen_expr(cg, e.value);
+            let name_idx = chunk_add_constant(cg.chunk, tgt.name);
+            chunk_write_op(cg.chunk, OP_SET_ATTR, name_idx);
+        }
+        return;
+    }
     codegen_expr(cg, node.expr);
     chunk_write_op(cg.chunk, OP_POP, 0);
 }
@@ -426,19 +928,23 @@ fn codegen_stmt(cg, stmt) {
     let kind = stmt.kind;
     
     if kind == "let" {
-        // Declare local first, then compile value
-        codegen_declare_local(cg, stmt.name);
-        codegen_let(cg, stmt);
+        if _at_module_top(cg) { codegen_global_let(cg, stmt); return; }
+        codegen_local_let(cg, stmt);
         return;
     }
     if kind == "const" {
-        codegen_declare_local(cg, stmt.name);
-        codegen_const(cg, stmt);
+        if _at_module_top(cg) { codegen_global_let(cg, stmt); return; }
+        codegen_local_let(cg, stmt);
         return;
     }
     if kind == "return" { codegen_return(cg, stmt); return; }
     if kind == "if" { codegen_if(cg, stmt); return; }
     if kind == "while" { codegen_while(cg, stmt); return; }
+    if kind == "for" { codegen_for(cg, stmt); return; }
+    if kind == "for_in" { codegen_for_in(cg, stmt); return; }
+    if kind == "for_range" { codegen_for_range(cg, stmt); return; }
+    if kind == "break" { codegen_break(cg); return; }
+    if kind == "continue" { codegen_continue(cg); return; }
     if kind == "fn" { codegen_fn(cg, stmt); return; }
     if kind == "expr_stmt" { codegen_expr_stmt(cg, stmt); return; }
     if kind == "print" { codegen_print(cg, stmt); return; }
@@ -448,6 +954,7 @@ fn codegen_stmt(cg, stmt) {
 /// Top-level compilation: stmts → chunk
 fn compile_stmts(stmts) {
     let cg = CodeGen();
+    cg.is_module = true;   // top-level let/const become module globals
     codegen_block(cg, stmts);
     return cg.chunk;
 }

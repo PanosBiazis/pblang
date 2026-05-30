@@ -189,7 +189,7 @@ For a full description of the embedding API (VM creation, sandboxing, limits, FF
 
 ---
 
-## Appendix A: Complete Language Reference (v0.5.1)
+## Appendix A: Complete Language Reference (v0.5.7)
 
 ### Operator Precedence (High → Low)
 
@@ -268,10 +268,13 @@ All numbers are `f64` (IEEE 754 double-precision float).
 
 ### String Operations
 
-Strings are UTF-8. String methods:
-- `len(s)` — character count
+Strings are UTF-8 and the whole string API is **codepoint-indexed** (not byte-indexed): `len`, indexing `s[i]`, `slice`/`s[a..b]`, `str_slice`, `str_index_of`, and `strcharcodeat` all count Unicode codepoints. For raw byte access use `str_to_bytes(s)` → `Array<u8>` (and `bytes_to_str` to decode). String methods:
+- `len(s)` — codepoint (character) count
 - `s + t` — concatenation  
-- `str_slice(s, start, end)` — substring (byte-indexed)
+- `s[i]` — the character (single-codepoint string) at codepoint index `i`
+- `str_slice(s, start, end)` — substring, codepoint-indexed (half-open `[start, end)`; same as `s[start..end]`)
+- `strcharcodeat(s, i)` — the full Unicode scalar value of the character at codepoint index `i` (e.g. `strcharcodeat("é", 0) == 233`)
+- `strfromcharcode(n)` — the one-character string for Unicode scalar `n`; inverse of `strcharcodeat`, so `strfromcharcode(strcharcodeat(s, i))` round-trips
 - `str_split(s, delim)` — split to array
 - `str_contains(s, needle)` — boolean search
 - `str_starts_with(s, prefix)` — boolean

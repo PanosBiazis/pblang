@@ -1,5 +1,12 @@
 # Help.md — Cursor AI Code-Change Reference for pblang
 
+> ⚠️ **STALE BATCH (as of 2026-05-30).** The "Batch Option 1: SP1-gamma — OOP +
+> Functional Conformance Fixes" recommended below is **obsolete**: `class` and
+> `match` are complete, native, self-hosting language features and there are no
+> failing class/match semantics tests (semantics is 189/0/1; the only ignored
+> case is `os_env_set_pass`). Treat the class/match "fix the failing tests"
+> sections as historical. For the real current frontier (self-host breadth/perf),
+> see `docs/CURRENT_STATUS.md` and `docs/Future_plans.md` (Updates 15–19).
 
 This file tells Cursor AI **exactly which files to touch, what code to write/change,
 and what tests to add** for the next recommended batch.
@@ -160,12 +167,16 @@ obj.method(args) → resolves method from obj's class method table → calls wit
 
 If method not found: runtime error "method '<name>' not found on <class>".
 
-Functional Semantics (v0.2)
+Functional Semantics
 Closures
-fn declared inside another fn captures outer bindings by deep copy at creation time.
+fn declared inside another fn captures outer bindings **by reference (upvalue)**.
 
-Captured bindings are immutable snapshots; mutations to outer variables after closure creation
-are not visible inside the closure (value semantics).
+Mutations to a captured variable are shared between the closure and the outer binding
+in both directions (e.g. `make_counter()` returns a closure that increments and
+returns a shared count). This matches `docs/Language_Semantics.md` ("Closures capture
+variables by reference (upvalue), so mutations inside a closure affect the outer
+binding"). (Note: closures passed to `spawn()` must have **closed** upvalues — see the
+spawn rules in Language_Semantics.)
 
 map / filter / reduce (stdlib:array.sapp)
 array.map(arr, fn) → new array where each element is fn(element).
