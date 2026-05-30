@@ -606,6 +606,16 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("decimal", Ty::Fn(vec![any.clone()], Box::new(Ty::Decimal))),
         ("str_trim", fn1(str_ty.clone())),
         ("str_split", fn2(Ty::Array(Box::new(str_ty.clone())))),
+        // Polymorphic `slice(seq, start, end)` over string/array (backs `seq[a..b]`);
+        // returns `any` because the element/result type follows the input. Used by
+        // the self-hosted tokenizer (char-indexed substring) and formatter.
+        (
+            "slice",
+            Ty::Fn(
+                vec![any.clone(), num.clone(), num.clone()],
+                Box::new(any.clone()),
+            ),
+        ),
         ("str_starts_with", fn2(bool_ty.clone())),
         ("array_push", fn2(nil.clone())),
         ("push", fn2(any.clone())),

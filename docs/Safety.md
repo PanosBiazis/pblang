@@ -431,9 +431,9 @@ fn main() {
 
 ---
 
-## 12. When pblang Moves to Self-Hosting
+## 12. Self-Hosting (in place today)
 
-When parts of pblang are eventually rewritten in pblang, safety is maintained through:
+pblang **already self-hosts**: the compiler under `stdlib/compiler/` (tokenizer → parser → semantic → typeck → ir → optimizer → codegen, plus `selfhost_frontend.sapp` and the `vm.sapp` interpreter) tokenizes, parses, compiles, and runs pblang end-to-end, all written in pblang. As that pblang-written compiler is maintained and extended, safety is maintained through:
 
 1. **`const` everywhere** for VM state that must not change
 2. **`freeze()`** for immutable data structures (AST nodes, IR chunks)

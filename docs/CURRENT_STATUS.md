@@ -1,12 +1,16 @@
 # pblang — Current Status
 
-**Last Updated**: 2026  
-**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 112 Stdlib Modules + Self-Hosting Compiler Pipeline + Multi-Backend Codegen
-**Test Suite**: semantics suite passing with known ignored cases (match-guard parser recovery limitation and `env_set` safety policy)
+**Last Updated**: 2026-05-30  
+**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 135 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen
+**Test Suite**: semantics 189 passed / 0 failed / 1 ignored (only `os_env_set_pass`, an `env_set` safety policy). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`-separator variants now pass.
 
 ---
 
 Canonical status is the top summary and `Test Results` section in this file. Older milestone snapshots below are kept for historical context and may reflect prior counts/plans.
+
+## ⭐ 2026-05-30 — Self-hosting is COMPLETE (the headline)
+
+The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, compiles, and RUNS** pblang end-to-end, entirely in pblang. `selfhost_frontend.frontend_run(source)` drives source → tokenize → parse → typecheck → codegen → `vm.sapp` bytecode interpreter and returns `{output, locals, globals}`. **Every core language feature self-hosts**: let/const, arithmetic/comparison, logical short-circuit, arrays/maps, `if`/`else if`/inline-`if` expressions, `while`/`for`/`for_in`, `break`/`continue`, functions (recursion + default params), index/member read+assign, `try`/`catch`, ~30 host builtins, module globals, nil-safe `??`/`?.`/`?[`, `match`, `struct`/`enum`, `fn_lit` (closures), member/index callees (`obj.f(args)`, `tbl[i]()`), and `class` + colon-call `obj:method(args)`. **No language gaps remain**; the last consistency item (`strcharcodeat` byte-vs-codepoint alignment) is closed — the self-host frontier is now breadth/perf. Locked by `tests/selfhost_drift.rs` (26 active + 1 ignored perf case) and `tests/typeck_compiler.rs` (5/0). See `docs/PrjAnalysis.md` §§40–45.
 
 ## 🤖 v0.5.6 AI Integration
 
@@ -111,12 +115,12 @@ Canonical status is the top summary and `Test Results` section in this file. Old
 |-----------|--------|-------|
 | Core VM | ✅ Stable | Bytecode, GC, sandboxing, error handling |
 | Package Manager | ✅ Functional | Lockfile, semver, file/hosted registry, HMAC verify |
-| Stdlib | ✅ 52+ modules | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor |
+| Stdlib | ✅ 135 modules | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor |
 | Threading | ✅ Working | VM-per-thread, channels, select, thread pool |
 | OOP/Types | ✅ Working | class, struct, enum modules with full test coverage |
 | New Stdlib | ✅ Added | testing, orm, async, env, log, jwt, template, graph, benchmark, crypto_advanced, class, struct, enum, http_client |
 | CLI Tooling | ✅ Complete | run, test, fmt, lint, build, install, publish, search |
-| Type Checker | ✅ Improved | Builtin prelude, generic call substitution, fn-literal body checks; host parser still ahead of self-hosting compiler `.sapp` syntax |
+| Type Checker | ✅ Improved | Builtin prelude, generic call substitution, fn-literal body checks; the self-hosted `.sapp` compiler now parses/compiles/runs the full language (parity reached) |
 | LSP Server | ✅ Unified | `pblang lsp` → `pblang-lsp` (tower-lsp): diagnostics, completions, hover, goto-def, workspace symbols |
 | Native Executables | ✅ Production | `pblang compile` (C99), `bundle`, `pack`, `bundle --self-extract` (embedded runtime at `bin/pblang`) |
 | TLS/HTTPS | ✅ Stable | rustls + webpki-roots, proper certificate verification |
@@ -127,7 +131,7 @@ Canonical status is the top summary and `Test Results` section in this file. Old
 | Polyglot Execution | ✅ Bridge | `polyglot_exec(lang, code)` builtin: execute Python, JS, Bash, Ruby, Perl, Lua, PHP, R inline |
 | WASM Backend | ✅ Prototype | `pblang-wasm` crate: compile pblang AST → WAT (.wat); functions, arithmetic, strings, exports |
 | LLVM Backend | ✅ Prototype | `pblang-llvm` crate: LLVM IR text emitter → compile with clang; `pblang compile --llvm`; functions, if/else, while, for, comparisons |
-| Self-Hosting | ✅ Started | `stdlib/compiler/tokenizer.sapp` + `stdlib/compiler/parser.sapp`: recursive-descent parser + tokenizer written in pblang (let, const, fn, if/elif/else, while, for/in, return, import, export, expressions, arrays, maps, fn literals) |
+| Self-Hosting | ✅ **Complete** | `stdlib/compiler/` (tokenizer→parser→semantic→typeck→ir→optimizer→codegen + `selfhost_frontend.sapp` entry + `vm.sapp` interpreter, ~5,300 lines) tokenizes, parses, compiles **and runs** pblang end-to-end. All language features self-host (incl. `match`, `struct`/`enum`, `class`+colon-call, closures, nil-safe ops). Frontier is now breadth/perf |
 | Polyglot Build | ✅ Bridge | `pblang build-polyglot`: extracts @python/@rust/@js blocks from .sapp files, compiles to .so/.pyc, generates manifest |
 | Math Library | ✅ Enhanced | `math.sapp`: trig (sin/cos/tan), hyperbolic, stats (mean/median/stddev/variance), linear algebra (dot/mat_mul/vec_norm), constants (PI/E/TAU/PHI), number theory (gcd/lcm/is_prime) |
 | New Stdlib | ✅ Added | `units.sapp` (150+ conversions), `functional.sapp` (map/filter/reduce/compose/pipe/curry/memoize), `encoding.sapp` (hex/URL/CSV/base64/JSON), `colors.sapp` (HEX/RGB/HSL/blending/palettes) |
@@ -136,20 +140,21 @@ Canonical status is the top summary and `Test Results` section in this file. Old
 ## ✅ Test Results
 
 ```
-cargo test --test semantics
-test result: ok. 160 passed; 0 failed; 2 ignored
+cargo test --test semantics      → 189 passed; 0 failed; 1 ignored
+cargo test --test selfhost_drift → 26 passed; 0 failed; 1 ignored
+cargo test --test modules        → 28 passed; 0 failed
+cargo test --test typeck_compiler→ 5 passed; 0 failed
+cargo test -p pblang-typeck      → 46 passed; 0 failed
+cargo test --test fmt            → 8 passed; 0 failed
+cargo test --test fmt_drift      → 2 passed; 0 failed
+cargo test -p pblang-vm --lib    → 2 passed; 0 failed
 ```
 
 Ignored tests are currently:
-- `match_guard_pass` — documents a chumsky 0.8 parser limitation:
-- Match arm guards with comparison operators and body separator `:` conflict because  
-  the method-call postfix `obj:method()` consumes `:` before the separator parser runs.
-- The `parse_recovery` mode then skips any alternative separator we add.
-- Fix requires either a different parser combinator library or restructuring the guard
-  expression to use a dedicated `guard_expr` variant without method-call postfix.
-- **Workaround**: Use `case n then body` (tilde `#` or `then` keyword) as separator,
-  defined at the top-level expression scope. Or wrap guards in helper functions.
-- `os_env_set_pass` — kept ignored because `env_set()` stays disabled in v0.5 security hardening (`std::env::set_var` is unsound in multi-threaded programs).
+- **semantics:** `os_env_set_pass` — kept ignored because `env_set()` stays disabled in v0.5 security hardening (`std::env::set_var` is unsound in multi-threaded programs). This is the *only* ignored semantics test.
+- **selfhost_drift:** one perf-gated case — running the full `stdlib/compiler/parser.sapp` *on the self-hosted interpreter* takes >60s per snippet; un-ignore once the self-hosted parser is fast enough to default-on.
+
+> The former match-guard limitation (arm guards + `:` separator vs. the `obj:method()` colon-call postfix) is **resolved**: `match_guard_pass`, `match_guard_accepts_colon_separator`, and `match_guard_still_accepts_tilde_separator` all pass. Guards work with `:`, `then`, and `#` separators.
 
 ## 🚀 Key Improvements Since v0.4
 
@@ -160,7 +165,7 @@ Ignored tests are currently:
    via parent chain, so `recv`, `send`, `channel`, etc. work inside spawned closures
 5. **`select()` now returns `{index, value}`** — Previously returned just index number
 6. **channel_close/is_closed** — Now correctly accept sender handle numbers
-7. **New builtins**: `strfromcharcode`, `strcharcodeat` for byte-level string ops
+7. **String char-code builtins**: `strfromcharcode`, `strcharcodeat` — both **codepoint-based** (as of 2026-05-30): `strcharcodeat(s, i)` returns the full Unicode scalar at codepoint index `i`, consistent with `len`/`s[i]`/`slice`/`str_index_of`, so `strfromcharcode(strcharcodeat(s,i))` round-trips. For raw bytes use `str_to_bytes(s)` → `Array<u8>`
 8. **stdlib/websocket.sapp** — Full `write_frame(opcode, payload)` implementation
 9. **stdlib/http.sapp** — Added `parse_sse_line`, `post_auth`
 10. **stdlib/quantum.sapp** — Added `to_qasm`, `measurements_to_string`, `measurements_to_int`,
@@ -179,17 +184,24 @@ Ignored tests are currently:
 | Issue | Priority | Effort |
 |-------|----------|--------|
 | ~~No TLS/HTTPS~~ | **✅ DONE** | Implemented with rustls |
-| Native executables incomplete | HIGH | 1-2 weeks (E5-gamma stub) |
-| Match guard body separator ambiguity | MEDIUM | Parser rewrite or alt-separator doc |
-| Type system stub | LOW | Months (full HM type inference) |
+| ~~Native executables incomplete~~ | **✅ DONE** | `bundle --self-extract` ships on Linux (Windows CI follow-up) |
+| ~~Match guard body separator ambiguity~~ | **✅ RESOLVED** | Guards work with `:`/`then`/`#`; all match-guard tests pass |
+| ~~Type system stub~~ | **✅ N/A** | Real prelude + generic substitution + fn-literal checks; struct/enum/class supported |
+| Self-hosted parser perf | LOW | Speed up `parser.sapp` on the interpreter to drop the `selfhost_drift` `#[ignore]` |
 
 ## 📋 Recommended Next Steps
 
-1. **Self-extracting binary** (E5-gamma) — Now highest priority production blocker
-2. **LSP improvements** (L3-delta) — Semantic tokens, richer type-aware hover
-3. **OOP conformance** (SP1-gamma) — Class constructor/method dispatch edge cases
-4. **nd.sapp linear algebra** (G3-gamma) — Matrix inverse, solve
-5. **Cranelift JIT** (N2-beta) — Native code compilation for hot paths
+The self-host frontier is now **breadth/perf**, not grammar (all language features self-host):
+
+1. **Differential run** — run a real `stdlib/*.sapp` module through `frontend_run` and diff output against the Rust VM.
+2. **Self-hosted parser speedup** — get `parser.sapp` fast enough on the interpreter to drop the `#[ignore]` on the full-parser `selfhost_drift` case.
+3. **Bootstrap probe** — feed `frontend_compile`'s own source through `frontend_run` and measure how far the pblang compiler gets toward compiling itself.
+4. **Cranelift JIT** (N2-beta) — native code compilation for hot paths.
+5. **LSP depth** — semantic tokens, richer type-aware hover, cross-file intelligence.
+
+**Longer-term vision:** **pbAI** — a native AI model family (a flagship pbAI-Max plus
+distilled, efficient sub-models) **written in pblang**, used as a coding/debugging agent
+to make pblang better, driving the **pb-mcp-server** tool catalog. Design: `docs/pbAI.md`.
 
 ## Archived snapshot (legacy notes below)
 

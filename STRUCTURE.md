@@ -30,6 +30,9 @@ pblang/
 │   ├── pblang-typeck/           # Type checker (inference + diagnostics)
 │   │   └── src/lib.rs
 │   │
+│   ├── pblang-lint/             # Lint passes & diagnostics
+│   │   └── src/lib.rs
+│   │
 │   ├── pblang-ffi/              # Foreign Function Interface (C ABI)
 │   │   └── src/lib.rs           # ffi_load, ffi_call, ffi_close
 │   │
@@ -65,7 +68,7 @@ pblang/
 │   └── pblang-stub/             # Self-extracting bundle launcher
 │       └── src/main.rs
 │
-├── stdlib/                      # 100+ standard library modules (.sapp)
+├── stdlib/                      # ~135 standard library modules (.sapp)
 │   ├── http.sapp, http_server.sapp, router.sapp, middleware.sapp
 │   ├── websocket.sapp, tls.sapp, multipart.sapp
 │   ├── json.sapp, csv.sapp, db.sapp, collections.sapp
@@ -75,15 +78,17 @@ pblang/
 │   ├── quantum.sapp, quantum_sim.sapp, quantum_viz.sapp, quantum_protocol.sapp
 │   ├── fs.sapp, os.sapp, path.sapp, process.sapp, time.sapp, net.sapp
 │   ├── memory.sapp                  # Wrapper around runtime memory_* builtins
-│   ├── compiler/                    # Self-hosting compiler in pblang
+│   ├── compiler/                    # Self-hosting compiler in pblang (tokenize→parse→compile→RUN)
 │   │   ├── tokenizer.sapp           # Lexer
 │   │   ├── parser.sapp              # Recursive-descent parser
+│   │   ├── semantic.sapp            # Semantic analysis
 │   │   ├── typeck.sapp              # Type checker
 │   │   ├── ir.sapp, optimizer.sapp  # IR + optimizations
 │   │   ├── codegen.sapp             # Bytecode code generator
+│   │   ├── vm.sapp                  # Bytecode interpreter (runs the emitted IR, in pblang)
 │   │   ├── bootstrap.sapp           # Bootstrap driver
-│   │   └── selfhost_frontend.sapp   # End-to-end self-host frontend
-│   └── ... (~100 more modules: testing, orm, async, env, log, jwt, template,
+│   │   └── selfhost_frontend.sapp   # End-to-end self-host frontend (frontend_run)
+│   └── ... (~125 more modules: testing, orm, async, env, log, jwt, template,
 │            graph, benchmark, registry, validate, regex, polyglot, ai, ...)
 │
 ├── tests/

@@ -2,11 +2,10 @@
 
 > **Status (final): chumsky 1.0.0-alpha.8 is shipped workspace-wide.**
 > The migration is complete. `cargo check -p pblang-core` is clean,
-> `cargo test --test semantics --test modules --test sandbox
-> --test stdlib_parse` is 161+16+10+1 green (with `match_guard_pass`
-> un-ignored and passing). The single remaining `#[ignore]` in the
-> semantics suite is the pre-existing `env_set` security-audit ignore,
-> unrelated to chumsky.
+> `cargo test --test semantics --test modules` is 189+28 green (with
+> `match_guard_pass` and the `:`-separator variants un-ignored and
+> passing). The single remaining `#[ignore]` in the semantics suite is
+> the pre-existing `env_set` security-audit ignore, unrelated to chumsky.
 >
 > Migration arc (this document is preserved end-to-end as a record):
 > 0.8 → 0.9.3 was API-compatible (zero `parser.rs`/`lib.rs` changes).

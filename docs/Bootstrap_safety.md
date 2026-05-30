@@ -1,5 +1,12 @@
 # Bootstrap safety — surviving the move from Rust to pblang
 
+> **Status (2026-05-30):** self-hosting is already in place. The pblang-written
+> compiler under `stdlib/compiler/` (tokenizer → parser → semantic → typeck → ir
+> → optimizer → codegen, plus `selfhost_frontend.sapp` and the `vm.sapp`
+> interpreter) tokenizes, parses, compiles, and runs pblang end-to-end. This
+> document is the **live maintenance contract** for that frontend and for any
+> further "move X from Rust to pblang" change — not a hypothetical future plan.
+
 This document answers a real worry that comes up the moment you start
 moving compiler/runtime code from Rust into pblang itself:
 

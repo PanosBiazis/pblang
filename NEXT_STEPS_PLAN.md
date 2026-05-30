@@ -1,5 +1,22 @@
 # Next Steps: High Priority Implementation Plan
 
+> ⚠️ **SUPERSEDED / HISTORICAL (as of 2026-05-30).** This plan predates the
+> completion of self-hosting and several items below are already DONE — notably:
+> TLS/HTTPS (rustls, shipped), native self-extracting executables (Linux), the
+> type checker (real builtin prelude + generic substitution + struct/enum/class
+> support — no longer a stub), and the **complete self-hosted compiler** (pblang
+> tokenizes, parses, compiles, and runs pblang end-to-end). Test counts quoted
+> here are stale; current greens are semantics 189/0/1, selfhost_drift 26/0/1,
+> modules 28/0, typeck_compiler 5/0, pblang-typeck 46/0.
+>
+> **For the canonical current status and next steps, see `docs/CURRENT_STATUS.md`,
+> `docs/PrjAnalysis.md` (§§40–45), and `docs/Future_plans.md` (Updates 15–19).**
+> The live frontier is self-host breadth/perf: run a real stdlib module through
+> `frontend_run` and diff vs the Rust VM; speed up the self-hosted parser to drop
+> the `selfhost_drift` `#[ignore]`; bootstrap probe (feed `frontend_compile`'s own
+> source through `frontend_run`). The package-manager / generics / traits items
+> below remain genuine future work; read the rest of this file with that in mind.
+
 ## Overview
 
 Based on the Future_plans documents, the following high-priority items need to be completed to achieve the goal of making pblang the "best, most optimal, ultra-powerful, easy, smart programming language possible".
@@ -826,7 +843,7 @@ The following high-priority items remain:
 - **Future-Proof**: Foundation for advanced features
 
 ## Success Criteria
-- **Backward Compatibility**: All existing tests pass (143 passed, 0 failed, 3 ignored)
+- **Backward Compatibility**: All existing tests pass (current greens: semantics 189/0/1, selfhost_drift 26/0/1, modules 28/0, typeck_compiler 5/0, pblang-typeck 46/0)
 - **Performance**: No performance regression
 - **Safety**: Memory safety and thread safety guarantees
 - **Integration**: Seamless integration with existing VM

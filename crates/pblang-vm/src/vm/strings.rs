@@ -293,6 +293,17 @@ pub(super) fn strfromcharcode(
     }
 }
 
+/// `strcharcodeat(s, i)` → the Unicode scalar value of the character at
+/// **codepoint** index `i`.
+///
+/// Indexing is by codepoint, consistent with `len`, string indexing `s[i]`,
+/// `slice`/`str_slice`, and `str_index_of` — the entire pblang string API
+/// treats a string as a sequence of codepoints, not bytes. The returned value
+/// is the full Unicode scalar (not a byte), so
+/// `strfromcharcode(strcharcodeat(s, i))` round-trips for every character,
+/// including non-ASCII. For pure-ASCII strings this is identical to the old
+/// byte-indexed behaviour (codepoint index == byte index, scalar == byte). For
+/// raw byte access on binary data, use `str_to_bytes(s)` and index the array.
 pub(super) fn strcharcodeat(
     host: &mut dyn VmHost,
     args: Vec<Value>,
@@ -310,15 +321,14 @@ pub(super) fn strcharcodeat(
         Value::Number(n) => *n as usize,
         _ => return Err(host.err("strcharcodeat(): index must be a number".into())),
     };
-    let bytes = s.as_bytes();
-    if idx >= bytes.len() {
-        return Err(host.err(format!(
+    match s.chars().nth(idx) {
+        Some(c) => Ok(Value::Number(c as u32 as f64)),
+        None => Err(host.err(format!(
             "strcharcodeat(): index {} out of bounds (len {})",
             idx,
-            bytes.len()
-        )));
+            s.chars().count()
+        ))),
     }
-    Ok(Value::Number(bytes[idx] as f64))
 }
 
 /// `str_to_bytes(s)` → array<number 0..255>: the raw UTF-8 bytes of `s`.
