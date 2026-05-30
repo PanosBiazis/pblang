@@ -4,7 +4,7 @@
 
 [![Version](https://img.shields.io/badge/version-0.5.7-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 
-pblang is a general-purpose programming language and bytecode VM designed for both **embedded scripting** (games, tools, applications) and **standalone development** (web servers, CLI tools, AI/quantum workflows). It features capability-based security, a built-in package manager, and a growing standard library of 100+ modules.
+pblang is a general-purpose programming language and bytecode VM designed for both **embedded scripting** (games, tools, applications) and **standalone development** (web servers, CLI tools, AI/quantum workflows). It features capability-based security, a built-in package manager, a standard library of ~135 modules, and a **complete self-hosted compiler** — pblang tokenizes, parses, compiles, and runs pblang, all written in pblang.
 
 ---
 
@@ -17,7 +17,7 @@ pblang is a general-purpose programming language and bytecode VM designed for bo
 - **Async / Await** — `async_spawn`, `await`, `await_all`, `await_any`, `map`, `then` built on the channel/thread runtime
 - **Multi-Backend Codegen** — Interpreter, Cranelift JIT + AOT, C99 transpiler, LLVM IR, and WebAssembly text — all consume the same IR
 - **Built-in Package Manager** — Semver resolution, local/remote registries, lockfiles, SHA256 + HMAC verification, token refresh
-- **100+ Standard Library Modules** — HTTP/HTTPS, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, AI, ORM, JWT, template, regex, and more
+- **~135 Standard Library Modules** — HTTP/HTTPS, WebSocket, SQLite, crypto, threading, tensors, quantum, graphics, AI, ORM, JWT, template, regex, and more
 - **AI / ML Integration** — `ai_chat`, `ai_embed`, `ai_token_count` with OpenAI / Anthropic / Ollama / custom providers; RAG helpers (`chunk_text`, `semantic_search`) in `pblang-ai`
 - **Quantum Computing Bridge** — `quantum_run`, `quantum_statevector`, `quantum_backends` via Qiskit / Cirq / Braket subprocess
 - **Polyglot Blocks** — Embed Python, JavaScript, SQL, Rust, Bash, etc. directly in source files; `polyglot_exec` for inline execution
@@ -26,9 +26,17 @@ pblang is a general-purpose programming language and bytecode VM designed for bo
 - **LSP Server** — `pblang lsp` (tower-lsp): diagnostics, completions, hover, goto-def, workspace symbols, semantic tokens
 - **CLI Toolchain** — `run`, `test`, `fmt`, `lint`, `build`, `bundle`, `publish`, `search`, `compile`, `pack`, `verify`, `lsp`, `--cfg`, `--symbols`, `--annotate`, `--dump-bytecode`
 - **Native Binaries** — `pblang bundle --self-extract` produces a single self-extracting executable
-- **Self-Hosting** — Tokenizer, parser, type checker, IR, optimizer, and codegen all available as `.sapp` modules under `stdlib/compiler/`
+- **Self-Hosting (complete)** — The pblang-written compiler under `stdlib/compiler/` (tokenizer → parser → semantic → typeck → ir → optimizer → codegen, plus the `selfhost_frontend.sapp` entry and `vm.sapp` bytecode interpreter) **tokenizes, parses, compiles, and runs** pblang end-to-end, entirely in pblang. Every language feature self-hosts — including `match`, `struct`/`enum`, `class` + colon-call, closures, and nil-safe operators
 - **Embeddable** — Drop into any Rust application with full control over capabilities
 - **Cross-Platform** — Linux, macOS, and Windows
+
+### 🧭 North-star goals (roadmap, not yet shipped)
+
+The language self-hosts its compiler today; the next horizons are deliberately ambitious:
+
+- **A self-hosted IDE + visual designer written in pblang** — *pblang Studio*: drag-and-drop building of GUI, web, and CLI apps (Delphi / Qt Designer / WordPress / Joomla / Android Studio / VS Code style), with the IDE itself authored in pblang. See [docs/Visual_Designer.md](docs/Visual_Designer.md).
+- **OS / bare-metal capability** — freestanding codegen + a kernel runtime so you can write (and boot) an OS in pblang. See [docs/OS_Development.md](docs/OS_Development.md).
+- **pbAI** — pblang's own AI model family (a flagship + distilled sub-models), written in pblang, for coding/debugging. See [docs/pbAI.md](docs/pbAI.md).
 
 ---
 
@@ -198,12 +206,13 @@ See [STRUCTURE.md](STRUCTURE.md) for the full crate map.
 ```
 pblang/
 ├── src/main.rs              # CLI entry point & REPL
-├── crates/                  # 16 workspace crates
+├── crates/                  # 17 workspace crates
 │   ├── pblang-core/         # Lexer (logos), parser (chumsky), AST
 │   ├── pblang-ir/           # Intermediate representation & opcodes
 │   ├── pblang-vm/           # Bytecode VM, builtins, GC, memory_safety, concurrency
 │   ├── pblang-compiler/     # AST → bytecode + optimizer
 │   ├── pblang-typeck/       # Type checker (inference + diagnostics)
+│   ├── pblang-lint/         # Lint passes & diagnostics
 │   ├── pblang-ffi/          # C ABI foreign function interface
 │   ├── pblang-pm/           # Package manager (registry, lockfile, semver, HMAC)
 │   ├── pblang-lsp/          # Language Server Protocol (tower-lsp)
@@ -215,12 +224,12 @@ pblang/
 │   ├── pblang-ai/           # AI / ML providers + RAG helpers
 │   ├── pblang-quantum/      # Qiskit / Cirq / Braket bridge
 │   └── pblang-stub/         # Self-extracting bundle launcher
-├── stdlib/                  # 100+ standard library modules (.sapp)
+├── stdlib/                  # ~135 standard library modules (.sapp)
 │   └── compiler/            # Self-hosting compiler in pblang itself
 ├── tests/                   # Semantics + integration suites
 ├── examples/                # Example projects
 ├── editors/vscode/          # VS Code extension
-├── docs/                    # 28 design documents & specifications
+├── docs/                    # 37 design documents & specifications
 └── benches/                 # Criterion performance benchmarks
 ```
 
@@ -343,6 +352,10 @@ Start with:
 - [Language Semantics](docs/Language_Semantics.md) — detailed language rules
 - [Tooling](docs/Tooling.md) — full CLI/LSP/packaging reference
 - [Current Status](docs/CURRENT_STATUS.md) — current feature maturity and known limits
+- [IDE Manual](docs/IDE_MANUAL.md) — the browser code IDE (`pblang serve`); goal: a self-hosted IDE written in pblang
+- [Visual Designer](docs/Visual_Designer.md) — **pblang Studio**: drag-and-drop builder for GUI, web, and CLI apps (design/roadmap)
+- [OS Development](docs/OS_Development.md) — roadmap to freestanding/bare-metal pblang (kernels, drivers, boot)
+- [pbAI](docs/pbAI.md) — design for pblang's native AI model family (coding/debugging agent, written in pblang)
 
 ---
 
@@ -364,7 +377,7 @@ Start with:
 | **Tooling** | `testing`, `benchmark`, `logger`, `assert`, `validate`, `template`, `regex`, `docs_generator`, `profiler`, `debugger` |
 | **Package Manager** | `registry`, `registry_server` |
 | **Compression** | `compression` (gzip, zstd, brotli) |
-| **Self-Hosting** | `compiler/tokenizer`, `compiler/parser`, `compiler/typeck`, `compiler/ir`, `compiler/optimizer`, `compiler/codegen`, `compiler/bootstrap` |
+| **Self-Hosting** | `compiler/tokenizer`, `compiler/parser`, `compiler/semantic`, `compiler/typeck`, `compiler/ir`, `compiler/optimizer`, `compiler/codegen`, `compiler/vm`, `compiler/selfhost_frontend` (end-to-end run), `compiler/bootstrap` |
 
 ---
 

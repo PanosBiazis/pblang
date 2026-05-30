@@ -1,6 +1,10 @@
 # pblang IDE Manual
 
-This manual covers the browser IDE in `editors/ide/index.html` and its backend API served by `pblang serve`.
+This manual covers the **code-first** browser IDE in `editors/ide/index.html` and its backend API served by `pblang serve` — write, run, check, format, and debug pblang.
+
+> Looking for the **visual drag-and-drop designer** (build desktop GUI, web, and CLI apps by dragging interactive elements — Delphi / Qt Designer / WordPress / Joomla / Android Studio / VS Code style)? That's **pblang Studio**, the visual authoring layer on top of this IDE — see **[`docs/Visual_Designer.md`](Visual_Designer.md)** (design/roadmap).
+>
+> **Goal:** the IDE itself is to be **written in pblang** (a self-hosted IDE on pblang's own runtime). The HTML/JS `index.html` below is the bootstrap toward that target.
 
 ## 1. Start the IDE
 

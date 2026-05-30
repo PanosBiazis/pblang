@@ -18,7 +18,7 @@
 | Workspace crates | **17** core (incl. `pblang-lint`) + `pblang-stub` launcher (+ `pb-mcp-server` external tooling) |
 | Total Rust LOC | **44,615** (refreshed 2026-05-29) |
 | Largest Rust files | `src/main.rs` (5,980), `pblang-core/src/parser.rs` (2,682), `pblang-vm/src/vm.rs` (2,526 — down from 12,321 after the submodule extraction), `pblang-pm/src/lib.rs` (2,474), `pblang-vm/src/vm/polyglot.rs` (2,156) |
-| Stdlib modules | **135** top-level `.sapp` files (146 incl. self-host compiler), **30,787** lines of pblang |
+| Stdlib modules | **135** top-level `.sapp` files (147 incl. self-host compiler), **30,970** lines of pblang |
 | Largest stdlib | `math.sapp` (1,018), `thread.sapp` (~976), `polyglot_registry.sapp` (703), `ide.sapp` (632), `async_await.sapp` (526) |
 | Examples | 23 |
 | Integration test files | 32 (semantics, pack, threads, sandbox, LSP, HTTP server, fmt, lint, modules, polyglot, quantum sim, tensors, …) |
@@ -669,7 +669,283 @@ Root causes (all in `stdlib/compiler/codegen.sapp`, plus consumers drifting from
 
 Result: `frontend_compile` now lowers the **core corpus** — `let`, arithmetic, identifiers, strings, arrays, unary minus, `while`, `if`/`else`, function defs + calls — to a non-empty bytecode IR (constants + opcodes) without crashing. Locked by `tests/selfhost_drift.rs::selfhost_drift_compiles_core_corpus_to_bytecode` (8 constructs). Adjacent suites green: `typeck_compiler` 8/0, `fmt_drift` 2/0, `fmt` 5/0, `selfhost_drift` 4/0, semantics `selfhost_frontend_pass` ok.
 
-**Honest scope / next step:** this proves the pblang compiler *emits* a structurally-coherent IR; it does **not** yet *execute* it. The self-hosted opcode set (`OP_*` in codegen.sapp) has no runner in-tree, and `elif` lowering, `for`/`for_in`, `assign`-as-statement, and member/index expressions still need codegen coverage. The next self-hosting increment is either a small interpreter for the self-hosted IR or a bridge that maps it onto the Rust VM's `Chunk` so emitted bytecode can be run and checked for output parity against the Rust compiler.
+**Honest scope / next step:** this proves the pblang compiler *emits* a structurally-coherent IR; executing it was the open item — **now done in §26.** Still uncovered by codegen: `elif` lowering, `for`/`for_in`, and member/index expressions.
+
+## 26. Self-hosting loop CLOSED: a pblang bytecode VM executes pblang-compiled code (2026-05-30)
+
+Built `stdlib/compiler/vm.sapp` — a stack-machine interpreter for the IR `codegen.sapp` emits — and `selfhost_frontend.frontend_run(source)`, which runs the full chain **pblang source → pblang tokenizer → parser → typecheck → codegen → pblang VM → result**. pblang now compiles *and runs* a meaningful subset of itself, with **zero Rust** in the loop.
+
+`vm.sapp` is a ~140-line stack machine: `CONSTANT`, arithmetic/comparison/`NOT`, `GET/SET_LOCAL` (slot-indexed, auto-growing), `GET/SET/DEFINE_GLOBAL` (name via constant pool; `DEFINE` peeks so the codegen `DEFINE`+`SET` pair for fn names balances), `JUMP`/`JUMP_IF_FALSE/TRUE`, `MAKE_ARRAY`, and `CLOSURE`+`CALL`+`RETURN` with real call frames (recursion works). `run(chunk)` returns `{ output, locals, globals }`; results are observed via top-level `let` slots (the self-hosted parser treats `print` as a plain identifier, so `OP_PRINT` is rarely emitted).
+
+Codegen gaps fixed to make execution correct:
+- **Number literals interned as strings** — the tokenizer carries a literal's source text, so `1 + 2` string-concatenated to `"12"` and `3 * 4` threw "arithmetic expects numbers". `codegen_literal` now `parse_number`s numeric literals.
+- **Assignment-as-statement** — `x = v` (parsed as `expr_stmt{assign}`) was a codegen no-op, so `while` counters never advanced. `codegen_expr_stmt` now special-cases `assign`: evaluate value → `SET_LOCAL`/`SET_GLOBAL` (consuming, no trailing `POP`).
+- **Function params declared as locals** — `codegen_fn` declared each param map *as* the local name; now uses `param.name`, so a function body resolves params via `GET_LOCAL`.
+
+Verified end-to-end (`tests/selfhost_drift.rs::selfhost_drift_executes_compiled_bytecode`): arithmetic `1+2=3`, precedence `2+3*4=14`, comparison `5>3=true`, if/else branch selection `=100`, while accumulation `Σ0..4=10`, function call `add(3,4)=7`, and **recursion** `fib(10)=55` / `fact(6)=720`. All five `selfhost_drift` tests pass; adjacent suites green (`modules` 28/0, `semantics` 189/0/1, `typeck_compiler` 8/0, `fmt`/`fmt_drift`). Stdlib `.sapp` count incl. self-host compiler 146 → 147 (`compiler/vm.sapp`; top-level still 135).
+
+**Next:** broaden codegen coverage (`elif`, `for`, modulo, arrays/maps) — **done in §27**; remaining: `for`/`for_in` over iterables, string/array builtin calls; eventually bootstrap by running `frontend_compile` *itself* through `frontend_run`.
+
+## 27. Self-hosting coverage broadened: loops, elif, modulo, arrays & maps (2026-05-30)
+
+Extended the executable self-hosted subset across the vertical slice (parser → codegen → `vm.sapp`), each verified end-to-end via `frontend_run`:
+- **`for <name> <end>` count loop** — lowered to `name=0; while name<end { body; name=name+1 }`. (`Σ0..4 = 10`, `5! via for = 120`.)
+- **`elif` chains** — `codegen_if` rewritten to a backpatched arm-chain (`if`/`elif*`/`else`), each arm jumping to a shared end. (grading `if/elif/else` selects the right arm.)
+- **`%` modulo** — new `OP_MOD` opcode (31) in codegen + interpreter (`num_mod`). (`17 % 5 = 2`; count-evens loop = 5.)
+- **Postfix indexing & member access** — the self-hosted `parse_call` had **no** `[index]` or `.member` (so the compiler couldn't parse itself); added both (`expr_index`/`expr_member`), matching codegen's existing `index`/`member` branches, plus interpreter `OP_GET_INDEX`/`OP_GET_ATTR`. (`a[1]=20`, array-sum loop, `a[1].n` chaining.)
+- **Map literals** — `map{...}` wasn't parsed (the tokenizer emits `map` as an *ident*, so the generic ident branch swallowed it; and entry keys use `:`, which is **punct**, but the dead map branch matched it as an *operator*). Rerouted map-literal parsing through the ident branch with `{` lookahead and `:`-as-punct; added interpreter `OP_MAKE_MAP`. (`m.k + m.j = 16`, `m["b"] = 8`.)
+- Number literals also corrected mid-pipeline: `codegen_literal` `parse_number`s the tokenizer's literal text (already noted in §26).
+
+**Bootstrap-probe findings (honest gauge):** multi-function programs with loops run correctly (`sum-of-squares(4) = 14`); the executable subset now covers literals, arithmetic + precedence, comparison, modulo, `if`/`elif`/`else`, `while`, `for`-count, functions + recursion + nested calls, arrays + indexing, and map literals + member/index + chaining. **Remaining parser/codegen gaps before self-compilation:** `for x in <iterable>` (needs a length/iter primitive the IR lacks), string/array method/builtin calls, type annotations (`:` is consumed as operator in `let`/params), and `?`/`??`/`?.` operators.
+
+Locked by `tests/selfhost_drift.rs::{selfhost_drift_executes_loops_elif_mod, selfhost_drift_executes_arrays_and_maps}` (selfhost_drift now **7 tests**). Adjacent suites green.
+
+## 28. Self-hosting: `for x in <iter>` + host builtin calls (2026-05-30)
+
+Two more gaps from §27 closed, each a full parser→codegen→VM slice verified via `frontend_run`:
+- **`for x in <iterable>`** — `codegen_for_in` lowers it to `__arr = iter; __i = 0; while __i < len(__arr) { name = __arr[__i]; body; __i = __i + 1; }` using a new **`OP_LEN`** opcode (33→ number 32). Hidden array/index locals get their own slots, so **nested** for-in works (`[[1,2],[3,4]] → 10`).
+- **Host builtin calls** — a call to a known builtin name (not shadowed by a user global) now dispatches to the *real* pblang builtin. `vm.sapp` pushes a `{__bi: name}` marker on `OP_GET_GLOBAL` of a builtin, and `OP_CALL` routes markers to `_call_builtin` (a dispatch table over ~30 core builtins: `len`, `str`, `array_push`/`array_pop`, `str_split`/`str_upper`/`str_lower`/`str_slice`/`str_trim`/`str_contains`/…, `parse_number`, `num_floor`/`num_abs`/`num_sqrt`/`num_mod`, `map_has`/`map_keys`/`map_remove`, `error`). So self-hosted code can call `len(a)`, `array_push(out, v)`, `str_split(s, ",")`, etc.
+
+Verified: for-in sum-of-squares `=14`, `array_push` inside for-in + index `=9`, nested for-in `=10`, `len([9,8,7])=3`, `str_split("a,b,c,d",",")` len `=4`, `str_upper("hi")="HI"`. Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_forin_and_builtins` (selfhost_drift now **8 tests**); `modules` 28/0, `semantics` 189/0/1 green.
+
+## 29. Self-hosting: logical `and`/`or`/`not` with short-circuit (2026-05-30)
+
+The bootstrap probe showed the next blocker: **logical operators weren't parsed** — `parse_or`/`parse_and` only matched the `||`/`&&` *operators*, but programs (and the compiler's own guards) use the `and`/`or`/`not` **keywords**, so an expression silently stopped at the first `and`/`or` (evaluating only the left operand). Fixed across the slice:
+- **Parser** — `parse_or`/`parse_and` now also accept the `and`/`or` keywords; `parse_unary` handles the `not` keyword (→ `unary{op:"not"}`).
+- **Codegen** — `and`/`or` route to a new `codegen_logical` with **proper short-circuit** via two new peek-jump opcodes (`OP_JUMP_IF_FALSE_PEEK` 33 / `OP_JUMP_IF_TRUE_PEEK` 34: jump on the condition *without* popping, so the short-circuited operand becomes the result). `not`/`!` → `OP_NOT`. Boolean literals now intern the real `true`/`false` (were `1`/`0`).
+- **Interpreter** — the two peek-jump opcodes added.
+
+Short-circuit is correct, not just convenient: `i < len(a) and a[i] == 1` evaluates `a[i]` only when `i < len(a)`. Verified: `and`/`or` true+false arms, `not`, real bool literal, the short-circuit guard `=99`, and nested grouping `(2>1 and 3>2) or (1>9) → 7`. Locked by `selfhost_drift::selfhost_drift_executes_logical_ops` (suite now **9 tests**); `modules` 28/0, `semantics` 189/0/1 green.
+
+**Remaining before self-compilation:** type annotations (`let x: T` / params — `:` is consumed as an operator), the `?`/`??`/`?.` operators, default parameter values, and method-call syntax (`obj.method(args)` — only free-function builtin calls work). The executable subset now covers logical operators on top of arithmetic/comparison/control-flow/functions/recursion/arrays/maps/for-in/builtins — i.e. most non-trivial straight-line, looping, and recursive programs.
+
+## 30. Self-hosting: index/member assignment + parser robustness, guided by the bootstrap probe (2026-05-30)
+
+Ran the bootstrap probe (`frontend_parse_full` on the compiler's own modules) and fixed the highest-frequency blockers it surfaced — parse-error counts on real compiler source dropped sharply (e.g. `typeck.sapp` **67 → 8**, `codegen.sapp` **26 → 7**):
+- **Comments** — the parser errored on every `//`/`///`/`//!` token; `parse()` now strips `comment` tokens up front.
+- **`return …;` ate no `;`** — unlike `let`/`const`, `parse_return` left its trailing `;`, emitting a spurious error per return; now consumed.
+- **Type-annotation `:`** — `let x: T` / params / return types matched `:` as an *operator*, but the tokenizer emits it as **punct**; fixed (4 sites), so annotations parse and skip cleanly.
+- **Map literals** — keys may now be **string literals** (`map{ "fn": true }` — the tokenizer's own KEYWORDS table) as well as idents; **trailing commas** allowed in maps, arrays, params, and call args.
+- **Index/member assignment** — the big one: `parse_assignment_expr` now parses a full postfix lvalue and, on `=`, emits `assign` (ident) or a new `assign_to{target,value}` (index/member). Codegen lowers index targets to `OP_SET_INDEX` and member targets to `OP_SET_ATTR` (added to `vm.sapp`); **nested lvalues** work (`a[0].n = 7`, `cg.chunk.instructions[j].operand = x`) because the obj chain is just a codegen'd expression.
+
+Verified end-to-end: `a[1]=99`, `m.k=42`, nested `a[0].n=7`, in-loop `a[i]=i*10` → `a[2]=20`, and string-key + trailing-comma maps. Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_index_member_assignment` (selfhost_drift now **10 tests**); `modules` 28/0, `semantics` 189/0/1.
+
+**Bootstrap gauge (parse-only) after this round:** `codegen.sapp` 53 stmts / 7 errors, `typeck.sapp` 52 / 8, `parser.sapp` 63 / 32. **Remaining blockers** before a module parses cleanly: `try expr catch fallback` (needs VM exception support), inline `if … { } else { }` **expressions** (currently only statements), default parameter values, and the `?`/`??`/`?.` operators.
+
+## 31. Self-hosting: `else if` chains + loop control (`break`/`continue`) (2026-05-30)
+
+Two more blockers from the probe, both common in the compiler's own source:
+- **`else if`** — the parser only knew `elif`, so every `} else if … {` failed with "Expected '{' but got keyword 'if'". `parse_if` now treats `else if` as an else-block holding a single nested `if` (`stmt_block([parse_if()])`). This alone unblocked most of `codegen.sapp`.
+- **`break` / `continue`** — new statements in the parser; codegen tracks a **loop-context stack** (`{breaks, continues}` per loop) in `CodeGen`, emitting placeholder `OP_JUMP`s that are backpatched when the loop closes: `break` → loop end, `continue` → the loop's re-check point (while: condition; for/for-in: the increment). Works in `while`, `for`-count, and `for-in`.
+
+Verified end-to-end: `else if` arm selection `=3`; `break` in while (`Σ0..4=10`); `continue` skipping evens (`1+3+5+7+9=25`); `break` in for (`=3`) and for-in (`=30`). Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_elseif_break_continue` (selfhost_drift now **11 tests**); `modules` 28/0, `semantics` 189/0/1.
+
+**Bootstrap gauge (parse-only) after this round:** `codegen.sapp` **73 stmts / 3 errors** (was 53/7 — `else if` was the big unlock), `parser.sapp` **67 / 12** (was 63/32), `typeck.sapp` 52 / 8, `ir.sapp` 28 / 7, `tokenizer.sapp` 21 / 12. The dominant remaining blockers are `try expr catch fallback` (needs VM exception support — `tokenizer.sapp`/`selfhost_frontend.sapp`) and inline `if {…} else {…}` **expressions** (`typeck.sapp`); then default parameter values and `?`/`??`/`?.`.
+
+## 32. Self-hosting: `try expr catch fallback` (2026-05-30)
+
+`try <body> catch <handler>` is now an executable expression. Codegen (`codegen_try`) compiles the body and handler into their own sub-chunks that **share the enclosing local slots** (their `CodeGen.locals` is copied from the parent, so in-scope variables resolve to the same slots), and emits a new `OP_TRY` whose constant is `{try_chunk, catch_chunk}`. The interpreter runs the body sub-chunk inside its **own pblang `try/catch`** — if the body raises (array OOB, missing map key, explicit `error(...)`), it falls back to the handler sub-chunk; both execute against the shared runtime locals/globals.
+
+Verified: catch array OOB → `-1`, successful body passes its value, catch missing map key → `0`, catch `error("boom")` → `42`, and **nested** `try (a[5]+1) catch (try a[9] catch 7)` → `7`. Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_try_catch` (selfhost_drift now **12 tests**); `modules` 28/0, `semantics` 189/0/1.
+
+**Gauge after this round:** `codegen.sapp` 76 stmts / 3 errors, `tokenizer.sapp` 21 / **8** (was /12 — try/catch in `is_keyword`), `typeck.sapp` 52 / 8, `parser.sapp` 67 / 12, `ir.sapp` 28 / 7.
+
+**Deeper finding (next priority beyond parsing):** even once a module *parses*, running it needs **module-level scoping** — the self-hosted codegen compiles top-level `let`/`const` as *locals* of the main chunk, so a function can't see a module-level constant (e.g. the tokenizer's `KEYWORDS`, or codegen's `OP_*`). Top-level `let`/`const` should become globals (visible to all functions in the module). That, inline `if/else` **expressions**, and default parameter values are the next blockers before `frontend_run` can execute a real compiler module. **→ Resolved in §33.**
+
+## 33. Self-hosting milestone: module-level scoping — real multi-function modules now RUN (2026-05-30)
+
+Implemented module-level scoping: top-level `let`/`const` now compile to **module globals** (`OP_DEFINE_GLOBAL`) instead of main-chunk locals, so **every function in the module can see them**. `CodeGen` gained an `is_module` flag (set by `compile_stmts`); `_at_module_top` (module + `scope_depth == 1`) routes top-level `let`/`const` through `codegen_global_let`; nested/block/function `let`s stay locals. Function definitions now bind via a single (consuming) `OP_DEFINE_GLOBAL` (the `DEFINE`+`SET` pair was collapsed; `DEFINE_GLOBAL` now pops like `SET_GLOBAL`). Globals are observed by name via `frontend_run(...).globals`.
+
+This is the **gating capability for running real modules**. Demonstrated end-to-end (`tests/selfhost_drift.rs::selfhost_drift_runs_multifunction_module`): a small "module" — shared constant `DIGITS`, mutually-referencing helpers `is_digit`/`count_digits`, string indexing `s[i]`, a `for` and a `while` loop, and the `str_contains`/`len` builtins — compiled by the pblang compiler and executed by the pblang VM, producing `count_digits("a1b2c3d4") = 4`, `sum_to(5) = 15`, composed `answer = 415`. Plus a focused `selfhost_drift_module_level_globals` test (functions reading a module global, map constant, `const`, and array).
+
+The 12 prior execution tests were migrated from slot-based observation (`r.locals[i]`) to name-based (`r.globals["x"]`), matching real pblang module semantics. selfhost_drift now **14 tests**; `modules` 28/0, `semantics` 189/0/1 green.
+
+**Remaining before `frontend_run` executes a *real* compiler module (e.g. `tokenizer.sapp`):** finish closing the parse gaps (inline `if/else` expressions, default parameter values, `?`/`??`/`?.`) so the module parses with zero errors; then iron out runtime edge cases. The executable language subset is now broad enough for genuine programs (module state, mutually-recursive functions, strings, collections, loops, error handling).
+
+## 34. Self-hosting: inline `if/else` expressions — and two real modules now PARSE clean (2026-05-30)
+
+Added inline `if {…} else {…}` as an **expression** (`let v = if c { a } else { b }`): a new `parse_if_expr` (in `parse_primary`, supports `else if` chains) produces an `if_expr` node; `codegen_if_expr` lowers it with a `codegen_block_expr` helper that leaves the branch block's **value** (its last expression, or nil) on the stack — no new opcode (reuses the jumps). Works as a function return, as a call argument, in the typeck-style `if x != nil { x } else { default }` guard, and with a statement preceding the final expression in a branch. Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_if_expressions` (selfhost_drift now **15 tests**); `modules` 28/0, `semantics` 189/0/1.
+
+**Milestone — two compiler modules now parse with ZERO errors:** the bootstrap gauge shows **`typeck.sapp` 40 stmts / 0 errors** and **`tokenizer.sapp` 12 / 0** (inline-if-expr was the last gap for both). `codegen.sapp` 80 / 4, `parser.sapp` 70 / 18.
+
+**And `tokenizer.sapp` now COMPILES AND RUNS** through the self-hosted pipeline — reading its real source, appending a `tokenize("let x = 42;")` call, and executing via `frontend_run` gets *deep* into `tokenize()` (nested `exec` frames) before hitting a **runtime slot/scoping edge case** (a local slot reads as a function-typed `nil` → a `nil.field` access). So the frontier has moved from *parsing* to *runtime correctness on complex real code*. (Also made the interpreter's `OP_GET_LOCAL` read an unassigned slot as `nil`, matching the Rust VM's nil-initialized frames, rather than throwing.)
+
+**Next:** trace the tokenizer's slot/scoping mismatch (likely block-scoped local slot reuse interacting with the if-expr branch scopes); then default parameter values and `?`/`??`/`?.`. The goal in sight: `frontend_run(tokenizer source + a call)` returning a correct token stream — pblang tokenizing pblang, end-to-end.
+
+## 35. Self-hosting: runtime hardening toward running the tokenizer (2026-05-30)
+
+Chased the tokenizer's runtime failures from §34. Four concrete fixes/hardenings to the self-hosted runtime, each keeping the verified subset green (`selfhost_drift` 15/15, `modules` 28/0, `semantics` 189/0/1):
+- **Missing char-code builtins** — `tokenize` calls `strcharcodeat`/`strfromcharcode` (and uses `str_from_char_code`/`str_repeat`); these weren't in `vm.sapp`'s dispatch table, so they resolved to `nil` and the call crashed. Added to `_is_builtin`/`_call_builtin`.
+- **Monotonic local slots** — `codegen_declare_local`/`codegen_resolve` used the live `cg.locals` *array index* as the slot, and `end_scope` popped it, so sibling scopes (two `if` branches, successive blocks in a big function) **reused** runtime slots — a latent stale-read hazard in deeply-nested code. Each local now gets a unique, never-reused slot (`CodeGen.next_slot`); name resolution still shadows correctly.
+- **Nil-tolerant `OP_GET_LOCAL`** — reading an unassigned slot now yields `nil` (matching the Rust VM's nil-initialized frames) instead of throwing array-OOB.
+- Confirmed in isolation that the tokenizer's building blocks all work end-to-end: map-returning functions + member access, a `push` helper building an array of maps, a `while` loop building maps, and a function returning an array of maps.
+
+**Status:** `tokenizer.sapp` parses with 0 errors and **compiles + runs** through the self-hosted VM (clean for trivial inputs), but full `tokenize(<multi-token source>)` still hits an input-dependent runtime error deep in its branch-heavy main loop (a slot reads as a function-typed `nil` on one path; a numeric compare sees `nil` on another). The isolated patterns pass, so the remaining bug is specific to the tokenizer's control-flow shape and needs instruction-level tracing — that's the active frontier. The honest summary: **the pblang compiler+VM parses and compiles the real tokenizer and executes the bulk of it; closing the last runtime edge cases is the next focused task.**
+
+## 36. Self-hosting milestone: pblang TOKENIZES pblang (`let` initializer scoping fix) (2026-05-30)
+
+Root-caused §35's tokenizer crash to a **`let`-initializer scoping bug**, and fixing it makes the real tokenizer run. The bug: `codegen` declared a `let`'s local **before** compiling its initializer, so `let len = len(source)` resolved the `len(...)` call to the just-declared (unset → `nil`) local instead of the builtin — `CALL` on `nil`. A `let`'s RHS must be evaluated in the **enclosing** scope. Fix: new `codegen_local_let` compiles the value first, then declares the local and stores (`OP_SET_LOCAL`). Locked by `tests/selfhost_drift.rs::selfhost_drift_let_shadows_builtin_in_initializer` (`let len = len(s)` → 5; `let str = str(x)` → "77"); selfhost_drift now **16 tests**, `modules` 28/0, `semantics` 189/0/1.
+
+**The payoff:** reading the real `stdlib/compiler/tokenizer.sapp` source, appending `tokenize("let foo = 42;")`, and running it through `frontend_run` now **deterministically returns 6 tokens** — `keyword:let`, `ident:foo`, `operator:=`, `number:…`, `punct:;`, `eof` — with **correct kinds** and correct `keyword`/`ident` texts. **pblang is tokenizing pblang.** (Verified manually; the run isn't a stable cargo test yet because it needs `fs` + the large combined chunk.)
+
+**One precise remaining bug:** the **number** token's `text` comes back `nil` (should be `"42"`), and observing the *last* statement of the very large combined chunk is flaky. The number-branch shape reproduces correctly in isolation (`let text=""; if …; while text = text + s[i]` → `"42"`), so the bug is context-dependent in `tokenize`'s deep control flow — the next instruction-trace target. **→ Resolved in §37 (single root cause: a UTF-8 bug).**
+
+## 37. ✅ MILESTONE: pblang tokenizes pblang — fully correct (UTF-8 `char_at` fix) (2026-05-30)
+
+The §36 "remaining bug" (number `text` = `nil`), the flaky "last statement dropped", and the `+`-input hang were **all one root cause**: a **UTF-8 char-vs-byte indexing bug**. The Rust VM's `strcharcodeat` is **byte-indexed** (`strcharcodeat("a→b", 1)` → `226`, the first UTF-8 byte of `→`), while `len`/`slice` are **char-indexed**. `tokenizer.sapp`'s `char_at` was `strfromcharcode(strcharcodeat(s, i))` — byte-indexed — so on any multi-byte char (the `→` arrows in the tokenizer's own comments) `pos` advanced by bytes while the loop bound `len(source)` counted chars, desyncing position tracking and **truncating the input** near the end. The truncation corrupted everything downstream (truncated idents, dropped tokens, `nil` number text, the apparent "last statement dropped").
+
+**Fix (pure `.sapp`):** `char_at(s, i)` now uses char-indexed `slice(s, i, i+1)`; added `slice` to the self-hosted VM's builtin dispatch.
+
+**Result — verified end to end and locked as a cargo test** (`tests/selfhost_drift.rs::selfhost_tokenizes_pblang_end_to_end`): reading the real `stdlib/compiler/tokenizer.sapp`, running its `tokenize("let foo = 42 + bar;")` through the self-hosted compiler + VM (`frontend_run`), returns the **fully correct** stream:
+
+```
+keyword:let  ident:foo  operator:=  number:42  operator:+  ident:bar  punct:;  eof:
+```
+
+**pblang now tokenizes pblang** — the pblang-written tokenizer, compiled by the pblang-written compiler, executed by the pblang-written VM, lexing real pblang source into a correct token stream. selfhost_drift **17 tests**; `modules` 28/0, `semantics` 189/0/1, all green.
+
+**VM note (potential future Rust fix):** `strcharcodeat`'s byte indexing is inconsistent with `len`/`slice`/string-`[]` (all char-indexed). The `.sapp` fix sidesteps it; aligning `strcharcodeat` to char indexing in the Rust VM would be the deeper correctness fix (needs a rebuild + audit of byte-dependent callers).
+
+**Next:** drive the self-hosted **parser** on this token stream (`frontend_parse_full` over a real snippet, run through the self-hosted VM), then `codegen` — i.e. push toward pblang *parsing* and *compiling* pblang, not just lexing it. Plus the still-open language gaps (default parameter values, `?`/`??`/`?.`). **→ Parser milestone reached in §38.**
+
+## 38. ✅ MILESTONE: pblang PARSES pblang (perf fix + 3 parser gaps closed) (2026-05-30)
+
+The UTF-8 `char_at` fix (§37) was char-correct but **O(n²)** (`slice(s,i,i+1)` is O(i) for UTF-8), so the large `parser.sapp`/`codegen.sapp` took ~60 s to tokenize. **Perf fix:** `tokenize` now pre-splits the source into a char array once (`str_split(source, "")`) and reads it via an O(1) bounds-safe `_cat` — tokenization is O(n) again; the whole compiler corpus gauges in well under a second.
+
+Then closed `parser.sapp`'s last **16 parse errors** (three root causes):
+- **Keywords as map keys** — `map{ else: …, then: … }` (the parser's own AST builders); the map-literal key may now be a keyword token, not just ident/string.
+- **`for i in LO to HI`** inclusive range loops — `parse_for` now recognizes the `to` form and emits a `for_range` node; `codegen_for_range` lowers it to `i=LO; while i<=HI { …; i=i+1 }` (with break/continue). Verified `for i in 1 to 5 → 15`.
+- **`import(...)` as an expression** — `let m = import("…")`; `import` in expression position now parses as an ident (so postfix `(...)` makes it a call).
+
+Result: **five compiler modules now parse with 0 errors** — `tokenizer` (13), `parser` (71), `codegen` (101), `typeck` (40), `ir` (22).
+
+**The milestone — pblang parses pblang, locked as a cargo test** (`tests/selfhost_drift.rs::selfhost_parses_pblang_end_to_end`): reading the real `tokenizer.sapp` **and** `parser.sapp`, then running `parse(tokenize("let x = 1; fn add(a, b) { return a + b; }"))` through the self-hosted compiler + VM, yields a correct AST — **2 statements**, `stmt0.kind = "let"`, `stmt1.kind = "fn"`, `fn name = "add"`. The pblang-written tokenizer *and* parser, compiled by the pblang-written compiler and executed by the pblang-written VM, lex and parse real pblang source. selfhost_drift **19 tests**; `modules` 28/0, `semantics` 189/0/1.
+
+**Next:** the third stage — drive `codegen` on the self-hosted AST (compile the parsed statements via the self-hosted `compile_stmts` running in the self-hosted VM), i.e. pblang *compiling* pblang end to end. Plus the still-open language gaps (default parameter values, `?`/`??`/`?.`) and the Rust-side `strcharcodeat` char-indexing alignment. **→ Done in §39 — and the full loop closes.**
+
+## 39. 👑 MILESTONE: pblang COMPILES AND RUNS pblang — the full self-hosting loop closes (2026-05-30)
+
+The complete self-hosted toolchain — **tokenizer + parser + codegen + bytecode VM, all written in pblang** — now compiles *and executes* pblang source, end to end. Two new cargo tests lock it (both fast — the pair runs in ~3.2 s):
+
+- **`selfhost_compiles_pblang_to_bytecode`** (Stage 3, codegen): reads `tokenizer.sapp` + `parser.sapp` + `codegen.sapp` and runs `compile_stmts(parse(tokenize("let x = 1; let y = x + 2;")).stmts)` through the self-hosted VM, producing a correct bytecode chunk (6 instructions, 4 constants: `CONST 1, DEFINE x, GET x, CONST 2, ADD, DEFINE y`).
+- **`selfhost_compiles_and_runs_pblang_end_to_end`** (the crown jewel): adds `vm.sapp` and runs the *whole* chain — `run(compile_stmts(parse(tokenize("let a = 6; let b = 7; let answer = a * b;")).stmts))` — inside the self-hosted VM, and reads back `answer = 42`.
+
+Required only minor plumbing: added the type-predicate builtins the codegen uses (`is_map`/`is_array`/`type`/…) to the VM's dispatch table. No name-collision issues across the four combined modules (`push` is defined identically in tokenizer/parser; the `OP_*` constants match codegen↔vm).
+
+**What this means:** the pblang-written compiler front-end (lexer→parser→codegen) and the pblang-written bytecode VM together compile and run a real pblang program — and the entire thing runs *inside another instance* of the same self-hosted compiler+VM. The Rust runtime is the host, but the language pipeline itself is pblang compiling and executing pblang. selfhost_drift **21 tests**; `modules` 28/0, `semantics` 189/0/1.
+
+**Trajectory (this session):** §26 closed the loop (pblang VM runs pblang-compiled bytecode) → §33 module scoping → §37 pblang *lexes* pblang → §38 pblang *parses* pblang → **§39 pblang *compiles and runs* pblang**. Remaining language gaps for compiling *arbitrary* pblang (vs. the verified subset): default parameter values, `?`/`??`/`?.`, `match`/`class`/`struct`/`enum`, and the Rust-side `strcharcodeat` char-indexing alignment. The realistic end-state per `Future_plans` remains build-time independence via the C-transpiler; this self-hosted bytecode path is the "pblang-written runtime" proof-of-concept, now demonstrably closed for the core language.
+
+## 40. Self-hosting: default parameter values (2026-05-30)
+
+Added **default parameter values** (`fn f(a, b = 5)`) to the self-hosted language. Parser: each param gains a `default` field (`parse_expr` after `=`). Codegen: a new `codegen_fill_defaults` emits, at function entry, `if param == nil { param = default; }` per defaulted param — an omitted arg reads as nil (the tolerant `OP_GET_LOCAL`), so it gets filled. Verified end-to-end: numeric (`add(3)` with `b=5` → 8), override (`add(3,10)` → 13), string (`greet("Bob")` → "Hi Bob"), nil (`opt(7)` → 7), and partial application of two defaults (`box(5)` → 15). Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_default_params` (selfhost_drift **22 tests**); the self-hosting milestone tests still pass on the modified codegen; `modules` 28/0, `semantics` 189/0/1.
+
+**Chumsky quirk hit again** (see `feedback_chumsky_cascade`): the new codegen used member access `p.default` and `inner_cg.chunk.instructions[jf].operand = …` inside the large `codegen.sapp`, which made the *real* (alpha-chumsky) parser emit a spurious "unexpected character '{'" cascade reported at an unrelated function's body brace — even though each construct parsed fine in isolation. Switching to **bracket access** (`p["default"]`, `[jf]["operand"]`) sidestepped it. (The pblang-written parser had no trouble with either form.)
+
+**Remaining language gaps for arbitrary pblang:** `?`/`??`/`?.`, `match`/`class`/`struct`/`enum`, and the Rust `strcharcodeat` char-indexing alignment.
+
+## 41. Self-hosting: nil-safe operators `??` / `?.` / `?[` (2026-05-30)
+
+Added the three null-safety operators to the self-hosted language, end to end through the pblang compiler + VM:
+
+- **`a ?? b`** — null-coalescing. Result is `a` unless `a` is **nil**, in which case `b` (short-circuit: `b` is not evaluated when `a != nil`). Crucially nil-only, **not** falsy — `false ?? 9 → false` and `0 ?? 9 → 0`, distinguishing it from `or`.
+- **`a?.b`** — optional member. `nil` if `a` is nil, else `a.b`. Chains short-circuit (`m?.a?.b` stays nil through the whole chain).
+- **`a?[i]`** — optional index. `nil` if `a` is nil, else `a[i]`.
+
+**Implementation.** The tokenizer already emitted all three as two-char operators (`??`/`?.`/`?[`). New work: (1) a `parse_coalesce` layer in `parser.sapp` between assignment and `or`; (2) `?.`/`?[` postfix branches in `parse_call` (→ `opt_member`/`opt_index` nodes); (3) three codegen handlers in `codegen.sapp` (`coalesce`/`opt_member`/`opt_index`); (4) two new peek-jump opcodes — **`OP_JUMP_IF_NIL_PEEK = 36`** and **`OP_JUMP_IF_NOT_NIL_PEEK = 37`** — added to both `codegen.sapp` and the self-hosted `vm.sapp` dispatch. The peek-jumps test the stack top for nil without popping, so the receiver/coalesced value is left in place on the short-circuit path. New codegen used **bracket access** (`node["left"]` etc.) per the chumsky-cascade memory.
+
+Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_nil_safe_operators` (selfhost_drift now **24 tests**: 23 active + 1 ignored perf case). `modules` 28/0, `semantics` 189/0/1 — no regressions.
+
+**Remaining language gaps for arbitrary pblang:** `match`/`class`/`struct`/`enum`, and the Rust `strcharcodeat` char-indexing alignment.
+
+## 42. Self-hosting: `match` expressions (2026-05-30)
+
+Added the value-returning **`match` expression** to the self-hosted language, mirroring the Rust grammar:
+
+```
+match SCRUTINEE {
+    case PATTERN [if GUARD] : BODY ;
+    ...
+    else : BODY ;
+}
+```
+
+Patterns: **literal** (number/string/bool/nil — matched by `==`), **`_` wildcard** (always matches), and **ident bind** (copies the scrutinee into a named local, visible in the guard and body). Arms are tried top to bottom; the first match's BODY is the value; `else`/no-match yields the else body, or **nil** if absent. Guards (`case n if n > 5: …`) gate a bind/wildcard arm with a boolean expression.
+
+**Implementation (all `.sapp`, no new opcodes).** Parser: `parse_match` + `parse_match_pattern`, dispatched from `parse_primary`'s keyword block (`match`/`case`/`else` are already keywords; `:` is a punct; `_` lexes as an ident). Codegen: `codegen_match` desugars to *store scrutinee in a temp local, then an if-else chain* — literal arms emit `GET tmp; <lit>; EQ; JUMP_IF_FALSE next`; bind arms emit `GET tmp; SET_LOCAL name` (then an optional guard test); each body is followed by `JUMP end`; the tail is the else body or a `nil` constant; all end-jumps are back-patched. It reuses only existing core opcodes (`EQ`/`JUMP`/`JUMP_IF_FALSE`/`GET_LOCAL`/`SET_LOCAL`), so **`vm.sapp` needed no change**. The whole thing is wrapped in `begin_scope`/`end_scope` so the temp and bound names don't leak past the match (locals are slot-addressed, so scope cleanup is compile-time only — the result value stays on the operand stack). New codegen uses bracket access per the chumsky-cascade memory.
+
+Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_match_expressions` (literal number+string arms, `else` fallthrough, no-match→nil, bind, `_` wildcard, guarded bind both ways, `nil` literal arm). selfhost_drift now **25 tests** (24 active + 1 ignored perf case). `modules` 28/0, `semantics` 189/0/1 — no regressions.
+
+**Remaining language gaps for arbitrary pblang:** `class`/`struct`/`enum`, and the Rust `strcharcodeat` char-indexing alignment.
+
+## 43. Self-hosting: `struct` / `enum` declarations (2026-05-30)
+
+Added `struct` and `enum` to the self-hosted language, end to end through the pblang compiler + VM — mirroring the **Rust parser-sugar** approach (§ "struct/enum syntax" in the 2026-05-28 host session): both desugar **in the parser** into constructs codegen already lowers, so there is no new IR/opcode and no new node kind threaded through codegen's dispatch.
+
+- **`struct Point { x: number, y: number }`** → a typed constructor `fn Point(x, y) { return map{ __struct: "Point", x: x, y: y }; }`. Instances are tagged maps; fields via normal `p.x`; the tag via `p.__struct`. Type annotations are parsed and discarded (the constructor copies each field through).
+- **`enum Color { Red, Green, Blue }`** → `let Color = map{ Red: map{ __enum: "Color", __variant: "Red" }, ... }`. Unit variants are `{__enum,__variant}` tagged maps — `Color.Green.__variant == "Green"`, `Color.Blue.__enum == "Color"` — and they `match` on `.__variant` (§42).
+- **Data variants `enum Shape { Circle(number), Rect(number, number) }`** → constructor functions stored on the enum map: `Shape.Circle(5)` → `{__enum:"Shape", __variant:"Circle", values:[5]}`, fields via `s.values[i]`. The field types in parens are parsed and counted (to size the constructor) then discarded.
+
+**Two enabling primitives this required (both genuine gaps, useful beyond enums):**
+
+1. **`fn_lit` codegen.** The parser already produced `fn_lit` nodes (anonymous `fn(p){…}`), but `codegen.sapp` had **no** handler — so anonymous closures (the data-variant constructors stored as map values) could never be lowered. New `codegen_fnlit` mirrors `codegen_fn` but takes **string** params (per `expr_fnlit`) and leaves the closure *value* on the operand stack (`OP_CLOSURE`) instead of `OP_DEFINE_GLOBAL`-binding a name.
+2. **Member / index callees in `codegen_call`.** `codegen_call` previously assumed the callee was always an ident and resolved it by `node.func.name`. For `Shape.Circle(5)` the callee is a `member` node whose `name` is `"Circle"` → it resolved a nonexistent global `Circle` → nil → `nil.chunk` at run time ("member access only supported on modules/maps"). Fixed: an ident callee is still resolved by name (this is also how host builtins route), but **any other callable expression** — `obj.f(args)`, `tbl[i](args)`, a parenthesized fn, a call result — is now code-generated normally so its value lands on the stack before `OP_CALL`. This is the first time the self-hosted compiler supports `obj.method(args)`-style calls.
+
+The desugaring is done by `parse_struct` / `parse_enum` / `enum_data_ctor` in `parser.sapp` (dispatched from `parse_stmt`'s keyword block — `struct`/`enum` were already tokenizer keywords) using the existing node constructors (`stmt_fn`, `stmt_let`, `expr_map`, `expr_fnlit`, `expr_string`, `expr_ident`, `expr_array`). No `vm.sapp` change. New codegen uses bracket access per the chumsky-cascade memory; `compiler_stdlib_modules_parse` confirms `parser.sapp`/`codegen.sapp` still host-parse clean.
+
+Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_struct_enum` (struct field access + arithmetic, `__struct` tag, struct passed through a function, enum unit `__variant`/`__enum`, data-variant `values[i]`/`__variant`, `match` on a variant tag, and a bare `fn_lit`-in-a-map called via member). selfhost_drift now **26 tests** (25 active + 1 ignored perf case). `modules` 28/0, `semantics` 189/0/1 — no regressions.
+
+**Bonus fix — pre-existing typeck gap closed.** `tests/typeck_compiler.rs::compiler_tokenizer_and_typeck_host_typecheck_clean` was **red** on the working tree: a prior session added the char-indexed `slice` builtin to `tokenizer.sapp` (HEAD had none) but never seeded `slice` into the host typecheck prelude, so `tokenizer.sapp` reported `variable 'slice' is not declared`. Added `("slice", Ty::Fn([any, num, num] -> any))` to `seed_builtin_prelude` (`crates/pblang-typeck/src/lib.rs`) — polymorphic over string/array, returns `any` because the result type follows the input. `typeck_compiler` 4/1 → **5/0**; `pblang-typeck` unit 46/0; `fmt` 8/0, `fmt_drift` 2/0 — no regressions.
+
+**Remaining language gaps for arbitrary pblang:** `class` (method dispatch / `self` / colon-call), and the Rust `strcharcodeat` char-indexing alignment.
+
+## 44. Self-hosting: `class` + colon-call — the LAST language gap closes (2026-05-30)
+
+Added `class` with implicit-`self` method dispatch to the self-hosted language — the final feature on the "remaining language gaps" list. Like `struct`/`enum`, it's **pure parser sugar** over primitives codegen already lowers (map, `fn_lit`, member, member-call, `??`); **no codegen or `vm.sapp` change**.
+
+```
+class Counter {
+    fn init(self, start) { self.count = start; }
+    fn inc(self)         { self.count = self.count + 1; }
+    fn get(self)         { return self.count; }
+}
+let c = Counter:new(5);
+c:inc();
+let n = c:get();   // 6
+```
+
+- **`class` desugar** (`parse_class`): `let Counter = map{ __class_name: "Counter", init: fn(self,start){…}, inc: fn(self){…}, get: fn(self){…}, new: fn(__cls, start){ let __o = map{__class:__cls}; __cls.init(__o, start); return __o; } }`. Methods are named closures whose first param is the receiver; the class value is a **shared method table**. An auto-generated `new` allocates an instance `map{__class:<table>}`, runs `init` (arity detected from the user's `init` params), and returns it. A class with no `init` gets a zero-extra-arg `new` that just allocates.
+- **Colon-call** (`obj:method(args)`, a new postfix branch in `parse_call`): desugars to `(obj.__class ?? obj).method(obj, args…)`. The receiver dispatches via its class table when it carries `__class` (a class instance), else via itself (a plain method-map). **Critically uses `??`, not Rust's `try obj.__class catch obj`** — the self-hosted VM's `OP_GET_ATTR` returns **nil** (not an error) for a missing key, so `obj.__class ?? obj` is the exact equivalent of Rust's try/catch fallback here (this is why §41's `??` was a prerequisite). The receiver is inlined, so it should be a side-effect-free lvalue (the common `var:method()` case); a chained/effectful receiver would be re-evaluated. Guard is tight (`:` + ident + `(`) so it never mis-fires on map-literal/`match`/type-annotation colons.
+
+Construct with `Name:new(args)`; dispatch with `inst:method(args)`; fields via normal `inst.x`; `inst.__class` is the class table (so `inst.__class.__class_name == "Name"`). Methods call sibling methods via `self:other(args)`.
+
+Locked by `tests/selfhost_drift.rs::selfhost_drift_executes_classes` (init+method, mutation across calls, method args, multi-field init, no-init class + manual field + dispatch, method→method via `self:m()`, colon-call in an expression, `__class` wiring). selfhost_drift now **27 tests** (26 active + 1 ignored perf case). `typeck_compiler` 5/0 (parser.sapp still host-parses clean — no chumsky cascade), `modules` 28/0, `semantics` 189/0/1 — no regressions.
+
+**All core language features now self-host.** The full pblang-written tokenizer→parser→codegen→VM compiles and runs: literals, arithmetic/comparison/logical (short-circuit), arrays/maps, `if`/`else if`/inline-`if` expressions, `while`/`for`/`for_in`, `break`/`continue`, functions (recursion, default params), index/member read+assign, `try…catch`, host builtins, module globals, `??`/`?.`/`?[`, `match`, `struct`/`enum`, `fn_lit`, `obj.f()`/`tbl[i]()` callees, and now **`class`**. The only remaining item from the gaps list is the Rust-side `strcharcodeat` char-indexing alignment — a string-builtin consistency nit, **not** a language feature.
+
+**Remaining items for arbitrary pblang:** the Rust `strcharcodeat` char-indexing alignment (string-builtin consistency, closed in §45). No language features remain.
+
+## 45. `strcharcodeat` codepoint alignment — string API is now uniformly codepoint-based (2026-05-30)
+
+Closed the last item from the old gaps list (a string-builtin consistency nit, not a language feature). `strcharcodeat(s, i)` was the **only** member of the string API that was byte-based: it indexed `s.as_bytes()[i]` and returned a raw byte (0–255). Every other string operation is **codepoint**-based — `len` is `s.chars().count()`, indexing `s[i]` is `s.chars().nth(i)`, `slice`/`str_slice`/`str_index_of` all count codepoints (`crates/pblang-vm/src/vm/strings.rs`, `vm.rs:1256`). So for any non-ASCII string, `strcharcodeat` desynced from `len`/`s[i]`/`slice`, and `strfromcharcode(strcharcodeat(s, i))` failed to round-trip.
+
+**Fix** (`crates/pblang-vm/src/vm/strings.rs::strcharcodeat`): index by codepoint and return the full Unicode scalar —
+
+```rust
+match s.chars().nth(idx) {
+    Some(c) => Ok(Value::Number(c as u32 as f64)),
+    None => Err(host.err(format!("strcharcodeat(): index {} out of bounds (len {})", idx, s.chars().count()))),
+}
+```
+
+- **Backward-compatible for ASCII** — all existing stdlib + self-hosted-compiler callers (tokenizer.sapp, ir.sapp, encoding/crypto/semver/colors/manifest_validate/strings/security/systems/…) operate on ASCII, where codepoint index == byte index and scalar == byte. No behavior change there; the byte-vs-codepoint split only mattered for multi-byte UTF-8, where the old result was effectively a bug.
+- **Now round-trips:** `strfromcharcode(strcharcodeat(s, i))` reconstructs the original character for every codepoint, making the two builtins true inverses (mirrors JS `fromCharCode`/`charCodeAt` over its character unit).
+- **Self-host parity is automatic:** `stdlib/compiler/vm.sapp` implements `strcharcodeat` by delegating to the host builtin (`_call_builtin` → `strcharcodeat(args[0], args[1])`), so the self-hosted VM inherits the aligned semantics with no `.sapp` change.
+- Genuine **byte**-level work (websocket frame masking, binary encoders) should use `str_to_bytes(s)` → `Array<u8>` and index that array; the `websocket.sapp` masking comment was updated to point there for binary payloads.
+
+Locked by extending `tests/semantics.rs::sort_and_numeric_builtins_pass` with non-ASCII cases: `strcharcodeat("é", 0) == 233` (scalar, not first byte 195), codepoint indexing across a multibyte char (`"aλb"` → idx 1 = 955, idx 2 = 98), and the `strfromcharcode(strcharcodeat("λ", 0)) == "λ"` round-trip. Suites green: `semantics` 189/0/1, `selfhost_drift` 26/0/1, `modules` 28/0, `typeck_compiler` 5/0, `pblang-vm` lib 2/0.
+
+**No remaining items.** Every documented language gap and the string-API consistency nit are closed; the self-host frontier is now purely breadth/perf (run a real stdlib module through `frontend_run` and diff vs the Rust VM; speed up the self-hosted parser to drop the `#[ignore]` on the full-parser drift test).
 
 ---
 

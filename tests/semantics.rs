@@ -2158,6 +2158,14 @@ fn sort_and_numeric_builtins_pass() {
         if s != "A" { print "FAIL strfromcharcode"; }
         if strcharcodeat("ABC", 0) != 65 { print "FAIL strcharcodeat A"; }
         if strcharcodeat("ABC", 2) != 67 { print "FAIL strcharcodeat C"; }
+        // strcharcodeat is codepoint-indexed (aligned with len/s[i]/slice), not
+        // byte-indexed: the scalar of 'é' is 233, not its first UTF-8 byte 195.
+        if strcharcodeat("é", 0) != 233 { print "FAIL strcharcodeat codepoint scalar"; }
+        // codepoint index, not byte offset: in "aλb" index 1 is 'λ' (955), index 2 is 'b'.
+        if strcharcodeat("aλb", 1) != 955 { print "FAIL strcharcodeat codepoint index"; }
+        if strcharcodeat("aλb", 2) != 98 { print "FAIL strcharcodeat codepoint index after multibyte"; }
+        // full round-trip through a non-ASCII char.
+        if strfromcharcode(strcharcodeat("λ", 0)) != "λ" { print "FAIL strcharcodeat round-trip"; }
 
         print "sort_and_numeric_builtins_pass";
     "#,
