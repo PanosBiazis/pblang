@@ -31,7 +31,7 @@ artifacts.
 
 ## Backend criteria
 
-Ένας πρακτικός native/hybrid backend (ή self-extracting wrapper) για Biapryx
+Ένας πρακτικός native/hybrid backend (ή self-extracting wrapper) για pblang
 πρέπει να:
 
 - **Μην απαιτεί LLVM/Cranelift στο πρώτο στάδιο** — να μπορεί να βασιστεί

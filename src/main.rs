@@ -1048,7 +1048,7 @@ fn parse_build_args(args: &[&str]) -> (String, String, String) {
 }
 
 fn show_help() {
-    println!("Biapryx REPL commands:");
+    println!("pblang REPL commands:");
     println!("  help | h | ?             Show this help");
     println!("  clear | cls              Clear the screen");
     println!("  exit | quit              Exit the REPL");
@@ -3573,7 +3573,7 @@ fn legacy_dispatch(args: Vec<String>) {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Biapryx module docs</title>
+  <title>pblang module docs</title>
   <style>
 body { font-family: system-ui, sans-serif; max-width: 800px; margin: 1rem auto; padding: 0 1rem; }
 h1 { font-size: 1.5rem; }
@@ -5981,7 +5981,7 @@ li { margin: 0.3em 0; }
     let repl_cfg = parse_capability_flags(&mut repl_args);
     let mut vm = VM::with_stdlib(repl_cfg);
 
-    println!("Welcome to Biapryx REPL!");
+    println!("Welcome to pblang REPL!");
     println!("Type 'help' for commands.");
 
     let mut buf = String::new();

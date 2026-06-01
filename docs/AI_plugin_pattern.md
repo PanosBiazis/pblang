@@ -4,20 +4,20 @@
 
 ## Στόχος
 
-Να τυποποιήσουμε πώς οι δυνατότητες AI (inference, embeddings, LLM APIs) έρχονται στο Sapphire **ως πακέτα/plugins**, χωρίς να φορτώνουμε τον core runtime με βαριά dependencies ή να αλλάζουμε τη γλώσσα.
+Να τυποποιήσουμε πώς οι δυνατότητες AI (inference, embeddings, LLM APIs) έρχονται στο pblang **ως πακέτα/plugins**, χωρίς να φορτώνουμε τον core runtime με βαριά dependencies ή να αλλάζουμε τη γλώσσα.
 
 ## Αρχή: Core μένει μικρός
 
 - Ο **core** (parser, compiler, VM, stdlib builtins) δεν περιλαμβάνει ONNX/CUDA/Python/HTTP AI stacks.
 - Το **onnx_infer** (αν υπάρχει ως builtin) παραμένει **stub**: επιστρέφει σφάλμα ότι δεν είναι built-in και προτείνει host embedding ή FFI/plugin.
 - Οι πραγματικές AI δυνατότητες έρχονται μέσω:
-  1. **Host embedding**: Η εφαρμογή (Rust/C++) φορτώνει Sapphire και παρέχει capabilities (π.χ. `infer(model, input)` ως host function).
+  1. **Host embedding**: Η εφαρμογή (Rust/C++) φορτώνει pblang και παρέχει capabilities (π.χ. `infer(model, input)` ως host function).
   2. **FFI**: Script φορτώνει dll/so που εκθέτει C ABI (ONNX Runtime, libtorch, κ.λπ.) και καλεί μέσω `ffi_load` / `ffi_call` (με FfiPolicy allowlist).
-  3. **Packages**: Πακέτο τύπου `@sapphire/onnx` ή `@sapphire/openai` που περιέχει Sapphire code + optional native libs· το script κάνει `import "@sapphire/onnx"` και χρησιμοποιεί API που εσωτερικά καλεί FFI ή host-provided capabilities.
+  3. **Packages**: Πακέτο τύπου `@pblang/onnx` ή `@pblang/openai` που περιέχει pblang code + optional native libs· το script κάνει `import "@pblang/onnx"` και χρησιμοποιεί API που εσωτερικά καλεί FFI ή host-provided capabilities.
 
 ## Τυπικό pattern για πακέτο AI
 
-1. **Package root**: Sapphire module(s) που εκθέτουν συναρτήσεις (π.χ. `onnx.run(model_path, input_map)`).
+1. **Package root**: pblang module(s) που εκθέτουν συναρτήσεις (π.χ. `onnx.run(model_path, input_map)`).
 2. **Υλοποίηση**: Εither (α) το module καλεί builtins που ο host έχει παρασχεθεί (capability), ή (β) το module καλεί `ffi_load` σε συγκεκριμένη βιβλιοθήκη (που το package συμπεριλαμβάνει ή που εγκαθίσταται χωριστά) και στη συνέχεια `ffi_call`.
 3. **Registry**: Όταν υπάρχει registry, το πακέτο δημοσιεύεται εκεί· τα projects το προσθέτουν στο `pblang.toml` και κάνουν `pblang install`.
 4. **Sandbox**: Σε sandbox mode το `allow_ffi` μπορεί να απενεργοποιείται· ο host αποφασίζει αν επιτρέπει AI plugins (μέσω FFI ή capability).
@@ -48,7 +48,7 @@ OpenAI-style REST adapter using `stdlib:http.sapp` and `stdlib:json.sapp`. No VM
 
 ### Usage
 
-```sapphire
+```pblang
 let p = import("examples/ai_http_provider/main.sapp");
 let res = p.openai_chat(my_key, "gpt-4o", [map{ role: "user", content: "Hello!" }]);
 print res["choices"][0]["message"]["content"];
@@ -71,7 +71,7 @@ Swap the endpoint in `call_provider` for Anthropic, Mistral, Ollama, etc. No VM 
 
 Use `http.post_stream(url, body, on_chunk)` + `http.parse_sse_line(line)`:
 
-```sapphire
+```pblang
 import "stdlib:http.sapp";
 http.post_stream(url, body, fn(chunk) {
     let lines = str_split(chunk, "\n");
@@ -94,7 +94,7 @@ Example: **openai_chat_stream(prompt, api_key, on_token)** in `examples/ai_http_
 
 For simple multi-provider setups, use `stdlib:provider_registry.sapp`:
 
-```sapphire
+```pblang
 import "stdlib:provider_registry.sapp";
 
 provider_registry.register("primary", "https://api.primary-llm.com/v1/chat", primary_key);
@@ -115,9 +115,9 @@ if r2.error != nil {
 
 For local model inference, `onnx_infer` is currently a stub. The correct path:
 
-1. Build a thin Rust crate `sapphire-onnx` that wraps `ort` (ONNX Runtime bindings) and exposes a C ABI: `sapphire_onnx_load(model_path)`, `sapphire_onnx_run(session, input_json)`.
-2. Load via FFI: `let onnx = ffi.load("sapphire_onnx.dll");`
-3. Call: `let result = onnx.sapphire_onnx_run(session, json_stringify(inputs));`
+1. Build a thin Rust crate `pblang-onnx` that wraps `ort` (ONNX Runtime bindings) and exposes a C ABI: `pblang_onnx_load(model_path)`, `pblang_onnx_run(session, input_json)`.
+2. Load via FFI: `let onnx = ffi.load("pblang_onnx.dll");`
+3. Call: `let result = onnx.pblang_onnx_run(session, json_stringify(inputs));`
 
 ---
 

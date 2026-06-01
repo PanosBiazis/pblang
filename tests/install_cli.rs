@@ -547,11 +547,11 @@ version = "0.1.0"
         .expect("run sapphire install for package without modules");
     assert!(
         !out.status.success(),
-        "install should fail when registry package has no Biapryx module files"
+        "install should fail when registry package has no pblang module files"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("has no Biapryx module files"),
+        stderr.contains("has no pblang module files"),
         "stderr should mention missing module files: {}",
         stderr
     );
@@ -986,11 +986,11 @@ version = "1.0.0"
         .expect("publish package without sapphire module files");
     assert!(
         !out.status.success(),
-        "publish should fail when package has no Biapryx module files"
+        "publish should fail when package has no pblang module files"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("has no Biapryx module files"),
+        stderr.contains("has no pblang module files"),
         "stderr should mention missing module-file contract: {}",
         stderr
     );
