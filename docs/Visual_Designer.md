@@ -171,17 +171,26 @@ read/update so toggling a checkbox or typing in a field updates state and re-ren
 
 ---
 
-## 8. pbAI assist (optional, planned)
+## 8. pbAI assist (**started** — the editor side ships today)
 
 Because pblang is getting its own model family (**pbAI** — see `docs/pbAI.md`), the
 designer can offer AI help that stays inside the tool:
 
-- **"Describe the screen"** → pbAI drafts a layout you can refine by hand.
-- **"Wire this button to save the form to SQLite"** → pbAI fills the handler body.
-- **Explain / fix** a diagnostic on the generated code.
+- **"Describe the screen"** → pbAI drafts a layout you can refine by hand. *(planned — designer side)*
+- **"Wire this button to save the form to SQLite"** → pbAI fills the handler body. *(planned — designer side)*
+- **Explain / fix** a diagnostic on the generated code. *(today — see below)*
 
 pbAI drives the same **pb-mcp-server** tools the rest of the toolchain uses, so its
 suggestions are grounded in your real project.
+
+**Shipped today (the editor side, §84):** the bootstrap IDE (`editors/ide/index.html`)
+now has a **`🤖 AI` panel** (`Ctrl+I`) wired to the **pb-mcp-server**. It shows live
+gateway status, lets you pick the AI tool (`ai_ollama_generate` for a local LLM,
+`ai_chain_of_thought`, …), and offers quick actions over the current code — **Explain**,
+**Find bugs**, **Improve**, **Add comments**, **Explain diagnostics** — plus a free-form
+prompt and *Insert into editor*. This is the same in-tool, project-grounded assistant the
+designer will reuse; the canvas-aware actions ("describe the screen", "wire this button")
+are the remaining designer-side work. See `docs/IDE_MANUAL.md` §2a.
 
 ---
 
@@ -219,12 +228,23 @@ suggestions are grounded in your real project.
 
 ## 10. Roadmap (planned)
 
+> **Status (2026-05-31, §88): D0 STARTED.** The bootstrap IDE now has a **`🎨 Designer`**
+> view (`Ctrl+D`): Palette · Canvas · Inspector, with a *kind* selector. **Web** (D0):
+> click components onto a live HTML canvas (incl. a **2D Canvas**, a **3D Scene** preview,
+> and a **Custom "any element"** for the 2D/3D/n-dimensional goal) and **codegen → pblang
+> (`html.sapp`)**. Two extra kinds shipped beyond the original three: **🔌 Circuit**
+> (digital logic — drag gates, truth-table simulation, codegen to boolean pblang) and
+> **⚛ Quantum** (gate grid, browser state-vector simulation, codegen to `quantum.sapp`).
+> Separately, a **`🌐 Browser`** whose engine is written in pblang (`stdlib/browser.sapp`).
+> Remaining D-phases (round-trip, events, desktop GUI, CLI, full 3D, self-hosted Studio)
+> are below.
+
 | Phase | Goal |
 |-------|------|
-| **D0 — Web canvas MVP** | Drag `html.sapp` blocks onto a canvas; emit a `web_framework.sapp` app; live preview via `pblang serve`. (Web is easiest — the canvas *is* HTML.) |
-| **D1 — Round-trip** | Parse the generated `.sapp` back into the canvas via the self-hosted parser; introduce the `.pbui` metadata doc. |
-| **D2 — Inspector + events** | Property inspector and visual event wiring (`on_click`/`on_submit`) generating handler stubs. |
-| **D3 — Desktop GUI target** | A `graphics.sapp`/`pblang-graphics` widget palette + form designer (the Delphi/Qt experience). |
+| **D0 — Web canvas MVP** | **STARTED (§88)** — drag `html.sapp` blocks onto a canvas; codegen a pblang web app; live preview. (Web is easiest — the canvas *is* HTML.) Round-trip + `web_framework.sapp` routing are the next slice (D1). |
+| **D1 — Round-trip** | **STARTED (§92)** — `stdlib/ui_parse.sapp` parses generated pblang web code back into the canvas via the **self-hosted parser** (the designer's `↩ From code` button + gateway `/parse-ui`). The `.pbui` metadata doc (canvas-only state) is the remaining piece. |
+| **D2 — Inspector + events** | **DONE for web (§95)** — the inspector now has an **Events** section: pick an applicable event per element (`on_click`/`on_change`/`on_input`/`on_submit`), Studio auto-names a handler (e.g. button "Save" → `on_save_click`) and wires it. Codegen emits the binding as an html attribute (`map{ "onclick": "on_save_click(event)" }`) **plus** a `fn on_save_click(event){…}` stub; the round-trip (`ui_parse.sapp`) reads those attrs back into the node's `events`, so a code→canvas→code cycle preserves the wiring. Bindings persist in the `.pbui`-style localStorage doc. Desktop/CLI event targets land with D3/D4. |
+| **D3 — Desktop GUI target** | **STARTED for web-parity widgets (§96)** — new `stdlib/gui.sapp` toolkit (widgets *drawn* from `graphics.sapp` primitives + the 5×7 bitmap font, mouse hit-tested, handlers as field closures) + a designer **🖥 Desktop** kind: widget palette, drag-to-move form-surface canvas, property/size inspector, D2-style event wiring → generates a runnable `gui.sapp` app (`form`/`add`/`run`). Widgets: label/button/textbox/checkbox/panel **+ radio/select(dropdown)/slider (§98)** — the standard form-control set, with the slider adding press-and-drag. **Round-trip (§97):** `stdlib/gui_parse.sapp` parses generated `gui.sapp` back into the form + widgets via the self-hosted parser (gateway `/parse-gui`, the **↩ From code** button) — the desktop kind is now two-way. **Data-binding (§99):** the form has a `model` (source of truth); widgets `bind` a value to a model field (inspector Model editor + per-widget bind), generating `gui.set_model` + `gui.bind(...)` and round-tripping both — toggling/typing updates the model, a handler writing the model re-displays. Next: popup dropdown, layout containers (nesting), radio-group binding. |
 | **D4 — CLI/TUI target** | Visual command/argument/prompt builder emitting a pblang CLI. |
 | **D5 — Themes/plugins + pbAI** | Reusable components, themes, a plugin slot (WordPress/Joomla flavor), and pbAI-assisted authoring. |
 
@@ -248,3 +268,6 @@ in `docs/CURRENT_STATUS.md` as it ships.
 *pblang Studio: drag interactive elements to build desktop GUI, web, and CLI apps —
 or write the code by hand — in one language, with readable, round-trippable pblang as
 the single source of truth.*
+
+
+i want also for both for web apps and gui apps to have 2d and 3d elements and give the programmer the ability to design any element if he/she wants, for n-dimensions

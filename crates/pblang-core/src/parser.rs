@@ -84,7 +84,24 @@ pub fn parser<'src>(
     let ws0 = one_of(" \t\r\n").repeated().ignored();
     let ws1 = one_of(" \t\r\n").repeated().at_least(1).ignored();
 
-    let number = text::int(10)
+    // Radix integer literals: `0x1F` (hex), `0b1010` (binary), `0o17` (octal).
+    // Tried before the decimal parser (which would otherwise match the leading
+    // `0` and leave `x`/`b`/`o` dangling). Parsed as integers into the f64
+    // value model (exact to 2^53; beyond that, ordinary f64 precision).
+    let hex_number = just("0x")
+        .or(just("0X"))
+        .ignore_then(text::digits(16).to_slice())
+        .map(|s: &str| ExprKind::Number(u64::from_str_radix(s, 16).map(|v| v as f64).unwrap_or(f64::NAN)));
+    let bin_number = just("0b")
+        .or(just("0B"))
+        .ignore_then(text::digits(2).to_slice())
+        .map(|s: &str| ExprKind::Number(u64::from_str_radix(s, 2).map(|v| v as f64).unwrap_or(f64::NAN)));
+    let oct_number = just("0o")
+        .or(just("0O"))
+        .ignore_then(text::digits(8).to_slice())
+        .map(|s: &str| ExprKind::Number(u64::from_str_radix(s, 8).map(|v| v as f64).unwrap_or(f64::NAN)));
+
+    let dec_number = text::int(10)
         .map(|s: &str| s.to_string())
         .then(
             just('.')
@@ -97,7 +114,9 @@ pub fn parser<'src>(
                 None => int_part,
             };
             ExprKind::Number(s.parse::<f64>().unwrap_or(f64::NAN))
-        })
+        });
+
+    let number = choice((hex_number, bin_number, oct_number, dec_number))
         .map_with(mk_expr_w)
         .padded();
 
@@ -396,6 +415,34 @@ pub fn parser<'src>(
         }))
         .map(|(((name, params), ret), body)| StmtKind::Fn(name, params, ret, body))
         .map_with(mk_stmt_w);
+
+    // `async fn f(params) { body }` — a function whose body runs concurrently.
+    // Desugars to `fn f(params) { return spawn(fn() { body }); }`: calling `f`
+    // spawns the body and returns a task handle (a "future"). `await <handle>`
+    // (see the prefix layer) joins it for the result. Pure parser sugar over the
+    // global `spawn`/`join` builtins — no IR/VM change, and no stdlib import.
+    let async_fn_stmt = just("async")
+        .then_ignore(ws1)
+        .then_ignore(just("fn"))
+        .then_ignore(ws1)
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .then(params.clone())
+        .then(ret_ann.clone())
+        .then(block_stmt.clone().map(|s| match s.kind {
+            StmtKind::Block(body) => body,
+            _ => unreachable!("block parser must produce StmtKind::Block"),
+        }))
+        .map_with(|(((name, params), ret), body), e| {
+            let sp = e.span().into_range();
+            let inner = mk_expr(ExprKind::FnLit(None, vec![], None, body), sp.clone());
+            let spawn_var = mk_expr(ExprKind::Var("spawn".to_string()), sp.clone());
+            let spawn_call =
+                mk_expr(ExprKind::Call(Box::new(spawn_var), vec![inner]), sp.clone());
+            let ret_stmt = mk_stmt(StmtKind::Return(Some(spawn_call)), sp.clone());
+            StmtKind::Fn(name, params, ret, vec![ret_stmt])
+        })
+        .map_with(mk_stmt_w)
+        .boxed();
 
     let printf_stmt = just("printf")
         .then_ignore(ws1)
@@ -1210,6 +1257,107 @@ pub fn parser<'src>(
             }
         });
 
+    // interface declaration (structural-conformance sugar):
+    //   interface Shape { area(); perimeter(); }
+    //   interface Point { x; y; }            // bare members = field requirements
+    //   interface Stream { read(n); close(); }
+    // Desugars to a predicate function `fn Shape(x)` returning whether `x`
+    // structurally conforms — i.e. `x` is a map and has every required member as
+    // a key. Methods on class instances and struct fields are both map keys, so
+    // one `map_has` check covers both. This gives pblang Go/TS/Python-`Protocol`-
+    // style structural typing with ZERO runtime/VM/import cost: `if Shape(obj) {
+    // obj.area() }`, `assert(Drawable(w), "needs draw()")`. Member param lists are
+    // parsed for familiar syntax but only the member NAME drives the check
+    // (arity of a stored closure isn't introspectable). `interface` is guarded by
+    // `ws1`, so `interface(x)` calls and `interfaces` identifiers are unaffected.
+    let interface_member = text::ident()
+        .map(|s: &str| s.to_string())
+        .padded()
+        .then_ignore(
+            text::ident()
+                .padded()
+                .separated_by(just(',').padded())
+                .allow_trailing()
+                .collect::<Vec<&str>>()
+                .delimited_by(just('(').padded(), just(')').padded())
+                .or_not(),
+        );
+
+    let interface_stmt = just("interface")
+        .then_ignore(ws1)
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .then_ignore(ws0)
+        .then(
+            interface_member
+                .separated_by(just(';').padded())
+                .allow_trailing()
+                .collect::<Vec<String>>()
+                .delimited_by(just('{').padded(), just('}').padded()),
+        )
+        .map_with(|(name, members), __e| {
+            let sp = Span::from(__e.span().into_range());
+            let xvar = || Expr {
+                kind: ExprKind::Var("x".to_string()),
+                span: sp,
+            };
+            // Base predicate: the value must be a map at all.
+            let mut acc = Expr {
+                kind: ExprKind::Call(
+                    Box::new(Expr {
+                        kind: ExprKind::Var("is_map".to_string()),
+                        span: sp,
+                    }),
+                    vec![xvar()],
+                ),
+                span: sp,
+            };
+            // AND in `has_member(x, "member")` for each required member. Using
+            // `has_member` (not `map_has`) so the check also sees methods reached
+            // through an instance's `__class` table — native-`class` instances
+            // store methods on the class, not the instance, yet must conform.
+            for mname in &members {
+                let has = Expr {
+                    kind: ExprKind::Call(
+                        Box::new(Expr {
+                            kind: ExprKind::Var("has_member".to_string()),
+                            span: sp,
+                        }),
+                        vec![
+                            xvar(),
+                            Expr {
+                                kind: ExprKind::Str(mname.clone()),
+                                span: sp,
+                            },
+                        ],
+                    ),
+                    span: sp,
+                };
+                acc = Expr {
+                    kind: ExprKind::Logical {
+                        left: Box::new(acc),
+                        op: LogicalOp::And,
+                        right: Box::new(has),
+                    },
+                    span: sp,
+                };
+            }
+            let body = vec![Stmt {
+                kind: StmtKind::Return(Some(acc)),
+                span: sp,
+            }];
+            let params = vec![Param {
+                name: "x".to_string(),
+                ty: None,
+                default: None,
+                is_vararg: false,
+            }];
+            Stmt {
+                kind: StmtKind::Fn(name, params, None, body),
+                span: sp,
+            }
+        })
+        .boxed();
+
     // struct declaration (typed-constructor sugar):
     //   struct Point { x: number, y: number }
     // Desugars to a typed constructor function `fn Point(x: number, y: number)`
@@ -1789,6 +1937,7 @@ pub fn parser<'src>(
     // IMPORTANT: keep set_stmt LAST so it doesn't steal `print`, `return`, `fn`, etc.
     // Split into two groups to stay within chumsky's choice() limit (24 parsers max).
     let stmt_group_a = choice((
+        async_fn_stmt,
         fn_stmt,
         printf_stmt,
         print_stmt,
@@ -1801,6 +1950,7 @@ pub fn parser<'src>(
         import_stmt,
         export_stmt,
         class_stmt,
+        interface_stmt,
         struct_stmt,
         enum_stmt,
         goto_block_stmt,
@@ -2423,11 +2573,19 @@ pub fn parser<'src>(
     enum Prefix {
         Neg,
         Not,
+        BitNot,
+        Await,
     }
     let prefix = choice((
         just('!').to(Prefix::Not),
         just("not").to(Prefix::Not),
         just('-').to(Prefix::Neg),
+        just('~').to(Prefix::BitNot),
+        // `await EXPR` — contextual keyword. The required trailing whitespace
+        // (`ws1`) means `await(x)` (no space) stays an ordinary call to a
+        // function named `await` (the stdlib concurrency modules define one),
+        // while `await x` / `await fetch()` is the keyword. Desugars to `join`.
+        just("await").then_ignore(ws1).to(Prefix::Await),
     ))
     .or_not();
 
@@ -2450,6 +2608,30 @@ pub fn parser<'src>(
                         span: sp,
                     }
                 }
+                // `~e` (bitwise NOT) desugars to a call to the `bit_not` builtin.
+                Some(Prefix::BitNot) => Expr {
+                    kind: ExprKind::Call(
+                        Box::new(Expr {
+                            kind: ExprKind::Var("bit_not".to_string()),
+                            span: sp,
+                        }),
+                        vec![e],
+                    ),
+                    span: sp,
+                },
+                // `await e` blocks on a task/future and yields its value; it
+                // desugars to `join(e)` (the global builtin that joins a spawned
+                // task and returns its result). `async fn` returns such a task.
+                Some(Prefix::Await) => Expr {
+                    kind: ExprKind::Call(
+                        Box::new(Expr {
+                            kind: ExprKind::Var("join".to_string()),
+                            span: sp,
+                        }),
+                        vec![e],
+                    ),
+                    span: sp,
+                },
                 None => e,
             }
         });
@@ -2498,6 +2680,72 @@ pub fn parser<'src>(
             Expr { kind, span: sp }
         });
 
+    // Bitwise operators `<< >> & ^ |` — pure parser sugar that desugars to the
+    // `bit_*` builtins (no IR/VM change). Precedence follows Rust/Python: all
+    // tighter than comparison, ordered `<< >>` → `&` → `^` → `|`. A nested `fn`
+    // builds the desugared 2-arg call; `~` (bit_not) is handled in the prefix layer.
+    fn bit_call2(name: &'static str, left: Expr, right: Expr) -> Expr {
+        let sp = Span::join(left.span, right.span);
+        Expr {
+            kind: ExprKind::Call(
+                Box::new(Expr {
+                    kind: ExprKind::Var(name.to_string()),
+                    span: sp,
+                }),
+                vec![left, right],
+            ),
+            span: sp,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShiftOp {
+        Shl,
+        Shr,
+    }
+    let shift_op = choice((
+        just("<<").to(ShiftOp::Shl),
+        just(">>").to(ShiftOp::Shr),
+    ))
+    .padded();
+    let shift_expr = add_expr
+        .clone()
+        .foldl(
+            shift_op.then(add_expr).repeated(),
+            |left: Expr, (op, right): (ShiftOp, Expr)| match op {
+                ShiftOp::Shl => bit_call2("bit_shl", left, right),
+                ShiftOp::Shr => bit_call2("bit_shr", left, right),
+            },
+        )
+        .boxed();
+
+    let band_expr = shift_expr
+        .clone()
+        .foldl(
+            just("&").padded().then(shift_expr).repeated(),
+            |left: Expr, (_op, right): (&str, Expr)| bit_call2("bit_and", left, right),
+        )
+        .boxed();
+
+    let bxor_expr = band_expr
+        .clone()
+        .foldl(
+            just("^").padded().then(band_expr).repeated(),
+            |left: Expr, (_op, right): (&str, Expr)| bit_call2("bit_xor", left, right),
+        )
+        .boxed();
+
+    // `|` as bitwise-or, but NOT `|>` (the pipeline operator, parsed looser).
+    // The `none_of(">").rewind()` peeks one char without consuming.
+    let bor_op = just("|").then_ignore(none_of(">").rewind()).padded();
+    let bor_expr = bxor_expr
+        .clone()
+        .foldl(
+            bor_op.then(bxor_expr).repeated(),
+            |left: Expr, (_op, right): (&str, Expr)| bit_call2("bit_or", left, right),
+        )
+        .boxed();
+
     // comparison: == != >= <= > <
     let cmp_op = choice((
         just("==").to(CmpOp::Eq),
@@ -2509,9 +2757,9 @@ pub fn parser<'src>(
     ))
     .padded();
 
-    let cmp_expr = add_expr
+    let cmp_expr = bor_expr
         .clone()
-        .foldl(cmp_op.then(add_expr).repeated(), |left: Expr, (op, right): (CmpOp, Expr)| {
+        .foldl(cmp_op.then(bor_expr).repeated(), |left: Expr, (op, right): (CmpOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             let kind = match op {
                 CmpOp::Eq => ExprKind::Eq(Box::new(left), Box::new(right)),

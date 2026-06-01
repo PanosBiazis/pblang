@@ -1,0 +1,48 @@
+// Test: the round-robin scheduler (stdlib/kernel/sched.sapp) — cooperative §78 and
+// preemptive §79 — over real stackful context switches.
+//
+// Each task runs on its own stack; switching is a genuine CPU context switch via the
+// `ctx_switch` intrinsic (save callee-saved regs, swap esp). Cooperative: tasks call
+// sched_yield. Preemptive: the timer ISR calls sched_yield for them, so tasks that
+// never yield still interleave. Both proven END-TO-END in QEMU (exit 85): two tasks on
+// separate stacks reach a shared target; for preemption neither task yields yet both
+// advance because the timer forces switches. We assert the codegen contract here.
+
+let ct = import("stdlib/compiler/ctranspile.sapp");
+let intr = fs_read("stdlib/kernel/interrupts.sapp");
+let timer = fs_read("stdlib/kernel/timer.sapp");
+let sched = fs_read("stdlib/kernel/sched.sapp");
+
+let src = "fn isr_timer() { pic_eoi(); sched_yield(peek32(37120)); } "
+    + "fn task_a() { sti(); while 1 > 0 { poke32(36864, peek32(36864) + 1); } } "
+    + "fn task_b() { sti(); while 1 > 0 { poke32(36868, peek32(36868) + 1); } } "
+    + "fn kmain() { let s = sched_new(8); poke32(37120, s); "
+    + "task_add(s, kmalloc(8192), 8192, addr_of(\"task_a\")); "
+    + "task_add(s, kmalloc(8192), 8192, addr_of(\"task_b\")); "
+    + "let idt = kmalloc(2048); pic_remap(); "
+    + "idt_set_gate(idt, 32, addr_of(\"isr_timer\"), 8, 142); idt_load(idt); "
+    + "pit_init(1193); sched_start(s); while 1 > 0 { hlt(); } }";
+
+let c = ct.transpile_kernel_int(intr + timer + sched + src);
+
+// ── The context-switch intrinsic (the heart of stackful multitasking) ───────────────
+assert(str_contains(c, "__attribute__((naked)) static void ctx_switch"), "ctx_switch intrinsic emitted (naked)");
+assert(str_contains(c, "movl %esp, (%eax)"), "ctx_switch saves the outgoing stack pointer");
+assert(str_contains(c, "movl %edx, %esp"), "ctx_switch loads the incoming stack pointer");
+
+// ── Scheduler API ───────────────────────────────────────────────────────────────────
+assert(str_contains(c, "long sched_new(long maxtasks)"), "sched_new transpiled");
+assert(str_contains(c, "long task_add(long s, long stack_base, long stack_size, long entry)"), "task_add transpiled");
+assert(str_contains(c, "long sched_start(long s)"), "sched_start transpiled");
+assert(str_contains(c, "long sched_yield(long s)"), "sched_yield transpiled");
+// task_add primes a fresh stack so the first switch `ret`s into the entry.
+assert(str_contains(c, "ctx_switch("), "the scheduler context-switches between tasks");
+
+// ── Preemptive wiring: the timer ISR drives the scheduler ───────────────────────────
+assert(str_contains(c, "__attribute__((interrupt)) void isr_timer(void* _frame)"), "timer ISR is a real interrupt handler");
+assert(str_contains(c, "(long)(u64)&isr_timer"), "isr_timer installed into an IDT gate (IRQ0)");
+
+assert(not str_contains(c, "double"), "scheduler is float-runtime-free");
+assert(str_contains(c, "0x1BADB002"), "multiboot header present");
+
+print "kernel_sched_pass";

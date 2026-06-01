@@ -34,6 +34,9 @@ Keyboard:
 
 - `Ctrl+Enter`: Run
 - `Ctrl+Shift+Enter`: Check
+- `Ctrl+I`: open the AI assistant
+- `Ctrl+D`: open the visual Designer (pblang Studio)
+- `Ctrl+B`: open the pblang web Browser
 - `Tab`: insert spaces in editor
 - `F8`: next diagnostic
 - `Shift+F8`: previous diagnostic
@@ -45,6 +48,85 @@ Manual modal:
 - Tabs switch between IDE and Project manuals fetched from backend:
   - `GET /manual/ide`
   - `GET /manual/project`
+
+## 2a. AI assistant (powered by pbAI — pblang's own model)
+
+The toolbar `🤖 AI` button (or `Ctrl+I`) opens an AI assistant backed by **pbAI**
+(`stdlib/pbai.sapp`) — pblang's own model. There is **no external LLM and no network**:
+pbAI runs locally, in pblang, and knows pblang's own idioms and gotchas.
+
+- **Connection status** — the panel pings the pbAI gateway (`GET /health`) and shows
+  `pbAI online / offline` live.
+- **Quick actions** over the current editor code: **Explain code**, **Find bugs**,
+  **Improve**, **Add comments**, **Explain diagnostics**. pbAI classifies the request with
+  a small neural net and runs a pblang-grounded skill (e.g. find-bugs checks brace/paren
+  balance and flags pblang-specific traps like missing-map-key reads).
+- **Free-form prompt** with an *include editor code* toggle, and **Insert into editor**.
+- **Config** (collapsible): the gateway **Endpoint** (default `http://localhost:8080`) and
+  a **Skill** override (auto / review / explain). Persists in
+  `localStorage['pblang.ide.aimcp.v1']`.
+
+**Run the pbAI gateway** (`editors/ide/tools/ai/gateway.sapp`, written in pblang — it
+serves the panel's contract and answers via `stdlib/pbai.sapp`):
+
+```bash
+# from the repo root — no model server needed; pbAI is in-process
+./target/debug/pblang run editors/ide/tools/ai/gateway.sapp --allow-all
+# serves GET /health, OPTIONS *, POST /mcp/tool on 127.0.0.1:8080 (PB_AI_GATEWAY_BIND to change)
+```
+
+Leave the panel **Endpoint** at `http://localhost:8080`. The gateway sets CORS headers so
+the browser IDE can call it; if it's down the panel degrades gracefully with this hint.
+
+Request contract — the panel `POST`s `{endpoint}/mcp/tool` with
+`{ "tool": "<name>", "arguments": { "prompt": "...", "language": "pblang" } }` and accepts
+`{result}` / `{text}` / `{content:[{text}]}` / raw-string responses.
+
+> pbAI is the language's own intelligence (see `docs/pbAI.md`); the assistant skills here
+> are useful today, and the generative scale-up toward a full pblang language model is the
+> roadmap. The pb-mcp-server remains pbAI's tool layer for agentic actions.
+
+## 2b. Visual designer — pblang Studio (`🎨 Designer` / `Ctrl+D`)
+
+A drag/click visual builder (the start of `docs/Visual_Designer.md`). Three panes —
+**Palette · Canvas · Inspector** — and a *kind* selector. The design is the single source
+of truth: it renders live and **generates pblang** (`⟶ To pblang code` writes a runnable
+program into the editor).
+
+- **🌐 Web** — click components (Heading, Text, Link, Button, Input, Image, Section,
+  Card, **2D Canvas**, **3D Scene**, **Custom element**) onto a live HTML canvas; nest
+  into a selected container; edit properties in the inspector. Codegen targets
+  `stdlib/html.sapp`.
+- **🔌 Circuit** — digital logic: add Inputs, AND/OR/NOT/XOR/NAND gates, and Outputs;
+  wire inputs in the inspector; **▶ Simulate** shows the truth table; codegen emits pblang
+  boolean functions.
+- **⚛ Quantum** — place H/X/Z/CNOT/Measure gates on a qubit grid; **▶ Simulate** runs a
+  browser state-vector simulation (basis-state probabilities); codegen targets
+  `stdlib/quantum.sapp` (`circuit`/`h`/`cx`/`measure`/`run`).
+
+## 2c. Web browser — written in pblang (`🌐 Browser` / `Ctrl+B`)
+
+A web browser whose **engine is pblang**: `stdlib/browser.sapp` fetches a page
+(`http_get`) and parses its title, reader text (script/style stripped), links (both `"`
+and `'` quoting), and **resolves relative links to absolute URLs** (`resolve(base, href)`
+— root-relative, protocol-relative, and directory-relative). The view has:
+
+- an address bar with **◀ Back / ▶ Forward / ⟳ Reload / ⌂ Home** (a real history stack)
+  and a loading indicator;
+- **Page / Reader / Links / Forms** modes — *Page* renders the fetched HTML in a
+  sandboxed iframe, *Reader* shows the pblang-extracted text, *Links* lists the
+  absolutized links, *Forms* lists the page's `<form>`s with editable fields;
+- **clickable link-following**: clicking a link in *Links* navigates to it (pushing
+  history), all fetched + parsed by pblang;
+- **form submission**: *Forms* mode renders each form's controls; **Submit** sends them
+  via the pblang engine — GET appends an encoded query string, POST sends an
+  `x-www-form-urlencoded` body (`browser.sapp` `forms`/`urlencode`/`submit`, with a
+  pblang UTF-8 percent-encoder) — and shows the resulting page.
+
+It calls `POST /browse {url}` (fetch) and `POST /submit {action, method, fields}` (form)
+on the pblang gateway (`editors/ide/tools/ai/gateway.sapp`, the same one the AI panel
+uses) — so browsing works end-to-end, down to pblang doing the fetch, parse, URL
+resolution, form encoding, and submission.
 
 ## 3. Diagnostics panel
 

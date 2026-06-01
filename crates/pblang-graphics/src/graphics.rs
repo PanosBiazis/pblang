@@ -433,8 +433,18 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
             return Ok(alloc_array(out));
         }
 
-        // Key down
-        let keys = gw.win.get_keys_pressed(KeyRepeat::No);
+        // The framebuffer is a FIXED size (gw.w × gw.h) that minifb stretches to fill the
+        // window; on HiDPI / when the WM resizes the window to fit the screen, the window
+        // size diverges from the buffer, so the raw mouse position (which is in window
+        // space) no longer matches what we drew. Map mouse → buffer space by the
+        // buffer/window ratio. When window == buffer (the common case) this is a no-op.
+        let (win_w, win_h) = gw.win.get_size();
+        let msx = if win_w > 0 { gw.w as f32 / win_w as f32 } else { 1.0 };
+        let msy = if win_h > 0 { gw.h as f32 / win_h as f32 } else { 1.0 };
+
+        // Key down. KeyRepeat::Yes so a HELD key (arrows, backspace, a letter) auto-repeats
+        // at the OS rate — continuous cursor movement / typing while held.
+        let keys = gw.win.get_keys_pressed(KeyRepeat::Yes);
         for k in keys {
             let mut m = HashMap::new();
             m.insert("type".into(), alloc_string("keydown"));
@@ -452,7 +462,9 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
         }
 
         // Mouse move
-        if let Some((mx, my)) = gw.win.get_mouse_pos(MouseMode::Discard) {
+        if let Some((rmx, rmy)) = gw.win.get_mouse_pos(MouseMode::Discard) {
+            let mx = rmx * msx;
+            let my = rmy * msy;
             let changed = match gw.last_mouse {
                 Some((px, py)) => (px != mx) || (py != my),
                 None => true,
@@ -467,32 +479,47 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
             }
         }
 
-        // Mouse buttons (edge detection)
+        // Mouse buttons (edge detection). Attach the cursor position to every
+        // button event: a click must know WHERE it happened, and the separate
+        // `mousemove` only fires when the position changes (and is suppressed when
+        // the cursor strays outside the client area), so consumers can't reliably
+        // reconstruct the click point from a tracked mousemove. `Clamp` keeps a
+        // top/edge click inside the window instead of dropping it to None.
         let left = gw.win.get_mouse_down(MouseButton::Left);
         let right = gw.win.get_mouse_down(MouseButton::Right);
+        let (rbx, rby) = gw.win.get_mouse_pos(MouseMode::Clamp).unwrap_or((0.0, 0.0));
+        let (bx, by) = (rbx * msx, rby * msy);
 
         if left && !gw.last_left {
             let mut m = HashMap::new();
             m.insert("type".into(), alloc_string("mousedown"));
             m.insert("button".into(), alloc_string("Left"));
+            m.insert("x".into(), Value::Number(bx as f64));
+            m.insert("y".into(), Value::Number(by as f64));
             out.push(alloc_map(m));
         }
         if !left && gw.last_left {
             let mut m = HashMap::new();
             m.insert("type".into(), alloc_string("mouseup"));
             m.insert("button".into(), alloc_string("Left"));
+            m.insert("x".into(), Value::Number(bx as f64));
+            m.insert("y".into(), Value::Number(by as f64));
             out.push(alloc_map(m));
         }
         if right && !gw.last_right {
             let mut m = HashMap::new();
             m.insert("type".into(), alloc_string("mousedown"));
             m.insert("button".into(), alloc_string("Right"));
+            m.insert("x".into(), Value::Number(bx as f64));
+            m.insert("y".into(), Value::Number(by as f64));
             out.push(alloc_map(m));
         }
         if !right && gw.last_right {
             let mut m = HashMap::new();
             m.insert("type".into(), alloc_string("mouseup"));
             m.insert("button".into(), alloc_string("Right"));
+            m.insert("x".into(), Value::Number(bx as f64));
+            m.insert("y".into(), Value::Number(by as f64));
             out.push(alloc_map(m));
         }
 

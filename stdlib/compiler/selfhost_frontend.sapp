@@ -193,19 +193,265 @@ fn frontend_optimize(chunk) {
 /// VM in stdlib/compiler/vm.sapp). Returns { ok, output, chunk } where `output`
 /// is the array of values the program printed. This closes the self-hosting
 /// loop for the supported language subset.
+// ── Module resolution for the self-hosted runtime ───────────────────────────────
+// frontend_run pre-resolves the `import("...")` references in a program into a
+// module cache (path -> exports map) that the self-hosted VM reads at runtime
+// (vm.sapp's `import` builtin looks up globals["__import_cache__"]). Each module
+// is itself compiled + run through the self-hosted pipeline, so the WHOLE program
+// — main source plus imported stdlib modules — executes on the pblang VM. This is
+// the multi-file step toward a self-hosted toolchain that can build real projects.
+
+// "stdlib:foo.sapp" -> "stdlib/foo.sapp"; other path forms used as-is.
+fn _resolve_import_path(s) {
+    if str_starts_with(s, "stdlib:") { return "stdlib/" + str_slice(s, 7, len(s)); }
+    return s;
+}
+
+// Scan `source` for `import("PATH")` occurrences, returning the PATH strings.
+fn _find_imports(source) {
+    let paths = [];
+    let marker = "import(\"";
+    let rest = source;
+    let guard = 0;
+    while guard < 4000 {
+        let idx = str_index_of(rest, marker);
+        if idx < 0 { break; }
+        let after = str_slice(rest, idx + len(marker), len(rest));
+        let endq = str_index_of(after, "\"");
+        if endq < 0 { break; }
+        array_push(paths, str_slice(after, 0, endq));
+        rest = str_slice(after, endq + 1, len(after));
+        guard = guard + 1;
+    }
+    return paths;
+}
+
+// Recursively compile+run the module at `path`, memoizing its exports (all of its
+// top-level globals) into `cache`. Dependencies are resolved first; failures
+// leave an empty exports map (graceful). `cache[path]` is pre-set empty as a
+// cycle guard.
+fn _resolve_module(path, cache) {
+    if map_has(cache, path) { return cache[path]; }
+    cache[path] = map{};
+    let file = _resolve_import_path(path);
+    let src = fs_read(file);
+    if src == nil or src == "" { return cache[path]; }
+    let deps = _find_imports(src);
+    let di = 0;
+    while di < len(deps) {
+        if not map_has(cache, deps[di]) { _resolve_module(deps[di], cache); }
+        di = di + 1;
+    }
+    let gp = import("stdlib/compiler/guard_preprocessor.sapp");
+    let processed = gp.preprocess(src);
+    let cr = frontend_compile(processed);
+    if not cr.ok { return cache[path]; }
+    let interp = import("stdlib/compiler/vm.sapp");
+    let res = interp.run_seeded(cr.chunk, map{ __import_cache__: cache });
+    let exports = map{};
+    // Real `export` semantics: if the module declared `__exports__` (a list of
+    // exported names), expose ONLY those. Otherwise (no export statement) fall
+    // back to exposing all top-level globals.
+    if map_has(res.globals, "__exports__") {
+        let names = res.globals["__exports__"];
+        let ni = 0;
+        while ni < len(names) {
+            let nm = names[ni];
+            if map_has(res.globals, nm) { exports[nm] = res.globals[nm]; }
+            ni = ni + 1;
+        }
+    } else {
+        let gkeys = map_keys(res.globals);
+        let gi = 0;
+        while gi < len(gkeys) {
+            if gkeys[gi] != "__import_cache__" { exports[gkeys[gi]] = res.globals[gkeys[gi]]; }
+            gi = gi + 1;
+        }
+    }
+    cache[path] = exports;
+    return exports;
+}
+
+// Build the import cache for `source` (resolves every imported module).
+fn _build_import_cache(source) {
+    let cache = map{};
+    let paths = _find_imports(source);
+    let i = 0;
+    while i < len(paths) {
+        _resolve_module(paths[i], cache);
+        i = i + 1;
+    }
+    return cache;
+}
+
+// Read a .sapp file from disk and run it end-to-end through the self-hosted
+// pipeline (guard preprocess → tokenize → parse → typecheck → codegen → optimize
+// → run), resolving its `import("...")`s along the way. This is the self-hosted
+// analog of the Rust CLI's `run` — a real `.sapp` file executed entirely on the
+// pblang toolchain.
+// ── Static linter (frontend_lint) ────────────────────────────────────────────────
+// A self-hosted static analyzer: catches issues the dynamic runtime would miss
+// until (or never) hit. Sound checks that need no builtin allowlist —
+// unreachable code after return/break/continue — plus the semantic analyzer's
+// warnings (e.g. assignment to an undeclared variable). A step toward static
+// safety + tooling, and the basis for IDE diagnostics. All pblang.
+
+fn _lint_block_node(blk, diags) {
+    if blk == nil { return; }
+    let stmts = try blk.stmts catch nil;
+    if stmts != nil { _lint_stmt_list(stmts, diags); }
+}
+
+fn _lint_stmt_list(stmts, diags) {
+    let terminated = false;
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        if terminated {
+            array_push(diags, map{ kind: "warning", message: "unreachable code after return/break/continue" });
+            terminated = false;   // report once per run of dead statements
+        }
+        let k = s.kind;
+        if k == "return" or k == "break" or k == "continue" { terminated = true; }
+        _lint_stmt(s, diags);
+        i = i + 1;
+    }
+}
+
+fn _lint_stmt(s, diags) {
+    let k = s.kind;
+    if k == "fn" { _lint_block_node(try s.body catch nil, diags); return; }
+    if k == "while" { _lint_block_node(try s.body catch nil, diags); return; }
+    if k == "for" { _lint_block_node(try s.body catch nil, diags); return; }
+    if k == "for_in" { _lint_block_node(try s.body catch nil, diags); return; }
+    if k == "for_range" { _lint_block_node(try s.body catch nil, diags); return; }
+    if k == "block" { _lint_stmt_list(try s.stmts catch [], diags); return; }
+    if k == "if" {
+        _lint_block_node(try s.then catch nil, diags);
+        let elifs = try s.elifs catch nil;
+        if elifs != nil {
+            let ei = 0;
+            while ei < len(elifs) {
+                let blk = try elifs[ei].block catch nil;
+                if blk == nil { blk = try elifs[ei].then catch nil; }
+                _lint_block_node(blk, diags);
+                ei = ei + 1;
+            }
+        }
+        let els = try s.else catch nil;
+        if els != nil { _lint_block_node(els, diags); }
+        return;
+    }
+}
+
+// Collect the names declared at the top level (hoisted): fn/let/const — which
+// also covers struct/interface (→ fn nodes) and class/enum (→ let nodes) after
+// parsing. Used to filter forward-referenced globals out of "undefined".
+fn _collect_global_decls(stmts) {
+    let decls = map{};
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let k = s.kind;
+        if k == "fn" or k == "let" or k == "const" {
+            let nm = try s.name catch nil;
+            if nm != nil { decls[nm] = true; }
+        }
+        i = i + 1;
+    }
+    return decls;
+}
+
+// frontend_lint(source) — returns { ok, diagnostics:[{kind,message}], count }.
+fn frontend_lint(source) {
+    let tok = import("stdlib/compiler/tokenizer.sapp");
+    let par = import("stdlib/compiler/parser.sapp");
+    let gp = import("stdlib/compiler/guard_preprocessor.sapp");
+    let ast = par.parse(tok.tokenize(gp.preprocess(source)));
+    let diags = [];
+    let stmts = try ast.stmts catch nil;
+    if stmts != nil { _lint_stmt_list(stmts, diags); }
+
+    // Undefined-name detection: a free variable (used but never bound in any
+    // scope) that is neither a host builtin nor a hoisted top-level declaration
+    // is genuinely undefined (typo / missing import). Sound — uses the generated
+    // builtin set, so no false positives on the 269 builtins.
+    if stmts != nil {
+        let sem_u = import("stdlib/compiler/semantic.sapp");
+        let bl = import("stdlib/compiler/builtins_list.sapp");
+        let builtins = bl.builtin_set();
+        let decls = _collect_global_decls(stmts);
+        let tbl_u = try sem_u.analyze(ast) catch nil;
+        if tbl_u != nil {
+            let fvs = try tbl_u.free_variables catch nil;
+            if fvs != nil {
+                let fi = 0;
+                while fi < len(fvs) {
+                    let nm = fvs[fi];
+                    let is_b = (try builtins[nm] catch nil) == true;
+                    let is_d = (try decls[nm] catch nil) == true;
+                    if not is_b and not is_d {
+                        array_push(diags, map{ kind: "error", message: "undefined name '" + nm + "'" });
+                    }
+                    fi = fi + 1;
+                }
+            }
+        }
+    }
+    // Fold in the semantic analyzer's warnings/errors (undeclared assignment, …).
+    let sem_mod = import("stdlib/compiler/semantic.sapp");
+    let tbl = try sem_mod.analyze(ast) catch nil;
+    if tbl != nil {
+        let d = try tbl.diagnostics catch nil;
+        if d != nil {
+            let di = 0;
+            while di < len(d) {
+                let e = d[di];
+                let kk = try e.kind catch "info";
+                if kk == "error" or kk == "warning" {
+                    array_push(diags, map{ kind: kk, message: try e.message catch "diagnostic" });
+                }
+                di = di + 1;
+            }
+        }
+    }
+    return map{ ok: len(diags) == 0, diagnostics: diags, count: len(diags) };
+}
+
+fn frontend_run_file(path) {
+    if path == nil or path == "" {
+        return map{ ok: false, error: "frontend_run_file: path is empty" };
+    }
+    let src = fs_read(path);
+    if src == nil or src == "" {
+        return map{ ok: false, error: "frontend_run_file: cannot read file: " + path };
+    }
+    let gp = import("stdlib/compiler/guard_preprocessor.sapp");
+    return frontend_run(gp.preprocess(src));
+}
+
 fn frontend_run(source) {
     let r = frontend_compile(source);
     if not r.ok {
         return map{ ok: false, error: "frontend_run: compilation failed", output: [], chunk: r.chunk };
     }
     let interp = import("stdlib/compiler/vm.sapp");
-    let res = interp.run(r.chunk);
+    // Apply the SAFE optimizer passes (constant folding of literal pairs,
+    // dead-code elimination, jump simplification) — these only rewrite
+    // provably-equivalent bytecode, so they're correct even with operator
+    // overloading. (Strength reduction is excluded: it's unsound for overloaded
+    // types; see optimize_safe.)
+    let opt = import("stdlib/compiler/optimizer.sapp");
+    let chunk = opt.optimize_safe(r.chunk).chunk;
+    // Pre-resolve imported modules so the program's `import(...)` calls find them.
+    let cache = _build_import_cache(source);
+    let res = interp.run_seeded(chunk, map{ __import_cache__: cache });
     return map{
         ok: true,
         output: res.output,
         locals: res.locals,
         globals: res.globals,
-        chunk: r.chunk,
+        chunk: chunk,
     };
 }
 
@@ -472,4 +718,4 @@ export frontend_analyze, frontend_parse_file, frontend_smoke;
 export frontend_parse_full, frontend_typecheck, frontend_compile, frontend_optimize;
 export frontend_compile_file, frontend_compile_project, frontend_analyze_file;
 export frontend_compile_with_guard_prep;
-export frontend_run;
+export frontend_run, frontend_run_file, frontend_lint;

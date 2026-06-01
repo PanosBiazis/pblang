@@ -572,11 +572,28 @@ fn seed_builtin_prelude(env: &mut Env) {
     let fn2 = |ret: Ty| Ty::Fn(vec![any.clone(), any.clone()], Box::new(ret));
     let fn2s_n = |ret: Ty| Ty::Fn(vec![str_ty.clone(), num.clone()], Box::new(ret));
 
+    // (`fn1n`/`fn2n` keep numeric-typed bitwise signatures concise.)
+    let fn1n = |ret: Ty| Ty::Fn(vec![num.clone()], Box::new(ret));
+    let fn2n = |ret: Ty| Ty::Fn(vec![num.clone(), num.clone()], Box::new(ret));
+
     for (name, ty) in [
         ("print", fn1(nil.clone())),
         ("len", fn1(num.clone())),
         ("str", fn1(str_ty.clone())),
         ("type", fn1(str_ty.clone())),
+        // Bitwise builtins (back the `& | ^ << >> ~` operators); all number→number.
+        ("bit_and", fn2n(num.clone())),
+        ("bit_or", fn2n(num.clone())),
+        ("bit_xor", fn2n(num.clone())),
+        ("bit_not", fn1n(num.clone())),
+        ("bit_shl", fn2n(num.clone())),
+        ("bit_shr", fn2n(num.clone())),
+        // Structural-conformance reflection (backs the `interface` keyword):
+        // (any, string) -> bool.
+        (
+            "has_member",
+            Ty::Fn(vec![any.clone(), str_ty.clone()], Box::new(bool_ty.clone())),
+        ),
         (
             "import",
             Ty::Fn(vec![str_ty.clone()], Box::new(any.clone())),

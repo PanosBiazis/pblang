@@ -1056,6 +1056,9 @@ fn show_help() {
 
     println!("CLI helpers (run without entering the REPL):");
     println!("  pblang init            Create pblang.toml in current directory");
+    println!("  pblang --ide [--allow-*]   Launch the pblang-native IDE (editors/ide/pbide.sapp): editor, terminal,");
+    println!("                          visual designer, AI panel (pbAI), and browser. Defaults to --allow-all (the");
+    println!("                          terminal panel needs exec); aliases: -ide, ide. Override path with PBLANG_IDE.");
     println!("  pblang run [file.sapp|file.bpx|dir] [--allow-*] [--deny-*] [--allow-all|--sandbox] [-- script-args...]");
     println!("                          Execute a script, or run the package entry from a manifest dir/current dir.");
     println!("                          Capability flags (all default to: fs+net+http+sqlite+spawn+gfx+core ON, exec+ffi OFF):");
@@ -1966,6 +1969,35 @@ fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     cfg
 }
 
+/// Resolve the native IDE script (editors/ide/pbide.sapp): an absolute path if
+/// found, else None. Search order: `PBLANG_IDE` env override → CWD-relative (the
+/// repo root) → walking up from the executable's directory (installed/dev layouts).
+fn locate_ide() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("PBLANG_IDE") {
+        let pb = std::path::PathBuf::from(&p);
+        if pb.exists() {
+            return pb.canonicalize().ok();
+        }
+    }
+    let cwd = std::path::Path::new("editors/ide/pbide.sapp");
+    if cwd.exists() {
+        return cwd.canonicalize().ok();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..6 {
+            if let Some(d) = &dir {
+                let cand = d.join("editors/ide/pbide.sapp");
+                if cand.exists() {
+                    return cand.canonicalize().ok();
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 /// Legacy top-level dispatch chain. This is the pre-clap CLI router; clap
 /// (in `main`) parses the subcommand and forwards here so the per-handler
 /// flag parsing inside each `if` branch is unchanged. It also still serves
@@ -1973,6 +2005,41 @@ fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
 /// `pblang --lock`, `pblang --cfg <file>`, top-level `--check`, etc.) and
 /// as the entry point for the REPL when no subcommand was given.
 fn legacy_dispatch(args: Vec<String>) {
+    // `pblang --ide` / `pblang -ide` / `pblang ide` — launch the pblang-native IDE
+    // (editors/ide/pbide.sapp). It needs gfx + (for the terminal panel) exec, so we
+    // run it with --allow-all. The IDE imports stdlib/* relative to the CWD, so we
+    // chdir to the repo root we resolved the script from; extra args pass through.
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("--ide") | Some("-ide") | Some("ide")
+    ) {
+        match locate_ide() {
+            Some(script) => {
+                if let Some(root) = script.ancestors().nth(3) {
+                    let _ = std::env::set_current_dir(root);
+                }
+                let mut run_args =
+                    vec!["run".to_string(), "editors/ide/pbide.sapp".to_string()];
+                let mut saw_caps = false;
+                for a in args.iter().skip(1) {
+                    if a.starts_with("--allow") || a == "--sandbox" || a.starts_with("--deny") {
+                        saw_caps = true;
+                    }
+                    run_args.push(a.clone());
+                }
+                if !saw_caps {
+                    run_args.push("--allow-all".to_string());
+                }
+                return legacy_dispatch(run_args);
+            }
+            None => {
+                eprintln!(
+                    "pblang --ide: could not find editors/ide/pbide.sapp.\n  Run from the pblang repo root, or set PBLANG_IDE=/path/to/pbide.sapp"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(|s| s.as_str()) == Some("init") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let manifest_path = cwd.join("pblang.toml");

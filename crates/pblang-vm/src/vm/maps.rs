@@ -49,6 +49,49 @@ pub(super) fn map_has(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, 
     Ok(Value::Bool(has))
 }
 
+/// `has_member(obj, name)` — structural-conformance reflection primitive that
+/// backs the `interface` keyword (and is useful directly). Returns `true` if
+/// `obj` is a map that has `name` as a key, OR has it on its `__class` table
+/// chain (so native-`class` instances — whose methods live on the class, not the
+/// instance — and `oop` inheritance both conform). Total over all value types:
+/// non-maps return `false` rather than erroring, so it composes inside `if` /
+/// `assert` guards. The `__class` walk is depth-bounded (32) to tolerate cycles.
+pub(super) fn has_member(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 2 {
+        return Err(host.err(format!(
+            "has_member() expects 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let name = args[1]
+        .as_str()
+        .map_err(|mm| host.err(format!("has_member(): {mm}")))?
+        .to_string();
+    let mut cur = match &args[0] {
+        Value::Map(m) => m.clone(),
+        _ => return Ok(Value::Bool(false)),
+    };
+    for _ in 0..32 {
+        let (found, parent) = {
+            let b = cur.borrow();
+            let found = b.contains_key(name.as_str());
+            let parent = match b.get("__class") {
+                Some(Value::Map(p)) => Some(p.clone()),
+                _ => None,
+            };
+            (found, parent)
+        };
+        if found {
+            return Ok(Value::Bool(true));
+        }
+        match parent {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
 pub(super) fn map_remove(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 2 {
         return Err(host.err(format!(

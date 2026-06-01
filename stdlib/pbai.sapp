@@ -1,0 +1,242 @@
+// stdlib/pbai.sapp — pbAI: pblang's own AI assistant, written entirely in pblang.
+//
+// NO external model, NO network, NO Ollama — this IS pblang's intelligence. It pairs a
+// small **neural intent classifier** (a `nn.sapp` MLP — the genuine pbAI model) with
+// pblang-grounded **skills** that inspect the code and compose an answer. Its edge is
+// that it knows pblang's *own* specifics (gotchas, idioms) an outside model wouldn't.
+//
+//   let pbai = import("stdlib/pbai.sapp");
+//   pbai.respond("Explain what this does:\n\nfn main() { print \"hi\"; }");
+//   pbai.respond_tool("ai_self_critique", promptText);   // tool hint overrides routing
+//
+// This is the pbAI foundation that backs the IDE 🤖 AI panel. Generative scale-up
+// (a full pblang language model) is the roadmap (docs/pbAI.md); the assistant skills
+// here are useful today and 100% pblang.
+
+let nn = import("stdlib/nn.sapp");
+
+// ── Text utilities ───────────────────────────────────────────────────────────────────
+fn _count(s, sub) {
+    if sub == "" { return 0; }
+    return len(str_split(s, sub)) - 1;
+}
+
+// ── Neural intent classifier (the pbAI model) ────────────────────────────────────────
+// Bag-of-keywords features → an MLP → one of 5 intents. Trained once, in pblang.
+let _VOCAB = ["explain", "what", "does", "describe", "step", "bug", "error",
+    "wrong", "mistake", "fix", "issue", "improve", "better", "optimize",
+    "refactor", "comment", "document", "how", "why", "generate", "write", "review"];
+
+// intent ids: 0 explain  1 bugs  2 improve  3 comment  4 general
+let _INTENTS = ["explain", "bugs", "improve", "comment", "general"];
+
+fn _featurize(text) {
+    let t = str_lower(text);
+    let v = [];
+    let i = 0;
+    while i < len(_VOCAB) {
+        if str_contains(t, _VOCAB[i]) { v[i] = 1; } else { v[i] = 0; }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _onehot(idx, n) {
+    let v = [];
+    let i = 0;
+    while i < n { if i == idx { v[i] = 1; } else { v[i] = 0; } i = i + 1; }
+    return v;
+}
+
+// Trained weights are CACHED on disk so the model loads (fast) instead of retraining
+// (~21 s) on every fresh process — train-once, load-forever. The cache is guarded by the
+// vocabulary size, so a model change retrains automatically.
+let _WPATH = "stdlib/pbai_model.json";
+let _MODEL = nil;
+fn _train_model() {
+    let net = nn.mlp_new(len(_VOCAB), 14, 5, 42);
+    let data = [
+        nn.sample(_featurize("explain what this code does"), _onehot(0, 5)),
+        nn.sample(_featurize("describe this program step by step"), _onehot(0, 5)),
+        nn.sample(_featurize("find the bugs and errors in this"), _onehot(1, 5)),
+        nn.sample(_featurize("what is wrong mistake issue with this code"), _onehot(1, 5)),
+        nn.sample(_featurize("improve and optimize refactor this code"), _onehot(2, 5)),
+        nn.sample(_featurize("make this better"), _onehot(2, 5)),
+        nn.sample(_featurize("add comments and document this code"), _onehot(3, 5)),
+        nn.sample(_featurize("how does pblang work and why"), _onehot(4, 5)),
+        nn.sample(_featurize("generate write create a program"), _onehot(4, 5))
+    ];
+    nn.train(net, data, 500, 0.3);
+    return net;
+}
+fn _model() {
+    if _MODEL != nil { return _MODEL; }
+    let cached = try json_parse(fs_read(_WPATH)) catch nil;
+    if cached != nil and (try cached.l1.n_in catch 0) == len(_VOCAB) {
+        _MODEL = cached;
+        return cached;
+    }
+    let net = _train_model();
+    try fs_write(_WPATH, json_stringify(net)) catch nil;   // cache for next time
+    _MODEL = net;
+    return net;
+}
+
+// classify(prompt) — the pbAI model's intent prediction (0..4).
+fn classify(prompt) {
+    return nn.argmax(nn.predict(_model(), _featurize(prompt)));
+}
+
+// ── Code inspection (grounded analysis) ──────────────────────────────────────────────
+// Pull the code out of an IDE prompt: prefer the part after a fenced/labelled marker,
+// else everything after the first blank line, else the whole text.
+fn _extract_code(prompt) {
+    let markers = ["--- pblang code ---", "```"];
+    let i = 0;
+    while i < len(markers) {
+        let idx = str_index_of(prompt, markers[i]);
+        if idx >= 0 {
+            let rest = str_slice(prompt, idx + len(markers[i]), len(prompt));
+            let close = str_index_of(rest, "```");
+            if close >= 0 { return str_trim(str_slice(rest, 0, close)); }
+            return str_trim(rest);
+        }
+        i = i + 1;
+    }
+    let nl = str_index_of(prompt, "
+
+");
+    if nl >= 0 { return str_trim(str_slice(prompt, nl, len(prompt))); }
+    return str_trim(prompt);
+}
+
+fn _fn_names(code) {
+    let parts = str_split(code, "fn ");
+    let names = "";
+    let i = 1;
+    while i < len(parts) {
+        let p = parts[i];
+        let paren = str_index_of(p, "(");
+        if paren > 0 {
+            let nm = str_trim(str_slice(p, 0, paren));
+            if nm != "" { if names == "" { names = nm; } else { names = names + ", " + nm; } }
+        }
+        i = i + 1;
+    }
+    return names;
+}
+
+fn _scan(code) {
+    return map{
+        fns: _count(code, "fn "),
+        lets: _count(code, "let ") + _count(code, "const "),
+        whiles: _count(code, "while "),
+        fors: _count(code, "for "),
+        ifs: _count(code, "if "),
+        structs: _count(code, "struct "),
+        classes: _count(code, "class "),
+        prints: _count(code, "print"),
+        open_brace: _count(code, "{"),
+        close_brace: _count(code, "}"),
+        open_paren: _count(code, "("),
+        close_paren: _count(code, ")")
+    };
+}
+
+// ── Skills ───────────────────────────────────────────────────────────────────────────
+fn _explain(code, s) {
+    let out = "pbAI · code overview\n";
+    if s.fns > 0 {
+        out = out + "• " + str(s.fns) + " function(s): " + _fn_names(code) + "\n";
+    } else {
+        out = out + "• top-level script (no function definitions)\n";
+    }
+    out = out + "• " + str(s.lets) + " local binding(s)";
+    let loops = s.whiles + s.fors;
+    if loops > 0 { out = out + ", " + str(loops) + " loop(s)"; }
+    if s.ifs > 0 { out = out + ", " + str(s.ifs) + " conditional(s)"; }
+    if s.structs > 0 { out = out + ", " + str(s.structs) + " struct(s)"; }
+    if s.classes > 0 { out = out + ", " + str(s.classes) + " class(es)"; }
+    out = out + ".\n";
+    if s.prints > 0 { out = out + "• produces output via print.\n"; }
+    if loops > 0 { out = out + "• control flow is iterative — trace the loop variables to follow it.\n"; }
+    return out;
+}
+
+fn _bugs(code, s) {
+    let out = "pbAI · review (pblang-aware)\n";
+    let found = 0;
+    if s.open_brace != s.close_brace {
+        out = out + "⚠ unbalanced braces: " + str(s.open_brace) + " '{' vs " + str(s.close_brace) + " '}'.\n"; found = found + 1;
+    }
+    if s.open_paren != s.close_paren {
+        out = out + "⚠ unbalanced parentheses: " + str(s.open_paren) + " '(' vs " + str(s.close_paren) + " ')'.\n"; found = found + 1;
+    }
+    // pblang-specific gotchas this model knows (an outside model often gets these wrong):
+    if str_contains(code, ".method(") or _count(code, ").") > 0 {
+        out = out + "• pblang has no UFCS — `obj.method(args)` is field access, not a call. Use a free function or colon-call.\n"; found = found + 1;
+    }
+    if (str_contains(code, "\" <") or str_contains(code, "\" >")) {
+        out = out + "• string `<`/`>` comparison is unsupported — compare with strcharcodeat / length instead.\n"; found = found + 1;
+    }
+    if str_contains(code, "[") and str_contains(code, "map") {
+        out = out + "• reading a missing map key RAISES (it is not nil) — guard with `map_has(m, k)`.\n"; found = found + 1;
+    }
+    if found == 0 {
+        out = out + "• no structural issues found (balanced braces/parens). Check edge cases: empty inputs, off-by-one in loop bounds, and missing-key map reads.\n";
+    }
+    return out;
+}
+
+fn _improve(code, s) {
+    let out = "pbAI · suggestions\n";
+    if s.fns == 0 { out = out + "• extract reusable logic into `fn`s for clarity and testing.\n"; }
+    if s.whiles > 0 and s.fors == 0 { out = out + "• where you iterate a fixed count, a `for i N { … }` loop reads cleaner than `while`.\n"; }
+    if s.lets > 12 { out = out + "• many bindings in one scope — consider grouping related state into a `map`/`struct`.\n"; }
+    out = out + "• name constants instead of magic numbers, and keep functions short (one job each).\n";
+    out = out + "• run the IDE Check (Ctrl+Shift+Enter) for diagnostics, and the linter for unreachable/undefined-name issues.\n";
+    return out;
+}
+
+fn _comment(code, s) {
+    let header = "// " + str(s.fns) + " function(s)";
+    if s.fns > 0 { header = header + ": " + _fn_names(code); }
+    header = header + "\n// (commented by pbAI — describe each function's purpose below)\n";
+    return "pbAI · commented version\n" + header + code + "\n";
+}
+
+// A small pblang knowledge base for general questions.
+fn _general(prompt) {
+    let t = str_lower(prompt);
+    if str_contains(t, "map") { return "pbAI · pblang maps: `map{ k: v }` literals; read with `m[k]` (missing key RAISES — use `map_has(m, k)`); `map_keys(m)` lists keys."; }
+    if str_contains(t, "loop") or str_contains(t, "while") or str_contains(t, "for") { return "pbAI · loops: `while cond { … }` and `for i N { … }` (i in 0..N). `break`/`continue` work as usual."; }
+    if str_contains(t, "function") or str_contains(t, "fn ") { return "pbAI · functions: `fn name(a, b) { return a + b; }`. Default params allowed (`fn f(x = 1)`). No UFCS — `obj.f()` is field access."; }
+    if str_contains(t, "struct") or str_contains(t, "class") { return "pbAI · OOP: `struct Pt { x, y }` and `class` are supported and self-host; construct with `Pt(1, 2)`, access with `p.x`."; }
+    if str_contains(t, "string") { return "pbAI · strings are codepoint-based; `<`/`>` comparison is unsupported (use strcharcodeat). Concatenate with `+`."; }
+    return "pbAI (pblang's own assistant). Ask about your code, or use a quick action (explain / find bugs / improve / comment). I know pblang's specifics — maps, loops, OOP, strings, and its gotchas.";
+}
+
+// ── Entry points ─────────────────────────────────────────────────────────────────────
+fn _run(intent, prompt) {
+    let code = _extract_code(prompt);
+    let s = _scan(code);
+    if intent == 0 { return _explain(code, s); }
+    if intent == 1 { return _bugs(code, s); }
+    if intent == 2 { return _improve(code, s); }
+    if intent == 3 { return _comment(code, s); }
+    return _general(prompt);
+}
+
+// respond(prompt) — classify the intent with the pbAI model, then run the skill.
+fn respond(prompt) {
+    return _run(classify(prompt), prompt);
+}
+
+// respond_tool(tool, prompt) — a tool name hint (from the gateway) overrides routing.
+fn respond_tool(tool, prompt) {
+    if tool == "ai_self_critique" { return _run(1, prompt); }       // critique ≈ find bugs
+    if tool == "ai_structured_extract" { return _run(0, prompt); }  // extract ≈ explain
+    return respond(prompt);
+}
+
+export classify, respond, respond_tool;

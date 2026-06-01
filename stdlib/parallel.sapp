@@ -1,0 +1,190 @@
+// stdlib/parallel.sapp — high-level PARALLEL PROGRAMMING for pblang.
+//
+// Data-parallel combinators built on the `spawn`/`join` primitives, which give
+// REAL per-OS-thread parallelism (each `spawn` runs its closure on its own VM
+// thread; `join` blocks and returns the result). This is the ergonomic layer on
+// top of the lower-level stdlib/thread.sapp (channels, select, mutexes, actors,
+// pipelines, race) and stdlib/thread_pool.sapp (bounded pools).
+//
+//   let p = import("stdlib:parallel.sapp");
+//   let squares = p.par_map([1,2,3,4], fn(x) { return x * x; });   // [1,4,9,16]
+//   let total   = p.par_sum([1,2,3,4,5]);                          // 15 (tree reduce)
+//   let results = p.par_invoke([fn(){return a();}, fn(){return b();}]); // run both at once
+//
+// Results always come back in INPUT ORDER (fork-join), so these are
+// deterministic despite running concurrently. f / pred must be thread-safe
+// (avoid shared mutable state; return values instead).
+//
+// Implemented entirely in pblang.
+
+// ── Fork / join primitives ───────────────────────────────────────────────────────
+
+// fork(f) — start a 0-arg function on its own thread; returns a task handle.
+fn fork(f) { return spawn(f); }
+
+// join_task(t) — block on one task, return its result.
+fn join_task(t) { return join(t); }
+
+// join_all(tasks) — block on every task, return results in the same order.
+fn join_all(tasks) {
+    let out = [];
+    for t in tasks { push(out, join(t)); }
+    return out;
+}
+
+// par_invoke(fns) — run a list of 0-arg functions concurrently; results in order.
+// The fork-join workhorse: `let [a, b] = par_invoke([taskA, taskB])` style.
+fn par_invoke(fns) {
+    let tasks = [];
+    for f in fns { push(tasks, spawn(f)); }
+    return join_all(tasks);
+}
+
+// ── Data parallelism ─────────────────────────────────────────────────────────────
+
+// par_map(arr, f) — apply f to every element concurrently (one thread each);
+// returns results in input order. Best when f is non-trivial work.
+fn par_map(arr, f) {
+    let tasks = [];
+    for x in arr { push(tasks, spawn(fn() { return f(x); })); }
+    return join_all(tasks);
+}
+
+// par_for(arr, f) — run f(x) for every element concurrently for side effects;
+// waits for all to finish. (Side effects must be thread-safe.)
+fn par_for(arr, f) {
+    let tasks = [];
+    for x in arr { push(tasks, spawn(fn() { f(x); return 0; })); }
+    join_all(tasks);
+    return nil;
+}
+
+// par_filter(arr, pred) — evaluate pred on every element in parallel, keep the
+// matches in input order.
+fn par_filter(arr, pred) {
+    let tasks = [];
+    for x in arr { push(tasks, spawn(fn() { return pred(x); })); }
+    let flags = join_all(tasks);
+    let out = [];
+    let i = 0;
+    while i < len(arr) {
+        if flags[i] { push(out, arr[i]); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// par_map_chunked(arr, f, nchunks) — split arr into `nchunks` contiguous chunks,
+// map each chunk on ONE thread, then concatenate. Far less thread overhead than
+// one-thread-per-element when arr is large or f is cheap. Order preserved.
+fn par_map_chunked(arr, f, nchunks) {
+    let n = len(arr);
+    if n == 0 { return []; }
+    if nchunks < 1 { nchunks = 1; }
+    if nchunks > n { nchunks = n; }
+    let tasks = [];
+    let c = 0;
+    while c < nchunks {
+        // balanced contiguous range [start, end) via floor division (no ceil needed)
+        let start = num_floor(c * n / nchunks);
+        let end = num_floor((c + 1) * n / nchunks);
+        push(tasks, spawn(fn() {
+            let sub = [];
+            let i = start;
+            while i < end { push(sub, f(arr[i])); i = i + 1; }
+            return sub;
+        }));
+        c = c + 1;
+    }
+    let parts = join_all(tasks);
+    let out = [];
+    for part in parts { for v in part { push(out, v); } }
+    return out;
+}
+
+// ── Parallel reductions (associative combiner required) ───────────────────────────
+
+// par_reduce(arr, f, identity) — parallel fold: reduce contiguous chunks on
+// separate threads, then combine the partials. `f` must be ASSOCIATIVE and
+// `identity` its neutral element (e.g. +/0, */1, max/-inf) for a correct result.
+fn par_reduce(arr, f, identity) {
+    let n = len(arr);
+    if n == 0 { return identity; }
+    let nchunks = 8;
+    if nchunks > n { nchunks = n; }
+    let tasks = [];
+    let c = 0;
+    while c < nchunks {
+        let start = num_floor(c * n / nchunks);
+        let end = num_floor((c + 1) * n / nchunks);
+        push(tasks, spawn(fn() {
+            let acc = identity;
+            let i = start;
+            while i < end { acc = f(acc, arr[i]); i = i + 1; }
+            return acc;
+        }));
+        c = c + 1;
+    }
+    let partials = join_all(tasks);
+    let total = identity;
+    for p in partials { total = f(total, p); }
+    return total;
+}
+
+fn par_sum(arr) { return par_reduce(arr, fn(a, x) { return a + x; }, 0); }
+fn par_product(arr) { return par_reduce(arr, fn(a, x) { return a * x; }, 1); }
+
+// par_count(arr, pred) — count matching elements in parallel. This is a
+// map-reduce (element -> 0/1, combine by +), NOT a plain par_reduce: the chunk
+// accumulator (a count) has a different type than the elements, so each chunk
+// counts locally and the partial COUNTS are summed (never re-passed to pred).
+fn par_count(arr, pred) {
+    let n = len(arr);
+    if n == 0 { return 0; }
+    let nchunks = 8;
+    if nchunks > n { nchunks = n; }
+    let tasks = [];
+    let c = 0;
+    while c < nchunks {
+        let start = num_floor(c * n / nchunks);
+        let end = num_floor((c + 1) * n / nchunks);
+        push(tasks, spawn(fn() {
+            let cnt = 0;
+            let i = start;
+            while i < end { if pred(arr[i]) { cnt = cnt + 1; } i = i + 1; }
+            return cnt;
+        }));
+        c = c + 1;
+    }
+    let partials = join_all(tasks);
+    let total = 0;
+    for pc in partials { total = total + pc; }
+    return total;
+}
+
+// ── Fork-join helpers for fixed pairs/triples ─────────────────────────────────────
+
+// par2(fa, fb) / par3(...) — run N independent 0-arg computations at once and
+// get their results as a tuple-array (common divide-and-conquer shape).
+fn par2(fa, fb) { return par_invoke([fa, fb]); }
+fn par3(fa, fb, fc) { return par_invoke([fa, fb, fc]); }
+
+// pmap2(a, b, f) — zip two arrays elementwise, computing each f(a[i],b[i]) in parallel.
+fn pmap2(a, b, f) {
+    let n = len(a);
+    if len(b) < n { n = len(b); }
+    let tasks = [];
+    let i = 0;
+    while i < n {
+        let ai = a[i];
+        let bi = b[i];
+        push(tasks, spawn(fn() { return f(ai, bi); }));
+        i = i + 1;
+    }
+    return join_all(tasks);
+}
+
+export fork, join_task, join_all, par_invoke;
+export par_map, par_for, par_filter, par_map_chunked;
+export par_reduce, par_sum, par_product, par_count;
+export par2, par3, pmap2;

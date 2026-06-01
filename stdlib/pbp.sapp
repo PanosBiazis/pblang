@@ -1,0 +1,112 @@
+// stdlib/pbp.sapp — PBP, the pblang Secure Protocol (pblang's OWN wire protocol).
+//
+// A compact, secure-by-default application protocol, in pblang. It is one of the three
+// tiers in docs/Protocols.md:
+//   1. COMPATIBILITY  — pblang speaks the current protocols (http_client/server, tls,
+//                        websocket).
+//   2. SECURITY LAYER — securelayer.sapp adds authenticated encryption ABOVE any of them.
+//   3. OWN PROTOCOL   — PBP (this module): a binary-ish framing with security BUILT IN.
+//
+// Why PBP is leaner than HTTP: a request needs a one-line header
+//   "PBP1 <type> <seq> <len>\n"   (~16 bytes)
+// instead of HTTP's verbose text headers (~90+ bytes) — and every DATA frame is
+// authenticated-encrypted by default (no separate TLS handshake for the pre-shared-key
+// case), with sequence numbers giving replay/reorder protection.
+//
+//   let p = import("stdlib/pbp.sapp");
+//   let cs = p.session_new(key); let ss = p.session_new(key);
+//   let frame = p.seal_frame(cs, "DATA", "hello");    // client seals
+//   let msg   = p.open_frame(ss, frame);              // server opens -> "hello"
+//
+// HONEST GAP (docs/Protocols.md): a live client needs a plain `tcp_connect` builtin (the
+// VM ships tcp_listen/accept and only tcp_connect_tls). The server (serve_once) and the
+// whole codec/session/security path are complete; the missing piece is one VM builtin.
+
+let sl = import("stdlib/securelayer.sapp");
+
+let MAGIC = "PBP1";
+let T_HELLO = "HELLO"; let T_DATA = "DATA"; let T_ACK = "ACK"; let T_BYE = "BYE"; let T_ERR = "ERR";
+
+// ── frame codec ──────────────────────────────────────────────────────────────────────
+// encode_frame(type, seq, payload) -> "PBP1 <type> <seq> <len>\n<payload>"
+fn encode_frame(type, seq, payload) {
+    return MAGIC + " " + type + " " + str(seq) + " " + str(len(payload)) + "
+" + payload;
+}
+// decode_frame(frame) -> map{ magic, type, seq, len, payload } or nil if malformed.
+fn decode_frame(frame) {
+    let nl = str_index_of(frame, "
+");
+    if nl < 0 { return nil; }
+    let parts = str_split(str_slice(frame, 0, nl), " ");
+    if len(parts) != 4 { return nil; }
+    if parts[0] != MAGIC { return nil; }
+    let plen = try parse_number(parts[3]) catch 0;
+    let seq = try parse_number(parts[2]) catch 0;
+    return map{ magic: parts[0], type: parts[1], seq: seq, len: plen,
+                payload: str_slice(frame, nl + 1, nl + 1 + plen) };
+}
+
+// ── secure session (replay-protected) ────────────────────────────────────────────────
+fn session_new(key) { return map{ key: key, send_seq: 0, recv_seq: 0 - 1 }; }
+
+// seal_frame(session, type, plaintext) -> a frame whose payload is authenticated-
+// encrypted (securelayer) and bound to a strictly increasing sequence number.
+fn seal_frame(sess, type, plaintext) {
+    let seq = sess.send_seq;
+    sess.send_seq = seq + 1;
+    return encode_frame(type, seq, sl.seal(sess.key, plaintext, seq));
+}
+
+// open_frame(session, frame) -> plaintext, or nil for a malformed frame, an auth
+// failure, or a replayed / out-of-order sequence number.
+fn open_frame(sess, frame) {
+    let f = decode_frame(frame);
+    if f == nil { return nil; }
+    if f.seq <= sess.recv_seq { return nil; }          // replay / reorder protection
+    let pt = sl.open(sess.key, f.payload, f.seq);
+    if pt == nil { return nil; }
+    sess.recv_seq = f.seq;
+    return pt;
+}
+
+// ── efficiency: framing overhead vs an equivalent HTTP request ────────────────────────
+fn frame_overhead(type, seq, payload_len) {
+    return len(MAGIC + " " + type + " " + str(seq) + " " + str(payload_len) + "X") - 1;
+}
+fn http_overhead_estimate(payload_len) {
+    return len("POST /msg HTTP/1.1
+Host: peer
+Content-Type: application/octet-stream
+Content-Length: " + str(payload_len) + "
+Connection: keep-alive
+
+");
+}
+
+// ── server over TCP (transport side) ─────────────────────────────────────────────────
+// serve_once(addr, key, handler): accept one PBP connection, open the request frame,
+// call handler(plaintext) -> reply plaintext, seal the reply, send it. Returns the bound
+// address. (A live pblang CLIENT additionally needs a plain `tcp_connect` builtin.)
+fn serve_once(addr, key, handler) {
+    let l = tcp_listen(addr);
+    let actual = tcp_local_addr(l);
+    let s = tcp_accept(l);
+    let header = tcp_read_until(s, "
+", 8192);
+    let parts = str_split(str_trim(header), " ");
+    let plen = try parse_number(parts[3]) catch 0;
+    let payload = tcp_read(s, plen);
+    let sess = session_new(key);
+    let req = open_frame(sess, header + payload);
+    let reply = handler(req);
+    if reply == nil { reply = ""; }
+    tcp_write(s, seal_frame(sess, T_DATA, reply));
+    tcp_close(s);
+    tcp_close(l);
+    return actual;
+}
+
+export MAGIC, T_HELLO, T_DATA, T_ACK, T_BYE, T_ERR;
+export encode_frame, decode_frame, session_new, seal_frame, open_frame;
+export frame_overhead, http_overhead_estimate, serve_once;

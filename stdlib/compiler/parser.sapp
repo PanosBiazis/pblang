@@ -229,6 +229,7 @@ fn parse_stmt() {
         if t.text == "const" { return parse_const(); }
         if t.text == "fn" { return parse_fn_decl(); }
         if t.text == "struct" { return parse_struct(); }
+        if t.text == "interface" { return parse_interface(); }
         if t.text == "enum" { return parse_enum(); }
         if t.text == "class" { return parse_class(); }
         if t.text == "return" { return parse_return(); }
@@ -239,6 +240,20 @@ fn parse_stmt() {
         if t.text == "export" { return parse_export(); }
         if t.text == "break" { advance(); if match_token("punct", ";") { } return make_node("break", nil); }
         if t.text == "continue" { advance(); if match_token("punct", ";") { } return make_node("continue", nil); }
+    }
+
+    // `async fn ...` — contextual: `async` is an ident, recognised only directly
+    // before the `fn` keyword (§48 port). Anywhere else it's a normal identifier.
+    if t.kind == "ident" and t.text == "async"
+       and peek(1).kind == "keyword" and peek(1).text == "fn" {
+        return parse_async_fn();
+    }
+
+    // `print` is reserved for the print statement (matches the Rust frontend);
+    // recognise it in statement-leading position, except `print = ...` (assignment).
+    if t.kind == "ident" and t.text == "print"
+       and not (peek(1).kind == "operator" and peek(1).text == "=") {
+        return parse_print();
     }
 
     if t.kind == "ident" and peek(1).kind == "operator" and peek(1).text == "=" {
@@ -321,6 +336,21 @@ fn parse_fn_decl() {
     return stmt_fn(name, params, body, ret_type);
 }
 
+// `async fn f(p) { body }` — desugars to `fn f(p) { return spawn(fn() { body }); }`
+// (mirrors the Rust §48 sugar): calling `f(...)` spawns the body as a task and
+// returns the handle. Pure parser sugar over the global `spawn`/`join` builtins —
+// no new IR. `async` is contextual (only recognised immediately before `fn`), so
+// it stays usable as an ordinary identifier elsewhere.
+fn parse_async_fn() {
+    advance(); // skip 'async'
+    let f = parse_fn_decl();
+    if f == nil { return nil; }
+    let inner = expr_fnlit([], f.body);            // fn() { <original body> }
+    let spawn_call = expr_call(expr_ident("spawn"), [inner]);
+    let new_body = stmt_block([stmt_return(spawn_call)]);
+    return stmt_fn(f.name, f.params, new_body, f.ret);
+}
+
 // `struct Name { field [: type] (, field [: type])* }` — desugars to a typed
 // constructor function `fn Name(fields...) { return map{ __struct: "Name",
 // field: field, ... }; }`. Instances are tagged maps; fields via normal `p.x`.
@@ -353,6 +383,53 @@ fn parse_struct() {
     }
 
     let body = stmt_block([stmt_return(expr_map(entries))]);
+    return stmt_fn(name, params, body, nil);
+}
+
+// `interface Name { m1; m2(a, b); m3(); }` — structural-conformance sugar (mirrors
+// the Rust §50 implementation). Desugars to a PREDICATE function
+// `fn Name(x) { return is_map(x) and has_member(x,"m1") and has_member(x,"m2") ...; }`.
+// Bare members are field requirements; `m(params)` members parse the param list
+// (discarded) and use only the name. This is the self-hosted parser learning a
+// feature the Rust frontend already had — one step further on rust→pblang.
+fn parse_interface() {
+    advance(); // skip 'interface'
+    let name_token = expect("ident", nil);
+    if name_token == nil { return nil; }
+    let name = name_token.text;
+
+    expect("punct", "{");
+    let members = [];
+    if not match_token("punct", "}") {
+        while true {
+            if current().kind == "punct" and current().text == "}" { break; }
+            let m_token = expect("ident", nil);
+            if m_token == nil { break; }
+            push(members, m_token.text);
+            // optional `( params )` — parsed and discarded (name drives the check)
+            if match_token("punct", "(") {
+                while not (current().kind == "punct" and current().text == ")") {
+                    if current().kind == "eof" { break; }
+                    advance();
+                }
+                match_token("punct", ")");
+            }
+            if not match_token("punct", ";") { break; }
+            if current().kind == "punct" and current().text == "}" { break; } // trailing ;
+        }
+        expect("punct", "}");
+    }
+
+    // Build `is_map(x) and has_member(x,"m1") and has_member(x,"m2") ...`
+    let acc = expr_call(expr_ident("is_map"), [expr_ident("x")]);
+    let i = 0;
+    while i < len(members) {
+        let has = expr_call(expr_ident("has_member"), [expr_ident("x"), expr_string(members[i])]);
+        acc = expr_binary("and", acc, has);
+        i = i + 1;
+    }
+    let body = stmt_block([stmt_return(acc)]);
+    let params = [ map{ name: "x", type: nil, default: nil } ];
     return stmt_fn(name, params, body, nil);
 }
 
@@ -500,6 +577,20 @@ fn parse_return() {
         if match_token("punct", ";") { /* consume trailing ';' */ }
     }
     return stmt_return(value);
+}
+
+// `print EXPR ;` — pblang's print is a statement keyword (not a function), so the
+// frontend must parse `print add(2,3)` / `print "hi"` as one print statement, not
+// as two stray expression statements. Emits a {kind:"print", value} node that
+// codegen_print lowers to OP_PRINT (captured into run output → drives F5 "run").
+fn parse_print() {
+    advance(); // skip 'print'
+    let value = nil;
+    if not match_token("punct", ";") {
+        value = parse_expr();
+        if match_token("punct", ";") { /* consume trailing ';' */ }
+    }
+    return make_node("print", map{ value: value });
 }
 
 // `if <cond> { ... } else { ... }` used as an EXPRESSION (each branch is a block
@@ -756,13 +847,59 @@ fn parse_equality() {
 }
 
 fn parse_comparison() {
-    let left = parse_term();
+    let left = parse_bitor();
     while current().kind == "operator"
           and (current().text == "<" or current().text == ">"
                or current().text == "<=" or current().text == ">=") {
         let op = advance().text;
-        let right = parse_term();
+        let right = parse_bitor();
         left = expr_binary(op, left, right);
+    }
+    return left;
+}
+
+// Bitwise infix ladder (§47 port), between comparison and additive, tightest
+// last: `|` (loosest) → `^` → `&` → `<<`/`>>` (tightest, just looser than +/-).
+// Each desugars to a call to the bit_* builtin (mirrors the Rust parser sugar).
+fn parse_bitor() {
+    let left = parse_bitxor();
+    while current().kind == "operator" and current().text == "|" {
+        advance();
+        let right = parse_bitxor();
+        left = expr_call(expr_ident("bit_or"), [left, right]);
+    }
+    return left;
+}
+
+fn parse_bitxor() {
+    let left = parse_bitand();
+    while current().kind == "operator" and current().text == "^" {
+        advance();
+        let right = parse_bitand();
+        left = expr_call(expr_ident("bit_xor"), [left, right]);
+    }
+    return left;
+}
+
+fn parse_bitand() {
+    let left = parse_shift();
+    while current().kind == "operator" and current().text == "&" {
+        advance();
+        let right = parse_shift();
+        left = expr_call(expr_ident("bit_and"), [left, right]);
+    }
+    return left;
+}
+
+fn parse_shift() {
+    let left = parse_term();
+    while current().kind == "operator"
+          and (current().text == "<<" or current().text == ">>") {
+        let op = advance().text;
+        let right = parse_term();
+        let fname = "bit_shl";
+        if op == ">>" { fname = "bit_shr"; }
+        left = expr_call(expr_ident(fname), [left, right]);
     }
     return left;
 }
@@ -789,17 +926,58 @@ fn parse_factor() {
 }
 
 fn parse_unary() {
+    // `await EXPR` — desugars to `join(EXPR)` (§48 port). Contextual & whitespace-
+    // guarded: `await x` / `await (e)` is the keyword, but `await(x)` with `(`
+    // ADJACENT (no space) stays an ordinary call to a function named `await`, so
+    // the concurrency stdlib's `fn await(...)` keeps working. Adjacency = the `(`
+    // begins exactly where `await` ends (col + len("await") == 5).
+    if current().kind == "ident" and current().text == "await" {
+        let nxt = peek(1);
+        let adjacent_call = nxt.kind == "punct" and nxt.text == "("
+            and nxt.line == current().line and nxt.col == current().col + 5;
+        if not adjacent_call {
+            advance();
+            let operand = parse_unary();
+            return expr_call(expr_ident("join"), [operand]);
+        }
+    }
     if current().kind == "operator" and (current().text == "-" or current().text == "!") {
         let op = advance().text;
         let operand = parse_unary();
         return expr_unary(op, operand);
+    }
+    // Prefix `~` — bitwise NOT, desugars to a `bit_not(e)` call (§47 port).
+    if current().kind == "operator" and current().text == "~" {
+        advance();
+        let operand = parse_unary();
+        return expr_call(expr_ident("bit_not"), [operand]);
     }
     if current().kind == "keyword" and current().text == "not" {
         advance();
         let operand = parse_unary();
         return expr_unary("not", operand);
     }
-    return parse_call();
+    // `throw EXPR` — raise a value (caught by an enclosing `try ... catch`).
+    // Parsed as a prefix so it works both as a statement and inside `(throw e)`.
+    if current().kind == "keyword" and current().text == "throw" {
+        advance();
+        let operand = parse_unary();
+        return make_node("throw", map{ value: operand });
+    }
+    return parse_power();
+}
+
+// `a ** b` — exponentiation, desugars to `num_pow(a, b)` (mirrors the Rust
+// frontend). Right-associative and binds tighter than unary, so `2 ** 3 ** 2`
+// is `2 ** (3 ** 2)` and `2 ** -3` parses (exponent goes through parse_unary).
+fn parse_power() {
+    let base = parse_call();
+    if current().kind == "operator" and current().text == "**" {
+        advance();
+        let exp = parse_unary();
+        return expr_call(expr_ident("num_pow"), [base, exp]);
+    }
+    return base;
 }
 
 fn parse_call() {

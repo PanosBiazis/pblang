@@ -1,0 +1,337 @@
+// stdlib/gui.sapp — a desktop GUI widget toolkit, in pblang.
+//
+// pblang has no native widget set and no text-render builtin — only a window with filled
+// rects/lines (graphics.sapp) and a 5x7 bitmap font (bitmap_font.sapp). This module draws
+// its own widgets from those primitives and hit-tests the mouse itself, giving a
+// Delphi/Qt-style form: a `form` holds positioned `widgets`, `run` opens a window and
+// drives the event loop, and event handlers ride as **closures stored in widget fields**.
+//
+//   let gui = import("stdlib/gui.sapp");
+//   fn on_ok(ctx) { print gui.get(ctx, "name").value; }
+//   fn build() {
+//       let f = gui.form("Hello", 360, 200);
+//       gui.add(f, gui.label("t", 20, 16, "Your name:"));
+//       gui.add(f, gui.textbox("name", 20, 44, 220, 26, ""));
+//       gui.add(f, gui.button("ok", 20, 84, 120, 30, "OK", on_ok));
+//       return f;
+//   }
+//   fn main() { gui.run(build()); }  main();
+//
+// The interactive core (`handle_event`) is window-free so it is unit-testable headlessly;
+// only `draw`/`run` touch a display. The designer's D3 GUI kind generates code against it.
+
+let gfx  = import("stdlib/graphics.sapp");
+let font = import("stdlib/bitmap_font.sapp");
+let keys = import("stdlib/keymap.sapp");
+
+// ── metrics & theme ───────────────────────────────────────────────────────────────────
+let SCALE = 2;          // bitmap-font pixel scale
+let CW = 12;            // scaled char advance  (font.char_width()  * SCALE)
+let CH = 16;            // scaled char height   (font.char_height() * SCALE)
+let _C = map{
+    bg:     gfx.rgb(30, 33, 48),
+    panel:  gfx.rgb(44, 49, 70),
+    field:  gfx.rgb(20, 22, 34),
+    border: gfx.rgb(90, 100, 140),
+    accent: gfx.rgb(108, 92, 231),
+    text:   gfx.rgb(225, 230, 245),
+    muted:  gfx.rgb(150, 160, 185)
+};
+fn theme() { return _C; }   // exposed so apps can reuse the palette
+
+// ── widget constructors ───────────────────────────────────────────────────────────────
+// Every widget is a map with at least {kind, name, x, y, w, h}. Auto-sized widgets
+// (label/checkbox) compute w/h from their text so hit-testing has a real box.
+fn label(name, x, y, text) {
+    return map{ kind: "label", name: name, x: x, y: y, w: len(text) * CW, h: CH, text: text };
+}
+fn button(name, x, y, w, h, text, onclick) {
+    return map{ kind: "button", name: name, x: x, y: y, w: w, h: h, text: text, onclick: onclick };
+}
+fn textbox(name, x, y, w, h, value) {
+    return map{ kind: "textbox", name: name, x: x, y: y, w: w, h: h, value: value };
+}
+fn checkbox(name, x, y, text, checked, onchange) {
+    return map{ kind: "checkbox", name: name, x: x, y: y, w: CH + 6 + len(text) * CW, h: CH,
+                text: text, checked: checked, onchange: onchange };
+}
+fn panel(name, x, y, w, h, title) {
+    return map{ kind: "panel", name: name, x: x, y: y, w: w, h: h, title: title };
+}
+// radio button: radios sharing `group` are mutually exclusive (selecting one clears its
+// siblings). Auto-sized like checkbox.
+fn radio(name, x, y, text, group, selected, onchange) {
+    return map{ kind: "radio", name: name, x: x, y: y, w: CH + 6 + len(text) * CW, h: CH,
+                text: text, group: group, selected: selected, onchange: onchange };
+}
+// select (cycle combo): clicking advances to the next option (wraps). `options` is a list
+// of strings, `selected` an index. (A drawn-from-primitives GUI has no native popup, so
+// this is an honest click-to-cycle select rather than a dropdown overlay.)
+fn select(name, x, y, w, h, options, selected, onchange) {
+    return map{ kind: "select", name: name, x: x, y: y, w: w, h: h,
+                options: options, selected: selected, onchange: onchange };
+}
+// horizontal slider: drag the knob to set `value` in [min, max].
+fn slider(name, x, y, w, h, value, min, max, onchange) {
+    return map{ kind: "slider", name: name, x: x, y: y, w: w, h: h,
+                value: value, min: min, max: max, onchange: onchange };
+}
+
+// ── form container ────────────────────────────────────────────────────────────────────
+fn form(title, w, h) {
+    return map{ kind: "form", title: title, w: w, h: h, widgets: [],
+                focus: nil, shift: false, mouse: map{ x: 0, y: 0 }, model: map{} };
+}
+fn add(f, w) { array_push(f.widgets, w); _pull(f, w); return f; }
+fn get(f, name) {
+    let i = 0;
+    while i < len(f.widgets) { if f.widgets[i].name == name { return f.widgets[i]; } i = i + 1; }
+    return nil;
+}
+
+// ── data-binding (Visual_Designer §7) ─────────────────────────────────────────────────
+// The form's `model` map is the source of truth. A widget bound to a model field (via
+// `bind`) PUSHES its value into the model when the user changes it and PULLS the model's
+// value on redraw / sync — so toggling a checkbox updates state, and a handler that writes
+// the model re-displays in the bound widget. Two-way for inputs, one-way for labels.
+fn bind(w, field) { w["bind"] = field; return w; }
+fn set_model(f, m) { f["model"] = m; sync(f); return f; }
+// which widget property mirrors the model for each kind ("" = not bindable)
+fn _bound_key(w) {
+    let k = w.kind;
+    if k == "textbox" { return "value"; }
+    if k == "checkbox" { return "checked"; }
+    if k == "slider" { return "value"; }
+    if k == "select" { return "selected"; }
+    if k == "label" { return "text"; }
+    return "";
+}
+fn _push(f, w) {                            // widget value -> model
+    let b = try w.bind catch nil;
+    if b == nil { return 0; }
+    let key = _bound_key(w);
+    if key != "" { f.model[b] = w[key]; }
+    return 0;
+}
+fn _pull(f, w) {                            // model value -> widget
+    let b = try w.bind catch nil;
+    if b == nil { return 0; }
+    if not map_has(f.model, b) { return 0; }
+    let key = _bound_key(w);
+    if key != "" { w[key] = f.model[b]; }
+    return 0;
+}
+// sync(form) — refresh every bound widget from the model (call after a handler mutates it).
+fn sync(f) {
+    let i = 0;
+    while i < len(f.widgets) { _pull(f, f.widgets[i]); i = i + 1; }
+    return 0;
+}
+
+// ── interactive core (window-free → testable) ─────────────────────────────────────────
+fn _in(w, x, y) { return x >= w.x and x < w.x + w.w and y >= w.y and y < w.y + w.h; }
+fn _focused(f) { if f.focus == nil { return nil; } return get(f, f.focus); }
+
+// hit_test(form, x, y) -> the topmost widget under (x, y), or nil. Last-added wins so
+// widgets drawn on top of a panel take the click.
+fn hit_test(f, x, y) {
+    let hit = nil;
+    let i = 0;
+    while i < len(f.widgets) { if _in(f.widgets[i], x, y) { hit = f.widgets[i]; } i = i + 1; }
+    return hit;
+}
+
+fn _type_into(f, w, key, shift) {
+    if w == nil or w.kind != "textbox" { return 0; }
+    if key == "Backspace" {
+        if len(w.value) > 0 { w["value"] = str_slice(w.value, 0, len(w.value) - 1); _push(f, w); }
+        return 0;
+    }
+    let ch = keys.key_to_char(key, shift);
+    if ch != "" { w["value"] = w.value + ch; _push(f, w); }
+    return 0;
+}
+
+// clamp helper
+fn _clamp(v, lo, hi) { if v < lo { return lo; } if v > hi { return hi; } return v; }
+// set a slider's value from an absolute mouse x (knob follows the cursor along the track).
+fn _slider_set(w, x) {
+    let span = w.w; if span <= 0 { span = 1; }
+    let t = _clamp((x - w.x) / span, 0, 1);
+    w["value"] = w.min + t * (w.max - w.min);
+    return 0;
+}
+// select the radio `w` and clear every sibling in the same group.
+fn _radio_pick(f, w) {
+    let i = 0;
+    while i < len(f.widgets) {
+        let o = f.widgets[i];
+        if o.kind == "radio" and o.group == w.group { o["selected"] = (o.name == w.name); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _click_at(f, x, y) {
+    f["focus"] = nil;                          // empty space clears focus
+    let w = hit_test(f, x, y);
+    if w == nil { return 0; }
+    if w.kind == "textbox" { f["focus"] = w.name; }
+    else if w.kind == "checkbox" {
+        w["checked"] = not w.checked;
+        _push(f, w);
+        if w.onchange != nil { w.onchange(f); }
+    }
+    else if w.kind == "radio" {
+        _radio_pick(f, w);
+        if w.onchange != nil { w.onchange(f); }
+    }
+    else if w.kind == "select" {
+        let n = len(w.options);
+        if n > 0 { w["selected"] = num_mod(w.selected + 1, n); _push(f, w); if w.onchange != nil { w.onchange(f); } }
+    }
+    else if w.kind == "slider" {
+        _slider_set(w, x);
+        _push(f, w);
+        if w.onchange != nil { w.onchange(f); }
+    }
+    else if w.kind == "button" {
+        if w.onclick != nil { w.onclick(f); }
+    }
+    return 0;
+}
+
+// handle_event(form, ev) — apply one gfxpollevents record (mousemove/mousedown/mouseup/
+// keydown/keyup). mousedown carries no coords, so we read the cursor tracked from mousemove.
+// A press on a slider starts a drag (f.drag) so the knob tracks the cursor until release.
+fn handle_event(f, ev) {
+    let t = try ev.type catch "";
+    if t == "mousemove" {
+        f["mouse"] = map{ x: ev.x, y: ev.y };
+        if (try f.drag catch nil) != nil {
+            let w = get(f, f.drag);
+            if w != nil and w.kind == "slider" { _slider_set(w, ev.x); _push(f, w); if w.onchange != nil { w.onchange(f); } }
+        }
+        return 0;
+    }
+    if t == "mousedown" {
+        if (try ev.button catch "Left") != "Left" { return 0; }
+        let hit = hit_test(f, f.mouse.x, f.mouse.y);
+        if hit != nil and hit.kind == "slider" { f["drag"] = hit.name; }
+        _click_at(f, f.mouse.x, f.mouse.y);
+        return 0;
+    }
+    if t == "mouseup" { f["drag"] = nil; return 0; }
+    if t == "keydown" {
+        let k = try ev.key catch "";
+        if keys.is_shift(k) { f["shift"] = true; return 0; }
+        _type_into(f, _focused(f), k, f.shift);
+        return 0;
+    }
+    if t == "keyup" {
+        let k = try ev.key catch "";
+        if keys.is_shift(k) { f["shift"] = false; }
+        return 0;
+    }
+    return 0;
+}
+
+// ── rendering (display) ───────────────────────────────────────────────────────────────
+fn _border(win, x, y, w, h, color) {
+    win.line(x, y, x + w, y, color);
+    win.line(x, y + h, x + w, y + h, color);
+    win.line(x, y, x, y + h, color);
+    win.line(x + w, y, x + w, y + h, color);
+}
+// scaled bitmap text: each lit 5x7 pixel becomes one SCALE×SCALE filled rect.
+fn _text(win, x, y, s, color) {
+    let cx = x;
+    let i = 0;
+    while i < len(s) {
+        let code = strcharcodeat(s, i);
+        if code != 32 {
+            let g = font.glyph(code);
+            if g == nil { g = [31, 17, 17, 17, 17, 17, 31]; }
+            let r = 0;
+            while r < 7 {
+                let row = g[r];
+                let c = 0;
+                while c < 5 {
+                    if bit_and(bit_shr(row, 4 - c), 1) == 1 {
+                        win.rect(cx + c * SCALE, y + r * SCALE, SCALE, SCALE, color);
+                    }
+                    c = c + 1;
+                }
+                r = r + 1;
+            }
+        }
+        cx = cx + CW;
+        i = i + 1;
+    }
+    return cx;
+}
+fn _draw_widget(win, f, w) {
+    _pull(f, w);                              // bound widgets mirror the model each frame
+    let ty = w.y + (w.h - 14) / 2;            // vertical text centering (glyph ≈ 14px tall)
+    if w.kind == "label" {
+        _text(win, w.x, w.y, w.text, _C.text);
+    } else if w.kind == "button" {
+        win.rect(w.x, w.y, w.w, w.h, _C.accent);
+        _border(win, w.x, w.y, w.w, w.h, _C.border);
+        _text(win, w.x + 8, ty, w.text, _C.text);
+    } else if w.kind == "textbox" {
+        win.rect(w.x, w.y, w.w, w.h, _C.field);
+        let bc = _C.border;
+        if f.focus == w.name { bc = _C.accent; }
+        _border(win, w.x, w.y, w.w, w.h, bc);
+        _text(win, w.x + 6, ty, w.value, _C.text);
+    } else if w.kind == "checkbox" {
+        win.rect(w.x, w.y, CH, CH, _C.field);
+        _border(win, w.x, w.y, CH, CH, _C.border);
+        if w.checked { _text(win, w.x + 3, w.y + 1, "X", _C.accent); }
+        _text(win, w.x + CH + 6, w.y + 1, w.text, _C.text);
+    } else if w.kind == "panel" {
+        win.rect(w.x, w.y, w.w, w.h, _C.panel);
+        _border(win, w.x, w.y, w.w, w.h, _C.border);
+        if w.title != "" { _text(win, w.x + 6, w.y + 4, w.title, _C.muted); }
+    } else if w.kind == "radio" {
+        win.circle(w.x + CH / 2, w.y + CH / 2, CH / 2 - 1, _C.border);
+        if w.selected { win.rect(w.x + CH / 2 - 3, w.y + CH / 2 - 3, 6, 6, _C.accent); }
+        _text(win, w.x + CH + 6, w.y + 1, w.text, _C.text);
+    } else if w.kind == "select" {
+        win.rect(w.x, w.y, w.w, w.h, _C.field);
+        _border(win, w.x, w.y, w.w, w.h, _C.border);
+        let opt = "";
+        if len(w.options) > 0 and w.selected >= 0 and w.selected < len(w.options) { opt = w.options[w.selected]; }
+        _text(win, w.x + 6, ty, opt, _C.text);
+        _text(win, w.x + w.w - 14, ty, "v", _C.muted);
+    } else if w.kind == "slider" {
+        let cy = w.y + w.h / 2;
+        win.line(w.x, cy, w.x + w.w, cy, _C.border);
+        let span = w.max - w.min; if span == 0 { span = 1; }
+        let t = _clamp((w.value - w.min) / span, 0, 1);
+        let kx = w.x + t * w.w;
+        win.rect(kx - 4, w.y + 2, 8, w.h - 4, _C.accent);
+    }
+}
+fn draw(win, f) {
+    win.clear(_C.bg);
+    let i = 0;
+    while i < len(f.widgets) { _draw_widget(win, f, f.widgets[i]); i = i + 1; }
+    return 0;
+}
+
+// ── run ───────────────────────────────────────────────────────────────────────────────
+// Open a window for the form and drive the 30 fps event loop. Blocks until the window
+// closes. (draw/run are the only display-dependent parts of this module.)
+fn run(f) {
+    let win = gfx.Window(f.w, f.h, f.title);
+    gfx.run(win, f,
+        fn(s, evs) { let i = 0; while i < len(evs) { handle_event(s, evs[i]); i = i + 1; } },
+        fn(s, w2) { draw(w2, s); },
+        30);
+    return 0;
+}
+
+export theme, label, button, textbox, checkbox, panel, radio, select, slider,
+       form, add, get, bind, set_model, sync, hit_test, handle_event, draw, run;
