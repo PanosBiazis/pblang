@@ -1774,6 +1774,17 @@ Continuation of §104. A batch of input fixes plus the last panel and a launcher
 - **`pblang --ide` launcher** (`src/main.rs`). `pblang --ide` (aliases `-ide`, `ide`) launches the native IDE with `--allow-all` (the terminal panel needs exec). `locate_ide()` resolves `editors/ide/pbide.sapp` via `PBLANG_IDE` → CWD → walking up from the executable, then chdir's to the repo root so the IDE's `stdlib/*` imports resolve — verified working from `/tmp` as well as the repo root.
 - **Validated:** `pbide.sapp` parses clean; `--ide`/`ide` aliases launch (exit 124) from repo root and `/tmp`; browser render pipeline checked offline (title/strip/links/wrap); **suite 160/0** (incl. new word-movement assertions); two release rebuilds clean ("Compiling pblang-graphics" / "Compiling pblang").
 
+## 106. Native IDE: rendering fixes, smarter pbAI, F1 shortcuts overlay (2026-06-01)
+
+From two user screenshots (browser + AI tabs) and follow-up requests.
+
+- **`pblang --ide` launched the REPL** — the user's `/usr/local/bin/pblang` is a stale copy (older than the build). `.sapp` files are read live, but Rust-level features (the `--ide` flag, the graphics host fixes) require reinstalling the rebuilt binary: `sudo cp target/release/pblang /usr/local/bin/pblang`.
+- **`□` boxes throughout AI/browser text.** The 5×7 font is ASCII-only and was drawing the missing-glyph box for Unicode punctuation (• · — › © …) coming from pbAI output and page text. Fixed with a `_fold(code)` in pbide's `_dt`: maps common Unicode punctuation to ASCII and renders any other non-ASCII (>126, e.g. Greek) as `?`. One renderer-seam fix clears every panel.
+- **Browser showed literal `&#917;` / `&amp;` and fused words ("GoogleGmail").** `browser.sapp` `strip_tags` now inserts a space per removed tag, collapses whitespace, and decodes HTML entities (numeric `&#N;` / `&#xH;` + named `&amp; &lt; &nbsp; &copy;` …); `_page` decodes the title and link hrefs too. Locked in `browser_test`.
+- **pbAI made smarter (`stdlib/pbai.sapp`).** Deeper `_scan` (recursion, closures, try/catch, imports, match/enum, nesting depth, brackets, line count, TODO/FIXME). Richer skills: `_explain` reports recursion/closures/imports/depth; `_bugs` adds pblang-specific catches (the **invalid `print(x)` paren form**, unbalanced `[]`, `while true` w/o break, `/0`, fns-without-return, TODOs); `_improve` flags deep nesting, long functions, unguarded I/O; `_comment` emits a `///` header per function with its params. The `_general` knowledge base grew to ~18 topics (errors, imports, async, precision ladder, JIT, capabilities, self-hosting, operators, arrays, …). A `_has_code` guard routes no-code questions to the knowledge base even when the neural classifier mis-routes them. New assertions in `pbai_test`.
+- **F1 shortcuts overlay** — ported from the web IDE's `#shortcuts-overlay`: F1 toggles a modal listing every keybinding per panel; Esc closes. Drawn last so it overlays any panel without disturbing layouts.
+- **Validated:** both files parse clean; pbAI responses verified (recursion, print-gotcha, doc headers, knowledge routing); browser decode/spacing checked offline; **suite 160/0**; bounded GUI launch clean. Remaining web→native gaps (not yet ported): file tree / open / multi-file tabs, the Designer's circuit + quantum kinds, a full property Inspector, and the manual panel.
+
 ---
 
 # Part 2 — Validation Baseline / Fix Log (preserved from earlier sessions)

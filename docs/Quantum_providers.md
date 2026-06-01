@@ -4,11 +4,11 @@
 
 ## Goal
 
-Allow Sapphire quantum code to target different backends (simulators, cloud QPUs) by swapping a provider map — no VM changes required.
+Allow pblang quantum code to target different backends (simulators, cloud QPUs) by swapping a provider map — no VM changes required.
 
 ## Provider Contract
 
-A provider is a Sapphire map with these keys:
+A provider is a pblang map with these keys:
 
 | Key       | Type     | Description                                    |
 |----------|----------|------------------------------------------------|
@@ -22,7 +22,7 @@ A provider is a Sapphire map with these keys:
 
 Uses `stdlib/quantum_sim.sapp` directly. No network required.
 
-```sapphire
+```pblang
 let sim_provider = map{
     "name": "local-sim",
     "submit": fn(circ) { return quantum_protocol.submit(circ); },
@@ -34,7 +34,7 @@ let sim_provider = map{
 
 Uses `quantum_protocol.submit_remote(url, circ)` and `quantum_protocol.poll_remote(url, job_id)`.
 
-```sapphire
+```pblang
 let remote_provider = fn(base_url) {
     return map{
         "name": "remote-http",
@@ -55,7 +55,7 @@ let remote_provider = fn(base_url) {
 Two integration paths, no VM changes:
 
 1. **Exec + JSON**: Host or script spawns Python/Node process that runs Qiskit/Braket/Cirq; circuit sent as JSON (same shape as `quantum.sapp` circuit: `{ n, ops }`); process returns JSON `{ measurements: [...] }`. Use `process.spawn_wait` or a small HTTP stub that forwards to a local Python server.
-2. **FFI**: Thin native crate (e.g. `sapphire-qiskit`) exposes C ABI: `sapphire_qiskit_run(circuit_json_cstr)` → result JSON string. Script does `ffi.load("sapphire_qiskit.so")` and `ffi_call("sapphire_qiskit_run", circuit_json)`. Requires FfiPolicy allowlist.
+2. **FFI**: Thin native crate (e.g. `pblang-qiskit`) exposes C ABI: `pblang_qiskit_run(circuit_json_cstr)` → result JSON string. Script does `ffi.load("pblang_qiskit.so")` and `ffi_call("pblang_qiskit_run", circuit_json)`. Requires FfiPolicy allowlist.
 
 Provider slot contract remains: `submit(circuit)` → job_id, `poll(job_id)` → result. Bridge implementation can wrap exec or FFI behind that interface.
 
@@ -68,7 +68,7 @@ On top of raw measurement arrays (0/1 per qubit, or integer outcomes), `stdlib:q
 
 Example:
 
-```sapphire
+```pblang
 let sim = import("stdlib:quantum_sim.sapp");
 let results = [0, 0, 1, 1, 1];
 let h = sim.histogram(results);
@@ -81,5 +81,5 @@ These utilities are intended as building blocks for higher-level analysis (e.g. 
 ## Non-goals
 
 - No hard-coded provider credentials in VM or stdlib
-- No provider SDK bundled with Sapphire
+- No provider SDK bundled with pblang
 - No breaking changes to existing `quantum_protocol.submit` / `poll`

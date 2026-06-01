@@ -21,7 +21,7 @@
 
 ### Επιλογή A: Spawn / Join
 
-```sapphire
+```pblang
 // spawn(fn) → handle
 let h = spawn(fn() {
     sleep_ms(1000);
@@ -33,7 +33,7 @@ let result = join(h);  // block μέχρι να τελειώσει, επιστρ
 
 ### Επιλογή B: Channels (producer/consumer)
 
-```sapphire
+```pblang
 let ch = channel();
 {
     let tx = ch.sender;

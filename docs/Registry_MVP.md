@@ -22,7 +22,7 @@
 Για κάθε dependency στο lockfile:
 - **path** (υπάρχον): resolved path για local/file-based.
 - **sha256** (υπάρχον): hash περιεχομένου.
-- **name** (νέο, optional): package name π.χ. `@sapphire/http`.
+- **name** (νέο, optional): package name π.χ. `@pblang/http`.
 - **version** (νέο, optional): semantic version π.χ. `1.2.0`.
 - **source** (νέο, optional): `registry`, `git`, `path`.
 - **resolved** (νέο, optional): URL ή path από όπου fetched (registry URL, git URL, ή local path).
@@ -37,14 +37,14 @@
   - tarball URL (ή checksum + URL)
   - optional sha256
 - **Πηγή**: αρχικά GitHub Releases ή απλό HTTP server που σερβίρει index + tarballs.
-- **Fetch**: το CLI κατεβάζει το tarball, το ξεπακετάρει σε cache dir (π.χ. `~/.sapphire/cache` ή `./.sapphire/cache`), και ενημερώνει το lockfile με path + sha256 + name + version + source. Για static registries, το `url` μπορεί πλέον να είναι είτε absolute URL είτε path relative προς το `index.json`.
+- **Fetch**: το CLI κατεβάζει το tarball, το ξεπακετάρει σε cache dir (π.χ. `~/.pblang/cache` ή `./.pblang/cache`), και ενημερώνει το lockfile με path + sha256 + name + version + source. Για static registries, το `url` μπορεί πλέον να είναι είτε absolute URL είτε path relative προς το `index.json`.
 
 ## pblang.toml (dependencies)
 
 Επεκτείνεται το `[dependencies]`:
 
 - **Local**: `"mylib" = { path = "./lib" }` (ή απλά path string αν το υπάρχον format το επιτρέπει).
-- **Registry**: `"@sapphire/http" = "1.2.0"` ή `"@sapphire/http" = { version = "1.2.0" }`.
+- **Registry**: `"@pblang/http" = "1.2.0"` ή `"@pblang/http" = { version = "1.2.0" }`.
 - **Git**: `"github.com/user/repo" = { git = "https://github.com/user/repo", rev = "abc123" }`.
 - **Package entrypoint**: στο `[package]` μπορεί προαιρετικά να υπάρχει **`entry = "src/lib.sapp"`** ώστε τα bare imports (`import("@scope/pkg")`, `import("depname")`) να μη βασίζονται μόνο στο root heuristic `lib/main.*`. Προαιρετικά **`description = "..."`** για packaging/shipping UX: εμφανίζεται στην έξοδο επιτυχίας του `pack`/`bundle` μαζί με name@version.
 
@@ -60,7 +60,7 @@ Registry/git packages δεν θεωρούνται installable μόνο επει�
 
 ## pblang publish (MVP — υλοποιήθηκε)
 
-- **`pblang publish --registry-dir \<dir\> [path]`**: Διαβάζει `pblang.toml` (απαιτεί [package] name και version). Αν υπάρχει δηλωμένο `[package].entry`, το validate-άρει πριν το publish: πρέπει να είναι relative path μέσα στο package root και να δείχνει σε υπαρκτό αρχείο, όχι directory. Στο τρέχον local-registry MVP, το package πρέπει επίσης να είναι **self-contained**: αν έχει entries στο `[dependencies]`, το publish αποτυγχάνει αντί να παράγει artifact που εξαρτάται από τοπικά ή μη-πακεταρισμένα dependencies. Αν δεν υπάρχει explicit `[package].entry`, το package παραμένει publishable μόνο αν έχει τουλάχιστον ένα Sapphire module αρχείο: είτε default bare-import entry (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`) είτε άλλο `.sap`/`.sapp` module που θα φορτωθεί μέσω package subpath import. Έπειτα φτιάχνει tarball του package (ίδιο file set με hash_dir: όλα τα αρχεία εκτός `target/` και dotfiles). Γράφει **\<name\>-\<ver\>.tar.gz** στο \<dir\> (όπου name με `/` αντικαθίσταται από `_`) και ενημερώνει **\<dir\>/index.json** με entry `packages[name][version] = { url: file:///..., sha256 }`. Από εκεί άλλο project μπορεί να κάνει `pblang install --registry-index file:///path/to/dir/index.json`.
+- **`pblang publish --registry-dir \<dir\> [path]`**: Διαβάζει `pblang.toml` (απαιτεί [package] name και version). Αν υπάρχει δηλωμένο `[package].entry`, το validate-άρει πριν το publish: πρέπει να είναι relative path μέσα στο package root και να δείχνει σε υπαρκτό αρχείο, όχι directory. Στο τρέχον local-registry MVP, το package πρέπει επίσης να είναι **self-contained**: αν έχει entries στο `[dependencies]`, το publish αποτυγχάνει αντί να παράγει artifact που εξαρτάται από τοπικά ή μη-πακεταρισμένα dependencies. Αν δεν υπάρχει explicit `[package].entry`, το package παραμένει publishable μόνο αν έχει τουλάχιστον ένα pblang module αρχείο: είτε default bare-import entry (`lib.sapp`, `lib.sap`, `main.sapp`, `main.sap`) είτε άλλο `.sap`/`.sapp` module που θα φορτωθεί μέσω package subpath import. Έπειτα φτιάχνει tarball του package (ίδιο file set με hash_dir: όλα τα αρχεία εκτός `target/` και dotfiles). Γράφει **\<name\>-\<ver\>.tar.gz** στο \<dir\> (όπου name με `/` αντικαθίσταται από `_`) και ενημερώνει **\<dir\>/index.json** με entry `packages[name][version] = { url: file:///..., sha256 }`. Από εκεί άλλο project μπορεί να κάνει `pblang install --registry-index file:///path/to/dir/index.json`.
 - **Immutability contract**: Το local registry θεωρεί κάθε `name + version` immutable. Αν γίνει δεύτερο publish του ίδιου version με **ίδιο** tarball content, η εντολή επιτρέπεται ως idempotent success. Αν το περιεχόμενο διαφέρει, το publish αποτυγχάνει αντί να αντικαταστήσει σιωπηρά το ήδη δημοσιευμένο package.
 - Δεν υλοποιείται ακόμα: ανέβασμα σε remote (API/auth).
 
@@ -80,7 +80,7 @@ Registry/git packages δεν θεωρούνται installable μόνο επει�
 - **Bare import** (`import("@scope/pkg")`): φορτώνει το canonical entry — είτε `[package].entry` είτε fallback σε `lib.sapp` / `lib.sap` / `main.sapp` / `main.sap`.
 - **Subpath import** (`import("@scope/pkg:src/foo.sapp")`): το subpath πρέπει να είναι relative, μέσα στο package root, και να δείχνει σε **αρχείο** (όχι directory). Δεν υπάρχει ρητή whitelist: οποιοδήποτε τέτοιο path επιτρέπεται αν το αρχείο υπάρχει.
 
-### Τι σημαίνει "export map" για Sapphire
+### Τι σημαίνει "export map" για pblang
 
 - **Export map**: προαιρετικό manifest field (π.χ. `[package].exports` ή `exports` σε ξεχωριστό schema) που δηλώνει **ποια module paths είναι public API** του package. Τα υπόλοιπα αρχεία θεωρούνται internal και δεν θα έπρεπε να βασίζονται σε αυτά εξωτερικοί consumers (ενδεχομένως να απορρίπτονται σε strict mode).
 - **Package surface contract**: η συμφωνία ότι το registry (ή το tooling) μπορεί να validate ότι τα imports ενός consumer απευθύνονται μόνο σε exported paths· και ότι το publish μπορεί να ελέγχει ότι τα exported paths υπάρχουν και είναι αρχεία.

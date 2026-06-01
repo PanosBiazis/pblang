@@ -4,7 +4,7 @@
 
 ## Σκοπός
 
-Το παρόν έγγραφο ορίζει τι θεωρείται **παγωμένο** για το core της γλώσσας Sapphire (syntax, semantics, error model, module system) ώστε να υπάρχει σταθερή βάση για conformance tests, tooling και συμβατότητα.
+Το παρόν έγγραφο ορίζει τι θεωρείται **παγωμένο** για το core της γλώσσας pblang (syntax, semantics, error model, module system) ώστε να υπάρχει σταθερή βάση για conformance tests, tooling και συμβατότητα.
 
 ## Ε scope του freeze (v0.1)
 
@@ -108,14 +108,14 @@
 - **Capture by reference**: Τα closures κάνουν **capture** τις μεταβλητές από το enclosing scope **by reference** (όχι by value).
   - Αν η captured μεταβλητή αλλάξει μετά το closure definition, το closure βλέπει τη νέα τιμή.
   - Παράδειγμα:
-    ```sapphire
+    ```pblang
     let x = 1;
     let f = fn() { return x; };
     x = 2;
     print f();  # prints 2
     ```
 - **Mutable capture**: Τα closures μπορούν να τροποποιούν captured μεταβλητές:
-  ```sapphire
+  ```pblang
   let counter = 0;
   let inc = fn() { counter = counter + 1; return counter; };
   print inc();  # 1

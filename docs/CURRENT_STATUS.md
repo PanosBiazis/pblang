@@ -323,7 +323,7 @@ The VM core is stable and battle-tested:
 - **Thread Pool Helper**: ✅ Implemented (T5-alpha)
 
 **Example**:
-```sapphire
+```pblang
 import "stdlib:thread.sapp";
 
 let jobs = thread.channel_new();
@@ -354,19 +354,19 @@ All major commands implemented:
 
 | Command | Status | Description |
 |---------|--------|-------------|
-| `sapphire run` | ✅ | Execute .sap/.sapp files |
-| `sapphire check` | ✅ | Parse + typecheck without execution |
-| `sapphire test` | ✅ | Run test suite |
+| `pblang run` | ✅ | Execute .sap/.sapp files |
+| `pblang check` | ✅ | Parse + typecheck without execution |
+| `pblang test` | ✅ | Run test suite |
 | `pblang install` | ✅ | Install dependencies or packages |
 | `pblang publish` | ✅ | Publish to registry |
 | `pblang search` | ✅ | Search packages |
 | `pblang bundle` | 🟡 | Package app (self-extract pending) |
-| `sapphire doc` | ✅ | Generate documentation |
-| `sapphire fmt` | ✅ | Format source code |
-| `sapphire lint` | ✅ | Lint source code |
-| `sapphire --annotate` | ✅ | Annotated disassembly |
-| `sapphire --symbols` | ✅ | Symbol table dump |
-| `sapphire --dump-bytecode` | ✅ | Bytecode disassembly |
+| `pblang doc` | ✅ | Generate documentation |
+| `pblang fmt` | ✅ | Format source code |
+| `pblang lint` | ✅ | Lint source code |
+| `pblang --annotate` | ✅ | Annotated disassembly |
+| `pblang --symbols` | ✅ | Symbol table dump |
+| `pblang --dump-bytecode` | ✅ | Bytecode disassembly |
 
 **Files**:
 - `src/main.rs` - CLI implementation
@@ -499,7 +499,7 @@ All major commands implemented:
 
 **Tasks**:
 1. Add `rustls` dependency
-2. Implement `SapphireStream` trait
+2. Implement `pblangStream` trait
 3. Add `tcp_listen_tls()` builtin
 4. Modify `tcp_accept` for TLS transparency
 5. Create `stdlib/tls.sapp` wrapper
@@ -581,7 +581,7 @@ cargo run -- run examples/hello.sapp
 # Generate docs
 cargo doc --open
 
-# Run sapphire doc
+# Run pblang doc
 cargo run -- doc examples/
 ```
 

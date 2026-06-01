@@ -21,10 +21,10 @@ let tls_stream = StreamOwned::new(server_conn, tcp_stream);
 ## Alternative: FFI plugin
 Load `rustls` or `openssl` as a FFI DLL from pblang script:
 ```pblang
-let tls = ffi.load("sapphire_tls.dll");
+let tls = ffi.load("pblang_tls.dll");
 let s = tls.wrap_server(raw_socket, cert_path, key_path);
 ```
-This requires a thin Rust crate `sapphire-tls` that exposes a C ABI.
+This requires a thin Rust crate `pblang-tls` that exposes a C ABI.
 
 ## Non-goals
 - No TLS handshake implemented in pure pblang script
@@ -32,7 +32,7 @@ This requires a thin Rust crate `sapphire-tls` that exposes a C ABI.
 - No breaking changes to tcp_listen/tcp_accept
 
 ## Required VM change (minimal)
-- A `SapphireStream` trait (Read + Write) so both plain and TLS streams share
+- A `pblangStream` trait (Read + Write) so both plain and TLS streams share
   the same handle type in the VM
 - `tcp_listen_tls(addr, cert_pem, key_pem)` builtin stub (sandboxed by net cap)
 

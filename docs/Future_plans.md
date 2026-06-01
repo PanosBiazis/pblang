@@ -64,7 +64,7 @@
 
 Τι γίνεται ρεαλιστικά με το “βάλε τα όλα”
 Το “όλες οι δυνατότητες” (OS-building, AI/quantum, full web stack, polyglot στο ίδιο αρχείο, άπειρες βιβλιοθήκες/εργαλεία) δεν είναι 1 feature αλλά ολόκληρο οικοσύστημα. Αυτό που μπορούμε να κάνουμε σωστά είναι να το χτίσουμε σαν πλατφόρμα: stable runtime/IR + package manager + FFI + stdlib + tooling, ώστε μετά να “κουμπώνουν” βιβλιοθήκες.
-Καλή είδηση: ήδη έχουμε τώρα modules με export, try/catch, arrays/maps, JSON/HTTP client, quantum QASM emitter, type annotations + typechecker, C ABI (sapphire-ffi) και optimizer hook. Άρα το “foundation” υπάρχει.
+Καλή είδηση: ήδη έχουμε τώρα modules με export, try/catch, arrays/maps, JSON/HTTP client, quantum QASM emitter, type annotations + typechecker, C ABI (pblang-ffi) και optimizer hook. Άρα το “foundation” υπάρχει.
 Web δυνατότητες (τι λείπει για να γίνει web-ready)
 Για να μπορείς να χτίσεις web apps/servers “κανονικά”, χρειάζονται αυτά (με αυτή τη σειρά value/effort):
 Stdlib net: TCP sockets + basic HTTP server (routing, headers, body, streaming).
@@ -76,8 +76,8 @@ AI-ready (πρακτικά)
 Interop-first: bindings σε ONNX Runtime / CUDA / Python / HTTP APIs.
 Data model: arrays/maps (έχεις), αλλά για σοβαρό AI χρειάζεται typed buffers / tensors (π.χ. tensor<float32>[...]) για performance.
 Inference API: το onnx_infer τώρα είναι stub (σωστά) — το σωστό είναι να γίνει είτε:
-(A) μέσω FFI plugin (dll/so) που φορτώνεται από Sapphire, ή
-(B) μέσω host embedding (η εφαρμογή σου καλεί Sapphire και δίνει “capabilities”).
+(A) μέσω FFI plugin (dll/so) που φορτώνεται από pblang, ή
+(B) μέσω host embedding (η εφαρμογή σου καλεί pblang και δίνει “capabilities”).
 Quantum-ready (πρακτικά)
 Το να είσαι quantum-ready χωρίς τεράστιο R&D σημαίνει:
 IR emitter (έχεις stdlib/quantum.sapp → QASM)
@@ -85,12 +85,12 @@ Bridge σε simulator/SDK (Qiskit, Braket, Cirq) μέσω:
 FFI προς Python runtime, ή
 exec + JSON protocol, ή
 native simulator library binding.
-“Να χτίσεις λειτουργικό (OS) με Sapphire”
+“Να χτίσεις λειτουργικό (OS) με pblang”
 Αυτό είναι άλλο επίπεδο: θέλει bare-metal target, δικό σου runtime χωρίς std, allocator, drivers, ABI, linker scripts. Ρεαλιστική πορεία:
-πρώτα Sapphire ως systems scripting (tooling, build scripts, userland),
+πρώτα pblang ως systems scripting (tooling, build scripts, userland),
 μετά compiler backend (LLVM/Cranelift) ή transpile σε C/Rust,
 και πολύ αργότερα kernel work.
-“Να γράφεις οποιαδήποτε γλώσσα στο ίδιο αρχείο μαζί με Sapphire”
+“Να γράφεις οποιαδήποτε γλώσσα στο ίδιο αρχείο μαζί με pblang”
 Αυτό γίνεται μόνο αν το ορίσουμε σαν polyglot build system, όχι σαν “μαγικό parser”.
 Η ρεαλιστική, future-proof λύση είναι ένα από τα παρακάτω (ή και τα δύο):
 Option 1 — Polyglot blocks (build-time)
@@ -100,13 +100,13 @@ Syntax τύπου:
 εξάγει τα blocks,
 τα χτίζει σε artifacts (dll/so/wasm),
 τα φορτώνει με ένα standard FFI ABI,
-και τα εκθέτει στη Sapphire ως module namespace.
+και τα εκθέτει στη pblang ως module namespace.
 Option 2 — Runtime FFI (load libraries)
 ffi.load("mylib.dll") και μετά mylib.fn(...).
 Αυτό είναι το πιο κοντινό σε “οποιαδήποτε γλώσσα”, γιατί κάθε γλώσσα μπορεί να βγάλει C ABI (ή να τυλιχτεί).
 Το επόμενο “σωστό” βήμα για να γίνει πανίσχυρη (και να ξεκλειδώσει libraries/tools)
 Αν συνεχίσουμε, το πιο υψηλού leverage είναι:
-1) Package manager + sapphire.toml + module search path + lockfile
+1) Package manager + pblang.toml + module search path + lockfile
 2) Stdlib web server (TCP/HTTP) + filesystem/path utils
 3) FFI loader API (πέρα από το embedding): ffi.load, ffi.call, type marshaling
 4) Polyglot blocks (πάνω στο package manager + FFI loader)
@@ -116,7 +116,7 @@ ffi.load("mylib.dll") και μετά mylib.fn(...).
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 είναι production ready ως γλώσσα προγραμματισμού;
-Όχι ακόμη—με τα στοιχεία που φαίνονται στον κώδικά σου, η Sapphire είναι σε “powerful prototype / early-stage runtime” φάση, όχι production‑ready γλώσσα για γενική χρήση.
+Όχι ακόμη—με τα στοιχεία που φαίνονται στον κώδικά σου, η pblang είναι σε “powerful prototype / early-stage runtime” φάση, όχι production‑ready γλώσσα για γενική χρήση.
 
 Γιατί δεν τη λες production-ready (ακόμα)
 Το runtime χρησιμοποιεί κυρίως reference counting και μετά κάνει “cycle collection” σπάζοντας κύκλους καθαρίζοντας unreachable containers (arrays/maps/modules). Αυτό είναι έξυπνο workaround, αλλά είναι επίσης ένδειξη ότι το memory model/GC story δεν έχει “κλειδώσει” σε production επίπεδο (ειδικά σε edge cases, determinism, performance).
@@ -146,10 +146,10 @@ Production για προσωπικά/internal εργαλεία: μπορεί ν�
 Production για τρίτους / κρίσιμα workloads: ακόμα όχι, μέχρι να “παγώσει” spec + να χτίσεις σοβαρό test/compatibility & safety story.
 ​
 
-Αν μου πεις τι εννοείς “production” (π.χ. scripting για τα δικά σου projects, ή να το δώσεις σε άλλους σαν runtime/SDK), μπορώ να σου φτιάξω ένα συγκεκριμένο checklist “Sapphire v0.1 → v1.0” με milestones (spec, stability guarantees, tests, CI, perf, security).
+Αν μου πεις τι εννοείς “production” (π.χ. scripting για τα δικά σου projects, ή να το δώσεις σε άλλους σαν runtime/SDK), μπορώ να σου φτιάξω ένα συγκεκριμένο checklist “pblang v0.1 → v1.0” με milestones (spec, stability guarantees, tests, CI, perf, security).
 
 Prepared using GPT-5.2
-Αν μου πεις τι εννοείς “production” (π.χ. scripting για τα δικά σου projects, ή να το δώσεις σε άλλους σαν runtime/SDK), μπορώ να σου φτιάξω ένα συγκεκριμένο checklist “Sapphire v0.1 → v1.0” με milestones (spec, stability guarantees, tests, CI, perf, security).
+Αν μου πεις τι εννοείς “production” (π.χ. scripting για τα δικά σου projects, ή να το δώσεις σε άλλους σαν runtime/SDK), μπορώ να σου φτιάξω ένα συγκεκριμένο checklist “pblang v0.1 → v1.0” με milestones (spec, stability guarantees, tests, CI, perf, security).
 ναι
 Τέλεια—πάμε να το κάνουμε “v0.1 → v1.0” checklist, με στόχο να μπορείς να το δώσεις σε άλλους (runtime/SDK) με ξεκάθαρες εγγυήσεις και όσο γίνεται λιγότερα “footguns”. Θα το προσαρμόσω σε αυτά που ήδη έχεις: --check, --doc, --lock, modules/import cache, polyglot blocks, try/defer, και το μεγάλο surface των builtins (fs/net/http/sqlite/ffi/json).
 
@@ -172,7 +172,7 @@ Error UX: ενοποίησε parse/type/runtime diagnostics σε “στυλ”:
 Stability policy: ονόμασε τι θεωρείς breaking change (syntax, stdlib builtins, module system, bytecode). Για v0.x μπορείς να λες “breaking allowed”, αλλά θέλεις versioning + changelog.
 ​
 
-Lockfile contract: τεκμηρίωσε τι εγγυάται το sapphire.lock (π.χ. pinned versions, reproducible resolution) και πρόσθεσε CI test “lockfile reproducibility”.
+Lockfile contract: τεκμηρίωσε τι εγγυάται το pblang.lock (π.χ. pinned versions, reproducible resolution) και πρόσθεσε CI test “lockfile reproducibility”.
 ​
 
 v0.4: Security hardening (ιδιαίτερα επειδή έχεις OS/network)
@@ -222,7 +222,7 @@ Prepared using GPT-5.2
 Θες να το στοχεύσεις αρχικά ως embedded scripting language (π.χ. για apps/games/tools), ή ως standalone general-purpose με package ecosystem; Αυτό αλλάζει πολύ το πώς πρέπει να σχεδιάσεις modules, stdlib και sandboxing.
 και τα δύο
 Thinking
-Προσαρμόζοντας το checklist roadmap της Sapphire για στόχευση και ως embedded scripting και ως standalone general-purpose γλώσσα.
+Προσαρμόζοντας το checklist roadmap της pblang για στόχευση και ως embedded scripting και ως standalone general-purpose γλώσσα.
 Searching
 pub trait VmHost
 
@@ -234,7 +234,7 @@ builtins module
 
 Module exports
 
-sapphire-pm
+pblang-pm
 
 generate_lockfile
 
@@ -259,9 +259,9 @@ Phase 1: Core Runtime (v0.2–0.3) — Embedding-First
 
 Αρχιτεκτονική: 3 crates
 text
-sapphire-core/        # Parser, compiler, bytecode VM (zero OS deps)
-sapphire-stdlib/      # Builtins (fs/net/http/sqlite/ffi) — optional features
-sapphire-cli/         # REPL, --check, --doc, --lock
+pblang-core/        # Parser, compiler, bytecode VM (zero OS deps)
+pblang-stdlib/      # Builtins (fs/net/http/sqlite/ffi) — optional features
+pblang-cli/         # REPL, --check, --doc, --lock
 Βασικά deliverables
 1. Σταθερό VmHost trait (embedding API):
 ​
@@ -282,7 +282,7 @@ pub trait VmHost {
 ​
 
 rust
-// sapphire-stdlib/src/lib.rs
+// pblang-stdlib/src/lib.rs
 pub struct StdlibConfig {
     pub fs: bool,
     pub net: bool,
@@ -323,7 +323,7 @@ Cross-platform CI: Windows (MSVC/GNU), Linux, macOS.
 ​
 
 Phase 2: Standalone + Package Manager (v0.4–0.6)
-Στόχος: Μετατρέπεις τη Sapphire σε general-purpose language με ecosystem (packages, lockfile, registry).
+Στόχος: Μετατρέπεις τη pblang σε general-purpose language με ecosystem (packages, lockfile, registry).
 ​
 
 Package system architecture
@@ -335,9 +335,9 @@ text
 let m = import("./mylib.sap");
 
 # Package imports (νέο)
-let http = import("@sapphire/http");  # από registry
+let http = import("@pblang/http");  # από registry
 let mylib = import("github.com/user/repo");  # git source
-2. sapphire.toml manifest (ήδη έχεις --lock):
+2. pblang.toml manifest (ήδη έχεις --lock):
 ​
 
 text
@@ -346,16 +346,16 @@ name = "my-app"
 version = "0.1.0"
 
 [dependencies]
-"@sapphire/http" = "1.2.0"
+"@pblang/http" = "1.2.0"
 "github.com/user/lib" = { git = "...", rev = "abc123" }
-3. Lockfile format (sapphire.lock generation ήδη υπάρχει):
+3. Lockfile format (pblang.lock generation ήδη υπάρχει):
 ​
 
 json
 {
   "packages": [
     {
-      "name": "@sapphire/http",
+      "name": "@pblang/http",
       "version": "1.2.0",
       "checksum": "sha256:...",
       "source": "registry+https://..."
@@ -364,12 +364,12 @@ json
 }
 4. Package registry (μπορείς να χρησιμοποιήσεις GitHub Releases ή απλό HTTP server αρχικά):
 
-sapphire install → download + extract + update lockfile.
+pblang install → download + extract + update lockfile.
 
-sapphire publish → package tarball + upload.
+pblang publish → package tarball + upload.
 
 Stdlib split: core vs community
-Core stdlib (@sapphire/core): fs/net/json/base64 (ship με CLI, always available).
+Core stdlib (@pblang/core): fs/net/json/base64 (ship με CLI, always available).
 ​
 
 Community packages: http client/server, sqlite wrappers, crypto, data structures (από registry).
@@ -423,12 +423,12 @@ Tooling roadmap
 1. Package manager commands:
 
 bash
-sapphire init          # δημιουργεί sapphire.toml
-sapphire install       # fetch deps + generate lockfile
-sapphire build         # compile project
-sapphire run main.sap  # execute με deps
-sapphire test          # run tests (convention: tests/*.sap)
-sapphire publish       # upload package σε registry
+pblang init          # δημιουργεί pblang.toml
+pblang install       # fetch deps + generate lockfile
+pblang build         # compile project
+pblang run main.sap  # execute με deps
+pblang test          # run tests (convention: tests/*.sap)
+pblang publish       # upload package σε registry
 2. Language server (LSP):
 
 Autocomplete: functions, modules, builtins.
@@ -443,14 +443,14 @@ Inline diagnostics (parser/typechecker errors).
 3. Formatter/linter:
 
 bash
-sapphire fmt *.sap    # auto-format
-sapphire lint *.sap   # style warnings
+pblang fmt *.sap    # auto-format
+pblang lint *.sap   # style warnings
 4. Documentation generator:
 Το --doc ήδη υπάρχει—επέκτασέ το σε HTML generator (σαν Rustdoc):
 ​
 
 bash
-sapphire doc --html   # generates ./docs/ με HTML για exports/functions
+pblang doc --html   # generates ./docs/ με HTML για exports/functions
 Πρακτικό "επόμενο βήμα" (αυτή τη βδομάδα)
 Για να κάνεις το split χωρίς να σπάσεις existing code, κάνε αυτό:
 
@@ -483,7 +483,7 @@ pub fn with_stdlib(config: StdlibConfig) -> Self {
 2. Φτιάξε embedding example (1 μέρα)
 rust
 // examples/embed.rs
-use sapphire::{VM, StdlibConfig};
+use pblang::{VM, StdlibConfig};
 
 fn main() {
     let mut vm = VM::with_stdlib(StdlibConfig {
@@ -521,7 +521,7 @@ Assuming ~10–15h/week (part-time, μαζί με Ergafon job):
 Phase	Version	Timeline	Key deliverable
 Core runtime	v0.2	2–3 weeks	Crate split, VmHost trait, stdlib config
 Tests & CI	v0.3	1–2 weeks	Golden tests, cross-platform CI
-Package system	v0.4	3–4 weeks	sapphire install, lockfile, registry client
+Package system	v0.4	3–4 weeks	pblang install, lockfile, registry client
 Sandboxing	v0.5	2–3 weeks	Resource limits, capability checks
 Tooling	v0.6–0.9	6–8 weeks	LSP, formatter, doc generator
 v1.0 release	v1.0	1 week	Freeze spec, publish announcement
@@ -582,9 +582,9 @@ Production readiness (για να το δώσεις σε τρίτους)
 
 Refactor builtins σε ξεχωριστά modules (fs.rs, net.rs, κ.λπ.) ακυρώθηκε προς το παρόν· η λογική μένει στο vm.rs με capability checks. Αν θέλεις, το επόμενο βήμα μπορεί να είναι package manager, golden tests ή LSP/formatter.
 
-Όλα τα σχετικά tests περνούν (golden, sandbox). Αν θες, επόμενο βήμα μπορεί να είναι: lockfile reproducibility test στο CI, FFI allowlist (FfiPolicy), ή tooling (sapphire init/install, doc --html).
+Όλα τα σχετικά tests περνούν (golden, sandbox). Αν θες, επόμενο βήμα μπορεί να είναι: lockfile reproducibility test στο CI, FFI allowlist (FfiPolicy), ή tooling (pblang init/install, doc --html).
 
-Όλα τα σχετικά tests περνούν (sandbox, lockfile_repro). Αν θες, επόμενο βήμα μπορεί να είναι: LSP βελτίωσεις, formatter (sapphire fmt), ή επέκταση stdlib/γραφικών σύμφωνα με το “εμπλουτισμός γραφικών και βιβλιοθήκης” στο Future_plans.
+Όλα τα σχετικά tests περνούν (sandbox, lockfile_repro). Αν θες, επόμενο βήμα μπορεί να είναι: LSP βελτίωσεις, formatter (pblang fmt), ή επέκταση stdlib/γραφικών σύμφωνα με το “εμπλουτισμός γραφικών και βιβλιοθήκης” στο Future_plans.
 
 Σημείωση: Το test tests/http_server.rs (http_server_serve_once_handles_one_request) αποτυγχάνει με "no addr: Timeout"· είναι υπάρχον θέμα (δικτύου/λίστενερ) και δεν σχετίζεται με τις αλλαγές αυτές. Όλα τα υπόλοιπα tests (golden, block_expr, κ.λπ.) περνούν.
 
@@ -592,10 +592,10 @@ Refactor builtins σε ξεχωριστά modules (fs.rs, net.rs, κ.λπ.) ακ
 
 Από το Future_plans.md και το Report.md αυτά δεν έχουν γίνει ακόμα (ή είναι μόνο μερικά/στη σχεδίαση):
 1. Package manager & registry (Phase 2)
-sapphire install — λήψη dependencies από registry + ενημέρωση lockfile (τώρα μόνο local deps).
-sapphire publish — ανέβασμα πακέτου σε registry.
+pblang install — λήψη dependencies από registry + ενημέρωση lockfile (τώρα μόνο local deps).
+pblang publish — ανέβασμα πακέτου σε registry.
 Package registry — server/υπηρεσία για πακέτα.
-Import από registry — π.χ. import("@sapphire/http"), import("github.com/user/repo") (τώρα μόνο local paths).
+Import από registry — π.χ. import("@pblang/http"), import("github.com/user/repo") (τώρα μόνο local paths).
 2. Web stack (ολοκλήρωση)
 Stdlib crypto/TLS — bindings OpenSSL/rustls ή host capability (τώρα δεν υπάρχει TLS).
 Πλήρες HTTP server layer — event loop, routing, streaming bodies, timeouts/limits, σταθερό API τύπου http.server.serve(...) πάνω στα υπάρχοντα TCP/HTTP helpers (τώρα υπάρχει stdlib http_server.sapp με serve_once/serve_forever, αλλά όχι πλήρης orchestration/timeouts).
@@ -611,7 +611,7 @@ Polyglot blocks ως build artifacts — εξαγωγή blocks, build σε dll/s
 6. Threads
 Υλοποίηση — spawn/join ή channels (υπάρχει μόνο σχεδίαση στο docs/Threads.md).
 7. Executables
-Native single-binary compile — ένα .exe/.bin χωρίς να χρειάζεται το sapphire binary δίπλα (τώρα υπάρχει μόνο sapphire bundle = portable folder).
+Native single-binary compile — ένα .exe/.bin χωρίς να χρειάζεται το pblang binary δίπλα (τώρα υπάρχει μόνο pblang bundle = portable folder).
 8. Production / v0.2–v1.0
 Spec freeze — παγώνει spec για core language + module system + error semantics.
 Timeouts/limits — max HTTP body, max tcp/fs read, max JSON depth/size· **VmLimits** περιλαμβάνουν **max_instructions**, **max_stack_depth**, **max_memory_bytes**, **io_timeout_ms**· **io_timeout_ms** εφαρμόζεται σε **http_get**, **http_post**, TCP streams (tcp_accept), και σε **fs_read**, **fs_write**, **fs_read_bytes**, **fs_write_bytes** (μέσω thread + timeout).
@@ -619,13 +619,13 @@ Crash resistance — μερικό audit ολοκληρώθηκε (catch unwind, 
 Conformance suite — **CI** (GitHub Actions): `.github/workflows/ci.yml` τρέχει `cargo test` σε **Linux** (ubuntu-latest) και **Windows** (windows-latest) on push/PR. MSVC matrix optional μελλοντικά.
 Embedding API — **ολοκληρώθηκε**: τεκμηρίωση στο docs/Embedding.md (VmHost, VM::new/with_stdlib, capabilities, limits, FFI policy, resource lifecycle).
 9. Αρχιτεκτονική (crate split)
-3 crates — sapphire-core, sapphire-stdlib, sapphire-cli (τώρα monolithic CLI + VM).
+3 crates — pblang-core, pblang-stdlib, pblang-cli (τώρα monolithic CLI + VM).
 Refactor builtins σε ξεχωριστά modules (fs.rs, net.rs, κ.λπ.) — ακυρώθηκε προς το παρόν.
 10. Tooling (περαιτέρω)
-sapphire fmt — έχει trim, **spacing γύρω από operators** (+ - * / == != < > <= >=), indent by brace depth (4 spaces), final newline· περαιτέρω κανόνες (line length κ.λπ.) μελλοντικά.
+pblang fmt — έχει trim, **spacing γύρω από operators** (+ - * / == != < > <= >=), indent by brace depth (4 spaces), final newline· περαιτέρω κανόνες (line length κ.λπ.) μελλοντικά.
 LSP — autocomplete, jump-to-definition (υπάρχει LSP, αλλά το επίπεδο αυτών των features δεν αναφέρεται ως ολοκληρωμένο).
 11. Από το τέλος του Future_plans (ευρύτερα θέλω)
-Έξυπνο AI Sapphire code editor — δικό σου editor με δυνατότητες άλλων editors + επιπλέον.
+Έξυπνο AI pblang code editor — δικό σου editor με δυνατότητες άλλων editors + επιπλέον.
 Reverse engineering — δυνατότητες/εργαλεία για reverse engineering.
 Ενσωμάτωση AI στη γλώσσα/εργαλεία.
 Εγγυήσεις χωρίς errors, warnings, memory-leaks, buffer-overflows σε όλο το stack (δεν ισχύει ακόμα ως επίσημη εγγύηση).
@@ -638,12 +638,12 @@ Compiler backend — LLVM/Cranelift ή transpile σε C/Rust για native execu
 
 Τι μένει (από Report / Future_plans)
 Θέμα	Κατάσταση
-Package manager	sapphire install (lockfile) υπάρχει· registry fetch/publish όχι ακόμα
+Package manager	pblang install (lockfile) υπάρχει· registry fetch/publish όχι ακόμα
 Web	HTTP server stdlib υπάρχει· TLS, πλήρης orchestration/timeouts όχι
 AI/Quantum	Stub/bridges όχι ακόμα
 Threads	Σχεδίαση στο Threads.md· υλοποίηση όχι
-Executables	sapphire bundle υπάρχει· native single-binary όχι
-sapphire fmt	Υπάρχει (trim, **spacing γύρω από operators**, indent by braces, **--max-line-length=N** για optional line wrap)· περαιτέρω κανόνες μελλοντικά
+Executables	pblang bundle υπάρχει· native single-binary όχι
+pblang fmt	Υπάρχει (trim, **spacing γύρω από operators**, indent by braces, **--max-line-length=N** για optional line wrap)· περαιτέρω κανόνες μελλοντικά
 LSP	Υπάρχει· autocomplete/jump-to-def σε βάθος όχι
 Crash resistance	Catch unwind, json init, Mutex tables ολοκληρωμένα· stack/constant bounds optional
 io_timeout	Σε http/tcp και fs εφαρμόζεται.
@@ -654,13 +654,13 @@ Sandbox: 8/8. Golden, lockfile_repro: περνούν. **Modules: 10/10** περ�
 
 ## Επόμενα βήματα (από Future_plans)
 
-- **Phase 4**: **sapphire fmt** έχει minimal formatting, **spacing γύρω από operators** (+ - * / == != < > <= >=), indent by brace depth (4 spaces), **--max-line-length=N** για optional line wrap· περαιτέρω κανόνες μελλοντικά· το lint υπάρχει· το **build** υλοποιήθηκε. **Spec_freeze.md** και **Registry_MVP.md** προστέθηκαν.
+- **Phase 4**: **pblang fmt** έχει minimal formatting, **spacing γύρω από operators** (+ - * / == != < > <= >=), indent by brace depth (4 spaces), **--max-line-length=N** για optional line wrap· περαιτέρω κανόνες μελλοντικά· το lint υπάρχει· το **build** υλοποιήθηκε. **Spec_freeze.md** και **Registry_MVP.md** προστέθηκαν.
 - **Web**: MVP HTTP server API· το stdlib `http_server.sapp` υπάρχει με serve_once/serve_forever.
 - **Graphics/stdlib**: HSL υλοποιήθηκε (hsl)· περαιτέρω σχήματα/βοηθητικά αν χρειαστεί.
 - **Threads**: σχεδίαση σε **docs/Threads.md**· υλοποίηση spawn/join ή channels μελλοντικά.
-- **Executables**: **sapphire bundle** υλοποιήθηκε (portable folder)· native single-binary compile μελλοντικά.
-- **Package manager**: **sapphire install** υλοποιήθηκε (lockfile generation)· registry fetch/publish μελλοντικά.
-- **Reverse engineering**: **sapphire --dump-bytecode** υλοποιήθηκε (disassembly)· περαιτέρω εργαλεία μελλοντικά.
+- **Executables**: **pblang bundle** υλοποιήθηκε (portable folder)· native single-binary compile μελλοντικά.
+- **Package manager**: **pblang install** υλοποιήθηκε (lockfile generation)· registry fetch/publish μελλοντικά.
+- **Reverse engineering**: **pblang --dump-bytecode** υλοποιήθηκε (disassembly)· περαιτέρω εργαλεία μελλοντικά.
 - **v1.0**: Spec freeze, conformance suite· **Embedding API** τεκμηριώθηκε στο docs/Embedding.md (VmHost, lifecycle).
 - **Production**: Crash resistance — έγινε μερικό audit (catch unwind, json init, Mutex tables ffi/db/net)· περαιτέρω: bounds checks αν χρειαστεί· **io_timeout_ms** εφαρμόζεται πλέον και σε **fs_read, fs_write, fs_read_bytes, fs_write_bytes** (μέσω thread + recv_timeout).
 
@@ -669,13 +669,13 @@ Sandbox: 8/8. Golden, lockfile_repro: περνούν. **Modules: 10/10** περ�
 **Tests**: smoke 6/6. semantics **30/37** (διορθώθηκαν sqlite_db, gc_collect· compiler επιτρέπει πολλαπλά `let _`· stdlib db.sapp δεύτερο for με j· 7 failing: class×2, defer, match×2, db_migrations, http_router_middleware· db_migrations αποτυγχάνει με "undefined global 'kind'" στο transaction closure).
 Με το repo να είναι στο GitHub, το workflow θα τρέχει αυτόματα στα επόμενα push/PR. Επόμενο βήμα: διορθώσεις για τα 7 failing semantics tests ή διερεύνηση upvalues στο db transaction.
 
-βάλε την δυνατότητα να δημιουργεί εκτελέσιμα αρχεία για windows/linux και δημιούργησε έναν έξυπνο AI sapphire code editor με όλες τις δυνατότητες των άλλων code editors και με παρα πάνω δυνατότητες και να είναι powerful and efficient especially on memory , βάλε όλες τις δυνατότητες των threads ,βάλε βάλε όλες τις δυνατότητες για reverse engineering ενίσχυση του OOP και του functional ,βάλε δυνατότητα δημιουργίας ή εισαγωγης ή εξαγωγης ή διαγραφης ή επεξεργασίας project και βάλε δυνατότητα δημιουργίας ή εισαγωγης ή εξαγωγης ή διαγραφης ή επεξεργασίας framework 
+βάλε την δυνατότητα να δημιουργεί εκτελέσιμα αρχεία για windows/linux και δημιούργησε έναν έξυπνο AI pblang code editor με όλες τις δυνατότητες των άλλων code editors και με παρα πάνω δυνατότητες και να είναι powerful and efficient especially on memory , βάλε όλες τις δυνατότητες των threads ,βάλε βάλε όλες τις δυνατότητες για reverse engineering ενίσχυση του OOP και του functional ,βάλε δυνατότητα δημιουργίας ή εισαγωγης ή εξαγωγης ή διαγραφης ή επεξεργασίας project και βάλε δυνατότητα δημιουργίας ή εισαγωγης ή εξαγωγης ή διαγραφης ή επεξεργασίας framework 
 
 εμπλουτισμός γραφικών και γενικότερα όλης της βιβλιοθηκης και περισσοτερα εργαλεία,ενίσχυση/συντήρηση των τωρινών δυνατοτήτων και χαρακτηρηστικών,απλοποίηση,ευκολία,ασφάλεια,ενσωμάτωση τεχνιτής νοημοσήνης(AI),βελτιστοποίηση,δυναμικότητα,εξυπνάδα,πολλαπλότητα,cross platform,πολυγλωσσικότητα σε όλες τις γλώσσες προγραμματισμού και frameworks και tools,πολύ καλό testing παντού,(χωρίς errors,warnings,memory-leaks,buffer-overflows και άλλα!!!),έτοιμη για συνέχεια υποστήριξης απο rust --> pblang,αποδοτικότητα από την πηγή μέχρι και τα υψηλότατα στρώματα στο τέλος θα ανανεώνεις το AAP\pl-dev\pblang\docs\Report.md
 
 !!!!!!====||
           \/
-Με βάση τα docs/Future_plans.md και docs/Report.md, ο στόχος σου είναι “Sapphire ως πλατφόρμα” (γλώσσα + runtime + tooling + ecosystem) που να καλύπτει embedded scripting και standalone general-purpose, με web/AI/quantum/polyglot, threads, reverse engineering, executables, editor, και production-hardening.
+Με βάση τα docs/Future_plans.md και docs/Report.md, ο στόχος σου είναι “pblang ως πλατφόρμα” (γλώσσα + runtime + tooling + ecosystem) που να καλύπτει embedded scripting και standalone general-purpose, με web/AI/quantum/polyglot, threads, reverse engineering, executables, editor, και production-hardening.
 
 Πού είσαι ήδη δυνατός (και γιατί αυτό είναι σωστό foundation)
 Έχεις ήδη χτίσει τα βασικά “seams” για να το κάνεις platform: capability-based sandbox μέσω VmHost (fs/net/http/sqlite/ffi/exec), StdlibConfig + VM::new()/VM::with_stdlib, limits (max_instructions, max_stack_depth), FFI allowlist policy, καθώς και CI + golden tests + lockfile reproducibility.
@@ -685,12 +685,12 @@ Sandbox: 8/8. Golden, lockfile_repro: περνούν. **Modules: 10/10** περ�
 Τι πρέπει να γίνει πρώτα (υψηλότερο leverage για τα μελλοντικά σχέδια)
 Package registry & publish/fetch: στο Report αναφέρεις ότι έχεις install για lockfile generation, αλλά όχι registry fetch/publish· αυτό είναι ο πολλαπλασιαστής που ξεκλειδώνει “άπειρες βιβλιοθήκες/εργαλεία” που ζητάς στο Future_plans.
 
-Native executables: ήδη έχεις sapphire bundle (portable folder), αλλά το Future_plans ζητά single-binary executables για Windows/Linux· αυτό χρειάζεται compiler backend ή σταθερό packaging story (τουλάχιστον “embed runtime + bytecode + assets” σε ένα αρχείο).
+Native executables: ήδη έχεις pblang bundle (portable folder), αλλά το Future_plans ζητά single-binary executables για Windows/Linux· αυτό χρειάζεται compiler backend ή σταθερό packaging story (τουλάχιστον “embed runtime + bytecode + assets” σε ένα αρχείο).
 
 Threads υλοποίηση: έχεις design doc (docs/Threads.md) αλλά όχι υλοποίηση· για να προχωρήσεις σε web servers, tooling, editor integrations και γενικά performance, πρέπει να ορίσεις μοντέλο concurrency (VM-per-thread; channels; shared-state policy).
 
 Πώς να “σπάσεις” το roadmap σε ρεαλιστικά milestones
-Milestone A (Ecosystem): “Registry MVP” με sapphire publish + sapphire install να δουλεύει από ένα απλό HTTP/GitHub Releases backend, με checksums στο lockfile (επεκτείνοντας το ήδη υπάρχον lockfile contract/repro tests).
+Milestone A (Ecosystem): “Registry MVP” με pblang publish + pblang install να δουλεύει από ένα απλό HTTP/GitHub Releases backend, με checksums στο lockfile (επεκτείνοντας το ήδη υπάρχον lockfile contract/repro tests).
 
 Milestone B (Executables): “Bytecode bundle executable” (1ο στάδιο) όπου το CLI παράγει ένα artifact που τρέχει χωρίς project folder, και 2ο στάδιο αργότερα “native compile” (LLVM/Cranelift ή transpile) όπως περιγράφεις στο Future_plans.
 
@@ -709,7 +709,7 @@ Milestone C (Concurrency): υλοποίησε threads όπως στο design (sp
 
 Prepared using GPT-5.2
 με όλες τις πληροφορίες που εχείς διαλεξε τις καλύτερες επιλογές με έμφαση στον συνδιασμο πραγμάτων και γενικοτερα στην καλύτερη τελειοποιηση που μπορει να γινει οσο και αν παρει για την εξασφάλησει των πλάνων μου
-Για να “εξασφαλίσεις” τα πλάνα σου (web + AI/quantum + polyglot + editor + executables + threads + production) χωρίς να καταλήξεις σε χαοτικό monolith, η καλύτερη επιλογή είναι να κλειδώσεις την Sapphire ως πλατφόρμα με επίπεδα: μικρός, σταθερός πυρήνας + επεκτάσεις/πακέτα + εργαλεία πάνω από αυτόν.
+Για να “εξασφαλίσεις” τα πλάνα σου (web + AI/quantum + polyglot + editor + executables + threads + production) χωρίς να καταλήξεις σε χαοτικό monolith, η καλύτερη επιλογή είναι να κλειδώσεις την pblang ως πλατφόρμα με επίπεδα: μικρός, σταθερός πυρήνας + επεκτάσεις/πακέτα + εργαλεία πάνω από αυτόν.
 
 Η καλύτερη στρατηγική (συνδυασμός που κλιμακώνει)
 Core runtime ως “kernel”: parser/IR/compiler/VM με αυστηρά API και συμβατότητα, και όχι συνεχές “φόρτωμα features” μέσα στο VM.
@@ -763,7 +763,7 @@ Executables = το σύστημα παράδοσης προϊόντος (deploy 
 
 Επιλογή αρχιτεκτονικής που κερδίζει μακροπρόθεσμα
 1) Registry: content-addressed + versioned, χωρίς να σπάσεις το lockfile
-Σήμερα το sapphire.lock ήδη pin-άρει dependencies με sha256 περιεχομένου και δένει με hash του sapphire.toml, αλλά είναι path-based και όχι cross-machine reproducible.
+Σήμερα το pblang.lock ήδη pin-άρει dependencies με sha256 περιεχομένου και δένει με hash του pblang.toml, αλλά είναι path-based και όχι cross-machine reproducible.
 Η καλύτερη εξέλιξη είναι: να κρατήσεις το content hash ως “πυρήνα αλήθειας” και να προσθέσεις πάνω του versions/registry metadata (name/version/source/checksum), ώστε να έχεις και reproducibility και οικοσύστημα.
 
 Απόφαση:
@@ -782,12 +782,12 @@ spawn(fn) -> handle, join(handle) -> value|error.
 
 channel() -> ch με send/recv.
 
-Data passing: μόνο “Send-safe” Sapphire values (numbers/bools/strings/arrays/maps by deep copy) ή serialize σε bytes/JSON. Αυτό αποφεύγει shared RC structures.
+Data passing: μόνο “Send-safe” pblang values (numbers/bools/strings/arrays/maps by deep copy) ή serialize σε bytes/JSON. Αυτό αποφεύγει shared RC structures.
 
 Και φυσικά capability-gating: allow_spawn (ή μέσω existing capabilities model) + inheritance των VmLimits στο child VM, όπως ήδη περιγράφεται ως αρχή.
 
 3) Executables: 2 στάδια (για να μη μπλοκάρεις χρόνια σε compiler backend)
-Στο Report ήδη έχεις sapphire bundle (portable folder), αλλά το Future_plans ζητά single-binary executables.
+Στο Report ήδη έχεις pblang bundle (portable folder), αλλά το Future_plans ζητά single-binary executables.
 Η καλύτερη στρατηγική είναι “2-stage shipping”:
 
 Stage A (σύντομα, ασφαλές): “Packaged executable” που περιέχει runtime + bytecode/assets σε ένα αρχείο (ή self-extract). Αυτό σου δίνει cross-platform deliverable χωρίς να γράψεις LLVM backend από νωρίς.
@@ -813,14 +813,14 @@ Gates “τελειοποίησης” (για να μην εκτροχιαστ�
 
 Θες να το κάνουμε με “σκληρό” scope 2 εβδομάδων για το Registry MVP (index format, fetch/install, lockfile changes, tests), ή προτιμάς 4 εβδομάδες ώστε να μπει από την αρχή και publish;
 
-Μένουν κυρίως τα “μεγάλα” που μετατρέπουν τη Sapphire από foundation σε πλήρη πλατφόρμα (ecosystem/registry, threads, executables) και μετά τα βαριά (AI/quantum bridges, polyglot build, editor, reverse‑engineering suite).
+Μένουν κυρίως τα “μεγάλα” που μετατρέπουν τη pblang από foundation σε πλήρη πλατφόρμα (ecosystem/registry, threads, executables) και μετά τα βαριά (AI/quantum bridges, polyglot build, editor, reverse‑engineering suite).
 
 Ecosystem / Registry (υψηλότερο leverage)
-Registry fetch/publish (πραγματική υλοποίηση): στο Report αναφέρεται ρητά ότι το sapphire install υπάρχει ως lockfile generation, αλλά registry fetch/publish είναι “μελλοντικά”.
+Registry fetch/publish (πραγματική υλοποίηση): στο Report αναφέρεται ρητά ότι το pblang install υπάρχει ως lockfile generation, αλλά registry fetch/publish είναι “μελλοντικά”.
 
 Lockfile v2 στην πράξη (όχι μόνο design): έχεις ήδη το design στο docs/Registry_MVP.md, αλλά μένει να εφαρμοστεί στον resolver/CLI και να “κλειδώσει” με tests.
 
-Package imports τύπου @sapphire/http / git sources: στο registry design περιγράφονται, αλλά δεν φαίνεται να έχουν υλοποιηθεί.
+Package imports τύπου @pblang/http / git sources: στο registry design περιγράφονται, αλλά δεν φαίνεται να έχουν υλοποιηθεί.
 
 Threads (concurrency)
 Υλοποίηση spawn/join/channels: υπάρχει μόνο σχεδίαση στο docs/Threads.md, ενώ στο Report δηλώνεται ως “μελλοντικά”.
@@ -828,7 +828,7 @@ Threads (concurrency)
 Policy για shared state/VM-per-thread και όρια/capabilities για spawned VMs: τα τεχνικά θέματα είναι καταγεγραμμένα, αλλά μένει η υλοποίηση και τα conformance tests.
 
 Executables (Windows/Linux)
-Single-binary / native compile: αυτή τη στιγμή έχεις sapphire bundle (portable folder) και το Report λέει ότι “native single-binary compile” είναι μελλοντικό.
+Single-binary / native compile: αυτή τη στιγμή έχεις pblang bundle (portable folder) και το Report λέει ότι “native single-binary compile” είναι μελλοντικό.
 
 Packaging story με deps + lockfile + bytecode ως “ένα artifact” (1ο στάδιο) και αργότερα backend (LLVM/Cranelift ή transpile) όπως περιγράφει το Future_plans.
 
@@ -846,7 +846,7 @@ Production hardening & “μεγάλα extra σχέδια”
 
 Περαιτέρω conformance/perf/security: το Future_plans αναφέρει ανάγκη για σοβαρό test suite/fuzzing/benchmarks και “production story” λόγω μεγάλου builtin surface (fs/net/http/sqlite/ffi/exec).
 
-AI Sapphire code editor οπως delphi,android studio,vscode,QT creator αλλα καλύτερος με δημιουργία εκτελεσιμων σε όλες τις πλατφόρμες-λειτουργικά και υποστήριξη, reverse engineering και γενικότερα cyber/ethical security εργαλεία, δυνατότητα παράλληλου, σειριακού και ψευδοπαραλληλού προγραμματισμού,παραδείγματα,ψευδοκώδικα,δυνατότητα blocks programming,δυνατότητα μετατροπης οποιαδηποτε αρχείο σε άλλο αρχείο και επεξεργασίας οποιαδήποτε αρχείο,OS-building, καθώς και “project/framework create/import/export/edit/delete”: είναι ρητά μέσα στα επιπλέον “θέλω” στο Future_plans, αλλά είναι ξεχωριστά μεγάλα projects που έρχονται αφού σταθεροποιήσεις ecosystem + concurrency + shipping , συμβατότητα με πολλα εργαλεια και frameworks,libraries ακομα και άλλων γλωσσών προγραμματισμού .
+AI pblang code editor οπως delphi,android studio,vscode,QT creator αλλα καλύτερος με δημιουργία εκτελεσιμων σε όλες τις πλατφόρμες-λειτουργικά και υποστήριξη, reverse engineering και γενικότερα cyber/ethical security εργαλεία, δυνατότητα παράλληλου, σειριακού και ψευδοπαραλληλού προγραμματισμού,παραδείγματα,ψευδοκώδικα,δυνατότητα blocks programming,δυνατότητα μετατροπης οποιαδηποτε αρχείο σε άλλο αρχείο και επεξεργασίας οποιαδήποτε αρχείο,OS-building, καθώς και “project/framework create/import/export/edit/delete”: είναι ρητά μέσα στα επιπλέον “θέλω” στο Future_plans, αλλά είναι ξεχωριστά μεγάλα projects που έρχονται αφού σταθεροποιήσεις ecosystem + concurrency + shipping , συμβατότητα με πολλα εργαλεια και frameworks,libraries ακομα και άλλων γλωσσών προγραμματισμού .
 
 
 Δες το project μεχρι στιγμής και πες μου αν είναι έτοιμη για production και αν είναι έτοιμη για "self-development" και απεξαρτησιοποιηση απο την rust
@@ -873,8 +873,8 @@ Error UX: file:line:col format πλέον υπάρχει
 ❌ Τι λείπει για production
 Κατηγορία	Πρόβλημα
 TLS/HTTPS	Δεν υπάρχει — μόνο plain TCP. Κανένα production web app δεν μπορεί να τρέξει χωρίς αυτό
-Type system	sapphire-typeck crate υπάρχει ως stub — δεν υπάρχει static type checking
-LSP	sapphire-lsp crate υπάρχει αλλά δεν έχει υλοποιηθεί — developer experience περιορισμένη
+Type system	pblang-typeck crate υπάρχει ως stub — δεν υπάρχει static type checking
+LSP	pblang-lsp crate υπάρχει αλλά δεν έχει υλοποιηθεί — developer experience περιορισμένη
 Native binary	docs/Native_backend_notes.md είναι κενό — όλα τα πεδία "To be filled"
 WebSocket frames	Μόνο upgrade handshake, όχι frame parsing
 Hosted registry	Μόνο design note, κανένας server
@@ -884,49 +884,49 @@ Error recovery	Parser δεν κάνει error recovery — ένα λάθος σ�
 Μερικώς — και αυτό είναι το πιο ενδιαφέρον κομμάτι.
 
 Τι σημαίνει "self-development" εδώ
-Self-development = να γράφεις τον compiler/VM/tooling της Sapphire σε Sapphire αντί για Rust. Αυτό απαιτεί τρία πράγματα:
+Self-development = να γράφεις τον compiler/VM/tooling της pblang σε pblang αντί για Rust. Αυτό απαιτεί τρία πράγματα:
 
-Bootstrap compiler — ένας Sapphire→bytecode compiler γραμμένος σε Sapphire
+Bootstrap compiler — ένας pblang→bytecode compiler γραμμένος σε pblang
 
-Self-hosted VM — ο interpreter γραμμένος σε Sapphire
+Self-hosted VM — ο interpreter γραμμένος σε pblang
 
 Απεξάρτηση από Rust — το cargo build να μην χρειάζεται
 
 ✅ Τι υπάρχει ήδη που βοηθά
-sapphire-compiler crate υπάρχει ξεχωριστά από sapphire-vm — καλή αρχιτεκτονική διαχωρισμού
+pblang-compiler crate υπάρχει ξεχωριστά από pblang-vm — καλή αρχιτεκτονική διαχωρισμού
 
-sapphire-ir crate υπάρχει — ξεχωριστό IR layer, βασική προϋπόθεση για self-hosting
+pblang-ir crate υπάρχει — ξεχωριστό IR layer, βασική προϋπόθεση για self-hosting
 
-sapphire-llvm crate υπάρχει — native backend groundwork, ακόμα stub
+pblang-llvm crate υπάρχει — native backend groundwork, ακόμα stub
 
-Η Sapphire ήδη τρέχει τα stdlib modules της γραμμένα σε .sapp — άρα έχει self-referential execution
+Η pblang ήδη τρέχει τα stdlib modules της γραμμένα σε .sapp — άρα έχει self-referential execution
 
-FFI layer (sapphire-ffi) — μπορεί να καλεί native βιβλιοθήκες
+FFI layer (pblang-ffi) — μπορεί να καλεί native βιβλιοθήκες
 
 --dump-bytecode υπάρχει — μπορείς να δεις τι παράγει ο compiler
 
 ❌ Τι λείπει για self-development
 Απαίτηση	Κατάσταση
 Self-hosted parser	Ο parser είναι Rust-only — δεν υπάρχει καν skeleton σε .sapp
-Τύποι δεδομένων	Η Sapphire δεν έχει struct/enum — αδύνατο να γράψεις compiler χωρίς αυτά
-Static types	sapphire-typeck είναι κενό — χωρίς types ο self-hosted compiler θα είναι άκρως fragile
-Native binary output	sapphire-llvm και Native_backend_notes.md είναι κενά stubs
+Τύποι δεδομένων	Η pblang δεν έχει struct/enum — αδύνατο να γράψεις compiler χωρίς αυτά
+Static types	pblang-typeck είναι κενό — χωρίς types ο self-hosted compiler θα είναι άκρως fragile
+Native binary output	pblang-llvm και Native_backend_notes.md είναι κενά stubs
 File I/O depth	Ο compiler χρειάζεται βαθύ FS access — υπάρχει αλλά δεν έχει δοκιμαστεί σε compiler-scale
-sapphire-lsp	Κενό crate — χωρίς LSP δεν μπορεί να γραφτεί comfortably σε Sapphire
+pblang-lsp	Κενό crate — χωρίς LSP δεν μπορεί να γραφτεί comfortably σε pblang
 Η Πραγματικότητα
-Το project έχει εξαιρετική αρχιτεκτονική πρόβλεψη — τα crates sapphire-ir, sapphire-compiler, sapphire-llvm δείχνουν ότι ο στόχος self-hosting ήταν στο σχέδιο από την αρχή . Ωστόσο υπάρχει ένα κρίσιμο gap: η γλώσσα δεν έχει ακόμα τα language features (structs, enums, generics, static types) που χρειάζεσαι για να γράψεις compiler-level κώδικα σε αυτή.
+Το project έχει εξαιρετική αρχιτεκτονική πρόβλεψη — τα crates pblang-ir, pblang-compiler, pblang-llvm δείχνουν ότι ο στόχος self-hosting ήταν στο σχέδιο από την αρχή . Ωστόσο υπάρχει ένα κρίσιμο gap: η γλώσσα δεν έχει ακόμα τα language features (structs, enums, generics, static types) που χρειάζεσαι για να γράψεις compiler-level κώδικα σε αυτή.
 
 Το roadmap προς self-development είναι:
 
-Τώρα → sapphire-typeck (type checker) + struct/enum syntax
+Τώρα → pblang-typeck (type checker) + struct/enum syntax
 
-Μετά → sapphire-lsp completion (developer UX για να γράφεις Sapphire σε Sapphire)
+Μετά → pblang-lsp completion (developer UX για να γράφεις pblang σε pblang)
 
-Μετά → sapphire-llvm / transpile-to-C πρώτο slice (N2)
+Μετά → pblang-llvm / transpile-to-C πρώτο slice (N2)
 
 Τέλος → self-hosted parser σε .sapp, bootstrap build
 
-Για απεξάρτηση από Rust συγκεκριμένα: το πιο ρεαλιστικό πρώτο βήμα είναι transpile-to-C (όχι απευθείας LLVM) — παράγεις C από Sapphire bytecode, το compiles με gcc/clang, και έτσι δεν χρειάζεσαι Rust toolchain για να τρέξεις Sapphire apps. Ο VM όμως θα παραμείνει σε Rust για πολύ ακόμα — αυτό είναι λογικό και σωστό.
+Για απεξάρτηση από Rust συγκεκριμένα: το πιο ρεαλιστικό πρώτο βήμα είναι transpile-to-C (όχι απευθείας LLVM) — παράγεις C από pblang bytecode, το compiles με gcc/clang, και έτσι δεν χρειάζεσαι Rust toolchain για να τρέξεις pblang apps. Ο VM όμως θα παραμείνει σε Rust για πολύ ακόμα — αυτό είναι λογικό και σωστό.
 
 ειναι έτοιμη για να χρησιμοποιηθεί χωρίς χρήση αλλης γλώσσας προγραμματισμου για os development;
 Έχω αρκετή εικόνα. Να η πλήρης, ειλικρινής ανάλυση:
@@ -945,13 +945,13 @@ sapphire-lsp	Κενό crate — χωρίς LSP δεν μπορεί να γραφ
 > OS/bare-metal development is now an explicit goal. The technical requirements listed below
 > are accurate and are treated as the roadmap, not a reason to decline. See `docs/OS_Development.md`.)*
 
-OS Development με Sapphire — Η Αλήθεια
-Η Sapphire δεν μπορεί να χρησιμοποιηθεί για OS development σήμερα, και δεν είναι καν κοντά σε αυτό. Αυτό δεν είναι κριτική — είναι απλώς η φύση του τι σημαίνει "OS development".
+OS Development με pblang — Η Αλήθεια
+Η pblang δεν μπορεί να χρησιμοποιηθεί για OS development σήμερα, και δεν είναι καν κοντά σε αυτό. Αυτό δεν είναι κριτική — είναι απλώς η φύση του τι σημαίνει "OS development".
 
 Τι Χρειάζεται ένα OS Language
 Για να γράψεις OS kernel/drivers σε μια γλώσσα, χωρίς άλλη γλώσσα, χρειάζεσαι αυτά τα απαραίτητα:
 
-Απαίτηση	Sapphire σήμερα
+Απαίτηση	pblang σήμερα
 Bare-metal execution — τρέχει χωρίς OS από κάτω	❌ Τρέχει πάνω σε Rust VM, πάνω σε OS
 Direct memory management — malloc/free, raw pointers, φυσικές διευθύνσεις	❌ GC/managed heap, ptr.sapp είναι stub
 Inline assembly	❌ Δεν υπάρχει
@@ -959,19 +959,19 @@ Interrupt handlers	❌ Δεν υπάρχει
 No standard library (freestanding)	❌ Εξαρτάται πλήρως από stdlib + Rust runtime
 Deterministic memory layout — structs με padding control, #[repr(C)]	❌ Δεν υπάρχουν structs καθόλου
 Static allocation — stack-only, no heap option	❌ Πάντα heap-allocated values
-Native binary — παράγει machine code απευθείας	❌ sapphire-llvm είναι κενό stub
+Native binary — παράγει machine code απευθείας	❌ pblang-llvm είναι κενό stub
 No runtime overhead — zero-cost abstractions	❌ Interpreter με boxing values
 Cross-compilation	❌ Δεν υπάρχει
 Linker control — custom linker scripts	❌ Δεν υπάρχει
 Η Ριζική Αρχιτεκτονική Αντίφαση
-Το βασικό πρόβλημα δεν είναι "λείπουν features" — είναι ότι η Sapphire έχει σχεδιαστεί με το αντίθετο φιλοσοφικό μοντέλο από ό,τι χρειάζεται το OS development:
+Το βασικό πρόβλημα δεν είναι "λείπουν features" — είναι ότι η pblang έχει σχεδιαστεί με το αντίθετο φιλοσοφικό μοντέλο από ό,τι χρειάζεται το OS development:
 
-Sapphire = managed, sandboxed, capability-gated VM
+pblang = managed, sandboxed, capability-gated VM
 OS development = unmanaged, bare-metal, total hardware control
 
-Το VmLimits, το sandboxing, τo FfiPolicy — αυτά που κάνουν τη Sapphire ασφαλή για εφαρμογές — είναι ακριβώς αυτά που την κάνουν αδύνατη για OS development. Ένας OS kernel πρέπει να έχει απεριόριστη πρόσβαση στο hardware.
+Το VmLimits, το sandboxing, τo FfiPolicy — αυτά που κάνουν τη pblang ασφαλή για εφαρμογές — είναι ακριβώς αυτά που την κάνουν αδύνατη για OS development. Ένας OS kernel πρέπει να έχει απεριόριστη πρόσβαση στο hardware.
 
-Επιπλέον, το vm.rs είναι 200KB Rust κώδικας — ολόκληρος ο κόσμος της Sapphire ζει μέσα σε αυτό. Δεν υπάρχει τρόπος να "βγεις έξω" από αυτό το sandbox για να μιλήσεις απευθείας με hardware.
+Επιπλέον, το vm.rs είναι 200KB Rust κώδικας — ολόκληρος ο κόσμος της pblang ζει μέσα σε αυτό. Δεν υπάρχει τρόπος να "βγεις έξω" από αυτό το sandbox για να μιλήσεις απευθείας με hardware.
 
 Σύγκριση με Γλώσσες που Μπορούν
 Γλώσσα	OS-capable;	Γιατί
@@ -979,11 +979,11 @@ C	✅	Bare-metal, inline asm, raw pointers, freestanding
 Rust	✅	#![no_std], inline asm, unsafe, raw pointers
 Zig	✅	Freestanding, comptime, inline asm
 C++	✅ (δύσκολο)	Με -ffreestanding, no STL
-Sapphire	❌	Interpreter on top of Rust on top of OS
+pblang	❌	Interpreter on top of Rust on top of OS
 Τι Θα Χρειαζόταν για να Γίνει Possible (θεωρητικά)
 Είναι τεχνικά δυνατό αλλά απαιτεί εντελώς νέο layer — ουσιαστικά νέα γλώσσα:
 
-sapphire-llvm να υλοποιηθεί πλήρως → native binary output
+pblang-llvm να υλοποιηθεί πλήρως → native binary output
 
 #[no_std] mode → freestanding compilation χωρίς OS
 
@@ -1000,9 +1000,9 @@ Interrupt attribute → #[interrupt] fn timer_handler() { ... }
 Αυτά είναι 6-8 major language features που δεν υπάρχουν, συν native backend από μηδέν. Μιλάμε για χρόνια δουλειάς.
 
 Το Πρακτικό Συμπέρασμα
-Η Sapphire έχει ξεκάθαρη ταυτότητα: application-level scripting/systems language με strong stdlib και safe concurrency . Αυτό είναι πολύτιμο. OS development είναι ένας εντελώς διαφορετικός κόσμος που απαιτεί διαφορετικό DNA στη γλώσσα από τη βάση.
+Η pblang έχει ξεκάθαρη ταυτότητα: application-level scripting/systems language με strong stdlib και safe concurrency . Αυτό είναι πολύτιμο. OS development είναι ένας εντελώς διαφορετικός κόσμος που απαιτεί διαφορετικό DNA στη γλώσσα από τη βάση.
 
-Αν ο στόχος είναι OS-level work, η Sapphire μπορεί να χρησιμεύσει ως high-level scripting layer πάνω από έναν OS (shell scripts, system automation, userspace tools) — αλλά όχι για τον kernel/drivers τον ίδιο.
+Αν ο στόχος είναι OS-level work, η pblang μπορεί να χρησιμεύσει ως high-level scripting layer πάνω από έναν OS (shell scripts, system automation, userspace tools) — αλλά όχι για τον kernel/drivers τον ίδιο.
 
 Prepared using GPT-5.4 Thinking
 
@@ -1010,15 +1010,15 @@ Prepared using GPT-5.4 Thinking
 Απο όλα τα δυνατότητες / χαρακτηριστικά που έχει το προτζεκτ και από το future_plans και σάρωσε όλο το πρότζεκτ αναλυτικά,τι μένει ως εκκρεμότητα ακόμα συνολικά;
 Έχω πλήρη εικόνα. Παρακάτω είναι η αναλυτική λίστα εκκρεμοτήτων βασισμένη σε όλο το project:
 
-Εκκρεμότητες Sapphire — Πλήρης Ανάλυση
+Εκκρεμότητες pblang — Πλήρης Ανάλυση
 Έχω σαρώσει το repo, το docs/Future_plans.md και το docs/Report.md. Παρακάτω είναι όλα όσα μένουν, ομαδοποιημένα κατά κατηγορία.
 
 🔴 Κρίσιμα (Μπλοκάρουν Production)
 Type System
 
-sapphire-typeck crate υπάρχει αλλά είναι κενό stub — δεν υπάρχει static type checking
+pblang-typeck crate υπάρχει αλλά είναι κενό stub — δεν υπάρχει static type checking
 
-Δεν υπάρχουν struct / enum / generics — αδύνατο να γράψεις compiler-level κώδικα σε Sapphire
+Δεν υπάρχουν struct / enum / generics — αδύνατο να γράψεις compiler-level κώδικα σε pblang
 
 TLS / HTTPS
 
@@ -1035,9 +1035,9 @@ Failing Semantics Tests
 🟠 Μεγάλες Εκκρεμότητες (Core Platform)
 Package Registry — Fetch/Publish
 
-sapphire install υπάρχει για lockfile generation, αλλά registry fetch/publish δεν υπάρχει
+pblang install υπάρχει για lockfile generation, αλλά registry fetch/publish δεν υπάρχει
 
-Package imports τύπου @sapphire/http ή github.com/user/repo δεν έχουν υλοποιηθεί
+Package imports τύπου @pblang/http ή github.com/user/repo δεν έχουν υλοποιηθεί
 
 Registry server: μόνο design doc (docs/Registry_MVP.md), κανένας server
 
@@ -1049,9 +1049,9 @@ Policy για shared state/VM-per-thread και limits/capabilities για spawn
 
 Native Executables (Windows/Linux)
 
-sapphire bundle = portable folder, αλλά single-binary native compile δεν υπάρχει
+pblang bundle = portable folder, αλλά single-binary native compile δεν υπάρχει
 
-sapphire-llvm crate = κενό stub, docs/Native_backend_notes.md = κενό
+pblang-llvm crate = κενό stub, docs/Native_backend_notes.md = κενό
 
 Stage A: "bytecode + runtime in one file" — δεν έγινε
 
@@ -1060,13 +1060,13 @@ Stage B: LLVM/Cranelift ή transpile-to-C backend — δεν έγινε
 🟡 Σημαντικά (Ecosystem & DX)
 LSP
 
-sapphire-lsp crate υπάρχει αλλά autocomplete, jump-to-definition δεν έχουν υλοποιηθεί
+pblang-lsp crate υπάρχει αλλά autocomplete, jump-to-definition δεν έχουν υλοποιηθεί
 
-Χωρίς LSP δεν μπορεί να γραφτεί comfortably σε Sapphire
+Χωρίς LSP δεν μπορεί να γραφτεί comfortably σε pblang
 
 Formatter — Επιπλέον κανόνες
 
-sapphire fmt έχει βασική λειτουργία (indent, operators, --max-line-length), αλλά περαιτέρω κανόνες (blank lines, trailing commas, string formatting κ.ά.) μελλοντικά
+pblang fmt έχει βασική λειτουργία (indent, operators, --max-line-length), αλλά περαιτέρω κανόνες (blank lines, trailing commas, string formatting κ.ά.) μελλοντικά
 
 Lockfile v2 — Cross-machine
 
@@ -1113,7 +1113,7 @@ Polyglot Build-time Artifacts
 > stdlib ≈135, semantics 189/0/1; the "AI editor" is now pblang Studio + pbAI; OS-dev is now a goal.)*
 
 🟣 Μεγάλα Extras (Future)
-AI Sapphire Code Editor
+AI pblang Code Editor
 
 Πλήρης IDE με AI και τον mcp server μου, reverse engineering, blocks programming, cross-platform executables, project/framework management = δεν έχει ξεκινήσει
 
@@ -1125,7 +1125,7 @@ Self-Development / Απεξάρτηση από Rust
 
 Self-hosted parser σε .sapp = δεν υπάρχει
 
-Bootstrap compiler (Sapphire → bytecode σε Sapphire) = απαιτεί πρώτα structs/types
+Bootstrap compiler (pblang → bytecode σε pblang) = απαιτεί πρώτα structs/types
 
 Transpile-to-C = πρώτο ρεαλιστικό βήμα, δεν έγινε
 
@@ -1140,8 +1140,8 @@ Stdlib (~20 modules: http, json, crypto, db, graphics, tensor, quantum κ.ά.)	�
 Package manager (install + lockfile local)	✅ Μερικό
 Threads (VM-per-thread, channel, select)	✅ Υπάρχει
 CI (Linux + Windows GitHub Actions)	✅ Υπάρχει
-sapphire fmt (βασικό), sapphire lint, --doc, --dump-bytecode	✅ Υπάρχει
-sapphire bundle (portable folder)	✅ Υπάρχει
+pblang fmt (βασικό), pblang lint, --doc, --dump-bytecode	✅ Υπάρχει
+pblang bundle (portable folder)	✅ Υπάρχει
 Spec freeze v0.1 (docs/Spec_freeze.md)	✅ Υπάρχει
 io_timeout σε http/tcp/fs	✅ Υπάρχει
 Semantics suite 54/54 (βασικά tests)	✅ Περνούν
@@ -1149,11 +1149,11 @@ Semantics suite 54/54 (βασικά tests)	✅ Περνούν
 
 
 
-Based on my comprehensive exploration of the Sapphire codebase, here's a detailed overview of the current state and next development priorities:
+Based on my comprehensive exploration of the pblang codebase, here's a detailed overview of the current state and next development priorities:
 
 ## **Project Overview**
 
-**Sapphire** is a sophisticated scripting language implemented in Rust with the following architecture:
+**pblang** is a sophisticated scripting language implemented in Rust with the following architecture:
 - **Language**: Rust-based VM with parser, IR, bytecode execution
 - **Runtime**: Capability-based sandboxing with VmLimits and FfiPolicy
 - **Modules**: 20+ stdlib modules (http, json, crypto, db, graphics, tensor, quantum, etc.)
@@ -1186,8 +1186,8 @@ Based on my comprehensive exploration of the Sapphire codebase, here's a detaile
 - **7 failing semantics tests**: class sugar/auto_new, defer, match×2, db_migrations, http_router_middleware
 - **No TLS/HTTPS**: Only plain TCP available
 - **No LSP completion**: LSP exists but autocomplete/jump-to-definition not implemented
-- **No type system**: sapphire-typeck crate exists but is a stub
-- **No native executables**: sapphire bundle exists but single-binary native compile doesn't
+- **No type system**: pblang-typeck crate exists but is a stub
+- **No native executables**: pblang bundle exists but single-binary native compile doesn't
 
 ## **Key Files and Their Purposes**
 
@@ -1212,7 +1212,7 @@ Based on the codebase analysis, here are the highest-impact next steps:
 **Why**: This is the "multiplier" that unlocks everything else
 - Implement registry fetch/publish for hosted registries (http(s))
 - Extend lockfile v2 for cross-machine reproducibility
-- Add package imports like `@sapphire/http` and `github.com/user/repo`
+- Add package imports like `@pblang/http` and `github.com/user/repo`
 - Complete the package manager ecosystem
 
 ### **🎯 **HIGH PRIORITY** - Threads Implementation (2-3 weeks)**
@@ -1238,7 +1238,7 @@ Based on the codebase analysis, here are the highest-impact next steps:
 
 ### **🎯 **MEDIUM PRIORITY** - Type System (2-3 weeks)**
 **Why**: Foundation for self-hosting and better tooling
-- Implement sapphire-typeck crate
+- Implement pblang-typeck crate
 - Add struct/enum syntax
 - Create type checker for static analysis
 - Enable better LSP and IDE integration
@@ -1268,8 +1268,8 @@ The codebase is in an excellent state with a solid foundation. The main gaps are
 
 Έχω πλήρη εικόνα του project. Ορίστε μια ολοκληρωμένη ανάλυση:
 
-Πού βρίσκεται η Sapphire σήμερα
-Το Sapphire είναι μια γλώσσα προγραμματισμού σε φάση "powerful prototype / early-stage platform" — πιο mature από ένα απλό side project, αλλά όχι ακόμα production-ready για γενική χρήση.
+Πού βρίσκεται η pblang σήμερα
+Το pblang είναι μια γλώσσα προγραμματισμού σε φάση "powerful prototype / early-stage platform" — πιο mature από ένα απλό side project, αλλά όχι ακόμα production-ready για γενική χρήση.
 
 ✅ Τι έχει ήδη γίνει (Solid)
 Ο πυρήνας είναι γερά θεμελιωμένος :
@@ -1278,9 +1278,9 @@ VM core με bytecode, sandboxing, VmLimits, FfiPolicy, capability-based builtin
 
 ~20 stdlib modules: http, json, crypto, db, graphics, tensor, quantum, csv, ffi, κ.ά.
 
-Package manager: sapphire install με lockfile, semver resolution, HMAC verify, tarball
+Package manager: pblang install με lockfile, semver resolution, HMAC verify, tarball
 
-Tooling: sapphire fmt, lint, bundle, doc (HTML), --dump-bytecode, --call-graph
+Tooling: pblang fmt, lint, bundle, doc (HTML), --dump-bytecode, --call-graph
 
 Threading model: VM-per-thread + channels + select (σωστό safety model)
 
@@ -1292,7 +1292,7 @@ Semantics test suite: 54/54 βασικά tests περνούν (X)
 
 🔴 Κρίσιμες Εκκρεμότητες (Μπλοκάρουν Production)
 Κατηγορία	Κατάσταση
-Type system	sapphire-typeck crate = κενό stub, δεν υπάρχουν structs/enums/generics
+Type system	pblang-typeck crate = κενό stub, δεν υπάρχουν structs/enums/generics
 TLS/HTTPS	Μόνο plain TCP — κανένα production web app δεν δουλεύει χωρίς αυτό
 WebSocket frames	Μόνο upgrade handshake, όχι frame parsing
 7 failing semantics tests	class sugar/auto_new, defer, match×2, db_migrations, http_router_middleware
@@ -1300,9 +1300,9 @@ LSP completion	Το crate υπάρχει αλλά autocomplete/jump-to-def δε�
 🟠 Μεγάλα που Λείπουν (Core Platform)
 Τα τρία πράγματα που ξεκλειδώνουν όλα τα υπόλοιπα :
 
-Registry fetch/publish: sapphire install υπάρχει για local lockfile, αλλά registry server + @sapphire/http imports + publish = δεν υπάρχουν (μόνο design στο Registry_MVP.md)
+Registry fetch/publish: pblang install υπάρχει για local lockfile, αλλά registry server + @pblang/http imports + publish = δεν υπάρχουν (μόνο design στο Registry_MVP.md)
 
-Native executables: sapphire bundle = portable folder, αλλά single-binary (Stage A: bytecode+runtime σε ένα αρχείο, Stage B: LLVM/Cranelift backend) = δεν έχουν γίνει. Το Native_backend_notes.md υπάρχει (9KB) αλλά ο sapphire-llvm crate είναι stub
+Native executables: pblang bundle = portable folder, αλλά single-binary (Stage A: bytecode+runtime σε ένα αρχείο, Stage B: LLVM/Cranelift backend) = δεν έχουν γίνει. Το Native_backend_notes.md υπάρχει (9KB) αλλά ο pblang-llvm crate είναι stub
 
 Threads υλοποίηση: Design στο Threads.md είναι έτοιμο, αλλά spawn/join/channels δεν έχουν υλοποιηθεί
 
@@ -1318,7 +1318,7 @@ Polyglot build-time: Τα @rust{} / @python{} blocks εξάγονται ως dat
 Self-hosting / απεξάρτηση από Rust: Αδύνατο χωρίς πρώτα structs + type system. Ρεαλιστικό πρώτο βήμα: transpile-to-C
 
 Συνολική Εικόνα
-Η Sapphire έχει εξαιρετική αρχιτεκτονική πρόβλεψη — το modular crate design (sapphire-core, sapphire-vm, sapphire-compiler, sapphire-ir, sapphire-lsp, κ.ά.) δείχνει ότι τα μεγάλα goals ήταν στο σχέδιο από την αρχή . Η σωστή σειρά για να "ξεκλειδώσουν" όλα τα υπόλοιπα είναι: Registry fetch/publish → Threads υλοποίηση → Native executables (Stage A) → Type system (structs/typeck) — χωρίς αυτά τα τέσσερα, AI/quantum/editor/self-hosting δεν μπορούν να χτιστούν σωστά.
+Η pblang έχει εξαιρετική αρχιτεκτονική πρόβλεψη — το modular crate design (pblang-core, pblang-vm, pblang-compiler, pblang-ir, pblang-lsp, κ.ά.) δείχνει ότι τα μεγάλα goals ήταν στο σχέδιο από την αρχή . Η σωστή σειρά για να "ξεκλειδώσουν" όλα τα υπόλοιπα είναι: Registry fetch/publish → Threads υλοποίηση → Native executables (Stage A) → Type system (structs/typeck) — χωρίς αυτά τα τέσσερα, AI/quantum/editor/self-hosting δεν μπορούν να χτιστούν σωστά.
 
 Prepared using GPT-5.4 Thinking
 
@@ -1355,7 +1355,7 @@ What realistically happens with “put in everything.”
 
 What we can do correctly is build it as a platform: stable runtime/IR + package manager + FFI + stdlib + tooling, so that libraries can then “plug in.”
 
-Good news: right now we already have modules with export, try/catch, arrays/maps, JSON/HTTP client, quantum QASM emitter, type annotations + typechecker, C ABI (sapphire-ffi), and optimizer hook.
+Good news: right now we already have modules with export, try/catch, arrays/maps, JSON/HTTP client, quantum QASM emitter, type annotations + typechecker, C ABI (pblang-ffi), and optimizer hook.
 
 So the “foundation” exists.
 
@@ -1381,9 +1381,9 @@ Data model: arrays/maps (you have them), but for serious AI you need typed buffe
 
 Inference API: onnx_infer right now is a stub (correctly), and the right way is for it to become either:
 
-(A) through an FFI plugin (dll/so) loaded by Sapphire, or
+(A) through an FFI plugin (dll/so) loaded by pblang, or
 
-(B) through host embedding (your application calls Sapphire and provides “capabilities”).
+(B) through host embedding (your application calls pblang and provides “capabilities”).
 
 Quantum-ready (in practice).
 
@@ -1399,13 +1399,13 @@ exec + JSON protocol, or
 
 native simulator library binding.
 
-“To build an operating system (OS) with Sapphire.”
+“To build an operating system (OS) with pblang.”
 
 That is another level: it needs a bare-metal target, your own runtime without std, allocator, drivers, ABI, linker scripts.
 
 A realistic path:
 
-first Sapphire as systems scripting (tooling, build scripts, userland),
+first pblang as systems scripting (tooling, build scripts, userland),
 
 then compiler backend (LLVM/Cranelift) or transpile to C/Rust,
 
@@ -1417,7 +1417,7 @@ and much later kernel work.
 > pblang compiler). `stdlib/systems.sapp` already sketches the OS-primitive API (asm/port/MMIO/
 > interrupts/paging/GDT/multiboot) as stubs.
 
-“To write any language in the same file together with Sapphire.”
+“To write any language in the same file together with pblang.”
 
 That only works if we define it as a polyglot build system, not as a “magic parser.”
 
@@ -1440,7 +1440,7 @@ builds them into artifacts (dll/so/wasm),
 
 loads them with a standard FFI ABI,
 
-and exposes them to Sapphire as a module namespace.
+and exposes them to pblang as a module namespace.
 
 Option 2 — Runtime FFI (load libraries).
 
@@ -1452,7 +1452,7 @@ The next “correct” step to make it ultra-powerful (and unlock libraries/tool
 
 If we continue, the highest leverage is:
 
-Package manager + sapphire.toml + module search path + lockfile.
+Package manager + pblang.toml + module search path + lockfile.
 
 Stdlib web server (TCP/HTTP) + filesystem/path utils.
 
@@ -1466,7 +1466,7 @@ Tell me which one you want us to start with first: package manager or web server
 
 Is it production ready as a programming language?
 
-Not yet—with the elements visible in your code, Sapphire is in a “powerful prototype / early-stage runtime” phase, not a production-ready language for general use.
+Not yet—with the elements visible in your code, pblang is in a “powerful prototype / early-stage runtime” phase, not a production-ready language for general use.
 
 Why you still can’t call it production-ready.
 
@@ -1498,11 +1498,11 @@ Production for personal/internal tools: it can work, if you control the environm
 
 Production for third parties / critical workloads: not yet, until you “freeze” the spec and build a serious test/compatibility & safety story.
 
-If you tell me what you mean by “production” (for example scripting for your own projects, or giving it to others as a runtime/SDK), I can make you a concrete “Sapphire v0.1 → v1.0” checklist with milestones (spec, stability guarantees, tests, CI, perf, security).
+If you tell me what you mean by “production” (for example scripting for your own projects, or giving it to others as a runtime/SDK), I can make you a concrete “pblang v0.1 → v1.0” checklist with milestones (spec, stability guarantees, tests, CI, perf, security).
 
 Prepared using GPT-5.2.
 
-If you tell me what you mean by “production” (for example scripting for your own projects, or giving it to others as a runtime/SDK), I can make you a concrete “Sapphire v0.1 → v1.0” checklist with milestones (spec, stability guarantees, tests, CI, perf, security).
+If you tell me what you mean by “production” (for example scripting for your own projects, or giving it to others as a runtime/SDK), I can make you a concrete “pblang v0.1 → v1.0” checklist with milestones (spec, stability guarantees, tests, CI, perf, security).
 
 Yes.
 
@@ -1534,7 +1534,7 @@ Stability policy: name what you consider a breaking change (syntax, stdlib built
 
 For v0.x you can say “breaking allowed,” but you want versioning + changelog.
 
-Lockfile contract: document what sapphire.lock guarantees (for example pinned versions, reproducible resolution) and add a CI test “lockfile reproducibility.”
+Lockfile contract: document what pblang.lock guarantees (for example pinned versions, reproducible resolution) and add a CI test “lockfile reproducibility.”
 
 v0.4: Security hardening (especially because you have OS/network).
 
@@ -1590,7 +1590,7 @@ Both.
 
 Thinking.
 
-Adjusting Sapphire’s checklist roadmap for targeting it both as an embedded scripting language and as a standalone general-purpose language.
+Adjusting pblang’s checklist roadmap for targeting it both as an embedded scripting language and as a standalone general-purpose language.
 
 Searching.
 
@@ -1604,7 +1604,7 @@ builtins module.
 
 Module exports.
 
-sapphire-pm.
+pblang-pm.
 
 generate_lockfile.
 
@@ -1643,9 +1643,9 @@ Goal: stable, minimal runtime that can be embedded into Rust apps/games/tools wi
 Architecture: 3 crates.
 
 text
-sapphire-core/        # Parser, compiler, bytecode VM (zero OS deps)
-sapphire-stdlib/      # Builtins (fs/net/http/sqlite/ffi) — optional features
-sapphire-cli/         # REPL, --check, --doc, --lock
+pblang-core/        # Parser, compiler, bytecode VM (zero OS deps)
+pblang-stdlib/      # Builtins (fs/net/http/sqlite/ffi) — optional features
+pblang-cli/         # REPL, --check, --doc, --lock
 Basic deliverables.
 
 Stable VmHost trait (embedding API):
@@ -1665,7 +1665,7 @@ pub trait VmHost {
 Builtin registry with conditional compilation:
 
 rust
-// sapphire-stdlib/src/lib.rs
+// pblang-stdlib/src/lib.rs
 pub struct StdlibConfig {
     pub fs: bool,
     pub net: bool,
@@ -1704,7 +1704,7 @@ Cross-platform CI: Windows (MSVC/GNU), Linux, macOS.
 
 Phase 2: Standalone + Package Manager (v0.4–0.6).
 
-Goal: turn Sapphire into a general-purpose language with an ecosystem (packages, lockfile, registry).
+Goal: turn pblang into a general-purpose language with an ecosystem (packages, lockfile, registry).
 
 Package system architecture.
 
@@ -1715,9 +1715,9 @@ text
 let m = import("./mylib.sap");
 
 # Package imports (new)
-let http = import("@sapphire/http");  # from registry
+let http = import("@pblang/http");  # from registry
 let mylib = import("github.com/user/repo");  # git source
-sapphire.toml manifest (you already have --lock):
+pblang.toml manifest (you already have --lock):
 
 text
 [package]
@@ -1725,15 +1725,15 @@ name = "my-app"
 version = "0.1.0"
 
 [dependencies]
-"@sapphire/http" = "1.2.0"
+"@pblang/http" = "1.2.0"
 "github.com/user/lib" = { git = "...", rev = "abc123" }
-Lockfile format (sapphire.lock generation already exists):
+Lockfile format (pblang.lock generation already exists):
 
 json
 {
   "packages": [
     {
-      "name": "@sapphire/http",
+      "name": "@pblang/http",
       "version": "1.2.0",
       "checksum": "sha256:...",
       "source": "registry+https://..."
@@ -1742,13 +1742,13 @@ json
 }
 Package registry (you can use GitHub Releases or a simple HTTP server initially):
 
-sapphire install → download + extract + update lockfile.
+pblang install → download + extract + update lockfile.
 
-sapphire publish → package tarball + upload.
+pblang publish → package tarball + upload.
 
 Stdlib split: core vs community.
 
-Core stdlib (@sapphire/core): fs/net/json/base64 (ships with CLI, always available).
+Core stdlib (@pblang/core): fs/net/json/base64 (ships with CLI, always available).
 
 Community packages: http client/server, sqlite wrappers, crypto, data structures (from registry).
 
@@ -1798,12 +1798,12 @@ Tooling roadmap.
 Package manager commands:
 
 bash
-sapphire init          # creates sapphire.toml
-sapphire install       # fetch deps + generate lockfile
-sapphire build         # compile project
-sapphire run main.sap  # execute with deps
-sapphire test          # run tests (convention: tests/*.sap)
-sapphire publish       # upload package to registry
+pblang init          # creates pblang.toml
+pblang install       # fetch deps + generate lockfile
+pblang build         # compile project
+pblang run main.sap  # execute with deps
+pblang test          # run tests (convention: tests/*.sap)
+pblang publish       # upload package to registry
 Language server (LSP):
 
 Autocomplete: functions, modules, builtins.
@@ -1815,14 +1815,14 @@ Inline diagnostics (parser/typechecker errors).
 Formatter/linter:
 
 bash
-sapphire fmt *.sap    # auto-format
-sapphire lint *.sap   # style warnings
+pblang fmt *.sap    # auto-format
+pblang lint *.sap   # style warnings
 Documentation generator.
 
 --doc already exists—extend it into an HTML generator (like Rustdoc):
 
 bash
-sapphire doc --html   # generates ./docs/ with HTML for exports/functions
+pblang doc --html   # generates ./docs/ with HTML for exports/functions
 Practical “next step” (this week).
 
 To make the split without breaking existing code, do this:
@@ -1858,7 +1858,7 @@ Make an embedding example (1 day):
 
 rust
 // examples/embed.rs
-use sapphire::{VM, StdlibConfig};
+use pblang::{VM, StdlibConfig};
 
 fn main() {
     let mut vm = VM::with_stdlib(StdlibConfig {
@@ -1901,7 +1901,7 @@ Core runtime | v0.2 | 2–3 weeks | Crate split, VmHost trait, stdlib config.
 
 Tests & CI | v0.3 | 1–2 weeks | Golden tests, cross-platform CI. 
 
-Package system | v0.4 | 3–4 weeks | sapphire install, lockfile, registry client. 
+Package system | v0.4 | 3–4 weeks | pblang install, lockfile, registry client. 
 
 Sandboxing | v0.5 | 2–3 weeks | Resource limits, capability checks. 
 
@@ -1971,11 +1971,11 @@ If you want, the next step can be package manager, golden tests, or LSP/formatte
 
 All related tests pass (golden, sandbox).
 
-If you want, the next step can be: lockfile reproducibility test in CI, FFI allowlist (FfiPolicy), or tooling (sapphire init/install, doc --html).
+If you want, the next step can be: lockfile reproducibility test in CI, FFI allowlist (FfiPolicy), or tooling (pblang init/install, doc --html).
 
 All related tests pass (sandbox, lockfile_repro).
 
-If you want, the next step can be: LSP improvements, formatter (sapphire fmt), or stdlib/graphics expansion according to the “graphics and library enrichment” in Future_plans.
+If you want, the next step can be: LSP improvements, formatter (pblang fmt), or stdlib/graphics expansion according to the “graphics and library enrichment” in Future_plans.
 
 Note: the test tests/http_server.rs (http_server_serve_once_handles_one_request) fails with “no addr: Timeout”; this is an existing issue (network/listener) and is not related to these changes.
 
@@ -1989,13 +1989,13 @@ From Future_plans.md and Report.md these have not been done yet (or are only par
 
 Package manager & registry (Phase 2).
 
-sapphire install — downloading dependencies from a registry + updating lockfile (right now only local deps).
+pblang install — downloading dependencies from a registry + updating lockfile (right now only local deps).
 
-sapphire publish — uploading a package to a registry.
+pblang publish — uploading a package to a registry.
 
 Package registry — server/service for packages.
 
-Import from registry — for example import("@sapphire/http"), import("github.com/user/repo") (right now only local paths).
+Import from registry — for example import("@pblang/http"), import("github.com/user/repo") (right now only local paths).
 
 Web stack (completion).
 
@@ -2031,7 +2031,7 @@ Implementation — spawn/join or channels (there is only design in docs/Threads.
 
 Executables.
 
-Native single-binary compile — one .exe/.bin without needing the sapphire binary next to it (right now there is only sapphire bundle = portable folder).
+Native single-binary compile — one .exe/.bin without needing the pblang binary next to it (right now there is only pblang bundle = portable folder).
 
 Production / v0.2–v1.0.
 
@@ -2049,19 +2049,19 @@ Embedding API — completed: documentation in docs/Embedding.md (VmHost, VM::new
 
 Architecture (crate split).
 
-3 crates — sapphire-core, sapphire-stdlib, sapphire-cli (right now monolithic CLI + VM).
+3 crates — pblang-core, pblang-stdlib, pblang-cli (right now monolithic CLI + VM).
 
 Refactor builtins into separate modules (fs.rs, net.rs, etc.) — canceled for now.
 
 Tooling (further).
 
-sapphire fmt — has trim, spacing around operators (+ - * / == != < > <= >=), indent by brace depth (4 spaces), final newline; further rules (line length, etc.) in the future.
+pblang fmt — has trim, spacing around operators (+ - * / == != < > <= >=), indent by brace depth (4 spaces), final newline; further rules (line length, etc.) in the future.
 
 LSP — autocomplete, jump-to-definition (there is an LSP, but the depth of these features is not mentioned as complete).
 
 From the end of Future_plans (broader wants).
 
-Smart AI Sapphire code editor — your own editor with the capabilities of other editors + more.
+Smart AI pblang code editor — your own editor with the capabilities of other editors + more.
 
 Reverse engineering — capabilities/tools for reverse engineering.
 
@@ -2089,7 +2089,7 @@ What remains (from Report / Future_plans).
 
 Topic | Status. 
 
-Package manager | sapphire install (lockfile) exists; registry fetch/publish not yet. 
+Package manager | pblang install (lockfile) exists; registry fetch/publish not yet. 
 
 Web | HTTP server stdlib exists; TLS, full orchestration/timeouts not yet. 
 
@@ -2097,9 +2097,9 @@ AI/Quantum | Stub/bridges not yet.
 
 Threads | Design in Threads.md; implementation not yet. 
 
-Executables | sapphire bundle exists; native single-binary not yet. 
+Executables | pblang bundle exists; native single-binary not yet. 
 
-sapphire fmt | Exists (trim, spacing around operators, indent by braces, --max-line-length=N for optional line wrap); further rules in the future. 
+pblang fmt | Exists (trim, spacing around operators, indent by braces, --max-line-length=N for optional line wrap); further rules in the future. 
 
 LSP | Exists; autocomplete/jump-to-def in depth not yet. 
 
@@ -2121,7 +2121,7 @@ tests/fmt.rs: regression for fmt (operator spacing, strings unchanged).
 
 Next steps (from Future_plans).
 
-Phase 4: sapphire fmt has minimal formatting, spacing around operators (+ - * / == != < > <= >=), indent by brace depth (4 spaces), --max-line-length=N for optional line wrap; further rules in the future; lint exists; build was implemented.
+Phase 4: pblang fmt has minimal formatting, spacing around operators (+ - * / == != < > <= >=), indent by brace depth (4 spaces), --max-line-length=N for optional line wrap; further rules in the future; lint exists; build was implemented.
 
 Spec_freeze.md and Registry_MVP.md were added.
 
@@ -2131,11 +2131,11 @@ Graphics/stdlib: HSL was implemented (hsl); further shapes/helpers if needed.
 
 Threads: design in docs/Threads.md; spawn/join or channels implementation in the future.
 
-Executables: sapphire bundle was implemented (portable folder); native single-binary compile in the future.
+Executables: pblang bundle was implemented (portable folder); native single-binary compile in the future.
 
-Package manager: sapphire install was implemented (lockfile generation); registry fetch/publish in the future.
+Package manager: pblang install was implemented (lockfile generation); registry fetch/publish in the future.
 
-Reverse engineering: sapphire --dump-bytecode was implemented (disassembly); further tools in the future.
+Reverse engineering: pblang --dump-bytecode was implemented (disassembly); further tools in the future.
 
 v1.0: Spec freeze, conformance suite; Embedding API documented in docs/Embedding.md (VmHost, lifecycle).
 
@@ -2153,7 +2153,7 @@ With the repo on GitHub, the workflow will run automatically on next push/PR.
 
 Next step: fixes for the 7 failing semantics tests or investigation of upvalues in the db transaction.
 
-Add the capability to create executable files for Windows/Linux and create a smart AI Sapphire code editor with all the capabilities of the other code editors and even more capabilities, and make it powerful and efficient especially on memory, add all thread capabilities, add all reverse engineering capabilities, strengthen OOP and functional programming, add the ability to create or import or export or delete or edit a project and add the ability to create or import or export or delete or edit a framework.
+Add the capability to create executable files for Windows/Linux and create a smart AI pblang code editor with all the capabilities of the other code editors and even more capabilities, and make it powerful and efficient especially on memory, add all thread capabilities, add all reverse engineering capabilities, strengthen OOP and functional programming, add the ability to create or import or export or delete or edit a project and add the ability to create or import or export or delete or edit a framework.
 
 Graphics enrichment and, more generally, of the whole library and more tools, strengthening/maintenance of the current capabilities and features, simplification, ease, security, integration of artificial intelligence (AI), optimization, dynamism, smartness, multiplicity, cross-platform, multilinguality in all programming languages and frameworks and tools, very good testing everywhere, (without errors, warnings, memory-leaks, buffer-overflows and others!!!), ready for continued support from rust --> pblang, efficiency from the source all the way to the highest layers at the end you will update AAP\pl-dev\pblang\docs\Report.md.
 
@@ -2161,7 +2161,7 @@ Graphics enrichment and, more generally, of the whole library and more tools, st
 
 /
 
-Based on docs/Future_plans.md and docs/Report.md, your goal is “Sapphire as a platform” (language + runtime + tooling + ecosystem) that covers embedded scripting and standalone general-purpose use, with web/AI/quantum/polyglot, threads, reverse engineering, executables, editor, and production-hardening.
+Based on docs/Future_plans.md and docs/Report.md, your goal is “pblang as a platform” (language + runtime + tooling + ecosystem) that covers embedded scripting and standalone general-purpose use, with web/AI/quantum/polyglot, threads, reverse engineering, executables, editor, and production-hardening.
 
 Where you are already strong (and why this is the right foundation).
 
@@ -2175,13 +2175,13 @@ What should be done first (highest leverage for future plans).
 
 Package registry & publish/fetch: in the Report you mention that you have install for lockfile generation, but not registry fetch/publish; this is the multiplier that unlocks the “endless libraries/tools” you ask for in Future_plans.
 
-Native executables: you already have sapphire bundle (portable folder), but Future_plans asks for single-binary executables for Windows/Linux; this needs a compiler backend or a stable packaging story (at least “embed runtime + bytecode + assets” in one file).
+Native executables: you already have pblang bundle (portable folder), but Future_plans asks for single-binary executables for Windows/Linux; this needs a compiler backend or a stable packaging story (at least “embed runtime + bytecode + assets” in one file).
 
 Threads implementation: you have a design doc (docs/Threads.md) but not implementation; to move forward in web servers, tooling, editor integrations and performance in general, you need to define a concurrency model (VM-per-thread; channels; shared-state policy).
 
 How to break the roadmap into realistic milestones.
 
-Milestone A (Ecosystem): “Registry MVP” with sapphire publish + sapphire install working from a simple HTTP/GitHub Releases backend, with checksums in the lockfile (extending the already existing lockfile contract/repro tests).
+Milestone A (Ecosystem): “Registry MVP” with pblang publish + pblang install working from a simple HTTP/GitHub Releases backend, with checksums in the lockfile (extending the already existing lockfile contract/repro tests).
 
 Milestone B (Executables): “Bytecode bundle executable” (stage 1) where the CLI produces an artifact that runs without a project folder, and later stage 2 “native compile” (LLVM/Cranelift or transpile) as described in Future_plans.
 
@@ -2207,7 +2207,7 @@ Prepared using GPT-5.2.
 
 With all the information you have, choose the best options with emphasis on the combination of things and generally on the best perfection that can be achieved no matter how long it takes to ensure my plans.
 
-To “ensure” your plans (web + AI/quantum + polyglot + editor + executables + threads + production) without ending up with a chaotic monolith, the best option is to lock Sapphire as a layered platform: small, stable core + extensions/packages + tools on top of it.
+To “ensure” your plans (web + AI/quantum + polyglot + editor + executables + threads + production) without ending up with a chaotic monolith, the best option is to lock pblang as a layered platform: small, stable core + extensions/packages + tools on top of it.
 
 The best strategy (combination that scales).
 
@@ -2285,7 +2285,7 @@ Architecture choice that wins long-term.
 
 Registry: content-addressed + versioned, without breaking the lockfile.
 
-Today sapphire.lock already pins dependencies with sha256 of content and ties it to a hash of sapphire.toml, but it is path-based and not cross-machine reproducible.
+Today pblang.lock already pins dependencies with sha256 of content and ties it to a hash of pblang.toml, but it is path-based and not cross-machine reproducible.
 
 The best evolution is: keep the content hash as the “core truth” and add versions/registry metadata on top of it (name/version/source/checksum), so you have both reproducibility and ecosystem.
 
@@ -2307,7 +2307,7 @@ spawn(fn) -> handle, join(handle) -> value|error.
 
 channel() -> ch with send/recv.
 
-Data passing: only “Send-safe” Sapphire values (numbers/bools/strings/arrays/maps by deep copy) or serialize to bytes/JSON.
+Data passing: only “Send-safe” pblang values (numbers/bools/strings/arrays/maps by deep copy) or serialize to bytes/JSON.
 
 That avoids shared RC structures.
 
@@ -2315,7 +2315,7 @@ And of course capability-gating: allow_spawn (or through existing capabilities m
 
 Executables: 2 stages (so you do not block for years on a compiler backend).
 
-In the Report you already have sapphire bundle (portable folder), but Future_plans asks for single-binary executables.
+In the Report you already have pblang bundle (portable folder), but Future_plans asks for single-binary executables.
 
 The best strategy is “2-stage shipping”:
 
@@ -2347,15 +2347,15 @@ Start with Registry MVP + Lockfile v2 design, because this is the “center of g
 
 Do you want us to do it with a “hard” 2-week scope for Registry MVP (index format, fetch/install, lockfile changes, tests), or do you prefer 4 weeks so publish is included from the beginning.
 
-What mainly remains are the “big” things that turn Sapphire from a foundation into a full platform (ecosystem/registry, threads, executables) and then the heavy ones (AI/quantum bridges, polyglot build, editor, reverse-engineering suite).
+What mainly remains are the “big” things that turn pblang from a foundation into a full platform (ecosystem/registry, threads, executables) and then the heavy ones (AI/quantum bridges, polyglot build, editor, reverse-engineering suite).
 
 Ecosystem / Registry (highest leverage).
 
-Registry fetch/publish (real implementation): the Report explicitly says sapphire install exists as lockfile generation, but registry fetch/publish is “future.”
+Registry fetch/publish (real implementation): the Report explicitly says pblang install exists as lockfile generation, but registry fetch/publish is “future.”
 
 Lockfile v2 in practice (not just design): you already have the design in docs/Registry_MVP.md, but it still needs to be applied in the resolver/CLI and “locked” with tests.
 
-Package imports like @sapphire/http / git sources: described in the registry design, but they do not seem to be implemented.
+Package imports like @pblang/http / git sources: described in the registry design, but they do not seem to be implemented.
 
 Threads (concurrency).
 
@@ -2365,7 +2365,7 @@ Policy for shared state/VM-per-thread and limits/capabilities for spawned VMs: t
 
 Executables (Windows/Linux).
 
-Single-binary / native compile: right now you have sapphire bundle (portable folder) and the Report says “native single-binary compile” is future.
+Single-binary / native compile: right now you have pblang bundle (portable folder) and the Report says “native single-binary compile” is future.
 
 Packaging story with deps + lockfile + bytecode as “one artifact” (stage 1), and later backend (LLVM/Cranelift or transpile) as described in Future_plans.
 
@@ -2385,7 +2385,7 @@ Closing the failing semantics tests (30/37 → 37/37): the Report records that 7
 
 Further conformance/perf/security: Future_plans mentions the need for a serious test suite/fuzzing/benchmarks and a “production story” because of the large builtin surface (fs/net/http/sqlite/ffi/exec).
 
-AI Sapphire code editor like Delphi, Android Studio, VSCode, QT Creator but better, with creation of executables on all platforms-operating systems and support, reverse engineering and cyber/ethical security tools generally, capability for parallel, serial and pseudo-parallel programming, examples, pseudocode, capability for blocks programming, capability to convert any file into another file and edit any file, OS-building, as well as “project/framework create/import/export/edit/delete,” is explicitly in the additional “wants” in Future_plans, but these are separate large projects that come after you stabilize ecosystem + concurrency + shipping, compatibility with many tools and frameworks, libraries even from other programming languages.
+AI pblang code editor like Delphi, Android Studio, VSCode, QT Creator but better, with creation of executables on all platforms-operating systems and support, reverse engineering and cyber/ethical security tools generally, capability for parallel, serial and pseudo-parallel programming, examples, pseudocode, capability for blocks programming, capability to convert any file into another file and edit any file, OS-building, as well as “project/framework create/import/export/edit/delete,” is explicitly in the additional “wants” in Future_plans, but these are separate large projects that come after you stabilize ecosystem + concurrency + shipping, compatibility with many tools and frameworks, libraries even from other programming languages.
 
 See the project so far and tell me if it is ready for production and if it is ready for “self-development” and independence from Rust.
 
@@ -2419,9 +2419,9 @@ Category | Problem.
 
 TLS/HTTPS | Does not exist — only plain TCP. No production web app can run without this. 
 
-Type system | sapphire-typeck crate exists as a stub — there is no static type checking. 
+Type system | pblang-typeck crate exists as a stub — there is no static type checking. 
 
-LSP | sapphire-lsp crate exists but has not been implemented — limited developer experience. 
+LSP | pblang-lsp crate exists but has not been implemented — limited developer experience. 
 
 Native binary | docs/Native_backend_notes.md is empty — all fields “To be filled.” 
 
@@ -2439,27 +2439,27 @@ Partially — and this is the most interesting part.
 
 What “self-development” means here.
 
-Self-development = writing the Sapphire compiler/VM/tooling in Sapphire instead of Rust.
+Self-development = writing the pblang compiler/VM/tooling in pblang instead of Rust.
 
 This requires three things:
 
-Bootstrap compiler — a Sapphire→bytecode compiler written in Sapphire.
+Bootstrap compiler — a pblang→bytecode compiler written in pblang.
 
-Self-hosted VM — the interpreter written in Sapphire.
+Self-hosted VM — the interpreter written in pblang.
 
 Independence from Rust — cargo build should not be required.
 
 What already exists that helps.
 
-sapphire-compiler crate exists separately from sapphire-vm — good separation architecture.
+pblang-compiler crate exists separately from pblang-vm — good separation architecture.
 
-sapphire-ir crate exists — separate IR layer, a basic prerequisite for self-hosting.
+pblang-ir crate exists — separate IR layer, a basic prerequisite for self-hosting.
 
-sapphire-llvm crate exists — native backend groundwork, still a stub.
+pblang-llvm crate exists — native backend groundwork, still a stub.
 
-Sapphire already runs the stdlib modules written in .sapp — so it already has self-referential execution.
+pblang already runs the stdlib modules written in .sapp — so it already has self-referential execution.
 
-FFI layer (sapphire-ffi) — can call native libraries.
+FFI layer (pblang-ffi) — can call native libraries.
 
 --dump-bytecode exists — you can see what the compiler produces.
 
@@ -2469,33 +2469,33 @@ Requirement | Status.
 
 Self-hosted parser | The parser is Rust-only — there is not even a skeleton in .sapp. 
 
-Data types | Sapphire does not have struct/enum — impossible to write a compiler without these. 
+Data types | pblang does not have struct/enum — impossible to write a compiler without these. 
 
-Static types | sapphire-typeck is empty — without types the self-hosted compiler will be extremely fragile. 
+Static types | pblang-typeck is empty — without types the self-hosted compiler will be extremely fragile. 
 
-Native binary output | sapphire-llvm and Native_backend_notes.md are empty stubs. 
+Native binary output | pblang-llvm and Native_backend_notes.md are empty stubs. 
 
 File I/O depth | The compiler needs deep FS access — it exists but has not been tested at compiler scale. 
 
-sapphire-lsp | Empty crate — without LSP it cannot be written comfortably in Sapphire. 
+pblang-lsp | Empty crate — without LSP it cannot be written comfortably in pblang. 
 
 The Reality.
 
-The project has excellent architectural foresight — the crates sapphire-ir, sapphire-compiler, sapphire-llvm show that the self-hosting goal was in the plan from the beginning.
+The project has excellent architectural foresight — the crates pblang-ir, pblang-compiler, pblang-llvm show that the self-hosting goal was in the plan from the beginning.
 
 However, there is one critical gap: the language still does not have the language features (structs, enums, generics, static types) that you need to write compiler-level code in it.
 
 The roadmap toward self-development is:
 
-Now → sapphire-typeck (type checker) + struct/enum syntax.
+Now → pblang-typeck (type checker) + struct/enum syntax.
 
-Then → sapphire-lsp completion (developer UX to write Sapphire in Sapphire).
+Then → pblang-lsp completion (developer UX to write pblang in pblang).
 
-Then → sapphire-llvm / transpile-to-C first slice (N2).
+Then → pblang-llvm / transpile-to-C first slice (N2).
 
 Finally → self-hosted parser in .sapp, bootstrap build.
 
-For independence from Rust specifically: the most realistic first step is transpile-to-C (not direct LLVM) — you generate C from Sapphire bytecode, compile it with gcc/clang, and then you do not need the Rust toolchain to run Sapphire apps.
+For independence from Rust specifically: the most realistic first step is transpile-to-C (not direct LLVM) — you generate C from pblang bytecode, compile it with gcc/clang, and then you do not need the Rust toolchain to run pblang apps.
 
 But the VM will remain in Rust for a long time — that is logical and correct.
 
@@ -2505,9 +2505,9 @@ I have enough picture.
 
 Here is the full, honest analysis:
 
-OS Development with Sapphire — The Truth.
+OS Development with pblang — The Truth.
 
-Sapphire cannot be used for OS development today, and it is not even close to that.
+pblang cannot be used for OS development today, and it is not even close to that.
 
 This is not criticism — it is simply the nature of what “OS development” means.
 
@@ -2515,7 +2515,7 @@ What an OS Language Needs.
 
 To write an OS kernel/drivers in a language, without another language, you need these essentials:
 
-Requirement | Sapphire today. 
+Requirement | pblang today. 
 
 Bare-metal execution — runs without an OS underneath | No, it runs on top of a Rust VM, on top of an OS. 
 
@@ -2531,7 +2531,7 @@ Deterministic memory layout — structs with padding control, #[repr(C)] | No, t
 
 Static allocation — stack-only, no heap option | No, values are always heap-allocated. 
 
-Native binary — produces machine code directly | No, sapphire-llvm is an empty stub. 
+Native binary — produces machine code directly | No, pblang-llvm is an empty stub. 
 
 No runtime overhead — zero-cost abstractions | No, interpreter with boxed values. 
 
@@ -2541,17 +2541,17 @@ Linker control — custom linker scripts | No, it does not exist.
 
 The Radical Architectural Contradiction.
 
-The basic problem is not “features are missing” — it is that Sapphire was designed with the opposite philosophical model from what OS development needs:
+The basic problem is not “features are missing” — it is that pblang was designed with the opposite philosophical model from what OS development needs:
 
-Sapphire = managed, sandboxed, capability-gated VM.
+pblang = managed, sandboxed, capability-gated VM.
 
 OS development = unmanaged, bare-metal, total hardware control.
 
-VmLimits, sandboxing, FfiPolicy — the things that make Sapphire safe for applications — are exactly the things that make it impossible for OS development.
+VmLimits, sandboxing, FfiPolicy — the things that make pblang safe for applications — are exactly the things that make it impossible for OS development.
 
 An OS kernel must have unlimited access to the hardware.
 
-In addition, vm.rs is 200KB of Rust code — the entire Sapphire world lives inside it.
+In addition, vm.rs is 200KB of Rust code — the entire pblang world lives inside it.
 
 There is no way to “get outside” that sandbox to speak directly to hardware.
 
@@ -2567,13 +2567,13 @@ Zig | Yes | Freestanding, comptime, inline asm.
 
 C++ | Yes (hard) | With -ffreestanding, no STL. 
 
-Sapphire | No | Interpreter on top of Rust on top of OS. 
+pblang | No | Interpreter on top of Rust on top of OS. 
 
 What It Would Need to Become Possible (theoretically).
 
 It is technically possible but it requires a completely new layer — essentially a new language:
 
-sapphire-llvm to be fully implemented → native binary output.
+pblang-llvm to be fully implemented → native binary output.
 
 #[no_std] mode → freestanding compilation without OS.
 
@@ -2593,13 +2593,13 @@ We are talking about years of work.
 
 The Practical Conclusion.
 
-Sapphire has a clear identity: application-level scripting/systems language with strong stdlib and safe concurrency.
+pblang has a clear identity: application-level scripting/systems language with strong stdlib and safe concurrency.
 
 That is valuable.
 
 OS development is a completely different world that requires different DNA in the language from the ground up.
 
-If the goal is OS-level work, Sapphire can serve as a high-level scripting layer on top of an OS (shell scripts, system automation, userspace tools) — but not for the kernel/drivers themselves.
+If the goal is OS-level work, pblang can serve as a high-level scripting layer on top of an OS (shell scripts, system automation, userspace tools) — but not for the kernel/drivers themselves.
 
 Prepared using GPT-5.4 Thinking.
 
@@ -2609,7 +2609,7 @@ I have the full picture.
 
 Below is the detailed list of pending items based on the whole project:
 
-Pending Sapphire Items — Full Analysis.
+Pending pblang Items — Full Analysis.
 
 I have scanned the repo, docs/Future_plans.md and docs/Report.md.
 
@@ -2619,9 +2619,9 @@ Critical (blocks Production).
 
 Type System.
 
-sapphire-typeck crate exists but is an empty stub — there is no static type checking.
+pblang-typeck crate exists but is an empty stub — there is no static type checking.
 
-There are no struct / enum / generics — impossible to write compiler-level code in Sapphire.
+There are no struct / enum / generics — impossible to write compiler-level code in pblang.
 
 TLS / HTTPS.
 
@@ -2639,9 +2639,9 @@ Large Pending Items (Core Platform).
 
 Package Registry — Fetch/Publish.
 
-sapphire install exists for lockfile generation, but registry fetch/publish does not exist.
+pblang install exists for lockfile generation, but registry fetch/publish does not exist.
 
-Package imports like @sapphire/http or github.com/user/repo have not been implemented.
+Package imports like @pblang/http or github.com/user/repo have not been implemented.
 
 Registry server: only a design doc (docs/Registry_MVP.md), no server.
 
@@ -2653,9 +2653,9 @@ Policy for shared state/VM-per-thread and limits/capabilities for spawned VMs: o
 
 Native Executables (Windows/Linux).
 
-sapphire bundle = portable folder, but single-binary native compile does not exist.
+pblang bundle = portable folder, but single-binary native compile does not exist.
 
-sapphire-llvm crate = empty stub, docs/Native_backend_notes.md = empty.
+pblang-llvm crate = empty stub, docs/Native_backend_notes.md = empty.
 
 Stage A: “bytecode + runtime in one file” — not done.
 
@@ -2665,13 +2665,13 @@ Important (Ecosystem & DX).
 
 LSP.
 
-sapphire-lsp crate exists but autocomplete, jump-to-definition have not been implemented.
+pblang-lsp crate exists but autocomplete, jump-to-definition have not been implemented.
 
-Without LSP it cannot be written comfortably in Sapphire.
+Without LSP it cannot be written comfortably in pblang.
 
 Formatter — Additional rules.
 
-sapphire fmt has basic functionality (indent, operators, --max-line-length), but further rules (blank lines, trailing commas, string formatting, etc.) are future work.
+pblang fmt has basic functionality (indent, operators, --max-line-length), but further rules (blank lines, trailing commas, string formatting, etc.) are future work.
 
 Lockfile v2 — Cross-machine.
 
@@ -2709,7 +2709,7 @@ There is no automatic build → dll/so/wasm → load as module.
 
 Large Extras (Future).
 
-AI Sapphire Code Editor.
+AI pblang Code Editor.
 
 Full IDE with AI, reverse engineering, blocks programming, cross-platform executables, project/framework management = has not started.
 
@@ -2721,7 +2721,7 @@ Self-Development / Independence from Rust.
 
 Self-hosted parser in .sapp = does not exist.
 
-Bootstrap compiler (Sapphire → bytecode in Sapphire) = requires structs/types first.
+Bootstrap compiler (pblang → bytecode in pblang) = requires structs/types first.
 
 Transpile-to-C = first realistic step, not done.
 
@@ -2743,9 +2743,9 @@ Threads (VM-per-thread, channel, select) | Exists.
 
 CI (Linux + Windows GitHub Actions) | Exists. 
 
-sapphire fmt (basic), sapphire lint, --doc, --dump-bytecode | Exists. 
+pblang fmt (basic), pblang lint, --doc, --dump-bytecode | Exists. 
 
-sapphire bundle (portable folder) | Exists. 
+pblang bundle (portable folder) | Exists. 
 
 Spec freeze v0.1 (docs/Spec_freeze.md) | Exists. 
 
@@ -2764,11 +2764,11 @@ Without these four, the rest (AI, quantum, editor, self-hosting) cannot be built
 > compiles+runs pblang) are all **done**. Authoritative status: `docs/CURRENT_STATUS.md`,
 > `docs/PrjAnalysis.md` §§26–46. Kept below as historical context only.
 
-Based on my comprehensive exploration of the Sapphire codebase, here’s a detailed overview of the current state and next development priorities:
+Based on my comprehensive exploration of the pblang codebase, here’s a detailed overview of the current state and next development priorities:
 
 Project Overview.
 
-Sapphire is a sophisticated scripting language implemented in Rust with the following architecture:
+pblang is a sophisticated scripting language implemented in Rust with the following architecture:
 
 Language: Rust-based VM with parser, IR, bytecode execution.
 
@@ -2808,9 +2808,9 @@ No TLS/HTTPS: only plain TCP available.
 
 No LSP completion: LSP exists but autocomplete/jump-to-definition not implemented.
 
-No type system: sapphire-typeck crate exists but is a stub.
+No type system: pblang-typeck crate exists but is a stub.
 
-No native executables: sapphire bundle exists but single-binary native compile does not.
+No native executables: pblang bundle exists but single-binary native compile does not.
 
 Key Files and Their Purposes.
 
@@ -2848,7 +2848,7 @@ Implement registry fetch/publish for hosted registries (http(s)).
 
 Extend lockfile v2 for cross-machine reproducibility.
 
-Add package imports like @sapphire/http and github.com/user/repo.
+Add package imports like @pblang/http and github.com/user/repo.
 
 Complete the package manager ecosystem.
 
@@ -2892,7 +2892,7 @@ MEDIUM PRIORITY - Type System (2-3 weeks).
 
 Why: Foundation for self-hosting and better tooling.
 
-Implement sapphire-typeck crate.
+Implement pblang-typeck crate.
 
 Add struct/enum syntax.
 
@@ -2936,9 +2936,9 @@ I have the full picture of the project.
 
 Here is a complete analysis:
 
-Where Sapphire stands today.
+Where pblang stands today.
 
-Sapphire is a programming language in a “powerful prototype / early-stage platform” phase — more mature than a simple side project, but not yet production-ready for general use.
+pblang is a programming language in a “powerful prototype / early-stage platform” phase — more mature than a simple side project, but not yet production-ready for general use.
 
 What has already been done (Solid).
 
@@ -2948,9 +2948,9 @@ VM core with bytecode, sandboxing, VmLimits, FfiPolicy, capability-based builtin
 
 ~20 stdlib modules: http, json, crypto, db, graphics, tensor, quantum, csv, ffi, etc.
 
-Package manager: sapphire install with lockfile, semver resolution, HMAC verify, tarball.
+Package manager: pblang install with lockfile, semver resolution, HMAC verify, tarball.
 
-Tooling: sapphire fmt, lint, bundle, doc (HTML), --dump-bytecode, --call-graph.
+Tooling: pblang fmt, lint, bundle, doc (HTML), --dump-bytecode, --call-graph.
 
 Threading model: VM-per-thread + channels + select (correct safety model).
 
@@ -2964,7 +2964,7 @@ Critical Pending Items (Block Production).
 
 Category | Status. 
 
-Type system | sapphire-typeck crate = empty stub, there are no structs/enums/generics. 
+Type system | pblang-typeck crate = empty stub, there are no structs/enums/generics. 
 
 TLS/HTTPS | Only plain TCP — no production web app works without it. 
 
@@ -2978,11 +2978,11 @@ Large Missing Pieces (Core Platform).
 
 The three things that unlock everything else:
 
-Registry fetch/publish: sapphire install exists for local lockfile, but registry server + @sapphire/http imports + publish = do not exist (only design in Registry_MVP.md).
+Registry fetch/publish: pblang install exists for local lockfile, but registry server + @pblang/http imports + publish = do not exist (only design in Registry_MVP.md).
 
-Native executables: sapphire bundle = portable folder, but single-binary (Stage A: bytecode+runtime in one file, Stage B: LLVM/Cranelift backend) = have not been done.
+Native executables: pblang bundle = portable folder, but single-binary (Stage A: bytecode+runtime in one file, Stage B: LLVM/Cranelift backend) = have not been done.
 
-Native_backend_notes.md exists (9KB) but the sapphire-llvm crate is a stub.
+Native_backend_notes.md exists (9KB) but the pblang-llvm crate is a stub.
 
 Threads implementation: Design in Threads.md is ready, but spawn/join/channels have not been implemented.
 
@@ -3004,7 +3004,7 @@ Realistic first step: transpile-to-C.
 
 Overall Picture.
 
-Sapphire has excellent architectural foresight — the modular crate design (sapphire-core, sapphire-vm, sapphire-compiler, sapphire-ir, sapphire-lsp, etc.) shows that the big goals were in the plan from the beginning.
+pblang has excellent architectural foresight — the modular crate design (pblang-core, pblang-vm, pblang-compiler, pblang-ir, pblang-lsp, etc.) shows that the big goals were in the plan from the beginning.
 
 The correct order to “unlock” everything else is: Registry fetch/publish → Threads implementation → Native executables (Stage A) → Type system (structs/typeck) — without these four, AI/quantum/editor/self-hosting cannot be built correctly.
 
@@ -3070,40 +3070,40 @@ To build real web apps and servers, the following are needed, in roughly this va
 AI-ready, in practice
 In practice, “AI-ready” means an interop-first design with bindings to ONNX Runtime, CUDA, Python, and HTTP APIs. Arrays and maps are useful, but for serious AI work you also need typed buffers or tensors, such as something like tensor<float32>[...], for performance.
 
-The current onnx_infer is a stub, which is fine for now. The proper next step is to implement it either through an FFI plugin that loads a DLL or shared object, or through host embedding where the host application calls Sapphire and provides the needed capabilities.
+The current onnx_infer is a stub, which is fine for now. The proper next step is to implement it either through an FFI plugin that loads a DLL or shared object, or through host embedding where the host application calls pblang and provides the needed capabilities.
 
 Quantum-ready, in practice
 Being quantum-ready without massive R&D means having an IR emitter — which you already have through stdlib/quantum.sapp to QASM — plus a bridge to simulators or SDKs such as Qiskit, Braket, or Cirq. That bridge could be done through FFI to a Python runtime, exec plus a JSON protocol, or a native simulator library binding.
 
-“Build an operating system with Sapphire”
-That is a completely different level. It requires a bare-metal target, your own runtime without std, an allocator, drivers, an ABI, and linker scripts. The realistic path is: first use Sapphire for systems scripting, tooling, build scripts, and userland; then add a compiler backend such as LLVM or Cranelift, or transpile to C or Rust; and only much later consider kernel work.
+“Build an operating system with pblang”
+That is a completely different level. It requires a bare-metal target, your own runtime without std, an allocator, drivers, an ABI, and linker scripts. The realistic path is: first use pblang for systems scripting, tooling, build scripts, and userland; then add a compiler backend such as LLVM or Cranelift, or transpile to C or Rust; and only much later consider kernel work.
 
-“Write any language in the same file together with Sapphire”
+“Write any language in the same file together with pblang”
 This is only realistic if it is defined as a polyglot build system, not as a “magic parser.” The future-proof solution is either polyglot blocks at build time or runtime FFI library loading.
 
-Option 1 is polyglot blocks like @rust { ... } and @python { ... }, where the compiler extracts the blocks, builds them into artifacts such as DLLs, shared objects, or WASM, loads them through a standard FFI ABI, and exposes them to Sapphire as a module namespace. Option 2 is runtime FFI with something like ffi.load("mylib.dll"), then calling functions from it; that is actually the closest to “any language,” because nearly every language can target a C ABI directly or through wrappers.
+Option 1 is polyglot blocks like @rust { ... } and @python { ... }, where the compiler extracts the blocks, builds them into artifacts such as DLLs, shared objects, or WASM, loads them through a standard FFI ABI, and exposes them to pblang as a module namespace. Option 2 is runtime FFI with something like ffi.load("mylib.dll"), then calling functions from it; that is actually the closest to “any language,” because nearly every language can target a C ABI directly or through wrappers.
 
 The highest-leverage next steps
-The most important next steps are: a package manager plus sapphire.toml, module search paths, and a lockfile; a stdlib web server with TCP/HTTP plus filesystem and path utilities; an FFI loader API beyond embedding; polyglot blocks on top of the package manager and FFI loader; and finally LSP, a formatter, and a docs generator so the language becomes usable at team scale.
+The most important next steps are: a package manager plus pblang.toml, module search paths, and a lockfile; a stdlib web server with TCP/HTTP plus filesystem and path utilities; an FFI loader API beyond embedding; polyglot blocks on top of the package manager and FFI loader; and finally LSP, a formatter, and a docs generator so the language becomes usable at team scale.
 
 Then the text asks which should come first: the package manager, web server stdlib, or FFI loader and polyglot blocks.
 
 Is it production-ready as a programming language?
-The answer given is: not yet. Based on the code shown, Sapphire is still in a “powerful prototype / early-stage runtime” phase, not a production-ready general-purpose language.
+The answer given is: not yet. Based on the code shown, pblang is still in a “powerful prototype / early-stage runtime” phase, not a production-ready general-purpose language.
 
 The reasons given are that the runtime mainly uses reference counting and then performs cycle collection by breaking cycles and cleaning unreachable containers such as arrays, maps, and modules, which is clever but also shows that the memory model and GC story are not fully locked down at a production level, especially for edge cases, determinism, and performance. There are also many builtins touching OS, networking, FFI, SQLite, and HTTP, which create a large production-hardening surface involving timeouts, resource leaks, sandboxing, error semantics, and thread safety. Some features are still explicitly marked as “not built-in yet,” such as onnxinfer, which shows the standard environment is still under construction.
 
 What is needed to call it production-ready?
 The document says a serious production-ready claim usually requires, at minimum: a language spec for syntax and semantics, especially for try/defer, modules/exports, truthiness, and numeric rules, plus compatibility promises by version; a full test suite for the parser, typechecker, VM bytecode conformance, fuzzing, and regressions; and tooling such as a package manager, deterministic lockfile behavior, stable docs, formatter, linter, and consistent stack traces and diagnostics.
 
-It adds that for personal or internal tools, Sapphire may already be usable if you control the environment and accept breaking changes. But for third parties or critical workloads, it is not there yet until the spec, compatibility, safety, and testing story are much stronger.
+It adds that for personal or internal tools, pblang may already be usable if you control the environment and accept breaking changes. But for third parties or critical workloads, it is not there yet until the spec, compatibility, safety, and testing story are much stronger.
 
 v0.1 to v1.0 roadmap
 The text then proposes a concrete checklist for moving from v0.1 to v1.0 so the language can be shipped to others as a runtime or SDK with clear guarantees and fewer footguns.
 
 For v0.2, the focus is core stability: write a “Language Semantics” markdown spec; create golden tests for parser, compiler, and VM; lock down deterministic behavior; and audit unwrap, expect, and panic paths, converting them to runtime errors where possible.
 
-For v0.3, the focus is diagnostics and compatibility contracts: unify parse, type, and runtime diagnostics; define what counts as a breaking change; and document exactly what sapphire.lock guarantees, along with CI tests for lockfile reproducibility.
+For v0.3, the focus is diagnostics and compatibility contracts: unify parse, type, and runtime diagnostics; define what counts as a breaking change; and document exactly what pblang.lock guarantees, along with CI tests for lockfile reproducibility.
 
 For v0.4, the focus is security hardening because the language already exposes OS and network features: add sandbox mode for embedding, timeouts and resource limits, and FFI guardrails such as allowlisted DLL paths and symbols.
 
@@ -3112,16 +3112,16 @@ For v0.5, the focus is performance and the memory model: formalize the RC plus c
 For v1.0, the release gates are: semver plus a spec freeze for the core language, module system, and error semantics; a conformance suite running on Windows and Linux, including MSVC; and a stable embedding API with documented resource lifecycle and predictable cleanup semantics.
 
 Embedded and standalone at the same time
-When asked whether Sapphire should target both embedded scripting and standalone general-purpose use, the answer is yes, but that requires a layered architecture: a minimal, embeddable core runtime plus a pluggable stdlib and a separate CLI/tooling layer.
+When asked whether pblang should target both embedded scripting and standalone general-purpose use, the answer is yes, but that requires a layered architecture: a minimal, embeddable core runtime plus a pluggable stdlib and a separate CLI/tooling layer.
 
-The proposed crate split is: pblang-core for parser, compiler, and VM; sapphire-stdlib for builtins such as fs, net, http, sqlite, and ffi; and sapphire-cli for the REPL and commands like --check, --doc, and --lock.
+The proposed crate split is: pblang-core for parser, compiler, and VM; pblang-stdlib for builtins such as fs, net, http, sqlite, and ffi; and pblang-cli for the REPL and commands like --check, --doc, and --lock.
 
 A stable VmHost trait is proposed as the embedding API, with functions for errors, module imports, cycle collection, and capability flags such as allow_fs, allow_net, allow_ffi, and allow_exec. A StdlibConfig structure is also proposed so an embedder can enable or disable builtins category by category.
 
 The idea is that the import system should go through VmHost::importmodule, so embedders can override it and load modules from memory instead of disk if needed. The roadmap also calls for golden tests, sandboxing tests, and cross-platform CI across Windows, Linux, and macOS.
 
 Package manager and registry
-A later phase aims to turn Sapphire into a general-purpose language with a package ecosystem. That means extending imports from local paths to package imports like @sapphire/http or Git-based sources, backed by a sapphire.toml manifest and a sapphire.lock file containing package metadata such as version, checksum, and source.
+A later phase aims to turn pblang into a general-purpose language with a package ecosystem. That means extending imports from local paths to package imports like @pblang/http or Git-based sources, backed by a pblang.toml manifest and a pblang.lock file containing package metadata such as version, checksum, and source.
 
 The initial registry could be simple, such as GitHub Releases or a basic HTTP server. Core stdlib pieces would ship with the CLI, while other libraries would live in the community registry.
 
@@ -3129,35 +3129,35 @@ Sandboxing and resource limits
 For safe execution of untrusted code, the text proposes a VmLimits structure that includes instruction limits, memory limits, stack depth limits, and I/O timeouts. It also proposes capability-based builtins plus an FfiPolicy with allowlists for libraries and symbols.
 
 Tooling roadmap
-The tooling roadmap includes commands such as sapphire init, pblang install, sapphire build, sapphire run, sapphire test, and pblang publish. It also includes a language server for autocomplete, jump-to-definition, and inline diagnostics, a formatter and linter, and an HTML docs generator built on the existing --doc functionality.
+The tooling roadmap includes commands such as pblang init, pblang install, pblang build, pblang run, pblang test, and pblang publish. It also includes a language server for autocomplete, jump-to-definition, and inline diagnostics, a formatter and linter, and an HTML docs generator built on the existing --doc functionality.
 
 What has and has not been done
 Much of the later text compares Future_plans.md and Report.md and repeatedly distinguishes between what already exists and what is still missing. According to the document, the existing foundation includes sandboxing, limits, FFI policy, a bundle command, graphics work, formatting support, install, --dump-bytecode, golden tests, lockfile tests, threads design, embedding API documentation, and baseline CI on Linux and Windows.
 
-The major things still missing or only partially done are: full package registry fetch and publish; a complete web stack with TLS; AI bridges such as ONNX, CUDA, and Python integration; quantum bridges beyond the QASM emitter; build-time polyglot artifacts; real threads implementation; native single-binary executables; a deeper formatter and LSP; an AI-powered Sapphire editor; stronger reverse-engineering tools; and the very long-term systems goals such as bare-metal or OS building.
+The major things still missing or only partially done are: full package registry fetch and publish; a complete web stack with TLS; AI bridges such as ONNX, CUDA, and Python integration; quantum bridges beyond the QASM emitter; build-time polyglot artifacts; real threads implementation; native single-binary executables; a deeper formatter and LSP; an AI-powered pblang editor; stronger reverse-engineering tools; and the very long-term systems goals such as bare-metal or OS building.
 
 Threads, executables, editor, reverse engineering, and “everything”
-Later sections repeatedly ask to add native executables for Windows and Linux, a smart AI Sapphire code editor, all thread capabilities, reverse-engineering tools, stronger OOP and functional support, project and framework creation/import/export/edit/delete, richer graphics and library support, AI integration, optimization, simplification, cross-platform support, multilingual interoperability with other languages, comprehensive testing everywhere, memory safety, and continued migration from Rust to Sapphire.
+Later sections repeatedly ask to add native executables for Windows and Linux, a smart AI pblang code editor, all thread capabilities, reverse-engineering tools, stronger OOP and functional support, project and framework creation/import/export/edit/delete, richer graphics and library support, AI integration, optimization, simplification, cross-platform support, multilingual interoperability with other languages, comprehensive testing everywhere, memory safety, and continued migration from Rust to pblang.
 
-The answer given is that the best overall strategy is not to force everything into the VM, but to keep Sapphire as a layered platform with a stable core, capabilities and limits everywhere, and an ecosystem-first approach through a package registry. The proposed order of work is to prioritize registry infrastructure, then threads, then executables, then type-system work, because those unlock most of the rest.
+The answer given is that the best overall strategy is not to force everything into the VM, but to keep pblang as a layered platform with a stable core, capabilities and limits everywhere, and an ecosystem-first approach through a package registry. The proposed order of work is to prioritize registry infrastructure, then threads, then executables, then type-system work, because those unlock most of the rest.
 
 Is it ready for production?
-The text’s honest assessment is no, not yet, although it says Sapphire is closer than it may appear. It considers the VM core, sandboxing, testing, stdlib depth, and tooling foundations solid, but it says production is blocked by missing TLS/HTTPS, an incomplete type system, incomplete LSP, lack of native binary output, incomplete WebSocket support, lack of a hosted registry, missing performance profiling, and parser limitations such as lack of error recovery.
+The text’s honest assessment is no, not yet, although it says pblang is closer than it may appear. It considers the VM core, sandboxing, testing, stdlib depth, and tooling foundations solid, but it says production is blocked by missing TLS/HTTPS, an incomplete type system, incomplete LSP, lack of native binary output, incomplete WebSocket support, lack of a hosted registry, missing performance profiling, and parser limitations such as lack of error recovery.
 
 Is it ready for self-development and independence from Rust?
-The document says only partially. It defines self-development as being able to write the Sapphire compiler, VM, and tooling in Sapphire itself instead of Rust.
+The document says only partially. It defines self-development as being able to write the pblang compiler, VM, and tooling in pblang itself instead of Rust.
 
-It notes that the project already has separate crates for the compiler, IR, and LLVM groundwork, and that Sapphire already runs parts of its stdlib written in .sapp, which helps. But it also says there is no self-hosted parser, no real type system, no structs, enums, or generics, and no native backend, so true self-hosting and full independence from Rust are not realistic yet.
+It notes that the project already has separate crates for the compiler, IR, and LLVM groundwork, and that pblang already runs parts of its stdlib written in .sapp, which helps. But it also says there is no self-hosted parser, no real type system, no structs, enums, or generics, and no native backend, so true self-hosting and full independence from Rust are not realistic yet.
 
-The suggested first practical step toward Rust independence is transpilation to C rather than going straight to LLVM. That would let Sapphire applications run without needing the Rust toolchain, even though the VM itself would still remain in Rust for a long time.
+The suggested first practical step toward Rust independence is transpilation to C rather than going straight to LLVM. That would let pblang applications run without needing the Rust toolchain, even though the VM itself would still remain in Rust for a long time.
 
 Is it ready for OS development without another programming language?
-The answer given is clearly no. The document explains that Sapphire currently runs as a managed, sandboxed VM on top of Rust and an operating system, while OS development requires the opposite model: bare-metal execution, direct memory control, inline assembly, interrupt handlers, a freestanding mode, deterministic memory layout, static allocation, native machine code output, cross-compilation, and linker control.
+The answer given is clearly no. The document explains that pblang currently runs as a managed, sandboxed VM on top of Rust and an operating system, while OS development requires the opposite model: bare-metal execution, direct memory control, inline assembly, interrupt handlers, a freestanding mode, deterministic memory layout, static allocation, native machine code output, cross-compilation, and linker control.
 
-It argues that this is not just a matter of “missing features,” but a deep architectural mismatch between a safe managed scripting platform and the needs of kernel or driver development. It says Sapphire could eventually serve as a high-level scripting layer for tools or userland, but not for building the kernel itself.
+It argues that this is not just a matter of “missing features,” but a deep architectural mismatch between a safe managed scripting platform and the needs of kernel or driver development. It says pblang could eventually serve as a high-level scripting layer for tools or userland, but not for building the kernel itself.
 
 Overall pending work
-The final overall conclusion in the document is that (old Sapphire)(old bypryx) pblang is currently a strong foundation or early platform, not yet a fully complete production platform. The highest-impact pending items are the package registry, threads, native executables, and the type system, because without those, later goals such as AI integration, quantum tooling, a full IDE + pb-mcp-server + my own ai model inside the ide for pblang coding combined by default, self-hosting, and broader platform ambitions cannot be built correctly.also, i want to add to my project mechanisms like rust mechanism or go or any other programming language mechanism that can improve my project.i'm thinking , now the project was written in rust and it has the memory protection and other mechanisms of rust but if someone write on this language the memory protection and other mechanisms of rust will be gone and the problem will be bigger when the project move from rust to pblang , if all of that is true then i want to solve it if you can .now make the threads safe and enhanced like other programming languages like go,kotlin,rust and more.check my whole project and all the documentation ,check for errors,warnings,bugs,vulnerabilities,sensitive data and more and also tell me what it is imcomplete(partial implemented),not implemented,wrong logic and more.read this whole file (./local_media) and continue the improvements and implementations and make a total optimazation on a bit level of the programming language and do what ever it takes to make it the best programming language overall of all categories/topic with tons of features in a way that no one needs to use every other programming language ever agin,"One programming can create anything, no more a lot of programmiing language to create one thing"
+The final overall conclusion in the document is that (old pblang)(old bypryx) pblang is currently a strong foundation or early platform, not yet a fully complete production platform. The highest-impact pending items are the package registry, threads, native executables, and the type system, because without those, later goals such as AI integration, quantum tooling, a full IDE + pb-mcp-server + my own ai model inside the ide for pblang coding combined by default, self-hosting, and broader platform ambitions cannot be built correctly.also, i want to add to my project mechanisms like rust mechanism or go or any other programming language mechanism that can improve my project.i'm thinking , now the project was written in rust and it has the memory protection and other mechanisms of rust but if someone write on this language the memory protection and other mechanisms of rust will be gone and the problem will be bigger when the project move from rust to pblang , if all of that is true then i want to solve it if you can .now make the threads safe and enhanced like other programming languages like go,kotlin,rust and more.check my whole project and all the documentation ,check for errors,warnings,bugs,vulnerabilities,sensitive data and more and also tell me what it is imcomplete(partial implemented),not implemented,wrong logic and more.read this whole file (./local_media) and continue the improvements and implementations and make a total optimazation on a bit level of the programming language and do what ever it takes to make it the best programming language overall of all categories/topic with tons of features in a way that no one needs to use every other programming language ever agin,"One programming can create anything, no more a lot of programmiing language to create one thing"
 
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -4034,7 +4034,7 @@ The binary is fully operational. Here is the complete summary of everything done
   │ 13  │ Threads.md is in Greek only                                                      │ contributor (and every LLM trying to  │  to start).                                            │
   │     │                                                                                  │ learn the model).                     │                                                        │
   ├─────┼──────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────┼────────────────────────────────────────────────────────┤
-  │     │ Replace lingering "sapphire" references with "pblang": docs/CURRENT_STATUS.md    │ The rename was incomplete; new users  │ grep -rn sapphire and triage; many are in comments and │
+  │     │ Replace lingering "pblang" references with "pblang": docs/CURRENT_STATUS.md    │ The rename was incomplete; new users  │ grep -rn pblang and triage; many are in comments and │
   │ 14  │ CLI table, crates/pblang-graphics/Cargo.toml comment,                            │ find conflicting names.               │  docs.                                                 │
   │     │ crates/pblang-vm/src/chunk.rs path comment, NEXT_STEPS_PLAN.md examples.         │                                       │                                                        │
   └─────┴──────────────────────────────────────────────────────────────────────────────────┴───────────────────────────────────────┴────────────────────────────────────────────────────────┘
@@ -4128,7 +4128,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
   If I were to keep going right now, the order I'd take is:
   1. P0 #1–#3 (the three injection / traversal issues) — small, security-relevant, one session.
-  2. P1 #7 + #9 + #11 + #14 (the duplications, the fake concurrency.sapp, the mutex poison handling, the sapphire→pblang rename) — all mechanical, all big readability wins.
+  2. P1 #7 + #9 + #11 + #14 (the duplications, the fake concurrency.sapp, the mutex poison handling, the pblang→pblang rename) — all mechanical, all big readability wins.
   3. P1 #8 (split vm.rs) — the biggest single quality-of-life refactor.
   4. P2 #15–#17 (the three missing spec docs) — unblocks every embedder.
   5. P3 #29 (chumsky 0.9) — biggest single unblock on the roadmap.
@@ -4205,8 +4205,8 @@ The binary is fully operational. Here is the complete summary of everything done
   
   If you want a real headline win on self-hosting in the next 1–2 sessions, these are realistic:
 
-  1. The formatter (sapphire fmt) — pure string-in, string-out. Could move entirely to stdlib/compiler/formatter.sapp. Removes ~200 lines from src/main.rs.
-  2. The linter (sapphire lint) — AST-in, diagnostics-out. The AST is already exposed via parse() builtin.
+  1. The formatter (pblang fmt) — pure string-in, string-out. Could move entirely to stdlib/compiler/formatter.sapp. Removes ~200 lines from src/main.rs.
+  2. The linter (pblang lint) — AST-in, diagnostics-out. The AST is already exposed via parse() builtin.
   3. The doc-generator (--doc, --html) — same shape.
   4. pblang new scaffolding — pure file I/O and template substitution.
   5. The polyglot block extractor — already partially in stdlib/polyglot_*.sapp.
