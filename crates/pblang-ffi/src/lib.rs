@@ -84,7 +84,7 @@ fn json_to_pblang_expr(v: &serde_json::Value) -> Result<String, String> {
     }
 }
 
-/// Create a new Sapphire VM.
+/// Create a new pblang VM.
 #[no_mangle]
 pub extern "C" fn pblang_create_vm() -> *mut VmWrapper {
     let w = VmWrapper {
@@ -94,7 +94,7 @@ pub extern "C" fn pblang_create_vm() -> *mut VmWrapper {
     Box::into_raw(Box::new(w))
 }
 
-/// Create a new Sapphire VM with explicit capability sandbox.
+/// Create a new pblang VM with explicit capability sandbox.
 /// Pass 0 to deny a capability, 1 to allow it.
 /// - allow_fs: 1 = allow filesystem access, 0 = deny
 /// - allow_net: 1 = allow TCP/HTTP networking, 0 = deny
@@ -307,7 +307,7 @@ pub unsafe extern "C" fn pblang_call_function(
     }
 }
 
-/// Destroy a Sapphire VM created by `pblang_create_vm`.
+/// Destroy a pblang VM created by `pblang_create_vm`.
 ///
 /// # Safety
 /// The `vm` pointer must have been returned by `pblang_create_vm` and must not
@@ -400,10 +400,10 @@ pub unsafe extern "C" fn pblang_eval(
     }
 }
 
-/// Free a string allocated by Sapphire FFI.
+/// Free a string allocated by pblang FFI.
 ///
 /// # Safety
-/// The `s` pointer must have been returned by a Sapphire FFI function (e.g., via `pblang_eval`)
+/// The `s` pointer must have been returned by a pblang FFI function (e.g., via `pblang_eval`)
 /// and must not have been freed already.
 #[no_mangle]
 pub unsafe extern "C" fn pblang_string_free(s: *mut c_char) {

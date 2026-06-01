@@ -1,5 +1,5 @@
 /**
- * pblang.h — C API for embedding pblang (Sapphire) in your application.
+ * pblang.h — C API for embedding pblang (pblang) in your application.
  *
  * Build the shared library with:
  *   cargo build --release --package pblang-ffi

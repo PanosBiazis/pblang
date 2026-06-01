@@ -573,10 +573,10 @@ let results = results.iter().map(|h| {
 ### Usage Examples
 ```pblang
 # Import from registry
-let http = import("@sapphire/http");
+let http = import("@pblang/http");
 
 # Install dependencies
-install "@sapphire/http@1.0.0";
+install "@pblang/http@1.0.0";
 
 # Build project
 build;
@@ -662,10 +662,10 @@ run main.sap
 ### Registry Usage
 ```pblang
 # Import from registry
-let http = import("@sapphire/http");
+let http = import("@pblang/http");
 
 # Install dependencies
-install "@sapphire/http@1.0.0";
+install "@pblang/http@1.0.0";
 
 # Build project
 build;
@@ -680,7 +680,7 @@ run main.sap
 search "database";
 
 # Install specific version
-install "@sapphire/database@2.5.1";
+install "@pblang/database@2.5.1";
 
 # List available packages
 list_packages();

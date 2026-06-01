@@ -145,7 +145,7 @@ text
 
 
 ### Class declaration
-```sapphire
+```pblang
 class MyClass {
     fn new(x) { self.x = x; }
     fn get_x() { return self.x; }
@@ -276,7 +276,7 @@ text
 ## T5-beta: Thread pool stdlib helper
 
 
-```sapphire
+```pblang
 import "stdlib:thread.sapp";
 let results = thread.thread_pool(4, tasks_array, fn(task) { return process(task); });
 thread.thread_pool(n_workers, tasks_array, worker_fn) — spawns n_workers threads,
@@ -300,13 +300,13 @@ text
 ### Goal
 Add a concrete chat tool-call example (`examples/ai_chat_toolcall/`) with `function_call`
 field handling, and extend `stdlib/tensor.sapp` with `slice`, `reshape`, and `dot` operations
-(pure Sapphire, no new builtins needed).
+(pure pblang, no new builtins needed).
 
 
 ### 3a. `examples/ai_chat_toolcall/main.sapp` — New file
 
 
-```sapphire
+```pblang
 // examples/ai_chat_toolcall/main.sapp
 // Demonstrates OpenAI-style tool-call request + response parsing.
 import "stdlib:http.sapp";
@@ -457,7 +457,7 @@ text
   demo using `http.post_auth` and `provider_registry`. Parses `finish_reason == "tool_calls"`.
 - **`tensor.slice(t, start, end)`** — extract row slice from a 2-D tensor.
 - **`tensor.reshape(t, new_rows, new_cols)`** — reinterpret shape (same total elements).
-- **`tensor.dot(a, b)`** — matrix product `[m×k] × [k×n] → [m×n]` (pure Sapphire).
+- **`tensor.dot(a, b)`** — matrix product `[m×k] × [k×n] → [m×n]` (pure pblang).
 Rules for Cursor AI
 Read docs/Tasks.md and docs/Report.md before every run.
 

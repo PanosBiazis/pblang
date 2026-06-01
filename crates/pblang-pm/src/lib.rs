@@ -749,7 +749,7 @@ pub fn validate_package_tree(package_dir: &Path) -> Result<(), String> {
         }
     }
     if !package_has_module_files(package_dir) {
-        return Err("package has no Biapryx module files (.sapp/.sap/.bpx)".to_string());
+        return Err("package has no pblang module files (.sapp/.sap/.bpx)".to_string());
     }
     Ok(())
 }
