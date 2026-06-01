@@ -42,6 +42,9 @@ const OP_JUMP_IF_TRUE_PEEK = 34;    // short-circuit: jump if top is truthy, do 
 const OP_TRY = 35;                  // try/catch: operand is a {try_chunk, catch_chunk} constant
 const OP_JUMP_IF_NIL_PEEK = 36;     // jump if top is nil, do NOT pop
 const OP_JUMP_IF_NOT_NIL_PEEK = 37; // jump if top is not nil, do NOT pop
+const OP_GET_UPVALUE = 38;          // push the closure's captured upvalue[operand]
+const OP_SET_UPVALUE = 39;          // store top into the closure's upvalue[operand]
+const OP_THROW = 40;                // raise the top-of-stack value (caught by OP_TRY)
 
 // ── Chunk ───────────────────────────────────────────────────────────────
 fn Chunk() {
@@ -74,6 +77,9 @@ fn CodeGen() {
         loops: [],       // stack of { breaks: [jump_idx...], continues: [jump_idx...] }
         is_module: false, // true for the top-level/main chunk (module scoping)
         next_slot: 0,     // monotonic local-slot counter (slots are never reused)
+        parent: nil,      // enclosing CodeGen (for upvalue resolution), nil at top
+        upvalues: [],     // [{index, is_local}] captured by THIS function
+        exports: [],      // names listed in `export ...;` statements (module API)
     };
 }
 
@@ -167,15 +173,54 @@ fn codegen_declare_local(cg, name) {
     return slot;
 }
 
-/// Resolve a variable name → returns {kind: "global"|"local", index: slot}
-fn codegen_resolve(cg, name) {
-    // Check locals (reverse order for shadowing)
+/// Look up `name` among a CodeGen's own locals only (no parent walk). Returns the
+/// slot, or -1 if not a local of this function.
+fn _resolve_local_only(cg, name) {
     let i = len(cg.locals) - 1;
     while i >= 0 {
-        if cg.locals[i].name == name {
-            return map{kind: "local", index: cg.locals[i].slot};
-        }
+        if cg.locals[i].name == name { return cg.locals[i].slot; }
         i = i - 1;
+    }
+    return -1;
+}
+
+/// Record that `cg` captures an upvalue (deduplicated). `index`/`is_local` say
+/// where it comes from in the ENCLOSING frame: a parent local slot (is_local) or
+/// the parent's own upvalue slot (transitive capture). Returns this function's
+/// upvalue index.
+fn _add_upvalue(cg, index, is_local) {
+    let i = 0;
+    while i < len(cg.upvalues) {
+        if cg.upvalues[i].index == index and cg.upvalues[i].is_local == is_local { return i; }
+        i = i + 1;
+    }
+    array_push(cg.upvalues, map{index: index, is_local: is_local});
+    return len(cg.upvalues) - 1;
+}
+
+/// Resolve `name` as an upvalue of `cg` by walking the enclosing chain. Returns
+/// the upvalue index in `cg`, or -1 if `name` is not an enclosing local/upvalue.
+fn codegen_resolve_upvalue(cg, name) {
+    if cg.parent == nil { return -1; }
+    // Captured directly from the enclosing function's locals?
+    let plocal = _resolve_local_only(cg.parent, name);
+    if plocal >= 0 { return _add_upvalue(cg, plocal, true); }
+    // Otherwise, captured transitively through the enclosing function's upvalues.
+    let puv = codegen_resolve_upvalue(cg.parent, name);
+    if puv >= 0 { return _add_upvalue(cg, puv, false); }
+    return -1;
+}
+
+/// Resolve a variable name → {kind: "local"|"upvalue"|"global", index}.
+/// Lexical order: own local → enclosing-scope capture (upvalue) → global.
+fn codegen_resolve(cg, name) {
+    // Check locals (reverse order for shadowing)
+    let local = _resolve_local_only(cg, name);
+    if local >= 0 { return map{kind: "local", index: local}; }
+    // Captured from an enclosing function (closure upvalue)
+    if cg.parent != nil {
+        let uv = codegen_resolve_upvalue(cg, name);
+        if uv >= 0 { return map{kind: "upvalue", index: uv}; }
     }
     // Global
     let const_idx = codegen_intern_global(cg, name);
@@ -220,6 +265,8 @@ fn codegen_var(cg, node) {
     let resolved = codegen_resolve(cg, node.name);
     if resolved.kind == "local" {
         chunk_write_op(cg.chunk, OP_GET_LOCAL, resolved.index);
+    } else if resolved.kind == "upvalue" {
+        chunk_write_op(cg.chunk, OP_GET_UPVALUE, resolved.index);
     } else {
         chunk_write_op(cg.chunk, OP_GET_GLOBAL, resolved.index);
     }
@@ -428,6 +475,11 @@ fn codegen_call(cg, node) {
         let resolved = codegen_resolve(cg, fn_node.name);
         if resolved.kind == "local" {
             chunk_write_op(cg.chunk, OP_GET_LOCAL, resolved.index);
+        } else if resolved.kind == "upvalue" {
+            // A captured function used as a callee (e.g. `g(x)` inside
+            // `fn(x){ return g(x); }` where g is an enclosing param). Without this
+            // branch the upvalue index was misemitted as OP_GET_GLOBAL.
+            chunk_write_op(cg.chunk, OP_GET_UPVALUE, resolved.index);
         } else {
             chunk_write_op(cg.chunk, OP_GET_GLOBAL, resolved.index);
         }
@@ -495,6 +547,13 @@ fn codegen_expr(cg, node) {
     }
     if kind == "fn_lit" {
         codegen_fnlit(cg, node);
+        return;
+    }
+    if kind == "throw" {
+        // Evaluate the thrown value, then OP_THROW raises it; OP_TRY (host
+        // try/catch in vm.sapp) catches and runs the handler.
+        codegen_expr(cg, node.value);
+        chunk_write_op(cg.chunk, OP_THROW, 0);
         return;
     }
     if kind == "try" {
@@ -805,6 +864,7 @@ fn codegen_fill_defaults(inner_cg, params, param_slots) {
 /// are plain strings (parser.sapp::expr_fnlit), not {name,type,default} maps.
 fn codegen_fnlit(cg, node) {
     let inner_cg = CodeGen();
+    inner_cg.parent = cg;   // enables capturing enclosing vars as upvalues
 
     let k = 0;
     while k < len(node["params"]) {
@@ -825,6 +885,7 @@ fn codegen_fnlit(cg, node) {
     let fn_const_idx = chunk_add_constant(cg.chunk, map{
         arity: len(node["params"]),
         chunk: inner_cg.chunk,
+        upvalues: inner_cg.upvalues,   // [{index, is_local}] for OP_CLOSURE capture
     });
     chunk_write_op(cg.chunk, OP_CLOSURE, fn_const_idx);
 }
@@ -833,7 +894,8 @@ fn codegen_fnlit(cg, node) {
 fn codegen_fn(cg, node) {
     // node = map{kind: "fn", name: "myfn", params: [...], body: [...]}
     let inner_cg = CodeGen();
-    
+    inner_cg.parent = cg;   // a nested named fn may capture enclosing vars too
+
     let param_slots = [];
     let k = 0;
     while k < len(node.params) {
@@ -841,23 +903,24 @@ fn codegen_fn(cg, node) {
         k = k + 1;
     }
     codegen_fill_defaults(inner_cg, node.params, param_slots);
-    
+
     codegen_block(inner_cg, node.body);
-    
+
     // Implicit return nil at end
-    if len(inner_cg.chunk.instructions) == 0 or 
+    if len(inner_cg.chunk.instructions) == 0 or
        inner_cg.chunk.instructions[len(inner_cg.chunk.instructions) - 1].op != OP_RETURN {
         let idx_nil = chunk_add_constant(inner_cg.chunk, nil);
         chunk_write_op(inner_cg.chunk, OP_CONSTANT, idx_nil);
         chunk_write_op(inner_cg.chunk, OP_RETURN, 0);
     }
-    
+
     // Store function as constant in parent chunk
     let fn_const_idx = chunk_add_constant(cg.chunk, map{
         arity: len(node["params"]),
         chunk: inner_cg.chunk,
+        upvalues: inner_cg.upvalues,
     });
-    
+
     chunk_write_op(cg.chunk, OP_CLOSURE, fn_const_idx);
 
     // Bind function name as a global (DEFINE_GLOBAL consumes the closure value).
@@ -874,6 +937,7 @@ fn codegen_expr_stmt(cg, node) {
         codegen_expr(cg, e.value);
         let r = codegen_resolve(cg, e.name);
         if r.kind == "local" { chunk_write_op(cg.chunk, OP_SET_LOCAL, r.index); }
+        else if r.kind == "upvalue" { chunk_write_op(cg.chunk, OP_SET_UPVALUE, r.index); }
         else { chunk_write_op(cg.chunk, OP_SET_GLOBAL, r.index); }
         return;
     }
@@ -949,6 +1013,16 @@ fn codegen_stmt(cg, stmt) {
     if kind == "expr_stmt" { codegen_expr_stmt(cg, stmt); return; }
     if kind == "print" { codegen_print(cg, stmt); return; }
     if kind == "block" { codegen_block(cg, stmt.stmts); return; }
+    if kind == "export" {
+        // Record exported names; emitted as the `__exports__` global at module end
+        // so importers can restrict a module's surface to its declared API.
+        let names = stmt.names;
+        let k = 0;
+        while k < len(names) { array_push(cg.exports, names[k]); k = k + 1; }
+        return;
+    }
+    if kind == "import" { return; }   // `import(...)` is handled as a call expr; the
+                                      // bare `import("...")` statement form is a no-op here.
 }
 
 /// Top-level compilation: stmts → chunk
@@ -956,6 +1030,21 @@ fn compile_stmts(stmts) {
     let cg = CodeGen();
     cg.is_module = true;   // top-level let/const become module globals
     codegen_block(cg, stmts);
+    // If the module declared `export ...`, emit `__exports__ = [names]` as a final
+    // global so importers can expose only the declared API (real `export`
+    // semantics — matches the Rust frontend). No exports → no marker → importer
+    // falls back to exposing all globals.
+    if len(cg.exports) > 0 {
+        let k = 0;
+        while k < len(cg.exports) {
+            let nidx = chunk_add_constant(cg.chunk, cg.exports[k]);
+            chunk_write_op(cg.chunk, OP_CONSTANT, nidx);
+            k = k + 1;
+        }
+        chunk_write_op(cg.chunk, OP_MAKE_ARRAY, len(cg.exports));
+        let ex_idx = codegen_intern_global(cg, "__exports__");
+        chunk_write_op(cg.chunk, OP_DEFINE_GLOBAL, ex_idx);
+    }
     return cg.chunk;
 }
 

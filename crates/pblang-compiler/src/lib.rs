@@ -507,6 +507,21 @@ impl Compiler {
 
             StmtKind::Return(opt) => {
                 match opt {
+                    // `return f(args)` — a call in tail position. Emit it like a
+                    // normal call but with OpTailCall so the VM can reuse the
+                    // current frame (constant stack depth for tail recursion). The
+                    // VM falls back to a normal call when the callee/frame isn't
+                    // reusable, and the OpReturn below then returns its result.
+                    Some(e) if matches!(e.kind, ExprKind::Call(..)) => {
+                        if let ExprKind::Call(callee, args) = e.kind {
+                            self.emit_expr(*callee);
+                            let argc = args.len();
+                            for arg in args {
+                                self.emit_expr(arg);
+                            }
+                            self.chunk.write(OpCode::OpTailCall(argc), vspan(sp));
+                        }
+                    }
                     Some(e) => self.emit_expr(e),
                     None => {
                         let k = self.chunk.add_const(Value::Nil);
@@ -1745,22 +1760,23 @@ impl Compiler {
                 }
             }
 
-            // `a ** b` — exponentiation via num_pow
+            // `a ** b` — exponentiation. Emits the OpPow opcode (which routes
+            // through `Value::arith(Pow)`, identical to the former `num_pow`
+            // call for numbers/bigint/rational/decimal) so that a `__pow__`/
+            // `__rpow__` operator overload can be dispatched on the slow path.
             ExprKind::Pow(a, b) => {
-                let pow_name = self.intern_name("num_pow");
-                self.chunk.write(OpCode::OpGetGlobal(pow_name), vspan(sp));
                 self.emit_expr(*a);
                 self.emit_expr(*b);
-                self.chunk.write(OpCode::OpCall(2), vspan(sp));
+                self.chunk.write(OpCode::OpPow, vspan(sp));
             }
 
-            // `a % b` — modulo via num_mod
+            // `a % b` — modulo. Emits OpMod (≡ `Value::arith(Mod)`, the same math
+            // the former `num_mod` call performed) so `__mod__`/`__rmod__`
+            // overloads can be dispatched on the slow path.
             ExprKind::Mod(a, b) => {
-                let mod_name = self.intern_name("num_mod");
-                self.chunk.write(OpCode::OpGetGlobal(mod_name), vspan(sp));
                 self.emit_expr(*a);
                 self.emit_expr(*b);
-                self.chunk.write(OpCode::OpCall(2), vspan(sp));
+                self.chunk.write(OpCode::OpMod, vspan(sp));
             }
         } // end emit_expr match
     } // end emit_expr fn
@@ -1996,6 +2012,7 @@ pub fn disasm(chunk: &Chunk) -> String {
             OpCode::OpSetUpvalue(idx) => format!("  {:4} OpSetUpvalue {}", i, idx),
             OpCode::OpCloseUpvalue => format!("  {:4} OpCloseUpvalue", i),
             OpCode::OpCall(argc) => format!("  {:4} OpCall {}", i, argc),
+            OpCode::OpTailCall(argc) => format!("  {:4} OpTailCall {}", i, argc),
             OpCode::OpReturn => format!("  {:4} OpReturn", i),
             OpCode::OpDefer => format!("  {:4} OpDefer", i),
             OpCode::OpJump(ip) => format!("  {:4} OpJump -> {}", i, ip),

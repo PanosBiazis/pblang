@@ -1,0 +1,512 @@
+// stdlib/compiler/ctranspile.sapp — a self-hosted pblang→C transpiler (seed of
+// the freestanding/OS-dev backend, and a rust→pblang move off the Rust
+// ctranspiler).
+//
+// Compiling pblang to C is the path to GC-free, no-libc, bootable code: C lowers
+// to native, and a freestanding profile (`-ffreestanding -nostdlib`, intrinsics→
+// inline asm) makes kernels possible — which the bytecode VM never can (it needs
+// a GC + heap runtime). This is the MINIMAL core: a numeric subset (numbers as
+// C `double`, matching pblang's f64) covering functions, arithmetic, comparison,
+// if/while, and return — enough to transpile real straight-line/looping/recursive
+// code. Maps/strings/closures/GC come later; this establishes the lowering.
+//
+//   let ct = import("stdlib/compiler/ctranspile.sapp");
+//   ct.transpile("fn add(a, b) { return a + b; }")   // -> C source string
+//
+// Implemented entirely in pblang.
+
+let _NL = "
+";
+
+// ── Struct/map field-layout registry ────────────────────────────────────────────────
+// Structs desugar to string-keyed maps; to lower `obj.field` to a fixed C offset we
+// assign each field NAME a stable slot index the first time it's seen (in a map
+// literal or a member access). A map literal allocates a block sized to its max slot
+// and stores values at their field slots; member access reads that slot. Reset per
+// transpile so each translation unit has a consistent layout. (Module-level mutable
+// state — `_FIELDS` is a shared map.)
+let _FIELDS = map{ slots: map{}, next: 0 };
+
+fn _reset_fields() { _FIELDS.slots = map{}; _FIELDS.next = 0; }
+
+fn _field_slot(name) {
+    if map_has(_FIELDS.slots, name) { return _FIELDS.slots[name]; }
+    let s = _FIELDS.next;
+    _FIELDS.slots[name] = s;
+    _FIELDS.next = s + 1;
+    return s;
+}
+
+// ── Numeric codegen mode ─────────────────────────────────────────────────────────────
+// Numbers lower to C `double` by default (matching pblang's f64). The INTEGER mode
+// lowers them to `long` (a signed integer the width of a pointer: 4 bytes on -m32,
+// 8 on 64-bit) instead — making kernel code completely FLOAT-RUNTIME-FREE: no SSE,
+// no soft-float libgcc (__adddf3/__fixunsdfsi/…), smaller and faster objects, AND it
+// lets GCC interrupt handlers (which require -mgeneral-regs-only — i.e. NO floating
+// point — for a correct ISR prologue) link and boot. In int mode `/` is integer
+// division and the long-casts already on bitwise/% ops are harmless no-ops, which is
+// exactly what OS code (ports, masks, addresses, slot indices) wants. (Module-level
+// mutable state — `_MODE` is a shared map, set/reset per transpile.)
+let _MODE = map{ intmode: false };
+fn _set_intmode(b) { _MODE.intmode = b; }
+
+// The C type a pblang number lowers to.
+fn _numty() { if _MODE.intmode { return "long"; } return "double"; }
+// Pointer-cast prefix, paste before a parenthesised address expression:
+// "(double*)(u64)" in float mode, "(long*)(u64)" in int mode.
+fn _pcast() { if _MODE.intmode { return "(long*)(u64)"; } return "(double*)(u64)"; }
+// Number-value cast — turn a pointer/integer back into a pblang number value:
+// "(double)(u64)" in float mode, "(long)(u64)" in int mode.
+fn _vcast() { if _MODE.intmode { return "(long)(u64)"; } return "(double)(u64)"; }
+
+// ── Expressions → C ────────────────────────────────────────────────────────────────
+fn transpile_expr(node) {
+    if node == nil { return "0"; }
+    let k = node.kind;
+    if k == "number" { return str(node.value); }
+    if k == "ident" { return node.name; }
+    if k == "bool" { if node.value { return "1"; } return "0"; }
+    if k == "nil" { return "0"; }
+    // Array literal → a length-prefixed block on the bump allocator: slot 0 holds
+    // the length, slots 1.. the elements. Value is the block address (as double).
+    // Uses a GCC statement-expression (available under -ffreestanding).
+    if k == "array" {
+        let items = try node.items catch [];
+        let n = len(items);
+        // Slots are sized 8 bytes (exact for double / 64-bit long; over-allocated but
+        // self-consistent for 32-bit long, since reads & writes share the same type).
+        let s = "({ " + _numty() + "* _a = " + _pcast() + "kmalloc(" + str((n + 1) * 8) + "); _a[0]=" + str(n) + ";";
+        let i = 0;
+        while i < n {
+            s = s + " _a[" + str(i + 1) + "]=" + transpile_expr(items[i]) + ";";
+            i = i + 1;
+        }
+        return s + " " + _vcast() + "_a; })";
+    }
+    // Index read `arr[i]` → element i (after the length prefix).
+    if k == "index" {
+        return "(" + _pcast() + "(" + transpile_expr(node.obj) + "))[1 + (long)(" + transpile_expr(node.index) + ")]";
+    }
+    // Map/struct literal → a block on the allocator; each field stored at its
+    // registered slot. (Structs desugar to these; `__struct` tags are stored too.)
+    if k == "map" {
+        let entries = try node.entries catch [];
+        let maxslot = 0 - 1;
+        let i = 0;
+        while i < len(entries) {
+            let slot = _field_slot(entries[i].key);
+            if slot > maxslot { maxslot = slot; }
+            i = i + 1;
+        }
+        let nslots = maxslot + 1;
+        if nslots < 1 { nslots = 1; }
+        let s = "({ " + _numty() + "* _m = " + _pcast() + "kmalloc(" + str(nslots * 8) + ");";
+        let j = 0;
+        while j < len(entries) {
+            let slot = _field_slot(entries[j].key);
+            s = s + " _m[" + str(slot) + "]=" + transpile_expr(entries[j].value) + ";";
+            j = j + 1;
+        }
+        return s + " " + _vcast() + "_m; })";
+    }
+    // Member access `obj.field` → the field's fixed slot in the block.
+    if k == "member" {
+        return "(" + _pcast() + "(" + transpile_expr(node.obj) + "))[" + str(_field_slot(node.name)) + "]";
+    }
+    // String literal → a null-terminated char block on the bump allocator; value
+    // is its address. Read bytes with peek8(addr + i); terminator is 0.
+    if k == "string" {
+        let v = node.value;
+        let n = len(v);
+        let s = "({ char* _s = (char*)(u64)kmalloc(" + str(n + 1) + ");";
+        let i = 0;
+        while i < n {
+            s = s + " _s[" + str(i) + "]=" + str(strcharcodeat(v, i)) + ";";
+            i = i + 1;
+        }
+        return s + " _s[" + str(n) + "]=0; " + _vcast() + "_s; })";
+    }
+    if k == "binary" {
+        let op = node.op;
+        // C `%` is integer-only, so modulo needs long casts.
+        if op == "%" {
+            return "((long)" + transpile_expr(node.left) + " % (long)" + transpile_expr(node.right) + ")";
+        }
+        // Map pblang logical keywords to C operators.
+        if op == "and" { op = "&&"; }
+        if op == "or" { op = "||"; }
+        return "(" + transpile_expr(node.left) + " " + op + " " + transpile_expr(node.right) + ")";
+    }
+    if k == "unary" {
+        if node.op == "-" { return "(-" + transpile_expr(node.operand) + ")"; }
+        if node.op == "not" or node.op == "!" { return "(!" + transpile_expr(node.operand) + ")"; }
+        return transpile_expr(node.operand);
+    }
+    if k == "call" {
+        let fname = "";
+        if (try node.func.kind catch "") == "ident" { fname = node.func.name; }
+        let args = try node.args catch [];
+        // Bitwise / modulo builtins lower to C operators (integers via long casts),
+        // so bit-twiddling and masks transpile to real native ops — essential for
+        // OS code (ports, flags, addresses).
+        if fname == "bit_and" and len(args) == 2 { return "((long)" + transpile_expr(args[0]) + " & (long)" + transpile_expr(args[1]) + ")"; }
+        if fname == "bit_or" and len(args) == 2 { return "((long)" + transpile_expr(args[0]) + " | (long)" + transpile_expr(args[1]) + ")"; }
+        if fname == "bit_xor" and len(args) == 2 { return "((long)" + transpile_expr(args[0]) + " ^ (long)" + transpile_expr(args[1]) + ")"; }
+        if fname == "bit_shl" and len(args) == 2 { return "((long)" + transpile_expr(args[0]) + " << (long)" + transpile_expr(args[1]) + ")"; }
+        if fname == "bit_shr" and len(args) == 2 { return "((long)" + transpile_expr(args[0]) + " >> (long)" + transpile_expr(args[1]) + ")"; }
+        if fname == "bit_not" and len(args) == 1 { return "(~(long)" + transpile_expr(args[0]) + ")"; }
+        if fname == "num_mod" and len(args) == 2 { return "((long)" + transpile_expr(args[0]) + " % (long)" + transpile_expr(args[1]) + ")"; }
+        // len(arr) → the array's length prefix (slot 0).
+        if fname == "len" and len(args) == 1 { return "(" + _pcast() + "(" + transpile_expr(args[0]) + "))[0]"; }
+        // addr_of("fn") → the address of a function as a number — needed to put an
+        // interrupt handler (or any function) into an IDT gate from pblang.
+        if fname == "addr_of" and len(args) == 1 and (try args[0].kind catch "") == "string" {
+            return _vcast() + "&" + args[0].value;
+        }
+        // generic call
+        let s = transpile_expr(node.func) + "(";
+        let i = 0;
+        while i < len(args) {
+            if i > 0 { s = s + ", "; }
+            s = s + transpile_expr(args[i]);
+            i = i + 1;
+        }
+        return s + ")";
+    }
+    return "0";   // unsupported expr → placeholder (subset)
+}
+
+// ── Statements → C (indented) ──────────────────────────────────────────────────────
+fn _indent(n) {
+    let s = "";
+    let i = 0;
+    while i < n { s = s + "    "; i = i + 1; }
+    return s;
+}
+
+fn transpile_stmt(node, depth) {
+    let pad = _indent(depth);
+    let k = node.kind;
+    if k == "let" or k == "const" {
+        return pad + _numty() + " " + node.name + " = " + transpile_expr(try node.value catch nil) + ";";
+    }
+    if k == "return" {
+        let rv = try node.value catch nil;
+        if rv == nil { return pad + "return;"; }   // bare return (void-safe for ISRs)
+        return pad + "return " + transpile_expr(rv) + ";";
+    }
+    if k == "expr_stmt" {
+        let e = node.expr;
+        if is_map(e) and (try e.kind catch "") == "assign" {
+            return pad + e.name + " = " + transpile_expr(e.value) + ";";
+        }
+        // `arr[i] = v` — index store into a length-prefixed array block.
+        if is_map(e) and (try e.kind catch "") == "assign_to" {
+            let tgt = e.target;
+            if (try tgt.kind catch "") == "index" {
+                return pad + "(" + _pcast() + "(" + transpile_expr(tgt.obj) + "))[1 + (long)("
+                    + transpile_expr(tgt.index) + ")] = " + transpile_expr(e.value) + ";";
+            }
+            // `obj.field = v` — member store into a struct/map block at its slot.
+            if (try tgt.kind catch "") == "member" {
+                return pad + "(" + _pcast() + "(" + transpile_expr(tgt.obj) + "))["
+                    + str(_field_slot(tgt.name)) + "] = " + transpile_expr(e.value) + ";";
+            }
+        }
+        return pad + transpile_expr(e) + ";";
+    }
+    if k == "if" {
+        let s = pad + "if (" + transpile_expr(node.cond) + ") {" + _NL;
+        s = s + transpile_block(try node.then catch nil, depth + 1);
+        s = s + pad + "}";
+        // else-if chain
+        let elifs = try node.elifs catch nil;
+        if elifs != nil {
+            let ei = 0;
+            while ei < len(elifs) {
+                let ec = try elifs[ei].cond catch nil;
+                let eb = try elifs[ei].block catch nil;
+                if eb == nil { eb = try elifs[ei].then catch nil; }
+                s = s + " else if (" + transpile_expr(ec) + ") {" + _NL + transpile_block(eb, depth + 1) + pad + "}";
+                ei = ei + 1;
+            }
+        }
+        let els = try node.else catch nil;
+        if els != nil {
+            s = s + " else {" + _NL + transpile_block(els, depth + 1) + pad + "}";
+        }
+        return s;
+    }
+    if k == "for" {
+        // `for i N { body }` iterates i in 0..N (exclusive) → a counted C for-loop.
+        let s = pad + "for (" + _numty() + " " + node.name + " = 0; " + node.name + " < ("
+            + transpile_expr(try node.end catch nil) + "); " + node.name + " = " + node.name + " + 1) {" + _NL;
+        s = s + transpile_block(try node.body catch nil, depth + 1);
+        s = s + pad + "}";
+        return s;
+    }
+    if k == "while" {
+        let s = pad + "while (" + transpile_expr(node.cond) + ") {" + _NL;
+        s = s + transpile_block(try node.body catch nil, depth + 1);
+        s = s + pad + "}";
+        return s;
+    }
+    if k == "break" { return pad + "break;"; }
+    if k == "continue" { return pad + "continue;"; }
+    return pad + "/* unsupported stmt: " + k + " */";
+}
+
+fn transpile_block(blk, depth) {
+    if blk == nil { return ""; }
+    let stmts = try blk.stmts catch nil;
+    if stmts == nil { return ""; }
+    let out = "";
+    let i = 0;
+    while i < len(stmts) {
+        out = out + transpile_stmt(stmts[i], depth) + _NL;
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── Function → C (params and return as double) ──────────────────────────────────────
+fn transpile_fn(node) {
+    let name = node.name;
+    // INTERRUPT HANDLERS: a pblang function named `isr...` (interrupt service
+    // routine) is emitted as a GCC interrupt handler — `__attribute__((interrupt))`
+    // void NAME(void* frame) — so it gets the correct prologue/epilogue and `iret`.
+    // This is the language feature that makes IDT/exception/IRQ handlers writable
+    // in pblang; the body uses the OS intrinsics (inb/outb/poke/peek) as usual.
+    if str_starts_with(name, "isr") {
+        let s = "__attribute__((interrupt)) void " + name + "(void* _frame) {" + _NL;
+        s = s + transpile_block(try node.body catch nil, 1);
+        s = s + "}" + _NL;
+        return s;
+    }
+    let s = _numty() + " " + name + "(";
+    let params = try node.params catch [];
+    let i = 0;
+    while i < len(params) {
+        if i > 0 { s = s + ", "; }
+        s = s + _numty() + " " + params[i].name;
+        i = i + 1;
+    }
+    s = s + ") {" + _NL;
+    s = s + transpile_block(try node.body catch nil, 1);
+    s = s + "}" + _NL;
+    return s;
+}
+
+// _proto_fn(node) — a C forward declaration for a function, so functions may call
+// each other in ANY order (and recurse mutually) without C's "implicit declaration"
+// error. Mirrors transpile_fn's signature under the current numeric mode.
+fn _proto_fn(node) {
+    let name = node.name;
+    if str_starts_with(name, "isr") {
+        return "__attribute__((interrupt)) void " + name + "(void* _frame);" + _NL;
+    }
+    let s = _numty() + " " + name + "(";
+    let params = try node.params catch [];
+    let i = 0;
+    while i < len(params) {
+        if i > 0 { s = s + ", "; }
+        s = s + _numty() + " " + params[i].name;
+        i = i + 1;
+    }
+    return s + ");" + _NL;
+}
+
+// _emit_fns(source, preamble) — the shared core: parse `source`, emit `preamble`,
+// then forward declarations for every top-level `fn`, then each `fn` transpiled under
+// the CURRENT numeric mode. Callers set the mode (and compute the preamble under it)
+// before calling. Non-fn top-level statements are dropped (a freestanding unit is
+// functions).
+fn _emit_fns(source, preamble) {
+    _reset_fields();   // fresh field-layout per translation unit
+    let tok = import("stdlib/compiler/tokenizer.sapp");
+    let par = import("stdlib/compiler/parser.sapp");
+    let ast = par.parse(tok.tokenize(source));
+    let stmts = try ast.stmts catch [];
+    let out = preamble;
+    // forward declarations (any call order / mutual recursion)
+    let i = 0;
+    while i < len(stmts) {
+        if stmts[i].kind == "fn" { out = out + _proto_fn(stmts[i]); }
+        i = i + 1;
+    }
+    out = out + _NL;
+    // definitions
+    i = 0;
+    while i < len(stmts) {
+        if stmts[i].kind == "fn" { out = out + transpile_fn(stmts[i]) + _NL; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// transpile(source) — parse pblang and emit a C translation unit (the supported
+// numeric subset, numbers as `double`). Returns the C source string.
+fn transpile(source) {
+    _set_intmode(false);
+    return _emit_fns(source, "/* generated by stdlib/compiler/ctranspile.sapp (pblang -> C, numeric subset) */" + _NL);
+}
+
+// ── Freestanding profile (OS-dev) ──────────────────────────────────────────────────
+// The freestanding preamble: NO libc, fixed-width integer typedefs, and inline-asm
+// intrinsics for the core OS primitives (port I/O, halt, interrupt flags). pblang
+// code calling `outb(port, val)` / `inb(port)` / `hlt()` / `cli()` / `sti()`
+// transpiles to these — real hardware access. Compile the result with
+// `gcc -ffreestanding -nostdlib` (link with a kernel linker script for a bootable
+// image). This is what makes a pblang kernel possible; the bytecode VM cannot.
+fn freestanding_preamble() {
+    return "/* pblang freestanding runtime — no libc (compile: gcc -ffreestanding -nostdlib) */" + _NL
+        + "typedef unsigned char  u8;" + _NL
+        + "typedef unsigned short u16;" + _NL
+        + "typedef unsigned int   u32;" + _NL
+        + "typedef unsigned long  u64;" + _NL
+        + "typedef long           i64;" + _NL
+        + "static inline void outb(u16 port, u8 val){ __asm__ volatile (\"outb %0, %1\" : : \"a\"(val), \"Nd\"(port)); }" + _NL
+        + "static inline u8 inb(u16 port){ u8 r; __asm__ volatile (\"inb %1, %0\" : \"=a\"(r) : \"Nd\"(port)); return r; }" + _NL
+        + "static inline void hlt(void){ __asm__ volatile (\"hlt\"); }" + _NL
+        + "static inline void cli(void){ __asm__ volatile (\"cli\"); }" + _NL
+        + "static inline void sti(void){ __asm__ volatile (\"sti\"); }" + _NL
+        + _NL;
+}
+
+// transpile_freestanding(source) — the freestanding C translation unit: the
+// no-libc preamble + intrinsics, then the transpiled functions. Suitable for
+// `gcc -ffreestanding -nostdlib`.
+fn transpile_freestanding(source) {
+    _set_intmode(false);
+    return _emit_fns(source, freestanding_preamble());
+}
+
+// ── Bootable kernel profile (multiboot + GC-free memory) ────────────────────────────
+// Everything `transpile_freestanding` has, plus what makes an image GRUB/QEMU can
+// boot: a multiboot1 header, a `_start` entry that sets up a stack and calls
+// `kmain`, a GC-free **bump allocator** (kmalloc/kfree/kreset over a static heap —
+// the no-GC memory model a kernel needs), and raw memory access (poke/peek) so
+// pblang code can touch hardware memory (VGA, MMIO). 32-bit (multiboot1); build
+// with `gcc -m32 -ffreestanding -nostdlib -fno-pie` then `ld -m elf_i386 -T <script>`.
+fn kernel_preamble() {
+    let nl = _NL;
+    let s = "/* pblang bootable kernel (multiboot1, 32-bit, no libc, no GC) */" + nl;
+    s = s + "/* build: gcc -m32 -ffreestanding -nostdlib -fno-pie -c k.c -o k.o */" + nl;
+    s = s + "/*        ld -m elf_i386 -T kernel.ld -o kernel.elf k.o            */" + nl;
+    s = s + "typedef unsigned char u8; typedef unsigned short u16;" + nl;
+    s = s + "typedef unsigned int u32; typedef unsigned long u64;" + nl;
+    // multiboot header (magic, flags=0, checksum)
+    s = s + "__attribute__((section(\".multiboot\"))) const u32 _mb[] = { 0x1BADB002, 0, (u32)(0 - (0x1BADB002u + 0u)) };" + nl;
+    // OS intrinsics
+    s = s + "static inline void outb(u16 p,u8 v){ __asm__ volatile(\"outb %0,%1\"::\"a\"(v),\"Nd\"(p)); }" + nl;
+    s = s + "static inline u8 inb(u16 p){ u8 r; __asm__ volatile(\"inb %1,%0\":\"=a\"(r):\"Nd\"(p)); return r; }" + nl;
+    s = s + "static inline void hlt(void){ __asm__ volatile(\"hlt\"); }" + nl;
+    s = s + "static inline void cli(void){ __asm__ volatile(\"cli\"); }" + nl;
+    s = s + "static inline void sti(void){ __asm__ volatile(\"sti\"); }" + nl;
+    // raw memory access (addresses pass as double → u64; fine for 32-bit MMIO/VGA)
+    s = s + "static inline void poke8(u64 a,u8 v){ *(volatile u8*)(u64)a = v; }" + nl;
+    s = s + "static inline u8 peek8(u64 a){ return *(volatile u8*)(u64)a; }" + nl;
+    s = s + "static inline void poke16(u64 a,u16 v){ *(volatile u16*)(u64)a = v; }" + nl;
+    s = s + "static inline void poke32(u64 a,u32 v){ *(volatile u32*)(u64)a = v; }" + nl;
+    s = s + "static inline u32 peek32(u64 a){ return *(volatile u32*)(u64)a; }" + nl;
+    // interrupt support: load IDT register, and a software-interrupt trigger (vec
+    // 0x30) used to exercise a handler. `cli`/`sti` (above) gate interrupts.
+    s = s + "static inline void lidt(u64 a){ __asm__ volatile(\"lidt (%0)\"::\"r\"((u32)(u64)a):\"memory\"); }" + nl;
+    s = s + "static inline void swint(void){ __asm__ volatile(\"int $0x30\"); }" + nl;
+    s = s + "static inline void swint80(void){ __asm__ volatile(\"int $0x80\"); }" + nl;   // syscall trap
+    // usermode (ring-3) readiness: load the GDT register, load the task register (TSS
+    // selector), and drop to ring 3 via iret. enter_user reloads the data segments to
+    // the user data selector (0x23), then pushes a ring-3 iret frame (user SS 0x23,
+    // user ESP, eflags, user CS 0x1B, entry) and irets — the standard ring0->ring3
+    // transition. (Selectors assume the gdt.sapp layout: user code idx 3, user data
+    // idx 4, both RPL 3.)
+    s = s + "static inline void lgdt(u64 a){ __asm__ volatile(\"lgdt (%0)\"::\"r\"((u32)(u64)a):\"memory\"); }" + nl;
+    s = s + "static inline void ltr(u32 sel){ __asm__ volatile(\"ltr %w0\"::\"r\"(sel)); }" + nl;
+    s = s + "static inline void enter_user(u32 entry, u32 ustack){ __asm__ volatile(" + nl;
+    s = s + "  \"movw $0x23, %%ax\\n movw %%ax, %%ds\\n movw %%ax, %%es\\n movw %%ax, %%fs\\n movw %%ax, %%gs\\n\"" + nl;
+    s = s + "  \"pushl $0x23\\n pushl %1\\n pushl $0x2\\n pushl $0x1B\\n pushl %0\\n iret\\n\"" + nl;
+    s = s + "  ::\"r\"(entry),\"r\"(ustack):\"eax\",\"memory\"); }" + nl;
+    // read_cs() — the current code selector. Its low 2 bits are the CPL, so code can
+    // check its own privilege level (0x1B = user code RPL 3; 0x08 = kernel RPL 0).
+    s = s + "static inline u32 read_cs(void){ u16 r; __asm__ volatile(\"movw %%cs, %0\":\"=r\"(r)); return (u32)r; }" + nl;
+    // paging (virtual memory): load the page-directory base into CR3, flip the paging
+    // bit (CR0.PG) on, read the faulting address (CR2), and flush one TLB entry. With an
+    // identity-mapped page directory installed first, enabling paging is seamless.
+    s = s + "static inline void set_cr3(u32 pd){ __asm__ volatile(\"movl %0, %%cr3\"::\"r\"(pd):\"memory\"); }" + nl;
+    s = s + "static inline void enable_paging(void){ __asm__ volatile(\"movl %%cr0, %%eax\\n orl $0x80000000, %%eax\\n movl %%eax, %%cr0\\n\":::\"eax\",\"memory\"); }" + nl;
+    s = s + "static inline u32 read_cr2(void){ u32 r; __asm__ volatile(\"movl %%cr2, %0\":\"=r\"(r)); return r; }" + nl;
+    s = s + "static inline void invlpg(u32 a){ __asm__ volatile(\"invlpg (%0)\"::\"r\"(a):\"memory\"); }" + nl;
+    // cooperative context switch: save callee-saved regs + esp into *old_sp, load
+    // new_sp and restore — the primitive a stackful scheduler is built on. Naked, cdecl
+    // args at 4(%esp)/8(%esp). A fresh task's stack is primed as [ebx,esi,edi,ebp,entry]
+    // so the first switch `ret`s straight into the task entry. (Both args u32 so the
+    // pblang `long` values pass without pointer warnings.)
+    s = s + "__attribute__((naked)) static void ctx_switch(u32 old_sp, u32 new_sp){ __asm__ volatile(" + nl;
+    s = s + "  \"movl 4(%esp), %eax\\n movl 8(%esp), %edx\\n\"" + nl;
+    s = s + "  \"pushl %ebx\\n pushl %esi\\n pushl %edi\\n pushl %ebp\\n\"" + nl;
+    s = s + "  \"movl %esp, (%eax)\\n movl %edx, %esp\\n\"" + nl;
+    s = s + "  \"popl %ebp\\n popl %edi\\n popl %esi\\n popl %ebx\\n ret\\n\"); }" + nl;
+    // GC-free bump allocator over a static heap. Allocator math is done in u64 (mode-
+    // independent); only the pblang-facing number type (n / return) follows the mode,
+    // so an int-mode kernel never touches a float.
+    let nt = _numty();
+    s = s + "static u8 _kheap[262144]; static u64 _koff = 0;" + nl;
+    s = s + "static " + nt + " kmalloc(" + nt + " n){ u64 o=_koff; _koff += ((u64)n + 7) & ~7UL; return (" + nt + ")(u64)&_kheap[o]; }" + nl;
+    s = s + "static void kfree(" + nt + " p){ (void)p; }" + nl;       // bump: no per-object free
+    s = s + "static void kreset(void){ _koff = 0; }" + nl;
+    // stack + entry: _start sets esp, calls kmain, halts forever
+    s = s + "static u8 _kstack[65536];" + nl;
+    s = s + "__attribute__((naked)) void _start(void){ __asm__ volatile(\"mov $_kstack + 65536, %esp\\n call kmain\\n 1: hlt\\n jmp 1b\\n\"); }" + nl;
+    s = s + nl;
+    return s;
+}
+
+// transpile_kernel(source) — a full bootable multiboot kernel (numbers as `double`):
+// kernel preamble (header, intrinsics, allocator, _start) + the transpiled
+// functions. `source` must define `fn kmain() { ... }` (the kernel entry).
+fn transpile_kernel(source) {
+    _set_intmode(false);
+    return _emit_fns(source, kernel_preamble());
+}
+
+// transpile_kernel_int(source) — the SAME bootable multiboot kernel, but in INTEGER
+// codegen mode: every number lowers to `long` instead of `double`, so the kernel is
+// completely float-runtime-free (no SSE, no soft-float libgcc). This is what lets a
+// kernel that installs GCC interrupt handlers (`isr...` fns, which need
+// -mgeneral-regs-only) actually LINK and BOOT — see PrjAnalysis §73. Build:
+//   gcc -m32 -ffreestanding -nostdlib -fno-pie -mgeneral-regs-only -c k.c -o k.o
+//   ld -m elf_i386 -T kernel.ld -o kernel.elf k.o
+fn transpile_kernel_int(source) {
+    _set_intmode(true);
+    let out = _emit_fns(source, kernel_preamble());
+    _set_intmode(false);   // restore default (module state persists across calls)
+    return out;
+}
+
+// transpile_freestanding_int(source) — freestanding profile in integer mode (no
+// multiboot/_start, but float-free). For OS object files compiled with
+// `gcc -ffreestanding -nostdlib -mgeneral-regs-only`.
+fn transpile_freestanding_int(source) {
+    _set_intmode(true);
+    let out = _emit_fns(source, freestanding_preamble());
+    _set_intmode(false);
+    return out;
+}
+
+// kernel_linker_script() — links the multiboot header first at 1 MiB, entry _start.
+fn kernel_linker_script() {
+    let nl = _NL;
+    return "ENTRY(_start)" + nl
+        + "SECTIONS {" + nl
+        + "  . = 1M;" + nl
+        + "  .text : { *(.multiboot) *(.text*) }" + nl
+        + "  .rodata : { *(.rodata*) }" + nl
+        + "  .data : { *(.data*) }" + nl
+        + "  .bss : { *(.bss*) *(COMMON) }" + nl
+        + "}" + nl;
+}
+
+export transpile_expr, transpile_stmt, transpile_block, transpile_fn, transpile;
+export freestanding_preamble, transpile_freestanding, transpile_freestanding_int;
+export kernel_preamble, transpile_kernel, transpile_kernel_int, kernel_linker_script;
+export _set_intmode, _numty;

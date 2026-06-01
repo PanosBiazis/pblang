@@ -1,0 +1,77 @@
+// stdlib/kernel/sched.sapp — a round-robin task scheduler, written in pblang.
+//
+// Real stackful multitasking: each task runs on its own stack, and switching tasks is
+// a genuine CPU context switch (the `ctx_switch` intrinsic saves/restores callee-saved
+// registers and swaps esp). This is the substrate for a multitasking kernel — drive it
+// COOPERATIVELY (tasks call `sched_yield`) or PREEMPTIVELY (the timer ISR calls
+// `sched_yield` for them; see stdlib/kernel/timer.sapp + §79).
+//
+// Scheduler control block (raw poke32 fields):  +0 ntasks  +4 current  +8 esp-table ptr
+// The esp-table holds one saved-stack-pointer cell per task.
+//
+//   fn task_a() { while 1 > 0 { /* work */ sched_yield(peek32(SCHED_CELL)); } }
+//   fn kmain() {
+//     let s = sched_new(8);
+//     poke32(SCHED_CELL, s);                                   // publish for the tasks
+//     task_add(s, kmalloc(4096), 4096, addr_of("task_a"));
+//     task_add(s, kmalloc(4096), 4096, addr_of("task_b"));
+//     sched_start(s);                                          // -> task 0 (no return)
+//   }
+//
+// Lower with `transpile_kernel_int`. All pblang.
+
+// sched_new(maxtasks) — an empty scheduler with room for `maxtasks` saved-esp cells.
+fn sched_new(maxtasks) {
+    let s = kmalloc(12);
+    poke32(s + 0, 0);                       // ntasks
+    poke32(s + 4, 0);                       // current task index
+    poke32(s + 8, kmalloc(maxtasks * 4));   // esp table
+    return s;
+}
+
+fn _esp_cell(s, i) { return peek32(s + 8) + i * 4; }
+
+// task_add(s, stack_base, stack_size, entry) — prime a fresh task's stack so the first
+// switch into it pops four zero callee-saved regs and `ret`s into `entry`, then record
+// the resulting saved stack pointer. Returns the task id. `entry` = addr_of("fn").
+fn task_add(s, stack_base, stack_size, entry) {
+    let top = stack_base + stack_size;
+    poke32(top - 4, entry);     // ret address -> task entry
+    poke32(top - 8, 0);         // ebp
+    poke32(top - 12, 0);        // edi
+    poke32(top - 16, 0);        // esi
+    poke32(top - 20, 0);        // ebx
+    let id = peek32(s + 0);
+    poke32(_esp_cell(s, id), top - 20);
+    poke32(s + 0, id + 1);
+    return id;
+}
+
+// PREEMPTIVE use: install a timer ISR that calls `sched_yield(s)` (see §79). Do NOT
+// `sti()` before `sched_start` — a tick firing while still in `kmain` (current=0) would
+// save the boot stack into task 0's cell and clobber its primed stack. Enable
+// interrupts INSIDE the first task instead (the interrupt gate clears IF on each switch
+// into a task, so every task should `sti()` on entry).
+
+// sched_start(s) — leave the boot context and run task 0. The boot context's esp is
+// saved into a throwaway cell (it is never resumed: the kernel lives in its tasks now).
+fn sched_start(s) {
+    let scratch = kmalloc(4);
+    poke32(s + 4, 0);
+    ctx_switch(scratch, peek32(_esp_cell(s, 0)));
+}
+
+// sched_yield(s) — round-robin to the next task and context-switch into it. Saves the
+// caller's stack pointer into its own cell, so it resumes here when its turn returns.
+fn sched_yield(s) {
+    let n = peek32(s + 0);
+    if n <= 1 { return 0; }                 // nothing to switch to
+    let cur = peek32(s + 4);
+    let nxt = cur + 1;
+    if nxt >= n { nxt = 0; }
+    poke32(s + 4, nxt);
+    ctx_switch(_esp_cell(s, cur), peek32(_esp_cell(s, nxt)));
+    return 0;
+}
+
+export sched_new, task_add, sched_start, sched_yield;

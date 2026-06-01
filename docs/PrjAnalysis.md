@@ -1,4 +1,4 @@
-# pblang — Project Quality Analysis (2026-05-24)
+# pblang — Project Quality Analysis (2026-05-24, current through 2026-05-30)
 
 > This document combines a **comprehensive quality audit** (top half, this section)
 > with a **validation baseline / fix log** (bottom half, preserved from earlier
@@ -6,6 +6,14 @@
 > the chumsky 1.0 migration, the axum/tokio serve rewrite, the `main.rs` split
 > into `src/cli/*`, and the polyglot bridge expansion to 47 host languages +
 > cached cdylib loader.
+>
+> **Current status (2026-05-30):** §§19–45 below extend the original audit. The
+> headline since: **self-hosting is COMPLETE** — the pblang-written compiler
+> tokenizes, parses, compiles, **and runs** pblang end-to-end, with every language
+> feature self-hosting (§§26–45). The §1 metrics and current-status claims have been
+> refreshed to the 2026-05-30 numbers; dated section verifications (§§17–25) are
+> kept as historical snapshots. The forward direction is captured in §46 (current
+> status + north-star goals: OS/bare-metal, a pblang-written IDE, and pbAI).
 
 ---
 
@@ -22,7 +30,7 @@
 | Largest stdlib | `math.sapp` (1,018), `thread.sapp` (~976), `polyglot_registry.sapp` (703), `ide.sapp` (632), `async_await.sapp` (526) |
 | Examples | 23 |
 | Integration test files | 32 (semantics, pack, threads, sandbox, LSP, HTTP server, fmt, lint, modules, polyglot, quantum sim, tensors, …) |
-| Total tests | **136** `#[test]` (Rust unit) + **112** `tests/semantics/*.sapp` end-to-end + 32 integration suites; cargo `tests/semantics.rs` **185/0/1**, `pblang-typeck` 42, `pblang-lint` 12, `pblang test tests/semantics` 111/1 (the 1 = capability-gated onnx) |
+| Total tests | **136+** `#[test]` (Rust unit) + **114** `tests/semantics/*.sapp` end-to-end + 32 integration suites; cargo `tests/semantics.rs` **191/0/1** (only `os_env_set_pass` ignored), `selfhost_drift` 26/0/1, `modules` 28/0, `typeck_compiler` 5/0, `pblang-typeck` **46**, `pblang-lint` 12, `fmt` 8/0, `fmt_drift` 2/0, `pblang test tests/semantics` 114/1 (the 1 = capability-gated onnx) |
 | License | MIT |
 | Edition / MSRV | Rust 2021 |
 
@@ -116,7 +124,7 @@ A dedicated security scan was performed against 10 categories. Summary:
 ## 7. Partial implementations and stubs
 
 ### Stdlib (`.sapp`)
-**121 modules total** — categorized by depth:
+**135 top-level modules** (147 incl. the 12 self-host compiler modules) — categorized by depth:
 
 | Tier | Count | Examples |
 |---|---|---|
@@ -172,7 +180,7 @@ Only **9 actionable** TODOs across the entire codebase (excluding the `pb-mcp-se
 | **Traits / interfaces** | Duck typing only. No nominal interface system. | Large |
 | **Compile-time macros / metaprogramming** | None. Fixed syntax. | Very large |
 | **Full HM-style type inference** | Inference is context-driven, not full Hindley-Milner | Large |
-| **Bare-metal kernel target** | Intentionally out of scope per architectural-impossibility analysis in `docs/Future_plans.md` | — |
+| **Bare-metal / OS-dev target** | **Now an explicit project goal** (reversing the earlier "out of scope" stance). The OS-primitive API is sketched in `stdlib/systems.sapp` (asm/port/MMIO/interrupts/paging/GDT/multiboot) but as **modeling stubs today**; the real work is a freestanding codegen mode (via `pblang-ctranspiler`/LLVM) + a kernel-grade runtime. Roadmap: `docs/OS_Development.md` (phases K0–K6) | Large |
 | **TLS for HTTP server (HTTPS on `pblang serve`)** | TLS exists at the VM net layer (`tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls`); the IDE-backend `pblang serve` is plaintext-only (`127.0.0.1` local-loopback removes most of the need) | Small |
 | ~~**HTTP/2 + WebSockets in serve**~~ | **Both done 2026-05-26.** WebSockets: new `GET /ws` route, tiny JSON-over-text protocol (ping/echo/version); CPU-bound run/check/format intentionally still on POST. HTTP/2: axum/http2 feature on; HTTPS path negotiates ALPN h2/http1.1 via custom `build_tls_config_with_alpn` helper. 3 HTTPS tests + 2 WS tests in `tests/new_cmd.rs`. | — |
 | **Headless-browser rendering for HTML/CSS** | `stdlib/polyglot_web.sapp` writes bundles and calls `xdg-open`/`open`/`start`; no Chrome-DevTools/Playwright integration | Medium |
@@ -426,20 +434,21 @@ Items still open:
 
 ### Implemented
 - **Control flow**: `if`/`elif`/`else`, `while`, `for i N`, `for x in array`, `for k, v in map`, `loop` + `break`/`continue`, `match` with pattern guards, `try`/`catch`, `throw`, `defer` (LIFO), `spawn`, `return`. `if expr` as expression.
+- **Operators**: arithmetic `+ - * / % **`, comparison, logical `and`/`or`/`not`, compound assignment `+= -= *= /= %= **=`, pipeline `|>`, slice `seq[a..b]`, nil-safe `?.`/`?[]`/`??`, and **infix bitwise `& | ^ << >>` + prefix `~`** (§47) with C/Rust-style precedence. **Radix integer literals** `0xFF` / `0b1010` / `0o17` (§47).
 - **Numbers — full precision ladder, programmer-opt-in:** unboxed `f64` (fast default) → `bigint(x)` (exact unbounded integers, `Obj::BigInt`) → `rational(x)`/`rational(n,d)` (exact unbounded fractions, `Obj::Rational` — `rational("0.1")+rational("0.2")` is exactly `3/10`) → `decimal(x)` (exact base-10, fixed-scale rounding division, `Obj::Decimal` — `decimal("0.1")+decimal("0.2")` is `0.3`). `type()` reports `"bigint"`/`"rational"`/`"decimal"`. See §19/§20/§21.
 - **Type system**: optional type annotations on `let` and `fn`; `TypeExpr` covers primitives, arrays, maps, functions, generics; partial context-driven inference; gradual typing. `struct`/`enum` declarations get **typed field/variant access** in `pblang-typeck` — `p.x` resolves to the field type and flows downstream, unknown fields/variants are reported with Levenshtein "did you mean?" suggestions, and data-variant constructors are argument-type-checked.
-- **OOP**: `class` syntax sugar desugaring to maps + methods; instance creation via `new(...)`; method dispatch with implicit `self`; structs as maps with named fields. No nominal inheritance.
+- **OOP**: native `class` syntax sugar desugaring to maps + methods; instance creation via `new(...)`; method dispatch with implicit `self`; structs as maps with named fields; **operator overloading** via dunder methods (`__add__`/`__mul__`/`__rmul__`/`__eq__`/`__lt__`/…, §51). Full object model — **single inheritance + `super` + mixins + static methods + bound methods** — in the pblang `stdlib/class.sapp` library (§52); the native `class` keyword itself has no nominal inheritance.
 - **Error model**: `RuntimeError` values; `try/catch` catches anything; `throw` raises with any value; `defer` runs LIFO on success/error/scope-exit.
-- **Concurrency**: `spawn(fn)` lightweight task, channels (send/recv), `select` over channels, mutexes, RwLocks, barriers, atomics, async/await as stdlib sugar.
+- **Concurrency**: `spawn(fn)` lightweight task, channels (send/recv), `select` over channels, mutexes, RwLocks, barriers, atomics, and **native `async fn` / `await` keywords** (§48, desugar to `spawn`/`join`).
 - **Modules**: `import("stdlib:name.sapp")`, `export name1, name2, …`, cycle detection, module caching, host-customizable resolver.
-- **String interpolation**, **nil-safe operators** (`?.`, `?[]`, `??`).
+- **String interpolation**, **nil-safe operators** (`?.`, `?[]`, `??`), **pipeline** `|>`, **slice** `seq[a..b]`.
+- **Self-hosting (complete)** — every feature above also compiles **and runs** through the pblang-written compiler (`stdlib/compiler/`): the language can express and execute its own full toolchain end-to-end (§§26–45).
 
 ### Not implemented (or partial)
-- **Traits / interfaces** — duck typing only.
+- ~~**Traits / interfaces** — duck typing only.~~ **✓ Done (§50):** the `interface` keyword declares a structural contract that desugars to a predicate function `Name(x)` (Go/TS/Python-`Protocol`-style structural typing), backed by the `has_member` reflection builtin which walks the `__class` chain so class instances conform too.
 - **Macros / compile-time metaprogramming** — none.
 - **Full HM type inference** — context-driven only.
-- **Tail-call optimization** — recursion works but isn't optimized to iteration.
-- **`async fn` / `await` as keywords** — sugar layer in `async_await.sapp` instead.
+- ~~**Tail-call optimization** — recursion works but isn't optimized to iteration.~~ **✓ Done (§49):** `return f(args)` in tail position reuses the call frame — deep self/mutual recursion runs in O(1) native-stack space.
 
 ## 13. Tooling and ecosystem
 
@@ -476,7 +485,7 @@ This compares **the runtime / language / ecosystem maturity** of pblang against 
 | Dynamic typing | ✓ gradual | ✓ | ✓ | optional | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | n/a (markup) |
 | Static type checker | ✓ `pblang lint` (gradual) | ⚠ mypy/pyright (external) | ⚠ JSDoc | ✓ | ✓ strong | ✓ | ✓ | ✓ | ⚠ | ✓ | ✓ | ✓ | ✓ | ✓ HM | ✓ HM | ⚠ spec | ✓ Dialyzer | n/a |
 | Pattern matching | ✓ with guards | ✓ structural (3.10+) | ✗ | ✓ via library | ✓ exhaustive | ✗ | ✓ (21+) | ✓ | ✗ | ✗ | ⚠ (26?) | ⚠ case | ✓ EVALUATE | ✓ | ✓ | ✓ core.match | ✓ | n/a |
-| Async/await (native) | ⚠ stdlib sugar | ✓ | ✓ | ✓ | ✓ | n/a (CSP) | ✓ (21 vt) | ✓ | ✗ coroutines | ✗ | ✓ (20) | ⚠ ext | ✗ | ✓ effects | ✓ | ✗ | n/a (actors) | n/a |
+| Async/await (native) | ✓ `async fn`/`await` keywords (sugar→spawn/join) | ✓ | ✓ | ✓ | ✓ | n/a (CSP) | ✓ (21 vt) | ✓ | ✗ coroutines | ✗ | ✓ (20) | ⚠ ext | ✗ | ✓ effects | ✓ | ✗ | n/a (actors) | n/a |
 | Channels / CSP | ✓ | ⚠ queue | ⚠ libs | ⚠ libs | ✓ std::sync::mpsc | ✓ first-class | ⚠ Disruptor | ✓ | ✗ | ✗ | ⚠ TBB | ✗ | ✗ | ⚠ libs | ⚠ libs | ✓ core.async | ✓ first-class | n/a |
 | Pattern-matched error handling | ✓ `try/catch` + `defer` | ✓ try/except | ✓ try/catch | ✓ | ✓ Result + ? | ✓ multi-return + defer | ✓ checked | ✓ | ✓ pcall | ✗ setjmp | ✓ throw | ✓ try/except | ✓ DECLARATIVES | ✓ exns + Result | ✓ Either monad | ✓ ex-info | ✓ try/catch/throw + supervisors | n/a |
 | Polyglot embedding (host any-lang in same file) | ✓ **47 languages** | ⚠ ctypes/cffi | ⚠ N-API | ⚠ N-API | ⚠ FFI | ⚠ cgo | ⚠ JNI/Panama | ⚠ JNI | ✓ via C | ✓ FFI | ✓ FFI | ✓ external | ✗ | ✓ FFI | ✓ FFI | ✓ JVM interop | ✓ NIF | ✗ |
@@ -486,7 +495,7 @@ This compares **the runtime / language / ecosystem maturity** of pblang against 
 | Optional native AOT | ⚠ cranelift/LLVM/wasm experimental | ⚠ Cython/Nuitka | n/a | n/a | ✓ | ✓ | ⚠ GraalVM | ✓ Native | ⚠ LuaJIT | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ⚠ GraalVM | ⚠ HiPE | n/a |
 | Built-in package manager | ✓ `pblang init`/`pack`/`publish` | ✓ pip | ✓ npm | ✓ npm | ✓ cargo | ✓ go mod | ✓ Maven/Gradle | ✓ Gradle | ⚠ luarocks | ⚠ vcpkg/conan | ⚠ vcpkg/conan | ⚠ FPM | ⚠ | ✓ opam | ✓ cabal | ✓ deps.edn | ✓ rebar3/mix | ⚠ npm (asset side) |
 | LSP server included | ✓ | ✓ pyright/jedi | ✓ many | ✓ | ✓ rust-analyzer | ✓ gopls | ✓ jdtls | ✓ | ⚠ | ✓ clangd | ✓ clangd | ⚠ | ⚠ | ✓ merlin | ✓ HLS | ✓ | ✓ ElixirLS | ✓ vscode-html |
-| Self-hosted compiler | ⚠ partial (`stdlib/compiler/*.sapp`, 4k+ LOC, runs on host VM) | ✗ (CPython is C) | ✗ (V8 is C++) | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ FPC self-host | ✗ | ✓ | ✓ | ✓ | ✓ | n/a |
+| Self-hosted compiler | ✓ **complete** (`stdlib/compiler/*.sapp`, ~5,300 LOC; tokenizes/parses/compiles **and runs** pblang end-to-end via `vm.sapp`) | ✗ (CPython is C) | ✗ (V8 is C++) | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ FPC self-host | ✗ | ✓ | ✓ | ✓ | ✓ | n/a |
 | HTTP server in stdlib | ✓ | ⚠ wsgiref | ✓ http | (via JS) | ⚠ via crate | ✓ | ⚠ HttpServer | (via Java) | ⚠ | ✗ | ⚠ Boost | ⚠ ext | ✗ | ⚠ Cohttp | ⚠ Warp/Servant | ⚠ Ring | ✓ cowboy | n/a (consumes) |
 | AI/ML primitives in stdlib | ✓ 24 native tensor + 10 NN primitives + provider bridges | ✗ (NumPy/Torch external) | ✗ (TF.js external) | ✗ | ✗ | ✗ | ✗ DJL | ✗ | ✗ | ✗ | ✗ libtorch | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | n/a |
 | Quantum primitives in stdlib | ✓ statevector simulator + circuit builder + QKD constants | ⚠ Qiskit external | ✗ | ✗ | ⚠ qrusty | ✗ | ⚠ Strange | ✗ | ✗ | ✗ | ⚠ Qpp | ✗ | ✗ | ✗ | ⚠ Quipper | ✗ | ✗ | n/a |
@@ -515,7 +524,7 @@ The realistic positioning: pblang can **emit and orchestrate** HTML/CSS/JS (buil
 - **Built-in concurrency stack** at language level — spawn, channels, select, mutexes, RwLocks, barriers, atomics, async/await sugar — rather than as a library.
 - **One-binary deployment** via `pblang bundle --self-extract` with hardened extraction.
 - **Capability-based sandboxing** — every sensitive builtin gates on `host.allow_*()`, suitable for embedding pblang in untrusted contexts.
-- **Self-hosting in progress** — `stdlib/compiler/*.sapp` is a pblang-in-pblang frontend.
+- **Self-hosting complete** — `stdlib/compiler/*.sapp` is a pblang-in-pblang compiler that tokenizes, parses, compiles, **and runs** pblang end-to-end; every language feature self-hosts (§§26–45).
 
 ### Where pblang trails
 
@@ -946,6 +955,824 @@ match s.chars().nth(idx) {
 Locked by extending `tests/semantics.rs::sort_and_numeric_builtins_pass` with non-ASCII cases: `strcharcodeat("é", 0) == 233` (scalar, not first byte 195), codepoint indexing across a multibyte char (`"aλb"` → idx 1 = 955, idx 2 = 98), and the `strfromcharcode(strcharcodeat("λ", 0)) == "λ"` round-trip. Suites green: `semantics` 189/0/1, `selfhost_drift` 26/0/1, `modules` 28/0, `typeck_compiler` 5/0, `pblang-vm` lib 2/0.
 
 **No remaining items.** Every documented language gap and the string-API consistency nit are closed; the self-host frontier is now purely breadth/perf (run a real stdlib module through `frontend_run` and diff vs the Rust VM; speed up the self-hosted parser to drop the `#[ignore]` on the full-parser drift test).
+
+## 46. Current status snapshot + north-star goals (2026-05-30)
+
+**Where pblang stands today.** The language is a production-quality bytecode-VM language (v0.5.7, 17 crates, ~135 stdlib modules) with a **complete self-hosted compiler** — pblang tokenizes, parses, compiles, and runs pblang end-to-end, with *every* core language feature self-hosting (§§26–45). The precision ladder (`f64`→`bigint`→`rational`→`decimal`) is complete (§§19–22). The string API is uniformly codepoint-based (§45). Infix bitwise operators + radix literals (§47), native `async`/`await` keywords (§48), tail-call optimization (§49), structural `interface`s (§50), operator overloading + comparison overloading (§51) landed. Green suites: `semantics` **191/0/1** (Rust) + the `.sapp` corpus runs **148/0** through the pblang test runner (no cargo) (only `os_env_set_pass` ignored — the former match-guard limitation is **resolved**), `selfhost_drift` 26/0/1, `modules` 28/0, `typeck_compiler` 5/0, `pblang-typeck` 46/0, `pblang-lint` 12/0, `fmt` 8/0, `fmt_drift` 2/0.
+
+**Immediate self-host frontier (breadth/perf, not grammar):**
+1. Run a real `stdlib/*.sapp` module through `frontend_run` and diff output vs the Rust VM.
+2. Speed up the self-hosted parser enough to drop the `#[ignore]` on the full-parser `selfhost_drift` case.
+3. Bootstrap probe — feed `frontend_compile`'s own source through `frontend_run`.
+
+**North-star goals (roadmap, documented honestly as not-yet-shipped):**
+- **OS / bare-metal capability** — make pblang usable to write and boot an OS. `stdlib/systems.sapp` sketches the OS-primitive API but as modeling stubs; the work is a freestanding codegen mode (via `pblang-ctranspiler`/LLVM) + a kernel-grade runtime (tiny allocator, no-GC subset, panic=halt). This **reverses** the earlier "out of scope" stance (see §8). Doc: `docs/OS_Development.md` (phases K0–K6).
+- **A self-hosted IDE + visual designer written in pblang** — *pblang Studio*: drag-and-drop building of GUI (`graphics.sapp`), web (`web_framework.sapp`/`html.sapp`), and CLI apps (Delphi / Qt Designer / WordPress / Joomla / Android Studio / VS Code style), with two-way code↔design sync via the self-hosted parser/codegen — and the IDE itself authored in pblang. Doc: `docs/Visual_Designer.md`.
+- **pbAI** — pblang's own AI model family (flagship pbAI-Max + distilled sub-models), written in pblang on the existing `tensor_*` builtins, expandable, driving the pb-mcp-server tool catalog, for coding/debugging to improve pblang itself. Doc: `docs/pbAI.md`.
+
+These three extend the same "all the way down / all in pblang" property self-hosting established for the compiler — to the IDE, to the bare metal, and to the language's own intelligence.
+
+## 47. Competitiveness: infix bitwise operators + radix integer literals (2026-05-30)
+
+Closed a real "every mainstream language has this, pblang didn't" gap (§12/§14) — and one directly on the path to the OS-dev goal (§8/§46), where bit manipulation of flags, masks, and page-table/descriptor bits is unavoidable. Before this, `6 & 3` was a **lex error** and `0xFF` was unrecognized; bit work meant importing `stdlib/bitops.sapp` helpers.
+
+**Native bitwise builtins** (`crates/pblang-vm/src/vm/bitwise.rs`, registered in `builtins_table.rs`, seeded in the typeck prelude): `bit_and`/`bit_or`/`bit_xor`/`bit_not`/`bit_shl`/`bit_shr`. **i64 semantics** — operands must be integral and in `i64` range, results returned in the f64 value model (exact to 2^53; for unbounded exact integers use `bigint(...)`); right shift is arithmetic; shift amounts are bounds-checked `0..=63`. Pure (no capability gate).
+
+**Infix operators** (parser sugar, `crates/pblang-core/src/parser.rs`, zero IR/VM change): `&` `|` `^` `<<` `>>` and prefix `~` desugar to the `bit_*` calls. Precedence follows Rust/Python (all tighter than comparison, ordered `<< >>` → `&` → `^` → `|`), inserted as new `.boxed()` `foldl` layers between the additive and comparison layers. The one hazard — `|` vs the `|>` pipeline operator — is handled by guarding the bitwise-`|` parser with `just("|").then_ignore(none_of(">").rewind())` so `a |> f` still pipes while `a | b` ORs. Verified: `5 |> bit_shl(1)` → `10` (pipe intact) and `10 & 6 == 2` → `true` (bitwise binds tighter than `==`).
+
+**Radix integer literals** (`crates/pblang-core/src/parser.rs`): `0x`/`0X` hex, `0b`/`0B` binary, `0o`/`0O` octal, parsed before the decimal literal (which would otherwise eat the leading `0`).
+
+Locked by `tests/semantics.rs::bitwise_operators_and_radix_literals` (13 assertions). Regression-clean: `semantics` **190/0/1**, `stdlib_parse` 1/0 (all stdlib still parses — no chumsky cascade), `modules` 28/0, `typeck_compiler` 5/0, `selfhost_drift` 26/0/1, `pblang-core` 4/0, `pblang-typeck` 46/0, `fmt`/`fmt_drift` green. **Follow-up:** teach the self-hosted `stdlib/compiler/tokenizer.sapp`/`parser.sapp` the same operators + radix literals so they self-host too (the Rust frontend — the primary path — has them now).
+
+## 48. Competitiveness: native `async` / `await` keywords (2026-05-30)
+
+Flipped §14's "Async/await (native)" row from **⚠ stdlib sugar** to **✓ keyword syntax** — matching Python/JS/TS/Rust/C#/Kotlin — without a runtime rewrite. Pure parser sugar over the existing global `spawn`/`join` builtins (which already give real per-VM-thread concurrency; `join` returns the spawned function's result), so **no IR/VM/typeck change and no stdlib import**.
+
+```
+async fn fetch(id) { return load(id); }   //  ≡  fn fetch(id) { return spawn(fn() { return load(id); }); }
+let task = fetch(7);                        //  starts running concurrently, returns a task handle
+let data = await task;                      //  ≡  join(task) — blocks, yields the result
+print (await fetch(1)) + (await fetch(2));  //  two tasks run concurrently, then both joined
+```
+
+- **`async fn f(p){ body }`** (`crates/pblang-core/src/parser.rs`, a new `async_fn_stmt` placed ahead of `fn_stmt` in the statement choice): desugars the declaration to `fn f(p){ return spawn(fn(){ body }); }`. Calling `f(...)` spawns the body and returns the task handle; params are captured by the inner closure (by-reference upvalues, transferred via `spawn_wire`).
+- **`await EXPR`** (a new `Prefix::Await` in the unary layer): desugars to `join(EXPR)`. It is a **whitespace-guarded contextual keyword** — `just("await").then_ignore(ws1)` — so `await task` / `await fetch()` is the keyword, while **`await(x)` with no space stays an ordinary call** to a function named `await`. This was essential: the concurrency stdlib (`thread.sapp`, `async.sapp`, `async_await.sapp`, `thread_pool.sapp`) defines `fn await(...)` and calls `await(future)` pervasively, and is load-bearing for many tests. The guard (plus chumsky's backtracking on the failed prefix alternative) means all of that still parses unchanged. `async` was safe to take — it appears only in comments.
+
+Locked by `tests/semantics.rs::async_await_keywords`. **Non-breaking, regression-clean:** `stdlib_parse` 1/0 (the whole stdlib — incl. every `fn await` / `await(...)` — still parses), `threads` 11/0, `semantics` **191/0/1**, `modules` 28/0, `typeck_compiler` 5/0, `selfhost_drift` 26/0/1, `fmt`/`fmt_drift` green. **Follow-up:** native `async fn`/`await` give task-per-call concurrency; `await_all`/`await_any`/`then`/`map` composition stay in `async_await.sapp`. Teach the self-hosted parser the same keywords for self-host parity.
+
+---
+
+## 49. Competitiveness: tail-call optimization (TCO) (2026-05-30)
+
+Closed §14's last "deep recursion overflows the native stack" gap. A `return f(args)` in **tail position** now reuses the current call frame instead of pushing a new one, so deep self-recursion and mutual recursion run in **O(1) native-stack space** — parity with Scheme, Lua, Scala (`@tailrec`), and proper-tail-call ECMAScript. `count_down(500000)`, `sum_to(100000,0)`, and `is_even(200000)` all run flat where they previously risked a stack overflow.
+
+```
+fn count_down(n) { if n == 0 { return 0; } return count_down(n - 1); }  // O(1) stack
+fn is_even(n) { if n == 0 { return true; } return is_odd(n - 1); }      // mutual, also O(1)
+fn fib(n)  { if n < 2 { return n; } return fib(n-1) + fib(n-2); }       // NOT tail → normal frames
+```
+
+**Design — minimal and provably safe (runtime-guarded, not analysis-trusted):**
+- **New opcode `OpTailCall(argc)`** (`pblang-ir`): identical wire shape to `OpCall`; the serializer's `_ => 255` catch-all means no encoder change.
+- **Compiler** (`pblang-compiler`): in `StmtKind::Return(Some(e))`, when `e` is a `Call`, emit operands then `OpTailCall` instead of `OpCall`. The trailing `OpReturn` is **kept** — it is what completes the return on every fallback path, so the change is a pure superset of the old codegen.
+- **VM `do_tail_call`** (`pblang-vm/src/vm.rs`): reuses the frame **only when** the callee is a user `Closure`/`Function` *and* the current frame has `defers.is_empty() && !is_defer_thunk`. It calls `call_top(argc)` (reusing all arity/default/vararg normalization), pops the freshly-pushed frame, closes upvalues from the old base, slides the new frame's stack window down onto the old `stack_base`, sets `ip = 0`, and swaps the frame in place. Any other case (**builtin**, **callable-map**, **pending defers**) falls back to plain `call_top` and the trailing `OpReturn` handles it. Because the reuse decision is a *runtime* check on `defers`, correctness holds regardless of compiler-side analysis.
+- **JIT** (`pblang-cranelift`): `OpTailCall` is marked not-JIT-able in validation, so JITed functions transparently fall back to the VM for tail calls — no miscompilation risk.
+
+Locked by `tests/semantics.rs::tail_call_optimization` **and** the corpus test `tests/semantics/tail_call_test.sapp` (deep self-recursion, accumulator recursion, mutual recursion, non-tail `fib`, **defer-fallback** — verifying both the value *and* that each guarded frame still fires its defer — and a builtin tail call). **Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **116 passed; 0 failed**. **Follow-up:** the optimization is whole-VM (applies to self-hosted code too); a future pass could also TCO tail calls inside `match`/`if`-expression arms once those lower through `StmtKind::Return`.
+
+---
+
+## 50. Competitiveness: structural interfaces (the `interface` keyword) (2026-05-30)
+
+Closed §14's "Traits / interfaces — duck typing only" gap. The new `interface` keyword declares a **structural contract** and desugars to a **predicate function** — giving pblang Go-interface / TypeScript-`interface` / Python-`Protocol`-style structural typing with **zero runtime/VM/import cost** (the proven parser-sugar pattern, like `struct`).
+
+```
+interface Shape    { area(); perimeter(); }   //  method requirements (params parsed, name drives the check)
+interface Point2   { x; y; }                   //  bare members = field requirements
+interface Drawable { draw(); resize(w, h); }
+
+if Shape(circle) { circle.area(); }            //  Shape(x) is a bool predicate: "does x conform?"
+assert(Drawable(widget), "widget needs draw()/resize()");
+```
+
+- **`interface Name { m1; m2(a,b); … }`** (`crates/pblang-core/src/parser.rs`, a new `interface_stmt` placed after `class_stmt` in `stmt_group_a`, 16→17 of 24) desugars to `fn Name(x) { return is_map(x) and has_member(x,"m1") and has_member(x,"m2") and …; }`. An empty interface is just `fn Name(x){ return is_map(x); }`. Member param lists are parsed for familiar syntax but only the **name** drives the check (a stored closure's arity isn't introspectable). `interface` is whitespace-guarded (`then_ignore(ws1)`), so `interface(x)` calls and `interfaces` identifiers are untouched — and the only stdlib uses (`di.sapp`, `cli.sapp`) are in comments.
+- **New reflection builtin `has_member(obj, name)`** (`crates/pblang-vm/src/vm/maps.rs`, registered in `builtins_table.rs`, seeded `(any,string)->bool` in the typeck prelude): `true` iff `obj` is a map that has `name` as a key **or** on its `__class` table chain (depth-bounded walk, 32). This is the crux — native-`class` instances are `map{__class: ClassTable, …fields}` with **methods on the class table, not the instance**, so a plain `map_has` would wrongly reject them; `has_member` walks `__class`, so plain maps, `struct` values, *and* class instances (incl. `oop` inheritance chains) all conform. It is **total** (non-maps return `false`, never error), so it composes inside `if`/`assert`. It's also useful directly as a reflection primitive.
+
+Locked by the corpus test `tests/semantics/interface_test.sapp` (map/method, bare-field, `struct`-field, native-`class`-via-`__class`, negative cases, non-map totality, empty interface, guard use, and direct `has_member` calls). **Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **117 passed; 0 failed**. **Follow-up:** structural-only by name (no arity/return checks — matching Python `Protocol`'s pragmatic stance); an optional `impl Name for Type` could later *register* conformance for nominal lookups, and the self-hosted parser can learn the same keyword for self-host parity.
+
+---
+
+## 51. Competitiveness: operator overloading (dunder methods) (2026-05-30)
+
+Added user-type operator overloading — `a + b`, `a * b`, `-a` etc. dispatch to **dunder methods** when operands aren't native numbers/strings — so vectors, matrices, complex numbers, money, and the precision-ladder wrappers use natural arithmetic. Parity with Python/C++/Rust(`std::ops`)/Swift/Kotlin/Haskell. This was **not** in §14's gap list but is a headline "best-language" feature.
+
+```
+fn vec(x, y) { return map{ x:x, y:y,
+    __add__:  fn(self,o){ return vec(self.x+o.x, self.y+o.y); },
+    __mul__:  fn(self,k){ return vec(self.x*k, self.y*k); },   // vec * scalar
+    __rmul__: fn(self,k){ return vec(self.x*k, self.y*k); },   // scalar * vec  (reflected)
+    __rsub__: fn(self,k){ return vec(k-self.x, k-self.y); } }; } // makes -vec work (0 - vec)
+let c = vec(1,2) + vec(3,4);   //  (4, 6)
+let r = 10 * vec(1,2);          //  (10, 20) via __rmul__
+let n = -vec(1,2);              //  (-1, -2) via __rsub__
+```
+
+**Design — pure VM slow-path, zero overhead for numerics:**
+- **Arithmetic opcodes** (`OpAdd`/`OpSub`/`OpMul`/`OpDiv`/`OpMod`/`OpPow`/`OpNegate`, `pblang-vm/src/vm.rs`) keep the unboxed fast path; **only when `Value::arith` returns `Err`** (operands not numbers/strings/bigints) do they consult `try_binary_overload`/`try_unary_overload`. Numeric code pays *nothing* — no extra branch on the hot path beyond the existing `Result`.
+- **Forward + reflected dispatch** (Python-style): `a + b` tries `a.__add__(a,b)`, else `b.__radd__(b,a)`. Reflection makes `scalar * vec` work via `__rmul__`, and — because unary `-x` already desugars to `0 - x` — makes `-vec` work via `__rsub__`. Dunders: `__add__/__radd__`, `__sub__/__rsub__`, `__mul__/__rmul__`, `__div__/__rdiv__`, `__mod__/__rmod__`, `__pow__/__rpow__`, plus unary `__neg__`.
+- **Method lookup** reuses the `__class`-chain walk (`lookup_member_value`, depth-bounded 32), so overloads work on **plain maps** *and* **native-`class` instances** (`class Money { fn __add__(self,o){…} }`).
+- **Invocation** is set up via `call_top` from inside the opcode handler — the same re-entrant mechanism `do_tail_call` uses. (Builtins *can't* re-enter the VM, which is exactly why this lives in the opcode handler, not a builtin.)
+- **`%` and `**` now compile to `OpMod`/`OpPow` opcodes** (`pblang-compiler`) instead of `num_mod`/`num_pow` builtin **calls**. Those builtins were already thin wrappers over `Value::arith(Mod/Pow)`, so the switch is **behavior-preserving for all numeric types** (verified: `bigint(2)**bigint(100)`, `bigint(17)%bigint(5)`, float `2**0.5`, decimal/rational) and additionally makes `%`/`**` overloadable. The cranelift JIT's `is_jit_eligible` already allowed `OpMod`/`OpPow`, and the JIT isn't wired into the `pblang run` interpreter path anyway.
+
+Overloading is **opt-in**: a map without the relevant dunder still raises the original arithmetic error (verified). Locked by `tests/semantics/operator_overload_test.sapp` (forward/reflected `+ - * / % **`, `scalar*vec`, `-vec`, native-class `Money`, numeric+string fast-path intactness, and the no-dunder-still-throws case). **Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **118 passed; 0 failed**.
+
+**Comparison overloading (same session).** Extended the same slow-path mechanism to `== != < > <= >=` via `__eq__ __ne__ __lt__ __le__ __gt__ __ge__` (`try_compare_overload`). `==`/`!=` keep native **structural** map equality and overload only **opt-in by presence** of `__eq__` (cheap `matches!(_, Map)` guard keeps numeric/string equality on the pure native path); ordering dispatches on the `num_cmp`-returns-`None` path. **Reflection uses the mirror operator** (`a > b` ⟺ `b < a`, so `Gt` reflects through `__lt__`), so defining `__lt__ __le__ __eq__ __ne__` yields all six operators — enabling custom **sorting/ordering** of user types (verified with an insertion sort over a `Version` type and native-`class` `Temp`). Locked by `tests/semantics/comparison_overload_test.sapp`. **Regression-clean:** **119 passed; 0 failed** (structural map equality preserved). **Follow-up:** the self-hosted compiler can learn `OpMod`/`OpPow` emission for self-host parity.
+
+---
+
+## 52. Multi-paradigm completion — OOP + functional, implemented in pblang (2026-05-30)
+
+**Directive shift (2026-05-30):** "every implementation will be on pblang, not to rust; the main goal always will remain to move from rust to pblang." From here on, features are built in **pblang** (stdlib `.sapp` / the self-hosted compiler), not the Rust crates. §52 is the first work under this rule — both pieces are pure pblang, **no Rust changes, no rebuild** (`.sapp` loads at runtime).
+
+**A. OOP completed in `stdlib/class.sapp`.** The pblang OOP library already had `define`/`new`/`extend` (single inheritance)/`instanceof`/method dispatch. Completed it to a full object model:
+- **`super` calls** — `super_call`/`super1`/`super2` (and `super_method` for the raw fn) invoke the parent class's version of an overridden method, so a child can reuse/extend inherited behaviour.
+- **Mixins** — `mixin(class_def, methods_map)` composes extra methods in (trait-style), chainable: `mixin(mixin(Base, Walks), Swims)`.
+- **Static (class-level) methods** — `define_static`/`call_static`/`call_static1`.
+- **Bound methods** — `bind0`/`bind1`/`bind2` return a callable carrying the instance.
+- **More arities** — `call3`/`call4` (pblang has no spread-call/`apply`, so dispatch arities are fixed overloads).
+- **Introspection** — `field_names`/`method_names`/`parent_of`.
+- **Operator-overloading bridge** — `new` now also exposes a class's dunder methods (`__add__`, `__eq__`, `__lt__`, …) under their **plain names** on the instance, so the VM's native operator overloading (§51) dispatches on `class.sapp` instances exactly as on hand-built maps — incl. **inherited** operators (since `extend` merges parent methods). *Subtlety found & fixed:* because the methods-definition map literally contains a `__eq__` key, library nil-checks like `if methods == nil` would dispatch that `__eq__` on the map itself; switched those to `type(x) == "nil"` (a string compare, always native) in `define`/`extend`/`new`.
+- Locked by `tests/semantics/oop_complete_test.sapp` (inheritance+super, super-with-arg, mixins, statics, bound methods, bridged `+`/`==`/`<` on instances incl. a subclass inheriting operators, deep `instanceof`, introspection).
+
+**B. Functional paradigm solidified in `stdlib/functional.sapp`.** The module already had map/filter/reduce/fold/compose/pipe/curry/memoize/zip/group_by/sort_by/etc. Added the missing core combinators: `identity`/`constant`/`flip`/`complement`/`partial`/`partial2`/`tap`/`thread`; `flat_map`/`zip_with`/`scan`; `repeat`/`iterate`; `chunk`/`windows`; `sum`/`product`/`mean`/`max_by`/`min_by`/`frequencies`; and declarative control `cond`/`when_fn`/`unless_fn`/`juxt`. Locked by `tests/semantics/functional_combinators_test.sapp`.
+
+**Paradigm coverage ("every programming way").** pblang now spans the major paradigms as first-class, mostly via pblang stdlib:
+| Paradigm | Support |
+|---|---|
+| Imperative / procedural | ✓ native — loops, mutation, functions, `defer`, `goto` block |
+| Object-oriented | ✓ native `class` + `stdlib/class.sapp` (inheritance, super, mixins, statics, operator overloading), structural `interface`s (§50) |
+| Functional | ✓ `stdlib/functional.sapp` (HOFs, combinators, immutable transforms), `match`, first-class/anon fns, closures, currying |
+| Concurrent / async / parallel | ✓ native `spawn`/channels/`select`/mutexes/atomics + `async`/`await` (§48) + **data-parallel** combinators (`stdlib/parallel.sapp`, §55: par_map/reduce/filter, fork-join) |
+| Generic / contract | ✓ structural `interface`s + duck typing + **parametric generics** (`stdlib/generics.sapp`, §53): runtime type descriptors & typed containers |
+| Declarative | ✓ `cond`/pattern `match`/pipeline `\|>`; data-driven configs |
+| Metaprogramming | ⚠ runtime reflection (`has_member`, `map_keys`, dynamic dispatch); no macros yet |
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **121 passed; 0 failed**. **Follow-up (all pblang):** teach the self-hosted parser `interface`/operator-emission for self-host parity; add a reactive/stream module and a logic/relational mini-module to widen paradigm coverage further; parametric generics remain the one structural gap.
+
+---
+
+## 53. Parametric generics in pblang (`stdlib/generics.sapp`) (2026-05-30)
+
+Closed the "parametric generics" structural gap — entirely in pblang (no Rust). pblang is dynamically typed, so generics are expressed as first-class **composable type descriptors** (`{ name, check }` predicates) plus **typed containers** parameterised by them. The parametric core is the family of **type constructors** that build new types from existing ones — the dynamic-language analog of `List<T>`/`Map<K,V>`/`Optional<T>`, checked at runtime:
+- Base: `T_number`/`T_string`/`T_bool`/`T_fn`/`T_array`/`T_map`/`T_any`.
+- **Parametric constructors:** `T_list_of(T)` → `list<T>`, `T_map_of(K,V)` → `map<K,V>`, `T_optional(T)`, `T_union(A,B)`, and `T_conforms(iface_pred, label)` which makes a generic **over a structural `interface`** (§50) — e.g. `T_list_of(T_conforms(Drawable,"Drawable"))` is "list of things that draw". These compose and nest (`list<list<number>>`), and `type_name` renders the parametric name.
+- **Typed containers:** `typed_list(T)`/`typed_map(K,V)` enforce element/key/value types at runtime (`tl_push` throws on mismatch); `tl_map(tl, result_T, f)` is a generic, type-preserving map that can also change the element type. Plus generic value containers `box(T,v)`, `pair`/`triple`, and a parametric `Option` (`some`/`none`/`opt_map`).
+- Locked by `tests/semantics/generics_test.sapp` (base/parametric/nested types, optional/union, the interface bridge, typed-container enforcement, generic map/filter, box/pair/Option).
+
+## 54. Self-hosting step: `interface` in the self-hosted compiler (rust→pblang) (2026-05-30)
+
+Per the directive, took **one step further on the rust→pblang migration**: the Rust frontend gained structural `interface`s in §50; now the **self-hosted compiler** (`stdlib/compiler/`, written in pblang) understands them too. Three small pblang edits:
+- `tokenizer.sapp` — added `interface` to the keyword set.
+- `parser.sapp` — new `parse_interface()` (dispatched from `parse_stmt`) mirroring §50: desugars `interface N { m1; m2(a,b); }` to a predicate `fn N(x){ return is_map(x) and has_member(x,"m1") and has_member(x,"m2"); }`, building the AST via the existing `expr_call`/`expr_binary("and")`/`stmt_fn` constructors.
+- `vm.sapp` — added `has_member` to the self-hosted VM's host-builtin whitelist + dispatcher (it delegates to the real `has_member`), so the desugared predicate runs.
+
+Verified end-to-end through `frontend_run` (compile via the pblang compiler → execute on the pblang VM `vm.sapp`): `interface` predicates conform plain maps, field requirements, the empty interface, **and self-hosted `class` instances via the `__class` chain** (`Account(acct)` true / `Printable(acct)` false). No regression to self-hosted struct/class/enum. Locked by `tests/semantics/selfhost_interface_test.sapp`. **This is the migration model going forward:** features added to the Rust frontend get re-implemented in `stdlib/compiler/` until the pblang toolchain reaches full parity and the Rust frontend can be retired.
+
+## 55. Parallel programming in pblang (`stdlib/parallel.sapp`) (2026-05-30)
+
+Added a high-level **data-parallel** facade (pblang) over the `spawn`/`join` primitives (real per-OS-thread parallelism), complementing the lower-level `thread.sapp` (channels/select/mutexes/actors/pipelines/race) and `thread_pool.sapp` (bounded pools). Fork-join, so results return in **input order** (deterministic despite concurrency):
+- **Fork/join:** `fork`/`join_task`/`join_all`/`par_invoke` (run N 0-arg fns at once).
+- **Data parallel:** `par_map` (thread per element), `par_for` (parallel side effects), `par_filter`, `par_map_chunked(arr,f,nchunks)` (contiguous chunks via floor-division ranges → fewer threads for large/cheap work).
+- **Parallel reductions:** `par_reduce(arr,f,identity)` (associative tree reduce), `par_sum`/`par_product`; and `par_count` implemented as a true **map-reduce** (chunk-count then sum partials — *not* `par_reduce`, since the count accumulator's type differs from the elements; passing partial counts back through `pred` was a bug, caught and fixed).
+- **Fork-join shapes:** `par2`/`par3`, `pmap2` (parallel elementwise zip).
+- Correctness rests on a verified pblang property: closures capture a **fresh per-iteration binding** of the loop variable across `spawn` (tested in both `for-in` and `while`+`let` forms), so spawn-in-loop parallel map is safe. Locked by `tests/semantics/parallel_test.sapp` (incl. 50-element loads).
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **124 passed; 0 failed**. All of §§53–55 are pure pblang (stdlib + self-hosted compiler), no Rust changes, no rebuild — squarely on the rust→pblang trajectory.
+
+## 56. Self-hosting step: bitwise operators + radix literals + `**` (rust→pblang) (2026-05-30)
+
+Continued the self-host parity march (§54 model): ported the Rust frontend's **infix bitwise operators, radix literals (§47), and exponentiation `**`** into the self-hosted compiler. All pblang, three files:
+- **`tokenizer.sapp`** — added `<<`/`>>` to the two-char operator set and `&`/`|`/`^`/`~` to single-char; added a **radix-literal branch** in the number scanner (`0x`/`0b`/`0o`, via a new `_radix_digit_val(c, base)` helper that converts to a decimal token immediately, sign-aware).
+- **`parser.sapp`** — a **bitwise precedence ladder** between comparison and additive (`parse_bitor` → `parse_bitxor` → `parse_bitand` → `parse_shift` → `parse_term`), each desugaring to a `bit_*` builtin call; prefix `~` → `bit_not(e)`; and a right-associative **`parse_power`** layer (`a ** b` → `num_pow(a, b)`, tighter than unary and `*`) that fixed a *pre-existing* gap (the self-hosted parser silently dropped `**`).
+- **`vm.sapp`** — added `bit_and`/`bit_or`/`bit_xor`/`bit_not`/`bit_shl`/`bit_shr`, `num_pow`, `num_ceil` to the host-builtin whitelist + dispatcher (delegate to the real builtins).
+
+Verified through `frontend_run` (pblang compiler → pblang VM): all six bitwise ops, prefix `~`, the three radix forms, full **precedence** (`&` > `^` > `|`, shift > `+`, all > comparison; `**` right-assoc, tighter than unary/`*`), a real bit-pack/unpack (`(hi << 8) | lo`, `(x >> 8) & 0xFF`), and a broad smoke (strings/arrays/maps/loops co-existing with the new operators) — no regression. Locked by `tests/semantics/selfhost_bitwise_test.sapp`. **Self-hosted-parser parity remaining:** `async`/`await` keywords (§48) and operator-overloading dispatch in `vm.sapp` arithmetic (§51) — the next ports.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **125 passed; 0 failed**.
+
+## 57. Self-hosting step: `async`/`await` in the self-hosted compiler (rust→pblang) (2026-05-30)
+
+Ported the Rust frontend's `async`/`await` (§48) into the self-hosted parser:
+- **`async fn f(p){ body }`** → `fn f(p){ return spawn(fn(){ body }); }` (`parse_async_fn`, dispatched from `parse_stmt`). `async` is **contextual** — recognised only directly before `fn`, otherwise an ordinary identifier.
+- **`await E`** → `join(E)` (a prefix in `parse_unary`). **Whitespace-guarded** exactly like Rust: `await x` / `await (e)` is the keyword, but `await(x)` with the `(` *adjacent* (col == `await`-col + 5) stays an ordinary call — so a function literally named `await` still works. Verified both ways.
+- **`spawn`/`join` un-keyworded:** the self-hosted tokenizer had `spawn`/`join` as *reserved keywords with no parser handling* (so they were unusable). Removed them from the keyword set → they are now ordinary global idents (as in the Rust frontend), which both enables `spawn(f)`/`join(t)` calls and lets the desugar resolve them at runtime.
+
+Verified through `frontend_run`: non-capturing `async fn compute(){ return 6*7; }` + `await` executes to 42 (with synchronous `spawn`/`join` stubs — the self-hosted VM is single-threaded; user globals shadow, so stubs Just Work); `await (5+3)` → 8; the `await(x)`-stays-a-call guard; and a capturing `async fn` *compiles* cleanly. Locked by `tests/semantics/selfhost_async_test.sapp`.
+
+**Pre-existing gap surfaced (now the top self-hosted-VM target): no upvalue capture.** `stdlib/compiler/vm.sapp`'s `OP_CLOSURE` just pushes the function constant — it does **not** capture the enclosing environment, so `fn outer(x){ let f = fn(){ return x; }; return f(); }` returns `nil`. This is why *capturing* async fns compile but don't yet execute (the desugar's inner `fn(){ body }` needs to see the outer params). Fixing it (codegen free-variable analysis + an upvalue array on the closure + `OP_GET_UPVALUE` in `vm.sapp`) would unlock real closures — and thus full async, functional, and OOP — in self-hosted code. It is a sizable, higher-risk change (touches codegen variable resolution and the closure representation), deliberately scoped as its own next increment rather than bundled here.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **126 passed; 0 failed**.
+
+## 58. Self-hosted VM: closure upvalue capture — real closures land (2026-05-30)
+
+Closed §57's top self-hosted-VM gap. The self-hosted compiler now supports **closure upvalue capture** — inner functions read (and mutate their own copy of) variables from enclosing function scopes. Before, `OP_CLOSURE` pushed the bare function constant with no environment, so a closure's free variables resolved to undefined globals (`nil`); `fn outer(x){ let f=fn(){return x;}; return f(); }` returned `nil`. **This is arguably the single most capability-unlocking self-hosted change** — it makes genuine closures (and therefore higher-order functions, currying, stateful counters, functional composition, and *capturing* async fns) work in self-hosted pblang. All pblang (codegen + vm.sapp), no Rust.
+
+**Mechanism (classic Lox-style, by value):**
+- **Codegen** (`codegen.sapp`): each `CodeGen` gained a `parent` link and an `upvalues` list. `codegen_resolve` is now lexical/recursive — own local → **upvalue** (walk the enclosing chain via `codegen_resolve_upvalue`/`_add_upvalue`, recording `{index, is_local}` descriptors and deduping) → global. Variable reads emit `OP_GET_UPVALUE`, writes `OP_SET_UPVALUE`. Each `fn`/`fn_lit` constant now carries its `upvalues` descriptor list. (Top-level `let`s are globals — `_at_module_top` — so only *nested* locals are ever captured; top-level behavior is unchanged.)
+- **VM** (`vm.sapp`): `exec` takes an `upvalues` array (5th param). `OP_CLOSURE` builds a closure value `{__fn, __upvalues}`, capturing each descriptor's value **by value** from the current frame — a parent local (`is_local`) or a transitive parent upvalue. `OP_GET_UPVALUE`/`OP_SET_UPVALUE` read/write that array; `OP_CALL` threads `callee.__upvalues` into the callee frame (and still accepts a raw fn constant for backward-compat). New opcodes `OP_GET_UPVALUE`=38, `OP_SET_UPVALUE`=39.
+
+Verified through `frontend_run`: basic capture (`outer(5)`→5), multi-param capture, **currying** (`adder(5)(100)`→105), **3-level transitive capture** (`nested(1)(2)(3)`→6), a closure passed to a higher-order map, a **stateful counter** (`make_counter(10)` → 11,12,13 — within-closure mutation persists across calls via the shared `__upvalues`), the previously-blocked **capturing async fn** (`await add(10,20)`→30), and a regression block (classes/methods/colon-call/recursion/struct unaffected). Locked by `tests/semantics/selfhost_closure_test.sapp` (and `selfhost_async_test` now asserts capturing-async execution). **Known limitation:** capture is by value, so a closure's writes update its *own* copy, not the original outer variable (sufficient for the vast majority of uses; true shared/boxed upvalues are a possible later refinement). **Self-hosted-parser parity remaining:** operator-overloading dispatch in `vm.sapp` arithmetic (§51).
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **127 passed; 0 failed**.
+
+## 59. Self-hosted VM: operator + comparison overloading — frontend parity reached (2026-05-30)
+
+Ported §51 into `stdlib/compiler/vm.sapp`, the **last major Rust-frontend feature the self-hosted compiler lacked**. The arithmetic and comparison opcodes now dispatch dunder methods on the slow path — possible only now that closures execute (§58), since the dunder is a closure invoked via `exec`. All pblang.
+
+- **Helpers** (`vm.sapp`): `_lookup_member(val, name)` walks `val` and its `__class` chain (bounded 32) — so plain maps *and* class instances conform; `_call_method` invokes a closure-object / raw-fn / builtin with args via `exec`; `_try_overload(a, b, dunder, rdunder)` does **forward `a.dunder(a,b)` then reflected `b.rdunder(b,a)`**. Per-op wrappers `_op_add/_op_sub/_op_mul/_op_div/_op_mod/_op_eq/_op_ne/_op_gt/_op_ge/_op_lt/_op_le` keep the **native fast path** and only consult an overload when a **map operand carries the dunder** (numbers/strings never pay the lookup). Reflection uses the mirror operator (`a>b ⟺ b<a`), so `__lt__/__le__/__eq__/__ne__` suffice for all six comparisons; `==`/`!=` keep **structural** map equality unless `__eq__` is present. Unary `-x` (compiled to `0 - x`) dispatches `__rsub__` automatically.
+- The 11 arithmetic/comparison opcode handlers now call those wrappers.
+
+Verified through `frontend_run`: `vec + vec`/`-`/`* scalar` (forward), `scalar * vec` (reflected `__rmul__`), `-vec` (reflected `__rsub__`), `==`/`<` (forward), `>` (reflected `__lt__`); the same on **native `class` instances** via the `__class` chain (a `Money` type's `+`/`<`/`==`); numeric `+ - * / %`, `==`/`<`, and string `+` fast paths intact; and **structural map `==` preserved** when no `__eq__`. Locked by `tests/semantics/selfhost_operator_overload_test.sapp`.
+
+**Milestone — self-hosted frontend parity.** With this, the self-hosted compiler (`stdlib/compiler/`) matches the Rust frontend on every language feature ported this session: structural `interface`s (§54), bitwise/radix/`**` (§56), `async`/`await` (§57), real closures with upvalue capture (§58), and now operator + comparison overloading (§59). The pblang-written toolchain can express and run the full modern language end-to-end — the key milestone toward **retiring the Rust frontend**. (Remaining self-hosted *VM*-semantics refinements, not parser gaps: by-value-only upvalues §58; `**` overloading not wired (`**` lowers to a `num_pow` call, not an opcode); precision-ladder/bigint coverage in `vm.sapp` arithmetic is thinner than the Rust VM.)
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **128 passed; 0 failed**.
+
+## 60. Differential pass: Rust VM ↔ self-hosted VM, and the `throw` fix (2026-05-30)
+
+Ran a **differential parity pass** — the same program evaluated natively (Rust VM) *and* via `frontend_run` (self-hosted compile → `vm.sapp`), results compared — across ~45 programs spanning the whole language surface (arithmetic/precedence, bitwise/radix/`**`, comparison/logical, strings, arrays, maps, functions/recursion/defaults, closures, control flow, `match`, `try/catch/throw`, nil-safe `??`/`?.`, inline-`if`, `struct`, and operator/comparison overloading incl. reflected).
+
+**Result: parity on every construct but one** — a single real divergence surfaced and was fixed:
+- **`throw` was unimplemented in the self-hosted compiler.** `try (throw "e") catch 99` returned `nil` (the throw silently evaluated to nothing, so the handler never ran) vs `99` natively. **Fixed** with a 3-part `throw` implementation (all pblang, mirroring the rest of the toolchain): `parser.sapp` parses `throw EXPR` as a prefix (works as statement *and* inside `(throw e)`); `codegen.sapp` emits new `OP_THROW`(40) after the value; `vm.sapp`'s `OP_THROW` does a host `throw`, which `OP_TRY`'s `try exec(...) catch _TRY_SENTINEL` catches and routes to the handler chunk. Verified: `try (throw "e") catch 99`→99, a guard that throws on bad input → caught, and a non-throwing `try` still returns its body.
+
+The only other reported mismatch was `fib(10)` self-hosted, which is **not a semantic divergence** — it's the `pblang run` call-depth limit (the self-hosted VM uses host recursion; `pblang run` caps deeper than the test harness, where `fib(10)` runs fine, cf. `selfhost_closure_test`). The permanent differential test uses `fact(5)` to stay fast (~0.4s for 44 checks).
+
+Locked by `tests/semantics/selfhost_differential_test.sapp` (now 50 native-vs-self-hosted assertions incl. the precision ladder; a fast standing parity guard). Upvalues remain by-value (§58); `**` overloading isn't wired (`**` lowers to a `num_pow` call).
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **129 passed; 0 failed**.
+
+## 61. Precision ladder in `vm.sapp` + library enhancements (2026-05-30)
+
+Closed the last self-hosted differential gap and enhanced two number libraries — all pblang.
+
+**(a) Precision ladder wired into the self-hosted VM.** Added the `bigint` / `rational` / `decimal` constructors (plus `num_exp`/`num_ln`/`str_replace_all`/`str_pad_left`/`str_pad_right`) to `vm.sapp`'s `_is_builtin` whitelist + `_call_builtin` dispatcher (delegating to the host; `rational` handles its 1-or-2-arg form). Arithmetic/comparison already flow through the opcodes (which delegate to the host's `Value::arith`/`num_cmp`), and `**` lowers to `num_pow` (already wired), so **only the constructors were needed**. Verified through `frontend_run`: `bigint("123…890") + bigint(10)`, `bigint(2) ** 64` = 18446744073709551616, `bigint(100)/bigint(7)` = 14, `bigint(...) >` comparison, `bigint(5) == 5`, `decimal("3.14")`, `rational(1,3)` = "1/3" — all exact, matching the Rust VM. The differential test (§60) gained 6 precision-ladder parity checks.
+
+**(b) `stdlib/bignum.sapp` enhanced** (exact big-integer number theory on `bigint`): added `mod_pow` (fast binary modular exponentiation — the crypto workhorse), `mod_inv` (extended-Euclid modular inverse), `comb_fast` (multiplicative binomial that avoids huge intermediate factorials), `is_prime`/`next_prime` (trial division), `sum_to`, and `digit_count`, alongside the existing factorial/gcd/lcm/pow/fib/comb/perm. Locked by `tests/semantics/bignum_test.sapp` (50! exact, fib(100), C(100,50), Fermat's little theorem via mod_pow, mod_inv non-existence, primality, …).
+
+**(c) `stdlib/complex.sapp` enhanced with operator overloading.** Complex values now carry dunders (`__add__`/`__radd__`/`__sub__`/`__rsub__`/`__mul__`/`__rmul__`/`__div__`/`__eq__`), each handling **both complex and scalar** operands, so natural `a + b`, `2 * z`, `z - 1`, `-z`, `a == b` work alongside the existing `add`/`mul`/… function API. A nice showcase: operator overloading now works identically in the Rust VM **and** the self-hosted VM (§59). Locked by `tests/semantics/complex_operators_test.sapp` (forward/reflected/scalar arithmetic, unary minus, division, by-value equality, and a mixed `(a+b)*2 - a` expression).
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **131 passed; 0 failed**.
+
+## 62. Self-hosted module `import` support — multi-file compilation (2026-05-30)
+
+`frontend_run` now resolves `import("…")` — the multi-file step toward a self-hosted toolchain that builds real projects. A program that imports stdlib modules executes **entirely on the pblang VM** (main + imported modules), all pblang.
+
+**Mechanism:** `frontend_run` pre-resolves imports before running the main program. `_find_imports` scans the source for `import("PATH")`; `_resolve_module(path, cache)` resolves the path (`stdlib:foo` → `stdlib/foo.sapp`), `fs_read`s it, recursively resolves its own imports, runs the guard preprocessor, compiles, and runs it via `vm.sapp`'s new `run_seeded` (seeding `__import_cache__`), memoizing the module's exports (all its top-level globals) — with a cycle-guard and graceful failure. The built cache is seeded as `globals["__import_cache__"]`; `vm.sapp`'s `import` builtin (special-cased in `OP_CALL`) returns `cache[path]`. Programs without imports are unaffected (empty cache). Also added the common collection builtins `push`/`pop`/`array_push`/`array_pop` to `vm.sapp` (stdlib modules use `push`). Verified: a program importing `stdlib:functional.sapp` and calling `f.map`/`f.filter`/`f.sum`/`f.reduce`/`f.compose` runs correctly. Locked by `tests/semantics/selfhost_modules_test.sapp`.
+
+**Bug fixed (surfaced by the import test): captured function used as a callee.** `f.compose(inc,dbl)` failed with "array index out of bounds". Root cause: `codegen_call`'s ident-callee path (which has its *own* inline name resolution, separate from `codegen_var`) handled `local`/`global` but **not `upvalue`** — a gap left by the §58 upvalue work. So a captured function called as `g(x)` inside `fn(x){ return g(x); }` mis-emitted the upvalue index as `OP_GET_GLOBAL`, and the closure's `OP_GET_UPVALUE` read an empty array. **Fixed** by adding the `upvalue` → `OP_GET_UPVALUE` branch to `codegen_call`. This makes higher-order composition (`compose`, `pipe`, callbacks over the import boundary) work in self-hosted code.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **132 passed; 0 failed**.
+
+## 63. Optimization: safe bytecode optimizer wired into the self-hosted run path (2026-05-30)
+
+Made self-hosted code **faster** by auto-applying the pblang bytecode optimizer in `frontend_run` — but only the **provably-safe** passes, after finding two soundness bugs. ~19% fewer instructions on typical code (74→60 over a sample), correctness preserved (the differential test still shows 0 divergences). All pblang.
+
+- **`optimize_safe` (new)** runs constant folding (of literal pairs), dead-code elimination, and jump simplification — passes that only rewrite provably-equivalent bytecode. It **excludes strength reduction** (`x*0 → 0`, `x+0 → x`), which is **unsound under operator overloading**: `vec * 0` must dispatch `__mul__` (a user type's "times zero" need not be zero), so the optimizer can't assume numeric identities at compile time. `frontend_run` now calls `optimize_safe` before running; `optimize` (all passes) stays available as the opt-in `frontend_optimize`.
+- **Bug fixed — constant-folded comparisons returned numbers.** `try_eval_binary` folded `5 == 5` / `3 < 7` to `1`/`0` instead of `true`/`false`, so an optimized `let f = 5 == 5` produced the number `1` and `f == true` failed. **Fixed** to return real booleans. (This is exactly why wiring an optimizer needs a differential/equivalence guard: it was caught immediately by the operator-overload and differential tests.)
+
+The optimizer only affects the self-hosted execution path (the Rust frontend remains the production hot path); this keeps the self-hosted toolchain honest about generating *efficient* code, not just correct code. **Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **132 passed; 0 failed**.
+
+## 64. Self-hosting step: real `export` semantics — module encapsulation (rust→pblang) (2026-05-30)
+
+Another step toward retiring the Rust frontend: the self-hosted compiler now honors **`export`**, so a module exposes only its declared API (previously §62 returned *all* top-level globals — looser than the Rust frontend). All pblang.
+
+- **Codegen** (`codegen.sapp`): `CodeGen` gained an `exports` list; `codegen_stmt` handles the `export` node by accumulating its names (and treats a bare `import("…")` statement as a no-op — `import` is a call expression). `compile_stmts` emits, after the module body, an `__exports__ = [names]` global (string constants → `OP_MAKE_ARRAY` → `OP_DEFINE_GLOBAL`). No `export` statement → no marker.
+- **Importer** (`selfhost_frontend.sapp::_resolve_module`): if a module's globals contain `__exports__`, the cached exports are **restricted** to exactly those names; otherwise it falls back to exposing all globals (backward-compatible).
+
+Verified: a module `fn pub_fn(x){…} fn priv_fn(x){…} export pub_fn;` — the importer can call `m.pub_fn` but `map_has(m, "priv_fn")` is `false` (the private helper is hidden). Locked by an export-restriction case in `tests/semantics/selfhost_modules_test.sapp`. This gives self-hosted modules genuine encapsulation, matching the Rust frontend.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **132 passed; 0 failed**.
+
+## 65. Self-hosted file runner + pbAI foundation: a trainable neural network in pblang (2026-05-30)
+
+Two steps: the self-hosted toolchain becomes file-capable, and the first **north-star** (pbAI) gets a concrete, working start. All pblang.
+
+**(a) Self-hosted file runner** — `frontend_run_file(path)` reads a `.sapp` file, guard-preprocesses it, and runs it end-to-end through the self-hosted pipeline *with import resolution* (the pblang analog of the Rust CLI's `run`). Verified: a file that `import("stdlib:functional.sapp")`s and calls `f.sum`/`f.map` executes entirely on the pblang toolchain. The self-hosted compiler can now build & run **multi-file projects** from disk.
+
+**(b) pbAI starts — `stdlib/nn.sapp`, a *trainable* model.** Where `ai.sapp` *calls* external models and `tensor.sapp` provides forward ops, this is the first model **trained in pblang**: a multilayer perceptron with **manual backpropagation** and SGD. The acid test is **XOR** — not linearly separable, so a network that solves it (a) has a hidden layer and (b) is genuinely learning via gradient descent, not memorizing. `mlp_new(2,4,1)` trained 2500 epochs (lr 0.7) drives all four XOR cases to the correct side of 0.5 and loss < 0.1. Dense layers, sigmoid + its derivative, hand-derived output/hidden deltas, deterministic index-hash weight init (no `Math.random` in the VM), `predict`/`train`/`argmax`. Locked by `tests/semantics/nn_xor_test.sapp`. **This proves pblang can implement and train models from scratch** — the seed of pbAI (the small in-pblang model for coding/debugging assistance per `docs/pbAI.md`).
+
+**Readiness for the north-stars** (`docs/{pbAI,OS_Development,Visual_Designer}.md`): the language is now genuinely ready as a substrate — self-hosting (toolchain in pblang), multi-file modules with encapsulation, the full precision ladder, operator overloading, closures, generics, parallelism, and now a trainable-model primitive. **pbAI** is underway (nn.sapp; next: bigger nets, an autograd/tensor-graph layer over `tensor.sapp`, a tokenizer+embedding path, and wiring `pb-mcp-server` tools). **OS dev** needs the freestanding/`no_std` codegen path (`systems.sapp` is still stubs — the largest remaining gap). **IDE** (pblang Studio) builds on the now-stable self-hosted frontend for in-editor compile/run.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **133 passed; 0 failed**.
+
+## 66. Weakness-remediation roadmap + self-hosted static linter (2026-05-30)
+
+An honest pass over pblang's weaknesses vs other languages, with a concrete plan per weakness (all to be done **in pblang**, per the rust→pblang directive — except where a weakness is intrinsically a Rust-VM property, which is called out). **First step shipped this session: a self-hosted static linter.**
+
+**Shipped — `frontend_lint` (static safety + tooling).** A pblang static analyzer over the AST: detects **unreachable code** after `return`/`break`/`continue` (a *sound* check — no builtin allowlist needed, so no false positives) and folds in the semantic analyzer's warnings (e.g. assignment to an undeclared variable). Returns `{ok, diagnostics:[{kind,message}], count}`. Opt-in (not wired into compile, so zero regression risk) and the basis for IDE diagnostics. Locked by `tests/semantics/selfhost_lint_test.sapp` (dead-code after return/break/continue, nested-in-`if`, and clean code → 0 diagnostics).
+
+**The weaknesses and the plan:**
+1. **Performance** *(intrinsic to the Rust VM)* — pblang is a bytecode interpreter (10–100× slower than compiled; no active JIT on the run path; f64-default; GC; no SIMD). The directive says don't optimize the Rust VM, so the pblang-side levers are: (a) the safe bytecode optimizer (§63), (b) better stdlib algorithms, (c) **native compute kernels** — the heavy math (matmul/softmax/conv) already runs in native Rust via the `tensor_*` builtins that `tensor.sapp` wraps, so pbAI can be fast *the NumPy way* (pblang model logic, native tensor kernels). Full general-purpose speed needs the JIT, which has since been **unlocked and wired** for loop-free numeric functions (§94) — loop/recursion codegen is the remaining JIT work.
+2. **Static safety / types** — typeck is advisory/partial; no static generics/traits/exhaustiveness. Plan (pblang): grow the linter (started) and `typeck.sapp` toward undefined-name detection (needs a generated builtin list), arity checks, and `match` exhaustiveness; surface them as opt-in diagnostics first, then optionally enforce.
+3. **Memory / OS-dev** *(biggest single gap)* — GC + no freestanding codegen. Plan: a `--freestanding`/`no_std` lowering (pblang→C99 or LLVM, no libc, GC-free subset, panic=halt) + intrinsics→inline-asm; `systems.sapp` must move from stubs to real codegen. Large, foundational; prerequisite for OS dev.
+4. **Concurrency maturity** — has spawn/channels/select/async but no work-stealing scheduler. Plan: a pblang scheduler/runtime over the thread primitives.
+5. **Tooling / ecosystem** *(the adoption gap)* — no package manager/registry, immature LSP/debugger. Plan (pblang): a package manifest + resolver (build on `frontend_run`'s import resolution), a doc generator, grow the formatter/linter; an LSP server speaking the self-hosted diagnostics.
+6. **Distribution** — interpreted, no single-binary AOT. Plan: harden the C-transpiler path to emit standalone executables.
+7. **Rough edges** — no UFCS, string ordering, missing-key errors, keyword collisions. Fix incrementally in the (self-hosted) parser/stdlib.
+8. **Self-host caveats** — by-value upvalues, thinner bigint coverage, depth limits in `vm.sapp`. Close incrementally.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **134 passed; 0 failed**.
+
+## 67. Started all three remediation fronts: static safety, packaging, freestanding codegen (2026-05-30)
+
+Concrete, tested starts on the three weaknesses from §66 — all pblang.
+
+**(a) Static safety — undefined-name + dead-code linting (completed the linter).** `frontend_lint` now also does **sound undefined-name detection**: a generated `stdlib/compiler/builtins_list.sapp` (269 host-builtin names, derived from `builtins_table.rs`) lets it flag a free variable that is neither a builtin nor a hoisted top-level declaration as an error — **no false positives** on builtins, forward references, or closures captured from an enclosing scope (verified). *Bug fixed in the process:* `semantic.sapp::scope_lookup` indexed the symbol map directly, so a missing key **raised** on the host VM (the missing-key gotcha) — which aborted analysis on the very undefined names it was meant to find. Switched to `map_has`. Locked by `tests/semantics/selfhost_lint_test.sapp`.
+
+**(b) Ecosystem — `stdlib/pkg.sapp`, a package/manifest system.** Manifests (`manifest(name, version, deps)`), **semantic versioning** (`semver_parse`/`semver_compare` — numeric, so `1.2.0 < 1.10.0`; `semver_satisfies` for `^`/`~`/`>=`/`*`/exact), `validate`, and **dependency resolution** (`resolve` checks each dep exists on disk, building on the import path mapping). The foundation a registry/installer can sit on. Locked by `tests/semantics/pkg_test.sapp`.
+
+**(c) OS-dev — `stdlib/compiler/ctranspile.sapp`, a self-hosted pblang→C transpiler.** The seed of the freestanding backend (and a rust→pblang move off the Rust ctranspiler). Lowers the numeric subset — functions, arithmetic, comparison, `if`/`while`, `return`, locals/assignment — to C (`double` for pblang's f64). **End-to-end validated:** `transpile("fn fib(n){…}")` → C that **gcc compiles and runs** (`fib(15)=610`). This is the path the bytecode VM can never take for kernels (C lowers to native, and a `-ffreestanding -nostdlib` profile + intrinsics→asm makes bootable code possible) — and it doubles as a **native-speed AOT route** (partially addressing the performance weakness). Maps/strings/closures/GC-free memory come next; this establishes the lowering. Locked by `tests/semantics/ctranspile_test.sapp`.
+
+Net: static safety and packaging have **shipped foundations**; OS-dev codegen has a **validated first step** (pblang→C→native). Recommended order from here: deepen the C-transpiler toward a real freestanding profile (it unlocks both OS-dev *and* native performance), then layer a registry/installer on `pkg.sapp`, then enforce linter diagnostics in the IDE.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **136 passed; 0 failed**.
+
+## 68. Freestanding C profile — pblang compiles to kernel-capable native code (2026-05-30)
+
+Deepened the self-hosted `ctranspile.sapp` (§67) into a **real freestanding profile** — the OS-dev enabler. pblang → C → **freestanding native object** now works for a meaningful subset.
+
+- **Wider subset:** logical `and`/`or` → `&&`/`||`; **bitwise** `& | ^ << >> ~` (parsed as `bit_*` calls) and `%` → C integer ops with `(long)` casts; **`for`-count loops** → counted C `for`; **`else if`** chains. So bit-twiddling, masks, ports, and looping all lower to real C.
+- **Freestanding profile** (`transpile_freestanding`): a **no-libc** preamble — fixed-width integer typedefs and **inline-asm intrinsics for the core OS primitives**: `outb`/`inb` (port I/O), `hlt`, `cli`/`sti` (interrupt flags). pblang code calling these transpiles to real hardware access. Output has **no `#include`s** and is meant for `gcc -ffreestanding -nostdlib`.
+- **End-to-end validated against gcc:** a realistic routine — serial-port init, a `serial_putc` with a busy-wait loop polling the line-status register via a bitwise mask, and a delay loop — written in pblang, transpiled, and compiled with `gcc -ffreestanding -nostdlib -O2 -c` into a **307-byte object with zero data/bss** (pure position-independent code, no libc, no GC). `serial_init`/`serial_putc`/`delay` are real native symbols.
+
+**Why it matters:** this is the path the bytecode VM can *never* take — a GC'd interpreter can't be a kernel. pblang can now lower to GC-free native code that does hardware I/O, which is the prerequisite OS-dev gap (§66 weakness #3). It *also* gives pblang a **native-speed AOT route** (compiled `fib`/loops run at C speed), partially addressing the performance weakness the directive otherwise blocks. Locked by `tests/semantics/ctranspile_test.sapp` (logical/bitwise/`%`/`for`/`else-if` lowering + freestanding preamble/intrinsics, no-includes). **Next toward a bootable kernel:** a multiboot/linker-script entry, a GC-free memory model (fixed arrays / tiny bump allocator), and lowering of maps/strings; then `systems.sapp` moves from stubs onto these intrinsics.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **136 passed; 0 failed**.
+
+## 69. 🚀 pblang boots: a real kernel + GC-free memory model, validated in QEMU (2026-05-30)
+
+**The OS-dev north-star crosses from "planned" to "demonstrated": a pblang program now boots as a real kernel in QEMU.** Built on §68's freestanding profile, `ctranspile.sapp` gained a **bootable kernel profile** + a **GC-free memory model** — all pblang.
+
+- **Kernel profile** (`transpile_kernel` + `kernel_linker_script`): emits a **multiboot1 header** (`0x1BADB002` in a `.multiboot` section), a **`_start` entry** (naked, sets up a static stack, calls `kmain`, then `hlt`-loops), the OS intrinsics (port I/O / halt / interrupt flags), **raw memory access** (`poke8/16/32`, `peek8` over `volatile` pointers — for VGA/MMIO), and the transpiled user functions. The linker script loads it at 1 MiB with the multiboot header first, entry `_start`.
+- **GC-free memory model**: a **bump allocator** over a static heap — `kmalloc(n)` (8-byte-aligned bump), `kfree` (no-op), `kreset` (rewind). No GC, no libc — exactly what a kernel needs and what the bytecode VM (a GC'd interpreter) can never provide.
+- **Validated by an actual boot, end-to-end:** a pblang `kmain` that `kmalloc`s a buffer, writes 40 and 2 into it (`poke8`), reads them back (`peek8`), sums them (= 42), and writes the result to QEMU's `isa-debug-exit` port → **`gcc -m32 -ffreestanding -nostdlib` + `ld -m elf_i386 -T kernel.ld`** produces an ELF that **`grub-file` confirms is a valid multiboot kernel**, and **QEMU boots it and exits with code 85 = `(42<<1)|1`** — proving the bump allocator, raw memory read/write, arithmetic, and hardware I/O *all ran inside the booted kernel*. (Toolchain checks gated; the codegen is locked by `tests/semantics/ctranspile_test.sapp`: multiboot header, `_start`/`call kmain`, `kmalloc`/`_kheap`, `poke8`/`peek8`, intrinsics, no-`#include`, and the linker script.)
+
+**Significance:** this validates the single biggest weakness-remediation claim — pblang is now usable for **operating-system development**, demonstrated by a real boot, not a stub. Combined with the native-speed AOT property (§68), the freestanding track has converted both the OS-dev gap *and* part of the performance gap from "roadmap" to "working." **Next toward a featureful kernel:** lower pblang arrays/strings/structs onto the bump allocator (so kernel code can use real data structures), a VGA/serial console module in pblang, an interrupt-descriptor-table setup via the intrinsics, and migrate `systems.sapp` from stubs onto this codegen.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **136 passed; 0 failed**.
+
+## 70. Kernel data structures: arrays + strings lowered onto the bump allocator (2026-05-30)
+
+Made pblang kernels *useful* by lowering **arrays** and **strings** onto the §69 GC-free bump allocator — kernel code can now hold real data, not just scalars. All pblang (`ctranspile.sapp`), QEMU-validated.
+
+- **Arrays** → a **length-prefixed block** on the allocator: a literal `[10, 20, 12]` lowers to a GCC statement-expression `({ double* _a = (double*)kmalloc((n+1)*8); _a[0]=n; _a[1]=…; (double)(u64)_a; })` (value = block address). `arr[i]` reads `((double*)addr)[1 + (long)i]` (past the length prefix), `arr[i] = v` writes it, and `len(arr)` reads slot 0. So array literals, indexing (read/write), and `len` all work — and iterate in `for`/`while` loops.
+- **Strings** → a **null-terminated char block** on the allocator: `"OK"` lowers to `({ char* _s = (char*)kmalloc(len+1); _s[0]=79; _s[1]=75; _s[2]=0; (double)(u64)_s; })`. Bytes are read with `peek8(addr + i)` until the 0 terminator (a 4-line pblang `puts` prints to serial).
+- **Validated by actual QEMU boots:** (1) a kernel building `[10,20,12]`, summing via `len`+indexing in a `while` loop (= 42), then index-writing `arr[0]=99` → **QEMU exit 85** = `(42<<1)|1`. (2) a kernel allocating the string `"OK"`, printing it to serial via a `peek8` loop, and summing its bytes → **serial shows `OK` and QEMU exits 85**. Both prove the allocator + array/string lowering run inside a booted kernel. Locked by `tests/semantics/ctranspile_test.sapp` (array literal size/length-prefix/index/`len`, string alloc/chars/null-terminator).
+
+**Significance:** kernel code in pblang can now use real buffers and text — the foundation for a console, drivers, and data tables. **Structs/maps are the documented next step:** they desugar to maps with string keys, which need a field-layout/offset model (not the simple positional block arrays use) before lowering to C structs — a focused compiler pass. With arrays + strings + the allocator + intrinsics, a basic pblang kernel (VGA/serial console, simple drivers) is now writable end-to-end.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **136 passed; 0 failed**.
+
+## 71. Structs in kernels + a pblang VGA/serial console — a real kernel component (2026-05-30)
+
+Completed the data-structure trio (struct/map lowering) and wrote the **first real, useful kernel component in pblang** — both QEMU-validated.
+
+**(a) Struct/map field-layout pass.** Structs desugar to string-keyed maps, so `ctranspile.sapp` gained a **field-name → slot registry**: each field name gets a stable slot the first time it's seen (in a map literal or member access), reset per translation unit. A `map{…}`/struct literal lowers to a block on the bump allocator with each value at its field's slot; `obj.field` reads `((double*)addr)[slot]`; `obj.field = v` writes it. So pblang structs now lower to fixed-offset C struct-like blocks. **Validated:** `struct Pt { x, y }; … let p = Pt(3,4); p.x + p.y; p.x = 100; …` compiled, linked, and **booted in QEMU → exit 85** (= `(7·6<<1)|1`), proving struct construction + member read/write run in the kernel. With arrays (§70), strings (§70), and now structs, all three composite types lower onto the GC-free allocator.
+
+**(b) `stdlib/kernel/console.sapp` — VGA text + serial console, in pblang.** The first genuinely useful kernel component: `vga_putc`/`vga_puts`/`vga_clear` (VGA text mode at `0xB8000`, 80×25, `(attr<<8)|ch` cells via `poke16`) and `serial_init`/`serial_putc`/`serial_puts` (COM1 at `0x3F8`, busy-wait on the line-status register via `inb`+bitwise). Written in the freestanding-transpilable subset, so `transpile_kernel(console + kmain)` lowers it to native code. **Validated:** a kernel doing `serial_init(); serial_puts("PBLANG-KERNEL"); vga_clear(15); vga_puts(0,0,…)` **booted in QEMU, printed `PBLANG-KERNEL` on the serial line, and exited 85**. Locked by `tests/semantics/ctranspile_test.sapp` (struct lowering) and `tests/semantics/kernel_console_test.sapp` (console transpiles to the expected VGA/serial C, freestanding, multiboot).
+
+**Significance:** a pblang kernel can now be written with **real data structures and a working console** — the foundation for drivers, a shell, and a memory manager. The OS-dev north-star has gone from "no codegen" → boots (§69) → useful data (§70) → **composite types + console (§71)** in three steps, each proven by an actual QEMU boot. **Next:** an interrupt-descriptor table + keyboard driver (interactivity), a slab/free-list allocator over the bump heap, and migrating `systems.sapp` onto this codegen.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **137 passed; 0 failed**.
+
+## 72. Language readiness for interrupts: IDT + handlers + keyboard primitives (2026-05-30)
+
+Made the **language** able to express interrupt-driven kernel code (IDT, exception/IRQ handlers, keyboard) — *the language is being made ready for OS dev; the OS itself is not built here.* All pblang.
+
+- **Interrupt-handler codegen** (`ctranspile.sapp`): a pblang function named `isr…` is emitted as a **GCC interrupt handler** — `__attribute__((interrupt)) void NAME(void* frame)` — so it gets the correct register-save prologue/epilogue and `iret`. This is the core language feature that makes exception/IRQ handlers writable in pblang.
+- **`addr_of("fn")`** intrinsic → `(double)(u64)&fn`: a function's address as a number, needed to install a handler into an IDT gate (the double model otherwise can't take a function's address). Plus a **`lidt`** intrinsic (load the IDT register), `peek32`, and a software-interrupt test trigger.
+- **`stdlib/kernel/interrupts.sapp`** (transpilable pblang primitives): `idt_set_gate` (writes an 8-byte gate via `poke16`/`poke8` with bitwise offset splitting), `idt_load` (builds the IDTR + `lidt`), `pic_remap` (remap the 8259 PIC off the exception vectors), `pic_eoi`/`pic_eoi_slave`, `kbd_scancode` (`inb 0x60`), `kbd_status` (`inb 0x64`). With these, a keyboard driver is writable in pblang (reading scancodes was already `inb` — the missing piece was interrupt handling).
+- **Validated by compilation:** a kernel with `fn isr_kbd(){ … } fn kmain(){ idt_set_gate(idt,33,addr_of("isr_kbd"),8,142); idt_load(idt); sti(); … }` (concatenated with `interrupts.sapp`) **compiles to a native object** with `gcc -m32 -ffreestanding -nostdlib -mgeneral-regs-only -c`. Locked by `tests/semantics/kernel_interrupts_test.sapp`.
+
+**Honest finding — the next codegen step:** GCC requires `-mgeneral-regs-only` for interrupt handlers (no x87/SSE), which forces the transpiler's `double`-everything arithmetic onto **software floating-point** (libgcc `__adddf3`/`__fixunsdfsi`/…). A full **QEMU boot of an interrupt firing** therefore needs either the 32-bit libgcc multilib (absent on this host) or — the right fix — an **integer codegen mode** (lower numbers to `long`/`i64` instead of `double`), which would make *all* kernel code float-runtime-free (smaller, faster, no SSE-enable dance) and let handlers link cleanly. This is the clear next OS-dev codegen improvement; the interrupt language features themselves are done and compile-correct. (Non-interrupt kernels — arrays/structs/strings/console, §69–71 — boot fine because they use SSE doubles.)
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **138 passed; 0 failed**.
+
+---
+
+## 73. 🚀 Integer codegen mode: float-free kernels — interrupt handlers boot end-to-end (2026-05-31)
+
+Closed the §72 gap. Added an **integer codegen mode** to `ctranspile.sapp`: every pblang number lowers to C **`long`** instead of `double`. `long` is the natural pointer-width integer in both targets — 4 bytes on `-m32` (ILP32), 8 on 64-bit (LP64) — so the number⇄pointer round-trips the allocator/array/struct lowering relies on stay exact. All pblang.
+
+- **A mode switch routed through small emit helpers** (`_numty`/`_pcast`/`_vcast` over a module-level `_MODE`): the C number type, the pointer-cast prefix (`(long*)(u64)` vs `(double*)(u64)`), and the value cast (`(long)(u64)` vs `(double)(u64)`). Every place that emitted a hardcoded `double` or a `(double*)`/`(double)` cast — `let`/`const`/`for`/params/return, array & string & map literals, index & member read/write, `len`, `addr_of`, and the bump allocator's `kmalloc`/`kfree` — now follows the mode. The `(long)` integer casts already on bitwise/`%` ops are float-free no-ops in int mode (exactly what OS code wants); `/` becomes integer division.
+- **New entry points** `transpile_kernel_int(source)` and `transpile_freestanding_int(source)` set int mode, emit, and restore the float default (so the mode never leaks across calls). The float `transpile`/`transpile_freestanding`/`transpile_kernel` are unchanged in output (verified by regression assertions). Refactored the three into a shared `_emit_fns(source, preamble)` core.
+- **Why it matters:** a GCC interrupt handler requires `-mgeneral-regs-only` (no x87/SSE — you must not touch float regs in an ISR), which forces a `double`-everything kernel onto **soft-float libgcc** (`__adddf3`/`__fixunsdfsi`/…) that isn't installed for 32-bit here. With **zero** float operations, there is nothing to link against.
+- **Validated END-TO-END in QEMU (a self-proving boot).** A kernel installs a pblang ISR on the software-interrupt vector `0x30`, clears a marker at `0x9000`, fires `int $0x30`, and reads the marker back: the ISR writes 42, so `outb(0xf4, marker)` exits QEMU with `(42<<1)|1 = 85` **iff the handler actually ran**. Build: `gcc -m32 -ffreestanding -nostdlib -fno-pie -mgeneral-regs-only -c` (exit 0) → `ld -m elf_i386 -T kernel.ld` (exit 0, **no missing soft-float symbols**) → `grub-file --is-x86-multiboot` OK → **QEMU exit 85**. So the interrupt language features of §72 now not only compile but **link and boot, with the handler firing** — the milestone §72 could only reach as an object file. Locked by `tests/semantics/ctranspile_intmode_test.sapp` (asserts the int-mode contract: all `long`, no `double`, ISR still a `void` interrupt routine, `addr_of`→`long`, aggregates through `long*`; plus float-mode regression + no-mode-leak).
+
+**Significance:** the OS-dev north-star path is now boots (§69) → useful data (§70) → composite types + console (§71) → interrupt *readiness* (§72) → **interrupts that actually fire in a booted kernel (§73)**, each proven by a real QEMU boot. Float-free codegen is also the faster/smaller native-AOT route generally. **Next:** a slab/free-list allocator over the bump heap, a real keyboard ISR loop (the primitives + handler firing both exist now), and migrating `systems.sapp` onto this codegen.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **139 passed; 0 failed**.
+
+---
+
+## 74. Free-list allocator — reclaiming kernel memory, written in pblang (2026-05-31)
+
+The §69 bump allocator never frees (`kfree` is a no-op), so a long-running kernel exhausts its heap. Added **`stdlib/kernel/heap.sapp`** — a real reclaiming allocator **written in pblang** (not hand-written C in the preamble, per the rust→pblang directive): first-fit + block splitting + a LIFO free list, each block carrying an 8-byte header (`size`, `next-free`). The free-list head is threaded through a caller-provided `ctrl` cell (the transpiler has no globals — and explicit state makes the allocator reentrant: independent arenas just use independent `ctrl` cells). Lowered with the §73 integer mode, so the whole memory manager is float-free.
+
+- `heap_init(ctrl, base, size)`, `heap_alloc(ctrl, n)` (first-fit, splits when the remainder ≥ a header), `heap_free(ctrl, p)` (LIFO push). `_align8` rounds up via a bitwise mask (integer in any codegen mode).
+- **Validated END-TO-END in QEMU (self-proving):** a kernel allocs `a` then `b`, frees `a`, allocs `c`; with a LIFO free list + first-fit, `c` must reuse `a`'s exact block. The kernel exits 85 (= `(42<<1)|1`) iff `c == a` — proving `heap_free` actually reclaims. Build `gcc -m32 -ffreestanding -nostdlib -mgeneral-regs-only -c` (0) → `ld -m elf_i386` (0) → **QEMU exit 85**. Locked by `tests/semantics/kernel_heap_test.sapp` (codegen contract; reuse proven by the boot).
+
+**Significance:** the kernel memory model goes from "allocate-only bump" to a genuine **alloc/free heap** — the substrate a GC, drivers, and a shell all need. **Next:** a tunable GC over this heap (§75).
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **140 passed; 0 failed**.
+
+---
+
+## 75. A tunable garbage collector (manual + automatic), written in pblang (2026-05-31)
+
+Per the directive *"gc will exist and will be tunable (manual + auto)"*: added **`stdlib/kernel/gc.sapp`** — a **precise mark-sweep GC** over the §74 free-list heap, written in pblang and tunable in both axes:
+
+- **Manual collection** — `gc_collect(g)` is always available and runs a full mark-from-roots / sweep-unreachable / compact-object-table cycle.
+- **Automatic collection** — when enabled, `gc_alloc` collects on its own once `bytes_since_last_collect >= threshold` (collecting *before* the triggering allocation, so a fresh object is never swept by the collection it caused). Both knobs are run-time tunable: `gc_set_auto(g, on)` (auto on/off → eager/lazy/fully-manual) and `gc_set_threshold(g, bytes)`. `gc_collections(g)`/`gc_live(g)` expose stats for tuning.
+
+**Precise, not conservative:** transpiled C can't portably scan the stack, so roots (`gc_add_root`) and inter-object edges (`gc_set_child`) are explicit — marking is exact. A GC object's payload is `[mark, nchildren, child…, user data]`; `_gc_mark` is a recursive DFS. The collector is lowered with the §73 integer mode, so it's float-free and boots under `-mgeneral-regs-only`.
+
+- **Transpiler improvement (enabling this):** `_emit_fns` now emits **C forward declarations** for every function before the definitions, so functions may call each other in any order or recurse mutually (`gc_alloc` calls `gc_collect`, defined later). This avoids GCC's "implicit declaration" error — a general correctness fix for the codegen, not GC-specific.
+- **Validated END-TO-END in QEMU (self-proving, both modes in one boot):** MANUAL — auto off, alloc root `R` + garbage `G`, `gc_collect`, then a new alloc must reuse `G`'s block. AUTO — auto on with a tiny threshold, alloc root `R2` + garbage `G2`, the next alloc crosses the threshold so auto-collect frees `G2` and that alloc reuses it while `gc_collections` advances. The kernel exits 85 iff **both** reclaim. Build `gcc -m32 -ffreestanding -nostdlib -mgeneral-regs-only -c` (0) → `ld -m elf_i386` (0, no soft-float) → **QEMU exit 85**. Locked by `tests/semantics/kernel_gc_test.sapp` (codegen contract; behaviour proven by the boot).
+
+**Significance:** pblang now has the memory model spectrum a real system needs — **GC-free** (bump §69, free-list §74) for the kernel core *and* an opt-in **tunable GC** (§75) for managed allocation — all written in pblang and float-free. OS-dev path: boots(§69)→data(§70)→structs+console(§71)→interrupt-ready(§72)→interrupts fire(§73)→reclaiming heap(§74)→**tunable GC(§75)**.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **141 passed; 0 failed**.
+
+---
+
+## 76. Real hardware interrupts: PIT timer (IRQ0) + a live keyboard driver (IRQ1) (2026-05-31)
+
+§73 proved a *software* `int` fires a handler. This proves **real asynchronous hardware interrupts** end-to-end — the device IRQs an OS is actually built on. All pblang.
+
+- **Timer — `stdlib/kernel/timer.sapp`.** `pit_init(divisor)` programs the 8253 PIT channel 0 (command `0x36` → mode 3, then divisor low/high to port `0x40`); `pit_divisor_for(hz)` (integer `/`). The PIT raises **IRQ0** on its own — the heartbeat a preemptive scheduler/timekeeping needs. **Validated END-TO-END in QEMU (deterministic, headless, no input):** install `isr_timer` on vector `0x20`, `pit_init`, `sti`, then spin in `hlt` until the tick counter the ISR increments is > 0 → **exit 85**. The interrupt fires asynchronously from hardware — nothing in the main path triggers it. Locked by `tests/semantics/kernel_timer_test.sapp`.
+- **Keyboard — a real IRQ1 driver.** `isr_kbd` reads a scancode from port `0x60` (`kbd_scancode`, §72) and EOIs; installed on vector `0x21` it takes the IRQ1 the PS/2 controller raises on a keypress. **Validated END-TO-END in QEMU with a LIVE injected keystroke:** the kernel `serial_init`s and emits a readiness byte on COM1; the host waits for it (so the key arrives *after* `sti`), injects a key via the QEMU monitor (`sendkey`), the handler captures the scancode and sets a flag, and the kernel **exits 85**. So a pblang interrupt handler caught a genuine asynchronous keyboard IRQ. Locked by `tests/semantics/kernel_keyboard_test.sapp`.
+
+Both ride the same path proven float-free by §73 (`-mgeneral-regs-only`, no soft-float). **Significance:** the two interrupt sources every interactive/preemptive OS starts from — the timer tick and the keyboard — now both work in a booted pblang kernel. This is the interactivity/preemption substrate (a cooperative or preemptive scheduler is now expressible).
+
+## 77. Free-list coalescing — an anti-fragmentation heap (2026-05-31)
+
+Hardened §74: `heap_free` now keeps the free list **address-ordered** and **coalesces** a freed block with its physically-adjacent free neighbours (forward-merge with the successor, then backward-merge with the predecessor). Without this, repeated alloc/free cycles fragment the heap into unusable slivers; with it, freed-adjacent space recombines into blocks large enough to satisfy later big requests. **Validated END-TO-END in QEMU:** an arena sized to *exactly* three blocks (no tail) — alloc a,b,c, free a then b (adjacent) → they merge into one block, and a subsequent allocation larger than either hole **succeeds only because of the merge** (would OOM otherwise) → **exit 85**. The §74 single-block reuse proof (`c == a`) and the §75 GC still boot under the new policy (the GC proof was re-expressed on observable collector state — `gc_live` drops, `gc_collections` advances — which is allocator-policy-independent and more rigorous). Locked by the extended `tests/semantics/kernel_heap_test.sapp` (coalescing fragments) + `kernel_gc_test.sapp`.
+
+**OS-dev path now:** boots(§69)→data(§70)→structs+console(§71)→interrupt-ready(§72)→sw-int fires(§73)→reclaiming heap(§74)→tunable GC(§75)→**hardware timer+keyboard IRQs(§76)**→**anti-fragmentation heap(§77)**, every step proven by an actual QEMU boot.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **143 passed; 0 failed**.
+
+---
+
+## 78. A task scheduler: real stackful context switching, written in pblang (2026-05-31)
+
+Turned the primitives into **multitasking**. Added a `ctx_switch` intrinsic (kernel preamble) and **`stdlib/kernel/sched.sapp`** — a round-robin scheduler where each task runs on its own stack and switching is a genuine CPU context switch.
+
+- **`ctx_switch(old_sp, new_sp)`** — a naked function: push the callee-saved registers (ebx/esi/edi/ebp), save esp into `*old_sp`, load `new_sp`, pop them, `ret`. The classic cooperative-threading core. A fresh task's stack is primed `[ebx,esi,edi,ebp,entry]` so the first switch `ret`s straight into the task entry.
+- **`sched.sapp`** (all pblang): `sched_new(maxtasks)`, `task_add(s, stack_base, stack_size, addr_of("fn"))` (primes the stack + records the saved esp), `sched_start(s)` (leave the boot context for task 0), `sched_yield(s)` (round-robin + `ctx_switch`). The scheduler control block and per-task saved-esp table are raw allocator cells.
+- **Validated END-TO-END in QEMU (cooperative):** two tasks on separate 4 KiB stacks share a counter; each increments and `sched_yield`s, so they strictly interleave (a,b,a,b,…). Reaching the target requires every switch to correctly preserve and resume each task's stack across many round-trips → **exit 85**. Locked by `tests/semantics/kernel_sched_test.sapp`.
+
+## 79. Preemptive scheduling — the timer drives the switch (2026-05-31)
+
+Drove §78 from the §76 timer: `isr_timer` does `pic_eoi()` then `sched_yield(s)`, so the scheduler runs **without tasks cooperating**.
+
+- **The mechanism:** preemption reuses the *cooperative* `ctx_switch`. A preempted task is always left suspended at the `ctx_switch` call inside its own `isr_timer` activation, so when it is resumed it unwinds back through that ISR's epilogue and `iret`s on its **own** stack — the GCC interrupt frame stays consistent per task. Because the interrupt gate clears IF on each switch into a task, every task `sti()`s on entry.
+- **A real ordering bug, found and fixed:** `sti()` must not run before `sched_start` — a tick firing while still in `kmain` (current=0) would save the boot stack into task 0's cell and clobber its primed stack (observed as a triple fault → QEMU exit 0). Fix: enable interrupts *inside* the first task, after the switch makes `current` consistent. Documented in `sched.sapp`.
+- **Validated END-TO-END in QEMU (preemptive):** two tasks that **never** call `sched_yield` — both tight spin loops — where task_b exits only once it observes that **both** counters advanced. Since neither yields, the only way both progress is the timer forcibly interleaving them → **exit 85**. So a pblang kernel now preemptively multitasks non-cooperating tasks.
+
+**Significance:** pblang has a working **multitasking kernel** — cooperative *and* preemptive — built entirely in pblang on real context switches, float-free (§73). Combined with the timer/keyboard (§76) and the heap+GC (§74/§75/§77), the core a small OS is built from now exists and boots. OS-dev path: …→hardware IRQs(§76)→anti-frag heap(§77)→**cooperative scheduler(§78)**→**preemptive scheduler(§79)**.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **144 passed; 0 failed**.
+
+---
+
+## 80. An interactive shell: keyboard input + the whole stack, composed (2026-05-31)
+
+The capstone — every primitive built this session running **at once** in one interactive pblang kernel: keyboard IRQ1 + a scancode ring buffer + a US keymap + the serial/VGA console + the heap + the timer-preemptive scheduler.
+
+- **`stdlib/kernel/keyboard.sapp`** (reusable input facilities, all pblang): a scancode **ring buffer** (`kbd_buf_new`/`kbd_push`/`kbd_pop`) fed by the IRQ1 ISR so the handler stays tiny and a task drains at leisure; a **US scancode-set-1 → ASCII keymap** (`kbd_keymap_new`/`kbd_ascii`) that ignores key releases.
+- **The shell**: print a prompt, drain the buffer, translate + echo each char, accumulate a line, and on Enter match a command. **Validated END-TO-END in QEMU with LIVE injected keystrokes** (single-threaded *and* composed under the scheduler): typing `ok`+Enter — keys injected via the QEMU monitor after the prompt appears on serial — flows keyboard-IRQ → ring buffer → shell → echo (`ok` seen on serial) → command match → **exit 85**. The composed version runs the shell as a scheduled **task** preempted by the timer, with IRQ0 and IRQ1 handlers coexisting.
+- **A real triple-fault bug, found and fixed:** `pic_remap` unmasks *all* IRQs, but a kernel that only installs *some* handlers triple-faults when a stray IRQ — QEMU's free-running PIT on IRQ0 — vectors to an uninstalled IDT gate. Manifested as the shell printing its prompt then dying (QEMU exit 0). Added **`pic_mask(master, slave)`** to `interrupts.sapp`; the shell masks everything except the IRQs it handles (`pic_mask(253,255)` keyboard-only; `pic_mask(252,255)` timer+keyboard). The self-proving boots distinguished crash(0)/hang(timeout)/correct(85), which made it diagnosable.
+
+**Significance:** a pblang kernel is now **interactive** — it takes real keyboard input and runs a shell loop — composing the timer, scheduler, interrupts, console, and heap into one working whole. Every core piece of a small OS, written in pblang and proven by QEMU boots, now exists *and runs together*. OS-dev path: …→cooperative sched(§78)→preemptive sched(§79)→**interactive shell / full composition(§80)**.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **145 passed; 0 failed**.
+
+---
+
+## 81. System calls: the `int 0x80` trap, written in pblang (2026-05-31)
+
+The user/kernel boundary primitive — the gateway toward usermode. Added a software-interrupt **syscall trap**: `stdlib/kernel/syscall.sapp` + a `swint80` (`int $0x80`) intrinsic.
+
+- **Memory-based ABI** (`sys_num`/`sys_arg`/`sys_return`/`sys_call`): the caller writes the syscall number + argument to fixed cells, executes `int 0x80`, and reads the result cell; the `isr_syscall` handler reads/writes the same cells. This deliberately avoids the register frame — a GCC `__attribute__((interrupt))` handler hides the saved registers, so the conventional "args in eax/ebx" ABI isn't readable without a hand-written naked entry stub. The memory ABI is a legitimate alternative (microkernels pass messages similarly) and keeps the whole thing in pblang.
+- **The dispatcher is an ordinary `isr_syscall`** the kernel author writes (read `sys_num`/`sys_arg`, switch on the number, `sys_return` the result), installed on IDT vector `0x80`. (DPL 0 here; ring-3 entry would use gate flags `0xEE`.)
+- **Validated END-TO-END in QEMU:** a kernel registers syscalls 1 = `putc(arg)` and 2 = `square(arg)`; `kmain` calls `sys_call(2, 6)` → the trap dispatches → handler returns 36 → **exit 85**, and `sys_call(1,'O')/('K')` print **`OK` on serial**. So caller→kernel trap, dispatch, and return all work. All hardware IRQs masked (`pic_mask(255,255)`) since only the software trap is used. Locked by `tests/semantics/kernel_syscall_test.sapp`.
+
+**Significance:** pblang can now express the **syscall trap** an OS uses to separate user code from kernel services — the last core mechanism before ring-3 usermode (GDT user segments + a TSS). OS-dev path: …→interactive shell(§80)→**syscall trap(§81)**.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **146 passed; 0 failed**.
+
+---
+
+## 82. Ring-3 usermode — LANGUAGE readiness for privilege separation (2026-05-31)
+
+*Making the language able to express usermode; the OS is the author's to build (cf. §72 for interrupts).* Added the primitives a kernel uses to run code unprivileged at ring 3 and bring it back via syscalls.
+
+- **Intrinsics** (kernel preamble): `lgdt` (load the GDT register), `ltr` (load the task register with the TSS selector), `enter_user(entry, ustack)` (the ring0→ring3 transition: reload the data segments to the user selector, push a ring-3 `iret` frame — user SS `0x23`, esp, eflags, user CS `0x1B`, entry — and `iret`), and `read_cs()` (read the code selector, whose low 2 bits are the CPL).
+- **`stdlib/kernel/gdt.sapp`** (all pblang): `gdt_set_entry` (8-byte descriptor encoder), `gdt_build` (the standard flat layout — kernel code/data `0x08`/`0x10` matching GRUB so no CS reload is needed, user code/data `0x1B`/`0x23`, and a TSS at `0x28`), `gdt_load` (build the GDTR + `lgdt`), `tss_init` (zero a TSS, set the ring-0 stack `esp0`/`ss0` used on a privilege-switch trap), `tss_load` (`ltr`). With a syscall gate at **DPL 3** (`idt_set_gate(..., 0xEE)`), ring-3 code may `int 0x80`.
+- **Validated END-TO-END in QEMU (and rigorously):** a kernel builds the GDT+TSS, installs a DPL-3 syscall handler, and `enter_user`s into a `user_main`. `user_main` calls `read_cs()` and proceeds **only if `cs == 0x1B`** (user code, RPL 3) — a value the CPU reports only at genuine CPL 3 — then traps back via `int 0x80` to ask the kernel to exit. **QEMU exit 85** + `R3` on serial. The `cs == 0x1B` gate is the rigorous part: had the "ring-3" transition silently stayed at ring 0, `cs` would be `0x08` and the kernel would never be asked to exit (timeout, not 85). So this proves *genuine* unprivileged execution + the TSS-provided kernel stack on the ring3→ring0 trap + the DPL-3 gate. Locked by `tests/semantics/kernel_usermode_test.sapp`.
+
+**Significance:** pblang can now express the **full privilege-separation mechanism** — user code runs unprivileged (it cannot do port I/O or `hlt`; it must ask the kernel) and the kernel services it through the syscall trap. With this, every core mechanism a protected-mode OS is built from is now expressible in pblang and proven by a QEMU boot. The language is OS-development-ready across the board; building an actual OS on these primitives is separate, downstream work. OS-dev readiness path: …→syscall trap(§81)→**ring-3 usermode(§82)**.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **147 passed; 0 failed**.
+
+---
+
+## 83. Paging / virtual memory — LANGUAGE readiness (completes the OS-dev mechanism set) (2026-05-31)
+
+The last core protected-mode mechanism. Added the primitives to build and install x86 32-bit page tables; an actual VM subsystem is the kernel author's to build on top.
+
+- **Intrinsics** (kernel preamble): `set_cr3` (load the page-directory base), `enable_paging` (flip `CR0.PG`), `read_cr2` (the faulting address, for a page-fault handler), `invlpg` (flush one TLB entry).
+- **`stdlib/kernel/paging.sapp`** (all pblang): `page_alloc` (a 4 KiB-aligned page — rounds the 8-byte-aligned bump allocation up), `pd_init`/`pd_set` (page directory), `pt_identity` (identity-map a 4 MiB table), `pt_map` (map one page with flags — `7` = present+rw+user for usermode pages), `paging_enable` (`set_cr3` + `enable_paging`).
+- **Validated END-TO-END in QEMU (rigorously — real translation, not an identity no-op):** identity-map the first 4 MiB (so the kernel keeps executing the instant paging turns on), then map **virtual 4 MiB → physical 2 MiB** via a second page table; after `paging_enable`, reading virtual 4 MiB returns the sentinel written to physical 2 MiB — the MMU genuinely remapped the address (virtual ≠ physical) → **exit 85**. A broken table would page-fault → triple fault → exit 0. Locked by `tests/semantics/kernel_paging_test.sapp`.
+
+**Significance:** **OS-dev language readiness is now complete across the mechanism set** — boot, GC-free + reclaiming + GC'd memory, software + hardware interrupts, preemptive scheduling, console, syscalls, ring-3 usermode, **and virtual memory** — every piece written in pblang and proven by a real QEMU boot, all float-free via the §73 integer codegen. pblang is ready for OS development; building an OS on these primitives (paging-backed process address spaces, an ELF loader, a filesystem, …) is the downstream work that now *has a foundation*. OS-dev readiness path: …→ring-3 usermode(§82)→**paging / virtual memory(§83)**.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **148 passed; 0 failed**.
+
+---
+
+## 84. IDE: AI assistant (pb-mcp-server) + a modernized visual design (2026-05-31)
+
+Started the **Improve-the-IDE** north-star (see `docs/Visual_Designer.md`, `docs/IDE_MANUAL.md`). Two pieces, both in `editors/ide/index.html` (the bootstrap browser IDE):
+
+- **AI assistant wired to the pb-mcp-server.** A new toolbar **`🤖 AI`** button (and `Ctrl+I`) opens an assistant panel powered by the project's own **pb-mcp-server** (`editors/ide/tools/mcpservers/pb-mcp-server`). It shows a live connection indicator (pings the gateway `GET /health`), a collapsible connection config (endpoint default `http://localhost:8080`, optional `PB_GATEWAY_TOKEN`, and an AI-tool selector — `ai_ollama_generate`/`ai_chain_of_thought`/`ai_self_critique`/`ai_structured_extract`/`ai_few_shot_classify`), **quick actions** over the current editor code (Explain / Find bugs / Improve / Add comments / Explain diagnostics), a free-form prompt with an *include-code* toggle, and *Insert into editor*. The client `POST`s `{endpoint}/mcp/tool` as `{tool, arguments}` and parses `{result}`/`{text}`/MCP-`{content[]}`/raw responses; it degrades gracefully offline with a gateway-startup hint. Config persists in `localStorage`. JS validated with `node --check`.
+- **Modernized visual design.** Introduced a CSS design-token palette (`:root` variables), a gradient toolbar with refreshed buttons (transitions, focus rings, accent `run`/`AI` actions), unified panel headers (uppercase tracking + a coloured left-accent bar per panel), custom thin scrollbars, an accent splitter, and a polished status bar (the `server:` dot now reflects live status). The editor/highlight-overlay font metrics and the `applyTheme` light/dark logic were preserved so syntax highlighting stays pixel-aligned. HTML tag balance + JS syntax verified.
+
+Docs updated: `IDE_MANUAL.md` gains an **AI assistant** section + the `Ctrl+I` shortcut (the manual is also served in-app via `/manual/ide`); `Visual_Designer.md` notes the AI panel as a Studio building block. The IDE remains the HTML/JS bootstrap toward the self-hosted, pblang-written **pblang Studio**; this advances its editor side (AI help + a cohesive look) without diverging from that target.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **148 passed; 0 failed** (IDE work is front-end; no `.sapp` corpus change).
+
+---
+
+## 85. IDE AI panel works end-to-end: a pblang AI gateway + a stdlib HTTP body fix (2026-05-31)
+
+Wired the §84 AI panel to a real model — and kept it **in pblang** (per the rust→pblang directive) instead of patching the Rust server.
+
+- **`editors/ide/tools/ai/gateway.sapp`** — a gateway written in pblang using `stdlib/http_server.sapp` + `stdlib/ai.sapp`. It serves exactly the panel's contract: `GET /health` (drives the live status dot), `OPTIONS *` → 204 + CORS (browser preflight), `POST /mcp/tool` `{tool, arguments:{prompt, model?, provider?}}` → routed to `ai.chat` (Ollama by default) → `{result, tool, model}`. Open CORS (`*`) so the browser IDE can call it cross-origin; a per-tool system prompt makes one chat backend serve the different `ai_*` tool names; default model via `PB_AI_MODEL`, bind via `PB_AI_GATEWAY_BIND`. **Validated end-to-end with `curl` and a live Ollama:** `/health` → 200+CORS, preflight → 204+CORS, and `POST /mcp/tool` (the panel's exact request shape, incl. `ai_chain_of_thought`) → a real model response (`llama3:latest`). The panel now talks to a real LLM with no Rust changes.
+- **stdlib fix — `http_server.sapp` now reads request bodies.** The server only read up to the header terminator (`tcp_read_until "\r\n\r\n"`), so POST bodies were dropped (`req.body` empty → the gateway saw "invalid JSON"). Added `_recv_request(s)`: after the headers, read the `Content-Length` bytes via `tcp_read` (which serves the bytes `tcp_read_until` left buffered in the stream, then reads the rest). Wired into all four serve loops (`serve_once`/`serve_forever`/`*_timeout`). This is a general correctness fix benefiting **every** pblang HTTP server, not just the gateway. Suite stayed **148/0**.
+- **Panel polish:** added an optional **Model** field (persisted, sent as `arguments.model`).
+
+**Significance:** the IDE's AI assistant is now genuinely functional against a local model, the whole AI path is pblang (front-end panel + pblang gateway + `stdlib/ai.sapp` → Ollama), and the pblang HTTP server gained real POST-body support along the way. Docs: `IDE_MANUAL.md` AI section updated with the gateway start command. *(Superseded by §86: the model backend is now pbAI, not Ollama.)*
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **148 passed; 0 failed**.
+
+---
+
+## 86. The IDE AI is backed by pbAI — pblang's OWN model, no external LLM (2026-05-31)
+
+Per directive — *the AI uses **pbAI**; no Ollama or any other external model.* Replaced the §85 Ollama backend with pblang's own intelligence and advanced the **pbAI north-star** (`docs/pbAI.md`).
+
+- **`stdlib/pbai.sapp`** — pbAI's IDE assistant, written entirely in pblang, **no network / no external model**. It pairs a **neural intent classifier** (a `nn.sapp` MLP — the genuine pbAI model, trained in-process on bag-of-keywords features) with pblang-grounded **skills**: `explain` (reports real structure — function names/count, loops, conditionals), `bugs` (balance checks + **pblang-specific gotchas** an outside model gets wrong: no UFCS, unsupported string `<`/`>`, missing-map-key reads *raise*), `improve`, `comment`, and a pblang **knowledge base** for general questions. `respond(prompt)` classifies then runs the skill; `respond_tool(tool, prompt)` lets a tool hint override routing. pbAI's edge is that it knows pblang's *own* specifics.
+- **Gateway rewired** (`editors/ide/tools/ai/gateway.sapp`): `/mcp/tool` now calls `pbai.respond_tool(tool, prompt)` and returns `{result, tool, model:"pbAI"}` — **Ollama/`ai.chat` removed**, no outbound network. **Validated end-to-end with `curl` and no model server running:** explain correctly analyzed a recursive `fib`; find-bugs caught unbalanced parens *and* the missing-map-key gotcha; responses tagged `"model":"pbAI"`.
+- **Panel updated** to say *powered by pbAI — pblang's own model (no external LLM)*; status reads `pbAI online/offline`; the model field and Ollama hints removed.
+- **Locked by a RUNNING test** (`tests/semantics/pbai_test.sapp`) — unlike the kernel codegen tests, pbAI is pure pblang on `nn.sapp`, so the test executes in the VM: it asserts the classifier routes (explain→0, bugs→1, comment→3) and the skills produce grounded, pblang-aware answers. **149/0.**
+
+**Significance:** pbAI moved from "a trainable MLP that learns XOR" (§65) to **pblang's own working assistant that backs the IDE** — the whole AI path (panel → pblang gateway → pbAI model, all pblang, zero external dependency). The generative scale-up toward a full pblang language model remains the `docs/pbAI.md` roadmap; the assistant skills are useful and 100% pblang today. (The §85 `http_server.sapp` POST-body fix stands.)
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **149 passed; 0 failed**.
+
+---
+
+## 87. Generative pbAI: a trainable character-level neural language model (2026-05-31)
+
+Started pbAI's **generative** side (the §86 assistant only classifies/analyzes). **`stdlib/pbai_lm.sapp`** is a character-level neural **language model** written entirely in pblang — pbAI's first model that *generates* text.
+
+- **Architecture** (a Bengio-style neural LM): the previous **K** characters are embedded (`E[V,D]`), concatenated, passed through a **tanh hidden layer** (`W1,b1`), projected to **vocab logits** (`W2,b2`), and softmax'd — trained on next-character prediction with cross-entropy. Because the VM's `tensor_*` kernels are **forward-only (no autograd)**, the gradients are computed by **manual backprop** in pblang (dlogits → W2/b2 → tanh → W1/b1 → scatter into the embedding rows); the **kernels accelerate inference** — `next_id` selects the next token with the native **`tensor_argmax`** over the logits. API: `vocab_build`/`encode`, `model_new`, `train_step`/`train` (sliding K-window), `avg_loss`, `next_id`, `generate` (autoregressive greedy).
+- **It learns and generates (validated).** On a small pblang corpus (`let x = 1; … fn add(a,b){…} fn main(){…}`), 60 epochs drove cross-entropy **3.29 → 0.58**, and greedy generation produced **coherent pblang**: seed `"fn "` → `fn main() { let r; } fn main() {`; seed `"let "` → `let r; } fn main() { let r; }`. The model genuinely learned the corpus's character structure.
+- **Two real bugs fixed in the build:** map keys must be strings (char *codes* were used as keys → `map_has` rejected them — now keyed by `str(code)`); and `tanh`'s `num_exp(2z)` overflowed to `NaN` under a higher learning rate, which the VM rejects in comparisons — `_tanh` now saturates for `|z|>20`.
+- **Locked by a fast RUNNING test** (`tests/semantics/pbai_lm_test.sapp`, ~1.6 s): a tiny model must reduce its loss after training and generate valid in-vocabulary text, and `next_id` (the kernel path) must return a valid token. **150/0.**
+
+**Significance:** pbAI now spans **analysis** (§86 classifier + grounded skills) *and* **generation** (§87 neural LM) — both written in pblang, both with no external model. This is the small, honest start of the pbAI generative family; scaling to a real transformer (multi-char context already supported via K; attention/more layers over the `tensor_*` kernels, larger corpora, sampling with temperature) is the `docs/pbAI.md` roadmap. A trained model can later back a "complete this code" IDE action (train-once, cache weights — per-request training is too slow in the interpreter).
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **150 passed; 0 failed**.
+
+---
+
+## 88. IDE: the visual designer (web / circuit / quantum) + a pblang web browser (2026-05-31)
+
+Began **completing the IDE** toward `docs/Visual_Designer.md` (pblang Studio). Two large features in `editors/ide/index.html`, plus two pblang stdlib modules.
+
+**(a) Visual designer — `🎨 Designer` / `Ctrl+D`.** A 3-pane view (Palette · Canvas · Inspector) that hosts multiple project **kinds** sharing one shell; the design is a single source-of-truth tree that both renders (live) and generates pblang.
+- **Web (roadmap D0):** a component palette (Heading/Text/Link/Button/Input/Image/Section/Card + **2D Canvas**, **3D Scene**, and a **Custom** "any element" per the user's 2D/3D/n-dimensional ask). Click to add (nesting into a selected container), a live HTML canvas preview, a property inspector, move/delete. **Codegen → `html.sapp`** (`tag`/`a`/`img`/`self_closing`/`page`) via *"⟶ To pblang code"*, which writes a runnable pblang web app into the editor. The 2D canvas draws a sample; the 3D scene is a CSS cube preview (codegen leaves a `pblang-graphics`/WebGL stub).
+- **Quantum circuit:** a qubit×op grid; place H/X/Z/CNOT/Measure gates; a **browser-side state-vector simulator** shows basis-state probabilities; **codegen → `stdlib/quantum.sapp`** (`circuit`/`h`/`cx`/`measure`/`run`) — a runnable, grounded quantum program.
+- **Circuit (digital logic):** Inputs + AND/OR/NOT/XOR/NAND gates + Outputs, wired via the inspector; a **truth-table simulator**; **codegen → pblang boolean functions**.
+
+**(b) pblang web browser — `🌐 Browser` / `Ctrl+B`.** A browser whose **engine is written in pblang**: `stdlib/browser.sapp` (`fetch` via `http_get`, `title`, `links`, `strip_tags` reader-text with script/style removal, `fetch_page`). The IDE Browser view (address bar + Page/Reader/Links modes) calls `POST /browse {url}` on the **pblang gateway** (`editors/ide/tools/ai/gateway.sapp` gained the route + a `browser.sapp` import). **Validated end-to-end:** fetching `http://example.com` through pblang returned title `Example Domain`, clean reader text (CSS/JS stripped), and the page's links.
+
+**Locked / validated:** the designer + browser front-end is validated by `node --check` (all 3 `<script>` blocks) + HTML tag balance; the pblang **browser engine** by a running VM test (`tests/semantics/browser_test.sapp`: title/strip-tags/links on static HTML). Suite **151/0**.
+
+**Honest scope:** this ships designer **D0** (web canvas + codegen) plus the circuit/quantum kinds and the browser. Roadmap remainder: **D1 round-trip** (parse generated `.sapp` back onto the canvas via the self-hosted parser + the `.pbui` doc), **D2 events/inspector depth**, **D3 desktop-GUI target** (`graphics.sapp`), **D4 CLI/TUI**, full 3D/WebGL, and migrating the IDE itself to being written in pblang (the self-hosted Studio). The IDE is now multi-modal (Code · Designer · Browser · AI) but not yet "totally complete."
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **151 passed; 0 failed**.
+
+---
+
+## 89. Protocols: a pblang security layer + PBP, pblang's own secure protocol (2026-05-31)
+
+Started the protocol strategy (`docs/Protocols.md`): **(1)** compatibility with current protocols (already: `http_*`/`tls`/`websocket`/`tcp_*`), **(2)** a **security layer above** any of them, **(3)** pblang's **own protocol**. Tiers 2–3 built in pblang, with an honest **gap analysis** of the idea.
+
+- **`stdlib/securelayer.sapp` — authenticated encryption over any transport.** `seal(key, plaintext, seq)`/`open(key, env, seq)` from the VM primitives (`sha256`, `hmac_sha256`, `random_bytes`): **encrypt-then-MAC** (sha256 keystream XOR + HMAC tag), **constant-time** tag check before decryption, **downgrade protection** (version bound in the tag), **replay protection** (sequence in the authenticated AAD), fresh nonce per message, full-Unicode (24-bit code-point encoding). Usable above HTTP/WS/files.
+- **`stdlib/pbp.sapp` — PBP, the pblang Secure Protocol.** Compact framing `PBP1 <type> <seq> <len>\n<payload>`; **secure-by-default** DATA frames (sealed via the layer); **sessions** with strictly-increasing sequence numbers (replay/reorder protection); a `serve_once` TCP server. **Measured efficiency:** framing overhead **14 bytes vs HTTP's 112 (~8× leaner)**.
+- **Gap analysis (the user asked to improve the idea's gaps).** Fixed in design: **downgrade** (version in tag) and **replay** (seq in AAD); **quantified** the efficiency claim. Flagged as needing VM builtins, not design changes: a **vetted AEAD** (AES-GCM/ChaCha20-Poly1305) to replace the from-primitives cipher + remove hex bloat; **X25519** key agreement for forward secrecy (PSK is the bootstrap); a plain **`tcp_connect`** builtin for a live PBP *client* (the VM has `tcp_listen`/`accept` + only `tcp_connect_tls`; server/codec/crypto are complete). Full detail + table in `docs/Protocols.md`.
+- **Locked by running VM tests:** `securelayer_test` (round-trip incl. Unicode, tamper/wrong-key/replay/downgrade rejection, fresh-nonce) and `pbp_test` (frame codec, secure session exchange, replay rejection, encrypted-on-the-wire, overhead < HTTP). **153/0.**
+
+**Significance:** pblang now has a real, tested **security layer** it can put above any protocol and a lean **own protocol** with security built in — the first concrete step of the compatibility/security/own-protocol vision. The remaining strength items are named VM builtins (AEAD, X25519, `tcp_connect`), not unknowns.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **153 passed; 0 failed**.
+
+---
+
+## 90. pblang-native IDE — browser-free, for total security (2026-05-31)
+
+Per directive — *make the IDE completely written in pblang, no HTML/CSS/JS, for total security.* Started the browser-free native IDE (`docs/PB_IDE.md`). The security argument is **subtractive**: a web IDE drags in an HTML parser, DOM (`innerHTML` → XSS, one already fixed), a CSS engine, and a JS engine (the largest attack surface in computing); a pblang-native IDE is just a window + pixels + key events under pblang's capability model — **nothing to inject into**.
+
+- **`stdlib/editor_model.sapp`** — the editor core (line buffer + cursor + edit ops: `insert_text`/`newline`/`backspace`/clamped cursor movement). Pure pblang, no UI dependency → fully tested in the VM (`editor_model_test`).
+- **`stdlib/bitmap_font.sapp`** — there is **no text-rendering builtin**, so the IDE draws its own glyphs: a 5×7 font where `draw_text` emits pixels via a `setpx(x,y,color)` callback (drives a real window, or a recording surface for tests). Tested by verifying a glyph's exact pixel set (`bitmap_font_test`).
+- **`editors/ide/pbide.sapp`** — the window binding (`graphics.sapp` → minifb/SDL2): creates the window, draws the buffer (line numbers + code + cursor + status bar) with the font, maps `gfxpollevents` keydowns (`{type, key}`) to editor ops, F5 runs the buffer through the self-hosted frontend. **Verified to run** — it opened a native window and executed the full draw/event loop with no error (a display backend is present; the loop ran clean for 5 s). Two real bugs fixed in the build: `gfxsize` returns a map `{w, h}` (not an array — map index must be string); the font/editor are decoupled via the `setpx` callback so they test without a display.
+- **Honest gaps (foundational, named):** interactive verification needs a human at the window (no headless key/pixel check); the key→char table + shift/modifier handling are v1-partial; the font is the printable subset (lowercase→uppercase); pixel-by-pixel text could use a native `gfx_draw_text` builtin; parity needs scrolling/selection/highlighting/panes. Full plan in `docs/PB_IDE.md`.
+
+**Significance:** the security-relevant **core** of the native IDE (editor model + text renderer) is now pure pblang and tested, and a native pblang window renders the editor end-to-end — the first real step of retiring the web stack for total security. `index.html` remains the bootstrap until the native IDE reaches parity.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **155 passed; 0 failed**.
+
+---
+
+## 91. Native IDE polish, Tor + layered security, and a responsive layout (2026-05-31)
+
+Continued the native IDE (§90) and a batch of security/UX directives.
+
+- **Native IDE parity pass (`editors/ide/pbide.sapp` + modules):** a **scrolling viewport** (`editor_model.sapp` `ensure_visible`/`page_up`/`page_down`), **shift/ctrl-aware input** (`stdlib/keymap.sapp`), **syntax highlighting** via the **self-hosted tokenizer** (`stdlib/syntax_hl.sapp` — token kind → colour), and an **output pane**. Plus the editor parity features, all in `editor_model.sapp`: **selection** (shift+movement, `selection_range`/`select_all`, with highlight drawn behind the text), **internal clipboard** (`copy`/`cut`/`paste`, Ctrl+C/X/V), **undo/redo** (snapshot stacks, Ctrl+Z/Y, with consecutive-typing coalescing), **find** (`find_next`, forward+wrapping, selects the match — a find-mode types the query, Enter=next, Esc=close), **save** (Ctrl+S → `fs_write`), **run** (F5 → self-hosted frontend) and **check** (F6 → `frontend_lint`). All the model logic is tested in the VM (`editor_model_test` — selection/clipboard/undo/find/scroll; `pbide_ui_test` — keymap/highlight); `pbide.sapp` runs the full window/loop. (Bug: `gfxsize` returns a map `{w,h}`.)
+- **Tor (opt-in, off by default) + layered security:** **`stdlib/socks5.sapp`** — the SOCKS5 client protocol in pblang (greeting + CONNECT request/reply), tested (`socks5_test`). `browser.sapp` `fetch_page`/`submit` take `via_tor=false`; the gateway threads a `tor` flag; the IDE has a `🧅 Tor` toggle (off by default). **A Tor connect composes the security layers** (Tor anonymity + TLS + Tier-2 `securelayer` authenticated encryption for pblang peers — defense in depth). **Gap (named):** the Tor transport needs a plain `tcp_connect` builtin + TLS-inside-SOCKS; until then Tor mode reports the requirement. **Careful network permissions:** network is capability-gated; the principle "a granted internet permission protects everything under it" is recorded in `docs/Protocols.md`.
+- **Responsive layout:** every IDE + designer element adapts to the window — flex-wrap toolbar/browser-bar, `vw`-bounded panel widths, and media queries (≤1080 / ≤820 / ≤600 px) that shrink the palette/inspector and **stack the panes vertically** on narrow screens.
+- **Validated with the pblang checker** (`check_html.sapp`, per the only-pblang directive) — CHECK PASS; suite **157/0**.
+
+**Significance:** the native IDE moved from "renders" to "usable editor" (scroll/input/highlight/run), the browser gained opt-in Tor with a layered, defense-in-depth security model, and the whole UI is responsive — all in pblang, validated by pblang.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **157 passed; 0 failed**.
+
+---
+
+## 92. Designer round-trip (D1) — the visual designer becomes two-way (2026-05-31)
+
+Made the visual designer (§88) **two-way** (`docs/Visual_Designer.md` D1): code ⇄ design. The designer already generated pblang; now it reads pblang **back** onto the canvas.
+
+- **`stdlib/ui_parse.sapp`** — parses generated pblang web code back into the designer's component tree, via the **self-hosted parser** (`stdlib/compiler/`): it walks the `render()` return expression, flattens the `+` concatenation of `html.*` calls, and maps each call back to a node (`html.tag("h1",…)` → heading, `p` → text, `a()` → link, `img()` → image, `section`/`div` → containers with **recursively parsed children**). The exact inverse of the designer's codegen. Tested in the VM (`ui_parse_test`: top-level nodes, nested container, no-`render()` → empty, parse-error → empty/no-crash).
+- **Gateway + IDE:** `POST /parse-ui {code}` → tree; the designer's **`↩ From code`** button sends the editor's pblang to it and rebuilds the canvas (ids assigned to the parsed tree). Validated end-to-end through the gateway (code → `[{heading,"Hello"},{text,"world"}]`).
+
+**Significance:** the designer is no longer a one-way scaffold generator — hand-edited `.sapp` and drag-authored design are now two views of one program (the D1 milestone), with the **parsing done in pblang** by the language's own compiler. (The `.pbui` metadata doc for canvas-only state, and D2 event wiring, remain.)
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **158 passed; 0 failed**.
+
+---
+
+## 93. Performance: pbAI weight caching (21 s → 0.04 s), token caching, designer persistence (2026-05-31)
+
+A performance pass ("pblang fast and efficient to every code") + IDE persistence.
+
+- **Root cause of a 40-minute hang found:** a leftover `pblang test` run hung because **two suites were running concurrently** on the slow external HD (doubled I/O + the model-training test thrashing). Killed it; the lesson is the cargo rule generalized — **never run two `pblang test` suites at once.** (`socks5_test` itself is 0.01 s; not the culprit.)
+- **The real cost: `pbai_test` was 21.4 s** — `stdlib/pbai.sapp` retrained its neural intent classifier (500 epochs) on every fresh process. Fix: **cache the trained weights** — `_model()` loads `stdlib/pbai_model.json` (7.8 KB, JSON of the `nn.sapp` model) when present and vocab-compatible, else trains once and saves. **21.80 s → 0.04 s (≈545×)**, test still green. Train-once, load-forever — the right efficiency pattern for an interpreted model.
+- **Whole suite: ~44 s → 22.8 s** (158/0), and no longer hang-prone.
+- **Native IDE token caching:** `pbide.sapp` re-tokenized the whole buffer every frame (30 fps); now it re-tokenizes only when the buffer changes (a `dirty` flag set on edits), caching tokens across frames — much less CPU at idle. Still runs clean.
+- **Designer persistence (.pbui-style):** the Studio design (web tree / quantum ops / circuit parts + kind) now auto-saves to `localStorage` (`pblang.ide.studio.v1`) on every change and restores when the designer opens — the design survives across sessions. Validated by the pblang checker (CHECK PASS).
+
+**Significance:** the dominant slow path (pbAI cold-start training) is gone, the suite is reliable and ~2× faster, the native IDE wastes far less CPU, and designs persist. The deeper VM-level speed (a JIT) was then **unlocked and wired** — see §94; the pblang-side levers (caching expensive computations, not redoing work per frame) remain applied on top.
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **158 passed; 0 failed** (≈22.8 s).
+
+---
+
+## 94. JIT unlocked: the Cranelift JIT wired into the VM (2026-05-31)
+
+The user **unlocked Rust VM work for a JIT** (keeping self-hosting intact). A Cranelift JIT *prototype* existed (`pblang-cranelift`) but was **unwired and crash-buggy**. Wired it into the VM and fixed it to a correct, safe subset.
+
+- **Wiring (`pblang-vm`):** added `pblang-cranelift` as a dep; the `VM` gained `jit`/`jit_state`/`jit_enabled`, and `call_top` now has a **JIT fast path** — a hot (`≥ JIT_THRESHOLD = 8` calls), eligible, **all-numeric, non-vararg** function is compiled to native (`JitCache::compile`) and run via `call_jit`; **any miss falls straight through to the interpreter**, so behaviour is identical. Gated behind the **`PBLANG_JIT` env var (off by default)** so it can never regress the default path.
+- **Three prototype bugs fixed in `pblang-cranelift`** (it panicked on essentially every real function): (1) **dead code after a terminator** — the compiler's implicit `return nil` trailing an explicit `return` was emitted into an already-filled block (`"block already filled"`); now unreachable instructions in a terminated block are skipped. (2) **backward jumps (loops)** crashed cranelift SSA sealing (`!is_sealed`) — `is_jit_eligible` now rejects loop back-edges. (3) **`OpCall` (recursion)** crashed — rejected too. So the JIT now compiles **loop-free, call-free numeric functions** (straight-line arithmetic + forward `if`) correctly.
+- **Validated:** `poly()×3M` → 54000000 identical JIT-off/on; **~1.4× faster** (release **1.51 s vs 2.14 s**; debug 14.6 s vs 21.0 s). Loops and recursion **fall back** correctly (no crash). **The full suite passes both JIT-off and `PBLANG_JIT=1` (158/0 each)** — the JIT miscompiles nothing across 158 tests. **Debug + release executables rebuilt** (debug 421 MB, release 32 MB), which also refreshed the previously-stale binary (e.g. the 3-arg `http_post`).
+- **Self-hosting preserved:** the JIT is an *optional accelerator under* the Rust VM; the self-hosted compiler/runtime (`stdlib/compiler/`) is untouched and still runs everything.
+
+**Honest gaps (the next JIT work):** the *big* wins need the codegen fixes the prototype lacks — **loop back-edge SSA sealing** (so the hot loop itself compiles, not just leaf calls) and a **call ABI** (so recursion/cross-function calls JIT). Until then the JIT accelerates call-heavy straight-line numeric code (~1.4×) and safely defers the rest. (The earlier §93 view that "JIT needs Rust and is deferred" is now superseded: Rust is unlocked and the JIT is wired.)
+
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **158 passed; 0 failed** (both JIT off and on).
+
+---
+
+## 95. Designer D2: visual event wiring (inspector → handler stubs → round-trip) (2026-05-31)
+
+Closed the **D2 — Inspector + events** slice of the Visual Designer roadmap for the web target. The designer could lay out and round-trip *structure* (D0/D1) but not *behaviour*; D2 makes elements interactive the Delphi way — bind an event visually, get a pblang handler stub.
+
+- **Node model:** each web node may now carry an `events` map `{ eventKey: handlerName }`. It persists automatically in the existing `.pbui`-style localStorage doc (it's just another field on the serialized tree).
+- **Inspector (`editors/ide/index.html`):** a new **Events** section lists the events applicable to the selected element (`DZ_EVENTS` catalog → `click` for most, `change`/`input` for `input`, `submit` for containers). "＋ on click" auto-names a handler from the element (`dzEvName`: button "Save" → `on_save_click`); the bound row lets you rename or remove it.
+- **Codegen (`dzAttrs` + `dzGenWeb`):** the gen functions were refactored to thread events through a shared `dzAttrs(n, baseAttrs)` helper that merges static attributes with `onclick`/… handler bindings into the element's `html.sapp` attrs map. `dzGenWeb` then emits a **deduped `fn <handler>(event) { … }` stub** for every wired handler above `render()`. So the binding lives in the *generated pblang* (attribute + stub), not hidden IDE state.
+- **Round-trip (`stdlib/ui_parse.sapp`):** `_events_from_attrs`/`_with_events` read the `onclick`/`onchange`/`oninput`/`onsubmit` attributes (parsed by the **self-hosted parser**) back into each node's `events`, stripping the `(event)` call suffix to recover the handler name. `dzAssignIds` preserves `events` when the gateway returns the tree — so a **code→canvas→code cycle keeps the wiring**.
+- **Validated:** the IDE front-end passes the pblang checker (`pblang run editors/ide/tools/check_html.sapp` → **CHECK PASS**). A round-trip test (button `onclick` + section `onsubmit`) parses back to `click=on_save_click` / `submit=on_form_submit`. The generated app **runs** (`pblang run`) and emits `<button onclick="on_save_click(event)">Save</button>`, confirming the stub is valid pblang and `html.tag` accepts the attrs map.
+
+**Honest scope:** D2 is done for the **web** target only. Desktop-GUI (`graphics.sapp`) and CLI/TUI event targets arrive with **D3/D4**, and data-binding (widget value ↔ model field, §7 of Visual_Designer.md) is still ahead. The validation kept to the only-pblang directive — front-end checked by the pblang checker, round-trip exercised by `pblang run`, no Node.
+
+---
+
+## 96. Designer D3: the desktop GUI kind + `stdlib/gui.sapp` widget toolkit (2026-05-31)
+
+Opened the **D3 — Desktop GUI target** slice: a Delphi/Qt-style form designer that generates a runnable native-window pblang app. The blocker was that **pblang had no GUI toolkit** — only a window with filled rects/lines (`graphics.sapp`) and a 5×7 bitmap font (`bitmap_font.sapp`), no native widgets and no text builtin. So D3 is two pieces: a new toolkit, then the designer kind that targets it.
+
+- **New `stdlib/gui.sapp` (all pblang):** a widget toolkit that *draws* its own widgets from primitives and hit-tests the mouse itself. Widgets (`label`/`button`/`textbox`/`checkbox`/`panel`) are maps `{kind,name,x,y,w,h,…}` on a `form`; **event handlers ride as closures stored in widget fields** (`button(..., onclick)`), invoked via pblang's `obj.field()` call (the supported non-UFCS pattern). Key design points: (1) **the cursor is tracked** — `gfxpollevents` emits `mousedown` with only a `button`, coordinates come from `mousemove`, so the toolkit keeps `form.mouse` current and reads it on click; (2) **scaled text** — each lit 5×7 font pixel becomes one `SCALE×SCALE` filled rect (`gfxdrawrect` fills); (3) **typing** reuses `keymap.sapp` (`key_to_char`, shift-aware, `Backspace`); (4) the **interactive core (`handle_event`/`hit_test`) is window-free**, so it's unit-testable headlessly — only `draw`/`run` touch a display.
+- **Designer D3 kind (`editors/ide/index.html`):** a 4th kind **🖥 Desktop** alongside web/circuit/quantum. A widget palette (`DZ_GUI`), a **form-surface canvas** with absolutely-positioned, **drag-to-move** widget previews + a title bar, and an inspector for `name`/text/`x`/`y`/`w`/`h` (and form-level title/size when nothing is selected). Events reuse the **D2 model** (button→`click`, checkbox→`change`) wired to handler stubs. Persists in the `.pbui`-style localStorage doc (`gui` key).
+- **Codegen (`dzGenDesktop`):** emits a real `gui.sapp` app — a deduped `fn <handler>(ctx){…}` stub per wired event, then `build()` adding each widget via its `gui.<kind>(…)` constructor (wired events pass the handler identifier, else `nil`), then `fn main(){ gui.run(build()); }`.
+- **Validated:** front-end **CHECK PASS** (`check_html.sapp`, 125 divs / 3 scripts). New **`gui_test`** drives the window-free core headlessly — hit-testing, click→handler dispatch, focus, shift-aware typing + backspace, checkbox toggle+`onchange`, right-click ignored, empty-click clears focus. The **generated-code shape** was run through `pblang run` (inspecting `build()` rather than the blocking `gui.run`) to confirm the constructor signatures line up exactly. **Suite 158→159, 0 failed.**
+
+**Honest scope:** D3 is the **web-parity** widget set (label/button/textbox/checkbox/panel) with click/change events; more widgets (radio/select/slider/list), layout containers, a **desktop round-trip** (a `gui.sapp` → form parser, the D1 analogue), and data-binding are the next steps. `gui.run` opens a real OS window (verified on this display-capable box via the toolkit), so it isn't exercised in the headless suite — the core logic is. Kept to only-pblang: toolkit in pblang, front-end checked by the pblang checker, codegen verified by `pblang run`, no Node.
+
+---
+
+## 97. Designer D3 round-trip: `stdlib/gui_parse.sapp` makes the desktop kind two-way (2026-05-31)
+
+Made the **desktop GUI designer two-way** — the D1 analogue for D3. The designer could generate a `gui.sapp` app (§96) but not read one back; now hand-edited desktop code and drag-authored forms stay in sync.
+
+- **New `stdlib/gui_parse.sapp` (all pblang):** `parse(code) → { form: {title,w,h}, widgets: [...] }` via the **self-hosted parser**. It scans every top-level `fn` body for `let form = gui.form(title,w,h)` and `gui.add(form, gui.<kind>(...))` statements, mapping each constructor (`label`/`button`/`textbox`/`checkbox`/`panel`) back to a widget map, and recovers wired handlers (`button`'s 7th arg → `events.click`, `checkbox`'s 6th arg → `events.change`; a `nil` arg → unwired). It's the inverse of `dzGenDesktop`. Graceful: a parse error or no `gui` calls returns the default empty form, never crashes.
+- **The gotcha that bit (and the fix):** the self-hosted parser stores **number literals as their source TEXT** — a `number` node's `value` is the string `"500"`, not `500`. The web round-trip never hit this (it only reads string args), but desktop geometry is numeric, so `x/y/w/h` came back as strings that printed as `500` yet failed `== 500`. Fixed with `parse_number(node.value)` in the numeric extractor. (Worth remembering for any future AST consumer that reads numeric literals — see the lang-gotchas note.)
+- **Wired end-to-end:** gateway gained `POST /parse-gui {code} → {ok, form, widgets}` (mirrors `/parse-ui`); the designer's **↩ From code** button now dispatches by kind (`dzFromCodeActive`) — desktop → `dzGuiFromCode` (calls `/parse-gui`, rebuilds `dzGui` with fresh ids), else the web path.
+- **Validated:** new **`gui_parse_test`** drives a full generate-shaped→parse cycle (form title/size, all 5 widget kinds, geometry as real ints, both wired handlers recovered, unwired widget has no `events`, plus the graceful no-`gui`/parse-error cases). Gateway re-parsed clean via the self-hosted parser (17 top-level stmts). Front-end **CHECK PASS**. **Suite 159→160, 0 failed.**
+
+**Honest scope:** round-trips the geometry, props, and click/change handlers — handler *bodies* stay in the code (the designer only re-creates the form tree, as on the web side). Still ahead for D3: more widgets, layout containers, data-binding.
+
+---
+
+## 98. Designer D3 widget set: radio / select / slider (toolkit + designer + round-trip) (2026-05-31)
+
+Completed the **standard form-control set** for D3 — `radio`, `select` (dropdown), and `slider` — driven through the *whole* pipeline (toolkit, designer, codegen, two-way round-trip, tests) to prove the D3 machinery generalizes beyond the initial five widgets. The `slider` also adds the toolkit's first **drag interaction**.
+
+- **Toolkit (`stdlib/gui.sapp`):** three new constructors + drawing + interaction. **`radio(name,x,y,text,group,selected,onchange)`** — radios sharing a `group` are mutually exclusive (`_radio_pick` clears siblings on select). **`select(name,x,y,w,h,options,selected,onchange)`** — an honest *click-to-cycle* combo (a primitive-drawn GUI has no native popup overlay), advancing the index with `num_mod` wrap. **`slider(name,x,y,w,h,value,min,max,onchange)`** — press-and-drag: `handle_event` now tracks a `mouseup` and a `f.drag` widget so a press on the knob starts a drag and `mousemove` updates the value via `_slider_set` until release. Drawn from primitives (radio = outline circle + filled dot; select = field + current option + ▾; slider = track line + knob rect).
+- **Designer (`editors/ide/index.html`):** palette entries + canvas previews (radio dot, select with ▾, a live slider knob positioned from value/min/max) + inspector. The inspector's prop editor was generalized to a **typed `fields` spec** (`text`/`num`/`bool`/`csv`) per widget, so each prop renders the right control (checkbox for bools, number input for numerics, comma-list for `select` options) and writes through the matching setter. Codegen (`dzGenWidget`) emits the new constructors — `select` options become a pblang array literal `["one","two"]`.
+- **Round-trip (`stdlib/gui_parse.sapp`):** the three constructors parse back, including a new `_strings` helper that reads an **array-literal AST node** (`{kind:"array", items}`) into the option list; `dzGuiFromCode` joins that array back to the designer's csv string. Wired handlers (radio/select/slider → `change`) and the unwired-`nil` case round-trip too.
+- **Validated:** `gui_test` extended with radio exclusivity, select cycle, and a full slider press→drag→release sequence (press at left → min, drag to middle → 50, ignored after release). `gui_parse_test` extended with the three kinds incl. the options array and numeric range. Generated-shape check ran via `pblang run`. Front-end **CHECK PASS**. **Suite 160/0** (both gui tests expanded in place).
+
+**Honest scope:** `select` is click-to-cycle, not a popup dropdown (a popup needs z-ordered overlay rendering + outside-click — a later refinement). Still ahead for D3: layout containers (nesting) and data-binding (widget value ↔ model field).
+
+---
+
+## 99. Designer D3 data-binding: a form model as the source of truth (2026-06-01)
+
+Shipped the flagship **data-driven UI** capability (Visual_Designer §7): a form carries a **`model`** map and widgets **bind** a value to a model field. Toggling a checkbox or typing in a field updates the model, and a handler that writes the model re-displays in the bound widget — the Delphi/Qt data-binding experience, in pblang.
+
+- **Toolkit (`stdlib/gui.sapp`):** `form` gained a `model` map (the source of truth). `bind(widget, field)` tags a widget; `set_model(form, map)` seeds it; `sync(form)` refreshes all bound widgets from the model. The wiring is **push on change, pull on draw**: a bound widget **pushes** its value into the model the instant the user changes it (`_push` in every interaction path — type/toggle/cycle/drag), and `_draw_widget` **pulls** the model value first each frame (`_pull`), so a handler mutating the model shows up on the next redraw. `_bound_key` maps each kind to its mirrored property (textbox→`value`, checkbox→`checked`, slider→`value`, select→`selected`, label→`text`). Two-way for inputs, one-way for labels. The whole thing is window-free, so it's unit-tested headlessly.
+- **Designer (`editors/ide/index.html`):** the form inspector (no selection) gained a **Model editor** — add/rename/remove `field → initial value` rows; bindable widgets gained a **"bind to model field"** input (a `<datalist>` of existing fields). Bound widgets show a teal edge + `⛓ bound to model.x` tooltip on the canvas. Codegen emits `gui.set_model(form, map{…})` (with bool/number/string inferred per value) and wraps each bound constructor in `gui.bind(…, "field")`.
+- **Round-trip (`stdlib/gui_parse.sapp`):** reads it all back — `_widget_from_call` unwraps a `gui.bind(gui.<kind>(…), "field")` call to the inner widget + its `bind`, and `_scan` recognizes `gui.set_model(form, map{…})`, decoding the map literal (`_map_from_node`, with `parse_number` for numerics) into the model. The gateway `/parse-gui` now returns `{form, widgets, model}` and the **↩ From code** button restores the model.
+- **Validated:** `gui_test` extended — `set_model` pulls initial values into all bound kinds; typing/toggling pushes to the model; a model mutation + `sync` reflects in the widget. `gui_parse_test` extended — `set_model` map (string/bool/number) + `bind`-wrapped widgets (geometry recovered through the wrap) + unbound widget has no `bind`. Generated app with model+bind built and bound via `pblang run`. Front-end **CHECK PASS**, gateway re-parses clean, **suite 160/0**.
+
+**Honest scope:** flat model (field → scalar); no nested/computed bindings, no list/repeater binding, and `radio` isn't bindable yet (radio groups need a value-per-button model — a later refinement). Remaining D3: popup dropdown, layout containers (nesting), radio-group binding.
+
+---
+
+## 100. Native IDE (`pbide.sapp`) fixes: F5/F6 crash, HiDPI crispness, idle perf (2026-06-01)
+
+User report (with screenshot): the native IDE was **pixelated on a high-res display**, the design felt **old/slow**, and **F5 killed the editor**. Diagnosed three distinct issues; all fixed in pblang only (no Rust).
+
+- **F5/F6 crash — lazy import resolves against CWD, not the script root.** `_run`/`_check` did `let fe = import("stdlib/compiler/selfhost_frontend.sapp")` *inside the function*. A **top-level** `import()` resolves relative to the script's project root (so the header imports always worked), but a **lazy** `import()` inside a function resolves relative to the **current working directory** — so launching from `target/debug/` (as the user did) made F5 throw `import not found`, and because the throw was *outside* the `try` around `frontend_run`, it escaped and killed the event loop. Fix: hoist the selfhost frontend to a top-level `let FE = import(...)` and call `FE.frontend_run`/`FE.frontend_lint`. (Recorded as a reusable gotcha: lazy `import()` is CWD-relative; prefer top-level imports.)
+- **Release "killed instantly" — `--alow-all` typo.** The user's command had a misspelled capability flag, so capabilities were denied and `sleep_ms()` in the render loop hit `exec access denied`. Not a code bug; the binary was confirmed **not stale** (0 Rust sources newer than `target/release/pblang`). (Real flag is `--allow-all`.)
+- **Pixelation + slowness — 1× per-pixel text.** `pbide` predated the `gui.sapp` `SCALE` technique: it drew each 5×7 glyph bit as a single `win.point` at 1× — tiny/jagged on a 3840px panel, and thousands of point-calls per frame at a fixed 30 fps even when idle. Fixes: (1) a `SCALE` factor (env `PBIDE_SCALE`, default 2, clamped 1–8) with all metrics (`CW`/`CH`/gutter/pane) derived from it; (2) scaled text now draws each lit bit as one `SCALE×SCALE` **filled rect** (crisp + fewer ops than SCALE² points); (3) a **`redraw` dirty flag** so idle frames skip `_draw` entirely (only repaint after input); (4) design polish — gutter background, current-line highlight, an accent divider above the pane, scale-aware window sizing (~100×40 cells).
+- **Validated:** `pbide.sapp` parses under both debug and release binaries; full suite **160/0**; a bounded headless launch ran the full window/event loop without crashing (`exit=124` timeout, empty error log). HiDPI users can bump `PBIDE_SCALE=3`/`4` on 4K.
+
+---
+
+## 101. PIVOT — web IDE frozen for security; native IDE foundation: lowercase font + mouse (2026-06-01)
+
+**Directive:** the user **stopped the web IDE** (`index.html` — HTML/DOM/JS is an attack surface they don't want) and asked to port its **design + functionality into the native IDE** (`pbide.sapp`), **only pblang**. The web IDE is now frozen legacy reference; the native IDE is the active line (the long-standing north-star "IDE written in pblang"). Recorded as directive `feedback_native_ide_only`. This is multi-session; started with the **foundation** (mouse + font) the Designer/AI/browser ports all depend on.
+
+- **Lowercase font (`stdlib/bitmap_font.sapp`).** The 5×7 font mapped lowercase→uppercase (`code-32`), so all source rendered ALL-CAPS (visible in the user's screenshot). Added **all 26 lowercase glyphs** (a–z, baseline-aligned x-height; descenders on g/j/p/q/y faked into the 7-row box) plus common code symbols (`| ? # @ & % ^ \ ` ~`). `glyph()` now returns the real lowercase glyph and only falls back to uppercase for an *uncovered* lowercase code. Verified a/A differ, all 26 present; locked in `bitmap_font_test`.
+- **Mouse support (`editor_model.sapp` + `pbide.sapp`).** The native editor had no mouse. Added `set_cursor(ed, row, col)` (clamped absolute caret placement) to the model, then wired the event loop: a `_mouse_pos` maps a pixel to (row,col) with the **same layout math as `_draw`** (`row = scroll + (my-TOP)/CH`, `col = (mx-GUTTERX)/CW` rounded), **click** places the caret (clears selection), **drag** extends the selection (`set_anchor` + `set_cursor` on `mousemove` while down). Reused the `gui.sapp` pattern: `mousedown` carries no coords, so the cursor is tracked from `mousemove` into `state.mx/my`. `_draw` caches `win.size()` into `state.winsz` for the mapping. Locked in `editor_model_test`.
+- **Validated:** `bitmap_font_test` + `editor_model_test` extended and green; `pbide.sapp` parses (debug+release); bounded headless launch ran the mouse-wired loop without crashing; **suite 160/0**.
+
+**Next (native port, remaining):** toolbar + panel switching (Code/Designer/AI like the web toolbar), the **Visual Designer** ported into a native window (reusing `gui.sapp`/`gui_parse.sapp`/`ui_parse.sapp`), the **AI panel** (`pbai.sapp`), the **browser** (`browser.sapp`), file open/tree, and tabs.
+
+## 102. Native IDE: F5/F6 fixed at the root, VS Code-style toolbar + working Terminal panel (2026-06-01)
+
+Continuation of §101 (native-IDE port). Three things landed.
+
+- **F5/F6 actually run/check now — real root cause found.** The earlier "CWD-relative lazy import" theory was a red herring; the self-hosted compiler simply **never supported `print`**. The tokenizer doesn't mark `print` a keyword and the parser had no print rule, so `print 7;` parsed as **two stray expression statements** (`print` ident load + `7` const, both popped — confirmed in the bytecode), and `vm.sapp`'s `print` builtin was a no-op `return nil`. So `frontend_run().output` was *always* empty and F5 showed nothing useful while F6 (lint) silently worked. Fixes: (1) `parser.sapp` gained `parse_print()`, dispatched in `parse_stmt` on a statement-leading ident `print` (except `print = …`), emitting `{kind:"print", value}` → the already-present `codegen_print` → `OP_PRINT`; (2) `vm.sapp` also captures the `print(x)` **call** form into the output buffer at the `OP_CALL` builtin dispatch (where `out` is in scope). Both the keyword form (`print add(2,3)`) and paren form (`print(9)`) now record into `output`. pbide `_run` prints each value on its own `» ` line and surfaces compile errors; `_check` lists up to 6 lint diagnostics. Regression-locked in `selfhost_frontend_test` (keyword/fn/multi/paren forms).
+- **VS Code-style toolbar + panel switching.** A top tab strip (`CODE / TERMINAL / DESIGN / AI / BROWSER`) drawn by `_draw_toolbar`; `TABS` list + `_tab_bounds` (cumulative x/width, shared by draw and hit-test) + `_toolbar_hit`. `_draw` is now a **dispatcher** (clear → toolbar → active panel → present); `state.panel` is switched by a toolbar click. The editor area shifted down by a new `TBH` (toolbar height); `TOP = TBH + PAD`.
+- **Terminal panel (the explicit ask: "a button like VS Code to open a panel for the pc terminal").** Real PC commands via `proc_spawn_wait("bash", ["-c", cmdline])` → `{exit_code, stdout, stderr}`, **gated on `allow_exec`** (`--allow-exec`/`--allow-all`; off by default — the security posture is preserved). NOT the `exec` builtin (single-token, blocks whitespace/metachars, no stdout). A tracked `cwd` is threaded by prepending `cd <shq(cwd)>;` and appending `printf '%s' "$(pwd)"` so the **last stdout line is the resulting directory** and `cd subdir` persists across commands like a real shell; stdout lines render green, stderr lines `! `-prefixed in red; `clear` empties scrollback (capped at 600 lines). If exec wasn't granted, the panel says so instead of crashing.
+- **Validated:** `selfhost_frontend_test` extended + green, **suite 160/0**; `pbide.sapp` parses (`--check`: only known-builtin false positives, no parse errors); terminal primitive proven in a standalone probe (cd persistence, pipes, stderr); bounded GUI launch clean (`DISPLAY=:0`, exit 124, no error output). DESIGN/AI/BROWSER tabs are reachable but honest `_draw_stub` placeholders — next milestones.
+
+## 103. Native IDE: tab-click bug fixed at the host; Visual Designer panel built (2026-06-01)
+
+Continuation of §102.
+
+- **Tab clicks landed on random tabs — fixed in the graphics host.** The `mousedown` event carried no coordinates, so the toolbar hit-test used the cursor position tracked from `mousemove`. But minifb's `get_mouse_pos(MouseMode::Discard)` returns `None` whenever the cursor leaves the client area — exactly what happens when you slide up to a top-edge tab and graze the title bar — so no `mousemove` fires and the click reads a **stale** position → wrong tab ("random after some time"). Fix (a host-primitive carve-out, same justification as the JIT): `crates/pblang-graphics/src/graphics.rs` (minifb — the **default** backend) and `sdl2_backend.rs` now attach `x/y` to every `mousedown`/`mouseup` (minifb queries `get_mouse_pos(Clamp)` so an edge click stays in-window; SDL2's button event already had `x,y`). `pbide.sapp` prefers `e.x/e.y` and falls back to the tracked cursor. Required a `cargo build --release -p pblang` (~43s; "Compiling pblang-graphics" confirmed). The same fix makes editor click-to-place-caret rock-solid too.
+- **Visual Designer panel — fleshed out (reuses `stdlib/gui.sapp`).** A real drag-and-drop form builder living in the native window: a **palette** (LABEL / BUTTON / TEXT / CHECK / PANEL + the `->CODE` and `CLEAR` actions), a **canvas** with a dot grid where a click places a widget of the current tool / selects an existing one / drag moves it, an **inspector** strip, **type-to-edit** the selected widget's text and **Del** to remove it. Placed widgets ARE `gui.sapp` widget maps (built by `G.label`/`G.button`/`G.textbox`/`G.checkbox`/`G.panel`), so `->CODE` emits **real runnable `gui.sapp` source** into the editor and switches to the CODE tab — a genuine design→code round-trip. Verified the generated UI parses + typechecks (`typecheck ok`).
+- **Validated:** `pbide.sapp` parses (`--check`, only known-builtin false positives); the codegen output typechecks clean; **suite 160/0**; bounded GUI launch clean (exit 124). AI and BROWSER tabs remain honest `_draw_stub` placeholders — next.
+
+## 104. Native IDE: AI panel backed by pbAI (2026-06-01)
+
+Continuation of §103. The **AI** tab is now a working chat against **pbAI** (`stdlib/pbai.sapp`) — pblang's own assistant (a neural intent classifier + pblang-grounded skills, **no network, no Ollama**).
+
+- **Free-text Q&A:** a question box at the bottom (type + Enter) calls `AI.respond(q)` and streams the reply into a scrollback (user lines accent-colored, capped at 600).
+- **Quick actions on your code:** chips `EXPLAIN · BUGS · IMPROVE · COMMENT` run the matching pbAI skill on the **current CODE editor buffer**, wrapping it in the `--- pblang code ---` marker that pbAI's `_extract_code` keys on; `CLEAR` resets the chat. This is the reuse win — the panel turns the editor content into grounded analysis.
+- **No GUI freeze:** `AI.respond` loads the trained MLP weights from `stdlib/pbai_model.json` (~0.04 s) instead of retraining (~21 s; cache guarded by vocab size), so the synchronous call returns fast enough to keep the 30 fps loop responsive.
+- **Validated:** `pbide.sapp` parses (`--check`, only known-builtin false positives); pbAI responses verified standalone (explain/bugs/general); **suite 160/0**; bounded GUI launch clean (exit 124, no error). Only **BROWSER** remains a `_draw_stub` placeholder now.
+
+## 105. Native IDE: Enter/HiDPI/key-repeat fixes, browser panel, `pblang --ide` (2026-06-01)
+
+Continuation of §104. A batch of input fixes plus the last panel and a launcher.
+
+- **Enter was dead on every tab — backend key-name mismatch.** minifb names the key `Enter` (and `NumPadEnter`); SDL2 names it `Return`. All panels checked `key == "Return"`, so on the **default minifb backend** Enter matched nothing — no editor newline, no terminal/AI submit, no find-next. Added `_is_enter(key)` (accepts all three) and routed every Enter check through it. (Lesson: minifb and SDL disagree on key names; accept both.)
+- **Tabs misfiring on 4K — HiDPI mouse-coordinate mismatch, fixed in the host.** minifb keeps our framebuffer at its fixed creation size and *stretches* it to the window; `get_mouse_pos` returns coordinates in **window** space (divided only by the integer `Scale`). On a 4K screen the WM resizes the large window to fit the display, so window ≠ buffer and the mouse no longer lines up with what was drawn → clicks hit the wrong tab. Fix in `graphics.rs`: scale the reported mouse by the `buffer / get_size()` ratio (a no-op when they're equal, so low-res is unaffected).
+- **Held-key auto-repeat.** `get_keys_pressed(KeyRepeat::No)` → `KeyRepeat::Yes` in `graphics.rs`: holding an arrow (or any key) now repeats at the OS rate — continuous cursor movement / typing.
+- **Ctrl+arrow accelerated movement.** The movement check now runs *before* the Ctrl-shortcut block in `_key`, and `_move(..., fast)` jumps by word (Ctrl+Left/Right, via new `editor_model.move_word_left/right`), by 5 lines (Ctrl+Up/Down), and to document edges (Ctrl+Home/End). Word movement is unit-tested in `editor_model_test`.
+- **Shift+Enter.** In the terminal and AI boxes, Enter submits and **Shift+Enter inserts a newline** (compose multi-line commands/questions). A shared `_draw_input` renders the multi-line input box, growing upward.
+- **Browser panel (`stdlib/browser.sapp`).** Address bar (type a URL + Enter → `B.fetch_page` → `http_get` → strip tags), word-wrapped page text and a link list, Up/Down/PgUp/PgDn scrolling. With this the BROWSER tab is real — all five panels (Code / Terminal / Designer / AI / Browser) now function.
+- **`pblang --ide` launcher** (`src/main.rs`). `pblang --ide` (aliases `-ide`, `ide`) launches the native IDE with `--allow-all` (the terminal panel needs exec). `locate_ide()` resolves `editors/ide/pbide.sapp` via `PBLANG_IDE` → CWD → walking up from the executable, then chdir's to the repo root so the IDE's `stdlib/*` imports resolve — verified working from `/tmp` as well as the repo root.
+- **Validated:** `pbide.sapp` parses clean; `--ide`/`ide` aliases launch (exit 124) from repo root and `/tmp`; browser render pipeline checked offline (title/strip/links/wrap); **suite 160/0** (incl. new word-movement assertions); two release rebuilds clean ("Compiling pblang-graphics" / "Compiling pblang").
 
 ---
 

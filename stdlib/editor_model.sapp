@@ -1,0 +1,300 @@
+// stdlib/editor_model.sapp — a text-editor model, in pblang.
+//
+// The heart of the pblang-native IDE (no HTML/CSS/JS): a line buffer + a cursor and the
+// edit operations a code editor needs. It is pure pblang and has no UI dependency, so it
+// is fully testable in the VM (the window/font binding is separate, in pbide.sapp). Part
+// of moving the IDE off the browser stack for total security — see docs/PB_IDE.md.
+//
+//   let E = import("stdlib/editor_model.sapp");
+//   let ed = E.new("fn main() {}");
+//   E.insert_char(ed, "x"); E.newline(ed); E.backspace(ed);
+//   print E.text(ed);
+//
+// All pblang.
+
+// new(text) -> editor state. anchor=selection start (nil=none); clipboard; undo/redo.
+fn new(text) {
+    let lines = str_split(text, "
+");
+    if len(lines) == 0 { lines = [""]; }
+    return map{ lines: lines, row: 0, col: 0, scroll: 0,
+                anchor: nil, clipboard: "", undo_stack: [], redo_stack: [] };
+}
+
+// ── viewport / scrolling ───────────────────────────────────────────────────────────
+// ensure_visible(ed, rows) — scroll the minimum amount so the cursor row is on screen,
+// given a viewport of `rows` text lines.
+fn ensure_visible(ed, rows) {
+    if ed.row < ed.scroll { ed.scroll = ed.row; }
+    if ed.row >= ed.scroll + rows { ed.scroll = ed.row - rows + 1; }
+    if ed.scroll < 0 { ed.scroll = 0; }
+}
+fn page_up(ed, rows) {
+    ed.row = ed.row - rows;
+    if ed.row < 0 { ed.row = 0; }
+    _clamp_col(ed);
+}
+fn page_down(ed, rows) {
+    ed.row = ed.row + rows;
+    if ed.row > len(ed.lines) - 1 { ed.row = len(ed.lines) - 1; }
+    _clamp_col(ed);
+}
+
+fn text(ed) {
+    let out = "";
+    let i = 0;
+    while i < len(ed.lines) {
+        if i > 0 { out = out + "
+"; }
+        out = out + ed.lines[i];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn line_count(ed) { return len(ed.lines); }
+fn current_line(ed) { return ed.lines[ed.row]; }
+
+// ── internal line list ops (rebuild — pblang arrays append only) ──────────────────────
+fn _insert_line(ed, idx, s) {
+    let out = [];
+    let i = 0;
+    while i < len(ed.lines) {
+        if i == idx { push(out, s); }
+        push(out, ed.lines[i]);
+        i = i + 1;
+    }
+    if idx >= len(ed.lines) { push(out, s); }
+    ed.lines = out;
+}
+fn _remove_line(ed, idx) {
+    let out = [];
+    let i = 0;
+    while i < len(ed.lines) { if i != idx { push(out, ed.lines[i]); } i = i + 1; }
+    if len(out) == 0 { push(out, ""); }
+    ed.lines = out;
+}
+
+// ── edits ────────────────────────────────────────────────────────────────────────────
+fn insert_char(ed, ch) {
+    if has_selection(ed) { delete_selection(ed); }
+    let line = ed.lines[ed.row];
+    ed.lines[ed.row] = str_slice(line, 0, ed.col) + ch + str_slice(line, ed.col, len(line));
+    ed.col = ed.col + 1;
+}
+fn insert_text(ed, s) {
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        if c == 10 { newline(ed); } else { insert_char(ed, strfromcharcode(c)); }
+        i = i + 1;
+    }
+}
+fn newline(ed) {
+    if has_selection(ed) { delete_selection(ed); }
+    let line = ed.lines[ed.row];
+    let before = str_slice(line, 0, ed.col);
+    let after = str_slice(line, ed.col, len(line));
+    ed.lines[ed.row] = before;
+    _insert_line(ed, ed.row + 1, after);
+    ed.row = ed.row + 1;
+    ed.col = 0;
+}
+fn backspace(ed) {
+    if has_selection(ed) { delete_selection(ed); return 0; }
+    if ed.col > 0 {
+        let line = ed.lines[ed.row];
+        ed.lines[ed.row] = str_slice(line, 0, ed.col - 1) + str_slice(line, ed.col, len(line));
+        ed.col = ed.col - 1;
+    } else {
+        if ed.row > 0 {
+            let prev = ed.lines[ed.row - 1];
+            let cur = ed.lines[ed.row];
+            let joincol = len(prev);
+            ed.lines[ed.row - 1] = prev + cur;
+            _remove_line(ed, ed.row);
+            ed.row = ed.row - 1;
+            ed.col = joincol;
+        }
+    }
+}
+
+// ── selection ────────────────────────────────────────────────────────────────────────
+fn set_anchor(ed) { ed.anchor = map{ row: ed.row, col: ed.col }; }
+fn clear_selection(ed) { ed.anchor = nil; }
+fn has_selection(ed) {
+    if ed.anchor == nil { return false; }
+    return not (ed.anchor.row == ed.row and ed.anchor.col == ed.col);
+}
+fn _sel_range(ed) {
+    let a = ed.anchor;
+    let c = map{ row: ed.row, col: ed.col };
+    if a.row < c.row or (a.row == c.row and a.col <= c.col) { return map{ start: a, end: c }; }
+    return map{ start: c, end: a };
+}
+fn selection_text(ed) {
+    if not has_selection(ed) { return ""; }
+    let r = _sel_range(ed);
+    if r.start.row == r.end.row { return str_slice(ed.lines[r.start.row], r.start.col, r.end.col); }
+    let out = str_slice(ed.lines[r.start.row], r.start.col, len(ed.lines[r.start.row]));
+    let i = r.start.row + 1;
+    while i < r.end.row { out = out + "
+" + ed.lines[i]; i = i + 1; }
+    return out + "
+" + str_slice(ed.lines[r.end.row], 0, r.end.col);
+}
+// selection_range(ed) — {start:{row,col}, end:{row,col}} (normalized), or nil if none.
+fn selection_range(ed) {
+    if not has_selection(ed) { return nil; }
+    return _sel_range(ed);
+}
+fn select_all(ed) {
+    ed.anchor = map{ row: 0, col: 0 };
+    ed.row = len(ed.lines) - 1;
+    ed.col = len(ed.lines[ed.row]);
+}
+fn delete_selection(ed) {
+    if ed.anchor == nil { return 0; }
+    let r = _sel_range(ed);
+    if r.start.row == r.end.row {
+        let line = ed.lines[r.start.row];
+        ed.lines[r.start.row] = str_slice(line, 0, r.start.col) + str_slice(line, r.end.col, len(line));
+    } else {
+        let head = str_slice(ed.lines[r.start.row], 0, r.start.col);
+        let tail = str_slice(ed.lines[r.end.row], r.end.col, len(ed.lines[r.end.row]));
+        ed.lines[r.start.row] = head + tail;
+        let out = [];
+        let i = 0;
+        while i < len(ed.lines) { if i <= r.start.row or i > r.end.row { push(out, ed.lines[i]); } i = i + 1; }
+        ed.lines = out;
+    }
+    ed.row = r.start.row; ed.col = r.start.col; ed.anchor = nil;
+    return 0;
+}
+
+// ── clipboard (internal) ─────────────────────────────────────────────────────────────
+fn copy(ed) { ed.clipboard = selection_text(ed); return ed.clipboard; }
+fn cut(ed) { let t = selection_text(ed); if has_selection(ed) { delete_selection(ed); } ed.clipboard = t; return t; }
+fn paste(ed) { if has_selection(ed) { delete_selection(ed); } insert_text(ed, ed.clipboard); }
+
+// ── undo / redo (snapshot before an edit; call snapshot() from the key handler) ───────
+fn _copy_lines(lines) { let out = []; let i = 0; while i < len(lines) { push(out, lines[i]); i = i + 1; } return out; }
+fn snapshot(ed) {
+    push(ed.undo_stack, map{ lines: _copy_lines(ed.lines), row: ed.row, col: ed.col });
+    ed.redo_stack = [];
+}
+fn undo(ed) {
+    if len(ed.undo_stack) == 0 { return 0; }
+    push(ed.redo_stack, map{ lines: _copy_lines(ed.lines), row: ed.row, col: ed.col });
+    let s = ed.undo_stack[len(ed.undo_stack) - 1];
+    ed.undo_stack = _pop_last(ed.undo_stack);
+    ed.lines = s.lines; ed.row = s.row; ed.col = s.col; ed.anchor = nil;
+    return 0;
+}
+fn redo(ed) {
+    if len(ed.redo_stack) == 0 { return 0; }
+    push(ed.undo_stack, map{ lines: _copy_lines(ed.lines), row: ed.row, col: ed.col });
+    let s = ed.redo_stack[len(ed.redo_stack) - 1];
+    ed.redo_stack = _pop_last(ed.redo_stack);
+    ed.lines = s.lines; ed.row = s.row; ed.col = s.col; ed.anchor = nil;
+    return 0;
+}
+fn _pop_last(arr) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) - 1 { push(out, arr[i]); i = i + 1; }
+    return out;
+}
+
+// ── find ─────────────────────────────────────────────────────────────────────────────
+// find_next(ed, query) — search forward from just after the cursor (wrapping). On a hit,
+// select the match (anchor at start, cursor at end) and return true.
+fn find_next(ed, query) {
+    if query == "" { return false; }
+    let n = len(ed.lines);
+    let r = ed.row;
+    let from = ed.col + 1;
+    let steps = 0;
+    while steps <= n {
+        let line = ed.lines[r];
+        if from <= len(line) {
+            let idx = str_index_of(str_slice(line, from, len(line)), query);
+            if idx >= 0 {
+                let col = from + idx;
+                ed.anchor = map{ row: r, col: col };
+                ed.row = r; ed.col = col + len(query);
+                return true;
+            }
+        }
+        r = r + 1;
+        from = 0;
+        if r >= n { r = 0; }
+        steps = steps + 1;
+    }
+    return false;
+}
+
+// ── cursor movement (clamped) ────────────────────────────────────────────────────────
+fn _clamp_col(ed) {
+    let n = len(ed.lines[ed.row]);
+    if ed.col > n { ed.col = n; }
+    if ed.col < 0 { ed.col = 0; }
+}
+fn move_left(ed) {
+    if ed.col > 0 { ed.col = ed.col - 1; }
+    else { if ed.row > 0 { ed.row = ed.row - 1; ed.col = len(ed.lines[ed.row]); } }
+}
+fn move_right(ed) {
+    if ed.col < len(ed.lines[ed.row]) { ed.col = ed.col + 1; }
+    else { if ed.row < len(ed.lines) - 1 { ed.row = ed.row + 1; ed.col = 0; } }
+}
+fn move_up(ed) { if ed.row > 0 { ed.row = ed.row - 1; _clamp_col(ed); } }
+fn move_down(ed) { if ed.row < len(ed.lines) - 1 { ed.row = ed.row + 1; _clamp_col(ed); } }
+fn home(ed) { ed.col = 0; }
+fn end(ed) { ed.col = len(ed.lines[ed.row]); }
+
+// ── word-wise movement (Ctrl+Left / Ctrl+Right) ──────────────────────────────────────
+// A "word" char is a letter, digit, or underscore. move_word_left skips any run of
+// non-word chars then the word to its left; move_word_right mirrors it. At a line edge
+// they fall through to plain left/right so movement still crosses lines.
+fn _is_word_char(c) {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95;
+}
+fn move_word_left(ed) {
+    if ed.col == 0 { move_left(ed); return 0; }
+    let line = ed.lines[ed.row];
+    let i = ed.col;
+    while i > 0 and not _is_word_char(strcharcodeat(line, i - 1)) { i = i - 1; }
+    while i > 0 and _is_word_char(strcharcodeat(line, i - 1)) { i = i - 1; }
+    ed.col = i;
+    return 0;
+}
+fn move_word_right(ed) {
+    let line = ed.lines[ed.row];
+    let n = len(line);
+    if ed.col >= n { move_right(ed); return 0; }
+    let i = ed.col;
+    while i < n and not _is_word_char(strcharcodeat(line, i)) { i = i + 1; }
+    while i < n and _is_word_char(strcharcodeat(line, i)) { i = i + 1; }
+    ed.col = i;
+    return 0;
+}
+
+// set_cursor(ed, row, col) — absolute caret placement, clamped into the buffer. Used for
+// mouse click-to-position; does NOT touch the selection anchor (the caller decides whether
+// the click starts/extends a selection).
+fn set_cursor(ed, row, col) {
+    if row < 0 { row = 0; }
+    if row > len(ed.lines) - 1 { row = len(ed.lines) - 1; }
+    ed.row = row;
+    ed.col = col;
+    _clamp_col(ed);
+}
+
+export new, text, line_count, current_line;
+export insert_char, insert_text, newline, backspace;
+export move_left, move_right, move_up, move_down, home, end, set_cursor;
+export move_word_left, move_word_right;
+export ensure_visible, page_up, page_down;
+export set_anchor, clear_selection, has_selection, selection_text, delete_selection;
+export selection_range, select_all, copy, cut, paste, snapshot, undo, redo, find_next;

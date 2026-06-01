@@ -1,0 +1,119 @@
+// stdlib/securelayer.sapp — a security layer that wraps ANY protocol, in pblang.
+//
+// Authenticated encryption you can put *above* an existing protocol (HTTP, TCP, a file)
+// or inside pblang's own protocol (pbp.sapp). It uses the primitives the VM ships —
+// sha256, hmac_sha256, random_bytes — in a sound construction:
+//
+//   ENCRYPT-THEN-MAC: a sha256 keystream XORs the plaintext (a nonce-based stream
+//   cipher), then HMAC-SHA256 authenticates (version ‖ aad ‖ nonce ‖ ciphertext). The
+//   tag is checked in CONSTANT TIME before anything is decrypted. The `aad`
+//   (additional authenticated data) binds context — a protocol VERSION (downgrade
+//   protection) and a SEQUENCE number (replay protection) — into the tag.
+//
+//   let s = import("stdlib/securelayer.sapp");
+//   let env = s.seal(key, "secret", 7);     // sequence 7 (version is bound automatically)
+//   let pt  = s.open(key, env, 7);           // -> "secret"; nil if tampered/replayed/downgraded
+//
+// HONEST LIMITS (see docs/Protocols.md): this is a from-primitives AEAD — correct and
+// authenticated, but a vetted cipher (AES-GCM / ChaCha20-Poly1305) and key agreement
+// (X25519) belong in the VM as native builtins for production strength and forward
+// secrecy. Payloads are code-point streams (full Unicode, U+0000..U+10FFFF). All pblang.
+
+let VERSION = 1;
+
+// ── hex / byte helpers ───────────────────────────────────────────────────────────────
+let _HEX = "0123456789abcdef";
+fn _byte_hex(v) {
+    let hi = (v - num_mod(v, 16)) / 16;
+    return strfromcharcode(strcharcodeat(_HEX, hi)) + strfromcharcode(strcharcodeat(_HEX, num_mod(v, 16)));
+}
+fn _hexval(c) { if c >= 48 and c <= 57 { return c - 48; } return c - 87; }   // '0'-'9' | 'a'-'f'
+fn _hex2(s, i) { return _hexval(strcharcodeat(s, i)) * 16 + _hexval(strcharcodeat(s, i + 1)); }
+// 24-bit code-point encoding (covers all of Unicode, U+0000..U+10FFFF), 6 hex chars.
+fn _hex6(v) {
+    let b2 = (v - num_mod(v, 65536)) / 65536;
+    let r = num_mod(v, 65536);
+    let b1 = (r - num_mod(r, 256)) / 256;
+    return _byte_hex(b2) + _byte_hex(b1) + _byte_hex(num_mod(r, 256));
+}
+
+fn rand_hex(nbytes) {
+    let b = random_bytes(nbytes);
+    let out = "";
+    let i = 0;
+    while i < len(b) { out = out + _byte_hex(b[i]); i = i + 1; }
+    return out;
+}
+
+// ── keystream: sha256(key|nonce|block) concatenated into bytes ────────────────────────
+fn _keystream(key, nonce, n) {
+    let ks = [];
+    let block = 0;
+    while len(ks) < n {
+        let h = sha256(key + "|" + nonce + "|" + str(block));   // 64 hex chars = 32 bytes
+        let j = 0;
+        while j < 32 {
+            if len(ks) < n { push(ks, _hex2(h, j * 2)); }
+            j = j + 1;
+        }
+        block = block + 1;
+    }
+    return ks;
+}
+
+// ── additional authenticated data (version + sequence) ────────────────────────────────
+fn aad(version, seq) { return str(version) + ":" + str(seq); }
+
+// constant-time string compare (avoid a timing oracle on the tag).
+fn _ct_eq(a, b) {
+    if len(a) != len(b) { return false; }
+    let diff = 0;
+    let i = 0;
+    while i < len(a) { diff = bit_or(diff, bit_xor(strcharcodeat(a, i), strcharcodeat(b, i))); i = i + 1; }
+    return diff == 0;
+}
+
+// ── seal / open ────────────────────────────────────────────────────────────────────
+// seal(key, plaintext, seq) -> a self-describing envelope string:
+//   v<version>.<nonce>.<ciphertext-hex>.<tag>
+// The current VERSION and `seq` are bound into the authenticated tag (downgrade + replay
+// protection), so the receiver must open with the same version and an unused sequence.
+fn seal(key, plaintext, seq) {
+    let nonce = rand_hex(16);
+    let n = len(plaintext);
+    let ks = _keystream(key, nonce, n);
+    let ct = "";
+    let i = 0;
+    while i < n { ct = ct + _hex6(bit_xor(strcharcodeat(plaintext, i), ks[i])); i = i + 1; }
+    let macin = str(VERSION) + "|" + aad(VERSION, seq) + "|" + nonce + "|" + ct;
+    let tag = hmac_sha256(macin, key);                      // (data, key)
+    return "v" + str(VERSION) + "." + nonce + "." + ct + "." + tag;
+}
+
+// open(key, envelope, want_seq) -> plaintext, or nil if the tag fails, the version is
+// wrong (downgrade), the sequence doesn't match (replay), or the envelope is malformed.
+fn open(key, envelope, want_seq) {
+    let parts = str_split(envelope, ".");
+    if len(parts) != 4 { return nil; }
+    let vtag = parts[0];
+    if vtag != "v" + str(VERSION) { return nil; }            // downgrade protection
+    let nonce = parts[1];
+    let ct = parts[2];
+    let tag = parts[3];
+    let macin = str(VERSION) + "|" + aad(VERSION, want_seq) + "|" + nonce + "|" + ct;
+    let expect = hmac_sha256(macin, key);
+    if not _ct_eq(expect, tag) { return nil; }               // integrity + replay (seq in aad)
+    // decrypt
+    let m = len(ct) / 6;
+    let ks = _keystream(key, nonce, m);
+    let out = "";
+    let i = 0;
+    while i < m {
+        let v = _hex2(ct, i * 6) * 65536 + _hex2(ct, i * 6 + 2) * 256 + _hex2(ct, i * 6 + 4);
+        out = out + strfromcharcode(bit_xor(v, ks[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+export VERSION, rand_hex, aad, seal, open;

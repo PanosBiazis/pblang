@@ -1,0 +1,940 @@
+// editors/ide/pbide.sapp — the pblang-NATIVE IDE (no HTML / CSS / JS).
+//
+// A code editor drawn entirely by pblang: a native window (graphics.sapp → minifb/SDL2),
+// the editor model (editor_model.sapp), pblang-rendered text (bitmap_font.sapp), shift/
+// ctrl-aware input (keymap.sapp), syntax highlighting via the self-hosted tokenizer
+// (syntax_hl.sapp), a scrolling viewport, selection, clipboard, undo/redo, find, save,
+// run/check, and an output pane. No browser, no DOM, no JS engine — the "total security"
+// point (docs/PB_IDE.md, docs/PrjAnalysis.md §90/§91).
+//
+// Run (needs a display):  ./target/debug/pblang run editors/ide/pbide.sapp --allow-all
+// Keys: type to edit · arrows/Home/End/PgUp/PgDn (Shift = select) · Enter/Backspace/Tab
+//       Ctrl+C/X/V copy/cut/paste · Ctrl+Z/Y undo/redo · Ctrl+A select-all · Ctrl+S save
+//       Ctrl+F find (type, Enter=next, Esc=close) · F5 run · F6 check.
+//
+// The editor model, font, keymap, and highlighting are tested in the VM. All pblang.
+
+let gfx = import("stdlib/graphics.sapp");
+let E = import("stdlib/editor_model.sapp");
+let F = import("stdlib/bitmap_font.sapp");
+let K = import("stdlib/keymap.sapp");
+let H = import("stdlib/syntax_hl.sapp");
+// The self-hosted frontend (F5 run / F6 check) is imported at TOP LEVEL on purpose:
+// top-level imports resolve relative to this script's project root, so they work no
+// matter the CWD. A *lazy* import() inside a function resolves relative to the CWD and
+// fails unless launched from the repo root — which is what used to crash F5/F6.
+let FE = import("stdlib/compiler/selfhost_frontend.sapp");
+// The Visual Designer panel reuses the pblang GUI toolkit's widget constructors and
+// hit-testing (stdlib/gui.sapp) — placed widgets ARE gui widget maps, so the generated
+// code is real gui.sapp calls (a true design↔code round-trip, all pblang).
+let G = import("stdlib/gui.sapp");
+// The AI panel is backed by pbAI — pblang's own assistant (stdlib/pbai.sapp): a neural
+// intent classifier + pblang-grounded skills. No external model, no network, no Ollama.
+let AI = import("stdlib/pbai.sapp");
+// The Browser panel renders web pages with the pblang-native browser (stdlib/browser.sapp):
+// http_get → strip tags → text + links, drawn with the bitmap font. No HTML engine.
+let B = import("stdlib/browser.sapp");
+
+let BG = gfx.rgb(20, 24, 38);
+let FG = gfx.rgb(220, 228, 240);
+let CURSOR = gfx.rgb(108, 92, 231);
+let GUTTER = gfx.rgb(120, 140, 170);
+let HILITE = gfx.rgb(40, 52, 86);
+let PANEBG = gfx.rgb(13, 17, 23);
+let PANEFG = gfx.rgb(150, 220, 200);
+let GUTTERBG = gfx.rgb(16, 20, 32);
+let CURROW = gfx.rgb(28, 33, 52);
+
+// HiDPI scale — the 5x7 bitmap font is drawn at SCALE× so glyphs are crisp (and large
+// enough) on high-resolution displays. Override with PBIDE_SCALE (e.g. 3 or 4 on 4K).
+fn _scale() {
+    let s = try parse_number(env_get("PBIDE_SCALE")) catch 0;
+    if s == nil or s < 1 { return 2; }
+    if s > 8 { return 8; }
+    return s;
+}
+let SCALE = _scale();
+let CW = 6 * SCALE;                  // glyph advance  (font is 5 wide + 1 space)
+let CH = 8 * SCALE;                  // line height    (font is 7 tall + 1 gap)
+let PAD = 4 * SCALE;
+let GUTTERX = PAD + 5 * CW;          // source text starts here (5-char line-number gutter)
+let TBH = CH + 2 * PAD;              // top toolbar (VS Code-style tab strip) height
+let TOP = TBH + PAD;                 // editor/content area starts BELOW the toolbar
+let PANEH = TOP + CH * 9 + PAD;      // bottom status + up to 8 output lines
+
+let TABBG = gfx.rgb(16, 20, 32);
+let TABACT = gfx.rgb(108, 92, 231);  // active-tab fill (accent)
+let TERMFG = gfx.rgb(170, 240, 180); // terminal text (green-ish)
+let TERMERR = gfx.rgb(255, 150, 150); // terminal stderr
+
+// VS Code-style top tabs. Clicking one switches state.panel; the editor, terminal,
+// designer, AI and browser are all panels in the SAME native window (no web stack).
+let TABS = [
+    map{ id: "code",   label: "CODE" },
+    map{ id: "term",   label: "TERMINAL" },
+    map{ id: "design", label: "DESIGN" },
+    map{ id: "ai",     label: "AI" },
+    map{ id: "web",    label: "BROWSER" },
+];
+// x/width of tab `idx` (cumulative — labels differ in length). Same math in draw + hit-test.
+fn _tab_bounds(idx) {
+    let x = PAD;
+    let i = 0;
+    while i < idx { x = x + (len(TABS[i].label) + 2) * CW + PAD; i = i + 1; }
+    return map{ x: x, w: (len(TABS[idx].label) + 2) * CW };
+}
+
+// F5 — compile + run the buffer through the self-hosted pipeline and surface what
+// the program PRINTED (one printed value per line, "» " prefixed). frontend_run now
+// captures print output (vm.sapp), so this shows real results instead of a raw map.
+fn _run(ed) {
+    let r = try FE.frontend_run(E.text(ed)) catch nil;
+    if r == nil { return "run: error — relaunch the IDE from the repo root (imports are CWD-relative)"; }
+    if not r.ok { return "run: compile error — " + str(try r.error catch "see F6 check"); }
+    let out = r.output;
+    if len(out) == 0 { return "run: ok · (no output)"; }
+    let s = "";
+    let i = 0;
+    while i < len(out) {
+        if i > 0 { s = s + "
+"; }
+        s = s + "» " + str(out[i]);
+        i = i + 1;
+    }
+    return s;
+}
+// F6 — static lint via the self-hosted analyzer: undefined names, unreachable code,
+// undeclared assignment. Lists up to 6 problems, one per line.
+fn _check(ed) {
+    let r = try FE.frontend_lint(E.text(ed)) catch nil;
+    if r == nil { return "check: error — relaunch the IDE from the repo root (imports are CWD-relative)"; }
+    if r.count == 0 { return "check: OK — no problems found"; }
+    let s = "check: " + str(r.count) + " problem(s)";
+    let i = 0;
+    while i < len(r.diagnostics) and i < 6 {
+        let d = r.diagnostics[i];
+        s = s + "
+  " + str(try d.kind catch "?") + ": " + str(try d.message catch "?");
+        i = i + 1;
+    }
+    return s;
+}
+fn _save(state) {
+    let ok = try fs_write(state.path, E.text(state.ed)) catch nil;
+    if ok == nil { return "save FAILED → " + state.path; }
+    return "saved → " + state.path;
+}
+
+// Enter/Return is named differently per backend: minifb → "Enter"/"NumPadEnter",
+// SDL2 → "Return". Accept all so Enter works everywhere (editor newline, terminal/AI
+// submit, find-next). This was the "Enter broken on all tabs" bug.
+fn _is_enter(key) { return key == "Return" or key == "Enter" or key == "NumPadEnter"; }
+
+fn _moveN(ed, dir, n) {
+    let i = 0;
+    while i < n { if dir == "up" { E.move_up(ed); } else { E.move_down(ed); } i = i + 1; }
+    return 0;
+}
+// _move(ed, key, shift, rows, fast). `fast` (Ctrl held) jumps by word horizontally and
+// by 5 lines / to document edges vertically — VS Code-style accelerated movement.
+fn _move(ed, key, shift, rows, fast) {
+    if shift { if ed.anchor == nil { E.set_anchor(ed); } } else { E.clear_selection(ed); }
+    if key == "Left" { if fast { E.move_word_left(ed); } else { E.move_left(ed); } }
+    if key == "Right" { if fast { E.move_word_right(ed); } else { E.move_right(ed); } }
+    if key == "Up" { if fast { _moveN(ed, "up", 5); } else { E.move_up(ed); } }
+    if key == "Down" { if fast { _moveN(ed, "down", 5); } else { E.move_down(ed); } }
+    if key == "Home" { if fast { ed.row = 0; } E.home(ed); }
+    if key == "End" { if fast { ed.row = len(ed.lines) - 1; } E.end(ed); }
+    if key == "PageUp" { E.page_up(ed, rows); }
+    if key == "PageDown" { E.page_down(ed, rows); }
+}
+fn _is_move(key) {
+    return key == "Left" or key == "Right" or key == "Up" or key == "Down"
+        or key == "Home" or key == "End" or key == "PageUp" or key == "PageDown";
+}
+
+// handle a keydown; returns a status string ("" keeps the current one).
+fn _key(state, key) {
+    let ed = state.ed;
+    if state.find_mode {
+        if _is_enter(key) { if E.find_next(ed, state.query) { return "find: " + state.query; } return "no match: " + state.query; }
+        if key == "Escape" { state.find_mode = false; return "find closed"; }
+        if key == "Backspace" { if len(state.query) > 0 { state.query = str_slice(state.query, 0, len(state.query) - 1); } return "find: " + state.query; }
+        let ch = K.key_to_char(key, state.shift);
+        if ch != "" { state.query = state.query + ch; return "find: " + state.query; }
+        return "";
+    }
+    // Movement first — so Ctrl+arrow accelerates (word / 5-line / doc-edge) instead of
+    // being swallowed by the Ctrl-shortcut block. Shift extends the selection.
+    if _is_move(key) { _move(ed, key, state.shift, state.rows, state.ctrl); return ""; }
+    if state.ctrl {
+        if key == "C" { E.copy(ed); return "copied"; }
+        if key == "X" { E.snapshot(ed); E.cut(ed); state.last = "other"; state.dirty = true; return "cut"; }
+        if key == "V" { E.snapshot(ed); E.paste(ed); state.last = "other"; state.dirty = true; return "pasted"; }
+        if key == "Z" { E.undo(ed); state.last = "other"; state.dirty = true; return "undo"; }
+        if key == "Y" { E.redo(ed); state.last = "other"; state.dirty = true; return "redo"; }
+        if key == "A" { E.select_all(ed); return "select all"; }
+        if key == "S" { return _save(state); }
+        if key == "F" { state.find_mode = true; state.query = ""; return "find: "; }
+        return "";
+    }
+    if key == "F5" { return _run(ed); }
+    if key == "F6" { return _check(ed); }
+    if key == "Backspace" { E.snapshot(ed); E.backspace(ed); state.last = "other"; state.dirty = true; return ""; }
+    if _is_enter(key) { E.snapshot(ed); E.newline(ed); state.last = "other"; state.dirty = true; return ""; }
+    if key == "Tab" { E.snapshot(ed); E.insert_text(ed, "    "); state.last = "other"; state.dirty = true; return ""; }
+    let ch = K.key_to_char(key, state.shift);
+    if ch != "" {
+        if state.last != "type" { E.snapshot(ed); }     // coalesce consecutive typing into one undo
+        state.last = "type"; state.dirty = true;
+        E.insert_char(ed, ch);
+        return "";
+    }
+    return "";
+}
+
+fn _line_tokens(toks, lineno) {
+    if toks == nil { return nil; }
+    let out = [];
+    let i = 0;
+    while i < len(toks) { if toks[i].line == lineno { push(out, toks[i]); } i = i + 1; }
+    return out;
+}
+
+// scaled text: each lit 5x7 font pixel becomes one SCALE×SCALE FILLED RECT — crisp on
+// HiDPI and fewer ops than SCALE² per-pixel points. Spaces advance without drawing.
+fn _dt(win, x, y, s, color) {
+    let cx = x;
+    let i = 0;
+    while i < len(s) {
+        let code = strcharcodeat(s, i);
+        if code != 32 {
+            let g = F.glyph(code);
+            if g == nil { g = [31, 17, 17, 17, 17, 17, 31]; }
+            let r = 0;
+            while r < 7 {
+                let row = g[r];
+                let c = 0;
+                while c < 5 {
+                    if bit_and(bit_shr(row, 4 - c), 1) == 1 {
+                        win.rect(cx + c * SCALE, y + r * SCALE, SCALE, SCALE, color);
+                    }
+                    c = c + 1;
+                }
+                r = r + 1;
+            }
+        }
+        cx = cx + CW;
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _draw_code(state, win, sz) {
+    let ed = state.ed;
+    let rows = (sz.h - PANEH - TOP) / CH;
+    state.rows = rows;
+    E.ensure_visible(ed, rows);
+
+    // re-tokenize only when the buffer changed (cached across frames — the editor
+    // redraws at 30 fps but the syntax tokens rarely change)
+    if state.dirty { state.tokens = try H.tokens(E.text(ed)) catch nil; state.dirty = false; }
+    let toks = state.tokens;
+    let selr = E.selection_range(ed);
+    let scr = ed.scroll;
+
+    // gutter background strip
+    win.rect(0, 0, GUTTERX - SCALE, sz.h - PANEH, GUTTERBG);
+
+    let vr = 0;
+    while vr < rows {
+        let r = scr + vr;
+        if r < E.line_count(ed) {
+            let y = TOP + vr * CH;
+            // current-line highlight (behind the text, across the editor area)
+            if r == ed.row { win.rect(GUTTERX - SCALE, y - SCALE, sz.w - GUTTERX + SCALE, CH, CURROW); }
+            // selection highlight (behind the text)
+            if selr != nil and r >= selr.start.row and r <= selr.end.row {
+                let sc = 0;
+                if r == selr.start.row { sc = selr.start.col; }
+                let ec = len(ed.lines[r]);
+                if r == selr.end.row { ec = selr.end.col; }
+                if ec < sc { ec = sc; }
+                win.rect(GUTTERX + sc * CW, y, (ec - sc) * CW + SCALE, CH, HILITE);
+            }
+            _dt(win, PAD, y, str(r + 1), GUTTER);
+            let lt = _line_tokens(toks, r + 1);
+            if lt == nil {
+                _dt(win, GUTTERX, y, ed.lines[r], FG);
+            } else {
+                let i = 0;
+                while i < len(lt) {
+                    let t = lt[i];
+                    let rgb = H.kind_color(t.kind);
+                    _dt(win, GUTTERX + (t.col - 1) * CW, y, t.text, gfx.rgb(rgb[0], rgb[1], rgb[2]));
+                    i = i + 1;
+                }
+            }
+        }
+        vr = vr + 1;
+    }
+
+    let curscreen = ed.row - scr;
+    if curscreen >= 0 and curscreen < rows {
+        win.rect(GUTTERX + ed.col * CW, TOP + curscreen * CH, SCALE, CH - SCALE, CURSOR);
+    }
+
+    // bottom output pane + accent divider
+    let py = sz.h - PANEH;
+    win.rect(0, py, sz.w, PANEH, PANEBG);
+    win.rect(0, py, sz.w, SCALE, CURSOR);
+    let head = "OUTPUT   LN " + str(ed.row + 1) + " COL " + str(ed.col + 1);
+    if ed.anchor != nil { head = head + " [SEL]"; }
+    head = head + "   F5 RUN  F6 CHECK  ^S SAVE  ^F FIND";
+    _dt(win, PAD, py + 3 * SCALE, head, GUTTER);
+    let maxchars = (sz.w - 2 * PAD) / CW;
+    let outlines = str_split(state.output, "
+");
+    let oi = 0;
+    while oi < len(outlines) and oi < 8 {
+        _dt(win, PAD, py + CH + 3 * SCALE + oi * CH, str_slice(outlines[oi], 0, maxchars), PANEFG);
+        oi = oi + 1;
+    }
+}
+
+// ── toolbar (top tab strip) ──────────────────────────────────────────────────────
+fn _draw_toolbar(state, win, sz) {
+    win.rect(0, 0, sz.w, TBH, TABBG);
+    win.rect(0, TBH - SCALE, sz.w, SCALE, TABACT);     // accent divider under the tabs
+    let i = 0;
+    while i < len(TABS) {
+        let b = _tab_bounds(i);
+        let active = TABS[i].id == state.panel;
+        let bg = PANEBG; if active { bg = TABACT; }
+        win.rect(b.x, PAD, b.w, CH, bg);
+        let fg = GUTTER; if active { fg = FG; }
+        _dt(win, b.x + CW, PAD + SCALE, TABS[i].label, fg);
+        i = i + 1;
+    }
+}
+// toolbar hit-test: pixel → tab id (nil if not on the toolbar).
+fn _toolbar_hit(mx, my) {
+    if my >= TBH { return nil; }
+    let i = 0;
+    while i < len(TABS) {
+        let b = _tab_bounds(i);
+        if mx >= b.x and mx < b.x + b.w { return TABS[i].id; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// ── terminal panel (real PC commands via proc_spawn_wait — needs --allow-exec) ────
+// Shell-quote a path for a single-quoted bash context.
+fn _shq(s) { return "'" + str_replace_all(s, "'", "'\\''") + "'"; }
+
+fn _term_push(state, line) {
+    array_push(state.term.lines, line);
+    // cap scrollback so a chatty command can't grow the buffer without bound
+    if len(state.term.lines) > 600 {
+        let out = [];
+        let i = len(state.term.lines) - 400;
+        while i < len(state.term.lines) { push(out, state.term.lines[i]); i = i + 1; }
+        state.term.lines = out;
+    }
+}
+fn _term_run(state) {
+    let t = state.term;
+    let cmd = str_trim(t.input);
+    _term_push(state, "$ " + cmd);
+    t.input = "";
+    if cmd == "" { return 0; }
+    if cmd == "clear" { state.term.lines = []; return 0; }
+    // Run inside the tracked cwd; a trailing `pwd` reports the directory AFTER the
+    // command (so `cd subdir` persists across commands like a real shell). stdout's
+    // last line is that pwd; everything above it is the command's own output.
+    let full = "cd " + _shq(t.cwd) + " 2>/dev/null; " + cmd + "\nprintf '%s' \"$(pwd)\"";
+    let r = try proc_spawn_wait("bash", ["-c", full]) catch nil;
+    if r == nil {
+        _term_push(state, "[terminal needs exec — relaunch with --allow-exec or --allow-all]");
+        return 0;
+    }
+    let outlines = str_split(r.stdout, "
+");
+    let n = len(outlines);
+    if n > 0 { state.term.cwd = outlines[n - 1]; }      // last line = resulting pwd
+    let i = 0;
+    while i < n - 1 { _term_push(state, outlines[i]); i = i + 1; }
+    let errl = str_split(r.stderr, "
+");
+    let j = 0;
+    while j < len(errl) { if str_trim(errl[j]) != "" { _term_push(state, "! " + errl[j]); } j = j + 1; }
+    return 0;
+}
+fn _term_key(state, key, shift) {
+    let t = state.term;
+    if _is_enter(key) {
+        if shift { t.input = t.input + "
+"; return 0; }                  // Shift+Enter = newline (compose a multi-line command)
+        _term_run(state); return 0;
+    }
+    if key == "Backspace" { if len(t.input) > 0 { t.input = str_slice(t.input, 0, len(t.input) - 1); } return 0; }
+    let ch = K.key_to_char(key, shift);
+    if ch != "" { t.input = t.input + ch; }
+    return 0;
+}
+// draw a (possibly multi-line) input box pinned to the window bottom; the first visual
+// line carries `prefix`. Multi-line because Shift+Enter inserts "\n" into `input`. Returns
+// the Y where the box starts, so the scrollback above can size itself to fit.
+fn _draw_input(win, sz, prefix, input, maxchars) {
+    let inlines = str_split(input, "
+");
+    let nl = len(inlines);
+    let boxTop = sz.h - CH * nl - PAD;
+    win.rect(0, boxTop - PAD, sz.w, CH * nl + 2 * PAD, PANEBG);
+    win.rect(0, boxTop - PAD, sz.w, SCALE, TABACT);
+    let i = 0;
+    while i < nl {
+        let txt = inlines[i];
+        if i == 0 { txt = prefix + txt; }
+        _dt(win, PAD, boxTop + i * CH, str_slice(txt, 0, maxchars), FG);
+        i = i + 1;
+    }
+    let lastlen = len(inlines[nl - 1]);
+    if nl == 1 { lastlen = lastlen + len(prefix); }
+    win.rect(PAD + lastlen * CW, boxTop + (nl - 1) * CH, SCALE, CH - SCALE, CURSOR);
+    return boxTop - PAD;
+}
+fn _draw_term(state, win, sz) {
+    let t = state.term;
+    let maxchars = (sz.w - 2 * PAD) / CW;
+    let promptTop = _draw_input(win, sz, t.cwd + " $ ", t.input, maxchars);
+    let areaRows = (promptTop - TOP) / CH;
+    let total = len(t.lines);
+    let start = 0;
+    if total > areaRows { start = total - areaRows; }    // tail the scrollback
+    let vr = 0;
+    while start + vr < total and vr < areaRows {
+        let ln = t.lines[start + vr];
+        let col = TERMFG;
+        if len(ln) > 0 and strcharcodeat(ln, 0) == 33 { col = TERMERR; }   // '!' = stderr line
+        _dt(win, PAD, TOP + vr * CH, str_slice(ln, 0, maxchars), col);
+        vr = vr + 1;
+    }
+}
+
+// ── placeholder panels (next milestones — reachable, honest about status) ─────────
+fn _draw_stub(win, sz, title, lines) {
+    _dt(win, PAD, TOP, title, TABACT);
+    let i = 0;
+    while i < len(lines) {
+        _dt(win, PAD, TOP + CH * 2 + i * CH, lines[i], PANEFG);
+        i = i + 1;
+    }
+}
+
+// ── Visual Designer panel ─────────────────────────────────────────────────────────
+// A drag-and-drop form builder: a palette of widget kinds + a canvas you click to
+// place widgets + an inspector, generating real stdlib/gui.sapp code. Placed widgets
+// ARE gui widget maps (built by the G.* constructors), so →CODE round-trips to source.
+let DPAL = [
+    map{ id: "label",    label: "LABEL",  act: false },
+    map{ id: "button",   label: "BUTTON", act: false },
+    map{ id: "textbox",  label: "TEXT",   act: false },
+    map{ id: "checkbox", label: "CHECK",  act: false },
+    map{ id: "panel",    label: "PANEL",  act: false },
+    map{ id: "gencode",  label: "->CODE", act: true },
+    map{ id: "clear",    label: "CLEAR",  act: true },
+];
+// x/width of palette chip `idx` (cumulative — same math in draw + hit-test).
+fn _pal_bounds(idx) {
+    let x = PAD;
+    let i = 0;
+    while i < idx { x = x + (len(DPAL[i].label) + 2) * CW + PAD; i = i + 1; }
+    return map{ x: x, w: (len(DPAL[idx].label) + 2) * CW };
+}
+// palette hit-test → chip id (nil if the click isn't on the palette row).
+fn _pal_hit(mx, my) {
+    if my < TOP or my >= TOP + CH { return nil; }
+    let i = 0;
+    while i < len(DPAL) {
+        let b = _pal_bounds(i);
+        if mx >= b.x and mx < b.x + b.w { return DPAL[i].id; }
+        i = i + 1;
+    }
+    return nil;
+}
+// rectangle outline (the toolkit only fills rects, so a border is four thin rects).
+fn _box(win, x, y, w, h, c) {
+    win.rect(x, y, w, SCALE, c);
+    win.rect(x, y + h - SCALE, w, SCALE, c);
+    win.rect(x, y, SCALE, h, c);
+    win.rect(x + w - SCALE, y, SCALE, h, c);
+}
+// which widget property holds its editable label (so typing edits the right field).
+fn _w_textkey(w) {
+    if w.kind == "textbox" { return "value"; }
+    if w.kind == "panel" { return "title"; }
+    return "text";
+}
+// build a new widget of `kind` at (x,y) via the gui.sapp constructors (auto-named).
+fn _make_widget(state, kind, x, y) {
+    state.design.counter = state.design.counter + 1;
+    let n = state.design.counter;
+    if kind == "label" { return G.label("lbl" + str(n), x, y, "Label"); }
+    if kind == "button" { return G.button("btn" + str(n), x, y, 120, 32, "Button", nil); }
+    if kind == "textbox" { return G.textbox("txt" + str(n), x, y, 160, 28, ""); }
+    if kind == "checkbox" { return G.checkbox("chk" + str(n), x, y, "Check", false, nil); }
+    if kind == "panel" { return G.panel("pnl" + str(n), x, y, 200, 120, "Panel"); }
+    return nil;
+}
+// topmost placed widget containing (x,y), or -1. Last-added wins (drawn on top).
+fn _design_widget_at(state, x, y) {
+    let ws = state.design.widgets;
+    let i = len(ws) - 1;
+    while i >= 0 {
+        let w = ws[i];
+        if x >= w.x and x < w.x + w.w and y >= w.y and y < w.y + w.h { return i; }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+fn _draw_dwidget(win, w, sel) {
+    let bd = GUTTER;
+    if sel { bd = CURSOR; }
+    let k = w.kind;
+    if k == "panel" {
+        win.rect(w.x, w.y, w.w, w.h, HILITE);
+        _box(win, w.x, w.y, w.w, w.h, bd);
+        _dt(win, w.x + PAD, w.y + PAD, w.title, FG);
+    } else if k == "button" {
+        win.rect(w.x, w.y, w.w, w.h, TABACT);
+        _dt(win, w.x + (w.w - len(w.text) * CW) / 2, w.y + (w.h - 7 * SCALE) / 2, w.text, FG);
+        if sel { _box(win, w.x, w.y, w.w, w.h, CURSOR); }
+    } else if k == "textbox" {
+        win.rect(w.x, w.y, w.w, w.h, PANEBG);
+        _box(win, w.x, w.y, w.w, w.h, bd);
+        _dt(win, w.x + PAD, w.y + (w.h - 7 * SCALE) / 2, w.value, FG);
+    } else if k == "checkbox" {
+        let bs = 5 * SCALE;
+        _box(win, w.x, w.y + (CH - bs) / 2, bs, bs, bd);
+        if w.checked { win.rect(w.x + SCALE, w.y + (CH - bs) / 2 + SCALE, bs - 2 * SCALE, bs - 2 * SCALE, TABACT); }
+        _dt(win, w.x + bs + PAD, w.y, w.text, FG);
+    } else if k == "label" {
+        _dt(win, w.x, w.y, w.text, FG);
+        if sel { _box(win, w.x, w.y, w.w, w.h, CURSOR); }
+    }
+}
+fn _draw_design(state, win, sz) {
+    let d = state.design;
+    // palette row
+    let i = 0;
+    while i < len(DPAL) {
+        let b = _pal_bounds(i);
+        let on = (not DPAL[i].act) and DPAL[i].id == d.tool;
+        let bg = PANEBG;
+        if DPAL[i].act { bg = gfx.rgb(46, 40, 64); } else if on { bg = TABACT; }
+        win.rect(b.x, TOP, b.w, CH, bg);
+        let fg = GUTTER; if on { fg = FG; }
+        _dt(win, b.x + CW, TOP + SCALE, DPAL[i].label, fg);
+        i = i + 1;
+    }
+    // canvas with a faint dot grid
+    let canvTop = TOP + CH + PAD;
+    let canvBot = sz.h - (CH + PAD);
+    win.rect(0, canvTop, sz.w, canvBot - canvTop, gfx.rgb(24, 28, 42));
+    let gx = PAD;
+    while gx < sz.w {
+        let gy = canvTop;
+        while gy < canvBot { win.rect(gx, gy, SCALE, SCALE, gfx.rgb(40, 46, 66)); gy = gy + CH * 2; }
+        gx = gx + CW * 4;
+    }
+    // placed widgets
+    let wi = 0;
+    while wi < len(d.widgets) { _draw_dwidget(win, d.widgets[wi], wi == d.sel); wi = wi + 1; }
+    // inspector strip
+    let iy = sz.h - (CH + PAD);
+    win.rect(0, iy, sz.w, CH + PAD, PANEBG);
+    win.rect(0, iy, sz.w, SCALE, TABACT);
+    let info = "tool: " + d.tool + " · click canvas to place · drag to move · type to edit · Del delete · ->CODE generates";
+    if d.sel >= 0 {
+        let w = d.widgets[d.sel];
+        info = "SEL " + w.kind + " '" + w.name + "' @ " + str(w.x) + "," + str(w.y) + " · type to rename · Del to delete";
+    }
+    _dt(win, PAD, iy + 2 * SCALE, str_slice(info, 0, (sz.w - 2 * PAD) / CW), TERMFG);
+}
+// codegen: placed widgets → runnable stdlib/gui.sapp source.
+fn _q(s) { return "\"" + str_replace_all(s, "\"", "\\\"") + "\""; }
+fn _w_ctor(w) {
+    let k = w.kind;
+    let h = _q(w.name) + ", " + str(w.x) + ", " + str(w.y);
+    if k == "label" { return "G.label(" + h + ", " + _q(w.text) + ")"; }
+    if k == "button" { return "G.button(" + h + ", " + str(w.w) + ", " + str(w.h) + ", " + _q(w.text) + ", nil)"; }
+    if k == "textbox" { return "G.textbox(" + h + ", " + str(w.w) + ", " + str(w.h) + ", " + _q(w.value) + ")"; }
+    if k == "checkbox" { return "G.checkbox(" + h + ", " + _q(w.text) + ", false, nil)"; }
+    if k == "panel" { return "G.panel(" + h + ", " + str(w.w) + ", " + str(w.h) + ", " + _q(w.title) + ")"; }
+    return "nil";
+}
+fn _design_code(state) {
+    let s = "let G = import(\"stdlib/gui.sapp\");
+let f = G.form(\"Designed UI\", 800, 600);
+";
+    let i = 0;
+    while i < len(state.design.widgets) {
+        s = s + "G.add(f, " + _w_ctor(state.design.widgets[i]) + ");
+";
+        i = i + 1;
+    }
+    s = s + "G.run(f);
+";
+    return s;
+}
+// a click in the Designer: palette action, select+drag an existing widget, or place one.
+fn _design_click(state, mx, my) {
+    let d = state.design;
+    let p = _pal_hit(mx, my);
+    if p != nil {
+        if p == "gencode" {
+            state.ed = E.new(_design_code(state));
+            state.dirty = true; state.tokens = nil; state.last = "other";
+            state.panel = "code";
+            state.output = "designer → generated " + str(len(d.widgets)) + " widget(s) into the editor (F5 to run)";
+            return 0;
+        }
+        if p == "clear" { d.widgets = []; d.sel = 0 - 1; return 0; }
+        d.tool = p; return 0;
+    }
+    let canvTop = TOP + CH + PAD;
+    let canvBot = state.winsz.h - (CH + PAD);
+    if my < canvTop or my >= canvBot { return 0; }
+    let hi = _design_widget_at(state, mx, my);
+    if hi >= 0 {
+        d.sel = hi; d.drag = true;
+        d.dx = mx - d.widgets[hi].x; d.dy = my - d.widgets[hi].y;
+        return 0;
+    }
+    let w = _make_widget(state, d.tool, mx, my);
+    if w != nil { array_push(d.widgets, w); d.sel = len(d.widgets) - 1; }
+    return 0;
+}
+fn _design_key(state, key, shift) {
+    let d = state.design;
+    if d.sel < 0 { return 0; }
+    let w = d.widgets[d.sel];
+    if key == "Delete" {
+        let out = []; let i = 0;
+        while i < len(d.widgets) { if i != d.sel { push(out, d.widgets[i]); } i = i + 1; }
+        d.widgets = out; d.sel = 0 - 1;
+        return 0;
+    }
+    let fk = _w_textkey(w);
+    if key == "Backspace" { let v = w[fk]; if len(v) > 0 { w[fk] = str_slice(v, 0, len(v) - 1); } return 0; }
+    let ch = K.key_to_char(key, shift);
+    if ch != "" { w[fk] = w[fk] + ch; }
+    return 0;
+}
+
+// ── AI panel (pbAI — stdlib/pbai.sapp) ────────────────────────────────────────────
+// A chat against pblang's own assistant: a free-text question box plus quick-action
+// chips that run pbAI on whatever is in the CODE editor (explain / find bugs / improve
+// / comment). pbAI grounds on code wrapped in a `--- pblang code ---` marker.
+let AIPAL = [
+    map{ id: "explain", label: "EXPLAIN" },
+    map{ id: "bugs",    label: "BUGS" },
+    map{ id: "improve", label: "IMPROVE" },
+    map{ id: "comment", label: "COMMENT" },
+    map{ id: "clear",   label: "CLEAR" },
+];
+fn _ai_bounds(idx) {
+    let x = PAD;
+    let i = 0;
+    while i < idx { x = x + (len(AIPAL[i].label) + 2) * CW + PAD; i = i + 1; }
+    return map{ x: x, w: (len(AIPAL[idx].label) + 2) * CW };
+}
+fn _ai_hit(mx, my) {
+    if my < TOP or my >= TOP + CH { return nil; }
+    let i = 0;
+    while i < len(AIPAL) {
+        let b = _ai_bounds(i);
+        if mx >= b.x and mx < b.x + b.w { return AIPAL[i].id; }
+        i = i + 1;
+    }
+    return nil;
+}
+fn _ai_push(state, line) {
+    array_push(state.ai.lines, line);
+    if len(state.ai.lines) > 600 {
+        let out = []; let i = len(state.ai.lines) - 400;
+        while i < len(state.ai.lines) { push(out, state.ai.lines[i]); i = i + 1; }
+        state.ai.lines = out;
+    }
+    return 0;
+}
+// send `prompt` to pbAI; `echo` is the user-visible line shown above the answer.
+fn _ai_send(state, prompt, echo) {
+    _ai_push(state, "> " + echo);
+    let reply = try AI.respond(prompt) catch "pbAI error — could not produce a response";
+    let rl = str_split(reply, "
+");
+    let i = 0;
+    while i < len(rl) { _ai_push(state, "  " + rl[i]); i = i + 1; }
+    _ai_push(state, "");
+    return 0;
+}
+// quick action: run a pbAI skill on the current editor buffer (or CLEAR the chat).
+fn _ai_action(state, id) {
+    if id == "clear" { state.ai.lines = []; return 0; }
+    let code = E.text(state.ed);
+    let verb = "explain what this code does";
+    if id == "bugs" { verb = "find the bugs and errors in this code"; }
+    else if id == "improve" { verb = "improve and optimize this code"; }
+    else if id == "comment" { verb = "add comments documenting this code"; }
+    let prompt = verb + ":
+
+--- pblang code ---
+" + code;
+    _ai_send(state, prompt, id + " (on editor buffer)");
+    return 0;
+}
+fn _ai_key(state, key, shift) {
+    let a = state.ai;
+    if _is_enter(key) {
+        if shift { a.input = a.input + "
+"; return 0; }                  // Shift+Enter = newline (compose a multi-line question)
+        let q = str_trim(a.input);
+        a.input = "";
+        if q != "" { _ai_send(state, q, q); }
+        return 0;
+    }
+    if key == "Backspace" { if len(a.input) > 0 { a.input = str_slice(a.input, 0, len(a.input) - 1); } return 0; }
+    let ch = K.key_to_char(key, shift);
+    if ch != "" { a.input = a.input + ch; }
+    return 0;
+}
+fn _draw_ai(state, win, sz) {
+    let a = state.ai;
+    // quick-action palette
+    let i = 0;
+    while i < len(AIPAL) {
+        let b = _ai_bounds(i);
+        let bg = PANEBG; if AIPAL[i].id == "clear" { bg = gfx.rgb(46, 40, 64); }
+        win.rect(b.x, TOP, b.w, CH, bg);
+        _dt(win, b.x + CW, TOP + SCALE, AIPAL[i].label, GUTTER);
+        i = i + 1;
+    }
+    // chat scrollback (tail), wrapping is by truncation to fit width
+    let maxchars = (sz.w - 2 * PAD) / CW;
+    let chatTop = TOP + CH + PAD;
+    let promptTop = _draw_input(win, sz, "ask pbAI > ", a.input, maxchars);
+    let rows = (promptTop - chatTop) / CH;
+    let total = len(a.lines);
+    let start = 0;
+    if total > rows { start = total - rows; }
+    let vr = 0;
+    while start + vr < total and vr < rows {
+        let ln = a.lines[start + vr];
+        let col = PANEFG;
+        if len(ln) > 0 and strcharcodeat(ln, 0) == 62 { col = TABACT; }   // '>' = user line, accent
+        _dt(win, PAD, chatTop + vr * CH, str_slice(ln, 0, maxchars), col);
+        vr = vr + 1;
+    }
+}
+
+// ── Browser panel (stdlib/browser.sapp) ───────────────────────────────────────────
+// word-wrap plain text into lines no wider than `width` chars.
+fn _wrap(text, width) {
+    let words = str_split(str_replace_all(text, "
+", " "), " ");
+    let lines = [];
+    let cur = "";
+    let i = 0;
+    while i < len(words) {
+        let w = words[i];
+        if w != "" {
+            if cur == "" { cur = w; }
+            else if len(cur) + len(w) + 1 > width { push(lines, cur); cur = w; }
+            else { cur = cur + " " + w; }
+        }
+        i = i + 1;
+    }
+    if cur != "" { push(lines, cur); }
+    return lines;
+}
+fn _web_load(state) {
+    let url = str_trim(state.web.input);
+    if url == "" { return 0; }
+    if not str_starts_with(url, "http") { url = "https://" + url; state.web.input = url; }
+    state.web.scroll = 0;
+    state.web.title = "loading " + url + " …";
+    state.web.lines = [];
+    let page = try B.fetch_page(url) catch nil;
+    if page == nil or not page.ok {
+        state.web.title = "load failed";
+        let why = "could not load (needs network + http; try a reachable http/https URL)";
+        if page != nil { why = try page.error catch why; }
+        state.web.lines = [why];
+        return 0;
+    }
+    state.web.url = page.url;
+    state.web.title = page.title;
+    let cols = (state.winsz.w - 2 * PAD) / CW;
+    let lines = _wrap(page.text, cols);
+    push(lines, "");
+    push(lines, "-- links (" + str(len(page.links)) + ") --");
+    let i = 0;
+    while i < len(page.links) and i < 40 { push(lines, "> " + page.links[i]); i = i + 1; }
+    state.web.lines = lines;
+    return 0;
+}
+fn _web_key(state, key, shift) {
+    let w = state.web;
+    if _is_enter(key) { _web_load(state); return 0; }
+    if key == "Down" { w.scroll = w.scroll + 3; return 0; }
+    if key == "PageDown" { w.scroll = w.scroll + 12; return 0; }
+    if key == "Up" { w.scroll = w.scroll - 3; if w.scroll < 0 { w.scroll = 0; } return 0; }
+    if key == "PageUp" { w.scroll = w.scroll - 12; if w.scroll < 0 { w.scroll = 0; } return 0; }
+    if key == "Backspace" { if len(w.input) > 0 { w.input = str_slice(w.input, 0, len(w.input) - 1); } return 0; }
+    let ch = K.key_to_char(key, shift);
+    if ch != "" { w.input = w.input + ch; }
+    return 0;
+}
+fn _draw_web(state, win, sz) {
+    let w = state.web;
+    let maxchars = (sz.w - 2 * PAD) / CW;
+    // address bar
+    win.rect(0, TOP, sz.w, CH, PANEBG);
+    win.rect(0, TOP + CH, sz.w, SCALE, TABACT);
+    let addr = "URL › " + w.input;
+    _dt(win, PAD, TOP + SCALE, str_slice(addr, 0, maxchars), FG);
+    win.rect(PAD + len(addr) * CW, TOP + SCALE, SCALE, CH - 2 * SCALE, CURSOR);
+    // title
+    let bodyTop = TOP + CH + PAD * 2;
+    if w.title != "" { _dt(win, PAD, bodyTop, str_slice(w.title, 0, maxchars), TABACT); bodyTop = bodyTop + CH + PAD; }
+    // content (scrollable)
+    let rows = (sz.h - bodyTop - PAD) / CH;
+    if w.scroll > len(w.lines) - 1 { if len(w.lines) > 0 { w.scroll = len(w.lines) - 1; } else { w.scroll = 0; } }
+    let vr = 0;
+    while w.scroll + vr < len(w.lines) and vr < rows {
+        let ln = w.lines[w.scroll + vr];
+        let col = PANEFG;
+        if len(ln) > 0 and strcharcodeat(ln, 0) == 8226 { col = TABACT; }   // '•' link line
+        _dt(win, PAD, bodyTop + vr * CH, str_slice(ln, 0, maxchars), col);
+        vr = vr + 1;
+    }
+}
+
+// top-level draw: clear, toolbar, then the active panel.
+fn _draw(state, win) {
+    win.clear(BG);
+    let sz = win.size();
+    state.winsz = sz;                 // cached for mouse → buffer-position mapping
+    _draw_toolbar(state, win, sz);
+    if state.panel == "code" { _draw_code(state, win, sz); }
+    else if state.panel == "term" { _draw_term(state, win, sz); }
+    else if state.panel == "design" { _draw_design(state, win, sz); }
+    else if state.panel == "ai" { _draw_ai(state, win, sz); }
+    else if state.panel == "web" { _draw_web(state, win, sz); }
+    win.present();
+}
+
+// mouse → buffer position. Maps a pixel (mx,my) in the editor area to (row,col), using the
+// SAME layout math as _draw: row r sits at y = TOP + (r - scroll)*CH, text starts at GUTTERX.
+// Returns nil for clicks outside the editor area (e.g. on the output pane).
+fn _mouse_pos(state, mx, my) {
+    let ed = state.ed;
+    let sz = state.winsz;
+    if sz != nil and my >= sz.h - PANEH { return nil; }    // not in the editor area
+    let vr = (my - TOP) / CH;
+    if vr < 0 { vr = 0; }
+    let row = ed.scroll + vr;
+    let col = 0;
+    if mx > GUTTERX { col = (mx - GUTTERX + CW / 2) / CW; }  // round to nearest gap
+    return map{ row: row, col: col };
+}
+
+// place the caret at the mouse, optionally extending the selection (drag).
+fn _mouse_place(state, mx, my, extend) {
+    let p = _mouse_pos(state, mx, my);
+    if p == nil { return 0; }
+    let ed = state.ed;
+    if extend { if ed.anchor == nil { E.set_anchor(ed); } } else { E.clear_selection(ed); }
+    E.set_cursor(ed, p.row, p.col);
+    return 0;
+}
+
+fn main() {
+    // Window sized in glyph cells so it scales with SCALE (≈100 cols × 40 rows).
+    let winw = GUTTERX + 5 * CW + 100 * CW + PAD;
+    let winh = TOP + 40 * CH + PANEH;
+    let win = gfx.Window(winw, winh, "pblang IDE — native (no web stack)");
+    let cwd0 = try env_get("PWD") catch ".";
+    if cwd0 == nil { cwd0 = "."; }
+    let state = map{
+        panel: "code",                                   // active toolbar tab
+        ed: E.new("fn add(a, b) {\n    return a + b;\n}\nprint add(2, 3);"),
+        shift: false, ctrl: false, find_mode: false, query: "",
+        rows: 40, path: "/tmp/pbide_buffer.sapp", last: "other",
+        tokens: nil, dirty: true, redraw: true,
+        mx: 0, my: 0, mdown: false, winsz: nil,
+        term: map{ cwd: cwd0, input: "", lines: ["pblang terminal — runs real PC commands (needs --allow-exec). Try: ls, pwd, cd .."] },
+        design: map{ tool: "button", widgets: [], sel: 0 - 1, drag: false, dx: 0, dy: 0, counter: 0 },
+        ai: map{ input: "", lines: ["pbAI — pblang's own assistant (no network, no Ollama). Type a question + Enter,", "or use a quick action above to run pbAI on the code in your editor."] },
+        web: map{ input: "example.com", url: "", title: "", scroll: 0, lines: ["pblang browser — type a URL + Enter to load. Up/Down scroll. Renders via stdlib/browser.sapp."] },
+        output: "ready · click to place cursor · drag to select · F5 run · F6 check · Ctrl+S/F"
+    };
+    gfx.run(win, state,
+        fn(s, events) {
+            let i = 0;
+            while i < len(events) {
+                let e = events[i];
+                if e.type == "keydown" {
+                    s.redraw = true;            // any keypress means the view may have changed
+                    if K.is_shift(e.key) { s.shift = true; }
+                    else if e.key == "LCtrl" or e.key == "RCtrl" { s.ctrl = true; }
+                    else if s.panel == "term" { _term_key(s, e.key, s.shift); }        // terminal owns its input line
+                    else if s.panel == "design" { _design_key(s, e.key, s.shift); }    // designer: edit/delete selected widget
+                    else if s.panel == "ai" { _ai_key(s, e.key, s.shift); }            // AI panel owns its question box
+                    else if s.panel == "web" { _web_key(s, e.key, s.shift); }          // browser owns its address bar
+                    else if s.panel == "code" { let st = _key(s, e.key); if st != "" { s.output = st; } }
+                }
+                if e.type == "keyup" {
+                    if K.is_shift(e.key) { s.shift = false; }
+                    if e.key == "LCtrl" or e.key == "RCtrl" { s.ctrl = false; }
+                }
+                // mousedown carries no coords (like gui.sapp) — use the tracked cursor.
+                if e.type == "mousemove" {
+                    s.mx = e.x; s.my = e.y;
+                    if s.mdown and s.panel == "code" { _mouse_place(s, e.x, e.y, true); s.redraw = true; }  // drag = extend selection
+                    if s.panel == "design" and s.design.drag and s.design.sel >= 0 {                       // drag = move widget
+                        let w = s.design.widgets[s.design.sel];
+                        w.x = e.x - s.design.dx; w.y = e.y - s.design.dy;
+                        s.redraw = true;
+                    }
+                }
+                if e.type == "mousedown" and (try e.button catch "Left") == "Left" {
+                    // Prefer the click's OWN coordinates (the host now attaches x/y to
+                    // mousedown); fall back to the tracked cursor only if absent. Using a
+                    // stale tracked position is what made tab clicks land on random tabs.
+                    let dx = try e.x catch s.mx;
+                    let dy = try e.y catch s.my;
+                    s.mx = dx; s.my = dy;
+                    let tab = _toolbar_hit(dx, dy);
+                    if tab != nil { s.panel = tab; s.redraw = true; }                  // click a tab → switch panel
+                    else {
+                        s.mdown = true;
+                        if s.panel == "code" { _mouse_place(s, dx, dy, false); }       // click = place caret
+                        else if s.panel == "design" { _design_click(s, dx, dy); }      // place/select a widget
+                        else if s.panel == "ai" { let act = _ai_hit(dx, dy); if act != nil { _ai_action(s, act); } }  // quick action
+                        s.redraw = true;
+                    }
+                }
+                if e.type == "mouseup" { s.mdown = false; s.design.drag = false; }
+                i = i + 1;
+            }
+        },
+        // Only repaint when something changed (idle frames are nearly free). The first
+        // frame draws because redraw starts true.
+        fn(s, w) { if s.redraw { _draw(s, w); s.redraw = false; } },
+        30);
+}
+main();
