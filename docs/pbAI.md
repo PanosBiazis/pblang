@@ -13,16 +13,23 @@
 ## 1. What pbAI is
 
 **pbAI** is a family of AI models that are **small, powerful, fast, smart, accurate,
-and efficient** — and, distinctively, **written in pblang itself**. pbAI is the
-language's own intelligence: a model you can run inside a pblang program, embed in
-the toolchain, and point at the language's own source to **make pblang better**.
+and efficient** — and, distinctively, **written in pblang itself** and **tool-driven
+through the pb-mcp-server**. pbAI is the language's own intelligence: a model you can
+run inside a pblang program, embed in the toolchain, and point at the language's own
+source to **make pblang better**.
+
+pbAI is an **agent, not just a text generator**: its hands are the **pb-mcp-server**
+tool catalog (code indexing/search, git, build/test/run, AI/reasoning, algorithms,
+and more — see [§7](#7-pb-mcp-server-tools)). It proposes; the tools observe and act on
+the real project, under the server's own capability gating.
 
 Its primary jobs:
 
 - **Coding** — generate, complete, and refactor pblang (and other) code.
 - **Debugging** — read a failing run, a stack trace, or a diff and propose a fix.
 - **And more** — code review, test synthesis, documentation, migration, semantic
-  search over the codebase, and self-improvement of pblang's own compiler/stdlib.
+  search over the codebase, and self-improvement of pblang's own compiler/stdlib —
+  all carried out by **calling pb-mcp-server tools** to index, search, run, and edit.
 
 pbAI is built to be **efficient first**: small enough to run locally and fast, while
 staying accurate enough to be trusted on real engineering tasks. It is the opposite
@@ -99,6 +106,23 @@ The tensor builtins above are exactly the kernels a decoder-only transformer nee
 for inference (embedding lookup → N×(attention via matmul+softmax+layer_norm) →
 projection → softmax/argmax sampling). pbAI's runtime is, at its core, a pblang
 program orchestrating these kernels.
+
+**Shipped today — pbAI's first working models (§65, §86, §87).**
+- `stdlib/nn.sapp` — a trainable MLP (learns XOR).
+- **`stdlib/pbai.sapp`** — pbAI's IDE **assistant**: a neural intent classifier (on `nn.sapp`)
+  plus pblang-grounded skills (explain / find-bugs / improve / comment / knowledge),
+  **no external model, no network**. It **backs the IDE 🤖 AI panel** via a pblang gateway
+  (`editors/ide/tools/ai/gateway.sapp`). Locked by `tests/semantics/pbai_test.sapp`.
+- **`stdlib/pbai_lm.sapp`** — pbAI's first **generative** model: a character-level neural
+  **language model** (embedding → tanh hidden → vocab logits → softmax), trained on
+  next-char prediction with **manual backprop** (the `tensor_*` kernels are forward-only),
+  generating autoregressively with the `tensor_argmax` kernel. It learns (cross-entropy
+  3.29 → 0.58 on a small pblang corpus) and generates coherent pblang
+  (`fn ` → `fn main() { let r; }`). Locked by `tests/semantics/pbai_lm_test.sapp`.
+
+These are the small end of the family — analysis **and** generation, all in pblang. The
+transformer scale-up (attention/more layers over the tensor kernels above, larger corpora,
+temperature sampling) is the roadmap below.
 
 ---
 

@@ -335,6 +335,12 @@ pub mod chunk {
         OpCloseUpvalue,
 
         OpCall(usize), // argc
+        // Tail call: like OpCall, but when the callee is a user closure and the
+        // current frame has no pending defers, the VM REUSES the current frame
+        // instead of pushing a new one (constant stack depth for tail recursion).
+        // Emitted by the compiler only in tail position (`return f(args)`), and
+        // always followed by OpReturn (used by the non-reuse fallback path).
+        OpTailCall(usize), // argc
         OpReturn,
         OpDefer, // pop closure from stack, register as defer for current frame (run on scope exit)
 

@@ -19,8 +19,9 @@
 use pblang_ir::BuiltinFn;
 
 use super::{
-    ai, arrays, atomics, crypto, db, encoding, env, ffi, fs, http, json, maps, math, memory, net,
-    os, parse, polyglot, predicates, quantum, re, runtime, spawn, strings, sync, tensor, time,
+    ai, arrays, atomics, bitwise, crypto, db, encoding, env, ffi, fs, http, json, maps, math,
+    memory, net, os, parse, polyglot, predicates, quantum, re, runtime, spawn, strings, sync,
+    tensor, time,
 };
 
 /// Construct the full builtin registration table.
@@ -78,6 +79,38 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         name: "num_pow",
         arity: Some(2),
         fun: math::num_pow,
+    },
+    // Bitwise (i64 semantics) — also reachable via the infix operators
+    // `& | ^ << >>` and the prefix `~`, which the parser desugars to these.
+    BuiltinFn {
+        name: "bit_and",
+        arity: Some(2),
+        fun: bitwise::bit_and,
+    },
+    BuiltinFn {
+        name: "bit_or",
+        arity: Some(2),
+        fun: bitwise::bit_or,
+    },
+    BuiltinFn {
+        name: "bit_xor",
+        arity: Some(2),
+        fun: bitwise::bit_xor,
+    },
+    BuiltinFn {
+        name: "bit_not",
+        arity: Some(1),
+        fun: bitwise::bit_not,
+    },
+    BuiltinFn {
+        name: "bit_shl",
+        arity: Some(2),
+        fun: bitwise::bit_shl,
+    },
+    BuiltinFn {
+        name: "bit_shr",
+        arity: Some(2),
+        fun: bitwise::bit_shr,
     },
     BuiltinFn {
         name: "num_ln",
@@ -166,6 +199,11 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         name: "map_has",
         arity: Some(2),
         fun: maps::map_has,
+    },
+    BuiltinFn {
+        name: "has_member",
+        arity: Some(2),
+        fun: maps::has_member,
     },
     BuiltinFn {
         name: "map_remove",

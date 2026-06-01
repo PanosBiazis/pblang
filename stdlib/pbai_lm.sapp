@@ -1,0 +1,283 @@
+// stdlib/pbai_lm.sapp — pbAI's GENERATIVE model: a character-level neural language
+// model, written entirely in pblang. The first step toward pbAI text generation
+// (docs/pbAI.md): tokenize → embed → hidden → vocab logits → sample.
+//
+// Architecture (a Bengio-style neural LM): the previous K characters are embedded
+// (E[V,D]), concatenated, run through a tanh hidden layer (W1,b1), then projected to
+// vocab logits (W2,b2) and softmax'd. Training is next-character prediction with
+// cross-entropy and MANUAL backprop — the VM's tensor_* kernels are forward-only (no
+// autograd), so the gradients are computed by hand here; the kernels accelerate the
+// inference/generation path (tensor_softmax / tensor_argmax over the logits).
+//
+//   let lm = import("stdlib/pbai_lm.sapp");
+//   let v  = lm.vocab_build(corpus);
+//   let m  = lm.model_new(v.size, 8, 24, 3, 1);
+//   lm.train(m, lm.encode(v, corpus), 30, 0.2);
+//   print lm.generate(m, v, "fn ", 40);
+//
+// Small by design (it runs in the interpreter); the transformer scale-up is the
+// roadmap. All pblang.
+
+// ── math helpers ─────────────────────────────────────────────────────────────────────
+fn _tanh(z) {
+    if z > 20 { return 1; }            // saturate to avoid num_exp overflow -> NaN
+    if z < 0 - 20 { return 0 - 1; }
+    let e2 = num_exp(2 * z);
+    return (e2 - 1) / (e2 + 1);
+}
+
+fn _rand(seed, a, b) {
+    let k = seed * 131 + a * 7 + b * 13 + 1;
+    return (num_mod(k * 2654435761, 100000) / 100000 - 0.5);   // ~[-0.5,0.5)
+}
+
+fn _zeros(n) { let v = []; let i = 0; while i < n { push(v, 0); i = i + 1; } return v; }
+fn _zeros2(rows, cols) { let m = []; let r = 0; while r < rows { push(m, _zeros(cols)); r = r + 1; } return m; }
+
+// ── vocabulary ───────────────────────────────────────────────────────────────────────
+fn vocab_build(text) {
+    let ch2id = map{};
+    let id2ch = [];
+    let size = 0;
+    let i = 0;
+    while i < len(text) {
+        let c = strcharcodeat(text, i);
+        let key = str(c);                 // map keys must be strings; id2ch keeps the code
+        if not map_has(ch2id, key) {
+            ch2id[key] = size;
+            push(id2ch, c);
+            size = size + 1;
+        }
+        i = i + 1;
+    }
+    return map{ ch2id: ch2id, id2ch: id2ch, size: size };
+}
+
+fn encode(vocab, text) {
+    let ids = [];
+    let i = 0;
+    while i < len(text) {
+        let key = str(strcharcodeat(text, i));
+        if map_has(vocab.ch2id, key) { push(ids, vocab.ch2id[key]); }
+        i = i + 1;
+    }
+    return ids;
+}
+
+// ── model ──────────────────────────────────────────────────────────────────────────
+// E[V][D], W1[K*D][H], b1[H], W2[H][V], b2[V].
+fn model_new(vsize, d, h, k, seed) {
+    let E = [];
+    let vi = 0;
+    while vi < vsize {
+        let row = [];
+        let di = 0;
+        while di < d { push(row, _rand(seed, vi, di)); di = di + 1; }
+        push(E, row);
+        vi = vi + 1;
+    }
+    let kd = k * d;
+    let W1 = [];
+    let ii = 0;
+    while ii < kd {
+        let row = [];
+        let hi = 0;
+        while hi < h { push(row, _rand(seed + 7, ii, hi) * 0.5); hi = hi + 1; }
+        push(W1, row);
+        ii = ii + 1;
+    }
+    let W2 = [];
+    let hi2 = 0;
+    while hi2 < h {
+        let row = [];
+        let vv = 0;
+        while vv < vsize { push(row, _rand(seed + 19, hi2, vv) * 0.5); vv = vv + 1; }
+        push(W2, row);
+        hi2 = hi2 + 1;
+    }
+    return map{ E: E, W1: W1, b1: _zeros(h), W2: W2, b2: _zeros(vsize),
+                V: vsize, D: d, H: h, K: k };
+}
+
+// forward(model, ctx) — ctx is an array of K char ids. Returns intermediates needed
+// for backprop: x (concat embeddings), a1 (hidden), p (softmax probs), logits.
+fn _forward(m, ctx) {
+    let x = [];
+    let k = 0;
+    while k < m.K {
+        let row = m.E[ctx[k]];
+        let d = 0;
+        while d < m.D { push(x, row[d]); d = d + 1; }
+        k = k + 1;
+    }
+    // hidden = tanh(x·W1 + b1)
+    let a1 = [];
+    let h = 0;
+    while h < m.H {
+        let z = m.b1[h];
+        let i = 0;
+        while i < len(x) { z = z + x[i] * m.W1[i][h]; i = i + 1; }
+        push(a1, _tanh(z));
+        h = h + 1;
+    }
+    // logits = a1·W2 + b2
+    let logits = [];
+    let v = 0;
+    while v < m.V {
+        let z = m.b2[v];
+        let h2 = 0;
+        while h2 < m.H { z = z + a1[h2] * m.W2[h2][v]; h2 = h2 + 1; }
+        push(logits, z);
+        v = v + 1;
+    }
+    // softmax
+    let mx = logits[0];
+    let vi = 1;
+    while vi < m.V { if logits[vi] > mx { mx = logits[vi]; } vi = vi + 1; }
+    let p = [];
+    let sum = 0;
+    let v2 = 0;
+    while v2 < m.V { let e = num_exp(logits[v2] - mx); push(p, e); sum = sum + e; v2 = v2 + 1; }
+    let v3 = 0;
+    while v3 < m.V { p[v3] = p[v3] / sum; v3 = v3 + 1; }
+    return map{ x: x, a1: a1, p: p, logits: logits };
+}
+
+// train_step — one SGD update on (ctx → target); returns the cross-entropy loss.
+fn train_step(m, ctx, target, lr) {
+    let f = _forward(m, ctx);
+    let p = f.p; let a1 = f.a1; let x = f.x;
+    let loss = 0 - num_ln(p[target] + 0.000000001);
+
+    // dlogits = p - onehot(target)
+    let dlog = [];
+    let v = 0;
+    while v < m.V { if v == target { push(dlog, p[v] - 1); } else { push(dlog, p[v]); } v = v + 1; }
+
+    // grads into W2/b2 and back to a1
+    let da1 = _zeros(m.H);
+    let h = 0;
+    while h < m.H {
+        let vv = 0;
+        while vv < m.V {
+            da1[h] = da1[h] + m.W2[h][vv] * dlog[vv];
+            m.W2[h][vv] = m.W2[h][vv] - lr * a1[h] * dlog[vv];
+            vv = vv + 1;
+        }
+        h = h + 1;
+    }
+    let vb = 0;
+    while vb < m.V { m.b2[vb] = m.b2[vb] - lr * dlog[vb]; vb = vb + 1; }
+
+    // through tanh: dz1 = da1 * (1 - a1^2)
+    let dz1 = [];
+    let h2 = 0;
+    while h2 < m.H { push(dz1, da1[h2] * (1 - a1[h2] * a1[h2])); h2 = h2 + 1; }
+
+    // grads into W1/b1 and back to x
+    let dx = _zeros(len(x));
+    let i = 0;
+    while i < len(x) {
+        let hh = 0;
+        while hh < m.H {
+            dx[i] = dx[i] + m.W1[i][hh] * dz1[hh];
+            m.W1[i][hh] = m.W1[i][hh] - lr * x[i] * dz1[hh];
+            hh = hh + 1;
+        }
+        i = i + 1;
+    }
+    let hb = 0;
+    while hb < m.H { m.b1[hb] = m.b1[hb] - lr * dz1[hb]; hb = hb + 1; }
+
+    // scatter dx back into the embedding rows
+    let k = 0;
+    while k < m.K {
+        let d = 0;
+        while d < m.D {
+            let cid = ctx[k];
+            m.E[cid][d] = m.E[cid][d] - lr * dx[k * m.D + d];
+            d = d + 1;
+        }
+        k = k + 1;
+    }
+    return loss;
+}
+
+// train(model, ids, epochs, lr) — slide a K-window over the id sequence; returns the
+// average loss of the final epoch (a learning signal: it should fall over epochs).
+fn train(m, ids, epochs, lr) {
+    let last = 0;
+    let e = 0;
+    while e < epochs {
+        let total = 0;
+        let n = 0;
+        let t = m.K;
+        while t < len(ids) {
+            let ctx = [];
+            let j = 0;
+            while j < m.K { push(ctx, ids[t - m.K + j]); j = j + 1; }
+            total = total + train_step(m, ctx, ids[t], lr);
+            n = n + 1;
+            t = t + 1;
+        }
+        if n > 0 { last = total / n; }
+        e = e + 1;
+    }
+    return last;
+}
+
+// avg_loss(model, ids) — mean cross-entropy over the sequence (no update).
+fn avg_loss(m, ids) {
+    let total = 0; let n = 0;
+    let t = m.K;
+    while t < len(ids) {
+        let ctx = [];
+        let j = 0;
+        while j < m.K { push(ctx, ids[t - m.K + j]); j = j + 1; }
+        let f = _forward(m, ctx);
+        total = total + (0 - num_ln(f.p[ids[t]] + 0.000000001));
+        n = n + 1;
+        t = t + 1;
+    }
+    if n > 0 { return total / n; }
+    return 0;
+}
+
+// next_id(model, ctx) — the most likely next token, chosen with the tensor_argmax
+// KERNEL over the model's logits (the inference path runs over the tensor builtins).
+fn next_id(m, ctx) {
+    let f = _forward(m, ctx);
+    let logits_t = map{ shape: [m.V], data: f.logits, dtype: "f32" };
+    return tensor_argmax(logits_t);     // native kernel
+}
+
+// generate(model, vocab, seed_text, n) — autoregressive greedy generation. Seeds the
+// context from the last K chars of seed_text and emits n more characters.
+fn generate(m, vocab, seed_text, n) {
+    let ids = encode(vocab, seed_text);
+    // pad/trim to a K-length context (pad with the first id if too short)
+    let ctx = [];
+    let start = len(ids) - m.K;
+    let j = 0;
+    while j < m.K {
+        let idx = start + j;
+        if idx < 0 { push(ctx, 0); } else { push(ctx, ids[idx]); }
+        j = j + 1;
+    }
+    let out = seed_text;
+    let step = 0;
+    while step < n {
+        let nid = next_id(m, ctx);
+        out = out + strfromcharcode(vocab.id2ch[nid]);
+        // shift the context window
+        let nc = [];
+        let s = 1;
+        while s < m.K { push(nc, ctx[s]); s = s + 1; }
+        push(nc, nid);
+        ctx = nc;
+        step = step + 1;
+    }
+    return out;
+}
+
+export vocab_build, encode, model_new, train_step, train, avg_loss, next_id, generate;

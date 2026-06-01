@@ -1,0 +1,319 @@
+// stdlib/browser.sapp — a minimal web browser ENGINE, written in pblang.
+//
+// The fetch-and-parse core of a browser, done entirely in pblang: it retrieves a page
+// over HTTP and extracts its title, readable text, and links by string-processing the
+// HTML. The IDE's Browser view (editors/ide/index.html) calls this through the pblang
+// gateway, so "the browser is written in pblang" all the way down to the page parsing.
+//
+//   let b = import("stdlib/browser.sapp");
+//   let page = b.fetch_page("http://example.com");
+//   print page.title;  print page.text;  print page.links;
+//
+// Rendering of sub-resources/scripts is the browser host's job; this module is the
+// engine (fetch + parse). All pblang.
+
+// fetch(url) — GET the raw page body, or nil on failure.
+fn fetch(url) {
+    return try http_get(url) catch nil;
+}
+
+// fetch_tor(url) — fetch THROUGH the Tor SOCKS5 proxy (127.0.0.1:9050) for anonymity.
+// Opt-in only (never the default). The SOCKS5 protocol is ready (stdlib/socks5.sapp);
+// the transport needs a plain `tcp_connect` builtin (the VM has tcp_listen/accept +
+// only tcp_connect_tls) and TLS-inside-SOCKS for https — see docs/Protocols.md. Until
+// those land this returns nil and the caller reports the requirement.
+fn fetch_tor(url) {
+    // let socks = import("stdlib/socks5.sapp");
+    // let s = tcp_connect("127.0.0.1:9050");            // <-- needs the tcp_connect builtin
+    // tcp_write(s, socks.greeting()); ... CONNECT host:port ... then speak HTTP over `s`.
+    return nil;
+}
+
+// title(html) — the contents of <title>…</title>, or "".
+fn title(html) {
+    let lo = str_lower(html);
+    let a = str_index_of(lo, "<title>");
+    if a < 0 { return ""; }
+    let b = str_index_of(lo, "</title>");
+    if b < 0 { return ""; }
+    return str_trim(str_slice(html, a + 7, b));
+}
+
+// _remove_block(html, tag) — delete every <tag …>…</tag> region (e.g. script, style),
+// so their contents don't leak into the reader text.
+fn _remove_block(html, tag) {
+    let open = "<" + tag;
+    let close = "</" + tag + ">";
+    let out = "";
+    let rest = html;
+    while true {
+        let lo = str_lower(rest);
+        let a = str_index_of(lo, open);
+        if a < 0 { return out + rest; }
+        out = out + str_slice(rest, 0, a);
+        let c = str_index_of(lo, close);
+        if c < 0 { return out; }
+        rest = str_slice(rest, c + len(close), len(rest));
+    }
+}
+
+// strip_tags(html) — readable text: drop script/style blocks, then everything between
+// '<' and '>'. (A reader view; the "rendering" pblang does without a layout engine.)
+fn strip_tags(html) {
+    html = _remove_block(_remove_block(html, "script"), "style");
+    let parts = str_split(html, "<");
+    let out = "";
+    let i = 0;
+    while i < len(parts) {
+        if i == 0 {
+            out = out + parts[i];
+        } else {
+            let gt = str_index_of(parts[i], ">");
+            if gt >= 0 { out = out + str_slice(parts[i], gt + 1, len(parts[i])); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// _hrefs(html, marker, quote) — targets for one href quoting style.
+fn _hrefs(html, marker, quote) {
+    let parts = str_split(html, marker);
+    let out = [];
+    let i = 1;
+    while i < len(parts) {
+        let q = str_index_of(parts[i], quote);
+        if q > 0 { push(out, str_slice(parts[i], 0, q)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// links(html) — every href target, in document order, for both " and ' quoting.
+fn links(html) {
+    let out = _hrefs(html, "href=\"", "\"");
+    let single = _hrefs(html, "href='", "'");
+    let i = 0;
+    while i < len(single) { push(out, single[i]); i = i + 1; }
+    return out;
+}
+
+// ── URL resolution (turn page-relative hrefs into absolute URLs) ──────────────────────
+fn _last_slash(s) {
+    let last = 0 - 1;
+    let i = 0;
+    while i < len(s) { if strcharcodeat(s, i) == 47 { last = i; } i = i + 1; }   // '/'=47
+    return last;
+}
+
+// _split_url(url) -> map{ scheme, host, path }.
+fn _split_url(url) {
+    let scheme = "http";
+    let rest = url;
+    let si = str_index_of(url, "://");
+    if si >= 0 { scheme = str_slice(url, 0, si); rest = str_slice(url, si + 3, len(url)); }
+    let slash = str_index_of(rest, "/");
+    if slash < 0 { return map{ scheme: scheme, host: rest, path: "/" }; }
+    return map{ scheme: scheme, host: str_slice(rest, 0, slash), path: str_slice(rest, slash, len(rest)) };
+}
+
+// resolve(base, href) — absolutize an href against the page URL (RFC-3986 essentials:
+// absolute, protocol-relative //, root-relative /path, and dotless relative paths).
+fn resolve(base, href) {
+    if href == "" { return base; }
+    if str_starts_with(href, "http://") or str_starts_with(href, "https://") { return href; }
+    if str_starts_with(href, "mailto:") or str_starts_with(href, "javascript:")
+        or str_starts_with(href, "data:") or str_starts_with(href, "#") or str_starts_with(href, "tel:") { return href; }
+    let b = _split_url(base);
+    if str_starts_with(href, "//") { return b.scheme + ":" + href; }
+    if str_starts_with(href, "/") { return b.scheme + "://" + b.host + href; }
+    let dir = b.path;
+    let li = _last_slash(dir);
+    if li >= 0 { dir = str_slice(dir, 0, li + 1); } else { dir = "/"; }
+    return b.scheme + "://" + b.host + dir + href;
+}
+
+// _page(url, body) — parse a fetched body into a structured page record (links
+// absolutized + forms extracted). Shared by fetch_page (GET) and submit (POST).
+fn _page(url, body) {
+    let raw = links(body);
+    let abs = [];
+    let i = 0;
+    while i < len(raw) {
+        let r = resolve(url, raw[i]);
+        if str_starts_with(r, "http") { push(abs, r); }   // only navigable web links
+        i = i + 1;
+    }
+    return map{
+        url: url, ok: true, status: 200,
+        title: title(body), text: strip_tags(body),
+        links: abs, forms: forms(url, body), html: body
+    };
+}
+
+// fetch_page(url, via_tor) — GET + parse into a page record. via_tor routes through Tor
+// (opt-in; defaults to false = direct connection).
+fn fetch_page(url, via_tor = false) {
+    let body = nil;
+    if via_tor { body = fetch_tor(url); } else { body = fetch(url); }
+    if body == nil {
+        let why = "could not fetch (network/DNS/blocked)";
+        if via_tor { why = "Tor route needs a tcp_connect builtin + SOCKS5/TLS (docs/Protocols.md)"; }
+        return map{ url: url, ok: false, status: 0, error: why, tor: via_tor };
+    }
+    let page = _page(url, body);
+    page.tor = via_tor;
+    return page;
+}
+
+// ── HTML attribute + form parsing ─────────────────────────────────────────────────────
+fn _attr(tag, name) {
+    let d = _attr_q(tag, name + "=\"", "\"");
+    if d != nil { return d; }
+    return _attr_q(tag, name + "='", "'");
+}
+fn _attr_q(tag, marker, quote) {
+    let idx = str_index_of(tag, marker);
+    if idx < 0 { return nil; }
+    let rest = str_slice(tag, idx + len(marker), len(tag));
+    let q = str_index_of(rest, quote);
+    if q < 0 { return nil; }
+    return str_slice(rest, 0, q);
+}
+
+// _form_fields(body) — the named <input>/<textarea> controls inside a form.
+fn _form_fields(body) {
+    let out = [];
+    let parts = str_split(body, "<input");
+    let i = 1;
+    while i < len(parts) {
+        let gt = str_index_of(parts[i], ">");
+        if gt >= 0 {
+            let tag = str_slice(parts[i], 0, gt);
+            let name = _attr(tag, "name");
+            if name != nil {
+                let typ = _attr(tag, "type"); if typ == nil { typ = "text"; }
+                let val = _attr(tag, "value"); if val == nil { val = ""; }
+                push(out, map{ name: name, type: typ, value: val });
+            }
+        }
+        i = i + 1;
+    }
+    let tparts = str_split(body, "<textarea");
+    i = 1;
+    while i < len(tparts) {
+        let gt = str_index_of(tparts[i], ">");
+        if gt >= 0 {
+            let tag = str_slice(tparts[i], 0, gt);
+            let name = _attr(tag, "name");
+            if name != nil { push(out, map{ name: name, type: "textarea", value: "" }); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// forms(page_url, html) — every <form> on the page: absolute action, method, fields.
+fn forms(page_url, html) {
+    let parts = str_split(html, "<form");
+    let out = [];
+    let i = 1;
+    while i < len(parts) {
+        let seg = parts[i];
+        let gt = str_index_of(seg, ">");
+        if gt >= 0 {
+            let tag = str_slice(seg, 0, gt);
+            let endf = str_index_of(seg, "</form>");
+            let fbody = "";
+            if endf >= 0 { fbody = str_slice(seg, gt + 1, endf); }
+            let action = _attr(tag, "action"); if action == nil { action = ""; }
+            let method = _attr(tag, "method"); if method == nil { method = "get"; }
+            let act_url = page_url;
+            if action != "" { act_url = resolve(page_url, action); }
+            push(out, map{ action: act_url, method: str_lower(method), fields: _form_fields(fbody) });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── form encoding (application/x-www-form-urlencoded) ─────────────────────────────────
+let _UHEX = "0123456789ABCDEF";
+fn _is_unreserved(c) {
+    if c >= 65 and c <= 90 { return true; }
+    if c >= 97 and c <= 122 { return true; }
+    if c >= 48 and c <= 57 { return true; }
+    return c == 45 or c == 95 or c == 46 or c == 126;        // - _ . ~
+}
+fn _pe_byte(v) {
+    let hi = (v - num_mod(v, 16)) / 16;
+    return "%" + strfromcharcode(strcharcodeat(_UHEX, hi)) + strfromcharcode(strcharcodeat(_UHEX, num_mod(v, 16)));
+}
+// UTF-8 encode a code point to a byte array (so non-ASCII form values encode correctly).
+fn _utf8(cp) {
+    let b = [];
+    if cp < 128 { push(b, cp); }
+    else if cp < 2048 {
+        push(b, bit_or(192, (cp - num_mod(cp, 64)) / 64));
+        push(b, bit_or(128, num_mod(cp, 64)));
+    } else if cp < 65536 {
+        push(b, bit_or(224, (cp - num_mod(cp, 4096)) / 4096));
+        push(b, bit_or(128, num_mod((cp - num_mod(cp, 64)) / 64, 64)));
+        push(b, bit_or(128, num_mod(cp, 64)));
+    } else {
+        push(b, bit_or(240, (cp - num_mod(cp, 262144)) / 262144));
+        push(b, bit_or(128, num_mod((cp - num_mod(cp, 4096)) / 4096, 64)));
+        push(b, bit_or(128, num_mod((cp - num_mod(cp, 64)) / 64, 64)));
+        push(b, bit_or(128, num_mod(cp, 64)));
+    }
+    return b;
+}
+fn percent_encode(s) {
+    let out = "";
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        if _is_unreserved(c) { out = out + strfromcharcode(c); }
+        else if c == 32 { out = out + "+"; }                 // form space -> +
+        else {
+            let bytes = _utf8(c);
+            let j = 0;
+            while j < len(bytes) { out = out + _pe_byte(bytes[j]); j = j + 1; }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+fn urlencode(fields) {
+    let ks = map_keys(fields);
+    let out = "";
+    let i = 0;
+    while i < len(ks) {
+        if i > 0 { out = out + "&"; }
+        out = out + percent_encode(ks[i]) + "=" + percent_encode(str(fields[ks[i]]));
+        i = i + 1;
+    }
+    return out;
+}
+
+// submit(action_url, method, fields) — submit a form. GET appends the encoded fields as
+// a query string; POST sends them as an x-www-form-urlencoded body. Returns a page record.
+// (The encoded body IS x-www-form-urlencoded; setting that Content-Type needs the 3-arg
+// http_post — present in the VM source; the running binary here takes url+body only.)
+fn submit(action_url, method, fields, via_tor = false) {
+    let body = urlencode(fields);
+    if str_lower(method) == "post" {
+        if via_tor { return map{ url: action_url, ok: false, status: 0, error: "Tor POST needs a tcp_connect builtin (docs/Protocols.md)", tor: true }; }
+        let resp = try http_post(action_url, body) catch nil;
+        if resp == nil { return map{ url: action_url, ok: false, status: 0, error: "POST failed" }; }
+        let page = _page(action_url, resp);
+        page.tor = false;
+        return page;
+    }
+    let geturl = action_url;
+    if body != "" { geturl = action_url + "?" + body; }
+    return fetch_page(geturl, via_tor);
+}
+
+export fetch, title, strip_tags, links, resolve, fetch_page;
+export forms, percent_encode, urlencode, submit;

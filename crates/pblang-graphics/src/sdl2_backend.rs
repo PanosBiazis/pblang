@@ -259,13 +259,15 @@ impl Sdl2Window {
                     out.push(alloc_map(m));
                     self.last_mouse = Some((x as f32, y as f32));
                 }
-                Event::MouseButtonDown { mouse_btn, .. } => {
+                Event::MouseButtonDown { mouse_btn, x, y, .. } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("mousedown"));
                     m.insert(
                         "button".into(),
                         alloc_string(format!("{:?}", mouse_btn).replace("MouseButton::", "")),
                     );
+                    m.insert("x".into(), Value::Number(x as f64));
+                    m.insert("y".into(), Value::Number(y as f64));
                     out.push(alloc_map(m));
                     if mouse_btn == SdlMouseButton::Left {
                         self.last_left = true;
@@ -274,13 +276,15 @@ impl Sdl2Window {
                         self.last_right = true;
                     }
                 }
-                Event::MouseButtonUp { mouse_btn, .. } => {
+                Event::MouseButtonUp { mouse_btn, x, y, .. } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("mouseup"));
                     m.insert(
                         "button".into(),
                         alloc_string(format!("{:?}", mouse_btn).replace("MouseButton::", "")),
                     );
+                    m.insert("x".into(), Value::Number(x as f64));
+                    m.insert("y".into(), Value::Number(y as f64));
                     out.push(alloc_map(m));
                     if mouse_btn == SdlMouseButton::Left {
                         self.last_left = false;

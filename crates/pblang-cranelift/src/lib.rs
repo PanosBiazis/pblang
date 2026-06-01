@@ -346,7 +346,7 @@ impl Default for JitCache {
 /// Returns `Ok(())` if `chunk` can be JIT-compiled (only numeric fast-path ops),
 /// or `Err(reason)` explaining why not.
 pub fn is_jit_eligible(chunk: &Chunk) -> Result<(), &'static str> {
-    for op in &chunk.instructions {
+    for (idx, op) in chunk.instructions.iter().enumerate() {
         match op {
             // Allowed: arithmetic
             OpCode::OpAdd | OpCode::OpSub | OpCode::OpMul | OpCode::OpDiv => {}
@@ -363,15 +363,24 @@ pub fn is_jit_eligible(chunk: &Chunk) -> Result<(), &'static str> {
             OpCode::OpGetLocal(_) | OpCode::OpSetLocal(_) => {}
             // Allowed: constants (must be numeric — checked separately)
             OpCode::OpConstant(_) => {}
-            // Allowed: control flow
-            OpCode::OpJump(_)
-            | OpCode::OpJumpIfFalse(_)
-            | OpCode::OpJumpIfTrue(_)
-            | OpCode::OpReturn => {}
-            // Allowed: call (may be self-recursive; validated during codegen)
-            OpCode::OpCall(_) => {}
-            // Allowed: globals (for self-recursive function lookup)
-            OpCode::OpGetGlobal(_) => {}
+            // Allowed: FORWARD control flow only. A backward jump is a loop back-edge,
+            // which the current SSA construction can't seal correctly (it panics in
+            // cranelift-frontend) — reject loops so they stay on the interpreter.
+            OpCode::OpJump(target)
+            | OpCode::OpJumpIfFalse(target)
+            | OpCode::OpJumpIfTrue(target) => {
+                if *target <= idx {
+                    return Err("backward jump (loop) not JIT-able");
+                }
+            }
+            OpCode::OpReturn => {}
+            // Rejected: calls — the prototype's call/recursion codegen panics in
+            // cranelift SSA construction; keep called functions on the interpreter.
+            OpCode::OpCall(_) => return Err("call not JIT-able (codegen incomplete)"),
+            // Tail calls reuse the interpreter's frame-reuse path; not JIT-able.
+            OpCode::OpTailCall(_) => return Err("tail call not JIT-able"),
+            // Rejected: global reads were only for self-recursive lookup (calls).
+            OpCode::OpGetGlobal(_) => return Err("global read not JIT-able (codegen incomplete)"),
             // Allowed: pop, not, print
             OpCode::OpPop | OpCode::OpNot | OpCode::OpPrint => {}
             // Rejected: everything else
@@ -595,6 +604,13 @@ fn build_cranelift_fn(
             builder.seal_block(cl_blocks[current_block_idx]);
             virtual_stack.clear();
             name_stack.clear(); // clear parallel name tracking on block transition
+        }
+
+        // Skip unreachable instructions inside an already-terminated block — e.g. the
+        // compiler's implicit `return nil` that trails an explicit `return`. Emitting
+        // into a filled block panics in cranelift ("block already filled").
+        if terminated_blocks.contains(&current_block_idx) {
+            continue;
         }
 
         match op {

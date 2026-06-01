@@ -1,0 +1,113 @@
+// stdlib/kernel/heap.sapp — a GC-free FREE-LIST allocator, written in pblang.
+//
+// Improves on the §69 bump allocator (whose `kfree` is a no-op): here `heap_free`
+// actually reclaims memory, so a long-running kernel can alloc/free indefinitely
+// without exhausting the heap — the real memory model a kernel needs. First-fit with
+// block splitting and a LIFO free list. Each block carries an 8-byte header:
+//   word0 = total block size (header + payload),  word1 = next-free pointer (0 = end).
+// The free-list head lives in a caller-provided 4-byte `ctrl` cell (threaded
+// explicitly — the transpiler has no globals, and this also makes the allocator
+// reentrant: independent arenas just use independent ctrl cells).
+//
+// Written in the freestanding-transpilable subset (numbers, while/if, poke32/peek32,
+// bitwise) — lower it with `transpile_kernel_int` so the whole thing is float-free.
+//
+//   fn kmain() {
+//     let ctrl   = kmalloc(8);        // free-list head cell
+//     let region = kmalloc(65536);    // arena backing store
+//     heap_init(ctrl, region, 65536);
+//     let p = heap_alloc(ctrl, 128);  // -> payload address (or 0 if OOM)
+//     heap_free(ctrl, p);             // reclaim — a later alloc can reuse it
+//   }
+//
+// Implemented entirely in pblang.
+
+// Round x up to the next multiple of 8 (block alignment). Bitwise so it's integer in
+// any codegen mode: clear the low 3 bits of (x + 7).
+fn _align8(x) { return bit_and(x + 7, bit_not(7)); }
+
+// heap_init(ctrl, base, size) — one free block covering [base, base+size); head=base.
+fn heap_init(ctrl, base, size) {
+    poke32(base, size);          // block total size
+    poke32(base + 4, 0);         // next free = none
+    poke32(ctrl, base);          // free-list head
+}
+
+// heap_alloc(ctrl, n) — first-fit over the free list; split the chosen block when the
+// remainder is big enough to hold another header (>= 16 bytes). Returns the payload
+// address (block + 8), or 0 if no block fits (out of memory).
+fn heap_alloc(ctrl, n) {
+    let need = _align8(n + 8);    // header + payload, 8-aligned
+    let prev = 0;
+    let cur = peek32(ctrl);
+    while cur > 0 {
+        let bsize = peek32(cur);
+        if bsize >= need {
+            let nxt = peek32(cur + 4);
+            if bsize - need >= 16 {
+                // Split: carve a new free block from the tail; it replaces `cur` in
+                // the free list (cur is about to be handed out).
+                let rest = cur + need;
+                poke32(rest, bsize - need);
+                poke32(rest + 4, nxt);
+                poke32(cur, need);
+                nxt = rest;
+            }
+            // Unlink the allocated block (relink to `nxt` — the split remainder, or
+            // the original successor if no split).
+            if prev == 0 { poke32(ctrl, nxt); }
+            else { poke32(prev + 4, nxt); }
+            return cur + 8;
+        }
+        prev = cur;
+        cur = peek32(cur + 4);
+    }
+    return 0;
+}
+
+// heap_free(ctrl, p) — return the block (header at p-8) to the free list, keeping the
+// list ADDRESS-ORDERED and COALESCING with physically-adjacent free neighbours. Two
+// blocks that become free side by side merge into one, so repeated alloc/free cycles
+// don't fragment the heap into unusable slivers — a later large request can still be
+// satisfied. (Forward merge with the successor, then backward merge with the
+// predecessor.)
+fn heap_free(ctrl, p) {
+    let block = p - 8;
+    let bsize = peek32(block);
+    // walk to the insertion point: prev < block <= cur (address order)
+    let prev = 0;
+    let cur = peek32(ctrl);
+    while cur > 0 {
+        if cur >= block { cur = 0 - 1; }     // sentinel: stop, keep prev/the real cur
+        else { prev = cur; cur = peek32(cur + 4); }
+    }
+    // recover the real successor (the loop above clobbered `cur` to stop)
+    let nxt = 0;
+    if prev == 0 { nxt = peek32(ctrl); }
+    else { nxt = peek32(prev + 4); }
+    // forward-merge: if `block` ends exactly where `nxt` begins, absorb `nxt`
+    if nxt > 0 {
+        if block + bsize == nxt {
+            bsize = bsize + peek32(nxt);
+            poke32(block, bsize);
+            poke32(block + 4, peek32(nxt + 4));
+        } else {
+            poke32(block + 4, nxt);
+        }
+    } else {
+        poke32(block + 4, 0);
+    }
+    // backward-merge: if `prev` ends exactly where `block` begins, absorb `block`
+    if prev > 0 {
+        if prev + peek32(prev) == block {
+            poke32(prev, peek32(prev) + bsize);
+            poke32(prev + 4, peek32(block + 4));
+        } else {
+            poke32(prev + 4, block);
+        }
+    } else {
+        poke32(ctrl, block);
+    }
+}
+
+export _align8, heap_init, heap_alloc, heap_free;

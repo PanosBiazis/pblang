@@ -36,6 +36,7 @@ use rusqlite::Connection;
 mod ai;
 mod arrays;
 mod atomics;
+mod bitwise;
 mod builtins_table;
 mod crypto;
 mod db;
@@ -511,7 +512,30 @@ pub struct VM {
     /// `os_signal_poll()` / `os_signal_pending()` and call the handler from
     /// regular bytecode context (see `stdlib/signal.sapp`).
     signal_handlers: Rc<RefCell<HashMap<String, Value>>>,
+    /// Cranelift JIT for numeric functions (opt-in via the `PBLANG_JIT` env var). Hot,
+    /// eligible functions (numeric arithmetic/loops/recursion) are compiled to native
+    /// code; anything else falls back to the bytecode interpreter. Off by default.
+    jit: Option<pblang_cranelift::JitCache>,
+    jit_state: HashMap<usize, JitSlot>,
+    jit_enabled: bool,
 }
+
+/// Per-function JIT status, keyed by the function's `Rc` pointer in `VM::jit_state`.
+#[derive(Clone, Copy)]
+enum JitStatus {
+    Unknown,
+    Compiled,
+    Ineligible,
+}
+struct JitSlot {
+    count: u32,
+    status: JitStatus,
+    func: Option<pblang_cranelift::JitFn>,
+}
+
+/// Compile a function after it has been called this many times (amortizes the Cranelift
+/// compile cost over a hot function's many invocations).
+const JIT_THRESHOLD: u32 = 8;
 
 // `GcMarks` moved to vm/gc.rs alongside the mark-and-sweep methods.
 
@@ -902,6 +926,9 @@ impl VM {
             handle_registry: VmHandleRegistry::new(),
             stdin_lines: std::collections::VecDeque::new(),
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
+            jit: None,
+            jit_state: HashMap::new(),
+            jit_enabled: std::env::var("PBLANG_JIT").map(|v| v != "0").unwrap_or(false),
         }
     }
 
@@ -961,6 +988,9 @@ impl VM {
             handle_registry: VmHandleRegistry::new(),
             stdin_lines: std::collections::VecDeque::new(),
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
+            jit: None,
+            jit_state: HashMap::new(),
+            jit_enabled: std::env::var("PBLANG_JIT").map(|v| v != "0").unwrap_or(false),
         }
     }
 
@@ -994,6 +1024,9 @@ impl VM {
             ffi_policy: None,
             stdin_lines: std::collections::VecDeque::new(),
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
+            jit: None,
+            jit_state: HashMap::new(),
+            jit_enabled: std::env::var("PBLANG_JIT").map(|v| v != "0").unwrap_or(false),
         }
     }
 
@@ -1106,48 +1139,95 @@ impl VM {
                     // Arithmetic routes through `Value::arith`, which keeps the
                     // unboxed f64 fast path but transparently switches to
                     // arbitrary-precision `BigInt` when an operand is a bigint.
+                    // Each binary arithmetic op keeps the unboxed fast path; on a
+                    // type failure it falls back to operator overloading
+                    // (`a.__op__(a, b)`) before surfacing the error, so user types
+                    // (vectors, matrices, complex, money) use natural `+ - * /`
+                    // at zero cost to numeric code.
                     OpCode::OpAdd => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.arith(&b, ArithOp::Add).map_err(|m| self.err(m))?;
-                        self.stack.push(v);
+                        match a.arith(&b, ArithOp::Add) {
+                            Ok(v) => self.stack.push(v),
+                            Err(m) => {
+                                if !self.try_binary_overload(a, b, "__add__", "__radd__")? {
+                                    return Err(self.err(m));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpSub => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.arith(&b, ArithOp::Sub).map_err(|m| self.err(m))?;
-                        self.stack.push(v);
+                        match a.arith(&b, ArithOp::Sub) {
+                            Ok(v) => self.stack.push(v),
+                            Err(m) => {
+                                if !self.try_binary_overload(a, b, "__sub__", "__rsub__")? {
+                                    return Err(self.err(m));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpMul => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.arith(&b, ArithOp::Mul).map_err(|m| self.err(m))?;
-                        self.stack.push(v);
+                        match a.arith(&b, ArithOp::Mul) {
+                            Ok(v) => self.stack.push(v),
+                            Err(m) => {
+                                if !self.try_binary_overload(a, b, "__mul__", "__rmul__")? {
+                                    return Err(self.err(m));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpDiv => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.arith(&b, ArithOp::Div).map_err(|m| self.err(m))?;
-                        self.stack.push(v);
+                        match a.arith(&b, ArithOp::Div) {
+                            Ok(v) => self.stack.push(v),
+                            Err(m) => {
+                                if !self.try_binary_overload(a, b, "__div__", "__rdiv__")? {
+                                    return Err(self.err(m));
+                                }
+                            }
+                        }
                     }
 
                     // ---- extended arithmetic ----
                     OpCode::OpNegate => {
                         let a = self.pop()?;
-                        let v = a.negate().map_err(|m| self.err(m))?;
-                        self.stack.push(v);
+                        match a.negate() {
+                            Ok(v) => self.stack.push(v),
+                            Err(m) => {
+                                if !self.try_unary_overload(a, "__neg__")? {
+                                    return Err(self.err(m));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpMod => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.arith(&b, ArithOp::Mod).map_err(|m| self.err(m))?;
-                        self.stack.push(v);
+                        match a.arith(&b, ArithOp::Mod) {
+                            Ok(v) => self.stack.push(v),
+                            Err(m) => {
+                                if !self.try_binary_overload(a, b, "__mod__", "__rmod__")? {
+                                    return Err(self.err(m));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpPow => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let v = a.arith(&b, ArithOp::Pow).map_err(|m| self.err(m))?;
-                        self.stack.push(v);
+                        match a.arith(&b, ArithOp::Pow) {
+                            Ok(v) => self.stack.push(v),
+                            Err(m) => {
+                                if !self.try_binary_overload(a, b, "__pow__", "__rpow__")? {
+                                    return Err(self.err(m));
+                                }
+                            }
+                        }
                     }
 
                     // ---- logic ----
@@ -1353,50 +1433,86 @@ impl VM {
                     }
 
                     // ---- comparisons ----
+                    // Equality is structural by default and never errors, so
+                    // overloading is opt-in by *presence*: dispatch `__eq__` only
+                    // when an operand defines it, otherwise native `==`.
                     OpCode::OpEq => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        self.stack.push(Value::Bool(a == b));
+                        // Cheap guard keeps numeric/string equality on the pure
+                        // native path; only map operands can carry `__eq__`.
+                        let maybe_overload = matches!(a, Value::Map(_)) || matches!(b, Value::Map(_));
+                        if !maybe_overload || !self.try_compare_overload(&a, &b, "__eq__", "__eq__")? {
+                            self.stack.push(Value::Bool(a == b));
+                        }
                     }
                     OpCode::OpNotEq => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        self.stack.push(Value::Bool(a != b));
+                        let maybe_overload = matches!(a, Value::Map(_)) || matches!(b, Value::Map(_));
+                        if !maybe_overload || !self.try_compare_overload(&a, &b, "__ne__", "__ne__")? {
+                            self.stack.push(Value::Bool(a != b));
+                        }
                     }
-                    // Ordering routes through `Value::num_cmp` (bigint-aware).
+                    // Ordering routes through `Value::num_cmp` (bigint-aware); when
+                    // it returns `None` (operands not numerically comparable) fall
+                    // back to a comparison overload before erroring. Reflected
+                    // dunder is the mirror operator (a > b ⟺ b < a).
                     OpCode::OpGt => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let ord = a
-                            .num_cmp(&b)
-                            .ok_or_else(|| self.err("comparison expects numbers"))?;
-                        self.stack.push(Value::Bool(ord == std::cmp::Ordering::Greater));
+                        match a.num_cmp(&b) {
+                            Some(ord) => self
+                                .stack
+                                .push(Value::Bool(ord == std::cmp::Ordering::Greater)),
+                            None => {
+                                if !self.try_compare_overload(&a, &b, "__gt__", "__lt__")? {
+                                    return Err(self.err("comparison expects numbers"));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpGe => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let ord = a
-                            .num_cmp(&b)
-                            .ok_or_else(|| self.err("comparison expects numbers"))?;
-                        self.stack
-                            .push(Value::Bool(ord != std::cmp::Ordering::Less));
+                        match a.num_cmp(&b) {
+                            Some(ord) => self
+                                .stack
+                                .push(Value::Bool(ord != std::cmp::Ordering::Less)),
+                            None => {
+                                if !self.try_compare_overload(&a, &b, "__ge__", "__le__")? {
+                                    return Err(self.err("comparison expects numbers"));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpLt => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let ord = a
-                            .num_cmp(&b)
-                            .ok_or_else(|| self.err("comparison expects numbers"))?;
-                        self.stack.push(Value::Bool(ord == std::cmp::Ordering::Less));
+                        match a.num_cmp(&b) {
+                            Some(ord) => self
+                                .stack
+                                .push(Value::Bool(ord == std::cmp::Ordering::Less)),
+                            None => {
+                                if !self.try_compare_overload(&a, &b, "__lt__", "__gt__")? {
+                                    return Err(self.err("comparison expects numbers"));
+                                }
+                            }
+                        }
                     }
                     OpCode::OpLe => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let ord = a
-                            .num_cmp(&b)
-                            .ok_or_else(|| self.err("comparison expects numbers"))?;
-                        self.stack
-                            .push(Value::Bool(ord != std::cmp::Ordering::Greater));
+                        match a.num_cmp(&b) {
+                            Some(ord) => self
+                                .stack
+                                .push(Value::Bool(ord != std::cmp::Ordering::Greater)),
+                            None => {
+                                if !self.try_compare_overload(&a, &b, "__le__", "__ge__")? {
+                                    return Err(self.err("comparison expects numbers"));
+                                }
+                            }
+                        }
                     }
 
                     // ---- stack / io ----
@@ -1848,6 +1964,8 @@ impl VM {
 
                     OpCode::OpCall(argc) => self.call_top(argc)?,
 
+                    OpCode::OpTailCall(argc) => self.do_tail_call(argc)?,
+
                     OpCode::OpReturn => self.do_return()?,
 
                     OpCode::OpDefer => {
@@ -1985,6 +2103,193 @@ impl VM {
         Ok(&frame.closure.function.chunk)
     }
 
+    /// Tail call (`OpTailCall`). When the callee is a user closure/function and
+    /// the current frame has no pending defers, REUSE the current frame instead
+    /// of pushing a new one — so tail recursion runs in constant stack depth.
+    /// Every other case (builtin, callable map, frame with defers) falls back to
+    /// a normal `call_top`; the compiler always emits an `OpReturn` after the
+    /// `OpTailCall`, so that fallback returns correctly (the reuse path jumps to
+    /// `ip = 0`, skipping that trailing return).
+    fn do_tail_call(&mut self, argc: usize) -> Result<(), RuntimeError> {
+        let callee_index = match self.stack.len().checked_sub(argc + 1) {
+            Some(i) => i,
+            None => return self.call_top(argc),
+        };
+
+        // Only direct user closures/functions are frame-reusable, and only when
+        // the current frame has nothing that must run on its return (defers /
+        // defer-thunk). Anything else: behave exactly like a normal call and let
+        // the trailing OpReturn finish the job.
+        let reusable = matches!(
+            self.stack[callee_index],
+            Value::Closure(_) | Value::Function(_)
+        );
+        let frame_clean = self
+            .frames
+            .last()
+            .map(|f| f.defers.is_empty() && !f.is_defer_thunk)
+            .unwrap_or(false);
+        if !(reusable && frame_clean) {
+            return self.call_top(argc);
+        }
+
+        let old_base = self
+            .frames
+            .last()
+            .expect("frame_clean implies a current frame")
+            .stack_base;
+
+        // Let call_top do all the arity / defaults / vararg normalization and
+        // push a fresh frame for the callee (exactly one, since the callee is a
+        // closure/function — not a builtin or map). Then collapse that frame
+        // down onto the current one, dropping the old frame.
+        self.call_top(argc)?;
+        let mut new_frame = self
+            .frames
+            .pop()
+            .expect("call_top on a closure pushes exactly one frame");
+        let new_base = new_frame.stack_base;
+
+        // Close upvalues captured from the OLD frame's locals before we overwrite
+        // them. The freshly-placed callee+args (at new_base..) hold no open
+        // upvalues yet (the new function hasn't run), so this only closes the
+        // discarded frame's captures.
+        self.close_upvalues_from(old_base + 1);
+
+        // Shift [new_base .. top] (new callee + normalized args) down to old_base.
+        // old_base <= new_base, so a forward copy never clobbers an unread source.
+        let n = self.stack.len() - new_base;
+        for i in 0..n {
+            self.stack[old_base + i] = self.stack[new_base + i].clone();
+        }
+        self.stack.truncate(old_base + n);
+
+        // Replace the old frame with the rebased new frame (ip already 0, defers
+        // empty, module_result None — fresh from call_top).
+        new_frame.stack_base = old_base;
+        new_frame.ip = 0;
+        *self
+            .frames
+            .last_mut()
+            .expect("old frame is still present after popping the new one") = new_frame;
+        Ok(())
+    }
+
+    /// Operator overloading — look up a dunder method (`__add__`, `__neg__`, …)
+    /// on a map value or anywhere up its `__class` table chain, returning the
+    /// method value if present. Mirrors `has_member`'s walk but yields the value
+    /// so the caller can invoke it. Associated fn (no `&self`) to keep borrows
+    /// clean at the call site. Depth-bounded (32) against cycles.
+    fn lookup_member_value(val: &Value, name: &str) -> Option<Value> {
+        let mut cur = match val {
+            Value::Map(m) => m.clone(),
+            _ => return None,
+        };
+        for _ in 0..32 {
+            let (found, parent) = {
+                let b = cur.borrow();
+                let found = b.get(name).cloned();
+                let parent = match b.get("__class") {
+                    Some(Value::Map(p)) => Some(p.clone()),
+                    _ => None,
+                };
+                (found, parent)
+            };
+            if found.is_some() {
+                return found;
+            }
+            match parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        None
+    }
+
+    /// Slow-path binary operator overloading. Called only AFTER native `arith`
+    /// fails (so numeric/string/bigint fast paths pay nothing).
+    ///
+    /// Forward dispatch: if the LEFT operand carries `dunder` (a method
+    /// `fn(self, other)`), call `a.dunder(a, b)`. Otherwise **reflected**
+    /// dispatch (Python-style): if the RIGHT operand carries `rdunder`, call
+    /// `b.rdunder(b, a)`. Reflection makes `scalar * vec` work via `__rmul__`
+    /// and — because unary `-x` desugars to `0 - x` — makes `-vec` work via
+    /// `__rsub__`. The call is set up through `call_top`; the main loop then runs
+    /// the method and its return value lands where the arithmetic result would
+    /// have. Returns `true` if a method was dispatched, `false` if neither
+    /// operand overloads it (caller then surfaces the original arithmetic error).
+    fn try_binary_overload(
+        &mut self,
+        a: Value,
+        b: Value,
+        dunder: &str,
+        rdunder: &str,
+    ) -> Result<bool, RuntimeError> {
+        if let Some(method) = Self::lookup_member_value(&a, dunder) {
+            self.stack.push(method);
+            self.stack.push(a);
+            self.stack.push(b);
+            self.call_top(2)?;
+            Ok(true)
+        } else if let Some(method) = Self::lookup_member_value(&b, rdunder) {
+            self.stack.push(method);
+            self.stack.push(b);
+            self.stack.push(a);
+            self.call_top(2)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Slow-path unary operator overloading (`-x` → `x.__neg__(x)`). Same
+    /// contract as `try_binary_overload` but with one argument.
+    fn try_unary_overload(&mut self, a: Value, dunder: &str) -> Result<bool, RuntimeError> {
+        if let Some(method) = Self::lookup_member_value(&a, dunder) {
+            self.stack.push(method);
+            self.stack.push(a);
+            self.call_top(1)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Comparison operator overloading (`==`, `!=`, `<`, `>`, `<=`, `>=`). Takes
+    /// the operands by reference so callers can still run the native comparison
+    /// when no overload exists. Forward dispatch `a.dunder(a, b)`, else reflected
+    /// `b.rdunder(b, a)` — where the reflected dunder is the *mirror* operator
+    /// (`a > b` ⟺ `b < a`, so Gt reflects through `__lt__`). Every comparison
+    /// dunder returns the final bool directly (the `call_top` mechanism can't
+    /// post-process a method's result), so defining `__lt__`, `__le__`, `__eq__`,
+    /// `__ne__` yields all six operators via reflection. Returns `true` if a
+    /// method was dispatched. Used as a pre-check for `==`/`!=` (which never error
+    /// natively, so opt-in by presence) and as the `None`-path fallback for
+    /// ordering.
+    fn try_compare_overload(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        dunder: &str,
+        rdunder: &str,
+    ) -> Result<bool, RuntimeError> {
+        if let Some(method) = Self::lookup_member_value(a, dunder) {
+            self.stack.push(method);
+            self.stack.push(a.clone());
+            self.stack.push(b.clone());
+            self.call_top(2)?;
+            Ok(true)
+        } else if let Some(method) = Self::lookup_member_value(b, rdunder) {
+            self.stack.push(method);
+            self.stack.push(b.clone());
+            self.stack.push(a.clone());
+            self.call_top(2)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn call_top(&mut self, argc: usize) -> Result<(), RuntimeError> {
         let callee_index = self
             .stack
@@ -2094,6 +2399,76 @@ impl VM {
             let vararg_arr = alloc_array(vararg_vals);
             // Push the vararg array as the last parameter
             self.stack.push(vararg_arr);
+        }
+
+        // ── JIT fast path: hot, eligible, all-numeric, non-vararg calls ──────────────
+        // Compile once a function is hot; thereafter run it natively. Any miss (not
+        // eligible, not yet hot, non-numeric arg, or call_jit decline) falls straight
+        // through to the bytecode interpreter below — so behaviour is unchanged.
+        if self.jit_enabled && !is_vararg {
+            let ptr = Rc::as_ptr(&closure_rc.function) as usize;
+            let args_start = callee_index + 1;
+            if self.stack.len() == args_start + arity {
+                let mut numeric = true;
+                for v in &self.stack[args_start..args_start + arity] {
+                    if !matches!(v, Value::Number(_) | Value::Bool(_)) {
+                        numeric = false;
+                        break;
+                    }
+                }
+                if numeric {
+                    let (cached_fp, should_compile) = {
+                        let slot = self.jit_state.entry(ptr).or_insert(JitSlot {
+                            count: 0,
+                            status: JitStatus::Unknown,
+                            func: None,
+                        });
+                        match slot.status {
+                            JitStatus::Compiled => (slot.func, false),
+                            JitStatus::Ineligible => (None, false),
+                            JitStatus::Unknown => {
+                                slot.count += 1;
+                                (None, slot.count >= JIT_THRESHOLD)
+                            }
+                        }
+                    };
+                    let fp = if cached_fp.is_some() {
+                        cached_fp
+                    } else if should_compile {
+                        if self.jit.is_none() {
+                            self.jit = pblang_cranelift::JitCache::new().ok();
+                        }
+                        let name = format!("f{:x}", ptr);
+                        let compiled = self.jit.as_mut().and_then(|j| {
+                            match j.compile(&name, closure_rc.function.as_ref()) {
+                                pblang_cranelift::JitResult::Compiled(f) => Some(f),
+                                _ => None,
+                            }
+                        });
+                        if let Some(slot) = self.jit_state.get_mut(&ptr) {
+                            match compiled {
+                                Some(f) => {
+                                    slot.status = JitStatus::Compiled;
+                                    slot.func = Some(f);
+                                }
+                                None => slot.status = JitStatus::Ineligible,
+                            }
+                        }
+                        compiled
+                    } else {
+                        None
+                    };
+                    if let Some(f) = fp {
+                        let args: Vec<Value> =
+                            self.stack[args_start..args_start + arity].to_vec();
+                        if let Some(ret) = pblang_cranelift::call_jit(f, &args) {
+                            self.stack.truncate(callee_index);
+                            self.stack.push(ret);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(ref lim) = self.limits {

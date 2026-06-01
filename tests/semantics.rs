@@ -2727,6 +2727,112 @@ fn slice_string_bounds() {
 }
 
 #[test]
+fn bitwise_operators_and_radix_literals() {
+    // Infix `& | ^ << >>` + prefix `~` desugar to the bit_* builtins; hex/binary/
+    // octal literals lex; bitwise binds tighter than comparison; `|` coexists with
+    // the `|>` pipe operator (the parser guards `|` against `|>`).
+    let out = run_collect(
+        r#"
+        print 6 & 3;
+        print 6 | 1;
+        print 6 ^ 3;
+        print ~0;
+        print 1 << 8;
+        print 256 >> 2;
+        print 0xFF;
+        print 0b1010;
+        print 0o17;
+        print 0xFF & 0x0F;
+        print (1 << 4) | (1 << 0);
+        print 10 & 6 == 2;
+        print 5 |> bit_shl(1);
+    "#,
+    );
+    assert_eq!(
+        out,
+        vec![
+            Value::Number(2.0),
+            Value::Number(7.0),
+            Value::Number(5.0),
+            Value::Number(-1.0),
+            Value::Number(256.0),
+            Value::Number(64.0),
+            Value::Number(255.0),
+            Value::Number(10.0),
+            Value::Number(15.0),
+            Value::Number(15.0),
+            Value::Number(17.0),
+            Value::Bool(true),
+            Value::Number(10.0),
+        ]
+    );
+}
+
+#[test]
+fn async_await_keywords() {
+    // `async fn` desugars to a function returning spawn(fn(){body}); `await x`
+    // (whitespace-guarded keyword) desugars to join(x). Real concurrency via the
+    // global spawn/join builtins, no stdlib import. `await(x)` with no space
+    // stays an ordinary call (verified separately by stdlib_parse/threads).
+    let out = run_collect(
+        r#"
+        async fn square(x) { return x * x; }
+        async fn add(a, b) { return a + b; }
+        let t = square(7);
+        print await t;
+        print await add(20, 22);
+        let t1 = square(3);
+        let t2 = square(4);
+        print (await t1) + (await t2);
+    "#,
+    );
+    assert_eq!(
+        out,
+        vec![Value::Number(49.0), Value::Number(42.0), Value::Number(25.0)]
+    );
+}
+
+#[test]
+fn tail_call_optimization() {
+    // Deep self-recursion in tail position must run in constant stack depth
+    // (500k frames would overflow without TCO). Mutual tail recursion too.
+    // Ordinary (non-tail) recursion stays correct; a tail call inside a function
+    // with a `defer` falls back to a normal call so the defer still runs.
+    let out = run_collect(
+        r#"
+        fn count_down(n, acc) {
+            if n <= 0 { return acc; }
+            return count_down(n - 1, acc + 1);
+        }
+        print count_down(500000, 0);
+
+        fn is_even(n) { if n == 0 { return true; } return is_odd(n - 1); }
+        fn is_odd(n)  { if n == 0 { return false; } return is_even(n - 1); }
+        print is_even(100000);
+
+        fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+        print fib(20);
+
+        fn with_defer(n) {
+            defer { }
+            if n <= 0 { return 7; }
+            return with_defer(n - 1);
+        }
+        print with_defer(3);
+    "#,
+    );
+    assert_eq!(
+        out,
+        vec![
+            Value::Number(500000.0),
+            Value::Bool(true),
+            Value::Number(6765.0),
+            Value::Number(7.0),
+        ]
+    );
+}
+
+#[test]
 fn slice_array_bounds() {
     let out = run_collect(
         r#"
