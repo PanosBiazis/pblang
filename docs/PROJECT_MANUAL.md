@@ -135,6 +135,10 @@ Native/backend notes: `docs/Native_backend_notes.md`.
 
 ## 8. IDE and developer tooling
 
+- Native IDE: `pblang --ide` (aliases: `pblang ide`, `pblang -ide`). It
+  launches `editors/ide/pbide.sapp` and searches `PBLANG_IDE`, the current
+  directory, executable-relative install paths, the build-time repo path, and
+  `/usr/local/share/pblang` / `/usr/share/pblang`.
 - IDE backend: `pblang serve --port 8090`
 - Browser IDE: open `editors/ide/index.html`
 - LSP integration in editors: `pblang lsp`

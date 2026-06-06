@@ -10,6 +10,7 @@ fn value_str(v: &Value) -> String {
     match v {
         Value::Obj(o) => match o.as_ref() {
             Obj::String(s) => s.clone(),
+            other => panic!("expected string, got {:?}", other),
         },
         _ => panic!("expected string, got {:?}", v),
     }

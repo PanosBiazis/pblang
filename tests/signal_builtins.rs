@@ -19,6 +19,7 @@ fn value_str(v: &Value) -> &str {
     match v {
         Value::Obj(o) => match o.as_ref() {
             Obj::String(s) => s.as_str(),
+            other => panic!("expected string, got {:?}", other),
         },
         _ => panic!("expected string, got {:?}", v),
     }

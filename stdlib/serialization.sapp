@@ -1,6 +1,132 @@
 //! serialization.sapp — Multi-format serialization for pblang
 //! Supports JSON (pretty/validate), TOML, YAML, CSV, XML escaping.
-//! Uses existing json builtins and system tools for TOML/YAML.
+//! TOML/YAML are parsed natively in pblang — no external tools, no shelling
+//! out (the old `exec(... | python3 ...)` path was both a non-pblang
+//! dependency and a shell-injection vector on untrusted input).
+
+// ---------------------------------------------------------------------------
+// Shared scalar/structure helpers used by the native TOML + YAML parsers.
+// ---------------------------------------------------------------------------
+
+/// Count leading spaces (the indentation level) of a raw line.
+fn _ser_indent(line) {
+    let n = len(line);
+    let i = 0;
+    while i < n and str_slice(line, i, i + 1) == " " { i = i + 1; }
+    return i;
+}
+
+/// True only if `s` is a plain numeric literal. `parse_number` THROWS on
+/// non-numeric input, so we must gate the call rather than try/catch it.
+fn _ser_is_num(s) {
+    let n = len(s);
+    if n == 0 { return false; }
+    let i = 0;
+    let digits = 0;
+    let dots = 0;
+    while i < n {
+        let c = strcharcodeat(s, i);
+        if c >= 48 and c <= 57 { digits = digits + 1; }
+        else if c == 46 { dots = dots + 1; }
+        else if c == 45 or c == 43 { if i != 0 { return false; } }
+        else { return false; }
+        i = i + 1;
+    }
+    return digits > 0 and dots <= 1;
+}
+
+/// Strip a matching pair of surrounding quotes from a key/identifier.
+fn _ser_unquote_key(k) {
+    let s = str_trim(k);
+    let n = len(s);
+    if n >= 2 {
+        let f = str_slice(s, 0, 1);
+        let l = str_slice(s, n - 1, n);
+        if (f == "\"" and l == "\"") or (f == "'" and l == "'") {
+            return str_slice(s, 1, n - 1);
+        }
+    }
+    return s;
+}
+
+/// Interpret a raw scalar fragment as string / number / bool / null.
+fn _ser_scalar(raw) {
+    let s = str_trim(raw);
+    let n = len(s);
+    if n == 0 { return ""; }
+    let first = str_slice(s, 0, 1);
+    let last = str_slice(s, n - 1, n);
+    if n >= 2 and ((first == "\"" and last == "\"") or (first == "'" and last == "'")) {
+        return str_slice(s, 1, n - 1);
+    }
+    if s == "true" { return true; }
+    if s == "false" { return false; }
+    if s == "null" or s == "~" { return nil; }
+    if _ser_is_num(s) { return parse_number(s); }
+    return s;
+}
+
+/// Split on `sep` at the top level only (commas inside quotes are kept).
+fn _ser_split_top(s, sep) {
+    let out = [];
+    let cur = "";
+    let i = 0;
+    let n = len(s);
+    let inq = false;
+    let qch = "";
+    while i < n {
+        let ch = str_slice(s, i, i + 1);
+        if inq {
+            cur = cur + ch;
+            if ch == qch { inq = false; }
+        } else {
+            if ch == "\"" or ch == "'" { inq = true; qch = ch; cur = cur + ch; }
+            else if ch == sep { array_push(out, cur); cur = ""; }
+            else { cur = cur + ch; }
+        }
+        i = i + 1;
+    }
+    array_push(out, cur);
+    return out;
+}
+
+/// Drop an unquoted trailing `#` comment from a value fragment.
+fn _ser_strip_comment(s) {
+    let out = "";
+    let i = 0;
+    let n = len(s);
+    let inq = false;
+    let qch = "";
+    while i < n {
+        let ch = str_slice(s, i, i + 1);
+        if inq {
+            out = out + ch;
+            if ch == qch { inq = false; }
+        } else {
+            if ch == "\"" or ch == "'" { inq = true; qch = ch; out = out + ch; }
+            else if ch == "#" { i = n; }
+            else { out = out + ch; }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Parse an inline `[a, b, c]` flow array into a pblang array.
+fn _ser_flow_array(s) {
+    let t = str_trim(s);
+    let inner = str_slice(t, 1, len(t) - 1);
+    let out = [];
+    if str_trim(inner) == "" { return out; }
+    let parts = _ser_split_top(inner, ",");
+    let i = 0;
+    while i < len(parts) {
+        let p = str_trim(parts[i]);
+        if p != "" { array_push(out, _ser_scalar(p)); }
+        i = i + 1;
+    }
+    return out;
+}
 
 /// Pretty-print JSON with indentation (2 spaces)
 fn json_pretty(data) {
@@ -58,11 +184,54 @@ fn json_validate(data) {
     return result != nil;
 }
 
-/// TOML parse using system tool (if available)
+/// Get or create the nested table for a (possibly dotted) `[section]` name.
+fn _ser_toml_table(root, name) {
+    let parts = _ser_split_top(name, ".");
+    let cur = root;
+    let i = 0;
+    while i < len(parts) {
+        let p = _ser_unquote_key(str_trim(parts[i]));
+        if not map_has(cur, p) { cur[p] = map{}; }
+        cur = cur[p];
+        i = i + 1;
+    }
+    return cur;
+}
+
+/// Native TOML parser (subset: comments, [tables] incl. dotted, key = value,
+/// strings/numbers/booleans, and inline `[a, b]` arrays). Returns a map.
 fn toml_parse(data) {
-    let result = exec("echo '" + data + "' | python3 -c \"import sys,json,tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())))\" 2>/dev/null");
-    if result == "" or result == nil { return {}; }
-    return json_parse(result);
+    let result = map{};
+    if data == nil or data == "" { return result; }
+    let lines = str_split(data, "\n");
+    let cur = result;
+    let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]);
+        i = i + 1;
+        if line == "" or str_slice(line, 0, 1) == "#" { continue; }
+        if str_slice(line, 0, 1) == "[" {
+            let close = str_index_of(line, "]");
+            if close > 0 {
+                let name = str_trim(str_slice(line, 1, close));
+                // [[array of tables]] is treated as a plain table here.
+                if str_slice(name, 0, 1) == "[" { name = str_trim(str_slice(name, 1, len(name))); }
+                cur = _ser_toml_table(result, name);
+            }
+        } else {
+            let eq = str_index_of(line, "=");
+            if eq > 0 {
+                let key = _ser_unquote_key(str_trim(str_slice(line, 0, eq)));
+                let valc = str_trim(_ser_strip_comment(str_slice(line, eq + 1, len(line))));
+                if len(valc) > 0 and str_slice(valc, 0, 1) == "[" {
+                    cur[key] = _ser_flow_array(valc);
+                } else {
+                    cur[key] = _ser_scalar(valc);
+                }
+            }
+        }
+    }
+    return result;
 }
 
 /// TOML stringify (simple key-value only)
@@ -81,11 +250,105 @@ fn toml_stringify(data) {
     return result;
 }
 
-/// YAML parse using system tool (if available)  
+/// Indentation of the next significant (non-blank, non-comment) line, or -1.
+fn _yaml_next_indent(lines, start) {
+    let n = len(lines);
+    let i = start;
+    while i < n {
+        let t = str_trim(lines[i]);
+        if t == "" or str_slice(t, 0, 1) == "#" { i = i + 1; }
+        else { return _ser_indent(lines[i]); }
+    }
+    return -1;
+}
+
+/// Parse one YAML block (a run of lines sharing the indent of the first
+/// significant line at/after `start`). Deeper lines recurse. Returns
+/// map{ val, next } where `next` is the line index after the block.
+fn _yaml_block(lines, start) {
+    let n = len(lines);
+    let i = start;
+    while i < n {
+        let t = str_trim(lines[i]);
+        if t == "" or str_slice(t, 0, 1) == "#" { i = i + 1; } else { break; }
+    }
+    if i >= n { return map{ val: nil, next: i }; }
+
+    let baseIndent = _ser_indent(lines[i]);
+    let firstT = str_trim(lines[i]);
+    let isList = (str_slice(firstT, 0, 2) == "- " or firstT == "-");
+
+    if isList {
+        let arr = [];
+        while i < n {
+            let raw = lines[i];
+            let t = str_trim(raw);
+            if t == "" or str_slice(t, 0, 1) == "#" { i = i + 1; continue; }
+            let ind = _ser_indent(raw);
+            if ind != baseIndent { break; }
+            if not (str_slice(t, 0, 2) == "- " or t == "-") { break; }
+            let item = str_trim(str_slice(t, 1, len(t)));
+            i = i + 1;
+            if item == "" {
+                let sub = _yaml_block(lines, i);
+                array_push(arr, sub["val"]);
+                i = sub["next"];
+            } else {
+                let colon = str_index_of(item, ":");
+                if colon > 0 {
+                    let m = map{};
+                    let k = _ser_unquote_key(str_trim(str_slice(item, 0, colon)));
+                    let v = str_trim(str_slice(item, colon + 1, len(item)));
+                    m[k] = _ser_scalar(v);
+                    array_push(arr, m);
+                } else {
+                    array_push(arr, _ser_scalar(item));
+                }
+            }
+        }
+        return map{ val: arr, next: i };
+    }
+
+    let m = map{};
+    while i < n {
+        let raw = lines[i];
+        let t = str_trim(raw);
+        if t == "" or str_slice(t, 0, 1) == "#" { i = i + 1; continue; }
+        let ind = _ser_indent(raw);
+        if ind != baseIndent { break; }
+        let line = str_trim(_ser_strip_comment(t));
+        let colon = str_index_of(line, ":");
+        if colon < 0 { i = i + 1; continue; }
+        let key = _ser_unquote_key(str_trim(str_slice(line, 0, colon)));
+        let valraw = str_trim(str_slice(line, colon + 1, len(line)));
+        i = i + 1;
+        if valraw == "" {
+            if _yaml_next_indent(lines, i) > baseIndent {
+                let sub = _yaml_block(lines, i);
+                m[key] = sub["val"];
+                i = sub["next"];
+            } else {
+                m[key] = nil;
+            }
+        } else if str_slice(valraw, 0, 1) == "[" {
+            m[key] = _ser_flow_array(valraw);
+        } else {
+            m[key] = _ser_scalar(valraw);
+        }
+    }
+    return map{ val: m, next: i };
+}
+
+/// Native YAML parser (subset: comments, nested maps by indentation, scalar
+/// and `- ` sequences, inline `[a, b]` flow arrays, true/false/null). Returns
+/// a map (or an array if the document's top level is a sequence).
 fn yaml_parse(data) {
-    let result = exec("echo '" + data + "' | python3 -c \"import sys,json,yaml; print(json.dumps(yaml.safe_load(sys.stdin.read())))\" 2>/dev/null");
-    if result == "" or result == nil { return {}; }
-    return json_parse(result);
+    if data == nil or data == "" { return map{}; }
+    let lines = str_split(data, "\n");
+    let res = _yaml_block(lines, 0);
+    let v = res["val"];
+    if v == nil { return map{}; }
+    return v;
 }
 
 /// YAML stringify (simple)
@@ -146,7 +409,7 @@ fn csv_parse(text, delimiter = ",") {
     let rows = [];
     let k = 1;
     while k < len(lines) {
-        let row = {};
+        let row = map{};
         let field2 = "";
         let col = 0;
         let m = 0;

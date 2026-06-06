@@ -1723,7 +1723,7 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
 /// Returns the new access token string on success.
 fn refresh_access_token(registry_url: &str, refresh_token: &str) -> Result<String, String> {
     let refresh_url = format!("{}/auth/refresh", registry_url.trim_end_matches('/'));
-    let refresh_body = format!(r#"{{"refresh_token":"{refresh_token}"}}"#);
+    let refresh_body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
     let resp = ureq::post(&refresh_url)
         .set("Content-Type", "application/json")
         .send_string(&refresh_body)
@@ -1742,7 +1742,9 @@ fn refresh_access_token(registry_url: &str, refresh_token: &str) -> Result<Strin
 /// Search a registry for packages matching `query`.
 pub fn search_registry(registry_url: &str, query: &str) -> Result<Vec<SearchResult>, String> {
     if registry_url.starts_with("file://") {
-        let path = registry_url.strip_prefix("file://").unwrap();
+        let path = registry_url
+            .strip_prefix("file://")
+            .ok_or_else(|| "internal: file registry URL missing file:// prefix".to_string())?;
         let index_path = Path::new(path).join("index.json");
         let bytes = std::fs::read(&index_path)
             .map_err(|e| format!("read index {}: {e}", index_path.display()))?;
@@ -2370,6 +2372,33 @@ version = "0.1.0"
         );
         stream.write_all(resp.as_bytes()).expect("write response");
         stream.flush().expect("flush response");
+    }
+
+    #[test]
+    fn refresh_access_token_json_escapes_refresh_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("server addr");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let (_, path, _, body) = read_http_request(&mut stream);
+            assert_eq!(path, "/auth/refresh");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("refresh request body should be valid JSON");
+            assert_eq!(parsed["refresh_token"], "refresh\"token\\with\\slashes");
+            write_http_response(&mut stream, 200, r#"{"token":"escaped-token"}"#);
+        });
+
+        let token = refresh_access_token(
+            &format!("http://{addr}"),
+            "refresh\"token\\with\\slashes",
+        )
+        .expect("refresh should succeed");
+        assert_eq!(token, "escaped-token");
+        server.join().expect("join test server thread");
     }
 
     #[test]

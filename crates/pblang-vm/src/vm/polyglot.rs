@@ -6,24 +6,23 @@
 //!   - `polyglot_exec(lang, code)` — interpreted-language subprocess
 //!     bridge (python / js / bash / ruby / perl / lua / php / r / tcl /
 //!     awk / julia / racket / scheme / clojure / elixir / groovy / fennel
-//!     / ocaml / scala / csharp via dotnet-script / deno / zsh / fish /
-//!     powershell / raku).
+//!     / ocaml / scala / csharp / deno / zsh / fish / powershell / raku /
+//!     qsharp / sql / sqlite / postgresql / mysql / mongodb / redis /
+//!     matlab / octave / prolog / smalltalk / forth / idris / sass / less /
+//!     bc / dc / gnuplot / io).
 //!   - `polyglot_exec_with_input(lang, code, input)` — stdin filter form.
 //!   - `polyglot_exec_compiled(lang, code)` — temp-dir compile-and-run for
 //!     rust / go / c / cpp / zig / java / kotlin / typescript / pascal /
 //!     nim / crystal / d / haskell / fortran / ada / swift / cobol /
 //!     erlang / vala / objc / nasm / gas / v / ocaml-compiled / csharp /
-//!     fsharp / vb.
+//!     fsharp / vb / qsharp-compiled / haxe / pony / red / verilog /
+//!     mercury / reason.
 //!   - `polyglot_detect()` — probe host PATH for every known language.
 //!   - `polyglot_compile_cached(lang, code)` — build-time cdylib cache for
-//!     16 languages (rust, c, cpp, go, pascal, csharp+fsharp NativeAOT,
+//!     17 languages (rust, c, cpp, go, pascal, csharp+fsharp NativeAOT,
 //!     zig, d, nim, swift, haskell, fortran, objc, ocaml, java GraalVM,
 //!     kotlin Kotlin/Native).
 //!   - `polyglot_cache_clear()` / `polyglot_cache_info()` — cache mgmt.
-//!
-//! All builtins gated by `host.allow_exec()`; `polyglot_compile_cached`
-//! additionally requires `host.allow_ffi()` because it returns an FFI
-//! handle.
 //!
 //! Visibility: every item is `pub(super)` so vm.rs reaches them via
 //! `fun: polyglot::polyglot_exec` in the BuiltinFn table.
@@ -86,6 +85,46 @@ pub(super) fn polyglot_exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
         // C# via dotnet-script (REPL-style single-file eval).
         // Requires `dotnet tool install -g dotnet-script`.
         "csharp" | "cs" | "c#" => ("dotnet-script", Some("eval")),
+        // ── Q# (Microsoft Quantum) ──────────────────────────────
+        "qsharp" | "qs" | "q#" => ("python3", Some("-c")),
+        // ── SQL / databases ─────────────────────────────────────
+        "sql" | "sqlite" => ("sqlite3", Some(":memory:")),
+        // ── MATLAB / Octave ─────────────────────────────────────
+        "matlab" | "octave" => ("octave", Some("--eval")),
+        // ── Prolog ──────────────────────────────────────────────
+        "prolog" | "plg" => ("swipl", Some("-g")),
+        // ── Smalltalk ───────────────────────────────────────────
+        "smalltalk" | "st" => ("gst", Some("-f")),
+        // ── Forth ───────────────────────────────────────────────
+        "forth" | "gforth" | "fth" => ("gforth", Some("-e")),
+        // ── Idris ───────────────────────────────────────────────
+        "idris" | "idr" => ("idris2", Some("--exec")),
+        // ── CSS preprocessors ───────────────────────────────────
+        "sass" | "scss" => ("sass", Some("--stdin")),
+        "less" => ("lessc", Some("-")),
+        // ── Database CLIs ───────────────────────────────────────
+        "postgresql" | "psql" | "pg" => ("psql", Some("-f")),
+        "mysql" | "mariadb" => ("mysql", Some("-e")),
+        "mongodb" | "mongo" => ("mongosh", Some("--eval")),
+        "redis" => ("redis-cli", Some("--eval")),
+        // ── Other scriptable tools ──────────────────────────────
+        "bc" => ("bc", Some("-l")),
+        "dc" => ("dc", None),
+        "gnuplot" | "gp" => ("gnuplot", Some("-e")),
+        "io" => ("io", Some("-e")),
+        // ── Additional databases ──────────────────────────────────
+        "duckdb" => ("duckdb", Some("-c")),
+        "cassandra" | "cqlsh" => ("cqlsh", Some("-e")),
+        "neo4j" | "cypher" => ("cypher-shell", Some("-e")),
+        "clickhouse" => ("clickhouse-client", Some("-q")),
+        // ── More scripting languages ─────────────────────────────
+        "lisp" | "sbcl" => ("sbcl", Some("--eval")),
+        "janet" => ("janet", Some("-e")),
+        "wren" => ("wren_cli", None),
+        "rholang" | "rho" => ("rho", Some("-e")),
+        "maxima" => ("maxima", Some("--batch-string")),
+        "gap" => ("gap", Some("-c")),
+        "pari" => ("gp", Some("-q")),
         // F# via dotnet fsi --use:- ... we pipe instead; for the
         // single-shot `-e`-style we use `fsi --exec --use:` which
         // doesn't exist, so fsi is interactive-only. Skip here; route
@@ -188,6 +227,25 @@ pub(super) fn polyglot_exec_with_input(
         "lua" => ("lua", "-e"),
         "php" => ("php", "-r"),
         "r" => ("Rscript", "-e"),
+        "deno" => ("deno", "eval"),
+        "zsh" => ("zsh", "-c"),
+        "fish" => ("fish", "-c"),
+        "powershell" | "pwsh" => ("pwsh", "-c"),
+        "raku" => ("raku", "-e"),
+        "tcl" => ("tclsh", "-c"),
+        "awk" => ("awk", ""),
+        "julia" | "jl" => ("julia", "-e"),
+        "racket" => ("racket", "-e"),
+        "scheme" | "guile" => ("guile", "-c"),
+        "clojure" | "clj" => ("clojure", "-M"),
+        "elixir" | "ex" | "exs" => ("elixir", "-e"),
+        "groovy" => ("groovy", "-e"),
+        "fennel" => ("fennel", "-e"),
+        "scala" => ("scala", "-e"),
+        "qsharp" | "qs" => ("python3", "-c"),
+        "sql" | "sqlite" => ("sqlite3", ":memory:"),
+        "octave" => ("octave", "--eval"),
+        "forth" | "gforth" => ("gforth", "-e"),
         other => {
             return Err(host.err(format!(
                 "polyglot_exec_with_input(): unsupported language '{}'",
@@ -296,6 +354,12 @@ pub(super) fn polyglot_exec_compiled(
         "cs" | "c#" => "csharp",
         "fs" | "fsx" | "f#" => "fsharp",
         "vbnet" | "visualbasic" => "vb",
+        "chpl" => "chapel",
+        "purs" => "purescript",
+        "sol" => "solidity",
+        "odin" => "odin",
+        "mojo" => "mojo",
+        "carbon" => "carbon",
         other => other,
     };
 
@@ -1062,9 +1126,188 @@ pub(super) fn polyglot_exec_compiled(
                 ],
             )
         }
+        // ── Q# compiled (via dotnet) ───────────────────────────
+        "qsharp-compiled" | "qs-compiled" => {
+            let dotnet = match first_available(&["dotnet"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH for Q#");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            (
+                "Program.qs",
+                None,
+                vec![dotnet, "run".into(), "--project".into(), work_dir.to_string_lossy().into_owned()],
+            )
+        }
+        // ── Haxe ───────────────────────────────────────────────
+        "haxe" | "hx" => {
+            let cc = match first_available(&["haxe"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: haxe not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let _src = work_dir.join("Main.hx");
+            ("Main.hx", None, vec![cc, "--run".into(), "Main".into(), "--cwd".into(), work_dir.to_string_lossy().into_owned()])
+        }
+        // ── Pony ───────────────────────────────────────────────
+        "pony" => {
+            let cc = match first_available(&["ponyc"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: ponyc not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let bin = work_dir.join("prog");
+            let src = work_dir.join("main.pony");
+            ("main.pony", Some((cc, vec![src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![bin.to_string_lossy().into_owned()])
+        }
+        // ── Red ────────────────────────────────────────────────
+        "red" => {
+            let cc = match first_available(&["red"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: red not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let src = work_dir.join("main.red");
+            ("main.red", None, vec![cc, src.to_string_lossy().into_owned()])
+        }
+        // ── Verilog ────────────────────────────────────────────
+        "verilog" | "vlog" => {
+            let cc = match first_available(&["iverilog"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: iverilog not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let vvp = first_available(&["vvp"]).unwrap_or_else(|| "vvp".to_string());
+            let src = work_dir.join("main.v");
+            let bin = work_dir.join("prog.vvp");
+            ("main.v", Some((cc, vec![src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![vvp, bin.to_string_lossy().into_owned()])
+        }
+        // ── Mercury ────────────────────────────────────────────
+        "mercury" => {
+            let cc = match first_available(&["mmc"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: mmc (Mercury) not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let src = work_dir.join("main.m");
+            let bin = work_dir.join("prog");
+            ("main.m", Some((cc, vec!["--make".into(), src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![bin.to_string_lossy().into_owned()])
+        }
+        // ── ReasonML / BuckleScript ────────────────────────────
+        "reason" | "re" => {
+            let cc = match first_available(&["bsb"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: bsb (BuckleScript) not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
+            let _src = work_dir.join("Main.re");
+            ("Main.re", Some((cc, vec!["-make-world".into()])), vec![node, "src/Main.bs.js".into()])
+        }
+        // ── Odin ────────────────────────────────────────────────
+        "odin" => {
+            let cc = match first_available(&["odin"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: odin not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let src = work_dir.join("main.odin");
+            ("main.odin", None, vec![cc, "run".into(), src.to_string_lossy().into_owned()])
+        }
+        // ── Carbon ──────────────────────────────────────────────
+        "carbon" => {
+            let cc = match first_available(&["carbon"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: carbon not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let src = work_dir.join("main.carbon");
+            ("main.carbon", None, vec![cc, "run".into(), src.to_string_lossy().into_owned()])
+        }
+        // ── Mojo ───────────────────────────────────────────────
+        "mojo" => {
+            let cc = match first_available(&["mojo"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: mojo not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let src = work_dir.join("main.mojo");
+            ("main.mojo", None, vec![cc, src.to_string_lossy().into_owned()])
+        }
+        // ── Chapel ──────────────────────────────────────────────
+        "chapel" | "chpl" => {
+            let cc = match first_available(&["chpl"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: chpl (Chapel) not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+            let src = work_dir.join("main.chpl");
+            ("main.chpl", Some((cc, vec![src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![bin.to_string_lossy().into_owned()])
+        }
+        // ── Factor ──────────────────────────────────────────────
+        "factor" => {
+            let cc = match first_available(&["factor"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: factor not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let src = work_dir.join("main.factor");
+            ("main.factor", None, vec![cc, src.to_string_lossy().into_owned()])
+        }
+        // ── PureScript ──────────────────────────────────────────
+        "purescript" | "purs" => {
+            let cc = match first_available(&["purs"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: purs (PureScript) not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
+            let src = work_dir.join("Main.purs");
+            ("Main.purs", Some((cc, vec!["compile".into(), src.to_string_lossy().into_owned(), "-o".into(), work_dir.to_string_lossy().into_owned()])), vec![node, "-e".into(), "require(047./output/Main/index.js047).main()".into()])
+        }
+        // ── Solidity (compiled) ─────────────────────────────────
+        "solidity" | "sol" => {
+            let cc = match first_available(&["solc"]) {
+                Some(c) => c,
+                None => {
+                    let stderr_esc = json_escape_string("polyglot_exec_compiled: solc (Solidity) not found in PATH");
+                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                }
+            };
+            let src = work_dir.join("main.sol");
+            let bin = work_dir.join("main.bin");
+            ("main.sol", Some((cc.clone(), vec![src.to_string_lossy().into_owned(), "--bin".into(), "-o".into(), work_dir.to_string_lossy().into_owned()])), vec!["cat".into(), bin.to_string_lossy().into_owned()])
+        }
         other => {
             return Err(host.err(format!(
-                "polyglot_exec_compiled(): unsupported language '{}'. Supported: rust, go, c, cpp, zig, java, typescript, pascal, kotlin, nim, crystal, d, haskell, fortran, ada, swift, cobol, erlang, vala, objc, nasm, gas, v, ocaml-compiled, csharp, fsharp, vb",
+                "polyglot_exec_compiled(): unsupported language '{}'. Supported: rust, go, c, cpp, zig, java, typescript, pascal, kotlin, nim, crystal, d, haskell, fortran, ada, swift, cobol, erlang, vala, objc, nasm, gas, v, ocaml-compiled, csharp, fsharp, vb, qsharp-compiled, haxe, pony, red, verilog, mercury, reason, odin, carbon, mojo, chapel, factor, purescript, solidity",
                 other
             )));
         }
@@ -1264,6 +1507,50 @@ pub(super) fn polyglot_detect(host: &mut dyn VmHost, args: Vec<Value>) -> Result
         ("dotnet-script", "interpreter", &["dotnet-script"]),
         ("native-image", "compiler", &["native-image"]),
         ("kotlin-native", "compiler", &["kotlinc-native"]),
+        // ── New interpreted languages ────────────────────────────
+        ("qsharp", "interpreter", &["python3"]),
+        ("sqlite", "interpreter", &["sqlite3"]),
+        ("psql", "interpreter", &["psql"]),
+        ("mysql", "interpreter", &["mysql"]),
+        ("mongosh", "interpreter", &["mongosh"]),
+        ("redis-cli", "interpreter", &["redis-cli"]),
+        ("octave", "interpreter", &["octave"]),
+        ("prolog", "interpreter", &["swipl"]),
+        ("smalltalk", "interpreter", &["gst"]),
+        ("forth", "interpreter", &["gforth"]),
+        ("idris", "interpreter", &["idris2"]),
+        ("sass", "interpreter", &["sass"]),
+        ("lessc", "interpreter", &["lessc"]),
+        ("bc", "interpreter", &["bc"]),
+        ("dc", "interpreter", &["dc"]),
+        ("gnuplot", "interpreter", &["gnuplot"]),
+        ("io", "interpreter", &["io"]),
+        // ── New compiled languages ──────────────────────────────
+        ("qsharp-compiled", "compiler", &["dotnet"]),
+        ("haxe", "compiler", &["haxe"]),
+        ("pony", "compiler", &["ponyc"]),
+        ("red", "compiler", &["red"]),
+        ("verilog", "compiler", &["iverilog"]),
+        ("mercury", "compiler", &["mmc"]),
+        ("reason", "compiler", &["bsb"]),
+        // ── New interpreted languages ───────────────────────────
+        ("duckdb", "interpreter", &["duckdb"]),
+        ("cassandra", "interpreter", &["cqlsh"]),
+        ("neo4j", "interpreter", &["cypher-shell"]),
+        ("clickhouse", "interpreter", &["clickhouse-client"]),
+        ("lisp", "interpreter", &["sbcl"]),
+        ("janet", "interpreter", &["janet"]),
+        ("maxima", "interpreter", &["maxima"]),
+        ("gap", "interpreter", &["gap"]),
+        ("pari", "interpreter", &["gp"]),
+        // ── New compiled languages ─────────────────────────────
+        ("odin", "compiler", &["odin"]),
+        ("carbon", "compiler", &["carbon"]),
+        ("mojo", "compiler", &["mojo"]),
+        ("chapel", "compiler", &["chpl"]),
+        ("factor", "compiler", &["factor"]),
+        ("purescript", "compiler", &["purs"]),
+        ("solidity", "compiler", &["solc"]),
     ];
     let mut json = String::from("{");
     let mut first = true;
