@@ -1,15 +1,15 @@
 # pblang Project Structure
 
-```
+```text
 pblang/
 ├── src/
-│   └── main.rs                  # CLI entry point, REPL, all subcommands
+│   ├── main.rs                  # CLI entry point, REPL, command dispatch
+│   └── cli/                     # CLI diagnostics, formatting, dataflow, call graph helpers
 │
 ├── crates/
-│   ├── pblang-core/             # Lexer (logos), parser (chumsky), AST types
+│   ├── pblang-core/             # Parser (chumsky), AST types, comments/polyglot masking
 │   │   └── src/
-│   │       ├── lib.rs           # AST definitions (Expr, Stmt, Span, etc.)
-│   │       ├── lexer.rs         # Token definitions
+│   │       ├── lib.rs           # AST definitions (Expr, Stmt, Span, TypeExpr, etc.)
 │   │       └── parser.rs        # Combinator parser
 │   │
 │   ├── pblang-ir/               # Intermediate representation
@@ -18,7 +18,8 @@ pblang/
 │   ├── pblang-vm/               # Bytecode virtual machine
 │   │   └── src/
 │   │       ├── lib.rs           # Public surface, re-exports
-│   │       ├── vm.rs            # Execution loop, builtins, GC
+│   │       ├── vm.rs            # VM state, resources, builtin registration
+│   │       ├── vm/              # Builtin groups: fs, net, http, json, crypto, AI, etc.
 │   │       ├── chunk.rs         # Chunk utilities
 │   │       ├── memory_safety.rs # Runtime ownership / borrow tracker
 │   │       ├── concurrency.rs   # Mutex/RwLock/Channel/ThreadPool primitives
@@ -33,8 +34,8 @@ pblang/
 │   ├── pblang-lint/             # Lint passes & diagnostics
 │   │   └── src/lib.rs
 │   │
-│   ├── pblang-ffi/              # Foreign Function Interface (C ABI)
-│   │   └── src/lib.rs           # ffi_load, ffi_call, ffi_close
+│   ├── pblang-ffi/              # Foreign Function Interface helpers
+│   │   └── src/lib.rs
 │   │
 │   ├── pblang-pm/               # Package manager
 │   │   └── src/lib.rs           # Manifest, lockfile, semver, registry, HMAC
@@ -68,79 +69,64 @@ pblang/
 │   └── pblang-stub/             # Self-extracting bundle launcher
 │       └── src/main.rs
 │
-├── stdlib/                      # ~135 standard library modules (.sapp)
+├── stdlib/                      # pblang standard library modules (.sapp)
 │   ├── http.sapp, http_server.sapp, router.sapp, middleware.sapp
 │   ├── websocket.sapp, tls.sapp, multipart.sapp
 │   ├── json.sapp, csv.sapp, db.sapp, collections.sapp
 │   ├── thread.sapp, thread_pool.sapp, concurrency.sapp, async_await.sapp
 │   ├── crypto.sapp, crypto_quantum.sapp, jwt.sapp
 │   ├── math.sapp, tensor.sapp, nd.sapp
-│   ├── quantum.sapp, quantum_sim.sapp, quantum_viz.sapp, quantum_protocol.sapp
+│   ├── browser.sapp, pbai.sapp, gui.sapp, graphics.sapp
 │   ├── fs.sapp, os.sapp, path.sapp, process.sapp, time.sapp, net.sapp
 │   ├── memory.sapp                  # Wrapper around runtime memory_* builtins
-│   ├── compiler/                    # Self-hosting compiler in pblang (tokenize→parse→compile→RUN)
-│   │   ├── tokenizer.sapp           # Lexer
+│   ├── compiler/                    # Self-hosting compiler in pblang
+│   │   ├── tokenizer.sapp           # Lexer/tokenizer
 │   │   ├── parser.sapp              # Recursive-descent parser
 │   │   ├── semantic.sapp            # Semantic analysis
 │   │   ├── typeck.sapp              # Type checker
 │   │   ├── ir.sapp, optimizer.sapp  # IR + optimizations
 │   │   ├── codegen.sapp             # Bytecode code generator
-│   │   ├── vm.sapp                  # Bytecode interpreter (runs the emitted IR, in pblang)
+│   │   ├── vm.sapp                  # Bytecode interpreter
 │   │   ├── bootstrap.sapp           # Bootstrap driver
-│   │   └── selfhost_frontend.sapp   # End-to-end self-host frontend (frontend_run)
-│   └── ... (~125 more modules: testing, orm, async, env, log, jwt, template,
-│            graph, benchmark, registry, validate, regex, polyglot, ai, ...)
+│   │   └── selfhost_frontend.sapp   # End-to-end self-host frontend
+│   └── ...
+│
+├── editors/
+│   └── ide/                         # Native pblang IDE + legacy/web bootstrap assets
+│       └── pbide.sapp               # Browser-free native IDE entry
 │
 ├── tests/
 │   ├── semantics.rs                 # Main semantics test harness
-│   ├── semantics/                   # ~95 .sapp test scripts
+│   ├── semantics/                   # .sapp test scripts
 │   ├── common.rs                    # Shared test utilities
 │   ├── cfg.rs, pack.rs, lsp.rs      # Specialized integration suites
 │   ├── threads.rs, install_cli.rs   # Threading + CLI / registry tests
-│   └── tensor_builtins.rs, signal_builtins.rs, ... (25+ files)
+│   └── tensor_builtins.rs, signal_builtins.rs, ...
 │
-├── examples/
-│   ├── ai_chat_toolcall/             # AI tool-call demo
-│   ├── ai_http_provider/             # AI HTTP provider adapter
-│   ├── quantum_bb84/                 # Quantum key distribution
-│   ├── thread_pool/                  # Worker pool pattern
-│   ├── self_host_demo/               # Self-hosting pipeline demo
-│   └── embed.rs                      # Rust embedding example
-│
-├── editors/
-│   └── vscode/                       # VS Code extension (TextMate + LSP)
-│
-├── docs/                             # Design & specification documents
-│   ├── CURRENT_STATUS.md             # Component status overview
-│   ├── Language_Semantics.md         # Language semantics contract
-│   ├── Tasks.md                      # Active backlog
-│   ├── Tooling.md, USAGE_GUIDE.md, TUTORIALS.md
-│   ├── Embedding.md, Safety.md, Threads.md, TLS_notes.md
-│   └── ... (28 documents)
-│
-├── benches/
-│   └── bench_vm.rs                   # Criterion benchmarks
-│
-├── Cargo.toml                        # Workspace manifest
+├── examples/                        # Example projects
+├── docs/                            # Design & specification documents
+├── benches/                         # Criterion benchmarks
+├── Cargo.toml                       # Workspace manifest
 ├── Cargo.lock
-├── pblang.toml                       # Self-hosting package manifest
+├── pblang.toml                      # pblang workspace manifest
 ├── README.md
 ├── ROADMAP.md
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
-├── LICENSE                           # MIT
+├── LICENSE                          # MIT
 └── .gitignore
 ```
 
 ## Crate Dependency Graph
 
-```
+```text
 pblang (binary)
-├── pblang-core         (lexer, parser, AST)
+├── pblang-core         (parser, AST)
 ├── pblang-ir           (opcodes, values)
 ├── pblang-vm           (execution, builtins, GC)            ← pblang-ir
 ├── pblang-compiler     (codegen + optimizer)                 ← pblang-core, pblang-ir
 ├── pblang-typeck       (inference, diagnostics)              ← pblang-core
+├── pblang-lint         (lints)                               ← pblang-core, pblang-typeck
 ├── pblang-pm           (manifest, lockfile, semver, registry)
 ├── pblang-graphics     (SDL2 / minifb)
 ├── pblang-ctranspiler  (AST → C99)                           ← pblang-core, pblang-ir
@@ -150,16 +136,16 @@ pblang (binary)
 ├── pblang-lsp          (tower-lsp)                           ← pblang-core, pblang-typeck
 ├── pblang-ai           (provider registry, RAG)
 ├── pblang-quantum      (Qiskit/Cirq/Braket bridge)
-├── pblang-ffi          (C ABI dynamic loading)
+├── pblang-ffi          (C ABI helpers)
 └── pblang-stub         (self-extracting binary launcher)
 ```
 
 ## Key Design Decisions
 
-1. **Crate separation** — each concern is isolated; crates can be used independently
-2. **IR as shared layer** — `pblang-ir` defines the bytecode format shared by compiler, VM, and JIT/AOT backends
-3. **Capability-based security** — all I/O goes through the `VmHost` trait; embedders control everything via `StdlibConfig`, `VmLimits`, and `FfiPolicy`
-4. **No shared-heap threading** — each thread gets an isolated VM instance; communication via typed channels and `select`
-5. **Runtime memory safety** — per-VM `MemoryTracker` enforces Rust-like borrow rules on `allocate`/`borrow_*`/`store`
-6. **Polyglot-first** — source files can embed other languages via `@lang name { ... }` blocks
-7. **Multi-backend codegen** — interpreter, Cranelift JIT/AOT, C99 transpile, LLVM IR, and WAT all consume the same IR
+1. **Crate separation** — each concern is isolated; crates can be used independently.
+2. **IR as shared layer** — `pblang-ir` defines the bytecode format shared by compiler, VM, and JIT/AOT backends.
+3. **Capability-based security** — I/O goes through host capability checks and embedder configuration.
+4. **No shared-heap threading** — each thread gets an isolated VM instance; communication uses channels and handles.
+5. **Runtime memory safety** — per-VM `MemoryTracker` enforces borrow/lifetime rules for the memory-safety builtins.
+6. **Polyglot-first, but capability-gated** — foreign execution is useful but belongs behind `exec`/host trust boundaries.
+7. **Multi-backend codegen** — interpreter is primary; JIT/AOT/C99/LLVM/WASM are backend surfaces with explicit support matrices.
