@@ -1,86 +1,93 @@
 # pblang-native IDE — browser-free, for total security
 
-> **Goal (yours).** Make the IDE **completely written in pblang — no HTML, CSS, or JS** —
-> for the scope of **total security**. This is the self-hosted Studio the project already
-> commits to (`docs/Visual_Designer.md`): the editor and designer are a *pblang
-> application* on pblang's own runtime, not an HTML/JS app that talks to pblang.
+> **Goal.** Make the IDE completely written in pblang — no HTML, CSS, or JS — while matching the web IDE's workflow as closely as possible.
+
+The native IDE is the self-hosted Studio direction of the project: editor, terminal, designer, AI helper, and browser are pblang code running on pblang's own runtime. The web IDE remains useful as a bootstrap/reference UI, but the native IDE is the long-term security-first target.
 
 ---
 
 ## Why — the security argument
 
-The browser IDE (`editors/ide/index.html`) is the bootstrap, but as a security surface a
-web IDE drags in **everything a browser is**:
+The browser IDE (`editors/ide/index.html`) is convenient, but a web IDE brings browser attack surface:
 
 | Web-stack layer | Attack surface it adds |
-|-----------------|------------------------|
+|---|---|
 | HTML parser | malformed-markup / injection bugs |
-| DOM + `innerHTML` | **XSS** (we already had to fix one — PrjAnalysis review) |
-| CSS engine | layout/parser exploits, data exfiltration tricks |
-| JS engine | the largest attack surface in computing (JIT bugs, prototype pollution) |
+| DOM + `innerHTML` | XSS and content-injection bugs |
+| CSS engine | layout/parser exploits and data exfiltration tricks |
+| JS engine | JIT bugs, prototype pollution, dependency surface |
 | `fetch`/iframes | SSRF, content-injection, sandbox escapes |
 
-A pblang-native IDE **deletes all of those layers**. The whole IDE is: a native window
-(`gfxcreatewindow`), a pixel buffer, key events (`gfxpollevents`), and pblang code —
-running under pblang's **capability model** (`docs/Capability_model.md`, `docs/Safety.md`).
-There is **no markup to inject, no script engine to exploit, no DOM**. "Total security"
-here means *removing* the dangerous layers, not hardening them. It also dogfoods the
-language (the IDE is built with the thing it edits) — the same "all the way down" property
-as self-hosting the compiler.
+A pblang-native IDE removes those layers. The whole IDE is a native window, a pixel buffer, input events, and pblang code under pblang's capability model. There is no DOM, no JS runtime, and no HTML renderer to exploit.
 
 ---
 
-## Architecture (all pblang)
+## Architecture
 
-```
+```text
         ┌─────────────── editors/ide/pbide.sapp ───────────────┐
-        │  window + event loop (graphics.sapp → minifb/SDL2)    │
-        │   • keydown → editor ops      • F5 → run via frontend │
+        │  native window + event loop                           │
+        │  code editor | terminal | designer | AI | browser      │
         ├───────────────────────────────────────────────────────┤
-        │  editor_model.sapp   buffer + cursor + edits  (tested) │
-        │  bitmap_font.sapp    5×7 glyphs → pixels      (tested) │
-        │  graphics.sapp       Window / point / rect / present   │
+        │  stdlib/editor_model.sapp   buffer + cursor + edits   │
+        │  stdlib/bitmap_font.sapp    5×7 glyphs → pixels       │
+        │  stdlib/browser.sapp        fetch + reader parser     │
+        │  stdlib/gui.sapp            designer widget model     │
+        │  stdlib/pbai.sapp           local pblang assistant    │
+        │  stdlib/graphics.sapp       window / rect / present   │
         └───────────────────────────────────────────────────────┘
 ```
 
-- **`stdlib/editor_model.sapp`** — the editor core: a line buffer + cursor and the edit
-  ops (`insert_text`, `newline`, `backspace`, cursor movement, clamping). Pure pblang, no
-  UI dependency → **fully tested in the VM** (`tests/semantics/editor_model_test.sapp`).
-- **`stdlib/bitmap_font.sapp`** — there is *no text-rendering builtin*, so the IDE draws
-  its own glyphs: a 5×7 font where `draw_text` emits pixels through a `setpx(x,y,color)`
-  callback (drives a real window, or a recording surface for tests). **Tested in the VM**
-  (`tests/semantics/bitmap_font_test.sapp`) by verifying a glyph's exact pixels.
-- **`editors/ide/pbide.sapp`** — the window binding: creates the window, draws the buffer
-  (line numbers + code + cursor + status bar) with the font, maps key events to editor
-  ops, and runs the buffer through the self-hosted frontend on F5. **Verified to run** —
-  it opens the window and executes the full draw/event loop without error.
+## Current native panels
+
+- **Code** — editor, syntax highlighting, selection, undo/redo, find, save, run, check, output pane.
+- **Terminal** — runs real PC commands through `proc_spawn_wait` when launched with `--allow-exec` or `--allow-all`.
+- **Design** — native visual designer with label/button/textbox/checkbox/panel palette and `->CODE` generation into the editor.
+- **AI** — local pbAI assistant with quick actions: explain, bugs, improve, comment.
+- **Browser** — pblang-native reader view using `stdlib/browser.sapp` to fetch pages, decode entities, strip scripts/styles, extract links, and parse forms.
+- **Help/Manual** — shortcut overlay and documentation-oriented panel.
 
 ---
 
-## Status & honest gaps
+## Web-IDE parity checklist
 
-- **Done + tested (no display needed):** editor model, keymap, syntax-highlighting
-  token flow, and font renderer are pure pblang and covered by VM tests.
-- **Runs:** `pblang --ide` launches `editors/ide/pbide.sapp` with `--allow-all`
-  by default. The resolver checks `PBLANG_IDE`, the current directory,
-  executable-relative install paths, the build-time repo path, and standard
-  share installs (`/usr/local/share/pblang`, `/usr/share/pblang`).
-- **Current native panels:** code editor, terminal, visual designer, pbAI chat,
-  and pblang browser. The browser/AI views hard-wrap long lines, and the bitmap
-  font folds common Unicode punctuation plus Greek letters to readable ASCII.
-- **Honest gaps:**
-  - **Interactive verification** still needs human window testing for real
-    keyboard layouts, focus behavior, and display backends.
-  - **Font fidelity** is still ASCII-first. Non-ASCII is made readable through
-    folding/transliteration, not full Unicode glyph rendering.
-  - **Performance:** text is drawn through the bitmap-font path. A host
-    `gfx_draw_text` primitive or row-run batching would help very large files.
+| Area | Native status |
+|---|---|
+| Top toolbar/actions | Implemented: run, check, save, clear, restore, panels. Format/auto-fix/examples/open still need native implementations. |
+| Code editor | Implemented: typing, movement, selection, find, undo/redo, syntax coloring, output pane. |
+| Terminal | Implemented with persistent cwd and scrollback. |
+| Designer | Implemented with palette, canvas, drag/move, delete, edit text, and code generation. |
+| AI helper | Implemented with local pbAI; no network/Ollama required. |
+| Browser reader | Improved: entity decode, whitespace collapse, script/style removal, adjacent-link spacing, absolute links, forms parser. |
+| Browser forms UI | Parser exists; editable form cards and submit UI are next. |
+| File picker | Pending; current fallback uses the configured buffer path. |
+| Visual polish | Ongoing: match web colors/layout while staying native and bitmap-font based. |
+
+---
+
+## Screenshot-driven fixes tracked
+
+The screenshots showed three main native IDE problems:
+
+1. **Greek/web text mojibake or unreadable entity text.** Fixed in `stdlib/browser.sapp` by improving entity decoding, title decoding, whitespace collapse, and reader parsing. The ASCII bitmap font still transliterates/folds non-ASCII at draw time until a full Unicode text renderer exists.
+2. **Browser panel looked unlike the web reader.** Improved by separating reader text, links, and parsed forms at the engine level. Forms UI is now the next UI task rather than a missing parser task.
+3. **Native IDE parity was unclear.** This document now separates implemented, partial, and pending web-parity items.
+
+Regression coverage: `tests/semantics/browser_native_ide_test.sapp` locks reader parsing, title/entity decode, link resolution, form extraction, and UTF-8 form URL encoding.
+
+---
+
+## Honest gaps
+
+- **Full Unicode rendering** is not done. The current native font is ASCII-first and folds/transliterates many non-ASCII characters for readability.
+- **Browser layout** is a reader view, not a full HTML/CSS layout engine.
+- **Interactive verification** still needs human testing across display backends, keyboard layouts, DPI settings, and focus behavior.
+- **Performance** can improve with a host `gfx_draw_text` primitive or row-run batching.
 
 ## Migration plan
 
-1. **Done:** editor model + font renderer (pblang, tested) + a running native window.
-2. **Done:** keymap/modifiers, scrolling viewport, selection, output pane, syntax highlighting.
-3. **Done:** native terminal, designer, pbAI, and browser panels.
-4. Next: add visual regression fixtures for the screenshot issues and improve font/text performance.
-5. Retire `index.html` once the native IDE reaches parity — the IDE is then 100% pblang,
-   with no web attack surface.
+1. Keep the web IDE as the reference workflow.
+2. Bring native panels to web-parity feature by feature.
+3. Add regression fixtures for every screenshot-level bug.
+4. Replace pending placeholders: format, auto-fix, examples picker, open dialog, browser form cards.
+5. Retire `index.html` only when the native IDE reaches real workflow parity.
