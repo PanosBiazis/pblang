@@ -1971,28 +1971,58 @@ fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
 
 /// Resolve the native IDE script (editors/ide/pbide.sapp): an absolute path if
 /// found, else None. Search order: `PBLANG_IDE` env override → CWD-relative (the
-/// repo root) → walking up from the executable's directory (installed/dev layouts).
+/// repo root) → walking up from the executable's directory (installed/dev layouts)
+/// → build-time repo root → standard share install locations.
 fn locate_ide() -> Option<std::path::PathBuf> {
+    fn canonical_ide_candidate(base: impl AsRef<std::path::Path>) -> Option<std::path::PathBuf> {
+        let cand = base.as_ref().join("editors/ide/pbide.sapp");
+        if cand.exists() {
+            return cand.canonicalize().ok();
+        }
+        None
+    }
+
     if let Ok(p) = std::env::var("PBLANG_IDE") {
         let pb = std::path::PathBuf::from(&p);
         if pb.exists() {
             return pb.canonicalize().ok();
         }
     }
-    let cwd = std::path::Path::new("editors/ide/pbide.sapp");
-    if cwd.exists() {
-        return cwd.canonicalize().ok();
+    if let Some(p) = canonical_ide_candidate(".") {
+        return Some(p);
     }
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(|p| p.to_path_buf());
         for _ in 0..6 {
             if let Some(d) = &dir {
-                let cand = d.join("editors/ide/pbide.sapp");
-                if cand.exists() {
-                    return cand.canonicalize().ok();
+                if let Some(p) = canonical_ide_candidate(d) {
+                    return Some(p);
                 }
                 dir = d.parent().map(|p| p.to_path_buf());
             }
+        }
+
+        if let Some(exe_dir) = exe.parent() {
+            for rel in [
+                "../share/pblang",
+                "../../share/pblang",
+                "../lib/pblang",
+                "../../lib/pblang",
+            ] {
+                if let Some(p) = canonical_ide_candidate(exe_dir.join(rel)) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+        if let Some(p) = canonical_ide_candidate(manifest_dir) {
+            return Some(p);
+        }
+    }
+    for base in ["/usr/local/share/pblang", "/usr/share/pblang"] {
+        if let Some(p) = canonical_ide_candidate(base) {
+            return Some(p);
         }
     }
     None
@@ -2034,7 +2064,7 @@ fn legacy_dispatch(args: Vec<String>) {
             }
             None => {
                 eprintln!(
-                    "pblang --ide: could not find editors/ide/pbide.sapp.\n  Run from the pblang repo root, or set PBLANG_IDE=/path/to/pbide.sapp"
+                    "pblang --ide: could not find editors/ide/pbide.sapp.\n  Searched PBLANG_IDE, the current directory, executable-relative install paths,\n  the build-time repo path, /usr/local/share/pblang, and /usr/share/pblang.\n  Set PBLANG_IDE=/path/to/pbide.sapp to override."
                 );
                 std::process::exit(1);
             }

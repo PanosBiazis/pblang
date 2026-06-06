@@ -44,6 +44,12 @@ let OP_GET_INDEX = 27;
 let OP_SET_INDEX = 28;
 let OP_GET_ATTR = 29;
 let OP_SET_ATTR = 30;
+// Short-circuit / nil-coalescing peek-jumps (must be remapped after any pass
+// that removes instructions, exactly like the plain jumps above).
+let OP_JUMP_IF_FALSE_PEEK = 33;
+let OP_JUMP_IF_TRUE_PEEK = 34;
+let OP_JUMP_IF_NIL_PEEK = 36;
+let OP_JUMP_IF_NOT_NIL_PEEK = 37;
 
 fn make_inst(op, operand) {
     return map{ op: op, operand: operand };
@@ -106,6 +112,53 @@ fn is_number(val) {
     return type(val) == "number";
 }
 
+// True for every opcode whose operand is an absolute instruction index (a jump
+// target). These MUST be remapped whenever instructions are removed.
+fn _is_jump_op(op) {
+    return op == OP_JUMP
+        or op == OP_JUMP_IF_FALSE or op == OP_JUMP_IF_TRUE
+        or op == OP_JUMP_IF_FALSE_PEEK or op == OP_JUMP_IF_TRUE_PEEK
+        or op == OP_JUMP_IF_NIL_PEEK or op == OP_JUMP_IF_NOT_NIL_PEEK;
+}
+
+// Compact `chunk.instructions` by dropping every instruction marked with op == -1,
+// then rewrite all jump operands so they still point at the right instruction.
+// Removing instructions shifts indices, so without this fix any surviving jump
+// (especially short-circuit `and`/`or` peek-jumps) would point at the wrong slot
+// — or off the end of the chunk, silently skipping code. Deleted slots map to the
+// next surviving instruction; index == len maps to the new length (so "jump to
+// end" stays "jump to end").
+fn _compact_and_remap(chunk) {
+    let old = chunk.instructions;
+    let n = len(old);
+    let new_index = [];
+    let count = 0;
+    let i = 0;
+    while i < n {
+        array_push(new_index, count);
+        if old[i].op != (-1) { count = count + 1; }
+        i = i + 1;
+    }
+    array_push(new_index, count); // map for index == n (one-past-the-end)
+
+    let cleaned = [];
+    let j = 0;
+    while j < n {
+        if old[j].op != (-1) { array_push(cleaned, old[j]); }
+        j = j + 1;
+    }
+
+    let k = 0;
+    while k < len(cleaned) {
+        if _is_jump_op(cleaned[k].op) {
+            let tgt = cleaned[k].operand;
+            if tgt >= 0 and tgt <= n { cleaned[k].operand = new_index[tgt]; }
+        }
+        k = k + 1;
+    }
+    chunk.instructions = cleaned;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Pass 1: Constant folding
 // Pattern: OP_CONSTANT(a) OP_CONSTANT(b) OP_BINARY  →  OP_CONSTANT(eval(a op b))
@@ -166,17 +219,11 @@ fn constant_folding_pass(chunk) {
         i = i + 1;
     }
 
-    // Clean up instructions marked with op == -1
-    let cleaned = [];
-    let j = 0;
-    while j < len(chunk.instructions) {
-        let inst = chunk.instructions[j];
-        if inst.op != (-1) {
-            array_push(cleaned, inst);
-        }
-        j = j + 1;
-    }
-    chunk.instructions = cleaned;
+    // Clean up instructions marked with op == -1, remapping jump targets so the
+    // folded-away CONSTANT/CONSTANT pairs don't desync `and`/`or` short-circuit
+    // jumps (this was the cause of `(a and b) or c` returning the wrong value /
+    // skipping the following statement entirely).
+    _compact_and_remap(chunk);
     return folded;
 }
 
@@ -188,34 +235,27 @@ fn constant_folding_pass(chunk) {
 fn dead_code_pass(chunk) {
     let removed = 0;
     let i = 0;
-    while i < chunk_len(chunk) {
+    let n = chunk_len(chunk);
+    while i < n {
         let inst = inst_at(chunk, i);
         if inst != nil and inst.op == OP_RETURN {
-            // Scan forward: remove instructions until we see a potential
-            // entry point (OP_CLOSURE, OP_DEFINE_GLOBAL, or a fn boundary)
+            // Scan forward: mark instructions dead until we see a potential
+            // entry point (OP_CLOSURE, OP_DEFINE_GLOBAL, or a fn boundary).
             let j = i + 1;
-            while j < chunk_len(chunk) {
+            while j < n {
                 let nxt = inst_at(chunk, j);
                 if nxt == nil { break; }
-                if nxt.op == OP_CLOSURE or nxt.op == OP_DEFINE_GLOBAL {
-                    break;
-                }
-                // Remove this dead instruction
-                let new_insts = [];
-                let k = 0;
-                while k < len(chunk.instructions) {
-                    if k != j {
-                        array_push(new_insts, chunk.instructions[k]);
-                    }
-                    k = k + 1;
-                }
-                chunk.instructions = new_insts;
+                if nxt.op == OP_CLOSURE or nxt.op == OP_DEFINE_GLOBAL { break; }
+                // Mark dead (op == -1); compaction + jump remap happens below so
+                // surviving jumps don't shift onto the wrong target.
+                set_inst(chunk, j, make_inst(-1, 0));
                 removed = removed + 1;
-                // Don't increment j; the next instruction shifted into j
+                j = j + 1;
             }
         }
         i = i + 1;
     }
+    if removed > 0 { _compact_and_remap(chunk); }
     return removed;
 }
 

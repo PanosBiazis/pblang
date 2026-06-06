@@ -642,10 +642,13 @@ impl Compiler {
             }
 
             StmtKind::Block(stmts) => {
-                let first_is_let_map = match &stmts[0].kind {
-                    StmtKind::Let(_, None, e) => matches!(e.kind, ExprKind::Map(_)),
-                    _ => false,
-                };
+                let first_is_let_map = stmts
+                    .first()
+                    .map(|st| match &st.kind {
+                        StmtKind::Let(_, None, e) => matches!(e.kind, ExprKind::Map(_)),
+                        _ => false,
+                    })
+                    .unwrap_or(false);
                 if self.scope_depth == 0 && stmts.len() > 1 && first_is_let_map {
                     // Class desugaring: first stmt (let Name = map{...}) at top-level => DefineGlobal.
                     self.emit_stmt(stmts[0].clone());

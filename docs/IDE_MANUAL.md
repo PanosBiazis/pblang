@@ -213,6 +213,10 @@ Responses are JSON and include CORS support for browser access.
 
 ## 9. Troubleshooting
 
+- **`pblang --ide` cannot find `pbide.sapp`**
+  - update to a recent `pblang` binary; old installed copies only looked under the current working directory
+  - set `PBLANG_IDE=/absolute/path/to/editors/ide/pbide.sapp` for custom layouts
+  - package installs can also place the repo payload under `/usr/local/share/pblang` or `/usr/share/pblang`
 - **Cannot connect to server**
   - start backend with `pblang serve --port 8090`
   - verify port and browser access
