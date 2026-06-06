@@ -59,27 +59,28 @@ as self-hosting the compiler.
 
 ## Status & honest gaps
 
-- **Done + tested (no display needed):** the editor model and the font renderer — the
-  hard, security-relevant logic — are pure pblang and green in the suite.
-- **Runs:** `pbide.sapp` opens a native window and renders the editor end-to-end (a
-  display backend is present here; the 5-second loop ran clean).
-- **Gaps (foundational, named — not design holes):**
-  - **Interactive verification** needs a human at the window (I can't press keys / see
-    pixels headlessly); the key-name → character table (`_key_char`) may need per-backend
-    tuning and **shift/modifier handling** (uppercase, symbols) is v1-partial.
-  - **Font coverage** is the printable subset (A–Z, 0–9, common symbols; lowercase maps to
-    uppercase); extend the glyph table for full fidelity.
-  - **Performance:** text is drawn pixel-by-pixel via `point`; a native `gfx_draw_text`
-    builtin (or row-run rects) would speed large files — optional.
-  - **Features to reach parity** with the web IDE: scrolling/viewport, selection, syntax
-    highlighting (reuse the self-hosted tokenizer), the output/diagnostics pane, and then
-    the Studio designer + browser as native panels.
+- **Done + tested (no display needed):** editor model, keymap, syntax-highlighting
+  token flow, and font renderer are pure pblang and covered by VM tests.
+- **Runs:** `pblang --ide` launches `editors/ide/pbide.sapp` with `--allow-all`
+  by default. The resolver checks `PBLANG_IDE`, the current directory,
+  executable-relative install paths, the build-time repo path, and standard
+  share installs (`/usr/local/share/pblang`, `/usr/share/pblang`).
+- **Current native panels:** code editor, terminal, visual designer, pbAI chat,
+  and pblang browser. The browser/AI views hard-wrap long lines, and the bitmap
+  font folds common Unicode punctuation plus Greek letters to readable ASCII.
+- **Honest gaps:**
+  - **Interactive verification** still needs human window testing for real
+    keyboard layouts, focus behavior, and display backends.
+  - **Font fidelity** is still ASCII-first. Non-ASCII is made readable through
+    folding/transliteration, not full Unicode glyph rendering.
+  - **Performance:** text is drawn through the bitmap-font path. A host
+    `gfx_draw_text` primitive or row-run batching would help very large files.
 
 ## Migration plan
 
-1. **(done, §90)** Editor model + font renderer (pblang, tested) + a running native window.
-2. Input polish: full key map + modifiers; scrolling viewport; selection.
-3. Native panels: output/diagnostics; syntax highlighting via `stdlib/compiler` tokenizer.
-4. Port the AI / browser / designer features to native pblang panels.
+1. **Done:** editor model + font renderer (pblang, tested) + a running native window.
+2. **Done:** keymap/modifiers, scrolling viewport, selection, output pane, syntax highlighting.
+3. **Done:** native terminal, designer, pbAI, and browser panels.
+4. Next: add visual regression fixtures for the screenshot issues and improve font/text performance.
 5. Retire `index.html` once the native IDE reaches parity — the IDE is then 100% pblang,
    with no web attack surface.

@@ -7,9 +7,9 @@ AI/Quantum/Web/Polyglot-ready, future-proof, no artificial limits, test-driven
 steps, stable core.
 
 **Current priority order:**
-TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) → LSP ✅ → Cranelift JIT ✅ → Registry ✅ → RE ✅ → Type System ✅ → Spec → Self-Hosting ✅ (tokenizer, parser, type_checker, codegen complete) → Editor → Framework/OS
+TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard ✅ (resolved) → LSP ✅ → Cranelift JIT partial ✅ → Registry ✅ → RE ✅ → Type System ✅ → Spec → Self-Hosting ✅ (tokenizer, parser, type_checker, codegen complete) → Editor → Framework/OS
 
-**Current status**: 160/162 semantics tests passing, 0 failing, 2 ignored (`match_guard_pass`, `os_env_set_pass`). Run `cargo test --test semantics` for the live count.
+**Current status**: `.sapp` corpus 160 passed / 0 failed / 0 ignored. The lone ignored test is `os_env_set_pass` in the cargo harness (`env_set` disabled in the v0.5 security audit) — `match_guard_pass` is **no longer ignored**, it passes. Canonical status lives in `docs/CURRENT_STATUS.md`; run `pblang test tests/semantics --allow-all` for the live count (the prebuilt-binary runner, no recompile), or `cargo test --test semantics` for the Rust harness.
 
 ---
 
@@ -17,9 +17,9 @@ TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) 
 
 - **W4 TLS builtins**: `tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls` fully working with rustls
 - **E5-gamma**: `crates/pblang-stub` self-extracting binary launcher
-- **SP1-gamma PARTIAL**: Parser restructured; blocked by chumsky 0.8 recovery cascade
+- **SP1 Match guards ✅**: Parser restructured; chumsky cascade worked around with `.or_not()` guard sub-parsers — `match_guard_pass` + colon/tilde-separator tests pass (see SP1 section below)
 - **L4-alpha**: LSP semantic tokens + hover with builtin signatures
-- **N2-beta**: `crates/pblang-cranelift` Cranelift JIT — fibonacci(20)=6765 in native code, benchmark harness
+- **N2-beta**: `crates/pblang-cranelift` Cranelift JIT prototype — numeric straight-line/forward-control-flow paths compile to native code; calls, recursion, globals, closures, collections, and dynamic features fall back to the VM
 - **M4-gamma**: Registry 401-refresh flow verified (test passes)
 - **R3-gamma**: CFG dump tests verified (`pblang --cfg` works end-to-end)
 - **M4-gamma**: Hosted publish flow now has real 401→refresh→retry HTTP unit test in `pblang-pm`
@@ -50,7 +50,7 @@ TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) 
 - **rustls + rustls-pemfile**: Added to `pblang-vm/Cargo.toml` — TLS builtin implementation ready
 - **W4 TLS builtins IMPLEMENTED**: `tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls` fully working with rustls
 - **E5-gamma IMPLEMENTED**: `crates/pblang-stub` self-extracting binary launcher with tar.gz extraction, cleanup, --extract-only, --bundle-version flags
-- **SP1-gamma PARTIAL**: Parser restructured (guarded/unguarded arms split), `~` separator defined; blocked by chumsky 0.8 `parse_recovery` cascade limitation; `BindGuard` compiler+VM fully correct
+- **SP1 Match guards ✅ RESOLVED**: Parser restructured (guarded/unguarded arms split), both `:` and `~` separators accepted; the chumsky 0.8 `parse_recovery` cascade was worked around (`.or_not()` guard sub-parsers); `BindGuard` compiler+VM correct; `match_guard_pass` + separator-variant tests pass
 - **L4-alpha IMPLEMENTED**: LSP semantic tokens (`textDocument/semanticTokens/full`) + hover with builtin signatures and local function docs
 
 ---
@@ -72,24 +72,26 @@ TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) 
 
 ## Pending Tasks
 
-### N2 — Cranelift JIT (highest priority)
+### N2 — Cranelift JIT Expansion
 
-**N2-beta** — Cranelift JIT prototype
+**N2-beta** — Cranelift JIT prototype ✅ / expansion open
 - `crates/pblang-cranelift/`: compile numeric functions to native code
 - Fallback to bytecode interpreter for dynamic features
-- Benchmark: compare JIT vs interpreter for fibonacci(40)
-- Initial focus: OpAdd, OpSub, OpMul, OpDiv, OpCall for f64 paths
+- Current unsupported surface: `OpCall`, `OpTailCall`, global reads/writes, closures/upvalues, collections, attrs/indexing, try/catch, defer
+- Next focus: explicit backend support matrix, then direct calls for simple non-closure functions before recursion benchmarks
 
 ---
 
-### SP1 — Match Guard Parser Fix (blocked)
+### SP1 — Match Guard Parser Fix ✅ RESOLVED
 
-**SP1-gamma** — chumsky 0.8 `parse_recovery` cascade limitation
-- Root cause: `cmp_op.padded().repeated()` generates error cascade at separator chars
-- Fix: migrate to chumsky 0.9+ (improved recovery model) or use winnow/nom
-- Compiler + VM: fully correct (`BindGuard` works end-to-end)
-- Parser: arms split into `guarded_match_arm` / `unguarded_match_arm` (structurally correct)
-- Test: `match_guard_pass` stays `#[ignore]` until parser migration
+- Original blocker: chumsky 0.8 `parse_recovery` cascade at separator chars
+  (`cmp_op.padded().repeated()`) — see [[feedback_chumsky_cascade]]. Worked around
+  with `.or_not()` guard sub-parsers rather than a wholesale parser-library swap.
+- Compiler + VM (`BindGuard`) were always correct; the parser now accepts guarded
+  arms with both the `:` and `~` separators.
+- Tests: `match_guard_pass`, `match_guard_accepts_colon_separator`, and
+  `match_guard_still_accepts_tilde_separator` all **pass** (no longer `#[ignore]`).
+  The suite's only ignored test is `os_env_set_pass` (security policy).
 
 ---
 
@@ -116,7 +118,7 @@ TLS/HTTPS ✅ → E5 Executables ✅ → Match Guard (blocked: parser recovery) 
 | Item | Reason |
 |------|--------|
 | Async runtime | Not planned; VM-per-thread sufficient |
-| OS building / bare-metal | Long-term; requires Cranelift first |
+| OS building / bare-metal | Long-term; requires freestanding codegen/runtime, not just JIT |
 | Full HM type inference | Months; design needed |
 | Debugger / profiler | Post v1.0 |
-| WASM target | Post Cranelift JIT |
+| WASM target | Numeric/string subset exists; broaden after backend support matrix |

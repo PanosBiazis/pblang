@@ -21,6 +21,7 @@ fn main() {
         exec: false,
         gfx: false,
         spawn: false,
+        env: false,
     };
 
     let mut vm = VM::with_stdlib(config);

@@ -1,8 +1,8 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-05-30  
+**Last Updated**: 2026-06-06  
 **Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 135 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen
-**Test Suite**: semantics 189 passed / 0 failed / 1 ignored (only `os_env_set_pass`, an `env_set` safety policy). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`-separator variants now pass.
+**Test Suite**: canonical `.sapp` corpus = **160 passed / 0 failed / 0 ignored** via `pblang test tests/semantics --allow-all` (the prebuilt-binary runner; no recompile). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
 
 ---
 
@@ -140,7 +140,8 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 ## ✅ Test Results
 
 ```
-cargo test --test semantics      → 189 passed; 0 failed; 1 ignored
+pblang test tests/semantics --allow-all → 160 passed; 0 failed; 0 ignored   (canonical .sapp corpus, no recompile)
+cargo test --test semantics      → 192 passed; 0 failed; 1 ignored (os_env_set_pass)
 cargo test --test selfhost_drift → 26 passed; 0 failed; 1 ignored
 cargo test --test modules        → 28 passed; 0 failed
 cargo test --test typeck_compiler→ 5 passed; 0 failed
@@ -196,7 +197,7 @@ The self-host frontier is now **breadth/perf**, not grammar (all language featur
 1. **Differential run** — run a real `stdlib/*.sapp` module through `frontend_run` and diff output against the Rust VM.
 2. **Self-hosted parser speedup** — get `parser.sapp` fast enough on the interpreter to drop the `#[ignore]` on the full-parser `selfhost_drift` case.
 3. **Bootstrap probe** — feed `frontend_compile`'s own source through `frontend_run` and measure how far the pblang compiler gets toward compiling itself.
-4. **Cranelift JIT** (N2-beta) — native code compilation for hot paths.
+4. **Cranelift JIT expansion** (N2-beta+) — the backend is wired and handles a numeric subset; calls/recursion/globals/closures/collections still fall back to the VM and are tracked as backend work.
 5. **LSP depth** — semantic tokens, richer type-aware hover, cross-file intelligence.
 
 **Longer-term vision:** **pbAI** — a native AI model family (a flagship pbAI-Max plus
@@ -208,6 +209,10 @@ to make pblang better, driving the **pb-mcp-server** tool catalog. Design: `docs
 The sections below are preserved for historical traceability and may include
 older milestone wording or counts. Use the top summary and `Test Results`
 section as canonical current status.
+
+Known stale examples in the archive: old test counts, the old "Type System:
+Stub" row, and older LSP/Cranelift maturity notes. Do not treat the archived
+tables as live project status.
 
 ---
 

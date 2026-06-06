@@ -221,6 +221,6 @@ features (closures, dynamic dispatch, import).
 
 ### Stage A — E5-beta implementation status
 
-- Προστέθηκε νέο crate `crates/pblang-stub` με απλό launcher (`pblang-stub`) που προορίζεται ως template για self-extracting binaries (περιέχει sentinel `BIAPRYX_BUNDLE_START\x00` και ελέγχει για embedded bundle).
-- Το `biapryx bundle` δέχεται πλέον προαιρετικό flag **`--self-extract`** (E5-beta): το flag αναγνωρίζεται και κρατιέται για workflows self-extracting runner + bundle, χωρίς να αλλάζει το υπάρχον σχήμα εξόδου του `bundle`.
-- Το πραγματικό embed του stub template + bundle παραμένει σχεδιαστικό βήμα: απαιτεί χειροκίνητο build του `pblang-stub` και αντιγραφή του παραγόμενου binary πάνω από το `stub_template.bin` (ή μελλοντικό εργαλείο που θα το αυτοματοποιεί).
+- Προστέθηκε νέο crate `crates/pblang-stub` με απλό launcher (`pblang-stub`) που χρησιμεύει ως template για self-extracting binaries (περιέχει sentinel `PBLANG_BUNDLE_START\x00` και ελέγχει για embedded bundle).
+- Το `pblang bundle` δέχεται προαιρετικό flag **`--self-extract`** (E5-beta): πλέον παράγει ένα **self-extracting εκτελέσιμο** αντί για κατάλογο bundle — σταδιοποιεί το package (source, `pblang.toml`, `pblang.lock`) μαζί με το τρέχον `pblang` runtime κάτω από `bin/`, το συμπιέζει σε tarball και το συνενώνει πάνω στο `pblang-stub` πίσω από το sentinel `PBLANG_BUNDLE_START\x00`. Η έξοδος προεπιλέγεται στο `[package].name` (`.exe` σε Windows) ή στη διαδρομή του `--output`.
+- Το embed του stub + bundle είναι πλέον υλοποιημένο μέσα στο `pblang bundle --self-extract` (διαβάζει το `pblang-stub` δίπλα στο τρέχον εκτελέσιμο και το συνενώνει με το tarball)· απαιτεί το `pblang-stub` να έχει χτιστεί/εγκατασταθεί δίπλα στο `pblang`.
