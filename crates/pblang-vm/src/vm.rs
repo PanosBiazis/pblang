@@ -66,6 +66,8 @@ mod spawn_wire;
 mod strings;
 mod sync;
 mod tensor;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod time;
 
 use gc::{gc_register_array, gc_register_map, gc_register_module};
@@ -354,6 +356,7 @@ impl StdlibConfig {
             | "tensor_mul"
             | "tensor_scale"
             | "tensor_matmul"
+            | "tensor_backend"
             | "tensor_dot"
             | "tensor_relu"
             | "tensor_sigmoid"
