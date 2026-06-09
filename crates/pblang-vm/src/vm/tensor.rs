@@ -205,6 +205,18 @@ pub(super) fn tensor_matmul_builtin(
         )));
     }
     let k = k1;
+    // Optional GPU offload (opt-in via PBLANG_GPU=1; f32 precision). Only attempted for
+    // large products and when built with --features gpu; otherwise the CPU path runs.
+    #[cfg(feature = "gpu")]
+    {
+        if std::env::var("PBLANG_GPU").ok().as_deref() == Some("1")
+            && m.saturating_mul(n).saturating_mul(k) >= (1 << 16)
+        {
+            if let Some(g) = super::gpu::matmul(&da, &db, m, k, n) {
+                return Ok(tensor_make(vec![m, n], g));
+            }
+        }
+    }
     let mut out = vec![0.0_f64; m * n];
     // Each output row is computed independently, in the same ijk order as the sequential
     // path, so results are bit-identical regardless of threading (deterministic). Large
@@ -230,6 +242,50 @@ pub(super) fn tensor_matmul_builtin(
             .for_each(|(i, row)| compute_row(i, row));
     }
     Ok(tensor_make(vec![m, n], out))
+}
+
+/// tensor_backend() — report the compute backend for tensor math: CPU thread count
+/// (rayon), and whether the optional GPU backend is compiled in / available / enabled.
+/// Honest by construction: without `--features gpu` it reports no GPU.
+pub(super) fn tensor_backend_builtin(
+    _host: &mut dyn VmHost,
+    _args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    let mut m = HashMap::new();
+    m.insert(
+        "cpu_threads".into(),
+        Value::Number(rayon::current_num_threads() as f64),
+    );
+    m.insert("parallel_matmul".into(), Value::Bool(true));
+    m.insert("gpu_feature".into(), Value::Bool(cfg!(feature = "gpu")));
+    #[cfg(feature = "gpu")]
+    {
+        m.insert("gpu_available".into(), Value::Bool(super::gpu::available()));
+        m.insert(
+            "gpu_enabled".into(),
+            Value::Bool(std::env::var("PBLANG_GPU").ok().as_deref() == Some("1")),
+        );
+        m.insert(
+            "gpu_adapter".into(),
+            alloc_string(&super::gpu::adapter_name().unwrap_or_else(|| "none".into())),
+        );
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        m.insert("gpu_available".into(), Value::Bool(false));
+        m.insert("gpu_enabled".into(), Value::Bool(false));
+        m.insert(
+            "gpu_adapter".into(),
+            alloc_string("none (rebuild with --features gpu)"),
+        );
+    }
+    m.insert(
+        "note".into(),
+        alloc_string(
+            "matmul fans out over CPU cores (rayon); GPU offload is f32 and opt-in via PBLANG_GPU=1 when built with --features gpu",
+        ),
+    );
+    Ok(alloc_map(m))
 }
 
 pub(super) fn tensor_dot_builtin(

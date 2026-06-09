@@ -1248,6 +1248,11 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         fun: tensor::tensor_matmul_builtin,
     },
     BuiltinFn {
+        name: "tensor_backend",
+        arity: Some(0),
+        fun: tensor::tensor_backend_builtin,
+    },
+    BuiltinFn {
         name: "tensor_dot",
         arity: Some(2),
         fun: tensor::tensor_dot_builtin,
