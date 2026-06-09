@@ -227,6 +227,33 @@ fn pblang_string_escape(s: &str) -> String {
     out
 }
 
+fn frontend_run_output(source: &str) -> Vec<pblang_vm::Value> {
+    let escaped = pblang_string_escape(source);
+    let driver = format!(
+        r#"
+        let f = import("stdlib:compiler/selfhost_frontend.sapp");
+        let r = f.frontend_run("{escaped}");
+        let i = 0;
+        while i < len(r.output) {{
+            print r.output[i];
+            i = i + 1;
+        }}
+        "#
+    );
+    run_collect(&driver)
+}
+
+fn assert_frontend_run_matches_rust_vm(label: &str, source: &str) {
+    let rust_output = run_collect(source);
+    let selfhost_output = frontend_run_output(source);
+    assert_eq!(
+        selfhost_output, rust_output,
+        "frontend_run output drift for {label}: self-hosted compiler+VM no \
+         longer matches the Rust parser/compiler/VM on a real stdlib-backed \
+         program. Source: {source:?}"
+    );
+}
+
 /// Codegen-level drift: the self-hosted pipeline must lower the core corpus all
 /// the way to bytecode (tokenize → parse → typecheck → codegen) without
 /// crashing. Before the 2026-05-29 codegen alignment fixes, `frontend_compile`
@@ -516,6 +543,51 @@ fn selfhost_drift_runs_multifunction_module() {
     assert_eq!(out[0], pblang_vm::Value::Number(4.0), "count_digits via module constant + builtin");
     assert_eq!(out[1], pblang_vm::Value::Number(15.0), "sum_to while loop");
     assert_eq!(out[2], pblang_vm::Value::Number(415.0), "composed result");
+}
+
+/// Recommended-next-step coverage from docs/CURRENT_STATUS.md: run real stdlib
+/// modules through `frontend_run` and diff their behavior against the Rust VM.
+/// This exercises import pre-resolution, exported function maps, module-level
+/// globals, callbacks, maps, strings, predicates, sibling helper calls, and
+/// fallback paths while keeping the programs small enough for the default
+/// self-host drift suite.
+#[test]
+fn selfhost_drift_stdlib_option_result_matches_rust_vm() {
+    let option_program = r#"
+        let opt = import("stdlib/option.sapp");
+        fn inc(x) { return x + 1; }
+        fn gt5(x) { return x > 5; }
+        fn fallback() { return opt.some(99); }
+        print opt.unwrap(opt.some(41)) + 1;
+        print opt.unwrap_or(opt.none(), 9);
+        print opt.unwrap_or(opt.some(5), 9);
+        print opt.unwrap(opt.map_val(opt.some(4), inc));
+        print opt.is_none(opt.filter(opt.some(3), gt5));
+        print opt.unwrap(opt.or_else(opt.none(), fallback));
+        print opt.is_some(opt.of("x"));
+        print opt.is_none(opt.of(nil));
+        print opt.to_string(opt.some("ok"));
+        print opt.to_string(opt.none());
+    "#;
+    assert_frontend_run_matches_rust_vm("stdlib/option.sapp", option_program);
+
+    let result_program = r#"
+        let res = import("stdlib/result.sapp");
+        fn inc(x) { return x + 1; }
+        fn tag(e) { return "error:" + e; }
+        fn recover(e) { return res.ok(len(e)); }
+        print res.unwrap(res.ok(12));
+        print res.unwrap_or(res.err("missing"), 7);
+        print res.unwrap_or(res.ok(3), 7);
+        print res.unwrap(res.map_val(res.ok(4), inc));
+        print res.unwrap_or_else(res.err("bad"), tag);
+        print res.unwrap(res.or_else(res.err("abcd"), recover));
+        print res.is_ok(res.ok("yes"));
+        print res.is_err(res.err("no"));
+        print res.to_string(res.ok("yes"));
+        print res.to_string(res.err("no"));
+    "#;
+    assert_frontend_run_matches_rust_vm("stdlib/result.sapp", result_program);
 }
 
 /// Inline `if … { } else { }` **expressions** (the value of the chosen branch's

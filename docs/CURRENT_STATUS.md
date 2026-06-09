@@ -202,7 +202,25 @@ The self-host frontier is now **breadth/perf**, not grammar (all language featur
 
 **Longer-term vision:** **pbAI** — a native AI model family (a flagship pbAI-Max plus
 distilled, efficient sub-models) **written in pblang**, used as a coding/debugging agent
-to make pblang better, driving the **pb-mcp-server** tool catalog. Design: `docs/pbAI.md`.
+to make pblang better, driving the **pb-mcp-server** tool catalog. The first reusable
+LLM substrate is now in `stdlib/llm_core.sapp`, `stdlib/llm_tokenizer.sapp`,
+`stdlib/llm_data.sapp`, `stdlib/llm_transformer.sapp`, plus the scale-up
+`llm_attention`, `llm_train`, `llm_stream`, `llm_weights`, `llm_tokenizer_train`,
+`llm_eval`, `llm_quant`, and `llm_binary` modules. `llm_binary` is the first explicit
+bit-level token substrate for token-id bits, bitstreams, byte-bit conversion, and
+binary LM example features. `llm_attention` now exposes live architecture updates
+for adding decoder layers, extending context, and tuning binary adapter strength;
+`llm_train` includes analytic binary-adapter backprop into `binary_projection`,
+analytic deep-input updates for token embeddings, positional embeddings, binary
+projection, and the LM head, adaptive error reduction, feedback loops, and guessing
+loops that keep previous/current feedback and guess states, then evaluate each
+correction or guess as successful or failed with a reward/punish/neutral reinforcement
+signal. Elite selection ranks these candidates, keeps the best, throws the worst, and
+uses the kept elite as the next generation seed.
+pblang owns these generic/Nano foundations; the pbAI-Max product lives in
+`AAP/ai/pbai`; its continuation path now uses pblang threads to run independent
+candidate evaluations in parallel while keeping checkpoint writes parent-only; design:
+`docs/pbAI.md`.
 
 ## Archived snapshot (legacy notes below)
 

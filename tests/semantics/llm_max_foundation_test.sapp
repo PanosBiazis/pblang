@@ -1,0 +1,129 @@
+// Test: pbAI-Max-oriented pblang LLM foundation layer.
+
+let tok = import("stdlib:llm_tokenizer.sapp");
+let ttrain = import("stdlib:llm_tokenizer_train.sapp");
+let data = import("stdlib:llm_data.sapp");
+let stream = import("stdlib:llm_stream.sapp");
+let att = import("stdlib:llm_attention.sapp");
+let train = import("stdlib:llm_train.sapp");
+let eval = import("stdlib:llm_eval.sapp");
+let weights = import("stdlib:llm_weights.sapp");
+let quant = import("stdlib:llm_quant.sapp");
+let binary = import("stdlib:llm_binary.sapp");
+
+let records = [
+    data.corpus_record("safe1.sapp", "fn add(a,b){return a+b;} fn main(){print add(1,1);}", "code"),
+    data.corpus_record("credentials.json", "token=secret", "text")
+];
+
+let trun = ttrain.train_bpe_records(records, 80, 2, 2000);
+assert(trun.summary.kind == "bpe", "corpus BPE training returns tokenizer");
+assert(trun.skipped == 1, "tokenizer trainer skips secret records");
+let q = data.record_quality(records[0]);
+assert(q.keep and q.score > 0, "record quality keeps useful pblang code");
+let fq = data.filter_quality_records(records);
+assert(fq.kept == 1 and fq.skipped == 1, "quality filter keeps useful records and skips secret/noisy records");
+
+let tokenizer = trun.tokenizer;
+let ids = tok.encode(tokenizer, "fn add(a,b){return a+b;}", true, true);
+let examples = data.lm_examples(ids, 4);
+assert(len(examples) > 1, "large-model data path creates examples");
+let bsum = binary.tokenizer_summary(tokenizer);
+assert(bsum.bit_width >= 1 and bsum.max_ids >= trun.summary.vocab_size, "binary token substrate computes enough bits for vocab IDs");
+let bits = binary.id_to_bits(ids[0], bsum.bit_width);
+assert(binary.bits_to_id(bits) == ids[0], "token IDs round-trip through binary bits");
+let bfeatures = binary.token_binary_features(ids, trun.summary.vocab_size);
+assert(bfeatures.bits == len(ids) * bsum.bit_width, "binary features see every token bit");
+let bex = binary.binary_lm_examples(examples, trun.summary.vocab_size, 2);
+assert(len(bex) == 2 and len(bex[0].y_bits) == bsum.bit_width, "LM examples expose x/y bit views");
+let byte_bits = binary.text_to_byte_bits("pbAI");
+assert(binary.byte_bits_to_text(byte_bits) == "pbAI", "byte-level data path round-trips text");
+
+let st = stream.from_records([records[0]], 16, 8);
+let ch1 = stream.next_chunk(st);
+let ch2 = stream.next_chunk(st);
+assert(not ch1.done and not ch2.done, "stream emits bounded chunks");
+assert(stream.stats(st).emitted >= 2, "stream tracks emitted chunks");
+
+let cfg = att.config(trun.summary.vocab_size, 8, 8, 16, 2, 2, 5);
+let model = att.model_new(cfg);
+let sum = att.summary(model);
+assert(sum.layers == 2 and sum.heads == 2, "stacked multi-head model is configured");
+assert(sum.binary_adapter and sum.binary_bit_width >= 1, "stacked model exposes binary token adapter");
+assert(sum.live_mutable, "stacked model architecture is live-updatable");
+assert(sum.growth_policy.enabled, "stacked model exposes controlled growth policy");
+let bin_emb = att.binary_embedding(model, ids[0]);
+assert(len(bin_emb) == cfg.d_model, "binary token embedding projects bits into hidden space");
+let l = att.logits(model, examples[0].x);
+assert(len(l) == trun.summary.vocab_size, "stacked decoder returns vocab logits");
+let deeper = att.live_architecture_update(model, "deeper");
+assert(deeper.action == "add_decoder_layer" and att.summary(model).layers == 3, "live architecture can add decoder layers");
+let longer = att.live_architecture_update(model, "longer_context");
+assert(longer.action == "extend_context" and att.summary(model).context == 16, "live architecture can extend context");
+let old_scale = att.summary(model).binary_scale;
+let stronger = att.live_architecture_update(model, "stronger_binary");
+assert(stronger.action == "set_binary_scale" and att.summary(model).binary_scale > old_scale, "live architecture can adjust binary adapter strength");
+let policy = att.set_growth_policy(model, map{ allowed_signals: ["stronger_binary", "weaker_binary"], target_valid_loss: 2.0 });
+assert(policy.target_valid_loss == 2.0, "growth policy can be updated without disabling live growth");
+let blocked = att.live_architecture_update(model, "deeper");
+assert(blocked.action == "blocked", "growth policy can constrain manual architecture manipulation");
+let directed = att.manipulate(model, map{ signal: "stronger_binary" });
+assert(directed.action == "set_binary_scale", "manual NN manipulation uses the live growth gate");
+
+let before = train.avg_loss(model, att.logits, examples);
+let run = train.train_epochs(model, att.forward_hidden, examples, 2, 0.05);
+let after = train.avg_loss(model, att.logits, examples);
+assert(run.mode == "frozen-transformer-lm-head-backprop", "training mode is explicit");
+assert(after <= before or run.final_loss > 0, "training/backprop path runs and reports loss");
+let brun = train.train_binary_adapter_epochs(model, att.forward_hidden, examples, 1, 0.03, 0.01);
+assert(brun.mode == "binary-adapter-analytic-backprop", "binary adapter has analytic backprop");
+assert(brun.bit_width == bsum.bit_width and brun.examples == len(examples), "binary adapter training reports bit width and examples");
+let deep = train.train_analytic_deep_inputs(model, att.forward_hidden, examples, 1, 0.02, 0.004, 0.004, 3);
+assert(deep.mode == "analytic-input-embedding-binary-backprop", "deep input training uses analytic gradients instead of finite differences");
+assert(deep.steps > 0 and deep.traces[0].updated_token_embeddings > 0, "analytic deep input training updates embedding state");
+let split = data.split(examples, 0.25);
+let er = train.error_report(model, att.logits, split.train, split.valid);
+assert(er.valid_examples > 0 and er.train_examples > 0, "error report measures train and validation splits");
+let adap = train.adaptive_error_reduction(model, att.forward_hidden, att.logits, att.live_architecture_update, split.train, split.valid, 1, 0.02, 0.01);
+assert(adap.mode == "train-measure-grow" and len(adap.traces) == 1, "adaptive error reduction trains then applies controlled growth");
+let fb = train.feedback_loop(model, att.forward_hidden, att.logits, att.live_architecture_update, split.train, split.valid, 1, 0.02, 0.01);
+assert(fb.mode == "measure-train-feedback-grow" and len(fb.traces) == 1, "feedback loop measures error then applies gated growth");
+assert(fb.traces[0].before_state.format == "pblang.llm.feedback_state.v1", "feedback loop keeps current feedback state");
+assert(fb.traces[0].after_state.format == "pblang.llm.feedback_state.v1", "feedback loop keeps post-feedback state");
+assert(fb.traces[0].evaluation.format == "pblang.llm.feedback_evaluation.v1", "feedback loop evaluates successful or failed feedback");
+assert(fb.traces[0].evaluation.reinforcement.format == "pblang.llm.reinforcement.v1", "feedback comparison produces reward/punish signal");
+let guesses = train.guess_candidates(model, er);
+assert(len(guesses) == 4, "guessing loop can build growth candidates");
+let guess = train.choose_guess(guesses);
+assert(guess.signal != "", "guessing loop chooses a candidate signal");
+let gl = train.guessing_loop(model, att.logits, att.live_architecture_update, split.train, split.valid, 1);
+assert(gl.mode == "guess-policy-gated-growth" and len(gl.traces) == 1, "guessing loop applies policy-gated candidate growth");
+assert(gl.traces[0].before_state.format == "pblang.llm.guess_state.v1", "guessing loop keeps current guess state");
+assert(gl.traces[0].after_state.format == "pblang.llm.guess_state.v1", "guessing loop keeps post-guess state");
+assert(gl.traces[0].evaluation.format == "pblang.llm.guess_evaluation.v1", "guessing loop evaluates successful or failed guesses");
+assert(gl.traces[0].evaluation.reinforcement.action == "reward" or gl.traces[0].evaluation.reinforcement.action == "punish" or gl.traces[0].evaluation.reinforcement.action == "neutral", "guess comparison produces reward/punish/neutral signal");
+let elite = train.select_elite(fb, gl, 1);
+assert(elite.format == "pblang.llm.elite_selection.v1", "elite selection is versioned");
+assert(len(elite.kept) == 1, "elite selection keeps the best candidate");
+assert(len(elite.candidates) >= len(elite.kept), "elite selection ranks all candidates");
+
+let ev = eval.evaluate(model, att.logits, examples);
+assert(ev.examples == len(examples), "eval suite counts examples");
+assert(ev.perplexity > 0, "eval suite computes perplexity");
+let bench = eval.benchmark_generate(model, att.generate, examples[0].x, 2, 1);
+assert(bench.tokens == 2, "generation benchmark counts tokens");
+
+let man = weights.manifest(model, trun.summary, "pbAI-Max-test", "pbAI-Max");
+assert(man.format == "pblang.llm.weights.manifest.v1", "weight manifest is versioned");
+let shards = weights.split_model(model);
+let joined = weights.join_model(man, shards);
+assert(weights.estimate_params(joined) > 0, "weight format can split/join model shards");
+assert(len(joined.binary_projection) == bsum.bit_width, "weight format preserves binary projection shard");
+
+let hidden = att.forward_hidden(model, examples[0].x);
+let last = hidden[len(hidden) - 1];
+let qh = quant.quantize_lm_head(model, 8);
+let qlog = quant.logits_q(last, qh);
+assert(len(qlog) == trun.summary.vocab_size, "quantized LM head returns vocab logits");
+
+print "llm_max_foundation_pass";

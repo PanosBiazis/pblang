@@ -4,7 +4,9 @@ This manual covers the **code-first** browser IDE in `editors/ide/index.html` an
 
 > Looking for the **visual drag-and-drop designer** (build desktop GUI, web, and CLI apps by dragging interactive elements — Delphi / Qt Designer / WordPress / Joomla / Android Studio / VS Code style)? That's **pblang Studio**, the visual authoring layer on top of this IDE — see **[`docs/Visual_Designer.md`](Visual_Designer.md)** (design/roadmap).
 >
-> **Goal:** the IDE itself is to be **written in pblang** (a self-hosted IDE on pblang's own runtime). The HTML/JS `index.html` below is the bootstrap toward that target.
+> **Native IDE:** the self-hosted pblang implementation has started. Run `pblang --ide`
+> for the browser-free native IDE (`editors/ide/pbide.sapp`) with Code, Terminal,
+> Designer, AI, and Browser panels. See **[`docs/PB_IDE.md`](PB_IDE.md)**.
 
 ## 1. Start the IDE
 
@@ -103,6 +105,11 @@ program into the editor).
 - **⚛ Quantum** — place H/X/Z/CNOT/Measure gates on a qubit grid; **▶ Simulate** runs a
   browser state-vector simulation (basis-state probabilities); codegen targets
   `stdlib/quantum.sapp` (`circuit`/`h`/`cx`/`measure`/`run`).
+
+Native Designer (`pblang --ide`) now has a parallel pblang-only surface: label/button/
+textbox/checkbox/panel palette, 3D cube/ball design items, drag/move/edit, `LAYOUT`
+cycling through free/responsive/grid/stack positions via `stdlib/design_engine.sapp`,
+and `->CODE` generation into the editor.
 
 ## 2c. Web browser — written in pblang (`🌐 Browser` / `Ctrl+B`)
 

@@ -1,0 +1,355 @@
+// stdlib/llm_attention.sapp -- stacked multi-head decoder attention for pbAI-Max work.
+//
+// This is an inference/runtime substrate: multi-head causal attention, decoder layers,
+// stacked decoder models, logits, and generation. Training utilities live in
+// llm_train.sapp so the forward path stays reusable.
+
+let core = import("stdlib:llm_core.sapp");
+let binary = import("stdlib:llm_binary.sapp");
+
+fn config(vocab_size, context, d_model, d_ff, layers, heads, seed) {
+    return map{
+        format: "pblang.llm.stack.config.v1",
+        vocab_size: vocab_size,
+        context: context,
+        d_model: d_model,
+        d_ff: d_ff,
+        layers: layers,
+        heads: heads,
+        binary_bit_width: binary.bit_width(vocab_size),
+        binary_scale: 0.05,
+        growth_policy: map{
+            format: "pblang.llm.live_growth_policy.v1",
+            enabled: true,
+            mode: "controlled",
+            target_valid_loss: 3.5,
+            target_accuracy: 0.25,
+            overfit_gap: 1.0,
+            max_growth_steps: 3,
+            manual_override: true,
+            allowed_signals: ["stronger_binary", "weaker_binary", "longer_context", "deeper"]
+        },
+        seed: seed
+    };
+}
+
+fn _layer_new(cfg, idx) {
+    let d = cfg.d_model;
+    let s = cfg.seed + idx * 100;
+    return map{
+        Wq: core.randn_matrix(d, d, s + 1, 0.04),
+        Wk: core.randn_matrix(d, d, s + 2, 0.04),
+        Wv: core.randn_matrix(d, d, s + 3, 0.04),
+        Wo: core.randn_matrix(d, d, s + 4, 0.04),
+        W1: core.randn_matrix(d, cfg.d_ff, s + 5, 0.04),
+        b1: core.zeros(cfg.d_ff),
+        W2: core.randn_matrix(cfg.d_ff, d, s + 6, 0.04),
+        b2: core.zeros(d)
+    };
+}
+
+fn model_new(cfg) {
+    let layers = [];
+    let i = 0;
+    while i < cfg.layers {
+        push(layers, _layer_new(cfg, i));
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.llm.stacked_decoder.v1",
+        config: cfg,
+        token_embedding: core.randn_matrix(cfg.vocab_size, cfg.d_model, cfg.seed + 1, 0.08),
+        pos_embedding: core.randn_matrix(cfg.context, cfg.d_model, cfg.seed + 2, 0.02),
+        binary_projection: core.randn_matrix(cfg.binary_bit_width, cfg.d_model, cfg.seed + 3, 0.02),
+        layers: layers,
+        lm_head: core.randn_matrix(cfg.d_model, cfg.vocab_size, cfg.seed + 999, 0.04),
+        lm_bias: core.zeros(cfg.vocab_size)
+    };
+}
+
+fn binary_embedding(model, token_id) {
+    let width = try model.config.binary_bit_width catch binary.bit_width(model.config.vocab_size);
+    let scale = try model.config.binary_scale catch 0.05;
+    let bits = binary.id_to_bits(token_id, width);
+    let proj = try model.binary_projection catch core.zeros2(width, model.config.d_model);
+    return core.scale_vec(core.vecmat(bits, proj), scale);
+}
+
+fn embed(model, ids) {
+    let out = [];
+    let i = 0;
+    while i < len(ids) {
+        push(out, core.add_vec(model.token_embedding[ids[i]], model.pos_embedding[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _slice(v, start, end) {
+    let out = [];
+    let i = start;
+    while i < end {
+        push(out, v[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _write_slice(dst, start, values) {
+    let i = 0;
+    while i < len(values) {
+        dst[start + i] = values[i];
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn _head_context(q, keys, values, pos, head_dim) {
+    let scores = [];
+    let scale = 1.0 / num_sqrt(head_dim);
+    let i = 0;
+    while i <= pos {
+        push(scores, core.dot(q, keys[i]) * scale);
+        i = i + 1;
+    }
+    let probs = core.softmax(scores, 1.0);
+    let ctx = core.zeros(head_dim);
+    let j = 0;
+    while j < len(probs) {
+        ctx = core.add_vec(ctx, core.scale_vec(values[j], probs[j]));
+        j = j + 1;
+    }
+    return ctx;
+}
+
+fn multi_head_attention(layer, x, heads) {
+    let d = len(x[0]);
+    let head_dim = d / heads;
+    let q = [];
+    let k = [];
+    let v = [];
+    let i = 0;
+    while i < len(x) {
+        push(q, core.vecmat(x[i], layer.Wq));
+        push(k, core.vecmat(x[i], layer.Wk));
+        push(v, core.vecmat(x[i], layer.Wv));
+        i = i + 1;
+    }
+    let out = [];
+    let t = 0;
+    while t < len(x) {
+        let joined = core.zeros(d);
+        let h = 0;
+        while h < heads {
+            let start = h * head_dim;
+            let end = start + head_dim;
+            let qh = _slice(q[t], start, end);
+            let kh = [];
+            let vh = [];
+            let p = 0;
+            while p <= t {
+                push(kh, _slice(k[p], start, end));
+                push(vh, _slice(v[p], start, end));
+                p = p + 1;
+            }
+            let ctx = _head_context(qh, kh, vh, t, head_dim);
+            joined = _write_slice(joined, start, ctx);
+            h = h + 1;
+        }
+        push(out, core.vecmat(joined, layer.Wo));
+        t = t + 1;
+    }
+    return out;
+}
+
+fn feed_forward(layer, x) {
+    let h = core.relu_vec(core.add_vec(core.vecmat(x, layer.W1), layer.b1));
+    return core.add_vec(core.vecmat(h, layer.W2), layer.b2);
+}
+
+fn decoder_layer(model, layer, x) {
+    let att = multi_head_attention(layer, x, model.config.heads);
+    let h = [];
+    let i = 0;
+    while i < len(x) {
+        push(h, core.layer_norm_vec(core.add_vec(x[i], att[i]), 0.00001));
+        i = i + 1;
+    }
+    let out = [];
+    let j = 0;
+    while j < len(h) {
+        push(out, core.layer_norm_vec(core.add_vec(h[j], feed_forward(layer, h[j])), 0.00001));
+        j = j + 1;
+    }
+    return out;
+}
+
+fn forward_hidden(model, ids) {
+    let h = embed(model, ids);
+    let i = 0;
+    while i < len(model.layers) {
+        h = decoder_layer(model, model.layers[i], h);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn logits(model, ids) {
+    let h = forward_hidden(model, ids);
+    let last = h[len(h) - 1];
+    let adapted = core.add_vec(last, binary_embedding(model, ids[len(ids) - 1]));
+    return core.add_vec(core.vecmat(adapted, model.lm_head), model.lm_bias);
+}
+
+fn loss(model, ids, target_id) {
+    return core.cross_entropy_from_logits(logits(model, ids), target_id);
+}
+
+fn generate(model, seed_ids, n) {
+    let ids = core.copy_vec(seed_ids);
+    let step = 0;
+    while step < n {
+        let start = len(ids) - model.config.context;
+        if start < 0 { start = 0; }
+        let ctx = [];
+        let i = start;
+        while i < len(ids) {
+            push(ctx, ids[i]);
+            i = i + 1;
+        }
+        push(ids, core.argmax(logits(model, ctx)));
+        step = step + 1;
+    }
+    return ids;
+}
+
+fn add_decoder_layer(model) {
+    let idx = len(model.layers);
+    push(model.layers, _layer_new(model.config, idx));
+    model.config.layers = len(model.layers);
+    return map{
+        format: "pblang.llm.architecture_update.v1",
+        action: "add_decoder_layer",
+        layers: model.config.layers,
+        d_model: model.config.d_model,
+        d_ff: model.config.d_ff,
+        heads: model.config.heads
+    };
+}
+
+fn extend_context(model, new_context) {
+    if new_context <= model.config.context {
+        return map{
+            format: "pblang.llm.architecture_update.v1",
+            action: "extend_context",
+            changed: false,
+            context: model.config.context
+        };
+    }
+    let i = len(model.pos_embedding);
+    while i < new_context {
+        push(model.pos_embedding, core.randn_vec(model.config.d_model, model.config.seed + 2000 + i, 0.02));
+        i = i + 1;
+    }
+    model.config.context = new_context;
+    return map{
+        format: "pblang.llm.architecture_update.v1",
+        action: "extend_context",
+        changed: true,
+        context: model.config.context
+    };
+}
+
+fn set_binary_scale(model, scale) {
+    if scale < 0.001 { scale = 0.001; }
+    if scale > 1.0 { scale = 1.0; }
+    model.config.binary_scale = scale;
+    return map{
+        format: "pblang.llm.architecture_update.v1",
+        action: "set_binary_scale",
+        binary_scale: model.config.binary_scale
+    };
+}
+
+fn set_growth_policy(model, policy) {
+    let old = try model.config.growth_policy catch map{};
+    if not map_has(old, "format") { old = config(model.config.vocab_size, model.config.context, model.config.d_model, model.config.d_ff, model.config.layers, model.config.heads, model.config.seed).growth_policy; }
+    if map_has(policy, "enabled") { old.enabled = policy.enabled; }
+    if map_has(policy, "target_valid_loss") { old.target_valid_loss = policy.target_valid_loss; }
+    if map_has(policy, "target_accuracy") { old.target_accuracy = policy.target_accuracy; }
+    if map_has(policy, "overfit_gap") { old.overfit_gap = policy.overfit_gap; }
+    if map_has(policy, "max_growth_steps") { old.max_growth_steps = policy.max_growth_steps; }
+    if map_has(policy, "manual_override") { old.manual_override = policy.manual_override; }
+    if map_has(policy, "allowed_signals") { old.allowed_signals = policy.allowed_signals; }
+    model.config.growth_policy = old;
+    return old;
+}
+
+fn _allowed(policy, signal) {
+    let allowed = try policy.allowed_signals catch ["stronger_binary", "weaker_binary", "longer_context", "deeper"];
+    let i = 0;
+    while i < len(allowed) {
+        if allowed[i] == signal { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn live_architecture_update(model, signal) {
+    let policy = try model.config.growth_policy catch map{ enabled: true, manual_override: true, allowed_signals: ["stronger_binary", "weaker_binary", "longer_context", "deeper"] };
+    if map_has(policy, "enabled") and not policy.enabled {
+        return map{ format: "pblang.llm.architecture_update.v1", action: "blocked", reason: "live growth disabled", signal: signal };
+    }
+    if not _allowed(policy, signal) {
+        return map{ format: "pblang.llm.architecture_update.v1", action: "blocked", reason: "signal not allowed by growth policy", signal: signal };
+    }
+    if signal == "deeper" { return add_decoder_layer(model); }
+    if signal == "longer_context" { return extend_context(model, model.config.context * 2); }
+    if signal == "stronger_binary" { return set_binary_scale(model, model.config.binary_scale * 1.25); }
+    if signal == "weaker_binary" { return set_binary_scale(model, model.config.binary_scale * 0.8); }
+    return map{
+        format: "pblang.llm.architecture_update.v1",
+        action: "noop",
+        signal: signal,
+        layers: model.config.layers,
+        context: model.config.context,
+        binary_scale: try model.config.binary_scale catch 0.05
+    };
+}
+
+fn manipulate(model, directive) {
+    let signal = try directive.signal catch "";
+    let policy = try directive.policy catch nil;
+    if policy != nil { set_growth_policy(model, policy); }
+    if signal == "set_binary_scale" { return set_binary_scale(model, directive.value); }
+    if signal != "" { return live_architecture_update(model, signal); }
+    return map{
+        format: "pblang.llm.architecture_update.v1",
+        action: "noop",
+        reason: "directive has no signal",
+        policy: try model.config.growth_policy catch map{}
+    };
+}
+
+fn summary(model) {
+    return map{
+        format: model.format,
+        vocab_size: model.config.vocab_size,
+        context: model.config.context,
+        d_model: model.config.d_model,
+        d_ff: model.config.d_ff,
+        layers: model.config.layers,
+        heads: model.config.heads,
+        binary_bit_width: try model.config.binary_bit_width catch binary.bit_width(model.config.vocab_size),
+        binary_adapter: true,
+        binary_scale: try model.config.binary_scale catch 0.05,
+        live_mutable: true,
+        live_updates: ["deeper", "longer_context", "stronger_binary", "weaker_binary"],
+        growth_policy: try model.config.growth_policy catch map{}
+    };
+}
+
+export config, model_new, embed, multi_head_attention, decoder_layer, forward_hidden;
+export binary_embedding, logits, loss, generate;
+export add_decoder_layer, extend_context, set_binary_scale, set_growth_policy;
+export live_architecture_update, manipulate, summary;

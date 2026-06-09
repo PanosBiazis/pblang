@@ -17,6 +17,24 @@
 
 All three are written in pblang (per the rust→pblang directive).
 
+## IDE / Studio protocol consumers
+
+The protocol work is not separate from the IDE. pblang Studio has several places where
+protocol design matters:
+
+- **IDE gateway traffic** — browser IDE panels call local pblang gateways for pbAI,
+  browsing, and tools. These should eventually prefer PBP or a securelayer-wrapped
+  payload when talking to pblang peers, while keeping HTTP compatibility for browsers.
+- **Native IDE (`pblang --ide`)** — the browser-free IDE removes DOM/JS attack surface,
+  but still needs explicit protocols for tool calls, pbAI, package/registry access, and
+  future collaboration.
+- **Design documents (`.pbui`)** — visual Studio data should serialize through a stable,
+  authenticated format: item tree, responsive layout metadata, 2D/3D/nD coordinates,
+  event bindings, and generated-code links. The new `stdlib/design_engine.sapp` item
+  model is the local in-memory shape; PBP/securelayer is the network/storage direction.
+- **Browser panel** — existing HTTP compatibility remains required, but pblang-to-pblang
+  pages/services can use PBP as the compact secure transport behind the same UI.
+
 ---
 
 ## Tier 2 — the security layer (`securelayer.sapp`)
@@ -111,5 +129,8 @@ everything**.*
    control; a compatibility **bridge** (PBP ⇄ HTTP) so PBP services are reachable from
    the current web.
 4. Wire the security layer through the IDE gateway and the pblang web browser.
+5. Define a Studio design-document protocol (`.pbui`) for 2D/3D/nD layouts, event
+   bindings, and code links; store locally as readable data and transmit over
+   securelayer/PBP for collaboration.
 
 *Next per the plan: continue the browser, then anything else.*
