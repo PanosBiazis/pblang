@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
+use rayon::prelude::*;
 
 use super::{alloc_array, alloc_map};
 
@@ -205,16 +206,28 @@ pub(super) fn tensor_matmul_builtin(
     }
     let k = k1;
     let mut out = vec![0.0_f64; m * n];
-    // Naive ijk; OK for moderate sizes and avoids extra deps.
-    for i in 0..m {
+    // Each output row is computed independently, in the same ijk order as the sequential
+    // path, so results are bit-identical regardless of threading (deterministic). Large
+    // products fan out across CPU cores via rayon; small ones stay sequential to avoid
+    // thread-pool overhead.
+    let compute_row = |i: usize, row: &mut [f64]| {
         for p in 0..k {
             let a_ip = da[i * k + p];
-            let row_off = i * n;
             let b_row = p * n;
             for j in 0..n {
-                out[row_off + j] += a_ip * db[b_row + j];
+                row[j] += a_ip * db[b_row + j];
             }
         }
+    };
+    let work = m.saturating_mul(n).saturating_mul(k);
+    if work >= 1 << 16 {
+        out.par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(i, row)| compute_row(i, row));
+    } else {
+        out.chunks_mut(n)
+            .enumerate()
+            .for_each(|(i, row)| compute_row(i, row));
     }
     Ok(tensor_make(vec![m, n], out))
 }
