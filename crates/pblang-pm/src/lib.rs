@@ -102,6 +102,14 @@ pub enum DependencySpec {
     Detailed {
         #[serde(default)]
         path: Option<String>,
+        /// Additional candidate paths, tried in order after `path` when resolving a
+        /// local path dependency (first existing wins). Lets one committed manifest
+        /// resolve the same dependency across different checkout layouts (e.g. a Linux
+        /// `../../pl-dev/pblang/stdlib` vs a Windows `../pblang/stdlib`) without any
+        /// per-machine edits. Each entry also supports `${VAR}` env expansion and a
+        /// leading `~`.
+        #[serde(default)]
+        paths: Option<Vec<String>>,
         #[serde(default)]
         git: Option<String>,
         #[serde(default)]
@@ -118,6 +126,24 @@ impl DependencySpec {
             DependencySpec::Version(_) => None,
             DependencySpec::Detailed { path, .. } => path.as_deref(),
         }
+    }
+
+    /// All local path candidates in priority order: `path` first (if set), then any
+    /// `paths` fallbacks. The resolver tries each until one exists on disk, so a
+    /// single manifest can resolve across machine layouts.
+    pub fn path_candidates(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        if let DependencySpec::Detailed { path, paths, .. } = self {
+            if let Some(p) = path.as_deref() {
+                out.push(p);
+            }
+            if let Some(list) = paths {
+                for p in list {
+                    out.push(p.as_str());
+                }
+            }
+        }
+        out
     }
 
     /// Returns the git URL, if any.
@@ -142,6 +168,41 @@ impl DependencySpec {
             DependencySpec::Detailed { rev, .. } => rev.as_deref(),
         }
     }
+}
+
+/// Expand `${VAR}` environment references inside a string. Unknown variables expand
+/// to empty. UTF-8 safe; a `${` with no closing `}` is left verbatim.
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("${") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        if let Some(end) = after.find('}') {
+            let var = &after[..end];
+            if let Ok(val) = std::env::var(var) {
+                out.push_str(&val);
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push_str(&rest[pos..]);
+            rest = "";
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Expand a dependency path string: a leading `~` becomes the home directory and
+/// `${VAR}` references are substituted. Best-effort and cross-platform.
+fn expand_dep_path(raw: &str) -> String {
+    let mut s = raw.to_string();
+    if s == "~" || s.starts_with("~/") || s.starts_with("~\\") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            s = format!("{}{}", home.to_string_lossy(), &s[1..]);
+        }
+    }
+    expand_env_vars(&s)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1426,12 +1487,23 @@ pub fn resolve_import(
                         "dependency '{pkg}' is not installed; run `pblang install` first"
                     ));
                 }
-                let rel = dep
-                    .path()
-                    .ok_or_else(|| format!("dependency '{pkg}' has no path"))?;
-                let root = man_dir.join(rel);
-                let root = canonicalize_existing(&root)
-                    .ok_or_else(|| format!("dependency path not found: {}", root.display()))?;
+                let candidates = dep.path_candidates();
+                if candidates.is_empty() {
+                    return Err(format!("dependency '{pkg}' has no path"));
+                }
+                let mut resolved: Option<PathBuf> = None;
+                let mut tried: Vec<String> = Vec::new();
+                for rel in &candidates {
+                    let cand = man_dir.join(expand_dep_path(rel));
+                    if let Some(c) = canonicalize_existing(&cand) {
+                        resolved = Some(c);
+                        break;
+                    }
+                    tried.push(cand.display().to_string());
+                }
+                let root = resolved.ok_or_else(|| {
+                    format!("dependency '{pkg}' path not found; tried: {}", tried.join(", "))
+                })?;
                 verify_package_tree_for_path_dep(&root)?;
                 root
             };
