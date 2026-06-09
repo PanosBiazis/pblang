@@ -14,6 +14,9 @@
 // here are useful today and 100% pblang.
 
 let nn = import("stdlib/nn.sapp");
+let MCP = import("stdlib:pb_mcp.sapp");
+let PBAI_ASSETS = import("stdlib/pbai_assets.sapp");
+let PBAI_LM = import("stdlib/pbai_lm.sapp");
 
 // ── Text utilities ───────────────────────────────────────────────────────────────────
 fn _count(s, sub) {
@@ -25,7 +28,8 @@ fn _count(s, sub) {
 // Bag-of-keywords features → an MLP → one of 5 intents. Trained once, in pblang.
 let _VOCAB = ["explain", "what", "does", "describe", "step", "bug", "error",
     "wrong", "mistake", "fix", "issue", "improve", "better", "optimize",
-    "refactor", "comment", "document", "how", "why", "generate", "write", "review"];
+    "refactor", "comment", "document", "how", "why", "generate", "write", "review",
+    "security", "sandbox", "capability", "ide", "browser", "typeclass", "logic", "reactive"];
 
 // intent ids: 0 explain  1 bugs  2 improve  3 comment  4 general
 let _INTENTS = ["explain", "bugs", "improve", "comment", "general"];
@@ -87,6 +91,14 @@ fn classify(prompt) {
     return nn.argmax(nn.predict(_model(), _featurize(prompt)));
 }
 
+fn classify_scores(prompt) {
+    let y = nn.predict(_model(), _featurize(prompt));
+    return map{
+        intent: _INTENTS[nn.argmax(y)],
+        scores: y,
+    };
+}
+
 // ── Code inspection (grounded analysis) ──────────────────────────────────────────────
 // Pull the code out of an IDE prompt: prefer the part after a fenced/labelled marker,
 // else everything after the first blank line, else the whole text.
@@ -108,6 +120,53 @@ fn _extract_code(prompt) {
 ");
     if nl >= 0 { return str_trim(str_slice(prompt, nl, len(prompt))); }
     return str_trim(prompt);
+}
+
+fn _looks_like_map_index_read(code) {
+    return (str_contains(code, "map{") or str_contains(code, "map =") or str_contains(code, "map="))
+        and str_contains(code, "[")
+        and not str_contains(code, "map_has");
+}
+
+fn _looks_like_missing_fn(code) {
+    let t = str_trim(code);
+    if str_starts_with(t, "fn ") or str_starts_with(t, "export fn ") { return false; }
+    let paren = str_index_of(t, "(");
+    let br = str_index_of(t, "{");
+    return paren > 0 and br > paren;
+}
+
+fn _looks_like_missing_let_equals(code) {
+    let parts = str_split(code, "let ");
+    let i = 1;
+    while i < len(parts) {
+        let stmt = parts[i];
+        let semi = str_index_of(stmt, ";");
+        if semi >= 0 { stmt = str_slice(stmt, 0, semi); }
+        if str_index_of(stmt, "=") < 0 and str_index_of(stmt, "(") > 0 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _looks_like_fs_name_typo(code) {
+    return str_contains(code, "fs read(") or str_contains(code, "fs write(");
+}
+
+fn _repair_preview(code) {
+    let out = str_trim(code);
+    out = str_replace_all(out, "print(s);", "print s;");
+    out = str_replace_all(out, "print(x);", "print x;");
+    out = str_replace_all(out, "print(path);", "print path;");
+    out = str_replace_all(out, "print(42);", "print 42;");
+    out = str_replace_all(out, "fs read(", "fs_read(");
+    out = str_replace_all(out, "fs write(", "fs_write(");
+    out = str_replace_all(out, "let s  fs_read(", "let s = fs_read(");
+    out = str_replace_all(out, "let s fs_read(", "let s = fs_read(");
+    out = str_replace_all(out, "let s  fs_write(", "let s = fs_write(");
+    out = str_replace_all(out, "let s fs_write(", "let s = fs_write(");
+    if _looks_like_missing_fn(out) { out = "fn " + out; }
+    return out;
 }
 
 fn _fn_names(code) {
@@ -171,6 +230,11 @@ fn _scan(code) {
         imports: _count(code, "import("),
         closures: _count(code, "fn("),
         returns: _count(code, "return"),
+        execs: _count(code, "proc_spawn") + _count(code, "exec(") + _count(code, "polyglot_exec"),
+        ffi: _count(code, "ffi_") + _count(code, "import(\"stdlib:ffi"),
+        http: _count(code, "http_get") + _count(code, "http_post") + _count(code, "import(\"stdlib:http"),
+        fs: _count(code, "fs_read") + _count(code, "fs_write") + _count(code, "import(\"stdlib:fs"),
+        env: _count(code, "env_get") + _count(code, "env_set"),
         todos: _count(lc, "todo") + _count(lc, "fixme"),
         open_brace: _count(code, "{"), close_brace: _count(code, "}"),
         open_paren: _count(code, "("), close_paren: _count(code, ")"),
@@ -181,9 +245,54 @@ fn _scan(code) {
     };
 }
 
+fn _quality_score(s) {
+    let score = 100;
+    score = score - s.todos * 12;
+    score = score - s.depth * 5;
+    score = score - (s.whiles + s.fors) * 2;
+    score = score - s.ifs;
+    if s.open_brace != s.close_brace { score = score - 30; }
+    if s.open_paren != s.close_paren { score = score - 30; }
+    if s.open_brack != s.close_brack { score = score - 30; }
+    if score < 0 { score = 0; }
+    if score > 100 { score = 100; }
+    return score;
+}
+
+fn _risk_summary(s) {
+    let caps = [];
+    if s.fs > 0 { array_push(caps, "fs"); }
+    if s.http > 0 { array_push(caps, "http"); }
+    if s.execs > 0 { array_push(caps, "exec"); }
+    if s.ffi > 0 { array_push(caps, "ffi"); }
+    if s.env > 0 { array_push(caps, "env"); }
+    if len(caps) == 0 { return "no obvious sensitive capability use"; }
+    let out = "";
+    for i len(caps) {
+        if i > 0 { out = out + ", "; }
+        out = out + caps[i];
+    }
+    return "uses sensitive capability area(s): " + out;
+}
+
+fn analyze(prompt) {
+    let code = _extract_code(prompt);
+    let s = _scan(code);
+    let c = classify_scores(prompt);
+    return map{
+        intent: c.intent,
+        scores: c.scores,
+        has_code: _has_code(code, s),
+        quality: _quality_score(s),
+        risk: _risk_summary(s),
+        scan: s,
+    };
+}
+
 // ── Skills ───────────────────────────────────────────────────────────────────────────
 fn _explain(code, s) {
     let out = "pbAI: code overview\n";
+    out = out + "- quality score: " + str(_quality_score(s)) + "/100; " + _risk_summary(s) + ".\n";
     if s.fns > 0 { out = out + "- " + str(s.fns) + " function(s): " + _fn_names(code) + "\n"; }
     else { out = out + "- top-level script (no function definitions)\n"; }
     out = out + "- " + str(s.lines) + " line(s), " + str(s.lets) + " binding(s)";
@@ -207,7 +316,17 @@ fn _explain(code, s) {
 
 fn _bugs(code, s) {
     let out = "pbAI: review (pblang-aware)\n";
+    out = out + "- quality score: " + str(_quality_score(s)) + "/100; " + _risk_summary(s) + ".\n";
     let found = 0;
+    if _looks_like_missing_fn(code) {
+        out = out + "- missing `fn` before the function name.\n"; found = found + 1;
+    }
+    if _looks_like_missing_let_equals(code) {
+        out = out + "- missing `=` in a `let` binding; write `let name = value;`.\n"; found = found + 1;
+    }
+    if _looks_like_fs_name_typo(code) {
+        out = out + "- `fs read(...)` / `fs write(...)` are not pblang builtins; use `fs_read(...)` / `fs_write(...)`.\n"; found = found + 1;
+    }
     if s.open_brace != s.close_brace {
         out = out + "! unbalanced braces: " + str(s.open_brace) + " '{' vs " + str(s.close_brace) + " '}'.\n"; found = found + 1;
     }
@@ -227,7 +346,7 @@ fn _bugs(code, s) {
     if str_contains(code, "\" <") or str_contains(code, "\" >") or str_contains(code, "< \"") or str_contains(code, "> \"") {
         out = out + "- string `<`/`>` comparison is unsupported; compare via strcharcodeat / length.\n"; found = found + 1;
     }
-    if str_contains(code, "[") and str_contains(code, "map") {
+    if _looks_like_map_index_read(code) {
         out = out + "- reading a MISSING map key RAISES (it is not nil); guard with `map_has(m, k)`.\n"; found = found + 1;
     }
     if str_contains(code, "while true") or str_contains(code, "while (true)") {
@@ -236,10 +355,23 @@ fn _bugs(code, s) {
     if str_contains(code, "/ 0") or str_contains(code, "/0") {
         out = out + "- possible division by zero — guard the denominator.\n"; found = found + 1;
     }
+    if s.execs > 0 {
+        out = out + "- exec/polyglot process calls require `--allow-exec`; never pass untrusted strings directly to a shell.\n"; found = found + 1;
+    }
+    if s.ffi > 0 {
+        out = out + "- FFI loads code into the host process; treat `--allow-ffi` like arbitrary native-code permission.\n"; found = found + 1;
+    }
+    if s.env > 0 {
+        out = out + "- env reads can expose secrets; use `--sandbox` or `--deny-env` for untrusted scripts.\n"; found = found + 1;
+    }
     if s.fns > 0 and s.returns == 0 {
         out = out + "- functions defined but no `return` — they yield nil; confirm that's intended.\n"; found = found + 1;
     }
     if s.todos > 0 { out = out + "- " + str(s.todos) + " TODO/FIXME marker(s) still in the code.\n"; found = found + 1; }
+    let fixed = _repair_preview(code);
+    if fixed != str_trim(code) {
+        out = out + "\nSuggested pblang fix:\n```pblang\n" + fixed + "\n```\n";
+    }
     if found == 0 {
         out = out + "- no structural issues found. Check edge cases: empty inputs, off-by-one in loop bounds, missing-key map reads, and nil propagation.\n";
     }
@@ -248,12 +380,19 @@ fn _bugs(code, s) {
 
 fn _improve(code, s) {
     let out = "pbAI: suggestions\n";
+    out = out + "- target: raise quality score from " + str(_quality_score(s)) + "/100 by reducing nesting, TODOs, and unchecked capability use.\n";
+    let fixed = _repair_preview(code);
+    if fixed != str_trim(code) {
+        out = out + "- apply this pblang syntax repair first:\n```pblang\n" + fixed + "\n```\n";
+    }
     if s.fns == 0 { out = out + "- extract reusable logic into `fn`s for clarity and testing.\n"; }
     if s.whiles > 0 and s.fors == 0 { out = out + "- for a fixed count, `for i N { ... }` reads cleaner than `while` with a manual counter.\n"; }
     if s.lets > 12 { out = out + "- many bindings in one scope (" + str(s.lets) + ") — group related state into a `map`/`struct`.\n"; }
     if s.depth >= 4 { out = out + "- nesting depth " + str(s.depth) + ": flatten with early `return`/`continue` or extract inner blocks into functions.\n"; }
     if s.fns > 0 and (s.lines / (s.fns + 0)) > 40 { out = out + "- average function is long; split each into smaller single-purpose helpers.\n"; }
     if s.tries == 0 and (s.imports > 0 or str_contains(code, "fs_read") or str_contains(code, "http")) { out = out + "- I/O without try/catch — wrap fallible calls (fs/http/import) so failures don't abort the run.\n"; }
+    if s.execs > 0 or s.ffi > 0 or s.env > 0 { out = out + "- isolate sensitive operations behind small wrapper functions and document required capabilities.\n"; }
+    if _looks_like_map_index_read(code) { out = out + "- if reading dynamic map keys, add `map_has` guards before indexing.\n"; }
     out = out + "- name constants instead of magic numbers, keep functions to one job, and prefer `else if` chains over deep nesting.\n";
     out = out + "- F6 (check) runs the self-hosted linter for unreachable code + undefined names; F5 runs it.\n";
     return out;
@@ -289,15 +428,33 @@ fn _comment(code, s) {
 // first so a question about "missing map key" routes to the maps answer, etc.
 fn _general(prompt) {
     let t = str_lower(prompt);
+    if (str_contains(t, "generate") or str_contains(t, "write") or str_contains(t, "create"))
+        and (str_contains(t, "code") or str_contains(t, "program") or str_contains(t, "function") or str_contains(t, "pblang")) {
+        let gen = generate(prompt, 80);
+        return "pbAI native generation (pbAI-Nano char LM, pblang source corpus):\n" + gen;
+    }
+    if str_contains(t, "pbai") and (str_contains(t, "asset") or str_contains(t, "checkpoint") or str_contains(t, "tokenizer") or str_contains(t, "model")) {
+        return PBAI_ASSETS.describe();
+    }
+    if str_contains(t, "mcp") or str_contains(t, "tool") or str_contains(t, "workspace") {
+        let ctx = try MCP.workspace_context() catch nil;
+        if ctx != nil {
+            return "pbAI tools: pblang-native pb_mcp bridge is active at " + str(ctx.root) + ". Safe core tools: workspace_context, read_file, read_file_tail, list_files, project_tree, grep_code. Use pbAI.tool_call(name, args) from pblang.";
+        }
+        return "pbAI tools: pb_mcp bridge is available as stdlib/pb_mcp.sapp; safe core tools include workspace_context/read_file/list_files/project_tree/grep_code.";
+    }
     if str_contains(t, "self-host") or str_contains(t, "selfhost") or str_contains(t, "bootstrap") { return "pbAI: pblang is SELF-HOSTING — stdlib/compiler/ (tokenizer/parser/typeck/codegen/vm, all .sapp) compiles AND runs pblang. F5 in the IDE runs your buffer through it."; }
     if str_contains(t, "jit") or str_contains(t, "cranelift") or str_contains(t, "fast") or str_contains(t, "perf") or str_contains(t, "speed") { return "pbAI: perf — the VM is a Rust bytecode interpreter; a Cranelift JIT (gated by PBLANG_JIT) compiles loop-free/call-free numeric fns. Also: cache expensive work to disk, and don't recompute per frame."; }
-    if str_contains(t, "capab") or str_contains(t, "permission") or str_contains(t, "allow") or str_contains(t, "sandbox") or str_contains(t, "exec") { return "pbAI: capabilities default fs+net+http+sqlite+spawn+gfx ON, exec+ffi OFF. Flags: --allow-exec/--allow-all/--sandbox. proc_spawn_wait + exec need --allow-exec."; }
+    if str_contains(t, "security") or str_contains(t, "capab") or str_contains(t, "permission") or str_contains(t, "allow") or str_contains(t, "sandbox") or str_contains(t, "exec") { return "pbAI: security — capabilities gate sensitive builtins. `--sandbox` denies risky defaults; `--allow-exec` and `--allow-ffi` are high-trust. env reads can expose secrets, so use `--deny-env` for untrusted scripts."; }
     if str_contains(t, "import") or str_contains(t, "module") { return "pbAI: modules — `let m = import(\"stdlib/foo.sapp\");` then `m.fn(...)`. Export with `export a, b;`. Keep imports at TOP level (lazy import() inside a fn resolves relative to the CWD)."; }
     if str_contains(t, "error") or str_contains(t, "try") or str_contains(t, "catch") or str_contains(t, "throw") { return "pbAI: errors — `try EXPR catch FALLBACK` (an expression); `throw v` raises; `error(\"msg\")` raises from a builtin. Missing map keys and bad index raise — wrap them."; }
     if str_contains(t, "async") or str_contains(t, "await") or str_contains(t, "concurren") or str_contains(t, "thread") or str_contains(t, "spawn") { return "pbAI: concurrency — `async fn`, `spawn`/`spawn_n` for parallel tasks, and a waitgroup in stdlib. The self-hosted compiler models async too."; }
     if str_contains(t, "bignum") or str_contains(t, "rational") or str_contains(t, "decimal") or str_contains(t, "precision") { return "pbAI: precision ladder — `bigint(n)` (arbitrary integers), `rational(a, b)` (exact fractions), `decimal(\"3.14\")` (fixed decimals). Arithmetic/compare operators work across them."; }
     if str_contains(t, "match") or str_contains(t, "enum") { return "pbAI: `match x { case 1: \"a\" case 2: \"b\" else: \"c\" }` is an expression; `enum` defines variants. Both self-host."; }
     if str_contains(t, "operator") or str_contains(t, "overload") or str_contains(t, "dunder") { return "pbAI: operator overloading via dunder methods on a map — `__add__`, `__lt__`, `__rmul__` (reflected), etc. `box(2) + box(4)` dispatches to `__add__`."; }
+    if str_contains(t, "typeclass") or str_contains(t, "trait") { return "pbAI: typeclasses — `stdlib/typeclass.sapp` gives runtime ad-hoc polymorphism: define required methods, register instances by type/interface/class/predicate, then generic-dispatch with call/call1/call2. Eq includes executable law checks."; }
+    if str_contains(t, "logic") or str_contains(t, "datalog") or str_contains(t, "relational") { return "pbAI: logic — `stdlib/logic.sapp` supports facts, variables (`?X`), rules, conjunctive queries, and projection. It renames rule variables hygienically before solving."; }
+    if str_contains(t, "reactive") or str_contains(t, "stream") or str_contains(t, "observable") { return "pbAI: reactive — `stdlib/observable.sapp` has refs, computed values, batching, subjects, subscriptions, and map/filter/scan/take/merge/combine_latest streams."; }
     if str_contains(t, "array") or str_contains(t, "list") or str_contains(t, "slice") { return "pbAI: arrays — `[1, 2, 3]`, index `a[i]`, `len(a)`, `push(a, v)`/`pop(a)`, `slice(a, i, j)`. Iterate `for v in a { ... }`. Arrays are append-style (rebuild to insert/remove)."; }
     if str_contains(t, "map") or str_contains(t, "dict") or str_contains(t, "hash") { return "pbAI: maps — `map{ k: v }`; read `m[k]` (a MISSING key RAISES, it is not nil — use `map_has(m, k)`); `map_keys(m)`, `map_remove(m, k)`. Member sugar `m.k` works for ident keys."; }
     if str_contains(t, "loop") or str_contains(t, "while") or str_contains(t, "iterate") { return "pbAI: loops — `while cond { ... }`, `for i N { ... }` (i in 0..N), `for v in arr { ... }`. `break`/`continue` as usual."; }
@@ -335,11 +492,53 @@ fn respond(prompt) {
     return _run(classify(prompt), prompt);
 }
 
+fn generate(prompt, n = 80) {
+    let seed = _extract_code(prompt);
+    if seed == "" or not _has_code(seed, _scan(seed)) {
+        if str_contains(str_lower(prompt), "fn ") { seed = "fn "; }
+        else if str_contains(str_lower(prompt), "let ") { seed = "let "; }
+        else { seed = "fn "; }
+    }
+    let out = PBAI_LM.generate_nano(seed, n, 4);
+    return out.text;
+}
+
+fn model_status() {
+    let ckpt = PBAI_LM.train_nano(2, 0.2);
+    return map{
+        family: "pbAI",
+        top: map{
+            assistant: "stdlib/pbai.sapp",
+            router: "neural intent classifier + grounded pblang skills",
+            tools: "stdlib/pb_mcp.sapp bridge"
+        },
+        bottom: map{
+            lm: "stdlib/pbai_lm.sapp",
+            tier: ckpt.tier,
+            format: ckpt.format,
+            source: ckpt.source,
+            architecture: ckpt.architecture,
+            learns: ckpt.metrics.loss_after < ckpt.metrics.loss_before
+        },
+        references: PBAI_ASSETS.implementation_plan()
+    };
+}
+
 // respond_tool(tool, prompt) — a tool name hint (from the gateway) overrides routing.
 fn respond_tool(tool, prompt) {
+    if tool == "ai_ollama_generate" { return generate(prompt, 80); } // replaced locally by native pbAI
     if tool == "ai_self_critique" { return _run(1, prompt); }       // critique ≈ find bugs
     if tool == "ai_structured_extract" { return _run(0, prompt); }  // extract ≈ explain
     return respond(prompt);
 }
 
-export classify, respond, respond_tool;
+fn tool_catalog() {
+    return MCP.tool_catalog();
+}
+
+fn tool_call(name, args = nil) {
+    return MCP.call(name, args);
+}
+
+export classify, classify_scores, analyze, respond, respond_tool, generate, model_status,
+       tool_catalog, tool_call;

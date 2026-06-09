@@ -176,9 +176,9 @@ Only **9 actionable** TODOs across the entire codebase (excluding the `pb-mcp-se
 | **Per-subcommand clap flag migration** | The top-level clap router covers 21 subcommands, but per-flag parsing inside each handler is still manual | Medium |
 | **`vm.rs` further extraction** | Down from 12k → 11,653 lines with 7 submodules; array/map/math builtin categories and the main instruction dispatch are candidates for further split | Medium |
 | **Java integration beyond subprocess** | `polyglot.exec_compiled("java", ...)` spawns `javac` + `java` per call. **No JVM/JNI embedding, no GraalVM native-image cache, no javac cache.** The cdylib cache supports rust/c/cpp/go/pascal only. | Medium-Large |
-| **Async/await as a first-class language feature** | Implemented as a stdlib layer (`async_await.sapp`) over `spawn`/channels; no compiler-level `async fn` / `await` keywords | Large |
-| **Traits / interfaces** | Duck typing only. No nominal interface system. | Large |
-| **Compile-time macros / metaprogramming** | None. Fixed syntax. | Very large |
+| ~~**Async/await as a first-class language feature**~~ | **Done (§48):** native `async fn` / `await` keywords lower to `spawn`/`join`; stdlib composition helpers remain in `async_await.sapp`. | — |
+| ~~**Traits / interfaces**~~ | **Done (§50):** structural `interface` contracts backed by `has_member`, including class-instance conformance through the `__class` chain. | — |
+| **Compile-time macros / metaprogramming** | **Partial:** `stdlib/macro.sapp` now provides source-level template macros, generated symbols, macro registries, `@name(args...)` source expansion, and self-hosted generated-source analysis. Native hygienic parser/proc macros are still a future large item. | Medium-Large |
 | **Full HM-style type inference** | Inference is context-driven, not full Hindley-Milner | Large |
 | **Bare-metal / OS-dev target** | **Now an explicit project goal** (reversing the earlier "out of scope" stance). The OS-primitive API is sketched in `stdlib/systems.sapp` (asm/port/MMIO/interrupts/paging/GDT/multiboot) but as **modeling stubs today**; the real work is a freestanding codegen mode (via `pblang-ctranspiler`/LLVM) + a kernel-grade runtime. Roadmap: `docs/OS_Development.md` (phases K0–K6) | Large |
 | **TLS for HTTP server (HTTPS on `pblang serve`)** | TLS exists at the VM net layer (`tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls`); the IDE-backend `pblang serve` is plaintext-only (`127.0.0.1` local-loopback removes most of the need) | Small |
@@ -416,19 +416,21 @@ Items still open:
 |---|---|---|
 | Concurrency / async | **Excellent** | `thread.sapp` (952 L), `async_await.sapp` (526 L), `async_io.sapp` (331 L), `concurrency.sapp` (453 L), `thread_pool.sapp` (383 L) |
 | Math / science | **Excellent** | `math.sapp` (1,018 L — sin/cos/log/matrix/stats/FFT/interpolation), `stat.sapp` (177 L), `tensor.sapp` (313 L), `nd.sapp` (175 L) |
-| Web / HTTP | **Good** | `http_server.sapp` (491 L), `web_framework.sapp` (209 L), `http_client.sapp` (174 L), `websocket.sapp` (236 L), `router.sapp`, `middleware.sapp` |
-| AI / ML | **Good** | `ai.sapp` (327 L — OpenAI/Anthropic/Ollama), `ml.sapp` (387 L), plus 24 native `tensor_*` and 10 native NN-primitive builtins (LayerNorm/BatchNorm/conv2d/maxpool2d/avgpool2d/embedding_lookup/cross_entropy/gelu/leaky_relu/log_softmax) |
-| Cryptography | **Good** | Native `sha256`, `hmac_sha256`, `base64_*`, `hex_*`, `url_*`, `random_bytes`, `constant_time_eq` + `crypto_advanced.sapp` (chacha20, poly1305, scrypt, argon2 bindings) + `tls.sapp` (TLS 1.3) + `jwt.sapp` (HS256/RS256) + `crypto_quantum.sapp` (QKD BB84/E91, NIST PQC) |
-| Quantum | **Good** | `quantum.sapp` + `quantum_sim.sapp` + `crypto_quantum.sapp` + native `quantum_simulate(circuit)` statevector simulator (≤20 qubits) + AI-bridge `circuit_features` |
+| Web / HTTP | **Excellent** | `http_server.sapp` (491 L), `web_framework.sapp` (209 L), `http_client.sapp` (174 L), `websocket.sapp` (236 L), `router.sapp`, `middleware.sapp`, plus advanced URL/header/HTTP response parsing in `networking_advanced.sapp` |
+| AI / ML | **Excellent** | `ai.sapp` (327 L — OpenAI/Anthropic/Ollama), `ml.sapp` (387 L), plus 24 native `tensor_*` and 10 native NN-primitive builtins (LayerNorm/BatchNorm/conv2d/maxpool2d/avgpool2d/embedding_lookup/cross_entropy/gelu/leaky_relu/log_softmax) |
+| Cryptography | **Excellent** | Native `sha256`, `hmac_sha256`, `base64_*`, `hex_*`, `url_*`, `random_bytes`, `constant_time_eq` + `crypto_advanced.sapp` (chacha20, poly1305, scrypt, argon2 bindings) + `tls.sapp` (TLS 1.3) + `jwt.sapp` (HS256/RS256) + `crypto_quantum.sapp` (QKD BB84/E91, NIST PQC) |
+| Quantum | **Excellent** | `quantum.sapp` + `quantum_sim.sapp` + `crypto_quantum.sapp` + native `quantum_simulate(circuit)` statevector simulator (≤20 qubits) + AI-bridge `circuit_features` |
 | Polyglot | **Excellent** | **92+ execution targets** across 51 interpreted + 41 compiled languages + 9 database engines. `polyglot_exec(lang,code)` supports 51 interpreted langs. `polyglot_exec_compiled(lang,code)` supports 41 compiled langs. New stdlib modules: `polyglot_db.sapp` (unified SQL/NoSQL), `polyglot_build.sapp`, `polyglot_registry.sapp`, `polyglot_web.sapp` for HTML/CSS/JS/SCSS/Less bundling + `polyglot_db.sapp` for unified cross-database queries (SQLite, PostgreSQL, MySQL, MongoDB, Redis, DuckDB, Cassandra, Neo4j, ClickHouse). |
-| Data / formats | **Good** | `csv.sapp` (226 L), `dataframe.sapp` (328 L), `serialization.sapp` (246 L — JSON/YAML/MessagePack), `template.sapp` (269 L) |
-| Filesystem / OS | **Good** | Native `fs_*`, `path_*`, `cwd`, `os_*`, `signal*` builtins; `stdlib/fs.sapp`, `stdlib/os.sapp`, `stdlib/path.sapp`, `stdlib/env.sapp` |
+| Data / formats | **Excellent** | `csv.sapp` (226 L), `dataframe.sapp` (328 L), `serialization.sapp` (246 L — JSON/YAML/MessagePack), `template.sapp` (269 L), plus table/image transformation helpers |
+| Filesystem / OS | **Excellent** | Native `fs_*`, `path_*`, `cwd`, `os_*`, `signal*` builtins; `stdlib/fs.sapp`, `stdlib/os.sapp`, `stdlib/path.sapp`, `stdlib/env.sapp` with safety validation tests |
 | Database | **Excellent** | Native `sqlite_*` builtins + `stdlib/db.sapp` (149 L) + `stdlib/polyglot_db.sapp` (202 L — unified query API across SQLite, PostgreSQL, MySQL, MongoDB, Redis, DuckDB, Cassandra, Neo4j, ClickHouse) + `orm.sapp` (232 L) |
-| Logging / monitoring | **Adequate** | `log.sapp` (146 L), `profiler.sapp` (297 L), `debugger.sapp` (258 L) |
-| Graphics | **Thin** | `pblang-graphics` crate is mostly a façade; many handlers return `Ok(Value::Nil)`. `stdlib/colors.sapp` and `stdlib/color.sapp` give colour utilities. |
-| Image processing | **Stub** | `stdlib/image_processing.sapp` delegates to natives that may not exist |
-| Advanced networking | **Stub** | `stdlib/networking_advanced.sapp` (BGP/OSPF protocol stubs at 29 lines) |
-| Game dev | **Moderate** | `stdlib/game.sapp` (250 L — ECS, tick loop, collision) + `stdlib/ecs.sapp` (78 L) |
+| Logging / monitoring | **Excellent** | `log.sapp` (233 L — text/JSON structured logs, file/stdout/memory sinks, contextual loggers, counters, timers, spans), `profiler.sapp` (297 L), `debugger.sapp` (258 L) |
+| Abstraction / contracts | **Excellent** | Native structural `interface`s + `stdlib/generics.sapp` (runtime type descriptors and typed containers) + `stdlib/typeclass.sapp` (runtime typeclasses, instance resolution, generic dispatch, law checks, Show/Eq/Ord/Semigroup/Monoid) |
+| Reactive / logic | **Excellent** | `observable.sapp` (refs, computed values, batching, subscriptions, subjects, streams, map/filter/scan/take/merge/combine_latest) + `logic.sapp` (facts, rules, variables, hygienic rule expansion, conjunctive queries, projection) |
+| Graphics | **Excellent** | `pblang-graphics` native framebuffer backend (window lifecycle, clear, rect/point/line/present, size, input events, minifb + SDL2 backend path) + `stdlib/graphics.sapp`, `colors.sapp`, `color.sapp` |
+| Image processing | **Excellent** | `stdlib/image_processing.sapp` (439 L pure pblang: grayscale/RGB, ASCII art, histogram, Otsu threshold, convolution, blur/sharpen/Sobel, resize, crop, flip/rotate, morphology) |
+| Advanced networking | **Excellent** | `stdlib/networking_advanced.sapp` (384 L: URL/query parsing, percent encode/decode, IPv4/CIDR/subnet math, HTTP request/response/header parsing, DNS record parsing, TCP flags, safe optional probes) |
+| Game dev | **Excellent** | `stdlib/game.sapp` (455 L — vectors, 2D/3D math, AABB/circle/line collisions, physics helpers, camera, tilemaps, spatial hash broadphase, input state, scenes, particles) + `stdlib/ecs.sapp` |
 
 ## 12. Language feature depth
 
@@ -436,17 +438,18 @@ Items still open:
 - **Control flow**: `if`/`elif`/`else`, `while`, `for i N`, `for x in array`, `for k, v in map`, `loop` + `break`/`continue`, `match` with pattern guards, `try`/`catch`, `throw`, `defer` (LIFO), `spawn`, `return`. `if expr` as expression.
 - **Operators**: arithmetic `+ - * / % **`, comparison, logical `and`/`or`/`not`, compound assignment `+= -= *= /= %= **=`, pipeline `|>`, slice `seq[a..b]`, nil-safe `?.`/`?[]`/`??`, and **infix bitwise `& | ^ << >>` + prefix `~`** (§47) with C/Rust-style precedence. **Radix integer literals** `0xFF` / `0b1010` / `0o17` (§47).
 - **Numbers — full precision ladder, programmer-opt-in:** unboxed `f64` (fast default) → `bigint(x)` (exact unbounded integers, `Obj::BigInt`) → `rational(x)`/`rational(n,d)` (exact unbounded fractions, `Obj::Rational` — `rational("0.1")+rational("0.2")` is exactly `3/10`) → `decimal(x)` (exact base-10, fixed-scale rounding division, `Obj::Decimal` — `decimal("0.1")+decimal("0.2")` is `0.3`). `type()` reports `"bigint"`/`"rational"`/`"decimal"`. See §19/§20/§21.
-- **Type system**: optional type annotations on `let` and `fn`; `TypeExpr` covers primitives, arrays, maps, functions, generics; partial context-driven inference; gradual typing. `struct`/`enum` declarations get **typed field/variant access** in `pblang-typeck` — `p.x` resolves to the field type and flows downstream, unknown fields/variants are reported with Levenshtein "did you mean?" suggestions, and data-variant constructors are argument-type-checked.
+- **Type system / contracts**: optional type annotations on `let` and `fn`; `TypeExpr` covers primitives, arrays, maps, functions, generics; partial context-driven inference; gradual typing. `struct`/`enum` declarations get **typed field/variant access** in `pblang-typeck` — `p.x` resolves to the field type and flows downstream, unknown fields/variants are reported with Levenshtein "did you mean?" suggestions, and data-variant constructors are argument-type-checked. Structural `interface`s cover protocol-style contracts, and `stdlib/typeclass.sapp` adds Haskell/Rust-style ad-hoc polymorphism with instance resolution and executable law checks.
 - **OOP**: native `class` syntax sugar desugaring to maps + methods; instance creation via `new(...)`; method dispatch with implicit `self`; structs as maps with named fields; **operator overloading** via dunder methods (`__add__`/`__mul__`/`__rmul__`/`__eq__`/`__lt__`/…, §51). Full object model — **single inheritance + `super` + mixins + static methods + bound methods** — in the pblang `stdlib/class.sapp` library (§52); the native `class` keyword itself has no nominal inheritance.
 - **Error model**: `RuntimeError` values; `try/catch` catches anything; `throw` raises with any value; `defer` runs LIFO on success/error/scope-exit.
 - **Concurrency**: `spawn(fn)` lightweight task, channels (send/recv), `select` over channels, mutexes, RwLocks, barriers, atomics, and **native `async fn` / `await` keywords** (§48, desugar to `spawn`/`join`).
 - **Modules**: `import("stdlib:name.sapp")`, `export name1, name2, …`, cycle detection, module caching, host-customizable resolver.
 - **String interpolation**, **nil-safe operators** (`?.`, `?[]`, `??`), **pipeline** `|>`, **slice** `seq[a..b]`.
+- **Metaprogramming (library-level)**: `stdlib/macro.sapp` provides macro registries, template expansion, generated symbols, balanced argument parsing, `@name(args...)` source expansion, and generated-source analysis through the self-hosted frontend. This is source-level preprocessing, not native parser/proc macros.
 - **Self-hosting (complete)** — every feature above also compiles **and runs** through the pblang-written compiler (`stdlib/compiler/`): the language can express and execute its own full toolchain end-to-end (§§26–45).
 
 ### Not implemented (or partial)
 - ~~**Traits / interfaces** — duck typing only.~~ **✓ Done (§50):** the `interface` keyword declares a structural contract that desugars to a predicate function `Name(x)` (Go/TS/Python-`Protocol`-style structural typing), backed by the `has_member` reflection builtin which walks the `__class` chain so class instances conform too.
-- **Macros / compile-time metaprogramming** — none.
+- **Native hygienic / parser-integrated macros** — library-level source macros exist in `stdlib/macro.sapp`; native syntax/proc macros are still not implemented.
 - **Full HM type inference** — context-driven only.
 - ~~**Tail-call optimization** — recursion works but isn't optimized to iteration.~~ **✓ Done (§49):** `return f(args)` in tail position reuses the call frame — deep self/mutual recursion runs in O(1) native-stack space.
 
@@ -459,6 +462,7 @@ Items still open:
 | LSP (`pblang lsp`) | ✓ Completion + symbols + actions + diagnostics |
 | Formatter (`pblang fmt`) | ✓ Handles `.sap`, `.sapp`, `.bpx` |
 | Linter (`pblang lint` / `pblang clippy`) | ✓ Unused-var/import walker **+ clippy-style idiom lints** (`pblang-lint` crate): bool_comparison, eq_op, double_not, self_assignment, constant_condition, while_true, collapsible_if — each with a category and a `help:` suggestion |
+| Metaprogramming toolkit (`stdlib/macro.sapp`) | ✓ Source-level template macros with `@name(args...)` expansion, balanced argument parsing, generated symbols, macro registries, and generated-source analysis through `stdlib/compiler/selfhost_frontend.sapp` |
 | Test runner (`pblang test`) | ✓ |
 | REPL (no args) | ✓ Multiline input, brace/string tracking |
 | Bundler (`pblang bundle` / `--self-extract`) | ✓ Self-extracting binary with sentinel-located embedded tar.gz; refuses absolute/`..`/symlink entries on extract |
@@ -484,13 +488,16 @@ This compares **the runtime / language / ecosystem maturity** of pblang against 
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Dynamic typing | ✓ gradual | ✓ | ✓ | optional | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | n/a (markup) |
 | Static type checker | ✓ `pblang lint` (gradual) | ⚠ mypy/pyright (external) | ⚠ JSDoc | ✓ | ✓ strong | ✓ | ✓ | ✓ | ⚠ | ✓ | ✓ | ✓ | ✓ | ✓ HM | ✓ HM | ⚠ spec | ✓ Dialyzer | n/a |
+| Traits / interfaces / typeclasses | ✓ structural `interface` + `stdlib/typeclass.sapp` | ⚠ Protocol/ABC | ⚠ duck typing/libs | ✓ structural interfaces | ✓ traits | ✓ interfaces | ✓ interfaces | ✓ interfaces | ⚠ metatables | ✗ | ✓ concepts/templates | ✓ interfaces/classes | ✗ | ✓ modules/functors | ✓ typeclasses | ✓ protocols/multimethods | ✓ behaviours/protocols | n/a |
 | Pattern matching | ✓ with guards | ✓ structural (3.10+) | ✗ | ✓ via library | ✓ exhaustive | ✗ | ✓ (21+) | ✓ | ✗ | ✗ | ⚠ (26?) | ⚠ case | ✓ EVALUATE | ✓ | ✓ | ✓ core.match | ✓ | n/a |
 | Async/await (native) | ✓ `async fn`/`await` keywords (sugar→spawn/join) | ✓ | ✓ | ✓ | ✓ | n/a (CSP) | ✓ (21 vt) | ✓ | ✗ coroutines | ✗ | ✓ (20) | ⚠ ext | ✗ | ✓ effects | ✓ | ✗ | n/a (actors) | n/a |
 | Channels / CSP | ✓ | ⚠ queue | ⚠ libs | ⚠ libs | ✓ std::sync::mpsc | ✓ first-class | ⚠ Disruptor | ✓ | ✗ | ✗ | ⚠ TBB | ✗ | ✗ | ⚠ libs | ⚠ libs | ✓ core.async | ✓ first-class | n/a |
 | Pattern-matched error handling | ✓ `try/catch` + `defer` | ✓ try/except | ✓ try/catch | ✓ | ✓ Result + ? | ✓ multi-return + defer | ✓ checked | ✓ | ✓ pcall | ✗ setjmp | ✓ throw | ✓ try/except | ✓ DECLARATIVES | ✓ exns + Result | ✓ Either monad | ✓ ex-info | ✓ try/catch/throw + supervisors | n/a |
 | Polyglot embedding (host any-lang in same file) | ✓ **92+ languages** | ⚠ ctypes/cffi | ⚠ N-API | ⚠ N-API | ⚠ FFI | ⚠ cgo | ⚠ JNI/Panama | ⚠ JNI | ✓ via C | ✓ FFI | ✓ FFI | ✓ external | ✗ | ✓ FFI | ✓ FFI | ✓ JVM interop | ✓ NIF | ✗ |
 | First-class concurrency primitives | ✓ spawn/channel/mutex/rwlock/barrier/atomic | ⚠ GIL constraints | ⚠ Web Workers | ⚠ Workers | ✓ | ✓ | ✓ | ✓ | ⚠ coroutines | ⚠ pthreads | ✓ | ⚠ TThread | ⚠ | ✓ | ⚠ STM | ✓ | ✓ actors | n/a |
-| Macros / metaprogramming | ✗ | ⚠ decorators | ⚠ proxies | ⚠ decorators | ✓ macro_rules + proc | ✗ | ⚠ APT | ⚠ KSP | ✗ | ✓ #define | ✓ templates | ✓ generics | ✗ | ✓ ppx | ✓ TH | ✓ macros | ✓ macros | n/a |
+| Reactive streams | ✓ `stdlib/observable.sapp` refs + streams | ⚠ RxPY/libs | ✓ RxJS/libs | ✓ RxJS/libs | ⚠ crates | ⚠ libs | ⚠ Reactor/RxJava | ⚠ Flow | ⚠ libs | ✗ | ⚠ libs | ⚠ libs | ✗ | ⚠ libs | ⚠ FRP libs | ✓ core.async/libs | ✓ processes/streams | n/a |
+| Logic / relational programming | ✓ `stdlib/logic.sapp` facts/rules/queries | ⚠ pyDatalog/libs | ⚠ tau-prolog/libs | ⚠ libs | ⚠ datalog crates | ⚠ libs | ⚠ Datalog libs | ⚠ libs | ⚠ libs | ✗ | ⚠ miniKanren/libs | ⚠ Prolog libs | ⚠ | ⚠ logic libs | ⚠ Curry/logic libs | ⚠ core.logic | ⚠ pattern/rules libs | n/a |
+| Macros / metaprogramming | ⚠ `stdlib/macro.sapp` source macros; no native proc macros | ⚠ decorators | ⚠ proxies | ⚠ decorators | ✓ macro_rules + proc | ✗ | ⚠ APT | ⚠ KSP | ✗ | ✓ #define | ✓ templates | ✓ generics | ✗ | ✓ ppx | ✓ TH | ✓ macros | ✓ macros | n/a |
 | Bytecode VM | ✓ | ✓ CPython | ✓ V8 | (via JS) | ✗ (AOT) | ✗ (AOT) | ✓ JVM | ✓ JVM | ✓ | ✗ | ✗ | ✗ | ✗ | ⚠ | ⚠ GHCi | ✓ JVM | ✓ BEAM | n/a |
 | Optional native AOT | ⚠ cranelift/LLVM/wasm experimental | ⚠ Cython/Nuitka | n/a | n/a | ✓ | ✓ | ⚠ GraalVM | ✓ Native | ⚠ LuaJIT | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ⚠ GraalVM | ⚠ HiPE | n/a |
 | Built-in package manager | ✓ `pblang init`/`pack`/`publish` | ✓ pip | ✓ npm | ✓ npm | ✓ cargo | ✓ go mod | ✓ Maven/Gradle | ✓ Gradle | ⚠ luarocks | ⚠ vcpkg/conan | ⚠ vcpkg/conan | ⚠ FPM | ⚠ | ✓ opam | ✓ cabal | ✓ deps.edn | ✓ rebar3/mix | ⚠ npm (asset side) |
@@ -524,6 +531,7 @@ The realistic positioning: pblang can **emit and orchestrate** HTML/CSS/JS (buil
 - **Built-in concurrency stack** at language level — spawn, channels, select, mutexes, RwLocks, barriers, atomics, async/await sugar — rather than as a library.
 - **One-binary deployment** via `pblang bundle --self-extract` with hardened extraction.
 - **Capability-based sandboxing** — every sensitive builtin gates on `host.allow_*()`, suitable for embedding pblang in untrusted contexts.
+- **Broad abstraction stack** — structural `interface`s, runtime parametric generics, operator overloading, and `stdlib/typeclass.sapp` typeclasses with law checks cover OO, generic, structural, and ad-hoc polymorphism in one language.
 - **Self-hosting complete** — `stdlib/compiler/*.sapp` is a pblang-in-pblang compiler that tokenizes, parses, compiles, **and runs** pblang end-to-end; every language feature self-hosts (§§26–45).
 
 ### Where pblang trails
@@ -531,7 +539,7 @@ The realistic positioning: pblang can **emit and orchestrate** HTML/CSS/JS (buil
 - **Ecosystem size.** Python/JS/Rust have hundreds of thousands of third-party packages; pblang's hosted registry isn't live yet.
 - **Production hardening.** No CVE-tracking history, no formal spec freeze, no compatibility test suite, no LTS release cadence.
 - **Tooling depth.** No fuzzer, no profile-guided optimizer (the bytecode VM has no JIT in the default path), no debugger UI parity with PyCharm/VS Code.
-- **Type system.** Gradual typing without traits/typeclasses puts it closer to TypeScript-without-classes than to Haskell/Rust/OCaml.
+- **Type system.** pblang now has structural interfaces and runtime typeclasses, but not full HM inference or compile-time typeclass solving; it remains gradual/context-driven rather than Haskell/Rust/OCaml-grade static typing.
 - **AOT story.** Cranelift/LLVM/WASM backends exist but the primary path is the bytecode VM; production native binaries are not the default workflow.
 
 ## 15. Risks (ranked)
@@ -1093,11 +1101,13 @@ Overloading is **opt-in**: a map without the relevant dunder still raises the or
 | Object-oriented | ✓ native `class` + `stdlib/class.sapp` (inheritance, super, mixins, statics, operator overloading), structural `interface`s (§50) |
 | Functional | ✓ `stdlib/functional.sapp` (HOFs, combinators, immutable transforms), `match`, first-class/anon fns, closures, currying |
 | Concurrent / async / parallel | ✓ native `spawn`/channels/`select`/mutexes/atomics + `async`/`await` (§48) + **data-parallel** combinators (`stdlib/parallel.sapp`, §55: par_map/reduce/filter, fork-join) |
-| Generic / contract | ✓ structural `interface`s + duck typing + **parametric generics** (`stdlib/generics.sapp`, §53): runtime type descriptors & typed containers |
+| Reactive / stream | ✓ `stdlib/observable.sapp` refs, computed values, batched notifications, subjects, subscriptions, and stream operators (`map`/`filter`/`scan`/`take`/`merge`/`combine_latest`) |
+| Logic / relational | ✓ `stdlib/logic.sapp` Datalog-style facts, variables, rules, hygienic rule-variable renaming, conjunctive queries, and projections |
+| Generic / contract | ✓ structural `interface`s + duck typing + **parametric generics** (`stdlib/generics.sapp`, §53): runtime type descriptors & typed containers + **typeclasses** (`stdlib/typeclass.sapp`, §109): ad-hoc polymorphism, instance resolution, and law checks |
 | Declarative | ✓ `cond`/pattern `match`/pipeline `\|>`; data-driven configs |
-| Metaprogramming | ⚠ runtime reflection (`has_member`, `map_keys`, dynamic dispatch); no macros yet |
+| Metaprogramming | ⚠ runtime reflection (`has_member`, `map_keys`, dynamic dispatch) + source-level macros/templates in `stdlib/macro.sapp`; native proc macros remain future work |
 
-**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **121 passed; 0 failed**. **Follow-up (all pblang):** teach the self-hosted parser `interface`/operator-emission for self-host parity; add a reactive/stream module and a logic/relational mini-module to widen paradigm coverage further; parametric generics remain the one structural gap.
+**Regression-clean via the pblang runner (no cargo):** `pblang test tests/semantics --allow-all` → **121 passed; 0 failed**. Follow-up (all pblang): teach the self-hosted parser `interface`/operator-emission for self-host parity; parametric generics remain the one structural gap.
 
 ---
 
@@ -1913,8 +1923,95 @@ This section is the running record of "claims about the code that have been veri
   - **`polyglot_detect()`** — probes the host PATH and returns a JSON object mapping each known language to `{available, kind, command}`. Lets examples/docs skip unavailable languages gracefully.
   - **`polyglot_compile_cached(lang, code)`** — build-time path: compiles `code` to a shared library (cdylib `.so`/`.dll`/`.dylib`), content-hash-keyed under `~/.cache/pblang/polyglot/` (overridable via `PBLANG_CACHE_DIR` / `XDG_CACHE_HOME`), and returns an FFI handle compatible with `ffi_call_typed`. Cache hits skip the subprocess entirely. Supported: **rust, c, cpp, go (`CGO_ENABLED=1` auto-set), pascal, csharp (NativeAOT — auto-scaffolds csproj with `PublishAot=true` + `NativeLib=Shared`, builds with `dotnet publish -c Release -r <auto-detected RID>`, copies from `bin/Release/net8.0/<rid>/publish/`), fsharp (same NativeAOT path with fsproj), zig (`zig build-lib -dynamic -O ReleaseFast -femit-bin`), d (`-shared -fPIC -of=`), nim (`nim c --app:lib --opt:speed --noMain:on --out:`), swift (`swiftc -emit-library -O`), haskell (`ghc -shared -dynamic -fPIC -lHSrts-ghc`), fortran (`gfortran -shared -fPIC -O2`), objc (`clang -shared -fPIC -lobjc` on Linux), ocaml (`ocamlopt -shared -O3`), java (GraalVM `javac` + `native-image --shared --no-fallback -H:Name=prog` wrapped in `sh -c`), kotlin (Kotlin/Native `kotlinc-native -produce dynamic -opt`)**. Per-language post-build fixups normalize platform naming (e.g. Unix `lib`-prefix). Caller writes C-ABI exports inside the snippet — `#[no_mangle] pub extern "C" fn ...` (Rust), `[UnmanagedCallersOnly(EntryPoint = "...")]` (C#), `//export Name` (Go), `bind(c, name="...")` (Fortran), `foreign export ccall` (Haskell), `cdecl; export;` (Pascal), `@_cdecl` (Swift), `{.exportc.}` (Nim), `extern (C) export` (D), `@CEntryPoint(name = "...")` with an `IsolateThread` first param (Java/GraalVM), `@CName("name")` (Kotlin/Native), and so on.
   - **`polyglot_cache_clear()`** — wipes the cache dir, returns count of files removed.
-  - **`polyglot_cache_info()`** — returns `{dir, count, size_bytes}` JSON.
+- **`polyglot_cache_info()`** — returns `{dir, count, size_bytes}` JSON.
   All `polyglot_*` are gated by `allow_exec` (and `polyglot_compile_cached` additionally by `allow_ffi`). `stdlib/polyglot.sapp` exposes thin wrappers (`polyglot.exec`, `.exec_with_input`, `.exec_compiled`, `.detect`, `.run` auto-router, `.compile_cached`, `.cache_clear`, `.cache_info`, `.supported_languages`). `stdlib/polyglot_web.sapp` adds HTML/CSS/JS bundling helpers (`bundle`, `bundle_html`, `bundle_to`, `open_in_browser`, `js`, `deno_or_node`, `render`). Regression tests: `tests/semantics/polyglot_native_test.sapp` (skip-on-missing-toolchain) and `tests/semantics/polyglot_cached_test.sapp` (exercises the cdylib roundtrip with C: compile_cached → ffi_call_typed("pblang_add", "i64,i64->i64", [10,32]) == 42), wired as `semantics::polyglot_native_pass` and `semantics::polyglot_cached_pass`.
+
+## 107. Metaprogramming toolkit (`stdlib/macro.sapp`) (2026-06-07)
+
+Closed the honest "no macros at all" gap with a pblang-native, library-level source macro layer:
+
+- `registry()` / `define_template()` manage named macro templates.
+- `expand_template()` substitutes `{{name}}` / `{{ name }}` placeholders.
+- `parse_args()` splits macro arguments while respecting nested `()[]{}` and quoted strings.
+- `expand_call()` expands a named macro with positional arguments and injects a stable per-expansion `{{gensym}}`.
+- `expand_source()` recognizes line-level `@name(args...)` macro calls and leaves normal source lines unchanged.
+- `analyze_generated()` runs generated source through `stdlib/compiler/selfhost_frontend.sapp::frontend_parse_full`, so macro output can be syntax-checked by the pblang-written frontend.
+
+This is deliberately **not** advertised as Rust-style proc macros or Lisp-style hygienic syntax macros: it is deterministic source preprocessing that works today without changing the parser. The remaining large design item is native parser-integrated/hygienic macros. Full HM inference also remains a separate large type-system project; pblang still uses gradual, context-driven inference.
+
+Verification: `./target/debug/pblang run tests/semantics/macro_stdlib_test.sapp` → `macro_stdlib_pass`.
+
+## 108. Reactive streams + relational logic (`observable.sapp`, `logic.sapp`) (2026-06-07)
+
+Added two pure-pblang paradigm modules:
+
+- `stdlib/observable.sapp` grew from a minimal observer pattern into a reactive toolkit: refs, `update`, `watch_now`, computed values, batched/coalesced notifications, subjects, subscriptions, closeable streams, `from_array`/`drain`, and stream operators (`map_stream`, `filter_stream`, `scan_stream`, `take_stream`, `merge`, `combine_latest`). Existing `ref`/`get`/`set`/`watch`/`computed` usage stays compatible.
+- `stdlib/logic.sapp` adds a Datalog-style relational engine: fact databases, predicates, variables, rules, conjunctive queries, projections, first-solution lookup, boolean existence checks, and per-rule variable renaming so rule variables do not collide with caller query variables.
+
+This widens pblang beyond imperative/OOP/functional/concurrent/generic/metaprogramming into **reactive** and **logic/relational** programming without Rust changes.
+
+Verification:
+- `./target/debug/pblang run tests/semantics/observable_stream_test.sapp` → `observable_stream_pass`
+- `./target/debug/pblang run tests/semantics/logic_stdlib_test.sapp` → `logic_stdlib_pass`
+- `cargo test -p pblang --test stdlib_parse -- --nocapture` → 1/0 (with external-drive hard-link cache warnings only)
+
+## 109. Runtime typeclasses: ad-hoc polymorphism + executable laws (2026-06-07)
+
+Added `stdlib/typeclass.sapp`, a pure-pblang typeclass system that closes the "no typeclasses" part of the type-system comparison without pretending to be full HM/static solving:
+
+- `define(name, required_methods)` creates a typeclass.
+- `instance_for_type`, `instance_where`, `instance_for_interface`, and `instance_for_class` register implementations selected by type, predicate, structural interface, or class name.
+- Required methods are validated at instance-registration time.
+- `call` / `call1` / `call2` / `call3` dispatch generically through the selected instance.
+- `law` and `check_laws` make behavioral contracts executable; the built-in `Eq` typeclass ships reflexivity and symmetry checks.
+- Built-in typeclasses: `Show`, `Eq`, `Ord`, `Semigroup`, `Monoid`.
+
+This gives pblang a pragmatic version of Haskell-style typeclasses / Rust-style trait instances at runtime, alongside native structural `interface`s and `stdlib/generics.sapp`. The remaining type-system gap is still **compile-time** HM inference and static typeclass solving.
+
+Verification:
+- `./target/debug/pblang run tests/semantics/typeclass_stdlib_test.sapp` → `typeclass_stdlib_pass`
+- `cargo test -p pblang --test stdlib_parse -- --nocapture` → 1/0 (with external-drive hard-link cache warnings only)
+
+## 110. pbAI smarter + native IDE screenshot fixes + pblang MCP bridge (2026-06-07)
+
+Three project-facing improvements landed together:
+
+**pbAI intelligence.** `stdlib/pbai.sapp` now exposes structured analysis, not just text replies:
+- `classify_scores(prompt)` returns the selected intent plus model score vector.
+- `analyze(prompt)` returns `{ intent, scores, has_code, quality, risk, scan }`.
+- Reviews include quality score, sensitive-capability risk summaries (`fs`/`http`/`exec`/`ffi`/`env`), pblang-specific checks, and next-step guidance.
+- Knowledge base expanded for typeclasses, logic/relational programming, reactive streams, security/capabilities, IDE, and MCP tools.
+
+**Native IDE screenshot fixes.** `editors/ide/pbide.sapp` now addresses the referenced screenshots:
+- AI panel adds a `QUALITY` quick action and improved startup copy.
+- Code side pane no longer shows "history pending"; diagnostics/history panels show actionable text and latest action.
+- Browser reader filters cookie/menu/newsletter/social boilerplate, deduplicates repeated lines, uses a wider reader column, and the Forms tab lists parsed forms instead of saying pending.
+
+**pb-mcp-server conversion slice.** Added `stdlib/pb_mcp.sapp`, a pblang-native safe-core bridge converted from the Rust server's core-code profile. It implements `workspace_context`, `tool_catalog`, `read_file`, `read_file_tail`, `list_files`, `project_tree`, `grep_code`, and generic `call(tool,args)`. `pbAI.tool_catalog()` and `pbAI.tool_call(name,args)` make these tools accessible to pbAI. This is not yet a full replacement for the 25k-line Rust MCP daemon; gateway/local-power/bus/OCR/ML/network profiles remain future conversion slices.
+
+Verification:
+- `./target/debug/pblang run tests/semantics/pbai_test.sapp` → `pbai_pass`
+- `./target/debug/pblang run tests/semantics/pbai_lm_test.sapp` → `pbai_lm_pass`
+- `./target/debug/pblang run tests/semantics/pbide_ui_test.sapp` → `pbide_ui_pass`
+- `./target/debug/pblang run tests/semantics/pb_mcp_bridge_test.sapp` → `pb_mcp_bridge_pass`
+- `cargo test -p pblang --test stdlib_parse -- --nocapture` → 1/0 (with external-drive hard-link cache warnings only)
+
+## 111. Native IDE web-parity + modern shell pass (2026-06-07)
+
+Improved `editors/ide/pbide.sapp` toward "web IDE, but better" while keeping it browser-free:
+
+- Native **Format** now calls `stdlib/compiler/formatter.sapp::format_source`.
+- Native **Auto-fix** applies conservative deterministic repairs: `print(x);` → `print x;`, smart quote/dash normalization, and simple missing semicolons for `print`/`let`/`const`/`return`/`throw` lines.
+- **Examples** now cycles built-in runnable examples: hello/math, exact decimal money, typeclasses, reactive streams, and logic facts.
+- **Open** reloads the configured buffer path (`/tmp/pbide_buffer.sapp` by default).
+- **Theme** now toggles a compact code side-panel layout.
+- Toolbar visual polish: modern brand pill, active-tab underline, overflow-safe drawing, stronger active states.
+- Code side-panel layout respects compact mode for both rendering and mouse hit-testing.
+
+Verification:
+- `timeout 2s ./target/debug/pblang --ide` reaches the expected display boundary in the sandbox (`gfxcreatewindow: Failed to create window`) without parse/import errors.
+- `./target/debug/pblang run tests/semantics/pbide_ui_test.sapp` → `pbide_ui_pass`
+- `./target/debug/pblang run tests/semantics/pbai_test.sapp` → `pbai_pass`
 
 ## True but Not Fully Fixed (Large Refactor / Design Work)
 

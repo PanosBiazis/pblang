@@ -109,6 +109,45 @@ program orchestrating these kernels.
 
 **Shipped today — pbAI's first working models (§65, §86, §87).**
 - `stdlib/nn.sapp` — a trainable MLP (learns XOR).
+- **`stdlib/llm_core.sapp`** — reusable LLM math/training substrate: deterministic
+  initialization, vector/matrix kernels, softmax, cross-entropy/perplexity, SGD, Adam,
+  checkpoint save/load, and benchmark wrappers.
+- **`stdlib/llm_tokenizer.sapp`** — pblang-native tokenizer contracts: char tokenizer,
+  small trainable BPE tokenizer, encode/decode, metadata, and JSON save/load.
+- **`stdlib/llm_data.sapp`** — corpus helpers: text detection, secret/noise exclusion,
+  chunking, next-token example packing, train/validation split, and corpus records.
+- **`stdlib/llm_transformer.sapp`** — the first reusable decoder-transformer substrate:
+  token/position embeddings, causal self-attention, feed-forward block, layer norm,
+  vocab logits, sampling hooks, generation, quantization helpers, and summary metadata.
+  Locked by `tests/semantics/llm_foundation_test.sapp`.
+- **Scale-up LLM foundation modules (today)** — `stdlib/llm_attention.sapp` adds stacked
+  multi-layer/multi-head decoder attention plus live architecture updates (`deeper`,
+  `longer_context`, `stronger_binary`, `weaker_binary`); `stdlib/llm_train.sapp` adds
+  next-token backprop for the LM head and analytic binary-adapter backprop into
+  `binary_projection` over frozen transformer states, plus an analytic deep-input
+  update stage for token embeddings, positional embeddings, binary projection, and the
+  LM head. This replaces the active finite-difference probe in the pbAI-Max training
+  path; full cached Q/K/V/O attention, FFN, residual, and layernorm gradients are the
+  next training stage. `llm_train` also provides adaptive error reduction,
+  feedback loops with previous/current feedback-state evaluation, and guessing loops
+  with previous/current guess-state evaluation. Both comparison paths emit
+  reinforcement records: reward, punish, or neutral; `select_elite` ranks candidates,
+  keeps the best, throws lower-ranked results, and exposes the elite state as the next
+  generation seed;
+  `stdlib/llm_stream.sapp` adds bounded streaming corpora; `stdlib/llm_weights.sapp`
+  adds sharded weight manifests; `stdlib/llm_tokenizer_train.sapp` adds bounded
+  corpus tokenizer training; `stdlib/llm_eval.sapp` adds loss/perplexity/accuracy and
+  generation benchmarks; `stdlib/llm_quant.sapp` adds row-wise quantized inference
+  helpers; `stdlib/llm_binary.sapp` adds the bit-level token substrate: token-id bit
+  width, ID<->bits round-trips, token bitstreams, binary LM example views, byte-bit
+  conversion, and hamming/transition features. Locked by
+  `tests/semantics/llm_max_foundation_test.sapp`. These are generic pblang libraries;
+  the pbAI-Max product lives outside pblang in `AAP/ai/pbai`.
+- **Resource use note (today)** — pbAI-Max continuation now uses pblang `spawn`/`join`
+  to evaluate independent candidates in parallel: quick screening workers run first,
+  then only top finalists run on the full example set. The parent process is the only
+  checkpoint writer. This raises CPU utilization above a single core without changing
+  pblang's VM semantics; memory use rises while workers hold separate candidate models.
 - **`stdlib/pbai.sapp`** — pbAI's IDE **assistant**: a neural intent classifier (on `nn.sapp`)
   plus pblang-grounded skills (explain / find-bugs / improve / comment / knowledge),
   **no external model, no network**. It **backs the IDE 🤖 AI panel** via a pblang gateway
@@ -118,11 +157,19 @@ program orchestrating these kernels.
   next-char prediction with **manual backprop** (the `tensor_*` kernels are forward-only),
   generating autoregressively with the `tensor_argmax` kernel. It learns (cross-entropy
   3.29 → 0.58 on a small pblang corpus) and generates coherent pblang
-  (`fn ` → `fn main() { let r; }`). Locked by `tests/semantics/pbai_lm_test.sapp`.
+  (`fn ` → `fn main() { let r; }`). The implementation now has a bottom-up pbAI-Nano
+  path: `source_corpus()` (pblang-native training source), `train_nano()` (source →
+  versioned `pbai.lm.char.v1` checkpoint), `checkpoint_generate()`, and
+  `generate_nano()`. Locked by `tests/semantics/pbai_lm_test.sapp`.
+- **Top-level pbAI generation (today)** — `stdlib/pbai.sapp` exposes the lower model
+  through `pbai.generate(prompt, n)` and reports the stack through `pbai.model_status()`:
+  top = intent router / grounded skills / tools; bottom = `pbai_lm.sapp` checkpoint and
+  architecture metadata. Generation requests to `pbai.respond(...)` and the gateway's
+  `ai_ollama_generate` hint route to native pbAI-Nano instead of an external model.
 
-These are the small end of the family — analysis **and** generation, all in pblang. The
-transformer scale-up (attention/more layers over the tensor kernels above, larger corpora,
-temperature sampling) is the roadmap below.
+These are the small end of the family — analysis, generation, and now the first reusable
+transformer foundation, all in pblang. Full training scale-up (multi-layer attention,
+larger corpora, benchmarks, and distillation) is the roadmap below.
 
 ---
 
@@ -245,43 +292,104 @@ capability gating the MCP server already enforces (e.g. write tools blocked on t
 
 ---
 
-## 8. Existing assets to build on (reference)
+## 8. External data and prior work boundaries
 
-A local sandbox of prior AI work — **`../AAP/ai/`** (outside this repo) — already
-contains a working small language model, a tokenizer, a from-scratch inference engine,
-a training pipeline, and datasets. pbAI does **not** start from zero; it should reuse
-these. (Paths below are on the dev machine, not committed to the pblang repo.)
+Local AI folders outside this repo — for example **`../AAP/ai/`** and
+**`../AAP/datasets/data/`** on the development machine — are useful inputs, but they are
+not pbAI itself. pbAI must be redesigned from the beginning with a pblang-native
+architecture whose first priorities are expandability, accuracy, speed, efficiency,
+portability, scalability, and clean tool integration.
 
-| Asset | Path | How it maps onto pbAI |
-|-------|------|------------------------|
-| **Trained GPT-2 (4L/4H, d=256, ffn=1024, ctx=128, vocab=16384, ~7–8M params, 29 MB fp32)** | `AAP/ai/max/max_model/model.safetensors` (+ `config.json`) | The first **teacher / flagship checkpoint** for distillation, and the proven **sub-model architecture blueprint**. Its forward pass is exactly: `tensor_embedding_lookup` → N×(attention = `tensor_matmul`+`tensor_softmax`+`tensor_layer_norm`) + FFN(`tensor_matmul`+`tensor_gelu`) → `tensor_matmul` → `tensor_softmax`/`tensor_argmax`. Every kernel already exists as a pblang builtin. |
-| **BPE tokenizer (16384 vocab, ByteLevel, `[UNK]/[PAD]/[BOS]/[EOS]`)** | `AAP/ai/max/max_model/tokenizer.json` | Parse the merge table + vocab → port to a pure-pblang BPE encoder/decoder. This is pbAI's tokenizer. |
-| **Pure-from-scratch inference engine (zero deps)** | `AAP/ai/max/NeuralNetwork.pas` and the pblang-era `AAP/ai/Sp_AIModel/SpAI/NeuralNetwork.pas` | **Highest direct-port value.** Object-Pascal with explicit embedding-lookup → forward-loop → softmax skeleton and no framework. Port the skeleton to pblang tensor builtins, swapping the LSTM cell for multi-head attention + layer-norm. `TChatbotModel.Predict` is the generation-loop template. (`Sp_AIModel` = "SpAI", from pblang's former name *pblang* — the original proof-of-concept.) |
-| **Binary checkpoint I/O pattern** | `AAP/ai/max/TextProcessor.pas` (`SaveToFile`/`LoadFromFile`), `AAP/ai/Sp_AIModel/SpAI/Win32/Debug/tokenizer.dat` | Template for pbAI's **native weight/tokenizer file format** that pblang can load (and eventually mmap) without a Python dependency. |
-| **Multi-provider agent / tool-call loop** | `AAP/ai/max/AIChatService.pas` (Gemini + OpenAI, retry/backoff, JSON I/O) | Pattern for pbAI's **provider/tool dispatcher** — maps onto `ai_chat`/`provider_registry.sapp` for remote fallback and onto the pb-mcp-server tool dispatch in [§7](#7-pb-mcp-server-tools). |
-| **Training + tokenizer pipeline** | `AAP/ai/max/trainer_max.py`, `train_tokenizer.py`, `prep_books.py`, `tokenize_data.py` | The pipeline that produced the checkpoint above; reuse to train/scale the flagship and to **distill** sub-models. Add a code corpus for the coding/debugging specialization. |
-| **Datasets (on disk)** | `AAP/datasets/data/` — TinyStories (~1.9 GB), BookCorpus (~4.8 GB), PG19, GloVe 6B | Pretraining corpora. For pbAI's coding/debugging focus, augment with a pblang/code corpus (the pblang repo itself: stdlib, tests, compiler). |
+The boundary is strict:
 
-**Practical first step (P0):** load `max_model/model.safetensors` + `config.json`, convert
-the weights to a flat pblang-loadable binary, and reimplement its GPT-2 forward pass in
-pblang on the existing `tensor_*` builtins — using `NeuralNetwork.pas` as the structural
-skeleton and `tokenizer.json` for encode/decode. That yields a real, runnable pbAI-Nano
-inference path before any new training is needed.
+- **Use external folders as data/reference only.** They can provide corpora,
+  tokenizer experiments, training scripts, checkpoint-conversion lessons, evaluation
+  prompts, and implementation notes.
+- **Do not use or replace pbAI with an old model.** Existing checkpoints, Pascal
+  prototypes, Python trainers, or provider wrappers are not the pbAI architecture and
+  are not the source of truth for pbAI behavior.
+- **Do not make a checkpoint the flagship.** pbAI-Max is trained or assembled for the
+  new architecture; older models may be used only as baselines, regression fixtures, or
+  optional comparison teachers during evaluation.
+- **Keep pbAI portable.** The runnable inference path lives in pblang over stable tensor
+  and file-format primitives. Optional ONNX/GGUF/remote backends remain plugins behind
+  the backend interface, never required by the core.
+
+| External input | Path | Allowed use |
+|----------------|------|-------------|
+| **Text/code datasets** | `AAP/datasets/data/`, the pblang repo itself, stdlib/tests/docs/compiler sources | Pretraining and evaluation corpora. pblang code/debugging data is mandatory for the coding-focused tiers. |
+| **Tokenizer experiments** | `AAP/ai/max/max_model/tokenizer.json`, tokenizer training scripts | Reference material for designing a pblang-native tokenizer. The final tokenizer should be versioned, testable, and decoupled from any old checkpoint. |
+| **Training pipeline scripts** | `AAP/ai/max/trainer_max.py`, `train_tokenizer.py`, `prep_books.py`, `tokenize_data.py` | Data preparation and reproducibility patterns. Reuse ideas and formats, not the old model contract. |
+| **Prior checkpoints** | `AAP/ai/max/max_model/model.safetensors` and similar artifacts | Optional evaluation baselines or temporary teacher signals. They must not define pbAI-Max, pbAI's architecture, or the public API. |
+| **Prototype inference code** | `AAP/ai/max/NeuralNetwork.pas`, `AAP/ai/Sp_AIModel/SpAI/NeuralNetwork.pas` | Historical reference for simple inference loops and file I/O. Do not direct-port it as pbAI's architecture. |
+| **Provider/tool-call prototypes** | `AAP/ai/max/AIChatService.pas` | Reference for retry/backoff and JSON tool envelopes. Core pbAI tool use is through the pblang API and pb-mcp-server. |
+
+**Practical first step (P0):** specify the new pbAI inference contract first: tokenizer
+format, weight format, decoder block interface, sampling API, model metadata, benchmark
+suite, and golden tests. This has started in pblang with `llm_core.sapp`,
+`llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, and the scale-up modules
+listed above, including the new `llm_binary.sapp` bit-level token substrate and
+live-mutable architecture hooks. pblang keeps the reusable foundation and Nano path; the
+pbAI-Max product module, training policy, corpora, and tier metadata live in
+`AAP/ai/pbai`. Existing checkpoints are used only to compare quality and speed.
 
 ## 9. Roadmap (planned)
 
 | Phase | Goal |
 |-------|------|
-| **P0 — Inference runtime** | A pblang module that runs a small decoder-only transformer purely on the existing tensor builtins (embedding → attention → sampling); load the existing `max_model` GPT-2 weights ([§8](#8-existing-assets-to-build-on-reference)) from a converted flat file; deterministic, testable forward pass. |
-| **P1 — pbAI-Nano/-Mini** | First tiny + small models with weights, focused on pblang completion/debugging; benchmark accuracy + tokens/sec; lock with drift tests. |
+| **P0 — Fresh inference contract** | Started: `llm_core.sapp`, `llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, `llm_attention.sapp`, `llm_train.sapp`, `llm_stream.sapp`, `llm_weights.sapp`, `llm_tokenizer_train.sapp`, `llm_eval.sapp`, `llm_quant.sapp`, `llm_binary.sapp`, and semantic tests define tokenizer/data/decoder/sampling/checkpoint/training/eval/binary-token/live-architecture/feedback/guessing-loop primitives. No old checkpoint defines this contract. |
+| **P1 — pbAI-Nano/-Mini** | Train the first fresh tiny + small models for pblang completion/debugging on pblang/code data plus selected external corpora; benchmark accuracy, latency, memory, and tokens/sec; lock with drift tests. |
 | **P2 — Agent loop + tools** | Wire the plan→act→verify loop to `frontend_run`, the lint/typeck oracles, and the pb-mcp-server tool catalog. |
-| **P3 — pbAI-Max + distillation** | Train/assemble the flagship; stand up the distillation pipeline that produces the sub-models from it. |
+| **P3 — pbAI-Max + distillation** | Train/assemble the new flagship on the full curated corpus; stand up the distillation pipeline that produces consistent Pro/Mini/Nano sub-models from pbAI-Max. |
 | **P4 — Self-improvement loop** | pbAI lands reviewed patches to pblang's own compiler/stdlib/docs; its successes feed the next pbAI-Max. |
 | **P5 — Expandability surface** | Stable plugin/adapter/backend/corpus registration APIs so the family grows without core forks. |
 
 Each phase is gated the pblang way: a feature is "done" only when locked by tests
 (`tests/*.rs` / `tests/semantics/*.sapp` / a new `tests/pbai_*` suite) and verified
 green, exactly as the self-hosting milestones (PrjAnalysis §§40–45) were.
+
+---
+
+## 9.1 Shipped assistant intelligence
+
+The current `stdlib/pbai.sapp` assistant is a pblang-grounded local model plus
+deterministic skills:
+
+- `classify(prompt)` routes to explain/bugs/improve/comment/general through the cached
+  neural intent classifier.
+- `classify_scores(prompt)` returns the intent name and raw score vector for IDE/tooling
+  diagnostics.
+- `analyze(prompt)` returns structured metadata: intent, scores, whether code was found,
+  quality score, sensitive-capability risk summary, and scan metrics.
+- Reviews flag pblang-specific issues: invalid `print(x)`, missing-key map reads,
+  string ordering comparisons, unchecked `exec`/`ffi`/`env`, unbalanced delimiters,
+  recursion, nesting depth, TODO/FIXME markers, and I/O without `try/catch`.
+- The native IDE exposes this through EXPLAIN / BUGS / IMPROVE / QUALITY / COMMENT
+  quick actions.
+
+Locked by `tests/semantics/pbai_test.sapp`, `pbai_lm_test.sapp`, and the native
+IDE UI smoke test.
+
+## 9.2 pblang-native MCP bridge
+
+`stdlib/pb_mcp.sapp` is the first conversion slice of the Rust
+`editors/ide/tools/mcpservers/pb-mcp-server` into pblang. It implements the safe
+core-code tools directly in pblang and exposes them to pbAI:
+
+- `workspace_context`
+- `tool_catalog`
+- `read_file`
+- `read_file_tail`
+- `list_files`
+- `project_tree`
+- `grep_code`
+
+pbAI imports this bridge and exposes `pbAI.tool_catalog()` / `pbAI.tool_call(name,args)`.
+The full Rust MCP protocol daemon still owns the larger 484+ tool catalog, gateway,
+terminal/local-power profile, bus, OCR/ML/network features, and IDE integrations; those
+should be ported incrementally after the pblang API stabilizes.
+
+Locked by `tests/semantics/pb_mcp_bridge_test.sapp`.
 
 ---
 

@@ -1,0 +1,187 @@
+// stdlib/llm_data.sapp -- dataset and corpus helpers for pblang-native LLMs.
+//
+// The goal is controlled learning: read/chunk/pack corpora, split train/validation,
+// and filter secrets/noise before data reaches a tokenizer or model.
+
+fn lower(s) { return str_lower(str(s)); }
+
+fn secret_name(name) {
+    let n = lower(name);
+    if n == "" { return true; }
+    if str_starts_with(n, ".") { return true; }
+    if n == "target" or n == "node_modules" or n == "__pycache__" or n == ".venv" { return true; }
+    if n == "cache" or n == "tmp" or n == "temp" or n == "build" or n == "dist" { return true; }
+    if str_contains(n, "credential") or str_contains(n, "password") or str_contains(n, "passwd") { return true; }
+    if str_contains(n, "secret") or str_contains(n, "token") or str_contains(n, "openrouter") { return true; }
+    if str_contains(n, "appsettings") or str_contains(n, "api_key") or str_contains(n, "access_key") { return true; }
+    if str_starts_with(n, "id_ed25519") or str_starts_with(n, "id_rsa") { return true; }
+    if str_ends_with(n, ".pem") or str_ends_with(n, ".p12") or str_ends_with(n, ".pfx") or str_ends_with(n, ".key") { return true; }
+    if str_ends_with(n, ".iso") or str_ends_with(n, ".exe") or str_ends_with(n, ".msi") or str_ends_with(n, ".zip") or str_ends_with(n, ".7z") { return true; }
+    return false;
+}
+
+fn text_like(path) {
+    let p = lower(path);
+    let exts = [".txt", ".md", ".json", ".jsonl", ".csv", ".tsv", ".sapp", ".pb", ".js", ".ts",
+        ".html", ".css", ".py", ".rs", ".c", ".cpp", ".h", ".hpp", ".cs", ".pas", ".java",
+        ".kt", ".go", ".rb", ".php", ".sql", ".sh", ".bat", ".ps1", ".toml", ".yaml",
+        ".yml", ".ini", ".log", ".xml"];
+    let i = 0;
+    while i < len(exts) {
+        if str_ends_with(p, exts[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn read_text_file(path, max_chars = 200000) {
+    if secret_name(path) or not text_like(path) { return ""; }
+    let raw = try fs_read(path) catch "";
+    if len(raw) > max_chars { return str_slice(raw, 0, max_chars); }
+    return raw;
+}
+
+fn chunk_text(text, chunk_chars = 2048, stride = 2048) {
+    let chunks = [];
+    if stride <= 0 { stride = chunk_chars; }
+    let i = 0;
+    while i < len(text) {
+        let end = i + chunk_chars;
+        if end > len(text) { end = len(text); }
+        if i < end { push(chunks, str_slice(text, i, end)); }
+        i = i + stride;
+    }
+    return chunks;
+}
+
+fn chunk_ids(ids, context, stride = nil) {
+    if stride == nil { stride = context; }
+    let chunks = [];
+    let i = 0;
+    while i + context <= len(ids) {
+        let c = [];
+        let j = 0;
+        while j < context {
+            push(c, ids[i + j]);
+            j = j + 1;
+        }
+        push(chunks, c);
+        i = i + stride;
+    }
+    return chunks;
+}
+
+fn lm_examples(ids, context) {
+    let out = [];
+    let i = 0;
+    while i + context < len(ids) {
+        let x = [];
+        let j = 0;
+        while j < context {
+            push(x, ids[i + j]);
+            j = j + 1;
+        }
+        push(out, map{ x: x, y: ids[i + context] });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn split(data, valid_ratio = 0.1) {
+    let n_valid = valid_ratio * len(data);
+    if n_valid < 1 and len(data) > 1 { n_valid = 1; }
+    let train = [];
+    let valid = [];
+    let i = 0;
+    while i < len(data) {
+        if i < n_valid { push(valid, data[i]); }
+        else { push(train, data[i]); }
+        i = i + 1;
+    }
+    return map{ train: train, valid: valid };
+}
+
+fn corpus_record(path, text, kind = "text") {
+    return map{ format: "pblang.llm.corpus_record.v1", path: path, kind: kind, text: text, chars: len(text) };
+}
+
+fn record_quality(record) {
+    let text = try record.text catch "";
+    let path = try record.path catch "";
+    let kind = try record.kind catch "text";
+    let trimmed = str_trim(text);
+    let score = 0;
+    let reasons = [];
+    if secret_name(path) {
+        push(reasons, "secret-path");
+        return map{ format: "pblang.llm.record_quality.v1", keep: false, score: -100, reasons: reasons };
+    }
+    if len(trimmed) < 12 {
+        push(reasons, "too-short");
+        return map{ format: "pblang.llm.record_quality.v1", keep: false, score: -10, reasons: reasons };
+    }
+    if kind == "pblang-code" or kind == "pblang-test" or str_ends_with(lower(path), ".sapp") {
+        score = score + 5;
+        push(reasons, "code");
+    }
+    if kind == "docs" or kind == "pblang-docs" or str_ends_with(lower(path), ".md") {
+        score = score + 2;
+        push(reasons, "docs");
+    }
+    if str_contains(text, "fn ") { score = score + 4; push(reasons, "fn"); }
+    if str_contains(text, "assert(") { score = score + 3; push(reasons, "test"); }
+    if str_contains(text, "return ") { score = score + 2; push(reasons, "return"); }
+    if str_contains(text, "print ") { score = score + 2; push(reasons, "print"); }
+    if str_contains(text, "TODO") or str_contains(text, "FIXME") { score = score - 2; push(reasons, "todo"); }
+    if len(trimmed) > 200 { score = score + 1; }
+    return map{
+        format: "pblang.llm.record_quality.v1",
+        keep: score > 0,
+        score: score,
+        reasons: reasons
+    };
+}
+
+fn filter_quality_records(records) {
+    let out = [];
+    let skipped = 0;
+    let total_score = 0;
+    let i = 0;
+    while i < len(records) {
+        let q = record_quality(records[i]);
+        if q.keep {
+            records[i].quality = q;
+            total_score = total_score + q.score;
+            push(out, records[i]);
+        } else {
+            skipped = skipped + 1;
+        }
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.llm.quality_filter.v1",
+        records: out,
+        kept: len(out),
+        skipped: skipped,
+        total_score: total_score
+    };
+}
+
+fn filter_records(records) {
+    let out = [];
+    let skipped = 0;
+    let i = 0;
+    while i < len(records) {
+        let r = records[i];
+        if secret_name(r.path) {
+            skipped = skipped + 1;
+        } else {
+            push(out, r);
+        }
+        i = i + 1;
+    }
+    return map{ records: out, skipped: skipped };
+}
+
+export secret_name, text_like, read_text_file, chunk_text, chunk_ids, lm_examples;
+export split, corpus_record, record_quality, filter_quality_records, filter_records;

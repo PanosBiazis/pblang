@@ -1,29 +1,384 @@
-//! networking_advanced.sapp — Advanced networking for pblang
+// stdlib/networking_advanced.sapp - advanced networking helpers.
+//
+// This module keeps pure parsing/planning helpers separate from optional shell or
+// socket probes. Pure helpers are safe in tests and sandboxes; probe helpers are
+// best-effort and return structured errors when the host denies networking/exec.
 
-fn ping(host, timeout_ms) { if timeout_ms==nil{timeout_ms=3000;} let c=tcp_connect(host+":80"); if c!=nil{tcp_close(c);return true;} return false; }
-fn dns_lookup(hostname) { return map{raw: exec("nslookup "+hostname+" 2>/dev/null || host "+hostname+" 2>/dev/null || echo ''")}; }
-fn whois(domain) { return exec("whois "+domain+" 2>/dev/null || echo ''"); }
-fn port_scan(host, start, end) { if start==nil{start=1;} if end==nil{end=1024;} let p=[]; let port=start; while port<=end { let c=tcp_connect(host+":"+str(port)); if c!=nil{tcp_close(c);array_push(p,port);} port=port+1; } return p; }
-fn ssl_expiry(hostname, port) { if port==nil{port=443;} return exec("echo | openssl s_client -connect "+hostname+":"+str(port)+" 2>/dev/null | openssl x509 -enddate -noout 2>/dev/null || echo ''"); }
-fn http_download(url, dest) { let r=exec("curl -s -o "+dest+" "+url+" 2>/dev/null || wget -q -O "+dest+" "+url+" 2>/dev/null"); return r==""; }
-fn url_parse(url) {
-    let scheme=""; let host=""; let port=""; let path="/"; let query="";
-    if str_contains(url, "://") { let idx=0; while idx<len(url) and url[idx..(idx+1)]!=":"{scheme=scheme+url[idx..(idx+1)];idx=idx+1;} url=url[idx+3..]; }
-    let j=0; let in_host=true;
-    while j<len(url) {
-        if in_host and url[j..(j+1)]=="/" { in_host=false; path=""; }
-        if in_host { host=host+url[j..(j+1)]; } else { path=path+url[j..(j+1)]; }
-        j=j+1;
-    }
-    if str_contains(path, "?") { let qi=0; while qi<len(path) and path[qi..(qi+1)]!="?"{qi=qi+1;} query=path[qi+1..]; }
-    return map{scheme:scheme, host:host, port:port, path:path, query:query};
+fn _is_digit(ch) { return str_contains("0123456789", ch); }
+
+fn shell_quote(s) {
+    return "'" + str_replace_all(s, "'", "'\\''") + "'";
 }
-fn url_encode(t) { let r=""; let i=0; while i<len(t) { let ch=t[i..(i+1)]; if ch==" "{r=r+"%20";}else{if ch=="&"{r=r+"%26";}else{if ch=="="{r=r+"%3D";}else{r=r+ch;}}} i=i+1; } return r; }
-fn url_decode(t) { let r=""; let i=0; while i<len(t) { if t[i..(i+1)]=="%" and i+2<len(t) { if t[i..(i+3)]=="%20"{r=r+" ";i=i+3;}else{if t[i..(i+3)]=="%26"{r=r+"&";i=i+3;}else{r=r+t[i..(i+1)];i=i+1;}} } else { r=r+t[i..(i+1)]; i=i+1; } } return r; }
-fn is_ipv4(s) { let d=0; let i=0; while i<len(s) { if s[i..(i+1)]=="."{d=d+1;} i=i+1; } return d==3; }
-fn is_ipv6(s) { return str_contains(s, ":"); }
-fn cidr_to_range(cidr) { let parts=[]; let cur=""; let i=0; while i<len(cidr) { if cidr[i..(i+1)]=="/"{array_push(parts,cur);cur="";}else{cur=cur+cidr[i..(i+1)];} i=i+1; } array_push(parts,cur); return map{network:parts[0], prefix:parts[1]}; }
 
-export ping; export dns_lookup; export whois; export port_scan; export ssl_expiry;
-export http_download; export url_parse; export url_encode; export url_decode;
-export is_ipv4; export is_ipv6; export cidr_to_range;
+fn split(s, sep) {
+    let out = [];
+    let cur = "";
+    let i = 0;
+    while i < len(s) {
+        let ch = s[i..(i + 1)];
+        if ch == sep { array_push(out, cur); cur = ""; }
+        else { cur = cur + ch; }
+        i = i + 1;
+    }
+    array_push(out, cur);
+    return out;
+}
+
+fn join(parts, sep) {
+    let out = "";
+    let i = 0;
+    while i < len(parts) {
+        if i > 0 { out = out + sep; }
+        out = out + str(parts[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn parse_query(q) {
+    let out = map{};
+    if q == nil or q == "" { return out; }
+    let pairs = split(q, "&");
+    let i = 0;
+    while i < len(pairs) {
+        let p = pairs[i];
+        let k = p;
+        let v = "";
+        let eq = 0 - 1;
+        let j = 0;
+        while j < len(p) {
+            if eq < 0 and p[j..(j + 1)] == "=" { eq = j; }
+            j = j + 1;
+        }
+        if eq >= 0 {
+            k = p[0..eq];
+            v = p[(eq + 1)..len(p)];
+        }
+        out[url_decode(k)] = url_decode(v);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn url_parse(input) {
+    let rest = input;
+    let scheme = "";
+    let host = "";
+    let port = nil;
+    let path = "/";
+    let query = "";
+    let fragment = "";
+
+    let i = 0;
+    while i + 2 < len(rest) {
+        if rest[i..(i + 3)] == "://" {
+            scheme = rest[0..i];
+            rest = rest[(i + 3)..len(rest)];
+            i = len(rest);
+        }
+        i = i + 1;
+    }
+
+    let hash = 0 - 1;
+    i = 0;
+    while i < len(rest) {
+        if hash < 0 and rest[i..(i + 1)] == "#" { hash = i; }
+        i = i + 1;
+    }
+    if hash >= 0 {
+        fragment = rest[(hash + 1)..len(rest)];
+        rest = rest[0..hash];
+    }
+
+    let qmark = 0 - 1;
+    i = 0;
+    while i < len(rest) {
+        if qmark < 0 and rest[i..(i + 1)] == "?" { qmark = i; }
+        i = i + 1;
+    }
+    if qmark >= 0 {
+        query = rest[(qmark + 1)..len(rest)];
+        rest = rest[0..qmark];
+    }
+
+    let slash = 0 - 1;
+    i = 0;
+    while i < len(rest) {
+        if slash < 0 and rest[i..(i + 1)] == "/" { slash = i; }
+        i = i + 1;
+    }
+    let authority = rest;
+    if slash >= 0 {
+        authority = rest[0..slash];
+        path = rest[slash..len(rest)];
+    }
+
+    let colon = 0 - 1;
+    i = 0;
+    while i < len(authority) {
+        if colon < 0 and authority[i..(i + 1)] == ":" { colon = i; }
+        i = i + 1;
+    }
+    if colon >= 0 {
+        host = authority[0..colon];
+        port = parse_number(authority[(colon + 1)..len(authority)]);
+    } else {
+        host = authority;
+        if scheme == "http" { port = 80; }
+        if scheme == "https" { port = 443; }
+    }
+
+    return map{
+        scheme: scheme,
+        host: host,
+        port: port,
+        path: path,
+        query: query,
+        query_params: parse_query(query),
+        fragment: fragment,
+        authority: authority,
+    };
+}
+
+fn url_encode(t) {
+    let out = "";
+    let i = 0;
+    while i < len(t) {
+        let ch = t[i..(i + 1)];
+        if ch == " " { out = out + "%20"; }
+        else if ch == "&" { out = out + "%26"; }
+        else if ch == "=" { out = out + "%3D"; }
+        else if ch == "?" { out = out + "%3F"; }
+        else if ch == "#" { out = out + "%23"; }
+        else if ch == "/" { out = out + "%2F"; }
+        else { out = out + ch; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn url_decode(t) {
+    let out = "";
+    let i = 0;
+    while i < len(t) {
+        if i + 2 < len(t) and t[i..(i + 1)] == "%" {
+            let trip = t[i..(i + 3)];
+            if trip == "%20" { out = out + " "; i = i + 3; }
+            else if trip == "%26" { out = out + "&"; i = i + 3; }
+            else if trip == "%3D" or trip == "%3d" { out = out + "="; i = i + 3; }
+            else if trip == "%3F" or trip == "%3f" { out = out + "?"; i = i + 3; }
+            else if trip == "%23" { out = out + "#"; i = i + 3; }
+            else if trip == "%2F" or trip == "%2f" { out = out + "/"; i = i + 3; }
+            else { out = out + t[i..(i + 1)]; i = i + 1; }
+        } else if t[i..(i + 1)] == "+" {
+            out = out + " ";
+            i = i + 1;
+        } else {
+            out = out + t[i..(i + 1)];
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn is_ipv4(s) {
+    let parts = split(s, ".");
+    if len(parts) != 4 { return false; }
+    let i = 0;
+    while i < 4 {
+        if parts[i] == "" { return false; }
+        let j = 0;
+        while j < len(parts[i]) {
+            if not _is_digit(parts[i][j..(j + 1)]) { return false; }
+            j = j + 1;
+        }
+        let n = parse_number(parts[i]);
+        if n < 0 or n > 255 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn is_ipv6(s) { return str_contains(s, ":"); }
+
+fn ipv4_to_int(ip) {
+    if not is_ipv4(ip) { return nil; }
+    let p = split(ip, ".");
+    return parse_number(p[0]) * 16777216 + parse_number(p[1]) * 65536 + parse_number(p[2]) * 256 + parse_number(p[3]);
+}
+
+fn int_to_ipv4(n) {
+    let a = num_floor(n / 16777216);
+    n = n - a * 16777216;
+    let b = num_floor(n / 65536);
+    n = n - b * 65536;
+    let c = num_floor(n / 256);
+    let d = n - c * 256;
+    return str(a) + "." + str(b) + "." + str(c) + "." + str(d);
+}
+
+fn pow2(n) {
+    let out = 1;
+    let i = 0;
+    while i < n { out = out * 2; i = i + 1; }
+    return out;
+}
+
+fn cidr_to_range(cidr) {
+    let parts = split(cidr, "/");
+    if len(parts) != 2 { return map{ ok: false, error: "expected a.b.c.d/prefix" }; }
+    let base = ipv4_to_int(parts[0]);
+    let prefix = parse_number(parts[1]);
+    if base == nil or prefix < 0 or prefix > 32 { return map{ ok: false, error: "invalid cidr" }; }
+    let size = pow2(32 - prefix);
+    let start = num_floor(base / size) * size;
+    let end = start + size - 1;
+    return map{ ok: true, network: int_to_ipv4(start), first: int_to_ipv4(start), last: int_to_ipv4(end), prefix: prefix, size: size };
+}
+
+fn cidr_contains(cidr, ip) {
+    let r = cidr_to_range(cidr);
+    let n = ipv4_to_int(ip);
+    if not r.ok or n == nil { return false; }
+    return n >= ipv4_to_int(r.first) and n <= ipv4_to_int(r.last);
+}
+
+fn subnet_mask(prefix) {
+    if prefix <= 0 { return "0.0.0.0"; }
+    if prefix >= 32 { return "255.255.255.255"; }
+    let mask = (pow2(32) - pow2(32 - prefix));
+    return int_to_ipv4(mask);
+}
+
+fn build_http_request(method, url, headers, body) {
+    let u = url_parse(url);
+    let path = u.path;
+    if u.query != "" { path = path + "?" + u.query; }
+    let out = method + " " + path + " HTTP/1.1\r\nHost: " + u.host + "\r\n";
+    if headers != nil {
+        let keys = map_keys(headers);
+        let i = 0;
+        while i < len(keys) {
+            out = out + keys[i] + ": " + str(headers[keys[i]]) + "\r\n";
+            i = i + 1;
+        }
+    }
+    if body != nil and body != "" { out = out + "Content-Length: " + str(len(body)) + "\r\n"; }
+    out = out + "\r\n";
+    if body != nil { out = out + body; }
+    return out;
+}
+
+fn parse_headers(text) {
+    let out = map{};
+    let lines = str_split(str_replace_all(text, "\r\n", "\n"), "\n");
+    let i = 0;
+    while i < len(lines) {
+        let line = lines[i];
+        let colon = 0 - 1;
+        let j = 0;
+        while j < len(line) {
+            if colon < 0 and line[j..(j + 1)] == ":" { colon = j; }
+            j = j + 1;
+        }
+        if colon > 0 {
+            let k = str_lower(str_trim(line[0..colon]));
+            let v = str_trim(line[(colon + 1)..len(line)]);
+            out[k] = v;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn parse_http_response(raw) {
+    let normalized = str_replace_all(raw, "\r\n", "\n");
+    let lines = str_split(normalized, "\n");
+    let status = "";
+    if len(lines) > 0 { status = lines[0]; }
+    let code = nil;
+    if len(status) >= 12 { code = parse_number(status[9..12]); }
+    let header_text = "";
+    let body = "";
+    let in_body = false;
+    let i = 1;
+    while i < len(lines) {
+        if in_body { body = body + lines[i]; if i + 1 < len(lines) { body = body + "\n"; } }
+        else if lines[i] == "" { in_body = true; }
+        else { header_text = header_text + lines[i] + "\n"; }
+        i = i + 1;
+    }
+    return map{ status_line: status, status: code, headers: parse_headers(header_text), body: body };
+}
+
+fn parse_dns_records(text) {
+    let records = [];
+    let lines = str_split(text, "\n");
+    let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]);
+        if line != "" {
+            let parts = str_split(line, " ");
+            let clean = [];
+            let j = 0;
+            while j < len(parts) { if parts[j] != "" { array_push(clean, parts[j]); } j = j + 1; }
+            if len(clean) >= 4 {
+                array_push(records, map{ name: clean[0], ttl: clean[1], class: clean[2], type: clean[3], value: join(clean[4..len(clean)], " ") });
+            }
+        }
+        i = i + 1;
+    }
+    return records;
+}
+
+fn decode_tcp_flags(n) {
+    let flags = [];
+    if num_mod(n, 2) >= 1 { array_push(flags, "FIN"); }
+    if num_mod(num_floor(n / 2), 2) >= 1 { array_push(flags, "SYN"); }
+    if num_mod(num_floor(n / 4), 2) >= 1 { array_push(flags, "RST"); }
+    if num_mod(num_floor(n / 8), 2) >= 1 { array_push(flags, "PSH"); }
+    if num_mod(num_floor(n / 16), 2) >= 1 { array_push(flags, "ACK"); }
+    if num_mod(num_floor(n / 32), 2) >= 1 { array_push(flags, "URG"); }
+    return flags;
+}
+
+fn ping(host, timeout_ms) {
+    if timeout_ms == nil { timeout_ms = 3000; }
+    let c = try tcp_connect(host + ":80") catch nil;
+    if c != nil { tcp_close(c); return map{ ok: true, host: host }; }
+    return map{ ok: false, host: host, error: "connection failed or networking denied" };
+}
+
+fn dns_lookup(hostname) {
+    let cmd = "nslookup " + shell_quote(hostname) + " 2>/dev/null || host " + shell_quote(hostname) + " 2>/dev/null || true";
+    let raw = try exec(cmd) catch "";
+    return map{ raw: raw, records: parse_dns_records(raw) };
+}
+
+fn whois(domain) {
+    return try exec("whois " + shell_quote(domain) + " 2>/dev/null || true") catch "";
+}
+
+fn port_scan(host, start, end) {
+    if start == nil { start = 1; }
+    if end == nil { end = 1024; }
+    let open = [];
+    let port = start;
+    while port <= end {
+        let c = try tcp_connect(host + ":" + str(port)) catch nil;
+        if c != nil { tcp_close(c); array_push(open, port); }
+        port = port + 1;
+    }
+    return open;
+}
+
+fn ssl_expiry(hostname, port) {
+    if port == nil { port = 443; }
+    let hp = shell_quote(hostname + ":" + str(port));
+    return try exec("echo | openssl s_client -connect " + hp + " 2>/dev/null | openssl x509 -enddate -noout 2>/dev/null || true") catch "";
+}
+
+export shell_quote, split, join, parse_query, url_parse, url_encode, url_decode;
+export is_ipv4, is_ipv6, ipv4_to_int, int_to_ipv4, cidr_to_range, cidr_contains, subnet_mask;
+export build_http_request, parse_headers, parse_http_response, parse_dns_records, decode_tcp_flags;
+export ping, dns_lookup, whois, port_scan, ssl_expiry;

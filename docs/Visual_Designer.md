@@ -1,13 +1,13 @@
 # pblang Studio — the visual drag-and-drop designer
 
-> **Status: VISION / DESIGN (2026-05-30).** Today the pblang IDE
-> (`editors/ide/index.html` + `pblang serve`) is a **code-first** editor: write,
-> run, check, format, debug (see `docs/IDE_MANUAL.md`). The **visual designer**
-> described here — build apps by dragging interactive elements onto a canvas —
-> is the roadmap. It is grounded in runtime pblang **already has** (`graphics.sapp`
-> / `pblang-graphics`, `web_framework.sapp` / `html.sapp` / `http_server.sapp`,
-> and the self-hosted parser/codegen for round-tripping). Items are marked
-> **(today)** or **(planned)**.
+> **Status: STARTED / FOUNDATION SHIPPING (updated 2026-06-07).** The browser IDE
+> (`editors/ide/index.html` + `pblang serve`) remains the code-first bootstrap, but
+> the native pblang IDE (`pblang --ide`, `editors/ide/pbide.sapp`) now ships a real
+> Designer panel: widget palette, canvas, drag/move, text editing, code generation,
+> 3D cube/ball design items, and responsive layout cycling. The reusable foundation is
+> `stdlib/design_engine.sapp`: backend-neutral 2D/3D item model, snap/grid/stack/free
+> layout, anchors, hit-testing, and simple isometric projection. Larger Studio features
+> below are marked **(today)** or **(planned)**.
 >
 > **The IDE is to be written in pblang.** A core project goal: pblang Studio — both
 > the editor and the designer — is itself a **pblang application** (using pblang's own
@@ -76,7 +76,11 @@ The designer is built from a small set of ideas shared across all three targets:
   `on_change`, `on_submit`, `on_select`, `on_timer`…) and bind it to a pblang
   handler — generated as a stub you fill in, or pointed at an existing function.
 - **Layout** — constraint/flex/grid layout so designs survive resize (rather than
-  absolute pixels only).
+  absolute pixels only). **Today:** `stdlib/design_engine.sapp` provides free,
+  responsive, grid, and stack positioning for native Designer items.
+- **2D/3D/n-dimensional item model** — 2D UI widgets, 3D scene items, CAD/circuit-style
+  nodes, and future n-dimensional data/geometry share one design-document shape. **Today:**
+  native Designer has 3D cube/ball items and `design_engine.sapp` has 3D projection.
 - **Data binding** — bind a widget to a value/model field so the UI updates when data
   changes and vice-versa.
 
@@ -113,14 +117,17 @@ home in code (canvas positions, grouping), kept beside the generated `.sapp`.
 ### Desktop GUI (Delphi / Qt Designer style)
 `Window`, `Panel`, `GroupBox`, `Label`, `Button`, `TextInput`, `TextArea`, `Checkbox`,
 `Radio`, `ComboBox`, `ListBox`, `Slider`, `ProgressBar`, `Menu`/`MenuItem`, `Toolbar`,
-`TabControl`, `Canvas`/`Image`, `Timer`. → emits `graphics.sapp` `window` + draw/event
-loop on `pblang-graphics`.
+`TabControl`, `Canvas`/`Image`, `Timer`, `2DCanvas`, `Scene3D`, `Cube3D`, `Sphere3D`,
+custom user-defined element. → emits `graphics.sapp` / `gui.sapp` code and design
+metadata. **Today in native IDE:** label/button/textbox/checkbox/panel plus 3D cube/ball
+design items and `LAYOUT` cycling.
 
 ### Web (WordPress / Joomla style)
 `Page`, `Header`/`Footer`, `NavBar`, `Section`, `Hero`, `Card`, `Grid`/`Columns`,
 `Form` + `Field`s, `Table`, `Button`, `Link`, `Image`, `List`, `Menu`, `Content
-block`, reusable `Component`/`Partial`, `Theme`, `Plugin slot`. → emits `html.sapp`
-markup + `web_framework.sapp` routes/middleware, served by `http_server.sapp`.
+block`, reusable `Component`/`Partial`, `Theme`, `Plugin slot`, `2DCanvas`, `Scene3D`,
+custom user-defined element. → emits `html.sapp` markup + `web_framework.sapp`
+routes/middleware, served by `http_server.sapp`.
 
 ### CLI / TUI
 `Command`, `Argument`, `Flag`/`Option`, `Prompt`, `Confirm`, `Select`, `MultiSelect`,
@@ -197,16 +204,17 @@ are the remaining designer-side work. See `docs/IDE_MANUAL.md` §2a.
 ## 9. Architecture (planned)
 
 ```
-┌───────────────────────── pblang IDE (browser) ─────────────────────────┐
+┌──────────────────── pblang Studio (browser + native) ──────────────────┐
 │  Palette │            Canvas (drag/drop)            │  Inspector        │
 │  Tree    │  ── live preview of GUI / web / CLI ──   │  props · events   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  Code editor (VS Code-like) ⇄ two-way sync ⇄ Designer                    │
 └───────────────────────────────┬─────────────────────────────────────────┘
-                                 │  HTTP/WS (pblang serve — today)
+                                 │  HTTP/WS (browser) or native event loop
                                  ▼
         ┌──────────────────────────────────────────────────────┐
         │  Backend: parse/codegen via stdlib/compiler           │
+        │  Layout: stdlib/design_engine.sapp                    │
         │  .pbui (design metadata) ⇄ app.sapp (pblang code)     │
         │  run/check/format (today) · preview render            │
         └───────────────────────────┬──────────────────────────┘
@@ -247,6 +255,7 @@ are the remaining designer-side work. See `docs/IDE_MANUAL.md` §2a.
 | **D3 — Desktop GUI target** | **STARTED for web-parity widgets (§96)** — new `stdlib/gui.sapp` toolkit (widgets *drawn* from `graphics.sapp` primitives + the 5×7 bitmap font, mouse hit-tested, handlers as field closures) + a designer **🖥 Desktop** kind: widget palette, drag-to-move form-surface canvas, property/size inspector, D2-style event wiring → generates a runnable `gui.sapp` app (`form`/`add`/`run`). Widgets: label/button/textbox/checkbox/panel **+ radio/select(dropdown)/slider (§98)** — the standard form-control set, with the slider adding press-and-drag. **Round-trip (§97):** `stdlib/gui_parse.sapp` parses generated `gui.sapp` back into the form + widgets via the self-hosted parser (gateway `/parse-gui`, the **↩ From code** button) — the desktop kind is now two-way. **Data-binding (§99):** the form has a `model` (source of truth); widgets `bind` a value to a model field (inspector Model editor + per-widget bind), generating `gui.set_model` + `gui.bind(...)` and round-tripping both — toggling/typing updates the model, a handler writing the model re-displays. Next: popup dropdown, layout containers (nesting), radio-group binding. |
 | **D4 — CLI/TUI target** | Visual command/argument/prompt builder emitting a pblang CLI. |
 | **D5 — Themes/plugins + pbAI** | Reusable components, themes, a plugin slot (WordPress/Joomla flavor), and pbAI-assisted authoring. |
+| **D6 — Unified 2D/3D/nD design engine** | **STARTED (2026-06-07)** — `stdlib/design_engine.sapp` now gives the native Designer a reusable 2D/3D item model, responsive grid/stack/free layout, snapping, hit-testing, and isometric projection. Next: constraints, nested containers, real 3D camera/meshes, and n-dimensional data/geometry views. |
 
 Each phase is gated the pblang way — locked by tests and verified green — and tracked
 in `docs/CURRENT_STATUS.md` as it ships.
@@ -258,6 +267,8 @@ in `docs/CURRENT_STATUS.md` as it ships.
 - **`editors/ide/index.html` + `pblang serve`** — the host the designer extends
   (`docs/IDE_MANUAL.md`).
 - **`stdlib/graphics.sapp` / `pblang-graphics`** — the desktop-GUI runtime.
+- **`stdlib/design_engine.sapp`** — responsive 2D/3D layout, hit-testing, snapping,
+  anchors, and projection shared by Studio surfaces.
 - **`stdlib/web_framework.sapp` / `html.sapp` / `http_server.sapp`** — the web runtime.
 - **`stdlib/compiler/` (self-hosted)** — parse↔codegen for two-way sync.
 - **Multi-backend codegen** — ship Studio projects as native / web / WASM / C / CLI.
@@ -265,9 +276,6 @@ in `docs/CURRENT_STATUS.md` as it ships.
 
 ---
 
-*pblang Studio: drag interactive elements to build desktop GUI, web, and CLI apps —
-or write the code by hand — in one language, with readable, round-trippable pblang as
-the single source of truth.*
-
-
-i want also for both for web apps and gui apps to have 2d and 3d elements and give the programmer the ability to design any element if he/she wants, for n-dimensions
+*pblang Studio: drag interactive elements to build desktop GUI, web, CLI, circuit,
+CAD-like, 2D, 3D, and future n-dimensional apps — or write the code by hand — in one
+language, with readable, round-trippable pblang as the single source of truth.*

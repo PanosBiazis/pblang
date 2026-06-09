@@ -1,0 +1,753 @@
+// stdlib/llm_train.sapp -- training/backprop utilities for pblang-native LLMs.
+//
+// The active path trains the decoder LM head, the binary adapter, and the deep input
+// state (token embeddings, positional embeddings, binary projection) with analytic
+// gradients. Full cached attention/FFN/residual/layernorm autograd is still the next
+// layer above this foundation.
+
+let core = import("stdlib:llm_core.sapp");
+let binary = import("stdlib:llm_binary.sapp");
+
+fn _dlogits(logits, target_id) {
+    let p = core.softmax(logits, 1.0);
+    let d = [];
+    let i = 0;
+    while i < len(p) {
+        if i == target_id { push(d, p[i] - 1.0); }
+        else { push(d, p[i]); }
+        i = i + 1;
+    }
+    return map{ probs: p, grad: d };
+}
+
+fn lm_head_train_step(model, hidden, target_id, lr) {
+    let logits = core.add_vec(core.vecmat(hidden, model.lm_head), model.lm_bias);
+    let loss = core.cross_entropy_from_logits(logits, target_id);
+    let dg = _dlogits(logits, target_id).grad;
+    let d = 0;
+    while d < len(hidden) {
+        let v = 0;
+        while v < len(dg) {
+            model.lm_head[d][v] = model.lm_head[d][v] - lr * hidden[d] * dg[v];
+            v = v + 1;
+        }
+        d = d + 1;
+    }
+    let b = 0;
+    while b < len(dg) {
+        model.lm_bias[b] = model.lm_bias[b] - lr * dg[b];
+        b = b + 1;
+    }
+    return loss;
+}
+
+fn train_step(model, forward_hidden_fn, ctx, target_id, lr) {
+    let hs = forward_hidden_fn(model, ctx);
+    let hidden = hs[len(hs) - 1];
+    return lm_head_train_step(model, hidden, target_id, lr);
+}
+
+fn binary_adapter_hidden(model, base_hidden, token_id) {
+    let width = try model.config.binary_bit_width catch binary.bit_width(model.config.vocab_size);
+    let scale = try model.config.binary_scale catch 0.05;
+    let bits = binary.id_to_bits(token_id, width);
+    let adapter = core.scale_vec(core.vecmat(bits, model.binary_projection), scale);
+    return map{ bits: bits, adapter: adapter, hidden: core.add_vec(base_hidden, adapter), scale: scale };
+}
+
+fn binary_adapter_train_step(model, forward_hidden_fn, ctx, target_id, lr = 0.05, adapter_lr = 0.02) {
+    let hs = forward_hidden_fn(model, ctx);
+    let base_hidden = hs[len(hs) - 1];
+    let tok_id = ctx[len(ctx) - 1];
+    let bh = binary_adapter_hidden(model, base_hidden, tok_id);
+    let hidden = bh.hidden;
+    let logits = core.add_vec(core.vecmat(hidden, model.lm_head), model.lm_bias);
+    let loss = core.cross_entropy_from_logits(logits, target_id);
+    let dg = _dlogits(logits, target_id).grad;
+
+    let d_hidden = core.zeros(len(hidden));
+    let d = 0;
+    while d < len(hidden) {
+        let s = 0.0;
+        let v = 0;
+        while v < len(dg) {
+            s = s + model.lm_head[d][v] * dg[v];
+            v = v + 1;
+        }
+        d_hidden[d] = s;
+        d = d + 1;
+    }
+
+    let bi = 0;
+    while bi < len(bh.bits) {
+        let hd = 0;
+        while hd < len(hidden) {
+            model.binary_projection[bi][hd] = model.binary_projection[bi][hd]
+                - adapter_lr * bh.bits[bi] * bh.scale * d_hidden[hd];
+            hd = hd + 1;
+        }
+        bi = bi + 1;
+    }
+
+    let h = 0;
+    while h < len(hidden) {
+        let v2 = 0;
+        while v2 < len(dg) {
+            model.lm_head[h][v2] = model.lm_head[h][v2] - lr * hidden[h] * dg[v2];
+            v2 = v2 + 1;
+        }
+        h = h + 1;
+    }
+    let b = 0;
+    while b < len(dg) {
+        model.lm_bias[b] = model.lm_bias[b] - lr * dg[b];
+        b = b + 1;
+    }
+
+    return map{
+        format: "pblang.llm.binary_adapter_step.v1",
+        mode: "binary-adapter-analytic-backprop",
+        loss: loss,
+        bit_width: len(bh.bits),
+        active_bits: binary.hamming_weight(bh.bits)
+    };
+}
+
+fn train_binary_adapter_epochs(model, forward_hidden_fn, examples, epochs = 1, lr = 0.05, adapter_lr = 0.02) {
+    let last = nil;
+    let e = 0;
+    while e < epochs {
+        let total = 0.0;
+        let active = 0;
+        let i = 0;
+        while i < len(examples) {
+            last = binary_adapter_train_step(model, forward_hidden_fn, examples[i].x, examples[i].y, lr, adapter_lr);
+            total = total + last.loss;
+            active = active + last.active_bits;
+            i = i + 1;
+        }
+        e = e + 1;
+    }
+    let final_loss = 0.0;
+    if last != nil { final_loss = last.loss; }
+    return map{
+        format: "pblang.llm.binary_adapter_training.v1",
+        mode: "binary-adapter-analytic-backprop",
+        epochs: epochs,
+        examples: len(examples),
+        bit_width: try model.config.binary_bit_width catch binary.bit_width(model.config.vocab_size),
+        final_loss: final_loss
+    };
+}
+
+fn _hidden_grad_from_dlogits(model, dlogits) {
+    let d_hidden = core.zeros(len(model.lm_head));
+    let h = 0;
+    while h < len(model.lm_head) {
+        let s = 0.0;
+        let v = 0;
+        while v < len(dlogits) {
+            s = s + model.lm_head[h][v] * dlogits[v];
+            v = v + 1;
+        }
+        d_hidden[h] = s;
+        h = h + 1;
+    }
+    return d_hidden;
+}
+
+fn analytic_deep_input_step(model, forward_hidden_fn, ctx, target_id, lr = 0.03, embed_lr = 0.005, adapter_lr = 0.005) {
+    let hs = forward_hidden_fn(model, ctx);
+    let base_hidden = hs[len(hs) - 1];
+    let tok_id = ctx[len(ctx) - 1];
+    let bh = binary_adapter_hidden(model, base_hidden, tok_id);
+    let hidden = bh.hidden;
+    let logits = core.add_vec(core.vecmat(hidden, model.lm_head), model.lm_bias);
+    let loss = core.cross_entropy_from_logits(logits, target_id);
+    let dl = _dlogits(logits, target_id).grad;
+    let d_hidden = _hidden_grad_from_dlogits(model, dl);
+
+    let h = 0;
+    while h < len(hidden) {
+        let v = 0;
+        while v < len(dl) {
+            model.lm_head[h][v] = model.lm_head[h][v] - lr * hidden[h] * dl[v];
+            v = v + 1;
+        }
+        h = h + 1;
+    }
+    let b = 0;
+    while b < len(dl) {
+        model.lm_bias[b] = model.lm_bias[b] - lr * dl[b];
+        b = b + 1;
+    }
+
+    let denom = len(ctx);
+    if denom < 1 { denom = 1; }
+    let i = 0;
+    while i < len(ctx) {
+        let weight = (i + 1) / denom;
+        let id = ctx[i];
+        let d = 0;
+        while d < len(d_hidden) {
+            let step = embed_lr * weight * d_hidden[d] / denom;
+            model.token_embedding[id][d] = model.token_embedding[id][d] - step;
+            if i < len(model.pos_embedding) {
+                model.pos_embedding[i][d] = model.pos_embedding[i][d] - step * 0.5;
+            }
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+
+    let bi = 0;
+    while bi < len(bh.bits) {
+        let d2 = 0;
+        while d2 < len(d_hidden) {
+            model.binary_projection[bi][d2] = model.binary_projection[bi][d2]
+                - adapter_lr * bh.bits[bi] * bh.scale * d_hidden[d2];
+            d2 = d2 + 1;
+        }
+        bi = bi + 1;
+    }
+
+    return map{
+        format: "pblang.llm.analytic_deep_input_step.v1",
+        mode: "analytic-input-embedding-binary-backprop",
+        loss: loss,
+        context: len(ctx),
+        updated_token_embeddings: len(ctx),
+        updated_pos_embeddings: len(ctx),
+        updated_binary_rows: len(bh.bits)
+    };
+}
+
+fn train_analytic_deep_inputs(model, forward_hidden_fn, examples, epochs = 1, lr = 0.03, embed_lr = 0.005, adapter_lr = 0.005, max_steps = 0) {
+    let traces = [];
+    let total_loss = 0.0;
+    let steps = 0;
+    let e = 0;
+    while e < epochs {
+        let i = 0;
+        while i < len(examples) {
+            if max_steps > 0 and steps >= max_steps { break; }
+            let st = analytic_deep_input_step(model, forward_hidden_fn, examples[i].x, examples[i].y, lr, embed_lr, adapter_lr);
+            total_loss = total_loss + st.loss;
+            if len(traces) < 4 { push(traces, st); }
+            steps = steps + 1;
+            i = i + 1;
+        }
+        e = e + 1;
+    }
+    let avg = 0.0;
+    if steps > 0 { avg = total_loss / steps; }
+    return map{
+        format: "pblang.llm.analytic_deep_input_training.v1",
+        mode: "analytic-input-embedding-binary-backprop",
+        boundary: "analytic gradients update LM head, token embeddings, positional embeddings, and binary projection; full Q/K/V/O attention and FFN backprop remains the next stage",
+        epochs: epochs,
+        steps: steps,
+        avg_loss: avg,
+        traces: traces
+    };
+}
+
+fn error_report(model, logits_fn, train_examples, valid_examples) {
+    let train_loss = avg_loss(model, logits_fn, train_examples);
+    let valid_loss = avg_loss(model, logits_fn, valid_examples);
+    return map{
+        format: "pblang.llm.error_report.v1",
+        train_loss: train_loss,
+        valid_loss: valid_loss,
+        generalization_gap: valid_loss - train_loss,
+        train_examples: len(train_examples),
+        valid_examples: len(valid_examples)
+    };
+}
+
+fn _growth_decision(model, report) {
+    let policy = try model.config.growth_policy catch map{ target_valid_loss: 3.5, overfit_gap: 1.0, max_growth_steps: 3 };
+    let target = try policy.target_valid_loss catch 3.5;
+    let gap = try policy.overfit_gap catch 1.0;
+    if report.valid_loss > target and report.generalization_gap > gap {
+        return "weaker_binary";
+    }
+    if report.valid_loss > target {
+        return "stronger_binary";
+    }
+    return "none";
+}
+
+fn feedback_signal(model, before, after) {
+    let policy = try model.config.growth_policy catch map{ target_valid_loss: 3.5, overfit_gap: 1.0 };
+    let target = try policy.target_valid_loss catch 3.5;
+    let gap = try policy.overfit_gap catch 1.0;
+    if after.valid_loss < before.valid_loss {
+        return map{ kind: "improving", signal: "stronger_binary", reason: "validation loss decreased; reinforce current binary adapter path" };
+    }
+    if after.generalization_gap > gap {
+        return map{ kind: "overfit", signal: "weaker_binary", reason: "validation gap is high; reduce adapter pressure" };
+    }
+    if after.valid_loss > target {
+        return map{ kind: "underfit", signal: "stronger_binary", reason: "validation loss remains above target; increase learnable binary signal" };
+    }
+    return map{ kind: "stable", signal: "none", reason: "error is within current policy bounds" };
+}
+
+fn feedback_state(model, report, signal = "none") {
+    return map{
+        format: "pblang.llm.feedback_state.v1",
+        signal: signal,
+        train_loss: report.train_loss,
+        valid_loss: report.valid_loss,
+        generalization_gap: report.generalization_gap,
+        layers: try model.config.layers catch 0,
+        context: try model.config.context catch 0,
+        binary_scale: try model.config.binary_scale catch 0.0
+    };
+}
+
+fn reinforcement_from_delta(valid_delta, train_delta, architecture_changed) {
+    let score = valid_delta * 2.0 + train_delta;
+    if architecture_changed and score < 0 { score = score - 0.1; }
+    if architecture_changed and score > 0 { score = score + 0.05; }
+    let action = "neutral";
+    if score > 0.000001 { action = "reward"; }
+    if score < -0.000001 { action = "punish"; }
+    return map{
+        format: "pblang.llm.reinforcement.v1",
+        action: action,
+        score: score,
+        reward: score > 0.000001,
+        punish: score < -0.000001,
+        neutral: score >= -0.000001 and score <= 0.000001,
+        reason: "reward if error decreases; punish if error increases; neutral if unchanged"
+    };
+}
+
+fn evaluate_feedback(before_state, after_state) {
+    let valid_delta = before_state.valid_loss - after_state.valid_loss;
+    let train_delta = before_state.train_loss - after_state.train_loss;
+    let architecture_changed = before_state.layers != after_state.layers
+        or before_state.context != after_state.context
+        or before_state.binary_scale != after_state.binary_scale;
+    let reinforcement = reinforcement_from_delta(valid_delta, train_delta, architecture_changed);
+    let success = reinforcement.reward;
+    let verdict = "neutral";
+    if reinforcement.reward { verdict = "successful"; }
+    if reinforcement.punish { verdict = "failed"; }
+    return map{
+        format: "pblang.llm.feedback_evaluation.v1",
+        verdict: verdict,
+        success: success,
+        valid_error_delta: valid_delta,
+        train_error_delta: train_delta,
+        architecture_changed: architecture_changed,
+        reinforcement: reinforcement
+    };
+}
+
+fn feedback_loop(model, forward_hidden_fn, logits_fn, growth_fn, train_examples, valid_examples, rounds = 2, lr = 0.03, adapter_lr = 0.01) {
+    let traces = [];
+    let before_all = error_report(model, logits_fn, train_examples, valid_examples);
+    let previous_feedback_state = nil;
+    let i = 0;
+    while i < rounds {
+        let before = error_report(model, logits_fn, train_examples, valid_examples);
+        let before_state = feedback_state(model, before, "none");
+        let train_run = train_binary_adapter_epochs(model, forward_hidden_fn, train_examples, 1, lr, adapter_lr);
+        let after = error_report(model, logits_fn, train_examples, valid_examples);
+        let fb = feedback_signal(model, before, after);
+        let update = map{ action: "none", signal: fb.signal };
+        if fb.signal != "none" and growth_fn != nil {
+            update = growth_fn(model, fb.signal);
+        }
+        let after_growth = error_report(model, logits_fn, train_examples, valid_examples);
+        let after_state = feedback_state(model, after_growth, fb.signal);
+        let evaluation = evaluate_feedback(before_state, after_state);
+        push(traces, map{
+            format: "pblang.llm.feedback_trace.v1",
+            round: i,
+            previous_feedback_state: previous_feedback_state,
+            before_state: before_state,
+            before: before,
+            training: train_run,
+            after: after,
+            feedback: fb,
+            growth_update: update,
+            after_state: after_state,
+            evaluation: evaluation
+        });
+        previous_feedback_state = after_state;
+        i = i + 1;
+    }
+    let after_all = error_report(model, logits_fn, train_examples, valid_examples);
+    return map{
+        format: "pblang.llm.feedback_loop.v1",
+        mode: "measure-train-feedback-grow",
+        rounds: rounds,
+        before: before_all,
+        after: after_all,
+        train_error_delta: before_all.train_loss - after_all.train_loss,
+        valid_error_delta: before_all.valid_loss - after_all.valid_loss,
+        traces: traces
+    };
+}
+
+fn guess_candidates(model, report) {
+    let target = try model.config.growth_policy.target_valid_loss catch 3.5;
+    let gap = try model.config.growth_policy.overfit_gap catch 1.0;
+    let c = [];
+    push(c, map{
+        signal: "stronger_binary",
+        score: report.valid_loss - target,
+        reason: "guess: stronger bit-derived features may reduce next-token error"
+    });
+    push(c, map{
+        signal: "weaker_binary",
+        score: report.generalization_gap - gap,
+        reason: "guess: weaker binary pressure may reduce overfitting"
+    });
+    push(c, map{
+        signal: "longer_context",
+        score: report.valid_loss * 0.25,
+        reason: "guess: more context may help when local context is too short"
+    });
+    push(c, map{
+        signal: "deeper",
+        score: report.train_loss - target,
+        reason: "guess: deeper network may help if training loss is still high"
+    });
+    return c;
+}
+
+fn choose_guess(candidates) {
+    let best = candidates[0];
+    let i = 1;
+    while i < len(candidates) {
+        if candidates[i].score > best.score { best = candidates[i]; }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn guess_state(model, report) {
+    return map{
+        format: "pblang.llm.guess_state.v1",
+        train_loss: report.train_loss,
+        valid_loss: report.valid_loss,
+        generalization_gap: report.generalization_gap,
+        layers: try model.config.layers catch 0,
+        context: try model.config.context catch 0,
+        binary_scale: try model.config.binary_scale catch 0.0
+    };
+}
+
+fn evaluate_guess(before_state, after_state) {
+    let valid_delta = before_state.valid_loss - after_state.valid_loss;
+    let train_delta = before_state.train_loss - after_state.train_loss;
+    let architecture_changed = before_state.layers != after_state.layers
+        or before_state.context != after_state.context
+        or before_state.binary_scale != after_state.binary_scale;
+    let reinforcement = reinforcement_from_delta(valid_delta, train_delta, architecture_changed);
+    let success = reinforcement.reward;
+    let verdict = "neutral";
+    if reinforcement.reward { verdict = "successful"; }
+    if reinforcement.punish { verdict = "failed"; }
+    return map{
+        format: "pblang.llm.guess_evaluation.v1",
+        verdict: verdict,
+        success: success,
+        valid_error_delta: valid_delta,
+        train_error_delta: train_delta,
+        architecture_changed: architecture_changed,
+        reinforcement: reinforcement
+    };
+}
+
+fn selection_score(evaluation, after_state) {
+    let reward_score = try evaluation.reinforcement.score catch 0.0;
+    return reward_score - after_state.valid_loss - after_state.generalization_gap * 0.25;
+}
+
+fn candidate_record(kind, trace) {
+    let after_state = try trace.after_state catch map{ valid_loss: 999999.0, generalization_gap: 999999.0 };
+    let evaluation = try trace.evaluation catch map{ reinforcement: map{ score: 0.0 }, verdict: "unknown" };
+    return map{
+        format: "pblang.llm.selection_candidate.v1",
+        kind: kind,
+        round: try trace.round catch 0,
+        signal: try trace.feedback.signal catch (try trace.chosen.signal catch "none"),
+        verdict: try evaluation.verdict catch "unknown",
+        reinforcement: try evaluation.reinforcement catch map{},
+        state: after_state,
+        score: selection_score(evaluation, after_state)
+    };
+}
+
+fn select_elite(feedback_run, guessing_run, keep_n = 1) {
+    let candidates = [];
+    let i = 0;
+    while i < len(feedback_run.traces) {
+        push(candidates, candidate_record("feedback", feedback_run.traces[i]));
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(guessing_run.traces) {
+        push(candidates, candidate_record("guess", guessing_run.traces[j]));
+        j = j + 1;
+    }
+    let ranked = [];
+    while len(candidates) > 0 {
+        let best_idx = 0;
+        let k = 1;
+        while k < len(candidates) {
+            if candidates[k].score > candidates[best_idx].score { best_idx = k; }
+            k = k + 1;
+        }
+        push(ranked, candidates[best_idx]);
+        let next = [];
+        let m = 0;
+        while m < len(candidates) {
+            if m != best_idx { push(next, candidates[m]); }
+            m = m + 1;
+        }
+        candidates = next;
+    }
+    let kept = [];
+    let thrown = [];
+    let r = 0;
+    while r < len(ranked) {
+        if r < keep_n { push(kept, ranked[r]); }
+        else { push(thrown, ranked[r]); }
+        r = r + 1;
+    }
+    return map{
+        format: "pblang.llm.elite_selection.v1",
+        rule: "keep best rewarded/lowest-error candidates; throw worst; generate next from elite",
+        keep_n: keep_n,
+        candidates: ranked,
+        kept: kept,
+        thrown: thrown,
+        elite: try kept[0] catch nil,
+        worst: try thrown[len(thrown) - 1] catch nil,
+        next_generation_seed: try kept[0].state catch nil
+    };
+}
+
+fn guessing_loop(model, logits_fn, growth_fn, train_examples, valid_examples, rounds = 1) {
+    let traces = [];
+    let previous_guess_state = nil;
+    let i = 0;
+    while i < rounds {
+        let report = error_report(model, logits_fn, train_examples, valid_examples);
+        let before_state = guess_state(model, report);
+        let candidates = guess_candidates(model, report);
+        let guess = choose_guess(candidates);
+        let update = map{ action: "none", signal: guess.signal };
+        if growth_fn != nil { update = growth_fn(model, guess.signal); }
+        let after_report = error_report(model, logits_fn, train_examples, valid_examples);
+        let after_state = guess_state(model, after_report);
+        let evaluation = evaluate_guess(before_state, after_state);
+        push(traces, map{
+            format: "pblang.llm.guessing_trace.v1",
+            round: i,
+            previous_guess_state: previous_guess_state,
+            before_state: before_state,
+            error: report,
+            candidates: candidates,
+            chosen: guess,
+            growth_update: update,
+            after_state: after_state,
+            evaluation: evaluation
+        });
+        previous_guess_state = after_state;
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.llm.guessing_loop.v1",
+        mode: "guess-policy-gated-growth",
+        rounds: rounds,
+        traces: traces,
+        after: error_report(model, logits_fn, train_examples, valid_examples)
+    };
+}
+
+fn adaptive_error_reduction(model, forward_hidden_fn, logits_fn, growth_fn, train_examples, valid_examples, steps = 2, lr = 0.03, adapter_lr = 0.01) {
+    let traces = [];
+    let before = error_report(model, logits_fn, train_examples, valid_examples);
+    let best_valid = before.valid_loss;
+    let best_train = before.train_loss;
+    let i = 0;
+    while i < steps {
+        let train_run = train_binary_adapter_epochs(model, forward_hidden_fn, train_examples, 1, lr, adapter_lr);
+        let report = error_report(model, logits_fn, train_examples, valid_examples);
+        let signal = _growth_decision(model, report);
+        let update = map{ action: "none", signal: signal };
+        if signal != "none" and growth_fn != nil {
+            update = growth_fn(model, signal);
+        }
+        if report.valid_loss < best_valid { best_valid = report.valid_loss; }
+        if report.train_loss < best_train { best_train = report.train_loss; }
+        push(traces, map{
+            format: "pblang.llm.adaptive_error_trace.v1",
+            step: i,
+            training: train_run,
+            error: report,
+            growth_signal: signal,
+            growth_update: update
+        });
+        i = i + 1;
+    }
+    let after = error_report(model, logits_fn, train_examples, valid_examples);
+    return map{
+        format: "pblang.llm.adaptive_error_reduction.v1",
+        mode: "train-measure-grow",
+        steps: steps,
+        before: before,
+        after: after,
+        best_valid_loss: best_valid,
+        best_train_loss: best_train,
+        train_error_delta: before.train_loss - after.train_loss,
+        valid_error_delta: before.valid_loss - after.valid_loss,
+        traces: traces
+    };
+}
+
+fn avg_loss(model, logits_fn, examples) {
+    let total = 0.0;
+    let i = 0;
+    while i < len(examples) {
+        total = total + core.cross_entropy_from_logits(logits_fn(model, examples[i].x), examples[i].y);
+        i = i + 1;
+    }
+    if len(examples) == 0 { return 0.0; }
+    return total / len(examples);
+}
+
+fn _loss_one(model, logits_fn, example) {
+    return core.cross_entropy_from_logits(logits_fn(model, example.x), example.y);
+}
+
+fn _finite_grad(model, logits_fn, example, kind, lr, eps) {
+    let old = 0.0;
+    let last_idx = len(example.x) - 1;
+    let tok_id = example.x[last_idx];
+    let layer_idx = len(model.layers) - 1;
+    let layer = model.layers[layer_idx];
+
+    if kind == "token_embedding" { old = model.token_embedding[tok_id][0]; model.token_embedding[tok_id][0] = old + eps; }
+    else if kind == "pos_embedding" { old = model.pos_embedding[last_idx][0]; model.pos_embedding[last_idx][0] = old + eps; }
+    else if kind == "Wq" { old = layer.Wq[0][0]; layer.Wq[0][0] = old + eps; }
+    else if kind == "Wk" { old = layer.Wk[0][0]; layer.Wk[0][0] = old + eps; }
+    else if kind == "Wv" { old = layer.Wv[0][0]; layer.Wv[0][0] = old + eps; }
+    else if kind == "Wo" { old = layer.Wo[0][0]; layer.Wo[0][0] = old + eps; }
+    else if kind == "W1" { old = layer.W1[0][0]; layer.W1[0][0] = old + eps; }
+    else if kind == "W2" { old = layer.W2[0][0]; layer.W2[0][0] = old + eps; }
+    else { return map{ kind: kind, grad: 0.0, skipped: true }; }
+
+    let loss_plus = _loss_one(model, logits_fn, example);
+
+    if kind == "token_embedding" { model.token_embedding[tok_id][0] = old - eps; }
+    else if kind == "pos_embedding" { model.pos_embedding[last_idx][0] = old - eps; }
+    else if kind == "Wq" { layer.Wq[0][0] = old - eps; }
+    else if kind == "Wk" { layer.Wk[0][0] = old - eps; }
+    else if kind == "Wv" { layer.Wv[0][0] = old - eps; }
+    else if kind == "Wo" { layer.Wo[0][0] = old - eps; }
+    else if kind == "W1" { layer.W1[0][0] = old - eps; }
+    else if kind == "W2" { layer.W2[0][0] = old - eps; }
+
+    let loss_minus = _loss_one(model, logits_fn, example);
+    let grad = (loss_plus - loss_minus) / (2.0 * eps);
+    let next = old - lr * grad;
+
+    if kind == "token_embedding" { model.token_embedding[tok_id][0] = next; }
+    else if kind == "pos_embedding" { model.pos_embedding[last_idx][0] = next; }
+    else if kind == "Wq" { layer.Wq[0][0] = next; }
+    else if kind == "Wk" { layer.Wk[0][0] = next; }
+    else if kind == "Wv" { layer.Wv[0][0] = next; }
+    else if kind == "Wo" { layer.Wo[0][0] = next; }
+    else if kind == "W1" { layer.W1[0][0] = next; }
+    else if kind == "W2" { layer.W2[0][0] = next; }
+
+    return map{ kind: kind, grad: grad, old: old, next: next, skipped: false };
+}
+
+fn deep_probe_step(model, logits_fn, example, lr = 0.005, eps = 0.001) {
+    let before = _loss_one(model, logits_fn, example);
+    let grads = [];
+    let kinds = ["token_embedding", "pos_embedding", "Wq", "Wk", "Wv", "Wo", "W1", "W2"];
+    let i = 0;
+    while i < len(kinds) {
+        push(grads, _finite_grad(model, logits_fn, example, kinds[i], lr, eps));
+        i = i + 1;
+    }
+    let after = _loss_one(model, logits_fn, example);
+    return map{
+        format: "pblang.llm.deep_probe_step.v1",
+        mode: "finite-difference-transformer-parameter-update",
+        before: before,
+        after: after,
+        grads: grads
+    };
+}
+
+fn train_deep_probe(model, logits_fn, examples, steps = 2, lr = 0.005, eps = 0.001) {
+    let traces = [];
+    let i = 0;
+    while i < steps and i < len(examples) {
+        push(traces, deep_probe_step(model, logits_fn, examples[i], lr, eps));
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.llm.deep_probe_training.v1",
+        mode: "finite-difference-transformer-parameter-update",
+        steps: i,
+        traces: traces
+    };
+}
+
+fn train_epochs(model, forward_hidden_fn, examples, epochs, lr) {
+    let last = 0.0;
+    let e = 0;
+    while e < epochs {
+        let total = 0.0;
+        let i = 0;
+        while i < len(examples) {
+            total = total + train_step(model, forward_hidden_fn, examples[i].x, examples[i].y, lr);
+            i = i + 1;
+        }
+        if len(examples) > 0 { last = total / len(examples); }
+        e = e + 1;
+    }
+    return map{
+        format: "pblang.llm.training.run.v1",
+        mode: "frozen-transformer-lm-head-backprop",
+        epochs: epochs,
+        examples: len(examples),
+        final_loss: last
+    };
+}
+
+fn training_plan() {
+    return [
+        "P1: train/fine-tune LM head over frozen transformer hidden states",
+        "P2: train binary token adapter with analytic gradients into binary_projection + LM head",
+        "P3: adaptive error reduction loop: train -> measure validation error -> policy-approved live growth",
+        "P4: feedback loop: measure output/error -> train -> feedback signal -> gated growth",
+        "P5: guessing loop: propose growth candidates -> choose best guess -> policy-gated update",
+        "P6: analytic deep input updates for token embeddings, positional embeddings, binary projection, and LM head",
+        "P7: add cached forward activations and analytic FFN/residual/layernorm plus Q/K/V/O attention gradients",
+        "P8: batch training, mixed precision, checkpoint shards, and distillation"
+    ];
+}
+
+export lm_head_train_step, train_step, avg_loss;
+export binary_adapter_hidden, binary_adapter_train_step, train_binary_adapter_epochs;
+export error_report, feedback_signal, feedback_state, evaluate_feedback, feedback_loop;
+export guess_candidates, choose_guess, guessing_loop;
+export guess_state, evaluate_guess, reinforcement_from_delta, selection_score, select_elite;
+export adaptive_error_reduction;
+export analytic_deep_input_step, train_analytic_deep_inputs;
+export deep_probe_step, train_deep_probe;
+export train_epochs, training_plan;
