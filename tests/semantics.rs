@@ -2364,6 +2364,16 @@ sapp_test!(
     "stat_stdlib_pass"
 );
 sapp_test!(
+    llm_foundation_pass,
+    "llm_foundation_test.sapp",
+    "llm_foundation_pass"
+);
+sapp_test!(
+    llm_max_foundation_pass,
+    "llm_max_foundation_test.sapp",
+    "llm_max_foundation_pass"
+);
+sapp_test!(
     format_stdlib_pass,
     "format_stdlib_test.sapp",
     "format_stdlib_pass"
@@ -2533,6 +2543,11 @@ sapp_test!(
     dataframe_stdlib_pass,
     "dataframe_test.sapp",
     "dataframe_stdlib_pass"
+);
+sapp_test!(
+    pbai_assets_pass,
+    "pbai_assets_test.sapp",
+    "pbai_assets_pass"
 );
 sapp_test!(
     systems_stdlib_pass,

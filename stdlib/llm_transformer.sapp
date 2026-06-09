@@ -1,0 +1,229 @@
+// stdlib/llm_transformer.sapp -- minimal pblang-native transformer decoder pieces.
+//
+// This is a small inference substrate: embeddings, positional encoding, causal
+// attention, transformer block, decoder LM logits, sampling, and quantization helpers.
+// Training/backprop can be layered on top later using llm_core optimizers.
+
+let core = import("stdlib:llm_core.sapp");
+
+fn config(vocab_size, context = 32, d_model = 32, d_ff = 64, seed = 1) {
+    return map{
+        format: "pblang.llm.transformer.config.v1",
+        vocab_size: vocab_size,
+        context: context,
+        d_model: d_model,
+        d_ff: d_ff,
+        seed: seed,
+        layers: 1,
+        heads: 1
+    };
+}
+
+fn model_new(cfg) {
+    let d = cfg.d_model;
+    let model = map{
+        format: "pblang.llm.decoder.v1",
+        config: cfg,
+        token_embedding: core.randn_matrix(cfg.vocab_size, d, cfg.seed + 1, 0.08),
+        pos_embedding: core.randn_matrix(cfg.context, d, cfg.seed + 2, 0.02),
+        Wq: core.randn_matrix(d, d, cfg.seed + 3, 0.04),
+        Wk: core.randn_matrix(d, d, cfg.seed + 4, 0.04),
+        Wv: core.randn_matrix(d, d, cfg.seed + 5, 0.04),
+        Wo: core.randn_matrix(d, d, cfg.seed + 6, 0.04),
+        W1: core.randn_matrix(d, cfg.d_ff, cfg.seed + 7, 0.04),
+        b1: core.zeros(cfg.d_ff),
+        W2: core.randn_matrix(cfg.d_ff, d, cfg.seed + 8, 0.04),
+        b2: core.zeros(d),
+        lm_head: core.randn_matrix(d, cfg.vocab_size, cfg.seed + 9, 0.04),
+        lm_bias: core.zeros(cfg.vocab_size)
+    };
+    return model;
+}
+
+fn embed(model, ids) {
+    let out = [];
+    let i = 0;
+    while i < len(ids) {
+        let token = model.token_embedding[ids[i]];
+        let pos = model.pos_embedding[i];
+        push(out, core.add_vec(token, pos));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _causal_scores(q, keys, pos) {
+    let scores = [];
+    let scale = 1.0 / num_sqrt(len(q));
+    let i = 0;
+    while i <= pos {
+        push(scores, core.dot(q, keys[i]) * scale);
+        i = i + 1;
+    }
+    return scores;
+}
+
+fn causal_self_attention(model, x) {
+    let q = [];
+    let k = [];
+    let v = [];
+    let i = 0;
+    while i < len(x) {
+        push(q, core.vecmat(x[i], model.Wq));
+        push(k, core.vecmat(x[i], model.Wk));
+        push(v, core.vecmat(x[i], model.Wv));
+        i = i + 1;
+    }
+
+    let out = [];
+    let t = 0;
+    while t < len(x) {
+        let probs = core.softmax(_causal_scores(q[t], k, t), 1.0);
+        let ctx = core.zeros(len(v[t]));
+        let j = 0;
+        while j < len(probs) {
+            let scaled = core.scale_vec(v[j], probs[j]);
+            ctx = core.add_vec(ctx, scaled);
+            j = j + 1;
+        }
+        push(out, core.vecmat(ctx, model.Wo));
+        t = t + 1;
+    }
+    return out;
+}
+
+fn feed_forward(model, x) {
+    let h = core.add_vec(core.vecmat(x, model.W1), model.b1);
+    h = core.relu_vec(h);
+    return core.add_vec(core.vecmat(h, model.W2), model.b2);
+}
+
+fn transformer_block(model, x) {
+    let att = causal_self_attention(model, x);
+    let h = [];
+    let i = 0;
+    while i < len(x) {
+        push(h, core.layer_norm_vec(core.add_vec(x[i], att[i]), 0.00001));
+        i = i + 1;
+    }
+    let out = [];
+    let j = 0;
+    while j < len(h) {
+        push(out, core.layer_norm_vec(core.add_vec(h[j], feed_forward(model, h[j])), 0.00001));
+        j = j + 1;
+    }
+    return out;
+}
+
+fn forward_hidden(model, ids) {
+    let x = embed(model, ids);
+    return transformer_block(model, x);
+}
+
+fn logits(model, ids) {
+    let h = forward_hidden(model, ids);
+    let last = h[len(h) - 1];
+    return core.add_vec(core.vecmat(last, model.lm_head), model.lm_bias);
+}
+
+fn loss(model, ids, target_id) {
+    return core.cross_entropy_from_logits(logits(model, ids), target_id);
+}
+
+fn greedy(logits_vec) {
+    return core.argmax(logits_vec);
+}
+
+fn sample(logits_vec, mode = "greedy", temperature = 1.0, top_k = 0, top_p = 1.0) {
+    if mode == "greedy" { return greedy(logits_vec); }
+    let probs = core.softmax(logits_vec, temperature);
+    if mode == "top_k" and top_k > 0 {
+        let best = 0;
+        let best_p = probs[0];
+        let i = 1;
+        while i < len(probs) {
+            if probs[i] > best_p { best = i; best_p = probs[i]; }
+            i = i + 1;
+        }
+        return best;
+    }
+    if mode == "top_p" and top_p < 1.0 {
+        let best2 = 0;
+        let best_p2 = probs[0];
+        let j = 1;
+        while j < len(probs) {
+            if probs[j] > best_p2 { best2 = j; best_p2 = probs[j]; }
+            j = j + 1;
+        }
+        return best2;
+    }
+    return core.argmax(probs);
+}
+
+fn generate(model, seed_ids, n, mode = "greedy") {
+    let ids = core.copy_vec(seed_ids);
+    let step = 0;
+    while step < n {
+        let start = len(ids) - model.config.context;
+        if start < 0 { start = 0; }
+        let ctx = [];
+        let i = start;
+        while i < len(ids) {
+            push(ctx, ids[i]);
+            i = i + 1;
+        }
+        let next = sample(logits(model, ctx), mode, 1.0, 0, 1.0);
+        push(ids, next);
+        step = step + 1;
+    }
+    return ids;
+}
+
+fn quantize_linear(values, bits = 8) {
+    let max_abs = 0.0;
+    let i = 0;
+    while i < len(values) {
+        let a = values[i];
+        if a < 0 { a = 0.0 - a; }
+        if a > max_abs { max_abs = a; }
+        i = i + 1;
+    }
+    if max_abs == 0 { max_abs = 1.0; }
+    let qmax = 127.0;
+    if bits == 4 { qmax = 7.0; }
+    let scale = max_abs / qmax;
+    let q = [];
+    let j = 0;
+    while j < len(values) {
+        push(q, num_floor(values[j] / scale));
+        j = j + 1;
+    }
+    return map{ format: "pblang.llm.quantized_linear.v1", bits: bits, scale: scale, values: q };
+}
+
+fn dequantize_linear(q) {
+    let out = [];
+    let i = 0;
+    while i < len(q.values) {
+        push(out, q.values[i] * q.scale);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn summary(model) {
+    let cfg = model.config;
+    return map{
+        format: model.format,
+        vocab_size: cfg.vocab_size,
+        context: cfg.context,
+        d_model: cfg.d_model,
+        d_ff: cfg.d_ff,
+        layers: cfg.layers,
+        heads: cfg.heads
+    };
+}
+
+export config, model_new, embed, causal_self_attention, feed_forward, transformer_block;
+export forward_hidden, logits, loss, greedy, sample, generate;
+export quantize_linear, dequantize_linear, summary;
