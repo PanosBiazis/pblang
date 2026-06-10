@@ -167,6 +167,28 @@ from pblang.
 > to pick a discrete GPU rather than the software (WARP) renderer — pblang already
 > requests it.
 
+### Arbitrary-width floats (`fN`)
+
+`stdlib/floatn.sapp` is a pblang-native engine for representing and quantizing floats in
+**any** bit width — `f0`, `f1`, `f2`, `f4`, `f8` (`f8e4m3`/`f8e5m2`), `f16`, `bf16`,
+`tf32`, `f32`, `f64`, `f128`, and arbitrary custom `fN`. It powers low-bit ML quantization
+(shrinking model weights), minifloats for old/embedded targets, and is the foundation for
+future language-level `fN` types.
+
+```pblang
+let F = import("stdlib:floatn.sapp");
+F.quantize(3.14159, "bf16")    // 3.140625   (nearest bf16 value, as f64)
+F.info("f8e4m3").max_finite    // 448
+F.matmul(A, B, "f16")          // emulated low-precision matmul (rounds each result to f16)
+let bytes = F.pack(weights, "f8e4m3")   // 4x smaller than f64 on disk
+```
+
+**Honest model:** hardware computes only in f32/f64, so the engine computes in f64 and
+uses `fN` as a representation/quantization layer (`fN` arithmetic = compute in f64, round
+to `fN`). f64 is the precision ceiling: wider formats (`f128`, big `fN`) are *described*
+and quantized within f64 precision, but their exact >52-bit patterns can't be assembled in
+an f64 — `info().encodable`/`faithful` report this and `encode()` raises rather than lie.
+
 ---
 
 ## Project layout
