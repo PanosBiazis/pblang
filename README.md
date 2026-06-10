@@ -194,6 +194,26 @@ to `fN`). f64 is the precision ceiling: wider formats (`f128`, big `fN`) are *de
 and quantized within f64 precision, but their exact >52-bit patterns can't be assembled in
 an f64 — `info().encodable`/`faithful` report this and `encode()` raises rather than lie.
 
+### Machine inventory (`hwinfo`)
+
+`stdlib/hwinfo.sapp` detects **every device** on the machine — CPU, RAM, drives (SSD/HDD),
+every GPU (integrated + discrete), NPU, network and sound cards, and a class histogram of
+all other PnP devices — **vendor-agnostically** (NVIDIA, AMD, Intel, Apple, Qualcomm, …;
+`vendor(name)` classifies any device). `survey()` returns the whole inventory and
+`compute_plan()` auto-selects the best compute path.
+
+```pblang
+let hw = import("stdlib:hwinfo.sapp");
+hw.survey();         // full inventory (needs --allow-exec for live probing)
+hw.compute_plan();   // best CPU/GPU config; lists everything else as not-compute
+```
+
+**Honest by construction:** only the **CPU** (all cores) and a **GPU** (opt-in, one adapter
+at a time) can be *used for compute*. NPU/RAM/disks/network/sound are detected but are
+storage and I/O devices, not processing units — the library says so rather than pretend
+otherwise. Detection uses `proc_spawn_wait` + CIM on Windows; other platforms degrade to
+notes.
+
 ---
 
 ## Project layout
