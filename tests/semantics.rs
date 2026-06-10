@@ -1393,6 +1393,23 @@ fn tensor_test_pass() {
 }
 
 #[test]
+fn floatn_test_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/floatn_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read floatn_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "floatn_test_pass",
+        "expected final print floatn_test_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
 fn quantum_circuit_builder_pass() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/semantics/quantum_circuit_builder_test.sapp");

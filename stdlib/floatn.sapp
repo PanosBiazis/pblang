@@ -1,0 +1,567 @@
+// stdlib/floatn.sapp -- arbitrary-width floating-point (fN) format engine.
+//
+// PURPOSE. A pblang-native engine for representing and quantizing floating-point values
+// in ANY bit width: f0, f1, f2, f4, f8 (e4m3/e5m2), f16, bf16, tf32, f32, f64, f128, and
+// arbitrary custom fN. It is the foundation for low-bit ML quantization (shrinking pbAI
+// weights), for minifloats on old/embedded machines, and -- later -- for language-level
+// fN types.
+//
+// HONEST MODEL (read this before trusting a number):
+//   * Hardware computes only in f32/f64. This engine therefore COMPUTES in f64 and uses
+//     fN as a *representation/quantization* layer: quantize(x, fmt) rounds x to the
+//     nearest value the format can represent and returns it as an f64. "fN arithmetic"
+//     (Phase 2) means dequantize -> f64 op -> re-quantize, exactly like real low-precision
+//     ML inference.
+//   * f64 is the precision CEILING. Formats with as much or less precision/range than f64
+//     (mantissa <= 52 bits, exponent in f64's range) are handled FAITHFULLY. Formats WIDER
+//     than f64 (f128, big fN) can be DESCRIBED (info) and their values quantized *within
+//     f64 precision*, but their full precision cannot be held in an f64 and their exact
+//     bit patterns cannot be assembled (a field wider than 52 bits is not an exact f64
+//     integer). Such cases are reported honestly via info().encodable, and encode/pack
+//     raise a clear error rather than return wrong bits.
+//   * Integer bit codes are exact only up to 2^53. We therefore build/By read bit FIELDS
+//     (sign, exponent, mantissa) individually -- each <= 52 bits -- so f64 itself (64-bit
+//     pattern, but 11- and 52-bit fields) still round-trips, while f128 (112-bit field)
+//     is honestly rejected for encoding.
+//
+// FORMAT MODEL. A format is a map:
+//   { name, bits, sign(0|1), exp, mant, bias, inf(bool), nan(bool), sub(bool) }
+// with bits = sign + exp + mant. Standard interpretation (IEEE-style):
+//   exponent == 0            -> zero (mant 0) or subnormal (mant > 0, if sub)
+//   exponent == all-ones     -> +/-inf (mant 0) or NaN (mant > 0), when inf/nan set
+//   otherwise (normal)       -> (-1)^s * 2^(exp-bias) * (1 + mant/2^mant_bits)
+// Formats without inf (e.g. OCP f8e4m3) use the all-ones exponent for finite numbers and
+// reserve only the single top code (all-ones exp + all-ones mant) for NaN.
+
+// ---- numeric helpers -------------------------------------------------------
+
+let _INF = num_pow(2.0, 1100.0);   // 2^1100 overflows f64 -> +inf
+let _NAN = _INF - _INF;            // inf - inf -> NaN
+
+fn _is_nan(x) { return x != x; }                       // NaN is the only value != itself
+fn _is_inf(x) { if x == 0 { return false; } return x == x * 2.0; }  // inf*2==inf; finite*2!=finite
+fn _pow2(k) { return num_pow(2.0, k); }
+
+// round-half-to-even of a non-negative real to an integer (banker's rounding)
+fn _round_even(r) {
+    let fl = num_floor(r);
+    let diff = r - fl;
+    if diff < 0.5 { return fl; }
+    if diff > 0.5 { return fl + 1; }
+    if num_mod(fl, 2.0) == 0 { return fl; }   // exactly .5 -> nearest even
+    return fl + 1;
+}
+
+// ---- format construction ---------------------------------------------------
+
+// format(bits, exp, mant, opts) — build a format map. sign defaults to bits-exp-mant
+// (normally 1, or 0 for an unsigned float). opts (optional map) may override:
+//   name, bias, inf, nan, sub, sign.
+// Default bias is the IEEE choice 2^(exp-1) - 1 (0 when exp < 1).
+fn format(bits, exp, mant, opts = nil) {
+    let sign = bits - exp - mant;
+    if sign < 0 { sign = 0; }
+    let bias = 0;
+    if exp >= 1 { bias = _pow2(exp - 1) - 1; }
+    // sensible defaults: tiny formats (<5 bits) drop inf/NaN; everything keeps subnormals.
+    let inf = true; let nan = true;
+    if bits < 5 or exp < 2 { inf = false; nan = false; }
+    let sub = true;
+    let name = "f" + str(bits);
+    if opts != nil {
+        if map_has(opts, "name") { name = opts.name; }
+        if map_has(opts, "bias") { bias = opts.bias; }
+        if map_has(opts, "inf") { inf = opts.inf; }
+        if map_has(opts, "nan") { nan = opts.nan; }
+        if map_has(opts, "sub") { sub = opts.sub; }
+        if map_has(opts, "sign") { sign = opts.sign; }
+    }
+    return map{
+        name: name, bits: bits, sign: sign, exp: exp, mant: mant,
+        bias: bias, inf: inf, nan: nan, sub: sub
+    };
+}
+
+// _ieee_exp_bits(bits) — IEEE-754 interchange exponent width where the standard defines
+// it (binary16/32/64/128 and the k>=128 multiple-of-32 rule round(4*log2(k))-13). Returns
+// -1 when there is no standard split for this width (tiny / non-standard fN).
+fn _ieee_exp_bits(bits) {
+    if bits == 16 { return 5; }
+    if bits == 32 { return 8; }
+    if bits == 64 { return 11; }
+    if bits == 128 { return 15; }
+    if bits >= 128 and num_mod(bits, 32.0) == 0 {
+        let r = num_ln(bits) / num_ln(2.0);          // log2(bits)
+        return _round_even(4.0 * r - 13.0);
+    }
+    return 0 - 1;
+}
+
+// _bare(bits) — derive a format from a bare bit count fN. Uses the IEEE interchange split
+// where defined; otherwise a documented convention: 1 sign bit (when bits>=2), then split
+// the remainder with a balanced exponent (favouring at least 1 exponent bit). f0 is the
+// constant {0}; tiny formats carry no inf/NaN. Callers wanting a SPECIFIC small layout
+// (e.g. f8e4m3 vs f8e5m2) should name it or build it with format().
+fn _bare(bits) {
+    if bits <= 0 { return format(0, 0, 0, map{ name: "f0" }); }
+    let e = _ieee_exp_bits(bits);
+    if e > 0 {
+        return format(bits, e, bits - 1 - e, map{ name: "f" + str(bits) });
+    }
+    // non-standard / tiny: 1 sign bit if we can afford it, balanced remainder.
+    let sign = 1;
+    if bits < 2 { sign = 0; }
+    let rem = bits - sign;
+    let exp = num_floor(rem / 2.0);
+    if exp < 1 and rem >= 1 { exp = 1; }
+    let mant = rem - exp;
+    if mant < 0 { mant = 0; }
+    return format(bits, exp, mant, map{ name: "f" + str(bits) });
+}
+
+// _registry(name) — named standard formats with their exact, correct field splits.
+// Returns nil when the name is not a registered standard.
+fn _registry(name) {
+    if name == "f4"     { return format(4, 2, 1, map{ name: "f4", inf: false, nan: false }); }      // E2M1 (FP4)
+    if name == "f8e4m3" { return format(8, 4, 3, map{ name: "f8e4m3", inf: false, nan: true }); }    // OCP E4M3
+    if name == "f8e5m2" { return format(8, 5, 2, map{ name: "f8e5m2", inf: true, nan: true }); }     // OCP E5M2 (IEEE-like)
+    if name == "f16"    { return format(16, 5, 10, map{ name: "f16" }); }                            // IEEE binary16
+    if name == "bf16"   { return format(16, 8, 7, map{ name: "bf16" }); }                            // bfloat16
+    if name == "tf32"   { return format(19, 8, 10, map{ name: "tf32" }); }                           // NVIDIA TF32
+    if name == "f32"    { return format(32, 8, 23, map{ name: "f32" }); }                            // IEEE binary32
+    if name == "f64"    { return format(64, 11, 52, map{ name: "f64" }); }                           // IEEE binary64
+    if name == "f128"   { return format(128, 15, 112, map{ name: "f128" }); }                        // IEEE binary128 (info-only)
+    return nil;
+}
+
+// _parse_fN(spec) — if spec is a bare "f<digits>" string, return the bit count; else -1.
+fn _parse_fN(spec) {
+    if len(spec) < 2 { return 0 - 1; }
+    if strcharcodeat(spec, 0) != 102 { return 0 - 1; }   // 'f'
+    let n = 0; let i = 1; let any = false;
+    while i < len(spec) {
+        let c = strcharcodeat(spec, i);
+        if c < 48 or c > 57 { return 0 - 1; }            // non-digit -> not a bare fN
+        n = n * 10 + (c - 48); any = true; i = i + 1;
+    }
+    if not any { return 0 - 1; }
+    return n;
+}
+
+// of(spec) — resolve a format from a name string: a registered standard ("f16","bf16",
+// "f8e4m3", ...) or a bare "fN" (any N). Raises for an unrecognised non-fN string.
+fn of(spec) {
+    let r = _registry(spec);
+    if r != nil { return r; }
+    let n = _parse_fN(spec);
+    if n >= 0 { return _bare(n); }
+    return error("floatn.of(): unknown format '" + str(spec) + "'");
+}
+
+// _resolve(fmt) — accept either a format map or a name string.
+fn _resolve(fmt) {
+    if is_string(fmt) { return of(fmt); }
+    return fmt;
+}
+
+// resolve(fmt) — public: normalise a name string OR a format map to a format map.
+fn resolve(fmt) { return _resolve(fmt); }
+
+// ---- value <-> fields ------------------------------------------------------
+
+// _value(s, e, m, fmt) — decode raw fields (sign s, exponent e, mantissa m) to an f64.
+fn _value(s, e, m, fmt) {
+    let E = fmt.exp; let M = fmt.mant; let B = fmt.bias;
+    let sgn = 1; if fmt.sign == 1 and s == 1 { sgn = 0 - 1; }
+    if E == 0 {
+        // No exponent field: fixed-point fraction sign * m / 2^M (f0 -> always 0).
+        if M == 0 { return sgn * 0; }
+        return sgn * (m / _pow2(M));
+    }
+    let allones = _pow2(E) - 1;
+    if e == allones {
+        if fmt.inf {
+            if m == 0 { return sgn * _INF; }
+            return _NAN;
+        }
+        if fmt.nan and m == (_pow2(M) - 1) { return _NAN; }   // e4m3: only top code is NaN
+    }
+    if e == 0 {
+        if m == 0 { return sgn * 0; }
+        if fmt.sub { return sgn * _pow2(1 - B) * (m / _pow2(M)); }
+        return sgn * 0;
+    }
+    return sgn * _pow2(e - B) * (1 + m / _pow2(M));
+}
+
+// ---- quantize --------------------------------------------------------------
+
+// _max_finite(fmt) — the largest finite magnitude the format can represent.
+fn _max_finite(fmt) {
+    let E = fmt.exp; let M = fmt.mant; let B = fmt.bias;
+    if E == 0 {
+        if M == 0 { return 0; }
+        return (_pow2(M) - 1) / _pow2(M);
+    }
+    let allones = _pow2(E) - 1;
+    let enormmax = allones;
+    if fmt.inf { enormmax = allones - 1; }
+    let mantmax = _pow2(M) - 1;
+    if (fmt.inf == false) and fmt.nan { mantmax = _pow2(M) - 2; }   // reserve top code as NaN
+    if mantmax < 0 { mantmax = 0; }
+    return _pow2(enormmax - B) * (1 + mantmax / _pow2(M));
+}
+
+// quantize(x, fmt) — round x to the nearest value representable in fmt; return it as f64.
+// Round-to-nearest-even. Overflow saturates to +/-inf (if the format has inf) else to the
+// max finite magnitude. Negatives in an unsigned format clamp to 0.
+fn quantize(x, fmt) {
+    fmt = _resolve(fmt);
+    if _is_nan(x) {
+        if fmt.nan { return _NAN; }
+        return 0;
+    }
+    let E = fmt.exp; let M = fmt.mant; let B = fmt.bias;
+    let s = 0; if x < 0 { s = 1; }
+    if fmt.sign == 0 { s = 0; }
+    let ax = num_abs(x);
+    if fmt.sign == 0 and x < 0 { ax = 0; }
+    let sgn = 1; if s == 1 { sgn = 0 - 1; }
+
+    let maxf = _max_finite(fmt);
+    if _is_inf(ax) or ax > maxf {
+        // Round-half-up region between maxf and the overflow threshold is treated as
+        // saturate/inf for simplicity and safety.
+        if fmt.inf { return sgn * _INF; }
+        return sgn * maxf;
+    }
+    if ax == 0 { return sgn * 0; }
+
+    if E == 0 {
+        // fixed-point fraction
+        if M == 0 { return sgn * 0; }
+        let q = _round_even(ax * _pow2(M));
+        if q > (_pow2(M) - 1) { q = _pow2(M) - 1; }
+        return sgn * (q / _pow2(M));
+    }
+
+    // normalise: find unbiased exponent ue with 2^ue <= ax < 2^(ue+1)
+    let ue = num_floor(num_ln(ax) / num_ln(2.0));
+    while _pow2(ue) > ax { ue = ue - 1; }
+    while _pow2(ue + 1) <= ax { ue = ue + 1; }
+
+    let allones = _pow2(E) - 1;
+    let enormmax = allones; if fmt.inf { enormmax = allones - 1; }
+    let emin = 1 - B;                 // smallest normal unbiased exponent
+
+    if ue < emin {
+        // subnormal: step = 2^(emin - M); quantise the magnitude onto that grid.
+        if fmt.sub == false {
+            // flush-to-zero formats: round to 0 or the smallest normal.
+            let half = _pow2(emin) / 2.0;
+            if ax < half { return sgn * 0; }
+            return sgn * _pow2(emin);
+        }
+        let step = _pow2(emin - M);
+        let q = _round_even(ax / step);
+        if q == 0 { return sgn * 0; }
+        if q >= _pow2(M) {
+            // rounded up into the normal range
+            return _value(s, 1, q - _pow2(M), fmt);
+        }
+        return _value(s, 0, q, fmt);
+    }
+
+    // normal range
+    let e = ue + B;
+    let frac = ax / _pow2(ue) - 1;          // in [0, 1)
+    let q = _round_even(frac * _pow2(M));
+    if q >= _pow2(M) { q = q - _pow2(M); e = e + 1; }   // mantissa carry
+    if e > enormmax {
+        if fmt.inf { return sgn * _INF; }
+        return sgn * maxf;
+    }
+    // reserve NaN code on no-inf formats (e4m3): clamp to max finite mantissa
+    if (fmt.inf == false) and fmt.nan and e == allones {
+        let mantmax = _pow2(M) - 2;
+        if q > mantmax { return sgn * maxf; }
+    }
+    return _value(s, e, q, fmt);
+}
+
+// quant_error(x, fmt) — signed error introduced by quantization, x - quantize(x).
+fn quant_error(x, fmt) {
+    return x - quantize(x, fmt);
+}
+
+// ---- bit fields / codes ----------------------------------------------------
+
+// _encodable(fmt) — can exact bit patterns be assembled? Requires each field <= 52 bits.
+fn _encodable(fmt) {
+    return fmt.exp <= 52 and fmt.mant <= 52;
+}
+
+// _fields(x, fmt) — quantise x and return its raw {s, e, m} fields. Internal.
+fn _fields(x, fmt) {
+    let q = quantize(x, fmt);
+    let E = fmt.exp; let M = fmt.mant; let B = fmt.bias;
+    let s = 0;
+    if fmt.sign == 1 and (q < 0 or (q == 0 and x < 0)) { s = 1; }
+    let aq = num_abs(q);
+    if _is_nan(q) {
+        // canonical NaN encoding
+        let allones = _pow2(E) - 1;
+        return map{ s: 0, e: allones, m: 1 };
+    }
+    if _is_inf(aq) {
+        let allones = _pow2(E) - 1;
+        return map{ s: s, e: allones, m: 0 };
+    }
+    if E == 0 {
+        if M == 0 { return map{ s: s, e: 0, m: 0 }; }
+        return map{ s: s, e: 0, m: _round_even(aq * _pow2(M)) };
+    }
+    if aq == 0 { return map{ s: s, e: 0, m: 0 }; }
+    let ue = num_floor(num_ln(aq) / num_ln(2.0));
+    while _pow2(ue) > aq { ue = ue - 1; }
+    while _pow2(ue + 1) <= aq { ue = ue + 1; }
+    let emin = 1 - B;
+    if ue < emin {
+        let m = _round_even(aq / _pow2(emin - M));
+        if m >= _pow2(M) { return map{ s: s, e: 1, m: m - _pow2(M) }; }
+        return map{ s: s, e: 0, m: m };
+    }
+    let e = ue + B;
+    let m = _round_even((aq / _pow2(ue) - 1) * _pow2(M));
+    if m >= _pow2(M) { m = m - _pow2(M); e = e + 1; }
+    return map{ s: s, e: e, m: m };
+}
+
+// encode_bits(x, fmt) — quantise x and return its N-bit pattern as an array of 0/1 bits,
+// most-significant bit first (sign, then exponent, then mantissa). General for any format
+// whose fields each fit in 52 bits (covers up to f64).
+fn encode_bits(x, fmt) {
+    fmt = _resolve(fmt);
+    if not _encodable(fmt) {
+        return error("floatn.encode_bits(): format '" + fmt.name + "' has a field wider than 52 bits; exact patterns exceed f64 precision");
+    }
+    let f = _fields(x, fmt);
+    let bits = [];
+    if fmt.sign == 1 { push(bits, f.s); }
+    _push_field(bits, f.e, fmt.exp);
+    _push_field(bits, f.m, fmt.mant);
+    return bits;
+}
+
+// _push_field(bits, value, width) — append `width` bits of `value`, MSB first.
+fn _push_field(bits, value, width) {
+    let i = width - 1;
+    while i >= 0 {
+        let p = _pow2(i);
+        let bit = num_floor(value / p);
+        bit = num_mod(bit, 2.0);
+        push(bits, bit);
+        i = i - 1;
+    }
+}
+
+// decode_bits(bits, fmt) — decode an N-bit pattern (MSB-first array) back to an f64.
+fn decode_bits(bits, fmt) {
+    fmt = _resolve(fmt);
+    let idx = 0;
+    let s = 0;
+    if fmt.sign == 1 { s = bits[idx]; idx = idx + 1; }
+    let e = 0; let i = 0;
+    while i < fmt.exp { e = e * 2 + bits[idx]; idx = idx + 1; i = i + 1; }
+    let m = 0; i = 0;
+    while i < fmt.mant { m = m * 2 + bits[idx]; idx = idx + 1; i = i + 1; }
+    return _value(s, e, m, fmt);
+}
+
+// code(x, fmt) — quantise x and return its bit pattern as a single unsigned integer.
+// Exact only when bits <= 53 (f64 integer ceiling); raises otherwise.
+fn code(x, fmt) {
+    fmt = _resolve(fmt);
+    if fmt.bits > 53 {
+        return error("floatn.code(): format '" + fmt.name + "' is wider than 53 bits; use encode_bits()/pack() instead");
+    }
+    let f = _fields(x, fmt);
+    return f.s * _pow2(fmt.exp + fmt.mant) + f.e * _pow2(fmt.mant) + f.m;
+}
+
+// decode_code(c, fmt) — decode an integer bit pattern (<= 53 bits) back to an f64.
+fn decode_code(c, fmt) {
+    fmt = _resolve(fmt);
+    let m = num_mod(c, _pow2(fmt.mant));
+    let rest = num_floor(c / _pow2(fmt.mant));
+    let e = num_mod(rest, _pow2(fmt.exp));
+    let s = num_floor(rest / _pow2(fmt.exp));
+    return _value(s, e, m, fmt);
+}
+
+// ---- packing ---------------------------------------------------------------
+
+// pack(values, fmt) — quantise and concatenate an array of values into a packed bitstream,
+// returned as an array of byte values (0..255), MSB-first, zero-padded to a byte boundary.
+fn pack(values, fmt) {
+    fmt = _resolve(fmt);
+    let bits = [];
+    let i = 0;
+    while i < len(values) {
+        let b = encode_bits(values[i], fmt);
+        let j = 0;
+        while j < len(b) { push(bits, b[j]); j = j + 1; }
+        i = i + 1;
+    }
+    while num_mod(len(bits), 8.0) != 0 { push(bits, 0); }   // pad to whole bytes
+    let bytes = [];
+    let k = 0;
+    while k < len(bits) {
+        let v = 0; let t = 0;
+        while t < 8 { v = v * 2 + bits[k + t]; t = t + 1; }
+        push(bytes, v);
+        k = k + 8;
+    }
+    return bytes;
+}
+
+// unpack(bytes, count, fmt) — decode `count` values from a packed bitstream (array of
+// bytes) produced by pack().
+fn unpack(bytes, count, fmt) {
+    fmt = _resolve(fmt);
+    let bits = [];
+    let i = 0;
+    while i < len(bytes) {
+        _push_field(bits, bytes[i], 8);
+        i = i + 1;
+    }
+    let out = [];
+    let idx = 0; let n = 0;
+    while n < count {
+        let one = [];
+        let j = 0;
+        while j < fmt.bits { push(one, bits[idx + j]); j = j + 1; }
+        push(out, decode_bits(one, fmt));
+        idx = idx + fmt.bits;
+        n = n + 1;
+    }
+    return out;
+}
+
+// ---- introspection ---------------------------------------------------------
+
+// info(fmt) — full metadata for a format. Pure math; works for ANY width including
+// f0/f1/f2 and f128. `encodable` reports whether exact bit patterns can be assembled in
+// f64 (each field <= 52 bits); `faithful` whether values fit f64 precision/range.
+fn info(fmt) {
+    fmt = _resolve(fmt);
+    let E = fmt.exp; let M = fmt.mant; let B = fmt.bias;
+    let maxf = _max_finite(fmt);
+    let min_normal = 0;
+    let min_sub = 0;
+    if E >= 1 {
+        min_normal = _pow2(1 - B);
+        if fmt.sub { min_sub = _pow2(1 - B - M); } else { min_sub = min_normal; }
+    }
+    let eps = _pow2(0 - M);                  // gap between 1.0 and the next value up
+    return map{
+        name: fmt.name,
+        bits: fmt.bits,
+        sign: fmt.sign,
+        exp: E,
+        mant: M,
+        bias: B,
+        inf: fmt.inf,
+        nan: fmt.nan,
+        sub: fmt.sub,
+        max_finite: maxf,
+        min_normal: min_normal,
+        min_subnormal: min_sub,
+        eps: eps,
+        count: _pow2(fmt.bits),              // total distinct codes
+        encodable: _encodable(fmt),
+        faithful: (M <= 52 and B <= 1023)
+    };
+}
+
+// ---- Phase 2: emulated low-precision arithmetic ----------------------------
+//
+// Hardware that "computes in fN" loads fN operands, computes in a wider internal
+// accumulator, then rounds the result back to fN. These functions model exactly that:
+// operands are quantized to fmt (idempotent for true fN values), the operation runs in
+// f64, and the result is rounded to fmt. This makes quantization error observable
+// end-to-end (e.g. add(1.0, 0.0001, "f16") -> 1.0, because 0.0001 < half an f16 ulp at 1).
+
+fn _q(x, fmt) { return quantize(x, fmt); }
+
+fn add(a, b, fmt) { fmt = _resolve(fmt); return _q(_q(a, fmt) + _q(b, fmt), fmt); }
+fn sub(a, b, fmt) { fmt = _resolve(fmt); return _q(_q(a, fmt) - _q(b, fmt), fmt); }
+fn mul(a, b, fmt) { fmt = _resolve(fmt); return _q(_q(a, fmt) * _q(b, fmt), fmt); }
+fn div(a, b, fmt) { fmt = _resolve(fmt); return _q(_q(a, fmt) / _q(b, fmt), fmt); }
+fn neg(a, fmt)    { fmt = _resolve(fmt); return _q(0 - _q(a, fmt), fmt); }
+
+// quantize_array(xs, fmt) — round a whole vector to fmt (e.g. a weight tensor).
+fn quantize_array(xs, fmt) {
+    fmt = _resolve(fmt);
+    let out = [];
+    let i = 0;
+    while i < len(xs) { push(out, quantize(xs[i], fmt)); i = i + 1; }
+    return out;
+}
+
+// dot(a, b, fmt) — dot product of two vectors. Operands are taken as fN; products and the
+// running sum accumulate in f64 (as real fN hardware uses a wider accumulator); the final
+// result is rounded to fmt.
+fn dot(a, b, fmt) {
+    fmt = _resolve(fmt);
+    let s = 0;
+    let i = 0;
+    while i < len(a) {
+        s = s + _q(a[i], fmt) * _q(b[i], fmt);
+        i = i + 1;
+    }
+    return _q(s, fmt);
+}
+
+// matmul(A, B, fmt) — A (m x k) times B (k x n), each as an array of row arrays. Each
+// output element is a dot product accumulated in f64 and rounded to fmt.
+fn matmul(A, B, fmt) {
+    fmt = _resolve(fmt);
+    let m = len(A);
+    let k = len(B);
+    let n = 0; if k > 0 { n = len(B[0]); }
+    let out = [];
+    let i = 0;
+    while i < m {
+        let row = [];
+        let j = 0;
+        while j < n {
+            let s = 0;
+            let t = 0;
+            while t < k {
+                s = s + _q(A[i][t], fmt) * _q(B[t][j], fmt);
+                t = t + 1;
+            }
+            push(row, _q(s, fmt));
+            j = j + 1;
+        }
+        push(out, row);
+        i = i + 1;
+    }
+    return out;
+}
+
+// describe(fmt) — one-line human summary.
+fn describe(fmt) {
+    fmt = _resolve(fmt);
+    let n = info(fmt);
+    return n.name + ": " + str(n.bits) + "-bit (s" + str(n.sign) + " e" + str(n.exp)
+        + " m" + str(n.mant) + "), bias=" + str(n.bias)
+        + ", max=" + str(n.max_finite) + ", eps=" + str(n.eps)
+        + ", inf=" + str(n.inf) + " nan=" + str(n.nan) + " sub=" + str(n.sub);
+}
+
+export _INF, _NAN, format, of, quantize, quant_error,
+       encode_bits, decode_bits, code, decode_code, pack, unpack,
+       add, sub, mul, div, neg, dot, matmul, quantize_array,
+       info, describe, resolve;
