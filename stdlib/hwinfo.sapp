@@ -1,0 +1,309 @@
+// stdlib/hwinfo.sapp -- pblang-native machine hardware inventory and compute planner.
+//
+// Detects EVERY device present on the PC -- CPU, RAM, storage drives (SSD/HDD), every GPU
+// (discrete + integrated), NPU, network adapters, sound devices, and a class histogram of
+// every other PnP device/card on the motherboard -- and reports, HONESTLY, which of them
+// can actually be USED for compute.
+//
+// HONEST compute picture (detection is not use):
+//   * CPU  -> USED: all cores (rayon tensor_matmul, spawn/spawn_n threads).
+//   * GPU  -> USABLE (opt-in): one adapter at a time via pblang built with `--features gpu`
+//             + PBLANG_GPU=1 (f32 matmul). Integrated GPUs are selectable (PBLANG_GPU_ADAPTER);
+//             multiple GPUs are NOT combined into one matmul.
+//   * NPU  -> DETECT ONLY: no pblang NPU compute backend (vendor stacks only:
+//             ONNX Runtime + Vitis AI / OpenVINO / QNN on INT8 graphs).
+//   * RAM / disks / network / sound / other cards -> DETECT ONLY. These are storage and
+//             I/O devices, not processing units; there is nothing to "use as compute".
+//
+// Detection uses proc_spawn_wait + PowerShell/CIM on Windows (needs --allow-exec). Other
+// platforms return a best-effort note rather than crashing.
+
+// _ps(cmd) — run a PowerShell command, return trimmed stdout ("" on any failure).
+fn _ps(cmd) {
+    let r = try proc_spawn_wait("powershell", ["-NoProfile", "-Command", cmd]) catch nil;
+    if r == nil { return ""; }
+    if r.stdout == nil { return ""; }
+    return str_trim(r.stdout);
+}
+
+// _ps_json(cmd) — run a CIM query that emits JSON; always return an ARRAY of maps
+// (PowerShell emits a bare object for a single row, which we normalise to a 1-element list).
+fn _ps_json(cmd) {
+    let out = _ps(cmd);
+    if out == "" { return []; }
+    let v = try json_parse(out) catch nil;
+    if v == nil { return []; }
+    if is_map(v) { return [v]; }
+    if is_array(v) { return v; }
+    return [v];
+}
+
+fn _is_windows() {
+    let p = try platform() catch "unknown";
+    return p == "windows";
+}
+
+// ---- per-device detectors --------------------------------------------------
+
+fn cpu() {
+    let cores = _cores();
+    if _is_windows() {
+        let rows = _ps_json("Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed | ConvertTo-Json -Compress");
+        if len(rows) > 0 {
+            let c = rows[0];
+            let cname = str_trim(str(c.Name));
+            return map{
+                name: cname,
+                vendor: _vendor(cname),
+                physical_cores: c.NumberOfCores,
+                logical_cores: c.NumberOfLogicalProcessors,
+                max_mhz: c.MaxClockSpeed,
+                used_by_pblang: "all cores (rayon tensor_matmul, spawn threads)"
+            };
+        }
+    }
+    return map{ name: "unknown", logical_cores: cores,
+               used_by_pblang: "all cores (rayon tensor_matmul, spawn threads)" };
+}
+
+fn ram() {
+    if _is_windows() {
+        let total = _ps("(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory");
+        let freemb = _ps("[math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1024)");
+        return map{
+            total_bytes: _num(total),
+            total_gb: _round2(_num(total) / 1073741824),
+            free_mb: _num(freemb),
+            used_by_pblang: "heap + GC like any program (not a compute device)"
+        };
+    }
+    return map{ note: "ram detection not implemented for this platform" };
+}
+
+// disks() — every physical drive with its media type (SSD/HDD/Unspecified) and capacity.
+fn disks() {
+    if _is_windows() {
+        let rows = _ps_json("Get-PhysicalDisk | Select-Object FriendlyName,MediaType,Size | ConvertTo-Json -Compress");
+        let out = [];
+        let i = 0;
+        while i < len(rows) {
+            let d = rows[i];
+            push(out, map{
+                name: str(d.FriendlyName),
+                media: str(d.MediaType),
+                size_gb: _round2(_num(str(d.Size)) / 1073741824)
+            });
+            i = i + 1;
+        }
+        return map{ drives: out, count: len(out),
+                    used_by_pblang: "file I/O + caching (not a compute device)" };
+    }
+    return map{ note: "disk detection not implemented for this platform" };
+}
+
+// gpus() — every display/GPU adapter (discrete + integrated).
+fn gpus() {
+    if _is_windows() {
+        let rows = _ps_json("Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress");
+        let out = [];
+        let i = 0;
+        while i < len(rows) {
+            let g = rows[i];
+            let gname = str_trim(str(g.Name));
+            push(out, map{
+                name: gname,
+                vendor: _vendor(gname),
+                vram_mb: _round2(_num(str(g.AdapterRAM)) / 1048576),
+                driver: str(g.DriverVersion)
+            });
+            i = i + 1;
+        }
+        return map{ adapters: out, count: len(out),
+                    used_by_pblang: "opt-in f32 matmul, one adapter at a time (--features gpu + PBLANG_GPU=1); integrated GPUs selectable, not combined" };
+    }
+    return map{ note: "gpu detection not implemented for this platform" };
+}
+
+fn npu() {
+    if _is_windows() {
+        let rows = _ps_json("Get-PnpDevice -PresentOnly -Class ComputeAccelerator -ErrorAction SilentlyContinue | Where-Object Status -eq 'OK' | Select-Object FriendlyName | ConvertTo-Json -Compress");
+        let out = [];
+        let i = 0;
+        while i < len(rows) { push(out, str(rows[i].FriendlyName)); i = i + 1; }
+        return map{ devices: out, count: len(out),
+                    used_by_pblang: "DETECT ONLY -- no pblang NPU compute backend (vendor stacks: ONNX Runtime + Vitis AI/OpenVINO/QNN)" };
+    }
+    return map{ note: "npu detection not implemented for this platform" };
+}
+
+fn network() {
+    if _is_windows() {
+        let rows = _ps_json("Get-CimInstance Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' | Select-Object Name,AdapterType,Speed | ConvertTo-Json -Compress");
+        let out = [];
+        let i = 0;
+        while i < len(rows) {
+            let nrec = rows[i];
+            push(out, map{ name: str(nrec.Name), type: str(nrec.AdapterType) });
+            i = i + 1;
+        }
+        return map{ adapters: out, count: len(out),
+                    used_by_pblang: "I/O via http/net builtins (not a compute device)" };
+    }
+    return map{ note: "network detection not implemented for this platform" };
+}
+
+fn sound() {
+    if _is_windows() {
+        let rows = _ps_json("Get-CimInstance Win32_SoundDevice | Select-Object Name | ConvertTo-Json -Compress");
+        let out = [];
+        let i = 0;
+        while i < len(rows) { push(out, str(rows[i].Name)); i = i + 1; }
+        return map{ devices: out, count: len(out),
+                    used_by_pblang: "DETECT ONLY -- audio I/O peripheral, not a compute device" };
+    }
+    return map{ note: "sound detection not implemented for this platform" };
+}
+
+// devices_by_class() — histogram of EVERY present PnP device grouped by class. The catch-all
+// for "every other card on the motherboard" (PCI bridges, USB/SATA/NVMe controllers, HID, ...).
+fn devices_by_class() {
+    if _is_windows() {
+        let rows = _ps_json("Get-PnpDevice -PresentOnly | Group-Object Class | Select-Object Name,Count | ConvertTo-Json -Compress");
+        let out = [];
+        let i = 0;
+        while i < len(rows) {
+            let g = rows[i];
+            push(out, map{ class: str(g.Name), count: g.Count });
+            i = i + 1;
+        }
+        return map{ classes: out, total_classes: len(out),
+                    note: "every present device class; I/O peripherals, not compute" };
+    }
+    return map{ note: "pnp enumeration not implemented for this platform" };
+}
+
+// compute_plan(intensity) — AUTOMATICALLY detect the compute-capable devices (CPU + GPU)
+// and emit the best configuration to use them. Honest by construction: it only plans for
+// devices that can actually run math, ranks GPU adapters (discrete > integrated > software),
+// and lists every other detected device as not-compute with the reason.
+fn compute_plan(intensity = "balanced") {
+    let cores = _cores();
+    let workers = cores - 1;                       // "max": leave one core for the system
+    if intensity == "eco" { workers = 1; }
+    else if intensity == "balanced" { workers = num_floor(cores / 2); }
+    if workers < 1 { workers = 1; }
+
+    let tb = tensor_backend();
+    let gpu_plan = map{};
+    if tb.gpu_feature == false {
+        gpu_plan = map{
+            available: false,
+            note: "GPU compute not compiled in; rebuild pblang with `cargo build --release --features gpu` to enable it"
+        };
+    } else {
+        // rank adapters: prefer a discrete GPU, then integrated, skip cpu/software.
+        let best = 0 - 1; let best_rank = 0 - 1; let best_name = "none";
+        let i = 0;
+        while i < len(tb.gpu_adapters) {
+            let a = tb.gpu_adapters[i];
+            let rank = 0;                          // other/software
+            if a.type == "integrated" { rank = 2; }
+            if a.type == "discrete" { rank = 3; }
+            if rank > best_rank { best_rank = rank; best = i; best_name = str(a.name); }
+            i = i + 1;
+        }
+        gpu_plan = map{
+            available: true,
+            adapters_seen: len(tb.gpu_adapters),
+            recommended_index: best,
+            recommended_adapter: best_name,
+            enable: "set PBLANG_GPU=1 and PBLANG_GPU_ADAPTER=" + str(best),
+            caveat: "f32, one adapter at a time; helps only for large matmul-based math, not tiny models"
+        };
+    }
+
+    return map{
+        intensity: intensity,
+        cpu: map{ cores: cores, workers: workers,
+                  use: "tensor_matmul (rayon) + spawn/spawn_n; already automatic for those paths" },
+        gpu: gpu_plan,
+        not_compute: [
+            "npu: detect-only (needs ONNX Runtime + Vitis AI EP; not a verifiable pblang backend)",
+            "ram: storage, not a processor (used as cache/working set)",
+            "disks: storage, not a processor (used for files/cache + parallel I/O)",
+            "network: I/O (compute over network = a distributed cluster, not this NIC)",
+            "sound: audio I/O peripheral, cannot run general compute",
+            "other cards: fixed-function I/O controllers, not programmable compute"
+        ],
+        summary: "Compute-capable devices: CPU (all cores) + one GPU adapter. Everything else is detected but is storage/I-O, not a processor."
+    };
+}
+
+// survey() — the full machine inventory in one call, each section labelled with how (or
+// whether) pblang can use it for compute.
+fn survey() {
+    return map{
+        platform: try platform() catch "unknown",
+        compute_usable: ["cpu (all cores)", "gpu (opt-in, one at a time)"],
+        detect_only: ["npu", "ram", "disks", "network", "sound", "other cards"],
+        cpu: cpu(),
+        ram: ram(),
+        disks: disks(),
+        gpus: gpus(),
+        npu: npu(),
+        network: network(),
+        sound: sound(),
+        devices: devices_by_class()
+    };
+}
+
+// ---- small numeric helpers -------------------------------------------------
+
+fn _cores() {
+    let raw = try env_get("NUMBER_OF_PROCESSORS") catch "";
+    if raw == nil { raw = ""; }
+    let n = _num(raw);
+    if n < 1 { return 4; }
+    return n;
+}
+
+// _num(s) — parse a leading non-negative integer from a string; 0 on failure/nil.
+fn _num(s) {
+    if s == nil { return 0; }
+    let str_s = str(s);
+    let n = 0; let i = 0; let any = false;
+    while i < len(str_s) {
+        let c = strcharcodeat(str_s, i);
+        if c >= 48 and c <= 57 { n = n * 10 + (c - 48); any = true; }
+        else if any { return n; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn _round2(x) { return num_floor(x * 100 + 0.5) / 100; }
+
+// _vendor(name) — classify a device name by manufacturer, vendor-agnostically. Covers the
+// major CPU/GPU/NPU vendors (NVIDIA, AMD, Intel, Apple, Qualcomm, ARM, Microsoft) and
+// returns "other" for anything else, so detection is not specific to the current machine.
+fn _vendor(name) {
+    if name == nil { return "unknown"; }
+    let s = str_lower(str(name));
+    if str_contains(s, "nvidia") or str_contains(s, "geforce") or str_contains(s, "rtx")
+        or str_contains(s, "gtx") or str_contains(s, "quadro") or str_contains(s, "tesla") { return "nvidia"; }
+    if str_contains(s, "amd") or str_contains(s, "radeon") or str_contains(s, "ryzen")
+        or str_contains(s, "instinct") or str_contains(s, "epyc") { return "amd"; }
+    if str_contains(s, "intel") or str_contains(s, "arc ") or str_contains(s, "iris")
+        or str_contains(s, "uhd graphics") or str_contains(s, "xeon") or str_contains(s, "core(tm)") { return "intel"; }
+    if str_contains(s, "apple") or str_contains(s, "m1") or str_contains(s, "m2") or str_contains(s, "m3") { return "apple"; }
+    if str_contains(s, "qualcomm") or str_contains(s, "snapdragon") or str_contains(s, "adreno")
+        or str_contains(s, "hexagon") { return "qualcomm"; }
+    if str_contains(s, "mali") or str_contains(s, "arm") { return "arm"; }
+    if str_contains(s, "microsoft") or str_contains(s, "basic render") or str_contains(s, "basic display") { return "microsoft"; }
+    return "other";
+}
+
+// vendor(name) — public manufacturer classifier (NVIDIA/AMD/Intel/Apple/Qualcomm/ARM/...).
+fn vendor(name) { return _vendor(name); }
+
+export cpu, ram, disks, gpus, npu, network, sound, devices_by_class, compute_plan, survey, vendor;
