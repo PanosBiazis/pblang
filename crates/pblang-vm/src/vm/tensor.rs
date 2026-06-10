@@ -269,6 +269,23 @@ pub(super) fn tensor_backend_builtin(
             "gpu_adapter".into(),
             alloc_string(&super::gpu::adapter_name().unwrap_or_else(|| "none".into())),
         );
+        m.insert(
+            "gpu_adapter_type".into(),
+            alloc_string(&super::gpu::adapter_type().unwrap_or_else(|| "none".into())),
+        );
+        // Every GPU adapter wgpu can see (name/type/backend) — one is used at a time;
+        // select with PBLANG_GPU_ADAPTER (index / "integrated" / "discrete" / name).
+        let adapters: Vec<Value> = super::gpu::list_adapters()
+            .into_iter()
+            .map(|(name, ty, backend)| {
+                let mut am = HashMap::new();
+                am.insert("name".into(), alloc_string(&name));
+                am.insert("type".into(), alloc_string(&ty));
+                am.insert("backend".into(), alloc_string(&backend));
+                alloc_map(am)
+            })
+            .collect();
+        m.insert("gpu_adapters".into(), alloc_array(adapters));
     }
     #[cfg(not(feature = "gpu"))]
     {
@@ -278,6 +295,8 @@ pub(super) fn tensor_backend_builtin(
             "gpu_adapter".into(),
             alloc_string("none (rebuild with --features gpu)"),
         );
+        m.insert("gpu_adapter_type".into(), alloc_string("none"));
+        m.insert("gpu_adapters".into(), alloc_array(Vec::new()));
     }
     m.insert(
         "note".into(),
