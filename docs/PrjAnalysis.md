@@ -2054,3 +2054,123 @@ Verification:
 - This validation was done against the GitHub repository state, not just historical reports.
 - Current branch: `main`
 - Last updated: 2026-05-24 (chumsky 1.0 + SP1-gamma refresh)
+
+---
+
+## 112. Full-project audit (2026-06-09): errors · warnings · bugs · vulnerabilities · sensitive data · partial implementations · quality · cross-language comparison
+
+> Methodology: four parallel read-only sweeps (stubs/partials, panic-paths, security, secrets+quality) over every tracked source file, plus fresh `cargo clippy --workspace --all-targets`, `cargo test --workspace`, and the canonical `pblang test tests/semantics --allow-all`. Every machine-flagged finding below was re-verified by reading the cited code; two agent claims were **refuted** during verification and are recorded as false alarms (§112.E).
+
+### 112.A Verification baseline (all green)
+
+| Check | Result |
+|---|---|
+| `cargo clippy --workspace --all-targets` | **0 errors**, ~24 warnings — all style-tier (collapsible `if`, doc-list indentation, `Default::default()` field assignment in tests, 4 unused helpers in `tests/common.rs`, 1 `type_complexity` in `polyglot.rs`) |
+| `cargo test --workspace` | **all suites pass**, 0 failures (exit 0) |
+| `pblang test tests/semantics --allow-all` | **175 / 0 / 0** (canonical end-to-end suite, up from 160 in §1) |
+| CI (`.github/workflows/ci.yml`) | check + test on **3 OSes**, clippy `-D warnings`, fmt, `cargo audit`, examples build |
+| Tracked size | ~48k lines Rust (17 crates + CLI), ~44k lines pblang (171 stdlib + 14 self-host compiler modules), 23 examples, 4 fuzz targets (`manifest`, `parse`, `parse_strict`, `registry_index`) |
+
+### 112.B Bugs / error-prone code (7 concrete high-severity, all panic-class)
+
+Reachable from ordinary `.sapp` user input — a malformed program gets a **Rust panic** instead of a pblang error:
+
+| # | Location | Defect | Trigger |
+|---|---|---|---|
+| 1 | `crates/pblang-vm/src/vm/tensor.rs:220` (`tensor_matmul`) | `m*n` un-checked before `vec!` alloc | user shape where product overflows `usize` |
+| 2 | `tensor.rs:456` (`tensor_transpose2d`) | same pattern | same |
+| 3 | `tensor.rs:706` (`tensor_embedding_lookup`) | `n*d` wraps → bounds panic on copy | `n` near `usize::MAX` |
+| 4 | `tensor.rs:873` (`tensor_conv2d`) | `n*co*oh*ow` overflow in alloc | large dims |
+| 5 | `tensor.rs:951` (`tensor_maxpool2d`) | same | same |
+| 6 | `tensor.rs:1016` (`tensor_avgpool2d`) | same | same |
+| 7 | `crates/pblang-vm/src/vm/strings.rs:497` (`str_repeat`) | `*x as usize` then unbounded `s.repeat(n)` | `str_repeat("x", 1e20)` → OOM |
+
+**Fix pattern:** `checked_mul()` chain → graceful `Err` (pblang runtime error), plus a max-bytes cap on `str_repeat` (mirroring the existing 10 MB `bounded_json_parse` cap at `vm.rs:460`).
+
+**Verified-safe areas** (checked, not just absence-of-grep-hits): no `lock().unwrap()` anywhere (all mutex paths use `map_err`); call-depth limit enforced (`vm.rs:2478` `max_stack_depth`); float sort uses `partial_cmp().unwrap_or(Equal)` (NaN-safe); the 275 direct `[0]`-style indexes in pblang-vm sit behind shape/len prechecks; `unsafe` total ≈ 12 blocks — 8 `transmute_copy` atomics (compile-time size-asserted), FFI `dlopen`/`CStr` (capability-gated), signal handlers (async-signal-safe subset). No soundness violation found. `pblang-compiler` has literally zero unwrap/expect/panic/index sites. Remaining soft spot: `max_instructions` is optional, so a tight infinite loop is only stoppable by the host.
+
+### 112.C Vulnerabilities (no criticals; 1 medium defect; rest by-design or already hardened)
+
+| Area | Verdict | Evidence |
+|---|---|---|
+| `exec()` builtin | **hardened** | rejects all shell metacharacters + whitespace (`vm/runtime.rs:149-155`) |
+| `proc_spawn_wait` | **hardened** | argv-array, never `sh -c` (`runtime.rs:30-68`) |
+| polyglot exec | by-design | runs foreign code by definition; gated by `host.allow_exec()` |
+| fs builtins | by-design | no VM-level chroot; gated by `host.allow_fs()`; document that embedders sandbox at OS level |
+| **pm registry over `http://`** | **MEDIUM defect** | `fetch_url` (`pblang-pm/src/lib.rs:561-582`) accepts plain `http://` → MITM on index/tarball. Fix: reject or require `--allow-insecure-http` |
+| pm tarball extraction | **hardened** | full zip-slip defense: rejects symlinks/hardlinks/`..`/absolute (`lib.rs:651-703`); SHA256 checksum verified (`:490`,`:1038`); 10 MB index cap; optional HMAC sidecar via `PBLANG_SIGNING_KEY` |
+| TLS | clean | `ureq`+rustls+webpki-roots, no verification bypass anywhere; SHA-1 only in the RFC 6455 WebSocket handshake (mandated, non-security) |
+| `securelayer.sapp` | **design verified sound** | encrypt-then-MAC with tag-verify-before-decrypt (`:95-117`), constant-time `_ct_eq` (`:67-74`), 128-bit random nonces. Gap: no KDF — document that password-derived keys need PBKDF2/Argon2 before use |
+| JSON deserialization | clean | external inputs go through `bounded_json_parse` (10 MB); in-VM `json_parse` unbounded but operates on already-allocated VM strings |
+| LSP | clean | stdio-only, no network listener |
+
+### 112.D Sensitive data: **0 real secrets**
+
+API keys are env-only (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`) with `#[serde(skip_serializing)]` on the stored field. No `.env`, no keys in git history. **Only finding:** the personal path `./local_media is hardcoded in `docs/Future_plans.md` (15+ hits), `docs/pbAI_externalization.md` (3), and `stdlib/pbai_assets.sapp` (1 array entry) — sanitize to `$PROJECT_ROOT`/placeholders before any public push.
+
+### 112.E Partial / not-implemented inventory (and two false alarms corrected)
+
+**Real gaps** — all in *experimental* backends/stdlib, all honestly labelled in README/ROADMAP:
+
+| Component | Missing | Severity |
+|---|---|---|
+| `pblang-llvm` (`src/lib.rs:25-30`) | strings, arrays/maps, closures, try/catch, modules, threads — numeric fns only | major (experimental) |
+| `pblang-wasm` (`src/lib.rs:40-44`) | closures, modules, try/catch, concurrency, polyglot | major (experimental) |
+| `pblang-ctranspiler` (`src/lib.rs:417`) | import/export → single-file only | major (experimental) |
+| `pblang-cranelift` | numeric/loop-free opcode subset (known §94 scope) | by-design |
+| `stdlib/jit.sapp:75-146` | `compile_fn`/`bench_compare`/`cache_stats` return stubs — the `pblang_jit_compile_fn` builtin **does not exist** | major (API mismatch) |
+| `stdlib/systems.sapp:45-62` | all 14 port-I/O/MMIO/GDT fns return descriptor maps (host-VM placeholders; the QEMU-proven OS work of §§69-83 runs through the freestanding path, not these) | known (north-star) |
+
+**False alarms refuted during verification:**
+1. *"Memory-safety builtins are stubs"* — **wrong.** The stub is only `pblang-ir`'s *default* `VmHost` trait impl (`pblang-ir/src/lib.rs:524-572`); `pblang-vm` overrides all of them in `vm/memory.rs` and registers them in `builtins_table.rs:886`. Implemented as claimed.
+2. *"JIT unusable"* — **wrong for the real path.** The Cranelift JIT engages transparently via `PBLANG_JIT=1` (`vm.rs:934`). Only `jit.sapp`'s *explicit* API is stubbed; either expose `pblang_jit_compile_fn` as a builtin or rewrite `jit.sapp` docs to describe the env-var flow.
+
+**Doc drift (root-level):** `NEXT_STEPS_PLAN.md` is self-declared SUPERSEDED → archive it; `COMPREHENSIVE_IMPROVEMENTS.md` vs `IMPLEMENTATION_PROGRESS.md` contradict each other on whether `memory.sapp`/`concurrency.sapp` are libraries or doc-wrappers (and quote stale test counts 143 vs 160 vs today's 175). README/ROADMAP/CHANGELOG/STRUCTURE are current.
+
+### 112.F Quality analysis
+
+- **Comment density:** pblang-vm 11.7%, stdlib 13.3% — healthy.
+- **Largest files:** `src/main.rs` 6,136 (CLI dispatch — candidate for further `src/cli/*` extraction), `vm.rs` 2,961, `parser.rs` 2,935, `pm/lib.rs` 2,575, `polyglot.rs` 2,443. None pathological.
+- **Apparent stdlib duplicates are deliberate layering** (verified by reading headers): `async`/`async_await`/`async_io` = goroutines vs futures vs event-loop; `date`/`datetime`/`duration` = layered; `crypto`/`crypto_advanced`/`crypto_quantum` = tiered. Only true overlap: `color.sapp` (34 lines) is subsumed by `colors.sapp` (249) → deprecate or alias.
+- **Tests:** 175 semantics .sapp + 148 Rust `#[test]` + integration suites (selfhost_drift 26, modules 28, typeck, lint, fmt) + 4 fuzz targets + benches; CI on 3 platforms with audit. Weakest spot: no coverage measurement, and the 7 §112.B panic paths show tensor/string builtins lack adversarial-input tests.
+- **Process health:** zero-warning policy effectively held (24 nits across 92k lines), conventional commits, CHANGELOG maintained, MIT licensed, MSRV pinned.
+
+### 112.G Comparison against other languages
+
+Where pblang stands today (v0.5.7, tree-walk VM + opt-in Cranelift JIT) against the languages it competes with conceptually:
+
+| Dimension | pblang | Python | JS/Node | Lua | Ruby | Go | Rust | C/C++ | Zig | Julia |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Execution model | bytecode VM + opt-in JIT (numeric) | bytecode VM (3.13 JIT exp.) | JIT (V8) | VM / LuaJIT | VM + YJIT | AOT native | AOT native | AOT native | AOT native | JIT (LLVM) |
+| Typical perf vs C | ~10-50× slower interp; ~1.4× JIT gain on numeric leaves; rayon+wgpu matmul intrinsics | 30-100× | 2-10× | 3-30× (LuaJIT ~2×) | 30-80× | 1.5-3× | ~1× | 1× | ~1× | 1-3× |
+| Memory safety (impl lang) | VM in safe Rust (~12 unsafe blocks) | C core | C++ core | C core | C core | n/a | n/a | n/a | n/a | C/LLVM |
+| Static type checking | optional (`pblang-typeck`), gradual | optional (mypy, external) | optional (TS, external) | no | optional (RBS) | yes | yes | yes | yes | dynamic+dispatch |
+| Self-hosted compiler | **yes** (tokenize→parse→compile→run, §§26-45) | no (CPython=C) | no | no | no | yes | yes | n/a | yes | mostly |
+| Capability security (fs/net/exec gates) | **yes — VM-level allow flags** | no | no (Deno: yes) | partial (sandbox-able) | no | no | no | no | no | no |
+| Supply-chain (pm) | zip-slip-proof, SHA256, optional HMAC, lockfile | pip (hash opt-in) | npm (lockfile, frequent incidents) | luarocks (weak) | gems (signing unused) | modules+sumdb (**strong**) | cargo (lockfile) | none std | zon (young) | Pkg (manifests) |
+| Concurrency | real threads, channels, atomics, pools (no GIL) | GIL (3.13 free-threading exp.) | event loop + workers | coroutines | GVL | goroutines (**best-in-class**) | threads+async | threads | async/threads | tasks |
+| Polyglot embedding | **47-language polyglot blocks** — unique | C ext/ctypes | N-API | C API (**easiest embed**) | C ext | cgo | FFI | n/a | C interop | ccall |
+| AI/tensor in stdlib | **built-in tensors, GPU matmul (wgpu), LLM toolkit, pbAI** | via numpy/torch (external, dominant) | via deps | no | no | no | via crates | via libs | no | **built-in-grade** (core strength) |
+| Quantum sim, OS-dev path, native IDE | quantum sim builtin; QEMU-proven boot→usermode (§§69-83); self-hosted IDE in progress | none of these in-tree | none | none | none | none | OS-dev via no_std | OS-dev native | OS-dev native | none |
+| Ecosystem size | **~185 first-party modules; no third-party ecosystem** | huge | huge | medium | large | large | huge | huge | small | medium (sci) |
+| Tooling | fmt, lint, LSP, test runner, pm, fuzzing — all first-party | mature | mature | thin | mature | **gold standard** | gold standard | mature | young | good |
+
+**Honest read-out** (updates §66's weakness roadmap):
+- **Unique territory** — no mainstream language ships this combination in-tree: 47-language polyglot blocks, capability-gated VM, tensor+GPU+LLM stdlib, quantum sim, a self-hosted compiler at v0.5, and a QEMU-proven bare-metal path. The nearest comparables are Deno (capabilities), Julia (numeric), GraalVM (polyglot) — each covers one axis; pblang covers all, shallower.
+- **Biggest competitive gaps, in order:** (1) **ecosystem** — zero third-party packages vs millions for Python/JS; the pm is technically more secure than npm/pip defaults but has nothing in its registry; (2) **interpreter throughput** — between Python and Ruby today; the JIT covers numeric leaves only (no loops/calls — §94's known frontier); (3) **gradual types are optional** and not yet a strict mode, so large-program refactoring safety trails TS/mypy strictness, far behind Go/Rust; (4) **single-maintainer bus factor** vs language foundations.
+- **Where pblang already beats peers in its weight class:** capability security (Python/Ruby/Lua have none), supply-chain hardening (npm/pip defaults are weaker than pblang-pm), no-GIL threading (Python's is experimental), and self-hosting at this maturity stage is rare.
+
+### 112.H Scorecard & priorities
+
+| Axis | Score | Note |
+|---|---|---|
+| Correctness/test health | 9/10 | 175/0/0 + 3-OS CI; minus: 7 panic paths, no coverage metric |
+| Security posture | 8.5/10 | capability model + hardened pm; minus: http registry, KDF doc gap |
+| Completeness honesty | 8/10 | experimental backends clearly labelled; minus: jit.sapp API mismatch, doc drift |
+| Code quality | 9/10 | near-zero clippy at 92k lines, layered stdlib, healthy comments |
+| Performance | 6/10 | interpreter-class; JIT/GPU/rayon are the right levers, partially engaged |
+| Ecosystem | 2/10 | first-party only — the defining gap |
+
+**Do next (smallest-first):** ① `checked_mul` guards in the 6 `tensor.rs` sites + `str_repeat` cap (one afternoon, kills every known panic path); ② reject `http://` registry URLs unless flagged; ③ scrub personal paths from the 3 files in §112.D; ④ reconcile/archive the three stale root docs; ⑤ either expose `pblang_jit_compile_fn` or fix `jit.sapp` docs; ⑥ deprecate `color.sapp` into `colors.sapp`.
+
+- Audit date: **2026-06-09**, branch `main` @ `6b2383e`.
