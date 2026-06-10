@@ -5,9 +5,12 @@
 //! lower precision than the deterministic CPU f64 path. That is why callers gate this
 //! behind `PBLANG_GPU=1`: it is opt-in, for throughput on large matmuls, not the default.
 //!
-//! The device/pipeline are initialized once (lazily) and reused. `HighPerformance` power
-//! preference is requested so a discrete/integrated GPU is chosen over the software
-//! rasterizer fallback where one is reachable.
+//! The device/pipeline are initialized once (lazily) and reused. By default `HighPerformance`
+//! power preference is requested so a discrete/integrated GPU is chosen over the software
+//! rasterizer fallback where one is reachable. Set `PBLANG_GPU_ADAPTER` to override the
+//! choice: an index into `list_adapters()`, a device type (`integrated`/`discrete`/`cpu`),
+//! or a name substring — so e.g. an integrated GPU can be selected explicitly. Only ONE
+//! adapter is used at a time; pblang does not split a matmul across multiple GPUs.
 
 use std::sync::OnceLock;
 
@@ -37,18 +40,76 @@ struct GpuCtx {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     adapter_name: String,
+    adapter_type: String,
 }
 
 static CTX: OnceLock<Option<GpuCtx>> = OnceLock::new();
 
-fn init() -> Option<GpuCtx> {
+/// Human label for a wgpu device type.
+fn type_str(t: wgpu::DeviceType) -> &'static str {
+    match t {
+        wgpu::DeviceType::IntegratedGpu => "integrated",
+        wgpu::DeviceType::DiscreteGpu => "discrete",
+        wgpu::DeviceType::VirtualGpu => "virtual",
+        wgpu::DeviceType::Cpu => "cpu",
+        _ => "other",
+    }
+}
+
+/// Enumerate every GPU adapter wgpu can see: (name, type, backend). This sees adapters the
+/// OS display inventory may not (e.g. both an integrated and a discrete GPU, or a software
+/// fallback), so it complements OS-level detection.
+pub fn list_adapters() -> Vec<(String, String, String)> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    instance
+        .enumerate_adapters(wgpu::Backends::all())
+        .iter()
+        .map(|a| {
+            let i = a.get_info();
+            (
+                i.name,
+                type_str(i.device_type).to_string(),
+                format!("{:?}", i.backend),
+            )
+        })
+        .collect()
+}
+
+/// Pick the adapter to use. Honors `PBLANG_GPU_ADAPTER` (index / type / name substring);
+/// otherwise requests a HighPerformance adapter as before.
+fn pick_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
+    if let Ok(sel) = std::env::var("PBLANG_GPU_ADAPTER") {
+        let sel = sel.trim().to_string();
+        // by index into the enumerated list
+        if let Ok(idx) = sel.parse::<usize>() {
+            let mut all = instance.enumerate_adapters(wgpu::Backends::all());
+            if idx < all.len() {
+                return Some(all.swap_remove(idx));
+            }
+        }
+        // by device type or name substring
+        let want = sel.to_lowercase();
+        for a in instance.enumerate_adapters(wgpu::Backends::all()) {
+            let info = a.get_info();
+            if type_str(info.device_type) == want || info.name.to_lowercase().contains(&want) {
+                return Some(a);
+            }
+        }
+        // fall through to the default if the selector matched nothing
+    }
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
-    }))?;
-    let adapter_name = adapter.get_info().name;
+    }))
+}
+
+fn init() -> Option<GpuCtx> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pick_adapter(&instance)?;
+    let info = adapter.get_info();
+    let adapter_name = info.name.clone();
+    let adapter_type = type_str(info.device_type).to_string();
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()?;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -63,7 +124,7 @@ fn init() -> Option<GpuCtx> {
         compilation_options: Default::default(),
         cache: None,
     });
-    Some(GpuCtx { device, queue, pipeline, adapter_name })
+    Some(GpuCtx { device, queue, pipeline, adapter_name, adapter_type })
 }
 
 fn ctx() -> Option<&'static GpuCtx> {
@@ -78,6 +139,11 @@ pub fn available() -> bool {
 /// Name of the chosen GPU adapter, if any.
 pub fn adapter_name() -> Option<String> {
     ctx().map(|c| c.adapter_name.clone())
+}
+
+/// Type ("integrated"/"discrete"/...) of the chosen GPU adapter, if any.
+pub fn adapter_type() -> Option<String> {
+    ctx().map(|c| c.adapter_type.clone())
 }
 
 /// GPU matmul: (m x k) * (k x n) -> (m x n), computed in f32 on the GPU. Returns None if

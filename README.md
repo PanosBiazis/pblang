@@ -157,7 +157,12 @@ print tensor_backend();
 
 `gpu_feature` is `true` only when built with `--features gpu`; `gpu_enabled` is `true`
 only when offload actually ran (feature on + `PBLANG_GPU=1` + a matmul large enough to
-offload). There is **no NPU compute backend**: NPUs are driven by vendor stacks
+offload). With the `gpu` feature, `tensor_backend().gpu_adapters` lists **every** GPU wgpu
+can see (name/type/backend — discrete, integrated, and software). Only one adapter is used
+at a time (pblang does not split a matmul across GPUs); choose which with
+`PBLANG_GPU_ADAPTER` — an index, a device type (`integrated`/`discrete`/`cpu`), or a name
+substring — so e.g. an integrated GPU can be selected explicitly. There is **no NPU
+compute backend**: NPUs are driven by vendor stacks
 (ONNX Runtime + Vitis AI / OpenVINO / QNN, on quantized graphs) that don't map to
 pblang's f64 tensor kernels, so a present NPU is detectable but not usable for compute
 from pblang.
