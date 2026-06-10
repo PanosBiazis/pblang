@@ -125,6 +125,50 @@ print result;
 
 ---
 
+## Tensor compute and hardware acceleration
+
+pblang ships CPU tensor kernels (the `tensor_*` builtins). Matrix multiply is the hot
+path and has two backends:
+
+- **CPU (default).** `tensor_matmul` runs **multi-core** via rayon, parallelised over
+  output rows. It is **deterministic and exact (f64)**: identical inputs produce
+  bit-identical results regardless of core count, so the default build is fully
+  reproducible.
+- **GPU (opt-in).** Build with the `gpu` feature to compile a wgpu compute-shader matmul,
+  then enable it at runtime:
+
+  ```bash
+  cargo build --release --features gpu
+  PBLANG_GPU=1 pblang run your_script.sapp
+  ```
+
+  The GPU path is **f32** (GPUs lack f64 in compute shaders), so it trades precision for
+  throughput on large matmuls — which is exactly why it is opt-in and the default stays
+  exact f64 on the CPU. A `gpu`-enabled binary still runs everything on the CPU unless
+  `PBLANG_GPU=1` is set, and only large matmuls are offloaded.
+
+Query what the running binary actually supports with the `tensor_backend()` builtin:
+
+```pblang
+print tensor_backend();
+// { cpu_threads, parallel_matmul,
+//   gpu_feature, gpu_available, gpu_enabled, gpu_adapter, note }
+```
+
+`gpu_feature` is `true` only when built with `--features gpu`; `gpu_enabled` is `true`
+only when offload actually ran (feature on + `PBLANG_GPU=1` + a matmul large enough to
+offload). There is **no NPU compute backend**: NPUs are driven by vendor stacks
+(ONNX Runtime + Vitis AI / OpenVINO / QNN, on quantized graphs) that don't map to
+pblang's f64 tensor kernels, so a present NPU is detectable but not usable for compute
+from pblang.
+
+> Windows build notes: if cargo fails TLS with `CRYPT_E_NO_REVOCATION_CHECK`, set
+> `CARGO_HTTP_CHECK_REVOKE=false`. The `gpu` feature needs the `HighPerformance` adapter
+> to pick a discrete GPU rather than the software (WARP) renderer — pblang already
+> requests it.
+
+---
+
 ## Project layout
 
 ```text
