@@ -571,6 +571,14 @@ pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
         // NOTE: On non-Windows we do NOT strip the leading slash — the path is absolute.
         return std::fs::read(path).map_err(|e| format!("read file {}: {e}", path));
     }
+    if url.starts_with("http://")
+        && std::env::var("PBLANG_ALLOW_INSECURE_HTTP").ok().as_deref() != Some("1")
+    {
+        return Err(
+            "insecure registry URL rejected: http:// requires PBLANG_ALLOW_INSECURE_HTTP=1"
+                .to_string(),
+        );
+    }
     let resp = ureq::get(url)
         .call()
         .map_err(|e| format!("GET {}: {e}", url))?;
@@ -783,9 +791,7 @@ fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Resul
 pub fn package_has_module_files(package_dir: &Path) -> bool {
     let mut entries = vec![];
     let _ = collect_files(package_dir, package_dir, &mut entries);
-    entries
-        .iter()
-        .any(|(rel, _)| has_module_extension(rel))
+    entries.iter().any(|(rel, _)| has_module_extension(rel))
 }
 
 /// Validate a package directory before publish/install (modules + optional entry).
@@ -968,8 +974,17 @@ fn resolve_package_entry_in_dir(package_dir: &Path) -> Result<PathBuf, String> {
         }
     }
     for candidate in [
-        "main.sapp", "main.sap", "main.bpx", "main.pbx", "main.pb", "main.bp", "lib.sapp",
-        "lib.sap", "lib.pbx", "lib.pb", "lib.bp",
+        "main.sapp",
+        "main.sap",
+        "main.bpx",
+        "main.pbx",
+        "main.pb",
+        "main.bp",
+        "lib.sapp",
+        "lib.sap",
+        "lib.pbx",
+        "lib.pb",
+        "lib.bp",
     ] {
         let p = package_dir.join(candidate);
         if p.is_file() {
@@ -1176,7 +1191,9 @@ pub fn resolve_workspace_members(
     if !ws.exclude.is_empty() {
         let mut excluded: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for pat in &ws.exclude {
-            for dir in expand_member_pattern(root, pat, /* literal_must_have_manifest */ false)? {
+            for dir in
+                expand_member_pattern(root, pat, /* literal_must_have_manifest */ false)?
+            {
                 excluded.insert(dir);
             }
         }
@@ -1208,13 +1225,10 @@ fn expand_member_pattern(
         ));
     }
     let mut out: Vec<PathBuf> = Vec::new();
-    if let Some(stem) = pat.strip_suffix("/*").or_else(|| {
-        if pat == "*" {
-            Some("")
-        } else {
-            None
-        }
-    }) {
+    if let Some(stem) = pat
+        .strip_suffix("/*")
+        .or_else(|| if pat == "*" { Some("") } else { None })
+    {
         // Wildcard: list immediate children of root/stem and keep those
         // with pblang.toml.
         let base = if stem.is_empty() {
@@ -1250,10 +1264,7 @@ fn expand_member_pattern(
         if p.is_dir() {
             out.push(p);
         } else if literal_must_have_manifest {
-            return Err(format!(
-                "workspace member '{}' is not a directory",
-                pat
-            ));
+            return Err(format!("workspace member '{}' is not a directory", pat));
         }
     }
     Ok(out)
@@ -1502,7 +1513,10 @@ pub fn resolve_import(
                     tried.push(cand.display().to_string());
                 }
                 let root = resolved.ok_or_else(|| {
-                    format!("dependency '{pkg}' path not found; tried: {}", tried.join(", "))
+                    format!(
+                        "dependency '{pkg}' path not found; tried: {}",
+                        tried.join(", ")
+                    )
                 })?;
                 verify_package_tree_for_path_dep(&root)?;
                 root
@@ -2366,6 +2380,13 @@ version = "0.1.0"
         );
     }
 
+    #[test]
+    fn fetch_url_rejects_plain_http_by_default() {
+        std::env::remove_var("PBLANG_ALLOW_INSECURE_HTTP");
+        let err = fetch_url("http://example.invalid/index.json").unwrap_err();
+        assert!(err.contains("insecure registry URL rejected"));
+    }
+
     fn read_http_request(stream: &mut TcpStream) -> (String, String, String, String) {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
@@ -2464,11 +2485,9 @@ version = "0.1.0"
             write_http_response(&mut stream, 200, r#"{"token":"escaped-token"}"#);
         });
 
-        let token = refresh_access_token(
-            &format!("http://{addr}"),
-            "refresh\"token\\with\\slashes",
-        )
-        .expect("refresh should succeed");
+        let token =
+            refresh_access_token(&format!("http://{addr}"), "refresh\"token\\with\\slashes")
+                .expect("refresh should succeed");
         assert_eq!(token, "escaped-token");
         server.join().expect("join test server thread");
     }

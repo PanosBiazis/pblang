@@ -1,5 +1,12 @@
 # Comprehensive pblang Improvements Implementation
 
+> Historical snapshot. This report records the memory-safety/concurrency work
+> from an earlier implementation phase and is not the canonical current status.
+> For current status, test counts, and active priorities, use
+> `docs/CURRENT_STATUS.md`, `docs/PrjAnalysis.md`, and `docs/Future_plans.md`.
+> In particular, VM memory builtins are wired in Rust; stdlib memory/concurrency
+> files may be wrappers or documentation depending on the module.
+
 ## Executive Summary
 
 Successfully implemented major enhancements to the pblang programming language based on requirements from `old/Future_plans.md` and `docs/Future_plans.md`. The focus has been on implementing Rust-like memory safety mechanisms and enhanced thread safety features.
