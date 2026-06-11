@@ -2174,3 +2174,28 @@ Where pblang stands today (v0.5.7, tree-walk VM + opt-in Cranelift JIT) against 
 **Do next (smallest-first):** ① `checked_mul` guards in the 6 `tensor.rs` sites + `str_repeat` cap (one afternoon, kills every known panic path); ② reject `http://` registry URLs unless flagged; ③ scrub personal paths from the 3 files in §112.D; ④ reconcile/archive the three stale root docs; ⑤ either expose `pblang_jit_compile_fn` or fix `jit.sapp` docs; ⑥ deprecate `color.sapp` into `colors.sapp`.
 
 - Audit date: **2026-06-09**, branch `main` @ `6b2383e`.
+
+## 113. Resolution log (2026-06-10)
+
+Follow-up fixes applied after the §112 audit:
+
+| Audit item | Status | What changed |
+|---|---|---|
+| §112.B #1-#6 — tensor allocation overflow / OOM panic paths | **FIXED** | `crates/pblang-vm/src/vm/tensor.rs` now validates tensor shape products and output allocation sizes with checked multiplication and a bounded element cap before allocating. This covers `tensor_get_shape_data`, `tensor_matmul`, `tensor_transpose2d`, `tensor_embedding_lookup`, `tensor_conv2d`, `tensor_maxpool2d`, and `tensor_avgpool2d`. |
+| §112.B #7 — unbounded `str_repeat` allocation | **FIXED** | `crates/pblang-vm/src/vm/strings.rs` now checks repeated byte size with overflow detection and a 10 MiB cap before calling `repeat`. |
+| §112.C — package registry accepts plaintext `http://` | **FIXED** | `pblang-pm::fetch_url` now rejects `http://` registry/package URLs by default. Explicit trusted use requires `PBLANG_ALLOW_INSECURE_HTTP=1`. |
+| §112.E — `stdlib/jit.sapp` direct API mismatch | **FIXED** | `stdlib/jit.sapp` now documents the real transparent VM JIT path (`PBLANG_JIT=1`) and labels direct compile/cache helpers as unavailable placeholders instead of implying nonexistent builtins. |
+| §112.D — active personal path references | **FIXED** | `stdlib/pbai_assets.sapp` now uses relative AAP candidate roots plus `PBAI_ASSET_ROOT`; `docs/pbAI_externalization.md` no longer names this laptop's absolute pbAI checkout path. Historical transcript paths in `docs/Future_plans.md` remain archival text, not active config. |
+| §112.F — duplicate `color.sapp` vs `colors.sapp` | **FIXED** | `stdlib/color.sapp` is now an explicit deprecated compatibility layer. Shared RGB/HEX/mix behavior delegates to `stdlib:colors.sapp`, while the old ANSI helpers remain available for compatibility. |
+| §112.E/F — root-level stale reports | **FIXED** | `COMPREHENSIVE_IMPROVEMENTS.md` and `IMPLEMENTATION_PROGRESS.md` now carry historical-snapshot banners, point to canonical current docs, and no longer present stale test counts as current. `NEXT_STEPS_PLAN.md` already had a superseded banner. |
+| Regression coverage | **ADDED** | `tests/tensor_builtins.rs` rejects huge tensor shapes, and `tests/string_limits.rs` rejects oversized `str_repeat` results. `Cargo.toml` registers the new `string_limits` integration target. |
+
+Verification:
+
+```sh
+cargo test -p pblang --test tensor_builtins --test string_limits
+cargo test -p pblang-pm fetch_url_rejects_plain_http_by_default
+pblang run tests/semantics/jit_status_test.sapp --allow-all
+```
+
+Result: passed (`tensor_builtins`: 9 passed; `string_limits`: 1 passed; pblang-pm HTTP guard: 1 passed; JIT status: `jit_status_pass`).

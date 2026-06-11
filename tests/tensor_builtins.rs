@@ -3,7 +3,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::run_collect;
+use common::{run_collect, run_err};
 use pblang_vm::Value;
 
 fn nums(v: &Value) -> Vec<f64> {
@@ -143,4 +143,19 @@ fn tensor_scale_native() {
         "#,
     );
     assert_eq!(tensor_data(&out[0]), vec![2.5, 5.0, 7.5]);
+}
+
+#[test]
+fn tensor_rejects_huge_shape_before_allocation() {
+    let err = run_err(
+        r#"
+        let a = map{ shape: [1000000000000, 1000000000000], data: [], dtype: "f32" };
+        print tensor_transpose2d(a);
+        "#,
+    );
+    assert!(
+        err.message.contains("overflows") || err.message.contains("maximum"),
+        "unexpected error: {}",
+        err.message
+    );
 }
