@@ -15,6 +15,8 @@ use pblang_ir::{alloc_string, Obj, RuntimeError, Value, VmHost};
 
 use super::alloc_array;
 
+const MAX_STRING_ALLOC_BYTES: usize = 10 * 1024 * 1024;
+
 // -------------------------------------------------------------------------
 // Simple predicates and trim/split
 // -------------------------------------------------------------------------
@@ -172,10 +174,7 @@ pub(super) fn slice(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Ru
     }
 }
 
-pub(super) fn str_index_of(
-    host: &mut dyn VmHost,
-    args: Vec<Value>,
-) -> Result<Value, RuntimeError> {
+pub(super) fn str_index_of(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 2 {
         return Err(host.err(format!(
             "str_index_of() expects 2 arguments, got {}",
@@ -335,10 +334,7 @@ pub(super) fn strcharcodeat(
 ///
 /// pblang strings are guaranteed UTF-8, so binary-aware code must work on
 /// byte arrays rather than codepoints. This is the inverse of `bytes_to_str`.
-pub(super) fn str_to_bytes(
-    host: &mut dyn VmHost,
-    args: Vec<Value>,
-) -> Result<Value, RuntimeError> {
+pub(super) fn str_to_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(
             "str_to_bytes() expects 1 argument, got {}",
@@ -349,17 +345,17 @@ pub(super) fn str_to_bytes(
         .as_str()
         .map_err(|m| host.err(format!("str_to_bytes(): {m}")))?;
     Ok(alloc_array(
-        s.as_bytes().iter().map(|b| Value::Number(*b as f64)).collect(),
+        s.as_bytes()
+            .iter()
+            .map(|b| Value::Number(*b as f64))
+            .collect(),
     ))
 }
 
 /// `bytes_to_str(arr)` → string: decode an array of bytes (0..255) as UTF-8.
 ///
 /// Errors if the bytes are not valid UTF-8. Inverse of `str_to_bytes`.
-pub(super) fn bytes_to_str(
-    host: &mut dyn VmHost,
-    args: Vec<Value>,
-) -> Result<Value, RuntimeError> {
+pub(super) fn bytes_to_str(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(
             "bytes_to_str() expects 1 argument, got {}",
@@ -494,14 +490,19 @@ pub(super) fn str_repeat(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
         Value::Number(x) if *x >= 0.0 => *x as usize,
         _ => return Err(host.err("str_repeat(): second arg must be non-negative number".into())),
     };
+    let bytes = s.len().checked_mul(n).ok_or_else(|| {
+        host.err("str_repeat(): repeated string size overflows addressable size".into())
+    })?;
+    if bytes > MAX_STRING_ALLOC_BYTES {
+        return Err(host.err(format!(
+            "str_repeat(): result is {bytes} bytes; maximum is {MAX_STRING_ALLOC_BYTES}"
+        )));
+    }
     Ok(alloc_string(s.repeat(n)))
 }
 
 /// `str_pad_left(s, width, pad_char)` → left-pads `s` to `width` with `pad_char`.
-pub(super) fn str_pad_left(
-    host: &mut dyn VmHost,
-    args: Vec<Value>,
-) -> Result<Value, RuntimeError> {
+pub(super) fn str_pad_left(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 3 {
         return Err(host.err("str_pad_left(s, width, pad) expects 3 arguments".into()));
     }

@@ -2,10 +2,11 @@
 
 Status: active handoff, 2026-06-07.
 
-pbAI development is moving out of the pblang core repository and into:
+pbAI development is moving out of the pblang core repository and into the
+workspace-local external project:
 
 ```text
-/media/panosboy/ExtHD/panag/Documents/projects/AAP/ai/pbai
+../../ai/pbai
 ```
 
 The pblang repository should keep only the language/runtime primitives that pbAI needs:
@@ -52,7 +53,7 @@ Apply that patch from the external pbAI root to bring it up to the current in-tr
 pbAI files:
 
 ```sh
-cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/ai/pbai
+cd ../../ai/pbai
 patch -p0 < /tmp/pbai-target-sync.patch
 ```
 

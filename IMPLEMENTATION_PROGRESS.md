@@ -1,5 +1,14 @@
 # pblang Implementation Progress Report
 
+> Historical snapshot. This report is kept for implementation history only and
+> should not be used as the current project status. Current status and test
+> counts live in `docs/CURRENT_STATUS.md`; audit/fix status lives in
+> `docs/PrjAnalysis.md`.
+>
+> Terminology correction: memory-safety VM builtins are implemented in the Rust
+> VM. Some stdlib memory/concurrency files are wrappers or design docs, not the
+> source of the VM implementation.
+
 ## Overview
 
 This document summarizes the comprehensive improvements made to the pblang programming language based on the requirements in `old/Future_plans.md` and `docs/Future_plans.md`. The focus has been implementing Rust-like memory safety mechanisms, enhanced thread safety, and advanced concurrency primitives.
@@ -150,7 +159,9 @@ The following high-priority items remain:
 
 ## Testing
 
-All existing tests continue to pass (143 passed, 0 failed, 3 ignored), demonstrating backward compatibility. The new features are ready for integration with comprehensive testing.
+At the time this snapshot was written, existing tests continued to pass. The
+exact count quoted by older copies of this document is stale; see
+`docs/CURRENT_STATUS.md` for the canonical current test baseline.
 
 ## Usage Examples
 

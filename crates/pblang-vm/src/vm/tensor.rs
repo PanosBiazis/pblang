@@ -25,6 +25,33 @@ use rayon::prelude::*;
 
 use super::{alloc_array, alloc_map};
 
+const MAX_TENSOR_ALLOC_ELEMENTS: usize = 25_000_000;
+
+fn checked_tensor_elements(
+    host: &mut dyn VmHost,
+    fname: &str,
+    dims: &[usize],
+) -> Result<usize, RuntimeError> {
+    if dims.is_empty() {
+        return Ok(0);
+    }
+    let mut total = 1usize;
+    for dim in dims {
+        total = total.checked_mul(*dim).ok_or_else(|| {
+            host.err(format!(
+                "{fname}(): tensor shape {:?} overflows addressable size",
+                dims
+            ))
+        })?;
+    }
+    if total > MAX_TENSOR_ALLOC_ELEMENTS {
+        return Err(host.err(format!(
+            "{fname}(): tensor result has {total} elements; maximum is {MAX_TENSOR_ALLOC_ELEMENTS}"
+        )));
+    }
+    Ok(total)
+}
+
 // ── Native tensor builtins (fast paths for AI workloads) ─────────────
 //
 // Tensors are pblang maps of shape:
@@ -77,11 +104,7 @@ pub(super) fn tensor_get_shape_data(
             _ => Err(host.err(format!("{fname}(): data entries must be numbers"))),
         })
         .collect::<Result<_, _>>()?;
-    let expected: usize =
-        shape
-            .iter()
-            .product::<usize>()
-            .max(if shape.is_empty() { 0 } else { 1 });
+    let expected = checked_tensor_elements(host, fname, &shape)?;
     if data.len() != expected {
         return Err(host.err(format!(
             "{fname}(): data length {} does not match shape size {}",
@@ -217,7 +240,8 @@ pub(super) fn tensor_matmul_builtin(
             }
         }
     }
-    let mut out = vec![0.0_f64; m * n];
+    let out_len = checked_tensor_elements(host, "tensor_matmul", &[m, n])?;
+    let mut out = vec![0.0_f64; out_len];
     // Each output row is computed independently, in the same ijk order as the sequential
     // path, so results are bit-identical regardless of threading (deterministic). Large
     // products fan out across CPU cores via rayon; small ones stay sequential to avoid
@@ -472,7 +496,8 @@ pub(super) fn tensor_transpose2d_builtin(
         )));
     }
     let (m, n) = (sa[0], sa[1]);
-    let mut out = vec![0.0_f64; m * n];
+    let out_len = checked_tensor_elements(host, "tensor_transpose2d", &[m, n])?;
+    let mut out = vec![0.0_f64; out_len];
     for i in 0..m {
         for j in 0..n {
             out[j * m + i] = da[i * n + j];
@@ -633,9 +658,9 @@ pub(super) fn tensor_batch_norm_builtin(
     }
     let (sa, da) = tensor_get_shape_data(host, &args[0], "tensor_batch_norm")?;
     if sa.len() < 2 {
-        return Err(host.err(
-            "tensor_batch_norm(): tensor must have at least 2 dims [N, C, ...]".into(),
-        ));
+        return Err(
+            host.err("tensor_batch_norm(): tensor must have at least 2 dims [N, C, ...]".into())
+        );
     }
     let eps = if args.len() == 2 {
         match &args[1] {
@@ -700,29 +725,27 @@ pub(super) fn tensor_embedding_lookup_builtin(
     let d = st[1];
     // Indices: accept either a flat array or a tensor map with shape/data.
     let idx_vals: Vec<i64> = match &args[1] {
-        Value::Array(a) => {
-            a.borrow()
-                .iter()
-                .map(|x| match x {
-                    Value::Number(n) => Ok(*n as i64),
-                    _ => Err(host
-                        .err("tensor_embedding_lookup(): indices must be numbers".into())),
-                })
-                .collect::<Result<_, _>>()?
-        }
+        Value::Array(a) => a
+            .borrow()
+            .iter()
+            .map(|x| match x {
+                Value::Number(n) => Ok(*n as i64),
+                _ => Err(host.err("tensor_embedding_lookup(): indices must be numbers".into())),
+            })
+            .collect::<Result<_, _>>()?,
         Value::Map(_) => {
-            let (_si, di) =
-                tensor_get_shape_data(host, &args[1], "tensor_embedding_lookup")?;
+            let (_si, di) = tensor_get_shape_data(host, &args[1], "tensor_embedding_lookup")?;
             di.iter().map(|n| *n as i64).collect()
         }
         _ => {
-            return Err(host.err(
-                "tensor_embedding_lookup(): indices must be an array or tensor".into(),
-            ))
+            return Err(
+                host.err("tensor_embedding_lookup(): indices must be an array or tensor".into())
+            )
         }
     };
     let n = idx_vals.len();
-    let mut out = vec![0.0_f64; n * d];
+    let out_len = checked_tensor_elements(host, "tensor_embedding_lookup", &[n, d])?;
+    let mut out = vec![0.0_f64; out_len];
     for (i, &ix) in idx_vals.iter().enumerate() {
         if ix < 0 || (ix as usize) >= v {
             return Err(host.err(format!(
@@ -763,8 +786,7 @@ pub(super) fn tensor_cross_entropy_builtin(
             .iter()
             .map(|x| match x {
                 Value::Number(num) => Ok(*num as usize),
-                _ => Err(host
-                    .err("tensor_cross_entropy(): label entries must be numbers".into())),
+                _ => Err(host.err("tensor_cross_entropy(): label entries must be numbers".into())),
             })
             .collect::<Result<_, _>>()?,
         Value::Map(_) => {
@@ -793,11 +815,7 @@ pub(super) fn tensor_cross_entropy_builtin(
                 )));
             }
         }
-        _ => {
-            return Err(
-                host.err("tensor_cross_entropy(): targets must be array or tensor".into())
-            )
-        }
+        _ => return Err(host.err("tensor_cross_entropy(): targets must be array or tensor".into())),
     };
     if target_labels.len() != n {
         return Err(host.err(format!(
@@ -846,18 +864,14 @@ pub(super) fn tensor_conv2d_builtin(
     let (sx, dx) = tensor_get_shape_data(host, &args[0], "tensor_conv2d")?;
     let (sk, dk) = tensor_get_shape_data(host, &args[1], "tensor_conv2d")?;
     if sx.len() != 4 || sk.len() != 4 {
-        return Err(host.err(
-            "tensor_conv2d(): expected [N,Ci,H,W] input and [Co,Ci,KH,KW] kernel".into(),
-        ));
+        return Err(
+            host.err("tensor_conv2d(): expected [N,Ci,H,W] input and [Co,Ci,KH,KW] kernel".into())
+        );
     }
     let stride = if args.len() >= 3 {
         match &args[2] {
             Value::Number(n) => (*n as usize).max(1),
-            _ => {
-                return Err(
-                    host.err("tensor_conv2d(): stride must be a positive integer".into())
-                )
-            }
+            _ => return Err(host.err("tensor_conv2d(): stride must be a positive integer".into())),
         }
     } else {
         1
@@ -866,8 +880,9 @@ pub(super) fn tensor_conv2d_builtin(
         match &args[3] {
             Value::Number(n) => *n as usize,
             _ => {
-                return Err(host
-                    .err("tensor_conv2d(): padding must be a non-negative integer".into()))
+                return Err(
+                    host.err("tensor_conv2d(): padding must be a non-negative integer".into())
+                )
             }
         }
     } else {
@@ -882,14 +897,22 @@ pub(super) fn tensor_conv2d_builtin(
         )));
     }
     // Output dims:
-    let h_padded = h + 2 * padding;
-    let w_padded = w + 2 * padding;
+    let pad2 = padding
+        .checked_mul(2)
+        .ok_or_else(|| host.err("tensor_conv2d(): padding overflows addressable size".into()))?;
+    let h_padded = h
+        .checked_add(pad2)
+        .ok_or_else(|| host.err("tensor_conv2d(): padded height overflows".into()))?;
+    let w_padded = w
+        .checked_add(pad2)
+        .ok_or_else(|| host.err("tensor_conv2d(): padded width overflows".into()))?;
     if h_padded < kh || w_padded < kw {
         return Err(host.err("tensor_conv2d(): kernel larger than padded input".into()));
     }
     let oh = (h_padded - kh) / stride + 1;
     let ow = (w_padded - kw) / stride + 1;
-    let mut out = vec![0.0_f64; n * co * oh * ow];
+    let out_len = checked_tensor_elements(host, "tensor_conv2d", &[n, co, oh, ow])?;
+    let mut out = vec![0.0_f64; out_len];
     // Naive direct conv. Adequate for small/medium tensors; users wanting
     // im2col can call tensor_matmul on a reshaped buffer.
     for batch in 0..n {
@@ -910,14 +933,13 @@ pub(super) fn tensor_conv2d_builtin(
                                 if iy_in >= h || ix_in >= w {
                                     continue;
                                 }
-                                let x_idx =
-                                    batch * ci * h * w + ic * h * w + iy_in * w + ix_in;
-                                let k_idx = oc * ci * kh * kw + ic * kh * kw + ky * kw + kx;
+                                let x_idx = ((batch * ci + ic) * h + iy_in) * w + ix_in;
+                                let k_idx = ((oc * ci + ic) * kh + ky) * kw + kx;
                                 acc += dx[x_idx] * dk[k_idx];
                             }
                         }
                     }
-                    let o_idx = batch * co * oh * ow + oc * oh * ow + oy * ow + ox;
+                    let o_idx = ((batch * co + oc) * oh + oy) * ow + ox;
                     out[o_idx] = acc;
                 }
             }
@@ -944,19 +966,13 @@ pub(super) fn tensor_maxpool2d_builtin(
     let k = match &args[1] {
         Value::Number(n) if *n as usize > 0 => *n as usize,
         _ => {
-            return Err(
-                host.err("tensor_maxpool2d(): kernel size must be positive integer".into())
-            )
+            return Err(host.err("tensor_maxpool2d(): kernel size must be positive integer".into()))
         }
     };
     let stride = if args.len() >= 3 {
         match &args[2] {
             Value::Number(n) => (*n as usize).max(1),
-            _ => {
-                return Err(
-                    host.err("tensor_maxpool2d(): stride must be positive integer".into())
-                )
-            }
+            _ => return Err(host.err("tensor_maxpool2d(): stride must be positive integer".into())),
         }
     } else {
         k
@@ -967,7 +983,8 @@ pub(super) fn tensor_maxpool2d_builtin(
     }
     let oh = (h - k) / stride + 1;
     let ow = (w - k) / stride + 1;
-    let mut out = vec![0.0_f64; n * c * oh * ow];
+    let out_len = checked_tensor_elements(host, "tensor_maxpool2d", &[n, c, oh, ow])?;
+    let mut out = vec![0.0_f64; out_len];
     for batch in 0..n {
         for ch in 0..c {
             for oy in 0..oh {
@@ -977,13 +994,13 @@ pub(super) fn tensor_maxpool2d_builtin(
                         for kx in 0..k {
                             let iy = oy * stride + ky;
                             let ix = ox * stride + kx;
-                            let idx = batch * c * h * w + ch * h * w + iy * w + ix;
+                            let idx = ((batch * c + ch) * h + iy) * w + ix;
                             if dx[idx] > best {
                                 best = dx[idx];
                             }
                         }
                     }
-                    let o_idx = batch * c * oh * ow + ch * oh * ow + oy * ow + ox;
+                    let o_idx = ((batch * c + ch) * oh + oy) * ow + ox;
                     out[o_idx] = best;
                 }
             }
@@ -1009,19 +1026,13 @@ pub(super) fn tensor_avgpool2d_builtin(
     let k = match &args[1] {
         Value::Number(n) if *n as usize > 0 => *n as usize,
         _ => {
-            return Err(
-                host.err("tensor_avgpool2d(): kernel size must be positive integer".into())
-            )
+            return Err(host.err("tensor_avgpool2d(): kernel size must be positive integer".into()))
         }
     };
     let stride = if args.len() >= 3 {
         match &args[2] {
             Value::Number(n) => (*n as usize).max(1),
-            _ => {
-                return Err(
-                    host.err("tensor_avgpool2d(): stride must be positive integer".into())
-                )
-            }
+            _ => return Err(host.err("tensor_avgpool2d(): stride must be positive integer".into())),
         }
     } else {
         k
@@ -1032,8 +1043,12 @@ pub(super) fn tensor_avgpool2d_builtin(
     }
     let oh = (h - k) / stride + 1;
     let ow = (w - k) / stride + 1;
-    let mut out = vec![0.0_f64; n * c * oh * ow];
-    let denom = (k * k) as f64;
+    let out_len = checked_tensor_elements(host, "tensor_avgpool2d", &[n, c, oh, ow])?;
+    let mut out = vec![0.0_f64; out_len];
+    let denom = k
+        .checked_mul(k)
+        .ok_or_else(|| host.err("tensor_avgpool2d(): kernel area overflows".into()))?
+        as f64;
     for batch in 0..n {
         for ch in 0..c {
             for oy in 0..oh {
@@ -1043,11 +1058,11 @@ pub(super) fn tensor_avgpool2d_builtin(
                         for kx in 0..k {
                             let iy = oy * stride + ky;
                             let ix = ox * stride + kx;
-                            let idx = batch * c * h * w + ch * h * w + iy * w + ix;
+                            let idx = ((batch * c + ch) * h + iy) * w + ix;
                             acc += dx[idx];
                         }
                     }
-                    let o_idx = batch * c * oh * ow + ch * oh * ow + oy * ow + ox;
+                    let o_idx = ((batch * c + ch) * oh + oy) * ow + ox;
                     out[o_idx] = acc / denom;
                 }
             }
