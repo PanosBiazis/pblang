@@ -47,9 +47,8 @@ pub(super) fn bigint(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
         Value::Obj(o) => match o.as_ref() {
             pblang_ir::Obj::String(s) => pblang_ir::bigint_from_str(s).map_err(|m| host.err(m)),
             pblang_ir::Obj::BigInt(_) => Ok(args[0].clone()),
-            pblang_ir::Obj::Rational(_) | pblang_ir::Obj::Decimal(_) => Err(host.err(
-                "bigint(): cannot convert a rational/decimal (it may be fractional)".into(),
-            )),
+            pblang_ir::Obj::Rational(_) | pblang_ir::Obj::Decimal(_) => Err(host
+                .err("bigint(): cannot convert a rational/decimal (it may be fractional)".into())),
         },
         _ => Err(host.err("bigint(): expected a number or decimal string".into())),
     }

@@ -2060,6 +2060,8 @@ Verification:
 ## 112. Full-project audit (2026-06-09): errors · warnings · bugs · vulnerabilities · sensitive data · partial implementations · quality · cross-language comparison
 
 > Methodology: four parallel read-only sweeps (stubs/partials, panic-paths, security, secrets+quality) over every tracked source file, plus fresh `cargo clippy --workspace --all-targets`, `cargo test --workspace`, and the canonical `pblang test tests/semantics --allow-all`. Every machine-flagged finding below was re-verified by reading the cited code; two agent claims were **refuted** during verification and are recorded as false alarms (§112.E).
+>
+> Status note: §112 is the original 2026-06-09 audit snapshot. The current state is in §113: the original tensor/string panic paths, plaintext-registry defect, JIT API honesty gap, active personal-path references, and root-level stale reports are fixed.
 
 ### 112.A Verification baseline (all green)
 
@@ -2100,7 +2102,7 @@ Reachable from ordinary `.sapp` user input — a malformed program gets a **Rust
 | **pm registry over `http://`** | **MEDIUM defect** | `fetch_url` (`pblang-pm/src/lib.rs:561-582`) accepts plain `http://` → MITM on index/tarball. Fix: reject or require `--allow-insecure-http` |
 | pm tarball extraction | **hardened** | full zip-slip defense: rejects symlinks/hardlinks/`..`/absolute (`lib.rs:651-703`); SHA256 checksum verified (`:490`,`:1038`); 10 MB index cap; optional HMAC sidecar via `PBLANG_SIGNING_KEY` |
 | TLS | clean | `ureq`+rustls+webpki-roots, no verification bypass anywhere; SHA-1 only in the RFC 6455 WebSocket handshake (mandated, non-security) |
-| `securelayer.sapp` | **design verified sound** | encrypt-then-MAC with tag-verify-before-decrypt (`:95-117`), constant-time `_ct_eq` (`:67-74`), 128-bit random nonces. Gap: no KDF — document that password-derived keys need PBKDF2/Argon2 before use |
+| `securelayer.sapp` | **design verified sound** | encrypt-then-MAC with tag-verify-before-decrypt (`:95-117`), constant-time `_ct_eq` (`:67-74`), 128-bit random nonces. KDF boundary is now documented: `seal`/`open` require high-entropy key material; password-derived keys need PBKDF2/Argon2/scrypt before use. |
 | JSON deserialization | clean | external inputs go through `bounded_json_parse` (10 MB); in-VM `json_parse` unbounded but operates on already-allocated VM strings |
 | LSP | clean | stdio-only, no network listener |
 
@@ -2132,7 +2134,7 @@ API keys are env-only (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`) with `#[serde(skip_
 - **Comment density:** pblang-vm 11.7%, stdlib 13.3% — healthy.
 - **Largest files:** `src/main.rs` 6,136 (CLI dispatch — candidate for further `src/cli/*` extraction), `vm.rs` 2,961, `parser.rs` 2,935, `pm/lib.rs` 2,575, `polyglot.rs` 2,443. None pathological.
 - **Apparent stdlib duplicates are deliberate layering** (verified by reading headers): `async`/`async_await`/`async_io` = goroutines vs futures vs event-loop; `date`/`datetime`/`duration` = layered; `crypto`/`crypto_advanced`/`crypto_quantum` = tiered. Only true overlap: `color.sapp` (34 lines) is subsumed by `colors.sapp` (249) → deprecate or alias.
-- **Tests:** 175 semantics .sapp + 148 Rust `#[test]` + integration suites (selfhost_drift 26, modules 28, typeck, lint, fmt) + 4 fuzz targets + benches; CI on 3 platforms with audit. Weakest spot: no coverage measurement, and the 7 §112.B panic paths show tensor/string builtins lack adversarial-input tests.
+- **Tests:** 181 semantics .sapp + Rust `#[test]` + integration suites (selfhost_drift, modules, typeck, lint, fmt) + 4 fuzz targets + benches; CI on 3 platforms with audit. Weakest spot: no coverage measurement; the §112.B tensor/string panic paths now have adversarial-input regression tests in §113.
 - **Process health:** zero-warning policy effectively held (24 nits across 92k lines), conventional commits, CHANGELOG maintained, MIT licensed, MSRV pinned.
 
 ### 112.G Comparison against other languages
@@ -2164,14 +2166,14 @@ Where pblang stands today (v0.5.7, tree-walk VM + opt-in Cranelift JIT) against 
 
 | Axis | Score | Note |
 |---|---|---|
-| Correctness/test health | 9/10 | 175/0/0 + 3-OS CI; minus: 7 panic paths, no coverage metric |
-| Security posture | 8.5/10 | capability model + hardened pm; minus: http registry, KDF doc gap |
-| Completeness honesty | 8/10 | experimental backends clearly labelled; minus: jit.sapp API mismatch, doc drift |
+| Correctness/test health | 9.2/10 | 181/0/0 after fixes; tensor/string panic paths covered; minus: no coverage metric |
+| Security posture | 9.1/10 | capability model + hardened pm; plaintext registry URLs now require explicit opt-in; securelayer KDF boundary now documented; minus: native KDF/AEAD ergonomics remain roadmap |
+| Completeness honesty | 8.5/10 | experimental backends clearly labelled; jit.sapp API mismatch and root doc drift fixed; roadmap gaps remain explicit |
 | Code quality | 9/10 | near-zero clippy at 92k lines, layered stdlib, healthy comments |
 | Performance | 6/10 | interpreter-class; JIT/GPU/rayon are the right levers, partially engaged |
 | Ecosystem | 2/10 | first-party only — the defining gap |
 
-**Do next (smallest-first):** ① `checked_mul` guards in the 6 `tensor.rs` sites + `str_repeat` cap (one afternoon, kills every known panic path); ② reject `http://` registry URLs unless flagged; ③ scrub personal paths from the 3 files in §112.D; ④ reconcile/archive the three stale root docs; ⑤ either expose `pblang_jit_compile_fn` or fix `jit.sapp` docs; ⑥ deprecate `color.sapp` into `colors.sapp`.
+**Original Do next status:** items ①-⑥ are fixed in the resolution log below. Remaining work is now roadmap-scale: add native KDF/AEAD ergonomics, grow the package ecosystem, and continue JIT loop/call support.
 
 - Audit date: **2026-06-09**, branch `main` @ `6b2383e`.
 
@@ -2188,6 +2190,10 @@ Follow-up fixes applied after the §112 audit:
 | §112.D — active personal path references | **FIXED** | `stdlib/pbai_assets.sapp` now uses relative AAP candidate roots plus `PBAI_ASSET_ROOT`; `docs/pbAI_externalization.md` no longer names this laptop's absolute pbAI checkout path. Historical transcript paths in `docs/Future_plans.md` remain archival text, not active config. |
 | §112.F — duplicate `color.sapp` vs `colors.sapp` | **FIXED** | `stdlib/color.sapp` is now an explicit deprecated compatibility layer. Shared RGB/HEX/mix behavior delegates to `stdlib:colors.sapp`, while the old ANSI helpers remain available for compatibility. |
 | §112.E/F — root-level stale reports | **FIXED** | `COMPREHENSIVE_IMPROVEMENTS.md` and `IMPLEMENTATION_PROGRESS.md` now carry historical-snapshot banners, point to canonical current docs, and no longer present stale test counts as current. `NEXT_STEPS_PLAN.md` already had a superseded banner. |
+| pbAI follow-up — `hwinfo.npu()` fallback shape | **FIXED** | Non-Windows fallback maps in `stdlib/hwinfo.sapp` now include the same `used_by_pblang` honesty field as Windows-backed detections for RAM, disks, GPU, NPU, network, sound, and device-class inventory. This keeps pblang and pbAI callers platform-stable. |
+| pbAI follow-up — real non-Windows CPU core count | **IMPROVED** | `stdlib/hwinfo.sapp` now tries `nproc` and `getconf _NPROCESSORS_ONLN` when `NUMBER_OF_PROCESSORS` is unset, so Linux/macOS compute planning no longer falls back to a hardcoded 4 cores when process probing is allowed. |
+| Test honesty — `nd_linalg_test` false-positive print | **FIXED** | `tests/semantics/nd_linalg_test.sapp` now uses `assert(...)` for every internal check. The 3x3 solve expected value was corrected from the wrong `[-0.25, 1.5, 0.75]` to the mathematically correct `[0, 1, 1]`, removing a hidden `FAIL` line from an otherwise passing suite. |
+| `securelayer.sapp` KDF documentation gap | **FIXED** | `stdlib/securelayer.sapp` and `docs/Protocols.md` now state that `seal`/`open` require high-entropy key material, and that human passwords/passphrases must first be stretched with PBKDF2, Argon2, or scrypt in a host/plugin layer until pblang has a native KDF builtin. |
 | Regression coverage | **ADDED** | `tests/tensor_builtins.rs` rejects huge tensor shapes, and `tests/string_limits.rs` rejects oversized `str_repeat` results. `Cargo.toml` registers the new `string_limits` integration target. |
 
 Verification:
@@ -2195,7 +2201,68 @@ Verification:
 ```sh
 cargo test -p pblang --test tensor_builtins --test string_limits
 cargo test -p pblang-pm fetch_url_rejects_plain_http_by_default
+cargo test --test install_cli fetch_url_reads_registry_index_over_http_when_explicitly_allowed
 pblang run tests/semantics/jit_status_test.sapp --allow-all
+pblang run tests/semantics/hwinfo_test.sapp --allow-all
+pblang run tests/semantics/nd_linalg_test.sapp --allow-all
+pblang test tests/semantics --allow-all
 ```
 
-Result: passed (`tensor_builtins`: 9 passed; `string_limits`: 1 passed; pblang-pm HTTP guard: 1 passed; JIT status: `jit_status_pass`).
+Result: passed (`tensor_builtins`: 9 passed; `string_limits`: 1 passed; pblang-pm HTTP guard: 1 passed; JIT status: `jit_status_pass`; full pblang semantics later extended to 181 passed after §§114-115).
+
+## 114. Docs-driven HTTP AI auth/streaming fix (2026-06-12)
+
+Reading the docs beyond this audit found a real mismatch: `docs/AI_plugin_pattern.md`, `docs/Tooling.md`, and old report text still described authenticated AI HTTP as future or as `http_post_auth(url, body, token)`, while the VM builtin is `http_post_auth(url, headers_map, body)`.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `stdlib:http.sapp` auth wrapper | **FIXED** | `post_auth(url, body, token)` now builds `Authorization: Bearer ...` and calls the raw builtin as `http_post_auth(url, headers_map, body)`. `post_json_auth` uses the same path. |
+| Documented streaming helpers | **IMPLEMENTED** | Added `get_stream`, `post_stream`, and `post_stream_auth` SSE-style shims. They fetch the full response today, split on blank lines, and call `on_chunk` per event-sized part, matching the documented contract while true socket-level streaming remains future runtime work. |
+| AI/provider wrappers | **FIXED** | `stdlib:provider_registry.sapp` uses `http.post_auth`; `stdlib:ai.sapp` sends explicit header maps for OpenAI Bearer auth and Anthropic `x-api-key` + `anthropic-version`. |
+| Docs/examples | **SYNCED** | `docs/AI_plugin_pattern.md`, `docs/Tooling.md`, `docs/Report.md`, and `examples/ai_http_provider/main.sapp` now describe the current wrapper/builtin split. |
+| Regression coverage | **ADDED** | `tests/semantics/http_stream_helpers_test.sapp` verifies the streaming helper exports and SSE parser behavior; `tests/semantics.rs` now includes `http_stream_helpers_pass`. |
+
+Verification:
+
+```sh
+pblang run tests/semantics/http_stream_helpers_test.sapp --allow-all
+pblang run tests/semantics/provider_registry_test.sapp --allow-all
+pblang run tests/semantics/http_post_auth_test.sapp --allow-all
+cargo test --test semantics http_stream_helpers_pass
+cargo test --test semantics provider_registry_register_and_call_pass
+cargo test --test semantics http_post_auth_builtin_registered_pass
+pblang test tests/semantics --allow-all
+```
+
+Result: passed, including the full pblang semantics suite; the suite later reached **181 passed / 0 failed / 0 ignored** after §115. Cargo still reports the known external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 115. Docs-driven ONNX bridge status sync (2026-06-12)
+
+Reading the broader docs found stale AI-plugin wording that still described `onnx_infer` as a stub. The current VM has a capability-gated Python ONNX Runtime bridge and the raw builtin was already covered by `onnx_infer_bridge_test`.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `docs/AI_plugin_pattern.md` ONNX status | **SYNCED** | Now documents `onnx_infer` as an `allow_exec`-gated Python bridge that returns structured success/error maps, while still recommending FFI packaging for production plugins. |
+| `docs/CURRENT_STATUS.md` ONNX row | **SYNCED** | Now points to the bridge behavior and `stdlib:ai.sapp` `onnx_run(...)` wrapper instead of describing only an error-message stub. |
+| Stdlib wrapper coverage | **ADDED** | `tests/semantics/ai_onnx_wrapper_test.sapp` verifies `ai.onnx_run(...)` returns a structured failure map for an unavailable model instead of throwing or crashing. |
+
+Verification:
+
+```sh
+pblang run tests/semantics/ai_onnx_wrapper_test.sapp --allow-all
+cargo test --test semantics ai_onnx_wrapper_returns_structured_result
+```
+
+Result: passed. Cargo still reports the known external-drive incremental-cache hard-link warning; it is not a test failure.
+
+Full-suite follow-up:
+
+```sh
+pblang test tests/semantics --allow-all
+```
+
+Result: passed, **181 passed / 0 failed / 0 ignored**.

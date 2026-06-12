@@ -22,7 +22,9 @@ fn http_server_serve_once_handles_one_request() {
     let _ = std::fs::remove_file(&port_file);
     // SAFETY: test-only; set before spawning the server thread.
     #[allow(unused_unsafe)]
-    unsafe { std::env::set_var("PBLANG_TEST_PORT_FILE", &port_file_str) };
+    unsafe {
+        std::env::set_var("PBLANG_TEST_PORT_FILE", &port_file_str)
+    };
 
     let server = thread::spawn(move || {
         let src = r#"
@@ -80,7 +82,9 @@ fn http_server_read_request_reads_fixed_length_body() {
     let _ = std::fs::remove_file(&port_file);
     // SAFETY: test-only; set before spawning the server thread.
     #[allow(unused_unsafe)]
-    unsafe { std::env::set_var("PBLANG_TEST_PORT_FILE", &port_file_str) };
+    unsafe {
+        std::env::set_var("PBLANG_TEST_PORT_FILE", &port_file_str)
+    };
 
     let server = thread::spawn(move || {
         let src = r#"
@@ -134,7 +138,9 @@ fn http_server_serve_once_limited_rejects_oversized_body() {
     let _ = std::fs::remove_file(&port_file);
     // SAFETY: test-only; set before spawning the server thread.
     #[allow(unused_unsafe)]
-    unsafe { std::env::set_var("PBLANG_TEST_PORT_FILE", &port_file_str) };
+    unsafe {
+        std::env::set_var("PBLANG_TEST_PORT_FILE", &port_file_str)
+    };
 
     let server = thread::spawn(move || {
         let src = r#"

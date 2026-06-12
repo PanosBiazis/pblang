@@ -45,11 +45,7 @@ pub(crate) fn format_ide_source(src: &str, max_line_length: Option<usize>) -> St
             continue;
         }
         // Separate each top-level function declaration with a blank line.
-        if depth == 0
-            && trimmed.starts_with("fn ")
-            && !out.is_empty()
-            && !out.ends_with("\n\n")
-        {
+        if depth == 0 && trimmed.starts_with("fn ") && !out.is_empty() && !out.ends_with("\n\n") {
             out.push('\n');
         }
         // A line that opens with '}' closes a block, so render the brace one

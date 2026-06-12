@@ -586,7 +586,11 @@ fn rational_exact_precision_pass() {
         .last()
         .and_then(|v: &pblang_vm::Value| v.as_str().ok())
         .unwrap_or("");
-    assert_eq!(last, "rational_pass", "rational test failed; output: {:?}", out);
+    assert_eq!(
+        last, "rational_pass",
+        "rational test failed; output: {:?}",
+        out
+    );
 }
 
 #[test]
@@ -597,7 +601,11 @@ fn decimal_arbitrary_precision_pass() {
         .last()
         .and_then(|v: &pblang_vm::Value| v.as_str().ok())
         .unwrap_or("");
-    assert_eq!(last, "decimal_pass", "decimal test failed; output: {:?}", out);
+    assert_eq!(
+        last, "decimal_pass",
+        "decimal test failed; output: {:?}",
+        out
+    );
 }
 
 #[test]
@@ -774,7 +782,10 @@ fn struct_construction_and_field_access() {
         "#,
     );
     let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
-    assert_eq!(out, vec![Value::Number(3.0), Value::Number(4.0), sv("Point")]);
+    assert_eq!(
+        out,
+        vec![Value::Number(3.0), Value::Number(4.0), sv("Point")]
+    );
 }
 
 #[test]
@@ -790,7 +801,10 @@ fn enum_unit_and_data_variants() {
         "#,
     );
     let sv = |c: &str| Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(c.to_string())));
-    assert_eq!(out, vec![sv("Empty"), Value::Number(5.0), Value::Number(3.0)]);
+    assert_eq!(
+        out,
+        vec![sv("Empty"), Value::Number(5.0), Value::Number(3.0)]
+    );
 }
 
 #[test]
@@ -1371,6 +1385,23 @@ fn ai_stream_parse_sse_pass() {
     assert_eq!(
         got, "ai_stream_test: pass",
         "expected final print ai_stream_test: pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn http_stream_helpers_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/http_stream_helpers_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read http_stream_helpers_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "http_stream_helpers_pass",
+        "expected final print http_stream_helpers_pass, got: {:?}",
         out
     );
 }
@@ -2075,9 +2106,12 @@ fn polyglot_cdylib_per_lang_pass() {
     let any_ok = out
         .iter()
         .any(|v| v.as_str().ok().map(|s| s.contains(": ok")).unwrap_or(false));
-    let any_compile_attempt = out
-        .iter()
-        .any(|v| v.as_str().ok().map(|s| s.contains("polyglot_cdylib_")).unwrap_or(false));
+    let any_compile_attempt = out.iter().any(|v| {
+        v.as_str()
+            .ok()
+            .map(|s| s.contains("polyglot_cdylib_"))
+            .unwrap_or(false)
+    });
     assert!(
         any_compile_attempt,
         "expected polyglot_cdylib_* trace lines in output, got: {:?}",
@@ -2145,6 +2179,27 @@ fn onnx_infer_bridge_returns_structured_result() {
     assert_eq!(
         got, "onnx_infer_bridge_pass",
         "expected onnx_infer_bridge_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn ai_onnx_wrapper_returns_structured_result() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/ai_onnx_wrapper_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read ai_onnx_wrapper_test.sapp");
+    let cfg = StdlibConfig {
+        exec: true,
+        ..StdlibConfig::default()
+    };
+    let out = run_collect_with_config(cfg, &src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "ai_onnx_wrapper_pass",
+        "expected ai_onnx_wrapper_pass, got: {:?}",
         out
     );
 }
@@ -2276,8 +2331,7 @@ fn cranelift_jit_fib_pass() {
         }
         JitResult::NotEligible(r) => {
             assert_eq!(
-                r,
-                "global read not JIT-able (codegen incomplete)",
+                r, "global read not JIT-able (codegen incomplete)",
                 "unexpected Cranelift JIT rejection reason"
             );
         }
@@ -2841,7 +2895,11 @@ fn async_await_keywords() {
     );
     assert_eq!(
         out,
-        vec![Value::Number(49.0), Value::Number(42.0), Value::Number(25.0)]
+        vec![
+            Value::Number(49.0),
+            Value::Number(42.0),
+            Value::Number(25.0)
+        ]
     );
 }
 

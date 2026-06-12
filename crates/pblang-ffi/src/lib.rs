@@ -214,10 +214,11 @@ pub unsafe extern "C" fn pblang_call_function(
     // Parse args as JSON array — capped at the VM's `max_external_json_bytes`
     // (default 10 MB) to bound memory consumption from untrusted external
     // embedders. The cap matches what the IDE-server middleware enforces.
-    let args_val: serde_json::Value = match pblang_vm::bounded_json_parse::<
-        serde_json::Value,
-    >("pblang_call_function args_json", args_str.as_bytes(), w.vm.limits())
-    {
+    let args_val: serde_json::Value = match pblang_vm::bounded_json_parse::<serde_json::Value>(
+        "pblang_call_function args_json",
+        args_str.as_bytes(),
+        w.vm.limits(),
+    ) {
         Ok(v) => v,
         Err(e) => {
             set_error(w, e);

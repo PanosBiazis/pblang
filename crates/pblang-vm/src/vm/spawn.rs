@@ -46,7 +46,10 @@ use super::spawn_wire::{
 use super::{alloc_array, alloc_map, StdlibConfig, VmLimits, VM};
 use crate::concurrency::{SpawnWireClosure, SpawnWireValue, VmChannelBuf};
 
-pub(super) fn spawn_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn spawn_builtin(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if !host.allow_spawn() {
         return Err(host.err("spawn not allowed".into()));
     }
@@ -55,11 +58,7 @@ pub(super) fn spawn_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
     }
     let closure = match &args[0] {
         Value::Closure(c) => c.clone(),
-        _ => {
-            return Err(
-                host.err("spawn: expected a closure (function with no arguments)".into())
-            )
-        }
+        _ => return Err(host.err("spawn: expected a closure (function with no arguments)".into())),
     };
     // Serialize closure captures. Closed upvalues transfer directly.
     // Open upvalues are snapshotted from the current VM stack at spawn time.
@@ -71,18 +70,14 @@ pub(super) fn spawn_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
                 let vm = match host.as_any_mut().downcast_mut::<VM>() {
                     Some(vm) => vm,
                     None => {
-                        return Err(host.err(
-                            "spawn: host does not support open-upvalue snapshot".into(),
-                        ))
+                        return Err(
+                            host.err("spawn: host does not support open-upvalue snapshot".into())
+                        )
                     }
                 };
                 match vm.stack.get(*i).cloned() {
                     Some(v) => v,
-                    None => {
-                        return Err(
-                            host.err("spawn: open upvalue points outside stack".into())
-                        )
-                    }
+                    None => return Err(host.err("spawn: open upvalue points outside stack".into())),
                 }
             }
         };
@@ -247,9 +242,9 @@ pub(super) fn channel_buffered_builtin(
     let capacity = match args.first() {
         Some(Value::Number(n)) if *n >= 1.0 => *n as usize,
         _ => {
-            return Err(host.err(
-                "channel_buffered(capacity): expected positive integer capacity".into(),
-            ))
+            return Err(
+                host.err("channel_buffered(capacity): expected positive integer capacity".into())
+            )
         }
     };
     let id = reg.channel_next.fetch_add(1, Ordering::SeqCst);
@@ -351,11 +346,7 @@ pub(super) fn channel_recv_timeout_builtin(
     }
     let ms = match args[1] {
         Value::Number(n) if n >= 0.0 => n as u64,
-        _ => {
-            return Err(
-                host.err("recv_timeout: timeout_ms must be a non-negative number".into())
-            )
-        }
+        _ => return Err(host.err("recv_timeout: timeout_ms must be a non-negative number".into())),
     };
     channel_recv_impl(host, vec![args[0].clone()], ms)
 }
@@ -390,8 +381,7 @@ pub(super) fn channel_recv_impl(
             if let Some(json_str) = buf.pop_front() {
                 // Notify blocked senders that space is available
                 cb.space_cv.1.notify_all();
-                let j: sj::Value =
-                    sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
+                let j: sj::Value = sj::from_str(&json_str).map_err(|e| host.err(e.to_string()))?;
                 return Ok(spawn_value_from_json(&j));
             }
         }
@@ -539,17 +529,11 @@ pub(super) fn channel_select_timeout_builtin(
 ) -> Result<Value, RuntimeError> {
     let reg = vm_handles(host)?;
     if args.len() < 2 {
-        return Err(
-            host.err("select_with_timeout(channels, ms) expects 2 arguments".into())
-        );
+        return Err(host.err("select_with_timeout(channels, ms) expects 2 arguments".into()));
     }
     let ms = match args[1] {
         Value::Number(n) if n >= 0.0 => n as u64,
-        _ => {
-            return Err(
-                host.err("select_with_timeout: ms must be non-negative number".into())
-            )
-        }
+        _ => return Err(host.err("select_with_timeout: ms must be non-negative number".into())),
     };
     let ids: Vec<usize> = match &args[0] {
         Value::Array(a) => {
@@ -653,9 +637,8 @@ pub(super) fn join_all_builtin(
                 .spawn
                 .lock()
                 .map_err(|_| host.err("join_all: spawn table unavailable".into()))?;
-            t.remove(&id).ok_or_else(|| {
-                host.err("join_all: invalid or already joined handle".into())
-            })?
+            t.remove(&id)
+                .ok_or_else(|| host.err("join_all: invalid or already joined handle".into()))?
         };
         let result = rx
             .recv()
@@ -682,7 +665,10 @@ pub(super) fn join_all_builtin(
 
 /// spawn_n(n, fn) — spawn n threads each running fn(), return array of handles.
 /// Like Go's fan-out pattern: for i := 0; i < n; i++ { go fn() }.
-pub(super) fn spawn_n_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn spawn_n_builtin(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() < 2 {
         return Err(host.err("spawn_n(n, fn) expects 2 arguments".into()));
     }
@@ -702,7 +688,10 @@ pub(super) fn spawn_n_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result
 /// ticker(interval_ms) — create a channel that receives a tick every interval_ms.
 /// Like Go's time.NewTicker(). Close the channel to stop it.
 /// Returns the receiver handle (a channel).
-pub(super) fn ticker_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn ticker_builtin(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     let reg = vm_handles(host)?;
     let ms = match args.first() {
         Some(Value::Number(n)) if *n >= 1.0 => *n as u64,

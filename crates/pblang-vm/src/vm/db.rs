@@ -41,10 +41,7 @@ fn pblang_value_to_sqlite_param(
         Value::Nil => Ok(rusqlite::types::Value::Null),
         Value::Bool(b) => Ok(rusqlite::types::Value::Integer(if b { 1 } else { 0 })),
         Value::Number(n) => {
-            if n.is_finite()
-                && n.fract() == 0.0
-                && n >= (i64::MIN as f64)
-                && n <= (i64::MAX as f64)
+            if n.is_finite() && n.fract() == 0.0 && n >= (i64::MIN as f64) && n <= (i64::MAX as f64)
             {
                 Ok(rusqlite::types::Value::Integer(n as i64))
             } else {
@@ -116,8 +113,7 @@ pub(super) fn sqlite_open(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Val
     let path = args[0]
         .as_str()
         .map_err(|m| host.err(format!("sqlite_open(): {m}")))?;
-    let conn =
-        Connection::open(path).map_err(|e| host.err(format!("sqlite_open(): {e}")))?;
+    let conn = Connection::open(path).map_err(|e| host.err(format!("sqlite_open(): {e}")))?;
     let id = with_db_table(host, |t| {
         let id = DB_NEXT.fetch_add(1, Ordering::Relaxed);
         t.insert(id, DbResource::Sqlite(conn));

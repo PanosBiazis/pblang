@@ -1592,10 +1592,9 @@ mod tests {
 
         match result {
             JitResult::Compiled(_) => panic!("recursive fibonacci should not JIT yet"),
-            JitResult::NotEligible(reason) => assert_eq!(
-                reason,
-                "global read not JIT-able (codegen incomplete)"
-            ),
+            JitResult::NotEligible(reason) => {
+                assert_eq!(reason, "global read not JIT-able (codegen incomplete)")
+            }
         }
     }
 
@@ -1606,10 +1605,9 @@ mod tests {
 
         match cache.compile("fib", &func) {
             JitResult::Compiled(_) => panic!("recursive fibonacci should not JIT yet"),
-            JitResult::NotEligible(reason) => assert_eq!(
-                reason,
-                "global read not JIT-able (codegen incomplete)"
-            ),
+            JitResult::NotEligible(reason) => {
+                assert_eq!(reason, "global read not JIT-able (codegen incomplete)")
+            }
         }
     }
 

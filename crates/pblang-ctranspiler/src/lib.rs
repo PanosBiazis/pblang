@@ -794,7 +794,6 @@ impl TranspileCtx {
     }
 }
 
-
 /// Transpile pblang source code string directly to self-contained C.
 ///
 /// This is a convenience wrapper around parse + transpile.
@@ -868,4 +867,3 @@ fn find_ctranspiler_cc() -> Result<String, String> {
 pub fn is_c_compiler_available() -> bool {
     find_ctranspiler_cc().is_ok()
 }
-

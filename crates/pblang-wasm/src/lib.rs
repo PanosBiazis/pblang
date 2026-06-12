@@ -594,8 +594,8 @@ impl WasmCtx {
     /// `local.set` simply reuses the slot.
     fn declare_local_once(&mut self, name: &str) {
         if let Some(f) = self.module.functions.iter_mut().last() {
-            let exists = f.locals.iter().any(|(n, _)| n == name)
-                || f.params.iter().any(|(n, _)| n == name);
+            let exists =
+                f.locals.iter().any(|(n, _)| n == name) || f.params.iter().any(|(n, _)| n == name);
             if !exists {
                 f.locals.push((name.to_string(), WatType::F64));
             }
@@ -746,7 +746,9 @@ impl WasmCtx {
             }
             // Comparisons: compute the i32 result, then widen to f64 (0.0/1.0) so
             // it composes with the uniform-f64 value model.
-            ExprKind::Eq(left, right) => self.compile_cmp(*left, *right, WatInstr::Eq(WatType::F64)),
+            ExprKind::Eq(left, right) => {
+                self.compile_cmp(*left, *right, WatInstr::Eq(WatType::F64))
+            }
             ExprKind::NotEq(left, right) => {
                 self.compile_cmp(*left, *right, WatInstr::Ne(WatType::F64))
             }
@@ -1060,11 +1062,7 @@ fn sigil(name: &str) -> String {
 fn cmp_wat(ty: &WatType, op: &str, signed: bool) -> String {
     match ty {
         WatType::F64 => format!("f64.{op}"),
-        _ => format!(
-            "{}.{op}_{}",
-            ty.wat_str(),
-            if signed { "s" } else { "u" }
-        ),
+        _ => format!("{}.{op}_{}", ty.wat_str(), if signed { "s" } else { "u" }),
     }
 }
 
@@ -1074,7 +1072,11 @@ fn render_instrs(instrs: &[WatInstr], indent: usize, out: &mut String) {
     let pad = "  ".repeat(indent);
     for instr in instrs {
         match instr {
-            WatInstr::If { then_, else_, result_type } => {
+            WatInstr::If {
+                then_,
+                else_,
+                result_type,
+            } => {
                 match result_type {
                     Some(rt) => out.push_str(&format!("{pad}if (result {})\n", rt.wat_str())),
                     None => out.push_str(&format!("{pad}if\n")),
@@ -1086,12 +1088,19 @@ fn render_instrs(instrs: &[WatInstr], indent: usize, out: &mut String) {
                 }
                 out.push_str(&format!("{pad}end\n"));
             }
-            WatInstr::Block { label, instrs: inner, .. } => {
+            WatInstr::Block {
+                label,
+                instrs: inner,
+                ..
+            } => {
                 out.push_str(&format!("{pad}block {}\n", label.as_deref().unwrap_or("")));
                 render_instrs(inner, indent + 1, out);
                 out.push_str(&format!("{pad}end\n"));
             }
-            WatInstr::Loop { label, instrs: inner } => {
+            WatInstr::Loop {
+                label,
+                instrs: inner,
+            } => {
                 out.push_str(&format!("{pad}loop {}\n", label.as_deref().unwrap_or("")));
                 render_instrs(inner, indent + 1, out);
                 out.push_str(&format!("{pad}end\n"));
@@ -1133,7 +1142,10 @@ mod tests {
         assert!(wat.contains("\n    if\n"), "expected `if` block:\n{wat}");
         assert!(wat.contains("else"), "expected `else`:\n{wat}");
         assert!(wat.contains("end"), "expected `end`:\n{wat}");
-        assert!(wat.contains("f64.gt"), "expected f64.gt (no signed suffix):\n{wat}");
+        assert!(
+            wat.contains("f64.gt"),
+            "expected f64.gt (no signed suffix):\n{wat}"
+        );
         assert!(
             !warnings.iter().any(|w| w.contains("if/else not fully")),
             "if/else should be implemented: {warnings:?}"
@@ -1146,9 +1158,18 @@ mod tests {
             pblang_core::parse("fn f(n) { let i = 0; while i < n { i = i + 1; } return i; }")
                 .unwrap();
         let (wat, warnings) = compile_to_wat(stmts).unwrap();
-        assert!(wat.contains("loop $while_start"), "expected loop label:\n{wat}");
-        assert!(wat.contains("block $while_end"), "expected block label:\n{wat}");
-        assert!(wat.contains("br $while_start"), "expected back-edge br:\n{wat}");
+        assert!(
+            wat.contains("loop $while_start"),
+            "expected loop label:\n{wat}"
+        );
+        assert!(
+            wat.contains("block $while_end"),
+            "expected block label:\n{wat}"
+        );
+        assert!(
+            wat.contains("br $while_start"),
+            "expected back-edge br:\n{wat}"
+        );
         assert!(wat.contains("f64.lt"), "expected f64.lt:\n{wat}");
         assert!(
             !warnings.iter().any(|w| w.contains("while not fully")),
@@ -1162,7 +1183,10 @@ mod tests {
             pblang_core::parse("fn f() { let s = 0; for i 10 { s = s + i; } return s; }").unwrap();
         let (wat, warnings) = compile_to_wat(stmts).unwrap();
         assert!(wat.contains("loop $for_start"), "expected for loop:\n{wat}");
-        assert!(wat.contains("f64.ge"), "expected f64.ge bound check:\n{wat}");
+        assert!(
+            wat.contains("f64.ge"),
+            "expected f64.ge bound check:\n{wat}"
+        );
         assert!(wat.contains("f64.add"), "expected increment add:\n{wat}");
         assert!(
             !warnings.iter().any(|w| w.contains("for not fully")),
@@ -1191,7 +1215,10 @@ mod tests {
             and_wat.contains("if (result f64)"),
             "and should lower to a result-typed if:\n{and_wat}"
         );
-        assert!(and_wat.contains("else"), "and needs an else branch:\n{and_wat}");
+        assert!(
+            and_wat.contains("else"),
+            "and needs an else branch:\n{and_wat}"
+        );
         // `a or b` => if (result f64) { 1 } else { truthy(b) }
         let or_wat = compile_to_wat(pblang_core::parse("fn f(a, b) { return a or b; }").unwrap())
             .unwrap()
@@ -1253,35 +1280,50 @@ mod tests {
         let stmts = pblang_core::parse("fn f(x) { print f\"val={x}!\"; }").unwrap();
         let (wat, _) = compile_to_wat(stmts).unwrap();
         // literal segments via string print, interpolation via f64 print
-        assert!(wat.contains("call $pblang_print\n") || wat.contains("call $pblang_print"), "string parts:\n{wat}");
-        assert!(wat.contains("call $pblang_print_f64"), "interp via f64:\n{wat}");
+        assert!(
+            wat.contains("call $pblang_print\n") || wat.contains("call $pblang_print"),
+            "string parts:\n{wat}"
+        );
+        assert!(
+            wat.contains("call $pblang_print_f64"),
+            "interp via f64:\n{wat}"
+        );
     }
 
     #[test]
     fn wasm_repeated_local_declared_once() {
         // A shadowed/re-declared `let x` must emit only one `(local $x f64)`
         // (WASM locals are function-flat); duplicates would be invalid WAT.
-        let stmts = pblang_core::parse(
-            "fn f() { let x = 1; { let x = 2; } let x = 3; return x; }",
-        )
-        .unwrap();
+        let stmts = pblang_core::parse("fn f() { let x = 1; { let x = 2; } let x = 3; return x; }")
+            .unwrap();
         let (wat, _) = compile_to_wat(stmts).unwrap();
         let count = wat.matches("(local $x f64)").count();
-        assert_eq!(count, 1, "expected exactly one (local $x f64), got {count}:\n{wat}");
+        assert_eq!(
+            count, 1,
+            "expected exactly one (local $x f64), got {count}:\n{wat}"
+        );
     }
 
     #[test]
     fn wasm_identifiers_carry_dollar_sigil() {
-        let stmts =
-            pblang_core::parse("fn add(a, b) { let s = a + b; return s; }").unwrap();
+        let stmts = pblang_core::parse("fn add(a, b) { let s = a + b; return s; }").unwrap();
         let (wat, _) = compile_to_wat(stmts).unwrap();
-        assert!(wat.contains("(func $add"), "func name needs $ sigil:\n{wat}");
-        assert!(wat.contains("(param $a f64)"), "params declared+sigiled:\n{wat}");
+        assert!(
+            wat.contains("(func $add"),
+            "func name needs $ sigil:\n{wat}"
+        );
+        assert!(
+            wat.contains("(param $a f64)"),
+            "params declared+sigiled:\n{wat}"
+        );
         assert!(wat.contains("(local $s f64)"), "locals sigiled:\n{wat}");
         assert!(wat.contains("local.get $a"), "local.get sigiled:\n{wat}");
         assert!(wat.contains("(memory $memory"), "memory sigiled:\n{wat}");
         // No bare (unsigiled) identifier forms should remain.
-        assert!(!wat.contains("local.get a\n"), "found unsigiled local.get:\n{wat}");
+        assert!(
+            !wat.contains("local.get a\n"),
+            "found unsigiled local.get:\n{wat}"
+        );
         assert!(!wat.contains("(func add "), "found unsigiled func:\n{wat}");
     }
 

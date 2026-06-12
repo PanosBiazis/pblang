@@ -170,8 +170,7 @@ pub(super) fn quantum_simulate_builtin(
         let n = match r.get("n_qubits") {
             Some(Value::Number(n)) if *n >= 0.0 => *n as usize,
             _ => {
-                return Err(host
-                    .err("quantum_simulate(): circuit missing 'n_qubits' number".into()))
+                return Err(host.err("quantum_simulate(): circuit missing 'n_qubits' number".into()))
             }
         };
         let ops = r
@@ -207,25 +206,24 @@ pub(super) fn quantum_simulate_builtin(
                 Obj::String(s) => s.to_uppercase(),
                 _ => return Err(host.err("quantum_simulate(): 'gate' must be a string".into())),
             },
-            _ => {
-                return Err(host.err("quantum_simulate(): op missing 'gate' string".into()))
-            }
+            _ => return Err(host.err("quantum_simulate(): op missing 'gate' string".into())),
         };
         let qubits_v = r
             .get("qubits")
             .cloned()
             .ok_or_else(|| host.err("quantum_simulate(): op missing 'qubits'".into()))?;
         let qubits: Vec<usize> = match qubits_v {
-            Value::Array(a) => a
-                .borrow()
-                .iter()
-                .map(|v| match v {
-                    Value::Number(n) if *n >= 0.0 => Ok(*n as usize),
-                    _ => Err(host.err(
-                        "quantum_simulate(): qubits must be non-negative integers".into(),
-                    )),
-                })
-                .collect::<Result<_, _>>()?,
+            Value::Array(a) => {
+                a.borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Value::Number(n) if *n >= 0.0 => Ok(*n as usize),
+                        _ => Err(host.err(
+                            "quantum_simulate(): qubits must be non-negative integers".into(),
+                        )),
+                    })
+                    .collect::<Result<_, _>>()?
+            }
             _ => return Err(host.err("quantum_simulate(): qubits must be an array".into())),
         };
         let theta = match r.get("theta") {
@@ -303,8 +301,7 @@ pub(super) fn apply_quantum_gate(
                 return Err(host.err(format!("{gate}: expected 1 qubit")));
             }
             let q = qubits[0];
-            let t = theta
-                .ok_or_else(|| host.err(format!("{gate}: missing 'theta' parameter")))?;
+            let t = theta.ok_or_else(|| host.err(format!("{gate}: missing 'theta' parameter")))?;
             apply_1q_gate(gate, q, n, re, im, Some(t));
             Ok(())
         }

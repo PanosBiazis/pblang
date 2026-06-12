@@ -24,7 +24,10 @@ use super::alloc_array;
 // Base64
 // -------------------------------------------------------------------------
 
-pub(super) fn base64_encode(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn base64_encode(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(
             "base64_encode() expects 1 argument, got {}",
@@ -65,9 +68,7 @@ pub(super) fn base64_encode_bytes(
             Value::Number(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 => {
                 bytes.push(*n as u8);
             }
-            _ => {
-                return Err(host.err("base64_encode_bytes(): expected byte numbers 0..255".into()))
-            }
+            _ => return Err(host.err("base64_encode_bytes(): expected byte numbers 0..255".into())),
         }
     }
     Ok(alloc_string(base64::Engine::encode(
@@ -76,7 +77,10 @@ pub(super) fn base64_encode_bytes(
     )))
 }
 
-pub(super) fn base64_decode(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn base64_decode(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(
             "base64_decode() expects 1 argument, got {}",

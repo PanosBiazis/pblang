@@ -32,9 +32,7 @@ const VALID_CORPUS: &[(&str, &str)] = &[
 
 /// Snippets that should be rejected by both implementations as
 /// syntactically malformed.
-const INVALID_CORPUS: &[(&str, &str)] = &[
-    ("assignment_missing_rhs", "let x = ;"),
-];
+const INVALID_CORPUS: &[(&str, &str)] = &[("assignment_missing_rhs", "let x = ;")];
 
 #[test]
 fn selfhost_drift_smoke_baseline() {
@@ -323,10 +321,22 @@ fn selfhost_drift_executes_compiled_bytecode() {
     "#;
     let out = run_collect(src);
     assert_eq!(out[0], pblang_vm::Value::Number(3.0), "arithmetic");
-    assert_eq!(out[1], pblang_vm::Value::Number(14.0), "operator precedence");
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(14.0),
+        "operator precedence"
+    );
     assert_eq!(out[2], pblang_vm::Value::Bool(true), "comparison");
-    assert_eq!(out[3], pblang_vm::Value::Number(100.0), "if/else branch selection");
-    assert_eq!(out[4], pblang_vm::Value::Number(10.0), "while-loop accumulation");
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(100.0),
+        "if/else branch selection"
+    );
+    assert_eq!(
+        out[4],
+        pblang_vm::Value::Number(10.0),
+        "while-loop accumulation"
+    );
     assert_eq!(out[5], pblang_vm::Value::Number(7.0), "function call");
     assert_eq!(out[6], pblang_vm::Value::Number(55.0), "recursion (fib 10)");
 }
@@ -370,10 +380,18 @@ fn selfhost_drift_executes_arrays_and_maps() {
     "#;
     let out = run_collect(src);
     assert_eq!(out[0], pblang_vm::Value::Number(20.0), "array index");
-    assert_eq!(out[1], pblang_vm::Value::Number(14.0), "array sum via for+index");
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(14.0),
+        "array sum via for+index"
+    );
     assert_eq!(out[2], pblang_vm::Value::Number(16.0), "map member access");
     assert_eq!(out[3], pblang_vm::Value::Number(8.0), "map string index");
-    assert_eq!(out[4], pblang_vm::Value::Number(3.0), "chained index + member");
+    assert_eq!(
+        out[4],
+        pblang_vm::Value::Number(3.0),
+        "chained index + member"
+    );
 }
 
 /// `for x in <iterable>` (including nested) and host builtin calls (`len`,
@@ -393,8 +411,16 @@ fn selfhost_drift_executes_forin_and_builtins() {
         print g("let u = str_upper(\"hi\");", "u");                                                  // HI
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(14.0), "for-in sum of squares");
-    assert_eq!(out[1], pblang_vm::Value::Number(9.0), "array_push in for-in + index");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(14.0),
+        "for-in sum of squares"
+    );
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(9.0),
+        "array_push in for-in + index"
+    );
     assert_eq!(out[2], pblang_vm::Value::Number(10.0), "nested for-in");
     assert_eq!(out[3], pblang_vm::Value::Number(3.0), "len() builtin");
     assert_eq!(out[4], pblang_vm::Value::Number(4.0), "str_split + len");
@@ -419,12 +445,24 @@ fn selfhost_drift_executes_logical_ops() {
     "#;
     let out = run_collect(src);
     assert_eq!(out[0], pblang_vm::Value::Number(1.0), "and true");
-    assert_eq!(out[1], pblang_vm::Value::Number(0.0), "and short-circuit false");
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(0.0),
+        "and short-circuit false"
+    );
     assert_eq!(out[2], pblang_vm::Value::Number(1.0), "or true");
     assert_eq!(out[3], pblang_vm::Value::Number(1.0), "not");
     assert_eq!(out[4], pblang_vm::Value::Bool(true), "real boolean literal");
-    assert_eq!(out[5], pblang_vm::Value::Number(99.0), "short-circuit guard");
-    assert_eq!(out[6], pblang_vm::Value::Number(7.0), "nested and/or grouping");
+    assert_eq!(
+        out[5],
+        pblang_vm::Value::Number(99.0),
+        "short-circuit guard"
+    );
+    assert_eq!(
+        out[6],
+        pblang_vm::Value::Number(7.0),
+        "nested and/or grouping"
+    );
 }
 
 /// Index/member assignment (`a[i] = v`, `m.k = v`, nested `a[0].n = v`) and
@@ -443,11 +481,31 @@ fn selfhost_drift_executes_index_member_assignment() {
         print g("let m = map{ \"x\": 5, \"y\": 6, }; let v = m[\"y\"];", "v");                        // 6 (string keys + trailing comma)
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(99.0), "array index assignment");
-    assert_eq!(out[1], pblang_vm::Value::Number(42.0), "map member assignment");
-    assert_eq!(out[2], pblang_vm::Value::Number(7.0), "nested lvalue assignment");
-    assert_eq!(out[3], pblang_vm::Value::Number(20.0), "in-loop element mutation");
-    assert_eq!(out[4], pblang_vm::Value::Number(6.0), "map string keys + trailing comma");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(99.0),
+        "array index assignment"
+    );
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(42.0),
+        "map member assignment"
+    );
+    assert_eq!(
+        out[2],
+        pblang_vm::Value::Number(7.0),
+        "nested lvalue assignment"
+    );
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(20.0),
+        "in-loop element mutation"
+    );
+    assert_eq!(
+        out[4],
+        pblang_vm::Value::Number(6.0),
+        "map string keys + trailing comma"
+    );
 }
 
 /// `else if` chains and loop control (`break`/`continue` in while, for-count, and
@@ -489,8 +547,16 @@ fn selfhost_drift_executes_try_catch() {
     let out = run_collect(src);
     assert_eq!(out[0], pblang_vm::Value::Number(-1.0), "catch array OOB");
     assert_eq!(out[1], pblang_vm::Value::Number(2.0), "body succeeds");
-    assert_eq!(out[2], pblang_vm::Value::Number(0.0), "catch missing map key");
-    assert_eq!(out[3], pblang_vm::Value::Number(42.0), "catch explicit error()");
+    assert_eq!(
+        out[2],
+        pblang_vm::Value::Number(0.0),
+        "catch missing map key"
+    );
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(42.0),
+        "catch explicit error()"
+    );
     assert_eq!(out[4], pblang_vm::Value::Number(7.0), "nested try/catch");
 }
 
@@ -509,10 +575,26 @@ fn selfhost_drift_module_level_globals() {
         print g("let a = [3, 1, 4]; fn first() { return a[0]; } let r = first();", "r");               // 3
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(100.0), "function reads module global");
-    assert_eq!(out[1], pblang_vm::Value::Number(9.0), "function reads module map constant");
-    assert_eq!(out[2], pblang_vm::Value::Number(15.0), "function reads module const");
-    assert_eq!(out[3], pblang_vm::Value::Number(3.0), "function reads module array");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(100.0),
+        "function reads module global"
+    );
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(9.0),
+        "function reads module map constant"
+    );
+    assert_eq!(
+        out[2],
+        pblang_vm::Value::Number(15.0),
+        "function reads module const"
+    );
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(3.0),
+        "function reads module array"
+    );
 }
 
 /// A realistic multi-function "module" running entirely through the self-hosted
@@ -540,7 +622,11 @@ fn selfhost_drift_runs_multifunction_module() {
         prog.replace('\\', "\\\\").replace('"', "\\\"")
     );
     let out = run_collect(&src);
-    assert_eq!(out[0], pblang_vm::Value::Number(4.0), "count_digits via module constant + builtin");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(4.0),
+        "count_digits via module constant + builtin"
+    );
     assert_eq!(out[1], pblang_vm::Value::Number(15.0), "sum_to while loop");
     assert_eq!(out[2], pblang_vm::Value::Number(415.0), "composed result");
 }
@@ -607,12 +693,36 @@ fn selfhost_drift_executes_if_expressions() {
         print g("let n = 3; let v = if n > 0 { let d = n * 2; d + 1 } else { 0 };", "v");                   // 7
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(100.0), "if-expr true branch");
-    assert_eq!(out[1], pblang_vm::Value::Number(200.0), "if-expr false branch");
-    assert_eq!(out[2], pblang_vm::Value::Number(3.0), "if-expr else-if chain");
-    assert_eq!(out[3], pblang_vm::Value::Number(20.0), "if-expr as function return");
-    assert_eq!(out[4], pblang_vm::Value::Number(5.0), "typeck-style nil guard");
-    assert_eq!(out[5], pblang_vm::Value::Number(7.0), "branch block: stmt then final expr");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(100.0),
+        "if-expr true branch"
+    );
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(200.0),
+        "if-expr false branch"
+    );
+    assert_eq!(
+        out[2],
+        pblang_vm::Value::Number(3.0),
+        "if-expr else-if chain"
+    );
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(20.0),
+        "if-expr as function return"
+    );
+    assert_eq!(
+        out[4],
+        pblang_vm::Value::Number(5.0),
+        "typeck-style nil guard"
+    );
+    assert_eq!(
+        out[5],
+        pblang_vm::Value::Number(7.0),
+        "branch block: stmt then final expr"
+    );
 }
 
 /// `let len = len(s)` — a local shadowing a builtin *in its own initializer*. The
@@ -630,7 +740,11 @@ fn selfhost_drift_let_shadows_builtin_in_initializer() {
         print g("fn dbl(x) { let str = str(x); return str + str; } let r = dbl(7);", "r");
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(5.0), "let len = len(s) resolves the builtin in the initializer");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(5.0),
+        "let len = len(s) resolves the builtin in the initializer"
+    );
     assert_eq!(out[1].as_str().unwrap(), "77", "let str = str(x) shadowing");
 }
 
@@ -680,7 +794,11 @@ fn selfhost_parses_pblang_end_to_end() {
         print r.globals["_fname"];
     "#;
     let out = run_collect_with_config(cfg, src);
-    assert_eq!(out[0], pblang_vm::Value::Number(2.0), "two top-level statements");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(2.0),
+        "two top-level statements"
+    );
     assert_eq!(out[1].as_str().unwrap(), "let", "stmt 0 is a let");
     assert_eq!(out[2].as_str().unwrap(), "fn", "stmt 1 is a fn");
     assert_eq!(out[3].as_str().unwrap(), "add", "fn name parsed");
@@ -697,7 +815,11 @@ fn selfhost_drift_executes_for_range() {
     "#;
     let out = run_collect(src);
     assert_eq!(out[0], pblang_vm::Value::Number(15.0), "for-range sum 1..5");
-    assert_eq!(out[1], pblang_vm::Value::Number(24.0), "for-range product 2..4");
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(24.0),
+        "for-range product 2..4"
+    );
 }
 
 /// Stage 3: pblang COMPILES pblang. Reads tokenizer + parser + codegen and runs
@@ -717,8 +839,11 @@ fn selfhost_compiles_pblang_to_bytecode() {
         print r.globals["_ni"];
     "#;
     let out = run_collect_with_config(cfg, src);
-    assert!(matches!(out[0], pblang_vm::Value::Number(n) if n >= 6.0),
-        "self-hosted codegen emitted bytecode, got {:?}", out[0]);
+    assert!(
+        matches!(out[0], pblang_vm::Value::Number(n) if n >= 6.0),
+        "self-hosted codegen emitted bytecode, got {:?}",
+        out[0]
+    );
 }
 
 /// THE crown-jewel milestone: pblang COMPILES AND RUNS pblang. The entire
@@ -740,8 +865,11 @@ fn selfhost_compiles_and_runs_pblang_end_to_end() {
         print r.globals["_answer"];
     "#;
     let out = run_collect_with_config(cfg, src);
-    assert_eq!(out[0], pblang_vm::Value::Number(42.0),
-        "the full pblang-written toolchain compiles and runs pblang: 6 * 7 = 42");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(42.0),
+        "the full pblang-written toolchain compiles and runs pblang: 6 * 7 = 42"
+    );
 }
 
 /// Default parameter values through the self-hosted compiler+VM: an omitted arg
@@ -765,8 +893,16 @@ fn selfhost_drift_executes_default_params() {
     assert_eq!(out[1], pblang_vm::Value::Number(13.0), "default overridden");
     assert_eq!(out[2].as_str().unwrap(), "Hi Bob", "string default");
     assert_eq!(out[3], pblang_vm::Value::Number(7.0), "nil default");
-    assert_eq!(out[4], pblang_vm::Value::Number(6.0), "two defaults, both omitted");
-    assert_eq!(out[5], pblang_vm::Value::Number(15.0), "two defaults, partial");
+    assert_eq!(
+        out[4],
+        pblang_vm::Value::Number(6.0),
+        "two defaults, both omitted"
+    );
+    assert_eq!(
+        out[5],
+        pblang_vm::Value::Number(15.0),
+        "two defaults, partial"
+    );
 }
 
 /// §40 follow-up: nil-safe operators through the self-hosted compiler+VM.
@@ -788,14 +924,38 @@ fn selfhost_drift_executes_nil_safe_operators() {
         print g("let a = nil; let r = a?[1];", "r");                  // nil
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(5.0), "?? falls through on nil");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(5.0),
+        "?? falls through on nil"
+    );
     assert_eq!(out[1], pblang_vm::Value::Number(7.0), "?? keeps non-nil");
-    assert_eq!(out[2], pblang_vm::Value::Bool(false), "?? keeps false (nil-only, not falsy)");
-    assert_eq!(out[3], pblang_vm::Value::Number(0.0), "?? keeps 0 (nil-only, not falsy)");
-    assert_eq!(out[4], pblang_vm::Value::Number(3.0), "?. reads member on non-nil");
+    assert_eq!(
+        out[2],
+        pblang_vm::Value::Bool(false),
+        "?? keeps false (nil-only, not falsy)"
+    );
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(0.0),
+        "?? keeps 0 (nil-only, not falsy)"
+    );
+    assert_eq!(
+        out[4],
+        pblang_vm::Value::Number(3.0),
+        "?. reads member on non-nil"
+    );
     assert_eq!(out[5], pblang_vm::Value::Nil, "?. short-circuits on nil");
-    assert_eq!(out[6], pblang_vm::Value::Nil, "?. chains short-circuit on nil");
-    assert_eq!(out[7], pblang_vm::Value::Number(20.0), "?[ indexes on non-nil");
+    assert_eq!(
+        out[6],
+        pblang_vm::Value::Nil,
+        "?. chains short-circuit on nil"
+    );
+    assert_eq!(
+        out[7],
+        pblang_vm::Value::Number(20.0),
+        "?[ indexes on non-nil"
+    );
     assert_eq!(out[8], pblang_vm::Value::Nil, "?[ short-circuits on nil");
 }
 
@@ -821,11 +981,23 @@ fn selfhost_drift_executes_match_expressions() {
     assert_eq!(out[0].as_str().unwrap(), "two", "literal number arm");
     assert_eq!(out[1].as_str().unwrap(), "other", "else fallthrough");
     assert_eq!(out[2], pblang_vm::Value::Nil, "no match, no else -> nil");
-    assert_eq!(out[3], pblang_vm::Value::Number(14.0), "bind pattern body sees scrutinee");
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(14.0),
+        "bind pattern body sees scrutinee"
+    );
     assert_eq!(out[4].as_str().unwrap(), "wild", "wildcard arm");
     assert_eq!(out[5], pblang_vm::Value::Number(2.0), "string literal arm");
-    assert_eq!(out[6].as_str().unwrap(), "big", "guarded bind matches when guard true");
-    assert_eq!(out[7].as_str().unwrap(), "small", "guarded bind falls through when guard false");
+    assert_eq!(
+        out[6].as_str().unwrap(),
+        "big",
+        "guarded bind matches when guard true"
+    );
+    assert_eq!(
+        out[7].as_str().unwrap(),
+        "small",
+        "guarded bind falls through when guard false"
+    );
     assert_eq!(out[8].as_str().unwrap(), "isnil", "nil literal arm");
 }
 
@@ -854,16 +1026,52 @@ fn selfhost_drift_executes_struct_enum() {
         print g("let m = map{ ff: fn(a) { return a * 2; } }; let r = m.ff(3);", "r");                            // 6
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(7.0), "struct field access + arithmetic");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(7.0),
+        "struct field access + arithmetic"
+    );
     assert_eq!(out[1].as_str().unwrap(), "Point", "struct __struct tag");
-    assert_eq!(out[2], pblang_vm::Value::Number(25.0), "struct passed to a function, fields read inside");
-    assert_eq!(out[3].as_str().unwrap(), "Green", "enum unit variant __variant");
-    assert_eq!(out[4].as_str().unwrap(), "Color", "enum unit variant __enum");
-    assert_eq!(out[5], pblang_vm::Value::Number(5.0), "enum data variant values[0]");
-    assert_eq!(out[6], pblang_vm::Value::Number(9.0), "enum data variant values[1]");
-    assert_eq!(out[7].as_str().unwrap(), "Rect", "enum data variant __variant");
-    assert_eq!(out[8], pblang_vm::Value::Number(1.0), "match on enum variant tag");
-    assert_eq!(out[9], pblang_vm::Value::Number(6.0), "fn_lit stored in a map, called via member (obj.f(args))");
+    assert_eq!(
+        out[2],
+        pblang_vm::Value::Number(25.0),
+        "struct passed to a function, fields read inside"
+    );
+    assert_eq!(
+        out[3].as_str().unwrap(),
+        "Green",
+        "enum unit variant __variant"
+    );
+    assert_eq!(
+        out[4].as_str().unwrap(),
+        "Color",
+        "enum unit variant __enum"
+    );
+    assert_eq!(
+        out[5],
+        pblang_vm::Value::Number(5.0),
+        "enum data variant values[0]"
+    );
+    assert_eq!(
+        out[6],
+        pblang_vm::Value::Number(9.0),
+        "enum data variant values[1]"
+    );
+    assert_eq!(
+        out[7].as_str().unwrap(),
+        "Rect",
+        "enum data variant __variant"
+    );
+    assert_eq!(
+        out[8],
+        pblang_vm::Value::Number(1.0),
+        "match on enum variant tag"
+    );
+    assert_eq!(
+        out[9],
+        pblang_vm::Value::Number(6.0),
+        "fn_lit stored in a map, called via member (obj.f(args))"
+    );
 }
 
 /// §44: `class` + colon-call (`obj:method(args)`) through the self-hosted
@@ -889,12 +1097,44 @@ fn selfhost_drift_executes_classes() {
         print g("class K { fn init(self, v) { self.v = v; } fn val(self) { return self.v; } } let k = K:new(3); let r = k.__class.__class_name;", "r");  // K
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0], pblang_vm::Value::Number(5.0), "init stores field, method reads it");
-    assert_eq!(out[1], pblang_vm::Value::Number(3.0), "mutating method across multiple colon-calls");
-    assert_eq!(out[2], pblang_vm::Value::Number(17.0), "method with an argument");
-    assert_eq!(out[3], pblang_vm::Value::Number(7.0), "multi-field init + field access");
-    assert_eq!(out[4].as_str().unwrap(), "hi bob", "no-init class, manual field set, method dispatch");
-    assert_eq!(out[5], pblang_vm::Value::Number(20.0), "method calls another method via self:m()");
-    assert_eq!(out[6], pblang_vm::Value::Number(9.0), "colon-call result used in arithmetic");
-    assert_eq!(out[7].as_str().unwrap(), "K", "instance __class points at the class table");
+    assert_eq!(
+        out[0],
+        pblang_vm::Value::Number(5.0),
+        "init stores field, method reads it"
+    );
+    assert_eq!(
+        out[1],
+        pblang_vm::Value::Number(3.0),
+        "mutating method across multiple colon-calls"
+    );
+    assert_eq!(
+        out[2],
+        pblang_vm::Value::Number(17.0),
+        "method with an argument"
+    );
+    assert_eq!(
+        out[3],
+        pblang_vm::Value::Number(7.0),
+        "multi-field init + field access"
+    );
+    assert_eq!(
+        out[4].as_str().unwrap(),
+        "hi bob",
+        "no-init class, manual field set, method dispatch"
+    );
+    assert_eq!(
+        out[5],
+        pblang_vm::Value::Number(20.0),
+        "method calls another method via self:m()"
+    );
+    assert_eq!(
+        out[6],
+        pblang_vm::Value::Number(9.0),
+        "colon-call result used in arithmetic"
+    );
+    assert_eq!(
+        out[7].as_str().unwrap(),
+        "K",
+        "instance __class points at the class table"
+    );
 }
