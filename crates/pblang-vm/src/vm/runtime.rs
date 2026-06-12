@@ -27,7 +27,10 @@ use pblang_ir::{alloc_string, string_alloc_count, Obj, RuntimeError, Value, VmHo
 use super::errors::vm_cap;
 use super::{alloc_map, ARRAY_ALLOCS, MAP_ALLOCS, MODULE_ALLOCS, VM};
 
-pub(super) fn proc_spawn_wait(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn proc_spawn_wait(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
         return Err(vm_cap!(host, "proc_spawn_wait", "exec"));
     }
@@ -147,8 +150,8 @@ pub(super) fn exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
         .as_str()
         .map_err(|m| host.err(format!("exec(): {m}")))?;
     let blocked: &[char] = &[
-        ';', '&', '|', '$', '`', '>', '<', '!', '{', '}', '(', ')', '\'', '"', '\\', '*',
-        '?', '[', ']', '#', '~',
+        ';', '&', '|', '$', '`', '>', '<', '!', '{', '}', '(', ')', '\'', '"', '\\', '*', '?', '[',
+        ']', '#', '~',
     ];
     if cmd
         .chars()
@@ -189,7 +192,10 @@ pub(super) fn gc_stats(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
 
 /// assert(cond) or assert(cond, msg) — Rust-style debug assertion.
 /// Throws RuntimeError if cond is falsy.
-pub(super) fn assert_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn assert_builtin(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.is_empty() {
         return Err(host.err("assert() requires at least 1 argument".into()));
     }

@@ -104,7 +104,10 @@ pub(super) fn json_parse(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
     Ok(json_to_value(&v))
 }
 
-pub(super) fn json_stringify(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn json_stringify(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(
             "json_stringify() expects 1 argument, got {}",

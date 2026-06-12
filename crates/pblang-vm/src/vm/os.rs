@@ -34,7 +34,10 @@ pub(super) fn os_args_builtin(
     Ok(alloc_array(argv))
 }
 
-pub(super) fn os_exit_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn os_exit_builtin(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!("os_exit() expects 1 argument, got {}", args.len())));
     }

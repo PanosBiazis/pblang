@@ -238,7 +238,10 @@ pub(super) fn array_chunk(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Val
 }
 
 /// array_flatten(arr) → flattens one level of nesting
-pub(super) fn array_flatten(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn array_flatten(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err("array_flatten(arr) expects 1 argument".into()));
     }

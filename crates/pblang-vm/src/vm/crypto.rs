@@ -27,7 +27,10 @@ pub(super) fn sha256(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
     Ok(alloc_string(hex::encode(digest)))
 }
 
-pub(super) fn constant_time_eq(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn constant_time_eq(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 2 {
         return Err(host.err(format!(
             "constant_time_eq() expects 2 arguments, got {}",

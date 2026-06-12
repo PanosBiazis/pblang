@@ -1130,9 +1130,7 @@ impl Value {
                         }
                         x / y
                     }
-                    ArithOp::Mod => {
-                        return Err("modulo (%) is not defined for rationals".into())
-                    }
+                    ArithOp::Mod => return Err("modulo (%) is not defined for rationals".into()),
                     ArithOp::Pow => {
                         // exponent must be an integer (a^(p/q) is generally irrational)
                         let exp = other

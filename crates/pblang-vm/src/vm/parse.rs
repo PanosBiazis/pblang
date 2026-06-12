@@ -52,7 +52,10 @@ pub(super) fn parse_bool(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
     }
 }
 
-pub(super) fn parse_sse_line(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn parse_sse_line(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(
             "parse_sse_line() expects 1 argument, got {}",

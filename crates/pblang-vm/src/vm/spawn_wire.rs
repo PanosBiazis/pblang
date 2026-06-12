@@ -179,9 +179,7 @@ pub(super) fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
             }
             Ok(SpawnWireValue::Module { globals, exports })
         }
-        _ => Err(
-            "spawn: value not transferable (unsupported: builtin/resource handle)".into(),
-        ),
+        _ => Err("spawn: value not transferable (unsupported: builtin/resource handle)".into()),
     }
 }
 

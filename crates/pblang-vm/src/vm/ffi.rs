@@ -62,8 +62,7 @@ pub(super) fn ffi_load(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
     // (defaults deny everything), and the whole builtin is gated by
     // `host.allow_ffi()`. The returned Library is owned by the FFI
     // table; drop = unload.
-    let lib =
-        unsafe { Library::new(path) }.map_err(|e| host.err(format!("ffi_load(): {e}")))?;
+    let lib = unsafe { Library::new(path) }.map_err(|e| host.err(format!("ffi_load(): {e}")))?;
     let id = with_ffi_table(host, |t| {
         let id = FFI_NEXT.fetch_add(1, Ordering::Relaxed);
         t.insert(id, FfiResource::Library(lib));
@@ -147,25 +146,21 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
                         f(nums[0])
                     }
                     2 => {
-                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
-                            lib.get(sym.as_bytes())
-                                .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> = lib
+                            .get(sym.as_bytes())
+                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
                         f(nums[0], nums[1])
                     }
                     3 => {
-                        let f: libloading::Symbol<
-                            unsafe extern "C" fn(f64, f64, f64) -> f64,
-                        > = lib
+                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64) -> f64> = lib
                             .get(sym.as_bytes())
                             .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
                         f(nums[0], nums[1], nums[2])
                     }
                     4 => {
-                        let f: libloading::Symbol<
-                            unsafe extern "C" fn(f64, f64, f64, f64) -> f64,
-                        > = lib
-                            .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64, f64) -> f64> =
+                            lib.get(sym.as_bytes())
+                                .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
                         f(nums[0], nums[1], nums[2], nums[3])
                     }
                     5 => {
@@ -185,12 +180,8 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
                         f(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5])
                     }
                     n => {
-                        let _ = with_ffi_table(host, |t| {
-                            t.insert(id, FfiResource::Library(lib))
-                        });
-                        return Err(
-                            host.err(format!("ffi_call(): too many args ({}), max 6", n))
-                        );
+                        let _ = with_ffi_table(host, |t| t.insert(id, FfiResource::Library(lib)));
+                        return Err(host.err(format!("ffi_call(): too many args ({}), max 6", n)));
                     }
                 }
             };
@@ -297,9 +288,7 @@ pub(super) fn ffi_call_typed_builtin(
                 a_f64[i] = match v {
                     Value::Number(n) => *n,
                     _ => {
-                        return Err(
-                            host.err(format!("ffi_call_typed(): arg[{i}] expected number"))
-                        )
+                        return Err(host.err(format!("ffi_call_typed(): arg[{i}] expected number")))
                     }
                 };
             }
@@ -313,11 +302,7 @@ pub(super) fn ffi_call_typed_builtin(
                 a_ptr[i] = c.as_ptr();
                 c_strings.push(c);
             }
-            _ => {
-                return Err(
-                    host.err(format!("ffi_call_typed(): unsupported arg type '{ty}'"))
-                )
-            }
+            _ => return Err(host.err(format!("ffi_call_typed(): unsupported arg type '{ty}'"))),
         }
     }
 

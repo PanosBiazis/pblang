@@ -30,17 +30,16 @@ pub(super) fn onnx_infer(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
         return Err(vm_cap!(host, "onnx_infer", "exec"));
     }
     if args.is_empty() {
-        return Err(
-            host.err("onnx_infer() expects at least 1 argument (model_path)".into())
-        );
+        return Err(host.err("onnx_infer() expects at least 1 argument (model_path)".into()));
     }
     let model_path = args[0]
         .as_str()
         .map_err(|m| host.err(format!("onnx_infer(): {m}")))?;
     let input = if args.len() >= 2 {
         match &args[1] {
-            Value::Obj(_) | Value::Array(_) | Value::Map(_) => value_to_json(&args[1])
-                .map_err(|m| host.err(format!("onnx_infer(): {m}")))?,
+            Value::Obj(_) | Value::Array(_) | Value::Map(_) => {
+                value_to_json(&args[1]).map_err(|m| host.err(format!("onnx_infer(): {m}")))?
+            }
             _ => {
                 let s = args[1]
                     .as_str()
@@ -57,8 +56,9 @@ pub(super) fn onnx_infer(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
     };
     let options = if args.len() >= 3 {
         match &args[2] {
-            Value::Obj(_) | Value::Array(_) | Value::Map(_) => value_to_json(&args[2])
-                .map_err(|m| host.err(format!("onnx_infer(): {m}")))?,
+            Value::Obj(_) | Value::Array(_) | Value::Map(_) => {
+                value_to_json(&args[2]).map_err(|m| host.err(format!("onnx_infer(): {m}")))?
+            }
             _ => {
                 let s = args[2]
                     .as_str()
@@ -192,9 +192,9 @@ except Exception as e:
 
         if let Some(stdin) = child.stdin.as_mut() {
             use std::io::Write;
-            stdin.write_all(payload.as_bytes()).map_err(|e| {
-                host.err(format!("onnx_infer(): write bridge payload: {e}"))
-            })?;
+            stdin
+                .write_all(payload.as_bytes())
+                .map_err(|e| host.err(format!("onnx_infer(): write bridge payload: {e}")))?;
         }
         let output = child
             .wait_with_output()
@@ -246,41 +246,40 @@ pub(super) fn ai_chat(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, 
     let mut registry = pblang_ai::ProviderRegistry::new();
     registry.auto_register();
 
-    let options: pblang_ai::ChatOptions =
-        if options_str.trim().is_empty() || options_str == "{}" {
-            pblang_ai::ChatOptions::default()
-        } else {
-            // Cap the options payload; ai_chat is a network-fronted
-            // builtin and options often come from user-controlled
-            // strings derived from external sources.
-            let cap = host.max_external_json_bytes();
-            if options_str.len() > cap {
-                return Err(host.err(format!(
-                    "ai_chat(): options JSON of {} bytes exceeds cap of {} bytes",
-                    options_str.len(),
-                    cap
-                )));
-            }
-            let v: serde_json::Value = serde_json::from_str(options_str)
-                .map_err(|e| host.err(format!("ai_chat(): invalid options JSON: {e}")))?;
-            let mut opts = pblang_ai::ChatOptions::default();
-            if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
-                opts.provider = Some(p.to_string());
-            }
-            if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
-                opts.model = Some(m.to_string());
-            }
-            if let Some(s) = v.get("system_prompt").and_then(|x| x.as_str()) {
-                opts.system_prompt = Some(s.to_string());
-            }
-            if let Some(t) = v.get("temperature").and_then(|x| x.as_f64()) {
-                opts.temperature = Some(t);
-            }
-            if let Some(mt) = v.get("max_tokens").and_then(|x| x.as_u64()) {
-                opts.max_tokens = Some(mt as u32);
-            }
-            opts
-        };
+    let options: pblang_ai::ChatOptions = if options_str.trim().is_empty() || options_str == "{}" {
+        pblang_ai::ChatOptions::default()
+    } else {
+        // Cap the options payload; ai_chat is a network-fronted
+        // builtin and options often come from user-controlled
+        // strings derived from external sources.
+        let cap = host.max_external_json_bytes();
+        if options_str.len() > cap {
+            return Err(host.err(format!(
+                "ai_chat(): options JSON of {} bytes exceeds cap of {} bytes",
+                options_str.len(),
+                cap
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_str(options_str)
+            .map_err(|e| host.err(format!("ai_chat(): invalid options JSON: {e}")))?;
+        let mut opts = pblang_ai::ChatOptions::default();
+        if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
+            opts.provider = Some(p.to_string());
+        }
+        if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+            opts.model = Some(m.to_string());
+        }
+        if let Some(s) = v.get("system_prompt").and_then(|x| x.as_str()) {
+            opts.system_prompt = Some(s.to_string());
+        }
+        if let Some(t) = v.get("temperature").and_then(|x| x.as_f64()) {
+            opts.temperature = Some(t);
+        }
+        if let Some(mt) = v.get("max_tokens").and_then(|x| x.as_u64()) {
+            opts.max_tokens = Some(mt as u32);
+        }
+        opts
+    };
 
     match pblang_ai::chat(prompt, &options, &registry) {
         Ok(resp) => {
@@ -313,21 +312,20 @@ pub(super) fn ai_embed(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
     let mut registry = pblang_ai::ProviderRegistry::new();
     registry.auto_register();
 
-    let options: pblang_ai::ChatOptions =
-        if options_str.trim().is_empty() || options_str == "{}" {
-            pblang_ai::ChatOptions::default()
-        } else {
-            let v: serde_json::Value = serde_json::from_str(options_str)
-                .map_err(|e| host.err(format!("ai_embed(): invalid options JSON: {e}")))?;
-            let mut opts = pblang_ai::ChatOptions::default();
-            if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
-                opts.provider = Some(p.to_string());
-            }
-            if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
-                opts.model = Some(m.to_string());
-            }
-            opts
-        };
+    let options: pblang_ai::ChatOptions = if options_str.trim().is_empty() || options_str == "{}" {
+        pblang_ai::ChatOptions::default()
+    } else {
+        let v: serde_json::Value = serde_json::from_str(options_str)
+            .map_err(|e| host.err(format!("ai_embed(): invalid options JSON: {e}")))?;
+        let mut opts = pblang_ai::ChatOptions::default();
+        if let Some(p) = v.get("provider").and_then(|x| x.as_str()) {
+            opts.provider = Some(p.to_string());
+        }
+        if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
+            opts.model = Some(m.to_string());
+        }
+        opts
+    };
 
     match pblang_ai::embed(text, &options, &registry) {
         Ok(resp) => {
@@ -339,7 +337,10 @@ pub(super) fn ai_embed(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
 }
 
 /// ai_token_count(text) — Estimate token count for text.
-pub(super) fn ai_token_count(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn ai_token_count(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!(
             "ai_token_count() expects 1 argument, got {}",

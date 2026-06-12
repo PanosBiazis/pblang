@@ -178,7 +178,10 @@ fn check_via_pblang_uses_self_hosted_frontend() {
         .output()
         .expect("run --check --via-pblang");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "self-hosted check should succeed: {stdout}");
+    assert!(
+        out.status.success(),
+        "self-hosted check should succeed: {stdout}"
+    );
     assert!(
         stdout.contains("self-hosted check ok"),
         "expected self-hosted frontend output, got: {stdout}"

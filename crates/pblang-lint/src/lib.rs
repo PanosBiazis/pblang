@@ -400,10 +400,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<LintDiagnostic>) {
                 walk_expr(e, out);
             }
         }
-        StmtKind::Import(_)
-        | StmtKind::Export(_)
-        | StmtKind::Break
-        | StmtKind::Continue => {}
+        StmtKind::Import(_) | StmtKind::Export(_) | StmtKind::Break | StmtKind::Continue => {}
     }
 }
 
@@ -462,14 +459,26 @@ mod tests {
 
     #[test]
     fn constant_condition_if() {
-        assert!(has_lint("fn f() { if true { print 1; } }", "constant_condition"));
-        assert!(has_lint("fn f() { if false { print 1; } }", "constant_condition"));
-        assert!(!has_lint("fn f() { if x { print 1; } }", "constant_condition"));
+        assert!(has_lint(
+            "fn f() { if true { print 1; } }",
+            "constant_condition"
+        ));
+        assert!(has_lint(
+            "fn f() { if false { print 1; } }",
+            "constant_condition"
+        ));
+        assert!(!has_lint(
+            "fn f() { if x { print 1; } }",
+            "constant_condition"
+        ));
     }
 
     #[test]
     fn constant_condition_while_false() {
-        assert!(has_lint("fn f() { while false { print 1; } }", "constant_condition"));
+        assert!(has_lint(
+            "fn f() { while false { print 1; } }",
+            "constant_condition"
+        ));
     }
 
     #[test]
@@ -513,6 +522,10 @@ mod tests {
     #[test]
     fn clean_code_has_no_lints() {
         let src = "fn add(a, b) { return a + b; }\nlet x = add(1, 2)\nif x > 0 { print x; }";
-        assert!(lints_of(src).is_empty(), "unexpected lints: {:?}", lints_of(src));
+        assert!(
+            lints_of(src).is_empty(),
+            "unexpected lints: {:?}",
+            lints_of(src)
+        );
     }
 }

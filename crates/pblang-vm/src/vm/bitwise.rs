@@ -26,9 +26,7 @@ fn to_i64(host: &mut dyn VmHost, v: &Value, fname: &str) -> Result<i64, RuntimeE
     match v {
         Value::Number(n) => {
             if !n.is_finite() || n.fract() != 0.0 {
-                return Err(host.err(format!(
-                    "{fname}(): operand must be an integer, got {n}"
-                )));
+                return Err(host.err(format!("{fname}(): operand must be an integer, got {n}")));
             }
             if *n < i64::MIN as f64 || *n > i64::MAX as f64 {
                 return Err(host.err(format!(
@@ -37,9 +35,7 @@ fn to_i64(host: &mut dyn VmHost, v: &Value, fname: &str) -> Result<i64, RuntimeE
             }
             Ok(*n as i64)
         }
-        _ => Err(host.err(format!(
-            "{fname}(): expected an integer operand"
-        ))),
+        _ => Err(host.err(format!("{fname}(): expected an integer operand"))),
     }
 }
 
@@ -48,19 +44,14 @@ fn to_i64(host: &mut dyn VmHost, v: &Value, fname: &str) -> Result<i64, RuntimeE
 fn shift_amount(host: &mut dyn VmHost, v: &Value, fname: &str) -> Result<u32, RuntimeError> {
     let n = to_i64(host, v, fname)?;
     if !(0..=63).contains(&n) {
-        return Err(host.err(format!(
-            "{fname}(): shift amount must be 0..=63, got {n}"
-        )));
+        return Err(host.err(format!("{fname}(): shift amount must be 0..=63, got {n}")));
     }
     Ok(n as u32)
 }
 
 fn arity2(host: &mut dyn VmHost, args: &[Value], fname: &str) -> Result<(), RuntimeError> {
     if args.len() != 2 {
-        return Err(host.err(format!(
-            "{fname}() expects 2 arguments, got {}",
-            args.len()
-        )));
+        return Err(host.err(format!("{fname}() expects 2 arguments, got {}", args.len())));
     }
     Ok(())
 }

@@ -51,6 +51,10 @@ encryption** built from the VM's primitives (`sha256`, `hmac_sha256`, `random_by
   rejects any envelope whose seq it has already accepted.
 - **Fresh nonce per message** — sealing the same plaintext twice yields different
   envelopes (no deterministic ciphertext).
+- **Key-material boundary.** `key` must already be high-entropy key material, such as
+  random session bytes or output from a vetted KDF. Do **not** pass human
+  passwords/passphrases directly to `seal`/`open`; derive keys first with PBKDF2,
+  Argon2, or scrypt in the host/plugin layer until pblang ships a native KDF builtin.
 
 Usable *above current protocols*: `seal` a payload and put it in an HTTP body, a
 WebSocket frame, or a file — confidentiality + integrity + authenticity travel with the
@@ -82,6 +86,7 @@ is either **fixed in the design** or **flagged** as needing a VM builtin.
 | "Compatibility **and** our own protocol" | **Downgrade attack** (force the weaker fallback) | **Fixed** — protocol version bound into the authenticated tag. |
 | "More secure" with no anti-replay | **Replay/reorder** of captured messages | **Fixed** — sequence number in authenticated AAD + monotonic session seq. |
 | Rolling a cipher from `sha256` | Hand-rolled crypto is fragile | **Mitigated** — sound construction (encrypt-then-MAC, constant-time verify). **Flagged**: a **vetted AEAD** (`AES-GCM` / `ChaCha20-Poly1305`) belongs in the VM as a native builtin — it would also remove the hex-encoding payload bloat. |
+| Password passed directly as key | Offline guessing if a low-entropy human secret is used as the AEAD key | **Documented boundary** — `securelayer` now requires high-entropy key material; password-derived keys must come from PBKDF2, Argon2, or scrypt before `seal`/`open`. A native KDF builtin remains a future ergonomics improvement. |
 | No key establishment named | Pre-shared keys don't scale; **no forward secrecy** | **Flagged** — needs an **X25519** key-agreement builtin for ephemeral session keys (forward secrecy); PSK is the bootstrap. |
 | "Faster/efficient" unquantified | Unfalsifiable claims | **Fixed** — framing overhead is **measured** (14 vs 112 bytes); honest note: the *security* envelope currently inflates the payload (from-primitives hex), which the native AEAD above resolves. |
 | Live client transport | Can't open a connection | **Flagged** — the VM has `tcp_listen`/`accept` and only `tcp_connect_tls`; a plain **`tcp_connect`** builtin is needed for a pblang PBP *client* (the server + codec + crypto are done). |

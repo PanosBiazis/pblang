@@ -259,7 +259,9 @@ impl Sdl2Window {
                     out.push(alloc_map(m));
                     self.last_mouse = Some((x as f32, y as f32));
                 }
-                Event::MouseButtonDown { mouse_btn, x, y, .. } => {
+                Event::MouseButtonDown {
+                    mouse_btn, x, y, ..
+                } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("mousedown"));
                     m.insert(
@@ -276,7 +278,9 @@ impl Sdl2Window {
                         self.last_right = true;
                     }
                 }
-                Event::MouseButtonUp { mouse_btn, x, y, .. } => {
+                Event::MouseButtonUp {
+                    mouse_btn, x, y, ..
+                } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("mouseup"));
                     m.insert(

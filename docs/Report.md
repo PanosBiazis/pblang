@@ -251,7 +251,7 @@
 - **tests/fixtures/call_graph_sample.sapp**, **tests/call_graph.rs** (3 tests). **Cargo.toml** [[test]] call_graph. **docs/Tooling.md** R2-alpha.
 
 ### A3-gamma — http_post_auth (Μάρτιος 2026)
-- **crates/pblang-vm**: builtin **http_post_auth(url, body, token)** — POST με `Authorization: Bearer <token>`· allow_http. **stdlib/http.sapp**: **post_auth(url, body, token)**. **examples/ai_http_provider/main.sapp**: **openai_chat_auth(prompt, api_key)**. **tests/semantics/http_post_auth_test.sapp** + **http_post_auth_builtin_registered_pass**. Tooling.md A3-gamma.
+- **crates/pblang-vm**: builtin **http_post_auth(url, headers_map, body)** — POST με caller-supplied headers· allow_http. **stdlib/http.sapp**: **post_auth(url, body, token)** builds `Authorization: Bearer <token>` for the common API-key case. **examples/ai_http_provider/main.sapp**: **openai_chat_auth(prompt, api_key)**. **tests/semantics/http_post_auth_test.sapp** + **http_post_auth_builtin_registered_pass**. Tooling.md A3-gamma. Corrected June 2026 after the docs audit found older wrapper docs still described the raw builtin as `(url, body, token)`.
 
 ### Q2-delta — Quantum remote stub (Μάρτιος 2026)
 - **stdlib/quantum_protocol.sapp**: **submit_remote(url, circuit_map)** (json.stringify + http.post, return data["job_id"]), **poll_remote(url, job_id)** (http.get url+"/"+job_id, json.parse). **docs/Quantum_providers.md** — provider contract (name, submit, poll), local-sim και remote-http stubs, Qiskit/Braket/Cirq future. **tests/semantics/quantum_remote_stub_test.sapp** + **quantum_remote_stub_contract_pass**. Tooling.md quantum_protocol Q2-delta.

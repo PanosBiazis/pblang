@@ -746,10 +746,7 @@ impl MemoryTracker {
     /// Check whether a memory location has any active borrows (of any type).
     pub fn is_borrowed(&self, memory_id: MemoryId) -> bool {
         let inner = self.inner.borrow();
-        inner
-            .borrows
-            .get(&memory_id)
-            .is_some_and(|v| !v.is_empty())
+        inner.borrows.get(&memory_id).is_some_and(|v| !v.is_empty())
     }
 
     /// Return a reference-counted handle to the inner tracker, allowing

@@ -2,7 +2,7 @@
 
 **Last Updated**: 2026-06-06  
 **Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 135 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen
-**Test Suite**: canonical `.sapp` corpus = **160 passed / 0 failed / 0 ignored** via `pblang test tests/semantics --allow-all` (the prebuilt-binary runner; no recompile). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
+**Test Suite**: canonical `.sapp` corpus = **181 passed / 0 failed / 0 ignored** via `pblang test tests/semantics --allow-all` (the prebuilt-binary runner; no recompile). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
 
 ---
 
@@ -20,7 +20,7 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | `ai_chat()` builtin | Chat completion via OpenAI, Anthropic, Ollama, or custom providers — returns JSON response |
 | `ai_embed()` builtin | Text embedding generation via any registered provider — returns JSON with vector + dimensions |
 | `ai_token_count()` builtin | Token estimation for prompt budgeting (chars/1.3 and chars/4 heuristics) |
-| `onnx_infer()` builtin | Updated with clearer error message directing users to ai_chat/ai_embed or FFI for ONNX models |
+| `onnx_infer()` builtin | Capability-gated Python bridge for ONNX Runtime. Requires `allow_exec`; returns structured `{success, outputs? | error?}` maps and degrades cleanly if Python/onnxruntime/model files are unavailable. `stdlib:ai.sapp` exposes `ai.onnx_run(...)`. |
 | Provider auto-registration | Auto-detects `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OLLAMA_URL` env vars |
 | Streaming support | `chat_stream()` in the AI crate for SSE-based streaming responses |
 | Vector math | `cosine_similarity()`, `dot_product()`, `euclidean_distance()` in the AI crate |
@@ -140,7 +140,7 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 ## ✅ Test Results
 
 ```
-pblang test tests/semantics --allow-all → 160 passed; 0 failed; 0 ignored   (canonical .sapp corpus, no recompile)
+pblang test tests/semantics --allow-all → 181 passed; 0 failed; 0 ignored   (canonical .sapp corpus, no recompile)
 cargo test --test semantics      → 192 passed; 0 failed; 1 ignored (os_env_set_pass)
 cargo test --test selfhost_drift → 26 passed; 0 failed; 1 ignored
 cargo test --test modules        → 28 passed; 0 failed

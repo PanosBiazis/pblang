@@ -84,9 +84,7 @@ pub(super) fn release_borrow_builtin(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if args.is_empty() {
-        return Err(
-            host.err("release_borrow(borrow_id) or release_borrow(handle, type)".into())
-        );
+        return Err(host.err("release_borrow(borrow_id) or release_borrow(handle, type)".into()));
     }
     if args.len() == 1 {
         let borrow_id = match &args[0] {
@@ -193,17 +191,13 @@ pub(super) fn memory_borrow_builtin(
     let borrow_type = match &args[1] {
         Value::Number(n) => *n as i64,
         _ => {
-            return Err(
-                host.err("memory_borrow: type must be 0 (immutable) or 1 (mutable)".into())
-            )
+            return Err(host.err("memory_borrow: type must be 0 (immutable) or 1 (mutable)".into()))
         }
     };
     match borrow_type {
         0 => Ok(Value::Number(host.mem_borrow_immutable(handle)?)),
         1 => Ok(Value::Number(host.mem_borrow_mutable(handle)?)),
-        _ => {
-            Err(host.err("memory_borrow: type must be 0 (immutable) or 1 (mutable)".into()))
-        }
+        _ => Err(host.err("memory_borrow: type must be 0 (immutable) or 1 (mutable)".into())),
     }
 }
 
@@ -214,7 +208,10 @@ pub(super) fn memory_release_builtin(
     args: Vec<Value>,
 ) -> Result<Value, RuntimeError> {
     if args.is_empty() {
-        return Err(host.err("memory_release(borrow_id) or memory_release(handle, type) expects at least 1 arg".into()));
+        return Err(host.err(
+            "memory_release(borrow_id) or memory_release(handle, type) expects at least 1 arg"
+                .into(),
+        ));
     }
     if args.len() == 1 {
         // Release by borrow_id

@@ -39,7 +39,10 @@ use super::FfiResource;
 /// polyglot_exec(lang, code) — Execute code in a foreign language via subprocess.
 /// Supported langs: python, js (node), bash (sh), ruby, perl
 /// Returns JSON: { success, stdout, stderr, exit_code }
-pub(super) fn polyglot_exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn polyglot_exec(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
         return Err(vm_cap!(host, "polyglot_exec", "exec"));
     }
@@ -368,8 +371,7 @@ pub(super) fn polyglot_exec_compiled(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let work_dir =
-        std::env::temp_dir().join(format!("pblang_polyglot_{lang_norm}_{nonce}"));
+    let work_dir = std::env::temp_dir().join(format!("pblang_polyglot_{lang_norm}_{nonce}"));
     if let Err(e) = std::fs::create_dir_all(&work_dir) {
         let stderr_esc = json_escape_string(&format!(
             "polyglot_exec_compiled: cannot create temp dir: {e}"
@@ -403,335 +405,474 @@ pub(super) fn polyglot_exec_compiled(
 
     // Build & run plan: (src filename, compile argv builder, run argv).
     // We materialize the source, then optionally compile, then run.
-    let (src_name, compile_cmd, run_cmd_path): (
-        &str,
-        Option<(String, Vec<String>)>,
-        Vec<String>,
-    ) = match lang_norm {
-        "rust" => {
-            let cc = match first_available(&["rustc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: rustc not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
+    let (src_name, compile_cmd, run_cmd_path): (&str, Option<(String, Vec<String>)>, Vec<String>) =
+        match lang_norm {
+            "rust" => {
+                let cc = match first_available(&["rustc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: rustc not found in PATH");
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.rs");
-            (
-                "main.rs",
-                Some((
-                    cc,
-                    vec![
-                        "--edition".into(),
-                        "2021".into(),
-                        "-O".into(),
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        bin.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "go" => {
-            let cc = match first_available(&["go"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc =
-                        json_escape_string("polyglot_exec_compiled: go not found in PATH");
-                    return Ok(alloc_string(format!(
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.rs");
+                (
+                    "main.rs",
+                    Some((
+                        cc,
+                        vec![
+                            "--edition".into(),
+                            "2021".into(),
+                            "-O".into(),
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "go" => {
+                let cc = match first_available(&["go"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: go not found in PATH");
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let src = work_dir.join("main.go");
-            (
-                "main.go",
-                None,
-                vec![cc, "run".into(), src.to_string_lossy().into_owned()],
-            )
-        }
-        "c" => {
-            let cc = match first_available(&["cc", "gcc", "clang"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: no C compiler found (tried cc, gcc, clang)",
-                    );
-                    return Ok(alloc_string(format!(
+                    }
+                };
+                let src = work_dir.join("main.go");
+                (
+                    "main.go",
+                    None,
+                    vec![cc, "run".into(), src.to_string_lossy().into_owned()],
+                )
+            }
+            "c" => {
+                let cc = match first_available(&["cc", "gcc", "clang"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: no C compiler found (tried cc, gcc, clang)",
+                        );
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.c");
-            (
-                "main.c",
-                Some((
-                    cc,
-                    vec![
-                        "-O2".into(),
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        bin.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "cpp" => {
-            let cc = match first_available(&["c++", "g++", "clang++"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.c");
+                (
+                    "main.c",
+                    Some((
+                        cc,
+                        vec![
+                            "-O2".into(),
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "cpp" => {
+                let cc = match first_available(&["c++", "g++", "clang++"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
                         "polyglot_exec_compiled: no C++ compiler found (tried c++, g++, clang++)",
                     );
-                    return Ok(alloc_string(format!(
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.cpp");
-            (
-                "main.cpp",
-                Some((
-                    cc,
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.cpp");
+                (
+                    "main.cpp",
+                    Some((
+                        cc,
+                        vec![
+                            "-O2".into(),
+                            "-std=c++17".into(),
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "zig" => {
+                let cc = match first_available(&["zig"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: zig not found in PATH");
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let src = work_dir.join("main.zig");
+                (
+                    "main.zig",
+                    None,
+                    vec![cc, "run".into(), src.to_string_lossy().into_owned()],
+                )
+            }
+            "java" => {
+                let javac = match first_available(&["javac"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: javac not found in PATH");
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let java = first_available(&["java"]).unwrap_or_else(|| "java".to_string());
+                let src = work_dir.join("Main.java");
+                (
+                    "Main.java",
+                    Some((javac, vec![src.to_string_lossy().into_owned()])),
                     vec![
-                        "-O2".into(),
-                        "-std=c++17".into(),
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        bin.to_string_lossy().into_owned(),
+                        java,
+                        "-cp".into(),
+                        work_dir.to_string_lossy().into_owned(),
+                        "Main".into(),
                     ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "zig" => {
-            let cc = match first_available(&["zig"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc =
-                        json_escape_string("polyglot_exec_compiled: zig not found in PATH");
-                    return Ok(alloc_string(format!(
+                )
+            }
+            "typescript" => {
+                let tsc = match first_available(&["tsc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: tsc not found in PATH");
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let src = work_dir.join("main.zig");
-            (
-                "main.zig",
-                None,
-                vec![cc, "run".into(), src.to_string_lossy().into_owned()],
-            )
-        }
-        "java" => {
-            let javac = match first_available(&["javac"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: javac not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
+                    }
+                };
+                let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
+                let src = work_dir.join("main.ts");
+                let js = work_dir.join("main.js");
+                (
+                    "main.ts",
+                    Some((
+                        tsc,
+                        vec![
+                            "--target".into(),
+                            "es2020".into(),
+                            "--module".into(),
+                            "commonjs".into(),
+                            src.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![node, js.to_string_lossy().into_owned()],
+                )
+            }
+            "pascal" => {
+                // Free Pascal Compiler. Output is named `prog`.
+                let cc = match first_available(&["fpc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: fpc (Free Pascal) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let java = first_available(&["java"]).unwrap_or_else(|| "java".to_string());
-            let src = work_dir.join("Main.java");
-            (
-                "Main.java",
-                Some((javac, vec![src.to_string_lossy().into_owned()])),
-                vec![
-                    java,
-                    "-cp".into(),
-                    work_dir.to_string_lossy().into_owned(),
-                    "Main".into(),
-                ],
-            )
-        }
-        "typescript" => {
-            let tsc = match first_available(&["tsc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc =
-                        json_escape_string("polyglot_exec_compiled: tsc not found in PATH");
-                    return Ok(alloc_string(format!(
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.pas");
+                (
+                    "main.pas",
+                    Some((
+                        cc,
+                        vec![
+                            format!("-o{}", bin.to_string_lossy()),
+                            src.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "kotlin" => {
+                // Kotlin: kotlinc compiles to JAR, then java -jar runs it.
+                // Assumes top-level `fun main() { ... }` in the user's code.
+                let kc = match first_available(&["kotlinc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: kotlinc not found in PATH");
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
-            let src = work_dir.join("main.ts");
-            let js = work_dir.join("main.js");
-            (
-                "main.ts",
-                Some((
-                    tsc,
+                    }
+                };
+                let java = first_available(&["java"]).unwrap_or_else(|| "java".to_string());
+                let src = work_dir.join("main.kt");
+                let jar = work_dir.join("prog.jar");
+                (
+                    "main.kt",
+                    Some((
+                        kc,
+                        vec![
+                            src.to_string_lossy().into_owned(),
+                            "-include-runtime".into(),
+                            "-d".into(),
+                            jar.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![java, "-jar".into(), jar.to_string_lossy().into_owned()],
+                )
+            }
+            "nim" => {
+                let cc = match first_available(&["nim"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: nim not found in PATH");
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let src = work_dir.join("main.nim");
+                // `nim r` = compile + run, single invocation.
+                (
+                    "main.nim",
+                    None,
                     vec![
-                        "--target".into(),
-                        "es2020".into(),
-                        "--module".into(),
-                        "commonjs".into(),
-                        src.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![node, js.to_string_lossy().into_owned()],
-            )
-        }
-        "pascal" => {
-            // Free Pascal Compiler. Output is named `prog`.
-            let cc = match first_available(&["fpc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: fpc (Free Pascal) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.pas");
-            (
-                "main.pas",
-                Some((
-                    cc,
-                    vec![
-                        format!("-o{}", bin.to_string_lossy()),
-                        src.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "kotlin" => {
-            // Kotlin: kotlinc compiles to JAR, then java -jar runs it.
-            // Assumes top-level `fun main() { ... }` in the user's code.
-            let kc = match first_available(&["kotlinc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: kotlinc not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let java = first_available(&["java"]).unwrap_or_else(|| "java".to_string());
-            let src = work_dir.join("main.kt");
-            let jar = work_dir.join("prog.jar");
-            (
-                "main.kt",
-                Some((
-                    kc,
-                    vec![
-                        src.to_string_lossy().into_owned(),
-                        "-include-runtime".into(),
-                        "-d".into(),
-                        jar.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![java, "-jar".into(), jar.to_string_lossy().into_owned()],
-            )
-        }
-        "nim" => {
-            let cc = match first_available(&["nim"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc =
-                        json_escape_string("polyglot_exec_compiled: nim not found in PATH");
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let src = work_dir.join("main.nim");
-            // `nim r` = compile + run, single invocation.
-            (
-                "main.nim",
-                None,
-                vec![
-                    cc,
-                    "r".into(),
-                    "--hints:off".into(),
-                    src.to_string_lossy().into_owned(),
-                ],
-            )
-        }
-        "crystal" => {
-            let cc = match first_available(&["crystal"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: crystal not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let src = work_dir.join("main.cr");
-            (
-                "main.cr",
-                None,
-                vec![cc, "run".into(), src.to_string_lossy().into_owned()],
-            )
-        }
-        "d" => {
-            let cc = match first_available(&["dmd", "ldc2", "gdc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: no D compiler found (tried dmd, ldc2, gdc)",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.d");
-            // dmd: -of=path; ldc2: -of=path; both accept this.
-            (
-                "main.d",
-                Some((
-                    cc,
-                    vec![
-                        format!("-of={}", bin.to_string_lossy()),
+                        cc,
+                        "r".into(),
+                        "--hints:off".into(),
                         src.to_string_lossy().into_owned(),
                     ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "haskell" => {
-            // runghc = compile-and-run in one shot.
-            let cc = match first_available(&["runghc", "runhaskell", "ghc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
+                )
+            }
+            "crystal" => {
+                let cc = match first_available(&["crystal"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: crystal not found in PATH");
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let src = work_dir.join("main.cr");
+                (
+                    "main.cr",
+                    None,
+                    vec![cc, "run".into(), src.to_string_lossy().into_owned()],
+                )
+            }
+            "d" => {
+                let cc = match first_available(&["dmd", "ldc2", "gdc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: no D compiler found (tried dmd, ldc2, gdc)",
+                        );
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.d");
+                // dmd: -of=path; ldc2: -of=path; both accept this.
+                (
+                    "main.d",
+                    Some((
+                        cc,
+                        vec![
+                            format!("-of={}", bin.to_string_lossy()),
+                            src.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "haskell" => {
+                // runghc = compile-and-run in one shot.
+                let cc = match first_available(&["runghc", "runhaskell", "ghc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
                         "polyglot_exec_compiled: no Haskell runner found (tried runghc, runhaskell, ghc)",
                     );
-                    return Ok(alloc_string(format!(
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
+                    }
+                };
+                let src = work_dir.join("Main.hs");
+                if cc.ends_with("ghc") && !cc.contains("runghc") && !cc.contains("runhaskell") {
+                    // Plain ghc → compile then run separately.
+                    let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                    (
+                        "Main.hs",
+                        Some((
+                            cc,
+                            vec![
+                                src.to_string_lossy().into_owned(),
+                                "-o".into(),
+                                bin.to_string_lossy().into_owned(),
+                            ],
+                        )),
+                        vec![bin.to_string_lossy().into_owned()],
+                    )
+                } else {
+                    (
+                        "Main.hs",
+                        None,
+                        vec![cc, src.to_string_lossy().into_owned()],
+                    )
                 }
-            };
-            let src = work_dir.join("Main.hs");
-            if cc.ends_with("ghc") && !cc.contains("runghc") && !cc.contains("runhaskell") {
-                // Plain ghc → compile then run separately.
+            }
+            "fortran" => {
+                let cc = match first_available(&["gfortran", "flang"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                        "polyglot_exec_compiled: no Fortran compiler found (tried gfortran, flang)",
+                    );
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
                 let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.f90");
                 (
-                    "Main.hs",
+                    "main.f90",
+                    Some((
+                        cc,
+                        vec![
+                            "-O2".into(),
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "ada" => {
+                let cc = match first_available(&["gnatmake"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: gnatmake (GNAT) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let src = work_dir.join("main.adb");
+                let bin = work_dir.join(if cfg!(windows) { "main.exe" } else { "main" });
+                (
+                    "main.adb",
+                    Some((cc, vec![src.to_string_lossy().into_owned()])),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "swift" => {
+                let cc = match first_available(&["swift"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: swift not found in PATH");
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let src = work_dir.join("main.swift");
+                (
+                    "main.swift",
+                    None,
+                    vec![cc, src.to_string_lossy().into_owned()],
+                )
+            }
+            "cobol" => {
+                let cc = match first_available(&["cobc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: cobc (GnuCOBOL) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.cob");
+                (
+                    "main.cob",
+                    Some((
+                        cc,
+                        vec![
+                            "-x".into(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                            src.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "erlang" => {
+                let cc = match first_available(&["escript"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: escript (Erlang) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let src = work_dir.join("main.escript");
+                (
+                    "main.escript",
+                    None,
+                    vec![cc, src.to_string_lossy().into_owned()],
+                )
+            }
+            "vala" => {
+                let cc = match first_available(&["valac"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: valac not found in PATH");
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.vala");
+                (
+                    "main.vala",
                     Some((
                         cc,
                         vec![
@@ -742,583 +883,572 @@ pub(super) fn polyglot_exec_compiled(
                     )),
                     vec![bin.to_string_lossy().into_owned()],
                 )
-            } else {
-                ("Main.hs", None, vec![cc, src.to_string_lossy().into_owned()])
             }
-        }
-        "fortran" => {
-            let cc = match first_available(&["gfortran", "flang"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: no Fortran compiler found (tried gfortran, flang)",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.f90");
-            (
-                "main.f90",
-                Some((
-                    cc,
-                    vec![
-                        "-O2".into(),
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        bin.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "ada" => {
-            let cc = match first_available(&["gnatmake"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: gnatmake (GNAT) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let src = work_dir.join("main.adb");
-            let bin = work_dir.join(if cfg!(windows) { "main.exe" } else { "main" });
-            (
-                "main.adb",
-                Some((cc, vec![src.to_string_lossy().into_owned()])),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "swift" => {
-            let cc = match first_available(&["swift"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: swift not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let src = work_dir.join("main.swift");
-            (
-                "main.swift",
-                None,
-                vec![cc, src.to_string_lossy().into_owned()],
-            )
-        }
-        "cobol" => {
-            let cc = match first_available(&["cobc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: cobc (GnuCOBOL) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.cob");
-            (
-                "main.cob",
-                Some((
-                    cc,
-                    vec![
-                        "-x".into(),
-                        "-o".into(),
-                        bin.to_string_lossy().into_owned(),
-                        src.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "erlang" => {
-            let cc = match first_available(&["escript"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: escript (Erlang) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let src = work_dir.join("main.escript");
-            ("main.escript", None, vec![cc, src.to_string_lossy().into_owned()])
-        }
-        "vala" => {
-            let cc = match first_available(&["valac"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: valac not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.vala");
-            (
-                "main.vala",
-                Some((
-                    cc,
-                    vec![
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        bin.to_string_lossy().into_owned(),
-                    ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "objc" => {
-            let cc = match first_available(&["clang", "gcc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
+            "objc" => {
+                let cc = match first_available(&["clang", "gcc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
                         "polyglot_exec_compiled: clang/gcc not found in PATH (Objective-C needs an Obj-C-capable compiler)",
                     );
-                    return Ok(alloc_string(format!(
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.m");
+                // -ObjC + -lobjc on Linux/GNUstep; macOS auto-detects via .m.
+                let mut comp_args = vec![
+                    "-O2".into(),
+                    src.to_string_lossy().into_owned(),
+                    "-o".into(),
+                    bin.to_string_lossy().into_owned(),
+                ];
+                if cfg!(target_os = "linux") {
+                    comp_args.push("-lobjc".into());
                 }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.m");
-            // -ObjC + -lobjc on Linux/GNUstep; macOS auto-detects via .m.
-            let mut comp_args = vec![
-                "-O2".into(),
-                src.to_string_lossy().into_owned(),
-                "-o".into(),
-                bin.to_string_lossy().into_owned(),
-            ];
-            if cfg!(target_os = "linux") {
-                comp_args.push("-lobjc".into());
+                (
+                    "main.m",
+                    Some((cc, comp_args)),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
             }
-            (
-                "main.m",
-                Some((cc, comp_args)),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "nasm" => {
-            // x86_64 ELF assembly via nasm + ld. Linux-only path.
-            let cc = match first_available(&["nasm"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc =
-                        json_escape_string("polyglot_exec_compiled: nasm not found in PATH");
-                    return Ok(alloc_string(format!(
+            "nasm" => {
+                // x86_64 ELF assembly via nasm + ld. Linux-only path.
+                let cc = match first_available(&["nasm"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: nasm not found in PATH");
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let ld = first_available(&["ld"]).unwrap_or_else(|| "ld".to_string());
-            let src = work_dir.join("main.asm");
-            let obj = work_dir.join("main.o");
-            let bin = work_dir.join("prog");
-            // Single "compile" step is just nasm; we tack on the ld step
-            // as the run argv by chaining sh -c. The driver below treats
-            // run_cmd_path as a single execvp call, so use a shell.
-            (
-                "main.asm",
-                Some((
-                    cc,
+                    }
+                };
+                let ld = first_available(&["ld"]).unwrap_or_else(|| "ld".to_string());
+                let src = work_dir.join("main.asm");
+                let obj = work_dir.join("main.o");
+                let bin = work_dir.join("prog");
+                // Single "compile" step is just nasm; we tack on the ld step
+                // as the run argv by chaining sh -c. The driver below treats
+                // run_cmd_path as a single execvp call, so use a shell.
+                (
+                    "main.asm",
+                    Some((
+                        cc,
+                        vec![
+                            "-f".into(),
+                            "elf64".into(),
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            obj.to_string_lossy().into_owned(),
+                        ],
+                    )),
                     vec![
-                        "-f".into(),
-                        "elf64".into(),
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        obj.to_string_lossy().into_owned(),
+                        "sh".into(),
+                        "-c".into(),
+                        format!(
+                            "{} {} -o {} && {}",
+                            ld,
+                            obj.to_string_lossy(),
+                            bin.to_string_lossy(),
+                            bin.to_string_lossy()
+                        ),
                     ],
-                )),
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    format!(
-                        "{} {} -o {} && {}",
-                        ld,
-                        obj.to_string_lossy(),
-                        bin.to_string_lossy(),
-                        bin.to_string_lossy()
-                    ),
-                ],
-            )
-        }
-        "gas" => {
-            // GNU assembler + ld. Same shape as nasm.
-            let cc = match first_available(&["as"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: as (GNU assembler) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
+                )
+            }
+            "gas" => {
+                // GNU assembler + ld. Same shape as nasm.
+                let cc = match first_available(&["as"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: as (GNU assembler) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let ld = first_available(&["ld"]).unwrap_or_else(|| "ld".to_string());
-            let src = work_dir.join("main.s");
-            let obj = work_dir.join("main.o");
-            let bin = work_dir.join("prog");
-            (
-                "main.s",
-                Some((
-                    cc,
+                    }
+                };
+                let ld = first_available(&["ld"]).unwrap_or_else(|| "ld".to_string());
+                let src = work_dir.join("main.s");
+                let obj = work_dir.join("main.o");
+                let bin = work_dir.join("prog");
+                (
+                    "main.s",
+                    Some((
+                        cc,
+                        vec![
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            obj.to_string_lossy().into_owned(),
+                        ],
+                    )),
                     vec![
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        obj.to_string_lossy().into_owned(),
+                        "sh".into(),
+                        "-c".into(),
+                        format!(
+                            "{} {} -o {} && {}",
+                            ld,
+                            obj.to_string_lossy(),
+                            bin.to_string_lossy(),
+                            bin.to_string_lossy()
+                        ),
                     ],
-                )),
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    format!(
-                        "{} {} -o {} && {}",
-                        ld,
-                        obj.to_string_lossy(),
-                        bin.to_string_lossy(),
-                        bin.to_string_lossy()
-                    ),
-                ],
-            )
-        }
-        "v" => {
-            let cc = match first_available(&["v"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc =
-                        json_escape_string("polyglot_exec_compiled: v not found in PATH");
-                    return Ok(alloc_string(format!(
+                )
+            }
+            "v" => {
+                let cc = match first_available(&["v"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: v not found in PATH");
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let src = work_dir.join("main.v");
-            (
-                "main.v",
-                None,
-                vec![cc, "run".into(), src.to_string_lossy().into_owned()],
-            )
-        }
-        "ocaml-compiled" => {
-            // Bytecode compile + run via ocamlfind/ocamlc, since the
-            // plain `ocaml` toplevel is interpreter-style.
-            let cc = match first_available(&["ocamlfind", "ocamlc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: ocamlfind/ocamlc not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
+                    }
+                };
+                let src = work_dir.join("main.v");
+                (
+                    "main.v",
+                    None,
+                    vec![cc, "run".into(), src.to_string_lossy().into_owned()],
+                )
+            }
+            "ocaml-compiled" => {
+                // Bytecode compile + run via ocamlfind/ocamlc, since the
+                // plain `ocaml` toplevel is interpreter-style.
+                let cc = match first_available(&["ocamlfind", "ocamlc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: ocamlfind/ocamlc not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let src = work_dir.join("main.ml");
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            (
-                "main.ml",
-                Some((
-                    cc,
+                    }
+                };
+                let src = work_dir.join("main.ml");
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                (
+                    "main.ml",
+                    Some((
+                        cc,
+                        vec![
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            "csharp" => {
+                // C# via the .NET SDK: scaffold `Program.cs` + a minimal
+                // `prog.csproj`, then `dotnet run` which builds & runs.
+                // Skips the explicit compile_cmd step — `dotnet run` does
+                // both. The csproj is dropped after the standard source
+                // write below (see special-case for lang_norm == "csharp").
+                let dotnet = match first_available(&["dotnet"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
+                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
+                    )));
+                    }
+                };
+                (
+                    "Program.cs",
+                    None,
                     vec![
-                        src.to_string_lossy().into_owned(),
-                        "-o".into(),
-                        bin.to_string_lossy().into_owned(),
+                        dotnet,
+                        "run".into(),
+                        "--project".into(),
+                        work_dir.to_string_lossy().into_owned(),
+                        "-c".into(),
+                        "Release".into(),
+                        "--verbosity".into(),
+                        "quiet".into(),
+                        "--nologo".into(),
                     ],
-                )),
-                vec![bin.to_string_lossy().into_owned()],
-            )
-        }
-        "csharp" => {
-            // C# via the .NET SDK: scaffold `Program.cs` + a minimal
-            // `prog.csproj`, then `dotnet run` which builds & runs.
-            // Skips the explicit compile_cmd step — `dotnet run` does
-            // both. The csproj is dropped after the standard source
-            // write below (see special-case for lang_norm == "csharp").
-            let dotnet = match first_available(&["dotnet"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
+                )
+            }
+            "fsharp" => {
+                // F# via dotnet fsi for single-file scripts.
+                let fsi = match first_available(&["dotnet"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            (
-                "Program.cs",
-                None,
-                vec![
-                    dotnet,
-                    "run".into(),
-                    "--project".into(),
-                    work_dir.to_string_lossy().into_owned(),
-                    "-c".into(),
-                    "Release".into(),
-                    "--verbosity".into(),
-                    "quiet".into(),
-                    "--nologo".into(),
-                ],
-            )
-        }
-        "fsharp" => {
-            // F# via dotnet fsi for single-file scripts.
-            let fsi = match first_available(&["dotnet"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
+                    }
+                };
+                let src = work_dir.join("main.fsx");
+                (
+                    "main.fsx",
+                    None,
+                    vec![fsi, "fsi".into(), src.to_string_lossy().into_owned()],
+                )
+            }
+            "vb" | "vbnet" | "visualbasic" => {
+                // Visual Basic .NET — same csproj-scaffold trick as C#.
+                let dotnet = match first_available(&["dotnet"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!(
                         "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                     )));
-                }
-            };
-            let src = work_dir.join("main.fsx");
-            (
-                "main.fsx",
-                None,
-                vec![fsi, "fsi".into(), src.to_string_lossy().into_owned()],
-            )
-        }
-        "vb" | "vbnet" | "visualbasic" => {
-            // Visual Basic .NET — same csproj-scaffold trick as C#.
-            let dotnet = match first_available(&["dotnet"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string(
-                        "polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH",
-                    );
-                    return Ok(alloc_string(format!(
-                        "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
-                    )));
-                }
-            };
-            (
-                "Program.vb",
-                None,
-                vec![
-                    dotnet,
-                    "run".into(),
-                    "--project".into(),
-                    work_dir.to_string_lossy().into_owned(),
-                    "-c".into(),
-                    "Release".into(),
-                    "--verbosity".into(),
-                    "quiet".into(),
-                    "--nologo".into(),
-                ],
-            )
-        }
-        // ── Q# compiled (via dotnet) ───────────────────────────
-        "qsharp-compiled" | "qs-compiled" => {
-            let dotnet = match first_available(&["dotnet"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH for Q#");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            (
-                "Program.qs",
-                None,
-                vec![dotnet, "run".into(), "--project".into(), work_dir.to_string_lossy().into_owned()],
-            )
-        }
-        // ── Haxe ───────────────────────────────────────────────
-        "haxe" | "hx" => {
-            let cc = match first_available(&["haxe"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: haxe not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let _src = work_dir.join("Main.hx");
-            ("Main.hx", None, vec![cc, "--run".into(), "Main".into(), "--cwd".into(), work_dir.to_string_lossy().into_owned()])
-        }
-        // ── Pony ───────────────────────────────────────────────
-        "pony" => {
-            let cc = match first_available(&["ponyc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: ponyc not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let bin = work_dir.join("prog");
-            let src = work_dir.join("main.pony");
-            ("main.pony", Some((cc, vec![src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![bin.to_string_lossy().into_owned()])
-        }
-        // ── Red ────────────────────────────────────────────────
-        "red" => {
-            let cc = match first_available(&["red"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: red not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let src = work_dir.join("main.red");
-            ("main.red", None, vec![cc, src.to_string_lossy().into_owned()])
-        }
-        // ── Verilog ────────────────────────────────────────────
-        "verilog" | "vlog" => {
-            let cc = match first_available(&["iverilog"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: iverilog not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let vvp = first_available(&["vvp"]).unwrap_or_else(|| "vvp".to_string());
-            let src = work_dir.join("main.v");
-            let bin = work_dir.join("prog.vvp");
-            ("main.v", Some((cc, vec![src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![vvp, bin.to_string_lossy().into_owned()])
-        }
-        // ── Mercury ────────────────────────────────────────────
-        "mercury" => {
-            let cc = match first_available(&["mmc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: mmc (Mercury) not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let src = work_dir.join("main.m");
-            let bin = work_dir.join("prog");
-            ("main.m", Some((cc, vec!["--make".into(), src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![bin.to_string_lossy().into_owned()])
-        }
-        // ── ReasonML / BuckleScript ────────────────────────────
-        "reason" | "re" => {
-            let cc = match first_available(&["bsb"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: bsb (BuckleScript) not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
-            let _src = work_dir.join("Main.re");
-            ("Main.re", Some((cc, vec!["-make-world".into()])), vec![node, "src/Main.bs.js".into()])
-        }
-        // ── Odin ────────────────────────────────────────────────
-        "odin" => {
-            let cc = match first_available(&["odin"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: odin not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let src = work_dir.join("main.odin");
-            ("main.odin", None, vec![cc, "run".into(), src.to_string_lossy().into_owned()])
-        }
-        // ── Carbon ──────────────────────────────────────────────
-        "carbon" => {
-            let cc = match first_available(&["carbon"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: carbon not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let src = work_dir.join("main.carbon");
-            ("main.carbon", None, vec![cc, "run".into(), src.to_string_lossy().into_owned()])
-        }
-        // ── Mojo ───────────────────────────────────────────────
-        "mojo" => {
-            let cc = match first_available(&["mojo"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: mojo not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let src = work_dir.join("main.mojo");
-            ("main.mojo", None, vec![cc, src.to_string_lossy().into_owned()])
-        }
-        // ── Chapel ──────────────────────────────────────────────
-        "chapel" | "chpl" => {
-            let cc = match first_available(&["chpl"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: chpl (Chapel) not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
-            let src = work_dir.join("main.chpl");
-            ("main.chpl", Some((cc, vec![src.to_string_lossy().into_owned(), "-o".into(), bin.to_string_lossy().into_owned()])), vec![bin.to_string_lossy().into_owned()])
-        }
-        // ── Factor ──────────────────────────────────────────────
-        "factor" => {
-            let cc = match first_available(&["factor"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: factor not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let src = work_dir.join("main.factor");
-            ("main.factor", None, vec![cc, src.to_string_lossy().into_owned()])
-        }
-        // ── PureScript ──────────────────────────────────────────
-        "purescript" | "purs" => {
-            let cc = match first_available(&["purs"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: purs (PureScript) not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
-            let src = work_dir.join("Main.purs");
-            ("Main.purs", Some((cc, vec!["compile".into(), src.to_string_lossy().into_owned(), "-o".into(), work_dir.to_string_lossy().into_owned()])), vec![node, "-e".into(), "require(047./output/Main/index.js047).main()".into()])
-        }
-        // ── Solidity (compiled) ─────────────────────────────────
-        "solidity" | "sol" => {
-            let cc = match first_available(&["solc"]) {
-                Some(c) => c,
-                None => {
-                    let stderr_esc = json_escape_string("polyglot_exec_compiled: solc (Solidity) not found in PATH");
-                    return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
-                }
-            };
-            let src = work_dir.join("main.sol");
-            let bin = work_dir.join("main.bin");
-            ("main.sol", Some((cc.clone(), vec![src.to_string_lossy().into_owned(), "--bin".into(), "-o".into(), work_dir.to_string_lossy().into_owned()])), vec!["cat".into(), bin.to_string_lossy().into_owned()])
-        }
-        other => {
-            return Err(host.err(format!(
+                    }
+                };
+                (
+                    "Program.vb",
+                    None,
+                    vec![
+                        dotnet,
+                        "run".into(),
+                        "--project".into(),
+                        work_dir.to_string_lossy().into_owned(),
+                        "-c".into(),
+                        "Release".into(),
+                        "--verbosity".into(),
+                        "quiet".into(),
+                        "--nologo".into(),
+                    ],
+                )
+            }
+            // ── Q# compiled (via dotnet) ───────────────────────────
+            "qsharp-compiled" | "qs-compiled" => {
+                let dotnet = match first_available(&["dotnet"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string("polyglot_exec_compiled: dotnet (the .NET SDK) not found in PATH for Q#");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                (
+                    "Program.qs",
+                    None,
+                    vec![
+                        dotnet,
+                        "run".into(),
+                        "--project".into(),
+                        work_dir.to_string_lossy().into_owned(),
+                    ],
+                )
+            }
+            // ── Haxe ───────────────────────────────────────────────
+            "haxe" | "hx" => {
+                let cc = match first_available(&["haxe"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: haxe not found in PATH");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let _src = work_dir.join("Main.hx");
+                (
+                    "Main.hx",
+                    None,
+                    vec![
+                        cc,
+                        "--run".into(),
+                        "Main".into(),
+                        "--cwd".into(),
+                        work_dir.to_string_lossy().into_owned(),
+                    ],
+                )
+            }
+            // ── Pony ───────────────────────────────────────────────
+            "pony" => {
+                let cc = match first_available(&["ponyc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: ponyc not found in PATH");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let bin = work_dir.join("prog");
+                let src = work_dir.join("main.pony");
+                (
+                    "main.pony",
+                    Some((
+                        cc,
+                        vec![
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            // ── Red ────────────────────────────────────────────────
+            "red" => {
+                let cc = match first_available(&["red"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: red not found in PATH");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let src = work_dir.join("main.red");
+                (
+                    "main.red",
+                    None,
+                    vec![cc, src.to_string_lossy().into_owned()],
+                )
+            }
+            // ── Verilog ────────────────────────────────────────────
+            "verilog" | "vlog" => {
+                let cc = match first_available(&["iverilog"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: iverilog not found in PATH",
+                        );
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let vvp = first_available(&["vvp"]).unwrap_or_else(|| "vvp".to_string());
+                let src = work_dir.join("main.v");
+                let bin = work_dir.join("prog.vvp");
+                (
+                    "main.v",
+                    Some((
+                        cc,
+                        vec![
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![vvp, bin.to_string_lossy().into_owned()],
+                )
+            }
+            // ── Mercury ────────────────────────────────────────────
+            "mercury" => {
+                let cc = match first_available(&["mmc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: mmc (Mercury) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let src = work_dir.join("main.m");
+                let bin = work_dir.join("prog");
+                (
+                    "main.m",
+                    Some((
+                        cc,
+                        vec![
+                            "--make".into(),
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            // ── ReasonML / BuckleScript ────────────────────────────
+            "reason" | "re" => {
+                let cc = match first_available(&["bsb"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: bsb (BuckleScript) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
+                let _src = work_dir.join("Main.re");
+                (
+                    "Main.re",
+                    Some((cc, vec!["-make-world".into()])),
+                    vec![node, "src/Main.bs.js".into()],
+                )
+            }
+            // ── Odin ────────────────────────────────────────────────
+            "odin" => {
+                let cc = match first_available(&["odin"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: odin not found in PATH");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let src = work_dir.join("main.odin");
+                (
+                    "main.odin",
+                    None,
+                    vec![cc, "run".into(), src.to_string_lossy().into_owned()],
+                )
+            }
+            // ── Carbon ──────────────────────────────────────────────
+            "carbon" => {
+                let cc = match first_available(&["carbon"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: carbon not found in PATH");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let src = work_dir.join("main.carbon");
+                (
+                    "main.carbon",
+                    None,
+                    vec![cc, "run".into(), src.to_string_lossy().into_owned()],
+                )
+            }
+            // ── Mojo ───────────────────────────────────────────────
+            "mojo" => {
+                let cc = match first_available(&["mojo"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: mojo not found in PATH");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let src = work_dir.join("main.mojo");
+                (
+                    "main.mojo",
+                    None,
+                    vec![cc, src.to_string_lossy().into_owned()],
+                )
+            }
+            // ── Chapel ──────────────────────────────────────────────
+            "chapel" | "chpl" => {
+                let cc = match first_available(&["chpl"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: chpl (Chapel) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let bin = work_dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+                let src = work_dir.join("main.chpl");
+                (
+                    "main.chpl",
+                    Some((
+                        cc,
+                        vec![
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            bin.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![bin.to_string_lossy().into_owned()],
+                )
+            }
+            // ── Factor ──────────────────────────────────────────────
+            "factor" => {
+                let cc = match first_available(&["factor"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc =
+                            json_escape_string("polyglot_exec_compiled: factor not found in PATH");
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let src = work_dir.join("main.factor");
+                (
+                    "main.factor",
+                    None,
+                    vec![cc, src.to_string_lossy().into_owned()],
+                )
+            }
+            // ── PureScript ──────────────────────────────────────────
+            "purescript" | "purs" => {
+                let cc = match first_available(&["purs"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: purs (PureScript) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let node = first_available(&["node"]).unwrap_or_else(|| "node".to_string());
+                let src = work_dir.join("Main.purs");
+                (
+                    "Main.purs",
+                    Some((
+                        cc,
+                        vec![
+                            "compile".into(),
+                            src.to_string_lossy().into_owned(),
+                            "-o".into(),
+                            work_dir.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec![
+                        node,
+                        "-e".into(),
+                        "require(047./output/Main/index.js047).main()".into(),
+                    ],
+                )
+            }
+            // ── Solidity (compiled) ─────────────────────────────────
+            "solidity" | "sol" => {
+                let cc = match first_available(&["solc"]) {
+                    Some(c) => c,
+                    None => {
+                        let stderr_esc = json_escape_string(
+                            "polyglot_exec_compiled: solc (Solidity) not found in PATH",
+                        );
+                        return Ok(alloc_string(format!("{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}")));
+                    }
+                };
+                let src = work_dir.join("main.sol");
+                let bin = work_dir.join("main.bin");
+                (
+                    "main.sol",
+                    Some((
+                        cc.clone(),
+                        vec![
+                            src.to_string_lossy().into_owned(),
+                            "--bin".into(),
+                            "-o".into(),
+                            work_dir.to_string_lossy().into_owned(),
+                        ],
+                    )),
+                    vec!["cat".into(), bin.to_string_lossy().into_owned()],
+                )
+            }
+            other => {
+                return Err(host.err(format!(
                 "polyglot_exec_compiled(): unsupported language '{}'. Supported: rust, go, c, cpp, zig, java, typescript, pascal, kotlin, nim, crystal, d, haskell, fortran, ada, swift, cobol, erlang, vala, objc, nasm, gas, v, ocaml-compiled, csharp, fsharp, vb, qsharp-compiled, haxe, pony, red, verilog, mercury, reason, odin, carbon, mojo, chapel, factor, purescript, solidity",
                 other
             )));
-        }
-    };
+            }
+        };
 
     // Write source.
     let src_path = work_dir.join(src_name);
     if let Err(e) = std::fs::write(&src_path, code) {
-        let stderr_esc = json_escape_string(&format!(
-            "polyglot_exec_compiled: write source: {e}"
-        ));
+        let stderr_esc = json_escape_string(&format!("polyglot_exec_compiled: write source: {e}"));
         return Ok(alloc_string(format!(
             "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
         )));
@@ -1342,9 +1472,8 @@ pub(super) fn polyglot_exec_compiled(
         "vb" => {
             let vbproj = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net8.0</TargetFramework>\n    <RootNamespace>PblangPolyglot</RootNamespace>\n  </PropertyGroup>\n</Project>\n";
             if let Err(e) = std::fs::write(work_dir.join("prog.vbproj"), vbproj) {
-                let stderr_esc = json_escape_string(&format!(
-                    "polyglot_exec_compiled(vb): write vbproj: {e}"
-                ));
+                let stderr_esc =
+                    json_escape_string(&format!("polyglot_exec_compiled(vb): write vbproj: {e}"));
                 return Ok(alloc_string(format!(
                     "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                 )));
@@ -1364,9 +1493,8 @@ pub(super) fn polyglot_exec_compiled(
         let compile_output = match compile_output {
             Ok(o) => o,
             Err(e) => {
-                let stderr_esc = json_escape_string(&format!(
-                    "polyglot_exec_compiled: spawn {compiler}: {e}"
-                ));
+                let stderr_esc =
+                    json_escape_string(&format!("polyglot_exec_compiled: spawn {compiler}: {e}"));
                 return Ok(alloc_string(format!(
                     "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
                 )));
@@ -1399,9 +1527,8 @@ pub(super) fn polyglot_exec_compiled(
     let run_output = match run_output {
         Ok(o) => o,
         Err(e) => {
-            let stderr_esc = json_escape_string(&format!(
-                "polyglot_exec_compiled: spawn {run_prog}: {e}"
-            ));
+            let stderr_esc =
+                json_escape_string(&format!("polyglot_exec_compiled: spawn {run_prog}: {e}"));
             return Ok(alloc_string(format!(
                 "{{\"success\":false,\"stdout\":\"\",\"stderr\":\"{stderr_esc}\",\"exit_code\":-1}}"
             )));
@@ -1425,7 +1552,10 @@ pub(super) fn polyglot_exec_compiled(
 /// `{ available: bool, kind: "interpreter"|"compiler", command: "..." }`.
 /// Useful for examples/docs to skip unavailable languages gracefully
 /// instead of failing on missing toolchains.
-pub(super) fn polyglot_detect(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn polyglot_detect(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if !host.allow_exec() {
         return Err(vm_cap!(host, "polyglot_detect", "exec"));
     }
@@ -1683,11 +1813,8 @@ pub(super) fn polyglot_compile_cached(
         other => other,
     };
     match lang_norm {
-        "rust" | "c" | "cpp" | "go" | "pascal"
-        | "csharp" | "fsharp"
-        | "zig" | "d" | "nim" | "swift"
-        | "haskell" | "fortran" | "objc" | "ocaml"
-        | "java" | "kotlin" => {}
+        "rust" | "c" | "cpp" | "go" | "pascal" | "csharp" | "fsharp" | "zig" | "d" | "nim"
+        | "swift" | "haskell" | "fortran" | "objc" | "ocaml" | "java" | "kotlin" => {}
         _ => {
             return Err(host.err(format!(
                 "polyglot_compile_cached(): unsupported language '{}'. Supported: rust, c, cpp, go, pascal, csharp, fsharp, zig, d, nim, swift, haskell, fortran, objc, ocaml, java, kotlin (must produce cdylib)",
@@ -1700,19 +1827,33 @@ pub(super) fn polyglot_compile_cached(
     #[allow(dead_code)]
     fn dotnet_rid() -> &'static str {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        { return "linux-x64"; }
+        {
+            return "linux-x64";
+        }
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        { return "linux-arm64"; }
+        {
+            return "linux-arm64";
+        }
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        { return "osx-x64"; }
+        {
+            return "osx-x64";
+        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        { return "osx-arm64"; }
+        {
+            return "osx-arm64";
+        }
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        { return "win-x64"; }
+        {
+            return "win-x64";
+        }
         #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-        { return "win-arm64"; }
+        {
+            return "win-arm64";
+        }
         #[allow(unreachable_code)]
-        { "linux-x64" }
+        {
+            "linux-x64"
+        }
     }
 
     let key = polyglot_cache_key(lang_norm, code);
@@ -1758,8 +1899,7 @@ pub(super) fn polyglot_compile_cached(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let work_dir =
-        std::env::temp_dir().join(format!("pblang_polyglot_build_{lang_norm}_{nonce}"));
+    let work_dir = std::env::temp_dir().join(format!("pblang_polyglot_build_{lang_norm}_{nonce}"));
     if let Err(e) = std::fs::create_dir_all(&work_dir) {
         return Err(host.err(format!(
             "polyglot_compile_cached(): cannot create work dir: {e}"
@@ -1813,8 +1953,7 @@ pub(super) fn polyglot_compile_cached(
         "c" => {
             let cc = first_available_cmd(&["cc", "gcc", "clang"]).ok_or_else(|| {
                 host.err(
-                    "polyglot_compile_cached(c): no C compiler found (tried cc, gcc, clang)"
-                        .into(),
+                    "polyglot_compile_cached(c): no C compiler found (tried cc, gcc, clang)".into(),
                 )
             })?;
             let src = work_dir.join("src.c");
@@ -1968,8 +2107,7 @@ pub(super) fn polyglot_compile_cached(
         "d" => {
             let cc = first_available_cmd(&["dmd", "ldc2", "gdc"]).ok_or_else(|| {
                 host.err(
-                    "polyglot_compile_cached(d): no D compiler found (tried dmd, ldc2, gdc)"
-                        .into(),
+                    "polyglot_compile_cached(d): no D compiler found (tried dmd, ldc2, gdc)".into(),
                 )
             })?;
             let src = work_dir.join("src.d");
@@ -2141,11 +2279,7 @@ pub(super) fn polyglot_compile_cached(
                 ni = native_image,
                 wd = work_dir.to_string_lossy(),
             );
-            (
-                "sh".to_string(),
-                vec!["-c".into(), script],
-                "Main.java",
-            )
+            ("sh".to_string(), vec!["-c".into(), script], "Main.java")
         }
         "kotlin" => {
             // Kotlin/Native cdylib via `kotlinc-native -produce dynamic`.
@@ -2179,9 +2313,7 @@ pub(super) fn polyglot_compile_cached(
 
     let src_path = work_dir.join(src_name);
     if let Err(e) = std::fs::write(&src_path, code) {
-        return Err(host.err(format!(
-            "polyglot_compile_cached(): write source: {e}"
-        )));
+        return Err(host.err(format!("polyglot_compile_cached(): write source: {e}")));
     }
 
     // Languages that need a sibling project manifest get it dropped
@@ -2301,7 +2433,11 @@ pub(super) fn polyglot_compile_cached(
     // work_dir with a name we asked for, but on Unix they prepend
     // `lib`. Fall back to that name if the bare one isn't there.
     if (lang_norm == "java" || lang_norm == "kotlin") && !staged_lib.is_file() {
-        let stem = if lang_norm == "java" { "prog" } else { "staged_kn" };
+        let stem = if lang_norm == "java" {
+            "prog"
+        } else {
+            "staged_kn"
+        };
         let ext = cdylib_ext();
         let candidates = [
             work_dir.join(format!("{stem}.{ext}")),
@@ -2319,9 +2455,7 @@ pub(super) fn polyglot_compile_cached(
             if let Ok(entries) = std::fs::read_dir(&work_dir) {
                 for entry in entries.flatten() {
                     let p = entry.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some(ext)
-                        && p != staged_lib
-                    {
+                    if p.extension().and_then(|s| s.to_str()) == Some(ext) && p != staged_lib {
                         let _ = std::fs::rename(&p, &staged_lib);
                         break;
                     }
