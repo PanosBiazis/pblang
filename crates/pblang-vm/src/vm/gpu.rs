@@ -111,7 +111,8 @@ fn init() -> Option<GpuCtx> {
     let adapter_name = info.name.clone();
     let adapter_type = type_str(info.device_type).to_string();
     let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .ok()?;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("pblang-matmul"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -124,7 +125,13 @@ fn init() -> Option<GpuCtx> {
         compilation_options: Default::default(),
         cache: None,
     });
-    Some(GpuCtx { device, queue, pipeline, adapter_name, adapter_type })
+    Some(GpuCtx {
+        device,
+        queue,
+        pipeline,
+        adapter_name,
+        adapter_type,
+    })
 }
 
 fn ctx() -> Option<&'static GpuCtx> {
@@ -154,16 +161,20 @@ pub fn matmul(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Option<Vec<
     let af: Vec<f32> = a.iter().map(|&x| x as f32).collect();
     let bf: Vec<f32> = b.iter().map(|&x| x as f32).collect();
 
-    let a_buf = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("a"),
-        contents: bytemuck::cast_slice(&af),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let b_buf = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("b"),
-        contents: bytemuck::cast_slice(&bf),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
+    let a_buf = g
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("a"),
+            contents: bytemuck::cast_slice(&af),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+    let b_buf = g
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("b"),
+            contents: bytemuck::cast_slice(&bf),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
     let out_size = (m * n) as u64 * 4;
     let c_buf = g.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("c"),
@@ -172,11 +183,13 @@ pub fn matmul(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Option<Vec<
         mapped_at_creation: false,
     });
     let dims = [m as u32, k as u32, n as u32, 0u32];
-    let dim_buf = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("dims"),
-        contents: bytemuck::cast_slice(&dims),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let dim_buf = g
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dims"),
+            contents: bytemuck::cast_slice(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
     let staging = g.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("staging"),
         size: out_size,
@@ -188,10 +201,22 @@ pub fn matmul(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Option<Vec<
         label: None,
         layout: &g.pipeline.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: a_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: b_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: c_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: dim_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: a_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: b_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: c_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: dim_buf.as_entire_binding(),
+            },
         ],
     });
 

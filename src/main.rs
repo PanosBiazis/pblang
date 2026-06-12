@@ -36,7 +36,7 @@ use cli::fmt::{
     disable_help_flag = true,
     disable_help_subcommand = true,
     disable_version_flag = true,
-    arg_required_else_help = false,
+    arg_required_else_help = false
 )]
 struct Cli {
     #[command(subcommand)]
@@ -266,8 +266,8 @@ fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
         })
         .collect::<Vec<_>>()
         .into_iter()
-    .filter_map(|p| p.canonicalize().ok())
-    .find(|resolved| resolved.is_file() && resolved.starts_with(&package_root));
+        .filter_map(|p| p.canonicalize().ok())
+        .find(|resolved| resolved.is_file() && resolved.starts_with(&package_root));
 
     candidate
         .ok_or_else(|| {
@@ -1671,14 +1671,44 @@ fn handle_build_polyglot(args: Vec<String>) {
 /// once, then subsequent runs of the user's code skip the subprocess entirely.
 fn warm_polyglot_cache(man_dir: &std::path::Path) {
     const CACHEABLE_LANGS: &[&str] = &[
-        "rust", "rs", "c", "cpp", "c++", "cxx", "go", "pascal", "pas", "delphi", "freepascal",
-        "csharp", "cs", "c#", "fsharp", "fs", "fsx", "f#",
-        "zig", "d", "nim", "swift",
-        "haskell", "hs",
-        "fortran", "f90", "f95", "f03", "f08", "f",
-        "objc", "objective-c", "m",
-        "ocaml", "ml",
-        "java", "kotlin", "kt",
+        "rust",
+        "rs",
+        "c",
+        "cpp",
+        "c++",
+        "cxx",
+        "go",
+        "pascal",
+        "pas",
+        "delphi",
+        "freepascal",
+        "csharp",
+        "cs",
+        "c#",
+        "fsharp",
+        "fs",
+        "fsx",
+        "f#",
+        "zig",
+        "d",
+        "nim",
+        "swift",
+        "haskell",
+        "hs",
+        "fortran",
+        "f90",
+        "f95",
+        "f03",
+        "f08",
+        "f",
+        "objc",
+        "objective-c",
+        "m",
+        "ocaml",
+        "ml",
+        "java",
+        "kotlin",
+        "kt",
     ];
 
     let mut blocks: Vec<(String, String)> = Vec::new();
@@ -1808,7 +1838,10 @@ print "warm-polyglot: " + str(warmed) + " warmed, " + str(skipped) + " skipped";
     let mut chunk = match compile(stmts) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("warm-polyglot: synthesized bootstrap failed to compile: {}", e);
+            eprintln!(
+                "warm-polyglot: synthesized bootstrap failed to compile: {}",
+                e
+            );
             std::process::exit(3);
         }
     };
@@ -1859,8 +1892,9 @@ fn build_tls_config_with_alpn(
 
     // Accept any of: PKCS8, RSA, EC. rustls-pemfile dispatches on the PEM
     // tag automatically via `private_key`.
-    let key = rustls_pemfile::private_key(&mut Cursor::new(key_bytes))?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key in PEM"))?;
+    let key = rustls_pemfile::private_key(&mut Cursor::new(key_bytes))?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key in PEM")
+    })?;
 
     let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1912,58 +1946,154 @@ fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     }
 
     // 1. Env-var pre-fill.
-    if env_on("PBLANG_ALLOW_EXEC") { cfg.exec = true; }
-    if env_on("PBLANG_ALLOW_FFI")  { cfg.ffi  = true; }
-    if env_on("PBLANG_ALLOW_NET")  { cfg.net  = true; }
-    if env_on("PBLANG_ALLOW_FS")   { cfg.fs   = true; }
-    if env_on("PBLANG_ALLOW_HTTP") { cfg.http = true; }
-    if env_on("PBLANG_ALLOW_SQLITE") { cfg.sqlite = true; }
-    if env_on("PBLANG_ALLOW_SPAWN")  { cfg.spawn  = true; }
-    if env_on("PBLANG_ALLOW_GFX")    { cfg.gfx    = true; }
-    if env_on("PBLANG_ALLOW_ENV")    { cfg.env    = true; }
-    if env_on("PBLANG_DENY_ENV")     { cfg.env    = false; }
+    if env_on("PBLANG_ALLOW_EXEC") {
+        cfg.exec = true;
+    }
+    if env_on("PBLANG_ALLOW_FFI") {
+        cfg.ffi = true;
+    }
+    if env_on("PBLANG_ALLOW_NET") {
+        cfg.net = true;
+    }
+    if env_on("PBLANG_ALLOW_FS") {
+        cfg.fs = true;
+    }
+    if env_on("PBLANG_ALLOW_HTTP") {
+        cfg.http = true;
+    }
+    if env_on("PBLANG_ALLOW_SQLITE") {
+        cfg.sqlite = true;
+    }
+    if env_on("PBLANG_ALLOW_SPAWN") {
+        cfg.spawn = true;
+    }
+    if env_on("PBLANG_ALLOW_GFX") {
+        cfg.gfx = true;
+    }
+    if env_on("PBLANG_ALLOW_ENV") {
+        cfg.env = true;
+    }
+    if env_on("PBLANG_DENY_ENV") {
+        cfg.env = false;
+    }
     if env_on("PBLANG_ALLOW_ALL") {
-        cfg.exec = true; cfg.ffi = true; cfg.net = true; cfg.fs = true;
-        cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true; cfg.env = true;
+        cfg.exec = true;
+        cfg.ffi = true;
+        cfg.net = true;
+        cfg.fs = true;
+        cfg.http = true;
+        cfg.sqlite = true;
+        cfg.spawn = true;
+        cfg.gfx = true;
+        cfg.env = true;
     }
     if env_on("PBLANG_SANDBOX") {
-        cfg.exec = false; cfg.ffi = false; cfg.net = false; cfg.fs = false;
-        cfg.http = false; cfg.sqlite = false; cfg.env = false;
+        cfg.exec = false;
+        cfg.ffi = false;
+        cfg.net = false;
+        cfg.fs = false;
+        cfg.http = false;
+        cfg.sqlite = false;
+        cfg.env = false;
     }
 
     // 2. CLI flag scan + strip.
-    args.retain(|a| {
-        match a.as_str() {
-            "--allow-exec"   => { cfg.exec = true;  false }
-            "--allow-ffi"    => { cfg.ffi = true;   false }
-            "--allow-net"    => { cfg.net = true;   false }
-            "--allow-fs"     => { cfg.fs = true;    false }
-            "--allow-http"   => { cfg.http = true;  false }
-            "--allow-sqlite" => { cfg.sqlite = true; false }
-            "--allow-spawn"  => { cfg.spawn = true; false }
-            "--allow-gfx"    => { cfg.gfx = true;   false }
-            "--allow-env"    => { cfg.env = true;   false }
-            "--deny-exec"    => { cfg.exec = false; false }
-            "--deny-ffi"     => { cfg.ffi = false;  false }
-            "--deny-net"     => { cfg.net = false;  false }
-            "--deny-fs"      => { cfg.fs = false;   false }
-            "--deny-http"    => { cfg.http = false; false }
-            "--deny-sqlite"  => { cfg.sqlite = false; false }
-            "--deny-spawn"   => { cfg.spawn = false; false }
-            "--deny-gfx"     => { cfg.gfx = false;  false }
-            "--deny-env"     => { cfg.env = false;  false }
-            "--allow-all" => {
-                cfg.exec = true; cfg.ffi = true; cfg.net = true; cfg.fs = true;
-                cfg.http = true; cfg.sqlite = true; cfg.spawn = true; cfg.gfx = true; cfg.env = true;
-                false
-            }
-            "--sandbox" => {
-                cfg.exec = false; cfg.ffi = false; cfg.net = false; cfg.fs = false;
-                cfg.http = false; cfg.sqlite = false; cfg.env = false;
-                false
-            }
-            _ => true,
+    args.retain(|a| match a.as_str() {
+        "--allow-exec" => {
+            cfg.exec = true;
+            false
         }
+        "--allow-ffi" => {
+            cfg.ffi = true;
+            false
+        }
+        "--allow-net" => {
+            cfg.net = true;
+            false
+        }
+        "--allow-fs" => {
+            cfg.fs = true;
+            false
+        }
+        "--allow-http" => {
+            cfg.http = true;
+            false
+        }
+        "--allow-sqlite" => {
+            cfg.sqlite = true;
+            false
+        }
+        "--allow-spawn" => {
+            cfg.spawn = true;
+            false
+        }
+        "--allow-gfx" => {
+            cfg.gfx = true;
+            false
+        }
+        "--allow-env" => {
+            cfg.env = true;
+            false
+        }
+        "--deny-exec" => {
+            cfg.exec = false;
+            false
+        }
+        "--deny-ffi" => {
+            cfg.ffi = false;
+            false
+        }
+        "--deny-net" => {
+            cfg.net = false;
+            false
+        }
+        "--deny-fs" => {
+            cfg.fs = false;
+            false
+        }
+        "--deny-http" => {
+            cfg.http = false;
+            false
+        }
+        "--deny-sqlite" => {
+            cfg.sqlite = false;
+            false
+        }
+        "--deny-spawn" => {
+            cfg.spawn = false;
+            false
+        }
+        "--deny-gfx" => {
+            cfg.gfx = false;
+            false
+        }
+        "--deny-env" => {
+            cfg.env = false;
+            false
+        }
+        "--allow-all" => {
+            cfg.exec = true;
+            cfg.ffi = true;
+            cfg.net = true;
+            cfg.fs = true;
+            cfg.http = true;
+            cfg.sqlite = true;
+            cfg.spawn = true;
+            cfg.gfx = true;
+            cfg.env = true;
+            false
+        }
+        "--sandbox" => {
+            cfg.exec = false;
+            cfg.ffi = false;
+            cfg.net = false;
+            cfg.fs = false;
+            cfg.http = false;
+            cfg.sqlite = false;
+            cfg.env = false;
+            false
+        }
+        _ => true,
     });
 
     cfg
@@ -2048,8 +2178,7 @@ fn legacy_dispatch(args: Vec<String>) {
                 if let Some(root) = script.ancestors().nth(3) {
                     let _ = std::env::set_current_dir(root);
                 }
-                let mut run_args =
-                    vec!["run".to_string(), "editors/ide/pbide.sapp".to_string()];
+                let mut run_args = vec!["run".to_string(), "editors/ide/pbide.sapp".to_string()];
                 let mut saw_caps = false;
                 for a in args.iter().skip(1) {
                     if a.starts_with("--allow") || a == "--sandbox" || a.starts_with("--deny") {
@@ -2918,11 +3047,10 @@ fn legacy_dispatch(args: Vec<String>) {
 
         if let Some(ws) = parsed_manifest.workspace.as_ref() {
             // Workspace mode.
-            let members =
-                pblang_pm::resolve_workspace_members(&man_dir, ws).unwrap_or_else(|e| {
-                    eprintln!("pblang build: {}", e);
-                    std::process::exit(1);
-                });
+            let members = pblang_pm::resolve_workspace_members(&man_dir, ws).unwrap_or_else(|e| {
+                eprintln!("pblang build: {}", e);
+                std::process::exit(1);
+            });
             // Hybrid root: also build the root package if it has its own
             // [package] section. Pure-virtual workspace skips this.
             let has_root_package = parsed_manifest.package.is_some();
@@ -2955,7 +3083,11 @@ fn legacy_dispatch(args: Vec<String>) {
                 println!("build ok [{}]", label);
             }
             let total = members.len() + if has_root_package { 1 } else { 0 };
-            println!("workspace build ok ({} package{})", total, if total == 1 { "" } else { "s" });
+            println!(
+                "workspace build ok ({} package{})",
+                total,
+                if total == 1 { "" } else { "s" }
+            );
             if warm_polyglot {
                 // Pre-warm against the workspace root; polyglot blocks
                 // are scanned from this directory downwards, so members
@@ -3737,7 +3869,9 @@ li { margin: 0.3em 0; }
                     i += 1;
                     if i >= args.len() {
                         eprintln!("pblang serve: --port requires a value");
-                        eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
+                        eprintln!(
+                            "usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]"
+                        );
                         std::process::exit(2);
                     }
                     match args[i].parse::<u16>() {
@@ -3765,14 +3899,16 @@ li { margin: 0.3em 0; }
                     }
                     tls_key = Some(std::path::PathBuf::from(&args[i]));
                 }
-                other => match other.parse::<u16>() {
-                    Ok(p) if p > 0 => port = p,
-                    _ => {
-                        eprintln!("pblang serve: unrecognized argument '{}'", other);
-                        eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
-                        std::process::exit(2);
+                other => {
+                    match other.parse::<u16>() {
+                        Ok(p) if p > 0 => port = p,
+                        _ => {
+                            eprintln!("pblang serve: unrecognized argument '{}'", other);
+                            eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
+                            std::process::exit(2);
+                        }
                     }
-                },
+                }
             }
             i += 1;
         }
@@ -3906,12 +4042,7 @@ li { margin: 0.3em 0; }
         // `Content-Type: application/json` + serialized body shape exactly.
         fn json_with_status(status: StatusCode, body: serde_json::Value) -> Response {
             let s = serde_json::to_string(&body).unwrap_or_default();
-            (
-                status,
-                [(header::CONTENT_TYPE, "application/json")],
-                s,
-            )
-                .into_response()
+            (status, [(header::CONTENT_TYPE, "application/json")], s).into_response()
         }
 
         async fn handle_run(Json(req): Json<serde_json::Value>) -> Response {
@@ -4264,7 +4395,10 @@ li { margin: 0.3em 0; }
                     serde_json::json!({ "ok": false, "error": "unknown manual id" }),
                 );
             }
-            let selected = state.manual_docs.iter().find(|(doc_id, _, _)| *doc_id == id);
+            let selected = state
+                .manual_docs
+                .iter()
+                .find(|(doc_id, _, _)| *doc_id == id);
             if let Some((doc_id, title, rel_path)) = selected {
                 match std::fs::read_to_string(rel_path) {
                     Ok(content) => json_with_status(
@@ -4348,11 +4482,7 @@ li { margin: 0.3em 0; }
                     Message::Close(_) => break,
                 };
                 let reply = ws_dispatch(&text);
-                if socket
-                    .send(Message::Text(reply.to_string()))
-                    .await
-                    .is_err()
-                {
+                if socket.send(Message::Text(reply.to_string())).await.is_err() {
                     break;
                 }
             }
@@ -4399,12 +4529,7 @@ li { margin: 0.3em 0; }
 
         async fn handle_index() -> Response {
             let html = include_str!("../editors/ide/index.html");
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/html")],
-                html,
-            )
-                .into_response()
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response()
         }
 
         // Enforce explicit Content-Length on POST: the legacy hand-rolled
@@ -4673,9 +4798,8 @@ li { margin: 0.3em 0; }
                                     // indent, splitting at it produces a head that trims to empty
                                     // and a tail that re-indents to the same line — infinite loop.
                                     // Force a hard break at max_len in that case.
-                                    let head_blank = line_to_output[..break_at_raw]
-                                        .trim_end()
-                                        .is_empty();
+                                    let head_blank =
+                                        line_to_output[..break_at_raw].trim_end().is_empty();
                                     let break_at = if break_at_raw == 0 || head_blank {
                                         max_len
                                     } else {
@@ -5143,8 +5267,7 @@ li { margin: 0.3em 0; }
             let src = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(e) => {
-                    planning_failures
-                        .push((stem.clone(), format!("read {path_str}: {e}")));
+                    planning_failures.push((stem.clone(), format!("read {path_str}: {e}")));
                     continue;
                 }
             };
@@ -5166,9 +5289,7 @@ li { margin: 0.3em 0; }
             let test_fns: Vec<String> = stmts
                 .iter()
                 .filter_map(|st| match &st.kind {
-                    StmtKind::Fn(name, _, _, _) if name.starts_with("test_") => {
-                        Some(name.clone())
-                    }
+                    StmtKind::Fn(name, _, _, _) if name.starts_with("test_") => Some(name.clone()),
                     _ => None,
                 })
                 .collect();
@@ -5262,8 +5383,7 @@ li { margin: 0.3em 0; }
                     (Err(e), Some(_)) => {
                         // File load failed; mark all fn-level tests for it as failed.
                         failed += 1;
-                        failures
-                            .push((id.clone(), format!("file load error: {}", e.message)));
+                        failures.push((id.clone(), format!("file load error: {}", e.message)));
                         println!("test {id} ... FAILED");
                     }
                     (Ok(()), Some(name)) => {
@@ -5274,12 +5394,10 @@ li { margin: 0.3em 0; }
                             call_chunk.add_const(pblang_ir::alloc_string(name.clone()));
                         let nil_const = call_chunk.add_const(pblang_ir::Value::Nil);
                         let sp = pblang_ir::chunk::Span::default();
-                        call_chunk
-                            .write(pblang_ir::OpCode::OpGetGlobal(name_const), sp);
+                        call_chunk.write(pblang_ir::OpCode::OpGetGlobal(name_const), sp);
                         call_chunk.write(pblang_ir::OpCode::OpCall(0), sp);
                         call_chunk.write(pblang_ir::OpCode::OpPop, sp);
-                        call_chunk
-                            .write(pblang_ir::OpCode::OpConstant(nil_const), sp);
+                        call_chunk.write(pblang_ir::OpCode::OpConstant(nil_const), sp);
                         call_chunk.write(pblang_ir::OpCode::OpReturn, sp);
                         call_chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
 

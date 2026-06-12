@@ -1037,10 +1037,10 @@ impl VmThreadSupervisor {
             h.remove(&id);
         });
 
-        self.handles.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            id,
-            SupervisedThread { deadline },
-        );
+        self.handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, SupervisedThread { deadline });
         id
     }
 

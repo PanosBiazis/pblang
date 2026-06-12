@@ -80,9 +80,7 @@ fn fs_read_and_fs_write_work() {
 
 #[test]
 fn fs_exists_and_listdir_work() {
-    let dir = std::env::temp_dir()
-        .join("pblang_tests")
-        .join("fs_listdir");
+    let dir = std::env::temp_dir().join("pblang_tests").join("fs_listdir");
     let _ = std::fs::create_dir_all(&dir);
     let a = dir.join("a.txt");
     let b = dir.join("b.txt");
@@ -261,9 +259,7 @@ fn ai_plugin_example_builds_normalized_request_envelope() {
         out,
         vec![
             Value::Bool(true),
-            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(
-                "demo".to_string()
-            ))),
+            Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String("demo".to_string()))),
             Value::Number(64.0),
             Value::Obj(std::rc::Rc::new(pblang_vm::Obj::String(
                 "stubbed by example bridge".to_string()
@@ -550,8 +546,16 @@ fn money_is_exact_decimal_based() {
     let out = run_collect(src);
     assert_eq!(out[0].as_str().unwrap(), "0.3", "exact decimal add");
     assert_eq!(out[1].as_str().unwrap(), "19.99 USD", "format");
-    assert_eq!(out[2].as_str().unwrap(), "3.34,3.33,3.33", "cents-exact split");
-    assert_eq!(out[3].as_str().unwrap(), "10", "split parts sum back exactly");
+    assert_eq!(
+        out[2].as_str().unwrap(),
+        "3.34,3.33,3.33",
+        "cents-exact split"
+    );
+    assert_eq!(
+        out[3].as_str().unwrap(),
+        "10",
+        "split parts sum back exactly"
+    );
     assert_eq!(out[4].as_str().unwrap(), "108.25 USD", "tax");
 }
 
@@ -568,7 +572,10 @@ fn bignum_exact_helpers() {
         print str(bignum.perm(10, 3));     // 720
     "#;
     let out = run_collect(src);
-    assert_eq!(out[0].as_str().unwrap(), "265252859812191058636308480000000");
+    assert_eq!(
+        out[0].as_str().unwrap(),
+        "265252859812191058636308480000000"
+    );
     assert_eq!(out[1].as_str().unwrap(), "12");
     assert_eq!(out[2].as_str().unwrap(), "12");
     assert_eq!(out[3].as_str().unwrap(), "354224848179261915075");
@@ -596,7 +603,11 @@ fn fraction_exact_wrapper_over_rational() {
     assert_eq!(out[3].as_str().unwrap(), "4/3", "reciprocal");
     assert_eq!(out[4].as_str().unwrap(), "2/5", "mediant");
     assert_eq!(out[5].as_str().unwrap(), "355/113", "pi approximation");
-    assert_eq!(out[6].as_str().unwrap(), "1/4", "decimal-string -> fraction");
+    assert_eq!(
+        out[6].as_str().unwrap(),
+        "1/4",
+        "decimal-string -> fraction"
+    );
 }
 
 #[test]
@@ -848,8 +859,16 @@ fn resources_module_memory_and_capture() {
     assert_eq!(out[2], Value::Bool(true), "total >= map allocs");
     assert_eq!(out[3], Value::Number(30.0), "tracked op return value");
     assert_eq!(out[4], Value::Bool(true), "string allocations tracked");
-    assert_eq!(out[5], Value::Number(5.0), "live_capture baseline + 4 steps");
+    assert_eq!(
+        out[5],
+        Value::Number(5.0),
+        "live_capture baseline + 4 steps"
+    );
     assert_eq!(out[6], Value::Number(4.0), "sample yields per-step diffs");
     assert_eq!(out[7], Value::Bool(true), "gc reclaim counts numeric");
-    assert_eq!(out[8], Value::Bool(true), "format produces a readable string");
+    assert_eq!(
+        out[8],
+        Value::Bool(true),
+        "format produces a readable string"
+    );
 }

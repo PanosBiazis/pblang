@@ -108,7 +108,10 @@ pub(super) fn http_post(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
     Ok(alloc_string(out))
 }
 
-pub(super) fn http_get_auth(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn http_get_auth(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() < 2 {
         return Err(host.err(format!(
             "http_get_auth() expects 2 arguments (url, token), got {}",
@@ -134,7 +137,10 @@ pub(super) fn http_get_auth(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
     }
 }
 
-pub(super) fn http_post_auth(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn http_post_auth(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() < 3 {
         return Err(host.err(format!(
             "http_post_auth() expects 3 arguments, got {}",
@@ -283,7 +289,10 @@ pub(super) fn http_parse_request(
     Ok(alloc_map(out))
 }
 
-pub(super) fn http_response(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn http_response(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if args.len() != 2 {
         return Err(host.err(format!(
             "http_response() expects 2 arguments (status, body), got {}",
@@ -387,7 +396,8 @@ pub(super) fn websocket_accept_key(
     const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     let combined = format!("{key}{WS_GUID}");
     let hash = sha1::Sha1::digest(combined.as_bytes());
-    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
+    let encoded =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
     Ok(alloc_string(encoded))
 }
 
@@ -472,8 +482,14 @@ pub(super) fn ws_parse_frame(
         Value::Number(if masked { 1.0 } else { 0.0 }),
     );
     m.insert("payload_len".into(), Value::Number(payload_len as f64));
-    m.insert("frame_len".into(), Value::Number((idx + payload_len) as f64));
-    m.insert("next_index".into(), Value::Number((idx + payload_len) as f64));
+    m.insert(
+        "frame_len".into(),
+        Value::Number((idx + payload_len) as f64),
+    );
+    m.insert(
+        "next_index".into(),
+        Value::Number((idx + payload_len) as f64),
+    );
     Ok(alloc_map(m))
 }
 
@@ -497,7 +513,12 @@ pub(super) fn ws_write_frame(
     let payload_bytes: Vec<u8> = payload.chars().map(|c| (c as u32).min(255) as u8).collect();
 
     let mut rng = rand::thread_rng();
-    let mask_key = [rng.gen::<u8>(), rng.gen::<u8>(), rng.gen::<u8>(), rng.gen::<u8>()];
+    let mask_key = [
+        rng.gen::<u8>(),
+        rng.gen::<u8>(),
+        rng.gen::<u8>(),
+        rng.gen::<u8>(),
+    ];
     let mut out = String::new();
     let b0 = 0x80u8 | (opcode & 0x0f); // FIN=1
     let plen = payload_bytes.len();
@@ -544,4 +565,3 @@ pub(super) fn ws_write_frame(
     }
     Ok(alloc_string(out))
 }
-

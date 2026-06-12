@@ -394,8 +394,8 @@ pub(super) fn tcp_listen_tls(
         .with_single_cert(certs, key)
         .map_err(|e| host.err(format!("tcp_listen_tls(): config: {e}")))?;
 
-    let listener = TcpListener::bind(addr)
-        .map_err(|e| host.err(format!("tcp_listen_tls(): bind: {e}")))?;
+    let listener =
+        TcpListener::bind(addr).map_err(|e| host.err(format!("tcp_listen_tls(): bind: {e}")))?;
 
     let id = with_net_table(host, |t| {
         let id = NET_NEXT.fetch_add(1, Ordering::Relaxed);
@@ -509,16 +509,16 @@ pub(super) fn tcp_wrap_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
             StreamKind::Plain(s) => s,
             _ => {
                 let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(st)));
-                return Err(host.err(
-                    "tcp_wrap_tls(): handle must be a plain (non-TLS) TCP stream".into(),
-                ));
+                return Err(
+                    host.err("tcp_wrap_tls(): handle must be a plain (non-TLS) TCP stream".into())
+                );
             }
         },
         other => {
             let _ = with_net_table(host, |t| t.insert(id, other));
-            return Err(host.err(
-                "tcp_wrap_tls(): handle must be a plain (non-TLS) TCP stream".into(),
-            ));
+            return Err(
+                host.err("tcp_wrap_tls(): handle must be a plain (non-TLS) TCP stream".into())
+            );
         }
     };
 

@@ -2281,7 +2281,7 @@ version = "0.1.0"
 }
 
 #[test]
-fn fetch_url_reads_registry_index_over_http() {
+fn fetch_url_reads_registry_index_over_http_when_explicitly_allowed() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test http listener");
     let addr = listener.local_addr().expect("listener addr");
     let body =
@@ -2299,7 +2299,9 @@ fn fetch_url_reads_registry_index_over_http() {
         }
     });
     let url = format!("http://{}/index.json", addr);
+    std::env::set_var("PBLANG_ALLOW_INSECURE_HTTP", "1");
     let bytes = fetch_url(&url).expect("fetch registry index over http");
+    std::env::remove_var("PBLANG_ALLOW_INSECURE_HTTP");
     handle.join().expect("http server thread");
     let val: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert!(val.get("packages").is_some());

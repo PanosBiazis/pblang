@@ -31,17 +31,18 @@ fn pblang_bin() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target");
     p.push("debug");
-    p.push(if cfg!(windows) { "pblang.exe" } else { "pblang" });
+    p.push(if cfg!(windows) {
+        "pblang.exe"
+    } else {
+        "pblang"
+    });
     p
 }
 
 /// `(label, mangled input)`. Each input is intentionally mis-formatted
 /// so the formatter has something to fix.
 const INDENT_CORPUS: &[(&str, &str)] = &[
-    (
-        "single_fn",
-        "fn main() {\nlet x = 1;\nprint x;\n}\n",
-    ),
+    ("single_fn", "fn main() {\nlet x = 1;\nprint x;\n}\n"),
     (
         "nested_blocks",
         "fn main() {\nlet x = 1;\nif x == 1 {\nprint x;\n}\n}\n",
@@ -64,10 +65,7 @@ const INDENT_CORPUS: &[(&str, &str)] = &[
         "compare_ops_no_spaces",
         "fn main() {\nlet b=1==2;\nlet c=1!=2;\nprint b;\n}\n",
     ),
-    (
-        "comma_in_call",
-        "fn main() {\nfoo(1,2,3);\n}\n",
-    ),
+    ("comma_in_call", "fn main() {\nfoo(1,2,3);\n}\n"),
     (
         "unary_minus_literal",
         "fn main() {\nlet n=-1;\nprint n;\n}\n",
@@ -94,11 +92,8 @@ fn run_rust_fmt(mangled: &str, max_line_length: Option<usize>) -> String {
     );
 
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "pblang-fmt-drift-{}-{}",
-        std::process::id(),
-        seq,
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("pblang-fmt-drift-{}-{}", std::process::id(), seq,));
     std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
     let path = tmp_dir.join("input.sapp");
     std::fs::write(&path, mangled).expect("write fmt input");

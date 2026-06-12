@@ -100,7 +100,11 @@ impl Ty {
     /// Result type of an arithmetic op on two numeric operands: the higher-rank
     /// type (mirrors the VM's promotion). `Any` propagates as `Any`.
     fn numeric_widen(a: &Ty, b: &Ty) -> Ty {
-        if matches!(a, Ty::Any) || matches!(b, Ty::Any) || matches!(a, Ty::Generic(_)) || matches!(b, Ty::Generic(_)) {
+        if matches!(a, Ty::Any)
+            || matches!(b, Ty::Any)
+            || matches!(a, Ty::Generic(_))
+            || matches!(b, Ty::Generic(_))
+        {
             return Ty::Any;
         }
         let (ra, rb) = (a.numeric_rank(), b.numeric_rank());
@@ -758,9 +762,7 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
                         if attr == "__variant" {
                             // Re-infer the discriminant's owner without emitting
                             // duplicate diagnostics.
-                            if let Ty::EnumInstance(ename) =
-                                infer_expr(obj, env, &mut Vec::new())
-                            {
+                            if let Ty::EnumInstance(ename) = infer_expr(obj, env, &mut Vec::new()) {
                                 if let Some(all) = env.enums.get(&ename).cloned() {
                                     let covered: std::collections::HashSet<&str> = arms
                                         .iter()
@@ -898,22 +900,20 @@ fn infer_expr(e: &Expr, env: &mut Env, diags: &mut Vec<Diagnostic>) -> Ty {
         ExprKind::GetAttr(obj, name) => {
             let obj_ty = infer_expr(obj, env, diags);
             match &obj_ty {
-                Ty::Struct(sname, fields) => {
-                    match fields.iter().find(|(fname, _)| fname == name) {
-                        Some((_, fty)) => fty.clone(),
-                        None => {
-                            let mut msg = format!("no field '{}' on struct '{}'", name, sname);
-                            if let Some(s) = closest_field(fields, name) {
-                                msg.push_str(&format!(". Did you mean '{}'?", s));
-                            }
-                            diags.push(Diagnostic {
-                                message: msg,
-                                span: Some(e.span),
-                            });
-                            Ty::Any
+                Ty::Struct(sname, fields) => match fields.iter().find(|(fname, _)| fname == name) {
+                    Some((_, fty)) => fty.clone(),
+                    None => {
+                        let mut msg = format!("no field '{}' on struct '{}'", name, sname);
+                        if let Some(s) = closest_field(fields, name) {
+                            msg.push_str(&format!(". Did you mean '{}'?", s));
                         }
+                        diags.push(Diagnostic {
+                            message: msg,
+                            span: Some(e.span),
+                        });
+                        Ty::Any
                     }
-                }
+                },
                 Ty::Enum(ename, variants) => {
                     match variants.iter().find(|(vname, _)| vname == name) {
                         Some((_, vty)) => vty.clone(),
@@ -1621,9 +1621,8 @@ mod tests {
     fn test_struct_construction_arg_type_mismatch() {
         // `struct` desugars to a typed constructor function, so passing the
         // wrong field type to the constructor is caught as an argument mismatch.
-        let diags = typecheck_source(
-            "struct Point { x: number, y: number }\nlet p = Point(1, \"two\")",
-        );
+        let diags =
+            typecheck_source("struct Point { x: number, y: number }\nlet p = Point(1, \"two\")");
         let mismatch: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
@@ -1637,9 +1636,7 @@ mod tests {
 
     #[test]
     fn test_struct_construction_well_typed_ok() {
-        let diags = typecheck_source(
-            "struct Point { x: number, y: number }\nlet p = Point(1, 2)",
-        );
+        let diags = typecheck_source("struct Point { x: number, y: number }\nlet p = Point(1, 2)");
         let mismatch: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
@@ -1675,7 +1672,11 @@ mod tests {
             .iter()
             .filter(|d| d.message.contains("cannot assign"))
             .collect();
-        assert!(mism.is_empty(), "precision annotations should accept their values: {:?}", mism);
+        assert!(
+            mism.is_empty(),
+            "precision annotations should accept their values: {:?}",
+            mism
+        );
     }
 
     #[test]
@@ -1700,7 +1701,11 @@ mod tests {
             .iter()
             .filter(|d| d.message.contains("expected numeric operands"))
             .collect();
-        assert!(numeric_errs.is_empty(), "bigint/decimal arithmetic is numeric: {:?}", numeric_errs);
+        assert!(
+            numeric_errs.is_empty(),
+            "bigint/decimal arithmetic is numeric: {:?}",
+            numeric_errs
+        );
     }
 
     #[test]
@@ -1816,7 +1821,11 @@ mod tests {
             .iter()
             .filter(|d| d.message.contains("no variant"))
             .collect();
-        assert!(errs.is_empty(), "valid variant access should not warn: {:?}", errs);
+        assert!(
+            errs.is_empty(),
+            "valid variant access should not warn: {:?}",
+            errs
+        );
     }
 
     #[test]
@@ -1824,7 +1833,9 @@ mod tests {
         let diags = typecheck_source("enum Color { Red, Green, Blue }\nlet c = Color.Rad");
         let suggest: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("no variant") && d.message.contains("Did you mean 'Red'"))
+            .filter(|d| {
+                d.message.contains("no variant") && d.message.contains("Did you mean 'Red'")
+            })
             .collect();
         assert!(
             !suggest.is_empty(),
@@ -1836,9 +1847,8 @@ mod tests {
     #[test]
     fn test_enum_data_variant_arg_check() {
         // Data variants are typed constructors: wrong arg type is caught.
-        let diags = typecheck_source(
-            "enum Shape { Empty, Circle(number) }\nlet c = Shape.Circle(\"x\")",
-        );
+        let diags =
+            typecheck_source("enum Shape { Empty, Circle(number) }\nlet c = Shape.Circle(\"x\")");
         let mismatch: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
@@ -1852,9 +1862,8 @@ mod tests {
 
     #[test]
     fn test_enum_data_variant_ok() {
-        let diags = typecheck_source(
-            "enum Shape { Empty, Circle(number) }\nlet c = Shape.Circle(5)",
-        );
+        let diags =
+            typecheck_source("enum Shape { Empty, Circle(number) }\nlet c = Shape.Circle(5)");
         let mismatch: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("argument") && d.message.contains("type mismatch"))
@@ -1893,7 +1902,11 @@ mod tests {
             .iter()
             .filter(|d| d.message.contains("non-exhaustive"))
             .collect();
-        assert!(errs.is_empty(), "exhaustive match should not warn: {:?}", errs);
+        assert!(
+            errs.is_empty(),
+            "exhaustive match should not warn: {:?}",
+            errs
+        );
     }
 
     #[test]

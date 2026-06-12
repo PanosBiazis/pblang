@@ -439,8 +439,16 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
         // space) no longer matches what we drew. Map mouse → buffer space by the
         // buffer/window ratio. When window == buffer (the common case) this is a no-op.
         let (win_w, win_h) = gw.win.get_size();
-        let msx = if win_w > 0 { gw.w as f32 / win_w as f32 } else { 1.0 };
-        let msy = if win_h > 0 { gw.h as f32 / win_h as f32 } else { 1.0 };
+        let msx = if win_w > 0 {
+            gw.w as f32 / win_w as f32
+        } else {
+            1.0
+        };
+        let msy = if win_h > 0 {
+            gw.h as f32 / win_h as f32
+        } else {
+            1.0
+        };
 
         // Key down. KeyRepeat::Yes so a HELD key (arrows, backspace, a letter) auto-repeats
         // at the OS rate — continuous cursor movement / typing while held.

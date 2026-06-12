@@ -1694,11 +1694,12 @@ pub fn publish_to_registry_dir(package_dir: &Path, registry_dir: &Path) -> Resul
     std::fs::write(&tarball_path, &tarball_bytes).map_err(|e| format!("write tarball: {e}"))?;
 
     let tarball_abs = canonicalize_existing(&tarball_path).unwrap_or(tarball_path);
-    let mut url_path = tarball_abs.to_string_lossy().replace('\\', "/");
+    let url_path = tarball_abs.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
-    if let Some(stripped) = url_path.strip_prefix(r"\\?\") {
-        url_path = stripped.to_string();
-    }
+    let url_path = url_path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&url_path)
+        .to_string();
     let url = format!("file:///{}", url_path);
 
     let index_path = registry_dir.join("index.json");

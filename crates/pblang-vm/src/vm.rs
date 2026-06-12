@@ -1,7 +1,7 @@
 use pblang_ir::chunk::{Chunk, OpCode, Span};
 use pblang_ir::{
-    alloc_string, ArithOp, BuiltinFn, Closure, Function, Module, Obj, Upvalue, Value,
-    VmHost, VmLimits as IrVmLimits,
+    alloc_string, ArithOp, BuiltinFn, Closure, Function, Module, Obj, Upvalue, Value, VmHost,
+    VmLimits as IrVmLimits,
 };
 pub use pblang_ir::{FrameTrace, RuntimeError};
 
@@ -47,15 +47,17 @@ mod ffi;
 mod ffi_dispatch;
 mod fs;
 mod gc;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod handles;
 mod http;
 mod json;
 mod maps;
 mod math;
 mod memory;
-mod parse;
 mod net;
 mod os;
+mod parse;
 mod polyglot;
 mod predicates;
 mod quantum;
@@ -66,8 +68,6 @@ mod spawn_wire;
 mod strings;
 mod sync;
 mod tensor;
-#[cfg(feature = "gpu")]
-mod gpu;
 mod time;
 
 use gc::{gc_register_array, gc_register_map, gc_register_module};
@@ -617,7 +617,6 @@ impl VM {
 
     // GC methods (gc_collect_cycles_impl, gc_mark_*, gc_sweep_*) moved to vm/gc.rs
 
-
     fn get_global_from(module: &Rc<RefCell<Module>>, name: &str) -> Option<Value> {
         let mut cur = Some(module.clone());
         while let Some(m) = cur {
@@ -649,7 +648,6 @@ impl VM {
         // array_push / array_pop moved to vm/arrays.rs.
         // map_keys / map_has / map_remove moved to vm/maps.rs.
 
-
         // env_get / env_set moved to vm/env.rs.
 
         // sleep_ms moved to vm/time.rs.
@@ -675,23 +673,15 @@ impl VM {
 
         // str_contains / str_starts_with / str_trim / str_split moved to vm/strings.rs.
 
-
         // tcp_* + tls + find_subslice moved to vm/net.rs (imported above).
 
         // http_status_reason / http_parse_request / http_response /
         // http_response_ct / http_response_json moved to vm/http.rs.
 
-
-
         // ── polyglot builtins extracted ────────────────────────────
         //
         // Implementations live in vm/polyglot.rs and are registered in the
         // BuiltinFn table below as `fun: polyglot::polyglot_*`.
-
-
-
-
-
 
         // ---- String helper builtins ----
         //
@@ -710,7 +700,6 @@ impl VM {
         // hmac_sha256 moved to vm/crypto.rs.
 
         // str_format moved to vm/strings.rs.
-
 
         // ── str_format is a core utility ────────────────────────────────────────────────
 
@@ -736,15 +725,12 @@ impl VM {
 
         // ---- OS builtins ----
 
-
-
         // ── Native quantum statevector simulator ─────────────────────────────
         // `quantum_simulate(circuit)` runs a circuit produced by
         // `stdlib/crypto_quantum.sapp::new_circuit()/apply_gate()/...` against
         // an actual complex statevector and returns the probability vector
 
         // ── Native encoding builtins (hex / url) moved to vm/encoding.rs ──────────────────────
-
 
         // websocket_accept_key / http_post_auth / http_get_auth moved to vm/http.rs.
 
@@ -931,7 +917,9 @@ impl VM {
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
             jit: None,
             jit_state: HashMap::new(),
-            jit_enabled: std::env::var("PBLANG_JIT").map(|v| v != "0").unwrap_or(false),
+            jit_enabled: std::env::var("PBLANG_JIT")
+                .map(|v| v != "0")
+                .unwrap_or(false),
         }
     }
 
@@ -993,7 +981,9 @@ impl VM {
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
             jit: None,
             jit_state: HashMap::new(),
-            jit_enabled: std::env::var("PBLANG_JIT").map(|v| v != "0").unwrap_or(false),
+            jit_enabled: std::env::var("PBLANG_JIT")
+                .map(|v| v != "0")
+                .unwrap_or(false),
         }
     }
 
@@ -1029,7 +1019,9 @@ impl VM {
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
             jit: None,
             jit_state: HashMap::new(),
-            jit_enabled: std::env::var("PBLANG_JIT").map(|v| v != "0").unwrap_or(false),
+            jit_enabled: std::env::var("PBLANG_JIT")
+                .map(|v| v != "0")
+                .unwrap_or(false),
         }
     }
 
@@ -1259,9 +1251,8 @@ impl VM {
                                 Some(Value::Obj(o)) => match o.as_ref() {
                                     pblang_ir::Obj::String(s) => s.clone(),
                                     _ => {
-                                        return Err(
-                                            self.err("OpSafeGetAttr: invalid attr name".to_string()),
-                                        )
+                                        return Err(self
+                                            .err("OpSafeGetAttr: invalid attr name".to_string()))
                                     }
                                 },
                                 _ => {
@@ -1444,16 +1435,22 @@ impl VM {
                         let a = self.pop()?;
                         // Cheap guard keeps numeric/string equality on the pure
                         // native path; only map operands can carry `__eq__`.
-                        let maybe_overload = matches!(a, Value::Map(_)) || matches!(b, Value::Map(_));
-                        if !maybe_overload || !self.try_compare_overload(&a, &b, "__eq__", "__eq__")? {
+                        let maybe_overload =
+                            matches!(a, Value::Map(_)) || matches!(b, Value::Map(_));
+                        if !maybe_overload
+                            || !self.try_compare_overload(&a, &b, "__eq__", "__eq__")?
+                        {
                             self.stack.push(Value::Bool(a == b));
                         }
                     }
                     OpCode::OpNotEq => {
                         let b = self.pop()?;
                         let a = self.pop()?;
-                        let maybe_overload = matches!(a, Value::Map(_)) || matches!(b, Value::Map(_));
-                        if !maybe_overload || !self.try_compare_overload(&a, &b, "__ne__", "__ne__")? {
+                        let maybe_overload =
+                            matches!(a, Value::Map(_)) || matches!(b, Value::Map(_));
+                        if !maybe_overload
+                            || !self.try_compare_overload(&a, &b, "__ne__", "__ne__")?
+                        {
                             self.stack.push(Value::Bool(a != b));
                         }
                     }
@@ -1601,10 +1598,9 @@ impl VM {
 
                         match obj {
                             Value::Module(m) => {
-                                let v =
-                                    m.borrow().exports.get(attr).cloned().ok_or_else(|| {
-                                        self.err(format!("undefined export '{attr}'"))
-                                    })?;
+                                let v = m.borrow().exports.get(attr).cloned().ok_or_else(|| {
+                                    self.err(format!("undefined export '{attr}'"))
+                                })?;
                                 self.stack.push(v);
                             }
                             Value::Map(m) => {
@@ -1765,23 +1761,19 @@ impl VM {
                                 Obj::String(s) => {
                                     let i = match index {
                                         Value::Number(n) => n as isize,
-                                        _ => {
-                                            return Err(self.err("string index must be number"))
-                                        }
+                                        _ => return Err(self.err("string index must be number")),
                                     };
                                     if i < 0 {
                                         return Err(self.err("string index out of bounds"));
                                     }
                                     match s.chars().nth(i as usize) {
                                         Some(c) => self.stack.push(alloc_string(c.to_string())),
-                                        None => {
-                                            return Err(self.err("string index out of bounds"))
-                                        }
+                                        None => return Err(self.err("string index out of bounds")),
                                     }
                                 }
                                 _ => {
                                     return Err(
-                                        self.err("indexing only supported on strings/arrays/maps"),
+                                        self.err("indexing only supported on strings/arrays/maps")
                                     )
                                 }
                             },
@@ -2462,8 +2454,7 @@ impl VM {
                         None
                     };
                     if let Some(f) = fp {
-                        let args: Vec<Value> =
-                            self.stack[args_start..args_start + arity].to_vec();
+                        let args: Vec<Value> = self.stack[args_start..args_start + arity].to_vec();
                         if let Some(ret) = pblang_cranelift::call_jit(f, &args) {
                             self.stack.truncate(callee_index);
                             self.stack.push(ret);

@@ -79,8 +79,7 @@ enum MulOp {
     Div,
 }
 
-pub fn parser<'src>(
-) -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simple<'src, char>>> {
+pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simple<'src, char>>> {
     let ws0 = one_of(" \t\r\n").repeated().ignored();
     let ws1 = one_of(" \t\r\n").repeated().at_least(1).ignored();
 
@@ -91,15 +90,33 @@ pub fn parser<'src>(
     let hex_number = just("0x")
         .or(just("0X"))
         .ignore_then(text::digits(16).to_slice())
-        .map(|s: &str| ExprKind::Number(u64::from_str_radix(s, 16).map(|v| v as f64).unwrap_or(f64::NAN)));
+        .map(|s: &str| {
+            ExprKind::Number(
+                u64::from_str_radix(s, 16)
+                    .map(|v| v as f64)
+                    .unwrap_or(f64::NAN),
+            )
+        });
     let bin_number = just("0b")
         .or(just("0B"))
         .ignore_then(text::digits(2).to_slice())
-        .map(|s: &str| ExprKind::Number(u64::from_str_radix(s, 2).map(|v| v as f64).unwrap_or(f64::NAN)));
+        .map(|s: &str| {
+            ExprKind::Number(
+                u64::from_str_radix(s, 2)
+                    .map(|v| v as f64)
+                    .unwrap_or(f64::NAN),
+            )
+        });
     let oct_number = just("0o")
         .or(just("0O"))
         .ignore_then(text::digits(8).to_slice())
-        .map(|s: &str| ExprKind::Number(u64::from_str_radix(s, 8).map(|v| v as f64).unwrap_or(f64::NAN)));
+        .map(|s: &str| {
+            ExprKind::Number(
+                u64::from_str_radix(s, 8)
+                    .map(|v| v as f64)
+                    .unwrap_or(f64::NAN),
+            )
+        });
 
     let dec_number = text::int(10)
         .map(|s: &str| s.to_string())
@@ -122,7 +139,8 @@ pub fn parser<'src>(
 
     // String content: either non-escape char or escape sequences
     // Supports: \n \t \r \" \\ \0 \xNN (hex byte) \uXXXX (unicode)
-    let hex_digit = any::<&'src str, extra::Err<Simple<'src, char>>>().filter(|c: &char| c.is_ascii_hexdigit());
+    let hex_digit =
+        any::<&'src str, extra::Err<Simple<'src, char>>>().filter(|c: &char| c.is_ascii_hexdigit());
     let escape = just('\\').then(choice((
         just('n').to('\n'),
         just('t').to('\t'),
@@ -186,10 +204,7 @@ pub fn parser<'src>(
     .map_with(mk_expr_w)
     .padded();
 
-    let nil_lit = just("nil")
-        .to(ExprKind::Nil)
-        .map_with(mk_expr_w)
-        .padded();
+    let nil_lit = just("nil").to(ExprKind::Nil).map_with(mk_expr_w).padded();
 
     let ident = text::ident().map(|s: &str| s.to_string()).padded();
 
@@ -270,7 +285,8 @@ pub fn parser<'src>(
         .padded();
 
     // Generic type parameter: an uppercase-starting identifier (e.g. T, K, V)
-    let ty_generic = text::ident().map(|s: &str| s.to_string())
+    let ty_generic = text::ident()
+        .map(|s: &str| s.to_string())
         .padded()
         .try_map(|name: String, span| {
             if name
@@ -286,11 +302,13 @@ pub fn parser<'src>(
             {
                 Ok(TypeKind::Generic(name))
             } else {
-                Err(<Simple<char> as chumsky::label::LabelError<&'src str, _>>::expected_found(
-                    Vec::<chumsky::util::MaybeRef<'_, char>>::new(),
-                    None,
-                    span,
-                ))
+                Err(
+                    <Simple<char> as chumsky::label::LabelError<&'src str, _>>::expected_found(
+                        Vec::<chumsky::util::MaybeRef<'_, char>>::new(),
+                        None,
+                        span,
+                    ),
+                )
             }
         })
         .map_with(mk_type_w)
@@ -377,7 +395,8 @@ pub fn parser<'src>(
         }),
     ));
 
-    let param_with_default = text::ident().map(|s: &str| s.to_string())
+    let param_with_default = text::ident()
+        .map(|s: &str| s.to_string())
         .padded()
         .then(type_ann.clone())
         .then(
@@ -436,8 +455,7 @@ pub fn parser<'src>(
             let sp = e.span().into_range();
             let inner = mk_expr(ExprKind::FnLit(None, vec![], None, body), sp.clone());
             let spawn_var = mk_expr(ExprKind::Var("spawn".to_string()), sp.clone());
-            let spawn_call =
-                mk_expr(ExprKind::Call(Box::new(spawn_var), vec![inner]), sp.clone());
+            let spawn_call = mk_expr(ExprKind::Call(Box::new(spawn_var), vec![inner]), sp.clone());
             let ret_stmt = mk_stmt(StmtKind::Return(Some(spawn_call)), sp.clone());
             StmtKind::Fn(name, params, ret, vec![ret_stmt])
         })
@@ -524,7 +542,8 @@ pub fn parser<'src>(
     let export_stmt = just("export")
         .then_ignore(ws1)
         .ignore_then(
-            text::ident().map(|s: &str| s.to_string())
+            text::ident()
+                .map(|s: &str| s.to_string())
                 .padded()
                 .separated_by(just(',').padded())
                 .allow_trailing()
@@ -554,7 +573,8 @@ pub fn parser<'src>(
         )
         .then_ignore(just('=').padded())
         .then(expr.clone())
-        .map_with(|(names, rhs), __e| { let sp = __e.span().into_range();
+        .map_with(|(names, rhs), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__destruct_{}", sp.start);
             let tmp_expr = Expr {
@@ -676,13 +696,15 @@ pub fn parser<'src>(
     //   With rename: let {key: alias} = expr  →  let alias = __d_N.key;
     let map_destruct_field = choice((
         // key: local_name
-        text::ident().map(|s: &str| s.to_string())
+        text::ident()
+            .map(|s: &str| s.to_string())
             .padded()
             .then_ignore(just(':').padded())
             .then(text::ident().map(|s: &str| s.to_string()).padded())
             .map(|(key, alias): (String, String)| (key, alias)),
         // key  (same name for key and local)
-        text::ident().map(|s: &str| s.to_string())
+        text::ident()
+            .map(|s: &str| s.to_string())
             .padded()
             .map(|name: String| (name.clone(), name)),
     ));
@@ -698,7 +720,8 @@ pub fn parser<'src>(
         )
         .then_ignore(just('=').padded())
         .then(expr.clone())
-        .map_with(|(fields, rhs), __e| { let sp = __e.span().into_range();
+        .map_with(|(fields, rhs), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__mdestruct_{}", sp.start);
             let tmp_expr = Expr {
@@ -770,32 +793,36 @@ pub fn parser<'src>(
         .map_with(|x, e| LPostfix::Index(x, Span::from(span_of(e))))
         .padded();
 
-    let lvalue = text::ident().map(|s: &str| s.to_string())
+    let lvalue = text::ident()
+        .map(|s: &str| s.to_string())
         .padded()
         .map(ExprKind::Var)
         .map_with(mk_expr_w)
-        .foldl(choice((l_attr, l_index)).repeated(), |left: Expr, pf: LPostfix| match pf {
-            LPostfix::Attr(name, a_sp) => {
-                let sp = Span {
-                    start: left.span.start,
-                    end: a_sp.end,
-                };
-                Expr {
-                    kind: ExprKind::GetAttr(Box::new(left), name),
-                    span: sp,
+        .foldl(
+            choice((l_attr, l_index)).repeated(),
+            |left: Expr, pf: LPostfix| match pf {
+                LPostfix::Attr(name, a_sp) => {
+                    let sp = Span {
+                        start: left.span.start,
+                        end: a_sp.end,
+                    };
+                    Expr {
+                        kind: ExprKind::GetAttr(Box::new(left), name),
+                        span: sp,
+                    }
                 }
-            }
-            LPostfix::Index(ix, i_sp) => {
-                let sp = Span {
-                    start: left.span.start,
-                    end: i_sp.end,
-                };
-                Expr {
-                    kind: ExprKind::Index(Box::new(left), Box::new(ix)),
-                    span: sp,
+                LPostfix::Index(ix, i_sp) => {
+                    let sp = Span {
+                        start: left.span.start,
+                        end: i_sp.end,
+                    };
+                    Expr {
+                        kind: ExprKind::Index(Box::new(left), Box::new(ix)),
+                        span: sp,
+                    }
                 }
-            }
-        });
+            },
+        );
 
     // Augmented assignment operators: +=, -=, **=, *=, /=, %=
     #[derive(Clone, Copy, Debug)]
@@ -819,48 +846,50 @@ pub fn parser<'src>(
     .padded();
 
     // aug_assign: lvalue op= expr  (desugars to lvalue = lvalue op expr)
-    let aug_assign_stmt = lvalue
-        .clone()
-        .then(aug_op)
-        .then(expr.clone())
-        .map_with(|((lhs, op), rhs), __e| { let sp = __e.span().into_range();
-            let sp = Span::from(sp);
-            // Build: lhs_expr op rhs
-            let lhs_expr = lhs.clone();
-            let combined = match op {
-                AugOp::Add => Expr {
-                    kind: ExprKind::Add(Box::new(lhs_expr), Box::new(rhs)),
-                    span: sp,
-                },
-                AugOp::Sub => Expr {
-                    kind: ExprKind::Sub(Box::new(lhs_expr), Box::new(rhs)),
-                    span: sp,
-                },
-                AugOp::Mul => Expr {
-                    kind: ExprKind::Mul(Box::new(lhs_expr), Box::new(rhs)),
-                    span: sp,
-                },
-                AugOp::Div => Expr {
-                    kind: ExprKind::Div(Box::new(lhs_expr), Box::new(rhs)),
-                    span: sp,
-                },
-                AugOp::Mod => Expr {
-                    kind: ExprKind::Mod(Box::new(lhs_expr), Box::new(rhs)),
-                    span: sp,
-                },
-                AugOp::Pow => Expr {
-                    kind: ExprKind::Pow(Box::new(lhs_expr), Box::new(rhs)),
-                    span: sp,
-                },
-            };
-            let kind = match lhs.kind {
-                ExprKind::Var(name) => StmtKind::Assign(name, combined),
-                ExprKind::GetAttr(obj, name) => StmtKind::SetAttr(*obj, name, combined),
-                ExprKind::Index(obj, ix) => StmtKind::SetIndex(*obj, *ix, combined),
-                _ => unreachable!("lvalue parser only builds Var/GetAttr/Index"),
-            };
-            Stmt { kind, span: sp }
-        });
+    let aug_assign_stmt =
+        lvalue
+            .clone()
+            .then(aug_op)
+            .then(expr.clone())
+            .map_with(|((lhs, op), rhs), __e| {
+                let sp = __e.span().into_range();
+                let sp = Span::from(sp);
+                // Build: lhs_expr op rhs
+                let lhs_expr = lhs.clone();
+                let combined = match op {
+                    AugOp::Add => Expr {
+                        kind: ExprKind::Add(Box::new(lhs_expr), Box::new(rhs)),
+                        span: sp,
+                    },
+                    AugOp::Sub => Expr {
+                        kind: ExprKind::Sub(Box::new(lhs_expr), Box::new(rhs)),
+                        span: sp,
+                    },
+                    AugOp::Mul => Expr {
+                        kind: ExprKind::Mul(Box::new(lhs_expr), Box::new(rhs)),
+                        span: sp,
+                    },
+                    AugOp::Div => Expr {
+                        kind: ExprKind::Div(Box::new(lhs_expr), Box::new(rhs)),
+                        span: sp,
+                    },
+                    AugOp::Mod => Expr {
+                        kind: ExprKind::Mod(Box::new(lhs_expr), Box::new(rhs)),
+                        span: sp,
+                    },
+                    AugOp::Pow => Expr {
+                        kind: ExprKind::Pow(Box::new(lhs_expr), Box::new(rhs)),
+                        span: sp,
+                    },
+                };
+                let kind = match lhs.kind {
+                    ExprKind::Var(name) => StmtKind::Assign(name, combined),
+                    ExprKind::GetAttr(obj, name) => StmtKind::SetAttr(*obj, name, combined),
+                    ExprKind::Index(obj, ix) => StmtKind::SetIndex(*obj, *ix, combined),
+                    _ => unreachable!("lvalue parser only builds Var/GetAttr/Index"),
+                };
+                Stmt { kind, span: sp }
+            });
 
     // Plain assignment: lvalue = expr
     // NOTE: aug_assign MUST come first in choice() to avoid consuming lvalue then failing on `+=`
@@ -903,7 +932,8 @@ pub fn parser<'src>(
         .then(block_body.clone())
         .then(elif_clause.repeated().collect::<Vec<(Expr, Vec<Stmt>)>>())
         .then(else_clause)
-        .map_with(|(((cond, then_body), elifs), else_body), __e| { let sp = __e.span().into_range();
+        .map_with(|(((cond, then_body), elifs), else_body), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let mut else_body = else_body;
 
@@ -1015,7 +1045,8 @@ pub fn parser<'src>(
         .then(params.clone())
         .then(ret_ann.clone())
         .then(block_body.clone())
-        .map_with(|(((name, params), ret), body), __e| { let sp = __e.span().into_range();
+        .map_with(|(((name, params), ret), body), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let f = Expr {
                 kind: ExprKind::FnLit(Some(name.clone()), params, ret, body),
@@ -1035,7 +1066,8 @@ pub fn parser<'src>(
                 .collect::<Vec<(String, Expr)>>()
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with(|(name, methods), __e| { let sp = __e.span().into_range();
+        .map_with(|(name, methods), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             // Detect init arity BEFORE methods is moved into the map expression.
             // Used later to wire up __call so that `ClassName(args...)` works.
@@ -1395,12 +1427,18 @@ pub fn parser<'src>(
             let mut entries: Vec<(String, Expr)> = Vec::with_capacity(fields.len() + 1);
             entries.push((
                 "__struct".to_string(),
-                Expr { kind: ExprKind::Str(name.clone()), span: sp },
+                Expr {
+                    kind: ExprKind::Str(name.clone()),
+                    span: sp,
+                },
             ));
             for (fname, _) in &fields {
                 entries.push((
                     fname.clone(),
-                    Expr { kind: ExprKind::Var(fname.clone()), span: sp },
+                    Expr {
+                        kind: ExprKind::Var(fname.clone()),
+                        span: sp,
+                    },
                 ));
             }
             let ret_stmt = Stmt {
@@ -1424,17 +1462,14 @@ pub fn parser<'src>(
     // (`Color.Red`); data variants are typed constructor functions
     // (`Shape.Circle(5)`). Both carry `__enum`/`__variant`; data variants also
     // carry a `values` array.
-    let enum_variant = text::ident()
-        .map(|s: &str| s.to_string())
-        .padded()
-        .then(
-            ty.clone()
-                .separated_by(just(',').padded())
-                .allow_trailing()
-                .collect::<Vec<TypeExpr>>()
-                .delimited_by(just('(').padded(), just(')').padded())
-                .or_not(),
-        );
+    let enum_variant = text::ident().map(|s: &str| s.to_string()).padded().then(
+        ty.clone()
+            .separated_by(just(',').padded())
+            .allow_trailing()
+            .collect::<Vec<TypeExpr>>()
+            .delimited_by(just('(').padded(), just(')').padded())
+            .or_not(),
+    );
 
     let enum_stmt = just("enum")
         .then_ignore(ws1)
@@ -1452,7 +1487,10 @@ pub fn parser<'src>(
             let tag = |key: &str, val: String| {
                 (
                     key.to_string(),
-                    Expr { kind: ExprKind::Str(val), span: sp },
+                    Expr {
+                        kind: ExprKind::Str(val),
+                        span: sp,
+                    },
                 )
             };
             let mut map_entries: Vec<(String, Expr)> = Vec::with_capacity(variants.len());
@@ -1516,7 +1554,10 @@ pub fn parser<'src>(
                 kind: StmtKind::Let(
                     name,
                     None,
-                    Expr { kind: ExprKind::Map(map_entries), span: sp },
+                    Expr {
+                        kind: ExprKind::Map(map_entries),
+                        span: sp,
+                    },
                 ),
                 span: sp,
             }
@@ -1561,7 +1602,8 @@ pub fn parser<'src>(
     let goto_jump_stmt = just("goto")
         .then_ignore(ws1)
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
-        .map_with(|label, __e| { let sp = __e.span().into_range();
+        .map_with(|label, __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let e = Expr {
                 kind: ExprKind::Str(label),
@@ -1605,7 +1647,8 @@ pub fn parser<'src>(
         .then(gblock_body.clone())
         .then(g_elif_clause.repeated().collect::<Vec<(Expr, Vec<Stmt>)>>())
         .then(g_else_clause)
-        .map_with(|(((cond, then_body), elifs), else_body), __e| { let sp = __e.span().into_range();
+        .map_with(|(((cond, then_body), elifs), else_body), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let mut else_body = else_body;
             for (econd, ebody) in elifs.into_iter().rev() {
@@ -1719,7 +1762,8 @@ pub fn parser<'src>(
                 .collect::<Vec<(String, Vec<Stmt>)>>()
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with(|labels, __e| { let sp = __e.span().into_range();
+        .map_with(|labels, __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
 
             let pc = format!("__pc_{}", sp.start);
@@ -1896,7 +1940,8 @@ pub fn parser<'src>(
                 .then(switch_default)
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with(|(scrutinee, (cases, default_body)), __e| { let sp = __e.span().into_range();
+        .map_with(|(scrutinee, (cases, default_body)), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__switch_{}", sp.start);
             let tmp_expr = Expr {
@@ -1986,7 +2031,10 @@ pub fn parser<'src>(
         .allow_trailing()
         .collect::<Vec<Expr>>()
         .delimited_by(just('('), just(')'))
-        .map_with(|args, __e| { let sp = __e.span().into_range(); (args, Span::from(sp)) })
+        .map_with(|args, __e| {
+            let sp = __e.span().into_range();
+            (args, Span::from(sp))
+        })
         .padded();
 
     let ident_expr = ident.map(ExprKind::Var).map_with(mk_expr_w);
@@ -1994,7 +2042,9 @@ pub fn parser<'src>(
     // Function literal expression:
     // fn (a, b) { ... }
     // fn name(a, b) { ... }   (optional name, mainly for debugging/stack traces later)
-    let fn_lit_name = ws1.ignore_then(text::ident().map(|s: &str| s.to_string()).padded()).or_not();
+    let fn_lit_name = ws1
+        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .or_not();
 
     let fn_lit_expr = just("fn")
         .ignore_then(fn_lit_name)
@@ -2123,11 +2173,7 @@ pub fn parser<'src>(
         .then_ignore(ws1)
         .ignore_then(match_pattern)
         .then_ignore(just(':').padded())
-        .then(
-            ws0
-                .ignore_then(expr.clone())
-                .then_ignore(ws0),
-        );
+        .then(ws0.ignore_then(expr.clone()).then_ignore(ws0));
 
     // match_arm = guarded (guard absorbed in ws) | unguarded (with `:`)
     let match_arm = choice((guarded_match_arm, unguarded_match_arm));
@@ -2188,7 +2234,8 @@ pub fn parser<'src>(
                 .then(switch_default_expr)
                 .delimited_by(just('{').padded(), just('}').padded()),
         )
-        .map_with(|(scrutinee, (cases, default_expr)), __e| { let sp = __e.span().into_range();
+        .map_with(|(scrutinee, (cases, default_expr)), __e| {
+            let sp = __e.span().into_range();
             let sp = Span::from(sp);
             let tmp = format!("__switch_{}", sp.start);
             let out = format!("__switch_out_{}", sp.start);
@@ -2355,7 +2402,10 @@ pub fn parser<'src>(
             end().to(()),
         )))
         .rewind()
-        .map_with(|_, __e| { let sp = __e.span().into_range(); Postfix::ResultUnwrap(Span::from(sp)) })
+        .map_with(|_, __e| {
+            let sp = __e.span().into_range();
+            Postfix::ResultUnwrap(Span::from(sp))
+        })
         .padded();
 
     // `?? expr` — null coalescing as postfix (parsed before single `?` to avoid ambiguity)
@@ -2364,7 +2414,10 @@ pub fn parser<'src>(
     let null_coal_pf = just("??")
         .ignore_then(ws0)
         .ignore_then(expr.clone())
-        .map_with(|right, __e| { let sp = __e.span().into_range(); Postfix::NullCoal(right, Span::from(sp)) })
+        .map_with(|right, __e| {
+            let sp = __e.span().into_range();
+            Postfix::NullCoal(right, Span::from(sp))
+        })
         .padded();
 
     let call = args.clone().map(|(a, sp)| Postfix::Call(a, sp));
@@ -2372,13 +2425,19 @@ pub fn parser<'src>(
     let method = just(':')
         .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
         .then(args.clone())
-        .map_with(|(name, (a, _)), __e| { let sp = __e.span().into_range(); Postfix::Method(name, a, Span::from(sp)) })
+        .map_with(|(name, (a, _)), __e| {
+            let sp = __e.span().into_range();
+            Postfix::Method(name, a, Span::from(sp))
+        })
         .padded();
 
     let index = expr
         .clone()
         .delimited_by(just('['), just(']'))
-        .map_with(|e, __e| { let sp = __e.span().into_range(); Postfix::Index(e, Span::from(sp)) })
+        .map_with(|e, __e| {
+            let sp = __e.span().into_range();
+            Postfix::Index(e, Span::from(sp))
+        })
         .padded();
 
     // `[start? .. end?]` — slice. Must be tried before `index` so `[a..b]`
@@ -2589,52 +2648,51 @@ pub fn parser<'src>(
     ))
     .or_not();
 
-    let unary_expr = prefix
-        .then(call_expr.clone())
-        .map_with(|(pfx, e), __e| { let sp = __e.span().into_range();
-            let sp = Span::from(sp);
-            match pfx {
-                Some(Prefix::Not) => Expr {
-                    kind: ExprKind::Not(Box::new(e)),
+    let unary_expr = prefix.then(call_expr.clone()).map_with(|(pfx, e), __e| {
+        let sp = __e.span().into_range();
+        let sp = Span::from(sp);
+        match pfx {
+            Some(Prefix::Not) => Expr {
+                kind: ExprKind::Not(Box::new(e)),
+                span: sp,
+            },
+            Some(Prefix::Neg) => {
+                let zero = Expr {
+                    kind: ExprKind::Number(0.0),
                     span: sp,
-                },
-                Some(Prefix::Neg) => {
-                    let zero = Expr {
-                        kind: ExprKind::Number(0.0),
-                        span: sp,
-                    };
-                    Expr {
-                        kind: ExprKind::Sub(Box::new(zero), Box::new(e)),
-                        span: sp,
-                    }
+                };
+                Expr {
+                    kind: ExprKind::Sub(Box::new(zero), Box::new(e)),
+                    span: sp,
                 }
-                // `~e` (bitwise NOT) desugars to a call to the `bit_not` builtin.
-                Some(Prefix::BitNot) => Expr {
-                    kind: ExprKind::Call(
-                        Box::new(Expr {
-                            kind: ExprKind::Var("bit_not".to_string()),
-                            span: sp,
-                        }),
-                        vec![e],
-                    ),
-                    span: sp,
-                },
-                // `await e` blocks on a task/future and yields its value; it
-                // desugars to `join(e)` (the global builtin that joins a spawned
-                // task and returns its result). `async fn` returns such a task.
-                Some(Prefix::Await) => Expr {
-                    kind: ExprKind::Call(
-                        Box::new(Expr {
-                            kind: ExprKind::Var("join".to_string()),
-                            span: sp,
-                        }),
-                        vec![e],
-                    ),
-                    span: sp,
-                },
-                None => e,
             }
-        });
+            // `~e` (bitwise NOT) desugars to a call to the `bit_not` builtin.
+            Some(Prefix::BitNot) => Expr {
+                kind: ExprKind::Call(
+                    Box::new(Expr {
+                        kind: ExprKind::Var("bit_not".to_string()),
+                        span: sp,
+                    }),
+                    vec![e],
+                ),
+                span: sp,
+            },
+            // `await e` blocks on a task/future and yields its value; it
+            // desugars to `join(e)` (the global builtin that joins a spawned
+            // task and returns its result). `async fn` returns such a task.
+            Some(Prefix::Await) => Expr {
+                kind: ExprKind::Call(
+                    Box::new(Expr {
+                        kind: ExprKind::Var("join".to_string()),
+                        span: sp,
+                    }),
+                    vec![e],
+                ),
+                span: sp,
+            },
+            None => e,
+        }
+    });
 
     // multiplicative: * / % and ** (power)
     // Note: ** must be tried before * to avoid consuming first * of **
@@ -2653,9 +2711,9 @@ pub fn parser<'src>(
     ))
     .padded();
 
-    let mul_expr = unary_expr
-        .clone()
-        .foldl(mul_ext_op.then(unary_expr.clone()).repeated(), |left: Expr, (op, right): (MulExtOp, Expr)| {
+    let mul_expr = unary_expr.clone().foldl(
+        mul_ext_op.then(unary_expr.clone()).repeated(),
+        |left: Expr, (op, right): (MulExtOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             let kind = match op {
                 MulExtOp::Mul => ExprKind::Mul(Box::new(left), Box::new(right)),
@@ -2664,21 +2722,23 @@ pub fn parser<'src>(
                 MulExtOp::Pow => ExprKind::Pow(Box::new(left), Box::new(right)),
             };
             Expr { kind, span: sp }
-        });
+        },
+    );
 
     // additive: + -
     let add_op = choice((just('+').to(AddOp::Add), just('-').to(AddOp::Sub))).padded();
 
-    let add_expr = mul_expr
-        .clone()
-        .foldl(add_op.then(mul_expr).repeated(), |left: Expr, (op, right): (AddOp, Expr)| {
+    let add_expr = mul_expr.clone().foldl(
+        add_op.then(mul_expr).repeated(),
+        |left: Expr, (op, right): (AddOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             let kind = match op {
                 AddOp::Add => ExprKind::Add(Box::new(left), Box::new(right)),
                 AddOp::Sub => ExprKind::Sub(Box::new(left), Box::new(right)),
             };
             Expr { kind, span: sp }
-        });
+        },
+    );
 
     // Bitwise operators `<< >> & ^ |` — pure parser sugar that desugars to the
     // `bit_*` builtins (no IR/VM change). Precedence follows Rust/Python: all
@@ -2703,11 +2763,7 @@ pub fn parser<'src>(
         Shl,
         Shr,
     }
-    let shift_op = choice((
-        just("<<").to(ShiftOp::Shl),
-        just(">>").to(ShiftOp::Shr),
-    ))
-    .padded();
+    let shift_op = choice((just("<<").to(ShiftOp::Shl), just(">>").to(ShiftOp::Shr))).padded();
     let shift_expr = add_expr
         .clone()
         .foldl(
@@ -2757,9 +2813,9 @@ pub fn parser<'src>(
     ))
     .padded();
 
-    let cmp_expr = bor_expr
-        .clone()
-        .foldl(cmp_op.then(bor_expr).repeated(), |left: Expr, (op, right): (CmpOp, Expr)| {
+    let cmp_expr = bor_expr.clone().foldl(
+        cmp_op.then(bor_expr).repeated(),
+        |left: Expr, (op, right): (CmpOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             let kind = match op {
                 CmpOp::Eq => ExprKind::Eq(Box::new(left), Box::new(right)),
@@ -2770,7 +2826,8 @@ pub fn parser<'src>(
                 CmpOp::Le => ExprKind::Le(Box::new(left), Box::new(right)),
             };
             Expr { kind, span: sp }
-        });
+        },
+    );
 
     // SP1-gamma: define the restricted `guard_expr` parser used by
     // `case <ident> if <guard> ~ <body>` arms.
@@ -2834,9 +2891,9 @@ pub fn parser<'src>(
     let logical_op =
         choice((just("and").to(LogicalOp::And), just("or").to(LogicalOp::Or))).padded();
 
-    let logical_expr = cmp_expr
-        .clone()
-        .foldl(logical_op.then(cmp_expr).repeated(), |left: Expr, (op, right): (LogicalOp, Expr)| {
+    let logical_expr = cmp_expr.clone().foldl(
+        logical_op.then(cmp_expr).repeated(),
+        |left: Expr, (op, right): (LogicalOp, Expr)| {
             let sp = Span::join(left.span, right.span);
             Expr {
                 kind: ExprKind::Logical {
@@ -2846,7 +2903,8 @@ pub fn parser<'src>(
                 },
                 span: sp,
             }
-        });
+        },
+    );
 
     // Pipeline: `x |> f`, `x |> f(a, b)`, `x |> f(a, _, b)`.
     // Left-associative and looser than logical ops, so `a and b |> f` is
@@ -2854,40 +2912,43 @@ pub fn parser<'src>(
     // injected at the first `_` placeholder in the target call's arguments;
     // with no placeholder it is prepended as the first argument (Elixir-style).
     // A bare target `x |> f` becomes `f(x)`.
-    let pipe_expr = logical_expr.clone().foldl(
-        just("|>").padded().ignore_then(logical_expr.clone()).repeated(),
-        |left: Expr, right: Expr| {
-            let sp = Span::join(left.span, right.span);
-            match right.kind {
-                ExprKind::Call(callee, args) => {
-                    let mut new_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
-                    let mut injected = false;
-                    for a in args {
-                        if !injected
-                            && matches!(&a.kind, ExprKind::Var(n) if n == "_")
-                        {
-                            new_args.push(left.clone());
-                            injected = true;
-                        } else {
-                            new_args.push(a);
+    let pipe_expr = logical_expr
+        .clone()
+        .foldl(
+            just("|>")
+                .padded()
+                .ignore_then(logical_expr.clone())
+                .repeated(),
+            |left: Expr, right: Expr| {
+                let sp = Span::join(left.span, right.span);
+                match right.kind {
+                    ExprKind::Call(callee, args) => {
+                        let mut new_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+                        let mut injected = false;
+                        for a in args {
+                            if !injected && matches!(&a.kind, ExprKind::Var(n) if n == "_") {
+                                new_args.push(left.clone());
+                                injected = true;
+                            } else {
+                                new_args.push(a);
+                            }
+                        }
+                        if !injected {
+                            new_args.insert(0, left.clone());
+                        }
+                        Expr {
+                            kind: ExprKind::Call(callee, new_args),
+                            span: sp,
                         }
                     }
-                    if !injected {
-                        new_args.insert(0, left.clone());
-                    }
-                    Expr {
-                        kind: ExprKind::Call(callee, new_args),
+                    _ => Expr {
+                        kind: ExprKind::Call(Box::new(right), vec![left]),
                         span: sp,
-                    }
+                    },
                 }
-                _ => Expr {
-                    kind: ExprKind::Call(Box::new(right), vec![left]),
-                    span: sp,
-                },
-            }
-        },
-    )
-    .boxed();
+            },
+        )
+        .boxed();
 
     // Ternary: `cond ? then : else` (desugars to IfExpr with block arms).
     let expr_top = pipe_expr

@@ -889,18 +889,14 @@ fn build_warm_polyglot_walks_and_warms() {
     // CI), Pascal scaffolds as a "skipped" path on hosts without fpc.
     // Use a unique function name per test run so we exercise the cold path.
     let unique = nonce;
-    let c_code = format!(
-        "long warm_test_{unique}(long a, long b) {{ return a + b; }}\n"
-    );
+    let c_code = format!("long warm_test_{unique}(long a, long b) {{ return a + b; }}\n");
     let pas_code = format!(
         "library prog;\n\
          function pblang_x_{unique}(a, b: Int64): Int64; cdecl; export;\n\
          begin\n  pblang_x_{unique} := a + b;\nend;\n\
          exports pblang_x_{unique};\nbegin\nend.\n"
     );
-    let src = format!(
-        "@c {{\n{c_code}}}\n@pascal {{\n{pas_code}}}\nprint \"ok\";\n"
-    );
+    let src = format!("@c {{\n{c_code}}}\n@pascal {{\n{pas_code}}}\nprint \"ok\";\n");
     std::fs::write(src_dir.join("main.sapp"), &src).unwrap();
 
     let out = Command::new(&bin)
@@ -928,7 +924,10 @@ fn build_warm_polyglot_walks_and_warms() {
     // At least one of "warmed c" / "skipped c" should appear (C-compiler is
     // installed on virtually every CI; if it weren't we'd see "skipped c").
     let saw_c = stdout.contains("warmed c") || stdout.contains("skipped c");
-    assert!(saw_c, "expected the C block to be warmed or skipped. stdout={stdout}");
+    assert!(
+        saw_c,
+        "expected the C block to be warmed or skipped. stdout={stdout}"
+    );
 }
 
 /// Idempotent: running `--warm-polyglot` twice should not error and the
@@ -998,7 +997,10 @@ fn build_warm_polyglot_handles_empty_project() {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let _ = std::fs::remove_dir_all(&work);
 
-    assert!(out.status.success(), "should exit 0 on empty project. stdout={stdout}");
+    assert!(
+        out.status.success(),
+        "should exit 0 on empty project. stdout={stdout}"
+    );
     assert!(
         stdout.contains("no cacheable @lang blocks found"),
         "expected the empty-project message. stdout={stdout}"
@@ -1033,17 +1035,17 @@ fn make_self_signed_cert() -> Option<(std::path::PathBuf, std::path::PathBuf, st
     let cert = dir.join("cert.pem");
     let key = dir.join("key.pem");
     let status = Command::new("openssl")
-        .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-            "-keyout",
-        ])
+        .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
         .arg(&key)
         .arg("-out")
         .arg(&cert)
         .args([
-            "-days", "1",
-            "-subj", "/CN=localhost",
-            "-addext", "subjectAltName=DNS:localhost",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1170,7 +1172,10 @@ fn https_get_self_signed(port: u16, path: &str) -> std::io::Result<String> {
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     sock.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-    let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        path
+    );
     tls.write_all(req.as_bytes())?;
     let mut buf = Vec::new();
     let _ = tls.read_to_end(&mut buf);
@@ -1402,7 +1407,10 @@ fn ws_send_one_text(port: u16, payload: &str) -> std::io::Result<String> {
     if !header_str.starts_with("HTTP/1.1 101") {
         return Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
-            format!("WS upgrade not 101: {}", header_str.lines().next().unwrap_or("")),
+            format!(
+                "WS upgrade not 101: {}",
+                header_str.lines().next().unwrap_or("")
+            ),
         ));
     }
     let expected_accept = ws_expected_accept(&nonce_b64);

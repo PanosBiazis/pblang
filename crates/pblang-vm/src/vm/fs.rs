@@ -160,7 +160,10 @@ pub(super) fn fs_copy(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, 
     Ok(Value::Nil)
 }
 
-pub(super) fn fs_read_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn fs_read_bytes(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
         return Err(vm_cap!(host, "fs_read_bytes", "fs"));
     }
@@ -189,7 +192,10 @@ pub(super) fn fs_read_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<V
     Ok(alloc_array(out))
 }
 
-pub(super) fn fs_write_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn fs_write_bytes(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
         return Err(vm_cap!(host, "fs_write_bytes", "fs"));
     }
@@ -206,9 +212,7 @@ pub(super) fn fs_write_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<
     let mut bytes: Vec<u8> = Vec::with_capacity(arr.borrow().len());
     for v in arr.borrow().iter() {
         match v {
-            Value::Number(n)
-                if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 =>
-            {
+            Value::Number(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 => {
                 bytes.push(*n as u8);
             }
             _ => {
@@ -234,7 +238,6 @@ pub(super) fn fs_write_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<
     };
     Ok(Value::Nil)
 }
-
 
 pub(super) fn cwd(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
@@ -308,9 +311,7 @@ pub(super) fn path_join(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
     }
     let mut pb = std::path::PathBuf::new();
     for a in args {
-        let s = a
-            .as_str()
-            .map_err(|m| vm_err!(host, "path_join", "{m}"))?;
+        let s = a.as_str().map_err(|m| vm_err!(host, "path_join", "{m}"))?;
         pb.push(s);
     }
     Ok(alloc_string(to_sapp_path(&pb)))
@@ -334,7 +335,10 @@ pub(super) fn path_dirname(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
     Ok(alloc_string(to_sapp_path(&out)))
 }
 
-pub(super) fn path_basename(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+pub(super) fn path_basename(
+    host: &mut dyn VmHost,
+    args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
     if !host.allow_fs() {
         return Err(vm_cap!(host, "path_basename", "fs"));
     }
