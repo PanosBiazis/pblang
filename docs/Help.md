@@ -29,14 +29,14 @@ Rewrite this file after every run to reflect the next batch.
 | **L3-beta** | LSP `open_files` map + scope-aware completion (didOpen/didChange + `collect_local_names`); `tests/lsp.rs`; `docs/Tooling.md` updated. |
 | **Q3-gamma** | `stdlib/quantum_sim.sapp`: `repetition_encode`, `repetition_decode`; `examples/quantum_bb84/main.sapp`; `tests/semantics/quantum_ecc_test.sapp` + `quantum_ecc_repetition_pass`; docs updated. |
 | **Q3-beta** | `stdlib/quantum_sim.sapp`: `histogram`; `tests/semantics/quantum_histogram_test.sapp`; docs updated. |
-| **G3-beta** | `stdlib/math.sapp`: `clamp`, `lerp`, `smoothstep`; `tests/semantics/math_ext_test.sapp`; docs updated. |
+| **G3-beta** | `stdlib/math.sapp`: `math.util` scalar helpers, exported `math.stats`, `math.la` vector/matrix helpers with native large-array routes; `tests/semantics/math_ext_test.sapp`; docs updated. |
 | **A4-beta** | `stdlib/http.sapp`: `post_stream_auth`; `stdlib/provider_registry.sapp`; test; docs updated. |
 | **W4-beta+** | `stdlib/http_server.sapp`: `mw_rate_limit`; test; docs updated. |
 | **W4-beta** | `stdlib/websocket.sapp`: `write_frame`; test; docs updated. |
 | **R3-alpha** | `pblang --dataflow`; `tests/dataflow.rs`; docs updated. |
 | **M4-alpha** | `fetch_and_install_package`; `pblang install <name>@<version>`; `tests/install_cli.rs`; docs updated. |
 | **T5-alpha** | `stdlib/thread.sapp` wrapper; test; docs updated. |
-| **G3-alpha** | `stdlib/collections.sapp`; test; docs updated. |
+| **G3-alpha** | `stdlib/collections.sapp`; `stdlib/array.sapp` exposes native flatten/unique/zip/chunk/take/drop plus find/count/partition helpers; `stdlib/map.sapp` adds copy/defaults/merge_all/optimized omit/update/rename/sorted-key helpers; tests; docs updated. |
 | **L3-alpha** | `pblang fmt` blank line between `fn`; test; docs updated. |
 | **E5-alpha** | `docs/Native_backend_notes.md` Stage A+B design; cross-ref. |
 | **W4-alpha** | `tcp_set_timeout`; http_server timeout/SSE; `docs/TLS_notes.md`; test. |

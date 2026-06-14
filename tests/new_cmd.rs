@@ -57,6 +57,487 @@ fn version_flag_prints_package_version() {
 }
 
 #[test]
+fn test_quiet_suppresses_script_prints_but_reports_status() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_quiet_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("quiet_sample.sapp"),
+        "print \"noisy test output\";\nprint \"quiet_sample_pass\";\n",
+    )
+    .expect("write quiet sample");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--quiet")
+        .output()
+        .expect("run pblang test --quiet");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("test quiet_sample ... ok")
+            && stdout.contains("test result: ok. 1 passed; 0 failed"),
+        "quiet mode should still report test status. stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("noisy test output") && !stdout.contains("quiet_sample_pass"),
+        "quiet mode should suppress script print output. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_list_prints_discovered_tests_without_running_scripts() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_list_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("sample.sapp"),
+        "print \"should_not_execute\";\nfn test_one() { print \"one\"; }\nfn test_two() { print \"two\"; }\n",
+    )
+    .expect("write list sample");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--list")
+        .output()
+        .expect("run pblang test --list");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("2 tests")
+            && stdout.contains("sample::test_one: test")
+            && stdout.contains("sample::test_two: test"),
+        "list mode should print discovered test ids. stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("should_not_execute") && !stdout.contains("\none\n"),
+        "list mode must not execute script code. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_fail_fast_stops_after_first_failure() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_fail_fast_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("a_fail.sapp"),
+        "assert(false, \"first failure\");\n",
+    )
+    .expect("write failing sample");
+    std::fs::write(
+        tests_dir.join("b_late.sapp"),
+        "print \"late_should_not_run\";\n",
+    )
+    .expect("write late sample");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--fail-fast")
+        .arg("--quiet")
+        .output()
+        .expect("run pblang test --fail-fast");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(!out.status.success(), "fail-fast run should fail");
+    assert!(
+        stdout.contains("test a_fail ... FAILED")
+            && stdout.contains("test result: FAILED. 0 passed; 1 failed"),
+        "fail-fast should report the first failure. stderr={stderr}\nstdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("test b_late ... ok") && !stdout.contains("late_should_not_run"),
+        "fail-fast should not run later tests. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_filter_reports_filtered_out_count() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_filter_count_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("sample.sapp"),
+        "fn test_alpha() { print \"alpha\"; }\nfn test_beta() { print \"beta\"; }\nfn test_gamma() { print \"gamma\"; }\n",
+    )
+    .expect("write filter sample");
+
+    let list = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--filter")
+        .arg("alpha")
+        .arg("--list")
+        .output()
+        .expect("run pblang test --filter --list");
+    let list_stdout = String::from_utf8_lossy(&list.stdout).to_string();
+    let list_stderr = String::from_utf8_lossy(&list.stderr).to_string();
+    assert!(
+        list.status.success(),
+        "list should succeed: stderr={list_stderr}\nstdout={list_stdout}"
+    );
+    assert!(
+        list_stdout.contains("1 tests, 2 filtered out")
+            && list_stdout.contains("sample::test_alpha: test")
+            && !list_stdout.contains("sample::test_beta: test"),
+        "list mode should report selected and filtered tests. stdout={list_stdout}"
+    );
+
+    let run = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--filter=alpha")
+        .arg("--quiet")
+        .output()
+        .expect("run pblang test --filter");
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(run.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("test sample::test_alpha ... ok")
+            && stdout.contains(
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out"
+            ),
+        "filtered run should report the filtered-out count. stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("test sample::test_beta ... ok")
+            && !stdout.contains("test sample::test_gamma ... ok"),
+        "filtered run should not execute non-matching tests. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_exact_selects_only_one_test_id() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_exact_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("sample.sapp"),
+        "fn test_alpha() { print \"alpha\"; }\nfn test_alpha_extra() { print \"extra\"; }\nfn test_beta() { print \"beta\"; }\n",
+    )
+    .expect("write exact sample");
+
+    let list = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--exact=sample::test_alpha")
+        .arg("--list")
+        .output()
+        .expect("run pblang test --exact --list");
+    let list_stdout = String::from_utf8_lossy(&list.stdout).to_string();
+    let list_stderr = String::from_utf8_lossy(&list.stderr).to_string();
+    assert!(
+        list.status.success(),
+        "list should succeed: stderr={list_stderr}\nstdout={list_stdout}"
+    );
+    assert!(
+        list_stdout.contains("1 tests, 2 filtered out")
+            && list_stdout.contains("sample::test_alpha: test")
+            && !list_stdout.contains("sample::test_alpha_extra: test"),
+        "exact list mode should select only the exact id. stdout={list_stdout}"
+    );
+
+    let run = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--exact")
+        .arg("sample::test_alpha")
+        .arg("--quiet")
+        .output()
+        .expect("run pblang test --exact");
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(run.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("test sample::test_alpha ... ok")
+            && stdout.contains(
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out"
+            ),
+        "exact run should report one selected test and two filtered tests. stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("test sample::test_alpha_extra ... ok")
+            && !stdout.contains("test sample::test_beta ... ok"),
+        "exact run should not execute partial or unrelated matches. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_skip_excludes_matching_test_ids() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_skip_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("sample.sapp"),
+        "fn test_fast() { print \"fast\"; }\nfn test_slow() { print \"slow\"; }\nfn test_flaky() { print \"flaky\"; }\n",
+    )
+    .expect("write skip sample");
+
+    let list = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--skip=slow")
+        .arg("--skip")
+        .arg("flaky")
+        .arg("--list")
+        .output()
+        .expect("run pblang test --skip --list");
+    let list_stdout = String::from_utf8_lossy(&list.stdout).to_string();
+    let list_stderr = String::from_utf8_lossy(&list.stderr).to_string();
+    assert!(
+        list.status.success(),
+        "list should succeed: stderr={list_stderr}\nstdout={list_stdout}"
+    );
+    assert!(
+        list_stdout.contains("1 tests, 2 filtered out")
+            && list_stdout.contains("sample::test_fast: test")
+            && !list_stdout.contains("sample::test_slow: test")
+            && !list_stdout.contains("sample::test_flaky: test"),
+        "skip list mode should exclude matching ids. stdout={list_stdout}"
+    );
+
+    let run = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--skip=slow")
+        .arg("--quiet")
+        .output()
+        .expect("run pblang test --skip");
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(run.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("test sample::test_fast ... ok")
+            && stdout.contains("test sample::test_flaky ... ok")
+            && stdout.contains(
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out"
+            ),
+        "skip run should report two selected tests and one skipped/filtered test. stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("test sample::test_slow ... ok"),
+        "skip run should not execute matching tests. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_cache_reuses_unchanged_passes_and_invalidates_on_edit() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_cache_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    let sample = tests_dir.join("cache_sample.sapp");
+    std::fs::write(&sample, "print \"CACHE_EXECUTES_1\";\n").expect("write cache sample");
+
+    let first = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--cache")
+        .output()
+        .expect("run first pblang test --cache");
+    let first_stdout = String::from_utf8_lossy(&first.stdout).to_string();
+    assert!(first.status.success(), "stdout={first_stdout}");
+    assert!(
+        first_stdout.contains("CACHE_EXECUTES_1"),
+        "first cached run should execute the script. stdout={first_stdout}"
+    );
+
+    let second = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--cache")
+        .output()
+        .expect("run second pblang test --cache");
+    let second_stdout = String::from_utf8_lossy(&second.stdout).to_string();
+    assert!(second.status.success(), "stdout={second_stdout}");
+    assert!(
+        second_stdout.contains("test cache_sample ... ok")
+            && !second_stdout.contains("CACHE_EXECUTES_1"),
+        "second cached run should reuse pass without executing prints. stdout={second_stdout}"
+    );
+
+    std::fs::write(&sample, "print \"CACHE_EXECUTES_2\";\n").expect("mutate cache sample");
+    let third = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--cache")
+        .output()
+        .expect("run third pblang test --cache");
+    let third_stdout = String::from_utf8_lossy(&third.stdout).to_string();
+    assert!(third.status.success(), "stdout={third_stdout}");
+    assert!(
+        third_stdout.contains("CACHE_EXECUTES_2"),
+        "edited source should invalidate cached pass. stdout={third_stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn test_jobs_runs_independent_files_in_parallel_mode() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_jobs_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("a_jobs.sapp"),
+        "print \"A_LOAD\";\nfn test_one() { print \"A_ONE\"; }\n",
+    )
+    .expect("write first jobs sample");
+    std::fs::write(
+        tests_dir.join("b_jobs.sapp"),
+        "print \"B_LOAD\";\nfn test_two() { print \"B_TWO\"; }\n",
+    )
+    .expect("write second jobs sample");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--jobs=2")
+        .output()
+        .expect("run pblang test --jobs");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("running 2 tests")
+            && stdout.contains("A_LOAD")
+            && stdout.contains("A_ONE")
+            && stdout.contains("B_LOAD")
+            && stdout.contains("B_TWO")
+            && stdout.contains("test a_jobs::test_one ... ok")
+            && stdout.contains("test b_jobs::test_two ... ok")
+            && stdout.contains(
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+            ),
+        "parallel jobs mode should run both files and report deterministic status. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_timings_and_slow_report_are_opt_in() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_timings_{nonce}"));
+    let tests_dir = work.join("tests");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp tests dir");
+    std::fs::write(
+        tests_dir.join("timed.sapp"),
+        "fn test_fast() { print \"fast\"; }\nfn test_slow() { sleep_ms(1); print \"slow\"; }\n",
+    )
+    .expect("write timing sample");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("tests")
+        .arg("--timings")
+        .arg("--slow=1")
+        .arg("--quiet")
+        .arg("--allow-all")
+        .output()
+        .expect("run pblang test --timings --slow");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("test timed::test_fast ... ok (")
+            && stdout.contains("test timed::test_slow ... ok (")
+            && stdout.contains("slow tests:")
+            && stdout.contains("timed::test_slow")
+            && stdout.contains(
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+            ),
+        "timings mode should show per-test durations and slow-test report. stdout={stdout}"
+    );
+}
+
+#[test]
 fn manifest_check_valid_manifest_succeeds() {
     let bin = require_pblang_bin();
     let tmp = std::env::temp_dir().join("pblang_manifest_check_ok");
@@ -442,6 +923,81 @@ fn compile_rejects_conflicting_llvm_and_wasm_flags() {
         stderr.contains("mutually exclusive"),
         "expected mutually exclusive flag error, got stderr: {}",
         stderr
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn compile_reuses_executable_when_project_inputs_are_unchanged() {
+    let bin = require_pblang_bin();
+    let cc_available = ["cc", "gcc", "clang"].iter().any(|cc| {
+        Command::new(cc)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    });
+    if !cc_available {
+        eprintln!("skipping: no C compiler available");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join("pblang_compile_cache_hit");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let script = tmp.join("main.sapp");
+    let exe = tmp.join(if cfg!(windows) { "app.exe" } else { "app" });
+    std::fs::write(&script, "print 1;\n").expect("write script");
+
+    let first = Command::new(&bin)
+        .arg("compile")
+        .arg(&script)
+        .arg("--out")
+        .arg(&exe)
+        .output()
+        .expect("first pblang compile");
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first.status.success(),
+        "first compile failed: {first_stderr}"
+    );
+    assert!(exe.is_file(), "compile should create executable");
+
+    let second = Command::new(&bin)
+        .arg("compile")
+        .arg(&script)
+        .arg("--out")
+        .arg(&exe)
+        .output()
+        .expect("second pblang compile");
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "second compile failed: {second_stderr}"
+    );
+    assert!(
+        second_stderr.contains("cache hit"),
+        "second compile should reuse unchanged executable, stderr={second_stderr}"
+    );
+
+    std::fs::write(&script, "print 2;\n").expect("mutate script");
+    let third = Command::new(&bin)
+        .arg("compile")
+        .arg(&script)
+        .arg("--out")
+        .arg(&exe)
+        .output()
+        .expect("third pblang compile");
+    let third_stderr = String::from_utf8_lossy(&third.stderr);
+    assert!(
+        third.status.success(),
+        "third compile failed: {third_stderr}"
+    );
+    assert!(
+        !third_stderr.contains("cache hit"),
+        "changed source must invalidate cache, stderr={third_stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

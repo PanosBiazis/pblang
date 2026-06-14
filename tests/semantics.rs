@@ -1066,26 +1066,34 @@ fn web_middleware_wrap_and_chain() {
         let m = router.route_map();
         router.add_route(m, "GET", "/hello", fn(req) { return map{ "status": 200, "body": "hello" }; });
         let inner = fn(req) { return router.dispatch(m, req["method"], req["path"], req); };
-        let wrapped = middleware.wrap(inner, middleware.mw_log_stub());
+        let wrapped = middleware.wrap(inner, middleware.mw_log());
         let res = wrapped(map{ method: "GET", path: "/hello" });
         print res["status"];
         print res["body"];
         let inner2 = fn(req) { return map{ "status": 200, "body": "ok" }; };
-        let with_auth = middleware.chain(inner2, [middleware.mw_require_auth_stub("secret")]);
+        let with_auth = middleware.chain(inner2, [middleware.mw_require_auth("secret")]);
         let res_bad = with_auth(map{});
         print res_bad["status"];
         let res_ok = with_auth(map{ auth: "secret" });
         print res_ok["status"];
         print res_ok["body"];
+        let legacy_auth = middleware.mw_require_auth_stub("legacy");
+        print legacy_auth(map{}).status;
+        let legacy_log = middleware.mw_log_stub();
+        let legacy_log_res = legacy_log(map{ method: "GET", path: "/legacy" });
+        if legacy_log_res == nil { print "legacy-log-ok"; }
     "#;
     let out = run_collect(src);
-    assert_eq!(out.len(), 6);
+    assert_eq!(out.len(), 9);
     assert_eq!(out[0].as_str().unwrap(), "GET /hello");
     assert_eq!(out[1], Value::Number(200.0));
     assert_eq!(out[2].as_str().unwrap(), "hello");
     assert_eq!(out[3], Value::Number(401.0));
     assert_eq!(out[4], Value::Number(200.0));
     assert_eq!(out[5].as_str().unwrap(), "ok");
+    assert_eq!(out[6], Value::Number(401.0));
+    assert_eq!(out[7].as_str().unwrap(), "GET /legacy");
+    assert_eq!(out[8].as_str().unwrap(), "legacy-log-ok");
 }
 
 #[test]
@@ -3099,4 +3107,72 @@ fn for_in_count_words_pass() {
     "#,
     );
     assert_eq!(out, vec![Value::Number(13.0)]);
+}
+
+#[test]
+fn blocks_programming_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/blocks_programming_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read blocks_programming_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "blocks_programming_pass",
+        "expected final print blocks_programming_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn machine_opt_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/machine_opt_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read machine_opt_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "machine_opt_pass",
+        "expected final print machine_opt_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn lang_extras_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/lang_extras_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read lang_extras_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "lang_extras_pass",
+        "expected final print lang_extras_pass, got: {:?}",
+        out
+    );
+}
+
+#[test]
+fn graphics_helpers_pass() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/semantics/graphics_helpers_test.sapp");
+    let src = std::fs::read_to_string(&path).expect("read graphics_helpers_test.sapp");
+    let out = run_collect(&src);
+    let got = out
+        .last()
+        .and_then(|v: &pblang_vm::Value| v.as_str().ok().map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        got, "graphics_helpers_pass",
+        "expected final print graphics_helpers_pass, got: {:?}",
+        out
+    );
 }

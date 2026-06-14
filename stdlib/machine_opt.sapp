@@ -1,0 +1,545 @@
+// stdlib/machine_opt.sapp -- portable machine/device optimization planner.
+//
+// This module is an honest substrate for low-level pblang optimization. It
+// builds plans for register pressure, memory layout, cache tiling, binary
+// backend choice, and device routing. It does not magically compile every
+// backend itself; real JIT/AOT/GPU/NPU/FPGA/quantum backends plug in behind the
+// routes this module chooses.
+
+fn profile(kind) {
+    let k = str_lower(str(kind ?? "portable"));
+    if k == "old" or k == "legacy" {
+        return map{
+            kind: "old",
+            word_bits: 32,
+            registers: 8,
+            vector_bits: 0,
+            l1_bytes: 16384,
+            l2_bytes: 0,
+            ram_bytes: 134217728,
+            backend: "freestanding-c",
+            notes: ["prefer small integer kernels", "avoid large heaps", "stream data in chunks"]
+        };
+    }
+    if k == "microcontroller" or k == "mcu" {
+        return map{
+            kind: "microcontroller",
+            word_bits: 32,
+            registers: 16,
+            vector_bits: 0,
+            l1_bytes: 8192,
+            l2_bytes: 0,
+            ram_bytes: 262144,
+            backend: "freestanding-c",
+            notes: ["no dynamic allocation in hot loops", "fixed buffers", "integer math first"]
+        };
+    }
+    if k == "gpu" {
+        return map{
+            kind: "gpu",
+            word_bits: 32,
+            registers: 64,
+            vector_bits: 1024,
+            l1_bytes: 65536,
+            l2_bytes: 4194304,
+            ram_bytes: 4294967296,
+            backend: "gpu-kernel",
+            notes: ["batch tensor work", "coalesce memory reads", "copy once then compute many"]
+        };
+    }
+    if k == "quantum" or k == "qpu" {
+        return map{
+            kind: "quantum",
+            word_bits: 0,
+            registers: 0,
+            vector_bits: 0,
+            l1_bytes: 0,
+            l2_bytes: 0,
+            ram_bytes: 0,
+            backend: "quantum-protocol",
+            notes: ["classical controller prepares circuits", "simulate locally unless remote QPU is configured"]
+        };
+    }
+    if k == "wasm" {
+        return map{
+            kind: "wasm",
+            word_bits: 32,
+            registers: 16,
+            vector_bits: 128,
+            l1_bytes: 32768,
+            l2_bytes: 1048576,
+            ram_bytes: 268435456,
+            backend: "wasm",
+            notes: ["portable sandbox target", "linear memory", "prefer compact arrays"]
+        };
+    }
+    return map{
+        kind: "portable",
+        word_bits: 64,
+        registers: 16,
+        vector_bits: 256,
+        l1_bytes: 32768,
+        l2_bytes: 1048576,
+        ram_bytes: 8589934592,
+        backend: "bytecode-vm+jit-when-safe",
+        notes: ["default to VM", "use JIT/AOT for numeric hot loops", "keep bytecode portability"]
+    };
+}
+
+fn workload(kind, size, dtype) {
+    let k = str_lower(str(kind ?? "generic"));
+    let n = _num_or(size, 1);
+    let dt = str_lower(str(dtype ?? "f64"));
+    return map{
+        kind: k,
+        size: n,
+        dtype: dt,
+        elem_bytes: dtype_bytes(dt),
+        hot_values: _hot_values(k),
+        access: _access_pattern(k)
+    };
+}
+
+fn device(kind, name, props) {
+    let p = props ?? map{};
+    return map{
+        kind: str_lower(str(kind ?? "cpu")),
+        name: str(name ?? kind ?? "device"),
+        props: p,
+        available: _bool_or(try p.available catch true, true)
+    };
+}
+
+fn register_plan(prof, work) {
+    let regs = _max(1, _num_or(try prof.registers catch 8, 8));
+    let hot = _max(1, _num_or(try work.hot_values catch 4, 4));
+    let usable = _min(regs, hot);
+    let spills = _max(0, hot - regs);
+    let strategy = "scalar-register";
+    let vector_bits = _num_or(try prof.vector_bits catch 0, 0);
+    let pk = str_lower(str(try prof.kind catch ""));
+    if vector_bits >= 128 {
+        if _is_numeric(work) {
+            strategy = "vector-register";
+        }
+    }
+    if pk == "quantum" {
+        strategy = "qubit-register-envelope";
+    }
+    return map{
+        strategy: strategy,
+        physical_register_budget: regs,
+        virtual_hot_values: hot,
+        pinned_registers: usable,
+        expected_spills: spills,
+        rule: "keep hottest loop counters, accumulators, and pointers in registers; spill cold values"
+    };
+}
+
+fn memory_plan(bytes, pattern, prof) {
+    let b = _max(0, _num_or(bytes, 0));
+    let p = str_lower(str(pattern ?? "sequential"));
+    let ram = _num_or(try prof.ram_bytes catch 0, 0);
+    let layout = "contiguous";
+    if p == "random" { layout = "chunked-indexed"; }
+    if p == "stream" or p == "sequential" { layout = "streaming-contiguous"; }
+    let chunks = 1;
+    if ram > 0 and b > ram / 4 { chunks = _max(1, num_floor(b / _max(1, ram / 8)) + 1); }
+    let prefetch = p == "stream" or p == "sequential";
+    return map{
+        bytes: b,
+        access: p,
+        layout: layout,
+        chunks: chunks,
+        prefetch: prefetch,
+        cache_friendly: p != "random",
+        rule: "prefer contiguous arrays, bounded chunks, and predictable access before adding more threads"
+    };
+}
+
+fn tile_plan(rows, cols, elem_bytes, cache_bytes) {
+    let r = _max(1, _num_or(rows, 1));
+    let c = _max(1, _num_or(cols, 1));
+    let e = _max(1, _num_or(elem_bytes, 8));
+    let cache = _max(1024, _num_or(cache_bytes, 32768));
+    let elems = _max(1, num_floor(cache / e / 3));
+    let side = _max(1, _isqrt(elems));
+    return map{
+        rows: r,
+        cols: c,
+        elem_bytes: e,
+        cache_bytes: cache,
+        tile_rows: _min(r, side),
+        tile_cols: _min(c, side),
+        tiles_total: _ceil_div(r, side) * _ceil_div(c, side),
+        rule: "fit two inputs plus one output tile in cache when possible"
+    };
+}
+
+fn cache_plan(work, prof) {
+    let l1 = _num_or(try prof.l1_bytes catch 32768, 32768);
+    let n = _max(1, _num_or(try work.size catch 1, 1));
+    let elem = _max(1, _num_or(try work.elem_bytes catch 8, 8));
+    let t = tile_plan(n, n, elem, l1);
+    return map{
+        l1_bytes: l1,
+        l2_bytes: _num_or(try prof.l2_bytes catch 0, 0),
+        tile: t,
+        policy: "hot-loop-cache-first",
+        rule: "tile matrix/tensor work; stream linear work; avoid random pointer chasing in hot paths"
+    };
+}
+
+fn binary_plan(work, prof) {
+    let wk = str_lower(str(try work.kind catch "generic"));
+    let pk = str_lower(str(try prof.kind catch "portable"));
+    let backend = "bytecode-vm";
+    let mode = "portable";
+    let reason = "generic dynamic pblang code stays on the VM";
+    if _is_quantum_work(wk) {
+        backend = "quantum-protocol";
+        mode = "hybrid-classical-quantum";
+        reason = "quantum work is circuit/protocol routed; local simulator is fallback";
+    } else if pk == "old" or pk == "microcontroller" {
+        backend = "freestanding-c";
+        mode = "aot";
+        reason = "small/old machines need predictable memory and C-style binaries";
+    } else if pk == "wasm" {
+        backend = "wasm";
+        mode = "aot";
+        reason = "portable browser/edge sandbox target";
+    } else if _is_numeric(work) and _num_or(try work.size catch 0, 0) >= 64 {
+        backend = "cranelift-jit-or-c-aot";
+        mode = "jit/aot";
+        reason = "numeric hot loops should move from bytecode to machine-code backends";
+    }
+    return map{
+        backend: backend,
+        mode: mode,
+        reason: reason,
+        keep_vm_fallback: true,
+        machine_code_boundary: "verified pblang bytecode/IR first, then JIT/AOT selected hot kernels"
+    };
+}
+
+fn device_plan(work, devices) {
+    let ds = devices ?? [device("cpu", "portable cpu", map{ available: true, cores: 1 })];
+    let wk = str_lower(str(try work.kind catch "generic"));
+    let best = nil;
+    let best_score = -1;
+    let considered = [];
+    let rejected = [];
+    let i = 0;
+    while i < len(ds) {
+        let d = ds[i];
+        let s = _score_device(wk, d);
+        push(considered, map{ device: d, score: s.score, reason: s.reason });
+        if s.score > best_score {
+            best_score = s.score;
+            best = d;
+        }
+        if s.score <= 0 { push(rejected, map{ device: d, reason: s.reason }); }
+        i = i + 1;
+    }
+    if best == nil { best = device("cpu", "portable cpu", map{ available: true, cores: 1 }); best_score = 10; }
+    return map{
+        selected: best,
+        score: best_score,
+        considered: considered,
+        rejected: rejected,
+        rule: "select specialized devices only when the workload and required runtime/toolchain match; CPU is the safe fallback"
+    };
+}
+
+fn full_plan(work, prof, devices) {
+    let p = prof ?? profile("portable");
+    let w = work ?? workload("generic", 1, "f64");
+    let bytes = _max(1, _num_or(try w.size catch 1, 1)) * _max(1, _num_or(try w.elem_bytes catch 8, 8));
+    return map{
+        profile: p,
+        workload: w,
+        registers: register_plan(p, w),
+        memory: memory_plan(bytes, try w.access catch "sequential", p),
+        cache: cache_plan(w, p),
+        binary: binary_plan(w, p),
+        device: device_plan(w, devices ?? []),
+        growth_rule: "measure, keep best plans, reject worse plans, and expand only when validation improves"
+    };
+}
+
+fn play_target(kind) {
+    let k = str_lower(str(kind ?? "desktop"));
+    if k == "desktop" or k == "laptop" or k == "pc" {
+        return map{ kind: "desktop", route: "pblang-vm", artifact: ".sapp source or bundled runtime",
+            command: "pblang run app.sapp", needs: ["pblang runtime"],
+            notes: ["best default route", "JIT may accelerate numeric hot kernels when enabled"] };
+    }
+    if k == "server" or k == "cloud" {
+        return map{ kind: "server", route: "pblang-vm-service", artifact: "bundle or container image",
+            command: "pblang run service.sapp", needs: ["pblang runtime", "capability policy"],
+            notes: ["pin fs/net/exec capabilities", "use logs, health checks, and restart policy"] };
+    }
+    if k == "browser" or k == "web" {
+        return map{ kind: "browser", route: "wasm", artifact: ".wasm/.wat plus web loader",
+            command: "pblang compile --wasm app.sapp", needs: ["WASM backend", "browser host bridge"],
+            notes: ["sandboxed linear memory", "host APIs must be bridged explicitly"] };
+    }
+    if k == "mobile" or k == "android" or k == "ios" {
+        return map{ kind: "mobile", route: "embedded-runtime-or-wasm", artifact: "app bundle with pblang runtime or WASM module",
+            command: "bundle runtime into native shell", needs: ["mobile host app", "capability bridge"],
+            notes: ["keep storage/network permissions explicit", "prefer WASM/runtime embedding first"] };
+    }
+    if k == "old" or k == "old_pc" or k == "legacy" {
+        return map{ kind: "old_pc", route: "freestanding-c-aot", artifact: "small native executable",
+            command: "pblang compile app.sapp --opt 2", needs: ["C compiler or cross compiler"],
+            notes: ["avoid large heaps", "stream files", "prefer integer kernels"] };
+    }
+    if k == "microcontroller" or k == "mcu" or k == "embedded" {
+        return map{ kind: "microcontroller", route: "firmware-c-subset", artifact: "C subset / firmware object",
+            command: "transpile constrained pblang subset, then use vendor toolchain",
+            needs: ["no dynamic runtime features", "vendor SDK"],
+            notes: ["fixed buffers", "no filesystem unless board supplies one", "interrupts and registers are host-specific"] };
+    }
+    if k == "gpu" {
+        return map{ kind: "gpu", route: "host-vm-plus-gpu-kernels", artifact: "pblang app plus GPU kernel backend",
+            command: "run on CPU host; offload tensor kernels", needs: ["GPU runtime", "kernel verification"],
+            notes: ["GPU is an accelerator, not a standalone pblang host", "copy data once, compute many times"] };
+    }
+    if k == "npu" {
+        return map{ kind: "npu", route: "host-vm-plus-vendor-inference-runtime", artifact: "model graph plus pblang controller",
+            command: "run pblang on host; call NPU runtime for supported graphs",
+            needs: ["OpenVINO/QNN/Vitis AI or vendor runtime"],
+            notes: ["NPU is inference-specialized", "fallback to CPU when runtime is missing"] };
+    }
+    if k == "fpga" {
+        return map{ kind: "fpga", route: "host-vm-plus-bitstream", artifact: "bitstream plus pblang controller",
+            command: "generate/flash bitstream with HDL toolchain, control from pblang host",
+            needs: ["HDL/HLS toolchain", "board driver"],
+            notes: ["excellent for streams/pipelines", "not direct general pblang execution yet"] };
+    }
+    if k == "quantum" or k == "qpu" {
+        return map{ kind: "quantum", route: "quantum-protocol", artifact: "circuit spec / QASM / provider job",
+            command: "build circuit in pblang, simulate locally or submit remotely",
+            needs: ["quantum_sim or provider bridge"],
+            notes: ["classical pblang controls the circuit", "QPU execution is remote/protocol-based"] };
+    }
+    if k == "cluster" or k == "distributed" {
+        return map{ kind: "distributed", route: "multi-node-controller", artifact: "bundle per node plus coordination config",
+            command: "deploy pblang bundle to each node and coordinate jobs",
+            needs: ["network transport", "scheduler/agent"],
+            notes: ["partition data first", "measure communication overhead"] };
+    }
+    if k == "iot" or k == "robot" or k == "device" {
+        return map{ kind: "iot", route: "edge-runtime-or-controller", artifact: "small runtime bundle or host-controller script",
+            command: "run pblang on gateway or embedded host", needs: ["device driver bridge"],
+            notes: ["keep hardware access behind capabilities", "prefer gateway control for tiny devices"] };
+    }
+    return map{ kind: k, route: "portable-vm-fallback", artifact: ".sapp source plus runtime",
+        command: "pblang run app.sapp", needs: ["pblang runtime for target"],
+        notes: ["unknown target class; use VM fallback until a backend is added"] };
+}
+
+fn play_plan(program, target_kind, opts) {
+    let t = play_target(target_kind);
+    let o = opts ?? map{};
+    let w = workload(try o.workload catch "generic", try o.size catch 1, try o.dtype catch "f64");
+    let p = profile(_profile_for_target(try t.kind catch "desktop"));
+    let plan = full_plan(w, p, try o.devices catch []);
+    return map{
+        program: str(program ?? "app.sapp"),
+        target: t,
+        optimization: plan,
+        route: t.route,
+        artifact: t.artifact,
+        command: t.command,
+        stages: _play_stages(t, plan),
+        safety: ["capability policy first", "verify generated code/artifact", "keep VM or simulator fallback"],
+        status: "planned"
+    };
+}
+
+fn play_matrix(program, targets) {
+    let ts = targets ?? ["desktop", "browser", "old_pc", "microcontroller", "gpu", "npu", "fpga", "quantum", "distributed", "iot"];
+    let out = [];
+    let i = 0;
+    while i < len(ts) {
+        push(out, play_plan(program, ts[i], map{}));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn explain(plan) {
+    let p = plan ?? map{};
+    let dev = try p.device.selected.kind catch "cpu";
+    let bin = try p.binary.backend catch "bytecode-vm";
+    let reg = try p.registers.strategy catch "scalar-register";
+    let mem = try p.memory.layout catch "contiguous";
+    return "machine_opt: device=" + str(dev)
+        + ", backend=" + str(bin)
+        + ", registers=" + str(reg)
+        + ", memory=" + str(mem)
+        + ". Boundary: this is a planning substrate; backend implementations must verify generated code.";
+}
+
+fn dtype_bytes(dtype) {
+    let d = str_lower(str(dtype ?? "f64"));
+    if d == "u8" or d == "i8" or d == "byte" or d == "bool" { return 1; }
+    if d == "u16" or d == "i16" or d == "f16" { return 2; }
+    if d == "u32" or d == "i32" or d == "f32" { return 4; }
+    if d == "u64" or d == "i64" or d == "f64" { return 8; }
+    if d == "qubit" { return 0; }
+    return 8;
+}
+
+fn _score_device(wk, d) {
+    let kind = str_lower(str(try d.kind catch "cpu"));
+    let props = try d.props catch map{};
+    let avail = _bool_or(try d.available catch true, true);
+    if not avail { return map{ score: 0, reason: "device unavailable" }; }
+    if kind == "quantum" or kind == "qpu" {
+        if _is_quantum_work(wk) { return map{ score: 100, reason: "quantum circuit/protocol workload" }; }
+        return map{ score: 0, reason: "not a quantum workload" };
+    }
+    if kind == "gpu" {
+        if (_is_tensor_work(wk) or wk == "matmul") and _bool_or(try props.tensor catch false, false) {
+            return map{ score: 90, reason: "tensor/matmul workload with GPU tensor support" };
+        }
+        return map{ score: 5, reason: "GPU present but no matching tensor kernel/runtime" };
+    }
+    if kind == "npu" {
+        if (wk == "inference" or wk == "onnx") and _bool_or(try props.runtime catch false, false) {
+            return map{ score: 85, reason: "inference workload with NPU runtime" };
+        }
+        return map{ score: 0, reason: "NPU detected only until a vendor runtime is configured" };
+    }
+    if kind == "fpga" {
+        if (wk == "stream" or wk == "bitstream") and _bool_or(try props.toolchain catch false, false) {
+            return map{ score: 80, reason: "streaming workload with FPGA toolchain" };
+        }
+        return map{ score: 0, reason: "FPGA needs an external HDL/toolchain path" };
+    }
+    if kind == "distributed" {
+        if _bool_or(try props.network catch false, false) and _num_or(try props.nodes catch 0, 0) > 1 {
+            return map{ score: 50, reason: "distributed execution available but coordination overhead applies" };
+        }
+        return map{ score: 0, reason: "distributed device lacks network/node metadata" };
+    }
+    if kind == "cpu" { return map{ score: 40, reason: "portable CPU fallback" }; }
+    return map{ score: 10, reason: "unknown device class; route conservatively" };
+}
+
+fn _hot_values(k) {
+    if k == "matmul" { return 12; }
+    if k == "tensor" or k == "training" { return 16; }
+    if k == "inference" or k == "onnx" { return 10; }
+    if _is_quantum_work(k) { return 4; }
+    return 6;
+}
+
+fn _access_pattern(k) {
+    if k == "matmul" or k == "tensor" or k == "training" { return "tiled"; }
+    if k == "stream" or k == "dataset" { return "stream"; }
+    if k == "graph" { return "random"; }
+    return "sequential";
+}
+
+fn _is_numeric(work) {
+    let k = str_lower(str(try work.kind catch "generic"));
+    let dt = str_lower(str(try work.dtype catch "f64"));
+    return k == "matmul" or k == "tensor" or k == "training" or k == "numeric"
+        or dt == "f32" or dt == "f64" or dt == "i32" or dt == "i64";
+}
+
+fn _is_tensor_work(k) {
+    return k == "tensor" or k == "training" or k == "inference" or k == "onnx";
+}
+
+fn _is_quantum_work(k) {
+    return k == "quantum" or k == "quantum_circuit" or k == "qpu" or k == "qubit";
+}
+
+fn _profile_for_target(k) {
+    let t = str_lower(str(k ?? "desktop"));
+    if t == "old_pc" { return "old"; }
+    if t == "microcontroller" { return "microcontroller"; }
+    if t == "browser" { return "wasm"; }
+    if t == "gpu" { return "gpu"; }
+    if t == "quantum" { return "quantum"; }
+    return "portable";
+}
+
+fn _play_stages(target, plan) {
+    let route = str_lower(str(try target.route catch "pblang-vm"));
+    let stages = ["parse", "typecheck", "capability-check"];
+    if route == "pblang-vm" or route == "pblang-vm-service" or route == "portable-vm-fallback" {
+        push(stages, "bytecode");
+        push(stages, "run-on-vm");
+        return stages;
+    }
+    if route == "wasm" or route == "embedded-runtime-or-wasm" {
+        push(stages, "compile-wasm");
+        push(stages, "bind-host-apis");
+        push(stages, "run-in-sandbox");
+        return stages;
+    }
+    if route == "freestanding-c-aot" or route == "firmware-c-subset" {
+        push(stages, "lower-safe-subset");
+        push(stages, "emit-c");
+        push(stages, "cross-compile");
+        push(stages, "flash-or-run-native");
+        return stages;
+    }
+    if route == "host-vm-plus-gpu-kernels" or route == "host-vm-plus-vendor-inference-runtime" or route == "host-vm-plus-bitstream" {
+        push(stages, "run-controller-on-vm");
+        push(stages, "prepare-device-artifact");
+        push(stages, "verify-device-output");
+        push(stages, "fallback-to-cpu");
+        return stages;
+    }
+    if route == "quantum-protocol" {
+        push(stages, "build-circuit");
+        push(stages, "simulate-or-submit");
+        push(stages, "verify-measurements-classically");
+        return stages;
+    }
+    if route == "multi-node-controller" {
+        push(stages, "bundle");
+        push(stages, "deploy-to-nodes");
+        push(stages, "coordinate-results");
+        return stages;
+    }
+    push(stages, "run-with-vm-fallback");
+    return stages;
+}
+
+fn _isqrt(n) {
+    let x = _max(0, _num_or(n, 0));
+    let r = 0;
+    while (r + 1) * (r + 1) <= x { r = r + 1; }
+    return r;
+}
+
+fn _ceil_div(a, b) {
+    let x = _max(0, _num_or(a, 0));
+    let y = _max(1, _num_or(b, 1));
+    return num_floor((x + y - 1) / y);
+}
+
+fn _num_or(x, fallback) {
+    if is_number(x) { return x; }
+    let n = try num(x) catch fallback;
+    if is_number(n) { return n; }
+    return fallback;
+}
+
+fn _bool_or(x, fallback) {
+    if is_bool(x) { return x; }
+    return fallback;
+}
+
+fn _min(a, b) { if a < b { return a; } return b; }
+fn _max(a, b) { if a > b { return a; } return b; }
+
+export profile, workload, device, register_plan, memory_plan, tile_plan, cache_plan;
+export binary_plan, device_plan, full_plan, play_target, play_plan, play_matrix, explain, dtype_bytes;

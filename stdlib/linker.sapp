@@ -1,0 +1,265 @@
+// stdlib/linker.sapp -- pblang-owned linker substrate.
+//
+// This is the portable linker model layer: object descriptions, symbol tables,
+// relocation records, layout planning, duplicate/undefined-symbol diagnostics,
+// and deterministic linked-image manifests. Real ELF/PE/Mach-O writers can use
+// this as the front half instead of each backend inventing its own linker logic.
+
+fn object(name, sections, symbols, relocations) {
+    return map{
+        format: "pbai.linker.object.v1",
+        name: str(name ?? "object"),
+        sections: sections ?? [],
+        symbols: symbols ?? [],
+        relocations: relocations ?? []
+    };
+}
+
+fn section(name, bytes, flags, align) {
+    return map{
+        name: str(name ?? ".text"),
+        bytes: bytes ?? [],
+        flags: flags ?? ["alloc"],
+        align: _max(1, _num_or(align, 1)),
+        address: 0,
+        offset: 0,
+        size: len(bytes ?? [])
+    };
+}
+
+fn symbol(name, section_name, offset, global) {
+    return map{
+        name: str(name ?? ""),
+        section: str(section_name ?? ""),
+        offset: _num_or(offset, 0),
+        global: _bool_or(global, true),
+        address: 0
+    };
+}
+
+fn relocation(section_name, offset, symbol_name, kind, addend) {
+    return map{
+        section: str(section_name ?? ".text"),
+        offset: _num_or(offset, 0),
+        symbol: str(symbol_name ?? ""),
+        kind: str(kind ?? "abs64"),
+        addend: _num_or(addend, 0)
+    };
+}
+
+fn link(objects, opts) {
+    let options = opts ?? map{};
+    let base = _num_or(try options.base catch 4194304, 4194304);
+    let image = map{
+        format: "pbai.linker.image.v1",
+        target: str(try options.target catch "portable"),
+        entry: str(try options.entry catch "_start"),
+        base: base,
+        sections: [],
+        symbols: map{},
+        relocations: [],
+        diagnostics: [],
+        ok: true
+    };
+
+    let cursor = base;
+    let oi = 0;
+    while oi < len(objects) {
+        let obj = objects[oi];
+        let si = 0;
+        while si < len(obj.sections) {
+            let sec = obj.sections[si];
+            let align = _max(1, _num_or(try sec.align catch 1, 1));
+            cursor = _align(cursor, align);
+            let placed = _copy_section(sec);
+            placed.address = cursor;
+            placed.offset = cursor - base;
+            placed.object = obj.name;
+            push(image.sections, placed);
+            cursor = cursor + placed.size;
+            si = si + 1;
+        }
+        oi = oi + 1;
+    }
+
+    _resolve_symbols(image, objects);
+    _collect_relocations(image, objects);
+    _check_relocations(image);
+    if len(image.diagnostics) > 0 { image.ok = false; }
+    return image;
+}
+
+fn emit_manifest(image) {
+    let out = "";
+    out = out + "format=" + image.format + "\n";
+    out = out + "target=" + image.target + "\n";
+    out = out + "entry=" + image.entry + "\n";
+    out = out + "base=" + str(image.base) + "\n";
+    out = out + "ok=" + str(image.ok) + "\n";
+    out = out + "[sections]\n";
+    let i = 0;
+    while i < len(image.sections) {
+        let s = image.sections[i];
+        out = out + s.name + " addr=" + str(s.address) + " size=" + str(s.size) + " object=" + s.object + "\n";
+        i = i + 1;
+    }
+    out = out + "[symbols]\n";
+    let names = map_keys(image.symbols);
+    names = _sort_strings(names);
+    i = 0;
+    while i < len(names) {
+        let n = names[i];
+        let sym = image.symbols[n];
+        out = out + n + " addr=" + str(sym.address) + " section=" + sym.section + " object=" + sym.object + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolve_symbols(image, objects) {
+    let oi = 0;
+    while oi < len(objects) {
+        let obj = objects[oi];
+        let si = 0;
+        while si < len(obj.symbols) {
+            let sym = obj.symbols[si];
+            if _bool_or(try sym.global catch true, true) {
+                if map_has(image.symbols, sym.name) {
+                    push(image.diagnostics, "duplicate symbol: " + sym.name);
+                } else {
+                    let sec = _find_section(image.sections, obj.name, sym.section);
+                    if sec == nil {
+                        push(image.diagnostics, "symbol section not found: " + sym.name + " -> " + sym.section);
+                    } else {
+                        let placed = map{
+                            name: sym.name,
+                            section: sym.section,
+                            object: obj.name,
+                            offset: _num_or(try sym.offset catch 0, 0),
+                            address: sec.address + _num_or(try sym.offset catch 0, 0)
+                        };
+                        image.symbols[sym.name] = placed;
+                    }
+                }
+            }
+            si = si + 1;
+        }
+        oi = oi + 1;
+    }
+}
+
+fn _collect_relocations(image, objects) {
+    let oi = 0;
+    while oi < len(objects) {
+        let obj = objects[oi];
+        let ri = 0;
+        while ri < len(obj.relocations) {
+            let r = obj.relocations[ri];
+            let sec = _find_section(image.sections, obj.name, r.section);
+            let at = _num_or(try r.offset catch 0, 0);
+            let addr = 0;
+            if sec != nil { addr = sec.address + at; }
+            push(image.relocations, map{
+                object: obj.name,
+                section: r.section,
+                offset: at,
+                address: addr,
+                symbol: r.symbol,
+                kind: r.kind,
+                addend: _num_or(try r.addend catch 0, 0)
+            });
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+}
+
+fn _check_relocations(image) {
+    let i = 0;
+    while i < len(image.relocations) {
+        let r = image.relocations[i];
+        if not map_has(image.symbols, r.symbol) {
+            push(image.diagnostics, "undefined symbol: " + r.symbol);
+        }
+        i = i + 1;
+    }
+}
+
+fn _find_section(sections, object_name, section_name) {
+    let i = 0;
+    while i < len(sections) {
+        let s = sections[i];
+        if s.object == object_name and s.name == section_name { return s; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _copy_section(sec) {
+    return map{
+        name: sec.name,
+        bytes: sec.bytes,
+        flags: sec.flags,
+        align: _max(1, _num_or(try sec.align catch 1, 1)),
+        address: 0,
+        offset: 0,
+        size: len(try sec.bytes catch [])
+    };
+}
+
+fn _align(value, align) {
+    let a = _max(1, _num_or(align, 1));
+    let rem = num_mod(value, a);
+    if rem == 0 { return value; }
+    return value + (a - rem);
+}
+
+fn _sort_strings(values) {
+    let out = values;
+    let i = 0;
+    while i < len(out) {
+        let j = i + 1;
+        while j < len(out) {
+            if _str_cmp(str(out[j]), str(out[i])) < 0 {
+                let tmp = out[i];
+                out[i] = out[j];
+                out[j] = tmp;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _str_cmp(a, b) {
+    let la = len(a);
+    let lb = len(b);
+    let n = la;
+    if lb < la { n = lb; }
+    let i = 0;
+    while i < n {
+        let ca = strcharcodeat(a, i);
+        let cb = strcharcodeat(b, i);
+        if ca < cb { return 0 - 1; }
+        if ca > cb { return 1; }
+        i = i + 1;
+    }
+    if la < lb { return 0 - 1; }
+    if la > lb { return 1; }
+    return 0;
+}
+
+fn _num_or(v, fallback) {
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _bool_or(v, fallback) {
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _max(a, b) { if a > b { return a; } return b; }
+
+export object, section, symbol, relocation, link, emit_manifest;

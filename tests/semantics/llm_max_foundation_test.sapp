@@ -10,6 +10,7 @@ let eval = import("stdlib:llm_eval.sapp");
 let weights = import("stdlib:llm_weights.sapp");
 let quant = import("stdlib:llm_quant.sapp");
 let binary = import("stdlib:llm_binary.sapp");
+let offload = import("stdlib:llm_offload.sapp");
 
 let records = [
     data.corpus_record("safe1.sapp", "fn add(a,b){return a+b;} fn main(){print add(1,1);}", "code"),
@@ -26,8 +27,10 @@ assert(fq.kept == 1 and fq.skipped == 1, "quality filter keeps useful records an
 
 let tokenizer = trun.tokenizer;
 let ids = tok.encode(tokenizer, "fn add(a,b){return a+b;}", true, true);
-let examples = data.lm_examples(ids, 4);
-assert(len(examples) > 1, "large-model data path creates examples");
+let all_examples = data.lm_examples(ids, 4);
+assert(len(all_examples) > 1, "large-model data path creates examples");
+let examples = data.sample_stride(all_examples, 4);
+assert(len(examples) <= len(all_examples) and len(examples) > 1, "diagnostic example sampling keeps a bounded representative subset");
 let bsum = binary.tokenizer_summary(tokenizer);
 assert(bsum.bit_width >= 1 and bsum.max_ids >= trun.summary.vocab_size, "binary token substrate computes enough bits for vocab IDs");
 let bits = binary.id_to_bits(ids[0], bsum.bit_width);
@@ -81,7 +84,8 @@ assert(brun.bit_width == bsum.bit_width and brun.examples == len(examples), "bin
 let deep = train.train_analytic_deep_inputs(model, att.forward_hidden, examples, 1, 0.02, 0.004, 0.004, 3);
 assert(deep.mode == "analytic-input-embedding-binary-backprop", "deep input training uses analytic gradients instead of finite differences");
 assert(deep.steps > 0 and deep.traces[0].updated_token_embeddings > 0, "analytic deep input training updates embedding state");
-let split = data.split(examples, 0.25);
+let split = data.split_bounded(all_examples, 0.25, 3, 1);
+assert(split.original_train >= split.sampled_train and split.original_valid >= split.sampled_valid, "bounded split reports original and sampled sizes");
 let er = train.error_report(model, att.logits, split.train, split.valid);
 assert(er.valid_examples > 0 and er.train_examples > 0, "error report measures train and validation splits");
 let adap = train.adaptive_error_reduction(model, att.forward_hidden, att.logits, att.live_architecture_update, split.train, split.valid, 1, 0.02, 0.01);
@@ -108,7 +112,7 @@ assert(len(elite.kept) == 1, "elite selection keeps the best candidate");
 assert(len(elite.candidates) >= len(elite.kept), "elite selection ranks all candidates");
 
 let ev = eval.evaluate(model, att.logits, examples);
-assert(ev.examples == len(examples), "eval suite counts examples");
+assert(ev.examples == len(examples), "eval suite counts bounded diagnostic examples");
 assert(ev.perplexity > 0, "eval suite computes perplexity");
 let bench = eval.benchmark_generate(model, att.generate, examples[0].x, 2, 1);
 assert(bench.tokens == 2, "generation benchmark counts tokens");
@@ -119,6 +123,22 @@ let shards = weights.split_model(model);
 let joined = weights.join_model(man, shards);
 assert(weights.estimate_params(joined) > 0, "weight format can split/join model shards");
 assert(len(joined.binary_projection) == bsum.bit_width, "weight format preserves binary projection shard");
+
+let layer_plan = [
+    offload.layer("embed", 100, 10, "cpu"),
+    offload.layer("block0", 180, 20, "gpu"),
+    offload.layer("block1", 180, 20, "gpu"),
+    offload.layer("head", 90, 10, "cpu")
+];
+let kv_bytes = offload.kv_cache_bytes(8, len(layer_plan), 2, 4, 2);
+let off_cfg = offload.config(1600, kv_bytes, 1, 1, 1);
+let off_plan = offload.plan(layer_plan, off_cfg);
+assert(off_plan.format == "pblang.llm.offload.plan.v1", "AirLLM-style offload plan is versioned");
+assert(off_plan.streamed_layers > 0 and off_plan.fits_budget, "offload planner streams layers within a memory budget");
+let off_summary = offload.summarize(off_plan);
+assert(off_summary.kv_cache_bytes == kv_bytes, "offload planner reserves KV cache memory");
+let off_mb = offload.microbatch_capacity(off_cfg, 100, 1, 8);
+assert(off_mb > 0, "offload planner suggests a bounded microbatch size");
 
 let hidden = att.forward_hidden(model, examples[0].x);
 let last = hidden[len(hidden) - 1];

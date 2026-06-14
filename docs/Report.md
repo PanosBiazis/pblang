@@ -378,8 +378,8 @@
 - **Τι δεν έγινε**: chunked body reading· WebSocket· per-request timeout από script.
 
 ### W3-beta — Middleware chain (Μάρτιος 2026)
-- **stdlib/middleware.sapp**: νέο module — **wrap(inner, mw)** (mw(req) → nil ή response map), **chain(inner, mws)** (πτύχωμα middleware γύρω από handler), **mw_log_stub()**, **mw_require_auth_stub(expected_token)**. Συμβατό με router.sapp.
-- **tests/semantics.rs**: νέο test **web_middleware_wrap_and_chain** — wrap dispatch με logger, chain με auth stub, έλεγχος 200/401.
+- **stdlib/middleware.sapp**: νέο module — **wrap(inner, mw)** (mw(req) → nil ή response map), **chain(inner, mws)** (πτύχωμα middleware γύρω από handler), **mw_log()**, **mw_require_auth(expected_token)**. Τα παλιά **mw_log_stub()** / **mw_require_auth_stub(...)** μένουν ως aliases για συμβατότητα. Συμβατό με router.sapp.
+- **tests/semantics.rs**: νέο test **web_middleware_wrap_and_chain** — wrap dispatch με logger, chain με auth middleware, έλεγχος 200/401 και compatibility aliases.
 - **docs/Tooling.md**: stdlib:middleware.sapp προστέθηκε.
 - **Τι δεν έγινε**: chunked body reading, WebSocket, TLS.
 - **Επόμενο**: W3 chunked/streaming ή E4-alpha signing· ενημέρωση Help.md.
