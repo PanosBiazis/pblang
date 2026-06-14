@@ -1,0 +1,324 @@
+// Native pblang media/OCR/speech/screenshot tool plans.
+//
+// The Rust implementation can invoke ffmpeg, ImageMagick, Tesseract, screen
+// capture utilities, and speech engines behind deployment gates. This pblang
+// port validates paths/parameters and returns auditable command plans without
+// executing external binaries.
+
+let FS = import("stdlib:fs.sapp");
+let sec = import("src/security.sapp");
+
+let AUDIO_TOOLS = [
+    "audio_convert", "audio_extract_from_video", "audio_extract_segment",
+    "audio_info", "audio_merge", "audio_mix", "audio_normalize",
+    "audio_reverse", "audio_silence_detect", "audio_speed", "audio_split",
+    "audio_trim", "audio_volume", "audio_waveform",
+];
+
+let IMAGE_TOOLS = [
+    "image_compare", "image_convert", "image_crop", "image_extract_exif",
+    "image_flip", "image_grayscale", "image_histogram", "image_info",
+    "image_resize", "image_rotate", "image_thumbnail", "image_watermark",
+];
+
+let OCR_TOOLS = [
+    "ocr_batch", "ocr_detect_text_regions", "ocr_file",
+    "ocr_from_clipboard", "ocr_list_languages", "ocr_pdf",
+    "ocr_preprocess", "ocr_screen_region", "ocr_table", "ocr_tesseract",
+    "ocr_with_confidence",
+];
+
+let SCREENSHOT_TOOLS = [
+    "screenshot_annotate", "screenshot_capture", "screenshot_color_pick",
+    "screenshot_compare", "screenshot_monitor_info", "screenshot_ocr",
+    "screenshot_record", "screenshot_region", "screenshot_timelapse",
+    "screenshot_window",
+];
+
+let SPEECH_TOOLS = [
+    "speech_detect_language", "speech_diarize", "speech_enhance",
+    "speech_extract_words", "speech_list_models", "speech_list_voices",
+    "speech_text_to_speech", "speech_text_to_speech_ssml",
+    "speech_transcribe_file", "speech_transcribe_microphone",
+    "speech_transcribe_stream", "speech_translate",
+];
+
+fn _contains(arr, value) {
+    for i len(arr) {
+        if arr[i] == value { return true; }
+    }
+    return false;
+}
+
+fn _s(args, key, fallback = "") {
+    return str(try args[key] catch fallback);
+}
+
+fn _num(args, key, fallback, lo, hi) {
+    return sec.clamp(try args[key] catch fallback, lo, hi);
+}
+
+fn _safe_path(value, fallback = "") {
+    let v = str(value);
+    if v == "" { return fallback; }
+    return sec.safe_rel_path(v, fallback);
+}
+
+fn _ext(path) {
+    let p = str_lower(str(path));
+    let parts = str_split(p, ".");
+    if len(parts) <= 1 { return ""; }
+    return parts[len(parts) - 1];
+}
+
+fn _file_meta(path) {
+    let p = _safe_path(path, "");
+    if p == "" { return map{ path: "", exists: false, bytes: nil, extension: "" }; }
+    return map{ path: p, exists: try FS.exists(p) catch false, bytes: try FS.size(p) catch nil, extension: _ext(p) };
+}
+
+fn _gate(kind) {
+    let blocked = sec.is_public_profile();
+    return map{
+        blocked: blocked,
+        profile: sec.network_profile(),
+        requires: ["trusted/local-power profile", "terminal execution gate", kind + " binary allowlist"],
+    };
+}
+
+fn _out(args, fallback) {
+    return _safe_path(_s(args, "output_path", _s(args, "output", fallback)), fallback);
+}
+
+fn _media_result(tool, family, input, output, program, argv, extra = nil) {
+    if extra == nil { extra = map{}; }
+    return map{
+        ok: true,
+        tool: tool,
+        family: family,
+        executed: false,
+        input: input,
+        output_path: output,
+        program: program,
+        argv: argv,
+        gate: _gate(program),
+        extra: extra,
+    };
+}
+
+fn audio_tool(tool, args) {
+    if args == nil { args = map{}; }
+    let input = _file_meta(_s(args, "path", _s(args, "input_path", _s(args, "audio_path", ""))));
+    let output = _out(args, "audio-output." + _s(args, "format", "wav"));
+    if tool == "audio_info" {
+        return _media_result(tool, "audio", input, "", "ffprobe", ["ffprobe", input.path], map{ metadata_only: true, format_hint: input.extension });
+    }
+    if tool == "audio_waveform" {
+        return _media_result(tool, "audio", input, "", "ffprobe", ["ffprobe", "-show_frames", input.path], map{ samples: sec.clamp(try args.samples catch 128, 1, 4096) });
+    }
+    if tool == "audio_silence_detect" {
+        return _media_result(tool, "audio", input, "", "ffmpeg", ["ffmpeg", "-i", input.path, "-af", "silencedetect"], map{ threshold_db: _num(args, "threshold_db", -30, -120, 0) });
+    }
+    if tool == "audio_merge" {
+        let files = try args.paths catch try args.inputs catch [];
+        let safe = [];
+        for i sec.clamp(len(files), 0, 100) { safe[len(safe)] = _safe_path(files[i], ""); }
+        return _media_result(tool, "audio", map{ paths: safe }, output, "ffmpeg", ["ffmpeg", "concat", output], map{ input_count: len(safe) });
+    }
+    if tool == "audio_mix" {
+        let a = _file_meta(_s(args, "path_a", _s(args, "path", "")));
+        let b = _file_meta(_s(args, "path_b", _s(args, "overlay_path", "")));
+        return _media_result(tool, "audio", map{ a: a, b: b }, output, "ffmpeg", ["ffmpeg", "-i", a.path, "-i", b.path, "-filter_complex", "amix", output], map{ volume_a: try args.volume_a catch 1, volume_b: try args.volume_b catch 1 });
+    }
+    if tool == "audio_extract_segment" or tool == "audio_trim" {
+        return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-ss", str(_num(args, "start", 0, 0, 86400)), "-t", str(_num(args, "duration", 30, 0, 86400)), "-i", input.path, output], map{ start: _num(args, "start", 0, 0, 86400), duration: _num(args, "duration", 30, 0, 86400) });
+    }
+    if tool == "audio_split" {
+        return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, "-f", "segment", output], map{ segment_seconds: _num(args, "segment_seconds", 60, 1, 86400) });
+    }
+    if tool == "audio_speed" {
+        return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, "-filter:a", "atempo=" + str(_num(args, "speed", 1, 0.25, 4)), output], map{ speed: _num(args, "speed", 1, 0.25, 4) });
+    }
+    if tool == "audio_volume" {
+        return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, "-filter:a", "volume=" + str(_num(args, "volume", 1, 0, 10)), output], map{ volume: _num(args, "volume", 1, 0, 10) });
+    }
+    if tool == "audio_normalize" {
+        return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, "-af", "loudnorm", output], map{ target_db: _num(args, "target_db", -14, -60, 0) });
+    }
+    if tool == "audio_reverse" {
+        return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, "-af", "areverse", output], map{});
+    }
+    if tool == "audio_extract_from_video" {
+        return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, "-vn", output], map{ source_kind: "video" });
+    }
+    return _media_result(tool, "audio", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, output], map{ format: _s(args, "format", _ext(output)) });
+}
+
+fn image_tool(tool, args) {
+    if args == nil { args = map{}; }
+    let input = _file_meta(_s(args, "path", _s(args, "input_path", "")));
+    let output = _out(args, "image-output." + _s(args, "format", "png"));
+    if tool == "image_info" {
+        return _media_result(tool, "image", input, "", "identify", ["identify", "-verbose", input.path], map{ metadata_only: true, format_hint: input.extension });
+    }
+    if tool == "image_extract_exif" {
+        return _media_result(tool, "image", input, "", "exiftool", ["exiftool", input.path], map{ metadata_only: true });
+    }
+    if tool == "image_compare" {
+        let other = _file_meta(_s(args, "other_path", _s(args, "path_b", "")));
+        return _media_result(tool, "image", map{ a: input, b: other }, "", "compare", ["compare", "-metric", "MAE", input.path, other.path, "null:"], map{ metric: "MAE" });
+    }
+    if tool == "image_histogram" {
+        return _media_result(tool, "image", input, "", "convert", ["convert", input.path, "-format", "%c", "histogram:info:"], map{ buckets: sec.clamp(try args.buckets catch 256, 1, 4096) });
+    }
+    if tool == "image_crop" {
+        let geom = str(_num(args, "width", 100, 1, 100000)) + "x" + str(_num(args, "height", 100, 1, 100000)) + "+" + str(_num(args, "x", 0, 0, 100000)) + "+" + str(_num(args, "y", 0, 0, 100000));
+        return _media_result(tool, "image", input, output, "convert", ["convert", input.path, "-crop", geom, output], map{ geometry: geom });
+    }
+    if tool == "image_resize" {
+        let geom = str(_num(args, "width", 512, 1, 100000)) + "x" + str(_num(args, "height", 512, 1, 100000));
+        return _media_result(tool, "image", input, output, "convert", ["convert", input.path, "-resize", geom, output], map{ geometry: geom });
+    }
+    if tool == "image_thumbnail" {
+        let side = _num(args, "max_side", 256, 1, 100000);
+        return _media_result(tool, "image", input, output, "convert", ["convert", input.path, "-thumbnail", str(side) + "x" + str(side), output], map{ max_side: side });
+    }
+    if tool == "image_rotate" {
+        return _media_result(tool, "image", input, output, "convert", ["convert", input.path, "-rotate", str(_num(args, "degrees", 90, -360, 360)), output], map{ degrees: _num(args, "degrees", 90, -360, 360) });
+    }
+    if tool == "image_flip" {
+        let mode = str_lower(_s(args, "mode", _s(args, "direction", "horizontal")));
+        let op = if mode == "vertical" { "-flip" } else { "-flop" };
+        return _media_result(tool, "image", input, output, "convert", ["convert", input.path, op, output], map{ mode: mode });
+    }
+    if tool == "image_grayscale" {
+        return _media_result(tool, "image", input, output, "convert", ["convert", input.path, "-colorspace", "Gray", output], map{});
+    }
+    if tool == "image_watermark" {
+        return _media_result(tool, "image", input, output, "convert", ["convert", input.path, "-gravity", _s(args, "position", "southeast"), "-annotate", "+12+12", _s(args, "text", "watermark"), output], map{ text: _s(args, "text", "watermark") });
+    }
+    return _media_result(tool, "image", input, output, "convert", ["convert", input.path, output], map{ format: _s(args, "format", _ext(output)) });
+}
+
+fn ocr_tool(tool, args) {
+    if args == nil { args = map{}; }
+    let input = _file_meta(_s(args, "path", _s(args, "image_path", _s(args, "pdf_path", ""))));
+    let lang = _s(args, "lang", _s(args, "language", "eng"));
+    if tool == "ocr_list_languages" {
+        return _media_result(tool, "ocr", map{}, "", "tesseract", ["tesseract", "--list-langs"], map{ expected_output: "language list" });
+    }
+    if tool == "ocr_batch" {
+        let files = try args.paths catch [];
+        let safe = [];
+        for i sec.clamp(len(files), 0, 200) { safe[len(safe)] = _safe_path(files[i], ""); }
+        return _media_result(tool, "ocr", map{ paths: safe }, "", "tesseract", ["tesseract", "batch"], map{ input_count: len(safe), lang: lang });
+    }
+    if tool == "ocr_from_clipboard" {
+        return _media_result(tool, "ocr", map{ clipboard: true }, "", "xclip+tesseract", ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"], map{ lang: lang });
+    }
+    if tool == "ocr_screen_region" {
+        return _media_result(tool, "ocr", map{ x: _num(args, "x", 0, 0, 100000), y: _num(args, "y", 0, 0, 100000) }, _out(args, ".mint-mcp/screenshots/ocr-region.png"), "import+tesseract", ["import", "region.png"], map{ lang: lang });
+    }
+    if tool == "ocr_pdf" {
+        return _media_result(tool, "ocr", input, "", "pdftoppm+tesseract", ["pdftoppm", input.path, "page", "&&", "tesseract"], map{ lang: lang, page_start: _num(args, "page_start", 1, 1, 100000), page_end: _num(args, "page_end", 1, 1, 100000) });
+    }
+    if tool == "ocr_preprocess" {
+        return _media_result(tool, "ocr", input, _out(args, "ocr-preprocessed.png"), "convert", ["convert", input.path, _s(args, "operation", "grayscale"), _out(args, "ocr-preprocessed.png")], map{ operation: _s(args, "operation", "grayscale") });
+    }
+    let mode = "plain";
+    if tool == "ocr_detect_text_regions" { mode = "boxes"; }
+    if tool == "ocr_table" { mode = "table-tsv"; }
+    if tool == "ocr_with_confidence" { mode = "confidence-tsv"; }
+    return _media_result(tool, "ocr", input, "", "tesseract", ["tesseract", input.path, "stdout", "-l", lang], map{ mode: mode, lang: lang });
+}
+
+fn screenshot_tool(tool, args) {
+    if args == nil { args = map{}; }
+    let output = _out(args, ".mint-mcp/screenshots/screenshot.png");
+    if tool == "screenshot_monitor_info" {
+        return _media_result(tool, "screenshot", map{}, "", "xrandr", ["xrandr", "--query"], map{ metadata_only: true });
+    }
+    if tool == "screenshot_color_pick" {
+        return _media_result(tool, "screenshot", map{ x: _num(args, "x", 0, 0, 100000), y: _num(args, "y", 0, 0, 100000) }, "", "import", ["import", "-window", "root", "-crop", "1x1+" + str(_num(args, "x", 0, 0, 100000)) + "+" + str(_num(args, "y", 0, 0, 100000)), "txt:-"], map{ color_format: "hex/rgb" });
+    }
+    if tool == "screenshot_compare" {
+        let a = _file_meta(_s(args, "path_a", _s(args, "path", "")));
+        let b = _file_meta(_s(args, "path_b", _s(args, "other_path", "")));
+        return _media_result(tool, "screenshot", map{ a: a, b: b }, "", "compare", ["compare", "-metric", "MAE", a.path, b.path, "null:"], map{ metric: "MAE" });
+    }
+    if tool == "screenshot_region" {
+        let geom = str(_num(args, "width", 800, 1, 100000)) + "x" + str(_num(args, "height", 600, 1, 100000)) + "+" + str(_num(args, "x", 0, 0, 100000)) + "+" + str(_num(args, "y", 0, 0, 100000));
+        return _media_result(tool, "screenshot", map{ geometry: geom }, output, "import", ["import", "-window", "root", "-crop", geom, output], map{ geometry: geom });
+    }
+    if tool == "screenshot_window" {
+        return _media_result(tool, "screenshot", map{ window: _s(args, "window", _s(args, "name", "")) }, output, "xdotool+import", ["xdotool", "search", "--name", _s(args, "window", ""), "import", output], map{});
+    }
+    if tool == "screenshot_record" {
+        return _media_result(tool, "screenshot", map{}, _out(args, ".mint-mcp/screenshots/recording.mp4"), "ffmpeg", ["ffmpeg", "-f", "x11grab", "-t", str(_num(args, "duration", 10, 1, 600)), _out(args, ".mint-mcp/screenshots/recording.mp4")], map{ duration: _num(args, "duration", 10, 1, 600) });
+    }
+    if tool == "screenshot_timelapse" {
+        return _media_result(tool, "screenshot", map{}, output, "grim/import", ["capture", "repeated", output], map{ count: _num(args, "count", 10, 1, 10000), interval_ms: _num(args, "interval_ms", 1000, 100, 3600000) });
+    }
+    if tool == "screenshot_annotate" {
+        let input = _file_meta(_s(args, "path", _s(args, "input_path", "")));
+        return _media_result(tool, "screenshot", input, output, "convert", ["convert", input.path, "-annotate", "+10+10", _s(args, "text", "label"), output], map{ annotations: try args.annotations catch [] });
+    }
+    if tool == "screenshot_ocr" {
+        return _media_result(tool, "screenshot", map{}, output, "grim+tesseract", ["grim", output, "&&", "tesseract", output, "stdout"], map{ ocr: true });
+    }
+    return _media_result(tool, "screenshot", map{}, output, "grim", ["grim", output], map{});
+}
+
+fn speech_tool(tool, args) {
+    if args == nil { args = map{}; }
+    let input = _file_meta(_s(args, "path", _s(args, "audio_path", "")));
+    let output = _out(args, "speech-output.wav");
+    if tool == "speech_list_models" {
+        return _media_result(tool, "speech", map{}, "", "speech-engine", ["speech-engine", "list-models"], map{ model_family: "stt/tts" });
+    }
+    if tool == "speech_list_voices" {
+        return _media_result(tool, "speech", map{}, "", "speech-engine", ["speech-engine", "list-voices"], map{ model_family: "tts" });
+    }
+    if tool == "speech_text_to_speech" or tool == "speech_text_to_speech_ssml" {
+        return _media_result(tool, "speech", map{ text_chars: len(_s(args, "text", _s(args, "ssml", ""))) }, output, "tts-engine", ["tts-engine", "--voice", _s(args, "voice", "default"), "--out", output], map{ voice: _s(args, "voice", "default"), ssml: tool == "speech_text_to_speech_ssml" });
+    }
+    if tool == "speech_transcribe_microphone" {
+        return _media_result(tool, "speech", map{ microphone: true }, "", "rec+stt-engine", ["rec", "-d", str(_num(args, "duration", 5, 1, 600)), "mic.wav"], map{ duration: _num(args, "duration", 5, 1, 600) });
+    }
+    if tool == "speech_enhance" {
+        return _media_result(tool, "speech", input, output, "ffmpeg", ["ffmpeg", "-i", input.path, "-af", "afftdn", output], map{ operation: "noise-reduction" });
+    }
+    if tool == "speech_transcribe_stream" {
+        return _media_result(tool, "speech", input, "", "stt-engine", ["stt-engine", "--stream", input.path], map{ segment_seconds: _num(args, "segment_seconds", 30, 1, 600) });
+    }
+    if tool == "speech_translate" {
+        return _media_result(tool, "speech", input, "", "stt-engine", ["stt-engine", "--translate", _s(args, "target_language", "en"), input.path], map{ target_language: _s(args, "target_language", "en") });
+    }
+    let mode = "transcribe";
+    if tool == "speech_detect_language" { mode = "detect-language"; }
+    if tool == "speech_diarize" { mode = "diarize"; }
+    if tool == "speech_extract_words" { mode = "word-timestamps"; }
+    return _media_result(tool, "speech", input, "", "stt-engine", ["stt-engine", "--mode", mode, input.path], map{ mode: mode });
+}
+
+fn call_media(tool, args) {
+    if _contains(AUDIO_TOOLS, tool) { return audio_tool(tool, args); }
+    if _contains(IMAGE_TOOLS, tool) { return image_tool(tool, args); }
+    if _contains(OCR_TOOLS, tool) { return ocr_tool(tool, args); }
+    if _contains(SCREENSHOT_TOOLS, tool) { return screenshot_tool(tool, args); }
+    if _contains(SPEECH_TOOLS, tool) { return speech_tool(tool, args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    let out = [];
+    for i len(AUDIO_TOOLS) { out[len(out)] = AUDIO_TOOLS[i]; }
+    for i len(IMAGE_TOOLS) { out[len(out)] = IMAGE_TOOLS[i]; }
+    for i len(OCR_TOOLS) { out[len(out)] = OCR_TOOLS[i]; }
+    for i len(SCREENSHOT_TOOLS) { out[len(out)] = SCREENSHOT_TOOLS[i]; }
+    for i len(SPEECH_TOOLS) { out[len(out)] = SPEECH_TOOLS[i]; }
+    return out;
+}
+
+export implemented_tools, call_media, audio_tool, image_tool, ocr_tool,
+       screenshot_tool, speech_tool;
