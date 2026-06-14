@@ -1,0 +1,173 @@
+// Native pblang translations for deterministic review helpers.
+
+let git = import("src/git_tools.sapp");
+let text = import("src/text_tools.sapp");
+let sec = import("src/security.sapp");
+
+fn _diff(args) {
+    let d = try args.diff catch try args.text catch nil;
+    if d != nil { return str(d); }
+    let r = git.git_diff(args);
+    if r.ok == true { return r.stdout; }
+    return "";
+}
+
+fn _lines(s) { return str_split(str(s), "\n"); }
+
+fn _contains(hay, needle) { return str_contains(str_lower(str(hay)), str_lower(str(needle))); }
+
+fn _push_unique(arr, value) {
+    if value == nil or value == "" { return arr; }
+    for i len(arr) { if arr[i] == value { return arr; } }
+    arr[len(arr)] = value;
+    return arr;
+}
+
+fn _risk_files(files) {
+    let out = [];
+    for i len(files) {
+        let f = str_lower(files[i]);
+        if str_contains(f, "security") or str_contains(f, "auth") or str_contains(f, "crypto") or
+           str_ends_with(f, ".sh") or str_ends_with(f, ".ps1") or str_ends_with(f, ".yml") or
+           str_ends_with(f, ".yaml") or f == "cargo.toml" or f == "cargo.lock" {
+            out = _push_unique(out, files[i]);
+        }
+    }
+    return out;
+}
+
+fn _stats(diff) {
+    let lines = _lines(diff);
+    let added = 0;
+    let removed = 0;
+    let hunks = 0;
+    for i len(lines) {
+        let l = lines[i];
+        if str_starts_with(l, "@@") { hunks = hunks + 1; }
+        else if str_starts_with(l, "+") and not str_starts_with(l, "+++") { added = added + 1; }
+        else if str_starts_with(l, "-") and not str_starts_with(l, "---") { removed = removed + 1; }
+    }
+    return map{ lines: len(lines), added: added, removed: removed, hunks: hunks };
+}
+
+fn review_diff_risk(args) {
+    let diff = _diff(args);
+    let st = _stats(diff);
+    let files = text.summarize_diff_file_list(diff, try args.max_files catch 200);
+    let risky = _risk_files(files);
+    let risk_items = [];
+    if st.added + st.removed > 500 { risk_items[len(risk_items)] = "large diff"; }
+    if len(risky) > 0 { risk_items[len(risk_items)] = "risky file areas changed"; }
+    if _contains(diff, "unsafe") { risk_items[len(risk_items)] = "unsafe keyword present"; }
+    if _contains(diff, "unwrap()") or _contains(diff, "panic!") { risk_items[len(risk_items)] = "panic-prone Rust pattern present"; }
+    if _contains(diff, "password") or _contains(diff, "token") or _contains(diff, "secret") { risk_items[len(risk_items)] = "secret-like words present"; }
+    let score = st.added + st.removed + len(risky) * 50 + len(risk_items) * 20;
+    let level = "low";
+    if score > 800 { level = "high"; }
+    else if score > 220 { level = "medium"; }
+    else if len(risk_items) > 0 { level = "medium"; }
+    return map{ risk: level, score: score, stats: st, files: files, risky_files: risky, risk_items: risk_items };
+}
+
+fn review_focused_review(args) {
+    let concern = str_lower(str(try args.concern catch "correctness"));
+    let diff = _diff(args);
+    let checks = [];
+    if concern == "security" {
+        if _contains(diff, "token") or _contains(diff, "secret") or _contains(diff, "password") { checks[len(checks)] = "secret-like terms changed"; }
+        if _contains(diff, "http://") { checks[len(checks)] = "plaintext HTTP appears"; }
+        if _contains(diff, "allow-all") or _contains(diff, "allow_all") { checks[len(checks)] = "broad allow flag appears"; }
+    } else if concern == "performance" {
+        if _contains(diff, "for ") and _contains(diff, "for ") { checks[len(checks)] = "loop-heavy diff; inspect nested work"; }
+        if _contains(diff, "regex") { checks[len(checks)] = "regex use changed; ensure compilation is not inside hot loops"; }
+    } else if concern == "maintainability" {
+        if _stats(diff).added > 300 { checks[len(checks)] = "large addition; consider module boundary/tests"; }
+        if _contains(diff, "todo") { checks[len(checks)] = "TODO marker present"; }
+    } else {
+        if _contains(diff, "unwrap()") or _contains(diff, "panic!") { checks[len(checks)] = "panic path may be reachable"; }
+        if _contains(diff, "not implemented") { checks[len(checks)] = "placeholder text present"; }
+    }
+    return map{ concern: concern, findings: checks, risk: review_diff_risk(map{ diff: diff }) };
+}
+
+fn review_missing_tests(args) {
+    let diff = _diff(args);
+    let files = text.summarize_diff_file_list(diff, try args.max_files catch 400);
+    let code_changed = [];
+    let test_changed = [];
+    for i len(files) {
+        let f = files[i];
+        let lf = str_lower(f);
+        if str_contains(lf, "test") or str_contains(lf, "/tests/") { test_changed = _push_unique(test_changed, f); }
+        else if str_ends_with(lf, ".rs") or str_ends_with(lf, ".sapp") or str_ends_with(lf, ".js") or str_ends_with(lf, ".py") {
+            code_changed = _push_unique(code_changed, f);
+        }
+    }
+    let missing = len(code_changed) > 0 and len(test_changed) == 0;
+    let message = "test coverage change detected or no code file changed";
+    if missing { message = "code changed but no obvious test file changed"; }
+    return map{ missing_tests_likely: missing, code_changed: code_changed, test_changed: test_changed, message: message };
+}
+
+fn review_pr_packet(args) {
+    let diff = _diff(args);
+    let risk = review_diff_risk(map{ diff: diff });
+    let tests = review_missing_tests(map{ diff: diff });
+    return map{
+        summary: map{ changed_files: len(risk.files), added: risk.stats.added, removed: risk.stats.removed, risk: risk.risk },
+        changed_files: risk.files,
+        risk_items: risk.risk_items,
+        missing_tests: tests,
+        suggested_verification: ["run focused tests for changed modules", "run lint/check for touched language", "review high-risk files manually"],
+    };
+}
+
+fn _rule_matches(diff, rules) {
+    let out = [];
+    for i len(rules) {
+        let r = rules[i];
+        let pattern = if type(r) == "map" { str(try r.pattern catch try r.match catch "") } else { str(r) };
+        let name = if type(r) == "map" { str(try r.name catch pattern) } else { pattern };
+        if pattern != "" and _contains(diff, pattern) {
+            out[len(out)] = map{ rule: name, pattern: pattern };
+        }
+    }
+    return out;
+}
+
+fn review_rulebook_check(args) {
+    let diff = _diff(args);
+    let rules = try args.rules catch [];
+    if type(rules) == "string" {
+        let parsed = try json_parse(rules) catch nil;
+        if parsed != nil { rules = parsed; }
+        else { rules = str_split(rules, "\n"); }
+    }
+    rules = if type(rules) == "array" { rules } else { [] };
+    let matches = _rule_matches(diff, rules);
+    return map{ ok: len(matches) == 0, matches: matches, rules_checked: len(rules) };
+}
+
+fn call_review(tool, args) {
+    if args == nil { args = map{}; }
+    if tool == "review_diff_risk" { return review_diff_risk(args); }
+    if tool == "review_focused_review" { return review_focused_review(args); }
+    if tool == "review_missing_tests" { return review_missing_tests(args); }
+    if tool == "review_pr_packet" { return review_pr_packet(args); }
+    if tool == "review_rulebook_check" { return review_rulebook_check(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    return [
+        "review_diff_risk",
+        "review_focused_review",
+        "review_missing_tests",
+        "review_pr_packet",
+        "review_rulebook_check",
+    ];
+}
+
+export implemented_tools, call_review,
+       review_diff_risk, review_focused_review, review_missing_tests,
+       review_pr_packet, review_rulebook_check;

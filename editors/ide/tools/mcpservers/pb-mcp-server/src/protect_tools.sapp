@@ -1,0 +1,247 @@
+// Native pblang translations for deterministic protect/security tools.
+//
+// External antivirus, YARA, firewall, and rootkit engines are not invoked here.
+// These handlers provide bounded local heuristics and honest fallback metadata.
+
+let FS = import("stdlib:fs.sapp");
+let sec = import("src/security.sapp");
+let core = import("src/core_tools.sapp");
+
+fn _lower(v) { return str_lower(str(v)); }
+
+fn _contains(hay, needle) { return str_contains(_lower(hay), _lower(needle)); }
+
+fn _push(out, item) {
+    out[len(out)] = item;
+    return out;
+}
+
+fn _read_path_or_text(args) {
+    let text = try args.text catch nil;
+    if text != nil { return str(text); }
+    let path = sec.safe_rel_path(try args.path catch "", "");
+    if path == "" { return ""; }
+    return try FS.read(path) catch "";
+}
+
+fn _secret_patterns() {
+    return [
+        map{ name: "openai-style-key", needle: "sk-" },
+        map{ name: "github-token", needle: "ghp_" },
+        map{ name: "private-key", needle: "BEGIN PRIVATE KEY" },
+        map{ name: "password-field", needle: "password" },
+        map{ name: "secret-field", needle: "secret" },
+        map{ name: "token-field", needle: "token" },
+        map{ name: "aws-access-key-label", needle: "aws_access_key_id" },
+    ];
+}
+
+fn _scan_text_for_secrets(text, path, max_hits) {
+    let pats = _secret_patterns();
+    let lines = str_split(str(text), "\n");
+    let hits = [];
+    for i len(lines) {
+        if len(hits) >= max_hits { return hits; }
+        let line = lines[i];
+        for p len(pats) {
+            if _contains(line, pats[p].needle) {
+                hits[len(hits)] = map{ path: path, line: i + 1, kind: pats[p].name, preview: str_slice(line, 0, if len(line) > 160 { 160 } else { len(line) }) };
+            }
+        }
+    }
+    return hits;
+}
+
+fn protect_secret_scan(args) {
+    if args == nil { args = map{}; }
+    let max_hits = sec.clamp(try args.max_hits catch 100, 1, 1000);
+    let path = sec.safe_rel_path(try args.path catch "", "");
+    if path == "" {
+        let hits = _scan_text_for_secrets(try args.text catch "", "[input]", max_hits);
+        return map{ ok: len(hits) == 0, hits: hits, scanned_files: 0, mode: "text" };
+    }
+    let kind = try FS.listdir(path) catch nil;
+    if type(kind) == "array" {
+        let files = core.list_files(path, sec.clamp(try args.max_files catch 200, 1, 2000), sec.clamp(try args.max_depth catch 6, 0, sec.MAX_DEPTH));
+        let hits = [];
+        let scanned = 0;
+        for i len(files) {
+            if len(hits) >= max_hits { break; }
+            let raw = try FS.read(files[i]) catch nil;
+            if type(raw) == "string" {
+                scanned = scanned + 1;
+                let one = _scan_text_for_secrets(raw, files[i], max_hits - len(hits));
+                for j len(one) { hits[len(hits)] = one[j]; }
+            }
+        }
+        return map{ ok: len(hits) == 0, hits: hits, scanned_files: scanned, mode: "directory" };
+    }
+    let raw = try FS.read(path) catch "";
+    let hits = _scan_text_for_secrets(raw, path, max_hits);
+    return map{ ok: len(hits) == 0, hits: hits, scanned_files: 1, mode: "file" };
+}
+
+fn protect_file_reputation(args) {
+    if args == nil { args = map{}; }
+    let path = sec.safe_rel_path(try args.path catch "", "");
+    if path == "" { return map{ ok: false, error: "path is required" }; }
+    let raw = FS.read(path);
+    let hash = sha256(raw);
+    let known = try args.known_bad_hashes catch [];
+    let bad = false;
+    for i len(known) {
+        if str(known[i]) == hash { bad = true; }
+    }
+    return map{ ok: true, path: path, sha256: hash, reputation: if bad { "known-bad" } else { "unknown-local-only" }, external_lookup: false };
+}
+
+fn protect_dependency_audit(args) {
+    if args == nil { args = map{}; }
+    let path = sec.safe_rel_path(try args.path catch ".", ".");
+    let files = core.list_files(path, sec.clamp(try args.max_files catch 500, 1, 2000), sec.clamp(try args.max_depth catch 4, 0, sec.MAX_DEPTH));
+    let findings = [];
+    let scanned = 0;
+    for i len(files) {
+        let f = files[i];
+        let lf = str_lower(f);
+        if str_ends_with(lf, "cargo.toml") or str_ends_with(lf, "package.json") or str_ends_with(lf, "requirements.txt") or str_ends_with(lf, "pyproject.toml") {
+            scanned = scanned + 1;
+            let raw = try FS.read(f) catch "";
+            if _contains(raw, "git =") { findings[len(findings)] = map{ path: f, issue: "git dependency requires source review" }; }
+            if _contains(raw, "path =") { findings[len(findings)] = map{ path: f, issue: "local path dependency reduces reproducibility" }; }
+            if _contains(raw, "\"*\"") or _contains(raw, "'*'") { findings[len(findings)] = map{ path: f, issue: "wildcard dependency version" }; }
+            if _contains(raw, "postinstall") or _contains(raw, "preinstall") { findings[len(findings)] = map{ path: f, issue: "npm install script present" }; }
+        }
+    }
+    return map{ ok: len(findings) == 0, scanned_manifests: scanned, findings: findings, external_vulnerability_db: false };
+}
+
+fn _manifest_for_paths(paths) {
+    let rows = map{};
+    for i len(paths) {
+        let p = sec.safe_rel_path(paths[i], "");
+        let raw = try FS.read(p) catch nil;
+        if type(raw) == "string" { rows[p] = sha256(raw); }
+    }
+    return rows;
+}
+
+fn protect_integrity_check(args) {
+    if args == nil { args = map{}; }
+    let paths = try args.paths catch nil;
+    if paths == nil {
+        let p = sec.safe_rel_path(try args.path catch "", "");
+        if p == "" { return map{ ok: false, error: "path or paths is required" }; }
+        paths = [p];
+    }
+    let actual = _manifest_for_paths(paths);
+    let expected = try args.manifest catch nil;
+    if expected == nil {
+        let mp = try args.manifest_path catch "";
+        if mp != "" { expected = try json_parse(FS.read(sec.safe_rel_path(mp, ""))) catch nil; }
+    }
+    if expected == nil {
+        let outp = try args.output_path catch "";
+        if outp != "" {
+            sec.require_trusted("protect_integrity_check write manifest");
+            FS.write(sec.safe_rel_path(outp, ""), json_stringify(actual));
+            return map{ ok: true, mode: "manifest-written", manifest: actual, output_path: outp };
+        }
+        return map{ ok: true, mode: "manifest-generated", manifest: actual };
+    }
+    let mismatches = [];
+    let keys = map_keys(actual);
+    for i len(keys) {
+        let k = keys[i];
+        let want = try expected[k] catch nil;
+        if want == nil { mismatches[len(mismatches)] = map{ path: k, issue: "missing from expected manifest", actual: actual[k] }; }
+        else if str(want) != str(actual[k]) { mismatches[len(mismatches)] = map{ path: k, issue: "hash mismatch", expected: want, actual: actual[k] }; }
+    }
+    return map{ ok: len(mismatches) == 0, mode: "verified", mismatches: mismatches, checked: len(keys) };
+}
+
+fn _pattern_scan(args, engine) {
+    let raw = _read_path_or_text(args);
+    let rules = try args.rules catch try args.patterns catch [];
+    if type(rules) == "string" { rules = [rules]; }
+    let hits = [];
+    for i len(rules) {
+        let r = rules[i];
+        let name = if type(r) == "map" { str(try r.name catch "rule-" + str(i + 1)) } else { str(r) };
+        let needle = if type(r) == "map" { str(try r.pattern catch try r.needle catch "") } else { str(r) };
+        if needle != "" and _contains(raw, needle) { hits[len(hits)] = map{ rule: name, pattern: needle }; }
+    }
+    return map{ ok: len(hits) == 0, engine: engine, native_fallback: true, hits: hits };
+}
+
+fn protect_yara_scan(args) { return _pattern_scan(args, "pblang-string-rules-not-yara-engine"); }
+
+fn protect_scan_file(args) {
+    let raw = _read_path_or_text(args);
+    let rules = [
+        map{ name: "eicar-test-string", pattern: "EICAR-STANDARD-ANTIVIRUS-TEST-FILE" },
+        map{ name: "encoded-powershell", pattern: "EncodedCommand" },
+        map{ name: "curl-pipe-shell", pattern: "curl " },
+        map{ name: "wget-pipe-shell", pattern: "wget " },
+    ];
+    return _pattern_scan(map{ text: raw, rules: rules }, "pblang-malware-heuristics");
+}
+
+fn protect_scan_directory(args) {
+    if args == nil { args = map{}; }
+    let path = sec.safe_rel_path(try args.path catch ".", ".");
+    let files = core.list_files(path, sec.clamp(try args.max_files catch 200, 1, 2000), sec.clamp(try args.max_depth catch 6, 0, sec.MAX_DEPTH));
+    let hits = [];
+    let scanned = 0;
+    for i len(files) {
+        let raw = try FS.read(files[i]) catch nil;
+        if type(raw) == "string" {
+            scanned = scanned + 1;
+            let r = protect_scan_file(map{ text: raw });
+            if len(r.hits) > 0 { hits[len(hits)] = map{ path: files[i], hits: r.hits }; }
+        }
+    }
+    return map{ ok: len(hits) == 0, scanned_files: scanned, hits: hits, engine: "pblang-malware-heuristics" };
+}
+
+fn protect_permissions_scan(args) {
+    return map{ ok: true, findings: [], supported: false, reason: "pblang has no portable file-mode stat builtin yet; use Rust server for permission bits" };
+}
+
+fn protect_world_writable_find(args) { return protect_permissions_scan(args); }
+fn protect_suid_find(args) { return protect_permissions_scan(args); }
+
+fn call_protect(tool, args) {
+    if tool == "protect_secret_scan" { return protect_secret_scan(args); }
+    if tool == "protect_file_reputation" { return protect_file_reputation(args); }
+    if tool == "protect_dependency_audit" { return protect_dependency_audit(args); }
+    if tool == "protect_integrity_check" { return protect_integrity_check(args); }
+    if tool == "protect_yara_scan" { return protect_yara_scan(args); }
+    if tool == "protect_scan_file" { return protect_scan_file(args); }
+    if tool == "protect_scan_directory" { return protect_scan_directory(args); }
+    if tool == "protect_permissions_scan" { return protect_permissions_scan(args); }
+    if tool == "protect_world_writable_find" { return protect_world_writable_find(args); }
+    if tool == "protect_suid_find" { return protect_suid_find(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    return [
+        "protect_secret_scan",
+        "protect_file_reputation",
+        "protect_dependency_audit",
+        "protect_integrity_check",
+        "protect_yara_scan",
+        "protect_scan_file",
+        "protect_scan_directory",
+        "protect_permissions_scan",
+        "protect_world_writable_find",
+        "protect_suid_find",
+    ];
+}
+
+export implemented_tools, call_protect,
+       protect_secret_scan, protect_file_reputation, protect_dependency_audit,
+       protect_integrity_check, protect_yara_scan, protect_scan_file,
+       protect_scan_directory, protect_permissions_scan,
+       protect_world_writable_find, protect_suid_find;
