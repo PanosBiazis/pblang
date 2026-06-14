@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include <setjmp.h>
 #include <time.h>
+#include <ctype.h>
 
 /* ─── Value type tags ──────────────────────────────────────────────── */
 #define PB_TAG_NIL    0
@@ -491,8 +492,229 @@ static PbVal pb_builtin_error(PbVal msg) {
 static void pb_defer_push(PbVal fn) { (void)fn; /* stub */ }
 static PbVal pb_builtin_print(PbVal v) { pb_print(v); return PB_NIL; }
 static void pb_printf(PbVal v) { pb_print(v); }
-static PbVal pb_builtin_json_parse(PbVal s) { (void)s; return PB_NIL; /* stub */ }
-static PbVal pb_builtin_json_stringify(PbVal v) { (void)v; return PB_STR("{}"); /* stub */ }
+
+typedef struct { const char* p; } PbJsonParser;
+
+typedef struct {
+    char* data;
+    size_t len;
+    size_t cap;
+} PbBuf;
+
+static void pb_buf_init(PbBuf* b) {
+    b->len = 0;
+    b->cap = 128;
+    b->data = (char*)malloc(b->cap);
+    b->data[0] = '\0';
+}
+
+static void pb_buf_reserve(PbBuf* b, size_t extra) {
+    size_t need = b->len + extra + 1;
+    if (need <= b->cap) return;
+    while (b->cap < need) b->cap *= 2;
+    b->data = (char*)realloc(b->data, b->cap);
+}
+
+static void pb_buf_append_n(PbBuf* b, const char* s, size_t n) {
+    pb_buf_reserve(b, n);
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+static void pb_buf_append(PbBuf* b, const char* s) { pb_buf_append_n(b, s, strlen(s)); }
+
+static void pb_json_skip_ws(PbJsonParser* jp) {
+    while (*jp->p && isspace((unsigned char)*jp->p)) jp->p++;
+}
+
+static bool pb_json_match(PbJsonParser* jp, const char* word) {
+    size_t n = strlen(word);
+    if (strncmp(jp->p, word, n) == 0) { jp->p += n; return true; }
+    return false;
+}
+
+static PbVal pb_json_parse_value(PbJsonParser* jp);
+
+static PbVal pb_json_parse_string(PbJsonParser* jp) {
+    if (*jp->p != '"') return PB_NIL;
+    jp->p++;
+    PbBuf out; pb_buf_init(&out);
+    while (*jp->p && *jp->p != '"') {
+        char ch = *jp->p++;
+        if (ch == '\\') {
+            char esc = *jp->p++;
+            if (esc == '"' || esc == '\\' || esc == '/') {
+                pb_buf_append_n(&out, &esc, 1);
+            } else if (esc == 'b') {
+                char c = '\b'; pb_buf_append_n(&out, &c, 1);
+            } else if (esc == 'f') {
+                char c = '\f'; pb_buf_append_n(&out, &c, 1);
+            } else if (esc == 'n') {
+                char c = '\n'; pb_buf_append_n(&out, &c, 1);
+            } else if (esc == 'r') {
+                char c = '\r'; pb_buf_append_n(&out, &c, 1);
+            } else if (esc == 't') {
+                char c = '\t'; pb_buf_append_n(&out, &c, 1);
+            } else if (esc == 'u') {
+                /* Minimal C99 runtime: keep JSON valid without full UTF-16 decoding. */
+                for (int i = 0; i < 4 && isxdigit((unsigned char)jp->p[i]); i++) {}
+                int ok = 1;
+                for (int i = 0; i < 4; i++) if (!isxdigit((unsigned char)jp->p[i])) ok = 0;
+                if (!ok) { free(out.data); return PB_NIL; }
+                jp->p += 4;
+                char q = '?'; pb_buf_append_n(&out, &q, 1);
+            } else {
+                free(out.data);
+                return PB_NIL;
+            }
+        } else {
+            pb_buf_append_n(&out, &ch, 1);
+        }
+    }
+    if (*jp->p != '"') { free(out.data); return PB_NIL; }
+    jp->p++;
+    PbVal v; v.tag = PB_TAG_STR; v.str = out.data; return v;
+}
+
+static PbVal pb_json_parse_array(PbJsonParser* jp) {
+    if (*jp->p != '[') return PB_NIL;
+    jp->p++;
+    PbVal arr = pb_arr_new(4);
+    pb_json_skip_ws(jp);
+    if (*jp->p == ']') { jp->p++; return arr; }
+    while (*jp->p) {
+        PbVal item = pb_json_parse_value(jp);
+        pb_arr_push(arr, item);
+        pb_json_skip_ws(jp);
+        if (*jp->p == ',') { jp->p++; pb_json_skip_ws(jp); continue; }
+        if (*jp->p == ']') { jp->p++; return arr; }
+        return PB_NIL;
+    }
+    return PB_NIL;
+}
+
+static PbVal pb_json_parse_object(PbJsonParser* jp) {
+    if (*jp->p != '{') return PB_NIL;
+    jp->p++;
+    PbVal map = pb_map_new();
+    pb_json_skip_ws(jp);
+    if (*jp->p == '}') { jp->p++; return map; }
+    while (*jp->p) {
+        PbVal key = pb_json_parse_string(jp);
+        if (key.tag != PB_TAG_STR) return PB_NIL;
+        pb_json_skip_ws(jp);
+        if (*jp->p != ':') return PB_NIL;
+        jp->p++;
+        PbVal val = pb_json_parse_value(jp);
+        pb_map_set(map, key, val);
+        pb_json_skip_ws(jp);
+        if (*jp->p == ',') { jp->p++; pb_json_skip_ws(jp); continue; }
+        if (*jp->p == '}') { jp->p++; return map; }
+        return PB_NIL;
+    }
+    return PB_NIL;
+}
+
+static PbVal pb_json_parse_number(PbJsonParser* jp) {
+    char* end = NULL;
+    double n = strtod(jp->p, &end);
+    if (end == jp->p) return PB_NIL;
+    jp->p = end;
+    return PB_NUM(n);
+}
+
+static PbVal pb_json_parse_value(PbJsonParser* jp) {
+    pb_json_skip_ws(jp);
+    if (*jp->p == '"') return pb_json_parse_string(jp);
+    if (*jp->p == '[') return pb_json_parse_array(jp);
+    if (*jp->p == '{') return pb_json_parse_object(jp);
+    if (*jp->p == '-' || (*jp->p >= '0' && *jp->p <= '9')) return pb_json_parse_number(jp);
+    if (pb_json_match(jp, "true")) return PB_TRUE;
+    if (pb_json_match(jp, "false")) return PB_FALSE;
+    if (pb_json_match(jp, "null")) return PB_NIL;
+    return PB_NIL;
+}
+
+static PbVal pb_builtin_json_parse(PbVal s) {
+    if (s.tag != PB_TAG_STR) return PB_NIL;
+    PbJsonParser jp; jp.p = s.str;
+    PbVal v = pb_json_parse_value(&jp);
+    pb_json_skip_ws(&jp);
+    if (*jp.p != '\0') return PB_NIL;
+    return v;
+}
+
+static void pb_json_stringify_value(PbBuf* out, PbVal v, int depth);
+
+static void pb_json_stringify_string(PbBuf* out, const char* s) {
+    pb_buf_append(out, "\"");
+    for (const char* p = s; *p; p++) {
+        char ch = *p;
+        if (ch == '"') pb_buf_append(out, "\\\"");
+        else if (ch == '\\') pb_buf_append(out, "\\\\");
+        else if (ch == '\n') pb_buf_append(out, "\\n");
+        else if (ch == '\r') pb_buf_append(out, "\\r");
+        else if (ch == '\t') pb_buf_append(out, "\\t");
+        else if ((unsigned char)ch < 32) {
+            char tmp[8]; snprintf(tmp, sizeof(tmp), "\\u%04x", (unsigned char)ch);
+            pb_buf_append(out, tmp);
+        } else {
+            pb_buf_append_n(out, &ch, 1);
+        }
+    }
+    pb_buf_append(out, "\"");
+}
+
+static void pb_json_stringify_value(PbBuf* out, PbVal v, int depth) {
+    if (depth > 64) { pb_buf_append(out, "null"); return; }
+    char numbuf[64];
+    switch (v.tag) {
+        case PB_TAG_NIL:  pb_buf_append(out, "null"); break;
+        case PB_TAG_BOOL: pb_buf_append(out, v.bval ? "true" : "false"); break;
+        case PB_TAG_NUM:
+            if (isfinite(v.num)) {
+                if (v.num == (double)(long long)v.num)
+                    snprintf(numbuf, sizeof(numbuf), "%lld", (long long)v.num);
+                else
+                    snprintf(numbuf, sizeof(numbuf), "%.17g", v.num);
+                pb_buf_append(out, numbuf);
+            } else {
+                pb_buf_append(out, "null");
+            }
+            break;
+        case PB_TAG_STR:
+            pb_json_stringify_string(out, v.str ? v.str : "");
+            break;
+        case PB_TAG_ARR:
+            pb_buf_append(out, "[");
+            for (size_t i = 0; v.arr && i < v.arr->len; i++) {
+                if (i > 0) pb_buf_append(out, ",");
+                pb_json_stringify_value(out, v.arr->data[i], depth + 1);
+            }
+            pb_buf_append(out, "]");
+            break;
+        case PB_TAG_MAP:
+            pb_buf_append(out, "{");
+            for (size_t i = 0; v.map && i < v.map->len; i++) {
+                if (i > 0) pb_buf_append(out, ",");
+                pb_json_stringify_string(out, v.map->entries[i].key);
+                pb_buf_append(out, ":");
+                pb_json_stringify_value(out, v.map->entries[i].val, depth + 1);
+            }
+            pb_buf_append(out, "}");
+            break;
+        default:
+            pb_buf_append(out, "null");
+            break;
+    }
+}
+
+static PbVal pb_builtin_json_stringify(PbVal v) {
+    PbBuf out; pb_buf_init(&out);
+    pb_json_stringify_value(&out, v, 0);
+    PbVal s; s.tag = PB_TAG_STR; s.str = out.data; return s;
+}
 static PbVal pb_builtin_sha256(PbVal s) { (void)s; return PB_STR("0000000000000000000000000000000000000000000000000000000000000000"); }
 
 /* ─── Init / Shutdown ────────────────────────────────────────────── */

@@ -174,6 +174,25 @@ The VM exposes an **optional, runtime-only** borrow checker for explicit handles
 
 Errors are runtime errors (catchable with `try` / `catch`). Embedders that are not the stock VM receive "not supported by this host" unless they override the `VmHost` memory hooks.
 
+`stdlib:memory_safety.sapp` wraps these low-level builtins with safer pointer
+patterns borrowed from Rust, Go, Swift, and C++:
+
+| Stdlib helper | Rule |
+|---------------|------|
+| `box_new` / `box_read` / `box_write` / `box_drop` / `box_into_inner` | Owned heap value; read/write/drop check that the owner is live and not moved. |
+| `non_null(owner)` | Rejects nil/dead owners before treating a handle as pointer-like. |
+| `borrow_guard(owner)` / `borrow_mut_guard(owner)` / `guard_release(g)` | Runtime borrow guards; shared borrows block mutation until released, mutable borrows are exclusive. |
+| `pin(owner)` / `is_pinned(owner)` | Marks an owner as non-movable; `box_into_inner` and `unique_move` reject pinned owners. |
+| `unique_move(owner)` | Move-style guard; old owner reads fail after the move. |
+| `rc_new` / `rc_clone` / `rc_release` / `rc_read` / `rc_write` | Reference-counted ownership; mutation requires unique strong ownership. |
+| `weak_new` / `weak_upgrade` / `weak_release` | Weak references that do not keep the value alive. |
+| `slice_ref` / `slice_len` / `slice_get` / `slice_set` | Bounds-checked safe spans over owned arrays/strings; writes require array owners. |
+| `arena_new` / `arena_alloc` / `arena_drop_all` | Region allocation; dropping the arena invalidates every child owner. |
+
+This is still runtime checking, not a static Rust borrow checker for all ordinary
+pblang variables. The next deeper step is lifting these rules into the type
+checker for annotated code.
+
 ## FFI policy (embedding)
 
 When **FfiPolicy** is set via `vm.set_ffi_policy(Some(policy))` and `allow_all` is false:

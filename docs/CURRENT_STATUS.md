@@ -1,8 +1,8 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-06-06  
-**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 135 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen
-**Test Suite**: canonical `.sapp` corpus = **181 passed / 0 failed / 0 ignored** via `pblang test tests/semantics --allow-all` (the prebuilt-binary runner; no recompile). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
+**Last Updated**: 2026-06-14
+**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 179 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + cross-device play/run planning + cross-language convenience helpers
+**Test Suite**: canonical `.sapp` corpus = **189 passed / 0 failed / 0 ignored** via `pblang test tests/semantics --allow-all --quiet` (the prebuilt-binary runner; no recompile). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
 
 ---
 
@@ -54,8 +54,9 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | **VM builtins wired** | `allocate`, `borrow_immutable`, `borrow_mutable`, `borrow_unique`, `release_borrow`, `load`, `store`, `deallocate`, `push_lifetime`, `pop_lifetime`, `memory_stats` |
 | Borrow rules | Mutable borrows exclusive; multiple immutable borrows allowed; `store` rejects active borrows; `borrow_unique` = use-after-move |
 | Lifetime scoping | `push_lifetime` / `pop_lifetime` invalidate values allocated in popped scopes |
-| Tests | `tests/semantics/memory_safety_builtins_test.sapp` + Rust unit tests on `MemoryTracker` |
-| **Not yet** | Compile-time borrow checking for ordinary values; `stdlib/memory_safety.sapp` remains a sketch (use builtins instead) |
+| Safe pointer stdlib | `memory_safety.sapp` now wraps the builtins with Box, NonNull, borrow guards, Pin, Rc/Weak, checked slices, and arenas |
+| Tests | `tests/semantics/memory_safety_builtins_test.sapp`, `tests/semantics/memory_safety_stdlib_test.sapp`, and Rust unit tests on `MemoryTracker` |
+| **Not yet** | Compile-time borrow checking for ordinary values; the current safety layer is runtime-enforced |
 
 ## 🔒 v0.5.1 Security Fixes (Comprehensive Audit)
 
@@ -82,7 +83,7 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | Jump Threading | Multi-pass jump-to-jump resolution for branch optimization |
 | `bitops.sapp` | 26 bit-level operations: AND/OR/XOR/NOT/SHL/SHR, popcount, CLZ/CTZ, bit test/set/clear/toggle, rotations, byte swap, binary/hex conversion |
 | `compression.sapp` | Gzip, Zstd, Brotli compress/decompress + auto-detect |
-| `serialization.sapp` | JSON pretty/validate, TOML/YAML parse/stringify, CSV parse/stringify, XML escape/unescape |
+| `serialization.sapp` | Safe JSON validation, nested TOML/YAML stringify, quote-aware CSV, format detect/convert |
 
 
 ## 🚀 v0.5.6 — Generic Types + 6 New Stdlib Modules + Full Algorithm Suite
@@ -115,14 +116,14 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 |-----------|--------|-------|
 | Core VM | ✅ Stable | Bytecode, GC, sandboxing, error handling |
 | Package Manager | ✅ Functional | Lockfile, semver, file/hosted registry, HMAC verify |
-| Stdlib | ✅ 135 modules | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor |
+| Stdlib | ✅ 179 top-level modules | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor, graphics, blocks, machine optimization, linker, LLM offload, cross-language helpers |
 | Threading | ✅ Working | VM-per-thread, channels, select, thread pool |
 | OOP/Types | ✅ Working | class, struct, enum modules with full test coverage |
 | New Stdlib | ✅ Added | testing, orm, async, env, log, jwt, template, graph, benchmark, crypto_advanced, class, struct, enum, http_client |
 | CLI Tooling | ✅ Complete | run, test, fmt, lint, build, install, publish, search |
 | Type Checker | ✅ Improved | Builtin prelude, generic call substitution, fn-literal body checks; the self-hosted `.sapp` compiler now parses/compiles/runs the full language (parity reached) |
 | LSP Server | ✅ Unified | `pblang lsp` → `pblang-lsp` (tower-lsp): diagnostics, completions, hover, goto-def, workspace symbols |
-| Native Executables | ✅ Production | `pblang compile` (C99), `bundle`, `pack`, `bundle --self-extract` (embedded runtime at `bin/pblang`) |
+| Native Executables | ✅ Production | `pblang compile` (C99), `bundle`, `pack`, `bundle --self-extract` (embedded runtime at `bin/pblang`); C runtime JSON parse/stringify now handles real structured values |
 | TLS/HTTPS | ✅ Stable | rustls + webpki-roots, proper certificate verification |
 | Concurrency | ✅ Enhanced | SafeMutex, SafeRwLock, SafeChannel, ThreadPool, Barrier, Once, Timer |
 | Memory Safety | ✅ Wired | Runtime builtins + `MemoryTracker`; not compile-time for all values |
@@ -133,14 +134,25 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | LLVM Backend | ✅ Prototype | `pblang-llvm` crate: LLVM IR text emitter → compile with clang; `pblang compile --llvm`; functions, if/else, while, for, comparisons |
 | Self-Hosting | ✅ **Complete** | `stdlib/compiler/` (tokenizer→parser→semantic→typeck→ir→optimizer→codegen + `selfhost_frontend.sapp` entry + `vm.sapp` interpreter, ~5,300 lines) tokenizes, parses, compiles **and runs** pblang end-to-end. All language features self-host (incl. `match`, `struct`/`enum`, `class`+colon-call, closures, nil-safe ops). Frontier is now breadth/perf |
 | Polyglot Build | ✅ Bridge | `pblang build-polyglot`: extracts @python/@rust/@js blocks from .sapp files, compiles to .so/.pyc, generates manifest |
-| Math Library | ✅ Enhanced | `math.sapp`: trig (sin/cos/tan), hyperbolic, stats (mean/median/stddev/variance), linear algebra (dot/mat_mul/vec_norm), constants (PI/E/TAU/PHI), number theory (gcd/lcm/is_prime) |
+| Math Library | ✅ Enhanced | `math.sapp`: trig (sin/cos/tan), hyperbolic, exported `math.stats` (sum/mean/median/stddev/variance/min/max/range), native tensor-backed large vector/matrix routes, constants (PI/E/TAU/PHI), number theory (gcd/lcm/is_prime) |
 | New Stdlib | ✅ Added | `units.sapp` (150+ conversions), `functional.sapp` (map/filter/reduce/compose/pipe/curry/memoize), `encoding.sapp` (hex/URL/CSV/base64/JSON), `colors.sapp` (HEX/RGB/HSL/blending/palettes) |
+| Array Helpers | ✅ Enhanced | `array.sapp`: clamped slice, native-backed flatten/unique/zip/chunk/take/drop, numeric min/max, find/find_index/count/partition helpers |
+| Map Helpers | ✅ Enhanced | `map.sapp`: copy/defaults/merge_all, optimized omit, has_all/has_any, sorted-key helpers, update/rename, filter/map entries |
+| String Helpers | ✅ Enhanced | `strings.sapp`: native-backed repeat/pad, safe empty-needle replace/count, final-length truncate, normalize/collapse/indent/quote helpers |
 | Type Checker | ✅ Enhanced | "did you mean?" suggestions for undeclared variables (Levenshtein distance), better error messages |
 
 ## ✅ Test Results
 
 ```
-pblang test tests/semantics --allow-all → 181 passed; 0 failed; 0 ignored   (canonical .sapp corpus, no recompile)
+pblang test tests/semantics --allow-all → 189 passed; 0 failed; 0 ignored   (canonical .sapp corpus, no recompile)
+pblang test tests/semantics --allow-all --quiet → same suite with script print output captured/suppressed for faster, cleaner CI logs
+pblang test tests/semantics --allow-all --jobs auto --quiet → run independent test files in isolated VM workers
+pblang test tests/semantics --allow-all --timings --slow 10 --quiet → show per-test durations and the slowest tests
+pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow 3 → LLM subset passes; pbAI-Max diagnostics use bounded samples plus native LLM-core tensor/activation routing (~4.0s Max fixture)
+pblang test tests/semantics --list → discover tests without executing them
+pblang test tests/semantics --exact <id> --quiet → rerun one exact discovered test id
+pblang test tests/semantics --skip <substr> --quiet → run everything except matching discovered test ids
+pblang test tests/semantics --fail-fast → stop after the first failure for faster debug loops
 cargo test --test semantics      → 192 passed; 0 failed; 1 ignored (os_env_set_pass)
 cargo test --test selfhost_drift → 26 passed; 0 failed; 1 ignored
 cargo test --test modules        → 28 passed; 0 failed
@@ -208,8 +220,13 @@ LLM substrate is now in `stdlib/llm_core.sapp`, `stdlib/llm_tokenizer.sapp`,
 `llm_attention`, `llm_train`, `llm_stream`, `llm_weights`, `llm_tokenizer_train`,
 `llm_eval`, `llm_quant`, and `llm_binary` modules. `llm_binary` is the first explicit
 bit-level token substrate for token-id bits, bitstreams, byte-bit conversion, and
-binary LM example features. `llm_attention` now exposes live architecture updates
+binary LM example features. `llm_core` can route larger dot/vector/matrix operations
+plus selected softmax/argmax/ReLU/layernorm helpers through native `tensor_*` kernels
+while keeping normal array APIs. `llm_attention` now exposes live architecture updates
 for adding decoder layers, extending context, and tuning binary adapter strength;
+`llm_data` includes bounded representative sampling for faster pbAI-Max diagnostics
+(the Max semantics fixture now uses a small diagnostic eval set instead of
+benchmark-scale full-example eval);
 `llm_train` includes analytic binary-adapter backprop into `binary_projection`,
 analytic deep-input updates for token embeddings, positional embeddings, binary
 projection, and the LM head, adaptive error reduction, feedback loops, and guessing
@@ -309,7 +326,7 @@ The VM core is stable and battle-tested:
 |--------|--------|----------|
 | `thread.sapp` | ✅ Enhanced | spawn, join, channels, select, WaitGroup, Barrier, Once, Semaphore, CircuitBreaker, RateLimiter, FanOut/FanIn |
 | `concurrency.sapp` | ✅ Added | SafeMutex, SafeRwLock, SafeChannel, ThreadPool, Barrier, Once, Timer, Atomic, concurrency stats |
-| `memory_safety.sapp` | 🟡 Sketch | Real API is VM builtins; see `Language_Semantics.md` |
+| `memory_safety.sapp` | ✅ Runtime-safe wrapper | Box/NonNull/borrow guards/Pin/Rc/Weak/checked slices/arenas over the VM memory-safety builtins |
 | `async_await.sapp` | ✅ Added | async_spawn, await, await_all, await_any, map, then |
 | `http.sapp` | ✅ Stable | GET, POST, streaming, SSE |
 | `http_server.sapp` | ✅ Stable | TCP server, routing, middleware, timeouts |
@@ -319,9 +336,13 @@ The VM core is stable and battle-tested:
 | `tensor.sapp` | ✅ Working | Basic tensor operations |
 | `quantum.sapp` | ✅ Working | Circuit builder, QASM emitter |
 | `quantum_sim.sapp` | ✅ Working | Measurement, histogram, ECC helpers |
-| `collections.sapp` | ✅ Stable | Stack, queue, set helpers |
+| `collections.sapp` | ✅ Stable | Stack, queue, set helpers; `array.sapp` and `map.sapp` expose richer data-structure helpers |
 | `math.sapp` | ✅ Stable | Complex, lerp, clamp, smoothstep |
-| `csv.sapp` | ✅ Stable | CSV parsing with quoting |
+| `csv.sapp` | ✅ Stable | Quote-aware CSV records, CRLF, header maps, stringify helpers |
+| `dataframe.sapp` | ✅ Stable | Normalized tables, quote-aware CSV I/O, schema/validation helpers |
+| `template.sapp` | ✅ Stable | Isolated loops, chained filters, condition helpers, strict missing-var checks |
+| `validate.sapp` | ✅ Stable | Nested schemas, defaults, strict fields, batch validation |
+| `config.sapp` | ✅ Stable | Layered config, typed schema maps, validation bridge |
 | `websocket.sapp` | ✅ Working | Frame parsing and writing |
 | `graphics.sapp` | 🟡 MVP | Basic graphics primitives |
 | `ffi.sapp` | ✅ Stable | C ABI bindings |
@@ -379,7 +400,7 @@ All major commands implemented:
 |---------|--------|-------------|
 | `pblang run` | ✅ | Execute .sap/.sapp files |
 | `pblang check` | ✅ | Parse + typecheck without execution |
-| `pblang test` | ✅ | Run test suite |
+| `pblang test` | ✅ | Run/list/filter/exact-select test suites |
 | `pblang install` | ✅ | Install dependencies or packages |
 | `pblang publish` | ✅ | Publish to registry |
 | `pblang search` | ✅ | Search packages |
