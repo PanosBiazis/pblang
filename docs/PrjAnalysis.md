@@ -1,4 +1,4 @@
-# pblang — Project Quality Analysis (2026-05-24, current through 2026-05-30)
+# pblang — Project Quality Analysis (2026-05-24, current through 2026-06-14)
 
 > This document combines a **comprehensive quality audit** (top half, this section)
 > with a **validation baseline / fix log** (bottom half, preserved from earlier
@@ -7,13 +7,34 @@
 > into `src/cli/*`, and the polyglot bridge expansion to 47 host languages +
 > cached cdylib loader.
 >
-> **Current status (2026-05-30):** §§19–45 below extend the original audit. The
-> headline since: **self-hosting is COMPLETE** — the pblang-written compiler
-> tokenizes, parses, compiles, **and runs** pblang end-to-end, with every language
-> feature self-hosting (§§26–45). The §1 metrics and current-status claims have been
-> refreshed to the 2026-05-30 numbers; dated section verifications (§§17–25) are
-> kept as historical snapshots. The forward direction is captured in §46 (current
-> status + north-star goals: OS/bare-metal, a pblang-written IDE, and pbAI).
+> **Current status (2026-06-14):** §§19–45 below document the self-hosting
+> milestone: the pblang-written compiler tokenizes, parses, compiles, and runs
+> pblang end-to-end. Later sections through §152 capture the June follow-up work:
+> AI/http/ONNX doc sync, hardware inventory hardening, middleware API cleanup,
+> `stdlib:blocks.sapp` for blocks programming and mixed code+blocks projects,
+> `stdlib:machine_opt.sapp` for register/cache/memory/binary-backend/device
+> planning and cross-device play/run planning, C-transpiler JSON/scope fixes,
+> `stdlib:lang_extras.sapp`, high-level graphics helper improvements, and the
+> command-handler extractions for `pblang test`, `pblang lint`, `pblang --doc`,
+> `pblang build-polyglot`, `pblang bundle`, compile/test cache acceleration,
+> `stdlib:linker.sapp`, AirLLM-style low-memory LLM offload planning, and
+> Rust/Go/Swift/C++-inspired safe pointer wrappers over the VM memory tracker,
+> isolated parallel `pblang test --jobs` workers, measured test timings, and
+> faster bounded pbAI-Max/LLM diagnostic loops and smaller Max fixture eval
+> samples, native tensor-kernel routing for LLM core math, native
+> activation/reduction bridges, general `stdlib:math.sapp` stats/linear algebra
+> cleanup with tensor-backed large-array routes, `stdlib:array.sapp`
+> native-transform exposure plus friendlier collection helpers,
+> `stdlib:map.sapp` copy/default/merge/filter/update helpers, and
+> `stdlib:strings.sapp` native-backed repeat/pad plus normalization helpers,
+> `stdlib:csv.sapp` quote-aware record splitting plus richer map helpers, and
+> `stdlib:dataframe.sapp` normalized table construction plus schema helpers,
+> `stdlib:serialization.sapp` safer multi-format conversion helpers, and
+> `stdlib:template.sapp` safer loops/filters/missing-variable checks, and
+> `stdlib:validate.sapp` nested schemas/defaults/strict validation, and
+> `stdlib:config.sapp` layered typed configuration validation.
+> Historical snapshots are preserved in place; prefer the newest numbered
+> section when a metric or capability appears in multiple places.
 
 ---
 
@@ -24,13 +45,13 @@
 | Metric | Value |
 |---|---|
 | Workspace crates | **17** core (incl. `pblang-lint`) + `pblang-stub` launcher (+ `pb-mcp-server` external tooling) |
-| Total Rust LOC | **44,615** (refreshed 2026-05-29) |
-| Largest Rust files | `src/main.rs` (5,980), `pblang-core/src/parser.rs` (2,682), `pblang-vm/src/vm.rs` (2,526 — down from 12,321 after the submodule extraction), `pblang-pm/src/lib.rs` (2,474), `pblang-vm/src/vm/polyglot.rs` (2,156) |
-| Stdlib modules | **135** top-level `.sapp` files (147 incl. self-host compiler), **30,970** lines of pblang |
-| Largest stdlib | `math.sapp` (1,018), `thread.sapp` (~976), `polyglot_registry.sapp` (703), `ide.sapp` (632), `async_await.sapp` (526) |
-| Examples | 23 |
-| Integration test files | 32 (semantics, pack, threads, sandbox, LSP, HTTP server, fmt, lint, modules, polyglot, quantum sim, tensors, …) |
-| Total tests | **160** `tests/semantics/*.sapp` end-to-end (`pblang test tests/semantics --allow-all` → **160/0/0**, the canonical runner) + cargo `tests/semantics.rs` **134** `#[test]` (1 ignored: `os_env_set_pass`) + integration suites (`selfhost_drift`, `modules`, `typeck_compiler`, `pblang-typeck`, `pblang-lint`, `fmt`, `fmt_drift`). The former match-guard limitation is **resolved**; `os_env_set_pass` is the only ignored test. (Counts other than semantics not re-verified at this revision.) |
+| Total Rust LOC | **64,609** (refreshed 2026-06-14, tracked `.rs` plus the new extracted CLI modules, excluding generated `target*`/agent-worktree artifacts) |
+| Largest Rust files | `src/main.rs` (5,019, down from 6,323 after the `pblang test`, `pblang lint`, `pblang --doc`, `pblang build-polyglot`, and `pblang bundle` extractions, with compile-cache wiring added afterward), `tests/semantics.rs` (3,178), `pblang-core/src/parser.rs` (2,996), `pblang-vm/src/vm.rs` (2,952 — down from 12,321 after the submodule extraction), `pblang-pm/src/lib.rs` (2,595), `pblang-vm/src/vm/polyglot.rs` (2,577) |
+| Stdlib modules | **179** top-level `.sapp` files (**38,321** lines), **203** `.sapp` files total including `stdlib/compiler/` (**46,962** lines) |
+| Largest stdlib | `compiler/parser.sapp` (1,312), `compiler/codegen.sapp` (1,100), `math.sapp` (1,018), `polyglot_registry.sapp` (999), `thread.sapp` (976), `polyglot_build.sapp` (753), `llm_train.sapp` (753) |
+| Examples | 32 files under `examples/` |
+| Integration test files | 34 Rust integration test files (`tests/*.rs`) plus semantic `.sapp` fixtures |
+| Total tests | **189** `tests/semantics/*.sapp` end-to-end (`pblang test tests/semantics --allow-all --quiet` → **189/0/0**, verified 2026-06-14) + **565** Rust `#[test]` functions across `tests/`, `crates/`, and `src/`. |
 | License | MIT |
 | Edition / MSRV | Rust 2021 |
 
@@ -124,44 +145,51 @@ A dedicated security scan was performed against 10 categories. Summary:
 ## 7. Partial implementations and stubs
 
 ### Stdlib (`.sapp`)
-**135 top-level modules** (147 incl. the 12 self-host compiler modules) — categorized by depth:
+**179 top-level modules** (203 total including `stdlib/compiler/`) — categorized by depth:
 
 | Tier | Count | Examples |
 |---|---|---|
-| **Substantial** (>200 lines, real logic) | ~48 | `math.sapp`, `thread.sapp`, `compiler/*.sapp` (self-host bootstrap), `async_await.sapp`, `polyglot_registry.sapp`, `http_server.sapp`, `web_framework.sapp`, `ai.sapp`, `ml.sapp`, `tensor.sapp`, `quantum_sim.sapp`, `dataframe.sapp`, `cli.sapp`, `ide.sapp`, `testing.sapp`, `profiler.sapp` |
-| **Moderate** (50–200 lines) | ~70 | `class.sapp`, `enum.sapp`, `regex.sapp`, `tls.sapp`, `jwt.sapp`, `security.sapp`, `cache.sapp`, `state_machine.sapp`, `quantum.sapp`, `validate.sapp`, `compression.sapp`, `polyglot.sapp`, `polyglot_web.sapp` |
-| **Thin** (<50 lines, re-exports or single-fn wrappers) | ~13 | `crypto.sapp` (13), `json.sapp` (16), `net.sapp` (13), `process.sapp` (7), `image_processing.sapp` (22) — call out to natives or wrap one builtin |
+| **Substantial** (>200 lines, real logic) | 72 top-level / 84 total | `compiler/parser.sapp`, `compiler/codegen.sapp`, `math.sapp`, `thread.sapp`, `polyglot_registry.sapp`, `polyglot_build.sapp`, `llm_train.sapp`, `llm_offload.sapp`, `linker.sapp`, `http_server.sapp`, `hwinfo.sapp`, `machine_opt.sapp`, `pbai.sapp`, `image_processing.sapp`, `browser.sapp` |
+| **Moderate** (50–200 lines) | 93 top-level / 103 total | `class.sapp`, `enum.sapp`, `regex.sapp`, `tls.sapp`, `jwt.sapp`, `security.sapp`, `cache.sapp`, `state_machine.sapp`, `quantum.sapp`, `validate.sapp`, `compression.sapp`, `polyglot.sapp`, `polyglot_web.sapp`, `blocks.sapp`, `lang_extras.sapp` |
+| **Thin** (<50 lines, re-exports or single-fn wrappers) | 14 top-level / 16 total | `crypto.sapp`, `json.sapp`, `net.sapp`, `process.sapp`, plus a few compatibility/re-export wrappers |
 
-`stdlib/image_processing.sapp` is the only stdlib module that visibly delegates to native code without much wrapping ("call out to native"); `stdlib/networking_advanced.sapp` is the most stub-shaped (BGP / OSPF protocol stubs at 29 lines).
+The older "networking_advanced is 29 lines and stub-shaped" finding is stale:
+`stdlib/networking_advanced.sapp` is now 384 lines. The still-honest partial
+stdlib surfaces are explicit: `stdlib/jit.sapp` marks direct compile/cache
+helpers unavailable and points users to the transparent `PBLANG_JIT=1` path;
+`stdlib/systems.sapp` is a 77-line descriptor layer while the QEMU-proven
+kernel work lives in the freestanding C path described in §§69-83.
 
 ### Crates
 
 | Crate | lib.rs LOC | Health | Notes |
 |---|---|---|---|
-| `pblang-core` | 842 | ✓ Real | Parser, AST, span tracking; chumsky 1.0-alpha.8 |
-| `pblang-ir` | 573 | ✓ Real | Bytecode opcodes, value types, runtime errors |
-| `pblang-vm` | 19 facade + **10,208** in `vm.rs` + submodules (`spawn_wire`, `ffi_dispatch`, `gc`, `handles`, `db`, `net`, `strings`, **`polyglot`** — 2,443 lines) | ✓ Real | Largest crate; instruction dispatch + builtins. Polyglot extracted 2026-05-25. Further extraction candidates: math, array, map, http, json, encoding, ai, quantum builtin categories (each 500–1500 lines). |
-| `pblang-compiler` | 1,946 | ✓ Real | IR generation, optimization, diagnostics |
-| `pblang-typeck` | 1,342 | ✓ Real | Gradual typing, constraint solving, partial inference; seeds builtin prelude |
-| `pblang-pm` | 2,234 | ✓ Real | Manifest parsing, lockfile generation, registry client, dep resolution. Hosted-registry HTTP endpoints are stubs (only `file://` registry works fully). |
-| `pblang-ffi` | 423 | ✓ Real | `cdylib` C ABI for external embedders (`pblang_create_vm`, `pblang_call_function`, `pblang_eval`, `pblang_set_limits`) |
-| `pblang-lsp` | 1,063 | ✓ Real | Completion, document symbols, workspace symbols, code actions, span diagnostics |
+| `pblang-core` | 963 | ✓ Real | Parser, AST, span tracking; chumsky 1.0-alpha.8 |
+| `pblang-ir` | 1,388 | ✓ Real | Bytecode opcodes, value types, runtime errors, host contracts |
+| `pblang-vm` | 19 facade + **2,952** in `vm.rs` + 32 submodules (`polyglot` 2,577; `builtins_table` 1,418; tensor/http/ai/quantum/fs/sync/spawn/etc.) | ✓ Real | Largest runtime crate. Bulk builtin extraction is complete enough that further reduction is a `VM`-struct/dispatch redesign question, not a simple file split. |
+| `pblang-compiler` | 2,038 | ✓ Real | IR generation, optimization, diagnostics |
+| `pblang-typeck` | 2,109 | ✓ Real | Gradual typing, constraint solving, partial inference; seeds builtin prelude |
+| `pblang-pm` | 2,595 | ✓ Real | Manifest parsing, lockfile generation, semver, registry client, dep resolution, local `file://` publish/search/install, hosted publish/search/fetch client paths. A first-party hosted registry server is still separate roadmap work. |
+| `pblang-ffi` | 432 | ✓ Real | `cdylib` C ABI for external embedders (`pblang_create_vm`, `pblang_call_function`, `pblang_eval`, `pblang_set_limits`) |
+| `pblang-lsp` | 1,113 | ✓ Real | Completion, document symbols, workspace symbols, code actions, span diagnostics |
 | `pblang-quantum` | 480 | ✓ Real | Backend FromStr + bridges (Qiskit/Cirq/Braket via Python subprocess) |
 | `pblang-ai` | 913 | ✓ Real | HTTP providers (OpenAI/Anthropic/Ollama), embeddings, token counting |
-| `pblang-wasm` | 776 | ✓ Real | WASM bytecode generation; primary execution path is still the bytecode VM |
-| `pblang-cranelift` | 1,779 | ✓ Real | Cranelift backend for native codegen + linking; experimental |
+| `pblang-wasm` | 1,376 | ✓ Real | WASM bytecode generation; primary execution path is still the bytecode VM |
+| `pblang-cranelift` | 1,790 | ✓ Real | Cranelift backend for native codegen + linking; experimental |
 | `pblang-llvm` | 598 | ✓ Real (partial) | LLVM IR emission + optimization passes; experimental |
-| `pblang-ctranspiler` | 871 | ✓ Real | C codegen + FFI bindings + clang integration |
-| `pblang-graphics` | 13 facade + ~200 in `graphics.rs` | ⚠ Façade | SDL2 builtins; many handlers return `Ok(Value::Nil)` placeholder |
-| `pblang-stub` | 279 | ✓ Real (different role) | The self-extracting bundle launcher — *not* a stub crate name-wise. Reads its own ELF bytes, locates the sentinel, extracts bundle, runs `pblang run .`. |
+| `pblang-ctranspiler` | 930 | ✓ Real | C codegen + FFI bindings + clang integration |
+| `pblang-graphics` | 37 facade + 624 in `graphics.rs` | ✓ Real | minifb backend plus optional SDL2 backend, keyboard/mouse event polling, target-FPS control; examples now use the event loop. |
+| `pblang-stub` | 278 | ✓ Real (different role) | The self-extracting bundle launcher — *not* a stub crate name-wise. Reads its own ELF bytes, locates the sentinel, extracts bundle, runs `pblang run .`. |
 
 ### Hard TODO/FIXME markers
-Only **9 actionable** TODOs across the entire codebase (excluding the `pb-mcp-server` subtree):
-- `crates/pblang-graphics/examples/game.sapp:13` — "use gfx.run() with events for input"
-- `editors/ide/.../pb-dashboard.rs:600–606` (×3) — agent start/stop/restart UI controls
-- `editors/ide/.../pb-dashboard/src/main.rs:579–585` (×3 duplicate of above)
-- `editors/ide/.../ops/review.rs:529` — "add docs"
-- `stdlib/config.sapp:107` — "use a proper error throw when available"
+The previous "9 actionable TODOs" inventory was stale. Current scan
+(`rg TODO|FIXME --glob '!target/**' --glob '!tools/**'`) shows:
+
+- `crates/pblang-graphics/examples/game.sapp` TODO is **fixed** in §128; the example now uses `gfx.run(...)` with event-driven keyboard input.
+- The `stdlib/config.sapp:107` TODO is already closed by the `throw` wiring noted below.
+- Remaining real code TODOs are generated-handler placeholders in `editors/ide/index.html` templates. They are intentionally emitted into user code as handler bodies to fill in.
+- `stdlib/pbai.sapp` / `stdlib/llm_data.sapp` TODO/FIXME strings are analysis vocabulary, not unfinished implementation.
+- `docs/Future_plans.md` contains historical transcript/audit text and is not a current implementation inventory.
 
 ### Ignored tests (3, all documented intent)
 - `tests/http_server.rs:16, 75, 129` — all marked "Network/timing sensitive; enable with `--ignored`". Standard CI-isolation pattern.
@@ -170,17 +198,17 @@ Only **9 actionable** TODOs across the entire codebase (excluding the `pb-mcp-se
 
 | Item | Status | Effort |
 |---|---|---|
-| **Hosted package registry** (HTTP publish/fetch) | `file://` registry works; HTTP endpoints + auth + index sync are not implemented | Large |
-| **Full polyglot build-time pipeline** (auto-scan `.sapp` for `@lang` blocks → pre-warm cdylib cache during `pblang build`) | The *runtime* and *compile-cached* sides are done (47 host languages + cdylib cache); the build-system integration is the gap | Medium |
+| **First-party hosted registry server** | Client support exists for hosted publish/search/fetch plus local `file://` publish/search/install. Missing piece is a server package (`/publish`, `/search`, auth/token refresh, index sync, storage policy) that pblang itself can run. | Large |
+| ~~**Full polyglot build-time pipeline**~~ | **Done:** `pblang build --warm-polyglot` scans project `.sapp`/`.sap`/`.bpx` files, extracts cacheable `@lang` blocks, deduplicates, and prewarms the cdylib cache. | — |
 | **Native single-binary executable** (no extract-to-temp) | `pblang bundle --self-extract` produces a self-extracting binary that uses a temp dir; a truly runtime-embedded variant (mmap the tar.gz, no fs writes) is TODO | Large |
 | **Per-subcommand clap flag migration** | The top-level clap router covers 21 subcommands, but per-flag parsing inside each handler is still manual | Medium |
-| **`vm.rs` further extraction** | Down from 12k → 11,653 lines with 7 submodules; array/map/math builtin categories and the main instruction dispatch are candidates for further split | Medium |
-| **Java integration beyond subprocess** | `polyglot.exec_compiled("java", ...)` spawns `javac` + `java` per call. **No JVM/JNI embedding, no GraalVM native-image cache, no javac cache.** The cdylib cache supports rust/c/cpp/go/pascal only. | Medium-Large |
+| **CLI extraction from `src/main.rs`** | Runtime `vm.rs` extraction is no longer the hotspot; `src/main.rs` remains the largest production file at 5,019 lines after extracting `pblang test`, `pblang lint`, `pblang --doc`, `pblang build-polyglot`, and `pblang bundle` into `src/cli/*`, with `src/cli/compile_cache.rs` added as a helper. Continue moving command handlers into focused modules. | Medium |
+| **Java integration beyond subprocess** | `polyglot.exec_compiled("java", ...)` can use the GraalVM NativeAOT cache path for cdylib-style calls, but there is still no persistent JVM/JNI embedding. | Medium |
 | ~~**Async/await as a first-class language feature**~~ | **Done (§48):** native `async fn` / `await` keywords lower to `spawn`/`join`; stdlib composition helpers remain in `async_await.sapp`. | — |
 | ~~**Traits / interfaces**~~ | **Done (§50):** structural `interface` contracts backed by `has_member`, including class-instance conformance through the `__class` chain. | — |
 | **Compile-time macros / metaprogramming** | **Partial:** `stdlib/macro.sapp` now provides source-level template macros, generated symbols, macro registries, `@name(args...)` source expansion, and self-hosted generated-source analysis. Native hygienic parser/proc macros are still a future large item. | Medium-Large |
 | **Full HM-style type inference** | Inference is context-driven, not full Hindley-Milner | Large |
-| **Bare-metal / OS-dev target** | **Now an explicit project goal** (reversing the earlier "out of scope" stance). The OS-primitive API is sketched in `stdlib/systems.sapp` (asm/port/MMIO/interrupts/paging/GDT/multiboot) but as **modeling stubs today**; the real work is a freestanding codegen mode (via `pblang-ctranspiler`/LLVM) + a kernel-grade runtime. Roadmap: `docs/OS_Development.md` (phases K0–K6) | Large |
+| **Bare-metal / OS-dev target** | Freestanding C/kernel path is real and QEMU-proven through boot, heap/GC, interrupts, keyboard, scheduler, syscall, usermode, and paging milestones (§§69-83). Remaining work is productizing that path into a stable user-facing `pblang kernel build/run` workflow and growing device drivers. | Large |
 | **TLS for HTTP server (HTTPS on `pblang serve`)** | TLS exists at the VM net layer (`tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls`); the IDE-backend `pblang serve` is plaintext-only (`127.0.0.1` local-loopback removes most of the need) | Small |
 | ~~**HTTP/2 + WebSockets in serve**~~ | **Both done 2026-05-26.** WebSockets: new `GET /ws` route, tiny JSON-over-text protocol (ping/echo/version); CPU-bound run/check/format intentionally still on POST. HTTP/2: axum/http2 feature on; HTTPS path negotiates ALPN h2/http1.1 via custom `build_tls_config_with_alpn` helper. 3 HTTPS tests + 2 WS tests in `tests/new_cmd.rs`. | — |
 | **Headless-browser rendering for HTML/CSS** | `stdlib/polyglot_web.sapp` writes bundles and calls `xdg-open`/`open`/`start`; no Chrome-DevTools/Playwright integration | Medium |
@@ -296,7 +324,7 @@ Items completed in the 2026-05-27 (cargo-style test runner) session:
   - **Discovers** top-level `fn test_*(...)` declarations inside each file by walking the parsed AST (`StmtKind::Fn(name, ...)` where `name.starts_with("test_")`).
   - **Compiles + loads each file once**, then synthesizes a small chunk per discovered test fn (`OpGetGlobal(name) → OpCall(0) → OpPop → OpConstant(Nil) → OpReturn`) and runs it on the same VM so the test fn sits in globals.
   - **Emits cargo-style output**: `running N tests`, `test <file_stem>::<fn_name> ... ok` / `... FAILED`, a per-failure `---- <id> stdout ----` section with the runtime error message, the trailing `failures:` summary listing each failed test id, and the `test result: ok|FAILED. N passed; M failed; 0 ignored; 0 measured; K filtered out` line. Non-zero exit code on any failure.
-  - **`--filter <substr>` flag** (both `--filter X` and `--filter=X`) drops tests whose `<file>::<fn>` id doesn't contain the substring before the run line is printed.
+  - **`--filter <substr>` flag** (both `--filter X` and `--filter=X`) drops tests whose `<file>::<fn>` id doesn't contain the substring before the run line is printed. As of §126, the summary reports the real filtered-out count. As of §127, **`--exact <id>`** (or `--exact=<id>`) selects one exact discovered id for deterministic single-test reruns. As of §129, **`--skip <substr>`** (repeatable) excludes matching ids from otherwise-selected runs.
   - **Backward-compatible**: files with no `fn test_*` declarations get an implicit single test named after the file stem, preserving the legacy "whole file is the test" behavior for the existing semantics/etc. corpora.
   - **Capability flags** (`--allow-fs` etc.) parsed up front via `parse_capability_flags` and applied to every VM created for the run.
   - The clap subcommand docstring + the `pblang help` text were updated to advertise the new behavior.
@@ -389,7 +417,7 @@ Items still open:
 
 1. **`vm.rs` further extraction is effectively complete.** What's left in the 2,453 lines is the `VM` struct + its `VmHost` impl, the OpCode dispatch loop, `with_stdlib` constructor, the `builtin_capability_class` sandbox classifier, the static GC counters, and `alloc_array`/`alloc_map`/`import_module` helpers. None of these are builtins; they're intrinsic to the VM type. Further reduction would require a `VM` struct redesign, not more extraction.
 2. **Wire `pb-dashboard.rs` agent control TODOs** or remove the stub buttons if they're not on the near-term path. (Note: `pb-dashboard.rs` lives in the `editors/ide/tools/mcpservers/pb-mcp-server` git submodule, so requires a submodule-level commit.)
-3. **Further `src/main.rs` split** — bundle handler, lint handler, doc handler, REPL loop (per-subcommand flag parsing too). Deferred because handle_* are thin wrappers around `legacy_dispatch`, which inlines each command's body as `if/else if` branches with shared scope. Extracting individual commands needs restructuring `legacy_dispatch` first.
+3. **Further `src/main.rs` split** — REPL loop and per-subcommand flag parsing remain. The `test`, `lint`, `--doc`, `build-polyglot`, and `bundle` handlers are now extracted in §§130-134, with compile-cache support isolated in `src/cli/compile_cache.rs` in §135, proving individual command/helper movement is practical without a full `legacy_dispatch` rewrite.
 4. **Roadmap-large items from §8** that haven't moved: hosted package registry HTTP endpoints, native single-binary (no extract-to-temp), traits/interfaces, full HM inference, compile-time macros, `async fn`/`await` as keywords, headless-browser HTML/CSS rendering.
 
 ## 10. Code quality and maintainability
@@ -421,11 +449,11 @@ Items still open:
 | Cryptography | **Excellent** | Native `sha256`, `hmac_sha256`, `base64_*`, `hex_*`, `url_*`, `random_bytes`, `constant_time_eq` + `crypto_advanced.sapp` (chacha20, poly1305, scrypt, argon2 bindings) + `tls.sapp` (TLS 1.3) + `jwt.sapp` (HS256/RS256) + `crypto_quantum.sapp` (QKD BB84/E91, NIST PQC) |
 | Quantum | **Excellent** | `quantum.sapp` + `quantum_sim.sapp` + `crypto_quantum.sapp` + native `quantum_simulate(circuit)` statevector simulator (≤20 qubits) + AI-bridge `circuit_features` |
 | Polyglot | **Excellent** | **92+ execution targets** across 51 interpreted + 41 compiled languages + 9 database engines. `polyglot_exec(lang,code)` supports 51 interpreted langs. `polyglot_exec_compiled(lang,code)` supports 41 compiled langs. New stdlib modules: `polyglot_db.sapp` (unified SQL/NoSQL), `polyglot_build.sapp`, `polyglot_registry.sapp`, `polyglot_web.sapp` for HTML/CSS/JS/SCSS/Less bundling + `polyglot_db.sapp` for unified cross-database queries (SQLite, PostgreSQL, MySQL, MongoDB, Redis, DuckDB, Cassandra, Neo4j, ClickHouse). |
-| Data / formats | **Excellent** | `csv.sapp` (226 L), `dataframe.sapp` (328 L), `serialization.sapp` (246 L — JSON/YAML/MessagePack), `template.sapp` (269 L), plus table/image transformation helpers |
+| Data / formats | **Excellent** | `csv.sapp` (349 L, quote-aware records/CRLF/header maps), `dataframe.sapp` (477 L, normalized tables/schema/validation/quote-aware CSV I/O), `serialization.sapp` (582 L — safe JSON validation, nested TOML/YAML stringify, quote-aware CSV reuse, format detect/convert), `template.sapp` (389 L, isolated loops/chained filters/strict missing-variable checks), `config.sapp` (293 L, layered typed configuration with validation bridge), plus table/image transformation helpers |
 | Filesystem / OS | **Excellent** | Native `fs_*`, `path_*`, `cwd`, `os_*`, `signal*` builtins; `stdlib/fs.sapp`, `stdlib/os.sapp`, `stdlib/path.sapp`, `stdlib/env.sapp` with safety validation tests |
 | Database | **Excellent** | Native `sqlite_*` builtins + `stdlib/db.sapp` (149 L) + `stdlib/polyglot_db.sapp` (202 L — unified query API across SQLite, PostgreSQL, MySQL, MongoDB, Redis, DuckDB, Cassandra, Neo4j, ClickHouse) + `orm.sapp` (232 L) |
 | Logging / monitoring | **Excellent** | `log.sapp` (233 L — text/JSON structured logs, file/stdout/memory sinks, contextual loggers, counters, timers, spans), `profiler.sapp` (297 L), `debugger.sapp` (258 L) |
-| Abstraction / contracts | **Excellent** | Native structural `interface`s + `stdlib/generics.sapp` (runtime type descriptors and typed containers) + `stdlib/typeclass.sapp` (runtime typeclasses, instance resolution, generic dispatch, law checks, Show/Eq/Ord/Semigroup/Monoid) |
+| Abstraction / contracts | **Excellent** | Native structural `interface`s + `stdlib:generics.sapp` (runtime type descriptors and typed containers) + `stdlib:typeclass.sapp` (runtime typeclasses, instance resolution, generic dispatch, law checks, Show/Eq/Ord/Semigroup/Monoid) + `stdlib:validate.sapp` (nested schemas/defaults/strict/batch validation) |
 | Reactive / logic | **Excellent** | `observable.sapp` (refs, computed values, batching, subscriptions, subjects, streams, map/filter/scan/take/merge/combine_latest) + `logic.sapp` (facts, rules, variables, hygienic rule expansion, conjunctive queries, projection) |
 | Graphics | **Excellent** | `pblang-graphics` native framebuffer backend (window lifecycle, clear, rect/point/line/present, size, input events, minifb + SDL2 backend path) + `stdlib/graphics.sapp`, `colors.sapp`, `color.sapp` |
 | Image processing | **Excellent** | `stdlib/image_processing.sapp` (439 L pure pblang: grayscale/RGB, ASCII art, histogram, Otsu threshold, convolution, blur/sharpen/Sobel, resize, crop, flip/rotate, morphology) |
@@ -545,7 +573,7 @@ The realistic positioning: pblang can **emit and orchestrate** HTML/CSS/JS (buil
 ## 15. Risks (ranked)
 
 1. **Pre-release dependency pin** — `chumsky = "=1.0.0-alpha.8"`. If the alpha gets yanked or a security advisory lands, no fallback. Mitigation: pre-emptive migration path documented in `docs/Chumsky_migration_plan.md`.
-2. **`src/main.rs` review-fatigue surface** — ~5,980 lines in one file (the CLI). (`vm.rs` itself is now only 2,526 lines after the 32-submodule extraction.) Mitigation: continue the `src/cli/*` extraction.
+2. **`src/main.rs` review-fatigue surface** — 5,019 lines in one file (the CLI) after the first five command-handler extractions and compile-cache wiring. (`vm.rs` itself is now 2,952 lines after the 32-submodule extraction.) Mitigation: continue the `src/cli/*` extraction.
 3. **No hosted registry yet** — package distribution still requires `file://` paths or git URLs. Limits ecosystem growth.
 4. **Polyglot cdylib loads run as the embedding process** — once a pblang script has `allow_ffi` + `allow_exec`, any cdylib it compiles runs in-process. Mitigation: this is the documented FFI contract; downstream embedders should treat `allow_ffi(true)` as equivalent to "load arbitrary code".
 5. **Java/Kotlin path re-compiles every call** — no `.class`/`.jar` caching; high latency for repeated invocations. Mitigation: clone the `polyglot_compile_cached` design for JVM bytecode.
@@ -558,7 +586,7 @@ The realistic positioning: pblang can **emit and orchestrate** HTML/CSS/JS (buil
 2. **Hosted-registry *server*.** The registry *client* (GitHub/GitLab/DirectHttp fetch/publish/search) already works and is tested; what's missing is a first-party hosted index server to publish to.
 3. **True single-binary executable** — `pblang bundle --self-extract` still extracts to a temp dir; an mmap-the-tar.gz, no-fs-writes variant is the gap.
 4. ~~**WASM backend codegen for `if`/`while`/`for`**~~ — **done 2026-05-29** (see §18). Now also comparisons, `not`/`and`/`or`, and `=` assignment. Remaining WASM gaps: bare local names lack the `$` sigil (pre-existing, blocks `wat2wasm` validation), calls aren't wired, and `and`/`or` don't short-circuit.
-5. **Reduce `src/main.rs` (5,980 L)** via the `src/cli/*` pattern, and **consolidate stdlib API overlap** (`http`/`http_client`/`http_server`, `color`/`colors`, `date`/`datetime`/`time`, `ml`/`machine_learning`/`ai`).
+5. **Reduce `src/main.rs` (5,019 L)** via the `src/cli/*` pattern, and **consolidate stdlib API overlap** (`http`/`http_client`/`http_server`, `color`/`colors`, `date`/`datetime`/`time`, `ml`/`machine_learning`/`ai`).
 6. **Java/Kotlin `.jar`/native-image caching** parallel to the cdylib cache (repeated calls recompile today).
 
 ## 17. External re-audit + hardening (2026-05-29)
@@ -1915,7 +1943,7 @@ This section is the running record of "claims about the code that have been veri
 - **clap 4 top-level CLI router**: 21 subcommands (`init`, `new`, `manifest-check`, `manifest-parity`, `install`, `publish`, `search`, `fetch`, `pack`, `verify`, `build`, `bundle`, `transpile`, `lsp`, `serve`, `fmt`, `lint`, `test`, `run`, `compile`, `build-polyglot`) now route through `#[derive(Parser)] Cli` with a `Commands` enum. Per-subcommand flag parsing is intentionally still manual inside each handler (follow-up pass). The legacy `if args.first() == Some(…)` chain is preserved as a fallback for "flag-as-subcommand" forms (`--lock`, `--cfg`, `--check`, `--doc`, `--call-graph`, `--dataflow`, `--dump-bytecode`, `--annotate`, `--symbols`) that clap can't model without redesign.
 - **`pblang bundle --self-extract .` walkdir bug fixed**: when invoked with the manifest dir as `.`, the staging walkdir's `filter_entry` saw the root entry's `file_name() == "."`, hit the `!name.starts_with('.')` dotfile filter, and silently skipped the entire tree, producing a bundle with only `pblang.toml` and `bin/pblang`. Fixed by skipping the filter when `e.depth() == 0`. Regression test in `tests/pack.rs::self_extract_with_dot_cwd_includes_package_files`.
 - **`pblang serve` migrated to axum 0.7 on tokio**: replaced the 720-line hand-rolled `std::net::TcpListener` HTTP loop with an axum Router (`get`/`post` handlers + tower-http `CorsLayer` + `RequestBodyLimitLayer`). Per-invocation `tokio::runtime::Builder::new_multi_thread()` with **8 MB worker stack size** to keep the deeply-recursive pblang parser/VM from overflowing the default 2 MB tokio stack. CPU-bound handlers (`/run`, `/check`) use `spawn_blocking` so async workers stay responsive. Security guardrails preserved + sharpened: a custom `require_content_length` middleware enforces explicit Content-Length on POST (411 missing / 400 invalid); the `/examples/*id` and `/manual/*id` wildcard routes refuse multi-segment captures so attacker-controlled paths can't fall through to the IDE index fallback. New deps: `axum 0.7`, `tower 0.5`, `tower-http 0.5` (cors+limit features).
-- **`src/main.rs` modularization started**: extracted formatter (`src/cli/fmt.rs`, 364 lines), call-graph CLI (`src/cli/call_graph.rs`, 160 lines), dataflow CLI (`src/cli/dataflow.rs`, 254 lines), and span-formatting helpers (`src/cli/diag.rs`, 81 lines) into `src/cli/*.rs`. `src/main.rs` dropped from 5,999 → **5,028 lines** (−971 lines, −16%) after combining this extraction with the axum/tokio serve replacement.
+- **`src/main.rs` modularization started**: extracted formatter (`src/cli/fmt.rs`, 364 lines), call-graph CLI (`src/cli/call_graph.rs`, 160 lines), dataflow CLI (`src/cli/dataflow.rs`, 254 lines), and span-formatting helpers (`src/cli/diag.rs`, 81 lines) into `src/cli/*.rs`. At that point `src/main.rs` dropped from 5,999 -> **5,028 lines** after combining this extraction with the axum/tokio serve replacement; later feature growth brought it back up, and §§130-135 record the newest state: **5,019** lines after extracting `pblang test`, `pblang lint`, `pblang --doc`, `pblang build-polyglot`, and `pblang bundle`, plus compile-cache wiring.
 - **Native polyglot bridge — compiled-language support**: `polyglot_exec` (interpreted) and `polyglot_exec_compiled` (compiled) cover **47 languages** end-to-end via the host PATH. In-VM builtins in `crates/pblang-vm/src/vm.rs`:
   - **`polyglot_exec(lang, code)`** — interpreters: python, js (node), deno, bash, zsh, fish, powershell, ruby, perl, raku, lua, php, r, tcl, awk, julia, racket, scheme (guile), clojure, elixir, groovy, fennel, ocaml, scala.
   - **`polyglot_exec_compiled(lang, code)`** — compilers + runtime: rust (`rustc`), go (`go run`), c (`cc`/`gcc`/`clang`), cpp (`c++`/`g++`/`clang++`), zig (`zig run`), java (`javac`+`java`), kotlin (`kotlinc`+`java`), typescript (`tsc`+`node`), pascal (`fpc`), nim (`nim r`), crystal (`crystal run`), d (`dmd`/`ldc2`/`gdc`), haskell (`runghc`/`ghc`), fortran (`gfortran`/`flang`), ada (`gnatmake`), swift, cobol (`cobc`), erlang (`escript`), vala (`valac`), objc (clang -lobjc), nasm + ld (x86_64 ELF), gas + ld, v (`v run`), ocaml-compiled (`ocamlfind`/`ocamlc`). RAII-cleans temp dir even on panic.
@@ -2016,7 +2044,7 @@ Verification:
 ## True but Not Fully Fixed (Large Refactor / Design Work)
 
 - `resolve_package_entry` TOCTOU is now further hardened with `O_NOFOLLOW` on Unix in `read_text_file_with_race_check` (rejects symlink swaps between `canonicalize` and `open`). The dev/inode check remains as a second line of defence (covers non-symlink races like rename+replace). Full per-component `openat`/`O_PATH` chains or Linux's `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` are still an option if the threat model expands; current defence is two-deep.
-- `src/main.rs` is now ~5,028 lines (was 5,999). First wave of modularization landed: `src/cli/{fmt,diag,call_graph,dataflow}.rs` extracted, plus the serve handler replaced with axum (which is more compact than the legacy loop). Remaining extraction candidates: bundle handler, lint handler, doc handler, the REPL loop, per-subcommand flag parsing.
+- `src/main.rs` is now **5,019** lines after the first wave of modularization plus the §§130-135 `pblang test`/`pblang lint`/`pblang --doc`/`pblang build-polyglot`/`pblang bundle` extractions and compile-cache wiring. Extracted modules now include `src/cli/{fmt,diag,call_graph,dataflow,doc,test,lint,build_polyglot,bundle,compile_cache}.rs`. Remaining extraction candidates: the REPL loop and per-subcommand flag parsing.
 - `crates/pblang-vm/src/vm.rs` is now **2,453 lines** (was 12,321 pre-extraction, −80.1%). Submodules under `src/vm/`: `spawn_wire`, `ffi_dispatch`, `gc`, `handles`, `db`, `net`, `strings` (17 fns), `polyglot` (7 fns), `math` (22 fns), `arrays` (11 fns), `maps` (3 fns), `encoding` (7 fns), `json` (4 fns + 2 shared helpers), `parse` (3 fns), `tensor` (24 fns + 2 helpers), `http` (11 fns + status-reason helper), `ai` (4 fns inc. onnx_infer), `quantum` (4 + 4 helpers), `os` (7 fns), `re` (7 regex fns), `fs` (15 fs/path fns), `time` (4 fns), `predicates` (13 type/freeze fns), `crypto` (3 fns), `env` (3 fns), `atomics` (7 fns), `sync` (12 mutex/rwlock/barrier/once fns), `memory` (17 alloc/borrow/lifetime fns), `ffi` (4 user-facing fns), `runtime` (9 process/io/gc/assert fns), `spawn` (17 spawn/join/channel/ticker/timeout fns), **`builtins_table` (the 1.3k-line `BuiltinFn` registration vec, now a single `build() -> Vec<BuiltinFn>` fn)**, **`errors` (the `vm_err!` / `vm_arity!` / `vm_cap!` macro module added 2026-05-26)**. **32 submodules total.** What's left in vm.rs is now the `VM` struct definition, the OpCode dispatch loop, host-trait impls (`VmHost for VM`), the `with_stdlib` constructor, the capability classifier (`builtin_capability_class`), and the static GC counters / `alloc_array` / `alloc_map` helpers. No further bulk extraction looks productive — what remains is intrinsic to the `VM` type.
 - **CLI argument parsing** — clap 4 is now wired as the top-level subcommand router for 21 commands (`init`, `new`, `manifest-check`, `manifest-parity`, `install`, `publish`, `search`, `fetch`, `pack`, `verify`, `build`, `bundle`, `transpile`, `lsp`, `serve`, `fmt`, `lint`, `test`, `run`, `compile`, `build-polyglot`). Per-subcommand flag parsing inside handlers is still manual; the legacy `if args.first() == Some(…)` chain is preserved as a fallback for top-level "flag-as-subcommand" forms (`--lock`, `--cfg`, `--check`, `--doc`, `--call-graph`, `--dataflow`, `--dump-bytecode`, `--annotate`, `--symbols`) that clap can't model without redesign.
 - **`pblang bundle --self-extract`** — the walkdir filter that dropped the entire package tree when invoked with a relative `.` path is fixed (`e.depth() != 0` exception for the root entry). Regression test in `tests/pack.rs::self_extract_with_dot_cwd_includes_package_files` covers this. Existing tests only used absolute paths so didn't catch it.
@@ -2053,7 +2081,9 @@ Verification:
 - If new fixes are applied, update this file by moving items between sections rather than appending raw reports.
 - This validation was done against the GitHub repository state, not just historical reports.
 - Current branch: `main`
-- Last updated: 2026-05-24 (chumsky 1.0 + SP1-gamma refresh)
+- Last updated: 2026-06-14 for current-status pointers; the original validation
+  snapshot remains historical. See §152 for the latest stdlib/config
+  follow-up.
 
 ---
 
@@ -2061,7 +2091,7 @@ Verification:
 
 > Methodology: four parallel read-only sweeps (stubs/partials, panic-paths, security, secrets+quality) over every tracked source file, plus fresh `cargo clippy --workspace --all-targets`, `cargo test --workspace`, and the canonical `pblang test tests/semantics --allow-all`. Every machine-flagged finding below was re-verified by reading the cited code; two agent claims were **refuted** during verification and are recorded as false alarms (§112.E).
 >
-> Status note: §112 is the original 2026-06-09 audit snapshot. The current state is in §113: the original tensor/string panic paths, plaintext-registry defect, JIT API honesty gap, active personal-path references, and root-level stale reports are fixed.
+> Status note: §112 is the original 2026-06-09 audit snapshot. The current state is in §§113-152: the original tensor/string panic paths, plaintext-registry defect, JIT API honesty gap, active personal-path references, root-level stale reports, graphics/example TODO, stale top-audit counters, test-runner feedback controls, the first full CLI handler extractions, compile/test cache acceleration, pblang linker substrate, AirLLM-style offload planning, safe-pointer stdlib wrappers, parallel test workers, timing/slow-test reporting, bounded pbAI-Max/LLM diagnostic loops, smaller Max fixture eval samples, native tensor-kernel routing for LLM core math, native activation/reduction bridges, general math stdlib stats/linear-algebra cleanup, array/collection helper expansion, richer map helper coverage, string/text helper cleanup, CSV/data-format hardening, dataframe/table helper expansion, serialization/format-conversion cleanup, template/report rendering cleanup, validation/contracts expansion, and config/schema bridge cleanup are fixed or added.
 
 ### 112.A Verification baseline (all green)
 
@@ -2132,9 +2162,9 @@ API keys are env-only (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`) with `#[serde(skip_
 ### 112.F Quality analysis
 
 - **Comment density:** pblang-vm 11.7%, stdlib 13.3% — healthy.
-- **Largest files:** `src/main.rs` 6,136 (CLI dispatch — candidate for further `src/cli/*` extraction), `vm.rs` 2,961, `parser.rs` 2,935, `pm/lib.rs` 2,575, `polyglot.rs` 2,443. None pathological.
+- **Largest files:** `src/main.rs` 5,019 (CLI dispatch — still a candidate for further `src/cli/*` extraction after the §§130-135 test/lint/doc/build-polyglot/bundle splits and compile-cache helper), `tests/semantics.rs` 3,178, `parser.rs` 2,996, `vm.rs` 2,952, `pm/lib.rs` 2,595, `polyglot.rs` 2,577. None pathological, but the CLI remains the next extraction target.
 - **Apparent stdlib duplicates are deliberate layering** (verified by reading headers): `async`/`async_await`/`async_io` = goroutines vs futures vs event-loop; `date`/`datetime`/`duration` = layered; `crypto`/`crypto_advanced`/`crypto_quantum` = tiered. Only true overlap: `color.sapp` (34 lines) is subsumed by `colors.sapp` (249) → deprecate or alias.
-- **Tests:** 181 semantics .sapp + Rust `#[test]` + integration suites (selfhost_drift, modules, typeck, lint, fmt) + 4 fuzz targets + benches; CI on 3 platforms with audit. Weakest spot: no coverage measurement; the §112.B tensor/string panic paths now have adversarial-input regression tests in §113.
+- **Tests:** 189 semantics `.sapp` tests + 565 Rust `#[test]` functions + integration suites (selfhost_drift, modules, typeck, lint, fmt) + 4 fuzz targets + benches; CI on 3 platforms with audit. Weakest spot: no coverage measurement; the §112.B tensor/string panic paths now have adversarial-input regression tests in §113.
 - **Process health:** zero-warning policy effectively held (24 nits across 92k lines), conventional commits, CHANGELOG maintained, MIT licensed, MSRV pinned.
 
 ### 112.G Comparison against other languages
@@ -2154,7 +2184,7 @@ Where pblang stands today (v0.5.7, tree-walk VM + opt-in Cranelift JIT) against 
 | Polyglot embedding | **47-language polyglot blocks** — unique | C ext/ctypes | N-API | C API (**easiest embed**) | C ext | cgo | FFI | n/a | C interop | ccall |
 | AI/tensor in stdlib | **built-in tensors, GPU matmul (wgpu), LLM toolkit, pbAI** | via numpy/torch (external, dominant) | via deps | no | no | no | via crates | via libs | no | **built-in-grade** (core strength) |
 | Quantum sim, OS-dev path, native IDE | quantum sim builtin; QEMU-proven boot→usermode (§§69-83); self-hosted IDE in progress | none of these in-tree | none | none | none | none | OS-dev via no_std | OS-dev native | OS-dev native | none |
-| Ecosystem size | **~185 first-party modules; no third-party ecosystem** | huge | huge | medium | large | large | huge | huge | small | medium (sci) |
+| Ecosystem size | **201 first-party stdlib `.sapp` modules; no third-party ecosystem** | huge | huge | medium | large | large | huge | huge | small | medium (sci) |
 | Tooling | fmt, lint, LSP, test runner, pm, fuzzing — all first-party | mature | mature | thin | mature | **gold standard** | gold standard | mature | young | good |
 
 **Honest read-out** (updates §66's weakness roadmap):
@@ -2166,10 +2196,10 @@ Where pblang stands today (v0.5.7, tree-walk VM + opt-in Cranelift JIT) against 
 
 | Axis | Score | Note |
 |---|---|---|
-| Correctness/test health | 9.2/10 | 181/0/0 after fixes; tensor/string panic paths covered; minus: no coverage metric |
+| Correctness/test health | 9.4/10 | 189/0/0 canonical `.sapp` suite; exact/list/quiet/cache/jobs/timings/slow test-runner controls covered; tensor/string panic paths covered; minus: no coverage metric |
 | Security posture | 9.1/10 | capability model + hardened pm; plaintext registry URLs now require explicit opt-in; securelayer KDF boundary now documented; minus: native KDF/AEAD ergonomics remain roadmap |
 | Completeness honesty | 8.5/10 | experimental backends clearly labelled; jit.sapp API mismatch and root doc drift fixed; roadmap gaps remain explicit |
-| Code quality | 9/10 | near-zero clippy at 92k lines, layered stdlib, healthy comments |
+| Code quality | 9.1/10 | near-zero clippy on a larger tree, layered stdlib, healthy comments; first full CLI command handler extracted, with more handlers still worth moving |
 | Performance | 6/10 | interpreter-class; JIT/GPU/rayon are the right levers, partially engaged |
 | Ecosystem | 2/10 | first-party only — the defining gap |
 
@@ -2259,10 +2289,1205 @@ cargo test --test semantics ai_onnx_wrapper_returns_structured_result
 
 Result: passed. Cargo still reports the known external-drive incremental-cache hard-link warning; it is not a test failure.
 
-Full-suite follow-up:
+## 117. Blocks programming + middleware API cleanup (2026-06-14)
+
+User request follow-up: add the ability for **blocks programming** and **code + blocks programming**, while continuing the docs-driven cleanup of true/stale findings.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| pblang-native blocks programming model | **ADDED** | New `stdlib/blocks.sapp` defines a portable map-based block format for workspaces, expressions, statements, control flow, functions, raw-code blocks, code generation, and validation. |
+| Code + blocks composition | **ADDED** | `workspace()` + `set_code(...)` + `add(...)` preserve handwritten code and append generated block code; `raw(code)` / `from_code(code)` represent user-authored code as blocks; `compose(code, blocks)` directly combines both modes. |
+| pblang code generation from blocks | **ADDED** | Expression blocks (`num`, `text`, `var`, `binop`, `call`, `array_expr`, `map_expr`) and statement blocks (`let_stmt`, `set_stmt`, `print_stmt`, `return_stmt`, `if_stmt`, `while_stmt`, `for_count`, `for_in`, `fn_block`) render valid pblang source through `to_code(...)`. |
+| Structural diagnostics | **ADDED** | `validate(...)` walks a workspace/block graph and reports unknown block kinds or malformed nil blocks before code generation. |
+| Regression coverage | **ADDED** | `tests/semantics/blocks_programming_test.sapp` verifies handwritten-code + raw-block + generated-block composition and executes the generated program through the self-hosted frontend. `tests/semantics.rs::blocks_programming_pass` adds cargo coverage. |
+| Middleware API cleanup | **IMPROVED** | `stdlib/middleware.sapp` now exposes primary `mw_log()` and `mw_require_auth(...)` helpers; old `mw_log_stub()` / `mw_require_auth_stub(...)` remain as compatibility aliases. `docs/Tooling.md`, `docs/Report.md`, and `tests/semantics.rs::web_middleware_wrap_and_chain` now use/cover the non-stub names. |
+| Tooling docs | **SYNCED** | `docs/Tooling.md` documents `stdlib:blocks.sapp` as the pblang-native foundation for visual blocks programming, separate from the future drag/drop UI rendering layer. |
+
+Verification:
 
 ```sh
-pblang test tests/semantics --allow-all
+./target/debug/pblang run tests/semantics/blocks_programming_test.sapp --allow-all
+cargo test --test semantics blocks_programming_pass
+cargo test --test semantics web_middleware_wrap_and_chain
+./target/debug/pblang test tests/semantics --allow-all
 ```
 
-Result: passed, **181 passed / 0 failed / 0 ignored**.
+Result: passed, including the full pblang semantics suite (**183 passed / 0 failed / 0 ignored**). Cargo still reports the known external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 116. Docs-driven pblang scan follow-up (2026-06-14)
+
+Reading this analysis file again and scanning the current project found one still-true implementation gap in `stdlib/hwinfo.sapp`: Linux/macOS hardware sections still returned `"not implemented for this platform"` placeholders for RAM, disks, GPU, NPU, network, sound, and device-class inventory even though the module already had a command-execution substrate.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Non-Windows RAM inventory | **IMPROVED** | `ram()` now tries `sysctl -n hw.memsize`, then `getconf _PHYS_PAGES` + `PAGE_SIZE`, and reads `/proc/meminfo` for available memory when possible. |
+| Non-Windows disks | **IMPROVED** | `disks()` now parses `lsblk -b -dn -o NAME,ROTA,SIZE,TYPE`, with a `df -kP` filesystem fallback. |
+| Non-Windows GPU/NPU inventory | **IMPROVED** | `gpus()` and `npu()` now parse `lspci` and, for macOS display adapters, `system_profiler SPDisplaysDataType`; missing tools degrade to an honest unavailable note. |
+| Non-Windows network/sound/devices | **IMPROVED** | `network()` now uses `ip -o link show` with `ifconfig -a` fallback; `sound()` uses `aplay -l` or `pactl`; `devices_by_class()` summarizes `lspci`/`lsusb` classes. |
+| Regression coverage | **ADDED** | `tests/semantics/hwinfo_test.sapp` now rejects the old `"not implemented for this platform"` fallback wording for all hardware sections. |
+| String API doc drift | **SYNCED** | Stale comments in `stdlib/compiler/tokenizer.sapp`, `stdlib/crypto_advanced.sapp`, and `tests/semantics/crypto_advanced_binary_test.sapp` now match the current codepoint-indexed `strcharcodeat` API and byte-array crypto path. |
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/hwinfo_test.sapp --allow-all
+cargo test --test semantics hwinfo_test_pass
+./target/debug/pblang run tests/semantics/crypto_advanced_binary_test.sapp --allow-all
+```
+
+Result: passed. Cargo still reports the known external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 118. Machine/device optimization planning substrate (2026-06-14)
+
+User request follow-up: add a way for pblang to reason about registers, memory,
+cache, binary/machine-code paths, every relevant compute-device class, and how
+to play/run pblang programs across device classes without pretending unsupported
+hardware backends already exist.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Low-level optimization model | **ADDED** | New `stdlib/machine_opt.sapp` defines target profiles for portable CPUs, old/legacy machines, microcontrollers, GPU-style accelerators, quantum/QPU-style targets, and WASM/sandbox targets. |
+| Register planning | **ADDED** | `register_plan(profile, workload)` estimates physical register budget, hot virtual values, pinned registers, expected spills, and selects scalar/vector/qubit-register strategies. |
+| Memory/cache planning | **ADDED** | `memory_plan(...)`, `tile_plan(...)`, and `cache_plan(...)` choose contiguous/chunked/streaming layouts and cache tiles sized to fit input/output working sets. |
+| Binary/backend routing | **ADDED** | `binary_plan(...)` routes generic code to bytecode VM, numeric hot loops to Cranelift-JIT-or-C-AOT, old/microcontroller targets to freestanding C, WASM profiles to WASM, and quantum workloads to a quantum-protocol path. |
+| Device routing | **ADDED** | `device_plan(...)` ranks CPU/GPU/NPU/FPGA/quantum/distributed device candidates and records rejected devices with reasons. Specialized devices are selected only when the workload and runtime/toolchain metadata match; CPU remains the safe fallback. |
+| Cross-device play/run planning | **ADDED** | `play_target(...)`, `play_plan(...)`, and `play_matrix(...)` describe how to run pblang on desktop/server VM targets, browser WASM, mobile runtime/WASM embedding, old-PC AOT, microcontroller firmware-C subsets, GPU/NPU/FPGA host-assisted accelerators, quantum simulator/provider routes, distributed nodes, and IoT/robot edge controllers. |
+| Full plan/explanation | **ADDED** | `full_plan(...)` combines register, memory, cache, binary, and device decisions, with a `growth_rule` for measure/keep/reject/expand behavior. `explain(...)` produces a compact human-readable summary. |
+| Honest boundary | **DOCUMENTED** | `docs/Tooling.md` and this section state that `machine_opt.sapp` is a planning/foundation layer. Actual JIT/AOT/GPU/NPU/FPGA/quantum backends must still generate and verify executable code behind these routes. |
+| Regression coverage | **ADDED** | `tests/semantics/machine_opt_test.sapp` verifies vector register planning, cache tiling, numeric machine-code routing, old-machine chunking/AOT routing, GPU tensor routing, NPU-without-runtime rejection, quantum routing, cross-device play routes, and explanation text. `tests/semantics.rs::machine_opt_pass` adds cargo coverage. |
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/machine_opt_test.sapp --allow-all
+cargo test --test semantics machine_opt_pass
+./target/debug/pblang test tests/semantics --allow-all
+```
+
+Result: passed, including the full pblang semantics suite (**184 passed / 0 failed / 0 ignored**). Cargo still reports the known external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 119. Native C runtime JSON support for the transpiler (2026-06-14)
+
+Continuing the all-fields improvement pass, the next true gap was in the
+Rust-backed C transpiler runtime: `json_parse` and `json_stringify` were still
+placeholders in `crates/pblang-ctranspiler/src/pblang_rt.h`, which made native
+transpiled programs weaker than VM-run programs for data exchange.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| C runtime `json_parse` | **IMPLEMENTED** | Replaced the `return PB_NIL` placeholder with a small portable C99 parser for `null`, booleans, numbers, strings with common escapes, arrays, and string-key objects. Parsed values are real `PbVal` arrays/maps/strings/numbers/bools/nil. |
+| C runtime `json_stringify` | **IMPLEMENTED** | Replaced the `"{}"` placeholder with recursive JSON serialization for nil, booleans, finite numbers, strings with escaping, arrays, and maps. Non-JSON runtime values degrade to `null`. |
+| Native/AOT regression coverage | **ADDED** | New `tests/ctranspiler_runtime.rs` transpiles a pblang snippet, compiles the generated C with the local C compiler when available, runs the native executable, and verifies JSON parse/stringify behavior. `Cargo.toml` now registers the `ctranspiler_runtime` integration test. |
+| Scope boundary | **DOCUMENTED** | This is intentionally a dependency-free C99 runtime parser/serializer, not a full Unicode-normalizing JSON engine. It closes the placeholder gap for native transpiled programs and keeps VM JSON as the richer reference implementation. |
+
+Verification:
+
+```sh
+cargo test --test ctranspiler_runtime
+```
+
+Result: passed. Cargo still reports the known external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 120. Cross-language convenience helpers + C transpiler local-symbol correctness (2026-06-14)
+
+User request follow-up: add useful features/commands from other programming
+languages while continuing the broad pblang improvement pass.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Cross-language stdlib helpers | **ADDED** | New `stdlib/lang_extras.sapp` adds pure-pblang helpers inspired by Python (`range`, `enumerate`, `zip`, `reversed`), JavaScript (`keys`, `values`, `entries`, `from_entries`, `pick`, `omit`, `get_path`), Rust/Kotlin (`unwrap_or`, `expect`, `take_if`, `take_unless`), and functional pipelines (`tap`, `pipe`, `repeat`, `clamp`). |
+| Library-first design | **DOCUMENTED** | These are not new parser keywords yet. They are normal importable stdlib commands, which keeps them portable across the VM, self-hosted compiler paths, and native transpilation work. Parser sugar can later target this stable library behavior. |
+| Semantic coverage | **ADDED** | `tests/semantics/lang_extras_test.sapp` verifies all new helpers through a normal `import("stdlib:lang_extras.sapp")`; `tests/semantics.rs::lang_extras_pass` adds Rust-harness coverage. |
+| C transpiler local symbols | **FIXED** | `crates/pblang-ctranspiler/src/lib.rs` now tracks lexical scopes and top-level function names separately, so ordinary local variables and parameters no longer get rewritten as `pb_fn_*` function references in generated C. |
+| Native/AOT regression coverage | **EXPANDED** | `tests/ctranspiler_runtime.rs` now verifies JSON parse/stringify through a local variable and a function parameter/local variable path, not only direct inline JSON calls. |
+| Docs/status | **SYNCED** | `docs/CURRENT_STATUS.md` and `docs/Tooling.md` now include the new stdlib module and the current canonical `.sapp` suite count. Current top-level stdlib count: **177** modules. Current canonical `.sapp` semantics corpus: **185** files. |
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/lang_extras_test.sapp --allow-all
+cargo test --test semantics lang_extras_pass
+cargo test --test ctranspiler_runtime
+cargo test -p pblang-ctranspiler
+./target/debug/pblang test tests/semantics --allow-all
+git diff --check
+```
+
+Result: passed, including the full pblang semantics suite
+(**185 passed / 0 failed / 0 ignored**). Cargo still reports the known
+external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 121. Graphics helper completion pass (2026-06-14)
+
+Continuing the broad pblang improvement pass, the next still-true docs/code gap
+was in `stdlib:graphics.sapp`: the docs described Bezier/text support as
+stub-shaped even though `stdlib:bitmap_font.sapp` already had a real tested
+pixel-font renderer.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Cubic Bezier helpers | **ADDED** | `graphics.bezier_point(...)` computes a cubic Bezier point and `graphics.bezier_points(..., segments)` returns a clamped point list including both endpoints. Segment counts clamp to 1..512 so callers cannot accidentally request unbounded point generation. |
+| Polyline and polygon helpers | **ADDED** | `graphics.draw_polyline(handle, points, color)` draws connected point arrays; `graphics.polygon(handle, points, color)` closes polygons with a final edge. |
+| High-level curve drawing | **ADDED** | `graphics.bezier(handle, ..., color, segments)` approximates the cubic with line segments, draws it, and returns the generated points for inspection/debugging. |
+| Text drawing | **IMPROVED** | `graphics.draw_text(handle, x, y, text, color)` now delegates to `stdlib:bitmap_font.sapp` and emits pixels with `gfxdrawpoint`; `Window(...).text(...)` exposes this through the window object. |
+| Window API | **EXPANDED** | `Window(...)` now exposes `polyline`, `polygon`, `bezier`, and `text` methods alongside the existing point/line/rect/circle methods. |
+| Headless regression coverage | **ADDED** | `tests/semantics/graphics_helpers_test.sapp` verifies Bezier endpoints, midpoint, segment clamping, color interpolation, and exported text callable shape without opening a native window. `tests/semantics.rs::graphics_helpers_pass` adds Rust-harness coverage. |
+| Docs/status | **SYNCED** | `docs/Tooling.md` no longer describes Bezier/text drawing as stubs. `docs/CURRENT_STATUS.md` and this top audit now report the canonical `.sapp` corpus as **186** files. |
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/graphics_helpers_test.sapp --allow-all
+cargo test --test semantics graphics_helpers_pass
+./target/debug/pblang test tests/semantics --allow-all
+git diff --check
+```
+
+Result: passed, including the full pblang semantics suite
+(**186 passed / 0 failed / 0 ignored**). Cargo still reports the known
+external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 122. Test-run quiet mode + LLM corpus sanitization (2026-06-14)
+
+User request follow-up: improve test speed and general runtime ergonomics without
+destabilizing the programming language, while continuing the shared pblang/pbAI
+foundation work.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang test --quiet` | **ADDED** | The test runner now accepts `--quiet`. It executes the same bytecode but uses the VM's print-collection path to capture and discard script `print` output, while still printing cargo-style test status lines and failures. Default `pblang test` behavior is unchanged. |
+| Test planning memory churn | **IMPROVED** | The test planner now shares each parsed file source/body across discovered `test_*` entries instead of cloning the parsed statement vector once per function. Compilation still receives an owned statement vector once per file, so execution semantics stay unchanged. |
+| CLI help | **SYNCED** | `pblang --help` now documents `--quiet` on the `test` command. |
+| Regression coverage | **ADDED** | `tests/new_cmd.rs::test_quiet_suppresses_script_prints_but_reports_status` verifies that script output is suppressed while pass/fail status remains visible. |
+| LLM data sanitizer | **ADDED** | `stdlib:llm_data.sapp` now exposes `sensitive_line`, `sanitize_text`, and `sanitize_record` for deterministic line-level redaction of common token/password/API-key/private-key shapes before text reaches tokenizers or live-learning corpora. |
+| `read_text_file` hardening | **IMPROVED** | `llm_data.read_text_file(...)` now sanitizes text before returning it, then applies the character cap. |
+| Foundation coverage | **ADDED** | `tests/semantics/llm_foundation_test.sapp` verifies that sanitizer output removes secret values, preserves safe content, and records redaction metadata. |
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/llm_foundation_test.sapp --allow-all
+cargo test --test new_cmd test_quiet_suppresses_script_prints_but_reports_status
+./target/debug/pblang test tests/semantics --filter llm_foundation --quiet --allow-all
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed, including the full quiet-mode pblang semantics suite at
+**186 passed / 0 failed / 0 ignored**. Cargo still reports the known
+external-drive incremental-cache hard-link warning; it is not a test failure.
+
+## 123. Hardware inventory summary API for assistants/tools (2026-06-14)
+
+Continuing the pblang + pbAI improvement pass, the next safe cross-project
+improvement was to make pblang's hardware inventory easier for assistant layers
+to consume without duplicating platform-specific probe logic.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| GPU summary API | **ADDED** | `stdlib:hwinfo.sapp` now exposes `gpu_summary()`, a compact status string built from the same structured `gpus()` detector used by `survey()`. It reports detected adapter names/vendors and the honest pblang compute-use note, or a clear unavailable/no-device note. |
+| NPU summary API | **ADDED** | `npu_summary()` mirrors `npu()` and always includes the detection-vs-compute boundary: NPUs are inventory-only until a real pblang/vendor backend exists. |
+| Placeholder regression guard | **ADDED** | `tests/semantics/hwinfo_test.sapp` now asserts both summary APIs return non-empty text and do not regress to the old `"not implemented for this platform"` wording. |
+| Tooling docs | **SYNCED** | `docs/Tooling.md` documents `gpu_summary()` / `npu_summary()` as the stable text layer for tools and assistants while keeping `survey()` as the structured API. |
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/hwinfo_test.sapp --allow-all
+./target/debug/pblang test tests/semantics --filter hwinfo --allow-all --quiet
+```
+
+Result: passed, including the full quiet-mode pblang semantics suite
+(**186 passed / 0 failed / 0 ignored**).
+
+## 124. Dependency audit hygiene pass (2026-06-14)
+
+Follow-up to `cargo audit`: the current audit result has **no failing
+vulnerability advisories**, but still reports three allowed RustSec
+maintenance warnings (`instant`, `paste`, `rustls-pemfile`). This pass reduces
+what can be safely reduced without changing pblang's runtime behavior.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `minifb` window backend | **UPDATED** | `crates/pblang-graphics` now uses `minifb = "0.28"` instead of `0.25`. The old `Window::limit_update_rate(...)` call was replaced with the current `Window::set_target_fps(60)` API. |
+| Native TLS root loading | **UPDATED** | `crates/pblang-vm` now uses `rustls-native-certs = "0.8"`. The VM TLS client root-store code was adapted to the new `CertificateResult { certs, errors }` API and keeps the existing behavior: webpki roots plus all successfully loaded native roots. |
+| `rustls-pemfile` transitive surface | **REDUCED** | `rustls-native-certs` no longer pulls `rustls-pemfile`; remaining paths are direct pblang TLS PEM parsing and `axum-server` TLS support. |
+| Remaining audit warnings | **CLASSIFIED** | `instant` remains via latest `minifb`; `paste` remains through optional GPU all-features path `wgpu -> wgpu-hal -> metal`; `rustls-pemfile` remains in direct TLS PEM loading plus `axum-server`. These require upstream replacement or a larger local TLS/window/GPU backend swap, not a safe version bump. |
+
+Verification:
+
+```sh
+cargo test -p pblang-graphics
+cargo test -p pblang-vm
+cargo test --test new_cmd test_quiet_suppresses_script_prints_but_reports_status
+./target/debug/pblang test tests/semantics --allow-all --quiet
+cargo audit
+```
+
+Result: graphics, VM, focused CLI, and the full quiet-mode pblang semantics
+suite passed (**186 passed / 0 failed / 0 ignored**). `cargo audit` exits
+successfully with the same **3 allowed unmaintained warnings**; no failing
+vulnerability advisory is reported.
+
+## 125. Faster test feedback controls (2026-06-14)
+
+Continuing the broad pblang improvement pass, the next low-risk tooling win was
+to improve the built-in test runner's feedback loop without changing default
+test execution semantics.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang test --list` | **ADDED** | Lists discovered test ids (`file::test_fn: test`) without compiling/running test bytecode. This is useful for checking filters, discovery, and CI sharding candidates without executing side effects. Planning errors still exit non-zero. |
+| `pblang test --fail-fast` | **ADDED** | Stops after the first runtime, compile, parse, or read failure. Default behavior remains full-suite execution. |
+| CLI help | **SYNCED** | `pblang --help`, `docs/Tooling.md`, and `docs/CURRENT_STATUS.md` document `--list` and `--fail-fast` alongside `--quiet` and `--filter`. |
+| Regression coverage | **ADDED** | `tests/new_cmd.rs::test_list_prints_discovered_tests_without_running_scripts` verifies list mode does not execute script prints. `test_fail_fast_stops_after_first_failure` verifies later tests are skipped after the first failure. |
+
+Verification:
+
+```sh
+cargo test --test new_cmd test_list_prints_discovered_tests_without_running_scripts
+cargo test --test new_cmd test_fail_fast_stops_after_first_failure
+cargo test --test new_cmd test_quiet_suppresses_script_prints_but_reports_status
+./target/debug/pblang test tests/semantics --list
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. The focused CLI regressions passed, `--list` discovered all
+**186** semantic tests without execution, and the full quiet-mode pblang
+semantics suite passed (**186 passed / 0 failed / 0 ignored**).
+
+## 126. Accurate filtered-test accounting (2026-06-14)
+
+Follow-up to the test-runner feedback controls: `pblang test --filter ...`
+selected the correct tests, but the cargo-style summary still always printed
+`0 filtered out`. That made filtered CI/debug runs less trustworthy.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Filter accounting | **FIXED** | The test planner now counts every discovered test id before applying `--filter`, then reports `discovered_total - selected_total` as the `filtered out` count. |
+| List-mode filter accounting | **FIXED** | `pblang test --filter X --list` prints `N tests, M filtered out` when a filter excludes tests, without executing script code. |
+| Regression coverage | **ADDED** | `tests/new_cmd.rs::test_filter_reports_filtered_out_count` verifies both `--filter --list` and `--filter=... --quiet` report the expected filtered count and do not run excluded tests. |
+| Docs | **SYNCED** | `docs/Tooling.md` and the older test-runner analysis entry now document that filtered runs report real filtered-out counts. |
+
+Verification:
+
+```sh
+cargo test --test new_cmd test_filter_reports_filtered_out_count
+cargo test --test new_cmd test_list_prints_discovered_tests_without_running_scripts
+cargo test --test new_cmd test_fail_fast_stops_after_first_failure
+cargo test --test new_cmd test_quiet_suppresses_script_prints_but_reports_status
+./target/debug/pblang test tests/semantics --filter websocket --allow-all --quiet
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. Focused CLI regressions passed, `--filter websocket` reports
+**5 passed / 181 filtered out**, and the full quiet-mode pblang semantics
+suite passed (**186 passed / 0 failed / 0 ignored**).
+
+## 127. Exact test-id selection (2026-06-14)
+
+Follow-up to the test-runner feedback loop: substring filters are useful for
+topic sweeps, but they are not precise enough when two tests share a prefix.
+For large suites and CI reruns, pblang now has an exact selector.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang test --exact <id>` | **ADDED** | The runner accepts both `--exact ID` and `--exact=ID`. It selects only tests whose discovered id equals the requested id. |
+| Combined selectors | **SUPPORTED** | `--filter` and `--exact` use one shared predicate; if both are provided, a test must satisfy both. Existing substring-only behavior is unchanged. |
+| List/run accounting | **SYNCED** | `--exact ... --list` and `--exact ... --quiet` both report the real filtered-out count, matching the §126 accounting fix. |
+| Regression coverage | **ADDED** | `tests/new_cmd.rs::test_exact_selects_only_one_test_id` verifies that `sample::test_alpha` does not accidentally select `sample::test_alpha_extra`. |
+| Docs/help | **SYNCED** | `pblang --help` and `docs/Tooling.md` document `--exact` alongside `--filter`, `--quiet`, `--fail-fast`, and `--list`. |
+
+Verification:
+
+```sh
+cargo test --test new_cmd test_exact_selects_only_one_test_id
+cargo test --test new_cmd test_filter_reports_filtered_out_count
+./target/debug/pblang test tests/semantics --exact websocket_write_frame_test --allow-all --quiet
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. Focused CLI regressions passed, exact selection on the real
+semantic suite ran **1 passed / 185 filtered out**, and the full quiet-mode
+pblang semantics suite passed (**186 passed / 0 failed / 0 ignored**).
+
+## 128. Whole-file PrjAnalysis refresh + graphics example cleanup (2026-06-14)
+
+User request follow-up: read/update the whole analysis because some sections
+were outdated, and continue improving pblang rather than only editing docs.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Top metrics | **REFRESHED** | §1 now reports the measured current tree: **64,609** Rust LOC, **179** top-level stdlib modules / **203** total `.sapp` files, **46,962** stdlib pblang lines, **189** semantic fixtures, and **565** Rust `#[test]` functions. |
+| Stdlib partial/stub inventory | **REFRESHED** | §7 no longer says `networking_advanced.sapp` is a 29-line stub-shaped module. The current honest partials are `stdlib/jit.sapp` direct compile/cache helpers and `stdlib/systems.sapp` descriptors, with the real OS path documented through the freestanding backend. |
+| Crate table | **REFRESHED** | §7 crate LOC/status now reflects `vm.rs` at **2,952** lines, `polyglot.rs` at **2,577**, `pblang-pm` at **2,595**, `pblang-graphics` at **624** backend lines, and the current registry/client/graphics boundaries. |
+| Roadmap gaps | **REFRESHED** | §8 now distinguishes missing first-party hosted registry **server** work from implemented hosted registry client flows, marks `build --warm-polyglot` as done, replaces stale `vm.rs` extraction with `src/main.rs` CLI extraction, and updates OS-dev status to the QEMU-proven freestanding path. |
+| Later audit snapshot | **REFRESHED** | §112 notes now point readers to §§113-152 for current status and update test/size/scorecard references from stale 181-era numbers to the current 189/0/0 baseline plus focused safe-pointer, parallel-test, timing, LLM-Max diagnostic-speed, native LLM-core math, general math-stdlib, array/collection, map-helper, string-helper, CSV/data-format, dataframe/table, serialization, template, validation, and config coverage. |
+| Graphics example TODO | **FIXED** | `crates/pblang-graphics/examples/game.sapp` now uses `gfx.run(win, state, update, draw, 60)` with keyboard event handling, matching the already-documented `docs/Report.md` claim. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check crates/pblang-graphics/examples/game.sapp
+cargo test --test new_cmd test_exact_selects_only_one_test_id
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. The graphics example typechecks, the focused exact-selector
+CLI regression passed, and the full quiet-mode pblang semantics suite passed
+(**186 passed / 0 failed / 0 ignored**).
+
+## 129. Test-runner skip selector for faster feedback loops (2026-06-14)
+
+Continuing the tooling/performance ergonomics work: `--filter` and `--exact`
+select tests to include, but there was no inverse selector for "run everything
+except this slow/flaky/topic group." That matters for local iteration and CI
+sharding on the larger semantics corpus.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang test --skip <substr>` | **ADDED** | The runner accepts both `--skip X` and `--skip=X`. It excludes discovered test ids containing the substring. |
+| Repeatable skips | **ADDED** | Multiple `--skip` flags can be used in one run; a test is selected only if it satisfies `--filter`/`--exact` and none of the skip patterns. |
+| Accounting | **SYNCED** | Skipped tests contribute to the existing `filtered out` count in list and run modes, matching cargo-style output. |
+| Regression coverage | **ADDED** | `tests/new_cmd.rs::test_skip_excludes_matching_test_ids` verifies `--skip=...`, `--skip ...`, repeated skips, list mode, quiet mode, and non-execution of skipped tests. |
+| Docs/help | **SYNCED** | `pblang --help`, `docs/Tooling.md`, `docs/USAGE_GUIDE.md`, and `docs/CURRENT_STATUS.md` document `--skip`. |
+
+Verification:
+
+```sh
+cargo test --test new_cmd test_skip_excludes_matching_test_ids
+cargo test --test new_cmd test_exact_selects_only_one_test_id
+./target/debug/pblang test tests/semantics --skip websocket --allow-all --quiet
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. Focused CLI regressions passed, the real semantics-suite skip
+run reported **181 passed / 5 filtered out**, and the full quiet-mode pblang
+semantics suite passed (**186 passed / 0 failed / 0 ignored**).
+
+## 130. CLI maintainability: `pblang test` handler extracted (2026-06-14)
+
+Continuing the source-layout category from §8/§112: after the VM split, the
+largest production file was still `src/main.rs`. The next safe step was not a
+semantic rewrite, but a behavior-preserving command extraction with full
+regression coverage.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang test` command body | **EXTRACTED** | The full test planner/executor moved from `src/main.rs` into `src/cli/test.rs` (342 lines), matching the existing `src/cli/{fmt,diag,call_graph,dataflow}.rs` pattern. |
+| CLI entrypoint | **SIMPLIFIED** | `src/main.rs` now delegates the `test` branch through `cli::test::handle_test(args)` and keeps only routing logic in the dispatch chain. |
+| Capability flags | **SHARED** | `parse_capability_flags` is now `pub(crate)` so extracted command modules can keep using the exact same `--allow-*` / `--deny-*` parsing behavior as `run` and `repl`. |
+| Largest-file pressure | **REDUCED** | `src/main.rs` is down to **5,996** lines. It remains the largest production file, but the first full command-handler extraction is complete and verified. |
+| Behavior | **UNCHANGED** | `--filter`, `--exact`, repeatable `--skip`, `--quiet`, `--fail-fast`, `--list`, planning failures, cargo-style summaries, and capability flags all continue through the extracted handler. |
+
+Verification:
+
+```sh
+cargo test --test new_cmd test_skip_excludes_matching_test_ids
+cargo test --test new_cmd test_exact_selects_only_one_test_id
+./target/debug/pblang test tests/semantics --skip websocket --allow-all --quiet
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. Focused Rust CLI regressions passed. The real semantics-suite
+skip run reported **181 passed / 5 filtered out**, and the full quiet-mode
+pblang semantics suite passed **186 passed / 0 failed / 0 ignored** through the
+extracted handler. Cargo emitted only the known ExtHD incremental-cache
+hard-link warning, not a code warning.
+
+## 131. CLI maintainability: `pblang lint` handler extracted (2026-06-14)
+
+Continuing the same source-layout category before moving on: `pblang lint` was
+the next self-contained command body in `src/main.rs`. It combined a local
+unused-binding AST walker, typecheck diagnostics, parse diagnostics, and
+clippy-style `pblang-lint` diagnostics.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang lint` command body | **EXTRACTED** | The full file loop moved into `src/cli/lint.rs`, including parse/typecheck diagnostics, unused variable/import warnings, shadowing warnings, and `pblang_lint::lint` output. |
+| Unused-binding walker | **EXTRACTED** | The nested `lint_unused_warnings` AST walk is no longer embedded inside `legacy_dispatch`; it lives beside the lint command handler. |
+| `clippy` alias | **PRESERVED** | The clap-level `pblang clippy` alias still routes to the same lint handler and continues to emit clippy-style idiom/style/correctness diagnostics. |
+| Largest-file pressure | **REDUCED** | `src/main.rs` is down to **5,673** lines. Extracted CLI modules now include `fmt`, `diag`, `call_graph`, `dataflow`, `test`, and `lint`. |
+| Behavior | **UNCHANGED** | Existing lint regression tests pass, including unused variable/import warnings, shadowing, parse error location output, clippy-style lints, and the `clippy` alias. |
+
+Verification:
+
+```sh
+cargo test --test lint
+rustfmt --check src/cli/lint.rs src/cli/test.rs
+git diff --check
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. The Rust lint integration suite passed **5/0**, formatting and
+diff whitespace checks are clean for the touched modules, and the full
+quiet-mode pblang semantics suite passed **186 passed / 0 failed / 0 ignored**.
+Cargo emitted only the known ExtHD incremental-cache hard-link warning.
+
+## 132. CLI maintainability: `pblang --doc` handler extracted (2026-06-14)
+
+Continuing the CLI source-layout category: `pblang --doc` was another
+self-contained command body in `src/main.rs`. It handled source loading,
+polyglot-aware parsing, type rendering, export/function collection, text docs,
+and HTML docs in one inline block.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang --doc` command body | **EXTRACTED** | The full documentation renderer moved into `src/cli/doc.rs` (247 lines). |
+| Type rendering | **EXTRACTED** | `TypeExpr`/`TypeKind` signature rendering now lives beside the doc command instead of inside `legacy_dispatch`. |
+| Polyglot block reporting | **PRESERVED** | Text and HTML docs still include language, name, args, attrs, span, and code-line counts for polyglot blocks. |
+| Largest-file pressure | **REDUCED** | `src/main.rs` is down to **5,455** lines. Extracted CLI modules now include `fmt`, `diag`, `call_graph`, `dataflow`, `doc`, `test`, and `lint`. |
+| Behavior | **UNCHANGED** | The existing doc CLI regression passes for both text and HTML output. |
+
+Verification:
+
+```sh
+cargo test --test doc_cli
+rustfmt --check src/cli/doc.rs src/cli/lint.rs src/cli/test.rs
+git diff --check
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. The doc CLI integration test passed **1/0**, formatting and
+diff whitespace checks are clean for the touched modules, and the full
+quiet-mode pblang semantics suite passed **186 passed / 0 failed / 0 ignored**.
+Cargo emitted only the known ExtHD incremental-cache hard-link warning.
+
+## 133. CLI maintainability: `pblang build-polyglot` handler extracted (2026-06-14)
+
+Continuing the CLI source-layout category: `pblang build-polyglot` was another
+self-contained command body. It resolves one source file, extracts `@lang`
+blocks, writes per-block source files, opportunistically compiles Python/Rust
+artifacts, and writes `polyglot.toml`.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang build-polyglot` command body | **EXTRACTED** | The full extraction/build flow moved into `src/cli/build_polyglot.rs` (136 lines). |
+| Polyglot extraction | **PRESERVED** | The command still uses `pblang_core::extract_polyglot_blocks`, keeps the same filename convention, and writes the same manifest shape. |
+| Opportunistic compile | **PRESERVED** | Rust blocks still try `rustc --crate-type cdylib`; Python blocks still try `python3 -m py_compile`; missing tools remain non-fatal. |
+| Largest-file pressure | **REDUCED** | `src/main.rs` is down to **5,326** lines. Extracted CLI modules now include `fmt`, `diag`, `call_graph`, `dataflow`, `doc`, `test`, `lint`, and `build_polyglot`. |
+| Behavior | **VERIFIED** | A real temporary `@python worker { ... }` fixture extracted `main_worker.py`, produced `.pyc`, and wrote `polyglot.toml`. |
+
+Verification:
+
+```sh
+cargo check --bin pblang
+./target/debug/pblang build-polyglot /tmp/pblang-build-polyglot-fixture/main.sapp --out-dir /tmp/pblang-build-polyglot-out
+rustfmt --check src/cli/build_polyglot.rs src/cli/doc.rs src/cli/lint.rs src/cli/test.rs
+git diff --check
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. The extracted command produced source, `.pyc`, and manifest
+files from a real polyglot block; formatting and diff whitespace checks are
+clean for the touched modules; and the full quiet-mode pblang semantics suite
+passed **186 passed / 0 failed / 0 ignored**. Cargo emitted only the known
+ExtHD incremental-cache hard-link warning.
+
+## 134. CLI maintainability: `pblang bundle` handler extracted (2026-06-14)
+
+Continuing the CLI source-layout category: `pblang bundle` was the next large
+package command still embedded inside `src/main.rs`. It handles lockfile
+generation, manifest validation, package entry copying, local path-dependency
+copying, metadata output, and the `--self-extract` binary path.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang bundle` command body | **EXTRACTED** | The full bundle/self-extract flow moved into `src/cli/bundle.rs` (366 lines). |
+| Package helper boundary | **SHARED** | Existing package helpers used by pack/build/install flows are now `pub(crate)` so extracted command modules can reuse the exact same manifest, registry, entry, lockfile, and directory-copy behavior. |
+| Self-extract behavior | **PRESERVED** | The extracted handler still strips `--self-extract`, honors `--output`, stages package files, embeds the runtime, appends the sentinel plus tarball, and sets executable permissions on Unix. |
+| Largest-file pressure | **REDUCED** | `src/main.rs` is now **5,019** lines after compile-cache wiring. Extracted CLI modules now include `fmt`, `diag`, `call_graph`, `dataflow`, `doc`, `test`, `lint`, `build_polyglot`, `bundle`, and the `compile_cache` helper. |
+| Behavior | **VERIFIED** | The bundle regression filter passed all 9 matching tests, including metadata output, registry lockfile generation, local dependency rejection, bundle-run behavior, flag recognition, and self-extract sentinel generation. |
+
+Verification:
+
+```sh
+cargo check --bin pblang
+cargo test --test pack bundle
+cargo build --bin pblang
+rustfmt --check src/main.rs src/cli.rs src/cli/bundle.rs src/cli/build_polyglot.rs src/cli/doc.rs src/cli/lint.rs src/cli/test.rs
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed. `cargo check` and `cargo build` emitted only the known ExtHD
+incremental-cache hard-link warning. The filtered bundle integration run passed
+**9 passed / 0 failed / 17 filtered out**, and the fresh debug `pblang`
+semantic suite passed **186 passed / 0 failed / 0 ignored**.
+
+## 135. Build/test speed, pblang linker substrate, and AirLLM-style LLM offload (2026-06-14)
+
+Continuing the performance/tooling and pbAI foundation categories: the next
+useful improvements were not a VM rewrite. They were deterministic reuse for
+unchanged builds/tests, a pblang-owned linker substrate, and a low-memory LLM
+execution planner inspired by AirLLM's layer-by-layer inference idea.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang compile` executable cache | **ADDED** | `src/cli/compile_cache.rs` fingerprints the source, enclosing `pblang.toml` project inputs, compiler/backend flags, output path, and current `pblang` binary. If the output executable and sidecar match, compile returns immediately with a cache-hit message. `--keep-c` and `--wasm` intentionally bypass this cache because they have different side effects/output semantics. |
+| `pblang test --cache` | **ADDED** | The test runner can reuse previous passing tests when the test source, stdlib, and `pblang` binary are unchanged. The cache is opt-in, default behavior is unchanged, and invalidation is content-based. |
+| pblang linker substrate | **ADDED** | `stdlib/linker.sapp` defines object/section/symbol/relocation/link/manifest primitives, deterministic section layout, duplicate-symbol diagnostics, and undefined-symbol diagnostics. It is pblang code today; a VM/native linker primitive is only needed later for efficient raw ELF/PE/Mach-O emission. |
+| AirLLM-style LLM offload planning | **ADDED** | `stdlib/llm_offload.sapp` adds KV-cache byte estimation, memory-budget configs, resident-layer selection that leaves a streaming slot, load/compute/release schedules, prefetch hints, offload manifests, and microbatch capacity planning. This is honest planning for future shard/device execution, not a full GPU backend. |
+| pbAI-Max foundation coverage | **EXTENDED** | `tests/semantics/llm_max_foundation_test.sapp` now imports and verifies the low-memory offload planner alongside tokenizer/data/transformer/train/eval/weights/quant/binary modules. |
+| Metrics | **REFRESHED** | Current tree: **64,609** Rust LOC including extracted CLI modules, **179** top-level stdlib modules / **203** total `.sapp` files, **46,962** stdlib pblang lines, **189** semantic fixtures, and **565** Rust `#[test]` functions. |
+
+Verification:
+
+```sh
+cargo check --bin pblang
+cargo test --test new_cmd compile
+cargo test --test new_cmd test_cache_reuses_unchanged_passes_and_invalidates_on_edit
+./target/debug/pblang run tests/semantics/linker_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/llm_offload_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/llm_max_foundation_test.sapp --allow-all
+./target/debug/pblang test tests/semantics --filter linker --allow-all --cache
+./target/debug/pblang test tests/semantics --filter linker --allow-all --cache
+rustfmt --check src/main.rs src/cli.rs src/cli/compile_cache.rs src/cli/test.rs tests/new_cmd.rs
+git diff --check
+./target/debug/pblang test tests/semantics --allow-all --quiet
+```
+
+Result: passed for the focused runs completed in this section. `cargo check`
+emitted only the known ExtHD incremental-cache hard-link warning. Compile-cache
+regressions passed **2/0**, test-cache regression passed **1/0**, the linker
+fixture printed `linker_pass`, the AirLLM-style offload fixture printed
+`llm_offload_pass`, the Max foundation fixture printed
+`llm_max_foundation_pass`, and the full semantics baseline before the offload
+fixture landed passed **187 passed / 0 failed / 0 ignored**. After the offload
+fixture landed, the full semantics suite passed **188 passed / 0 failed /
+0 ignored**.
+
+## 136. Safe pointer and memory-safety stdlib layer (2026-06-14)
+
+User request follow-up: add safety pointers and memory items from other
+programming languages, but keep pblang's memory safety rules instead of adding
+raw unsafe pointer access.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Owned pointer | **ADDED** | `memory_safety.box_new/read/write/drop/into_inner` wraps VM memory handles with live/moved checks. |
+| Non-null pointer | **ADDED** | `non_null(owner)` rejects nil/dead owners before exposing a pointer-like handle. |
+| Borrow guards | **ADDED** | `borrow_guard`, `borrow_mut_guard`, `guard_read`, and idempotent `guard_release` expose Rust/C++-style guard objects over the VM borrow tracker. |
+| Pinning | **ADDED** | `pin(owner)` marks an owner non-movable; `box_into_inner` and `unique_move` reject pinned owners. |
+| Reference counting | **ADDED** | `rc_new`, `rc_clone`, `rc_release`, `rc_read`, `rc_write`, `weak_new`, `weak_upgrade`, and `weak_release` model Rust `Rc`/`Weak` and C++ `shared_ptr`/`weak_ptr` rules. Mutation requires unique strong ownership. |
+| Checked slices/spans | **ADDED** | `slice_ref`, `slice_len`, `slice_get`, and `slice_set` carry bounds with the view and reject out-of-range access. |
+| Arenas/regions | **ADDED** | `arena_new`, `arena_alloc`, and `arena_drop_all` provide parser/compiler-style region allocation; dropping the arena invalidates child owners. |
+| Docs | **SYNCED** | `docs/Language_Semantics.md` and `docs/CURRENT_STATUS.md` now describe the stdlib wrapper as real runtime-checked API, not a sketch. |
+
+Important boundary: these are runtime memory-safety rules over explicit handles.
+They do not yet make ordinary unannotated pblang variables statically
+borrow-checked like Rust. The next deeper compiler/type-system step is to lift
+these same ownership/borrow rules into `pblang-typeck` for annotated code.
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/memory_safety_stdlib_test.sapp --allow-all
+```
+
+Result: passed; the fixture printed `memory_safety_stdlib_pass`.
+
+## 137. Test-speed category: isolated parallel `pblang test --jobs` workers (2026-06-14)
+
+Continuing the speed/optimization category: after compile caching and test
+caching, the next useful step was to use host CPU cores safely. The runner now
+supports opt-in file-level parallelism while keeping each test file in its own
+VM instance.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang test --jobs N` | **ADDED** | Independent test files run in isolated worker threads. Each worker owns its parsed file, compiled chunk, VM, and stdlib capability config; no VM state is shared across threads. |
+| `--jobs auto` / `--jobs 0` | **ADDED** | Uses `std::thread::available_parallelism()` to size the worker pool to the local machine. |
+| Worker stack hardening | **ADDED** | Parallel test workers use a 16 MB stack. The first full-suite verification found that default worker stacks overflow on deep parser/compiler fixtures; the larger stack fixes that without weakening parser depth limits. |
+| Deterministic output | **PRESERVED** | Worker output is collected and printed in sorted file order, so cargo-style status remains stable even when execution is parallel. |
+| Existing semantics | **PRESERVED** | `--cache` and `--fail-fast` keep the serial path for now because their semantics depend on ordered mutation/early stopping. `--list` still performs discovery only. |
+| Regression coverage | **ADDED** | `tests/new_cmd.rs::test_jobs_runs_independent_files_in_parallel_mode` verifies two independent files execute through `--jobs=2`, preserve print output, and report the correct cargo-style summary. |
+| Docs/help | **SYNCED** | `pblang --help`, `docs/Tooling.md`, `docs/USAGE_GUIDE.md`, and `docs/CURRENT_STATUS.md` document `--jobs`. |
+
+Verification:
+
+```sh
+cargo check --bin pblang
+cargo test --test new_cmd test_jobs_runs_independent_files_in_parallel_mode
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --jobs=2
+cargo build --bin pblang
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: passed. `cargo check` emitted only the known ExtHD incremental-cache
+hard-link warning. The Rust regression passed **1/0**, and the real LLM subset
+through the pblang runner passed **3 passed / 0 failed / 186 filtered out**.
+The full rebuilt parallel semantics suite passed **189 passed / 0 failed /
+0 ignored**.
+
+## 138. Test-speed category: timing and slow-test reporting (2026-06-14)
+
+Continuing the same test-speed category: after cache and parallel jobs, the
+next useful step was measurement. The test runner can now show per-test timing
+and the slowest tests so future optimization work is driven by actual runtime
+evidence instead of guessing.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `pblang test --timings` | **ADDED** | Status lines include each test duration in milliseconds. |
+| `pblang test --slow N` | **ADDED** | Enables timings and prints the N slowest tests sorted by duration. |
+| Serial support | **ADDED** | Whole-file and function-style tests are measured in the normal ordered path. |
+| Parallel support | **ADDED** | `--jobs` workers report durations from isolated worker VMs without changing deterministic output ordering. |
+| Cache semantics | **PRESERVED** | Cached passes report zero milliseconds so cache hits remain visible without pretending work was rerun. |
+| Regression coverage | **ADDED** | `tests/new_cmd.rs::test_timings_and_slow_report_are_opt_in` checks opt-in timing output and the slow-test table. |
+| Docs/help | **SYNCED** | `pblang --help`, `docs/Tooling.md`, `docs/USAGE_GUIDE.md`, and `docs/CURRENT_STATUS.md` document `--timings` and `--slow`. |
+
+Optimization target found:
+
+```text
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=2
+
+slow tests:
+    23676.871 ms  llm_max_foundation_test
+      249.363 ms  llm_foundation_test
+```
+
+That makes `llm_max_foundation_test` the next clear target inside the
+LLM/pbAI-Max category. The runner itself now has enough visibility to avoid
+optimizing blind.
+
+Verification:
+
+```sh
+cargo check --bin pblang
+cargo test --test new_cmd test_timings_and_slow_report_are_opt_in
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=2
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+rustfmt --check src/main.rs src/cli.rs src/cli/compile_cache.rs src/cli/test.rs tests/new_cmd.rs
+git diff --check
+```
+
+Result: code checks passed before this docs-only section was added. The focused
+timing regression passed **1/0**, the LLM subset passed **3 passed / 0 failed /
+186 filtered out**, and the full parallel semantics suite passed **189 passed /
+0 failed / 0 ignored**. `cargo check` emitted only the known external-drive
+incremental-cache hard-link warning.
+
+## 139. pbAI-Max / LLM category: bounded diagnostics and reused error reports (2026-06-14)
+
+The timing work in §138 showed that `llm_max_foundation_test` was the clear
+slow path: about **23.7 seconds** for one fixture. This section keeps the same
+feature coverage but makes the expensive train/evaluate/grow loops use bounded,
+representative diagnostic data and removes repeated loss evaluations that were
+already computed inside the feedback and guessing loops.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `llm_data.take(data, n)` | **ADDED** | Deterministic bounded copy helper for small diagnostic/eval subsets. |
+| `llm_data.sample_stride(data, n)` | **ADDED** | Picks a spread-out subset across the source data instead of always taking only the prefix. |
+| `llm_data.split_bounded(data, ratio, max_train, max_valid)` | **ADDED** | Produces train/validation samples and reports original vs sampled sizes for honest diagnostics. |
+| Max fixture sampling | **UPDATED** | `llm_max_foundation_test.sapp` still builds the full LM example stream, then uses a bounded representative subset for the expensive train/feedback/guess path. |
+| Eval boundary | **UPDATED IN §140** | The fixture originally kept one full generated-example eval; §140 changes that to bounded diagnostic eval because semantics coverage does not require benchmark-scale eval work. |
+| Feedback loop reuse | **OPTIMIZED** | `feedback_loop` reuses the first and last `error_report` results instead of recomputing the same state. |
+| Guessing loop reuse | **OPTIMIZED** | `guessing_loop` returns the already-computed final report instead of running one extra full evaluation. |
+
+Measured result:
+
+```text
+before (§138):
+  llm_max_foundation_test ... ok (23676.871 ms)
+
+after:
+  llm_max_foundation_test ... ok (7135.990 ms)
+```
+
+That is roughly a **3.3x** improvement for the slowest LLM semantics fixture,
+while preserving the same public APIs: tokenizer/data/binary substrate,
+attention, live architecture growth, analytic input/binary training, feedback,
+guessing, elite selection, eval, weights, offload, and quantization.
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact llm_max_foundation_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+```
+
+Result: passed. The exact Max fixture passed in about **7.3s**, and the full LLM
+subset passed **3 passed / 0 failed / 186 filtered out** with
+`llm_max_foundation_test` still the slowest at about **7.1s**. §140 continues
+from this measurement and tightens the diagnostic eval set further.
+
+## 140. pbAI-Max / LLM category: smaller diagnostic eval set (2026-06-14)
+
+The next optimization pass checked the attention hot loop directly. A direct
+indexed pblang rewrite avoided temporary slices, but it was slower in the current
+interpreter than the helper-based path that uses `core.dot`, `core.add_vec`, and
+`core.scale_vec`. That change was not kept. The useful improvement was to reduce
+the Max semantics fixture to the smallest representative diagnostic set that
+still exercises every subsystem.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Attention micro-optimization | **REJECTED** | Direct interpreted inner loops were slower than the existing helper-based attention path, so the faster helper path stayed in place. |
+| Diagnostic examples | **TIGHTENED** | `llm_max_foundation_test.sapp` now samples **4** spread-out examples for train/eval/benchmark diagnostics instead of a larger subset. |
+| Bounded split | **TIGHTENED** | The Max fixture now uses a **3 train / 1 validation** diagnostic split while still reporting original train/validation sizes. |
+| Eval boundary | **UPDATED** | `eval.evaluate(...)` now runs on the bounded diagnostic examples. The fixture still verifies full example construction, tokenizer/data flow, and every Max subsystem; it no longer treats semantics as a full eval benchmark. |
+
+Measured result:
+
+```text
+before §140:
+  llm_max_foundation_test ... ok (7135.990 ms)
+
+after:
+  llm_max_foundation_test ... ok (6294.489 ms)
+```
+
+This is a smaller but real improvement on top of §139. Combined with §139, the
+slowest LLM fixture moved from about **23.7s** to about **6.3s** while keeping
+coverage of tokenizer/data/binary substrate, attention, live architecture
+growth, analytic input/binary training, feedback, guessing, elite selection,
+eval, weights, offload, and quantization.
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact llm_max_foundation_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+```
+
+Result: passed. The exact Max fixture passed in about **6.4s**, and the full LLM
+subset passed **3 passed / 0 failed / 186 filtered out** with
+`llm_max_foundation_test` at about **6.3s**.
+
+## 141. LLM-core category: native tensor-kernel bridge for vector/matrix math (2026-06-14)
+
+The next speed/readability pass moved LLM core math toward the existing native
+`tensor_*` kernels instead of rewriting hot loops in interpreted pblang. The
+public `llm_core` API still works on normal arrays, but larger dot/vector/matrix
+operations can now route through VM-backed tensor kernels.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Tensor conversion helpers | **ADDED** | `tensor1`, `tensor1_row`, `flatten2`, `tensor2`, and `unflatten2` bridge normal pblang arrays to tensor maps. |
+| Explicit native helpers | **ADDED** | `native_dot`, `native_add_vec`, `native_sub_vec`, `native_scale_vec`, `native_matmul`, and `native_vecmat` expose direct VM-backed math for LLM code. |
+| Automatic routing | **ADDED** | `dot`, `add_vec`, `sub_vec`, `scale_vec`, `matmul`, and `vecmat` use native tensor kernels only above conservative thresholds, keeping tiny vectors on the simpler interpreted path. |
+| Regression coverage | **ADDED** | `llm_foundation_test.sapp` now verifies native dot/add/scale/vecmat/matmul bridge behavior. |
+| Honest boundary | **PRESERVED** | The model stays pblang-native at the architecture/training level; heavy numeric kernels can run in Rust VM builtins, like NumPy-backed Python. |
+
+Measured result:
+
+```text
+before §141:
+  llm_max_foundation_test ... ok (6294.489 ms)
+
+after:
+  llm_max_foundation_test ... ok (3880.417 ms)
+  LLM subset: 3 passed / 0 failed / 186 filtered out
+```
+
+This gives another large speedup on top of §§139-140. The slowest LLM fixture
+has moved from about **23.7s** at the first timing pass to about **3.9s** while
+keeping the pblang model code readable and preserving normal array APIs.
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+./target/debug/pblang test tests/semantics --exact llm_max_foundation_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: passed. The full canonical `.sapp` suite passed **189 passed / 0 failed
+/ 0 ignored**.
+
+## 142. LLM-core category: native activation and reduction bridges (2026-06-14)
+
+Continuing the native LLM-core acceleration category from §141: vector/matrix
+ops were already routed through VM tensor kernels, but reductions and common
+activation-style helpers still only had interpreted implementations. This pass
+adds explicit native bridge helpers and uses conservative automatic routing where
+the native path is likely to pay for its tensor-map conversion cost.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `native_softmax(v)` | **ADDED** | Routes 1D softmax through `tensor_softmax`. |
+| `native_argmax(v)` | **ADDED** | Routes max-index selection through `tensor_argmax`. |
+| `native_relu_vec(v)` | **ADDED** | Routes ReLU through `tensor_relu`. |
+| `native_layer_norm_vec(v, eps)` | **ADDED** | Routes layer norm through `tensor_layer_norm`. |
+| Automatic routing | **ADDED** | `softmax(..., 1.0)` and `argmax` use native kernels above small thresholds; ReLU/layernorm stay conservative for larger vectors. |
+| Regression coverage | **ADDED** | `llm_foundation_test.sapp` now checks native softmax/argmax/ReLU/layernorm bridges directly. |
+
+Measured result:
+
+```text
+LLM subset:
+  llm_foundation_test ... ok (150.418 ms)
+  llm_max_foundation_test ... ok (3827.068 ms)
+  llm_offload_test ... ok (16.284 ms)
+```
+
+The exact Max fixture remains about **4.0s**, so this pass is a breadth and
+readability improvement more than a new large speedup. It makes the LLM core's
+native-kernel route more complete while keeping normal pblang array APIs.
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+./target/debug/pblang test tests/semantics --exact llm_max_foundation_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: passed. The full canonical `.sapp` suite passed **189 passed / 0 failed
+/ 0 ignored**.
+
+## 143. Math category: stats API and tensor-backed linear algebra cleanup (2026-06-14)
+
+This pass moved from LLM-specific math helpers back to the general-purpose
+`stdlib:math.sapp` module. The goal was to simplify math operations, fix API
+drift, and make larger numeric calculations use existing VM tensor kernels
+without changing the friendly array-based stdlib API.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Documented `math.stats.*` API | **FIXED** | `math.stats.sum/mean/median/variance/stddev/min/max/range` is now exported; the file header and status docs no longer point at a missing namespace. |
+| Duplicate `gcd` | **FIXED** | Removed the later duplicate `gcd` implementation that could shadow the safer non-negative number-theory version; `math.algorithms.gcd(-48, 18)` now returns `6`. |
+| Median implementation | **SIMPLIFIED** | Replaced local bubble sort with the VM `array_sort` builtin. |
+| Stats reductions | **OPTIMIZED** | Large `sum` calls route through `tensor_sum`; `min/max/range` use native reductions when available and keep interpreted fallbacks. |
+| Linear algebra fast paths | **ADDED** | `math.la.vec_add/sub/dot/scale`, `math.la.mat_mul`, and `math.la.mat_vec_mul` use native `tensor_*` kernels above conservative thresholds and fall back to pblang loops for small inputs. |
+| Redundant matrix code | **CLEANED** | Removed duplicate dimension setup and reused `dot`/scale helpers where appropriate. |
+| Regression coverage | **EXPANDED** | `math_ext_test.sapp` now covers scalar helpers, `math.stats`, negative/positive `gcd`, matrix/vector operations, and large-vector native routes. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact math_ext_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: passed. The focused math fixture passed in about **59 ms** and exercises
+both fallback and native-threshold routes. The full canonical `.sapp` suite
+passed **189 passed / 0 failed / 0 ignored**.
+
+## 144. Collections category: richer `array.sapp` API over native transforms (2026-06-14)
+
+This pass moved from numeric math into the core collection/data category. The VM
+already had fast native array transforms, but `stdlib:array.sapp` exposed only a
+small older helper set. The stdlib now gives users the native transforms through
+the normal import path and adds common higher-order helpers for simpler code.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Native array transforms | **EXPOSED** | Added `array.flatten`, `array.unique`, `array.zip`, `array.chunk`, `array.take`, and `array.drop` wrappers over the VM builtins. |
+| Friendlier slicing | **HARDENED** | `array.slice(a, start, end)` now clamps negative and out-of-range bounds and returns `[]` for reversed ranges instead of risking an index error. |
+| Common helpers | **ADDED** | Added `min`, `max`, `none`, `find`, `find_index`, `count`, and `partition` to reduce repeated user loops. |
+| Existing API | **PRESERVED** | Existing `map/filter/reduce/contains/index_of/first/last/reverse/flat_map/sum/any/all/sort` behavior remains intact. |
+| Regression coverage | **EXPANDED** | `array_map_functional_test.sapp` now covers clamped slicing, native-backed transforms, numeric min/max, search/count helpers, and partitioning. |
+| Docs | **SYNCED** | `Tooling.md`, `CURRENT_STATUS.md`, `Help.md`, and this analysis file now describe the richer array/collection surface. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact array_map_functional_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: passed. The focused array fixture passed in about **33 ms**. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 145. Map category: richer dictionary helpers and linear-time omit (2026-06-14)
+
+Continuing the core data-structure category from §144, this pass expands
+`stdlib:map.sapp` so common dictionary workflows do not need repeated handwritten
+loops. The existing API remains intact, while new helpers make config/default
+merging, entry transforms, key checks, and deterministic sorted-key reads easier.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Shallow copy/defaults | **ADDED** | Added `copy(m)` and `defaults(m, default_map)` for safer config-style composition. |
+| Multi-map merge | **ADDED** | Added `merge_all([m1, m2, ...])`, preserving left-to-right overwrite semantics. |
+| `omit` complexity | **OPTIMIZED** | `omit(m, keys)` now builds a deny map first, reducing repeated key scans from O(n*m) to O(n+m). |
+| Entry flexibility | **IMPROVED** | `from_entries` now accepts both `{key,value}` maps and `[key,value]` pairs. |
+| Filtering/transforms | **ADDED** | Added `filter_values`, `map_entries`, `update`, and `rename_key`. |
+| Query helpers | **ADDED** | Added `has_all`, `has_any`, `contains_value`, `keys_sorted`, and `values_by_sorted_keys`. |
+| Regression coverage | **EXPANDED** | `map_extended_test.sapp` now covers the new helpers, optimized omit semantics, array-pair entries, and sorted-key reads. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact map_extended_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: passed. The focused map fixture passed in about **24 ms**. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 146. Strings category: native-backed padding/repeat and safer text cleanup (2026-06-14)
+
+Continuing through core data/text helpers, this pass tightens
+`stdlib:strings.sapp`. The module already had many useful functions, but a few
+paths still used interpreted loops despite native VM builtins, and empty
+substring handling could produce surprising split-based behavior.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Native repeat/pad | **OPTIMIZED** | `repeat`, `pad_left`, and `pad_right` now route through VM builtins with host-side allocation checks. |
+| Empty needle behavior | **HARDENED** | `replace_all`, `replace_first`, and `count` treat an empty needle as a no-op/zero-count case instead of relying on `str_split(s, "")`. |
+| Truncation contract | **FIXED** | `truncate(s, max_len, suffix)` now treats `max_len` as final output length, including suffix. |
+| Predicate helpers | **ADDED** | Added `starts_with_any`, `ends_with_any`, `contains_any`, and `contains_all`. |
+| Text cleanup helpers | **ADDED** | Added `normalize_space`, `collapse_blank_lines`, `remove_empty_lines`, `indent`, `quote`, and `unquote`. |
+| Regression coverage | **EXPANDED** | `string_bytes_test.sapp` now covers the stdlib string helpers alongside byte/string conversion builtins. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact string_bytes_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --exact format_stdlib_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: passed. The focused string fixture passed in about **38 ms**, and the
+format fixture still passed after the truncate contract cleanup. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 147. CSV/data-format category: quote-aware records and richer table helpers (2026-06-14)
+
+Continuing through data interchange and corpus-ingestion foundations, this pass
+tightens `stdlib:csv.sapp`. The previous implementation parsed each newline
+split independently, which was simple but not enough for real CSV files from
+docs, spreadsheets, exports, or LLM corpora where CRLF and quoted embedded
+newlines are common.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Quote-aware record splitting | **FIXED** | Added `split_records(text)`, which tracks quoted regions so embedded newlines stay inside the field instead of becoming fake rows. |
+| CRLF handling | **HARDENED** | Records strip only the trailing carriage return from row endings, avoiding the old whole-row trim that hid CRLF while also deleting meaningful field spaces. |
+| Field spacing | **PRESERVED** | `parse(...)` no longer trims every row before `parse_line(...)`; unquoted leading/trailing spaces remain part of the field value. |
+| Header maps | **IMPROVED** | Header-based parsing now fills missing cells with `""`, giving maps a stable shape for downstream code. |
+| Data-pipeline helpers | **ADDED** | Added `parse_records`, `parse_maps`, `headers`, `to_maps`, `infer_headers`, `stringify_rows`, and `stringify_maps`. |
+| Stringify correctness | **HARDENED** | Fields containing CR now quote like fields containing LF, delimiter, or quotes; map stringification infers headers across all rows instead of only the first row. |
+| Regression coverage | **EXPANDED** | `csv_quoted_test.sapp` now covers CRLF, embedded quoted newlines, preserved spacing, missing header cells, helper APIs, inferred map headers, and CR round-trips. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact csv_quoted_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused CSV verification passed in about **26 ms**. The full canonical
+`.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 148. Dataframe/table category: normalized rows, safe CSV I/O, and schema helpers (2026-06-14)
+
+Continuing the data category after CSV, this pass improves
+`stdlib:dataframe.sapp` as the higher-level table layer used by data tools,
+corpus inspection, benchmark summaries, and pbAI training diagnostics. The
+existing dataframe shape remains `{ columns, rows, _col_index }`, but construction
+and CSV paths are now less lossy.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Column inference | **FIXED** | `from_rows` now infers columns across all rows instead of only the first row, so later-row fields are not silently dropped. |
+| Row normalization | **ADDED** | Constructed dataframes fill missing inferred cells with `nil`, giving downstream helpers a stable table shape. |
+| CSV parser reuse | **IMPROVED** | `from_csv_string` now routes through `stdlib:csv.sapp`, gaining quoted embedded newline, quoted comma, CRLF, and missing-cell handling. |
+| CSV output | **HARDENED** | `to_csv` now uses `csv.stringify_maps(...)`, so delimiter, quote, LF, and CR values round-trip correctly. |
+| Row slicing | **ADDED** | Added clamped `slice(df, start, end)` and negative-safe `head`/`tail` behavior. |
+| Table transforms | **ADDED** | Added `drop_columns`, `rename_column`, and `fill_missing` for common cleanup workflows. |
+| Introspection | **ADDED** | Added `schema(df)` and `validate(df)` for type/missing summaries and structural checks. |
+| Regression coverage | **EXPANDED** | `dataframe_test.sapp` now covers uneven rows, quoted CSV newline/comma round trips, numeric coercion, slicing, renaming, dropping, filling, schema, and validation. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact dataframe_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused dataframe verification passed in about **61 ms**. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 149. Serialization category: safer validation and multi-format conversion helpers (2026-06-14)
+
+Continuing the data/formats category after CSV and dataframe, this pass improves
+`stdlib:serialization.sapp` as the general conversion layer for configs,
+checkpoints, package metadata, tool payloads, and pbAI records. The module
+already had native TOML/YAML parsers; this pass strengthens its output and
+dispatch helpers without adding external dependencies.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| JSON validation | **HARDENED** | `json_validate` now returns `false` for malformed JSON instead of letting parse errors escape; `json_validate_detail` returns `{ok, value}` or `{ok:false,error}`. |
+| Shared scalar output | **ADDED** | Added internal string escaping and scalar/array emitters used by TOML and YAML output. |
+| TOML stringify | **IMPROVED** | `toml_stringify` now handles nested map tables, arrays, booleans, nil/null, numbers, and escaped strings instead of only top-level strings/numbers. |
+| YAML stringify | **IMPROVED** | `yaml_stringify` now emits nested maps and arrays with indentation instead of only top-level scalar keys. |
+| CSV reuse | **HARDENED** | `csv_parse` and `csv_stringify` now route through `stdlib:csv.sapp`, inheriting quote-aware records, CRLF handling, and proper output quoting. |
+| Format routing | **ADDED** | Added `detect_format`, `parse_format`, `stringify_format`, and `convert(text, from, to)` for JSON/TOML/YAML/CSV/text workflows. |
+| Regression coverage | **EXPANDED** | `stdlib_smoke_test.sapp` now covers invalid JSON validation, nested TOML/YAML round trips, quoted CSV parsing/stringifying, format detection, and JSON-to-YAML conversion. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact stdlib_smoke_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused stdlib smoke verification passed in about **162 ms**. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 150. Template category: safer loop rendering, richer filters, and strict checks (2026-06-14)
+
+Closing the current data/formats cluster, this pass improves
+`stdlib:template.sapp` for generated docs, reports, prompts, pbAI/tool output,
+and web views. The original module already supported variables, comments,
+single-level if/for blocks, and a few filters. This pass keeps that small API
+but makes rendering less leaky and more useful for real templates.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Loop context isolation | **FIXED** | `{% for ... %}` now renders with a copied context, so item variables and loop metadata do not leak into the caller's original context map. |
+| Recursive loop bodies | **IMPROVED** | Loop bodies now call `render(...)`, so variables, filters, nested conditionals, and nested loops inside the body are processed consistently. |
+| Loop metadata | **EXPANDED** | Loops now expose `loop_index`, `loop_number`, `loop_first`, and `loop_last`. |
+| Map iteration | **ADDED** | `{% for key in attrs %}` over maps is supported, with `key` and `key_value` available in the loop body. |
+| Filters | **EXPANDED** | Filters now chain left-to-right and include `default:"..."`, `join:"..."`, `escape`/`html_escape`, plus existing trim/case/len/json helpers. |
+| Conditions | **IMPROVED** | `{% if %}` now supports truthy checks, `not name`, `left == right`, and `left != right`, including dotted variables and quoted literals. |
+| Strict checks | **ADDED** | Added `missing_vars(template, ctx)` and `render_strict(template, ctx)` for preflight validation. |
+| Regression coverage | **EXPANDED** | `template_stdlib_test.sapp` now covers chained/default/join filters, equality and `not` conditions, recursive loop rendering, context isolation, map iteration, missing-variable inspection, and strict rendering errors. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact template_stdlib_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused template verification passed in about **37 ms**. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 151. Validation/contracts category: nested schemas, defaults, and batch checks (2026-06-14)
+
+Moving from data formatting to contracts, this pass improves
+`stdlib:validate.sapp` as the small schema-validation layer for configs,
+manifests, pbAI records, tool payloads, and generated structured data. The
+existing `schema(...)`, `check(...)`, and helper predicates remain compatible,
+but schemas can now express deeper shapes without repeated handwritten checks.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Schema options | **ADDED** | `schema(fields, options)` now accepts options such as `strict: true` while keeping the original one-argument API. |
+| Strict maps | **ADDED** | `check(...)` can reject unknown fields at the root or nested map level. |
+| Nested maps | **ADDED** | Map field definitions can contain nested `fields`, with dotted error paths such as `profile.email`. |
+| Array item schemas | **ADDED** | Array fields can validate each element with `items`, producing indexed paths such as `tags[0]`. |
+| Defaults | **ADDED** | Added `apply_defaults(...)` and `check_with_defaults(...)` for config-style values. |
+| Richer constraints | **EXPANDED** | Added generic enum checks, string `format` checks for `email`/`url`, and numeric `multiple_of`. |
+| Batch/assert helpers | **ADDED** | Added `validate_all(...)`, `assert_valid(...)`, and `explain(...)` for bulk validation and readable error output. |
+| Defensive checking | **HARDENED** | Invalid schema/value shapes now return structured validation errors instead of assuming map input. |
+| Regression coverage | **EXPANDED** | `validate_stdlib_test.sapp` now covers strict root/nested errors, defaults, nested maps, array item checks, enum/format/multiple constraints, batch validation, and assert-style failures. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact validate_stdlib_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused validation verification passed in about **25 ms**. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 152. Configuration category: typed layered config with validation bridge (2026-06-14)
+
+Continuing from validation/contracts, this pass improves `stdlib:config.sapp`.
+Config is the practical place where defaults, environment overrides, explicit
+settings, and schema validation meet, so the module now exposes a more complete
+configuration workflow while keeping the original `new/set/get/get_int/get_bool`
+surface intact.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Bulk construction | **ADDED** | Added `from_map(values, defaults)`, `set_many`, and `set_defaults` for simpler setup. |
+| Key management | **ADDED** | Added `unset`, `has`, and `keys` helpers. |
+| Env lookup | **IMPROVED** | `get(...)` now also checks normalized env names such as `database.url` → `DATABASE_URL` under the configured prefix. |
+| Typed accessors | **TIGHTENED** | `get_int` now rejects fractional numbers; `get_number`, `require_int`, and `require_bool` were added. |
+| List parsing | **IMPROVED** | `get_list` trims items after splitting, making comma-list configs easier to use. |
+| Typed maps | **ADDED** | `typed_map(cfg, schema)` converts string-backed config values to schema-guided number/bool/array values. |
+| Validation bridge | **ADDED** | Added `validate(cfg, schema)` and `validate_with_defaults(cfg, schema)` through `stdlib:validate.sapp`. |
+| Regression coverage | **EXPANDED** | `config_stdlib_test.sapp` now covers bulk defaults, key helpers, list trimming, strict integer reads, required typed reads, typed maps, schema validation, invalid config errors, and default application. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact config_stdlib_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused config verification passed in about **49 ms**. The full
+canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.

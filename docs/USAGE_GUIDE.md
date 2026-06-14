@@ -154,7 +154,7 @@ pblang run .
 ## 6) Useful CLI commands
 
 - `pblang run <file|dir>`: execute script/project
-- `pblang test [dir]`: run tests
+- `pblang test [dir] [--filter text] [--exact id] [--skip text] [--quiet] [--jobs N|auto] [--cache] [--timings] [--slow N] [--list] [--fail-fast]`: discover and run tests
 - `pblang fmt [files...]`: format files
 - `pblang lint [files...]`: parse/typecheck diagnostics
 - `pblang --check <file>`: check single file without running
@@ -168,6 +168,11 @@ Put test scripts in `tests/` and run:
 
 ```bash
 pblang test tests
+pblang test tests --list
+pblang test tests --exact sample::test_name --quiet
+pblang test tests --skip slow --quiet
+pblang test tests --jobs auto --quiet
+pblang test tests --timings --slow 10 --quiet
 ```
 
 For Rust integration tests in this repo:

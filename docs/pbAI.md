@@ -111,11 +111,17 @@ program orchestrating these kernels.
 - `stdlib/nn.sapp` — a trainable MLP (learns XOR).
 - **`stdlib/llm_core.sapp`** — reusable LLM math/training substrate: deterministic
   initialization, vector/matrix kernels, softmax, cross-entropy/perplexity, SGD, Adam,
-  checkpoint save/load, and benchmark wrappers.
+  checkpoint save/load, and benchmark wrappers. Larger dot/vector/matrix operations
+  plus selected softmax/argmax/ReLU/layernorm helpers can route through native VM
+  `tensor_*` kernels while the public API stays normal pblang arrays.
 - **`stdlib/llm_tokenizer.sapp`** — pblang-native tokenizer contracts: char tokenizer,
   small trainable BPE tokenizer, encode/decode, metadata, and JSON save/load.
 - **`stdlib/llm_data.sapp`** — corpus helpers: text detection, secret/noise exclusion,
-  chunking, next-token example packing, train/validation split, and corpus records.
+  chunking, next-token example packing, train/validation split, corpus records, and
+  bounded representative sampling for faster pbAI-Max diagnostics without hiding
+  original corpus sizes. Semantics tests use these bounded samples for fast subsystem
+  diagnostics; real training/evaluation should still use larger curated train/valid
+  sets.
 - **`stdlib/llm_transformer.sapp`** — the first reusable decoder-transformer substrate:
   token/position embeddings, causal self-attention, feed-forward block, layer norm,
   vocab logits, sampling hooks, generation, quantization helpers, and summary metadata.
@@ -140,7 +146,11 @@ program orchestrating these kernels.
   generation benchmarks; `stdlib/llm_quant.sapp` adds row-wise quantized inference
   helpers; `stdlib/llm_binary.sapp` adds the bit-level token substrate: token-id bit
   width, ID<->bits round-trips, token bitstreams, binary LM example views, byte-bit
-  conversion, and hamming/transition features. Locked by
+  conversion, and hamming/transition features; `stdlib/llm_offload.sapp` adds an
+  AirLLM-style low-memory inference planner: KV-cache reservation, resident-layer
+  selection, layer streaming, prefetch hints, offload manifests, and bounded
+  microbatch sizing. This is the planning layer for future shard/device execution,
+  not a claim that full GPU kernels are implemented in pblang today. Locked by
   `tests/semantics/llm_max_foundation_test.sapp`. These are generic pblang libraries;
   the pbAI-Max product lives outside pblang in `AAP/ai/pbai`.
 - **Resource use note (today)** — pbAI-Max continuation now uses pblang `spawn`/`join`
@@ -328,8 +338,9 @@ The boundary is strict:
 format, weight format, decoder block interface, sampling API, model metadata, benchmark
 suite, and golden tests. This has started in pblang with `llm_core.sapp`,
 `llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, and the scale-up modules
-listed above, including the new `llm_binary.sapp` bit-level token substrate and
-live-mutable architecture hooks. pblang keeps the reusable foundation and Nano path; the
+listed above, including the new `llm_binary.sapp` bit-level token substrate,
+`llm_offload.sapp` low-memory inference planning, and live-mutable architecture hooks.
+pblang keeps the reusable foundation and Nano path; the
 pbAI-Max product module, training policy, corpora, and tier metadata live in
 `AAP/ai/pbai`. Existing checkpoints are used only to compare quality and speed.
 
@@ -337,7 +348,7 @@ pbAI-Max product module, training policy, corpora, and tier metadata live in
 
 | Phase | Goal |
 |-------|------|
-| **P0 — Fresh inference contract** | Started: `llm_core.sapp`, `llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, `llm_attention.sapp`, `llm_train.sapp`, `llm_stream.sapp`, `llm_weights.sapp`, `llm_tokenizer_train.sapp`, `llm_eval.sapp`, `llm_quant.sapp`, `llm_binary.sapp`, and semantic tests define tokenizer/data/decoder/sampling/checkpoint/training/eval/binary-token/live-architecture/feedback/guessing-loop primitives. No old checkpoint defines this contract. |
+| **P0 — Fresh inference contract** | Started: `llm_core.sapp`, `llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, `llm_attention.sapp`, `llm_train.sapp`, `llm_stream.sapp`, `llm_weights.sapp`, `llm_tokenizer_train.sapp`, `llm_eval.sapp`, `llm_quant.sapp`, `llm_binary.sapp`, `llm_offload.sapp`, and semantic tests define tokenizer/data/decoder/sampling/checkpoint/training/eval/binary-token/live-architecture/feedback/guessing-loop/low-memory-offload primitives. No old checkpoint defines this contract. |
 | **P1 — pbAI-Nano/-Mini** | Train the first fresh tiny + small models for pblang completion/debugging on pblang/code data plus selected external corpora; benchmark accuracy, latency, memory, and tokens/sec; lock with drift tests. |
 | **P2 — Agent loop + tools** | Wire the plan→act→verify loop to `frontend_run`, the lint/typeck oracles, and the pb-mcp-server tool catalog. |
 | **P3 — pbAI-Max + distillation** | Train/assemble the new flagship on the full curated corpus; stand up the distillation pipeline that produces consistent Pro/Mini/Nano sub-models from pbAI-Max. |

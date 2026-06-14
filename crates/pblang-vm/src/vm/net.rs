@@ -447,10 +447,9 @@ pub(super) fn tcp_connect_tls(
     // that accepted ANY certificate (v0.5.1 security audit).
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Ok(native_certs) = rustls_native_certs::load_native_certs() {
-        for cert in native_certs {
-            let _ = root_store.add(cert);
-        }
+    let native_certs = rustls_native_certs::load_native_certs();
+    for cert in native_certs.certs {
+        let _ = root_store.add(cert);
     }
     let client_config = ClientConfig::builder()
         .with_root_certificates(root_store)

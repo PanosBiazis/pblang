@@ -1,9 +1,6 @@
 use pblang_compiler::{compile, disasm};
 
-use pblang_core::{
-    parse, parse_strict, parse_with_polyglot, strip_comments_mask, Expr, ExprKind, Span, Stmt,
-    StmtKind, TypeExpr, TypeKind,
-};
+use pblang_core::{parse, parse_strict, parse_with_polyglot, strip_comments_mask};
 use pblang_ir::Chunk;
 use pblang_typeck::check as type_check;
 use pblang_vm::{StdlibConfig, VmLimits, VM};
@@ -18,6 +15,9 @@ use std::path::{Component, Path, PathBuf};
 
 mod cli;
 use cli::call_graph::{build_call_graph, print_call_graph};
+use cli::compile_cache::{
+    fingerprint_for_compile, is_compile_cache_hit, write_compile_cache, CompileFingerprint,
+};
 use cli::dataflow::print_dataflow_report;
 use cli::diag::{format_parse_error, get_line, line_col, print_parse_errors, underline_span};
 use cli::fmt::{
@@ -144,7 +144,7 @@ enum Commands {
     /// Discover and run `fn test_*` functions inside .sap/.sapp/.bpx
     /// files (cargo-test style); falls back to whole-file execution
     /// for files that declare no `test_*` functions. Supports
-    /// `--filter <substr>` to run a subset.
+    /// `--filter <substr>`, `--exact <id>`, or `--skip <substr>` to run a subset.
     Test {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -203,7 +203,7 @@ fn validate_package_relative_path<'a>(path: &'a str, label: &str) -> Result<&'a 
     Ok(rel_path)
 }
 
-fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
+pub(crate) fn resolve_package_entry(man_dir: &Path) -> Result<PathBuf, String> {
     let package_root = man_dir
         .canonicalize()
         .unwrap_or_else(|_| man_dir.to_path_buf());
@@ -340,7 +340,9 @@ fn read_package_entry_source(man_dir: &Path) -> Result<(PathBuf, String), String
 }
 
 /// Loads [package] name, version, description from manifest for pack/bundle success output. Returns None if no manifest or parse error.
-fn load_package_display_metadata(man_dir: &Path) -> Option<(String, String, Option<String>)> {
+pub(crate) fn load_package_display_metadata(
+    man_dir: &Path,
+) -> Option<(String, String, Option<String>)> {
     let manifest_path = man_dir.join("pblang.toml");
     let man_bytes = std::fs::read(&manifest_path).ok()?;
     let man_str = std::str::from_utf8(&man_bytes).ok()?;
@@ -352,7 +354,7 @@ fn load_package_display_metadata(man_dir: &Path) -> Option<(String, String, Opti
     Some((name, version, description))
 }
 
-fn validate_packaged_local_dependencies(man_dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn validate_packaged_local_dependencies(man_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let manifest_path = man_dir.join("pblang.toml");
     if !manifest_path.is_file() {
         return Ok(vec![]);
@@ -409,7 +411,7 @@ fn require_registry_sha256(cli_flag: bool) -> bool {
             .unwrap_or(false)
 }
 
-fn generate_lockfile_for_cli(
+pub(crate) fn generate_lockfile_for_cli(
     man_dir: &Path,
     registry_index_url: Option<&str>,
     require_registry_sha256_cli: bool,
@@ -879,7 +881,10 @@ fn strict_manifest_validator_enabled(context: &str) -> bool {
         .any(|s| !s.is_empty() && s == ctx)
 }
 
-fn shadow_validate_manifest_with_pblang(man_dir: &Path, context: &str) -> Result<(), String> {
+pub(crate) fn shadow_validate_manifest_with_pblang(
+    man_dir: &Path,
+    context: &str,
+) -> Result<(), String> {
     let manifest_path = man_dir.join("pblang.toml");
     if !manifest_path.is_file() {
         return Ok(());
@@ -927,7 +932,7 @@ fn shadow_validate_manifest_with_pblang(man_dir: &Path, context: &str) -> Result
     Ok(())
 }
 
-fn parse_registry_options_and_positionals<'a>(
+pub(crate) fn parse_registry_options_and_positionals<'a>(
     command: &str,
     rest: &'a [String],
 ) -> Result<(Option<&'a str>, bool, Vec<PathBuf>), String> {
@@ -1047,6 +1052,27 @@ fn parse_build_args(args: &[&str]) -> (String, String, String) {
     (input, output, cc)
 }
 
+fn resolve_compile_cc(args: &[String]) -> String {
+    args.iter()
+        .position(|a| a == "--cc")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            for c in &["gcc", "clang", "cc"] {
+                if std::process::Command::new(c)
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok()
+                {
+                    return c.to_string();
+                }
+            }
+            "gcc".to_string()
+        })
+}
+
 fn show_help() {
     println!("pblang REPL commands:");
     println!("  help | h | ?             Show this help");
@@ -1069,7 +1095,7 @@ fn show_help() {
     println!("                            --allow-env / --deny-env  Allow/deny env_get reading process env vars (default allow; --sandbox denies)");
     println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx/env)");
     println!("                          Env-var equivalents: PBLANG_ALLOW_EXEC=1, PBLANG_ALLOW_FFI=1, PBLANG_ALLOW_ALL=1, PBLANG_SANDBOX=1, etc.");
-    println!("  pblang test [dir] [--filter <substr>] [--allow-*]  Discover and run `fn test_*` functions in dir (default: tests); cargo-test style output. Files with no test_* fns are run wholesale. Accepts the same capability flags as `run`.");
+    println!("  pblang test [dir] [--filter <substr>] [--exact <id>] [--skip <substr>] [--quiet] [--jobs N|auto] [--cache] [--timings] [--slow N] [--fail-fast] [--list] [--allow-*]  Discover and run `fn test_*` functions in dir (default: tests); cargo-test style output. Files with no test_* fns are run wholesale. Accepts the same capability flags as `run`. --quiet captures test print output instead of writing it to stdout; --jobs runs independent test files in isolated VM workers when cache/fail-fast are not active; --cache reuses unchanged passing tests; --timings prints per-test durations; --slow N prints the N slowest tests; --exact runs only the exact test id; --skip excludes matching test ids; --fail-fast stops after the first failure; --list prints discovered tests without executing them.");
     println!("  pblang fmt [--max-line-length=N] [--via-pblang] [file.sap|file.bpx …] Format .sap/.sapp/.bpx (trim, operator spacing, indent 4 spaces, optional line wrap, final newline). --via-pblang formats via the self-hosted stdlib/compiler/formatter.sapp instead of the Rust formatter.");
     println!(
     "  pblang lint [file.sap|file.bpx …] Parse + typecheck files, report diagnostics (exit 1 if any), plus clippy-style idiom/style/correctness lints"
@@ -1443,7 +1469,7 @@ version = "0.1.0"
 [dependencies]
 "#;
 
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     let src_root = src.canonicalize()?;
     std::fs::create_dir_all(dst)?;
     let dst_root = dst.to_path_buf();
@@ -1936,7 +1962,7 @@ fn prepend(name: &str, mut rest: Vec<String>) -> Vec<String> {
 ///   PBLANG_ALLOW_SPAWN, PBLANG_ALLOW_GFX, PBLANG_ALLOW_ALL, PBLANG_SANDBOX
 ///
 /// CLI flags take precedence over env vars; later flags override earlier ones.
-fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
+pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     let mut cfg = StdlibConfig::default();
 
     fn env_on(name: &str) -> bool {
@@ -3112,365 +3138,7 @@ fn legacy_dispatch(args: Vec<String>) {
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("bundle") {
-        // Experimental: support an optional --self-extract flag (E5-beta).
-        // We strip it from the arg list before feeding the rest into the
-        // registry option parser so it is never reported as an unknown flag.
-        let mut rest: Vec<String> = args.iter().skip(1).cloned().collect();
-        let mut self_extract = false;
-        if let Some(pos) = rest.iter().position(|a| a == "--self-extract") {
-            self_extract = true;
-            rest.remove(pos);
-        }
-
-        // Extract --output flag (only relevant for --self-extract)
-        let mut self_extract_output: Option<String> = None;
-        if let Some(pos) = rest.iter().position(|a| a == "--output") {
-            if pos + 1 < rest.len() {
-                self_extract_output = Some(rest[pos + 1].clone());
-                rest.remove(pos + 1);
-                rest.remove(pos);
-            }
-        }
-
-        let (registry_index_url, require_registry_sha256_cli, positionals) =
-            parse_registry_options_and_positionals("bundle", &rest).unwrap_or_else(|e| {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            });
-        if positionals.len() > 2 {
-            eprintln!("pblang bundle: expected [path] [out_dir]");
-            std::process::exit(1);
-        }
-        let start = positionals
-            .first()
-            .cloned()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-        let man_dir = pblang_pm::find_manifest_dir(&start).unwrap_or_else(|| {
-            eprintln!(
-                "pblang bundle: could not find pblang.toml from '{}'",
-                start.display()
-            );
-            std::process::exit(1);
-        });
-        shadow_validate_manifest_with_pblang(&man_dir, "bundle").unwrap_or_else(|e| {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        });
-        let lock =
-            generate_lockfile_for_cli(&man_dir, registry_index_url, require_registry_sha256_cli)
-                .unwrap_or_else(|e| {
-                    eprintln!("pblang bundle: failed to generate lockfile: {}", e);
-                    std::process::exit(1);
-                });
-        let lock_str = pblang_pm::write_lockfile(&lock).unwrap_or_else(|e| {
-            eprintln!("pblang bundle: failed to serialize lockfile: {}", e);
-            std::process::exit(1);
-        });
-        let lock_path = man_dir.join("pblang.lock");
-        std::fs::write(&lock_path, lock_str).unwrap_or_else(|e| {
-            eprintln!(
-                "pblang bundle: failed to write {}: {}",
-                lock_path.display(),
-                e
-            );
-            std::process::exit(1);
-        });
-
-        // Handle --self-extract mode: create self-extracting binary
-        if self_extract {
-            // Determine output path from --output flag or default
-            let output_path = if let Some(output) = self_extract_output {
-                std::path::PathBuf::from(output)
-            } else {
-                let pkg_name = load_package_display_metadata(&man_dir)
-                    .map(|(n, _, _)| n)
-                    .unwrap_or_else(|| "package".to_string());
-                let exe_name = if cfg!(target_os = "windows") {
-                    format!("{}.exe", pkg_name)
-                } else {
-                    pkg_name
-                };
-                man_dir.join(exe_name)
-            };
-
-            // Find current pblang executable (to embed as bin/pblang in the tarball)
-            let current_exe = std::env::current_exe().unwrap_or_else(|e| {
-                eprintln!(
-                    "pblang bundle --self-extract: cannot read current executable path: {}",
-                    e
-                );
-                std::process::exit(1);
-            });
-
-            // Create a temp staging directory that includes:
-            //   - all package files (source, manifest, lockfile)
-            //   - bin/pblang (or bin/pblang.exe) — the embedded runtime
-            let staging = std::env::temp_dir().join(format!(
-                "pblang-self-extract-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            std::fs::create_dir_all(&staging).unwrap_or_else(|e| {
-                eprintln!(
-                    "pblang bundle --self-extract: cannot create staging dir: {}",
-                    e
-                );
-                std::process::exit(1);
-            });
-
-            // Copy package files into staging
-            for entry in walkdir::WalkDir::new(&man_dir)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|e| {
-                    // Always allow the root entry through. Otherwise, when the
-                    // user passes a relative path like `.`, walkdir reports
-                    // the root's `file_name()` as `"."` which starts with `.`
-                    // and the dotfile filter below would skip the entire
-                    // tree, silently producing an empty staging dir.
-                    if e.depth() == 0 {
-                        return true;
-                    }
-                    let name = e.file_name().to_string_lossy();
-                    if e.file_type().is_dir() {
-                        name != "target" && name != ".git" && !name.starts_with('.')
-                    } else {
-                        true
-                    }
-                })
-            {
-                let entry = entry.unwrap_or_else(|e| {
-                    eprintln!("pblang bundle --self-extract: walk error: {}", e);
-                    std::process::exit(1);
-                });
-                let rel = entry.path().strip_prefix(&man_dir).unwrap_or_else(|_| {
-                    eprintln!(
-                        "pblang bundle --self-extract: invalid path outside package root: {}",
-                        entry.path().display()
-                    );
-                    std::process::exit(1);
-                });
-                let dest = staging.join(rel);
-                if entry.file_type().is_dir() {
-                    let _ = std::fs::create_dir_all(&dest);
-                } else if entry.file_type().is_file() {
-                    if let Some(parent) = dest.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Err(e) = std::fs::copy(entry.path(), &dest) {
-                        eprintln!(
-                            "pblang bundle --self-extract: failed to copy {} → {}: {}",
-                            entry.path().display(),
-                            dest.display(),
-                            e
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            // Embed pblang runtime at bin/pblang
-            let bin_dir = staging.join("bin");
-            std::fs::create_dir_all(&bin_dir).unwrap_or_else(|e| {
-                eprintln!("pblang bundle --self-extract: cannot create bin dir: {}", e);
-                std::process::exit(1);
-            });
-            let runtime_name = if cfg!(target_os = "windows") {
-                "pblang.exe"
-            } else {
-                "pblang"
-            };
-            let dest_runtime = bin_dir.join(runtime_name);
-            std::fs::copy(&current_exe, &dest_runtime).unwrap_or_else(|e| {
-                eprintln!(
-                    "pblang bundle --self-extract: failed to copy runtime to {}: {}",
-                    dest_runtime.display(),
-                    e
-                );
-                std::process::exit(1);
-            });
-
-            // Also copy pblang.toml if present
-            let man_toml = man_dir.join("pblang.toml");
-            if man_toml.is_file() {
-                let _ = std::fs::copy(&man_toml, staging.join("pblang.toml"));
-            }
-
-            // Create tarball of the staging directory (package + embedded runtime)
-            let tarball_bytes = pblang_pm::create_package_tarball(&staging).unwrap_or_else(|e| {
-                eprintln!(
-                    "pblang bundle --self-extract: failed to create tarball: {}",
-                    e
-                );
-                std::process::exit(1);
-            });
-
-            // Clean up staging
-            let _ = std::fs::remove_dir_all(&staging);
-
-            // Find pblang-stub binary (look next to current executable)
-            let Some(current_exe_parent) = current_exe.parent() else {
-                eprintln!(
-                    "pblang bundle --self-extract: cannot find parent directory of executable"
-                );
-                std::process::exit(1);
-            };
-            let stub_path = current_exe_parent.join(if cfg!(target_os = "windows") {
-                "pblang-stub.exe"
-            } else {
-                "pblang-stub"
-            });
-
-            let stub_bytes = std::fs::read(&stub_path).unwrap_or_else(|e| {
-                eprintln!(
-                    "pblang bundle --self-extract: failed to read stub binary at {}: {}",
-                    stub_path.display(),
-                    e
-                );
-                eprintln!(
-                    "Make sure pblang-stub is built and installed alongside the pblang executable."
-                );
-                std::process::exit(1);
-            });
-
-            // Concatenate: stub + SENTINEL + tarball
-            const SENTINEL: &[u8] = b"PBLANG_BUNDLE_START\x00";
-            let mut output_bytes =
-                Vec::with_capacity(stub_bytes.len() + SENTINEL.len() + tarball_bytes.len());
-            output_bytes.extend_from_slice(&stub_bytes);
-            output_bytes.extend_from_slice(SENTINEL);
-            output_bytes.extend_from_slice(&tarball_bytes);
-
-            // Write to output file
-            std::fs::write(&output_path, &output_bytes).unwrap_or_else(|e| {
-                eprintln!(
-                    "pblang bundle --self-extract: failed to write {}: {}",
-                    output_path.display(),
-                    e
-                );
-                std::process::exit(1);
-            });
-
-            // Set executable permissions on Unix
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o755))
-                    .unwrap_or_else(|e| {
-                        eprintln!(
-                            "pblang bundle --self-extract: failed to set permissions: {}",
-                            e
-                        );
-                        std::process::exit(1);
-                    });
-            }
-
-            println!("Created self-extracting binary: {}", output_path.display());
-            println!(
-                "To run: {} (includes embedded pblang runtime; no separate install required)",
-                output_path.display()
-            );
-            return;
-        }
-
-        let out_dir = positionals
-            .get(1)
-            .cloned()
-            .unwrap_or_else(|| man_dir.join("dist"));
-        if let Err(e) = std::fs::create_dir_all(&out_dir) {
-            eprintln!(
-                "pblang bundle: failed to create {}: {}",
-                out_dir.display(),
-                e
-            );
-            std::process::exit(1);
-        }
-        let exe_name = if cfg!(target_os = "windows") {
-            "pblang.exe"
-        } else {
-            "pblang"
-        };
-        let dest_exe = out_dir.join(exe_name);
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Err(e) = std::fs::copy(&current_exe, &dest_exe) {
-                eprintln!(
-                    "pblang bundle: failed to copy executable to {}: {}",
-                    dest_exe.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-        for f in &["pblang.toml", "pblang.lock"] {
-            let src = man_dir.join(f);
-            if src.is_file() {
-                let _ = std::fs::copy(&src, out_dir.join(f));
-            }
-        }
-        if let Err(e) = pblang_pm::validate_manifest_metadata(&man_dir) {
-            eprintln!("pblang bundle: {}", e);
-            std::process::exit(1);
-        }
-        let entry_path = resolve_package_entry(&man_dir).unwrap_or_else(|e| {
-            eprintln!("pblang bundle: {}", e);
-            std::process::exit(1);
-        });
-        let entry_rel = entry_path
-            .strip_prefix(&man_dir)
-            .unwrap_or(&entry_path)
-            .to_path_buf();
-        let bundled_entry = out_dir.join(&entry_rel);
-        if let Some(parent) = bundled_entry.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "pblang bundle: failed to create {}: {}",
-                    parent.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-        if let Err(e) = std::fs::copy(&entry_path, &bundled_entry) {
-            eprintln!(
-                "pblang bundle: failed to copy entry {}: {}",
-                entry_path.display(),
-                e
-            );
-            std::process::exit(1);
-        }
-        let local_dep_paths = validate_packaged_local_dependencies(&man_dir).unwrap_or_else(|e| {
-            eprintln!("pblang bundle: {}", e);
-            std::process::exit(1);
-        });
-        for rel in local_dep_paths {
-            let src = man_dir.join(&rel);
-            let dest = out_dir.join(&rel);
-            if let Err(e) = copy_dir_all(&src, &dest) {
-                eprintln!("pblang bundle: failed to copy dep {}: {}", rel.display(), e);
-                std::process::exit(1);
-            }
-        }
-        let mut msg = format!(
-            "bundled to {} (entry {})",
-            out_dir.display(),
-            entry_rel.to_string_lossy().replace('\\', "/")
-        );
-        if let Some((name, version, desc)) = load_package_display_metadata(&man_dir) {
-            if !name.is_empty() && !version.is_empty() {
-                msg.push_str(&format!(" — {}@{}", name, version));
-            }
-            if let Some(d) = desc.as_deref().filter(|s| !s.is_empty()) {
-                msg.push_str(&format!(" — {}", d));
-            }
-        }
-        println!("{}", msg);
-        println!(
-            "To run: {} run {}",
-            out_dir.display(),
-            entry_rel.to_string_lossy().replace('\\', "/")
-        );
+        cli::bundle::handle_bundle(args);
         return;
     }
 
@@ -3635,224 +3303,8 @@ fn legacy_dispatch(args: Vec<String>) {
         }
     }
     if args.first().map(|s| s.as_str()) == Some("--doc") {
-        let Some(path) = args.get(1) else {
-            eprintln!("usage: pblang --doc <file> [--html] [out_dir]");
-            std::process::exit(2);
-        };
-        let html_mode = args.get(2).map(|s| s.as_str()) == Some("--html");
-        let out_dir = if html_mode {
-            args.get(3).map(String::as_str).unwrap_or("docs")
-        } else {
-            ""
-        };
-        let src = match std::fs::read_to_string(path) {
-            Ok(src) => src,
-            Err(e) => {
-                eprintln!("pblang --doc: failed to read '{}': {}", path, e);
-                std::process::exit(1);
-            }
-        };
-
-        fn render_ty(t: &TypeExpr) -> String {
-            match &t.kind {
-                TypeKind::Any => "any".into(),
-                TypeKind::Number => "number".into(),
-                TypeKind::BigInt => "bigint".into(),
-                TypeKind::Rational => "rational".into(),
-                TypeKind::Decimal => "decimal".into(),
-                TypeKind::Bool => "bool".into(),
-                TypeKind::String => "string".into(),
-                TypeKind::Nil => "nil".into(),
-                TypeKind::Array(inner) => format!("array<{}>", render_ty(inner)),
-                TypeKind::Map(k, v) => format!("map<{}, {}>", render_ty(k), render_ty(v)),
-                TypeKind::Option(inner) => format!("{}?", render_ty(inner)),
-                TypeKind::Result(ok, err) => {
-                    format!("result<{}, {}>", render_ty(ok), render_ty(err))
-                }
-                TypeKind::Generic(name) => name.clone(),
-                TypeKind::NonNull(inner) => format!("{}!", render_ty(inner)),
-            }
-        }
-
-        fn render_polyglot_attrs(attrs: &std::collections::HashMap<String, String>) -> String {
-            if attrs.is_empty() {
-                return "(none)".into();
-            }
-            let mut pairs = attrs
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>();
-            pairs.sort();
-            pairs.join(", ")
-        }
-
-        fn polyglot_code_line_count(code: &str) -> usize {
-            if code.is_empty() {
-                0
-            } else {
-                code.lines().count()
-            }
-        }
-
-        match parse_with_polyglot(&src) {
-            Ok((stmts, blocks)) => {
-                let mut exports: Vec<String> = vec![];
-                let mut fns: Vec<String> = vec![];
-
-                for s in &stmts {
-                    match &s.kind {
-                        StmtKind::Export(names) => {
-                            exports.extend(names.iter().cloned());
-                        }
-                        StmtKind::Fn(name, params, ret, _body) => {
-                            let ps = params
-                                .iter()
-                                .map(|p| match &p.ty {
-                                    Some(t) => format!("{}: {}", p.name, render_ty(t)),
-                                    None => p.name.clone(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let r = ret.as_ref().map(render_ty);
-                            let sig = if let Some(r) = r {
-                                format!("fn {name}({ps}) -> {r}")
-                            } else {
-                                format!("fn {name}({ps})")
-                            };
-                            fns.push(sig);
-                        }
-                        _ => {}
-                    }
-                }
-
-                exports.sort();
-                exports.dedup();
-                fns.sort();
-
-                if html_mode {
-                    let mut html = String::from(
-                        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>pblang module docs</title>
-  <style>
-body { font-family: system-ui, sans-serif; max-width: 800px; margin: 1rem auto; padding: 0 1rem; }
-h1 { font-size: 1.5rem; }
-h2 { font-size: 1.2rem; margin-top: 1.5rem; }
-code { background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; }
-ul { list-style: none; padding-left: 0; }
-li { margin: 0.3em 0; }
-  </style>
-</head>
-<body>
-  <h1>Module docs</h1>
-  <p><strong>file</strong>: <code>"#,
-                    );
-                    html.push_str(path);
-                    html.push_str(
-                        r#"</code></p>
-  <h2>Exports</h2>
-  <ul>
-"#,
-                    );
-                    if exports.is_empty() {
-                        html.push_str("    <li>(none)</li>\n");
-                    } else {
-                        for e in &exports {
-                            html.push_str("    <li><code>");
-                            html.push_str(&e.replace('<', "&lt;").replace('>', "&gt;"));
-                            html.push_str("</code></li>\n");
-                        }
-                    }
-                    html.push_str("  </ul>\n  <h2>Top-level functions</h2>\n  <ul>\n");
-                    if fns.is_empty() {
-                        html.push_str("    <li>(none)</li>\n");
-                    } else {
-                        for f in &fns {
-                            html.push_str("    <li><code>");
-                            html.push_str(&f.replace('<', "&lt;").replace('>', "&gt;"));
-                            html.push_str("</code></li>\n");
-                        }
-                    }
-                    html.push_str("  </ul>\n  <h2>Polyglot blocks</h2>\n  <ul>\n");
-                    if blocks.is_empty() {
-                        html.push_str("    <li>(none)</li>\n");
-                    } else {
-                        for b in blocks {
-                            let name = b.name.as_deref().unwrap_or("<unnamed>");
-                            let block_args = b.args.as_deref().unwrap_or("");
-                            let attrs = render_polyglot_attrs(&b.attrs);
-                            let lines = polyglot_code_line_count(&b.code);
-                            html.push_str(&format!(
-                            "    <li><code>@{} {} {}</code> (span {}..{}, attrs: {}, code lines: {})</li>\n",
-                            b.lang, name, block_args, b.span.start, b.span.end, attrs, lines
-                        ));
-                        }
-                    }
-                    html.push_str("  </ul>\n</body>\n</html>\n");
-
-                    let out_path = std::path::Path::new(out_dir);
-                    let _ = std::fs::create_dir_all(out_path);
-                    let index = out_path.join("index.html");
-                    if let Err(e) = std::fs::write(&index, html) {
-                        eprintln!(
-                            "pblang --doc --html: failed to write {}: {}",
-                            index.display(),
-                            e
-                        );
-                        std::process::exit(1);
-                    }
-                    println!("wrote {}", index.display());
-                } else {
-                    println!("## Module docs");
-                    println!();
-                    println!("- **file**: `{path}`");
-                    println!();
-                    println!("### Exports");
-                    if exports.is_empty() {
-                        println!();
-                        println!("(none)");
-                    } else {
-                        for e in &exports {
-                            println!("- `{e}`");
-                        }
-                    }
-                    println!();
-                    println!("### Top-level functions");
-                    if fns.is_empty() {
-                        println!();
-                        println!("(none)");
-                    } else {
-                        for f in &fns {
-                            println!("- `{f}`");
-                        }
-                    }
-                    println!();
-                    println!("### Polyglot blocks");
-                    if blocks.is_empty() {
-                        println!();
-                        println!("(none)");
-                    } else {
-                        for b in blocks {
-                            let name = b.name.as_deref().unwrap_or("<unnamed>");
-                            let block_args = b.args.as_deref().unwrap_or("");
-                            let attrs = render_polyglot_attrs(&b.attrs);
-                            let lines = polyglot_code_line_count(&b.code);
-                            println!(
-                                "- `@{} {}` `{}` (span {}..{}, attrs: {}, code lines: {})",
-                                b.lang, name, block_args, b.span.start, b.span.end, attrs, lines
-                            );
-                        }
-                    }
-                }
-                return;
-            }
-            Err(errs) => {
-                print_parse_errors(&src, errs, Some(path));
-                std::process::exit(2);
-            }
-        }
+        cli::doc::handle_doc(args);
+        return;
     }
 
     // Format .sap/.sapp files: trim, spacing around operators, indent by brace depth (4 spaces), optional line wrap, ensure final newline
@@ -4851,331 +4303,9 @@ li { margin: 0.3em 0; }
         return;
     }
 
-    fn lint_unused_warnings(stmts: &[Stmt]) -> Vec<(Span, String)> {
-        let mut warnings = vec![];
-        // (span, is_import, read)
-        let mut scope: Vec<std::collections::HashMap<String, (Span, bool, bool)>> = vec![];
-        scope.push(std::collections::HashMap::new());
-
-        fn mark_read(
-            name: &str,
-            scope: &mut [std::collections::HashMap<String, (Span, bool, bool)>],
-        ) {
-            for frame in scope.iter_mut().rev() {
-                if let Some((_, _, read)) = frame.get_mut(name) {
-                    *read = true;
-                    return;
-                }
-            }
-        }
-
-        fn is_import_call(e: &Expr) -> bool {
-            if let ExprKind::Call(callee, _) = &e.kind {
-                if let ExprKind::Var(s) = &callee.kind {
-                    return s == "import";
-                }
-            }
-            false
-        }
-
-        fn pop_scope_and_report(
-            scope: &mut Vec<std::collections::HashMap<String, (Span, bool, bool)>>,
-            warnings: &mut Vec<(Span, String)>,
-        ) {
-            if let Some(top) = scope.pop() {
-                for (name, (sp, is_import, read)) in top {
-                    if !read {
-                        let msg = if is_import {
-                            format!("unused import: `{}`", name)
-                        } else {
-                            format!("unused variable: `{}`", name)
-                        };
-                        warnings.push((sp, msg));
-                    }
-                }
-            }
-        }
-
-        fn walk_expr(
-            e: &Expr,
-            scope: &mut Vec<std::collections::HashMap<String, (Span, bool, bool)>>,
-            warnings: &mut Vec<(Span, String)>,
-        ) {
-            match &e.kind {
-                ExprKind::Var(name) => mark_read(name, scope),
-                ExprKind::Call(callee, args) => {
-                    walk_expr(callee, scope, warnings);
-                    for a in args {
-                        walk_expr(a, scope, warnings);
-                    }
-                }
-                ExprKind::GetAttr(obj, _) => walk_expr(obj, scope, warnings),
-                ExprKind::Index(obj, ix) => {
-                    walk_expr(obj, scope, warnings);
-                    walk_expr(ix, scope, warnings);
-                }
-                ExprKind::Add(a, b)
-                | ExprKind::Sub(a, b)
-                | ExprKind::Mul(a, b)
-                | ExprKind::Div(a, b) => {
-                    walk_expr(a, scope, warnings);
-                    walk_expr(b, scope, warnings);
-                }
-                ExprKind::Eq(a, b)
-                | ExprKind::NotEq(a, b)
-                | ExprKind::Gt(a, b)
-                | ExprKind::Ge(a, b)
-                | ExprKind::Lt(a, b)
-                | ExprKind::Le(a, b) => {
-                    walk_expr(a, scope, warnings);
-                    walk_expr(b, scope, warnings);
-                }
-                ExprKind::Logical { left, right, .. } => {
-                    walk_expr(left, scope, warnings);
-                    walk_expr(right, scope, warnings);
-                }
-                ExprKind::Try(try_e, catch_e) => {
-                    walk_expr(try_e, scope, warnings);
-                    walk_expr(catch_e, scope, warnings);
-                }
-                ExprKind::Match(scrut, arms, else_e) => {
-                    walk_expr(scrut, scope, warnings);
-                    for (_arm, e) in arms {
-                        walk_expr(e, scope, warnings);
-                    }
-                    if let Some(ee) = else_e {
-                        walk_expr(ee, scope, warnings);
-                    }
-                }
-                ExprKind::Array(arr) => {
-                    for a in arr {
-                        walk_expr(a, scope, warnings);
-                    }
-                }
-                ExprKind::Map(entries) => {
-                    for (_, v) in entries {
-                        walk_expr(v, scope, warnings);
-                    }
-                }
-                ExprKind::FnLit(_, _, _, body) => {
-                    scope.push(std::collections::HashMap::new());
-                    for s in body {
-                        walk_stmt(s, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                ExprKind::BlockExpr(stmts_in, opt_final) => {
-                    scope.push(std::collections::HashMap::new());
-                    for s in stmts_in {
-                        walk_stmt(s, scope, warnings);
-                    }
-                    if let Some(e) = opt_final {
-                        walk_expr(e, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                _ => {}
-            }
-        }
-
-        fn walk_stmt(
-            s: &Stmt,
-            scope: &mut Vec<std::collections::HashMap<String, (Span, bool, bool)>>,
-            warnings: &mut Vec<(Span, String)>,
-        ) {
-            match &s.kind {
-                StmtKind::Let(name, _, init) => {
-                    if scope.len() > 1 {
-                        for frame in scope[..scope.len() - 1].iter() {
-                            if frame.contains_key(name) {
-                                warnings.push((
-                                    s.span,
-                                    format!("variable `{}` shadows outer binding", name),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    let is_import = is_import_call(init);
-                    if let Some(top) = scope.last_mut() {
-                        top.insert(name.clone(), (s.span, is_import, false));
-                    }
-                    walk_expr(init, scope, warnings);
-                }
-                StmtKind::Assign(name, rhs) => {
-                    mark_read(name, scope);
-                    walk_expr(rhs, scope, warnings);
-                }
-                StmtKind::SetIndex(t, ix, val) => {
-                    walk_expr(t, scope, warnings);
-                    walk_expr(ix, scope, warnings);
-                    walk_expr(val, scope, warnings);
-                }
-                StmtKind::SetAttr(obj, _, val) => {
-                    walk_expr(obj, scope, warnings);
-                    walk_expr(val, scope, warnings);
-                }
-                StmtKind::Expr(e) => walk_expr(e, scope, warnings),
-                StmtKind::Print(e)
-                | StmtKind::PrintF(_, e)
-                | StmtKind::Return(Some(e))
-                | StmtKind::Defer(e) => {
-                    walk_expr(e, scope, warnings);
-                }
-                StmtKind::If(cond, then_b, else_b) => {
-                    walk_expr(cond, scope, warnings);
-                    scope.push(std::collections::HashMap::new());
-                    for s in then_b {
-                        walk_stmt(s, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                    if let Some(else_stmts) = else_b {
-                        scope.push(std::collections::HashMap::new());
-                        for s in else_stmts {
-                            walk_stmt(s, scope, warnings);
-                        }
-                        pop_scope_and_report(scope, warnings);
-                    }
-                }
-                StmtKind::While(cond, body) => {
-                    walk_expr(cond, scope, warnings);
-                    scope.push(std::collections::HashMap::new());
-                    for s in body {
-                        walk_stmt(s, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                StmtKind::For(name, count, body) => {
-                    walk_expr(count, scope, warnings);
-                    if scope.len() > 1 {
-                        for frame in scope[..scope.len() - 1].iter() {
-                            if frame.contains_key(name) {
-                                warnings.push((
-                                    s.span,
-                                    format!("variable `{}` shadows outer binding", name),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(top) = scope.last_mut() {
-                        top.insert(name.clone(), (s.span, false, false));
-                    }
-                    scope.push(std::collections::HashMap::new());
-                    for s in body {
-                        walk_stmt(s, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                StmtKind::ForIn(name, col, body) => {
-                    walk_expr(col, scope, warnings);
-                    scope.push(std::collections::HashMap::new());
-                    if let Some(top) = scope.last_mut() {
-                        top.insert(name.clone(), (s.span, false, false));
-                    }
-                    for st in body {
-                        walk_stmt(st, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                StmtKind::ForInKV(k, v, col, body) => {
-                    walk_expr(col, scope, warnings);
-                    scope.push(std::collections::HashMap::new());
-                    if let Some(top) = scope.last_mut() {
-                        top.insert(k.clone(), (s.span, false, false));
-                        top.insert(v.clone(), (s.span, false, false));
-                    }
-                    for st in body {
-                        walk_stmt(st, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                StmtKind::Fn(_name, _params, _ret, body) => {
-                    scope.push(std::collections::HashMap::new());
-                    for s in body {
-                        walk_stmt(s, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                StmtKind::Block(body) => {
-                    scope.push(std::collections::HashMap::new());
-                    for s in body {
-                        walk_stmt(s, scope, warnings);
-                    }
-                    pop_scope_and_report(scope, warnings);
-                }
-                _ => {}
-            }
-        }
-
-        for s in stmts {
-            walk_stmt(s, &mut scope, &mut warnings);
-        }
-        pop_scope_and_report(&mut scope, &mut warnings);
-        warnings
-    }
-
     // Lint: parse + typecheck one or more files, report diagnostics + unused var/import warnings
     if args.first().map(|s| s.as_str()) == Some("lint") {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let files: Vec<_> = args.iter().skip(1).map(|s| cwd.join(s)).collect();
-        if files.is_empty() {
-            eprintln!("pblang lint: pass one or more .sap, .sapp, or .bpx files");
-            std::process::exit(1);
-        }
-        let mut has_error = false;
-        for path in &files {
-            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let path_str = path.to_string_lossy();
-            let src = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("pblang lint: {}: {}", path_str, e);
-                    has_error = true;
-                    continue;
-                }
-            };
-            match parse_strict(&src) {
-                Ok(stmts) => {
-                    let diags = type_check(&stmts);
-                    for d in &diags {
-                        has_error = true;
-                        if let Some(sp) = d.span {
-                            eprintln!("{}:{}..{}: {}", path_str, sp.start, sp.end, d.message);
-                        } else {
-                            eprintln!("{}: {}", path_str, d.message);
-                        }
-                    }
-                    if diags.is_empty() {
-                        for (sp, msg) in lint_unused_warnings(&stmts) {
-                            eprintln!("{}:{}..{}: warning: {}", path_str, sp.start, sp.end, msg);
-                        }
-                        // Clippy-style idiom/style/correctness lints.
-                        for d in pblang_lint::lint(&stmts) {
-                            eprintln!(
-                                "{}:{}..{}: warning: {} [{}: {}]",
-                                path_str,
-                                d.span.start,
-                                d.span.end,
-                                d.message,
-                                d.category.as_str(),
-                                d.name
-                            );
-                            if let Some(help) = &d.help {
-                                eprintln!("    help: {}", help);
-                            }
-                        }
-                    }
-                }
-                Err(errs) => {
-                    has_error = true;
-                    print_parse_errors(&src, errs, Some(&path_str));
-                }
-            }
-        }
-        if has_error {
-            std::process::exit(1);
-        }
+        cli::lint::handle_lint(args);
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("lsp") {
@@ -5192,265 +4322,7 @@ li { margin: 0.3em 0; }
 
     // Run test scripts (convention: tests/*.sap, tests/*.sapp, or tests/*.bpx)
     if args.first().map(|s| s.as_str()) == Some("test") {
-        let mut args = args;
-        let stdlib_cfg = parse_capability_flags(&mut args);
-
-        // --filter <substring>: only run tests whose `<file_stem>::<fn_name>`
-        // identifier contains this substring. Mirrors cargo's positional
-        // filter argument; accept both `--filter X` and `--filter=X`.
-        let mut filter: Option<String> = None;
-        let mut positional: Vec<String> = Vec::new();
-        let mut i = 1usize;
-        while i < args.len() {
-            let a = &args[i];
-            if let Some(rest) = a.strip_prefix("--filter=") {
-                filter = Some(rest.to_string());
-                i += 1;
-            } else if a == "--filter" && i + 1 < args.len() {
-                filter = Some(args[i + 1].clone());
-                i += 2;
-            } else {
-                positional.push(a.clone());
-                i += 1;
-            }
-        }
-
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let test_dir = positional
-            .first()
-            .map(|s| cwd.join(s))
-            .unwrap_or_else(|| cwd.join("tests"));
-
-        let mut entries = match std::fs::read_dir(&test_dir) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!(
-                    "pblang test: cannot read directory '{}': {}",
-                    test_dir.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .map(pblang_pm::is_module_ext)
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-        entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-        // Plan the work first so we can print the cargo-style
-        // "running N tests" line before any test runs.
-        struct PlannedTest {
-            file_path: std::path::PathBuf,
-            file_src: String,
-            file_stmts: Vec<Stmt>,
-            // None = run the whole file as one test (legacy fallback).
-            // Some(name) = call `fn <name>()` after running the file.
-            fn_name: Option<String>,
-            id: String,
-        }
-        let mut plan: Vec<PlannedTest> = Vec::new();
-        let mut planning_failures: Vec<(String, String)> = Vec::new();
-
-        for path in &entries {
-            let path_str = path.to_string_lossy().to_string();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("test")
-                .to_string();
-            let src = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(e) => {
-                    planning_failures.push((stem.clone(), format!("read {path_str}: {e}")));
-                    continue;
-                }
-            };
-            let masked = strip_comments_mask(&src);
-            let stmts = match parse_strict(&masked) {
-                Ok(s) => s,
-                Err(errs) => {
-                    let msg = errs
-                        .first()
-                        .map(format_parse_error)
-                        .unwrap_or_else(|| "parse error".into());
-                    planning_failures.push((stem.clone(), format!("parse: {msg}")));
-                    continue;
-                }
-            };
-
-            // Discover top-level `fn test_*`. Backward-compat: if none,
-            // run the whole file as a single implicit test.
-            let test_fns: Vec<String> = stmts
-                .iter()
-                .filter_map(|st| match &st.kind {
-                    StmtKind::Fn(name, _, _, _) if name.starts_with("test_") => Some(name.clone()),
-                    _ => None,
-                })
-                .collect();
-
-            if test_fns.is_empty() {
-                let id = stem.clone();
-                if filter.as_deref().map(|f| id.contains(f)).unwrap_or(true) {
-                    plan.push(PlannedTest {
-                        file_path: path.clone(),
-                        file_src: src,
-                        file_stmts: stmts,
-                        fn_name: None,
-                        id,
-                    });
-                }
-            } else {
-                // Stash the parsed+source state once per file; each
-                // test entry will re-clone what it needs. Cheap because
-                // `Stmt` is `Clone`.
-                for name in &test_fns {
-                    let id = format!("{stem}::{name}");
-                    if filter.as_deref().map(|f| id.contains(f)).unwrap_or(true) {
-                        plan.push(PlannedTest {
-                            file_path: path.clone(),
-                            file_src: src.clone(),
-                            file_stmts: stmts.clone(),
-                            fn_name: Some(name.clone()),
-                            id,
-                        });
-                    }
-                }
-            }
-        }
-
-        let total = plan.len();
-        println!();
-        println!("running {} tests", total);
-
-        let mut passed = 0usize;
-        let mut failed = 0usize;
-        let mut failures: Vec<(String, String)> = Vec::new();
-
-        // Group consecutive entries by file so we only compile + load
-        // each file once, then call each discovered test fn on the
-        // already-loaded VM (test fns sit in the module's globals).
-        let mut idx = 0;
-        while idx < plan.len() {
-            let file_path = plan[idx].file_path.clone();
-            let file_src = plan[idx].file_src.clone();
-            let file_stmts = plan[idx].file_stmts.clone();
-
-            // Run the file once to register top-level fns into the VM's
-            // module globals.
-            let path_str = file_path.to_string_lossy().to_string();
-            let mut file_chunk = match compile(file_stmts) {
-                Ok(c) => c,
-                Err(e) => {
-                    // Mark every planned test for this file as a failure.
-                    while idx < plan.len() && plan[idx].file_path == file_path {
-                        let id = plan[idx].id.clone();
-                        failed += 1;
-                        failures.push((id.clone(), format!("compile error: {e}")));
-                        println!("test {id} ... FAILED");
-                        idx += 1;
-                    }
-                    continue;
-                }
-            };
-            file_chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
-            file_chunk.source = Some(std::rc::Rc::new(file_src));
-
-            let mut vm = VM::with_stdlib(stdlib_cfg.clone());
-            let load_result = vm.run(file_chunk);
-
-            while idx < plan.len() && plan[idx].file_path == file_path {
-                let id = plan[idx].id.clone();
-                let fn_name = plan[idx].fn_name.clone();
-                idx += 1;
-
-                match (&load_result, &fn_name) {
-                    (Err(e), None) => {
-                        // Legacy whole-file test: file load IS the test.
-                        failed += 1;
-                        failures.push((id.clone(), e.message.clone()));
-                        println!("test {id} ... FAILED");
-                    }
-                    (Ok(()), None) => {
-                        passed += 1;
-                        println!("test {id} ... ok");
-                    }
-                    (Err(e), Some(_)) => {
-                        // File load failed; mark all fn-level tests for it as failed.
-                        failed += 1;
-                        failures.push((id.clone(), format!("file load error: {}", e.message)));
-                        println!("test {id} ... FAILED");
-                    }
-                    (Ok(()), Some(name)) => {
-                        // Synthesize a tiny chunk that calls `<name>()` on
-                        // the already-loaded VM, then returns nil.
-                        let mut call_chunk = pblang_ir::chunk::Chunk::default();
-                        let name_const =
-                            call_chunk.add_const(pblang_ir::alloc_string(name.clone()));
-                        let nil_const = call_chunk.add_const(pblang_ir::Value::Nil);
-                        let sp = pblang_ir::chunk::Span::default();
-                        call_chunk.write(pblang_ir::OpCode::OpGetGlobal(name_const), sp);
-                        call_chunk.write(pblang_ir::OpCode::OpCall(0), sp);
-                        call_chunk.write(pblang_ir::OpCode::OpPop, sp);
-                        call_chunk.write(pblang_ir::OpCode::OpConstant(nil_const), sp);
-                        call_chunk.write(pblang_ir::OpCode::OpReturn, sp);
-                        call_chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
-
-                        match vm.run(call_chunk) {
-                            Ok(()) => {
-                                passed += 1;
-                                println!("test {id} ... ok");
-                            }
-                            Err(e) => {
-                                failed += 1;
-                                failures.push((id.clone(), e.message.clone()));
-                                println!("test {id} ... FAILED");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Surface planning-time failures (read error, parse error) after
-        // the run summary so they look like cargo's "could not compile"
-        // output.
-        for (id, msg) in &planning_failures {
-            failed += 1;
-            failures.push((id.clone(), msg.clone()));
-            println!("test {id} ... FAILED");
-        }
-
-        if !failures.is_empty() {
-            println!();
-            println!("failures:");
-            println!();
-            for (id, msg) in &failures {
-                println!("---- {id} stdout ----");
-                println!("{msg}");
-                println!();
-            }
-            println!("failures:");
-            for (id, _) in &failures {
-                println!("    {id}");
-            }
-        }
-
-        let filtered_out = 0usize;
-        println!();
-        let verdict = if failed == 0 { "ok" } else { "FAILED" };
-        println!(
-            "test result: {verdict}. {passed} passed; {failed} failed; \
-             0 ignored; 0 measured; {filtered_out} filtered out"
-        );
-        if failed > 0 {
-            std::process::exit(1);
-        }
+        cli::test::handle_test(args);
         return;
     }
 
@@ -5647,25 +4519,6 @@ li { margin: 0.3em 0; }
             eprintln!("pblang compile: cannot find '{}': {e}", args[1]);
             std::process::exit(1);
         });
-        let src = match std::fs::read_to_string(&script_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "pblang compile: failed to read '{}': {e}",
-                    script_path.display()
-                );
-                std::process::exit(1);
-            }
-        };
-        let src_for_parse = strip_comments_mask(&src);
-        let stmts = match parse_strict(&src_for_parse) {
-            Ok(s) => s,
-            Err(errs) => {
-                print_parse_errors(&src_for_parse, errs, Some(&script_path.to_string_lossy()));
-                std::process::exit(2);
-            }
-        };
-
         let default_out = if cfg!(windows) { "a.exe" } else { "a.out" };
         let out_name = args
             .iter()
@@ -5702,6 +4555,71 @@ li { margin: 0.3em 0; }
             );
             std::process::exit(2);
         }
+
+        let out_path = {
+            let candidate = PathBuf::from(out_name);
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                cwd.join(candidate)
+            }
+        };
+        let cc = resolve_compile_cc(&args);
+        let requested_backend = if use_llvm {
+            "llvm"
+        } else if use_cranelift {
+            "cranelift"
+        } else {
+            "c99"
+        };
+        let compile_fingerprint: Option<CompileFingerprint> = if !keep_c && !use_wasm {
+            match fingerprint_for_compile(
+                &script_path,
+                requested_backend,
+                &out_path,
+                opt_level,
+                Some(&cc),
+                target_triple.as_deref(),
+            ) {
+                Ok(fp) => {
+                    if is_compile_cache_hit(&out_path, &fp) {
+                        eprintln!(
+                            "pblang compile: cache hit, reused '{}' ({} input files, {} bytes unchanged)",
+                            out_path.display(),
+                            fp.input_count,
+                            fp.input_bytes
+                        );
+                        return;
+                    }
+                    Some(fp)
+                }
+                Err(e) => {
+                    eprintln!("pblang compile: cache disabled: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let src = match std::fs::read_to_string(&script_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "pblang compile: failed to read '{}': {e}",
+                    script_path.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        let src_for_parse = strip_comments_mask(&src);
+        let stmts = match parse_strict(&src_for_parse) {
+            Ok(s) => s,
+            Err(errs) => {
+                print_parse_errors(&src_for_parse, errs, Some(&script_path.to_string_lossy()));
+                std::process::exit(2);
+            }
+        };
 
         if use_wasm {
             match pblang_wasm::compile_to_wat(stmts.clone()) {
@@ -5746,6 +4664,11 @@ li { margin: 0.3em 0; }
                         script_path.display(),
                         out_name
                     );
+                    if let Some(fp) = compile_fingerprint.as_ref() {
+                        if let Err(e) = write_compile_cache(&out_path, fp) {
+                            eprintln!("pblang compile: warning: failed to write cache: {e}");
+                        }
+                    }
                     return;
                 }
                 Err(e) => {
@@ -5786,25 +4709,6 @@ li { margin: 0.3em 0; }
                     });
 
                     // Compile the C stub with the pblang runtime linked in
-                    let cc = args
-                        .iter()
-                        .position(|a| a == "--cc")
-                        .and_then(|i| args.get(i + 1))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            for c in &["gcc", "clang", "cc"] {
-                                if std::process::Command::new(c)
-                                    .arg("--version")
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .status()
-                                    .is_ok()
-                                {
-                                    return c.to_string();
-                                }
-                            }
-                            "gcc".to_string()
-                        });
                     let opt_flag = format!("-O{opt_level}");
                     let status = std::process::Command::new(&cc)
                         .arg(&stub_path)
@@ -5826,6 +4730,11 @@ li { margin: 0.3em 0; }
                         out_name
                     );
                         let _ = std::fs::remove_file(&stub_path);
+                        if let Some(fp) = compile_fingerprint.as_ref() {
+                            if let Err(e) = write_compile_cache(&out_path, fp) {
+                                eprintln!("pblang compile: warning: failed to write cache: {e}");
+                            }
+                        }
                         return;
                     } else {
                         eprintln!("pblang compile: Cranelift AOT compilation failed, falling back to C99 backend");
@@ -5857,26 +4766,6 @@ li { margin: 0.3em 0; }
             std::process::exit(1);
         });
 
-        let cc = args
-            .iter()
-            .position(|a| a == "--cc")
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-            .unwrap_or_else(|| {
-                for c in &["gcc", "clang", "cc"] {
-                    if std::process::Command::new(c)
-                        .arg("--version")
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .is_ok()
-                    {
-                        return c.to_string();
-                    }
-                }
-                "gcc".to_string()
-            });
-
         let opt_flag = format!("-O{opt_level}");
         let status = std::process::Command::new(&cc)
             .arg(&c_path)
@@ -5904,6 +4793,11 @@ li { margin: 0.3em 0; }
             script_path.display(),
             out_name
         );
+        if let Some(fp) = compile_fingerprint.as_ref() {
+            if let Err(e) = write_compile_cache(&out_path, fp) {
+                eprintln!("pblang compile: warning: failed to write cache: {e}");
+            }
+        }
         if !keep_c {
             let _ = std::fs::remove_file(&c_path);
         } else {
@@ -5990,136 +4884,7 @@ li { margin: 0.3em 0; }
     }
 
     if args.first().map(|s| s.as_str()) == Some("build-polyglot") {
-        if args.len() < 2 {
-            eprintln!("usage: pblang build-polyglot <file.sapp> [--out-dir <dir>]");
-            eprintln!("  Extracts @lang {{ }} polyglot blocks from source and builds them.");
-            eprintln!(
-                "  --out-dir <dir>  Output directory for built artifacts (default: ./polyglot-out)"
-            );
-            std::process::exit(1);
-        }
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let script_path = {
-            let candidate = PathBuf::from(&args[1]);
-            if candidate.is_absolute() {
-                candidate
-            } else {
-                cwd.join(&candidate)
-            }
-        };
-        let script_path = script_path.canonicalize().unwrap_or_else(|e| {
-            eprintln!("build-polyglot: cannot find '{}': {e}", args[1]);
-            std::process::exit(1);
-        });
-        let out_dir = args
-            .iter()
-            .position(|a| a == "--out-dir")
-            .and_then(|i| args.get(i + 1))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| cwd.join("polyglot-out"));
-        std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| {
-            eprintln!("build-polyglot: cannot create '{}': {e}", out_dir.display());
-            std::process::exit(1);
-        });
-
-        let src = std::fs::read_to_string(&script_path).unwrap_or_else(|e| {
-            eprintln!(
-                "build-polyglot: cannot read '{}': {e}",
-                script_path.display()
-            );
-            std::process::exit(1);
-        });
-
-        let blocks = pblang_core::extract_polyglot_blocks(&src);
-        if blocks.is_empty() {
-            eprintln!(
-                "build-polyglot: no polyglot blocks found in '{}'",
-                script_path.display()
-            );
-            eprintln!("  Use @lang {{ }} syntax to embed foreign code: @python {{ print('hi') }}");
-            return;
-        }
-
-        eprintln!("Found {} polyglot block(s):", blocks.len());
-        for b in &blocks {
-            let name = b.name.as_deref().unwrap_or("unnamed");
-            let out_file = out_dir.join(format!(
-                "{}_{}.{}",
-                script_path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                name,
-                match b.lang.as_str() {
-                    "python" | "py" => "py",
-                    "rust" | "rs" => "rs",
-                    "js" | "javascript" => "js",
-                    "bash" | "sh" => "sh",
-                    "ruby" | "rb" => "rb",
-                    "lua" => "lua",
-                    other => other,
-                }
-            ));
-            std::fs::write(&out_file, &b.code).unwrap_or_else(|e| {
-                eprintln!("build-polyglot: cannot write '{}': {e}", out_file.display());
-                std::process::exit(1);
-            });
-            eprintln!("  @{} {} → {}", b.lang, name, out_file.display());
-
-            // Attempt to compile if possible
-            if b.lang == "rust" || b.lang == "rs" {
-                let out_so = out_dir.join(format!("lib{}.so", name));
-                let status = std::process::Command::new("rustc")
-                    .arg(&out_file)
-                    .arg("--crate-type")
-                    .arg("cdylib")
-                    .arg("-o")
-                    .arg(&out_so)
-                    .status();
-                match status {
-                    Ok(s) if s.success() => eprintln!("    → compiled {}", out_so.display()),
-                    _ => eprintln!("    (rustc not available, keeping source)"),
-                }
-            }
-
-            if b.lang == "python" || b.lang == "py" {
-                // Python: compile to .pyc
-                let status = std::process::Command::new("python3")
-                    .arg("-m")
-                    .arg("py_compile")
-                    .arg(&out_file)
-                    .status();
-                match status {
-                    Ok(s) if s.success() => eprintln!("    → compiled .pyc"),
-                    _ => { /* py_compile not critical */ }
-                }
-            }
-        }
-
-        // Write manifest
-        let manifest = out_dir.join("polyglot.toml");
-        let mut toml = String::from("[polyglot]\n");
-        toml.push_str(&format!("source = \"{}\"\n", script_path.display()));
-        toml.push_str(&format!("blocks = {}\n", blocks.len()));
-        toml.push_str("\n[[blocks]]\n");
-        for b in &blocks {
-            let name = b.name.as_deref().unwrap_or("unnamed");
-            toml.push_str(&format!("lang = \"{}\"\n", b.lang));
-            toml.push_str(&format!("name = \"{}\"\n", name));
-            toml.push_str(&format!("lines = {}\n", b.code.lines().count()));
-            toml.push_str("\n[[blocks]]\n");
-        }
-        // Remove trailing [[blocks]]
-        if toml.ends_with("[[blocks]]\n") {
-            toml = toml[..toml.len() - "[[blocks]]\n".len()].to_string();
-        }
-        std::fs::write(&manifest, toml).unwrap();
-        eprintln!("Manifest: {}", manifest.display());
-        eprintln!(
-            "Done. {} blocks extracted to '{}'",
-            blocks.len(),
-            out_dir.display()
-        );
+        cli::build_polyglot::handle_build_polyglot(args);
         return;
     }
 

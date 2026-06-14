@@ -63,6 +63,8 @@
 //! | Import/Export               | ❌ (future)|
 //! | Concurrency (spawn/channel) | ❌ (future)|
 
+use std::collections::HashSet;
+
 use pblang_core::{ExprKind, FStringPart, LogicalOp, MatchArm, Stmt, StmtKind};
 
 /// The pblang C runtime header — embedded in every generated C file.
@@ -119,6 +121,10 @@ struct TranspileCtx {
     target: OutputTarget,
     /// Current function body buffer (when inside a function).
     fn_buf: String,
+    /// Top-level user function names collected before emission.
+    function_names: HashSet<String>,
+    /// Lexical variable scopes for generated PbVal variables.
+    scopes: Vec<HashSet<String>>,
     pub warnings: Vec<String>,
 }
 
@@ -139,6 +145,8 @@ impl TranspileCtx {
             tmp_counter: 0,
             target: OutputTarget::Main,
             fn_buf: String::new(),
+            function_names: HashSet::new(),
+            scopes: vec![HashSet::new()],
             warnings: Vec::new(),
         }
     }
@@ -169,10 +177,31 @@ impl TranspileCtx {
         format!("__pb_t{}", self.tmp_counter)
     }
 
+    fn push_scope(&mut self) {
+        self.scopes.push(HashSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
+    fn declare_var(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string());
+        }
+    }
+
+    fn is_local_var(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|scope| scope.contains(name))
+    }
+
     fn transpile_program(&mut self, stmts: Vec<Stmt>) {
         // First pass: collect all top-level fn declarations for forward decls
         for s in &stmts {
             if let StmtKind::Fn(name, params, _ret, _body) = &s.kind {
+                self.function_names.insert(name.clone());
                 let arity = params.len();
                 let param_str = (0..arity)
                     .map(|i| format!("PbVal a{i}"))
@@ -194,10 +223,12 @@ impl TranspileCtx {
             StmtKind::Let(name, _ty, init) => {
                 let rhs = self.emit_expr_str(&init.kind);
                 self.emit(&format!("PbVal {name} = {rhs};"));
+                self.declare_var(&name);
             }
             StmtKind::Const(name, _ty, init) => {
                 let rhs = self.emit_expr_str(&init.kind);
                 self.emit(&format!("PbVal {name} = {rhs}; /* const */"));
+                self.declare_var(&name);
             }
             StmtKind::Assign(name, expr) => {
                 let rhs = self.emit_expr_str(&expr.kind);
@@ -228,16 +259,20 @@ impl TranspileCtx {
                 let cond_s = self.emit_expr_str(&cond.kind);
                 self.emit(&format!("if (pb_truthy({cond_s})) {{"));
                 self.indent += 1;
+                self.push_scope();
                 for s in then_body {
                     self.emit_stmt(s);
                 }
+                self.pop_scope();
                 self.indent -= 1;
                 if let Some(else_stmts) = else_body {
                     self.emit("} else {");
                     self.indent += 1;
+                    self.push_scope();
                     for s in else_stmts {
                         self.emit_stmt(s);
                     }
+                    self.pop_scope();
                     self.indent -= 1;
                 }
                 self.emit("}");
@@ -246,9 +281,11 @@ impl TranspileCtx {
                 let cond_s = self.emit_expr_str(&cond.kind);
                 self.emit(&format!("while (pb_truthy({cond_s})) {{"));
                 self.indent += 1;
+                self.push_scope();
                 for s in body {
                     self.emit_stmt(s);
                 }
+                self.pop_scope();
                 self.indent -= 1;
                 self.emit("}");
             }
@@ -257,9 +294,12 @@ impl TranspileCtx {
                 let tmp_n = self.fresh_tmp();
                 self.emit(&format!("{{ PbVal {tmp_n} = {cnt}; for (PbVal {var} = PB_NUM(0.0); pb_lt({var}, {tmp_n}); {var} = PB_NUM(pb_num({var}) + 1.0)) {{"));
                 self.indent += 1;
+                self.push_scope();
+                self.declare_var(&var);
                 for s in body {
                     self.emit_stmt(s);
                 }
+                self.pop_scope();
                 self.indent -= 1;
                 self.emit("}}");
             }
@@ -272,9 +312,12 @@ impl TranspileCtx {
                 self.emit(&format!(
                     "PbVal {var} = pb_arr_get({tmp_col}, PB_NUM((double)__i_{tmp_i}));"
                 ));
+                self.push_scope();
+                self.declare_var(&var);
                 for s in body {
                     self.emit_stmt(s);
                 }
+                self.pop_scope();
                 self.indent -= 1;
                 self.emit("}}");
             }
@@ -288,18 +331,24 @@ impl TranspileCtx {
                     "PbVal {k} = pb_arr_get(__keys_{tmp_i}, PB_NUM((double)__i_{tmp_i}));"
                 ));
                 self.emit(&format!("PbVal {v} = pb_map_get({tmp_col}, {k});"));
+                self.push_scope();
+                self.declare_var(&k);
+                self.declare_var(&v);
                 for s in body {
                     self.emit_stmt(s);
                 }
+                self.pop_scope();
                 self.indent -= 1;
                 self.emit("}}");
             }
             StmtKind::Loop(body) => {
                 self.emit("for (;;) {");
                 self.indent += 1;
+                self.push_scope();
                 for s in body {
                     self.emit_stmt(s);
                 }
+                self.pop_scope();
                 self.indent -= 1;
                 self.emit("}");
             }
@@ -351,6 +400,7 @@ impl TranspileCtx {
                 let prev_buf = std::mem::take(&mut self.fn_buf);
                 let prev_target = std::mem::replace(&mut self.target, OutputTarget::Function);
                 let prev_indent = self.indent;
+                let prev_scopes = std::mem::replace(&mut self.scopes, vec![HashSet::new()]);
                 self.indent = 1;
 
                 // Function header
@@ -372,12 +422,14 @@ impl TranspileCtx {
                     } else {
                         self.emit(&format!("PbVal {pn} = a{i};", pn = p.name));
                     }
+                    self.declare_var(&p.name);
                 }
 
                 // Vararg binding
                 if is_vararg {
                     if let Some(vp) = params.last() {
                         self.emit(&format!("PbVal {vname} = __varargs;", vname = vp.name));
+                        self.declare_var(&vp.name);
                     }
                 }
 
@@ -392,13 +444,16 @@ impl TranspileCtx {
                 self.functions.push_str(&fn_code);
                 self.target = prev_target;
                 self.indent = prev_indent;
+                self.scopes = prev_scopes;
             }
             StmtKind::Block(stmts) => {
                 self.emit("{");
                 self.indent += 1;
+                self.push_scope();
                 for s in stmts {
                     self.emit_stmt(s);
                 }
+                self.pop_scope();
                 self.indent -= 1;
                 self.emit("}");
             }
@@ -478,8 +533,9 @@ impl TranspileCtx {
                     "str_replace_all" => "pb_builtin_str_replace_all".to_string(),
                     "assert" => "pb_builtin_assert".to_string(),
                     "error" => "pb_builtin_error".to_string(),
-                    // User-defined function reference
-                    _ => format!("pb_fn_{name}"),
+                    _ if self.is_local_var(name) => name.clone(),
+                    _ if self.function_names.contains(name) => format!("pb_fn_{name}"),
+                    _ => name.clone(),
                 }
             }
             ExprKind::Add(a, b) => {
@@ -637,12 +693,14 @@ impl TranspileCtx {
                 let prev_buf = std::mem::take(&mut self.fn_buf);
                 let prev_target = std::mem::replace(&mut self.target, OutputTarget::Function);
                 let prev_indent = self.indent;
+                let prev_scopes = std::mem::replace(&mut self.scopes, vec![HashSet::new()]);
                 self.indent = 1;
 
                 self.fn_buf
                     .push_str(&format!("static PbVal {c_fn_name}({param_str}) {{\n"));
                 for (i, p) in params.iter().enumerate() {
                     self.emit(&format!("PbVal {pn} = a{i};", pn = p.name));
+                    self.declare_var(&p.name);
                 }
                 for s in body.iter().cloned() {
                     self.emit_stmt(s);
@@ -654,6 +712,7 @@ impl TranspileCtx {
                 self.functions.push_str(&fn_code);
                 self.target = prev_target;
                 self.indent = prev_indent;
+                self.scopes = prev_scopes;
 
                 // Return function pointer as PbVal
                 format!("PB_FN({c_fn_name})")
@@ -709,9 +768,11 @@ impl TranspileCtx {
                         MatchArm::Wildcard => "1".to_string(),
                         MatchArm::Bind(name) => {
                             // Bind variable to scrutinee
+                            self.declare_var(name);
                             format!("({name} = {sc_tmp}, 1)")
                         }
                         MatchArm::BindGuard(name, guard) => {
+                            self.declare_var(name);
                             let g = self.emit_expr_str(&guard.kind);
                             format!("({name} = {sc_tmp}, pb_truthy({g}))")
                         }

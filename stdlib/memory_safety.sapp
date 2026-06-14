@@ -121,19 +121,230 @@ fn stats() {
 fn Box(value) {
     let h = allocate(value, 1);
     return map{
+        kind: "Box",
         handle: h,
         value: value,
+        alive: true,
+        pinned: false,
     };
 }
 
-// Rc(value) — reference-counted shared ownership (simulated via VM)
-// Multiple Rc handles can point to the same value
+fn box_new(value) {
+    return Box(value);
+}
+
+fn _assert_owner_alive(owner) {
+    if owner == nil { throw "memory_safety: nil owner"; }
+    if (try owner.alive catch true) == false { throw "memory_safety: owner is not alive"; }
+    if (try owner.moved catch false) { throw "memory_safety: owner was moved"; }
+    return nil;
+}
+
+fn box_read(owner) {
+    _assert_owner_alive(owner);
+    return load(owner.handle);
+}
+
+fn box_write(owner, value) {
+    _assert_owner_alive(owner);
+    store(owner.handle, value);
+    owner.value = value;
+    return value;
+}
+
+fn box_drop(owner) {
+    _assert_owner_alive(owner);
+    deallocate(owner.handle);
+    owner.alive = false;
+    return nil;
+}
+
+fn box_into_inner(owner) {
+    _assert_owner_alive(owner);
+    if (try owner.pinned catch false) { throw "memory_safety: pinned owner cannot be moved"; }
+    let v = load(owner.handle);
+    deallocate(owner.handle);
+    owner.alive = false;
+    owner.moved = true;
+    return v;
+}
+
+fn non_null(owner) {
+    _assert_owner_alive(owner);
+    if owner.handle == nil { throw "memory_safety: null handle"; }
+    return map{ kind: "NonNull", owner: owner, handle: owner.handle };
+}
+
+fn pin(owner) {
+    _assert_owner_alive(owner);
+    owner.pinned = true;
+    return map{ kind: "Pin", owner: owner };
+}
+
+fn is_pinned(owner) {
+    if owner == nil { return false; }
+    return try owner.pinned catch false;
+}
+
+// Borrow guards model Rust/C++ RAII-style handles at runtime. They must be
+// released explicitly; release is idempotent so cleanup paths can call it safely.
+fn borrow_guard(owner) {
+    _assert_owner_alive(owner);
+    let id = borrow_immutable(owner.handle);
+    return map{ kind: "BorrowGuard", mode: "shared", owner: owner, borrow_id: id, active: true };
+}
+
+fn borrow_mut_guard(owner) {
+    _assert_owner_alive(owner);
+    let id = borrow_mutable(owner.handle);
+    return map{ kind: "BorrowGuard", mode: "mutable", owner: owner, borrow_id: id, active: true };
+}
+
+fn guard_read(g) {
+    if g.active != true { throw "memory_safety: borrow guard is not active"; }
+    return load(g.owner.handle);
+}
+
+fn guard_release(g) {
+    if g.active {
+        release_borrow(g.borrow_id);
+        g.active = false;
+    }
+    return nil;
+}
+
+fn unique_move(owner) {
+    _assert_owner_alive(owner);
+    if (try owner.pinned catch false) { throw "memory_safety: pinned owner cannot be moved"; }
+    let id = borrow_unique(owner.handle);
+    owner.moved = true;
+    return map{ kind: "MoveGuard", owner: owner, borrow_id: id, active: true };
+}
+
+// Rc(value) — reference-counted shared ownership over one VM memory handle.
+// This mirrors Rust Rc / C++ shared_ptr policy: shared reads are fine, mutation
+// through rc_write requires unique strong ownership.
 fn Rc(value) {
     let h = allocate(value, 1);
+    let c = map{ handle: h, strong: 1, weak: 0, alive: true };
     return map{
-        handle: h,
-        refs: 1,
+        kind: "Rc",
+        control: c,
     };
+}
+
+fn rc_new(value) { return Rc(value); }
+
+fn rc_clone(rc) {
+    if rc.control.alive != true { throw "memory_safety: Rc target is dead"; }
+    rc.control.strong = rc.control.strong + 1;
+    return map{ kind: "Rc", control: rc.control };
+}
+
+fn rc_strong_count(rc) { return rc.control.strong; }
+fn rc_weak_count(rc) { return rc.control.weak; }
+
+fn rc_read(rc) {
+    if rc.control.alive != true { throw "memory_safety: Rc target is dead"; }
+    return load(rc.control.handle);
+}
+
+fn rc_write(rc, value) {
+    if rc.control.alive != true { throw "memory_safety: Rc target is dead"; }
+    if rc.control.strong != 1 { throw "memory_safety: Rc write requires unique strong owner"; }
+    store(rc.control.handle, value);
+    return value;
+}
+
+fn rc_release(rc) {
+    if rc.control.strong <= 0 { return nil; }
+    rc.control.strong = rc.control.strong - 1;
+    if rc.control.strong == 0 and rc.control.alive {
+        deallocate(rc.control.handle);
+        rc.control.alive = false;
+    }
+    return nil;
+}
+
+fn weak_new(rc) {
+    if rc.control.alive != true { throw "memory_safety: Rc target is dead"; }
+    rc.control.weak = rc.control.weak + 1;
+    return map{ kind: "Weak", control: rc.control, active: true };
+}
+
+fn weak_upgrade(w) {
+    if w.active != true or w.control.alive != true or w.control.strong <= 0 {
+        return map{ none: true };
+    }
+    w.control.strong = w.control.strong + 1;
+    return map{ some: map{ kind: "Rc", control: w.control } };
+}
+
+fn weak_release(w) {
+    if w.active {
+        if w.control.weak > 0 { w.control.weak = w.control.weak - 1; }
+        w.active = false;
+    }
+    return nil;
+}
+
+// Checked slice/span over an owned array/string. This mirrors safe slices in
+// Rust/Go/Swift: length and bounds are carried with the view.
+fn slice_ref(owner, start, end_idx) {
+    _assert_owner_alive(owner);
+    let v = load(owner.handle);
+    if start < 0 or end_idx < start or end_idx > len(v) {
+        throw "memory_safety: slice bounds out of range";
+    }
+    return map{ kind: "SliceRef", owner: owner, start: start, end: end_idx };
+}
+
+fn slice_len(s) {
+    return s.end - s.start;
+}
+
+fn slice_get(s, idx) {
+    if idx < 0 or idx >= slice_len(s) { throw "memory_safety: slice index out of range"; }
+    let v = load(s.owner.handle);
+    return v[s.start + idx];
+}
+
+fn slice_set(s, idx, value) {
+    if idx < 0 or idx >= slice_len(s) { throw "memory_safety: slice index out of range"; }
+    let v = load(s.owner.handle);
+    if type(v) != "array" { throw "memory_safety: slice_set requires array owner"; }
+    v[s.start + idx] = value;
+    store(s.owner.handle, v);
+    s.owner.value = v;
+    return value;
+}
+
+// Arena/region allocation: useful for parsers/compilers. Dropping the arena
+// releases every still-live child handle in reverse creation order.
+fn arena_new(name) {
+    return map{ kind: "Arena", name: name, handles: [], alive: true };
+}
+
+fn arena_alloc(arena, value) {
+    if arena.alive != true { throw "memory_safety: arena is not alive"; }
+    let owner = Box(value);
+    push(arena.handles, owner);
+    return owner;
+}
+
+fn arena_drop_all(arena) {
+    if arena.alive != true { return nil; }
+    let i = len(arena.handles) - 1;
+    while i >= 0 {
+        let owner = arena.handles[i];
+        if (try owner.alive catch false) {
+            deallocate(owner.handle);
+            owner.alive = false;
+        }
+        i = i - 1;
+    }
+    arena.alive = false;
+    return nil;
 }
 
 // ── Borrow Checker Helpers ────────────────────────────────────────────────────
@@ -171,3 +382,10 @@ export scope, begin_scope, end_scope;
 export stats;
 export Box, Rc;
 export assert_not_borrowed, try_borrow, try_borrow_mut;
+export box_new, box_read, box_write, box_drop, box_into_inner;
+export non_null, pin, is_pinned;
+export borrow_guard, borrow_mut_guard, guard_read, guard_release, unique_move;
+export rc_new, rc_clone, rc_strong_count, rc_weak_count, rc_read, rc_write, rc_release;
+export weak_new, weak_upgrade, weak_release;
+export slice_ref, slice_len, slice_get, slice_set;
+export arena_new, arena_alloc, arena_drop_all;

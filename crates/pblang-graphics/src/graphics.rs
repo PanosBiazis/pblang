@@ -133,7 +133,7 @@ pub fn gfxcreatewindow(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
     };
     let mut win = Window::new(&title, w as usize, h as usize, opts)
         .map_err(|e| host.err(format!("gfxcreatewindow: {e}")))?;
-    win.limit_update_rate(Some(std::time::Duration::from_micros(16_000))); // ~60 fps
+    win.set_target_fps(60);
     win.set_background_color(0, 0, 0);
 
     let id = GFX_NEXT.fetch_add(1, Ordering::Relaxed);

@@ -1,0 +1,243 @@
+// stdlib/llm_offload.sapp -- AirLLM-style low-memory inference planning.
+//
+// This is a pblang-native substrate for large-model execution on small memory
+// machines. It does not pretend to execute GPU kernels yet. It provides the
+// deterministic memory plan that a real shard loader / device backend can
+// follow: keep a small resident layer set, stream the rest layer-by-layer,
+// reserve KV-cache memory, prefetch near-future layers, and choose a microbatch
+// size that fits the active memory budget.
+
+fn layer(name, param_bytes, workspace_bytes, device) {
+    return map{
+        format: "pblang.llm.offload.layer.v1",
+        name: name,
+        param_bytes: param_bytes,
+        workspace_bytes: workspace_bytes,
+        device: device
+    };
+}
+
+fn config(memory_budget_bytes, kv_cache_bytes, prefetch_layers, keep_first, keep_last) {
+    return map{
+        format: "pblang.llm.offload.config.v1",
+        memory_budget_bytes: memory_budget_bytes,
+        kv_cache_bytes: kv_cache_bytes,
+        prefetch_layers: prefetch_layers,
+        keep_first: keep_first,
+        keep_last: keep_last
+    };
+}
+
+fn kv_cache_bytes(tokens, layers, kv_heads, head_dim, bytes_per_value) {
+    if tokens < 0 or layers < 0 or kv_heads < 0 or head_dim < 0 or bytes_per_value < 0 {
+        return 0;
+    }
+    // Key + value cache.
+    return tokens * layers * kv_heads * head_dim * bytes_per_value * 2;
+}
+
+fn layer_bytes(l) {
+    return l.param_bytes + l.workspace_bytes;
+}
+
+fn _available_layer_bytes(cfg) {
+    let avail = cfg.memory_budget_bytes - cfg.kv_cache_bytes;
+    if avail < 0 { return 0; }
+    return avail;
+}
+
+fn _contains(values, x) {
+    let i = 0;
+    while i < len(values) {
+        if values[i] == x { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _mandatory_resident_index(i, n, cfg) {
+    if i < cfg.keep_first { return true; }
+    if i >= n - cfg.keep_last { return true; }
+    return false;
+}
+
+fn choose_resident_layers(layers, cfg) {
+    let resident = [];
+    let used = 0;
+    let available = _available_layer_bytes(cfg);
+    let n = len(layers);
+    let total_layer_bytes = 0;
+    let max_stream_bytes = 0;
+    let scan = 0;
+    while scan < n {
+        let bscan = layer_bytes(layers[scan]);
+        total_layer_bytes = total_layer_bytes + bscan;
+        if bscan > max_stream_bytes { max_stream_bytes = bscan; }
+        scan = scan + 1;
+    }
+
+    let budget = available;
+    if total_layer_bytes > available {
+        budget = available - max_stream_bytes;
+        if budget < 0 { budget = 0; }
+    }
+
+    // Honor explicit first/last layer residency first. These are useful for
+    // embeddings/final-normalization style layers that are touched every token.
+    let i = 0;
+    while i < n {
+        if _mandatory_resident_index(i, n, cfg) {
+            let b = layer_bytes(layers[i]);
+            if used + b <= budget {
+                push(resident, i);
+                used = used + b;
+            }
+        }
+        i = i + 1;
+    }
+
+    // Fill remaining space greedily in execution order. This mirrors the useful
+    // AirLLM/RabbitLLM idea: keep what fits, stream only the missing layers.
+    let j = 0;
+    while j < n {
+        if not _contains(resident, j) {
+            let b2 = layer_bytes(layers[j]);
+            if used + b2 <= budget {
+                push(resident, j);
+                used = used + b2;
+            }
+        }
+        j = j + 1;
+    }
+
+    return map{
+        format: "pblang.llm.offload.resident.v1",
+        resident: resident,
+        resident_bytes: used,
+        resident_budget_bytes: budget,
+        available_layer_bytes: available,
+        stream_slot_bytes: max_stream_bytes,
+        kv_cache_bytes: cfg.kv_cache_bytes,
+        memory_budget_bytes: cfg.memory_budget_bytes
+    };
+}
+
+fn plan(layers, cfg) {
+    let chosen = choose_resident_layers(layers, cfg);
+    let events = [];
+    let peak = cfg.kv_cache_bytes + chosen.resident_bytes;
+    let streamed_layers = 0;
+    let n = len(layers);
+
+    let i = 0;
+    while i < n {
+        let l = layers[i];
+        let resident = _contains(chosen.resident, i);
+        let active_bytes = cfg.kv_cache_bytes + chosen.resident_bytes;
+        if resident {
+            push(events, map{
+                step: len(events),
+                action: "use_resident",
+                layer: i,
+                name: l.name,
+                bytes: layer_bytes(l),
+                active_bytes: active_bytes
+            });
+        } else {
+            let load_bytes = layer_bytes(l);
+            let load_active = active_bytes + load_bytes;
+            if load_active > peak { peak = load_active; }
+            streamed_layers = streamed_layers + 1;
+            push(events, map{
+                step: len(events),
+                action: "load_layer",
+                layer: i,
+                name: l.name,
+                bytes: load_bytes,
+                active_bytes: load_active
+            });
+            push(events, map{
+                step: len(events),
+                action: "compute_layer",
+                layer: i,
+                name: l.name,
+                bytes: load_bytes,
+                active_bytes: load_active
+            });
+            push(events, map{
+                step: len(events),
+                action: "release_layer",
+                layer: i,
+                name: l.name,
+                bytes: load_bytes,
+                active_bytes: active_bytes
+            });
+        }
+
+        let p = 1;
+        while p <= cfg.prefetch_layers {
+            let next = i + p;
+            if next < n and not _contains(chosen.resident, next) {
+                push(events, map{
+                    step: len(events),
+                    action: "prefetch_hint",
+                    layer: next,
+                    name: layers[next].name,
+                    bytes: layer_bytes(layers[next]),
+                    active_bytes: active_bytes
+                });
+            }
+            p = p + 1;
+        }
+
+        i = i + 1;
+    }
+
+    return map{
+        format: "pblang.llm.offload.plan.v1",
+        config: cfg,
+        resident: chosen.resident,
+        resident_bytes: chosen.resident_bytes,
+        streamed_layers: streamed_layers,
+        events: events,
+        peak_active_bytes: peak,
+        fits_budget: peak <= cfg.memory_budget_bytes
+    };
+}
+
+fn microbatch_capacity(cfg, activation_bytes_per_token, min_batch, max_batch) {
+    if activation_bytes_per_token <= 0 { return min_batch; }
+    let avail = _available_layer_bytes(cfg);
+    let cap = num_floor(avail / activation_bytes_per_token);
+    if cap < min_batch { return min_batch; }
+    if cap > max_batch { return max_batch; }
+    return cap;
+}
+
+fn summarize(p) {
+    return map{
+        format: "pblang.llm.offload.summary.v1",
+        resident_layers: len(p.resident),
+        streamed_layers: p.streamed_layers,
+        event_count: len(p.events),
+        peak_active_bytes: p.peak_active_bytes,
+        memory_budget_bytes: p.config.memory_budget_bytes,
+        kv_cache_bytes: p.config.kv_cache_bytes,
+        fits_budget: p.fits_budget
+    };
+}
+
+fn manifest(p, name) {
+    return map{
+        format: "pblang.llm.offload.manifest.v1",
+        name: name,
+        strategy: "layer-streaming-resident-window",
+        plan_format: p.format,
+        summary: summarize(p),
+        events: p.events
+    };
+}
+
+export layer, config, kv_cache_bytes, layer_bytes;
+export choose_resident_layers, plan, microbatch_capacity;
+export summarize, manifest;
