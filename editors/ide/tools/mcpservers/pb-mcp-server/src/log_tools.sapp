@@ -1,0 +1,283 @@
+// Native pblang translations for deterministic log tools.
+
+let FS = import("stdlib:fs.sapp");
+let JSON = import("stdlib:json.sapp");
+let sec = import("src/security.sapp");
+let core = import("src/core_tools.sapp");
+
+fn _read(args) {
+    sec.require_trusted("log tool");
+    return core.read_file(try args.path catch try args.file catch "", nil, nil, try args.max_chars catch sec.MAX_READ_CHARS);
+}
+
+fn _lines(text) {
+    return str_split(str(text), "\n");
+}
+
+fn _level(line) {
+    let s = str_upper(str(line));
+    if str_contains(s, "ERROR") or str_contains(s, " ERR ") { return "ERROR"; }
+    if str_contains(s, "WARN") or str_contains(s, "WARNING") { return "WARN"; }
+    if str_contains(s, "DEBUG") or str_contains(s, "TRACE") { return "DEBUG"; }
+    if str_contains(s, "INFO") { return "INFO"; }
+    return "UNKNOWN";
+}
+
+fn _inc(counts, key) {
+    let cur = try counts[key] catch 0;
+    counts[key] = cur + 1;
+    return counts;
+}
+
+fn log_level_summary(args) {
+    let lines = _lines(_read(args));
+    let counts = map{ DEBUG: 0, INFO: 0, WARN: 0, ERROR: 0, UNKNOWN: 0 };
+    for i len(lines) {
+        if str_trim(lines[i]) != "" { _inc(counts, _level(lines[i])); }
+    }
+    return map{ total_lines: len(lines), counts: counts };
+}
+
+fn log_search(args) {
+    let pattern = str(try args.pattern catch try args.query catch "");
+    let lines = _lines(_read(args));
+    let out = [];
+    let max_results = sec.clamp(try args.max_results catch 100, 1, 1000);
+    for i len(lines) {
+        if len(out) >= max_results { return out; }
+        if pattern == "" or str_contains(lines[i], pattern) {
+            out[len(out)] = map{ line: i + 1, level: _level(lines[i]), text: lines[i] };
+        }
+    }
+    return out;
+}
+
+fn log_tail(args) {
+    let lines = _lines(_read(args));
+    let n = sec.clamp(try args.lines catch try args.n catch 100, 1, 2000);
+    let filter_level = str_upper(str(try args.level catch ""));
+    let out = [];
+    let start = len(lines) - n;
+    if start < 0 { start = 0; }
+    for i in start to len(lines) - 1 {
+        let lvl = _level(lines[i]);
+        if filter_level == "" or lvl == filter_level {
+            out[len(out)] = map{ line: i + 1, level: lvl, text: lines[i] };
+        }
+    }
+    return out;
+}
+
+fn log_parse_json(args) {
+    let lines = _lines(_read(args));
+    let filter = try args.filter catch map{};
+    let fkeys = map_keys(filter);
+    let out = [];
+    let max_entries = sec.clamp(try args.max_entries catch 500, 1, 5000);
+    for i len(lines) {
+        if len(out) >= max_entries { return out; }
+        let t = str_trim(lines[i]);
+        if t != "" {
+            let v = try JSON.parse(t) catch nil;
+            if v != nil {
+                let ok = true;
+                for k len(fkeys) {
+                    if (try v[fkeys[k]] catch nil) != filter[fkeys[k]] { ok = false; }
+                }
+                if ok == true { out[len(out)] = v; }
+            }
+        }
+    }
+    return out;
+}
+
+fn log_parse_nginx(args) {
+    let lines = _lines(_read(args));
+    let out = [];
+    let max_entries = sec.clamp(try args.max_entries catch 500, 1, 5000);
+    for i len(lines) {
+        if len(out) >= max_entries { return out; }
+        let line = str_trim(lines[i]);
+        if line != "" {
+            let parts = str_split(line, " ");
+            let req = "";
+            let q = str_split(line, "\"");
+            if len(q) > 1 { req = q[1]; }
+            let rparts = str_split(req, " ");
+            out[len(out)] = map{
+                line: i + 1,
+                ip: try parts[0] catch "",
+                method: try rparts[0] catch "",
+                path: try rparts[1] catch "",
+                protocol: try rparts[2] catch "",
+                status: try parse_number(try parts[8] catch "0") catch 0,
+                bytes: try parse_number(try parts[9] catch "0") catch 0,
+                raw: line
+            };
+        }
+    }
+    return out;
+}
+
+fn log_parse_syslog(args) {
+    let lines = _lines(_read(args));
+    let out = [];
+    let max_entries = sec.clamp(try args.max_entries catch 500, 1, 5000);
+    for i len(lines) {
+        if len(out) >= max_entries { return out; }
+        let line = str_trim(lines[i]);
+        if line != "" {
+            let parts = str_split(line, " ");
+            out[len(out)] = map{
+                line: i + 1,
+                timestamp: (try parts[0] catch "") + " " + (try parts[1] catch "") + " " + (try parts[2] catch ""),
+                host: try parts[3] catch "",
+                level: _level(line),
+                message: line,
+            };
+        }
+    }
+    return out;
+}
+
+fn _normalize_error(line) {
+    let s = str_lower(str(line));
+    let out = "";
+    let last_space = false;
+    for i len(s) {
+        let ch = str_slice(s, i, i + 1);
+        if str_contains("0123456789abcdefABCDEF", ch) {
+            if last_space != true { out = out + "#"; last_space = false; }
+        } else if ch == " " or ch == "\t" {
+            if last_space != true { out = out + " "; }
+            last_space = true;
+        } else {
+            out = out + ch;
+            last_space = false;
+        }
+    }
+    return str_trim(out);
+}
+
+fn log_error_cluster(args) {
+    let lines = _lines(_read(args));
+    let counts = map{};
+    for i len(lines) {
+        let lvl = _level(lines[i]);
+        if lvl == "ERROR" or str_contains(str_lower(lines[i]), "exception") or str_contains(str_lower(lines[i]), "failed") {
+            _inc(counts, _normalize_error(lines[i]));
+        }
+    }
+    return _top_counts(counts, try args.limit catch 25);
+}
+
+fn _top_counts(counts, limit) {
+    let keys = map_keys(counts);
+    let used = map{};
+    let out = [];
+    let n = sec.clamp(limit, 1, 200);
+    for rank n {
+        let best = nil;
+        let best_count = -1;
+        for i len(keys) {
+            let k = keys[i];
+            if (try used[k] catch false) != true and counts[k] > best_count {
+                best = k;
+                best_count = counts[k];
+            }
+        }
+        if best != nil {
+            used[best] = true;
+            out[len(out)] = map{ pattern: best, count: best_count };
+        }
+    }
+    return out;
+}
+
+fn log_time_range_filter(args) {
+    let since = str(try args.since catch "");
+    let until = str(try args.until catch "");
+    let lines = _lines(_read(args));
+    let out = [];
+    let max_results = sec.clamp(try args.max_results catch 500, 1, 5000);
+    for i len(lines) {
+        if len(out) >= max_results { return out; }
+        let line = lines[i];
+        let ok = true;
+        if since != "" and line < since { ok = false; }
+        if until != "" and line > until { ok = false; }
+        if ok == true { out[len(out)] = map{ line: i + 1, text: line, level: _level(line) }; }
+    }
+    return out;
+}
+
+fn _export_csv(entries) {
+    let out = "index,level,text\n";
+    for i len(entries) {
+        let text = str_replace_all(str(try entries[i].text catch try entries[i].message catch entries[i]), "\"", "\"\"");
+        out = out + str(i) + ",\"" + str(try entries[i].level catch "") + "\",\"" + text + "\"\n";
+    }
+    return out;
+}
+
+fn _export_markdown(entries) {
+    let out = "| index | level | text |\n|---:|---|---|\n";
+    for i len(entries) {
+        let text = str_replace_all(str(try entries[i].text catch try entries[i].message catch entries[i]), "|", "\\|");
+        out = out + "| " + str(i) + " | " + str(try entries[i].level catch "") + " | " + text + " |\n";
+    }
+    return out;
+}
+
+fn log_export(args) {
+    sec.require_trusted("log export");
+    let entries = try args.entries catch [];
+    let format = str_lower(str(try args.format catch "json"));
+    let body = "";
+    if format == "csv" { body = _export_csv(entries); }
+    else if format == "md" or format == "markdown" { body = _export_markdown(entries); }
+    else { body = JSON.stringify(entries); }
+    let path = sec.safe_rel_path(try args.output_path catch "logs-export.json", "logs-export.json");
+    FS.write(path, body);
+    return map{ output_path: path, format: format, entries: len(entries), chars: len(body) };
+}
+
+fn log_audit_query(args) {
+    args.path = try args.path catch ".mint-mcp/audit/audit-log.jsonl";
+    return log_parse_json(args);
+}
+
+fn call_log(tool, args) {
+    if args == nil { args = map{}; }
+    if tool == "log_level_summary" { return log_level_summary(args); }
+    if tool == "log_search" { return log_search(args); }
+    if tool == "log_tail" { return log_tail(args); }
+    if tool == "log_parse_json" { return log_parse_json(args); }
+    if tool == "log_parse_nginx" { return log_parse_nginx(args); }
+    if tool == "log_parse_syslog" { return log_parse_syslog(args); }
+    if tool == "log_error_cluster" { return log_error_cluster(args); }
+    if tool == "log_time_range_filter" { return log_time_range_filter(args); }
+    if tool == "log_export" { return log_export(args); }
+    if tool == "log_audit_query" { return log_audit_query(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    return [
+        "log_level_summary",
+        "log_search",
+        "log_tail",
+        "log_parse_json",
+        "log_parse_nginx",
+        "log_parse_syslog",
+        "log_error_cluster",
+        "log_time_range_filter",
+        "log_export",
+        "log_audit_query",
+    ];
+}
+
+export implemented_tools, call_log,
+       log_level_summary, log_search, log_tail, log_parse_json,
+       log_parse_nginx, log_parse_syslog, log_error_cluster,
+       log_time_range_filter, log_export, log_audit_query;

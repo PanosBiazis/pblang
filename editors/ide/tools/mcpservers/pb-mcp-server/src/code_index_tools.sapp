@@ -1,0 +1,426 @@
+// Native pblang translation for lightweight persisted code index tools.
+
+let FS = import("stdlib:fs.sapp");
+let sec = import("src/security.sapp");
+let core = import("src/core_tools.sapp");
+let codebase = import("src/codebase_tools.sapp");
+
+let INDEX_PATH = ".mint-mcp/code-index.json";
+let MANIFEST_PATH = ".mint-mcp/file-manifest.jsonl";
+
+fn _now_ms() { return try now_ms() catch num_floor(clock() * 1000.0); }
+
+fn _basename(path) {
+    let parts = str_split(str_replace_all(str(path), "\\", "/"), "/");
+    if len(parts) == 0 { return str(path); }
+    return parts[len(parts) - 1];
+}
+
+fn _extension(path) {
+    let base = _basename(path);
+    let parts = str_split(base, ".");
+    if len(parts) <= 1 { return ""; }
+    return str_lower(parts[len(parts) - 1]);
+}
+
+fn _clip(s, max_chars) {
+    s = str(s);
+    max_chars = sec.clamp(max_chars, 0, sec.MAX_READ_CHARS);
+    if len(s) <= max_chars { return s; }
+    return str_slice(s, 0, max_chars);
+}
+
+fn _clean_name(s) {
+    s = str_trim(str(s));
+    let stops = ["(", "{", ":", "<", "=", " ", "\t"];
+    for i len(stops) {
+        let idx = str_index_of(s, stops[i]);
+        if idx >= 0 { s = str_slice(s, 0, idx); }
+    }
+    return str_trim(s);
+}
+
+fn _after_prefix(t, prefix) {
+    if str_starts_with(t, prefix) { return str_trim(str_slice(t, len(prefix), len(t))); }
+    return nil;
+}
+
+fn _symbol_from_line(t) {
+    let rest = _after_prefix(t, "fn ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "fn" }; }
+    rest = _after_prefix(t, "def ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "def" }; }
+    rest = _after_prefix(t, "class ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "class" }; }
+    rest = _after_prefix(t, "struct ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "struct" }; }
+    rest = _after_prefix(t, "enum ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "enum" }; }
+    rest = _after_prefix(t, "trait ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "trait" }; }
+    rest = _after_prefix(t, "impl ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "impl" }; }
+    rest = _after_prefix(t, "function ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "function" }; }
+    rest = _after_prefix(t, "export function ");
+    if rest != nil { return map{ name: _clean_name(rest), kind: "function" }; }
+    rest = _after_prefix(t, "const ");
+    if rest != nil and str_contains(rest, "=>") { return map{ name: _clean_name(rest), kind: "const-fn" }; }
+    return nil;
+}
+
+fn _extract_symbols(path, raw, max_symbols_per_file) {
+    let lines = str_split(str(raw), "\n");
+    let out = [];
+    max_symbols_per_file = sec.clamp(max_symbols_per_file, 1, 1000);
+    for i len(lines) {
+        if len(out) >= max_symbols_per_file { return out; }
+        let t = str_trim(lines[i]);
+        let sym = _symbol_from_line(t);
+        if sym != nil and sym.name != "" {
+            out[len(out)] = map{ name: sym.name, kind: sym.kind, path: path, line: i + 1, text: _clip(t, 240) };
+        }
+    }
+    return out;
+}
+
+fn _ensure_dir() {
+    sec.require_trusted("code index write");
+    FS.mkdirs(".mint-mcp");
+    return true;
+}
+
+fn _load_index() {
+    let raw = try FS.read(INDEX_PATH) catch nil;
+    if type(raw) != "string" { return nil; }
+    return try json_parse(raw) catch nil;
+}
+
+fn _save_index(idx) {
+    _ensure_dir();
+    FS.write(INDEX_PATH, json_stringify(idx));
+    return idx;
+}
+
+fn code_index_build(args) {
+    if args == nil { args = map{}; }
+    _ensure_dir();
+    let dir = sec.safe_rel_path(try args.dir catch try args.path catch ".", ".");
+    let max_files = sec.clamp(try args.max_files catch try args.max_entries catch 500, 1, sec.MAX_LIST_ENTRIES);
+    let max_depth = sec.clamp(try args.max_depth catch 8, 0, sec.MAX_DEPTH);
+    let sample_chars = sec.clamp(try args.sample_chars catch 80000, 128, sec.MAX_READ_CHARS);
+    let paths = codebase.codebase_path_list(map{ dir: dir, max_entries: max_files, max_depth: max_depth });
+    let files = [];
+    let symbol_count = 0;
+    for i len(paths) {
+        let path = paths[i];
+        let raw = try FS.read(path) catch "";
+        let bytes = try FS.size(path) catch len(raw);
+        let sample = _clip(raw, sample_chars);
+        let syms = _extract_symbols(path, sample, try args.max_symbols_per_file catch 200);
+        symbol_count = symbol_count + len(syms);
+        files[len(files)] = map{ path: path, bytes: bytes, ext: _extension(path), symbols: syms };
+    }
+    let idx = map{
+        format: "pb-mcp.code-index.pblang.v1",
+        generated_ms: _now_ms(),
+        root: try cwd() catch ".",
+        source_dir: dir,
+        file_count: len(files),
+        symbol_count: symbol_count,
+        files: files,
+    };
+    _save_index(idx);
+    return map{ ok: true, path: INDEX_PATH, file_count: idx.file_count, symbol_count: idx.symbol_count };
+}
+
+fn code_index_status(args) {
+    let exists = try FS.exists(INDEX_PATH) catch false;
+    if exists != true { return map{ exists: false, path: INDEX_PATH }; }
+    let idx = _load_index();
+    if idx == nil { return map{ exists: true, path: INDEX_PATH, ok: false, error: "index exists but cannot be parsed" }; }
+    return map{ exists: true, path: INDEX_PATH, ok: true, format: try idx.format catch "", file_count: try idx.file_count catch len(try idx.files catch []), symbol_count: try idx.symbol_count catch 0, generated_ms: try idx.generated_ms catch nil };
+}
+
+fn _files(idx) {
+    if idx == nil { return []; }
+    return try idx.files catch [];
+}
+
+fn _match_symbol(sym, q) {
+    let hay = str_lower(str(sym.name) + " " + str(sym.kind) + " " + str(sym.path) + " " + str(sym.text));
+    return q == "" or str_contains(hay, q);
+}
+
+fn code_index_search(args) {
+    if args == nil { args = map{}; }
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first", path: INDEX_PATH }; }
+    let q = str_lower(str(try args.query catch try args.q catch ""));
+    let limit = sec.clamp(try args.limit catch try args.max_results catch 50, 1, 1000);
+    let out = [];
+    let files = _files(idx);
+    for i len(files) {
+        if len(out) >= limit { return map{ ok: true, query: q, matches: out }; }
+        let f = files[i];
+        if q == "" or str_contains(str_lower(f.path), q) {
+            out[len(out)] = map{ kind: "path", path: f.path, bytes: f.bytes, ext: f.ext };
+        }
+        let syms = try f.symbols catch [];
+        for j len(syms) {
+            if len(out) >= limit { return map{ ok: true, query: q, matches: out }; }
+            if _match_symbol(syms[j], q) { out[len(out)] = map{ kind: "symbol", path: f.path, symbol: syms[j] }; }
+        }
+    }
+    return map{ ok: true, query: q, matches: out };
+}
+
+fn code_index_file_symbols(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let path = sec.safe_rel_path(try args.path catch "", "");
+    let files = _files(idx);
+    for i len(files) {
+        if files[i].path == path { return map{ ok: true, path: path, symbols: try files[i].symbols catch [] }; }
+    }
+    return map{ ok: false, path: path, error: "path not found in index" };
+}
+
+fn code_index_paths_prefix(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let prefix = str(try args.prefix catch "");
+    let limit = sec.clamp(try args.limit catch 200, 1, 2000);
+    let out = [];
+    let files = _files(idx);
+    for i len(files) {
+        if len(out) >= limit { return out; }
+        if prefix == "" or str_starts_with(files[i].path, prefix) { out[len(out)] = files[i].path; }
+    }
+    return out;
+}
+
+fn code_index_path_substring(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let q = str_lower(str(try args.substring catch try args.query catch ""));
+    let limit = sec.clamp(try args.limit catch 200, 1, 2000);
+    let out = [];
+    let files = _files(idx);
+    for i len(files) {
+        if len(out) >= limit { return out; }
+        if q == "" or str_contains(str_lower(files[i].path), q) { out[len(out)] = files[i].path; }
+    }
+    return out;
+}
+
+fn code_index_symbol_prefix(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let prefix = str(try args.prefix catch "");
+    let case_sensitive = try args.case_sensitive catch false;
+    let cmp_prefix = if case_sensitive == true { prefix } else { str_lower(prefix) };
+    let seen = map{};
+    let out = [];
+    let files = _files(idx);
+    for i len(files) {
+        let syms = try files[i].symbols catch [];
+        for j len(syms) {
+            let name = str(syms[j].name);
+            let cmp = if case_sensitive == true { name } else { str_lower(name) };
+            if (prefix == "" or str_starts_with(cmp, cmp_prefix)) and (try seen[name] catch false) != true {
+                seen[name] = true;
+                out[len(out)] = name;
+            }
+        }
+    }
+    return out;
+}
+
+fn code_index_paths_without_symbols(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let out = [];
+    let files = _files(idx);
+    for i len(files) {
+        if len(try files[i].symbols catch []) == 0 { out[len(out)] = files[i].path; }
+    }
+    return out;
+}
+
+fn code_index_extension_histogram(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let hist = map{};
+    let files = _files(idx);
+    for i len(files) {
+        let ext = try files[i].ext catch "";
+        if ext == "" { ext = "[none]"; }
+        let cur = try hist[ext] catch 0;
+        hist[ext] = cur + 1;
+    }
+    return hist;
+}
+
+fn code_index_symbol_frequency(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let freq = map{};
+    let files = _files(idx);
+    for i len(files) {
+        let syms = try files[i].symbols catch [];
+        for j len(syms) {
+            let name = str(syms[j].name);
+            let cur = try freq[name] catch 0;
+            freq[name] = cur + 1;
+        }
+    }
+    return _top_counts(freq, try args.limit catch 50);
+}
+
+fn _top_counts(counts, limit) {
+    let keys = map_keys(counts);
+    let used = map{};
+    let out = [];
+    let n = sec.clamp(limit, 1, 500);
+    for rank n {
+        let best = nil;
+        let best_count = -1;
+        for i len(keys) {
+            let k = keys[i];
+            if (try used[k] catch false) != true and counts[k] > best_count {
+                best = k;
+                best_count = counts[k];
+            }
+        }
+        if best != nil {
+            used[best] = true;
+            out[len(out)] = map{ name: best, count: best_count };
+        }
+    }
+    return out;
+}
+
+fn _unique_push(arr, value) {
+    for i len(arr) { if arr[i] == value { return arr; } }
+    arr[len(arr)] = value;
+    return arr;
+}
+
+fn code_index_duplicate_symbols(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let min_files = sec.clamp(try args.min_files catch 2, 2, 1000);
+    let paths_by_symbol = map{};
+    let files = _files(idx);
+    for i len(files) {
+        let syms = try files[i].symbols catch [];
+        for j len(syms) {
+            let name = str(syms[j].name);
+            let arr = try paths_by_symbol[name] catch [];
+            arr = _unique_push(arr, files[i].path);
+            paths_by_symbol[name] = arr;
+        }
+    }
+    let out = [];
+    let keys = map_keys(paths_by_symbol);
+    for i len(keys) {
+        let arr = paths_by_symbol[keys[i]];
+        if len(arr) >= min_files { out[len(out)] = map{ symbol: keys[i], files: arr, file_count: len(arr) }; }
+    }
+    return out;
+}
+
+fn code_index_aggregate_stats(args) {
+    let idx = _load_index();
+    if idx == nil { return map{ ok: false, error: "run code_index_build first" }; }
+    let files = _files(idx);
+    let rows = [];
+    let total_symbols = 0;
+    for i len(files) {
+        let syms = try files[i].symbols catch [];
+        total_symbols = total_symbols + len(syms);
+        rows[len(rows)] = map{ path: files[i].path, symbol_count: len(syms), bytes: try files[i].bytes catch 0 };
+    }
+    return map{ ok: true, files: len(files), symbols: total_symbols, top_files: _top_symbol_files(rows, try args.limit catch 20) };
+}
+
+fn _top_symbol_files(rows, limit) {
+    let used = map{};
+    let out = [];
+    let n = sec.clamp(limit, 1, 200);
+    for rank n {
+        let best = -1;
+        let best_i = -1;
+        for i len(rows) {
+            if (try used[str(i)] catch false) != true and rows[i].symbol_count > best {
+                best = rows[i].symbol_count;
+                best_i = i;
+            }
+        }
+        if best_i >= 0 {
+            used[str(best_i)] = true;
+            out[len(out)] = rows[best_i];
+        }
+    }
+    return out;
+}
+
+fn codebase_manifest_write(args) {
+    if args == nil { args = map{}; }
+    _ensure_dir();
+    let dir = sec.safe_rel_path(try args.dir catch try args.path catch ".", ".");
+    let paths = codebase.codebase_path_list(map{ dir: dir, max_entries: try args.max_entries catch 1000, max_depth: try args.max_depth catch 8 });
+    let out = "";
+    for i len(paths) {
+        let row = map{ path: paths[i], bytes: try FS.size(paths[i]) catch 0, mtime_ms: nil };
+        out = out + json_stringify(row) + "\n";
+    }
+    let out_path = sec.safe_rel_path(try args.output_path catch MANIFEST_PATH, MANIFEST_PATH);
+    FS.write(out_path, out);
+    return map{ ok: true, path: out_path, files: len(paths), format: "jsonl" };
+}
+
+fn call_code_index(tool, args) {
+    if args == nil { args = map{}; }
+    if tool == "code_index_build" { return code_index_build(args); }
+    if tool == "code_index_status" { return code_index_status(args); }
+    if tool == "code_index_search" { return code_index_search(args); }
+    if tool == "code_index_file_symbols" { return code_index_file_symbols(args); }
+    if tool == "code_index_paths_prefix" { return code_index_paths_prefix(args); }
+    if tool == "code_index_path_substring" { return code_index_path_substring(args); }
+    if tool == "code_index_symbol_prefix" { return code_index_symbol_prefix(args); }
+    if tool == "code_index_paths_without_symbols" { return code_index_paths_without_symbols(args); }
+    if tool == "code_index_extension_histogram" { return code_index_extension_histogram(args); }
+    if tool == "code_index_symbol_frequency" { return code_index_symbol_frequency(args); }
+    if tool == "code_index_duplicate_symbols" { return code_index_duplicate_symbols(args); }
+    if tool == "code_index_aggregate_stats" { return code_index_aggregate_stats(args); }
+    if tool == "codebase_manifest_write" { return codebase_manifest_write(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    return [
+        "code_index_build",
+        "code_index_status",
+        "code_index_search",
+        "code_index_file_symbols",
+        "code_index_paths_prefix",
+        "code_index_path_substring",
+        "code_index_symbol_prefix",
+        "code_index_paths_without_symbols",
+        "code_index_extension_histogram",
+        "code_index_symbol_frequency",
+        "code_index_duplicate_symbols",
+        "code_index_aggregate_stats",
+        "codebase_manifest_write",
+    ];
+}
+
+export implemented_tools, call_code_index,
+       code_index_build, code_index_status, code_index_search,
+       code_index_file_symbols, code_index_paths_prefix,
+       code_index_path_substring, code_index_symbol_prefix,
+       code_index_paths_without_symbols, code_index_extension_histogram,
+       code_index_symbol_frequency, code_index_duplicate_symbols,
+       code_index_aggregate_stats, codebase_manifest_write;

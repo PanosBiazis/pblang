@@ -1,0 +1,340 @@
+// Native pblang deterministic AI helper fallbacks.
+//
+// These tools do not call Ollama or external providers. They provide lexical,
+// schema, and scoring fallbacks so the pblang port remains useful and honest.
+
+let FS = import("stdlib:fs.sapp");
+let sec = import("src/security.sapp");
+let texttools = import("src/text_tools.sapp");
+let context = import("src/context_tools.sapp");
+
+fn _lower(v) { return str_lower(str(v)); }
+
+fn _words(s) {
+    s = _lower(s);
+    let clean = "";
+    let allowed = "abcdefghijklmnopqrstuvwxyz0123456789_ ";
+    for i len(s) {
+        let ch = str_slice(s, i, i + 1);
+        if str_contains(allowed, ch) { clean = clean + ch; }
+        else { clean = clean + " "; }
+    }
+    let raw = str_split(clean, " ");
+    let out = [];
+    for i len(raw) {
+        let w = str_trim(raw[i]);
+        if w != "" { out[len(out)] = w; }
+    }
+    return out;
+}
+
+fn _contains(arr, value) {
+    for i len(arr) { if arr[i] == value { return true; } }
+    return false;
+}
+
+fn _word_overlap(a, b) {
+    let aw = _words(a);
+    let bw = _words(b);
+    if len(aw) == 0 or len(bw) == 0 { return 0.0; }
+    let inter = 0;
+    let union = [];
+    for i len(aw) {
+        if not _contains(union, aw[i]) { union[len(union)] = aw[i]; }
+        if _contains(bw, aw[i]) { inter = inter + 1; }
+    }
+    for i len(bw) {
+        if not _contains(union, bw[i]) { union[len(union)] = bw[i]; }
+    }
+    if len(union) == 0 { return 0.0; }
+    return inter / len(union);
+}
+
+fn _label_score(text, label) {
+    let t = _lower(text);
+    let l = _lower(label);
+    let score = _word_overlap(t, l);
+    if str_contains(t, l) { return score + 1.0; }
+    return score;
+}
+
+fn ai_zero_shot_classify(args) {
+    if args == nil { args = map{}; }
+    let input = str(try args.text catch try args.input catch "");
+    let labels = try args.labels catch try args.classes catch [];
+    let out = [];
+    let best = "";
+    let best_score = -1.0;
+    for i len(labels) {
+        let label = str(labels[i]);
+        let score = _label_score(input, label);
+        out[len(out)] = map{ label: label, score: score };
+        if score > best_score {
+            best = label;
+            best_score = score;
+        }
+    }
+    return map{ label: best, confidence: best_score, scores: out, method: "pblang-lexical-zero-shot" };
+}
+
+fn ai_few_shot_classify(args) {
+    if args == nil { args = map{}; }
+    let input = str(try args.text catch try args.input catch "");
+    let examples = try args.examples catch [];
+    let scores = map{};
+    for i len(examples) {
+        let ex = examples[i];
+        let label = str(try ex.label catch try ex.class catch "");
+        let sample = str(try ex.text catch try ex.input catch "");
+        if label != "" {
+            let cur = try scores[label] catch 0.0;
+            scores[label] = cur + _word_overlap(input, sample);
+        }
+    }
+    let keys = map_keys(scores);
+    let best = "";
+    let best_score = -1.0;
+    for i len(keys) {
+        if scores[keys[i]] > best_score {
+            best = keys[i];
+            best_score = scores[keys[i]];
+        }
+    }
+    return map{ label: best, confidence: best_score, scores: scores, method: "pblang-lexical-few-shot" };
+}
+
+fn ai_semantic_search(args) {
+    if args == nil { args = map{}; }
+    let query = str(try args.query catch "");
+    let docs = try args.documents catch try args.docs catch [];
+    let rows = [];
+    for i len(docs) {
+        let doc = if type(docs[i]) == "map" { str(try docs[i].text catch try docs[i].content catch "") } else { str(docs[i]) };
+        rows[len(rows)] = map{ index: i, score: _word_overlap(query, doc), text: doc };
+    }
+    return _top_rows(rows, try args.limit catch 10);
+}
+
+fn _top_rows(rows, limit) {
+    let used = map{};
+    let out = [];
+    let n = sec.clamp(limit, 1, 200);
+    for rank n {
+        let best = -1;
+        let best_i = -1;
+        for i len(rows) {
+            if (try used[str(i)] catch false) != true and rows[i].score > best {
+                best = rows[i].score;
+                best_i = i;
+            }
+        }
+        if best_i >= 0 {
+            used[str(best_i)] = true;
+            out[len(out)] = rows[best_i];
+        }
+    }
+    return out;
+}
+
+fn ai_cluster_texts(args) {
+    if args == nil { args = map{}; }
+    let docs = try args.texts catch try args.documents catch [];
+    let threshold = try args.threshold catch 0.25;
+    let clusters = [];
+    for i len(docs) {
+        let doc = str(docs[i]);
+        let placed = false;
+        for c len(clusters) {
+            if placed != true {
+                let rep = str(clusters[c].representative);
+                if _word_overlap(doc, rep) >= threshold {
+                    let members = clusters[c].members;
+                    members[len(members)] = i;
+                    clusters[c].members = members;
+                    placed = true;
+                }
+            }
+        }
+        if placed != true {
+            clusters[len(clusters)] = map{ representative: doc, members: [i] };
+        }
+    }
+    return map{ clusters: clusters, method: "pblang-lexical-overlap" };
+}
+
+fn ai_embed_text(args) {
+    if args == nil { args = map{}; }
+    let input = str(try args.text catch "");
+    let dims = sec.clamp(try args.dimensions catch 16, 4, 128);
+    let vec = [];
+    for i dims { vec[len(vec)] = 0.0; }
+    let words = _words(input);
+    for i len(words) {
+        let h = texttools.text_djb2_hash(words[i]);
+        let n = try parse_number(h) catch i;
+        let idx = n % dims;
+        vec[idx] = vec[idx] + 1.0;
+    }
+    return map{ embedding: vec, dimensions: dims, method: "pblang-hash-bag-of-words" };
+}
+
+fn ai_structured_extract(args) {
+    if args == nil { args = map{}; }
+    let input = str(try args.text catch try args.input catch "");
+    let schema = try args.schema catch map{};
+    let fields = try schema.fields catch try args.fields catch [];
+    let out = map{};
+    let lines = str_split(input, "\n");
+    for f len(fields) {
+        let name = str(if type(fields[f]) == "map" { try fields[f].name catch "" } else { fields[f] });
+        let value = nil;
+        for i len(lines) {
+            let line = lines[i];
+            let prefix = name + ":";
+            if str_starts_with(_lower(str_trim(line)), _lower(prefix)) {
+                value = str_trim(str_slice(line, len(prefix), len(line)));
+            }
+        }
+        out[name] = value;
+    }
+    return map{ data: out, method: "pblang-key-value-extract" };
+}
+
+fn ai_verify_factual(args) {
+    if args == nil { args = map{}; }
+    let claim = str(try args.claim catch "");
+    let refs = try args.references catch try args.documents catch [];
+    let evidence = [];
+    for i len(refs) {
+        let r = str(refs[i]);
+        if _word_overlap(claim, r) > 0.2 or str_contains(_lower(r), _lower(claim)) {
+            evidence[len(evidence)] = map{ index: i, text: r, score: _word_overlap(claim, r) };
+        }
+    }
+    let verdict = if len(evidence) > 0 { "supported" } else { "unverifiable" };
+    return map{ verdict: verdict, evidence: evidence, method: "pblang-lexical-reference-check" };
+}
+
+fn ai_rewrite_style(args) {
+    if args == nil { args = map{}; }
+    let input = str(try args.text catch "");
+    let style = _lower(try args.style catch "concise");
+    let out = input;
+    if style == "concise" { out = texttools.compress_sentences(input, 3, try args.max_chars catch 800); }
+    else if style == "eli5" { out = "Simple version: " + texttools.compress_sentences(input, 4, try args.max_chars catch 1000); }
+    else if style == "technical" { out = "Technical summary: " + texttools.compress_sentences(input, 6, try args.max_chars catch 1400); }
+    else { out = texttools.compress_sentences(input, 5, try args.max_chars catch 1200); }
+    return map{ text: out, style: style, method: "pblang-deterministic-rewrite" };
+}
+
+fn ai_self_critique(args) {
+    if args == nil { args = map{}; }
+    let response = str(try args.response catch try args.text catch "");
+    let issues = [];
+    if len(response) < 20 { issues[len(issues)] = "response is very short"; }
+    if not str_contains(response, ".") { issues[len(issues)] = "response may lack complete sentences"; }
+    if str_contains(_lower(response), "maybe") or str_contains(_lower(response), "probably") { issues[len(issues)] = "uncertainty markers present"; }
+    return map{ critique: issues, improved: texttools.compress_sentences(response, 5, try args.max_chars catch 1200), method: "pblang-rule-critique" };
+}
+
+fn ai_chain_of_thought(args) {
+    if args == nil { args = map{}; }
+    let q = str(try args.question catch try args.prompt catch "");
+    return map{
+        question: q,
+        reasoning_outline: ["identify task type", "list known facts", "check for missing evidence", "return concise conclusion"],
+        conclusion: "Use explicit evidence and verification for: " + q,
+        method: "pblang-reasoning-outline",
+    };
+}
+
+fn ai_debate(args) {
+    if args == nil { args = map{}; }
+    let topic = str(try args.topic catch try args.prompt catch "");
+    return map{
+        topic: topic,
+        pro: "Best argument for: " + topic,
+        con: "Best argument against: " + topic,
+        synthesis: "Compare evidence, risks, and reversibility before deciding.",
+        method: "pblang-deterministic-debate-template",
+    };
+}
+
+fn ai_multi_model_compare(args) {
+    if args == nil { args = map{}; }
+    let models = try args.models catch ["pblang-local-fallback"];
+    let prompt = str(try args.prompt catch "");
+    let out = [];
+    for i len(models) {
+        out[len(out)] = map{ model: str(models[i]), output: "No external model called. Prompt length=" + str(len(prompt)), latency_ms: 0 };
+    }
+    return map{ comparisons: out, external_calls: false };
+}
+
+fn ai_context_pack_smart(args) {
+    if args == nil { args = map{}; }
+    let paths = try args.paths catch try args.files catch [];
+    let segments = [];
+    let labels = [];
+    let max_each = sec.clamp(try args.max_chars_each catch 4000, 1, sec.MAX_READ_CHARS);
+    for i len(paths) {
+        let p = sec.safe_rel_path(paths[i], "");
+        let raw = try FS.read(p) catch "";
+        if len(raw) > max_each { raw = str_slice(raw, 0, max_each); }
+        segments[len(segments)] = raw;
+        labels[len(labels)] = p;
+    }
+    return context.pack_context(map{ segments: segments, segment_labels: labels, max_chars: try args.max_chars catch try args.token_budget catch 12000 });
+}
+
+fn ai_stack_probe(args) {
+    return map{
+        external_probes_run: false,
+        reason: "pblang fallback does not execute CLIs; use terminal_program_version with explicit allowlist for live probing",
+        known_optional_tools: ["python3", "tesseract", "ollama", "ffmpeg", "codex", "claude", "aider", "gemini"],
+    };
+}
+
+fn call_ai(tool, args) {
+    if tool == "ai_zero_shot_classify" { return ai_zero_shot_classify(args); }
+    if tool == "ai_few_shot_classify" { return ai_few_shot_classify(args); }
+    if tool == "ai_semantic_search" { return ai_semantic_search(args); }
+    if tool == "ai_cluster_texts" { return ai_cluster_texts(args); }
+    if tool == "ai_embed_text" { return ai_embed_text(args); }
+    if tool == "ai_structured_extract" { return ai_structured_extract(args); }
+    if tool == "ai_verify_factual" { return ai_verify_factual(args); }
+    if tool == "ai_rewrite_style" { return ai_rewrite_style(args); }
+    if tool == "ai_self_critique" { return ai_self_critique(args); }
+    if tool == "ai_chain_of_thought" { return ai_chain_of_thought(args); }
+    if tool == "ai_debate" { return ai_debate(args); }
+    if tool == "ai_multi_model_compare" { return ai_multi_model_compare(args); }
+    if tool == "ai_context_pack_smart" { return ai_context_pack_smart(args); }
+    if tool == "ai_stack_probe" { return ai_stack_probe(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    return [
+        "ai_zero_shot_classify",
+        "ai_few_shot_classify",
+        "ai_semantic_search",
+        "ai_cluster_texts",
+        "ai_embed_text",
+        "ai_structured_extract",
+        "ai_verify_factual",
+        "ai_rewrite_style",
+        "ai_self_critique",
+        "ai_chain_of_thought",
+        "ai_debate",
+        "ai_multi_model_compare",
+        "ai_context_pack_smart",
+        "ai_stack_probe",
+    ];
+}
+
+export implemented_tools, call_ai,
+       ai_zero_shot_classify, ai_few_shot_classify, ai_semantic_search,
+       ai_cluster_texts, ai_embed_text, ai_structured_extract,
+       ai_verify_factual, ai_rewrite_style, ai_self_critique,
+       ai_chain_of_thought, ai_debate, ai_multi_model_compare,
+       ai_context_pack_smart, ai_stack_probe;
