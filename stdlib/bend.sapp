@@ -1,0 +1,235 @@
+// stdlib/bend.sapp — Bend-inspired parallel recursion helpers for pblang.
+//
+// Bend's key practical idea is that tree-shaped, divide-and-conquer programs
+// expose parallel work naturally. This module brings that model to pblang as a
+// library layer over the existing spawn/join runtime instead of adding risky
+// syntax first.
+
+fn _min(a, b) { if a < b { return a; } return b; }
+
+fn _max(a, b) { if a > b { return a; } return b; }
+
+fn leaf(value) {
+    return map{ kind: "Leaf", value: value };
+}
+
+fn node(left, right, value = nil) {
+    return map{ kind: "Node", left: left, right: right, value: value };
+}
+
+fn is_leaf(tree) {
+    return type(tree) == "map" and (try tree.kind catch "") == "Leaf";
+}
+
+fn is_node(tree) {
+    return type(tree) == "map" and (try tree.kind catch "") == "Node";
+}
+
+// fork_pair(left_fn, right_fn) evaluates two independent thunks concurrently
+// when the runtime can safely transfer the closures. If a closure captures an
+// open upvalue, pblang rejects the spawn; fall back to sequential execution.
+fn fork_pair(left_fn, right_fn) {
+    let pair = try {
+        let lh = spawn(fn() { return left_fn(); });
+        let rh = spawn(fn() { return right_fn(); });
+        let lv = join(lh);
+        let rv = join(rh);
+        [lv, rv]
+    } catch [left_fn(), right_fn()];
+    return pair;
+}
+
+// bend_tree builds a binary tree from a seed until pred(seed) is false or depth
+// is exhausted. The left_seed/right_seed/value_fn functions define the shape.
+fn bend_tree(seed, pred, left_seed, right_seed, value_fn, max_depth = 32) {
+    if max_depth <= 0 or not pred(seed) {
+        return leaf(value_fn(seed));
+    }
+    let l = bend_tree(left_seed(seed), pred, left_seed, right_seed, value_fn, max_depth - 1);
+    let r = bend_tree(right_seed(seed), pred, left_seed, right_seed, value_fn, max_depth - 1);
+    return node(l, r, seed);
+}
+
+// Parallel version. parallel_depth limits the number of recursive levels that
+// spawn work so a small input cannot create unbounded threads.
+fn bend_tree_parallel(seed, pred, left_seed, right_seed, value_fn, max_depth = 32, parallel_depth = 4) {
+    if max_depth <= 0 or not pred(seed) {
+        return leaf(value_fn(seed));
+    }
+    if parallel_depth <= 0 {
+        return bend_tree(seed, pred, left_seed, right_seed, value_fn, max_depth);
+    }
+    let pair = fork_pair(
+        fn() { return bend_tree_parallel(left_seed(seed), pred, left_seed, right_seed, value_fn, max_depth - 1, parallel_depth - 1); },
+        fn() { return bend_tree_parallel(right_seed(seed), pred, left_seed, right_seed, value_fn, max_depth - 1, parallel_depth - 1); }
+    );
+    return node(pair[0], pair[1], seed);
+}
+
+fn fold_tree(tree, leaf_fn, node_fn) {
+    if is_leaf(tree) { return leaf_fn(tree.value); }
+    if is_node(tree) {
+        let l = fold_tree(tree.left, leaf_fn, node_fn);
+        let r = fold_tree(tree.right, leaf_fn, node_fn);
+        return node_fn(try tree.value catch nil, l, r);
+    }
+    return leaf_fn(tree);
+}
+
+fn fold_tree_parallel(tree, leaf_fn, node_fn, parallel_depth = 4) {
+    if is_leaf(tree) { return leaf_fn(tree.value); }
+    if not is_node(tree) { return leaf_fn(tree); }
+    if parallel_depth <= 0 {
+        return fold_tree(tree, leaf_fn, node_fn);
+    }
+    let pair = fork_pair(
+        fn() { return fold_tree_parallel(tree.left, leaf_fn, node_fn, parallel_depth - 1); },
+        fn() { return fold_tree_parallel(tree.right, leaf_fn, node_fn, parallel_depth - 1); }
+    );
+    return node_fn(try tree.value catch nil, pair[0], pair[1]);
+}
+
+fn map_tree(tree, f) {
+    if is_leaf(tree) { return leaf(f(tree.value)); }
+    if is_node(tree) {
+        return node(map_tree(tree.left, f), map_tree(tree.right, f), try tree.value catch nil);
+    }
+    return f(tree);
+}
+
+fn tree_sum(tree) {
+    return fold_tree(tree, fn(v) { return v; }, fn(seed, l, r) { return l + r; });
+}
+
+fn tree_count(tree) {
+    return fold_tree(tree, fn(v) { return 1; }, fn(seed, l, r) { return 1 + l + r; });
+}
+
+// divide_reduce reduces an integer half-open range [start, end) by splitting it
+// into independent halves. item_fn(i) maps an index to a value. combine(a,b)
+// combines two partial results.
+fn divide_reduce(start, end, item_fn, combine, identity, grain = 1) {
+    if end <= start { return identity; }
+    if end - start <= grain {
+        let acc = identity;
+        let i = start;
+        while i < end {
+            acc = combine(acc, item_fn(i));
+            i = i + 1;
+        }
+        return acc;
+    }
+    let mid = num_floor((start + end) / 2);
+    let l = divide_reduce(start, mid, item_fn, combine, identity, grain);
+    let r = divide_reduce(mid, end, item_fn, combine, identity, grain);
+    return combine(l, r);
+}
+
+fn divide_reduce_parallel(start, end, item_fn, combine, identity, grain = 1, parallel_depth = 4) {
+    if end <= start { return identity; }
+    if parallel_depth <= 0 or end - start <= grain {
+        return divide_reduce(start, end, item_fn, combine, identity, grain);
+    }
+    let mid = num_floor((start + end) / 2);
+    let pair = fork_pair(
+        fn() { return divide_reduce_parallel(start, mid, item_fn, combine, identity, grain, parallel_depth - 1); },
+        fn() { return divide_reduce_parallel(mid, end, item_fn, combine, identity, grain, parallel_depth - 1); }
+    );
+    return combine(pair[0], pair[1]);
+}
+
+fn range_sum(start, end) {
+    return divide_reduce(start, end, fn(i) { return i; }, fn(a, b) { return a + b; }, 0, 64);
+}
+
+fn range_sum_parallel(start, end, parallel_depth = 4) {
+    return divide_reduce_parallel(start, end, fn(i) { return i; }, fn(a, b) { return a + b; }, 0, 64, parallel_depth);
+}
+
+fn parallel_map(items, f, parallel_depth = 4) {
+    return _parallel_map_range(items, f, 0, len(items), parallel_depth);
+}
+
+fn _parallel_map_range(items, f, start, end, parallel_depth) {
+    if end <= start { return []; }
+    if parallel_depth <= 0 or end - start <= 1 {
+        let out = [];
+        let i = start;
+        while i < end {
+            out[len(out)] = f(items[i]);
+            i = i + 1;
+        }
+        return out;
+    }
+    let mid = num_floor((start + end) / 2);
+    let pair = fork_pair(
+        fn() { return _parallel_map_range(items, f, start, mid, parallel_depth - 1); },
+        fn() { return _parallel_map_range(items, f, mid, end, parallel_depth - 1); }
+    );
+    let out = pair[0];
+    for i len(pair[1]) { out[len(out)] = pair[1][i]; }
+    return out;
+}
+
+fn parallel_filter(items, pred, parallel_depth = 4) {
+    let mapped = parallel_map(items, fn(x) {
+        if pred(x) { return map{ keep: true, value: x }; }
+        return map{ keep: false, value: nil };
+    }, parallel_depth);
+    let out = [];
+    for i len(mapped) {
+        if mapped[i].keep == true { out[len(out)] = mapped[i].value; }
+    }
+    return out;
+}
+
+fn _merge(left, right, less) {
+    let out = [];
+    let i = 0;
+    let j = 0;
+    while i < len(left) and j < len(right) {
+        if less(left[i], right[j]) {
+            out[len(out)] = left[i];
+            i = i + 1;
+        } else {
+            out[len(out)] = right[j];
+            j = j + 1;
+        }
+    }
+    while i < len(left) { out[len(out)] = left[i]; i = i + 1; }
+    while j < len(right) { out[len(out)] = right[j]; j = j + 1; }
+    return out;
+}
+
+fn divide_sort(items, less, parallel_depth = 4) {
+    if len(items) <= 1 { return items; }
+    let mid = num_floor(len(items) / 2);
+    let left = [];
+    let right = [];
+    for i len(items) {
+        if i < mid { left[len(left)] = items[i]; }
+        else { right[len(right)] = items[i]; }
+    }
+    if parallel_depth <= 0 {
+        return _merge(divide_sort(left, less, 0), divide_sort(right, less, 0), less);
+    }
+    let pair = fork_pair(
+        fn() { return divide_sort(left, less, parallel_depth - 1); },
+        fn() { return divide_sort(right, less, parallel_depth - 1); }
+    );
+    return _merge(pair[0], pair[1], less);
+}
+
+fn runtime_model() {
+    return map{
+        inspired_by: "Bend/HVM style: expose parallelism through pure tree-shaped divide-and-conquer work",
+        pblang_layer: "stdlib library over spawn/join; no syntax change required",
+        safety: "parallel_depth and grain prevent unbounded thread creation; open-upvalue spawn failures fall back to sequential work",
+        gpu_boundary: "no CUDA/HVM backend here; pblang can add a backend later after benchmarks and IR work",
+    };
+}
+
+export leaf, node, is_leaf, is_node, fork_pair, bend_tree, bend_tree_parallel,
+       fold_tree, fold_tree_parallel, map_tree, tree_sum, tree_count,
+       divide_reduce, divide_reduce_parallel, range_sum, range_sum_parallel,
+       parallel_map, parallel_filter, divide_sort, runtime_model;
