@@ -41,16 +41,27 @@ fn ctranspiler_runtime_json_parse_and_stringify_work() {
     } else {
         exe_base
     };
-    let run = Command::new(&exe).output().expect("run generated native executable");
+    let run = Command::new(&exe)
+        .output()
+        .expect("run generated native executable");
     assert!(
         run.status.success(),
         "generated executable failed: stderr={}",
         String::from_utf8_lossy(&run.stderr)
     );
     let stdout = String::from_utf8_lossy(&run.stdout);
-    assert!(stdout.contains("2\n"), "array value should print, stdout={stdout:?}");
-    assert!(stdout.contains("true\n"), "bool value should print, stdout={stdout:?}");
-    assert!(stdout.contains("x\\ny\n") || stdout.contains("x\ny\n"), "escaped string should print, stdout={stdout:?}");
+    assert!(
+        stdout.contains("2\n"),
+        "array value should print, stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("true\n"),
+        "bool value should print, stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("x\\ny\n") || stdout.contains("x\ny\n"),
+        "escaped string should print, stdout={stdout:?}"
+    );
     assert!(
         stdout.contains("1\n"),
         "function parameter/local variable access should print, stdout={stdout:?}"
