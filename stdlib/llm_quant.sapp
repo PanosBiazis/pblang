@@ -1,5 +1,37 @@
 // stdlib/llm_quant.sapp -- efficient inference helpers and quantized matvec.
 
+let core = import("stdlib:llm_core.sapp");
+
+fn _abs(x) {
+    if x < 0 { return 0.0 - x; }
+    return x;
+}
+
+fn _round(x) {
+    if x >= 0 { return num_floor(x + 0.5); }
+    return 0 - num_floor((0.0 - x) + 0.5);
+}
+
+fn _clamp(x, lo, hi) {
+    if x < lo { return lo; }
+    if x > hi { return hi; }
+    return x;
+}
+
+fn _valid_turbovec_bits(bits) {
+    return bits == 2 or bits == 3 or bits == 4;
+}
+
+fn _vec_norm(v) {
+    return num_sqrt(core.dot(v, v));
+}
+
+fn _normalize_vec(v) {
+    let n = _vec_norm(v);
+    if n == 0 { return core.copy_vec(v); }
+    return core.scale_vec(v, 1.0 / n);
+}
+
 fn quantize_vec(v, bits) {
     let max_abs = 0.0;
     let i = 0;
@@ -59,6 +91,458 @@ fn qmat_vecmat(v, qm) {
     return out;
 }
 
+fn _sign(seed, i) {
+    let k = num_mod((seed + 17) * 1103515245 + (i + 1) * 12345, 2147483647);
+    if num_mod(k, 2) == 0 { return 1.0; }
+    return -1.0;
+}
+
+fn turbo_rotate(v, seed = 1) {
+    let out = [];
+    let inv = 1.0 / num_sqrt(2.0);
+    let i = 0;
+    while i < len(v) {
+        let s = _sign(seed, i);
+        if i + 1 < len(v) {
+            let a = v[i];
+            let b = v[i + 1];
+            push(out, s * (a + b) * inv);
+            push(out, s * (a - b) * inv);
+            i = i + 2;
+        } else {
+            push(out, s * v[i]);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn turbo_unrotate(v, seed = 1) {
+    let out = [];
+    let inv = 1.0 / num_sqrt(2.0);
+    let i = 0;
+    while i < len(v) {
+        let s = _sign(seed, i);
+        if i + 1 < len(v) {
+            let y0 = s * v[i];
+            let y1 = s * v[i + 1];
+            push(out, (y0 + y1) * inv);
+            push(out, (y0 - y1) * inv);
+            i = i + 2;
+        } else {
+            push(out, s * v[i]);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn turboquant_mse(v, bits = 4, seed = 1) {
+    if bits < 2 { bits = 2; }
+    if bits > 8 { bits = 8; }
+    let rotated = turbo_rotate(v, seed);
+    let max_abs = 0.0;
+    let i = 0;
+    while i < len(rotated) {
+        let a = _abs(rotated[i]);
+        if a > max_abs { max_abs = a; }
+        i = i + 1;
+    }
+    if max_abs == 0 { max_abs = 1.0; }
+    let qmax = num_pow(2, bits - 1) - 1;
+    let scale = max_abs / qmax;
+    let values = [];
+    let j = 0;
+    while j < len(rotated) {
+        push(values, _clamp(_round(rotated[j] / scale), 0 - qmax, qmax));
+        j = j + 1;
+    }
+    return map{
+        format: "pblang.llm.turboquant_mse.v1",
+        algorithm: "data-oblivious-rotation-plus-scalar-quantization",
+        bits: bits,
+        seed: seed,
+        scale: scale,
+        dim: len(v),
+        values: values,
+        note: "pblang TurboQuant-style helper, not a fused Google production kernel"
+    };
+}
+
+fn tqplus_calibration(vectors, seed = 1) {
+    let dim = 0;
+    if len(vectors) > 0 { dim = len(vectors[0]); }
+    let mean = core.zeros(dim);
+    let abs_mean = core.zeros(dim);
+    if len(vectors) == 0 {
+        return map{ format: "pblang.llm.tqplus_calibration.v1", dim: dim, seed: seed, count: 0, shift: mean, scale: abs_mean };
+    }
+    let i = 0;
+    while i < len(vectors) {
+        let r = turbo_rotate(_normalize_vec(vectors[i]), seed);
+        let j = 0;
+        while j < dim {
+            mean[j] = mean[j] + r[j];
+            abs_mean[j] = abs_mean[j] + _abs(r[j]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    let k = 0;
+    while k < dim {
+        mean[k] = mean[k] / len(vectors);
+        abs_mean[k] = abs_mean[k] / len(vectors);
+        if abs_mean[k] < 0.000001 { abs_mean[k] = 1.0; }
+        k = k + 1;
+    }
+    return map{
+        format: "pblang.llm.tqplus_calibration.v1",
+        dim: dim,
+        seed: seed,
+        count: len(vectors),
+        shift: mean,
+        scale: abs_mean,
+        note: "pblang TQ+ style first-batch per-coordinate shift/scale calibration"
+    };
+}
+
+fn _apply_calibration(rotated, calibration) {
+    if calibration == nil { return rotated; }
+    let out = [];
+    let i = 0;
+    while i < len(rotated) {
+        let sc = calibration.scale[i];
+        if sc == 0 { sc = 1.0; }
+        push(out, (rotated[i] - calibration.shift[i]) / sc);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _undo_calibration(rotated, calibration) {
+    if calibration == nil { return rotated; }
+    let out = [];
+    let i = 0;
+    while i < len(rotated) {
+        push(out, rotated[i] * calibration.scale[i] + calibration.shift[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn turboquant_encode(v, bits = 4, seed = 1, calibration = nil) {
+    let norm = _vec_norm(v);
+    let unit = _normalize_vec(v);
+    let rotated = _apply_calibration(turbo_rotate(unit, seed), calibration);
+    let base = turboquant_mse(rotated, bits, seed);
+    base.format = "pblang.llm.turboquant_encoded.v1";
+    base.norm = norm;
+    base.calibration = calibration;
+    base.renorm = 1.0;
+    let recon_rot = [];
+    let i = 0;
+    while i < len(base.values) {
+        push(recon_rot, base.values[i] * base.scale);
+        i = i + 1;
+    }
+    let dot = core.dot(rotated, recon_rot);
+    if dot != 0 { base.renorm = norm / dot; }
+    return base;
+}
+
+fn turboquant_dequantize(qv) {
+    let rotated = [];
+    let i = 0;
+    while i < len(qv.values) {
+        push(rotated, qv.values[i] * qv.scale);
+        i = i + 1;
+    }
+    let uncal = _undo_calibration(rotated, try qv.calibration catch nil);
+    let out = turbo_unrotate(uncal, qv.seed);
+    if map_has(qv, "norm") {
+        out = core.scale_vec(out, qv.norm);
+    }
+    return out;
+}
+
+fn turboquant_error(original, qv) {
+    let recon = turboquant_dequantize(qv);
+    let mse = 0.0;
+    let max_error = 0.0;
+    let i = 0;
+    while i < len(original) and i < len(recon) {
+        let e = original[i] - recon[i];
+        let ae = _abs(e);
+        if ae > max_error { max_error = ae; }
+        mse = mse + e * e;
+        i = i + 1;
+    }
+    if i > 0 { mse = mse / i; }
+    return map{
+        format: "pblang.llm.turboquant_error.v1",
+        examples: i,
+        mse: mse,
+        rmse: num_sqrt(mse),
+        max_error: max_error
+    };
+}
+
+fn _project_sign(v, seed, slot) {
+    let s = 0.0;
+    let i = 0;
+    while i < len(v) {
+        s = s + v[i] * _sign(seed + slot * 7919, i);
+        i = i + 1;
+    }
+    if s >= 0 { return 1; }
+    return -1;
+}
+
+fn qjl_residual_signs(original, qv, sketch_dim = 8) {
+    if sketch_dim < 1 { sketch_dim = 1; }
+    let recon = turboquant_dequantize(qv);
+    let residual = [];
+    let i = 0;
+    while i < len(original) and i < len(recon) {
+        push(residual, original[i] - recon[i]);
+        i = i + 1;
+    }
+    let signs = [];
+    let j = 0;
+    while j < sketch_dim {
+        push(signs, _project_sign(residual, qv.seed + 9001, j));
+        j = j + 1;
+    }
+    return map{
+        format: "pblang.llm.qjl_residual_signs.v1",
+        sketch_dim: sketch_dim,
+        seed: qv.seed + 9001,
+        signs: signs,
+        note: "1-bit residual sketch for TurboQuant-style product estimation"
+    };
+}
+
+fn turboquant_prod(v, bits = 4, seed = 1, sketch_dim = 8) {
+    let base = turboquant_mse(v, bits, seed);
+    return map{
+        format: "pblang.llm.turboquant_prod.v1",
+        base: base,
+        residual: qjl_residual_signs(v, base, sketch_dim)
+    };
+}
+
+fn _as_vec(x) {
+    if is_map(x) and map_has(x, "format") {
+        if x.format == "pblang.llm.turboquant_mse.v1" { return turboquant_dequantize(x); }
+        if x.format == "pblang.llm.turboquant_encoded.v1" { return turboquant_dequantize(x); }
+        if x.format == "pblang.llm.turboquant_prod.v1" { return turboquant_dequantize(x.base); }
+        if x.format == "pblang.llm.qvec.v1" { return dequantize_vec(x); }
+    }
+    return x;
+}
+
+fn turboquant_dot(a, b) {
+    return core.dot(_as_vec(a), _as_vec(b));
+}
+
+fn turboquant_compression(qv, original_bytes_per_value = 4) {
+    let dim = try qv.dim catch len(qv.values);
+    let original_bits = dim * original_bytes_per_value * 8;
+    let compressed_bits = dim * qv.bits + 64;
+    let ratio = 0.0;
+    if compressed_bits > 0 { ratio = original_bits / compressed_bits; }
+    return map{
+        format: "pblang.llm.turboquant_compression.v1",
+        original_bits: original_bits,
+        compressed_bits: compressed_bits,
+        ratio: ratio
+    };
+}
+
+fn turbovec_new(dim = nil, bit_width = 4, stable_ids = false) {
+    if not _valid_turbovec_bits(bit_width) { bit_width = 4; }
+    return map{
+        format: "pblang.llm.turbovec.index.v2",
+        dim: dim,
+        bit_width: bit_width,
+        stable_ids: stable_ids,
+        prepared: false,
+        seed: 1,
+        calibration: nil,
+        items: [],
+        slot_to_id: [],
+        id_to_slot: map{}
+    };
+}
+
+fn _lock_dim(index, vector) {
+    if index.dim == nil { index.dim = len(vector); }
+    if len(vector) != index.dim {
+        throw "turbovec dimension mismatch";
+    }
+    return index.dim;
+}
+
+fn _id_key(id) {
+    return str(id);
+}
+
+fn _index_add_one(index, vector, id) {
+    _lock_dim(index, vector);
+    if index.calibration == nil {
+        index.calibration = tqplus_calibration([vector], index.seed);
+    }
+    let slot = len(index.items);
+    let enc = turboquant_encode(vector, index.bit_width, index.seed, index.calibration);
+    push(index.items, map{ slot: slot, id: id, vector: enc, norm: _vec_norm(vector), active: true });
+    push(index.slot_to_id, id);
+    index.id_to_slot[_id_key(id)] = slot;
+    return slot;
+}
+
+fn turbovec_add(index, vectors) {
+    let start = len(index.items);
+    let i = 0;
+    while i < len(vectors) {
+        _index_add_one(index, vectors[i], len(index.items));
+        i = i + 1;
+    }
+    index.prepared = true;
+    return map{ format: "pblang.llm.turbovec.add.v1", start: start, added: len(vectors), len: len(index.items), dim: index.dim };
+}
+
+fn turbovec_add_with_ids(index, vectors, ids) {
+    if len(vectors) != len(ids) { throw "turbovec ids length mismatch"; }
+    let start = len(index.items);
+    let i = 0;
+    while i < len(vectors) {
+        let key = _id_key(ids[i]);
+        if map_has(index.id_to_slot, key) { throw "turbovec duplicate id"; }
+        _index_add_one(index, vectors[i], ids[i]);
+        i = i + 1;
+    }
+    index.stable_ids = true;
+    index.prepared = true;
+    return map{ format: "pblang.llm.turbovec.add_with_ids.v1", start: start, added: len(vectors), len: len(index.items), dim: index.dim };
+}
+
+fn turbovec_prepare(index) {
+    index.prepared = true;
+    return map{ format: "pblang.llm.turbovec.prepare.v1", prepared: true, len: len(index.items), dim: index.dim, bit_width: index.bit_width };
+}
+
+fn _allowlist_has(allowlist, id) {
+    if allowlist == nil { return true; }
+    let i = 0;
+    while i < len(allowlist) {
+        if allowlist[i] == id { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _mask_allows(mask, slot) {
+    if mask == nil { return true; }
+    if slot < 0 or slot >= len(mask) { return false; }
+    return mask[slot];
+}
+
+fn turbovec_index(vectors, bits = 4, seed = 1) {
+    let idx = turbovec_new(nil, bits, false);
+    idx.seed = seed;
+    turbovec_add(idx, vectors);
+    return idx;
+}
+
+fn _insert_top(results, item, top_k) {
+    let out = [];
+    let inserted = false;
+    let i = 0;
+    while i < len(results) {
+        if not inserted and item.score > results[i].score {
+            push(out, item);
+            inserted = true;
+        }
+        push(out, results[i]);
+        i = i + 1;
+    }
+    if not inserted { push(out, item); }
+    while len(out) > top_k {
+        pop(out);
+    }
+    return out;
+}
+
+fn turbovec_search(index, query, top_k = 3, allowlist = nil, mask = nil) {
+    if top_k < 1 { top_k = 1; }
+    let results = [];
+    if len(index.items) == 0 {
+        return map{ format: "pblang.llm.turbovec.search.v1", top_k: top_k, effective_k: 0, results: results };
+    }
+    _lock_dim(index, query);
+    let i = 0;
+    while i < len(index.items) {
+        let item = index.items[i];
+        if (try item.active catch true) and _allowlist_has(allowlist, item.id) and _mask_allows(mask, item.slot) {
+            let score = turboquant_dot(query, item.vector) * (try item.vector.renorm catch 1.0);
+            results = _insert_top(results, map{ id: item.id, slot: item.slot, score: score }, top_k);
+        }
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.llm.turbovec.search.v1",
+        top_k: top_k,
+        effective_k: len(results),
+        filtered: allowlist != nil or mask != nil,
+        results: results
+    };
+}
+
+fn turbovec_remove(index, id) {
+    let key = _id_key(id);
+    if not map_has(index.id_to_slot, key) {
+        return map{ format: "pblang.llm.turbovec.remove.v1", removed: false, id: id };
+    }
+    let slot = index.id_to_slot[key];
+    index.items[slot].active = false;
+    map_remove(index.id_to_slot, key);
+    return map{ format: "pblang.llm.turbovec.remove.v1", removed: true, id: id, slot: slot };
+}
+
+fn turbovec_swap_remove(index, slot) {
+    if slot < 0 or slot >= len(index.items) {
+        return map{ format: "pblang.llm.turbovec.swap_remove.v1", removed: false, slot: slot };
+    }
+    let last = len(index.items) - 1;
+    let removed_id = index.items[slot].id;
+    if slot != last {
+        index.items[slot] = index.items[last];
+        index.items[slot].slot = slot;
+        index.slot_to_id[slot] = index.items[slot].id;
+        index.id_to_slot[_id_key(index.items[slot].id)] = slot;
+    }
+    pop(index.items);
+    pop(index.slot_to_id);
+    map_remove(index.id_to_slot, _id_key(removed_id));
+    return map{ format: "pblang.llm.turbovec.swap_remove.v1", removed: true, removed_id: removed_id, moved_slot: slot, len: len(index.items) };
+}
+
+fn turbovec_manifest(index, kind = "tv") {
+    let magic = "TVPI";
+    if kind == "idmap" or index.stable_ids { magic = "TVIM"; }
+    return map{
+        format: "pblang.llm.turbovec.manifest.v1",
+        magic: magic,
+        version: 3,
+        dim: index.dim,
+        bit_width: index.bit_width,
+        n_vectors: len(index.items),
+        stable_ids: index.stable_ids,
+        prepared: index.prepared,
+        has_tqplus: index.calibration != nil
+    };
+}
+
 fn quantize_lm_head(model, bits) {
     return map{
         format: "pblang.llm.quantized_lm_head.v1",
@@ -80,3 +564,7 @@ fn logits_q(hidden, qhead) {
 
 export quantize_vec, dequantize_vec, quantize_matrix_rows, qmat_vecmat;
 export quantize_lm_head, logits_q;
+export turbo_rotate, turbo_unrotate, tqplus_calibration, turboquant_mse, turboquant_encode, turboquant_dequantize, turboquant_error;
+export qjl_residual_signs, turboquant_prod, turboquant_dot, turboquant_compression;
+export turbovec_new, turbovec_add, turbovec_add_with_ids, turbovec_prepare, turbovec_index, turbovec_search;
+export turbovec_remove, turbovec_swap_remove, turbovec_manifest;
