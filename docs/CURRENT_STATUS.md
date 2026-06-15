@@ -1,8 +1,8 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-06-14
-**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 179 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + cross-device play/run planning + cross-language convenience helpers
-**Test Suite**: canonical `.sapp` corpus = **189 passed / 0 failed / 0 ignored** via `pblang test tests/semantics --allow-all --quiet` (the prebuilt-binary runner; no recompile). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
+**Last Updated**: 2026-06-15
+**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 179 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+**Test Suite**: canonical `.sapp` corpus = **189 passed / 0 failed / 0 ignored** via `pblang test semantics` (expands to `tests/semantics --allow-all --quiet --jobs smart`). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
 
 ---
 
@@ -147,6 +147,8 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 pblang test tests/semantics --allow-all → 189 passed; 0 failed; 0 ignored   (canonical .sapp corpus, no recompile)
 pblang test tests/semantics --allow-all --quiet → same suite with script print output captured/suppressed for faster, cleaner CI logs
 pblang test tests/semantics --allow-all --jobs auto --quiet → run independent test files in isolated VM workers
+pblang test semantics → shorthand for tests/semantics + allow-all + quiet + resource-aware jobs; 189 passed; 0 failed; 0 ignored
+pblang test llm → shorthand for the LLM subset + timings; 3 passed; 0 failed; 186 filtered out
 pblang test tests/semantics --allow-all --timings --slow 10 --quiet → show per-test durations and the slowest tests
 pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow 3 → LLM subset passes; pbAI-Max diagnostics use bounded samples plus native LLM-core tensor/activation routing (~4.0s Max fixture)
 pblang test tests/semantics --list → discover tests without executing them
@@ -223,8 +225,16 @@ bit-level token substrate for token-id bits, bitstreams, byte-bit conversion, an
 binary LM example features. `llm_core` can route larger dot/vector/matrix operations
 plus selected softmax/argmax/ReLU/layernorm helpers through native `tensor_*` kernels
 while keeping normal array APIs. `llm_attention` now exposes live architecture updates
-for adding decoder layers, extending context, and tuning binary adapter strength;
-`llm_data` includes bounded representative sampling for faster pbAI-Max diagnostics
+for adding decoder layers, extending context, tuning binary adapter strength, and
+safe anti-collapse generation through `generate_safe(...)` plus
+`repetition_penalized_logits(...)`; `llm_eval` includes prompt-generation quality
+scoring through `generation_quality(...)`, `choose_generation(...)`, and
+`max_repetition_run(...)`, plus sequence-level loss/perplexity/accuracy through
+`sequence_evaluate(...)` and deterministic output-shape scoring through
+`text_shape(...)`, cheap screening proxies through `regression_proxy(...)`, and
+validation/regression candidate ranking through `selection_score(...)`;
+`llm_data` includes bounded representative sampling plus curriculum repetition/interleaving
+helpers for faster, higher-signal pbAI-Max diagnostics and training
 (the Max semantics fixture now uses a small diagnostic eval set instead of
 benchmark-scale full-example eval);
 `llm_train` includes analytic binary-adapter backprop into `binary_projection`,

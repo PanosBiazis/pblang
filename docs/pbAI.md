@@ -117,8 +117,9 @@ program orchestrating these kernels.
 - **`stdlib/llm_tokenizer.sapp`** — pblang-native tokenizer contracts: char tokenizer,
   small trainable BPE tokenizer, encode/decode, metadata, and JSON save/load.
 - **`stdlib/llm_data.sapp`** — corpus helpers: text detection, secret/noise exclusion,
-  chunking, next-token example packing, train/validation split, corpus records, and
-  bounded representative sampling for faster pbAI-Max diagnostics without hiding
+  chunking, next-token example packing, train/validation split, corpus records,
+  curriculum example repetition/interleaving, and bounded representative sampling
+  for faster pbAI-Max diagnostics without hiding
   original corpus sizes. Semantics tests use these bounded samples for fast subsystem
   diagnostics; real training/evaluation should still use larger curated train/valid
   sets.
@@ -127,8 +128,13 @@ program orchestrating these kernels.
   vocab logits, sampling hooks, generation, quantization helpers, and summary metadata.
   Locked by `tests/semantics/llm_foundation_test.sapp`.
 - **Scale-up LLM foundation modules (today)** — `stdlib/llm_attention.sapp` adds stacked
-  multi-layer/multi-head decoder attention plus live architecture updates (`deeper`,
-  `longer_context`, `stronger_binary`, `weaker_binary`); `stdlib/llm_train.sapp` adds
+  multi-layer/multi-head decoder attention, Gemma-3-style local/global attention
+  planning (`gemma3_config`, `attention_plan`) with grouped-query KV sharing, and
+  Gemma-4-style planning (`gemma4_config`) for per-layer embeddings, MoE loaded-vs-active
+  parameter accounting, MTP/speculative decoding, native system prompts, thinking-mode
+  prompt templates, multimodal direct projections, and memory estimates. It also keeps
+  live architecture updates (`deeper`, `longer_context`, `stronger_binary`,
+  `weaker_binary`); `stdlib/llm_train.sapp` adds
   next-token backprop for the LM head and analytic binary-adapter backprop into
   `binary_projection` over frozen transformer states, plus an analytic deep-input
   update stage for token embeddings, positional embeddings, binary projection, and the
@@ -142,14 +148,21 @@ program orchestrating these kernels.
   generation seed;
   `stdlib/llm_stream.sapp` adds bounded streaming corpora; `stdlib/llm_weights.sapp`
   adds sharded weight manifests; `stdlib/llm_tokenizer_train.sapp` adds bounded
-  corpus tokenizer training; `stdlib/llm_eval.sapp` adds loss/perplexity/accuracy and
-  generation benchmarks; `stdlib/llm_quant.sapp` adds row-wise quantized inference
-  helpers; `stdlib/llm_binary.sapp` adds the bit-level token substrate: token-id bit
+  corpus tokenizer training; `stdlib/llm_eval.sapp` adds loss/perplexity/accuracy,
+  generation benchmarks, sequence-level scoring, text-shape scoring for cleaner
+  generated code, cheap regression proxies for fast candidate screening,
+  validation/regression selection scoring, generation-quality scoring, and
+  candidate-generation reranking;
+  `stdlib/llm_quant.sapp` adds row-wise quantized inference helpers plus pblang
+  TurboQuant-style vector compression, first-batch TQ+ calibration, length-renormalized
+  vector scoring metadata, 1-bit QJL residual sketches, and TurboVec-style compressed
+  vector search with online add, stable ids, filtered search, removal, and manifest
+  metadata; `stdlib/llm_binary.sapp` adds the bit-level token substrate: token-id bit
   width, ID<->bits round-trips, token bitstreams, binary LM example views, byte-bit
   conversion, and hamming/transition features; `stdlib/llm_offload.sapp` adds an
-  AirLLM-style low-memory inference planner: KV-cache reservation, resident-layer
-  selection, layer streaming, prefetch hints, offload manifests, and bounded
-  microbatch sizing. This is the planning layer for future shard/device execution,
+  AirLLM-style low-memory inference planner: KV-cache reservation, compressed KV-cache
+  sizing, resident-layer selection, layer streaming, prefetch hints, offload manifests,
+  and bounded microbatch sizing. This is the planning layer for future shard/device execution,
   not a claim that full GPU kernels are implemented in pblang today. Locked by
   `tests/semantics/llm_max_foundation_test.sapp`. These are generic pblang libraries;
   the pbAI-Max product lives outside pblang in `AAP/ai/pbai`.
@@ -226,7 +239,9 @@ pbAI is designed to **grow without rewrites** — expandable along every axis:
 
 - **More models / bigger sizes.** New tiers slot into the family (a larger pbAI-Max,
   or new distilled sub-models) without changing callers — the same pbAI API serves
-  any tier.
+  any tier. The current outside-project Max tier in `AAP/ai/pbai` owns checkpoint
+  policy and prompt-level regression gates, while this pblang repo owns the reusable
+  `llm_*` foundations and Nano-compatible primitives.
 - **Pluggable backends.** Run a pblang-native model (tensor builtins), an ONNX/GGUF
   model via FFI/`onnx_infer`, or a remote provider via `ai_chat` — chosen per task,
   swappable behind one interface.

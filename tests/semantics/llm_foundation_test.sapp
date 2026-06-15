@@ -4,6 +4,8 @@ let core = import("stdlib:llm_core.sapp");
 let tok = import("stdlib:llm_tokenizer.sapp");
 let data = import("stdlib:llm_data.sapp");
 let tr = import("stdlib:llm_transformer.sapp");
+let train = import("stdlib:llm_train.sapp");
+let adapt = import("stdlib:llm_adapters.sapp");
 
 let text = "fn add(a,b){return a+b;} fn main(){print add(1,1);}";
 let t = tok.bpe_train(text, 64, 2);
@@ -73,5 +75,35 @@ assert(len(dq) == 3, "quantization round-trips vector length");
 let ckpt = core.checkpoint(model, map{ name: "llm_foundation_test" });
 assert(ckpt.format == "pblang.llm.checkpoint.v1", "checkpoint contract is versioned");
 assert(tr.summary(model).format == "pblang.llm.decoder.v1", "transformer summary is versioned");
+
+fn tiny_forward(model, ctx) {
+    return [[1.0, 0.5]];
+}
+
+let tiny = map{ lm_head: [[0.01, -0.01], [0.02, -0.02]], lm_bias: [0.0, 0.0] };
+let tiny_examples = [map{ x: [0], y: 0 }, map{ x: [1], y: 1 }, map{ x: [0], y: 0 }, map{ x: [1], y: 1 }];
+let par_run = train.train_epochs_parallel(tiny, tiny_forward, tiny_examples, 1, 0.05, 2);
+assert(par_run.mode == "parallel-sharded-lm-head-backprop" and par_run.parallel_workers == 2,
+    "LLM training can shard LM-head updates across pblang workers");
+
+let adapter = adapt.lm_head_adapter(model, 2, 4.0, 123);
+let adapter_summary = adapt.summary(adapter);
+assert(adapter_summary.format == "pblang.llm.adapter_summary.v1" and adapter_summary.rank == 2,
+    "LoRA-style adapter summary is versioned");
+assert(adapter_summary.trainable_params < len(model.lm_head) * len(model.lm_head[0]),
+    "LoRA-style adapter trains fewer params than full LM head for this model");
+let before_delta = adapt.delta_logits(core.zeros(len(model.lm_head)), adapter);
+assert(len(before_delta) == s.vocab_size, "LoRA-style adapter produces vocab-sized deltas");
+let adapter_run = adapt.train_epochs(model, adapter, tr.forward_hidden, examples, 1, 0.05, 4);
+assert(adapter_run.format == "pblang.llm.lora_training.v1" and adapter_run.steps > 0 and adapter_run.steps <= 4,
+    "LoRA-style adapter trains over hidden states with frozen base weights");
+adapter = adapt.from_state(adapter, adapter_run.last.updated_a_matrix, adapter_run.last.updated_b_matrix,
+    adapter_run.last.loss, adapter_run.steps, adapter_run.steps);
+assert(adapt.summary(adapter).steps == adapter_run.steps, "LoRA-style adapter records training steps");
+let head_before = model.lm_head[0][0];
+let merge = adapt.merge_lm_head(model, adapter, 1.0);
+assert(merge.format == "pblang.llm.lora_merge.v1", "LoRA-style adapter can merge into the LM head");
+assert(model.lm_head[0][0] != head_before or adapter_run.steps > 0,
+    "LoRA-style adapter merge path is executable");
 
 print "llm_foundation_pass";

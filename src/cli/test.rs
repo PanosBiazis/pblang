@@ -18,6 +18,9 @@ use super::diag::format_parse_error;
 use crate::parse_capability_flags;
 
 const TEST_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const AUTO_JOBS: usize = usize::MAX;
+const SMART_JOBS: usize = usize::MAX - 1;
+const DEFAULT_TEST_WORKER_RAM_MB: usize = 96;
 
 #[derive(Clone)]
 struct PlannedTest {
@@ -61,7 +64,7 @@ struct TestTiming {
 }
 
 pub(crate) fn handle_test(mut args: Vec<String>) {
-    let stdlib_cfg = parse_capability_flags(&mut args);
+    let mut stdlib_cfg = parse_capability_flags(&mut args);
 
     // --filter <substring>: run tests whose `<file_stem>::<fn_name>`
     // identifier contains this substring. --exact <id> requires an exact
@@ -81,7 +84,55 @@ pub(crate) fn handle_test(mut args: Vec<String>) {
     let mut i = 1usize;
     while i < args.len() {
         let a = &args[i];
-        if let Some(rest) = a.strip_prefix("--filter=") {
+        if let Some(rest) = a.strip_prefix("--profile=") {
+            apply_test_profile(
+                rest,
+                &mut positional,
+                &mut filter,
+                &mut quiet,
+                &mut jobs,
+                &mut show_timings,
+                &mut slow_limit,
+                &mut stdlib_cfg,
+            );
+            i += 1;
+        } else if a == "--profile" && i + 1 < args.len() {
+            apply_test_profile(
+                &args[i + 1],
+                &mut positional,
+                &mut filter,
+                &mut quiet,
+                &mut jobs,
+                &mut show_timings,
+                &mut slow_limit,
+                &mut stdlib_cfg,
+            );
+            i += 2;
+        } else if let Some(rest) = a.strip_prefix("--preset=") {
+            apply_test_profile(
+                rest,
+                &mut positional,
+                &mut filter,
+                &mut quiet,
+                &mut jobs,
+                &mut show_timings,
+                &mut slow_limit,
+                &mut stdlib_cfg,
+            );
+            i += 1;
+        } else if a == "--preset" && i + 1 < args.len() {
+            apply_test_profile(
+                &args[i + 1],
+                &mut positional,
+                &mut filter,
+                &mut quiet,
+                &mut jobs,
+                &mut show_timings,
+                &mut slow_limit,
+                &mut stdlib_cfg,
+            );
+            i += 2;
+        } else if let Some(rest) = a.strip_prefix("--filter=") {
             filter = Some(rest.to_string());
             i += 1;
         } else if a == "--filter" && i + 1 < args.len() {
@@ -132,6 +183,20 @@ pub(crate) fn handle_test(mut args: Vec<String>) {
             positional.push(a.clone());
             i += 1;
         }
+    }
+
+    if let Some(profile) = positional.first().cloned().filter(|p| is_test_profile(p)) {
+        positional.remove(0);
+        apply_test_profile(
+            &profile,
+            &mut positional,
+            &mut filter,
+            &mut quiet,
+            &mut jobs,
+            &mut show_timings,
+            &mut slow_limit,
+            &mut stdlib_cfg,
+        );
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -291,11 +356,7 @@ pub(crate) fn handle_test(mut args: Vec<String>) {
     if jobs > 1 && !use_cache && !fail_fast && planning_failures.is_empty() {
         let mut groups = planned_groups(&plan);
         if groups.len() > 1 {
-            if jobs == usize::MAX {
-                jobs = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1);
-            }
+            jobs = resolve_jobs(jobs);
             jobs = jobs.max(1).min(groups.len());
             let (tx, rx) = std::sync::mpsc::channel::<GroupRun>();
             let mut active = 0usize;
@@ -559,18 +620,131 @@ pub(crate) fn handle_test(mut args: Vec<String>) {
     }
 }
 
-fn parse_jobs(value: &str) -> usize {
-    if value == "auto" {
-        return usize::MAX;
+fn is_test_profile(name: &str) -> bool {
+    matches!(
+        name,
+        "semantics" | "sem" | "full" | "all" | "llm" | "models" | "model"
+    )
+}
+
+fn allow_all(cfg: &mut pblang_vm::StdlibConfig) {
+    cfg.exec = true;
+    cfg.ffi = true;
+    cfg.net = true;
+    cfg.fs = true;
+    cfg.http = true;
+    cfg.sqlite = true;
+    cfg.spawn = true;
+    cfg.gfx = true;
+    cfg.env = true;
+}
+
+fn set_semantics_profile(
+    positional: &mut Vec<String>,
+    quiet: &mut bool,
+    jobs: &mut usize,
+    stdlib_cfg: &mut pblang_vm::StdlibConfig,
+) {
+    if positional.is_empty() {
+        positional.push("tests/semantics".to_string());
     }
-    match value.parse::<usize>() {
-        Ok(0) => usize::MAX,
-        Ok(n) => n,
-        Err(_) => {
-            eprintln!("pblang test: --jobs expects a positive integer, 0, or auto");
+    *quiet = true;
+    *jobs = SMART_JOBS;
+    allow_all(stdlib_cfg);
+}
+
+fn apply_test_profile(
+    profile: &str,
+    positional: &mut Vec<String>,
+    filter: &mut Option<String>,
+    quiet: &mut bool,
+    jobs: &mut usize,
+    show_timings: &mut bool,
+    slow_limit: &mut usize,
+    stdlib_cfg: &mut pblang_vm::StdlibConfig,
+) {
+    match profile {
+        "semantics" | "sem" | "full" | "all" => {
+            set_semantics_profile(positional, quiet, jobs, stdlib_cfg);
+        }
+        "llm" | "models" | "model" => {
+            set_semantics_profile(positional, quiet, jobs, stdlib_cfg);
+            if filter.is_none() {
+                *filter = Some("llm".to_string());
+            }
+            *show_timings = true;
+            if *slow_limit == 0 {
+                *slow_limit = 3;
+            }
+        }
+        _ => {
+            eprintln!("pblang test: unknown profile '{profile}' (expected semantics or llm)");
             std::process::exit(1);
         }
     }
+}
+
+fn parse_jobs(value: &str) -> usize {
+    if value == "auto" {
+        return AUTO_JOBS;
+    }
+    if value == "smart" {
+        return SMART_JOBS;
+    }
+    match value.parse::<usize>() {
+        Ok(0) => AUTO_JOBS,
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("pblang test: --jobs expects a positive integer, 0, auto, or smart");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse::<usize>().ok()
+}
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn linux_available_memory_mb() -> Option<usize> {
+    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+fn resolve_jobs(jobs: usize) -> usize {
+    if jobs == AUTO_JOBS {
+        return available_parallelism();
+    }
+    if jobs != SMART_JOBS {
+        return jobs;
+    }
+    let cores = available_parallelism();
+    let mut cap = cores;
+    if let Some(max_jobs) = parse_env_usize("PBLANG_TEST_MAX_JOBS") {
+        cap = cap.min(max_jobs.max(1));
+    }
+    let worker_mb = parse_env_usize("PBLANG_TEST_WORKER_MB").unwrap_or(DEFAULT_TEST_WORKER_RAM_MB);
+    if let Some(available_mb) =
+        parse_env_usize("PBLANG_TEST_RAM_MB").or_else(linux_available_memory_mb)
+    {
+        let memory_cap = (available_mb / worker_mb.max(1)).max(1);
+        cap = cap.min(memory_cap);
+    }
+    cap.max(1)
 }
 
 fn parse_count_flag(flag: &str, value: &str) -> usize {

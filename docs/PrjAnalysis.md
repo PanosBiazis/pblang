@@ -1,4 +1,4 @@
-# pblang — Project Quality Analysis (2026-05-24, current through 2026-06-14)
+# pblang — Project Quality Analysis (2026-05-24, current through 2026-06-15)
 
 > This document combines a **comprehensive quality audit** (top half, this section)
 > with a **validation baseline / fix log** (bottom half, preserved from earlier
@@ -7,7 +7,7 @@
 > into `src/cli/*`, and the polyglot bridge expansion to 47 host languages +
 > cached cdylib loader.
 >
-> **Current status (2026-06-14):** §§19–45 below document the self-hosting
+> **Current status (2026-06-15):** §§19–45 below document the self-hosting
 > milestone: the pblang-written compiler tokenizes, parses, compiles, and runs
 > pblang end-to-end. Later sections through §152 capture the June follow-up work:
 > AI/http/ONNX doc sync, hardware inventory hardening, middleware API cleanup,
@@ -19,7 +19,8 @@
 > `pblang build-polyglot`, `pblang bundle`, compile/test cache acceleration,
 > `stdlib:linker.sapp`, AirLLM-style low-memory LLM offload planning, and
 > Rust/Go/Swift/C++-inspired safe pointer wrappers over the VM memory tracker,
-> isolated parallel `pblang test --jobs` workers, measured test timings, and
+> isolated parallel `pblang test --jobs` workers, measured test timings,
+> resource-aware `pblang test semantics` / `pblang test llm` profiles, and
 > faster bounded pbAI-Max/LLM diagnostic loops and smaller Max fixture eval
 > samples, native tensor-kernel routing for LLM core math, native
 > activation/reduction bridges, general `stdlib:math.sapp` stats/linear algebra
@@ -2091,7 +2092,7 @@ Verification:
 
 > Methodology: four parallel read-only sweeps (stubs/partials, panic-paths, security, secrets+quality) over every tracked source file, plus fresh `cargo clippy --workspace --all-targets`, `cargo test --workspace`, and the canonical `pblang test tests/semantics --allow-all`. Every machine-flagged finding below was re-verified by reading the cited code; two agent claims were **refuted** during verification and are recorded as false alarms (§112.E).
 >
-> Status note: §112 is the original 2026-06-09 audit snapshot. The current state is in §§113-152: the original tensor/string panic paths, plaintext-registry defect, JIT API honesty gap, active personal-path references, root-level stale reports, graphics/example TODO, stale top-audit counters, test-runner feedback controls, the first full CLI handler extractions, compile/test cache acceleration, pblang linker substrate, AirLLM-style offload planning, safe-pointer stdlib wrappers, parallel test workers, timing/slow-test reporting, bounded pbAI-Max/LLM diagnostic loops, smaller Max fixture eval samples, native tensor-kernel routing for LLM core math, native activation/reduction bridges, general math stdlib stats/linear-algebra cleanup, array/collection helper expansion, richer map helper coverage, string/text helper cleanup, CSV/data-format hardening, dataframe/table helper expansion, serialization/format-conversion cleanup, template/report rendering cleanup, validation/contracts expansion, and config/schema bridge cleanup are fixed or added.
+> Status note: §112 is the original 2026-06-09 audit snapshot. The current state is in §§113-154: the original tensor/string panic paths, plaintext-registry defect, JIT API honesty gap, active personal-path references, root-level stale reports, graphics/example TODO, stale top-audit counters, test-runner feedback controls, the first full CLI handler extractions, compile/test cache acceleration, pblang linker substrate, AirLLM-style offload planning, safe-pointer stdlib wrappers, parallel test workers, timing/slow-test reporting, bounded pbAI-Max/LLM diagnostic loops, smaller Max fixture eval samples, native tensor-kernel routing for LLM core math, native activation/reduction bridges, general math stdlib stats/linear-algebra cleanup, array/collection helper expansion, richer map helper coverage, string/text helper cleanup, CSV/data-format hardening, dataframe/table helper expansion, serialization/format-conversion cleanup, template/report rendering cleanup, validation/contracts expansion, config/schema bridge cleanup, LLM safe anti-collapse generation, and LLM generation-quality scoring are fixed or added.
 
 ### 112.A Verification baseline (all green)
 
@@ -3491,3 +3492,347 @@ Verification:
 
 Result: focused config verification passed in about **49 ms**. The full
 canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 153. LLM attention category: safe anti-collapse generation (2026-06-14)
+
+This pass closes the concrete pbAI-Max regression found by the new prompt-level
+quality gate: greedy stacked-decoder generation could collapse into long runs of
+one token, especially `/`, while aggregate loss/perplexity still looked valid.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Repetition scoring | **ADDED** | `stdlib:llm_attention.sapp` now exposes `repetition_penalized_logits(...)`, which subtracts a recent-token penalty from logits before choosing the next token. |
+| Hard tail cap | **ADDED** | If the current output tail repeats the same token at `max_repeat`, that token is temporarily blocked with a very low logit. |
+| Safe generation | **ADDED** | `generate_safe(model, seed_ids, n, recent_window, repetition_penalty, max_repeat)` mirrors greedy generation but uses the repetition-penalized logits path. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies hard blocking of a repeated tail token and the safe-generation output shape. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact llm_max_foundation_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused LLM-Max foundation verification passed in about **4.1s**.
+The LLM subset passed **3 passed / 0 failed / 186 filtered out**, and the
+full canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+The outside pbAI-Max project now uses this pblang substrate for `max_generate`,
+checkpoint benchmarks, and prompt regression.
+
+## 154. LLM eval category: reusable generation-quality scoring (2026-06-14)
+
+Continuing the Max quality work, this pass moves prompt-output scoring into the
+shared pblang LLM evaluation layer so model projects do not each invent their
+own collapse checks.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Repetition metric | **ADDED** | `stdlib:llm_eval.sapp` exposes `max_repetition_run(text)` for deterministic repeated-character collapse detection. |
+| Generation quality | **ADDED** | `generation_quality(prompt, text, expected, forbidden, min_generated, max_repeat)` scores expected-token hits, forbidden-token misses, minimum generated length, blank tails, and repetition/collapse. |
+| Versioned contract | **ADDED** | The helper returns `pblang.llm.generation_quality.v1` with `score`, `max_score`, `normalized`, `passed`, hit counts, repetition run, generated chars, and details. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies collapsed output fails and normal output scores higher. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --exact llm_max_foundation_test --allow-all --quiet --timings --slow=1
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused LLM-Max foundation verification passed in about **4.2s**.
+The full canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+pbAI-Max now delegates prompt-regression scoring to this shared pblang helper.
+
+## 155. LLM eval category: candidate-generation reranking (2026-06-14)
+
+This pass adds a reusable chooser on top of the generation-quality scorer. The
+goal is to let Max-style projects try several safe decoding settings and keep
+the best scored output instead of trusting a single greedy/safe decode.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Candidate chooser | **ADDED** | `stdlib:llm_eval.sapp` exposes `choose_generation(prompt, texts, expected, forbidden, min_generated, max_repeat)`. |
+| Versioned result | **ADDED** | The chooser returns `pblang.llm.generation_choice.v1` with every candidate's quality report, the selected index, selected text, and selected quality. |
+| Tie breaking | **ADDED** | Candidates are ranked by normalized quality, then lower repetition run, then longer generated tail. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies that a collapsed candidate loses to a normal pblang-like candidate. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
+0 failed / 0 ignored**.
+
+## 156. LLM eval category: sequence-level scoring for generation ranking (2026-06-14)
+
+The candidate chooser now has a model-side signal available: sequence-level
+loss/perplexity/accuracy over a token ID stream. This lets projects such as
+pbAI-Max prefer candidates that are both text-shape acceptable and more likely
+under the current model.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Sequence eval | **ADDED** | `stdlib:llm_eval.sapp` exposes `sequence_evaluate(model, logits_fn, ids, context)`. |
+| Versioned result | **ADDED** | The helper returns `pblang.llm.sequence_eval.v1` with token count, example count, loss, perplexity, and accuracy. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies sequence eval over tokenizer IDs. |
+| Max integration | **USED** | `AAP/ai/pbai` now combines this signal with generation-quality scoring in pbAI-Max ranked generation. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
+0 failed / 0 ignored** after the cross-repo Max training pass.
+
+## 157. LLM eval category: text-shape scoring for cleaner Max generation (2026-06-14)
+
+This pass adds a small deterministic signal for generated text shape. It does
+not replace learned model loss; it catches cheap bad outputs that loss alone
+does not punish enough in tiny checkpoints, such as long punctuation runs or
+obvious delimiter imbalance.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Text-shape scorer | **ADDED** | `stdlib:llm_eval.sapp` exposes `text_shape(text)` returning `pblang.llm.text_shape.v1`. |
+| Cleaner-code signal | **ADDED** | The scorer tracks alnum/space/symbol counts, maximum symbol run, delimiter imbalance, and pblang keyword hits. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies that a cleaner pblang-like snippet scores above a noisy symbol-heavy snippet. |
+| Max integration | **USED** | `AAP/ai/pbai` now combines this signal with generation quality and sequence loss in pbAI-Max ranked generation. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
+0 failed / 0 ignored** after the final cross-repo Max training run.
+
+## 163. Resource-efficiency category: smart background planning and compact test profiles (2026-06-15)
+
+This pass turns the resource-use research direction into two practical pblang
+surfaces: a pblang stdlib planner for demanding background work and a simpler
+CLI shape for the most common expensive test runs. The goal is not just using
+more CPU; it is using the right amount of CPU for the available RAM, cache, and
+device class.
+
+Sources and theory checked:
+
+- LoRA: `https://arxiv.org/abs/2106.09685`
+- QLoRA: `https://arxiv.org/abs/2305.14314`
+- Work-stealing scheduling: `https://dl.acm.org/doi/10.1145/324133.324234`
+- External-memory algorithms: `https://dl.acm.org/doi/10.1145/384192.384193`
+- Gemma core docs: `https://ai.google.dev/gemma/docs/core`
+- TurboVec: `https://github.com/RyanCodrai/turbovec`
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Compact semantic test profile | **ADDED** | `pblang test semantics` now expands to `tests/semantics --allow-all --quiet --jobs smart`. |
+| Compact LLM test profile | **ADDED** | `pblang test llm` runs the LLM subset with quiet output, timings, and `--slow=3`. |
+| Resource-aware workers | **ADDED** | `--jobs smart` caps workers by CPU and available RAM, using `/proc/meminfo` on Linux plus `PBLANG_TEST_MAX_JOBS`, `PBLANG_TEST_RAM_MB`, and `PBLANG_TEST_WORKER_MB` overrides. |
+| Background task planner | **ADDED** | `stdlib:machine_opt.sapp` exposes `background_task(...)` and `resource_efficiency_plan(...)`. |
+| RAM reduction path | **ADDED** | Large tasks now get a versioned plan for external-memory chunking, bounded scratch memory, and chunk counts instead of assuming everything fits in memory. |
+| Parallel scheduling path | **ADDED** | Resource plans choose locality-aware work stealing when chunk counts and cores justify parallelism. |
+| Cache/locality path | **ADDED** | Plans record cache-aware tiling, arena/region scratch release, and content-hash cache reuse as first-class strategies. |
+| CLI regression coverage | **ADDED** | `tests/new_cmd.rs` verifies both shorthand profiles and quiet/timing/filter behavior. |
+| Stdlib regression coverage | **EXPANDED** | `machine_opt_test.sapp` verifies large background-task chunking and bounded scratch memory. |
+
+Verification:
+
+```sh
+cargo test --test new_cmd profile
+./target/debug/pblang run tests/semantics/machine_opt_test.sapp --allow-all
+./target/debug/pblang test llm
+./target/debug/pblang test semantics
+```
+
+Results:
+
+- `cargo test --test new_cmd profile`: **2 passed / 0 failed**.
+- `machine_opt_test.sapp`: **machine_opt_pass**.
+- `pblang test llm`: **3 passed / 0 failed / 186 filtered out**.
+- `pblang test semantics`: **189 passed / 0 failed / 0 ignored**.
+
+Environment note: Cargo still warns that the ExtHD target directory cannot use
+hard links for incremental-cache files and falls back to copying. That is not a
+pblang code failure, but it is a real build-speed issue on this mount. A
+Linux-native SSD/tmp `CARGO_TARGET_DIR` is the next environment-level speed
+win.
+
+## 162. LLM substrate category: real TurboVec API shape and Gemma 4 planning (2026-06-15)
+
+Follow-up after checking the user-provided sources:
+
+- TurboVec source: `https://github.com/RyanCodrai/turbovec`
+- Gemma 4 core docs: `https://ai.google.dev/gemma/docs/core`
+
+The previous §161 implementation had the right direction but was too generic:
+it exposed compressed search, but not enough of TurboVec's actual API shape. It
+also treated Gemma 4 as uncertain; the core docs now provide concrete planning
+features worth representing in pblang.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| TurboVec online index | **ADDED** | `stdlib:llm_quant.sapp` now exposes `turbovec_new(...)`, `turbovec_add(...)`, and `turbovec_add_with_ids(...)` for lazy dimension locking and online ingest. |
+| Stable ids | **ADDED** | `turbovec_add_with_ids(...)`, `turbovec_remove(...)`, and `id_to_slot`/`slot_to_id` metadata support stable external ids. |
+| Filtered search | **ADDED** | `turbovec_search(index, query, k, allowlist, mask)` supports stable-id allowlists and positional slot masks, matching the useful hybrid-retrieval/ACL/time-window shape. |
+| Removal semantics | **ADDED** | `turbovec_remove(...)` marks stable ids inactive; `turbovec_swap_remove(...)` provides positional swap-remove behavior. |
+| File-format metadata | **ADDED** | `turbovec_manifest(...)` reports `.tv`/`.tvim`-style magic/version/dim/bit-width/vector-count/TQ+ metadata. |
+| TQ+ calibration | **ADDED** | `tqplus_calibration(...)` and `turboquant_encode(...)` add first-batch per-coordinate shift/scale calibration plus length-renormalized scoring metadata. |
+| Gemma 4 planning | **ADDED** | `stdlib:llm_attention.sapp` now exposes `gemma4_config(...)`, `ple_params(...)`, `moe_plan(...)`, `mtp_plan(...)`, `system_prompt_turn(...)`, `multimodal_projection_plan(...)`, and `memory_requirement_bytes(...)`. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies stable-id add/search/remove/manifest, allowlist and mask filtering, Gemma 4 PLE/MoE/MTP/system-prompt/thinking/multimodal planning. |
+
+Useful theories/features found during the scan:
+
+| Idea | Usefulness for pblang | Status |
+|---|---|---|
+| TurboQuant / TurboVec | Local compressed vector search for pbAI RAG, code search, memory, and KV/cache experiments. | **Started** in pure pblang; SIMD/native kernels are future work. |
+| Gemma 4 PLE | Better parameter efficiency for small/mobile tiers by giving layers token-specific lightweight embedding views. | **Planner added**; actual per-layer embedding injection is future work. |
+| Gemma 4 MoE | High throughput and better reasoning when routing to a small active expert set while loading all experts. | **Planner added**; real expert-router layers are future work. |
+| MTP/speculative decoding | Faster generation by drafting multiple tokens and verifying them. | **Planner added**; real draft/verify decoding loop is future work. |
+| QAT / QLoRA / LoRA | Efficient fine-tuning and lower-memory training for pbAI-Max/Pro/Mini. | **Recommended next**: add LoRA adapter matrices and QLoRA-style frozen quantized base training. |
+| Thinking/system-prompt templates | Better controllability for assistant behavior and explicit reasoning channels. | **Prompt substrate added**; policy/UI integration is future work. |
+| Recurrent/linear-time sequence models | Potential lower-memory alternative for long context on weak hardware. | **Recommended next** after LLM adapters. |
+| Radix/prefix KV reuse | Useful for servers, agents, and repeated prompts. | **Recommended next** for pblang server/cache layer. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
+0 failed / 0 ignored**.
+
+## 161. LLM architecture/quant category: Gemma-style attention and TurboQuant-style vectors (2026-06-15)
+
+This pass adds implementable techniques from public long-context/model-efficiency
+work into pblang's LLM substrate. The code does not claim to be Google's private
+production implementation; it provides pblang-native, testable equivalents for
+the useful ideas: local/global attention scheduling, grouped-query KV sharing,
+compressed KV-cache planning, online vector quantization, a 1-bit residual
+sketch, and compressed vector search.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Gemma-style config | **ADDED** | `stdlib:llm_attention.sapp` exposes `gemma3_config(...)` and `attention_plan(...)` for local-window layers, periodic global layers, and grouped-query KV metadata. |
+| Local/global attention | **ADDED** | Decoder layers now carry `attention_type`, and local layers use a bounded recent-token window while global layers keep full causal attention. |
+| Grouped-query KV sharing | **ADDED** | `multi_head_attention_window(...)` supports `kv_heads < heads` by sharing key/value head slices across query heads. |
+| TurboQuant-style vectors | **ADDED** | `stdlib:llm_quant.sapp` adds deterministic rotation, scalar quantization, dequantization, error reports, compression reports, and approximate dot products. |
+| QJL residual sketch | **ADDED** | `qjl_residual_signs(...)` and `turboquant_prod(...)` expose a 1-bit residual sketch for inner-product-oriented experiments. |
+| TurboVec-style search | **ADDED** | `turbovec_index(...)` and `turbovec_search(...)` provide a compressed vector-search substrate for retrieval/KV experiments. |
+| Compressed KV planning | **ADDED** | `stdlib:llm_offload.sapp` adds `kv_cache_bytes_quantized(...)` and `kv_compression_plan(...)` to estimate long-context KV memory with low-bit caches. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` covers the Gemma-style plan/logits path and TurboQuant/TurboVec helpers; `llm_offload_test.sapp` covers quantized KV-cache sizing. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**. The Max fixture remains the slow path at about **4.97s**.
+The full canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
+
+## 160. LLM training category: parallel sharded LM-head training (2026-06-15)
+
+This pass adds a pblang-native parallel training primitive for LM-head updates.
+The helper shards examples across pblang workers, trains model copies in
+parallel, and merges the learned LM head/bias at a deterministic barrier.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Parallel LM-head training | **ADDED** | `stdlib:llm_train.sapp` exposes `train_epochs_parallel(...)`. |
+| Deterministic merge | **ADDED** | Worker model copies merge by averaging `lm_head` and `lm_bias`; shared mutable model state is not updated concurrently. |
+| Regression coverage | **EXPANDED** | `llm_foundation_test.sapp` verifies the parallel mode and worker count on a tiny local model. |
+| Max integration note | **USED WITH CARE** | `AAP/ai/pbai` uses a Max-local worker wrapper because imported module functions need their module context inside spawned workers. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**.
+
+## 159. LLM data category: curriculum example interleaving (2026-06-15)
+
+This pass adds reusable data-shaping helpers for bounded model training. The
+goal is to make tiny local training runs smarter without blindly increasing
+corpus size: repeat high-signal examples and interleave them into the broader
+dataset under an explicit cap.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Curriculum repetition | **ADDED** | `stdlib:llm_data.sapp` exposes `repeat_examples(examples, times, max_total)`. |
+| Priority interleaving | **ADDED** | `interleave_priority_examples(base, priority, every, max_total)` mixes high-signal examples through a bounded base set. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies both helpers. |
+| Max integration | **USED** | `AAP/ai/pbai` now uses these helpers to reserve part of pbAI-Max's training budget for clean pblang curriculum snippets. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
+0 failed / 0 ignored** after the final cross-repo Max training run.
+
+## 158. LLM eval category: fast candidate-screening helpers (2026-06-14)
+
+This pass moves two pbAI-Max training-speed primitives into the shared pblang
+LLM eval layer: a cheap proxy record for candidates that intentionally skip
+prompt generation, and a reusable validation/regression selection score.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Regression proxy | **ADDED** | `stdlib:llm_eval.sapp` exposes `regression_proxy(valid_loss, mode)` returning `pblang.llm.regression_proxy.v1`. |
+| Selection score | **ADDED** | `selection_score(valid_loss, regression)` returns `pblang.llm.selection_score.v1` using validation loss plus pass-rate/score/failed-case weights. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies both helpers. |
+| Max integration | **USED** | `AAP/ai/pbai` uses these helpers to make quick continuation screening head-only and validation-only before full finalists run prompt regression. |
+
+Verification:
+
+```sh
+./target/debug/pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow=3
+```
+
+Result: focused LLM subset verification passed **3 passed / 0 failed /
+186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
+0 failed / 0 ignored** after the final cross-repo Max training run.

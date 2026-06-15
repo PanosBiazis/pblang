@@ -138,6 +138,87 @@ fn test_list_prints_discovered_tests_without_running_scripts() {
 }
 
 #[test]
+fn test_semantics_profile_expands_common_flags() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_semantics_profile_{nonce}"));
+    let tests_dir = work.join("tests").join("semantics");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp semantics dir");
+    std::fs::write(
+        tests_dir.join("sample.sapp"),
+        "print \"profile_should_be_quiet\";\nprint \"sample_pass\";\n",
+    )
+    .expect("write profile sample");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("semantics")
+        .output()
+        .expect("run pblang test semantics");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("running 1 tests")
+            && stdout.contains("test sample ... ok")
+            && stdout.contains("test result: ok. 1 passed; 0 failed"),
+        "semantics profile should run tests/semantics quietly. stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("profile_should_be_quiet") && !stdout.contains("sample_pass"),
+        "semantics profile should imply --quiet. stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_llm_profile_filters_and_prints_slow_timings() {
+    let bin = require_pblang_bin();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = std::env::temp_dir().join(format!("pblang_test_llm_profile_{nonce}"));
+    let tests_dir = work.join("tests").join("semantics");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&tests_dir).expect("create temp semantics dir");
+    std::fs::write(
+        tests_dir.join("sample.sapp"),
+        "fn test_llm_fast() { print \"llm_profile_should_be_quiet\"; }\nfn test_other() { print \"other\"; }\n",
+    )
+    .expect("write llm profile sample");
+
+    let out = Command::new(&bin)
+        .current_dir(&work)
+        .arg("test")
+        .arg("llm")
+        .output()
+        .expect("run pblang test llm");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&work);
+
+    assert!(out.status.success(), "stderr={stderr}\nstdout={stdout}");
+    assert!(
+        stdout.contains("running 1 tests")
+            && stdout.contains("test sample::test_llm_fast ... ok (")
+            && stdout.contains("1 filtered out")
+            && stdout.contains("slow tests:"),
+        "llm profile should filter LLM tests and enable timing output. stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("llm_profile_should_be_quiet") && !stdout.contains("\nother\n"),
+        "llm profile should imply --quiet. stdout={stdout}"
+    );
+}
+
+#[test]
 fn test_fail_fast_stops_after_first_failure() {
     let bin = require_pblang_bin();
     let nonce = std::time::SystemTime::now()

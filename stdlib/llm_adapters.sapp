@@ -1,0 +1,263 @@
+// stdlib/llm_adapters.sapp -- low-rank adapter utilities for pblang LLMs.
+//
+// This is the first LoRA-style foundation: train a small low-rank delta over the
+// LM head while keeping the base model weights frozen. Larger adapter targets
+// (Q/K/V/O, FFN, embeddings) should build on the same contract.
+
+let core = import("stdlib:llm_core.sapp");
+
+fn config(rank = 2, alpha = 1.0, target = "lm_head") {
+    if rank < 1 { rank = 1; }
+    if alpha <= 0.0 { alpha = rank; }
+    return map{
+        format: "pblang.llm.adapter_config.v1",
+        kind: "lora-style-low-rank",
+        target: target,
+        rank: rank,
+        alpha: alpha,
+        scaling: alpha / rank
+    };
+}
+
+fn trainable_params(ad) {
+    return len(ad.a_matrix) * len(ad.a_matrix[0]) + len(ad.b_matrix) * len(ad.b_matrix[0]);
+}
+
+fn _copy_matrix(m) {
+    let out = [];
+    let i = 0;
+    while i < len(m) {
+        push(out, core.copy_vec(m[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn lm_head_adapter(model, rank = 2, alpha = 1.0, seed = 1) {
+    let cfg = config(rank, alpha, "lm_head");
+    let d_model = len(model.lm_head);
+    let vocab = len(model.lm_head[0]);
+    return map{
+        format: "pblang.llm.lora_adapter.v1",
+        kind: "lora-style-low-rank",
+        target: "lm_head",
+        rank: cfg.rank,
+        alpha: cfg.alpha,
+        scaling: cfg.scaling,
+        base_d_model: d_model,
+        base_vocab: vocab,
+        a_matrix: core.randn_matrix(d_model, cfg.rank, seed + 11, 0.02),
+        b_matrix: core.zeros2(cfg.rank, vocab),
+        steps: 0,
+        step_count: 0,
+        examples: 0,
+        example_count: 0,
+        last_loss: 0.0,
+        base_weights_frozen: true,
+        trainable_params: d_model * cfg.rank + cfg.rank * vocab
+    };
+}
+
+fn from_state(ad, a_matrix, b_matrix, loss = 0.0, steps = 0, examples = 0) {
+    let rank_i = num_floor(ad.rank);
+    let base_d = len(a_matrix);
+    let base_v = 0;
+    if len(b_matrix) > 0 { base_v = len(b_matrix[0]); }
+    return map{
+        format: "pblang.llm.lora_adapter.v1",
+        kind: "lora-style-low-rank",
+        target: "lm_head",
+        rank: rank_i,
+        alpha: ad.alpha,
+        scaling: ad.scaling,
+        base_d_model: base_d,
+        base_vocab: base_v,
+        a_matrix: a_matrix,
+        b_matrix: b_matrix,
+        steps: steps,
+        step_count: steps,
+        examples: examples,
+        example_count: examples,
+        last_loss: loss,
+        base_weights_frozen: true,
+        trainable_params: base_d * rank_i + rank_i * base_v
+    };
+}
+
+fn summary(ad) {
+    return map{
+        format: "pblang.llm.adapter_summary.v1",
+        kind: try ad.kind catch "lora-style-low-rank",
+        target: ad.target,
+        rank: ad.rank,
+        alpha: ad.alpha,
+        scaling: ad.scaling,
+        base_d_model: ad.base_d_model,
+        base_vocab: ad.base_vocab,
+        trainable_params: trainable_params(ad),
+        steps: try ad.step_count catch try ad.steps catch 0,
+        examples: try ad.example_count catch try ad.examples catch 0,
+        last_loss: try ad.last_loss catch 0.0,
+        base_weights_frozen: try ad.base_weights_frozen catch true
+    };
+}
+
+fn delta_logits(hidden, ad) {
+    let mid = core.vecmat(hidden, ad.a_matrix);
+    return core.scale_vec(core.vecmat(mid, ad.b_matrix), ad.scaling);
+}
+
+fn logits(model, hidden, ad) {
+    let base = core.add_vec(core.vecmat(hidden, model.lm_head), model.lm_bias);
+    return core.add_vec(base, delta_logits(hidden, ad));
+}
+
+fn _dlogits(raw_logits, target_id) {
+    let p = core.softmax(raw_logits, 1.0);
+    let d = [];
+    let i = 0;
+    while i < len(p) {
+        if i == target_id { push(d, p[i] - 1.0); }
+        else { push(d, p[i]); }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn train_step(model, ad, hidden, target_id, lr = 0.01) {
+    let raw = logits(model, hidden, ad);
+    let loss = core.cross_entropy_from_logits(raw, target_id);
+    let dg = _dlogits(raw, target_id);
+    let mid = core.vecmat(hidden, ad.a_matrix);
+
+    let through = [];
+    let r = 0;
+    while r < ad.rank {
+        let ri = num_floor(r);
+        let through_b = 0.0;
+        let v = 0;
+        while v < len(dg) {
+            let vi = num_floor(v);
+            through_b = through_b + ad.b_matrix[ri][vi] * dg[vi] * ad.scaling;
+            v = v + 1;
+        }
+        push(through, through_b);
+        r = r + 1;
+    }
+
+    let next_b = [];
+    let r2 = 0;
+    while r2 < ad.rank {
+        let r2i = num_floor(r2);
+        let brow = [];
+        let v2 = 0;
+        while v2 < len(dg) {
+            let v2i = num_floor(v2);
+            push(brow, ad.b_matrix[r2i][v2i] - lr * mid[r2i] * dg[v2i] * ad.scaling);
+            v2 = v2 + 1;
+        }
+        push(next_b, brow);
+        r2 = r2 + 1;
+    }
+
+    let next_a = [];
+    let d2 = 0;
+    while d2 < len(ad.a_matrix) {
+        let d2i = num_floor(d2);
+        let arow = [];
+        let r3 = 0;
+        while r3 < ad.rank {
+            let r3i = num_floor(r3);
+            push(arow, ad.a_matrix[d2i][r3i] - lr * hidden[d2i] * through[r3i]);
+            r3 = r3 + 1;
+        }
+        push(next_a, arow);
+        d2 = d2 + 1;
+    }
+
+    let next_steps = (try ad.step_count catch try ad.steps catch 0) + 1;
+    let next_examples = (try ad.example_count catch try ad.examples catch 0) + 1;
+    return map{
+        format: "pblang.llm.lora_train_step.v1",
+        mode: "frozen-base-low-rank-lm-head-adapter",
+        loss: loss,
+        target: ad.target,
+        rank: ad.rank,
+        trainable_params: trainable_params(ad),
+        next_steps: next_steps,
+        next_examples: next_examples,
+        updated_a_matrix: next_a,
+        updated_b_matrix: next_b
+    };
+}
+
+fn train_epochs(model, ad, forward_hidden_fn, examples, epochs = 1, lr = 0.01, max_steps = 0) {
+    let total = 0.0;
+    let steps = 0;
+    let last = nil;
+    let e = 0;
+    while e < epochs {
+        let i = 0;
+        while i < len(examples) {
+            if max_steps > 0 and steps >= max_steps { break; }
+            let hs = forward_hidden_fn(model, examples[i].x);
+            let hidden = hs[len(hs) - 1];
+            last = train_step(model, ad, hidden, examples[i].y, lr);
+            ad = from_state(ad, last.updated_a_matrix, last.updated_b_matrix, last.loss, last.next_steps, last.next_examples);
+            total = total + last.loss;
+            steps = steps + 1;
+            i = i + 1;
+        }
+        e = e + 1;
+    }
+    let avg = 0.0;
+    if steps > 0 { avg = total / steps; }
+    let final_ad = ad;
+    if last != nil {
+        final_ad = from_state(ad, last.updated_a_matrix, last.updated_b_matrix, last.loss, steps, steps);
+    }
+    return map{
+        format: "pblang.llm.lora_training.v1",
+        mode: "frozen-base-low-rank-lm-head-adapter",
+        target: final_ad.target,
+        rank: final_ad.rank,
+        epochs: epochs,
+        steps: steps,
+        avg_loss: avg,
+        last: last,
+        adapter_summary: summary(final_ad),
+        summary: summary(final_ad)
+    };
+}
+
+fn merge_lm_head(model, ad, strength = 1.0) {
+    let merged_head = [];
+    let d = 0;
+    while d < len(model.lm_head) {
+        let row = [];
+        let v = 0;
+        while v < len(model.lm_head[d]) {
+            let delta = 0.0;
+            let r = 0;
+            while r < ad.rank {
+                delta = delta + ad.a_matrix[d][r] * ad.b_matrix[r][v];
+                r = r + 1;
+            }
+            push(row, model.lm_head[d][v] + delta * ad.scaling * strength);
+            v = v + 1;
+        }
+        push(merged_head, row);
+        d = d + 1;
+    }
+    model.lm_head = merged_head;
+    return map{
+        format: "pblang.llm.lora_merge.v1",
+        target: ad.target,
+        rank: ad.rank,
+        strength: strength,
+        merged_params: len(model.lm_head) * len(model.lm_head[0])
+    };
+}
+
+export config, lm_head_adapter, from_state, summary, trainable_params;
+export delta_logits, logits, train_step, train_epochs, merge_lm_head;

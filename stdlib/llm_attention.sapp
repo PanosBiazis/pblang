@@ -16,6 +16,10 @@ fn config(vocab_size, context, d_model, d_ff, layers, heads, seed) {
         d_ff: d_ff,
         layers: layers,
         heads: heads,
+        kv_heads: heads,
+        local_window: context,
+        global_every: 1,
+        attention_family: "full-causal",
         binary_bit_width: binary.bit_width(vocab_size),
         binary_scale: 0.05,
         growth_policy: map{
@@ -33,10 +37,171 @@ fn config(vocab_size, context, d_model, d_ff, layers, heads, seed) {
     };
 }
 
+fn gemma3_config(vocab_size, context, d_model, d_ff, layers, heads, kv_heads, local_window, global_every, seed) {
+    let cfg = config(vocab_size, context, d_model, d_ff, layers, heads, seed);
+    if kv_heads < 1 { kv_heads = 1; }
+    if kv_heads > heads { kv_heads = heads; }
+    if local_window < 1 { local_window = context; }
+    if global_every < 1 { global_every = 1; }
+    cfg.format = "pblang.llm.gemma3_style.config.v1";
+    cfg.kv_heads = kv_heads;
+    cfg.local_window = local_window;
+    cfg.global_every = global_every;
+    cfg.attention_family = "gemma3-style-local-global-gqa";
+    cfg.notes = [
+        "pblang implementation inspired by public Gemma 3 long-context architecture notes",
+        "uses periodic global layers plus local-window layers to reduce KV/cache pressure",
+        "grouped-query attention shares key/value head slices across query heads"
+    ];
+    return cfg;
+}
+
+fn ple_params(vocab_size, layers, ple_dim) {
+    if ple_dim < 0 { ple_dim = 0; }
+    return vocab_size * layers * ple_dim;
+}
+
+fn moe_plan(total_params, active_params, experts, active_experts) {
+    if experts < 1 { experts = 1; }
+    if active_experts < 1 { active_experts = 1; }
+    if active_experts > experts { active_experts = experts; }
+    let loaded_to_active = 0.0;
+    if active_params > 0 { loaded_to_active = total_params / active_params; }
+    return map{
+        format: "pblang.llm.moe_plan.v1",
+        total_params: total_params,
+        active_params: active_params,
+        experts: experts,
+        active_experts: active_experts,
+        loaded_to_active_ratio: loaded_to_active,
+        routing: "load-all-route-few",
+        note: "memory must hold total expert weights even when active params per token are lower"
+    };
+}
+
+fn mtp_plan(draft_tokens = 4, accept_rate = 0.75) {
+    if draft_tokens < 1 { draft_tokens = 1; }
+    if accept_rate < 0 { accept_rate = 0.0; }
+    if accept_rate > 1 { accept_rate = 1.0; }
+    let expected_tokens = 1.0 + draft_tokens * accept_rate;
+    return map{
+        format: "pblang.llm.mtp_plan.v1",
+        draft_tokens: draft_tokens,
+        accept_rate: accept_rate,
+        expected_tokens_per_verify: expected_tokens,
+        mode: "draft-model-speculative-decoding"
+    };
+}
+
+fn system_prompt_turn(system_prompt, user_prompt, thinking = false) {
+    let think = "";
+    if thinking { think = "<|think|>"; }
+    return map{
+        format: "pblang.llm.system_prompt_turn.v1",
+        system_prompt: system_prompt,
+        user_prompt: user_prompt,
+        thinking: thinking,
+        text: "<|turn>system\n" + system_prompt + "\n" + think + "<turn|>\n<|turn>user\n" + user_prompt + "<turn|>\n<|turn>model"
+    };
+}
+
+fn multimodal_projection_plan(input_kind, input_dim, d_model, tokens) {
+    if tokens < 1 { tokens = 1; }
+    return map{
+        format: "pblang.llm.multimodal_projection_plan.v1",
+        input_kind: input_kind,
+        input_dim: input_dim,
+        d_model: d_model,
+        tokens: tokens,
+        projection_params: input_dim * d_model,
+        output_shape: [tokens, d_model],
+        mode: "direct-linear-projection-to-language-space"
+    };
+}
+
+fn memory_requirement_bytes(params, bits = 16, overhead = 0.20) {
+    let base = params * bits / 8;
+    return base + base * overhead;
+}
+
+fn gemma4_config(name, vocab_size, context, d_model, d_ff, layers, heads, seed, opts = nil) {
+    if opts == nil { opts = map{}; }
+    let kv_heads = try opts.kv_heads catch heads;
+    let local_window = try opts.local_window catch context;
+    let global_every = try opts.global_every catch 4;
+    let total_params = try opts.total_params catch 0;
+    let active_params = try opts.active_params catch 0;
+    let experts = try opts.experts catch 1;
+    let active_experts = try opts.active_experts catch 1;
+    let draft_tokens = try opts.draft_tokens catch 4;
+    let accept_rate = try opts.accept_rate catch 0.75;
+    let cfg = gemma3_config(vocab_size, context, d_model, d_ff, layers, heads, kv_heads, local_window, global_every, seed);
+    cfg.format = "pblang.llm.gemma4_style.config.v1";
+    cfg.name = name;
+    cfg.attention_family = "gemma4-style-local-global-gqa";
+    cfg.system_prompt_support = true;
+    cfg.thinking_support = try opts.thinking catch true;
+    cfg.modalities = try opts.modalities catch ["text"];
+    cfg.ple_dim = try opts.ple_dim catch 0;
+    cfg.ple_params = ple_params(vocab_size, layers, cfg.ple_dim);
+    cfg.moe = moe_plan(total_params, active_params, experts, active_experts);
+    cfg.mtp = mtp_plan(draft_tokens, accept_rate);
+    cfg.memory = map{
+        format: "pblang.llm.gemma4_memory.v1",
+        bf16_bytes: memory_requirement_bytes(total_params, 16, 0.20),
+        q4_bytes: memory_requirement_bytes(total_params, 4, 0.20),
+        note: "base-weight estimate only; KV cache and runtime overhead need separate planning"
+    };
+    cfg.notes = [
+        "pblang Gemma 4 style planning contract",
+        "PLE, MoE, MTP, system-prompt, thinking, and multimodal projection are substrate metadata/planners unless a model explicitly uses them",
+        "does not include Google weights or private kernels"
+    ];
+    return cfg;
+}
+
+fn attention_plan(cfg) {
+    let layers = [];
+    let i = 0;
+    let ge = try cfg.global_every catch 1;
+    let lw = try cfg.local_window catch cfg.context;
+    let kvh = try cfg.kv_heads catch cfg.heads;
+    while i < cfg.layers {
+        let typ = "global";
+        if ge > 1 and num_mod(i + 1, ge) != 0 {
+            typ = "local";
+        }
+        push(layers, map{
+            layer: i,
+            attention: typ,
+            local_window: lw,
+            query_heads: cfg.heads,
+            kv_heads: kvh
+        });
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.llm.attention_plan.v1",
+        family: try cfg.attention_family catch "full-causal",
+        layers: layers,
+        local_window: try cfg.local_window catch cfg.context,
+        global_every: try cfg.global_every catch 1,
+        query_heads: cfg.heads,
+        kv_heads: try cfg.kv_heads catch cfg.heads
+    };
+}
+
 fn _layer_new(cfg, idx) {
     let d = cfg.d_model;
     let s = cfg.seed + idx * 100;
+    let ge = try cfg.global_every catch 1;
+    let attention_type = "global";
+    if ge > 1 and num_mod(idx + 1, ge) != 0 {
+        attention_type = "local";
+    }
     return map{
+        index: idx,
+        attention_type: attention_type,
         Wq: core.randn_matrix(d, d, s + 1, 0.04),
         Wk: core.randn_matrix(d, d, s + 2, 0.04),
         Wv: core.randn_matrix(d, d, s + 3, 0.04),
@@ -104,11 +269,11 @@ fn _write_slice(dst, start, values) {
     return dst;
 }
 
-fn _head_context(q, keys, values, pos, head_dim) {
+fn _head_context(q, keys, values, head_dim) {
     let scores = [];
     let scale = 1.0 / num_sqrt(head_dim);
     let i = 0;
-    while i <= pos {
+    while i < len(keys) {
         push(scores, core.dot(q, keys[i]) * scale);
         i = i + 1;
     }
@@ -122,9 +287,11 @@ fn _head_context(q, keys, values, pos, head_dim) {
     return ctx;
 }
 
-fn multi_head_attention(layer, x, heads) {
+fn multi_head_attention_window(layer, x, heads, kv_heads, local_window) {
     let d = len(x[0]);
     let head_dim = d / heads;
+    if kv_heads < 1 { kv_heads = heads; }
+    if kv_heads > heads { kv_heads = heads; }
     let q = [];
     let k = [];
     let v = [];
@@ -139,20 +306,30 @@ fn multi_head_attention(layer, x, heads) {
     let t = 0;
     while t < len(x) {
         let joined = core.zeros(d);
+        let first_pos = 0;
+        if local_window > 0 and local_window < t + 1 {
+            first_pos = t - local_window + 1;
+        }
         let h = 0;
         while h < heads {
             let start = h * head_dim;
             let end = start + head_dim;
+            let kv_h = h;
+            if kv_heads < heads {
+                kv_h = num_floor(h * kv_heads / heads);
+            }
+            let kv_start = kv_h * head_dim;
+            let kv_end = kv_start + head_dim;
             let qh = _slice(q[t], start, end);
             let kh = [];
             let vh = [];
-            let p = 0;
+            let p = first_pos;
             while p <= t {
-                push(kh, _slice(k[p], start, end));
-                push(vh, _slice(v[p], start, end));
+                push(kh, _slice(k[p], kv_start, kv_end));
+                push(vh, _slice(v[p], kv_start, kv_end));
                 p = p + 1;
             }
-            let ctx = _head_context(qh, kh, vh, t, head_dim);
+            let ctx = _head_context(qh, kh, vh, head_dim);
             joined = _write_slice(joined, start, ctx);
             h = h + 1;
         }
@@ -162,13 +339,21 @@ fn multi_head_attention(layer, x, heads) {
     return out;
 }
 
+fn multi_head_attention(layer, x, heads) {
+    return multi_head_attention_window(layer, x, heads, heads, len(x));
+}
+
 fn feed_forward(layer, x) {
     let h = core.relu_vec(core.add_vec(core.vecmat(x, layer.W1), layer.b1));
     return core.add_vec(core.vecmat(h, layer.W2), layer.b2);
 }
 
 fn decoder_layer(model, layer, x) {
-    let att = multi_head_attention(layer, x, model.config.heads);
+    let local_window = len(x);
+    if (try layer.attention_type catch "global") == "local" {
+        local_window = try model.config.local_window catch len(x);
+    }
+    let att = multi_head_attention_window(layer, x, model.config.heads, try model.config.kv_heads catch model.config.heads, local_window);
     let h = [];
     let i = 0;
     while i < len(x) {
@@ -218,6 +403,75 @@ fn generate(model, seed_ids, n) {
             i = i + 1;
         }
         push(ids, core.argmax(logits(model, ctx)));
+        step = step + 1;
+    }
+    return ids;
+}
+
+fn _copy_logits(v) {
+    let out = [];
+    let i = 0;
+    while i < len(v) {
+        push(out, v[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _recent_count(ids, token_id, window) {
+    let count = 0;
+    let start = len(ids) - window;
+    if start < 0 { start = 0; }
+    let i = start;
+    while i < len(ids) {
+        if ids[i] == token_id { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn _tail_run(ids) {
+    if len(ids) == 0 { return map{ token: -1, run: 0 }; }
+    let token = ids[len(ids) - 1];
+    let run = 0;
+    let i = len(ids) - 1;
+    while i >= 0 and ids[i] == token {
+        run = run + 1;
+        i = i - 1;
+    }
+    return map{ token: token, run: run };
+}
+
+fn repetition_penalized_logits(raw_logits, ids, recent_window = 16, repetition_penalty = 0.35, max_repeat = 4) {
+    let out = _copy_logits(raw_logits);
+    let i = 0;
+    while i < len(out) {
+        let c = _recent_count(ids, i, recent_window);
+        if c > 0 { out[i] = out[i] - repetition_penalty * c; }
+        i = i + 1;
+    }
+    let tail = _tail_run(ids);
+    if tail.token >= 0 and tail.token < len(out) and tail.run >= max_repeat {
+        out[tail.token] = -1000000000.0;
+    }
+    return out;
+}
+
+fn generate_safe(model, seed_ids, n, recent_window = 16, repetition_penalty = 0.35, max_repeat = 4) {
+    let ids = core.copy_vec(seed_ids);
+    let step = 0;
+    while step < n {
+        let start = len(ids) - model.config.context;
+        if start < 0 { start = 0; }
+        let ctx = [];
+        let i = start;
+        while i < len(ids) {
+            push(ctx, ids[i]);
+            i = i + 1;
+        }
+        let raw = logits(model, ctx);
+        let penalized = repetition_penalized_logits(raw, ids, recent_window, repetition_penalty, max_repeat);
+        push(ids, core.argmax(penalized));
         step = step + 1;
     }
     return ids;
@@ -340,6 +594,15 @@ fn summary(model) {
         d_ff: model.config.d_ff,
         layers: model.config.layers,
         heads: model.config.heads,
+        kv_heads: try model.config.kv_heads catch model.config.heads,
+        attention_family: try model.config.attention_family catch "full-causal",
+        system_prompt_support: try model.config.system_prompt_support catch false,
+        thinking_support: try model.config.thinking_support catch false,
+        modalities: try model.config.modalities catch ["text"],
+        ple_params: try model.config.ple_params catch 0,
+        moe: try model.config.moe catch nil,
+        mtp: try model.config.mtp catch nil,
+        attention_plan: attention_plan(model.config),
         binary_bit_width: try model.config.binary_bit_width catch binary.bit_width(model.config.vocab_size),
         binary_adapter: true,
         binary_scale: try model.config.binary_scale catch 0.05,
@@ -349,7 +612,9 @@ fn summary(model) {
     };
 }
 
-export config, model_new, embed, multi_head_attention, decoder_layer, forward_hidden;
-export binary_embedding, logits, loss, generate;
+export config, gemma3_config, gemma4_config, attention_plan, ple_params, moe_plan, mtp_plan;
+export system_prompt_turn, multimodal_projection_plan, memory_requirement_bytes;
+export model_new, embed, multi_head_attention, multi_head_attention_window, decoder_layer, forward_hidden;
+export binary_embedding, logits, loss, generate, repetition_penalized_logits, generate_safe;
 export add_decoder_layer, extend_context, set_binary_scale, set_growth_policy;
 export live_architecture_update, manipulate, summary;
