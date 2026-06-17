@@ -477,7 +477,7 @@ All major commands implemented:
 - ✅ Design in `docs/TLS_notes.md`
 - ✅ Per-request timeout in HTTP server (W4-alpha)
 - ✅ SSE support in HTTP server
-- ✅ `tcp_set_timeout()` builtin
+- ✅ VM-level TCP read/write timeout through `VmLimits.io_timeout_ms` (no script-level `tcp_set_timeout` builtin in this build)
 
 **What's Missing**:
 - ⏳ Expanded cross-platform cert-path test matrix
