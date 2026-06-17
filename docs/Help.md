@@ -39,7 +39,7 @@ Rewrite this file after every run to reflect the next batch.
 | **G3-alpha** | `stdlib/collections.sapp`; `stdlib/array.sapp` exposes native flatten/unique/zip/chunk/take/drop plus find/count/partition helpers; `stdlib/map.sapp` adds copy/defaults/merge_all/optimized omit/update/rename/sorted-key helpers; tests; docs updated. |
 | **L3-alpha** | `pblang fmt` blank line between `fn`; test; docs updated. |
 | **E5-alpha** | `docs/Native_backend_notes.md` Stage A+B design; cross-ref. |
-| **W4-alpha** | `tcp_set_timeout`; http_server timeout/SSE; `docs/TLS_notes.md`; test. |
+| **W4-alpha** | VM-level `io_timeout_ms`; http_server timeout compatibility helpers/SSE; `docs/TLS_notes.md`; test. |
 | **A4-alpha** | `get_stream`, `post_stream`, `parse_sse_line`; example; test. |
 | **Q3-alpha** | `run(circ)`, `measurements_to_string`, `measurements_to_int`; test. |
 
