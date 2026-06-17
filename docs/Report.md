@@ -178,8 +178,15 @@
 - **docs/Tooling.md**: A4-alpha στο stdlib http.sapp bullet.
 
 ### W4-alpha — Per-request timeout + SSE + TLS research (Μάρτιος 2026)
-- **crates/pblang-vm**: builtin **tcp_set_timeout(stream_handle, timeout_ms)** — sets read/write timeout on TCP stream (allow_net; 0 = no timeout). Uses with_net_table get_mut on NetResource::Stream.
-- **stdlib/http_server.sapp**: **serve_once_timeout(addr, timeout_ms, handler)**, **serve_forever_timeout(addr, timeout_ms, handler)** (tcp_set_timeout after accept); **sse_event(event, data)** (SSE frame string); **res_sse_headers()** (200, text/event-stream, Cache-Control no-cache). Export extended.
+- **Correction (2026-06-17):** this build does not expose a script-level
+  `tcp_set_timeout(stream_handle, timeout_ms)` builtin. TCP read/write timeout is
+  controlled by the host VM limit `VmLimits.io_timeout_ms`. The stdlib
+  `serve_once_timeout(...)` / `serve_forever_timeout(...)` helpers are kept for
+  compatibility: `timeout_ms=0` is a no-op, while nonzero values now fail loudly
+  instead of pretending per-socket timeout was applied.
+- **stdlib/http_server.sapp**: **sse_event(event, data)** (SSE frame string);
+  **res_sse_headers()** (200, text/event-stream, Cache-Control no-cache). Export
+  extended.
 - **docs/TLS_notes.md**: TLS research note — host-bridge (rustls StreamOwned), FFI plugin alternative, non-goals, minimal VM change (pblangStream trait, tcp_listen_tls stub). Status: design, not implemented.
 - **tests/semantics/http_server_timeout_test.sapp** + **http_server_timeout_serve_once_pass** (exports + sse_event/res_sse_headers).
 - **docs/Tooling.md**: W4-alpha in http_server bullet + TLS_notes.md reference.

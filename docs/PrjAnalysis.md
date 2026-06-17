@@ -3761,6 +3761,31 @@ Result: focused LLM subset verification passed **3 passed / 0 failed /
 186 filtered out**. The Max fixture remains the slow path at about **4.97s**.
 The full canonical `.sapp` suite passed **189 passed / 0 failed / 0 ignored**.
 
+## 161. Frontend and HTTP hardening for pbAI-Max verification (2026-06-17)
+
+This pass supports pbAI-Max verified generation while also fixing two true
+project-review findings in pblang's own stdlib surface.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Safe self-host parser API | **ADDED** | `stdlib/compiler/selfhost_frontend.sapp` now exposes `frontend_parse_safe(source)`, which catches tokenizer/parser exceptions and returns `pblang.frontend.parse_safe.v1` diagnostics instead of throwing. |
+| HTTP response splitting | **HARDENED** | `stdlib:http_server.sapp` validates custom header names, skips CR/LF-bearing values, and falls back to `text/plain` for unsafe content types before building the response string. |
+| Timeout helper honesty | **FIXED** | `serve_once_timeout` / `serve_forever_timeout` now fail loudly for nonzero `timeout_ms` because this build only exposes VM-level `io_timeout_ms`, not script-level per-socket timeout control. |
+| Regression coverage | **ADDED** | New semantic tests lock `frontend_parse_safe` and HTTP header/timeout behavior. |
+| Docs | **UPDATED** | `docs/Tooling.md` no longer claims a non-existent `tcp_set_timeout` builtin and documents the actual VM-level timeout boundary. |
+
+Verification:
+
+```sh
+pblang run tests/semantics/selfhost_parse_safe_test.sapp --allow-all
+pblang run tests/semantics/http_server_security_test.sapp --allow-all
+```
+
+Result: both focused semantic tests passed (`selfhost_parse_safe_pass`,
+`http_server_security_pass`).
+
 ## 160. LLM training category: parallel sharded LM-head training (2026-06-15)
 
 This pass adds a pblang-native parallel training primitive for LM-head updates.
