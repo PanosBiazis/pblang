@@ -1799,6 +1799,23 @@ fn optimize_chunk(chunk: &mut Chunk) {
     // Walk the instruction list looking for pairs: OpConstant(a) + OpConstant(b) + OpXxx
     // where OpXxx is a pure arithmetic/comparison op. Replace with a single OpConstant(result).
     let n = chunk.instructions.len();
+    // Collect jump/branch targets so we never fold across a basic-block boundary.
+    // Control flow can enter the middle of a 3-instruction window — e.g. a try/catch's
+    // success path jumps onto the RHS `OpConstant` of a following comparison — and folding
+    // the window into one constant would corrupt that entry. (This was the root cause of
+    // `(try x catch <num>) <op> <num>` mis-evaluating.)
+    let mut jump_targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for op in &chunk.instructions {
+        match op {
+            OpCode::OpJump(t)
+            | OpCode::OpJumpIfFalse(t)
+            | OpCode::OpJumpIfTrue(t)
+            | OpCode::OpTry(t) => {
+                jump_targets.insert(*t);
+            }
+            _ => {}
+        }
+    }
     let mut i = 0usize;
     while i + 2 < n {
         // Peek at three consecutive instructions
@@ -1806,7 +1823,12 @@ fn optimize_chunk(chunk: &mut Chunk) {
         let op1 = chunk.instructions.get(i + 1).cloned();
         let op2 = chunk.instructions.get(i + 2).cloned();
 
-        // Pattern: OpConstant(a), OpConstant(b), BinaryOp → fold to OpConstant(result)
+        // Pattern: OpConstant(a), OpConstant(b), BinaryOp → fold to OpConstant(result),
+        // but only if no branch can land on i+1/i+2 (same basic block).
+        if jump_targets.contains(&(i + 1)) || jump_targets.contains(&(i + 2)) {
+            i += 1;
+            continue;
+        }
         if let (Some(OpCode::OpConstant(ia)), Some(OpCode::OpConstant(ib)), Some(ref arith)) =
             (op0, op1, op2)
         {
