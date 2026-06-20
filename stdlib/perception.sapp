@@ -1,0 +1,121 @@
+// stdlib/perception.sapp — local "computer-use" perception (screen / OCR / audio),
+// every capture routed through the Master Control safety core. Perception is read-only
+// observation of THIS machine; it still requires a human unlock + per-action approval,
+// is audit-logged, and can never run while the kill switch is engaged.
+//
+// Flow (human-in-the-loop):
+//   let p = import("stdlib:perception.sapp");
+//   let req = p.screen();              // -> { status:"pending", id } (or denied if locked)
+//   let res = p.run(req.id, nonce);    // human approves with the unlock nonce, then it runs
+//
+// Backends shell out to whatever capture tools exist (gnome-screenshot/import, tesseract,
+// arecord) and degrade to { available:false } when none are present or there's no display.
+
+let mc    = import("stdlib:master_control.sapp");
+let watch = import("stdlib:watch.sapp");
+
+let _execs = map{};   // pending request id -> executor closure
+
+fn _has_tool(name) {
+    let r = try proc_spawn_wait("which", [name]) catch nil;
+    return r != nil and (try r.exit_code catch 1) == 0;
+}
+
+fn backends() {
+    return map{
+        screenshot: _has_tool("gnome-screenshot") or _has_tool("import") or _has_tool("scrot") or _has_tool("maim"),
+        ocr: _has_tool("tesseract"),
+        audio: _has_tool("arecord"),
+    };
+}
+
+// ── capture backends (run inside an approved master-control execute) ──────────
+fn _do_screen(opts) {
+    let out = try opts.out catch "/tmp/pb_screen.png";
+    let tool = nil;
+    let args = [];
+    if _has_tool("gnome-screenshot") { tool = "gnome-screenshot"; args = ["-f", out]; }
+    else if _has_tool("scrot") { tool = "scrot"; args = ["-o", out]; }
+    else if _has_tool("maim") { tool = "maim"; args = [out]; }
+    else if _has_tool("import") { tool = "import"; args = ["-window", "root", out]; }
+    if tool == nil { return map{ available: false, note: "no screenshot tool installed" }; }
+    let r = try proc_spawn_wait(tool, args) catch nil;
+    if r == nil or (try r.exit_code catch 1) != 0 {
+        return map{ available: false, tool: tool, note: "capture failed (no display?)" };
+    }
+    let meta = try watch.image(out) catch map{};
+    return map{ available: true, tool: tool, path: out,
+                format: try meta.format catch nil, width: try meta.width catch nil, height: try meta.height catch nil };
+}
+
+fn _do_ocr(path) {
+    if not _has_tool("tesseract") { return map{ available: false, note: "tesseract not installed" }; }
+    let r = try proc_spawn_wait("tesseract", [path, "stdout"]) catch nil;
+    if r == nil { return map{ available: false, note: "ocr failed" }; }
+    return map{ available: true, exit_code: try r.exit_code catch nil, text: try r.stdout catch "" };
+}
+
+fn _do_audio(seconds) {
+    let out = "/tmp/pb_audio.wav";
+    if not _has_tool("arecord") { return map{ available: false, note: "arecord not installed" }; }
+    let r = try proc_spawn_wait("arecord", ["-q", "-d", str(seconds), "-f", "cd", out]) catch nil;
+    if r == nil or (try r.exit_code catch 1) != 0 { return map{ available: false, note: "record failed (no input device?)" }; }
+    let meta = try watch.audio(out) catch map{};
+    return map{ available: true, path: out, seconds: seconds,
+                sample_rate: try meta.sample_rate catch nil, duration_sec: try meta.duration_sec catch nil };
+}
+
+// ── gating: request -> (human approve) -> execute ────────────────────────────
+fn _gated(action, executor) {
+    let req = mc.request(action);
+    if req.status != "pending" {
+        return map{ status: req.status, reason: try req.reason catch "" };
+    }
+    _execs[str(req.id)] = executor;
+    return map{ status: "pending", id: req.id, capability: action.kind, note: "approve+run with run(id, nonce)" };
+}
+
+// Capability requests. Each returns a pending id (or "denied" if master control is
+// locked / the action is disallowed). Nothing is captured until a human approves.
+fn screen(opts = nil) {
+    if opts == nil { opts = map{}; }
+    return _gated(map{ kind: "screen" }, fn() { return _do_screen(opts); });
+}
+fn ocr(path) {
+    return _gated(map{ kind: "ocr", path: path }, fn() { return _do_ocr(path); });
+}
+fn audio(seconds = nil) {
+    if seconds == nil { seconds = 3; }
+    return _gated(map{ kind: "audio" }, fn() { return _do_audio(seconds); });
+}
+
+// Live screen sampling request: capture every interval_ms for `count` frames. Each frame
+// is still one approved execute, so a human stays in the loop.
+fn screen_sampling(count, interval_ms, opts = nil) {
+    if opts == nil { opts = map{}; }
+    return _gated(map{ kind: "screen", mode: "sampling", count: count, interval_ms: interval_ms },
+                  fn() {
+                      let frames = [];
+                      let i = 0;
+                      while i < count {
+                          array_push(frames, _do_screen(opts));
+                          i = i + 1;
+                          if i < count { sleep_ms(interval_ms); }
+                      }
+                      return map{ available: true, frames: frames };
+                  });
+}
+
+// Human approves a pending capability and runs it. `nonce` must match the unlock token.
+fn run(id, nonce) {
+    let a = mc.approve(id, nonce);
+    if not a.ok { return map{ ok: false, reason: a.reason }; }
+    let key = str(id);
+    let ex = _execs[key];
+    if ex == nil { return map{ ok: false, reason: "no pending executor for id " + str(id) }; }
+    let r = mc.execute(id, ex);
+    _execs[key] = nil;
+    return r;
+}
+
+export backends, screen, ocr, audio, screen_sampling, run;
