@@ -1,0 +1,205 @@
+// stdlib/storage.sapp — a Delphi-style compressed STORAGE container for pblang.
+//
+// Put files/folders/data into one storage; each entry is compressed on insert and
+// decompressed ON DEMAND when the program needs it. Save/load the whole thing as a
+// single binary file. The codec is pluggable (default: stdlib:pbz.sapp) so a faster or
+// smaller backend can be swapped in without changing the container format/API.
+//
+//   let S = import("stdlib:storage.sapp");
+//   let st = S.create();
+//   S.put(st, "readme", "hello");          // a string
+//   S.put_file(st, "logo.png", "logo.png"); // a file (bytes)
+//   S.put_folder(st, "src/", "src");        // a folder, recursively
+//   S.save(st, "assets.pbst");
+//   ... later ...
+//   let st2 = S.load("assets.pbst");
+//   let text = S.get(st2, "readme");        // decompressed on demand
+
+let Z  = import("stdlib:pbz.sapp");
+let FS = import("stdlib:fs.sapp");
+
+let MAGIC = [80, 66, 83, 84];   // "PBST"
+
+// ── construction ──────────────────────────────────────────────────────────────
+fn create() { return map{ entries: map{}, order: [], codec: "pbz" }; }
+
+fn _store(st, name, bytes, is_text) {
+    let comp = Z.compress(bytes);
+    if not map_has(st.entries, name) { array_push(st.order, name); }
+    st.entries[name] = map{ orig_len: len(bytes), comp_len: len(comp), comp: comp, text: is_text };
+    return st;
+}
+
+fn put(st, name, data) {
+    if type(data) == "string" { return _store(st, name, str_to_bytes(data), true); }
+    return _store(st, name, data, false);
+}
+
+fn put_file(st, name, path) {
+    let raw = try fs_read_bytes(path) catch nil;
+    if raw == nil { return map{ ok: false, error: "cannot read: " + str(path) }; }
+    _store(st, name, raw, false);
+    return map{ ok: true, name: name, bytes: len(raw) };
+}
+
+fn _walk_put(st, prefix, dir, base) {
+    let items = try FS.listdir(dir) catch [];
+    let i = 0;
+    while i < len(items) {
+        let nm = items[i];
+        if nm != ".git" and nm != "target" and nm != "node_modules" {
+            let full = dir + "/" + nm;
+            let rel = prefix + nm;
+            let sub = try FS.listdir(full) catch nil;
+            if sub != nil {
+                _walk_put(st, rel + "/", full, base);
+            } else {
+                let raw = try fs_read_bytes(full) catch nil;
+                if raw != nil { _store(st, rel, raw, false); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn put_folder(st, prefix, dir) {
+    if prefix == nil { prefix = ""; }
+    _walk_put(st, prefix, dir, dir);
+    return st;
+}
+
+// ── access (decompress on demand) ───────────────────────────────────────────────
+fn has(st, name) { return map_has(st.entries, name); }
+
+fn get_bytes(st, name) {
+    if not map_has(st.entries, name) { return nil; }
+    return Z.decompress(st.entries[name].comp);
+}
+
+fn get(st, name) {
+    if not map_has(st.entries, name) { return nil; }
+    let e = st.entries[name];
+    let bytes = Z.decompress(e.comp);
+    if e.text { return bytes_to_str(bytes); }
+    return bytes;
+}
+
+fn remove(st, name) {
+    if not map_has(st.entries, name) { return st; }
+    map_remove(st.entries, name);
+    let no = [];
+    let i = 0;
+    while i < len(st.order) { if st.order[i] != name { array_push(no, st.order[i]); } i = i + 1; }
+    st.order = no;
+    return st;
+}
+
+fn list(st) {
+    let out = [];
+    let i = 0;
+    while i < len(st.order) {
+        let nm = st.order[i];
+        let e = st.entries[nm];
+        array_push(out, map{ name: nm, orig_len: e.orig_len, comp_len: e.comp_len });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn stats(st) {
+    let orig = 0;
+    let comp = 0;
+    let i = 0;
+    while i < len(st.order) {
+        let e = st.entries[st.order[i]];
+        orig = orig + e.orig_len;
+        comp = comp + e.comp_len;
+        i = i + 1;
+    }
+    return map{ entries: len(st.order), original_bytes: orig, compressed_bytes: comp, ratio: Z.ratio(orig, comp) };
+}
+
+// ── serialization (single binary file) ──────────────────────────────────────────
+fn _w32(out, v) {
+    array_push(out, bit_and(bit_shr(v, 24), 255));
+    array_push(out, bit_and(bit_shr(v, 16), 255));
+    array_push(out, bit_and(bit_shr(v, 8), 255));
+    array_push(out, bit_and(v, 255));
+}
+fn _w16(out, v) {
+    array_push(out, bit_and(bit_shr(v, 8), 255));
+    array_push(out, bit_and(v, 255));
+}
+fn _wstr(out, s) {
+    let b = str_to_bytes(s);
+    _w16(out, len(b));
+    let i = 0;
+    while i < len(b) { array_push(out, b[i]); i = i + 1; }
+}
+
+fn save(st, path) {
+    let out = [];
+    let i = 0;
+    while i < 4 { array_push(out, MAGIC[i]); i = i + 1; }
+    _w32(out, len(st.order));
+    let e = 0;
+    while e < len(st.order) {
+        let nm = st.order[e];
+        let en = st.entries[nm];
+        _wstr(out, nm);
+        if en.text { array_push(out, 1); } else { array_push(out, 0); }
+        _w32(out, en.orig_len);
+        _w32(out, en.comp_len);
+        let c = 0;
+        while c < len(en.comp) { array_push(out, en.comp[c]); c = c + 1; }
+        e = e + 1;
+    }
+    let ok = try fs_write_bytes(path, out) catch false;
+    return map{ ok: ok != false, path: path, bytes: len(out), entries: len(st.order) };
+}
+
+fn _r32(b, pos) {
+    let v = b[pos.i] * 16777216 + b[pos.i + 1] * 65536 + b[pos.i + 2] * 256 + b[pos.i + 3];
+    pos.i = pos.i + 4;
+    return v;
+}
+fn _r16(b, pos) {
+    let v = b[pos.i] * 256 + b[pos.i + 1];
+    pos.i = pos.i + 2;
+    return v;
+}
+fn _rstr(b, pos) {
+    let n = _r16(b, pos);
+    let sub = [];
+    let i = 0;
+    while i < n { array_push(sub, b[pos.i + i]); i = i + 1; }
+    pos.i = pos.i + n;
+    return bytes_to_str(sub);
+}
+
+fn load(path) {
+    let b = try fs_read_bytes(path) catch nil;
+    if b == nil or len(b) < 8 { return nil; }
+    if b[0] != MAGIC[0] or b[1] != MAGIC[1] or b[2] != MAGIC[2] or b[3] != MAGIC[3] { return nil; }
+    let st = create();
+    let pos = map{ i: 4 };
+    let count = _r32(b, pos);
+    let e = 0;
+    while e < count {
+        let nm = _rstr(b, pos);
+        let is_text = b[pos.i] == 1;
+        pos.i = pos.i + 1;
+        let orig_len = _r32(b, pos);
+        let comp_len = _r32(b, pos);
+        let comp = [];
+        let c = 0;
+        while c < comp_len { array_push(comp, b[pos.i + c]); c = c + 1; }
+        pos.i = pos.i + comp_len;
+        array_push(st.order, nm);
+        st.entries[nm] = map{ orig_len: orig_len, comp_len: comp_len, comp: comp, text: is_text };
+        e = e + 1;
+    }
+    return st;
+}
+
+export create, put, put_file, put_folder, has, get, get_bytes, remove, list, stats, save, load;
