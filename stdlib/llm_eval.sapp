@@ -90,6 +90,31 @@ fn _is_space_code(c) {
     return c == 9 or c == 10 or c == 13 or c == 32;
 }
 
+fn _contains_forbidden_text(lower_text, forbidden) {
+    let f = str_lower(str(forbidden));
+    if f == "" { return false; }
+    let base = 0;
+    let rest = lower_text;
+    while true {
+        let pos = str_index_of(rest, f);
+        if pos < 0 { return false; }
+        let actual = base + pos;
+        let ok = true;
+        if _is_alnum_code(strcharcodeat(f, 0)) and actual > 0 and _is_alnum_code(strcharcodeat(lower_text, actual - 1)) {
+            ok = false;
+        }
+        let end = actual + len(f);
+        if _is_alnum_code(strcharcodeat(f, len(f) - 1)) and end < len(lower_text) and _is_alnum_code(strcharcodeat(lower_text, end)) {
+            ok = false;
+        }
+        if ok { return true; }
+        base = actual + 1;
+        if base >= len(lower_text) { return false; }
+        rest = str_slice(lower_text, base, len(lower_text));
+    }
+    return false;
+}
+
 fn text_shape(text) {
     let opens = 0;
     let closes = 0;
@@ -177,7 +202,7 @@ fn generation_quality(prompt, text, expected = nil, forbidden = nil, min_generat
     while j < len(forbidden) {
         max_score = max_score + 2;
         let f = str(forbidden[j]);
-        if str_contains(lc, str_lower(f)) {
+        if _contains_forbidden_text(lc, f) {
             forbidden_hits = forbidden_hits + 1;
             push(details, "forbidden:" + f);
         } else {
@@ -263,6 +288,236 @@ fn choose_generation(prompt, texts, expected = nil, forbidden = nil, min_generat
     };
 }
 
+fn teacher_record_quality(record, min_chars = 40, min_score = 0.65) {
+    let text = str(try record.teacher_text catch "");
+    let prompt = str(try record.prompt catch "");
+    let expected = try record.expected catch [];
+    let forbidden = try record.forbidden catch [];
+    let source = str(try record.teacher_text_source catch "unknown");
+    let chars = len(text);
+    let q = generation_quality(prompt, text, expected, forbidden, 1, 8);
+    let shape = text_shape(text);
+    let length_score = 1.0;
+    if chars < min_chars {
+        length_score = chars / min_chars;
+    }
+    if length_score < 0.0 { length_score = 0.0; }
+    if length_score > 1.0 { length_score = 1.0; }
+
+    let score = q.normalized * 0.60 + shape.score * 0.30 + length_score * 0.10;
+    let reasons = [];
+    if chars < min_chars { push(reasons, "teacher-text-too-short"); }
+    if q.forbidden_hits > 0 { push(reasons, "forbidden-token-hit"); }
+    if not q.passed { push(reasons, "generation-quality-failed"); }
+    if shape.score < 0.55 { push(reasons, "text-shape-weak"); }
+    if score < min_score { push(reasons, "teacher-score-low"); }
+    return map{
+        format: "pblang.llm.teacher_record_quality.v1",
+        source: source,
+        chars: chars,
+        min_chars: min_chars,
+        score: score,
+        min_score: min_score,
+        passed: len(reasons) == 0,
+        reasons: reasons,
+        generation_quality: q,
+        text_shape: shape
+    };
+}
+
+fn teacher_dataset_quality(records, min_chars = 40, min_score = 0.65) {
+    let qualities = [];
+    let passed = 0;
+    let failed = 0;
+    let total_score = 0.0;
+    let total_chars = 0;
+    let min_seen_chars = 0;
+    let i = 0;
+    while i < len(records) {
+        let q = teacher_record_quality(records[i], min_chars, min_score);
+        push(qualities, q);
+        total_score = total_score + q.score;
+        total_chars = total_chars + q.chars;
+        if i == 0 or q.chars < min_seen_chars { min_seen_chars = q.chars; }
+        if q.passed { passed = passed + 1; }
+        else { failed = failed + 1; }
+        i = i + 1;
+    }
+    let avg_score = 0.0;
+    let avg_chars = 0.0;
+    if len(records) > 0 {
+        avg_score = total_score / len(records);
+        avg_chars = total_chars / len(records);
+    }
+    return map{
+        format: "pblang.llm.teacher_dataset_quality.v1",
+        records: len(records),
+        passed_records: passed,
+        failed_records: failed,
+        min_chars: min_chars,
+        min_score: min_score,
+        min_seen_chars: min_seen_chars,
+        avg_chars: avg_chars,
+        avg_score: avg_score,
+        passed: len(records) > 0 and failed == 0 and avg_score >= min_score,
+        qualities: qualities,
+        policy: "teacher data must be long enough, avoid forbidden tokens, and pass generation/text-shape checks before distillation"
+    };
+}
+
+fn _abs_num(x) {
+    if x < 0 { return 0 - x; }
+    return x;
+}
+
+fn objective_component(name, value, target, direction = "higher", weight = 1.0) {
+    let gap = 0.0;
+    if direction == "lower" {
+        if value > target { gap = value - target; }
+    } else if direction == "near" {
+        gap = _abs_num(value - target);
+    } else {
+        if value < target { gap = target - value; }
+    }
+    let scale = _abs_num(target);
+    if scale < 1.0 { scale = 1.0; }
+    let normalized = gap / scale;
+    if normalized < 0.0 { normalized = 0.0; }
+    let weighted = normalized * weight;
+    return map{
+        format: "pblang.llm.objective_component.v1",
+        name: name,
+        value: value,
+        target: target,
+        direction: direction,
+        weight: weight,
+        gap: gap,
+        normalized_gap: normalized,
+        weighted_gap: weighted,
+        passed: gap <= 0.0
+    };
+}
+
+fn objective_distance(components) {
+    let total_weight = 0.0;
+    let total_gap = 0.0;
+    let passed = 0;
+    let failed = 0;
+    let i = 0;
+    while i < len(components) {
+        total_weight = total_weight + components[i].weight;
+        total_gap = total_gap + components[i].weighted_gap;
+        if components[i].passed { passed = passed + 1; }
+        else { failed = failed + 1; }
+        i = i + 1;
+    }
+    let distance = 0.0;
+    if total_weight > 0 { distance = total_gap / total_weight; }
+    return map{
+        format: "pblang.llm.objective_distance.v1",
+        components: components,
+        component_count: len(components),
+        passed_components: passed,
+        failed_components: failed,
+        total_weight: total_weight,
+        distance: distance,
+        alignment_score: 1.0 / (1.0 + distance),
+        passed: len(components) > 0 and failed == 0
+    };
+}
+
+fn reinforcement_from_objective(previous, current, tolerance = 0.0001) {
+    let delta = previous.distance - current.distance;
+    let action = "neutral";
+    if delta > tolerance { action = "reward"; }
+    if delta < 0 - tolerance { action = "punish"; }
+    return map{
+        format: "pblang.llm.objective_reinforcement.v1",
+        action: action,
+        score: delta,
+        reward: action == "reward",
+        punish: action == "punish",
+        neutral: action == "neutral",
+        previous_distance: previous.distance,
+        current_distance: current.distance,
+        tolerance: tolerance,
+        reason: "reward if objective distance decreases; punish if it increases; neutral inside tolerance"
+    };
+}
+
+fn trial_candidate(name, previous_objective, current_objective, metadata = nil) {
+    if metadata == nil { metadata = map{}; }
+    let reinforcement = reinforcement_from_objective(previous_objective, current_objective, 0.0001);
+    return map{
+        format: "pblang.llm.trial_candidate.v1",
+        name: name,
+        previous_state: previous_objective,
+        current_state: current_objective,
+        previous_distance: previous_objective.distance,
+        current_distance: current_objective.distance,
+        delta: reinforcement.score,
+        reinforcement: reinforcement,
+        accepted: reinforcement.reward,
+        metadata: metadata
+    };
+}
+
+fn select_trial_elites(candidates, keep_n = 1) {
+    if keep_n < 1 { keep_n = 1; }
+    let pending = [];
+    let i = 0;
+    let rewarded = 0;
+    let punished = 0;
+    let neutral = 0;
+    while i < len(candidates) {
+        push(pending, candidates[i]);
+        if candidates[i].reinforcement.reward { rewarded = rewarded + 1; }
+        else if candidates[i].reinforcement.punish { punished = punished + 1; }
+        else { neutral = neutral + 1; }
+        i = i + 1;
+    }
+    let ranked = [];
+    while len(pending) > 0 {
+        let best_idx = 0;
+        let j = 1;
+        while j < len(pending) {
+            let better = false;
+            if pending[j].current_distance < pending[best_idx].current_distance { better = true; }
+            if pending[j].current_distance == pending[best_idx].current_distance and pending[j].delta > pending[best_idx].delta { better = true; }
+            if better { best_idx = j; }
+            j = j + 1;
+        }
+        push(ranked, pending[best_idx]);
+        let next = [];
+        let k = 0;
+        while k < len(pending) {
+            if k != best_idx { push(next, pending[k]); }
+            k = k + 1;
+        }
+        pending = next;
+    }
+    let kept = [];
+    let rejected = [];
+    let r = 0;
+    while r < len(ranked) {
+        if r < keep_n { push(kept, ranked[r]); }
+        else { push(rejected, ranked[r]); }
+        r = r + 1;
+    }
+    return map{
+        format: "pblang.llm.trial_elite_selection.v1",
+        candidates: ranked,
+        kept: kept,
+        rejected: rejected,
+        keep_n: keep_n,
+        rewarded: rewarded,
+        punished: punished,
+        neutral: neutral,
+        best: if len(kept) > 0 { kept[0] } else { nil },
+        policy: "rank by lowest current objective distance, then largest positive delta"
+    };
+}
+
 fn regression_proxy(valid_loss, mode = "validation-only-quick-screen") {
     return map{
         format: "pblang.llm.regression_proxy.v1",
@@ -318,4 +573,4 @@ fn benchmark_generate(model, generate_fn, seed_ids, n, iterations) {
     };
 }
 
-export evaluate, sequence_evaluate, regression_prompt, max_repetition_run, text_shape, generation_quality, choose_generation, regression_proxy, selection_score, benchmark_generate;
+export evaluate, sequence_evaluate, regression_prompt, max_repetition_run, text_shape, generation_quality, choose_generation, teacher_record_quality, teacher_dataset_quality, objective_component, objective_distance, reinforcement_from_objective, trial_candidate, select_trial_elites, regression_proxy, selection_score, benchmark_generate;

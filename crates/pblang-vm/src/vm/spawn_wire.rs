@@ -126,7 +126,25 @@ pub(super) fn spawn_closure_to_wire(closure: &Rc<Closure>) -> Result<SpawnWireCl
 }
 
 /// Serialize a Value to a send-safe representation for spawn/join.
+/// Recursion-depth cap for wire serialization. pblang values can form reference
+/// cycles (e.g. a symbol table whose scopes hold parent back-pointers); serializing
+/// one would recurse until the thread stack overflows and *aborts the whole process*
+/// — uncatchable. Capping the depth turns that into an ordinary, catchable error so a
+/// `spawn`/`join` caller can recover. The cap is far deeper than any legitimate value
+/// (real ASTs/chunks nest in the hundreds), so it only ever trips on cycles or
+/// pathologically deep data.
+const SPAWN_WIRE_MAX_DEPTH: usize = 4096;
+
 pub(super) fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
+    spawn_value_to_wire_depth(v, 0)
+}
+
+fn spawn_value_to_wire_depth(v: &Value, depth: usize) -> Result<SpawnWireValue, String> {
+    if depth > SPAWN_WIRE_MAX_DEPTH {
+        return Err(
+            "spawn: value too deeply nested or cyclic to transfer across threads".into(),
+        );
+    }
     match v {
         Value::Nil => Ok(SpawnWireValue::Nil),
         Value::Bool(b) => Ok(SpawnWireValue::Bool(*b)),
@@ -141,7 +159,7 @@ pub(super) fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
             let a = a.borrow();
             let mut out = Vec::with_capacity(a.len());
             for x in a.iter() {
-                out.push(spawn_value_to_wire(x)?);
+                out.push(spawn_value_to_wire_depth(x, depth + 1)?);
             }
             Ok(SpawnWireValue::Array(out))
         }
@@ -149,7 +167,7 @@ pub(super) fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
             let m = m.borrow();
             let mut out = HashMap::with_capacity(m.len());
             for (k, vv) in m.iter() {
-                out.insert(k.clone(), spawn_value_to_wire(vv)?);
+                out.insert(k.clone(), spawn_value_to_wire_depth(vv, depth + 1)?);
             }
             Ok(SpawnWireValue::Map(out))
         }
@@ -167,13 +185,13 @@ pub(super) fn spawn_value_to_wire(v: &Value) -> Result<SpawnWireValue, String> {
             let m = m.borrow();
             let mut globals = HashMap::new();
             for (k, v) in m.globals.iter() {
-                if let Ok(wv) = spawn_value_to_wire(v) {
+                if let Ok(wv) = spawn_value_to_wire_depth(v, depth + 1) {
                     globals.insert(k.clone(), wv);
                 }
             }
             let mut exports = HashMap::new();
             for (k, v) in m.exports.iter() {
-                if let Ok(wv) = spawn_value_to_wire(v) {
+                if let Ok(wv) = spawn_value_to_wire_depth(v, depth + 1) {
                     exports.insert(k.clone(), wv);
                 }
             }

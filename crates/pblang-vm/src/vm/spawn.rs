@@ -46,6 +46,21 @@ use super::spawn_wire::{
 use super::{alloc_array, alloc_map, StdlibConfig, VmLimits, VM};
 use crate::concurrency::{SpawnWireClosure, SpawnWireValue, VmChannelBuf};
 
+/// Stack size for spawned VM threads. Plain `thread::spawn` gives ~2 MiB, far less
+/// than the main thread's ~8 MiB, so a spawned closure running deeply-recursive
+/// pblang (e.g. the self-hosted compiler's parser/semantic walk) overflows and aborts
+/// the whole process. We give spawned threads a generous default and let it be tuned
+/// via `PBLANG_SPAWN_STACK_MB` for unusually deep workloads.
+fn spawn_stack_size() -> usize {
+    const DEFAULT_MB: usize = 32;
+    let mb = std::env::var("PBLANG_SPAWN_STACK_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&m| m > 0)
+        .unwrap_or(DEFAULT_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
 pub(super) fn spawn_builtin(
     host: &mut dyn VmHost,
     args: Vec<Value>,
@@ -111,7 +126,10 @@ pub(super) fn spawn_builtin(
 
     let child_handles = Arc::clone(&handles);
     let config = StdlibConfig::default();
-    thread::spawn(move || {
+    let spawn_result = thread::Builder::new()
+        .name("pblang-spawn".into())
+        .stack_size(spawn_stack_size())
+        .spawn(move || {
         let module = Rc::new(RefCell::new(Module {
             globals: HashMap::new(),
             parent: None,
@@ -174,6 +192,12 @@ pub(super) fn spawn_builtin(
         };
         let _ = tx.send(result);
     });
+    // If the OS could not create the thread, the child's `tx` was dropped with the
+    // closure, so a later join() observes a closed channel and surfaces a spawn
+    // failure — no panic, graceful degradation.
+    if let Err(e) = spawn_result {
+        return Err(host.err(format!("spawn: could not create thread: {e}")));
+    }
     Ok(Value::Number(id as f64))
 }
 
