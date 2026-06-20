@@ -3628,6 +3628,95 @@ Result: focused LLM subset verification passed **3 passed / 0 failed /
 186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
 0 failed / 0 ignored** after the final cross-repo Max training run.
 
+## 159. LLM eval category: teacher-data quality gates (2026-06-19)
+
+This pass adds shared pblang-native quality gates for distillation teacher
+records, so pbAI and future model projects do not each invent their own weak
+length-only checks.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Teacher record quality | **ADDED** | `stdlib:llm_eval.sapp` exposes `teacher_record_quality(record, min_chars, min_score)` returning `pblang.llm.teacher_record_quality.v1`. |
+| Teacher dataset quality | **ADDED** | `teacher_dataset_quality(records, min_chars, min_score)` aggregates record scores, pass/fail counts, average chars, and average score as `pblang.llm.teacher_dataset_quality.v1`. |
+| Gate policy | **ADDED** | The quality gate combines teacher length, forbidden-token checks, generation-quality scoring, and text-shape scoring. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies accepted rich teacher text, rejected weak/forbidden teacher text, short clean teacher text rejection, empty-dataset failure, mixed good/bad dataset failure, and forbidden-token boundary behavior directly through generation scoring and teacher scoring (`nanobot`/`banana` are harmless, punctuation-delimited `nan` is rejected). |
+| Max integration | **USED** | `AAP/ai/pbai` now attaches this shared gate to pbAI-Max distillation datasets and requires it in the Max pipeline checks. |
+
+Verification:
+
+```sh
+pblang run tests/semantics/llm_max_foundation_test.sapp --allow-all
+```
+
+## 160. LLM eval category: weighted objective distance (2026-06-20)
+
+This pass adds a tiny shared primitive for training and evaluation loops that
+need to measure distance from a target behavior without hard-coding that logic
+inside model projects.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Objective component | **ADDED** | `objective_component(name, value, target, direction, weight)` returns `pblang.llm.objective_component.v1` with gap, normalized gap, weighted gap, and pass/fail status. |
+| Objective distance | **ADDED** | `objective_distance(components)` aggregates weighted component gaps into `pblang.llm.objective_distance.v1` with `distance` and `alignment_score`. |
+| Direction support | **ADDED** | Components support `"higher"`, `"lower"`, and `"near"` targets for pass-rate, loss/error, and closeness-style metrics. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies failing and passing objective sets. |
+| Max integration | **USED** | `AAP/ai/pbai` uses this helper for the pbAI-Max Ideal / Imaginary Variable NN alignment objective proxy. |
+
+Verification:
+
+```sh
+pblang run tests/semantics/llm_max_foundation_test.sapp --allow-all
+```
+
+## 161. LLM eval category: trial/error reinforcement helpers (2026-06-20)
+
+This pass moves the small fast reward/punish substrate into the shared pblang
+LLM evaluation library, so pbAI-Max and future pblang-native model projects can
+compare tiny training candidates without duplicating the same local logic.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Objective reinforcement | **ADDED** | `reinforcement_from_objective(previous, current, tolerance)` returns `pblang.llm.objective_reinforcement.v1` and labels reward/punish/neutral from objective-distance deltas. |
+| Trial candidate contract | **ADDED** | `trial_candidate(name, previous_objective, current_objective, metadata)` records previous/current objective state, delta, reinforcement, and metadata. |
+| Elite trial selection | **ADDED** | `select_trial_elites(candidates, keep_n)` ranks by lowest current objective distance, then largest positive delta, while reporting reward/punish/neutral counts. |
+| Safety boundary | **KEPT** | These helpers are pure evaluation contracts: they compare states and select candidates; they do not mutate model weights or write checkpoints. |
+| Regression coverage | **EXPANDED** | `llm_max_foundation_test.sapp` verifies rewarded, punished, and neutral trials plus best-trial elite selection. |
+
+Verification:
+
+```sh
+pblang run tests/semantics/llm_max_foundation_test.sapp --allow-all
+```
+
+## 164. Math category: inverse trig and complex formula correctness (2026-06-20)
+
+This pass tightens `stdlib:math.sapp` correctness without changing the public
+namespace shape.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| `asin` accuracy | **FIXED** | `asin(x)` now uses `atan2(x, sqrt(1 - x*x))`, fixing large endpoint error from the previous short Taylor approximation. |
+| `acos` accuracy | **FIXED** | `acos(1)` now reaches 0 through the corrected `asin`, instead of inheriting endpoint error. |
+| Complex exponential | **FIXED** | `math.complex.exp(a+bi)` now computes `exp(a) * (cos(b) + i*sin(b))`. |
+| Complex logarithm | **FIXED** | `math.complex.ln(z)` now returns `ln(|z|) + i*arg(z)`. |
+| Complex scalar power | **FIXED** | `math.complex.pow_scalar(z, p)` now uses `exp(p * ln(z))`. |
+| Complex square root | **FIXED** | `math.complex.sqrt(z)` now returns the principal complex square root, including `sqrt(-1) = i`. |
+| Regression coverage | **EXPANDED** | `math_ext_test.sapp` now covers inverse-trig endpoints and representative complex exp/ln/sqrt/power cases. |
+
+Verification:
+
+```sh
+pblang run tests/semantics/math_ext_test.sapp --allow-all
+```
+
 ## 163. Resource-efficiency category: smart background planning and compact test profiles (2026-06-15)
 
 This pass turns the resource-use research direction into two practical pblang
