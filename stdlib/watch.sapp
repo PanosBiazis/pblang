@@ -1,0 +1,427 @@
+// stdlib/watch.sapp — pblang Watchers: a unified, extensible observability + reverse-
+// engineering facade. One simple API to capture state across every level pblang can
+// reach: from bytecode/opcodes (the lowest level pblang executes) up to heap, memory,
+// CPU/GPU/NPU compute, storage, devices, network, quantum backends, and binary files —
+// plus a watcher abstraction (snapshot / diff / watch-a-block) and LIVE time-series
+// sampling (incl. over networks).
+//
+// Design: each domain is a "probe" (a function returning a map). Probes are read-only
+// and fail safe — a probe whose backend is unavailable returns { available: false }
+// instead of throwing, so a watcher never crashes the program it observes.
+//
+//   let w = import("stdlib:watch.sapp");
+//   w.disasm("let x = 1 + 2;")        // bytecode/opcodes
+//   w.capture_all()                    // fast full snapshot (time/heap/memory/compute)
+//   let wt = w.watcher("run");
+//   w.watch(wt, "load", fn(){ ... })   // measure allocations + time of a block
+//   w.sample(w.compute, 5, 200)        // live: 5 samples, 200ms apart
+//   w.binary("target/release/pblang")  // reverse-engineer a file (format/entropy/magic)
+
+let FS = import("stdlib:fs.sapp");
+
+// Opcode number -> name, mirroring stdlib/compiler/ir.sapp (0..40). Index by op number.
+let OPNAMES = [
+    "CONSTANT", "ADD", "SUB", "MUL", "DIV", "EQ", "NOT_EQ", "GT", "GE", "LT", "LE",
+    "POP", "PRINT", "DEFINE_GLOBAL", "GET_GLOBAL", "SET_GLOBAL", "GET_LOCAL", "SET_LOCAL",
+    "CALL", "RETURN", "JUMP", "JUMP_IF_FALSE", "JUMP_IF_TRUE", "NOT", "CLOSURE",
+    "MAKE_ARRAY", "MAKE_MAP", "GET_INDEX", "SET_INDEX", "GET_ATTR", "SET_ATTR", "MOD",
+    "LEN", "JUMP_IF_FALSE_PEEK", "JUMP_IF_TRUE_PEEK", "TRY", "JUMP_IF_NIL_PEEK",
+    "JUMP_IF_NOT_NIL_PEEK", "GET_UPVALUE", "SET_UPVALUE", "THROW"
+];
+
+let HEX = "0123456789abcdef";
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+fn _opname(op) {
+    if op >= 0 and op < len(OPNAMES) { return OPNAMES[op]; }
+    return "OP_" + str(op);
+}
+
+// Parse "a=1 b=2" (the gc_stats string) into a numeric map.
+fn _parse_kv(s) {
+    let m = map{};
+    if type(s) != "string" { return m; }
+    let parts = str_split(s, " ");
+    for i len(parts) {
+        let p = str_trim(parts[i]);
+        if p != "" and str_contains(p, "=") {
+            let kv = str_split(p, "=");
+            if len(kv) >= 2 {
+                let v = try parse_number(kv[1]) catch nil;
+                if v == nil { v = kv[1]; }
+                m[kv[0]] = v;
+            }
+        }
+    }
+    return m;
+}
+
+fn _hex2(b) {
+    let hi = num_floor(b / 16);
+    let lo = num_mod(b, 16);
+    return str_slice(HEX, hi, hi + 1) + str_slice(HEX, lo, lo + 1);
+}
+
+fn _bytes_to_hex(bytes) {
+    let out = "";
+    for i len(bytes) {
+        if i > 0 { out = out + " "; }
+        out = out + _hex2(bytes[i]);
+    }
+    return out;
+}
+
+// Shannon entropy (bits/byte) over a sample — a quick reverse-engineering signal:
+// ~8.0 means compressed/encrypted, low values mean structured/text.
+fn _entropy(bytes, sample) {
+    let n = len(bytes);
+    if n == 0 { return 0; }
+    if sample > 0 and n > sample { n = sample; }
+    let counts = [];
+    let z = 0;
+    while z < 256 { array_push(counts, 0); z = z + 1; }
+    let i = 0;
+    while i < n { let b = bytes[i]; counts[b] = counts[b] + 1; i = i + 1; }
+    let h = 0;
+    let k = 0;
+    while k < 256 {
+        if counts[k] > 0 {
+            let p = counts[k] / n;
+            h = h - p * (num_ln(p) / num_ln(2));
+        }
+        k = k + 1;
+    }
+    return h;
+}
+
+fn _detect_format(bytes) {
+    let n = len(bytes);
+    fn at(i) { if i < n { return bytes[i]; } return -1; }
+    if at(0) == 127 and at(1) == 69 and at(2) == 76 and at(3) == 70 { return "ELF"; }       // \x7fELF
+    if at(0) == 77 and at(1) == 90 { return "PE/DOS (MZ)"; }                                  // MZ
+    if at(0) == 137 and at(1) == 80 and at(2) == 78 and at(3) == 71 { return "PNG"; }
+    if at(0) == 255 and at(1) == 216 and at(2) == 255 { return "JPEG"; }
+    if at(0) == 31 and at(1) == 139 { return "gzip"; }
+    if at(0) == 80 and at(1) == 75 and at(2) == 3 and at(3) == 4 { return "zip"; }            // PK..
+    if at(0) == 37 and at(1) == 80 and at(2) == 68 and at(3) == 70 { return "PDF"; }          // %PDF
+    if at(0) == 82 and at(1) == 73 and at(2) == 70 and at(3) == 70 { return "RIFF (wav/avi)"; }
+    if at(0) == 202 and at(1) == 254 and at(2) == 186 and at(3) == 190 { return "Mach-O (fat)"; }
+    return "data";
+}
+
+// ── bytecode / opcode probes (lowest level pblang executes) ──────────────────
+fn disasm(source) {
+    let out = [];
+    let FE = import("stdlib:compiler/selfhost_frontend.sapp");
+    let r = try FE.frontend_compile(source) catch nil;
+    if r == nil { return out; }
+    let chunk = try r.chunk catch nil;
+    if chunk == nil { return out; }
+    let ins = try chunk.instructions catch nil;
+    if ins == nil { return out; }
+    for i len(ins) {
+        let inst = ins[i];
+        let op = try inst.op catch (0 - 1);
+        array_push(out, map{ index: i, op: op, name: _opname(op), operand: try inst.operand catch nil });
+    }
+    return out;
+}
+
+fn opcode_histogram(source) {
+    let d = disasm(source);
+    let hist = map{};
+    for i len(d) {
+        let name = d[i].name;
+        if map_has(hist, name) { hist[name] = hist[name] + 1; } else { hist[name] = 1; }
+    }
+    return hist;
+}
+
+fn bytecode(source) {
+    let FE = import("stdlib:compiler/selfhost_frontend.sapp");
+    let r = try FE.frontend_compile(source) catch nil;
+    let chunk = nil;
+    if r != nil { chunk = try r.chunk catch nil; }
+    let n = 0;
+    let nconst = 0;
+    if chunk != nil {
+        n = len(try chunk.instructions catch []);
+        nconst = len(try chunk.constants catch []);
+    }
+    return map{
+        ok: try r.ok catch false,
+        instructions: n,
+        constants: nconst,
+        histogram: opcode_histogram(source),
+    };
+}
+
+// ── runtime probes (heap / memory / vm) ──────────────────────────────────────
+fn heap()   { return _parse_kv(try gc_stats() catch ""); }     // object allocation counts
+fn memory() { return try memory_stats() catch map{}; }          // ref-count / borrow tracker
+fn time_now() { return try now_ms() catch 0; }
+
+fn vm() {
+    return map{ time_ms: time_now(), heap: heap(), memory: memory() };
+}
+
+// ── hardware / compute probes ────────────────────────────────────────────────
+fn compute() { return try tensor_backend() catch map{}; }       // fast: CPU threads / GPU
+
+fn _hw() { return import("stdlib:hwinfo.sapp"); }
+
+fn cpu()     { return try _hw().cpu() catch map{ available: false }; }
+fn storage() { return try _hw().disks() catch map{ available: false }; }
+fn gpus()    { return try _hw().gpus() catch map{ available: false }; }
+fn npu()     { return try _hw().npu() catch map{ available: false }; }
+fn devices() { return try _hw().devices_by_class() catch map{ available: false }; }
+fn network() { return try _hw().network() catch map{ available: false }; }
+
+fn quantum() {
+    return map{
+        available: true,
+        backends: try quantum_backends() catch nil,
+    };
+}
+
+fn neural() {
+    // Neural-network compute view: backend (CPU threads / GPU) the tensor kernels use.
+    return map{ available: true, backend: compute() };
+}
+
+// Full hardware survey (slower: queries the OS). Each piece fails safe.
+fn hardware() {
+    return map{
+        cpu: cpu(), storage: storage(), gpus: gpus(), npu: npu(),
+        network: network(), devices: devices(), compute: compute(),
+    };
+}
+
+// ── target probes: binaries / compression (reverse engineering) ──────────────
+fn binary(path) {
+    let bytes = try FS.read_bytes(path) catch nil;
+    if bytes == nil { return map{ path: path, available: false }; }
+    let n = len(bytes);
+    let head = [];
+    let i = 0;
+    while i < n and i < 16 { array_push(head, bytes[i]); i = i + 1; }
+    return map{
+        path: path,
+        available: true,
+        size: n,
+        format: _detect_format(bytes),
+        magic_hex: _bytes_to_hex(head),
+        entropy: _entropy(bytes, 65536),
+    };
+}
+
+fn hexdump(bytes, max_bytes = 256) {
+    if type(bytes) == "string" { bytes = str_to_bytes(bytes); }
+    let n = len(bytes);
+    if max_bytes > 0 and n > max_bytes { n = max_bytes; }
+    let out = "";
+    let i = 0;
+    while i < n {
+        if num_mod(i, 16) == 0 {
+            if i > 0 { out = out + "\n"; }
+            out = out + _hex2(num_floor(i / 256)) + _hex2(num_mod(i, 256)) + "  ";
+        }
+        out = out + _hex2(bytes[i]) + " ";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hexdump_file(path, max_bytes = 256) {
+    let bytes = try FS.read_bytes(path) catch nil;
+    if bytes == nil { return ""; }
+    return hexdump(bytes, max_bytes);
+}
+
+// Self-contained compressibility estimate via Shannon entropy — no temp files or
+// subprocess (secure, fast). estimated_compressed_bytes is the information-theoretic
+// lower bound; entropy near 8 bits/byte means already-compressed/encrypted data.
+fn compress_stats(data) {
+    if type(data) != "string" { data = str(data); }
+    let bytes = str_to_bytes(data);
+    let orig = len(bytes);
+    if orig == 0 {
+        return map{ available: true, original_bytes: 0, entropy_bits_per_byte: 0,
+                    estimated_compressed_bytes: 0, estimated_ratio: 0 };
+    }
+    let ent = _entropy(bytes, 0);
+    let est = num_floor(orig * ent / 8) + 1;
+    let ratio = 0;
+    if est > 0 { ratio = orig / est; }
+    return map{
+        available: true,
+        original_bytes: orig,
+        entropy_bits_per_byte: ent,
+        estimated_compressed_bytes: est,
+        estimated_ratio: ratio,
+    };
+}
+
+// ── unified capture ──────────────────────────────────────────────────────────
+// Fast snapshot: only the cheap, always-available probes (no OS queries).
+fn capture_all() {
+    return map{
+        time_ms: time_now(),
+        heap: heap(),
+        memory: memory(),
+        compute: compute(),
+    };
+}
+
+// Everything, including the slower hardware survey.
+fn capture_full() {
+    let s = capture_all();
+    s.hardware = hardware();
+    s.quantum = quantum();
+    return s;
+}
+
+// Registry of no-target probes, for discovery and generic dispatch.
+fn probes() {
+    return ["time", "heap", "memory", "vm", "compute", "neural", "quantum",
+            "cpu", "storage", "gpus", "npu", "devices", "network", "hardware"];
+}
+
+fn probe(name) {
+    if name == "time"     { return map{ time_ms: time_now() }; }
+    if name == "heap"     { return heap(); }
+    if name == "memory"   { return memory(); }
+    if name == "vm"       { return vm(); }
+    if name == "compute"  { return compute(); }
+    if name == "neural"   { return neural(); }
+    if name == "quantum"  { return quantum(); }
+    if name == "cpu"      { return cpu(); }
+    if name == "storage"  { return storage(); }
+    if name == "gpus"     { return gpus(); }
+    if name == "npu"      { return npu(); }
+    if name == "devices"  { return devices(); }
+    if name == "network"  { return network(); }
+    if name == "hardware" { return hardware(); }
+    throw "watch: unknown probe '" + str(name) + "'";
+}
+
+// ── watcher abstraction (snapshots over time) ────────────────────────────────
+fn watcher(name) {
+    return map{ name: name, created: time_now(), snapshots: [] };
+}
+
+fn snapshot(w, label) {
+    let snap = map{ label: label, at: time_now(), state: capture_all() };
+    array_push(w.snapshots, snap);
+    return snap;
+}
+
+// Delta between two capture_all() states: allocations created + elapsed ms.
+fn diff(a, b) {
+    let ha = try a.heap catch map{};
+    let hb = try b.heap catch map{};
+    let alloc = map{};
+    let keys = map_keys(hb);
+    for i len(keys) {
+        let k = keys[i];
+        let va = try ha[k] catch 0;
+        alloc[k] = hb[k] - va;
+    }
+    return map{
+        ms: (try b.time_ms catch 0) - (try a.time_ms catch 0),
+        allocations: alloc,
+    };
+}
+
+// Watch a code block: snapshot before, run f, snapshot after; report result + cost.
+fn watch(w, label, f) {
+    let before = snapshot(w, label + ":before");
+    let result = f();
+    let after = snapshot(w, label + ":after");
+    return map{
+        result: result,
+        ms: after.at - before.at,
+        delta: diff(before.state, after.state),
+    };
+}
+
+fn report(w) {
+    let out = "watcher '" + str(w.name) + "' — " + str(len(w.snapshots)) + " snapshots\n";
+    for i len(w.snapshots) {
+        let s = w.snapshots[i];
+        out = out + "  [" + str(i) + "] " + str(s.label) + " @ " + str(s.at) + "ms\n";
+    }
+    return out;
+}
+
+// ── live sampling (time-series; works for any probe, incl. network) ──────────
+// probe_fn: a 0-arg function (e.g. watch.compute, watch.network). Returns an array of
+// { at, value } samples, `interval_ms` apart.
+fn sample(probe_fn, n, interval_ms = 100) {
+    let out = [];
+    let i = 0;
+    while i < n {
+        array_push(out, map{ at: time_now(), value: probe_fn() });
+        i = i + 1;
+        if i < n { sleep_ms(interval_ms); }
+    }
+    return out;
+}
+
+// Convenience: live-sample a named probe (discrete mode).
+fn live(name, n, interval_ms = 100) {
+    return sample(fn() { return probe(name); }, n, interval_ms);
+}
+
+// CONTINUOUS mode: sample as fast as possible until `duration_ms` elapses (or a safety
+// cap of max_samples). Yields a dense time-series — use for fine-grained live capture.
+fn sample_continuous(probe_fn, duration_ms, max_samples = 100000) {
+    let out = [];
+    let start = time_now();
+    while (time_now() - start) < duration_ms and len(out) < max_samples {
+        array_push(out, map{ at: time_now(), value: probe_fn() });
+    }
+    return out;
+}
+
+// TRIGGERED mode: sample at an interval until `predicate(value)` is true (or max hit).
+// The last sample is the one that satisfied the predicate.
+fn sample_until(probe_fn, predicate, max_samples = 1000, interval_ms = 50) {
+    let out = [];
+    let i = 0;
+    while i < max_samples {
+        let v = probe_fn();
+        array_push(out, map{ at: time_now(), value: v });
+        if predicate(v) { return out; }
+        i = i + 1;
+        sleep_ms(interval_ms);
+    }
+    return out;
+}
+
+fn sample_modes() { return ["discrete", "continuous", "until"]; }
+
+// Unified entry: stream(probe_fn, map{ mode, ... }). mode defaults to "discrete".
+//   discrete:   { n, interval_ms }
+//   continuous: { duration_ms, max_samples }
+//   until:      { predicate, max_samples, interval_ms }
+fn stream(probe_fn, opts) {
+    if opts == nil { opts = map{}; }
+    let mode = try opts.mode catch "discrete";
+    if mode == "continuous" {
+        return sample_continuous(probe_fn, try opts.duration_ms catch 1000, try opts.max_samples catch 100000);
+    }
+    if mode == "until" {
+        return sample_until(probe_fn, opts.predicate, try opts.max_samples catch 1000, try opts.interval_ms catch 50);
+    }
+    return sample(probe_fn, try opts.n catch 10, try opts.interval_ms catch 100);
+}
+
+export OPNAMES;
+export disasm, opcode_histogram, bytecode;
+export heap, memory, vm, time_now, compute, neural, quantum;
+export cpu, storage, gpus, npu, devices, network, hardware;
+export binary, hexdump, hexdump_file, compress_stats;
+export capture_all, capture_full, probes, probe;
+export watcher, snapshot, diff, watch, report;
+export sample, live, sample_continuous, sample_until, sample_modes, stream;
