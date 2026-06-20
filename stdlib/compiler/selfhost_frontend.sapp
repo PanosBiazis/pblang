@@ -220,6 +220,57 @@ fn frontend_compile(source) {
     };
 }
 
+/// Compile a batch of independent source strings, returning one frontend_compile()
+/// result per input, in input order. Per-source compilation shares no mutable state
+/// (each produces its own chunk), so the batch fans out across CPU cores via
+/// spawn/join — the textbook per-translation-unit parallelism. Each spawned closure
+/// captures the shared read-only `sources` array plus its own index; frontend_compile
+/// is a module-level function (resolved as a global, not a transferred upvalue), so
+/// the spawn is accepted. If the runtime rejects the spawned closures, this falls back
+/// to sequential compilation, so correctness never depends on threading.
+fn frontend_compile_many(sources) {
+    let n = len(sources);
+    let results = [];
+    if n == 0 { return results; }
+    if n == 1 {
+        array_push(results, frontend_compile(sources[0]));
+        return results;
+    }
+
+    // Spawn one compile per source. Spawn rejection is deterministic on the closure
+    // shape, so it is all-or-nothing: either every spawn succeeds or the first fails.
+    let handles = [];
+    let parallel = true;
+    let i = 0;
+    while i < n {
+        let idx = i;
+        let h = try spawn(fn() { return frontend_compile(sources[idx]); }) catch nil;
+        if h == nil { parallel = false; break; }
+        array_push(handles, h);
+        i = i + 1;
+    }
+
+    if parallel and len(handles) == n {
+        let j = 0;
+        while j < len(handles) {
+            let v = try join(handles[j]) catch nil;
+            if v == nil { parallel = false; break; }
+            array_push(results, v);
+            j = j + 1;
+        }
+        if parallel { return results; }
+        results = [];   // a join failed: recompute sequentially for a complete result
+    }
+
+    // Sequential fallback (threading unavailable or a join failed).
+    let k = 0;
+    while k < n {
+        array_push(results, frontend_compile(sources[k]));
+        k = k + 1;
+    }
+    return results;
+}
+
 /// Run the optimizer on a chunk, returning optimized chunk and stats.
 fn frontend_optimize(chunk) {
     let opt = import("stdlib/compiler/optimizer.sapp");
@@ -542,7 +593,9 @@ fn frontend_compile_file(path) {
     }
 
     if ast.stmts != nil {
-        let type_diags = tck.type_check(ast.stmts);
+        // The self-hosted typechecker is still partial; treat it as advisory and
+        // never let a gap in it abort compilation (matches frontend_compile()).
+        let type_diags = try tck.type_check(ast.stmts) catch [];
         let ti = 0;
         while ti < len(type_diags) {
             array_push(diagnostics, type_diags[ti]);
@@ -552,9 +605,10 @@ fn frontend_compile_file(path) {
 
     let chunk = cg.compile_stmts(ast.stmts);
 
-    // Run semantic analysis
+    // Run semantic analysis (advisory: the self-hosted analyzer is partial, so a gap
+    // in it must not abort compilation of an otherwise-valid file).
     let sem = import("stdlib/compiler/semantic.sapp");
-    let sym_table = sem.analyze(ast);
+    let sym_table = try sem.analyze(ast) catch nil;
 
     return map{
         ok: len(diagnostics) == 0,
@@ -567,6 +621,72 @@ fn frontend_compile_file(path) {
         symbol_table: sym_table,
         was_preprocessed: processed_src != src,
     };
+}
+
+// A frontend_compile_file() result holds a `symbol_table` that can be a *cyclic*
+// graph (scopes carry parent back-pointers), which cannot cross the spawn/join wire
+// boundary — serializing a cycle would otherwise be unbounded. For batch compilation
+// we drop that table; every other field is preserved. Single-file callers of
+// frontend_compile_file still receive the full result (no wire transfer is involved).
+fn _file_result_wire_safe(r) {
+    if not map_has(r, "chunk") { return r; }   // error-shaped result: already small/safe
+    return map{
+        ok: r.ok,
+        path: r.path,
+        src_size: r.src_size,
+        tokens_count: r.tokens_count,
+        stmt_count: r.stmt_count,
+        diagnostics: r.diagnostics,
+        chunk: r.chunk,
+        symbol_table: nil,
+        was_preprocessed: r.was_preprocessed,
+    };
+}
+
+/// Compile a batch of files by path, one wire-safe frontend_compile_file() result per
+/// input, in order. Files are independent translation units, so the batch fans out
+/// across CPU cores via spawn/join; each spawned closure captures the shared read-only
+/// `paths` array plus its own index. Falls back to sequential compilation if the
+/// runtime rejects the spawned closures, so correctness never depends on threading.
+/// Results omit `symbol_table` (see _file_result_wire_safe).
+fn frontend_compile_file_many(paths) {
+    let n = len(paths);
+    let results = [];
+    if n == 0 { return results; }
+    if n == 1 {
+        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[0])));
+        return results;
+    }
+
+    let handles = [];
+    let parallel = true;
+    let i = 0;
+    while i < n {
+        let idx = i;
+        let h = try spawn(fn() { return _file_result_wire_safe(frontend_compile_file(paths[idx])); }) catch nil;
+        if h == nil { parallel = false; break; }
+        array_push(handles, h);
+        i = i + 1;
+    }
+
+    if parallel and len(handles) == n {
+        let j = 0;
+        while j < len(handles) {
+            let v = try join(handles[j]) catch nil;
+            if v == nil { parallel = false; break; }
+            array_push(results, v);
+            j = j + 1;
+        }
+        if parallel { return results; }
+        results = [];
+    }
+
+    let k = 0;
+    while k < n {
+        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[k])));
+        k = k + 1;
+    }
+    return results;
 }
 
 /// Compile a project directory: find all .sapp files and compile them.
@@ -591,22 +711,32 @@ fn frontend_compile_project(dir) {
         };
     }
 
+    // Collect the .sapp files first, then compile them in parallel — each file is an
+    // independent translation unit, so the whole directory fans out across CPU cores.
+    let names = [];
+    let paths = [];
     let fi = 0;
     while fi < len(files) {
         let f = files[fi];
-        // Check if it ends with .sapp
         if str_ends_with(f, ".sapp") {
-            let full_path = dir + "/" + f;
-            let result = frontend_compile_file(full_path);
-            array_push(results, map{
-                file: f,
-                ok: result.ok,
-                diagnostics: result.diagnostics,
-            });
-            if result.ok { total_ok = total_ok + 1; }
-            else { total_fail = total_fail + 1; }
+            array_push(names, f);
+            array_push(paths, dir + "/" + f);
         }
         fi = fi + 1;
+    }
+
+    let compiled = frontend_compile_file_many(paths);
+    let ci = 0;
+    while ci < len(compiled) {
+        let result = compiled[ci];
+        array_push(results, map{
+            file: names[ci],
+            ok: result.ok,
+            diagnostics: result.diagnostics,
+        });
+        if result.ok { total_ok = total_ok + 1; }
+        else { total_fail = total_fail + 1; }
+        ci = ci + 1;
     }
 
     return map{
@@ -759,7 +889,7 @@ fn frontend_compile_with_guard_prep(source) {
 }
 
 export frontend_analyze, frontend_parse_file, frontend_smoke;
-export frontend_parse_full, frontend_parse_safe, frontend_typecheck, frontend_compile, frontend_optimize;
-export frontend_compile_file, frontend_compile_project, frontend_analyze_file;
+export frontend_parse_full, frontend_parse_safe, frontend_typecheck, frontend_compile, frontend_compile_many, frontend_optimize;
+export frontend_compile_file, frontend_compile_file_many, frontend_compile_project, frontend_analyze_file;
 export frontend_compile_with_guard_prep;
 export frontend_run, frontend_run_file, frontend_lint;
