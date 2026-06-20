@@ -25,18 +25,47 @@ fn is_node(tree) {
     return type(tree) == "map" and (try tree.kind catch "") == "Node";
 }
 
-// fork_pair(left_fn, right_fn) evaluates two independent thunks concurrently
-// when the runtime can safely transfer the closures. If a closure captures an
-// open upvalue, pblang rejects the spawn; fall back to sequential execution.
+// Spawn a single thunk, in its OWN frame. This indirection is load-bearing: capturing
+// a closure-valued open upvalue *inside a try-handler frame* corrupts the upvalue's
+// stack index and makes spawn throw. The previous fork_pair spawned directly inside a
+// `try { ... }`, so every spawn threw and the catch silently ran both thunks
+// sequentially — i.e. every bend combinator was secretly serial. Spawning from a plain
+// helper (no enclosing try around the capture) keeps the index valid and actually
+// parallelises (measured ~2x for two equal thunks).
+// The spawned thunk catches its own error and reports {ok, value}. This lets fork_pair
+// tell a genuine nil result apart from a failure, and recover: a thunk can fail in the
+// child when it references a global that did not cross the spawn boundary (closures are
+// rehydrated against the child's module), in which case we recompute it sequentially.
+fn _spawn_thunk(thunk) {
+    return spawn(fn() {
+        return try { map{ ok: true, value: thunk() } } catch map{ ok: false };
+    });
+}
+
+fn _join_outcome(h) { return try join(h) catch map{ ok: false }; }
+
+// fork_pair(left_fn, right_fn) evaluates two independent thunks concurrently when the
+// runtime can spawn and the thunks can run in a child thread; otherwise it falls back to
+// sequential execution so the result is always correct.
 fn fork_pair(left_fn, right_fn) {
-    let pair = try {
-        let lh = spawn(fn() { return left_fn(); });
-        let rh = spawn(fn() { return right_fn(); });
-        let lv = join(lh);
-        let rv = join(rh);
-        [lv, rv]
-    } catch [left_fn(), right_fn()];
-    return pair;
+    let lh = try _spawn_thunk(left_fn) catch nil;
+    if lh == nil {
+        // spawn unavailable: run both inline, in order.
+        let lv = left_fn();
+        return [lv, right_fn()];
+    }
+    let rh = try _spawn_thunk(right_fn) catch nil;
+    if rh == nil {
+        let lr = _join_outcome(lh);
+        if lr.ok { return [lr.value, right_fn()]; }
+        return [left_fn(), right_fn()];
+    }
+    let lr = _join_outcome(lh);
+    let rr = _join_outcome(rh);
+    if lr.ok and rr.ok { return [lr.value, rr.value]; }
+    // A spawned thunk failed in the child (e.g. it references a non-transferred global);
+    // recompute sequentially. Safe for bend's pure combinators.
+    return [left_fn(), right_fn()];
 }
 
 // bend_tree builds a binary tree from a seed until pred(seed) is false or depth
