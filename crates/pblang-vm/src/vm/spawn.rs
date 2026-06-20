@@ -215,8 +215,10 @@ pub(super) fn join_builtin(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
         t.remove(&id)
             .ok_or_else(|| host.err("join: invalid or already joined handle".into()))?
     };
-    let result = rx
-        .recv()
+    // Release the GIL (if enabled) while blocked on the child, so the child can run.
+    let result = reg
+        .gil
+        .blocking(|| rx.recv())
         .map_err(|_| host.err("join: channel closed (spawn failed?)".into()))?;
     match result {
         Ok(v) => {
@@ -335,12 +337,15 @@ pub(super) fn channel_send_builtin(
             if std::time::Instant::now() >= deadline {
                 return Err(host.err("send: timeout waiting for channel space".into()));
             }
-            // Wait for space signal with 5ms sleep (condvar across threads is tricky here)
+            // Wait for space signal with 5ms sleep (condvar across threads is tricky here).
+            // Release the GIL (if enabled) while waiting so a consumer thread can run.
             let (lock, cv) = cb.space_cv.as_ref();
             let guard = lock
                 .lock()
                 .map_err(|_| host.err("send: condvar lock".into()))?;
-            let _ = cv.wait_timeout(guard, Duration::from_millis(5));
+            reg.gil.blocking(|| {
+                let _ = cv.wait_timeout(guard, Duration::from_millis(5));
+            });
         }
     }
     cb.buf
@@ -415,12 +420,15 @@ pub(super) fn channel_recv_impl(
         if std::time::Instant::now() >= deadline {
             return Ok(Value::Nil); // timeout
         }
-        // Sleep briefly then retry (condvar across threads requires Arc<Condvar>)
+        // Sleep briefly then retry (condvar across threads requires Arc<Condvar>).
+        // Release the GIL (if enabled) while waiting so a producer thread can run.
         let (lock, cv) = cb.item_cv.as_ref();
         let guard = lock
             .lock()
             .map_err(|_| host.err("recv: condvar lock".into()))?;
-        let _ = cv.wait_timeout(guard, Duration::from_millis(1));
+        reg.gil.blocking(|| {
+            let _ = cv.wait_timeout(guard, Duration::from_millis(1));
+        });
     }
 }
 
@@ -664,8 +672,9 @@ pub(super) fn join_all_builtin(
             t.remove(&id)
                 .ok_or_else(|| host.err("join_all: invalid or already joined handle".into()))?
         };
-        let result = rx
-            .recv()
+        let result = reg
+            .gil
+            .blocking(|| rx.recv())
             .map_err(|_| host.err("join_all: channel closed".into()))?;
         let module = host
             .as_any_mut()

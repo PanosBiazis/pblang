@@ -29,6 +29,18 @@ use pblang_ir::{RuntimeError, Value, VmHost};
 use super::handles::{value_to_handle, vm_handles};
 use crate::concurrency::{VmSyncBarrier, VmSyncMutex, VmSyncOnce, VmSyncRwLock};
 
+// ---- GIL introspection ----
+
+/// gil_enabled() — true if the optional Global Interpreter Lock is active for this run
+/// (i.e. PBLANG_GIL was set). Lets pblang code and tests detect serialized execution.
+pub(super) fn gil_enabled_builtin(
+    host: &mut dyn VmHost,
+    _args: Vec<Value>,
+) -> Result<Value, RuntimeError> {
+    let reg = vm_handles(host)?;
+    Ok(Value::Bool(reg.gil.enabled))
+}
+
 // ---- Mutex builtins (Go sync.Mutex / Rust Mutex) ----
 
 /// mutex_new() — create a mutex. Returns a handle.

@@ -769,6 +769,11 @@ pub(super) fn build() -> Vec<BuiltinFn> {
         },
         // ---- Mutex (Go sync.Mutex / Rust Mutex) ----
         BuiltinFn {
+            name: "gil_enabled",
+            arity: Some(0),
+            fun: sync::gil_enabled_builtin,
+        },
+        BuiltinFn {
             name: "mutex_new",
             arity: Some(0),
             fun: sync::mutex_new_builtin,
