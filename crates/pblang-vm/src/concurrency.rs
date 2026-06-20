@@ -1318,11 +1318,132 @@ pub struct VmSyncAtomic {
     pub val: AtomicI64,
 }
 
+/// Optional Global Interpreter Lock.
+///
+/// Off by default — pblang runs spawned threads fully in parallel (no shared mutable
+/// memory, so no GIL is needed for safety). Enabling it (env `PBLANG_GIL=1`) makes the
+/// runtime execute one thread's bytecode at a time, Python-style: useful for
+/// deterministic debugging or for porting code that assumes a single interpreter lock.
+///
+/// The lock is **recursive** (a thread may re-enter `run_inner` via import/eval while
+/// already holding it) and is released around blocking waits (`join`, channel `recv`,
+/// bounded `send`) and at periodic yield points in the dispatch loop, so it interleaves
+/// threads cooperatively and never deadlocks the spawn/join or channel patterns.
+struct GilState {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+}
+
+pub struct Gil {
+    pub enabled: bool,
+    state: Mutex<GilState>,
+    cv: Condvar,
+}
+
+impl Gil {
+    fn new(enabled: bool) -> Self {
+        Gil {
+            enabled,
+            state: Mutex::new(GilState { owner: None, depth: 0 }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Acquire the lock for the current thread (recursive: re-entry bumps a depth count).
+    pub fn acquire(&self) {
+        if !self.enabled {
+            return;
+        }
+        let me = thread::current().id();
+        let mut st = self.state.lock().unwrap();
+        if st.owner == Some(me) {
+            st.depth += 1;
+            return;
+        }
+        while st.owner.is_some() {
+            st = self.cv.wait(st).unwrap();
+        }
+        st.owner = Some(me);
+        st.depth = 1;
+    }
+
+    /// Release one level of ownership held by the current thread.
+    pub fn release(&self) {
+        if !self.enabled {
+            return;
+        }
+        let me = thread::current().id();
+        let mut st = self.state.lock().unwrap();
+        if st.owner != Some(me) {
+            return;
+        }
+        st.depth -= 1;
+        if st.depth == 0 {
+            st.owner = None;
+            self.cv.notify_one();
+        }
+    }
+
+    /// Cooperative yield: if this thread holds the lock at the outermost level, drop it
+    /// so another waiting thread can run, then re-acquire. No-op while nested.
+    pub fn yield_point(&self) {
+        if !self.enabled {
+            return;
+        }
+        let me = thread::current().id();
+        let mut st = self.state.lock().unwrap();
+        if st.owner != Some(me) || st.depth != 1 {
+            return;
+        }
+        st.owner = None;
+        self.cv.notify_one();
+        while st.owner.is_some() {
+            st = self.cv.wait(st).unwrap();
+        }
+        st.owner = Some(me);
+    }
+
+    /// Run a blocking operation without holding the lock: fully release (remembering the
+    /// recursion depth), run `f`, then re-acquire to the same depth. This is what keeps
+    /// `join`/`recv`/`send` from deadlocking — a thread waiting on another never holds
+    /// the GIL while it waits.
+    pub fn blocking<T>(&self, f: impl FnOnce() -> T) -> T {
+        if !self.enabled {
+            return f();
+        }
+        let me = thread::current().id();
+        let saved_depth = {
+            let mut st = self.state.lock().unwrap();
+            if st.owner == Some(me) {
+                let d = st.depth;
+                st.owner = None;
+                st.depth = 0;
+                self.cv.notify_one();
+                d
+            } else {
+                0
+            }
+        };
+        let result = f();
+        if saved_depth > 0 {
+            let mut st = self.state.lock().unwrap();
+            while st.owner.is_some() {
+                st = self.cv.wait(st).unwrap();
+            }
+            st.owner = Some(me);
+            st.depth = saved_depth;
+        }
+        result
+    }
+}
+
 /// Per-VM tables for spawn/join, channels, and sync primitives.
 ///
 /// Parent and child VMs created via `spawn` share one registry (`Arc` clone).
 /// Separate top-level `VM` instances do not share handles.
 pub struct VmHandleRegistry {
+    /// Optional global interpreter lock, shared by all VMs in this registry.
+    pub gil: Gil,
     pub spawn: Mutex<HashMap<usize, SpawnJoinReceiver>>,
     pub spawn_next: AtomicUsize,
     pub channels: Mutex<HashMap<usize, VmChannelBuf>>,
@@ -1341,7 +1462,14 @@ pub struct VmHandleRegistry {
 
 impl VmHandleRegistry {
     pub fn new() -> Arc<Self> {
+        let gil_on = std::env::var("PBLANG_GIL")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false);
         Arc::new(Self {
+            gil: Gil::new(gil_on),
             spawn: Mutex::new(HashMap::new()),
             spawn_next: AtomicUsize::new(1),
             channels: Mutex::new(HashMap::new()),

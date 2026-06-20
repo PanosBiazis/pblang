@@ -1090,6 +1090,20 @@ impl VM {
         self.stack.push(Value::Closure(script_closure));
         self.call_top(0)?;
 
+        // Optional Global Interpreter Lock (off unless PBLANG_GIL is set). Acquire for
+        // the duration of this run; the guard releases on every exit path, including the
+        // `?`/`return Err(..)` shortcuts below. Recursive, so re-entering run_inner via
+        // import/eval on the same thread is safe.
+        let gil_reg = self.handle_registry.clone();
+        gil_reg.gil.acquire();
+        struct GilGuard(Arc<VmHandleRegistry>);
+        impl Drop for GilGuard {
+            fn drop(&mut self) {
+                self.0.gil.release();
+            }
+        }
+        let _gil_guard = GilGuard(gil_reg.clone());
+
         let mut instruction_count: u64 = 0;
         while !self.frames.is_empty() {
             if let Some(ref lim) = self.limits {
@@ -1100,6 +1114,11 @@ impl VM {
                 }
             }
             instruction_count += 1;
+            // GIL cooperative yield: periodically hand the lock to another waiting
+            // thread so threads interleave. No-op (one predictable branch) when off.
+            if gil_reg.gil.enabled && (instruction_count & 0x1FFF) == 0 {
+                gil_reg.gil.yield_point();
+            }
 
             let op = {
                 let frame = match self.frames.last_mut() {
