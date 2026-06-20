@@ -1,0 +1,258 @@
+// stdlib/master_control.sapp — local-only, human-gated capability control for an AI
+// "computer-use" agent (the "master control" feature), built safety-first.
+//
+// DESIGN (why this is safe):
+//   1. classify() is an ABSOLUTE deny-ceiling. Malicious actions — deleting system
+//      paths (/ , /etc, C:\Windows\System32 ...), known destructive commands
+//      (rm -rf /, mkfs, fork bombs, format), downloading/executing malware, or
+//      controlling ANOTHER host (botnet / lateral movement) — are denied
+//      UNCONDITIONALLY, even when fully unlocked and human-approved. No gate can
+//      override the deny-list, so a tricked or compromised AI has no path to them.
+//   2. Everything that passes the ceiling still requires, in order: the kill switch
+//      to be off, a HUMAN unlock (env flag + a secret nonce file only the human
+//      creates), an active non-expired session, and per-action HUMAN approval.
+//   3. Local only: no network listener, no remote trigger; actions targeting other
+//      hosts are denied. The module never performs actions itself — it gates an
+//      executor the caller supplies — and records an append-only audit trail.
+//
+// This module is the guardrail layer. Perception (screen/OCR/audio) and actuation
+// (keyboard/mouse) are wired ON TOP of it later, each call routed through request()
+// + approve() + execute() so the protections always apply.
+
+let HOME = try env_get("HOME") catch "";
+let UNLOCK_FILE = HOME + "/.pb_master_control_unlock";   // human creates this with a secret nonce
+let AUDIT_FILE  = HOME + "/.pb_master_control_audit.log";
+let SESSION_MS  = 600000;   // 10-minute sessions; re-unlock after expiry
+
+let _STATE = map{
+    unlocked: false,
+    killed: false,
+    session_expires: 0,
+    pending: map{},
+    approvals: map{},
+    log: [],
+    next_id: 1,
+};
+
+// Destructive operation kinds and the system paths they must never touch.
+let _DESTRUCTIVE = ["delete", "write", "overwrite", "move", "rename", "chmod", "chown", "format", "mkfs", "truncate"];
+let _SYS_ROOTS = ["/", "/etc", "/bin", "/sbin", "/usr", "/lib", "/lib64", "/boot",
+                  "/sys", "/proc", "/dev", "/var", "/root", "/System", "/Library", "/Applications"];
+let _WIN_DANGER = ["\\windows", "/windows", "system32", "syswow64", "program files"];
+// Substrings that mark a command as categorically destructive/malicious.
+let _BAD_CMDS = ["rm -rf /", "rm -rf /*", "rm -fr /", "mkfs", "dd if=", ":(){", ":|:&",
+                 "format c:", "del /f", "del /s", "rd /s", "shutdown", "reboot", "halt",
+                 "reg delete", "> /dev/sd", "of=/dev/sd", "chmod -r 000", "chown -r"];
+let _EXE_EXT = [".exe", ".dll", ".so", ".dylib", ".bat", ".cmd", ".sh", ".ps1", ".msi", ".scr", ".com", ".vbs", ".jar"];
+
+fn _now() { return try now_ms() catch 0; }
+
+fn _audit(event, detail) {
+    let entry = map{ at: _now(), event: event, detail: detail };
+    array_push(_STATE.log, entry);
+    try fs_append(AUDIT_FILE, str(entry.at) + " " + event + " " + str(detail) + "\n") catch nil;
+}
+
+fn _lower(s) { if type(s) != "string" { return ""; } return str_lower(s); }
+
+fn _is_system_path(path) {
+    if type(path) != "string" or path == "" { return false; }
+    if path == "/" { return true; }
+    let i = 0;
+    while i < len(_SYS_ROOTS) {
+        let r = _SYS_ROOTS[i];
+        if path == r or str_starts_with(path, r + "/") { return true; }
+        i = i + 1;
+    }
+    let lp = _lower(path);
+    let j = 0;
+    while j < len(_WIN_DANGER) {
+        if str_contains(lp, _WIN_DANGER[j]) { return true; }
+        j = j + 1;
+    }
+    if str_starts_with(lp, "c:\\") or str_starts_with(lp, "c:/") { return true; }
+    return false;
+}
+
+fn _has_bad_cmd(cmd) {
+    let c = _lower(cmd);
+    let i = 0;
+    while i < len(_BAD_CMDS) {
+        if str_contains(c, _BAD_CMDS[i]) { return true; }
+        i = i + 1;
+    }
+    // download piped into a shell (curl|wget ... | sh/bash)
+    if (str_contains(c, "curl") or str_contains(c, "wget")) and
+       (str_contains(c, "| sh") or str_contains(c, "|sh") or str_contains(c, "| bash") or str_contains(c, "|bash")) {
+        return true;
+    }
+    return false;
+}
+
+fn _is_local_host(host) {
+    if host == nil or host == "" { return true; }   // no host = local
+    let h = _lower(host);
+    return h == "localhost" or h == "127.0.0.1" or h == "::1" or h == "[::1]";
+}
+
+fn _is_executable_target(name) {
+    let n = _lower(name);
+    let i = 0;
+    while i < len(_EXE_EXT) {
+        if str_contains(n, _EXE_EXT[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// classify(action) -> { allowed, reason, severity }. The unconditional deny-ceiling.
+// action = map{ kind, path?, command?, host?, target? }
+fn classify(action) {
+    if type(action) != "map" { return map{ allowed: false, reason: "invalid action", severity: "high" }; }
+    let kind = _lower(try action.kind catch "");
+    let path = try action.path catch nil;
+    let cmd  = try action.command catch nil;
+    let host = try action.host catch nil;
+
+    // 1. Destructive ops on system paths -> NEVER.
+    let di = 0;
+    let destructive = false;
+    while di < len(_DESTRUCTIVE) { if kind == _DESTRUCTIVE[di] { destructive = true; } di = di + 1; }
+    if destructive and _is_system_path(path) {
+        return map{ allowed: false, reason: "destructive op on protected system path: " + str(path), severity: "critical" };
+    }
+
+    // 2. Categorically destructive/malicious commands -> NEVER.
+    if kind == "exec" or kind == "shell" or kind == "command" {
+        if cmd != nil and _has_bad_cmd(cmd) {
+            return map{ allowed: false, reason: "blocked destructive/malicious command", severity: "critical" };
+        }
+    }
+
+    // 3. System control (power/registry) -> NEVER.
+    if kind == "system_control" or kind == "power" {
+        return map{ allowed: false, reason: "system power/registry control is not permitted", severity: "critical" };
+    }
+
+    // 4. Downloading executables / malware -> NEVER.
+    if kind == "download" {
+        let tgt = str(try action.target catch (try action.path catch ""));
+        if _is_executable_target(tgt) {
+            return map{ allowed: false, reason: "download of executable/script is blocked (malware risk)", severity: "critical" };
+        }
+    }
+
+    // 5. Acting on another host (botnet / lateral movement) -> NEVER.
+    if kind == "network" or kind == "remote" or kind == "device_control" {
+        if not _is_local_host(host) {
+            return map{ allowed: false, reason: "control of non-local host is blocked (local-only): " + str(host), severity: "critical" };
+        }
+    }
+
+    // Otherwise allowed by POLICY (still requires unlock + approval to execute).
+    return map{ allowed: true, reason: "ok", severity: "normal" };
+}
+
+// ── session / gating ─────────────────────────────────────────────────────────
+fn _env_enabled() {
+    let v = try env_get("PB_MASTER_CONTROL") catch nil;
+    return v == "1" or v == "true" or v == "on";
+}
+
+fn is_active() {
+    return _STATE.unlocked and not _STATE.killed and _now() < _STATE.session_expires;
+}
+
+fn status() {
+    return map{
+        unlocked: _STATE.unlocked,
+        killed: _STATE.killed,
+        active: is_active(),
+        env_enabled: _env_enabled(),
+        session_expires: _STATE.session_expires,
+        pending: len(map_keys(_STATE.pending)),
+        audit_entries: len(_STATE.log),
+        local_only: true,
+    };
+}
+
+// unlock requires BOTH the env flag (set by the human in their shell) AND a secret
+// nonce matching the human-created unlock file. An AI cannot self-enable it.
+fn unlock(nonce) {
+    if _STATE.killed { _audit("unlock_denied", "kill switch"); return map{ ok: false, reason: "kill switch engaged; reset() required" }; }
+    if not _env_enabled() { _audit("unlock_denied", "env"); return map{ ok: false, reason: "PB_MASTER_CONTROL not set by a human" }; }
+    let token = try fs_read(UNLOCK_FILE) catch nil;
+    if token == nil { _audit("unlock_denied", "no token file"); return map{ ok: false, reason: "no unlock token; a human must create " + UNLOCK_FILE }; }
+    if nonce == nil or nonce == "" or str_trim(token) != str(nonce) {
+        _audit("unlock_denied", "nonce mismatch");
+        return map{ ok: false, reason: "nonce does not match unlock token" };
+    }
+    _STATE.unlocked = true;
+    _STATE.session_expires = _now() + SESSION_MS;
+    _audit("unlock", "session opened");
+    return map{ ok: true, expires_at: _STATE.session_expires };
+}
+
+fn lock() { _STATE.unlocked = false; _audit("lock", ""); return map{ ok: true }; }
+
+// kill switch — instantly disables everything until a human reset()s it.
+fn kill() { _STATE.killed = true; _STATE.unlocked = false; _audit("kill", "kill switch engaged"); return map{ ok: true }; }
+
+fn reset(nonce) {
+    let token = try fs_read(UNLOCK_FILE) catch nil;
+    if token == nil or str_trim(token) != str(nonce) { return map{ ok: false, reason: "nonce required to reset kill switch" }; }
+    _STATE.killed = false;
+    _audit("reset", "kill switch cleared");
+    return map{ ok: true };
+}
+
+// request(action) -> {status, ...}. Runs the deny-ceiling, then requires an active
+// session; allowed actions become pending until a human approves them.
+fn request(action) {
+    let pol = classify(action);
+    if not pol.allowed {
+        _audit("denied_policy", map{ action: action, reason: pol.reason });
+        return map{ status: "denied", reason: pol.reason, severity: pol.severity };
+    }
+    if not is_active() {
+        return map{ status: "denied", reason: "master control not active (human unlock required)" };
+    }
+    let id = _STATE.next_id;
+    _STATE.next_id = id + 1;
+    _STATE.pending[str(id)] = action;
+    _audit("requested", map{ id: id, action: action });
+    return map{ status: "pending", id: id, note: "awaiting human approval: approve(id, nonce)" };
+}
+
+// approve(id, nonce) — the HUMAN approves a pending request (nonce binds it to the
+// human who created the unlock file).
+fn approve(id, nonce) {
+    if not is_active() { return map{ ok: false, reason: "not active" }; }
+    let token = try fs_read(UNLOCK_FILE) catch nil;
+    if token == nil or str_trim(token) != str(nonce) { return map{ ok: false, reason: "nonce required to approve" }; }
+    let key = str(id);
+    if not map_has(_STATE.pending, key) { return map{ ok: false, reason: "no such pending request" }; }
+    _STATE.approvals[key] = true;
+    _audit("approved", id);
+    return map{ ok: true };
+}
+
+// execute(id, executor) — runs the approved action via the caller-supplied executor()
+// only if still active, approved, AND still passing the deny-ceiling (re-checked).
+fn execute(id, executor) {
+    let key = str(id);
+    if not is_active() { return map{ ok: false, reason: "not active" }; }
+    if not map_has(_STATE.approvals, key) { return map{ ok: false, reason: "not approved by a human" }; }
+    let action = _STATE.pending[key];
+    let pol = classify(action);
+    if not pol.allowed { _audit("blocked_at_exec", pol.reason); return map{ ok: false, reason: pol.reason }; }
+    let result = executor();
+    _audit("executed", map{ id: id, action: action });
+    _STATE.pending[key] = nil;
+    _STATE.approvals[key] = nil;
+    return map{ ok: true, result: result };
+}
+
+fn audit_log() { return _STATE.log; }
+
+export classify, status, is_active, unlock, lock, kill, reset, request, approve, execute, audit_log;
