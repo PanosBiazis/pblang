@@ -1,0 +1,121 @@
+// stdlib/input_control.sapp — keyboard/mouse actuation for a local computer-use agent.
+// This is the highest-risk capability, so it carries STRICTER gates than perception:
+//
+//   1. A SEPARATE opt-in: requires env PB_INPUT_CONTROL=1 in addition to the master
+//      control unlock — perception can be enabled without ever enabling actuation.
+//   2. The master-control deny-ceiling inspects typed TEXT: input that would enter a
+//      destructive/malicious command (rm -rf /, shutdown, ...) is denied unconditionally.
+//   3. Keys are restricted to a safe allowlist; typed text is length-capped.
+//   4. Still: human unlock + per-action nonce-bound approval + audit + kill switch.
+//
+// Flow:  let ic = import("stdlib:input_control.sapp");
+//        let req = ic.type_text("hello");   // -> pending (or denied)
+//        let res = ic.run(req.id, nonce);   // human approves, then it actuates
+
+let mc = import("stdlib:master_control.sapp");
+
+let _execs = map{};
+let MAX_TEXT = 4096;
+let _SAFE_KEYS = ["Return", "Enter", "Tab", "Escape", "BackSpace", "Delete", "space",
+                  "Up", "Down", "Left", "Right", "Home", "End", "Page_Up", "Page_Down"];
+
+fn _input_enabled() {
+    let v = try env_get("PB_INPUT_CONTROL") catch nil;
+    return v == "1" or v == "true" or v == "on";
+}
+
+fn _has_tool(name) {
+    let r = try proc_spawn_wait("which", [name]) catch nil;
+    return r != nil and (try r.exit_code catch 1) == 0;
+}
+fn _tool() {
+    if _has_tool("xdotool") { return "xdotool"; }
+    if _has_tool("ydotool") { return "ydotool"; }
+    return nil;
+}
+fn backends() {
+    return map{ xdotool: _has_tool("xdotool"), ydotool: _has_tool("ydotool"),
+                available: _tool() != nil, enabled: _input_enabled() };
+}
+
+// ── actuation backends (run inside an approved master-control execute) ────────
+fn _do_type(text) {
+    let t = _tool();
+    if t == nil { return map{ available: false, note: "no input tool (xdotool/ydotool)" }; }
+    let r = nil;
+    if t == "xdotool" { r = try proc_spawn_wait("xdotool", ["type", "--", text]) catch nil; }
+    else { r = try proc_spawn_wait("ydotool", ["type", text]) catch nil; }
+    if r == nil or (try r.exit_code catch 1) != 0 { return map{ available: false, tool: t, note: "type failed (no display?)" }; }
+    return map{ available: true, tool: t, typed_chars: len(text) };
+}
+fn _do_key(name) {
+    let t = _tool();
+    if t == nil { return map{ available: false, note: "no input tool" }; }
+    let r = try proc_spawn_wait(t, ["key", name]) catch nil;
+    if r == nil or (try r.exit_code catch 1) != 0 { return map{ available: false, tool: t, note: "key failed" }; }
+    return map{ available: true, tool: t, key: name };
+}
+fn _do_mouse_move(x, y) {
+    let t = _tool();
+    if t == nil { return map{ available: false, note: "no input tool" }; }
+    let r = try proc_spawn_wait(t, ["mousemove", str(x), str(y)]) catch nil;
+    if r == nil or (try r.exit_code catch 1) != 0 { return map{ available: false, tool: t, note: "mousemove failed" }; }
+    return map{ available: true, tool: t, x: x, y: y };
+}
+fn _do_click(button) {
+    let t = _tool();
+    if t == nil { return map{ available: false, note: "no input tool" }; }
+    let r = try proc_spawn_wait(t, ["click", str(button)]) catch nil;
+    if r == nil or (try r.exit_code catch 1) != 0 { return map{ available: false, tool: t, note: "click failed" }; }
+    return map{ available: true, tool: t, button: button };
+}
+
+// ── stricter gate: separate enable flag, THEN the full master-control pipeline ─
+fn _gate_input(action, executor) {
+    if not _input_enabled() {
+        return map{ status: "denied", reason: "input control not enabled (a human must set PB_INPUT_CONTROL=1)" };
+    }
+    let req = mc.request(action);   // deny-ceiling (incl. malicious typed text) + active session
+    if req.status != "pending" { return map{ status: req.status, reason: try req.reason catch "" }; }
+    _execs[str(req.id)] = executor;
+    return map{ status: "pending", id: req.id, capability: "input:" + str(action.subkind), note: "approve with run(id, nonce)" };
+}
+
+fn type_text(text) {
+    if type(text) != "string" { return map{ status: "denied", reason: "text must be a string" }; }
+    if len(text) > MAX_TEXT { return map{ status: "denied", reason: "text exceeds max length " + str(MAX_TEXT) }; }
+    return _gate_input(map{ kind: "input", subkind: "type", text: text }, fn() { return _do_type(text); });
+}
+
+fn key(name) {
+    let ok = false;
+    let i = 0;
+    while i < len(_SAFE_KEYS) { if _SAFE_KEYS[i] == name { ok = true; } i = i + 1; }
+    if not ok { return map{ status: "denied", reason: "key not in allowlist: " + str(name) }; }
+    return _gate_input(map{ kind: "input", subkind: "key", key: name }, fn() { return _do_key(name); });
+}
+
+fn mouse_move(x, y) {
+    return _gate_input(map{ kind: "input", subkind: "mouse_move", x: x, y: y }, fn() { return _do_mouse_move(x, y); });
+}
+
+fn click(button) {
+    if button == nil { button = 1; }
+    return _gate_input(map{ kind: "input", subkind: "click", button: button }, fn() { return _do_click(button); });
+}
+
+fn safe_keys() { return _SAFE_KEYS; }
+
+// Human approves a pending input action and runs it.
+fn run(id, nonce) {
+    let a = mc.approve(id, nonce);
+    if not a.ok { return map{ ok: false, reason: a.reason }; }
+    let key = str(id);
+    let ex = _execs[key];
+    if ex == nil { return map{ ok: false, reason: "no pending executor for id " + str(id) }; }
+    let r = mc.execute(id, ex);
+    _execs[key] = nil;
+    return r;
+}
+
+export backends, type_text, key, mouse_move, click, safe_keys, run;
