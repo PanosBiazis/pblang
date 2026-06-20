@@ -232,6 +232,90 @@ fn hexdump(bytes, max_bytes = 256) {
     return out;
 }
 
+// Read an n-byte big-endian / little-endian unsigned integer from a byte array.
+fn _be(bytes, off, n) {
+    let v = 0;
+    let i = 0;
+    while i < n { v = v * 256 + bytes[off + i]; i = i + 1; }
+    return v;
+}
+fn _le(bytes, off, n) {
+    let v = 0;
+    let mult = 1;
+    let i = 0;
+    while i < n { v = v + bytes[off + i] * mult; mult = mult * 256; i = i + 1; }
+    return v;
+}
+
+// Scan a JPEG for its Start-Of-Frame marker to recover dimensions.
+fn _jpeg_dims(bytes) {
+    let n = len(bytes);
+    let i = 2;   // skip the FF D8 SOI marker
+    while i + 9 < n {
+        if bytes[i] != 255 { i = i + 1; }
+        else {
+            let marker = bytes[i + 1];
+            // SOF0..SOF15 (0xC0..0xCF) excluding DHT(0xC4), JPG(0xC8), DAC(0xCC)
+            if marker >= 192 and marker <= 207 and marker != 196 and marker != 200 and marker != 204 {
+                return [_be(bytes, i + 7, 2), _be(bytes, i + 5, 2)];   // [width, height]
+            }
+            i = i + 2 + _be(bytes, i + 2, 2);   // skip this segment by its length
+        }
+    }
+    return nil;
+}
+
+// image(path): read-only metadata (format + dimensions) by parsing the file header.
+// Self-contained: PNG / JPEG / GIF / BMP, no external decoder.
+fn image(path) {
+    let bytes = try FS.read_bytes(path) catch nil;
+    if bytes == nil { return map{ path: path, available: false }; }
+    let n = len(bytes);
+    let res = map{ path: path, available: true, size: n, format: _detect_format(bytes), width: nil, height: nil };
+    if res.format == "PNG" and n >= 24 {
+        res.width = _be(bytes, 16, 4);
+        res.height = _be(bytes, 20, 4);
+    } else if res.format == "JPEG" {
+        let wh = _jpeg_dims(bytes);
+        if wh != nil { res.width = wh[0]; res.height = wh[1]; }
+    } else if n >= 10 and bytes[0] == 71 and bytes[1] == 73 and bytes[2] == 70 {   // "GIF"
+        res.format = "GIF";
+        res.width = _le(bytes, 6, 2);
+        res.height = _le(bytes, 8, 2);
+    } else if n >= 26 and bytes[0] == 66 and bytes[1] == 77 {                       // "BM"
+        res.format = "BMP";
+        res.width = _le(bytes, 18, 4);
+        res.height = _le(bytes, 22, 4);
+    }
+    return res;
+}
+
+// audio(path): read-only metadata by parsing the header. Self-contained WAV (PCM)
+// support: channels / sample rate / bit depth / duration; other formats report format+size.
+fn audio(path) {
+    let bytes = try FS.read_bytes(path) catch nil;
+    if bytes == nil { return map{ path: path, available: false }; }
+    let n = len(bytes);
+    let is_wav = n >= 44 and bytes[0] == 82 and bytes[1] == 73 and bytes[2] == 70 and bytes[3] == 70
+                 and bytes[8] == 87 and bytes[9] == 65 and bytes[10] == 86 and bytes[11] == 69;
+    if is_wav {
+        let channels = _le(bytes, 22, 2);
+        let sample_rate = _le(bytes, 24, 4);
+        let byte_rate = _le(bytes, 28, 4);
+        let bits = _le(bytes, 34, 2);
+        let data_size = _le(bytes, 40, 4);
+        let duration = 0;
+        if byte_rate > 0 { duration = data_size / byte_rate; }
+        return map{
+            path: path, available: true, format: "WAV", size: n,
+            channels: channels, sample_rate: sample_rate, bits_per_sample: bits,
+            duration_sec: duration,
+        };
+    }
+    return map{ path: path, available: true, format: _detect_format(bytes), size: n,
+                note: "header parse supports PCM WAV; other formats report format+size only" };
+}
+
 fn hexdump_file(path, max_bytes = 256) {
     let bytes = try FS.read_bytes(path) catch nil;
     if bytes == nil { return ""; }
@@ -399,7 +483,34 @@ fn sample_until(probe_fn, predicate, max_samples = 1000, interval_ms = 50) {
     return out;
 }
 
-fn sample_modes() { return ["discrete", "continuous", "until"]; }
+// ON-CHANGE mode: poll `checks` times at an interval but only record a sample when its
+// value differs from the last recorded one (the first is always recorded). `eq` is an
+// optional comparator; by default values compare by their string form. Great for
+// watching something that changes rarely without storing redundant samples.
+fn sample_on_change(probe_fn, checks, interval_ms = 50, eq = nil) {
+    let out = [];
+    let last = nil;
+    let have_last = false;
+    let i = 0;
+    while i < checks {
+        let v = probe_fn();
+        let changed = true;
+        if have_last {
+            if eq != nil { changed = not eq(last, v); }
+            else { changed = str(last) != str(v); }
+        }
+        if changed {
+            array_push(out, map{ at: time_now(), value: v });
+            last = v;
+            have_last = true;
+        }
+        i = i + 1;
+        if i < checks { sleep_ms(interval_ms); }
+    }
+    return out;
+}
+
+fn sample_modes() { return ["discrete", "continuous", "until", "on_change"]; }
 
 // Unified entry: stream(probe_fn, map{ mode, ... }). mode defaults to "discrete".
 //   discrete:   { n, interval_ms }
@@ -414,6 +525,9 @@ fn stream(probe_fn, opts) {
     if mode == "until" {
         return sample_until(probe_fn, opts.predicate, try opts.max_samples catch 1000, try opts.interval_ms catch 50);
     }
+    if mode == "on_change" {
+        return sample_on_change(probe_fn, try opts.checks catch 100, try opts.interval_ms catch 50, try opts.eq catch nil);
+    }
     return sample(probe_fn, try opts.n catch 10, try opts.interval_ms catch 100);
 }
 
@@ -421,7 +535,7 @@ export OPNAMES;
 export disasm, opcode_histogram, bytecode;
 export heap, memory, vm, time_now, compute, neural, quantum;
 export cpu, storage, gpus, npu, devices, network, hardware;
-export binary, hexdump, hexdump_file, compress_stats;
+export binary, hexdump, hexdump_file, compress_stats, image, audio;
 export capture_all, capture_full, probes, probe;
 export watcher, snapshot, diff, watch, report;
-export sample, live, sample_continuous, sample_until, sample_modes, stream;
+export sample, live, sample_continuous, sample_until, sample_on_change, sample_modes, stream;
