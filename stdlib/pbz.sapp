@@ -28,7 +28,7 @@ fn _insert(heads, k, pos) {
 }
 
 // compress(data: string|bytes) -> byte array
-fn compress(data) {
+fn _lzss_compress(data) {
     let bytes = _as_bytes(data);
     let n = len(bytes);
     let out = [];
@@ -102,7 +102,7 @@ fn compress(data) {
 }
 
 // decompress(blob: bytes) -> byte array
-fn decompress(blob) {
+fn _lzss_decompress(blob) {
     let n = blob[0] * 16777216 + blob[1] * 65536 + blob[2] * 256 + blob[3];
     let out = [];
     let pos = 4;
@@ -129,11 +129,231 @@ fn decompress(blob) {
     return out;
 }
 
+// ── Huffman entropy stage (DEFLATE-style canonical Huffman over the byte alphabet) ──
+// Applied as a second pass over the LZSS output to entropy-code its skewed byte
+// distribution. Canonical codes => the decoder only needs the 256 code lengths.
+
+fn _w32b(out, v) {
+    array_push(out, bit_and(bit_shr(v, 24), 255));
+    array_push(out, bit_and(bit_shr(v, 16), 255));
+    array_push(out, bit_and(bit_shr(v, 8), 255));
+    array_push(out, bit_and(v, 255));
+}
+
+fn _min_idx(nodes, skip) {
+    let best = 0 - 1;
+    let i = 0;
+    while i < len(nodes) {
+        if i != skip {
+            if best < 0 or nodes[i].f < nodes[best].f { best = i; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn _assign_lengths(node, depth, lengths) {
+    if node.sym >= 0 {
+        let d = depth;
+        if d < 1 { d = 1; }
+        lengths[node.sym] = d;
+        return 0;
+    }
+    _assign_lengths(node.l, depth + 1, lengths);
+    _assign_lengths(node.r, depth + 1, lengths);
+    return 0;
+}
+
+// freq[256] -> code length per symbol (0 = unused).
+fn _code_lengths(freq) {
+    let lengths = [];
+    let z = 0;
+    while z < 256 { array_push(lengths, 0); z = z + 1; }
+    let nodes = [];
+    let s = 0;
+    while s < 256 { if freq[s] > 0 { array_push(nodes, map{ f: freq[s], sym: s, l: nil, r: nil }); } s = s + 1; }
+    if len(nodes) == 0 { return lengths; }
+    if len(nodes) == 1 { lengths[nodes[0].sym] = 1; return lengths; }
+    while len(nodes) > 1 {
+        let i1 = _min_idx(nodes, 0 - 1);
+        let i2 = _min_idx(nodes, i1);
+        let parent = map{ f: nodes[i1].f + nodes[i2].f, sym: 0 - 1, l: nodes[i1], r: nodes[i2] };
+        let keep = [];
+        let i = 0;
+        while i < len(nodes) { if i != i1 and i != i2 { array_push(keep, nodes[i]); } i = i + 1; }
+        array_push(keep, parent);
+        nodes = keep;
+    }
+    _assign_lengths(nodes[0], 0, lengths);
+    return lengths;
+}
+
+fn _maxlen(lengths) {
+    let m = 0;
+    let i = 0;
+    while i < 256 { if lengths[i] > m { m = lengths[i]; } i = i + 1; }
+    return m;
+}
+
+// canonical code value per symbol from the code lengths.
+fn _canonical(lengths, maxlen) {
+    let bl_count = [];
+    let l = 0;
+    while l <= maxlen { array_push(bl_count, 0); l = l + 1; }
+    let i = 0;
+    while i < 256 { if lengths[i] > 0 { bl_count[lengths[i]] = bl_count[lengths[i]] + 1; } i = i + 1; }
+    let next_code = [];
+    l = 0;
+    while l <= maxlen { array_push(next_code, 0); l = l + 1; }
+    let code = 0;
+    l = 1;
+    while l <= maxlen { code = (code + bl_count[l - 1]) * 2; next_code[l] = code; l = l + 1; }
+    let codes = [];
+    i = 0;
+    while i < 256 { array_push(codes, 0); i = i + 1; }
+    i = 0;
+    while i < 256 {
+        if lengths[i] > 0 { codes[i] = next_code[lengths[i]]; next_code[lengths[i]] = next_code[lengths[i]] + 1; }
+        i = i + 1;
+    }
+    return codes;
+}
+
+fn _bw_write(bw, code, len) {
+    let i = len - 1;
+    while i >= 0 {
+        let bit = bit_and(bit_shr(code, i), 1);
+        bw.cur = bit_or(bw.cur, bit_shl(bit, 7 - bw.nbits));
+        bw.nbits = bw.nbits + 1;
+        if bw.nbits == 8 { array_push(bw.bytes, bw.cur); bw.cur = 0; bw.nbits = 0; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// huffman_encode(bytes) -> byte array, or nil if codes would exceed 30 bits (bail).
+fn huffman_encode(bytes) {
+    let n = len(bytes);
+    let freq = [];
+    let z = 0;
+    while z < 256 { array_push(freq, 0); z = z + 1; }
+    let i = 0;
+    while i < n { freq[bytes[i]] = freq[bytes[i]] + 1; i = i + 1; }
+    let lengths = _code_lengths(freq);
+    let mx = _maxlen(lengths);
+    if mx > 30 { return nil; }
+    let codes = _canonical(lengths, mx);
+    let out = [];
+    _w32b(out, n);
+    i = 0;
+    while i < 256 { array_push(out, lengths[i]); i = i + 1; }
+    let bw = map{ bytes: [], cur: 0, nbits: 0 };
+    i = 0;
+    while i < n { _bw_write(bw, codes[bytes[i]], lengths[bytes[i]]); i = i + 1; }
+    if bw.nbits > 0 { array_push(bw.bytes, bw.cur); }
+    let j = 0;
+    while j < len(bw.bytes) { array_push(out, bw.bytes[j]); j = j + 1; }
+    return out;
+}
+
+// huffman_decode(blob, start) -> byte array.
+fn huffman_decode(blob, start) {
+    let n = blob[start] * 16777216 + blob[start + 1] * 65536 + blob[start + 2] * 256 + blob[start + 3];
+    let lengths = [];
+    let i = 0;
+    while i < 256 { array_push(lengths, blob[start + 4 + i]); i = i + 1; }
+    let body = start + 4 + 256;
+    let out = [];
+    if n == 0 { return out; }
+    let mx = _maxlen(lengths);
+    // per-length first canonical code + symbol index tables
+    let bl_count = [];
+    let l = 0;
+    while l <= mx { array_push(bl_count, 0); l = l + 1; }
+    i = 0;
+    while i < 256 { if lengths[i] > 0 { bl_count[lengths[i]] = bl_count[lengths[i]] + 1; } i = i + 1; }
+    let first_code = [];
+    let first_index = [];
+    l = 0;
+    while l <= mx { array_push(first_code, 0); array_push(first_index, 0); l = l + 1; }
+    let code = 0;
+    let idx = 0;
+    l = 1;
+    while l <= mx {
+        code = (code + bl_count[l - 1]) * 2;
+        first_code[l] = code;
+        first_index[l] = idx;
+        idx = idx + bl_count[l];
+        l = l + 1;
+    }
+    // symbols sorted by (length, symbol)
+    let sorted = [];
+    l = 1;
+    while l <= mx {
+        let s = 0;
+        while s < 256 { if lengths[s] == l { array_push(sorted, s); } s = s + 1; }
+        l = l + 1;
+    }
+    // bit-read + canonical decode
+    let pos = body;
+    let bit = 0;
+    while len(out) < n {
+        let acc = 0;
+        let clen = 0;
+        let sym = 0 - 1;
+        while sym < 0 and clen <= mx {
+            let b = bit_and(bit_shr(blob[pos], 7 - bit), 1);
+            bit = bit + 1;
+            if bit == 8 { bit = 0; pos = pos + 1; }
+            acc = acc * 2 + b;
+            clen = clen + 1;
+            if bl_count[clen] > 0 {
+                let offset = acc - first_code[clen];
+                if offset >= 0 and offset < bl_count[clen] { sym = sorted[first_index[clen] + offset]; }
+            }
+        }
+        array_push(out, sym);
+    }
+    return out;
+}
+
+// ── public codec: tag byte selects pipeline, always picks the smaller result ──
+fn compress(data, level = nil) {
+    if level == nil { level = 1; }
+    let lz = _lzss_compress(data);
+    if level > 0 {
+        let hf = huffman_encode(lz);
+        if hf != nil and len(hf) + 1 < len(lz) + 1 {
+            let out = [1];
+            let i = 0;
+            while i < len(hf) { array_push(out, hf[i]); i = i + 1; }
+            return out;
+        }
+    }
+    let out = [0];
+    let i = 0;
+    while i < len(lz) { array_push(out, lz[i]); i = i + 1; }
+    return out;
+}
+
+fn decompress(blob) {
+    let tag = blob[0];
+    if tag == 1 {
+        let lz = huffman_decode(blob, 1);
+        return _lzss_decompress(lz);
+    }
+    // tag 0: strip the tag byte, decompress LZSS
+    let lz = [];
+    let i = 1;
+    while i < len(blob) { array_push(lz, blob[i]); i = i + 1; }
+    return _lzss_decompress(lz);
+}
+
 // Convenience: string round-trip.
-fn compress_str(s) { return compress(str_to_bytes(s)); }
+fn compress_str(s) { return compress(str_to_bytes(s), 1); }
 fn decompress_str(blob) { return bytes_to_str(decompress(blob)); }
 
 // ratio(original_len, compressed_len) -> compression ratio (orig/comp).
 fn ratio(orig, comp) { if comp <= 0 { return 0; } return orig / comp; }
 
-export compress, decompress, compress_str, decompress_str, ratio;
+export compress, decompress, compress_str, decompress_str, ratio, huffman_encode, huffman_decode;
