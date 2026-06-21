@@ -380,6 +380,58 @@ pub(super) fn bytes_to_str(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
     Ok(alloc_string(s))
 }
 
+/// `num_to_le_bytes(n)` → array<number 0..255> of length 8: the IEEE-754
+/// little-endian byte encoding of `n` (an f64). Inverse of `num_from_le_bytes`.
+/// The binary-serialization primitive pblang lacked — lets pure-pblang code emit
+/// exact float bytes (e.g. produce the Rust `.pbck` constant encoding).
+pub(super) fn num_to_le_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(host.err(format!(
+            "num_to_le_bytes() expects 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let n = match &args[0] {
+        Value::Number(n) => *n,
+        _ => return Err(host.err("num_to_le_bytes(): expected a number".into())),
+    };
+    Ok(alloc_array(
+        n.to_le_bytes().iter().map(|b| Value::Number(*b as f64)).collect(),
+    ))
+}
+
+/// `num_from_le_bytes(arr)` → number: decode an 8-byte little-endian array as an
+/// f64. Inverse of `num_to_le_bytes`.
+pub(super) fn num_from_le_bytes(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 1 {
+        return Err(host.err(format!(
+            "num_from_le_bytes() expects 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let arr = match &args[0] {
+        Value::Array(a) => a.clone(),
+        _ => return Err(host.err("num_from_le_bytes(): expected a byte array".into())),
+    };
+    let b = arr.borrow();
+    if b.len() != 8 {
+        return Err(host.err(format!(
+            "num_from_le_bytes(): expected 8 bytes, got {}",
+            b.len()
+        )));
+    }
+    let mut bytes = [0u8; 8];
+    for (i, v) in b.iter().enumerate() {
+        match v {
+            Value::Number(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 => {
+                bytes[i] = *n as u8;
+            }
+            _ => return Err(host.err("num_from_le_bytes(): expected byte numbers 0..255".into())),
+        }
+    }
+    Ok(Value::Number(f64::from_le_bytes(bytes)))
+}
+
 // -------------------------------------------------------------------------
 // Replace / format / repeat / pad
 // -------------------------------------------------------------------------

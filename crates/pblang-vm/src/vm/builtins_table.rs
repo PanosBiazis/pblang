@@ -1011,6 +1011,16 @@ pub(super) fn build() -> Vec<BuiltinFn> {
             fun: strings::str_to_bytes,
         },
         BuiltinFn {
+            name: "num_to_le_bytes",
+            arity: Some(1),
+            fun: strings::num_to_le_bytes,
+        },
+        BuiltinFn {
+            name: "num_from_le_bytes",
+            arity: Some(1),
+            fun: strings::num_from_le_bytes,
+        },
+        BuiltinFn {
             name: "bytes_to_str",
             arity: Some(1),
             fun: strings::bytes_to_str,
