@@ -10,14 +10,24 @@
 //      then chunk = u32 n_ins, per-op (tag byte + u32 operand where applicable),
 //      u32 n_const + values, u32 n_spans + (u32,u32), u8 has_source_name.
 //
-// Scope: the core opcode subset (constants, arithmetic, comparisons, globals,
-// locals, print, jumps, call, not, return). Opcodes with no Rust-VM equivalent
-// (the self-hosted short-circuit *_PEEK jumps) or needing structural rewrites
-// (OP_CLOSURE captures, try/defer) throw — they are the documented next step.
+// Functions and closures: the self-hosted codegen now shares the Rust VM's
+// calling convention (callee pushed first, then args — see codegen.sapp), so a
+// self-hosted OP_CLOSURE/OP_CALL/OP_GET_UPVALUE stream maps directly onto the
+// native VM. A self-hosted function constant `{arity, chunk, upvalues}` becomes a
+// Rust Function value (tag 7), and OP_CLOSURE's capture list (stored on the fn
+// constant) is inlined into the Rust OpClosure instruction. Function chunks are
+// translated recursively.
+//
+// Remaining boundary: opcodes with no Rust-VM equivalent (the short-circuit
+// *_PEEK jumps, OP_TRY/OP_THROW) and default-parameter metadata (defaults are
+// baked into the body, so calls must pass the exact arity) still throw / are not
+// represented — the documented next step.
 
 let RUST_VERSION = 1;
 
 // Self-hosted op number -> Rust OpCode tag. Identity for 0..15; remapped above.
+// OP_CLOSURE (24) is NOT here: it needs inline captures and is handled in
+// `_emit_instruction` directly.
 fn _rust_op(op) {
     if op <= 15 { return op; }            // OP_CONSTANT..OP_SET_GLOBAL match exactly
     if op == 16 { return 25; }            // OP_GET_LOCAL  -> OpGetLocal
@@ -34,7 +44,9 @@ fn _rust_op(op) {
     if op == 28 { return 22; }            // OP_SET_INDEX  -> OpSetIndex
     if op == 29 { return 16; }            // OP_GET_ATTR   -> OpGetAttr
     if op == 30 { return 17; }            // OP_SET_ATTR   -> OpSetAttr
-    return (0 - 1);                       // unmapped (peek jumps, closure, try, ...)
+    if op == 38 { return 28; }            // OP_GET_UPVALUE -> OpGetUpvalue
+    if op == 39 { return 29; }            // OP_SET_UPVALUE -> OpSetUpvalue
+    return (0 - 1);                       // unmapped (peek jumps, try, throw, ...)
 }
 
 // Rust ops that carry a single u32 operand in the .pbck layout.
@@ -62,69 +74,167 @@ fn _w_f64(out, n) {
     while i < 8 { array_push(out, b[i]); i = i + 1; }
 }
 
+// A self-hosted function constant is a map carrying a compiled body chunk plus
+// arity/capture metadata (codegen.sapp::codegen_fn / codegen_fnlit).
+fn _is_function_const(v) {
+    return type(v) == "map" and map_has(v, "chunk") and map_has(v, "arity");
+}
+
 fn _w_value(out, v) {
     if v == nil { _w_u8(out, 2); return; }
+    if _is_function_const(v) { _w_u8(out, 7); _w_function(out, v); return; }
     let t = type(v);
     if t == "number" { _w_u8(out, 0); _w_f64(out, v); return; }
     if t == "bool" { _w_u8(out, 1); _w_u8(out, if v { 1 } else { 0 }); return; }
     if t == "string" { _w_u8(out, 3); _w_str(out, v); return; }
-    throw "selfhost_to_pbck: unsupported constant kind (functions/closures not yet translated)";
+    throw "selfhost_to_pbck: unsupported constant kind " + t;
 }
 
-// Emit the Rust .pbck bytes for a self-hosted chunk-map. Appends an implicit
-// `OpConstant(nil); OpReturn` if the chunk doesn't already end in a return, to
-// satisfy the Rust VM's main-chunk exit convention.
-fn translate(chunk) {
+// Encode a self-hosted function constant as a Rust Function (pbck tag 7 body).
+// Defaults are compiled into the body, so min_arity == arity and the defaults
+// list is empty (callers must pass the exact argument count).
+fn _w_function(out, fc) {
+    _w_u8(out, 0);              // name: None
+    _w_u32(out, fc.arity);     // arity
+    _w_u32(out, fc.arity);     // min_arity = arity
+    _w_u32(out, 0);            // defaults: none
+    _w_u8(out, 0);             // is_vararg: false
+    _w_u8(out, 0);             // param_types: None
+    _emit_chunk(out, fc.chunk, false, fc.arity);  // body chunk (ends in OP_RETURN)
+}
+
+// Rust jump ops carry an ABSOLUTE target instruction index (not a byte offset).
+// When we prepend local-slot placeholders we shift every target by that count.
+fn _is_rust_jump(rop) { return rop == 35 or rop == 36 or rop == 37; }
+
+// Emit one instruction into the byte buffer `out`; returns the instruction count
+// emitted (always 1). `shift` is added to jump targets (see _emit_chunk).
+//   - OP_CLOSURE is special: the Rust OpClosure encodes its capture list inline
+//     (fn_const u32, n u32, then per-capture is_local u8 + idx u32), whereas the
+//     self-hosted form keeps the captures on the fn constant.
+fn _emit_instruction(out, inst, consts, shift) {
+    let op = inst.op;
+    if op == 24 {                          // OP_CLOSURE -> OpClosure (tag 27)
+        let fn_idx = inst.operand;
+        let fc = consts[fn_idx];
+        let ups = try fc.upvalues catch [];
+        _w_u8(out, 27);
+        _w_u32(out, fn_idx);               // constant index — not a jump target
+        _w_u32(out, len(ups));
+        let u = 0;
+        while u < len(ups) {
+            _w_u8(out, if ups[u].is_local { 1 } else { 0 });
+            _w_u32(out, ups[u].index);
+            u = u + 1;
+        }
+        return 1;
+    }
+    let rop = _rust_op(op);
+    if rop < 0 {
+        throw "selfhost_to_pbck: opcode " + str(op) + " has no Rust-VM equivalent yet";
+    }
+    _w_u8(out, rop);
+    if _rust_op_has_operand(rop) {
+        let operand = try inst.operand catch 0;
+        if _is_rust_jump(rop) { operand = operand + shift; }
+        _w_u32(out, operand);
+    }
+    return 1;
+}
+
+// Highest local slot referenced by OP_GET_LOCAL(16)/OP_SET_LOCAL(17), or -1.
+fn _max_local_slot(ins) {
+    let m = 0 - 1;
+    let i = 0;
+    while i < len(ins) {
+        let op = ins[i].op;
+        if op == 16 or op == 17 {
+            let s = try ins[i].operand catch 0;
+            if s > m { m = s; }
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+// Emit a chunk (instructions, constants, spans, source_name) in the .pbck layout.
+//
+// Local-model bridge: the self-hosted compiler treats a `let` DECLARATION inside
+// a function as `expr; OP_SET_LOCAL slot` against a growable locals array, but the
+// Rust VM's locals are stack-relative slots that must already exist (its OpSetLocal
+// pops and overwrites slot `stack_base+1+slot`). So at function entry we push one
+// `nil` per non-parameter local slot (arity..max_slot); now every OP_SET_LOCAL has
+// a slot to write and slot NUMBERS are unchanged. Prepending those instructions
+// shifts absolute jump targets, which `_emit_instruction` corrects.
+//
+// `is_top` additionally appends an implicit `OpConstant(nil); OpReturn` to satisfy
+// the Rust VM's main-chunk exit convention when the chunk doesn't end in a return.
+fn _emit_chunk(out, chunk, is_top, arity) {
     let ins = chunk.instructions;
     let consts = chunk.constants;
 
-    // Copy constants (we may add a trailing nil).
+    // Copy constants (we may append nil placeholders / a trailing-return nil).
     let out_consts = [];
     let ci = 0;
     while ci < len(consts) { array_push(out_consts, consts[ci]); ci = ci + 1; }
 
-    // Build the (possibly extended) instruction list as (rust_op, operand) pairs.
-    let pairs = [];
+    // Placeholder local slots to pre-push at entry.
+    let pad = (_max_local_slot(ins) + 1) - arity;
+    if pad < 0 { pad = 0; }
+
+    let ibytes = [];
+    let n_ins = 0;
+
+    if pad > 0 {
+        array_push(out_consts, nil);
+        let nil_idx = len(out_consts) - 1;
+        let p = 0;
+        while p < pad {
+            _w_u8(ibytes, 0); _w_u32(ibytes, nil_idx);   // OpConstant nil
+            n_ins = n_ins + 1;
+            p = p + 1;
+        }
+    }
+
+    // Body instructions, jump targets shifted by `pad`.
     let i = 0;
     while i < len(ins) {
-        let rop = _rust_op(ins[i].op);
-        if rop < 0 {
-            throw "selfhost_to_pbck: opcode " + str(ins[i].op) + " has no Rust-VM equivalent yet";
-        }
-        array_push(pairs, map{ op: rop, operand: try ins[i].operand catch 0 });
+        n_ins = n_ins + _emit_instruction(ibytes, ins[i], consts, pad);
         i = i + 1;
     }
-    // Ensure a trailing OpReturn (Rust op 33).
-    let needs_ret = len(pairs) == 0 or pairs[len(pairs) - 1].op != 33;
-    if needs_ret {
-        array_push(out_consts, nil);
-        array_push(pairs, map{ op: 0, operand: len(out_consts) - 1 }); // OpConstant nil
-        array_push(pairs, map{ op: 33, operand: 0 });                  // OpReturn
+
+    if is_top {
+        let last_ret = len(ins) > 0 and _rust_op(ins[len(ins) - 1].op) == 33;
+        if not last_ret {
+            array_push(out_consts, nil);
+            _w_u8(ibytes, 0); _w_u32(ibytes, len(out_consts) - 1);  // OpConstant nil
+            _w_u8(ibytes, 33);                                       // OpReturn
+            n_ins = n_ins + 2;
+        }
     }
 
-    let out = [];
-    _w_u8(out, 80); _w_u8(out, 66); _w_u8(out, 67); _w_u8(out, 75);   // "PBCK"
-    _w_u8(out, RUST_VERSION);
-
-    // chunk: instructions
-    _w_u32(out, len(pairs));
-    let p = 0;
-    while p < len(pairs) {
-        _w_u8(out, pairs[p].op);
-        if _rust_op_has_operand(pairs[p].op) { _w_u32(out, pairs[p].operand); }
-        p = p + 1;
-    }
+    // instructions
+    _w_u32(out, n_ins);
+    let b = 0;
+    while b < len(ibytes) { array_push(out, ibytes[b]); b = b + 1; }
     // constants
     _w_u32(out, len(out_consts));
     let k = 0;
     while k < len(out_consts) { _w_value(out, out_consts[k]); k = k + 1; }
     // spans: one zero span per instruction (keeps spans.len == instructions.len)
-    _w_u32(out, len(pairs));
+    _w_u32(out, n_ins);
     let s = 0;
-    while s < len(pairs) { _w_u32(out, 0); _w_u32(out, 0); s = s + 1; }
+    while s < n_ins { _w_u32(out, 0); _w_u32(out, 0); s = s + 1; }
     // source_name: none
     _w_u8(out, 0);
+}
 
+// Emit the Rust .pbck bytes for a self-hosted chunk-map.
+fn translate(chunk) {
+    let out = [];
+    _w_u8(out, 80); _w_u8(out, 66); _w_u8(out, 67); _w_u8(out, 75);   // "PBCK"
+    _w_u8(out, RUST_VERSION);
+    _emit_chunk(out, chunk, true, 0);
     return out;
 }
 
