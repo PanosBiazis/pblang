@@ -6,6 +6,57 @@ use crate::{
     TypeKind,
 };
 
+// ── Unicode identifier policy (UAX#31, mainstream stance) ────────────────────────
+// Identifiers may use Unicode LETTERS (Latin incl. accents, Greek, Cyrillic,
+// Armenian, Hebrew, Arabic, Devanagari, Hiragana, Katakana, Hangul, CJK), plus
+// `_` to start and digits/combining marks to continue. Emoji are NOT letters and
+// are excluded. This mirrors stdlib/unicode_ident.sapp (the pblang-side policy
+// core) so the Rust lexer and the self-hosted tokenizer agree.
+//
+// Known edge: an identifier that is an exact ASCII keyword prefix immediately
+// followed by a non-ASCII letter (e.g. `letλ`) is not handled here, because
+// keyword matching uses ASCII boundaries; such identifiers are vanishingly rare.
+fn is_ident_start_char(c: char) -> bool {
+    if c == '_' || c.is_ascii_alphabetic() {
+        return true;
+    }
+    if c.is_ascii() {
+        return false;
+    }
+    let cp = c as u32;
+    (0xC0..=0xD6).contains(&cp)
+        || (0xD8..=0xF6).contains(&cp)
+        || (0xF8..=0x2FF).contains(&cp)
+        || (0x1E00..=0x1EFF).contains(&cp) // Latin Extended Additional
+        || (0x370..=0x3FF).contains(&cp)   // Greek & Coptic
+        || (0x400..=0x4FF).contains(&cp)   // Cyrillic
+        || (0x531..=0x556).contains(&cp)
+        || (0x561..=0x586).contains(&cp)   // Armenian
+        || (0x5D0..=0x5EA).contains(&cp)   // Hebrew
+        || (0x620..=0x64A).contains(&cp)
+        || (0x66E..=0x6D3).contains(&cp)   // Arabic
+        || (0x904..=0x939).contains(&cp)   // Devanagari
+        || (0x3041..=0x3096).contains(&cp) // Hiragana
+        || (0x30A1..=0x30FA).contains(&cp) // Katakana
+        || (0x3400..=0x4DBF).contains(&cp) // CJK Ext A
+        || (0x4E00..=0x9FFF).contains(&cp) // CJK Unified
+        || (0xAC00..=0xD7A3).contains(&cp) // Hangul Syllables
+        || cp == 0xAA
+        || cp == 0xB5
+        || cp == 0xBA
+}
+
+fn is_ident_continue_char(c: char) -> bool {
+    if is_ident_start_char(c) || c.is_ascii_digit() {
+        return true;
+    }
+    if c.is_ascii() {
+        return false;
+    }
+    let cp = c as u32;
+    (0x300..=0x36F).contains(&cp) || (0x1DC0..=0x1DFF).contains(&cp) // combining marks
+}
+
 fn mk_expr(kind: ExprKind, span: std::ops::Range<usize>) -> Expr {
     Expr {
         kind,
@@ -223,7 +274,25 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let nil_lit = just("nil").to(ExprKind::Nil).map_with(mk_expr_w).padded();
 
-    let ident = text::ident().map(|s: &str| s.to_string()).padded();
+    // Unicode-aware identifier parser (UAX#31 letters; see is_ident_start_char).
+    // Reused (via .clone()) at value-identifier sites in place of the ASCII-only
+    // `text::ident()`. Type-generic names (ty_generic) intentionally stay ASCII.
+    let uident = any::<&'src str, extra::Err<Simple<'src, char>>>()
+        .filter(|c: &char| is_ident_start_char(*c))
+        .then(
+            any::<&'src str, extra::Err<Simple<'src, char>>>()
+                .filter(|c: &char| is_ident_continue_char(*c))
+                .repeated()
+                .collect::<String>(),
+        )
+        .map(|(first, rest): (char, String)| {
+            let mut s = String::with_capacity(first.len_utf8() + rest.len());
+            s.push(first);
+            s.push_str(&rest);
+            s
+        })
+        .padded();
+    let ident = uident.clone();
 
     // Mutual recursion: expression blocks need statements, and statements need expressions.
     let mut expr = Recursive::declare();
@@ -350,7 +419,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     // vararg param: ...name (must be last in param list)
     let vararg_param = just("...")
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .map(|name| Param {
             name,
             ty: None,
@@ -412,9 +481,8 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
         }),
     ));
 
-    let param_with_default = text::ident()
-        .map(|s: &str| s.to_string())
-        .padded()
+    let param_with_default = uident
+        .clone()
         .then(type_ann.clone())
         .then(
             just('=')
@@ -442,7 +510,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let fn_stmt = just("fn")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then(params.clone())
         .then(ret_ann.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
@@ -461,7 +529,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
         .then_ignore(ws1)
         .then_ignore(just("fn"))
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then(params.clone())
         .then(ret_ann.clone())
         .then(block_stmt.clone().map(|s| match s.kind {
@@ -573,9 +641,9 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     //   desugars to: let __d_N = expr; let a = __d_N[0]; let b = __d_N[1]; ...
     //   with optional rest: let [a, b, ...rest] = expr
     //     desugars to: ... let rest = [__d_N[2], __d_N[3], ...]
-    let destruct_ident = text::ident().map(|s: &str| s.to_string()).padded();
+    let destruct_ident = uident.clone();
     let destruct_rest = just("...")
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .map(|name| (name, true)); // (name, is_rest)
     let destruct_name_or_rest = choice((destruct_rest, destruct_ident.map(|n| (n, false))));
 
@@ -717,7 +785,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
             .map(|s: &str| s.to_string())
             .padded()
             .then_ignore(just(':').padded())
-            .then(text::ident().map(|s: &str| s.to_string()).padded())
+            .then(uident.clone())
             .map(|(key, alias): (String, String)| (key, alias)),
         // key  (same name for key and local)
         text::ident()
@@ -800,7 +868,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     }
 
     let l_attr = just('.')
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .map_with(|name, e| LPostfix::Attr(name, Span::from(span_of(e))))
         .padded();
 
@@ -810,9 +878,8 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
         .map_with(|x, e| LPostfix::Index(x, Span::from(span_of(e))))
         .padded();
 
-    let lvalue = text::ident()
-        .map(|s: &str| s.to_string())
-        .padded()
+    let lvalue = uident
+        .clone()
         .map(ExprKind::Var)
         .map_with(mk_expr_w)
         .foldl(
@@ -984,9 +1051,9 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     // for k, v in expr { body } — iterates map key-value pairs
     let for_in_kv_stmt = just("for")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then_ignore(just(',').padded())
-        .then(text::ident().map(|s: &str| s.to_string()).padded())
+        .then(uident.clone())
         .then_ignore(ws0) // padded already consumed trailing ws
         .then_ignore(just("in"))
         .then_ignore(ws1)
@@ -1058,7 +1125,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     // let Name = map{ method: fn method(self, x) { ... }, other: fn other() { ... } };
     let class_method = just("fn")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then(params.clone())
         .then(ret_ann.clone())
         .then(block_body.clone())
@@ -1074,7 +1141,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let class_stmt = just("class")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then_ignore(ws0)
         .then(
             class_method
@@ -1334,7 +1401,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let interface_stmt = just("interface")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then_ignore(ws0)
         .then(
             interface_member
@@ -1421,7 +1488,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let struct_stmt = just("struct")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then_ignore(ws0)
         .then(
             struct_field
@@ -1479,7 +1546,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     // (`Color.Red`); data variants are typed constructor functions
     // (`Shape.Circle(5)`). Both carry `__enum`/`__variant`; data variants also
     // carry a `values` array.
-    let enum_variant = text::ident().map(|s: &str| s.to_string()).padded().then(
+    let enum_variant = uident.clone().then(
         ty.clone()
             .separated_by(just(',').padded())
             .allow_trailing()
@@ -1490,7 +1557,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let enum_stmt = just("enum")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then_ignore(ws0)
         .then(
             enum_variant
@@ -1618,7 +1685,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let goto_jump_stmt = just("goto")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .map_with(|label, __e| {
             let sp = __e.span().into_range();
             let sp = Span::from(sp);
@@ -1691,9 +1758,9 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     // g_for_in_kv_stmt: for k, v in expr { body } inside goto context
     let g_for_in_kv_stmt = just("for")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then_ignore(just(',').padded())
-        .then(text::ident().map(|s: &str| s.to_string()).padded())
+        .then(uident.clone())
         .then_ignore(ws0) // padded already consumed trailing ws
         .then_ignore(just("in"))
         .then_ignore(ws1)
@@ -1767,7 +1834,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let goto_label = just("label")
         .then_ignore(ws1)
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then(gblock_body.clone());
 
     let goto_block_stmt = just("goto")
@@ -2060,7 +2127,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     // fn (a, b) { ... }
     // fn name(a, b) { ... }   (optional name, mainly for debugging/stack traces later)
     let fn_lit_name = ws1
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .or_not();
 
     let fn_lit_expr = just("fn")
@@ -2109,7 +2176,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     let map_key = choice((
         // allow: foo: 1
-        text::ident().map(|s: &str| s.to_string()).padded(),
+        uident.clone(),
         // allow: "foo": 1
         string_raw,
     ));
@@ -2389,13 +2456,13 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     }
 
     let attr = just('.')
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .map_with(|name, __e| Postfix::Attr(name, Span::from(span_of(__e))))
         .padded();
 
     // `?.field` — nil-safe attribute access
     let safe_attr = just("?.")
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .map_with(|name, __e| Postfix::SafeAttr(name, Span::from(span_of(__e))))
         .padded();
 
@@ -2441,7 +2508,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     let call = args.clone().map(|(a, sp)| Postfix::Call(a, sp));
 
     let method = just(':')
-        .ignore_then(text::ident().map(|s: &str| s.to_string()).padded())
+        .ignore_then(uident.clone())
         .then(args.clone())
         .map_with(|(name, (a, _)), __e| {
             let sp = __e.span().into_range();
