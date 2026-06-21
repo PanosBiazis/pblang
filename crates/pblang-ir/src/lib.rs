@@ -1386,3 +1386,449 @@ mod serialize_tests {
         assert!(bytes.len() > 8);
     }
 }
+
+// ============================================================================
+// PBCK v1 — lossless bytecode container (compile once, run without re-parsing)
+//
+// Unlike the write-only `serialize_chunk_pbck` above (used by the Cranelift AOT
+// path, lossy by design), this is a complete, reversible serializer + a matching
+// deserializer covering EVERY opcode, every compile-time constant type (Number,
+// Bool, Nil, String — plus BigInt/Rational forward-compat), and nested function
+// constants (recursively, the whole closure template tree) with spans. This is
+// the basis for regenerating a runnable program from pblang without re-running
+// the Rust parser/compiler — `pblang run file.pbck`.
+//
+// Format: magic b"PBCK", u8 version=1, then one serialized <chunk>. All integers
+// little-endian u32; strings are u32 length + UTF-8 bytes.
+// ============================================================================
+
+/// Container format version. Bump on any breaking layout change.
+pub const PBCK_V1_VERSION: u8 = 1;
+
+#[inline]
+fn pbck_w_u32(out: &mut Vec<u8>, v: usize) {
+    out.extend_from_slice(&(v as u32).to_le_bytes());
+}
+#[inline]
+fn pbck_w_str(out: &mut Vec<u8>, s: &str) {
+    pbck_w_u32(out, s.len());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn pbck_w_opcode(out: &mut Vec<u8>, op: &OpCode) {
+    match op {
+        OpCode::OpConstant(i) => { out.push(0); pbck_w_u32(out, *i); }
+        OpCode::OpAdd => out.push(1),
+        OpCode::OpSub => out.push(2),
+        OpCode::OpMul => out.push(3),
+        OpCode::OpDiv => out.push(4),
+        OpCode::OpEq => out.push(5),
+        OpCode::OpNotEq => out.push(6),
+        OpCode::OpGt => out.push(7),
+        OpCode::OpGe => out.push(8),
+        OpCode::OpLt => out.push(9),
+        OpCode::OpLe => out.push(10),
+        OpCode::OpPop => out.push(11),
+        OpCode::OpPrint => out.push(12),
+        OpCode::OpDefineGlobal(i) => { out.push(13); pbck_w_u32(out, *i); }
+        OpCode::OpGetGlobal(i) => { out.push(14); pbck_w_u32(out, *i); }
+        OpCode::OpSetGlobal(i) => { out.push(15); pbck_w_u32(out, *i); }
+        OpCode::OpGetAttr(i) => { out.push(16); pbck_w_u32(out, *i); }
+        OpCode::OpSetAttr(i) => { out.push(17); pbck_w_u32(out, *i); }
+        OpCode::OpExport(i) => { out.push(18); pbck_w_u32(out, *i); }
+        OpCode::OpMakeArray(i) => { out.push(19); pbck_w_u32(out, *i); }
+        OpCode::OpMakeMap(i) => { out.push(20); pbck_w_u32(out, *i); }
+        OpCode::OpGetIndex => out.push(21),
+        OpCode::OpSetIndex => out.push(22),
+        OpCode::OpTry(i) => { out.push(23); pbck_w_u32(out, *i); }
+        OpCode::OpEndTry => out.push(24),
+        OpCode::OpGetLocal(i) => { out.push(25); pbck_w_u32(out, *i); }
+        OpCode::OpSetLocal(i) => { out.push(26); pbck_w_u32(out, *i); }
+        OpCode::OpClosure { fn_const, captures } => {
+            out.push(27);
+            pbck_w_u32(out, *fn_const);
+            pbck_w_u32(out, captures.len());
+            for (is_local, idx) in captures {
+                out.push(u8::from(*is_local));
+                pbck_w_u32(out, *idx);
+            }
+        }
+        OpCode::OpGetUpvalue(i) => { out.push(28); pbck_w_u32(out, *i); }
+        OpCode::OpSetUpvalue(i) => { out.push(29); pbck_w_u32(out, *i); }
+        OpCode::OpCloseUpvalue => out.push(30),
+        OpCode::OpCall(i) => { out.push(31); pbck_w_u32(out, *i); }
+        OpCode::OpTailCall(i) => { out.push(32); pbck_w_u32(out, *i); }
+        OpCode::OpReturn => out.push(33),
+        OpCode::OpDefer => out.push(34),
+        OpCode::OpJump(i) => { out.push(35); pbck_w_u32(out, *i); }
+        OpCode::OpJumpIfFalse(i) => { out.push(36); pbck_w_u32(out, *i); }
+        OpCode::OpJumpIfTrue(i) => { out.push(37); pbck_w_u32(out, *i); }
+        OpCode::OpNot => out.push(38),
+        OpCode::OpNegate => out.push(39),
+        OpCode::OpMod => out.push(40),
+        OpCode::OpPow => out.push(41),
+        OpCode::OpSafeGetAttr(i) => { out.push(42); pbck_w_u32(out, *i); }
+        OpCode::OpSafeIndex => out.push(43),
+        OpCode::OpResultUnwrap => out.push(44),
+        OpCode::OpIsNil => out.push(45),
+        OpCode::OpDup => out.push(46),
+        OpCode::OpThrow => out.push(47),
+    }
+}
+
+fn pbck_w_value(out: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Number(n) => { out.push(0); out.extend_from_slice(&n.to_le_bytes()); }
+        Value::Bool(b) => { out.push(1); out.push(u8::from(*b)); }
+        Value::Nil => out.push(2),
+        Value::Obj(o) => match o.as_ref() {
+            Obj::String(s) => { out.push(3); pbck_w_str(out, s); }
+            Obj::BigInt(n) => { out.push(4); pbck_w_str(out, &n.to_string()); }
+            Obj::Rational(r) => { out.push(5); pbck_w_str(out, &r.to_string()); }
+            Obj::Decimal(d) => { out.push(6); pbck_w_str(out, &d.to_string()); }
+        },
+        Value::Function(f) => { out.push(7); pbck_w_function(out, f); }
+        // Closures/Builtins/Modules/Array/Map are runtime-only and never appear
+        // as compile-time constants; encode as Nil to keep the format total.
+        _ => out.push(2),
+    }
+}
+
+fn pbck_w_function(out: &mut Vec<u8>, f: &Function) {
+    match &f.name {
+        Some(n) => { out.push(1); pbck_w_str(out, n); }
+        None => out.push(0),
+    }
+    pbck_w_u32(out, f.arity);
+    pbck_w_u32(out, f.min_arity);
+    pbck_w_u32(out, f.defaults.len());
+    for d in &f.defaults {
+        pbck_w_value(out, d);
+    }
+    out.push(u8::from(f.is_vararg));
+    match &f.param_types {
+        Some(pts) => {
+            out.push(1);
+            pbck_w_u32(out, pts.len());
+            for pt in pts {
+                out.push(match pt {
+                    ParamType::F64 => 0,
+                    ParamType::I64 => 1,
+                    ParamType::Bool => 2,
+                });
+            }
+        }
+        None => out.push(0),
+    }
+    pbck_w_chunk(out, &f.chunk);
+}
+
+fn pbck_w_chunk(out: &mut Vec<u8>, chunk: &Chunk) {
+    pbck_w_u32(out, chunk.instructions.len());
+    for op in &chunk.instructions {
+        pbck_w_opcode(out, op);
+    }
+    pbck_w_u32(out, chunk.constants.len());
+    for c in &chunk.constants {
+        pbck_w_value(out, c);
+    }
+    pbck_w_u32(out, chunk.spans.len());
+    for sp in &chunk.spans {
+        pbck_w_u32(out, sp.start);
+        pbck_w_u32(out, sp.end);
+    }
+    match &chunk.source_name {
+        Some(n) => { out.push(1); pbck_w_str(out, n); }
+        None => out.push(0),
+    }
+}
+
+/// Serialize a compiled [`Chunk`] (with nested function constants) to the
+/// lossless PBCK v1 container.
+pub fn pbck_serialize(chunk: &Chunk) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(b"PBCK");
+    out.push(PBCK_V1_VERSION);
+    pbck_w_chunk(&mut out, chunk);
+    out
+}
+
+struct PbckReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PbckReader<'a> {
+    fn u8(&mut self) -> Result<u8, String> {
+        let b = *self.buf.get(self.pos).ok_or("pbck: unexpected end of input")?;
+        self.pos += 1;
+        Ok(b)
+    }
+    fn u32(&mut self) -> Result<usize, String> {
+        let end = self.pos + 4;
+        let s = self.buf.get(self.pos..end).ok_or("pbck: truncated u32")?;
+        let arr: [u8; 4] = s.try_into().map_err(|_| "pbck: bad u32".to_string())?;
+        self.pos = end;
+        Ok(u32::from_le_bytes(arr) as usize)
+    }
+    fn f64(&mut self) -> Result<f64, String> {
+        let end = self.pos + 8;
+        let s = self.buf.get(self.pos..end).ok_or("pbck: truncated f64")?;
+        let arr: [u8; 8] = s.try_into().map_err(|_| "pbck: bad f64".to_string())?;
+        self.pos = end;
+        Ok(f64::from_le_bytes(arr))
+    }
+    fn str(&mut self) -> Result<String, String> {
+        let n = self.u32()?;
+        let end = self.pos + n;
+        let s = self.buf.get(self.pos..end).ok_or("pbck: truncated string")?;
+        let out = String::from_utf8(s.to_vec()).map_err(|_| "pbck: invalid utf-8".to_string())?;
+        self.pos = end;
+        Ok(out)
+    }
+}
+
+fn pbck_r_opcode(r: &mut PbckReader) -> Result<OpCode, String> {
+    let tag = r.u8()?;
+    Ok(match tag {
+        0 => OpCode::OpConstant(r.u32()?),
+        1 => OpCode::OpAdd,
+        2 => OpCode::OpSub,
+        3 => OpCode::OpMul,
+        4 => OpCode::OpDiv,
+        5 => OpCode::OpEq,
+        6 => OpCode::OpNotEq,
+        7 => OpCode::OpGt,
+        8 => OpCode::OpGe,
+        9 => OpCode::OpLt,
+        10 => OpCode::OpLe,
+        11 => OpCode::OpPop,
+        12 => OpCode::OpPrint,
+        13 => OpCode::OpDefineGlobal(r.u32()?),
+        14 => OpCode::OpGetGlobal(r.u32()?),
+        15 => OpCode::OpSetGlobal(r.u32()?),
+        16 => OpCode::OpGetAttr(r.u32()?),
+        17 => OpCode::OpSetAttr(r.u32()?),
+        18 => OpCode::OpExport(r.u32()?),
+        19 => OpCode::OpMakeArray(r.u32()?),
+        20 => OpCode::OpMakeMap(r.u32()?),
+        21 => OpCode::OpGetIndex,
+        22 => OpCode::OpSetIndex,
+        23 => OpCode::OpTry(r.u32()?),
+        24 => OpCode::OpEndTry,
+        25 => OpCode::OpGetLocal(r.u32()?),
+        26 => OpCode::OpSetLocal(r.u32()?),
+        27 => {
+            let fn_const = r.u32()?;
+            let n = r.u32()?;
+            let mut captures = Vec::with_capacity(n);
+            for _ in 0..n {
+                let is_local = r.u8()? != 0;
+                let idx = r.u32()?;
+                captures.push((is_local, idx));
+            }
+            OpCode::OpClosure { fn_const, captures }
+        }
+        28 => OpCode::OpGetUpvalue(r.u32()?),
+        29 => OpCode::OpSetUpvalue(r.u32()?),
+        30 => OpCode::OpCloseUpvalue,
+        31 => OpCode::OpCall(r.u32()?),
+        32 => OpCode::OpTailCall(r.u32()?),
+        33 => OpCode::OpReturn,
+        34 => OpCode::OpDefer,
+        35 => OpCode::OpJump(r.u32()?),
+        36 => OpCode::OpJumpIfFalse(r.u32()?),
+        37 => OpCode::OpJumpIfTrue(r.u32()?),
+        38 => OpCode::OpNot,
+        39 => OpCode::OpNegate,
+        40 => OpCode::OpMod,
+        41 => OpCode::OpPow,
+        42 => OpCode::OpSafeGetAttr(r.u32()?),
+        43 => OpCode::OpSafeIndex,
+        44 => OpCode::OpResultUnwrap,
+        45 => OpCode::OpIsNil,
+        46 => OpCode::OpDup,
+        47 => OpCode::OpThrow,
+        other => return Err(format!("pbck: unknown opcode tag {other}")),
+    })
+}
+
+fn pbck_r_value(r: &mut PbckReader) -> Result<Value, String> {
+    use std::str::FromStr;
+    let tag = r.u8()?;
+    Ok(match tag {
+        0 => Value::Number(r.f64()?),
+        1 => Value::Bool(r.u8()? != 0),
+        2 => Value::Nil,
+        3 => alloc_string(r.str()?),
+        4 => {
+            let s = r.str()?;
+            alloc_bigint(BigInt::from_str(&s).map_err(|_| "pbck: bad bigint".to_string())?)
+        }
+        5 => {
+            let s = r.str()?;
+            alloc_rational(BigRational::from_str(&s).map_err(|_| "pbck: bad rational".to_string())?)
+        }
+        6 => return Err("pbck: decimal constants are not supported".to_string()),
+        7 => Value::Function(Rc::new(pbck_r_function(r)?)),
+        other => return Err(format!("pbck: unknown value tag {other}")),
+    })
+}
+
+fn pbck_r_function(r: &mut PbckReader) -> Result<Function, String> {
+    let name = if r.u8()? != 0 { Some(r.str()?) } else { None };
+    let arity = r.u32()?;
+    let min_arity = r.u32()?;
+    let n_defaults = r.u32()?;
+    let mut defaults = Vec::with_capacity(n_defaults);
+    for _ in 0..n_defaults {
+        defaults.push(pbck_r_value(r)?);
+    }
+    let is_vararg = r.u8()? != 0;
+    let param_types = if r.u8()? != 0 {
+        let n = r.u32()?;
+        let mut pts = Vec::with_capacity(n);
+        for _ in 0..n {
+            pts.push(match r.u8()? {
+                0 => ParamType::F64,
+                1 => ParamType::I64,
+                2 => ParamType::Bool,
+                other => return Err(format!("pbck: bad param type {other}")),
+            });
+        }
+        Some(pts)
+    } else {
+        None
+    };
+    let chunk = pbck_r_chunk(r)?;
+    Ok(Function {
+        name,
+        arity,
+        min_arity,
+        defaults,
+        is_vararg,
+        chunk,
+        param_types,
+    })
+}
+
+fn pbck_r_chunk(r: &mut PbckReader) -> Result<Chunk, String> {
+    let n_ins = r.u32()?;
+    let mut instructions = Vec::with_capacity(n_ins);
+    for _ in 0..n_ins {
+        instructions.push(pbck_r_opcode(r)?);
+    }
+    let n_const = r.u32()?;
+    let mut constants = Vec::with_capacity(n_const);
+    for _ in 0..n_const {
+        constants.push(pbck_r_value(r)?);
+    }
+    let n_spans = r.u32()?;
+    let mut spans = Vec::with_capacity(n_spans);
+    for _ in 0..n_spans {
+        let start = r.u32()?;
+        let end = r.u32()?;
+        spans.push(crate::chunk::Span { start, end });
+    }
+    let source_name = if r.u8()? != 0 {
+        Some(Rc::new(r.str()?))
+    } else {
+        None
+    };
+    Ok(Chunk {
+        instructions,
+        constants,
+        spans,
+        source_name,
+        source: None,
+    })
+}
+
+/// Load a [`Chunk`] from a PBCK v1 container produced by [`pbck_serialize`].
+pub fn pbck_deserialize(buf: &[u8]) -> Result<Chunk, String> {
+    if buf.len() < 5 || &buf[0..4] != b"PBCK" {
+        return Err("pbck: bad magic (not a PBCK file)".to_string());
+    }
+    let version = buf[4];
+    if version != PBCK_V1_VERSION {
+        return Err(format!(
+            "pbck: unsupported version {version} (this build reads v{PBCK_V1_VERSION})"
+        ));
+    }
+    let mut r = PbckReader { buf, pos: 5 };
+    pbck_r_chunk(&mut r)
+}
+
+#[cfg(test)]
+mod pbck_roundtrip_tests {
+    use super::*;
+    use chunk::Span;
+
+    fn sample_chunk() -> Chunk {
+        // A chunk exercising several opcode shapes + a nested function constant.
+        let mut inner = Chunk::default();
+        let sp = Span::default();
+        let c = inner.add_const(Value::Number(7.0));
+        inner.write(OpCode::OpConstant(c), sp);
+        inner.write(OpCode::OpReturn, sp);
+        let func = Function {
+            name: Some("inner".to_string()),
+            arity: 1,
+            min_arity: 1,
+            defaults: vec![Value::Number(1.0), alloc_string("x")],
+            is_vararg: false,
+            chunk: inner,
+            param_types: Some(vec![ParamType::F64, ParamType::I64]),
+        };
+
+        let mut top = Chunk::default();
+        let fc = top.add_const(Value::Function(Rc::new(func)));
+        let s = top.add_const(alloc_string("hi"));
+        top.write(OpCode::OpClosure { fn_const: fc, captures: vec![(true, 0), (false, 2)] }, sp);
+        top.write(OpCode::OpConstant(s), sp);
+        top.write(OpCode::OpPrint, sp);
+        top.write(OpCode::OpJumpIfFalse(2), sp);
+        top.write(OpCode::OpReturn, sp);
+        top.source_name = Some(Rc::new("sample.sapp".to_string()));
+        top
+    }
+
+    #[test]
+    fn pbck_roundtrip_is_byte_stable() {
+        let chunk = sample_chunk();
+        let b1 = pbck_serialize(&chunk);
+        assert!(b1.starts_with(b"PBCK"));
+        let restored = pbck_deserialize(&b1).expect("deserialize must succeed");
+        let b2 = pbck_serialize(&restored);
+        assert_eq!(b1, b2, "serialize∘deserialize must be byte-stable (lossless)");
+    }
+
+    #[test]
+    fn pbck_preserves_structure() {
+        let chunk = sample_chunk();
+        let restored = pbck_deserialize(&pbck_serialize(&chunk)).unwrap();
+        assert_eq!(restored.instructions.len(), chunk.instructions.len());
+        assert_eq!(restored.constants.len(), chunk.constants.len());
+        assert_eq!(restored.spans.len(), chunk.spans.len());
+        assert_eq!(
+            restored.source_name.as_deref().map(|s| s.as_str()),
+            Some("sample.sapp")
+        );
+        // nested function constant survived with its own chunk + defaults
+        match &restored.constants[0] {
+            Value::Function(f) => {
+                assert_eq!(f.name.as_deref(), Some("inner"));
+                assert_eq!(f.arity, 1);
+                assert_eq!(f.defaults.len(), 2);
+                assert_eq!(f.chunk.instructions.len(), 2);
+                assert!(matches!(f.param_types.as_deref(), Some([ParamType::F64, ParamType::I64])));
+            }
+            other => panic!("expected function constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pbck_rejects_bad_magic() {
+        assert!(pbck_deserialize(b"NOPE.....").is_err());
+    }
+}
