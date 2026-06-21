@@ -42,6 +42,8 @@ Keyboard:
 - `Tab`: insert spaces in editor
 - `F8`: next diagnostic
 - `Shift+F8`: previous diagnostic
+- `F11`: toggle Debug / Release mode in the native IDE
+- `F12`: toggle native IDE watcher status
 - `Ctrl+/`: open in-IDE manual modal
 
 Manual modal:
@@ -107,33 +109,76 @@ program into the editor).
   `stdlib/quantum.sapp` (`circuit`/`h`/`cx`/`measure`/`run`).
 
 Native Designer (`pblang --ide`) now has a parallel pblang-only surface: label/button/
-textbox/checkbox/panel palette, 3D cube/ball design items, drag/move/edit, `LAYOUT`
-cycling through free/responsive/grid/stack positions via `stdlib/design_engine.sapp`,
-and `->CODE` generation into the editor.
+textbox/checkbox/radio/select/slider/panel palette, 3D cube/ball design items,
+2D chart items, N-dimensional item placeholders, custom component placeholders,
+web/HTML metadata placeholders, scanner/3D asset placeholders, and game-engine-style
+camera/light/material/terrain/particle/physics/prefab/render-backend placeholders. The
+palette wraps across rows when needed. It supports drag/move/edit, `LAYOUT` cycling
+through free/responsive/grid/stack positions via `stdlib/design_engine.sapp`, and
+parse-checked `->CODE` generation into the editor.
+Generated desktop GUI code follows the web IDE shape: `let gui = import(...)`,
+`build()`, `main()`, and `main();`, so the result is easier to run and round-trip.
+Foreign-language, HTML/CSS/JS, and scanner components are stored as safe metadata or
+runnable placeholders unless an explicit host renderer/importer is added later.
 
-## 2c. Web browser — written in pblang (`🌐 Browser` / `Ctrl+B`)
+## 2c. Native run/check history (`Hist` / `F9`)
 
-A web browser whose **engine is pblang**: `stdlib/browser.sapp` fetches a page
-(`http_get`) and parses its title, reader text (script/style stripped), links (both `"`
-and `'` quoting), and **resolves relative links to absolute URLs** (`resolve(base, href)`
-— root-relative, protocol-relative, and directory-relative). The view has:
+The pblang-native IDE now mirrors the web IDE's History workflow without HTML, CSS, or
+JavaScript. Run (`F5`) and Check (`F6`) each add a bounded newest-first history record
+with action, pass/fail status, output summary, and the source snapshot from that moment.
 
-- an address bar with **◀ Back / ▶ Forward / ⟳ Reload / ⌂ Home** (a real history stack)
-  and a loading indicator;
-- **Page / Reader / Links / Forms** modes — *Page* renders the fetched HTML in a
-  sandboxed iframe, *Reader* shows the pblang-extracted text, *Links* lists the
-  absolutized links, *Forms* lists the page's `<form>`s with editable fields;
-- **clickable link-following**: clicking a link in *Links* navigates to it (pushing
-  history), all fetched + parsed by pblang;
-- **form submission**: *Forms* mode renders each form's controls; **Submit** sends them
-  via the pblang engine — GET appends an encoded query string, POST sends an
-  `x-www-form-urlencoded` body (`browser.sapp` `forms`/`urlencode`/`submit`, with a
-  pblang UTF-8 percent-encoder) — and shows the resulting page.
+- `F9` opens the native `Hist` tab.
+- Clicking a history row restores that record's code snapshot into the editor.
+- History is intentionally session-local for now; persistent history remains a browser IDE
+  feature until the native file picker/storage layer is completed.
 
-It calls `POST /browse {url}` (fetch) and `POST /submit {action, method, fields}` (form)
-on the pblang gateway (`editors/ide/tools/ai/gateway.sapp`, the same one the AI panel
-uses) — so browsing works end-to-end, down to pblang doing the fetch, parse, URL
-resolution, form encoding, and submission.
+Native diagnostics now match the web IDE's main workflow:
+
+- `F6` Check stores structured diagnostics for the current buffer.
+- The code side pane lists current diagnostics with inferred line/column where available.
+- Click a diagnostic row to jump to that location.
+- `F8` jumps to the next diagnostic; `Shift+F8` jumps to the previous diagnostic.
+- `F10` opens the native Browser panel because `F8` is reserved for diagnostics parity.
+
+## 2d. Web browser — written in pblang (`🌐 Browser` / `Ctrl+B`)
+
+A native browser whose **engine is pblang**: `stdlib/browser.sapp` enforces a URL
+policy, fetches a page (`http_get`), parses title, reader text (script/style stripped),
+headings, images, links, and forms, and **resolves relative links to absolute URLs**
+(`resolve(base, href)` — root-relative, protocol-relative, and directory-relative).
+
+Native safety rules:
+
+- only explicit `http://` and `https://` URLs are fetched;
+- `file:`, `javascript:`, `data:`, and similar non-web schemes are blocked;
+- credential URLs (`https://user:pass@host`), CR/LF/control characters, and common
+  non-web service ports are blocked before fetch, form submit, or host rendering;
+- common ad/tracker/malicious URL patterns are blocked before network access;
+- loopback, LAN, and private hosts are blocked by default unless the caller explicitly
+  opts in with `allow_private=true`;
+- native Browser rendering has no DOM, no JS engine, and no embedded iframe.
+
+The native view has:
+
+- an address bar with Reload and Page/Reader/Links/Forms/Render mode buttons;
+- **Page / Reader / Links / Forms / Render** modes — *Page* renders pblang-extracted page blocks
+  (title/headings/paragraphs/images), *Reader* shows clean text, *Links* lists the
+  absolutized links, *Forms* lists discovered `<form>` fields, and *Render* is an
+  explicit host-browser screenshot path through `stdlib/browser_render.sapp`;
+- form parsing and form encoding in the pblang engine (`forms`/`urlencode`/`submit`).
+
+The web IDE may still use browser-native UI features as a reference surface, but the
+native IDE Browser intentionally stays a pblang reader/page renderer by default. Exact
+Chrome-like rendering requires a real DOM/CSS/JS engine, so the native `Render` tab
+delegates to an installed Chromium/Chrome-compatible browser in headless screenshot mode
+after the pblang URL policy passes. It needs `--allow-exec`; Page/Reader remain the
+safe no-JS default.
+
+The 2026-06-21 Browser screenshots showed why this boundary matters: a full Google page
+contains script-driven layout, navigation links, images, and generated parameters that a
+reader engine must filter instead of drawing verbatim. Native Page mode now keeps raw URLs
+in Links mode, filters noisy/corrupt page blocks, and uses a wider page column so it reads
+closer to the web IDE while staying browser-free.
 
 ## 3. Diagnostics panel
 
@@ -177,6 +222,13 @@ IDE behavior:
 - loads fallback examples if backend example catalog is unavailable
 - supports filter/search input by id/title
 
+Native IDE parity:
+
+- In `pblang --ide`, click `Ex` to open the searchable examples picker.
+- Type to filter examples by title or source code.
+- `Up` / `Down` changes selection, `Enter` loads the selected example, and `Esc` closes.
+- Clicking a row loads that example into the editor.
+
 ## 6. Persistence
 
 IDE persists:
@@ -193,6 +245,70 @@ Storage keys are local browser keys under `localStorage`.
 
 - drag splitter between editor and output pane to resize output width
 - width is clamped and persisted
+
+Native IDE parity:
+
+- In `pblang --ide`, drag the vertical splitter between the editor and right output pane
+  to resize the output pane.
+- Native splitter width is clamped during the session. Browser localStorage persistence is
+  still web-IDE-only until native storage preferences are added.
+- Default native scale is now smaller and cleaner (`PBIDE_SCALE=1`) with a fixed minimum
+  window size. Use `PBIDE_SCALE=2` or higher for larger text.
+- Key input accepts common graphics/browser backend names for digits and symbols:
+  direct digits (`1`), `Digit1`, `Key1`, `Num1`, `Numpad1`, and numpad arithmetic keys.
+- The native code editor also accepts direct Unicode character keys from capable
+  graphics backends and IMEs, so pasted or typed symbols like `π`, `≤`, and `→` stay
+  visible when the compact native font has a glyph. Emoji and other unsupported glyphs
+  stay in the buffer and render as a visible missing-glyph cell instead of disappearing.
+- In the native code editor, type math compose shortcuts such as `\pi`, `\Pi`/`\prod`,
+  `\sqrt`, `\le`, `\ge`, `\ne`, `\sum`, or `\int`, then press Space or Tab to insert the
+  symbol. `π` is the pi constant; `Π`/`∏` is product/repeated multiplication and
+  normalizes to `product(...)`. `Fix` can still normalize these symbols back into
+  parser-friendly pblang source.
+- Source strings support direct Unicode and scalar escapes such as `"\u{1F600}"` for
+  emoji. Use `stdlib:unicode.sapp` for codepoint inspection, escaping, and basic
+  classification.
+- Code typing auto-pairs `()`, `[]`, `{}`, and quotes, and skips over an existing
+  closing pair when typed at the cursor.
+- Native build modes mirror normal IDE behavior: **Debug** runs Check before Run and
+  blocks execution when diagnostics exist; **Release** runs directly for a faster loop.
+  Use the toolbar Mode button or `F11`.
+- Native watcher status mirrors normal IDE project watches without a background thread:
+  it tracks buffer revision/hash, dirty/clean state, line count, symbol count, and
+  diagnostics. It appears in the Code side pane and status bar; toggle with Watch or
+  `F12`.
+- Native Code panel shortcut parity: `Ctrl+Enter` runs, `Ctrl+Shift+Enter` checks,
+  `Ctrl+D` opens Designer, `Ctrl+B` opens Browser, and `Ctrl+I` opens AI.
+
+## 7b. Visual/media engine
+
+`stdlib/visual_engine.sapp` is the high-level scene contract for graphics and media. It
+does not replace `graphics.sapp`; it sits above it and describes what a renderer should
+draw or play:
+
+- 2D nodes: rectangles, lines, circles, polygons, meshes, paths, groups, text, images,
+  charts, custom UI components, and imported-designer metadata;
+- 3D nodes: points, meshes, cubes, spheres, surfaces, 3D scatter/chart data;
+- engine-scene nodes: cameras, lights, materials, shader metadata, physics bodies,
+  terrains, particle systems, skyboxes, ECS-style entities/components, prefabs, and
+  render backend targets for native/web/OpenGL/Vulkan/Godot/Unity/Unreal-style bridges;
+- N-dimensional nodes: points, clouds, tensors, and generic N-dimensional items with a
+  projection hint;
+- media nodes: image/audio/video asset references, timelines, and keyframes;
+- web/foreign/scanner components: HTML/CSS/JS, other-language snippets, and scanner
+  assets are represented as metadata-only safe nodes until a trusted renderer/importer
+  is explicitly used;
+- safe network asset policy using the same `browser.sapp` URL guard.
+
+Backends can compile this scene plan to the native IDE, web canvas, future GPU renderer,
+or network display without changing the pblang scene source.
+
+## 7c. Science library
+
+`stdlib/science.sapp` adds a first portable science layer: constants, unit conversion,
+quantities, vector math, physics formulas, chemistry helpers, geometry helpers, signal
+processing, and experiment tables. It is meant to support simulations, scientific plots,
+AI data preparation, and future visual-science panels in the IDE.
 
 ## 8. Backend API contract
 
