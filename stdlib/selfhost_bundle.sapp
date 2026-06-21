@@ -1,0 +1,223 @@
+// stdlib/selfhost_bundle.sapp — a pure-pblang LINKER for the self-hosted compiler.
+//
+// `bundle(main_src, resolve)` links a program and the modules it `import(...)`s
+// into ONE self-hosted chunk with NO remaining import() calls, so the result —
+// after stdlib/selfhost_to_pbck.sapp::translate — is a self-contained .pbck that
+// the native Rust VM runs WITHOUT resolving (or recompiling) any dependency at
+// load time. That makes a bundled pblang program independent of the Rust import
+// path: pblang compiled it, pblang linked it, the kernel just runs the bytes.
+//
+// Strategy (shared global namespace + collision rejection): each module's
+// top-level code is concatenated (its globals run in the one shared namespace);
+// after a module's init we synthesize `__bundle_N = map{ name: <global name>, ... }`
+// from its defined globals, and every `import("path")` call site in main is
+// rewritten in place to push `__bundle_N`. Correctness is guaranteed by REJECTING
+// (ok:false) any program where this could alias: a name defined by two modules,
+// a module global that shadows a builtin, an unresolvable path, a compile error,
+// or a module that itself imports (nested). On ok:false the caller simply keeps
+// using runtime-resolved import (still correct, just not self-contained).
+
+let _fe  = import("stdlib/compiler/selfhost_frontend.sapp");
+let _blt = import("stdlib/compiler/builtins_list.sapp");
+
+// Self-hosted opcode numbers (mirror stdlib/compiler/ir.sapp / codegen.sapp).
+let OP_CONSTANT = 0;
+let OP_POP = 11;
+let OP_DEFINE_GLOBAL = 13;
+let OP_GET_GLOBAL = 14;
+let OP_CALL = 18;
+let OP_MAKE_MAP = 26;
+
+// ── source scan: import("PATH") paths, in source order, de-duplicated ─────────
+fn _find_imports(src) {
+    let out = [];
+    let seen = map{};
+    let marker = "import(\"";
+    let n = len(src);
+    let i = 0;
+    while i < n {
+        if i + len(marker) <= n and str_slice(src, i, i + len(marker)) == marker {
+            let j = i + len(marker);
+            let start = j;
+            while j < n and str_slice(src, j, j + 1) != "\"" { j = j + 1; }
+            let path = str_slice(src, start, j);
+            if not map_has(seen, path) { seen[path] = true; array_push(out, path); }
+            i = j + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+// Top-level globals a chunk DEFINEs (OP_DEFINE_GLOBAL name), minus __exports__.
+fn _defined_globals(chunk) {
+    let out = [];
+    let i = 0;
+    while i < len(chunk.instructions) {
+        let ins = chunk.instructions[i];
+        if ins.op == OP_DEFINE_GLOBAL {
+            let name = chunk.constants[ins.operand];
+            if name != "__exports__" { array_push(out, name); }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Does the chunk's TOP LEVEL contain an import() call? (GET_GLOBAL "import").
+fn _has_top_import(chunk) {
+    let i = 0;
+    while i < len(chunk.instructions) {
+        let ins = chunk.instructions[i];
+        if ins.op == OP_GET_GLOBAL and chunk.constants[ins.operand] == "import" { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Which self-hosted ops carry a JUMP TARGET (instruction index) operand.
+fn _is_jump(op) {
+    return op == 20 or op == 21 or op == 22 or op == 33 or op == 34 or op == 36 or op == 37;
+}
+// Which carry a CONSTANT-POOL index operand.
+fn _is_const_operand(op) {
+    return op == 0 or op == 13 or op == 14 or op == 15 or op == 24 or op == 29 or op == 30 or op == 35;
+}
+
+// Append one constant to `merged.constants`, return its index.
+fn _add_const(merged, v) {
+    array_push(merged.constants, v);
+    return len(merged.constants) - 1;
+}
+
+// Append `chunk`'s top-level into `merged`, offsetting constant indices and jump
+// targets so the concatenation stays self-consistent. If `bundle_map` is non-nil
+// (main only), rewrite each `import("path")` triple in place (3 insns -> 3 insns,
+// preserving the linear index mapping) to push the bundle's exports map for that
+// path. Returns true on success, false if an import path is not in bundle_map.
+fn _append(merged, chunk, bundle_map, nil_idx) {
+    let base_ins = len(merged.instructions);
+    let base_const = len(merged.constants);
+
+    // Copy constants verbatim (nested fn/try constants are self-relative).
+    let c = 0;
+    while c < len(chunk.constants) { array_push(merged.constants, chunk.constants[c]); c = c + 1; }
+
+    let ins = chunk.instructions;
+    let n = len(ins);
+    let i = 0;
+    while i < n {
+        // import("path") rewrite: GET_GLOBAL "import"; CONST <string path>; CALL 1.
+        if bundle_map != nil and ins[i].op == OP_GET_GLOBAL
+           and chunk.constants[ins[i].operand] == "import"
+           and i + 2 < n and ins[i + 1].op == OP_CONSTANT and ins[i + 2].op == OP_CALL
+           and ins[i + 2].operand == 1 {
+            let path = chunk.constants[ins[i + 1].operand];
+            if type(path) == "string" and map_has(bundle_map, path) {
+                let bn_idx = bundle_map[path];
+                array_push(merged.instructions, map{ op: OP_CONSTANT, operand: nil_idx });   // push nil
+                array_push(merged.instructions, map{ op: OP_POP, operand: 0 });               // drop nil
+                array_push(merged.instructions, map{ op: OP_GET_GLOBAL, operand: bn_idx });   // push bundle map
+                i = i + 3;
+            } else {
+                return false;   // dynamic / unresolved import path inside a bundle
+            }
+        } else {
+            let op = ins[i].op;
+            let operand = try ins[i].operand catch 0;
+            if _is_jump(op) { operand = operand + base_ins; }
+            else if _is_const_operand(op) { operand = operand + base_const; }
+            array_push(merged.instructions, map{ op: op, operand: operand });
+            i = i + 1;
+        }
+    }
+    return true;
+}
+
+// After a module's init, synthesize `__bundle_<name> = map{ g: <global g>, ... }`.
+fn _emit_export_map(merged, defined, bundle_name) {
+    let i = 0;
+    while i < len(defined) {
+        let name = defined[i];
+        let k = _add_const(merged, name);
+        array_push(merged.instructions, map{ op: OP_CONSTANT, operand: k });        // key
+        array_push(merged.instructions, map{ op: OP_GET_GLOBAL, operand: k });      // value (reuse const)
+        i = i + 1;
+    }
+    array_push(merged.instructions, map{ op: OP_MAKE_MAP, operand: len(defined) });
+    let bn = _add_const(merged, bundle_name);
+    array_push(merged.instructions, map{ op: OP_DEFINE_GLOBAL, operand: bn });
+    return bn;
+}
+
+fn _err(reason) { return map{ ok: false, reason: reason }; }
+
+// Link `main_src` + its imports into one self-hosted chunk. `resolve(path)` returns
+// the module source for an import path, or nil if not found.
+fn bundle(main_src, resolve) {
+    let paths = _find_imports(main_src);
+    if len(paths) == 0 {
+        let only = _fe.frontend_compile(main_src);
+        if not only.ok { return _err("main failed to compile"); }
+        return map{ ok: true, chunk: only.chunk, modules: 0 };
+    }
+
+    // Resolve + compile each module; reject nested imports and builtin shadowing.
+    let mods = [];           // { path, chunk, defined }
+    let all_defined = map{}; // name -> path (collision detection)
+    let pi = 0;
+    while pi < len(paths) {
+        let path = paths[pi];
+        let src = try resolve(path) catch nil;
+        if src == nil { return _err("cannot resolve import: " + str(path)); }
+        let cr = _fe.frontend_compile(src);
+        if not cr.ok { return _err("module failed to compile: " + str(path)); }
+        if _has_top_import(cr.chunk) { return _err("nested import in module not supported: " + str(path)); }
+        let defined = _defined_globals(cr.chunk);
+        let di = 0;
+        while di < len(defined) {
+            let nm = defined[di];
+            if _blt.is_builtin_name(nm) { return _err("module global shadows builtin '" + str(nm) + "' in " + str(path)); }
+            if map_has(all_defined, nm) { return _err("global name collision '" + str(nm) + "' (" + str(all_defined[nm]) + " and " + str(path) + ")"); }
+            all_defined[nm] = path;
+            di = di + 1;
+        }
+        array_push(mods, map{ path: path, chunk: cr.chunk, defined: defined });
+        pi = pi + 1;
+    }
+
+    // Compile main; its own top-level globals must not collide with module globals.
+    let mc = _fe.frontend_compile(main_src);
+    if not mc.ok { return _err("main failed to compile"); }
+    let main_defined = _defined_globals(mc.chunk);
+    let mdi = 0;
+    while mdi < len(main_defined) {
+        if map_has(all_defined, main_defined[mdi]) {
+            return _err("main global collides with a module global '" + str(main_defined[mdi]) + "'");
+        }
+        mdi = mdi + 1;
+    }
+
+    // Merge: nil const, then each module (init + export map), then main (imports rewritten).
+    let merged = map{ instructions: [], constants: [] };
+    let nil_idx = _add_const(merged, nil);
+    let bundle_map = map{};
+
+    let m = 0;
+    while m < len(mods) {
+        let mod = mods[m];
+        if not _append(merged, mod.chunk, nil, nil_idx) { return _err("module append failed: " + str(mod.path)); }
+        let bn = _emit_export_map(merged, mod.defined, "__bundle_" + str(m));
+        bundle_map[mod.path] = bn;
+        m = m + 1;
+    }
+
+    if not _append(merged, mc.chunk, bundle_map, nil_idx) {
+        return _err("unresolved import call site in main");
+    }
+
+    return map{ ok: true, chunk: merged, modules: len(mods) };
+}
+
+export bundle;
