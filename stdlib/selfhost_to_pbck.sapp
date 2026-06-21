@@ -10,24 +10,30 @@
 //      then chunk = u32 n_ins, per-op (tag byte + u32 operand where applicable),
 //      u32 n_const + values, u32 n_spans + (u32,u32), u8 has_source_name.
 //
-// Functions and closures: the self-hosted codegen now shares the Rust VM's
-// calling convention (callee pushed first, then args — see codegen.sapp), so a
-// self-hosted OP_CLOSURE/OP_CALL/OP_GET_UPVALUE stream maps directly onto the
-// native VM. A self-hosted function constant `{arity, chunk, upvalues}` becomes a
-// Rust Function value (tag 7), and OP_CLOSURE's capture list (stored on the fn
-// constant) is inlined into the Rust OpClosure instruction. Function chunks are
-// translated recursively.
+// The self-hosted codegen shares the Rust VM's calling convention (callee pushed
+// first, then args — see codegen.sapp), so calls/closures map directly. The
+// translation pipeline is:
+//   _lower(chunk)  -> a flat list of Rust "items" with jump targets as LABELS,
+//                     constants merged into one pool, and the constructs that have
+//                     no native opcode lowered to equivalents (see below).
+//   resolve labels -> instruction indices, then emit the .pbck byte layout.
+// A label-based IR is used (instead of fixed index arithmetic) so nesting —
+// try-in-try, closures, loops — composes without manual offset bookkeeping.
 //
-// Remaining boundary: opcodes with no Rust-VM equivalent (the short-circuit
-// *_PEEK jumps, OP_TRY/OP_THROW) and default-parameter metadata (defaults are
-// baked into the body, so calls must pass the exact arity) still throw / are not
-// represented — the documented next step.
+// Constructs with no native opcode, lowered here:
+//   - short-circuit / nil-coalescing *_PEEK jumps -> OpDup(+OpIsNil)+OpJumpIf*
+//   - OP_LEN -> stash in a scratch local, OpGetGlobal "len", reload, OpCall 1
+//   - OP_TRY (try/catch) -> inline OpTry/OpEndTry with the body & handler
+//     sub-chunks lowered into the same frame (they share enclosing locals)
+//
+// Boundary: default-parameter calls (min_arity == arity, so a call must pass the
+// exact arity) and OP_DEFER are not represented.
 
 let RUST_VERSION = 1;
 
 // Self-hosted op number -> Rust OpCode tag. Identity for 0..15; remapped above.
-// OP_CLOSURE (24) is NOT here: it needs inline captures and is handled in
-// `_emit_instruction` directly.
+// OP_CLOSURE (24), the *_PEEK jumps, OP_LEN (32) and OP_TRY (35) have no 1:1 tag
+// and are lowered specially in `_lower_inst`.
 fn _rust_op(op) {
     if op <= 15 { return op; }            // OP_CONSTANT..OP_SET_GLOBAL match exactly
     if op == 16 { return 25; }            // OP_GET_LOCAL  -> OpGetLocal
@@ -48,7 +54,7 @@ fn _rust_op(op) {
     if op == 38 { return 28; }            // OP_GET_UPVALUE -> OpGetUpvalue
     if op == 39 { return 29; }            // OP_SET_UPVALUE -> OpSetUpvalue
     if op == 40 { return 47; }            // OP_THROW      -> OpThrow (uncaught raises)
-    return (0 - 1);                       // unmapped (OP_LEN, OP_TRY, peek jumps handled separately)
+    return (0 - 1);                       // handled specially or unmapped
 }
 
 // Rust ops that carry a single u32 operand in the .pbck layout.
@@ -57,6 +63,17 @@ fn _rust_op_has_operand(rop) {
         or rop == 18 or rop == 19 or rop == 20 or rop == 23 or rop == 25 or rop == 26
         or rop == 28 or rop == 29 or rop == 31 or rop == 32 or rop == 35 or rop == 36
         or rop == 37 or rop == 42;
+}
+
+// Rust ops whose operand is a CONSTANT-POOL index (need offset when a sub-chunk's
+// constants are merged into the shared pool).
+fn _rust_op_is_const_operand(rop) {
+    return rop == 0 or rop == 13 or rop == 14 or rop == 15 or rop == 16 or rop == 17;
+}
+
+// Self-hosted ops whose operand is a JUMP TARGET (an instruction index).
+fn _sh_is_jump(op) {
+    return op == 20 or op == 21 or op == 22 or op == 33 or op == 34 or op == 36 or op == 37;
 }
 
 // ── byte writers ────────────────────────────────────────────────────────────
@@ -84,6 +101,9 @@ fn _is_function_const(v) {
 
 fn _w_value(out, v) {
     if v == nil { _w_u8(out, 2); return; }
+    // An OP_TRY descriptor {try_chunk, catch_chunk} is consumed (inlined) during
+    // lowering, so its pool slot is dead — emit nil to keep indices stable.
+    if type(v) == "map" and map_has(v, "try_chunk") and map_has(v, "catch_chunk") { _w_u8(out, 2); return; }
     if _is_function_const(v) { _w_u8(out, 7); _w_function(out, v); return; }
     let t = type(v);
     if t == "number" { _w_u8(out, 0); _w_f64(out, v); return; }
@@ -93,8 +113,8 @@ fn _w_value(out, v) {
 }
 
 // Encode a self-hosted function constant as a Rust Function (pbck tag 7 body).
-// Defaults are compiled into the body, so min_arity == arity and the defaults
-// list is empty (callers must pass the exact argument count).
+// A closure is its OWN frame, so its body is a separately-compiled chunk (NOT
+// inlined). Defaults are compiled into the body, so min_arity == arity.
 fn _w_function(out, fc) {
     _w_u8(out, 0);              // name: None
     _w_u32(out, fc.arity);     // arity
@@ -105,91 +125,21 @@ fn _w_function(out, fc) {
     _emit_chunk(out, fc.chunk, false, fc.arity);  // body chunk (ends in OP_RETURN)
 }
 
-// Rust jump ops carry an ABSOLUTE target instruction index (not a byte offset).
-fn _is_rust_jump(rop) { return rop == 35 or rop == 36 or rop == 37; }
+// ── label IR ──────────────────────────────────────────────────────────────────
+// `code` is a flat list of items, each a map:
+//   { label: id }                    zero-width position marker
+//   { op: tag }                      no-operand op
+//   { op: tag, n: int }              op with a literal operand (const idx, slot, ...)
+//   { op: tag, jmp: id }             jump op; operand resolved to label `id`'s index
+//   { op: 27, fnc: idx, caps: [..] } OpClosure
+// `ctx` holds a monotonic label counter shared across an entire frame (so labels
+// in inlined try sub-chunks never collide).
 
-// How many Rust instructions a self-hosted op expands to, or -1 if unmapped.
-// Most ops are 1:1. The self-hosted short-circuit / nil-coalescing *_PEEK jumps
-// have no native equivalent and are emulated with OpDup(+OpIsNil)+OpJumpIf*.
-fn _emit_count(op) {
-    if op == 33 or op == 34 { return 2; }          // PEEK false/true -> Dup; JumpIf*
-    if op == 36 or op == 37 { return 3; }          // PEEK nil/not-nil -> Dup; IsNil; JumpIf*
-    if op == 32 { return 4; }                      // OP_LEN -> SetLocal; GetGlobal len; GetLocal; Call 1
-    if op == 24 { return 1; }                      // OP_CLOSURE (captures are inline operands)
-    if _rust_op(op) >= 0 { return 1; }
-    return (0 - 1);
-}
+fn _fresh(ctx) { ctx.n = ctx.n + 1; return ctx.n; }
 
-// Map a self-hosted target index to its Rust index via the precomputed table;
-// a target one past the end (jump-to-end) resolves to `rend`.
-fn _resolve_target(t, ridx, rend) {
-    if t < len(ridx) { return ridx[t]; }
-    return rend;
-}
-
-// Emit one self-hosted instruction (possibly several Rust ops); returns the Rust
-// instruction count emitted. `ridx`/`rend` remap absolute jump targets.
-fn _emit_instruction(out, inst, consts, ridx, rend, scratch, len_idx) {
-    let op = inst.op;
-    if op == 32 {                          // OP_LEN -> len(<top>) via a scratch local
-        _w_u8(out, 26); _w_u32(out, scratch);    // OpSetLocal scratch  (pop collection)
-        _w_u8(out, 14); _w_u32(out, len_idx);    // OpGetGlobal "len"
-        _w_u8(out, 25); _w_u32(out, scratch);    // OpGetLocal scratch  (push collection)
-        _w_u8(out, 31); _w_u32(out, 1);          // OpCall 1
-        return 4;
-    }
-    if op == 24 {                          // OP_CLOSURE -> OpClosure (tag 27)
-        let fn_idx = inst.operand;
-        let fc = consts[fn_idx];
-        let ups = try fc.upvalues catch [];
-        _w_u8(out, 27);
-        _w_u32(out, fn_idx);               // constant index — not a jump target
-        _w_u32(out, len(ups));
-        let u = 0;
-        while u < len(ups) {
-            _w_u8(out, if ups[u].is_local { 1 } else { 0 });
-            _w_u32(out, ups[u].index);
-            u = u + 1;
-        }
-        return 1;
-    }
-    if op == 33 {                          // JUMP_IF_FALSE_PEEK -> Dup; JumpIfFalse
-        _w_u8(out, 46);
-        _w_u8(out, 36); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
-        return 2;
-    }
-    if op == 34 {                          // JUMP_IF_TRUE_PEEK -> Dup; JumpIfTrue
-        _w_u8(out, 46);
-        _w_u8(out, 37); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
-        return 2;
-    }
-    if op == 36 {                          // JUMP_IF_NIL_PEEK -> Dup; IsNil; JumpIfTrue
-        _w_u8(out, 46);
-        _w_u8(out, 45);
-        _w_u8(out, 37); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
-        return 3;
-    }
-    if op == 37 {                          // JUMP_IF_NOT_NIL_PEEK -> Dup; IsNil; JumpIfFalse
-        _w_u8(out, 46);
-        _w_u8(out, 45);
-        _w_u8(out, 36); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
-        return 3;
-    }
-    let rop = _rust_op(op);
-    if rop < 0 {
-        throw "selfhost_to_pbck: opcode " + str(op) + " has no Rust-VM equivalent yet";
-    }
-    _w_u8(out, rop);
-    if _rust_op_has_operand(rop) {
-        let operand = try inst.operand catch 0;
-        if _is_rust_jump(rop) { operand = _resolve_target(operand, ridx, rend); }
-        _w_u32(out, operand);
-    }
-    return 1;
-}
-
-// Highest local slot referenced by OP_GET_LOCAL(16)/OP_SET_LOCAL(17), or -1.
-fn _max_local_slot(ins) {
+// Highest local slot referenced anywhere in `ins` (incl. inlined OP_TRY
+// sub-chunks, which share the enclosing frame's slots), or -1.
+fn _max_local_slot(ins, consts) {
     let m = 0 - 1;
     let i = 0;
     while i < len(ins) {
@@ -198,99 +148,223 @@ fn _max_local_slot(ins) {
             let s = try ins[i].operand catch 0;
             if s > m { m = s; }
         }
+        if op == 35 {                                  // OP_TRY -> recurse
+            let tc = consts[ins[i].operand];
+            let mb = _max_local_slot(tc.try_chunk.instructions, tc.try_chunk.constants);
+            let mh = _max_local_slot(tc.catch_chunk.instructions, tc.catch_chunk.constants);
+            if mb > m { m = mb; }
+            if mh > m { m = mh; }
+        }
         i = i + 1;
     }
     return m;
 }
 
+// Lower one self-hosted instruction into `code`. `coff` offsets this chunk's
+// constant indices into the shared pool; `lbl_at` maps target indices -> labels.
+fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx) {
+    let op = inst.op;
+
+    if op == 24 {                                      // OP_CLOSURE -> OpClosure
+        let fc = pool[coff + inst.operand];
+        array_push(code, map{ op: 27, fnc: coff + inst.operand, caps: try fc.upvalues catch [] });
+        return;
+    }
+    if op == 32 {                                      // OP_LEN via a scratch local
+        array_push(code, map{ op: 26, n: scratch });   // OpSetLocal scratch
+        array_push(code, map{ op: 14, n: len_idx });   // OpGetGlobal "len"
+        array_push(code, map{ op: 25, n: scratch });   // OpGetLocal scratch
+        array_push(code, map{ op: 31, n: 1 });         // OpCall 1
+        return;
+    }
+    if op == 33 {                                      // JUMP_IF_FALSE_PEEK
+        array_push(code, map{ op: 46 });               // OpDup
+        array_push(code, map{ op: 36, jmp: lbl_at[str(inst.operand)] });
+        return;
+    }
+    if op == 34 {                                      // JUMP_IF_TRUE_PEEK
+        array_push(code, map{ op: 46 });
+        array_push(code, map{ op: 37, jmp: lbl_at[str(inst.operand)] });
+        return;
+    }
+    if op == 36 {                                      // JUMP_IF_NIL_PEEK
+        array_push(code, map{ op: 46 });               // OpDup
+        array_push(code, map{ op: 45 });               // OpIsNil
+        array_push(code, map{ op: 37, jmp: lbl_at[str(inst.operand)] });
+        return;
+    }
+    if op == 37 {                                      // JUMP_IF_NOT_NIL_PEEK
+        array_push(code, map{ op: 46 });
+        array_push(code, map{ op: 45 });
+        array_push(code, map{ op: 36, jmp: lbl_at[str(inst.operand)] });
+        return;
+    }
+    if op == 35 {                                      // OP_TRY -> inline try/catch
+        let tc = pool[coff + inst.operand];
+        let catch_lbl = _fresh(ctx);
+        let end_lbl = _fresh(ctx);
+        array_push(code, map{ op: 23, jmp: catch_lbl });   // OpTry -> handler
+        _lower(code, tc.try_chunk, ctx, pool, scratch, len_idx, true);
+        array_push(code, map{ op: 24 });                   // OpEndTry (success)
+        array_push(code, map{ op: 35, jmp: end_lbl });     // OpJump end
+        array_push(code, map{ label: catch_lbl });
+        array_push(code, map{ op: 11 });                   // OpPop (discard error str)
+        _lower(code, tc.catch_chunk, ctx, pool, scratch, len_idx, true);
+        array_push(code, map{ label: end_lbl });
+        return;
+    }
+
+    let rop = _rust_op(op);
+    if rop < 0 {
+        throw "selfhost_to_pbck: opcode " + str(op) + " has no Rust-VM equivalent yet";
+    }
+    if _sh_is_jump(op) {
+        array_push(code, map{ op: rop, jmp: lbl_at[str(inst.operand)] });
+        return;
+    }
+    if _rust_op_has_operand(rop) {
+        let operand = try inst.operand catch 0;
+        if _rust_op_is_const_operand(rop) { operand = coff + operand; }
+        array_push(code, map{ op: rop, n: operand });
+        return;
+    }
+    array_push(code, map{ op: rop });
+}
+
+// Lower a whole chunk into `code`. Merges constants into `pool`. When
+// `drop_last_ret` is true (try/catch sub-chunks), the trailing OP_RETURN is
+// omitted so the sub-chunk's value is left on the stack instead of returning from
+// the enclosing function.
+fn _lower(code, chunk, ctx, pool, scratch, len_idx, drop_last_ret) {
+    let ins = chunk.instructions;
+    let coff = len(pool);
+    let ci = 0;
+    while ci < len(chunk.constants) { array_push(pool, chunk.constants[ci]); ci = ci + 1; }
+
+    let n = len(ins);
+
+    // Assign a label to every jump target index (and to the end index).
+    let lbl_at = map{};
+    let i = 0;
+    while i < n {
+        if _sh_is_jump(ins[i].op) {
+            let t = ins[i].operand;
+            if not map_has(lbl_at, str(t)) { lbl_at[str(t)] = _fresh(ctx); }
+        }
+        i = i + 1;
+    }
+    if not map_has(lbl_at, str(n)) { lbl_at[str(n)] = _fresh(ctx); }
+
+    i = 0;
+    while i < n {
+        if map_has(lbl_at, str(i)) { array_push(code, map{ label: lbl_at[str(i)] }); }
+        let skip = drop_last_ret and i == n - 1 and ins[i].op == 19;   // trailing OP_RETURN
+        if not skip {
+            _lower_inst(code, ins[i], ctx, pool, coff, lbl_at, scratch, len_idx);
+        }
+        i = i + 1;
+    }
+    array_push(code, map{ label: lbl_at[str(n)] });   // end-of-chunk position
+}
+
+// The op of the last real (non-label) item in `code`, or -1.
+fn _last_real_op(code) {
+    let i = len(code) - 1;
+    while i >= 0 {
+        if not map_has(code[i], "label") { return code[i].op; }
+        i = i - 1;
+    }
+    return (0 - 1);
+}
+
+// Emit one resolved code item to the byte buffer.
+fn _emit_item(out, it, pos) {
+    if map_has(it, "jmp") {
+        _w_u8(out, it.op);
+        _w_u32(out, pos[str(it.jmp)]);
+        return;
+    }
+    if it.op == 27 {                                   // OpClosure (inline captures)
+        _w_u8(out, 27);
+        _w_u32(out, it.fnc);
+        _w_u32(out, len(it.caps));
+        let u = 0;
+        while u < len(it.caps) {
+            _w_u8(out, if it.caps[u].is_local { 1 } else { 0 });
+            _w_u32(out, it.caps[u].index);
+            u = u + 1;
+        }
+        return;
+    }
+    _w_u8(out, it.op);
+    if map_has(it, "n") { _w_u32(out, it.n); }
+}
+
 // Emit a chunk (instructions, constants, spans, source_name) in the .pbck layout.
 //
-// Local-model bridge: the self-hosted compiler treats a `let` DECLARATION inside
-// a function as `expr; OP_SET_LOCAL slot` against a growable locals array, but the
+// Local-model bridge: the self-hosted compiler treats a `let` declaration inside a
+// function as `expr; OP_SET_LOCAL slot` against a growable locals array, while the
 // Rust VM's locals are stack-relative slots that must already exist (its OpSetLocal
-// pops and overwrites slot `stack_base+1+slot`). So at function entry we push one
-// `nil` per non-parameter local slot (arity..max_slot); now every OP_SET_LOCAL has
-// a slot to write and slot NUMBERS are unchanged.
+// POPS then overwrites slot `stack_base+1+slot`). So at entry we push one `nil` per
+// non-parameter local slot (plus one scratch slot used by the OP_LEN emulation).
 //
-// Because the entry pad and the *_PEEK expansions change instruction indices, a
-// first pass computes each self-hosted index's Rust index (`ridx`) so jump targets
-// remap exactly; the second pass emits with remapped targets.
-//
-// `is_top` additionally appends an implicit `OpConstant(nil); OpReturn` to satisfy
-// the Rust VM's main-chunk exit convention when the chunk doesn't end in a return.
+// `is_top` appends an implicit `OpConstant(nil); OpReturn` to satisfy the Rust VM's
+// main-chunk exit convention when the chunk doesn't already end in a return.
 fn _emit_chunk(out, chunk, is_top, arity) {
-    let ins = chunk.instructions;
-    let consts = chunk.constants;
+    // Shared constant pool, seeded with the two constants the lowering needs.
+    let pool = ["len", nil];
+    let len_idx = 0;
+    let nil_idx = 1;
 
-    // Copy constants (we may append nil placeholders / a trailing-return nil).
-    let out_consts = [];
-    let ci = 0;
-    while ci < len(consts) { array_push(out_consts, consts[ci]); ci = ci + 1; }
-
-    // Placeholder local slots to pre-push at entry, plus one extra scratch slot
-    // used by the OP_LEN emulation (len(<top>) needs to stash the collection while
-    // the `len` builtin is pushed, since the Rust VM has no swap/len opcode).
-    let pad = (_max_local_slot(ins) + 1) - arity;
+    let maxloc = _max_local_slot(chunk.instructions, chunk.constants);
+    let pad = (maxloc + 1) - arity;
     if pad < 0 { pad = 0; }
-    let scratch = arity + pad;     // slot index for the OP_LEN scratch
-    let pad_total = pad + 1;       // always reserve the scratch slot
+    let scratch = arity + pad;          // dedicated OP_LEN scratch slot
+    let pad_total = pad + 1;            // real local placeholders + the scratch slot
 
-    // "len" builtin name as a constant (for OP_LEN's OpGetGlobal).
-    array_push(out_consts, "len");
-    let len_idx = len(out_consts) - 1;
+    // Lower the chunk to label IR (this also merges chunk constants into `pool`).
+    let body = [];
+    let ctx = map{ n: 0 };
+    _lower(body, chunk, ctx, pool, scratch, len_idx, false);
 
-    // Pass 1: Rust instruction index for each self-hosted instruction index.
-    let ridx = [];
-    let acc = pad_total;
-    let i = 0;
-    while i < len(ins) {
-        array_push(ridx, acc);
-        let c = _emit_count(ins[i].op);
-        if c < 0 {
-            throw "selfhost_to_pbck: opcode " + str(ins[i].op) + " has no Rust-VM equivalent yet";
-        }
-        acc = acc + c;
-        i = i + 1;
-    }
-    let rend = acc;   // index one past the last body instruction (jump-to-end)
-
-    let ibytes = [];
-    let n_ins = 0;
-
-    array_push(out_consts, nil);
-    let nil_idx = len(out_consts) - 1;
+    // Assemble: entry placeholders, then the lowered body, then (top) a return.
+    let code = [];
     let p = 0;
-    while p < pad_total {
-        _w_u8(ibytes, 0); _w_u32(ibytes, nil_idx);   // OpConstant nil
-        n_ins = n_ins + 1;
-        p = p + 1;
+    while p < pad_total { array_push(code, map{ op: 0, n: nil_idx }); p = p + 1; }
+    let bi = 0;
+    while bi < len(body) { array_push(code, body[bi]); bi = bi + 1; }
+    if is_top and _last_real_op(code) != 33 {
+        array_push(code, map{ op: 0, n: nil_idx });    // OpConstant nil
+        array_push(code, map{ op: 33 });               // OpReturn
     }
 
-    // Pass 2: body instructions with remapped jump targets.
+    // Resolve labels -> instruction indices.
+    let pos = map{};
+    let idx = 0;
+    let i = 0;
+    while i < len(code) {
+        if map_has(code[i], "label") { pos[str(code[i].label)] = idx; }
+        else { idx = idx + 1; }
+        i = i + 1;
+    }
+    let n_ins = idx;
+
+    // Emit instruction bytes.
+    let ibytes = [];
     i = 0;
-    while i < len(ins) {
-        n_ins = n_ins + _emit_instruction(ibytes, ins[i], consts, ridx, rend, scratch, len_idx);
+    while i < len(code) {
+        if not map_has(code[i], "label") { _emit_item(ibytes, code[i], pos); }
         i = i + 1;
     }
 
-    if is_top {
-        let last_ret = len(ins) > 0 and _rust_op(ins[len(ins) - 1].op) == 33;
-        if not last_ret {
-            array_push(out_consts, nil);
-            _w_u8(ibytes, 0); _w_u32(ibytes, len(out_consts) - 1);  // OpConstant nil
-            _w_u8(ibytes, 33);                                       // OpReturn
-            n_ins = n_ins + 2;
-        }
-    }
-
-    // instructions
+    // chunk: instructions
     _w_u32(out, n_ins);
     let b = 0;
     while b < len(ibytes) { array_push(out, ibytes[b]); b = b + 1; }
     // constants
-    _w_u32(out, len(out_consts));
+    _w_u32(out, len(pool));
     let k = 0;
-    while k < len(out_consts) { _w_value(out, out_consts[k]); k = k + 1; }
+    while k < len(pool) { _w_value(out, pool[k]); k = k + 1; }
     // spans: one zero span per instruction (keeps spans.len == instructions.len)
     _w_u32(out, n_ins);
     let s = 0;
