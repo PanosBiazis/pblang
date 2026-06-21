@@ -1,0 +1,175 @@
+// stdlib/selfhost_pbck.sapp — bytecode container for the SELF-HOSTED compiler.
+//
+// Serializes/deserializes the pblang-written compiler's chunk-maps
+//   chunk = { instructions: [ {op:int, operand:int} ], constants: [ value... ] }
+//   value = number | string | bool | nil | function{ arity, chunk, upvalues }
+//   upvalue = { index:int, is_local:bool }
+// to/from a flat byte array, so the pblang toolchain can compile, PERSIST
+// bytecode to disk (fs_write_bytes), reload, and run it on the self-hosted VM —
+// all in pblang, with no Rust front-end involved.
+//
+// This is the self-hosted-IR container. It is intentionally SEPARATE from the
+// Rust `.pbck` (crates/pblang-ir) which uses the Rust VM's opcode numbering;
+// unifying the two (so self-hosted output runs on the Rust VM) requires aligning
+// the opcode sets and is a documented future step.
+//
+// Format: magic "PBCS", u8 version=1, then one <chunk>. Integers are 4-byte LE;
+// strings are u32 length + UTF-8 bytes; numbers are stored as their decimal
+// string (exact for integers; simple decimals round-trip via parse_number).
+
+let _MAGIC = [80, 66, 67, 83];   // "PBCS"
+let _VERSION = 1;
+
+// ── writers ──────────────────────────────────────────────────────────────────
+fn _w_u8(out, b) { array_push(out, bit_and(b, 255)); }
+fn _w_u32(out, v) {
+    _w_u8(out, v);
+    _w_u8(out, bit_shr(v, 8));
+    _w_u8(out, bit_shr(v, 16));
+    _w_u8(out, bit_shr(v, 24));
+}
+fn _w_str(out, s) {
+    let b = str_to_bytes(s);
+    _w_u32(out, len(b));
+    let i = 0;
+    while i < len(b) { array_push(out, b[i]); i = i + 1; }
+}
+
+fn _w_value(out, v) {
+    if v == nil { _w_u8(out, 2); return; }
+    let t = type(v);
+    if t == "number" { _w_u8(out, 0); _w_str(out, str(v)); return; }
+    if t == "bool" { _w_u8(out, 1); _w_u8(out, if v { 1 } else { 0 }); return; }
+    if t == "string" { _w_u8(out, 3); _w_str(out, v); return; }
+    if t == "map" and map_has(v, "chunk") {
+        // function constant {arity, chunk, upvalues}
+        _w_u8(out, 4);
+        _w_u32(out, try v.arity catch 0);
+        let ups = try v.upvalues catch [];
+        _w_u32(out, len(ups));
+        let i = 0;
+        while i < len(ups) {
+            _w_u32(out, try ups[i].index catch 0);
+            _w_u8(out, if (try ups[i].is_local catch false) { 1 } else { 0 });
+            i = i + 1;
+        }
+        _w_chunk(out, v.chunk);
+        return;
+    }
+    // Unsupported constant kind (should not occur in self-hosted output) -> nil.
+    _w_u8(out, 2);
+}
+
+fn _w_chunk(out, chunk) {
+    let ins = chunk.instructions;
+    _w_u32(out, len(ins));
+    let i = 0;
+    while i < len(ins) {
+        _w_u32(out, try ins[i].op catch 0);
+        _w_u32(out, try ins[i].operand catch 0);
+        i = i + 1;
+    }
+    let cs = chunk.constants;
+    _w_u32(out, len(cs));
+    let j = 0;
+    while j < len(cs) {
+        _w_value(out, cs[j]);
+        j = j + 1;
+    }
+}
+
+fn serialize_chunk(chunk) {
+    let out = [];
+    let m = 0;
+    while m < len(_MAGIC) { array_push(out, _MAGIC[m]); m = m + 1; }
+    _w_u8(out, _VERSION);
+    _w_chunk(out, chunk);
+    return out;
+}
+
+// ── readers ──────────────────────────────────────────────────────────────────
+fn _mk_reader(bytes) { return map{ buf: bytes, pos: 0 }; }
+
+fn _r_u8(r) {
+    if r.pos >= len(r.buf) { throw "selfhost_pbck: unexpected end of input"; }
+    let b = r.buf[r.pos];
+    r.pos = r.pos + 1;
+    return b;
+}
+fn _r_u32(r) {
+    let a = _r_u8(r);
+    let b = _r_u8(r);
+    let c = _r_u8(r);
+    let d = _r_u8(r);
+    return a + b * 256 + c * 65536 + d * 16777216;
+}
+fn _r_str(r) {
+    let n = _r_u32(r);
+    let arr = [];
+    let i = 0;
+    while i < n { array_push(arr, _r_u8(r)); i = i + 1; }
+    return bytes_to_str(arr);
+}
+
+fn _r_value(r) {
+    let tag = _r_u8(r);
+    if tag == 0 { return parse_number(_r_str(r)); }
+    if tag == 1 { return _r_u8(r) == 1; }
+    if tag == 2 { return nil; }
+    if tag == 3 { return _r_str(r); }
+    if tag == 4 {
+        let arity = _r_u32(r);
+        let nup = _r_u32(r);
+        let ups = [];
+        let i = 0;
+        while i < nup {
+            let idx = _r_u32(r);
+            let isl = _r_u8(r) == 1;
+            array_push(ups, map{ index: idx, is_local: isl });
+            i = i + 1;
+        }
+        let ch = _r_chunk(r);
+        return map{ arity: arity, chunk: ch, upvalues: ups };
+    }
+    throw "selfhost_pbck: unknown value tag " + str(tag);
+}
+
+fn _r_chunk(r) {
+    let nins = _r_u32(r);
+    let ins = [];
+    let i = 0;
+    while i < nins {
+        let op = _r_u32(r);
+        let operand = _r_u32(r);
+        array_push(ins, map{ op: op, operand: operand });
+        i = i + 1;
+    }
+    let nc = _r_u32(r);
+    let cs = [];
+    let j = 0;
+    while j < nc {
+        array_push(cs, _r_value(r));
+        j = j + 1;
+    }
+    return map{ instructions: ins, constants: cs };
+}
+
+fn deserialize_chunk(bytes) {
+    if len(bytes) < 5 { throw "selfhost_pbck: too short"; }
+    let i = 0;
+    while i < len(_MAGIC) {
+        if bytes[i] != _MAGIC[i] { throw "selfhost_pbck: bad magic"; }
+        i = i + 1;
+    }
+    let ver = bytes[4];
+    if ver != _VERSION { throw "selfhost_pbck: unsupported version " + str(ver); }
+    let r = _mk_reader(bytes);
+    r.pos = 5;
+    return _r_chunk(r);
+}
+
+// Convenience: write/read a chunk to/from a file (requires fs capability).
+fn write_file(path, chunk) { return fs_write_bytes(path, serialize_chunk(chunk)); }
+fn read_file(path) { return deserialize_chunk(fs_read_bytes(path)); }
+
+export serialize_chunk, deserialize_chunk, write_file, read_file;
