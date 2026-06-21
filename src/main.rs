@@ -2915,6 +2915,59 @@ fn legacy_dispatch(args: Vec<String>) {
         println!("{}", disasm(&chunk));
         return;
     }
+    if args.first().map(|s| s.as_str()) == Some("emit-pbck") {
+        // Compile a source file to a lossless `.pbck` bytecode container that
+        // `pblang run` can execute directly (no re-parsing). This is the front
+        // half of "regenerate the program from pblang bytecode".
+        let path = match args.get(1) {
+            Some(p) => p,
+            None => {
+                eprintln!("usage: pblang emit-pbck <file.sapp> [-o <out.pbck>]");
+                std::process::exit(1);
+            }
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let file_path = cwd.join(path);
+        let out_path = args
+            .iter()
+            .position(|a| a == "-o")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| {
+                let base = path
+                    .rsplit_once('.')
+                    .map(|(b, _)| b.to_string())
+                    .unwrap_or_else(|| path.clone());
+                format!("{base}.pbck")
+            });
+        let src = std::fs::read_to_string(&file_path).unwrap_or_else(|e| {
+            eprintln!("pblang emit-pbck: failed to read {}: {}", file_path.display(), e);
+            std::process::exit(1);
+        });
+        let src_for_parse = strip_comments_mask(&src);
+        let stmts = match parse_strict(&src_for_parse) {
+            Ok(s) => s,
+            Err(errs) => {
+                print_parse_errors(&src_for_parse, errs, Some(path));
+                std::process::exit(2);
+            }
+        };
+        let mut chunk = match compile(stmts) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pblang: compile error: {}", e);
+                std::process::exit(3);
+            }
+        };
+        chunk.source_name = Some(std::rc::Rc::new(path.clone()));
+        let bytes = pblang_ir::pbck_serialize(&chunk);
+        if let Err(e) = std::fs::write(&out_path, &bytes) {
+            eprintln!("pblang emit-pbck: failed to write {}: {}", out_path, e);
+            std::process::exit(1);
+        }
+        println!("wrote {} ({} bytes)", out_path, bytes.len());
+        return;
+    }
     if args.first().map(|s| s.as_str()) == Some("--annotate") {
         let path = match args.get(1) {
             Some(p) => p,
@@ -4395,38 +4448,57 @@ fn legacy_dispatch(args: Vec<String>) {
         }
 
         let path_str = script_path.to_string_lossy().to_string();
-        let src = if let Some(s) = script_src_preloaded {
-            s
-        } else {
-            match std::fs::read_to_string(&script_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!(
-                        "pblang run: failed to read '{}': {}",
-                        script_path.display(),
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
-        };
-        let src_for_parse = strip_comments_mask(&src);
-        let stmts = match parse_strict(&src_for_parse) {
-            Ok(s) => s,
-            Err(errs) => {
-                print_parse_errors(&src_for_parse, errs, Some(&path_str));
-                std::process::exit(2);
-            }
-        };
-        let mut chunk = match compile(stmts) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("pblang: compile error: {}", e);
+        // A `.pbck` file is a pre-compiled bytecode container: load and run it
+        // directly, no parsing or compiling. This is the "regenerate the program
+        // from pblang bytecode without the Rust front-end" path.
+        let (chunk, src) = if path_str.ends_with(".pbck") {
+            let bytes = std::fs::read(&script_path).unwrap_or_else(|e| {
+                eprintln!("pblang run: failed to read '{}': {}", script_path.display(), e);
+                std::process::exit(1);
+            });
+            let mut c = pblang_ir::pbck_deserialize(&bytes).unwrap_or_else(|e| {
+                eprintln!("pblang run: {}: {}", path_str, e);
                 std::process::exit(3);
+            });
+            if c.source_name.is_none() {
+                c.source_name = Some(std::rc::Rc::new(path_str.clone()));
             }
+            (c, String::new())
+        } else {
+            let src = if let Some(s) = script_src_preloaded {
+                s
+            } else {
+                match std::fs::read_to_string(&script_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "pblang run: failed to read '{}': {}",
+                            script_path.display(),
+                            e
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let src_for_parse = strip_comments_mask(&src);
+            let stmts = match parse_strict(&src_for_parse) {
+                Ok(s) => s,
+                Err(errs) => {
+                    print_parse_errors(&src_for_parse, errs, Some(&path_str));
+                    std::process::exit(2);
+                }
+            };
+            let mut chunk = match compile(stmts) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("pblang: compile error: {}", e);
+                    std::process::exit(3);
+                }
+            };
+            chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
+            chunk.source = Some(std::rc::Rc::new(src.clone()));
+            (chunk, src)
         };
-        chunk.source_name = Some(std::rc::Rc::new(path_str.clone()));
-        chunk.source = Some(std::rc::Rc::new(src.clone()));
 
         // Arguments after "--" are passed to the script as os.args() (newline-separated in env).
         let script_args: Vec<String> = args
