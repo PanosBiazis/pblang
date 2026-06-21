@@ -1,0 +1,329 @@
+// stdlib/dist.sapp — cross-OS executable builder for pblang.
+//
+// Goal: let a programmer turn any pblang script/project into a native
+// executable for EVERY desktop OS, without rebuilding the Rust toolchain.
+//
+// How: pblang already transpiles to a single self-contained C99 file
+// (`pblang transpile`). C is the universal floor — every OS has a C compiler,
+// and cross-compilers (zig cc, mingw, osxcross) target other OSes from one
+// host. So the whole pipeline is:
+//
+//     pblang source  --(pblang transpile)-->  one .c file  --(C compiler)-->  native exe
+//
+// This module is the orchestration layer, written in pblang itself. Adding a
+// new target or tweaking flags is a pblang change, not a Rust change — which is
+// the point of a self-hosted language.
+//
+// Usage:
+//   let dist = import("stdlib/dist.sapp");
+//   dist.available_targets();              // what this host can build right now
+//   dist.build(src, "windows-x64", out);   // one target
+//   dist.build_all(src, "dist");           // every available target -> dist/
+//   print dist.report_to_string(rep);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Toolchain detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+// True if `cmd` resolves on PATH. Uses proc_spawn_wait("which", ...) like the
+// rest of stdlib (codec.sapp / browser_render.sapp); falls back to os_which.
+fn have(cmd) {
+    let r = try proc_spawn_wait("which", [cmd]) catch nil;
+    if r != nil {
+        let code = try r.exit_code catch 1;
+        if code == 0 { return true; }
+    }
+    let w = try os_which(cmd) catch nil;
+    if w != nil and w != "" { return true; }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Target catalog
+//
+// Each target lists, in priority order, the "recipes" that can produce it. A
+// recipe is { bin, pre } where `bin` is the compiler executable and `pre` are
+// the args that come before the shared `<c> -O2 -o <out> [-lm]` tail. The first
+// recipe whose `bin` exists on this host is used.
+//
+// `zig cc -target <triple>` is the universal cross-compiler: one install builds
+// for all OSes/arches, so it's listed first for every target when present.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn _recipe(bin, pre) { return map{ bin: bin, pre: pre }; }
+
+fn all_targets() {
+    return [
+        map{ name: "linux-x64", os: "linux", arch: "x86_64", ext: "", needs_lm: true,
+             recipes: [ _recipe("zig", ["cc", "-target", "x86_64-linux-musl"]),
+                        _recipe("cc", []), _recipe("gcc", []), _recipe("clang", []) ] },
+        map{ name: "linux-arm64", os: "linux", arch: "aarch64", ext: "", needs_lm: true,
+             recipes: [ _recipe("zig", ["cc", "-target", "aarch64-linux-musl"]),
+                        _recipe("aarch64-linux-gnu-gcc", []) ] },
+        map{ name: "windows-x64", os: "windows", arch: "x86_64", ext: ".exe", needs_lm: false,
+             recipes: [ _recipe("zig", ["cc", "-target", "x86_64-windows-gnu"]),
+                        _recipe("x86_64-w64-mingw32-gcc", []) ] },
+        map{ name: "windows-x86", os: "windows", arch: "i686", ext: ".exe", needs_lm: false,
+             recipes: [ _recipe("zig", ["cc", "-target", "x86-windows-gnu"]),
+                        _recipe("i686-w64-mingw32-gcc", []) ] },
+        map{ name: "macos-x64", os: "macos", arch: "x86_64", ext: "", needs_lm: true,
+             recipes: [ _recipe("zig", ["cc", "-target", "x86_64-macos"]),
+                        _recipe("o64-clang", []) ] },
+        map{ name: "macos-arm64", os: "macos", arch: "aarch64", ext: "", needs_lm: true,
+             recipes: [ _recipe("zig", ["cc", "-target", "aarch64-macos"]),
+                        _recipe("oa64-clang", []) ] },
+    ];
+}
+
+fn target_by_name(name) {
+    for t in all_targets() {
+        if t.name == name { return t; }
+    }
+    return nil;
+}
+
+// The first usable recipe for a target (or nil if no toolchain is installed).
+fn _pick_recipe(target) {
+    for r in target.recipes {
+        if have(r.bin) { return r; }
+    }
+    return nil;
+}
+
+// Every target this host can build right now, each annotated with the compiler
+// that will be used. Targets with no installed toolchain are omitted.
+fn available_targets() {
+    let out = [];
+    for t in all_targets() {
+        let r = _pick_recipe(t);
+        if r != nil {
+            array_push(out, map{ name: t.name, os: t.os, arch: t.arch,
+                                 ext: t.ext, compiler: r.bin });
+        }
+    }
+    return out;
+}
+
+// Human-readable note on which targets are NOT yet buildable and how to enable
+// them (install zig for universal cross-compilation; mingw for Windows;
+// osxcross for macOS).
+fn missing_targets_help() {
+    let lines = [];
+    for t in all_targets() {
+        if _pick_recipe(t) == nil {
+            let bins = [];
+            for r in t.recipes { array_push(bins, r.bin); }
+            array_push(lines, "  " + t.name + " — install one of: " + str_join(bins, ", "));
+        }
+    }
+    if len(lines) == 0 { return "All catalog targets are buildable on this host."; }
+    return "Unavailable targets (install a toolchain to enable):\n" + str_join(lines, "\n")
+        + "\nTip: `zig` alone (https://ziglang.org) cross-compiles ALL targets.";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn _pblang_bin() { return "pblang"; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build options — the knobs that make pblang's exe output best-in-class:
+//   opt    : "speed" (-O2, default) | "max" (-O3) | "size" (-Os) | "debug" (-O0 -g)
+//   strip  : drop symbol tables for a smaller binary (default true, off in debug)
+//   static : fully static, copy-anywhere binary (no shared-lib deps)
+//   lto    : link-time optimization (-flto) — smaller + faster
+//   compress : run UPX if installed for the smallest possible on-disk size
+// ─────────────────────────────────────────────────────────────────────────────
+fn default_opts() {
+    return map{ opt: "speed", strip: true, static: false, lto: false, compress: false };
+}
+
+// release(): the recommended "ship it" profile — small, stripped, fully static
+// where the toolchain supports it. Produces the most portable single file.
+fn release_opts() {
+    return map{ opt: "size", strip: true, static: true, lto: true, compress: false };
+}
+
+fn _opt(opts, key, dflt) {
+    if opts == nil { return dflt; }
+    let v = try opts[key] catch nil;
+    if v == nil { return dflt; }
+    return v;
+}
+
+// Translate opts into the optimization/link flags appended after the source.
+fn _opt_flags(target, opts) {
+    let flags = [];
+    let level = _opt(opts, "opt", "speed");
+    if level == "max" { array_push(flags, "-O3"); }
+    elif level == "size" { array_push(flags, "-Os"); }
+    elif level == "debug" { array_push(flags, "-O0"); array_push(flags, "-g"); }
+    else { array_push(flags, "-O2"); }
+
+    if _opt(opts, "lto", false) and level != "debug" { array_push(flags, "-flto"); }
+    // Strip symbols via the linker (-s); never strip a debug build.
+    if _opt(opts, "strip", true) and level != "debug" { array_push(flags, "-s"); }
+    if _opt(opts, "static", false) { array_push(flags, "-static"); }
+    return flags;
+}
+
+// On-disk size in bytes (nil if unreadable). Uses fs_read_bytes since there is
+// no fs_size builtin; binaries here are small enough that this is fine.
+fn _file_size(path) {
+    let b = try fs_read_bytes(path) catch nil;
+    if b == nil { return nil; }
+    return len(b);
+}
+
+// pblang source -> portable C. Returns map{ ok, c_path, stderr }.
+fn transpile(src, c_path) {
+    let r = try proc_spawn_wait(_pblang_bin(), ["transpile", src, "-o", c_path]) catch nil;
+    if r == nil {
+        return map{ ok: false, c_path: c_path, stderr: "could not run pblang transpile" };
+    }
+    let code = try r.exit_code catch 1;
+    let ok = code == 0 and fs_exists(c_path);
+    return map{ ok: ok, c_path: c_path, stderr: try r.stderr catch "" };
+}
+
+// Compile an already-transpiled .c for one target with the given opts. Returns
+// map{ ok, output, target, compiler, stderr, size, compressed }.
+fn compile_c(c_path, target_name, out_path, opts = nil) {
+    let t = target_by_name(target_name);
+    if t == nil {
+        return map{ ok: false, output: out_path, target: target_name,
+                    compiler: nil, stderr: "unknown target: " + target_name };
+    }
+    let recipe = _pick_recipe(t);
+    if recipe == nil {
+        return map{ ok: false, output: out_path, target: target_name, compiler: nil,
+                    stderr: "no C toolchain for " + target_name + ". " + missing_targets_help() };
+    }
+    let out = out_path + t.ext;
+    let args = [];
+    for a in recipe.pre { array_push(args, a); }
+    array_push(args, c_path);
+    for f in _opt_flags(t, opts) { array_push(args, f); }
+    array_push(args, "-o");
+    array_push(args, out);
+    if t.needs_lm { array_push(args, "-lm"); }
+
+    let r = try proc_spawn_wait(recipe.bin, args) catch nil;
+    if r == nil {
+        return map{ ok: false, output: out, target: target_name, compiler: recipe.bin,
+                    stderr: "could not run " + recipe.bin };
+    }
+    let code = try r.exit_code catch 1;
+    let ok = code == 0 and fs_exists(out);
+
+    // Optional UPX compression for the smallest on-disk binary, if available.
+    let compressed = false;
+    if ok and _opt(opts, "compress", false) and have("upx") {
+        let u = try proc_spawn_wait("upx", ["--best", "--lzma", "-q", out]) catch nil;
+        if u != nil and (try u.exit_code catch 1) == 0 { compressed = true; }
+    }
+
+    return map{ ok: ok, output: out, target: target_name, compiler: recipe.bin,
+                stderr: try r.stderr catch "", size: _file_size(out), compressed: compressed };
+}
+
+// Full single-target build: transpile then compile. `out_base` is the output
+// path WITHOUT extension (the target's ext, e.g. ".exe", is appended).
+// Returns map{ ok, output, target, compiler, stderr, c_path }.
+fn build(src, target_name, out_base, opts = nil) {
+    let c_path = out_base + ".c";
+    let tr = transpile(src, c_path);
+    if not tr.ok {
+        return map{ ok: false, output: nil, target: target_name, compiler: nil,
+                    stderr: "transpile failed: " + str(tr.stderr), c_path: c_path };
+    }
+    let res = compile_c(c_path, target_name, out_base, opts);
+    res.c_path = c_path;
+    return res;
+}
+
+// release(): build the recommended "ship it" binary (small, stripped, static).
+// `target` defaults to the host's first available target.
+fn release(src, out_base, target = nil) {
+    if target == nil {
+        let av = available_targets();
+        if len(av) == 0 { return map{ ok: false, stderr: "no C toolchain on host" }; }
+        target = av[0].name;
+    }
+    return build(src, target, out_base, release_opts());
+}
+
+// Build for many targets at once. Transpiles ONCE (the C is host-independent),
+// then compiles each requested target. `targets` is a list of names, or nil for
+// "every available target". `out_dir` receives `<basename>-<target><ext>`.
+// Returns map{ ok, c_path, results: [ per-target build maps ] }.
+fn build_all(src, out_dir, targets = nil, opts = nil) {
+    if targets == nil {
+        targets = [];
+        for t in available_targets() { array_push(targets, t.name); }
+    }
+    let base = _basename_noext(src);
+    let c_path = out_dir + "/" + base + ".c";
+    try fs_mkdirs(out_dir) catch nil;
+
+    let tr = transpile(src, c_path);
+    if not tr.ok {
+        return map{ ok: false, c_path: c_path,
+                    results: [ map{ ok: false, stderr: "transpile failed: " + str(tr.stderr) } ] };
+    }
+
+    let results = [];
+    let all_ok = true;
+    for name in targets {
+        let out_base = out_dir + "/" + base + "-" + name;
+        let res = compile_c(c_path, name, out_base, opts);
+        array_push(results, res);
+        if not res.ok { all_ok = false; }
+    }
+    return map{ ok: all_ok, c_path: c_path, results: results };
+}
+
+fn _basename_noext(path) {
+    let parts = str_split(path, "/");
+    let fname = parts[len(parts) - 1];
+    let dot = str_split(fname, ".");
+    if len(dot) <= 1 { return fname; }
+    let out = dot[0];
+    let i = 1;
+    while i < len(dot) - 1 { out = out + "." + dot[i]; i = i + 1; }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reporting
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn _fmt_size(n) {
+    if n == nil { return "?"; }
+    if n < 1024 { return str(n) + "B"; }
+    if n < 1048576 { return str(num_floor(n / 1024)) + "KB"; }
+    return str(num_floor(n / 104857.6) / 10) + "MB";
+}
+
+fn report_to_string(rep) {
+    let lines = [];
+    for res in rep.results {
+        let tag = "FAIL";
+        if res.ok { tag = " ok "; }
+        let line = "[" + tag + "] " + str(try res.target catch "?");
+        if res.ok {
+            line = line + " -> " + str(res.output)
+                 + " (" + str(res.compiler) + ", " + _fmt_size(try res.size catch nil);
+            if try res.compressed catch false { line = line + ", upx"; }
+            line = line + ")";
+        } else {
+            line = line + " : " + str(try res.stderr catch "?");
+        }
+        array_push(lines, line);
+    }
+    return str_join(lines, "\n");
+}
+
+export have, all_targets, target_by_name, available_targets, missing_targets_help;
+export default_opts, release_opts, transpile, compile_c, build, build_all, release, report_to_string;
