@@ -65,17 +65,6 @@ fn _defined_globals(chunk) {
     return out;
 }
 
-// Does the chunk's TOP LEVEL contain an import() call? (GET_GLOBAL "import").
-fn _has_top_import(chunk) {
-    let i = 0;
-    while i < len(chunk.instructions) {
-        let ins = chunk.instructions[i];
-        if ins.op == OP_GET_GLOBAL and chunk.constants[ins.operand] == "import" { return true; }
-        i = i + 1;
-    }
-    return false;
-}
-
 // Which self-hosted ops carry a JUMP TARGET (instruction index) operand.
 fn _is_jump(op) {
     return op == 20 or op == 21 or op == 22 or op == 33 or op == 34 or op == 36 or op == 37;
@@ -153,8 +142,33 @@ fn _emit_export_map(merged, defined, bundle_name) {
 
 fn _err(reason) { return map{ ok: false, reason: reason }; }
 
-// Link `main_src` + its imports into one self-hosted chunk. `resolve(path)` returns
-// the module source for an import path, or nil if not found.
+// Depth-first collect the TRANSITIVE module graph reachable from `path`, in
+// deps-first (post-order) order so a module is appended after every module it
+// imports. Cycles and resolve/compile errors are reported via `errbox.err`
+// (pblang `catch` doesn't bind the error, so we thread errors through a box).
+fn _collect(path, resolve, reg, visiting, order, errbox) {
+    if errbox.err != nil { return; }
+    if map_has(reg, path) { return; }
+    if map_has(visiting, path) { errbox.err = "import cycle at " + str(path); return; }
+    visiting[path] = true;
+    let src = try resolve(path) catch nil;
+    if src == nil { errbox.err = "cannot resolve import: " + str(path); return; }
+    let cr = _fe.frontend_compile(src);
+    if not cr.ok { errbox.err = "module failed to compile: " + str(path); return; }
+    let deps = _find_imports(src);
+    let i = 0;
+    while i < len(deps) {
+        _collect(deps[i], resolve, reg, visiting, order, errbox);
+        if errbox.err != nil { return; }
+        i = i + 1;
+    }
+    reg[path] = map{ path: path, chunk: cr.chunk, defined: _defined_globals(cr.chunk) };
+    array_push(order, path);
+    map_remove(visiting, path);
+}
+
+// Link `main_src` + its (transitive) imports into one self-hosted chunk.
+// `resolve(path)` returns the module source for an import path, or nil if missing.
 fn bundle(main_src, resolve) {
     let paths = _find_imports(main_src);
     if len(paths) == 0 {
@@ -163,28 +177,32 @@ fn bundle(main_src, resolve) {
         return map{ ok: true, chunk: only.chunk, modules: 0 };
     }
 
-    // Resolve + compile each module; reject nested imports and builtin shadowing.
-    let mods = [];           // { path, chunk, defined }
-    let all_defined = map{}; // name -> path (collision detection)
+    // Resolve the whole dependency tree, deps-first.
+    let reg = map{};
+    let order = [];
+    let visiting = map{};
+    let errbox = map{ err: nil };
     let pi = 0;
     while pi < len(paths) {
-        let path = paths[pi];
-        let src = try resolve(path) catch nil;
-        if src == nil { return _err("cannot resolve import: " + str(path)); }
-        let cr = _fe.frontend_compile(src);
-        if not cr.ok { return _err("module failed to compile: " + str(path)); }
-        if _has_top_import(cr.chunk) { return _err("nested import in module not supported: " + str(path)); }
-        let defined = _defined_globals(cr.chunk);
+        _collect(paths[pi], resolve, reg, visiting, order, errbox);
+        if errbox.err != nil { return _err(errbox.err); }
+        pi = pi + 1;
+    }
+
+    // Collision + builtin-shadow detection across every module (shared namespace).
+    let all_defined = map{};
+    let oi = 0;
+    while oi < len(order) {
+        let mod = reg[order[oi]];
         let di = 0;
-        while di < len(defined) {
-            let nm = defined[di];
-            if _blt.is_builtin_name(nm) { return _err("module global shadows builtin '" + str(nm) + "' in " + str(path)); }
-            if map_has(all_defined, nm) { return _err("global name collision '" + str(nm) + "' (" + str(all_defined[nm]) + " and " + str(path) + ")"); }
-            all_defined[nm] = path;
+        while di < len(mod.defined) {
+            let nm = mod.defined[di];
+            if _blt.is_builtin_name(nm) { return _err("module global shadows builtin '" + str(nm) + "' in " + str(mod.path)); }
+            if map_has(all_defined, nm) { return _err("global name collision '" + str(nm) + "' (" + str(all_defined[nm]) + " and " + str(mod.path) + ")"); }
+            all_defined[nm] = mod.path;
             di = di + 1;
         }
-        array_push(mods, map{ path: path, chunk: cr.chunk, defined: defined });
-        pi = pi + 1;
+        oi = oi + 1;
     }
 
     // Compile main; its own top-level globals must not collide with module globals.
@@ -199,15 +217,15 @@ fn bundle(main_src, resolve) {
         mdi = mdi + 1;
     }
 
-    // Merge: nil const, then each module (init + export map), then main (imports rewritten).
+    // Merge in deps-first order. Each module's OWN import sites are rewritten using
+    // bundle_map, which already holds its deps' bundle globals (built earlier).
     let merged = map{ instructions: [], constants: [] };
     let nil_idx = _add_const(merged, nil);
     let bundle_map = map{};
-
     let m = 0;
-    while m < len(mods) {
-        let mod = mods[m];
-        if not _append(merged, mod.chunk, nil, nil_idx) { return _err("module append failed: " + str(mod.path)); }
+    while m < len(order) {
+        let mod = reg[order[m]];
+        if not _append(merged, mod.chunk, bundle_map, nil_idx) { return _err("unresolved import in module: " + str(mod.path)); }
         let bn = _emit_export_map(merged, mod.defined, "__bundle_" + str(m));
         bundle_map[mod.path] = bn;
         m = m + 1;
@@ -217,7 +235,7 @@ fn bundle(main_src, resolve) {
         return _err("unresolved import call site in main");
     }
 
-    return map{ ok: true, chunk: merged, modules: len(mods) };
+    return map{ ok: true, chunk: merged, modules: len(order) };
 }
 
 export bundle;
