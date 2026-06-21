@@ -1,0 +1,133 @@
+// stdlib/selfhost_to_pbck.sapp — translate a SELF-HOSTED compiler chunk-map into
+// the RUST .pbck bytecode container, so `pblang run file.pbck` (the native Rust
+// VM) executes bytecode produced by the pblang-written compiler.
+//
+// Two impedance mismatches are bridged here:
+//   1. Opcode NUMBERING differs above 15 (self-hosted ir.sapp vs the Rust OpCode
+//      enum). `_rust_op` is the fixed translation table.
+//   2. The Rust .pbck encodes constants/operands in a specific byte layout
+//      (matches crates/pblang-ir::pbck_deserialize): magic "PBCK", u8 version=1,
+//      then chunk = u32 n_ins, per-op (tag byte + u32 operand where applicable),
+//      u32 n_const + values, u32 n_spans + (u32,u32), u8 has_source_name.
+//
+// Scope: the core opcode subset (constants, arithmetic, comparisons, globals,
+// locals, print, jumps, call, not, return). Opcodes with no Rust-VM equivalent
+// (the self-hosted short-circuit *_PEEK jumps) or needing structural rewrites
+// (OP_CLOSURE captures, try/defer) throw — they are the documented next step.
+
+let RUST_VERSION = 1;
+
+// Self-hosted op number -> Rust OpCode tag. Identity for 0..15; remapped above.
+fn _rust_op(op) {
+    if op <= 15 { return op; }            // OP_CONSTANT..OP_SET_GLOBAL match exactly
+    if op == 16 { return 25; }            // OP_GET_LOCAL  -> OpGetLocal
+    if op == 17 { return 26; }            // OP_SET_LOCAL  -> OpSetLocal
+    if op == 18 { return 31; }            // OP_CALL       -> OpCall
+    if op == 19 { return 33; }            // OP_RETURN     -> OpReturn
+    if op == 20 { return 35; }            // OP_JUMP       -> OpJump
+    if op == 21 { return 36; }            // OP_JUMP_IF_FALSE -> OpJumpIfFalse
+    if op == 22 { return 37; }            // OP_JUMP_IF_TRUE  -> OpJumpIfTrue
+    if op == 23 { return 38; }            // OP_NOT        -> OpNot
+    if op == 25 { return 19; }            // OP_MAKE_ARRAY -> OpMakeArray
+    if op == 26 { return 20; }            // OP_MAKE_MAP   -> OpMakeMap
+    if op == 27 { return 21; }            // OP_GET_INDEX  -> OpGetIndex
+    if op == 28 { return 22; }            // OP_SET_INDEX  -> OpSetIndex
+    if op == 29 { return 16; }            // OP_GET_ATTR   -> OpGetAttr
+    if op == 30 { return 17; }            // OP_SET_ATTR   -> OpSetAttr
+    return (0 - 1);                       // unmapped (peek jumps, closure, try, ...)
+}
+
+// Rust ops that carry a single u32 operand in the .pbck layout.
+fn _rust_op_has_operand(rop) {
+    return rop == 0 or rop == 13 or rop == 14 or rop == 15 or rop == 16 or rop == 17
+        or rop == 18 or rop == 19 or rop == 20 or rop == 23 or rop == 25 or rop == 26
+        or rop == 28 or rop == 29 or rop == 31 or rop == 32 or rop == 35 or rop == 36
+        or rop == 37 or rop == 42;
+}
+
+// ── byte writers ────────────────────────────────────────────────────────────
+fn _w_u8(out, b) { array_push(out, bit_and(b, 255)); }
+fn _w_u32(out, v) {
+    _w_u8(out, v); _w_u8(out, bit_shr(v, 8)); _w_u8(out, bit_shr(v, 16)); _w_u8(out, bit_shr(v, 24));
+}
+fn _w_str(out, s) {
+    let b = str_to_bytes(s);
+    _w_u32(out, len(b));
+    let i = 0;
+    while i < len(b) { array_push(out, b[i]); i = i + 1; }
+}
+fn _w_f64(out, n) {
+    let b = num_to_le_bytes(n);
+    let i = 0;
+    while i < 8 { array_push(out, b[i]); i = i + 1; }
+}
+
+fn _w_value(out, v) {
+    if v == nil { _w_u8(out, 2); return; }
+    let t = type(v);
+    if t == "number" { _w_u8(out, 0); _w_f64(out, v); return; }
+    if t == "bool" { _w_u8(out, 1); _w_u8(out, if v { 1 } else { 0 }); return; }
+    if t == "string" { _w_u8(out, 3); _w_str(out, v); return; }
+    throw "selfhost_to_pbck: unsupported constant kind (functions/closures not yet translated)";
+}
+
+// Emit the Rust .pbck bytes for a self-hosted chunk-map. Appends an implicit
+// `OpConstant(nil); OpReturn` if the chunk doesn't already end in a return, to
+// satisfy the Rust VM's main-chunk exit convention.
+fn translate(chunk) {
+    let ins = chunk.instructions;
+    let consts = chunk.constants;
+
+    // Copy constants (we may add a trailing nil).
+    let out_consts = [];
+    let ci = 0;
+    while ci < len(consts) { array_push(out_consts, consts[ci]); ci = ci + 1; }
+
+    // Build the (possibly extended) instruction list as (rust_op, operand) pairs.
+    let pairs = [];
+    let i = 0;
+    while i < len(ins) {
+        let rop = _rust_op(ins[i].op);
+        if rop < 0 {
+            throw "selfhost_to_pbck: opcode " + str(ins[i].op) + " has no Rust-VM equivalent yet";
+        }
+        array_push(pairs, map{ op: rop, operand: try ins[i].operand catch 0 });
+        i = i + 1;
+    }
+    // Ensure a trailing OpReturn (Rust op 33).
+    let needs_ret = len(pairs) == 0 or pairs[len(pairs) - 1].op != 33;
+    if needs_ret {
+        array_push(out_consts, nil);
+        array_push(pairs, map{ op: 0, operand: len(out_consts) - 1 }); // OpConstant nil
+        array_push(pairs, map{ op: 33, operand: 0 });                  // OpReturn
+    }
+
+    let out = [];
+    _w_u8(out, 80); _w_u8(out, 66); _w_u8(out, 67); _w_u8(out, 75);   // "PBCK"
+    _w_u8(out, RUST_VERSION);
+
+    // chunk: instructions
+    _w_u32(out, len(pairs));
+    let p = 0;
+    while p < len(pairs) {
+        _w_u8(out, pairs[p].op);
+        if _rust_op_has_operand(pairs[p].op) { _w_u32(out, pairs[p].operand); }
+        p = p + 1;
+    }
+    // constants
+    _w_u32(out, len(out_consts));
+    let k = 0;
+    while k < len(out_consts) { _w_value(out, out_consts[k]); k = k + 1; }
+    // spans: one zero span per instruction (keeps spans.len == instructions.len)
+    _w_u32(out, len(pairs));
+    let s = 0;
+    while s < len(pairs) { _w_u32(out, 0); _w_u32(out, 0); s = s + 1; }
+    // source_name: none
+    _w_u8(out, 0);
+
+    return out;
+}
+
+fn write_file(path, chunk) { return fs_write_bytes(path, translate(chunk)); }
+
+export translate, write_file;
