@@ -141,6 +141,32 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     // Supports: \n \t \r \" \\ \0 \xNN (hex byte) \uXXXX (unicode)
     let hex_digit =
         any::<&'src str, extra::Err<Simple<'src, char>>>().filter(|c: &char| c.is_ascii_hexdigit());
+    let unicode_escape = just('u').ignore_then(choice((
+        just('{')
+            .ignore_then(
+                hex_digit
+                    .clone()
+                    .repeated()
+                    .at_least(1)
+                    .at_most(6)
+                    .collect::<String>(),
+            )
+            .then_ignore(just('}'))
+            .map(|s| {
+                let cp = u32::from_str_radix(&s, 16).unwrap_or(0);
+                char::from_u32(cp).unwrap_or('\u{FFFD}')
+            }),
+        hex_digit
+            .clone()
+            .then(hex_digit.clone())
+            .then(hex_digit.clone())
+            .then(hex_digit.clone())
+            .map(|(((a, b), c), d)| {
+                let s = format!("{}{}{}{}", a, b, c, d);
+                let cp = u32::from_str_radix(&s, 16).unwrap_or(0);
+                char::from_u32(cp).unwrap_or('\u{FFFD}')
+            }),
+    )));
     let escape = just('\\').then(choice((
         just('n').to('\n'),
         just('t').to('\t'),
@@ -155,18 +181,8 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
             let s = format!("{}{}", a, b);
             char::from(u8::from_str_radix(&s, 16).unwrap_or(0))
         })),
-        // \uXXXX — unicode escape (4 hex digits)
-        just('u').ignore_then(
-            hex_digit
-                .then(hex_digit)
-                .then(hex_digit)
-                .then(hex_digit)
-                .map(|(((a, b), c), d)| {
-                    let s = format!("{}{}{}{}", a, b, c, d);
-                    let cp = u32::from_str_radix(&s, 16).unwrap_or(0);
-                    char::from_u32(cp).unwrap_or('\u{FFFD}')
-                }),
-        ),
+        // \uXXXX or \u{X..XXXXXX} — unicode scalar escape
+        unicode_escape.clone(),
     )));
     let string_char = choice((
         none_of(
@@ -189,6 +205,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
         just('r').to('\r'),
         just('"').to('"'),
         just('\\').to('\\'),
+        unicode_escape.clone(),
     )));
     let string_char_raw = choice((none_of("\"\\").map(|c| c), escape_raw.map(|(_, c)| c)));
     let string_raw = just('"')
@@ -2313,6 +2330,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
             just('\\').to('\\'),
             just('{').to('{'),
             just('}').to('}'),
+            unicode_escape,
         ))))
         .repeated()
         .at_least(1)

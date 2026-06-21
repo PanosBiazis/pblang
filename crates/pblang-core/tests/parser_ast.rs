@@ -186,3 +186,4 @@ fn parse_elif_is_sugared_as_else_with_single_if_stmt() {
         other => panic!("expected if stmt, got {other:?}"),
     }
 }
+
