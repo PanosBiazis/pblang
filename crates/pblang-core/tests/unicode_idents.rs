@@ -63,6 +63,36 @@ fn digits_allowed_in_continue_position() {
 }
 
 #[test]
+fn identifiers_may_start_with_a_keyword_prefix() {
+    // Regression: literal/operator keywords (true/false/nil/and/or/not) were
+    // matched with `just(...)` (no word boundary), so identifiers that merely
+    // START with one (nilish, truething, android, nothing) failed to parse.
+    for src in [
+        "let nilish = 1; print nilish;",
+        "let truething = 2; print truething;",
+        "let falsehood = 3; print falsehood;",
+        "let android = 4; print android;",
+        "let nothing = 5; print nothing;",
+        "let orbit = 6; print orbit;",
+        "fn nilcheck(nil_idx) { return nil_idx; }",
+    ] {
+        assert!(
+            parse_strict(src).is_ok(),
+            "identifier starting with a keyword prefix must parse: {src:?} -> {:?}",
+            parse_strict(src).err()
+        );
+    }
+}
+
+#[test]
+fn keywords_still_work_as_keywords() {
+    // The fix must not break the actual keywords.
+    parse_strict("let a = true; let b = false; let c = nil;").expect("literal keywords");
+    parse_strict("let d = not true; let e = (1 < 2) and (3 < 4); let f = (1 > 2) or (3 > 2);")
+        .expect("operator keywords");
+}
+
+#[test]
 fn emoji_identifier_rejected() {
     // Emoji are not letters (UAX#31); they remain invalid as identifiers.
     assert!(

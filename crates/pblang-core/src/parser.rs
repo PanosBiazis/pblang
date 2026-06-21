@@ -266,13 +266,13 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
         .padded();
 
     let bool_lit = choice((
-        just("true").to(ExprKind::Bool(true)),
-        just("false").to(ExprKind::Bool(false)),
+        text::keyword("true").to(ExprKind::Bool(true)),
+        text::keyword("false").to(ExprKind::Bool(false)),
     ))
     .map_with(mk_expr_w)
     .padded();
 
-    let nil_lit = just("nil").to(ExprKind::Nil).map_with(mk_expr_w).padded();
+    let nil_lit = text::keyword("nil").to(ExprKind::Nil).map_with(mk_expr_w).padded();
 
     // Unicode-aware identifier parser (UAX#31 letters; see is_ident_start_char).
     // Reused (via .clone()) at value-identifier sites in place of the ASCII-only
@@ -337,7 +337,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
         just("number").to(TypeKind::Number),
         just("bool").to(TypeKind::Bool),
         just("string").to(TypeKind::String),
-        just("nil").to(TypeKind::Nil),
+        text::keyword("nil").to(TypeKind::Nil),
     ))
     .map_with(mk_type_w)
     .padded();
@@ -466,8 +466,8 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
             }),
         // bool literal
         choice((
-            just("true").to(ExprKind::Bool(true)),
-            just("false").to(ExprKind::Bool(false)),
+            text::keyword("true").to(ExprKind::Bool(true)),
+            text::keyword("false").to(ExprKind::Bool(false)),
         ))
         .padded()
         .map(|k| Expr {
@@ -475,7 +475,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
             span: Span { start: 0, end: 0 },
         }),
         // nil literal
-        just("nil").to(ExprKind::Nil).padded().map(|k| Expr {
+        text::keyword("nil").to(ExprKind::Nil).padded().map(|k| Expr {
             kind: k,
             span: Span { start: 0, end: 0 },
         }),
@@ -2722,7 +2722,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
     }
     let prefix = choice((
         just('!').to(Prefix::Not),
-        just("not").to(Prefix::Not),
+        text::keyword("not").to(Prefix::Not),
         just('-').to(Prefix::Neg),
         just('~').to(Prefix::BitNot),
         // `await EXPR` — contextual keyword. The required trailing whitespace
@@ -2974,7 +2974,7 @@ pub fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Stmt>, extra::Err<Simp
 
     // logical: and/or
     let logical_op =
-        choice((just("and").to(LogicalOp::And), just("or").to(LogicalOp::Or))).padded();
+        choice((text::keyword("and").to(LogicalOp::And), text::keyword("or").to(LogicalOp::Or))).padded();
 
     let logical_expr = cmp_expr.clone().foldl(
         logical_op.then(cmp_expr).repeated(),
