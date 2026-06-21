@@ -44,9 +44,11 @@ fn _rust_op(op) {
     if op == 28 { return 22; }            // OP_SET_INDEX  -> OpSetIndex
     if op == 29 { return 16; }            // OP_GET_ATTR   -> OpGetAttr
     if op == 30 { return 17; }            // OP_SET_ATTR   -> OpSetAttr
+    if op == 31 { return 40; }            // OP_MOD        -> OpMod
     if op == 38 { return 28; }            // OP_GET_UPVALUE -> OpGetUpvalue
     if op == 39 { return 29; }            // OP_SET_UPVALUE -> OpSetUpvalue
-    return (0 - 1);                       // unmapped (peek jumps, try, throw, ...)
+    if op == 40 { return 47; }            // OP_THROW      -> OpThrow (uncaught raises)
+    return (0 - 1);                       // unmapped (OP_LEN, OP_TRY, peek jumps handled separately)
 }
 
 // Rust ops that carry a single u32 operand in the .pbck layout.
@@ -104,15 +106,29 @@ fn _w_function(out, fc) {
 }
 
 // Rust jump ops carry an ABSOLUTE target instruction index (not a byte offset).
-// When we prepend local-slot placeholders we shift every target by that count.
 fn _is_rust_jump(rop) { return rop == 35 or rop == 36 or rop == 37; }
 
-// Emit one instruction into the byte buffer `out`; returns the instruction count
-// emitted (always 1). `shift` is added to jump targets (see _emit_chunk).
-//   - OP_CLOSURE is special: the Rust OpClosure encodes its capture list inline
-//     (fn_const u32, n u32, then per-capture is_local u8 + idx u32), whereas the
-//     self-hosted form keeps the captures on the fn constant.
-fn _emit_instruction(out, inst, consts, shift) {
+// How many Rust instructions a self-hosted op expands to, or -1 if unmapped.
+// Most ops are 1:1. The self-hosted short-circuit / nil-coalescing *_PEEK jumps
+// have no native equivalent and are emulated with OpDup(+OpIsNil)+OpJumpIf*.
+fn _emit_count(op) {
+    if op == 33 or op == 34 { return 2; }          // PEEK false/true -> Dup; JumpIf*
+    if op == 36 or op == 37 { return 3; }          // PEEK nil/not-nil -> Dup; IsNil; JumpIf*
+    if op == 24 { return 1; }                      // OP_CLOSURE (captures are inline operands)
+    if _rust_op(op) >= 0 { return 1; }
+    return (0 - 1);
+}
+
+// Map a self-hosted target index to its Rust index via the precomputed table;
+// a target one past the end (jump-to-end) resolves to `rend`.
+fn _resolve_target(t, ridx, rend) {
+    if t < len(ridx) { return ridx[t]; }
+    return rend;
+}
+
+// Emit one self-hosted instruction (possibly several Rust ops); returns the Rust
+// instruction count emitted. `ridx`/`rend` remap absolute jump targets.
+fn _emit_instruction(out, inst, consts, ridx, rend) {
     let op = inst.op;
     if op == 24 {                          // OP_CLOSURE -> OpClosure (tag 27)
         let fn_idx = inst.operand;
@@ -129,6 +145,28 @@ fn _emit_instruction(out, inst, consts, shift) {
         }
         return 1;
     }
+    if op == 33 {                          // JUMP_IF_FALSE_PEEK -> Dup; JumpIfFalse
+        _w_u8(out, 46);
+        _w_u8(out, 36); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
+        return 2;
+    }
+    if op == 34 {                          // JUMP_IF_TRUE_PEEK -> Dup; JumpIfTrue
+        _w_u8(out, 46);
+        _w_u8(out, 37); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
+        return 2;
+    }
+    if op == 36 {                          // JUMP_IF_NIL_PEEK -> Dup; IsNil; JumpIfTrue
+        _w_u8(out, 46);
+        _w_u8(out, 45);
+        _w_u8(out, 37); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
+        return 3;
+    }
+    if op == 37 {                          // JUMP_IF_NOT_NIL_PEEK -> Dup; IsNil; JumpIfFalse
+        _w_u8(out, 46);
+        _w_u8(out, 45);
+        _w_u8(out, 36); _w_u32(out, _resolve_target(inst.operand, ridx, rend));
+        return 3;
+    }
     let rop = _rust_op(op);
     if rop < 0 {
         throw "selfhost_to_pbck: opcode " + str(op) + " has no Rust-VM equivalent yet";
@@ -136,7 +174,7 @@ fn _emit_instruction(out, inst, consts, shift) {
     _w_u8(out, rop);
     if _rust_op_has_operand(rop) {
         let operand = try inst.operand catch 0;
-        if _is_rust_jump(rop) { operand = operand + shift; }
+        if _is_rust_jump(rop) { operand = _resolve_target(operand, ridx, rend); }
         _w_u32(out, operand);
     }
     return 1;
@@ -164,8 +202,11 @@ fn _max_local_slot(ins) {
 // Rust VM's locals are stack-relative slots that must already exist (its OpSetLocal
 // pops and overwrites slot `stack_base+1+slot`). So at function entry we push one
 // `nil` per non-parameter local slot (arity..max_slot); now every OP_SET_LOCAL has
-// a slot to write and slot NUMBERS are unchanged. Prepending those instructions
-// shifts absolute jump targets, which `_emit_instruction` corrects.
+// a slot to write and slot NUMBERS are unchanged.
+//
+// Because the entry pad and the *_PEEK expansions change instruction indices, a
+// first pass computes each self-hosted index's Rust index (`ridx`) so jump targets
+// remap exactly; the second pass emits with remapped targets.
 //
 // `is_top` additionally appends an implicit `OpConstant(nil); OpReturn` to satisfy
 // the Rust VM's main-chunk exit convention when the chunk doesn't end in a return.
@@ -182,6 +223,21 @@ fn _emit_chunk(out, chunk, is_top, arity) {
     let pad = (_max_local_slot(ins) + 1) - arity;
     if pad < 0 { pad = 0; }
 
+    // Pass 1: Rust instruction index for each self-hosted instruction index.
+    let ridx = [];
+    let acc = pad;
+    let i = 0;
+    while i < len(ins) {
+        array_push(ridx, acc);
+        let c = _emit_count(ins[i].op);
+        if c < 0 {
+            throw "selfhost_to_pbck: opcode " + str(ins[i].op) + " has no Rust-VM equivalent yet";
+        }
+        acc = acc + c;
+        i = i + 1;
+    }
+    let rend = acc;   // index one past the last body instruction (jump-to-end)
+
     let ibytes = [];
     let n_ins = 0;
 
@@ -196,10 +252,10 @@ fn _emit_chunk(out, chunk, is_top, arity) {
         }
     }
 
-    // Body instructions, jump targets shifted by `pad`.
-    let i = 0;
+    // Pass 2: body instructions with remapped jump targets.
+    i = 0;
     while i < len(ins) {
-        n_ins = n_ins + _emit_instruction(ibytes, ins[i], consts, pad);
+        n_ins = n_ins + _emit_instruction(ibytes, ins[i], consts, ridx, rend);
         i = i + 1;
     }
 
