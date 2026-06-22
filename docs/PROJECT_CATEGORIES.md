@@ -47,6 +47,8 @@ alongside the language: `ai/pbai` (the neural bridge) and
 - **CLI commands** (`src/`, `src/cli/`):
   `run, build, test, fmt, lint, repl, new, init, check, doc, bench, pack,
   install, publish, add, compile, transpile, bundle, dist, lsp`
+- **pblang-written tools** (`tools/`): `pbdist.sapp` (cross-OS exe builder),
+  `pbrun.sapp` (run/inspect a self-hosted `.pbck` bytecode artifact)
 
 ## 5. Self-Hosted Compiler (pblang-in-pblang) — `stdlib/compiler/`
 
