@@ -98,6 +98,40 @@ fn captureless_fn_literal_is_static() {
     assert_eq!(run(src), "42");
 }
 
+// ── Nested function definitions (fn inside fn) ─────────────────────────────────
+
+#[test]
+fn nested_function_definition() {
+    let out = run("fn outer(n){ fn helper(x){ return x * 2; } return helper(n) + 1; } print outer(10);");
+    assert_eq!(out, "21");
+}
+
+#[test]
+fn nested_function_captures_enclosing_param() {
+    let out = run("fn outer(n){ fn add(x){ return x + n; } return add(5); } print outer(100);");
+    assert_eq!(out, "105");
+}
+
+// ── By-reference-style capture: mutation persists across a closure's own calls ──
+
+#[test]
+fn closure_mutates_captured_state_across_calls() {
+    let out = run(
+        "fn counter(){ let c = 0; return fn(){ c = c + 1; return c; }; } \
+         let nx = counter(); print nx() + nx() + nx();",
+    );
+    assert_eq!(out, "6"); // 1 + 2 + 3
+}
+
+#[test]
+fn independent_counters_do_not_share_state() {
+    let out = run(
+        "fn counter(){ let c = 0; return fn(){ c = c + 1; return c; }; } \
+         let a = counter(); let b = counter(); print a() + a() + b();",
+    );
+    assert_eq!(out, "4"); // a:1, a:2, b:1
+}
+
 // ── Regression: the common (non-closure) paths must still work unchanged ───────
 
 #[test]
