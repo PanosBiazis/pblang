@@ -129,6 +129,10 @@ struct TranspileCtx {
     function_arities: HashMap<String, usize>,
     /// Lexical variable scopes for generated PbVal variables.
     scopes: Vec<HashSet<String>>,
+    /// Variable-name -> C lvalue rewrite, used inside a closure for captured
+    /// variables that are MUTATED: they alias their env slot `(__env[j])` so the
+    /// mutation persists across calls (by-reference-style capture).
+    renames: HashMap<String, String>,
     pub warnings: Vec<String>,
 }
 
@@ -152,6 +156,7 @@ impl TranspileCtx {
             function_names: HashSet::new(),
             function_arities: HashMap::new(),
             scopes: vec![HashSet::new()],
+            renames: HashMap::new(),
             warnings: Vec::new(),
         }
     }
@@ -202,6 +207,12 @@ impl TranspileCtx {
         self.scopes.iter().rev().any(|scope| scope.contains(name))
     }
 
+    /// The C lvalue for a local variable, honoring closure capture renames
+    /// (a mutated captured var aliases its env slot).
+    fn var_ref(&self, name: &str) -> String {
+        self.renames.get(name).cloned().unwrap_or_else(|| name.to_string())
+    }
+
     /// Variables a closure body references from the enclosing scope, in
     /// first-seen order. These are captured by value. Names bound inside the
     /// closure (its params, and its own let/for/fn bindings) are excluded, and
@@ -213,6 +224,77 @@ impl TranspileCtx {
         let mut seen: HashSet<String> = HashSet::new();
         walk_stmts(body, &mut bound, &mut out, &mut seen);
         out.into_iter().filter(|n| self.is_local_var(n)).collect()
+    }
+
+    /// Emit a function-literal / closure body and return the C expression that
+    /// constructs its value. Captures enclosing locals by value; a captured var
+    /// that is MUTATED inside the body aliases its env slot so the mutation
+    /// persists across the closure's calls (by-reference-style). Captureless
+    /// closures become static singletons (no heap allocation).
+    fn emit_closure(&mut self, params: &[Param], body: &[Stmt]) -> String {
+        let arity = params.len();
+        // Capture analysis happens in the ENCLOSING scope (before we switch).
+        let captures = self.compute_captures(params, body);
+        // The env-build expressions, evaluated NOW (outer renames apply).
+        let env_exprs: Vec<String> = captures.iter().map(|c| self.var_ref(c)).collect();
+        // Which captures are reassigned inside the body -> alias their env slot.
+        let mutated = collect_assigned(body);
+
+        let id = self.fresh_tmp();
+        let c_fn_name = format!("pb_clo{id}");
+        self.forward_decls
+            .push_str(&format!("static PbVal {c_fn_name}(PbVal*, PbVal*, size_t);\n"));
+
+        let prev_buf = std::mem::take(&mut self.fn_buf);
+        let prev_target = std::mem::replace(&mut self.target, OutputTarget::Function);
+        let prev_indent = self.indent;
+        let prev_scopes = std::mem::replace(&mut self.scopes, vec![HashSet::new()]);
+        let prev_renames = std::mem::take(&mut self.renames);
+        self.indent = 1;
+
+        self.fn_buf.push_str(&format!(
+            "static PbVal {c_fn_name}(PbVal* __env, PbVal* __args, size_t __nargs) {{\n"
+        ));
+        self.emit("(void)__env; (void)__args; (void)__nargs;");
+        for (i, p) in params.iter().enumerate() {
+            self.emit(&format!(
+                "PbVal {pn} = (__nargs > {i}) ? __args[{i}] : PB_NIL;",
+                pn = p.name
+            ));
+            self.declare_var(&p.name);
+        }
+        for (j, cap) in captures.iter().enumerate() {
+            if mutated.contains(cap) {
+                // By-reference: alias the env slot; mutation persists across calls.
+                self.renames.insert(cap.clone(), format!("(__env[{j}])"));
+            } else {
+                self.emit(&format!("PbVal {cap} = __env[{j}];"));
+            }
+            self.declare_var(cap);
+        }
+        for s in body.iter().cloned() {
+            self.emit_stmt(s);
+        }
+        self.emit("return PB_NIL;");
+        self.fn_buf.push_str("}\n\n");
+
+        let fn_code = std::mem::replace(&mut self.fn_buf, prev_buf);
+        self.functions.push_str(&fn_code);
+        self.target = prev_target;
+        self.indent = prev_indent;
+        self.scopes = prev_scopes;
+        self.renames = prev_renames;
+
+        if captures.is_empty() {
+            self.forward_decls.push_str(&format!(
+                "static PbClosure pb_clov{id} = {{ {c_fn_name}, {arity}, 0, NULL }};\n"
+            ));
+            format!("pb_fn_as_val(&pb_clov{id})")
+        } else {
+            let env = env_exprs.join(", ");
+            let k = captures.len();
+            format!("pb_make_closure((PbFnPtr){c_fn_name}, {arity}, (PbVal[]){{{env}}}, {k})")
+        }
     }
 
     fn transpile_program(&mut self, stmts: Vec<Stmt>) {
@@ -263,7 +345,8 @@ impl TranspileCtx {
             }
             StmtKind::Assign(name, expr) => {
                 let rhs = self.emit_expr_str(&expr.kind);
-                self.emit(&format!("{name} = {rhs};"));
+                let target = self.var_ref(&name);
+                self.emit(&format!("{target} = {rhs};"));
             }
             StmtKind::SetAttr(obj, attr, val) => {
                 let obj_s = self.emit_expr_str(&obj.kind);
@@ -408,6 +491,14 @@ impl TranspileCtx {
                 let s = self.emit_expr_str(&e.kind);
                 self.emit(&format!("/* defer */ pb_defer_push({s});"));
             }
+            StmtKind::Fn(name, params, _ret, body) if self.target == OutputTarget::Function => {
+                // A nested function (defined inside another function body) is a
+                // local closure bound to a name. (Self-recursion isn't supported:
+                // the name isn't in scope inside its own body.)
+                let val = self.emit_closure(&params, &body);
+                self.emit(&format!("PbVal {name} = {val};"));
+                self.declare_var(&name);
+            }
             StmtKind::Fn(name, params, _ret, body) => {
                 let is_vararg = params.last().map(|p| p.is_vararg).unwrap_or(false);
                 let named_arity = if is_vararg {
@@ -549,7 +640,7 @@ impl TranspileCtx {
                 if let Some(b) = builtin_c_name(name) {
                     b.to_string()
                 } else if self.is_local_var(name) {
-                    name.clone()
+                    self.var_ref(name)
                 } else if self.function_names.contains(name) {
                     // A top-level function used as a VALUE -> the static closure
                     // singleton (no heap allocation).
@@ -715,65 +806,7 @@ impl TranspileCtx {
                 let c = self.emit_expr_str(&catch_expr.kind);
                 format!("pb_try({t}, {c})")
             }
-            ExprKind::FnLit(_name, params, _ret, body) => {
-                let arity = params.len();
-                // Variables the body references from the ENCLOSING scope are
-                // captured by value into the closure's env (computed before we
-                // switch scopes, so is_local_var sees the enclosing frame).
-                let captures = self.compute_captures(params, body);
-
-                let id = self.fresh_tmp();
-                let c_fn_name = format!("pb_clo{id}");
-                self.forward_decls
-                    .push_str(&format!("static PbVal {c_fn_name}(PbVal*, PbVal*, size_t);\n"));
-
-                // Emit the closure body (uniform ABI) into the functions buffer.
-                let prev_buf = std::mem::take(&mut self.fn_buf);
-                let prev_target = std::mem::replace(&mut self.target, OutputTarget::Function);
-                let prev_indent = self.indent;
-                let prev_scopes = std::mem::replace(&mut self.scopes, vec![HashSet::new()]);
-                self.indent = 1;
-
-                self.fn_buf.push_str(&format!(
-                    "static PbVal {c_fn_name}(PbVal* __env, PbVal* __args, size_t __nargs) {{\n"
-                ));
-                self.emit("(void)__env; (void)__args; (void)__nargs;");
-                for (i, p) in params.iter().enumerate() {
-                    self.emit(&format!(
-                        "PbVal {pn} = (__nargs > {i}) ? __args[{i}] : PB_NIL;",
-                        pn = p.name
-                    ));
-                    self.declare_var(&p.name);
-                }
-                for (j, cap) in captures.iter().enumerate() {
-                    self.emit(&format!("PbVal {cap} = __env[{j}];"));
-                    self.declare_var(cap);
-                }
-                for s in body.iter().cloned() {
-                    self.emit_stmt(s);
-                }
-                self.emit("return PB_NIL;");
-                self.fn_buf.push_str("}\n\n");
-
-                let fn_code = std::mem::replace(&mut self.fn_buf, prev_buf);
-                self.functions.push_str(&fn_code);
-                self.target = prev_target;
-                self.indent = prev_indent;
-                self.scopes = prev_scopes;
-
-                // Build the closure value, capturing the env by value at this site.
-                if captures.is_empty() {
-                    // No captures -> a static singleton, no per-evaluation malloc.
-                    self.forward_decls.push_str(&format!(
-                        "static PbClosure pb_clov{id} = {{ {c_fn_name}, {arity}, 0, NULL }};\n"
-                    ));
-                    format!("pb_fn_as_val(&pb_clov{id})")
-                } else {
-                    let env = captures.join(", ");
-                    let k = captures.len();
-                    format!("pb_make_closure((PbFnPtr){c_fn_name}, {arity}, (PbVal[]){{{env}}}, {k})")
-                }
-            }
+            ExprKind::FnLit(_name, params, _ret, body) => self.emit_closure(params, body),
             ExprKind::IfExpr(cond, then_br, else_br) => {
                 let cond_s = self.emit_expr_str(&cond.kind);
                 let tmp = self.fresh_tmp();
@@ -1022,6 +1055,34 @@ fn builtin_c_name(name: &str) -> Option<&'static str> {
         "error" => "pb_builtin_error",
         _ => return None,
     })
+}
+
+/// Names reassigned (`x = ...`) directly in a body or its control-flow blocks,
+/// NOT descending into nested function/closure literals (those handle their own
+/// captures). Used to decide which captured variables need by-reference aliasing.
+fn collect_assigned(stmts: &[Stmt]) -> HashSet<String> {
+    fn walk(stmts: &[Stmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Assign(n, _) => { out.insert(n.clone()); }
+                StmtKind::If(_, a, b) => {
+                    walk(a, out);
+                    if let Some(eb) = b { walk(eb, out); }
+                }
+                StmtKind::While(_, b)
+                | StmtKind::Loop(b)
+                | StmtKind::For(_, _, b)
+                | StmtKind::ForIn(_, _, b)
+                | StmtKind::ForInKV(_, _, _, b)
+                | StmtKind::Block(b)
+                | StmtKind::Seq(b) => walk(b, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(stmts, &mut out);
+    out
 }
 
 /// Record a referenced variable that is not bound inside the closure.
