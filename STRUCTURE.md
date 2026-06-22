@@ -1,5 +1,9 @@
 # pblang Project Structure
 
+> For a complete category map of every layer (crates, backends, stdlib domains,
+> kernel, tests, examples, editors, and sibling projects), see
+> [PROJECT_CATEGORIES.md](docs/PROJECT_CATEGORIES.md).
+
 ```text
 pblang/
 ├── src/
