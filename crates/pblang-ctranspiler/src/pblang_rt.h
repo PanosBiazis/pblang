@@ -36,19 +36,30 @@
 typedef struct PbVal PbVal;
 typedef struct PbArr PbArr;
 typedef struct PbMap PbMap;
-typedef PbVal (*PbFnPtr)(PbVal*, size_t);
+typedef struct PbClosure PbClosure;
+/* Uniform closure ABI: (captured env, arg array, arg count). Top-level
+   functions get a wrapper of this shape (empty env); fn-literals carry the
+   variables they capture in env. */
+typedef PbVal (*PbFnPtr)(PbVal*, PbVal*, size_t);
 
 /* ─── Value struct ─────────────────────────────────────────────────── */
 struct PbVal {
     uint8_t tag;
     union {
-        double   num;
-        bool     bval;
-        char*    str;       /* heap-allocated, null-terminated, shared */
-        PbArr*   arr;       /* reference-counted array */
-        PbMap*   map;       /* reference-counted map */
-        PbFnPtr  fn;
+        double      num;
+        bool        bval;
+        char*       str;    /* heap-allocated, null-terminated, shared */
+        PbArr*      arr;    /* reference-counted array */
+        PbMap*      map;    /* reference-counted map */
+        PbClosure*  clo;    /* function / closure */
     };
+};
+
+struct PbClosure {
+    PbFnPtr fn;
+    size_t  arity;
+    size_t  env_len;
+    PbVal*  env;        /* captured values, by value */
 };
 
 struct PbArr {
@@ -75,7 +86,6 @@ static inline PbVal pb_num(double n)         { PbVal v; v.tag=PB_TAG_NUM; v.num=
 #define PB_TRUE  (pb_bool(true))
 #define PB_FALSE (pb_bool(false))
 #define PB_NUM(n)(pb_num(n))
-#define PB_FN(f) (pb_fn_val((PbFnPtr)(f)))
 #define PB_STR(s)(pb_str_lit(s))
 
 /* ─── String allocation ───────────────────────────────────────────── */
@@ -92,8 +102,29 @@ static inline PbVal pb_str_lit(const char* s) {
     return v;
 }
 
-static inline PbVal pb_fn_val(PbFnPtr f) {
-    PbVal v; v.tag = PB_TAG_FN; v.fn = f; return v;
+/* ─── Closures / first-class functions ────────────────────────────── */
+static PbVal pb_make_closure(PbFnPtr fn, size_t arity, PbVal* env, size_t env_len) {
+    PbClosure* c = (PbClosure*)malloc(sizeof(PbClosure));
+    c->fn = fn; c->arity = arity; c->env_len = env_len;
+    if (env_len > 0) {
+        c->env = (PbVal*)malloc(sizeof(PbVal) * env_len);
+        for (size_t i = 0; i < env_len; i++) { c->env[i] = env[i]; }
+    } else {
+        c->env = NULL;
+    }
+    PbVal v; v.tag = PB_TAG_FN; v.clo = c; return v;
+}
+
+/* Wrap a statically-allocated closure as a value — no heap allocation. Used for
+   captureless function values (top-level functions and capture-free literals). */
+static inline PbVal pb_fn_as_val(PbClosure* c) {
+    PbVal v; v.tag = PB_TAG_FN; v.clo = c; return v;
+}
+
+/* Indirect call: invoke any function value with an argument array. */
+static PbVal pb_call(PbVal callee, PbVal* args, size_t n) {
+    if (callee.tag != PB_TAG_FN || callee.clo == NULL) { return PB_NIL; }
+    return callee.clo->fn(callee.clo->env, args, n);
 }
 
 /* ─── Array operations ────────────────────────────────────────────── */
