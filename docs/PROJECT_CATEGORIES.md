@@ -59,11 +59,12 @@ ctranspile · formatter · guard_preprocessor · builtins_list ·
 selfhost_frontend · bootstrap
 
 Plus the self-host bundling / output pipeline (`stdlib/`):
-`selfhost_bundle.sapp` (linker), `selfhost_to_pbck.sapp` (Rust `.pbck` writer),
-`selfhost_pbck.sapp` (self-hosted container: serialize/deserialize),
+`selfhost_bundle.sapp` (bytecode linker), `selfhost_to_pbck.sapp` (Rust `.pbck`
+writer), `selfhost_pbck.sapp` (self-hosted container: serialize/deserialize),
 `selfhost_loader.sapp` (`.pbck` loader: read a file from disk and execute it on
-the self-hosted VM — closes the compile→emit→disk→load→run loop), `linker.sapp`,
-`dist.sapp`
+the self-hosted VM — closes the compile→emit→disk→load→run loop),
+`source_inliner.sapp` (source-level linker: inline imports into one `.sapp` for
+native multi-module builds), `linker.sapp`, `dist.sapp`
 
 ## 6. Standard Library (201 `.sapp` modules) — `stdlib/`, by domain
 
