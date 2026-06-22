@@ -30,7 +30,9 @@ alongside the language: `ai/pbai` (the neural bridge) and
 
 - **`pblang-cranelift`** — Cranelift JIT + AOT native object emission
 - **`pblang-llvm`** — LLVM IR (`.ll`) text emitter → clang
-- **`pblang-ctranspiler`** — pblang → portable C99 (with `pblang_rt.h` runtime header)
+- **`pblang-ctranspiler`** — pblang → portable C99 (with `pblang_rt.h` runtime header);
+  supports closures + first-class functions via a uniform closure ABI (captureless
+  function values compile to zero-alloc static singletons)
 - **`pblang-wasm`** — WebAssembly (`.wat` / `.wasm`) backend
 - **`pblang-stub`** — self-extracting binary stub for standalone bundles
 
