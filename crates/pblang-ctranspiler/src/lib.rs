@@ -53,7 +53,8 @@
 //! | Break/Continue              | ✅        |
 //! | Arrays ([1,2,3])            | ✅        |
 //! | Maps (map{k:v})             | ✅        |
-//! | Closures (fn() captures env)| ⚠️ basic  |
+//! | Closures (fn() captures env)| ✅        |
+//! | First-class functions       | ✅        |
 //! | Try/catch                   | ✅        |
 //! | Throw                       | ✅        |
 //! | Print                       | ✅        |
@@ -63,9 +64,10 @@
 //! | Import/Export               | ❌ (future)|
 //! | Concurrency (spawn/channel) | ❌ (future)|
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
-use pblang_core::{ExprKind, FStringPart, LogicalOp, MatchArm, Stmt, StmtKind};
+use pblang_core::{ExprKind, FStringPart, LogicalOp, MatchArm, Param, Stmt, StmtKind};
 
 /// The pblang C runtime header — embedded in every generated C file.
 /// This header defines PbVal, memory management, and all builtin operations.
@@ -123,6 +125,8 @@ struct TranspileCtx {
     fn_buf: String,
     /// Top-level user function names collected before emission.
     function_names: HashSet<String>,
+    /// Top-level user function arities (named param count), for closure wrappers.
+    function_arities: HashMap<String, usize>,
     /// Lexical variable scopes for generated PbVal variables.
     scopes: Vec<HashSet<String>>,
     pub warnings: Vec<String>,
@@ -146,6 +150,7 @@ impl TranspileCtx {
             target: OutputTarget::Main,
             fn_buf: String::new(),
             function_names: HashSet::new(),
+            function_arities: HashMap::new(),
             scopes: vec![HashSet::new()],
             warnings: Vec::new(),
         }
@@ -197,18 +202,44 @@ impl TranspileCtx {
         self.scopes.iter().rev().any(|scope| scope.contains(name))
     }
 
+    /// Variables a closure body references from the enclosing scope, in
+    /// first-seen order. These are captured by value. Names bound inside the
+    /// closure (its params, and its own let/for/fn bindings) are excluded, and
+    /// only names that are locals in the CURRENT (enclosing) scope are kept —
+    /// builtins and top-level functions are not captured (they're global in C).
+    fn compute_captures(&self, params: &[Param], body: &[Stmt]) -> Vec<String> {
+        let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        walk_stmts(body, &mut bound, &mut out, &mut seen);
+        out.into_iter().filter(|n| self.is_local_var(n)).collect()
+    }
+
     fn transpile_program(&mut self, stmts: Vec<Stmt>) {
         // First pass: collect all top-level fn declarations for forward decls
         for s in &stmts {
             if let StmtKind::Fn(name, params, _ret, _body) = &s.kind {
                 self.function_names.insert(name.clone());
                 let arity = params.len();
+                self.function_arities.insert(name.clone(), arity);
                 let param_str = (0..arity)
                     .map(|i| format!("PbVal a{i}"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.forward_decls
                     .push_str(&format!("PbVal pb_fn_{name}({param_str});\n"));
+                // Uniform-ABI wrapper so the function can be used as a value,
+                // plus a static closure singleton (captureless -> no malloc).
+                let named = if params.last().map(|p| p.is_vararg).unwrap_or(false) {
+                    arity.saturating_sub(1)
+                } else {
+                    arity
+                };
+                self.forward_decls
+                    .push_str(&format!("PbVal pb_fnw_{name}(PbVal*, PbVal*, size_t);\n"));
+                self.forward_decls.push_str(&format!(
+                    "static PbClosure pb_clov_{name} = {{ pb_fnw_{name}, {named}, 0, NULL }};\n"
+                ));
             }
         }
 
@@ -440,6 +471,20 @@ impl TranspileCtx {
                 self.emit("return PB_NIL; /* fallthrough */");
 
                 self.fn_buf.push_str("}\n\n");
+
+                // Uniform-ABI wrapper: lets this function be used as a first-class
+                // value (stored, passed, called indirectly via pb_call).
+                let mut call_args: Vec<String> = (0..named_arity)
+                    .map(|i| format!("(__n > {i}) ? __a[{i}] : PB_NIL"))
+                    .collect();
+                if is_vararg {
+                    call_args.push("pb_arr_new(0)".to_string());
+                }
+                self.fn_buf.push_str(&format!(
+                    "PbVal pb_fnw_{name}(PbVal* __e, PbVal* __a, size_t __n) {{\n    (void)__e; (void)__a; (void)__n;\n    return pb_fn_{name}({});\n}}\n\n",
+                    call_args.join(", ")
+                ));
+
                 let fn_code = std::mem::replace(&mut self.fn_buf, prev_buf);
                 self.functions.push_str(&fn_code);
                 self.target = prev_target;
@@ -501,41 +546,16 @@ impl TranspileCtx {
                 format!("PB_STR(\"{}\")", escaped)
             }
             ExprKind::Var(name) => {
-                // Check if it's a builtin
-                match name.as_str() {
-                    "len" => "pb_builtin_len".to_string(),
-                    "str" => "pb_builtin_str".to_string(),
-                    "type" => "pb_builtin_type".to_string(),
-                    "print" => "pb_builtin_print".to_string(),
-                    "array_push" => "pb_builtin_array_push".to_string(),
-                    "array_pop" => "pb_builtin_array_pop".to_string(),
-                    "map_keys" => "pb_builtin_map_keys".to_string(),
-                    "json_parse" => "pb_builtin_json_parse".to_string(),
-                    "json_stringify" => "pb_builtin_json_stringify".to_string(),
-                    "sha256" => "pb_builtin_sha256".to_string(),
-                    "sleep_ms" => "pb_builtin_sleep_ms".to_string(),
-                    "clock" => "pb_builtin_clock".to_string(),
-                    "now_ms" => "pb_builtin_now_ms".to_string(),
-                    "parse_number" => "pb_builtin_parse_number".to_string(),
-                    "num_sqrt" => "pb_builtin_num_sqrt".to_string(),
-                    "num_floor" => "pb_builtin_num_floor".to_string(),
-                    "num_ceil" => "pb_builtin_num_ceil".to_string(),
-                    "num_abs" => "pb_builtin_num_abs".to_string(),
-                    "num_pow" => "pb_builtin_num_pow".to_string(),
-                    "str_contains" => "pb_builtin_str_contains".to_string(),
-                    "str_starts_with" => "pb_builtin_str_starts_with".to_string(),
-                    "str_ends_with" => "pb_builtin_str_ends_with".to_string(),
-                    "str_slice" => "pb_builtin_str_slice".to_string(),
-                    "str_split" => "pb_builtin_str_split".to_string(),
-                    "str_trim" => "pb_builtin_str_trim".to_string(),
-                    "str_upper" => "pb_builtin_str_upper".to_string(),
-                    "str_lower" => "pb_builtin_str_lower".to_string(),
-                    "str_replace_all" => "pb_builtin_str_replace_all".to_string(),
-                    "assert" => "pb_builtin_assert".to_string(),
-                    "error" => "pb_builtin_error".to_string(),
-                    _ if self.is_local_var(name) => name.clone(),
-                    _ if self.function_names.contains(name) => format!("pb_fn_{name}"),
-                    _ => name.clone(),
+                if let Some(b) = builtin_c_name(name) {
+                    b.to_string()
+                } else if self.is_local_var(name) {
+                    name.clone()
+                } else if self.function_names.contains(name) {
+                    // A top-level function used as a VALUE -> the static closure
+                    // singleton (no heap allocation).
+                    format!("pb_fn_as_val(&pb_clov_{name})")
+                } else {
+                    name.clone()
                 }
             }
             ExprKind::Add(a, b) => {
@@ -616,13 +636,31 @@ impl TranspileCtx {
                 format!("pb_coalesce({a}, {b})")
             }
             ExprKind::Call(callee, args) => {
-                let callee_s = self.emit_expr_str(&callee.kind);
                 let args_s = args
                     .iter()
                     .map(|a| self.emit_expr_str(&a.kind))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{callee_s}({args_s})")
+                // Fast direct path: builtins and top-level functions called by name
+                // (not shadowed by a local) compile to a plain positional C call.
+                if let ExprKind::Var(name) = &callee.kind {
+                    if !self.is_local_var(name) {
+                        if let Some(b) = builtin_c_name(name) {
+                            return format!("{b}({args_s})");
+                        }
+                        if self.function_names.contains(name) {
+                            return format!("pb_fn_{name}({args_s})");
+                        }
+                    }
+                }
+                // Indirect path: call a closure value through the uniform ABI.
+                let callee_s = self.emit_expr_str(&callee.kind);
+                let n = args.len();
+                if n == 0 {
+                    format!("pb_call({callee_s}, NULL, 0)")
+                } else {
+                    format!("pb_call({callee_s}, (PbVal[]){{{args_s}}}, {n})")
+                }
             }
             ExprKind::GetAttr(obj, attr) => {
                 let obj_s = self.emit_expr_str(&obj.kind);
@@ -677,30 +715,39 @@ impl TranspileCtx {
                 let c = self.emit_expr_str(&catch_expr.kind);
                 format!("pb_try({t}, {c})")
             }
-            ExprKind::FnLit(name, params, _ret, body) => {
-                // Inline anonymous functions: generate a named C function
-                let fn_name = name
-                    .clone()
-                    .unwrap_or_else(|| format!("__anon_{}", self.fresh_tmp()));
-                let c_fn_name = format!("pb_fn_{fn_name}");
+            ExprKind::FnLit(_name, params, _ret, body) => {
                 let arity = params.len();
-                let param_str = (0..arity)
-                    .map(|i| format!("PbVal a{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                // Variables the body references from the ENCLOSING scope are
+                // captured by value into the closure's env (computed before we
+                // switch scopes, so is_local_var sees the enclosing frame).
+                let captures = self.compute_captures(params, body);
 
-                // Emit function into functions buffer
+                let id = self.fresh_tmp();
+                let c_fn_name = format!("pb_clo{id}");
+                self.forward_decls
+                    .push_str(&format!("static PbVal {c_fn_name}(PbVal*, PbVal*, size_t);\n"));
+
+                // Emit the closure body (uniform ABI) into the functions buffer.
                 let prev_buf = std::mem::take(&mut self.fn_buf);
                 let prev_target = std::mem::replace(&mut self.target, OutputTarget::Function);
                 let prev_indent = self.indent;
                 let prev_scopes = std::mem::replace(&mut self.scopes, vec![HashSet::new()]);
                 self.indent = 1;
 
-                self.fn_buf
-                    .push_str(&format!("static PbVal {c_fn_name}({param_str}) {{\n"));
+                self.fn_buf.push_str(&format!(
+                    "static PbVal {c_fn_name}(PbVal* __env, PbVal* __args, size_t __nargs) {{\n"
+                ));
+                self.emit("(void)__env; (void)__args; (void)__nargs;");
                 for (i, p) in params.iter().enumerate() {
-                    self.emit(&format!("PbVal {pn} = a{i};", pn = p.name));
+                    self.emit(&format!(
+                        "PbVal {pn} = (__nargs > {i}) ? __args[{i}] : PB_NIL;",
+                        pn = p.name
+                    ));
                     self.declare_var(&p.name);
+                }
+                for (j, cap) in captures.iter().enumerate() {
+                    self.emit(&format!("PbVal {cap} = __env[{j}];"));
+                    self.declare_var(cap);
                 }
                 for s in body.iter().cloned() {
                     self.emit_stmt(s);
@@ -714,8 +761,18 @@ impl TranspileCtx {
                 self.indent = prev_indent;
                 self.scopes = prev_scopes;
 
-                // Return function pointer as PbVal
-                format!("PB_FN({c_fn_name})")
+                // Build the closure value, capturing the env by value at this site.
+                if captures.is_empty() {
+                    // No captures -> a static singleton, no per-evaluation malloc.
+                    self.forward_decls.push_str(&format!(
+                        "static PbClosure pb_clov{id} = {{ {c_fn_name}, {arity}, 0, NULL }};\n"
+                    ));
+                    format!("pb_fn_as_val(&pb_clov{id})")
+                } else {
+                    let env = captures.join(", ");
+                    let k = captures.len();
+                    format!("pb_make_closure((PbFnPtr){c_fn_name}, {arity}, (PbVal[]){{{env}}}, {k})")
+                }
             }
             ExprKind::IfExpr(cond, then_br, else_br) => {
                 let cond_s = self.emit_expr_str(&cond.kind);
@@ -927,4 +984,192 @@ fn find_ctranspiler_cc() -> Result<String, String> {
 /// Check if C compilation is available on this system.
 pub fn is_c_compiler_available() -> bool {
     find_ctranspiler_cc().is_ok()
+}
+
+/// Map a pblang builtin name to its C runtime function, if it is one.
+/// Shared by the variable and call emitters so both treat builtins identically.
+fn builtin_c_name(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "len" => "pb_builtin_len",
+        "str" => "pb_builtin_str",
+        "type" => "pb_builtin_type",
+        "print" => "pb_builtin_print",
+        "array_push" => "pb_builtin_array_push",
+        "array_pop" => "pb_builtin_array_pop",
+        "map_keys" => "pb_builtin_map_keys",
+        "json_parse" => "pb_builtin_json_parse",
+        "json_stringify" => "pb_builtin_json_stringify",
+        "sha256" => "pb_builtin_sha256",
+        "sleep_ms" => "pb_builtin_sleep_ms",
+        "clock" => "pb_builtin_clock",
+        "now_ms" => "pb_builtin_now_ms",
+        "parse_number" => "pb_builtin_parse_number",
+        "num_sqrt" => "pb_builtin_num_sqrt",
+        "num_floor" => "pb_builtin_num_floor",
+        "num_ceil" => "pb_builtin_num_ceil",
+        "num_abs" => "pb_builtin_num_abs",
+        "num_pow" => "pb_builtin_num_pow",
+        "str_contains" => "pb_builtin_str_contains",
+        "str_starts_with" => "pb_builtin_str_starts_with",
+        "str_ends_with" => "pb_builtin_str_ends_with",
+        "str_slice" => "pb_builtin_str_slice",
+        "str_split" => "pb_builtin_str_split",
+        "str_trim" => "pb_builtin_str_trim",
+        "str_upper" => "pb_builtin_str_upper",
+        "str_lower" => "pb_builtin_str_lower",
+        "str_replace_all" => "pb_builtin_str_replace_all",
+        "assert" => "pb_builtin_assert",
+        "error" => "pb_builtin_error",
+        _ => return None,
+    })
+}
+
+/// Record a referenced variable that is not bound inside the closure.
+fn record_ref(name: &str, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    if !bound.contains(name) && !seen.contains(name) {
+        seen.insert(name.to_string());
+        out.push(name.to_string());
+    }
+}
+
+/// Walk a statement list for free-variable collection, threading `bound`
+/// (names bound so far at this level — e.g. earlier `let`s are visible later).
+fn walk_stmts(stmts: &[Stmt], bound: &mut HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    for s in stmts {
+        walk_stmt(&s.kind, bound, out, seen);
+    }
+}
+
+fn walk_block(stmts: &[Stmt], bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    // A nested block gets its own scope: bindings inside don't leak outward.
+    let mut inner = bound.clone();
+    walk_stmts(stmts, &mut inner, out, seen);
+}
+
+fn walk_stmt(s: &StmtKind, bound: &mut HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match s {
+        StmtKind::Print(e) | StmtKind::PrintF(_, e) | StmtKind::Throw(e) | StmtKind::Defer(e) | StmtKind::Expr(e) => {
+            walk_expr(&e.kind, bound, out, seen);
+        }
+        StmtKind::Return(opt) => {
+            if let Some(e) = opt { walk_expr(&e.kind, bound, out, seen); }
+        }
+        StmtKind::Let(n, _, e) | StmtKind::Const(n, _, e) => {
+            walk_expr(&e.kind, bound, out, seen); // rhs sees the outer scope
+            bound.insert(n.clone());
+        }
+        StmtKind::Assign(n, e) => {
+            // Assignment target must exist as a C variable -> treat as a use.
+            record_ref(n, bound, out, seen);
+            walk_expr(&e.kind, bound, out, seen);
+        }
+        StmtKind::SetIndex(t, i, v) => {
+            walk_expr(&t.kind, bound, out, seen);
+            walk_expr(&i.kind, bound, out, seen);
+            walk_expr(&v.kind, bound, out, seen);
+        }
+        StmtKind::SetAttr(t, _, v) => {
+            walk_expr(&t.kind, bound, out, seen);
+            walk_expr(&v.kind, bound, out, seen);
+        }
+        StmtKind::If(c, then_b, else_b) => {
+            walk_expr(&c.kind, bound, out, seen);
+            walk_block(then_b, bound, out, seen);
+            if let Some(eb) = else_b { walk_block(eb, bound, out, seen); }
+        }
+        StmtKind::While(c, body) => {
+            walk_expr(&c.kind, bound, out, seen);
+            walk_block(body, bound, out, seen);
+        }
+        StmtKind::Loop(body) => walk_block(body, bound, out, seen),
+        StmtKind::For(n, e, body) | StmtKind::ForIn(n, e, body) => {
+            walk_expr(&e.kind, bound, out, seen);
+            let mut inner = bound.clone();
+            inner.insert(n.clone());
+            walk_stmts(body, &mut inner, out, seen);
+        }
+        StmtKind::ForInKV(k, v, e, body) => {
+            walk_expr(&e.kind, bound, out, seen);
+            let mut inner = bound.clone();
+            inner.insert(k.clone());
+            inner.insert(v.clone());
+            walk_stmts(body, &mut inner, out, seen);
+        }
+        StmtKind::Fn(name, params, _ret, body) => {
+            bound.insert(name.clone());
+            let mut inner = bound.clone();
+            for p in params { inner.insert(p.name.clone()); }
+            walk_stmts(body, &mut inner, out, seen);
+        }
+        StmtKind::Block(stmts) => walk_block(stmts, bound, out, seen),
+        StmtKind::Seq(stmts) => walk_stmts(stmts, bound, out, seen),
+        StmtKind::Break | StmtKind::Continue | StmtKind::Import(_) | StmtKind::Export(_) => {}
+    }
+}
+
+fn walk_expr(e: &ExprKind, bound: &HashSet<String>, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match e {
+        ExprKind::Var(n) => record_ref(n, bound, out, seen),
+        ExprKind::Number(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {}
+        ExprKind::Call(c, args) => {
+            walk_expr(&c.kind, bound, out, seen);
+            for a in args { walk_expr(&a.kind, bound, out, seen); }
+        }
+        ExprKind::GetAttr(o, _) | ExprKind::SafeGetAttr(o, _) | ExprKind::Not(o) | ExprKind::ResultUnwrap(o) => {
+            walk_expr(&o.kind, bound, out, seen);
+        }
+        ExprKind::Index(o, i) | ExprKind::SafeIndex(o, i) => {
+            walk_expr(&o.kind, bound, out, seen);
+            walk_expr(&i.kind, bound, out, seen);
+        }
+        ExprKind::Array(items) => { for it in items { walk_expr(&it.kind, bound, out, seen); } }
+        ExprKind::Map(pairs) => { for (_, v) in pairs { walk_expr(&v.kind, bound, out, seen); } }
+        ExprKind::Add(a, b) | ExprKind::Sub(a, b) | ExprKind::Mul(a, b) | ExprKind::Div(a, b)
+        | ExprKind::Mod(a, b) | ExprKind::Pow(a, b) | ExprKind::Eq(a, b) | ExprKind::NotEq(a, b)
+        | ExprKind::Gt(a, b) | ExprKind::Ge(a, b) | ExprKind::Lt(a, b) | ExprKind::Le(a, b)
+        | ExprKind::Try(a, b) | ExprKind::NullCoalesce(a, b) => {
+            walk_expr(&a.kind, bound, out, seen);
+            walk_expr(&b.kind, bound, out, seen);
+        }
+        ExprKind::Logical { left, right, .. } => {
+            walk_expr(&left.kind, bound, out, seen);
+            walk_expr(&right.kind, bound, out, seen);
+        }
+        ExprKind::IfExpr(c, t, e2) => {
+            walk_expr(&c.kind, bound, out, seen);
+            walk_expr(&t.kind, bound, out, seen);
+            walk_expr(&e2.kind, bound, out, seen);
+        }
+        ExprKind::Match(sc, arms, else_e) => {
+            walk_expr(&sc.kind, bound, out, seen);
+            for (arm, body) in arms {
+                let mut inner = bound.clone();
+                match arm {
+                    MatchArm::Bind(n) => { inner.insert(n.clone()); }
+                    MatchArm::BindGuard(n, g) => { inner.insert(n.clone()); walk_expr(&g.kind, &inner, out, seen); }
+                    MatchArm::Literal(_) | MatchArm::Wildcard => {}
+                }
+                walk_expr(&body.kind, &inner, out, seen);
+            }
+            if let Some(e2) = else_e { walk_expr(&e2.kind, bound, out, seen); }
+        }
+        ExprKind::FString(parts) => {
+            for p in parts {
+                if let FStringPart::Interp(e2) = p { walk_expr(&e2.kind, bound, out, seen); }
+            }
+        }
+        ExprKind::BlockExpr(stmts, tail) => {
+            let mut inner = bound.clone();
+            walk_stmts(stmts, &mut inner, out, seen);
+            if let Some(t) = tail { walk_expr(&t.kind, &inner, out, seen); }
+        }
+        ExprKind::FnLit(_, params, _ret, body) => {
+            // A nested closure: its free vars that come from OUR scope must also
+            // be captured by us (so we can pass them down). Recurse with the
+            // nested params bound.
+            let mut inner = bound.clone();
+            for p in params { inner.insert(p.name.clone()); }
+            walk_stmts(body, &mut inner, out, seen);
+        }
+    }
 }
