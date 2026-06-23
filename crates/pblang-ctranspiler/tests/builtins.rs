@@ -45,3 +45,44 @@ fn builtin_num_min_max() {
 fn builtin_push_alias() {
     assert_eq!(run("let a = [1, 2]; push(a, 3); push(a, 4); print len(a);"), "4");
 }
+
+#[test]
+fn builtin_num_mod() {
+    assert_eq!(run("print num_mod(17, 5); print num_mod(10, 2);"), "2\n0");
+}
+
+#[test]
+fn builtin_aggregations() {
+    assert_eq!(run("print sum([1, 2, 3, 4]);"), "10");
+    assert_eq!(run("print product([1, 2, 3, 4]);"), "24");
+    assert_eq!(run("print min_of([3, 1, 2]); print max_of([3, 1, 2]);"), "1\n3");
+}
+
+#[test]
+fn builtin_clamp() {
+    assert_eq!(run("print clamp(15, 0, 10); print clamp(0 - 3, 0, 10); print clamp(5, 0, 10);"), "10\n0\n5");
+}
+
+#[test]
+fn builtin_str_repeat() {
+    // str_repeat(_, 0) → "" prints a blank line, trimmed away by the harness.
+    assert_eq!(run("print str_repeat(\"ab\", 3); print str_repeat(\"x\", 0);"), "ababab");
+    assert_eq!(run("print str_repeat(\"x\", 0) == \"\";"), "true");
+}
+
+#[test]
+fn builtin_str_join() {
+    assert_eq!(run("print str_join([\"a\", \"b\", \"c\"], \"-\");"), "a-b-c");
+}
+
+#[test]
+fn builtin_map_remove() {
+    assert_eq!(run("let m = map{a: 1, b: 2}; print map_remove(m, \"a\"); print map_has(m, \"a\"); print map_has(m, \"b\");"), "1\nfalse\ntrue");
+}
+
+#[test]
+fn builtin_range() {
+    assert_eq!(run("print sum(range(5));"), "10");
+    assert_eq!(run("print sum(range(2, 5));"), "9");
+    assert_eq!(run("print len(range(0, 10, 2));"), "5");
+}

@@ -443,6 +443,116 @@ static PbVal pb_builtin_num_max(PbVal a, PbVal b) {
     if (a.tag != PB_TAG_NUM || b.tag != PB_TAG_NUM) return PB_NIL;
     return PB_NUM(a.num > b.num ? a.num : b.num);
 }
+/* num_mod(a, b) → a % b (IEEE remainder via fmod), matching the VM. */
+static PbVal pb_builtin_num_mod(PbVal a, PbVal b) {
+    if (a.tag != PB_TAG_NUM || b.tag != PB_TAG_NUM) return PB_NIL;
+    return PB_NUM(fmod(a.num, b.num));
+}
+/* clamp(v, lo, hi) → v.max(lo).min(hi), matching the VM's fold order. */
+static PbVal pb_builtin_clamp(PbVal v, PbVal lo, PbVal hi) {
+    if (v.tag != PB_TAG_NUM || lo.tag != PB_TAG_NUM || hi.tag != PB_TAG_NUM) return PB_NIL;
+    double x = v.num;
+    if (x < lo.num) x = lo.num;
+    if (x > hi.num) x = hi.num;
+    return PB_NUM(x);
+}
+/* sum(arr) → sum of numeric elements (non-numbers skipped); empty → 0. */
+static PbVal pb_builtin_sum(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return PB_NUM(0.0);
+    double s = 0.0;
+    for (size_t i = 0; i < arr.arr->len; i++)
+        if (arr.arr->data[i].tag == PB_TAG_NUM) s += arr.arr->data[i].num;
+    return PB_NUM(s);
+}
+/* product(arr) → product of numeric elements; empty → 1. */
+static PbVal pb_builtin_product(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return PB_NUM(1.0);
+    double p = 1.0;
+    for (size_t i = 0; i < arr.arr->len; i++)
+        if (arr.arr->data[i].tag == PB_TAG_NUM) p *= arr.arr->data[i].num;
+    return PB_NUM(p);
+}
+/* min_of(arr) → minimum numeric element, or nil when none. */
+static PbVal pb_builtin_min_of(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return PB_NIL;
+    bool seen = false; double m = 0.0;
+    for (size_t i = 0; i < arr.arr->len; i++) {
+        if (arr.arr->data[i].tag != PB_TAG_NUM) continue;
+        double x = arr.arr->data[i].num;
+        if (!seen || x < m) { m = x; seen = true; }
+    }
+    return seen ? PB_NUM(m) : PB_NIL;
+}
+/* max_of(arr) → maximum numeric element, or nil when none. */
+static PbVal pb_builtin_max_of(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return PB_NIL;
+    bool seen = false; double m = 0.0;
+    for (size_t i = 0; i < arr.arr->len; i++) {
+        if (arr.arr->data[i].tag != PB_TAG_NUM) continue;
+        double x = arr.arr->data[i].num;
+        if (!seen || x > m) { m = x; seen = true; }
+    }
+    return seen ? PB_NUM(m) : PB_NIL;
+}
+/* str_repeat(s, n) → s concatenated n times (n>=0). */
+static PbVal pb_builtin_str_repeat(PbVal s, PbVal n) {
+    if (s.tag != PB_TAG_STR || n.tag != PB_TAG_NUM || n.num < 0.0) return PB_STR("");
+    size_t reps = (size_t)n.num;
+    size_t sl = strlen(s.str);
+    char* out = (char*)malloc(sl * reps + 1);
+    char* op = out;
+    for (size_t i = 0; i < reps; i++) { memcpy(op, s.str, sl); op += sl; }
+    *op = 0;
+    PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
+}
+/* str_join(arr, sep) → join string elements with sep; non-strings → "". */
+static PbVal pb_builtin_str_join(PbVal arr, PbVal sep) {
+    if (arr.tag != PB_TAG_ARR || sep.tag != PB_TAG_STR) return PB_STR("");
+    size_t sepl = strlen(sep.str);
+    size_t total = 1;
+    for (size_t i = 0; i < arr.arr->len; i++) {
+        if (arr.arr->data[i].tag == PB_TAG_STR) total += strlen(arr.arr->data[i].str);
+        if (i + 1 < arr.arr->len) total += sepl;
+    }
+    char* out = (char*)malloc(total);
+    char* op = out;
+    for (size_t i = 0; i < arr.arr->len; i++) {
+        if (arr.arr->data[i].tag == PB_TAG_STR) {
+            size_t l = strlen(arr.arr->data[i].str);
+            memcpy(op, arr.arr->data[i].str, l); op += l;
+        }
+        if (i + 1 < arr.arr->len) { memcpy(op, sep.str, sepl); op += sepl; }
+    }
+    *op = 0;
+    PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
+}
+/* map_remove(m, key) → remove key (in place), return its value or nil. */
+static PbVal pb_builtin_map_remove(PbVal m, PbVal key) {
+    if (m.tag != PB_TAG_MAP || key.tag != PB_TAG_STR) return PB_NIL;
+    PbMap* mm = m.map;
+    for (size_t i = 0; i < mm->len; i++) {
+        if (strcmp(mm->entries[i].key, key.str) == 0) {
+            PbVal v = mm->entries[i].val;
+            for (size_t j = i + 1; j < mm->len; j++) mm->entries[j - 1] = mm->entries[j];
+            mm->len--;
+            return v;
+        }
+    }
+    return PB_NIL;
+}
+/* range(...) → [start, end) stepped; arity-specialized to keep the fast
+   positional call path. step!=0; ascending while i<end else descending. */
+static PbVal pb_builtin_range3(PbVal start, PbVal end, PbVal step) {
+    double s = start.tag == PB_TAG_NUM ? start.num : 0.0;
+    double e = end.tag == PB_TAG_NUM ? end.num : 0.0;
+    double st = (step.tag == PB_TAG_NUM && step.num != 0.0) ? step.num : 1.0;
+    PbVal arr = pb_arr_new(8);
+    if (st > 0.0) { for (double i = s; i < e; i += st) pb_arr_push(arr, PB_NUM(i)); }
+    else          { for (double i = s; i > e; i += st) pb_arr_push(arr, PB_NUM(i)); }
+    return arr;
+}
+static PbVal pb_builtin_range2(PbVal start, PbVal end) { return pb_builtin_range3(start, end, PB_NUM(1.0)); }
+static PbVal pb_builtin_range1(PbVal end) { return pb_builtin_range3(PB_NUM(0.0), end, PB_NUM(1.0)); }
 static PbVal pb_builtin_str_starts_with(PbVal s, PbVal prefix) {
     if (s.tag!=PB_TAG_STR || prefix.tag!=PB_TAG_STR) return PB_FALSE;
     return pb_bool(strncmp(s.str, prefix.str, strlen(prefix.str)) == 0);
