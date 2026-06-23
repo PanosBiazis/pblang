@@ -405,10 +405,12 @@ static jmp_buf* pb__catch_buf = NULL;
 static PbVal    pb__error_val;
 
 static PbVal pb_try(PbVal try_val, PbVal catch_val) {
-    /* Note: pb_try in C is evaluated eagerly — complex try/catch  */
-    /* requires restructuring to macro or statement form.           */
-    (void)catch_val;
-    return try_val; /* simplified: no exception propagation */
+    /* Eager evaluation: both operands are already computed. If the try
+       expression produced an error VALUE (e.g. error("x")), yield the catch
+       fallback — matching the VM. (A try-expr that THROWS/longjmps before this
+       point is a separate, deeper limitation.) */
+    if (try_val.tag == PB_TAG_ERR) return catch_val;
+    return try_val;
 }
 
 static void pb_throw(PbVal v) {

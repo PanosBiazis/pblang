@@ -781,7 +781,16 @@ impl TranspileCtx {
                         // A user-defined function shadows a builtin of the same
                         // name (matches the VM), so check function_names FIRST.
                         if self.function_names.contains(name) {
-                            return format!("pb_fn_{name}({args_s})");
+                            // pad omitted trailing args with PB_NIL so default
+                            // parameters fill in (the body uses pb_is_nil checks).
+                            let arity = self.function_arities.get(name).copied().unwrap_or(args.len());
+                            let mut a = args_s.clone();
+                            let mut k = args.len();
+                            while k < arity {
+                                if a.is_empty() { a.push_str("PB_NIL"); } else { a.push_str(", PB_NIL"); }
+                                k += 1;
+                            }
+                            return format!("pb_fn_{name}({a})");
                         }
                         // range() is variadic (1-3 args); dispatch to an
                         // arity-specialized helper so the fast positional path
