@@ -1,0 +1,145 @@
+// stdlib/debug.sapp — runtime debugging toolkit for pblang, in pure pblang.
+//
+// Built on the self-hosted frontend (frontend_run = compile+run = eval) and
+// stdlib/watch.sapp (heap/timing observability). Lets you:
+//   - run_source(src)            eval a snippet, capture output + globals
+//   - run_lines(src, a, b)       run ONLY a 1-based, inclusive line range
+//   - run_file_lines(path, a, b) the same, sourced from disk
+//   - eval_expr(expr)            the value of a single expression
+//   - trace_source(src)          run under a watcher: elapsed ms + allocations
+//   - disasm_lines(src, a, b)    bytecode of a line range
+// Everything degrades to {ok:false, error} instead of throwing, so a REPL or a
+// tool can drive it safely. No Rust; runs on the normal interpreter.
+
+let FE    = import("stdlib/compiler/selfhost_frontend.sapp");
+let watch = import("stdlib/watch.sapp");
+
+// Eval a source string. Never throws: compile/run failures come back as
+// { ok:false, error }. On success: { ok, output:[printed values], globals }.
+fn run_source(src) {
+    let r = try FE.frontend_run(src) catch nil;
+    if r == nil {
+        return map{ ok: false, error: "run_source: execution raised", output: [], globals: map{} };
+    }
+    if not (try r.ok catch false) {
+        return map{ ok: false, error: try r.error catch "run_source: compile failed",
+                    output: try r.output catch [], globals: map{} };
+    }
+    return map{ ok: true, output: r.output, globals: r.globals, error: nil };
+}
+
+// Slice a 1-based, inclusive line range out of a source string. Clamps to the
+// available lines; an empty/invalid range yields "".
+fn _extract_lines(src, start_line, end_line) {
+    let lines = str_split(src, "\n");
+    let n = len(lines);
+    let s = start_line; if s < 1 { s = 1; }
+    let e = end_line;   if e > n { e = n; }
+    let out = "";
+    let i = s;
+    while i <= e {
+        out = out + lines[i - 1];
+        if i < e { out = out + "\n"; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Run only lines [start_line, end_line] (1-based, inclusive) of `src`. The range
+// must be self-contained (anything it references must be defined within it).
+fn run_lines(src, start_line, end_line) {
+    let snippet = _extract_lines(src, start_line, end_line);
+    let r = run_source(snippet);
+    r.lines = snippet;
+    r.start_line = start_line;
+    r.end_line = end_line;
+    return r;
+}
+
+// run_lines, but read the source from a file first. Missing file -> ok:false.
+fn run_file_lines(path, start_line, end_line) {
+    let src = try fs_read(path) catch nil;
+    if src == nil or src == "" {
+        return map{ ok: false, error: "run_file_lines: cannot read " + str(path),
+                    output: [], globals: map{} };
+    }
+    return run_lines(src, start_line, end_line);
+}
+
+// Evaluate a single expression and return its value: { ok, value }.
+// (Compiles `let __debug_result = (<expr>);` and reads it back from globals.)
+fn eval_expr(expr) {
+    let r = run_source("let __debug_result = (" + str(expr) + ");");
+    if not r.ok { return map{ ok: false, error: r.error, value: nil }; }
+    return map{ ok: true, value: try r.globals.__debug_result catch nil, error: nil };
+}
+
+// Run a snippet under a watcher and report its cost: elapsed ms + the heap
+// allocation delta captured around the run. Uses stdlib/watch.sapp.
+fn trace_source(src) {
+    let w = watch.watcher("debug");
+    let res = watch.watch(w, "run", fn() { return run_source(src); });
+    let r = res.result;
+    return map{
+        ok: try r.ok catch false,
+        output: try r.output catch [],
+        globals: try r.globals catch map{},
+        ms: res.ms,
+        allocations: try res.delta.allocations catch map{}
+    };
+}
+
+// Disassemble a line range to a list of { index, op, name, operand }.
+fn disasm_lines(src, start_line, end_line) {
+    return watch.disasm(_extract_lines(src, start_line, end_line));
+}
+
+// Pure CLI adapter (no print / no exit, so it's testable) for tools/pbdebug.sapp.
+//   pbdebug <file> --lines A:B   run lines A..B of <file>
+//   pbdebug <file> --lines N     run a single line N
+//   pbdebug <file>               run the whole file
+//   pbdebug --expr "<expr>"      evaluate one expression, return its value
+// Returns { ok, exit_code, output, value, error }: 0 ok / 1 run-error / 2 usage.
+fn cli_run(args) {
+    let path = nil;
+    let lines = nil;
+    let expr = nil;
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--lines" and i + 1 < len(args) { lines = args[i + 1]; i = i + 2; }
+        else { if a == "--expr" and i + 1 < len(args) { expr = args[i + 1]; i = i + 2; }
+        else { if not str_starts_with(a, "--") and path == nil { path = a; i = i + 1; }
+        else { i = i + 1; } } }
+    }
+
+    if expr != nil {
+        let ev = eval_expr(expr);
+        if not ev.ok {
+            return map{ ok: false, exit_code: 1, output: [], value: nil, error: ev.error };
+        }
+        return map{ ok: true, exit_code: 0, output: [ev.value], value: ev.value, error: nil };
+    }
+
+    if path == nil {
+        return map{ ok: false, exit_code: 2, output: [], value: nil,
+                    error: "usage: pbdebug <file> [--lines A:B | --lines N] | --expr \"<expr>\"" };
+    }
+
+    let start_line = 1;
+    let end_line = 1000000000;
+    if lines != nil {
+        let parts = str_split(lines, ":");
+        start_line = parse_number(parts[0]);
+        if len(parts) > 1 { end_line = parse_number(parts[1]); } else { end_line = start_line; }
+    }
+
+    let r = run_file_lines(path, start_line, end_line);
+    if not r.ok {
+        return map{ ok: false, exit_code: 1, output: try r.output catch [], value: nil,
+                    error: try r.error catch "run failed" };
+    }
+    return map{ ok: true, exit_code: 0, output: r.output, value: nil, error: nil };
+}
+
+export run_source, run_lines, run_file_lines, eval_expr, trace_source, disasm_lines, cli_run;
