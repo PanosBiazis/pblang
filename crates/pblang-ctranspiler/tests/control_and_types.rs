@@ -92,6 +92,23 @@ fn float_formatting_shortest_roundtrip() {
 }
 
 #[test]
+fn default_parameters() {
+    // calling with fewer args must fill defaults (direct call pads with PB_NIL)
+    assert_eq!(
+        run("fn greet(name, greeting = \"Hi\") { return greeting + \" \" + name; } print greet(\"Al\"); print greet(\"Bo\", \"Yo\");"),
+        "Hi Al\nYo Bo"
+    );
+    assert_eq!(run("fn f(a, b = 10, c = 100) { return a + b + c; } print f(1); print f(1, 2); print f(1, 2, 3);"), "111\n103\n6");
+}
+
+#[test]
+fn try_catch_error_value() {
+    // try-expr that yields an error value -> the catch fallback (matches the VM)
+    assert_eq!(run("let r = try error(\"boom\") catch 99; print r;"), "99");
+    assert_eq!(run("let r = try (10 / 2) catch 0; print r;"), "5");
+}
+
+#[test]
 fn user_function_shadows_builtin() {
     // `sum` is also a builtin; a user fn named `sum` must win (matches the VM),
     // else the recursion dispatches to pb_builtin_sum and returns 0.
