@@ -363,6 +363,32 @@ static inline bool pb_is_nil(PbVal v) { return v.tag == PB_TAG_NIL; }
 static PbVal pb_index(PbVal obj, PbVal idx) {
     if (obj.tag == PB_TAG_ARR) return pb_arr_get(obj, idx);
     if (obj.tag == PB_TAG_MAP) return pb_map_get(obj, idx);
+    if (obj.tag == PB_TAG_STR) {
+        /* codepoint-indexed: s[i] returns the i-th UTF-8 codepoint as a string
+           (matches the VM, and is consistent with len() counting codepoints). */
+        if (idx.tag != PB_TAG_NUM || idx.num < 0) return PB_NIL;
+        long want = (long)idx.num;
+        const unsigned char* p = (const unsigned char*)obj.str;
+        long cp = 0;
+        while (*p) {
+            if ((*p & 0xC0) != 0x80) {            /* lead byte of a codepoint */
+                if (cp == want) {
+                    int n = 1;
+                    if      ((*p & 0x80) == 0x00) n = 1;
+                    else if ((*p & 0xE0) == 0xC0) n = 2;
+                    else if ((*p & 0xF0) == 0xE0) n = 3;
+                    else if ((*p & 0xF8) == 0xF0) n = 4;
+                    char* out = (char*)malloc(n + 1);
+                    memcpy(out, p, n);
+                    out[n] = 0;
+                    PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
+                }
+                cp++;
+            }
+            p++;
+        }
+        return PB_NIL;                            /* out of range */
+    }
     return PB_NIL;
 }
 static PbVal pb_safe_index(PbVal obj, PbVal idx) {
