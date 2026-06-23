@@ -773,6 +773,12 @@ impl TranspileCtx {
                 // (not shadowed by a local) compile to a plain positional C call.
                 if let ExprKind::Var(name) = &callee.kind {
                     if !self.is_local_var(name) {
+                        // range() is variadic (1-3 args); dispatch to an
+                        // arity-specialized helper so the fast positional path
+                        // still applies.
+                        if name == "range" && (1..=3).contains(&args.len()) {
+                            return format!("pb_builtin_range{}({args_s})", args.len());
+                        }
                         if let Some(b) = builtin_c_name(name) {
                             return format!("{b}({args_s})");
                         }
@@ -1093,6 +1099,15 @@ fn builtin_c_name(name: &str) -> Option<&'static str> {
         "str_upper" => "pb_builtin_str_upper",
         "str_lower" => "pb_builtin_str_lower",
         "str_replace_all" => "pb_builtin_str_replace_all",
+        "str_repeat" => "pb_builtin_str_repeat",
+        "str_join" => "pb_builtin_str_join",
+        "num_mod" => "pb_builtin_num_mod",
+        "clamp" => "pb_builtin_clamp",
+        "sum" => "pb_builtin_sum",
+        "product" => "pb_builtin_product",
+        "min_of" => "pb_builtin_min_of",
+        "max_of" => "pb_builtin_max_of",
+        "map_remove" => "pb_builtin_map_remove",
         "assert" => "pb_builtin_assert",
         "error" => "pb_builtin_error",
         _ => return None,
