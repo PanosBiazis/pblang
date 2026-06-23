@@ -431,7 +431,7 @@ impl TranspileCtx {
             StmtKind::For(var, count, body) => {
                 let cnt = self.emit_expr_str(&count.kind);
                 let tmp_n = self.fresh_tmp();
-                self.emit(&format!("{{ PbVal {tmp_n} = {cnt}; for (PbVal {var} = PB_NUM(0.0); pb_lt({var}, {tmp_n}); {var} = PB_NUM(pb_num({var}) + 1.0)) {{"));
+                self.emit(&format!("{{ PbVal {tmp_n} = {cnt}; for (PbVal {var} = PB_NUM(0.0); pb_truthy(pb_lt({var}, {tmp_n})); {var} = PB_NUM({var}.num + 1.0)) {{"));
                 self.indent += 1;
                 self.push_scope();
                 self.declare_var(&var);
