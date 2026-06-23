@@ -395,6 +395,12 @@ static PbVal pb_safe_index(PbVal obj, PbVal idx) {
     if (obj.tag == PB_TAG_NIL) return PB_NIL;
     return pb_index(obj, idx);
 }
+
+/* Polymorphic indexed assignment obj[idx] = val: array slot or map key. */
+static void pb_set_index(PbVal obj, PbVal idx, PbVal val) {
+    if (obj.tag == PB_TAG_ARR) pb_arr_set(obj, idx, val);
+    else if (obj.tag == PB_TAG_MAP) pb_map_set(obj, idx, val);
+}
 static PbVal pb_safe_map_get(PbVal map, PbVal key) {
     if (map.tag == PB_TAG_NIL) return PB_NIL;
     return pb_map_get(map, key);
