@@ -1,0 +1,140 @@
+// stdlib/decimal_round.sapp — banking/trading-grade decimal rounding & allocation.
+//
+// pblang's `decimal` type is EXACT (arbitrary-precision base-10): 0.1 + 0.2 is
+// exactly 0.3, 1.005 * 100 is exactly 100.5, and summing has zero drift. What
+// finance additionally needs is CONTROLLED rounding — especially banker's
+// rounding (round half to even, the IEEE-754/GAAP/most-exchange default, which
+// avoids the upward bias of round-half-up over millions of operations) — and
+// penny-perfect allocation where the parts MUST sum back to the total.
+//
+// All rounding is done on the decimal's exact digit string (no float ever), with
+// carry handled by the exact bigint type. Modes: half_even (default), half_up,
+// half_down, floor, ceil, truncate.
+
+fn _digit(s, i) { return parse_number(s[i]); }
+
+fn _all_zero(ds) {
+    let i = 0;
+    while i < len(ds) { if ds[i] != "0" { return false; } i = i + 1; }
+    return true;
+}
+
+// Round the decimal-string `s` to `places` fractional digits under `mode`.
+// Returns a normalized decimal string (with sign, no float).
+fn _round_str(s, places, mode) {
+    let neg = false;
+    if len(s) > 0 and s[0] == "-" { neg = true; s = slice(s, 1, len(s)); }
+    let parts = str_split(s, ".");
+    let int_part = parts[0];
+    if int_part == "" { int_part = "0"; }
+    let frac = "";
+    if len(parts) > 1 { frac = parts[1]; }
+    // ensure at least one digit past the cut so there is a deciding digit
+    while len(frac) < places + 1 { frac = frac + "0"; }
+
+    let kept = slice(frac, 0, places);
+    let round_digit = _digit(frac, places);
+    // is anything beyond the deciding digit nonzero? (distinguishes exact half)
+    let rest_nonzero = false;
+    let k = places + 1;
+    while k < len(frac) { if _digit(frac, k) != 0 { rest_nonzero = true; } k = k + 1; }
+
+    // magnitude = floor(|value| * 10^places) as a digit string
+    let mag_str = int_part + kept;
+    let last_digit = parse_number(mag_str[len(mag_str) - 1]);
+    let last_even = (last_digit % 2) == 0;
+
+    let inc = false;
+    if mode == "truncate" { inc = false; }
+    else { if mode == "floor" { inc = neg and (round_digit != 0 or rest_nonzero); }
+    else { if mode == "ceil" { inc = (not neg) and (round_digit != 0 or rest_nonzero); }
+    else { if mode == "half_up" { inc = round_digit >= 5; }
+    else { if mode == "half_down" { inc = (round_digit > 5) or (round_digit == 5 and rest_nonzero); }
+    else {
+        // half_even (banker's): up if >5, down if <5, on exact-5 go to the even neighbor
+        if round_digit > 5 { inc = true; }
+        else { if round_digit == 5 {
+            if rest_nonzero { inc = true; } else { inc = not last_even; }
+        } else { inc = false; } }
+    } } } } }
+
+    let scaled = bigint(mag_str);
+    if inc { scaled = scaled + bigint(1); }
+    let ds = str(scaled);
+
+    let result = "";
+    if places == 0 {
+        result = ds;
+    } else {
+        while len(ds) < places + 1 { ds = "0" + ds; }   // left-pad so the point fits
+        let cut = len(ds) - places;
+        result = slice(ds, 0, cut) + "." + slice(ds, cut, len(ds));
+    }
+    if neg and not _all_zero(ds) { result = "-" + result; }
+    return result;
+}
+
+// Public rounding entry points → return an exact `decimal`.
+fn round_mode(d, places, mode) { return decimal(_round_str(str(d), places, mode)); }
+fn bankers(d, places)     { return decimal(_round_str(str(d), places, "half_even")); }
+fn quantize(d, places)    { return decimal(_round_str(str(d), places, "half_even")); }
+fn half_up(d, places)     { return decimal(_round_str(str(d), places, "half_up")); }
+fn half_down(d, places)   { return decimal(_round_str(str(d), places, "half_down")); }
+fn floor_to(d, places)    { return decimal(_round_str(str(d), places, "floor")); }
+fn ceil_to(d, places)     { return decimal(_round_str(str(d), places, "ceil")); }
+fn truncate_to(d, places) { return decimal(_round_str(str(d), places, "truncate")); }
+
+// One unit at the given scale: places=2 -> decimal("0.01"), places=0 -> decimal("1").
+fn _unit(places) {
+    if places <= 0 { return decimal("1"); }
+    let s = "0.";
+    let i = 1;
+    while i < places { s = s + "0"; i = i + 1; }
+    return decimal(s + "1");
+}
+
+// allocate(total, weights, places) — split `total` across `weights` so that each
+// part is quantized to `places` AND the parts sum EXACTLY to `total` (no lost or
+// phantom penny). Uses the largest-remainder method: floor every share, then hand
+// the leftover units one at a time to the parts with the biggest dropped fraction.
+fn allocate(total, weights, places = 2) {
+    let n = len(weights);
+    if n == 0 { return []; }
+    let wsum = decimal("0");
+    let i = 0;
+    while i < n { wsum = wsum + decimal(str(weights[i])); i = i + 1; }
+
+    let parts = [];
+    let remainders = [];
+    let allocated = decimal("0");
+    i = 0;
+    while i < n {
+        let raw = total * decimal(str(weights[i])) / wsum;
+        let q = truncate_to(raw, places);
+        push(parts, q);
+        push(remainders, raw - q);     // dropped fraction, for largest-remainder
+        allocated = allocated + q;
+        i = i + 1;
+    }
+
+    let unit = _unit(places);
+    // number of leftover units to distribute (exact: leftover is a multiple of unit)
+    let leftover = total - allocated;
+    let units_left = parse_number(_round_str(str(leftover / unit), 0, "half_up"));
+
+    let guard = 0;
+    while units_left > 0 and guard < n {
+        // pick the part with the largest dropped fraction (ties -> lowest index)
+        let mi = 0;
+        let mr = remainders[0];
+        let j = 1;
+        while j < n { if remainders[j] > mr { mr = remainders[j]; mi = j; } j = j + 1; }
+        parts[mi] = parts[mi] + unit;
+        remainders[mi] = decimal("-1");   // don't pick this one again
+        units_left = units_left - 1;
+        guard = guard + 1;
+    }
+    return parts;
+}
+
+export round_mode, bankers, quantize, half_up, half_down, floor_to, ceil_to, truncate_to, allocate;
