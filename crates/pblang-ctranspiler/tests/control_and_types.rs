@@ -111,6 +111,13 @@ fn logical_short_circuit() {
 }
 
 #[test]
+fn string_indexing_codepoints() {
+    // s[i] returns the i-th codepoint as a string (matches the VM)
+    assert_eq!(run("let s = \"abc\"; print s[0]; print s[2];"), "a\nc");
+    assert_eq!(run("let s = \"héllo\"; print s[1]; print len(s[1]);"), "é\n1");
+}
+
+#[test]
 fn len_counts_codepoints() {
     // len on a string counts Unicode codepoints, not UTF-8 bytes (matches the VM)
     assert_eq!(run("print len(\"café\"); print len(\"naïve\"); print len(\"abc\");"), "4\n5\n3");
