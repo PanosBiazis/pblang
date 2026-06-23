@@ -18,6 +18,10 @@ use super::diag::format_parse_error;
 use crate::parse_capability_flags;
 
 const TEST_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+// Watchdog: longest the parallel runner waits for ANY worker to report before
+// declaring the still-running groups hung. Converts an indefinite deadlock into a
+// bounded failure. Override with PBLANG_TEST_TIMEOUT_SECS.
+const TEST_RECV_TIMEOUT: Duration = Duration::from_secs(180);
 const AUTO_JOBS: usize = usize::MAX;
 const SMART_JOBS: usize = usize::MAX - 1;
 const DEFAULT_TEST_WORKER_RAM_MB: usize = 96;
@@ -362,6 +366,9 @@ pub(crate) fn handle_test(mut args: Vec<String>) {
             let mut active = 0usize;
             let mut next = 0usize;
             let mut results: Vec<Option<GroupRun>> = (0..groups.len()).map(|_| None).collect();
+            let recv_timeout = parse_env_usize("PBLANG_TEST_TIMEOUT_SECS")
+                .map(|s| Duration::from_secs(s as u64))
+                .unwrap_or(TEST_RECV_TIMEOUT);
 
             while next < groups.len() || active > 0 {
                 while active < jobs && next < groups.len() {
@@ -378,10 +385,38 @@ pub(crate) fn handle_test(mut args: Vec<String>) {
                     next += 1;
                     active += 1;
                 }
-                let result = rx.recv().expect("pblang test worker channel closed");
-                active -= 1;
-                let index = result.index;
-                results[index] = Some(result);
+                match rx.recv_timeout(recv_timeout) {
+                    Ok(result) => {
+                        active -= 1;
+                        let index = result.index;
+                        results[index] = Some(result);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // No worker reported within the watchdog window: the
+                        // dispatched-but-unreported groups are hung. Record them as
+                        // failures and stop waiting rather than deadlocking forever.
+                        let stuck: Vec<usize> =
+                            (0..next).filter(|i| results[*i].is_none()).collect();
+                        eprintln!(
+                            "pblang test: watchdog — {} worker(s) produced no result in {}s; \
+                             treating as failures (likely a hung/deadlocked test). \
+                             Re-run those files individually to investigate.",
+                            stuck.len(),
+                            recv_timeout.as_secs()
+                        );
+                        for i in stuck {
+                            let label = groups[i].file_path.display().to_string();
+                            eprintln!("  hung: {label}");
+                            failures.push((
+                                label,
+                                "test worker timed out (no result within watchdog window)".to_string(),
+                            ));
+                            failed += 1;
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
             groups.clear();
 
