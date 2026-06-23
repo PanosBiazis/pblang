@@ -108,6 +108,19 @@ fn builtin_array_unique() {
 }
 
 #[test]
+fn builtin_char_codes() {
+    assert_eq!(run("print strfromcharcode(65); print strfromcharcode(97);"), "A\na");
+    assert_eq!(run("print strcharcodeat(\"ABC\", 1);"), "66");
+    // round-trip incl. a multi-byte codepoint
+    assert_eq!(run("print strfromcharcode(233); print strcharcodeat(strfromcharcode(233), 0);"), "é\n233");
+}
+
+#[test]
+fn builtin_num_atan2() {
+    assert_eq!(run("print num_atan2(0.0, 1.0);"), "0");
+}
+
+#[test]
 fn builtin_str_pad() {
     assert_eq!(run("print str_pad_left(\"42\", 5, \"0\");"), "00042");
     assert_eq!(run("print str_pad_right(\"42\", 5, \"-\");"), "42---");

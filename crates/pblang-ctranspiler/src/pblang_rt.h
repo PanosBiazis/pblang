@@ -620,9 +620,48 @@ static PbVal pb_builtin_range3(PbVal start, PbVal end, PbVal step) {
 static PbVal pb_builtin_range2(PbVal start, PbVal end) { return pb_builtin_range3(start, end, PB_NUM(1.0)); }
 static PbVal pb_builtin_range1(PbVal end) { return pb_builtin_range3(PB_NUM(0.0), end, PB_NUM(1.0)); }
 
-/* num_ln(x) → natural log; num_exp(x) → e^x. */
+/* num_ln(x) → natural log; num_exp(x) → e^x; num_atan2(y,x) → atan2. */
 static PbVal pb_builtin_num_ln(PbVal v)  { return PB_NUM(log(v.num)); }
 static PbVal pb_builtin_num_exp(PbVal v) { return PB_NUM(exp(v.num)); }
+static PbVal pb_builtin_num_atan2(PbVal y, PbVal x) { return PB_NUM(atan2(y.num, x.num)); }
+
+/* strfromcharcode(code) → the one Unicode codepoint, UTF-8 encoded. */
+static PbVal pb_builtin_strfromcharcode(PbVal code) {
+    if (code.tag != PB_TAG_NUM || code.num < 0) return PB_STR("");
+    long cp = (long)code.num;
+    char b[5]; int n;
+    if      (cp < 0x80)    { b[0] = (char)cp; n = 1; }
+    else if (cp < 0x800)   { b[0] = (char)(0xC0 | (cp >> 6)); b[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) { b[0] = (char)(0xE0 | (cp >> 12)); b[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
+    else                   { b[0] = (char)(0xF0 | (cp >> 18)); b[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); b[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); b[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
+    b[n] = 0;
+    char* out = (char*)malloc(n + 1); memcpy(out, b, n + 1);
+    PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
+}
+
+/* strcharcodeat(s, i) → codepoint value at codepoint index i (out of range → nil). */
+static PbVal pb_builtin_strcharcodeat(PbVal s, PbVal idx) {
+    if (s.tag != PB_TAG_STR || idx.tag != PB_TAG_NUM || idx.num < 0) return PB_NIL;
+    long want = (long)idx.num;
+    const unsigned char* p = (const unsigned char*)s.str;
+    long cp = 0;
+    while (*p) {
+        if ((*p & 0xC0) != 0x80) {
+            if (cp == want) {
+                unsigned long c; int n;
+                if      ((*p & 0x80) == 0x00) { c = *p; n = 1; }
+                else if ((*p & 0xE0) == 0xC0) { c = *p & 0x1F; n = 2; }
+                else if ((*p & 0xF0) == 0xE0) { c = *p & 0x0F; n = 3; }
+                else                          { c = *p & 0x07; n = 4; }
+                for (int k = 1; k < n; k++) if ((p[k] & 0xC0) == 0x80) c = (c << 6) | (p[k] & 0x3F);
+                return PB_NUM((double)c);
+            }
+            cp++;
+        }
+        p++;
+    }
+    return PB_NIL;
+}
 
 /* Value equality for numbers/strings/bools/nil; arrays/maps by identity.
    Mirrors the common cases of the VM's Value == Value. */
