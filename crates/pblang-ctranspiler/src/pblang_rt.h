@@ -241,6 +241,37 @@ static PbVal pb_map_keys(PbVal map) {
 }
 
 /* ─── String operations ───────────────────────────────────────────── */
+/* Shortest decimal that round-trips back to the same double — matches the VM's
+   (Rust) float Display: 1.0/3.0 -> "0.3333333333333333" not "0.333333", and
+   plain decimal (never exponential), so 0.000001 -> "0.000001" not "1e-06". */
+static void pb_fmt_double(char* buf, size_t bufsz, double n) {
+    int prec = 1;
+    while (prec <= 17) {
+        snprintf(buf, bufsz, "%.*g", prec, n);
+        if (strtod(buf, NULL) == n) break;
+        prec++;
+    }
+    if (prec > 17) { snprintf(buf, bufsz, "%.17g", n); return; }
+    /* %g may pick exponential form (e.g. 1e-06); Rust's Display never does.
+       Reformat in plain decimal with the fewest fractional digits that round-trip. */
+    if (strchr(buf, 'e') || strchr(buf, 'E')) {
+        char tmp[64];
+        for (int f = 0; f <= 30; f++) {
+            snprintf(tmp, sizeof(tmp), "%.*f", f, n);
+            if (strtod(tmp, NULL) == n) {
+                char* dot = strchr(tmp, '.');
+                if (dot) {
+                    char* end = tmp + strlen(tmp) - 1;
+                    while (end > dot && *end == '0') { *end-- = 0; }
+                    if (end == dot) { *end = 0; }
+                }
+                snprintf(buf, bufsz, "%s", tmp);
+                return;
+            }
+        }
+    }
+}
+
 static PbVal pb_to_str(PbVal v) {
     char buf[64];
     switch (v.tag) {
@@ -251,7 +282,7 @@ static PbVal pb_to_str(PbVal v) {
             if (v.num == (double)(long long)v.num && !isinf(v.num) && !isnan(v.num))
                 snprintf(buf, sizeof(buf), "%lld", (long long)v.num);
             else
-                snprintf(buf, sizeof(buf), "%g", v.num);
+                pb_fmt_double(buf, sizeof(buf), v.num);
             return pb_str_lit(buf);
         case PB_TAG_ARR:  return PB_STR("[array]");
         case PB_TAG_MAP:  return PB_STR("[map]");

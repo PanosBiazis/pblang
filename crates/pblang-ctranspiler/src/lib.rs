@@ -890,6 +890,19 @@ impl TranspileCtx {
                 let sc_tmp = self.fresh_tmp();
                 self.emit(&format!("PbVal {sc_tmp} = {sc};"));
                 self.emit(&format!("PbVal {tmp} = PB_NIL;"));
+                // Pre-declare any bound names: the if-chain assigns to them via the
+                // comma-expression condition, and the arm bodies read them, so they
+                // must be declared (and in scope) before the chain. Dedupe so a name
+                // bound by two arms isn't redeclared.
+                let mut declared_binds: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (arm, _) in arms.iter() {
+                    if let MatchArm::Bind(name) | MatchArm::BindGuard(name, _) = arm {
+                        if declared_binds.insert(name.clone()) {
+                            self.declare_var(name);
+                            self.emit(&format!("PbVal {name} = PB_NIL;"));
+                        }
+                    }
+                }
                 let mut first = true;
                 for (arm, body_expr) in arms {
                     let body_s = self.emit_expr_str(&body_expr.kind);
@@ -900,12 +913,9 @@ impl TranspileCtx {
                         }
                         MatchArm::Wildcard => "1".to_string(),
                         MatchArm::Bind(name) => {
-                            // Bind variable to scrutinee
-                            self.declare_var(name);
                             format!("({name} = {sc_tmp}, 1)")
                         }
                         MatchArm::BindGuard(name, guard) => {
-                            self.declare_var(name);
                             let g = self.emit_expr_str(&guard.kind);
                             format!("({name} = {sc_tmp}, pb_truthy({g}))")
                         }
