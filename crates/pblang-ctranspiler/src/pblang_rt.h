@@ -553,6 +553,93 @@ static PbVal pb_builtin_range3(PbVal start, PbVal end, PbVal step) {
 }
 static PbVal pb_builtin_range2(PbVal start, PbVal end) { return pb_builtin_range3(start, end, PB_NUM(1.0)); }
 static PbVal pb_builtin_range1(PbVal end) { return pb_builtin_range3(PB_NUM(0.0), end, PB_NUM(1.0)); }
+
+/* num_ln(x) → natural log; num_exp(x) → e^x. */
+static PbVal pb_builtin_num_ln(PbVal v)  { return PB_NUM(log(v.num)); }
+static PbVal pb_builtin_num_exp(PbVal v) { return PB_NUM(exp(v.num)); }
+
+/* Value equality for numbers/strings/bools/nil; arrays/maps by identity.
+   Mirrors the common cases of the VM's Value == Value. */
+static bool pb_val_eq(PbVal a, PbVal b) {
+    if (a.tag != b.tag) return false;
+    if (a.tag == PB_TAG_NUM)  return a.num == b.num;
+    if (a.tag == PB_TAG_BOOL) return a.bval == b.bval;
+    if (a.tag == PB_TAG_STR)  return strcmp(a.str, b.str) == 0;
+    if (a.tag == PB_TAG_NIL)  return true;
+    if (a.tag == PB_TAG_ARR)  return a.arr == b.arr;
+    if (a.tag == PB_TAG_MAP)  return a.map == b.map;
+    return false;
+}
+
+/* array_sort(arr) → NEW array: numbers ascending, strings lexicographic, mixed
+   left in place. Stable insertion sort to match the VM's sort_by stability. */
+static int pb_sort_cmp(PbVal x, PbVal y) {
+    if (x.tag == PB_TAG_NUM && y.tag == PB_TAG_NUM) {
+        if (x.num < y.num) return -1;
+        if (x.num > y.num) return 1;
+        return 0;
+    }
+    if (x.tag == PB_TAG_STR && y.tag == PB_TAG_STR) return strcmp(x.str, y.str);
+    return 0;
+}
+static PbVal pb_builtin_array_sort(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return pb_arr_new(0);
+    size_t n = arr.arr->len;
+    PbVal out = pb_arr_new(n);
+    for (size_t i = 0; i < n; i++) pb_arr_push(out, arr.arr->data[i]);
+    for (size_t i = 1; i < n; i++) {
+        PbVal cur = out.arr->data[i];
+        size_t j = i;
+        while (j > 0 && pb_sort_cmp(out.arr->data[j - 1], cur) > 0) {
+            out.arr->data[j] = out.arr->data[j - 1];
+            j--;
+        }
+        out.arr->data[j] = cur;
+    }
+    return out;
+}
+
+/* array_unique(arr) → NEW array, first-occurrence order, dedup by value. */
+static PbVal pb_builtin_array_unique(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return pb_arr_new(0);
+    PbVal out = pb_arr_new(8);
+    for (size_t i = 0; i < arr.arr->len; i++) {
+        PbVal v = arr.arr->data[i];
+        bool seen = false;
+        for (size_t k = 0; k < out.arr->len && !seen; k++)
+            if (pb_val_eq(out.arr->data[k], v)) seen = true;
+        if (!seen) pb_arr_push(out, v);
+    }
+    return out;
+}
+
+/* str_pad_left/right(s, width, pad) → pad s to `width` bytes with pad's first
+   char; if already at/over width, return s unchanged. */
+static PbVal pb_builtin_str_pad_left(PbVal s, PbVal width, PbVal pad) {
+    if (s.tag != PB_TAG_STR || width.tag != PB_TAG_NUM) return s;
+    size_t w = (size_t)(width.num < 0 ? 0 : width.num);
+    size_t cur = strlen(s.str);
+    if (cur >= w) return s;
+    char pc = (pad.tag == PB_TAG_STR && pad.str[0]) ? pad.str[0] : ' ';
+    char* out = (char*)malloc(w + 1);
+    size_t fill = w - cur;
+    for (size_t i = 0; i < fill; i++) out[i] = pc;
+    memcpy(out + fill, s.str, cur);
+    out[w] = 0;
+    PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
+}
+static PbVal pb_builtin_str_pad_right(PbVal s, PbVal width, PbVal pad) {
+    if (s.tag != PB_TAG_STR || width.tag != PB_TAG_NUM) return s;
+    size_t w = (size_t)(width.num < 0 ? 0 : width.num);
+    size_t cur = strlen(s.str);
+    if (cur >= w) return s;
+    char pc = (pad.tag == PB_TAG_STR && pad.str[0]) ? pad.str[0] : ' ';
+    char* out = (char*)malloc(w + 1);
+    memcpy(out, s.str, cur);
+    for (size_t i = cur; i < w; i++) out[i] = pc;
+    out[w] = 0;
+    PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
+}
 static PbVal pb_builtin_str_starts_with(PbVal s, PbVal prefix) {
     if (s.tag!=PB_TAG_STR || prefix.tag!=PB_TAG_STR) return PB_FALSE;
     return pb_bool(strncmp(s.str, prefix.str, strlen(prefix.str)) == 0);
