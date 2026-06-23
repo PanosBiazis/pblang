@@ -1,0 +1,270 @@
+// stdlib/secscan.sapp — defensive cybersecurity toolkit, in pure pblang.
+//
+// DEFENSIVE security only: detect hostile input, find leaked secrets, score
+// password strength, and redact sensitive data for safe logging. This is the
+// "spot and harden" half of security (a complement to the sanitizers in
+// stdlib/security.sapp and the primitives in stdlib/crypto.sapp). No attack
+// tooling — just classification, scanning, and hardening helpers.
+
+// ── char helpers ─────────────────────────────────────────────────────────────
+fn _is_lower(c) { return c >= 97 and c <= 122; }
+fn _is_upper(c) { return c >= 65 and c <= 90; }
+fn _is_digit(c) { return c >= 48 and c <= 57; }
+
+// A "token char": the alphabet of API keys / base64 / JWTs (alnum _ - + / .).
+fn _is_tok(c) {
+    if _is_lower(c) or _is_upper(c) or _is_digit(c) { return true; }
+    return c == 95 or c == 45 or c == 43 or c == 47 or c == 46;
+}
+
+fn _first(s, k) {
+    let out = "";
+    let i = 0;
+    let n = len(s);
+    while i < k and i < n { out = out + strfromcharcode(strcharcodeat(s, i)); i = i + 1; }
+    return out;
+}
+
+fn _count_dots(s) {
+    let n = 0;
+    let i = 0;
+    while i < len(s) { if strcharcodeat(s, i) == 46 { n = n + 1; } i = i + 1; }
+    return n;
+}
+
+// ── Shannon entropy (bits per character) ─────────────────────────────────────
+fn shannon_entropy(s) {
+    let n = len(s);
+    if n <= 1 { return 0.0; }
+    let freq = map{};
+    let i = 0;
+    while i < n {
+        let ch = strfromcharcode(strcharcodeat(s, i));
+        if map_has(freq, ch) { freq[ch] = freq[ch] + 1; } else { freq[ch] = 1; }
+        i = i + 1;
+    }
+    let keys = map_keys(freq);
+    let ln2 = num_ln(2.0);
+    let h = 0.0;
+    let k = 0;
+    while k < len(keys) {
+        let p = freq[keys[k]] / n;
+        h = h - p * (num_ln(p) / ln2);
+        k = k + 1;
+    }
+    return h;
+}
+
+// ── input threat detection ───────────────────────────────────────────────────
+// A small, conservative pattern table per attack class. Matched against the
+// LOWERCASED input so casing tricks don't evade it.
+let _ATTACKS = [
+    map{ type: "sql_injection", severity: "high", patterns:
+        ["' or ", " or 1=1", "union select", "'--", "; drop ", " or '1'='1", "xp_cmdshell", "' or '"] },
+    map{ type: "xss", severity: "high", patterns:
+        ["<script", "javascript:", "onerror=", "onload=", "<iframe", "document.cookie", "<img "] },
+    map{ type: "path_traversal", severity: "high", patterns:
+        ["../", "..\\", "%2e%2e", "/etc/passwd", "..%2f"] },
+    map{ type: "command_injection", severity: "high", patterns:
+        ["$(", "&&", "||", "`", "; rm ", "; cat ", "| sh", "| bash", "; wget ", "; curl "] },
+    map{ type: "null_byte", severity: "medium", patterns: ["%00"] },
+];
+
+// scan_input(s) → { safe, risk, threats:[{type, severity, evidence}] }.
+fn scan_input(s) {
+    let ls = str_lower(s);
+    let threats = [];
+    let ai = 0;
+    while ai < len(_ATTACKS) {
+        let atk = _ATTACKS[ai];
+        let hit = nil;
+        let pj = 0;
+        while pj < len(atk.patterns) and hit == nil {
+            if str_contains(ls, atk.patterns[pj]) { hit = atk.patterns[pj]; }
+            pj = pj + 1;
+        }
+        if hit != nil { push(threats, map{ type: atk.type, severity: atk.severity, evidence: hit }); }
+        ai = ai + 1;
+    }
+    let nhigh = 0;
+    let nmed = 0;
+    let ti = 0;
+    while ti < len(threats) {
+        if threats[ti].severity == "high" { nhigh = nhigh + 1; } else { nmed = nmed + 1; }
+        ti = ti + 1;
+    }
+    let risk = "none";
+    if nmed > 0 { risk = "low"; }
+    if nhigh == 1 { risk = "high"; }
+    if nhigh >= 2 { risk = "critical"; }
+    return map{ safe: len(threats) == 0, risk: risk, threats: threats };
+}
+
+// ── leaked-secret scanning ───────────────────────────────────────────────────
+// Split text into candidate tokens on the token-char alphabet.
+fn _tokens(text) {
+    let out = [];
+    let cur = "";
+    let i = 0;
+    let n = len(text);
+    while i < n {
+        let c = strcharcodeat(text, i);
+        if _is_tok(c) { cur = cur + strfromcharcode(c); }
+        else { if cur != "" { push(out, cur); cur = ""; } }
+        i = i + 1;
+    }
+    if cur != "" { push(out, cur); }
+    return out;
+}
+
+// Does the token mix upper + lower + digit? (typical of random keys, not URLs.)
+fn _has_mix(t) {
+    let up = false;
+    let lo = false;
+    let dg = false;
+    let i = 0;
+    while i < len(t) {
+        let c = strcharcodeat(t, i);
+        if _is_upper(c) { up = true; }
+        if _is_lower(c) { lo = true; }
+        if _is_digit(c) { dg = true; }
+        i = i + 1;
+    }
+    return up and lo and dg;
+}
+
+fn _classify_token(t) {
+    let n = len(t);
+    if str_starts_with(t, "ghp_") or str_starts_with(t, "gho_") or str_starts_with(t, "ghu_")
+       or str_starts_with(t, "ghs_") or str_starts_with(t, "ghr_") {
+        if n >= 20 { return "github_token"; }
+    }
+    if str_starts_with(t, "xoxb-") or str_starts_with(t, "xoxp-")
+       or str_starts_with(t, "xoxa-") or str_starts_with(t, "xoxr-") { return "slack_token"; }
+    if str_starts_with(t, "AKIA") and n == 20 { return "aws_access_key"; }
+    if str_starts_with(t, "eyJ") and _count_dots(t) == 2 { return "jwt"; }
+    if n >= 20 and _has_mix(t) and shannon_entropy(t) >= 3.5 { return "high_entropy_secret"; }
+    return nil;
+}
+
+fn _redact_token(t) { return _first(t, 4) + "***"; }
+
+// detect_secrets(text) → [{ type, redacted, preview, value }]. `value` is the raw
+// match (caller already holds the text); used by redact().
+fn detect_secrets(text) {
+    let found = [];
+    if str_contains(text, "-----BEGIN") and str_contains(text, "PRIVATE KEY") {
+        push(found, map{ type: "private_key", redacted: "-----BEGIN [REDACTED] PRIVATE KEY-----",
+                         preview: "-----BEGIN", value: nil });
+    }
+    let toks = _tokens(text);
+    let i = 0;
+    while i < len(toks) {
+        let t = toks[i];
+        let ty = _classify_token(t);
+        if ty != nil {
+            push(found, map{ type: ty, redacted: _redact_token(t), preview: _first(t, 4), value: t });
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+// redact(text) → text with detected token secrets masked (for safe logging).
+fn redact(text) {
+    let secrets = detect_secrets(text);
+    let out = text;
+    let i = 0;
+    while i < len(secrets) {
+        let v = secrets[i].value;
+        if v != nil { out = str_replace_all(out, v, secrets[i].redacted); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── password strength ────────────────────────────────────────────────────────
+// password_strength(pw) → graded score 0-4 from Shannon search-space entropy.
+fn password_strength(pw) {
+    let n = len(pw);
+    let lower = false;
+    let upper = false;
+    let digit = false;
+    let symbol = false;
+    let i = 0;
+    while i < n {
+        let c = strcharcodeat(pw, i);
+        if _is_lower(c) { lower = true; }
+        else { if _is_upper(c) { upper = true; }
+        else { if _is_digit(c) { digit = true; }
+        else { symbol = true; } } }
+        i = i + 1;
+    }
+    let charset = 0;
+    if lower { charset = charset + 26; }
+    if upper { charset = charset + 26; }
+    if digit { charset = charset + 10; }
+    if symbol { charset = charset + 33; }
+    let classes = 0;
+    if lower { classes = classes + 1; }
+    if upper { classes = classes + 1; }
+    if digit { classes = classes + 1; }
+    if symbol { classes = classes + 1; }
+    let bits = 0.0;
+    if charset > 0 and n > 0 { bits = n * (num_ln(charset) / num_ln(2.0)); }
+    let score = 0;
+    if bits >= 36 { score = 1; }
+    if bits >= 60 { score = 2; }
+    if bits >= 80 { score = 3; }
+    if bits >= 120 { score = 4; }
+    let verdict = "very_weak";
+    if score == 1 { verdict = "weak"; }
+    if score == 2 { verdict = "fair"; }
+    if score == 3 { verdict = "strong"; }
+    if score == 4 { verdict = "very_strong"; }
+    return map{
+        length: n, classes: classes, charset: charset, entropy_bits: bits,
+        score: score, verdict: verdict,
+        has_lower: lower, has_upper: upper, has_digit: digit, has_symbol: symbol
+    };
+}
+
+// Pure CLI adapter (no print / no exit) for tools/pbscan.sapp. Scans a file or
+// inline text for leaked secrets + hostile patterns. CI-style exit codes:
+// 0 clean / 1 findings / 2 usage|read-error.
+//   pbscan <file>            scan a file
+//   pbscan --text "<text>"   scan inline text
+fn cli_scan(args) {
+    let text = nil;
+    let source = nil;
+    let i = 0;
+    while i < len(args) {
+        let a = args[i];
+        if a == "--text" and i + 1 < len(args) { text = args[i + 1]; source = "<text>"; i = i + 2; }
+        else { if not str_starts_with(a, "--") and source == nil {
+            source = a;
+            text = try fs_read(a) catch nil;
+            i = i + 1;
+        } else { i = i + 1; } }
+    }
+    if source == nil {
+        return map{ ok: false, exit_code: 2, secrets: [], threats: [],
+                    error: "usage: pbscan <file> | --text \"<text>\"" };
+    }
+    if text == nil {
+        return map{ ok: false, exit_code: 2, secrets: [], threats: [],
+                    error: "pbscan: cannot read " + str(source) };
+    }
+    let secrets = detect_secrets(text);
+    let scan = scan_input(text);
+    let findings = len(secrets) + len(scan.threats);
+    let code = 0;
+    if findings > 0 { code = 1; }
+    return map{
+        ok: true, exit_code: code, source: source,
+        secrets: secrets, threats: scan.threats, risk: scan.risk,
+        findings: findings
+    };
+}
+
+export scan_input, detect_secrets, redact, password_strength, shannon_entropy, cli_scan;
