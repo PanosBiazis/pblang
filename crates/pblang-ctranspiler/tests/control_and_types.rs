@@ -128,6 +128,19 @@ fn logical_short_circuit() {
 }
 
 #[test]
+fn map_index_assignment() {
+    // m[key] = value must populate the map (was a no-op natively)
+    assert_eq!(run("let m = map{}; for i 50 { m[str(i)] = i * i; } print m[\"49\"]; print len(m);"), "2401\n50");
+    // overwrite an existing key
+    assert_eq!(run("let m = map{a: 1}; m[\"a\"] = 99; m[\"b\"] = 7; print m[\"a\"] + m[\"b\"];"), "106");
+}
+
+#[test]
+fn array_index_assignment_still_works() {
+    assert_eq!(run("let a = [1, 2, 3]; a[1] = 20; print a[0] + a[1] + a[2];"), "24");
+}
+
+#[test]
 fn string_indexing_codepoints() {
     // s[i] returns the i-th codepoint as a string (matches the VM)
     assert_eq!(run("let s = \"abc\"; print s[0]; print s[2];"), "a\nc");
