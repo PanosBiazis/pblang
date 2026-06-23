@@ -640,6 +640,82 @@ static PbVal pb_builtin_str_pad_right(PbVal s, PbVal width, PbVal pad) {
     out[w] = 0;
     PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
 }
+
+/* array_take(arr, n) → first n elements (capped at len). */
+static PbVal pb_builtin_array_take(PbVal arr, PbVal n) {
+    if (arr.tag != PB_TAG_ARR || n.tag != PB_TAG_NUM) return pb_arr_new(0);
+    size_t k = (size_t)(n.num < 0 ? 0 : n.num);
+    if (k > arr.arr->len) k = arr.arr->len;
+    PbVal out = pb_arr_new(k);
+    for (size_t i = 0; i < k; i++) pb_arr_push(out, arr.arr->data[i]);
+    return out;
+}
+
+/* array_drop(arr, n) → elements after the first n. */
+static PbVal pb_builtin_array_drop(PbVal arr, PbVal n) {
+    if (arr.tag != PB_TAG_ARR || n.tag != PB_TAG_NUM) return pb_arr_new(0);
+    size_t k = (size_t)(n.num < 0 ? 0 : n.num);
+    PbVal out = pb_arr_new(8);
+    for (size_t i = k; i < arr.arr->len; i++) pb_arr_push(out, arr.arr->data[i]);
+    return out;
+}
+
+/* array_chunk(arr, size) → array of sub-arrays of `size` (last may be smaller). */
+static PbVal pb_builtin_array_chunk(PbVal arr, PbVal size) {
+    if (arr.tag != PB_TAG_ARR || size.tag != PB_TAG_NUM || size.num < 1.0) return pb_arr_new(0);
+    size_t sz = (size_t)size.num;
+    PbVal out = pb_arr_new(8);
+    size_t i = 0;
+    while (i < arr.arr->len) {
+        PbVal chunk = pb_arr_new(sz);
+        size_t j = 0;
+        while (j < sz && i < arr.arr->len) { pb_arr_push(chunk, arr.arr->data[i]); i++; j++; }
+        pb_arr_push(out, chunk);
+    }
+    return out;
+}
+
+/* array_flatten(arr) → one level of nesting expanded; non-arrays kept. */
+static PbVal pb_builtin_array_flatten(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return pb_arr_new(0);
+    PbVal out = pb_arr_new(8);
+    for (size_t i = 0; i < arr.arr->len; i++) {
+        PbVal v = arr.arr->data[i];
+        if (v.tag == PB_TAG_ARR) {
+            for (size_t j = 0; j < v.arr->len; j++) pb_arr_push(out, v.arr->data[j]);
+        } else {
+            pb_arr_push(out, v);
+        }
+    }
+    return out;
+}
+
+/* array_zip(a, b) → [a_i, b_i] pairs, stopping at the shorter length. */
+static PbVal pb_builtin_array_zip(PbVal a, PbVal b) {
+    if (a.tag != PB_TAG_ARR || b.tag != PB_TAG_ARR) return pb_arr_new(0);
+    size_t n = a.arr->len < b.arr->len ? a.arr->len : b.arr->len;
+    PbVal out = pb_arr_new(n);
+    for (size_t i = 0; i < n; i++) {
+        PbVal pair = pb_arr_new(2);
+        pb_arr_push(pair, a.arr->data[i]);
+        pb_arr_push(pair, b.arr->data[i]);
+        pb_arr_push(out, pair);
+    }
+    return out;
+}
+
+/* enumerate(arr) → [index, value] pairs. */
+static PbVal pb_builtin_enumerate(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return pb_arr_new(0);
+    PbVal out = pb_arr_new(arr.arr->len);
+    for (size_t i = 0; i < arr.arr->len; i++) {
+        PbVal pair = pb_arr_new(2);
+        pb_arr_push(pair, PB_NUM((double)i));
+        pb_arr_push(pair, arr.arr->data[i]);
+        pb_arr_push(out, pair);
+    }
+    return out;
+}
 static PbVal pb_builtin_str_starts_with(PbVal s, PbVal prefix) {
     if (s.tag!=PB_TAG_STR || prefix.tag!=PB_TAG_STR) return PB_FALSE;
     return pb_bool(strncmp(s.str, prefix.str, strlen(prefix.str)) == 0);

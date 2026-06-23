@@ -113,3 +113,31 @@ fn builtin_str_pad() {
     assert_eq!(run("print str_pad_right(\"42\", 5, \"-\");"), "42---");
     assert_eq!(run("print str_pad_left(\"longer\", 3, \"0\");"), "longer");
 }
+
+#[test]
+fn builtin_array_take_drop() {
+    assert_eq!(run("let t = array_take([1,2,3,4,5], 2); print len(t); print t[1];"), "2\n2");
+    assert_eq!(run("let d = array_drop([1,2,3,4,5], 2); print len(d); print d[0];"), "3\n3");
+    assert_eq!(run("print len(array_take([1,2], 9));"), "2");
+}
+
+#[test]
+fn builtin_array_chunk() {
+    assert_eq!(run("let c = array_chunk([1,2,3,4,5], 2); print len(c); print c[0][1]; print c[2][0];"), "3\n2\n5");
+}
+
+#[test]
+fn builtin_array_flatten() {
+    assert_eq!(run("let f = array_flatten([[1,2],[3],[4,5]]); print len(f); print f[0]; print f[4];"), "5\n1\n5");
+    assert_eq!(run("let f = array_flatten([[1],2,[3]]); print len(f); print f[1];"), "3\n2");
+}
+
+#[test]
+fn builtin_array_zip() {
+    assert_eq!(run("let z = array_zip([1,2,3],[10,20]); print len(z); print z[0][0]; print z[0][1]; print z[1][1];"), "2\n1\n10\n20");
+}
+
+#[test]
+fn builtin_enumerate() {
+    assert_eq!(run("let e = enumerate([\"a\",\"b\"]); print len(e); print e[0][0]; print e[1][1];"), "2\n0\nb");
+}
