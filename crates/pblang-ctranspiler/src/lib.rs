@@ -384,7 +384,9 @@ impl TranspileCtx {
                 let obj_s = self.emit_expr_str(&obj.kind);
                 let idx_s = self.emit_expr_str(&idx.kind);
                 let val_s = self.emit_expr_str(&val.kind);
-                self.emit(&format!("pb_arr_set({obj_s}, {idx_s}, {val_s});"));
+                // polymorphic: array slot OR map key (pb_arr_set alone is a no-op
+                // on maps, which silently dropped `m[k] = v`).
+                self.emit(&format!("pb_set_index({obj_s}, {idx_s}, {val_s});"));
             }
             StmtKind::Print(e) => {
                 let s = self.emit_expr_str(&e.kind);
