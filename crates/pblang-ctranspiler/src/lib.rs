@@ -751,11 +751,16 @@ impl TranspileCtx {
                 format!("pb_not({s})")
             }
             ExprKind::Logical { left, op, right } => {
+                // Short-circuit: evaluate the left once; the ternary only evaluates
+                // the right when needed (a statement-expression keeps it inline and
+                // avoids re-evaluating the left). `and` returns left if falsy else
+                // right; `or` returns left if truthy else right (matches the VM).
                 let l = self.emit_expr_str(&left.kind);
                 let r = self.emit_expr_str(&right.kind);
+                let t = self.fresh_tmp();
                 match op {
-                    LogicalOp::And => format!("pb_and({l}, {r})"),
-                    LogicalOp::Or => format!("pb_or({l}, {r})"),
+                    LogicalOp::And => format!("({{ PbVal {t} = ({l}); pb_truthy({t}) ? ({r}) : {t}; }})"),
+                    LogicalOp::Or => format!("({{ PbVal {t} = ({l}); pb_truthy({t}) ? {t} : ({r}); }})"),
                 }
             }
             ExprKind::NullCoalesce(a, b) => {
@@ -773,6 +778,11 @@ impl TranspileCtx {
                 // (not shadowed by a local) compile to a plain positional C call.
                 if let ExprKind::Var(name) = &callee.kind {
                     if !self.is_local_var(name) {
+                        // A user-defined function shadows a builtin of the same
+                        // name (matches the VM), so check function_names FIRST.
+                        if self.function_names.contains(name) {
+                            return format!("pb_fn_{name}({args_s})");
+                        }
                         // range() is variadic (1-3 args); dispatch to an
                         // arity-specialized helper so the fast positional path
                         // still applies.
@@ -781,9 +791,6 @@ impl TranspileCtx {
                         }
                         if let Some(b) = builtin_c_name(name) {
                             return format!("{b}({args_s})");
-                        }
-                        if self.function_names.contains(name) {
-                            return format!("pb_fn_{name}({args_s})");
                         }
                     }
                 }
