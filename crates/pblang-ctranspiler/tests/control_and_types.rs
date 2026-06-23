@@ -92,6 +92,31 @@ fn float_formatting_shortest_roundtrip() {
 }
 
 #[test]
+fn user_function_shadows_builtin() {
+    // `sum` is also a builtin; a user fn named `sum` must win (matches the VM),
+    // else the recursion dispatches to pb_builtin_sum and returns 0.
+    assert_eq!(
+        run("fn sum(n) { if n == 0 { return 0; } return n + sum(n - 1); } print sum(100);"),
+        "5050"
+    );
+}
+
+#[test]
+fn logical_short_circuit() {
+    // the right operand must NOT be evaluated when the left settles the result
+    assert_eq!(run("fn boom() { throw \"x\"; } let r = false and boom(); print r;"), "false");
+    assert_eq!(run("fn boom() { throw \"x\"; } let r = true or boom(); print r;"), "true");
+    // and/or return the operand value (truthy semantics), not a bare bool
+    assert_eq!(run("print true and 5; print false or 9; print 7 and 8;"), "5\n9\n8");
+}
+
+#[test]
+fn len_counts_codepoints() {
+    // len on a string counts Unicode codepoints, not UTF-8 bytes (matches the VM)
+    assert_eq!(run("print len(\"café\"); print len(\"naïve\"); print len(\"abc\");"), "4\n5\n3");
+}
+
+#[test]
 fn enum_match_dispatch() {
     let src = "enum Shape { Empty, Circle(number), Rect(number, number) } \
                fn area(s) { return match s.__variant { \

@@ -400,7 +400,14 @@ static PbVal pb_result_unwrap(PbVal v) { return v; }
 /* ─── Builtins ───────────────────────────────────────────────────── */
 static PbVal pb_builtin_len(PbVal v) {
     if (v.tag == PB_TAG_ARR) return PB_NUM((double)v.arr->len);
-    if (v.tag == PB_TAG_STR) return PB_NUM((double)strlen(v.str));
+    if (v.tag == PB_TAG_STR) {
+        /* count UTF-8 codepoints (not bytes) to match the VM: a continuation
+           byte is 0b10xxxxxx, so count every byte that isn't one. */
+        size_t cnt = 0;
+        for (const unsigned char* p = (const unsigned char*)v.str; *p; p++)
+            if ((*p & 0xC0) != 0x80) cnt++;
+        return PB_NUM((double)cnt);
+    }
     if (v.tag == PB_TAG_MAP) return PB_NUM((double)v.map->len);
     return PB_NUM(0.0);
 }
