@@ -129,10 +129,11 @@ struct TranspileCtx {
     function_arities: HashMap<String, usize>,
     /// Lexical variable scopes for generated PbVal variables.
     scopes: Vec<HashSet<String>>,
-    /// Variable-name -> C lvalue rewrite, used inside a closure for captured
-    /// variables that are MUTATED: they alias their env slot `(__env[j])` so the
-    /// mutation persists across calls (by-reference-style capture).
-    renames: HashMap<String, String>,
+    /// Variables boxed as shared single-element arrays (heap cells): a local that
+    /// is captured by a nested closure AND mutated. Reads -> pb_index(x,0),
+    /// writes -> pb_arr_set(x,0,v); the box is captured by reference so all
+    /// closures + the enclosing scope share one mutable cell (VM upvalue parity).
+    boxed: HashSet<String>,
     pub warnings: Vec<String>,
 }
 
@@ -156,7 +157,7 @@ impl TranspileCtx {
             function_names: HashSet::new(),
             function_arities: HashMap::new(),
             scopes: vec![HashSet::new()],
-            renames: HashMap::new(),
+            boxed: HashSet::new(),
             warnings: Vec::new(),
         }
     }
@@ -207,10 +208,13 @@ impl TranspileCtx {
         self.scopes.iter().rev().any(|scope| scope.contains(name))
     }
 
-    /// The C lvalue for a local variable, honoring closure capture renames
-    /// (a mutated captured var aliases its env slot).
-    fn var_ref(&self, name: &str) -> String {
-        self.renames.get(name).cloned().unwrap_or_else(|| name.to_string())
+    /// C expression that READS a local variable (a boxed var dereferences its cell).
+    fn read_var(&self, name: &str) -> String {
+        if self.boxed.contains(name) {
+            format!("pb_index({name}, PB_NUM(0.0))")
+        } else {
+            name.to_string()
+        }
     }
 
     /// Variables a closure body references from the enclosing scope, in
@@ -235,10 +239,22 @@ impl TranspileCtx {
         let arity = params.len();
         // Capture analysis happens in the ENCLOSING scope (before we switch).
         let captures = self.compute_captures(params, body);
-        // The env-build expressions, evaluated NOW (outer renames apply).
-        let env_exprs: Vec<String> = captures.iter().map(|c| self.var_ref(c)).collect();
-        // Which captures are reassigned inside the body -> alias their env slot.
-        let mutated = collect_assigned(body);
+        // Env is built NOW, in the parent: a boxed parent var's C variable already
+        // holds the shared cell array, so the raw name shares it; a plain capture
+        // copies the current value. Either way it's just the variable name.
+        let env_exprs: Vec<String> = captures.iter().map(|c| c.clone()).collect();
+        // Which captures are boxed in the PARENT -> they stay boxed in the child.
+        let inherited: Vec<String> = captures
+            .iter()
+            .filter(|c| self.boxed.contains(*c))
+            .cloned()
+            .collect();
+
+        // The child's own boxed locals + inherited boxed captures.
+        let mut child_boxed = compute_boxed(params, body);
+        for c in &inherited {
+            child_boxed.insert(c.clone());
+        }
 
         let id = self.fresh_tmp();
         let c_fn_name = format!("pb_clo{id}");
@@ -249,7 +265,7 @@ impl TranspileCtx {
         let prev_target = std::mem::replace(&mut self.target, OutputTarget::Function);
         let prev_indent = self.indent;
         let prev_scopes = std::mem::replace(&mut self.scopes, vec![HashSet::new()]);
-        let prev_renames = std::mem::take(&mut self.renames);
+        let prev_boxed = std::mem::replace(&mut self.boxed, child_boxed);
         self.indent = 1;
 
         self.fn_buf.push_str(&format!(
@@ -257,19 +273,17 @@ impl TranspileCtx {
         ));
         self.emit("(void)__env; (void)__args; (void)__nargs;");
         for (i, p) in params.iter().enumerate() {
-            self.emit(&format!(
-                "PbVal {pn} = (__nargs > {i}) ? __args[{i}] : PB_NIL;",
-                pn = p.name
-            ));
+            let value = format!("(__nargs > {i}) ? __args[{i}] : PB_NIL");
+            if self.boxed.contains(&p.name) {
+                self.emit(&format!("PbVal {pn} = pb_arr_lit(1, {value});", pn = p.name));
+            } else {
+                self.emit(&format!("PbVal {pn} = {value};", pn = p.name));
+            }
             self.declare_var(&p.name);
         }
         for (j, cap) in captures.iter().enumerate() {
-            if mutated.contains(cap) {
-                // By-reference: alias the env slot; mutation persists across calls.
-                self.renames.insert(cap.clone(), format!("(__env[{j}])"));
-            } else {
-                self.emit(&format!("PbVal {cap} = __env[{j}];"));
-            }
+            // Captured value (a plain value, or — for boxed vars — the shared cell).
+            self.emit(&format!("PbVal {cap} = __env[{j}];"));
             self.declare_var(cap);
         }
         for s in body.iter().cloned() {
@@ -283,7 +297,7 @@ impl TranspileCtx {
         self.target = prev_target;
         self.indent = prev_indent;
         self.scopes = prev_scopes;
-        self.renames = prev_renames;
+        self.boxed = prev_boxed;
 
         if captures.is_empty() {
             self.forward_decls.push_str(&format!(
@@ -335,18 +349,29 @@ impl TranspileCtx {
         match stmt.kind {
             StmtKind::Let(name, _ty, init) => {
                 let rhs = self.emit_expr_str(&init.kind);
-                self.emit(&format!("PbVal {name} = {rhs};"));
+                if self.boxed.contains(&name) {
+                    self.emit(&format!("PbVal {name} = pb_arr_lit(1, {rhs});"));
+                } else {
+                    self.emit(&format!("PbVal {name} = {rhs};"));
+                }
                 self.declare_var(&name);
             }
             StmtKind::Const(name, _ty, init) => {
                 let rhs = self.emit_expr_str(&init.kind);
-                self.emit(&format!("PbVal {name} = {rhs}; /* const */"));
+                if self.boxed.contains(&name) {
+                    self.emit(&format!("PbVal {name} = pb_arr_lit(1, {rhs}); /* const */"));
+                } else {
+                    self.emit(&format!("PbVal {name} = {rhs}; /* const */"));
+                }
                 self.declare_var(&name);
             }
             StmtKind::Assign(name, expr) => {
                 let rhs = self.emit_expr_str(&expr.kind);
-                let target = self.var_ref(&name);
-                self.emit(&format!("{target} = {rhs};"));
+                if self.boxed.contains(&name) {
+                    self.emit(&format!("pb_arr_set({name}, PB_NUM(0.0), {rhs});"));
+                } else {
+                    self.emit(&format!("{name} = {rhs};"));
+                }
             }
             StmtKind::SetAttr(obj, attr, val) => {
                 let obj_s = self.emit_expr_str(&obj.kind);
@@ -492,12 +517,20 @@ impl TranspileCtx {
                 self.emit(&format!("/* defer */ pb_defer_push({s});"));
             }
             StmtKind::Fn(name, params, _ret, body) if self.target == OutputTarget::Function => {
-                // A nested function (defined inside another function body) is a
-                // local closure bound to a name. (Self-recursion isn't supported:
-                // the name isn't in scope inside its own body.)
-                let val = self.emit_closure(&params, &body);
-                self.emit(&format!("PbVal {name} = {val};"));
-                self.declare_var(&name);
+                // A nested function (inside a function body) is a local closure
+                // bound to a name. If it is boxed (captured + reassigned, e.g.
+                // self-recursive), declare the cell first so the closure can
+                // capture the box and call itself through it.
+                if self.boxed.contains(&name) {
+                    self.emit(&format!("PbVal {name} = pb_arr_lit(1, PB_NIL);"));
+                    self.declare_var(&name);
+                    let val = self.emit_closure(&params, &body);
+                    self.emit(&format!("pb_arr_set({name}, PB_NUM(0.0), {val});"));
+                } else {
+                    let val = self.emit_closure(&params, &body);
+                    self.emit(&format!("PbVal {name} = {val};"));
+                    self.declare_var(&name);
+                }
             }
             StmtKind::Fn(name, params, _ret, body) => {
                 let is_vararg = params.last().map(|p| p.is_vararg).unwrap_or(false);
@@ -523,26 +556,29 @@ impl TranspileCtx {
                 let prev_target = std::mem::replace(&mut self.target, OutputTarget::Function);
                 let prev_indent = self.indent;
                 let prev_scopes = std::mem::replace(&mut self.scopes, vec![HashSet::new()]);
+                let prev_boxed = std::mem::replace(&mut self.boxed, compute_boxed(&params, &body));
                 self.indent = 1;
 
                 // Function header
                 self.fn_buf
                     .push_str(&format!("PbVal pb_fn_{name}({param_str}) {{\n"));
 
-                // Bind named params
+                // Bind named params (a captured+mutated param is boxed).
                 for (i, p) in params.iter().enumerate().take(named_arity) {
                     let default_expr = p
                         .default
                         .as_ref()
                         .map(|d| self.emit_expr_str(&d.kind))
                         .unwrap_or_else(|| "PB_NIL".to_string());
-                    if p.default.is_some() {
-                        self.emit(&format!(
-                            "PbVal {pn} = pb_is_nil(a{i}) ? {default_expr} : a{i};",
-                            pn = p.name
-                        ));
+                    let value = if p.default.is_some() {
+                        format!("pb_is_nil(a{i}) ? {default_expr} : a{i}")
                     } else {
-                        self.emit(&format!("PbVal {pn} = a{i};", pn = p.name));
+                        format!("a{i}")
+                    };
+                    if self.boxed.contains(&p.name) {
+                        self.emit(&format!("PbVal {pn} = pb_arr_lit(1, {value});", pn = p.name));
+                    } else {
+                        self.emit(&format!("PbVal {pn} = {value};", pn = p.name));
                     }
                     self.declare_var(&p.name);
                 }
@@ -581,6 +617,7 @@ impl TranspileCtx {
                 self.target = prev_target;
                 self.indent = prev_indent;
                 self.scopes = prev_scopes;
+                self.boxed = prev_boxed;
             }
             StmtKind::Block(stmts) => {
                 self.emit("{");
@@ -640,7 +677,7 @@ impl TranspileCtx {
                 if let Some(b) = builtin_c_name(name) {
                     b.to_string()
                 } else if self.is_local_var(name) {
-                    self.var_ref(name)
+                    self.read_var(name)
                 } else if self.function_names.contains(name) {
                     // A top-level function used as a VALUE -> the static closure
                     // singleton (no heap allocation).
@@ -1028,8 +1065,13 @@ fn builtin_c_name(name: &str) -> Option<&'static str> {
         "type" => "pb_builtin_type",
         "print" => "pb_builtin_print",
         "array_push" => "pb_builtin_array_push",
+        "push" => "pb_builtin_array_push",
         "array_pop" => "pb_builtin_array_pop",
         "map_keys" => "pb_builtin_map_keys",
+        "map_has" => "pb_builtin_map_has",
+        "str_index_of" => "pb_builtin_str_index_of",
+        "num_min" => "pb_builtin_num_min",
+        "num_max" => "pb_builtin_num_max",
         "json_parse" => "pb_builtin_json_parse",
         "json_stringify" => "pb_builtin_json_stringify",
         "sha256" => "pb_builtin_sha256",
@@ -1057,32 +1099,149 @@ fn builtin_c_name(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Names reassigned (`x = ...`) directly in a body or its control-flow blocks,
-/// NOT descending into nested function/closure literals (those handle their own
-/// captures). Used to decide which captured variables need by-reference aliasing.
-fn collect_assigned(stmts: &[Stmt]) -> HashSet<String> {
-    fn walk(stmts: &[Stmt], out: &mut HashSet<String>) {
-        for s in stmts {
-            match &s.kind {
-                StmtKind::Assign(n, _) => { out.insert(n.clone()); }
-                StmtKind::If(_, a, b) => {
-                    walk(a, out);
-                    if let Some(eb) = b { walk(eb, out); }
-                }
-                StmtKind::While(_, b)
-                | StmtKind::Loop(b)
-                | StmtKind::For(_, _, b)
-                | StmtKind::ForIn(_, _, b)
-                | StmtKind::ForInKV(_, _, _, b)
-                | StmtKind::Block(b)
-                | StmtKind::Seq(b) => walk(b, out),
-                _ => {}
+// ── Boxing (heap-cell upvalue) analysis ──────────────────────────────────────
+// A local is BOXED if it is captured by a nested closure AND assigned somewhere
+// (so the mutation must be shared). Boxed locals become single-element arrays.
+
+/// Raw free variables of a closure body (referenced, not bound within it).
+/// walk_stmts already recurses into nested closures, so this is transitive.
+fn closure_free_vars(params: &[Param], body: &[Stmt]) -> Vec<String> {
+    let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    walk_stmts(body, &mut bound, &mut out, &mut seen);
+    out
+}
+
+/// Names captured by nested closures/fns defined directly in `stmts` (this
+/// function's scope) — collected WITHOUT descending into those closures.
+fn collect_nested_free(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Fn(_, params, _, body) => {
+                for v in closure_free_vars(params, body) { out.insert(v); }
             }
+            StmtKind::Let(_, _, e) | StmtKind::Const(_, _, e) | StmtKind::Assign(_, e)
+            | StmtKind::Print(e) | StmtKind::PrintF(_, e) | StmtKind::Throw(e)
+            | StmtKind::Defer(e) | StmtKind::Expr(e) => cnf_expr(&e.kind, out),
+            StmtKind::Return(o) => { if let Some(e) = o { cnf_expr(&e.kind, out); } }
+            StmtKind::SetIndex(a, b, c) => { cnf_expr(&a.kind, out); cnf_expr(&b.kind, out); cnf_expr(&c.kind, out); }
+            StmtKind::SetAttr(a, _, c) => { cnf_expr(&a.kind, out); cnf_expr(&c.kind, out); }
+            StmtKind::If(c, a, b) => { cnf_expr(&c.kind, out); collect_nested_free(a, out); if let Some(eb) = b { collect_nested_free(eb, out); } }
+            StmtKind::While(c, b) => { cnf_expr(&c.kind, out); collect_nested_free(b, out); }
+            StmtKind::Loop(b) => collect_nested_free(b, out),
+            StmtKind::For(_, e, b) | StmtKind::ForIn(_, e, b) => { cnf_expr(&e.kind, out); collect_nested_free(b, out); }
+            StmtKind::ForInKV(_, _, e, b) => { cnf_expr(&e.kind, out); collect_nested_free(b, out); }
+            StmtKind::Block(b) | StmtKind::Seq(b) => collect_nested_free(b, out),
+            _ => {}
         }
     }
-    let mut out = HashSet::new();
-    walk(stmts, &mut out);
-    out
+}
+
+fn cnf_expr(e: &ExprKind, out: &mut HashSet<String>) {
+    match e {
+        ExprKind::FnLit(_, params, _, body) => {
+            for v in closure_free_vars(params, body) { out.insert(v); }
+        }
+        ExprKind::Call(c, args) => { cnf_expr(&c.kind, out); for a in args { cnf_expr(&a.kind, out); } }
+        ExprKind::GetAttr(o, _) | ExprKind::SafeGetAttr(o, _) | ExprKind::Not(o) | ExprKind::ResultUnwrap(o) => cnf_expr(&o.kind, out),
+        ExprKind::Index(o, i) | ExprKind::SafeIndex(o, i) => { cnf_expr(&o.kind, out); cnf_expr(&i.kind, out); }
+        ExprKind::Array(items) => { for it in items { cnf_expr(&it.kind, out); } }
+        ExprKind::Map(pairs) => { for (_, v) in pairs { cnf_expr(&v.kind, out); } }
+        ExprKind::Add(a, b) | ExprKind::Sub(a, b) | ExprKind::Mul(a, b) | ExprKind::Div(a, b)
+        | ExprKind::Mod(a, b) | ExprKind::Pow(a, b) | ExprKind::Eq(a, b) | ExprKind::NotEq(a, b)
+        | ExprKind::Gt(a, b) | ExprKind::Ge(a, b) | ExprKind::Lt(a, b) | ExprKind::Le(a, b)
+        | ExprKind::Try(a, b) | ExprKind::NullCoalesce(a, b) => { cnf_expr(&a.kind, out); cnf_expr(&b.kind, out); }
+        ExprKind::Logical { left, right, .. } => { cnf_expr(&left.kind, out); cnf_expr(&right.kind, out); }
+        ExprKind::IfExpr(c, t, e2) => { cnf_expr(&c.kind, out); cnf_expr(&t.kind, out); cnf_expr(&e2.kind, out); }
+        ExprKind::Match(sc, arms, e2) => {
+            cnf_expr(&sc.kind, out);
+            for (_, b) in arms { cnf_expr(&b.kind, out); }
+            if let Some(e3) = e2 { cnf_expr(&e3.kind, out); }
+        }
+        ExprKind::FString(parts) => { for p in parts { if let FStringPart::Interp(e2) = p { cnf_expr(&e2.kind, out); } } }
+        ExprKind::BlockExpr(stmts, tail) => { collect_nested_free(stmts, out); if let Some(t) = tail { cnf_expr(&t.kind, out); } }
+        _ => {}
+    }
+}
+
+/// Names assigned anywhere (incl. inside nested closures), plus nested fn names
+/// (their let-style binding counts). Descends into closures.
+fn collect_assigned_deep(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Assign(n, e) => { out.insert(n.clone()); ad_expr(&e.kind, out); }
+            StmtKind::Fn(name, _, _, body) => { out.insert(name.clone()); collect_assigned_deep(body, out); }
+            StmtKind::Let(_, _, e) | StmtKind::Const(_, _, e) | StmtKind::Print(e)
+            | StmtKind::PrintF(_, e) | StmtKind::Throw(e) | StmtKind::Defer(e)
+            | StmtKind::Expr(e) => ad_expr(&e.kind, out),
+            StmtKind::Return(o) => { if let Some(e) = o { ad_expr(&e.kind, out); } }
+            StmtKind::SetIndex(a, b, c) => { ad_expr(&a.kind, out); ad_expr(&b.kind, out); ad_expr(&c.kind, out); }
+            StmtKind::SetAttr(a, _, c) => { ad_expr(&a.kind, out); ad_expr(&c.kind, out); }
+            StmtKind::If(c, a, b) => { ad_expr(&c.kind, out); collect_assigned_deep(a, out); if let Some(eb) = b { collect_assigned_deep(eb, out); } }
+            StmtKind::While(c, b) => { ad_expr(&c.kind, out); collect_assigned_deep(b, out); }
+            StmtKind::Loop(b) => collect_assigned_deep(b, out),
+            StmtKind::For(_, e, b) | StmtKind::ForIn(_, e, b) => { ad_expr(&e.kind, out); collect_assigned_deep(b, out); }
+            StmtKind::ForInKV(_, _, e, b) => { ad_expr(&e.kind, out); collect_assigned_deep(b, out); }
+            StmtKind::Block(b) | StmtKind::Seq(b) => collect_assigned_deep(b, out),
+            _ => {}
+        }
+    }
+}
+
+fn ad_expr(e: &ExprKind, out: &mut HashSet<String>) {
+    match e {
+        ExprKind::FnLit(_, _, _, body) => collect_assigned_deep(body, out),
+        ExprKind::Call(c, args) => { ad_expr(&c.kind, out); for a in args { ad_expr(&a.kind, out); } }
+        ExprKind::GetAttr(o, _) | ExprKind::SafeGetAttr(o, _) | ExprKind::Not(o) | ExprKind::ResultUnwrap(o) => ad_expr(&o.kind, out),
+        ExprKind::Index(o, i) | ExprKind::SafeIndex(o, i) => { ad_expr(&o.kind, out); ad_expr(&i.kind, out); }
+        ExprKind::Array(items) => { for it in items { ad_expr(&it.kind, out); } }
+        ExprKind::Map(pairs) => { for (_, v) in pairs { ad_expr(&v.kind, out); } }
+        ExprKind::Add(a, b) | ExprKind::Sub(a, b) | ExprKind::Mul(a, b) | ExprKind::Div(a, b)
+        | ExprKind::Mod(a, b) | ExprKind::Pow(a, b) | ExprKind::Eq(a, b) | ExprKind::NotEq(a, b)
+        | ExprKind::Gt(a, b) | ExprKind::Ge(a, b) | ExprKind::Lt(a, b) | ExprKind::Le(a, b)
+        | ExprKind::Try(a, b) | ExprKind::NullCoalesce(a, b) => { ad_expr(&a.kind, out); ad_expr(&b.kind, out); }
+        ExprKind::Logical { left, right, .. } => { ad_expr(&left.kind, out); ad_expr(&right.kind, out); }
+        ExprKind::IfExpr(c, t, e2) => { ad_expr(&c.kind, out); ad_expr(&t.kind, out); ad_expr(&e2.kind, out); }
+        ExprKind::Match(sc, arms, e2) => {
+            ad_expr(&sc.kind, out);
+            for (_, b) in arms { ad_expr(&b.kind, out); }
+            if let Some(e3) = e2 { ad_expr(&e3.kind, out); }
+        }
+        ExprKind::FString(parts) => { for p in parts { if let FStringPart::Interp(e2) = p { ad_expr(&e2.kind, out); } } }
+        ExprKind::BlockExpr(stmts, tail) => { collect_assigned_deep(stmts, out); if let Some(t) = tail { ad_expr(&t.kind, out); } }
+        _ => {}
+    }
+}
+
+/// This function's own local declarations (let/const + nested fn names), NOT
+/// descending into nested closures.
+fn collect_local_decls(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let(n, _, _) | StmtKind::Const(n, _, _) => { out.insert(n.clone()); }
+            StmtKind::Fn(name, _, _, _) => { out.insert(name.clone()); }
+            StmtKind::If(_, a, b) => { collect_local_decls(a, out); if let Some(eb) = b { collect_local_decls(eb, out); } }
+            StmtKind::While(_, b) | StmtKind::Loop(b) | StmtKind::For(_, _, b)
+            | StmtKind::ForIn(_, _, b) | StmtKind::ForInKV(_, _, _, b)
+            | StmtKind::Block(b) | StmtKind::Seq(b) => collect_local_decls(b, out),
+            _ => {}
+        }
+    }
+}
+
+/// Locals to box: captured by a nested closure AND assigned AND declared here.
+fn compute_boxed(params: &[Param], body: &[Stmt]) -> HashSet<String> {
+    let mut captured = HashSet::new();
+    collect_nested_free(body, &mut captured);
+    let mut assigned = HashSet::new();
+    collect_assigned_deep(body, &mut assigned);
+    let mut locals: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+    collect_local_decls(body, &mut locals);
+    captured
+        .into_iter()
+        .filter(|n| assigned.contains(n) && locals.contains(n))
+        .collect()
 }
 
 /// Record a referenced variable that is not bound inside the closure.

@@ -422,6 +422,27 @@ static PbVal pb_builtin_str_contains(PbVal s, PbVal needle) {
     if (s.tag!=PB_TAG_STR || needle.tag!=PB_TAG_STR) return PB_FALSE;
     return pb_bool(strstr(s.str, needle.str) != NULL);
 }
+static PbVal pb_builtin_map_has(PbVal m, PbVal key) {
+    if (m.tag != PB_TAG_MAP || key.tag != PB_TAG_STR) return PB_FALSE;
+    for (size_t i = 0; i < m.map->len; i++) {
+        if (strcmp(m.map->entries[i].key, key.str) == 0) return PB_TRUE;
+    }
+    return PB_FALSE;
+}
+static PbVal pb_builtin_str_index_of(PbVal s, PbVal needle) {
+    if (s.tag != PB_TAG_STR || needle.tag != PB_TAG_STR) return PB_NUM(-1.0);
+    char* found = strstr(s.str, needle.str);
+    if (found == NULL) return PB_NUM(-1.0);
+    return PB_NUM((double)(found - s.str));
+}
+static PbVal pb_builtin_num_min(PbVal a, PbVal b) {
+    if (a.tag != PB_TAG_NUM || b.tag != PB_TAG_NUM) return PB_NIL;
+    return PB_NUM(a.num < b.num ? a.num : b.num);
+}
+static PbVal pb_builtin_num_max(PbVal a, PbVal b) {
+    if (a.tag != PB_TAG_NUM || b.tag != PB_TAG_NUM) return PB_NIL;
+    return PB_NUM(a.num > b.num ? a.num : b.num);
+}
 static PbVal pb_builtin_str_starts_with(PbVal s, PbVal prefix) {
     if (s.tag!=PB_TAG_STR || prefix.tag!=PB_TAG_STR) return PB_FALSE;
     return pb_bool(strncmp(s.str, prefix.str, strlen(prefix.str)) == 0);
