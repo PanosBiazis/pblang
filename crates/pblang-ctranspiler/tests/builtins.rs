@@ -86,3 +86,30 @@ fn builtin_range() {
     assert_eq!(run("print sum(range(2, 5));"), "9");
     assert_eq!(run("print len(range(0, 10, 2));"), "5");
 }
+
+#[test]
+fn builtin_num_ln_exp() {
+    assert_eq!(run("print num_ln(1); print num_exp(0);"), "0\n1");
+}
+
+#[test]
+fn builtin_array_sort_numbers() {
+    assert_eq!(run("let a = array_sort([3, 1, 2]); print a[0]; print a[1]; print a[2];"), "1\n2\n3");
+}
+
+#[test]
+fn builtin_array_sort_strings() {
+    assert_eq!(run("let a = array_sort([\"banana\", \"apple\", \"cherry\"]); print a[0]; print a[2];"), "apple\ncherry");
+}
+
+#[test]
+fn builtin_array_unique() {
+    assert_eq!(run("let u = array_unique([1, 2, 2, 3, 1]); print len(u); print u[0]; print u[2];"), "3\n1\n3");
+}
+
+#[test]
+fn builtin_str_pad() {
+    assert_eq!(run("print str_pad_left(\"42\", 5, \"0\");"), "00042");
+    assert_eq!(run("print str_pad_right(\"42\", 5, \"-\");"), "42---");
+    assert_eq!(run("print str_pad_left(\"longer\", 3, \"0\");"), "longer");
+}
