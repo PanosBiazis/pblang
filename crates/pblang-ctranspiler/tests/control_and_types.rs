@@ -68,6 +68,30 @@ fn enum_unit_and_data_variants() {
 }
 
 #[test]
+fn match_bind_arm() {
+    // a bare-identifier arm binds the scrutinee; the binding must be declared in C
+    assert_eq!(run("let x = 42; let r = match x { case n: n * 2 }; print r;"), "84");
+}
+
+#[test]
+fn match_bind_guard_arm() {
+    assert_eq!(
+        run("let x = 7; let r = match x { case n if n > 5: \"big\"; case m: \"small\" }; print r;"),
+        "big"
+    );
+}
+
+#[test]
+fn float_formatting_shortest_roundtrip() {
+    // VM prints Rust's shortest round-trip; native must match (not %g 6-digit)
+    assert_eq!(run("print 1.0 / 3.0;"), "0.3333333333333333");
+    assert_eq!(run("print 0.1; print 1.5; print 2.0 / 4.0;"), "0.1\n1.5\n0.5");
+    assert_eq!(run("print 0.1 + 0.2;"), "0.30000000000000004");
+    // plain decimal, never exponential (matches Rust Display)
+    assert_eq!(run("print 0.000001; print 123456.789;"), "0.000001\n123456.789");
+}
+
+#[test]
 fn enum_match_dispatch() {
     let src = "enum Shape { Empty, Circle(number), Rect(number, number) } \
                fn area(s) { return match s.__variant { \
