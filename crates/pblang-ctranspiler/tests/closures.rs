@@ -132,6 +132,30 @@ fn independent_counters_do_not_share_state() {
     assert_eq!(out, "4"); // a:1, a:2, b:1
 }
 
+// ── Heap-cell upvalues: two closures SHARE one mutable captured variable ───────
+
+#[test]
+fn closures_share_mutable_captured_variable() {
+    // inc mutates n; get reads it; both must see the same heap cell.
+    let out = run(
+        "fn pair(){ let n = 0; \
+           let inc = fn(){ n = n + 1; return n; }; \
+           let get = fn(){ return n; }; \
+           inc(); inc(); return get(); } \
+         print pair();",
+    );
+    assert_eq!(out, "2");
+}
+
+#[test]
+fn self_recursive_nested_function() {
+    let out = run(
+        "fn outer(){ fn fact(k){ if k < 2 { return 1; } return k * fact(k - 1); } return fact(5); } \
+         print outer();",
+    );
+    assert_eq!(out, "120");
+}
+
 // ── Regression: the common (non-closure) paths must still work unchanged ───────
 
 #[test]
