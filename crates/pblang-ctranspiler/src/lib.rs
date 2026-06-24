@@ -1139,6 +1139,7 @@ fn builtin_c_name(name: &str) -> Option<&'static str> {
         "num_ln" => "pb_builtin_num_ln",
         "num_exp" => "pb_builtin_num_exp",
         "num_atan2" => "pb_builtin_num_atan2",
+        "decimal" => "pb_builtin_decimal",
         "strfromcharcode" => "pb_builtin_strfromcharcode",
         "strcharcodeat" => "pb_builtin_strcharcodeat",
         "array_sort" => "pb_builtin_array_sort",

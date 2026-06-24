@@ -31,12 +31,14 @@
 #define PB_TAG_MAP    5
 #define PB_TAG_FN     6
 #define PB_TAG_ERR    7
+#define PB_TAG_DEC    8   /* exact int128 fixed-point decimal */
 
 /* ─── Forward declarations ─────────────────────────────────────────── */
 typedef struct PbVal PbVal;
 typedef struct PbArr PbArr;
 typedef struct PbMap PbMap;
 typedef struct PbClosure PbClosure;
+typedef struct PbDecimal PbDecimal;
 /* Uniform closure ABI: (captured env, arg array, arg count). Top-level
    functions get a wrapper of this shape (empty env); fn-literals carry the
    variables they capture in env. */
@@ -52,7 +54,15 @@ struct PbVal {
         PbArr*      arr;    /* reference-counted array */
         PbMap*      map;    /* reference-counted map */
         PbClosure*  clo;    /* function / closure */
+        PbDecimal*  dec;    /* exact int128 fixed-point decimal */
     };
+};
+
+/* Exact fixed-point decimal: value = mantissa / 10^scale. int128 holds ~38
+   significant digits (ample for finance up to ~10^31). */
+struct PbDecimal {
+    __int128 mantissa;
+    int32_t  scale;
 };
 
 struct PbClosure {
@@ -272,10 +282,144 @@ static void pb_fmt_double(char* buf, size_t bufsz, double n) {
     }
 }
 
+/* ── exact int128 fixed-point decimal ───────────────────────────────────────
+   value = mantissa / 10^scale. Exact for +,-,*,compare within int128 range
+   (~38 digits); overflow yields an error value rather than a wrong answer. */
+static PbVal _pb_err(const char* m) { PbVal v; v.tag = PB_TAG_ERR; v.str = pb_strdup(m); return v; }
+
+static PbVal pb_dec_make(__int128 m, int scale) {
+    PbDecimal* d = (PbDecimal*)malloc(sizeof(PbDecimal));
+    d->mantissa = m; d->scale = scale;
+    PbVal v; v.tag = PB_TAG_DEC; v.dec = d; return v;
+}
+
+static __int128 _dec_pow10(int n, int* ovf) {
+    __int128 r = 1; *ovf = 0;
+    for (int i = 0; i < n; i++)
+        if (__builtin_mul_overflow(r, (__int128)10, &r)) { *ovf = 1; return 0; }
+    return r;
+}
+
+/* Parse "[+/-]int[.frac]" (no exponent) -> decimal; error on bad/overflow. */
+static PbVal pb_dec_from_str(const char* s) {
+    if (!s) return _pb_err("decimal: null");
+    int neg = 0; const char* p = s;
+    while (*p == ' ') p++;
+    if (*p == '-') { neg = 1; p++; } else if (*p == '+') { p++; }
+    __int128 m = 0; int scale = 0, seen = 0, after = 0;
+    for (; *p; p++) {
+        if (*p == '.') { if (after) return _pb_err("decimal: bad format"); after = 1; continue; }
+        if (*p < '0' || *p > '9') return _pb_err("decimal: bad character");
+        if (__builtin_mul_overflow(m, (__int128)10, &m)) return _pb_err("decimal: too large for int128");
+        if (__builtin_add_overflow(m, (__int128)(*p - '0'), &m)) return _pb_err("decimal: too large for int128");
+        seen = 1; if (after) scale++;
+    }
+    if (!seen) return _pb_err("decimal: no digits");
+    if (neg) m = -m;
+    return pb_dec_make(m, scale);
+}
+
+/* Promote NUM (via shortest decimal string) / STR to decimal; DEC unchanged. */
+static PbVal _dec_promote(PbVal v) {
+    if (v.tag == PB_TAG_DEC) return v;
+    if (v.tag == PB_TAG_NUM) {
+        char b[64];
+        if (v.num == (double)(long long)v.num && !isinf(v.num) && !isnan(v.num))
+            snprintf(b, sizeof(b), "%lld", (long long)v.num);
+        else
+            pb_fmt_double(b, sizeof(b), v.num);
+        return pb_dec_from_str(b);
+    }
+    if (v.tag == PB_TAG_STR) return pb_dec_from_str(v.str);
+    return _pb_err("decimal: cannot convert");
+}
+
+static int _i128_digits(__int128 m, char* buf) {  /* m >= 0 */
+    char tmp[48]; int n = 0;
+    if (m == 0) { buf[0] = '0'; buf[1] = 0; return 1; }
+    while (m > 0) { tmp[n++] = (char)('0' + (int)(m % 10)); m /= 10; }
+    for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    buf[n] = 0; return n;
+}
+
+static PbVal pb_dec_to_str(PbVal v) {
+    PbDecimal* d = v.dec;
+    __int128 m = d->mantissa; int scale = d->scale;
+    int neg = (m < 0); if (neg) m = -m;
+    char digits[48]; int nd = _i128_digits(m, digits);
+    char out[96]; int oi = 0;
+    if (neg) out[oi++] = '-';
+    if (scale <= 0) {
+        memcpy(out + oi, digits, nd); oi += nd;
+    } else {
+        char padded[96]; int pd;
+        if (nd <= scale) {
+            int lead = scale - nd + 1;
+            for (int i = 0; i < lead; i++) padded[i] = '0';
+            memcpy(padded + lead, digits, nd); pd = lead + nd;
+        } else {
+            memcpy(padded, digits, nd); pd = nd;
+        }
+        int point = pd - scale;
+        memcpy(out + oi, padded, point); oi += point;
+        int fracend = pd;  /* strip trailing zeros (VM normalizes 0.30 -> 0.3) */
+        while (fracend > point && padded[fracend - 1] == '0') fracend--;
+        if (fracend > point) {
+            out[oi++] = '.';
+            memcpy(out + oi, padded + point, fracend - point); oi += (fracend - point);
+        }
+    }
+    out[oi] = 0;
+    if (out[0] == '-' && out[1] == '0' && out[2] == 0) { out[0] = '0'; out[1] = 0; }  /* -0 -> 0 */
+    return pb_str_lit(out);
+}
+
+/* compare two decimals -> -1/0/1 (scale-insensitive) */
+static int _dec_cmp(PbVal a, PbVal b) {
+    __int128 ma = a.dec->mantissa, mb = b.dec->mantissa;
+    int sa = a.dec->scale, sb = b.dec->scale, ovf = 0;
+    if (sa < sb) { __int128 f = _dec_pow10(sb - sa, &ovf); if (ovf || __builtin_mul_overflow(ma, f, &ma)) goto fb; }
+    else if (sb < sa) { __int128 f = _dec_pow10(sa - sb, &ovf); if (ovf || __builtin_mul_overflow(mb, f, &mb)) goto fb; }
+    if (ma < mb) return -1; if (ma > mb) return 1; return 0;
+fb:;
+    long double la = (long double)a.dec->mantissa / powl(10.0L, (long double)sa);
+    long double lb = (long double)b.dec->mantissa / powl(10.0L, (long double)sb);
+    return la < lb ? -1 : (la > lb ? 1 : 0);
+}
+
+static PbVal pb_dec_add(PbVal a, PbVal b) {
+    PbVal da = _dec_promote(a), db = _dec_promote(b);
+    if (da.tag != PB_TAG_DEC) return da; if (db.tag != PB_TAG_DEC) return db;
+    __int128 ma = da.dec->mantissa, mb = db.dec->mantissa;
+    int sa = da.dec->scale, sb = db.dec->scale, sc = sa > sb ? sa : sb, ovf = 0;
+    if (sa < sc) { __int128 f = _dec_pow10(sc - sa, &ovf); if (ovf || __builtin_mul_overflow(ma, f, &ma)) return _pb_err("decimal: overflow in +"); }
+    if (sb < sc) { __int128 f = _dec_pow10(sc - sb, &ovf); if (ovf || __builtin_mul_overflow(mb, f, &mb)) return _pb_err("decimal: overflow in +"); }
+    __int128 r; if (__builtin_add_overflow(ma, mb, &r)) return _pb_err("decimal: overflow in +");
+    return pb_dec_make(r, sc);
+}
+static PbVal pb_dec_sub(PbVal a, PbVal b) {
+    PbVal da = _dec_promote(a), db = _dec_promote(b);
+    if (da.tag != PB_TAG_DEC) return da; if (db.tag != PB_TAG_DEC) return db;
+    __int128 ma = da.dec->mantissa, mb = db.dec->mantissa;
+    int sa = da.dec->scale, sb = db.dec->scale, sc = sa > sb ? sa : sb, ovf = 0;
+    if (sa < sc) { __int128 f = _dec_pow10(sc - sa, &ovf); if (ovf || __builtin_mul_overflow(ma, f, &ma)) return _pb_err("decimal: overflow in -"); }
+    if (sb < sc) { __int128 f = _dec_pow10(sc - sb, &ovf); if (ovf || __builtin_mul_overflow(mb, f, &mb)) return _pb_err("decimal: overflow in -"); }
+    __int128 r; if (__builtin_sub_overflow(ma, mb, &r)) return _pb_err("decimal: overflow in -");
+    return pb_dec_make(r, sc);
+}
+static PbVal pb_dec_mul(PbVal a, PbVal b) {
+    PbVal da = _dec_promote(a), db = _dec_promote(b);
+    if (da.tag != PB_TAG_DEC) return da; if (db.tag != PB_TAG_DEC) return db;
+    __int128 r; if (__builtin_mul_overflow(da.dec->mantissa, db.dec->mantissa, &r)) return _pb_err("decimal: overflow in *");
+    return pb_dec_make(r, da.dec->scale + db.dec->scale);
+}
+static PbVal pb_builtin_decimal(PbVal v) { return _dec_promote(v); }
+
 static PbVal pb_to_str(PbVal v) {
     char buf[64];
     switch (v.tag) {
         case PB_TAG_NIL:  return PB_STR("nil");
+        case PB_TAG_DEC:  return pb_dec_to_str(v);
         case PB_TAG_BOOL: return PB_STR(v.bval ? "true" : "false");
         case PB_TAG_STR:  return v;
         case PB_TAG_NUM:
@@ -313,17 +457,38 @@ static PbVal pb_str_concat_n(size_t n, ...) {
 /* ─── Arithmetic ──────────────────────────────────────────────────── */
 static PbVal pb_add(PbVal a, PbVal b) {
     if (a.tag == PB_TAG_NUM && b.tag == PB_TAG_NUM) return PB_NUM(a.num + b.num);
+    if (a.tag == PB_TAG_DEC || b.tag == PB_TAG_DEC) return pb_dec_add(a, b);
     if (a.tag == PB_TAG_STR || b.tag == PB_TAG_STR) return pb_str_concat(a, b);
     fprintf(stderr, "pblang: type error in +\n"); exit(1);
 }
-static PbVal pb_sub(PbVal a, PbVal b) { return PB_NUM(a.num - b.num); }
-static PbVal pb_mul(PbVal a, PbVal b) { return PB_NUM(a.num * b.num); }
-static PbVal pb_div(PbVal a, PbVal b) { if (b.num == 0.0) return PB_NUM(1.0/0.0); return PB_NUM(a.num / b.num); }
-static PbVal pb_mod(PbVal a, PbVal b) { return PB_NUM(fmod(a.num, b.num)); }
-static PbVal pb_pow(PbVal a, PbVal b) { return PB_NUM(pow(a.num, b.num)); }
+static PbVal pb_sub(PbVal a, PbVal b) {
+    if (a.tag == PB_TAG_DEC || b.tag == PB_TAG_DEC) return pb_dec_sub(a, b);
+    return PB_NUM(a.num - b.num);
+}
+static PbVal pb_mul(PbVal a, PbVal b) {
+    if (a.tag == PB_TAG_DEC || b.tag == PB_TAG_DEC) return pb_dec_mul(a, b);
+    return PB_NUM(a.num * b.num);
+}
+static PbVal pb_div(PbVal a, PbVal b) {
+    if (a.tag == PB_TAG_DEC || b.tag == PB_TAG_DEC) return _pb_err("decimal: division not yet supported natively (use the interpreter)");
+    if (b.num == 0.0) return PB_NUM(1.0/0.0); return PB_NUM(a.num / b.num);
+}
+static PbVal pb_mod(PbVal a, PbVal b) {
+    if (a.tag == PB_TAG_DEC || b.tag == PB_TAG_DEC) return _pb_err("decimal: modulo not supported");
+    return PB_NUM(fmod(a.num, b.num));
+}
+static PbVal pb_pow(PbVal a, PbVal b) {
+    if (a.tag == PB_TAG_DEC || b.tag == PB_TAG_DEC) return _pb_err("decimal: pow not yet supported natively");
+    return PB_NUM(pow(a.num, b.num));
+}
 
 /* ─── Comparisons ────────────────────────────────────────────────── */
 static bool pb_vals_equal(PbVal a, PbVal b) {
+    if (a.tag == PB_TAG_DEC || b.tag == PB_TAG_DEC) {
+        PbVal da = _dec_promote(a), db = _dec_promote(b);
+        if (da.tag != PB_TAG_DEC || db.tag != PB_TAG_DEC) return false;
+        return _dec_cmp(da, db) == 0;  /* scale-insensitive: 2 == 2.00 */
+    }
     if (a.tag != b.tag) return false;
     switch (a.tag) {
         case PB_TAG_NIL:  return true;
@@ -333,11 +498,17 @@ static bool pb_vals_equal(PbVal a, PbVal b) {
         default:          return a.arr == b.arr; /* pointer equality for composite types */
     }
 }
+/* decimal-aware comparison: returns INT_MIN sentinel if not both numeric-ish */
+static int _dec_cmp_vals(PbVal a, PbVal b) {
+    PbVal da = _dec_promote(a), db = _dec_promote(b);
+    if (da.tag != PB_TAG_DEC || db.tag != PB_TAG_DEC) return 2;  /* sentinel */
+    return _dec_cmp(da, db);
+}
 static PbVal pb_eq(PbVal a, PbVal b)  { return pb_bool(pb_vals_equal(a, b)); }
-static PbVal pb_lt(PbVal a, PbVal b)  { return pb_bool(a.num < b.num); }
-static PbVal pb_le(PbVal a, PbVal b)  { return pb_bool(a.num <= b.num); }
-static PbVal pb_gt(PbVal a, PbVal b)  { return pb_bool(a.num > b.num); }
-static PbVal pb_ge(PbVal a, PbVal b)  { return pb_bool(a.num >= b.num); }
+static PbVal pb_lt(PbVal a, PbVal b)  { if (a.tag==PB_TAG_DEC||b.tag==PB_TAG_DEC){int c=_dec_cmp_vals(a,b); return pb_bool(c!=2 && c<0);} return pb_bool(a.num < b.num); }
+static PbVal pb_le(PbVal a, PbVal b)  { if (a.tag==PB_TAG_DEC||b.tag==PB_TAG_DEC){int c=_dec_cmp_vals(a,b); return pb_bool(c!=2 && c<=0);} return pb_bool(a.num <= b.num); }
+static PbVal pb_gt(PbVal a, PbVal b)  { if (a.tag==PB_TAG_DEC||b.tag==PB_TAG_DEC){int c=_dec_cmp_vals(a,b); return pb_bool(c!=2 && c>0);} return pb_bool(a.num > b.num); }
+static PbVal pb_ge(PbVal a, PbVal b)  { if (a.tag==PB_TAG_DEC||b.tag==PB_TAG_DEC){int c=_dec_cmp_vals(a,b); return pb_bool(c!=2 && c>=0);} return pb_bool(a.num >= b.num); }
 
 /* ─── Logical ─────────────────────────────────────────────────────── */
 static bool pb_truthy(PbVal v) {
@@ -345,6 +516,7 @@ static bool pb_truthy(PbVal v) {
         case PB_TAG_NIL:  return false;
         case PB_TAG_BOOL: return v.bval;
         case PB_TAG_NUM:  return v.num != 0.0 && !isnan(v.num);
+        case PB_TAG_DEC:  return v.dec->mantissa != 0;
         case PB_TAG_STR:  return v.str != NULL && v.str[0] != '\0';
         case PB_TAG_ARR:  return v.arr && v.arr->len > 0;
         case PB_TAG_MAP:  return v.map && v.map->len > 0;
@@ -451,6 +623,7 @@ static PbVal pb_builtin_type(PbVal v) {
         case PB_TAG_NIL:  return PB_STR("nil");
         case PB_TAG_BOOL: return PB_STR("bool");
         case PB_TAG_NUM:  return PB_STR("number");
+        case PB_TAG_DEC:  return PB_STR("decimal");
         case PB_TAG_STR:  return PB_STR("string");
         case PB_TAG_ARR:  return PB_STR("array");
         case PB_TAG_MAP:  return PB_STR("map");
