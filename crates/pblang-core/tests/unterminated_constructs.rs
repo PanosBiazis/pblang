@@ -43,6 +43,23 @@ fn closed_polyglot_block_still_parses() {
 }
 
 #[test]
+fn unterminated_errors_span_from_opener_to_eof() {
+    // The error span should cover the whole dangling region (opener..EOF), not a
+    // single point, so an editor can underline it.
+    let src = "let x = 1 /* dangling";
+    let errs = parse_strict(src).expect_err("must error");
+    let e = &errs[0];
+    assert_eq!(e.span.start, 10, "span starts at the /* opener");
+    assert_eq!(e.span.end, src.len(), "span runs to EOF");
+    assert!(e.span.end > e.span.start, "span is a range, not a point");
+
+    let s = "let x = \"dangling";
+    let errs = parse_strict(s).expect_err("must error");
+    assert_eq!(errs[0].span.start, 8, "string span starts at the opening quote");
+    assert_eq!(errs[0].span.end, s.len(), "string span runs to EOF");
+}
+
+#[test]
 fn brace_inside_polyglot_string_does_not_break_closing() {
     // A '}' inside a string within the block must not be counted as the closer.
     assert!(

@@ -246,12 +246,53 @@ pub enum StmtKind {
 /// with the original text. Handles `//` line comments and nested `/* */`
 /// block comments.
 pub fn strip_comments_mask(src: &str) -> String {
+    scan_comments(src).0
+}
+
+/// An opener (block comment or double-quoted string) that reached EOF unclosed,
+/// tagged with the byte offset of the opener. (FIX #17: a single source of truth
+/// replaces what used to be three near-identical state machines.)
+enum Unterminated {
+    BlockComment(usize),
+    Str(usize),
+}
+
+impl Unterminated {
+    /// Build a located `ParseError`. The span runs from the opener to EOF so an
+    /// editor can underline the whole dangling region, not just a point.
+    fn into_error(self, src_len: usize) -> ParseError {
+        match self {
+            Unterminated::BlockComment(at) => ParseError {
+                message: format!("unterminated block comment opened at byte {at}"),
+                span: at..src_len,
+                found: None,
+            },
+            Unterminated::Str(at) => ParseError {
+                message: format!("unterminated string literal opened at byte {at}"),
+                span: at..src_len,
+                found: None,
+            },
+        }
+    }
+}
+
+/// THE comment/string scanner — single pass, single source of truth for
+/// `strip_comments_mask`, `check_unterminated_comment`, and
+/// `check_unterminated_string`. Masks `//` and nested `/* */` comments to spaces
+/// (length-preserving, newlines kept), tracks string literals so comment markers
+/// inside strings are ignored, and reports the first unterminated block comment
+/// or double-quoted string. pblang strings are double-quoted only; single quotes
+/// are tracked solely to keep state in lock-step (an unclosed `'` is not
+/// reported, since `'…'` is not a pblang string).
+fn scan_comments(src: &str) -> (String, Option<Unterminated>) {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec(); // same length as input (byte offsets preserved)
     let mut i = 0usize;
     let mut in_double_string = false;
     let mut in_single_string = false;
     let mut block_depth: i32 = 0;
+    let mut block_open_at = 0usize; // outermost open `/*`
+    let mut dq_open_at = 0usize; // open `"`
 
     while i < out.len() {
         let b = out[i];
@@ -297,6 +338,7 @@ pub fn strip_comments_mask(src: &str) -> String {
         // Not in string/comment
         if b == b'"' {
             in_double_string = true;
+            dq_open_at = i;
             i += 1;
             continue;
         }
@@ -322,6 +364,9 @@ pub fn strip_comments_mask(src: &str) -> String {
         if i + 1 < out.len() && out[i] == b'/' && out[i + 1] == b'*' {
             out[i] = b' ';
             out[i + 1] = b' ';
+            if block_depth == 0 {
+                block_open_at = i;
+            }
             block_depth += 1;
             i += 2;
             continue;
@@ -330,7 +375,19 @@ pub fn strip_comments_mask(src: &str) -> String {
         i += 1;
     }
 
-    String::from_utf8(out.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string())
+    let masked = String::from_utf8(out.clone())
+        .unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string());
+    // At EOF at most one region can be open (a string inside a comment is masked
+    // comment text; a comment inside a string is string text), so precedence is
+    // unambiguous.
+    let unterminated = if block_depth > 0 {
+        Some(Unterminated::BlockComment(block_open_at))
+    } else if in_double_string {
+        Some(Unterminated::Str(dq_open_at))
+    } else {
+        None
+    };
+    (masked, unterminated)
 }
 
 fn mask_and_extract_polyglot_blocks(
@@ -724,7 +781,7 @@ fn mask_and_extract_polyglot_blocks(
                                 "unterminated polyglot block '@{}' opened at byte {}",
                                 lang, block_start
                             ),
-                            span: block_start..block_start,
+                            span: block_start..src.len(),
                             found: Some('@'),
                         });
                     }
@@ -777,19 +834,14 @@ fn preprocess_for_parse(input: &str) -> Result<(String, Vec<PolyglotBlock>), Par
     if let Some(err) = poly_err {
         return Err(err);
     }
-    // Reject an unterminated `/* … */` BEFORE comment-stripping erases the
-    // evidence (the masker turns `/*` into spaces, so a stray open would
-    // otherwise silently swallow the rest of the file). Run on the
-    // polyglot-masked text so a `/*` inside a polyglot block can't false-trip.
-    if let Some(err) = check_unterminated_comment(&poly_masked) {
-        return Err(err);
+    // One scan does it all: mask comments AND report an unterminated `/* … */`
+    // or `"…` (the masker would otherwise turn a stray `/*` into spaces and
+    // silently swallow the rest of the file). Runs on the polyglot-masked text
+    // so markers inside a polyglot block can't false-trip.
+    let (masked, unterminated) = scan_comments(&poly_masked);
+    if let Some(u) = unterminated {
+        return Err(u.into_error(poly_masked.len()));
     }
-    // Likewise surface an unterminated double-quoted string with a located
-    // message instead of chumsky's vague "unexpected end of input".
-    if let Some(err) = check_unterminated_string(&poly_masked) {
-        return Err(err);
-    }
-    let masked = strip_comments_mask(&poly_masked);
     Ok((masked, blocks))
 }
 
@@ -855,83 +907,10 @@ fn check_nesting_depth(masked: &str) -> Option<ParseError> {
 /// Public so CLI front-ends that mask comments themselves (erasing the evidence)
 /// before calling [`parse_strict`] can run this guard on the RAW source first.
 pub fn check_unterminated_comment(src: &str) -> Option<ParseError> {
-    let bytes = src.as_bytes();
-    let mut i = 0usize;
-    let mut in_dq = false;
-    let mut in_sq = false;
-    let mut depth: i32 = 0;
-    let mut open_at = 0usize; // byte offset of the outermost open `/*`
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if in_dq || in_sq {
-            if b == b'\\' {
-                i = i.saturating_add(2);
-                continue;
-            }
-            if in_dq && b == b'"' {
-                in_dq = false;
-            } else if in_sq && b == b'\'' {
-                in_sq = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if depth > 0 {
-            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                depth += 1;
-                i += 2;
-                continue;
-            }
-            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                depth -= 1;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b'"' {
-            in_dq = true;
-            i += 1;
-            continue;
-        }
-        if b == b'\'' {
-            in_sq = true;
-            i += 1;
-            continue;
-        }
-        // line comment // — runs to end of line, so a `/*` inside it is inert
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // block comment open
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            if depth == 0 {
-                open_at = i;
-            }
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        i += 1;
+    match scan_comments(src).1 {
+        Some(u @ Unterminated::BlockComment(_)) => Some(u.into_error(src.len())),
+        _ => None,
     }
-
-    if depth > 0 {
-        return Some(ParseError {
-            message: format!("unterminated block comment opened at byte {}", open_at),
-            span: open_at..open_at,
-            found: None,
-        });
-    }
-    None
 }
 
 /// Detect an unterminated double-quoted string literal and return a `ParseError`
@@ -941,79 +920,10 @@ pub fn check_unterminated_comment(src: &str) -> Option<ParseError> {
 /// unclosed `'` is not reported. Skips `//` and `/* */` comments so a `"` inside
 /// a comment is not mistaken for a string opener.
 pub fn check_unterminated_string(src: &str) -> Option<ParseError> {
-    let bytes = src.as_bytes();
-    let mut i = 0usize;
-    let mut in_dq = false;
-    let mut in_sq = false;
-    let mut dq_open_at = 0usize;
-    let mut depth: i32 = 0; // block-comment depth
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if in_dq || in_sq {
-            if b == b'\\' {
-                i = i.saturating_add(2);
-                continue;
-            }
-            if in_dq && b == b'"' {
-                in_dq = false;
-            } else if in_sq && b == b'\'' {
-                in_sq = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if depth > 0 {
-            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                depth += 1;
-                i += 2;
-                continue;
-            }
-            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                depth -= 1;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b'"' {
-            in_dq = true;
-            dq_open_at = i;
-            i += 1;
-            continue;
-        }
-        if b == b'\'' {
-            in_sq = true;
-            i += 1;
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        i += 1;
+    match scan_comments(src).1 {
+        Some(u @ Unterminated::Str(_)) => Some(u.into_error(src.len())),
+        _ => None,
     }
-
-    if in_dq {
-        return Some(ParseError {
-            message: format!("unterminated string literal opened at byte {}", dq_open_at),
-            span: dq_open_at..dq_open_at,
-            found: None,
-        });
-    }
-    None
 }
 
 fn errs_to_owned<'src>(errs: Vec<Simple<'src, char>>) -> Vec<ParseError> {
