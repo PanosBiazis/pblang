@@ -1405,6 +1405,11 @@ mod serialize_tests {
 /// Container format version. Bump on any breaking layout change.
 pub const PBCK_V1_VERSION: u8 = 1;
 
+/// Max function-constant nesting the `.pbck` reader will follow before erroring.
+/// Bounds recursion (function → chunk → value → function) so a hostile bytecode
+/// file can't overflow the native stack. Far above any realistic compiler output.
+pub const PBCK_MAX_DEPTH: u32 = 256;
+
 #[inline]
 fn pbck_w_u32(out: &mut Vec<u8>, v: usize) {
     out.extend_from_slice(&(v as u32).to_le_bytes());
@@ -1559,20 +1564,31 @@ struct PbckReader<'a> {
 }
 
 impl<'a> PbckReader<'a> {
+    /// Bytes left to read — the only legitimate upper bound on any declared count
+    /// (each element needs ≥1 byte), so it caps untrusted-length pre-allocations.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+    /// A safe `Vec::with_capacity` size for a declared element count `n`: never
+    /// reserve more than the buffer could possibly contain, so a hostile count
+    /// (e.g. 0xFFFFFFFF) can't trigger a multi-GB allocation / OOM abort.
+    fn cap(&self, n: usize) -> usize {
+        n.min(self.remaining())
+    }
     fn u8(&mut self) -> Result<u8, String> {
         let b = *self.buf.get(self.pos).ok_or("pbck: unexpected end of input")?;
         self.pos += 1;
         Ok(b)
     }
     fn u32(&mut self) -> Result<usize, String> {
-        let end = self.pos + 4;
+        let end = self.pos.checked_add(4).ok_or("pbck: offset overflow")?;
         let s = self.buf.get(self.pos..end).ok_or("pbck: truncated u32")?;
         let arr: [u8; 4] = s.try_into().map_err(|_| "pbck: bad u32".to_string())?;
         self.pos = end;
         Ok(u32::from_le_bytes(arr) as usize)
     }
     fn f64(&mut self) -> Result<f64, String> {
-        let end = self.pos + 8;
+        let end = self.pos.checked_add(8).ok_or("pbck: offset overflow")?;
         let s = self.buf.get(self.pos..end).ok_or("pbck: truncated f64")?;
         let arr: [u8; 8] = s.try_into().map_err(|_| "pbck: bad f64".to_string())?;
         self.pos = end;
@@ -1580,7 +1596,7 @@ impl<'a> PbckReader<'a> {
     }
     fn str(&mut self) -> Result<String, String> {
         let n = self.u32()?;
-        let end = self.pos + n;
+        let end = self.pos.checked_add(n).ok_or("pbck: offset overflow")?;
         let s = self.buf.get(self.pos..end).ok_or("pbck: truncated string")?;
         let out = String::from_utf8(s.to_vec()).map_err(|_| "pbck: invalid utf-8".to_string())?;
         self.pos = end;
@@ -1621,7 +1637,7 @@ fn pbck_r_opcode(r: &mut PbckReader) -> Result<OpCode, String> {
         27 => {
             let fn_const = r.u32()?;
             let n = r.u32()?;
-            let mut captures = Vec::with_capacity(n);
+            let mut captures = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 let is_local = r.u8()? != 0;
                 let idx = r.u32()?;
@@ -1653,7 +1669,7 @@ fn pbck_r_opcode(r: &mut PbckReader) -> Result<OpCode, String> {
     })
 }
 
-fn pbck_r_value(r: &mut PbckReader) -> Result<Value, String> {
+fn pbck_r_value(r: &mut PbckReader, depth: u32) -> Result<Value, String> {
     use std::str::FromStr;
     let tag = r.u8()?;
     Ok(match tag {
@@ -1670,24 +1686,29 @@ fn pbck_r_value(r: &mut PbckReader) -> Result<Value, String> {
             alloc_rational(BigRational::from_str(&s).map_err(|_| "pbck: bad rational".to_string())?)
         }
         6 => return Err("pbck: decimal constants are not supported".to_string()),
-        7 => Value::Function(Rc::new(pbck_r_function(r)?)),
+        7 => Value::Function(Rc::new(pbck_r_function(r, depth)?)),
         other => return Err(format!("pbck: unknown value tag {other}")),
     })
 }
 
-fn pbck_r_function(r: &mut PbckReader) -> Result<Function, String> {
+fn pbck_r_function(r: &mut PbckReader, depth: u32) -> Result<Function, String> {
+    if depth >= PBCK_MAX_DEPTH {
+        return Err(format!(
+            "pbck: function nesting too deep (exceeds {PBCK_MAX_DEPTH}): refusing to parse to avoid a stack overflow"
+        ));
+    }
     let name = if r.u8()? != 0 { Some(r.str()?) } else { None };
     let arity = r.u32()?;
     let min_arity = r.u32()?;
     let n_defaults = r.u32()?;
-    let mut defaults = Vec::with_capacity(n_defaults);
+    let mut defaults = Vec::with_capacity(r.cap(n_defaults));
     for _ in 0..n_defaults {
-        defaults.push(pbck_r_value(r)?);
+        defaults.push(pbck_r_value(r, depth + 1)?);
     }
     let is_vararg = r.u8()? != 0;
     let param_types = if r.u8()? != 0 {
         let n = r.u32()?;
-        let mut pts = Vec::with_capacity(n);
+        let mut pts = Vec::with_capacity(r.cap(n));
         for _ in 0..n {
             pts.push(match r.u8()? {
                 0 => ParamType::F64,
@@ -1700,7 +1721,7 @@ fn pbck_r_function(r: &mut PbckReader) -> Result<Function, String> {
     } else {
         None
     };
-    let chunk = pbck_r_chunk(r)?;
+    let chunk = pbck_r_chunk(r, depth + 1)?;
     Ok(Function {
         name,
         arity,
@@ -1712,19 +1733,19 @@ fn pbck_r_function(r: &mut PbckReader) -> Result<Function, String> {
     })
 }
 
-fn pbck_r_chunk(r: &mut PbckReader) -> Result<Chunk, String> {
+fn pbck_r_chunk(r: &mut PbckReader, depth: u32) -> Result<Chunk, String> {
     let n_ins = r.u32()?;
-    let mut instructions = Vec::with_capacity(n_ins);
+    let mut instructions = Vec::with_capacity(r.cap(n_ins));
     for _ in 0..n_ins {
         instructions.push(pbck_r_opcode(r)?);
     }
     let n_const = r.u32()?;
-    let mut constants = Vec::with_capacity(n_const);
+    let mut constants = Vec::with_capacity(r.cap(n_const));
     for _ in 0..n_const {
-        constants.push(pbck_r_value(r)?);
+        constants.push(pbck_r_value(r, depth)?);
     }
     let n_spans = r.u32()?;
-    let mut spans = Vec::with_capacity(n_spans);
+    let mut spans = Vec::with_capacity(r.cap(n_spans));
     for _ in 0..n_spans {
         let start = r.u32()?;
         let end = r.u32()?;
@@ -1756,7 +1777,7 @@ pub fn pbck_deserialize(buf: &[u8]) -> Result<Chunk, String> {
         ));
     }
     let mut r = PbckReader { buf, pos: 5 };
-    pbck_r_chunk(&mut r)
+    pbck_r_chunk(&mut r, 0)
 }
 
 #[cfg(test)]
@@ -1830,5 +1851,87 @@ mod pbck_roundtrip_tests {
     #[test]
     fn pbck_rejects_bad_magic() {
         assert!(pbck_deserialize(b"NOPE.....").is_err());
+    }
+
+    // ── adversarial / malformed input (untrusted .pbck is a DoS surface) ──
+
+    fn pbck_header() -> Vec<u8> {
+        // A valid 5-byte header ("PBCK" + version), reused to craft hostile bodies.
+        pbck_serialize(&Chunk::default())[0..5].to_vec()
+    }
+    fn u32le(v: u32) -> [u8; 4] {
+        v.to_le_bytes()
+    }
+
+    #[test]
+    fn pbck_rejects_huge_length_without_oom() {
+        // A 9-byte file claiming ~4.29 billion instructions must NOT pre-allocate
+        // ~tens of GB (Vec::with_capacity on an attacker-controlled count) — it
+        // must fail fast with an error, bounded by the actual buffer size.
+        let mut buf = pbck_header();
+        buf.extend_from_slice(&u32le(u32::MAX)); // n_ins = 0xFFFFFFFF
+        assert!(
+            pbck_deserialize(&buf).is_err(),
+            "a huge declared count must error, not allocate gigabytes"
+        );
+    }
+
+    #[test]
+    fn pbck_rejects_huge_count_for_each_section() {
+        // Same for constants and spans (each reached after a 0-count predecessor).
+        // constants: n_ins=0, n_const=MAX
+        let mut b = pbck_header();
+        b.extend_from_slice(&u32le(0));
+        b.extend_from_slice(&u32le(u32::MAX));
+        assert!(pbck_deserialize(&b).is_err());
+        // spans: n_ins=0, n_const=0, n_spans=MAX
+        let mut b = pbck_header();
+        b.extend_from_slice(&u32le(0));
+        b.extend_from_slice(&u32le(0));
+        b.extend_from_slice(&u32le(u32::MAX));
+        assert!(pbck_deserialize(&b).is_err());
+    }
+
+    #[test]
+    fn pbck_rejects_deeply_nested_functions_without_stack_overflow() {
+        // Build a chain of ~100k nested function constants by hand. The reader
+        // recurses function -> chunk -> value -> function; without a depth guard
+        // this overflows the native stack (uncatchable abort). It must instead
+        // return an error.
+        let n = 100_000usize;
+        // Per-level wrapper around an inner value:
+        //   value tag 7 (function)
+        //   function: name(0) arity(u32 0) min_arity(0) n_defaults(0)
+        //             is_vararg(0) param_types_present(0)
+        //   chunk:    n_ins(0) n_const(1)  <inner value...>  [suffix later]
+        let mut prefix = vec![7u8, 0u8];
+        prefix.extend_from_slice(&u32le(0)); // arity
+        prefix.extend_from_slice(&u32le(0)); // min_arity
+        prefix.extend_from_slice(&u32le(0)); // n_defaults
+        prefix.push(0); // is_vararg
+        prefix.push(0); // param_types: none
+        prefix.extend_from_slice(&u32le(0)); // chunk.n_ins
+        prefix.extend_from_slice(&u32le(1)); // chunk.n_const = 1 (the inner value)
+        // chunk suffix after the inner constant: n_spans(0) source_name(none)
+        let mut suffix = u32le(0).to_vec();
+        suffix.push(0);
+
+        let mut buf = pbck_header();
+        buf.extend_from_slice(&u32le(0)); // top chunk n_ins
+        buf.extend_from_slice(&u32le(1)); // top chunk n_const = 1 (the chain)
+        for _ in 0..n {
+            buf.extend_from_slice(&prefix);
+        }
+        buf.push(2); // innermost value = Nil (tag 2), terminating the chain
+        for _ in 0..n {
+            buf.extend_from_slice(&suffix);
+        }
+        buf.extend_from_slice(&u32le(0)); // top chunk n_spans
+        buf.push(0); // top chunk source_name: none
+
+        assert!(
+            pbck_deserialize(&buf).is_err(),
+            "deeply nested function constants must error, not overflow the stack"
+        );
     }
 }
