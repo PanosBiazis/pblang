@@ -333,10 +333,16 @@ pub fn strip_comments_mask(src: &str) -> String {
     String::from_utf8(out.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string())
 }
 
-fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
+fn mask_and_extract_polyglot_blocks(
+    src: &str,
+) -> (String, Vec<PolyglotBlock>, Option<ParseError>) {
     let bytes = src.as_bytes();
     let mut out = bytes.to_vec(); // same length as input (byte offsets preserved)
     let mut blocks: Vec<PolyglotBlock> = vec![];
+    // First `@lang { … ` whose `{` is never matched by a `}` (the scanner would
+    // otherwise leave the `@…{` as text and let chumsky fail with a useless
+    // "unexpected end of input at byte 0").
+    let mut unterminated: Option<ParseError> = None;
 
     fn is_ident_start(b: u8) -> bool {
         (b as char).is_ascii_alphabetic() || b == b'_'
@@ -706,9 +712,21 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
                         p += 1;
                     }
 
-                    // If we found no closing brace, fall through and treat as normal text.
+                    // If we found no closing brace, the block is unterminated:
+                    // record a clear error (first occurrence) and fall through so
+                    // masking/offsets are unchanged for the lenient path.
                     if i != block_start {
                         continue;
+                    }
+                    if unterminated.is_none() {
+                        unterminated = Some(ParseError {
+                            message: format!(
+                                "unterminated polyglot block '@{}' opened at byte {}",
+                                lang, block_start
+                            ),
+                            span: block_start..block_start,
+                            found: Some('@'),
+                        });
                     }
                 }
             }
@@ -721,6 +739,7 @@ fn mask_and_extract_polyglot_blocks(src: &str) -> (String, Vec<PolyglotBlock>) {
         String::from_utf8(out.clone())
             .unwrap_or_else(|_| String::from_utf8_lossy(&out).to_string()),
         blocks,
+        unterminated,
     )
 }
 
@@ -752,12 +771,22 @@ pub type ParseWithPolyglotResult = Result<(Vec<Stmt>, Vec<PolyglotBlock>), Vec<P
 
 fn preprocess_for_parse(input: &str) -> Result<(String, Vec<PolyglotBlock>), ParseError> {
     // Keep byte offsets stable by masking comments/polyglot blocks with spaces.
-    let (poly_masked, blocks) = mask_and_extract_polyglot_blocks(input);
+    let (poly_masked, blocks, poly_err) = mask_and_extract_polyglot_blocks(input);
+    // An unterminated `@lang { … ` opener wins first — otherwise its leftover
+    // `@…{` text produces spurious downstream comment/string/parse errors.
+    if let Some(err) = poly_err {
+        return Err(err);
+    }
     // Reject an unterminated `/* … */` BEFORE comment-stripping erases the
     // evidence (the masker turns `/*` into spaces, so a stray open would
     // otherwise silently swallow the rest of the file). Run on the
     // polyglot-masked text so a `/*` inside a polyglot block can't false-trip.
     if let Some(err) = check_unterminated_comment(&poly_masked) {
+        return Err(err);
+    }
+    // Likewise surface an unterminated double-quoted string with a located
+    // message instead of chumsky's vague "unexpected end of input".
+    if let Some(err) = check_unterminated_string(&poly_masked) {
         return Err(err);
     }
     let masked = strip_comments_mask(&poly_masked);
@@ -905,6 +934,88 @@ pub fn check_unterminated_comment(src: &str) -> Option<ParseError> {
     None
 }
 
+/// Detect an unterminated double-quoted string literal and return a `ParseError`
+/// at the opening quote's byte offset (chumsky otherwise reports a vague
+/// "unexpected end of input"). pblang strings are double-quoted only, so single
+/// quotes are tracked merely to stay in lock-step with the comment masker — an
+/// unclosed `'` is not reported. Skips `//` and `/* */` comments so a `"` inside
+/// a comment is not mistaken for a string opener.
+pub fn check_unterminated_string(src: &str) -> Option<ParseError> {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut in_dq = false;
+    let mut in_sq = false;
+    let mut dq_open_at = 0usize;
+    let mut depth: i32 = 0; // block-comment depth
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if in_dq || in_sq {
+            if b == b'\\' {
+                i = i.saturating_add(2);
+                continue;
+            }
+            if in_dq && b == b'"' {
+                in_dq = false;
+            } else if in_sq && b == b'\'' {
+                in_sq = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if depth > 0 {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                depth -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' {
+            in_dq = true;
+            dq_open_at = i;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_sq = true;
+            i += 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+
+    if in_dq {
+        return Some(ParseError {
+            message: format!("unterminated string literal opened at byte {}", dq_open_at),
+            span: dq_open_at..dq_open_at,
+            found: None,
+        });
+    }
+    None
+}
+
 fn errs_to_owned<'src>(errs: Vec<Simple<'src, char>>) -> Vec<ParseError> {
     errs.into_iter()
         .map(|e| {
@@ -993,7 +1104,7 @@ pub fn parse_with_polyglot(input: &str) -> ParseWithPolyglotResult {
 }
 
 pub fn extract_polyglot_blocks(input: &str) -> Vec<PolyglotBlock> {
-    let (_masked, blocks) = mask_and_extract_polyglot_blocks(input);
+    let (_masked, blocks, _unterminated) = mask_and_extract_polyglot_blocks(input);
     blocks
 }
 
