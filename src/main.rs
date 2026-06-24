@@ -4480,6 +4480,13 @@ fn legacy_dispatch(args: Vec<String>) {
                     }
                 }
             };
+            // Reject an unterminated `/* … */` on the RAW source before masking
+            // erases it — otherwise a stray `/*` silently deletes the rest of the
+            // file with exit 0 (the comment masker turns it all to spaces).
+            if let Some(e) = pblang_core::check_unterminated_comment(&src) {
+                print_parse_errors(&src, vec![e], Some(&path_str));
+                std::process::exit(2);
+            }
             let src_for_parse = strip_comments_mask(&src);
             let stmts = match parse_strict(&src_for_parse) {
                 Ok(s) => s,
