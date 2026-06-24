@@ -10,6 +10,22 @@ use pblang_vm::{StdlibConfig, VmLimits, VM};
 
 use clap::{Parser, Subcommand};
 
+/// Mask comments for parsing, but FIRST reject an unterminated `/* … */` on the
+/// RAW source. The CLI pre-masks comments at many sites before calling
+/// `parse_strict`, which erases a stray `/*` (it becomes spaces) so the
+/// library-level guard never sees it — without this a stray `/*` would silently
+/// delete the rest of the file and run with exit 0. On an unterminated comment
+/// this prints a located error and exits 2; otherwise it returns the masked
+/// source. (Unterminated strings/polyglot blocks survive masking and are caught
+/// downstream by `parse_strict`.)
+fn mask_for_parse_or_exit(src: &str, label: Option<&str>) -> String {
+    if let Some(e) = pblang_core::check_unterminated_comment(src) {
+        print_parse_errors(src, vec![e], label);
+        std::process::exit(2);
+    }
+    strip_comments_mask(src)
+}
+
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -2841,7 +2857,7 @@ fn legacy_dispatch(args: Vec<String>) {
             eprintln!("error reading {}: {}", path, e);
             std::process::exit(1);
         });
-        let src_for_parse = strip_comments_mask(&src);
+        let src_for_parse = mask_for_parse_or_exit(&src, None);
         match parse_strict(&src_for_parse) {
             Ok(ast) => {
                 let graph = build_call_graph(&ast, path);
@@ -2868,7 +2884,7 @@ fn legacy_dispatch(args: Vec<String>) {
             eprintln!("error reading {}: {}", path, e);
             std::process::exit(1);
         });
-        let src_for_parse = strip_comments_mask(&src);
+        let src_for_parse = mask_for_parse_or_exit(&src, None);
         let ast = match parse_strict(&src_for_parse) {
             Ok(ast) => ast,
             Err(errs) => {
@@ -2897,7 +2913,7 @@ fn legacy_dispatch(args: Vec<String>) {
             );
             std::process::exit(1);
         });
-        let src_for_parse = strip_comments_mask(&src);
+        let src_for_parse = mask_for_parse_or_exit(&src, None);
         let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
@@ -2944,7 +2960,7 @@ fn legacy_dispatch(args: Vec<String>) {
             eprintln!("pblang emit-pbck: failed to read {}: {}", file_path.display(), e);
             std::process::exit(1);
         });
-        let src_for_parse = strip_comments_mask(&src);
+        let src_for_parse = mask_for_parse_or_exit(&src, None);
         let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
@@ -2986,7 +3002,7 @@ fn legacy_dispatch(args: Vec<String>) {
             );
             std::process::exit(1);
         });
-        let src_for_parse = strip_comments_mask(&src);
+        let src_for_parse = mask_for_parse_or_exit(&src, None);
         let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
@@ -3022,7 +3038,7 @@ fn legacy_dispatch(args: Vec<String>) {
             );
             std::process::exit(1);
         });
-        let src_for_parse = strip_comments_mask(&src);
+        let src_for_parse = mask_for_parse_or_exit(&src, None);
         let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
@@ -3059,7 +3075,7 @@ fn legacy_dispatch(args: Vec<String>) {
             );
             std::process::exit(1);
         });
-        let src_masked = strip_comments_mask(&src);
+        let src_masked = mask_for_parse_or_exit(&src, None);
         let stmts = match parse_strict(&src_masked) {
             Ok(s) => s,
             Err(errs) => {
@@ -4480,14 +4496,7 @@ fn legacy_dispatch(args: Vec<String>) {
                     }
                 }
             };
-            // Reject an unterminated `/* … */` on the RAW source before masking
-            // erases it — otherwise a stray `/*` silently deletes the rest of the
-            // file with exit 0 (the comment masker turns it all to spaces).
-            if let Some(e) = pblang_core::check_unterminated_comment(&src) {
-                print_parse_errors(&src, vec![e], Some(&path_str));
-                std::process::exit(2);
-            }
-            let src_for_parse = strip_comments_mask(&src);
+            let src_for_parse = mask_for_parse_or_exit(&src, Some(&path_str));
             let stmts = match parse_strict(&src_for_parse) {
                 Ok(s) => s,
                 Err(errs) => {
@@ -4691,7 +4700,7 @@ fn legacy_dispatch(args: Vec<String>) {
                 std::process::exit(1);
             }
         };
-        let src_for_parse = strip_comments_mask(&src);
+        let src_for_parse = mask_for_parse_or_exit(&src, None);
         let stmts = match parse_strict(&src_for_parse) {
             Ok(s) => s,
             Err(errs) => {
