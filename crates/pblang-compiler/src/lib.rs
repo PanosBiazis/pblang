@@ -1798,7 +1798,16 @@ fn optimize_chunk(chunk: &mut Chunk) {
     // Pass 1: Constant folding — replace constant arithmetic at compile time.
     // Walk the instruction list looking for pairs: OpConstant(a) + OpConstant(b) + OpXxx
     // where OpXxx is a pure arithmetic/comparison op. Replace with a single OpConstant(result).
+    // Fold to a FIXPOINT so constant chains like (((2+3)+4)+5) collapse fully:
+    // one sweep only reaches the first pair, leaving the folded result adjacent to
+    // the next literal for the following sweep to combine. Each fold is individually
+    // correct and the basic-block guard is conservative, so iterating never
+    // mis-folds; a pass cap bounds the work.
+    let fold_cap = chunk.instructions.len() + 1;
+    let mut fold_round = 0usize;
+    loop {
     let n = chunk.instructions.len();
+    let mut folded_any = false;
     // Collect jump/branch targets so we never fold across a basic-block boundary.
     // Control flow can enter the middle of a 3-instruction window — e.g. a try/catch's
     // success path jumps onto the RHS `OpConstant` of a following comparison — and folding
@@ -1869,6 +1878,7 @@ fn optimize_chunk(chunk: &mut Chunk) {
                 _ => None,
             };
             if let Some(result) = folded {
+                folded_any = true;
                 let new_idx = chunk.constants.len();
                 chunk.constants.push(result);
                 // Replace the 3-instruction sequence with OpConstant(new_idx) + 2 x OpPop-and-skip
@@ -1897,11 +1907,23 @@ fn optimize_chunk(chunk: &mut Chunk) {
         }
         i += 1;
     }
+    fold_round += 1;
+    if !folded_any || fold_round > fold_cap {
+        break;
+    }
+    }
 
     // Pass 2: Jump threading — jump-to-jump becomes direct jump
     // This keeps bytecode stable and cheap without changing instruction indices (no deletions).
+    // `thread_cap` bounds the fixpoint: legitimate jump chains resolve in at most
+    // `len` passes, but a pathological jump CYCLE (e.g. a 3-cycle of OpJumps) would
+    // otherwise oscillate forever and hang the compiler. The cap turns that into a
+    // (harmless) early stop instead of a denial of service.
+    let thread_cap = chunk.instructions.len() + 1;
+    let mut thread_round = 0usize;
     let mut changed = true;
-    while changed {
+    while changed && thread_round <= thread_cap {
+        thread_round += 1;
         changed = false;
         for i in 0..chunk.instructions.len() {
             let op = chunk.instructions[i].clone();
@@ -1932,15 +1954,37 @@ fn optimize_chunk(chunk: &mut Chunk) {
         }
     }
 
-    // Pass 3: Peephole — remove redundant instruction pairs
+    // Pass 3: Peephole — remove redundant instruction pairs.
+    // Like pass 1, these pair-removals are only sound WITHIN a basic block: if a
+    // branch can land on the SECOND instruction of the pair, replacing it with a
+    // no-op jump changes the stack effect on that entry path (the same class of
+    // bug pass 1's basic-block guard fixed). So recompute jump targets and never
+    // collapse a pair whose second slot is a branch target.
+    let pe_targets: std::collections::HashSet<usize> = chunk
+        .instructions
+        .iter()
+        .filter_map(|op| match op {
+            OpCode::OpJump(t)
+            | OpCode::OpJumpIfFalse(t)
+            | OpCode::OpJumpIfTrue(t)
+            | OpCode::OpTry(t) => Some(*t),
+            _ => None,
+        })
+        .collect();
     let n2 = chunk.instructions.len();
     let mut i = 0;
     while i + 1 < n2 {
         let op0 = chunk.instructions.get(i).cloned();
         let op1 = chunk.instructions.get(i + 1).cloned();
 
+        // A branch into the middle of the pair makes removal unsafe — skip it.
+        let pair_entered = pe_targets.contains(&(i + 1));
+
         // Dup + Pop → remove both (net zero effect), replace with OpJump(next)
-        if matches!(op0, Some(OpCode::OpDup)) && matches!(op1, Some(OpCode::OpPop)) {
+        if !pair_entered
+            && matches!(op0, Some(OpCode::OpDup))
+            && matches!(op1, Some(OpCode::OpPop))
+        {
             chunk.instructions[i] = OpCode::OpJump(i + 2);
             chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
             i += 2;
@@ -1948,7 +1992,10 @@ fn optimize_chunk(chunk: &mut Chunk) {
         }
 
         // Not + Not → remove both (double negation), replace with OpJump(next)
-        if matches!(op0, Some(OpCode::OpNot)) && matches!(op1, Some(OpCode::OpNot)) {
+        if !pair_entered
+            && matches!(op0, Some(OpCode::OpNot))
+            && matches!(op1, Some(OpCode::OpNot))
+        {
             chunk.instructions[i] = OpCode::OpJump(i + 2);
             chunk.instructions[i + 1] = OpCode::OpJump(i + 2);
             i += 2;
