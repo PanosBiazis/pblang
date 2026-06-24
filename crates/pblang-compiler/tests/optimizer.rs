@@ -62,6 +62,20 @@ fn folds_a_constant_chain_to_a_fixpoint() {
 }
 
 #[test]
+fn folds_constant_string_concatenation() {
+    // pblang strings are immutable, so "a" + "b" can fold to "ab" at compile time.
+    let has_ab = constants_of("let s = \"a\" + \"b\";")
+        .iter()
+        .any(|c| matches!(c, Value::Obj(o) if format!("{o:?}").contains("ab")));
+    assert!(has_ab, "\"a\"+\"b\" should fold to the string \"ab\"");
+    // a chain folds fully too: "a"+"b"+"c" -> "abc"
+    let has_abc = constants_of("let s = \"a\" + \"b\" + \"c\";")
+        .iter()
+        .any(|c| matches!(c, Value::Obj(o) if format!("{o:?}").contains("abc")));
+    assert!(has_abc, "a constant string chain should fold to \"abc\"");
+}
+
+#[test]
 fn compiles_large_branchy_program_without_hanging() {
     // Many conditionals/loops exercise the jump-threading pass; this must always
     // terminate (the test completing is the assertion — a jump cycle would hang).
