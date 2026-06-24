@@ -1874,7 +1874,14 @@ fn optimize_chunk(chunk: &mut Chunk) {
                 (Some(Value::Number(a)), Some(Value::Number(b)), OpCode::OpGe) => {
                     Some(Value::Bool(a >= b))
                 }
-                // String concatenation folding
+                // String concatenation folding — pblang strings are immutable, so
+                // "a" + "b" folds to "ab" with no identity/mutation concerns.
+                (Some(ref a), Some(ref b), OpCode::OpAdd) => {
+                    match (a.as_str(), b.as_str()) {
+                        (Ok(sa), Ok(sb)) => Some(pblang_ir::alloc_string(format!("{sa}{sb}"))),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             if let Some(result) = folded {
