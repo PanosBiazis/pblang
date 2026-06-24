@@ -750,11 +750,18 @@ impl std::error::Error for ParseError {}
 /// Type alias for the result of `parse_with_polyglot` to tame the complex type signature.
 pub type ParseWithPolyglotResult = Result<(Vec<Stmt>, Vec<PolyglotBlock>), Vec<ParseError>>;
 
-fn preprocess_for_parse(input: &str) -> (String, Vec<PolyglotBlock>) {
+fn preprocess_for_parse(input: &str) -> Result<(String, Vec<PolyglotBlock>), ParseError> {
     // Keep byte offsets stable by masking comments/polyglot blocks with spaces.
-    let (masked, blocks) = mask_and_extract_polyglot_blocks(input);
-    let masked = strip_comments_mask(&masked);
-    (masked, blocks)
+    let (poly_masked, blocks) = mask_and_extract_polyglot_blocks(input);
+    // Reject an unterminated `/* … */` BEFORE comment-stripping erases the
+    // evidence (the masker turns `/*` into spaces, so a stray open would
+    // otherwise silently swallow the rest of the file). Run on the
+    // polyglot-masked text so a `/*` inside a polyglot block can't false-trip.
+    if let Some(err) = check_unterminated_comment(&poly_masked) {
+        return Err(err);
+    }
+    let masked = strip_comments_mask(&poly_masked);
+    Ok((masked, blocks))
 }
 
 /// Maximum bracket/paren/brace nesting depth the parser will accept. Source that
@@ -808,6 +815,96 @@ fn check_nesting_depth(masked: &str) -> Option<ParseError> {
     None
 }
 
+/// Detect an unterminated `/* … */` block comment and return a `ParseError` at
+/// the byte offset of the unclosed opener (or `None` if every block comment is
+/// closed). Without this an unterminated `/*` is masked all the way to EOF —
+/// silently deleting the rest of the file with no diagnostic, even though an
+/// unterminated *string* already errors. Mirrors `strip_comments_mask`'s
+/// string- and line-comment skipping so a `/*` inside a string literal or after
+/// a `//` is correctly ignored, and counts nesting so `/* /* */` is still open.
+///
+/// Public so CLI front-ends that mask comments themselves (erasing the evidence)
+/// before calling [`parse_strict`] can run this guard on the RAW source first.
+pub fn check_unterminated_comment(src: &str) -> Option<ParseError> {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut in_dq = false;
+    let mut in_sq = false;
+    let mut depth: i32 = 0;
+    let mut open_at = 0usize; // byte offset of the outermost open `/*`
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if in_dq || in_sq {
+            if b == b'\\' {
+                i = i.saturating_add(2);
+                continue;
+            }
+            if in_dq && b == b'"' {
+                in_dq = false;
+            } else if in_sq && b == b'\'' {
+                in_sq = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if depth > 0 {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                depth -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' {
+            in_dq = true;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_sq = true;
+            i += 1;
+            continue;
+        }
+        // line comment // — runs to end of line, so a `/*` inside it is inert
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // block comment open
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            if depth == 0 {
+                open_at = i;
+            }
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+
+    if depth > 0 {
+        return Some(ParseError {
+            message: format!("unterminated block comment opened at byte {}", open_at),
+            span: open_at..open_at,
+            found: None,
+        });
+    }
+    None
+}
+
 fn errs_to_owned<'src>(errs: Vec<Simple<'src, char>>) -> Vec<ParseError> {
     errs.into_iter()
         .map(|e| {
@@ -827,7 +924,10 @@ fn errs_to_owned<'src>(errs: Vec<Simple<'src, char>>) -> Vec<ParseError> {
 }
 
 pub fn parse_with_polyglot_strict(input: &str) -> ParseWithPolyglotResult {
-    let (masked, blocks) = preprocess_for_parse(input);
+    let (masked, blocks) = match preprocess_for_parse(input) {
+        Ok(v) => v,
+        Err(e) => return Err(vec![e]),
+    };
     if let Some(err) = check_nesting_depth(&masked) {
         return Err(vec![err]);
     }
@@ -850,7 +950,10 @@ pub fn parse_with_polyglot_strict(input: &str) -> ParseWithPolyglotResult {
 }
 
 pub fn parse_with_polyglot(input: &str) -> ParseWithPolyglotResult {
-    let (masked, blocks) = preprocess_for_parse(input);
+    let (masked, blocks) = match preprocess_for_parse(input) {
+        Ok(v) => v,
+        Err(e) => return Err(vec![e]),
+    };
     if let Some(err) = check_nesting_depth(&masked) {
         return Err(vec![err]);
     }
