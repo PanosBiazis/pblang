@@ -122,6 +122,35 @@ fn lint_reports_clippy_style_lints() {
 }
 
 #[test]
+fn type_error_does_not_suppress_clippy_lints() {
+    // Regression: clippy-style lints used to run only when the type checker was
+    // completely silent, so a single type error hid every style/correctness
+    // lint. The lints are orthogonal and must still fire.
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/lint_clippy_with_type_error.sapp");
+    assert!(fixture.exists(), "fixture must exist");
+    let out = std::process::Command::new(bin)
+        .arg("lint")
+        .arg(&fixture)
+        .output()
+        .expect("run pblang lint");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The type error is still reported …
+    assert!(
+        stderr.contains("mismatch") || stderr.contains("number"),
+        "type error should still be reported: {}",
+        stderr
+    );
+    // … and so is the clippy lint, despite the type error.
+    assert!(
+        stderr.contains("eq_op"),
+        "eq_op lint must fire even when a type error is present: {}",
+        stderr
+    );
+}
+
+#[test]
 fn clippy_subcommand_is_lint_alias() {
     let bin = env!("CARGO_BIN_EXE_pblang");
     let fixture =
