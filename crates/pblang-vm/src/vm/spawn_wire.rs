@@ -29,6 +29,15 @@ use super::{alloc_array, alloc_map};
 /// payloads that need a stable on-wire shape — e.g. handles passed to
 /// host-side queues).
 pub(super) fn spawn_value_to_json(v: &Value) -> Result<sj::Value, String> {
+    spawn_value_to_json_depth(v, 0)
+}
+
+fn spawn_value_to_json_depth(v: &Value, depth: usize) -> Result<sj::Value, String> {
+    // Same cyclic/deep-nesting stack-overflow defense as `spawn_value_to_wire`
+    // (a cyclic array shipped to a host queue would otherwise abort the process).
+    if depth > SPAWN_WIRE_MAX_DEPTH {
+        return Err("spawn: value too deeply nested or cyclic to transfer across threads".into());
+    }
     match v {
         Value::Nil => Ok(sj::Value::Null),
         Value::Bool(b) => Ok(sj::Value::Bool(*b)),
@@ -47,7 +56,7 @@ pub(super) fn spawn_value_to_json(v: &Value) -> Result<sj::Value, String> {
             let a = a.borrow();
             let mut out = Vec::with_capacity(a.len());
             for x in a.iter() {
-                out.push(spawn_value_to_json(x)?);
+                out.push(spawn_value_to_json_depth(x, depth + 1)?);
             }
             Ok(sj::Value::Array(out))
         }
@@ -55,7 +64,7 @@ pub(super) fn spawn_value_to_json(v: &Value) -> Result<sj::Value, String> {
             let m = m.borrow();
             let mut out = sj::Map::new();
             for (k, vv) in m.iter() {
-                out.insert(k.clone(), spawn_value_to_json(vv)?);
+                out.insert(k.clone(), spawn_value_to_json_depth(vv, depth + 1)?);
             }
             Ok(sj::Value::Object(out))
         }
