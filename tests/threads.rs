@@ -278,3 +278,20 @@ fn channel_handles_are_isolated_between_top_level_vms() {
         err.message
     );
 }
+
+#[test]
+fn channel_buffered_huge_capacity_does_not_oom() {
+    // The buffered-channel capacity is a *logical* bound for blocking; it must
+    // not be eagerly allocated. A program asking for a giant capacity used to
+    // `VecDeque::with_capacity(huge)` and crash the runtime with a "capacity
+    // overflow"/OOM abort. The channel must instead be created fine and stay
+    // functional (send/recv one item).
+    let out = run_collect(
+        r#"
+        let ch = channel_buffered(1000000000000000000);
+        send(ch.sender, 7);
+        print recv(ch.receiver);
+        "#,
+    );
+    assert_eq!(out, vec![Value::Number(7.0)]);
+}
