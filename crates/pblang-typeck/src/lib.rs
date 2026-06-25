@@ -563,6 +563,59 @@ impl Env {
     }
 }
 
+/// Every builtin name the VM registers (`pblang-vm` `builtins_table.rs`). Kept
+/// here so the checker knows them as global values and does not emit false
+/// "variable not declared" diagnostics for legitimate builtins. Names not given
+/// a precise signature above are seeded as `Any` (callable, returns `Any`).
+/// A drift guard test asserts the prelude covers all of these.
+const ALL_VM_BUILTINS: &[&str] = &[
+    "ai_chat", "ai_embed", "ai_token_count", "allocate", "array_chunk", "array_drop",
+    "array_flatten", "array_pop", "array_push", "array_sort", "array_take", "array_unique",
+    "array_zip", "assert", "atomic_add", "atomic_cas", "atomic_get", "atomic_new", "atomic_set",
+    "atomic_sub", "atomic_swap", "barrier_new", "barrier_wait", "base64_decode",
+    "base64_decode_bytes", "base64_encode", "base64_encode_bytes", "bigint", "bit_and", "bit_not",
+    "bit_or", "bit_shl", "bit_shr", "bit_xor", "borrow_immutable", "borrow_mutable",
+    "borrow_unique", "bytes_to_str", "channel", "channel_buffered", "channel_close",
+    "channel_is_closed", "channel_size", "checked_add", "checked_div", "checked_mul",
+    "checked_sub", "clamp", "clock", "constant_time_eq", "cwd", "deallocate", "decimal",
+    "enumerate", "env_get", "env_set", "error", "exec", "ffi_call", "ffi_call_typed", "ffi_close",
+    "ffi_load", "freeze", "fs_append", "fs_copy", "fs_exists", "fs_listdir", "fs_mkdirs", "fs_read",
+    "fs_read_bytes", "fs_remove", "fs_rename", "fs_write", "fs_write_bytes", "gc_collect",
+    "gc_stats", "gil_enabled", "has_member", "hex_decode", "hex_encode", "hmac_sha256", "http_get",
+    "http_get_auth", "http_parse_request", "http_post", "http_post_auth", "http_response",
+    "http_response_ct", "http_response_json", "import", "is_array", "is_bool", "is_fn",
+    "is_frozen", "is_map", "is_nil", "is_number", "is_string", "join", "join_all", "json_parse",
+    "json_stringify", "len", "load", "map_has", "map_keys", "map_remove", "max_of", "memory_alloc",
+    "memory_borrow", "memory_free", "memory_get", "memory_release", "memory_set", "memory_stats",
+    "min_of", "mutex_lock", "mutex_new", "mutex_try_lock", "mutex_unlock", "now_iso", "now_ms",
+    "num_abs", "num_atan2", "num_ceil", "num_exp", "num_floor", "num_from_le_bytes", "num_ln",
+    "num_max", "num_min", "num_mod", "num_pow", "num_sqrt", "num_to_le_bytes", "once_is_done",
+    "once_new", "onnx_infer", "os_args", "os_exit", "os_signal_handler_get", "os_signal_pending",
+    "os_signal_poll", "os_signal_trap", "os_which", "parse_bool", "parse_number", "parse_sse_line",
+    "path_basename", "path_dirname", "path_join", "platform", "polyglot_cache_clear",
+    "polyglot_cache_info", "polyglot_compile_cached", "polyglot_detect", "polyglot_exec",
+    "polyglot_exec_compiled", "polyglot_exec_with_input", "pop", "pop_lifetime", "proc_spawn_wait",
+    "product", "push", "push_lifetime", "quantum_backends", "quantum_run", "quantum_simulate",
+    "quantum_statevector", "random_bytes", "random_float", "range", "rational", "read_line",
+    "recv", "recv_timeout", "regex_capture", "regex_find", "regex_find_all", "regex_match",
+    "regex_replace", "regex_replace_all", "regex_split", "release_borrow", "require_type",
+    "rwlock_new", "rwlock_read", "rwlock_unlock", "rwlock_write", "select", "select_with_timeout",
+    "send", "sha256", "sleep_ms", "slice", "spawn", "spawn_n", "sqlite_close", "sqlite_exec",
+    "sqlite_last_insert_rowid", "sqlite_open", "sqlite_query", "store", "str", "strcharcodeat",
+    "str_contains", "str_ends_with", "str_format", "str_from_char_code", "strfromcharcode",
+    "str_index_of", "str_join", "str_lower", "str_pad_left", "str_pad_right", "str_repeat",
+    "str_replace_all", "str_slice", "str_split", "str_starts_with", "str_to_bytes", "str_trim",
+    "str_upper", "sum", "tcp_accept", "tcp_close", "tcp_connect_tls", "tcp_listen", "tcp_listen_tls",
+    "tcp_local_addr", "tcp_read", "tcp_read_until", "tcp_wrap_tls", "tcp_write", "tensor_add",
+    "tensor_argmax", "tensor_avgpool2d", "tensor_backend", "tensor_batch_norm", "tensor_conv2d",
+    "tensor_cross_entropy", "tensor_dot", "tensor_embedding_lookup", "tensor_gelu",
+    "tensor_layer_norm", "tensor_leaky_relu", "tensor_log_softmax", "tensor_matmul",
+    "tensor_maxpool2d", "tensor_mean", "tensor_mul", "tensor_relu", "tensor_scale",
+    "tensor_sigmoid", "tensor_softmax", "tensor_sub", "tensor_sum", "tensor_tanh",
+    "tensor_transpose2d", "ticker", "timeout_channel", "type", "type_assert", "url_decode",
+    "url_encode", "websocket_accept_key", "websocket_parse_frame", "websocket_write_frame",
+];
+
 /// Seed the global scope with common VM/stdlib builtin signatures.
 fn seed_builtin_prelude(env: &mut Env) {
     let any = Ty::Any;
@@ -674,8 +727,68 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("gfxpollevents", fn1(any.clone())),
         ("parse", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
         ("compile", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
+        // Numeric math builtins (all numeric args → number).
+        ("num_exp", fn1(num.clone())),
+        ("num_ln", fn1(num.clone())),
+        ("num_min", fn2(num.clone())),
+        ("num_max", fn2(num.clone())),
+        ("num_atan2", fn2(num.clone())),
+        ("clamp", Ty::Fn(vec![num.clone(), num.clone(), num.clone()], Box::new(num.clone()))),
+        // Aggregations over arrays.
+        ("sum", fn1(num.clone())),
+        ("product", fn1(num.clone())),
+        ("min_of", fn1(any.clone())),
+        ("max_of", fn1(any.clone())),
+        ("range", fn1(Ty::Array(Box::new(num.clone())))),
+        // String transforms (→ string).
+        ("str_lower", fn1(str_ty.clone())),
+        ("str_upper", fn1(str_ty.clone())),
+        ("str_slice", fn1(str_ty.clone())),
+        ("str_repeat", fn2(str_ty.clone())),
+        ("str_join", fn2(str_ty.clone())),
+        ("str_format", fn1(str_ty.clone())),
+        ("str_replace_all", Ty::Fn(vec![str_ty.clone(), str_ty.clone(), str_ty.clone()], Box::new(str_ty.clone()))),
+        ("str_pad_left", Ty::Fn(vec![str_ty.clone(), num.clone(), str_ty.clone()], Box::new(str_ty.clone()))),
+        ("str_pad_right", Ty::Fn(vec![str_ty.clone(), num.clone(), str_ty.clone()], Box::new(str_ty.clone()))),
+        ("str_index_of", fn2(num.clone())),
+        ("str_ends_with", fn2(bool_ty.clone())),
+        ("str_to_bytes", fn1(Ty::Array(Box::new(num.clone())))),
+        ("bytes_to_str", fn1(str_ty.clone())),
+        // Type predicates (→ bool).
+        ("is_array", fn1(bool_ty.clone())),
+        ("is_bool", fn1(bool_ty.clone())),
+        ("is_fn", fn1(bool_ty.clone())),
+        ("is_map", fn1(bool_ty.clone())),
+        ("is_nil", fn1(bool_ty.clone())),
+        ("is_number", fn1(bool_ty.clone())),
+        ("is_string", fn1(bool_ty.clone())),
+        ("is_frozen", fn1(bool_ty.clone())),
+        // FS / env / process (precise where the return is obvious).
+        ("fs_read", fn1(str_ty.clone())),
+        ("fs_exists", fn1(bool_ty.clone())),
+        ("env_get", fn1(str_ty.clone())),
+        ("cwd", fn0(str_ty.clone())),
+        ("platform", fn0(str_ty.clone())),
+        ("os_args", fn0(Ty::Array(Box::new(str_ty.clone())))),
+        // Hashing / encoding (→ string).
+        ("sha256", fn1(str_ty.clone())),
+        ("hex_encode", fn1(str_ty.clone())),
+        ("hex_decode", fn1(str_ty.clone())),
+        ("base64_encode", fn1(str_ty.clone())),
+        ("base64_decode", fn1(str_ty.clone())),
+        ("url_encode", fn1(str_ty.clone())),
+        ("url_decode", fn1(str_ty.clone())),
     ] {
         env.insert(name.to_string(), ty);
+    }
+
+    // Backstop: every remaining VM builtin is seeded as a known global value so
+    // the checker never emits a false "variable not declared" for a legitimate
+    // builtin. Callable (calling `Any` yields `Any`); precise entries above win.
+    for name in ALL_VM_BUILTINS {
+        if env.get(name).is_none() {
+            env.insert((*name).to_string(), Ty::Any);
+        }
     }
 }
 
@@ -2076,6 +2189,50 @@ mod tests {
             "thread/json builtins should be known: {:?}",
             undeclared
         );
+    }
+
+    #[test]
+    fn test_common_numeric_and_io_builtins_are_known() {
+        // Regression: these are all real VM builtins but were missing from the
+        // prelude, so the checker emitted false "variable not declared" errors
+        // (the long-standing math.sapp / stdlib lint noise).
+        let diags = typecheck_source(
+            r#"
+            print num_exp(1);
+            print num_ln(2);
+            print num_min(1, 2);
+            print num_max(1, 2);
+            print range(10);
+            print str_lower("X");
+            print str_upper("y");
+            print env_get("PATH");
+            fs_append("f", "x");
+            print fs_read("f");
+            "#,
+        );
+        let undeclared: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("not declared"))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "common VM builtins must be known to the checker: {:?}",
+            undeclared
+        );
+    }
+
+    #[test]
+    fn test_every_vm_builtin_name_is_seeded() {
+        // Drift guard: every builtin the VM registers must be known to the
+        // checker, or stdlib that uses it gets false "not declared" noise.
+        let mut env = Env::new();
+        seed_builtin_prelude(&mut env);
+        let missing: Vec<&str> = ALL_VM_BUILTINS
+            .iter()
+            .filter(|n| env.get(n).is_none())
+            .copied()
+            .collect();
+        assert!(missing.is_empty(), "builtins missing from prelude: {missing:?}");
     }
 
     #[test]
