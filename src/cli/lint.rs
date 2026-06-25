@@ -299,23 +299,24 @@ pub(crate) fn handle_lint(args: Vec<String>) {
                         eprintln!("{}: {}", path_str, d.message);
                     }
                 }
-                if diags.is_empty() {
-                    for (sp, msg) in lint_unused_warnings(&stmts) {
-                        eprintln!("{}:{}..{}: warning: {}", path_str, sp.start, sp.end, msg);
-                    }
-                    for d in pblang_lint::lint(&stmts) {
-                        eprintln!(
-                            "{}:{}..{}: warning: {} [{}: {}]",
-                            path_str,
-                            d.span.start,
-                            d.span.end,
-                            d.message,
-                            d.category.as_str(),
-                            d.name
-                        );
-                        if let Some(help) = &d.help {
-                            eprintln!("    help: {}", help);
-                        }
+                // Style / correctness lints are orthogonal to type errors — run
+                // them regardless of whether the type checker had findings, so a
+                // single type note can't hide every style/correctness lint.
+                for (sp, msg) in lint_unused_warnings(&stmts) {
+                    eprintln!("{}:{}..{}: warning: {}", path_str, sp.start, sp.end, msg);
+                }
+                for d in pblang_lint::lint(&stmts) {
+                    eprintln!(
+                        "{}:{}..{}: warning: {} [{}: {}]",
+                        path_str,
+                        d.span.start,
+                        d.span.end,
+                        d.message,
+                        d.category.as_str(),
+                        d.name
+                    );
+                    if let Some(help) = &d.help {
+                        eprintln!("    help: {}", help);
                     }
                 }
             }
