@@ -274,9 +274,15 @@ pub(super) fn channel_buffered_builtin(
         }
     };
     let id = reg.channel_next.fetch_add(1, Ordering::SeqCst);
+    // `capacity` is the *logical* bound enforced by send/recv; it must NOT be
+    // eagerly allocated. A program asking for a giant capacity (e.g.
+    // `channel_buffered(1e18)`) would otherwise hit `VecDeque::with_capacity`'s
+    // "capacity overflow"/OOM abort and crash the runtime. Preallocate only a
+    // small amount; the deque grows on demand up to `capacity`.
+    const CHANNEL_PREALLOC_CAP: usize = 1024;
     let cb = VmChannelBuf {
         buf: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
-            capacity,
+            capacity.min(CHANNEL_PREALLOC_CAP),
         ))),
         closed: Arc::new(AtomicBool::new(false)),
         capacity,
