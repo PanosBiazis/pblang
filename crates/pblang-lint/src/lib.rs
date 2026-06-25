@@ -15,7 +15,7 @@
 //! | name                 | category    | flags                                            |
 //! |----------------------|-------------|--------------------------------------------------|
 //! | `bool_comparison`    | style       | `x == true`, `x != false`, …                     |
-//! | `eq_op`              | correctness | identical operands: `a == a`, `a - a`, `a / a`   |
+//! | `eq_op`              | correctness | identical operands: `a == a`, `a < a`, `a - a`, `a / a` |
 //! | `double_not`         | complexity  | `not (not x)`                                     |
 //! | `self_assignment`    | correctness | `x = x`                                           |
 //! | `constant_condition` | correctness | `if true`/`if false`/`while false`               |
@@ -125,6 +125,22 @@ fn check_expr_lints(e: &Expr, out: &mut Vec<LintDiagnostic>) {
                         }
                         .into(),
                     ),
+                    span: e.span,
+                });
+            }
+        }
+        // Only the STRICT relational ops are flagged: `a < a` / `a > a` are
+        // always false, even under IEEE-754 (NaN compares false to everything).
+        // `a <= a` / `a >= a` are deliberately NOT flagged — like `a == a` /
+        // `a != a`, they are the idiomatic NaN test (`NaN <= NaN` is false), so
+        // flagging them would be a false positive.
+        ExprKind::Lt(a, b) | ExprKind::Gt(a, b) => {
+            if pure_expr_eq(a, b) {
+                out.push(LintDiagnostic {
+                    name: "eq_op",
+                    category: LintCategory::Correctness,
+                    message: "both operands of this comparison are identical".into(),
+                    help: Some("this comparison is always false".into()),
                     span: e.span,
                 });
             }
@@ -436,6 +452,25 @@ mod tests {
         assert!(has_lint("let r = a - a", "eq_op"));
         assert!(has_lint("let r = a / a", "eq_op"));
         assert!(has_lint("let r = a.b.c == a.b.c", "eq_op"));
+    }
+
+    #[test]
+    fn eq_op_strict_relational_identical_operands() {
+        // `a < a` / `a > a` are always false (NaN included) → flag as a likely typo.
+        assert!(has_lint("let r = a < a", "eq_op"));
+        assert!(has_lint("let r = a > a", "eq_op"));
+        assert!(has_lint("let r = a.b < a.b", "eq_op"));
+        // Different or impure operands never fire.
+        assert!(!has_lint("let r = a < b", "eq_op"));
+        assert!(!has_lint("let r = f() < f()", "eq_op"));
+    }
+
+    #[test]
+    fn eq_op_does_not_flag_nan_idiom_relationals() {
+        // `a <= a` / `a >= a` are the idiomatic NaN test (NaN <= NaN is false),
+        // not constant — flagging them would be a false positive.
+        assert!(!has_lint("let r = a <= a", "eq_op"));
+        assert!(!has_lint("let r = a >= a", "eq_op"));
     }
 
     #[test]
