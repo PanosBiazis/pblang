@@ -14,9 +14,98 @@
 //   heavy Python C API libraries and works with any Python installation.
 
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
+
+/// Hard cap on `shots`. A simulator runs the circuit once per shot, so an
+/// unbounded count (e.g. a script passing 4_000_000_000) is a denial-of-service.
+/// 1,000,000 is far beyond any realistic sampling need.
+const MAX_SHOTS: u32 = 1_000_000;
+
+/// Wall-clock budget for the Python subprocess. Without it, a hung interpreter
+/// (pathological circuit, deadlocked SDK) hangs the pblang program forever.
+/// Overridable via `PBLANG_QUANTUM_TIMEOUT_SECS`.
+fn quantum_timeout() -> Duration {
+    let secs = std::env::var("PBLANG_QUANTUM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(120);
+    Duration::from_secs(secs)
+}
+
+/// Clamp a requested shot count into `[1, MAX_SHOTS]`.
+fn clamp_shots(requested: u32) -> u32 {
+    requested.clamp(1, MAX_SHOTS)
+}
+
+/// Run a Python `script` with `qasm` on stdin and `PBLANG_QUANTUM_SHOTS=shots`,
+/// returning its stdout. Enforces a wall-clock `timeout` (kills the child on
+/// expiry) and drains stdout/stderr on separate threads so a large statevector
+/// dump can't deadlock against a full pipe buffer. stdin is closed after writing
+/// so Python's `sys.stdin.read()` sees EOF.
+fn run_python(script: &str, qasm: &str, shots: &str, timeout: Duration) -> Result<String, String> {
+    let python = find_python()?;
+    let mut child = Command::new(&python)
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("PBLANG_QUANTUM_SHOTS", shots)
+        .spawn()
+        .map_err(|e| format!("Failed to start Python ({python}): {e}"))?;
+
+    {
+        let mut stdin = child.stdin.take().ok_or("Python stdin unavailable")?;
+        stdin
+            .write_all(qasm.as_bytes())
+            .map_err(|e| format!("Failed to write QASM to Python stdin: {e}"))?;
+        // stdin dropped here → EOF for `sys.stdin.read()`.
+    }
+
+    let mut out = child.stdout.take().ok_or("Python stdout unavailable")?;
+    let mut err = child.stderr.take().ok_or("Python stderr unavailable")?;
+    let out_h = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out.read_to_end(&mut v);
+        v
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err.read_to_end(&mut v);
+        v
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("Failed to wait for Python: {e}"))? {
+            Some(st) => break st,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_h.join();
+                    let _ = err_h.join();
+                    return Err(format!(
+                        "Python quantum subprocess timed out after {}s (set PBLANG_QUANTUM_TIMEOUT_SECS to change)",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out_h.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&err_h.join().unwrap_or_default()).into_owned();
+    if !status.success() {
+        return Err(format!("Python process failed: {stderr}"));
+    }
+    Ok(stdout)
+}
 
 // ─────────────────────────────────────────────────────
 // Common types
@@ -243,40 +332,14 @@ fn find_python() -> Result<String, String> {
 
 /// Execute QASM circuit on a quantum backend.
 pub fn run_qasm(qasm: &str, backend: QuantumBackend, shots: u32) -> Result<QuantumResult, String> {
-    let python = find_python()?;
     let script = match backend {
         QuantumBackend::QiskitAer | QuantumBackend::QiskitIBMQ => QISKIT_SCRIPT,
         QuantumBackend::CirqLocal => CIRQ_SCRIPT,
         QuantumBackend::BraketLocal | QuantumBackend::BraketAws => BRAKET_SCRIPT,
     };
+    let shots = clamp_shots(shots);
 
-    let mut child = Command::new(&python)
-        .arg("-c")
-        .arg(script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("PBLANG_QUANTUM_SHOTS", shots.to_string())
-        .spawn()
-        .map_err(|e| format!("Failed to start Python ({python}): {e}"))?;
-
-    // Write QASM to stdin
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
-            .write_all(qasm.as_bytes())
-            .map_err(|e| format!("Failed to write QASM to Python stdin: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for Python: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Python process failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = run_python(script, qasm, &shots.to_string(), quantum_timeout())?;
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .map_err(|e| format!("Failed to parse Python output as JSON: {e}\nOutput: {stdout}"))?;
 
@@ -316,34 +379,14 @@ pub fn run_qasm(qasm: &str, backend: QuantumBackend, shots: u32) -> Result<Quant
 
 /// Run QASM and get the statevector.
 pub fn get_statevector(qasm: &str, backend: QuantumBackend) -> Result<QuantumStatevector, String> {
-    let python = find_python()?;
     let script = match backend {
         QuantumBackend::QiskitAer | QuantumBackend::QiskitIBMQ => QISKIT_SCRIPT,
         QuantumBackend::CirqLocal => CIRQ_SCRIPT,
         _ => QISKIT_SCRIPT, // Braket statevector not supported in this MVP
     };
 
-    let mut child = Command::new(&python)
-        .arg("-c")
-        .arg(script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("PBLANG_QUANTUM_SHOTS", "1") // only need 1 shot for statevector
-        .spawn()
-        .map_err(|e| format!("Failed to start Python ({python}): {e}"))?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
-            .write_all(qasm.as_bytes())
-            .map_err(|e| format!("Failed to write QASM to Python stdin: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for Python: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Only need 1 shot for the statevector.
+    let stdout = run_python(script, qasm, "1", quantum_timeout())?;
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse Python output: {e}"))?;
 
@@ -404,6 +447,57 @@ pub fn statevector_to_json(s: &QuantumStatevector) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_shots_bounds_dos() {
+        assert_eq!(clamp_shots(1024), 1024);
+        assert_eq!(clamp_shots(0), 1); // at least one shot
+        assert_eq!(clamp_shots(u32::MAX), MAX_SHOTS); // capped, no simulator hang
+        assert_eq!(clamp_shots(MAX_SHOTS + 1), MAX_SHOTS);
+    }
+
+    #[test]
+    fn run_python_kills_a_hung_subprocess() {
+        // A Python process that would run for 30s must be killed at the timeout,
+        // not hang the caller forever. Needs a python3 on the box.
+        if find_python().is_err() {
+            eprintln!("no python; skipping");
+            return;
+        }
+        let start = Instant::now();
+        let r = run_python(
+            "import time, sys\nsys.stdin.read()\ntime.sleep(30)\nprint('never')",
+            "",
+            "1",
+            Duration::from_millis(700),
+        );
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "a hung subprocess must return Err");
+        assert!(
+            r.unwrap_err().contains("timed out"),
+            "error should say it timed out"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must return promptly after the timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn run_python_round_trips_stdin_to_stdout() {
+        if find_python().is_err() {
+            eprintln!("no python; skipping");
+            return;
+        }
+        let out = run_python(
+            "import sys; sys.stdout.write(sys.stdin.read().upper())",
+            "hello",
+            "1",
+            Duration::from_secs(10),
+        )
+        .expect("python should run");
+        assert_eq!(out, "HELLO");
+    }
 
     #[test]
     fn test_backend_from_str() {
