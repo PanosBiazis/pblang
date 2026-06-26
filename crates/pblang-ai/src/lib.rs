@@ -193,6 +193,23 @@ pub struct TokenCount {
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Truncate `s` to at most `max` bytes, ending on a UTF-8 char boundary.
+///
+/// Used to embed a snippet of an (untrusted) response body in an error message.
+/// A plain `&s[..max]` byte slice panics when `max` lands mid-character — and
+/// provider/error responses are routinely non-ASCII — so this backs off to the
+/// nearest boundary instead.
+fn truncate_for_error(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn http_post_json(
     url: &str,
     body: serde_json::Value,
@@ -218,7 +235,7 @@ fn http_post_json(
     serde_json::from_str(&resp_body).map_err(|e| {
         format!(
             "parse JSON response: {e} (body: {})",
-            &resp_body[..resp_body.len().min(500)]
+            truncate_for_error(&resp_body, 500)
         )
     })
 }
@@ -245,7 +262,7 @@ pub fn http_get_json(
     serde_json::from_str(&resp_body).map_err(|e| {
         format!(
             "parse JSON response: {e} (body: {})",
-            &resp_body[..resp_body.len().min(500)]
+            truncate_for_error(&resp_body, 500)
         )
     })
 }
@@ -833,6 +850,23 @@ pub fn embeddings_to_json(embeddings: &[f64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_for_error_never_splits_a_char() {
+        // A response body whose byte-500 boundary lands mid-UTF-8 char must not
+        // panic when truncated for an error message. Build a string where a
+        // 3-byte char straddles the cut point.
+        let s = format!("{}\u{4e16}{}", "a".repeat(499), "b".repeat(50)); // 'a'*499 + '世'(3B) + 'b'*50
+        assert!(!s.is_char_boundary(500), "test setup: byte 500 must be mid-char");
+        let t = truncate_for_error(&s, 500);
+        assert!(t.len() <= 500);
+        // The result is valid UTF-8 (it's a &str), and is a prefix of s.
+        assert!(s.starts_with(t));
+        // Short strings pass through unchanged.
+        assert_eq!(truncate_for_error("héllo", 500), "héllo");
+        // ASCII cuts exactly.
+        assert_eq!(truncate_for_error("abcdef", 3), "abc");
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {
