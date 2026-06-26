@@ -38,8 +38,14 @@ pub(crate) fn format_ide_source(src: &str, max_line_length: Option<usize>) -> St
 
     for line in &lines {
         let mut trimmed = line.trim().to_string();
-        trimmed = fmt_normalize_operator_spacing(&trimmed);
-        trimmed = fmt_normalize_comma_spacing(&trimmed);
+        // A line beginning INSIDE a block comment (an unclosed `/*` from a prior
+        // line) is comment text — never normalize it, or interior operators and
+        // commas would be rewritten. Single-line `//` and inline `/* ... */` are
+        // handled inside the normalizers themselves.
+        if block_comment_depth == 0 {
+            trimmed = fmt_normalize_operator_spacing(&trimmed);
+            trimmed = fmt_normalize_comma_spacing(&trimmed);
+        }
         if trimmed.is_empty() {
             out.push('\n');
             continue;
@@ -181,6 +187,22 @@ pub(crate) fn scan_line_for_braces(
 
 /// Normalize spacing around binary operators (outside string literals). Ensures one space
 /// before and after + - * / == != < > <= >=. Does not change content inside "...".
+/// Index just past the matching `*/` for a block comment opening at `start`
+/// (where `bytes[start..start+2] == "/*"`), or `bytes.len()` if it is not closed
+/// on the line. The spacing normalizers copy `/* ... */` (and `// ...`) regions
+/// VERBATIM so they never rewrite comment text — a comment is not code, and
+/// rewriting `//` into `/ /` would change program meaning.
+fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
+    let mut j = start + 2;
+    while j < bytes.len() {
+        if j + 1 < bytes.len() && bytes[j] == b'*' && bytes[j + 1] == b'/' {
+            return j + 2;
+        }
+        j += 1;
+    }
+    bytes.len()
+}
+
 pub(crate) fn fmt_normalize_operator_spacing(line: &str) -> String {
     let mut in_string = false;
     let mut escape_next = false;
@@ -209,6 +231,18 @@ pub(crate) fn fmt_normalize_operator_spacing(line: &str) -> String {
             in_string = true;
             out.push(c);
             i += 1;
+            continue;
+        }
+        // Comments are not code: copy them verbatim so operator spacing never
+        // rewrites `//` into `/ /` or touches `/* ... */` interiors.
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            out.push_str(std::str::from_utf8(&bytes[i..]).unwrap_or(""));
+            break;
+        }
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let bend = skip_block_comment(bytes, i);
+            out.push_str(std::str::from_utf8(&bytes[i..bend]).unwrap_or(""));
+            i = bend;
             continue;
         }
         let need_space_before = !out.is_empty()
@@ -305,6 +339,17 @@ pub(crate) fn fmt_normalize_comma_spacing(line: &str) -> String {
             in_string = true;
             out.push(c);
             i += 1;
+            continue;
+        }
+        // Comments are not code: copy them verbatim (commas in comments are text).
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            out.push_str(std::str::from_utf8(&bytes[i..]).unwrap_or(""));
+            break;
+        }
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let bend = skip_block_comment(bytes, i);
+            out.push_str(std::str::from_utf8(&bytes[i..bend]).unwrap_or(""));
+            i = bend;
             continue;
         }
         if c == ',' {
