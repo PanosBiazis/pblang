@@ -13,7 +13,7 @@
 //! `PBLANG_GFX=sdl2` is set, each builtin delegates to the
 //! `sdl2_backend` module instead.
 
-use minifb::{KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -92,6 +92,17 @@ where
             .ok_or_else(|| host.err(format!("{what}: invalid handle")))?;
         f(w)
     })
+}
+
+fn insert_key_modifiers(m: &mut HashMap<String, Value>, win: &Window) {
+    let shift = win.is_key_down(Key::LeftShift) || win.is_key_down(Key::RightShift);
+    let ctrl = win.is_key_down(Key::LeftCtrl) || win.is_key_down(Key::RightCtrl);
+    let alt = win.is_key_down(Key::LeftAlt) || win.is_key_down(Key::RightAlt);
+    let meta = win.is_key_down(Key::LeftSuper) || win.is_key_down(Key::RightSuper);
+    m.insert("shift".into(), Value::Bool(shift));
+    m.insert("ctrl".into(), Value::Bool(ctrl));
+    m.insert("alt".into(), Value::Bool(alt));
+    m.insert("meta".into(), Value::Bool(meta));
 }
 
 fn alloc_array(items: Vec<Value>) -> Value {
@@ -291,9 +302,11 @@ pub fn gfxdrawpoint(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Ru
         });
     }
     with_window_mut(host, id, "gfxdrawpoint", |gw| {
-        let px = x.max(0).min(gw.w as i64 - 1) as usize;
-        let py = y.max(0).min(gw.h as i64 - 1) as usize;
-        gw.buf[py * gw.w + px] = c;
+        // An off-screen point is a no-op. The previous code CLAMPED to the nearest
+        // edge, which silently painted a phantom pixel on the border.
+        if x >= 0 && y >= 0 && x < gw.w as i64 && y < gw.h as i64 {
+            gw.buf[y as usize * gw.w + x as usize] = c;
+        }
         Ok(Value::Nil)
     })
 }
@@ -346,14 +359,95 @@ struct LineParams {
     color: u32,
 }
 
+/// Cohen–Sutherland: clip the segment to the inclusive pixel rect
+/// `[0, w-1] × [0, h-1]`. Returns the clipped integer endpoints, or `None` if
+/// the segment is entirely outside the viewport.
+///
+/// This is what makes line drawing safe against huge user coordinates: without
+/// it, `draw_line_bresenham` iterates `max(|dx|,|dy|)` times, so a line to a
+/// 10^12 endpoint hangs the program. Clipping first bounds the loop to the
+/// framebuffer while preserving the line's slope (so partially-visible lines
+/// still render correctly).
+pub(crate) fn clip_line(
+    x1: i64,
+    y1: i64,
+    x2: i64,
+    y2: i64,
+    w: usize,
+    h: usize,
+) -> Option<(i64, i64, i64, i64)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    const INSIDE: u8 = 0;
+    const LEFT: u8 = 1;
+    const RIGHT: u8 = 2;
+    const BOTTOM: u8 = 4;
+    const TOP: u8 = 8;
+    let (xmax, ymax) = ((w - 1) as f64, (h - 1) as f64);
+    let code = |x: f64, y: f64| -> u8 {
+        let mut c = INSIDE;
+        if x < 0.0 {
+            c |= LEFT;
+        } else if x > xmax {
+            c |= RIGHT;
+        }
+        if y < 0.0 {
+            c |= BOTTOM;
+        } else if y > ymax {
+            c |= TOP;
+        }
+        c
+    };
+    let (mut ax, mut ay, mut bx, mut by) = (x1 as f64, y1 as f64, x2 as f64, y2 as f64);
+    let mut ca = code(ax, ay);
+    let mut cb = code(bx, by);
+    loop {
+        if ca | cb == 0 {
+            return Some((
+                ax.round() as i64,
+                ay.round() as i64,
+                bx.round() as i64,
+                by.round() as i64,
+            ));
+        }
+        if ca & cb != 0 {
+            return None; // both share an outside half-plane → fully outside
+        }
+        // Clip the endpoint that is outside. The chosen edge guarantees a
+        // non-degenerate denominator (a horizontal line never selects TOP/BOTTOM,
+        // a vertical line never selects LEFT/RIGHT — such lines share the bit on
+        // both ends and are rejected by the `ca & cb` test above).
+        let out = if ca != 0 { ca } else { cb };
+        let (nx, ny) = if out & TOP != 0 {
+            (ax + (bx - ax) * (ymax - ay) / (by - ay), ymax)
+        } else if out & BOTTOM != 0 {
+            (ax + (bx - ax) * (0.0 - ay) / (by - ay), 0.0)
+        } else if out & RIGHT != 0 {
+            (xmax, ay + (by - ay) * (xmax - ax) / (bx - ax))
+        } else {
+            (0.0, ay + (by - ay) * (0.0 - ax) / (bx - ax))
+        };
+        if out == ca {
+            ax = nx;
+            ay = ny;
+            ca = code(ax, ay);
+        } else {
+            bx = nx;
+            by = ny;
+            cb = code(bx, by);
+        }
+    }
+}
+
 fn draw_line_bresenham(buf: &mut [u32], w: usize, h: usize, params: LineParams) {
-    let LineParams {
-        x1,
-        y1,
-        x2,
-        y2,
-        color,
-    } = params;
+    let color = params.color;
+    // Clip to the viewport first so the loop is bounded by the framebuffer, not
+    // by the (possibly enormous) user-supplied coordinates.
+    let (x1, y1, x2, y2) = match clip_line(params.x1, params.y1, params.x2, params.y2, w, h) {
+        Some(c) => c,
+        None => return,
+    };
     let mut x = x1;
     let mut y = y1;
     let dx = (x2 - x1).abs();
@@ -457,6 +551,7 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
             let mut m = HashMap::new();
             m.insert("type".into(), alloc_string("keydown"));
             m.insert("key".into(), alloc_string(format!("{k:?}")));
+            insert_key_modifiers(&mut m, &gw.win);
             out.push(alloc_map(m));
         }
 
@@ -466,6 +561,7 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
             let mut m = HashMap::new();
             m.insert("type".into(), alloc_string("keyup"));
             m.insert("key".into(), alloc_string(format!("{k:?}")));
+            insert_key_modifiers(&mut m, &gw.win);
             out.push(alloc_map(m));
         }
 
@@ -621,4 +717,55 @@ pub fn gfx_builtins() -> Vec<pblang_ir::BuiltinFn> {
             fun: gfxclosewindow,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_line_keeps_fully_inside_segment() {
+        assert_eq!(clip_line(2, 3, 5, 6, 10, 10), Some((2, 3, 5, 6)));
+    }
+
+    #[test]
+    fn clip_line_rejects_fully_outside_segment() {
+        assert_eq!(clip_line(-5, -5, -3, -3, 10, 10), None);
+        assert_eq!(clip_line(20, 20, 30, 30, 10, 10), None);
+    }
+
+    #[test]
+    fn clip_line_clips_horizontal_crossing() {
+        // y=5 line spanning far left..far right clips to the pixel row [0..9].
+        assert_eq!(clip_line(-1000, 5, 1000, 5, 10, 10), Some((0, 5, 9, 5)));
+    }
+
+    #[test]
+    fn clip_line_bounds_huge_endpoint() {
+        // The DoS case: a line to a 10^12 endpoint must clip to the viewport so
+        // the Bresenham loop is bounded by the framebuffer, not the coordinate.
+        let (cx1, cy1, cx2, cy2) =
+            clip_line(0, 0, 1_000_000_000_000, 0, 10, 10).expect("crosses viewport");
+        assert!((0..10).contains(&cx1) && (0..10).contains(&cx2));
+        assert!((0..10).contains(&cy1) && (0..10).contains(&cy2));
+    }
+
+    #[test]
+    fn draw_line_with_huge_endpoint_terminates_and_draws_visible_pixels() {
+        // Without viewport clipping this loops ~10^12 times (an effective hang).
+        // It must complete and color the on-screen run.
+        let (w, h) = (16usize, 16usize);
+        let mut buf = vec![0u32; w * h];
+        draw_line_bresenham(
+            &mut buf,
+            w,
+            h,
+            LineParams { x1: 0, y1: 0, x2: 1_000_000_000_000, y2: 0, color: 0xABCDEF },
+        );
+        // Row 0 should be fully colored; no write landed out of bounds (the test
+        // completing without panic/hang is itself the assertion).
+        for x in 0..w {
+            assert_eq!(buf[x], 0xABCDEF, "pixel ({x},0) should be drawn");
+        }
+    }
 }

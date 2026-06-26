@@ -12,6 +12,7 @@
 
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 use sdl2::event::Event;
+use sdl2::keyboard::Mod;
 use sdl2::mouse::MouseButton as SdlMouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
@@ -78,6 +79,17 @@ pub(crate) fn create(
     Ok(win)
 }
 
+fn insert_key_modifiers(m: &mut HashMap<String, Value>, keymod: Mod) {
+    let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+    let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD);
+    let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+    let meta = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
+    m.insert("shift".into(), Value::Bool(shift));
+    m.insert("ctrl".into(), Value::Bool(ctrl));
+    m.insert("alt".into(), Value::Bool(alt));
+    m.insert("meta".into(), Value::Bool(meta));
+}
+
 pub(crate) fn insert(id: usize, win: Sdl2Window) {
     GFX_SDL2_WINDOWS.with(|tbl| tbl.borrow_mut().insert(id, win));
 }
@@ -135,6 +147,14 @@ impl Sdl2Window {
     pub fn draw_line(&mut self, x1: i64, y1: i64, x2: i64, y2: i64, color: u32) {
         let w = self.w as i64;
         let h = self.h as i64;
+        // Clip to the viewport first so a huge user coordinate can't make this
+        // Bresenham loop run ~max(|dx|,|dy|) times (an effective hang). Shares
+        // the unit-tested clipper with the minifb path.
+        let (x1, y1, x2, y2) =
+            match crate::graphics::clip_line(x1, y1, x2, y2, self.w as usize, self.h as usize) {
+                Some(c) => c,
+                None => return,
+            };
         let mut x = x1;
         let mut y = y1;
         let dx = (x2 - x1).abs();
@@ -230,7 +250,9 @@ impl Sdl2Window {
                     out.push(alloc_map(m));
                 }
                 Event::KeyDown {
-                    keycode: Some(k), ..
+                    keycode: Some(k),
+                    keymod,
+                    ..
                 } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("keydown"));
@@ -238,10 +260,13 @@ impl Sdl2Window {
                         "key".into(),
                         alloc_string(format!("{:?}", k).replace("Keycode::", "")),
                     );
+                    insert_key_modifiers(&mut m, keymod);
                     out.push(alloc_map(m));
                 }
                 Event::KeyUp {
-                    keycode: Some(k), ..
+                    keycode: Some(k),
+                    keymod,
+                    ..
                 } => {
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("keyup"));
@@ -249,6 +274,7 @@ impl Sdl2Window {
                         "key".into(),
                         alloc_string(format!("{:?}", k).replace("Keycode::", "")),
                     );
+                    insert_key_modifiers(&mut m, keymod);
                     out.push(alloc_map(m));
                 }
                 Event::MouseMotion { x, y, .. } => {
