@@ -739,12 +739,23 @@ static PbVal pb_builtin_max_of(PbVal arr) {
     }
     return seen ? PB_NUM(m) : PB_NIL;
 }
+/* Maximum bytes any single string builtin will allocate (mirrors the VM's
+ * MAX_STRING_ALLOC_BYTES = 10 MiB). Bounds memory use and, crucially, makes the
+ * size computation overflow-safe. */
+#define PB_MAX_STR_ALLOC ((size_t)10 * 1024 * 1024)
+
 /* str_repeat(s, n) → s concatenated n times (n>=0). */
 static PbVal pb_builtin_str_repeat(PbVal s, PbVal n) {
     if (s.tag != PB_TAG_STR || n.tag != PB_TAG_NUM || n.num < 0.0) return PB_STR("");
     size_t reps = (size_t)n.num;
     size_t sl = strlen(s.str);
-    char* out = (char*)malloc(sl * reps + 1);
+    /* Reject counts that would overflow `sl*reps+1` or exceed the cap. The
+     * division form never overflows; without this, a large `n` produced an
+     * undersized (wrapped) malloc and the copy loop smashed the heap. */
+    if (sl != 0 && reps > (PB_MAX_STR_ALLOC - 1) / sl) return PB_STR("");
+    size_t total = sl * reps + 1;
+    char* out = (char*)malloc(total);
+    if (!out) return PB_STR("");
     char* op = out;
     for (size_t i = 0; i < reps; i++) { memcpy(op, s.str, sl); op += sl; }
     *op = 0;
@@ -904,8 +915,10 @@ static PbVal pb_builtin_str_pad_left(PbVal s, PbVal width, PbVal pad) {
     size_t w = (size_t)(width.num < 0 ? 0 : width.num);
     size_t cur = strlen(s.str);
     if (cur >= w) return s;
+    if (w > PB_MAX_STR_ALLOC - 1) return s; /* refuse absurd widths (also guards w+1 overflow) */
     char pc = (pad.tag == PB_TAG_STR && pad.str[0]) ? pad.str[0] : ' ';
     char* out = (char*)malloc(w + 1);
+    if (!out) return s;
     size_t fill = w - cur;
     for (size_t i = 0; i < fill; i++) out[i] = pc;
     memcpy(out + fill, s.str, cur);
@@ -917,8 +930,10 @@ static PbVal pb_builtin_str_pad_right(PbVal s, PbVal width, PbVal pad) {
     size_t w = (size_t)(width.num < 0 ? 0 : width.num);
     size_t cur = strlen(s.str);
     if (cur >= w) return s;
+    if (w > PB_MAX_STR_ALLOC - 1) return s; /* refuse absurd widths (also guards w+1 overflow) */
     char pc = (pad.tag == PB_TAG_STR && pad.str[0]) ? pad.str[0] : ' ';
     char* out = (char*)malloc(w + 1);
+    if (!out) return s;
     memcpy(out, s.str, cur);
     for (size_t i = cur; i < w; i++) out[i] = pc;
     out[w] = 0;
