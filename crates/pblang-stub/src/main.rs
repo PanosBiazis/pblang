@@ -48,9 +48,18 @@ fn find_bundle_offset(exe: &[u8]) -> Option<usize> {
     if exe.len() < slen {
         return None;
     }
+    // The embedded bundle is always a gzip stream (magic `1f 8b`). Requiring it
+    // here means the SENTINEL constant that lives in this stub's own .rodata
+    // (a template with no appended bundle) is not mistaken for one — so callers
+    // can show the friendly "no embedded bundle" guidance instead of a cryptic
+    // "invalid gzip header".
+    const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
     for start in (0..=(exe.len() - slen)).rev() {
         if &exe[start..start + slen] == SENTINEL {
-            return Some(start + slen);
+            let payload = start + slen;
+            if exe.len() >= payload + 2 && exe[payload..payload + 2] == GZIP_MAGIC {
+                return Some(payload);
+            }
         }
     }
     None
@@ -148,7 +157,10 @@ fn main() {
             process::exit(1);
         });
         let _cleanup = TempDir(tmp.clone());
-        extract_bundle(tarball, &tmp);
+        extract_bundle(tarball, &tmp).unwrap_or_else(|e| {
+            eprintln!("pblang-stub: {e}");
+            process::exit(1);
+        });
 
         let manifest = tmp.join("pblang.toml");
         if let Ok(contents) = std::fs::read_to_string(&manifest) {
@@ -179,7 +191,10 @@ fn main() {
             eprintln!("pblang-stub: cannot create '{}': {e}", dest.display());
             process::exit(1);
         });
-        extract_bundle(tarball, &dest);
+        extract_bundle(tarball, &dest).unwrap_or_else(|e| {
+            eprintln!("pblang-stub: {e}");
+            process::exit(1);
+        });
         println!("{}", dest.display());
         return;
     }
@@ -190,7 +205,10 @@ fn main() {
         process::exit(1);
     });
     let _cleanup = TempDir(tmp.clone()); // removed on Drop (even on panic)
-    extract_bundle(tarball, &tmp);
+    extract_bundle(tarball, &tmp).unwrap_or_else(|e| {
+        eprintln!("pblang-stub: {e}");
+        process::exit(1);
+    });
 
     // ── 5. Find pblang and run the bundle ──────────────────────────────────────
     let pblang_bin = find_pblang(&exe_path, &tmp);
@@ -223,56 +241,236 @@ fn main() {
 
 // ── Bundle extraction ─────────────────────────────────────────────────────────
 
-fn extract_bundle(tarball: &[u8], dest: &Path) {
+/// Extract the embedded tar.gz `tarball` into `dest`, enforcing that nothing can
+/// escape `dest`. Returns `Err` (never panics/exits) on any malformed or unsafe
+/// entry so callers control the failure, and so the safety properties are unit
+/// testable.
+///
+/// Defenses (defense-in-depth):
+///   - reject absolute paths and any `..` component;
+///   - **allow-list** entry types — only `Regular` files and `Directory`s are
+///     extracted; symlinks, hardlinks, and every exotic type (devices, fifos,
+///     etc.) are rejected (a deny-list would miss future/exotic types);
+///   - verify the joined target stays under `dest`;
+///   - `unpack_in`, which independently enforces containment.
+fn extract_bundle(tarball: &[u8], dest: &Path) -> Result<(), String> {
     let dest_root = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
     let gz = GzDecoder::new(std::io::Cursor::new(tarball));
     let mut archive = Archive::new(gz);
-    let entries = archive.entries().unwrap_or_else(|e| {
-        eprintln!("pblang-stub: failed to read bundle entries: {e}");
-        process::exit(1);
-    });
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("failed to read bundle entries: {e}"))?;
     for entry_res in entries {
-        let mut entry = entry_res.unwrap_or_else(|e| {
-            eprintln!("pblang-stub: failed to read a bundle entry: {e}");
-            process::exit(1);
-        });
-        let entry_path = entry.path().map(|p| p.into_owned()).unwrap_or_else(|e| {
-            eprintln!("pblang-stub: invalid entry path in bundle: {e}");
-            process::exit(1);
-        });
+        let mut entry = entry_res.map_err(|e| format!("failed to read a bundle entry: {e}"))?;
+        let entry_path = entry
+            .path()
+            .map(|p| p.into_owned())
+            .map_err(|e| format!("invalid entry path in bundle: {e}"))?;
         if entry_path.is_absolute()
             || entry_path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
-            eprintln!(
-                "pblang-stub: refusing to extract unsafe bundle path '{}'",
+            return Err(format!(
+                "refusing to extract unsafe bundle path '{}'",
                 entry_path.display()
-            );
-            process::exit(1);
+            ));
         }
+        // Allow-list: only plain files and directories. Symlink/Link/Char/Block/
+        // Fifo/Continuous/GNU* etc. are all rejected so a crafted bundle can't
+        // create a link or device node.
         let entry_type = entry.header().entry_type();
-        if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
-            eprintln!(
-                "pblang-stub: refusing to extract link entry '{}'",
-                entry_path.display()
-            );
-            process::exit(1);
+        if !matches!(entry_type, tar::EntryType::Regular | tar::EntryType::Directory) {
+            return Err(format!(
+                "refusing to extract non-regular entry '{}' (type {:?})",
+                entry_path.display(),
+                entry_type
+            ));
         }
         let target = dest_root.join(&entry_path);
         if !target.starts_with(&dest_root) {
-            eprintln!(
-                "pblang-stub: refusing to extract outside target dir: '{}'",
+            return Err(format!(
+                "refusing to extract outside target dir: '{}'",
                 entry_path.display()
-            );
-            process::exit(1);
+            ));
         }
-        entry.unpack_in(&dest_root).unwrap_or_else(|e| {
-            eprintln!(
-                "pblang-stub: failed to extract '{}': {e}",
-                entry_path.display()
-            );
-            process::exit(1);
-        });
+        entry
+            .unpack_in(&dest_root)
+            .map_err(|e| format!("failed to extract '{}': {e}", entry_path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    /// Write `val` as a right-justified, NUL-terminated octal string into `buf`.
+    fn octal(buf: &mut [u8], val: u64) {
+        let s = format!("{:0width$o}", val, width = buf.len() - 1);
+        let b = s.as_bytes();
+        let n = b.len().min(buf.len() - 1);
+        buf[..n].copy_from_slice(&b[b.len() - n..]);
+        buf[buf.len() - 1] = 0;
+    }
+
+    /// Build a raw ustar 512-byte header. We hand-craft it because the `tar`
+    /// crate's Builder deliberately refuses to *create* unsafe archives (`..`,
+    /// absolute paths) — but a real attacker uses GNU tar, which does. The whole
+    /// point is to feed extract_bundle the kind of archive it must defend against.
+    fn header(name: &str, typeflag: u8, size: u64, linkname: &str) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        let nb = name.as_bytes();
+        let nn = nb.len().min(100);
+        h[..nn].copy_from_slice(&nb[..nn]);
+        // Directories need the execute (search) bit or files can't be created
+        // inside them once unpack applies the mode.
+        let mode = if typeflag == b'5' { 0o755 } else { 0o644 };
+        octal(&mut h[100..108], mode); // mode
+        octal(&mut h[108..116], 0); // uid
+        octal(&mut h[116..124], 0); // gid
+        octal(&mut h[124..136], size); // size
+        octal(&mut h[136..148], 0); // mtime
+        h[156] = typeflag;
+        let lb = linkname.as_bytes();
+        let ln = lb.len().min(100);
+        h[157..157 + ln].copy_from_slice(&lb[..ln]);
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        // checksum: field treated as spaces while summing.
+        for b in &mut h[148..156] {
+            *b = b' ';
+        }
+        let sum: u32 = h.iter().map(|&b| b as u32).sum();
+        let cks = format!("{sum:06o}");
+        h[148..148 + cks.len()].copy_from_slice(cks.as_bytes());
+        h[154] = 0;
+        h[155] = b' ';
+        h
+    }
+
+    /// `(name, typeflag, data, linkname)` → gzip'd raw tar bytes.
+    fn raw_targz(entries: &[(&str, u8, &[u8], &str)]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        for (name, tf, data, link) in entries {
+            tar.extend_from_slice(&header(name, *tf, data.len() as u64, link));
+            tar.extend_from_slice(data);
+            let pad = (512 - (data.len() % 512)) % 512;
+            tar.extend(std::iter::repeat(0u8).take(pad));
+        }
+        tar.extend(std::iter::repeat(0u8).take(1024)); // end-of-archive
+        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    const REG: u8 = b'0';
+    const DIR: u8 = b'5';
+    const SYM: u8 = b'2';
+    const FIFO: u8 = b'6';
+
+    fn tmp() -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "pbstub-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn find_bundle_offset_requires_gzip_magic() {
+        // A bare stub template contains the SENTINEL constant in its own .rodata;
+        // that must NOT be mistaken for an embedded bundle (which is always a
+        // gzip stream, magic 1f 8b). Otherwise the friendly "no bundle" guidance
+        // is unreachable and the user sees a confusing "invalid gzip header".
+        let mut just_sentinel = b"prefix".to_vec();
+        just_sentinel.extend_from_slice(SENTINEL);
+        just_sentinel.extend_from_slice(&[0x00, 0x01, 0x02]); // not gzip
+        assert_eq!(find_bundle_offset(&just_sentinel), None);
+
+        let mut real = b"stub-bytes".to_vec();
+        real.extend_from_slice(SENTINEL);
+        let payload_at = real.len();
+        real.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00]); // gzip magic + header
+        assert_eq!(find_bundle_offset(&real), Some(payload_at));
+    }
+
+    #[test]
+    fn extracts_a_normal_bundle() {
+        let dest = tmp();
+        let gz = raw_targz(&[
+            ("pblang.toml", REG, b"version = \"1.0\"\n", ""),
+            ("sub/", DIR, b"", ""),
+            ("sub/main.sapp", REG, b"print 1;\n", ""),
+        ]);
+        extract_bundle(&gz, &dest).expect("normal bundle extracts");
+        assert_eq!(
+            std::fs::read(dest.join("pblang.toml")).unwrap(),
+            b"version = \"1.0\"\n"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("sub/main.sapp")).unwrap(),
+            b"print 1;\n"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn rejects_parent_dir_traversal() {
+        let dest = tmp();
+        let gz = raw_targz(&[("../escape.txt", REG, b"pwned", "")]);
+        assert!(extract_bundle(&gz, &dest).is_err(), "`..` path must be rejected");
+        assert!(
+            !dest.parent().unwrap().join("escape.txt").exists(),
+            "no file escaped via .."
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn rejects_absolute_path() {
+        let dest = tmp();
+        let evil = std::env::temp_dir().join("pbstub_abs_escape.txt");
+        let _ = std::fs::remove_file(&evil);
+        let gz = raw_targz(&[(evil.to_str().unwrap(), REG, b"pwned", "")]);
+        assert!(
+            extract_bundle(&gz, &dest).is_err(),
+            "absolute path must be rejected"
+        );
+        assert!(!evil.exists(), "absolute-path file must not be written");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn rejects_symlink_entry() {
+        let dest = tmp();
+        let gz = raw_targz(&[("link", SYM, b"", "/etc/passwd")]);
+        assert!(
+            extract_bundle(&gz, &dest).is_err(),
+            "symlink entry must be rejected"
+        );
+        assert!(!dest.join("link").exists(), "symlink must not be created");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn rejects_non_regular_special_entry() {
+        // Allow-list: only Regular + Directory. A fifo (or any exotic type) must
+        // be rejected, not handed to unpack.
+        let dest = tmp();
+        let gz = raw_targz(&[("dev", FIFO, b"", "")]);
+        assert!(
+            extract_bundle(&gz, &dest).is_err(),
+            "fifo/special entry must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }
