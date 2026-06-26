@@ -547,16 +547,40 @@ fn build_cranelift_fn(
     builder.switch_to_block(cl_blocks[0]);
     builder.seal_block(cl_blocks[0]);
 
-    // Extract args from pointer
+    // Extract args from pointer.
     let entry_params = builder.block_params(cl_blocks[0]).to_vec();
     let args_ptr = entry_params[0];
-    // nargs is entry_params[1] but we trust the caller passes the right count
+    let nargs_val = entry_params[1]; // u32 count of args actually supplied (I32)
 
+    // Defend against a caller passing fewer than `arity` args. The previous code
+    // read `arity` f64s from `args_ptr` unconditionally, ignoring `nargs`, so a
+    // short buffer (e.g. `call_jit(fp, &[])`) caused an out-of-bounds host-memory
+    // read (UB / segfault). We only ever LOAD from a guaranteed-valid address:
+    // `args_ptr + i*8` when `i < nargs`, otherwise a scratch stack slot holding
+    // zero. Absent args therefore default to 0 and no OOB read can occur. The
+    // `args_ptr + i*8` arithmetic for an absent slot is never dereferenced.
+    let zero_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+        8,
+        3,
+    ));
+    let zero_addr = builder.ins().stack_addr(ptr_type, zero_slot, 0);
+    let zero_val = if use_i64 {
+        builder.ins().iconst(types::I64, 0)
+    } else {
+        builder.ins().f64const(0.0)
+    };
+    builder.ins().store(MemFlags::trusted(), zero_val, zero_addr, 0);
     for (i, &var) in local_vars.iter().enumerate().take(arity) {
-        let offset = (i * 8) as i32;
-        let val = builder
-            .ins()
-            .load(val_type, MemFlags::trusted(), args_ptr, offset);
+        let arg_addr = builder.ins().iadd_imm(args_ptr, (i * 8) as i64);
+        let i_const = builder.ins().iconst(types::I32, i as i64);
+        let present = builder.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::UnsignedGreaterThan,
+            nargs_val,
+            i_const,
+        );
+        let addr = builder.ins().select(present, arg_addr, zero_addr);
+        let val = builder.ins().load(val_type, MemFlags::trusted(), addr, 0);
         builder.def_var(var, val);
     }
 
@@ -1098,12 +1122,14 @@ pub fn call_jit(fn_ptr: JitFn, args: &[PblangValue]) -> Option<PblangValue> {
             _ => return None, // non-numeric arg → fall back to interpreter
         }
     }
-    // SAFETY: `fn_ptr` is a JitFn produced by this module's compilation
-    // path (signature: `fn(*const f64, u32) -> f64`). The args slice is
-    // built locally above with `f64_args.len()` matching the count we
-    // pass — pointer is valid for `f64_args.len() * 8` bytes during the
-    // call. JIT'd code is execute-able in this process per Cranelift
-    // JITModule contract.
+    // SAFETY: `fn_ptr` is a JitFn produced by this module's compilation path
+    // (signature `fn(*const f64, u32) -> f64`). The pointer is valid for
+    // `f64_args.len() * 8` bytes for the duration of the call, and we pass that
+    // exact count as `nargs`. The JIT'd entry only loads `args[i]` when
+    // `i < nargs` (see `build_cranelift_fn`), defaulting any further params to
+    // 0 — so even if `f64_args.len()` is less than the function's arity, no
+    // read past this buffer occurs. JIT'd code is executable in this process
+    // per the Cranelift JITModule contract.
     let result = unsafe { fn_ptr(f64_args.as_ptr(), f64_args.len() as u32) };
     if result.is_nan() {
         Some(PblangValue::Nil)
@@ -1786,5 +1812,44 @@ mod tests {
                 panic!("print_42 should be JIT-eligible: {reason}")
             }
         }
+    }
+
+    /// SOUNDNESS: a JIT'd function of arity N read N f64s from the `args`
+    /// pointer unconditionally, ignoring `nargs`. Calling (via the safe public
+    /// `call_jit`) with fewer args than the arity therefore read out of bounds.
+    /// Missing args must default to 0.0 and never read past the buffer.
+    #[test]
+    fn jit_fn_with_fewer_args_than_arity_is_memory_safe() {
+        let mut chunk = Chunk::default();
+        let sp = pblang_ir::chunk::Span::default();
+        // fn add(a, b) { return a + b; }
+        chunk.write(OpCode::OpGetLocal(0), sp);
+        chunk.write(OpCode::OpGetLocal(1), sp);
+        chunk.write(OpCode::OpAdd, sp);
+        chunk.write(OpCode::OpReturn, sp);
+        let func = Function {
+            name: Some("add2".into()),
+            arity: 2,
+            min_arity: 2,
+            defaults: vec![],
+            is_vararg: false,
+            chunk,
+            param_types: None,
+        };
+        let mut cache = JitCache::new().expect("JitCache::new");
+        let fp = match cache.compile("add2", &func) {
+            JitResult::Compiled(fp) => fp,
+            JitResult::NotEligible(r) => panic!("add2 should be JIT-eligible: {r}"),
+        };
+        let num = |o: Option<PV>| match o {
+            Some(PV::Number(n)) => n,
+            other => panic!("expected Number, got {other:?}"),
+        };
+        // One arg supplied → missing `b` defaults to 0, never an OOB read.
+        assert_eq!(num(call_jit(fp, &[PV::Number(5.0)])), 5.0);
+        // Zero args (and the empty-slice pointer) → both default to 0.
+        assert_eq!(num(call_jit(fp, &[])), 0.0);
+        // Full args still work.
+        assert_eq!(num(call_jit(fp, &[PV::Number(2.0), PV::Number(3.0)])), 5.0);
     }
 }
