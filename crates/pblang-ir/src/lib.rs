@@ -485,6 +485,15 @@ pub trait VmHost {
         true
     }
 
+    /// Whether `os_exit()` may call `std::process::exit` and terminate the whole
+    /// process. Defaults to true (correct for the `pblang` CLI, where the script
+    /// *is* the process). Embedders (e.g. `pblang-ffi`) set this false so an
+    /// untrusted script cannot kill the host application; `os_exit` then returns
+    /// a recoverable error instead.
+    fn allow_process_exit(&self) -> bool {
+        true
+    }
+
     /// FFI guardrails: when not overridden, allow all (no allowlist). Override to restrict libraries/symbols.
     fn ffi_allowed_library(&self, _path: &str) -> bool {
         true

@@ -249,6 +249,10 @@ pub struct StdlibConfig {
     /// If true, `env_get` may read process environment variables; if false it is
     /// denied (prevents secret exfiltration in a sandbox). Defaults to true.
     pub env: bool,
+    /// If true, `os_exit()` may call `std::process::exit` and terminate the
+    /// process. Defaults to true (correct for the CLI). Embedders set it false
+    /// so an untrusted script cannot kill the host; `os_exit` then errors.
+    pub process_exit: bool,
 }
 
 impl Default for StdlibConfig {
@@ -266,6 +270,7 @@ impl Default for StdlibConfig {
             gfx: true,
             spawn: true,
             env: true,
+            process_exit: true,
         }
     }
 }
@@ -2809,6 +2814,14 @@ impl VmHost for VM {
         // Default true (benign) when no config is set, matching the trait default;
         // an explicit StdlibConfig (CLI/embedder) controls it.
         self.stdlib_config.as_ref().map(|c| c.env).unwrap_or(true)
+    }
+    fn allow_process_exit(&self) -> bool {
+        // Default true (CLI: the script is the process); an embedder's
+        // StdlibConfig sets it false so os_exit can't kill the host.
+        self.stdlib_config
+            .as_ref()
+            .map(|c| c.process_exit)
+            .unwrap_or(true)
     }
 
     /// Library allowlist check. When no policy is set, behaves like the default

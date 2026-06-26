@@ -88,7 +88,11 @@ fn json_to_pblang_expr(v: &serde_json::Value) -> Result<String, String> {
 #[no_mangle]
 pub extern "C" fn pblang_create_vm() -> *mut VmWrapper {
     let w = VmWrapper {
-        vm: VM::with_stdlib(StdlibConfig::default()),
+        // Embedded VMs never let a script call `os_exit()` to terminate the host.
+        vm: VM::with_stdlib(StdlibConfig {
+            process_exit: false,
+            ..StdlibConfig::default()
+        }),
         last_error: CString::new("").unwrap(),
     };
     Box::into_raw(Box::new(w))
@@ -124,6 +128,8 @@ pub extern "C" fn pblang_create_vm_sandboxed(
         // Embedders that haven't opted into env reads shouldn't leak host secrets;
         // tie it to the exec capability (the closest "host access" gate they set).
         env: allow_exec != 0,
+        // Never let an embedded script terminate the host via os_exit().
+        process_exit: false,
     };
     let w = VmWrapper {
         vm: VM::with_stdlib(config),
@@ -419,6 +425,151 @@ pub unsafe extern "C" fn pblang_string_free(s: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_os_exit_does_not_kill_the_host() {
+        // SECURITY: an embedded/untrusted script calling os_exit() must NOT call
+        // std::process::exit and terminate the host. The test process reaching
+        // the assertions at all proves it returned a normal error instead.
+        let vm = pblang_create_vm();
+        let src = std::ffi::CString::new("os_exit(0); print 1;").unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { pblang_eval(vm, src.as_ptr(), &mut out) };
+        assert_ne!(rc, 0, "os_exit in an embedded VM must be a recoverable error");
+        let err = unsafe { pblang_last_error(vm) };
+        assert!(!err.is_null());
+        let msg = unsafe { CStr::from_ptr(err) }.to_string_lossy().to_string();
+        assert!(
+            msg.contains("os_exit") || msg.to_lowercase().contains("not permitted")
+                || msg.to_lowercase().contains("denied"),
+            "expected an os_exit-disabled error, got: {msg}"
+        );
+        if !out.is_null() {
+            unsafe { pblang_string_free(out) };
+        }
+        unsafe { pblang_free_vm(vm) };
+    }
+
+    #[test]
+    fn embedded_sandboxed_os_exit_also_blocked() {
+        // The sandboxed constructor must block host exit too.
+        let vm = pblang_create_vm_sandboxed(0, 0, 0, 0, 0);
+        let src = std::ffi::CString::new("os_exit(7);").unwrap();
+        let rc = unsafe { pblang_eval(vm, src.as_ptr(), std::ptr::null_mut()) };
+        assert_ne!(rc, 0, "sandboxed os_exit must not terminate the host");
+        unsafe { pblang_free_vm(vm) };
+    }
+
+    // ---- Test helpers -----------------------------------------------------
+    unsafe fn eval(vm: *mut VmWrapper, src: &str) -> (i32, Option<String>) {
+        let c = std::ffi::CString::new(src).unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let rc = pblang_eval(vm, c.as_ptr(), &mut out);
+        let s = if out.is_null() {
+            None
+        } else {
+            let v = CStr::from_ptr(out).to_string_lossy().to_string();
+            pblang_string_free(out);
+            Some(v)
+        };
+        (rc, s)
+    }
+
+    #[test]
+    fn eval_round_trip_and_free() {
+        unsafe {
+            let vm = pblang_create_vm();
+            let (rc, out) = eval(vm, "print 1 + 2;");
+            assert_eq!(rc, 0);
+            assert_eq!(out.as_deref(), Some("3"));
+            pblang_free_vm(vm);
+        }
+    }
+
+    #[test]
+    fn call_function_round_trip() {
+        unsafe {
+            let vm = pblang_create_vm();
+            let (rc, _) = eval(vm, "fn add(a, b) { return a + b; }");
+            assert_eq!(rc, 0);
+            let name = std::ffi::CString::new("add").unwrap();
+            let args = std::ffi::CString::new("[2, 3]").unwrap();
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = pblang_call_function(vm, name.as_ptr(), args.as_ptr(), &mut out);
+            assert_eq!(rc, 0);
+            assert_eq!(CStr::from_ptr(out).to_string_lossy(), "5");
+            pblang_string_free(out);
+            pblang_free_vm(vm);
+        }
+    }
+
+    #[test]
+    fn null_pointers_are_handled() {
+        unsafe {
+            assert_eq!(pblang_eval(std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut()), 2);
+            assert_eq!(pblang_set_limits(std::ptr::null_mut(), 0, 0), 1);
+            assert!(pblang_last_error(std::ptr::null_mut()).is_null());
+            // free(null) and string_free(null) must be no-ops, not crashes.
+            pblang_free_vm(std::ptr::null_mut());
+            pblang_string_free(std::ptr::null_mut());
+            let vm = pblang_create_vm();
+            // null source on a valid vm → arg error.
+            assert_eq!(pblang_eval(vm, std::ptr::null(), std::ptr::null_mut()), 2);
+            pblang_free_vm(vm);
+        }
+    }
+
+    #[test]
+    fn sandbox_denies_filesystem() {
+        unsafe {
+            // fs denied (all caps 0).
+            let vm = pblang_create_vm_sandboxed(0, 0, 0, 0, 0);
+            let (rc, _) = eval(vm, "print fs_read(\"/etc/passwd\");");
+            assert_ne!(rc, 0, "fs_read must be denied under the sandbox");
+            let err = CStr::from_ptr(pblang_last_error(vm)).to_string_lossy().to_string();
+            assert!(
+                err.to_lowercase().contains("denied") || err.to_lowercase().contains("access"),
+                "expected a capability-denied error, got: {err}"
+            );
+            pblang_free_vm(vm);
+        }
+    }
+
+    #[test]
+    fn call_function_rejects_injection_in_name() {
+        unsafe {
+            let vm = pblang_create_vm();
+            let name = std::ffi::CString::new("add); evil(").unwrap();
+            let args = std::ffi::CString::new("[]").unwrap();
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = pblang_call_function(vm, name.as_ptr(), args.as_ptr(), &mut out);
+            assert_ne!(rc, 0, "a non-identifier fn_name must be rejected");
+            pblang_free_vm(vm);
+        }
+    }
+
+    #[test]
+    fn call_function_string_arg_is_data_not_code() {
+        // SECURITY: a string argument containing pblang syntax must be passed as
+        // a value, never spliced into executable source.
+        unsafe {
+            let vm = pblang_create_vm();
+            assert_eq!(eval(vm, "fn echo(s) { return s; }").0, 0);
+            let name = std::ffi::CString::new("echo").unwrap();
+            // JSON array with one string: a"); danger = 1; ("b
+            let args = std::ffi::CString::new(r#"["a\"); danger = 1; (\"b"]"#).unwrap();
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = pblang_call_function(vm, name.as_ptr(), args.as_ptr(), &mut out);
+            assert_eq!(rc, 0, "the call should succeed with the string as data");
+            let got = CStr::from_ptr(out).to_string_lossy().to_string();
+            assert_eq!(got, r#"a"); danger = 1; ("b"#, "string arg must round-trip verbatim");
+            pblang_string_free(out);
+            // The injected `danger` global must NOT have been created.
+            let (rc2, out2) = eval(vm, "print danger;");
+            assert_ne!(rc2, 0, "injected global must not exist; got out={out2:?}");
+            pblang_free_vm(vm);
+        }
+    }
 
     #[test]
     fn ffi_version_matches_package_version() {
