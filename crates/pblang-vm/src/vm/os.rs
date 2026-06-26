@@ -4,7 +4,8 @@
 //! `VM::builtins()` (vm.rs):
 //!
 //!   - `os_args()` — `std::env::args().skip(1)` as an array of strings.
-//!   - `os_exit(code)` — `std::process::exit(code)`.
+//!   - `os_exit(code)` — `std::process::exit(code)` when `host.allow_process_exit()`
+//!     (the CLI); embedders disable it so a script can't kill the host (errors instead).
 //!   - `os_signal_trap(name, handler)` — install a real OS signal
 //!     handler via `crate::signals::install`. Stashes the handler in the
 //!     per-VM `signal_handlers` registry (keyed by canonical signal
@@ -45,6 +46,13 @@ pub(super) fn os_exit_builtin(
         Value::Number(n) => n as i32,
         _ => return Err(host.err("os_exit(): expected number".into())),
     };
+    // Embedders (pblang-ffi and any host running untrusted scripts) disable this
+    // so a script cannot terminate the host process. The CLI leaves it enabled.
+    if !host.allow_process_exit() {
+        return Err(host.err(
+            "os_exit(): process exit is not permitted in this (embedded) runtime".into(),
+        ));
+    }
     std::process::exit(code);
 }
 

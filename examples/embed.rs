@@ -22,6 +22,8 @@ fn main() {
         gfx: false,
         spawn: false,
         env: false,
+        // Embedded host: a script must not be able to call os_exit() and kill us.
+        process_exit: false,
     };
 
     let mut vm = VM::with_stdlib(config);
