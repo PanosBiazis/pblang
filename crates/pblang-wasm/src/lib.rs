@@ -244,7 +244,13 @@ pub enum WatInstr {
 struct WasmCtx {
     module: WatModule,
     string_table: Vec<String>,
+    /// Parallel to `string_table`: the linear-memory offset assigned to each
+    /// interned string (its 4-byte length prefix). Cumulative, not fixed-stride.
+    string_offsets: Vec<u32>,
     string_offset: u32,
+    /// Next free offset for the string arena; advances by the actual bytes each
+    /// string uses (a fixed stride overlapped/corrupted strings > the stride).
+    next_string_offset: u32,
     current_fn: Option<String>,
     fn_return_types: HashMap<String, Option<WatType>>,
     loop_start_label: Option<String>,
@@ -258,7 +264,9 @@ impl WasmCtx {
         let mut ctx = WasmCtx {
             module: WatModule::default(),
             string_table: Vec::new(),
+            string_offsets: Vec::new(),
             string_offset: 1024, // Start after null region
+            next_string_offset: 1024,
             current_fn: None,
             fn_return_types: HashMap::new(),
             loop_start_label: None,
@@ -305,15 +313,19 @@ impl WasmCtx {
     }
 
     fn intern_string(&mut self, s: &str) -> u32 {
-        // Check if already interned
+        // Reuse an existing identical string (return its actual offset).
         for (i, existing) in self.string_table.iter().enumerate() {
             if existing == s {
-                return self.string_offset + i as u32 * 256;
+                return self.string_offsets[i];
             }
         }
-        let offset = self.string_offset + self.string_table.len() as u32 * 256;
+        // Place at the next free offset and advance by the exact bytes used —
+        // a 4-byte length prefix + the UTF-8 bytes, rounded up to 4-byte
+        // alignment. (The previous fixed 256-byte stride meant any string longer
+        // than the stride overlapped — and corrupted — the next one.)
+        let offset = self.next_string_offset;
         self.string_table.push(s.to_string());
-        // Add data segment for this string (length-prefixed: 4 bytes len + data)
+        self.string_offsets.push(offset);
         let len = s.len() as u32;
         let mut data = Vec::new();
         data.extend_from_slice(&len.to_le_bytes());
@@ -323,6 +335,8 @@ impl WasmCtx {
             offset,
             data,
         });
+        let used = 4u32.saturating_add(len);
+        self.next_string_offset = offset.saturating_add((used + 3) & !3);
         offset
     }
 
@@ -862,6 +876,23 @@ impl WasmCtx {
             });
         }
 
+        // Grow the declared minimum memory so every interned-string data segment
+        // fits at instantiation. Without this, a string arena exceeding the
+        // initial 64 KiB page would make the module trap when its data segment
+        // is applied past the end of memory.
+        const PAGE: u32 = 65536;
+        let needed_pages = self.next_string_offset.div_ceil(PAGE).max(1);
+        if let Some(mem) = self.module.memories.first_mut() {
+            if mem.min_pages < needed_pages {
+                mem.min_pages = needed_pages;
+            }
+            if let Some(max) = mem.max_pages {
+                if max < mem.min_pages {
+                    mem.max_pages = Some(mem.min_pages);
+                }
+            }
+        }
+
         (self.module, self.warnings)
     }
 }
@@ -1125,6 +1156,157 @@ pub fn compile_to_wat(stmts: Vec<Stmt>) -> Result<(String, Vec<String>), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of this backend is to feed wat2wasm / a wasm runtime, so
+    /// substring checks prove nothing if the WAT is malformed. Parse + validate
+    /// the emitted module with the `wat` crate (pure Rust) and require it valid.
+    fn assert_valid_wat(src: &str) {
+        let stmts = pblang_core::parse(src).expect("parse");
+        let (wat, _warnings) = compile_to_wat(stmts).expect("compile");
+        if let Err(e) = wat::parse_str(&wat) {
+            panic!("emitted WAT is invalid: {e}\n--- WAT ---\n{wat}");
+        }
+    }
+
+    // ── Execution harness: actually RUN the emitted wasm (correctness, not just
+    //    validity) via the pure-Rust `wasmi` interpreter, providing the host
+    //    `env.pblang_print`/`pblang_print_f64` imports. ────────────────────────
+    #[derive(Default)]
+    struct HostOut {
+        text: String,
+    }
+
+    fn instantiate(
+        src: &str,
+    ) -> (wasmi::Store<HostOut>, wasmi::Instance) {
+        let stmts = pblang_core::parse(src).expect("parse");
+        let (wat, _w) = compile_to_wat(stmts).expect("compile");
+        let wasm = wat::parse_str(&wat).expect("wat->wasm");
+        let engine = wasmi::Engine::default();
+        let module = wasmi::Module::new(&engine, &wasm[..]).expect("module");
+        let mut store = wasmi::Store::new(&engine, HostOut::default());
+        let mut linker = wasmi::Linker::new(&engine);
+        linker
+            .func_wrap(
+                "env",
+                "pblang_print",
+                |mut caller: wasmi::Caller<HostOut>, ptr: i32, len: i32| {
+                    let mem = caller
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .expect("memory export");
+                    let data = mem.data(&caller);
+                    let (a, b) = (ptr as usize, ptr as usize + len as usize);
+                    let s = String::from_utf8_lossy(&data[a..b]).into_owned();
+                    caller.data_mut().text.push_str(&s);
+                },
+            )
+            .unwrap();
+        linker
+            .func_wrap(
+                "env",
+                "pblang_print_f64",
+                |mut caller: wasmi::Caller<HostOut>, x: f64| {
+                    caller.data_mut().text.push_str(&format!("{x}"));
+                },
+            )
+            .unwrap();
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate")
+            .start(&mut store)
+            .expect("start");
+        (store, instance)
+    }
+
+    /// Call an exported function with f64 args, return its f64 result.
+    fn call_f64(src: &str, func: &str, args: &[f64]) -> f64 {
+        let (mut store, instance) = instantiate(src);
+        let f = instance.get_func(&store, func).expect("export fn");
+        let params: Vec<wasmi::Val> = args.iter().map(|a| wasmi::Val::F64((*a).into())).collect();
+        let mut results = [wasmi::Val::F64(0.0.into())];
+        f.call(&mut store, &params, &mut results).expect("call");
+        match results[0] {
+            wasmi::Val::F64(v) => v.into(),
+            _ => panic!("expected f64 result"),
+        }
+    }
+
+    /// Call an exported (0-arg) function and return everything it printed.
+    fn run_capture(src: &str, func: &str) -> String {
+        let (mut store, instance) = instantiate(src);
+        let f = instance.get_func(&store, func).expect("export fn");
+        let mut results = [wasmi::Val::F64(0.0.into())];
+        f.call(&mut store, &[], &mut results).expect("call");
+        store.data().text.clone()
+    }
+
+    #[test]
+    fn wasm_arithmetic_executes_correctly() {
+        assert_eq!(call_f64("fn add(a, b) { return a + b; }", "add", &[2.0, 3.0]), 5.0);
+        assert_eq!(call_f64("fn poly(x) { return x * x - x; }", "poly", &[5.0]), 20.0);
+    }
+
+    #[test]
+    fn wasm_loop_and_call_execute_correctly() {
+        // sum of squares 0..n: run(6) = 0+1+4+9+16+25 = 55.
+        let src = "fn sq(x){return x*x;}\nfn run(n){ let t=0; for i n { t = t + sq(i); } return t; }";
+        assert_eq!(call_f64(src, "run", &[6.0]), 55.0);
+    }
+
+    #[test]
+    fn wasm_branch_executes_correctly() {
+        let src = "fn classify(n){ let s=0; if n > 0 { s = 1; } else { s = 2; } return s; }";
+        assert_eq!(call_f64(src, "classify", &[5.0]), 1.0);
+        assert_eq!(call_f64(src, "classify", &[-5.0]), 2.0);
+    }
+
+    #[test]
+    fn wasm_long_string_literal_is_not_corrupted() {
+        // Two adjacent interned strings, the first longer than the 256-byte slot
+        // stride. A fixed-stride layout makes the second segment overwrite the
+        // tail of the first (or overrun memory). Each must print intact.
+        let a = "A".repeat(260);
+        let b = "B".repeat(260);
+        let src = format!("fn show() {{ print \"{a}\"; print \"{b}\"; return 0; }}");
+        let out = run_capture(&src, "show");
+        assert_eq!(out, format!("{a}{b}"), "interned strings must not overlap/corrupt");
+    }
+
+    #[test]
+    fn wasm_string_arena_grows_memory_past_one_page() {
+        // A string arena larger than the initial 64 KiB page must grow the
+        // declared memory, or applying its data segment traps at instantiation.
+        let big = "Z".repeat(70_000); // > 1 page
+        let src = format!("fn show() {{ print \"{big}\"; return 0; }}");
+        let out = run_capture(&src, "show");
+        assert_eq!(out.len(), big.len(), "big string must round-trip intact");
+        assert_eq!(out, big);
+    }
+
+    #[test]
+    fn emitted_wat_is_valid_arithmetic() {
+        assert_valid_wat("fn add(a, b) { return a + b; }");
+    }
+
+    #[test]
+    fn emitted_wat_is_valid_control_flow() {
+        assert_valid_wat(
+            "fn classify(n) { let s = 0; if n > 0 { s = 1; } else { s = 2; } return s; }",
+        );
+    }
+
+    #[test]
+    fn emitted_wat_is_valid_loops_and_calls() {
+        assert_valid_wat(
+            "fn sq(x) { return x * x; }\nfn run(n) { let t = 0; for i n { t = t + sq(i); } return t; }",
+        );
+    }
+
+    #[test]
+    fn emitted_wat_is_valid_logical_and_print() {
+        assert_valid_wat("fn f(a, b) { print \"hi\"; print a + b; return a and b; }");
+    }
 
     #[test]
     fn test_empty_module() {
