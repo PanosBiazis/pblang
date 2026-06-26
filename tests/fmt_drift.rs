@@ -74,13 +74,26 @@ const INDENT_CORPUS: &[(&str, &str)] = &[
         "comma_inside_string_unchanged",
         "fn main() {\nlet s = \"a,b,c\";\nprint s;\n}\n",
     ),
-    // NOTE: snippets containing `//`-line-comments are intentionally
-    // excluded from this corpus. Both formatters' operator-spacing
-    // passes rewrite `//` into `/ /` (they see two `/` operator chars
-    // and insert a space). Until the formatters learn that `//`
-    // begins a line comment, snippets with trailing `// ...` would
-    // round-trip as `/ / ...` — semantically a comment rewrite the
-    // user didn't ask for. Leave it out of the drift corpus.
+    // Comments must be copied VERBATIM by both formatters: the operator/comma
+    // spacing passes skip `//` line comments and `/* ... */` block comments
+    // (incl. multi-line), so they never rewrite `//` into `/ /` or touch comment
+    // interiors. These snippets lock that behavior across both implementations.
+    (
+        "trailing_line_comment",
+        "fn main() {\nlet x=1+2; // sum a+b\nprint x;\n}\n",
+    ),
+    (
+        "full_line_comment",
+        "// header: x*y, z-1\nfn main() {\nprint 1;\n}\n",
+    ),
+    (
+        "inline_block_comment",
+        "fn main() {\nlet z = 4 /* a+b,c */ + 6;\nprint z;\n}\n",
+    ),
+    (
+        "multiline_block_comment",
+        "/* multi\n line a+b\n done */\nfn main() {\nlet w=7+1;\nprint w;\n}\n",
+    ),
 ];
 
 fn run_rust_fmt(mangled: &str, max_line_length: Option<usize>) -> String {

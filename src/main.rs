@@ -4272,8 +4272,15 @@ fn legacy_dispatch(args: Vec<String>) {
                         let mut seen_toplevel_fn = false;
                         for line in &lines {
                             let mut trimmed = line.trim().to_string();
-                            trimmed = fmt_normalize_operator_spacing(&trimmed);
-                            trimmed = fmt_normalize_comma_spacing(&trimmed);
+                            // A line beginning INSIDE a block comment (unclosed
+                            // `/*` from a prior line) is comment text — never
+                            // normalize it, or interior operators/commas would be
+                            // rewritten. `//` and inline `/* ... */` are handled
+                            // inside the normalizers themselves.
+                            if block_comment_depth == 0 {
+                                trimmed = fmt_normalize_operator_spacing(&trimmed);
+                                trimmed = fmt_normalize_comma_spacing(&trimmed);
+                            }
                             if trimmed.is_empty() {
                                 out.push('\n');
                                 last_line_was_blank = true;
