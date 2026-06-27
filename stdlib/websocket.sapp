@@ -16,22 +16,16 @@
 //   parse_frames(bytes: Array<u8>) -> Array<frame> | map{error}
 //   parse_message(bytes: Array<u8>) -> map (reassembled message)
 
+// Frame-size limit (configurable): a frame whose declared payload exceeds this is
+// rejected by the parser BEFORE allocating, so a malicious/oversized length cannot
+// exhaust memory.
+let _CFG = map{ max_payload: 16777216 };   // 16 MiB
+fn set_max_payload(n) { _CFG.max_payload = n; return _CFG.max_payload; }
+fn get_max_payload() { return _CFG.max_payload; }
+
 fn upgrade_response(key) {
     let accept = websocket_accept_key(key);
     return "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
-}
-
-// Pure-pblang XOR for two byte values (0-255).
-fn _byte_xor(a, b) {
-    let result = 0;
-    let bit = 128;
-    while bit >= 1 {
-        let ab = num_floor(a / bit) - num_floor(a / (bit * 2)) * 2;
-        let bb = num_floor(b / bit) - num_floor(b / (bit * 2)) * 2;
-        if ab != bb { result = result + bit; }
-        bit = num_floor(bit / 2);
-    }
-    return result;
 }
 
 // Append every byte of `src` (Array<u8>) onto `dst` (Array<u8>) in place.
@@ -80,21 +74,6 @@ fn _u64_at(data, offset) {
     return n;
 }
 
-// Convert an Array<u8> slice [start, end) into a string. Each byte is
-// emitted via strfromcharcode; bytes < 128 become 1-byte UTF-8, bytes
-// >= 128 expand to 2-byte UTF-8 codepoints. Suitable for text payloads
-// (opcode 1) which are UTF-8 by protocol. For binary payloads the
-// caller should keep the raw byte array.
-fn _bytes_to_text(data, start, end_idx) {
-    let s = "";
-    let i = start;
-    while i < end_idx {
-        s = s + strfromcharcode(data[i]);
-        i = i + 1;
-    }
-    return s;
-}
-
 fn _parse_frame_at(data, start_idx) {
     if data == nil or start_idx < 0 or start_idx >= len(data) or len(data) - start_idx < 2 {
         return map{ error: "frame too short", fin: 0, opcode: 0, masked: 0, payload: "" };
@@ -137,11 +116,16 @@ fn _parse_frame_at(data, start_idx) {
         idx = idx + 4;
     }
 
+    // Reject an oversized DECLARED payload before allocating (DoS guard).
+    if payload_len > _CFG.max_payload {
+        return map{ error: "payload too large", fin: fin, opcode: opcode, masked: masked, payload: "" };
+    }
+
     if len(data) < idx + payload_len {
         return map{ error: "truncated payload", fin: fin, opcode: opcode, masked: masked, payload: "" };
     }
 
-    // Unmask (if needed) into a fresh byte array.
+    // Unmask (if needed) into a fresh byte array, using the native bit_xor.
     let payload_bytes = [];
     let i = 0;
     while i < payload_len {
@@ -152,7 +136,7 @@ fn _parse_frame_at(data, start_idx) {
             if m == 1 { mk = mk1; }
             else if m == 2 { mk = mk2; }
             else if m == 3 { mk = mk3; }
-            array_push(payload_bytes, _byte_xor(b, mk));
+            array_push(payload_bytes, bit_xor(b, mk));
         } else {
             array_push(payload_bytes, b);
         }
@@ -164,7 +148,10 @@ fn _parse_frame_at(data, start_idx) {
         opcode: opcode,
         masked: masked,
         payload_len: payload_len,
-        payload: _bytes_to_text(payload_bytes, 0, len(payload_bytes)),
+        // Text payloads (opcode 1) are UTF-8 by protocol -> decode with bytes_to_str;
+        // for binary/invalid bytes this is meaningless (use payload_bytes), so guard
+        // it so a non-UTF-8 payload can't crash the parser.
+        payload: try bytes_to_str(payload_bytes) catch "",
         payload_bytes: payload_bytes,
         frame_len: (idx + payload_len) - start_idx,
         next_index: idx + payload_len
@@ -231,10 +218,11 @@ fn parse_message(data) {
     return reassemble_fragments(frames);
 }
 
-// write_frame(opcode, payload: string) → Array<u8> (RFC 6455 masked frame).
-// opcode: 1 = text, 2 = binary, 8 = close, 9 = ping, 10 = pong.
-fn write_frame(opcode, payload) {
-    let plen = len(payload);
+// _write_frame_bytes(opcode, bytes: Array<u8>) → RFC 6455 masked frame (Array<u8>).
+// The framing core: the length and masking operate on raw BYTES, so any payload
+// (binary, or UTF-8 text via str_to_bytes) is framed correctly on the wire.
+fn _write_frame_bytes(opcode, bytes) {
+    let plen = len(bytes);
     let out = [];
 
     // Byte 0: FIN=1 (0x80) + opcode.
@@ -253,31 +241,57 @@ fn write_frame(opcode, payload) {
 
     // 4-byte masking key.
     let mask_bytes = random_bytes(4);
-    let mk0 = mask_bytes[0];
-    let mk1 = mask_bytes[1];
-    let mk2 = mask_bytes[2];
-    let mk3 = mask_bytes[3];
-    array_push(out, mk0);
-    array_push(out, mk1);
-    array_push(out, mk2);
-    array_push(out, mk3);
+    let mk0 = mask_bytes[0]; let mk1 = mask_bytes[1];
+    let mk2 = mask_bytes[2]; let mk3 = mask_bytes[3];
+    array_push(out, mk0); array_push(out, mk1); array_push(out, mk2); array_push(out, mk3);
 
-    // Mask the payload bytes. The payload is read char-by-char via
-    // strcharcodeat (codepoint-indexed) — safe here only because the test
-    // payloads are ASCII, where each codepoint is one byte; for true binary
-    // payloads, accept Array<u8> directly or use str_to_bytes().
     let i = 0;
     while i < plen {
-        let byte_val = strcharcodeat(payload, i);
         let mk = mk0;
         let m = num_mod(i, 4);
         if m == 1 { mk = mk1; }
         else if m == 2 { mk = mk2; }
         else if m == 3 { mk = mk3; }
-        array_push(out, _byte_xor(byte_val, mk));
+        array_push(out, bit_xor(bytes[i], mk));
         i = i + 1;
     }
     return out;
 }
 
-export upgrade_response, parse_frame, parse_frames, reassemble_fragments, parse_message, write_frame;
+// write_frame(opcode, payload: string) → Array<u8> (RFC 6455 masked frame).
+// opcode: 1 = text, 2 = binary, 8 = close, 9 = ping, 10 = pong. The text payload is
+// encoded as UTF-8 (str_to_bytes), so non-ASCII frames are valid on the wire.
+fn write_frame(opcode, payload) {
+    return _write_frame_bytes(opcode, str_to_bytes(payload));
+}
+
+// write_text(s) / write_binary(bytes) — convenience for the two data opcodes.
+fn write_text(s) { return _write_frame_bytes(1, str_to_bytes(s)); }
+fn write_binary(bytes) { return _write_frame_bytes(2, bytes); }
+
+// ping/pong with an optional (string) application payload.
+fn ping(payload) { return _write_frame_bytes(9, str_to_bytes(try payload catch "")); }
+fn pong(payload) { return _write_frame_bytes(10, str_to_bytes(try payload catch "")); }
+
+// close(code, reason) → a close frame: 2-byte big-endian status code + UTF-8 reason.
+fn close(code, reason) {
+    let bytes = _u16be(code);
+    _append_bytes(bytes, str_to_bytes(try reason catch ""));
+    return _write_frame_bytes(8, bytes);
+}
+
+// decode_close(payload_bytes) → { code, reason } from a close-frame payload.
+fn decode_close(payload_bytes) {
+    if payload_bytes == nil or len(payload_bytes) < 2 {
+        return map{ code: 1005, reason: "" };   // 1005 = no status code present
+    }
+    let code = payload_bytes[0] * 256 + payload_bytes[1];
+    let rest = [];
+    let i = 2;
+    while i < len(payload_bytes) { array_push(rest, payload_bytes[i]); i = i + 1; }
+    return map{ code: code, reason: try bytes_to_str(rest) catch "" };
+}
+
+export upgrade_response, parse_frame, parse_frames, reassemble_fragments, parse_message,
+       write_frame, write_text, write_binary, ping, pong, close, decode_close,
+       set_max_payload, get_max_payload;
