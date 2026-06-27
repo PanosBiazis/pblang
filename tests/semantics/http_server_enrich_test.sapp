@@ -1,0 +1,79 @@
+// tests/semantics/http_server_enrich_test.sapp — fixes + enrichment for http_server
+//
+// FIX (DoS): _recv_request read `Content-Length - have` bytes with NO cap, so a
+//   malicious "Content-Length: 999999999999" forced an unbounded body read
+//   (memory-exhaustion DoS). Now capped at a configurable max_body, with a 413.
+// FIX: _parse_query split on EVERY "=", so a value containing "=" was truncated.
+// ENRICH: PUT/DELETE/PATCH routes (+ generic app_route), 405 Method Not Allowed,
+//   HEAD->GET, catch-all wildcard routes, and body_json / form_data request
+//   helpers.
+
+let H = import("stdlib/http_server.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+
+fn mk_req(method, path, headers, body) {
+    return map{ method: method, path: path, headers: headers, body: body };
+}
+fn tagged(name) { return fn(req) { return map{ status: 200, body: name }; }; }
+
+// ── ENRICH: HTTP verbs (PUT/DELETE/PATCH) work as server routes ─────────────────
+let app = H.app_new();
+H.app_get(app, "/items/:id", tagged("get"));
+H.app_put(app, "/items/:id", tagged("put"));
+H.app_delete(app, "/items/:id", tagged("del"));
+H.app_patch(app, "/items/:id", tagged("patch"));
+H.app_post(app, "/items", tagged("create"));
+H.app_get(app, "/static/*path", tagged("static"));
+
+eq(H.app_handle(app, mk_req("PUT", "/items/7", map{}, "")).body, "put", "PUT route");
+eq(H.app_handle(app, mk_req("DELETE", "/items/7", map{}, "")).body, "del", "DELETE route");
+eq(H.app_handle(app, mk_req("PATCH", "/items/7", map{}, "")).body, "patch", "PATCH route");
+
+// ── ENRICH: 405 Method Not Allowed (path matches, method doesn't) ───────────────
+let r405 = H.app_handle(app, mk_req("POST", "/items/7", map{}, ""));
+eq(r405.status, 405, "wrong method on a matching path -> 405");
+
+// ── ENRICH: HEAD falls back to a GET route ──────────────────────────────────────
+eq(H.app_handle(app, mk_req("HEAD", "/items/7", map{}, "")).body, "get", "HEAD -> GET");
+
+// ── ENRICH: catch-all wildcard route ────────────────────────────────────────────
+let rs = H.app_handle(app, mk_req("GET", "/static/css/app.css", map{}, ""));
+eq(rs.body, "static", "wildcard route matches deep path");
+
+// ── 404 still for an unknown path ───────────────────────────────────────────────
+eq(H.app_handle(app, mk_req("GET", "/nope", map{}, "")).status, 404, "unknown path -> 404");
+
+// ── FIX: query splits on the FIRST "=" only ─────────────────────────────────────
+let rq = H.app_handle(app, mk_req("GET", "/items/9?token=a=b=c", map{}, ""));
+// app_handle stores req.query; the matched handler ignores it, but params route ran.
+// Re-check via a dedicated handler:
+let app2 = H.app_new();
+H.app_get(app2, "/q", fn(req) { return map{ status: 200, body: req.query.token }; });
+eq(H.app_handle(app2, mk_req("GET", "/q?token=a=b=c", map{}, "")).body, "a=b=c", "query value keeps '='");
+
+// ── ENRICH: body_json / form_data request helpers ───────────────────────────────
+eq(H.body_json(mk_req("POST", "/", map{}, "{\"n\":5}")).n, 5, "body_json parses JSON body");
+if H.body_json(mk_req("POST", "/", map{}, "{bad")) != nil { fail("body_json on garbage -> nil"); }
+let fd = H.form_data(mk_req("POST", "/", map{}, "a=1&b=hello+world&c=x=y"));
+eq(fd.b, "hello world", "form_data decodes +");
+eq(fd.c, "x=y", "form_data value keeps '='");
+
+// ── FIX (DoS): request body read is bounded by max_body ─────────────────────────
+H.set_max_body(100);
+eq(H.get_max_body(), 100, "max_body configurable");
+let p_big = H.body_read_plan(999999999999, 0);   // huge Content-Length
+eq(p_big.read, 100, "huge body read is capped at max_body");
+if not p_big.too_large { fail("huge body must be flagged too_large"); }
+let p_ok = H.body_read_plan(50, 0);
+eq(p_ok.read, 50, "small body read unbounded under cap");
+if p_ok.too_large { fail("small body must not be too_large"); }
+let p_part = H.body_read_plan(80, 30);           // already have 30
+eq(p_part.read, 50, "read only the remainder");
+
+// ── 413 response is well-formed ─────────────────────────────────────────────────
+let r413 = H.to_http_response(map{ status: 413, body: "Request Entity Too Large", content_type: "text/plain" });
+if str_index_of(r413, "413") < 0 { fail("413 response status"); }
+
+print "http_server_enrich_pass";

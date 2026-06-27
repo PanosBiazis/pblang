@@ -167,19 +167,25 @@ fn _query_string(p) {
 
 fn _parse_query(qs) {
     // qs: "a=1&b=2%20hi" -> map{ a: "1", b: "2 hi" }
-    // URL-decodes both keys and values so encoded characters are correctly handled.
+    // URL-decodes both keys and values. Splits each pair on the FIRST "=" only, so
+    // a value that itself contains "=" (e.g. base64 / "token=a=b=c") is preserved.
     let out = map{};
     if qs == "" { return out; }
     let pairs = str_split(qs, "&");
-    for i len(pairs) {
-        let kv = str_split(pairs[i], "=");
-        let k = str_trim(url_decode(kv[0]));
-        if k == "" {
-            // skip empty keys
+    let i = 0;
+    while i < len(pairs) {
+        let pair = pairs[i];
+        let eq = str_index_of(pair, "=");
+        let k = "";
+        let v = "";
+        if eq >= 0 {
+            k = str_trim(url_decode(str_slice(pair, 0, eq)));
+            v = str_trim(url_decode(str_slice(pair, eq + 1, len(pair))));
         } else {
-            let v = str_trim(url_decode(try kv[1] catch ""));
-            out[k] = v;
+            k = str_trim(url_decode(pair));
         }
+        if k != "" { out[k] = v; }
+        i = i + 1;
     }
     return out;
 }
@@ -202,21 +208,35 @@ fn _param_name(seg) {
 }
 
 fn _match_path(pattern, path) {
-    // returns params map, or nil if no match
+    // returns params map, or nil if no match. `:name` captures one segment;
+    // `*name` (catch-all, must be last) captures the rest of the path (joined by
+    // "/", possibly empty).
     let p = _split_path(pattern);
     let s = _split_path(path);
-    if len(p) != len(s) { return nil; }
 
     let params = map{};
-    for i len(p) {
+    let i = 0;
+    while i < len(p) {
         let ps = p[i];
+        if str_starts_with(ps, "*") {
+            let name = str_slice(ps, 1, len(ps));
+            if name == "" { name = "wildcard"; }
+            let rest = [];
+            let j = i;
+            while j < len(s) { array_push(rest, s[j]); j = j + 1; }
+            params[name] = str_join(rest, "/");
+            return params;
+        }
+        if i >= len(s) { return nil; }
         let ss = s[i];
         if str_starts_with(ps, ":") {
             params[_param_name(ps)] = ss;
         } else {
             if ps != ss { return nil; }
         }
+        i = i + 1;
     }
+    if len(s) != len(p) { return nil; }
     return params;
 }
 
@@ -233,15 +253,22 @@ fn app_use(app, mw) {
     return app;
 }
 
-fn app_get(app, path, handler) {
-    app.routes[len(app.routes)] = map{ method: "GET", path: path, handler: handler, middleware: [] };
+// Generic route registration — any HTTP method, with optional route-level mws.
+fn app_route(app, method, path, handler) {
+    app.routes[len(app.routes)] = map{ method: method, path: path, handler: handler, middleware: [] };
     return app;
 }
 
-fn app_post(app, path, handler) {
-    app.routes[len(app.routes)] = map{ method: "POST", path: path, handler: handler, middleware: [] };
+fn app_route_mw(app, method, path, mws, handler) {
+    app.routes[len(app.routes)] = map{ method: method, path: path, handler: handler, middleware: mws };
     return app;
 }
+
+fn app_get(app, path, handler) { return app_route(app, "GET", path, handler); }
+fn app_post(app, path, handler) { return app_route(app, "POST", path, handler); }
+fn app_put(app, path, handler) { return app_route(app, "PUT", path, handler); }
+fn app_delete(app, path, handler) { return app_route(app, "DELETE", path, handler); }
+fn app_patch(app, path, handler) { return app_route(app, "PATCH", path, handler); }
 
 fn app_get_mw(app, path, mws, handler) {
     app.routes[len(app.routes)] = map{ method: "GET", path: path, handler: handler, middleware: mws };
@@ -273,12 +300,23 @@ fn app_handle(app, req) {
         }
     }
 
-    // Route matching + optional route-level middleware
+    // Route matching + optional route-level middleware. Track whether the PATH
+    // matched any route so we can answer 405 (not 404) for a wrong method, and
+    // let a HEAD request fall back to a GET route (HTTP semantics).
+    let path_matched = false;
+    let allow = [];
     for i len(app.routes) {
         let r = app.routes[i];
-        if r.method == method {
-            let params = _match_path(r.path, path);
-            if params != nil {
+        let params = _match_path(r.path, path);
+        if params != nil {
+            path_matched = true;
+            let am = 0;
+            let already = false;
+            while am < len(allow) { if allow[am] == r.method { already = true; } am = am + 1; }
+            if not already { allow[len(allow)] = r.method; }
+
+            let method_ok = r.method == method or (method == "HEAD" and r.method == "GET");
+            if method_ok {
                 req.params = params;
 
                 // Route-level middleware (ίδιο συμβόλαιο με global)
@@ -295,6 +333,9 @@ fn app_handle(app, req) {
                 return handler(req);
             }
         }
+    }
+    if path_matched {
+        return map{ status: 405, body: "method not allowed", content_type: "text/plain", headers: map{ "Allow": str_join(allow, ", ") } };
     }
     return map{ status: 404, body: "not found", content_type: "text/plain" };
 }
@@ -330,6 +371,13 @@ fn mw_require_header(name, expected) {
     };
 }
 
+// Server limits (configurable). max_body caps how many request-body bytes the
+// server will read, so an attacker-controlled Content-Length cannot force an
+// unbounded read (memory-exhaustion DoS).
+let _CFG = map{ max_body: 10485760 };   // 10 MiB default
+fn set_max_body(n) { _CFG.max_body = n; return _CFG.max_body; }
+fn get_max_body() { return _CFG.max_body; }
+
 // _content_length(req) — the request's Content-Length (0 if absent / unparseable).
 fn _content_length(req) {
     let h = try req.headers["Content-Length"] catch nil;
@@ -338,6 +386,20 @@ fn _content_length(req) {
     let n = try parse_number(str_trim(str(h))) catch nil;
     if n == nil { return 0; }
     return n;
+}
+
+// body_read_plan(content_length, have) → { read, too_large }: how many MORE body
+// bytes to read given `have` already buffered, BOUNDED by max_body. If the
+// declared length exceeds the cap, `read` is clamped to the cap and `too_large`
+// is set so the server can answer 413 instead of reading gigabytes.
+fn body_read_plan(content_length, have) {
+    let max = _CFG.max_body;
+    let too_large = content_length > max;
+    let target = content_length;
+    if target > max { target = max; }
+    let read = target - have;
+    if read < 0 { read = 0; }
+    return map{ read: read, too_large: too_large };
 }
 
 // _recv_request(s) — read a full HTTP request: the header block (via tcp_read_until),
@@ -350,11 +412,25 @@ fn _recv_request(s) {
     let req = http_parse_request(raw);
     let have = len(try req.body catch "");
     let total = _content_length(req);
-    if total > have {
-        let extra = tcp_read(s, total - have);
+    // Bound the body read by max_body so a malicious Content-Length can't force an
+    // unbounded read; flag oversized requests so the server answers 413.
+    let plan = body_read_plan(total, have);
+    if plan.read > 0 {
+        let extra = tcp_read(s, plan.read);
         req.body = (try req.body catch "") + extra;
     }
+    if plan.too_large { req.too_large = true; }
     return req;
+}
+
+// Produce the response string for a received request: 413 if the body exceeded
+// max_body, otherwise the handler's response. Centralizes the limit check so every
+// serve_* entry point enforces it.
+fn _serve_response(handler, req) {
+    if (try req.too_large catch false) == true {
+        return _resp_from_handler(map{ status: 413, body: "Request Entity Too Large", content_type: "text/plain" });
+    }
+    return _resp_from_handler(handler(req));
 }
 
 fn serve_once_app(addr, app) {
@@ -373,8 +449,7 @@ fn serve_once(addr, handler) {
     // read headers (and potentially some body). Keep it simple for now.
     let req = _recv_request(s);
 
-    let out = handler(req);
-    let resp = _resp_from_handler(out);
+    let resp = _serve_response(handler, req);
     tcp_write(s, resp);
 
     tcp_close(s);
@@ -389,8 +464,7 @@ fn serve_forever(addr, handler) {
     while true {
         let s = tcp_accept(l);
         let req = _recv_request(s);
-        let out = handler(req);
-        let resp = _resp_from_handler(out);
+        let resp = _serve_response(handler, req);
         tcp_write(s, resp);
         tcp_close(s);
     }
@@ -420,6 +494,23 @@ fn cookie_get(req, name, default_val) {
     let v = try cs[name] catch nil;
     if v == nil { return default_val; }
     return v;
+}
+
+// body_json(req) — parse the request body as JSON, or nil on empty/invalid (safe:
+// json.parse throws on garbage, so it is wrapped).
+fn body_json(req) {
+    import "stdlib:json.sapp";
+    let b = try req.body catch "";
+    if b == nil or b == "" { return nil; }
+    return try json.parse(b) catch nil;
+}
+
+// form_data(req) — parse an application/x-www-form-urlencoded request body into a
+// map (percent-decoded, first-"=" split — same rules as the query parser).
+fn form_data(req) {
+    let b = try req.body catch "";
+    if b == nil { return map{}; }
+    return _parse_query(b);
 }
 
 fn _mime_type(filename) {
@@ -501,8 +592,7 @@ fn serve_once_timeout(addr, handler, timeout_ms) {
     let s = tcp_accept(l);
     // Apply per-connection read timeout so slow clients cannot stall the server
     let req = _recv_request(s);
-    let out = handler(req);
-    let resp = _resp_from_handler(out);
+    let resp = _serve_response(handler, req);
     tcp_write(s, resp);
     tcp_close(s);
     tcp_close(l);
@@ -519,8 +609,7 @@ fn serve_forever_timeout(addr, handler, timeout_ms) {
     while true {
         let s = tcp_accept(l);
         let req = _recv_request(s);
-        let out = handler(req);
-        let resp = _resp_from_handler(out);
+        let resp = _serve_response(handler, req);
         tcp_write(s, resp);
         tcp_close(s);
     }
@@ -544,4 +633,4 @@ fn res_sse_headers() {
     };
 }
 
-export app_new, app_use, app_get, app_post, app_get_mw, app_post_mw, app_handle, res, res_json, res_text, to_http_response, mw_log, mw_require_header, serve_once, serve_forever, serve_once_app, serve_forever_app, cookies, cookie_get, static_file_response, mw_rate_limit, serve_once_timeout, serve_forever_timeout, sse_event, res_sse_headers, url_decode, _path_safe;
+export app_new, app_use, app_get, app_post, app_put, app_delete, app_patch, app_route, app_route_mw, app_get_mw, app_post_mw, app_handle, res, res_json, res_text, to_http_response, mw_log, mw_require_header, serve_once, serve_forever, serve_once_app, serve_forever_app, cookies, cookie_get, body_json, form_data, static_file_response, mw_rate_limit, serve_once_timeout, serve_forever_timeout, sse_event, res_sse_headers, url_decode, _path_safe, set_max_body, get_max_body, body_read_plan;
