@@ -11,30 +11,57 @@
 let thread = import("stdlib:thread.sapp");
 
 // go(fn) — launch a goroutine-style concurrent task. Returns a Future handle.
-// The returned future can be resolved with async.await(future).
+// A task that RETURNS nil resolves successfully with nil; only a THROWN error is
+// a failure. We distinguish the two with a per-call sentinel (pblang's `catch`
+// can't bind the thrown value, so a nil return is otherwise indistinguishable
+// from a caught throw).
 fn go(task_fn) {
     let ch = channel();
+    let sentinel = map{ __async_threw: true };
     let worker = spawn(fn() {
-        let result = try task_fn() catch nil;
-        let err = nil;
-        if result == nil {
-            err = "task returned nil";
-        }
-        send(ch.sender, map{ ok: err == nil, value: result, error: err });
+        let val = try task_fn() catch sentinel;
+        let threw = (val == sentinel);
+        let v = val;
+        if threw { v = nil; }
+        send(ch.sender, map{ ok: not threw, value: v });
     });
     return map{ channel: ch, worker: worker, resolved: false, _value: nil };
 }
 
-// await(future) — block until the future resolves and return its value.
+// await(future) — block until the future resolves and return its value. Throws
+// only if the task itself threw.
 fn await(future) {
     if future.resolved == true { return future._value; }
     let msg = recv(future.channel.receiver);
     join(future.worker);
     if msg == nil { return nil; }
     if msg.ok == false {
-        return error("async.await: task failed: " + str(msg.error));
+        return error("async.await: task threw");
     }
+    future._value = msg.value;
+    future.resolved = true;
     return msg.value;
+}
+
+// all_settled(futures) — wait for all and return [{ ok, value }, ...]. Never
+// throws, even if some tasks failed.
+fn all_settled(futures) {
+    let out = [];
+    for i len(futures) {
+        let f = futures[i];
+        let msg = recv(f.channel.receiver);
+        try join(f.worker) catch nil;
+        if msg == nil { out[i] = map{ ok: false, value: nil }; }
+        else { out[i] = map{ ok: msg.ok, value: msg.value }; }
+    }
+    return out;
+}
+
+// gather(fns) — spawn every zero-arg fn with go() and await all results in order.
+fn gather(fns) {
+    let futures = [];
+    for i len(fns) { futures[i] = go(fns[i]); }
+    return await_all(futures);
 }
 
 // await_all(futures) — wait for all futures and return array of results.
@@ -95,29 +122,33 @@ fn timeout(ms, task_fn) {
 
 // pool(size, tasks) — run tasks in a worker pool of `size` goroutines.
 // tasks: array of zero-arg functions. Returns array of results in order.
+// NOTE: each task must be SELF-CONTAINED — captured upvalues do not survive the
+// thread boundary in this VM. For mapping a function over data, prefer
+// map_parallel (which passes items as data to a single shared mapper).
 fn pool(size, tasks) {
     let n = len(tasks);
     if n == 0 { return []; }
     if size > n { size = n; }
 
-    let work_ch = thread.channel_new(n);
-    let result_ch = channel();
+    let work_ch = thread.channel_new_buffered(n);
+    let result_ch = thread.channel_new_buffered(n);
 
-    // Send all tasks to work channel
+    // Send task INDICES (numbers are transferable; closures are not — they cross
+    // the thread boundary only as captured upvalues, never through a channel).
     for i n {
-        send(work_ch.sender, map{ idx: i, fn: tasks[i] });
+        send(work_ch.sender, i);
     }
     channel_close(work_ch.sender);
 
-    // Spawn workers
+    // Spawn workers; each captures the `tasks` array (upvalue) and pulls indices.
     let workers = [];
     for w size {
         workers[w] = spawn(fn() {
             while true {
-                let item = try recv(work_ch.receiver) catch nil;
-                if item == nil { return nil; }
-                let result = try item.fn() catch nil;
-                send(result_ch.sender, map{ idx: item.idx, value: result });
+                let idx = try recv(work_ch.receiver) catch nil;
+                if idx == nil { return nil; }
+                let result = try tasks[idx]() catch nil;
+                send(result_ch.sender, map{ idx: idx, value: result });
             }
         });
     }
@@ -139,15 +170,47 @@ fn pool(size, tasks) {
     return results;
 }
 
-// map_parallel(items, fn, pool_size) — apply fn to each item in parallel.
+// map_parallel(items, fn, pool_size) — apply `fn` to each item across a worker
+// pool. Workers capture the shared `fn` and `items` (upvalues) and pull item
+// INDICES off a channel; the mapper receives each item as data.
+//
+// IMPORTANT (pblang concurrency constraint): a closure's captured upvalues do NOT
+// cross the thread boundary, so `fn` must be SELF-CONTAINED (non-capturing) — e.g.
+// `fn(x) { return x * 10; }`. A mapper that closes over outer variables will see
+// them as undefined inside a worker. (This is why the previous implementation,
+// which wrapped each item in a capturing closure, silently produced nils.)
 fn map_parallel(items, fn_, pool_size = nil) {
-    let tasks = [];
-    for i len(items) {
-        let item = items[i];
-        tasks[i] = fn() { return fn_(item); };
+    let n = len(items);
+    if n == 0 { return []; }
+    let size = pool_size;
+    if size == nil { size = n; }
+    if size > n { size = n; }
+
+    let work_ch = thread.channel_new_buffered(n);
+    let result_ch = thread.channel_new_buffered(n);
+    for i n { send(work_ch.sender, i); }
+    channel_close(work_ch.sender);
+
+    let workers = [];
+    for w size {
+        workers[w] = spawn(fn() {
+            while true {
+                let idx = try recv(work_ch.receiver) catch nil;
+                if idx == nil { return nil; }
+                let result = try fn_(items[idx]) catch nil;
+                send(result_ch.sender, map{ idx: idx, value: result });
+            }
+        });
     }
-    if pool_size == nil { pool_size = len(items); }
-    return pool(pool_size, tasks);
+
+    let results = [];
+    for i n { results[i] = nil; }
+    for i n {
+        let r = recv(result_ch.receiver);
+        if r != nil { results[r.idx] = r.value; }
+    }
+    for w size { try join(workers[w]) catch nil; }
+    return results;
 }
 
 // debounce(fn, delay_ms) — returns a debounced version of fn.
@@ -179,5 +242,5 @@ fn throttle(fn_, interval_ms) {
     };
 }
 
-export go, await, await_all, await_race, sleep, timeout, pool, map_parallel,
-       debounce, throttle;
+export go, await, await_all, await_race, all_settled, gather, sleep, timeout,
+       pool, map_parallel, debounce, throttle;
