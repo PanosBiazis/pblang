@@ -9,43 +9,70 @@
 
 let http_mod = import("stdlib:http.sapp");
 
-// parse_response(raw) — parse an HTTP response string
+// parse_response(raw) — parse an HTTP response string into
+// { status, status_text, headers, body, ok }.
 fn parse_response(raw) {
     if raw == nil or raw == "" {
-        return map{ status: 0, headers: map{}, body: "", ok: false };
+        return map{ status: 0, status_text: "", headers: map{}, body: "", ok: false };
     }
-    let parts = str_split(raw, "\r\n\r\n");
-    let header_section = parts[0];
-    let body = try parts[1] catch "";
+    // Split on the FIRST "\r\n\r\n" only — a body that itself contains a blank
+    // line (HTML, multi-part text, ...) must NOT be truncated.
+    let sep = str_index_of(raw, "\r\n\r\n");
+    let header_section = raw;
+    let body = "";
+    if sep >= 0 {
+        header_section = str_slice(raw, 0, sep);
+        body = str_slice(raw, sep + 4, len(raw));
+    }
 
     let header_lines = str_split(header_section, "\r\n");
     let status_line = try header_lines[0] catch "";
 
-    // Parse status code from "HTTP/1.1 200 OK"
+    // "HTTP/1.1 200 OK" -> code 200, text "OK"
     let status_parts = str_split(status_line, " ");
     let status_code = try parse_number(status_parts[1]) catch 0;
+    let status_text = "";
+    let sp = 2;
+    while sp < len(status_parts) {
+        if status_text == "" { status_text = status_parts[sp]; }
+        else { status_text = status_text + " " + status_parts[sp]; }
+        sp = sp + 1;
+    }
 
-    // Parse headers
     let headers = map{};
-    for i len(header_lines) {
-        if i == 0 { } // skip status line
-        else {
-            let line = header_lines[i];
-            let colon_pos = str_index_of(line, ":");
-            if colon_pos > 0 {
-                let k = str_trim(str_slice(line, 0, colon_pos));
-                let v = str_trim(str_slice(line, colon_pos + 1, len(line)));
-                headers[k] = v;
-            }
+    let i = 1;
+    while i < len(header_lines) {
+        let line = header_lines[i];
+        let colon_pos = str_index_of(line, ":");
+        if colon_pos > 0 {
+            let k = str_trim(str_slice(line, 0, colon_pos));
+            let v = str_trim(str_slice(line, colon_pos + 1, len(line)));
+            headers[k] = v;
         }
+        i = i + 1;
     }
 
     return map{
         status: status_code,
+        status_text: status_text,
         headers: headers,
         body: body,
         ok: status_code >= 200 and status_code < 300
     };
+}
+
+// header_get(resp, name) — case-insensitive header lookup (HTTP header names are
+// case-insensitive), or nil if absent.
+fn header_get(resp, name) {
+    let target = str_lower(str(name));
+    let hs = try resp.headers catch map{};
+    let keys = map_keys(hs);
+    let i = 0;
+    while i < len(keys) {
+        if str_lower(keys[i]) == target { return hs[keys[i]]; }
+        i = i + 1;
+    }
+    return nil;
 }
 
 // retry(fn, max_attempts, delay_ms) — retry with exponential backoff
@@ -64,23 +91,35 @@ fn retry(fn_, max_attempts = 3, delay_ms = 100) {
     return error("http_client.retry: all " + str(max_attempts) + " attempts failed");
 }
 
-// build_query_string(params) — build URL query string from map
-fn build_query_string(params) {
+// encode_form(params) — "k1=v1&k2=v2", keys AND values percent-encoded (a value
+// containing &, =, space or # would otherwise corrupt the query / inject extra
+// parameters). A LIST value emits one repeated key per element ("tag=x&tag=y").
+// Also the application/x-www-form-urlencoded body form.
+fn encode_form(params) {
     if params == nil { return ""; }
     let keys = map_keys(params);
-    if len(keys) == 0 { return ""; }
     let parts = [];
-    for i len(keys) {
+    let i = 0;
+    while i < len(keys) {
         let k = keys[i];
-        let v = str(params[k]);
-        parts[i] = k + "=" + v;
+        let v = params[k];
+        if is_array(v) {
+            let j = 0;
+            while j < len(v) { array_push(parts, url_encode(k) + "=" + url_encode(str(v[j]))); j = j + 1; }
+        } else {
+            array_push(parts, url_encode(k) + "=" + url_encode(str(v)));
+        }
+        i = i + 1;
     }
-    let result = "";
-    for i len(parts) {
-        if i > 0 { result = result + "&"; }
-        result = result + parts[i];
-    }
-    return "?" + result;
+    return str_join(parts, "&");
+}
+
+// build_query_string(params) — leading-"?" query string (or "" when empty),
+// percent-encoded (see encode_form). Safe to append to a URL.
+fn build_query_string(params) {
+    let body = encode_form(params);
+    if body == "" { return ""; }
+    return "?" + body;
 }
 
 // new(base_url, default_headers) — create a new HTTP client
@@ -131,6 +170,14 @@ fn new(base_url = "", default_headers = nil) {
         return new(client._base_url, new_headers);
     };
 
+    // client.post_form(path, fields) — POST an x-www-form-urlencoded body
+    client.post_form = fn(path, fields) {
+        let url = client._base_url + path;
+        let raw = try http_post(url, encode_form(fields), "application/x-www-form-urlencoded") catch nil;
+        if raw == nil { return map{ status: 0, ok: false, body: nil, headers: map{} }; }
+        return parse_response(raw);
+    };
+
     // client.get_json(path, params) — GET and parse JSON response body
     client.get_json = fn(path, params) {
         let resp = client.get(path, params);
@@ -171,4 +218,12 @@ fn get_json(url) {
     return try json_parse(resp.body) catch nil;
 }
 
-export new, get, post, get_json, parse_response, retry, build_query_string;
+// post_form(url, fields) — POST an application/x-www-form-urlencoded body.
+fn post_form(url, fields) {
+    let raw = try http_post(url, encode_form(fields), "application/x-www-form-urlencoded") catch nil;
+    if raw == nil { return map{ status: 0, ok: false, body: nil, headers: map{} }; }
+    return parse_response(raw);
+}
+
+export new, get, post, post_form, get_json, parse_response, retry,
+       build_query_string, encode_form, header_get;
