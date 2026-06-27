@@ -1,16 +1,240 @@
-// stdlib/json.sapp
+// stdlib/json.sapp — JSON toolkit built over the VM builtins json_parse /
+// json_stringify.
 //
-// Thin convenience layer over VM builtins:
-// - json_parse(str) -> value
-// - json_stringify(value) -> string
+// Core:    parse, stringify, try_parse
+// Inspect: is_valid, parse_or, get, has
+// Shape:   pretty, merge, clone, equal, flatten
+// Streams: parse_lines, stringify_lines  (JSON Lines / ndjson)
+//
+// NOTE on numbers: the json_stringify builtin renders every number as a float
+// (the integer 1 serializes as "1.0"); pblang has a single f64 number type.
+// pretty() and stringify_lines() reuse the builtin for scalars, so they share
+// that formatting (and its correct string escaping).
+
+// Maximum recursion depth for the structural walkers — a defensive cap so a
+// pathologically nested value degrades to a clear error instead of a VM crash.
+let _MAX_DEPTH = 256;
+
+// A unique sentinel used by has() to distinguish "absent" from a real nil value.
+let _MISSING = map{ __json_missing: true };
 
 fn parse(s) { return json_parse(s); }
 fn stringify(v) { return json_stringify(v); }
+fn try_parse(s) { return try json_parse(s) catch nil; }
 
-// Handy helpers
-fn try_parse(s) {
-    return try json_parse(s) catch nil;
+// is_valid(s) — true if `s` parses as JSON. (A successful parse to nil only
+// happens for the literal "null", so that case is checked explicitly.)
+fn is_valid(s) {
+    let r = try json_parse(s) catch nil;
+    if r != nil { return true; }
+    return str_trim(s) == "null";
 }
 
-export parse, stringify, try_parse;
+// parse_or(s, default) — parse, returning `default` on any error.
+fn parse_or(s, default) {
+    return try json_parse(s) catch default;
+}
 
+// ── dotted-path access ──────────────────────────────────────────────────────────
+
+fn _to_index(key) {
+    let n = try parse_number(key) catch nil;
+    if n == nil { return nil; }
+    return num_floor(n);
+}
+
+// get(obj, path, default) — read a value by a dotted path ("a.b.0.c"). Numeric
+// path segments index into arrays. Returns `default` (nil if omitted) when any
+// segment is missing or out of range.
+fn get(obj, path, default = nil) {
+    let parts = str_split(path, ".");
+    let cur = obj;
+    let i = 0;
+    while i < len(parts) {
+        let key = parts[i];
+        if is_map(cur) {
+            if map_has(cur, key) { cur = cur[key]; } else { return default; }
+        } else if is_array(cur) {
+            let idx = _to_index(key);
+            if idx == nil or idx < 0 or idx >= len(cur) { return default; }
+            cur = cur[idx];
+        } else {
+            return default;
+        }
+        i = i + 1;
+    }
+    return cur;
+}
+
+// has(obj, path) — true if a value exists at the dotted path.
+fn has(obj, path) { return get(obj, path, _MISSING) != _MISSING; }
+
+// ── structural walkers ──────────────────────────────────────────────────────────
+
+fn _clone(v, depth) {
+    if depth > _MAX_DEPTH { return error("json.clone: max depth exceeded"); }
+    if is_map(v) {
+        let out = map{};
+        let ks = map_keys(v);
+        let i = 0;
+        while i < len(ks) { out[ks[i]] = _clone(v[ks[i]], depth + 1); i = i + 1; }
+        return out;
+    }
+    if is_array(v) {
+        let out = [];
+        let i = 0;
+        while i < len(v) { out[len(out)] = _clone(v[i], depth + 1); i = i + 1; }
+        return out;
+    }
+    return v;  // scalars are immutable
+}
+
+// clone(v) — deep copy of a JSON value.
+fn clone(v) { return _clone(v, 0); }
+
+fn _merge(a, b, depth) {
+    if depth > _MAX_DEPTH { return error("json.merge: max depth exceeded"); }
+    if is_map(a) and is_map(b) {
+        let out = _clone(a, depth);
+        let ks = map_keys(b);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            if map_has(out, k) and is_map(out[k]) and is_map(b[k]) {
+                out[k] = _merge(out[k], b[k], depth + 1);
+            } else {
+                out[k] = _clone(b[k], depth + 1);
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+    return _clone(b, depth);
+}
+
+// merge(a, b) — deep merge; values from `b` win. Neither input is mutated.
+fn merge(a, b) { return _merge(a, b, 0); }
+
+fn _equal(a, b, depth) {
+    if depth > _MAX_DEPTH { return error("json.equal: max depth exceeded"); }
+    if is_map(a) and is_map(b) {
+        let ka = map_keys(a);
+        if len(ka) != len(map_keys(b)) { return false; }
+        let i = 0;
+        while i < len(ka) {
+            let k = ka[i];
+            if not map_has(b, k) { return false; }
+            if not _equal(a[k], b[k], depth + 1) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if is_array(a) and is_array(b) {
+        if len(a) != len(b) { return false; }
+        let i = 0;
+        while i < len(a) { if not _equal(a[i], b[i], depth + 1) { return false; } i = i + 1; }
+        return true;
+    }
+    return a == b;
+}
+
+// equal(a, b) — deep structural equality (map key order is irrelevant; array
+// order is significant).
+fn equal(a, b) { return _equal(a, b, 0); }
+
+// ── pretty printing ─────────────────────────────────────────────────────────────
+
+fn _pretty(v, indent, depth) {
+    if depth > _MAX_DEPTH { return error("json.pretty: max depth exceeded"); }
+    if is_map(v) {
+        let ks = map_keys(v);
+        if len(ks) == 0 { return "{}"; }
+        let pad = str_repeat(" ", indent * (depth + 1));
+        let endpad = str_repeat(" ", indent * depth);
+        let out = "{\n";
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            out = out + pad + json_stringify(k) + ": " + _pretty(v[k], indent, depth + 1);
+            if i < len(ks) - 1 { out = out + ","; }
+            out = out + "\n";
+            i = i + 1;
+        }
+        return out + endpad + "}";
+    }
+    if is_array(v) {
+        if len(v) == 0 { return "[]"; }
+        let pad = str_repeat(" ", indent * (depth + 1));
+        let endpad = str_repeat(" ", indent * depth);
+        let out = "[\n";
+        let i = 0;
+        while i < len(v) {
+            out = out + pad + _pretty(v[i], indent, depth + 1);
+            if i < len(v) - 1 { out = out + ","; }
+            out = out + "\n";
+            i = i + 1;
+        }
+        return out + endpad + "]";
+    }
+    return json_stringify(v);  // scalar: correct escaping + number formatting from the builtin
+}
+
+// pretty(v, indent) — human-readable JSON with `indent` spaces per level (2 by
+// default). Map keys come out sorted (the builtin's deterministic order).
+fn pretty(v, indent = 2) { return _pretty(v, indent, 0); }
+
+// ── flatten ─────────────────────────────────────────────────────────────────────
+
+fn _flatten(obj, prefix, sep, out, depth) {
+    if depth > _MAX_DEPTH { return error("json.flatten: max depth exceeded"); }
+    let ks = map_keys(obj);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        let key = k;
+        if prefix != "" { key = prefix + sep + k; }
+        let val = obj[k];
+        if is_map(val) and len(map_keys(val)) > 0 {
+            _flatten(val, key, sep, out, depth + 1);
+        } else {
+            out[key] = val;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// flatten(obj, sep) — flatten nested maps into a single map with `sep`-joined
+// keys ("a.b.c"). Arrays and empty maps are kept as leaf values.
+fn flatten(obj, sep = ".") { return _flatten(obj, "", sep, map{}, 0); }
+
+// ── JSON Lines (ndjson) ──────────────────────────────────────────────────────────
+
+// parse_lines(s) — parse newline-delimited JSON into an array of values. Blank
+// lines (including a trailing newline) are skipped.
+fn parse_lines(s) {
+    let lines = str_split(s, "\n");
+    let out = [];
+    let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]);
+        if line != "" { out[len(out)] = json_parse(line); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// stringify_lines(arr) — serialize an array of values to newline-delimited JSON.
+fn stringify_lines(arr) {
+    let out = "";
+    let i = 0;
+    while i < len(arr) {
+        out = out + json_stringify(arr[i]);
+        if i < len(arr) - 1 { out = out + "\n"; }
+        i = i + 1;
+    }
+    return out;
+}
+
+export parse, stringify, try_parse, is_valid, parse_or, get, has,
+       clone, merge, equal, pretty, flatten, parse_lines, stringify_lines;
