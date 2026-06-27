@@ -1,128 +1,224 @@
 // stdlib/jwt.sapp — JSON Web Token (JWT) implementation for pblang.
 //
-// Supports HS256 (HMAC-SHA256) signing and verification.
-// Conforms to RFC 7519.
+// Supports HS256 (HMAC-SHA256) signing and verification. Conforms to RFC 7519
+// (claims) and RFC 7515 (JWS compact serialization) — the signature segment is
+// base64url of the RAW HMAC bytes, so tokens interoperate with any standard JWT
+// library (verified against the well-known jwt.io reference token in tests).
+//
+// SECURITY: there is NO sha256(input+secret) fallback (that construction is
+// vulnerable to length-extension); HS256 always uses a real HMAC. verify()
+// enforces an algorithm allowlist (default ["HS256"]) which rejects the
+// "alg: none" / algorithm-confusion attack.
 //
 // Usage:
 //   let jwt = import("stdlib:jwt.sapp");
-//   let token = jwt.sign(map{ sub: "user123", exp: jwt.expiry(3600) }, "my-secret");
-//   let payload = jwt.verify(token, "my-secret");
+//   let token = jwt.sign(map{ sub: "user123" }, "my-secret", map{ exp_in: 3600 });
+//   let payload = jwt.verify(token, "my-secret");            // throws on failure
+//   let res = jwt.try_verify(token, "my-secret");            // {valid, payload|error}
 
-// expiry(seconds) — return Unix timestamp for now + seconds (for exp claim)
-fn expiry(seconds) {
-    return num_floor(clock()) + seconds;
-}
+// expiry(seconds) — Unix timestamp for now + seconds (for the exp claim).
+fn expiry(seconds) { return num_floor(clock()) + seconds; }
 
-// _b64url_encode(s) — base64url encode a string (URL-safe, no padding)
+// ── base64url helpers ─────────────────────────────────────────────────────────
+
+// _b64url_encode(s) — base64url-encode a STRING (URL-safe, unpadded). Used for the
+// header/payload JSON segments.
 fn _b64url_encode(s) {
     let b64 = base64_encode(s);
-    // Convert standard base64 to base64url
     b64 = str_replace_all(b64, "+", "-");
     b64 = str_replace_all(b64, "/", "_");
-    // Remove padding
-    while str_ends_with(b64, "=") {
-        b64 = str_slice(b64, 0, len(b64) - 1);
-    }
+    while str_ends_with(b64, "=") { b64 = str_slice(b64, 0, len(b64) - 1); }
     return b64;
 }
 
-// _b64url_decode(s) — base64url decode to string
+// _b64url_decode(s) — base64url-decode to a string.
 fn _b64url_decode(s) {
-    // Restore base64url to standard base64
     s = str_replace_all(s, "-", "+");
     s = str_replace_all(s, "_", "/");
-    // Add padding
     let rem = len(s) % 4;
     if rem == 2 { s = s + "=="; }
     else if rem == 3 { s = s + "="; }
     return base64_decode(s);
 }
 
-// sign(payload, secret) — create a signed JWT token (HS256)
-fn sign(payload, secret) {
-    let header = map{ alg: "HS256", typ: "JWT" };
-    let header_json = json_stringify(header);
-    let payload_json = json_stringify(payload);
-
-    let header_b64 = _b64url_encode(header_json);
-    let payload_b64 = _b64url_encode(payload_json);
-
-    let signing_input = header_b64 + "." + payload_b64;
-
-    // HMAC-SHA256 via builtin hmac_sha256 or sha256 with key derivation
-    let sig = try hmac_sha256(signing_input, secret) catch nil;
-    if sig == nil {
-        // Fallback: sha256(input + secret) — less secure but works without HMAC builtin
-        sig = sha256(signing_input + secret);
+// _hex_to_bytes(hex) — decode a lowercase/uppercase hex string into a byte array.
+fn _hex_to_bytes(hex) {
+    let h = str_lower(hex);
+    let bytes = [];
+    let i = 0;
+    while i + 1 < len(h) {
+        let hi = str_index_of("0123456789abcdef", str_slice(h, i, i + 1));
+        let lo = str_index_of("0123456789abcdef", str_slice(h, i + 1, i + 2));
+        bytes[len(bytes)] = hi * 16 + lo;
+        i = i + 2;
     }
-    let sig_b64 = _b64url_encode(sig);
-
-    return signing_input + "." + sig_b64;
+    return bytes;
 }
 
-// verify(token, secret) — verify and decode a JWT. Returns payload map or nil on error.
-fn verify(token, secret) {
-    let parts = str_split(token, ".");
-    if len(parts) != 3 {
-        return error("jwt.verify: invalid token format (expected 3 parts)");
+// _b64url_bytes(bytes) — RFC 4648 base64url (unpadded) of a raw byte array.
+fn _b64url_bytes(bytes) {
+    let alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let out = "";
+    let n = len(bytes);
+    let i = 0;
+    while i < n {
+        let rem = n - i;
+        let b0 = bytes[i];
+        let b1 = 0;
+        let b2 = 0;
+        if rem > 1 { b1 = bytes[i + 1]; }
+        if rem > 2 { b2 = bytes[i + 2]; }
+        let triple = b0 * 65536 + b1 * 256 + b2;
+        let c0 = bit_and(bit_shr(triple, 18), 63);
+        let c1 = bit_and(bit_shr(triple, 12), 63);
+        let c2 = bit_and(bit_shr(triple, 6), 63);
+        let c3 = bit_and(triple, 63);
+        out = out + str_slice(alpha, c0, c0 + 1) + str_slice(alpha, c1, c1 + 1);
+        if rem > 1 { out = out + str_slice(alpha, c2, c2 + 1); }
+        if rem > 2 { out = out + str_slice(alpha, c3, c3 + 1); }
+        i = i + 3;
     }
+    return out;
+}
 
+// _hmac_b64(signing_input, secret) — HS256 signature, base64url of the raw bytes.
+fn _hmac_b64(signing_input, secret) {
+    return _b64url_bytes(_hex_to_bytes(hmac_sha256(signing_input, secret)));
+}
+
+fn _in_list(list, v) {
+    let i = 0;
+    while i < len(list) { if list[i] == v { return true; } i = i + 1; }
+    return false;
+}
+
+// _aud_matches(aud, want) — RFC 7519 aud may be a string or an array of strings.
+fn _aud_matches(aud, want) {
+    if aud == nil { return false; }
+    if is_array(aud) { return _in_list(aud, want); }
+    return aud == want;
+}
+
+// _with_claims(payload, opts) — copy payload and inject registered claims.
+// opts: { no_iat, exp_in, iss, aud }
+fn _with_claims(payload, opts) {
+    let out = map{};
+    let ks = map_keys(payload);
+    let i = 0;
+    while i < len(ks) { out[ks[i]] = payload[ks[i]]; i = i + 1; }
+    let now = num_floor(clock());
+    if not (try opts.no_iat catch false) {
+        if not map_has(out, "iat") { out["iat"] = now; }
+    }
+    let exp_in = try opts.exp_in catch nil;
+    if exp_in != nil and not map_has(out, "exp") { out["exp"] = now + exp_in; }
+    let iss = try opts.iss catch nil;
+    if iss != nil and not map_has(out, "iss") { out["iss"] = iss; }
+    let aud = try opts.aud catch nil;
+    if aud != nil and not map_has(out, "aud") { out["aud"] = aud; }
+    return out;
+}
+
+// ── public API ────────────────────────────────────────────────────────────────
+
+// sign(payload, secret, opts) — create a signed JWT (HS256). opts (optional):
+//   { exp_in: seconds, iss, aud, kid, no_iat: true }
+fn sign(payload, secret, opts = nil) {
+    if opts == nil { opts = map{}; }
+    let claims = _with_claims(payload, opts);
+    let header = map{ alg: "HS256", typ: "JWT" };
+    let kid = try opts.kid catch nil;
+    if kid != nil { header["kid"] = kid; }
+
+    let header_b64 = _b64url_encode(json_stringify(header));
+    let payload_b64 = _b64url_encode(json_stringify(claims));
+    let signing_input = header_b64 + "." + payload_b64;
+    return signing_input + "." + _hmac_b64(signing_input, secret);
+}
+
+// _verify_core(token, secret, opts) — full validation, NEVER throws. Returns
+// { valid: true, payload } or { valid: false, error }.
+fn _verify_core(token, secret, opts) {
+    if opts == nil { opts = map{}; }
+    let parts = str_split(token, ".");
+    if len(parts) != 3 { return map{ valid: false, error: "invalid token format (expected 3 parts)" }; }
     let header_b64 = parts[0];
     let payload_b64 = parts[1];
     let sig_b64 = parts[2];
 
+    // Header + algorithm allowlist (defeats alg:none / algorithm confusion).
+    let header = try json_parse(_b64url_decode(header_b64)) catch nil;
+    if header == nil { return map{ valid: false, error: "invalid header JSON" }; }
+    let alg = try header.alg catch nil;
+    let algs = try opts.algs catch ["HS256"];
+    if not _in_list(algs, alg) { return map{ valid: false, error: "algorithm not allowed: " + str(alg) }; }
+    if alg != "HS256" { return map{ valid: false, error: "unsupported algorithm: " + str(alg) }; }
+
+    // Signature (constant-time compare).
     let signing_input = header_b64 + "." + payload_b64;
+    let expected = _hmac_b64(signing_input, secret);
+    if constant_time_eq(sig_b64, expected) == false { return map{ valid: false, error: "invalid signature" }; }
 
-    // Recompute signature
-    let expected_sig = try hmac_sha256(signing_input, secret) catch nil;
-    if expected_sig == nil {
-        expected_sig = sha256(signing_input + secret);
-    }
-    let expected_b64 = _b64url_encode(expected_sig);
+    // Payload.
+    let payload = try json_parse(_b64url_decode(payload_b64)) catch nil;
+    if payload == nil { return map{ valid: false, error: "invalid payload JSON" }; }
 
-    // Constant-time comparison to prevent timing attacks
-    if constant_time_eq(sig_b64, expected_b64) == false {
-        return error("jwt.verify: invalid signature");
-    }
-
-    // Decode payload
-    let payload_json = _b64url_decode(payload_b64);
-    let payload = try json_parse(payload_json) catch nil;
-    if payload == nil {
-        return error("jwt.verify: invalid payload JSON");
-    }
-
-    // Check expiry claim
+    // Temporal claims with optional leeway (clock-skew tolerance, seconds).
+    let leeway = try opts.leeway catch 0;
+    let now = num_floor(clock());
     let exp = try payload.exp catch nil;
-    if exp != nil {
-        let now = num_floor(clock());
-        if now > exp {
-            return error("jwt.verify: token has expired");
-        }
-    }
-
-    // Check not-before claim
+    if exp != nil and now > (exp + leeway) { return map{ valid: false, error: "token has expired" }; }
     let nbf = try payload.nbf catch nil;
-    if nbf != nil {
-        let now = num_floor(clock());
-        if now < nbf {
-            return error("jwt.verify: token not yet valid");
-        }
+    if nbf != nil and now < (nbf - leeway) { return map{ valid: false, error: "token not yet valid" }; }
+
+    // Audience / issuer (only checked when requested).
+    let want_aud = try opts.aud catch nil;
+    if want_aud != nil {
+        if not _aud_matches(try payload.aud catch nil, want_aud) { return map{ valid: false, error: "audience mismatch" }; }
+    }
+    let want_iss = try opts.iss catch nil;
+    if want_iss != nil {
+        if (try payload.iss catch nil) != want_iss { return map{ valid: false, error: "issuer mismatch" }; }
     }
 
-    return payload;
+    return map{ valid: true, payload: payload };
 }
 
-// decode(token) — decode WITHOUT verifying signature (for inspection only)
+// verify(token, secret, opts) — verify and return the payload; THROWS on any
+// failure (signature, algorithm, expiry, audience, issuer). opts (optional):
+//   { algs: ["HS256"], leeway: seconds, aud, iss }
+fn verify(token, secret, opts = nil) {
+    let r = _verify_core(token, secret, opts);
+    if r.valid == false { return error("jwt.verify: " + r.error); }
+    return r.payload;
+}
+
+// try_verify(token, secret, opts) — non-throwing verify. Returns
+// { valid: true, payload } or { valid: false, error }.
+fn try_verify(token, secret, opts = nil) {
+    return _verify_core(token, secret, opts);
+}
+
+// is_expired(token) — true if the token is malformed or its exp is in the past.
+// (No signature check — for cheap pre-flight only.)
+fn is_expired(token) {
+    let parts = str_split(token, ".");
+    if len(parts) != 3 { return true; }
+    let payload = try json_parse(_b64url_decode(parts[1])) catch nil;
+    if payload == nil { return true; }
+    let exp = try payload.exp catch nil;
+    if exp == nil { return false; }
+    return num_floor(clock()) > exp;
+}
+
+// decode(token) — decode WITHOUT verifying the signature (inspection only).
 fn decode(token) {
     let parts = str_split(token, ".");
     if len(parts) != 3 { return nil; }
-    let header_json = _b64url_decode(parts[0]);
-    let payload_json = _b64url_decode(parts[1]);
     return map{
-        header: try json_parse(header_json) catch nil,
-        payload: try json_parse(payload_json) catch nil
+        header: try json_parse(_b64url_decode(parts[0])) catch nil,
+        payload: try json_parse(_b64url_decode(parts[1])) catch nil
     };
 }
 
-export sign, verify, decode, expiry;
+export sign, verify, try_verify, decode, expiry, is_expired;
