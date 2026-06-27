@@ -1,526 +1,275 @@
 // stdlib/async_await.sapp — Async/await-like primitives for pblang.
 //
-// Provides future-based async composition using the existing channel and thread
-// infrastructure. Unlike stdlib:async.sapp (Go-style goroutines + pools), this
-// module focuses on composable futures with `map` and `then` chaining.
+// Future-based async composition over the channel/thread builtins, with map/then
+// chaining, await_all/any, timeouts, and error recovery.
 //
-// Usage:
+// NOTE on error handling: pblang's `catch` does NOT bind the thrown value — the
+// form is `try <expr> catch <fallback-expr>`. So we detect "did it throw?" with a
+// per-call sentinel rather than a named catch binding. (A previous version used
+// `try { ... } catch e { err = e; }`, which mis-parsed: the `{ ... }` ran
+// unconditionally and read an undefined global `e`, killing the worker before it
+// sent its result — every async_spawn deadlocked. This version fixes that.)
+//
 //   let aa = import("stdlib:async_await.sapp");
-//
-//   // Spawn a background computation
-//   let f1 = aa.async_spawn(fn() { return heavy_computation(); });
-//
-//   // Block and get the result
-//   let result = aa.await(f1);
-//
-//   // Compose futures
-//   let f2 = aa.map(f1, fn(x) { return x * 2; });
-//   let f3 = aa.then(f1, fn(x) { return aa.async_spawn(fn() { return x + 1; }); });
-//
-//   // Wait for all or any
-//   let all_results = aa.await_all([f1, f2, f3]);
-//   let first_result = aa.await_any([f1, f2, f3]);
-//
-// Primitives:
-//   async_spawn(fn)  — spawn a computation, return a Future
-//   await(future)     — block until the Future resolves, return its value
-//   await_all(fs)     — wait for all Futures, return [values]
-//   await_any(fs)     — return {index, value} of the first resolved Future
-//   map(future, fn)   — transform a Future's result with fn(value) → new_value
-//   then(future, fn)  — chain: fn(value) returns a new Future; resolves to its value
-//
-// Built on: VM builtins (spawn, join, channel, send, recv, select, recv_timeout,
-//           channel_close, channel_is_closed) and stdlib:thread.sapp utilities.
+//   let f = aa.async_spawn(fn() { return work(); });
+//   let v = aa.await(f);
+//   let g = aa.map(f, fn(x) { return x * 2; });
+//   let r = aa.all_settled([f, g]);     // never raises
 
-let thread = import("stdlib:thread.sapp");
+// A Future is map{ __ch, __handle, __resolved, __value, __error, __tag }.
+// The worker sends map{ ok, value } (ok=false means the task threw).
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 1. FUTURE REPRESENTATION
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// A Future is a map with the following keys:
-//   __ch       — channel pair {sender, receiver} used to transmit the result
-//   __handle   — thread handle returned by spawn()
-//   __resolved — bool, true once the result has been read
-//   __value    — cached result value (nil until resolved)
-//   __error    — cached error string (nil if no error)
-//   __tag      — string label for debugging ("async_spawn", "map", "then")
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. CORE: async_spawn / await
-// ─────────────────────────────────────────────────────────────────────────────
-
-// async_spawn(fn) → Future
-//   Spawns fn() in a new thread. The function's return value (or error) is
-//   sent over a channel and can be retrieved with await().
-//
-//   If fn() throws an error, the Future resolves to an error state and
-//   await() will re-raise it.
 fn async_spawn(task_fn) {
     let ch = channel();
+    let sentinel = map{ __threw: true };
     let handle = spawn(fn() {
-        let ok = true;
-        let val = nil;
-        let err = nil;
-        try {
-            val = task_fn();
-        } catch e {
-            ok = false;
-            err = e;
-        }
-        send(ch.sender, map{ ok: ok, value: val, error: err });
+        let val = try task_fn() catch sentinel;
+        let threw = (val == sentinel);
+        let v = val;
+        if threw { v = nil; }
+        send(ch.sender, map{ ok: not threw, value: v });
     });
-    return map{
-        __ch: ch,
-        __handle: handle,
-        __resolved: false,
-        __value: nil,
-        __error: nil,
-        __tag: "async_spawn"
-    };
+    return map{ __ch: ch, __handle: handle, __resolved: false, __value: nil, __error: nil, __tag: "async_spawn" };
 }
 
-// await(future) → value
-//   Blocks until the Future resolves. Returns the computed value.
-//   If the computation failed, raises an error.
-//   If the future is already resolved (cached), returns immediately.
+// await(future) → value — block until resolved; raise if the task threw.
 fn await(future) {
     if future.__resolved == true {
-        if future.__error != nil {
-            return error("async_await.await: " + str(future.__error));
-        }
+        if future.__error != nil { return error("async_await.await: " + str(future.__error)); }
         return future.__value;
     }
-
     let msg = recv(future.__ch.receiver);
-    try { join(future.__handle); } catch _ {}
-
+    try join(future.__handle) catch nil;
+    future.__resolved = true;
     if msg == nil {
-        future.__resolved = true;
         future.__error = "channel closed without result";
         return error("async_await.await: channel closed without result");
     }
-
-    future.__resolved = true;
     if msg.ok == false {
-        future.__error = msg.error;
-        return error("async_await.await: computation failed: " + str(msg.error));
+        future.__error = "task threw";
+        return error("async_await.await: computation failed");
     }
     future.__value = msg.value;
     return msg.value;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. COMPOSITION: await_all / await_any
-// ─────────────────────────────────────────────────────────────────────────────
-
-// await_all(futures) → [values]
-//   Waits for every Future in the array to resolve, then returns an array
-//   of results in the same order. If any Future fails, returns the first
-//   error encountered.
-fn await_all(futures) {
-    let results = [];
-    let n = len(futures);
-    let i = 0;
-    while i < n {
-        array_push(results, await(futures[i]));
-        i = i + 1;
-    }
-    return results;
-}
-
-// await_any(futures) → {index, value}
-//   Returns as soon as the first Future resolves. The returned map contains
-//   `index` (position in the array) and `value` (the resolved result).
-//   All other threads are joined for cleanup.
-fn await_any(futures) {
-    let n = len(futures);
-    if n == 0 {
-        return error("async_await.await_any: empty futures array");
-    }
-
-    // Collect receivers for select()
-    let receivers = [];
-    let i = 0;
-    while i < n {
-        if futures[i].__resolved == true {
-            // Already resolved — return immediately
-            let val = nil;
-            if futures[i].__error != nil {
-                return error("async_await.await_any: future " + str(i) + " failed: " + str(futures[i].__error));
-            }
-            val = futures[i].__value;
-            // Join all handles for cleanup
-            let j = 0;
-            while j < n {
-                try { join(futures[j].__handle); } catch _ {}
-                j = j + 1;
-            }
-            return map{ index: i, value: val };
-        }
-        array_push(receivers, futures[i].__ch.receiver);
-        i = i + 1;
-    }
-
-    let sel = select(receivers);
-    if sel == nil {
-        // Join all for cleanup
-        let k = 0;
-        while k < n {
-            try { join(futures[k].__handle); } catch _ {}
-            k = k + 1;
-        }
-        return error("async_await.await_any: select returned nil");
-    }
-
-    let idx = sel.index;
-    let msg = sel.value;
-
-    // Mark the winning future as resolved
-    futures[idx].__resolved = true;
-    if msg != nil {
-        if msg.ok == false {
-            futures[idx].__error = msg.error;
-        } else {
-            futures[idx].__value = msg.value;
-        }
-    }
-
-    // Join all handles for cleanup
-    let k = 0;
-    while k < n {
-        try { join(futures[k].__handle); } catch _ {}
-        k = k + 1;
-    }
-
-    if msg == nil {
-        return map{ index: idx, value: nil };
-    }
-    if msg.ok == false {
-        return error("async_await.await_any: future " + str(idx) + " failed: " + str(msg.error));
-    }
-    return map{ index: idx, value: msg.value };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. TRANSFORMATION: map / then
-// ─────────────────────────────────────────────────────────────────────────────
-
-// map(future, fn) → Future
-//   Creates a new Future whose result is fn(await(future)).
-//   The transform fn is applied in the caller's thread after the original
-//   Future resolves. If the original Future errors, the mapped Future also
-//   errors (fn is never called).
-fn map(future, transform_fn) {
-    let ch = channel();
-    let handle = spawn(fn() {
-        let msg = recv(future.__ch.receiver);
-        try { join(future.__handle); } catch _ {}
-
-        if msg == nil {
-            send(ch.sender, map{ ok: false, value: nil, error: "map: source channel closed" });
-        } else if msg.ok == false {
-            // Propagate error
-            send(ch.sender, map{ ok: false, value: nil, error: msg.error });
-        } else {
-            let mapped = nil;
-            let mapped_ok = true;
-            let mapped_err = nil;
-            try {
-                mapped = transform_fn(msg.value);
-            } catch e {
-                mapped_ok = false;
-                mapped_err = e;
-            }
-            send(ch.sender, map{ ok: mapped_ok, value: mapped, error: mapped_err });
-        }
-    });
-    return map{
-        __ch: ch,
-        __handle: handle,
-        __resolved: false,
-        __value: nil,
-        __error: nil,
-        __tag: "map"
-    };
-}
-
-// then(future, fn) → Future
-//   Sequential chaining: awaits `future`, then calls fn(value) which must
-//   return a new Future. The returned Future resolves to the inner Future's
-//   value. This is the "bind" or "flatMap" operation.
-//
-//   Example:
-//     let f1 = aa.async_spawn(fn() { return fetch_user(); });
-//     let f2 = aa.then(f1, fn(user) {
-//         return aa.async_spawn(fn() { return fetch_orders(user); });
-//     });
-//     let orders = aa.await(f2);
-fn then(future, chain_fn) {
-    let ch = channel();
-    let handle = spawn(fn() {
-        // Wait for the first future to resolve
-        let msg = recv(future.__ch.receiver);
-        try { join(future.__handle); } catch _ {}
-
-        if msg == nil {
-            send(ch.sender, map{ ok: false, value: nil, error: "then: source channel closed" });
-        } else if msg.ok == false {
-            // Propagate error from first future
-            send(ch.sender, map{ ok: false, value: nil, error: msg.error });
-        } else {
-            // Call chain_fn to get the next future
-            let next_future = nil;
-            let next_ok = true;
-            let next_err = nil;
-            try {
-                next_future = chain_fn(msg.value);
-            } catch e {
-                next_ok = false;
-                next_err = e;
-            }
-
-            if next_ok == false {
-                send(ch.sender, map{ ok: false, value: nil, error: "then: chain_fn failed: " + str(next_err) });
-            } else {
-                // Await the inner future
-                let inner_msg = recv(next_future.__ch.receiver);
-                try { join(next_future.__handle); } catch _ {}
-
-                if inner_msg == nil {
-                    send(ch.sender, map{ ok: false, value: nil, error: "then: inner channel closed" });
-                } else if inner_msg.ok == false {
-                    send(ch.sender, map{ ok: false, value: nil, error: inner_msg.error });
-                } else {
-                    send(ch.sender, map{ ok: true, value: inner_msg.value, error: nil });
-                }
-            }
-        }
-    });
-    return map{
-        __ch: ch,
-        __handle: handle,
-        __resolved: false,
-        __value: nil,
-        __error: nil,
-        __tag: "then"
-    };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. UTILITY: is_resolved / await_timeout / race_with_timeout
-// ─────────────────────────────────────────────────────────────────────────────
-
-// is_resolved(future) → bool
-//   Returns true if the Future has already been read/cached (non-blocking).
-fn is_resolved(future) {
-    return future.__resolved == true;
-}
-
-// await_timeout(future, ms) → {ok, value} | {ok: false, error: "timeout"}
-//   Like await() but with a timeout. Returns {ok: true, value: v} on success,
-//   {ok: false, error: "timeout"} if the deadline expires, or
-//   {ok: false, error: msg} if the computation failed.
-fn await_timeout(future, ms) {
+// settle(future) → {ok, value} | {ok:false, error} — block but NEVER raise.
+fn settle(future) {
     if future.__resolved == true {
-        if future.__error != nil {
-            return map{ ok: false, error: str(future.__error) };
-        }
+        if future.__error != nil { return map{ ok: false, error: str(future.__error) }; }
         return map{ ok: true, value: future.__value };
     }
-
-    let msg = recv_timeout(future.__ch.receiver, ms);
-    if msg == nil {
-        return map{ ok: false, error: "timeout" };
-    }
-
-    try { join(future.__handle); } catch _ {}
+    let msg = recv(future.__ch.receiver);
+    try join(future.__handle) catch nil;
     future.__resolved = true;
-
-    if msg.ok == false {
-        future.__error = msg.error;
-        return map{ ok: false, error: str(msg.error) };
-    }
-
+    if msg == nil { future.__error = "channel closed without result"; return map{ ok: false, error: "channel closed without result" }; }
+    if msg.ok == false { future.__error = "task threw"; return map{ ok: false, error: "task threw" }; }
     future.__value = msg.value;
     return map{ ok: true, value: msg.value };
 }
 
-// await_all_timeout(futures, ms) → {ok, values} | {ok: false, error: "timeout"}
-//   Like await_all but with a total timeout across all futures.
+// await_all(futures) → [values] — raises on the first failure.
+fn await_all(futures) {
+    let results = [];
+    let i = 0;
+    while i < len(futures) { array_push(results, await(futures[i])); i = i + 1; }
+    return results;
+}
+
+// all_settled(futures) → [{ok, value|error}, ...] — never raises.
+fn all_settled(futures) {
+    let out = [];
+    let i = 0;
+    while i < len(futures) { array_push(out, settle(futures[i])); i = i + 1; }
+    return out;
+}
+
+// await_any(futures) → {index, value} — first to resolve (raises if it failed).
+fn await_any(futures) {
+    let n = len(futures);
+    if n == 0 { return error("async_await.await_any: empty futures array"); }
+    let receivers = [];
+    let i = 0;
+    while i < n {
+        if futures[i].__resolved == true {
+            if futures[i].__error != nil { return error("async_await.await_any: future " + str(i) + " failed"); }
+            return map{ index: i, value: futures[i].__value };
+        }
+        array_push(receivers, futures[i].__ch.receiver);
+        i = i + 1;
+    }
+    let sel = select(receivers);
+    if sel == nil { return error("async_await.await_any: select returned nil"); }
+    let idx = sel.index;
+    let msg = sel.value;
+    futures[idx].__resolved = true;
+    if msg != nil {
+        if msg.ok == false { futures[idx].__error = "task threw"; }
+        else { futures[idx].__value = msg.value; }
+    }
+    if msg == nil { return map{ index: idx, value: nil }; }
+    if msg.ok == false { return error("async_await.await_any: future " + str(idx) + " failed"); }
+    return map{ index: idx, value: msg.value };
+}
+
+// map(future, fn) → Future — transform the resolved value with fn (errors propagate).
+fn map(future, transform_fn) {
+    let ch = channel();
+    let sentinel = map{ __threw: true };
+    let handle = spawn(fn() {
+        let msg = recv(future.__ch.receiver);
+        try join(future.__handle) catch nil;
+        if msg == nil { send(ch.sender, map{ ok: false, value: nil }); }
+        else if msg.ok == false { send(ch.sender, map{ ok: false, value: nil }); }
+        else {
+            let mapped = try transform_fn(msg.value) catch sentinel;
+            let threw = (mapped == sentinel);
+            let v = mapped;
+            if threw { v = nil; }
+            send(ch.sender, map{ ok: not threw, value: v });
+        }
+    });
+    return map{ __ch: ch, __handle: handle, __resolved: false, __value: nil, __error: nil, __tag: "map" };
+}
+
+// then(future, fn) → Future — fn(value) returns a new Future; result flattens it.
+fn then(future, chain_fn) {
+    let ch = channel();
+    let sentinel = map{ __threw: true };
+    let handle = spawn(fn() {
+        let msg = recv(future.__ch.receiver);
+        try join(future.__handle) catch nil;
+        if msg == nil { send(ch.sender, map{ ok: false, value: nil }); }
+        else if msg.ok == false { send(ch.sender, map{ ok: false, value: nil }); }
+        else {
+            let next_future = try chain_fn(msg.value) catch sentinel;
+            if next_future == sentinel { send(ch.sender, map{ ok: false, value: nil }); }
+            else {
+                let inner = recv(next_future.__ch.receiver);
+                try join(next_future.__handle) catch nil;
+                if inner == nil { send(ch.sender, map{ ok: false, value: nil }); }
+                else if inner.ok == false { send(ch.sender, map{ ok: false, value: nil }); }
+                else { send(ch.sender, map{ ok: true, value: inner.value }); }
+            }
+        }
+    });
+    return map{ __ch: ch, __handle: handle, __resolved: false, __value: nil, __error: nil, __tag: "then" };
+}
+
+// catch_error(future, handler) → Future — on failure, resolve to handler(reason);
+// on success, pass the value through. (handler runs in a worker; keep it self-contained.)
+fn catch_error(future, handler) {
+    let ch = channel();
+    let sentinel = map{ __threw: true };
+    let handle = spawn(fn() {
+        let msg = recv(future.__ch.receiver);
+        try join(future.__handle) catch nil;
+        let failed = (msg == nil) or (msg.ok == false);
+        if failed {
+            let r = try handler("task failed") catch sentinel;
+            let threw = (r == sentinel);
+            let v = r;
+            if threw { v = nil; }
+            send(ch.sender, map{ ok: not threw, value: v });
+        } else {
+            send(ch.sender, map{ ok: true, value: msg.value });
+        }
+    });
+    return map{ __ch: ch, __handle: handle, __resolved: false, __value: nil, __error: nil, __tag: "catch_error" };
+}
+
+// is_resolved(future) → bool (non-blocking).
+fn is_resolved(future) { return future.__resolved == true; }
+
+// await_timeout(future, ms) → {ok, value} | {ok:false, error}.
+fn await_timeout(future, ms) {
+    if future.__resolved == true {
+        if future.__error != nil { return map{ ok: false, error: str(future.__error) }; }
+        return map{ ok: true, value: future.__value };
+    }
+    let msg = recv_timeout(future.__ch.receiver, ms);
+    if msg == nil { return map{ ok: false, error: "timeout" }; }
+    try join(future.__handle) catch nil;
+    future.__resolved = true;
+    if msg.ok == false { future.__error = "task threw"; return map{ ok: false, error: "task threw" }; }
+    future.__value = msg.value;
+    return map{ ok: true, value: msg.value };
+}
+
+// await_all_timeout(futures, ms) → {ok, values} | {ok:false, error}.
 fn await_all_timeout(futures, ms) {
     let n = len(futures);
     let per_future_ms = ms;
     if n > 0 { per_future_ms = ms / n; }
     if per_future_ms < 100 { per_future_ms = 100; }
-
     let results = [];
     let i = 0;
     while i < n {
         let r = await_timeout(futures[i], per_future_ms);
-        if r.ok == false {
-            return map{ ok: false, error: r.error };
-        }
+        if r.ok == false { return map{ ok: false, error: r.error }; }
         array_push(results, r.value);
         i = i + 1;
     }
     return map{ ok: true, values: results };
 }
 
-// race_with_timeout(futures, ms) → {index, value} | {ok: false, error: "timeout"}
-//   Like await_any but with a deadline.
+// race_with_timeout(futures, ms) → {ok, index, value} | {ok:false, error}.
 fn race_with_timeout(futures, ms) {
     let n = len(futures);
-    if n == 0 {
-        return map{ ok: false, error: "empty futures array" };
-    }
-
+    if n == 0 { return map{ ok: false, error: "empty futures array" }; }
     let receivers = [];
     let i = 0;
     while i < n {
         if futures[i].__resolved == true {
-            if futures[i].__error != nil {
-                return map{ ok: false, error: str(futures[i].__error) };
-            }
+            if futures[i].__error != nil { return map{ ok: false, error: str(futures[i].__error) }; }
             return map{ ok: true, index: i, value: futures[i].__value };
         }
         array_push(receivers, futures[i].__ch.receiver);
         i = i + 1;
     }
-
     let sel = select_with_timeout(receivers, ms);
-    if sel == nil {
-        return map{ ok: false, error: "timeout" };
-    }
-
+    if sel == nil { return map{ ok: false, error: "timeout" }; }
     let idx = sel.index;
     let msg = sel.value;
-
     futures[idx].__resolved = true;
     if msg != nil {
-        if msg.ok == false {
-            futures[idx].__error = msg.error;
-            return map{ ok: false, error: str(msg.error) };
-        }
+        if msg.ok == false { futures[idx].__error = "task threw"; return map{ ok: false, error: "task threw" }; }
         futures[idx].__value = msg.value;
     }
-
-    // Cleanup all handles
-    let k = 0;
-    while k < n {
-        try { join(futures[k].__handle); } catch _ {}
-        k = k + 1;
-    }
-
-    if msg == nil {
-        return map{ ok: true, index: idx, value: nil };
-    }
+    if msg == nil { return map{ ok: true, index: idx, value: nil }; }
     return map{ ok: true, index: idx, value: msg.value };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. CONVENIENCE: from_value / never / first_ok
-// ─────────────────────────────────────────────────────────────────────────────
-
-// from_value(value) → Future
-//   Creates an already-resolved Future wrapping a static value.
-//   Useful for composition: then(some_future, fn(x) { return from_value(transform(x)); })
+// from_value(value) → Future — already-resolved Future wrapping a static value.
 fn from_value(value) {
-    let ch = channel_buffered(1);
-    send(ch.sender, map{ ok: true, value: value, error: nil });
-    return map{
-        __ch: ch,
-        __handle: nil,
-        __resolved: true,
-        __value: value,
-        __error: nil,
-        __tag: "from_value"
-    };
+    return map{ __ch: nil, __handle: nil, __resolved: true, __value: value, __error: nil, __tag: "from_value" };
 }
 
-// from_error(err_msg) → Future
-//   Creates an already-failed Future with the given error message.
+// from_error(err_msg) → Future — already-failed Future.
 fn from_error(err_msg) {
-    let ch = channel_buffered(1);
-    send(ch.sender, map{ ok: false, value: nil, error: err_msg });
-    return map{
-        __ch: ch,
-        __handle: nil,
-        __resolved: true,
-        __value: nil,
-        __error: err_msg,
-        __tag: "from_error"
-    };
+    return map{ __ch: nil, __handle: nil, __resolved: true, __value: nil, __error: err_msg, __tag: "from_error" };
 }
 
-// never() → Future
-//   Creates a Future that never resolves. Useful as a placeholder in
-//   await_any() when you want the race to depend on real futures only.
+// never() → Future — never resolves (placeholder for races).
 fn never() {
-    // Use an unbounded channel with no sender — it will block forever
-    let ch = channel();
-    // Don't close the sender, don't send anything — recv will block indefinitely
-    // We close the sender to make the future block, but never resolve
-    // Actually: leave the channel open so recv blocks. But we need a handle.
-    // Use a separate long-lived channel that never receives.
-    return map{
-        __ch: ch,
-        __handle: nil,
-        __resolved: false,
-        __value: nil,
-        __error: nil,
-        __tag: "never"
-    };
+    return map{ __ch: channel(), __handle: nil, __resolved: false, __value: nil, __error: nil, __tag: "never" };
 }
 
-// first_ok(futures) → {index, value} | nil
-//   Like await_any but skips futures that error, returning the first
-//   successful result. Returns nil if all futures fail.
+// first_ok(futures) → {index, value} | nil — first SUCCESSFUL result, skip failures.
 fn first_ok(futures) {
     let n = len(futures);
     if n == 0 { return nil; }
-
     let i = 0;
     while i < n {
-        if futures[i].__resolved == true {
-            if futures[i].__error == nil {
-                return map{ index: i, value: futures[i].__value };
-            }
-            // Already resolved with error — skip
-            i = i + 1;
-            continue;
-        }
-
-        let msg = recv(futures[i].__ch.receiver);
-        try { join(futures[i].__handle); } catch _ {}
-
-        futures[i].__resolved = true;
-        if msg != nil and msg.ok == true {
-            futures[i].__value = msg.value;
-            // Cleanup remaining handles
-            let j = i + 1;
-            while j < n {
-                try { join(futures[j].__handle); } catch _ {}
-                j = j + 1;
-            }
-            return map{ index: i, value: msg.value };
-        }
-        if msg != nil {
-            futures[i].__error = msg.error;
-        }
+        let r = settle(futures[i]);
+        if r.ok == true { return map{ index: i, value: r.value }; }
         i = i + 1;
     }
-
-    // All failed
     return nil;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EXPORTS
-// ─────────────────────────────────────────────────────────────────────────────
-
 export
-    async_spawn, await, await_all, await_any,
-    map, then,
+    async_spawn, await, settle, await_all, all_settled, await_any,
+    map, then, catch_error,
     is_resolved, await_timeout, await_all_timeout, race_with_timeout,
     from_value, from_error, never, first_ok;
