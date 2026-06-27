@@ -1,41 +1,101 @@
-// stdlib/socks5.sapp — the SOCKS5 client protocol, in pblang (for Tor routing).
+// stdlib/socks5.sapp — the SOCKS5 client protocol, in pblang (for Tor / proxy routing).
 //
-// Tor exposes a SOCKS5 proxy (default 127.0.0.1:9050). To browse via Tor, a client opens
-// a plain TCP socket to that proxy, performs the SOCKS5 no-auth greeting, sends a CONNECT
-// request for the target host:port, then speaks HTTP over the established tunnel. This
-// module builds/parses those SOCKS5 messages — the protocol is pure pblang and tested in
-// the VM. Bytes are carried as code points in a string (each 0..255).
+// Tor exposes a SOCKS5 proxy (default 127.0.0.1:9050). A client opens a TCP socket to
+// the proxy, performs the SOCKS5 greeting, sends a CONNECT for the target host:port,
+// then speaks the target protocol over the tunnel. This module builds/parses those
+// messages AND (now that the VM has tcp_connect + byte-array tcp_write) performs the
+// full handshake end-to-end.
 //
-// HONEST GAP (docs/Protocols.md): the *transport* needs a plain `tcp_connect` builtin
-// (the VM ships tcp_listen/accept + only tcp_connect_tls), and HTTPS targets additionally
-// need TLS *inside* the SOCKS tunnel. The protocol below is ready for when those land.
+// Messages are BYTE ARRAYS (Array<u8>). SOCKS5 is a binary protocol, so frames must
+// NOT be carried in a UTF-8 string — a byte >= 128 (e.g. the low byte of port 443 =
+// 0xBB) would be re-encoded as a multi-byte UTF-8 sequence and corrupt the frame.
 
-fn _byte(v) { return strfromcharcode(v); }
+// ── byte helpers ─────────────────────────────────────────────────────────────────
+fn _u16be(n) { return [num_floor(n / 256), num_mod(n, 256)]; }
+fn _push_bytes(arr, src) { let i = 0; while i < len(src) { array_push(arr, src[i]); i = i + 1; } }
 
-// greeting() — client hello offering the "no authentication" method (0x00).
-//   [ ver=0x05, n_methods=0x01, method=0x00 ]
-fn greeting() { return _byte(5) + _byte(1) + _byte(0); }
-
-// connect_request(host, port) — a SOCKS5 CONNECT to a domain target.
-//   [ ver=0x05, cmd=0x01(CONNECT), rsv=0x00, atyp=0x03(domain), len, host…, port_hi, port_lo ]
-fn connect_request(host, port) {
-    let n = len(host);
-    let hi = (port - num_mod(port, 256)) / 256;
-    let lo = num_mod(port, 256);
-    return _byte(5) + _byte(1) + _byte(0) + _byte(3) + _byte(n) + host + _byte(hi) + _byte(lo);
+fn _is_digits(s) {
+    if s == "" { return false; }
+    let i = 0;
+    while i < len(s) { if str_index_of("0123456789", s[i..(i + 1)]) < 0 { return false; } i = i + 1; }
+    return true;
+}
+fn _is_ipv4(s) {
+    let parts = str_split(s, ".");
+    if len(parts) != 4 { return false; }
+    let i = 0;
+    while i < 4 {
+        if not _is_digits(parts[i]) { return false; }
+        let n = parse_number(parts[i]);
+        if n < 0 or n > 255 { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
-// parse_method_reply(bytes) — server's chosen method: [ ver, method ]. method 0x00 = ok.
+// ── message builders (Array<u8>) ───────────────────────────────────────────────
+// greeting() — offer "no authentication" (0x00): [ver=5, n=1, method=0].
+fn greeting() { return [5, 1, 0]; }
+
+// greeting_auth() — offer no-auth AND username/password (0x02): [5, 2, 0, 2].
+fn greeting_auth() { return [5, 2, 0, 2]; }
+
+// userpass_auth_request(user, pass) — RFC 1929: [ver=1, ulen, user…, plen, pass…].
+fn userpass_auth_request(user, pass) {
+    let out = [1];
+    let ub = str_to_bytes(user);
+    array_push(out, len(ub)); _push_bytes(out, ub);
+    let pb = str_to_bytes(pass);
+    array_push(out, len(pb)); _push_bytes(out, pb);
+    return out;
+}
+
+// connect_request(host, port) — CONNECT to a target. Uses atyp 0x01 (IPv4) when host
+// is a dotted-quad literal, else atyp 0x03 (domain).
+//   [ ver=5, cmd=1, rsv=0, atyp, addr…, port_hi, port_lo ]
+fn connect_request(host, port) {
+    let out = [5, 1, 0];
+    if _is_ipv4(host) {
+        array_push(out, 1);
+        let parts = str_split(host, ".");
+        let i = 0;
+        while i < 4 { array_push(out, parse_number(parts[i])); i = i + 1; }
+    } else {
+        array_push(out, 3);
+        let hb = str_to_bytes(host);
+        array_push(out, len(hb));
+        _push_bytes(out, hb);
+    }
+    _push_bytes(out, _u16be(port));
+    return out;
+}
+
+// ── reply parsers (accept a byte array OR a string of code points) ──────────────
+fn _at(data, i) {
+    if is_array(data) { return data[i]; }
+    return strcharcodeat(data, i);
+}
+
+// parse_method_reply(bytes) — [ ver, method ]. method 0x00 = no-auth accepted.
 fn parse_method_reply(bytes) {
-    if len(bytes) < 2 { return nil; }
-    return map{ ver: strcharcodeat(bytes, 0), method: strcharcodeat(bytes, 1) };
+    if bytes == nil or len(bytes) < 2 { return nil; }
+    return map{ ver: _at(bytes, 0), method: _at(bytes, 1) };
 }
 fn method_ok(reply) { return reply != nil and reply.ver == 5 and reply.method == 0; }
 
-// parse_connect_reply(bytes) — CONNECT result: [ ver, rep, rsv, atyp, … ]. rep 0x00 = ok.
+// parse_auth_reply(bytes) — RFC 1929 reply [ ver=1, status ]. status 0x00 = success.
+fn parse_auth_reply(bytes) {
+    if bytes == nil or len(bytes) < 2 { return nil; }
+    return map{ ver: _at(bytes, 0), status: _at(bytes, 1) };
+}
+fn auth_ok(reply) { return reply != nil and reply.status == 0; }
+
+// parse_connect_reply(bytes) — [ ver, rep, rsv, atyp, … ]. rep 0x00 = ok.
 fn parse_connect_reply(bytes) {
-    if len(bytes) < 2 { return nil; }
-    return map{ ver: strcharcodeat(bytes, 0), rep: strcharcodeat(bytes, 1) };
+    if bytes == nil or len(bytes) < 2 { return nil; }
+    let m = map{ ver: _at(bytes, 0), rep: _at(bytes, 1) };
+    if len(bytes) >= 4 { m.atyp = _at(bytes, 3); }
+    return m;
 }
 fn connect_ok(reply) { return reply != nil and reply.rep == 0; }
 
@@ -47,8 +107,54 @@ fn rep_text(rep) {
     if rep == 3 { return "network unreachable"; }
     if rep == 4 { return "host unreachable"; }
     if rep == 5 { return "connection refused"; }
+    if rep == 6 { return "TTL expired"; }
+    if rep == 7 { return "command not supported"; }
+    if rep == 8 { return "address type not supported"; }
     return "error " + str(rep);
 }
 
-export greeting, connect_request, parse_method_reply, method_ok;
-export parse_connect_reply, connect_ok, rep_text;
+// ── high-level handshake (over an OPEN proxy stream handle) ──────────────────────
+// The reply's first bytes [ver, rep, rsv, atyp] are all < 128, so reading the reply
+// as a string and recovering bytes via str_to_bytes is exact for those fields.
+fn handshake(conn, host, port) {
+    tcp_write(conn, greeting());
+    let mr = parse_method_reply(str_to_bytes(try tcp_read(conn, 2) catch ""));
+    if not method_ok(mr) { return map{ ok: false, error: "SOCKS5: no-auth not accepted" }; }
+    tcp_write(conn, connect_request(host, port));
+    let cr = parse_connect_reply(str_to_bytes(try tcp_read(conn, 10) catch ""));
+    if cr == nil { return map{ ok: false, error: "SOCKS5: no CONNECT reply" }; }
+    if not connect_ok(cr) { return map{ ok: false, error: "SOCKS5: " + rep_text(cr.rep) }; }
+    return map{ ok: true };
+}
+
+// handshake_auth(conn, host, port, user, pass) — username/password handshake.
+fn handshake_auth(conn, host, port, user, pass) {
+    tcp_write(conn, greeting_auth());
+    let mr = parse_method_reply(str_to_bytes(try tcp_read(conn, 2) catch ""));
+    if mr == nil { return map{ ok: false, error: "SOCKS5: no method reply" }; }
+    if mr.method == 2 {
+        tcp_write(conn, userpass_auth_request(user, pass));
+        let ar = parse_auth_reply(str_to_bytes(try tcp_read(conn, 2) catch ""));
+        if not auth_ok(ar) { return map{ ok: false, error: "SOCKS5: authentication failed" }; }
+    } else {
+        if mr.method != 0 { return map{ ok: false, error: "SOCKS5: no acceptable auth method" }; }
+    }
+    tcp_write(conn, connect_request(host, port));
+    let cr = parse_connect_reply(str_to_bytes(try tcp_read(conn, 10) catch ""));
+    if not connect_ok(cr) { return map{ ok: false, error: "SOCKS5: " + rep_text(try cr.rep catch 1) }; }
+    return map{ ok: true };
+}
+
+// connect(proxy_addr, host, port) — open the proxy with tcp_connect and run the
+// no-auth handshake. Returns { ok, connection } or { ok:false, error }.
+fn connect(proxy_addr, host, port) {
+    let conn = try tcp_connect(proxy_addr) catch nil;
+    if conn == nil { return map{ ok: false, error: "SOCKS5: cannot reach proxy " + str(proxy_addr) }; }
+    let h = handshake(conn, host, port);
+    if not h.ok { try tcp_close(conn) catch nil; return h; }
+    return map{ ok: true, connection: conn };
+}
+
+export greeting, greeting_auth, userpass_auth_request, connect_request;
+export parse_method_reply, method_ok, parse_auth_reply, auth_ok;
+export parse_connect_reply, connect_ok, rep_text, handshake, handshake_auth, connect;
