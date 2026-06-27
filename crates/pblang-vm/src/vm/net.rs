@@ -302,9 +302,35 @@ pub(super) fn tcp_write(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
         )));
     }
     let id = value_to_handle(host, args[0].clone(), "tcp_write")?;
-    let s = args[1]
-        .as_str()
-        .map_err(|m| host.err(format!("tcp_write(): {m}")))?;
+    // Accept either a string (sent as UTF-8) or a byte array (0..255), so binary
+    // protocols (e.g. SOCKS5) can write raw bytes >= 128 that a UTF-8 string would
+    // otherwise re-encode as multi-byte sequences.
+    let bytes: Vec<u8> = match &args[1] {
+        Value::Array(a) => {
+            let borrowed = a.borrow();
+            let mut b = Vec::with_capacity(borrowed.len());
+            for v in borrowed.iter() {
+                match v {
+                    Value::Number(n)
+                        if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 255.0 =>
+                    {
+                        b.push(*n as u8)
+                    }
+                    _ => {
+                        return Err(host.err(
+                            "tcp_write(): byte array must contain numbers 0..255".into(),
+                        ))
+                    }
+                }
+            }
+            b
+        }
+        _ => args[1]
+            .as_str()
+            .map_err(|m| host.err(format!("tcp_write(): {m}")))?
+            .as_bytes()
+            .to_vec(),
+    };
 
     let r = with_net_table(host, |t| t.remove(&id))?
         .ok_or_else(|| host.err("tcp_write(): invalid handle".into()))?;
@@ -318,7 +344,7 @@ pub(super) fn tcp_write(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
 
     let n = st
         .inner
-        .write(s.as_bytes())
+        .write(&bytes)
         .map_err(|e| host.err(format!("tcp_write(): {e}")))?;
     let _ = with_net_table(host, |t| t.insert(id, NetResource::Stream(Box::new(st))));
     Ok(Value::Number(n as f64))
