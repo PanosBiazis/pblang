@@ -1,119 +1,139 @@
-//! compression.sapp — Compression utilities for pblang
-//! Provides gzip, zstd, brotli compression via system tools.
-//! Uses exec builtin to call system compression utilities.
+//! compression.sapp — gzip / zstd / xz / brotli compression for pblang.
+//!
+//! Byte-safe by construction: data is written to a temp file and the compressor's
+//! OUTPUT FILE is read back with fs_read_bytes. We never capture a tool's binary
+//! stdout as a string (that re-encodes every byte >= 128 as UTF-8 and corrupts the
+//! payload) and never interpolate untrusted data into a shell command. All
+//! functions take and return byte arrays (a string input is converted first).
+//!
+//!   let C = import("stdlib:compression.sapp");
+//!   let blob = C.gzip_compress(str_to_bytes("hello"));
+//!   let back = C.gzip_decompress(blob);   // byte array
 
-/// Gzip compress a string, returns base64-encoded compressed data
+let _seq = map{ n: 0 };
+
+fn _as_bytes(data) { if type(data) == "string" { return str_to_bytes(data); } return data; }
+
+fn _ec(r) { if r == nil { return 1; } let e = try r.exit_code catch 1; return e; }
+
+fn _has(name) {
+    let r = try proc_spawn_wait("which", [name]) catch nil;
+    return r != nil and _ec(r) == 0;
+}
+
+// available() — which backends are usable on this host.
+fn available() {
+    return map{ gzip: _has("gzip"), zstd: _has("zstd"), xz: _has("xz"), brotli: _has("brotli") };
+}
+
+fn _tmp(suffix) {
+    _seq.n = _seq.n + 1;
+    return "/tmp/pblang_zip_" + str(now_ms()) + "_" + str(_seq.n) + suffix;
+}
+
+// _run(prog, args, in_bytes, in_path, out_path) — write input, run the tool, read
+// the output file back as bytes. Returns nil on any failure. Temp files always
+// cleaned up.
+fn _run(prog, args, in_bytes, in_path, out_path) {
+    if (try fs_write_bytes(in_path, in_bytes) catch false) == false { return nil; }
+    let r = try proc_spawn_wait(prog, args) catch nil;
+    let out = nil;
+    if r != nil and _ec(r) == 0 { out = try fs_read_bytes(out_path) catch nil; }
+    try fs_remove(in_path) catch nil;
+    try fs_remove(out_path) catch nil;
+    return out;
+}
+
+// ── gzip ──────────────────────────────────────────────────────────────────────
 fn gzip_compress(data) {
-    // Write data to temp file, compress, read back
-    let tmp_in = "/tmp/pblang_gzip_in_" + str(random_bytes(4));
-    let tmp_out = tmp_in + ".gz";
-    
-    let ok = fs_write_bytes(tmp_in, data);
-    if not ok { return error("gzip_compress: failed to write temp file"); }
-    
-    let result = exec("gzip -c " + tmp_in);
-    let ok2 = fs_remove(tmp_in);
-    
-    return result;
+    let b = _as_bytes(data);
+    let ip = _tmp("");
+    let op = ip + ".gz";
+    let r = _run("gzip", ["-k", "-f", "-n", "-9", ip], b, ip, op);
+    if r == nil { return error("gzip_compress: gzip failed or missing"); }
+    return r;
 }
-
-/// Gzip decompress a base64-encoded compressed string
 fn gzip_decompress(data) {
-    let tmp_in = "/tmp/pblang_gzdec_in_" + str(random_bytes(4));
-    let tmp_out = tmp_in + ".dec";
-    
-    let ok = fs_write_bytes(tmp_in, data);
-    if not ok { return error("gzip_decompress: failed to write temp file"); }
-    
-    let result = exec("gzip -d -c " + tmp_in);
-    let ok2 = fs_remove(tmp_in);
-    
-    return result;
+    let b = _as_bytes(data);
+    let ip = _tmp(".gz");
+    let op = str_slice(ip, 0, len(ip) - 3);
+    let r = _run("gunzip", ["-k", "-f", ip], b, ip, op);
+    if r == nil { return error("gzip_decompress: gunzip failed or missing"); }
+    return r;
 }
 
-/// Zstd compress
-fn zstd_compress(data, level = 3) {
-    let tmp_in = "/tmp/pblang_zst_in_" + str(random_bytes(4));
-    let ok = fs_write_bytes(tmp_in, data);
-    if not ok { return error("zstd_compress: failed to write temp file"); }
-    let result = exec("zstd -" + str(level) + " -c " + tmp_in + " 2>/dev/null");
-    let ok2 = fs_remove(tmp_in);
-    return result;
+// ── zstd ──────────────────────────────────────────────────────────────────────
+fn zstd_compress(data, level = 19) {
+    let b = _as_bytes(data);
+    let ip = _tmp("");
+    let op = ip + ".zst";
+    let r = _run("zstd", ["-q", "-f", "-" + str(level), "-o", op, ip], b, ip, op);
+    if r == nil { return error("zstd_compress: zstd failed or missing"); }
+    return r;
 }
-
-/// Zstd decompress
 fn zstd_decompress(data) {
-    let tmp_in = "/tmp/pblang_zstd_in_" + str(random_bytes(4));
-    let ok = fs_write_bytes(tmp_in, data);
-    if not ok { return error("zstd_decompress: failed to write temp file"); }
-    let result = exec("zstd -d -c " + tmp_in + " 2>/dev/null");
-    let ok2 = fs_remove(tmp_in);
-    return result;
+    let b = _as_bytes(data);
+    let ip = _tmp(".zst");
+    let op = ip + ".out";
+    let r = _run("zstd", ["-d", "-q", "-f", "-o", op, ip], b, ip, op);
+    if r == nil { return error("zstd_decompress: zstd failed or missing"); }
+    return r;
 }
 
-/// Brotli compress. Uses a temp file (not shell-piped echo) so payloads
-/// containing apostrophes / shell metacharacters cannot inject commands.
+// ── xz ──────────────────────────────────────────────────────────────────────
+fn xz_compress(data, level = 9) {
+    let b = _as_bytes(data);
+    let ip = _tmp("");
+    let op = ip + ".xz";
+    let r = _run("xz", ["-k", "-f", "-" + str(level), ip], b, ip, op);
+    if r == nil { return error("xz_compress: xz failed or missing"); }
+    return r;
+}
+fn xz_decompress(data) {
+    let b = _as_bytes(data);
+    let ip = _tmp(".xz");
+    let op = str_slice(ip, 0, len(ip) - 3);
+    let r = _run("unxz", ["-k", "-f", ip], b, ip, op);
+    if r == nil { return error("xz_decompress: unxz failed or missing"); }
+    return r;
+}
+
+// ── brotli (optional; not always installed) ──────────────────────────────────
 fn brotli_compress(data, quality = 11) {
-    let tmp_in = "/tmp/pblang_br_in_" + str(random_bytes(4));
-    let ok = fs_write_bytes(tmp_in, data);
-    if not ok { return error("brotli_compress: failed to write temp file"); }
-    let result = exec("brotli -" + str(quality) + " -c " + tmp_in + " 2>/dev/null");
-    let ok2 = fs_remove(tmp_in);
-    return result;
+    let b = _as_bytes(data);
+    let ip = _tmp("");
+    let op = ip + ".br";
+    let r = _run("brotli", ["-q", str(quality), "-f", "-o", op, ip], b, ip, op);
+    if r == nil { return error("brotli_compress: brotli failed or missing"); }
+    return r;
 }
-
-/// Brotli decompress. Temp-file based for the same shell-safety reason.
 fn brotli_decompress(data) {
-    let tmp_in = "/tmp/pblang_brdec_in_" + str(random_bytes(4));
-    let ok = fs_write_bytes(tmp_in, data);
-    if not ok { return error("brotli_decompress: failed to write temp file"); }
-    let result = exec("brotli -d -c " + tmp_in + " 2>/dev/null");
-    let ok2 = fs_remove(tmp_in);
-    return result;
+    let b = _as_bytes(data);
+    let ip = _tmp(".br");
+    let op = ip + ".out";
+    let r = _run("brotli", ["-d", "-f", "-o", op, ip], b, ip, op);
+    if r == nil { return error("brotli_decompress: brotli failed or missing"); }
+    return r;
 }
 
-/// Auto-detect compression format from magic bytes and decompress
+// ── format detection ──────────────────────────────────────────────────────────
+fn _magic(b, sig) {
+    if len(b) < len(sig) { return false; }
+    let i = 0;
+    while i < len(sig) { if b[i] != sig[i] { return false; } i = i + 1; }
+    return true;
+}
+
+// auto_decompress(data) — detect the format from magic bytes and decompress.
+// Returns the input unchanged when no known signature matches.
 fn auto_decompress(data) {
-    let magic = "";
-    if len(data) >= 2 { magic = data[0..2]; }
-    
-    // gzip magic: 0x1F 0x8B
-    if len(data) >= 2 {
-        // Check for gzip
-        let b0 = data[0..1];
-        let b1 = data[1..2];
-        if b0 == "\x1f" and b1 == "\x8b" {
-            return gzip_decompress(data);
-        }
-    }
-    
-    // zstd magic: 0x28 0xB5 0x2F 0xFD
-    if len(data) >= 4 {
-        let magic4 = data[0..4];
-        if magic4 == "\x28\xb5\x2f\xfd" {
-            return zstd_decompress(data);
-        }
-    }
-    
-    // Try brotli
-    let result = brotli_decompress(data);
-    if result != "" { return result; }
-    
-    // Try gzip
-    let result2 = gzip_decompress(data);
-    if result2 != "" { return result2; }
-    
-    // Try zstd
-    let result3 = zstd_decompress(data);
-    if result3 != "" { return result3; }
-    
-    return data; // no compression detected, return as-is
+    let b = _as_bytes(data);
+    if _magic(b, [31, 139]) { return gzip_decompress(b); }            // gzip: 1f 8b
+    if _magic(b, [40, 181, 47, 253]) { return zstd_decompress(b); }   // zstd: 28 b5 2f fd
+    if _magic(b, [253, 55, 122, 88, 90, 0]) { return xz_decompress(b); } // xz: fd 37 7a 58 5a 00
+    if _magic(b, [27, 0, 0]) and _has("brotli") { return brotli_decompress(b); }
+    return b;
 }
 
-export gzip_compress;
-export gzip_decompress;
-export zstd_compress;
-export zstd_decompress;
-export brotli_compress;
-export brotli_decompress;
-export auto_decompress;
+export available, gzip_compress, gzip_decompress, zstd_compress, zstd_decompress,
+       xz_compress, xz_decompress, brotli_compress, brotli_decompress, auto_decompress;
