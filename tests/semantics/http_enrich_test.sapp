@@ -1,0 +1,73 @@
+// tests/semantics/http_enrich_test.sapp — bug fixes + enrichment for stdlib/http.sapp
+//
+// FIXES:
+//  * build_query_string did NOT url-encode keys/values — a value with &, =, space
+//    or # broke the query and allowed PARAMETER INJECTION
+//    (get_with_params(url, {q:"a&admin=1"}) -> "...?q=a&admin=1").
+//  * parse_response_json THREW on invalid JSON despite promising a "safe" parse.
+//  * parse_sse_line only handled "field: value" (one space) — real SSE also uses
+//    "field:value" (no space) and ":"-prefixed comment lines.
+// ENRICHMENT:
+//  * encode_form / post_form (application/x-www-form-urlencoded), list-valued
+//    query params, and retry_backoff (exponential backoff).
+
+let http = import("stdlib/http.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+fn count_sub(s, sub) {
+    let n = 0; let start = 0;
+    while true {
+        let rest = str_slice(s, start, len(s));
+        let j = str_index_of(rest, sub);
+        if j < 0 { break; }
+        n = n + 1;
+        start = start + j + len(sub);
+    }
+    return n;
+}
+
+// ── FIX: query encoding (no injection, spaces escaped) ──────────────────────────
+eq(http.build_query_string(map{ q: "a b" }), "q=a%20b", "space is percent-encoded");
+let inj = http.build_query_string(map{ q: "a&admin=1" });
+// The injected '&' and '=' must be percent-encoded, NOT emitted raw.
+if str_contains(inj, "&admin=1") { fail("parameter injection: " + inj); }
+if str_index_of(inj, "%26") < 0 { fail("'&' must be percent-encoded: " + inj); }
+
+// ── ENRICH: list-valued query params -> repeated keys ───────────────────────────
+let lq = http.build_query_string(map{ tag: ["x", "y"] });
+// two "tag=" occurrences
+if str_index_of(lq, "tag=") < 0 { fail("list query missing: " + lq); }
+eq(count_sub(lq, "tag="), 2, "list value emits repeated keys");
+
+// ── FIX: parse_response_json is safe on garbage (returns an error map) ──────────
+let bad = try http.parse_response_json("{not json") catch "THREW";
+if bad == "THREW" { fail("parse_response_json must not throw on invalid JSON"); }
+if not map_has(bad, "error") { fail("parse_response_json must return an error map: " + str(bad)); }
+let ok = http.parse_response_json("{\"a\":1}");
+eq(ok.a, 1, "parse_response_json still parses valid JSON");
+let emp = http.parse_response_json(nil);
+if not map_has(emp, "error") { fail("nil response -> error map"); }
+
+// ── FIX: parse_sse_line handles no-space fields + comments ──────────────────────
+eq(http.parse_sse_line("data:hello").value, "hello", "data without space");
+eq(http.parse_sse_line("data: hi").value, "hi", "data with space (existing)");
+eq(http.parse_sse_line(": keepalive").kind, "comment", "colon comment line");
+eq(http.parse_sse_line("event:ping").kind, "event", "event without space");
+
+// ── ENRICH: encode_form / post_form body ────────────────────────────────────────
+let form = http.encode_form(map{ name: "Jane Doe", role: "a&b" });
+if str_contains(form, "Jane Doe") { fail("form value must be encoded: " + form); }
+if str_contains(form, "a&b") { fail("form value '&' must be encoded: " + form); }
+
+// ── ENRICH: retry_backoff retries and returns the first success ─────────────────
+let attempts = [0];
+fn flaky() {
+    attempts[0] = attempts[0] + 1;
+    if attempts[0] < 3 { return map{ error: "transient" }; }
+    return map{ ok: true, n: attempts[0] };
+}
+let r = http.retry_backoff(flaky, 5, 1);
+eq(r.n, 3, "retry_backoff returns first success after retries");
+
+print "http_enrich_pass";
