@@ -67,7 +67,9 @@ The designer is built from a small set of ideas shared across all three targets:
 - **Palette** — a categorized tray of **components/items** (widgets, blocks, CLI
   controls). Drag one onto the canvas to instantiate it.
 - **Canvas** — the live, what-you-see surface. Drop, move, resize, nest, and align
-  elements directly. Snap-to-grid and alignment guides.
+  elements directly. The native Designer supports snapped drag movement plus keyboard
+  movement/resizing for selected items (`arrows`, `Ctrl+arrows`, and larger `Shift`
+  steps). Alignment guides remain the next polish layer.
 - **Tree / outline** — the component hierarchy (parent → children), like a DOM/VCL
   tree; select, reparent, and reorder here when the canvas is crowded.
 - **Property inspector** — edit the selected element's properties (text, size, color,
@@ -77,10 +79,16 @@ The designer is built from a small set of ideas shared across all three targets:
   handler — generated as a stub you fill in, or pointed at an existing function.
 - **Layout** — constraint/flex/grid layout so designs survive resize (rather than
   absolute pixels only). **Today:** `stdlib/design_engine.sapp` provides free,
-  responsive, grid, and stack positioning for native Designer items.
+  responsive, grid, and stack positioning for native Designer items, while manual
+  item sizes are preserved for selected-item edits and snapped to the Designer grid.
 - **2D/3D/n-dimensional item model** — 2D UI widgets, 3D scene items, CAD/circuit-style
   nodes, and future n-dimensional data/geometry share one design-document shape. **Today:**
-  native Designer has 3D cube/ball items and `design_engine.sapp` has 3D projection.
+  native Designer has runnable 3D cube/ball GUI widgets, 3D/scanner metadata items, and
+  `design_engine.sapp` has 3D projection.
+- **App target mode** — native Designer has an `APP` selector for `gui`, `web`, or `both`.
+  `gui` generates a runnable `gui.sapp` app, `web` carries web/export intent as safe
+  metadata for the next exporter stage, and `both` keeps the GUI runnable while preserving
+  web intent.
 - **Data binding** — bind a widget to a value/model field so the UI updates when data
   changes and vice-versa.
 
@@ -119,8 +127,9 @@ home in code (canvas positions, grouping), kept beside the generated `.sapp`.
 `Radio`, `ComboBox`, `ListBox`, `Slider`, `ProgressBar`, `Menu`/`MenuItem`, `Toolbar`,
 `TabControl`, `Canvas`/`Image`, `Timer`, `2DCanvas`, `Scene3D`, `Cube3D`, `Sphere3D`,
 custom user-defined element. → emits `graphics.sapp` / `gui.sapp` code and design
-metadata. **Today in native IDE:** label/button/textbox/checkbox/panel plus 3D cube/ball
-design items and `LAYOUT` cycling.
+metadata. **Today in native IDE:** label/button/textbox/checkbox/radio/select/slider/panel,
+runnable `Cube3D`/`Sphere3D` widgets, app target cycling (`gui`/`web`/`both`), responsive
+`gui.fit_form`, headless preview for IDE Run, and `LAYOUT` cycling.
 
 ### Web (WordPress / Joomla style)
 `Page`, `Header`/`Footer`, `NavBar`, `Section`, `Hero`, `Card`, `Grid`/`Columns`,
@@ -252,7 +261,7 @@ are the remaining designer-side work. See `docs/IDE_MANUAL.md` §2a.
 | **D0 — Web canvas MVP** | **STARTED (§88)** — drag `html.sapp` blocks onto a canvas; codegen a pblang web app; live preview. (Web is easiest — the canvas *is* HTML.) Round-trip + `web_framework.sapp` routing are the next slice (D1). |
 | **D1 — Round-trip** | **STARTED (§92)** — `stdlib/ui_parse.sapp` parses generated pblang web code back into the canvas via the **self-hosted parser** (the designer's `↩ From code` button + gateway `/parse-ui`). The `.pbui` metadata doc (canvas-only state) is the remaining piece. |
 | **D2 — Inspector + events** | **DONE for web (§95)** — the inspector now has an **Events** section: pick an applicable event per element (`on_click`/`on_change`/`on_input`/`on_submit`), Studio auto-names a handler (e.g. button "Save" → `on_save_click`) and wires it. Codegen emits the binding as an html attribute (`map{ "onclick": "on_save_click(event)" }`) **plus** a `fn on_save_click(event){…}` stub; the round-trip (`ui_parse.sapp`) reads those attrs back into the node's `events`, so a code→canvas→code cycle preserves the wiring. Bindings persist in the `.pbui`-style localStorage doc. Desktop/CLI event targets land with D3/D4. |
-| **D3 — Desktop GUI target** | **STARTED for web-parity widgets (§96)** — new `stdlib/gui.sapp` toolkit (widgets *drawn* from `graphics.sapp` primitives + the 5×7 bitmap font, mouse hit-tested, handlers as field closures) + a designer **🖥 Desktop** kind: widget palette, drag-to-move form-surface canvas, property/size inspector, D2-style event wiring → generates a runnable `gui.sapp` app (`form`/`add`/`run`). Widgets: label/button/textbox/checkbox/panel **+ radio/select(dropdown)/slider (§98)** — the standard form-control set, with the slider adding press-and-drag. **Round-trip (§97):** `stdlib/gui_parse.sapp` parses generated `gui.sapp` back into the form + widgets via the self-hosted parser (gateway `/parse-gui`, the **↩ From code** button) — the desktop kind is now two-way. **Data-binding (§99):** the form has a `model` (source of truth); widgets `bind` a value to a model field (inspector Model editor + per-widget bind), generating `gui.set_model` + `gui.bind(...)` and round-tripping both — toggling/typing updates the model, a handler writing the model re-displays. Next: popup dropdown, layout containers (nesting), radio-group binding. |
+| **D3 — Desktop GUI target** | **STARTED for web-parity widgets (§96)** — new `stdlib/gui.sapp` toolkit (widgets *drawn* from `graphics.sapp` primitives + the 5×7 bitmap font, mouse hit-tested, handlers as field closures) + a designer **🖥 Desktop** kind: widget palette, drag-to-move form-surface canvas, property/size inspector, D2-style event wiring → generates a runnable `gui.sapp` app (`form`/`add`/`run`). Widgets: label/button/textbox/checkbox/panel **+ radio/select(dropdown)/slider (§98)** plus first-class `cube3d`/`sphere3d` previews — the standard form-control set, with the slider adding press-and-drag. Generated apps now use a safe `preview()` for IDE Run, `run_gui()` for the real window, `gui.fit_form(...)` for responsive sizing, and `app_target()` metadata selected by the native `APP` mode (`gui`, `web`, `both`). **Round-trip (§97):** `stdlib/gui_parse.sapp` parses generated `gui.sapp` back into the form + widgets via the self-hosted parser (gateway `/parse-gui`, the **↩ From code** button) — the desktop kind is now two-way. **Data-binding (§99):** the form has a `model` (source of truth); widgets `bind` a value to a model field (inspector Model editor + per-widget bind), generating `gui.set_model` + `gui.bind(...)` and round-tripping both — toggling/typing updates the model, a handler writing the model re-displays. Next: popup dropdown, layout containers (nesting), radio-group binding, and real web export from `app_target() == "web"` / `"both"`. |
 | **D4 — CLI/TUI target** | Visual command/argument/prompt builder emitting a pblang CLI. |
 | **D5 — Themes/plugins + pbAI** | Reusable components, themes, a plugin slot (WordPress/Joomla flavor), and pbAI-assisted authoring. |
 | **D6 — Unified 2D/3D/nD design engine** | **STARTED (2026-06-07)** — `stdlib/design_engine.sapp` now gives the native Designer a reusable 2D/3D item model, responsive grid/stack/free layout, snapping, hit-testing, and isometric projection. Next: constraints, nested containers, real 3D camera/meshes, and n-dimensional data/geometry views. |

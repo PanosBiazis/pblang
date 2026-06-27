@@ -1,0 +1,160 @@
+// Native pblang reverse-engineering helpers and command plans.
+
+let FS = import("stdlib:fs.sapp");
+let sec = import("src/security.sapp");
+
+let RE_TOOLS = [
+    "re_binary_info", "re_binwalk_scan", "re_carve", "re_dependencies",
+    "re_diff_binary", "re_disassemble", "re_entropy", "re_hexdump",
+    "re_pattern_search", "re_sections", "re_strace", "re_strings",
+    "re_struct_parse", "re_symbols",
+];
+
+fn _contains(arr, value) {
+    for i len(arr) {
+        if arr[i] == value { return true; }
+    }
+    return false;
+}
+
+fn _path(args) {
+    return sec.safe_rel_path(try args.path catch try args.file catch "", "");
+}
+
+fn _meta(path) {
+    if path == "" { return map{ path: "", exists: false, bytes: nil }; }
+    return map{ path: path, exists: try FS.exists(path) catch false, bytes: try FS.size(path) catch nil };
+}
+
+fn _gate(program) {
+    return map{ blocked: sec.is_public_profile(), profile: sec.network_profile(), requires: ["experimental-lab profile", program + " allowlist"] };
+}
+
+fn _plan(tool, path, program, argv, extra = nil) {
+    if extra == nil { extra = map{}; }
+    return map{ ok: true, tool: tool, executed: false, input: _meta(path), program: program, argv: argv, gate: _gate(program), extra: extra };
+}
+
+fn _entropy_text(raw) {
+    if raw == "" { return 0; }
+    let counts = map{};
+    for i len(raw) {
+        let c = str_slice(raw, i, i + 1);
+        let old = try counts[c] catch 0;
+        counts[c] = old + 1;
+    }
+    let keys = map_keys(counts);
+    let h = 0.0;
+    for i len(keys) {
+        let p = counts[keys[i]] / len(raw);
+        if p > 0 { h = h - p * (num_ln(p) / num_ln(2)); }
+    }
+    return h;
+}
+
+fn _printable(c) {
+    let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _.-:/\\+*=()[]{}<>@#$%^&!?,;'";
+    return str_contains(allowed, c);
+}
+
+fn _strings(raw, min_len, limit) {
+    let out = [];
+    let cur = "";
+    for i len(raw) {
+        let c = str_slice(raw, i, i + 1);
+        if _printable(c) {
+            cur = cur + c;
+        } else {
+            if len(cur) >= min_len { out[len(out)] = cur; }
+            cur = "";
+        }
+        if len(out) >= limit { return out; }
+    }
+    if len(cur) >= min_len and len(out) < limit { out[len(out)] = cur; }
+    return out;
+}
+
+fn re_tool(tool, args) {
+    if args == nil { args = map{}; }
+    let path = _path(args);
+    if tool == "re_entropy" {
+        let max_chars = sec.clamp(try args.max_chars catch 200000, 1, sec.MAX_READ_CHARS);
+        let raw = try FS.read(path) catch "";
+        if len(raw) > max_chars { raw = str_slice(raw, 0, max_chars); }
+        return map{ ok: true, tool: tool, input: _meta(path), entropy_bits_per_char: _entropy_text(raw), scanned_chars: len(raw), method: "pblang character entropy" };
+    }
+    if tool == "re_strings" {
+        let raw = try FS.read(path) catch "";
+        let max_chars = sec.clamp(try args.max_chars catch 200000, 1, sec.MAX_READ_CHARS);
+        if len(raw) > max_chars { raw = str_slice(raw, 0, max_chars); }
+        return map{ ok: true, tool: tool, input: _meta(path), strings: _strings(raw, sec.clamp(try args.min_len catch 4, 1, 200), sec.clamp(try args.limit catch 100, 1, 2000)), scanned_chars: len(raw) };
+    }
+    if tool == "re_pattern_search" {
+        let raw = try FS.read(path) catch "";
+        let needle = str(try args.pattern catch try args.needle catch "");
+        let hits = [];
+        let start = 0;
+        while needle != "" and start < len(raw) and len(hits) < sec.clamp(try args.limit catch 100, 1, 2000) {
+            let idx = str_index_of(str_slice(raw, start, len(raw)), needle);
+            if idx < 0 { start = len(raw); }
+            else {
+                hits[len(hits)] = start + idx;
+                start = start + idx + len(needle);
+            }
+        }
+        return map{ ok: true, tool: tool, input: _meta(path), pattern: needle, offsets: hits, match_count: len(hits), mode: "literal text/byte-string fallback" };
+    }
+    if tool == "re_hexdump" {
+        let offset = sec.clamp(try args.offset catch 0, 0, 1000000000);
+        let length = sec.clamp(try args.length catch 256, 1, 4096);
+        return _plan(tool, path, "xxd", ["xxd", "-s", str(offset), "-l", str(length), path], map{ offset: offset, length: length });
+    }
+    if tool == "re_carve" {
+        let offset = sec.clamp(try args.offset catch 0, 0, 1000000000);
+        let length = sec.clamp(try args.length catch 1024, 1, 1000000000);
+        let outp = sec.safe_rel_path(try args.output_path catch "carve.bin", "carve.bin");
+        return _plan(tool, path, "dd", ["dd", "if=" + path, "of=" + outp, "bs=1", "skip=" + str(offset), "count=" + str(length)], map{ output_path: outp, offset: offset, length: length });
+    }
+    if tool == "re_binary_info" {
+        return _plan(tool, path, "file/readelf", ["file", path], map{ bytes: try FS.size(path) catch nil });
+    }
+    if tool == "re_binwalk_scan" {
+        return _plan(tool, path, "binwalk", ["binwalk", path], map{});
+    }
+    if tool == "re_dependencies" {
+        return _plan(tool, path, "ldd/otool", ["ldd", path], map{});
+    }
+    if tool == "re_diff_binary" {
+        let other = sec.safe_rel_path(try args.other_path catch try args.path_b catch "", "");
+        return _plan(tool, path, "cmp", ["cmp", "-l", path, other], map{ other_path: other });
+    }
+    if tool == "re_disassemble" {
+        return _plan(tool, path, "objdump", ["objdump", "-d", path], map{ section: try args.section catch "" });
+    }
+    if tool == "re_sections" {
+        return _plan(tool, path, "readelf", ["readelf", "-S", path], map{});
+    }
+    if tool == "re_symbols" {
+        return _plan(tool, path, "nm", ["nm", "-C", path], map{});
+    }
+    if tool == "re_struct_parse" {
+        return _plan(tool, path, "struct-parser", ["parse-struct", path], map{ offset: sec.clamp(try args.offset catch 0, 0, 1000000000), fields: try args.fields catch [] });
+    }
+    if tool == "re_strace" {
+        return _plan(tool, path, "strace", ["strace", "-f", path], map{ executes_target: true });
+    }
+    return nil;
+}
+
+fn call_re(tool, args) {
+    if _contains(RE_TOOLS, tool) { return re_tool(tool, args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    let out = [];
+    for i len(RE_TOOLS) { out[len(out)] = RE_TOOLS[i]; }
+    return out;
+}
+
+export implemented_tools, call_re, re_tool;

@@ -1,0 +1,141 @@
+// Test: pbAI — pblang's own AI assistant (stdlib/pbai.sapp), §86.
+//
+// Unlike the kernel codegen tests, this RUNS in the pblang VM (pbai.sapp is pure pblang
+// on nn.sapp — no kernel intrinsics). It verifies the neural intent classifier (the
+// pbAI model) routes correctly and the grounded skills produce pblang-aware answers,
+// entirely in-process with NO external model or network.
+
+let pbai = import("stdlib/pbai.sapp");
+let lm = import("stdlib/pbai_lm.sapp");
+
+// ── The neural intent classifier (the pbAI model) routes correctly ───────────────────
+// ids: 0 explain  1 bugs  2 improve  3 comment  4 general
+assert(pbai.classify("explain what this code does") == 0, "classifies an explain request");
+assert(pbai.classify("find the bugs and errors here") == 1, "classifies a bug-finding request");
+assert(pbai.classify("add comments to document this") == 3, "classifies a commenting request");
+
+// ── Grounded code analysis: explain reports real structure ───────────────────────────
+let ex = pbai.respond("Explain what this does:\n\nfn add(a, b) { return a + b; }\nfn main() { print add(2, 3); }");
+assert(str_contains(ex, "2 function(s)"), "explain counts the functions");
+assert(str_contains(ex, "add") and str_contains(ex, "main"), "explain lists the function names");
+let fenced = pbai.respond("Explain:\n\n```pblang\nfn boxed() { return 1; }\n```");
+assert(str_contains(fenced, "boxed"), "extracts fenced pblang code without treating the language tag as code");
+
+// ── pblang-aware bug review (catches things grounded in pblang itself) ───────────────
+let bugs = pbai.respond("Find bugs:\n\nfn g() { let m = map{ a: 1 }; print m[b]; (x }");
+assert(str_contains(bugs, "unbalanced"), "review flags unbalanced parens/braces");
+assert(str_contains(bugs, "map_has"), "review knows missing-map-key reads RAISE (a pblang gotcha)");
+let array_ok = pbai.respond_tool("ai_self_critique", "review:\n\n--- pblang code ---\nfn arr() { let xs = [1, 2, 3]; return xs[0]; }");
+assert(not str_contains(array_ok, "map_has"), "array indexing alone does not trigger missing-map-key guidance");
+
+// ── A tool hint overrides routing ────────────────────────────────────────────────────
+let crit = pbai.respond_tool("ai_self_critique", "look at this:\n\nfn h() { (a }");
+assert(str_contains(crit, "review"), "ai_self_critique routes to the review skill");
+
+// ── General pblang knowledge ─────────────────────────────────────────────────────────
+let gen = pbai.respond("How do maps work in pblang?");
+assert(str_contains(gen, "map_has"), "general Q&A answers from pblang knowledge");
+let teach = pbai.respond("i want to learn you something");
+assert(str_contains(teach, "learn:"), "teaching intent explains live learning command");
+let broad = pbai.respond("maps, loops, fns, OOP, strings, errors, imports, async, precision, JIT, capabilities");
+assert(str_contains(broad, "maps:") and str_contains(broad, "loops:") and str_contains(broad, "capabilities:"), "multi-topic prompt answers multiple topics");
+let casual = pbai.respond("what's up?");
+assert(str_contains(casual, "learn") and str_contains(casual, "pblang"), "casual chat gives useful assistant status");
+
+// ── Smarter analysis (deeper scan) ───────────────────────────────────────────────────
+let rec = pbai.respond("explain:\n\n--- pblang code ---\nfn fact(n) { if n <= 1 { return 1; } return n * fact(n - 1); }");
+assert(str_contains(rec, "RECURSION"), "explain detects recursion");
+
+// the `print(x)` paren form is invalid pblang — pbAI flags it (an outside model misses this)
+let pp = pbai.respond_tool("ai_self_critique", "review:\n\n--- pblang code ---\nfn f() { print(42); }");
+assert(str_contains(pp, "print"), "review flags the invalid print(x) paren form");
+assert(str_contains(pp, "Suggested pblang fix") and str_contains(pp, "print 42;"), "review offers a concrete print syntax repair");
+
+let miss_eq = pbai.respond("Find bugs:\n\n--- pblang code ---\nfn risky(path) { let s  fs_read(path); print(s); return s; }");
+assert(str_contains(miss_eq, "missing `=`"), "review catches a missing let assignment operator");
+assert(str_contains(miss_eq, "let s = fs_read(path)") and str_contains(miss_eq, "print s;"), "review repairs missing equals plus print syntax");
+
+let generic_fix = pbai.respond("Find bugs:\n\n--- pblang code ---\nfn risky(path) { let contents  fs_read(path); print(contents); return contents; }");
+assert(str_contains(generic_fix, "let contents = fs_read(path)"), "review repairs missing equals for arbitrary binding names");
+assert(str_contains(generic_fix, "print contents;"), "review repairs print(expr) for arbitrary expressions");
+
+let fs_typo = pbai.respond("Find bugs:\n\n--- pblang code ---\nfn risky(path) { let s = fs read(path); print(s); return s; }");
+assert(str_contains(fs_typo, "fs_read"), "review catches spaced filesystem builtin typo");
+
+let miss_fn = pbai.respond("Find bugs:\n\n--- pblang code ---\nrisky(path) { let s = fs_read(path); print(s); return s; }");
+assert(str_contains(miss_fn, "missing `fn`"), "review catches a missing function keyword");
+
+// per-function documentation headers
+let doc = pbai.respond("add comments:\n\n--- pblang code ---\nfn add(a, b) { return a + b; }\nfn mul(x, y) { return x * y; }");
+assert(str_contains(doc, "add(a, b)") and str_contains(doc, "mul(x, y)"), "comment emits a header per function");
+
+// no-code questions route to the knowledge base even if mis-classified
+let cap = pbai.respond("what about exec permissions and the sandbox?");
+assert(str_contains(cap, "allow-exec") or str_contains(cap, "capabilit"), "capability question answered from knowledge base");
+let err = pbai.respond("how does error handling and try catch work?");
+assert(str_contains(err, "catch"), "errors question answered from knowledge base");
+
+// structured analysis API for IDE/tooling
+let meta = pbai.analyze("review:\n\n--- pblang code ---\nfn risky(path) { let s = fs_read(path); return s; }");
+assert(meta.has_code, "analyze detects code");
+assert(meta.quality >= 0 and meta.quality <= 100, "quality score bounded");
+assert(str_contains(meta.risk, "fs"), "risk summary detects fs use");
+assert(meta.confidence >= 0 and meta.confidence <= 99, "analyze reports bounded confidence");
+assert(len(meta.findings) > 0, "analyze returns structured review findings");
+let eval = pbai.self_eval("review:\n\n--- pblang code ---\nfn risky(path) { let s = fs_read(path); return s; }");
+assert(eval.format == "pbai.eval.v1", "self_eval has a versioned contract");
+assert(eval.issue_count > 0 and str_contains(eval.risk, "fs"), "self_eval reports issues and risk");
+let tca = pbai.respond("how do typeclasses or traits work?");
+assert(str_contains(tca, "typeclass"), "typeclass knowledge answer");
+let stream = pbai.respond("how do reactive streams work?");
+assert(str_contains(stream, "observable") or str_contains(stream, "stream"), "reactive knowledge answer");
+let data = pbai.respond("can pbAI understand json csv image audio video data?");
+assert(str_contains(data, "JSON") and str_contains(data, "image") and str_contains(data, "audio"), "data understanding answer covers multiple modalities");
+let ag = pbai.respond("show me sub-agents atomic-agents and sub-atomic-agents");
+assert(str_contains(ag, "sub-agents") and str_contains(ag, "atomic-agents") and str_contains(ag, "sub-atomic-agents"), "agent hierarchy answer covers all agent layers");
+let tools = pbai.respond("what tools and mcp capabilities can pbAI use?");
+assert(str_contains(tools, "pb-mcp-server") and str_contains(tools, "code_index") and str_contains(tools, "datasets"), "tool answer uses audited local substrate");
+let math_add = pbai.respond("1+1");
+assert(str_contains(math_add, "1 + 1 = 2"), "simple arithmetic answers directly");
+let math_div = pbai.respond("27/9");
+assert(str_contains(math_div, "quotient 3") and str_contains(math_div, "remainder 0"), "integer division reports quotient and remainder");
+
+let smarter = pbai.respond_tool("ai_self_critique", "review:\n\n--- pblang code ---\nfn run(cmd) { return exec(\"sh -c \" + cmd); }");
+assert(str_contains(smarter, "dynamically composed") and str_contains(smarter, "allow-exec"), "review catches dynamic exec risk");
+
+// top of pbAI is now wired to the bottom pblang-native generative model.
+let status = pbai.model_status();
+assert(status.family == "pbAI", "model status reports the pbAI family");
+assert(status.bottom.format == "pbai.lm.char.v1", "model status exposes the bottom checkpoint format");
+assert(status.bottom.learns, "bottom model reports a learning signal");
+assert(status.bottom.live_learning.source_chars > 0, "model status exposes live-learning corpus stats");
+assert(len(status.tool_substrate) >= 8, "model status exposes audited tool substrate");
+let max_rl = pbai.max_rl_status();
+assert(max_rl.format == "pbai.max.rl_trial_learning_status.v1", "pbAI facade exposes Max RL status");
+assert(max_rl.reward_improved and not max_rl.mutates_checkpoint, "Max RL status reports safe improvement without checkpoint mutation");
+assert(len(max_rl.reward_history) >= 2, "Max RL status exposes reward history");
+let gen = pbai.generate("fn ", 10);
+assert(len(gen) == 3 + 10, "top-level generate appends text through pbAI-Nano");
+let routed_gen = pbai.respond("generate a pblang function");
+assert(str_contains(routed_gen, "pbAI native generation"), "general generation request routes to native pbAI");
+
+let before_live = lm.live_corpus();
+let unique_lesson = "fn facade_learned_unique_" + str(len(before_live)) + "() { return \"facade live learning unique\"; }";
+let learned = pbai.learn(unique_lesson, 4);
+assert(learned.metrics.loss_after < learned.metrics.loss_before, "top-level pbAI learn retrains the native LM");
+let learned_cmd = pbai.respond("learn 1+1=2");
+assert(str_contains(learned_cmd, "pbAI learned this local lesson") and str_contains(learned_cmd, "1+1=2"), "space-form learn command stores a local lesson");
+let recalled_math = pbai.respond("what did i teach about 1+1?");
+assert(str_contains(recalled_math, "1+1=2") and str_contains(recalled_math, "live memory"), "short exact learned lessons can be recalled");
+let ingested = pbai.ingest_path("tests/fixtures", 4, 2, 2);
+assert(ingested.stats.files > 0 and ingested.stats.chunks > 0, "path ingestion learns text fixtures");
+let recalled_ingest = pbai.respond("what did i teach about comet orchid?");
+assert(str_contains(recalled_ingest, "comet orchid") and str_contains(recalled_ingest, "live memory"), "path-ingested text is available in conversation");
+lm.remember_text("project rule: pbAI favorite color is teal because local live memory can override generic answers.");
+let recalled = pbai.respond("what is pbAI favorite color?");
+assert(str_contains(recalled, "teal") and str_contains(recalled, "live memory"), "pbAI answers from live learned memory");
+let recalled_meta = pbai.analyze("what is pbAI favorite color?");
+assert(len(recalled_meta.live_memory) > 0, "analyze exposes live memory matches");
+fs_write(lm.live_corpus_path(), before_live);
+
+print "pbai_pass";

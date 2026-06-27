@@ -1,0 +1,290 @@
+// Native pblang Watcher tools for pb-mcp-server.
+//
+// Exposes the stdlib:watch.sapp observability + reverse-engineering facade as MCP tools.
+// READ-ONLY by design: agents can observe (bytecode, heap, compute, hardware, files,
+// media, binaries) but cannot drive Master Control — unlock/approval/actuation stay
+// local + human-only and are intentionally NOT exposed over the server. watch_mc_status
+// is read-only status.
+
+let watch = import("stdlib:watch.sapp");
+let mc    = import("stdlib:master_control.sapp");
+let sec   = import("src/security.sapp");
+
+// Note: watch_disasm/watch_bytecode are intentionally not exposed here — they need the
+// self-hosted compiler whose internal imports are cwd-relative and unreachable from the
+// server's working directory. Use them from the pblang stdlib directly instead.
+let WATCH_TOOLS = [
+    "watch_capture", "watch_inspect", "watch_folder", "watch_binary",
+    "watch_media", "watch_hardware", "watch_probe", "watch_probes", "watch_sample",
+    "watch_analyze", "watch_delta", "watch_top_allocations", "watch_summary",
+    "watch_probe_all", "watch_probe_delta", "watch_alloc_hotspots",
+    "watch_leak_check", "watch_report", "watch_mc_status",
+];
+
+fn tool_list() { return WATCH_TOOLS; }
+
+fn _rel(args) { return sec.safe_rel_path(try args.path catch ".", "."); }
+
+fn call_watch(tool, args) {
+    if args == nil { args = map{}; }
+    if tool == "watch_capture"  { return watch.capture_all(); }
+    if tool == "watch_inspect"  { return watch.inspect(_rel(args)); }
+    if tool == "watch_folder"   { return watch.folder(_rel(args)); }
+    if tool == "watch_binary"   { return watch.binary(_rel(args)); }
+    if tool == "watch_media"    { return watch.media(_rel(args)); }
+    if tool == "watch_hardware" { return watch.hardware(); }
+    if tool == "watch_probe"    { return watch.probe(try args.name catch "compute"); }
+    // watch_probes: list the probe names accepted by watch_probe / watch_sample.
+    if tool == "watch_probes"   { return map{ probes: watch.probes() }; }
+    // watch_sample: poll a named probe over time and return the time-series plus a
+    // statistical analysis (min/max/mean/stddev/rate/trend) and z-score anomalies.
+    // Bounded (n<=50, interval<=2000ms) so it stays a quick, safe observation.
+    if tool == "watch_sample" {
+        let name = try args.name catch "compute";
+        let n = try args.n catch 5;
+        if n > 50 { n = 50; }
+        if n < 1 { n = 1; }
+        let interval = try args.interval_ms catch 100;
+        if interval > 2000 { interval = 2000; }
+        if interval < 1 { interval = 1; }
+        let key = try args.key catch nil;
+        let samples = watch.live(name, n, interval);
+        return map{
+            probe: name,
+            n: len(samples),
+            key: key,
+            analysis: watch.analyze(samples, key),
+            anomalies: watch.anomalies(samples, key, try args.z catch 3.0),
+            samples: samples
+        };
+    }
+    // watch_analyze: run the time-series analytics on caller-supplied data — either
+    // `samples` ([{at,value}], e.g. from watch_sample) or a plain `values` numeric
+    // array. Returns stats (min/max/mean/stddev/rate/trend) + z-score anomalies.
+    // Lets an agent analyze metrics it gathered elsewhere, with no sampling delay.
+    if tool == "watch_analyze" {
+        let samples = try args.samples catch nil;
+        if samples == nil {
+            let vals = try args.values catch [];
+            samples = [];
+            let i = 0;
+            while i < len(vals) { push(samples, map{ at: i, value: vals[i] }); i = i + 1; }
+        }
+        let key = try args.key catch nil;
+        return map{
+            n: len(samples),
+            key: key,
+            analysis: watch.analyze(samples, key),
+            anomalies: watch.anomalies(samples, key, try args.z catch 3.0)
+        };
+    }
+    // watch_delta: capture, wait a bounded window, capture again, and return the
+    // allocation churn (objects created per category) + elapsed ms. A quick "is
+    // something allocating?" probe over a short interval.
+    if tool == "watch_delta" {
+        let ms = try args.ms catch 50;
+        if ms > 2000 { ms = 2000; }
+        if ms < 0 { ms = 0; }
+        let a = watch.capture_all();
+        sleep_ms(ms);
+        let b = watch.capture_all();
+        return watch.diff(a, b);
+    }
+    // watch_top_allocations: heap allocation categories ranked by count, so an
+    // agent sees at a glance which allocation type dominates.
+    if tool == "watch_top_allocations" {
+        let h = watch.heap();
+        let keys = map_keys(h);
+        let rows = [];
+        let i = 0;
+        while i < len(keys) { push(rows, map{ category: keys[i], count: try h[keys[i]] catch 0 }); i = i + 1; }
+        // insertion sort, descending by count
+        let a = 1;
+        while a < len(rows) {
+            let cur = rows[a];
+            let b = a - 1;
+            while b >= 0 and rows[b].count < cur.count { rows[b + 1] = rows[b]; b = b - 1; }
+            rows[b + 1] = cur;
+            a = a + 1;
+        }
+        return map{ allocations: rows };
+    }
+    // watch_summary: one-call READ-ONLY health overview — heap category count +
+    // the single dominant allocation category + a hardware snapshot + Master
+    // Control status. A quick "how's the system?" dashboard in one tool call.
+    if tool == "watch_summary" {
+        let h = watch.heap();
+        let keys = map_keys(h);
+        let top_cat = nil;
+        let top_count = 0 - 1;
+        let i = 0;
+        while i < len(keys) {
+            let cnt = try h[keys[i]] catch 0;
+            if cnt > top_count { top_count = cnt; top_cat = keys[i]; }
+            i = i + 1;
+        }
+        if top_count < 0 { top_count = 0; }
+        return map{
+            heap_categories: len(keys),
+            top_category: top_cat,
+            top_count: top_count,
+            hardware: watch.hardware(),
+            mc: mc.status()
+        };
+    }
+    // watch_probe_all: one-shot READ-ONLY snapshot of every registered probe's
+    // current value at once — a whole-system gauge board in a single call.
+    if tool == "watch_probe_all" {
+        let names = watch.probes();
+        let values = map{};
+        let i = 0;
+        while i < len(names) {
+            values[names[i]] = try watch.probe(names[i]) catch nil;
+            i = i + 1;
+        }
+        return map{ probes: names, values: values, count: len(names) };
+    }
+    // watch_probe_delta: one-call READ-ONLY "what's moving?" — snapshot every
+    // probe, wait a bounded window, snapshot again, and report the per-probe
+    // change (numeric probes only) plus a per-second rate. Complements
+    // watch_probe_all (static gauge board) and watch_delta (allocations only).
+    if tool == "watch_probe_delta" {
+        let ms = try args.ms catch 50;
+        if ms > 2000 { ms = 2000; }
+        if ms < 0 { ms = 0; }
+        let names = watch.probes();
+        let before = map{};
+        let i = 0;
+        while i < len(names) { before[names[i]] = try watch.probe(names[i]) catch nil; i = i + 1; }
+        sleep_ms(ms);
+        let after = map{};
+        i = 0;
+        while i < len(names) { after[names[i]] = try watch.probe(names[i]) catch nil; i = i + 1; }
+        let deltas = map{};
+        let rates = map{};
+        let secs = ms / 1000.0;
+        i = 0;
+        while i < len(names) {
+            let a = before[names[i]];
+            let b = after[names[i]];
+            if is_number(a) and is_number(b) {
+                let d = b - a;
+                deltas[names[i]] = d;
+                if secs > 0.0 { rates[names[i]] = d / secs; }
+            }
+            i = i + 1;
+        }
+        return map{
+            probes: names,
+            count: len(names),
+            ms: ms,
+            before: before,
+            after: after,
+            deltas: deltas,
+            rates: rates
+        };
+    }
+    // watch_alloc_hotspots: one-call READ-ONLY "where's the allocation pressure?"
+    // — capture the heap, wait a bounded window, capture again, and rank the heap
+    // categories by CHURN (objects created during the window) via watch.diff.
+    // Distinct from watch_top_allocations (absolute counts) and watch_delta (raw,
+    // unranked diff): this surfaces the dominant allocator over the interval.
+    if tool == "watch_alloc_hotspots" {
+        let ms = try args.ms catch 50;
+        if ms > 2000 { ms = 2000; }
+        if ms < 0 { ms = 0; }
+        let a = watch.capture_all();
+        sleep_ms(ms);
+        let b = watch.capture_all();
+        let d = watch.diff(a, b);
+        let alloc = try d.allocations catch map{};
+        let keys = map_keys(alloc);
+        let rows = [];
+        let total = 0;
+        let i = 0;
+        while i < len(keys) {
+            let v = try alloc[keys[i]] catch 0;
+            push(rows, map{ category: keys[i], delta: v });
+            total = total + v;
+            i = i + 1;
+        }
+        // insertion sort, descending by delta (churn)
+        let x = 1;
+        while x < len(rows) {
+            let cur = rows[x];
+            let y = x - 1;
+            while y >= 0 and rows[y].delta < cur.delta { rows[y + 1] = rows[y]; y = y - 1; }
+            rows[y + 1] = cur;
+            x = x + 1;
+        }
+        let top_cat = nil;
+        if len(rows) > 0 and rows[0].delta > 0 { top_cat = rows[0].category; }
+        return map{ ms: ms, elapsed_ms: d.ms, total_churn: total, top_category: top_cat, hotspots: rows };
+    }
+    // watch_leak_check: READ-ONLY memory-leak probe — sample the TOTAL heap
+    // allocation count over n bounded windows and flag a rising trend. Sums all
+    // heap categories (watch.heap) into one scalar per sample; "leaking" requires
+    // net growth AND a monotonic increase across every step (conservative).
+    if tool == "watch_leak_check" {
+        let n = try args.n catch 4;
+        if n > 10 { n = 10; }
+        if n < 2 { n = 2; }
+        let interval = try args.interval_ms catch 50;
+        if interval > 200 { interval = 200; }
+        if interval < 0 { interval = 0; }
+        let samples = [];
+        let s = 0;
+        while s < n {
+            let h = watch.heap();
+            let keys = map_keys(h);
+            let total = 0;
+            let k = 0;
+            while k < len(keys) { total = total + (try h[keys[k]] catch 0); k = k + 1; }
+            push(samples, total);
+            if s < n - 1 { sleep_ms(interval); }
+            s = s + 1;
+        }
+        let start = samples[0];
+        let end = samples[len(samples) - 1];
+        let rising = 0;
+        let i = 1;
+        while i < len(samples) {
+            if samples[i] > samples[i - 1] { rising = rising + 1; }
+            i = i + 1;
+        }
+        let leaking = (end > start) and (rising == len(samples) - 1);
+        let verdict = "stable";
+        if leaking { verdict = "leaking"; }
+        else { if end > start { verdict = "growing"; } }
+        return map{
+            n: n, interval_ms: interval, samples: samples,
+            total_start: start, total_end: end, growth: end - start,
+            rising_steps: rising, leaking: leaking, verdict: verdict
+        };
+    }
+    // watch_report: one-call READ-ONLY consolidated diagnostic — composes
+    // watch_summary (heap + hardware + MC), watch_alloc_hotspots (churn over a
+    // tiny window), and watch_leak_check (short heap-trend) into a single health
+    // board with an overall verdict. The agent-facing "how is everything?" call.
+    if tool == "watch_report" {
+        let summary = call_watch("watch_summary", map{});
+        let hot = call_watch("watch_alloc_hotspots", map{ ms: 5 });
+        let leak = call_watch("watch_leak_check", map{ n: 3, interval_ms: 5 });
+        let verdict = "ok";
+        if try leak.leaking catch false { verdict = "leak_suspected"; }
+        return map{
+            heap_categories: summary.heap_categories,
+            top_category: summary.top_category,
+            hardware: summary.hardware,
+            mc: summary.mc,
+            hotspots: hot.hotspots,
+            top_churn_category: hot.top_category,
+            leak: leak,
+            verdict: verdict
+        };
+    }
+    if tool == "watch_mc_status" { return mc.status(); }
+    return nil;
+}
+
+export call_watch, tool_list, WATCH_TOOLS;

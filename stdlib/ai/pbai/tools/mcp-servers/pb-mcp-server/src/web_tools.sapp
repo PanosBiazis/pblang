@@ -1,0 +1,198 @@
+// Native pblang web/research/notification planning tools.
+//
+// The Rust server can call curl/browser/mail helpers behind deployment gates.
+// This pblang port validates inputs and returns auditable plans without making
+// network, desktop, or mail calls.
+
+let sec = import("src/security.sapp");
+
+fn _s(args, key, fallback = "") {
+    return str(try args[key] catch fallback);
+}
+
+fn _bounded_url(url) {
+    let u = str_trim(str(url));
+    if u == "" { return ""; }
+    if len(u) > 4096 { throw "URL too long"; }
+    let low = str_lower(u);
+    if not (str_starts_with(low, "http://") or str_starts_with(low, "https://")) {
+        throw "URL must start with http:// or https://";
+    }
+    return u;
+}
+
+fn _host_from_url(url) {
+    let u = _bounded_url(url);
+    let rest = u;
+    if str_starts_with(str_lower(rest), "https://") { rest = str_slice(rest, 8, len(rest)); }
+    else if str_starts_with(str_lower(rest), "http://") { rest = str_slice(rest, 7, len(rest)); }
+    let slash = str_index_of(rest, "/");
+    if slash >= 0 { rest = str_slice(rest, 0, slash); }
+    let colon = str_index_of(rest, ":");
+    if colon >= 0 { rest = str_slice(rest, 0, colon); }
+    return str_lower(rest);
+}
+
+fn _private_host(host) {
+    let h = str_lower(str(host));
+    if h == "localhost" or h == "127.0.0.1" or h == "::1" { return true; }
+    if str_starts_with(h, "10.") { return true; }
+    if str_starts_with(h, "192.168.") { return true; }
+    if str_starts_with(h, "169.254.") { return true; }
+    if str_starts_with(h, "172.") {
+        let parts = str_split(h, ".");
+        if len(parts) >= 2 {
+            let n = int(parts[1]);
+            if n >= 16 and n <= 31 { return true; }
+        }
+    }
+    return false;
+}
+
+fn _blocked_state(kind, target) {
+    let blocked = sec.is_public_profile();
+    return map{ blocked: blocked, profile: sec.network_profile(), reason: if blocked { kind + " blocked on public profile" } else { target + " requires a trusted network executor" } };
+}
+
+fn _q(s) {
+    let out = str_replace_all(str_trim(str(s)), " ", "+");
+    return str_replace_all(out, "\n", "+");
+}
+
+fn web_dns_lookup(args) {
+    if args == nil { args = map{}; }
+    let host = str_lower(str_trim(_s(args, "host", _s(args, "hostname", ""))));
+    if host == "" { return map{ ok: false, error: "host is required" }; }
+    return map{ ok: true, executed: false, host: host, record_types: try args.record_types catch ["A", "AAAA", "MX", "TXT"], command_plan: ["dig", host], gate: _blocked_state("dns lookup", "dig/nslookup") };
+}
+
+fn web_tls_inspect(args) {
+    if args == nil { args = map{}; }
+    let host = _s(args, "host", "");
+    if host == "" {
+        let url = _s(args, "url", "");
+        if url != "" { host = _host_from_url(url); }
+    }
+    if host == "" { return map{ ok: false, error: "host or url is required" }; }
+    let port = sec.clamp(try args.port catch 443, 1, 65535);
+    return map{ ok: true, executed: false, host: host, port: port, command_plan: ["openssl", "s_client", "-connect", host + ":" + str(port), "-servername", host], gate: _blocked_state("tls inspect", "openssl") };
+}
+
+fn web_search(args) {
+    if args == nil { args = map{}; }
+    let query = str_trim(_s(args, "query", _s(args, "q", "")));
+    if query == "" { return map{ ok: false, error: "query is required" }; }
+    let backend = str_lower(_s(args, "backend", "duckduckgo"));
+    let url = "https://duckduckgo.com/html/?q=" + _q(query);
+    return map{ ok: true, executed: false, backend: backend, query: query, url: url, results: [], gate: _blocked_state("web search", "configured search backend") };
+}
+
+fn web_api_call(args) {
+    if args == nil { args = map{}; }
+    let url = _bounded_url(_s(args, "url", ""));
+    let method = str_upper(_s(args, "method", "GET"));
+    let host = _host_from_url(url);
+    return map{
+        ok: not _private_host(host),
+        executed: false,
+        method: method,
+        url: url,
+        host: host,
+        ssrf_private_host: _private_host(host),
+        headers: try args.headers catch map{},
+        body_bytes: len(_s(args, "body", "")),
+        gate: _blocked_state("web api call", "HTTP client"),
+    };
+}
+
+fn web_download_file(args) {
+    if args == nil { args = map{}; }
+    let url = _bounded_url(_s(args, "url", ""));
+    let host = _host_from_url(url);
+    let outp = sec.safe_rel_path(_s(args, "output_path", "download.bin"), "download.bin");
+    return map{ ok: not _private_host(host), executed: false, url: url, output_path: outp, ssrf_private_host: _private_host(host), gate: _blocked_state("download", "HTTP client") };
+}
+
+fn web_rss_fetch(args) {
+    if args == nil { args = map{}; }
+    let url = _bounded_url(_s(args, "url", ""));
+    return map{ ok: true, executed: false, url: url, parser: "rss/atom", items: [], gate: _blocked_state("rss fetch", "HTTP client") };
+}
+
+fn web_screenshot_url(args) {
+    if args == nil { args = map{}; }
+    let url = _bounded_url(_s(args, "url", ""));
+    let outp = sec.safe_rel_path(_s(args, "output_path", ".mint-mcp/screenshots/url.png"), ".mint-mcp/screenshots/url.png");
+    return map{ ok: true, executed: false, url: url, output_path: outp, command_plan: ["chromium", "--headless", "--screenshot=" + outp, url], gate: _blocked_state("web screenshot", "headless browser") };
+}
+
+fn research_arxiv_search(args) {
+    if args == nil { args = map{}; }
+    let query = str_trim(_s(args, "query", _s(args, "q", "")));
+    if query == "" { return map{ ok: false, error: "query is required" }; }
+    let max_results = sec.clamp(try args.max_results catch 10, 1, 100);
+    let url = "https://export.arxiv.org/api/query?search_query=all:" + _q(query) + "&start=0&max_results=" + str(max_results);
+    return map{ ok: true, executed: false, query: query, max_results: max_results, url: url, gate: _blocked_state("arxiv search", "arXiv API") };
+}
+
+fn research_arxiv_download(args) {
+    if args == nil { args = map{}; }
+    let id = str_trim(_s(args, "id", _s(args, "arxiv_id", "")));
+    if id == "" { return map{ ok: false, error: "id/arxiv_id is required" }; }
+    let clean = str_replace_all(id, "arXiv:", "");
+    let url = "https://arxiv.org/pdf/" + clean + ".pdf";
+    let outp = sec.safe_rel_path(_s(args, "output_path", "arxiv-" + clean + ".pdf"), "arxiv-" + clean + ".pdf");
+    return map{ ok: true, executed: false, arxiv_id: clean, url: url, output_path: outp, gate: _blocked_state("arxiv download", "HTTP client") };
+}
+
+fn ntfy_desktop(args) {
+    if args == nil { args = map{}; }
+    let title = _s(args, "title", "pb-mcp-server");
+    let message = _s(args, "message", _s(args, "body", ""));
+    return map{ ok: true, executed: false, title: title, message: message, command_plan: ["notify-send", title, message], gate: _blocked_state("desktop notification", "desktop notifier") };
+}
+
+fn ntfy_email(args) {
+    if args == nil { args = map{}; }
+    let to = _s(args, "to", "");
+    let subject = _s(args, "subject", "pb-mcp-server");
+    return map{ ok: to != "", executed: false, to: to, subject: subject, body_bytes: len(_s(args, "body", "")), gate: _blocked_state("email", "sendmail/mailx") };
+}
+
+fn ntfy_webhook(args) {
+    if args == nil { args = map{}; }
+    let url = _bounded_url(_s(args, "url", ""));
+    let host = _host_from_url(url);
+    return map{ ok: not _private_host(host), executed: false, url: url, host: host, ssrf_private_host: _private_host(host), payload_keys: if type(try args.payload catch nil) == "map" { map_keys(args.payload) } else { [] }, gate: _blocked_state("webhook", "HTTP client") };
+}
+
+fn call_web(tool, args) {
+    if tool == "web_dns_lookup" { return web_dns_lookup(args); }
+    if tool == "web_tls_inspect" { return web_tls_inspect(args); }
+    if tool == "web_search" { return web_search(args); }
+    if tool == "web_api_call" { return web_api_call(args); }
+    if tool == "web_download_file" { return web_download_file(args); }
+    if tool == "web_rss_fetch" { return web_rss_fetch(args); }
+    if tool == "web_screenshot_url" { return web_screenshot_url(args); }
+    if tool == "research_arxiv_search" { return research_arxiv_search(args); }
+    if tool == "research_arxiv_download" { return research_arxiv_download(args); }
+    if tool == "notify_desktop" { return ntfy_desktop(args); }
+    if tool == "notify_email" { return ntfy_email(args); }
+    if tool == "notify_webhook" { return ntfy_webhook(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    return [
+        "web_dns_lookup", "web_tls_inspect", "web_search", "web_api_call",
+        "web_download_file", "web_rss_fetch", "web_screenshot_url",
+        "research_arxiv_search", "research_arxiv_download",
+        "notify_desktop", "notify_email", "notify_webhook",
+    ];
+}
+
+export implemented_tools, call_web,
+       web_dns_lookup, web_tls_inspect, web_search, web_api_call,
+       web_download_file, web_rss_fetch, web_screenshot_url,
+       research_arxiv_search, research_arxiv_download,
+       ntfy_desktop, ntfy_email, ntfy_webhook;
