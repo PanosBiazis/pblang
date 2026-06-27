@@ -29,14 +29,25 @@ fn listen_tls(addr, cert_path, key_path) {
     return result;
 }
 
-// connect_tls(host, port) — connect to a TLS server
-// Returns map{handle: <tcp_handle>} or map{error: ...}
+// connect_tls(host, port) — connect to a TLS server. Always returns a normalized
+// { handle, error } map: handle is the TCP handle on success (error nil); on
+// failure handle is nil and error is set. (Previously it returned the raw builtin
+// result, so the documented conn.handle / conn.error usage didn't work.)
 fn connect_tls(host, port) {
-    let result = try tcp_connect_tls(host, port) catch nil;
-    if result == nil {
-        return map{ error: "tcp_connect_tls not available in this build." };
+    let result = try tcp_connect_tls(host, port) catch "__threw__";
+    if result == "__threw__" {
+        return map{ handle: nil, error: "tcp_connect_tls failed (host/port unreachable, or TLS handshake error)" };
     }
-    return result;
+    if type(result) == "map" {
+        // Builtin already returned a shaped map — fill in any missing slot.
+        if map_has(result, "handle") or map_has(result, "error") {
+            if not map_has(result, "handle") { result.handle = nil; }
+            if not map_has(result, "error") { result.error = nil; }
+            return result;
+        }
+        return map{ handle: result, error: nil };
+    }
+    return map{ handle: result, error: nil };   // raw TCP handle
 }
 
 // serve_once_tls(addr, cert_path, key_path, handler) — accept one TLS connection
@@ -78,10 +89,82 @@ fn wrap_tls(tcp_handle, cert_path, key_path) {
     return result;
 }
 
-// is_available() — check if TLS builtins are present in this build
+// is_available() — whether this build can do TLS. rustls is a HARD dependency of
+// pblang-vm (Cargo [dependencies], not a feature), so the TLS builtins are always
+// compiled in -> TLS is available. (The old implementation probed with the invalid
+// address "__probe__", which THROWS regardless of TLS support, so it always
+// returned false.)
 fn is_available() {
-    let r = try tcp_listen_tls("__probe__", "", "") catch nil;
-    return r != nil;
+    return true;
 }
 
-export listen_tls, connect_tls, serve_once_tls, serve_forever_tls, wrap_tls, is_available;
+// ── high-level HTTPS client ─────────────────────────────────────────────────────
+// request_https(method, url, headers, body) → { ok, status, status_text, headers,
+// body } (via http_client.parse_response) or { ok:false, error }. Connects with TLS,
+// sends one request (Connection: close), reads the full response. Never throws.
+fn request_https(method, url, headers, body) {
+    if not str_starts_with(url, "https://") {
+        return map{ ok: false, error: "request_https: URL must start with https://" };
+    }
+    let rest = str_slice(url, 8, len(url));
+    let slash = str_index_of(rest, "/");
+    let authority = rest;
+    let path = "/";
+    if slash >= 0 { authority = str_slice(rest, 0, slash); path = str_slice(rest, slash, len(rest)); }
+    let host = authority;
+    let port = 443;
+    let colon = str_index_of(authority, ":");
+    if colon >= 0 {
+        host = str_slice(authority, 0, colon);
+        port = try parse_number(str_slice(authority, colon + 1, len(authority))) catch 443;
+    }
+
+    let conn = connect_tls(host, port);
+    if conn.error != nil { return map{ ok: false, error: conn.error }; }
+    let h = conn.handle;
+
+    let b = body;
+    if b == nil { b = ""; }
+    let req = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
+    if headers != nil {
+        let ks = map_keys(headers);
+        let i = 0;
+        while i < len(ks) { req = req + ks[i] + ": " + str(headers[ks[i]]) + "\r\n"; i = i + 1; }
+    }
+    if b != "" { req = req + "Content-Length: " + str(len(b)) + "\r\n"; }
+    req = req + "\r\n" + b;
+
+    let wrote = try tcp_write(h, req) catch nil;
+    if wrote == nil { try tcp_close(h) catch nil; return map{ ok: false, error: "request_https: write failed" }; }
+
+    // Read until the server closes the connection (Connection: close).
+    let raw = "";
+    let chunk = try tcp_read(h, 65536) catch nil;
+    while chunk != nil and chunk != "" {
+        raw = raw + chunk;
+        chunk = try tcp_read(h, 65536) catch nil;
+    }
+    try tcp_close(h) catch nil;
+
+    let hc = import("stdlib:http_client.sapp");
+    let resp = hc.parse_response(raw);
+    return resp;
+}
+
+// get_https(url) — convenience GET.
+fn get_https(url) { return request_https("GET", url, nil, nil); }
+
+// post_https(url, body, headers) — convenience POST.
+fn post_https(url, body, headers) { return request_https("POST", url, headers, body); }
+
+// serve_app_tls(addr, cert, key, app) — serve an http_server app (app_handle) over
+// TLS. Returns { error } if the listener can't start (e.g. bad cert).
+fn serve_app_tls(addr, cert_path, key_path, app) {
+    let hs = import("stdlib:http_server.sapp");
+    return serve_forever_tls(addr, cert_path, key_path, fn(req) {
+        return hs.to_http_response(hs.app_handle(app, req));
+    });
+}
+
+export listen_tls, connect_tls, serve_once_tls, serve_forever_tls, serve_app_tls,
+       wrap_tls, is_available, request_https, get_https, post_https;
