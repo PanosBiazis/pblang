@@ -68,6 +68,42 @@ pub(super) fn tcp_listen(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Valu
     Ok(Value::Number(id as f64))
 }
 
+/// `tcp_connect("host:port")` → a plain (non-TLS) client stream handle. The
+/// counterpart to `tcp_listen`/`tcp_accept` for the client side (the TLS client is
+/// `tcp_connect_tls`). Returns the stream handle, usable with tcp_read/write/close.
+pub(super) fn tcp_connect(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if !host.allow_net() {
+        return Err(vm_cap!(host, "tcp_connect", "net"));
+    }
+    if args.len() != 1 {
+        return Err(host.err(format!(
+            "tcp_connect() expects 1 argument (\"host:port\"), got {}",
+            args.len()
+        )));
+    }
+    let addr = args[0]
+        .as_str()
+        .map_err(|m| host.err(format!("tcp_connect(): {m}")))?;
+    let s = TcpStream::connect(&addr).map_err(|e| host.err(format!("tcp_connect(): {e}")))?;
+    if let Some(ms) = host.io_timeout_ms() {
+        let d = Duration::from_millis(ms);
+        let _ = s.set_read_timeout(Some(d));
+        let _ = s.set_write_timeout(Some(d));
+    }
+    let sid = with_net_table(host, |t| {
+        let sid = NET_NEXT.fetch_add(1, Ordering::Relaxed);
+        t.insert(
+            sid,
+            NetResource::Stream(Box::new(NetStream {
+                inner: StreamKind::Plain(s),
+                buf: vec![],
+            })),
+        );
+        sid
+    })?;
+    Ok(Value::Number(sid as f64))
+}
+
 pub(super) fn tcp_accept(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if !host.allow_net() {
         return Err(vm_cap!(host, "tcp_accept", "net"));

@@ -408,7 +408,7 @@ impl StdlibConfig {
             | "url_decode" => self.crypto,
             "json_parse" | "json_stringify" => self.json,
             "http_get" | "http_post" | "ai_chat" | "ai_embed" => self.http,
-            "tcp_listen" | "tcp_accept" | "tcp_read" | "tcp_read_until" | "tcp_write"
+            "tcp_listen" | "tcp_connect" | "tcp_accept" | "tcp_read" | "tcp_read_until" | "tcp_write"
             | "tcp_close" | "tcp_local_addr" | "tcp_listen_tls" | "tcp_connect_tls"
             | "tcp_wrap_tls" | "http_parse_request" | "http_response" | "http_response_ct"
             | "http_response_json" | "ai_token_count" => self.net,
