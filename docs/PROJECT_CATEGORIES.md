@@ -14,7 +14,7 @@ alongside the language: `ai/pbai` (the neural bridge) and
 
 ---
 
-## 1. Compiler & Runtime Core (Rust crates — the native floor) — `crates/`
+## 1. Compiler & Runtime Core (Rust crates — the native floor) — `crates/` (DONE)
 
 | Category | Crate | Role |
 |---|---|---|
@@ -26,7 +26,7 @@ alongside the language: `ai/pbai` (the neural bridge) and
 | Lint | `pblang-lint` | Lint passes |
 | FFI | `pblang-ffi` | Foreign-function interface |
 
-## 2. Code-Generation Backends (compile targets) — `crates/`
+## 2. Code-Generation Backends (compile targets) — `crates/` (DONE)
 
 - **`pblang-cranelift`** — Cranelift JIT + AOT native object emission
 - **`pblang-llvm`** — LLVM IR (`.ll`) text emitter → clang
@@ -36,13 +36,13 @@ alongside the language: `ai/pbai` (the neural bridge) and
 - **`pblang-wasm`** — WebAssembly (`.wat` / `.wasm`) backend
 - **`pblang-stub`** — self-extracting binary stub for standalone bundles
 
-## 3. Domain Bridges (Rust) — `crates/`
+## 3. Domain Bridges (Rust) — `crates/` (DONE)
 
 - **`pblang-graphics`** — graphics backend (SDL2 / minifb)
 - **`pblang-ai`** — AI/ML provider integration (chat, embeddings, ONNX, tokenization, RAG)
 - **`pblang-quantum`** — quantum bridge to Qiskit / Cirq / Braket via Python subprocess
 
-## 4. Developer Tooling (Rust) — `crates/` + `src/`
+## 4. Developer Tooling (Rust) — `crates/` + `src/` (DONE)
 
 - **`pblang-lsp`** — Language Server Protocol (tower-lsp): diagnostics, completion, hover, goto-def
 - **`pblang-pm`** — package manager: manifest, lockfile, semver, registry, HMAC
@@ -54,7 +54,7 @@ alongside the language: `ai/pbai` (the neural bridge) and
   artifacts, multi-target C builds), `pbrun.sapp` (run/inspect a self-hosted
   `.pbck` bytecode artifact)
 
-## 5. Self-Hosted Compiler (pblang-in-pblang) — `stdlib/compiler/`
+## 5. Self-Hosted Compiler (pblang-in-pblang) — `stdlib/compiler/` (DONE)
 
 tokenizer · parser · semantic · typeck · codegen · optimizer · ir · vm ·
 ctranspile · formatter · guard_preprocessor · builtins_list ·
@@ -72,7 +72,7 @@ native multi-module builds), `linker.sapp`, `dist.sapp`
 
 - **Web / Net:** http, http_server, http_client, router, middleware, middleware_chain,
   websocket, tls, multipart, net, networking, networking_advanced, url, socks5,
-  protocol, web_framework
+  protocol, web_framework (DONE)
 - **Data / Serialization:** json, csv, dataframe, db, orm, serialization, encoding,
   base32, codec, compression, regex, template
 - **Concurrency / Async:** thread, thread_pool, concurrency, async, async_await,

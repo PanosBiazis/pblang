@@ -1,0 +1,241 @@
+// stdlib/pbai_rl.sapp -- pbAI reinforcement-learning / "trial and error" trainer.
+//
+// Small, fast, deterministic primitives for learning by trying: a seeded RNG, an
+// epsilon-greedy bandit (explore vs exploit), a generic trial-and-error hill climber
+// (propose a candidate; keep it only if the reward improves), and an RL trainer that
+// pulls a model toward the Ideal NN (reward = -ideality_distance). All deterministic
+// under a seed so tests are fast and reproducible.
+//
+// Self-contained: depends only on stdlib/pbai_ideal_nn.sapp (for the ideal reward).
+
+let IDEAL = import("stdlib/pbai_ideal_nn.sapp");
+
+// ── Deterministic RNG (Park-Miller minimal-standard LCG) ─────────────────────────────
+// state in [1, 2^31-2]; products stay < 2^45 so they are exact in f64.
+let _MOD = 2147483647.0;   // 2^31 - 1
+let _MUL = 16807.0;
+
+fn make_rng(seed) {
+    let s = num_mod(seed, 2147483646.0) + 1.0;   // map any seed into [1, 2147483646]
+    return map{ state: s };
+}
+
+fn rng_next(rng) {
+    let s = num_mod(rng.state * _MUL, _MOD);
+    return map{ rng: map{ state: s }, value: s / _MOD };
+}
+
+fn rng_uniform(rng, lo, hi) {
+    let nx = rng_next(rng);
+    return map{ rng: nx.rng, value: lo + (hi - lo) * nx.value };
+}
+
+// ── Epsilon-greedy bandit (classic explore/exploit RL) ───────────────────────────────
+
+fn bandit_new(n) {
+    let q = [];
+    let c = [];
+    let i = 0;
+    while i < n { push(q, 0.0); push(c, 0.0); i = i + 1; }
+    return map{ q: q, counts: c, n: n };
+}
+
+fn bandit_best(b) {
+    let best = 0;
+    let i = 1;
+    while i < b.n {
+        if b.q[i] > b.q[best] { best = i; }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn bandit_select(b, epsilon, rng) {
+    let nx = rng_next(rng);
+    if nx.value < epsilon {
+        // explore: a uniformly random action
+        let nx2 = rng_next(nx.rng);
+        let a = num_floor(nx2.value * b.n);
+        if a >= b.n { a = b.n - 1; }
+        return map{ action: a, rng: nx2.rng };
+    }
+    // exploit: the current best action
+    return map{ action: bandit_best(b), rng: nx.rng };
+}
+
+fn bandit_update(b, action, reward) {
+    // incremental sample-average update: Q <- Q + (reward - Q) / count
+    let q = [];
+    let counts = [];
+    let i = 0;
+    while i < b.n {
+        if i == action {
+            let c = b.counts[i] + 1.0;
+            push(counts, c);
+            push(q, b.q[i] + (reward - b.q[i]) / c);
+        } else {
+            push(counts, b.counts[i]);
+            push(q, b.q[i]);
+        }
+        i = i + 1;
+    }
+    return map{ q: q, counts: counts, n: b.n };
+}
+
+// ── Generic trial-and-error optimizer (greedy hill climbing) ─────────────────────────
+// propose(candidate, rng) -> map{ value, rng };  reward(candidate) -> number (maximize).
+// Keeps a candidate only if it strictly improves the reward -> best-reward is monotone.
+fn trial_and_error(initial, propose, reward, iters, seed) {
+    let rng = make_rng(seed);
+    let best = initial;
+    let best_reward = reward(initial);
+    let history = [best_reward];
+    let accepted = 0;
+    let tried = 0;
+    let i = 0;
+    while i < iters {
+        let p = propose(best, rng);
+        rng = p.rng;
+        tried = tried + 1;
+        let r = reward(p.value);
+        if r > best_reward {
+            best = p.value;
+            best_reward = r;
+            accepted = accepted + 1;
+        }
+        push(history, best_reward);
+        i = i + 1;
+    }
+    return map{
+        format: "pbai.rl.trial_and_error.v1",
+        best: best,
+        best_reward: best_reward,
+        history: history,
+        accepted: accepted,
+        tried: tried
+    };
+}
+
+// ── RL trainer toward the Ideal NN ───────────────────────────────────────────────────
+
+// Reward is the negated ideality distance: higher reward == closer to the Ideal NN.
+fn ideal_reward(model, ideal) {
+    return 0.0 - IDEAL.ideality_distance(model, ideal).total;
+}
+
+// Random perturbation of the trainable parts (complex weights + output distribution).
+fn _perturb_model(model, rng, sigma) {
+    let cw = [];
+    let i = 0;
+    while i < len(model.complex_weights) {
+        let w = model.complex_weights[i];
+        let u1 = rng_uniform(rng, 0.0 - sigma, sigma);
+        rng = u1.rng;
+        let u2 = rng_uniform(rng, 0.0 - sigma, sigma);
+        rng = u2.rng;
+        push(cw, map{ re: w.re + u1.value, im: w.im + u2.value });
+        i = i + 1;
+    }
+    let od = [];
+    let s = 0.0;
+    let j = 0;
+    while j < len(model.output_dist) {
+        let u = rng_uniform(rng, 0.0, sigma);
+        rng = u.rng;
+        let v = model.output_dist[j] + u.value;
+        if v < 0.0 { v = 0.0; }
+        push(od, v);
+        s = s + v;
+        j = j + 1;
+    }
+    let odn = [];
+    let k = 0;
+    while k < len(od) {
+        if s > 0.0 { push(odn, od[k] / s); } else { push(odn, od[k]); }
+        k = k + 1;
+    }
+    return map{
+        rng: rng,
+        model: map{ layers: model.layers, output_dist: odn, complex_weights: cw }
+    };
+}
+
+// Trial-and-error training: each iteration tries `candidates` random perturbations and
+// keeps the best one only if it improves the reward (moves closer to the Ideal NN).
+fn train_toward_ideal_rl(model, ideal, iters, candidates, sigma, seed) {
+    let rng = make_rng(seed);
+    let cur = model;
+    let cur_reward = ideal_reward(cur, ideal);
+    let rewards = [cur_reward];
+    let accepted = 0;
+    let i = 0;
+    while i < iters {
+        let best_model = cur;
+        let best_r = cur_reward;
+        let improved = false;
+        let c = 0;
+        while c < candidates {
+            let p = _perturb_model(cur, rng, sigma);
+            rng = p.rng;
+            let r = ideal_reward(p.model, ideal);
+            if r > best_r {
+                best_r = r;
+                best_model = p.model;
+                improved = true;
+            }
+            c = c + 1;
+        }
+        if improved {
+            cur = best_model;
+            cur_reward = best_r;
+            accepted = accepted + 1;
+        }
+        push(rewards, cur_reward);
+        i = i + 1;
+    }
+    return map{
+        format: "pbai.rl.train_toward_ideal.v1",
+        final: cur,
+        rewards: rewards,
+        accepted: accepted,
+        iters: iters
+    };
+}
+
+// Hybrid trainer toward the ideal NN: alternate DIRECTED gradient descent
+// (ideal_nn.iterate_toward_ideal — fast, deterministic) with STOCHASTIC RL exploration
+// (train_toward_ideal_rl — escapes spots a gradient step can't improve). Each phase keeps
+// its result only if it lowered the ideality distance, so progress never regresses.
+fn train_toward_ideal_hybrid(model, ideal, rounds, grad_steps, lr, rl_iters, candidates, sigma, seed) {
+    let cur = model;
+    let d0 = IDEAL.ideality_distance(cur, ideal).total;
+    let history = [d0];
+    let i = 0;
+    while i < rounds {
+        let g = IDEAL.iterate_toward_ideal(cur, ideal, lr, grad_steps);
+        let grad_d = IDEAL.ideality_distance(g.final, ideal).total;
+        let cur_d = IDEAL.ideality_distance(cur, ideal).total;
+        if grad_d < cur_d { cur = g.final; }
+        let rl = train_toward_ideal_rl(cur, ideal, rl_iters, candidates, sigma, seed + i);
+        let rl_d = IDEAL.ideality_distance(rl.final, ideal).total;
+        let cur_d2 = IDEAL.ideality_distance(cur, ideal).total;
+        if rl_d < cur_d2 { cur = rl.final; }
+        push(history, IDEAL.ideality_distance(cur, ideal).total);
+        i = i + 1;
+    }
+    let final_d = IDEAL.ideality_distance(cur, ideal).total;
+    return map{
+        format: "pbai.rl.train_toward_ideal_hybrid.v1",
+        final: cur,
+        initial_distance: d0,
+        final_distance: final_d,
+        improved: final_d < d0,
+        history: history,
+        rounds: rounds
+    };
+}
+
+export make_rng, rng_next, rng_uniform;
+export bandit_new, bandit_best, bandit_select, bandit_update;
+export trial_and_error;
+export ideal_reward, train_toward_ideal_rl, train_toward_ideal_hybrid;

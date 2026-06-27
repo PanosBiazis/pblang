@@ -7,6 +7,9 @@ This manual covers the **code-first** browser IDE in `editors/ide/index.html` an
 > **Native IDE:** the self-hosted pblang implementation has started. Run `pblang --ide`
 > for the browser-free native IDE (`editors/ide/pbide.sapp`) with Code, Terminal,
 > Designer, AI, and Browser panels. See **[`docs/PB_IDE.md`](PB_IDE.md)**.
+> The native Code panel uses the self-hosted pblang frontend for Run/Check and
+> now shows its toolchain status in the side pane; the Rust VM is still the native
+> execution kernel and fallback while the self-host path keeps expanding.
 
 ## 1. Start the IDE
 
@@ -29,8 +32,11 @@ Health endpoint:
 - Write/edit code in the main editor.
 - `Run` executes code through backend `/run`.
 - `Check` runs parse/type diagnostics through `/check`.
-- `Format` uses `/format` (falls back to local formatting if backend unavailable).
-- `Auto-fix` applies simple known fixes and re-checks.
+- `Format` uses the pblang formatter behind a parse/lint guard. If formatted code
+  would stop parsing or increase diagnostics, the editor leaves the buffer unchanged.
+- `Auto-fix` applies deterministic safe fixes, including inline `print(x);` to
+  `print x;`, smart punctuation, math-symbol normalization, and common `fs read` /
+  `fs write` spacing mistakes.
 
 Keyboard:
 
@@ -39,12 +45,32 @@ Keyboard:
 - `Ctrl+I`: open the AI assistant
 - `Ctrl+D`: open the visual Designer (pblang Studio)
 - `Ctrl+B`: open the pblang web Browser
-- `Tab`: insert spaces in editor
+- `Ctrl+P`: open the native IDE command palette
+- `Ctrl+N`: create a new untitled buffer from the Code panel
+- `Ctrl+Shift+S`: Save As from the Code panel
+- `Ctrl+Shift+D`: duplicate the current editor line
+- `Ctrl+Shift+K`: delete the current editor line
+- `Alt+Up` / `Alt+Down`: move the current editor line up/down
+- `Ctrl+/`: toggle `//` line comments on the current line or selected lines
+- `Ctrl+1` ... `Ctrl+9`: switch native panels left-to-right; the tab strip shows
+  the same numbers and compacts to labels like `1C`, `2T`, `3A` on narrow windows
+- `Ctrl+Tab` / `Ctrl+Shift+Tab`: cycle next / previous native panel
+- `Ctrl+PageDown` / `Ctrl+PageUp`: cycle next / previous native panel
+- `F5` / `F6`: Run / Check from any panel
+- `Ctrl+G`: Go To Line modal; type a line number and press Enter
+- `Alt+Left` / `Alt+Right`: navigate back / forward through diagnostic, Outline,
+  and Go To Line jumps
+- Control/Alt/Meta modifiers accept SDL/minifb/platform aliases such as `LCtrl`,
+  `LeftCtrl`, `ControlLeft`, and `Control`, and graphics key events now also carry
+  direct modifier booleans, so shortcuts work across graphics backends even when a
+  standalone modifier keydown is missed.
+- `Tab`: indent selected lines, expand math shortcuts, or insert spaces in editor
+- `Shift+Tab`: outdent the current line or selected lines
 - `F8`: next diagnostic
 - `Shift+F8`: previous diagnostic
-- `F11`: toggle Debug / Release mode in the native IDE
-- `F12`: toggle native IDE watcher status
-- `Ctrl+/`: open in-IDE manual modal
+- `F11`: toggle Debug / Release mode in the native IDE from any panel
+- `F12`: toggle native IDE watcher status from any panel
+- `F1`: open/close the in-IDE keyboard manual overlay
 
 Manual modal:
 
@@ -53,7 +79,25 @@ Manual modal:
   - `GET /manual/ide`
   - `GET /manual/project`
 
-## 2a. AI assistant (powered by pbAI — pblang's own model)
+## 2a. Native terminal (`Term` / `F3`)
+
+The native Terminal panel runs real PC commands through pblang's process capability when
+the IDE is launched with `--allow-exec` or `--allow-all`.
+
+- The terminal keeps a persistent working directory, so `cd subdir` affects later
+  commands.
+- Scrollback is bounded so noisy commands cannot grow the IDE session without limit.
+- Up/Down recalls a bounded de-duplicated command history. If you start typing a new
+  command, press Up to browse history, then Down back past the newest command to restore
+  your in-progress draft.
+- `Shift+Enter` inserts a newline for multi-line shell commands.
+- `clear` clears the terminal output area.
+- `Ctrl+P` exposes **Clear Terminal output**, so you can clear Terminal scrollback from
+  any panel.
+- The status strip above scrollback shows command-history count/selection and the core
+  keyboard hints.
+
+## 2b. AI assistant (powered by pbAI — pblang's own model)
 
 The toolbar `🤖 AI` button (or `Ctrl+I`) opens an AI assistant backed by **pbAI**
 (`stdlib/pbai.sapp`) — pblang's own model. There is **no external LLM and no network**:
@@ -62,10 +106,20 @@ pbAI runs locally, in pblang, and knows pblang's own idioms and gotchas.
 - **Connection status** — the panel pings the pbAI gateway (`GET /health`) and shows
   `pbAI online / offline` live.
 - **Quick actions** over the current editor code: **Explain code**, **Find bugs**,
-  **Improve**, **Add comments**, **Explain diagnostics**. pbAI classifies the request with
-  a small neural net and runs a pblang-grounded skill (e.g. find-bugs checks brace/paren
+  **Improve**, **Add comments**, **Explain diagnostics**. In the native IDE these are
+  exposed as `EXPLAIN`, `BUGS`, `IMPROVE`, `QUALITY`, `COMMENT`, and `DIAG`; `INSERT`
+  places the last raw pbAI answer into the editor. pbAI classifies the request with a
+  small neural net and runs a pblang-grounded skill (e.g. find-bugs checks brace/paren
   balance and flags pblang-specific traps like missing-map-key reads).
-- **Free-form prompt** with an *include editor code* toggle, and **Insert into editor**.
+- `Ctrl+P` exposes the same AI actions as searchable commands: AI explain, bugs,
+  improve, quality, comment, diagnostics, insert last answer, and clear chat.
+- **Free-form prompt** with editor-code context. The native panel stores the last raw
+  pbAI answer for `INSERT`.
+- Up/Down recalls previous free-form prompts from a bounded de-duplicated prompt
+  history. When you start typing a draft, browse older prompts, then press Down past
+  the newest prompt, the native panel restores your draft.
+- `Shift+Enter` inserts a newline for multi-line prompts, and the status strip above
+  chat output shows prompt-history count/selection plus the main keyboard hints.
 - **Config** (collapsible): the gateway **Endpoint** (default `http://localhost:8080`) and
   a **Skill** override (auto / review / explain). Persists in
   `localStorage['pblang.ide.aimcp.v1']`.
@@ -90,7 +144,7 @@ Request contract — the panel `POST`s `{endpoint}/mcp/tool` with
 > are useful today, and the generative scale-up toward a full pblang language model is the
 > roadmap. The pb-mcp-server remains pbAI's tool layer for agentic actions.
 
-## 2b. Visual designer — pblang Studio (`🎨 Designer` / `Ctrl+D`)
+## 2c. Visual designer — pblang Studio (`🎨 Designer` / `Ctrl+D`)
 
 A drag/click visual builder (the start of `docs/Visual_Designer.md`). Three panes —
 **Palette · Canvas · Inspector** — and a *kind* selector. The design is the single source
@@ -109,19 +163,33 @@ program into the editor).
   `stdlib/quantum.sapp` (`circuit`/`h`/`cx`/`measure`/`run`).
 
 Native Designer (`pblang --ide`) now has a parallel pblang-only surface: label/button/
-textbox/checkbox/radio/select/slider/panel palette, 3D cube/ball design items,
+textbox/checkbox/radio/select/slider/panel palette, an `APP` target selector
+(`gui`/`web`/`both`), runnable 3D cube/ball GUI widgets,
 2D chart items, N-dimensional item placeholders, custom component placeholders,
 web/HTML metadata placeholders, scanner/3D asset placeholders, and game-engine-style
 camera/light/material/terrain/particle/physics/prefab/render-backend placeholders. The
-palette wraps across rows when needed. It supports drag/move/edit, `LAYOUT` cycling
-through free/responsive/grid/stack positions via `stdlib/design_engine.sapp`, and
+palette wraps across rows when needed. It supports drag/move/edit, snapped keyboard
+nudging with arrows, snapped keyboard resizing with `Ctrl+arrows` (`Shift` uses a larger step),
+selection cycling with `Tab` / `Shift+Tab`, duplication with `Insert`, and layer ordering
+with `Ctrl+[` / `Ctrl+]` (`Shift` sends to back/front),
+`LAYOUT` cycling through free/responsive/grid/stack positions via `stdlib/design_engine.sapp`, and
 parse-checked `->CODE` generation into the editor.
+`Ctrl+P` also exposes Designer commands for code generation, clear canvas, layout cycle,
+app target cycle, select next/previous, duplicate, delete, layer forward/backward, send
+back, and bring front, so the main builder actions are available without memorizing
+every shortcut.
+The native inspector strip summarizes the current app target, layout mode, active tool,
+item count, and selected widget geometry so you can check the design state without
+reading the generated code.
 Generated desktop GUI code follows the web IDE shape: `let gui = import(...)`,
-`build()`, `main()`, and `main();`, so the result is easier to run and round-trip.
-Foreign-language, HTML/CSS/JS, and scanner components are stored as safe metadata or
-runnable placeholders unless an explicit host renderer/importer is added later.
+`app_target()`, `build()`, `preview()`, `run_gui()`, `main()`, and `main();`. IDE Run
+executes `preview()` safely without opening a second graphics window; call `run_gui()`
+when you want the real GUI window. Generated forms call `gui.fit_form(...)` so placed
+items, including 3D previews, fit the form. Foreign-language, HTML/CSS/JS, and scanner
+components are stored as safe metadata or runnable placeholders unless an explicit host
+renderer/importer is added later.
 
-## 2c. Native run/check history (`Hist` / `F9`)
+## 2d. Native run/check history (`Hist` / `F9`)
 
 The pblang-native IDE now mirrors the web IDE's History workflow without HTML, CSS, or
 JavaScript. Run (`F5`) and Check (`F6`) each add a bounded newest-first history record
@@ -129,6 +197,12 @@ with action, pass/fail status, output summary, and the source snapshot from that
 
 - `F9` opens the native `Hist` tab.
 - Clicking a history row restores that record's code snapshot into the editor.
+- Type to filter run/check snapshots by action, status, output, code, or timestamp.
+  The filter row shows shown/total snapshots plus selected-position status.
+- Use Up/Down, Home/End, PageUp/PageDown, or `Ctrl+N`/`Ctrl+P` to select a snapshot,
+  then press Enter or click the row to restore its code into the editor.
+- Press `Delete` to clear only the filter. Press `C`, click the footer clear action,
+  or run **Clear run/check history** from `Ctrl+P` to clear the native session history.
 - History is intentionally session-local for now; persistent history remains a browser IDE
   feature until the native file picker/storage layer is completed.
 
@@ -136,11 +210,73 @@ Native diagnostics now match the web IDE's main workflow:
 
 - `F6` Check stores structured diagnostics for the current buffer.
 - The code side pane lists current diagnostics with inferred line/column where available.
+  Its Diagnostics header summarizes current severity counts, for example
+  `diagnostics: 2 error(s), 1 warning(s)`, before the individual rows.
+- The Code editor gutter marks diagnostic lines with compact severity letters:
+  `E` for error, `W` for warning, `I` for info, and `?` for other diagnostic kinds.
+  When several diagnostics share one line, the marker uses the most severe kind.
+- The bottom Code status bar mirrors the web IDE's core editor signals: current
+  file/dirty state, `Ln`/`Col`, line count, character count, diagnostics count,
+  selected-character count, build mode, self-host status, navigation back/forward
+  counts, and watcher badge.
+  It also includes a compact `health OK/WARN/ERROR/OFF` strip that merges
+  Debug/Release mode, watcher freshness, the watcher next action, and
+  UI-observer quality into one glanceable signal.
+  The `scope ...` segment shows the nearest top-level symbol span for the caret,
+  such as `scope fn build L12-L28`, so you can keep orientation without opening
+  Outline.
+  When the caret is on a diagnostic line, the same status bar adds a compact
+  `line error:` / `line warning:` message and a `+N` suffix for additional issues
+  on that line.
+  Code-line actions include indent/outdent selected lines,
+  duplicate-current-line, delete-current-line, and
+  move-current-line-up/down, and toggle-line-comment through `Ctrl+Shift+D`,
+  `Ctrl+Shift+K`, `Alt+Up`, `Alt+Down`, and `Ctrl+/` or the command palette;
+  `Tab` / `Shift+Tab` handle indentation. The command palette also exposes
+  **Trim trailing whitespace**, which cleans selected lines when a selection exists
+  or the whole buffer otherwise. These actions use normal undo snapshots and update
+  the dirty state.
+  Clipboard shortcuts also behave like modern code editors: `Ctrl+C` copies the
+  current line when there is no selection, and `Ctrl+X` cuts the current line when
+  there is no selection.
+  Syntax highlighting is refreshed from a separate source hash, so repainting the
+  editor does not clear the unsaved marker.
+- `Ctrl+G` opens a native Go To Line modal. The requested line is clamped to the
+  current buffer's valid line range, then the editor jumps to column 1.
+- `Ctrl+F` opens native Find and `Ctrl+H` opens Replace. The status line shows
+  live match counts while typing; Replace also shows the active field and
+  replacement text before Enter applies replace-all. When a query has matches,
+  the status also shows the current match ordinal and source location, such as
+  `match 2/5 at L18:C9`. `Ctrl+P` also exposes Find and Replace commands for
+  keyboard-discoverable access.
+- Diagnostic jumps, Outline jumps, and Go To Line record the previous cursor
+  location. Use `Alt+Left` / `Alt+Right` or the command palette to move through
+  that jump history. Opening a different file clears stale same-buffer jump
+  history, and no-op jumps do not add duplicate navigation entries.
 - Click a diagnostic row to jump to that location.
 - `F8` jumps to the next diagnostic; `Shift+F8` jumps to the previous diagnostic.
+- `Ctrl+P` command palette includes **Problems**, **Next diagnostic**, and
+  **Previous diagnostic**. Problems refreshes stale/unchecked diagnostics with Check,
+  jumps to the first fresh diagnostic when issues exist, or reports a clean fresh buffer.
+- The command palette also exposes Browser commands: Reload/Back, Live/Reader/Links/
+  Forms/Source/Inspect/Host views, Safe/Live/Trusted/Tor security profiles, and the
+  Tor route toggle.
+- The `Prob` panel is a dedicated Problems view. It shows the watcher action row plus
+  current diagnostics and an error/warning/info summary; Enter/click runs the action
+  row or jumps to the selected diagnostic, and Esc returns to Code. The small padding
+  gap between the action row and diagnostics is inert, so a click on the first
+  diagnostic cannot accidentally run the watcher action.
+  Type in the panel to filter diagnostics by severity, message, source text, or
+  location tokens such as `L12` / `C5`; Backspace edits the filter and `Delete`
+  clears it. The filter row shows shown/total diagnostics and selected-position
+  status.
+  Use Home/End, PageUp/PageDown, arrows, or `Ctrl+N` / `Ctrl+P` to move through
+  the filtered list.
+  A selected-diagnostic detail strip at the bottom shows the diagnostic severity,
+  line/column, message, and source line without leaving the Problems panel.
 - `F10` opens the native Browser panel because `F8` is reserved for diagnostics parity.
 
-## 2d. Web browser — written in pblang (`🌐 Browser` / `Ctrl+B`)
+## 2e. Web browser — written in pblang (`🌐 Browser` / `Ctrl+B`)
 
 A native browser whose **engine is pblang**: `stdlib/browser.sapp` enforces a URL
 policy, fetches a page (`http_get`), parses title, reader text (script/style stripped),
@@ -156,29 +292,54 @@ Native safety rules:
 - common ad/tracker/malicious URL patterns are blocked before network access;
 - loopback, LAN, and private hosts are blocked by default unless the caller explicitly
   opts in with `allow_private=true`;
+- the native toolbar exposes **Sec:Safe/Live/Trusted/Tor** and **Tor:on/off**. Safe is
+  the default, Live enables pblang-owned interactive links/forms without JS/DOM,
+  Trusted is the explicit local/private and Host-render opt-in, and Tor is opt-in
+  but currently needs the lower-level SOCKS/TLS transport work described by the
+  browser engine;
+- the Browser shows a visible security summary row for the active profile: links,
+  forms, private-host access, Tor route, ad/tracker blocking, and `js/dom:off`.
+  This row is informational; only the button row above it changes Browser mode,
+  security profile, Tor state, reload, or back navigation;
 - native Browser rendering has no DOM, no JS engine, and no embedded iframe.
 
 The native view has:
 
-- an address bar with Reload and Page/Reader/Links/Forms/Render mode buttons;
-- **Page / Reader / Links / Forms / Render** modes — *Page* renders pblang-extracted page blocks
-  (title/headings/paragraphs/images), *Reader* shows clean text, *Links* lists the
-  absolutized links, *Forms* lists discovered `<form>` fields, and *Render* is an
-  explicit host-browser screenshot path through `stdlib/browser_render.sapp`;
-- form parsing and form encoding in the pblang engine (`forms`/`urlencode`/`submit`).
+- an address bar with Back, Reload, Live/Reader/Links/Forms/Source/Inspect/Host mode
+  buttons, a `Sec:*` profile button, and a `Tor:on/off` route toggle;
+- **Live / Reader / Links / Forms / Source / Inspect / Host** modes — *Live* renders
+  pblang-extracted page blocks (title/headings/paragraphs/images) as native cards,
+  *Reader* shows clean text, *Links* lists the absolutized links, *Forms* lists
+  discovered `<form>` fields with editable values and submit previews, *Source* shows numbered HTML source, *Inspect* shows
+  F12-style details (URL, policy, status, counts, elements, links, images, forms), and
+  *Host* is an explicit external screenshot fallback through `stdlib/browser_render.sapp`;
+- form parsing, form value defaults, form encoding, submit preview, and profile-aware
+  submit blocking in the pblang engine (`forms`/`form_values`/`form_preview_url`/
+  `form_submit_mode`/`urlencode`/`submit`).
+
+Forms mode keys:
+
+- `Tab` / `Shift+Tab`: select next / previous field.
+- `Ctrl+N` / `Ctrl+P`: select next / previous form on the page.
+- Type text / `Backspace`: edit the selected field value.
+- `Space`, `Left`, or `Right`: toggle checkbox/radio fields or cycle select options.
+- Mouse click: select a form/field row; checkbox/radio/select rows cycle immediately;
+  the submit-preview row submits.
+- `Enter`: submit through the current Browser security profile. Safe and Tor block
+  submits; Live and Trusted allow them subject to URL policy.
 
 The web IDE may still use browser-native UI features as a reference surface, but the
-native IDE Browser intentionally stays a pblang reader/page renderer by default. Exact
-Chrome-like rendering requires a real DOM/CSS/JS engine, so the native `Render` tab
-delegates to an installed Chromium/Chrome-compatible browser in headless screenshot mode
-after the pblang URL policy passes. It needs `--allow-exec`; Page/Reader remain the
-safe no-JS default.
+native IDE Browser intentionally stays a pblang Live/Reader/Source/Inspect renderer by
+default. Exact Chrome-like rendering requires a real DOM/CSS/JS engine, so the native
+`Host` tab can delegate to an installed Chromium/Chrome/Brave/Edge/Firefox browser in
+headless screenshot mode after the pblang URL policy passes. It needs `--allow-exec`;
+Live/Reader/Source/Inspect remain the safe no-JS defaults.
 
 The 2026-06-21 Browser screenshots showed why this boundary matters: a full Google page
 contains script-driven layout, navigation links, images, and generated parameters that a
-reader engine must filter instead of drawing verbatim. Native Page mode now keeps raw URLs
-in Links mode, filters noisy/corrupt page blocks, and uses a wider page column so it reads
-closer to the web IDE while staying browser-free.
+reader engine must filter instead of drawing verbatim. Native Live mode now keeps raw URLs
+in Links mode, filters noisy/corrupt page blocks, adds Source/Inspect details, and uses a
+wider page column so it reads closer to the web IDE while staying browser-free.
 
 ## 3. Diagnostics panel
 
@@ -206,7 +367,9 @@ Actions:
 
 - `Show`: replay that entry output + diagnostics
 - `Load code`: restore snapshot into editor
-- `Clear`: clear history
+- `Search/filter`: narrow snapshots by action/status/output/code
+- `Clear filter`: remove the current history search
+- `Clear`: clear all history
 
 All history is stored in browser local storage.
 
@@ -226,7 +389,9 @@ Native IDE parity:
 
 - In `pblang --ide`, click `Ex` to open the searchable examples picker.
 - Type to filter examples by title or source code.
-- `Up` / `Down` changes selection, `Enter` loads the selected example, and `Esc` closes.
+- The filter row shows shown/total examples plus selected-position status.
+- `Up`/`Down`, Home/End, PageUp/PageDown, or `Ctrl+N`/`Ctrl+P` change selection.
+- `Delete` clears the current filter, `Enter` loads the selected example, and `Esc` closes.
 - Clicking a row loads that example into the editor.
 
 ## 6. Persistence
@@ -273,10 +438,87 @@ Native IDE parity:
 - Native build modes mirror normal IDE behavior: **Debug** runs Check before Run and
   blocks execution when diagnostics exist; **Release** runs directly for a faster loop.
   Use the toolbar Mode button or `F11`.
+- The toolbar Mode button shows the full `Debug` / `Release` label, and the Watcher
+  button uses a wider label so both are easier to hit and read. The Watcher button
+  also shows compact state labels such as `Stale`, `ErrN`, `Dirty`, `Unchk`, or
+  `Watch`, and the bottom status bar uses compact badges such as `watch ok` or
+  `watch stale` instead of the full watcher summary.
 - Native watcher status mirrors normal IDE project watches without a background thread:
   it tracks buffer revision/hash, dirty/clean state, line count, symbol count, and
-  diagnostics. It appears in the Code side pane and status bar; toggle with Watch or
-  `F12`.
+  diagnostics. It also records line/symbol/diagnostic deltas and a bounded newest-first
+  event log. Diagnostics are marked `unchecked`, `fresh`, or `stale`: Check makes the
+  current buffer fresh, and later edits mark diagnostics stale until the next Check.
+  The Code side pane includes a watcher action row, and the command palette exposes
+  **Run watcher suggested action**: stale/unchecked diagnostics run Check, fresh
+  diagnostics jump through F8 navigation, and clean dirty buffers route to Save.
+  You can also click the watcher action row directly in the Code side pane.
+  Unchanged draw refreshes do not overwrite the last meaningful event. The watcher
+  appears in the Code side pane and status bar; toggle with Watch or `F12`.
+- The native IDE also publishes a structured UI observer snapshot through
+  `stdlib/ui_observer.sapp`. Each draw records the visible surface regions, active
+  focus, useful signals, recent command/mouse interactions, and layout issues such
+  as nonpositive sizes, offscreen regions, or overlapping regions. It also computes
+  a bounded `quality_score` so healthy layouts are obvious at a glance. The Code
+  side pane shows a clickable compact `UI OBSERVER` block, the watcher state carries
+  `ui_snapshot` / `ui_lines`, and `Ctrl+P` exposes **Show UI observer snapshot** to
+  print a freshly refreshed report into the output pane.
+- Save writes the current buffer path, falling back to `.pbide_buffer.sapp` if needed.
+  Save As opens a path prompt, writes the buffer to that path, marks the buffer clean,
+  records it in recent files, and clears stale navigation when the current file changes.
+  Revert reloads the current path from disk, clears stale diagnostics/navigation/modals,
+  and marks the buffer clean again.
+  Open / `Ctrl+O` shows a native Quick Open modal. It lists the current directory with
+  folders first, prepends matching recent files, filters as you type, supports
+  Up/Down/PageUp/PageDown/Home/End and `Ctrl+N`/`Ctrl+P`, shows result counts and
+  selected-position details, opens files with Enter or click, enters directories
+  with Enter/click, and falls back to the typed path when no row matches.
+- The native `Files` panel is the persistent project browser. It uses the same
+  pblang-owned directory listing as Quick Open, keeps its current directory visible,
+  filters as you type, shows result counts and selected-position details, toggles
+  flat/tree/recent mode with `Tab`, supports Up/Down/PageUp/PageDown/Home/End and
+  `Ctrl+N`/`Ctrl+P`, opens files with Enter/click, enters directories with
+  Enter/click, goes up with Backspace on an empty filter, and refreshes with
+  `Ctrl+R`. It also tracks workspace roots: `Ctrl+Left`/`Ctrl+Right` or
+  `Ctrl+H`/`Ctrl+L` cycles roots, and `Ctrl+B` bookmarks the current directory as
+  a root. `Ctrl+Plus` / `Ctrl+Minus` adjusts tree depth, clamped to `1..8`.
+  Opening files records a bounded newest-first recent list, so recent mode can
+  quickly return to active work without walking the full project tree.
+  `Ctrl+P` also exposes Files commands for Flat, Tree, Recent, and Reveal current
+  file; Reveal switches to the active file's directory and filters by its name.
+  In recent mode, `Delete` removes the selected recent row, `Ctrl+Delete` clears
+  the whole recent list, and `Ctrl+P` exposes **Clear recent files**.
+  Tree mode is bounded by depth and entry count and skips generated-heavy folders
+  so project browsing stays responsive.
+- `Ctrl+P` opens the native command palette. Type to filter commands, use Up/Down,
+  PageUp/PageDown, Home/End, or `Ctrl+N`/`Ctrl+P` to select, Enter to run, and Esc
+  to close. It exposes Run, Check, New buffer, Save, Save As, Open, Revert, Clear output, Restore starter, Format,
+  Fix, Indent/Outdent lines, Duplicate line, Delete line, Move line up/down, Toggle line comment, Trim trailing whitespace, Find, Replace, Examples, Debug/Release, Watcher, Theme, UI snapshot, panel switches, Files
+  view/reveal commands, and Help from one modal.
+  Shortcuts are searchable, multi-word queries can match across fields such as
+  `panel ctrl+6`, and the palette shows shown/total commands plus selected-command
+  position/detail. `Delete` clears the current command filter. Shortcuts render in
+  their own right-side column, so hidden
+  toolbar actions stay discoverable on compact windows. Clicks outside native
+  modals are absorbed by the backdrop, so Quick Open, Examples, and Command
+  Palette cannot accidentally trigger controls behind the overlay. Backdrop
+  clicks also close Help, Go To Line, Quick Open, Examples, and Command Palette,
+  matching normal IDE modal behavior.
+  The native Theme toggle now affects the main editor, Browser, Files, Outline,
+  Problems, History, Terminal/AI input bars, and core modals such as Go To Line,
+  Examples, Command Palette, Quick Open, Help, and the Designer palette/canvas/
+  inspector/widget preview surface. The top toolbar action buttons and panel tabs
+  also use the same Light/Dark-aware color system, including Browser body output
+  rows, security-mode chips, Files/Outline semantic rows, Problems diagnostics,
+  watcher status, UI observer issue lines, AI chat user lines, code side-pane
+  headers, Terminal output, History OK/FAIL rows, modal empty-result text,
+  Designer component badges, Watch toolbar stale/error states, and Code syntax
+  highlighting.
+- The native `Out` panel is the source outline. It lists top-level `fn`, `let`,
+  `const`, and `export` symbols with `Lx-Ly` spans and line counts. The filter
+  row shows shown/total symbols plus the selected row position; type to filter,
+  use Up/Down, Home/End, PageUp/PageDown, or `Ctrl+N`/`Ctrl+P` to select, `Delete`
+  to clear the filter, Enter or click to jump to the source line, and Esc to
+  return to Code.
 - Native Code panel shortcut parity: `Ctrl+Enter` runs, `Ctrl+Shift+Enter` checks,
   `Ctrl+D` opens Designer, `Ctrl+B` opens Browser, and `Ctrl+I` opens AI.
 

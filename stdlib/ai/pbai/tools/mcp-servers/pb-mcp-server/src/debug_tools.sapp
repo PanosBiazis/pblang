@@ -1,0 +1,155 @@
+// Native pblang translations for debug trace/report helpers.
+
+let FS = import("stdlib:fs.sapp");
+let JSON = import("stdlib:json.sapp");
+let sec = import("src/security.sapp");
+
+let TRACE_PATH = ".mint-mcp/debug-traces.jsonl";
+
+fn _now_ms() { return try now_ms() catch num_floor(clock() * 1000.0); }
+
+fn _ensure_dir() {
+    sec.require_trusted("debug trace write");
+    FS.mkdirs(".mint-mcp");
+    return true;
+}
+
+fn _safe_program(value) {
+    let s = str(value);
+    let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-";
+    if s == "" { return ""; }
+    for i len(s) {
+        if not str_contains(allowed, str_slice(s, i, i + 1)) { throw "unsafe program name: " + s; }
+    }
+    return s;
+}
+
+fn _clip(s, max_chars) {
+    s = str(s);
+    max_chars = sec.clamp(max_chars, 1, sec.MAX_READ_CHARS);
+    if len(s) <= max_chars { return s; }
+    return str_slice(s, 0, max_chars) + "\n... truncated at " + str(max_chars) + " chars";
+}
+
+fn _traces() {
+    let raw = try FS.read(TRACE_PATH) catch "";
+    let lines = str_split(raw, "\n");
+    let out = [];
+    for i len(lines) {
+        let t = str_trim(lines[i]);
+        if t != "" {
+            let v = try JSON.parse(t) catch nil;
+            if v != nil { out[len(out)] = v; }
+        }
+    }
+    return out;
+}
+
+fn _append_trace(row) {
+    _ensure_dir();
+    FS.append(TRACE_PATH, JSON.stringify(row) + "\n");
+    return row;
+}
+
+fn _trace_id() {
+    return "trace-" + str(_now_ms()) + "-" + str(len(_traces()) + 1);
+}
+
+fn debug_trace_run(args) {
+    if args == nil { args = map{}; }
+    let program = _safe_program(try args.program catch try args.command catch "");
+    let argv = try args.argv catch [];
+    let dry = try args.dry_run catch true;
+    let supplied_output = try args.output catch try args.stdout catch nil;
+    let row = map{
+        id: _trace_id(),
+        ts_ms: _now_ms(),
+        program: program,
+        argv: argv,
+        dry_run: dry,
+        executed: false,
+        stdout: if supplied_output == nil { "" } else { str(supplied_output) },
+        stderr: str(try args.stderr catch ""),
+        exit_code: try args.exit_code catch nil,
+        status: if supplied_output == nil { "planned" } else { "recorded" },
+    };
+    _append_trace(row);
+    return row;
+}
+
+fn _find_trace(id) {
+    let rows = _traces();
+    for i len(rows) {
+        if str(try rows[i].id catch "") == id { return rows[i]; }
+    }
+    return nil;
+}
+
+fn debug_replay_run(args) {
+    if args == nil { args = map{}; }
+    let id = str(try args.trace_id catch try args.id catch "");
+    let row = _find_trace(id);
+    if row == nil { return map{ ok: false, error: "trace not found", trace_id: id }; }
+    return map{ ok: true, trace: row, dry_run: true, replay_plan: [row.program, try row.argv catch []], message: "pblang replay is a dry-run plan; it does not re-execute commands" };
+}
+
+fn _failure_key(text) {
+    let s = str_lower(str(text));
+    if str_contains(s, "permission") { return "permission"; }
+    if str_contains(s, "not found") or str_contains(s, "no such file") { return "not-found"; }
+    if str_contains(s, "timeout") { return "timeout"; }
+    if str_contains(s, "panic") { return "panic"; }
+    if str_contains(s, "syntax") or str_contains(s, "parse") { return "syntax-parse"; }
+    if str_contains(s, "failed") or str_contains(s, "error") { return "generic-error"; }
+    return "unknown";
+}
+
+fn debug_failure_cluster(args) {
+    if args == nil { args = map{}; }
+    let rows = try args.traces catch _traces();
+    let groups = map{};
+    for i len(rows) {
+        let txt = str(try rows[i].stderr catch "") + "\n" + str(try rows[i].stdout catch "") + "\n" + str(try rows[i].error catch "");
+        let key = _failure_key(txt);
+        let arr = try groups[key] catch [];
+        arr[len(arr)] = try rows[i].id catch "input-" + str(i + 1);
+        groups[key] = arr;
+    }
+    let keys = map_keys(groups);
+    let out = [];
+    for i len(keys) { out[len(out)] = map{ cluster: keys[i], trace_ids: groups[keys[i]], count: len(groups[keys[i]]) }; }
+    return out;
+}
+
+fn debug_root_cause_report(args) {
+    if args == nil { args = map{}; }
+    let id = str(try args.trace_id catch try args.id catch "");
+    let row = if id == "" { try args.trace catch nil } else { _find_trace(id) };
+    let text = "";
+    if row != nil { text = str(try row.stderr catch "") + "\n" + str(try row.stdout catch ""); }
+    else { text = str(try args.text catch ""); }
+    let key = _failure_key(text);
+    let actions = [];
+    if key == "permission" { actions = ["check file permissions and capability gate", "avoid broad sudo escalation", "verify path is under project root"]; }
+    else if key == "not-found" { actions = ["verify command/path exists", "check cwd and generated file paths", "add a preflight existence check"]; }
+    else if key == "timeout" { actions = ["reduce input size", "add timeout cap", "split work into smaller calls"]; }
+    else if key == "syntax-parse" { actions = ["minimize repro", "run syntax check", "inspect generated code around reported line"]; }
+    else { actions = ["inspect stdout/stderr", "add focused regression test", "rerun with smaller input"]; }
+    return map{ ok: true, trace_id: id, cluster: key, summary: _clip(text, 800), suggested_actions: actions };
+}
+
+fn call_debug(tool, args) {
+    if tool == "debug_trace_run" { return debug_trace_run(args); }
+    if tool == "debug_replay_run" { return debug_replay_run(args); }
+    if tool == "debug_failure_cluster" { return debug_failure_cluster(args); }
+    if tool == "debug_root_cause_report" { return debug_root_cause_report(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    return ["debug_trace_run", "debug_replay_run", "debug_failure_cluster", "debug_root_cause_report"];
+}
+
+export implemented_tools, call_debug,
+       debug_trace_run, debug_replay_run, debug_failure_cluster,
+       debug_root_cause_report;
