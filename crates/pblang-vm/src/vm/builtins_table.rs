@@ -505,6 +505,11 @@ pub(super) fn build() -> Vec<BuiltinFn> {
             fun: net::tcp_listen,
         },
         BuiltinFn {
+            name: "tcp_connect",
+            arity: Some(1),
+            fun: net::tcp_connect,
+        },
+        BuiltinFn {
             name: "tcp_accept",
             arity: Some(1),
             fun: net::tcp_accept,
