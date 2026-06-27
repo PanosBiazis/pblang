@@ -1,4 +1,4 @@
-// stdlib/web_framework.sapp — Full web framework combining routing, middleware, 
+// stdlib/web_framework.sapp — Full web framework combining routing, middleware,
 // templating, sessions, CORS, static files, and JSON APIs.
 //
 // This is the "batteries-included" web framework for pblang, inspired by
@@ -10,9 +10,13 @@
 //   web.get(app, "/", fn(ctx) { return ctx.json(map{ hello: "world" }); });
 //   web.get(app, "/users/:id", fn(ctx) { return ctx.text("User " + ctx.params.id); });
 //   web.post(app, "/api/data", fn(ctx) { return ctx.json(map{ received: ctx.body }); });
-//   web.use(app, web.cors());
+//   web.put(app, "/api/data/:id", fn(ctx) { return ctx.json(map{ updated: ctx.params.id }); });
+//   let api = web.group(app, "/api/v1");           // prefixed route group
+//   web.get(api, "/health", fn(ctx) { return ctx.json(map{ up: true }); });
+//   web.use(app, web.cors(map{ origin: "https://example.com" }));
 //   web.use(app, web.logger());
 //   web.listen(app);
+//   // testing, no socket:  web.handle(app, map{ method: "GET", path: "/", headers: map{}, body: "" })
 
 let server = import("stdlib:http_server.sapp");
 let tmpl = import("stdlib:template.sapp");
@@ -31,6 +35,7 @@ fn create_app(config = nil) {
             view_dir: try config.view_dir catch "./views",
             session_secret: try config.session_secret catch nil
         },
+        _prefix: "",
         _middleware: [],
         _error_handler: nil
     };
@@ -38,20 +43,40 @@ fn create_app(config = nil) {
 
 // Context builder — wraps request with convenience methods.
 fn _make_context(req, app) {
+    // Eagerly parse the JSON body once (nil when absent or not valid JSON).
+    let raw_body = try req.body catch "";
+    let parsed_body = nil;
+    if raw_body != nil and raw_body != "" { parsed_body = try json_parse(raw_body) catch nil; }
+
     return map{
         request: req,
         method: req.method,
         path: req.path,
-        query: req.query,
+        query: try req.query catch map{},
         params: try req.params catch map{},
         headers: try req.headers catch map{},
         body: try req.body catch "",
+        body_json: parsed_body,
         cookies: try server.cookies(req) catch map{},
-        
+
+        // header(name) — case-insensitive request header lookup (nil when absent).
+        header: fn(name) {
+            let hs = try req.headers catch map{};
+            let want = str_lower(str(name));
+            let ks = map_keys(hs);
+            let i = 0;
+            while i < len(ks) {
+                if str_lower(str(ks[i])) == want { return hs[ks[i]]; }
+                i = i + 1;
+            }
+            return nil;
+        },
+
         // Response helpers
         json: fn(data) { return server.res.ok_json(data); },
         text: fn(body) { return server.res.ok_text(body); },
         html: fn(body) { return map{ status: 200, body: body, content_type: "text/html" }; },
+        no_content: fn() { return map{ status: 204, body: "" }; },
         status: fn(code) {
             return map{
                 json: fn(data) { return server.res_json(code, data); },
@@ -75,22 +100,43 @@ fn _make_context(req, app) {
     };
 }
 
-// get(app, path, handler) — register a GET route.
-fn get(app, path, handler) {
-    server.app_get(app._app, path, fn(req) {
+// ── Routing ───────────────────────────────────────────────────────────────────
+
+// route(app, method, path, handler) — register a route for any HTTP method.
+// `app` may be a base app OR a group() (whose _prefix is prepended to `path`).
+fn route(app, method, path, handler) {
+    let full = (try app._prefix catch "") + path;
+    server.app_route(app._app, method, full, fn(req) {
         let ctx = _make_context(req, app);
         return handler(ctx);
     });
     return app;
 }
 
-// post(app, path, handler) — register a POST route.
-fn post(app, path, handler) {
-    server.app_post(app._app, path, fn(req) {
-        let ctx = _make_context(req, app);
-        return handler(ctx);
-    });
+fn get(app, path, handler) { return route(app, "GET", path, handler); }
+fn post(app, path, handler) { return route(app, "POST", path, handler); }
+fn put(app, path, handler) { return route(app, "PUT", path, handler); }
+fn patch(app, path, handler) { return route(app, "PATCH", path, handler); }
+fn delete(app, path, handler) { return route(app, "DELETE", path, handler); }
+
+// any(app, path, handler) — register the handler for every common HTTP method.
+fn any(app, path, handler) {
+    let methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"];
+    let i = 0;
+    while i < len(methods) { route(app, methods[i], path, handler); i = i + 1; }
     return app;
+}
+
+// group(app, prefix) — a route group sharing the same underlying server app, with
+// `prefix` (combined with any existing prefix) prepended to all its routes.
+fn group(app, prefix) {
+    return map{
+        _app: app._app,
+        config: app.config,
+        _prefix: (try app._prefix catch "") + prefix,
+        _middleware: app._middleware,
+        _error_handler: app._error_handler
+    };
 }
 
 // use(app, middleware_fn) — add global middleware.
@@ -99,26 +145,51 @@ fn use(app, mw_fn) {
     return app;
 }
 
+// handle(app, req) — dispatch a request in-process (no socket). Ideal for tests
+// and for embedding the app behind another transport.
+fn handle(app, req) {
+    return server.app_handle(app._app, req);
+}
+
 // ── Built-in Middleware ───────────────────────────────────────────────────────
 
-// cors() — CORS middleware allowing all origins.
-fn cors() {
-    return fn(req) {
-        // For preflight OPTIONS requests
-        if req.method == "OPTIONS" {
-            return map{
-                status: 204,
-                body: "",
-                headers: map{
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,PATCH,OPTIONS",
-                    "Access-Control-Allow-Headers": "Content-Type,Authorization",
-                    "Access-Control-Max-Age": "86400"
-                }
-            };
-        }
-        return nil;  // continue to next middleware/route
+// _cors_headers(opts) — build the CORS header map.
+// opts: { origin, methods, headers, max_age, credentials }
+fn _cors_headers(opts) {
+    if opts == nil { opts = map{}; }
+    let h = map{
+        "Access-Control-Allow-Origin": try opts.origin catch "*",
+        "Access-Control-Allow-Methods": try opts.methods catch "GET,POST,PUT,DELETE,PATCH,OPTIONS",
+        "Access-Control-Allow-Headers": try opts.headers catch "Content-Type,Authorization",
+        "Access-Control-Max-Age": str(try opts.max_age catch "86400")
     };
+    if (try opts.credentials catch false) { h["Access-Control-Allow-Credentials"] = "true"; }
+    return h;
+}
+
+// cors(opts) — CORS preflight middleware. Answers OPTIONS with 204 + headers and
+// lets every other request continue. (Attach headers to real responses with
+// with_cors(), since this middleware model is guard-only / response-blind.)
+fn cors(opts = nil) {
+    return fn(req) {
+        if req.method == "OPTIONS" {
+            return map{ status: 204, body: "", headers: _cors_headers(opts) };
+        }
+        return nil;
+    };
+}
+
+// with_cors(res, opts) — merge CORS headers into an existing response.
+fn with_cors(res, opts = nil) {
+    let h = try res.headers catch map{};
+    let ch = _cors_headers(opts);
+    h["Access-Control-Allow-Origin"]  = ch["Access-Control-Allow-Origin"];
+    h["Access-Control-Allow-Methods"] = ch["Access-Control-Allow-Methods"];
+    h["Access-Control-Allow-Headers"] = ch["Access-Control-Allow-Headers"];
+    h["Access-Control-Max-Age"]       = ch["Access-Control-Max-Age"];
+    if map_has(ch, "Access-Control-Allow-Credentials") { h["Access-Control-Allow-Credentials"] = "true"; }
+    res.headers = h;
+    return res;
 }
 
 // logger() — request logging middleware.
@@ -129,7 +200,7 @@ fn rate_limit(max_req, window_ms) {
     return server.mw_rate_limit(max_req, window_ms);
 }
 
-// json_body() — middleware that parses JSON body.
+// json_body() — middleware that parses a JSON body onto req.json_body.
 fn json_body() {
     return fn(req) {
         if req.body != nil and req.body != "" {
@@ -153,6 +224,9 @@ fn auth_bearer(validator_fn) {
         if len(parts) < 2 {
             return server.res_json(401, map{ error: "invalid authorization header" });
         }
+        if str_lower(parts[0]) != "bearer" {
+            return server.res_json(401, map{ error: "invalid authorization scheme" });
+        }
         let token = parts[1];
         let valid = try validator_fn(token) catch false;
         if valid == false {
@@ -163,12 +237,12 @@ fn auth_bearer(validator_fn) {
     };
 }
 
-// static_files(dir) — serve static files from a directory.
+// static_files(dir) — serve static files from a directory (path-traversal safe via
+// http_server._path_safe; non-200 results fall through to routes).
 fn static_files(dir) {
     return fn(req) {
         if req.method != "GET" { return nil; }
         let path = try req.path catch "/";
-        // Only handle /static/* or direct file paths
         let response = server.static_file_response(dir, path);
         if response.status == 200 { return response; }
         return nil;  // not found in static dir, continue to routes
@@ -181,13 +255,13 @@ fn static_files(dir) {
 fn listen(app) {
     let addr = app.config.host + ":" + str(app.config.port);
     print "🚀 Server listening on http://" + addr;
-    
+
     // If static_dir is configured, add static file middleware
     let static_dir = try app.config.static_dir catch nil;
     if static_dir != nil {
         server.app_use(app._app, static_files(static_dir));
     }
-    
+
     server.serve_forever_app(addr, app._app);
 }
 
@@ -205,5 +279,6 @@ fn on_error(app, handler_fn) {
     return app;
 }
 
-export create_app, get, post, use, cors, logger, rate_limit,
-       json_body, auth_bearer, static_files, listen, listen_once, on_error;
+export create_app, route, get, post, put, patch, delete, any, group, use, handle,
+       cors, with_cors, logger, rate_limit, json_body, auth_bearer, static_files,
+       listen, listen_once, on_error;
