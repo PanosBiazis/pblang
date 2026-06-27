@@ -9,6 +9,40 @@
 // Each part begins with "--<boundary>\r\n", has headers separated from the
 // body by "\r\n\r\n", and ends before the next "--<boundary>" delimiter.
 
+// _is_ident_char(c) — letter/digit/underscore (for parameter-boundary checks).
+fn _is_ident_char(c) {
+    if c == "" { return false; }
+    return str_index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", c) >= 0;
+}
+
+// _get_param(line, name) — value of a quoted Content-Disposition parameter
+// (name="..."), or nil. The match must be at a PARAMETER boundary (start of line,
+// or preceded by a space/semicolon/tab) so `name=` is NOT matched inside
+// `filename=` regardless of parameter order.
+fn _get_param(line, name) {
+    let marker = name + "=\"";
+    let from = 0;
+    while from <= len(line) {
+        let idx = str_index_of(str_slice(line, from, len(line)), marker);
+        if idx < 0 { return nil; }
+        let abs = from + idx;
+        let at_boundary = abs == 0;
+        if not at_boundary {
+            let prev = str_slice(line, abs - 1, abs);
+            if not _is_ident_char(prev) { at_boundary = true; }
+        }
+        if at_boundary {
+            let vstart = abs + len(marker);
+            let rest = str_slice(line, vstart, len(line));
+            let vend = str_index_of(rest, "\"");
+            if vend < 0 { return nil; }
+            return str_slice(rest, 0, vend);
+        }
+        from = abs + len(marker);
+    }
+    return nil;
+}
+
 fn _parse_headers(header_block) {
     // Parse a block of MIME headers and return a map with name, filename, content_type.
     let result = map{ name: nil, filename: nil, content_type: "application/octet-stream" };
@@ -19,26 +53,8 @@ fn _parse_headers(header_block) {
         let line_lower = str_lower(line);
 
         if str_contains(line_lower, "content-disposition") {
-            // Extract name="..."
-            if str_contains(line, "name=\"") {
-                let name_start = str_index_of(line, "name=\"");
-                let v_start = name_start + 6;
-                let rest = str_slice(line, v_start, len(line));
-                let v_end = str_index_of(rest, "\"");
-                if v_end >= 0 {
-                    result.name = str_slice(rest, 0, v_end);
-                }
-            }
-            // Extract filename="..."
-            if str_contains(line, "filename=\"") {
-                let fn_start = str_index_of(line, "filename=\"");
-                let v_start = fn_start + 10;
-                let rest = str_slice(line, v_start, len(line));
-                let v_end = str_index_of(rest, "\"");
-                if v_end >= 0 {
-                    result.filename = str_slice(rest, 0, v_end);
-                }
-            }
+            result.name = _get_param(line, "name");
+            result.filename = _get_param(line, "filename");
         }
 
         if str_contains(line_lower, "content-type:") {
@@ -103,4 +119,94 @@ fn parse(body, boundary) {
     return parts;
 }
 
-export parse;
+// boundary_from_content_type(ct) — pull the boundary out of a Content-Type header
+// value ("multipart/form-data; boundary=----xyz", quoted or not), or nil.
+fn boundary_from_content_type(ct) {
+    if ct == nil { return nil; }
+    let marker = "boundary=";
+    let idx = str_index_of(ct, marker);
+    if idx < 0 { return nil; }
+    let rest = str_trim(str_slice(ct, idx + len(marker), len(ct)));
+    if str_starts_with(rest, "\"") {
+        let inner = str_slice(rest, 1, len(rest));
+        let q = str_index_of(inner, "\"");
+        if q >= 0 { return str_slice(inner, 0, q); }
+        return inner;
+    }
+    // unquoted: ends at the next ";" or whitespace
+    let semi = str_index_of(rest, ";");
+    if semi >= 0 { rest = str_slice(rest, 0, semi); }
+    return str_trim(rest);
+}
+
+// fields(parts) — map of name -> body for the NON-file parts (plain form fields).
+fn fields(parts) {
+    let out = map{};
+    let i = 0;
+    while i < len(parts) {
+        let p = parts[i];
+        if (try p.filename catch nil) == nil and (try p.name catch nil) != nil {
+            out[p.name] = p.body;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// files(parts) — map of name -> { filename, content_type, body } for file parts.
+fn files(parts) {
+    let out = map{};
+    let i = 0;
+    while i < len(parts) {
+        let p = parts[i];
+        if (try p.filename catch nil) != nil and (try p.name catch nil) != nil {
+            out[p.name] = map{ filename: p.filename, content_type: p.content_type, body: p.body };
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// find(parts, name) — the first part with the given field name, or nil.
+fn find(parts, name) {
+    let i = 0;
+    while i < len(parts) {
+        if (try parts[i].name catch nil) == name { return parts[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// build(text_fields, file_parts, boundary) — encode a multipart/form-data body.
+// text_fields: map{ name: value }; file_parts: array of
+// { name, filename, content_type?, body }. Round-trips with parse().
+fn build(text_fields, file_parts, boundary) {
+    let out = "";
+    if text_fields != nil {
+        let ks = map_keys(text_fields);
+        let i = 0;
+        while i < len(ks) {
+            out = out + "--" + boundary + "\r\n";
+            out = out + "Content-Disposition: form-data; name=\"" + str(ks[i]) + "\"\r\n\r\n";
+            out = out + str(text_fields[ks[i]]) + "\r\n";
+            i = i + 1;
+        }
+    }
+    if file_parts != nil {
+        let j = 0;
+        while j < len(file_parts) {
+            let f = file_parts[j];
+            let ct = try f.content_type catch "application/octet-stream";
+            if ct == nil { ct = "application/octet-stream"; }
+            out = out + "--" + boundary + "\r\n";
+            out = out + "Content-Disposition: form-data; name=\"" + str(f.name) + "\"; filename=\"" + str(try f.filename catch "file") + "\"\r\n";
+            out = out + "Content-Type: " + str(ct) + "\r\n\r\n";
+            out = out + str(f.body) + "\r\n";
+            j = j + 1;
+        }
+    }
+    out = out + "--" + boundary + "--\r\n";
+    return out;
+}
+
+export parse, boundary_from_content_type, fields, files, find, build;
