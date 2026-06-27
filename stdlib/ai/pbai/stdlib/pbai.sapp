@@ -1,0 +1,1146 @@
+// stdlib/pbai.sapp — pbAI: pblang's own AI assistant, written entirely in pblang.
+//
+// NO external model, NO network, NO Ollama — this IS pblang's intelligence. It pairs a
+// small **neural intent classifier** (a `nn.sapp` MLP — the genuine pbAI model) with
+// pblang-grounded **skills** that inspect the code and compose an answer. Its edge is
+// that it knows pblang's *own* specifics (gotchas, idioms) an outside model wouldn't.
+//
+//   let pbai = import("stdlib/pbai.sapp");
+//   pbai.respond("Explain what this does:\n\nfn main() { print \"hi\"; }");
+//   pbai.respond_tool("ai_self_critique", promptText);   // tool hint overrides routing
+//
+// This is the pbAI foundation that backs the IDE 🤖 AI panel. Generative scale-up
+// (a full pblang language model) is the roadmap (docs/pbAI.md); the assistant skills
+// here are useful today and 100% pblang.
+
+let nn = import("stdlib:nn.sapp");
+let MCP = import("stdlib:pb_mcp.sapp");
+let PBAI_ASSETS = import("stdlib/pbai_assets.sapp");
+let PBAI_LM = import("stdlib/pbai_lm.sapp");
+let PBAI_TOKENIZER = import("stdlib/pbai_tokenizer.sapp");
+let PBAI_BPE = import("stdlib/pbai_bpe.sapp");
+let PBAI_ACCEL = import("stdlib/pbai_accel.sapp");
+let PBAI_QUANT = import("stdlib/pbai_quant.sapp");
+let PBAI_BRAIN = import("stdlib/pbai_brain.sapp");
+let PBAI_TOOLS = import("stdlib/pbai_tools.sapp");
+let PBAI_INGEST = import("stdlib/pbai_ingest.sapp");
+let PBAI_MAX = import("stdlib/pbai_max.sapp");
+let PBAI_CACHE = import("stdlib/pbai_cache.sapp");
+
+// ── Text utilities ───────────────────────────────────────────────────────────────────
+fn _count(s, sub) {
+    if sub == "" { return 0; }
+    return len(str_split(s, sub)) - 1;
+}
+
+// ── Neural intent classifier (the pbAI model) ────────────────────────────────────────
+// Bag-of-keywords features → an MLP → one of 5 intents. Trained once, in pblang.
+let _VOCAB = ["explain", "what", "does", "describe", "step", "bug", "error",
+    "wrong", "mistake", "fix", "issue", "improve", "better", "optimize",
+    "refactor", "comment", "document", "how", "why", "generate", "write", "review",
+    "security", "sandbox", "capability", "ide", "browser", "typeclass", "logic", "reactive",
+    "test", "quality", "learn", "memory", "performance", "summarize"];
+
+// intent ids: 0 explain  1 bugs  2 improve  3 comment  4 general
+let _INTENTS = ["explain", "bugs", "improve", "comment", "general"];
+
+fn _featurize(text) {
+    let t = str_lower(text);
+    let v = [];
+    let i = 0;
+    while i < len(_VOCAB) {
+        if str_contains(t, _VOCAB[i]) { v[i] = 1; } else { v[i] = 0; }
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _onehot(idx, n) {
+    let v = [];
+    let i = 0;
+    while i < n { if i == idx { v[i] = 1; } else { v[i] = 0; } i = i + 1; }
+    return v;
+}
+
+// Trained weights are CACHED on disk so the model loads (fast) instead of retraining
+// (~21 s) on every fresh process — train-once, load-forever. The cache is guarded by the
+// vocabulary size, so a model change retrains automatically.
+let _WPATH = "stdlib/pbai_model.json";
+let _MODEL = nil;
+fn _train_model() {
+    let net = nn.mlp_new(len(_VOCAB), 14, 5, 42);
+    let data = [
+        nn.sample(_featurize("explain what this code does"), _onehot(0, 5)),
+        nn.sample(_featurize("describe this program step by step"), _onehot(0, 5)),
+        nn.sample(_featurize("find the bugs and errors in this"), _onehot(1, 5)),
+        nn.sample(_featurize("what is wrong mistake issue with this code"), _onehot(1, 5)),
+        nn.sample(_featurize("improve and optimize refactor this code"), _onehot(2, 5)),
+        nn.sample(_featurize("make this better"), _onehot(2, 5)),
+        nn.sample(_featurize("add comments and document this code"), _onehot(3, 5)),
+        nn.sample(_featurize("how does pblang work and why"), _onehot(4, 5)),
+        nn.sample(_featurize("generate write create a program"), _onehot(4, 5))
+    ];
+    nn.train(net, data, 500, 0.3);
+    return net;
+}
+fn _model() {
+    if _MODEL != nil { return _MODEL; }
+    let cached = try json_parse(fs_read(_WPATH)) catch nil;
+    if cached != nil and (try cached.l1.n_in catch 0) == len(_VOCAB) {
+        _MODEL = cached;
+        return cached;
+    }
+    let net = _train_model();
+    try fs_write(_WPATH, json_stringify(net)) catch nil;   // cache for next time
+    _MODEL = net;
+    return net;
+}
+
+// classify(prompt) — the pbAI model's intent prediction (0..4).
+fn classify(prompt) {
+    return nn.argmax(nn.predict(_model(), _featurize(prompt)));
+}
+
+fn classify_scores(prompt) {
+    let y = nn.predict(_model(), _featurize(prompt));
+    return map{
+        intent: _INTENTS[nn.argmax(y)],
+        scores: y,
+    };
+}
+
+// ── Code inspection (grounded analysis) ──────────────────────────────────────────────
+// Pull the code out of an IDE prompt: prefer the part after a fenced/labelled marker,
+// else everything after the first blank line, else the whole text.
+fn _extract_code(prompt) {
+    let label = "--- pblang code ---";
+    let labelled = str_index_of(prompt, label);
+    if labelled >= 0 {
+        return str_trim(str_slice(prompt, labelled + len(label), len(prompt)));
+    }
+
+    let fence = str_index_of(prompt, "```");
+    if fence >= 0 {
+        let rest = str_slice(prompt, fence + 3, len(prompt));
+        let close = str_index_of(rest, "```");
+        if close >= 0 { rest = str_slice(rest, 0, close); }
+        rest = str_trim(rest);
+        let nl0 = str_index_of(rest, "\n");
+        if nl0 > 0 {
+            let first = str_trim(str_slice(rest, 0, nl0));
+            if first == "pblang" or first == "sapp" or first == "pb" {
+                rest = str_trim(str_slice(rest, nl0 + 1, len(rest)));
+            }
+        }
+        return rest;
+    }
+    let nl = str_index_of(prompt, "
+
+");
+    if nl >= 0 { return str_trim(str_slice(prompt, nl, len(prompt))); }
+    return str_trim(prompt);
+}
+
+fn _looks_like_map_index_read(code) {
+    return (str_contains(code, "map{") or str_contains(code, "map =") or str_contains(code, "map="))
+        and str_contains(code, "[")
+        and not str_contains(code, "map_has");
+}
+
+fn _looks_like_missing_fn(code) {
+    let t = str_trim(code);
+    if str_starts_with(t, "fn ") or str_starts_with(t, "export fn ") { return false; }
+    let paren = str_index_of(t, "(");
+    let br = str_index_of(t, "{");
+    return paren > 0 and br > paren;
+}
+
+fn _looks_like_missing_let_equals(code) {
+    let parts = str_split(code, "let ");
+    let i = 1;
+    while i < len(parts) {
+        let stmt = parts[i];
+        let semi = str_index_of(stmt, ";");
+        if semi >= 0 { stmt = str_slice(stmt, 0, semi); }
+        if str_index_of(stmt, "=") < 0 and str_index_of(stmt, "(") > 0 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _looks_like_fs_name_typo(code) {
+    return str_contains(code, "fs read(") or str_contains(code, "fs write(");
+}
+
+fn _repair_print_parens(code) {
+    let out = "";
+    let i = 0;
+    while i < len(code) {
+        if str_slice(code, i, i + 6) == "print(" {
+            let expr_start = i + 6;
+            let j = expr_start;
+            let depth = 1;
+            while j < len(code) and depth > 0 {
+                let c = strcharcodeat(code, j);
+                if c == 40 { depth = depth + 1; }       // '('
+                else if c == 41 { depth = depth - 1; }  // ')'
+                if depth > 0 { j = j + 1; }
+            }
+            if depth == 0 {
+                let k = j + 1;
+                while k < len(code) and (strcharcodeat(code, k) == 32 or strcharcodeat(code, k) == 9) { k = k + 1; }
+                if k < len(code) and strcharcodeat(code, k) == 59 {
+                    out = out + "print " + str_trim(str_slice(code, expr_start, j)) + ";";
+                    i = k + 1;
+                } else {
+                    out = out + str_slice(code, i, j + 1);
+                    i = j + 1;
+                }
+            } else {
+                out = out + str_slice(code, i, i + 1);
+                i = i + 1;
+            }
+        } else {
+            out = out + str_slice(code, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _last_nonempty(parts) {
+    let i = len(parts) - 1;
+    while i >= 0 {
+        let p = str_trim(parts[i]);
+        if p != "" { return p; }
+        i = i - 1;
+    }
+    return "";
+}
+
+fn _first_nonempty(parts) {
+    let i = 0;
+    while i < len(parts) {
+        let p = str_trim(parts[i]);
+        if p != "" { return p; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn _repair_let_missing_equals(code) {
+    let parts = str_split(code, "let ");
+    if len(parts) <= 1 { return code; }
+    let out = parts[0];
+    let i = 1;
+    while i < len(parts) {
+        let seg = parts[i];
+        let semi = str_index_of(seg, ";");
+        let stmt = seg;
+        let tail = "";
+        let had_semi = false;
+        if semi >= 0 {
+            stmt = str_slice(seg, 0, semi);
+            tail = str_slice(seg, semi + 1, len(seg));
+            had_semi = true;
+        }
+        let candidate = str_trim(stmt);
+        if str_index_of(candidate, "=") < 0 and str_index_of(candidate, "(") > 0 {
+            let paren = str_index_of(candidate, "(");
+            let before = str_trim(str_slice(candidate, 0, paren));
+            let bits = str_split(before, " ");
+            let name = _first_nonempty(bits);
+            let callee = _last_nonempty(bits);
+            if name != "" and callee != "" and name != callee {
+                candidate = name + " = " + callee + str_slice(candidate, paren, len(candidate));
+            }
+        }
+        out = out + "let " + candidate;
+        if had_semi { out = out + ";" + tail; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _repair_preview(code) {
+    let out = str_trim(code);
+    out = _repair_print_parens(out);
+    out = str_replace_all(out, "fs read(", "fs_read(");
+    out = str_replace_all(out, "fs write(", "fs_write(");
+    out = _repair_let_missing_equals(out);
+    if _looks_like_missing_fn(out) { out = "fn " + out; }
+    return out;
+}
+
+fn _fn_names(code) {
+    let parts = str_split(code, "fn ");
+    let names = "";
+    let i = 1;
+    while i < len(parts) {
+        let p = parts[i];
+        let paren = str_index_of(p, "(");
+        if paren > 0 {
+            let nm = str_trim(str_slice(p, 0, paren));
+            if nm != "" { if names == "" { names = nm; } else { names = names + ", " + nm; } }
+        }
+        i = i + 1;
+    }
+    return names;
+}
+
+// deepest `{` nesting depth — a proxy for cyclomatic complexity / readability.
+fn _max_depth(code) {
+    let d = 0; let mx = 0; let i = 0;
+    while i < len(code) {
+        let c = strcharcodeat(code, i);
+        if c == 123 { d = d + 1; if d > mx { mx = d; } }   // '{'
+        else if c == 125 { if d > 0 { d = d - 1; } }       // '}'
+        i = i + 1;
+    }
+    return mx;
+}
+// heuristic: does any function call its own name inside its body? (recursion)
+fn _has_recursion(code) {
+    let parts = str_split(code, "fn ");
+    let i = 1;
+    while i < len(parts) {
+        let p = parts[i];
+        let paren = str_index_of(p, "(");
+        let br = str_index_of(p, "{");
+        if paren > 0 and br > paren {
+            let nm = str_trim(str_slice(p, 0, paren));
+            if nm != "" and str_contains(str_slice(p, br, len(p)), nm + "(") { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _scan(code) {
+    let lc = str_lower(code);
+    return map{
+        fns: _count(code, "fn "),
+        lets: _count(code, "let ") + _count(code, "const "),
+        whiles: _count(code, "while "),
+        fors: _count(code, "for "),
+        ifs: _count(code, "if "),
+        structs: _count(code, "struct "),
+        classes: _count(code, "class "),
+        enums: _count(code, "enum "),
+        matches: _count(code, "match "),
+        prints: _count(code, "print"),
+        tries: _count(code, "try "),
+        imports: _count(code, "import("),
+        closures: _count(code, "fn("),
+        returns: _count(code, "return"),
+        execs: _count(code, "proc_spawn") + _count(code, "exec(") + _count(code, "polyglot_exec"),
+        ffi: _count(code, "ffi_") + _count(code, "import(\"stdlib:ffi"),
+        http: _count(code, "http_get") + _count(code, "http_post") + _count(code, "import(\"stdlib:http"),
+        fs: _count(code, "fs_read") + _count(code, "fs_write") + _count(code, "import(\"stdlib:fs"),
+        env: _count(code, "env_get") + _count(code, "env_set"),
+        todos: _count(lc, "todo") + _count(lc, "fixme"),
+        open_brace: _count(code, "{"), close_brace: _count(code, "}"),
+        open_paren: _count(code, "("), close_paren: _count(code, ")"),
+        open_brack: _count(code, "["), close_brack: _count(code, "]"),
+        lines: _count(code, "\n") + 1,
+        depth: _max_depth(code),
+        recursion: _has_recursion(code)
+    };
+}
+
+fn _quality_score(s) {
+    let score = 100;
+    score = score - s.todos * 12;
+    score = score - s.depth * 5;
+    score = score - (s.whiles + s.fors) * 2;
+    score = score - s.ifs;
+    if s.open_brace != s.close_brace { score = score - 30; }
+    if s.open_paren != s.close_paren { score = score - 30; }
+    if s.open_brack != s.close_brack { score = score - 30; }
+    if score < 0 { score = 0; }
+    if score > 100 { score = 100; }
+    return score;
+}
+
+fn _risk_summary(s) {
+    let caps = [];
+    if s.fs > 0 { array_push(caps, "fs"); }
+    if s.http > 0 { array_push(caps, "http"); }
+    if s.execs > 0 { array_push(caps, "exec"); }
+    if s.ffi > 0 { array_push(caps, "ffi"); }
+    if s.env > 0 { array_push(caps, "env"); }
+    if len(caps) == 0 { return "no obvious sensitive capability use"; }
+    let out = "";
+    for i len(caps) {
+        if i > 0 { out = out + ", "; }
+        out = out + caps[i];
+    }
+    return "uses sensitive capability area(s): " + out;
+}
+
+fn _confidence_score(code, s) {
+    let score = 58;
+    if _has_code(code, s) { score = score + 18; }
+    if s.fns > 0 { score = score + 8; }
+    if s.open_brace == s.close_brace and s.open_paren == s.close_paren and s.open_brack == s.close_brack { score = score + 8; }
+    if s.fs > 0 or s.http > 0 or s.execs > 0 or s.ffi > 0 or s.env > 0 { score = score - 8; }
+    if s.depth >= 5 { score = score - 6; }
+    if score < 0 { score = 0; }
+    if score > 99 { score = 99; }
+    return score;
+}
+
+fn _review_findings(code, s) {
+    let findings = [];
+    if _looks_like_missing_fn(code) { push(findings, "missing function keyword before a function-like block"); }
+    if _looks_like_missing_let_equals(code) { push(findings, "missing assignment operator in a let binding"); }
+    if _looks_like_fs_name_typo(code) { push(findings, "filesystem builtin is misspelled as spaced words"); }
+    if s.open_brace != s.close_brace { push(findings, "unbalanced braces"); }
+    if s.open_paren != s.close_paren { push(findings, "unbalanced parentheses"); }
+    if s.open_brack != s.close_brack { push(findings, "unbalanced brackets"); }
+    if str_contains(code, "print(") { push(findings, "invalid print call form; print is a statement"); }
+    if str_contains(code, ".method(") or _count(code, ").") > 0 { push(findings, "possible UFCS-style method call; pblang uses free functions or colon calls"); }
+    if str_contains(code, "\" <") or str_contains(code, "\" >") or str_contains(code, "< \"") or str_contains(code, "> \"") { push(findings, "unsupported string ordering comparison"); }
+    if _looks_like_map_index_read(code) { push(findings, "dynamic map read should be guarded with map_has"); }
+    if (s.fs > 0 or s.http > 0 or s.imports > 0) and s.tries == 0 { push(findings, "fallible I/O/import path has no try/catch"); }
+    if s.execs > 0 and str_contains(code, "+") { push(findings, "process command appears dynamically composed; review injection risk"); }
+    if s.execs > 0 { push(findings, "process execution requires explicit capability review"); }
+    if s.ffi > 0 { push(findings, "FFI requires high-trust native-code capability review"); }
+    if s.env > 0 { push(findings, "environment access can expose secrets"); }
+    if s.fns > 0 and s.returns == 0 { push(findings, "function body has no explicit return"); }
+    if s.recursion and not (str_contains(code, "<=") or str_contains(code, ">=") or str_contains(code, "==")) { push(findings, "recursive function has no obvious base-case comparison"); }
+    if s.todos > 0 { push(findings, "TODO/FIXME markers remain"); }
+    return findings;
+}
+
+fn _live_memory_matches(prompt) {
+    let live = PBAI_LM.live_corpus();
+    let p = str_lower(prompt);
+    let exact = str_trim(p);
+    let matches = [];
+    if str_trim(live) == "" { return matches; }
+    let memory_query = str_contains(p, "what did i teach") or str_contains(p, "learned") or str_contains(p, "memory") or str_contains(p, "recall");
+    let samples = str_split(live, "### learned sample");
+    let words = str_split(p, " ");
+    let i = 0;
+    while i < len(samples) {
+        let sample = str_trim(samples[i]);
+        if sample != "" {
+            let sl = str_lower(sample);
+            let score = 0;
+            if len(exact) >= 2 and str_contains(sl, exact) { score = score + 4; }
+            let w = 0;
+            while w < len(words) {
+                let word = str_trim(words[w]);
+                if len(word) > 3 and str_contains(sl, word) { score = score + 1; }
+                w = w + 1;
+            }
+            if score > 0 or memory_query {
+                push(matches, map{ text: sample, score: score });
+            }
+        }
+        i = i + 1;
+    }
+    return matches;
+}
+
+fn _live_memory_text(prompt) {
+    let matches = _live_memory_matches(prompt);
+    if len(matches) == 0 { return ""; }
+    let out = "";
+    let i = 0;
+    let used = [];
+    while i < len(matches) and i < 3 {
+        let best = -1;
+        let best_score = -1;
+        let j = 0;
+        while j < len(matches) {
+            // `>=` makes later (more recently learned) samples win ties, so a freshly
+            // taught lesson surfaces ahead of older equally-scored memory.
+            if not PBAI_BRAIN.contains(used, j) and matches[j].score >= best_score {
+                best = j;
+                best_score = matches[j].score;
+            }
+            j = j + 1;
+        }
+        if best < 0 { return out; }
+        push(used, best);
+        out = out + "- " + matches[best].text + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _live_memory_answer(prompt) {
+    let mem = _live_memory_text(prompt);
+    if mem == "" { return ""; }
+    return "pbAI live memory match:\n" + mem + "This came from `stdlib/pbai_live_corpus.txt`, not a hard-coded answer.";
+}
+
+fn _is_learning_command(t) {
+    return str_starts_with(t, "learn:") or str_starts_with(t, "teach:")
+        or str_starts_with(t, "learn ") or str_starts_with(t, "teach ");
+}
+
+fn _lesson_from_learning_command(prompt) {
+    let text = str_trim(prompt);
+    let t = str_lower(text);
+    if str_starts_with(t, "learn:") or str_starts_with(t, "teach:") {
+        let idx = str_index_of(text, ":");
+        return str_trim(str_slice(text, idx + 1, len(text)));
+    }
+    if str_starts_with(t, "learn ") { return str_trim(str_slice(text, 6, len(text))); }
+    if str_starts_with(t, "teach ") { return str_trim(str_slice(text, 6, len(text))); }
+    return "";
+}
+
+fn _digit(c) {
+    if c >= 48 and c <= 57 { return c - 48; }
+    return -1;
+}
+
+fn _parse_uint(s) {
+    s = str_trim(s);
+    if s == "" { return nil; }
+    let n = 0;
+    let i = 0;
+    while i < len(s) {
+        let d = _digit(strcharcodeat(s, i));
+        if d < 0 { return nil; }
+        n = n * 10 + d;
+        i = i + 1;
+    }
+    return n;
+}
+
+fn _simple_arithmetic(prompt) {
+    let t = str_trim(str_lower(prompt));
+    t = str_replace_all(t, " ", "");
+    if str_ends_with(t, "?") { t = str_slice(t, 0, len(t) - 1); }
+    let ops = ["+", "-", "*", "/"];
+    for op in ops {
+        let idx = str_index_of(t, op);
+        if idx > 0 {
+            let a = _parse_uint(str_slice(t, 0, idx));
+            let b = _parse_uint(str_slice(t, idx + 1, len(t)));
+            if a == nil or b == nil { return ""; }
+            if op == "+" { return "pbAI math: " + str(a) + " + " + str(b) + " = " + str(a + b); }
+            if op == "-" { return "pbAI math: " + str(a) + " - " + str(b) + " = " + str(a - b); }
+            if op == "*" { return "pbAI math: " + str(a) + " * " + str(b) + " = " + str(a * b); }
+            if op == "/" {
+                if b == 0 { return "pbAI math: division by zero is undefined."; }
+                let q = 0;
+                let rem = a;
+                while rem >= b {
+                    rem = rem - b;
+                    q = q + 1;
+                }
+                return "pbAI math: " + str(a) + " / " + str(b) + " = quotient " + str(q) + ", remainder " + str(rem) + ".";
+            }
+        }
+    }
+    return "";
+}
+
+fn analyze(prompt) {
+    let code = _extract_code(prompt);
+    let s = _scan(code);
+    let c = classify_scores(prompt);
+    let findings = _review_findings(code, s);
+    return map{
+        intent: c.intent,
+        scores: c.scores,
+        has_code: _has_code(code, s),
+        quality: _quality_score(s),
+        risk: _risk_summary(s),
+        scan: s,
+        findings: findings,
+        confidence: _confidence_score(code, s),
+        suggested_fix: _repair_preview(code),
+        live_memory: _live_memory_matches(prompt)
+    };
+}
+
+fn self_eval(prompt) {
+    let meta = analyze(prompt);
+    return map{
+        format: "pbai.eval.v1",
+        intent: meta.intent,
+        quality: meta.quality,
+        confidence: meta.confidence,
+        risk: meta.risk,
+        findings: meta.findings,
+        issue_count: len(meta.findings),
+        suggested_fix: meta.suggested_fix
+    };
+}
+
+// ── Skills ───────────────────────────────────────────────────────────────────────────
+fn _explain(code, s) {
+    let out = "pbAI: code overview\n";
+    out = out + "- quality score: " + str(_quality_score(s)) + "/100; " + _risk_summary(s) + ".\n";
+    if s.fns > 0 { out = out + "- " + str(s.fns) + " function(s): " + _fn_names(code) + "\n"; }
+    else { out = out + "- top-level script (no function definitions)\n"; }
+    out = out + "- " + str(s.lines) + " line(s), " + str(s.lets) + " binding(s)";
+    let loops = s.whiles + s.fors;
+    if loops > 0 { out = out + ", " + str(loops) + " loop(s)"; }
+    if s.ifs > 0 { out = out + ", " + str(s.ifs) + " conditional(s)"; }
+    if s.matches > 0 { out = out + ", " + str(s.matches) + " match"; }
+    if s.structs > 0 { out = out + ", " + str(s.structs) + " struct(s)"; }
+    if s.classes > 0 { out = out + ", " + str(s.classes) + " class(es)"; }
+    if s.enums > 0 { out = out + ", " + str(s.enums) + " enum(s)"; }
+    out = out + ".\n";
+    if s.imports > 0 { out = out + "- pulls in " + str(s.imports) + " module(s) via import().\n"; }
+    if s.recursion { out = out + "- uses RECURSION — verify the base case terminates.\n"; }
+    if s.closures > 0 { out = out + "- defines " + str(s.closures) + " closure(s) (anonymous fn) — captured variables live on.\n"; }
+    if s.tries > 0 { out = out + "- handles errors with try/catch (" + str(s.tries) + ").\n"; }
+    if s.prints > 0 { out = out + "- produces output via print.\n"; }
+    if loops > 0 { out = out + "- control flow is iterative; trace the loop variables to follow it.\n"; }
+    if s.depth >= 4 { out = out + "- nesting depth " + str(s.depth) + " is deep; the hot path is buried inside several blocks.\n"; }
+    return out;
+}
+
+fn _bugs(code, s) {
+    let out = "pbAI: review (pblang-aware)\n";
+    out = out + "- quality score: " + str(_quality_score(s)) + "/100; " + _risk_summary(s) + ".\n";
+    let found = 0;
+    if _looks_like_missing_fn(code) {
+        out = out + "- missing `fn` before the function name.\n"; found = found + 1;
+    }
+    if _looks_like_missing_let_equals(code) {
+        out = out + "- missing `=` in a `let` binding; write `let name = value;`.\n"; found = found + 1;
+    }
+    if _looks_like_fs_name_typo(code) {
+        out = out + "- `fs read(...)` / `fs write(...)` are not pblang builtins; use `fs_read(...)` / `fs_write(...)`.\n"; found = found + 1;
+    }
+    if s.open_brace != s.close_brace {
+        out = out + "! unbalanced braces: " + str(s.open_brace) + " '{' vs " + str(s.close_brace) + " '}'.\n"; found = found + 1;
+    }
+    if s.open_paren != s.close_paren {
+        out = out + "! unbalanced parentheses: " + str(s.open_paren) + " '(' vs " + str(s.close_paren) + " ')'.\n"; found = found + 1;
+    }
+    if s.open_brack != s.close_brack {
+        out = out + "! unbalanced brackets: " + str(s.open_brack) + " '[' vs " + str(s.close_brack) + " ']'.\n"; found = found + 1;
+    }
+    // pblang-specific gotchas this model knows (an outside model often gets these wrong):
+    if str_contains(code, "print(") {
+        out = out + "- `print(x)` is INVALID in pblang — print is a statement: write `print x;` (the paren form errors with 'undefined global print').\n"; found = found + 1;
+    }
+    if str_contains(code, ".method(") or _count(code, ").") > 0 {
+        out = out + "- no UFCS: `obj.method(args)` is field access, not a call. Use a free function or colon-call `obj:method(args)`.\n"; found = found + 1;
+    }
+    if str_contains(code, "\" <") or str_contains(code, "\" >") or str_contains(code, "< \"") or str_contains(code, "> \"") {
+        out = out + "- string `<`/`>` comparison is unsupported; compare via strcharcodeat / length.\n"; found = found + 1;
+    }
+    if _looks_like_map_index_read(code) {
+        out = out + "- reading a MISSING map key RAISES (it is not nil); guard with `map_has(m, k)`.\n"; found = found + 1;
+    }
+    if (s.fs > 0 or s.http > 0 or s.imports > 0) and s.tries == 0 {
+        out = out + "- fallible I/O/import path has no `try ... catch`; bad paths, network failures, or missing modules can abort the run.\n"; found = found + 1;
+    }
+    if str_contains(code, "while true") or str_contains(code, "while (true)") {
+        if not str_contains(code, "break") { out = out + "- `while true` with no `break` is an infinite loop.\n"; found = found + 1; }
+    }
+    if str_contains(code, "/ 0") or str_contains(code, "/0") {
+        out = out + "- possible division by zero — guard the denominator.\n"; found = found + 1;
+    }
+    if s.execs > 0 {
+        out = out + "- exec/polyglot process calls require `--allow-exec`; never pass untrusted strings directly to a shell.\n"; found = found + 1;
+        if str_contains(code, "+") {
+            out = out + "- command string appears dynamically composed; prefer an argv-style API or validate each part before execution.\n"; found = found + 1;
+        }
+    }
+    if s.ffi > 0 {
+        out = out + "- FFI loads code into the host process; treat `--allow-ffi` like arbitrary native-code permission.\n"; found = found + 1;
+    }
+    if s.env > 0 {
+        out = out + "- env reads can expose secrets; use `--sandbox` or `--deny-env` for untrusted scripts.\n"; found = found + 1;
+    }
+    if s.fns > 0 and s.returns == 0 {
+        out = out + "- functions defined but no `return` — they yield nil; confirm that's intended.\n"; found = found + 1;
+    }
+    if s.recursion and not (str_contains(code, "<=") or str_contains(code, ">=") or str_contains(code, "==")) {
+        out = out + "- recursive function has no obvious base-case comparison; verify it terminates.\n"; found = found + 1;
+    }
+    if s.todos > 0 { out = out + "- " + str(s.todos) + " TODO/FIXME marker(s) still in the code.\n"; found = found + 1; }
+    let fixed = _repair_preview(code);
+    if fixed != str_trim(code) {
+        out = out + "\nSuggested pblang fix:\n```pblang\n" + fixed + "\n```\n";
+    }
+    if found == 0 {
+        out = out + "- no structural issues found. Check edge cases: empty inputs, off-by-one in loop bounds, missing-key map reads, and nil propagation.\n";
+    }
+    return out;
+}
+
+fn _improve(code, s) {
+    let out = "pbAI: suggestions\n";
+    out = out + "- target: raise quality score from " + str(_quality_score(s)) + "/100 by reducing nesting, TODOs, and unchecked capability use.\n";
+    let fixed = _repair_preview(code);
+    if fixed != str_trim(code) {
+        out = out + "- apply this pblang syntax repair first:\n```pblang\n" + fixed + "\n```\n";
+    }
+    if s.fns == 0 { out = out + "- extract reusable logic into `fn`s for clarity and testing.\n"; }
+    if s.whiles > 0 and s.fors == 0 { out = out + "- for a fixed count, `for i N { ... }` reads cleaner than `while` with a manual counter.\n"; }
+    if s.lets > 12 { out = out + "- many bindings in one scope (" + str(s.lets) + ") — group related state into a `map`/`struct`.\n"; }
+    if s.depth >= 4 { out = out + "- nesting depth " + str(s.depth) + ": flatten with early `return`/`continue` or extract inner blocks into functions.\n"; }
+    if s.fns > 0 and (s.lines / (s.fns + 0)) > 40 { out = out + "- average function is long; split each into smaller single-purpose helpers.\n"; }
+    if s.tries == 0 and (s.imports > 0 or str_contains(code, "fs_read") or str_contains(code, "http")) { out = out + "- I/O without try/catch — wrap fallible calls (fs/http/import) so failures don't abort the run.\n"; }
+    if s.execs > 0 or s.ffi > 0 or s.env > 0 { out = out + "- isolate sensitive operations behind small wrapper functions and document required capabilities.\n"; }
+    if _looks_like_map_index_read(code) { out = out + "- if reading dynamic map keys, add `map_has` guards before indexing.\n"; }
+    out = out + "- name constants instead of magic numbers, keep functions to one job, and prefer `else if` chains over deep nesting.\n";
+    out = out + "- F6 (check) runs the self-hosted linter for unreachable code + undefined names; F5 runs it.\n";
+    return out;
+}
+
+// Generate suggested `///` doc headers, one per function (params listed).
+fn _comment(code, s) {
+    let out = "pbAI: documentation headers\n";
+    let parts = str_split(code, "fn ");
+    if len(parts) <= 1 {
+        return out + "// top-level script — add a one-line purpose comment at the top, e.g.\n// <what this program does, and how to run it>\n";
+    }
+    let i = 1;
+    while i < len(parts) {
+        let p = parts[i];
+        let paren = str_index_of(p, "(");
+        let close = str_index_of(p, ")");
+        if paren > 0 {
+            let nm = str_trim(str_slice(p, 0, paren));
+            let params = "";
+            if close > paren { params = str_trim(str_slice(p, paren + 1, close)); }
+            out = out + "/// " + nm + "(" + params + ") - TODO: describe what it does";
+            if params != "" { out = out + " (args: " + params + ")"; }
+            out = out + ".\n";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── pblang knowledge base (general questions) ─────────────────────────────────────────
+// pbAI's edge: it knows pblang's OWN specifics, idioms, and gotchas. Matched most-specific
+// first so a question about "missing map key" routes to the maps answer, etc.
+fn _topic_line(topic) {
+    if topic == "maps" { return "- maps: `map{ k: v }`; missing keys raise, so guard dynamic reads with `map_has(m, k)`."; }
+    if topic == "loops" { return "- loops: `while cond { ... }`, `for i N { ... }`, and `for v in arr { ... }`; use `break`/`continue` normally."; }
+    if topic == "fns" { return "- functions: `fn name(a, b = 1) { return a + b; }`; anonymous `fn(x) { ... }` closures capture scope."; }
+    if topic == "oop" { return "- OOP: `struct` and `class` self-host; construct values, access fields with `.`, call methods with `obj:method(args)`."; }
+    if topic == "strings" { return "- strings: codepoint-based; concatenate with `+`; use str_split/str_slice/str_index_of/str_contains/strcharcodeat."; }
+    if topic == "errors" { return "- errors: `try EXPR catch FALLBACK`, `throw v`, and `error(\"msg\")`; bad indexes and missing map keys raise."; }
+    if topic == "imports" { return "- imports: `let m = import(\"stdlib/foo.sapp\");`, then call exported members as `m.fn(...)`; keep imports top-level when possible."; }
+    if topic == "async" { return "- async: `async fn`, `spawn`/`spawn_n`, and waitgroup-style coordination are available for concurrent work."; }
+    if topic == "precision" { return "- precision: `bigint`, `rational`, and `decimal` cover arbitrary integers, exact fractions, and fixed decimals."; }
+    if topic == "jit" { return "- JIT/perf: the VM is Rust bytecode; Cranelift JIT is gated by `PBLANG_JIT` for suitable numeric functions."; }
+    if topic == "capabilities" { return "- capabilities: `--sandbox` denies risky defaults; `--allow-exec`/`--allow-ffi` are high-trust; env can expose secrets."; }
+    if topic == "data" { return "- data: pbAI routes text/code/logs/diffs/tests/JSON/CSV/Markdown plus image/audio/video/binary hints; deep modalities are plugin/backend roadmap."; }
+    return "";
+}
+
+fn _multi_topic_answer(t) {
+    let topics = [];
+    if str_contains(t, "map") { push(topics, "maps"); }
+    if str_contains(t, "loop") or str_contains(t, "while") { push(topics, "loops"); }
+    if str_contains(t, "fn") or str_contains(t, "function") { push(topics, "fns"); }
+    if str_contains(t, "oop") or str_contains(t, "object") or str_contains(t, "class") or str_contains(t, "struct") { push(topics, "oop"); }
+    if str_contains(t, "string") or str_contains(t, "text") { push(topics, "strings"); }
+    if str_contains(t, "error") or str_contains(t, "try") or str_contains(t, "catch") { push(topics, "errors"); }
+    if str_contains(t, "import") or str_contains(t, "module") { push(topics, "imports"); }
+    if str_contains(t, "async") or str_contains(t, "spawn") { push(topics, "async"); }
+    if str_contains(t, "precision") or str_contains(t, "bigint") or str_contains(t, "rational") or str_contains(t, "decimal") { push(topics, "precision"); }
+    if str_contains(t, "jit") or str_contains(t, "perf") or str_contains(t, "speed") { push(topics, "jit"); }
+    if str_contains(t, "capab") or str_contains(t, "sandbox") or str_contains(t, "permission") { push(topics, "capabilities"); }
+    if str_contains(t, "data") or str_contains(t, "json") or str_contains(t, "csv") or str_contains(t, "image") or str_contains(t, "audio") or str_contains(t, "video") { push(topics, "data"); }
+    if len(topics) < 2 { return ""; }
+    let out = "pbAI: quick pblang map\n";
+    for i len(topics) {
+        out = out + _topic_line(topics[i]) + "\n";
+    }
+    return out + "Ask one topic for a deeper answer, or paste code and I will review it.";
+}
+
+fn _general(prompt) {
+    let t = str_lower(prompt);
+    if _is_learning_command(t) and not str_contains(t, "learn you") and not str_contains(t, "teach you") {
+        let lesson = _lesson_from_learning_command(prompt);
+        if lesson == "" { return "pbAI learning mode: write `learn <lesson>` or `learn: <lesson>`."; }
+        let learned = learn(lesson, 6);
+        return "pbAI learned this local lesson.\n- lesson: " + lesson + "\n- live loss before: " + str(learned.metrics.loss_before) + "\n- live loss after: " + str(learned.metrics.loss_after) + "\n- source: stdlib/pbai_live_corpus.txt";
+    }
+    let math = _simple_arithmetic(prompt);
+    if math != "" { return math; }
+    if str_contains(t, "best llm") or str_contains(t, "be the best") or str_contains(t, "make you better") or str_contains(t, "frontier") {
+        return "pbAI improvement target: become a pblang-written LLM family with live learning, multimodal data routing, memory, tools, retrieval, tests, and verified coding ability. Today I am Nano + grounded skills; the next real upgrades are a stronger tokenizer, transformer decoder blocks, larger curated corpora, benchmark suites, retrieval memory, and tool-verified self-improvement.";
+    }
+    if str_contains(t, "learn you") or str_contains(t, "teach you") or str_contains(t, "learn:") or str_contains(t, "teach:") {
+        return "pbAI learning mode: send `learn: <lesson or example>` in the live website and I will store it in the local live corpus, retrain pbAI-Nano, and report the learning loss. Good lessons include pblang facts, examples, corrections, tests, or project rules.";
+    }
+    if str_contains(t, "sub-agent") or str_contains(t, "sub agent") or str_contains(t, "atomic-agent") or str_contains(t, "atomic agent") or str_contains(t, "sub-atomic") or str_contains(t, "subatomic") {
+        let ag = PBAI_BRAIN.agent_hierarchy(prompt);
+        return "pbAI agent hierarchy: root pbAI orchestrates " + str(len(ag.sub_agents)) + " sub-agents, " + str(len(ag.atomic_agents)) + " atomic-agents, and " + str(len(ag.sub_atomic_agents)) + " sub-atomic-agents. Sub-agents handle planning/review/learning/tools, atomic-agents handle perception/attention/retrieval/verification/reflection, and sub-atomic-agents handle tokens/signals/gradients/capability gates.";
+    }
+    if (str_contains(t, "generate") or str_contains(t, "write") or str_contains(t, "create"))
+        and (str_contains(t, "code") or str_contains(t, "program") or str_contains(t, "function") or str_contains(t, "pblang")) {
+        let gen = generate(prompt, 80);
+        return "pbAI native generation (pbAI-Nano char LM, pblang source corpus):\n" + gen;
+    }
+    if str_contains(t, "pbai") and (str_contains(t, "asset") or str_contains(t, "checkpoint") or str_contains(t, "tokenizer") or str_contains(t, "model")) {
+        return PBAI_ASSETS.describe() + "\n" + PBAI_TOKENIZER.describe();
+    }
+    if str_contains(t, "pbai") and (str_contains(t, "brain") or str_contains(t, "memory") or str_contains(t, "plan") or str_contains(t, "cognitive")) {
+        return PBAI_BRAIN.describe();
+    }
+    if str_contains(t, "data") or str_contains(t, "multimodal") or str_contains(t, "image") or str_contains(t, "audio") or str_contains(t, "video") or str_contains(t, "json") or str_contains(t, "csv") {
+        return "pbAI data understanding: today the pblang brain detects and routes text, pblang/code, logs, diffs, tests, JSON, CSV, Markdown, and file-type hints for image/audio/video/binary data. Deep image/audio/video understanding is planned through native parsers, retrieval, embeddings, and optional plugin backends behind the same pblang capability gates.";
+    }
+    let broad = _multi_topic_answer(t);
+    if broad != "" { return broad; }
+    if str_contains(t, "mcp") or str_contains(t, "tool") or str_contains(t, "workspace") {
+        let ctx = try MCP.workspace_context() catch nil;
+        if ctx != nil {
+            return PBAI_TOOLS.answer() + "\nActive native bridge root: " + str(ctx.root) + ". Use pbAI.tool_call(name, args) for the safe pblang pb_mcp slice.";
+        }
+        return PBAI_TOOLS.answer();
+    }
+    if str_contains(t, "self-host") or str_contains(t, "selfhost") or str_contains(t, "bootstrap") { return "pbAI: pblang is SELF-HOSTING — stdlib/compiler/ (tokenizer/parser/typeck/codegen/vm, all .sapp) compiles AND runs pblang. F5 in the IDE runs your buffer through it."; }
+    if str_contains(t, "jit") or str_contains(t, "cranelift") or str_contains(t, "fast") or str_contains(t, "perf") or str_contains(t, "speed") { return "pbAI: perf — the VM is a Rust bytecode interpreter; a Cranelift JIT (gated by PBLANG_JIT) compiles loop-free/call-free numeric fns. Also: cache expensive work to disk, and don't recompute per frame."; }
+    if str_contains(t, "security") or str_contains(t, "capab") or str_contains(t, "permission") or str_contains(t, "allow") or str_contains(t, "sandbox") or str_contains(t, "exec") { return "pbAI: security — capabilities gate sensitive builtins. `--sandbox` denies risky defaults; `--allow-exec` and `--allow-ffi` are high-trust. env reads can expose secrets, so use `--deny-env` for untrusted scripts."; }
+    if str_contains(t, "import") or str_contains(t, "module") { return "pbAI: modules — `let m = import(\"stdlib/foo.sapp\");` then `m.fn(...)`. Export with `export a, b;`. Keep imports at TOP level (lazy import() inside a fn resolves relative to the CWD)."; }
+    if str_contains(t, "error") or str_contains(t, "try") or str_contains(t, "catch") or str_contains(t, "throw") { return "pbAI: errors — `try EXPR catch FALLBACK` (an expression); `throw v` raises; `error(\"msg\")` raises from a builtin. Missing map keys and bad index raise — wrap them."; }
+    if str_contains(t, "async") or str_contains(t, "await") or str_contains(t, "concurren") or str_contains(t, "thread") or str_contains(t, "spawn") { return "pbAI: concurrency — `async fn`, `spawn`/`spawn_n` for parallel tasks, and a waitgroup in stdlib. The self-hosted compiler models async too."; }
+    if str_contains(t, "bignum") or str_contains(t, "rational") or str_contains(t, "decimal") or str_contains(t, "precision") { return "pbAI: precision ladder — `bigint(n)` (arbitrary integers), `rational(a, b)` (exact fractions), `decimal(\"3.14\")` (fixed decimals). Arithmetic/compare operators work across them."; }
+    if str_contains(t, "match") or str_contains(t, "enum") { return "pbAI: `match x { case 1: \"a\" case 2: \"b\" else: \"c\" }` is an expression; `enum` defines variants. Both self-host."; }
+    if str_contains(t, "operator") or str_contains(t, "overload") or str_contains(t, "dunder") { return "pbAI: operator overloading via dunder methods on a map — `__add__`, `__lt__`, `__rmul__` (reflected), etc. `box(2) + box(4)` dispatches to `__add__`."; }
+    if str_contains(t, "typeclass") or str_contains(t, "trait") { return "pbAI: typeclasses — `stdlib/typeclass.sapp` gives runtime ad-hoc polymorphism: define required methods, register instances by type/interface/class/predicate, then generic-dispatch with call/call1/call2. Eq includes executable law checks."; }
+    if str_contains(t, "logic") or str_contains(t, "datalog") or str_contains(t, "relational") { return "pbAI: logic — `stdlib/logic.sapp` supports facts, variables (`?X`), rules, conjunctive queries, and projection. It renames rule variables hygienically before solving."; }
+    if str_contains(t, "reactive") or str_contains(t, "stream") or str_contains(t, "observable") { return "pbAI: reactive — `stdlib/observable.sapp` has refs, computed values, batching, subjects, subscriptions, and map/filter/scan/take/merge/combine_latest streams."; }
+    if str_contains(t, "array") or str_contains(t, "list") or str_contains(t, "slice") { return "pbAI: arrays — `[1, 2, 3]`, index `a[i]`, `len(a)`, `push(a, v)`/`pop(a)`, `slice(a, i, j)`. Iterate `for v in a { ... }`. Arrays are append-style (rebuild to insert/remove)."; }
+    if str_contains(t, "map") or str_contains(t, "dict") or str_contains(t, "hash") { return "pbAI: maps — `map{ k: v }`; read `m[k]` (a MISSING key RAISES, it is not nil — use `map_has(m, k)`); `map_keys(m)`, `map_remove(m, k)`. Member sugar `m.k` works for ident keys."; }
+    if str_contains(t, "loop") or str_contains(t, "while") or str_contains(t, "iterate") { return "pbAI: loops — `while cond { ... }`, `for i N { ... }` (i in 0..N), `for v in arr { ... }`. `break`/`continue` as usual."; }
+    if str_contains(t, "function") or str_contains(t, "fn ") or str_contains(t, "closure") { return "pbAI: functions — `fn name(a, b = 1) { return a + b; }`; anonymous `fn(x) { ... }` are closures that capture their scope. No UFCS — `obj.f()` is field access, use a free fn or `obj:f()` colon-call."; }
+    if str_contains(t, "struct") or str_contains(t, "class") or str_contains(t, "oop") or str_contains(t, "object") { return "pbAI: OOP — `struct Pt { x, y }` and `class` with methods both self-host; construct `Pt(1, 2)`, access `p.x`, call methods `obj:method(args)`."; }
+    if str_contains(t, "string") or str_contains(t, "text") or str_contains(t, "char") { return "pbAI: strings are codepoint-based; `<`/`>` comparison is unsupported (use strcharcodeat/length). `+` concatenates; str_split/str_slice/str_index_of/str_contains/strcharcodeat/strfromcharcode are the workhorses."; }
+    if str_contains(t, "print") or str_contains(t, "output") { return "pbAI: `print x;` is a STATEMENT (not a function) — `print(x)` errors. It writes a line to stdout; the IDE F5 captures printed values."; }
+    if str_contains(t, "ide") or str_contains(t, "editor") or str_contains(t, "shortcut") or str_contains(t, "key") { return "pbAI: IDE — tabs CODE/TERMINAL/DESIGN/AI/BROWSER. In CODE: F5 run, F6 check, Ctrl+S save, Ctrl+F find, Ctrl+arrow word/fast move, Shift+arrow select. Launch with `pblang --ide`."; }
+    if str_contains(t, "what's up") or str_contains(t, "whats up") or str_contains(t, "sup") {
+        return "pbAI: running live in pblang. I can answer pblang questions, review code, explain bugs, generate tiny Nano output, think through a plan, and learn local examples with `learn: ...`.";
+    }
+    if str_contains(t, "hello") or str_contains(t, "hi ") or t == "hi" or str_contains(t, "who are you") or str_contains(t, "what can you") { return "pbAI: I'm pblang's own assistant: local neural intent routing, pblang-grounded skills, brain loop, live learning, and a Nano generative model. Ask a topic, paste code, or teach me with `learn: ...`."; }
+    let live_answer = _live_memory_answer(prompt);
+    if live_answer != "" { return live_answer; }
+    return "pbAI: I need either a pblang topic, a code snippet, or a learning command. Try `maps`, `loops`, `how do imports work?`, `Find bugs:\\n--- pblang code ---\\n...`, or `learn: <new lesson>`.";
+}
+
+// Does the prompt actually carry pblang code worth analyzing? The code-skills
+// (explain/bugs/improve/comment) are useless without it, so a free-text question that
+// the classifier mis-routes to one of them is answered from the knowledge base instead.
+fn _has_code(code, s) {
+    return s.fns > 0 or s.lets > 0 or s.open_brace > 0 or s.whiles > 0 or s.fors > 0
+        or str_contains(code, "print ") or str_contains(code, "import(") or str_contains(code, "return ");
+}
+
+// ── Entry points ─────────────────────────────────────────────────────────────────────
+fn _run(intent, prompt) {
+    let code = _extract_code(prompt);
+    let s = _scan(code);
+    if intent <= 3 and not _has_code(code, s) { return _general(prompt); }   // no code → answer the question
+    if intent == 0 { return _explain(code, s); }
+    if intent == 1 { return _bugs(code, s); }
+    if intent == 2 { return _improve(code, s); }
+    if intent == 3 { return _comment(code, s); }
+    return _general(prompt);
+}
+
+// respond(prompt) — classify the intent with the pbAI model, then run the skill.
+fn respond(prompt) {
+    return _run(classify(prompt), prompt);
+}
+
+fn generate(prompt, n = 80) {
+    let seed = _extract_code(prompt);
+    if seed == "" or not _has_code(seed, _scan(seed)) {
+        if str_contains(str_lower(prompt), "fn ") { seed = "fn "; }
+        else if str_contains(str_lower(prompt), "let ") { seed = "let "; }
+        else { seed = "fn "; }
+    }
+    // Temperature/top-k sampling reads far better than greedy argmax on the tiny Nano
+    // LM (greedy collapses into repeated loops). Seed is derived from the seed text so
+    // output is reproducible per prompt but varies across different prompts.
+    let out = PBAI_LM.generate_nano_sampled(seed, n, 4, 0.85, 8, 1 + len(seed), 0.6);
+    return out.text;
+}
+
+fn learn(text, epochs = 8) {
+    return PBAI_LM.learn_text(text, epochs, 0.2);
+}
+
+fn ingest_path(path, max_files = 80, max_depth = 4, epochs = 4) {
+    return PBAI_INGEST.ingest_path(path, max_files, max_depth, epochs);
+}
+
+fn max_status() { return PBAI_MAX.status(); }
+fn max_rl_status() { return PBAI_MAX.rl_trial_learning_status(); }
+fn max_memory_status(max_records = 96) { return PBAI_MAX.memory_status(max_records); }
+fn max_memory_retrieve(prompt, top_k = 3, max_records = 96) {
+    return PBAI_MAX.memory_retrieve(prompt, top_k, max_records);
+}
+fn max_adapter_status() { return PBAI_MAX.adapter_status(); }
+fn max_train_adapter(epochs = 1, lr = 0.02, max_examples = 96) {
+    return PBAI_MAX.train_adapter(epochs, lr, max_examples, 2, 4.0);
+}
+fn max_train_live_adapter(epochs = 1, lr = 0.02, max_examples = 96) {
+    return PBAI_MAX.train_live_adapter(epochs, lr, max_examples, 2, 4.0);
+}
+fn max_teach_adapter(text = "", epochs = 1, lr = 0.02, max_examples = 96) {
+    return PBAI_MAX.teach_adapter(text, epochs, lr, max_examples, 2, 4.0);
+}
+fn max_train_checkpoint(epochs = 3, lr = 0.05, max_examples = 1280) {
+    return PBAI_MAX.train_checkpoint(epochs, lr, 4, 1, max_examples);
+}
+fn _max_dir(dir) {
+    if dir == "" { return "checkpoints/pbai-max"; }
+    return dir;
+}
+fn max_save_checkpoint(dir = "checkpoints/pbai-max", epochs = 3, lr = 0.05, max_examples = 1280) {
+    return PBAI_MAX.save_checkpoint(_max_dir(dir), PBAI_MAX.train_checkpoint(epochs, lr, 4, 1, max_examples));
+}
+fn max_load_checkpoint(dir = "checkpoints/pbai-max") { return PBAI_MAX.load_checkpoint(_max_dir(dir)); }
+fn max_checkpoint_summary(dir = "checkpoints/pbai-max") { return PBAI_MAX.checkpoint_summary_saved(_max_dir(dir)); }
+fn max_continue_training(dir = "checkpoints/pbai-max", epochs = 2, lr = 0.01, max_examples = 1280) {
+    return PBAI_MAX.continue_training(_max_dir(dir), epochs, lr, 1, max_examples);
+}
+fn max_teach(dir = "checkpoints/pbai-max", text = "", epochs = 1, lr = 0.01, max_examples = 1280) {
+    return PBAI_MAX.teach_live(_max_dir(dir), text, epochs, lr, max_examples);
+}
+fn max_generate(prompt, n = 16, dir = "checkpoints/pbai-max") { return PBAI_MAX.generate_saved(prompt, n, _max_dir(dir)); }
+fn max_generate_ranked(prompt, n = 16, dir = "checkpoints/pbai-max") {
+    return PBAI_MAX.generate_ranked_saved(prompt, n, _max_dir(dir), [prompt], ["undefined", "nan", "<unk>"], 1);
+}
+fn max_verify_generation(text = "", prompt = "", expected = nil, forbidden = nil) {
+    return PBAI_MAX.strict_verify_generation(text, prompt, expected, forbidden);
+}
+fn max_generate_verified(prompt, n = 16, dir = "checkpoints/pbai-max", expected = nil, forbidden = nil) {
+    if expected == nil { expected = [prompt]; }
+    if forbidden == nil { forbidden = ["undefined", "nan", "<unk>"]; }
+    return PBAI_MAX.generate_verified_saved(prompt, n, _max_dir(dir), expected, forbidden, 1);
+}
+fn max_eval(dir = "checkpoints/pbai-max") { return PBAI_MAX.evaluate_checkpoint(PBAI_MAX.ensure_checkpoint(_max_dir(dir), 3, 0.05)); }
+fn max_regression(dir = "checkpoints/pbai-max", n = 16) {
+    return PBAI_MAX.regression_suite(PBAI_MAX.ensure_checkpoint(_max_dir(dir), 3, 0.05), n);
+}
+fn max_benchmark(dir = "", n = 8) {
+    if dir == "" { return PBAI_MAX.benchmark_suite(nil, n); }
+    return PBAI_MAX.benchmark_suite(PBAI_MAX.load_checkpoint(_max_dir(dir)), n);
+}
+fn max_distillation_preview(dir = "", max_records = 8, n = 4) {
+    if max_records < 1 { max_records = 1; }
+    if max_records > 16 { max_records = 16; }
+    if n < 1 { n = 1; }
+    if n > 12 { n = 12; }
+    if dir == "" { return PBAI_MAX.distillation_preview(nil, max_records, n); }
+    return PBAI_MAX.distillation_preview(PBAI_MAX.load_checkpoint(_max_dir(dir)), max_records, n);
+}
+fn max_distill_train(dir = "", tier = "pbAI-Mini", epochs = 1, lr = 0.02, max_records = 8, n = 4) {
+    if max_records < 1 { max_records = 1; }
+    if max_records > 16 { max_records = 16; }
+    if n < 1 { n = 1; }
+    if n > 12 { n = 12; }
+    if dir == "" { return PBAI_MAX.train_distilled_student(nil, tier, epochs, lr, max_records, n); }
+    return PBAI_MAX.train_distilled_student(PBAI_MAX.load_checkpoint(_max_dir(dir)), tier, epochs, lr, max_records, n);
+}
+fn max_distill_family(dir = "", epochs = 1, lr = 0.02, max_records = 8, n = 4) {
+    if max_records < 1 { max_records = 1; }
+    if max_records > 16 { max_records = 16; }
+    if n < 1 { n = 1; }
+    if n > 12 { n = 12; }
+    if dir == "" { return PBAI_MAX.distill_family(nil, epochs, lr, max_records, n); }
+    return PBAI_MAX.distill_family(PBAI_MAX.load_checkpoint(_max_dir(dir)), epochs, lr, max_records, n);
+}
+fn max_distill_save_family(out_dir = "checkpoints/pbai-max/students", teacher_dir = "", epochs = 1, lr = 0.02, max_records = 8, n = 4) {
+    if out_dir == "" { out_dir = "checkpoints/pbai-max/students"; }
+    if max_records < 1 { max_records = 1; }
+    if max_records > 16 { max_records = 16; }
+    if n < 1 { n = 1; }
+    if n > 12 { n = 12; }
+    let family = nil;
+    if teacher_dir == "" { family = PBAI_MAX.distill_family(nil, epochs, lr, max_records, n); }
+    else { family = PBAI_MAX.distill_family(PBAI_MAX.load_checkpoint(_max_dir(teacher_dir)), epochs, lr, max_records, n); }
+    return PBAI_MAX.save_distilled_family(out_dir, family);
+}
+fn max_distill_family_summary(dir = "checkpoints/pbai-max/students") {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    return PBAI_MAX.distilled_family_summary_saved(dir);
+}
+fn max_distill_student_eval(dir = "checkpoints/pbai-max/students", tier = "pbAI-Mini", max_examples = 256) {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    return PBAI_MAX.evaluate_distilled_student_saved(dir, tier, max_examples);
+}
+fn max_distill_family_eval(dir = "checkpoints/pbai-max/students", max_examples = 256) {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    return PBAI_MAX.evaluate_distilled_family_saved(dir, max_examples);
+}
+fn max_distill_student_generate(prompt = "fn ", n = 16, dir = "checkpoints/pbai-max/students", tier = "pbAI-Mini") {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    return PBAI_MAX.generate_distilled_student_saved(dir, tier, prompt, n);
+}
+fn max_distill_student_generate_ranked(prompt = "fn ", n = 16, dir = "checkpoints/pbai-max/students", tier = "pbAI-Mini", expected = nil, forbidden = nil) {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    if expected == nil { expected = [prompt]; }
+    if forbidden == nil { forbidden = ["undefined", "nan", "<unk>"]; }
+    return PBAI_MAX.generate_distilled_student_ranked_saved(dir, tier, prompt, n, expected, forbidden, 1);
+}
+fn max_distill_route(prompt = "", dir = "checkpoints/pbai-max/students") {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    return PBAI_MAX.route_distilled_tier(prompt, dir);
+}
+fn max_distill_route_generate(prompt = "fn ", n = 16, dir = "checkpoints/pbai-max/students", expected = nil, forbidden = nil) {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    if expected == nil { expected = [prompt]; }
+    if forbidden == nil { forbidden = ["undefined", "nan", "<unk>"]; }
+    return PBAI_MAX.generate_distilled_route_saved(prompt, n, dir, expected, forbidden);
+}
+fn max_distill_route_eval(prompt = "", dir = "checkpoints/pbai-max/students", max_examples = 256) {
+    if dir == "" { dir = "checkpoints/pbai-max/students"; }
+    return PBAI_MAX.evaluate_distilled_route_saved(prompt, dir, max_examples);
+}
+fn cache_status() { return PBAI_CACHE.status(); }
+fn cache_clear(kind = "") {
+    if kind == "" { return PBAI_CACHE.clear_all(); }
+    return PBAI_CACHE.clear_kind(kind);
+}
+
+let _BPE_TOK = nil;
+let _BPE_CORPUS = "";
+// Cached BPE tokenizer trained on pbAI's own source corpus, so its merges reflect real
+// pblang/code (retrained when the live corpus changes).
+fn _bpe() {
+    let corpus = PBAI_LM.source_corpus();
+    if _BPE_TOK == nil or _BPE_CORPUS != corpus {
+        _BPE_TOK = PBAI_BPE.train(corpus, 160);
+        _BPE_CORPUS = corpus;
+    }
+    return _BPE_TOK;
+}
+
+// bpe_tokenize(text) — subword tokenize via the BPE tokenizer; reports the compression
+// (token_count vs char_count) that shorter subword sequences buy a fixed-context model.
+fn bpe_tokenize(text, add_specials = true) {
+    let tok = _bpe();
+    let ids = PBAI_BPE.encode(tok, text, add_specials, add_specials);
+    return map{
+        format: tok.format,
+        text: text,
+        ids: ids,
+        tokens: PBAI_BPE.tokenize(tok, text, add_specials, add_specials),
+        token_count: len(ids),
+        char_count: len(text),
+        vocab_size: tok.vocab_size,
+        merges: tok.num_merges
+    };
+}
+
+// accelerate_status() — honest hardware/acceleration report (CPU-only compute, core
+// count, recommended parallelism). GPU/NPU are informational; pass true to probe.
+fn accelerate_status(allow_probe = false) {
+    return PBAI_ACCEL.detect(allow_probe);
+}
+
+// train_parallel(intensity) — retrain pbAI-Nano using multi-core best-of-N training at
+// the chosen intensity ("eco"/"balanced"/"max" or an explicit worker count). Uses more
+// CPU for a better (lowest-loss-of-N) checkpoint; reports what it did.
+fn train_parallel(intensity = "balanced", epochs = 18, lr = 0.25) {
+    let p = PBAI_ACCEL.plan(intensity);
+    let ckpt = PBAI_LM.train_nano_parallel(p.workers, epochs, lr);
+    return map{
+        intensity: intensity,
+        workers: p.workers,
+        cpu_cores: p.cpu_cores,
+        backend: p.backend,
+        tier: ckpt.tier,
+        loss_before: ckpt.metrics.loss_before,
+        loss_after: ckpt.metrics.loss_after,
+        note: "best-of-" + str(p.workers) + " across CPU cores; pblang has no GPU/NPU compute backend."
+    };
+}
+
+fn model_status() {
+    let ckpt = PBAI_LM.train_nano(2, 0.2);
+    let tok = PBAI_TOKENIZER.train_default();
+    let learning = PBAI_LM.live_stats();
+    return map{
+        family: "pbAI",
+        top: map{
+            assistant: "stdlib/pbai.sapp",
+            router: "neural intent classifier + grounded pblang skills",
+            tools: PBAI_TOOLS.short_summary(),
+            target: "full pbAI LLM family, not only pbAI-Nano"
+        },
+        tokenizer: PBAI_TOKENIZER.metadata(tok),
+        subword: PBAI_BPE.metadata(_bpe()),
+        accelerator: PBAI_ACCEL.detect(false),
+        quantization: PBAI_QUANT.capability(),
+        model_io: PBAI_TOKENIZER.model_io(tok),
+        brain: map{
+            module: "stdlib/pbai_brain.sapp",
+            format: "pbai.brain.loop.v1",
+            neural: "pbai.neural.brain.v1 portable pblang MLP",
+            loop: "perceive -> plan -> critique -> verify",
+            memory: "working + episodic + long_term",
+            agents: "root -> sub-agents -> atomic-agents -> sub-atomic-agents"
+        },
+        bottom: map{
+            lm: "stdlib/pbai_lm.sapp",
+            tier: ckpt.tier,
+            format: ckpt.format,
+            source: ckpt.source,
+            architecture: ckpt.architecture,
+            learns: true,
+            training_signal: map{
+                loss_before: ckpt.metrics.loss_before,
+                loss_after: ckpt.metrics.loss_after,
+                improved: ckpt.metrics.loss_after < ckpt.metrics.loss_before
+            },
+            live_learning: learning
+        },
+        max: PBAI_MAX.status(),
+        references: PBAI_ASSETS.implementation_plan(),
+        tool_substrate: PBAI_TOOLS.catalog()
+    };
+}
+
+fn think(prompt, observed_output = "") {
+    let loop = PBAI_BRAIN.run(prompt, observed_output);
+    loop.answer = respond(prompt);
+    let p = PBAI_BRAIN.perceive(prompt);
+    if p.kind == "code" or p.kind == "failure" or p.kind == "diff" {
+        loop.live_memory = [];
+    } else {
+        loop.live_memory = _live_memory_matches(prompt);
+    }
+    return loop;
+}
+
+// respond_tool(tool, prompt) — a tool name hint (from the gateway) overrides routing.
+fn respond_tool(tool, prompt) {
+    if tool == "ai_ollama_generate" { return generate(prompt, 80); } // replaced locally by native pbAI
+    if tool == "ai_self_critique" { return _run(1, prompt); }       // critique ≈ find bugs
+    if tool == "ai_structured_extract" { return _run(0, prompt); }  // extract ≈ explain
+    return respond(prompt);
+}
+
+fn tool_catalog() {
+    return MCP.tool_catalog();
+}
+
+fn tool_call(name, args = nil) {
+    return MCP.call(name, args);
+}
+
+export classify, classify_scores, analyze, self_eval, respond, respond_tool, generate, learn, ingest_path;
+export max_status, max_rl_status, max_memory_status, max_memory_retrieve, max_adapter_status, max_train_adapter, max_train_live_adapter, max_teach_adapter, max_train_checkpoint, max_save_checkpoint, max_load_checkpoint, max_checkpoint_summary;
+export max_continue_training, max_teach, max_generate, max_generate_ranked, max_verify_generation, max_generate_verified, max_eval, max_regression, max_benchmark, max_distillation_preview, max_distill_train, max_distill_family, max_distill_save_family, max_distill_family_summary;
+export max_distill_student_eval, max_distill_family_eval, max_distill_student_generate, max_distill_student_generate_ranked;
+export max_distill_route, max_distill_route_generate, max_distill_route_eval;
+export cache_status, cache_clear;
+export model_status, think, bpe_tokenize, accelerate_status, train_parallel,
+       tool_catalog, tool_call;

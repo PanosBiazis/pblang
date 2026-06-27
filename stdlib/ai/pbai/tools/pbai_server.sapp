@@ -1,0 +1,237 @@
+// tools/pbai_server.sapp -- local pbAI website + API server, written in pblang.
+//
+// Run from ai/pbai:
+//   pblang run tools/pbai_server.sapp --allow-all -- 8088
+// Optional hardening:
+//   PBAI_SERVER_TOKEN=<random> pblang run tools/pbai_server.sapp --allow-all -- 8088 --allow-ingest
+//
+// Then open:
+//   http://127.0.0.1:8088/website/
+
+let http = import("stdlib:http_server.sapp");
+let pbai = import("stdlib/pbai.sapp");
+let tokmod = import("stdlib/pbai_tokenizer.sapp");
+let brain = import("stdlib/pbai_brain.sapp");
+
+fn _cli_arg(idx, fallback = "") {
+    let a = os_args();
+    let start = 0;
+    let i = 0;
+    while i < len(a) {
+        if a[i] == "--" { start = i + 1; }
+        i = i + 1;
+    }
+    let real = start + idx;
+    if real < len(a) { return a[real]; }
+    return fallback;
+}
+
+fn _has_flag(flag) {
+    let a = os_args();
+    let i = 0;
+    while i < len(a) {
+        if a[i] == flag { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _server_token() {
+    return try env_get("PBAI_SERVER_TOKEN") catch "";
+}
+
+fn _allowed_origin() {
+    return try env_get("PBAI_SERVER_ORIGIN") catch ("http://127.0.0.1:" + str(_cli_arg(0, "8088")));
+}
+
+fn _path_only(p) {
+    return str_split(p, "?")[0];
+}
+
+fn _starts(s, prefix) {
+    return str_starts_with(s, prefix);
+}
+
+fn _bad_static_path(rel) {
+    if rel == nil { return true; }
+    let s = str(rel);
+    if s == "" { return false; }
+    if _starts(s, "/") { return true; }
+    if _starts(s, "\\") { return true; }
+    if str_contains(s, "..") { return true; }
+    if str_contains(s, ":") { return true; }
+    if str_contains(s, "\\") { return true; }
+    return false;
+}
+
+fn _request_json(req) {
+    let body = try req.body catch "";
+    if str_trim(body) == "" { return map{}; }
+    return try json_parse(body) catch map{};
+}
+
+fn _prompt(req_json) {
+    return try str(req_json.prompt) catch "";
+}
+
+fn _observed(req_json) {
+    return try str(req_json.observed_output) catch "";
+}
+
+fn _n(req_json) {
+    return try req_json.n catch 80;
+}
+
+fn _epochs(req_json) {
+    return try req_json.epochs catch 8;
+}
+
+fn _path(req_json) {
+    return try str(req_json.path) catch "";
+}
+
+fn _max_files(req_json) {
+    return try req_json.max_files catch 80;
+}
+
+fn _max_depth(req_json) {
+    return try req_json.max_depth catch 4;
+}
+
+fn _json(status, value) {
+    return map{
+        status: status,
+        json: value,
+        headers: map{
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": _allowed_origin(),
+            "Access-Control-Allow-Headers": "Content-Type, X-pbAI-Token",
+            "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+        }
+    };
+}
+
+fn _ok(action, value) {
+    return _json(200, map{ ok: true, action: action, value: value });
+}
+
+fn _err(status, message) {
+    return _json(status, map{ ok: false, error: message });
+}
+
+fn _tokenize(prompt) {
+    let tok = tokmod.train_default();
+    let ids = tokmod.encode(tok, prompt, true, true);
+    return map{
+        description: tokmod.describe(tok),
+        ids: ids,
+        tokens: tokmod.tokenize(tok, prompt, true, true),
+        decoded: tokmod.decode(tok, ids)
+    };
+}
+
+fn _header(req, name) {
+    let v = try req.headers[name] catch nil;
+    if v != nil { return v; }
+    return try req.headers[str_lower(name)] catch "";
+}
+
+fn _origin_allowed(req) {
+    let origin = _header(req, "Origin");
+    if origin == "" { return true; }
+    return origin == _allowed_origin();
+}
+
+fn _authorized(req) {
+    let token = _server_token();
+    if token == "" { return true; }
+    let header = _header(req, "X-pbAI-Token");
+    if header == token { return true; }
+    let auth = _header(req, "Authorization");
+    return auth == "Bearer " + token;
+}
+
+fn _api(action, req) {
+    let data = _request_json(req);
+    let prompt = _prompt(data);
+    if action == "health" {
+        return _json(200, map{ ok: true, server: "pbai-local-pblang", runtime: "pblang" });
+    }
+    if action == "respond" {
+        return _ok(action, map{ response: pbai.respond(prompt), thought: pbai.think(prompt, _observed(data)) });
+    }
+    if action == "analyze" { return _ok(action, pbai.analyze(prompt)); }
+    if action == "self_eval" { return _ok(action, pbai.self_eval(prompt)); }
+    if action == "think" { return _ok(action, pbai.think(prompt, _observed(data))); }
+    if action == "generate" { return _ok(action, pbai.generate(prompt, _n(data))); }
+    if action == "tokenize" { return _ok(action, _tokenize(prompt)); }
+    if action == "learn" { return _ok(action, pbai.learn(prompt, _epochs(data))); }
+    if action == "ingest_path" {
+        if not _has_flag("--allow-ingest") { return _err(403, "ingest_path requires --allow-ingest"); }
+        return _ok(action, pbai.ingest_path(_path(data), _max_files(data), _max_depth(data), _epochs(data)));
+    }
+    if action == "status" { return _ok(action, pbai.model_status()); }
+    if action == "brain" { return _ok(action, brain.run(prompt, _observed(data))); }
+    if action == "tool_catalog" { return _ok(action, pbai.tool_catalog()); }
+    if action == "tool_call" {
+        // tool_call reaches the pb_mcp bridge (read-only file/code tools + Watchers).
+        // Gated for a network server so remote clients can't read the workspace unless
+        // the operator opts in, mirroring --allow-ingest.
+        if not _has_flag("--allow-tools") { return _err(403, "tool_call requires --allow-tools"); }
+        return _ok(action, pbai.tool_call(try str(data.tool) catch "", try data.args catch nil));
+    }
+    return _err(404, "unknown pbAI action: " + action);
+}
+
+fn _action_from_path(path) {
+    let parts = str_split(path, "/");
+    if len(parts) >= 4 { return parts[3]; }
+    return "";
+}
+
+fn _static(req_path) {
+    let p = _path_only(req_path);
+    if p == "/" or p == "" {
+        return map{ status: 302, body: "", headers: map{ "Location": "/website/" } };
+    }
+    if _starts(p, "/website/") {
+        let rel = str_slice(p, len("/website/"), len(p));
+        if rel == "" { rel = "index.html"; }
+        if _bad_static_path(rel) {
+            return _err(400, "bad static path");
+        }
+        return http.static_file_response("website", rel);
+    }
+    return _err(404, "not found");
+}
+
+fn handler(req) {
+    let method = try req.method catch "GET";
+    let path = _path_only(try req.path catch "/");
+    if method == "OPTIONS" {
+        return _json(200, map{ ok: true });
+    }
+    if path == "/api/health" {
+        return _api("health", req);
+    }
+    if _starts(path, "/api/pbai/") {
+        if method != "POST" {
+            return _err(405, "pbAI API uses POST");
+        }
+        if not _origin_allowed(req) { return _err(403, "origin not allowed"); }
+        if not _authorized(req) { return _err(401, "missing or invalid pbAI server token"); }
+        return _api(_action_from_path(path), req);
+    }
+    return _static(path);
+}
+
+fn main() {
+    let port = _cli_arg(0, "8088");
+    let addr = "127.0.0.1:" + str(port);
+    print "pbAI pblang server starting";
+    print "website: http://" + addr + "/website/";
+    print "api:     http://" + addr + "/api/health";
+    http.serve_forever(addr, handler);
+}
+
+main();

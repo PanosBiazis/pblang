@@ -1,0 +1,527 @@
+// Test: pbai_ideal_bridge.sapp — wires the Ideal NN into the REAL pbai LM model.
+//
+// The Ideal NN modules (pbai_ideal_nn / pbai_rl) operate on an abstract view
+// { layers, output_dist, complex_weights }. The bridge adapts a real pbai LM
+// model { E, W1, b1, W2, b2, V, D, H, K } into that view, exposes an ideality
+// STATUS for observability, and provides a SOUND training nudge
+// (orthogonal regularization of W1/W2 — orthonormal columns = dynamical
+// isometry = better gradient flow). All deterministic; no Rust.
+
+let br = import("stdlib/pbai_ideal_bridge.sapp");
+let nn = import("stdlib/pbai_ideal_nn.sapp");
+
+fn approx(a, b) { let d = a - b; if d < 0 { d = 0 - d; } return d < 0.0001; }
+
+// A tiny hand-built LM model (same field shape as pbai_lm.model_new). W1/W2 are
+// near-orthonormal-ish so the Newton-Schulz nudge sits in its convergence basin.
+fn tiny_model() {
+    return map{
+        E:  [[0.1, 0.2], [0.0, 0.1]],
+        W1: [[1.1, 0.05], [0.0, 0.95]],
+        b1: [0.0, 0.0],
+        W2: [[1.05, 0.0, 0.1], [0.02, 0.9, 0.0]],
+        b2: [0.0, 0.0, 0.0],
+        V: 3, D: 2, H: 2, K: 1
+    };
+}
+
+// ── output_prior: softmax(b2) is a valid probability distribution ──────────────
+let m = tiny_model();
+let prior = br.output_prior(m);
+let s = 0.0;
+let i = 0;
+while i < len(prior) { s = s + prior[i]; i = i + 1; }
+assert(approx(s, 1.0), "output_prior is a normalized distribution");
+assert(approx(prior[0], 1.0 / 3.0), "zero b2 -> uniform prior");
+
+// ── default_target_dist is uniform and normalized ──────────────────────────────
+let td = br.default_target_dist(3);
+assert(len(td) == 3 and approx(td[0], 1.0 / 3.0), "default target dist is uniform");
+
+// ── ideality_status: real-model observability with all four axes ───────────────
+let st = br.ideality_status(m, nil);
+assert(st.total >= 0.0, "ideality total is non-negative");
+assert(st.spectral >= 0.0, "spectral defect present");
+assert(len(st.per_layer_spectral) == 2, "per-layer spectral defect for W1 and W2");
+// output prior is uniform == default target -> distributional/geometric ~ 0
+assert(approx(st.distributional, 0.0), "uniform prior matches uniform target (KL ~ 0)");
+assert(approx(st.geometric, 0.0), "uniform prior matches uniform target (Fisher-Rao ~ 0)");
+
+// ── THE wiring claim: orthogonal_regularize REDUCES the real model's spectral
+//    defect (||W^T W - I||). This proves the Ideal NN is acting on the real
+//    model's actual weight matrices, not a toy. ──────────────────────────────────
+fn spectral_total(model) {
+    return nn.orthogonality_defect(model.W1) + nn.orthogonality_defect(model.W2);
+}
+let before = spectral_total(m);
+let m2 = br.orthogonal_regularize(m, 0.5);
+let after = spectral_total(m2);
+assert(after < before, "orthogonal regularization lowers the model's orthogonality defect");
+// it must preserve the model's structure (shape/fields) so training can continue
+assert(m2.V == 3 and m2.D == 2 and m2.H == 2 and m2.K == 1, "model dims preserved");
+assert(len(m2.W1) == 2 and len(m2.W2) == 2, "weight-matrix shapes preserved");
+assert(m2.b2[0] == m.b2[0], "biases untouched by the spectral nudge");
+
+// repeated nudges keep improving (monotone toward orthogonality)
+let m3 = br.orthogonal_regularize(m2, 0.5);
+assert(spectral_total(m3) < after, "successive nudges keep reducing the defect");
+
+// ── regularized_loss = task_loss + lambda * ideality total ──────────────────────
+let rl = br.regularized_loss(m, 2.0, 0.1, nil);
+assert(approx(rl, 2.0 + 0.1 * st.total), "regularized loss adds lambda * ideality");
+
+// ── status carries a human-readable summary ─────────────────────────────────────
+assert(len(st.summary) > 0, "status includes a summary string");
+
+// ── train_with_orthogonal_reg: interleave task steps + spectral regularization.
+//    A no-op task step (weights unchanged) + regularization every step must
+//    monotonically improve conditioning and track both histories. ───────────────
+let tm = tiny_model();
+let step_count = 0;
+fn noop_step(m) { return map{ model: m, loss: 1.0 }; }
+let run = br.train_with_orthogonal_reg(tm, noop_step, 4, 1, 0.5, nil);
+assert(run.format == "pbai.ideal_bridge.train.v1", "trainer format tag");
+assert(len(run.loss_history) == 4, "one loss entry per step");
+assert(len(run.spectral_history) == 5, "initial + one spectral entry per step");
+assert(run.improved_conditioning, "regularization must not worsen conditioning");
+// spectral history is non-increasing (each reg step only lowers the defect)
+let h = run.spectral_history;
+let k = 1;
+while k < len(h) {
+    assert(h[k] <= h[k - 1] + 0.0000001, "spectral defect never increases under regularization");
+    k = k + 1;
+}
+assert(h[len(h) - 1] < h[0], "after 4 reg steps the defect is strictly lower");
+
+// ── train_with_adaptive_reg: regularize ON DEMAND, only when the spectral defect
+//    exceeds a tolerance. A high tolerance should NEVER fire; a low tolerance
+//    should fire and pull the defect under budget. ──────────────────────────────
+fn noop_step2(mm) { return map{ model: mm, loss: 0.5 }; }
+
+// High tolerance: the tiny model already sits under it, so no regularization.
+let lazy = br.train_with_adaptive_reg(tiny_model(), noop_step2, 3, 100.0, 0.5, nil);
+assert(lazy.format == "pbai.ideal_bridge.adaptive.v1", "adaptive trainer format tag");
+assert(lazy.reg_count == 0, "no regularization when defect is within tolerance");
+assert(len(lazy.spectral_history) == 4, "initial + one spectral entry per step");
+assert(lazy.within_tolerance, "lazy run ends within tolerance");
+
+// Tight tolerance: the model starts above it (~1.27) and the spectral axis
+// asymptotes toward ~1.0 under the nudge, so a budget just above the floor forces
+// a few on-demand corrections and then stops once under budget.
+let tol = 1.05;
+let strict = br.train_with_adaptive_reg(tiny_model(), noop_step2, 6, tol, 0.5, nil);
+assert(strict.reg_count > 0, "tight tolerance triggers on-demand regularization");
+assert(strict.within_tolerance, "adaptive run drives the defect under tolerance");
+assert(strict.spectral_history[len(strict.spectral_history) - 1] <= tol + 0.0000001, "final defect under budget");
+assert(strict.reg_count < strict.steps, "stops regularizing once under budget (not every step)");
+assert(strict.reg_steps[0] >= 1, "reg_steps records 1-based step indices");
+
+// ── training_summary: assess a training run's conditioning + loss trajectory ──
+let tmrun = br.train_with_orthogonal_reg(tiny_model(), noop_step2, 4, 1, 0.5, nil);
+let sum = br.training_summary(tmrun);
+assert(sum.format == "pbai.ideal_bridge.training_summary.v1", "training_summary format");
+assert(sum.steps == 4, "training_summary step count");
+assert(sum.conditioning_improved, "regularized run improves conditioning");
+assert(sum.spectral_last <= sum.spectral_first, "spectral defect did not grow");
+assert(sum.spectral_delta <= 0.0, "spectral delta non-positive");
+assert(sum.loss_first == 0.5 and sum.loss_last == 0.5, "noop loss flat");
+assert(sum.loss_improved, "flat loss counts as not-worse");
+assert(len(sum.summary) > 0, "training_summary has a summary string");
+// adaptive run summary surfaces reg_count
+let adrun = br.train_with_adaptive_reg(tiny_model(), noop_step2, 5, 1.05, 0.5, nil);
+let adsum = br.training_summary(adrun);
+assert(adsum.reg_count != nil and adsum.reg_count >= 0, "adaptive summary carries reg_count");
+
+// ── recommend_regularization: dry-run advice from reclaimable conditioning ──
+// tiny_model has reclaimable defect in W1 (within the Newton-Schulz basin) ->
+// "regularize"; a model already nudged to its floor -> "none".
+let rec_reg = br.recommend_regularization(tiny_model(), nil, 0.02);
+assert(rec_reg.format == "pbai.ideal_bridge.recommendation.v1", "recommendation format");
+assert(rec_reg.action == "regularize", "model with reclaimable defect should be flagged");
+assert(rec_reg.suggested_lr > 0.0 and rec_reg.suggested_lr <= 0.5, "suggested lr in (0, 0.5]");
+assert(rec_reg.relative_improvement > 0.02, "a nudge reclaims total defect");
+assert(rec_reg.total_defect_after_trial < rec_reg.total_defect_before, "dry-run nudge lowers total defect");
+// after several nudges the model settles at its floor -> no further benefit
+let settled = tiny_model();
+let ri = 0;
+while ri < 8 { settled = br.orthogonal_regularize(settled, 0.5); ri = ri + 1; }
+let rec_settled = br.recommend_regularization(settled, nil, 0.02);
+assert(rec_settled.action == "none", "settled model needs no further regularization");
+
+// ── auto_regularize: run recommend -> act until the model hits its floor ──
+let ar = br.auto_regularize(tiny_model(), 12, nil);
+assert(ar.format == "pbai.ideal_bridge.auto_reg.v1", "auto_regularize format");
+assert(ar.rounds > 0, "a model with reclaimable defect needs at least one round");
+assert(ar.converged, "auto_regularize converges within the round budget");
+assert(ar.final_total_defect < ar.start_total_defect, "auto_regularize lowers total defect");
+assert(len(ar.log) == ar.rounds + 1, "log records each acting round plus the final 'none'");
+// re-running on the already-conditioned model does nothing
+let ar2 = br.auto_regularize(ar.final, 12, nil);
+assert(ar2.rounds == 0, "a settled model needs no rounds");
+
+// ── output_entropy + model_health ──
+// b2 all zeros -> uniform prior -> entropy ~ 1.0 (maximally diverse).
+let ent_uniform = br.output_entropy(tiny_model());
+assert(ent_uniform > 0.999, "uniform output prior has ~max entropy (got " + str(ent_uniform) + ")");
+// a peaked b2 -> lower entropy
+let peaked = tiny_model();
+peaked.b2 = [10.0, 0.0, 0.0];
+assert(br.output_entropy(peaked) < ent_uniform, "peaked prior has lower entropy than uniform");
+let health = br.model_health(tiny_model(), nil);
+assert(health.format == "pbai.ideal_bridge.health.v1", "model_health format");
+assert(health.output_entropy > 0.999, "health reports the entropy");
+assert(health.recommendation == "regularize" or health.recommendation == "none", "health carries a recommendation");
+assert(len(health.summary) > 0, "health has a summary string");
+
+// ── target_from_corpus: Laplace-smoothed distribution from token counts ──
+let td_c = br.target_from_corpus([0, 10, 0], 1.0);
+let tsum = 0.0; let ti = 0;
+while ti < len(td_c) { tsum = tsum + td_c[ti]; ti = ti + 1; }
+assert(approx(tsum, 1.0), "corpus target is normalized");
+assert(td_c[1] > td_c[0] and td_c[0] > 0.0, "higher count -> higher prob; smoothing keeps zeros positive");
+// usable as a target_dist for ideality (a model's prior vs a real-data target)
+let st_c = br.ideality_status(tiny_model(), td_c);
+assert(st_c.total >= 0.0, "ideality measurable against a corpus target");
+
+// ── compare_models: A/B selection on conditioning + diversity ──
+let cond = br.auto_regularize(tiny_model(), 12, nil).final;   // conditioned variant
+let cmp = br.compare_models(cond, tiny_model(), nil);
+assert(cmp.format == "pbai.ideal_bridge.compare.v1", "compare_models format");
+assert(cmp.better_conditioned == "a", "the regularized model is better conditioned");
+// a peaked-output model is less diverse than the uniform tiny_model
+let peaked2 = tiny_model();
+peaked2.b2 = [8.0, 0.0, 0.0];
+let cmp2 = br.compare_models(tiny_model(), peaked2, nil);
+assert(cmp2.more_diverse == "a", "the uniform-output model is more diverse");
+
+// ── rank_models: N-way selection across checkpoints/variants ──
+// Score rewards diversity (entropy) and penalizes conditioning defect
+// (ideality_total). The conditioned variant should rank ABOVE the raw model,
+// and a peaked (low-entropy) model should rank LAST.
+let cond3 = br.auto_regularize(tiny_model(), 12, nil).final;
+let peaked3 = tiny_model();
+peaked3.b2 = [8.0, 0.0, 0.0];
+let rk = br.rank_models([tiny_model(), cond3, peaked3], nil);
+assert(rk.format == "pbai.ideal_bridge.ranking.v1", "rank_models format");
+assert(len(rk.ranking) == 3, "ranking covers every model");
+assert(rk.ranking[0].index == 1, "the conditioned model (index 1) ranks first");
+assert(rk.best_index == 1, "best_index points at the conditioned model");
+// ranking is sorted by score, non-increasing
+assert(rk.ranking[0].score >= rk.ranking[1].score, "ranking sorted by score (0>=1)");
+assert(rk.ranking[1].score >= rk.ranking[2].score, "ranking sorted by score (1>=2)");
+assert(rk.ranking[2].index == 2, "the peaked low-diversity model ranks last");
+// empty input is handled
+let rk0 = br.rank_models([], nil);
+assert(len(rk0.ranking) == 0 and rk0.best_index == 0 - 1, "empty ranking -> best_index -1");
+
+// ── pick_best: the winner + selection-confidence margin to the runner-up ──
+let pk = br.pick_best([tiny_model(), cond3, peaked3], nil);
+assert(pk.format == "pbai.ideal_bridge.pick.v1", "pick_best format");
+assert(pk.index == 1, "pick_best chooses the conditioned model");
+assert(pk.health.ideality_total == br.model_health(cond3, nil).ideality_total, "pick_best carries the winner's health");
+assert(pk.margin > 0.0, "a clear winner has a positive margin over the runner-up");
+assert(pk.confident == true, "positive margin -> confident pick");
+// empty -> no pick
+let pk0 = br.pick_best([], nil);
+assert(pk0.index == 0 - 1 and pk0.confident == false, "empty -> no confident pick");
+
+// ── ensemble_prior: soft, ideality-weighted blend of model outputs ──
+// Generalizes pick_best (hard argmax) into a temperature-controlled softmax
+// over selection scores, blending each model's output prior into one
+// distribution. Better-conditioned/diverse models pull more weight.
+let cond4 = br.auto_regularize(tiny_model(), 12, nil).final;
+let peaked4 = tiny_model();
+peaked4.b2 = [8.0, 0.0, 0.0];
+let ens = br.ensemble_prior([tiny_model(), cond4, peaked4], nil, 1.0);
+assert(ens.format == "pbai.ideal_bridge.ensemble.v1", "ensemble_prior format");
+assert(ens.n == 3, "ensemble covers every model");
+// weights form a valid distribution
+let wsum = 0.0; let wi = 0;
+while wi < len(ens.weights) { wsum = wsum + ens.weights[wi]; wi = wi + 1; }
+assert(approx(wsum, 1.0), "ensemble weights sum to 1");
+// blended prior is a valid distribution (length V, sums to 1)
+assert(len(ens.prior) == 3, "ensemble prior has V entries");
+let psum = 0.0; let pi = 0;
+while pi < len(ens.prior) { psum = psum + ens.prior[pi]; pi = pi + 1; }
+assert(approx(psum, 1.0), "ensemble prior is normalized");
+// the best model (conditioned, index 1) carries the largest weight
+assert(ens.weights[1] >= ens.weights[0] and ens.weights[1] >= ens.weights[2], "best model dominates ensemble weight");
+// temperature: LOWER temp concentrates weight on the winner, HIGHER flattens it
+let ens_hot = br.ensemble_prior([tiny_model(), cond4, peaked4], nil, 5.0);
+assert(ens.weights[1] > ens_hot.weights[1], "lower temperature concentrates weight on the winner");
+// reported ensemble entropy is the normalized entropy of the blended prior
+assert(ens.entropy >= 0.0 and ens.entropy <= 1.0001, "ensemble entropy normalized to [0,1]");
+// empty input handled
+let ens0 = br.ensemble_prior([], nil, 1.0);
+assert(ens0.n == 0 and len(ens0.prior) == 0, "empty ensemble -> no prior");
+
+// ── diagnose_model: one-call model debugging report ──
+// Combines conditioning (ideality), output diversity (entropy), and the
+// regularization dry-run into flags + a verdict + the worst-conditioned layer.
+fn has_flag(flags, name) {
+    let i = 0;
+    while i < len(flags) { if flags[i] == name { return true; } i = i + 1; }
+    return false;
+}
+let dg = br.diagnose_model(tiny_model(), nil);
+assert(dg.format == "pbai.ideal_bridge.diagnose.v1", "diagnose_model format");
+assert(dg.flags != nil, "diagnose_model lists flags");
+assert(dg.verdict != nil, "diagnose_model gives a verdict");
+assert(dg.worst_layer >= 0, "diagnose_model identifies the worst-conditioned layer");
+
+// a peaked-output model is flagged collapsed and is not healthy
+let peakedD = tiny_model();
+peakedD.b2 = [10.0, 0.0, 0.0];
+let dgp = br.diagnose_model(peakedD, nil);
+assert(has_flag(dgp.flags, "collapsed_output"), "peaked model flagged collapsed_output");
+assert(dgp.verdict != "healthy", "a collapsed model is not healthy");
+
+// after auto_regularize converges, recommend says "none" -> no ill_conditioned flag
+let condD = br.auto_regularize(tiny_model(), 12, nil).final;
+let dgc = br.diagnose_model(condD, nil);
+assert(not has_flag(dgc.flags, "ill_conditioned"), "a converged model is not flagged ill_conditioned");
+
+// ── fleet_report: rank + per-model diagnosis + a deployment recommendation ──
+fn find_entry(entries, idx) {
+    let i = 0;
+    while i < len(entries) { if entries[i].index == idx { return entries[i]; } i = i + 1; }
+    return nil;
+}
+let condR = br.auto_regularize(tiny_model(), 12, nil).final;
+let peakedR = tiny_model();
+peakedR.b2 = [10.0, 0.0, 0.0];
+let rep = br.fleet_report([tiny_model(), condR, peakedR], nil);
+assert(rep.format == "pbai.ideal_bridge.fleet.v1", "fleet_report format");
+assert(len(rep.entries) == 3, "fleet_report covers every model");
+assert(rep.best_index == 1, "fleet_report recommends the conditioned model");
+assert(rep.entries[0].index == rep.best_index, "first entry is the ranked winner");
+assert(rep.entries[0].rank == 0, "ranks are 0-based");
+assert(rep.entries[0].verdict != nil, "entries carry a diagnosis verdict");
+let pe = find_entry(rep.entries, 2);
+assert(pe != nil and has_flag(pe.flags, "collapsed_output"), "the peaked model is flagged collapsed in the report");
+assert(rep.healthy_count + rep.needs_attention_count + rep.unhealthy_count == 3, "verdict tallies cover every model");
+assert(rep.recommendation != nil, "fleet_report gives a deployment recommendation");
+let rep0 = br.fleet_report([], nil);
+assert(len(rep0.entries) == 0 and rep0.best_index == 0 - 1, "empty fleet -> no recommendation");
+
+// ── consensus_score: inter-model output agreement (pick-one vs ensemble) ──
+let condC = br.auto_regularize(tiny_model(), 12, nil).final;   // output prior unchanged (b2 fixed)
+let peakedC = tiny_model();
+peakedC.b2 = [10.0, 0.0, 0.0];
+let cs2 = br.consensus_score([tiny_model(), condC], nil);
+assert(cs2.format == "pbai.ideal_bridge.consensus.v1", "consensus_score format");
+assert(cs2.mean_agreement > 0.99, "near-identical outputs -> ~full agreement");
+let cs3 = br.consensus_score([tiny_model(), condC, peakedC], nil);
+assert(cs3.mean_agreement < cs2.mean_agreement, "a divergent model lowers consensus");
+assert(cs3.most_divergent.a == 2 or cs3.most_divergent.b == 2, "the peaked model is in the most-divergent pair");
+assert(cs3.most_divergent.agreement < 0.9, "the divergent pair has low overlap");
+let cs1 = br.consensus_score([tiny_model()], nil);
+assert(cs1.mean_agreement == 1.0 and cs1.most_divergent == nil, "single model -> trivial full consensus");
+let cs0 = br.consensus_score([], nil);
+assert(cs0.n == 0, "empty consensus handled");
+
+// ── recommend_strategy: fuse fleet health + consensus into one action ──
+let condS = br.auto_regularize(tiny_model(), 12, nil).final;
+let stratA = br.recommend_strategy([condS, tiny_model()], nil);
+assert(stratA.format == "pbai.ideal_bridge.strategy.v1", "recommend_strategy format");
+assert(stratA.strategy == "deploy_single", "a clear healthy winner -> deploy_single");
+assert(stratA.best_index == 0, "winner is the conditioned model (index 0)");
+
+// tight race (symmetric scores) + divergent outputs -> ensemble
+let condP = br.auto_regularize(tiny_model(), 12, nil).final;
+condP.b2 = [2.0, 0.0, 0.0];
+let condQ = br.auto_regularize(tiny_model(), 12, nil).final;
+condQ.b2 = [0.0, 2.0, 0.0];
+let stratB = br.recommend_strategy([condP, condQ], nil);
+assert(stratB.strategy == "ensemble", "tight race + low consensus -> ensemble");
+
+// best available is unhealthy -> retrain
+let bad1 = tiny_model();
+bad1.b2 = [12.0, 0.0, 0.0];
+let bad2 = tiny_model();
+bad2.b2 = [0.0, 0.0, 12.0];
+let stratC = br.recommend_strategy([bad1, bad2], nil);
+assert(stratC.strategy == "retrain", "an all-unhealthy fleet -> retrain");
+
+assert(br.recommend_strategy([tiny_model()], nil).strategy == "deploy_single", "single model -> deploy_single");
+assert(br.recommend_strategy([], nil).strategy == "none", "empty fleet -> none");
+
+// ── summarize: human-readable one-liner for any family result ──
+let stratX = br.recommend_strategy([condS, tiny_model()], nil);
+let txtS = br.summarize(stratX);
+assert(str_contains(txtS, "strategy"), "summarize labels a strategy result");
+assert(str_contains(txtS, "deploy_single"), "summarize includes the chosen action");
+
+let flX = br.fleet_report([condS, tiny_model()], nil);
+assert(str_contains(br.summarize(flX), "fleet"), "summarize labels a fleet result");
+
+let dgX = br.diagnose_model(tiny_model(), nil);
+assert(str_contains(br.summarize(dgX), dgX.verdict), "summarize a diagnosis includes its verdict");
+
+let csX = br.consensus_score([condS, tiny_model()], nil);
+assert(str_contains(br.summarize(csX), "consensus"), "summarize labels a consensus result");
+
+assert(br.summarize(map{ foo: 1 }) != nil, "summarize tolerates an unknown shape");
+
+// ── checkpoint_gate: accept a new checkpoint only if it's healthy AND improves ──
+let prevG = br.auto_regularize(tiny_model(), 12, nil).final;
+let gate1 = br.checkpoint_gate(tiny_model(), prevG, nil);   // raw -> conditioned: improves
+assert(gate1.format == "pbai.ideal_bridge.gate.v1", "checkpoint_gate format");
+assert(gate1.accept == true, "a healthier, higher-scoring checkpoint is accepted");
+assert(gate1.delta > 0.0, "an accepted checkpoint has positive score delta");
+
+let badG = tiny_model();
+badG.b2 = [12.0, 0.0, 0.0];                                  // collapsed + unhealthy
+let gate2 = br.checkpoint_gate(prevG, badG, nil);
+assert(gate2.accept == false, "an unhealthy checkpoint is rejected even if scored");
+
+let lowerG = br.auto_regularize(tiny_model(), 12, nil).final;
+lowerG.b2 = [1.5, 0.0, 0.0];                                 // healthy-ish but lower score
+let gate3 = br.checkpoint_gate(prevG, lowerG, nil);
+assert(gate3.accept == false, "a non-improving checkpoint is rejected");
+assert(gate3.delta <= 0.0, "a non-improving checkpoint has non-positive delta");
+
+// ── select: one-call capstone — returns WHAT TO USE, not just advice ──
+let condSel = br.auto_regularize(tiny_model(), 12, nil).final;
+let sel = br.select([condSel, tiny_model()], nil);
+assert(sel.format == "pbai.ideal_bridge.select.v1", "select format");
+assert(sel.strategy == "deploy_single", "select picks deploy_single for a clear winner");
+assert(sel.model != nil and sel.index == 0, "select returns the chosen model + index");
+
+let b1 = tiny_model();
+b1.b2 = [12.0, 0.0, 0.0];
+let b2 = tiny_model();
+b2.b2 = [0.0, 0.0, 12.0];
+let selR = br.select([b1, b2], nil);
+assert(selR.strategy == "retrain" and selR.model == nil, "retrain -> no model, advice instead");
+
+let cP = br.auto_regularize(tiny_model(), 12, nil).final;
+cP.b2 = [2.0, 0.0, 0.0];
+let cQ = br.auto_regularize(tiny_model(), 12, nil).final;
+cQ.b2 = [0.0, 2.0, 0.0];
+let selE = br.select([cP, cQ], nil);
+assert(selE.strategy == "ensemble" and selE.ensemble != nil, "ensemble -> blended prior returned");
+
+// ── pareto_front: non-dominated models on (conditioning, diversity) ──
+fn contains(a, x) {
+    let i = 0;
+    while i < len(a) { if a[i] == x { return true; } i = i + 1; }
+    return false;
+}
+// mA: well-conditioned (low spectral) but peaked output (low entropy)
+let mA = br.auto_regularize(tiny_model(), 12, nil).final;
+mA.b2 = [3.0, 0.0, 0.0];
+// mB: poorly-conditioned (high spectral, raw W) but uniform output (max entropy)
+let mB = tiny_model();
+// mC: poorly-conditioned AND peaked -> dominated on both axes
+let mC = tiny_model();
+mC.b2 = [3.0, 0.0, 0.0];
+let pf = br.pareto_front([mA, mB, mC], nil);
+assert(pf.format == "pbai.ideal_bridge.pareto.v1", "pareto_front format");
+assert(contains(pf.dominated, 2), "mC (poorly-conditioned + peaked) is dominated");
+assert(not contains(pf.front, 2), "mC is not on the Pareto front");
+assert(contains(pf.front, 0) and contains(pf.front, 1), "well-conditioned-peaked and raw-uniform are both Pareto-optimal");
+
+// ── improvement: per-axis training delta with a verdict ──
+let prevI = tiny_model();
+let newI = br.auto_regularize(tiny_model(), 12, nil).final;   // better conditioning, same output
+let imp = br.improvement(prevI, newI, nil);
+assert(imp.format == "pbai.ideal_bridge.improvement.v1", "improvement format");
+assert(imp.spectral_delta > 0.0, "conditioning improved (positive spectral_delta)");
+assert(imp.verdict == "improved", "better on both/either axis -> improved");
+
+let badI = tiny_model();
+badI.b2 = [10.0, 0.0, 0.0];                                    // raw W + collapsed output
+let imp2 = br.improvement(newI, badI, nil);
+assert(imp2.verdict == "regressed", "to a worse-on-both model -> regressed");
+
+// ── report_text: full human-readable dashboard for a fleet ──
+let condR2 = br.auto_regularize(tiny_model(), 12, nil).final;
+let rt = br.report_text([condR2, tiny_model()], nil);
+assert(str_contains(rt, "pbai model report"), "report has a header");
+assert(str_contains(rt, "strategy"), "report includes the strategy");
+assert(str_contains(rt, "consensus"), "report includes consensus");
+assert(str_contains(rt, "pareto front"), "report includes the pareto front");
+assert(str_contains(rt, "ranking"), "report includes the ranking");
+assert(br.report_text([], nil) != nil, "empty fleet report is handled");
+
+// ── best_for_corpus: select against a REAL data distribution (token counts) ──
+let condBC = br.auto_regularize(tiny_model(), 12, nil).final;
+let bc = br.best_for_corpus([condBC, tiny_model()], [10, 5, 1]);
+assert(bc.format == "pbai.ideal_bridge.select.v1", "best_for_corpus returns a selection");
+assert(bc.strategy != nil, "best_for_corpus has a strategy");
+assert(bc.target != nil and len(bc.target) == 3, "best_for_corpus attaches the corpus-derived target");
+assert(bc.target[0] > bc.target[2], "higher token count -> higher target probability");
+
+// ── rank_for_targets: best model per candidate target distribution ──
+let condMT = br.auto_regularize(tiny_model(), 12, nil).final;
+let t1 = br.default_target_dist(3);     // uniform
+let t2 = [0.8, 0.1, 0.1];               // peaked
+let rft = br.rank_for_targets([condMT, tiny_model()], [t1, t2]);
+assert(rft.format == "pbai.ideal_bridge.multitarget.v1", "rank_for_targets format");
+assert(len(rft.per_target) == 2, "one result per target distribution");
+assert(rft.per_target[0].target_index == 0 and rft.per_target[1].target_index == 1, "targets indexed in order");
+assert(rft.per_target[0].best_index >= 0 and rft.per_target[0].best_index < 2, "valid winner index");
+
+// ── score: the public selection score (entropy - ideality) ──
+let hSc = br.model_health(tiny_model(), nil);
+let sc = br.score(tiny_model(), nil);
+assert(sc == hSc.output_entropy - hSc.ideality_total, "score == output_entropy - ideality_total");
+
+// ── perplexity: exp(Shannon entropy) — the canonical "effective # of choices" ──
+assert(approx(br.perplexity([0.5, 0.5]), 2.0), "perplexity of a fair coin = 2");
+assert(approx(br.perplexity([1.0]), 1.0), "perplexity of a certain outcome = 1");
+assert(approx(br.perplexity([0.25, 0.25, 0.25, 0.25]), 4.0), "perplexity of a fair 4-way = 4");
+assert(approx(br.perplexity(br.default_target_dist(5)), 5.0), "uniform over 5 -> perplexity 5");
+// output_perplexity(model) = perplexity of the model's output prior, in [1, V]
+let oppV = len(br.output_prior(tiny_model()));
+let opp = br.output_perplexity(tiny_model());
+assert(opp >= 1.0 and opp <= oppV + 0.0001, "output perplexity sits within [1, V]");
+// and model_health surfaces it alongside entropy
+let mh = br.model_health(tiny_model(), nil);
+assert(approx(mh.output_perplexity, opp), "model_health reports the same output_perplexity");
+
+// ── KL divergence + cross-entropy: distributional comparison (nats) ──
+assert(approx(br.kl_divergence([0.5, 0.5], [0.5, 0.5]), 0.0), "KL of identical distributions = 0");
+assert(approx(br.kl_divergence([1.0, 0.0], [0.5, 0.5]), 0.6931472), "KL([1,0]||[.5,.5]) = ln2");
+assert(br.kl_divergence([0.6, 0.4], [0.4, 0.6]) > 0.0, "KL is non-negative (Gibbs' inequality)");
+assert(approx(br.cross_entropy([0.5, 0.5], [0.5, 0.5]), 0.6931472), "cross-entropy of a fair coin with itself = ln2");
+// identity CE(p,q) = H(p) + KL(p,q); H([1,0]) = 0 so CE == KL there
+assert(approx(br.cross_entropy([1.0, 0.0], [0.5, 0.5]), br.kl_divergence([1.0, 0.0], [0.5, 0.5])), "CE = H(p)+KL, with H([1,0])=0");
+// model-level: KL of the output prior against itself is 0
+let selfP = br.output_prior(tiny_model());
+assert(approx(br.output_kl(tiny_model(), selfP), 0.0), "output_kl(model, its own prior) = 0");
+
+// ── Jensen-Shannon divergence: symmetric, bounded [0, ln2], always finite ──
+assert(approx(br.js_divergence([0.5, 0.5], [0.5, 0.5]), 0.0), "JS of identical distributions = 0");
+assert(approx(br.js_divergence([1.0, 0.0], [0.0, 1.0]), 0.6931472), "JS of disjoint distributions = ln2 (max)");
+assert(approx(br.js_divergence([0.7, 0.3], [0.2, 0.8]), br.js_divergence([0.2, 0.8], [0.7, 0.3])), "JS is symmetric");
+let jsv = br.js_divergence([0.9, 0.1], [0.1, 0.9]);
+assert(jsv >= 0.0 and jsv <= 0.6931472 + 0.0001, "JS stays within [0, ln2]");
+
+// ── Hellinger distance: symmetric, true metric, bounded [0,1] ──
+assert(approx(br.hellinger_distance([0.5, 0.5], [0.5, 0.5]), 0.0), "Hellinger of identical distributions = 0");
+assert(approx(br.hellinger_distance([1.0, 0.0], [0.0, 1.0]), 1.0), "Hellinger of disjoint distributions = 1 (max)");
+assert(approx(br.hellinger_distance([0.6, 0.4], [0.3, 0.7]), br.hellinger_distance([0.3, 0.7], [0.6, 0.4])), "Hellinger is symmetric");
+let hd = br.hellinger_distance([0.8, 0.2], [0.2, 0.8]);
+assert(hd >= 0.0 and hd <= 1.0 + 0.0000001, "Hellinger stays within [0,1]");
+
+// ── total variation distance: TV = 1/2 * sum|p-q|, bounded [0,1] ──
+assert(approx(br.total_variation_distance([0.5, 0.5], [0.5, 0.5]), 0.0), "TV of identical distributions = 0");
+assert(approx(br.total_variation_distance([1.0, 0.0], [0.0, 1.0]), 1.0), "TV of disjoint distributions = 1 (max)");
+assert(approx(br.total_variation_distance([0.7, 0.3], [0.4, 0.6]), 0.3), "TV([.7,.3],[.4,.6]) = 0.3");
+assert(approx(br.total_variation_distance([0.6, 0.4], [0.1, 0.9]), br.total_variation_distance([0.1, 0.9], [0.6, 0.4])), "TV is symmetric");
+// consensus_score still works after refactoring to share the TV helper
+let cs = br.consensus_score([tiny_model(), tiny_model()], nil);
+assert(approx(cs.mean_agreement, 1.0), "two identical models agree perfectly (TV=0 -> agreement 1)");
+
+// ── Gini coefficient: distribution concentration (0 = uniform, ->1 = peaked) ──
+assert(approx(br.gini_coefficient([0.5, 0.5]), 0.0), "Gini of a uniform 2-way = 0");
+assert(approx(br.gini_coefficient([0.25, 0.25, 0.25, 0.25]), 0.0), "Gini of a uniform 4-way = 0");
+assert(approx(br.gini_coefficient([1.0, 0.0]), 0.5), "Gini of fully concentrated 2-way = 0.5");
+assert(approx(br.gini_coefficient([1.0, 0.0, 0.0, 0.0]), 0.75), "Gini of fully concentrated 4-way = 0.75");
+// model-level: output_gini in [0,1)
+let og = br.output_gini(tiny_model());
+assert(og >= 0.0 and og < 1.0, "output_gini sits in [0,1)");
+
+print "pbai_ideal_bridge_pass";
