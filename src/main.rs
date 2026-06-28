@@ -157,6 +157,11 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Smart diagnostics: errors, warnings, "did you mean" suggestions, autofix hints
+    Check {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Discover and run `fn test_*` functions inside .sap/.sapp/.bpx
     /// files (cargo-test style); falls back to whole-file execution
     /// for files that declare no `test_*` functions. Supports
@@ -1613,6 +1618,7 @@ fn run_cli() {
             Some(Commands::Fmt { args }) => return handle_fmt(args),
             Some(Commands::Lint { args }) => return handle_lint(args),
             Some(Commands::Clippy { args }) => return handle_lint(args),
+            Some(Commands::Check { args }) => return handle_check(args),
             Some(Commands::Test { args }) => return handle_test(args),
             Some(Commands::Run { args }) => return handle_run(args),
             Some(Commands::Compile { args }) => return handle_compile(args),
@@ -1684,6 +1690,9 @@ fn handle_fmt(args: Vec<String>) {
 }
 fn handle_lint(args: Vec<String>) {
     legacy_dispatch(prepend("lint", args));
+}
+fn handle_check(args: Vec<String>) {
+    legacy_dispatch(prepend("check", args));
 }
 fn handle_test(args: Vec<String>) {
     legacy_dispatch(prepend("test", args));
@@ -4382,6 +4391,10 @@ fn legacy_dispatch(args: Vec<String>) {
     // Lint: parse + typecheck one or more files, report diagnostics + unused var/import warnings
     if args.first().map(|s| s.as_str()) == Some("lint") {
         cli::lint::handle_lint(args);
+        return;
+    }
+    if args.first().map(|s| s.as_str()) == Some("check") {
+        cli::check::handle_check(args);
         return;
     }
     if args.first().map(|s| s.as_str()) == Some("lsp") {
