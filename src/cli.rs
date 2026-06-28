@@ -5,6 +5,7 @@
 pub(crate) mod build_polyglot;
 pub(crate) mod bundle;
 pub(crate) mod call_graph;
+pub(crate) mod check;
 pub(crate) mod compile_cache;
 pub(crate) mod dataflow;
 pub(crate) mod diag;
