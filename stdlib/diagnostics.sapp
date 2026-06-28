@@ -1,0 +1,253 @@
+// stdlib/diagnostics.sapp — smart error/warning detection + suggestions for pblang.
+//
+// Rust-style diagnostics, written in pblang (self-hosted). It is the single source of
+// truth for smart checks: the watchers (stdlib/watch.sapp) and the `pblang check` CLI
+// both delegate here, so the logic is never duplicated.
+//
+// Pipeline: source -> self-hosted frontend (AST) -> semantic analysis (scopes/symbols)
+//           -> smart layer (did-you-mean, unused, pitfalls, unreachable) -> diagnostics.
+//
+// A diagnostic is a map:
+//   { severity: "error"|"warning"|"hint", code, message, name?, suggestion?, line, help?, fix? }
+// A fix (when autofixable) is a map: { kind: "replace_identifier", from, to } or { kind: "remove_binding", name }.
+//
+// Usage:
+//   let dx = import("stdlib:diagnostics.sapp");
+//   let r = dx.diagnose(source);   // { ok, diagnostics, errors, warnings, hints, counts }
+//   print dx.format(r);
+//   let f = dx.autofix(source);    // { fixed, applied, count }
+
+let FE = import("stdlib:compiler/selfhost_frontend.sapp");
+let SEM = import("stdlib:compiler/semantic.sapp");
+let BL = import("stdlib:compiler/builtins_list.sapp");
+
+// ── edit distance (Levenshtein), the core of "did you mean?" ──────────────────────
+fn edit_distance(a, b) {
+    let la = len(a);
+    let lb = len(b);
+    if la == 0 { return lb; }
+    if lb == 0 { return la; }
+    let prev = [];
+    let j = 0;
+    while j <= lb { array_push(prev, j); j = j + 1; }
+    let i = 1;
+    while i <= la {
+        let cur = [i];
+        let jj = 1;
+        while jj <= lb {
+            let cost = 1;
+            if a[i - 1] == b[jj - 1] { cost = 0; }
+            let del = prev[jj] + 1;
+            let ins = cur[jj - 1] + 1;
+            let sub = prev[jj - 1] + cost;
+            let m = del;
+            if ins < m { m = ins; }
+            if sub < m { m = sub; }
+            array_push(cur, m);
+            jj = jj + 1;
+        }
+        prev = cur;
+        i = i + 1;
+    }
+    return prev[lb];
+}
+
+// suggest_name(name, candidates) — closest candidate within an adaptive threshold,
+// or nil. Short names get a stricter threshold to avoid silly suggestions.
+fn suggest_name(name, candidates) {
+    let best = nil;
+    let bestd = 999;
+    let i = 0;
+    while i < len(candidates) {
+        let c = candidates[i];
+        if c != name {
+            let d = edit_distance(name, c);
+            if d < bestd { bestd = d; best = c; }
+        }
+        i = i + 1;
+    }
+    let thr = 2;
+    if len(name) <= 3 { thr = 1; }
+    if best != nil and bestd > 0 and bestd <= thr { return best; }
+    return nil;
+}
+
+// ── candidate gathering from the semantic symbol table + builtins ─────────────────
+fn _collect_scope_names(scope, acc) {
+    if scope == nil { return; }
+    let ks = map_keys(scope.symbols);
+    let i = 0;
+    while i < len(ks) { array_push(acc, ks[i]); i = i + 1; }
+    let ch = try scope.children catch [];
+    let c = 0;
+    while c < len(ch) { _collect_scope_names(ch[c], acc); c = c + 1; }
+}
+
+fn _candidates(table) {
+    let acc = [];
+    _collect_scope_names(table.global_scope, acc);
+    let bset = try BL.builtin_set() catch map{};
+    let bks = map_keys(bset);
+    let i = 0;
+    while i < len(bks) { array_push(acc, bks[i]); i = i + 1; }
+    return acc;
+}
+
+// ── unused-symbol detection (reads Symbol.references recorded by semantic) ─────────
+fn _collect_unused(scope, diags) {
+    if scope == nil { return; }
+    let ks = map_keys(scope.symbols);
+    let i = 0;
+    while i < len(ks) {
+        let sym = scope.symbols[ks[i]];
+        let kind = try sym.kind catch "variable";
+        let refs = try sym.references catch [];
+        let exported = try sym.is_exported catch false;
+        let nm = try sym.name catch ks[i];
+        let is_var = kind == "let" or kind == "const" or kind == "variable";
+        if (is_var or kind == "import") and len(refs) == 0 and not exported {
+            let code = "unused-variable";
+            let msg = "unused variable `" + nm + "`";
+            if kind == "import" { code = "unused-import"; msg = "unused import `" + nm + "`"; }
+            array_push(diags, map{
+                severity: "warning", code: code, message: msg, name: nm,
+                line: try sym.defined_line catch 0,
+                help: "remove it, or prefix with `_` if it is intentionally unused",
+                fix: map{ kind: "remove_binding", name: nm },
+            });
+        }
+        i = i + 1;
+    }
+    let ch = try scope.children catch [];
+    let c = 0;
+    while c < len(ch) { _collect_unused(ch[c], diags); c = c + 1; }
+}
+
+// _extra_lints is filled in by the pitfall/unreachable pass; defined as a no-op here
+// so diagnose() can call it unconditionally.
+fn _extra_lints(source, diags) { return; }
+
+// ── result assembly ────────────────────────────────────────────────────────────────
+fn _result(diags) {
+    let errors = [];
+    let warnings = [];
+    let hints = [];
+    let i = 0;
+    while i < len(diags) {
+        let sev = diags[i].severity;
+        if sev == "error" { array_push(errors, diags[i]); }
+        else if sev == "warning" { array_push(warnings, diags[i]); }
+        else { array_push(hints, diags[i]); }
+        i = i + 1;
+    }
+    return map{
+        ok: len(errors) == 0,
+        diagnostics: diags,
+        errors: errors,
+        warnings: warnings,
+        hints: hints,
+        counts: map{ error: len(errors), warning: len(warnings), hint: len(hints) },
+    };
+}
+
+// ── main entry: diagnose(source) ─────────────────────────────────────────────────
+fn diagnose(source) {
+    let parsed = FE.frontend_parse_safe(source);
+    let diags = [];
+
+    let perrs = try parsed.errors catch [];
+    let pe = 0;
+    while pe < len(perrs) {
+        array_push(diags, map{
+            severity: "error", code: "parse-error", message: str(perrs[pe]),
+            name: nil, line: 0, help: nil, fix: nil,
+        });
+        pe = pe + 1;
+    }
+
+    let ast = try parsed.ast catch nil;
+    if ast != nil {
+        let table = SEM.analyze(ast);
+        let cands = _candidates(table);
+
+        let fv = try table.free_variables catch [];
+        let i = 0;
+        while i < len(fv) {
+            let name = fv[i];
+            let s = suggest_name(name, cands);
+            let help = nil;
+            let fix = nil;
+            if s != nil {
+                help = "did you mean `" + s + "`?";
+                fix = map{ kind: "replace_identifier", from: name, to: s };
+            }
+            array_push(diags, map{
+                severity: "error", code: "undefined-name",
+                message: "cannot find name `" + name + "` in this scope",
+                name: name, suggestion: s, line: 0, help: help, fix: fix,
+            });
+            i = i + 1;
+        }
+
+        _collect_unused(table.global_scope, diags);
+        _extra_lints(source, diags);
+    }
+
+    return _result(diags);
+}
+
+// suggest(source) — just the actionable did-you-mean items: [{name, suggestion}].
+fn suggest(source) {
+    let r = diagnose(source);
+    let out = [];
+    let i = 0;
+    while i < len(r.diagnostics) {
+        let d = r.diagnostics[i];
+        if d.code == "undefined-name" and (try d.suggestion catch nil) != nil {
+            array_push(out, map{ name: d.name, suggestion: d.suggestion });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// autofix(source) — apply every safe, unambiguous fix; returns { fixed, applied, count }.
+fn autofix(source) {
+    let r = diagnose(source);
+    let fixed = source;
+    let applied = [];
+    let i = 0;
+    while i < len(r.diagnostics) {
+        let d = r.diagnostics[i];
+        let fix = try d.fix catch nil;
+        if fix != nil and fix.kind == "replace_identifier" {
+            fixed = regex_replace_all(fixed, "\\b" + fix.from + "\\b", fix.to);
+            array_push(applied, map{ kind: "replace_identifier", from: fix.from, to: fix.to });
+        }
+        i = i + 1;
+    }
+    return map{ fixed: fixed, applied: applied, count: len(applied) };
+}
+
+// format(result) — Rust-style human-readable rendering of a diagnose() result.
+fn format(result) {
+    if len(result.diagnostics) == 0 { return "no issues found\n"; }
+    let out = "";
+    let i = 0;
+    while i < len(result.diagnostics) {
+        let d = result.diagnostics[i];
+        let loc = "";
+        let ln = try d.line catch 0;
+        if ln != nil and ln > 0 { loc = ":" + str(ln); }
+        out = out + d.severity + "[" + d.code + "]" + loc + ": " + d.message + "\n";
+        let help = try d.help catch nil;
+        if help != nil { out = out + "  = help: " + help + "\n"; }
+        i = i + 1;
+    }
+    out = out + "\n" + str(result.counts.error) + " error(s), "
+              + str(result.counts.warning) + " warning(s), "
+              + str(result.counts.hint) + " hint(s)\n";
+    return out;
+}
+
+export edit_distance, suggest_name, diagnose, suggest, autofix, format;
