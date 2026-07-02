@@ -1,0 +1,637 @@
+// stdlib/codegen_x64.sapp — pblang generating REAL x86-64 machine code + native Linux ELF.
+//
+// This is pblang's "native mode" seed: instead of running a program on the bytecode VM, it
+// EMITS machine-code bytes and writes a runnable ELF executable that the bare CPU runs
+// directly — with ZERO Rust in the codegen path (the existing Cranelift/LLVM backends are
+// Rust; this is the pure-pblang alternative). The only thing pblang leans on is the OS to
+// run a file (fs_write_bytes + exec) — not a compiler, not Rust.
+//
+//   let cg = import("stdlib/codegen_x64.sapp");
+//   let elf = cg.build_print_exit("hello\n");   // bytes of a native x86-64 Linux binary
+//   fs_write_bytes("hello", elf);               // chmod +x hello && ./hello  -> prints it
+//
+// SCOPE: this is the minimal honest core — Linux x86-64, static, syscalls write+exit. It
+// establishes the lowering (instruction encoding + ELF layout). SIMD/all-core/GPU codegen
+// and a full pblang-AST front end build ON this; the boundary that stays native is issuing
+// GPU/NPU work (that needs a device driver, not just machine code). See docs in the repo.
+
+// ── little-endian byte encoders ──────────────────────────────────────────────────────
+fn _le(n, k) {
+    let out = [];
+    let v = n;
+    let i = 0;
+    while i < k {
+        let byte = v - num_floor(v / 256) * 256;
+        array_push(out, byte);
+        v = num_floor(v / 256);
+        i = i + 1;
+    }
+    return out;
+}
+fn le16(n) { return _le(n, 2); }
+fn le32(n) { return _le(n, 4); }
+fn le64(n) { return _le(n, 8); }
+
+// append every byte of `src` onto `dst` (in place), returning dst.
+fn _app(dst, src) {
+    let i = 0;
+    while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+
+// ── x86-64 instruction encoders ──────────────────────────────────────────────────────
+// ModR/M (mod=11 register-direct) rm field per register, for the `mov r64, imm32` form.
+fn _modrm_reg(reg) {
+    if reg == "rax" { return 0xC0; }
+    if reg == "rcx" { return 0xC1; }
+    if reg == "rdx" { return 0xC2; }
+    if reg == "rbx" { return 0xC3; }
+    if reg == "rsi" { return 0xC6; }
+    if reg == "rdi" { return 0xC7; }
+    throw "codegen_x64: unsupported reg for mov_imm32: " + reg;
+}
+// opcode byte for `movabs r64, imm64` (B8+rd) per register.
+fn _movabs_op(reg) {
+    if reg == "rax" { return 0xB8; }
+    if reg == "rcx" { return 0xB9; }
+    if reg == "rdx" { return 0xBA; }
+    if reg == "rbx" { return 0xBB; }
+    if reg == "rsi" { return 0xBE; }
+    if reg == "rdi" { return 0xBF; }
+    throw "codegen_x64: unsupported reg for movabs: " + reg;
+}
+
+// mov r64, imm32 (sign-extended): REX.W + C7 /0 id  ->  48 C7 <modrm> <imm32>
+fn mov_imm32(reg, imm) {
+    let out = [0x48, 0xC7, _modrm_reg(reg)];
+    return _app(out, le32(imm));
+}
+// movabs r64, imm64: REX.W + (B8+rd) io  ->  48 <op> <imm64>
+fn movabs_imm64(reg, imm) {
+    let out = [0x48, _movabs_op(reg)];
+    return _app(out, le64(imm));
+}
+// syscall: 0F 05
+fn syscall() { return [0x0F, 0x05]; }
+
+// ── ELF64 container ──────────────────────────────────────────────────────────────────
+let _LOAD = 0x400000;   // load base address
+let _EHSIZE = 64;       // ELF64 header size
+let _PHSIZE = 56;       // one program header
+let _HSIZE = 120;       // _EHSIZE + _PHSIZE
+
+// elf64_exec(code, data) — wrap a code blob + trailing data into a static, single-segment
+// (RWX) ELF64 executable. `entry` is the first code byte; the whole file is mapped at _LOAD,
+// so a file offset X lives at virtual address _LOAD + X.
+fn elf64_exec(code, data) {
+    let total = _HSIZE + len(code) + len(data);
+    let entry = _LOAD + _HSIZE;
+
+    let out = [];
+    // e_ident: magic, ELFCLASS64(2), ELFDATA2LSB(1), EV_CURRENT(1), SysV ABI(0), pad...
+    _app(out, [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    _app(out, le16(2));              // e_type    = ET_EXEC
+    _app(out, le16(0x3E));           // e_machine = x86-64
+    _app(out, le32(1));              // e_version
+    _app(out, le64(entry));          // e_entry
+    _app(out, le64(_EHSIZE));        // e_phoff (program headers follow the ELF header)
+    _app(out, le64(0));              // e_shoff
+    _app(out, le32(0));              // e_flags
+    _app(out, le16(_EHSIZE));        // e_ehsize
+    _app(out, le16(_PHSIZE));        // e_phentsize
+    _app(out, le16(1));              // e_phnum
+    _app(out, le16(0));              // e_shentsize
+    _app(out, le16(0));              // e_shnum
+    _app(out, le16(0));              // e_shstrndx
+    // program header (PT_LOAD, RWX, maps the whole file)
+    _app(out, le32(1));              // p_type  = PT_LOAD
+    _app(out, le32(7));              // p_flags = R|W|X
+    _app(out, le64(0));              // p_offset
+    _app(out, le64(_LOAD));          // p_vaddr
+    _app(out, le64(_LOAD));          // p_paddr
+    _app(out, le64(total));          // p_filesz
+    _app(out, le64(total));          // p_memsz
+    _app(out, le64(0x1000));         // p_align
+    _app(out, code);
+    _app(out, data);
+    return out;
+}
+
+// _print_exit_code(msg_vaddr, mlen) — the fixed instruction sequence:
+//   write(1, msg_vaddr, mlen); exit(0)
+fn _print_exit_code(msg_vaddr, mlen) {
+    let c = [];
+    _app(c, mov_imm32("rax", 1));            // sys_write
+    _app(c, mov_imm32("rdi", 1));            // fd = stdout
+    _app(c, movabs_imm64("rsi", msg_vaddr)); // buf
+    _app(c, mov_imm32("rdx", mlen));         // len
+    _app(c, syscall());
+    _app(c, mov_imm32("rax", 60));           // sys_exit
+    _app(c, mov_imm32("rdi", 0));            // status 0
+    _app(c, syscall());
+    return c;
+}
+
+// build_print_exit(msg) — full bytes of a native x86-64 Linux executable that prints `msg`
+// and exits 0. The message is placed right after the code; its virtual address is computed
+// from the (fixed) code length.
+fn build_print_exit(msg) {
+    let data = str_to_bytes(msg);
+    // code length is independent of the address/len values, so measure with a placeholder.
+    let probe = _print_exit_code(0, 0);
+    let code_len = len(probe);
+    let msg_vaddr = _LOAD + _HSIZE + code_len;
+    let code = _print_exit_code(msg_vaddr, len(data));
+    return elf64_exec(code, data);
+}
+
+// ── register-IR → native compiler (arithmetic + loops) ───────────────────────────────
+// A tiny, SAFE register machine compiled straight to x86-64. Virtual registers r0..r3 map
+// to rax/rcx/rdx/rbx (x86 reg numbers 0..3, so the IR index IS the encoding index). r0 is
+// the result → it becomes the process exit code (mod 256). The generator VALIDATES every
+// instruction (known op, register in range, immediate fits in 32 bits) and throws on bad
+// input, so it can never emit malformed/out-of-bounds code (a memory-safe code generator).
+//
+//   IR instr forms (each an array):
+//     ["seti", r, imm]      r = imm
+//     ["add",  a, b]        a = a + b
+//     ["sub",  a, b]        a = a - b
+//     ["mul",  a, b]        a = a * b
+//     ["addi", r, imm]      r = r + imm
+//     ["loop", r, [body]]   run body while r != 0, decrementing r each pass (0 ⇒ skipped)
+
+fn _vreg(r) { if r < 0 or r > 3 { throw "codegen_x64: register out of range 0..3: " + str(r); } return r; }
+fn _vimm(n) { if n < 0 or n > 2147483647 { throw "codegen_x64: immediate out of 32-bit range: " + str(n); } return n; }
+fn _u32(rel) { if rel < 0 { return 4294967296 + rel; } return rel; }
+
+// signed two's-complement 32-bit immediate (allows e.g. negative jump displacements).
+fn mov_imm32_r(i, imm) { return _app([0x48, 0xC7, 0xC0 + _vreg(i)], le32(_vimm(imm))); }
+fn add_rr(a, b) { return [0x48, 0x01, 0xC0 + (_vreg(b) * 8) + _vreg(a)]; }   // a += b
+fn sub_rr(a, b) { return [0x48, 0x29, 0xC0 + (_vreg(b) * 8) + _vreg(a)]; }   // a -= b
+fn imul_rr(a, b) { return [0x48, 0x0F, 0xAF, 0xC0 + (_vreg(a) * 8) + _vreg(b)]; } // a *= b
+fn addi_r(a, imm) { return _app([0x48, 0x81, 0xC0 + _vreg(a)], le32(_vimm(imm))); }  // a += imm
+fn dec_r(a) { return [0x48, 0xFF, 0xC8 + _vreg(a)]; }
+fn test_rr(a) { return [0x48, 0x85, 0xC0 + (_vreg(a) * 8) + _vreg(a)]; }
+fn jnz_rel32(rel) { return _app([0x0F, 0x85], le32(_u32(rel))); }
+fn jz_rel32(rel) { return _app([0x0F, 0x84], le32(_u32(rel))); }
+fn jmp_rel32(rel) { return _app([0xE9], le32(_u32(rel))); }
+
+// _emit_ifnz(reg, then, else) — if reg != 0 run `then` else run `else`.
+//   test reg,reg ; jz else ; <then> ; jmp end ; <else> ; end:
+fn _emit_ifnz(reg, thenb, elseb) {
+    let out = [];
+    _app(out, test_rr(reg));
+    _app(out, jz_rel32(len(thenb) + 5));     // skip then(.) + jmp(5) -> else
+    _app(out, thenb);
+    _app(out, jmp_rel32(len(elseb)));        // skip else -> end
+    _app(out, elseb);
+    return out;
+}
+
+// _emit_loop(counter, body) — guarded counted loop: skip when counter==0, else run body,
+// decrement, and jump back while nonzero.
+fn _emit_loop(counter, body) {
+    let l = len(body);
+    let out = [];
+    _app(out, test_rr(counter));
+    _app(out, jz_rel32(l + 3 + 6));        // skip past body(l) + dec(3) + jnz(6)
+    _app(out, body);
+    _app(out, dec_r(counter));
+    _app(out, jnz_rel32(0 - (l + 3 + 6))); // back to body start
+    return out;
+}
+
+// ── syscall op ───────────────────────────────────────────────────────────────────────
+// ["syscall", nr, [argregs]] — invoke Linux syscall `nr` with args taken from the listed IR
+// registers (in order), result back in r0 (rax). This is the device-driver escape hatch:
+// ioctl()/mmap()/read()/write()/open() on /dev nodes, all in generated machine code, no Rust.
+// Syscalls are arch-specific (number + ABI), so `nr` is for THIS backend (x86-64).
+//   x86-64 ABI: nr in rax; args rdi, rsi, rdx, r10, r8, r9; `syscall`; result in rax.
+fn _push_r(i) { return [0x50 + _vreg(i)]; }              // push rax/rcx/rdx/rbx
+fn _pop_abi(idx) {
+    if idx == 0 { return [0x5F]; }        // pop rdi
+    if idx == 1 { return [0x5E]; }        // pop rsi
+    if idx == 2 { return [0x5A]; }        // pop rdx
+    if idx == 3 { return [0x41, 0x5A]; }  // pop r10
+    if idx == 4 { return [0x41, 0x58]; }  // pop r8
+    if idx == 5 { return [0x41, 0x59]; }  // pop r9
+    throw "codegen_x64: syscall supports up to 6 args";
+}
+// move arg values through the STACK so sources can't clobber each other before use.
+fn _syscall_op(nr, argregs) {
+    let out = [];
+    let i = 0;
+    while i < len(argregs) { _app(out, _push_r(argregs[i])); i = i + 1; }
+    let j = len(argregs) - 1;
+    while j >= 0 { _app(out, _pop_abi(j)); j = j - 1; }
+    _app(out, mov_imm32_r(0, nr));        // rax = syscall number
+    _app(out, syscall());
+    return out;
+}
+
+// compile_ir(ir) — lower an IR list to a code-byte blob (no ELF wrapper). Recurses on loops.
+fn compile_ir(ir) {
+    let code = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "seti" { _app(code, mov_imm32_r(ins[1], ins[2])); }
+        else if op == "add" { _app(code, add_rr(ins[1], ins[2])); }
+        else if op == "sub" { _app(code, sub_rr(ins[1], ins[2])); }
+        else if op == "mul" { _app(code, imul_rr(ins[1], ins[2])); }
+        else if op == "addi" { _app(code, addi_r(ins[1], ins[2])); }
+        else if op == "loop" { _app(code, _emit_loop(_vreg(ins[1]), compile_ir(ins[2]))); }
+        else if op == "ifnz" { _app(code, _emit_ifnz(_vreg(ins[1]), compile_ir(ins[2]), compile_ir(ins[3]))); }
+        else if op == "syscall" { _app(code, _syscall_op(ins[1], ins[2])); }
+        else if op == "pushr" { array_push(code, 0x50 + _vreg(ins[1])); }           // push reg
+        else if op == "popr" { array_push(code, 0x58 + _vreg(ins[1])); }            // pop reg
+        else if op == "movr" { _app(code, [0x48, 0x89, 0xC0 + _vreg(ins[2]) * 8 + _vreg(ins[1])]); } // mov a, b
+        else { throw "codegen_x64: unknown IR op: " + str(op); }
+        i = i + 1;
+    }
+    return code;
+}
+
+// ── variables (locals in memory) + value-return for the front end ────────────────────
+// _emit(ir, lbuf) — like compile_ir but also lowers local-variable ops against the memory
+// area at vaddr `lbuf`: ["lset", slot] stores r0; ["lget", slot] loads r0. Recurses bodies.
+fn _emit(ir, lbuf) {
+    let code = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "lset" { _app(code, [0x48, 0xA3]); _app(code, le64(lbuf + ins[1] * 8)); }       // mov [lbuf+slot*8], rax
+        else if op == "lget" { _app(code, [0x48, 0xA1]); _app(code, le64(lbuf + ins[1] * 8)); }  // mov rax, [lbuf+slot*8]
+        else if op == "loop" { _app(code, _emit_loop(_vreg(ins[1]), _emit(ins[2], lbuf))); }
+        else if op == "ifnz" { _app(code, _emit_ifnz(_vreg(ins[1]), _emit(ins[2], lbuf), _emit(ins[3], lbuf))); }
+        else { _app(code, compile_ir([ins])); }   // all addr-free ops (incl pushr/popr/movr)
+        i = i + 1;
+    }
+    return code;
+}
+// _value_tail(buf) — store rax to buf, write its 8 bytes to stdout, exit(0).
+fn _value_tail(buf) {
+    let c = [];
+    _app(c, [0x48, 0xA3]); _app(c, le64(buf));        // mov [buf], rax
+    _app(c, mov_imm32_r(0, 1));                        // rax = 1 (write)
+    _app(c, [0x48, 0xC7, 0xC7]); _app(c, le32(1));    // rdi = 1
+    _app(c, movabs_imm64("rsi", buf));                // rsi = buf
+    _app(c, mov_imm32_r(2, 8));                        // rdx = 8
+    _app(c, syscall());
+    _app(c, mov_imm32_r(0, 60));                       // rax = 60 (exit)
+    _app(c, [0x48, 0xC7, 0xC7]); _app(c, le32(0));
+    _app(c, syscall());
+    return c;
+}
+// build_value_fn(ir, nlocals) — run `ir` (which may use lset/lget + the value stack), write
+// r0's 64-bit result to stdout, exit. Backs the front end's variables + arbitrary-depth exprs.
+fn build_value_fn(ir, nlocals) {
+    let code_len = len(_emit(ir, 0)) + len(_value_tail(0));
+    let lbuf = _LOAD + _HSIZE + code_len;
+    let rbuf = lbuf + nlocals * 8;
+    let code = [];
+    _app(code, _emit(ir, lbuf));
+    _app(code, _value_tail(rbuf));
+    let data = [];
+    let k = 0; while k < nlocals * 8 + 8 { array_push(data, 0); k = k + 1; }
+    return elf64_exec(code, data);
+}
+
+// ── floating point (SSE2 scalar double) — for scientific/graphics kernels ─────────────
+// Float registers f0..f3 map to xmm0..xmm3. A constant pool in the data section holds 8-byte
+// IEEE-754 doubles; fseti loads from it. Result (f0) is returned as a raw 8-byte double.
+//   IR: ["fseti", fr, value] ["fadd"|"fsub"|"fmul"|"fdiv", a, b] ["fmovr", a, b]
+fn _vfreg(r) { if r < 0 or r > 3 { throw "codegen_x64: float reg out of range 0..3: " + str(r); } return r; }
+fn faddr(a, b) { return [0xF2, 0x0F, 0x58, 0xC0 + _vfreg(a) * 8 + _vfreg(b)]; }   // addsd
+fn fsubr(a, b) { return [0xF2, 0x0F, 0x5C, 0xC0 + _vfreg(a) * 8 + _vfreg(b)]; }   // subsd
+fn fmulr(a, b) { return [0xF2, 0x0F, 0x59, 0xC0 + _vfreg(a) * 8 + _vfreg(b)]; }   // mulsd
+fn fdivr(a, b) { return [0xF2, 0x0F, 0x5E, 0xC0 + _vfreg(a) * 8 + _vfreg(b)]; }   // divsd
+fn fmovrr(a, b) { return [0xF2, 0x0F, 0x10, 0xC0 + _vfreg(a) * 8 + _vfreg(b)]; }  // movsd xmm,xmm
+fn _fload(fr, addr) { let c = mov_imm32_r(0, addr); _app(c, [0xF2, 0x0F, 0x10, _vfreg(fr) * 8]); return c; } // mov rax,addr; movsd xmm_fr,[rax]
+
+fn _fcollect(ir, vals, idx) {
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        if ins[0] == "fseti" {
+            let k = str(ins[2]);
+            if not map_has(idx, k) { idx[k] = len(vals); array_push(vals, ins[2]); }
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+fn _femit(ir, pool_base, idx) {
+    let code = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "fseti" { _app(code, _fload(ins[1], pool_base + idx[str(ins[2])] * 8)); }
+        else if op == "fadd" { _app(code, faddr(ins[1], ins[2])); }
+        else if op == "fsub" { _app(code, fsubr(ins[1], ins[2])); }
+        else if op == "fmul" { _app(code, fmulr(ins[1], ins[2])); }
+        else if op == "fdiv" { _app(code, fdivr(ins[1], ins[2])); }
+        else if op == "fmovr" { _app(code, fmovrr(ins[1], ins[2])); }
+        else { throw "codegen_x64._femit: unsupported float op " + str(op); }
+        i = i + 1;
+    }
+    return code;
+}
+fn _fvalue_tail(buf) {
+    let c = mov_imm32_r(0, buf);                  // rax = buf
+    _app(c, [0xF2, 0x0F, 0x11, 0x00]);            // movsd [rax], xmm0
+    _app(c, mov_imm32_r(0, 1));                    // rax = 1 (write)
+    _app(c, [0x48, 0xC7, 0xC7]); _app(c, le32(1));// rdi = 1
+    _app(c, movabs_imm64("rsi", buf));            // rsi = buf
+    _app(c, mov_imm32_r(2, 8));                    // rdx = 8
+    _app(c, syscall());
+    _app(c, mov_imm32_r(0, 60)); _app(c, [0x48, 0xC7, 0xC7]); _app(c, le32(0)); _app(c, syscall());
+    return c;
+}
+// build_value_f(ir) — run a float IR, write f0 (an 8-byte double) to stdout, exit.
+fn build_value_f(ir) {
+    let vals = [];
+    let idx = map{};
+    _fcollect(ir, vals, idx);
+    let code_len = len(_femit(ir, 0, idx)) + len(_fvalue_tail(0));
+    let result_buf = _LOAD + _HSIZE + code_len;
+    let pool_base = result_buf + 8;
+    let code = [];
+    _app(code, _femit(ir, pool_base, idx));
+    _app(code, _fvalue_tail(result_buf));
+    let data = [];
+    let k = 0; while k < 8 { array_push(data, 0); k = k + 1; }     // result buffer
+    let j = 0;
+    while j < len(vals) {
+        let b = num_to_le_bytes(vals[j]);
+        let m = 0; while m < 8 { array_push(data, b[m]); m = m + 1; }
+        j = j + 1;
+    }
+    return elf64_exec(code, data);
+}
+
+// ── functions: call / ret with a relocation pass (a mini-linker) ─────────────────────
+// A "unit" is a set of named functions plus a `main`. main and each function are IR bodies
+// that may use ["call", name] and ["ret"]. Registers are SHARED and NOT auto-saved across a
+// call (the caller manages any values it needs preserved) — simple, fast, and enough for
+// reusable subroutines. Calls are resolved in a second pass once every function's offset is
+// known, so forward references and self-recursion both work.
+fn _enc_leaf(ins) {
+    let op = ins[0];
+    if op == "seti" { return mov_imm32_r(ins[1], ins[2]); }
+    if op == "add" { return add_rr(ins[1], ins[2]); }
+    if op == "sub" { return sub_rr(ins[1], ins[2]); }
+    if op == "mul" { return imul_rr(ins[1], ins[2]); }
+    if op == "addi" { return addi_r(ins[1], ins[2]); }
+    if op == "syscall" { return _syscall_op(ins[1], ins[2]); }
+    throw "codegen_x64: not a leaf op: " + str(op);
+}
+fn _merge_fixups(dst, sub, base) {
+    let i = 0;
+    while i < len(sub) { array_push(dst, map{ pos: sub[i].pos + base, name: sub[i].name }); i = i + 1; }
+    return dst;
+}
+// _cbody(ir) → { bytes, fixups } where each fixup {pos, name} marks a rel32 field to patch.
+fn _cbody(ir) {
+    let bytes = [];
+    let fixups = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "call" {
+            // caller-save r1/r2/r3 (rcx,rdx,rbx) around the call so recursion works; r0 (rax)
+            // carries the argument in and the result out.
+            _app(bytes, [0x51, 0x52, 0x53]);          // push rcx, rdx, rbx
+            array_push(bytes, 0xE8);
+            let pos = len(bytes);
+            _app(bytes, [0, 0, 0, 0]);
+            array_push(fixups, map{ pos: pos, name: ins[1] });
+            _app(bytes, [0x5B, 0x5A, 0x59]);          // pop rbx, rdx, rcx
+        } else if op == "ret" {
+            array_push(bytes, 0xC3);
+        } else if op == "loop" {
+            let sub = _cbody(ins[2]);
+            let base = len(bytes) + 9;                 // body offset inside _emit_loop output
+            _app(bytes, _emit_loop(_vreg(ins[1]), sub.bytes));
+            _merge_fixups(fixups, sub.fixups, base);
+        } else if op == "ifnz" {
+            let st = _cbody(ins[2]);
+            let se = _cbody(ins[3]);
+            let then_base = len(bytes) + 9;            // test(3)+jz(6)
+            let else_base = len(bytes) + 9 + len(st.bytes) + 5;  // +then+jmp(5)
+            _app(bytes, _emit_ifnz(_vreg(ins[1]), st.bytes, se.bytes));
+            _merge_fixups(fixups, st.fixups, then_base);
+            _merge_fixups(fixups, se.fixups, else_base);
+        } else {
+            _app(bytes, _enc_leaf(ins));
+        }
+        i = i + 1;
+    }
+    return map{ bytes: bytes, fixups: fixups };
+}
+fn _set32(code, pos, val) {
+    let b = le32(val);
+    let i = 0;
+    while i < 4 { code[pos + i] = b[i]; i = i + 1; }
+    return code;
+}
+// compile_unit(funcs, main) — funcs is a list of map{ name, body }. Returns a native ELF that
+// runs `main` (exiting with r0) and can call the named functions (and they each other).
+fn compile_unit(funcs, main) {
+    let mainr = _cbody(main);
+    let code = mainr.bytes;
+    _app(code, [0x48, 0x89, 0xC7]);    // mov rdi, rax (exit code = r0)
+    _app(code, mov_imm32_r(0, 60));
+    _app(code, syscall());
+    let allfix = [];
+    _merge_fixups(allfix, mainr.fixups, 0);
+    let offsets = map{};
+    let f = 0;
+    while f < len(funcs) {
+        let fb = _cbody(funcs[f].body);
+        let base = len(code);
+        offsets[funcs[f].name] = base;
+        _app(code, fb.bytes);
+        array_push(code, 0xC3);         // ensure the function returns
+        _merge_fixups(allfix, fb.fixups, base);
+        f = f + 1;
+    }
+    // resolve every call: rel32 = target - (pos + 4)
+    let k = 0;
+    while k < len(allfix) {
+        let fx = allfix[k];
+        if not map_has(offsets, fx.name) { throw "codegen_x64: call to undefined function '" + fx.name + "'"; }
+        let target = offsets[fx.name];
+        _set32(code, fx.pos, _u32(target - (fx.pos + 4)));
+        k = k + 1;
+    }
+    return elf64_exec(code, []);
+}
+
+// ── calling convention: arguments + return values + recursion (stack frames) ──────────
+// A function takes up to 4 args in r0..r3 and returns its result in r0. On entry a prologue
+// builds a stack frame (push rbp; mov rbp,rsp; sub rsp,frame) and captures the argument
+// registers into frame-local slots; lget/lset address locals RELATIVE TO rbp, so every call
+// has its own private locals → recursion just works. The epilogue tears the frame down (mov
+// rsp,rbp; pop rbp; ret). Caller: set r0..r3 to the args, `call`, read the result in r0.
+fn _frame_bytes(nlocals) { let f = nlocals * 8; return num_floor((f + 15) / 16) * 16; }
+fn _prologue(nparams, nlocals) {
+    let c = [0x55, 0x48, 0x89, 0xE5];                       // push rbp; mov rbp, rsp
+    _app(c, [0x48, 0x81, 0xEC]); _app(c, le32(_frame_bytes(nlocals)));  // sub rsp, frame
+    let i = 0;
+    while i < nparams {                                     // mov [rbp - 8*(i+1)], arg_reg_i
+        _app(c, [0x48, 0x89, 0x80 + 5 + i * 8]); _app(c, le32(_u32(0 - 8 * (i + 1))));  // modrm mod=10,rm=rbp
+        i = i + 1;
+    }
+    return c;
+}
+let _EPILOGUE = [0x48, 0x89, 0xEC, 0x5D, 0xC3];            // mov rsp, rbp; pop rbp; ret
+
+// _cbody2(ir) → { bytes, fixups } — frame-aware: lget/lset are rbp-relative; `call` records a
+// fixup; `ret` emits the epilogue. Recurses through loop/ifnz (keeping fixup offsets right).
+fn _cbody2(ir) {
+    let bytes = [];
+    let fixups = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "lset" { _app(bytes, [0x48, 0x89, 0x85]); _app(bytes, le32(_u32(0 - 8 * (ins[1] + 1)))); }      // mov [rbp+disp], rax
+        else if op == "lget" { _app(bytes, [0x48, 0x8B, 0x85]); _app(bytes, le32(_u32(0 - 8 * (ins[1] + 1)))); } // mov rax, [rbp+disp]
+        else if op == "call" {
+            array_push(bytes, 0xE8);
+            let pos = len(bytes);
+            _app(bytes, [0, 0, 0, 0]);
+            array_push(fixups, map{ pos: pos, name: ins[1] });
+        } else if op == "ret" {
+            _app(bytes, _EPILOGUE);
+        } else if op == "loop" {
+            let sub = _cbody2(ins[2]);
+            let base = len(bytes) + 9;
+            _app(bytes, _emit_loop(_vreg(ins[1]), sub.bytes));
+            _merge_fixups(fixups, sub.fixups, base);
+        } else if op == "ifnz" {
+            let st = _cbody2(ins[2]);
+            let se = _cbody2(ins[3]);
+            let then_base = len(bytes) + 9;
+            let else_base = len(bytes) + 9 + len(st.bytes) + 5;
+            _app(bytes, _emit_ifnz(_vreg(ins[1]), st.bytes, se.bytes));
+            _merge_fixups(fixups, st.fixups, then_base);
+            _merge_fixups(fixups, se.fixups, else_base);
+        } else {
+            _app(bytes, compile_ir([ins]));   // addr-free ops: seti/add/sub/mul/addi/movr/pushr/popr/syscall
+        }
+        i = i + 1;
+    }
+    return map{ bytes: bytes, fixups: fixups };
+}
+
+// compile_call_unit(funcs, entry) — native ELF. funcs: list of {name, nparams, nlocals, body};
+// entry: {nlocals, body}. Runs entry and exits with r0. Functions are real callables with args.
+fn compile_call_unit(funcs, entry) {
+    let er = _cbody2(entry.body);
+    let pe = _prologue(0, entry.nlocals);
+    let code = [];
+    _app(code, pe);
+    _app(code, er.bytes);
+    _app(code, [0x48, 0x89, 0xC7]);            // mov rdi, rax (exit code = result)
+    _app(code, mov_imm32_r(0, 60)); _app(code, syscall());
+    let allfix = [];
+    _merge_fixups(allfix, er.fixups, len(pe));  // entry body sits after the entry prologue
+    let offsets = map{};
+    let f = 0;
+    while f < len(funcs) {
+        let fn_def = funcs[f];
+        let fp = _prologue(fn_def.nparams, fn_def.nlocals);
+        let fb = _cbody2(fn_def.body);
+        let base = len(code);
+        offsets[fn_def.name] = base;            // calls jump to the prologue
+        _app(code, fp);
+        _app(code, fb.bytes);
+        _app(code, _EPILOGUE);
+        _merge_fixups(allfix, fb.fixups, base + len(fp));
+        f = f + 1;
+    }
+    let k = 0;
+    while k < len(allfix) {
+        let fx = allfix[k];
+        if not map_has(offsets, fx.name) { throw "codegen_x64: call to undefined function '" + fx.name + "'"; }
+        _set32(code, fx.pos, _u32(offsets[fx.name] - (fx.pos + 4)));
+        k = k + 1;
+    }
+    return elf64_exec(code, []);
+}
+
+// compile_program(ir) — full native ELF: run the IR, then exit with r0 (rax) as the code.
+fn compile_program(ir) {
+    let code = compile_ir(ir);
+    _app(code, [0x48, 0x89, 0xC7]);        // mov rdi, rax  (exit code = result)
+    _app(code, mov_imm32_r(0, 60));        // mov rax, 60   (sys_exit)
+    _app(code, syscall());
+    return elf64_exec(code, []);
+}
+
+// ── device I/O via generated syscalls (the ioctl/mmap-class escape hatch, concrete) ──
+// build_read_device(path, n) — a native program that open()s `path`, does a SIZED read() of
+// n bytes (so it NEVER blocks on EOF — the fix for the fs_read_bytes gotcha on /dev/urandom),
+// writes those bytes to stdout, and exits. Pure generated machine code talking to a kernel
+// driver — no Rust. open/read/write are the same syscall mechanism as ioctl/mmap, so this is
+// the template for driving ioctl-based devices (i2c/spi/gpio/framebuffer) too.
+fn _read_dev_ir(path_vaddr, buf_vaddr, n) {
+    return [
+        ["seti", 0, path_vaddr], ["seti", 1, 0], ["seti", 2, 0], ["syscall", 2, [0, 1, 2]],   // open(path,O_RDONLY,0) -> r0=fd
+        ["seti", 1, buf_vaddr], ["seti", 2, n], ["syscall", 0, [0, 1, 2]],                     // read(fd,buf,n) -> r0=count
+        ["seti", 0, 1], ["seti", 1, buf_vaddr], ["seti", 2, n], ["syscall", 1, [0, 1, 2]],     // write(1,buf,n)
+        ["seti", 0, 0], ["syscall", 60, [0]]                                                   // exit(0)
+    ];
+}
+fn build_read_device(path, n) {
+    let pbytes = str_to_bytes(path);
+    let plen = len(pbytes);
+    let code_len = len(compile_ir(_read_dev_ir(0, 0, n)));   // address-independent length
+    let path_vaddr = _LOAD + _HSIZE + code_len;
+    let buf_vaddr = path_vaddr + plen + 1;                   // after the NUL-terminated path
+    let code = compile_ir(_read_dev_ir(path_vaddr, buf_vaddr, n));
+    let data = [];
+    _app(data, pbytes); array_push(data, 0);                 // path\0
+    let k = 0; while k < n { array_push(data, 0); k = k + 1; } // n-byte read buffer (writable, RWX seg)
+    return elf64_exec(code, data);
+}
+
+// ── compute-and-return-a-value (native mode that returns arbitrary integers) ─────────
+// build_value(ir) — run the IR, then write r0's 8 raw little-endian bytes to stdout and
+// exit. The caller reads those 8 bytes back as a 64-bit integer, so native results are no
+// longer limited to a 0..255 exit code — this is what makes native mode usable by libraries.
+fn _value_code(ir, buf_vaddr) {
+    let c = compile_ir(ir);                                  // result in rax (r0)
+    _app(c, [0x48, 0xA3]); _app(c, le64(buf_vaddr));        // mov [buf_vaddr], rax
+    _app(c, mov_imm32_r(0, 1));                              // rax = 1 (write)
+    _app(c, [0x48, 0xC7, 0xC7]); _app(c, le32(1));          // mov rdi, 1 (stdout)
+    _app(c, movabs_imm64("rsi", buf_vaddr));                // rsi = buf
+    _app(c, mov_imm32_r(2, 8));                              // rdx = 8 bytes
+    _app(c, syscall());
+    _app(c, mov_imm32_r(0, 60));                             // rax = 60 (exit)
+    _app(c, [0x48, 0xC7, 0xC7]); _app(c, le32(0));          // mov rdi, 0
+    _app(c, syscall());
+    return c;
+}
+fn build_value(ir) {
+    let code_len = len(_value_code(ir, 0));                  // address-independent length
+    let buf_vaddr = _LOAD + _HSIZE + code_len;
+    let code = _value_code(ir, buf_vaddr);
+    let data = [];
+    let k = 0; while k < 8 { array_push(data, 0); k = k + 1; }  // 8-byte result buffer
+    return elf64_exec(code, data);
+}
+
+export le16, le32, le64;
+export mov_imm32, movabs_imm64, syscall;
+export elf64_exec, build_print_exit, build_read_device, build_value, build_value_fn, build_value_f;
+export faddr, fsubr, fmulr, fdivr, fmovrr;
+export mov_imm32_r, add_rr, sub_rr, imul_rr, addi_r, dec_r, test_rr, jnz_rel32, jz_rel32;
+export compile_ir, compile_program, compile_unit, compile_call_unit;
+export jmp_rel32;

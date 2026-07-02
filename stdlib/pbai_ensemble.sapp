@@ -1,0 +1,601 @@
+// stdlib/pbai_ensemble.sapp — the shared pbAI MULTI-LLM (MLLM) engine. ONE ensemble that both
+// pbai builds (the embedded stdlib classifier and the standalone stdlib/ai/pbai project) plug
+// into, so there is a single source of truth for confidence-weighted + adaptive + cached +
+// parallel voting across many models.
+//
+// It is HOST-AGNOSTIC: configure() it with the host's classify_scores(prompt)->{intent,scores}
+// and the intent list; then any number of extra models/LLMs join as voters:
+//   let ens = import("stdlib:pbai_ensemble.sapp");
+//   ens.configure(classify_scores, INTENTS);           // the primary (native) model
+//   ens.register_model("pbai-max", other_classify_scores, 2);   // another brain
+//   ens.register_voter_weighted("gpt", ens.llm_voter("openai","gpt-4o"), 3);
+//   ens.use_ollama();                                  // a live local model
+//   ens.set_adaptive(true); ens.set_parallel(true);
+//   ens.ensemble_decide(prompt);                        // {intent, confidence, escalate, ...}
+
+let P   = import("stdlib:parallel.sapp");            // fork/join for concurrent voters
+let PR  = import("stdlib:provider_registry.sapp");   // external LLM providers
+let OLL = import("stdlib:ollama.sapp");              // live local ollama models
+
+// ── host wiring ─────────────────────────────────────────────────────────────────────────
+let _H = map{ scores: nil, intents: ["explain", "bugs", "improve", "comment", "general"], cache: map{} };
+// configure(scores_fn, intents) — scores_fn(prompt) -> {intent, scores:[..]} (the native model).
+// Reconfiguring drops the native-scores cache (a new model produces different scores).
+fn configure(scores_fn, intents = nil) { _H.scores = scores_fn; if intents != nil { _H.intents = intents; } _H.cache = map{}; return nil; }
+fn intents() { return _H.intents; }
+// clear_native_cache() — forget memoized native scores (call if the model is retrained).
+fn clear_native_cache() { _H.cache = map{}; return nil; }
+// _native(prompt) -> {intent, conf} for the primary model (conf = max softmax score). Memoized
+// per prompt so a heavy classifier is evaluated once even across ensemble/confidence/decide.
+fn _native(prompt) {
+    if map_has(_H.cache, prompt) { return _H.cache[prompt]; }
+    let s = _H.scores(prompt);
+    let m = s.scores[0];
+    let i = 1;
+    while i < len(s.scores) { if s.scores[i] > m { m = s.scores[i]; } i = i + 1; }
+    let r = map{ intent: s.intent, conf: m, scores: s.scores };
+    _H.cache[prompt] = r;
+    return r;
+}
+
+// Each vote is weighted by (per-voter reliability weight) * (self-reported confidence).
+let _ENS = map{ voters: [], native_weight: 1, stats: map{}, last: map{}, adaptive: false, parallel: false, routing: false };
+
+// ── concurrency: query voters in parallel (fork/join, shared heap) ──────────────────────
+fn set_parallel(on) { _ENS.parallel = on; return nil; }
+fn _fork_voter(f, prompt) { return P.fork(fn() { return try f(prompt) catch nil; }); }
+fn _collect_votes(prompt) {
+    let n = len(_ENS.voters);
+    let out = [];
+    if _ENS.parallel != true or n < 2 {
+        let i = 0;
+        while i < n { let f = _ENS.voters[i].fn; array_push(out, _voter_result(try f(prompt) catch nil)); i = i + 1; }
+        return out;
+    }
+    let tasks = [];
+    let i = 0;
+    while i < n { array_push(tasks, _fork_voter(_ENS.voters[i].fn, prompt)); i = i + 1; }
+    let j = 0;
+    while j < n { array_push(out, _voter_result(try P.join_task(tasks[j]) catch nil)); j = j + 1; }
+    return out;
+}
+
+// ── adaptive reliability (the ensemble learns who to trust) ─────────────────────────────
+fn reliability(name) {
+    if not map_has(_ENS.stats, name) { return 0.5; }
+    let s = _ENS.stats[name];
+    return (s.correct + 1) / (s.total + 2);
+}
+fn _relmul(name) { if _ENS.adaptive == true { return 2 * reliability(name); } return 1; }
+// reliability_for(name, intent) — how reliable a model is WHEN IT VOTES `intent` (per-category).
+fn reliability_for(name, intent) { return reliability(name + "@" + intent); }
+// _wmul(name, voted) — vote multiplier: 1 unless adaptive; then per-category (routing) or global
+// reliability, ×2 so chance (0.5) is neutral (1.0).
+fn _wmul(name, voted) {
+    if _ENS.adaptive != true { return 1; }
+    if _ENS.routing == true { return 2 * reliability(name + "@" + voted); }
+    return 2 * reliability(name);
+}
+fn set_adaptive(on) { _ENS.adaptive = on; return nil; }
+fn set_routing(on) { _ENS.routing = on; return nil; }
+fn reset_stats() { _ENS.stats = map{}; _ENS.last = map{}; return nil; }
+fn _write_ok(path, content) { fs_write(path, content); return true; }
+fn save_stats(path) { return (try _write_ok(path, json_stringify(_ENS.stats)) catch false) == true; }
+fn load_stats(path) {
+    if (try fs_exists(path) catch false) != true { return false; }
+    let raw = try fs_read(path) catch nil;
+    if raw == nil { return false; }
+    let obj = try json_parse(raw) catch nil;
+    if not is_map(obj) { return false; }
+    _ENS.stats = obj;
+    return true;
+}
+fn _bump(key, correct) {
+    if not map_has(_ENS.stats, key) { _ENS.stats[key] = map{ correct: 0, total: 0 }; }
+    let s = _ENS.stats[key];
+    s.total = s.total + 1;
+    if correct == true { s.correct = s.correct + 1; }
+    _ENS.stats[key] = s;
+    return nil;
+}
+fn record_outcome(true_intent) {
+    let keys = map_keys(_ENS.last);
+    let i = 0;
+    while i < len(keys) {
+        let name = keys[i];
+        let voted = _ENS.last[name];
+        let ok = voted == true_intent;
+        _bump(name, ok);                    // global reliability
+        _bump(name + "@" + voted, ok);      // per-category (routing) reliability
+        i = i + 1;
+    }
+    return nil;
+}
+
+// ── voters ──────────────────────────────────────────────────────────────────────────────
+fn register_voter(name, f) { array_push(_ENS.voters, map{ name: name, fn: f, weight: 1 }); return nil; }
+fn register_voter_weighted(name, f, weight) { array_push(_ENS.voters, map{ name: name, fn: f, weight: weight }); return nil; }
+fn voters() { let out = []; let i = 0; while i < len(_ENS.voters) { array_push(out, _ENS.voters[i].name); i = i + 1; } return out; }
+fn clear_voters() { _ENS.voters = []; return nil; }
+fn set_native_weight(w) { _ENS.native_weight = w; return nil; }
+
+// register_model(name, model_fn, weight) — plug ANOTHER model/brain into the MLLM as a voter.
+// model_fn(prompt) may return an intent string, or {intent, scores} / {intent, confidence}. Its
+// confidence is the max score (if scores given) so a strong model's vote counts more. THIS is
+// how two pbai brains combine into one MLLM.
+fn register_model(name, model_fn, weight = 1) {
+    let v = fn(prompt) {
+        let r = try model_fn(prompt) catch nil;
+        if r == nil { return nil; }
+        if is_string(r) { return map{ intent: r, confidence: 1 }; }
+        if is_map(r) and map_has(r, "intent") {
+            let c = 1;
+            if map_has(r, "scores") {
+                let s = r.scores; let m = s[0]; let i = 1;
+                while i < len(s) { if s[i] > m { m = s[i]; } i = i + 1; }
+                c = m;
+                // keep the full distribution so soft fusion can use it
+                return map{ intent: r.intent, confidence: c, scores: r.scores };
+            }
+            if map_has(r, "confidence") { c = r.confidence; }
+            return map{ intent: r.intent, confidence: c };
+        }
+        return nil;
+    };
+    register_voter_weighted(name, v, weight);
+    return nil;
+}
+
+// A voter may return a bare intent string (conf 1.0), {intent, confidence}, or nil to abstain.
+fn _voter_result(r) {
+    if r == nil { return nil; }
+    if is_string(r) { return map{ intent: r, conf: 1 }; }
+    if is_map(r) and map_has(r, "intent") {
+        if map_has(r, "scores") {
+            let s = r.scores; let m = s[0]; let i = 1;
+            while i < len(s) { if s[i] > m { m = s[i]; } i = i + 1; }
+            return map{ intent: r.intent, conf: m, scores: s };
+        }
+        let c = 1;
+        if map_has(r, "confidence") { c = r.confidence; }
+        return map{ intent: r.intent, conf: c };
+    }
+    return nil;
+}
+
+// ── voter response caching ──────────────────────────────────────────────────────────────
+let _VCACHE = map{ store: map{}, hits: 0, misses: 0 };
+fn clear_voter_cache() { _VCACHE.store = map{}; _VCACHE.hits = 0; _VCACHE.misses = 0; return nil; }
+fn voter_cache_stats() { return map{ size: len(map_keys(_VCACHE.store)), hits: _VCACHE.hits, misses: _VCACHE.misses }; }
+fn memoize_voter(name, f) {
+    return fn(prompt) {
+        let key = name + "\n#\n" + prompt;
+        if map_has(_VCACHE.store, key) { _VCACHE.hits = _VCACHE.hits + 1; return _VCACHE.store[key]; }
+        let r = try f(prompt) catch nil;
+        _VCACHE.misses = _VCACHE.misses + 1;
+        if r != nil { _VCACHE.store[key] = r; }
+        return r;
+    };
+}
+
+// ── the ensemble decision ───────────────────────────────────────────────────────────────
+// ── fusion mode: "hard" (argmax votes only) vs "soft" (full score distributions) ────────
+// Soft fusion sums each model's weighted score VECTOR, so a strong second choice still
+// carries mass — the classic soft-voting > hard-voting result for calibrated models.
+// Label-only voters degrade to a one-hot contribution (same as hard), so mixing is safe.
+fn set_fusion(mode) { _ENS.fusion = mode; return nil; }
+fn _fusion() {
+    if map_has(_ENS, "fusion") and _ENS.fusion == "soft" { return "soft"; }
+    return "hard";
+}
+fn _tally_add(tally, intent, amount) {
+    if amount <= 0 { return nil; }
+    if map_has(tally, intent) { tally[intent] = tally[intent] + amount; }
+    else { tally[intent] = amount; }
+    return nil;
+}
+// add a model's contribution: soft = mult * scores[j] per intent; hard/one-hot = mult * conf.
+fn _fuse_into(tally, soft, scores, intent, conf, mult) {
+    if soft and scores != nil {
+        let ints = _H.intents;
+        let j = 0;
+        while j < len(ints) and j < len(scores) { _tally_add(tally, ints[j], mult * scores[j]); j = j + 1; }
+        return nil;
+    }
+    _tally_add(tally, intent, mult * conf);
+    return nil;
+}
+
+fn ensemble_detail(prompt) {
+    let nv = _native(prompt);
+    let native = nv.intent;
+    let nconf = nv.conf;
+    let soft = _fusion() == "soft";
+    _ENS.last = map{};
+    _ENS.last["native"] = native;
+    let tally = map{};
+    _fuse_into(tally, soft, try nv.scores catch nil, native, nconf, _ENS.native_weight * _wmul("native", native));
+    let votes = _collect_votes(prompt);
+    let i = 0;
+    while i < len(_ENS.voters) {
+        let v = _ENS.voters[i];
+        let parsed = votes[i];
+        if parsed != nil {
+            _ENS.last[v.name] = parsed.intent;
+            _fuse_into(tally, soft, try parsed.scores catch nil, parsed.intent, parsed.conf, v.weight * _wmul(v.name, parsed.intent));
+        }
+        i = i + 1;
+    }
+    let winner = native;
+    let best = 0;
+    if map_has(tally, native) { best = tally[native]; }
+    let keys = map_keys(tally);
+    let k = 0;
+    while k < len(keys) { if tally[keys[k]] > best { best = tally[keys[k]]; winner = keys[k]; } k = k + 1; }
+    return map{ intent: winner, tally: tally, voters: len(_ENS.voters) + 1,
+        native: native, native_confidence: nconf };
+}
+fn ensemble(prompt) { return ensemble_detail(prompt).intent; }
+fn ensemble_confidence(prompt) {
+    let det = ensemble_detail(prompt);
+    let keys = map_keys(det.tally);
+    let total = 0;
+    let k = 0;
+    while k < len(keys) { total = total + det.tally[keys[k]]; k = k + 1; }
+    if total <= 0 { return 0; }
+    return det.tally[det.intent] / total;
+}
+// _log2(x) — base-2 log via natural log (no num_log2 builtin).
+fn _log2(x) { return num_ln(x) / num_ln(2); }
+
+// _tally_uncertainty(tally) — normalized Shannon entropy of the vote-mass distribution,
+// in [0,1]. 0 = all mass on one intent (unanimous); 1 = uniform across every CONFIGURED
+// intent. Distinct from top-1 confidence: it measures how spread the *rest* of the mass is,
+// so it flags genuine disagreement the winner-share alone can miss. Normalized by
+// log2(#configured intents) so a 4-way split reads as more uncertain than a 2-way split.
+fn _tally_uncertainty(tally) {
+    let keys = map_keys(tally);
+    let total = 0;
+    let i = 0;
+    while i < len(keys) { total = total + tally[keys[i]]; i = i + 1; }
+    if total <= 0 { return 0; }
+    let base = len(_H.intents);
+    if base < 2 { base = len(keys); }
+    if base < 2 { return 0; }
+    let h = 0;
+    let j = 0;
+    while j < len(keys) {
+        let p = tally[keys[j]] / total;
+        if p > 0 { h = h - p * _log2(p); }
+        j = j + 1;
+    }
+    return h / _log2(base);
+}
+
+// uncertainty(prompt) — the normalized vote-distribution entropy for a decision.
+fn uncertainty(prompt) { return _tally_uncertainty(ensemble_detail(prompt).tally); }
+
+fn ensemble_decide(prompt, threshold = 0.6) {
+    let det = ensemble_detail(prompt);
+    let keys = map_keys(det.tally);
+    let total = 0;
+    let k = 0;
+    while k < len(keys) { total = total + det.tally[keys[k]]; k = k + 1; }
+    let conf = 0;
+    if total > 0 { conf = det.tally[det.intent] / total; }
+    return map{ intent: det.intent, confidence: conf, escalate: conf < threshold,
+        uncertainty: _tally_uncertainty(det.tally), voters: det.voters, tally: det.tally };
+}
+
+// decide_ex(prompt, conf_threshold, uncertainty_threshold) — escalate on EITHER low winner
+// confidence OR high disagreement. `reason` ∈ {"low_confidence","uncertain","none"}; low
+// confidence takes precedence when both trip. Lets a caller catch split votes that pass the
+// confidence bar (e.g. a 2-way tie where the winner still has the plurality share).
+fn decide_ex(prompt, conf_threshold = 0.6, uncertainty_threshold = 0.7) {
+    let d = ensemble_decide(prompt, conf_threshold);
+    let reason = "none";
+    let escalate = false;
+    if d.confidence < conf_threshold { escalate = true; reason = "low_confidence"; }
+    else if d.uncertainty > uncertainty_threshold { escalate = true; reason = "uncertain"; }
+    return map{ intent: d.intent, confidence: d.confidence, uncertainty: d.uncertainty,
+        escalate: escalate, reason: reason, voters: d.voters, tally: d.tally };
+}
+// ── decision explanation ────────────────────────────────────────────────────────────────
+// explain_decision(prompt) — a human-readable trace: what each model voted, with what
+// weight and reliability, under which fusion/decision mode, and why the winner won.
+fn _round2(x) { return num_floor(x * 100) / 100; }
+fn explain_decision(prompt, threshold = 0.6) {
+    let d = ensemble_decide(prompt, threshold);
+    let lines = [];
+    let mode = "static";
+    if _ENS.adaptive == true { mode = "adaptive"; if _ENS.routing == true { mode = "routing"; } }
+    array_push(lines, "mode=" + mode + " fusion=" + _fusion() + " models=" + str(len(_ENS.voters) + 1));
+    let nvote = try _ENS.last["native"] catch "?";
+    array_push(lines, "native voted '" + str(nvote) + "' (weight " + str(_round2(_ENS.native_weight))
+        + ", reliability " + str(_round2(reliability("native"))) + ")");
+    let i = 0;
+    while i < len(_ENS.voters) {
+        let v = _ENS.voters[i];
+        let voted = "abstained";
+        if map_has(_ENS.last, v.name) { voted = "voted '" + str(_ENS.last[v.name]) + "'"; }
+        array_push(lines, v.name + " " + voted + " (weight " + str(_round2(v.weight))
+            + ", reliability " + str(_round2(reliability(v.name))) + ")");
+        i = i + 1;
+    }
+    array_push(lines, "winner '" + str(d.intent) + "' with confidence " + str(_round2(d.confidence))
+        + " (escalate=" + str(d.escalate) + ")");
+    return map{ intent: d.intent, confidence: d.confidence, escalate: d.escalate,
+        lines: lines, tally: d.tally };
+}
+
+// explain_line(prompt, conf_threshold, uncertainty_threshold) — a compact ONE-LINE decision
+// summary for status bars / logs:
+//   "<intent> <conf>% · <mode>/<fusion> · <winner-mass>/<total-mass> [⚠escalate:<reason>]"
+// It uses decide_ex, so the escalation reason (low_confidence / uncertain) is shown — the
+// glanceable "why it's asking" cue. The multi-line explain_decision is for panels.
+fn explain_line(prompt, conf_threshold = 0.6, uncertainty_threshold = 0.7) {
+    let d = decide_ex(prompt, conf_threshold, uncertainty_threshold);
+    let mode = "static";
+    if _ENS.adaptive == true { mode = "adaptive"; if _ENS.routing == true { mode = "routing"; } }
+    let total = 0;
+    let keys = map_keys(d.tally);
+    let k = 0;
+    while k < len(keys) { total = total + d.tally[keys[k]]; k = k + 1; }
+    let win = 0;
+    if map_has(d.tally, d.intent) { win = d.tally[d.intent]; }
+    let pct = num_floor(d.confidence * 100);
+    let tag = "";
+    if d.escalate { tag = " ⚠escalate:" + d.reason; }
+    return str(d.intent) + " " + str(pct) + "% · " + mode + "/" + _fusion()
+        + " · " + str(_round2(win)) + "/" + str(_round2(total)) + tag;
+}
+
+// ── answer synthesis ────────────────────────────────────────────────────────────────────
+// set_responder(f) — wire the host's skill dispatcher: f(intent, prompt) -> answer text.
+// answer(prompt) then returns the DECISION plus the full text the winning skill produced,
+// so the MLLM gives real answers, not just intent labels. Pass nil to unwire.
+fn set_responder(f) { _ENS.responder = f; return true; }
+
+// answer(prompt, threshold) — ensemble_decide + run the responder for the decided intent.
+// A missing or throwing responder degrades to text=nil (the decision always survives).
+fn answer(prompt, threshold = 0.6) {
+    let d = ensemble_decide(prompt, threshold);
+    let text = nil;
+    if map_has(_ENS, "responder") and _ENS.responder != nil {
+        text = try _ENS.responder(d.intent, prompt) catch nil;
+    }
+    return map{ intent: d.intent, confidence: d.confidence, escalate: d.escalate,
+        text: text, voters: d.voters, tally: d.tally };
+}
+
+fn ensemble_batch(prompts, threshold = 0.6) {
+    let out = [];
+    let i = 0;
+    while i < len(prompts) {
+        let d = ensemble_decide(prompts[i], threshold);
+        array_push(out, map{ intent: d.intent, confidence: d.confidence, escalate: d.escalate });
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── evaluation + auto-calibration on a labeled set ──────────────────────────────────────
+// evaluate(examples) — examples = [{prompt, intent}]. Runs the ensemble on each and scores the
+// ensemble AND every participating model (from the per-round votes). Returns
+// {n, ensemble_accuracy, per_model: {name: accuracy}}. Does NOT change reliability.
+fn evaluate(examples) {
+    let total = len(examples);
+    let ens_correct = 0;
+    let mcorrect = map{};
+    let mtotal = map{};
+    let i = 0;
+    while i < total {
+        let ex = examples[i];
+        let det = ensemble_detail(ex.prompt);
+        if det.intent == ex.intent { ens_correct = ens_correct + 1; }
+        let keys = map_keys(_ENS.last);
+        let k = 0;
+        while k < len(keys) {
+            let name = keys[k];
+            if not map_has(mtotal, name) { mtotal[name] = 0; mcorrect[name] = 0; }
+            mtotal[name] = mtotal[name] + 1;
+            if _ENS.last[name] == ex.intent { mcorrect[name] = mcorrect[name] + 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    let per = map{};
+    let mk = map_keys(mtotal);
+    let j = 0;
+    while j < len(mk) { let n = mk[j]; per[n] = mcorrect[n] / mtotal[n]; j = j + 1; }
+    let acc = 0;
+    if total > 0 { acc = ens_correct / total; }
+    return map{ n: total, ensemble_accuracy: acc, per_model: per };
+}
+// ── auto mode selection ─────────────────────────────────────────────────────────────────
+// The engine has three decision modes: "static" (fixed weights only), "adaptive" (global
+// reliability multiplier), "routing" (per-intent reliability), and two fusion modes:
+// "hard" (argmax votes) / "soft" (full score distributions). auto_configure(examples)
+// sweeps ALL SIX combos on a labeled set, keeps the best (ties -> simplest = static+hard),
+// restores BOTH dimensions, and returns {mode, fusion, accuracy, results (per mode, best
+// fusion), results_full (per "mode/fusion")}. Stats are read, never mutated. The native
+// cache stores the full score vector, so it is fusion-independent (no clearing needed).
+fn _mode_apply(m) {
+    if m == "adaptive" { set_adaptive(true); set_routing(false); return nil; }
+    if m == "routing" { set_adaptive(true); set_routing(true); return nil; }
+    set_adaptive(false); set_routing(false);
+    return nil;
+}
+fn auto_configure(examples) {
+    let modes = ["static", "adaptive", "routing"];
+    let fusions = ["hard", "soft"];   // order matters: hard first so ties keep the simpler
+    let results = map{};              // per-mode: best accuracy across fusions (back-compat)
+    let results_full = map{};         // per "mode/fusion"
+    let best_mode = "static";
+    let best_fusion = "hard";
+    let bestAcc = 0 - 1;
+    let mi = 0;
+    while mi < len(modes) {
+        _mode_apply(modes[mi]);
+        let modeBest = 0 - 1;
+        let fi = 0;
+        while fi < len(fusions) {
+            set_fusion(fusions[fi]);
+            let acc = try evaluate(examples).ensemble_accuracy catch 0;
+            results_full[modes[mi] + "/" + fusions[fi]] = acc;
+            if acc > modeBest { modeBest = acc; }
+            if acc > bestAcc { bestAcc = acc; best_mode = modes[mi]; best_fusion = fusions[fi]; }
+            fi = fi + 1;
+        }
+        results[modes[mi]] = modeBest;
+        mi = mi + 1;
+    }
+    _mode_apply(best_mode);
+    set_fusion(best_fusion);
+    return map{ mode: best_mode, fusion: best_fusion, accuracy: bestAcc,
+        results: results, results_full: results_full };
+}
+// set_voter_weight(name, w) — override a single voter's static weight; false if not found.
+fn set_voter_weight(name, w) {
+    let i = 0;
+    while i < len(_ENS.voters) { if _ENS.voters[i].name == name { _ENS.voters[i].weight = w; return true; } i = i + 1; }
+    return false;
+}
+fn _wfn(a, scale, minw) { let w = a * scale; if w < minw { w = minw; } return w; }
+// tune_weights(examples, opts) — bake each model's MEASURED accuracy into its static vote weight
+// (weight = accuracy*scale, floored at min_weight); native via set_native_weight. Unlike adaptive
+// reliability (a runtime multiplier), this sets fixed weights — use one or the other. Returns the
+// weights it set, keyed by name (plus "native"). opts: scale (1), min_weight (0).
+fn tune_weights(examples, opts = nil) {
+    let o = opts; if o == nil { o = map{}; }
+    let scale = 1; if map_has(o, "scale") { scale = o.scale; }
+    let minw = 0;  if map_has(o, "min_weight") { minw = o.min_weight; }
+    let per = evaluate(examples).per_model;
+    let out = map{};
+    let na = 0.5; if map_has(per, "native") { na = per["native"]; }
+    let nw = _wfn(na, scale, minw);
+    set_native_weight(nw);
+    out["native"] = nw;
+    let i = 0;
+    while i < len(_ENS.voters) {
+        let v = _ENS.voters[i];
+        let a = 0.5; if map_has(per, v.name) { a = per[v.name]; }
+        let w = _wfn(a, scale, minw);
+        _ENS.voters[i].weight = w;
+        out[v.name] = w;
+        i = i + 1;
+    }
+    return out;
+}
+
+// calibrate(examples) — learn per-voter reliability from a labeled set (records each outcome),
+// then re-measure. Returns {before, after} ensemble accuracy. Enable set_adaptive(true) to make
+// the learned reliability actually re-weight votes (that's when `after` improves).
+fn calibrate(examples) {
+    let before = evaluate(examples).ensemble_accuracy;
+    let i = 0;
+    while i < len(examples) {
+        ensemble_detail(examples[i].prompt);
+        record_outcome(examples[i].intent);
+        i = i + 1;
+    }
+    let after = evaluate(examples).ensemble_accuracy;
+    return map{ before: before, after: after };
+}
+
+// calibration_report(examples, nbins) — is the ensemble's stated confidence trustworthy?
+// A well-calibrated model that says "80%" is right ~80% of the time. Returns:
+//   { n, accuracy, mean_confidence, brier, bins:[{lo,hi,n,confidence,accuracy}] }
+// brier = mean((confidence - correct)^2), lower is better (0 = perfect). The gap
+// (mean_confidence - accuracy) is the over/under-confidence. Reads decisions; no stat
+// mutation. bins are the occupied confidence ranges for a reliability curve.
+fn calibration_report(examples, nbins = 5) {
+    let n = len(examples);
+    let bin_n = []; let bin_conf = []; let bin_acc = [];
+    let bi = 0;
+    while bi < nbins { array_push(bin_n, 0); array_push(bin_conf, 0); array_push(bin_acc, 0); bi = bi + 1; }
+    let sum_brier = 0; let sum_conf = 0; let correct = 0;
+    let i = 0;
+    while i < n {
+        let ex = examples[i];
+        let d = ensemble_decide(ex.prompt);
+        let conf = d.confidence;
+        let ok = 0;
+        if d.intent == ex.intent { ok = 1; }
+        let diff = conf - ok;
+        sum_brier = sum_brier + diff * diff;
+        sum_conf = sum_conf + conf;
+        correct = correct + ok;
+        let idx = num_floor(conf * nbins);
+        if idx >= nbins { idx = nbins - 1; }
+        if idx < 0 { idx = 0; }
+        bin_n[idx] = bin_n[idx] + 1;
+        bin_conf[idx] = bin_conf[idx] + conf;
+        bin_acc[idx] = bin_acc[idx] + ok;
+        i = i + 1;
+    }
+    let bins = [];
+    let j = 0;
+    while j < nbins {
+        if bin_n[j] > 0 {
+            array_push(bins, map{ lo: j / nbins, hi: (j + 1) / nbins, n: bin_n[j],
+                confidence: bin_conf[j] / bin_n[j], accuracy: bin_acc[j] / bin_n[j] });
+        }
+        j = j + 1;
+    }
+    let brier = 0; let mc = 0; let acc = 0;
+    if n > 0 { brier = sum_brier / n; mc = sum_conf / n; acc = correct / n; }
+    return map{ n: n, accuracy: acc, mean_confidence: mc, brier: brier, bins: bins };
+}
+
+// ── external + local LLM voters ─────────────────────────────────────────────────────────
+fn _parse_intent(text) {
+    if not is_string(text) { return nil; }
+    let t = str_lower(str_trim(text));
+    let best = nil;
+    let bestpos = -1;
+    let i = 0;
+    while i < len(_H.intents) {
+        let pos = str_index_of(t, _H.intents[i]);
+        if pos >= 0 and (bestpos < 0 or pos < bestpos) { bestpos = pos; best = _H.intents[i]; }
+        i = i + 1;
+    }
+    if best == nil { return nil; }
+    let conf = 0.7;
+    if t == best { conf = 0.9; }
+    return map{ intent: best, confidence: conf };
+}
+fn llm_voter(provider, model = nil, caller = nil) {
+    let names = "";
+    let i = 0;
+    while i < len(_H.intents) { if i > 0 { names = names + ", "; } names = names + _H.intents[i]; i = i + 1; }
+    return fn(prompt) {
+        let msg = "Classify this coding request into exactly one of these intents: " + names
+            + ". Reply with only the single intent word.\n\nRequest: " + prompt;
+        let reply = nil;
+        if caller != nil { reply = try caller(msg) catch nil; }
+        else { reply = try PR.call_provider(provider, msg, model) catch nil; }
+        return _parse_intent(reply);
+    };
+}
+fn ollama_available() { return OLL.available(); }
+fn ollama_voter(model = nil, post_fn = nil) {
+    if model == nil { model = OLL.default_model(); }
+    return llm_voter("ollama", model, OLL.voter_caller(model, post_fn));
+}
+fn use_ollama(model = nil, weight = 2) {
+    if not OLL.available() { return false; }
+    if model == nil { model = OLL.default_model(); }
+    if model == nil { return false; }
+    register_voter_weighted("ollama:" + model, memoize_voter("ollama:" + model, ollama_voter(model)), weight);
+    return true;
+}
+
+export configure, intents, register_model, clear_native_cache, evaluate, calibrate, calibration_report;
+export tune_weights, set_voter_weight, auto_configure, set_responder, answer;
+export set_fusion, explain_decision, explain_line, uncertainty, decide_ex;
+export ensemble, ensemble_detail, ensemble_confidence, ensemble_decide, ensemble_batch;
+export register_voter, register_voter_weighted, set_native_weight, voters, clear_voters;
+export reliability, reliability_for, set_adaptive, set_routing, reset_stats, record_outcome, save_stats, load_stats;
+export memoize_voter, clear_voter_cache, voter_cache_stats, set_parallel;
+export llm_voter, ollama_available, ollama_voter, use_ollama;

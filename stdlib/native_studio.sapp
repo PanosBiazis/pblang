@@ -1,0 +1,132 @@
+// stdlib/native_studio.sapp — the ergonomic, observable front door to pblang's native mode.
+//
+// Goal: make compiling-to-native FAST, SMART, and SIMPLE for everyday code.
+//   * EASY    — a small builder so you write readable steps, not raw IR arrays.
+//   * SMART   — every program is validated and constant-folded before it is compiled.
+//   * FAST    — results are CACHED (a pure integer kernel is deterministic, so the same IR
+//               never recompiles or re-executes).
+//   * OBSERVABLE — counters + the pblang watchers (stdlib/watch.sapp) expose what's happening.
+//
+//   let s = import("stdlib/native_studio.sapp");
+//   let p = s.prog(); s.seti(p,0,0); s.seti(p,1,100); s.loopb(p,1,[["add",0,1]]);
+//   s.run_value(p);   // 5050, then cached
+//   s.metrics();      // { runs, cache_hits, compiles, folds, ... }
+
+let NAT = import("stdlib:native.sapp");
+let OPT = import("stdlib:codegen_ir.sapp");
+let W = import("stdlib:watch.sapp");
+
+// ── easy IR builder (mutates an op list, returns it for chaining) ─────────────────────
+fn prog() { return []; }
+fn seti(p, r, v) { array_push(p, ["seti", r, v]); return p; }
+fn addv(p, a, b) { array_push(p, ["add", a, b]); return p; }
+fn subv(p, a, b) { array_push(p, ["sub", a, b]); return p; }
+fn mulv(p, a, b) { array_push(p, ["mul", a, b]); return p; }
+fn addi(p, r, v) { array_push(p, ["addi", r, v]); return p; }
+fn loopb(p, r, body) { array_push(p, ["loop", r, body]); return p; }
+fn iffb(p, r, thenb, elseb) { array_push(p, ["ifnz", r, thenb, elseb]); return p; }
+fn callb(p, name) { array_push(p, ["call", name]); return p; }
+
+// ── observability state ───────────────────────────────────────────────────────────────
+let _M = map{ runs: 0, cache_hits: 0, compiles: 0, folds: 0, const_hits: 0, total_ms: 0, last_ms: 0, cache: map{}, trace: [] };
+
+fn reset() { _M.runs = 0; _M.cache_hits = 0; _M.compiles = 0; _M.folds = 0; _M.const_hits = 0; _M.total_ms = 0; _M.last_ms = 0; _M.cache = map{}; _M.trace = []; return _M; }
+fn metrics() { return map{ runs: _M.runs, cache_hits: _M.cache_hits, compiles: _M.compiles, folds: _M.folds, const_hits: _M.const_hits, total_ms: _M.total_ms, last_ms: _M.last_ms }; }
+// _is_const(o) — did optimize() reduce this to a single `seti r0, value`? Then there is
+// nothing to run: the answer is already known and we return it IN-PROCESS (no fork/exec/disk).
+fn _is_const(o) { return len(o) == 1 and o[0][0] == "seti" and o[0][1] == 0; }
+// eval_interp(ir) — run the IR on the in-process pblang interpreter (the bytecode VM), with no
+// native compile or process spawn. Fastest path for small/one-shot integer kernels.
+fn eval_interp(ir) { return OPT.eval(ir); }
+fn _tick(kind, cached, ms) {
+    _M.last_ms = ms; _M.total_ms = _M.total_ms + ms;
+    array_push(_M.trace, map{ kind: kind, cached: cached, ms: ms });
+    if len(_M.trace) > 25 { _M.trace = _drop_first(_M.trace); }
+    return nil;
+}
+fn _drop_first(a) { let o = []; let i = 1; while i < len(a) { array_push(o, a[i]); i = i + 1; } return o; }
+fn trace() { return _M.trace; }
+fn available() { return try NAT.supported() catch false; }
+
+// _prep(ir) — validate + optimize (smart). Returns the optimized IR.
+fn _prep(ir) {
+    OPT.assert_valid(ir);
+    let o = OPT.optimize(ir);
+    if len(o) < len(ir) { _M.folds = _M.folds + 1; }
+    return o;
+}
+
+// run_value(ir) — the everyday entry: validate → optimize → (cache) → native execute → value.
+fn run_value(ir) {
+    let t0 = try now_ms() catch 0;
+    let o = _prep(ir);
+    let key = json_stringify(o);
+    if map_has(_M.cache, key) {
+        _M.cache_hits = _M.cache_hits + 1;
+        _M.runs = _M.runs + 1;
+        _tick("run_value", true, (try now_ms() catch 0) - t0);
+        return _M.cache[key];
+    }
+    // FAST PATH: a fully-folded program needs no native binary at all.
+    if _is_const(o) {
+        let cv = o[0][2];
+        _M.const_hits = _M.const_hits + 1;
+        _M.runs = _M.runs + 1;
+        _M.cache[key] = cv;
+        _tick("const", false, (try now_ms() catch 0) - t0);
+        return cv;
+    }
+    let v = NAT.run_value(o);
+    _M.compiles = _M.compiles + 1;
+    _M.runs = _M.runs + 1;
+    _M.cache[key] = v;
+    _tick("run_value", false, (try now_ms() catch 0) - t0);
+    return v;
+}
+
+// strategy(ir) — which path run_value will take: "const" (in-process, no exec), or "native".
+fn strategy(ir) {
+    let o = _prep(ir);
+    if _is_const(o) { return "const"; }
+    return "native";
+}
+
+// run(ir) — exit-code variant (0..255), same validate/optimize/cache path.
+fn run(ir) {
+    let o = _prep(ir);
+    let key = "rc:" + json_stringify(o);
+    if map_has(_M.cache, key) { _M.cache_hits = _M.cache_hits + 1; _M.runs = _M.runs + 1; return _M.cache[key]; }
+    let v = NAT.run(o);
+    _M.compiles = _M.compiles + 1;
+    _M.runs = _M.runs + 1;
+    _M.cache[key] = v;
+    return v;
+}
+
+// info() — host + hardware view via the pblang watchers (what resources native mode can use).
+fn info() {
+    return map{
+        host_arch: try NAT.host_arch() catch "unknown",
+        native: try NAT.info() catch map{ supported: false },
+        hardware: try W.compute() catch (try W.hardware() catch map{ available: false }),
+        cache_size: len(map_keys(_M.cache))
+    };
+}
+
+// process_report() — the unified observability view: run metrics + recent trace + the live
+// hardware picture from the pblang watchers. One call to see how the native pipeline behaves.
+fn process_report() {
+    return map{
+        metrics: metrics(),
+        trace: _M.trace,
+        cache_size: len(map_keys(_M.cache)),
+        host_arch: try NAT.host_arch() catch "unknown",
+        compute: try W.compute() catch map{ available: false },
+        cpu: try W.cpu() catch map{ available: false },
+        memory: try W.memory() catch map{ available: false }
+    };
+}
+
+export prog, seti, addv, subv, mulv, addi, loopb, iffb, callb;
+export reset, metrics, trace, available, run, run_value, info, process_report;
+export eval_interp, strategy;

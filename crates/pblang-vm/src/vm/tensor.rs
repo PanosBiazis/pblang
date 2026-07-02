@@ -201,6 +201,39 @@ pub(super) fn tensor_scale_builtin(
     Ok(tensor_make(sa, out))
 }
 
+/// Read PBLANG_GPU into a normalized mode: "off" (force CPU / deterministic), "on" (force
+/// GPU whenever a device exists), or "auto" (the default — route by problem size).
+#[cfg(feature = "gpu")]
+fn gpu_mode() -> &'static str {
+    let v = std::env::var("PBLANG_GPU").unwrap_or_default();
+    match v.trim().to_lowercase().as_str() {
+        "0" | "off" | "cpu" | "false" | "no" => "off",
+        "1" | "on" | "always" | "true" | "yes" => "on",
+        _ => "auto", // unset or anything else → automatic
+    }
+}
+
+/// Decide whether to offload a matmul of this `work` (= m*n*k) to the GPU. This is what
+/// makes pblang use the GPU "when needed": automatic, size-based routing once the backend
+/// is built in. The GPU has higher fixed overhead than spawning rayon threads (buffer
+/// alloc + dispatch + readback), so its threshold is deliberately HIGHER than the
+/// CPU-parallel threshold (1<<16) — tiny matmuls are faster (and exact, f64) on the CPU.
+/// Override the threshold with PBLANG_GPU_MIN (work elements).
+#[cfg(feature = "gpu")]
+fn gpu_should_offload(work: usize) -> bool {
+    let mode = gpu_mode();
+    if mode == "off" {
+        return false;
+    }
+    // forced GPU only needs a tiny floor; auto waits until the GPU clearly pays off.
+    let default_min: usize = if mode == "on" { 1 << 12 } else { 1 << 20 };
+    let min = std::env::var("PBLANG_GPU_MIN")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default_min);
+    work >= min && super::gpu::available()
+}
+
 pub(super) fn tensor_matmul_builtin(
     host: &mut dyn VmHost,
     args: Vec<Value>,
@@ -228,16 +261,18 @@ pub(super) fn tensor_matmul_builtin(
         )));
     }
     let k = k1;
-    // Optional GPU offload (opt-in via PBLANG_GPU=1; f32 precision). Only attempted for
-    // large products and when built with --features gpu; otherwise the CPU path runs.
+    // GPU offload — used AUTOMATICALLY "when needed": once built with --features gpu and a
+    // device is available, large matmuls run on the GPU and small ones stay on the
+    // (deterministic, f64) CPU path. See gpu_should_offload for the mode/threshold rules.
+    // GPU math is f32, so a deterministic CPU override (PBLANG_GPU=off) is always honored.
     #[cfg(feature = "gpu")]
     {
-        if std::env::var("PBLANG_GPU").ok().as_deref() == Some("1")
-            && m.saturating_mul(n).saturating_mul(k) >= (1 << 16)
-        {
+        let work = m.saturating_mul(n).saturating_mul(k);
+        if gpu_should_offload(work) {
             if let Some(g) = super::gpu::matmul(&da, &db, m, k, n) {
                 return Ok(tensor_make(vec![m, n], g));
             }
+            // device vanished mid-run → fall through to the CPU path below.
         }
     }
     let out_len = checked_tensor_elements(host, "tensor_matmul", &[m, n])?;
@@ -285,9 +320,12 @@ pub(super) fn tensor_backend_builtin(
     #[cfg(feature = "gpu")]
     {
         m.insert("gpu_available".into(), Value::Bool(super::gpu::available()));
+        // mode: "auto" (route by size, the default), "on" (force), or "off" (force CPU).
+        m.insert("gpu_mode".into(), alloc_string(gpu_mode()));
+        // enabled = the GPU will actually be used for large matmuls right now.
         m.insert(
             "gpu_enabled".into(),
-            Value::Bool(std::env::var("PBLANG_GPU").ok().as_deref() == Some("1")),
+            Value::Bool(gpu_mode() != "off" && super::gpu::available()),
         );
         m.insert(
             "gpu_adapter".into(),
@@ -314,6 +352,7 @@ pub(super) fn tensor_backend_builtin(
     #[cfg(not(feature = "gpu"))]
     {
         m.insert("gpu_available".into(), Value::Bool(false));
+        m.insert("gpu_mode".into(), alloc_string("off"));
         m.insert("gpu_enabled".into(), Value::Bool(false));
         m.insert(
             "gpu_adapter".into(),
@@ -325,7 +364,7 @@ pub(super) fn tensor_backend_builtin(
     m.insert(
         "note".into(),
         alloc_string(
-            "matmul fans out over CPU cores (rayon); GPU offload is f32 and opt-in via PBLANG_GPU=1 when built with --features gpu",
+            "matmul fans out over CPU cores (rayon); with --features gpu it AUTO-routes large matmuls to the GPU (f32) when a device is available — PBLANG_GPU=off forces deterministic CPU f64, =on forces GPU, PBLANG_GPU_MIN tunes the size threshold",
         ),
     );
     Ok(alloc_map(m))

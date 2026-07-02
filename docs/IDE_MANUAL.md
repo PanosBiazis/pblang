@@ -307,6 +307,8 @@ The native view has:
 
 - an address bar with Back, Reload, Live/Reader/Links/Forms/Source/Inspect/Host mode
   buttons, a `Sec:*` profile button, and a `Tor:on/off` route toggle;
+- the Browser header is responsive: on narrow or manually scaled windows it compacts
+  labels such as `Reader` -> `Read` and keeps the control row inside the viewport;
 - **Live / Reader / Links / Forms / Source / Inspect / Host** modes — *Live* renders
   pblang-extracted page blocks (title/headings/paragraphs/images) as native cards,
   *Reader* shows clean text, *Links* lists the absolutized links, *Forms* lists
@@ -391,6 +393,7 @@ Native IDE parity:
 - Type to filter examples by title or source code.
 - The filter row shows shown/total examples plus selected-position status.
 - `Up`/`Down`, Home/End, PageUp/PageDown, or `Ctrl+N`/`Ctrl+P` change selection.
+- Larger example catalogs scroll inside the modal and show a right-side scrollbar.
 - `Delete` clears the current filter, `Enter` loads the selected example, and `Esc` closes.
 - Clicking a row loads that example into the editor.
 
@@ -512,7 +515,13 @@ Native IDE parity:
   watcher status, UI observer issue lines, AI chat user lines, code side-pane
   headers, Terminal output, History OK/FAIL rows, modal empty-result text,
   Designer component badges, Watch toolbar stale/error states, and Code syntax
-  highlighting.
+  highlighting. The toolbar/browser/history buttons also use density-aware hit
+  padding, so compact layouts keep small visual buttons without making the
+  clickable target too small. Repeated text labels are shaped through a bounded
+  pblang cache before drawing, which keeps the smoother text path responsive.
+  Browser controls, Designer palette buttons, and History actions share the
+  same raised native button chrome as the main toolbar, and editor/list/browser
+  panels use thicker rounded scrollbars so compact layouts are easier to scan.
 - The native `Out` panel is the source outline. It lists top-level `fn`, `let`,
   `const`, and `export` symbols with `Lx-Ly` spans and line counts. The filter
   row shows shown/total symbols plus the selected row position; type to filter,

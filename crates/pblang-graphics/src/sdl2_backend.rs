@@ -54,11 +54,24 @@ pub(crate) fn create(
         .map_err(|e| host.err(format!("sdl2 video: {e}")))?;
     let window = video
         .window(title, width, height)
+        .resizable()
         .build()
         .map_err(|e| host.err(format!("sdl2 window: {e}")))?;
-    let canvas = window
-        .into_canvas()
-        .present_vsync()
+    // Explicitly request a GPU-ACCELERATED renderer (was relying on SDL's default driver
+    // pick). This puts the per-frame texture upload + blit on the GPU. NOTE: the 2D
+    // primitives (rect/line/text) are still rasterized on the CPU into `buf`; only the
+    // present path is GPU-accelerated here. `PBLANG_GFX_SOFTWARE=1` forces the old software
+    // renderer (useful for headless/CI or broken drivers).
+    let mut cb = window.into_canvas().present_vsync();
+    if std::env::var("PBLANG_GFX_SOFTWARE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        cb = cb.software();
+    } else {
+        cb = cb.accelerated();
+    }
+    let canvas = cb
         .build()
         .map_err(|e| host.err(format!("sdl2 canvas: {e}")))?;
     let texture_creator = canvas.texture_creator();
@@ -127,6 +140,15 @@ impl Sdl2Window {
         self.open
     }
 
+    /// Pixel size of the display the window currently sits on (for live UI
+    /// density when the window is dragged between monitors). Best-effort.
+    fn current_display_size(&self) -> Option<(u32, u32)> {
+        let window = self.canvas.window();
+        let idx = window.display_index().ok()?;
+        let bounds = window.subsystem().display_bounds(idx).ok()?;
+        Some((bounds.width(), bounds.height()))
+    }
+
     pub fn clear(&mut self, color: u32) {
         self.buf.fill(color);
     }
@@ -179,6 +201,30 @@ impl Sdl2Window {
                 y += sy;
             }
         }
+    }
+
+    pub fn draw_text_aa(
+        &mut self,
+        x: i64,
+        y: i64,
+        text: &str,
+        color: u32,
+        px: f32,
+        font_path: &str,
+        advance: f32,
+    ) -> Result<crate::graphics::TextDrawStats, String> {
+        crate::graphics::draw_text_aa_into(
+            &mut self.buf,
+            self.w as usize,
+            self.h as usize,
+            x,
+            y,
+            text,
+            color,
+            px,
+            font_path,
+            advance,
+        )
     }
 
     pub fn present(&mut self) -> Result<(), RuntimeError> {
@@ -247,6 +293,45 @@ impl Sdl2Window {
                     self.open = false;
                     let mut m = HashMap::new();
                     m.insert("type".into(), alloc_string("close"));
+                    out.push(alloc_map(m));
+                }
+                // RESIZABLE: track the new window size, regrow the back-buffer, and tell the app.
+                Event::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::Resized(nw, nh)
+                        | sdl2::event::WindowEvent::SizeChanged(nw, nh),
+                    ..
+                } => {
+                    if nw > 0 && nh > 0 {
+                        self.w = nw as u32;
+                        self.h = nh as u32;
+                        self.buf.resize((self.w * self.h) as usize, 0);
+                        let mut m = HashMap::new();
+                        m.insert("type".into(), alloc_string("resize"));
+                        m.insert("w".into(), Value::Number(self.w as f64));
+                        m.insert("h".into(), Value::Number(self.h as f64));
+                        if let Some((dw, dh)) = self.current_display_size() {
+                            m.insert("display_w".into(), Value::Number(dw as f64));
+                            m.insert("display_h".into(), Value::Number(dh as f64));
+                        }
+                        out.push(alloc_map(m));
+                    }
+                }
+                // LIVE MULTI-MONITOR: when the window is dragged, report where it went
+                // and how big the display under it is, so the app can rescale its UI
+                // the moment the window crosses onto another screen (no shell probes).
+                Event::Window {
+                    win_event: sdl2::event::WindowEvent::Moved(nx, ny),
+                    ..
+                } => {
+                    let mut m = HashMap::new();
+                    m.insert("type".into(), alloc_string("moved"));
+                    m.insert("x".into(), Value::Number(nx as f64));
+                    m.insert("y".into(), Value::Number(ny as f64));
+                    if let Some((dw, dh)) = self.current_display_size() {
+                        m.insert("display_w".into(), Value::Number(dw as f64));
+                        m.insert("display_h".into(), Value::Number(dh as f64));
+                    }
                     out.push(alloc_map(m));
                 }
                 Event::KeyDown {

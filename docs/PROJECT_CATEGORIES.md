@@ -100,6 +100,7 @@ native multi-module builds), `linker.sapp`, `dist.sapp`
   debugger, event, state_machine
 - **MCP / Agent:** pb_mcp, pbp, pbz, registry, registry_server, provider_registry,
   resources
+- **Parallel and other features and libaries of pblang**
 
 ## 7. OS-Dev Kernel (bare-metal pblang) — `stdlib/kernel/`
 

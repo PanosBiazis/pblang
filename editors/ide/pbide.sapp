@@ -1,7 +1,7 @@
 // editors/ide/pbide.sapp — the pblang-NATIVE IDE (no HTML / CSS / JS).
 //
 // A code editor drawn entirely by pblang: a native window (graphics.sapp → minifb/SDL2),
-// the editor model (editor_model.sapp), pblang-rendered text (bitmap_font.sapp), shift/
+// the editor model (editor_model.sapp), native anti-aliased text with bitmap fallback, shift/
 // ctrl-aware input (keymap.sapp), syntax highlighting via the self-hosted tokenizer
 // (syntax_hl.sapp), a scrolling viewport, selection, clipboard, undo/redo, find, save,
 // run/check, and an output pane. No browser, no DOM, no JS engine — the "total security"
@@ -17,6 +17,7 @@
 let gfx = import("stdlib/graphics.sapp");
 let E = import("stdlib/editor_model.sapp");
 let F = import("stdlib/bitmap_font.sapp");
+let TL = import("stdlib/text_layout.sapp");
 let K = import("stdlib/keymap.sapp");
 let H = import("stdlib/syntax_hl.sapp");
 let FMT = import("stdlib/compiler/formatter.sapp");
@@ -51,6 +52,10 @@ let WEB = import("stdlib/web_engine.sapp"); // fetch->parse->layout->paint web e
 let FLEX = import("stdlib/flexbox.sapp");   // row/column layout (toolbars, status bar)
 let CANVAS = import("stdlib/canvas.sapp");  // renderer-agnostic draw-command buffer
 let DOCX = import("stdlib/doc_export.sapp");// page -> markdown/text/html exporter
+let UIK = import("stdlib/ui_kit.sapp");     // modern widget geometry: rounded cards/pills/elevation
+let WP = import("stdlib/window_probe.sapp");// pblang-only live OS window size probe (X11 tools)
+
+let PBIDE_TITLE = "pblang IDE - Smart Code Editor";
 
 // ── Palette — DATA-DRIVEN from stdlib:theme.sapp (modern, futuristic dark) ─────────
 // Every color is derived from one THEME object via its semantic roles, so the whole
@@ -72,18 +77,93 @@ let PANEFG = _trole("panel_fg");    // panel accent text (mint/cyan)
 let GUTTERBG = _trole("gutter_bg"); // gutter background
 let CURROW = _trole("current_line");// current-line highlight
 
-// UI scale — default 1 keeps the native IDE closer to the web IDE's information
-// density. Override with PBIDE_SCALE=2+ when readability matters more than density.
+// ── Auto-scaling: fit the UI to whatever display the IDE is launched on ───────────
+// At a fixed scale of 1 the bitmap font is ~7px tall — fine on a 768p laptop, but
+// microscopic on a 4K panel. So we detect the screen resolution once at startup and
+// pick a scale that keeps text comfortable everywhere. PBIDE_SCALE always overrides.
+
+// _parse_wh(text) — first "<W>x<H>" pixel pair in text (tolerates spaces and 'X'),
+// e.g. xrandr's "3840x2160" or macOS's "3840 x 2160". Returns {w,h} or nil.
+fn _parse_wh(text) {
+    let DIG = "0123456789";
+    let n = len(text);
+    let i = 0;
+    while i < n {
+        let j = i;
+        let a = "";
+        while j < n and str_index_of(DIG, str_slice(text, j, j + 1)) >= 0 {
+            a = a + str_slice(text, j, j + 1); j = j + 1;
+        }
+        if len(a) >= 3 {
+            let k = j;
+            while k < n and str_slice(text, k, k + 1) == " " { k = k + 1; }
+            let xch = "";
+            if k < n { xch = str_slice(text, k, k + 1); }
+            if xch == "x" or xch == "X" {
+                k = k + 1;
+                while k < n and str_slice(text, k, k + 1) == " " { k = k + 1; }
+                let b = "";
+                while k < n and str_index_of(DIG, str_slice(text, k, k + 1)) >= 0 {
+                    b = b + str_slice(text, k, k + 1); k = k + 1;
+                }
+                if len(b) >= 3 { return map{ w: parse_number(a), h: parse_number(b) }; }
+            }
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// _detect_wh() — best-effort current display resolution via an OS query (the IDE runs
+// with --allow-all, so exec is available). X11/Wayland: xrandr/xdpyinfo; macOS:
+// system_profiler; Windows: PowerShell + WMI. Returns {w,h} or nil on any failure.
+fn _detect_wh() {
+    let os = try platform() catch "unknown";
+    let cmd = "bash";
+    let argv = ["-c", "xrandr 2>/dev/null | grep -E '\\*' | head -1; xdpyinfo 2>/dev/null | grep -i dimensions | head -1"];
+    if os == "windows" {
+        cmd = "powershell";
+        argv = ["-NoProfile", "-Command", "$v=Get-CimInstance Win32_VideoController | Where-Object { $_.CurrentHorizontalResolution } | Select-Object -First 1; if ($v) { Write-Output ($v.CurrentHorizontalResolution.ToString()+'x'+$v.CurrentVerticalResolution.ToString()) }"];
+    }
+    if os == "macos" {
+        argv = ["-c", "system_profiler SPDisplaysDataType 2>/dev/null | grep -i Resolution | head -1"];
+    }
+    let r = try proc_spawn_wait(cmd, argv) catch nil;
+    if r == nil { return nil; }
+    let out = try r.stdout catch "";
+    if out == nil { out = ""; }
+    return _parse_wh(out);
+}
+
+// _scale_for(wh) — choose a compact modern UI scale from the display/window HEIGHT.
+// 1080p/1440p-class screens now stay at 1 so PBIDE feels less pixelated; 4K-class
+// screens use 2, and very large/5K+ displays can use 3. PBIDE_SCALE still overrides.
+fn _scale_for(wh) {
+    if wh == nil { return 1; }
+    let h = try wh.h catch 0;
+    if h == nil { h = 0; }
+    if h >= 3000 { return 3; }
+    if h >= 1900 { return 2; }
+    return 1;
+}
+
+// The detected display (queried once at startup) and the auto-chosen UI scale.
+let DISPLAY = _detect_wh();
+
+// _scale() — PBIDE_SCALE wins (1..8); otherwise auto-fit to the current display so the
+// IDE is never microscopic on a 4K panel nor oversized on a small laptop.
 fn _scale() {
     let s = try parse_number(env_get("PBIDE_SCALE")) catch 0;
-    if s == nil or s < 1 { return 1; }
-    if s > 8 { return 8; }
-    return s;
+    if s != nil and s >= 1 {
+        if s > 8 { return 8; }
+        return num_floor(s);
+    }
+    return _scale_for(DISPLAY);
 }
 let SCALE = _scale();
 let CW = 6 * SCALE;                  // glyph advance  (font is 5 wide + 1 space)
 let CH = 8 * SCALE;                  // line height    (font is 7 tall + 1 gap)
-let PAD = 4 * SCALE;
+let PAD = 3 * SCALE;                 // compact chrome padding (denser modern layout)
 let GUTTERX = PAD + 5 * CW;          // source text starts here (5-char line-number gutter)
 let TBH = CH + 3 * PAD;              // web-IDE-style action toolbar height
 let TOP = TBH + PAD;                 // editor/content area starts BELOW the toolbar
@@ -91,6 +171,271 @@ let STATUSH = CH + 2 * PAD;          // bottom status bar
 let PANEH = STATUSH;                 // kept for old mouse/layout call-sites
 let TOKEN_CHAR_LIMIT = 80000;        // keep huge buffers responsive: plain text past this
 let DESIGN_GRID = 4 * SCALE;         // Designer snap unit for clean mouse/key layout edits
+
+let RAD = 3 * SCALE;                 // corner radius for rounded chips/cards/buttons
+let RAD_LG = 5 * SCALE;              // larger radius for panels/cards (matches _set_density)
+
+fn _set_density(scale) {
+    let s = try parse_number(str(scale)) catch 1;
+    if s == nil { s = 1; }
+    s = num_floor(s);
+    if s < 1 { s = 1; }
+    if s > 4 { s = 4; }
+    SCALE = s;
+    CW = 6 * SCALE;
+    CH = 8 * SCALE;
+    PAD = 3 * SCALE;
+    GUTTERX = PAD + 5 * CW;
+    TBH = CH + 3 * PAD;
+    TOP = TBH + PAD;
+    STATUSH = CH + 2 * PAD;
+    PANEH = STATUSH;
+    DESIGN_GRID = 4 * SCALE;
+    RAD = 3 * SCALE;
+    RAD_LG = 5 * SCALE;
+    return SCALE;
+}
+
+fn _scale_override() {
+    let s = try parse_number(env_get("PBIDE_SCALE")) catch 0;
+    if s != nil and s >= 1 {
+        if s > 8 { return 8; }
+        return num_floor(s);
+    }
+    return nil;
+}
+
+fn _density_for_size(sz) {
+    let forced = _scale_override();
+    let d = IDE.ide_responsive_density(try sz.w catch 0, try sz.h catch 0, forced);
+    return try d.scale catch 1;
+}
+fn _density_for_state_size(state, sz) {
+    let forced = try state.density_manual catch nil;
+    if forced == nil { forced = _scale_override(); }
+    let d = IDE.ide_responsive_density(try sz.w catch 0, try sz.h catch 0, forced);
+    return try d.scale catch 1;
+}
+
+fn _density_basis_for_state(state, fallback) {
+    let win = try state.live_winsz catch fallback;
+    let mon = try state.display_winsz catch nil;
+    return WP.display_size_for_window(win, mon);
+}
+
+fn _apply_live_density(state, sz) {
+    let next = _density_for_state_size(state, sz);
+    if next != SCALE {
+        _set_density(next);
+        if state != nil {
+            state.density_scale = SCALE;
+            state.output = "ui density: live scale " + str(SCALE) + " for " + str(try sz.w catch "?") + "x" + str(try sz.h catch "?");
+        }
+        return true;
+    }
+    return false;
+}
+_set_density(SCALE);
+
+fn _text_mode() {
+    let v = try env_get("PBIDE_TEXT_RENDER") catch "";
+    if v == nil { return "smooth"; }
+    v = str_lower(str(v));
+    if v == "bitmap" or v == "pixel" or v == "off" { return "bitmap"; }
+    return "smooth";
+}
+let TEXT_MODE = _text_mode();
+let TEXT_PROFILE = try gfx.text_profile() catch map{ renderer: "bitmap-font", antialias: false, available: false, font: "" };
+let TEXT_AA_READY = TEXT_MODE != "bitmap" and (try TEXT_PROFILE.available catch false);
+let TEXT_SHAPE_CACHE = map{};
+let TEXT_SHAPE_CACHE_KEYS = [];
+let TEXT_SHAPE_CACHE_LIMIT = 512;
+
+fn _density_status(sz, manual) {
+    let d = IDE.ide_responsive_density(try sz.w catch 0, try sz.h catch 0, manual);
+    return "ui density " + str(try d.scale catch SCALE) + "x " + str(try d.density catch "?") + " (" + str(try d.source catch "?") + ": " + str(try d.reason catch "?") + ")";
+}
+
+fn _window_probe_status(state) {
+    if try state.window_probe_enabled catch false {
+        let sz = try state.live_winsz catch nil;
+        let mon = try state.display_winsz catch nil;
+        if sz != nil {
+            let out = "probe on " + str(try sz.w catch "?") + "x" + str(try sz.h catch "?");
+            if mon != nil and (try state.monitor_probe_enabled catch false) { out = out + " @" + str(try mon.w catch "?") + "x" + str(try mon.h catch "?"); }
+            return out;
+        }
+        return "probe on";
+    }
+    return "probe off";
+}
+
+fn _graphics_status() {
+    let s = try gfx.backend_status() catch "gfx unknown";
+    let tr = try TEXT_PROFILE.renderer catch "bitmap-font";
+    if TEXT_MODE == "bitmap" { tr = "bitmap-font"; }
+    return s + " · text " + str(tr) + "+pblang-shape cache " + str(len(TEXT_SHAPE_CACHE_KEYS));
+}
+
+fn _debug_events_enabled() {
+    let v = try env_get("PBIDE_DEBUG_EVENTS") catch "";
+    return v == "1" or v == "true" or v == "on";
+}
+
+fn _debug_event(text) {
+    if not _debug_events_enabled() { return 0; }
+    try fs_append("/tmp/pbide-events.log", str(try now_ms() catch 0) + " " + str(text) + "\n") catch nil;
+    return 0;
+}
+
+fn _record_input_event(state, text) {
+    state.event_count = (try state.event_count catch 0) + 1;
+    state.last_event = str(text);
+    _debug_event(text);
+    return 0;
+}
+
+fn _event_status(state) {
+    if not _debug_events_enabled() { return ""; }
+    return " · ev " + str(try state.event_count catch 0) + " " + str(try state.last_event catch "none");
+}
+
+fn _debug_status_suffix(state) {
+    if not _debug_events_enabled() { return ""; }
+    return "  [" + str(try state.event_count catch 0) + " " + str(try state.last_event catch "none") + "]";
+}
+
+fn _idle_redraw_interval_ms() {
+    let raw = try env_get("PBIDE_IDLE_REDRAW_MS") catch "";
+    let n = try parse_number(raw) catch 500;
+    if n == nil { n = 500; }
+    n = num_floor(n);
+    if n < 0 { return 0; }
+    if n > 5000 { return 5000; }
+    return n;
+}
+
+fn _density_set_manual(state, scale) {
+    let s = try parse_number(str(scale)) catch SCALE;
+    if s == nil { s = SCALE; }
+    s = num_floor(s);
+    if s < 1 { s = 1; }
+    if s > 4 { s = 4; }
+    state.density_manual = s;
+    _set_density(s);
+    state.density_scale = SCALE;
+    state.output = "ui density: manual " + str(SCALE) + "x";
+    _ui_event(state, "density manual " + str(SCALE));
+    return 0;
+}
+
+fn _density_auto(state) {
+    state.density_manual = nil;
+    let sz = _density_basis_for_state(state, try state.winsz catch map{ w: 1280, h: 760 });
+    let s = _density_for_size(sz);
+    _set_density(s);
+    state.density_scale = SCALE;
+    state.output = _density_status(sz, nil);
+    _ui_event(state, "density auto " + str(SCALE));
+    return 0;
+}
+
+fn _density_refresh(state) {
+    let sz = _density_basis_for_state(state, try state.winsz catch map{ w: 1280, h: 760 });
+    let changed = _apply_live_density(state, sz);
+    state.density_scale = SCALE;
+    if not changed {
+        state.output = _density_status(sz, try state.density_manual catch nil);
+    }
+    _ui_event(state, "density refresh " + str(SCALE));
+    return 0;
+}
+
+fn _viewport_layout_for(sz) {
+    return IDE.ide_viewport_layout(try sz.w catch 1280, try sz.h catch 760, SCALE);
+}
+
+fn _window_probe_default() {
+    let off = try env_get("PBIDE_WINDOW_PROBE") catch "";
+    if off == "0" or off == "false" or off == "off" { return false; }
+    return try WP.available() catch false;
+}
+
+fn _window_probe_interval_ms() {
+    let n = try parse_number(env_get("PBIDE_WINDOW_PROBE_MS")) catch 1200;
+    if n == nil or n < 300 { return 300; }
+    if n > 10000 { return 10000; }
+    return num_floor(n);
+}
+
+fn _monitor_probe_default() {
+    let off = try env_get("PBIDE_MONITOR_PROBE") catch "";
+    if off == "0" or off == "false" or off == "off" { return false; }
+    return try WP.monitor_available() catch false;
+}
+
+fn _monitor_probe_interval_ms() {
+    let n = try parse_number(env_get("PBIDE_MONITOR_PROBE_MS")) catch 5000;
+    if n == nil or n < 1200 { return 1200; }
+    if n > 30000 { return 30000; }
+    return num_floor(n);
+}
+
+fn _maybe_probe_window(state) {
+    if not (try state.window_probe_enabled catch false) { return 0; }
+    let now = try now_ms() catch 0;
+    let last = try state.window_probe_last_ms catch 0;
+    if now > 0 and last > 0 and now - last < _window_probe_interval_ms() { return 0; }
+    state.window_probe_last_ms = now;
+    let live = try WP.size_by_title(PBIDE_TITLE) catch nil;
+    if live == nil { return 0; }
+    let display = try state.display_winsz catch nil;
+    if try state.monitor_probe_enabled catch false {
+        let mlast = try state.window_monitor_probe_last_ms catch 0;
+        if now == 0 or mlast == 0 or now - mlast >= _monitor_probe_interval_ms() {
+            state.window_monitor_probe_last_ms = now;
+            display = try WP.monitor_size_by_title(PBIDE_TITLE) catch display;
+        }
+    }
+    let prev = try state.live_winsz catch nil;
+    let prevDisplay = try state.display_winsz catch nil;
+    if WP.changed(prev, live) or WP.changed(prevDisplay, display) {
+        state.live_winsz = live;
+        state.display_winsz = display;
+        state.window_size = live;
+        let basis = WP.display_size_for_window(live, display);
+        _apply_live_density(state, basis);
+        state.viewport_layout = _viewport_layout_for(live);
+        state.redraw = true;
+        let screen = "";
+        if display != nil { screen = " on " + str(display.w) + "x" + str(display.h); }
+        state.output = "window probe: " + str(live.w) + "x" + str(live.h) + screen + " · " + _density_status(basis, try state.density_manual catch nil);
+        _ui_event(state, "window probe " + str(live.w) + "x" + str(live.h));
+    }
+    return 0;
+}
+
+// _apply_display_event(state, e) — pick up display_w/display_h attached to SDL2
+// "moved"/"resize" events. Returns true when the display under the window changed
+// (the caller then re-applies live density). Events without display info are ignored,
+// so the minifb backend and older binaries keep working via the shell probe fallback.
+fn _apply_display_event(state, e) {
+    let dw = try e.display_w catch nil;
+    let dh = try e.display_h catch nil;
+    if dw == nil or dh == nil { return false; }
+    if dw <= 0 or dh <= 0 { return false; }
+    let mon = map{ w: dw, h: dh };
+    if not WP.changed(try state.display_winsz catch nil, mon) { return false; }
+    state.display_winsz = mon;
+    return true;
+}
+
+fn _density_delta(state, delta) {
+    let cur = try state.density_manual catch nil;
+    if cur == nil { cur = SCALE; }
+    _density_set_manual(state, cur + delta);
+    return 0;
+}
 
 let TABBG = _trole("tab_bg");     // inactive tab strip (near-black)
 let TABACT = _trole("tab_active"); // active-tab fill (electric-violet accent)
@@ -148,6 +493,34 @@ let EXAMPLES = [
         title: "While loop",
         code: "// While loop and map updates\nlet stats = map{ total: 0, count: 0 };\nlet i = 1;\nwhile i <= 5 {\n    stats.total = stats.total + i;\n    stats.count = stats.count + 1;\n    i = i + 1;\n}\nprint \"count = \" + str(stats.count);\nprint \"total = \" + str(stats.total);\n"
     },
+    map{
+        title: "Functions + returns",
+        code: "// Functions and return values\nfn add(a, b) {\n    return a + b;\n}\n\nfn twice(x) {\n    return add(x, x);\n}\n\nprint \"twice(21) = \" + str(twice(21));\n"
+    },
+    map{
+        title: "For index loop",
+        code: "// for i N loops from 0 to N-1\nlet total = 0;\nfor i 6 {\n    total = total + i;\n    print \"i=\" + str(i) + \" total=\" + str(total);\n}\n"
+    },
+    map{
+        title: "Nested maps",
+        code: "// Nested maps and field reads\nlet app = map{ name: \"pbIDE\", stats: map{ runs: 2, checks: 3 } };\nlet stats = app.stats;\nstats.runs = stats.runs + 1;\nprint app.name + \" runs=\" + str(stats.runs);\nprint \"checks=\" + str(stats.checks);\n"
+    },
+    map{
+        title: "Array builder",
+        code: "// Build an array with push\nlet xs = [];\nfor i 5 {\n    push(xs, i * i);\n}\nprint \"squares=\" + str(xs);\n"
+    },
+    map{
+        title: "Text processing",
+        code: "// Simple text processing\nlet text = \"pblang native ide\";\nlet parts = str_split(text, \" \");\nlet upper = [];\nfor p in parts {\n    push(upper, str_upper(p));\n}\nprint str_join(upper, \" / \");\n"
+    },
+    map{
+        title: "FizzBuzz",
+        code: "// Classic branch exercise\nfor i 16 {\n    if i == 0 {\n        print \"start\";\n    } elif i % 15 == 0 {\n        print \"fizzbuzz\";\n    } elif i % 3 == 0 {\n        print \"fizz\";\n    } elif i % 5 == 0 {\n        print \"buzz\";\n    } else {\n        print str(i);\n    }\n}\n"
+    },
+    map{
+        title: "Table rows",
+        code: "// Array of maps as table rows\nlet rows = [\n    map{ name: \"Ada\", lang: \"math\" },\n    map{ name: \"Grace\", lang: \"compiler\" },\n    map{ name: \"Linus\", lang: \"kernel\" }\n];\n\nfor row in rows {\n    print row.name + \" -> \" + row.lang;\n}\n"
+    },
 ];
 fn _starter_code() {
     return EXAMPLES[0].code;
@@ -159,10 +532,7 @@ fn _style_name(state) {
     return s;
 }
 fn _style_next(s) {
-    if s == "web" { return "smooth"; }
-    if s == "smooth" { return "contrast"; }
-    if s == "contrast" { return "pixel"; }
-    return "web";
+    return IDE.ide_visual_style_next(s);
 }
 fn _theme_name(state) {
     let t = try state.theme catch "dark";
@@ -183,70 +553,88 @@ fn _theme_toggle(state) {
     _ui_event(state, "theme " + state.theme);
     return 0;
 }
+fn _visual_tokens(state) {
+    return IDE.ide_visual_tokens(_style_name(state), _theme_name(state));
+}
+fn _visual_chrome(state) {
+    return IDE.ide_visual_chrome(_style_name(state), _theme_name(state));
+}
 fn _style_bg(state) {
-    if _theme_is_light(state) { return gfx.rgb(242, 245, 250); }
+    if _theme_is_light(state) { return gfx.rgb(246, 248, 252); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(13, 17, 23); }
-    if s == "smooth" { return gfx.rgb(15, 23, 42); }
-    if s == "contrast" { return gfx.rgb(6, 8, 14); }
+    if s == "web" { return gfx.rgb(9, 13, 20); }
+    if s == "smooth" { return gfx.rgb(11, 18, 30); }
+    if s == "crystal" { return gfx.rgb(7, 15, 26); }
+    if s == "contrast" { return gfx.rgb(2, 5, 10); }
     return BG;
 }
 fn _style_surface(state) {
-    if _theme_is_light(state) { return gfx.rgb(225, 232, 242); }
+    if _theme_is_light(state) { return gfx.rgb(235, 240, 248); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(22, 27, 34); }
-    if s == "smooth" { return gfx.rgb(24, 34, 55); }
-    if s == "contrast" { return gfx.rgb(13, 18, 30); }
+    if s == "web" { return gfx.rgb(18, 24, 34); }
+    if s == "smooth" { return gfx.rgb(22, 33, 50); }
+    if s == "crystal" { return gfx.rgb(18, 35, 50); }
+    if s == "contrast" { return gfx.rgb(12, 17, 27); }
     return SURFACE;
 }
 fn _style_surface2(state) {
-    if _theme_is_light(state) { return gfx.rgb(236, 241, 248); }
+    if _theme_is_light(state) { return gfx.rgb(246, 249, 253); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(33, 38, 45); }
-    if s == "smooth" { return gfx.rgb(35, 48, 75); }
-    if s == "contrast" { return gfx.rgb(26, 33, 52); }
+    if s == "web" { return gfx.rgb(28, 36, 48); }
+    if s == "smooth" { return gfx.rgb(32, 48, 70); }
+    if s == "crystal" { return gfx.rgb(30, 58, 78); }
+    if s == "contrast" { return gfx.rgb(27, 35, 54); }
     return SURFACE2;
 }
 fn _style_panel(state) {
-    if _theme_is_light(state) { return gfx.rgb(249, 251, 255); }
+    if _theme_is_light(state) { return gfx.rgb(252, 253, 255); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(13, 17, 23); }
-    if s == "smooth" { return gfx.rgb(10, 16, 26); }
+    if s == "web" { return gfx.rgb(11, 16, 24); }
+    if s == "smooth" { return gfx.rgb(8, 15, 25); }
+    if s == "crystal" { return gfx.rgb(10, 22, 34); }
     if s == "contrast" { return gfx.rgb(2, 6, 12); }
     return PANEBG;
 }
 fn _style_gutter(state) {
-    if _theme_is_light(state) { return gfx.rgb(213, 222, 236); }
+    if _theme_is_light(state) { return gfx.rgb(225, 232, 244); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(10, 14, 20); }
-    if s == "smooth" { return gfx.rgb(12, 19, 31); }
+    if s == "web" { return gfx.rgb(8, 12, 18); }
+    if s == "smooth" { return gfx.rgb(10, 17, 28); }
+    if s == "crystal" { return gfx.rgb(8, 19, 30); }
     if s == "contrast" { return gfx.rgb(4, 7, 13); }
     return GUTTERBG;
 }
 fn _style_accent(state) {
-    if _theme_is_light(state) { return gfx.rgb(22, 100, 210); }
+    if _theme_is_light(state) { return gfx.rgb(24, 96, 216); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(88, 166, 255); }
-    if s == "smooth" { return gfx.rgb(56, 189, 248); }
+    if s == "web" { return gfx.rgb(80, 190, 255); }
+    if s == "smooth" { return gfx.rgb(64, 220, 190); }
+    if s == "crystal" { return gfx.rgb(125, 225, 255); }
     if s == "contrast" { return gfx.rgb(245, 158, 11); }
     return TABACT;
 }
 fn _style_border(state) {
-    if _theme_is_light(state) { return gfx.rgb(190, 203, 222); }
+    if _theme_is_light(state) { return gfx.rgb(205, 216, 232); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(48, 54, 61); }
+    if s == "web" { return gfx.rgb(45, 55, 72); }
+    if s == "smooth" { return gfx.rgb(44, 62, 86); }
+    if s == "crystal" { return gfx.rgb(56, 82, 104); }
     return BORDER;
 }
 fn _style_muted(state) {
-    if _theme_is_light(state) { return gfx.rgb(74, 85, 104); }
+    if _theme_is_light(state) { return gfx.rgb(72, 84, 104); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(139, 148, 158); }
+    if s == "web" { return gfx.rgb(148, 163, 184); }
+    if s == "smooth" { return gfx.rgb(156, 176, 196); }
+    if s == "crystal" { return gfx.rgb(172, 202, 218); }
     return GUTTER;
 }
 fn _style_text(state) {
-    if _theme_is_light(state) { return gfx.rgb(25, 33, 46); }
+    if _theme_is_light(state) { return gfx.rgb(21, 30, 44); }
     let s = _style_name(state);
-    if s == "web" { return gfx.rgb(201, 209, 217); }
+    if s == "web" { return gfx.rgb(225, 232, 242); }
+    if s == "smooth" { return gfx.rgb(230, 240, 248); }
+    if s == "crystal" { return gfx.rgb(235, 250, 255); }
     return FG;
 }
 fn _style_pane_text(state) {
@@ -254,20 +642,26 @@ fn _style_pane_text(state) {
     return PANEFG;
 }
 fn _style_currow(state) {
-    if _theme_is_light(state) { return gfx.rgb(229, 236, 248); }
+    if _theme_is_light(state) { return gfx.rgb(235, 241, 252); }
+    if _style_name(state) == "smooth" { return gfx.rgb(17, 29, 46); }
+    if _style_name(state) == "crystal" { return gfx.rgb(14, 34, 50); }
     return CURROW;
 }
 fn _style_hilite(state) {
-    if _theme_is_light(state) { return gfx.rgb(211, 225, 248); }
+    if _theme_is_light(state) { return gfx.rgb(216, 231, 252); }
+    if _style_name(state) == "smooth" { return gfx.rgb(34, 64, 88); }
+    if _style_name(state) == "crystal" { return gfx.rgb(34, 86, 104); }
     return HILITE;
 }
 fn _style_row_rule(state) {
-    if _theme_is_light(state) { return gfx.rgb(232, 238, 248); }
-    return gfx.rgb(17, 24, 39);
+    if _theme_is_light(state) { return gfx.rgb(235, 241, 250); }
+    if _style_name(state) == "smooth" { return gfx.rgb(21, 32, 48); }
+    if _style_name(state) == "crystal" { return gfx.rgb(16, 37, 54); }
+    return gfx.rgb(15, 23, 34);
 }
 fn _style_modal_backdrop(state) {
-    if _theme_is_light(state) { return gfx.rgb(225, 232, 242); }
-    return gfx.rgb(8, 10, 18);
+    if _theme_is_light(state) { return gfx.rgb(226, 234, 245); }
+    return gfx.rgb(6, 9, 16);
 }
 fn _style_info(state) {
     if _theme_is_light(state) { return gfx.rgb(28, 96, 160); }
@@ -291,7 +685,23 @@ fn _style_purple(state) {
 }
 fn _style_splitter(state) {
     if _theme_is_light(state) { return gfx.rgb(202, 214, 232); }
-    return gfx.rgb(19, 29, 51);
+    return gfx.rgb(18, 30, 48);
+}
+fn _style_focus(state) {
+    if _theme_is_light(state) { return gfx.rgb(42, 145, 245); }
+    if _style_name(state) == "contrast" { return gfx.rgb(255, 198, 92); }
+    if _style_name(state) == "crystal" { return gfx.rgb(132, 245, 255); }
+    return gfx.rgb(68, 226, 198);
+}
+fn _style_shadow(state) {
+    if _theme_is_light(state) { return gfx.rgb(214, 224, 238); }
+    if _style_name(state) == "crystal" { return gfx.rgb(1, 12, 22); }
+    return gfx.rgb(3, 7, 13);
+}
+fn _style_rail(state) {
+    if _theme_is_light(state) { return gfx.rgb(218, 230, 247); }
+    if _style_name(state) == "crystal" { return gfx.rgb(4, 14, 24); }
+    return gfx.rgb(6, 11, 20);
 }
 fn _design_canvas_bg(state) {
     if _theme_is_light(state) { return gfx.rgb(242, 246, 252); }
@@ -311,11 +721,15 @@ fn _design_palette_app_bg(state) {
 }
 fn _toolbar_panel_bg(state, active) {
     if active {
-        if _theme_is_light(state) { return gfx.rgb(22, 100, 210); }
-        return gfx.rgb(79, 70, 229);
+        if _theme_is_light(state) { return gfx.rgb(30, 107, 222); }
+        if _style_name(state) == "smooth" { return gfx.rgb(28, 150, 136); }
+        if _style_name(state) == "crystal" { return gfx.rgb(28, 145, 190); }
+        return gfx.rgb(47, 115, 218);
     }
-    if _theme_is_light(state) { return gfx.rgb(232, 239, 250); }
-    return gfx.rgb(38, 52, 86);
+    if _theme_is_light(state) { return gfx.rgb(238, 244, 252); }
+    if _style_name(state) == "smooth" { return gfx.rgb(23, 36, 55); }
+    if _style_name(state) == "crystal" { return gfx.rgb(18, 41, 58); }
+    return gfx.rgb(24, 34, 50);
 }
 fn _toolbar_panel_fg(state, active) {
     if active { return gfx.rgb(245, 248, 255); }
@@ -324,20 +738,21 @@ fn _toolbar_panel_fg(state, active) {
 fn _toolbar_action_bg(state, id) {
     if id == "run" { return gfx.rgb(0, 184, 148); }
     if id == "mode" {
-        if _theme_is_light(state) { return gfx.rgb(218, 235, 250); }
-        return gfx.rgb(36, 72, 104);
+        if _theme_is_light(state) { return gfx.rgb(224, 239, 252); }
+        return gfx.rgb(31, 72, 105);
     }
     if id == "watch" {
-        if _theme_is_light(state) { return gfx.rgb(218, 241, 234); }
-        return gfx.rgb(34, 88, 72);
+        if _theme_is_light(state) { return gfx.rgb(220, 244, 237); }
+        return gfx.rgb(27, 82, 68);
     }
     if id == "style" {
-        if _theme_is_light(state) { return gfx.rgb(238, 230, 250); }
-        return gfx.rgb(46, 40, 64);
+        if _theme_is_light(state) { return gfx.rgb(239, 234, 252); }
+        if _style_name(state) == "crystal" { return gfx.rgb(28, 82, 104); }
+        return gfx.rgb(51, 45, 74);
     }
     if id == "theme" {
-        if _theme_is_light(state) { return gfx.rgb(206, 218, 236); }
-        return gfx.rgb(45, 55, 72);
+        if _theme_is_light(state) { return gfx.rgb(224, 232, 244); }
+        return gfx.rgb(34, 45, 62);
     }
     return _style_surface2(state);
 }
@@ -362,6 +777,55 @@ fn _toolbar_action_fg(state, id) {
     if id == "theme" { return FG; }
     return _style_text(state);
 }
+fn _toolbar_brand_subtitle(state) {
+    let v = _visual_tokens(state);
+    return str(try v.density catch "clean") + " / " + str(try v.motion catch "fast");
+}
+fn _toolbar_brand_w(sz) {
+    let ww = try sz.w catch 1280;
+    if ww < 760 { return 9 * CW; }
+    if ww < 1100 { return 12 * CW; }
+    return 18 * CW;
+}
+fn _toolbar_action_start(sz) {
+    return PAD + _toolbar_brand_w(sz) + PAD;
+}
+
+fn _toolbar_rows(sz) {
+    if sz == nil { return 1; }
+    let one = _toolbar_brand_w(sz) + PAD + _actions_linear_w(sz) + PAD + _panel_total_w_mode(true) + 2 * PAD;
+    if one > (try sz.w catch 1280) { return 2; }
+    return 1;
+}
+
+fn _toolbar_height_for(sz) {
+    if _toolbar_rows(sz) > 1 { return CH * 2 + 5 * PAD; }
+    return CH + 3 * PAD;
+}
+
+fn _apply_toolbar_metrics(sz) {
+    let h = _toolbar_height_for(sz);
+    if h != TBH {
+        TBH = h;
+        TOP = TBH + PAD;
+        STATUSH = CH + 2 * PAD;
+        PANEH = STATUSH;
+        return true;
+    }
+    return false;
+}
+
+fn _actions_linear_w(sz) {
+    let w = 0;
+    let i = 0;
+    let gap = _toolbar_gap(sz);
+    while i < len(ACTIONS) {
+        w = w + _action_w(i);
+        if i + 1 < len(ACTIONS) { w = w + gap; }
+        i = i + 1;
+    }
+    return w;
+}
 fn _design_badge_color(state, kind) {
     if kind == "nditem" or kind == "light" or kind == "particles" { return _style_warning(state); }
     if kind == "scan3d" or kind == "terrain" or kind == "backend" { return _style_success(state); }
@@ -371,11 +835,16 @@ fn _design_badge_color(state, kind) {
 }
 
 // x/width of action `idx` (cumulative — same math in draw + hit-test).
-fn _action_bounds(idx) {
-    let x = PAD + 20 * CW;
+fn _action_bounds_for(idx, sz) {
+    let x = _toolbar_action_start(sz);
+    if _toolbar_rows(sz) > 1 { x = PAD; }
+    let gap = _toolbar_gap(sz);
     let i = 0;
-    while i < idx { x = x + _action_w(i) + PAD; i = i + 1; }
+    while i < idx { x = x + _action_w(i) + gap; i = i + 1; }
     return map{ x: x, w: _action_w(idx) };
+}
+fn _action_bounds(idx) {
+    return _action_bounds_for(idx, map{ w: 1280, h: 760 });
 }
 
 fn _action_w(idx) {
@@ -383,14 +852,28 @@ fn _action_w(idx) {
     let id = ACTIONS[idx].id;
     if id == "mode" { label = "Release"; }
     if id == "watch" { label = "Watcher"; }
+    if id == "style" { label = "Contrast"; }
     if id == "theme" { label = "Light"; }
     return (len(label) + 2) * CW;
 }
 
-fn _actions_total_w() {
+fn _toolbar_gap(sz) {
+    let gap = PAD;
+    let ww = try sz.w catch 1280;
+    if ww < 980 {
+        gap = PAD / 2;
+        if gap < 2 { gap = 2; }
+    }
+    return gap;
+}
+
+fn _actions_total_w_for(sz) {
     if len(ACTIONS) == 0 { return PAD; }
-    let b = _action_bounds(len(ACTIONS) - 1);
+    let b = _action_bounds_for(len(ACTIONS) - 1, sz);
     return b.x + b.w + 2 * PAD;
+}
+fn _actions_total_w() {
+    return _actions_total_w_for(map{ w: 1280, h: 760 });
 }
 
 fn _panel_label_full(idx) {
@@ -426,7 +909,9 @@ fn _panel_total_w_mode(compact) {
 
 fn _panel_compact(sz) {
     if sz == nil { return false; }
-    let avail = sz.w - _actions_total_w() - PAD;
+    let action_space = _toolbar_brand_w(sz) + PAD + _actions_linear_w(sz) + 3 * PAD;
+    if _toolbar_rows(sz) > 1 { action_space = 2 * PAD; }
+    let avail = sz.w - action_space;
     if avail < 0 { avail = 0; }
     return _panel_total_w_mode(false) > avail;
 }
@@ -748,6 +1233,15 @@ fn _refresh_watcher(state, event) {
         state.watch.ui_snapshot = snap;
         state.watch.ui_lines = UIO.snapshot_lines(snap, 4);
     }
+    return 0;
+}
+
+fn _refresh_watcher_draw(state) {
+    let now = try now_ms() catch 0;
+    let last = try state.watch_draw_last_ms catch 0;
+    if now > 0 and last > 0 and now - last < 1000 { return 0; }
+    state.watch_draw_last_ms = now;
+    _refresh_watcher(state, "draw");
     return 0;
 }
 
@@ -1426,10 +1920,15 @@ fn _code_hist_y() { return _code_ui_y() + CH * 4; }
 
 fn _code_output_w_state(state, sz) {
     if try state.compact catch false { return 22 * CW; }
-    let w = try state.outw catch 34 * CW;
-    if w == nil or w <= 0 { w = 34 * CW; }
+    let vp = try state.viewport_layout catch _viewport_layout_for(sz);
+    let baseChars = try vp.side_chars catch 30;
+    let baseW = baseChars * CW;
+    let w = try state.outw catch baseW;
+    if w == nil or w <= 0 { w = baseW; }
     if w > sz.w * 7 / 10 { w = sz.w * 7 / 10; }
-    if w < 18 * CW { w = 18 * CW; }
+    let minW = 18 * CW;
+    if baseChars <= 22 { minW = 16 * CW; }
+    if w < minW { w = minW; }
     return w;
 }
 
@@ -1495,9 +1994,7 @@ fn _fold(code) {
     if code == 937 { return 79; } if code == 969 or code == 974 { return 111; }
     return code;
 }
-// scaled text: each lit 5x7 font pixel becomes one SCALE×SCALE FILLED RECT — crisp on
-// HiDPI and fewer ops than SCALE² per-pixel points. Spaces advance without drawing.
-fn _dt(win, x, y, s, color) {
+fn _dt_bitmap(win, x, y, s, color) {
     let cx = x;
     let i = 0;
     while i < len(s) {
@@ -1523,6 +2020,198 @@ fn _dt(win, x, y, s, color) {
     }
     return 0;
 }
+
+fn _shape_text_cached(s) {
+    let raw = str(s);
+    if map_has(TEXT_SHAPE_CACHE, raw) { return TEXT_SHAPE_CACHE[raw]; }
+    if len(TEXT_SHAPE_CACHE_KEYS) >= TEXT_SHAPE_CACHE_LIMIT {
+        TEXT_SHAPE_CACHE = map{};
+        TEXT_SHAPE_CACHE_KEYS = [];
+    }
+    let shown = try TL.visual_text(raw, map{ mode: "code" }) catch raw;
+    TEXT_SHAPE_CACHE[raw] = shown;
+    array_push(TEXT_SHAPE_CACHE_KEYS, raw);
+    return shown;
+}
+
+// Smooth text uses the native fontdue-backed renderer in pblang-graphics. It keeps the
+// same fixed cell advance as the bitmap path, so cursor positioning, hit testing, and
+// responsive panel layout stay unchanged. PBIDE_TEXT_RENDER=bitmap restores the old path.
+fn _dt(win, x, y, s, color) {
+    let shown = _shape_text_cached(s);
+    if TEXT_AA_READY {
+        let r = try win.textAA(x, y - SCALE, shown, color, CH + SCALE, CW) catch nil;
+        if r != nil and (try r.ok catch false) {
+            return 0;
+        }
+    }
+    return _dt_bitmap(win, x, y, shown, color);
+}
+
+// ── modern UI primitives (rounded chips/cards/elevation) via stdlib/ui_kit.sapp ───
+// A rounded filled rect — corners beveled by radius r so chrome looks contemporary.
+fn _fill_round(win, x, y, w, h, color, r) {
+    let rs = UIK.rounded_rect(x, y, w, h, r);
+    let i = 0;
+    while i < len(rs) { let b = rs[i]; win.rect(b.x, b.y, b.w, b.h, color); i = i + 1; }
+    return 0;
+}
+// A rounded card: soft drop shadow + border ring + inset fill (elevated panel look).
+fn _card(win, x, y, w, h, fill, border, r) {
+    let sh = UIK.elevation(x, y, w, h, SCALE);
+    let i = 0;
+    while i < len(sh) { let b = sh[i]; win.rect(b.x, b.y, b.w, b.h, GUTTERBG); i = i + 1; }
+    _fill_round(win, x, y, w, h, border, r);
+    _fill_round(win, x + SCALE, y + SCALE, w - 2 * SCALE, h - 2 * SCALE, fill, r);
+    return 0;
+}
+fn _card_state(state, win, x, y, w, h, fill, border, r) {
+    if w <= 0 or h <= 0 { return 0; }
+    let sh = UIK.elevation(x, y, w, h, SCALE);
+    _draw_rects(win, sh, _style_shadow(state));
+    let c = UIK.card(x, y, w, h, r, SCALE);
+    _draw_rects(win, c.border, border);
+    _draw_rects(win, c.fill, fill);
+    return 0;
+}
+fn _button_face(state, win, x, y, w, h, fill, active) {
+    if w <= 0 or h <= 0 { return 0; }
+    let r = RAD;
+    if active { r = RAD_LG; }
+    _fill_round(win, x, y + SCALE, w, h, _style_shadow(state), r);
+    _fill_round(win, x, y, w, h, _style_border(state), r);
+    _fill_round(win, x + SCALE, y + SCALE, w - 2 * SCALE, h - 2 * SCALE, fill, r);
+    if w > 4 * SCALE and h > 3 * SCALE {
+        let hi = _style_surface2(state);
+        if active { hi = _style_focus(state); }
+        win.rect(x + r, y + SCALE, w - 2 * r, SCALE, hi);
+    }
+    return 0;
+}
+fn _button_label(state, win, x, y, w, h, label, fg, fill, active) {
+    _button_face(state, win, x, y, w, h, fill, active);
+    let chars = num_floor((w - 2 * CW) / CW);
+    if chars < 1 { return 0; }
+    _dt(win, x + CW, y + PAD / 2, str_slice(str(label), 0, chars), fg);
+    return 0;
+}
+// A thin accent bar across the top of a widget (active-tab / active-section marker).
+fn _accent_bar(win, x, y, w, color) {
+    win.rect(x, y, w, num_floor(SCALE * 3 / 2) + 1, color);
+    return 0;
+}
+// Unified panel section header: a surface strip with a rounded accent spine on the left
+// and a hairline bottom border. Returns the x where the panel's header TEXT should start
+// (past the spine), so every panel reads with the same modern, consistent rhythm.
+fn _panel_head(state, win, sz, y) {
+    win.rect(0, y, sz.w, CH + PAD, _style_surface(state));
+    win.rect(0, y + CH + PAD, sz.w, SCALE, _style_border(state));
+    _fill_round(win, PAD, y + PAD, 2 * SCALE, CH - PAD, _style_accent(state), SCALE);
+    return PAD + 3 * SCALE + PAD;
+}
+// Reusable list-panel chrome components: ONE source for the header bar (surface +
+// accent rail + bottom rule) and footer bar (surface + top rule) that all five list
+// panels (files/outline/problems/history/manage) share — keeps them pixel-identical
+// and makes restyling a one-line change.
+fn _panel_header_chrome(state, win, sz, m) {
+    _panel_header_chrome(state, win, sz, m);
+    return 0;
+}
+fn _panel_footer_chrome(state, win, sz, footerY) {
+    _panel_footer_chrome(state, win, sz, footerY);
+    return 0;
+}
+
+fn _panel_metrics(sz, kind) {
+    if sz == nil { sz = map{ w: 1280, h: 760 }; }
+    return IDE.ide_panel_metrics(sz.w, sz.h, SCALE, CW, CH, PAD, TOP, STATUSH, kind);
+}
+
+fn _list_start_for(sel, total, rows) {
+    let s = try parse_number(str(sel)) catch 0;
+    let n = try parse_number(str(total)) catch 0;
+    let r = try parse_number(str(rows)) catch 1;
+    if s == nil { s = 0; }
+    if n == nil { n = 0; }
+    if r == nil or r < 1 { r = 1; }
+    s = num_floor(s);
+    n = num_floor(n);
+    r = num_floor(r);
+    if n <= r { return 0; }
+    if s < 0 { s = 0; }
+    if s >= n { s = n - 1; }
+    let start = s - r + 1;
+    if start < 0 { start = 0; }
+    if start > n - r { start = n - r; }
+    return start;
+}
+
+fn _draw_panel_scrollbar(state, win, sz, m, total, rows, offset) {
+    if total <= rows { return 0; }
+    let h = m.footer_y - m.body_top - PAD;
+    if h <= CH { return 0; }
+    let thick = _scrollbar_thickness();
+    let sb = UIK.scrollbar(sz.w - PAD - thick, m.body_top, h, total, rows, offset, thick);
+    _fill_round(win, sb.track.x, sb.track.y, sb.track.w, sb.track.h, _style_surface(state), thick / 2);
+    _fill_round(win, sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h, _style_focus(state), thick / 2);
+    return 0;
+}
+
+fn _scrollbar_thickness() {
+    let thick = 3 * SCALE;
+    if thick < 6 { thick = 6; }
+    if thick > 14 { thick = 14; }
+    return thick;
+}
+
+fn _hit_rect(mx, my, x, y, w, h, slop) {
+    let s = try parse_number(str(slop)) catch 0;
+    if s == nil { s = 0; }
+    if w < 1 { w = 1; }
+    if h < 1 { h = 1; }
+    return mx >= x - s and mx <= x + w + s and my >= y - s and my <= y + h + s;
+}
+
+fn _hit_slop() {
+    let s = PAD * 2;
+    if s < 12 { s = 12; }
+    if s > 24 { s = 24; }
+    return s;
+}
+
+fn _hit_row(my, y, h) {
+    let s = _hit_slop() / 2;
+    return my >= y - s and my < y + h + s;
+}
+fn _panel_search_box(state, win, m) {
+    _fill_round(win, PAD, m.search_y, m.content_w, m.search_h, _style_surface2(state), RAD);
+    win.rect(PAD + RAD, m.search_y, m.content_w - 2 * RAD, SCALE, _style_border(state));
+    return 0;
+}
+// Draw a list of ui_kit rects in one color (small convenience for cards/segments/bars).
+fn _draw_rects(win, rs, color) {
+    let i = 0;
+    while i < len(rs) { let b = rs[i]; win.rect(b.x, b.y, b.w, b.h, color); i = i + 1; }
+    return 0;
+}
+fn _side_section(state, win, x, y, w, h, title, accent, title_color) {
+    if h <= CH + PAD { return 0; }
+    // The new chrome owns this whole section. Clear it first so old flat-panel
+    // layers from previous designs cannot show through rounded-card gaps.
+    win.rect(x, y, w, h, _style_bg(state));
+    let sx = x + PAD / 2;
+    let sy = y + PAD / 2;
+    let sw = w - PAD;
+    let sh = h - PAD;
+    if sw <= 0 or sh <= 0 { return 0; }
+    _card_state(state, win, sx, sy, sw, sh, _style_panel(state), _style_border(state), RAD_LG);
+    _fill_round(win, sx + SCALE, sy + SCALE, sw - 2 * SCALE, CH + PAD, _style_surface(state), RAD);
+    _fill_round(win, sx + SCALE, sy + PAD, 2 * SCALE, CH - PAD / 2, accent, SCALE);
+    _dt(win, sx + PAD, sy + PAD / 2, title, title_color);
+    return 0;
+}
+fn _side_content_x(px) { return px + 2 * PAD; }
+fn _side_content_y(y) { return y + CH + PAD; }
 
 fn _draw_code(state, win, sz) {
     let ed = state.ed;
@@ -1611,127 +2300,153 @@ fn _draw_code(state, win, sz) {
         win.rect(GUTTERX + cur_col * CW, TOP + curscreen * CH, SCALE, CH - SCALE, CURSOR);
     }
 
+    // editor scrollbar (drawn over the content, at the right edge of the code area)
+    let edTotal = E.line_count(ed);
+    if edTotal > rows {
+        let sbH = sz.h - STATUSH - TOP;
+        let thick = _scrollbar_thickness();
+        let sb = UIK.scrollbar(editorW - PAD - thick, TOP, sbH, edTotal, rows, scr, thick);
+        _fill_round(win, sb.track.x, sb.track.y, sb.track.w, sb.track.h, _style_surface2(state), thick / 2);
+        _fill_round(win, sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h, _style_accent(state), thick / 2);
+    }
+
     // web IDE output side pane
     let ox = editorW;
     win.rect(ox, TOP, splitw, sz.h - TOP - STATUSH, _style_splitter(state));
-    win.rect(ox + splitw, TOP, outw, sz.h - TOP - STATUSH, _style_panel(state));
+    win.rect(ox + splitw, TOP, outw, sz.h - TOP - STATUSH, _style_bg(state));
     let px = ox + splitw;
-    win.rect(px, TOP, outw, CH + PAD, _style_surface(state));
-    win.rect(px, TOP, SCALE * 2, CH + PAD, _style_warning(state));
-    _dt(win, px + PAD, TOP + PAD / 2, "INPUT FOR read_line()", _style_warning(state));
     let stdinY = TOP + CH + PAD;
-    win.rect(px, stdinY, outw, CH * 3, _style_surface2(state));
-    _dt(win, px + PAD, stdinY + PAD / 2, "one input per line", _style_muted(state));
     let outHeadY = stdinY + CH * 3;
-    win.rect(px, outHeadY, outw, CH + PAD, _style_surface(state));
-    win.rect(px, outHeadY, SCALE * 2, CH + PAD, gfx.rgb(0, 184, 148));
+    let diagY = _code_diag_y();
+    let toolY = _code_tool_y();
+    let watchY = _code_watch_y();
+    let uiY = _code_ui_y();
+    let histY = _code_hist_y();
+    _side_section(state, win, px, TOP, outw, outHeadY - TOP - PAD / 2, "INPUT FOR read_line()", _style_warning(state), _style_warning(state));
+    _fill_round(win, px + PAD, stdinY, outw - 2 * PAD, CH * 2 + PAD, _style_surface2(state), RAD);
+    _dt(win, _side_content_x(px), stdinY + PAD / 2, "one input per line", _style_muted(state));
     let output_head = "OUTPUT   LN " + str(ed.row + 1) + " COL " + str(ed.col + 1);
     if (try state.syntax_status catch "") != "" { output_head = output_head + "   " + state.syntax_status; }
-    let maxchars = (outw - 2 * PAD) / CW;
-    _dt(win, px + PAD, outHeadY + PAD / 2, str_slice(output_head, 0, maxchars), _style_success(state));
+    let maxchars = (outw - 4 * PAD) / CW;
+    _side_section(state, win, px, outHeadY, outw, diagY - outHeadY - PAD / 2, str_slice(output_head, 0, maxchars), _style_success(state), _style_success(state));
     let outlines = str_split(state.output, "
 ");
     let oi = 0;
-    while oi < len(outlines) and oi < 8 {
-        _dt(win, px + PAD, outHeadY + CH + PAD + oi * CH, str_slice(outlines[oi], 0, maxchars), _style_pane_text(state));
+    while oi < len(outlines) and oi < 7 {
+        _dt(win, _side_content_x(px), _side_content_y(outHeadY) + oi * CH, str_slice(outlines[oi], 0, maxchars), _style_pane_text(state));
         oi = oi + 1;
     }
-    let diagY = _code_diag_y();
-    win.rect(px, diagY, outw, CH + PAD, _style_surface(state));
-    win.rect(px, diagY, SCALE * 2, CH + PAD, _style_warning(state));
-    _dt(win, px + PAD, diagY + PAD / 2, str_slice("DIAGNOSTICS  " + IDE.diagnostic_counts_label(state.diagnostics), 0, maxchars), _style_warning(state));
+    _side_section(state, win, px, diagY, outw, toolY - diagY - PAD / 2, str_slice("DIAGNOSTICS  " + IDE.diagnostic_counts_label(state.diagnostics), 0, maxchars), _style_warning(state), _style_warning(state));
     let dl = IDE.diagnostic_summary(state.diagnostics, 4);
     let di = 0;
     while di < len(dl) and di < 4 {
-        let rowY = diagY + CH + PAD + di * CH;
+        let rowY = _side_content_y(diagY) + di * CH;
         if di == state.diag_index { win.rect(px + SCALE, rowY, outw - 2 * SCALE, CH, _style_hilite(state)); }
         let dc = _style_muted(state);
         if str_contains(dl[di], "ERROR") { dc = _style_error(state); }
         if str_contains(dl[di], "WARNING") { dc = _style_warning(state); }
-        _dt(win, px + PAD, rowY, str_slice(dl[di], 0, maxchars), dc);
+        _dt(win, _side_content_x(px), rowY, str_slice(dl[di], 0, maxchars), dc);
         di = di + 1;
     }
-    let toolY = _code_tool_y();
-    win.rect(px, toolY, outw, CH + PAD, _style_surface(state));
-    win.rect(px, toolY, SCALE * 2, CH + PAD, gfx.rgb(108, 92, 231));
-    _dt(win, px + PAD, toolY + PAD / 2, "TOOLCHAIN", _style_purple(state));
+    _side_section(state, win, px, toolY, outw, watchY - toolY - PAD / 2, "TOOLCHAIN", _style_purple(state), _style_purple(state));
     let tl = _toolchain_lines();
     let ti = 0;
     while ti < len(tl) and ti < 3 {
-        _dt(win, px + PAD, toolY + CH + PAD + ti * CH, str_slice(tl[ti], 0, maxchars), _style_muted(state));
+        _dt(win, _side_content_x(px), _side_content_y(toolY) + ti * CH, str_slice(tl[ti], 0, maxchars), _style_muted(state));
         ti = ti + 1;
     }
-    let watchY = _code_watch_y();
-    win.rect(px, watchY, outw, CH + PAD, _style_surface(state));
-    win.rect(px, watchY, SCALE * 2, CH + PAD, _style_success(state));
-    _dt(win, px + PAD, watchY + PAD / 2, "WATCHER", _style_success(state));
+    _side_section(state, win, px, watchY, outw, uiY - watchY - PAD / 2, "WATCHER", _style_success(state), _style_success(state));
     let wl = ["watch: off"];
     if try state.watch_enabled catch true { wl = IDE.watcher_lines(state.watch, 4); }
     let wi = 0;
     while wi < len(wl) and wi < 4 {
         let wc = _style_muted(state);
         if str_contains(wl[wi], "diagnostics stale") { wc = _style_warning(state); }
-        _dt(win, px + PAD, watchY + CH + PAD + wi * CH, str_slice(wl[wi], 0, maxchars), wc);
+        _dt(win, _side_content_x(px), _side_content_y(watchY) + wi * CH, str_slice(wl[wi], 0, maxchars), wc);
         wi = wi + 1;
     }
-    let uiY = _code_ui_y();
-    win.rect(px, uiY, outw, CH + PAD, _style_surface(state));
-    win.rect(px, uiY, SCALE * 2, CH + PAD, _style_purple(state));
-    _dt(win, px + PAD, uiY + PAD / 2, "UI OBSERVER", _style_purple(state));
+    _side_section(state, win, px, uiY, outw, histY - uiY - PAD / 2, "UI OBSERVER", _style_purple(state), _style_purple(state));
     let ul = UIO.snapshot_lines(try state.ui_snapshot catch nil, 3);
     let ui = 0;
     while ui < len(ul) and ui < 3 {
         let uc = _style_muted(state);
         if str_contains(ul[ui], "issue:") { uc = _style_warning(state); }
-        _dt(win, px + PAD, uiY + CH + PAD + ui * CH, str_slice(ul[ui], 0, maxchars), uc);
+        _dt(win, _side_content_x(px), _side_content_y(uiY) + ui * CH, str_slice(ul[ui], 0, maxchars), uc);
         ui = ui + 1;
     }
-    let histY = _code_hist_y();
-    win.rect(px, histY, outw, CH + PAD, _style_surface(state));
-    win.rect(px, histY, SCALE * 2, CH + PAD, _style_info(state));
-    _dt(win, px + PAD, histY + PAD / 2, "HISTORY", _style_info(state));
+    _side_section(state, win, px, histY, outw, sz.h - STATUSH - histY - PAD / 2, "HISTORY", _style_info(state), _style_info(state));
     let hs = _wrap("Last action: " + state.output, maxchars);
     let hi = 0;
     while hi < len(hs) and hi < 4 {
-        _dt(win, px + PAD, histY + CH + PAD + hi * CH, hs[hi], _style_muted(state));
+        _dt(win, _side_content_x(px), _side_content_y(histY) + hi * CH, hs[hi], _style_muted(state));
         hi = hi + 1;
     }
 
-    // bottom status bar
+    // bottom status bar — surface strip, hairline top border, accent status LED
     let sy = sz.h - STATUSH;
     win.rect(0, sy, sz.w, STATUSH, _style_surface(state));
     win.rect(0, sy, sz.w, SCALE, _style_border(state));
+    _fill_round(win, PAD, sy + PAD, 2 * SCALE, CH - PAD, _style_accent(state), SCALE);
+    let statusX = PAD + 3 * SCALE + PAD;
     let status = _code_status_line(state);
     if try state.save_as_mode catch false { status = "SAVE AS  " + state.save_as_path + "  Enter=save  Esc=cancel"; }
     if try state.open_mode catch false { status = "OPEN  " + state.open_path + "  Enter=open  Esc=cancel"; }
     if state.find_mode { status = _find_status(state); }
-    _dt(win, PAD, sy + PAD / 2, str_slice(status, 0, (sz.w - 2 * PAD) / CW), _style_muted(state));
+    status = status + _debug_status_suffix(state);
+    let rightReserve = PAD;
+    if sz.w > 1040 {
+        let chip = _style_name(state) + "/" + _theme_name(state) + " · " + _window_probe_status(state) + _event_status(state);
+        if sz.w > 1500 { chip = chip + " · " + _graphics_status(); }
+        if len(chip) * CW > sz.w / 2 { chip = str_slice(chip, 0, (sz.w / 2) / CW); }
+        let chipW = len(chip) * CW + 2 * PAD;
+        _fill_round(win, sz.w - chipW - PAD, sy + PAD / 2, chipW, CH + PAD / 2, _style_panel(state), RAD);
+        _dt(win, sz.w - chipW, sy + PAD / 2, chip, _style_focus(state));
+        rightReserve = chipW + 3 * PAD;
+    }
+    _dt(win, statusX, sy + PAD / 2, str_slice(status, 0, (sz.w - statusX - rightReserve) / CW), _style_muted(state));
 }
 
 // ── toolbar (top tab strip) ──────────────────────────────────────────────────────
 fn _draw_toolbar(state, win, sz) {
-    win.rect(0, 0, sz.w, TBH, _style_surface(state));
+    _apply_toolbar_metrics(sz);
+    win.rect(0, 0, sz.w, TBH, _style_rail(state));
+    win.rect(0, 0, sz.w, SCALE, _style_focus(state));
     win.rect(0, TBH - SCALE, sz.w, SCALE, _style_border(state));
-    win.rect(PAD, PAD, 18 * CW, CH + PAD, _style_panel(state));
-    win.rect(PAD, PAD, SCALE * 2, CH + PAD, _style_accent(state));
-    _dt(win, PAD + CW, PAD + SCALE, "pblang IDE v0.6.0", _style_accent(state));
+    if sz.w > 320 {
+        win.rect(0, SCALE, sz.w, SCALE, _style_shadow(state));
+        win.rect(0, TBH - 2 * SCALE, sz.w, SCALE, _style_surface2(state));
+    }
+    // Brand block: compact, readable, and futuristic without adding new hit zones.
+    let brandW = _toolbar_brand_w(sz);
+    _button_face(state, win, PAD, PAD, brandW, CH + PAD, _style_panel(state), false);
+    _fill_round(win, PAD + SCALE, PAD + SCALE, 3 * SCALE, CH + PAD - 2 * SCALE, _style_focus(state), SCALE);
+    _dt(win, PAD + CW + SCALE, PAD + SCALE, "pbIDE", _style_focus(state));
+    if brandW >= 18 * CW and sz.w > 900 {
+        _dt(win, PAD + 7 * CW, PAD + SCALE, "native studio", _style_muted(state));
+    }
+    let rows = _toolbar_rows(sz);
+    let actionY = PAD;
+    if rows > 1 { actionY = PAD + CH + 2 * PAD; }
+    let panelY = PAD;
     let i = 0;
     let panelStart = sz.w - PAD - _panel_total_w_for(sz);
     if panelStart < PAD { panelStart = PAD; }
     while i < len(ACTIONS) {
-        let b = _action_bounds(i);
+        let b = _action_bounds_for(i, sz);
         let id = ACTIONS[i].id;
-        if b.x + b.w + PAD < panelStart {
+        if rows > 1 or b.x + b.w + PAD < panelStart {
             let bg = _toolbar_action_bg(state, id);
             if id == "watch" { bg = _toolbar_watch_state_bg(state, _watch_badge(state)); }
-            win.rect(b.x, PAD, b.w, CH + PAD, bg);
-            win.rect(b.x, PAD, b.w, SCALE, _style_border(state));
+            if id == (try state.hover_tab catch nil) { bg = _style_surface2(state); }
+            _button_face(state, win, b.x, actionY, b.w, CH + PAD, bg, id == "run");
             let fg = _toolbar_action_fg(state, id);
             let label = ACTIONS[i].label;
             if id == "mode" { label = _mode_label(state); }
             if id == "watch" { label = _watch_toolbar_label(state); }
+            if id == "style" { label = str_upper(str_slice(_style_name(state), 0, 1)) + str_slice(_style_name(state), 1, len(_style_name(state))); }
             if id == "theme" { label = _theme_label(state); }
-            _dt(win, b.x + CW, PAD + PAD / 2, label, fg);
+            _dt(win, b.x + CW, actionY + PAD / 2, label, fg);
+            if id == "run" { win.rect(b.x + RAD, actionY + CH + PAD - SCALE, b.w - 2 * RAD, SCALE, _style_focus(state)); }
         }
         i = i + 1;
     }
@@ -1741,31 +2456,54 @@ fn _draw_toolbar(state, win, sz) {
         let id = PANELS[i].id;
         let active = id == state.panel;
         let bg = _toolbar_panel_bg(state, active);
-        win.rect(b.x, PAD, b.w, CH + PAD, bg);
-        win.rect(b.x, PAD, b.w, SCALE, _style_border(state));
-        if active { win.rect(b.x, TBH - 2 * SCALE, b.w, 2 * SCALE, _style_accent(state)); }
+        let hovered = not active and id == (try state.hover_tab catch nil);
+        if hovered { bg = _style_surface2(state); }
+        _button_face(state, win, b.x, panelY, b.w, CH + PAD, bg, active);
+        // hovered tab: a soft accent underline hints "clickable" before commit
+        if hovered { win.rect(b.x + RAD, TBH - SCALE, b.w - 2 * RAD, SCALE, _style_surface2(state)); }
+        // active panel tab: an accent underline at the toolbar baseline (modern tab cue)
+        if active {
+            win.rect(b.x + RAD, panelY, b.w - 2 * RAD, SCALE, _style_focus(state));
+            win.rect(b.x + RAD, TBH - 2 * SCALE, b.w - 2 * RAD, 2 * SCALE, _style_focus(state));
+        }
         let fg = _toolbar_panel_fg(state, active);
-        _dt(win, b.x + CW, PAD + PAD / 2, _panel_label_for(i, sz), fg);
+        _dt(win, b.x + CW, panelY + PAD / 2, _panel_label_for(i, sz), fg);
         i = i + 1;
+    }
+    if sz.w > 1180 and rows == 1 {
+        let visual = _toolbar_brand_subtitle(state);
+        let vx = panelStart - (len(visual) + 2) * CW;
+        if vx > PAD + 84 * CW {
+            _dt(win, vx, PAD + PAD / 2, visual, _style_muted(state));
+        }
     }
 }
 // toolbar hit-test: pixel → tab id (nil if not on the toolbar).
 fn _toolbar_hit(mx, my, sz) {
-    if my < PAD or my >= PAD + CH + PAD { return nil; }
     if sz == nil { return nil; }
+    _apply_toolbar_metrics(sz);
+    let rows = _toolbar_rows(sz);
+    let slop = _hit_slop();
+    let panelY = PAD;
+    let actionY = PAD;
+    if rows > 1 { actionY = PAD + CH + 2 * PAD; }
     let i = 0;
-    while i < len(PANELS) {
-        let b = _panel_bounds(i, sz);
-        if mx >= b.x and mx < b.x + b.w { return PANELS[i].id; }
-        i = i + 1;
+    if my >= panelY - slop and my < panelY + CH + PAD + slop {
+        while i < len(PANELS) {
+            let b = _panel_bounds(i, sz);
+            if _hit_rect(mx, my, b.x, panelY, b.w, CH + PAD, slop) { return PANELS[i].id; }
+            i = i + 1;
+        }
     }
     let panelStart = sz.w - PAD - _panel_total_w_for(sz);
     if panelStart < PAD { panelStart = PAD; }
     i = 0;
-    while i < len(ACTIONS) {
-        let b = _action_bounds(i);
-        if b.x + b.w + PAD < panelStart and mx >= b.x and mx < b.x + b.w { return ACTIONS[i].id; }
-        i = i + 1;
+    if my >= actionY - slop and my < actionY + CH + PAD + slop {
+        while i < len(ACTIONS) {
+            let b = _action_bounds_for(i, sz);
+            if (rows > 1 or b.x + b.w + PAD < panelStart) and _hit_rect(mx, my, b.x, actionY, b.w, CH + PAD, slop) { return ACTIONS[i].id; }
+            i = i + 1;
+        }
     }
     return nil;
 }
@@ -2024,10 +2762,10 @@ fn _diagnostic_click(state, mx, my) {
     let sz = state.winsz;
     let outw = _code_output_w_state(state, sz);
     let px = sz.w - outw;
-    if mx < px { return false; }
+    if mx < px - _hit_slop() { return false; }
     let diagY = _code_diag_y();
     let rowTop = diagY + CH + PAD;
-    if my < rowTop or my >= rowTop + 4 * CH { return false; }
+    if my < rowTop - _hit_slop() or my >= rowTop + 4 * CH + _hit_slop() { return false; }
     let idx = num_floor((my - rowTop) / CH);
     if idx < 0 or idx >= len(state.diagnostics) { return false; }
     state.diag_index = idx;
@@ -2040,10 +2778,10 @@ fn _watcher_click(state, mx, my) {
     let sz = state.winsz;
     let outw = _code_output_w_state(state, sz);
     let px = sz.w - outw;
-    if mx < px { return false; }
+    if mx < px - _hit_slop() { return false; }
     let watchY = _code_watch_y();
     let rowTop = watchY + CH + PAD;
-    if my < rowTop or my >= rowTop + 4 * CH { return false; }
+    if my < rowTop - _hit_slop() or my >= rowTop + 4 * CH + _hit_slop() { return false; }
     let idx = num_floor((my - rowTop) / CH);
     if idx != 1 { return false; }
     state.panel = "code";
@@ -2056,10 +2794,10 @@ fn _ui_observer_click(state, mx, my) {
     let sz = state.winsz;
     let outw = _code_output_w_state(state, sz);
     let px = sz.w - outw;
-    if mx < px { return false; }
+    if mx < px - _hit_slop() { return false; }
     let uiY = _code_ui_y();
     let blockH = CH * 4 + PAD;
-    if my < uiY or my >= uiY + blockH { return false; }
+    if my < uiY - _hit_slop() or my >= uiY + blockH + _hit_slop() { return false; }
     _show_ui_snapshot(state);
     return true;
 }
@@ -2092,7 +2830,7 @@ fn _load_next_example(state) {
 }
 
 fn _example_hits(state) {
-    return IDE.filter_examples(EXAMPLES, try state.example_query catch "", 12);
+    return IDE.filter_examples(EXAMPLES, try state.example_query catch "", 10000);
 }
 
 fn _load_example_index(state, idx) {
@@ -2124,14 +2862,16 @@ fn _example_clamp(state) {
 fn _examples_key(state, key, shift) {
     if key == "Escape" { state.examples_mode = false; state.output = "examples closed"; return 0; }
     let n = len(_example_hits(state));
-    if key == "Home" { state.example_sel = IDE.selection_move(state.example_sel, n, "home", 10); return 0; }
-    if key == "End" { state.example_sel = IDE.selection_move(state.example_sel, n, "end", 10); return 0; }
-    if (try state.ctrl catch false) and (key == "N" or key == "KeyN") { state.example_sel = IDE.selection_move(state.example_sel, n, "next", 10); return 0; }
-    if (try state.ctrl catch false) and (key == "P" or key == "KeyP") { state.example_sel = IDE.selection_move(state.example_sel, n, "previous", 10); return 0; }
-    if key == "Down" { state.example_sel = IDE.selection_move(state.example_sel, n, "down", 10); return 0; }
-    if key == "Up" { state.example_sel = IDE.selection_move(state.example_sel, n, "up", 10); return 0; }
-    if key == "PageDown" { state.example_sel = IDE.selection_move(state.example_sel, n, "page_down", 10); return 0; }
-    if key == "PageUp" { state.example_sel = IDE.selection_move(state.example_sel, n, "page_up", 10); return 0; }
+    let page = 10;
+    if state.winsz != nil { page = _examples_visible_rows(_example_box(state.winsz)); }
+    if key == "Home" { state.example_sel = IDE.selection_move(state.example_sel, n, "home", page); return 0; }
+    if key == "End" { state.example_sel = IDE.selection_move(state.example_sel, n, "end", page); return 0; }
+    if (try state.ctrl catch false) and (key == "N" or key == "KeyN") { state.example_sel = IDE.selection_move(state.example_sel, n, "next", page); return 0; }
+    if (try state.ctrl catch false) and (key == "P" or key == "KeyP") { state.example_sel = IDE.selection_move(state.example_sel, n, "previous", page); return 0; }
+    if key == "Down" { state.example_sel = IDE.selection_move(state.example_sel, n, "down", page); return 0; }
+    if key == "Up" { state.example_sel = IDE.selection_move(state.example_sel, n, "up", page); return 0; }
+    if key == "PageDown" { state.example_sel = IDE.selection_move(state.example_sel, n, "page_down", page); return 0; }
+    if key == "PageUp" { state.example_sel = IDE.selection_move(state.example_sel, n, "page_up", page); return 0; }
     if key == "Delete" { state.example_query = ""; state.example_sel = 0; return 0; }
     if key == "Backspace" {
         if len(state.example_query) > 0 { state.example_query = str_slice(state.example_query, 0, len(state.example_query) - 1); }
@@ -2190,9 +2930,13 @@ fn _toolbar_click(state, id) {
     if id == "watch_action" { state.panel = "code"; _watch_action(state); return 0; }
     if id == "style" {
         state.style = _style_next(_style_name(state));
-        state.output = "style: " + state.style + " (Web/Smooth/Contrast/Pixel; set PBIDE_SCALE=1 for smaller text)";
+        state.output = "style: " + state.style + " (Web/Smooth/Crystal/Contrast; PBIDE_SCALE=1..4 overrides live density)";
         return 0;
     }
+    if id == "density_smaller" { _density_delta(state, 0 - 1); return 0; }
+    if id == "density_larger" { _density_delta(state, 1); return 0; }
+    if id == "density_auto" { _density_auto(state); return 0; }
+    if id == "density_refresh" { _density_refresh(state); return 0; }
     if id == "theme" { _theme_toggle(state); return 0; }
     if id == "help" { state.help = not state.help; return 0; }
     return 0;
@@ -2284,6 +3028,10 @@ fn _command_execute(state, id) {
     if id == "history_delete_selected" { state.panel = "hist"; _history_delete_selected(state); return 0; }
     if id == "history_toggle_store" { _history_toggle_store(state); return 0; }
     if id == "history_save" { _history_save_persistent(state); return 0; }
+    if id == "density_smaller" { _density_delta(state, 0 - 1); return 0; }
+    if id == "density_larger" { _density_delta(state, 1); return 0; }
+    if id == "density_auto" { _density_auto(state); return 0; }
+    if id == "density_refresh" { _density_refresh(state); return 0; }
     if id == "diagnostic_next" { state.panel = "code"; _diagnostic_goto(state, 1); return 0; }
     if id == "diagnostic_prev" { state.panel = "code"; _diagnostic_goto(state, 0 - 1); return 0; }
     if id == "browser_load" { state.panel = "web"; _web_load(state); return 0; }
@@ -2407,30 +3155,34 @@ fn _goto_line_key(state, key, shift) {
     return 0;
 }
 
-fn _goto_line_box(sz) {
-    let bw = 54 * CW;
+// _modal_box(sz, want_w, want_h, top_pad) — the shared modal geometry every picker uses:
+// clamp the desired size to the window (leaving a 2·PAD margin), center horizontally, sit
+// top_pad·PAD below the toolbar, and re-center vertically if it would overflow the status
+// bar. Returns { x, y, w, h }; callers add view-specific fields (e.g. list_y).
+fn _modal_box(sz, want_w, want_h, top_pad) {
+    let bw = want_w;
     if bw > sz.w - 4 * PAD { bw = sz.w - 4 * PAD; }
-    let bh = CH * 7 + 6 * PAD;
+    let bh = want_h;
     if bh > sz.h - 4 * PAD { bh = sz.h - 4 * PAD; }
     let bx = (sz.w - bw) / 2;
-    let by = TOP + 5 * PAD;
+    let by = TOP + top_pad * PAD;
     if by + bh > sz.h - STATUSH { by = (sz.h - bh) / 2; }
     return map{ x: bx, y: by, w: bw, h: bh };
+}
+
+fn _goto_line_box(sz) {
+    return _modal_box(sz, 54 * CW, CH * 7 + 6 * PAD, 5);
 }
 
 fn _draw_goto_line(state, win, sz) {
     let b = _goto_line_box(sz);
     win.rect(0, TOP, sz.w, sz.h - TOP, _style_modal_backdrop(state));
-    win.rect(b.x, b.y, b.w, b.h, _style_panel(state));
-    win.rect(b.x, b.y, b.w, SCALE, _style_accent(state));
-    win.rect(b.x, b.y + b.h - SCALE, b.w, SCALE, _style_border(state));
-    win.rect(b.x, b.y, SCALE, b.h, _style_border(state));
-    win.rect(b.x + b.w - SCALE, b.y, SCALE, b.h, _style_border(state));
+    _card_state(state, win, b.x, b.y, b.w, b.h, _style_panel(state), _style_border(state), RAD_LG);
+    _accent_bar(win, b.x + RAD_LG, b.y, b.w - 2 * RAD_LG, _style_accent(state));
     _dt(win, b.x + 2 * PAD, b.y + 2 * PAD, "Go To Line", _style_accent(state));
     _dt(win, b.x + 2 * PAD, b.y + CH + 3 * PAD, "Line 1.." + str(E.line_count(state.ed)) + "   Enter jump   Esc close", _style_muted(state));
     let qy = b.y + CH * 3 + 4 * PAD;
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, SCALE, _style_border(state));
+    _fill_round(win, b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state), RAD);
     let prompt = "Line: " + str(try state.goto_line_input catch "");
     let shown = str_slice(prompt, 0, (b.w - 6 * PAD) / CW);
     _dt(win, b.x + 3 * PAD, qy + PAD / 2, shown, _style_text(state));
@@ -2526,30 +3278,30 @@ fn _draw_input(state, win, sz, prefix, input, maxchars) {
 ");
     let nl = len(inlines);
     let boxTop = sz.h - CH * nl - 2 * PAD;
-    win.rect(0, boxTop - PAD, sz.w, CH * nl + 3 * PAD, _style_panel(state));
-    win.rect(0, boxTop - PAD, sz.w, SCALE, _style_accent(state));
+    win.rect(0, boxTop - PAD, sz.w, CH * nl + 3 * PAD, _style_bg(state));
+    _card_state(state, win, PAD, boxTop - PAD / 2, sz.w - 2 * PAD, CH * nl + 2 * PAD, _style_panel(state), _style_border(state), RAD_LG);
+    _fill_round(win, PAD + SCALE, boxTop, 2 * SCALE, CH * nl, _style_focus(state), SCALE);
     let i = 0;
     while i < nl {
         let txt = inlines[i];
         if i == 0 { txt = prefix + txt; }
-        _dt(win, PAD, boxTop + i * CH, str_slice(txt, 0, maxchars), _style_text(state));
+        _dt(win, 2 * PAD, boxTop + i * CH, str_slice(txt, 0, maxchars), _style_text(state));
         i = i + 1;
     }
     let lastlen = len(inlines[nl - 1]);
     if nl == 1 { lastlen = lastlen + len(prefix); }
     if lastlen > maxchars { lastlen = maxchars; }
-    win.rect(PAD + lastlen * CW, boxTop + (nl - 1) * CH, SCALE, CH - SCALE, CURSOR);
+    win.rect(2 * PAD + lastlen * CW, boxTop + (nl - 1) * CH, SCALE, CH - SCALE, CURSOR);
     return boxTop - PAD;
 }
 fn _draw_term(state, win, sz) {
     let t = state.term;
     let maxchars = (sz.w - 2 * PAD) / CW;
     let promptTop = _draw_input(state, win, sz, t.cwd + " $ ", t.input, maxchars);
-    win.rect(0, TOP, sz.w, CH + PAD, _style_surface(state));
-    win.rect(0, TOP + CH + PAD, sz.w, SCALE, _style_border(state));
+    let hx = _panel_head(state, win, sz, TOP);
     let header = IDE.terminal_history_status(try t.cmd_history catch [], try t.hist_pos catch len(try t.cmd_history catch [])) +
         " · Up/Down recall · Shift+Enter newline · clear clears output";
-    _dt(win, PAD, TOP + PAD / 2, str_slice(header, 0, maxchars), _style_muted(state));
+    _dt(win, hx, TOP + PAD / 2, str_slice(header, 0, maxchars), _style_muted(state));
     let scrollTop = TOP + CH + 2 * PAD;
     let areaRows = (promptTop - scrollTop) / CH;
     let total = len(t.lines);
@@ -2637,11 +3389,11 @@ fn _pal_height(sz) {
 }
 // palette hit-test → chip id (nil if the click isn't on the palette row).
 fn _pal_hit(mx, my, sz) {
-    if my < TOP or my >= TOP + _pal_height(sz) { return nil; }
+    if my < TOP - _hit_slop() or my >= TOP + _pal_height(sz) + _hit_slop() { return nil; }
     let i = 0;
     while i < len(DPAL) {
         let b = _pal_bounds(i, sz);
-        if mx >= b.x and mx < b.x + b.w and my >= b.y and my < b.y + CH { return DPAL[i].id; }
+        if _hit_rect(mx, my, b.x, b.y, b.w, CH + SCALE, _hit_slop() / 2) { return DPAL[i].id; }
         i = i + 1;
     }
     return nil;
@@ -2827,6 +3579,26 @@ fn _draw_sphere3d(state, win, w, sel) {
     _dt(win, w.x + PAD, w.y + w.h + PAD, w.text, _style_text(state));
     if sel { _box(win, w.x - SCALE, w.y - SCALE, w.w + 2 * SCALE, w.h + 2 * SCALE, CURSOR); }
 }
+// Badge-card Designer widgets: caption + subtitle on the shared card chrome. One
+// table row per kind replaces a whole draw branch — new kinds are a one-line add.
+fn _badge_card_specs() {
+    return map{
+        docmedia:  map{ caption: "MEDIA",         sub: "audio/video player",      sub_style: "text", accent_line: true },
+        webcomp:   map{ caption: "WEB component", sub: "HTML/CSS/JS metadata",    sub_style: "muted" },
+        scan3d:    map{ caption: "SCAN 3D",       sub: "obj/ply/stl/point cloud", sub_style: "muted" },
+        camera:    map{ caption: "CAMERA",        sub: "fov 60  perspective",     sub_style: "muted" },
+        light:     map{ caption: "LIGHT",         sub: "directional / point",     sub_style: "muted" },
+        material:  map{ caption: "MATERIAL",      sub: "pbr-lite roughness",      sub_style: "muted" },
+        terrain:   map{ caption: "TERRAIN",       sub: "heightfield / LOD",       sub_style: "muted" },
+        particles: map{ caption: "PARTICLES",     sub: "emitter rate lifetime",   sub_style: "muted" },
+        physics:   map{ caption: "PHYSICS",       sub: "body collider mass",      sub_style: "muted" },
+        prefab:    map{ caption: "PREFAB",        sub: "entity/component asset",  sub_style: "muted" },
+        backend:   map{ caption: "VK/GL TARGET",  sub: "plan-only renderer",      sub_style: "muted" },
+        // body:"slice_text" -> the subtitle is the widget's own text, clipped to width
+        doctext:   map{ caption: "RICH TEXT",     sub: "", body: "slice_text" },
+        custom:    map{ caption: "CUSTOM",        sub: "", body: "slice_text" },
+    };
+}
 fn _draw_dwidget(state, win, w, sel) {
     let k = w.kind;
     let bd = _style_muted(state);
@@ -2837,6 +3609,23 @@ fn _draw_dwidget(state, win, w, sel) {
     let panel = _style_panel(state);
     let card = _style_surface2(state);
     let badge = _design_badge_color(state, k);
+    let specs = _badge_card_specs();
+    if map_has(specs, k) {
+        let sp = specs[k];
+        win.rect(w.x, w.y, w.w, w.h, card);
+        _box(win, w.x, w.y, w.w, w.h, bd);
+        _dt(win, w.x + PAD, w.y + PAD, sp.caption, badge);
+        let subtext = sp.sub;
+        let subc = muted;
+        if sp.sub_style == "text" { subc = text; }
+        if (try sp.body catch "") == "slice_text" {
+            subtext = str_slice(w.text, 0, (w.w - 2 * PAD) / CW);
+            subc = text;
+        }
+        _dt(win, w.x + PAD, w.y + 3 * CH, subtext, subc);
+        if (try sp.accent_line catch false) { win.rect(w.x + PAD, w.y + w.h - 2 * CH, w.w - 2 * PAD, SCALE, accent); }
+        return 0;
+    }
     if k == "cube" {
         _draw_cube3d(state, win, w, sel);
     } else if k == "sphere" {
@@ -2892,11 +3681,6 @@ fn _draw_dwidget(state, win, w, sel) {
         win.rect(w.x + 2 * PAD, w.y + 4 * CH, w.w - 4 * PAD, SCALE, gfx.rgb(200, 205, 216));
         win.rect(w.x + 2 * PAD, w.y + 6 * CH, w.w - 8 * PAD, SCALE, gfx.rgb(210, 215, 226));
         win.rect(w.x + 2 * PAD, w.y + 8 * CH, w.w - 6 * PAD, SCALE, gfx.rgb(210, 215, 226));
-    } else if k == "doctext" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "RICH TEXT", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, str_slice(w.text, 0, (w.w - 2 * PAD) / CW), text);
     } else if k == "docimage" {
         win.rect(w.x, w.y, w.w, w.h, card);
         _box(win, w.x, w.y, w.w, w.h, bd);
@@ -2911,73 +3695,12 @@ fn _draw_dwidget(state, win, w, sel) {
         while tx < w.x + w.w - PAD { win.rect(tx, w.y + 3 * CH, SCALE, w.h - 4 * CH, muted); tx = tx + (w.w - 2 * PAD) / 3; }
         let ty = w.y + 3 * CH;
         while ty < w.y + w.h - PAD { win.rect(w.x + PAD, ty, w.w - 2 * PAD, SCALE, muted); ty = ty + CH * 2; }
-    } else if k == "docmedia" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "MEDIA", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "audio/video player", text);
-        win.rect(w.x + PAD, w.y + w.h - 2 * CH, w.w - 2 * PAD, SCALE, accent);
     } else if k == "nditem" {
         win.rect(w.x, w.y, w.w, w.h, card);
         _box(win, w.x, w.y, w.w, w.h, bd);
         _dt(win, w.x + PAD, w.y + PAD, "ND", badge);
         _dt(win, w.x + 5 * CW, w.y + PAD, w.text, text);
         _dt(win, w.x + PAD, w.y + 3 * CH, "dims: 5  projection: pca", muted);
-    } else if k == "custom" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "CUSTOM", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, str_slice(w.text, 0, (w.w - 2 * PAD) / CW), text);
-    } else if k == "webcomp" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "WEB component", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "HTML/CSS/JS metadata", muted);
-    } else if k == "scan3d" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "SCAN 3D", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "obj/ply/stl/point cloud", muted);
-    } else if k == "camera" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "CAMERA", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "fov 60  perspective", muted);
-    } else if k == "light" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "LIGHT", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "directional / point", muted);
-    } else if k == "material" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "MATERIAL", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "pbr-lite roughness", muted);
-    } else if k == "terrain" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "TERRAIN", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "heightfield / LOD", muted);
-    } else if k == "particles" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "PARTICLES", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "emitter rate lifetime", muted);
-    } else if k == "physics" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "PHYSICS", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "body collider mass", muted);
-    } else if k == "prefab" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "PREFAB", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "entity/component asset", muted);
-    } else if k == "backend" {
-        win.rect(w.x, w.y, w.w, w.h, card);
-        _box(win, w.x, w.y, w.w, w.h, bd);
-        _dt(win, w.x + PAD, w.y + PAD, "VK/GL TARGET", badge);
-        _dt(win, w.x + PAD, w.y + 3 * CH, "plan-only renderer", muted);
     } else if k == "label" {
         _dt(win, w.x, w.y, w.text, text);
         if sel { _box(win, w.x, w.y, w.w, w.h, CURSOR); }
@@ -2996,11 +3719,10 @@ fn _draw_design(state, win, sz) {
         if DPAL[i].act { bg = _design_palette_action_bg(state); } else if on { bg = _style_accent(state); }
         if DPAL[i].id == "layout" and layout != "free" { bg = gfx.rgb(0, 184, 148); }
         if DPAL[i].id == "apptype" { bg = _design_palette_app_bg(state); }
-        win.rect(b.x, b.y, b.w, CH, bg);
         let fg = _style_muted(state); if on { fg = _style_text(state); }
         let label = DPAL[i].label;
         if DPAL[i].id == "apptype" { label = "APP:" + target; }
-        _dt(win, b.x + CW, b.y + SCALE, label, fg);
+        _button_label(state, win, b.x, b.y, b.w, CH + SCALE, label, fg, bg, on);
         i = i + 1;
     }
     // canvas with a faint dot grid
@@ -3592,16 +4314,22 @@ fn _design_key(state, key, shift) {
 
 // ── AI panel (pbAI — stdlib/pbai.sapp) ────────────────────────────────────────────
 // A chat against pblang's own assistant: a free-text question box plus quick-action
-// chips that run pbAI on whatever is in the CODE editor (explain / find bugs / improve
-// / comment / explain diagnostics). pbAI grounds on code wrapped in a
-// `--- pblang code ---` marker. The last raw answer can be inserted into the editor.
+// chips that run pbAI on whatever is in the CODE editor. This native panel mirrors the
+// pbAI web test console (stdlib/ai/pbai/website): Respond (type + Enter), ANALYZE,
+// GENERATE, and a STATUS view (the console's Family/Bottom/Tokenizer/Brain status grid +
+// LLM family map) — brought into the IDE, no browser. Every answer carries a decision cue
+// (intent, confidence, and why it would ask you to confirm). pbAI grounds on code wrapped
+// in a `--- pblang code ---` marker; the last raw answer can be inserted into the editor.
 let AIPAL = [
     map{ id: "explain", label: "EXPLAIN" },
     map{ id: "bugs",    label: "BUGS" },
     map{ id: "improve", label: "IMPROVE" },
     map{ id: "quality", label: "QUALITY" },
     map{ id: "comment", label: "COMMENT" },
+    map{ id: "analyze", label: "ANALYZE" },
+    map{ id: "generate", label: "GENERATE" },
     map{ id: "diag",    label: "DIAG" },
+    map{ id: "status",  label: "STATUS" },
     map{ id: "insert",  label: "INSERT" },
     map{ id: "clear",   label: "CLEAR" },
 ];
@@ -3612,11 +4340,11 @@ fn _ai_bounds(idx) {
     return map{ x: x, w: (len(AIPAL[idx].label) + 2) * CW };
 }
 fn _ai_hit(mx, my) {
-    if my < TOP or my >= TOP + CH { return nil; }
+    if my < TOP - _hit_slop() or my >= TOP + CH + _hit_slop() { return nil; }
     let i = 0;
     while i < len(AIPAL) {
         let b = _ai_bounds(i);
-        if mx >= b.x and mx < b.x + b.w { return AIPAL[i].id; }
+        if _hit_rect(mx, my, b.x, TOP, b.w, CH, _hit_slop() / 2) { return AIPAL[i].id; }
         i = i + 1;
     }
     return nil;
@@ -3639,6 +4367,14 @@ fn _ai_send(state, prompt, echo) {
 ");
     let i = 0;
     while i < len(rl) { _ai_push(state, "  " + rl[i]); i = i + 1; }
+    // Decision cue: pbAI's intent + confidence and, when the ensemble is unsure, WHY it
+    // would ask you to confirm (low_confidence vs uncertain). Defensive — never breaks the
+    // panel if the ensemble isn't configured.
+    let cue = try AI.explain_line(prompt) catch nil;
+    if cue != nil {
+        _ai_push(state, "  · pbAI: " + str(cue));
+        state.ai.last_cue = str(cue);
+    }
     _ai_push(state, "");
     return 0;
 }
@@ -3674,13 +4410,55 @@ fn _ai_insert_last_response(state) {
     _refresh_watcher(state, "ai_insert");
     return 0;
 }
+// _ai_render_reply(state, reply, echo) — push a structured (already-produced) answer with
+// the same framing as _ai_send but WITHOUT re-running respond (for analyze/generate/status
+// which call a specific pbAI entry point directly, like the web console's action buttons).
+fn _ai_render_reply(state, reply, echo) {
+    _ai_push(state, "> " + echo);
+    let s = str(reply);
+    state.ai.last_response = s;
+    let rl = str_split(s, "
+");
+    let i = 0;
+    while i < len(rl) { _ai_push(state, "  " + rl[i]); i = i + 1; }
+    _ai_push(state, "");
+    return 0;
+}
+// _ai_status_report(state) — the web console's status grid + LLM family map, natively.
+fn _ai_status_report(state) {
+    let st = try AI.model_status() catch nil;
+    _ai_push(state, "> pbAI status");
+    if st == nil { _ai_push(state, "  (status unavailable)"); _ai_push(state, ""); return 0; }
+    _ai_push(state, "  Family:    " + str(try st.family catch "?"));
+    _ai_push(state, "  Router:    " + str(try st.top.router catch "?"));
+    _ai_push(state, "  Bottom:    " + str(try st.bottom.lm catch "?") + " (" + str(try st.bottom.tier catch "?") + ")");
+    _ai_push(state, "  Format:    " + str(try st.bottom.format catch "?"));
+    _ai_push(state, "  Arch:      " + str(try st.bottom.architecture catch "?"));
+    _ai_push(state, "  Learns:    " + str(try st.bottom.learns catch "?"));
+    _ai_push(state, "  Tools:     " + str(try st.top.tools catch "?"));
+    _ai_push(state, "");
+    return 0;
+}
 // quick action: run a pbAI skill on the current editor buffer (or CLEAR the chat).
 fn _ai_action(state, id) {
-    if id == "clear" { state.ai.lines = []; state.ai.last_response = ""; return 0; }
+    if id == "clear" { state.ai.lines = []; state.ai.last_response = ""; state.ai.last_cue = ""; return 0; }
     if id == "insert" { _ai_insert_last_response(state); return 0; }
+    if id == "status" { _ai_status_report(state); return 0; }
     let code = E.text(state.ed);
     if id == "diag" {
         _ai_send(state, _ai_diag_prompt(state, code), "explain diagnostics");
+        return 0;
+    }
+    if id == "analyze" {
+        let a = try AI.analyze(code) catch "pbAI error — analyze failed";
+        _ai_render_reply(state, a, "analyze (on editor buffer)");
+        return 0;
+    }
+    if id == "generate" {
+        let seed = code;
+        if str_trim(seed) == "" { seed = str_trim(try state.ai.input catch ""); }
+        let g = try AI.generate(seed, 80) catch "pbAI error — generate failed";
+        _ai_render_reply(state, g, "generate (from buffer/prompt)");
         return 0;
     }
     let verb = "explain what this code does";
@@ -3746,7 +4524,7 @@ fn _draw_ai(state, win, sz) {
         let b = _ai_bounds(i);
         let bg = _style_panel(state); if AIPAL[i].id == "clear" { bg = gfx.rgb(46, 40, 64); }
         if AIPAL[i].id == "clear" and _theme_is_light(state) { bg = gfx.rgb(228, 220, 245); }
-        win.rect(b.x, TOP, b.w, CH, bg);
+        _fill_round(win, b.x, TOP, b.w, CH, bg, RAD);
         _dt(win, b.x + CW, TOP + SCALE, AIPAL[i].label, _style_muted(state));
         i = i + 1;
     }
@@ -3754,6 +4532,7 @@ fn _draw_ai(state, win, sz) {
     let maxchars = (sz.w - 2 * PAD) / CW;
     let statusY = TOP + CH + PAD;
     win.rect(0, statusY, sz.w, CH + PAD, _style_surface(state));
+    win.rect(0, statusY, 2 * SCALE, CH + PAD, _style_accent(state));
     win.rect(0, statusY + CH + PAD, sz.w, SCALE, _style_border(state));
     let aiStatus = IDE.ai_prompt_history_status(try a.prompt_history catch [], try a.hist_pos catch len(try a.prompt_history catch [])) +
         " · Up/Down recall · Shift+Enter newline · INSERT last answer";
@@ -4576,23 +5355,32 @@ fn _web_click(state, mx, my) {
         return 0;
     }
     if zone == "summary" { return 0; }
-    if mx >= PAD and mx < PAD + 6 * CW { _web_back(state); return 0; }
-    if mx >= PAD + 7 * CW and mx < PAD + 15 * CW { _web_load(state); return 0; }
-    let modeX = PAD + 16 * CW;
-    if mx >= modeX and mx < modeX + 6 * CW { state.web.mode = "live"; state.web.scroll = 0; return 0; }
-    if mx >= modeX + 6 * CW and mx < modeX + 14 * CW { state.web.mode = "reader"; state.web.scroll = 0; return 0; }
-    if mx >= modeX + 14 * CW and mx < modeX + 21 * CW { state.web.mode = "links"; state.web.scroll = 0; return 0; }
-    if mx >= modeX + 21 * CW and mx < modeX + 28 * CW { state.web.mode = "forms"; state.web.scroll = 0; return 0; }
-    if mx >= modeX + 28 * CW and mx < modeX + 36 * CW { state.web.mode = "source"; state.web.scroll = 0; return 0; }
-    if mx >= modeX + 36 * CW and mx < modeX + 45 * CW { state.web.mode = "inspect"; state.web.scroll = 0; return 0; }
-    if mx >= modeX + 45 * CW and mx < modeX + 51 * CW { _web_render(state); return 0; }
-    if mx >= modeX + 52 * CW and mx < modeX + 66 * CW {
+    let slop = _hit_slop();
+    let bl = IDE.browser_header_layout(state.winsz.w, CW, PAD);
+    if _hit_rect(mx, my, bl.back.x, TOP + PAD, bl.back.w, CH + PAD, slop) { _web_back(state); return 0; }
+    if _hit_rect(mx, my, bl.reload.x, TOP + PAD, bl.reload.w, CH + PAD, slop) { _web_load(state); return 0; }
+    let modes = bl.modes;
+    let mi = 0;
+    while mi < len(modes) {
+        let b = modes[mi];
+        if _hit_rect(mx, my, b.x, TOP + PAD, b.w, CH + PAD, slop) {
+            if mi == 0 { state.web.mode = "live"; state.web.scroll = 0; return 0; }
+            if mi == 1 { state.web.mode = "reader"; state.web.scroll = 0; return 0; }
+            if mi == 2 { state.web.mode = "links"; state.web.scroll = 0; return 0; }
+            if mi == 3 { state.web.mode = "forms"; state.web.scroll = 0; return 0; }
+            if mi == 4 { state.web.mode = "source"; state.web.scroll = 0; return 0; }
+            if mi == 5 { state.web.mode = "inspect"; state.web.scroll = 0; return 0; }
+            if mi == 6 { _web_render(state); return 0; }
+        }
+        mi = mi + 1;
+    }
+    if _hit_rect(mx, my, bl.security.x, TOP + PAD, bl.security.w, CH + PAD, slop) {
         state.web.security = B.next_security_mode(try state.web.security catch "safe");
         let sec = B.security_profile(state.web.security);
         state.web.status = "security " + str(try sec.label catch state.web.security);
         return 0;
     }
-    if mx >= modeX + 67 * CW and mx < modeX + 76 * CW {
+    if _hit_rect(mx, my, bl.tor.x, TOP + PAD, bl.tor.w, CH + PAD, slop) {
         state.web.tor = not (try state.web.tor catch false);
         if state.web.tor { state.web.status = "Tor enabled"; }
         else { state.web.status = "Tor disabled"; }
@@ -4642,7 +5430,7 @@ fn _draw_live_block(state, win, x, y, w, kind, text, extra) {
     let lines = _wrap_with_prefix(prefix, text, maxchars);
     let h = (len(lines) + 2) * CH;
     if h < 4 * CH { h = 4 * CH; }
-    win.rect(x, y, w, h, bg);
+    _card_state(state, win, x, y, w, h, bg, _style_border(state), RAD);
     win.rect(x, y, SCALE * 2, h, accent);
     let label = str_upper(kind);
     _dt(win, x + 2 * PAD, y + PAD / 2, label, _style_muted(state));
@@ -4692,20 +5480,11 @@ fn _draw_web(state, win, sz) {
     // web IDE browser bar
     let barh = _web_bar_h();
     win.rect(0, TOP, sz.w, barh, _style_surface(state));
+    win.rect(0, TOP, 2 * SCALE, barh, _style_accent(state));
     win.rect(0, TOP + barh, sz.w, SCALE, _style_border(state));
-    let bx = PAD;
-    win.rect(bx, TOP + PAD, 6 * CW, CH + PAD, _style_surface2(state));
-    _dt(win, bx + CW, TOP + PAD + PAD / 2, "Back", _style_text(state));
-    win.rect(bx + 7 * CW, TOP + PAD, 8 * CW, CH + PAD, _style_surface2(state));
-    _dt(win, bx + 8 * CW, TOP + PAD + PAD / 2, "Reload", _style_text(state));
-    let modeX = bx + 16 * CW;
-    let m0 = "Live";
-    let m1 = "Reader";
-    let m2 = "Links";
-    let m3 = "Forms";
-    let m4 = "Source";
-    let m5 = "Inspect";
-    let m6 = "Host";
+    let bl = IDE.browser_header_layout(sz.w, CW, PAD);
+    _button_label(state, win, bl.back.x, TOP + PAD, bl.back.w, CH + PAD, bl.back.label, _style_text(state), _style_surface2(state), false);
+    _button_label(state, win, bl.reload.x, TOP + PAD, bl.reload.w, CH + PAD, bl.reload.label, _style_text(state), _style_surface2(state), false);
     let mbg = _style_surface2(state);
     let abg = _style_accent(state);
     let a0 = w.mode == "live" or w.mode == "page";
@@ -4722,13 +5501,15 @@ fn _draw_web(state, win, sz) {
     let bg4 = mbg; if a4 { bg4 = abg; }
     let bg5 = mbg; if a5 { bg5 = abg; }
     let bg6 = mbg; if a6 { bg6 = abg; }
-    win.rect(modeX, TOP + PAD, 6 * CW, CH + PAD, bg0); _dt(win, modeX + CW, TOP + PAD + PAD / 2, m0, _web_button_fg(state, a0));
-    win.rect(modeX + 6 * CW, TOP + PAD, 8 * CW, CH + PAD, bg1); _dt(win, modeX + 7 * CW, TOP + PAD + PAD / 2, m1, _web_button_fg(state, a1));
-    win.rect(modeX + 14 * CW, TOP + PAD, 7 * CW, CH + PAD, bg2); _dt(win, modeX + 15 * CW, TOP + PAD + PAD / 2, m2, _web_button_fg(state, a2));
-    win.rect(modeX + 21 * CW, TOP + PAD, 7 * CW, CH + PAD, bg3); _dt(win, modeX + 22 * CW, TOP + PAD + PAD / 2, m3, _web_button_fg(state, a3));
-    win.rect(modeX + 28 * CW, TOP + PAD, 8 * CW, CH + PAD, bg4); _dt(win, modeX + 29 * CW, TOP + PAD + PAD / 2, m4, _web_button_fg(state, a4));
-    win.rect(modeX + 36 * CW, TOP + PAD, 9 * CW, CH + PAD, bg5); _dt(win, modeX + 37 * CW, TOP + PAD + PAD / 2, m5, _web_button_fg(state, a5));
-    win.rect(modeX + 45 * CW, TOP + PAD, 6 * CW, CH + PAD, bg6); _dt(win, modeX + 46 * CW, TOP + PAD + PAD / 2, m6, _web_button_fg(state, a6));
+    let modeRects = bl.modes;
+    let active = [a0, a1, a2, a3, a4, a5, a6];
+    let fills = [bg0, bg1, bg2, bg3, bg4, bg5, bg6];
+    let mi = 0;
+    while mi < len(modeRects) {
+        let mb = modeRects[mi];
+        _button_label(state, win, mb.x, TOP + PAD, mb.w, CH + PAD, mb.label, _web_button_fg(state, active[mi]), fills[mi], active[mi]);
+        mi = mi + 1;
+    }
     let sec = B.security_profile(try w.security catch "safe");
     let secLabel = "Sec:" + str(try sec.label catch "Safe");
     let secBg = _style_surface2(state);
@@ -4750,18 +5531,15 @@ fn _draw_web(state, win, sz) {
         if _theme_is_light(state) { secBg = gfx.rgb(232, 224, 247); }
     }
     let secActive = (try sec.mode catch "safe") != "safe";
-    win.rect(modeX + 52 * CW, TOP + PAD, 14 * CW, CH + PAD, secBg);
-    _dt(win, modeX + 53 * CW, TOP + PAD + PAD / 2, str_slice(secLabel, 0, 12), _web_button_fg(state, secActive));
+    _button_label(state, win, bl.security.x, TOP + PAD, bl.security.w, CH + PAD, str_slice(secLabel, 0, 12), _web_button_fg(state, secActive), secBg, secActive);
     let torBg = _style_surface2(state);
     let torText = "Tor:off";
     if try w.tor catch false { torBg = gfx.rgb(58, 47, 91); torText = "Tor:on"; }
-    win.rect(modeX + 67 * CW, TOP + PAD, 9 * CW, CH + PAD, torBg);
-    _dt(win, modeX + 68 * CW, TOP + PAD + PAD / 2, torText, _web_button_fg(state, try w.tor catch false));
-    let urlX = modeX + 77 * CW;
-    let urlW = sz.w - urlX - 14 * CW;
+    _button_label(state, win, bl.tor.x, TOP + PAD, bl.tor.w, CH + PAD, torText, _web_button_fg(state, try w.tor catch false), torBg, try w.tor catch false);
+    let urlX = bl.url_x;
+    let urlW = bl.url_w;
     if urlW > 10 * CW {
-        win.rect(urlX, TOP + PAD, urlW, CH + PAD, _style_surface2(state));
-        win.rect(urlX, TOP + PAD, urlW, SCALE, _style_border(state));
+        _button_face(state, win, urlX, TOP + PAD, urlW, CH + PAD, _style_surface2(state), false);
     }
     let searchProf = B.search_engine_profile(try w.search_engine catch "duckduckgo");
     let addr = "URL › [" + str(try searchProf.label catch "Search") + "] " + w.input;
@@ -4770,7 +5548,9 @@ fn _draw_web(state, win, sz) {
     let cursorCol = len(addr);
     let cur = cursorCol; if cur > urlChars { cur = urlChars; }
     if urlChars > 4 { win.rect(urlX + CW + cur * CW, TOP + PAD + PAD / 2, SCALE, CH - SCALE, CURSOR); }
-    _dt(win, sz.w - 12 * CW, TOP + PAD + PAD / 2, try w.status catch "ready", _style_muted(state));
+    if not (try bl.compact catch false) {
+        _dt(win, bl.status_x, TOP + PAD + PAD / 2, try w.status catch "ready", _style_muted(state));
+    }
     let summaryMode = try w.security catch "safe";
     if try w.tor catch false { summaryMode = "tor"; }
     let secSummary = B.security_summary(summaryMode);
@@ -4827,6 +5607,8 @@ fn _draw_web(state, win, sz) {
         _dt(win, colX, bodyTop + vr * CH, str_slice(ln, 0, colW / CW), col);
         vr = vr + 1;
     }
+    let sm = map{ body_top: bodyTop, footer_y: sz.h - PAD };
+    _draw_panel_scrollbar(state, win, sz, sm, len(source), rows, w.scroll);
 }
 
 // ── History panel: web-IDE-style run/check snapshots with click-to-restore ─────────
@@ -4994,22 +5776,23 @@ fn _history_button_hit(state, mx, my) {
     let i = 0;
     while i < len(buttons) {
         let b = buttons[i];
-        if mx >= b.x and mx <= b.x + b.w and my >= b.y and my <= b.y + b.h { return b.id; }
+        if _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop()) { return b.id; }
         i = i + 1;
     }
     return "";
 }
 
 fn _draw_history(state, win, sz) {
-    let maxchars = (sz.w - 2 * PAD) / CW;
-    win.rect(0, TOP, sz.w, CH + 3 * PAD, _style_surface(state));
-    win.rect(0, TOP + CH + 3 * PAD, sz.w, SCALE, _style_border(state));
+    let m = _panel_metrics(sz, "history");
+    let maxchars = m.max_chars;
+    _panel_header_chrome(state, win, sz, m);
     _dt(win, PAD, TOP + PAD, "Run / Check History", _style_accent(state));
-    _dt(win, PAD + 24 * CW, TOP + PAD, "type filter · S temp/permanent · Ctrl+S save · Enter load", _style_muted(state));
+    if m.hint_mode == "full" {
+        _dt(win, PAD + 24 * CW, TOP + PAD, "type filter · S temp/permanent · Ctrl+S save · Enter load", _style_muted(state));
+    }
 
-    let qy = TOP + CH + 4 * PAD;
-    win.rect(PAD, qy, sz.w - 2 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(PAD, qy, sz.w - 2 * PAD, SCALE, _style_border(state));
+    let qy = m.search_y;
+    _panel_search_box(state, win, m);
     let q = "Search: " + (try state.history_query catch "") + "   " +
         IDE.history_filter_status(try state.history catch [], try state.history_query catch "", try state.history_sel catch 0) +
         "   " + _history_storage_summary(state);
@@ -5024,16 +5807,11 @@ fn _draw_history(state, win, sz) {
         if b.id == "clear" { fill = gfx.rgb(72, 44, 52); }
         if b.id == "clear" and _theme_is_light(state) { fill = gfx.rgb(248, 226, 226); }
         if b.id == "delete" { fill = _style_surface(state); }
-        win.rect(b.x, b.y, b.w, b.h, fill);
-        win.rect(b.x, b.y, b.w, SCALE, _style_border(state));
-        win.rect(b.x, b.y + b.h - SCALE, b.w, SCALE, _style_border(state));
-        win.rect(b.x, b.y, SCALE, b.h, _style_border(state));
-        win.rect(b.x + b.w - SCALE, b.y, SCALE, b.h, _style_border(state));
-        _dt(win, b.x + CW, b.y + PAD / 2, b.label, _style_text(state));
+        _button_label(state, win, b.x, b.y, b.w, b.h, b.label, _style_text(state), fill, b.id == "delete");
         bi = bi + 1;
     }
 
-    let bodyTop = qy + CH + 2 * PAD;
+    let bodyTop = m.body_top;
     let hits = _history_clamp(state);
     let i = 0;
     if len(hits) == 0 {
@@ -5041,14 +5819,17 @@ fn _draw_history(state, win, sz) {
         if len(try state.history catch []) > 0 { msg = "No history snapshots match the filter."; }
         _dt(win, PAD, bodyTop, msg, _style_error(state));
     }
-    while i < len(hits) {
-        let y = bodyTop + i * CH;
-        if i == (try state.history_sel catch 0) { win.rect(0, y, sz.w, CH, _style_hilite(state)); }
+    let start = _list_start_for(try state.history_sel catch 0, len(hits), m.rows);
+    i = 0;
+    while start + i < len(hits) and i < m.rows {
+        let y = bodyTop + i * m.row_h;
+        let actual = start + i;
+        if actual == (try state.history_sel catch 0) { _fill_round(win, SCALE, y, sz.w - 2 * SCALE, m.row_h, _style_hilite(state), RAD); }
         if i % 2 == 0 { win.rect(0, y, sz.w, CH, _style_row_rule(state)); }
-        let h = hits[i];
+        let h = hits[actual];
         let badge = "FAIL";
         if try h.ok catch false { badge = "OK"; }
-        let line = str((try h.index catch i) + 1) + ". " + str_upper(str(try h.action catch "?")) +
+        let line = str((try h.index catch actual) + 1) + ". " + str_upper(str(try h.action catch "?")) +
             " " + badge + "  " + str(try h.summary catch try h.output catch "");
         let col = _style_pane_text(state);
         if badge == "FAIL" { col = _style_error(state); }
@@ -5056,10 +5837,10 @@ fn _draw_history(state, win, sz) {
         _dt(win, PAD, y, str_slice(line, 0, maxchars), col);
         i = i + 1;
     }
+    _draw_panel_scrollbar(state, win, sz, m, len(hits), m.rows, start);
 
-    let footerY = sz.h - STATUSH;
-    win.rect(0, footerY, sz.w, STATUSH, _style_surface(state));
-    win.rect(0, footerY, sz.w, SCALE, _style_border(state));
+    let footerY = m.footer_y;
+    _panel_footer_chrome(state, win, sz, footerY);
     _dt(win, PAD, footerY + PAD / 2, "History: Enter restore. Shift+Delete/Delete Sel removes selected. C/Clear All removes all. Delete clears filter.", _style_muted(state));
 }
 
@@ -5071,11 +5852,12 @@ fn _history_click(state, mx, my) {
         _history_clear(state);
         return 0;
     }
-    let qy = TOP + CH + 4 * PAD;
-    let bodyTop = qy + CH + 2 * PAD;
+    let m = _panel_metrics(state.winsz, "history");
+    let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let idx = num_floor((my - bodyTop) / CH);
+    let idx = num_floor((my - bodyTop) / m.row_h);
     let hits = _history_clamp(state);
+    idx = idx + _list_start_for(try state.history_sel catch 0, len(hits), m.rows);
     if idx < 0 or idx >= len(hits) { return 0; }
     state.history_sel = idx;
     _history_restore(state, hits[idx]);
@@ -5204,15 +5986,16 @@ fn _manage_key(state, key, shift) {
 }
 
 fn _draw_manage(state, win, sz) {
-    let maxchars = (sz.w - 2 * PAD) / CW;
-    win.rect(0, TOP, sz.w, CH + 3 * PAD, _style_surface(state));
-    win.rect(0, TOP + CH + 3 * PAD, sz.w, SCALE, _style_border(state));
+    let m = _panel_metrics(sz, "manage");
+    let maxchars = m.max_chars;
+    _panel_header_chrome(state, win, sz, m);
     _dt(win, PAD, TOP + PAD, "Management / Databases", _style_accent(state));
-    _dt(win, PAD + 28 * CW, TOP + PAD, "database · storage · files · browser · AI · backups", _style_muted(state));
+    if m.hint_mode == "full" {
+        _dt(win, PAD + 28 * CW, TOP + PAD, "database · storage · files · browser · AI · backups", _style_muted(state));
+    }
 
-    let qy = TOP + CH + 4 * PAD;
-    win.rect(PAD, qy, sz.w - 2 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(PAD, qy, sz.w - 2 * PAD, SCALE, _style_border(state));
+    let qy = m.search_y;
+    _panel_search_box(state, win, m);
     let records = _manage_records(state);
     let q = "Search: " + (try state.manage.query catch "") + "   " +
         IDE.management_filter_status(records, try state.manage.query catch "", try state.manage.sel catch 0);
@@ -5220,35 +6003,38 @@ fn _draw_manage(state, win, sz) {
     _dt(win, PAD + CW, qy + PAD / 2, shown, _style_text(state));
     win.rect(PAD + CW + len(shown) * CW, qy + PAD / 2, SCALE, CH - SCALE, CURSOR);
 
-    let bodyTop = qy + CH + 2 * PAD;
+    let bodyTop = m.body_top;
     let hits = _manage_clamp(state);
     let i = 0;
     if len(hits) == 0 {
         _dt(win, PAD, bodyTop, "No management areas match the filter.", _style_error(state));
     }
-    while i < len(hits) {
-        let y = bodyTop + i * (CH * 2);
-        if i == (try state.manage.sel catch 0) { win.rect(0, y, sz.w, CH * 2, _style_hilite(state)); }
-        let h = hits[i];
-        let head = str((try h.index catch i) + 1) + ". [" + str(try h.group catch "?") + "] " + str(try h.title catch "?") +
+    let start = _list_start_for(try state.manage.sel catch 0, len(hits), m.rows);
+    while start + i < len(hits) and i < m.rows {
+        let y = bodyTop + i * m.row_h;
+        let actual = start + i;
+        if actual == (try state.manage.sel catch 0) { _fill_round(win, SCALE, y, sz.w - 2 * SCALE, m.row_h, _style_hilite(state), RAD); }
+        let h = hits[actual];
+        let head = str((try h.index catch actual) + 1) + ". [" + str(try h.group catch "?") + "] " + str(try h.title catch "?") +
             " · " + str(try h.status catch "");
         _dt(win, PAD, y, str_slice(head, 0, maxchars), _style_pane_text(state));
         _dt(win, PAD + 2 * CW, y + CH, str_slice(str(try h.detail catch ""), 0, maxchars - 2), _style_muted(state));
         i = i + 1;
     }
+    _draw_panel_scrollbar(state, win, sz, m, len(hits), m.rows, start);
 
-    let footerY = sz.h - STATUSH;
-    win.rect(0, footerY, sz.w, STATUSH, _style_surface(state));
-    win.rect(0, footerY, sz.w, SCALE, _style_border(state));
+    let footerY = m.footer_y;
+    _panel_footer_chrome(state, win, sz, footerY);
     _dt(win, PAD, footerY + PAD / 2, "Management: Enter opens selected area. Database management is planned; History storage is active now.", _style_muted(state));
 }
 
 fn _manage_click(state, mx, my) {
-    let qy = TOP + CH + 4 * PAD;
-    let bodyTop = qy + CH + 2 * PAD;
+    let m = _panel_metrics(state.winsz, "manage");
+    let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let idx = num_floor((my - bodyTop) / (CH * 2));
+    let idx = num_floor((my - bodyTop) / m.row_h);
     let hits = _manage_clamp(state);
+    idx = idx + _list_start_for(try state.manage.sel catch 0, len(hits), m.rows);
     if idx < 0 or idx >= len(hits) { return 0; }
     state.manage.sel = idx;
     _manage_open(state, hits[idx]);
@@ -5610,11 +6396,11 @@ fn _files_key(state, key, shift) {
 }
 
 fn _draw_files(state, win, sz) {
-    let maxchars = (sz.w - 2 * PAD) / CW;
+    let m = _panel_metrics(sz, "files");
+    let maxchars = m.max_chars;
     let entries = try state.files.entries catch [];
     if len(entries) == 0 { _files_refresh(state); }
-    win.rect(0, TOP, sz.w, CH + 3 * PAD, _style_surface(state));
-    win.rect(0, TOP + CH + 3 * PAD, sz.w, SCALE, _style_border(state));
+    _panel_header_chrome(state, win, sz, m);
     _dt(win, PAD, TOP + PAD, "Files / Project", _style_accent(state));
     let mode = str(try state.files.mode catch "flat");
     let roots = try state.files.roots catch [try state.files.dir catch "."];
@@ -5627,11 +6413,12 @@ fn _draw_files(state, win, sz) {
     let treeText = "depth " + str(settings.depth);
     if mode != "tree" { treeText = "flat"; }
     if mode == "recent" { treeText = "recent " + str(len(try state.recent_files catch [])); }
-    _dt(win, PAD + 19 * CW, TOP + PAD, mode + " · " + treeText + " · " + rootText + " · Ctrl+Shift+B label · Ctrl+Shift+G group", _style_muted(state));
+    if m.hint_mode == "full" {
+        _dt(win, PAD + 19 * CW, TOP + PAD, mode + " · " + treeText + " · " + rootText + " · Ctrl+Shift+B label · Ctrl+Shift+G group", _style_muted(state));
+    }
 
-    let qy = TOP + CH + 4 * PAD;
-    win.rect(PAD, qy, sz.w - 2 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(PAD, qy, sz.w - 2 * PAD, SCALE, _style_border(state));
+    let qy = m.search_y;
+    _panel_search_box(state, win, m);
     let q = rootText + "  " + mode + "  " + treeText + "  > " + str(try state.files.query catch "");
     let shown = str_slice(q, 0, maxchars - 4);
     _dt(win, PAD + CW, qy + PAD / 2, shown, _style_text(state));
@@ -5645,7 +6432,7 @@ fn _draw_files(state, win, sz) {
     );
     _dt(win, PAD, statusY, str_slice(fileStatus, 0, maxchars), _style_muted(state));
 
-    let bodyTop = qy + CH * 3 + 3 * PAD;
+    let bodyTop = m.body_top;
     let hits = _files_clamp(state);
     let countText = str(len(hits)) + " result";
     if len(hits) != 1 { countText = countText + "s"; }
@@ -5661,38 +6448,42 @@ fn _draw_files(state, win, sz) {
         _dt(win, PAD, bodyTop - CH * 2 - PAD / 2, str_slice(hint + " · " + actionHint, 0, maxchars), _style_muted(state));
         _dt(win, PAD, bodyTop - SCALE, "NAME", _style_muted(state));
         _dt(win, PAD + 34 * CW, bodyTop - SCALE, "PATH", _style_muted(state));
-        let rows = (sz.h - bodyTop - STATUSH - PAD) / CH;
+        let rows = m.rows;
+        let start = _list_start_for(try state.files.sel catch 0, len(hits), rows);
         let i = 0;
-        while i < len(hits) and i < rows {
-            let y = bodyTop + i * CH;
-            if i == state.files.sel { win.rect(0, y, sz.w, CH, _style_hilite(state)); }
+        while start + i < len(hits) and i < rows {
+            let y = bodyTop + i * m.row_h;
+            let actual = start + i;
+            if actual == state.files.sel { _fill_round(win, SCALE, y, sz.w - 2 * SCALE, m.row_h, _style_hilite(state), RAD); }
             if i % 2 == 0 { win.rect(0, y, sz.w, SCALE, _style_row_rule(state)); }
-            let h = hits[i];
+            let h = hits[actual];
             let col = _style_pane_text(state);
             if (try h.kind catch "file") == "dir" { col = _style_info(state); }
             let nameW = 32 * CW;
+            if m.viewport_class == "small" { nameW = 22 * CW; }
             let pathX = PAD + nameW + CW;
             let pathMax = (sz.w - PAD - pathX) / CW;
-            let name = str(i + 1) + ". " + h.label;
+            let name = str(actual + 1) + ". " + h.label;
             _dt(win, PAD, y, str_slice(name, 0, nameW / CW), col);
             _dt(win, pathX, y, str_slice(h.path, 0, pathMax), _style_muted(state));
             i = i + 1;
         }
+        _draw_panel_scrollbar(state, win, sz, m, len(hits), rows, start);
     }
-    let footerY = sz.h - STATUSH;
-    win.rect(0, footerY, sz.w, STATUSH, _style_surface(state));
-    win.rect(0, footerY, sz.w, SCALE, _style_border(state));
+    let footerY = m.footer_y;
+    _panel_footer_chrome(state, win, sz, footerY);
     let footer = "Files: Tab flat/tree/recent, Ctrl+/- depth, Ctrl+Left/Right roots, Ctrl+B bookmark, Ctrl+Shift+B label, Ctrl+Shift+G group";
     if mode == "recent" { footer = "Files recent: Enter open, Delete removes selected, Ctrl+Delete clears, Tab leaves recent."; }
     _dt(win, PAD, footerY + PAD / 2, footer, _style_muted(state));
 }
 
 fn _files_click(state, mx, my) {
-    let qy = TOP + CH + 4 * PAD;
-    let bodyTop = qy + CH + 2 * PAD;
+    let m = _panel_metrics(state.winsz, "files");
+    let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let row = num_floor((my - bodyTop) / CH);
+    let row = num_floor((my - bodyTop) / m.row_h);
     let hits = _files_clamp(state);
+    row = row + _list_start_for(try state.files.sel catch 0, len(hits), m.rows);
     if row >= 0 and row < len(hits) {
         state.files.sel = row;
         _files_accept(state, hits[row]);
@@ -5754,15 +6545,16 @@ fn _outline_key(state, key, shift) {
 }
 
 fn _draw_outline(state, win, sz) {
-    let maxchars = (sz.w - 2 * PAD) / CW;
-    win.rect(0, TOP, sz.w, CH + 3 * PAD, _style_surface(state));
-    win.rect(0, TOP + CH + 3 * PAD, sz.w, SCALE, _style_border(state));
+    let m = _panel_metrics(sz, "outline");
+    let maxchars = m.max_chars;
+    _panel_header_chrome(state, win, sz, m);
     _dt(win, PAD, TOP + PAD, "Outline / Symbols", _style_accent(state));
-    _dt(win, PAD + 22 * CW, TOP + PAD, "type filter · Home/End/Pg/Ctrl+N/P select · Delete clear · Enter jump", _style_muted(state));
+    if m.hint_mode == "full" {
+        _dt(win, PAD + 22 * CW, TOP + PAD, "type filter · Home/End/Pg/Ctrl+N/P select · Delete clear · Enter jump", _style_muted(state));
+    }
 
-    let qy = TOP + CH + 4 * PAD;
-    win.rect(PAD, qy, sz.w - 2 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(PAD, qy, sz.w - 2 * PAD, SCALE, _style_border(state));
+    let qy = m.search_y;
+    _panel_search_box(state, win, m);
     let q = "Search: " + (try state.outline.query catch "") + "   " +
         IDE.outline_filter_status(E.text(state.ed), try state.outline.query catch "", try state.outline.sel catch 0) +
         "   Delete clears";
@@ -5770,18 +6562,20 @@ fn _draw_outline(state, win, sz) {
     _dt(win, PAD + CW, qy + PAD / 2, shown, _style_text(state));
     win.rect(PAD + CW + len(shown) * CW, qy + PAD / 2, SCALE, CH - SCALE, CURSOR);
 
-    let bodyTop = qy + CH + 2 * PAD;
+    let bodyTop = m.body_top;
     let hits = _outline_clamp(state);
     if len(hits) == 0 {
         _dt(win, PAD, bodyTop, "No symbols found.", _style_error(state));
     } else {
-        let rows = (sz.h - bodyTop - STATUSH - PAD) / CH;
+        let rows = m.rows;
+        let start = _list_start_for(try state.outline.sel catch 0, len(hits), rows);
         let i = 0;
-        while i < len(hits) and i < rows {
-            let y = bodyTop + i * CH;
-            if i == state.outline.sel { win.rect(0, y, sz.w, CH, _style_hilite(state)); }
+        while start + i < len(hits) and i < rows {
+            let y = bodyTop + i * m.row_h;
+            let actual = start + i;
+            if actual == state.outline.sel { _fill_round(win, SCALE, y, sz.w - 2 * SCALE, m.row_h, _style_hilite(state), RAD); }
             if i % 2 == 0 { win.rect(0, y, sz.w, SCALE, _style_row_rule(state)); }
-            let h = hits[i];
+            let h = hits[actual];
             let span = "L" + str(try h.line catch 1);
             let endLine = try h.end_line catch try h.line catch 1;
             if endLine != (try h.line catch 1) { span = span + "-L" + str(endLine); }
@@ -5792,19 +6586,20 @@ fn _draw_outline(state, win, sz) {
             _dt(win, PAD, y, str_slice(txt, 0, maxchars), col);
             i = i + 1;
         }
+        _draw_panel_scrollbar(state, win, sz, m, len(hits), rows, start);
     }
-    let footerY = sz.h - STATUSH;
-    win.rect(0, footerY, sz.w, STATUSH, _style_surface(state));
-    win.rect(0, footerY, sz.w, SCALE, _style_border(state));
+    let footerY = m.footer_y;
+    _panel_footer_chrome(state, win, sz, footerY);
     _dt(win, PAD, footerY + PAD / 2, "Outline shows top-level fn/let/const/export from the current buffer.", _style_muted(state));
 }
 
 fn _outline_click(state, mx, my) {
-    let qy = TOP + CH + 4 * PAD;
-    let bodyTop = qy + CH + 2 * PAD;
+    let m = _panel_metrics(state.winsz, "outline");
+    let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let row = num_floor((my - bodyTop) / CH);
+    let row = num_floor((my - bodyTop) / m.row_h);
     let hits = _outline_clamp(state);
+    row = row + _list_start_for(try state.outline.sel catch 0, len(hits), m.rows);
     if row >= 0 and row < len(hits) {
         state.outline.sel = row;
         _outline_jump(state, hits[row]);
@@ -5875,15 +6670,16 @@ fn _problems_key(state, key, shift) {
 }
 
 fn _draw_problems(state, win, sz) {
-    let maxchars = (sz.w - 2 * PAD) / CW;
-    win.rect(0, TOP, sz.w, CH + 3 * PAD, _style_surface(state));
-    win.rect(0, TOP + CH + 3 * PAD, sz.w, SCALE, _style_border(state));
+    let m = _panel_metrics(sz, "problems");
+    let maxchars = m.max_chars;
+    _panel_header_chrome(state, win, sz, m);
     _dt(win, PAD, TOP + PAD, "Problems / Diagnostics", _style_accent(state));
-    _dt(win, PAD + 27 * CW, TOP + PAD, str_slice(IDE.diagnostic_counts_label(state.diagnostics) + " · Enter/click action or jump · F6 refresh", 0, maxchars - 28), _style_muted(state));
+    if m.hint_mode == "full" {
+        _dt(win, PAD + 27 * CW, TOP + PAD, str_slice(IDE.diagnostic_counts_label(state.diagnostics) + " · Enter/click action or jump · F6 refresh", 0, maxchars - 28), _style_muted(state));
+    }
 
-    let qy = TOP + CH + 4 * PAD;
-    win.rect(PAD, qy, sz.w - 2 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(PAD, qy, sz.w - 2 * PAD, SCALE, _style_border(state));
+    let qy = m.search_y;
+    _panel_search_box(state, win, m);
     let q = "Filter: " + str(try state.problems.query catch "") + "   " +
         IDE.diagnostic_filter_status(state.diagnostics, try state.problems.query catch "", (try state.problems.sel catch 1) - 1) +
         "   Delete clears";
@@ -5891,11 +6687,11 @@ fn _draw_problems(state, win, sz) {
     _dt(win, PAD + CW, qy + PAD / 2, qshown, _style_text(state));
     win.rect(PAD + CW + len(qshown) * CW, qy + PAD / 2, SCALE, CH - SCALE, CURSOR);
 
-    let bodyTop = qy + CH + 2 * PAD;
+    let bodyTop = m.body_top;
     _problems_clamp(state);
     let action = IDE.watcher_action(state.watch);
     let actionText = "action: " + str(try action.message catch "watcher unavailable");
-    if state.problems.sel == 0 { win.rect(0, bodyTop, sz.w, CH, _style_hilite(state)); }
+    if state.problems.sel == 0 { _fill_round(win, SCALE, bodyTop, sz.w - 2 * SCALE, m.row_h, _style_hilite(state), RAD); }
     let ac = _style_muted(state);
     if (try action.severity catch "") == "warn" { ac = _style_warning(state); }
     if (try action.severity catch "") == "error" { ac = _style_error(state); }
@@ -5905,26 +6701,32 @@ fn _draw_problems(state, win, sz) {
     let hits = _problems_hits(state);
     let dl = IDE.diagnostic_summary(hits, 1000);
     let startY = bodyTop + CH + PAD;
-    let detailH = CH * 4 + PAD;
-    let detailY = sz.h - STATUSH - detailH;
+    let detailH = m.detail_h;
+    let detailY = m.detail_y;
     if len(try state.diagnostics catch []) == 0 {
         _dt(win, PAD, startY, str_slice(dl[0], 0, maxchars), _style_muted(state));
     } else if len(hits) == 0 {
         _dt(win, PAD, startY, str_slice("No diagnostics match filter: " + str(try state.problems.query catch ""), 0, maxchars), _style_warning(state));
     } else {
-        let rows = (detailY - startY - PAD) / CH;
+        let rows = m.rows;
         if rows < 1 { rows = 1; }
+        let diagSel = state.problems.sel - 1;
+        if diagSel < 0 { diagSel = 0; }
+        let start = _list_start_for(diagSel, len(dl), rows);
         let i = 0;
-        while i < len(dl) and i < rows {
-            let y = startY + i * CH;
-            if state.problems.sel == i + 1 { win.rect(0, y, sz.w, CH, _style_hilite(state)); }
+        while start + i < len(dl) and i < rows {
+            let y = startY + i * m.row_h;
+            let actual = start + i;
+            if state.problems.sel == actual + 1 { _fill_round(win, SCALE, y, sz.w - 2 * SCALE, m.row_h, _style_hilite(state), RAD); }
             if i % 2 == 0 { win.rect(0, y, sz.w, SCALE, _style_row_rule(state)); }
             let col = _style_muted(state);
-            if str_contains(dl[i], "ERROR") { col = _style_error(state); }
-            if str_contains(dl[i], "WARNING") { col = _style_warning(state); }
-            _dt(win, PAD, y, str_slice(dl[i], 0, maxchars), col);
+            if str_contains(dl[actual], "ERROR") { col = _style_error(state); }
+            if str_contains(dl[actual], "WARNING") { col = _style_warning(state); }
+            _dt(win, PAD, y, str_slice(dl[actual], 0, maxchars), col);
             i = i + 1;
         }
+        let sm = map{ body_top: startY, footer_y: detailY, row_h: m.row_h };
+        _draw_panel_scrollbar(state, win, sz, sm, len(dl), rows, start);
     }
     win.rect(0, detailY, sz.w, detailH, _style_panel(state));
     win.rect(0, detailY, sz.w, SCALE, _style_border(state));
@@ -5941,28 +6743,33 @@ fn _draw_problems(state, win, sz) {
         _dt(win, PAD, detailY + CH + PAD + dd * CH, str_slice(detail[dd], 0, maxchars), col);
         dd = dd + 1;
     }
-    let footerY = sz.h - STATUSH;
-    win.rect(0, footerY, sz.w, STATUSH, _style_surface(state));
-    win.rect(0, footerY, sz.w, SCALE, _style_border(state));
+    let footerY = m.footer_y;
+    _panel_footer_chrome(state, win, sz, footerY);
     _dt(win, PAD, footerY + PAD / 2, "Problems uses current diagnostics; stale/unchecked action row runs Check.", _style_muted(state));
 }
 
 fn _problems_click(state, mx, my) {
-    let qy = TOP + CH + 4 * PAD;
-    let bodyTop = qy + CH + 2 * PAD;
     let sz = try state.winsz catch nil;
+    let m = _panel_metrics(sz, "problems");
+    let bodyTop = m.body_top;
     if sz != nil {
-        let detailY = sz.h - STATUSH - (CH * 4 + PAD);
+        let detailY = m.detail_y;
         if my >= detailY { return false; }
     }
-    let hit = IDE.problems_panel_hit(my, bodyTop, CH, PAD, len(_problems_hits(state)));
+    let hit = IDE.problems_panel_hit(my, bodyTop, m.row_h, PAD, len(_problems_hits(state)));
     if (try hit.kind catch "") == "action" {
         state.problems.sel = 0;
         _problems_accept(state);
         return 0;
     }
     if (try hit.kind catch "") == "diagnostic" {
-        state.problems.sel = (try hit.index catch 0) + 1;
+        let hits = _problems_hits(state);
+        let rows = m.rows;
+        if rows < 1 { rows = 1; }
+        let diagSel = state.problems.sel - 1;
+        if diagSel < 0 { diagSel = 0; }
+        let start = _list_start_for(diagSel, len(hits), rows);
+        state.problems.sel = start + (try hit.index catch 0) + 1;
         _problems_accept(state);
     }
     return 0;
@@ -5970,30 +6777,30 @@ fn _problems_click(state, mx, my) {
 
 // ── searchable examples picker: native equivalent of the web IDE examples list ─────
 fn _example_box(sz) {
-    let bw = 72 * CW;
-    if bw > sz.w - 4 * PAD { bw = sz.w - 4 * PAD; }
-    let bh = CH * 17 + 6 * PAD;
-    if bh > sz.h - 4 * PAD { bh = sz.h - 4 * PAD; }
-    let bx = (sz.w - bw) / 2;
-    let by = TOP + 2 * PAD;
-    if by + bh > sz.h - STATUSH { by = (sz.h - bh) / 2; }
-    return map{ x: bx, y: by, w: bw, h: bh, list_y: by + CH * 4 + 4 * PAD };
+    let b = _modal_box(sz, 72 * CW, CH * 17 + 6 * PAD, 2);
+    return map{ x: b.x, y: b.y, w: b.w, h: b.h, list_y: b.y + CH * 4 + 4 * PAD };
+}
+
+fn _examples_visible_rows(b) {
+    let rows = num_floor((b.y + b.h - b.list_y - 2 * PAD) / CH);
+    if rows < 1 { rows = 1; }
+    return rows;
+}
+
+fn _examples_start(state, hits, rows) {
+    return _list_start_for(try state.example_sel catch 0, len(hits), rows);
 }
 
 fn _draw_examples(state, win, sz) {
     let b = _example_box(sz);
     win.rect(0, TOP, sz.w, sz.h - TOP, _style_modal_backdrop(state));
-    win.rect(b.x, b.y, b.w, b.h, _style_panel(state));
-    win.rect(b.x, b.y, b.w, SCALE, _style_accent(state));
-    win.rect(b.x, b.y + b.h - SCALE, b.w, SCALE, _style_border(state));
-    win.rect(b.x, b.y, SCALE, b.h, _style_border(state));
-    win.rect(b.x + b.w - SCALE, b.y, SCALE, b.h, _style_border(state));
+    _card_state(state, win, b.x, b.y, b.w, b.h, _style_panel(state), _style_border(state), RAD_LG);
+    _accent_bar(win, b.x + RAD_LG, b.y, b.w - 2 * RAD_LG, _style_accent(state));
     _dt(win, b.x + 2 * PAD, b.y + 2 * PAD, "Examples", _style_accent(state));
     _dt(win, b.x + 15 * CW, b.y + 2 * PAD, "type filter  Pg/Home/End/Ctrl+N/P select  Delete clear  Enter load", _style_muted(state));
 
     let qy = b.y + CH * 2 + 3 * PAD;
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, SCALE, _style_border(state));
+    _fill_round(win, b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state), RAD);
     let q = "Search: " + state.example_query + "   " +
         IDE.examples_filter_status(EXAMPLES, try state.example_query catch "", try state.example_sel catch 0) +
         "   Esc closes";
@@ -6006,14 +6813,23 @@ fn _draw_examples(state, win, sz) {
         _dt(win, b.x + 2 * PAD, b.list_y, "No matching examples.", _style_error(state));
         return 0;
     }
+    let rows = _examples_visible_rows(b);
+    let start = _examples_start(state, hits, rows);
     let i = 0;
-    while i < len(hits) and i < 12 {
+    while i < rows and start + i < len(hits) {
+        let actual = start + i;
         let y = b.list_y + i * CH;
-        if i == state.example_sel { win.rect(b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state)); }
-        let ex = EXAMPLES[hits[i].index];
-        let line = str(i + 1) + ". " + hits[i].title + "   #" + str(hits[i].index + 1);
-        _dt(win, b.x + 2 * PAD, y, str_slice(line, 0, (b.w - 4 * PAD) / CW), _style_pane_text(state));
+        if actual == state.example_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
+        let ex = EXAMPLES[hits[actual].index];
+        let line = str(actual + 1) + ". " + hits[actual].title + "   #" + str(hits[actual].index + 1);
+        _dt(win, b.x + 2 * PAD, y, str_slice(line, 0, (b.w - 6 * PAD) / CW), _style_pane_text(state));
         i = i + 1;
+    }
+    if len(hits) > rows {
+        let thick = _scrollbar_thickness();
+        let sb = UIK.scrollbar(b.x + b.w - 2 * PAD - thick, b.list_y, rows * CH, len(hits), rows, start, thick);
+        _fill_round(win, sb.track.x, sb.track.y, sb.track.w, sb.track.h, _style_surface(state), thick / 2);
+        _fill_round(win, sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h, _style_focus(state), thick / 2);
     }
     return 0;
 }
@@ -6021,44 +6837,37 @@ fn _draw_examples(state, win, sz) {
 fn _examples_click(state, mx, my) {
     if not (try state.examples_mode catch false) or state.winsz == nil { return false; }
     let b = _example_box(state.winsz);
-    if mx < b.x or mx >= b.x + b.w or my < b.y or my >= b.y + b.h { return false; }
+    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop() / 2) { return false; }
     if my < b.list_y { return true; }
     let row = num_floor((my - b.list_y) / CH);
     let hits = _example_clamp(state);
-    if row >= 0 and row < len(hits) {
-        state.example_sel = row;
-        _load_example_index(state, hits[row].index);
+    let rows = _examples_visible_rows(b);
+    let start = _examples_start(state, hits, rows);
+    let actual = start + row;
+    if row >= 0 and row < rows and actual < len(hits) {
+        state.example_sel = actual;
+        _load_example_index(state, hits[actual].index);
     }
     return true;
 }
 
 // ── command palette: keyboard route to all main IDE actions ─────────────────
 fn _command_box(sz) {
-    let bw = 84 * CW;
-    if bw > sz.w - 4 * PAD { bw = sz.w - 4 * PAD; }
-    let bh = CH * 16 + 6 * PAD;
-    if bh > sz.h - 4 * PAD { bh = sz.h - 4 * PAD; }
-    let bx = (sz.w - bw) / 2;
-    let by = TOP + 2 * PAD;
-    if by + bh > sz.h - STATUSH { by = (sz.h - bh) / 2; }
-    return map{ x: bx, y: by, w: bw, h: bh, list_y: by + CH * 4 + 4 * PAD };
+    let b = _modal_box(sz, 84 * CW, CH * 16 + 6 * PAD, 2);
+    return map{ x: b.x, y: b.y, w: b.w, h: b.h, list_y: b.y + CH * 4 + 4 * PAD };
 }
 
 fn _draw_command_palette(state, win, sz) {
     let b = _command_box(sz);
     win.rect(0, TOP, sz.w, sz.h - TOP, _style_modal_backdrop(state));
-    win.rect(b.x, b.y, b.w, b.h, _style_panel(state));
-    win.rect(b.x, b.y, b.w, SCALE, _style_accent(state));
-    win.rect(b.x, b.y + b.h - SCALE, b.w, SCALE, _style_border(state));
-    win.rect(b.x, b.y, SCALE, b.h, _style_border(state));
-    win.rect(b.x + b.w - SCALE, b.y, SCALE, b.h, _style_border(state));
+    _card_state(state, win, b.x, b.y, b.w, b.h, _style_panel(state), _style_border(state), RAD_LG);
+    _accent_bar(win, b.x + RAD_LG, b.y, b.w - 2 * RAD_LG, _style_accent(state));
     _dt(win, b.x + 2 * PAD, b.y + 2 * PAD, "Command Palette", _style_accent(state));
     let head = IDE.command_catalog_summary(nil) + "  ·  " + IDE.command_filter_examples_line(6) + "  Pg/Home/End/Ctrl+N/P select  Delete clear  Enter run";
     _dt(win, b.x + 22 * CW, b.y + 2 * PAD, str_slice(head, 0, (b.w - 24 * CW) / CW), _style_muted(state));
 
     let qy = b.y + CH * 2 + 3 * PAD;
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, SCALE, _style_border(state));
+    _fill_round(win, b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state), RAD);
     let q = "> " + (try state.command_query catch "") + "   " +
         IDE.command_filter_status(try state.command_query catch "", try state.command_sel catch 0);
     let shown = str_slice(q, 0, (b.w - 6 * PAD) / CW);
@@ -6082,7 +6891,7 @@ fn _draw_command_palette(state, win, sz) {
     let i = 0;
     while i < len(hits) and i < 12 {
         let y = b.list_y + i * CH;
-        if i == state.command_sel { win.rect(b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state)); }
+        if i == state.command_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
         let c = hits[i];
         let groupW = 11 * CW;
         let shortcutW = 26 * CW;
@@ -6101,7 +6910,7 @@ fn _draw_command_palette(state, win, sz) {
 fn _command_click(state, mx, my) {
     if not (try state.command_mode catch false) or state.winsz == nil { return false; }
     let b = _command_box(state.winsz);
-    if mx < b.x or mx >= b.x + b.w or my < b.y or my >= b.y + b.h { return false; }
+    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop() / 2) { return false; }
     if my < b.list_y { return true; }
     let row = num_floor((my - b.list_y) / CH);
     let hits = _command_clamp(state);
@@ -6267,32 +7076,22 @@ fn _quick_open_key(state, key, shift) {
 }
 
 fn _quick_open_box(sz) {
-    let bw = 92 * CW;
-    if bw > sz.w - 4 * PAD { bw = sz.w - 4 * PAD; }
-    let bh = CH * 18 + 6 * PAD;
-    if bh > sz.h - 4 * PAD { bh = sz.h - 4 * PAD; }
-    let bx = (sz.w - bw) / 2;
-    let by = TOP + 2 * PAD;
-    if by + bh > sz.h - STATUSH { by = (sz.h - bh) / 2; }
-    return map{ x: bx, y: by, w: bw, h: bh, list_y: by + CH * 4 + 4 * PAD };
+    let b = _modal_box(sz, 92 * CW, CH * 18 + 6 * PAD, 2);
+    return map{ x: b.x, y: b.y, w: b.w, h: b.h, list_y: b.y + CH * 4 + 4 * PAD };
 }
 
 fn _draw_quick_open(state, win, sz) {
     let b = _quick_open_box(sz);
     win.rect(0, TOP, sz.w, sz.h - TOP, _style_modal_backdrop(state));
-    win.rect(b.x, b.y, b.w, b.h, _style_panel(state));
-    win.rect(b.x, b.y, b.w, SCALE, _style_accent(state));
-    win.rect(b.x, b.y + b.h - SCALE, b.w, SCALE, _style_border(state));
-    win.rect(b.x, b.y, SCALE, b.h, _style_border(state));
-    win.rect(b.x + b.w - SCALE, b.y, SCALE, b.h, _style_border(state));
+    _card_state(state, win, b.x, b.y, b.w, b.h, _style_panel(state), _style_border(state), RAD_LG);
+    _accent_bar(win, b.x + RAD_LG, b.y, b.w - 2 * RAD_LG, _style_accent(state));
     _dt(win, b.x + 2 * PAD, b.y + 2 * PAD, "Quick Open", _style_accent(state));
     let recentCount = len(try state.recent_files catch []);
     let quickHead = "recent " + str(recentCount) + "  " + IDE.file_filter_examples_line(6) + "  path:line:col or line:120 col:4  Up/Down/Pg/Home/End  Enter open  Esc close";
     _dt(win, b.x + 17 * CW, b.y + 2 * PAD, str_slice(quickHead, 0, (b.w - 19 * CW) / CW), _style_muted(state));
 
     let qy = b.y + CH * 2 + 3 * PAD;
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state));
-    win.rect(b.x + 2 * PAD, qy, b.w - 4 * PAD, SCALE, _style_border(state));
+    _fill_round(win, b.x + 2 * PAD, qy, b.w - 4 * PAD, CH + PAD, _style_surface2(state), RAD);
     let q = str(try state.quick_query catch "");
     let prompt = str(try state.quick_dir catch ".") + "  recent+" + str(recentCount) + "  > " + q;
     let maxPrompt = (b.w - 6 * PAD) / CW;
@@ -6318,7 +7117,7 @@ fn _draw_quick_open(state, win, sz) {
     let i = 0;
     while i < len(hits) and i < 14 {
         let y = b.list_y + i * CH;
-        if i == state.quick_sel { win.rect(b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state)); }
+        if i == state.quick_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
         let h = hits[i];
         let nameW = 30 * CW;
         let pathX = b.x + 2 * PAD + nameW + CW;
@@ -6334,7 +7133,7 @@ fn _draw_quick_open(state, win, sz) {
 fn _quick_open_click(state, mx, my) {
     if not (try state.quick_open_mode catch false) or state.winsz == nil { return false; }
     let b = _quick_open_box(state.winsz);
-    if mx < b.x or mx >= b.x + b.w or my < b.y or my >= b.y + b.h { return false; }
+    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop() / 2) { return false; }
     if my < b.list_y { return true; }
     let row = num_floor((my - b.list_y) / CH);
     let hits = _quick_open_clamp(state);
@@ -6485,11 +7284,15 @@ let HELP = [
     "",
     "MODE      Debug checks before run; Release runs directly. Watcher tracks rev/dirty/diags.",
     "UI        Ctrl+P -> UI snapshot prints structured layout/UX observer lines.",
-    "STYLE     click Style to cycle Web / Smooth / Contrast / Pixel palettes.",
+    "          Ctrl+- / Ctrl+= adjust native UI density outside Files; Ctrl+P density auto/refresh.",
+    "STYLE     click Style to cycle Web / Smooth / Crystal / Contrast palettes.",
     "THEME     click Theme or Ctrl+P Theme to toggle Light / Dark.",
-    "          Web + Dark is default; Light matches the web IDE preference control.",
+    "          Crystal + Dark is default; Light matches the web IDE preference control.",
     "",
-    "Launch from a shell with:   pblang --ide",
+    "Launch from a shell with:   pblang ide   (or ./editors/ide/run.sh ; Windows: run.bat)",
+    "UI density uses the pblang window probe when available; PBIDE_SCALE=1..4 overrides.",
+    "Set PBIDE_WINDOW_PROBE=0 to disable probing or PBIDE_WINDOW_PROBE_MS=1200 to tune it.",
+    "Renderer: default minifb CPU framebuffer; use PBLANG_GFX=sdl2 for SDL2 GPU-present builds.",
 ];
 fn _draw_help(state, win, sz) {
     win.clear(_style_modal_backdrop(state));                  // modal backdrop
@@ -6500,11 +7303,8 @@ fn _draw_help(state, win, sz) {
     let bh = len(HELP) * CH + 4 * PAD;
     let bx = (sz.w - bw) / 2; if bx < 0 { bx = 0; }
     let by = (sz.h - bh) / 2; if by < 0 { by = 0; }
-    win.rect(bx, by, bw, bh, _style_panel(state));
-    win.rect(bx, by, bw, SCALE, _style_accent(state));
-    win.rect(bx, by + bh - SCALE, bw, SCALE, _style_accent(state));
-    win.rect(bx, by, SCALE, bh, _style_accent(state));
-    win.rect(bx + bw - SCALE, by, SCALE, bh, _style_accent(state));
+    _card_state(state, win, bx, by, bw, bh, _style_panel(state), _style_accent(state), RAD_LG);
+    _accent_bar(win, bx + RAD_LG, by, bw - 2 * RAD_LG, _style_accent(state));
     let r = 0;
     while r < len(HELP) {
         let col = _style_pane_text(state);
@@ -6516,11 +7316,17 @@ fn _draw_help(state, win, sz) {
 
 // top-level draw: clear, toolbar, then the active panel.
 fn _draw(state, win) {
+    let frame = win.size();
+    let live = try state.live_winsz catch frame;
+    _apply_live_density(state, live);
+    _apply_toolbar_metrics(frame);
     win.clear(_style_bg(state));
-    let sz = win.size();
+    let sz = frame;
     state.winsz = sz;                 // cached for mouse → buffer-position mapping
+    state.window_size = live;
+    state.viewport_layout = _viewport_layout_for(live);
     state.ui_snapshot = _ui_snapshot(state, sz);
-    _refresh_watcher(state, "draw");
+    _refresh_watcher_draw(state);
     _draw_toolbar(state, win, sz);
     if state.panel == "code" { _draw_code(state, win, sz); }
     else if state.panel == "term" { _draw_term(state, win, sz); }
@@ -6537,7 +7343,7 @@ fn _draw(state, win) {
     if try state.quick_open_mode catch false { _draw_quick_open(state, win, sz); }
     if try state.goto_line_mode catch false { _draw_goto_line(state, win, sz); }
     if state.help { _draw_help(state, win, sz); }     // modal overlay, drawn last (on top)
-    win.present();
+    return true;
 }
 
 // mouse → buffer position. Maps a pixel (mx,my) in the editor area to (row,col), using the
@@ -6575,9 +7381,23 @@ fn main() {
     // UI is cleaner/less blocky; users can raise PBIDE_SCALE without getting a tiny
     // viewport.
     let winw = GUTTERX + 5 * CW + 100 * CW + PAD;
-    let winh = TOP + 40 * CH + PANEH;
+    let winh = TOP + 46 * CH + PANEH;
     if winw < 1280 { winw = 1280; }
-    if winh < 760 { winh = 760; }
+    if winh < 860 { winh = 860; }
+    // Cap to ~94% of the detected display so the auto-scaled window always fits on
+    // screen (and leaves room for the OS taskbar/dock); never below the minimums.
+    if DISPLAY != nil {
+        let dw = try DISPLAY.w catch 0;
+        let dh = try DISPLAY.h catch 0;
+        if dw != nil and dw >= 800 {
+            let maxw = num_floor(dw * 94 / 100);
+            if winw > maxw { winw = maxw; }
+        }
+        if dh != nil and dh >= 600 {
+            let maxh = num_floor(dh * 94 / 100);
+            if winh > maxh { winh = maxh; }
+        }
+    }
     let win = gfx.Window(winw, winh, "pblang IDE - Smart Code Editor");
     let cwd0 = try env_get("PWD") catch ".";
     if cwd0 == nil { cwd0 = "."; }
@@ -6588,6 +7408,7 @@ fn main() {
     let hist0 = _history_load_persistent();
     let histMode0 = "temporary";
     if len(hist0) > 0 { histMode0 = "permanent"; }
+    let initialFrame = map{ w: winw, h: winh };
     let state = map{
         panel: "code",                                   // active toolbar tab
         ed: ed0,
@@ -6607,11 +7428,15 @@ fn main() {
         manage: map{ query: "", sel: 0 },
         examples_mode: false, example_query: "", example_sel: 0,
         command_mode: false, command_query: "", command_sel: 0,
-        mx: 0, my: 0, mdown: false, split_drag: false, winsz: nil, outw: 34 * CW, ui_snapshot: nil, ui_events: [],
-        style: "web", theme: "dark",
+        mx: 0, my: 0, mdown: false, split_drag: false, winsz: nil, outw: 30 * CW, ui_snapshot: nil, ui_events: [], hover_tab: nil,
+        style: "crystal", theme: "dark", density_scale: SCALE, window_size: initialFrame,
+        live_winsz: initialFrame, display_winsz: DISPLAY, viewport_layout: _viewport_layout_for(initialFrame),
+        window_probe_enabled: _window_probe_default(), monitor_probe_enabled: _monitor_probe_default(),
+        window_probe_last_ms: 0, window_monitor_probe_last_ms: 0,
+        event_count: 0, last_event: "none", last_present_ms: 0, watch_draw_last_ms: 0,
         term: map{ cwd: cwd0, input: "", lines: ["pblang terminal — runs real PC commands (needs --allow-exec). Try: ls, pwd, cd .."], cmd_history: [], hist_pos: 0, hist_draft: "" },
         design: map{ tool: "button", target: "gui", layout: "free", widgets: [], sel: 0 - 1, drag: false, dx: 0, dy: 0, counter: 0 },
-        ai: map{ input: "", last_response: "", prompt_history: [], hist_pos: 0, hist_draft: "", lines: ["pbAI — pblang's own assistant (no network, no Ollama). Type a question + Enter,", "or use EXPLAIN / BUGS / IMPROVE / QUALITY / COMMENT / DIAG, then INSERT the last answer."] },
+        ai: map{ input: "", last_response: "", last_cue: "", prompt_history: [], hist_pos: 0, hist_draft: "", lines: ["pbAI — pblang's own assistant (no network, no Ollama). Type a question + Enter,", "or use EXPLAIN / BUGS / IMPROVE / QUALITY / COMMENT / DIAG, then INSERT the last answer."] },
         web: map{ input: "example.com", url: "", title: "", mode: "live", security: "safe", tor: false, status: "safe", scroll: 0, history: [], forward: [], bookmarks: [], download_plans: [], search_engine: "duckduckgo", home: "example.com", find_query: "", page_obj: nil, page: ["pblang browser - type a URL + Enter to load. Live/Reader/Links/Forms/Source/Inspect/Host modes."], reader: ["pblang browser - type a URL + Enter to load. Up/Down scroll."], links: [], forms: ["No forms loaded."], form_sel: 0, form_field_sel: 0, form_values: map{}, source: ["No source loaded."], inspect: ["No inspector details loaded."], render_img: nil, render_path: "", render_lines: ["Host mode: switch security to Trusted or JS/DOM, enter a URL, click Host. Needs --allow-exec and chromium/google-chrome/brave/firefox."], lines: ["pblang browser - type a URL + Enter to load. Up/Down scroll."] },
         diagnostics: [],
         diag_index: 0 - 1,
@@ -6624,10 +7449,13 @@ fn main() {
     };
     gfx.run(win, state,
         fn(s, events) {
+            _maybe_probe_window(s);
+            if len(events) > 0 { _debug_event("events=" + str(len(events))); }
             let i = 0;
             while i < len(events) {
                 let e = events[i];
                 if e.type == "keydown" {
+                    _record_input_event(s, "keydown " + str(try e.key catch "?"));
                     s.redraw = true;            // any keypress means the view may have changed
                     _apply_event_modifiers(s, e);
                     if e.key == "F1" { s.help = not s.help; }                          // toggle the shortcuts overlay
@@ -6646,6 +7474,8 @@ fn main() {
                     else if s.alt and e.key == "Right" { _nav_forward(s); }
                     else if s.ctrl and e.key == "G" { _open_goto_line(s); }
                     else if s.ctrl and e.key == "P" { _open_command_palette(s); }
+                    else if s.ctrl and s.panel != "files" and (e.key == "Minus" or e.key == "NumpadSubtract" or e.key == "-") { _density_delta(s, 0 - 1); }
+                    else if s.ctrl and s.panel != "files" and (e.key == "Equals" or e.key == "Plus" or e.key == "NumpadAdd" or e.key == "=" or e.key == "+") { _density_delta(s, 1); }
                     else if s.ctrl and _panel_shortcut(s, e.key) { }
                     else if s.ctrl and s.shift and e.key == "Tab" { _panel_step(s, 0 - 1); }
                     else if s.ctrl and (e.key == "Tab" or e.key == "PageDown") { _panel_step(s, 1); }
@@ -6677,15 +7507,47 @@ fn main() {
                     else if s.panel == "code" { let st = _key(s, e.key); if st != "" { s.output = st; } }
                 }
                 if e.type == "keyup" {
+                    _record_input_event(s, "keyup " + str(try e.key catch "?"));
                     _apply_event_modifiers(s, e);
                     if K.is_shift(e.key) { s.shift = false; }
                     if K.is_ctrl(e.key) { s.ctrl = false; }
                     if K.is_alt(e.key) { s.alt = false; }
                     if K.is_meta(e.key) { s.meta = false; }
                 }
+                if e.type == "resize" {
+                    let nw = try e.w catch try s.winsz.w catch 0;
+                    let nh = try e.h catch try s.winsz.h catch 0;
+                    if nw > 0 and nh > 0 {
+                        s.live_winsz = map{ w: nw, h: nh };
+                        s.window_size = s.live_winsz;
+                        _apply_display_event(s, e);
+                        s.viewport_layout = _viewport_layout_for(s.live_winsz);
+                        _apply_toolbar_metrics(s.live_winsz);
+                        _apply_live_density(s, _density_basis_for_state(s, s.live_winsz));
+                        _record_input_event(s, "resize " + str(nw) + "x" + str(nh));
+                        s.redraw = true;
+                    }
+                }
+                // LIVE cross-screen autoscale: the SDL2 backend reports window moves with
+                // the size of the display under the window, so density updates the moment
+                // the window is dragged onto another monitor — no shell probe, no delay.
+                if e.type == "moved" {
+                    if _apply_display_event(s, e) {
+                        _apply_live_density(s, _density_basis_for_state(s, try s.live_winsz catch s.winsz));
+                        s.viewport_layout = _viewport_layout_for(try s.live_winsz catch map{ w: 1280, h: 760 });
+                        _record_input_event(s, "moved to display " + str(try s.display_winsz.w catch "?") + "x" + str(try s.display_winsz.h catch "?"));
+                        s.redraw = true;
+                    }
+                }
                 // mousedown carries no coords (like gui.sapp) — use the tracked cursor.
                 if e.type == "mousemove" {
+                    if _debug_events_enabled() { _record_input_event(s, "mousemove " + str(try e.x catch "?") + "," + str(try e.y catch "?")); }
                     s.mx = e.x; s.my = e.y;
+                    // hover feedback: highlight the toolbar button under the cursor (redraw
+                    // only when the hovered target changes, so idle mouse motion stays free)
+                    let hov = nil;
+                    if e.y < TBH + CH { hov = _toolbar_hit(e.x, e.y, s.winsz); }
+                    if hov != (try s.hover_tab catch nil) { s.hover_tab = hov; s.redraw = true; }
                     if s.split_drag {
                         _resize_output_pane(s, e.x);
                         s.redraw = true;
@@ -6705,6 +7567,7 @@ fn main() {
                     // stale tracked position is what made tab clicks land on random tabs.
                     let dx = try e.x catch s.mx;
                     let dy = try e.y catch s.my;
+                    _record_input_event(s, "mousedown " + str(dx) + "," + str(dy) + " button=" + str(try e.button catch "?"));
                     s.mx = dx; s.my = dy;
                     _ui_event(s, "mouse " + str(dx) + "," + str(dy) + " panel=" + str(s.panel));
                     let captured = false;
@@ -6716,7 +7579,7 @@ fn main() {
                     if captured { s.redraw = true; }
                     else {
                     let tab = _toolbar_hit(dx, dy, s.winsz);
-                    if tab != nil { _toolbar_click(s, tab); s.redraw = true; }         // web-style toolbar action
+                    if tab != nil { _record_input_event(s, "toolbar " + str(tab)); _toolbar_click(s, tab); s.redraw = true; }         // web-style toolbar action
                     else if _splitter_hit(s, dx, dy) {
                         s.split_drag = true;
                         _resize_output_pane(s, dx);
@@ -6739,13 +7602,35 @@ fn main() {
                     }
                     }
                 }
-                if e.type == "mouseup" { s.mdown = false; s.split_drag = false; s.design.drag = false; }
+                if e.type == "mouseup" {
+                    _record_input_event(s, "mouseup " + str(try e.x catch "?") + "," + str(try e.y catch "?"));
+                    s.mdown = false; s.split_drag = false; s.design.drag = false; s.redraw = true;
+                }
                 i = i + 1;
             }
         },
         // Only repaint when something changed (idle frames are nearly free). The first
-        // frame draws because redraw starts true.
-        fn(s, w) { if s.redraw { _draw(s, w); s.redraw = false; } },
-        20);
+        // frame draws because redraw starts true. A low-rate idle redraw keeps live
+        // density/window-probe changes visible even when the backend misses a resize
+        // event; PBIDE_IDLE_REDRAW_MS=0 disables it.
+        fn(s, w) {
+            let now = try now_ms() catch 0;
+            let idle = _idle_redraw_interval_ms();
+            let last = try s.last_present_ms catch 0;
+            if not s.redraw and idle > 0 {
+                if last == 0 or now == 0 or now - last >= idle { s.redraw = true; }
+            }
+            if s.redraw {
+                _draw(s, w);
+                s.redraw = false;
+                s.last_present_ms = now;
+                return true;
+            }
+            return false;
+        },
+        // 60 Hz event loop: input latency drops from ~50ms (20fps) to ~16ms so clicks,
+        // hover, and typing feel immediate. Idle frames skip present (drawFn returns
+        // false), so the higher rate costs almost nothing when nothing changes.
+        60);
 }
 main();

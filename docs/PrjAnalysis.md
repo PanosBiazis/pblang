@@ -1,4 +1,4 @@
-# pblang — Project Quality Analysis (2026-05-24, current through 2026-06-15)
+# pblang — Project Quality Analysis (2026-05-24, current through 2026-06-29)
 
 > This document combines a **comprehensive quality audit** (top half, this section)
 > with a **validation baseline / fix log** (bottom half, preserved from earlier
@@ -7,7 +7,7 @@
 > into `src/cli/*`, and the polyglot bridge expansion to 47 host languages +
 > cached cdylib loader.
 >
-> **Current status (2026-06-15):** §§19–45 below document the self-hosting
+> **Current status (2026-06-29):** §§19–45 below document the self-hosting
 > milestone: the pblang-written compiler tokenizes, parses, compiles, and runs
 > pblang end-to-end. Later sections through §152 capture the June follow-up work:
 > AI/http/ONNX doc sync, hardware inventory hardening, middleware API cleanup,
@@ -33,13 +33,68 @@
 > `stdlib:serialization.sapp` safer multi-format conversion helpers, and
 > `stdlib:template.sapp` safer loops/filters/missing-variable checks, and
 > `stdlib:validate.sapp` nested schemas/defaults/strict validation, and
-> `stdlib:config.sapp` layered typed configuration validation.
+> `stdlib:config.sapp` layered typed configuration validation. Later native IDE
+> work in `docs/PB_IDE.md` adds browser/security management, document/media
+> preview contracts, History storage, browser-data management, editable Files
+> root labels/groups, pblang-native browser hit targets, Crystal default chrome,
+> compact responsive density, pblang-owned density controls, tested shared
+> panel metrics, optional pblang live window and monitor probing, responsive
+> toolbar spacing, renderer backend profile/status reporting, status-visible
+> input-event diagnostics, and low-rate idle repainting for live resize/density
+> refresh without returning to constant framebuffer blitting.
 > Historical snapshots are preserved in place; prefer the newest numbered
 > section when a metric or capability appears in multiple places.
 
 ---
 
 # Part 1 — Comprehensive Quality Audit
+
+## Current native IDE addendum (2026-06-28)
+
+The native PBIDE line has moved beyond the older placeholder notes in the
+historical sections. The current source has real pblang-native panels for Code,
+Terminal, Designer, AI, Browser, Files, Outline, Problems, History, and
+Management. The latest passes closed the explicit Files-root metadata gap,
+added History delete controls, replaced the database placeholder with tested
+planning/execution-gate metadata, added a real Designer inspector/component
+library surface, and replaced plain document/media placeholder text with tested
+asset backend readiness/action-plan contracts:
+
+| Area | Current state |
+|---|---|
+| Files roots | Root bookmarks persist in the existing HOME-scoped roots file. Editable labels/groups are stored as compatible `#meta|...` comment records, so older root parsing still works. |
+| History | Delete Selected and Clear All are visible controls; selected deletion removes the original snapshot even when the list is filtered. |
+| Databases | Profiles, status summaries, and backup/restore/migration action plans are testable and explicitly non-executable until connection, confirmation, backup, and path gates are attached. |
+| Document/media backends | Current-file asset backend status/action plans now distinguish ready text/code/table paths from planned native decoder/export/player paths for document, PDF, image, audio, and video assets. |
+| Browser layout/interactivity | `stdlib/browser.sapp` now exposes a tested `pblang-native-flow` layout model with x/y/w/h boxes, wrapped text lines, image/link/form placeholders, hit detection, and a native-interaction summary. PBIDE Live mode draws from that layout, lets users click links/forms/images through the existing safety gates, and displays the no-full-JS/DOM-yet boundary directly in the Browser header. |
+| Designer | Selected-widget properties are exposed as structured fields, reusable component presets can be filtered/listed/inserted, and PBIDE renders the inspector plus component suggestions directly under the canvas. |
+| Native UI | The Files header/status now uses edited labels/groups and marks edited roots with `*`. The visible PBIDE chrome now has tested `pbide.visual.tokens.v1`, `pbide.visual.chrome.v1`, `pbide.responsive.density.v1`, `pbide.viewport.layout.v1`, and `pbide.panel.metrics.v1` design-system contracts, refreshed light/dark palettes, Crystal default styling, a modern brand rail, clearer focus accents, cleaner active-tab/action-button treatment, opaque carded Code side-pane sections that replace legacy flat layers, coherent status/input/modal chrome, compact 1080p/1440p default density, 4K-class `2x` scaling, shared responsive metrics for History/Management/Files/Outline/Problems panels, width-aware toolbar brand/action spacing, two-row toolbar fallback when actions and tabs cannot fit, dynamic button widths for runtime labels, padded hit zones for toolbar/browser/history controls, visible scrollbars in list/browser panels, taller default window geometry, and an optional pblang-only X11 window+monitor probe for live OS window-size and display-scale changes. Probe subprocesses are timeout-bounded, and the heavier monitor probe is separately gated by `PBIDE_MONITOR_PROBE` / `PBIDE_MONITOR_PROBE_MS` so missing or slow WM tools cannot stall the IDE event loop. `PBIDE_DEBUG_EVENTS=1` now exposes event state both in the wide status chip and in the main status text fallback, low-rate idle repainting keeps live density/resize changes visible without constant full-speed redraw, and draw-time watcher refresh is throttled so idle repaint does less editor-buffer work. |
+| Graphics/GPU | Current PBIDE graphics are rasterized in pblang into a framebuffer by default (`minifb`). The optional SDL2 backend presents that CPU buffer through a GPU-backed texture/canvas when built with the feature and run with `PBLANG_GFX=sdl2`; `PBLANG_GFX_SOFTWARE=1` forces SDL2 software present for comparison. `stdlib/graphics.sapp` now exposes the tested `pblang.graphics.backend.profile.v1` / `backend_status()` contract, PBIDE shows the renderer path in the wide status chip, and `graphics.run(...)` still skips `present()` when draw returns `false`; PBIDE combines immediate redraw after changes with a low-rate idle repaint for live resize/density visibility. |
+| Launcher | `editors/ide/run.sh` and `run.bat` now prefer the workspace binary (`target/debug/pblang`, then `target/release/pblang`) before `PATH`, and print the selected runtime. This prevents a newer PBIDE script from being run by an older installed graphics/input runtime, which can make clicks and scaling appear broken. The Linux launcher no longer sets `PBIDE_SCALE` from `xrandr`, so PBIDE's pblang-owned live density can respond to window/display changes unless the user explicitly overrides it. `PBLANG_BIN` remains an explicit override, and `PBIDE_DEBUG_EVENTS=1` records key/mouse batches to `/tmp/pbide-events.log` while also showing live input status inside PBIDE for input-path diagnosis. |
+| Commands | `files_root_label` labels the current root from the Files filter text; `files_root_group_next` cycles the current root group; `history_delete_selected` removes the selected snapshot; `design_component_library` lists reusable Designer components; `design_component_insert` applies the selected reusable component preset to the canvas; `density_smaller`, `density_larger`, `density_auto`, and `density_refresh` adjust, reset, or refresh native UI density without leaving pblang. |
+| Verification | `ide_features_test.sapp` covers metadata set/get, serialization, parsed metadata, status text, history deletion, database action gates, asset backend status/action-plan contracts, Designer property/component helpers, component preset insertion contracts, visual-token/chrome/density/viewport/panel-metrics contracts, and command-catalog discoverability. `graphics_helpers_test.sapp` covers the renderer backend profile/status contract used by PBIDE. |
+
+Remaining high-value native IDE gaps are no longer root metadata, Designer
+component insertion, unstructured document/media backend placeholders, a raw
+block-only browser Live view, or non-interactive Live browser cards. The most
+important open areas are real native document/media decoder/export/player
+implementations behind the new backend contracts, real database executors behind
+the existing gates, and a deeper pblang-native browser engine for CSS cascade,
+flex/grid, SVG/canvas painting, DOM mutation, and JavaScript beyond the safe
+flow-layout/hit-target reader model. True full live screen-move autoscale is
+still bounded by what the graphics backend reports to pblang, but PBIDE now has
+a pblang-only fallback: when `stdlib/window_probe.sapp` can find
+`xwininfo`/`xdotool`, it reads the live OS window size at a throttled interval
+and stores it separately from the fixed framebuffer size. Density and viewport
+metadata use that live size; drawing continues to target the real framebuffer
+for safety. `PBIDE_WINDOW_PROBE=0` disables the probe and
+`PBIDE_WINDOW_PROBE_MS` tunes the interval.
+
+Current graphics note: the local `target/debug/pblang` build inspected on
+2026-06-29 did not link SDL2/OpenGL/Vulkan and `PBLANG_GFX` was unset, so PBIDE
+was on the default `minifb` CPU framebuffer path. GPU compute exists separately
+for tensor matmul behind the `gpu` feature plus `PBLANG_GPU=1`; it does not make
+PBIDE drawing GPU-accelerated.
 
 ## 1. Project at a glance
 
@@ -3874,6 +3929,208 @@ pblang run tests/semantics/http_server_security_test.sapp --allow-all
 
 Result: both focused semantic tests passed (`selfhost_parse_safe_pass`,
 `http_server_security_pass`).
+
+## 165. Native IDE/graphics category: anti-aliased text renderer (2026-07-01)
+
+This pass removes the biggest honest PBIDE visual limitation: the native IDE is
+no longer forced to draw all editor text through a 5x7 bitmap font. The graphics
+crate now has a real TrueType/OpenType rasterization path and PBIDE uses it by
+default while preserving the old bitmap path for fallback/debugging.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Native anti-aliased text | **ADDED** | `pblang-graphics` now exposes `gfxdrawtextaa(...)`, backed by `fontdue`, and alpha-blends glyph coverage into the framebuffer. |
+| pblang stdlib wrapper | **ADDED** | `stdlib:graphics.sapp` exposes `draw_text_aa(...)`, `text_profile()`, and `Window.textAA(...)`. |
+| PBIDE integration | **ADDED** | PBIDE `_dt(...)` now uses smooth fixed-advance text by default, preserving existing cursor/hit-test/layout math. |
+| Fallback controls | **ADDED** | `PBIDE_TEXT_RENDER=bitmap` restores the old bitmap path; `PBIDE_FONT` / `PBLANG_FONT` can select a specific TTF/OTF font. |
+| SDL2/GPU-present compatibility | **VERIFIED** | The SDL2 backend compiles with the same text renderer, so `PBLANG_GFX=sdl2` can still use GPU-assisted present. |
+| Regression coverage | **EXPANDED** | `graphics_enrich_test.sapp` locks the text renderer profile/fallback contract. |
+
+Follow-up pblang-only text layout work added `stdlib:text_layout.sapp`, so the
+first shaping layer is no longer a Rust/backend concern. It handles combining
+clusters, ZWJ emoji clusters, first-strong base direction, simple RTL visual
+runs, padded code ligatures, and emoji variation cleanup before PBIDE calls
+`Window.textAA(...)` or the bitmap fallback. Remaining honest boundary:
+HarfBuzz-class script shaping, font fallback stacks, and color-font emoji
+painting are still future renderer parity work.
+
+Verification:
+
+```sh
+cargo check -p pblang-graphics
+cargo build -p pblang
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang --check --via-pblang stdlib/text_layout.sapp
+./target/debug/pblang run tests/semantics/text_layout_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/graphics_enrich_test.sapp --allow-all
+./target/debug/pblang test tests/semantics --filter ide --allow-all --quiet --jobs smart
+cargo check -p pblang-graphics --features sdl2
+```
+
+Result: all focused checks passed. The build emitted only existing warning-class
+output, including external-HDD incremental-cache hardlink warnings.
+
+Note: a later grouped `--filter ide` wrapper invocation was stopped after it
+stalled without additional output in this dirty external-HDD workspace. The
+direct semantic checks for the changed surfaces passed: `text_layout_pass`,
+`pbide_ui_pass`, `ide_features_pass`, `graphics_enrich_pass`,
+`unicode_characters_pass`, and the PBIDE self-hosted check.
+
+## 166. Native IDE interaction/polish category: faster text shaping and larger hit targets (2026-07-01)
+
+This pass keeps the PBIDE redesign moving in pblang code and targets the two
+practical UX problems reported after the visual refresh: buttons feeling hard to
+click and the interface doing too much repeated text work while drawing.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Text-shape cache | **ADDED** | PBIDE now caches the `stdlib:text_layout.sapp` visual text result for repeated labels/status lines before calling `Window.textAA(...)` or the bitmap fallback. The cache is bounded and resets when full, avoiding unbounded growth. |
+| Click target padding | **IMPROVED** | Toolbar, browser-header, and History action hit-tests now use a density-aware `_hit_slop()` instead of raw `PAD`, making small buttons easier to activate without changing their visible layout. |
+| Toolbar packing | **IMPROVED** | Compact windows use a smaller action gap before wrapping, so controls remain visible for longer and avoid the faded/hidden-button feel. |
+| Button chrome | **IMPROVED** | Toolbar actions and panel tabs now share a raised crystal button surface with border, fill, highlight, and active-state treatment. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/text_layout_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/graphics_enrich_test.sapp --allow-all
+```
+
+Result: all focused checks passed.
+
+## 167. Native IDE visual consistency category: shared chrome for Browser/Designer/History (2026-07-02)
+
+This pass continued the PBIDE redesign in pblang-only code. The goal was not to
+add another feature panel; it was to make the existing IDE feel more coherent,
+clickable, and modern across the panels the user interacts with most.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Shared button drawing | **EXPANDED** | Added `_button_label(...)` on top of the existing raised `_button_face(...)` chrome so repeated controls can share the same crystal button treatment. |
+| Browser controls | **IMPROVED** | Back, Reload, Live/Reader/Links/Forms/Source/Inspect/Host, security mode, Tor, and URL field now use the same raised native button/input chrome instead of flat rectangles. |
+| Designer palette | **IMPROVED** | Palette actions and app/layout/tool buttons now use the same raised button treatment, improving visual parity with the toolbar. |
+| History actions | **IMPROVED** | Delete Selected and Clear All moved to the shared button treatment while keeping the earlier larger hit target. |
+| Browser Live blocks | **IMPROVED** | Native Live page blocks now render as carded blocks with border/elevation instead of flat fills, making the browser panel fit the new PBIDE style. |
+| Panel scrollbars | **IMPROVED** | List/browser panel scrollbars are thicker and rounded at compact density, so they are visible without stealing meaningful content width. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/browser_native_ide_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_designer_codegen_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+```
+
+Result: all focused checks passed.
+
+## 168. Native IDE scrollbar/rendering gap cleanup (2026-07-02)
+
+This pass fixed one remaining visual inconsistency from the PBIDE redesign and
+cleaned a stale documentation gap.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Editor scrollbar | **IMPROVED** | The Code editor scrollbar now uses the same `_scrollbar_thickness()` helper and rounded track/thumb treatment as list/browser panels, instead of the older ultra-thin strip. |
+| Scrollbar sizing | **SIMPLIFIED** | Shared scrollbar thickness is centralized in pblang, so editor/list/browser surfaces stay visually consistent across density changes. |
+| Rendering gap docs | **FIXED** | `docs/PB_IDE.md` no longer claims anti-aliased/non-pixelated text is missing. It now records the implemented `graphics.textAA` + `stdlib:text_layout.sapp` path and lists the real remaining gaps: complex shaping, font fallback, CJK coverage, complex bidi, and color emoji. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+```
+
+## 169. Native IDE Browser responsive header contract (2026-07-02)
+
+This pass closed another PBIDE responsive-layout gap: the Browser header used
+fixed pixel/cell positions for Back/Reload, mode buttons, security, Tor, status,
+and URL entry. That worked on wide compact windows but could crowd or overflow on
+narrow/manual-scaled layouts.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Browser header layout helper | **ADDED** | `stdlib:ide_features.sapp` now exposes `browser_header_layout(...)`, returning full or compact button geometry for the native Browser header. |
+| Compact Browser labels | **ADDED** | Narrow/manual-scaled windows compact labels and widths (`Reader` -> `Read`, `Live` -> `Lv`, etc.) instead of letting controls overflow. |
+| Draw/hit-test sync | **FIXED** | PBIDE Browser drawing and click handling now both use the same tested layout helper, so visible buttons and hit targets stay aligned. |
+| Status reserve | **IMPROVED** | Compact Browser mode gives space back to controls/URL instead of reserving an unreachable right-side status label. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/browser_native_ide_test.sapp --allow-all
+```
+
+Result: all focused checks passed.
+
+## 170. Native IDE clickability-only pass: bigger invisible hit targets (2026-07-03)
+
+This pass intentionally did not change the visual design. It increases forgiving
+click areas for controls that still used exact row/rectangle math.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Base hit padding | **IMPROVED** | `_hit_slop()` now gives compact-density controls a slightly larger invisible target without resizing the drawn buttons. |
+| Code side-pane actions | **IMPROVED** | Diagnostics, watcher action, and UI observer blocks tolerate near-edge clicks. |
+| Designer/AI controls | **IMPROVED** | Designer palette chips and AI quick-action chips now use padded hit rectangles. |
+| Modals | **IMPROVED** | Examples, Command Palette, and Quick Open accept near-border clicks around the modal body. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+```
+
+Result: all focused checks passed.
+
+## 161. Native IDE examples: larger catalog and scrollable picker (2026-07-03)
+
+This pass expands the native PBIDE starter catalog and removes the old practical
+limit where the Examples picker only exposed the first visible rows.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Example catalog | **EXPANDED** | Added runnable examples for functions/returns, indexed loops, nested maps, array building, text processing, FizzBuzz-style branching, and array-of-map table rows. |
+| Examples picker | **IMPROVED** | The picker keeps the full filtered result set, computes visible rows from the modal size, uses selection-aware list offsets, and draws a right-side scrollbar when the catalog exceeds the visible rows. |
+| Mouse selection | **FIXED** | Clicks inside the scrolled list resolve through the current scroll offset, so selecting rows after PageUp/PageDown or keyboard movement loads the intended example. |
+| Regression coverage | **EXPANDED** | `pbide_examples_test.sapp` now runs the larger embedded example set through the same self-hosted frontend used by F5. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/pbide_examples_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+git diff --check -- editors/ide/pbide.sapp tests/semantics/pbide_examples_test.sapp docs/PB_IDE.md docs/IDE_MANUAL.md docs/PrjAnalysis.md
+```
+
+Result: focused PBIDE checks passed.
 
 ## 160. LLM training category: parallel sharded LM-head training (2026-06-15)
 

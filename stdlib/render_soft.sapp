@@ -1,0 +1,158 @@
+// stdlib/render_soft.sapp — a software renderer written ENTIRELY in pblang.
+//
+// WHY: the native graphics builtins rasterize on a SINGLE CPU core, so a big repaint pegs
+// one core while the rest sit idle (and the GPU can't help — GPU rasterization needs a
+// native driver backend, which pure pblang can't emit). This module is the honest
+// pure-pblang answer to "use the resources properly": it rasterizes a framebuffer across
+// ALL CPU cores by splitting the frame into horizontal BANDS and rendering one band per core
+// (via stdlib/parallel.sapp = OS threads), then stitching the bands. The parallel result is
+// pixel-identical to the sequential one.
+//
+// It renders OFFSCREEN (a pblang pixel array, ARGB ints) — useful for headless rendering,
+// image export (to_ppm), and tiling work. Putting it on screen needs either per-pixel
+// gfxpoint calls or a future "present this buffer" builtin; that boundary is native.
+//
+//   let RS = import("stdlib/render_soft.sapp");
+//   let rects = [[0,0,W,H,bg],[10,5,20,30,color], ...];   // painter's order
+//   let fb = RS.render(W, H, bg, rects);                   // all cores
+//   fs_write("out.ppm", RS.to_ppm(fb));
+
+let P = import("stdlib:parallel.sapp");
+let OS = import("stdlib:os.sapp");
+
+// ── framebuffer (single-core primitives) ────────────────────────────────────────────
+// fb = map{ w, h, px: [int...] } where px is row-major ARGB (or any int color).
+fn fb_new(w, h, bg) {
+    let px = [];
+    let n = w * h;
+    let i = 0;
+    while i < n { array_push(px, bg); i = i + 1; }
+    return map{ w: w, h: h, px: px };
+}
+
+fn get(fb, x, y) { return fb.px[y * fb.w + x]; }
+fn set(fb, x, y, c) { fb.px[y * fb.w + x] = c; return fb; }
+
+// fill_rect(fb, x, y, w, h, color) — paint a rectangle, clipped to the framebuffer. The
+// right/bottom edges are exclusive (x..x+w, y..y+h).
+fn fill_rect(fb, x, y, w, h, color) {
+    let x0 = x; let y0 = y; let x1 = x + w; let y1 = y + h;
+    if x0 < 0 { x0 = 0; } if y0 < 0 { y0 = 0; }
+    if x1 > fb.w { x1 = fb.w; } if y1 > fb.h { y1 = fb.h; }
+    let yy = y0;
+    while yy < y1 {
+        let row = yy * fb.w;
+        let xx = x0;
+        while xx < x1 { fb.px[row + xx] = color; xx = xx + 1; }
+        yy = yy + 1;
+    }
+    return fb;
+}
+
+// ── sequential reference renderer ───────────────────────────────────────────────────
+// render_seq(w, h, bg, rects) — clear to bg, then paint each [x,y,w,h,color] in order.
+fn render_seq(w, h, bg, rects) {
+    let fb = fb_new(w, h, bg);
+    let i = 0;
+    while i < len(rects) {
+        let r = rects[i];
+        fill_rect(fb, r[0], r[1], r[2], r[3], r[4]);
+        i = i + 1;
+    }
+    return fb;
+}
+
+// ── parallel tiled renderer (uses every core) ───────────────────────────────────────
+// render_tiles(w, h, bg, rects, ncores) — split the frame into `ncores` horizontal bands,
+// render each band on its own thread, then stitch. Pixel-identical to render_seq.
+//
+// par_map workers see ONLY their argument + builtins (no upvalues, no imported fns), so each
+// band's element is fully SELF-CONTAINED: it carries w, the band's row range, bg, and the
+// flat draw list, and the worker INLINES the clip+fill math. It returns the band's pixels.
+fn render_tiles(w, h, bg, rects, ncores) {
+    if ncores < 1 { ncores = 1; }
+    if ncores > h { ncores = h; }
+    if ncores < 1 { ncores = 1; }
+    let rows_per = num_floor((h + ncores - 1) / ncores);   // ceil(h/ncores)
+
+    // build one self-contained job per band
+    let jobs = [];
+    let b = 0;
+    while b < ncores {
+        let y0 = b * rows_per;
+        let y1 = y0 + rows_per;
+        if y1 > h { y1 = h; }
+        if y0 < h {
+            array_push(jobs, map{ w: w, y0: y0, y1: y1, bg: bg, rects: rects });
+        }
+        b = b + 1;
+    }
+
+    // render every band in parallel — worker is closed over nothing.
+    let bands = P.par_map(jobs, fn(job) {
+        let w = job.w; let y0 = job.y0; let y1 = job.y1; let bg = job.bg; let rects = job.rects;
+        let px = [];
+        let count = (y1 - y0) * w;
+        let i = 0;
+        while i < count { array_push(px, bg); i = i + 1; }
+        let ri = 0;
+        while ri < len(rects) {
+            let r = rects[ri];
+            let rx0 = r[0]; let ry0 = r[1]; let rx1 = r[0] + r[2]; let ry1 = r[1] + r[3]; let col = r[4];
+            if rx0 < 0 { rx0 = 0; }
+            if rx1 > w { rx1 = w; }
+            // clip the rect's rows to THIS band
+            let yy = ry0; if yy < y0 { yy = y0; }
+            let yend = ry1; if yend > y1 { yend = y1; }
+            while yy < yend {
+                let base = (yy - y0) * w;
+                let xx = rx0;
+                while xx < rx1 { px[base + xx] = col; xx = xx + 1; }
+                yy = yy + 1;
+            }
+            ri = ri + 1;
+        }
+        return map{ y0: y0, w: w, px: px };
+    });
+
+    // stitch bands back into one framebuffer (bands come back in input order)
+    let out = [];
+    let total = w * h;
+    let k = 0;
+    while k < total { array_push(out, bg); k = k + 1; }
+    let bi = 0;
+    while bi < len(bands) {
+        let band = bands[bi];
+        let off = band.y0 * w;
+        let p = 0;
+        while p < len(band.px) { out[off + p] = band.px[p]; p = p + 1; }
+        bi = bi + 1;
+    }
+    return map{ w: w, h: h, px: out };
+}
+
+// render(w, h, bg, rects) — convenience: tiled render across ALL detected cores.
+fn render(w, h, bg, rects) {
+    let cores = try OS.cpu_count() catch 1;
+    return render_tiles(w, h, bg, rects, cores);
+}
+
+// ── export ──────────────────────────────────────────────────────────────────────────
+// to_ppm(fb) — a portable-pixmap (P3 ascii) image so the offscreen render is a real,
+// viewable file. Treats each int as 0xRRGGBB (low 24 bits).
+fn to_ppm(fb) {
+    let out = "P3\n" + str(fb.w) + " " + str(fb.h) + "\n255\n";
+    let i = 0;
+    let n = fb.w * fb.h;
+    while i < n {
+        let c = fb.px[i];
+        let r = num_floor(c / 65536) - num_floor(c / 16777216) * 256;
+        let g = num_floor(c / 256) - num_floor(c / 65536) * 256;
+        let b = c - num_floor(c / 256) * 256;
+        out = out + str(r) + " " + str(g) + " " + str(b) + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+export fb_new, get, set, fill_rect, render_seq, render_tiles, render, to_ppm;

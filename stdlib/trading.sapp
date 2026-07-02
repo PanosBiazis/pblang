@@ -1,0 +1,365 @@
+// stdlib/trading.sapp — pure market-data toolkit (pblang-native, offline).
+//
+// Indicators (SMA/EMA/RSI/Bollinger), tick→OHLCV candle aggregation, risk-based
+// position sizing, drawdown, and validated PAPER order plans. HONEST BOUNDARY:
+// everything here is deterministic math over caller-supplied data — no broker
+// connection, no network, no execution. An order "plan" is a data structure a
+// separate, explicitly-permissioned integration would submit.
+//
+//   let T = import("stdlib:trading.sapp");
+//   let rsi = T.rsi(closes, 14);
+//   let qty = T.position_size(equity, 0.01, entry, stop);
+//   let plan = T.order_plan("AAPL", "buy", qty, "limit", 189.50);
+
+fn _abs(x) { if x < 0 { return 0 - x; } return x; }
+
+// sma(values, k) — simple moving average; same length as input, nil during warmup.
+fn sma(values, k) {
+    let out = [];
+    let sum = 0;
+    let i = 0;
+    while i < len(values) {
+        sum = sum + values[i];
+        if i >= k { sum = sum - values[i - k]; }
+        if i >= k - 1 { array_push(out, sum / k); } else { array_push(out, nil); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ema(values, k) — exponential moving average seeded with the k-SMA; multiplier 2/(k+1).
+fn ema(values, k) {
+    let out = [];
+    let mult = 2 / (k + 1);
+    let seed = sma(values, k);
+    let prev = nil;
+    let i = 0;
+    while i < len(values) {
+        if i < k - 1 { array_push(out, nil); }
+        else if i == k - 1 { prev = seed[i]; array_push(out, prev); }
+        else { prev = prev + (values[i] - prev) * mult; array_push(out, prev); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// rsi(values, k) — Wilder's Relative Strength Index (0..100); nil during warmup.
+// One-way series saturate: all gains -> 100, all losses -> 0.
+fn rsi(values, k) {
+    let out = [nil];
+    let avgain = 0;
+    let avloss = 0;
+    let i = 1;
+    while i < len(values) {
+        let ch = values[i] - values[i - 1];
+        let gain = 0; let loss = 0;
+        if ch > 0 { gain = ch; } else { loss = 0 - ch; }
+        if i <= k {
+            avgain = avgain + gain / k;
+            avloss = avloss + loss / k;
+        } else {
+            avgain = (avgain * (k - 1) + gain) / k;
+            avloss = (avloss * (k - 1) + loss) / k;
+        }
+        if i < k { array_push(out, nil); }
+        else if avloss == 0 and avgain == 0 { array_push(out, 50); }
+        else if avloss == 0 { array_push(out, 100); }
+        else { array_push(out, 100 - 100 / (1 + avgain / avloss)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _window_stddev(values, endi, k, mean) {
+    let s = 0;
+    let j = endi - k + 1;
+    while j <= endi { let d = values[j] - mean; s = s + d * d; j = j + 1; }
+    return num_sqrt(s / k);
+}
+
+// bollinger(values, k, mult) — {middle, upper, lower} bands (middle = k-SMA,
+// upper/lower = middle ± mult * window stddev); nil during warmup.
+fn bollinger(values, k, mult) {
+    let middle = sma(values, k);
+    let upper = [];
+    let lower = [];
+    let i = 0;
+    while i < len(values) {
+        if middle[i] == nil { array_push(upper, nil); array_push(lower, nil); }
+        else {
+            let sd = _window_stddev(values, i, k, middle[i]);
+            array_push(upper, middle[i] + mult * sd);
+            array_push(lower, middle[i] - mult * sd);
+        }
+        i = i + 1;
+    }
+    return map{ middle: middle, upper: upper, lower: lower };
+}
+
+// _ema_aligned(series, k) — EMA over a series that may have leading nils (like a MACD
+// line): compute EMA on the compact non-nil values, then realign to the original indices.
+fn _ema_aligned(series, k) {
+    let compact = [];
+    let idxmap = [];
+    let i = 0;
+    while i < len(series) {
+        if series[i] != nil { array_push(compact, series[i]); array_push(idxmap, i); }
+        i = i + 1;
+    }
+    let ce = ema(compact, k);
+    let out = [];
+    let j = 0;
+    while j < len(series) { array_push(out, nil); j = j + 1; }
+    let c = 0;
+    while c < len(compact) { out[idxmap[c]] = ce[c]; c = c + 1; }
+    return out;
+}
+
+// macd(values, fast, slow, signal_period) — {macd, signal, histogram}. macd line =
+// EMA(fast) - EMA(slow); signal = EMA(signal_period) of the macd line; histogram =
+// macd - signal. Each series is input-length with nils during warmup.
+fn macd(values, fast, slow, signal_period) {
+    let ef = ema(values, fast);
+    let es = ema(values, slow);
+    let line = [];
+    let i = 0;
+    while i < len(values) {
+        if ef[i] != nil and es[i] != nil { array_push(line, ef[i] - es[i]); }
+        else { array_push(line, nil); }
+        i = i + 1;
+    }
+    let sig = _ema_aligned(line, signal_period);
+    let hist = [];
+    let j = 0;
+    while j < len(values) {
+        if line[j] != nil and sig[j] != nil { array_push(hist, line[j] - sig[j]); }
+        else { array_push(hist, nil); }
+        j = j + 1;
+    }
+    return map{ macd: line, signal: sig, histogram: hist };
+}
+
+// atr(ohlc, k) — Average True Range over {high, low, close} candles. True range =
+// max(high-low, |high-prevclose|, |low-prevclose|); ATR = k-SMA of TR (nil warmup).
+fn atr(ohlc, k) {
+    let tr = [];
+    let i = 0;
+    while i < len(ohlc) {
+        let c = ohlc[i];
+        if i == 0 { array_push(tr, c.high - c.low); }
+        else {
+            let pc = ohlc[i - 1].close;
+            let a = c.high - c.low;
+            let b = _abs(c.high - pc);
+            let d = _abs(c.low - pc);
+            let m = a; if b > m { m = b; } if d > m { m = d; }
+            array_push(tr, m);
+        }
+        i = i + 1;
+    }
+    return sma(tr, k);
+}
+
+// backtest(prices, signal_fn, capital) — a simple long/flat, all-in equity simulation.
+// signal_fn(i, price) returns "long" (fully invested) or "flat" (all cash). Returns
+// {equity (per-bar portfolio value), final, trades (entries), max_drawdown}. No shorting,
+// no leverage, no commission — a clean baseline to feed pbai evaluate/calibrate.
+fn backtest(prices, signal_fn, capital) {
+    let cash = capital;
+    let shares = 0;
+    let long = false;
+    let trades = 0;
+    let equity = [];
+    let i = 0;
+    while i < len(prices) {
+        let px = prices[i];
+        let sig = try signal_fn(i, px) catch "flat";
+        if sig == "long" and not long {
+            shares = cash / px;
+            cash = 0;
+            long = true;
+            trades = trades + 1;
+        } else if sig == "flat" and long {
+            cash = shares * px;
+            shares = 0;
+            long = false;
+        }
+        array_push(equity, cash + shares * px);
+        i = i + 1;
+    }
+    let final = capital;
+    if len(equity) > 0 { final = equity[len(equity) - 1]; }
+    return map{ equity: equity, final: final, trades: trades, max_drawdown: max_drawdown(equity) };
+}
+
+// max_drawdown(equity_curve) — worst peak-to-trough loss as a fraction of the peak.
+fn max_drawdown(curve) {
+    if len(curve) == 0 { return 0; }
+    let peak = curve[0];
+    let worst = 0;
+    let i = 1;
+    while i < len(curve) {
+        if curve[i] > peak { peak = curve[i]; }
+        else if peak > 0 {
+            let dd = (peak - curve[i]) / peak;
+            if dd > worst { worst = dd; }
+        }
+        i = i + 1;
+    }
+    return worst;
+}
+
+// candles_from_ticks(ticks, bucket_ms) — aggregate {ts, price, size} ticks (sorted by
+// ts) into OHLCV candles per time bucket: {ts, open, high, low, close, volume}.
+fn candles_from_ticks(ticks, bucket_ms) {
+    let out = [];
+    let cur = nil;
+    let i = 0;
+    while i < len(ticks) {
+        let t = ticks[i];
+        let b = num_floor(t.ts / bucket_ms);
+        if cur == nil or cur.bucket != b {
+            if cur != nil { array_push(out, cur); }
+            cur = map{ bucket: b, ts: b * bucket_ms, open: t.price, high: t.price,
+                low: t.price, close: t.price, volume: t.size };
+        } else {
+            if t.price > cur.high { cur.high = t.price; }
+            if t.price < cur.low { cur.low = t.price; }
+            cur.close = t.price;
+            cur.volume = cur.volume + t.size;
+        }
+        i = i + 1;
+    }
+    if cur != nil { array_push(out, cur); }
+    return out;
+}
+
+// position_size(equity, risk_pct, entry, stop) — whole units so that hitting the stop
+// loses at most equity*risk_pct. A zero/invalid stop distance returns 0 (refuse to
+// size an unbounded risk) rather than guessing.
+fn position_size(equity, risk_pct, entry, stop) {
+    let dist = _abs(entry - stop);
+    if dist <= 0 or equity <= 0 or risk_pct <= 0 { return 0; }
+    return num_floor(equity * risk_pct / dist);
+}
+
+// order_plan(symbol, side, qty, type, limit) — a validated PAPER order plan. Throws on
+// invalid side/type, non-positive qty, or a limit order without a limit price. The
+// status is always "planned": this module never talks to a broker.
+fn order_plan(symbol, side, qty, type, limit) {
+    if side != "buy" and side != "sell" { throw "trading: side must be buy|sell"; }
+    if type != "market" and type != "limit" { throw "trading: type must be market|limit"; }
+    if qty == nil or qty <= 0 { throw "trading: qty must be > 0"; }
+    if type == "limit" and limit == nil { throw "trading: limit order needs a limit price"; }
+    return map{ symbol: str(symbol), side: side, qty: qty, type: type, limit: limit,
+        status: "planned", note: "paper plan only — no execution path in stdlib" };
+}
+
+// ── strategy signals: (i, price) -> "long"|"flat"|"hold" closures for backtest ──────────
+// backtest treats "hold" (anything not long/flat) as "keep the current position", so these
+// helpers can precompute an indicator once and index it by bar.
+
+// signal_from_macd(values, fast, slow, signal_period) — long while the MACD line is above
+// its signal line, flat below; flat during warmup (either line still nil).
+fn signal_from_macd(values, fast, slow, signal_period) {
+    let m = macd(values, fast, slow, signal_period);
+    let line = m.macd;
+    let sig = m.signal;
+    return fn(i, price) {
+        if i >= len(line) or line[i] == nil or sig[i] == nil { return "flat"; }
+        if line[i] > sig[i] { return "long"; }
+        return "flat";
+    };
+}
+
+// signal_from_rsi(values, k, oversold, overbought) — go long when RSI dips below oversold,
+// go flat when it rises above overbought, otherwise HOLD the current position. Flat during
+// warmup. Classic mean-reversion entry/exit.
+fn signal_from_rsi(values, k, oversold, overbought) {
+    let r = rsi(values, k);
+    return fn(i, price) {
+        if i >= len(r) or r[i] == nil { return "flat"; }
+        if r[i] < oversold { return "long"; }
+        if r[i] > overbought { return "flat"; }
+        return "hold";
+    };
+}
+
+// _returns(curve) — per-period simple returns r[i] = (c[i]-c[i-1])/c[i-1].
+fn _returns(curve) {
+    let out = [];
+    let i = 1;
+    while i < len(curve) {
+        let prev = curve[i - 1];
+        if prev == 0 { array_push(out, 0); } else { array_push(out, (curve[i] - prev) / prev); }
+        i = i + 1;
+    }
+    return out;
+}
+fn _mean(xs) {
+    if len(xs) == 0 { return 0; }
+    let s = 0; let i = 0;
+    while i < len(xs) { s = s + xs[i]; i = i + 1; }
+    return s / len(xs);
+}
+fn _stddev(xs) {
+    if len(xs) == 0 { return 0; }
+    let m = _mean(xs);
+    let s = 0; let i = 0;
+    while i < len(xs) { let d = xs[i] - m; s = s + d * d; i = i + 1; }
+    return num_sqrt(s / len(xs));
+}
+
+// equity_stats(curve, trades) — a performance report over an equity curve. `trades` is an
+// optional list of {pnl} (per closed trade); pass nil to skip win_rate. Returns:
+//   { return_pct, cagr, sharpe, volatility, max_drawdown, win_rate }
+// sharpe/volatility use per-period simple returns (risk-free = 0); sharpe is defined as 0
+// when volatility is 0 (a flat curve has no risk and no excess — never a div-by-zero).
+// cagr compounds over (n-1) periods. win_rate = fraction of trades with pnl > 0, or nil.
+fn equity_stats(curve, trades) {
+    let n = len(curve);
+    let ret = 0;
+    let cagr = 0;
+    if n >= 2 and curve[0] != 0 {
+        ret = (curve[n - 1] - curve[0]) / curve[0];
+        let growth = curve[n - 1] / curve[0];
+        if growth > 0 { cagr = num_pow(growth, 1 / (n - 1)) - 1; }
+    }
+    let rs = _returns(curve);
+    let vol = _stddev(rs);
+    let sharpe = 0;
+    if vol > 0 { sharpe = _mean(rs) / vol; }
+    let wr = nil;
+    if trades != nil and len(trades) > 0 {
+        let wins = 0;
+        let i = 0;
+        while i < len(trades) { if (try trades[i].pnl catch 0) > 0 { wins = wins + 1; } i = i + 1; }
+        wr = wins / len(trades);
+    }
+    return map{ return_pct: ret, cagr: cagr, sharpe: sharpe, volatility: vol,
+        max_drawdown: max_drawdown(curve), win_rate: wr };
+}
+
+fn _pct(x) { return str(num_floor(x * 10000) / 100) + "%"; }
+fn _r2(x) { return num_floor(x * 100) / 100; }
+
+// report(backtest_result, trades) — a human-readable multi-line performance summary from a
+// backtest() result. `trades` is the optional per-trade {pnl} list (adds the win-rate line).
+fn report(bt, trades) {
+    let st = equity_stats(bt.equity, trades);
+    let n = len(bt.equity);
+    let out = "pbOS trading backtest report\n";
+    out = out + "  bars:        " + str(n) + "\n";
+    out = out + "  trades:      " + str(try bt.trades catch 0) + "\n";
+    out = out + "  final:       " + str(_r2(try bt.final catch 0)) + "\n";
+    out = out + "  return:      " + _pct(st.return_pct) + "\n";
+    out = out + "  cagr:        " + _pct(st.cagr) + " / period\n";
+    out = out + "  sharpe:      " + str(_r2(st.sharpe)) + "\n";
+    out = out + "  volatility:  " + _pct(st.volatility) + "\n";
+    out = out + "  max drawdown: " + _pct(st.max_drawdown) + "\n";
+    if st.win_rate != nil { out = out + "  win rate:    " + _pct(st.win_rate) + "\n"; }
+    return out;
+}
+
+export sma, ema, rsi, bollinger, max_drawdown, candles_from_ticks, position_size, order_plan;
+export macd, atr, backtest, signal_from_macd, signal_from_rsi, equity_stats, report;

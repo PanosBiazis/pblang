@@ -262,6 +262,206 @@ fn next_id(m, ctx) {
     return tensor_argmax(logits_t);     // native kernel
 }
 
+// ── sampling: temperature + top-k for controllable, diverse generation ────────────
+// softmax_temp(logits, temperature) — temperature-scaled softmax. temperature<1 sharpens
+// toward the argmax (more deterministic); >1 flattens (more random). <=0 -> near-greedy.
+fn softmax_temp(logits, temperature) {
+    let t = temperature;
+    if t <= 0 { t = 0.0001; }
+    let n = len(logits);
+    let mx = logits[0];
+    let i = 1;
+    while i < n { if logits[i] > mx { mx = logits[i]; } i = i + 1; }
+    let p = [];
+    let sum = 0;
+    let j = 0;
+    while j < n { let e = num_exp((logits[j] - mx) / t); push(p, e); sum = sum + e; j = j + 1; }
+    let k = 0;
+    while k < n { p[k] = p[k] / sum; k = k + 1; }
+    return p;
+}
+
+// top_k_filter(probs, k) — keep only the k highest-probability entries (zero the rest)
+// and renormalize. k<=0 or k>=len leaves the distribution unchanged.
+fn top_k_filter(probs, k) {
+    let n = len(probs);
+    if k <= 0 or k >= n { return probs; }
+    let s = [];
+    let i = 0;
+    while i < n { push(s, probs[i]); i = i + 1; }
+    let a = 1;                                   // insertion sort, descending
+    while a < n {
+        let key = s[a];
+        let b = a - 1;
+        while b >= 0 and s[b] < key { s[b + 1] = s[b]; b = b - 1; }
+        s[b + 1] = key;
+        a = a + 1;
+    }
+    let thr = s[k - 1];
+    let out = [];
+    let sum = 0;
+    let j = 0;
+    while j < n { if probs[j] >= thr { push(out, probs[j]); sum = sum + probs[j]; } else { push(out, 0); } j = j + 1; }
+    let m = 0;
+    while m < n { if sum > 0 { out[m] = out[m] / sum; } m = m + 1; }
+    return out;
+}
+
+// top_p_filter(probs, p) — nucleus sampling: keep the smallest set of highest-prob
+// entries whose cumulative mass reaches p, zero the rest, renormalize. Always keeps at
+// least the single most-likely token. p>=1 leaves the distribution unchanged.
+fn top_p_filter(probs, p) {
+    let n = len(probs);
+    if p >= 1 or n == 0 { return probs; }
+    // indices sorted by descending probability (insertion sort on a paired copy)
+    let idx = [];
+    let i = 0;
+    while i < n { push(idx, i); i = i + 1; }
+    let a = 1;
+    while a < n {
+        let ki = idx[a];
+        let b = a - 1;
+        while b >= 0 and probs[idx[b]] < probs[ki] { idx[b + 1] = idx[b]; b = b - 1; }
+        idx[b + 1] = ki;
+        a = a + 1;
+    }
+    let keep = _zeros(n);          // 1 = inside the nucleus
+    let cum = 0;
+    let r = 0;
+    while r < n {
+        keep[idx[r]] = 1;
+        cum = cum + probs[idx[r]];
+        if cum >= p { r = n; } else { r = r + 1; }   // stop once we cover p
+    }
+    let out = [];
+    let sum = 0;
+    let j = 0;
+    while j < n { if keep[j] == 1 { push(out, probs[j]); sum = sum + probs[j]; } else { push(out, 0); } j = j + 1; }
+    let m = 0;
+    while m < n { if sum > 0 { out[m] = out[m] / sum; } m = m + 1; }
+    return out;
+}
+
+// apply_repetition_penalty(logits, recent_ids, penalty) — discourage already-emitted
+// ids (penalty>1). Following the common scheme: positive logits are divided, negative
+// logits are multiplied, so a seen token's score always moves toward less-likely.
+fn apply_repetition_penalty(logits, recent_ids, penalty) {
+    if penalty == nil or penalty <= 1 { return logits; }
+    let out = [];
+    let i = 0;
+    while i < len(logits) { push(out, logits[i]); i = i + 1; }
+    let r = 0;
+    while r < len(recent_ids) {
+        let id = recent_ids[r];
+        if id >= 0 and id < len(out) {
+            if out[id] > 0 { out[id] = out[id] / penalty; } else { out[id] = out[id] * penalty; }
+        }
+        r = r + 1;
+    }
+    return out;
+}
+
+// sample_from(probs, u) — inverse-CDF sample: the first index whose cumulative mass
+// exceeds u (u expected in [0,1)).
+fn sample_from(probs, u) {
+    let c = 0;
+    let i = 0;
+    while i < len(probs) { c = c + probs[i]; if u < c { return i; } i = i + 1; }
+    return len(probs) - 1;
+}
+
+// _lcg(state) — deterministic 31-bit LCG step (reproducible sampling from a seed).
+fn _lcg(state) { return num_mod(state * 1103515245 + 12345, 2147483648); }
+
+// next_id_sampled(m, ctx, temperature, top_k, state) — sample the next id from the
+// temperature/top-k distribution. Returns { id, state } so callers thread the RNG.
+fn next_id_sampled(m, ctx, temperature, top_k, state) {
+    let f = _forward(m, ctx);
+    let p = top_k_filter(softmax_temp(f.logits, temperature), top_k);
+    let st = _lcg(state);
+    let u = num_mod(st, 100000) / 100000;
+    return map{ id: sample_from(p, u), state: st };
+}
+
+// generate_sampled(m, vocab, seed_text, n, temperature, top_k, seed) — autoregressive
+// generation with temperature/top-k sampling. Deterministic for a given seed.
+// top_k=1 (or temperature->0) reproduces greedy generate().
+fn generate_sampled(m, vocab, seed_text, n, temperature, top_k, seed) {
+    let ids = encode(vocab, seed_text);
+    let ctx = [];
+    let start = len(ids) - m.K;
+    let j = 0;
+    while j < m.K {
+        let idx = start + j;
+        if idx < 0 { push(ctx, 0); } else { push(ctx, ids[idx]); }
+        j = j + 1;
+    }
+    let out = seed_text;
+    let state = seed;
+    let step = 0;
+    while step < n {
+        let r = next_id_sampled(m, ctx, temperature, top_k, state);
+        state = r.state;
+        let nid = r.id;
+        out = out + strfromcharcode(vocab.id2ch[nid]);
+        let nc = [];
+        let s = 1;
+        while s < m.K { push(nc, ctx[s]); s = s + 1; }
+        push(nc, nid);
+        ctx = nc;
+        step = step + 1;
+    }
+    return out;
+}
+
+// generate_decode(m, vocab, seed_text, n, opts) — full decoding loop combining
+// repetition penalty + temperature + top-k + top-p (nucleus), deterministic per seed.
+// opts keys (all optional): temperature (default 1), top_k (0=off), top_p (1=off),
+// repetition_penalty (1=off), seed (default 1). top_k=1 reproduces greedy generate().
+fn generate_decode(m, vocab, seed_text, n, opts) {
+    if opts == nil { opts = map{}; }
+    let temperature = try opts.temperature catch 1;
+    let top_k = try opts.top_k catch 0;
+    let top_p = try opts.top_p catch 1;
+    let rep = try opts.repetition_penalty catch 1;
+    let state = try opts.seed catch 1;
+    if temperature == nil { temperature = 1; }
+    if top_k == nil { top_k = 0; }
+    if top_p == nil { top_p = 1; }
+    if rep == nil { rep = 1; }
+    if state == nil { state = 1; }
+
+    let ids = encode(vocab, seed_text);
+    let ctx = [];
+    let start = len(ids) - m.K;
+    let j = 0;
+    while j < m.K {
+        let idx = start + j;
+        if idx < 0 { push(ctx, 0); } else { push(ctx, ids[idx]); }
+        j = j + 1;
+    }
+    let emitted = [];                       // ids produced so far (for repetition penalty)
+    let out = seed_text;
+    let step = 0;
+    while step < n {
+        let f = _forward(m, ctx);
+        let logits = apply_repetition_penalty(f.logits, emitted, rep);
+        let p = top_p_filter(top_k_filter(softmax_temp(logits, temperature), top_k), top_p);
+        state = _lcg(state);
+        let u = num_mod(state, 100000) / 100000;
+        let nid = sample_from(p, u);
+        push(emitted, nid);
+        out = out + strfromcharcode(vocab.id2ch[nid]);
+        let nc = [];
+        let s = 1;
+        while s < m.K { push(nc, ctx[s]); s = s + 1; }
+        push(nc, nid);
+        ctx = nc;
+        step = step + 1;
+    }
+    return out;
+}
+
 // generate(model, vocab, seed_text, n) — autoregressive greedy generation. Seeds the
 // context from the last K chars of seed_text and emits n more characters.
 fn generate(m, vocab, seed_text, n) {
@@ -349,3 +549,5 @@ fn perplexity(loss) { return num_exp(loss); }
 export vocab_build, encode, model_new, train_step, train, avg_loss, next_id, generate,
        source_corpus, checkpoint, checkpoint_generate, train_nano, generate_nano,
        vocab_size, perplexity;
+export softmax_temp, top_k_filter, sample_from, next_id_sampled, generate_sampled;
+export top_p_filter, apply_repetition_penalty, generate_decode;

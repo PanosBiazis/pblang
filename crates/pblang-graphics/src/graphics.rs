@@ -17,8 +17,22 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+const FALLBACK_FONT_PATHS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/ubuntu/UbuntuMono[wght].ttf",
+    "/usr/share/fonts/opentype/cantarell/Cantarell-Regular.otf",
+    "C:\\Windows\\Fonts\\consola.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/SFNSMono.ttf",
+];
 
 thread_local! {
     static GFX_WINDOWS: RefCell<HashMap<usize, GfxWindow>> = RefCell::new(HashMap::new());
@@ -74,6 +88,154 @@ fn color_from_value(host: &mut dyn VmHost, v: &Value, what: &str) -> Result<u32,
     let b = comp(2, "b")?;
     let a = if arr.len() == 4 { comp(3, "a")? } else { 255 };
     Ok(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+}
+
+fn text_font_path(requested: &str) -> Option<String> {
+    let requested = requested.trim();
+    if !requested.is_empty() && Path::new(requested).is_file() {
+        return Some(requested.to_string());
+    }
+    for env_name in ["PBIDE_FONT", "PBLANG_FONT"] {
+        if let Ok(v) = std::env::var(env_name) {
+            let v = v.trim();
+            if !v.is_empty() && Path::new(v).is_file() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    FALLBACK_FONT_PATHS
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .map(|p| (*p).to_string())
+}
+
+fn text_profile_map(font_path: Option<String>) -> Value {
+    let mut m = HashMap::new();
+    m.insert(
+        "format".into(),
+        alloc_string("pblang.graphics.text.profile.v1"),
+    );
+    m.insert("renderer".into(), alloc_string("native-aa-fontdue"));
+    m.insert("fallback".into(), alloc_string("bitmap-font"));
+    m.insert("antialias".into(), Value::Bool(true));
+    match font_path {
+        Some(p) => {
+            m.insert("available".into(), Value::Bool(true));
+            m.insert("font".into(), alloc_string(p));
+        }
+        None => {
+            m.insert("available".into(), Value::Bool(false));
+            m.insert("font".into(), alloc_string(""));
+        }
+    }
+    alloc_map(m)
+}
+
+fn blend_argb(dst: u32, src: u32, coverage: u8) -> u32 {
+    if coverage == 0 {
+        return dst;
+    }
+    let src_a = (((src >> 24) & 0xff) * coverage as u32) / 255;
+    if src_a == 0 {
+        return dst;
+    }
+    let inv = 255 - src_a;
+    let sr = (src >> 16) & 0xff;
+    let sg = (src >> 8) & 0xff;
+    let sb = src & 0xff;
+    let da = (dst >> 24) & 0xff;
+    let dr = (dst >> 16) & 0xff;
+    let dg = (dst >> 8) & 0xff;
+    let db = dst & 0xff;
+    let out_a = (src_a + (da * inv) / 255).min(255);
+    let out_r = ((sr * src_a + dr * inv) / 255).min(255);
+    let out_g = ((sg * src_a + dg * inv) / 255).min(255);
+    let out_b = ((sb * src_a + db * inv) / 255).min(255);
+    (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TextDrawStats {
+    pub width: i64,
+    pub height: i64,
+    pub glyphs: usize,
+    pub font_path: String,
+}
+
+pub(crate) fn draw_text_aa_into(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    x: i64,
+    y: i64,
+    text: &str,
+    color: u32,
+    px: f32,
+    requested_font_path: &str,
+    fixed_advance: f32,
+) -> Result<TextDrawStats, String> {
+    if w == 0 || h == 0 || text.is_empty() {
+        return Ok(TextDrawStats {
+            width: 0,
+            height: 0,
+            glyphs: 0,
+            font_path: String::new(),
+        });
+    }
+    let px = px.clamp(6.0, 256.0);
+    let font_path = text_font_path(requested_font_path)
+        .ok_or_else(|| "no usable TrueType/OpenType font found".to_string())?;
+    let font_bytes = fs::read(&font_path).map_err(|e| format!("read font {font_path}: {e}"))?;
+    let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
+        .map_err(|e| format!("load font {font_path}: {e}"))?;
+    let mut cursor = x as f32;
+    let mut glyphs = 0usize;
+    let mut max_right = x;
+    let mut max_bottom = y;
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        let (metrics, bitmap) = font.rasterize(ch, px);
+        if metrics.width > 0 && metrics.height > 0 {
+            let gx = cursor.round() as i64 + metrics.xmin as i64;
+            // PBIDE uses top-left cell coordinates. Keep glyphs vertically centered in
+            // the existing cell instead of changing line layout or cursor hit-testing.
+            let gy = y + ((px as i64 - metrics.height as i64) / 2).max(0);
+            for row in 0..metrics.height {
+                let py = gy + row as i64;
+                if py < 0 || py >= h as i64 {
+                    continue;
+                }
+                let src_row = row * metrics.width;
+                let dst_row = py as usize * w;
+                for col in 0..metrics.width {
+                    let px0 = gx + col as i64;
+                    if px0 < 0 || px0 >= w as i64 {
+                        continue;
+                    }
+                    let coverage = bitmap[src_row + col];
+                    let idx = dst_row + px0 as usize;
+                    buf[idx] = blend_argb(buf[idx], color, coverage);
+                }
+            }
+            max_right = max_right.max(gx + metrics.width as i64);
+            max_bottom = max_bottom.max(gy + metrics.height as i64);
+            glyphs += 1;
+        }
+        let adv = if fixed_advance > 0.0 {
+            fixed_advance
+        } else {
+            metrics.advance_width.max(px * 0.5)
+        };
+        cursor += adv;
+    }
+    Ok(TextDrawStats {
+        width: (cursor.round() as i64 - x).max(max_right - x),
+        height: (max_bottom - y).max(px as i64),
+        glyphs,
+        font_path,
+    })
 }
 
 fn with_window_mut<F, R>(
@@ -212,6 +374,14 @@ pub fn gfxsize(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runtime
         });
     }
     with_window_mut(host, id, "gfxsize", |gw| {
+        // Report the LIVE window size (and keep the framebuffer matched), so callers see the
+        // current size after a resize rather than the size the window was created at.
+        let (cw, ch) = gw.win.get_size();
+        if cw > 0 && ch > 0 && (cw != gw.w || ch != gw.h) {
+            gw.w = cw;
+            gw.h = ch;
+            gw.buf.resize(cw * ch, 0);
+        }
         let mut m = HashMap::new();
         m.insert("w".into(), Value::Number(gw.w as f64));
         m.insert("h".into(), Value::Number(gw.h as f64));
@@ -474,6 +644,87 @@ fn draw_line_bresenham(buf: &mut [u32], w: usize, h: usize, params: LineParams) 
     }
 }
 
+// --- gfxdrawtextaa(handle, x, y, text, color, px, font_path, advance)
+pub fn gfxdrawtextaa(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 8 {
+        return Err(host.err(format!(
+            "gfxdrawtextaa expects 8 arguments, got {}",
+            args.len()
+        )));
+    }
+    let id = handle_from_value(host, args[0].clone(), "gfxdrawtextaa")?;
+    let x = number(host, &args[1], "gfxdrawtextaa x")? as i64;
+    let y = number(host, &args[2], "gfxdrawtextaa y")? as i64;
+    let text = string_val(host, &args[3], "gfxdrawtextaa text")?;
+    let c = color_from_value(host, &args[4], "gfxdrawtextaa")?;
+    let px = number(host, &args[5], "gfxdrawtextaa px")? as f32;
+    let font_path = string_val(host, &args[6], "gfxdrawtextaa font_path")?;
+    let advance = number(host, &args[7], "gfxdrawtextaa advance")? as f32;
+
+    #[cfg(feature = "sdl2")]
+    if crate::sdl2_backend::has(id) {
+        return crate::sdl2_backend::with_window_mut(host, id, "gfxdrawtextaa", |w| {
+            let stats = w.draw_text_aa(x, y, &text, c, px, &font_path, advance);
+            Ok(text_draw_result(stats))
+        });
+    }
+    with_window_mut(host, id, "gfxdrawtextaa", |gw| {
+        let stats = draw_text_aa_into(
+            &mut gw.buf,
+            gw.w,
+            gw.h,
+            x,
+            y,
+            &text,
+            c,
+            px,
+            &font_path,
+            advance,
+        );
+        Ok(text_draw_result(stats))
+    })
+}
+
+fn text_draw_result(stats: Result<TextDrawStats, String>) -> Value {
+    let mut m = HashMap::new();
+    m.insert(
+        "format".into(),
+        alloc_string("pblang.graphics.text.draw.v1"),
+    );
+    match stats {
+        Ok(s) => {
+            m.insert("ok".into(), Value::Bool(true));
+            m.insert("renderer".into(), alloc_string("native-aa-fontdue"));
+            m.insert("font".into(), alloc_string(s.font_path));
+            m.insert("width".into(), Value::Number(s.width as f64));
+            m.insert("height".into(), Value::Number(s.height as f64));
+            m.insert("glyphs".into(), Value::Number(s.glyphs as f64));
+            m.insert("error".into(), alloc_string(""));
+        }
+        Err(e) => {
+            m.insert("ok".into(), Value::Bool(false));
+            m.insert("renderer".into(), alloc_string("bitmap-font-fallback"));
+            m.insert("font".into(), alloc_string(""));
+            m.insert("width".into(), Value::Number(0.0));
+            m.insert("height".into(), Value::Number(0.0));
+            m.insert("glyphs".into(), Value::Number(0.0));
+            m.insert("error".into(), alloc_string(e));
+        }
+    }
+    alloc_map(m)
+}
+
+// --- gfxtextprofile() -> map
+pub fn gfxtextprofile(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if !args.is_empty() {
+        return Err(host.err(format!(
+            "gfxtextprofile expects 0 arguments, got {}",
+            args.len()
+        )));
+    }
+    Ok(text_profile_map(text_font_path("")))
+}
+
 // --- gfxpresent(handle)
 pub fn gfxpresent(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
@@ -527,11 +778,26 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
             return Ok(alloc_array(out));
         }
 
-        // The framebuffer is a FIXED size (gw.w × gw.h) that minifb stretches to fill the
-        // window; on HiDPI / when the WM resizes the window to fit the screen, the window
-        // size diverges from the buffer, so the raw mouse position (which is in window
-        // space) no longer matches what we drew. Map mouse → buffer space by the
-        // buffer/window ratio. When window == buffer (the common case) this is a no-op.
+        // RESIZABLE: grow/shrink the framebuffer to match the live window so the app draws at
+        // the real resolution and REFLOWS, instead of minifb stretching a fixed buffer (blurry,
+        // never relayouts). Emit a "resize" event so the app can recompute its layout. After
+        // this, buffer == window so the mouse maps 1:1.
+        {
+            let (cur_w, cur_h) = gw.win.get_size();
+            if cur_w > 0 && cur_h > 0 && (cur_w != gw.w || cur_h != gw.h) {
+                gw.w = cur_w;
+                gw.h = cur_h;
+                gw.buf.resize(cur_w * cur_h, 0);
+                let mut m = HashMap::new();
+                m.insert("type".into(), alloc_string("resize"));
+                m.insert("w".into(), Value::Number(cur_w as f64));
+                m.insert("h".into(), Value::Number(cur_h as f64));
+                out.push(alloc_map(m));
+            }
+        }
+
+        // Mouse is in window space; with the buffer kept equal to the window above these are
+        // 1.0 (retained for the rare frame where the sizes momentarily diverge).
         let (win_w, win_h) = gw.win.get_size();
         let msx = if win_w > 0 {
             gw.w as f32 / win_w as f32
@@ -697,6 +963,16 @@ pub fn gfx_builtins() -> Vec<pblang_ir::BuiltinFn> {
             fun: gfxdrawline,
         },
         pblang_ir::BuiltinFn {
+            name: "gfxdrawtextaa",
+            arity: Some(8),
+            fun: gfxdrawtextaa,
+        },
+        pblang_ir::BuiltinFn {
+            name: "gfxtextprofile",
+            arity: Some(0),
+            fun: gfxtextprofile,
+        },
+        pblang_ir::BuiltinFn {
             name: "gfxpresent",
             arity: Some(1),
             fun: gfxpresent,
@@ -760,7 +1036,13 @@ mod tests {
             &mut buf,
             w,
             h,
-            LineParams { x1: 0, y1: 0, x2: 1_000_000_000_000, y2: 0, color: 0xABCDEF },
+            LineParams {
+                x1: 0,
+                y1: 0,
+                x2: 1_000_000_000_000,
+                y2: 0,
+                color: 0xABCDEF,
+            },
         );
         // Row 0 should be fully colored; no write landed out of bounds (the test
         // completing without panic/hang is itself the assertion).

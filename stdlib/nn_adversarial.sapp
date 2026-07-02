@@ -1,0 +1,146 @@
+// stdlib/nn_adversarial.sapp — self-adversarial robustness for stdlib/nn.sapp MLPs.
+//
+// A "little dangerous" but well-established idea: deliberately ATTACK a network (inject
+// noisy/infected nodes, poison the data, craft adversarial examples) and then TRAIN it to
+// DEFEND — adversarial training, which can regularize and harden a model. The danger is
+// that an unbounded attack degrades the model, so everything here is SAFE BY CONSTRUCTION:
+//   * attacks operate on CLONES and never mutate the input network;
+//   * `harden` keeps the toughened model ONLY if robustness improved without wrecking
+//     clean accuracy (otherwise it rolls back) — so it can't destroy your current net.
+//
+//   let adv = import("stdlib:nn_adversarial.sapp");
+//   let r = adv.harden(net, data, 100, 0.3, 0.2, 0.02);   // r.net is >= baseline on clean
+//
+// Defensive/educational use only.
+
+let nn = import("stdlib:nn.sapp");
+
+// deterministic bounded "noise" in [-mag, mag] from an index hash (no VM RNG).
+fn _noise(seed, a, b, mag) {
+    let k = seed * 131 + a * 7 + b * 13 + 1;
+    let f = num_mod(k * 2654435761, 100000) / 100000;
+    return (f - 0.5) * 2 * mag;
+}
+fn _copy(a) { let o = []; let i = 0; while i < len(a) { push(o, a[i]); i = i + 1; } return o; }
+
+// ── ATTACKS (each returns a CLONE / new data; the inputs are never mutated) ────────
+// noise_weights(net, sigma, seed) — jitter every weight by ±sigma (a generally "noisy"
+// network; small sigma ≈ a robustness probe, large sigma ≈ a corrupting attack).
+fn noise_weights(net, sigma, seed) {
+    let n = nn.clone(net);
+    let o = 0;
+    while o < len(n.l1.w) { let i = 0; while i < len(n.l1.w[o]) { n.l1.w[o][i] = n.l1.w[o][i] + _noise(seed, o, i, sigma); i = i + 1; } o = o + 1; }
+    let o2 = 0;
+    while o2 < len(n.l2.w) { let i2 = 0; while i2 < len(n.l2.w[o2]) { n.l2.w[o2][i2] = n.l2.w[o2][i2] + _noise(seed + 777, o2, i2, sigma); i2 = i2 + 1; } o2 = o2 + 1; }
+    return n;
+}
+
+// corrupt_neuron(net, idx, seed) — overwrite one hidden neuron's incoming weights with
+// noise: an "infected node" injected into the network (on a clone).
+fn corrupt_neuron(net, idx, seed) {
+    let n = nn.clone(net);
+    if idx < 0 or idx >= n.l1.n_out { throw "nn_adversarial.corrupt_neuron: index out of range"; }
+    let i = 0;
+    while i < len(n.l1.w[idx]) { n.l1.w[idx][i] = _noise(seed, idx, i, 1); i = i + 1; }
+    n.l1.b[idx] = 0;
+    return n;
+}
+
+// poison_data(data, frac, seed) — a NEW dataset with a `frac` (0..1) of labels corrupted
+// (flipped toward 1 - y). Models a poisoned training set.
+fn poison_data(data, frac, seed) {
+    let out = [];
+    let i = 0;
+    while i < len(data) {
+        let k = seed * 131 + i * 7 + 1;
+        let r = num_mod(k * 2654435761, 100000) / 100000;
+        if r < frac {
+            let y2 = [];
+            let j = 0;
+            while j < len(data[i].y) { push(y2, 1 - data[i].y[j]); j = j + 1; }
+            push(out, nn.sample(_copy(data[i].x), y2));
+        } else {
+            push(out, data[i]);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// adversarial_example(net, sample, epsilon) — a perturbed input that RAISES the loss
+// (gradient-free FGSM: nudge each input dim by ±epsilon in the loss-increasing
+// direction). The crafted attack the defender then trains against.
+fn adversarial_example(net, sample, epsilon) {
+    let x = sample.x;
+    let y = sample.y;
+    let base = nn.loss(net, [sample]);
+    let out = [];
+    let i = 0;
+    while i < len(x) {
+        let xp = _copy(x); xp[i] = x[i] + epsilon;
+        let xm = _copy(x); xm[i] = x[i] - epsilon;
+        let lp = nn.loss(net, [nn.sample(xp, y)]);
+        let lm = nn.loss(net, [nn.sample(xm, y)]);
+        let xi = x[i];
+        if lp >= lm and lp >= base { xi = x[i] + epsilon; }
+        else if lm > lp and lm >= base { xi = x[i] - epsilon; }
+        push(out, xi);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── DEFENSE ───────────────────────────────────────────────────────────────────────
+// robustness(net, data, epsilon) — mean loss on adversarial examples (lower = tougher).
+fn robustness(net, data, epsilon) {
+    if len(data) == 0 { return 0; }
+    let total = 0;
+    let i = 0;
+    while i < len(data) {
+        let ax = adversarial_example(net, data[i], epsilon);
+        total = total + nn.mse_loss(nn.predict(net, ax), data[i].y);
+        i = i + 1;
+    }
+    return total / len(data);
+}
+
+// adversarial_train(net, data, epochs, lr, epsilon) — train on freshly-crafted
+// adversarial examples each epoch (MUTATES net). This is the "learn to defend" step.
+fn adversarial_train(net, data, epochs, lr, epsilon) {
+    let e = 0;
+    let last = 0;
+    while e < epochs {
+        let total = 0;
+        let d = 0;
+        while d < len(data) {
+            let ax = adversarial_example(net, data[d], epsilon);
+            total = total + nn.train_sample(net, ax, data[d].y, lr);
+            d = d + 1;
+        }
+        last = total;
+        e = e + 1;
+    }
+    return last;
+}
+
+// harden(net, data, epochs, lr, epsilon, tol) — SAFE adversarial hardening. Adversarially
+// trains a CLONE, then keeps it ONLY if robustness improved AND clean loss stayed within
+// `tol` of the baseline; otherwise rolls back to the original. The returned net is
+// therefore NEVER worse than the baseline on clean data by more than tol — the attack
+// can speed up / toughen training but can't destroy the model. Returns
+// { net, hardened, clean_before, clean_after, robust_before, robust_after }.
+fn harden(net, data, epochs, lr, epsilon, tol) {
+    let clean_before = nn.loss(net, data);
+    let robust_before = robustness(net, data, epsilon);
+    let work = nn.clone(net);
+    adversarial_train(work, data, epochs, lr, epsilon);
+    let clean_after = nn.loss(work, data);
+    let robust_after = robustness(work, data, epsilon);
+    if robust_after <= robust_before and clean_after <= clean_before + tol {
+        return map{ net: work, hardened: true, clean_before: clean_before, clean_after: clean_after, robust_before: robust_before, robust_after: robust_after };
+    }
+    return map{ net: nn.clone(net), hardened: false, clean_before: clean_before, clean_after: clean_after, robust_before: robust_before, robust_after: robust_after };
+}
+
+export noise_weights, corrupt_neuron, poison_data, adversarial_example;
+export robustness, adversarial_train, harden;

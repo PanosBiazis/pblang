@@ -1,0 +1,170 @@
+// tests/semantics/trading_test.sapp — stdlib/trading.sapp: pure market-data math
+// (SMA/EMA/RSI/Bollinger/drawdown), tick→candle aggregation, risk-based position
+// sizing, and validated PAPER order plans (plans only — no execution, no network).
+
+let T = import("stdlib/trading.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+fn approx(a, b, m) { let d = a - b; if d < 0 { d = 0 - d; } if d > 0.0001 { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+
+// ── SMA: same-length series, nil during warmup ─────────────────────────────────────
+let sma = T.sma([1, 2, 3, 4, 5], 3);
+eq(len(sma), 5, "sma keeps length");
+if sma[0] != nil or sma[1] != nil { fail("sma warmup is nil"); }
+approx(sma[2], 2, "sma[2]"); approx(sma[3], 3, "sma[3]"); approx(sma[4], 4, "sma[4]");
+
+// ── EMA: seeded with the SMA, then standard multiplier 2/(k+1) ─────────────────────
+let ema = T.ema([2, 2, 2, 8], 3);
+if ema[0] != nil { fail("ema warmup nil"); }
+approx(ema[2], 2, "ema seed = sma");
+approx(ema[3], 5, "ema[3] = 2 + (8-2)*0.5");
+
+// ── RSI: bounded, saturates on one-way moves ───────────────────────────────────────
+let up = T.rsi([1, 2, 3, 4, 5, 6, 7, 8], 3);
+approx(up[len(up) - 1], 100, "all-up rsi -> 100");
+let down = T.rsi([8, 7, 6, 5, 4, 3, 2, 1], 3);
+approx(down[len(down) - 1], 0, "all-down rsi -> 0");
+
+// ── Bollinger: upper >= middle >= lower once warm ──────────────────────────────────
+let bb = T.bollinger([1, 2, 3, 4, 5, 6], 3, 2);
+let i = 2;
+while i < 6 {
+    if bb.upper[i] < bb.middle[i] or bb.middle[i] < bb.lower[i] { fail("bollinger band order"); }
+    i = i + 1;
+}
+approx(bb.middle[4], 4, "bollinger middle = sma");
+
+// ── max drawdown: peak-to-trough fraction ──────────────────────────────────────────
+approx(T.max_drawdown([100, 120, 60, 90]), 0.5, "60 from a 120 peak = 50%");
+approx(T.max_drawdown([1, 2, 3]), 0, "monotonic up has no drawdown");
+
+// ── ticks -> OHLCV candles ─────────────────────────────────────────────────────────
+let ticks = [
+    map{ ts: 0, price: 10, size: 1 }, map{ ts: 400, price: 12, size: 2 },
+    map{ ts: 900, price: 9, size: 1 }, map{ ts: 1200, price: 11, size: 3 }
+];
+let cs = T.candles_from_ticks(ticks, 1000);
+eq(len(cs), 2, "two 1s buckets");
+eq(cs[0].open, 10, "c0 open"); eq(cs[0].high, 12, "c0 high");
+eq(cs[0].low, 9, "c0 low"); eq(cs[0].close, 9, "c0 close");
+eq(cs[0].volume, 4, "c0 volume");
+eq(cs[1].open, 11, "c1 open"); eq(cs[1].volume, 3, "c1 volume");
+
+// ── risk-based position sizing ─────────────────────────────────────────────────────
+eq(T.position_size(10000, 0.01, 50, 48), 50, "risk $100 over $2 stop = 50 shares");
+eq(T.position_size(10000, 0.01, 50, 50), 0, "zero stop distance -> 0 (refuse)");
+
+// ── paper order plans: validated maps, never executed ──────────────────────────────
+let o = T.order_plan("AAPL", "buy", 10, "limit", 189.5);
+eq(o.symbol, "AAPL", "plan symbol"); eq(o.side, "buy", "plan side");
+eq(o.qty, 10, "plan qty"); eq(o.type, "limit", "plan type");
+approx(o.limit, 189.5, "plan limit");
+eq(o.status, "planned", "plans are PLANS, not executions");
+let bad = try T.order_plan("AAPL", "hold", 10, "market", nil) catch "rejected";
+eq(bad, "rejected", "invalid side throws");
+let bad2 = try T.order_plan("AAPL", "sell", 0, "market", nil) catch "rejected";
+eq(bad2, "rejected", "qty<=0 throws");
+let bad3 = try T.order_plan("AAPL", "buy", 5, "limit", nil) catch "rejected";
+eq(bad3, "rejected", "limit order without a limit price throws");
+
+// ── MACD: {macd, signal, histogram}, macd = EMA(fast) - EMA(slow) ──────────────────
+let closes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+let macd = T.macd(closes, 3, 6, 4);
+eq(len(macd.macd), len(closes), "macd keeps length");
+eq(len(macd.signal), len(closes), "signal keeps length");
+eq(len(macd.histogram), len(closes), "histogram keeps length");
+// on a steady uptrend the fast EMA leads the slow one -> macd line positive once warm
+if macd.macd[len(closes) - 1] <= 0 { fail("uptrend -> positive macd line"); }
+// histogram = macd - signal, checked where both are present
+let hi = len(closes) - 1;
+approx(macd.histogram[hi], macd.macd[hi] - macd.signal[hi], "histogram = macd - signal");
+
+// ── ATR: average true range over OHLC candles, nil during warmup ───────────────────
+let ohlc = [
+    map{ high: 10, low: 8, close: 9 }, map{ high: 11, low: 9, close: 10 },
+    map{ high: 12, low: 10, close: 11 }, map{ high: 13, low: 11, close: 12 }
+];
+let atr = T.atr(ohlc, 2);
+eq(len(atr), len(ohlc), "atr keeps length");
+if atr[len(atr) - 1] == nil { fail("atr warm at the end"); }
+if atr[len(atr) - 1] <= 0 { fail("atr positive for a moving series"); }
+
+// ── backtest: signal fn -> equity curve + stats (long/flat, next-bar fills) ─────────
+// buy-and-hold-ish signal: go long from the start.
+let prices = [100, 110, 121, 110, 121];
+let bt = T.backtest(prices, fn(i, px) { return "long"; }, 1000);
+eq(len(bt.equity), len(prices), "equity curve per bar");
+// starts at initial capital
+eq(bt.equity[0], 1000, "equity starts at capital");
+if bt.final <= 1000 { fail("net-up series should profit while long"); }
+eq(bt.trades, 1, "one entry (stayed long)");
+if bt.max_drawdown <= 0 { fail("the 121->110 dip is a real drawdown"); }
+// a flat signal never trades and never moves equity
+let flat = T.backtest(prices, fn(i, px) { return "flat"; }, 1000);
+eq(flat.final, 1000, "flat signal keeps capital");
+eq(flat.trades, 0, "flat signal makes no trades");
+
+// ── signal helpers: end-to-end backtest in one call ────────────────────────────────
+// signal_from_macd: long while the MACD line is above its signal line, else flat.
+let trend = [10, 11, 12, 13, 14, 15, 16, 15, 14, 13, 12, 11, 10, 11, 12, 13, 14, 15, 16, 17];
+let sf = T.signal_from_macd(trend, 3, 6, 4);
+// the signal fn takes (i, price) and returns "long"/"flat" — feed it straight to backtest
+let bt2 = T.backtest(trend, sf, 1000);
+eq(len(bt2.equity), len(trend), "macd-driven backtest runs full length");
+// during warmup (no macd yet) it must be flat, not throw
+eq(bt2.equity[0], 1000, "flat during macd warmup");
+
+// signal_from_rsi: long when RSI < oversold, flat when RSI > overbought, hold otherwise.
+let rf = T.signal_from_rsi(trend, 3, 30, 70);
+let bt3 = T.backtest(trend, rf, 1000);
+eq(len(bt3.equity), len(trend), "rsi-driven backtest runs full length");
+// the helpers are plain (i, price) fns
+if rf(0, trend[0]) != "flat" { fail("rsi warmup -> flat"); }
+
+// ── equity_stats: performance report over an equity curve ───────────────────────────
+// a curve that doubles over 4 periods (100% total return), with a mid dip
+let curve = [1000, 1100, 1210, 1100, 2000];
+let st = T.equity_stats(curve, nil);
+approx(st.return_pct, 1.0, "total return = (2000-1000)/1000 = 100%");
+// per-period simple returns: [0.10, 0.10, -0.0909.., 0.818..]; volatility = stddev of those
+if st.volatility <= 0 { fail("a moving curve has positive volatility"); }
+// max drawdown reuses the existing calc: 1210 -> 1100 = ~9.09%
+approx(st.max_drawdown, 0.0909091, "worst drawdown ~9.09%");
+// sharpe (rf=0) = mean(returns)/stddev(returns); positive here (net up)
+if st.sharpe <= 0 { fail("net-up curve has positive sharpe"); }
+// cagr over (n-1) periods: (2000/1000)^(1/4) - 1
+approx(st.cagr, 0.189207, "cagr = 2^(1/4)-1");
+
+// win_rate needs per-trade P&L; without trades it is nil, with a trade list it is the fraction up
+eq(T.equity_stats(curve, nil).win_rate, nil, "no trades -> win_rate nil");
+let wr = T.equity_stats(curve, [ map{ pnl: 50 }, map{ pnl: 0 - 20 }, map{ pnl: 30 }, map{ pnl: 0 } ]);
+approx(wr.win_rate, 0.5, "2 of 4 trades strictly positive = 50%");
+
+// a flat curve: zero return, zero volatility, sharpe defined as 0 (no risk, no excess)
+let flatc = [1000, 1000, 1000];
+let fs = T.equity_stats(flatc, nil);
+eq(fs.return_pct, 0, "flat curve zero return");
+eq(fs.volatility, 0, "flat curve zero volatility");
+eq(fs.sharpe, 0, "flat curve sharpe defined as 0 (no div-by-zero)");
+
+// a losing curve: negative return + negative sharpe
+let down = [1000, 900, 800, 850];
+let ds = T.equity_stats(down, nil);
+if ds.return_pct >= 0 { fail("down curve negative return"); }
+if ds.sharpe >= 0 { fail("down curve negative sharpe"); }
+
+// ── report: one-call human-readable performance summary ─────────────────────────────
+let btr = T.backtest([100, 110, 121, 110, 133], fn(i, px) { return "long"; }, 1000);
+let rep = T.report(btr, nil);
+if not is_string(rep) { fail("report is a string"); }
+if str_index_of(rep, "\n") < 0 { fail("report is multi-line"); }
+if str_index_of(rep, "return") < 0 { fail("report shows return"); }
+if str_index_of(rep, "sharpe") < 0 and str_index_of(rep, "Sharpe") < 0 { fail("report shows sharpe"); }
+if str_index_of(rep, "drawdown") < 0 { fail("report shows drawdown"); }
+if str_index_of(rep, "%") < 0 { fail("report shows percentages"); }
+// with a trade list the win rate line appears
+let rep2 = T.report(btr, [ map{ pnl: 10 }, map{ pnl: 0 - 5 } ]);
+if str_index_of(rep2, "win") < 0 and str_index_of(rep2, "Win") < 0 { fail("report shows win rate when trades given"); }
+
+print "trading_pass";
