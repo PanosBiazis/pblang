@@ -1,0 +1,344 @@
+// stdlib/nn_graph.sapp — a free-form GRAPH neural network (beyond the layered MLP).
+//
+// Nodes are joined by directed BONDS, and a pair may share MANY parallel bonds — multiple
+// weighted channels of communication, so the "bond" between two nodes can be made strong
+// and multi-stranded. The graph can be fully (multi-)connected (every node to every other),
+// nodes can be BORN (added + wired to all) or KILLED (removed + bonds reindexed) at
+// runtime, and each node makes CHOICES: which activation it uses and which incoming bond it
+// trusts most. Because connectivity may be cyclic, forward() propagates for a number of
+// synchronous steps.
+//
+//   let G = import("stdlib:nn_graph.sapp");
+//   let g = G.graph_new(); G.add_node(g, 0, "linear"); ...
+//   G.fully_connect(g, 0.1); G.birth_node(g, 0, "tanh", 0.1);
+//   let out = G.forward(g, inputs, 3);
+
+// node: { bias, act, value }   bond: { from, to, weight }
+fn graph_new() { return map{ nodes: [], bonds: [] }; }
+
+fn node_count(g) { return len(g.nodes); }
+fn bond_total(g) { return len(g.bonds); }
+fn bond_at(g, i) { return g.bonds[i]; }
+
+// add_node(g, bias, act) — append a node; returns its id. act ∈ linear/relu/sigmoid/tanh.
+fn add_node(g, bias, act) {
+    let id = len(g.nodes);
+    push(g.nodes, map{ bias: bias, act: act, value: 0 });
+    return id;
+}
+
+// add_bond(g, from, to, weight) — a directed bond. Calling it again on the same pair adds
+// ANOTHER parallel bond (multi-channel connection), it does not overwrite.
+fn add_bond(g, from, to, weight) {
+    push(g.bonds, map{ from: from, to: to, weight: weight });
+    return g;
+}
+
+// bond_count(g, from, to) — how many parallel bonds (channels) join the pair.
+fn bond_count(g, from, to) {
+    let c = 0;
+    let i = 0;
+    while i < len(g.bonds) { if g.bonds[i].from == from and g.bonds[i].to == to { c = c + 1; } i = i + 1; }
+    return c;
+}
+
+// bond_strength(g, from, to) — combined weight across all parallel bonds.
+fn bond_strength(g, from, to) {
+    let s = 0;
+    let i = 0;
+    while i < len(g.bonds) { if g.bonds[i].from == from and g.bonds[i].to == to { s = s + g.bonds[i].weight; } i = i + 1; }
+    return s;
+}
+
+// strengthen(g, from, to, delta) — reinforce the bond: add delta to EVERY existing channel
+// between the pair; if there is none, create one with weight delta.
+fn strengthen(g, from, to, delta) {
+    let found = false;
+    let i = 0;
+    while i < len(g.bonds) {
+        if g.bonds[i].from == from and g.bonds[i].to == to { g.bonds[i].weight = g.bonds[i].weight + delta; found = true; }
+        i = i + 1;
+    }
+    if not found { add_bond(g, from, to, delta); }
+    return g;
+}
+
+// fully_connect(g, weight) — add a directed bond for every ordered pair i≠j (multi-directed
+// mesh). Adds to whatever bonds already exist (so it can deepen connectivity).
+fn fully_connect(g, weight) {
+    let i = 0;
+    while i < len(g.nodes) {
+        let j = 0;
+        while j < len(g.nodes) { if i != j { add_bond(g, i, j, weight); } j = j + 1; }
+        i = i + 1;
+    }
+    return g;
+}
+
+// birth_node(g, bias, act, w) — a node is BORN: appended and wired to/from every existing
+// node (both directions, multi-directed). Returns the new node id.
+fn birth_node(g, bias, act, w) {
+    let id = len(g.nodes);
+    push(g.nodes, map{ bias: bias, act: act, value: 0 });
+    let i = 0;
+    while i < id {
+        add_bond(g, id, i, w);
+        add_bond(g, i, id, w);
+        i = i + 1;
+    }
+    return id;
+}
+
+// kill_node(g, id) — remove node `id` and every bond touching it; remaining node indices
+// (and the bond endpoints that reference them) shift down to stay contiguous.
+fn kill_node(g, id) {
+    let nodes = [];
+    let i = 0;
+    while i < len(g.nodes) { if i != id { push(nodes, g.nodes[i]); } i = i + 1; }
+    let bonds = [];
+    let b = 0;
+    while b < len(g.bonds) {
+        let e = g.bonds[b];
+        if e.from != id and e.to != id {
+            let f = e.from; if f > id { f = f - 1; }
+            let t = e.to; if t > id { t = t - 1; }
+            push(bonds, map{ from: f, to: t, weight: e.weight });
+        }
+        b = b + 1;
+    }
+    g.nodes = nodes;
+    g.bonds = bonds;
+    return g;
+}
+
+// ── choices ───────────────────────────────────────────────────────────────────────
+fn node_choice(g, id, act) { g.nodes[id].act = act; return g; }
+fn get_choice(g, id) { return g.nodes[id].act; }
+
+// dominant_input(g, id) — the from-node of the strongest (max |weight|) incoming bond:
+// the node's "choice" of who to listen to. Returns -1 if it has no inputs.
+fn dominant_input(g, id) {
+    let best = 0 - 1;
+    let bestw = 0 - 1;
+    let i = 0;
+    while i < len(g.bonds) {
+        if g.bonds[i].to == id {
+            let w = g.bonds[i].weight; if w < 0 { w = 0 - w; }
+            if w > bestw { bestw = w; best = g.bonds[i].from; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// ── activation + forward ──────────────────────────────────────────────────────────
+fn _activate(act, x) {
+    if act == "relu" { if x > 0 { return x; } return 0; }
+    if act == "sigmoid" { return 1 / (1 + num_exp(0 - x)); }
+    if act == "tanh" {
+        if x > 20 { return 1; }
+        if x < 0 - 20 { return 0 - 1; }
+        let e2 = num_exp(2 * x);
+        return (e2 - 1) / (e2 + 1);
+    }
+    return x;   // linear
+}
+
+// forward(g, inputs, steps) — clamp the first len(inputs) nodes to `inputs` and propagate
+// for `steps` synchronous rounds (each node = act(bias + Σ over incoming bonds w·from)).
+// Returns the value of every node. `steps` ≥ graph depth (or more for cyclic graphs).
+fn forward(g, inputs, steps) {
+    let vals = [];
+    let i = 0;
+    while i < len(g.nodes) {
+        if i < len(inputs) { push(vals, inputs[i]); } else { push(vals, 0); }
+        i = i + 1;
+    }
+    let s = 0;
+    while s < steps {
+        let next = [];
+        let n = 0;
+        while n < len(g.nodes) {
+            if n < len(inputs) {
+                push(next, inputs[n]);
+            } else {
+                let sum = g.nodes[n].bias;
+                let b = 0;
+                while b < len(g.bonds) {
+                    if g.bonds[b].to == n { sum = sum + g.bonds[b].weight * vals[g.bonds[b].from]; }
+                    b = b + 1;
+                }
+                push(next, _activate(g.nodes[n].act, sum));
+            }
+            n = n + 1;
+        }
+        vals = next;
+        s = s + 1;
+    }
+    return vals;
+}
+
+// ── Self-typing nodes: a node decides its own ROLE, data FLOW and PROCESSING ───────
+fn set_role(g, id, role) { g.nodes[id].role = role; return g; }
+fn get_role(g, id) { return try g.nodes[id].role catch nil; }
+
+fn _has_incoming(g, id) { let i = 0; while i < len(g.bonds) { if g.bonds[i].to == id { return true; } i = i + 1; } return false; }
+fn _has_outgoing(g, id) { let i = 0; while i < len(g.bonds) { if g.bonds[i].from == id { return true; } i = i + 1; } return false; }
+
+// decide_role(g, id) — the node decides what type it wants to be from how data flows
+// through it: only-outgoing → "input", only-incoming → "output", both → "hidden", neither
+// → "isolated". Stores and returns the role.
+fn decide_role(g, id) {
+    let inc = _has_incoming(g, id);
+    let out = _has_outgoing(g, id);
+    let role = "hidden";
+    if not inc and not out { role = "isolated"; }
+    else if (not inc) and out { role = "input"; }
+    else if inc and (not out) { role = "output"; }
+    g.nodes[id].role = role;
+    return role;
+}
+
+// auto_type(g) — every node decides its role; returns the tally {input,output,hidden,isolated}.
+fn auto_type(g) {
+    let counts = map{ input: 0, output: 0, hidden: 0, isolated: 0 };
+    let i = 0;
+    while i < len(g.nodes) {
+        let r = decide_role(g, i);
+        counts[r] = counts[r] + 1;
+        i = i + 1;
+    }
+    return counts;
+}
+
+// route(g, id) — the node decides where its data flows next: the target of its strongest
+// outgoing bond (-1 if it has none).
+fn route(g, id) {
+    let best = 0 - 1;
+    let bestw = 0 - 1;
+    let i = 0;
+    while i < len(g.bonds) {
+        if g.bonds[i].from == id {
+            let w = g.bonds[i].weight; if w < 0 { w = 0 - w; }
+            if w > bestw { bestw = w; best = g.bonds[i].to; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// auto_process(g) — each node decides its processing (activation) from its role:
+// input→linear, hidden→tanh, output→sigmoid. Deciding role first if needed.
+fn auto_process(g) {
+    let i = 0;
+    while i < len(g.nodes) {
+        let r = try g.nodes[i].role catch nil;
+        if r == nil { r = decide_role(g, i); }
+        if r == "input" { g.nodes[i].act = "linear"; }
+        else if r == "output" { g.nodes[i].act = "sigmoid"; }
+        else if r == "hidden" { g.nodes[i].act = "tanh"; }
+        i = i + 1;
+    }
+    return g;
+}
+
+// ── Hebbian self-wiring + developmental training ──────────────────────────────────
+fn _clampw(w, cap) { if w > cap { return cap; } if w < 0 - cap { return 0 - cap; } return w; }
+
+// hebbian_step(g, inputs, steps, rate) — "neurons that fire together wire together":
+// run forward, then nudge every bond by rate·from_value·to_value (co-active → stronger,
+// anti-correlated → weaker). Weights are capped for stability. Returns the node values.
+fn hebbian_step(g, inputs, steps, rate) {
+    let vals = forward(g, inputs, steps);
+    let i = 0;
+    while i < len(g.bonds) {
+        let e = g.bonds[i];
+        e.weight = _clampw(e.weight + rate * vals[e.from] * vals[e.to], 1000);
+        i = i + 1;
+    }
+    return vals;
+}
+
+// graph_curiosity(g, inputs, steps) — mean |activation| of the non-input nodes: how
+// active/"surprised" the graph is (the signal that drives birth-when-curious).
+fn graph_curiosity(g, inputs, steps) {
+    let vals = forward(g, inputs, steps);
+    let s = 0;
+    let c = 0;
+    let i = len(inputs);
+    while i < len(vals) { let v = vals[i]; if v < 0 { v = 0 - v; } s = s + v; c = c + 1; i = i + 1; }
+    if c == 0 { return 0; }
+    return s / c;
+}
+
+fn _node_activity(g, inputs_list, steps, id) {
+    if len(inputs_list) == 0 { return 0; }
+    let s = 0;
+    let k = 0;
+    while k < len(inputs_list) {
+        let vals = forward(g, inputs_list[k], steps);
+        let v = vals[id]; if v < 0 { v = 0 - v; }
+        s = s + v;
+        k = k + 1;
+    }
+    return s / len(inputs_list);
+}
+
+// graph_train(g, inputs_list, opts) — Hebbian learning over a batch with two
+// developmental rules: BIRTH-WHEN-CURIOUS (mean curiosity > birth_threshold → a node is
+// born and wired in) and KILL-WHEN-IDLE (the least-active non-input node, if below
+// kill_threshold, is pruned — but never below a floor of input_count+1 nodes). opts:
+// epochs(5), steps(2), rate(0.05), birth_threshold(huge=off), kill_threshold(-1=off),
+// act("tanh"). Returns { births, kills, graph }.
+fn graph_train(g, inputs_list, opts) {
+    if opts == nil { opts = map{}; }
+    let epochs = try opts.epochs catch 5;
+    let steps = try opts.steps catch 2;
+    let rate = try opts.rate catch 0.05;
+    let birth_threshold = try opts.birth_threshold catch 1000000000;
+    let kill_threshold = try opts.kill_threshold catch (0 - 1);
+    let act = try opts.act catch "tanh";
+    if epochs == nil { epochs = 5; }
+    if steps == nil { steps = 2; }
+    if rate == nil { rate = 0.05; }
+    if birth_threshold == nil { birth_threshold = 1000000000; }
+    if kill_threshold == nil { kill_threshold = 0 - 1; }
+    if act == nil { act = "tanh"; }
+
+    let inputlen = 0;
+    if len(inputs_list) > 0 { inputlen = len(inputs_list[0]); }
+    let births = 0;
+    let kills = 0;
+    let e = 0;
+    while e < epochs {
+        let totalcur = 0;
+        let k = 0;
+        while k < len(inputs_list) {
+            hebbian_step(g, inputs_list[k], steps, rate);
+            totalcur = totalcur + graph_curiosity(g, inputs_list[k], steps);
+            k = k + 1;
+        }
+        let avg = 0;
+        if len(inputs_list) > 0 { avg = totalcur / len(inputs_list); }
+        if avg > birth_threshold { birth_node(g, 0, act, rate); births = births + 1; }
+        if kill_threshold >= 0 and len(g.nodes) > inputlen + 1 {
+            let li = 0 - 1;
+            let la = 1000000000;
+            let n = inputlen;
+            while n < len(g.nodes) {
+                let a = _node_activity(g, inputs_list, steps, n);
+                if a < la { la = a; li = n; }
+                n = n + 1;
+            }
+            if li >= 0 and la < kill_threshold { kill_node(g, li); kills = kills + 1; }
+        }
+        e = e + 1;
+    }
+    return map{ births: births, kills: kills, graph: g };
+}
+
+export graph_new, node_count, bond_total, bond_at, add_node, add_bond;
+export bond_count, bond_strength, strengthen, fully_connect, birth_node, kill_node;
+export node_choice, get_choice, dominant_input, forward;
+export hebbian_step, graph_curiosity, graph_train;
+export set_role, get_role, decide_role, auto_type, route, auto_process;

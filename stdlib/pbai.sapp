@@ -17,6 +17,14 @@ let nn = import("stdlib/nn.sapp");
 let MCP = import("stdlib:pb_mcp.sapp");
 let PBAI_ASSETS = import("stdlib/pbai_assets.sapp");
 let PBAI_LM = import("stdlib/pbai_lm.sapp");
+let P = import("stdlib:parallel.sapp");   // multi-core batch classification
+let OS = import("stdlib:os.sapp");         // device detection
+let W = import("stdlib:watch.sapp");       // GPU/hardware view
+let ACC = import("stdlib:accelerator.sapp"); // CPU/GPU/NPU(AI accel) routing
+let PR = import("stdlib:provider_registry.sapp"); // external LLM voters (ollama / OpenAI-compat)
+let OLL = import("stdlib:ollama.sapp");            // real local ollama models as voters
+let T = import("stdlib:tensor.sapp");              // matmul batch (auto-GPU under --features gpu)
+let ENS = import("stdlib:pbai_ensemble.sapp"); // unified MLLM ensemble engine (shared)
 
 // ── Text utilities ───────────────────────────────────────────────────────────────────
 fn _count(s, sub) {
@@ -26,10 +34,24 @@ fn _count(s, sub) {
 
 // ── Neural intent classifier (the pbAI model) ────────────────────────────────────────
 // Bag-of-keywords features → an MLP → one of 5 intents. Trained once, in pblang.
-let _VOCAB = ["explain", "what", "does", "describe", "step", "bug", "error",
-    "wrong", "mistake", "fix", "issue", "improve", "better", "optimize",
-    "refactor", "comment", "document", "how", "why", "generate", "write", "review",
-    "security", "sandbox", "capability", "ide", "browser", "typeclass", "logic", "reactive"];
+// Discriminative bag-of-keywords. Grouped by the intent each word pulls toward so the
+// MLP has strong, low-overlap signal: explain / bugs / improve / comment / general.
+let _VOCAB = [
+    // explain
+    "explain", "what", "does", "describe", "step", "walk", "through", "trace",
+    "understand", "overview", "summary", "means",
+    // bugs
+    "bug", "error", "wrong", "mistake", "fix", "issue", "throw", "crash", "fail",
+    "exception", "broken", "debug", "panic", "problem",
+    // improve
+    "improve", "better", "optimize", "refactor", "faster", "cleaner", "performance",
+    "speed", "simplify", "efficient",
+    // comment
+    "comment", "document", "docstring", "annotate",
+    // general
+    "how", "why", "generate", "write", "create", "build", "implement", "review",
+    "security", "sandbox", "capability", "ide", "browser", "typeclass", "concurrency",
+    "logic", "reactive"];
 
 // intent ids: 0 explain  1 bugs  2 improve  3 comment  4 general
 let _INTENTS = ["explain", "bugs", "improve", "comment", "general"];
@@ -53,30 +75,78 @@ fn _onehot(idx, n) {
 }
 
 // Trained weights are CACHED on disk so the model loads (fast) instead of retraining
-// (~21 s) on every fresh process — train-once, load-forever. The cache is guarded by the
-// vocabulary size, so a model change retrains automatically.
+// on every fresh process — train-once, load-forever. The cache is guarded by BOTH the
+// vocabulary size AND a data version, so changing the training set (not just the vocab)
+// invalidates the cache and forces a retrain.
 let _WPATH = "stdlib/pbai_model.json";
 let _MODEL = nil;
+let _MODEL_VERSION = 2;   // bump whenever _train_model's data/architecture changes
+
+// _augment_data() — GENERATED training data: one single-keyword sample per strong,
+// unambiguous keyword, mapped to its intent. This teaches every distinctive word's class
+// directly (multi-word prompts then sum these signals), making the classifier robust to
+// phrasings the hand-written sentences don't cover. Ambiguous words (what/how/why/write/
+// create/review) are intentionally excluded so they don't get pinned to one intent.
+fn _aug(out, words, intent) {
+    let i = 0;
+    while i < len(words) { array_push(out, nn.sample(_featurize(words[i]), _onehot(intent, 5))); i = i + 1; }
+    return out;
+}
+fn _augment_data() {
+    let out = [];
+    _aug(out, ["explain", "describe", "walk", "through", "trace", "understand", "overview", "summary", "means", "step"], 0);
+    _aug(out, ["bug", "error", "wrong", "mistake", "issue", "throw", "crash", "fail", "exception", "broken", "debug", "panic", "problem"], 1);
+    _aug(out, ["improve", "optimize", "refactor", "faster", "cleaner", "performance", "speed", "simplify", "efficient", "better"], 2);
+    _aug(out, ["comment", "document", "docstring", "annotate"], 3);
+    _aug(out, ["typeclass", "concurrency", "security", "sandbox", "capability", "logic", "reactive", "implement", "generate", "build"], 4);
+    return out;
+}
+
 fn _train_model() {
-    let net = nn.mlp_new(len(_VOCAB), 14, 5, 42);
+    let net = nn.mlp_new(len(_VOCAB), 16, 5, 42);
     let data = [
+        // 0 explain
         nn.sample(_featurize("explain what this code does"), _onehot(0, 5)),
         nn.sample(_featurize("describe this program step by step"), _onehot(0, 5)),
+        nn.sample(_featurize("what does this function do"), _onehot(0, 5)),
+        nn.sample(_featurize("give an overview summary of this"), _onehot(0, 5)),
+        nn.sample(_featurize("help me understand and trace through this logic"), _onehot(0, 5)),
+        nn.sample(_featurize("walk through this step by step"), _onehot(0, 5)),
+        // 1 bugs
         nn.sample(_featurize("find the bugs and errors in this"), _onehot(1, 5)),
         nn.sample(_featurize("what is wrong mistake issue with this code"), _onehot(1, 5)),
+        nn.sample(_featurize("this code throws an exception and crashes"), _onehot(1, 5)),
+        nn.sample(_featurize("debug why this fails and panics"), _onehot(1, 5)),
+        nn.sample(_featurize("fix the broken function with the error"), _onehot(1, 5)),
+        // 2 improve
         nn.sample(_featurize("improve and optimize refactor this code"), _onehot(2, 5)),
         nn.sample(_featurize("make this better"), _onehot(2, 5)),
+        nn.sample(_featurize("rewrite this to be faster and cleaner"), _onehot(2, 5)),
+        nn.sample(_featurize("simplify and speed up this for performance and efficient code"), _onehot(2, 5)),
+        // 3 comment
         nn.sample(_featurize("add comments and document this code"), _onehot(3, 5)),
+        nn.sample(_featurize("add a docstring and annotate this function"), _onehot(3, 5)),
+        // 4 general
         nn.sample(_featurize("how does pblang work and why"), _onehot(4, 5)),
-        nn.sample(_featurize("generate write create a program"), _onehot(4, 5))
+        nn.sample(_featurize("generate write create a program"), _onehot(4, 5)),
+        nn.sample(_featurize("write and create a new function or script"), _onehot(4, 5)),
+        nn.sample(_featurize("build and implement a new feature"), _onehot(4, 5)),
+        nn.sample(_featurize("what is a typeclass and concurrency in pblang"), _onehot(4, 5)),
+        nn.sample(_featurize("review the security sandbox capability of the ide browser"), _onehot(4, 5))
     ];
-    nn.train(net, data, 500, 0.3);
+    // feed the GENERATED per-keyword samples alongside the hand-written sentences
+    let aug = _augment_data();
+    let ai = 0;
+    while ai < len(aug) { array_push(data, aug[ai]); ai = ai + 1; }
+    nn.train(net, data, 360, 0.3);
+    net["pbai_version"] = _MODEL_VERSION;
     return net;
 }
 fn _model() {
     if _MODEL != nil { return _MODEL; }
     let cached = try json_parse(fs_read(_WPATH)) catch nil;
-    if cached != nil and (try cached.l1.n_in catch 0) == len(_VOCAB) {
+    if cached != nil and (try cached.l1.n_in catch 0) == len(_VOCAB)
+        and (try cached.pbai_version catch 0) == _MODEL_VERSION {
         _MODEL = cached;
         return cached;
     }
@@ -165,6 +235,13 @@ fn _repair_preview(code) {
     out = str_replace_all(out, "let s fs_read(", "let s = fs_read(");
     out = str_replace_all(out, "let s  fs_write(", "let s = fs_write(");
     out = str_replace_all(out, "let s fs_write(", "let s = fs_write(");
+    // unambiguous cross-language swaps — these tokens are NEVER valid pblang, so the
+    // rewrite is always safe (ambiguous ones like None/True/.length are flagged, not auto-rewritten).
+    out = str_replace_all(out, "!==", "!=");
+    out = str_replace_all(out, "===", "==");
+    out = str_replace_all(out, "&&", "and");
+    out = str_replace_all(out, "||", "or");
+    out = str_replace_all(out, "null", "nil");
     if _looks_like_missing_fn(out) { out = "fn " + out; }
     return out;
 }
@@ -368,6 +445,58 @@ fn _bugs(code, s) {
         out = out + "- functions defined but no `return` — they yield nil; confirm that's intended.\n"; found = found + 1;
     }
     if s.todos > 0 { out = out + "- " + str(s.todos) + " TODO/FIXME marker(s) still in the code.\n"; found = found + 1; }
+    // more pblang gotchas an outside model (trained on other languages) gets wrong:
+    if str_contains(code, "elif ") {
+        out = out + "- pblang has no `elif`; use `else if`.\n"; found = found + 1;
+    }
+    if str_contains(code, "foreach") {
+        out = out + "- no `foreach`; iterate with `for v in arr { ... }`.\n"; found = found + 1;
+    }
+    if str_contains(code, "++;") or str_contains(code, "++)") or str_contains(code, "--;") or str_contains(code, "--)") {
+        out = out + "- pblang has no `++`/`--`; write `i = i + 1` / `i = i - 1`.\n"; found = found + 1;
+    }
+    if str_contains(code, "exit(") {
+        out = out + "- there is no `exit()` builtin; `throw` to abort, or signal completion via a status file.\n"; found = found + 1;
+    }
+    if str_contains(code, "===") or str_contains(code, "!==") {
+        out = out + "- pblang uses `==` / `!=`; there is no `===` / `!==`.\n"; found = found + 1;
+    }
+    if str_contains(code, "console.log") or str_contains(code, "printf(") or str_contains(code, "println") {
+        out = out + "- output is `print x;` (a statement) — not console.log / printf / println.\n"; found = found + 1;
+    }
+    // cross-language gotchas — mistakes a model trained on JS/Python/C makes, that pbAI
+    // knows are wrong because it knows pblang's OWN syntax:
+    if str_contains(code, "&&") or str_contains(code, "||") {
+        out = out + "- pblang's boolean operators are words: use `and` / `or` (and `not`), not `&&` / `||`.\n"; found = found + 1;
+    }
+    // `!` negation (but `!=` is valid) — match it only in clear negation positions.
+    if str_contains(code, "!(") or str_contains(code, "if !") or str_contains(code, "while !") or str_contains(code, "= !") or str_contains(code, "return !") {
+        out = out + "- pblang has no `!` negation; use `not x`.\n"; found = found + 1;
+    }
+    if str_contains(code, "null") or str_contains(code, "None") or str_contains(code, "undefined") {
+        out = out + "- pblang's empty value is `nil`; use `nil` (not null / None / undefined).\n"; found = found + 1;
+    }
+    if str_contains(code, "True") or str_contains(code, "False") {
+        out = out + "- booleans are lowercase `true`/`false` (not capitalized True/False).\n"; found = found + 1;
+    }
+    if str_contains(code, "function ") {
+        out = out + "- pblang has no `function` keyword; define with `fn name(...) { ... }`.\n"; found = found + 1;
+    }
+    if str_contains(code, "=>") {
+        out = out + "- no `=>` arrow functions; closures are `fn(x) { ... }`.\n"; found = found + 1;
+    }
+    if str_contains(code, "var ") {
+        out = out + "- no `var`/`const` declaration keyword for that; bind with `let name = value;`.\n"; found = found + 1;
+    }
+    if str_contains(code, ".length") {
+        out = out + "- there is no `.length` property; use `len(x)` for arrays/strings/maps.\n"; found = found + 1;
+    }
+    if str_contains(code, "${") {
+        out = out + "- no string interpolation; concatenate with `+` (e.g. \"hi \" + name).\n"; found = found + 1;
+    }
+    if str_contains(code, "lambda ") {
+        out = out + "- pblang has no `lambda`; an anonymous function is `fn(x) { ... }`.\n"; found = found + 1;
+    }
     let fixed = _repair_preview(code);
     if fixed != str_trim(code) {
         out = out + "\nSuggested pblang fix:\n```pblang\n" + fixed + "\n```\n";
@@ -444,7 +573,9 @@ fn _general(prompt) {
         return "pbAI tools: pb_mcp bridge is available as stdlib/pb_mcp.sapp; safe core tools include workspace_context/read_file/list_files/project_tree/grep_code.";
     }
     if str_contains(t, "self-host") or str_contains(t, "selfhost") or str_contains(t, "bootstrap") { return "pbAI: pblang is SELF-HOSTING — stdlib/compiler/ (tokenizer/parser/typeck/codegen/vm, all .sapp) compiles AND runs pblang. F5 in the IDE runs your buffer through it."; }
-    if str_contains(t, "jit") or str_contains(t, "cranelift") or str_contains(t, "fast") or str_contains(t, "perf") or str_contains(t, "speed") { return "pbAI: perf — the VM is a Rust bytecode interpreter; a Cranelift JIT (gated by PBLANG_JIT) compiles loop-free/call-free numeric fns. Also: cache expensive work to disk, and don't recompute per frame."; }
+    if str_contains(t, "jit") or str_contains(t, "cranelift") or str_contains(t, "fast") or str_contains(t, "perf") or str_contains(t, "speed") { return "pbAI: perf — the VM is a Rust bytecode interpreter; a Cranelift JIT (gated by PBLANG_JIT) compiles loop-free/call-free numeric fns. For integer/float kernels you can also emit REAL native machine code (ask about 'native codegen'). Cache expensive work to disk; don't recompute per frame."; }
+    if str_contains(t, "native") or str_contains(t, "machine code") or str_contains(t, "codegen") or str_contains(t, "compile to") or str_contains(t, "binary") or str_contains(t, "exe ") or str_contains(t, "assembl") { return "pbAI: native codegen (NO Rust) — emit REAL machine code: stdlib/codegen_x64 / codegen_x86 (i386) / codegen_arm64 cover arithmetic, loops, conditionals, functions, recursion, floats (SSE2) and syscalls; wrap as ELF/Mach-O/PE with stdlib/codegen_cross. Easiest paths: stdlib/native.sapp (run(ir)/run_value(ir) — JIT by exec), stdlib/native_studio.sapp (validate+optimize+cache+metrics; folded constants run in-process), and stdlib/native_lang.sapp lowers expression/variable ASTs to native. Functions get args+return+recursion via codegen_x64.compile_call_unit."; }
+    if str_contains(t, "device") or str_contains(t, "driver") or str_contains(t, "hal") or str_contains(t, "gpio") or str_contains(t, "ioctl") or str_contains(t, "i2c") { return "pbAI: devices/drivers — use the current OS drivers from pblang. stdlib/device.sapp reads/writes /dev, /sys, /proc (e.g. random_uuid() via the kernel RNG driver; ⚠ never fs_read_bytes an UNBOUNDED device like /dev/urandom — do a sized read in generated native code instead). stdlib/hal.sapp is a HAL: a device catalog + common verbs (read/write/open/ioctl/...) mapped to Linux syscall numbers per arch, the Windows API, and ioctl request codes — hal.recipe(class, verb) gives the how-to. ioctl/mmap devices are driven by generated syscalls; GPU/NPU vendor stacks need FFI."; }
     if str_contains(t, "security") or str_contains(t, "capab") or str_contains(t, "permission") or str_contains(t, "allow") or str_contains(t, "sandbox") or str_contains(t, "exec") { return "pbAI: security — capabilities gate sensitive builtins. `--sandbox` denies risky defaults; `--allow-exec` and `--allow-ffi` are high-trust. env reads can expose secrets, so use `--deny-env` for untrusted scripts."; }
     if str_contains(t, "import") or str_contains(t, "module") { return "pbAI: modules — `let m = import(\"stdlib/foo.sapp\");` then `m.fn(...)`. Export with `export a, b;`. Keep imports at TOP level (lazy import() inside a fn resolves relative to the CWD)."; }
     if str_contains(t, "error") or str_contains(t, "try") or str_contains(t, "catch") or str_contains(t, "throw") { return "pbAI: errors — `try EXPR catch FALLBACK` (an expression); `throw v` raises; `error(\"msg\")` raises from a builtin. Missing map keys and bad index raise — wrap them."; }
@@ -462,6 +593,10 @@ fn _general(prompt) {
     if str_contains(t, "struct") or str_contains(t, "class") or str_contains(t, "oop") or str_contains(t, "object") { return "pbAI: OOP — `struct Pt { x, y }` and `class` with methods both self-host; construct `Pt(1, 2)`, access `p.x`, call methods `obj:method(args)`."; }
     if str_contains(t, "string") or str_contains(t, "text") or str_contains(t, "char") { return "pbAI: strings are codepoint-based; `<`/`>` comparison is unsupported (use strcharcodeat/length). `+` concatenates; str_split/str_slice/str_index_of/str_contains/strcharcodeat/strfromcharcode are the workhorses."; }
     if str_contains(t, "print") or str_contains(t, "output") { return "pbAI: `print x;` is a STATEMENT (not a function) — `print(x)` errors. It writes a line to stdout; the IDE F5 captures printed values."; }
+    if str_contains(t, "resize") or (str_contains(t, "window") and str_contains(t, "size")) { return "pbAI: window size — `win.size()` returns the FIXED framebuffer size, NOT the live OS-resized size (the graphics builtin never exposes it). Read the real resized window with `stdlib/window_probe.sapp`: `wp.size_by_title(title)` queries the WM (xwininfo/xdotool; needs --allow-exec). Poll it and relayout when `wp.changed(prev, cur)`."; }
+    if str_contains(t, "graphics") or str_contains(t, "window") or str_contains(t, "draw") or str_contains(t, "gui") or str_contains(t, "canvas") { return "pbAI: graphics — `let gfx = import(\"stdlib/graphics.sapp\"); let win = gfx.Window(w, h, title);` then per frame `win.clear(c)`, `win.rect/line/point/text(...)`, `win.present()`, `win.pollEvents()`. `gfx.run(win, state, update, draw, fps)` drives the loop. Build a modern UI with `stdlib/ui_kit.sapp` (rounded cards/pills/scrollbar) + `stdlib/theme.sapp`."; }
+    if str_contains(t, "test") or str_contains(t, "tdd") or str_contains(t, "assert") { return "pbAI: testing — add `*_test.sapp` files under tests/semantics that `print \"..._pass\"` on success and `throw` on failure (each defines `test_` cases or runs wholesale); run `pblang test semantics` or `pblang run tests/semantics/x_test.sapp --allow-all`. `stdlib/assert.sapp` has eq/gt/contains helpers. TDD: write the failing test FIRST, watch it fail, then implement."; }
+    if str_contains(t, "package") or str_contains(t, "depend") or str_contains(t, "registry") or str_contains(t, "manifest") { return "pbAI: packages — a project carries a `pblang.toml` manifest; `pblang build` generates the lockfile + typechecks the entry, `pblang manifest-check` validates the manifest. Imports resolve `stdlib/...` and local modules — keep them at top level."; }
     if str_contains(t, "ide") or str_contains(t, "editor") or str_contains(t, "shortcut") or str_contains(t, "key") { return "pbAI: IDE — tabs CODE/TERMINAL/DESIGN/AI/BROWSER. In CODE: F5 run, F6 check, Ctrl+S save, Ctrl+F find, Ctrl+arrow word/fast move, Shift+arrow select. Launch with `pblang --ide`."; }
     if str_contains(t, "hello") or str_contains(t, "hi ") or t == "hi" or str_contains(t, "who are you") or str_contains(t, "what can you") { return "pbAI: I'm pblang's own assistant (a neural intent classifier + pblang-grounded skills; no network, no Ollama). Ask about the language, or use EXPLAIN/BUGS/IMPROVE/COMMENT on the code in your editor."; }
     return "pbAI (pblang's own assistant). Ask about pblang specifics (maps, loops, fns, OOP, strings, errors, imports, async, precision, JIT, capabilities), or use a quick action (explain / bugs / improve / comment) on your editor buffer.";
@@ -491,6 +626,17 @@ fn _run(intent, prompt) {
 fn respond(prompt) {
     return _run(classify(prompt), prompt);
 }
+
+// Direct skill entry points — run a specific code skill WITHOUT intent classification
+// (handy for tools/agents that already know what they want, and for fast/deterministic
+// use). Each extracts the code from the prompt and runs the grounded analyzer.
+fn review(prompt) { let code = _extract_code(prompt); return _bugs(code, _scan(code)); }
+fn suggest(prompt) { let code = _extract_code(prompt); return _improve(code, _scan(code)); }
+fn explain_code(prompt) { let code = _extract_code(prompt); return _explain(code, _scan(code)); }
+fn comment_code(prompt) { let code = _extract_code(prompt); return _comment(code, _scan(code)); }
+// knowledge(prompt) — answer a pblang question directly from the grounded knowledge base
+// (the _general skill), bypassing intent classification.
+fn knowledge(prompt) { return _general(prompt); }
 
 fn generate(prompt, n = 80) {
     let seed = _extract_code(prompt);
@@ -576,6 +722,198 @@ fn top_intents(prompt, k) {
     return out;
 }
 
+// ── device-aware batch classification ─────────────────────────────────────────────────
+// capabilities() — the compute power pbAI can use on this machine.
+fn capabilities() {
+    let cores = try OS.cpu_count() catch 1;
+    let gpu = false;
+    let g = try W.gpus() catch nil;
+    if g != nil { let a = try g.available catch false; if a == true { gpu = true; } }
+    return map{ cpu_cores: cores, gpu: gpu, parallel_batch: true,
+        cpu_accel: try ACC.cpu_accel() catch map{},
+        accelerators: try ACC.detect() catch [], best_device: try ACC.best() catch "cpu" };
+}
+// accelerators() — full CPU/GPU/NPU(AI accelerator) survey. best_device() — best USABLE one.
+fn accelerators() { return ACC.detect(); }
+fn best_device() { return ACC.best(); }
+// register_accel(kind, fn) — plug a native (FFI) GPU/NPU runtime so pbAI offloads to it.
+fn register_accel(kind, f) { return ACC.register_runtime(kind, f); }
+// classify_batch_smart(prompts) — route to the AI accelerator if a runtime is plugged, else
+// fan out across all CPU cores. "Use the full power of the device", honestly.
+fn classify_batch_smart(prompts) {
+    let d = ACC.best();
+    if d != "cpu" {
+        let r = ACC.run(d, prompts);
+        if r != nil { return r; }
+    }
+    // Honest GPU path: on a `--features gpu` build the tensor matmul auto-offloads to the GPU.
+    // (Returns plain intent strings, same shape as the CPU path.)
+    let gpu = try W.compute().gpu_enabled catch false;
+    if gpu == true {
+        let conf = classify_batch_tensor(prompts);
+        let out = [];
+        let i = 0;
+        while i < len(conf) { array_push(out, conf[i].intent); i = i + 1; }
+        return out;
+    }
+    return classify_batch_parallel(prompts);
+}
+fn _intent_of(prompt) { return _INTENTS[classify(prompt)]; }
+// classify_batch(prompts) — classify a list, sequentially.
+fn classify_batch(prompts) {
+    let out = [];
+    let i = 0;
+    while i < len(prompts) { array_push(out, _intent_of(prompts[i])); i = i + 1; }
+    return out;
+}
+// classify_batch_parallel(prompts) — fan the batch out across ALL CPU cores. Each worker is
+// SELF-CONTAINED (its argument + builtins only): the model weights + vocab are packed per
+// chunk and the featurize+MLP-forward+argmax are inlined. Results match classify_batch.
+fn classify_batch_parallel(prompts) {
+    let net = _model();
+    let cores = try OS.cpu_count() catch 1;
+    if cores < 1 { cores = 1; }
+    let per = num_floor((len(prompts) + cores - 1) / cores);
+    if per < 1 { per = 1; }
+    let jobs = [];
+    let s = 0;
+    while s < len(prompts) {
+        let chunk = [];
+        let j = 0;
+        while j < per and s + j < len(prompts) { array_push(chunk, prompts[s + j]); j = j + 1; }
+        array_push(jobs, map{ prompts: chunk, vocab: _VOCAB,
+            l1w: net.l1.w, l1b: net.l1.b, l2w: net.l2.w, l2b: net.l2.b,
+            nin: net.l1.n_in, nh: net.l1.n_out, no: net.l2.n_out });
+        s = s + per;
+    }
+    let parts = P.par_map(jobs, fn(job) {
+        let out = [];
+        let pi = 0;
+        while pi < len(job.prompts) {
+            let t = str_lower(job.prompts[pi]);
+            let x = [];
+            let v = 0;
+            while v < len(job.vocab) { if str_contains(t, job.vocab[v]) { array_push(x, 1); } else { array_push(x, 0); } v = v + 1; }
+            let h = [];
+            let o = 0;
+            while o < job.nh { let acc = job.l1b[o]; let i = 0; while i < job.nin { acc = acc + job.l1w[o][i] * x[i]; i = i + 1; } array_push(h, 1 / (1 + num_exp(0 - acc))); o = o + 1; }
+            let bi = 0; let bv = 0; let o2 = 0;
+            while o2 < job.no {
+                let acc2 = job.l2b[o2]; let k = 0; while k < job.nh { acc2 = acc2 + job.l2w[o2][k] * h[k]; k = k + 1; }
+                let y = 1 / (1 + num_exp(0 - acc2));
+                if o2 == 0 or y > bv { bv = y; bi = o2; }
+                o2 = o2 + 1;
+            }
+            array_push(out, bi);
+            pi = pi + 1;
+        }
+        return out;
+    });
+    let result = [];
+    let c = 0;
+    while c < len(parts) { let r = parts[c]; let j = 0; while j < len(r) { array_push(result, _INTENTS[r[j]]); j = j + 1; } c = c + 1; }
+    return result;
+}
+
+// classify_batch_confident(prompts) — like classify_batch_parallel but each result carries the
+// native softmax CONFIDENCE: [{intent, confidence}]. Confidence matches single-prompt
+// confidence(). Same self-contained all-cores worker, now returning {idx, conf} per item.
+fn classify_batch_confident(prompts) {
+    let net = _model();
+    let cores = try OS.cpu_count() catch 1;
+    if cores < 1 { cores = 1; }
+    let per = num_floor((len(prompts) + cores - 1) / cores);
+    if per < 1 { per = 1; }
+    let jobs = [];
+    let s = 0;
+    while s < len(prompts) {
+        let chunk = [];
+        let j = 0;
+        while j < per and s + j < len(prompts) { array_push(chunk, prompts[s + j]); j = j + 1; }
+        array_push(jobs, map{ prompts: chunk, vocab: _VOCAB,
+            l1w: net.l1.w, l1b: net.l1.b, l2w: net.l2.w, l2b: net.l2.b,
+            nin: net.l1.n_in, nh: net.l1.n_out, no: net.l2.n_out });
+        s = s + per;
+    }
+    let parts = P.par_map(jobs, fn(job) {
+        let out = [];
+        let pi = 0;
+        while pi < len(job.prompts) {
+            let t = str_lower(job.prompts[pi]);
+            let x = [];
+            let v = 0;
+            while v < len(job.vocab) { if str_contains(t, job.vocab[v]) { array_push(x, 1); } else { array_push(x, 0); } v = v + 1; }
+            let h = [];
+            let o = 0;
+            while o < job.nh { let acc = job.l1b[o]; let i = 0; while i < job.nin { acc = acc + job.l1w[o][i] * x[i]; i = i + 1; } array_push(h, 1 / (1 + num_exp(0 - acc))); o = o + 1; }
+            let bi = 0; let bv = 0; let o2 = 0;
+            while o2 < job.no {
+                let acc2 = job.l2b[o2]; let k = 0; while k < job.nh { acc2 = acc2 + job.l2w[o2][k] * h[k]; k = k + 1; }
+                let y = 1 / (1 + num_exp(0 - acc2));
+                if o2 == 0 or y > bv { bv = y; bi = o2; }
+                o2 = o2 + 1;
+            }
+            array_push(out, map{ idx: bi, conf: bv });
+            pi = pi + 1;
+        }
+        return out;
+    });
+    let result = [];
+    let c = 0;
+    while c < len(parts) { let r = parts[c]; let j = 0; while j < len(r) { array_push(result, map{ intent: _INTENTS[r[j].idx], confidence: r[j].conf }); j = j + 1; } c = c + 1; }
+    return result;
+}
+
+
+// classify_batch_tensor(prompts) — the WHOLE batch forward as two matmuls + sigmoid. tensor.dot
+// auto-offloads large matmuls to the GPU on a `--features gpu` build (f32) and fans over CPU
+// cores otherwise, so this is the honest "use the accelerator" path — same math, real hardware,
+// no FFI, no mock. Bias is folded in via an appended 1-column (X_aug · W_aug trick). Returns
+// [{intent, confidence}], numerically identical to the scalar classifier.
+fn classify_batch_tensor(prompts) {
+    let N = len(prompts);
+    if N == 0 { return []; }
+    let net = _model();
+    let nin = net.l1.n_in; let nh = net.l1.n_out; let no = net.l2.n_out;
+    // X_aug: N x (nin+1), last column = 1 (the bias input)
+    let xdata = [];
+    let p = 0;
+    while p < N {
+        let t = str_lower(prompts[p]);
+        let v = 0;
+        while v < nin { if str_contains(t, _VOCAB[v]) { array_push(xdata, 1); } else { array_push(xdata, 0); } v = v + 1; }
+        array_push(xdata, 1);
+        p = p + 1;
+    }
+    let X = T.tensor([N, nin + 1], xdata);
+    // W1_aug: (nin+1) x nh — rows are inputs, last row is the bias; W1a[i][o] = w[o][i]
+    let w1 = [];
+    let i1 = 0;
+    while i1 < nin { let o = 0; while o < nh { array_push(w1, net.l1.w[o][i1]); o = o + 1; } i1 = i1 + 1; }
+    let ob1 = 0; while ob1 < nh { array_push(w1, net.l1.b[ob1]); ob1 = ob1 + 1; }
+    let H = T.sigmoid(T.dot(X, T.tensor([nin + 1, nh], w1)));   // N x nh
+    // H_aug: N x (nh+1) with a bias column
+    let hdata = [];
+    let r = 0;
+    while r < N { let k = 0; while k < nh { array_push(hdata, T.get(H, [r, k])); k = k + 1; } array_push(hdata, 1); r = r + 1; }
+    let Ha = T.tensor([N, nh + 1], hdata);
+    let w2 = [];
+    let k2 = 0;
+    while k2 < nh { let o = 0; while o < no { array_push(w2, net.l2.w[o][k2]); o = o + 1; } k2 = k2 + 1; }
+    let ob2 = 0; while ob2 < no { array_push(w2, net.l2.b[ob2]); ob2 = ob2 + 1; }
+    let O = T.sigmoid(T.dot(Ha, T.tensor([nh + 1, no], w2)));   // N x no
+    let out = [];
+    let rr = 0;
+    while rr < N {
+        let bi = 0; let bv = T.get(O, [rr, 0]);
+        let c = 1;
+        while c < no { let y = T.get(O, [rr, c]); if y > bv { bv = y; bi = c; } c = c + 1; }
+        array_push(out, map{ intent: _INTENTS[bi], confidence: bv });
+        rr = rr + 1;
+    }
+    return out;
+}
+
 // is_intent(name) — is `name` a known classifier intent?
 fn is_intent(name) {
     let i = 0;
@@ -583,5 +921,72 @@ fn is_intent(name) {
     return false;
 }
 
+// _intent_index(name) — intent label -> classifier index (falls back to "general").
+fn _intent_index(name) {
+    let i = 0;
+    while i < len(_INTENTS) { if _INTENTS[i] == name { return i; } i = i + 1; }
+    return len(_INTENTS) - 1;
+}
+
+// respond_as(intent_name, prompt) — run the grounded skill for an ALREADY-decided intent
+// (by label). This is the public hook ensemble hosts (combined_mllm) wire as responder.
+fn respond_as(intent_name, prompt) { return _run(_intent_index(intent_name), prompt); }
+
+// ── unified MLLM ensemble: delegate to the shared engine (stdlib/pbai_ensemble.sapp) ──
+ENS.configure(classify_scores, _INTENTS);
+// answer synthesis: the ensemble decides the intent, then pbAI's grounded skill for that
+// intent produces the FULL text answer — the MLLM returns answers, not just labels.
+ENS.set_responder(respond_as);
+let ensemble = ENS.ensemble;
+let ensemble_detail = ENS.ensemble_detail;
+let ensemble_confidence = ENS.ensemble_confidence;
+let ensemble_decide = ENS.ensemble_decide;
+let ensemble_batch = ENS.ensemble_batch;
+let register_voter = ENS.register_voter;
+let register_voter_weighted = ENS.register_voter_weighted;
+let register_model = ENS.register_model;
+let clear_native_cache = ENS.clear_native_cache;
+let evaluate = ENS.evaluate;
+let calibrate = ENS.calibrate;
+let calibration_report = ENS.calibration_report;
+let set_routing = ENS.set_routing;
+let reliability_for = ENS.reliability_for;
+let tune_weights = ENS.tune_weights;
+let set_voter_weight = ENS.set_voter_weight;
+let auto_configure = ENS.auto_configure;
+let set_responder = ENS.set_responder;
+let answer = ENS.answer;
+let set_fusion = ENS.set_fusion;
+let explain_decision = ENS.explain_decision;
+let explain_line = ENS.explain_line;
+let uncertainty = ENS.uncertainty;
+let decide_ex = ENS.decide_ex;
+let set_native_weight = ENS.set_native_weight;
+let voters = ENS.voters;
+let clear_voters = ENS.clear_voters;
+let llm_voter = ENS.llm_voter;
+let reliability = ENS.reliability;
+let set_adaptive = ENS.set_adaptive;
+let reset_stats = ENS.reset_stats;
+let record_outcome = ENS.record_outcome;
+let save_stats = ENS.save_stats;
+let load_stats = ENS.load_stats;
+let memoize_voter = ENS.memoize_voter;
+let clear_voter_cache = ENS.clear_voter_cache;
+let voter_cache_stats = ENS.voter_cache_stats;
+let set_parallel = ENS.set_parallel;
+let ollama_available = ENS.ollama_available;
+let ollama_voter = ENS.ollama_voter;
+let use_ollama = ENS.use_ollama;
+
 export classify, classify_scores, analyze, respond, respond_tool, generate, model_status,
        tool_catalog, tool_call, intents, confidence, top_intents, is_intent;
+export review, suggest, explain_code, comment_code, knowledge;
+export ensemble, ensemble_detail, ensemble_confidence, ensemble_decide, ensemble_batch, register_model, clear_native_cache, evaluate, calibrate, set_routing, reliability_for, tune_weights, set_voter_weight, calibration_report;
+export auto_configure, set_responder, answer, respond_as, set_fusion, explain_decision, explain_line, uncertainty, decide_ex;
+export register_voter, register_voter_weighted, set_native_weight, voters, clear_voters, llm_voter;
+export reliability, set_adaptive, reset_stats, record_outcome, save_stats, load_stats;
+export memoize_voter, clear_voter_cache, voter_cache_stats, set_parallel;
+export ollama_available, ollama_voter, use_ollama;
+export capabilities, classify_batch, classify_batch_parallel, classify_batch_confident, classify_batch_tensor;
+export accelerators, best_device, register_accel, classify_batch_smart;

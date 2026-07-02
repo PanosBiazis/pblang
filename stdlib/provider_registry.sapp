@@ -19,6 +19,48 @@ fn register(name, url, token) {
     return true;
 }
 
+// register_ex(name, url, token, opts) — register with routing metadata. opts keys
+// (all optional): priority (higher wins), weight (>=1, for weighted selection),
+// models (list of model ids this provider serves; empty = serves any), enabled,
+// tags. Health counters (calls/failures/down_until) start at zero. Re-registering
+// the same name replaces it. Plain register() remains for the simple case.
+fn register_ex(name, url, token, opts) {
+    if opts == nil { opts = map{}; }
+    let rec = map{
+        name: name, url: url, token: token,
+        priority: try opts.priority catch 0,
+        weight: try opts.weight catch 1,
+        models: try opts.models catch [],
+        enabled: try opts.enabled catch true,
+        tags: try opts.tags catch [],
+        calls: 0, failures: 0, down_until: 0,
+    };
+    if rec.priority == nil { rec.priority = 0; }
+    if rec.weight == nil or rec.weight < 1 { rec.weight = 1; }
+    if rec.models == nil { rec.models = []; }
+    if rec.enabled == nil { rec.enabled = true; }
+    if rec.tags == nil { rec.tags = []; }
+    let i = 0;
+    while i < len(_registry) {
+        if _registry[i].name == name { _registry[i] = rec; return true; }
+        i = i + 1;
+    }
+    array_push(_registry, rec);
+    return true;
+}
+
+// _field(p, key, default) — read an optional record field, tolerating older records
+// created by the simple register() (which omits routing/health fields).
+fn _field(p, key, default) {
+    if p == nil { return default; }
+    if map_has(p, key) {
+        let v = p[key];
+        if v == nil { return default; }
+        return v;
+    }
+    return default;
+}
+
 fn get(name) {
     let i = 0;
     while i < len(_registry) {
@@ -135,16 +177,213 @@ fn has(name) { return get(name) != nil; }
 // count() — number of registered providers.
 fn count() { return len(_registry); }
 
-// providers() — provider records WITHOUT tokens (safe to log/display).
+// providers() — provider records WITHOUT tokens (safe to log/display). Includes the
+// routing/health metadata so dashboards can show priority/weight/models/health.
 fn providers() {
     let out = [];
     let i = 0;
     while i < len(_registry) {
-        array_push(out, map{ name: _registry[i].name, url: _registry[i].url });
+        let p = _registry[i];
+        array_push(out, map{
+            name: p.name, url: p.url,
+            priority: _field(p, "priority", 0), weight: _field(p, "weight", 1),
+            models: _field(p, "models", []), enabled: _field(p, "enabled", true),
+            calls: _field(p, "calls", 0), failures: _field(p, "failures", 0),
+        });
         i = i + 1;
     }
     return out;
 }
 
-export register, get, list, unregister, clear, call_provider, call_best, call_with_fallback, next_provider_name, call_round_robin;
+// ── routing metadata setters ──────────────────────────────────────────────────────
+fn _set(name, key, val) {
+    let i = 0;
+    while i < len(_registry) {
+        if _registry[i].name == name { _registry[i][key] = val; return true; }
+        i = i + 1;
+    }
+    return false;
+}
+fn set_enabled(name, on) { return _set(name, "enabled", on); }
+fn is_enabled(name) { return _field(get(name), "enabled", true) == true; }
+fn set_priority(name, n) { return _set(name, "priority", n); }
+fn set_weight(name, n) { if n < 1 { n = 1; } return _set(name, "weight", n); }
+fn set_models(name, models) { return _set(name, "models", models); }
+fn set_tags(name, tags) { return _set(name, "tags", tags); }
+
+// ── health tracking ───────────────────────────────────────────────────────────────
+fn record_success(name) {
+    let p = get(name);
+    if p == nil { return false; }
+    _set(name, "calls", _field(p, "calls", 0) + 1);
+    return true;
+}
+fn record_failure(name) {
+    let p = get(name);
+    if p == nil { return false; }
+    _set(name, "calls", _field(p, "calls", 0) + 1);
+    _set(name, "failures", _field(p, "failures", 0) + 1);
+    return true;
+}
+// mark_down(name, until_ms) — make a provider unavailable until a timestamp (cooldown
+// after repeated failures / rate limiting). until_ms is compared against now_ms().
+fn mark_down(name, until_ms) { return _set(name, "down_until", until_ms); }
+fn clear_down(name) { return _set(name, "down_until", 0); }
+
+fn health(name) {
+    let p = get(name);
+    if p == nil { return nil; }
+    let calls = _field(p, "calls", 0);
+    let failures = _field(p, "failures", 0);
+    let ok = calls - failures;
+    let rate = 0;
+    if calls > 0 { rate = ok / calls; }
+    return map{
+        name: name, calls: calls, failures: failures, ok: ok, success_rate: rate,
+        enabled: _field(p, "enabled", true), priority: _field(p, "priority", 0),
+        weight: _field(p, "weight", 1), down_until: _field(p, "down_until", 0),
+    };
+}
+
+// is_available_at(name, now) — enabled AND not in a cooldown window at time `now`
+// (pure; pass a clock value). is_available(name) uses the real clock.
+fn is_available_at(name, now) {
+    let p = get(name);
+    if p == nil { return false; }
+    if _field(p, "enabled", true) != true { return false; }
+    let du = _field(p, "down_until", 0);
+    if du > 0 and now < du { return false; }
+    return true;
+}
+fn is_available(name) { return is_available_at(name, now_ms()); }
+
+// ── capability matching ───────────────────────────────────────────────────────────
+// supports_model(p, model) — true if the provider declares the model, or declares no
+// models at all (an unconstrained provider serves any model). model nil = match all.
+fn supports_model(p, model) {
+    if p == nil { return false; }
+    if model == nil { return true; }
+    let ms = _field(p, "models", []);
+    if len(ms) == 0 { return true; }
+    let i = 0;
+    while i < len(ms) { if ms[i] == model { return true; } i = i + 1; }
+    return false;
+}
+
+// providers_for_model(model) — names of providers that can serve `model`.
+fn providers_for_model(model) {
+    let out = [];
+    let i = 0;
+    while i < len(_registry) {
+        if supports_model(_registry[i], model) { array_push(out, _registry[i].name); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// _candidates(model, now) — enabled + available records that serve `model`.
+fn _candidates(model, now) {
+    let out = [];
+    let i = 0;
+    while i < len(_registry) {
+        let p = _registry[i];
+        if supports_model(p, model) and is_available_at(p.name, now) { array_push(out, p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// select(strategy, model) — choose a provider NAME for `model` without calling it.
+// Strategies: "first" (registration order), "priority" (highest priority, ties→first),
+// "least_failures" (fewest failures), "round_robin" (rotate, advances the cursor),
+// "weighted" (highest weight, ties→first). Returns nil if nothing is eligible.
+fn select(strategy, model) { return _select_at(strategy, model, now_ms()); }
+fn _select_at(strategy, model, now) {
+    let cands = _candidates(model, now);
+    if len(cands) == 0 { return nil; }
+    if strategy == "round_robin" {
+        if _rr_cursor >= len(cands) { _rr_cursor = 0; }
+        let name = cands[_rr_cursor].name;
+        _rr_cursor = (_rr_cursor + 1) % len(cands);
+        return name;
+    }
+    let best = cands[0];
+    let i = 1;
+    while i < len(cands) {
+        let c = cands[i];
+        if strategy == "priority" {
+            if _field(c, "priority", 0) > _field(best, "priority", 0) { best = c; }
+        } else if strategy == "weighted" {
+            if _field(c, "weight", 1) > _field(best, "weight", 1) { best = c; }
+        } else if strategy == "least_failures" {
+            if _field(c, "failures", 0) < _field(best, "failures", 0) { best = c; }
+        }
+        i = i + 1;
+    }
+    return best.name;
+}
+
+// best_for(model, strategy) — select + return the full (token-free) record, or nil.
+fn best_for(model, strategy) {
+    let name = select(strategy, model);
+    if name == nil { return nil; }
+    return health(name);
+}
+
+// ── aggregate stats ───────────────────────────────────────────────────────────────
+fn stats() {
+    let calls = 0; let failures = 0; let enabled = 0;
+    let i = 0;
+    while i < len(_registry) {
+        let p = _registry[i];
+        calls = calls + _field(p, "calls", 0);
+        failures = failures + _field(p, "failures", 0);
+        if _field(p, "enabled", true) == true { enabled = enabled + 1; }
+        i = i + 1;
+    }
+    return map{ providers: len(_registry), enabled: enabled, calls: calls, failures: failures };
+}
+fn reset_stats() {
+    let i = 0;
+    while i < len(_registry) {
+        _registry[i]["calls"] = 0;
+        _registry[i]["failures"] = 0;
+        _registry[i]["down_until"] = 0;
+        i = i + 1;
+    }
+    return true;
+}
+
+// call_route(message, model, strategy) — health-aware call: pick by strategy, invoke,
+// record success/failure, and on failure fall through to the next candidate.
+fn call_route(message, model, strategy) {
+    let tried = [];
+    let guard = 0;
+    while guard < count() {
+        let name = select(strategy, model);
+        if name == nil { break; }
+        if _has_name(tried, name) {
+            // strategy is sticky (e.g. priority) and already failed → stop looping
+            break;
+        }
+        array_push(tried, name);
+        let result = call_provider(name, message, model);
+        let has_error = try map_has(result, "error") catch false;
+        if has_error == false { record_success(name); return result; }
+        record_failure(name);
+        guard = guard + 1;
+    }
+    if len(tried) == 0 { return map{ error: "no eligible provider for model: " + str(model) }; }
+    return map{ error: "all eligible providers failed", tried: tried };
+}
+fn _has_name(list, v) {
+    let i = 0;
+    while i < len(list) { if list[i] == v { return true; } i = i + 1; }
+    return false;
+}
+
+export register, register_ex, get, list, unregister, clear, call_provider, call_best, call_with_fallback, next_provider_name, call_round_robin;
 export has, count, providers, reset_round_robin;
+export set_enabled, is_enabled, set_priority, set_weight, set_models, set_tags;
+export record_success, record_failure, mark_down, clear_down, health, is_available, is_available_at;
+export supports_model, providers_for_model, select, best_for, stats, reset_stats, call_route;

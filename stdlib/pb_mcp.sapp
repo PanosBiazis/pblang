@@ -15,7 +15,17 @@ let MAX_GREP = 80;
 fn _safe_path(path) {
     if path == nil or path == "" { return "."; }
     if type(path) != "string" { throw "pb_mcp: path must be a string"; }
-    if str_starts_with(path, "/") or str_contains(path, "..") or str_contains(path, "\x00") {
+    // Refuse: unix-absolute (/), windows root/UNC (\), drive-qualified (C:\, C:/, C:x),
+    // any parent traversal (.. — checked after normalizing backslashes so "a\\..\\b"
+    // can't slip through), and embedded NUL.
+    if str_starts_with(path, "/") or str_starts_with(path, "\\") {
+        throw "pb_mcp: path outside workspace is not allowed: " + path;
+    }
+    if len(path) >= 2 and str_slice(path, 1, 2) == ":" {
+        throw "pb_mcp: path outside workspace is not allowed: " + path;
+    }
+    let norm = str_replace_all(path, "\\", "/");
+    if str_contains(norm, "..") or str_contains(path, "\x00") {
         throw "pb_mcp: path outside workspace is not allowed: " + path;
     }
     return path;
@@ -60,11 +70,25 @@ fn _push_recursive(out, dir, depth, max_depth, max_entries) {
     return out;
 }
 
+// Memoized catalog: the literal below never changes at runtime, and callers
+// (has_tool/tool_desc/tool_names/suggest_tool/profiles) hit it repeatedly.
+let _CAT = nil;
 fn tool_catalog() {
+    if _CAT != nil { return _CAT; }
+    _CAT = _tool_catalog_build();
+    return _CAT;
+}
+fn _tool_catalog_build() {
     return [
         map{ name: "workspace_context", profile: "core-code", desc: "repo root, top-level files, native tool categories" },
         map{ name: "read_file", profile: "core-code", desc: "bounded read of a workspace file" },
         map{ name: "read_file_tail", profile: "core-code", desc: "read last N lines of a workspace file" },
+        map{ name: "head_file", profile: "core-code", desc: "read first N lines of a workspace file" },
+        map{ name: "file_exists", profile: "core-code", desc: "test whether a workspace path is a readable file or directory" },
+        map{ name: "list_dirs", profile: "core-code", desc: "immediate subdirectories of a workspace directory" },
+        map{ name: "grep_count", profile: "core-code", desc: "count literal-text matches over workspace files" },
+        map{ name: "grep_files", profile: "core-code", desc: "distinct files containing a literal text match" },
+        map{ name: "outline", profile: "core-code", desc: "top-level symbols (fn/struct/class/enum) of a pblang file with line numbers" },
         map{ name: "list_files", profile: "core-code", desc: "recursive bounded file listing" },
         map{ name: "project_tree", profile: "core-code", desc: "bounded tree-style listing" },
         map{ name: "grep_code", profile: "core-code", desc: "literal text search over workspace files (optional case-insensitive)" },
@@ -78,6 +102,9 @@ fn tool_catalog() {
         map{ name: "watch_binary", profile: "watchers", desc: "reverse-engineer a file: format, magic, entropy" },
         map{ name: "watch_hardware", profile: "watchers", desc: "CPU/GPU/NPU/storage/devices/network survey" },
         map{ name: "watch_probe", profile: "watchers", desc: "run a named watcher probe (heap, memory, compute, quantum, ...)" },
+        map{ name: "suggest_tool", profile: "meta", desc: "rank catalog tools for a free-text task description (keyword tool discovery)" },
+        map{ name: "call_batch", profile: "meta", desc: "run many tool calls in one request; each failure is isolated per entry" },
+        map{ name: "call_stats", profile: "meta", desc: "per-tool usage counters since the last reset" },
     ];
 }
 
@@ -144,6 +171,33 @@ fn read_file(path, start_line = nil, end_line = nil) {
         i = i + 1;
     }
     return _truncate(out, MAX_READ_CHARS);
+}
+
+// head_file(path, n) — first N lines (complement to read_file_tail).
+fn head_file(path, n = 40) {
+    path = _safe_path(path);
+    return read_file(path, 1, n);
+}
+
+// file_exists(path) — true if the path is a readable file or a directory (workspace-only).
+fn file_exists(path) {
+    path = _safe_path(path);
+    return _is_file(path) or _is_dir(path);
+}
+
+// list_dirs(dir) — immediate subdirectories of `dir` (non-recursive, skips junk dirs).
+fn list_dirs(dir = ".") {
+    dir = _safe_path(dir);
+    let items = try FS.listdir(dir) catch [];
+    let out = [];
+    for i len(items) {
+        let name = items[i];
+        if name != ".git" and name != "target" and name != ".mint-mcp" {
+            let path = _join(dir, name);
+            if _is_dir(path) { array_push(out, name); }
+        }
+    }
+    return out;
 }
 
 fn read_file_tail(path, n = 40) {
@@ -230,12 +284,161 @@ fn grep_code(pattern, dir = ".", max_matches = nil, ignore_case = false) {
     return out;
 }
 
+// grep_count(pattern, dir, ignore_case) — number of matching lines (uncapped count,
+// up to a large internal ceiling). Cheap way for an agent to gauge prevalence.
+fn grep_count(pattern, dir = ".", ignore_case = false) {
+    return len(grep_code(pattern, dir, 100000, ignore_case));
+}
+
+// grep_files(pattern, dir, ignore_case) — DISTINCT file paths that contain the pattern
+// (one entry per file, in first-match order).
+fn grep_files(pattern, dir = ".", ignore_case = false) {
+    let hits = grep_code(pattern, dir, 100000, ignore_case);
+    let out = [];
+    let i = 0;
+    while i < len(hits) {
+        let p = hits[i].path;
+        let seen = false;
+        let j = 0;
+        while j < len(out) { if out[j] == p { seen = true; } j = j + 1; }
+        if not seen { array_push(out, p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// _ident_head(s) — leading identifier of `s` (up to '(', '{', ':', or space).
+fn _ident_head(s) {
+    let i = 0;
+    while i < len(s) {
+        let c = str_slice(s, i, i + 1);
+        if c == "(" or c == "{" or c == " " or c == ":" { break; }
+        i = i + 1;
+    }
+    return str_slice(s, 0, i);
+}
+
+// outline(path) — top-level symbols of a pblang file as [{kind,name,line}] (fn/struct/
+// class/enum), 1-based line numbers. Cheap navigation map for agents/editors.
+fn outline(path) {
+    path = _safe_path(path);
+    let raw = FS.read(path);
+    let lines = str_split(raw, "\n");
+    let out = [];
+    for i len(lines) {
+        let t = str_trim(lines[i]);
+        let kind = nil;
+        let rest = "";
+        if str_starts_with(t, "fn ") { kind = "fn"; rest = str_slice(t, 3, len(t)); }
+        else if str_starts_with(t, "struct ") { kind = "struct"; rest = str_slice(t, 7, len(t)); }
+        else if str_starts_with(t, "class ") { kind = "class"; rest = str_slice(t, 6, len(t)); }
+        else if str_starts_with(t, "enum ") { kind = "enum"; rest = str_slice(t, 5, len(t)); }
+        if kind != nil {
+            let name = _ident_head(str_trim(rest));
+            if name != "" { array_push(out, map{ kind: kind, name: name, line: i + 1 }); }
+        }
+    }
+    return out;
+}
+
+// tools_count() — number of catalog tools.
+fn tools_count() { return len(tool_catalog()); }
+
+// tool_desc(name) — the catalog description for a tool, or nil if unknown.
+fn tool_desc(name) {
+    let cat = tool_catalog();
+    let i = 0;
+    while i < len(cat) { if cat[i].name == name { return cat[i].desc; } i = i + 1; }
+    return nil;
+}
+
+// ── smart tool discovery ───────────────────────────────────────────────────────
+// suggest_tool(query, k) — rank catalog tools for a free-text task description.
+// Score favors how many DISTINCT query words a tool matches (x10), then name hits
+// (x2) over description hits, so "search text in files" lands on grep_code, not on
+// a tool that merely mentions "files". Words shorter than 3 chars are noise-skipped.
+fn suggest_tool(query, k = 3) {
+    let words = str_split(str_lower(str(query)), " ");
+    let cat = tool_catalog();
+    let scored = [];
+    let i = 0;
+    while i < len(cat) {
+        let name = str_lower(cat[i].name);
+        let desc = str_lower(cat[i].desc);
+        let distinct = 0;
+        let nhits = 0;
+        let dhits = 0;
+        let w = 0;
+        while w < len(words) {
+            let word = words[w];
+            if len(word) >= 3 {
+                let hit = false;
+                if str_index_of(name, word) >= 0 { nhits = nhits + 1; hit = true; }
+                if str_index_of(desc, word) >= 0 { dhits = dhits + 1; hit = true; }
+                if hit { distinct = distinct + 1; }
+            }
+            w = w + 1;
+        }
+        let score = distinct * 10 + nhits * 2 + dhits;
+        if score > 0 { array_push(scored, map{ name: cat[i].name, desc: cat[i].desc, score: score }); }
+        i = i + 1;
+    }
+    // selection sort (descending, stable enough for a ~24-entry catalog)
+    let out = [];
+    while len(out) < k and len(scored) > 0 {
+        let best = 0;
+        let j = 1;
+        while j < len(scored) { if scored[j].score > scored[best].score { best = j; } j = j + 1; }
+        array_push(out, scored[best]);
+        let rest = [];
+        j = 0;
+        while j < len(scored) { if j != best { array_push(rest, scored[j]); } j = j + 1; }
+        scored = rest;
+    }
+    return out;
+}
+
+// ── batch execution + usage stats ──────────────────────────────────────────────
+// call_batch(calls) — [{tool, args?}] -> [{ok, result}|{ok:false, error}], one entry
+// per call; a failing tool never aborts the rest of the batch.
+fn call_batch(calls) {
+    let out = [];
+    let i = 0;
+    while i < len(calls) {
+        let c = calls[i];
+        let tool = try c.tool catch "";
+        let args = try c.args catch nil;
+        let r = try map{ ok: true, result: call(tool, args) } catch nil;
+        if r == nil { r = map{ ok: false, error: "pb_mcp: call failed for tool '" + str(tool) + "'" }; }
+        array_push(out, r);
+        i = i + 1;
+    }
+    return out;
+}
+
+let _STATS = map{ total: 0, by_tool: map{} };
+fn call_stats() { return map{ total: _STATS.total, by_tool: _STATS.by_tool }; }
+fn reset_call_stats() { _STATS.total = 0; _STATS.by_tool = map{}; return nil; }
+fn _count_call(tool) {
+    _STATS.total = _STATS.total + 1;
+    if not map_has(_STATS.by_tool, tool) { _STATS.by_tool[tool] = 0; }
+    _STATS.by_tool[tool] = _STATS.by_tool[tool] + 1;
+    return nil;
+}
+
 fn call(tool, args = nil) {
     if args == nil { args = map{}; }
+    _count_call(tool);
     if tool == "workspace_context" { return workspace_context(); }
     if tool == "tool_catalog" { return tool_catalog(); }
     if tool == "read_file" { return read_file(try args.path catch "", try args.start_line catch nil, try args.end_line catch nil); }
     if tool == "read_file_tail" { return read_file_tail(try args.path catch "", try args.n catch 40); }
+    if tool == "head_file" { return head_file(try args.path catch "", try args.n catch 40); }
+    if tool == "file_exists" { return file_exists(try args.path catch ""); }
+    if tool == "list_dirs" { return list_dirs(try args.dir catch "."); }
+    if tool == "grep_count" { return grep_count(try args.pattern catch "", try args.dir catch ".", try args.ignore_case catch false); }
+    if tool == "grep_files" { return grep_files(try args.pattern catch "", try args.dir catch ".", try args.ignore_case catch false); }
+    if tool == "outline" { return outline(try args.path catch ""); }
     if tool == "list_files" { return list_files(try args.dir catch ".", try args.max_entries catch MAX_FILES); }
     if tool == "project_tree" { return project_tree(try args.dir catch ".", try args.max_depth catch 3, try args.max_entries catch 120); }
     if tool == "grep_code" { return grep_code(try args.pattern catch "", try args.dir catch ".", try args.max_matches catch MAX_GREP, try args.ignore_case catch false); }
@@ -249,6 +452,9 @@ fn call(tool, args = nil) {
     if tool == "watch_binary" { return watch_binary(try args.path catch ""); }
     if tool == "watch_hardware" { return watch_hardware(); }
     if tool == "watch_probe" { return watch_probe(try args.name catch "compute"); }
+    if tool == "suggest_tool" { return suggest_tool(try args.query catch "", try args.k catch 3); }
+    if tool == "call_batch" { return call_batch(try args.calls catch []); }
+    if tool == "call_stats" { return call_stats(); }
     throw "pb_mcp: unknown tool '" + str(tool) + "'";
 }
 
@@ -295,5 +501,7 @@ fn tools_by_profile(profile) {
 }
 
 export tool_catalog, workspace_context, read_file, read_file_tail, list_files, project_tree, grep_code, find_files, file_stats, call;
+export suggest_tool, call_batch, call_stats, reset_call_stats;
 export watch_capture, watch_disasm, watch_bytecode, watch_inspect, watch_folder, watch_binary, watch_hardware, watch_probe;
 export tool_names, has_tool, tools_by_profile, profiles;
+export head_file, file_exists, list_dirs, grep_count, grep_files, tools_count, tool_desc, outline;

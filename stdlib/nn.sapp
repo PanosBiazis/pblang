@@ -209,6 +209,289 @@ fn accuracy(net, data) {
     return correct / len(data);
 }
 
+// ── Model evolution: clone, merge, safe_merge, split (function-preserving) ─────────
+// loss(net, data) — mean squared error over a dataset (pure; no mutation). The metric
+// safe_merge uses to decide whether a merge actually helped.
+fn loss(net, data) {
+    if len(data) == 0 { return 0; }
+    let total = 0;
+    let i = 0;
+    while i < len(data) { total = total + mse_loss(predict(net, data[i].x), data[i].y); i = i + 1; }
+    return total / len(data);
+}
+
+fn _clone_layer(l) {
+    let w = [];
+    let o = 0;
+    while o < len(l.w) {
+        let row = [];
+        let i = 0;
+        while i < len(l.w[o]) { push(row, l.w[o][i]); i = i + 1; }
+        push(w, row);
+        o = o + 1;
+    }
+    let b = [];
+    let j = 0;
+    while j < len(l.b) { push(b, l.b[j]); j = j + 1; }
+    return map{ w: w, b: b, n_in: l.n_in, n_out: l.n_out };
+}
+
+// clone(net) — a DEEP copy. Training/splitting the clone never touches the original, so
+// you can safely fork a model, experiment, and keep or discard the result.
+fn clone(net) { return map{ l1: _clone_layer(net.l1), l2: _clone_layer(net.l2) }; }
+
+fn _same_shape(a, b) {
+    return a.l1.n_in == b.l1.n_in and a.l1.n_out == b.l1.n_out
+        and a.l2.n_in == b.l2.n_in and a.l2.n_out == b.l2.n_out;
+}
+
+fn _merge_layer(a, b, alpha) {
+    let w = [];
+    let o = 0;
+    while o < len(a.w) {
+        let row = [];
+        let i = 0;
+        while i < len(a.w[o]) { push(row, a.w[o][i] * alpha + b.w[o][i] * (1 - alpha)); i = i + 1; }
+        push(w, row);
+        o = o + 1;
+    }
+    let bb = [];
+    let j = 0;
+    while j < len(a.b) { push(bb, a.b[j] * alpha + b.b[j] * (1 - alpha)); j = j + 1; }
+    return map{ w: w, b: bb, n_in: a.n_in, n_out: a.n_out };
+}
+
+// merge(a, b, alpha) — a NEW net whose weights are the per-weight average
+// alpha*a + (1-alpha)*b ("model soup" / weight averaging). Both nets must share shape.
+// alpha=1 returns a's weights, alpha=0 returns b's.
+fn merge(a, b, alpha) {
+    if not _same_shape(a, b) { throw "nn.merge: shape mismatch"; }
+    return map{ l1: _merge_layer(a.l1, b.l1, alpha), l2: _merge_layer(a.l2, b.l2, alpha) };
+}
+
+// safe_merge(a, b, data, alpha) — merge, but KEEP the merge only if it lowers loss on
+// `data`; otherwise return the better parent untouched. Returns
+// { net, merged(bool), loss, loss_a, loss_b } so a merge can never make the model worse.
+fn safe_merge(a, b, data, alpha) {
+    let la = loss(a, data);
+    let lb = loss(b, data);
+    let best = a;
+    let lbest = la;
+    if lb < la { best = b; lbest = lb; }
+    let m = merge(a, b, alpha);
+    let lm = loss(m, data);
+    if lm <= lbest { return map{ net: m, merged: true, loss: lm, loss_a: la, loss_b: lb }; }
+    return map{ net: clone(best), merged: false, loss: lbest, loss_a: la, loss_b: lb };
+}
+
+// split_neuron(net, idx) — a SAFE split: widen the hidden layer by cloning neuron `idx`
+// (Net2Net-style). The duplicated neuron's outgoing weights are halved so the network's
+// output is exactly PRESERVED, giving extra capacity to train into without a regression.
+fn split_neuron(net, idx) {
+    let n = clone(net);
+    let h = n.l1.n_out;
+    if idx < 0 or idx >= h { throw "nn.split_neuron: index out of range"; }
+    // l1: append a copy of neuron idx's incoming weights + bias (h_idx' == h_idx)
+    let rowcopy = [];
+    let i = 0;
+    while i < len(n.l1.w[idx]) { push(rowcopy, n.l1.w[idx][i]); i = i + 1; }
+    push(n.l1.w, rowcopy);
+    push(n.l1.b, n.l1.b[idx]);
+    n.l1.n_out = h + 1;
+    // l2: halve the outgoing weight from idx and give the new neuron the other half, so
+    // each output sees w*h_idx == (w/2)*h_idx + (w/2)*h_idx' unchanged.
+    let o = 0;
+    while o < n.l2.n_out {
+        let orig = n.l2.w[o][idx];
+        n.l2.w[o][idx] = orig / 2;
+        push(n.l2.w[o], orig / 2);
+        o = o + 1;
+    }
+    n.l2.n_in = n.l2.n_in + 1;
+    return n;
+}
+
+// ── Density: grow capacity (function-preserving) + parameter metrics ──────────────
+// connectivity(net) — total trainable parameters (weights + biases) across both layers.
+fn _layer_params(l) {
+    let c = len(l.b);
+    let o = 0;
+    while o < len(l.w) { c = c + len(l.w[o]); o = o + 1; }
+    return c;
+}
+fn connectivity(net) { return _layer_params(net.l1) + _layer_params(net.l2); }
+
+// densify(net, extra) — add `extra` hidden neurons by repeatedly splitting (round-robin),
+// increasing the network's density/capacity while EXACTLY preserving its current function
+// (each split is function-preserving). Train afterwards to use the new capacity.
+fn densify(net, extra) {
+    let n = clone(net);
+    let added = 0;
+    while added < extra {
+        n = split_neuron(n, num_mod(added, n.l1.n_out));
+        added = added + 1;
+    }
+    return n;
+}
+// widen_to(net, target_hidden) — densify until the hidden layer reaches target (never
+// shrinks; returns a clone unchanged if already wide enough).
+fn widen_to(net, target_hidden) {
+    let h = net.l1.n_out;
+    if target_hidden <= h { return clone(net); }
+    return densify(net, target_hidden - h);
+}
+
+// ── OOP wrapper: an encapsulated model OBJECT with methods ─────────────────────────
+// model(net) returns an object bundling a network with its operations (encapsulation +
+// behavior together). clone/merge/safe_merge/split return NEW model objects (immutable
+// style); train mutates the held net in place (like nn.train).
+fn model(net) {
+    return map{
+        net: net,
+        predict: fn(x) { return predict(net, x); },
+        loss: fn(data) { return loss(net, data); },
+        accuracy: fn(data) { return accuracy(net, data); },
+        train: fn(data, epochs, lr) { return train(net, data, epochs, lr); },
+        clone: fn() { return model(clone(net)); },
+        merge: fn(other, alpha) { return model(merge(net, other.net, alpha)); },
+        safe_merge: fn(other, data, alpha) {
+            let r = safe_merge(net, other.net, data, alpha);
+            return map{ model: model(r.net), merged: r.merged, loss: r.loss, loss_a: r.loss_a, loss_b: r.loss_b };
+        },
+        split: fn(idx) { return model(split_neuron(net, idx)); },
+    };
+}
+
+// ── Structural topology ideas (onion / matryoshka / jenga / origami / nail shells) ─
+fn _copy_arr(a) { let o = []; let i = 0; while i < len(a) { push(o, a[i]); i = i + 1; } return o; }
+fn _without(arr, idx) { let out = []; let i = 0; while i < len(arr) { if i != idx { push(out, arr[i]); } i = i + 1; } return out; }
+
+// ONION layers — a nested container you build outward and peel back, like onion skins.
+// Generic: each layer can be anything (a net, a transform, metadata). Immutable.
+fn onion_new(core) { return map{ layers: [core] }; }
+fn onion_wrap(o, layer) { let ls = _copy_arr(o.layers); push(ls, layer); return map{ layers: ls }; }
+fn onion_depth(o) { return len(o.layers); }
+fn onion_core(o) { return o.layers[0]; }                 // innermost
+fn onion_at(o, i) { return o.layers[i]; }
+fn onion_peel(o) {                                       // remove the outermost skin
+    let ls = o.layers;
+    let n = len(ls);
+    if n == 0 { return map{ onion: o, removed: nil }; }
+    let inner = [];
+    let i = 0;
+    while i < n - 1 { push(inner, ls[i]); i = i + 1; }
+    return map{ onion: map{ layers: inner }, removed: ls[n - 1] };
+}
+
+// MATRYOSHKA (babuska) — nested-capacity sub-models: take the first k hidden neurons as
+// a smaller, self-contained network. k>=hidden returns the full net (the biggest doll).
+fn matryoshka(net, k) {
+    let h = net.l1.n_out;
+    if k < 1 { k = 1; }
+    if k >= h { return clone(net); }
+    let n = clone(net);
+    let w1 = []; let b1 = []; let o = 0;
+    while o < k { push(w1, n.l1.w[o]); push(b1, n.l1.b[o]); o = o + 1; }
+    n.l1.w = w1; n.l1.b = b1; n.l1.n_out = k;
+    let o2 = 0;
+    while o2 < n.l2.n_out {
+        let row = []; let i = 0;
+        while i < k { push(row, n.l2.w[o2][i]); i = i + 1; }
+        n.l2.w[o2] = row;
+        o2 = o2 + 1;
+    }
+    n.l2.n_in = k;
+    return n;
+}
+// matryoshka_sizes(net, step) — the nested doll sizes step, 2*step, …, hidden.
+fn matryoshka_sizes(net, step) {
+    if step < 1 { step = 1; }
+    let h = net.l1.n_out;
+    let out = []; let s = step;
+    while s < h { push(out, s); s = s + step; }
+    push(out, h);
+    return out;
+}
+
+// JENGA — pull a block (neuron) out without toppling the tower. neuron_importance scores
+// each hidden neuron by the L1 magnitude of its outgoing weights (how much the output
+// leans on it); remove_neuron prunes one; jenga_pull removes the LEAST important (safest
+// block to pull); jenga_safe_pull pulls only if loss stays within tolerance.
+fn neuron_importance(net) {
+    let h = net.l1.n_out;
+    let imp = []; let j = 0;
+    while j < h {
+        let s = 0; let o = 0;
+        while o < net.l2.n_out { let v = net.l2.w[o][j]; if v < 0 { v = 0 - v; } s = s + v; o = o + 1; }
+        push(imp, s);
+        j = j + 1;
+    }
+    return imp;
+}
+fn remove_neuron(net, idx) {
+    let n = clone(net);
+    let h = n.l1.n_out;
+    if idx < 0 or idx >= h { throw "nn.remove_neuron: index out of range"; }
+    if h <= 1 { throw "nn.remove_neuron: cannot remove the last hidden neuron"; }
+    n.l1.w = _without(n.l1.w, idx);
+    n.l1.b = _without(n.l1.b, idx);
+    n.l1.n_out = h - 1;
+    let o = 0;
+    while o < n.l2.n_out { n.l2.w[o] = _without(n.l2.w[o], idx); o = o + 1; }
+    n.l2.n_in = n.l2.n_in - 1;
+    return n;
+}
+fn jenga_pull(net) {
+    let imp = neuron_importance(net);
+    let bi = 0; let i = 1;
+    while i < len(imp) { if imp[i] < imp[bi] { bi = i; } i = i + 1; }
+    return map{ net: remove_neuron(net, bi), removed: bi, importance: imp[bi] };
+}
+fn jenga_safe_pull(net, data, tol) {
+    let r = jenga_pull(net);
+    let l0 = loss(net, data);
+    let l1v = loss(r.net, data);
+    if l1v <= l0 + tol { return map{ net: r.net, pulled: true, removed: r.removed, loss: l1v }; }
+    return map{ net: clone(net), pulled: false, removed: 0 - 1, loss: l0 };
+}
+
+// ORIGAMI — fold neuron j onto neuron i: add j's outgoing weights into i, then drop j.
+// This is the exact inverse of split_neuron, so origami_fold(split_neuron(net,i), i, new)
+// restores the original network (and its function). Folding two genuine duplicates is
+// lossless; folding dissimilar neurons is a lossy compression.
+fn origami_fold(net, i, j) {
+    if i == j { throw "nn.origami_fold: i and j must differ"; }
+    let n = clone(net);
+    let h = n.l1.n_out;
+    if i < 0 or i >= h or j < 0 or j >= h { throw "nn.origami_fold: index out of range"; }
+    let o = 0;
+    while o < n.l2.n_out { n.l2.w[o][i] = n.l2.w[o][i] + n.l2.w[o][j]; o = o + 1; }
+    return remove_neuron(n, j);
+}
+
+// SHELLS OF NAILS — protective frozen snapshots. nail() drives a nail into the current
+// weights (a deep-frozen copy); restore() returns a fresh net at a nailed state; a stack
+// of nails forms concentric protective shells you can roll back through (drive / pull).
+fn nail(net) { return clone(net); }
+fn restore(nailed) { return clone(nailed); }
+fn nails_new() { return []; }
+fn drive(nails, net) { let s = _copy_arr(nails); push(s, nail(net)); return s; }   // add outer shell
+fn pull(nails) {                                                                   // remove outer shell
+    let n = len(nails);
+    if n == 0 { return map{ nails: [], shell: nil }; }
+    let rest = []; let i = 0;
+    while i < n - 1 { push(rest, nails[i]); i = i + 1; }
+    return map{ nails: rest, shell: nails[n - 1] };
+}
+fn shell_depth(nails) { return len(nails); }
+
 export sigmoid, dsigmoid, dense_new, dense_forward;
 export mlp_new, mlp_forward, predict, train_sample, sample, train, argmax,
        softmax, mse_loss, predict_batch, accuracy;
+export loss, clone, merge, safe_merge, split_neuron, model;
+export onion_new, onion_wrap, onion_peel, onion_depth, onion_core, onion_at;
+export matryoshka, matryoshka_sizes;
+export neuron_importance, remove_neuron, jenga_pull, jenga_safe_pull;
+export origami_fold;
+export nail, restore, nails_new, drive, pull, shell_depth;
+export connectivity, densify, widen_to;

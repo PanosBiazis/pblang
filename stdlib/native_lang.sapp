@@ -1,0 +1,154 @@
+// stdlib/native_lang.sapp — a FRONT END: lower real expression/statement ASTs into the
+// register IR so ordinary code compiles to NATIVE machine code.
+//
+// Now stack-based, so there is NO register-depth limit (intermediates spill to the CPU value
+// stack via pushr/popr), and it supports VARIABLES (memory-backed locals via lset/lget) and
+// assignment. This is the step that lets real functions — not just tiny expressions — compile
+// to native: a program is a list of statements over named variables.
+//
+//   let l = import("stdlib/native_lang.sapp");
+//   l.eval_expr(["*", ["+",["lit",2],["lit",3]], ["lit",4]]);     // 20 (native)
+//   l.eval_program([["set","x",["lit",10]], ["set","y",["lit",20]],
+//                   ["ret", ["+", ["*",["var","x"],["var","y"]], ["var","x"]]]]);  // 210 (native)
+//
+// expr AST: ["lit",n] | ["var",name] | ["+"/"-"/"*", a, b]
+// stmt AST: ["set", name, expr] | ["ret", expr]
+
+let NAT = import("stdlib:native.sapp");
+
+// ── expression lowering (result in r0; unlimited depth via the value stack) ───────────
+fn _ce(node, slots) {
+    let op = node[0];
+    if op == "lit" { return [["seti", 0, node[1]]]; }
+    if op == "var" {
+        if not map_has(slots, node[1]) { throw "native_lang: undefined variable '" + node[1] + "'"; }
+        return [["lget", slots[node[1]]]];
+    }
+    if op == "+" or op == "-" or op == "*" {
+        let out = _ce(node[1], slots);          // left -> r0
+        array_push(out, ["pushr", 0]);          // save left
+        let r = _ce(node[2], slots);            // right -> r0
+        let i = 0; while i < len(r) { array_push(out, r[i]); i = i + 1; }
+        array_push(out, ["movr", 1, 0]);        // r1 = right
+        array_push(out, ["popr", 0]);           // r0 = left
+        if op == "+" { array_push(out, ["add", 0, 1]); }
+        else if op == "-" { array_push(out, ["sub", 0, 1]); }
+        else { array_push(out, ["mul", 0, 1]); }
+        return out;
+    }
+    throw "native_lang: unknown expression node '" + str(op) + "'";
+}
+
+// compile_expr(ast) — lower a pure expression (no variables) to IR (result in r0).
+fn compile_expr(ast) { return _ce(ast, map{}); }
+
+// _collect(stmts) — assign a memory slot to each variable that gets `set`.
+fn _collect(stmts) {
+    let slots = map{};
+    let n = 0;
+    let i = 0;
+    while i < len(stmts) {
+        if stmts[i][0] == "set" and not map_has(slots, stmts[i][1]) { slots[stmts[i][1]] = n; n = n + 1; }
+        i = i + 1;
+    }
+    return map{ slots: slots, count: n };
+}
+
+// compile_program(stmts) — lower a statement list to { ir, nlocals }. `ret` leaves r0 = result.
+fn compile_program(stmts) {
+    let info = _collect(stmts);
+    let ir = [];
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        if s[0] == "set" {
+            let e = _ce(s[2], info.slots);
+            let j = 0; while j < len(e) { array_push(ir, e[j]); j = j + 1; }
+            array_push(ir, ["lset", info.slots[s[1]]]);
+        } else if s[0] == "ret" {
+            let e = _ce(s[1], info.slots);
+            let j = 0; while j < len(e) { array_push(ir, e[j]); j = j + 1; }
+        } else {
+            throw "native_lang: unknown statement '" + str(s[0]) + "'";
+        }
+        i = i + 1;
+    }
+    return map{ ir: ir, nlocals: info.count };
+}
+
+// ── portable constant evaluators (oracle; always available) ───────────────────────────
+fn eval_const(ast) {
+    let op = ast[0];
+    if op == "lit" { return ast[1]; }
+    let a = eval_const(ast[1]); let b = eval_const(ast[2]);
+    if op == "+" { return a + b; }
+    if op == "-" { return a - b; }
+    if op == "*" { return a * b; }
+    throw "native_lang: unknown node '" + str(op) + "'";
+}
+fn _eval_e(node, vars) {
+    let op = node[0];
+    if op == "lit" { return node[1]; }
+    if op == "var" { return vars[node[1]]; }
+    let a = _eval_e(node[1], vars); let b = _eval_e(node[2], vars);
+    if op == "+" { return a + b; }
+    if op == "-" { return a - b; }
+    if op == "*" { return a * b; }
+    throw "native_lang: unknown node '" + str(op) + "'";
+}
+fn eval_program_const(stmts) {
+    let vars = map{};
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        if s[0] == "set" { vars[s[1]] = _eval_e(s[2], vars); }
+        else if s[0] == "ret" { return _eval_e(s[1], vars); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── FLOAT expressions (scientific kernels) -> SSE2 native ─────────────────────────────
+// fexpr AST: ["flit", x] | ["f+"/"f-"/"f*"/"f/", a, b].  Uses float regs f0..f3 as a stack
+// (depth <= 4; no float spill yet). Division is real — the thing the integer IR can't do.
+fn _cf(node, depth) {
+    if depth > 3 { throw "native_lang: float expression too deep for 4 fp registers"; }
+    let op = node[0];
+    if op == "flit" { return [["fseti", depth, node[1]]]; }
+    if op == "f+" or op == "f-" or op == "f*" or op == "f/" {
+        let out = _cf(node[1], depth);
+        let r = _cf(node[2], depth + 1);
+        let i = 0; while i < len(r) { array_push(out, r[i]); i = i + 1; }
+        if op == "f+" { array_push(out, ["fadd", depth, depth + 1]); }
+        else if op == "f-" { array_push(out, ["fsub", depth, depth + 1]); }
+        else if op == "f*" { array_push(out, ["fmul", depth, depth + 1]); }
+        else { array_push(out, ["fdiv", depth, depth + 1]); }
+        return out;
+    }
+    throw "native_lang: unknown float node '" + str(op) + "'";
+}
+fn compile_fexpr(ast) { return _cf(ast, 0); }
+fn eval_fconst(ast) {
+    let op = ast[0];
+    if op == "flit" { return ast[1]; }
+    let a = eval_fconst(ast[1]); let b = eval_fconst(ast[2]);
+    if op == "f+" { return a + b; }
+    if op == "f-" { return a - b; }
+    if op == "f*" { return a * b; }
+    if op == "f/" { return a / b; }
+    throw "native_lang: unknown float node '" + str(op) + "'";
+}
+fn eval_fexpr(ast) { return NAT.run_value_f(compile_fexpr(ast)); }
+
+fn native_available() { return try NAT.supported() catch false; }
+
+// eval_expr(ast) — compile a pure expression to native and run it.
+fn eval_expr(ast) { return NAT.run_value(compile_expr(ast)); }
+// eval_program(stmts) — compile a variable program to native machine code and run it.
+fn eval_program(stmts) {
+    let c = compile_program(stmts);
+    return NAT.run_value_fn(c.ir, c.nlocals);
+}
+
+export compile_expr, compile_program, eval_const, eval_program_const, eval_expr, eval_program, native_available;
+export compile_fexpr, eval_fconst, eval_fexpr;
