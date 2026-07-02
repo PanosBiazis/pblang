@@ -1,0 +1,149 @@
+// stdlib/compute.sapp — heterogeneous compute scheduler for pblang.
+//
+// Detects every compute/memory resource the machine exposes — CPU cores, GPU, NPU, RAM,
+// storage — plans work across them, and runs it. What's REAL today vs. routed:
+//   * CPU      — real multi-core execution via stdlib/parallel.sapp (spawn = OS threads).
+//   * STORAGE  — real parallel file I/O (read/scan many files at once).
+//   * RAM      — real budget-aware chunking (process datasets larger than a chunk).
+//   * GPU/NPU  — DETECTED via the hardware watcher and included in plans; actual dispatch
+//                needs native device kernels (not expressible in pure pblang), so the
+//                scheduler routes to a registered native hook if present and otherwise
+//                FALLS BACK to the CPU pool. The API is device-aware so kernels slot in.
+//
+//   let cp = import("stdlib:compute.sapp");
+//   let devs = cp.devices(); let plan = cp.plan(1000, devs);
+//   let out  = cp.run(items, worker);                 // multi-core (worker self-contained)
+//   let blobs = cp.storage_read_parallel(paths);      // parallel storage I/O
+
+let P = import("stdlib:parallel.sapp");
+let OS = import("stdlib:os.sapp");
+let W = import("stdlib:watch.sapp");
+let NAT = import("stdlib:native.sapp");   // native-code execution mode (real machine code)
+
+fn cpu_cores() { return try OS.cpu_count() catch 1; }
+
+fn _avail(probe) {
+    let r = try probe() catch nil;
+    if r == nil { return false; }
+    let a = try r.available catch false;
+    if a == nil { return false; }
+    return a;
+}
+
+// devices() — enumerate compute + memory resources with a scheduling `weight` (relative
+// throughput for the planner; memory resources carry weight 0 — they hold data, they
+// don't execute tasks).
+fn devices() {
+    let out = [];
+    let cores = cpu_cores();
+    array_push(out, map{ kind: "cpu", units: cores, available: true, weight: cores });
+    let gpu_ok = _avail(W.gpus);
+    let gw = 0; if gpu_ok { gw = 4 * cores; }                 // a GPU, when usable, is worth many cores
+    array_push(out, map{ kind: "gpu", units: 1, available: gpu_ok, weight: gw });
+    let npu_ok = _avail(W.npu);
+    let nw = 0; if npu_ok { nw = 2 * cores; }
+    array_push(out, map{ kind: "npu", units: 1, available: npu_ok, weight: nw });
+    array_push(out, map{ kind: "ram", units: 1, available: true, weight: 0 });
+    array_push(out, map{ kind: "storage", units: 1, available: true, weight: 0 });
+    return out;
+}
+
+// plan(n, devs) — split n tasks across the AVAILABLE executor devices (weight>0),
+// proportionally to weight; remainder goes to the heaviest. Returns [{kind, count}] that
+// sums to n. (GPU/NPU shares fall back to CPU at run time unless a native hook exists.)
+fn plan(n, devs) {
+    let tw = 0;
+    let i = 0;
+    while i < len(devs) { if devs[i].available and devs[i].weight > 0 { tw = tw + devs[i].weight; } i = i + 1; }
+    let out = [];
+    let assigned = 0;
+    let j = 0;
+    while j < len(devs) {
+        let cnt = 0;
+        if devs[j].available and devs[j].weight > 0 and tw > 0 { cnt = num_floor(n * devs[j].weight / tw); }
+        array_push(out, map{ kind: devs[j].kind, count: cnt });
+        assigned = assigned + cnt;
+        j = j + 1;
+    }
+    if assigned < n {
+        let best = 0 - 1;
+        let bestw = 0;
+        let k = 0;
+        while k < len(devs) { if devs[k].available and devs[k].weight > bestw { bestw = devs[k].weight; best = k; } k = k + 1; }
+        if best >= 0 { out[best].count = out[best].count + (n - assigned); }
+    }
+    return out;
+}
+
+// run(items, worker) — execute worker over every item using ALL CPU cores. `worker` must
+// be SELF-CONTAINED (its argument + builtins only — no upvalues / imported fns), because
+// each runs on its own VM thread. Results come back in input order.
+fn run(items, worker) { return P.par_map(items, worker); }
+
+// run_chunked(items, worker, chunk_size) — RAM-aware: process the data chunk-by-chunk
+// (each chunk run in parallel), so a dataset bigger than one chunk still fits.
+fn run_chunked(items, worker, chunk_size) {
+    let out = [];
+    let cs = chunk(items, chunk_size);
+    let c = 0;
+    while c < len(cs) {
+        let part = P.par_map(cs[c], worker);
+        let i = 0;
+        while i < len(part) { array_push(out, part[i]); i = i + 1; }
+        c = c + 1;
+    }
+    return out;
+}
+
+// chunk(items, size) — split into RAM-sized batches (ceil(n/size) chunks).
+fn chunk(items, size) {
+    if size < 1 { size = 1; }
+    let out = [];
+    let i = 0;
+    while i < len(items) {
+        let part = [];
+        let j = 0;
+        while j < size and i + j < len(items) { array_push(part, items[i + j]); j = j + 1; }
+        array_push(out, part);
+        i = i + size;
+    }
+    return out;
+}
+
+// storage_read_parallel(paths) — read many files at once (parallel storage I/O). fs_read
+// is a builtin, so the worker is self-contained.
+fn storage_read_parallel(paths) { return P.par_map(paths, fn(p) { return fs_read(p); }); }
+
+// hardware() — full device survey (CPU/GPU/NPU/storage/network) via the watcher.
+fn hardware() { return try W.hardware() catch map{ available: false }; }
+
+// summary(devs) — a one-line human description of the available compute fabric.
+fn summary(devs) {
+    let s = "compute:";
+    let i = 0;
+    while i < len(devs) {
+        if devs[i].available { s = s + " " + devs[i].kind + "(" + str(devs[i].units) + ")"; }
+        i = i + 1;
+    }
+    return s;
+}
+
+// ── native execution mode ─────────────────────────────────────────────────────────────
+// The scheduler can also run an integer kernel as REAL machine code on the host CPU (not the
+// VM), via stdlib/native.sapp. This is the "use the hardware properly" path for hot integer
+// loops: compile the shared register IR to a native binary and execute it.
+fn native_available() { return try NAT.supported() catch false; }
+fn native_arch() { return try NAT.host_arch() catch "unknown"; }
+fn native_run(ir) {
+    if not native_available() { throw "compute: native mode unavailable on host " + native_arch(); }
+    return NAT.run(ir);
+}
+// native_value(ir) — offload an integer kernel to native code and get the FULL result back.
+fn native_value(ir) {
+    if not native_available() { throw "compute: native mode unavailable on host " + native_arch(); }
+    return NAT.run_value(ir);
+}
+fn native_info() { return try NAT.info() catch map{ supported: false }; }
+
+export cpu_cores, devices, plan, run, run_chunked, chunk, storage_read_parallel, hardware, summary;
+export native_available, native_arch, native_run, native_value, native_info;

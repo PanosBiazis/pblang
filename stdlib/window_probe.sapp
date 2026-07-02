@@ -1,0 +1,161 @@
+// stdlib/window_probe.sapp — read the REAL OS window size from pblang (self-hosted).
+//
+// The pblang graphics builtin `win.size()` returns the fixed FRAMEBUFFER size, not the
+// live window size after the user/WM resizes the window — that information lives in the
+// OS windowing layer and isn't exposed by any graphics builtin. This module recovers it
+// WITHOUT any Rust change, by asking the window manager over a subprocess (the same
+// technique the IDE uses to detect display resolution). It needs --allow-exec.
+//
+//   let wp = import("stdlib:window_probe.sapp");
+//   let sz = wp.size_by_title("pblang IDE - Smart Code Editor");   // {w,h} or nil
+//   if wp.changed(prev, sz) { /* relayout for the new size */ }
+//
+// Linux/X11: uses `xwininfo -name <title>` (exact title) then `xdotool` as a fallback.
+// On Wayland/macOS/Windows the tools differ; size_by_title returns nil there (callers
+// should fall back to the framebuffer size from win.size()).
+
+let DIG = "0123456789";
+
+fn _is_digit(ch) { return str_index_of(DIG, ch) >= 0; }
+
+// _first_wh(text) — the first "<W>x<H>" integer pair in text (tolerates spaces / 'X').
+fn _first_wh(text) {
+    let n = len(text);
+    let i = 0;
+    while i < n {
+        let j = i;
+        let a = "";
+        while j < n and _is_digit(str_slice(text, j, j + 1)) { a = a + str_slice(text, j, j + 1); j = j + 1; }
+        if len(a) >= 2 {
+            let k = j;
+            while k < n and str_slice(text, k, k + 1) == " " { k = k + 1; }
+            let xch = "";
+            if k < n { xch = str_slice(text, k, k + 1); }
+            if xch == "x" or xch == "X" {
+                k = k + 1;
+                while k < n and str_slice(text, k, k + 1) == " " { k = k + 1; }
+                let b = "";
+                while k < n and _is_digit(str_slice(text, k, k + 1)) { b = b + str_slice(text, k, k + 1); k = k + 1; }
+                if len(b) >= 2 { return map{ w: parse_number(a), h: parse_number(b) }; }
+            }
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// _int_after(text, label) — the first integer that follows `label` on the same line.
+fn _int_after(text, label) {
+    let i = str_index_of(text, label);
+    if i < 0 { return nil; }
+    let n = len(text);
+    let j = i + len(label);
+    while j < n and not _is_digit(str_slice(text, j, j + 1)) {
+        if str_slice(text, j, j + 1) == "\n" { return nil; }   // don't cross lines
+        j = j + 1;
+    }
+    let num = "";
+    while j < n and _is_digit(str_slice(text, j, j + 1)) { num = num + str_slice(text, j, j + 1); j = j + 1; }
+    if len(num) == 0 { return nil; }
+    return parse_number(num);
+}
+
+// parse_geometry(text) — extract {w,h} from window-manager tool output. Recognizes
+// xdotool's "Geometry: WxH" (preferred) and xwininfo's "Width:"/"Height:" lines, with a
+// generic "WxH" fallback. Returns nil when no size is present.
+fn parse_geometry(text) {
+    if text == nil { return nil; }
+    let gi = str_index_of(text, "Geometry:");
+    if gi >= 0 {
+        let tail = str_slice(text, gi, len(text));
+        let wh = _first_wh(tail);
+        if wh != nil { return wh; }
+    }
+    let w = _int_after(text, "Width:");
+    let h = _int_after(text, "Height:");
+    if w != nil and h != nil { return map{ w: w, h: h }; }
+    return _first_wh(text);
+}
+
+// _shq(s) — single-quote a string for a bash command (so a window title with spaces or
+// metacharacters is passed as one safe literal argument).
+fn _shq(s) { return "'" + str_replace_all(str(s), "'", "'\\''") + "'"; }
+
+fn _run(cmd) {
+    let r = try proc_spawn_wait("timeout", ["0.35s", "bash", "-c", cmd]) catch nil;
+    if r == nil { return ""; }
+    let status = try r.status catch 0;
+    if status != 0 { return ""; }
+    let out = try r.stdout catch "";
+    if out == nil { return ""; }
+    return out;
+}
+
+fn _run_slow(cmd) {
+    let r = try proc_spawn_wait("timeout", ["0.8s", "bash", "-c", cmd]) catch nil;
+    if r == nil { return ""; }
+    let status = try r.status catch 0;
+    if status != 0 { return ""; }
+    let out = try r.stdout catch "";
+    if out == nil { return ""; }
+    return out;
+}
+
+// size_by_title(title) — the live OS window size for the window whose title exactly
+// matches `title`, or nil if it can't be determined (no X11 tools / other platform).
+fn size_by_title(title) {
+    let q = _shq(title);
+    // xwininfo matches the exact window name and prints Width:/Height:.
+    let g = parse_geometry(_run("xwininfo -name " + q + " 2>/dev/null"));
+    if g != nil { return g; }
+    // xdotool fallback: find the window id by (regex) name, then read its geometry.
+    g = parse_geometry(_run("xdotool getwindowgeometry $(xdotool search --name " + q + " 2>/dev/null | head -1) 2>/dev/null"));
+    if g != nil { return g; }
+    return nil;
+}
+
+// monitor_size_by_title(title) — best-effort active monitor size containing the window
+// center. This lets PBIDE update density when moved between screens even if the window
+// size itself did not change. X11-only: xdotool gives window position/size; xrandr gives
+// active monitor rectangles. Returns nil when unavailable.
+fn monitor_size_by_title(title) {
+    let q = _shq(title);
+    let cmd = "id=$(xdotool search --name " + q + " 2>/dev/null | head -1); "
+        + "[ -n \"$id\" ] || exit 0; "
+        + "eval \"$(xdotool getwindowgeometry --shell \"$id\" 2>/dev/null)\"; "
+        + "cx=$((X + WIDTH / 2)); cy=$((Y + HEIGHT / 2)); "
+        + "xrandr --listactivemonitors 2>/dev/null | awk -v cx=\"$cx\" -v cy=\"$cy\" '"
+        + "/^[[:space:]]*[0-9]+:/ { "
+        + "geom=$3; sub(/^[+*]*/, \"\", geom); split(geom, p, /[x+]/); "
+        + "split(p[1], wp, \"/\"); split(p[2], hp, \"/\"); "
+        + "w=wp[1]+0; h=hp[1]+0; x=p[3]+0; y=p[4]+0; "
+        + "if (cx >= x && cx < x + w && cy >= y && cy < y + h) { print w \"x\" h; found=1; exit; } "
+        + "} END { }'";
+    return _first_wh(_run_slow(cmd));
+}
+
+fn display_size_for_window(window_size, monitor_size) {
+    if monitor_size != nil { return monitor_size; }
+    return window_size;
+}
+
+// available() — is a supported probe tool (xwininfo or xdotool) on PATH?
+fn available() {
+    let out = _run("command -v xwininfo xdotool 2>/dev/null");
+    return str_index_of(out, "win") >= 0 or str_index_of(out, "dotool") >= 0;
+}
+
+fn monitor_available() {
+    let out = _run("command -v xdotool xrandr 2>/dev/null");
+    return str_index_of(out, "xdotool") >= 0 and str_index_of(out, "xrandr") >= 0;
+}
+
+// changed(prev, cur) — did the size change since the last probe? (nil prev counts as a
+// change; nil cur counts as no change so a failed probe doesn't trigger a relayout).
+fn changed(prev, cur) {
+    if cur == nil { return false; }
+    if prev == nil { return true; }
+    return (try prev.w catch 0) != cur.w or (try prev.h catch 0) != cur.h;
+}
+
+export parse_geometry, size_by_title, monitor_size_by_title, display_size_for_window, available, monitor_available, changed;

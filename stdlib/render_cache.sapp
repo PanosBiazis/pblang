@@ -1,0 +1,172 @@
+// stdlib/render_cache.sapp — pure-pblang render efficiency for the graphics stack.
+//
+// THE PROBLEM: pblang's graphics builtins rasterize on ONE CPU core, and apps typically
+// redraw the WHOLE surface every frame. For a mostly-static UI (the IDE, a dashboard)
+// that burns a core repainting pixels that never changed — the GPU stays idle and the CPU
+// is wasted. (Real GPU rasterization needs a native backend; see the graphics crate.)
+//
+// THE FIX (no Rust, no GPU): retained-mode helpers so an app repaints ONLY what changed
+// and SKIPS frames where nothing changed at all:
+//   * dirty-rectangle tracker — mark changed regions, coalesce overlaps, and promote to a
+//     full repaint once the dirty area dominates (partial redraw stops paying off).
+//   * frame governor — render only when there's an event or the state changed, and never
+//     more often than the target fps.
+//
+//   let R = import("stdlib/render_cache.sapp");
+//   let dc = R.new(W, H); let gov = R.governor_new(60);
+//   // per loop iteration:
+//   let f = R.should_render(gov, now_ms, state_hash, had_event); gov = f.gov;
+//   if f.render {
+//       for rc in R.regions(dc) { /* redraw only rc, then blit */ }
+//       R.clear_dirty(dc); win.present();
+//   }
+
+// ── rect helpers (pure) ──────────────────────────────────────────────────────────────
+fn rect_area(r) { return r.w * r.h; }
+
+// rectangles overlap when they intersect with positive area (edge-touching ≠ overlap).
+fn rect_overlaps(a, b) {
+    return a.x < b.x + b.w and b.x < a.x + a.w and a.y < b.y + b.h and b.y < a.y + a.h;
+}
+
+// smallest rect containing both.
+fn rect_union(a, b) {
+    let x = a.x; if b.x < x { x = b.x; }
+    let y = a.y; if b.y < y { y = b.y; }
+    let r = a.x + a.w; if b.x + b.w > r { r = b.x + b.w; }
+    let d = a.y + a.h; if b.y + b.h > d { d = b.y + b.h; }
+    return map{ x: x, y: y, w: r - x, h: d - y };
+}
+
+// clamp a rect to the [0,w]×[0,h] surface; fully-outside rects come back zero-area.
+fn rect_clip(r, w, h) {
+    let x0 = r.x; let y0 = r.y; let x1 = r.x + r.w; let y1 = r.y + r.h;
+    if x0 < 0 { x0 = 0; } if y0 < 0 { y0 = 0; }
+    if x1 > w { x1 = w; } if y1 > h { y1 = h; }
+    if x1 < x0 { x1 = x0; } if y1 < y0 { y1 = y0; }
+    return map{ x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+// ── dirty tracker ────────────────────────────────────────────────────────────────────
+// COVERAGE_FULL — once coalesced dirty area exceeds this fraction of the surface, a single
+// full repaint is cheaper (and simpler) than juggling many regions.
+let COVERAGE_FULL = 0.6;
+
+fn new(w, h) {
+    return map{ w: w, h: h, rects: [], full: false };
+}
+
+// mark(dc, x, y, w, h) — record a changed region (clipped to the surface). Zero-area
+// (out-of-bounds) marks are ignored. Promotes to a full repaint past the coverage cap.
+fn mark(dc, x, y, w, h) {
+    if dc.full { return dc; }
+    let r = rect_clip(map{ x: x, y: y, w: w, h: h }, dc.w, dc.h);
+    if r.w <= 0 or r.h <= 0 { return dc; }
+    array_push(dc.rects, r);
+    _maybe_promote(dc);
+    return dc;
+}
+
+fn mark_full(dc) { dc.full = true; dc.rects = []; return dc; }
+
+fn is_full(dc) { return dc.full; }
+fn is_dirty(dc) { return dc.full or len(dc.rects) > 0; }
+
+// _coalesce(rects) — repeatedly merge any two overlapping rects into their union until no
+// overlaps remain, so each returned region is painted once.
+fn _coalesce(rects) {
+    let work = [];
+    let i = 0;
+    while i < len(rects) { array_push(work, rects[i]); i = i + 1; }
+    let merged = true;
+    while merged {
+        merged = false;
+        let out = [];
+        let used = [];
+        let a = 0;
+        while a < len(work) { used[a] = false; a = a + 1; }
+        let p = 0;
+        while p < len(work) {
+            if not used[p] {
+                let cur = work[p];
+                let q = p + 1;
+                while q < len(work) {
+                    if not used[q] and rect_overlaps(cur, work[q]) {
+                        cur = rect_union(cur, work[q]);
+                        used[q] = true;
+                        merged = true;
+                    }
+                    q = q + 1;
+                }
+                array_push(out, cur);
+            }
+            p = p + 1;
+        }
+        work = out;
+    }
+    return work;
+}
+
+// _maybe_promote(dc) — if the coalesced dirty area now dominates the surface, collapse to
+// a full repaint.
+fn _maybe_promote(dc) {
+    let regs = _coalesce(dc.rects);
+    let area = 0;
+    let i = 0;
+    while i < len(regs) { area = area + rect_area(regs[i]); i = i + 1; }
+    let total = dc.w * dc.h;
+    if total > 0 and area / total > COVERAGE_FULL { mark_full(dc); }
+    return dc;
+}
+
+// regions(dc) — the rectangles to repaint this frame: the whole surface when full, else
+// the coalesced dirty rects.
+fn regions(dc) {
+    if dc.full { return [map{ x: 0, y: 0, w: dc.w, h: dc.h }]; }
+    return _coalesce(dc.rects);
+}
+
+// coverage(dc) — fraction (0..1) of the surface currently dirty.
+fn coverage(dc) {
+    let total = dc.w * dc.h;
+    if total <= 0 { return 0; }
+    let regs = regions(dc);
+    let area = 0;
+    let i = 0;
+    while i < len(regs) { area = area + rect_area(regs[i]); i = i + 1; }
+    return area / total;
+}
+
+// clear_dirty(dc) — reset after a present.
+fn clear_dirty(dc) { dc.rects = []; dc.full = false; return dc; }
+
+// ── frame governor ───────────────────────────────────────────────────────────────────
+// Renders only when something changed (input event or a new state hash) AND at most once
+// per frame interval — so an idle UI costs ~0 and an active one is capped to target fps.
+fn governor_new(fps) {
+    let interval = 16;
+    if fps > 0 { interval = num_floor(1000 / fps); }
+    return map{ fps: fps, interval: interval, last: 0 - 1000000, hash: nil, started: false };
+}
+
+// should_render(gov, now_ms, state_hash, had_event) — returns { render, gov }. `render` is
+// true when (an event happened OR state_hash changed) AND the interval since the last
+// render has elapsed. Pure: returns an updated governor; callers thread it forward.
+fn should_render(gov, now_ms, state_hash, had_event) {
+    let changed = had_event or (not gov.started) or state_hash != gov.hash;
+    let elapsed = now_ms - gov.last >= gov.interval;
+    if changed and elapsed {
+        gov.last = now_ms;
+        gov.hash = state_hash;
+        gov.started = true;
+        return map{ render: true, gov: gov };
+    }
+    // NOT rendering: leave `hash` untouched on purpose — if the state changed during a
+    // throttled frame, that pending change must persist until it actually gets painted
+    // (overwriting it here would silently drop the update).
+    return map{ render: false, gov: gov };
+}
+
+export rect_area, rect_overlaps, rect_union, rect_clip;
+export new, mark, mark_full, is_full, is_dirty, regions, coverage, clear_dirty;
+export governor_new, should_render;

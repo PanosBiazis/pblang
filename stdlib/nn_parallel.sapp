@@ -1,0 +1,145 @@
+// stdlib/nn_parallel.sapp — data-parallel inference & evaluation across CPU cores.
+//
+// Forward/eval over a BATCH is embarrassingly parallel (each input is independent), so we
+// fan it out with stdlib/parallel.sapp's par_map, which runs each worker on its own VM
+// thread → real multi-core (pblang's parallel level mapping onto the machine's cores).
+//
+// IMPORTANT pblang constraint: a spawned worker sees ONLY its argument + builtins — no
+// upvalues and no imported-module functions. So every worker here is SELF-CONTAINED: all
+// the data it needs (the net/graph + the input) is packed into its element, and the
+// forward math is inlined using builtins only. Results match the sequential nn.sapp /
+// nn_graph.sapp paths exactly.
+//
+//   let np = import("stdlib:nn_parallel.sapp");
+//   let ys = np.batch_predict(net, xs);          // MLP inference in parallel
+//   let yg = np.graph_batch(graph, inputs, 3);   // graph forward in parallel
+
+let P = import("stdlib:parallel.sapp");
+
+// _mlp worker: inline 2-layer sigmoid forward from a packed { net, x } element.
+fn _mlp_forward(it) {
+    let net = it.net;
+    let x = it.x;
+    let h = [];
+    let o = 0;
+    while o < net.l1.n_out {
+        let s = net.l1.b[o];
+        let i = 0;
+        while i < net.l1.n_in { s = s + net.l1.w[o][i] * x[i]; i = i + 1; }
+        push(h, 1 / (1 + num_exp(0 - s)));
+        o = o + 1;
+    }
+    let y = [];
+    let p = 0;
+    while p < net.l2.n_out {
+        let s2 = net.l2.b[p];
+        let k = 0;
+        while k < net.l2.n_in { s2 = s2 + net.l2.w[p][k] * h[k]; k = k + 1; }
+        push(y, 1 / (1 + num_exp(0 - s2)));
+        p = p + 1;
+    }
+    return y;
+}
+
+// batch_predict(net, xs) — predict every input in parallel (matches nn.predict). The
+// worker is fully inlined (no module calls) so it runs on a spawn thread.
+fn batch_predict(net, xs) {
+    let items = [];
+    let i = 0;
+    while i < len(xs) { push(items, map{ net: net, x: xs[i] }); i = i + 1; }
+    return P.par_map(items, fn(it) {
+        let net = it.net; let x = it.x;
+        let h = [];
+        let o = 0;
+        while o < net.l1.n_out {
+            let s = net.l1.b[o]; let a = 0;
+            while a < net.l1.n_in { s = s + net.l1.w[o][a] * x[a]; a = a + 1; }
+            push(h, 1 / (1 + num_exp(0 - s)));
+            o = o + 1;
+        }
+        let y = [];
+        let p = 0;
+        while p < net.l2.n_out {
+            let s2 = net.l2.b[p]; let k = 0;
+            while k < net.l2.n_in { s2 = s2 + net.l2.w[p][k] * h[k]; k = k + 1; }
+            push(y, 1 / (1 + num_exp(0 - s2)));
+            p = p + 1;
+        }
+        return y;
+    });
+}
+
+// par_losses(net, data) — per-sample squared-error loss in parallel (Σ matches nn.loss·n).
+fn par_losses(net, data) {
+    let items = [];
+    let i = 0;
+    while i < len(data) { push(items, map{ net: net, x: data[i].x, y: data[i].y }); i = i + 1; }
+    return P.par_map(items, fn(it) {
+        let net = it.net; let x = it.x; let yt = it.y;
+        let h = [];
+        let o = 0;
+        while o < net.l1.n_out {
+            let s = net.l1.b[o]; let a = 0;
+            while a < net.l1.n_in { s = s + net.l1.w[o][a] * x[a]; a = a + 1; }
+            push(h, 1 / (1 + num_exp(0 - s)));
+            o = o + 1;
+        }
+        let loss = 0;
+        let p = 0;
+        while p < net.l2.n_out {
+            let s2 = net.l2.b[p]; let k = 0;
+            while k < net.l2.n_in { s2 = s2 + net.l2.w[p][k] * h[k]; k = k + 1; }
+            let yp = 1 / (1 + num_exp(0 - s2));
+            let d = yp - yt[p];
+            loss = loss + d * d;
+            p = p + 1;
+        }
+        return loss / net.l2.n_out;
+    });
+}
+
+// graph_batch(g, inputs_list, steps) — run the graph forward on every input in parallel
+// (matches nn_graph.forward). The worker inlines the synchronous propagation + activations.
+fn graph_batch(g, inputs_list, steps) {
+    let items = [];
+    let i = 0;
+    while i < len(inputs_list) { push(items, map{ g: g, inp: inputs_list[i], steps: steps }); i = i + 1; }
+    return P.par_map(items, fn(it) {
+        let nodes = it.g.nodes;
+        let bonds = it.g.bonds;
+        let inputs = it.inp;
+        let vals = [];
+        let a = 0;
+        while a < len(nodes) { if a < len(inputs) { push(vals, inputs[a]); } else { push(vals, 0); } a = a + 1; }
+        let s = 0;
+        while s < it.steps {
+            let next = [];
+            let n = 0;
+            while n < len(nodes) {
+                if n < len(inputs) { push(next, inputs[n]); }
+                else {
+                    let sum = nodes[n].bias;
+                    let b = 0;
+                    while b < len(bonds) { if bonds[b].to == n { sum = sum + bonds[b].weight * vals[bonds[b].from]; } b = b + 1; }
+                    let act = nodes[n].act;
+                    let outv = sum;
+                    if act == "relu" { if sum > 0 { outv = sum; } else { outv = 0; } }
+                    else { if act == "sigmoid" { outv = 1 / (1 + num_exp(0 - sum)); }
+                    else { if act == "tanh" {
+                        if sum > 20 { outv = 1; } else { if sum < 0 - 20 { outv = 0 - 1; } else { let e2 = num_exp(2 * sum); outv = (e2 - 1) / (e2 + 1); } }
+                    } } }
+                    push(next, outv);
+                }
+                n = n + 1;
+            }
+            vals = next;
+            s = s + 1;
+        }
+        return vals;
+    });
+}
+
+// par_apply(items, f) — generic parallel map; f MUST be self-contained (arg + builtins only).
+fn par_apply(items, f) { return P.par_map(items, f); }
+
+export batch_predict, par_losses, graph_batch, par_apply;

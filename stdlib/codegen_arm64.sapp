@@ -1,0 +1,286 @@
+// stdlib/codegen_arm64.sapp — AArch64 (arm64) backend for the codegen register IR.
+//
+// The SAME IR as codegen_x64 (r0..r3 -> x0..x3, r0=result) lowered to real ARM64 machine
+// code + ELF (EM_AARCH64). AArch64 is a fixed-width 32-bit, little-endian ISA. On an x86-64
+// host without an emulator this is verified by exact instruction ENCODINGS (ARM ARM) and a
+// valid AArch64 ELF; it runs on real arm64 hardware. Zero Rust in the codegen path.
+//
+//   IR: ["seti",r,imm] ["add"|"sub"|"mul",a,b] ["addi",r,imm] ["loop",r,[body]]
+//   exit code = r0 (x0) via svc #0 with x8 = 93 (sys_exit).
+
+let X = import("stdlib:codegen_x64.sapp");   // reuse le16/le32 byte encoders
+
+fn _app(dst, src) { let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; } return dst; }
+fn _vreg(r) { if r < 0 or r > 3 { throw "codegen_arm64: register out of range 0..3: " + str(r); } return r; }
+fn _w(word) { return X.le32(word); }   // emit a 32-bit instruction word, little-endian
+
+// ── instruction encoders (fields combined by addition; they never overlap) ───────────
+fn movz_imm16(rd, imm16) { return _w(0xD2800000 + imm16 * 32 + _vreg(rd)); }         // movz Xd,#imm16
+fn _movk_hi16(rd, imm16) { return _w(0xF2A00000 + imm16 * 32 + _vreg(rd)); }         // movk Xd,#imm16,lsl#16
+fn add_rr(a, b) { return _w(0x8B000000 + _vreg(b) * 65536 + _vreg(a) * 32 + _vreg(a)); } // add Xa,Xa,Xb
+fn sub_rr(a, b) { return _w(0xCB000000 + _vreg(b) * 65536 + _vreg(a) * 32 + _vreg(a)); } // sub Xa,Xa,Xb
+fn mul_rr(a, b) { return _w(0x9B000000 + _vreg(b) * 65536 + 31 * 1024 + _vreg(a) * 32 + _vreg(a)); } // madd Xa,Xa,Xb,xzr
+fn addi_r(a, imm12) { return _w(0x91000000 + imm12 * 1024 + _vreg(a) * 32 + _vreg(a)); } // add Xa,Xa,#imm12
+fn _subi1(c) { return _w(0xD1000000 + 1 * 1024 + _vreg(c) * 32 + _vreg(c)); }        // sub Xc,Xc,#1
+fn svc0() { return _w(0xD4000001); }                                                 // svc #0
+
+// conditional compare-and-branch; off is a signed instruction count (×4 bytes). cbz/cbnz
+// carry a SIGNED 19-bit offset; guard against overflow so a huge loop body can't silently
+// produce a wrong branch (a classic codegen bug).
+fn _imm19(off) {
+    if off < 0 - 262144 or off > 262143 { throw "codegen_arm64: loop body too large for cbz/cbnz 19-bit branch range"; }
+    if off < 0 { return 524288 + off; }   // 19-bit two's complement
+    return off;
+}
+fn _cbnz(rt, off) { return _w(0xB5000000 + _imm19(off) * 32 + _vreg(rt)); }          // cbnz Xt, off
+fn _cbz(rt, off) { return _w(0xB4000000 + _imm19(off) * 32 + _vreg(rt)); }           // cbz  Xt, off
+// unconditional branch b; off is a signed instruction count (26-bit).
+fn _imm26(off) {
+    if off < 0 - 33554432 or off > 33554431 { throw "codegen_arm64: branch out of 26-bit range"; }
+    if off < 0 { return 67108864 + off; }
+    return off;
+}
+fn _b(off) { return _w(0x14000000 + _imm26(off)); }
+// _emit_ifnz(reg, then, else): cbz reg,else ; <then> ; b end ; <else>
+fn _emit_ifnz(reg, thenb, elseb) {
+    let ti = num_floor(len(thenb) / 4);
+    let ei = num_floor(len(elseb) / 4);
+    let out = [];
+    _app(out, _cbz(reg, ti + 2));        // skip then(ti)+b(1) -> else
+    _app(out, thenb);
+    _app(out, _b(ei + 1));               // skip else -> end
+    _app(out, elseb);
+    return out;
+}
+
+// seti_bytes(rd, imm) — load a 0..2^32-1 immediate: one movz for <=16 bits, else movz(low16)
+// followed by movk(high16, lsl#16).
+fn seti_bytes(rd, imm) {
+    if imm < 0 or imm > 4294967295 { throw "codegen_arm64: immediate out of 32-bit range: " + str(imm); }
+    let lo = imm - num_floor(imm / 65536) * 65536;
+    let hi = num_floor(imm / 65536);
+    let out = movz_imm16(rd, lo);
+    if hi > 0 { _app(out, _movk_hi16(rd, hi)); }
+    return out;
+}
+
+// _emit_loop — guard (cbz skips when 0), body, sub counter, cbnz back. Offsets in instrs.
+fn _emit_loop(counter, body) {
+    let body_instrs = num_floor(len(body) / 4);
+    let out = [];
+    _app(out, _cbz(counter, body_instrs + 3));      // skip body + sub + cbnz (then land after)
+    _app(out, body);
+    _app(out, _subi1(counter));
+    _app(out, _cbnz(counter, 0 - (body_instrs + 1)));
+    return out;
+}
+
+// ── syscall op ───────────────────────────────────────────────────────────────────────
+// ["syscall", nr, [argregs]] — AArch64 Linux syscall: nr in x8; args x0..x5; `svc #0`;
+// result in x0 (→ r0). Sources (x0..x3) are first copied to scratch x9.. so moving them into
+// the x0..x5 arg slots can't clobber a not-yet-read source.
+fn _mov_rr_raw(d, s) {
+    if d < 0 or d > 30 or s < 0 or s > 30 { throw "codegen_arm64: reg out of range: " + str(d) + "," + str(s); }
+    return _w(0xAA0003E0 + s * 65536 + d);   // orr Xd, xzr, Xs  (= mov Xd, Xs)
+}
+fn _movz_raw(rd, imm16) {
+    if rd < 0 or rd > 30 { throw "codegen_arm64: reg out of range: " + str(rd); }
+    return _w(0xD2800000 + imm16 * 32 + rd);
+}
+fn _syscall_op(nr, argregs) {
+    if len(argregs) > 6 { throw "codegen_arm64: syscall supports up to 6 args"; }
+    let out = [];
+    let i = 0;
+    while i < len(argregs) { _app(out, _mov_rr_raw(9 + i, _vreg(argregs[i]))); i = i + 1; }   // stash sources
+    i = 0;
+    while i < len(argregs) { _app(out, _mov_rr_raw(i, 9 + i)); i = i + 1; }                   // place into x0..x5
+    _app(out, _movz_raw(8, nr));      // x8 = syscall number
+    _app(out, svc0());
+    return out;
+}
+
+fn compile_ir(ir) {
+    let code = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "seti" { _app(code, seti_bytes(ins[1], ins[2])); }
+        else if op == "add" { _app(code, add_rr(ins[1], ins[2])); }
+        else if op == "sub" { _app(code, sub_rr(ins[1], ins[2])); }
+        else if op == "mul" { _app(code, mul_rr(ins[1], ins[2])); }
+        else if op == "addi" { _app(code, addi_r(ins[1], ins[2])); }
+        else if op == "loop" { _app(code, _emit_loop(_vreg(ins[1]), compile_ir(ins[2]))); }
+        else if op == "ifnz" { _app(code, _emit_ifnz(_vreg(ins[1]), compile_ir(ins[2]), compile_ir(ins[3]))); }
+        else if op == "syscall" { _app(code, _syscall_op(ins[1], ins[2])); }
+        else { throw "codegen_arm64: unknown IR op: " + str(op); }
+        i = i + 1;
+    }
+    return code;
+}
+
+// ── AArch64 ELF64 (same layout as x86-64, e_machine = 0xB7) ───────────────────────────
+let _LOAD = 0x400000;
+let _HSIZE = 120;   // 64 (ehdr) + 56 (one phdr)
+
+fn elf64_exec(code) {
+    let total = _HSIZE + len(code);
+    let entry = _LOAD + _HSIZE;
+    let out = [];
+    _app(out, [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    _app(out, X.le16(2));            // e_type ET_EXEC
+    _app(out, X.le16(0xB7));         // e_machine EM_AARCH64
+    _app(out, X.le32(1));            // e_version
+    _app(out, X.le64(entry));        // e_entry
+    _app(out, X.le64(64));           // e_phoff
+    _app(out, X.le64(0));            // e_shoff
+    _app(out, X.le32(0));            // e_flags
+    _app(out, X.le16(64));           // e_ehsize
+    _app(out, X.le16(56));           // e_phentsize
+    _app(out, X.le16(1));            // e_phnum
+    _app(out, X.le16(0));            // e_shentsize
+    _app(out, X.le16(0));            // e_shnum
+    _app(out, X.le16(0));            // e_shstrndx
+    _app(out, X.le32(1));            // p_type PT_LOAD
+    _app(out, X.le32(7));            // p_flags RWX
+    _app(out, X.le64(0));            // p_offset
+    _app(out, X.le64(_LOAD));        // p_vaddr
+    _app(out, X.le64(_LOAD));        // p_paddr
+    _app(out, X.le64(total));        // p_filesz
+    _app(out, X.le64(total));        // p_memsz
+    _app(out, X.le64(0x1000));       // p_align
+    _app(out, code);
+    return out;
+}
+
+// compile_program(ir) — run the IR, then exit(x0) via svc with x8=93.
+fn compile_program(ir) {
+    let code = compile_ir(ir);
+    _app(code, _w(0xD2800000 + 93 * 32 + 8));   // movz x8, #93 (sys_exit)
+    _app(code, svc0());
+    return elf64_exec(code);
+}
+
+// ── functions: bl/ret with a relocation pass (AArch64), recursion via stp/ldp save ───
+// Caller-saves x1..x3 + x30 (link register) around each bl so recursion works; x0 carries
+// the argument in and result out. Encoding-verified (no emulator on host); runs on arm64.
+fn _bl_placeholder() { return _w(0x94000000); }        // bl #0 (patched later)
+fn _ret() { return _w(0xD65F03C0); }                   // ret (x30)
+fn _stp_pre(t1, t2) { return _w(0xA9800000 + 0x7E * 32768 + t2 * 1024 + 31 * 32 + t1); }  // stp t1,t2,[sp,#-16]!
+fn _ldp_post(t1, t2) { return _w(0xA8C00000 + 2 * 32768 + t2 * 1024 + 31 * 32 + t1); }    // ldp t1,t2,[sp],#16
+fn _bl_off(off) {                                       // bl with signed 26-bit instr offset
+    let v = off; if v < 0 { v = 67108864 + v; }
+    return _w(0x94000000 + v);
+}
+
+fn _ucbody(ir) {
+    let bytes = [];
+    let fixups = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "call" {
+            _app(bytes, _stp_pre(1, 2));               // save x1,x2
+            _app(bytes, _stp_pre(3, 30));              // save x3,x30
+            let pos = num_floor(len(bytes) / 4);       // instruction index of the bl
+            _app(bytes, _bl_placeholder());
+            array_push(fixups, map{ pos: pos, name: ins[1] });
+            _app(bytes, _ldp_post(3, 30));             // restore x3,x30
+            _app(bytes, _ldp_post(1, 2));              // restore x1,x2
+        } else if op == "ret" {
+            _app(bytes, _ret());
+        } else if op == "loop" {
+            let sub = _ucbody(ins[2]);
+            let base = num_floor(len(bytes) / 4) + 1;  // arm64 loop prefix: cbz (1 instr)
+            _app(bytes, _emit_loop(_vreg(ins[1]), sub.bytes));
+            _umerge(fixups, sub.fixups, base);
+        } else if op == "ifnz" {
+            let st = _ucbody(ins[2]);
+            let se = _ucbody(ins[3]);
+            let then_base = num_floor(len(bytes) / 4) + 1;                          // cbz(1)
+            let else_base = num_floor(len(bytes) / 4) + 1 + num_floor(len(st.bytes) / 4) + 1;  // +then+b(1)
+            _app(bytes, _emit_ifnz(_vreg(ins[1]), st.bytes, se.bytes));
+            _umerge(fixups, st.fixups, then_base);
+            _umerge(fixups, se.fixups, else_base);
+        } else {
+            _app(bytes, compile_ir([ins]));            // leaf via the normal lowering
+        }
+        i = i + 1;
+    }
+    return map{ bytes: bytes, fixups: fixups };
+}
+fn _umerge(dst, sub, base) { let i = 0; while i < len(sub) { array_push(dst, map{ pos: sub[i].pos + base, name: sub[i].name }); i = i + 1; } return dst; }
+fn _patch_bl(code, instr_idx, off) {
+    let w = _bl_off(off);
+    let b = instr_idx * 4;
+    let i = 0; while i < 4 { code[b + i] = w[i]; i = i + 1; }
+    return code;
+}
+// _ldimm(rd, imm) — load a 0..2^32-1 immediate into any reg (movz low16 [+ movk high16]).
+fn _movk_raw(rd, imm16) { return _w(0xF2A00000 + imm16 * 32 + rd); }
+fn _ldimm(rd, imm) {
+    let lo = imm - num_floor(imm / 65536) * 65536;
+    let hi = num_floor(imm / 65536);
+    let out = _movz_raw(rd, lo);
+    if hi > 0 { _app(out, _movk_raw(rd, hi)); }
+    return out;
+}
+// _value_tail(buf) — store x0 to buf, write 8 bytes to stdout, exit. Fixed size for ≤32-bit buf.
+fn _value_tail(buf) {
+    let c = [];
+    _app(c, _ldimm(9, buf));                 // x9 = buf
+    _app(c, _w(0xF9000000 + 9 * 32 + 0));    // str x0, [x9]
+    _app(c, _movz_raw(0, 1));                // x0 = 1 (stdout fd)
+    _app(c, _ldimm(1, buf));                 // x1 = buf
+    _app(c, _movz_raw(2, 8));                // x2 = 8 (length)
+    _app(c, _movz_raw(8, 64));               // x8 = 64 (write)
+    _app(c, svc0());
+    _app(c, _movz_raw(0, 0));                // x0 = 0
+    _app(c, _movz_raw(8, 93));               // x8 = 93 (exit)
+    _app(c, svc0());
+    return c;
+}
+// build_value(ir) — run the IR, write x0's 8 bytes to stdout, exit. Lets arm64 native mode
+// return arbitrary 64-bit results. Encoding-verified (runs on real arm64).
+fn build_value(ir) {
+    let probe = compile_ir(ir);
+    let buf = _LOAD + _HSIZE + len(probe) + len(_value_tail(0));
+    let code = [];
+    _app(code, probe);
+    _app(code, _value_tail(buf));
+    let i = 0; while i < 8 { array_push(code, 0); i = i + 1; }   // 8-byte result buffer
+    return elf64_exec(code);
+}
+
+// compile_unit(funcs, main) — AArch64 native ELF with named bl/ret subroutines.
+fn compile_unit(funcs, main) {
+    let mainr = _ucbody(main);
+    let code = mainr.bytes;
+    _app(code, _w(0xD2800000 + 93 * 32 + 8));          // movz x8,#93 ; svc (exit r0)
+    _app(code, svc0());
+    let allfix = [];
+    _umerge(allfix, mainr.fixups, 0);
+    let offsets = map{};
+    let f = 0;
+    while f < len(funcs) {
+        let fb = _ucbody(funcs[f].body);
+        let base = num_floor(len(code) / 4);
+        offsets[funcs[f].name] = base;
+        _app(code, fb.bytes);
+        _app(code, _ret());
+        _umerge(allfix, fb.fixups, base);
+        f = f + 1;
+    }
+    let k = 0;
+    while k < len(allfix) {
+        let fx = allfix[k];
+        if not map_has(offsets, fx.name) { throw "codegen_arm64: call to undefined function '" + fx.name + "'"; }
+        _patch_bl(code, fx.pos, offsets[fx.name] - fx.pos);
+        k = k + 1;
+    }
+    return elf64_exec(code);
+}
+
+export movz_imm16, add_rr, sub_rr, mul_rr, addi_r, svc0, seti_bytes;
+export compile_ir, compile_program, compile_unit, build_value, elf64_exec;

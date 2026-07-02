@@ -1,0 +1,118 @@
+// stdlib/native.sapp — pblang's "native mode" for libraries.
+//
+// A single entry point that lets ANY pblang library run a computation as REAL machine code on
+// the actual CPU instead of the bytecode VM: it detects the host architecture, lowers the
+// shared register IR (see codegen_ir) with the matching backend (x86-64 / i386 / arm64),
+// writes a tiny ELF, executes it, and returns the result. No Rust in the codegen path.
+//
+//   let nat = import("stdlib/native.sapp");
+//   if nat.supported() { nat.run([["seti",0,0],["seti",1,1000000],["loop",1,[["addi",0,1]]]]); }
+//
+// LIMITS (honest): the IR is integer arithmetic + loops + syscalls; the return value comes
+// back as the process exit code (0..255). For wider results, have the program write the value
+// to stdout via the syscall op and parse it (see codegen_x64.build_read_device for the I/O
+// pattern). GPU/NPU execution is NOT here — that needs device drivers/FFI (see device.sapp).
+
+let X64 = import("stdlib:codegen_x64.sapp");
+let X86 = import("stdlib:codegen_x86.sapp");
+let A64 = import("stdlib:codegen_arm64.sapp");
+let IR = import("stdlib:codegen_ir.sapp");   // shared IR validator (safety gate)
+
+// _tmp(prefix) — a UNIQUE temp path under /tmp (kernel RNG uuid), so concurrent runs never
+// collide and nothing is left in the working directory.
+fn _tmp(prefix) {
+    let uid = try str_trim(fs_read("/proc/sys/kernel/random/uuid")) catch "x";
+    return "/tmp/" + prefix + "_" + uid + ".bin";
+}
+
+// host_arch() — normalized machine architecture via uname.
+fn host_arch() {
+    let r = try proc_spawn_wait("bash", ["-c", "uname -m"]) catch nil;
+    let m = str_trim(try r.stdout catch "");
+    if m == "x86_64" or m == "amd64" { return "x86_64"; }
+    if m == "i686" or m == "i386" { return "i386"; }
+    if m == "aarch64" or m == "arm64" { return "arm64"; }
+    return m;
+}
+
+// supported() — can we generate+run native code for this host right now?
+fn supported() {
+    let a = host_arch();
+    return a == "x86_64" or a == "i386" or a == "arm64";
+}
+
+// compile(ir) — ELF bytes of the IR for the HOST architecture. Validates first (safety gate).
+fn compile(ir) {
+    IR.assert_valid(ir);
+    let a = host_arch();
+    if a == "x86_64" { return X64.compile_program(ir); }
+    if a == "i386" { return X86.compile_program(ir); }
+    if a == "arm64" { return A64.compile_program(ir); }
+    throw "native: no backend for host arch '" + a + "'";
+}
+
+// run(ir) — compile to native, execute, and return the result (exit code 0..255). Uses a
+// unique temp file that is ALWAYS removed afterward (clean resource management).
+fn run(ir) {
+    let elf = compile(ir);
+    let path = _tmp("pbnat");
+    fs_write_bytes(path, elf);
+    let r = proc_spawn_wait("bash", ["-c", "chmod +x " + path + " && " + path + "; rc=$?; rm -f " + path + "; echo RC=$rc"]);
+    let out = try r.stdout catch "";
+    let idx = str_index_of(out, "RC=");
+    if idx < 0 { throw "native: could not read result"; }
+    return parse_number(str_trim(str_slice(out, idx + 3, len(out))));
+}
+
+// run_value(ir) — like run(), but returns the FULL 64-bit integer result (the generated
+// program writes r0's bytes to stdout). x86_64 host only for now. This is the entry libraries
+// use to offload an integer kernel and get a real value back (not a 0..255 exit code).
+fn run_value(ir) {
+    IR.assert_valid(ir);
+    let a = host_arch();
+    let elf = nil;
+    let od = "-td8";              // 64-bit result by default
+    if a == "x86_64" { elf = X64.build_value(ir); }
+    else if a == "i386" { elf = X86.build_value(ir); od = "-td4"; }   // 32-bit result
+    else if a == "arm64" { elf = A64.build_value(ir); }
+    else { throw "native: run_value has no backend for host '" + a + "'"; }
+    let path = _tmp("pbnat");
+    fs_write_bytes(path, elf);
+    let r = proc_spawn_wait("bash", ["-c", "chmod +x " + path + " && " + path + " | od -An " + od + "; rm -f " + path]);
+    return parse_number(str_trim(try r.stdout catch ""));
+}
+
+// run_value_fn(ir, nlocals) — like run_value, but the program may use the value stack and
+// `nlocals` memory-backed variables (lset/lget). x86_64 host only for now.
+fn run_value_fn(ir, nlocals) {
+    if host_arch() != "x86_64" { throw "native: run_value_fn is x86_64-only for now"; }
+    IR.assert_valid(ir);
+    let elf = X64.build_value_fn(ir, nlocals);
+    let path = _tmp("pbnat");
+    fs_write_bytes(path, elf);
+    let r = proc_spawn_wait("bash", ["-c", "chmod +x " + path + " && " + path + " | od -An -td8; rm -f " + path]);
+    return parse_number(str_trim(try r.stdout catch ""));
+}
+
+// run_value_f(ir) — run a FLOATING-POINT IR (SSE2 doubles) natively and return the double
+// result (f0). x86_64 host only for now. For scientific/graphics kernels.
+fn run_value_f(ir) {
+    if host_arch() != "x86_64" { throw "native: run_value_f is x86_64-only for now"; }
+    let elf = X64.build_value_f(ir);
+    let path = _tmp("pbnat");
+    fs_write_bytes(path, elf);
+    let r = proc_spawn_wait("bash", ["-c", "chmod +x " + path + " && " + path + " | LC_ALL=C od -An -tf8; rm -f " + path]);
+    return parse_number(str_trim(try r.stdout catch ""));
+}
+
+// info() — what native mode looks like on this machine (for schedulers/diagnostics).
+fn info() {
+    return map{
+        host_arch: host_arch(),
+        supported: supported(),
+        backends: ["x86_64", "i386", "arm64"],
+        result_channel: "exit-code (0..255); use stdout+syscall for wider values"
+    };
+}
+
+export host_arch, supported, compile, run, run_value, run_value_fn, run_value_f, info;

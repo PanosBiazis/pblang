@@ -1,0 +1,241 @@
+// stdlib/codegen_x86.sapp — 32-bit x86 (i386) backend for the codegen register IR.
+//
+// The SAME IR as codegen_x64 (r0..r3, r0=result) lowered to LEGACY 32-bit machine code +
+// ELF32 — the format that runs on decades of older x86 hardware (i386 and up). Verified by
+// running the static ELF32. Zero Rust in the codegen path.
+//
+//   IR: ["seti",r,imm] ["add"|"sub"|"mul",a,b] ["addi",r,imm] ["loop",r,[body]]
+//   regs r0..r3 -> eax/ecx/edx/ebx ; exit code = r0 (mod 256), via int 0x80.
+
+let X = import("stdlib:codegen_x64.sapp");   // reuse le16/le32 byte encoders
+
+fn _app(dst, src) { let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; } return dst; }
+fn _vreg(r) { if r < 0 or r > 3 { throw "codegen_x86: register out of range 0..3: " + str(r); } return r; }
+fn _vimm(n) { if n < 0 or n > 2147483647 { throw "codegen_x86: immediate out of 32-bit range: " + str(n); } return n; }
+fn _u32(rel) { if rel < 0 { return 4294967296 + rel; } return rel; }
+
+let _LOAD = 0x08048000;   // traditional i386 load address
+let _EHSIZE = 52;
+let _PHSIZE = 32;
+let _HSIZE = 84;
+
+// ── 32-bit instruction encoders (no REX prefix) ──────────────────────────────────────
+fn mov_imm32_r(i, imm) { return _app([0xB8 + _vreg(i)], X.le32(_vimm(imm))); }      // mov r32, imm32
+fn add_rr(a, b) { return [0x01, 0xC0 + (_vreg(b) * 8) + _vreg(a)]; }                // a += b
+fn sub_rr(a, b) { return [0x29, 0xC0 + (_vreg(b) * 8) + _vreg(a)]; }                // a -= b
+fn imul_rr(a, b) { return [0x0F, 0xAF, 0xC0 + (_vreg(a) * 8) + _vreg(b)]; }         // a *= b
+fn addi_r(a, imm) { return _app([0x81, 0xC0 + _vreg(a)], X.le32(_vimm(imm))); }     // a += imm
+fn dec_r(a) { return [0x48 + _vreg(a)]; }                                          // dec r32 (1 byte!)
+fn test_rr(a) { return [0x85, 0xC0 + (_vreg(a) * 8) + _vreg(a)]; }
+fn jnz_rel32(rel) { return _app([0x0F, 0x85], X.le32(_u32(rel))); }
+fn jz_rel32(rel) { return _app([0x0F, 0x84], X.le32(_u32(rel))); }
+fn jmp_rel32(rel) { return _app([0xE9], X.le32(_u32(rel))); }
+
+fn _emit_ifnz(reg, thenb, elseb) {
+    let out = [];
+    _app(out, test_rr(reg));
+    _app(out, jz_rel32(len(thenb) + 5));
+    _app(out, thenb);
+    _app(out, jmp_rel32(len(elseb)));
+    _app(out, elseb);
+    return out;
+}
+
+fn _emit_loop(counter, body) {
+    let l = len(body);
+    let out = [];
+    _app(out, test_rr(counter));
+    _app(out, jz_rel32(l + 1 + 6));        // skip body(l) + dec(1) + jnz(6)
+    _app(out, body);
+    _app(out, dec_r(counter));
+    _app(out, jnz_rel32(0 - (l + 1 + 6))); // back to body start
+    return out;
+}
+
+// ── syscall op ───────────────────────────────────────────────────────────────────────
+// ["syscall", nr, [argregs]] — Linux i386 syscall: nr in eax; args ebx,ecx,edx,esi,edi,ebp;
+// `int 0x80`; result in eax (→ r0). Args routed through the stack to avoid clobbering.
+fn _push_r(i) { return [0x50 + _vreg(i)]; }     // push eax/ecx/edx/ebx
+fn _pop_abi(idx) {
+    if idx == 0 { return [0x5B]; }   // pop ebx
+    if idx == 1 { return [0x59]; }   // pop ecx
+    if idx == 2 { return [0x5A]; }   // pop edx
+    if idx == 3 { return [0x5E]; }   // pop esi
+    if idx == 4 { return [0x5F]; }   // pop edi
+    if idx == 5 { return [0x5D]; }   // pop ebp
+    throw "codegen_x86: syscall supports up to 6 args";
+}
+fn _syscall_op(nr, argregs) {
+    let out = [];
+    let i = 0;
+    while i < len(argregs) { _app(out, _push_r(argregs[i])); i = i + 1; }
+    let j = len(argregs) - 1;
+    while j >= 0 { _app(out, _pop_abi(j)); j = j - 1; }
+    _app(out, mov_imm32_r(0, nr));   // eax = syscall number
+    _app(out, [0xCD, 0x80]);         // int 0x80
+    return out;
+}
+
+fn compile_ir(ir) {
+    let code = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "seti" { _app(code, mov_imm32_r(ins[1], ins[2])); }
+        else if op == "add" { _app(code, add_rr(ins[1], ins[2])); }
+        else if op == "sub" { _app(code, sub_rr(ins[1], ins[2])); }
+        else if op == "mul" { _app(code, imul_rr(ins[1], ins[2])); }
+        else if op == "addi" { _app(code, addi_r(ins[1], ins[2])); }
+        else if op == "loop" { _app(code, _emit_loop(_vreg(ins[1]), compile_ir(ins[2]))); }
+        else if op == "ifnz" { _app(code, _emit_ifnz(_vreg(ins[1]), compile_ir(ins[2]), compile_ir(ins[3]))); }
+        else if op == "syscall" { _app(code, _syscall_op(ins[1], ins[2])); }
+        else { throw "codegen_x86: unknown IR op: " + str(op); }
+        i = i + 1;
+    }
+    return code;
+}
+
+// elf32_exec(code) — minimal static ELF32 executable, single RWX PT_LOAD mapping the file.
+fn elf32_exec(code) {
+    let total = _HSIZE + len(code);
+    let entry = _LOAD + _HSIZE;
+    let out = [];
+    _app(out, [0x7F, 0x45, 0x4C, 0x46, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);  // e_ident, ELFCLASS32
+    _app(out, X.le16(2));            // e_type ET_EXEC
+    _app(out, X.le16(3));            // e_machine EM_386
+    _app(out, X.le32(1));            // e_version
+    _app(out, X.le32(entry));        // e_entry
+    _app(out, X.le32(_EHSIZE));      // e_phoff
+    _app(out, X.le32(0));            // e_shoff
+    _app(out, X.le32(0));            // e_flags
+    _app(out, X.le16(_EHSIZE));      // e_ehsize
+    _app(out, X.le16(_PHSIZE));      // e_phentsize
+    _app(out, X.le16(1));            // e_phnum
+    _app(out, X.le16(0));            // e_shentsize
+    _app(out, X.le16(0));            // e_shnum
+    _app(out, X.le16(0));            // e_shstrndx
+    // ELF32 program header — NOTE p_flags sits near the END (different from ELF64).
+    _app(out, X.le32(1));            // p_type PT_LOAD
+    _app(out, X.le32(0));            // p_offset
+    _app(out, X.le32(_LOAD));        // p_vaddr
+    _app(out, X.le32(_LOAD));        // p_paddr
+    _app(out, X.le32(total));        // p_filesz
+    _app(out, X.le32(total));        // p_memsz
+    _app(out, X.le32(7));            // p_flags R|W|X
+    _app(out, X.le32(0x1000));       // p_align
+    _app(out, code);
+    return out;
+}
+
+// ── functions: call/ret with a relocation pass (i386), recursion via caller-save ─────
+fn _enc_leaf(ins) {
+    let op = ins[0];
+    if op == "seti" { return mov_imm32_r(ins[1], ins[2]); }
+    if op == "add" { return add_rr(ins[1], ins[2]); }
+    if op == "sub" { return sub_rr(ins[1], ins[2]); }
+    if op == "mul" { return imul_rr(ins[1], ins[2]); }
+    if op == "addi" { return addi_r(ins[1], ins[2]); }
+    if op == "syscall" { return _syscall_op(ins[1], ins[2]); }
+    throw "codegen_x86: not a leaf op: " + str(op);
+}
+fn _merge_fixups(dst, sub, base) { let i = 0; while i < len(sub) { array_push(dst, map{ pos: sub[i].pos + base, name: sub[i].name }); i = i + 1; } return dst; }
+fn _cbody(ir) {
+    let bytes = [];
+    let fixups = [];
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i];
+        let op = ins[0];
+        if op == "call" {
+            _app(bytes, [0x51, 0x52, 0x53]);       // push ecx, edx, ebx (caller-save r1/r2/r3)
+            array_push(bytes, 0xE8);
+            let pos = len(bytes);
+            _app(bytes, [0, 0, 0, 0]);
+            array_push(fixups, map{ pos: pos, name: ins[1] });
+            _app(bytes, [0x5B, 0x5A, 0x59]);       // pop ebx, edx, ecx
+        } else if op == "ret" {
+            array_push(bytes, 0xC3);
+        } else if op == "loop" {
+            let sub = _cbody(ins[2]);
+            let base = len(bytes) + 8;             // i386 loop prefix: test(2)+jz(6)
+            _app(bytes, _emit_loop(_vreg(ins[1]), sub.bytes));
+            _merge_fixups(fixups, sub.fixups, base);
+        } else if op == "ifnz" {
+            let st = _cbody(ins[2]);
+            let se = _cbody(ins[3]);
+            let then_base = len(bytes) + 8;
+            let else_base = len(bytes) + 8 + len(st.bytes) + 5;
+            _app(bytes, _emit_ifnz(_vreg(ins[1]), st.bytes, se.bytes));
+            _merge_fixups(fixups, st.fixups, then_base);
+            _merge_fixups(fixups, se.fixups, else_base);
+        } else {
+            _app(bytes, _enc_leaf(ins));
+        }
+        i = i + 1;
+    }
+    return map{ bytes: bytes, fixups: fixups };
+}
+fn _set32(code, pos, val) { let b = X.le32(val); let i = 0; while i < 4 { code[pos + i] = b[i]; i = i + 1; } return code; }
+fn compile_unit(funcs, main) {
+    let mainr = _cbody(main);
+    let code = mainr.bytes;
+    _app(code, [0x89, 0xC3]);                       // mov ebx, eax (exit code)
+    _app(code, mov_imm32_r(0, 1));                  // mov eax, 1 (sys_exit)
+    _app(code, [0xCD, 0x80]);                       // int 0x80
+    let allfix = [];
+    _merge_fixups(allfix, mainr.fixups, 0);
+    let offsets = map{};
+    let f = 0;
+    while f < len(funcs) {
+        let fb = _cbody(funcs[f].body);
+        let base = len(code);
+        offsets[funcs[f].name] = base;
+        _app(code, fb.bytes);
+        array_push(code, 0xC3);
+        _merge_fixups(allfix, fb.fixups, base);
+        f = f + 1;
+    }
+    let k = 0;
+    while k < len(allfix) {
+        let fx = allfix[k];
+        if not map_has(offsets, fx.name) { throw "codegen_x86: call to undefined function '" + fx.name + "'"; }
+        _set32(code, fx.pos, _u32(offsets[fx.name] - (fx.pos + 4)));
+        k = k + 1;
+    }
+    return elf32_exec(code);
+}
+
+// compile_program(ir) — run the IR, then exit(r0) via int 0x80 (sys_exit=1, code in ebx).
+fn compile_program(ir) {
+    let code = compile_ir(ir);
+    _app(code, [0x89, 0xC3]);        // mov ebx, eax  (exit code)
+    _app(code, mov_imm32_r(0, 1));   // mov eax, 1    (sys_exit)
+    _app(code, [0xCD, 0x80]);        // int 0x80
+    return elf32_exec(code);
+}
+
+// build_value(ir) — run the IR, write eax's 4 little-endian bytes to stdout, exit. Lets
+// i386 native mode return arbitrary 32-bit results (read back as a number by the caller).
+fn _value_code(ir, buf) {
+    let c = compile_ir(ir);                          // result in eax
+    _app(c, [0xA3]); _app(c, X.le32(buf));          // mov [buf], eax
+    _app(c, [0xBB]); _app(c, X.le32(1));            // mov ebx, 1 (stdout)
+    _app(c, [0xB9]); _app(c, X.le32(buf));          // mov ecx, buf
+    _app(c, [0xBA]); _app(c, X.le32(4));            // mov edx, 4
+    _app(c, mov_imm32_r(0, 4));                      // mov eax, 4 (sys_write)
+    _app(c, [0xCD, 0x80]);
+    _app(c, [0xBB]); _app(c, X.le32(0));            // mov ebx, 0
+    _app(c, mov_imm32_r(0, 1));                      // mov eax, 1 (sys_exit)
+    _app(c, [0xCD, 0x80]);
+    return c;
+}
+fn build_value(ir) {
+    let buf = _LOAD + _HSIZE + len(_value_code(ir, 0));
+    let code = _value_code(ir, buf);
+    _app(code, [0, 0, 0, 0]);                        // 4-byte result buffer (in the RWX segment)
+    return elf32_exec(code);
+}
+
+export compile_ir, compile_program, compile_unit, build_value, elf32_exec;
+export mov_imm32_r, add_rr, sub_rr, imul_rr, addi_r, dec_r, test_rr, jnz_rel32, jz_rel32;

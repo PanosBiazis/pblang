@@ -1,0 +1,115 @@
+// stdlib/hal.sapp — a Hardware Abstraction Layer for pblang: ONE big map of device classes
+// plus a small set of COMMON verbs (open/read/write/ioctl/seek/poll/close) that apply to a
+// LOT of devices, resolved to the right mechanism per OS/arch.
+//
+// The insight the user asked for: most drivers speak the SAME few verbs. So instead of a
+// bespoke API per device, the HAL says, for each device class: where it lives (Linux devfs/
+// sysfs path, Windows path), how it's accessed (file read/write, ioctl, mmap, sysfs), and the
+// common ops it supports. Verbs map to Linux SYSCALL NUMBERS (per arch) and to the Windows
+// API call — so the same `read`/`write`/`ioctl` recipe drives many devices on many systems.
+//
+// Execution: file/sysfs classes go through stdlib/device.sapp (the current Linux drivers, via
+// syscalls); ioctl/mmap classes are driven by generated native code (codegen syscall op).
+//
+//   let h = import("stdlib/hal.sapp");
+//   h.recipe("gpio", "ioctl");   h.syscall("ioctl", "x86_64");   h.read_attr("rng");
+
+let DEV = import("stdlib:device.sapp");
+
+// ── common verbs → Linux syscall numbers (per arch) + Windows API ─────────────────────
+let _SYS = map{
+    read:  map{ x86_64: 0,  i386: 3,   arm64: 63 },
+    write: map{ x86_64: 1,  i386: 4,   arm64: 64 },
+    open:  map{ x86_64: 2,  i386: 5,   arm64: 56 },   // arm64 has no open(2); 56 = openat
+    close: map{ x86_64: 3,  i386: 6,   arm64: 57 },
+    ioctl: map{ x86_64: 16, i386: 54,  arm64: 29 },
+    seek:  map{ x86_64: 8,  i386: 19,  arm64: 62 },
+    poll:  map{ x86_64: 7,  i386: 168, arm64: 73 },
+    mmap:  map{ x86_64: 9,  i386: 192, arm64: 222 }
+};
+let _WINAPI = map{
+    read: "ReadFile", write: "WriteFile", open: "CreateFileA", close: "CloseHandle",
+    ioctl: "DeviceIoControl", seek: "SetFilePointerEx", poll: "WaitForSingleObject", mmap: "MapViewOfFile"
+};
+
+// ── ioctl request-code table (a sampling of widely-used codes) ─────────────────────────
+let _IOCTL = map{
+    TIOCGWINSZ: 0x5413, TIOCSWINSZ: 0x5414, FIONREAD: 0x541B, FIONBIO: 0x5421,
+    I2C_SLAVE: 0x0703, I2C_RDWR: 0x0707, I2C_FUNCS: 0x0705,
+    RTC_RD_TIME: 0x80247009, KDGETLED: 0x4B31, KDSETLED: 0x4B32,
+    FBIOGET_VSCREENINFO: 0x4600, FBIOPUT_VSCREENINFO: 0x4601,
+    BLKGETSIZE64: 0x80081272, RNDGETENTCNT: 0x80045200,
+    WDIOC_KEEPALIVE: 0x80045705, EVIOCGVERSION: 0x80044501
+};
+
+// ── the device catalog ────────────────────────────────────────────────────────────────
+// each: linux{path, access}, windows{path, api}, ops[], note
+let _DEVS = map{
+    null:        map{ linux: map{ path: "/dev/null",  access: "file" },   windows: map{ path: "NUL", api: "WriteFile" },        ops: ["write"],               note: "discard sink" },
+    zero:        map{ linux: map{ path: "/dev/zero",  access: "file" },   windows: map{ path: "NUL", api: "ReadFile" },         ops: ["read"],                note: "infinite zeros — use a SIZED read" },
+    rng:         map{ linux: map{ path: "/dev/urandom", access: "file" }, windows: map{ path: "", api: "BCryptGenRandom" },     ops: ["read"],                note: "kernel CSPRNG; /proc/sys/kernel/random/uuid is bounded" },
+    serial:      map{ linux: map{ path: "/dev/ttyS0", access: "ioctl" },  windows: map{ path: "\\\\.\\COM1", api: "ReadFile" }, ops: ["read","write","ioctl"], note: "termios via ioctl; COM ports on Windows" },
+    gpio:        map{ linux: map{ path: "/dev/gpiochip0", access: "ioctl" }, windows: map{ path: "", api: "DeviceIoControl" },  ops: ["ioctl"],               note: "GPIO v2 line ioctls" },
+    i2c:         map{ linux: map{ path: "/dev/i2c-0", access: "ioctl" },  windows: map{ path: "", api: "DeviceIoControl" },     ops: ["ioctl","read","write"], note: "I2C_SLAVE then read/write, or I2C_RDWR" },
+    spi:         map{ linux: map{ path: "/dev/spidev0.0", access: "ioctl" }, windows: map{ path: "", api: "DeviceIoControl" },  ops: ["ioctl"],               note: "SPI_IOC_MESSAGE transfers" },
+    framebuffer: map{ linux: map{ path: "/dev/fb0", access: "mmap" },     windows: map{ path: "", api: "MapViewOfFile" },       ops: ["mmap","ioctl","write"], note: "mmap the framebuffer; FBIOGET_VSCREENINFO" },
+    input:       map{ linux: map{ path: "/dev/input/event0", access: "file" }, windows: map{ path: "", api: "GetRawInputData" }, ops: ["read","ioctl"],       note: "input_event records" },
+    rtc:         map{ linux: map{ path: "/dev/rtc0", access: "ioctl" },   windows: map{ path: "", api: "GetSystemTime" },       ops: ["ioctl"],               note: "RTC_RD_TIME" },
+    watchdog:    map{ linux: map{ path: "/dev/watchdog", access: "file" },windows: map{ path: "", api: "DeviceIoControl" },     ops: ["write","ioctl"],       note: "write to pet; WDIOC_KEEPALIVE" },
+    storage:     map{ linux: map{ path: "/dev/sda", access: "file" },     windows: map{ path: "\\\\.\\PhysicalDrive0", api: "ReadFile" }, ops: ["read","write","ioctl","seek"], note: "block device; BLKGETSIZE64" },
+    led:         map{ linux: map{ path: "/sys/class/leds", access: "sysfs" }, windows: map{ path: "", api: "" },                ops: ["read","write"],        note: "brightness attribute" },
+    thermal:     map{ linux: map{ path: "/sys/class/thermal/thermal_zone0/temp", access: "sysfs" }, windows: map{ path: "", api: "" }, ops: ["read"],         note: "millidegrees C" },
+    backlight:   map{ linux: map{ path: "/sys/class/backlight", access: "sysfs" }, windows: map{ path: "", api: "" },           ops: ["read","write"],        note: "brightness attribute" },
+    audio:       map{ linux: map{ path: "/dev/snd/pcmC0D0p", access: "ioctl" }, windows: map{ path: "", api: "waveOutWrite" },  ops: ["ioctl","write"],       note: "ALSA pcm ioctls" }
+};
+
+// ── queries ───────────────────────────────────────────────────────────────────────────
+fn classes() { return map_keys(_DEVS); }
+fn verbs() { return map_keys(_SYS); }
+fn device(c) { if not map_has(_DEVS, c) { throw "hal: unknown device class '" + c + "'"; } return _DEVS[c]; }
+
+// syscall(verb, arch) — Linux syscall number for a common verb on the given arch.
+fn syscall(verb, arch) {
+    if not map_has(_SYS, verb) { throw "hal: unknown verb '" + verb + "'"; }
+    let m = _SYS[verb];
+    if not map_has(m, arch) { throw "hal: no syscall for verb '" + verb + "' on arch '" + arch + "'"; }
+    return m[arch];
+}
+fn windows_api(verb) { if not map_has(_WINAPI, verb) { throw "hal: unknown verb '" + verb + "'"; } return _WINAPI[verb]; }
+fn ioctl_code(name) { if not map_has(_IOCTL, name) { throw "hal: unknown ioctl '" + name + "'"; } return _IOCTL[name]; }
+fn ioctls() { return map_keys(_IOCTL); }
+
+// supports(class, verb) — does this device class advertise this verb?
+fn supports(c, verb) {
+    let d = device(c);
+    let i = 0;
+    while i < len(d.ops) { if d.ops[i] == verb { return true; } i = i + 1; }
+    return false;
+}
+
+// recipe(class, verb, arch?) — a portable how-to: the path, access mechanism, the Linux
+// syscall number, and the Windows API to perform `verb` on `class`.
+fn recipe(c, verb) {
+    let d = device(c);
+    return map{
+        class: c, verb: verb,
+        linux_path: d.linux.path,
+        access: d.linux.access,
+        linux_syscall: try syscall(verb, "x86_64") catch nil,
+        windows_path: d.windows.path,
+        windows_api: try windows_api(verb) catch nil,
+        note: d.note
+    };
+}
+
+// ── live access (file/sysfs classes, through the current Linux drivers) ────────────────
+// read_attr(class) — read a finite value from a file/sysfs device class. NEVER use on an
+// unbounded device (zero) — those need a sized read via generated native code.
+fn read_attr(c) {
+    let d = device(c);
+    if c == "rng" { return DEV.random_uuid(); }
+    if d.linux.access == "sysfs" or d.linux.access == "file" { return str_trim(DEV.read_text(d.linux.path)); }
+    throw "hal: read_attr only handles file/sysfs classes; '" + c + "' needs ioctl/mmap (use codegen syscall)";
+}
+
+export classes, verbs, device, syscall, windows_api, ioctl_code, ioctls, supports, recipe, read_attr;

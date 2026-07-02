@@ -1,0 +1,128 @@
+// stdlib/accelerator.sapp — pblang's AI-compute fabric: detect and route across CPU, GPU, and
+// the AI ACCELERATOR (NPU / Intel GNA / AMD XDNA / Apple ANE), with honest "present vs usable".
+//
+// THE TRUTH: hardware being PRESENT doesn't mean it's USABLE. A GPU needs the gpu build; an NPU
+// needs its vendor runtime (OpenVINO / Intel GNA lib / Vitis AI / QNN / ONNX Runtime). pblang
+// can DETECT all of them (including the Intel GNA the kernel /dev/accel probe misses, via PCI),
+// ROUTE to the best USABLE one, and FALL BACK to the CPU. To actually EXECUTE on a GPU/NPU you
+// register a native runtime via register_runtime(kind, fn) — an FFI hook to the vendor stack;
+// until then the device is reported present-but-unusable and work runs on the (real) CPU.
+//
+//   let a = import("stdlib/accelerator.sapp");
+//   a.detect();           // [{kind, name, present, usable, runtime, note}]
+//   a.best();             // "npu" | "gpu" | "cpu" (best USABLE; cpu always)
+//   a.register_runtime("npu", myNpuRuntime);  // plug a vendor/FFI runtime
+//   a.run("npu", payload);                     // dispatch (nil if no runtime -> caller falls back)
+
+let OS = import("stdlib:os.sapp");
+let W = import("stdlib:watch.sapp");
+
+let _ACCEL = map{ runtimes: map{} };
+
+// ── native-runtime hooks (FFI / vendor stacks) ────────────────────────────────────────
+fn register_runtime(kind, f) { _ACCEL.runtimes[kind] = f; return nil; }
+fn has_runtime(kind) { return map_has(_ACCEL.runtimes, kind); }
+fn clear_runtimes() { _ACCEL.runtimes = map{}; return nil; }
+// run(kind, payload) — dispatch to the registered runtime, or nil if none (caller falls back).
+fn run(kind, payload) {
+    if not map_has(_ACCEL.runtimes, kind) { return nil; }
+    let f = _ACCEL.runtimes[kind];
+    return f(payload);
+}
+
+// ── detection ─────────────────────────────────────────────────────────────────────────
+fn _gpu_enabled() { let b = try W.compute() catch nil; if b == nil { return false; } let e = try b.gpu_enabled catch false; if e == true { return true; } return false; }
+fn _gpu_present() { let g = try W.gpus() catch nil; if g == nil { return false; } let c = try g.count catch 0; return c > 0; }
+fn _gpu_name() { let g = try W.gpus() catch nil; if g == nil { return "GPU"; } let a = try g.adapters catch []; if len(a) > 0 { return try a[0].name catch "GPU"; } return "GPU"; }
+
+// _npu_probe() — {present, name}. Checks kernel NPU nodes, the GNA node, then PCI (catches the
+// Intel GNA that has no driver loaded — present in hardware, just not usable).
+fn _npu_probe() {
+    if (try fs_exists("/dev/accel0") catch false) == true { return map{ present: true, name: "NPU (/dev/accel0)" }; }
+    if (try fs_exists("/dev/accel/accel0") catch false) == true { return map{ present: true, name: "NPU (/dev/accel)" }; }
+    if (try fs_exists("/dev/gna0") catch false) == true or (try fs_exists("/dev/gna") catch false) == true { return map{ present: true, name: "Intel GNA (/dev/gna)" }; }
+    let r = try proc_spawn_wait("bash", ["-c", "lspci 2>/dev/null"]) catch nil;
+    let out = "";
+    if r != nil { out = try r.stdout catch ""; }
+    let low = str_lower(out);
+    if str_index_of(low, "gna") >= 0 { return map{ present: true, name: "Intel GNA Scoring Accelerator (no driver)" }; }
+    if str_index_of(low, "npu") >= 0 or str_index_of(low, "neural") >= 0 { return map{ present: true, name: "NPU (PCI, no driver)" }; }
+    return map{ present: false, name: "none" };
+}
+
+// ── on-CPU AI accelerator: Intel DL Boost (AVX-512 VNNI) / AVX-VNNI ─────────────────────
+// This is the DRIVER-FREE AI accelerator that supersedes the (deprecated, driverless) GNA:
+// INT8/BF16 fused dot-product instructions built into the CPU. It is always USABLE, but only
+// EXPLOITED when the binary is built for this CPU (RUSTFLAGS="-C target-cpu=native", or a
+// +avx512vnni feature). We read the CPU flags (injectable for tests) and report honestly.
+fn _cpu_flags() {
+    let r = try proc_spawn_wait("bash", ["-c", "grep -m1 '^flags' /proc/cpuinfo 2>/dev/null"]) catch nil;
+    if r == nil { return ""; }
+    return str_lower(try r.stdout catch "");
+}
+fn _has_flag(padded, f) { return str_index_of(padded, " " + f + " ") >= 0; }
+// cpu_accel(flags) — {avx2, avx512, vnni, bf16, dl_boost, name, usable, note}. Pass a flags
+// string to test; omit to read this machine's /proc/cpuinfo.
+fn cpu_accel(flags = nil) {
+    if flags == nil { flags = _cpu_flags(); }
+    let padded = " " + str_trim(flags) + " ";
+    let avx2 = _has_flag(padded, "avx2");
+    let avx512 = _has_flag(padded, "avx512f");
+    let vnni = _has_flag(padded, "avx512_vnni") or _has_flag(padded, "avx_vnni");
+    let bf16 = _has_flag(padded, "avx512_bf16") or _has_flag(padded, "amx_bf16");
+    let amx = _has_flag(padded, "amx_int8") or _has_flag(padded, "amx_tile");
+    let name = "CPU SIMD";
+    if amx { name = "Intel AMX"; }
+    else { if vnni { name = "Intel DL Boost (VNNI)"; } else { if avx512 { name = "AVX-512"; } else { if avx2 { name = "AVX2"; } } } }
+    return map{ avx2: avx2, avx512: avx512, vnni: vnni, bf16: bf16, amx: amx,
+        dl_boost: vnni or amx, name: name, usable: true,
+        note: "on-CPU AI accelerator (INT8/BF16 dot-products); EXPLOITED only on a target-cpu=native (or +avx512vnni) build" };
+}
+
+// usable(kind) — can we actually run AI work on this device RIGHT NOW?
+//   cpu: always. gpu: the gpu build must be enabled (or a runtime hook). npu: needs a runtime.
+fn usable(kind) {
+    if kind == "cpu" { return true; }
+    if has_runtime(kind) { return true; }
+    if kind == "gpu" { return _gpu_enabled(); }
+    return false;
+}
+
+fn detect() {
+    let cores = try OS.cpu_count() catch 1;
+    let np = _npu_probe();
+    let ca = cpu_accel();
+    return [
+        map{ kind: "cpu", name: "CPU", units: cores, present: true, usable: true,
+             ai_features: ca,
+             runtime: "native pblang (spawn, all cores) + " + ca.name,
+             note: "real multi-core; classify_batch_parallel uses it; on-CPU AI accel: " + ca.name + " (" + ca.note + ")" },
+        map{ kind: "gpu", name: _gpu_name(), units: 1, present: _gpu_present(), usable: usable("gpu"),
+             runtime: "wgpu f32 matmul (--features gpu + PBLANG_GPU=1) or FFI hook", note: "present!=usable; needs the gpu build or a runtime" },
+        map{ kind: "npu", name: np.name, units: 1, present: np.present, usable: usable("npu"),
+             runtime: "vendor stack via FFI hook (OpenVINO / Intel GNA / Vitis AI / QNN / ONNX Runtime)",
+             note: "AI accelerator; detected via /dev/accel,/dev/gna,PCI. Execution needs the vendor runtime." }
+    ];
+}
+
+// best() — the best USABLE device for AI work: npu > gpu > cpu (cpu always available).
+fn best() {
+    if usable("npu") { return "npu"; }
+    if usable("gpu") { return "gpu"; }
+    return "cpu";
+}
+
+fn summary() {
+    let d = detect();
+    let s = "accelerators:";
+    let i = 0;
+    while i < len(d) {
+        let u = "present"; if d[i].usable { u = "USABLE"; } else { if not d[i].present { u = "absent"; } }
+        s = s + " " + d[i].kind + "(" + u + ")";
+        i = i + 1;
+    }
+    s = s + " -> best=" + best();
+    return s;
+}
+
+export register_runtime, has_runtime, clear_runtimes, run, usable, detect, best, summary, cpu_accel;
