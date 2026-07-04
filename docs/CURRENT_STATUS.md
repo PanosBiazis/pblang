@@ -353,7 +353,8 @@ The VM core is stable and battle-tested:
 | `template.sapp` | ✅ Stable | Isolated loops, chained filters, condition helpers, strict missing-var checks |
 | `validate.sapp` | ✅ Stable | Nested schemas, defaults, strict fields, batch validation |
 | `config.sapp` | ✅ Stable | Layered config, typed schema maps, validation bridge |
-| `websocket.sapp` | ✅ Working | Frame parsing and writing |
+| `datetime.sapp` | ✅ Stable | Unix-ts arithmetic, calendar add_months/add_years (day-clamped), period boundaries, quarter/day_of_year/ISO week, date_range, business-day helpers |
+| `websocket.sapp` | ✅ Stable | Full RFC 6455: client+server handshake, masked/unmasked framing, streaming decode |
 | `graphics.sapp` | 🟡 MVP | Basic graphics primitives |
 | `ffi.sapp` | ✅ Stable | C ABI bindings |
 | `fs.sapp` | ✅ Stable | File I/O |
