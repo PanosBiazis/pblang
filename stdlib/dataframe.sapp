@@ -352,52 +352,259 @@ fn add_column(df, name, fn_or_values) {
 
 // group_by(df, column, agg) — group rows by column, apply aggregation.
 // agg: "count", "sum", "avg", "min", "max" (applied to numeric columns)
+// ── shared aggregation kernels ───────────────────────────────────────────────
+
+// _sorted_copy(vals) — an ascending insertion-sorted copy (numbers).
+fn _sorted_copy(vals) {
+    let sorted = [];
+    for i len(vals) { sorted[i] = vals[i]; }
+    let i = 1;
+    while i < len(sorted) {
+        let key = sorted[i];
+        let j = i - 1;
+        while j >= 0 and sorted[j] > key { sorted[j + 1] = sorted[j]; j = j - 1; }
+        sorted[j + 1] = key;
+        i = i + 1;
+    }
+    return sorted;
+}
+
+fn _median_of(vals) {
+    if len(vals) == 0 { return nil; }
+    let sorted = _sorted_copy(vals);
+    let n = len(sorted);
+    let mid = num_floor(n / 2);
+    if n % 2 == 1 { return sorted[mid]; }
+    return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// _std_of(vals) — sample standard deviation (n-1 denominator); nil for < 2 values.
+fn _std_of(vals) {
+    let n = len(vals);
+    if n < 2 { return nil; }
+    let s = 0; for v len(vals) { s = s + vals[v]; }
+    let mean = s / n;
+    let ss = 0; for v len(vals) { let d = vals[v] - mean; ss = ss + d * d; }
+    return num_sqrt(ss / (n - 1));
+}
+
+fn _numeric_of(rows, col) {
+    let vals = [];
+    for r len(rows) {
+        let v = try rows[r][col] catch nil;
+        if type(v) == "number" { vals[len(vals)] = v; }
+    }
+    return vals;
+}
+
+// _agg_column(rows, col, op) — aggregate one column over `rows`. Numeric ops
+// (sum/avg|mean/min/max/median/std) use only numeric cells; count/first/last/
+// count_distinct also work on non-numeric columns.
+fn _agg_column(rows, col, op) {
+    if op == "count" { return len(rows); }
+    if op == "count_valid" {
+        let n = 0; for r len(rows) { if (try rows[r][col] catch nil) != nil { n = n + 1; } } return n;
+    }
+    if op == "count_distinct" {
+        let seen = map{}; let n = 0;
+        for r len(rows) {
+            let key = str(try rows[r][col] catch nil);
+            if map_has(seen, key) == false { seen[key] = true; n = n + 1; }
+        }
+        return n;
+    }
+    if op == "first" {
+        for r len(rows) { let v = try rows[r][col] catch nil; if v != nil { return v; } }
+        return nil;
+    }
+    if op == "last" {
+        let i = len(rows) - 1;
+        while i >= 0 { let v = try rows[i][col] catch nil; if v != nil { return v; } i = i - 1; }
+        return nil;
+    }
+    let vals = _numeric_of(rows, col);
+    if len(vals) == 0 { return nil; }
+    if op == "median" { return _median_of(vals); }
+    if op == "std" { return _std_of(vals); }
+    if op == "min" { let m = vals[0]; for v len(vals) { if vals[v] < m { m = vals[v]; } } return m; }
+    if op == "max" { let m = vals[0]; for v len(vals) { if vals[v] > m { m = vals[v]; } } return m; }
+    let s = 0; for v len(vals) { s = s + vals[v]; }
+    if op == "sum" { return s; }
+    if op == "avg" or op == "mean" { return s / len(vals); }
+    return nil;
+}
+
+fn _group_key_cols(group_col) {
+    if type(group_col) == "array" { return group_col; }
+    return [group_col];
+}
+
+// group_by(df, group_col, agg) — group rows and aggregate.
+//   group_col : a column name, OR an array of names for multi-key grouping.
+//   agg       : "count"; a single op string ("sum"/"avg"/"min"/"max"/...)
+//               applied to every numeric non-key column; OR a per-column spec
+//               map { column: op } (pandas-style). The per-column map form
+//               used to be silently ignored (only the key survived) — fixed.
+// Group-key values keep their original type (2020 stays a number).
 fn group_by(df, group_col, agg) {
+    let key_cols = _group_key_cols(group_col);
+    let SEP = str_from_char_code(31);   // unit separator — unlikely in cell data
     let groups = map{};
+    let order = [];
     for i len(df.rows) {
-        let key = str(try df.rows[i][group_col] catch "nil");
-        if map_has(groups, key) == false { groups[key] = []; }
-        let arr = groups[key];
-        arr[len(arr)] = df.rows[i];
-        groups[key] = arr;
+        let row = df.rows[i];
+        let parts = [];
+        for kc len(key_cols) { parts[len(parts)] = str(try row[key_cols[kc]] catch "nil"); }
+        let key = str_join(parts, SEP);
+        if map_has(groups, key) == false {
+            let kv = map{};
+            for kc len(key_cols) { kv[key_cols[kc]] = try row[key_cols[kc]] catch nil; }
+            groups[key] = map{ rows: [], keyvals: kv };
+            order[len(order)] = key;
+        }
+        let g = groups[key];
+        g.rows[len(g.rows)] = row;
+        groups[key] = g;
     }
     let result = [];
-    let group_keys = map_keys(groups);
-    for i len(group_keys) {
-        let k = group_keys[i];
-        let group_rows = groups[k];
-        let row = map{};
-        row[group_col] = k;
-        if agg == "count" {
-            row.count = len(group_rows);
+    for i len(order) {
+        let g = groups[order[i]];
+        let out = map{};
+        for kc len(key_cols) { out[key_cols[kc]] = g.keyvals[key_cols[kc]]; }
+        if type(agg) == "map" {
+            let cols = map_keys(agg);
+            for c len(cols) { out[cols[c]] = _agg_column(g.rows, cols[c], agg[cols[c]]); }
+        } else if agg == "count" {
+            out.count = len(g.rows);
         } else {
-            // Apply agg to all numeric columns
-            let cols = df.columns;
-            for c len(cols) {
-                if cols[c] == group_col { } // skip group col
-                else {
-                    let vals = [];
-                    for r len(group_rows) {
-                        let v = try group_rows[r][cols[c]] catch nil;
-                        if type(v) == "number" { vals[len(vals)] = v; }
-                    }
-                    if len(vals) > 0 {
-                        if agg == "sum" {
-                            let s = 0; for v len(vals) { s = s + vals[v]; } row[cols[c]] = s;
-                        } else if agg == "avg" {
-                            let s = 0; for v len(vals) { s = s + vals[v]; } row[cols[c]] = s / len(vals);
-                        } else if agg == "min" {
-                            let m = vals[0]; for v len(vals) { if vals[v] < m { m = vals[v]; } } row[cols[c]] = m;
-                        } else if agg == "max" {
-                            let m = vals[0]; for v len(vals) { if vals[v] > m { m = vals[v]; } } row[cols[c]] = m;
-                        }
-                    }
+            for c len(df.columns) {
+                let cn = df.columns[c];
+                if _contains(key_cols, cn) == false {
+                    let val = _agg_column(g.rows, cn, agg);
+                    if val != nil { out[cn] = val; }
                 }
+            }
+        }
+        result[len(result)] = out;
+    }
+    return from_rows(result);
+}
+
+// ── Reshape & window operations ──────────────────────────────────────────────
+
+// _distinct_in_order(df, col) — distinct values of a column, first-seen order.
+fn _distinct_in_order(df, col) {
+    let seen = map{};
+    let out = [];
+    for i len(df.rows) {
+        let v = try df.rows[i][col] catch nil;
+        let key = str(v);
+        if map_has(seen, key) == false { seen[key] = true; out[len(out)] = v; }
+    }
+    return out;
+}
+
+// pivot(df, index_col, columns_col, values_col, op) — a pivot table: one row per
+// distinct index value, one column per distinct `columns_col` value, each cell
+// aggregating `values_col` with `op` (default "sum"). Missing combinations are
+// simply absent from their row.
+fn pivot(df, index_col, columns_col, values_col, op = "sum") {
+    let index_vals = _distinct_in_order(df, index_col);
+    let col_vals = _distinct_in_order(df, columns_col);
+    let result = [];
+    for ii len(index_vals) {
+        let iv = index_vals[ii];
+        let row = map{};
+        row[index_col] = iv;
+        for cc len(col_vals) {
+            let cv = col_vals[cc];
+            // rows matching this (index, column) cell
+            let cell_rows = [];
+            for r len(df.rows) {
+                let dr = df.rows[r];
+                if str(try dr[index_col] catch nil) == str(iv)
+                   and str(try dr[columns_col] catch nil) == str(cv) {
+                    cell_rows[len(cell_rows)] = dr;
+                }
+            }
+            if len(cell_rows) > 0 {
+                let agg_val = _agg_column(cell_rows, values_col, op);
+                if agg_val != nil { row[str(cv)] = agg_val; }
             }
         }
         result[len(result)] = row;
     }
     return from_rows(result);
+}
+
+// melt(df, id_cols, value_cols) — wide → long: for each row emit one row per
+// value column as { <id_cols...>, variable: <col name>, value: <cell> }.
+fn melt(df, id_cols, value_cols) {
+    let result = [];
+    for r len(df.rows) {
+        let row = df.rows[r];
+        for vc len(value_cols) {
+            let out = map{};
+            for ic len(id_cols) { out[id_cols[ic]] = try row[id_cols[ic]] catch nil; }
+            out.variable = value_cols[vc];
+            out.value = try row[value_cols[vc]] catch nil;
+            result[len(result)] = out;
+        }
+    }
+    return from_rows(result);
+}
+
+// cumsum(df, col) — running total of a numeric column (non-numeric cells add 0).
+fn cumsum(df, col) {
+    let out = [];
+    let acc = 0;
+    for i len(df.rows) {
+        let v = try df.rows[i][col] catch nil;
+        if type(v) == "number" { acc = acc + v; }
+        out[len(out)] = acc;
+    }
+    return out;
+}
+
+// pct_change(df, col) — period-over-period fractional change of a numeric column.
+// out[0] is nil (no prior); a nil/non-numeric/zero previous value yields nil.
+fn pct_change(df, col) {
+    let out = [];
+    let prev = nil;
+    for i len(df.rows) {
+        let v = try df.rows[i][col] catch nil;
+        if i == 0 or prev == nil or type(prev) != "number" or prev == 0 or type(v) != "number" {
+            out[len(out)] = nil;
+        } else {
+            out[len(out)] = (v - prev) / prev;
+        }
+        prev = v;
+    }
+    return out;
+}
+
+// rolling_mean(df, col, window) — trailing-window mean; the first window-1
+// positions are nil (window not yet filled). Non-numeric cells count as gaps
+// that yield nil for any window containing them.
+fn rolling_mean(df, col, window) {
+    let out = [];
+    for i len(df.rows) {
+        if i + 1 < window {
+            out[len(out)] = nil;
+        } else {
+            let s = 0;
+            let ok = true;
+            let j = i - window + 1;
+            while j <= i {
+                let v = try df.rows[j][col] catch nil;
+                if type(v) != "number" { ok = false; }
+                else { s = s + v; }
+                j = j + 1;
+            }
+            if ok { out[len(out)] = s / window; } else { out[len(out)] = nil; }
+        }
+    }
+    return out;
 }
 
 // describe(df) — descriptive statistics for all numeric columns.
@@ -601,15 +808,14 @@ fn _agg_vals(vals, op) {
 }
 
 // agg(df, spec) — aggregate the whole frame. `spec` maps column → op
-// ("sum"/"avg"/"min"/"max"/"count"). Returns a single map column → value.
+// (sum/avg|mean/min/max/median/std/count/count_valid/count_distinct/first/last).
+// Returns a single map column → value.
 fn agg(df, spec) {
     let out = map{};
     let cols = map_keys(spec);
     for c len(cols) {
         let name = cols[c];
-        let op = spec[name];
-        if op == "count" { out[name] = len(df.rows); }
-        else { out[name] = _agg_vals(_numeric_col(df, name), op); }
+        out[name] = _agg_column(df.rows, name, spec[name]);
     }
     return out;
 }
@@ -640,27 +846,21 @@ fn max_col(df, name)  { return _agg_vals(_numeric_col(df, name), "max"); }
 // median_col(df, name) — median of the numeric cells (average of the two middle
 // values for an even count).
 fn median_col(df, name) {
-    let vals = _numeric_col(df, name);
-    if len(vals) == 0 { return nil; }
-    let sorted = [];
-    for i len(vals) { sorted[i] = vals[i]; }
-    let i = 1;
-    while i < len(sorted) {
-        let key = sorted[i];
-        let j = i - 1;
-        while j >= 0 and sorted[j] > key { sorted[j + 1] = sorted[j]; j = j - 1; }
-        sorted[j + 1] = key;
-        i = i + 1;
-    }
-    let n = len(sorted);
-    let mid = num_floor(n / 2);
-    if n % 2 == 1 { return sorted[mid]; }
-    return (sorted[mid - 1] + sorted[mid]) / 2;
+    return _median_of(_numeric_col(df, name));
+}
+
+// std_col / var_col — sample standard deviation / variance of a numeric column.
+fn std_col(df, name) { return _std_of(_numeric_col(df, name)); }
+fn var_col(df, name) {
+    let s = _std_of(_numeric_col(df, name));
+    if s == nil { return nil; }
+    return s * s;
 }
 
 export from_rows, from_csv_string, from_csv, to_csv, nrows, ncols,
        head, tail, slice, select_columns, drop_columns, rename_column, fill_missing,
        filter, map_rows, sort_by, sort_values, column, add_column, apply, group_by, agg,
+       pivot, melt, cumsum, pct_change, rolling_mean,
        describe, join, left_join, concat, dropna,
-       sum_col, mean_col, min_col, max_col, median_col,
+       sum_col, mean_col, min_col, max_col, median_col, std_col, var_col,
        unique, value_counts, schema, validate;
