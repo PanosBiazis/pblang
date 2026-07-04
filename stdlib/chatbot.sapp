@@ -1,0 +1,135 @@
+// stdlib/chatbot.sapp — a retrieval chatbot with the pbai defensive stack built in.
+//
+// Harvested from the user's chatbot project (SQLite exact Q->A lookup with a
+// fallback string) and upgraded:
+//   - matching is deobfuscated + case-folded (leetspeak "h3llo" still hits "Hello")
+//   - retrieval is token-overlap (jaccard), not exact-match-or-nothing
+//   - harmful prompts are REFUSED before retrieval or escalation (prompt_safety)
+//   - low-confidence turns can escalate to an INJECTABLE model fn (ollama/pbai),
+//     the same seam as ollama.sapp transports — unit-testable with a lambda
+//
+//   let CB = import("stdlib:chatbot.sapp");
+//   let bot = CB.new();
+//   CB.teach(bot, "Hello", "Hi!");
+//   CB.respond(bot, "h3llo").text;                       // "Hi!"
+//   CB.respond_with(bot, q, OLL.voter_caller("llama3", http_post));  // real LLM behind it
+//
+// Honest boundary: token overlap is a coarse retriever — great for FAQ bots,
+// not semantic search. For embeddings-grade retrieval, pair with pbai/ollama.
+
+let DEOB = import("stdlib:deobfuscate.sapp");
+let PSAFE = import("stdlib:prompt_safety.sapp");
+
+let THRESHOLD = 0.4;
+let FALLBACK = "I'm not sure how to respond to that.";
+let REFUSAL = "I can't help with that.";
+
+// new() -> bot state. teach() mutates in place (maps are references).
+fn new() { return map{ pairs: [], turns: [] }; }
+
+// teach(bot, question, answer) — add one Q->A pair (pre-canonicalized for speed).
+fn teach(bot, question, answer) {
+    push(bot.pairs, map{ q: question, a: answer, canon: DEOB.canonicalize(question) });
+    return bot;
+}
+
+fn size(bot) { return len(bot.pairs); }
+
+fn _tokens(canon) {
+    // strip punctuation to spaces, then split; drops empty tokens
+    let cleaned = "";
+    let i = 0;
+    while i < len(canon) {
+        let c = str_slice(canon, i, i + 1);
+        if c == "?" or c == "!" or c == "." or c == "," or c == "'" or c == "\"" { cleaned = cleaned + " "; }
+        else { cleaned = cleaned + c; }
+        i = i + 1;
+    }
+    let parts = str_split(cleaned, " ");
+    let out = [];
+    i = 0;
+    while i < len(parts) { if parts[i] != "" { push(out, parts[i]); } i = i + 1; }
+    return out;
+}
+
+fn _jaccard(a, b) {
+    if len(a) == 0 or len(b) == 0 { return 0.0; }
+    let inter = 0;
+    let i = 0;
+    while i < len(a) {
+        let j = 0;
+        let hit = false;
+        while j < len(b) { if a[i] == b[j] { hit = true; } j = j + 1; }
+        if hit { inter = inter + 1; }
+        i = i + 1;
+    }
+    let uni = len(a) + len(b) - inter;
+    if uni == 0 { return 0.0; }
+    return inter / uni;
+}
+
+// best_match(bot, input) -> { pair|nil, confidence } (pure scoring, no history).
+fn best_match(bot, input) {
+    let canon = DEOB.canonicalize(input);
+    let toks = _tokens(canon);
+    let best = nil;
+    let score = 0.0;
+    let i = 0;
+    while i < len(bot.pairs) {
+        let p = bot.pairs[i];
+        let s = _jaccard(toks, _tokens(p.canon));
+        if p.canon == canon { s = 1.0; }
+        if s > score { score = s; best = p; }
+        i = i + 1;
+    }
+    return map{ pair: best, confidence: score };
+}
+
+fn _record(bot, input, text, matched, refused, escalated) {
+    push(bot.turns, map{ input: input, text: text, matched: matched,
+                         refused: refused, escalated: escalated });
+    return nil;
+}
+
+// respond(bot, input) -> { text, confidence, matched, refused, escalated }.
+// Harm triage runs FIRST: a flagged input is refused before any retrieval.
+fn respond(bot, input) {
+    if not PSAFE.is_safe(input) {
+        _record(bot, input, REFUSAL, nil, true, false);
+        return map{ text: REFUSAL, confidence: 0.0, matched: nil, refused: true, escalated: false };
+    }
+    let m = best_match(bot, input);
+    if m.pair != nil and m.confidence >= THRESHOLD {
+        _record(bot, input, m.pair.a, m.pair.q, false, false);
+        return map{ text: m.pair.a, confidence: m.confidence, matched: m.pair.q,
+                    refused: false, escalated: false };
+    }
+    _record(bot, input, FALLBACK, nil, false, false);
+    return map{ text: FALLBACK, confidence: m.confidence, matched: nil,
+                refused: false, escalated: false };
+}
+
+// respond_with(bot, input, model_fn) — like respond(), but low-confidence turns
+// escalate to model_fn(input). Refusals NEVER reach the model.
+fn respond_with(bot, input, model_fn) {
+    if not PSAFE.is_safe(input) {
+        _record(bot, input, REFUSAL, nil, true, false);
+        return map{ text: REFUSAL, confidence: 0.0, matched: nil, refused: true, escalated: false };
+    }
+    let m = best_match(bot, input);
+    if m.pair != nil and m.confidence >= THRESHOLD {
+        _record(bot, input, m.pair.a, m.pair.q, false, false);
+        return map{ text: m.pair.a, confidence: m.confidence, matched: m.pair.q,
+                    refused: false, escalated: false };
+    }
+    let text = try model_fn(input) catch FALLBACK;
+    if text == nil { text = FALLBACK; }
+    _record(bot, input, text, nil, false, true);
+    return map{ text: text, confidence: m.confidence, matched: nil,
+                refused: false, escalated: true };
+}
+
+fn history(bot) { return bot.turns; }
+fn turn_count(bot) { return len(bot.turns); }
+
+export new, teach, size, best_match, respond, respond_with, history, turn_count;
