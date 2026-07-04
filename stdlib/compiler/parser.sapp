@@ -316,9 +316,20 @@ fn parse_const() {
     return stmt_const(name, value, ty);
 }
 
+// Keywords the Rust frontend accepts as plain NAMES in name-only positions
+// (fn declarations, export lists): `fn match` (regex.sapp), `fn defer`
+// (async_io.sapp — this parser has no defer statement), `fn nil` (blocks.sapp
+// AST builders). Expression-position `nil` stays the literal.
+fn _is_ctx_name_kw(t) {
+    return t.kind == "keyword"
+        and (t.text == "match" or t.text == "defer" or t.text == "nil");
+}
+
 fn parse_fn_decl() {
     advance(); // skip 'fn'
-    let name_token = expect("ident", nil);
+    let name_token = nil;
+    if _is_ctx_name_kw(current()) { name_token = advance(); }
+    else { name_token = expect("ident", nil); }
     if name_token == nil { return nil; }
     let name = name_token.text;
 
@@ -743,8 +754,40 @@ fn parse_for() {
     }
 }
 
+// Binding name for the `import "path";` statement form (mirrors the Rust
+// frontend): take the path after the last ':' (specifier prefix) and the last
+// '/' or '\', strip the extension; empty -> "module".
+fn _import_binding_name(path) {
+    let s = path;
+    let i = len(s) - 1;
+    let cut = 0 - 1;
+    while i >= 0 { if slice(s, i, i + 1) == ":" { cut = i; break; } i = i - 1; }
+    if cut >= 0 { s = slice(s, cut + 1, len(s)); }
+    i = len(s) - 1; cut = 0 - 1;
+    while i >= 0 {
+        let c = slice(s, i, i + 1);
+        if c == "/" or c == "\\" { cut = i; break; }
+        i = i - 1;
+    }
+    if cut >= 0 { s = slice(s, cut + 1, len(s)); }
+    i = len(s) - 1; cut = 0 - 1;
+    while i >= 0 { if slice(s, i, i + 1) == "." { cut = i; break; } i = i - 1; }
+    if cut >= 0 { s = slice(s, 0, cut); }
+    if len(s) == 0 { return "module"; }
+    return s;
+}
+
 fn parse_import() {
     advance(); // skip 'import'
+    // Statement form: `import "path";` — desugars to `let <basename> = import(path)`
+    // exactly like the Rust frontend (which emits a call + define-global).
+    if current().kind == "string" {
+        let path_token = advance();
+        if match_token("punct", ";") { /* consume */ }
+        return stmt_let(_import_binding_name(path_token.text),
+                        expr_call(expr_ident("import"), [expr_string(path_token.text)]),
+                        nil);
+    }
     expect("punct", "(");
     let path_token = expect("string", nil);
     if path_token == nil { return nil; }
@@ -757,7 +800,9 @@ fn parse_export() {
     advance(); // skip 'export'
     let names = [];
     while true {
-        let n = expect("ident", nil);
+        let n = nil;
+        if _is_ctx_name_kw(current()) { n = advance(); }
+        else { n = expect("ident", nil); }
         if n == nil { break; }
         push(names, n.text);
         if not match_token("punct", ",") { break; }
@@ -799,6 +844,51 @@ fn parse_block() {
     return stmt_block(stmts);
 }
 
+// Expression block `{ stmt; stmt; tail? }` in expression position (the body of
+// `try { ... } catch`, or bare). Mirrors the Rust frontend's BlockExpr: inner
+// statements end with ';', an optional trailing expression is the block's
+// value (none -> nil). Desugars to an immediately-invoked zero-arg fn literal
+// — `(fn(){ stmts; return tail; })()` — so codegen and the VM need no new node;
+// closures already capture the enclosing scope. (Deviation from Rust: a
+// `return`/`break` INSIDE the block exits the block, not the enclosing
+// function/loop — stdlib block-exprs are straight-line value blocks.)
+fn parse_block_expr() {
+    expect("punct", "{");
+    let stmts = [];
+    let tail = nil;
+    while not is_at_end() and current().text != "}" {
+        let t = current();
+        let is_stmt_kw = t.kind == "keyword" and (t.text == "let" or t.text == "const"
+            or t.text == "fn" or t.text == "return" or t.text == "if" or t.text == "while"
+            or t.text == "for" or t.text == "break" or t.text == "continue"
+            or t.text == "import" or t.text == "export" or t.text == "struct"
+            or t.text == "enum" or t.text == "class" or t.text == "interface");
+        let is_assign = t.kind == "ident"
+            and peek(1).kind == "operator" and peek(1).text == "=";
+        if is_stmt_kw or is_assign {
+            let before = pos;
+            let s = parse_stmt();
+            if s != nil { push(stmts, s); }
+            if pos == before and not is_at_end() {
+                push(errors, "Parser stalled in block expression at token '"
+                    + current().text + "'; skipping");
+                advance();
+            }
+        } else {
+            let e = parse_expr();
+            if match_token("punct", ";") {
+                push(stmts, stmt_expr(e));
+            } else {
+                tail = e;
+                break;
+            }
+        }
+    }
+    expect("punct", "}");
+    if tail != nil { push(stmts, stmt_return(tail)); }
+    return expr_call(expr_fnlit([], stmt_block(stmts)), []);
+}
+
 // ── Expression parser (Pratt parser / precedence climbing) ────────────────────
 
 fn parse_expr() {
@@ -828,8 +918,27 @@ fn parse_coalesce() {
     return left;
 }
 
+// Ternary `cond ? a : b` — desugars to an if-expression with single-statement
+// block arms (exactly the Rust frontend's lowering to IfExpr + BlockExpr).
+// Non-nesting like the Rust grammar: chain with parentheses.
+fn parse_ternary() {
+    let cond = parse_coalesce();
+    if current().kind == "operator" and current().text == "?" {
+        advance();
+        let then_e = parse_coalesce();
+        expect("punct", ":");
+        let else_e = parse_coalesce();
+        return make_node("if_expr", map{
+            cond: cond,
+            then: stmt_block([stmt_expr(then_e)]),
+            else: stmt_block([stmt_expr(else_e)]),
+        });
+    }
+    return cond;
+}
+
 fn parse_assignment_expr() {
-    let left = parse_coalesce();
+    let left = parse_ternary();
     // Assignment: <lvalue> = <expr>. The lvalue is a parsed postfix expression —
     // a bare ident, or an index/member chain (`a[i] = v`, `m.k = v`,
     // `cg.chunk.instructions[j].operand = x`).
@@ -1026,9 +1135,30 @@ fn parse_call() {
             }
             expr = expr_call(expr, args);
         } else if match_token("punct", "[") {
-            let idx = parse_expr();
-            expect("punct", "]");
-            expr = expr_index(expr, idx);
+            // Range-slice sugar (mirrors the Rust frontend): `a[lo..hi]`,
+            // `a[lo..]`, `a[..hi]`, `a[..]` all desugar to slice(a, lo, hi)
+            // with an omitted bound becoming nil (slice reads nil as 0 / len).
+            if match_token("operator", "..") {
+                let hi = expr_nil();
+                if not (current().kind == "punct" and current().text == "]") {
+                    hi = parse_expr();
+                }
+                expect("punct", "]");
+                expr = expr_call(expr_ident("slice"), [expr, expr_nil(), hi]);
+            } else {
+                let idx = parse_expr();
+                if match_token("operator", "..") {
+                    let hi = expr_nil();
+                    if not (current().kind == "punct" and current().text == "]") {
+                        hi = parse_expr();
+                    }
+                    expect("punct", "]");
+                    expr = expr_call(expr_ident("slice"), [expr, idx, hi]);
+                } else {
+                    expect("punct", "]");
+                    expr = expr_index(expr, idx);
+                }
+            }
         } else if match_token("punct", ".") {
             let nm = _member_name();
             if nm == nil { go = false; } else { expr = expr_member(expr, nm.text); }
@@ -1124,8 +1254,26 @@ fn parse_primary() {
         if t.text == "false" { advance(); return expr_bool(false); }
         if t.text == "nil" { advance(); return expr_nil(); }
         if t.text == "import" { advance(); return expr_ident("import"); } // import(...) as expr
+        if t.text == "defer" { advance(); return expr_ident("defer"); }   // no defer stmt here,
+                                                                          // so it's a plain name
+                                                                          // (async_io.sapp)
         if t.text == "if" { return parse_if_expr(); }
-        if t.text == "match" { return parse_match(); }
+        if t.text == "match" {
+            // Contextual: `match` is only a match-expression when followed by a
+            // scrutinee (`match <expr> { case ... }`). Followed by `(`, `,`, `)`,
+            // `;`, `]`, `}` or `=` it's a plain identifier — regex.sapp defines
+            // and calls `fn match(s, pat)`. (The Rust frontend gets this via
+            // backtracking; known deviation: a parenthesized scrutinee
+            // `match (x) { ... }` needs the parens dropped here.)
+            let nx = peek(1);
+            if (nx.kind == "punct" and (nx.text == "(" or nx.text == "," or nx.text == ")"
+                    or nx.text == ";" or nx.text == "]" or nx.text == "}"))
+               or (nx.kind == "operator" and nx.text == "=") {
+                advance();
+                return expr_ident("match");
+            }
+            return parse_match();
+        }
         if t.text == "try" {
             // `try <expr> catch <expr>` — an expression that yields the body's
             // value, or the handler's value if the body raises.
@@ -1156,6 +1304,7 @@ fn parse_primary() {
         }
     }
     if t.kind == "punct" {
+        if t.text == "{" { return parse_block_expr(); }
         if t.text == "(" {
             advance();
             let e = parse_expr();
