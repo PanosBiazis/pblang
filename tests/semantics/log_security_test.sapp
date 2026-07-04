@@ -1,0 +1,84 @@
+// tests/semantics/log_security_test.sapp — lock the logging security model.
+//
+// Bugs this locks (all real before the fix):
+//   1. LOG INJECTION (CWE-117): text format wrote message/field values verbatim,
+//      so "evil\n[ts] [ERROR] forged" forged a second log line. Control chars
+//      (incl. ESC = terminal escape injection, CWE-150) passed through too.
+//   2. SEVERITY FORGERY: json format let caller fields overwrite the reserved
+//      ts/level/msg/source keys — map{level:"ERROR"} rebranded an INFO line.
+//   3. NO REDACTION: password/token/secret field values landed in plaintext.
+
+let log = import("stdlib:log.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+fn has(s, needle, m) { if str_index_of(s, needle) < 0 { fail(m + " missing '" + needle + "' in: " + s); } }
+fn lacks(s, needle, m) { if str_index_of(s, needle) >= 0 { fail(m + " leaked '" + needle + "' in: " + s); } }
+
+log.use_memory_output();
+log.set_level("debug");
+
+fn last_line() {
+    let entries = log.memory_entries();
+    return entries[len(entries) - 1].line;
+}
+
+// ── 1. text-format log injection ─────────────────────────────────────────────
+log.set_format("text");
+log.info("user login: evil" + str_from_char_code(10) + "[fake-ts] [ERROR] forged admin grant", nil);
+let l1 = last_line();
+lacks(l1, str_from_char_code(10), "newline must be escaped, not emitted");
+has(l1, "\\n", "newline visibly escaped as \\n");
+
+// field VALUES are attacker-controlled too
+log.info("ok", map{ user: "bob" + str_from_char_code(13) + str_from_char_code(10) + "[x] [ERROR] fake" });
+let l2 = last_line();
+lacks(l2, str_from_char_code(10), "field-value newline escaped");
+lacks(l2, str_from_char_code(13), "field-value CR escaped");
+
+// terminal escape injection: ESC must be stripped
+log.info("esc" + str_from_char_code(27) + "[31mred", nil);
+lacks(last_line(), str_from_char_code(27), "ESC stripped (terminal injection)");
+
+// ── 2. json-format severity forgery ──────────────────────────────────────────
+log.set_format("json");
+log.info("real message", map{ level: "ERROR", msg: "forged", ts: "1999" });
+let obj = json_parse(last_line());
+eq(obj.level, "INFO", "reserved key 'level' not overwritable by fields");
+eq(obj.msg, "real message", "reserved key 'msg' not overwritable by fields");
+// the caller data is still visible, just namespaced away from the envelope
+has(last_line(), "forged", "colliding field value preserved under a safe key");
+
+// ── 3. secret redaction (default-on) ─────────────────────────────────────────
+log.set_format("text");
+log.info("login attempt", map{ user: "bob", password: "hunter2" });
+let l3 = last_line();
+lacks(l3, "hunter2", "password value redacted");
+has(l3, "[REDACTED]", "redaction marker present");
+has(l3, "bob", "non-secret fields untouched");
+
+log.info("api call", map{ api_key: "sk-live-123", authorization: "Bearer xyz" });
+let l4 = last_line();
+lacks(l4, "sk-live-123", "api_key redacted");
+lacks(l4, "Bearer xyz", "authorization redacted");
+
+// redaction also applies to json format
+log.set_format("json");
+log.info("j", map{ token: "tok-999" });
+lacks(last_line(), "tok-999", "token redacted in json too");
+
+// custom redact keys extend the defaults
+log.set_redact_keys(["ssn"]);
+log.set_format("text");
+log.info("kyc", map{ ssn: "123-45-6789" });
+lacks(last_line(), "123-45-6789", "custom redact key honored");
+log.info("still", map{ password: "hunter3" });
+lacks(last_line(), "hunter3", "defaults still active after custom keys added");
+
+// redaction can be disabled explicitly (debugging escape hatch)
+log.set_redaction(false);
+log.info("raw", map{ password: "visible-on-purpose" });
+has(last_line(), "visible-on-purpose", "set_redaction(false) disables redaction");
+log.set_redaction(true);
+
+print "log_security_pass";
