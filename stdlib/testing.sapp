@@ -10,11 +10,31 @@
 //   });
 //   t.run_all();
 
+let TIME = import("stdlib:time.sapp");
+
 let _suites = [];
 let _current_suite = nil;
 let _pass_count = 0;
 let _fail_count = 0;
 let _skip_count = 0;
+let _has_focus = false;
+
+// reset() — clear all registered suites and counters so independent runs
+// don't accumulate (run_all() alone only resets the counters).
+fn reset() {
+    _suites = [];
+    _current_suite = nil;
+    _pass_count = 0;
+    _fail_count = 0;
+    _skip_count = 0;
+    _has_focus = false;
+}
+
+// stats() — counts from the most recent run_all(), readable even when
+// run_all() raised because of failures.
+fn stats() {
+    return map{ passed: _pass_count, failed: _fail_count, skipped: _skip_count };
+}
 
 // describe(name, fn) — define a test suite
 fn describe(name, suite_fn) {
@@ -29,19 +49,27 @@ fn describe(name, suite_fn) {
 // it(name, fn) — define a test case (inside describe)
 fn it(name, test_fn) {
     if _current_suite == nil { return error("testing.it() must be called inside describe()"); }
-    _current_suite.tests[len(_current_suite.tests)] = map{ name: name, fn: test_fn, skip: false };
+    _current_suite.tests[len(_current_suite.tests)] = map{ name: name, fn: test_fn, skip: false, focus: false };
 }
 
 // xit(name, fn) — skip a test (pending)
 fn xit(name, test_fn) {
     if _current_suite == nil { return error("testing.xit() must be called inside describe()"); }
-    _current_suite.tests[len(_current_suite.tests)] = map{ name: name, fn: test_fn, skip: true };
+    _current_suite.tests[len(_current_suite.tests)] = map{ name: name, fn: test_fn, skip: true, focus: false };
+}
+
+// fit(name, fn) — focused test: when any fit() exists, run_all() runs ONLY
+// focused tests and counts the rest as skipped (like Jest's it.only).
+fn fit(name, test_fn) {
+    if _current_suite == nil { return error("testing.fit() must be called inside describe()"); }
+    _current_suite.tests[len(_current_suite.tests)] = map{ name: name, fn: test_fn, skip: false, focus: true };
+    _has_focus = true;
 }
 
 // test(name, fn) — alias for it() for use outside describe()
 fn test(name, test_fn) {
     let suite = map{ name: "(top level)", tests: [], before_each: nil, after_each: nil, before_all: nil, after_all: nil };
-    suite.tests[0] = map{ name: name, fn: test_fn, skip: false };
+    suite.tests[0] = map{ name: name, fn: test_fn, skip: false, focus: false };
     _suites[len(_suites)] = suite;
 }
 
@@ -152,6 +180,32 @@ fn expect(val) {
             }
             return true;
         },
+        to_be_close_to: fn(expected, tol) {
+            let d = val - expected;
+            if d < 0 { d = 0 - d; }
+            if d > tol {
+                return error("expect: " + str(val) + " to be within " + str(tol) + " of " + str(expected));
+            }
+            return true;
+        },
+        to_start_with: fn(prefix) {
+            if type(val) != "string" {
+                return error("expect.to_start_with: value is not a string");
+            }
+            if str_starts_with(val, prefix) == false {
+                return error("expect: '" + val + "' to start with '" + prefix + "'");
+            }
+            return true;
+        },
+        to_end_with: fn(suffix) {
+            if type(val) != "string" {
+                return error("expect.to_end_with: value is not a string");
+            }
+            if str_ends_with(val, suffix) == false {
+                return error("expect: '" + val + "' to end with '" + suffix + "'");
+            }
+            return true;
+        },
         to_match_map: fn(expected_map) {
             if type(val) != "map" {
                 return error("expect.to_match_map: value is not a map");
@@ -171,10 +225,12 @@ fn expect(val) {
     };
 }
 
-// expect_throws(fn) — assert that fn() throws (returns an error)
+// expect_throws(fn) — assert that fn() throws. Uses the out-of-band map
+// sentinel: the old string sentinel had a false positive when fn()
+// legitimately returned "caught".
 fn expect_throws(fn_) {
-    let result = try fn_() catch "caught";
-    if result != "caught" {
+    let outcome = try map{ ok: true, value: fn_() } catch map{ ok: false, value: nil };
+    if outcome.ok {
         return error("expect_throws: function did not throw");
     }
     return true;
@@ -200,26 +256,51 @@ fn _run_test(suite_name, test_def, before_fn, after_fn) {
         _skip_count = _skip_count + 1;
         return;
     }
-
-    if before_fn != nil { try before_fn() catch nil; }
-
-    let ok = true;
-    let err_msg = "";
-    let result = try test_def.fn() catch nil;
-    if result == nil {
-        // check if the test raised an error
-        ok = false;
-        err_msg = "(unknown error — test fn returned nil or threw)";
+    if _has_focus and test_def.focus != true {
+        print "  ⏭  SKIP (unfocused): " + test_def.name;
+        _skip_count = _skip_count + 1;
+        return;
     }
 
-    if after_fn != nil { try after_fn() catch nil; }
+    // A throwing before_each means the test would run against broken state —
+    // that is a FAILURE, not something to swallow.
+    if before_fn != nil {
+        let bh = try map{ ok: true, value: before_fn() } catch map{ ok: false, value: nil };
+        if bh.ok == false {
+            print "  ✗  FAIL: " + test_def.name;
+            print "       (before_each threw)";
+            _fail_count = _fail_count + 1;
+            return;
+        }
+    }
 
-    if ok and result != false {
+    // catch binds no name in pblang, so pass/throw rides an out-of-band map.
+    // A test fn that returns nil (any statement-bodied fn) is a PASS; only a
+    // throw or an explicit `return false` fails.
+    let outcome = try map{ ok: true, value: test_def.fn() } catch map{ ok: false, value: nil };
+    let passed = outcome.ok;
+    let why = "";
+    if outcome.ok == false { why = "(test threw)"; }
+    if passed and outcome.value == false {
+        passed = false;
+        why = "(test returned false)";
+    }
+
+    // A throwing after_each fails an otherwise-passing test (leaked state).
+    if after_fn != nil {
+        let ah = try map{ ok: true, value: after_fn() } catch map{ ok: false, value: nil };
+        if ah.ok == false and passed {
+            passed = false;
+            why = "(after_each threw)";
+        }
+    }
+
+    if passed {
         print "  ✓  " + test_def.name;
         _pass_count = _pass_count + 1;
     } else {
         print "  ✗  FAIL: " + test_def.name;
-        if err_msg != "" { print "       " + err_msg; }
+        if why != "" { print "       " + why; }
         _fail_count = _fail_count + 1;
     }
 }
@@ -228,6 +309,7 @@ fn run_all() {
     _pass_count = 0;
     _fail_count = 0;
     _skip_count = 0;
+    let t0 = TIME.now_ms();
 
     for s len(_suites) {
         let suite = _suites[s];
@@ -239,12 +321,18 @@ fn run_all() {
         if suite.after_all != nil { try suite.after_all() catch nil; }
     }
 
+    let elapsed = num_floor((TIME.now_ms() - t0) * 10 + 0.5) / 10;
     print "\n─────────────────────────────";
-    print "Results: " + str(_pass_count) + " passed  " + str(_fail_count) + " failed  " + str(_skip_count) + " skipped";
+    print "Results: " + str(_pass_count) + " passed  " + str(_fail_count) + " failed  " + str(_skip_count) + " skipped  (" + str(elapsed) + " ms)";
     if _fail_count > 0 {
         return error("Test suite failed: " + str(_fail_count) + " test(s) failed");
     }
     return map{ passed: _pass_count, failed: _fail_count, skipped: _skip_count };
+}
+
+// fail(msg) — unconditionally fail the current test with a message
+fn fail(msg) {
+    return error("fail: " + str(msg));
 }
 
 // assert_equal(a, b) — quick assertion without builder pattern
@@ -287,6 +375,6 @@ fn assert_not_nil(v) {
     return true;
 }
 
-export describe, it, xit, test, before_each, after_each, before_all, after_all,
-       expect, expect_throws, expect_no_throw, run_all,
+export describe, it, xit, fit, test, before_each, after_each, before_all, after_all,
+       expect, expect_throws, expect_no_throw, run_all, reset, stats, fail,
        assert_equal, assert_true, assert_false, assert_nil, assert_not_nil;
