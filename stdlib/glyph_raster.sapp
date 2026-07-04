@@ -1,0 +1,161 @@
+// stdlib/glyph_raster.sapp — glyph outline -> alpha bitmap (fills the atlas texture).
+//
+// The rasterization core the GPU text path needs: a TrueType 'glyf' outline is a set of
+// CONTOURS made of line + quadratic-bezier segments; flatten the curves to polylines, fill
+// with the even-odd scanline rule, and blit the result into the atlas (packed by
+// glyph_atlas.sapp, drawn by gpu2d as kind=2 glyph quads). Font-format agnostic: a TTF
+// byte-parser produces the contours; this turns them into coverage pixels. Pure.
+//
+//   let GR = import("stdlib/glyph_raster.sapp");
+//   let bmp = GR.rasterize(contours, w, h);   // contours = [[{x,y}...], ...]
+//   GR.blit(atlas_bitmap, bmp, ox, oy);
+
+fn bitmap_new(w, h) {
+    let px = [];
+    let n = w * h;
+    let i = 0;
+    while i < n { array_push(px, 0); i = i + 1; }
+    return map{ w: w, h: h, px: px };
+}
+fn get(bmp, x, y) {
+    if x < 0 or y < 0 or x >= bmp.w or y >= bmp.h { return 0; }
+    return bmp.px[y * bmp.w + x];
+}
+fn set(bmp, x, y, v) {
+    if x >= 0 and y >= 0 and x < bmp.w and y < bmp.h { bmp.px[y * bmp.w + x] = v; }
+    return bmp;
+}
+
+// insertion sort of a float list (scanline crossing counts are tiny).
+fn _sort(xs) {
+    let a = xs;
+    let i = 1;
+    while i < len(a) {
+        let key = a[i];
+        let j = i - 1;
+        while j >= 0 and a[j] > key { a[j + 1] = a[j]; j = j - 1; }
+        a[j + 1] = key;
+        i = i + 1;
+    }
+    return a;
+}
+
+// rasterize(contours, w, h) — even-odd scanline fill; returns an alpha bitmap (0 or 255).
+fn rasterize(contours, w, h) {
+    let bmp = bitmap_new(w, h);
+    let y = 0;
+    while y < h {
+        let yc = y + 0.5;
+        let xs = [];
+        let ci = 0;
+        while ci < len(contours) {
+            let pts = contours[ci];
+            let n = len(pts);
+            let i = 0;
+            while i < n {
+                let a = pts[i];
+                let ni = i + 1;
+                if ni >= n { ni = 0; }
+                let bb = pts[ni];
+                let y0 = a.y;
+                let y1 = bb.y;
+                let cross = (y0 <= yc and y1 > yc) or (y1 <= yc and y0 > yc);
+                if cross {
+                    let t = (yc - y0) / (y1 - y0);
+                    array_push(xs, a.x + t * (bb.x - a.x));
+                }
+                i = i + 1;
+            }
+            ci = ci + 1;
+        }
+        xs = _sort(xs);
+        let k = 0;
+        while k + 1 < len(xs) {
+            let x0 = xs[k];
+            let x1 = xs[k + 1];
+            let px = 0;
+            while px < w {
+                let xc = px + 0.5;
+                if xc >= x0 and xc < x1 { bmp.px[y * w + px] = 255; }
+                px = px + 1;
+            }
+            k = k + 2;
+        }
+        y = y + 1;
+    }
+    return bmp;
+}
+
+fn _scale_contours(contours, s) {
+    let out = [];
+    let ci = 0;
+    while ci < len(contours) {
+        let pts = contours[ci];
+        let np = [];
+        let i = 0;
+        while i < len(pts) { array_push(np, map{ x: pts[i].x * s, y: pts[i].y * s }); i = i + 1; }
+        array_push(out, np);
+        ci = ci + 1;
+    }
+    return out;
+}
+// rasterize_aa(contours, w, h, ss) — antialiased coverage (0..255) by ss*ss supersampling:
+// rasterize at ss* resolution, then box-average each ss*ss block down to one pixel.
+fn rasterize_aa(contours, w, h, ss) {
+    if ss < 1 { ss = 1; }
+    let big = rasterize(_scale_contours(contours, ss), w * ss, h * ss);
+    let bw = w * ss;
+    let bmp = bitmap_new(w, h);
+    let y = 0;
+    while y < h {
+        let x = 0;
+        while x < w {
+            let sum = 0;
+            let sy = 0;
+            while sy < ss {
+                let sx = 0;
+                while sx < ss {
+                    if big.px[(y * ss + sy) * bw + (x * ss + sx)] > 0 { sum = sum + 1; }
+                    sx = sx + 1;
+                }
+                sy = sy + 1;
+            }
+            bmp.px[y * w + x] = num_floor(sum * 255 / (ss * ss));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bmp;
+}
+
+// flatten_quad(p0, cp, p1, steps) — sample a quadratic bezier into steps+1 points.
+fn flatten_quad(p0, cp, p1, steps) {
+    let out = [];
+    let i = 0;
+    while i <= steps {
+        let t = (i * 1.0) / steps;
+        let u = 1.0 - t;
+        let x = u * u * p0.x + 2.0 * u * t * cp.x + t * t * p1.x;
+        let y = u * u * p0.y + 2.0 * u * t * cp.y + t * t * p1.y;
+        array_push(out, map{ x: x, y: y });
+        i = i + 1;
+    }
+    return out;
+}
+
+// blit(dst, src, ox, oy) — copy non-zero src pixels into dst at an offset (max-composite).
+fn blit(dst, src, ox, oy) {
+    let y = 0;
+    while y < src.h {
+        let x = 0;
+        while x < src.w {
+            let v = src.px[y * src.w + x];
+            if v > 0 { set(dst, ox + x, oy + y, v); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return dst;
+}
+
+export bitmap_new, get, set, rasterize, rasterize_aa, flatten_quad, blit;

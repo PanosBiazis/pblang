@@ -1,0 +1,165 @@
+// stdlib/gpio.sapp — Linux sysfs GPIO driver in pure pblang (robotics/embedded).
+//
+// Harvested from the LightLedRasPi project: drive LEDs/relays/buttons on a
+// Raspberry Pi (or any board exposing /sys/class/gpio) with NO Rust and no
+// C library — the sysfs protocol is just files, and pblang can read/write
+// files. Same pattern as stdlib/device.sapp (use kernel drivers via /sys).
+//
+//   let GP = import("stdlib:gpio.sapp");
+//   let g = GP.new(GP.sysfs_backend());   // real hardware
+//   GP.export_pin(g, 17);
+//   GP.set_direction(g, 17, "out");
+//   GP.write_pin(g, 17, 1);               // LED on
+//
+// The backend is INJECTABLE ({read: fn(path), write: fn(path, text)}), so all
+// protocol logic is unit-testable on machines with no GPIO. Honest boundary:
+// sysfs GPIO needs permissions (gpio group or root) and is the legacy-but-
+// ubiquitous interface; the newer character-device API (gpiod ioctls) needs
+// the codegen syscall path instead.
+
+let BASE = "/sys/class/gpio";
+
+// new(backend) -> handle. backend: { read: fn(path)->text, write: fn(path, text) }.
+fn new(backend) { return map{ be: backend }; }
+
+// sysfs_backend() — the real filesystem-backed backend (absolute sysfs paths).
+fn sysfs_backend() {
+    return map{
+        read: fn(p) { return fs_read(p); },
+        write: fn(p, t) { return fs_write(p, t); },
+    };
+}
+
+fn _check_pin(pin) {
+    if type(pin) != "number" or pin < 0 or pin != num_floor(pin) {
+        throw "gpio: pin must be a non-negative whole number, got " + str(pin);
+    }
+    return nil;
+}
+
+// export_pin(g, pin) — ask the kernel to expose /sys/class/gpio/gpioN.
+fn export_pin(g, pin) {
+    _check_pin(pin);
+    let w = g.be.write;
+    w(BASE + "/export", str(pin));
+    return nil;
+}
+
+// unexport_pin(g, pin) — release the pin back to the kernel.
+fn unexport_pin(g, pin) {
+    _check_pin(pin);
+    let w = g.be.write;
+    w(BASE + "/unexport", str(pin));
+    return nil;
+}
+
+// set_direction(g, pin, dir) — "in" or "out" only.
+fn set_direction(g, pin, dir) {
+    _check_pin(pin);
+    if dir != "in" and dir != "out" {
+        throw "gpio: direction must be 'in' or 'out', got " + str(dir);
+    }
+    let w = g.be.write;
+    w(BASE + "/gpio" + str(pin) + "/direction", dir);
+    return nil;
+}
+
+// write_pin(g, pin, v) — v must be 0 or 1.
+fn write_pin(g, pin, v) {
+    _check_pin(pin);
+    if v != 0 and v != 1 { throw "gpio: value must be 0 or 1, got " + str(v); }
+    let w = g.be.write;
+    w(BASE + "/gpio" + str(pin) + "/value", str(v));
+    return nil;
+}
+
+// read_pin(g, pin) -> 0|1. Tolerates the trailing newline sysfs emits.
+fn read_pin(g, pin) {
+    _check_pin(pin);
+    let r = g.be.read;
+    let raw = str_trim(r(BASE + "/gpio" + str(pin) + "/value"));
+    if raw == "1" { return 1; }
+    if raw == "0" { return 0; }
+    throw "gpio: unexpected value '" + raw + "' on pin " + str(pin);
+}
+
+// blink_plan(pin, times, ms) — a PURE [{pin, value, ms}] schedule (on/off pairs)
+// that any executor (loop + sleep, watcher, wokwi-style simulator) can replay.
+fn blink_plan(pin, times, ms) {
+    _check_pin(pin);
+    let out = [];
+    let i = 0;
+    while i < times {
+        push(out, map{ pin: pin, value: 1, ms: ms });
+        push(out, map{ pin: pin, value: 0, ms: ms });
+        i = i + 1;
+    }
+    return out;
+}
+
+// pwm_plan(pin, duty_pct, period_ms, cycles) — a PURE software-PWM schedule:
+// each cycle is on for duty% of the period, off for the rest. For LEDs and
+// servo-ish dimming via any executor; real hardware PWM needs the pwmchip
+// sysfs interface (different files, same backend pattern).
+fn pwm_plan(pin, duty_pct, period_ms, cycles) {
+    _check_pin(pin);
+    if duty_pct < 0 or duty_pct > 100 {
+        throw "gpio: duty_pct must be 0..100, got " + str(duty_pct);
+    }
+    let on_ms = period_ms * duty_pct / 100;
+    let off_ms = period_ms - on_ms;
+    let out = [];
+    let i = 0;
+    while i < cycles {
+        push(out, map{ pin: pin, value: 1, ms: on_ms });
+        push(out, map{ pin: pin, value: 0, ms: off_ms });
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── debounce: pure state machine for mechanical switches ──────────────────────
+// A raw input must hold a new level for stable_ms before the debounced value
+// flips; shorter flickers (contact bounce) are ignored. Pure: step returns a
+// NEW state, so it composes with any polling loop or event source.
+fn debounce_new(initial, stable_ms) {
+    return map{ value: initial, candidate: initial, since_ms: 0, stable_ms: stable_ms };
+}
+
+fn debounce_step(state, raw, now_ms) {
+    let value = state.value;
+    let candidate = state.candidate;
+    let since = state.since_ms;
+    if raw == value {
+        candidate = raw;
+        since = now_ms;
+    } else if raw != candidate {
+        candidate = raw;
+        since = now_ms;
+    } else if now_ms - since >= state.stable_ms {
+        value = raw;
+    }
+    return map{ value: value, candidate: candidate, since_ms: since, stable_ms: state.stable_ms };
+}
+
+// servo_plan(pin, angle_deg, cycles) — standard hobby-servo schedule: 50Hz
+// (20ms) frames with a 1ms (0 deg) .. 2ms (180 deg) pulse. Software timing via
+// sysfs is jittery — fine for rough positioning, not for precision.
+fn servo_plan(pin, angle_deg, cycles) {
+    _check_pin(pin);
+    if angle_deg < 0 or angle_deg > 180 {
+        throw "gpio: angle must be 0..180, got " + str(angle_deg);
+    }
+    let pulse = 1.0 + angle_deg / 180.0;
+    let out = [];
+    let i = 0;
+    while i < cycles {
+        push(out, map{ pin: pin, value: 1, ms: pulse });
+        push(out, map{ pin: pin, value: 0, ms: 20.0 - pulse });
+        i = i + 1;
+    }
+    return out;
+}
+
+export new, sysfs_backend, export_pin, unexport_pin, set_direction, write_pin, read_pin, blink_plan, pwm_plan;
+export debounce_new, debounce_step, servo_plan;

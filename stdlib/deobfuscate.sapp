@@ -1,0 +1,170 @@
+// stdlib/deobfuscate.sapp — detect & canonicalize adversarial text obfuscation.
+//
+// The DEFENSIVE inverse of the G0DM0D3 "Parseltongue" perturbation engine
+// (~/G0DM0D3/src/lib/parseltongue.ts). Parseltongue hides trigger words from a filter
+// via leetspeak, Unicode homoglyphs, zero-width characters, and mixed case; this module
+// undoes those so a guard/classifier judges the REAL text. Pure + deterministic. Pairs
+// with stdlib/text_normalize.sapp (which cleans model *output*; this cleans *input*).
+//
+//   let D = import("stdlib/deobfuscate.sapp");
+//   D.canonicalize("H4CK​еr");                 // -> "hacker"
+//   D.is_obfuscated(userInput);                      // bool
+//   D.contains_trigger("how to b0mb", ["bomb"]);     // true (naive search misses "b0mb")
+//
+// Defensive use only: it reveals evasion, it does not create it.
+
+let U = import("stdlib:unicode.sapp");
+
+fn _is_ascii_letter(cp) { return (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122); }
+
+// zero-width / invisible joiners commonly injected between letters
+fn _is_zw(cp) { return cp == 8203 or cp == 8204 or cp == 8205 or cp == 65279 or cp == 8288; }
+
+// leetspeak: symbol/digit -> letter
+let _LEET = nil;
+fn _leet_map() {
+    if _LEET != nil { return _LEET; }
+    _LEET = map{ "4": "a", "3": "e", "1": "i", "0": "o", "5": "s", "7": "t",
+        "8": "b", "9": "g", "@": "a", "$": "s", "+": "t", "!": "i" };
+    return _LEET;
+}
+
+// explicit Unicode confusables -> ASCII letter (keyed by codepoint as string)
+let _HOMO = nil;
+fn _homo_map() {
+    if _HOMO != nil { return _HOMO; }
+    _HOMO = map{
+        "1072": "a", "1077": "e", "1086": "o", "1089": "c", "1088": "p",
+        "1093": "x", "1091": "y", "1082": "k",                    // Cyrillic lower
+        "1040": "a", "1045": "e", "1054": "o", "1057": "c", "1056": "p",
+        "1061": "x", "1059": "y", "1050": "k",                    // Cyrillic upper
+        "945": "a", "959": "o", "949": "e", "953": "i", "961": "p" // Greek
+    };
+    return _HOMO;
+}
+
+// _homoglyph(cp) — the ASCII letter a codepoint imitates, or "" if it is not a confusable.
+fn _homoglyph(cp) {
+    if cp >= 65345 and cp <= 65370 { return U.from_codepoint(97 + (cp - 65345)); } // fullwidth a-z
+    if cp >= 65313 and cp <= 65338 { return U.from_codepoint(97 + (cp - 65313)); } // fullwidth A-Z -> lower
+    let m = _homo_map();
+    let k = str(cp);
+    if map_has(m, k) { return m[k]; }
+    return "";
+}
+
+// ── zero-width ─────────────────────────────────────────────────────────────────────
+fn strip_zero_width(text) {
+    let out = "";
+    for i len(text) {
+        if not _is_zw(strcharcodeat(text, i)) { out = out + str_slice(text, i, i + 1); }
+    }
+    return out;
+}
+fn count_zero_width(text) {
+    let n = 0;
+    for i len(text) { if _is_zw(strcharcodeat(text, i)) { n = n + 1; } }
+    return n;
+}
+
+// ── homoglyphs ───────────────────────────────────────────────────────────────────
+fn fold_homoglyphs(text) {
+    let out = "";
+    for i len(text) {
+        let h = _homoglyph(strcharcodeat(text, i));
+        if h != "" { out = out + h; } else { out = out + str_slice(text, i, i + 1); }
+    }
+    return out;
+}
+fn count_homoglyphs(text) {
+    let n = 0;
+    for i len(text) { if _homoglyph(strcharcodeat(text, i)) != "" { n = n + 1; } }
+    return n;
+}
+
+// ── leetspeak (adjacency-aware: a digit only counts inside a word) ──────────────────
+fn _leet_adjacent(text, i) {
+    let prevL = false;
+    let nextL = false;
+    if i > 0 { prevL = _is_ascii_letter(strcharcodeat(text, i - 1)); }
+    if i + 1 < len(text) { nextL = _is_ascii_letter(strcharcodeat(text, i + 1)); }
+    return prevL or nextL;
+}
+fn unleet(text) {
+    let lm = _leet_map();
+    let out = "";
+    for i len(text) {
+        let c = str_slice(text, i, i + 1);
+        if map_has(lm, c) and _leet_adjacent(text, i) { out = out + lm[c]; }
+        else { out = out + c; }
+    }
+    return out;
+}
+fn count_leet(text) {
+    let lm = _leet_map();
+    let n = 0;
+    for i len(text) {
+        let c = str_slice(text, i, i + 1);
+        if map_has(lm, c) and _leet_adjacent(text, i) { n = n + 1; }
+    }
+    return n;
+}
+
+// mixed_case_ratio — fraction of adjacent in-word letter pairs whose case flips.
+fn mixed_case_ratio(text) {
+    let transitions = 0;
+    let pairs = 0;
+    let prev = 0 - 1;   // -1 = no letter yet / word boundary
+    for i len(text) {
+        let cp = strcharcodeat(text, i);
+        if _is_ascii_letter(cp) {
+            let up = 0;
+            if cp >= 65 and cp <= 90 { up = 1; }
+            if prev >= 0 { pairs = pairs + 1; if up != prev { transitions = transitions + 1; } }
+            prev = up;
+        } else {
+            prev = 0 - 1;
+        }
+    }
+    if pairs == 0 { return 0.0; }
+    return (transitions * 1.0) / (pairs * 1.0);
+}
+
+// ── canonicalize: undo every technique, in the order that keeps word adjacency ─────
+fn canonicalize(text) {
+    let t = strip_zero_width(text);   // first, so hidden joiners don't split words
+    t = fold_homoglyphs(t);           // homoglyph letters now count as real letters
+    t = unleet(t);                    // digits inside those words revert
+    return str_lower(t);
+}
+
+// ── detection + scoring ────────────────────────────────────────────────────────────
+fn detect(text) {
+    let zw = count_zero_width(text);
+    let ho = count_homoglyphs(text);
+    let le = count_leet(text);
+    let mc = mixed_case_ratio(text);
+    let techniques = [];
+    let score = 0.0;
+    if zw > 0 { array_push(techniques, "zero_width"); score = score + 0.4; }
+    if ho > 0 { array_push(techniques, "homoglyph"); score = score + 0.3; }
+    if le >= 2 { array_push(techniques, "leetspeak"); score = score + 0.3; }
+    if mc > 0.6 and len(text) >= 6 { array_push(techniques, "mixedcase"); score = score + 0.2; }
+    if score > 1.0 { score = 1.0; }
+    return map{ zero_width: zw, homoglyphs: ho, leet: le, mixed_case: mc,
+        canonical: canonicalize(text), score: score, techniques: techniques };
+}
+fn is_obfuscated(text) { return detect(text).score >= 0.5; }
+
+// contains_trigger(text, triggers) — does the CANONICAL text contain any trigger word?
+// This is what naive substring filters miss: "b0mb"/"b​omb"/cyrillic look-alikes.
+fn contains_trigger(text, triggers) {
+    let canon = canonicalize(text);
+    for i len(triggers) {
+        if str_contains(canon, canonicalize(triggers[i])) { return true; }
+    }
+    return false;
+}
+
+export strip_zero_width, count_zero_width, fold_homoglyphs, count_homoglyphs;
+export unleet, count_leet, mixed_case_ratio, canonicalize, detect, is_obfuscated, contains_trigger;

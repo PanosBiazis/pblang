@@ -1,0 +1,129 @@
+// stdlib/gpu2d.sapp — 2D draw-command IR + instanced-quad batcher (GPU UI, pblang-side).
+//
+// The CPU half of a GPU 2D rasterizer. You build a draw list of high-level commands
+// (rect, rounded-rect, glyph), then bake it into a flat f32 INSTANCE buffer: one 14-float
+// record per command that a GPU pipeline expands into a quad and shades. The whole UI then
+// draws in ONE instanced call. The shaders that consume this are in gpu2d_shader.sapp; the
+// host glue that uploads + draws it (Rust/C/C++/Python/JS) is in gpu2d_host.sapp; the same
+// list can also run on the CPU across all cores via render_soft. This module is pure and
+// deterministic — the exact philosophy of codegen_x64: pblang produces the real payload.
+//
+//   let D = import("stdlib/gpu2d.sapp");
+//   let dl = D.new();
+//   D.rrect(dl, x, y, w, h, 8, map{r:20,g:22,b:34,a:255});   // a rounded panel
+//   D.glyph(dl, gx, gy, gw, gh, atlas_uv, map{r:230,g:240,b:210,a:255});
+//   let buf = D.to_vertex_f32(dl);   // upload this; draw len/14 instances
+//
+// Instance layout (14 f32): [x, y, w, h, rad, r, g, b, a, u0, v0, u1, v1, kind]
+//   kind: 0 = solid rect, 1 = rounded rect (SDF corners), 2 = glyph (sample atlas * color)
+//   colors are normalized to 0..1 here; input colors are 0..255 (matches stdlib/graphics).
+
+let P = import("stdlib:parallel.sapp");   // multi-core bake for large draw lists
+
+let FLOATS_PER_INSTANCE = 14;
+
+fn new() { return map{ cmds: [] }; }
+
+fn _rgba(c) {
+    // accept {r,g,b,a} in 0..255; default opaque
+    let a = 255;
+    if map_has(c, "a") { a = c.a; }
+    return map{ r: c.r, g: c.g, b: c.b, a: a };
+}
+
+// rect(dl, x, y, w, h, color) — a solid axis-aligned rectangle.
+fn rect(dl, x, y, w, h, color) {
+    array_push(dl.cmds, map{ kind: 0, x: x, y: y, w: w, h: h, rad: 0,
+        col: _rgba(color), uv: map{ u0: 0, v0: 0, u1: 0, v1: 0 } });
+    return dl;
+}
+// rrect(dl, x, y, w, h, rad, color) — a rounded rectangle (GPU does SDF-antialiased corners).
+fn rrect(dl, x, y, w, h, rad, color) {
+    array_push(dl.cmds, map{ kind: 1, x: x, y: y, w: w, h: h, rad: rad,
+        col: _rgba(color), uv: map{ u0: 0, v0: 0, u1: 0, v1: 0 } });
+    return dl;
+}
+// glyph(dl, x, y, w, h, uv, color) — a textured quad sampling an atlas sub-rect, tinted.
+fn glyph(dl, x, y, w, h, uv, color) {
+    array_push(dl.cmds, map{ kind: 2, x: x, y: y, w: w, h: h, rad: 0,
+        col: _rgba(color), uv: uv });
+    return dl;
+}
+
+fn count(dl) { return len(dl.cmds); }
+fn clear(dl) { dl.cmds = []; return dl; }
+
+// _instance(c) — a command -> a GPU instance record (colors normalized to 0..1).
+fn _instance(c) {
+    return map{
+        kind: c.kind, x: c.x, y: c.y, w: c.w, h: c.h, rad: c.rad,
+        r: c.col.r / 255.0, g: c.col.g / 255.0, b: c.col.b / 255.0, a: c.col.a / 255.0,
+        u0: c.uv.u0, v0: c.uv.v0, u1: c.uv.u1, v1: c.uv.v1
+    };
+}
+// to_instances(dl) — the structured instance list.
+fn to_instances(dl) {
+    let out = [];
+    let i = 0;
+    while i < len(dl.cmds) { array_push(out, _instance(dl.cmds[i])); i = i + 1; }
+    return out;
+}
+
+// _floats(c) — a command -> its 14-float instance record (self-contained: pure fn of c,
+// safe to run in a parallel worker).
+fn _floats(c) {
+    return [
+        c.x * 1.0, c.y * 1.0, c.w * 1.0, c.h * 1.0, c.rad * 1.0,
+        c.col.r / 255.0, c.col.g / 255.0, c.col.b / 255.0, c.col.a / 255.0,
+        c.uv.u0 * 1.0, c.uv.v0 * 1.0, c.uv.u1 * 1.0, c.uv.v1 * 1.0, c.kind * 1.0
+    ];
+}
+
+// to_vertex_f32(dl) — the flat instance buffer to upload (len = 14 * command count).
+fn to_vertex_f32(dl) {
+    let out = [];
+    let i = 0;
+    while i < len(dl.cmds) {
+        let f = _floats(dl.cmds[i]);
+        let j = 0;
+        while j < len(f) { array_push(out, f[j]); j = j + 1; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// to_vertex_f32_par(dl) — same buffer, baked across cores (each command -> 14 floats in
+// parallel, then concatenated in order). Identical output to to_vertex_f32.
+fn to_vertex_f32_par(dl) {
+    let chunks = P.par_map(dl.cmds, _floats);
+    let out = [];
+    let i = 0;
+    while i < len(chunks) {
+        let f = chunks[i];
+        let j = 0;
+        while j < len(f) { array_push(out, f[j]); j = j + 1; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// stats(dl) — a compact report; note draw_calls is always 1 (instanced).
+fn stats(dl) {
+    let rects = 0;
+    let rrects = 0;
+    let glyphs = 0;
+    let i = 0;
+    while i < len(dl.cmds) {
+        let k = dl.cmds[i].kind;
+        if k == 0 { rects = rects + 1; }
+        if k == 1 { rrects = rrects + 1; }
+        if k == 2 { glyphs = glyphs + 1; }
+        i = i + 1;
+    }
+    let n = len(dl.cmds);
+    return map{ commands: n, rects: rects, rrects: rrects, glyphs: glyphs,
+        instances: n, triangles: 6, draw_calls: 1, floats: n * FLOATS_PER_INSTANCE };
+}
+
+export new, rect, rrect, glyph, count, clear;
+export to_instances, to_vertex_f32, to_vertex_f32_par, stats;

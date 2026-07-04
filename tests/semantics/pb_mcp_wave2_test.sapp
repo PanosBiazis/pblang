@@ -1,0 +1,95 @@
+// tests/semantics/pb_mcp_wave2_test.sapp
+//
+// pb_mcp wave-2 enrichment: context-grep, cross-file symbol search, directory
+// metrics, content hashing, dry-run call validation — plus the call_batch
+// nesting guard (a hostile batch must hit a deterministic limit, not wind the
+// VM stack to its recursion ceiling).
+
+let M = import("stdlib/pb_mcp.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=[" + str(a) + "] want=[" + str(b) + "]"); } }
+fn truthy(c, m) { if c != true { fail(m); } }
+
+// ── fixtures (workspace-relative, idempotent overwrite) ───────────────────────
+fs_mkdirs("tests/fixtures/_mcpw2/sub");
+fs_write("tests/fixtures/_mcpw2/a.sapp", "fn alpha_probe() { return 1; }\nlet x = 2;\nfn beta_probe() { return 2; }\n");
+fs_write("tests/fixtures/_mcpw2/sub/b.txt", "one\ntwo\nNEEDLE_LINE\nfour\nfive");
+
+// ── grep_context: match + surrounding lines ────────────────────────────────────
+let gc = M.grep_context("NEEDLE_LINE", "tests/fixtures/_mcpw2", 2, 1);
+eq(len(gc), 1, "grep_context finds one match");
+eq(gc[0].line, 3, "grep_context 1-based line");
+eq(len(gc[0].before), 2, "two lines of leading context");
+eq(gc[0].before[0], "one", "leading context in file order");
+eq(gc[0].before[1], "two", "leading context adjacent to match");
+eq(len(gc[0].after), 1, "one line of trailing context");
+eq(gc[0].after[0], "four", "trailing context");
+// context clamps at file edges instead of throwing
+let edge = M.grep_context("one", "tests/fixtures/_mcpw2/sub", 5, 5);
+eq(len(edge[0].before), 0, "before clamps at start of file");
+
+// ── search_symbols: cross-file definition lookup ───────────────────────────────
+let sy = M.search_symbols("alpha_probe", "tests/fixtures/_mcpw2");
+eq(len(sy), 1, "search_symbols finds the definition");
+eq(sy[0].kind, "fn", "symbol kind");
+eq(sy[0].line, 1, "symbol line");
+eq(len(M.search_symbols("ALPHA_PR", "tests/fixtures/_mcpw2")), 1, "symbol search is case-insensitive substring");
+eq(len(M.search_symbols("no_such_symbol_xyz", "tests/fixtures/_mcpw2")), 0, "no false positives");
+
+// ── dir_stats: recursive directory metrics ─────────────────────────────────────
+let ds = M.dir_stats("tests/fixtures/_mcpw2");
+eq(ds.files, 2, "dir_stats file count");
+eq(ds.dirs, 1, "dir_stats dir count");
+truthy(ds.bytes > 0, "dir_stats bytes accumulated");
+eq(ds.by_ext["sapp"], 1, "by-extension histogram: sapp");
+eq(ds.by_ext["txt"], 1, "by-extension histogram: txt");
+
+// ── file_hash: stable content hash for change detection ───────────────────────
+let h1 = M.file_hash("tests/fixtures/_mcpw2/a.sapp");
+eq(len(h1), 8, "hash is 8 hex chars");
+eq(h1, M.file_hash("tests/fixtures/_mcpw2/a.sapp"), "hash is deterministic");
+truthy(h1 != M.file_hash("tests/fixtures/_mcpw2/sub/b.txt"), "different content, different hash");
+let esc = try M.file_hash("/etc/passwd") catch "blocked";
+eq(esc, "blocked", "file_hash refuses paths outside the workspace");
+
+// ── tool_info / validate_call: dry-run introspection ───────────────────────────
+eq(M.tool_info("grep_code").profile, "core-code", "tool_info returns the full catalog entry");
+eq(M.tool_info("definitely_not_a_tool"), nil, "tool_info nil for unknown");
+truthy(M.validate_call("grep_code", map{ pattern: "x" }).ok, "valid call validates");
+let miss = M.validate_call("grep_code", map{});
+truthy(not miss.ok, "missing required arg is rejected");
+eq(miss.missing[0], "pattern", "missing arg is named");
+truthy(not M.validate_call("definitely_not_a_tool", map{}).ok, "unknown tool is rejected");
+
+// ── dispatcher + catalog wiring ────────────────────────────────────────────────
+eq(M.call("file_hash", map{ path: "tests/fixtures/_mcpw2/a.sapp" }), h1, "file_hash via call()");
+truthy(M.has_tool("grep_context"), "grep_context in catalog");
+truthy(M.has_tool("search_symbols"), "search_symbols in catalog");
+truthy(M.has_tool("dir_stats"), "dir_stats in catalog");
+truthy(M.has_tool("file_hash"), "file_hash in catalog");
+truthy(M.has_tool("tool_info"), "tool_info in catalog");
+truthy(M.has_tool("validate_call"), "validate_call in catalog");
+
+// ── call_batch nesting guard ───────────────────────────────────────────────────
+// Six levels of self-nesting must hit a deterministic depth limit (an ok:false
+// entry) somewhere down the chain instead of relying on the VM recursion ceiling.
+let calls = [map{ tool: "call_stats" }];
+let d = 0;
+while d < 6 { calls = [map{ tool: "call_batch", args: map{ calls: calls } }]; d = d + 1; }
+let cur = M.call_batch(calls);
+let blocked = false;
+let steps = 0;
+while steps < 10 and not blocked {
+    let e = cur[0];
+    if e.ok == false { blocked = true; }
+    else { cur = e.result; }
+    steps = steps + 1;
+}
+truthy(blocked, "deep call_batch nesting is refused deterministically");
+// ...and a shallow (depth-2) nest still works end-to-end.
+let ok2 = M.call_batch([map{ tool: "call_batch", args: map{ calls: [map{ tool: "call_stats" }] } }]);
+truthy(ok2[0].ok, "shallow nested batch still allowed");
+truthy(ok2[0].result[0].ok, "inner call of shallow nest succeeded");
+
+print "pb_mcp_wave2_pass";

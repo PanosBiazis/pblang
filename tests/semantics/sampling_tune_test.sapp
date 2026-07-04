@@ -1,0 +1,85 @@
+// tests/semantics/sampling_tune_test.sapp — stdlib/sampling_tune.sapp
+//
+// Context-adaptive sampling-parameter engine (harvested from the G0DM0D3 "AutoTune"
+// research module in ~/G0DM0D3): classify a prompt into a conversational context,
+// map that context to a six-dimension sampling profile (temperature/top_p/top_k/
+// presence/frequency/max_tokens), clamp params to valid ranges, and LEARN better
+// profiles from binary feedback via an EMA (alpha=0.3), the same online-feedback
+// idea the paper describes. Pure + deterministic — no network, no model calls.
+
+let S = import("stdlib/sampling_tune.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+fn approx(a, b, m) { let d = a - b; if d < 0 { d = 0 - d; } if d > 0.0001 { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+fn truthy(c, m) { if c != true { fail(m); } }
+
+// ── classify: keyword scoring into one of five contexts ────────────────────────────
+eq(S.classify("write a python function to sort a list"), "code", "code intent");
+eq(S.classify("write me a short poem about the sea"), "creative", "creative intent");
+eq(S.classify("what is the capital of France"), "factual", "factual intent");
+eq(S.classify("compare and analyze the tradeoffs between A and B"), "analysis", "analysis intent");
+// no strong signal -> falls back to the neutral "chat" context
+eq(S.classify("hey there"), "chat", "fallback chat");
+
+// classify_scores returns a score per context; the winner matches classify()
+let sc = S.classify_scores("debug this function and fix the bug in the code");
+truthy(map_has(sc, "code"), "scores has code");
+truthy(sc.code > sc.creative, "code beats creative on a coding prompt");
+
+// ── profiles: five contexts, six dimensions, sensible relative ordering ────────────
+let pc = S.profile_for("code");
+truthy(map_has(pc, "temperature"), "profile has temperature");
+truthy(map_has(pc, "top_p"), "profile has top_p");
+truthy(map_has(pc, "top_k"), "profile has top_k");
+truthy(map_has(pc, "presence_penalty"), "profile has presence_penalty");
+truthy(map_has(pc, "frequency_penalty"), "profile has frequency_penalty");
+truthy(map_has(pc, "max_tokens"), "profile has max_tokens");
+// creative should be hotter than code; factual should be the coldest
+truthy(S.profile_for("creative").temperature > S.profile_for("code").temperature, "creative hotter than code");
+truthy(S.profile_for("code").temperature >= S.profile_for("factual").temperature, "factual coldest");
+// unknown context returns the chat baseline (no throw on missing key)
+eq(S.profile_for("nonsense").temperature, S.profile_for("chat").temperature, "unknown -> chat baseline");
+
+// ── tune: prompt -> {context, params} in one call ──────────────────────────────────
+let t = S.tune("write a creative story about dragons");
+eq(t.context, "creative", "tune picks creative");
+approx(t.params.temperature, S.profile_for("creative").temperature, "tune params match profile");
+
+// ── clamp: enforce valid sampling ranges ───────────────────────────────────────────
+let cl = S.clamp(map{ temperature: 5.0, top_p: 2.0, top_k: 0, presence_penalty: 9.0, frequency_penalty: 0 - 9.0, max_tokens: 0 });
+approx(cl.temperature, 2.0, "temperature capped at 2");
+approx(cl.top_p, 1.0, "top_p capped at 1");
+truthy(cl.top_k >= 1, "top_k floored at 1");
+approx(cl.presence_penalty, 2.0, "presence capped at 2");
+approx(cl.frequency_penalty, 0 - 2.0, "frequency floored at -2");
+truthy(cl.max_tokens >= 1, "max_tokens floored at 1");
+
+// ── EMA feedback learning: good ratings pull the profile toward what worked ────────
+let st = S.new_state();
+// baseline learned profile == default profile
+approx(S.learned_profile(st, "code").temperature, S.profile_for("code").temperature, "cold start = default");
+// record a GOOD (rating 1) run with a hotter temperature; profile should move toward it
+let good = map{ temperature: 1.4, top_p: 0.95, top_k: 80, presence_penalty: 0.5, frequency_penalty: 0.5, max_tokens: 1024 };
+S.record(st, "code", good, 1);
+let after1 = S.learned_profile(st, "code");
+truthy(after1.temperature > S.profile_for("code").temperature, "one good rating warms it up");
+truthy(after1.temperature < good.temperature, "but only partway (EMA)");
+// alpha=0.3: new = 0.3*good + 0.7*default
+let base = S.profile_for("code").temperature;
+approx(after1.temperature, 0.3 * good.temperature + 0.7 * base, "EMA step alpha=0.3");
+// a BAD rating (0) must NOT drag the profile toward those params
+let before_bad = S.learned_profile(st, "code").temperature;
+S.record(st, "code", map{ temperature: 0.01, top_p: 0.1, top_k: 1, presence_penalty: 0, frequency_penalty: 0, max_tokens: 16 }, 0);
+approx(S.learned_profile(st, "code").temperature, before_bad, "rating 0 does not move the profile");
+// repeated good ratings converge toward the good params
+let k = 0;
+while k < 40 { S.record(st, "code", good, 1); k = k + 1; }
+approx(S.learned_profile(st, "code").temperature, good.temperature, "converges to good temp");
+
+// tune_learned: end-to-end tune that uses the learned profile for the classified context
+let tl = S.tune_learned(st, "refactor this function");
+eq(tl.context, "code", "tune_learned classifies");
+approx(tl.params.temperature, good.temperature, "tune_learned uses learned profile");
+
+print "sampling_tune_pass";

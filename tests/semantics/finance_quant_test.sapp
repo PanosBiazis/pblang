@@ -1,0 +1,117 @@
+// tests/semantics/finance_quant_test.sapp
+//
+// NEW Finance/Quant category, harvested from the ibkr trading project:
+//   indicators.sapp — SMA/EMA/RSI(Wilder)/MACD/Bollinger/ATR/crossovers
+//   risk_gate.sapp  — the pure deterministic risk cage (policy vs mechanism)
+//   backtest.sapp   — signals -> equity curve, drawdown, sharpe, win rate
+// All expected values below are hand-computed.
+
+let IND = import("stdlib/indicators.sapp");
+let RG = import("stdlib/risk_gate.sapp");
+let BT = import("stdlib/backtest.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=[" + str(a) + "] want=[" + str(b) + "]"); } }
+fn truthy(c, m) { if c != true { fail(m); } }
+fn approx(a, b, m) { let d = a - b; if d < 0 { d = 0 - d; } if d > 0.01 { fail(m + " got=" + str(a) + " want~" + str(b)); } }
+
+// ── indicators (extending the existing module: new exports only) ─────────────
+let s = IND.sma([1, 2, 3, 4, 5], 3);
+eq(len(s), 3, "sma window count");
+eq(s[0], 2, "sma[0]"); eq(s[2], 4, "sma[2]");
+
+// ema_period seeds with the SMA of the first period, k = 2/(p+1)
+let e = IND.ema_period([2, 4, 6, 8], 3);
+eq(len(e), 2, "ema_period length n-p+1");
+eq(e[0], 4, "ema_period seed = sma of first p");
+eq(e[1], 6, "ema_period step: 8*0.5 + 4*0.5");
+
+// rsi_wilder: Wilder smoothing, period 3 over [1,2,3,4,3,4]
+let r = IND.rsi_wilder([1, 2, 3, 4, 3, 4], 3);
+eq(len(r), 3, "rsi_wilder count = n-p");
+approx(r[0], 100.0, "all-gain window is RSI 100");
+approx(r[1], 66.667, "rsi after one loss");
+approx(r[2], 77.778, "rsi recovers on next gain");
+
+// existing macd/bollinger_bands APIs still behave (constant series -> zero/midline)
+let m = IND.macd([5, 5, 5, 5, 5, 5, 5, 5], 2, 4, 3);
+approx(m.macd_line[0], 0.0, "constant series: macd 0");
+approx(m.histogram[len(m.histogram) - 1], 0.0, "constant series: histogram 0");
+let b = IND.bollinger_bands([7, 7, 7, 7], 3, 2);
+approx(b.middle[0], 7.0, "bb mid");
+approx(b.upper[0], 7.0, "bb upper = mid when std 0");
+approx(b.lower[0], 7.0, "bb lower = mid when std 0");
+
+// atr: constant true range 2 stays 2 under Wilder smoothing
+let bars = [map{ h: 10, l: 8, c: 9 }, map{ h: 11, l: 9, c: 10 }, map{ h: 12, l: 10, c: 11 }];
+let a = IND.atr(bars, 2);
+eq(len(a), 2, "atr count");
+approx(a[0], 2.0, "atr[0]"); approx(a[1], 2.0, "atr[1]");
+
+// crossovers: fast crosses above slow at index 2
+let x = IND.cross_over([1, 2, 3], [2, 2, 2]);
+eq(len(x), 1, "one golden cross"); eq(x[0], 2, "cross index");
+eq(len(IND.cross_under([3, 2, 1], [2, 2, 2])), 1, "one death cross");
+
+// ── risk gate (the cage: first violated rule wins, SELL-to-close always allowed) ──
+let cfg = map{ is_live: false, whitelist: ["AAA", "BBB"], daily_loss_limit_pct: 0.05,
+               budget: 1000, cash_buffer_pct: 0.1, max_position_pct: 0.25 };
+let calm = map{ cash: 500, positions: map{ AAA: 10 }, day_open_equity: 1000,
+                current_equity: 1000, kill_switch: false };
+
+fn order(sym, side, qty, cost) { return map{ symbol: sym, side: side, quantity: qty, est_cost: cost, est_proceeds: 0 }; }
+
+// live guard outranks everything
+let live_cfg = map{ is_live: true, whitelist: ["AAA"], daily_loss_limit_pct: 0.05,
+                    budget: 1000, cash_buffer_pct: 0.1, max_position_pct: 0.25 };
+eq(RG.check(order("AAA", "BUY", 1, 10), calm, live_cfg, false).rule, "live_guard", "live unarmed refuses all");
+truthy(RG.check(order("AAA", "BUY", 1, 10), calm, live_cfg, true).allow, "live + confirmed passes the guard");
+
+eq(RG.check(order("ZZZ", "BUY", 1, 10), calm, cfg, false).rule, "whitelist", "non-whitelisted denied");
+eq(RG.check(order("AAA", "HOLD", 1, 10), calm, cfg, false).rule, "side", "unknown side denied");
+eq(RG.check(order("AAA", "BUY", 2.5, 10), calm, cfg, false).rule, "fractional", "fractional shares denied");
+eq(RG.check(order("AAA", "BUY", 0, 10), calm, cfg, false).rule, "quantity", "non-positive qty denied");
+eq(RG.check(order("AAA", "SELL", 11, 0), calm, cfg, false).rule, "no_short", "selling more than held denied");
+truthy(RG.check(order("AAA", "SELL", 10, 0), calm, cfg, false).allow, "sell within held allowed");
+
+// the kill switch blocks new BUYs but never blocks closing a position
+let killed = map{ cash: 500, positions: map{ AAA: 10 }, day_open_equity: 1000,
+                  current_equity: 1000, kill_switch: true };
+eq(RG.check(order("AAA", "BUY", 1, 10), killed, cfg, false).rule, "daily_loss_limit", "kill switch blocks buys");
+truthy(RG.check(order("AAA", "SELL", 5, 0), killed, cfg, false).allow, "kill switch still lets you exit");
+
+// drawdown breach: down 6% vs 5% limit
+let bleeding = map{ cash: 500, positions: map{}, day_open_equity: 1000,
+                    current_equity: 940, kill_switch: false };
+approx(RG.daily_drawdown(bleeding), -0.06, "signed drawdown");
+eq(RG.check(order("AAA", "BUY", 1, 10), bleeding, cfg, false).rule, "daily_loss_limit", "drawdown blocks buys");
+
+eq(RG.check(order("AAA", "BUY", 1, 300), calm, cfg, false).rule, "max_position", "oversized order denied (250 max)");
+// cash 500, buffer 100 -> investable 400; a 240 order fits max_position (250) but breaks the buffer at low cash
+let low_cash = map{ cash: 300, positions: map{}, day_open_equity: 1000, current_equity: 1000, kill_switch: false };
+eq(RG.check(order("AAA", "BUY", 1, 240), low_cash, cfg, false).rule, "buffer", "cash buffer preserved");
+truthy(RG.check(order("AAA", "BUY", 1, 240), calm, cfg, false).allow, "buy within all limits allowed");
+
+// position sizing: whole shares that fit the per-position cap
+eq(RG.size_for(1000, 40, 0.25), 6, "floor(250/40) = 6 shares");
+eq(RG.size_for(1000, 3000, 0.25), 0, "unaffordable -> 0");
+
+// ── backtest ───────────────────────────────────────────────────────────────────
+// long at [10->11->12], flat afterwards: equity compounds to 1.2 then drifts down with the 12->11 bar held? No —
+// signal 0 at i=2 means flat over 12->11, so equity ends at 1.2.
+let bt = BT.run([10, 11, 12, 11, 13], [1, 1, 0, 0, 0]);
+approx(bt.equity[0], 1.1, "step 1: +10%");
+approx(bt.equity[1], 1.2, "step 2: 12/11 compounding");
+approx(bt.equity[3], 1.2, "flat steps hold equity");
+approx(bt.total_return, 0.2, "total return");
+eq(bt.trades, 1, "one round trip");
+approx(bt.win_rate, 1.0, "the round trip won");
+approx(bt.max_drawdown, 0.0, "no drawdown when flat through the dip");
+
+// riding through the dip: long the whole way
+let bt2 = BT.run([10, 11, 12, 11, 13], [1, 1, 1, 1, 1]);
+approx(bt2.max_drawdown, 0.0833, "peak 1.2 -> trough 1.1");
+approx(bt2.total_return, 0.3, "13/10 - 1");
+truthy(bt2.sharpe > 0, "positive sharpe on a winning run");
+
+print "finance_quant_pass";

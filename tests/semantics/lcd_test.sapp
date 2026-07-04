@@ -1,0 +1,85 @@
+// tests/semantics/lcd_test.sapp
+//
+// stdlib/lcd.sapp — HD44780 (Arduino "LiquidCrystal") character-LCD driver in
+// pure pblang, layered the codegen way:
+//   1. PURE op plans:   init_ops / write_ops / cursor_ops / clear_ops -> [{rs, byte}]
+//   2. PURE lowering:   to_gpio_steps(ops, pins) -> [{pin, value}] 4-bit protocol
+//   3. executor:        run(gpio_handle, steps) — replays over stdlib/gpio.sapp
+// So the whole protocol is unit-testable with the fake gpio backend; only the
+// final `run` touches hardware. Expected sequences below are hand-computed.
+
+let LCD = import("stdlib/lcd.sapp");
+let GP = import("stdlib/gpio.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=[" + str(a) + "] want=[" + str(b) + "]"); } }
+fn truthy(c, m) { if c != true { fail(m); } }
+
+// ── op plans (rs=0 command, rs=1 data) ─────────────────────────────────────────
+let w = LCD.write_ops("A!");
+eq(len(w), 2, "one op per char");
+eq(w[0].rs, 1, "chars are data ops");
+eq(w[0].byte, 65, "'A' = 65");
+eq(w[1].byte, 33, "'!' = 33");
+
+let init = LCD.init_ops();
+truthy(len(init) >= 4, "init has the standard sequence");
+// must contain: function set 4-bit/2-line 0x28, display on 0x0C, entry mode 0x06, clear 0x01
+fn has_cmd(ops, b) {
+    let i = 0;
+    while i < len(ops) { if ops[i].rs == 0 and ops[i].byte == b { return true; } i = i + 1; }
+    return false;
+}
+truthy(has_cmd(init, 40), "function set 0x28");
+truthy(has_cmd(init, 12), "display on 0x0C");
+truthy(has_cmd(init, 6), "entry mode 0x06");
+truthy(has_cmd(init, 1), "clear 0x01");
+
+eq(LCD.cursor_ops(1, 3)[0].byte, 195, "row 1 col 3 -> 0x80|0x40|3");
+eq(LCD.cursor_ops(0, 0)[0].byte, 128, "home address");
+eq(LCD.clear_ops()[0].byte, 1, "clear command");
+eq(try LCD.cursor_ops(4, 0) catch "bad", "bad", "row out of range refused");
+
+// ── 4-bit lowering: one byte = rs, hi nibble on d4..d7, E pulse, lo nibble, E pulse ──
+let pins = map{ rs: 25, e: 24, d4: 23, d5: 17, d6: 27, d7: 22 };
+let steps = LCD.to_gpio_steps([map{ rs: 1, byte: 65 }], pins);
+eq(len(steps), 13, "13 pin writes per byte");
+eq(steps[0].pin, 25, "rs first"); eq(steps[0].value, 1, "rs=1 for data");
+// 'A' = 0x41: hi nibble 0100 -> d4=0 d5=0 d6=1 d7=0
+eq(steps[1].value, 0, "hi d4"); eq(steps[2].value, 0, "hi d5");
+eq(steps[3].value, 1, "hi d6"); eq(steps[4].value, 0, "hi d7");
+eq(steps[5].pin, 24, "enable pulse high"); eq(steps[5].value, 1, "E=1");
+eq(steps[6].value, 0, "E=0 latches the nibble");
+// lo nibble 0001 -> d4=1 d5=0 d6=0 d7=0
+eq(steps[7].value, 1, "lo d4"); eq(steps[8].value, 0, "lo d5");
+eq(steps[9].value, 0, "lo d6"); eq(steps[10].value, 0, "lo d7");
+eq(steps[11].value, 1, "second E=1"); eq(steps[12].value, 0, "second E=0");
+
+// ── executor over the injectable gpio backend ──────────────────────────────────
+let store = map{};
+let writes = [];
+let be = map{
+    read: fn(p) { if map_has(store, p) { return store[p]; } throw "no " + p; },
+    write: fn(p, t) { store[p] = t; push(writes, p); return nil; },
+};
+let g = GP.new(be);
+LCD.run(g, steps);
+eq(len(writes), 13, "every step executed");
+// after the full byte the LOW nibble (0001) is what remains on the data pins
+eq(store["/sys/class/gpio/gpio23/value"], "1", "d4 ends at lo-nibble bit 0");
+eq(store["/sys/class/gpio/gpio27/value"], "0", "d6 ends low (hi nibble was already latched)");
+eq(store["/sys/class/gpio/gpio24/value"], "0", "enable left low");
+eq(store["/sys/class/gpio/gpio25/value"], "1", "rs still in data mode");
+
+// hello-world convenience: init + text in one plan
+let hello = LCD.print_plan("Hi", pins);
+truthy(len(hello) > 13 * 2, "print_plan includes init + 2 chars");
+
+// ── gpio enrichment: pure PWM plan (software PWM schedule) ─────────────────────
+let pwm = GP.pwm_plan(18, 25, 20, 2);
+eq(len(pwm), 4, "2 cycles = 4 steps");
+eq(pwm[0].value, 1, "on first"); eq(pwm[0].ms, 5, "25% of 20ms on");
+eq(pwm[1].value, 0, "then off"); eq(pwm[1].ms, 15, "75% of 20ms off");
+eq(try GP.pwm_plan(18, 150, 20, 1) catch "bad", "bad", "duty > 100 refused");
+
+print "lcd_pass";
