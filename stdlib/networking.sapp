@@ -8,6 +8,10 @@
 //   let resp = net.request("GET", "https://api.example.com/data").send();
 //   let ws = net.websocket_connect("wss://echo.example.com");
 
+// Canonical RFC 6455 framing + client handshake live in stdlib:websocket.sapp;
+// this module wires them onto real tcp/tls sockets (was a broken re-impl).
+let _WS = import("stdlib:websocket.sapp");
+
 
 // ─── HTTP Request Builder (fluent API) ────────────────────────────────────
 
@@ -119,40 +123,54 @@ fn del(url) {
 
 // ─── WebSocket Client ──────────────────────────────────────────────────────
 
-fn websocket_connect(url) {
-    // Placeholder: real WebSocket requires upgrade handshake
-    // This uses raw TCP for basic framing demonstration
+// websocket_connect(url, extra_headers?) — open a real RFC 6455 client
+// connection: TLS for wss://, a RANDOM Sec-WebSocket-Key, and STRICT
+// verification of the server's Sec-WebSocket-Accept (a mismatch or non-101
+// aborts). Returns { connection, connected, host, _buffer } or { error }.
+// ws_endpoint(url) — resolve a ws:// or wss:// URL into the connection facts:
+// { host, port, secure, path }. Port defaults by scheme (ws=80, wss=443)
+// unless the URL gives one; path defaults to "/" and carries the query string.
+fn ws_endpoint(url) {
     let parsed = url_parse(url);
-    let host = parsed.host;
-    let port = 80;
+    let secure = parsed.scheme == "wss";
+    let port = try parsed.port catch nil;
+    if port == nil { if secure { port = 443; } else { port = 80; } }
+    let path = parsed.path;
+    if path == nil or path == "" { path = "/"; }
+    if (try parsed.query catch "") != "" { path = path + "?" + parsed.query; }
+    return map{ host: parsed.host, port: port, secure: secure, path: path };
+}
 
-    if parsed.scheme == "wss" { port = 443; }
+fn websocket_connect(url, extra_headers = nil) {
+    let ep = ws_endpoint(url);
+    let host = ep.host;
+    let secure = ep.secure;
+    let port = ep.port;
+    let path = ep.path;
 
-    let conn = try tcp_connect(host + ":" + str(port)) catch nil;
+    let conn = nil;
+    if secure {
+        conn = try tcp_connect_tls(host, port) catch nil;
+    } else {
+        conn = try tcp_connect(host + ":" + str(port)) catch nil;
+    }
     if conn == nil {
         return map{ error: "WebSocket: cannot connect to " + host + ":" + str(port) };
     }
 
-    // Send upgrade request
-    let key = "dGhlIHNhbXBsZSBub25jZQ==";
-    let req_str = "GET " + parsed.path + " HTTP/1.1\r\n" +
-        "Host: " + host + "\r\n" +
-        "Upgrade: websocket\r\n" +
-        "Connection: Upgrade\r\n" +
-        "Sec-WebSocket-Key: " + key + "\r\n" +
-        "Sec-WebSocket-Version: 13\r\n\r\n";
-
+    let key = _WS.client_key();
+    let req_str = _WS.client_handshake_request(host, path, key, extra_headers);
     tcp_write(conn, req_str);
 
-    // Read handshake response (simple)
-    let response = tcp_read_until(conn, "\r\n\r\n", 4096);
+    // Read the handshake response up to the blank line.
+    let response = try tcp_read_until(conn, "\r\n\r\n", 8192) catch nil;
     if response == nil or len(response) == 0 {
         tcp_close(conn);
-        return map{ error: "WebSocket: handshake failed" };
+        return map{ error: "WebSocket: handshake failed (no response)" };
     }
-    if not str_contains(response, "101") {
+    if not _WS.verify_handshake(response, key) {
         tcp_close(conn);
-        return map{ error: "WebSocket: upgrade rejected", response: response };
+        return map{ error: "WebSocket: upgrade rejected or accept mismatch", response: response };
     }
 
     return map{
@@ -163,24 +181,64 @@ fn websocket_connect(url) {
     };
 }
 
-fn websocket_send(ws, message) {
-    // Simple text frame: FIN=1, opcode=1 (text) — real framing not implemented;
-    // We store raw bytes via tcp_write; simplified framing
+// _ws_write(ws, frame_bytes) — mask+send an already-built frame (Array<u8>).
+fn _ws_write(ws, frame_bytes) {
     let conn = ws.connection;
     if conn == nil { return false; }
-    // For simplicity, send raw text (real impl would frame)
-    return tcp_write(conn, message);
+    return tcp_write(conn, bytes_to_str(frame_bytes));
 }
 
+// websocket_send(ws, message) — send a masked TEXT frame (RFC 6455 requires
+// client→server frames to be masked; the old raw tcp_write was protocol-illegal).
+fn websocket_send(ws, message) {
+    return _ws_write(ws, _WS.write_text(message));
+}
+
+// websocket_send_binary(ws, bytes) — send a masked BINARY frame.
+fn websocket_send_binary(ws, bytes) {
+    return _ws_write(ws, _WS.write_binary(bytes));
+}
+
+// websocket_ping(ws, payload?) / websocket_pong(ws, payload?) — control frames.
+fn websocket_ping(ws, payload = "") { return _ws_write(ws, _WS.ping(payload)); }
+fn websocket_pong(ws, payload = "") { return _ws_write(ws, _WS.pong(payload)); }
+
+// websocket_recv(ws) — read available bytes, parse whole frames from the
+// carry-over buffer, auto-answer pings with a pong, and return the first
+// decoded data message as text (nil if none complete yet). Close frames set
+// ws.connected = false and return { close: true, code, reason }.
 fn websocket_recv(ws) {
     let conn = ws.connection;
     if conn == nil { return nil; }
-    let data = tcp_read(conn, 65536);
-    return data;
+    let chunk = try tcp_read(conn, 65536) catch nil;
+    if chunk != nil and len(chunk) > 0 {
+        ws._buffer = ws._buffer + chunk;
+    }
+    if ws._buffer == nil or len(ws._buffer) == 0 { return nil; }
+
+    let data = str_to_bytes(ws._buffer);
+    let dec = _WS.stream_decode(data);
+
+    // Keep the unparsed tail buffered for the next read.
+    ws._buffer = bytes_to_str(slice(data, dec.consumed, len(data)));
+
+    // Answer any pings we saw (RFC 6455 keep-alive) before returning the message.
+    let pi = 0;
+    while pi < len(dec.pings) { _ws_write(ws, _WS.pong(dec.pings[pi])); pi = pi + 1; }
+
+    if dec.close != nil {
+        ws.connected = false;
+        return map{ close: true, code: dec.close.code, reason: dec.close.reason };
+    }
+    if dec.is_binary { return dec.binary; }
+    return dec.message;   // text message, or nil if none is complete yet
 }
 
-fn websocket_close(ws) {
+// websocket_close(ws, code?, reason?) — send a masked close frame, then close
+// the socket. Best-effort: a send failure still tears the socket down.
+fn websocket_close(ws, code = 1000, reason = "") {
     if ws.connected == true {
+        try _ws_write(ws, _WS.close(code, reason)) catch nil;
         tcp_close(ws.connection);
         ws.connected = false;
     }
@@ -343,7 +401,8 @@ fn rate_limited_call(fn_val, max_calls_per_sec) {
 export new_request, request_set_header, request_set_body, request_set_timeout,
        request_set_auth_bearer, request_set_content_json, request_set_content_form,
        request_send, get, post, post_json, put, del,
-       websocket_connect, websocket_send, websocket_recv, websocket_close,
+       ws_endpoint, websocket_connect, websocket_send, websocket_send_binary,
+       websocket_ping, websocket_pong, websocket_recv, websocket_close,
        fetch_paginated, resource, resource_get, resource_create,
        resource_update, resource_delete,
        ping_host, check_port, scan_ports,

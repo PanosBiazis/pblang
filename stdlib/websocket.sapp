@@ -28,6 +28,122 @@ fn upgrade_response(key) {
     return "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
 }
 
+// request_key(request) — the client's Sec-WebSocket-Key from a raw GET upgrade
+// request (case-insensitive header), or nil if absent. Feed it to
+// upgrade_response / server_accept.
+fn request_key(request) {
+    return _header_value(request, "Sec-WebSocket-Key");
+}
+
+// is_upgrade_request(request) — true only for a well-formed RFC 6455 upgrade:
+// an Upgrade: websocket header, a Connection header naming Upgrade, and a key.
+// Tokens are matched case-insensitively (RFC 7230 §3.2).
+fn is_upgrade_request(request) {
+    let up = _header_value(request, "Upgrade");
+    if up == nil or str_lower(up) != "websocket" { return false; }
+    let conn = _header_value(request, "Connection");
+    if conn == nil or not str_contains(str_lower(conn), "upgrade") { return false; }
+    return request_key(request) != nil;
+}
+
+// server_accept(request) — the full 101 handshake response for a client
+// request, with the Sec-WebSocket-Accept derived from its key. Returns nil if
+// the request is not a valid websocket upgrade (the server should 400/close).
+fn server_accept(request) {
+    if not is_upgrade_request(request) { return nil; }
+    return upgrade_response(request_key(request));
+}
+
+// ── Client-side opening handshake (RFC 6455 §4.1) ────────────────────────────
+
+// client_key() — a fresh Sec-WebSocket-Key: 16 random bytes, base64-encoded.
+// The nonce MUST be random per connection (a fixed key lets a cache/proxy
+// replay an old 101 response), which is exactly what the old networking.sapp
+// client got wrong with its hardcoded sample key.
+fn client_key() {
+    return base64_encode_bytes(random_bytes(16));
+}
+
+// client_accept_for(key) — the Sec-WebSocket-Accept the server MUST return for
+// `key` (base64(SHA1(key + GUID))). The client compares this to the response.
+fn client_accept_for(key) {
+    return websocket_accept_key(key);
+}
+
+// client_handshake_request(host, path, key, extra_headers?) — the GET upgrade
+// request a client sends. `extra_headers` is an optional map of name->value
+// (e.g. Origin, Sec-WebSocket-Protocol). Header names/values are single-line;
+// CR/LF in them is stripped to prevent request-splitting injection.
+fn _sanitize_header(v) {
+    let s = str(v);
+    s = str_replace_all(s, "\r", "");
+    s = str_replace_all(s, "\n", "");
+    return s;
+}
+fn client_handshake_request(host, path, key, extra_headers = nil) {
+    let p = str(path);
+    if p == "" { p = "/"; }
+    let req = "GET " + _sanitize_header(p) + " HTTP/1.1\r\n"
+        + "Host: " + _sanitize_header(host) + "\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Sec-WebSocket-Key: " + _sanitize_header(key) + "\r\n"
+        + "Sec-WebSocket-Version: 13\r\n";
+    if extra_headers != nil {
+        let ks = map_keys(extra_headers);
+        let i = 0;
+        while i < len(ks) {
+            req = req + _sanitize_header(ks[i]) + ": " + _sanitize_header(extra_headers[ks[i]]) + "\r\n";
+            i = i + 1;
+        }
+    }
+    return req + "\r\n";
+}
+
+// handshake_status(response) — the numeric HTTP status of a handshake response
+// ("HTTP/1.1 101 Switching Protocols" -> 101), or 0 if unparseable.
+fn handshake_status(response) {
+    let line_end = str_index_of(response, "\r\n");
+    let first = response;
+    if line_end >= 0 { first = str_slice(response, 0, line_end); }
+    let parts = str_split(first, " ");
+    if len(parts) < 2 { return 0; }
+    return try parse_number(parts[1]) catch 0;
+}
+
+// _header_value(response, name) — case-insensitive header lookup over the
+// response head (up to the blank line), or nil if absent.
+fn _header_value(response, name) {
+    let target = str_lower(str(name));
+    let head_end = str_index_of(response, "\r\n\r\n");
+    let head = response;
+    if head_end >= 0 { head = str_slice(response, 0, head_end); }
+    let lines = str_split(head, "\r\n");
+    let i = 1;   // skip the status line
+    while i < len(lines) {
+        let line = lines[i];
+        let colon = str_index_of(line, ":");
+        if colon > 0 {
+            let k = str_lower(str_trim(str_slice(line, 0, colon)));
+            if k == target {
+                return str_trim(str_slice(line, colon + 1, len(line)));
+            }
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// verify_handshake(response, key) — true only when the server returned 101 AND
+// Sec-WebSocket-Accept exactly matches the value derived from our key. Anything
+// else (wrong accept, non-101, missing header) is a rejected/hostile peer.
+fn verify_handshake(response, key) {
+    if handshake_status(response) != 101 { return false; }
+    let accept = _header_value(response, "Sec-WebSocket-Accept");
+    if accept == nil { return false; }
+    return accept == client_accept_for(key);
+}
+
 // Append every byte of `src` (Array<u8>) onto `dst` (Array<u8>) in place.
 fn _append_bytes(dst, src) {
     let i = 0;
@@ -162,6 +278,13 @@ fn parse_frame(data) {
     return _parse_frame_at(data, 0);
 }
 
+// parse_frame_at(data, idx) — public single-frame parse at a byte offset, for
+// incremental stream parsing (a streaming client keeps a byte buffer and calls
+// this at the running offset, stopping when it returns { error } = incomplete).
+fn parse_frame_at(data, idx) {
+    return _parse_frame_at(data, idx);
+}
+
 fn parse_frames(data) {
     let frames = [];
     let idx = 0;
@@ -280,6 +403,105 @@ fn close(code, reason) {
     return _write_frame_bytes(8, bytes);
 }
 
+// ── Server-direction frames (RFC 6455 §5.1: server→client MUST NOT mask) ─────
+// The masked write_* helpers above are for the CLIENT direction; a pblang
+// WebSocket server sends these unmasked frames instead.
+fn _frame_unmasked(opcode, bytes, fin) {
+    let plen = len(bytes);
+    let out = [];
+    let b0 = opcode;
+    if fin { b0 = 128 + opcode; }
+    array_push(out, b0);
+    if plen <= 125 {
+        array_push(out, plen);                 // MASK bit clear
+    } else if plen <= 65535 {
+        array_push(out, 126);
+        _append_bytes(out, _u16be(plen));
+    } else {
+        array_push(out, 127);
+        _append_bytes(out, _u64be(plen));
+    }
+    _append_bytes(out, bytes);
+    return out;
+}
+
+// server_frame(opcode, payload) → an unmasked, FIN=1 frame (Array<u8>).
+fn server_frame(opcode, payload) { return _frame_unmasked(opcode, str_to_bytes(payload), true); }
+// server_frame_frag(opcode, payload, fin) → unmasked frame with explicit FIN
+// (for emitting fragmented server messages).
+fn server_frame_frag(opcode, payload, fin) { return _frame_unmasked(opcode, str_to_bytes(payload), fin); }
+// server_text/binary/ping/pong — unmasked convenience builders.
+fn server_text(s) { return _frame_unmasked(1, str_to_bytes(s), true); }
+fn server_binary(bytes) { return _frame_unmasked(2, bytes, true); }
+fn server_ping(payload) { return _frame_unmasked(9, str_to_bytes(try payload catch ""), true); }
+fn server_pong(payload) { return _frame_unmasked(10, str_to_bytes(try payload catch ""), true); }
+// server_close(code, reason) → an unmasked close frame.
+fn server_close(code, reason) {
+    let bytes = _u16be(code);
+    _append_bytes(bytes, str_to_bytes(try reason catch ""));
+    return _frame_unmasked(8, bytes, true);
+}
+
+// ── Streaming decoder ────────────────────────────────────────────────────────
+fn _decode_data(op, bytes) {
+    if op == 2 {
+        return map{ message: nil, binary: bytes, is_binary: true };
+    }
+    return map{ message: try bytes_to_str(bytes) catch "", binary: nil, is_binary: false };
+}
+
+// stream_decode(data) — pull one complete data message out of a byte buffer,
+// reassembling fragments (FIN), collecting interleaved ping payloads to answer,
+// and surfacing a close frame. Returns:
+//   { message, binary, is_binary, close: {code,reason}|nil, pings: [..],
+//     consumed: <bytes fully processed> }
+// `consumed` lets a streaming client drop what was parsed and keep the trailing
+// partial frame buffered until more bytes arrive.
+fn stream_decode(data) {
+    let started = false;
+    let msg_opcode = 0;
+    let msg_bytes = [];
+    let pings = [];
+    let consumed = 0;
+    let i = 0;
+    let n = len(data);
+    while i < n {
+        let f = _parse_frame_at(data, i);
+        if type(f) == "map" and map_has(f, "error") { break; }   // incomplete — stop
+        let op = f.opcode;
+        let next = f.next_index;
+        if op == 9 {                                  // ping
+            array_push(pings, f.payload);
+            consumed = next; i = next;
+        } else if op == 10 {                          // pong — nothing to do
+            consumed = next; i = next;
+        } else if op == 8 {                           // close
+            return map{ message: nil, binary: nil, is_binary: false,
+                        close: decode_close(f.payload_bytes), pings: pings, consumed: next };
+        } else if op == 1 or op == 2 {                // data (start)
+            if f.fin == 1 {
+                let out = _decode_data(op, f.payload_bytes);
+                out.close = nil; out.pings = pings; out.consumed = next;
+                return out;
+            }
+            started = true; msg_opcode = op; msg_bytes = f.payload_bytes;
+            consumed = next; i = next;
+        } else if op == 0 {                           // continuation
+            if not started { break; }                 // stray continuation — stop
+            _append_bytes(msg_bytes, f.payload_bytes);
+            if f.fin == 1 {
+                let out = _decode_data(msg_opcode, msg_bytes);
+                out.close = nil; out.pings = pings; out.consumed = next;
+                return out;
+            }
+            consumed = next; i = next;
+        } else {
+            consumed = next; i = next;                // unknown opcode — skip
+        }
+    }
+    return map{ message: nil, binary: nil, is_binary: false, close: nil, pings: pings, consumed: consumed };
+}
+
 // decode_close(payload_bytes) → { code, reason } from a close-frame payload.
 fn decode_close(payload_bytes) {
     if payload_bytes == nil or len(payload_bytes) < 2 {
@@ -295,3 +517,9 @@ fn decode_close(payload_bytes) {
 export upgrade_response, parse_frame, parse_frames, reassemble_fragments, parse_message,
        write_frame, write_text, write_binary, ping, pong, close, decode_close,
        set_max_payload, get_max_payload;
+export client_key, client_accept_for, client_handshake_request,
+       handshake_status, verify_handshake;
+export request_key, is_upgrade_request, server_accept;
+export parse_frame_at, stream_decode;
+export server_frame, server_frame_frag, server_text, server_binary,
+       server_ping, server_pong, server_close;
