@@ -17,6 +17,18 @@
 
 All three are written in pblang (per the rust→pblang directive).
 
+### WebSocket (RFC 6455) — full client **and** server
+
+`stdlib/websocket.sapp` is a complete, self-hosted RFC 6455 implementation; the VM
+provides only the primitive `websocket_accept_key`/`parse_frame`/`write_frame` builtins.
+
+- **Client handshake**: `client_key()` (random 16-byte nonce), `client_handshake_request(host, path, key, extra?)` (CRLF-sanitised to prevent request-splitting), and `verify_handshake(response, key)` — **strict**: it rejects any non-101 status or an `Sec-WebSocket-Accept` that doesn't match the key. `stdlib/networking.sapp` wires these onto real sockets: `wss://` uses `tcp_connect_tls`, client→server frames are **masked** (protocol-mandatory), and `websocket_recv` streams frames.
+- **Server handshake**: `request_key(request)`, `is_upgrade_request(request)`, and `server_accept(request)` (returns the 101 response or `nil` for a non-upgrade). Server→client frames are built **unmasked** (`server_text`/`server_binary`/`server_ping`/`server_close`) per RFC 6455 §5.1.
+- **Streaming decode**: `stream_decode(buffer_bytes)` pulls one complete data message out of a carry-over byte buffer — reassembling FIN-fragmented messages, capturing interleaved pings to pong back, surfacing close frames, and reporting `consumed` so the partial trailing frame stays buffered. A configurable `set_max_payload` guards against memory-exhaustion frames.
+
+This replaced a broken re-implementation in `networking.sapp` (hardcoded key, **no**
+accept verification, and **unframed raw text** on the wire).
+
 ## IDE / Studio protocol consumers
 
 The protocol work is not separate from the IDE. pblang Studio has several places where
