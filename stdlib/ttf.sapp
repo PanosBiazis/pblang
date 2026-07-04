@@ -1,0 +1,339 @@
+// stdlib/ttf.sapp — TrueType decode core (sfnt directory + 'glyf' simple-glyph outlines).
+//
+// Turns TrueType font bytes into glyph OUTLINES (contours of points) that glyph_raster
+// rasterizes into the atlas, completing the pblang GPU text path: ttf -> outline ->
+// glyph_raster -> glyph_atlas -> gpu2d glyph quad. Operates on a byte array (list of ints
+// 0..255); big-endian throughout, per the spec. Pure + deterministic.
+//
+//   let TTF = import("stdlib/ttf.sapp");
+//   let dir = TTF.read_table_directory(bytes);
+//   let g   = TTF.parse_simple_glyph(bytes, dir.tables["glyf"].offset + glyph_offset);
+//   let bmp = GR.rasterize(g.contours, w, h);
+//
+// Scope: big-endian readers, the table directory, and simple-glyph coordinate decoding
+// (flags + delta-encoded x/y, with the repeat and same/short flags). Composite glyphs and
+// cmap (char -> glyph index) are separate follow-ups; parse_simple_glyph flags composites.
+
+let U = import("stdlib:unicode.sapp");
+
+// validate(bytes) -> { ok, reason }. A cheap up-front sanity check before parsing an
+// untrusted font. (pblang is memory-safe: a bad offset in a parse fn THROWS — catchable —
+// so this is defense-in-depth/UX, not a memory-safety fix. Wrap parse calls in try anyway.)
+fn validate(bytes) {
+    if bytes == nil or len(bytes) < 12 { return map{ ok: false, reason: "too short for an sfnt header" }; }
+    let ver = bytes[0] * 16777216 + bytes[1] * 65536 + bytes[2] * 256 + bytes[3];
+    // 0x00010000 (TrueType), 0x4F54544F "OTTO" (CFF), 0x74727565 "true"
+    if ver != 65536 and ver != 1330926671 and ver != 1953658213 {
+        return map{ ok: false, reason: "unrecognised sfnt version" };
+    }
+    let num = bytes[4] * 256 + bytes[5];
+    if 12 + num * 16 > len(bytes) { return map{ ok: false, reason: "table directory exceeds file length" }; }
+    return map{ ok: true, reason: "ok", num_tables: num };
+}
+
+// ── big-endian primitive readers ────────────────────────────────────────────────────
+fn u8(bytes, i) { return bytes[i]; }
+fn u16(bytes, i) { return bytes[i] * 256 + bytes[i + 1]; }
+fn i16(bytes, i) {
+    let v = u16(bytes, i);
+    if v >= 32768 { return v - 65536; }
+    return v;
+}
+fn u32(bytes, i) {
+    return bytes[i] * 16777216 + bytes[i + 1] * 65536 + bytes[i + 2] * 256 + bytes[i + 3];
+}
+
+fn _tag(bytes, off) {
+    let s = "";
+    let i = 0;
+    while i < 4 { s = s + U.from_codepoint(bytes[off + i]); i = i + 1; }
+    return s;
+}
+
+// read_table_directory(bytes) -> { sfnt_version, num_tables, tables: {tag: {offset,length,checksum}} }.
+fn read_table_directory(bytes) {
+    let ver = u32(bytes, 0);
+    let num = u16(bytes, 4);
+    let tables = map{};
+    let off = 12;
+    let i = 0;
+    while i < num {
+        let tag = _tag(bytes, off);
+        tables[tag] = map{ checksum: u32(bytes, off + 4), offset: u32(bytes, off + 8), length: u32(bytes, off + 12) };
+        off = off + 16;
+        i = i + 1;
+    }
+    return map{ sfnt_version: ver, num_tables: num, tables: tables };
+}
+
+// glyf simple-glyph flag bits
+let ON_CURVE = 1;
+let X_SHORT = 2;
+let Y_SHORT = 4;
+let REPEAT = 8;
+let X_POS = 16;   // when X_SHORT: sign; else: X is same as previous (no bytes)
+let Y_POS = 32;
+
+// parse_simple_glyph(bytes, off) -> { composite, contours:[[{x,y,on_curve}...]...], num_points }.
+fn parse_simple_glyph(bytes, off) {
+    let nc = i16(bytes, off);
+    off = off + 2;
+    if nc < 0 { return map{ composite: true, contours: [], num_points: 0 }; }
+    off = off + 8;   // skip xMin,yMin,xMax,yMax
+    let endPts = [];
+    let i = 0;
+    while i < nc { array_push(endPts, u16(bytes, off)); off = off + 2; i = i + 1; }
+    let numPoints = 0;
+    if nc > 0 { numPoints = endPts[nc - 1] + 1; }
+    let instrLen = u16(bytes, off);
+    off = off + 2 + instrLen;    // skip hinting instructions
+
+    // flags (a REPEAT flag is followed by a count of extra repeats)
+    let flags = [];
+    while len(flags) < numPoints {
+        let f = u8(bytes, off);
+        off = off + 1;
+        array_push(flags, f);
+        if (f & REPEAT) != 0 {
+            let rep = u8(bytes, off);
+            off = off + 1;
+            let r = 0;
+            while r < rep { array_push(flags, f); r = r + 1; }
+        }
+    }
+    // x coordinates (delta-encoded)
+    let xs = [];
+    let x = 0;
+    i = 0;
+    while i < numPoints {
+        let f = flags[i];
+        if (f & X_SHORT) != 0 {
+            let d = u8(bytes, off);
+            off = off + 1;
+            if (f & X_POS) == 0 { d = 0 - d; }
+            x = x + d;
+        } else {
+            if (f & X_POS) == 0 { x = x + i16(bytes, off); off = off + 2; }
+        }
+        array_push(xs, x);
+        i = i + 1;
+    }
+    // y coordinates
+    let ys = [];
+    let y = 0;
+    i = 0;
+    while i < numPoints {
+        let f = flags[i];
+        if (f & Y_SHORT) != 0 {
+            let d = u8(bytes, off);
+            off = off + 1;
+            if (f & Y_POS) == 0 { d = 0 - d; }
+            y = y + d;
+        } else {
+            if (f & Y_POS) == 0 { y = y + i16(bytes, off); off = off + 2; }
+        }
+        array_push(ys, y);
+        i = i + 1;
+    }
+    // slice points into contours by endPtsOfContours
+    let contours = [];
+    let start = 0;
+    let c = 0;
+    while c < nc {
+        let end = endPts[c];
+        let pts = [];
+        let p = start;
+        while p <= end {
+            array_push(pts, map{ x: xs[p], y: ys[p], on_curve: (flags[p] & ON_CURVE) != 0 });
+            p = p + 1;
+        }
+        array_push(contours, pts);
+        start = end + 1;
+        c = c + 1;
+    }
+    return map{ composite: false, contours: contours, num_points: numPoints };
+}
+
+fn _i8(bytes, i) {
+    let v = bytes[i];
+    if v >= 128 { return v - 256; }
+    return v;
+}
+
+// parse_cmap4(bytes, off) — decode a 'cmap' format-4 subtable into a lookup structure.
+fn parse_cmap4(bytes, off) {
+    let sc = u16(bytes, off + 6) / 2;   // segCountX2 / 2
+    let endBase = off + 14;
+    let startBase = endBase + 2 * sc + 2;   // +2 for reservedPad
+    let deltaBase = startBase + 2 * sc;
+    let rangeBase = deltaBase + 2 * sc;
+    let endCode = [];
+    let startCode = [];
+    let idDelta = [];
+    let idRange = [];
+    let i = 0;
+    while i < sc {
+        array_push(endCode, u16(bytes, endBase + 2 * i));
+        array_push(startCode, u16(bytes, startBase + 2 * i));
+        array_push(idDelta, i16(bytes, deltaBase + 2 * i));
+        array_push(idRange, u16(bytes, rangeBase + 2 * i));
+        i = i + 1;
+    }
+    return map{ seg_count: sc, end: endCode, start: startCode, delta: idDelta, range: idRange, range_base: rangeBase, bytes: bytes };
+}
+// cmap_lookup(cmap, charcode) -> glyph index (0 = .notdef / unmapped).
+fn cmap_lookup(cmap, c) {
+    let i = 0;
+    while i < cmap.seg_count {
+        if cmap.end[i] >= c {
+            if cmap.start[i] > c { return 0; }   // in a gap between segments
+            if cmap.range[i] == 0 {
+                let g = (c + cmap.delta[i]) % 65536;
+                if g < 0 { g = g + 65536; }
+                return g;
+            }
+            let addr = cmap.range_base + 2 * i + cmap.range[i] + 2 * (c - cmap.start[i]);
+            let raw = u16(cmap.bytes, addr);
+            if raw == 0 { return 0; }
+            let g2 = (raw + cmap.delta[i]) % 65536;
+            if g2 < 0 { g2 = g2 + 65536; }
+            return g2;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// composite-glyph component flags
+let ARG_WORDS = 1;       // 0x0001 args are 16-bit (else int8); 0x0002 = args are x/y offsets
+let MORE_COMPONENTS = 32;// 0x0020
+let HAVE_SCALE = 8;      // 0x0008
+let HAVE_XY_SCALE = 64;  // 0x0040
+let HAVE_2X2 = 128;      // 0x0080
+
+// parse_composite_glyph(bytes, off) -> { composite:true, components:[{glyph_index,dx,dy,flags}] }.
+fn parse_composite_glyph(bytes, off) {
+    off = off + 2 + 8;   // skip numberOfContours + bbox
+    let comps = [];
+    let more = true;
+    while more {
+        let flags = u16(bytes, off);
+        off = off + 2;
+        let gi = u16(bytes, off);
+        off = off + 2;
+        let dx = 0;
+        let dy = 0;
+        if (flags & ARG_WORDS) != 0 {
+            dx = i16(bytes, off); off = off + 2;
+            dy = i16(bytes, off); off = off + 2;
+        } else {
+            dx = _i8(bytes, off); off = off + 1;
+            dy = _i8(bytes, off); off = off + 1;
+        }
+        if (flags & HAVE_SCALE) != 0 { off = off + 2; }
+        if (flags & HAVE_XY_SCALE) != 0 { off = off + 4; }
+        if (flags & HAVE_2X2) != 0 { off = off + 8; }
+        array_push(comps, map{ glyph_index: gi, dx: dx, dy: dy, flags: flags });
+        if (flags & MORE_COMPONENTS) == 0 { more = false; }
+    }
+    return map{ composite: true, components: comps };
+}
+
+// parse_glyph(bytes, off) — route to simple or composite by the contour-count sign.
+fn parse_glyph(bytes, off) {
+    if i16(bytes, off) < 0 { return parse_composite_glyph(bytes, off); }
+    return parse_simple_glyph(bytes, off);
+}
+
+// ── metrics + layout tables ─────────────────────────────────────────────────────────
+// parse_head(bytes, off) -> { units_per_em, index_to_loc_format }.
+fn parse_head(bytes, off) {
+    return map{ units_per_em: u16(bytes, off + 18), index_to_loc_format: i16(bytes, off + 50) };
+}
+// parse_loca(bytes, off, num_glyphs, long) -> numGlyphs+1 glyph byte offsets (into glyf).
+fn parse_loca(bytes, off, num_glyphs, long) {
+    let out = [];
+    let n = num_glyphs + 1;
+    let i = 0;
+    while i < n {
+        if long == true { array_push(out, u32(bytes, off + 4 * i)); }
+        else { array_push(out, u16(bytes, off + 2 * i) * 2); }
+        i = i + 1;
+    }
+    return out;
+}
+// parse_hmtx(bytes, off, num_hmetrics, num_glyphs) -> [{advance_width, lsb}] per glyph.
+fn parse_hmtx(bytes, off, num_hmetrics, num_glyphs) {
+    let out = [];
+    let last = 0;
+    let i = 0;
+    while i < num_glyphs {
+        if i < num_hmetrics {
+            last = u16(bytes, off + 4 * i);
+            array_push(out, map{ advance_width: last, lsb: i16(bytes, off + 4 * i + 2) });
+        } else {
+            let base = off + 4 * num_hmetrics + 2 * (i - num_hmetrics);
+            array_push(out, map{ advance_width: last, lsb: i16(bytes, base) });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+// find_cmap4(bytes, cmap_off) -> the byte offset of a format-4 subtable, or -1.
+fn find_cmap4(bytes, cmap_off) {
+    let num = u16(bytes, cmap_off + 2);
+    let i = 0;
+    while i < num {
+        let rec = cmap_off + 4 + i * 8;
+        let sub = cmap_off + u32(bytes, rec + 4);
+        if u16(bytes, sub) == 4 { return sub; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _table(dir, tag) {
+    if not map_has(dir.tables, tag) { throw "ttf: missing required table '" + tag + "'"; }
+    return dir.tables[tag];
+}
+
+// load_font(bytes) -> a font object tying cmap + glyf + loca + hmtx together.
+fn load_font(bytes) {
+    let v = validate(bytes);
+    if not v.ok { throw "ttf: invalid font (" + v.reason + ")"; }
+    let dir = read_table_directory(bytes);
+    let head = parse_head(bytes, _table(dir, "head").offset);
+    let num_glyphs = u16(bytes, _table(dir, "maxp").offset + 4);
+    let loca = parse_loca(bytes, _table(dir, "loca").offset, num_glyphs, head.index_to_loc_format == 1);
+    let num_hmetrics = u16(bytes, _table(dir, "hhea").offset + 34);
+    let hmtx = parse_hmtx(bytes, _table(dir, "hmtx").offset, num_hmetrics, num_glyphs);
+    let cmap4 = find_cmap4(bytes, _table(dir, "cmap").offset);
+    let cmap = nil;
+    if cmap4 >= 0 { cmap = parse_cmap4(bytes, cmap4); }
+    return map{ bytes: bytes, dir: dir, head: head, num_glyphs: num_glyphs,
+        loca: loca, hmtx: hmtx, cmap: cmap, glyf_offset: _table(dir, "glyf").offset };
+}
+// font_glyph_index(font, charcode) -> glyph id (0 = .notdef).
+fn font_glyph_index(font, charcode) {
+    if font.cmap == nil { return 0; }
+    return cmap_lookup(font.cmap, charcode);
+}
+// font_glyph(font, charcode) -> the outline ({contours} or {composite}); empty for spaces.
+fn font_glyph(font, charcode) {
+    let gi = font_glyph_index(font, charcode);
+    if gi + 1 >= len(font.loca) { return map{ composite: false, contours: [], empty: true }; }
+    let start = font.loca[gi];
+    let end = font.loca[gi + 1];
+    if end <= start { return map{ composite: false, contours: [], empty: true }; }
+    return parse_glyph(font.bytes, font.glyf_offset + start);
+}
+// font_advance(font, charcode) -> advance width in font units.
+fn font_advance(font, charcode) {
+    let gi = font_glyph_index(font, charcode);
+    if gi >= len(font.hmtx) { return 0; }
+    return font.hmtx[gi].advance_width;
+}
+
+export u8, u16, i16, u32, read_table_directory, parse_simple_glyph;
+export parse_cmap4, cmap_lookup, parse_composite_glyph, parse_glyph, validate;
+export parse_head, parse_loca, parse_hmtx, find_cmap4, load_font, font_glyph_index, font_glyph, font_advance;

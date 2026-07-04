@@ -1,0 +1,145 @@
+// stdlib/sampling_tune.sapp — context-adaptive sampling-parameter engine.
+//
+// Harvested from the "AutoTune" module of the G0DM0D3 LLM-robustness research
+// framework (~/G0DM0D3): classify a prompt into a conversational CONTEXT, map that
+// context to a six-dimension sampling PROFILE, clamp params to valid ranges, and
+// LEARN better profiles from binary feedback with an EMA (the paper's online
+// feedback loop). Pure + deterministic: no model calls, no network. Pairs with the
+// pbAI ensemble, whose adaptive reliability uses the same EMA primitive.
+//
+//   let S = import("stdlib/sampling_tune.sapp");
+//   let t  = S.tune("write a python function");        // {context:"code", params:{...}}
+//   let st = S.new_state();
+//   S.record(st, "code", t.params, 1);                 // rating 1 = the params worked
+//   let p  = S.tune_learned(st, "refactor this");       // uses the learned profile
+//
+// Contexts: code, creative, factual, analysis, chat (chat = neutral fallback).
+
+let _ALPHA = 0.3;   // EMA weight on the newly-observed good params (the paper uses 0.3)
+let _KEYS  = ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "max_tokens"];
+
+// ── keyword banks: substrings that vote for each context ───────────────────────────
+fn _banks() {
+    return map{
+        code:     ["function", "code", "bug", "debug", "python", "refactor", "compile",
+                   "variable", "array", "loop", "class", "api", "sort", "list", "syntax", "stack trace"],
+        creative: ["poem", "story", "creative", "haiku", "song", "fiction", "fantasy",
+                   "imagine", "write me", "dragons", "novel", "lyrics", "character"],
+        factual:  ["what is", "what are", "capital", "who is", "who was", "when did",
+                   "where is", "define", "how many", "which ", "fact", "meaning of"],
+        analysis: ["analyze", "analysis", "compare", "tradeoff", "tradeoffs", "evaluate",
+                   "pros and cons", "versus", " vs ", "assess", "reason about", "explain why"]
+    };
+}
+
+// classify_scores(text) — substring-hit count per context (higher = stronger signal).
+fn classify_scores(text) {
+    let t = str_lower(text);
+    let banks = _banks();
+    let ctxs = ["code", "creative", "factual", "analysis"];
+    let out = map{};
+    for ci len(ctxs) {
+        let name = ctxs[ci];
+        let words = banks[name];
+        let score = 0;
+        for wi len(words) {
+            if str_contains(t, words[wi]) { score = score + 1; }
+        }
+        out[name] = score;
+    }
+    return out;
+}
+
+// classify(text) — the winning context, or "chat" when nothing scores.
+fn classify(text) {
+    let sc = classify_scores(text);
+    let ctxs = ["code", "creative", "factual", "analysis"];
+    let best = "chat";
+    let bestScore = 0;
+    for i len(ctxs) {
+        let name = ctxs[i];
+        if sc[name] > bestScore { bestScore = sc[name]; best = name; }
+    }
+    return best;
+}
+
+// ── default profiles: 5 contexts x 6 dimensions ────────────────────────────────────
+fn _mk(temp, tp, tk, pp, fp, mt) {
+    return map{ temperature: temp, top_p: tp, top_k: tk,
+        presence_penalty: pp, frequency_penalty: fp, max_tokens: mt };
+}
+fn _defaults() {
+    return map{
+        factual:  _mk(0.1, 0.70, 20, 0.0, 0.0, 512),
+        code:     _mk(0.2, 0.80, 40, 0.0, 0.0, 1024),
+        analysis: _mk(0.4, 0.90, 50, 0.2, 0.2, 1500),
+        chat:     _mk(0.7, 0.90, 50, 0.3, 0.3, 800),
+        creative: _mk(1.0, 0.95, 100, 0.6, 0.5, 1500)
+    };
+}
+fn _copy(p) { return _mk(p.temperature, p.top_p, p.top_k, p.presence_penalty, p.frequency_penalty, p.max_tokens); }
+
+// profile_for(context) — a fresh copy of the default profile; unknown -> chat baseline.
+fn profile_for(context) {
+    let d = _defaults();
+    if map_has(d, context) { return _copy(d[context]); }
+    return _copy(d.chat);
+}
+
+// tune(text) — classify then hand back {context, params} using the default profile.
+fn tune(text) {
+    let c = classify(text);
+    return map{ context: c, params: profile_for(c) };
+}
+
+// ── clamp: keep sampling params inside provider-legal ranges ────────────────────────
+fn _lo_hi(x, lo, hi) { if x < lo { return lo; } if x > hi { return hi; } return x; }
+fn clamp(p) {
+    let out = _copy(p);
+    out.temperature = _lo_hi(out.temperature, 0.0, 2.0);
+    out.top_p = _lo_hi(out.top_p, 0.0, 1.0);
+    if out.top_k < 1 { out.top_k = 1; }
+    out.presence_penalty = _lo_hi(out.presence_penalty, 0.0 - 2.0, 2.0);
+    out.frequency_penalty = _lo_hi(out.frequency_penalty, 0.0 - 2.0, 2.0);
+    if out.max_tokens < 1 { out.max_tokens = 1; }
+    return out;
+}
+
+// ── EMA feedback learning ──────────────────────────────────────────────────────────
+// new_state() — an opaque learning store (per-context learned profiles).
+fn new_state() { return map{ learned: map{} }; }
+
+// learned_profile(state, context) — the learned profile, or the default if never taught.
+fn learned_profile(state, context) {
+    if map_has(state.learned, context) { return _copy(state.learned[context]); }
+    return profile_for(context);
+}
+
+// record(state, context, params, rating) — teach the engine. rating 1 = these params
+// worked; the learned profile EMAs toward them. rating 0 (or anything != 1) is ignored,
+// so bad runs never drag the profile around.
+fn record(state, context, params, rating) {
+    if rating != 1 { return learned_profile(state, context); }
+    let cur = learned_profile(state, context);   // seeds from default on first touch
+    for i len(_KEYS) {
+        let k = _KEYS[i];
+        if map_has(params, k) {
+            cur[k] = _ALPHA * params[k] + (1.0 - _ALPHA) * cur[k];
+        }
+    }
+    let clamped = clamp(cur);
+    state.learned[context] = clamped;
+    return _copy(clamped);
+}
+
+// tune_learned(state, text) — like tune(), but returns the learned profile.
+fn tune_learned(state, text) {
+    let c = classify(text);
+    return map{ context: c, params: learned_profile(state, c) };
+}
+
+// contexts() — the five context labels.
+fn contexts() { return ["code", "creative", "factual", "analysis", "chat"]; }
+
+export classify, classify_scores, profile_for, tune, clamp;
+export new_state, learned_profile, record, tune_learned, contexts;

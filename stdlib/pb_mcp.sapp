@@ -7,6 +7,9 @@
 
 let FS = import("stdlib:fs.sapp");
 let WATCH = import("stdlib:watch.sapp");
+let TUNE = import("stdlib:sampling_tune.sapp");     // context-adaptive sampling params (cycle-free)
+let NORM = import("stdlib:text_normalize.sapp");    // reply output normalizer (cycle-free)
+let DEOB = import("stdlib:deobfuscate.sapp");       // adversarial input de-obfuscation (cycle-free)
 
 let MAX_READ_CHARS = 20000;
 let MAX_FILES = 400;
@@ -105,6 +108,15 @@ fn _tool_catalog_build() {
         map{ name: "suggest_tool", profile: "meta", desc: "rank catalog tools for a free-text task description (keyword tool discovery)" },
         map{ name: "call_batch", profile: "meta", desc: "run many tool calls in one request; each failure is isolated per entry" },
         map{ name: "call_stats", profile: "meta", desc: "per-tool usage counters since the last reset" },
+        map{ name: "pbai_recommend_sampling", profile: "ai", desc: "context-adaptive LLM sampling parameters (temperature/top_p/top_k/penalties) for a prompt" },
+        map{ name: "pbai_normalize_reply", profile: "ai", desc: "strip preambles/hedging/formality from a model reply, leaving the substance" },
+        map{ name: "pbai_detect_obfuscation", profile: "ai", desc: "detect adversarial input obfuscation (leetspeak/homoglyph/zero-width/mixed-case) and return the canonical de-obfuscated text + risk score" },
+        map{ name: "grep_context", profile: "core-code", desc: "literal text search returning each match with N lines of surrounding context (grep -B/-A style)" },
+        map{ name: "search_symbols", profile: "core-code", desc: "find fn/struct/class/enum definitions by name (case-insensitive substring) across .sapp files" },
+        map{ name: "dir_stats", profile: "core-code", desc: "recursive directory metrics: file/dir counts, total bytes, by-extension histogram" },
+        map{ name: "file_hash", profile: "core-code", desc: "stable content hash (djb2-32 hex) of a workspace file, for cheap change detection" },
+        map{ name: "tool_info", profile: "meta", desc: "full catalog entry (name/profile/desc) for a tool, nil if unknown" },
+        map{ name: "validate_call", profile: "meta", desc: "dry-run check that a tool exists and its required args are present, without executing it" },
     ];
 }
 
@@ -127,6 +139,7 @@ fn workspace_context() {
         native: true,
         converted_from: "editors/ide/tools/mcpservers/pb-mcp-server safe core",
         tools: tool_catalog(),
+        tool_profiles: profiles(),
         top_level: top,
         limits: map{
             max_read_chars: MAX_READ_CHARS,
@@ -307,6 +320,167 @@ fn grep_files(pattern, dir = ".", ignore_case = false) {
     return out;
 }
 
+// grep_context(pattern, dir, before, after, max) — like grep_code, but each match
+// carries `before`/`after` arrays of surrounding lines (clamped at file edges).
+// This is the grep -B/-A an agent needs to judge a hit without a second read_file.
+fn grep_context(pattern, dir = ".", before = 2, after = 2, max_matches = 20) {
+    if pattern == nil or pattern == "" { return []; }
+    dir = _safe_path(dir);
+    if before < 0 { before = 0; }
+    if after < 0 { after = 0; }
+    let files = list_files(dir, MAX_FILES);
+    let out = [];
+    for i len(files) {
+        if len(out) >= max_matches { return out; }
+        let raw = try FS.read(files[i]) catch nil;
+        if type(raw) == "string" {
+            let lines = str_split(raw, "\n");
+            for line_no len(lines) {
+                if len(out) >= max_matches { return out; }
+                if str_contains(lines[line_no], pattern) {
+                    let pre = [];
+                    let b = line_no - before;
+                    if b < 0 { b = 0; }
+                    while b < line_no { array_push(pre, lines[b]); b = b + 1; }
+                    let post = [];
+                    let a = line_no + 1;
+                    while a <= line_no + after and a < len(lines) { array_push(post, lines[a]); a = a + 1; }
+                    array_push(out, map{ path: files[i], line: line_no + 1, text: lines[line_no], before: pre, after: post });
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// search_symbols(name, dir, max) — where is `name` DEFINED? Scans .sapp files under
+// `dir` with outline() and returns [{path, kind, name, line}] whose symbol name
+// contains `name` (case-insensitive). Complements grep_code, which finds USES.
+fn search_symbols(name, dir = ".", max_results = 40) {
+    if name == nil or name == "" { return []; }
+    dir = _safe_path(dir);
+    let needle = str_lower(name);
+    let files = list_files(dir, MAX_FILES);
+    let out = [];
+    for i len(files) {
+        if len(out) >= max_results { return out; }
+        let path = files[i];
+        if str_ends_with(path, ".sapp") {
+            let syms = try outline(path) catch [];
+            for s len(syms) {
+                if len(out) >= max_results { return out; }
+                if str_contains(str_lower(syms[s].name), needle) {
+                    array_push(out, map{ path: path, kind: syms[s].kind, name: syms[s].name, line: syms[s].line });
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// dir_stats(dir) — one-call recursive metrics: {files, dirs, bytes, by_ext}.
+// Unreadable (e.g. binary non-UTF8) files still count as files with 0 bytes.
+fn dir_stats(dir = ".") {
+    dir = _safe_path(dir);
+    let paths = [];
+    _push_recursive(paths, dir, 0, 8, MAX_FILES);
+    let files = 0;
+    let dirs = 0;
+    let bytes = 0;
+    let by_ext = map{};
+    for i len(paths) {
+        if _is_dir(paths[i]) { dirs = dirs + 1; }
+        else {
+            files = files + 1;
+            let raw = try FS.read(paths[i]) catch nil;
+            if type(raw) == "string" { bytes = bytes + len(str_to_bytes(raw)); }
+            let base = _basename(paths[i]);
+            let dot = 0 - 1;
+            let ci = 0;
+            while ci < len(base) { if str_slice(base, ci, ci + 1) == "." { dot = ci; } ci = ci + 1; }
+            let ext = "(none)";
+            if dot > 0 { ext = str_slice(base, dot + 1, len(base)); }
+            if not map_has(by_ext, ext) { by_ext[ext] = 0; }
+            by_ext[ext] = by_ext[ext] + 1;
+        }
+    }
+    return map{ files: files, dirs: dirs, bytes: bytes, by_ext: by_ext };
+}
+
+fn _hex32(n) {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while i < 8 {
+        let d = n % 16;
+        out = str_slice(digits, d, d + 1) + out;
+        n = (n - d) / 16;
+        i = i + 1;
+    }
+    return out;
+}
+
+// file_hash(path) — djb2-32 of the raw bytes, as 8 hex chars. Every step stays
+// under 2^38 so f64 arithmetic is exact; workspace-only via _safe_path.
+fn file_hash(path) {
+    path = _safe_path(path);
+    let bytes = str_to_bytes(FS.read(path));
+    let h = 5381;
+    let i = 0;
+    while i < len(bytes) {
+        h = (h * 33 + bytes[i]) % 4294967296;
+        i = i + 1;
+    }
+    return _hex32(h);
+}
+
+// tool_info(name) — the whole catalog entry, or nil (tool_desc returns desc only).
+fn tool_info(name) {
+    let cat = tool_catalog();
+    let i = 0;
+    while i < len(cat) { if cat[i].name == name { return cat[i]; } i = i + 1; }
+    return nil;
+}
+
+// Required argument names per tool, for validate_call's dry-run check. Tools not
+// listed here have no required args (all-default or zero-arg).
+let _REQ = nil;
+fn _required_args() {
+    if _REQ != nil { return _REQ; }
+    _REQ = map{
+        read_file: ["path"], read_file_tail: ["path"], head_file: ["path"],
+        file_exists: ["path"], file_stats: ["path"], file_hash: ["path"], outline: ["path"],
+        grep_code: ["pattern"], grep_count: ["pattern"], grep_files: ["pattern"], grep_context: ["pattern"],
+        find_files: ["name"], search_symbols: ["name"], tool_info: ["name"],
+        watch_disasm: ["source"], watch_bytecode: ["source"],
+        watch_inspect: ["path"], watch_folder: ["path"], watch_binary: ["path"], watch_probe: ["name"],
+        suggest_tool: ["query"], call_batch: ["calls"], validate_call: ["tool"],
+        pbai_recommend_sampling: ["prompt"], pbai_normalize_reply: ["text"], pbai_detect_obfuscation: ["text"],
+    };
+    return _REQ;
+}
+
+// validate_call(tool, args) — {ok} or {ok:false, error, missing?} WITHOUT executing.
+// Lets an agent (or call_batch builder) reject a malformed plan before paying for it.
+fn validate_call(tool, args = nil) {
+    if args == nil { args = map{}; }
+    if not has_tool(tool) and tool != "tool_catalog" {
+        return map{ ok: false, error: "pb_mcp: unknown tool '" + str(tool) + "'" };
+    }
+    let req = _required_args();
+    let missing = [];
+    if map_has(req, tool) {
+        let names = req[tool];
+        let i = 0;
+        while i < len(names) {
+            if not map_has(args, names[i]) { array_push(missing, names[i]); }
+            i = i + 1;
+        }
+    }
+    if len(missing) > 0 { return map{ ok: false, error: "pb_mcp: missing required args", missing: missing }; }
+    return map{ ok: true };
+}
+
 // _ident_head(s) — leading identifier of `s` (up to '(', '{', ':', or space).
 fn _ident_head(s) {
     let i = 0;
@@ -401,7 +575,14 @@ fn suggest_tool(query, k = 3) {
 // ── batch execution + usage stats ──────────────────────────────────────────────
 // call_batch(calls) — [{tool, args?}] -> [{ok, result}|{ok:false, error}], one entry
 // per call; a failing tool never aborts the rest of the batch.
+// Depth guard: call_batch can dispatch call_batch, so a hostile batch could wind
+// the VM stack to its recursion ceiling. Cap self-nesting at a deterministic 4.
+let _BATCH_DEPTH = 0;
 fn call_batch(calls) {
+    if _BATCH_DEPTH >= 4 {
+        return [map{ ok: false, error: "pb_mcp: call_batch nested too deep (max 4)" }];
+    }
+    _BATCH_DEPTH = _BATCH_DEPTH + 1;
     let out = [];
     let i = 0;
     while i < len(calls) {
@@ -413,6 +594,8 @@ fn call_batch(calls) {
         array_push(out, r);
         i = i + 1;
     }
+    // every per-call throw is absorbed by the try above, so this is always reached
+    _BATCH_DEPTH = _BATCH_DEPTH - 1;
     return out;
 }
 
@@ -455,6 +638,15 @@ fn call(tool, args = nil) {
     if tool == "suggest_tool" { return suggest_tool(try args.query catch "", try args.k catch 3); }
     if tool == "call_batch" { return call_batch(try args.calls catch []); }
     if tool == "call_stats" { return call_stats(); }
+    if tool == "pbai_recommend_sampling" { return TUNE.tune(try args.prompt catch ""); }
+    if tool == "pbai_normalize_reply" { return NORM.normalize(try args.text catch ""); }
+    if tool == "pbai_detect_obfuscation" { return DEOB.detect(try args.text catch ""); }
+    if tool == "grep_context" { return grep_context(try args.pattern catch "", try args.dir catch ".", try args.before catch 2, try args.after catch 2, try args.max_matches catch 20); }
+    if tool == "search_symbols" { return search_symbols(try args.name catch "", try args.dir catch ".", try args.max_results catch 40); }
+    if tool == "dir_stats" { return dir_stats(try args.dir catch "."); }
+    if tool == "file_hash" { return file_hash(try args.path catch ""); }
+    if tool == "tool_info" { return tool_info(try args.name catch ""); }
+    if tool == "validate_call" { return validate_call(try args.tool catch "", try args.args catch nil); }
     throw "pb_mcp: unknown tool '" + str(tool) + "'";
 }
 
@@ -505,3 +697,4 @@ export suggest_tool, call_batch, call_stats, reset_call_stats;
 export watch_capture, watch_disasm, watch_bytecode, watch_inspect, watch_folder, watch_binary, watch_hardware, watch_probe;
 export tool_names, has_tool, tools_by_profile, profiles;
 export head_file, file_exists, list_dirs, grep_count, grep_files, tools_count, tool_desc, outline;
+export grep_context, search_symbols, dir_stats, file_hash, tool_info, validate_call;
