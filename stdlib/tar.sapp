@@ -1,0 +1,426 @@
+// stdlib/tar.sapp — POSIX tar (ustar) archive reader/writer in pure pblang.
+//
+// Reads ustar/GNU/pax archives: header checksums are verified, pax extended
+// headers ('x'/'g': path/linkpath/size overrides) and GNU long-name entries
+// ('L'/'K') are honored, and sizes may be octal or base-256. Writes strict
+// ustar with the prefix field for names over 100 bytes, padded to the standard
+// 10 KiB blocking factor so every tar tool accepts the output. .tar.gz is
+// covered by to_tgz/from_tgz over stdlib:flate.sapp — no external binaries.
+//
+// Security: extract() refuses traversal names (absolute paths, `..` segments,
+// backslash tricks, NUL bytes), skips symlinks/hardlinks/devices instead of
+// creating them, and read()/extract() take an optional per-entry byte cap.
+//
+//   let T = import("stdlib:tar.sapp");
+//   T.entries(bytes);                  // [{name,type,mode,size,mtime,linkname}]
+//   T.read(bytes, "a/b.txt");          // byte array
+//   T.extract(bytes, "/tmp/out");      // {written:[...], skipped:[...]}
+//   T.create([map{name:"a.txt", data:str_to_bytes("hi")}]);   // tar bytes
+
+let F = import("stdlib:flate.sapp");
+
+fn _as_bytes(data) { if type(data) == "string" { return str_to_bytes(data); } return data; }
+
+fn _all_zero(b, off) {
+    let i = 0;
+    while i < 512 { if b[off + i] != 0 { return false; } i = i + 1; }
+    return true;
+}
+
+// _str_field(b, off, n) — NUL-terminated string field.
+fn _str_field(b, off, n) {
+    let s = [];
+    let i = 0;
+    while i < n {
+        let c = b[off + i];
+        if c == 0 { break; }
+        array_push(s, c);
+        i = i + 1;
+    }
+    return bytes_to_str(s);
+}
+
+// _num_field(b, off, n) — octal field (leading spaces/NULs tolerated) or GNU
+// base-256 (first byte has the high bit set) for sizes beyond 8 GiB.
+fn _num_field(b, off, n) {
+    if b[off] >= 128 {
+        let v = b[off] - 128;
+        let i = 1;
+        while i < n { v = v * 256 + b[off + i]; i = i + 1; }
+        return v;
+    }
+    let v = 0;
+    let i = 0;
+    let seen = false;
+    while i < n {
+        let c = b[off + i];
+        if c >= 48 and c <= 55 { v = v * 8 + (c - 48); seen = true; }
+        else { if seen { break; } if c != 32 and c != 0 { break; } }
+        i = i + 1;
+    }
+    return v;
+}
+
+// _cksum(b, off) — header checksum: byte sum with the checksum field as spaces.
+fn _cksum(b, off) {
+    let sum = 0;
+    let i = 0;
+    while i < 512 {
+        let v = b[off + i];
+        if i >= 148 and i < 156 { v = 32; }
+        sum = sum + v;
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn _pad512(n) { let r = n % 512; if r == 0 { return n; } return n + 512 - r; }
+
+fn _dec_str(s) {
+    let b = str_to_bytes(s);
+    let v = 0;
+    let i = 0;
+    while i < len(b) {
+        if b[i] < 48 or b[i] > 57 { break; }
+        v = v * 10 + (b[i] - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// _pax_records(b, off, size) — parse "len key=value\n" records into a map.
+fn _pax_records(b, off, size) {
+    let out = map{};
+    let end = off + size;
+    let p = off;
+    while p < end {
+        let l = 0;
+        let q = p;
+        while q < end and b[q] >= 48 and b[q] <= 57 { l = l * 10 + (b[q] - 48); q = q + 1; }
+        if l <= 0 or p + l > end { break; }
+        let rec_end = p + l;
+        let r = q + 1;   // skip the space after the length
+        let ks = r;
+        while r < rec_end and b[r] != 61 { r = r + 1; }
+        if r < rec_end {
+            let key = bytes_to_str(slice(b, ks, r));
+            out[key] = bytes_to_str(slice(b, r + 1, rec_end - 1));   // drop trailing \n
+        }
+        p = rec_end;
+    }
+    return out;
+}
+
+fn _type_of(tf) {
+    if tf == 0 or tf == 48 { return "file"; }      // NUL / '0'
+    if tf == 53 { return "dir"; }                  // '5'
+    if tf == 50 { return "symlink"; }              // '2'
+    if tf == 49 { return "hardlink"; }             // '1'
+    return "other";
+}
+
+// entries(data) — list the archive's entries (checksum-verified headers).
+fn entries(data) {
+    let b = _as_bytes(data);
+    let n = len(b);
+    if n < 512 { error("tar: data too short (not a tar?)"); }
+    let out = [];
+    let pos = 0;
+    let px_path = nil;
+    let px_link = nil;
+    let px_size = nil;
+    while pos + 512 <= n {
+        if _all_zero(b, pos) { break; }
+        if _num_field(b, pos + 148, 8) != _cksum(b, pos) {
+            error("tar: bad header checksum at offset " + str(pos));
+        }
+        let tf = b[pos + 156];
+        let dsize = _num_field(b, pos + 124, 12);
+        if pos + 512 + dsize > n { error("tar: truncated entry data at offset " + str(pos)); }
+        // pax extended headers and GNU long-name entries describe the NEXT entry
+        if tf == 120 or tf == 103 {   // 'x' / 'g'
+            let recs = _pax_records(b, pos + 512, dsize);
+            if map_has(recs, "path") { px_path = recs["path"]; }
+            if map_has(recs, "linkpath") { px_link = recs["linkpath"]; }
+            if map_has(recs, "size") { px_size = _dec_str(recs["size"]); }
+            pos = pos + 512 + _pad512(dsize);
+            continue;
+        }
+        if tf == 76 {   // 'L' GNU longname
+            px_path = _str_field(b, pos + 512, dsize);
+            pos = pos + 512 + _pad512(dsize);
+            continue;
+        }
+        if tf == 75 {   // 'K' GNU longlink
+            px_link = _str_field(b, pos + 512, dsize);
+            pos = pos + 512 + _pad512(dsize);
+            continue;
+        }
+        let size = dsize;
+        if px_size != nil { size = px_size; if pos + 512 + size > n { error("tar: truncated entry data at offset " + str(pos)); } }
+        let name = _str_field(b, pos, 100);
+        let prefix = _str_field(b, pos + 345, 155);
+        if prefix != "" { name = prefix + "/" + name; }
+        if px_path != nil { name = px_path; }
+        let lname = _str_field(b, pos + 157, 100);
+        if px_link != nil { lname = px_link; }
+        // directories are conventionally stored with a trailing "/" — normalize
+        if tf == 53 and len(name) > 0 and name[len(name) - 1] == "/" {
+            name = str_slice(name, 0, len(name) - 1);
+        }
+        array_push(out, map{
+            name: name,
+            type: _type_of(tf),
+            mode: _num_field(b, pos + 100, 8),
+            size: size,
+            mtime: _num_field(b, pos + 136, 12),
+            linkname: lname,
+            offset: pos + 512,
+        });
+        px_path = nil;
+        px_link = nil;
+        px_size = nil;
+        pos = pos + 512 + _pad512(size);
+    }
+    return out;
+}
+
+fn _read_entry(b, e, max_out) {
+    if max_out != nil and e.size > max_out { error("tar: entry exceeds max_out cap"); }
+    return slice(b, e.offset, e.offset + e.size);
+}
+
+// read(data, name, max_out?) — the bytes of one regular-file entry.
+fn read(data, name, max_out = nil) {
+    let b = _as_bytes(data);
+    let es = entries(b);
+    let i = 0;
+    while i < len(es) {
+        if es[i].name == name and es[i].type == "file" { return _read_entry(b, es[i], max_out); }
+        i = i + 1;
+    }
+    return error("tar: no file entry named " + name);
+}
+
+// read_all(data, max_each?) — map of name -> bytes for every regular file.
+fn read_all(data, max_each = nil) {
+    let b = _as_bytes(data);
+    let es = entries(b);
+    let out = map{};
+    let i = 0;
+    while i < len(es) {
+        if es[i].type == "file" { out[es[i].name] = _read_entry(b, es[i], max_each); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── safe extraction ──────────────────────────────────────────────────────────
+// _safe_name(name) — nil when the entry name is a traversal attempt.
+fn _safe_name(name) {
+    if name == nil or len(name) == 0 { return nil; }
+    let norm = "";
+    let i = 0;
+    while i < len(name) {
+        let c = name[i];
+        if c == str_from_char_code(0) { return nil; }
+        if c == str_from_char_code(92) { norm = norm + "/"; } else { norm = norm + c; }
+        i = i + 1;
+    }
+    if norm[0] == "/" { return nil; }
+    if len(norm) >= 2 and norm[1] == ":" { return nil; }   // drive-letter prefix
+    let seg = "";
+    i = 0;
+    while i <= len(norm) {
+        let end = i == len(norm);
+        if end or norm[i] == "/" {
+            if seg == ".." { return nil; }
+            seg = "";
+        } else { seg = seg + norm[i]; }
+        i = i + 1;
+    }
+    return norm;
+}
+
+fn _parent_dir(path) {
+    let last = -1;
+    let i = 0;
+    while i < len(path) {
+        if path[i] == "/" { last = i; }
+        i = i + 1;
+    }
+    if last <= 0 { return nil; }
+    return str_slice(path, 0, last);
+}
+
+// extract(data, dest_dir, max_each?) — write files and dirs under dest_dir.
+// Symlinks, hardlinks and device nodes are never created (they are the classic
+// tar-slip escalation vector); their names come back in `skipped`. Traversal
+// names error out. Returns map{written, skipped}.
+fn extract(data, dest_dir, max_each = nil) {
+    let b = _as_bytes(data);
+    let es = entries(b);
+    let written = [];
+    let skipped = [];
+    let i = 0;
+    while i < len(es) {
+        let e = es[i];
+        let safe = _safe_name(e.name);
+        if safe == nil { error("tar: unsafe entry name refused: " + e.name); }
+        if e.type == "dir" {
+            try fs_mkdirs(dest_dir + "/" + safe) catch nil;
+        } else { if e.type == "file" {
+            let path = dest_dir + "/" + safe;
+            let dir = _parent_dir(path);
+            if dir != nil { try fs_mkdirs(dir) catch nil; }
+            fs_write_bytes(path, _read_entry(b, e, max_each));
+            array_push(written, path);
+        } else {
+            array_push(skipped, e.name);
+        } }
+        i = i + 1;
+    }
+    return map{ written: written, skipped: skipped };
+}
+
+// ── writer ───────────────────────────────────────────────────────────────────
+fn _oct_field(hdr, off, v, n) {
+    // n-1 zero-padded octal digits followed by NUL
+    let i = n - 2;
+    while i >= 0 {
+        hdr[off + i] = 48 + v % 8;
+        v = (v - v % 8) / 8;
+        i = i - 1;
+    }
+    hdr[off + n - 1] = 0;
+    return nil;
+}
+
+fn _put_str(hdr, off, s, n) {
+    let b = str_to_bytes(s);
+    if len(b) > n { error("tar: field too long: " + s); }
+    let i = 0;
+    while i < len(b) { hdr[off + i] = b[i]; i = i + 1; }
+    return nil;
+}
+
+// _split_name(name) — [prefix, name] fitting ustar's 155+100 byte fields.
+fn _split_name(name) {
+    let b = str_to_bytes(name);
+    if len(b) <= 100 { return ["", name]; }
+    let min_pos = len(b) - 101;
+    if min_pos < 0 { min_pos = 0; }
+    let i = min_pos;
+    while i < len(b) and i <= 155 {
+        if b[i] == 47 {   // '/'
+            return [bytes_to_str(slice(b, 0, i)), bytes_to_str(slice(b, i + 1, len(b)))];
+        }
+        i = i + 1;
+    }
+    return error("tar: name too long for ustar (needs a '/' split <= 155+100 bytes): " + name);
+}
+
+fn _push_all(out, arr) {
+    let i = 0;
+    while i < len(arr) { array_push(out, arr[i]); i = i + 1; }
+    return nil;
+}
+
+// create(files) — files: [map{name, data, mode?, mtime?}]. A trailing "/" (or
+// nil data) makes a directory entry. Returns strict-ustar tar bytes padded to
+// the 10 KiB blocking factor.
+fn create(files) {
+    let out = [];
+    let fi = 0;
+    while fi < len(files) {
+        let f = files[fi];
+        let name = f.name;
+        let data = nil;
+        if map_has(f, "data") and f.data != nil { data = _as_bytes(f.data); }
+        let is_dir = len(name) > 0 and name[len(name) - 1] == "/";
+        if data == nil and not is_dir { is_dir = true; name = name + "/"; }
+        let mode = 420;                       // 0644
+        if is_dir { mode = 493; }             // 0755
+        if map_has(f, "mode") and f.mode != nil { mode = f.mode; }
+        let mtime = 0;
+        if map_has(f, "mtime") and f.mtime != nil { mtime = f.mtime; }
+        let size = 0;
+        if data != nil { size = len(data); }
+        let parts = _split_name(name);
+        let hdr = [];
+        let z = 0;
+        while z < 512 { array_push(hdr, 0); z = z + 1; }
+        _put_str(hdr, 0, parts[1], 100);
+        _oct_field(hdr, 100, mode, 8);
+        _oct_field(hdr, 108, 0, 8);           // uid
+        _oct_field(hdr, 116, 0, 8);           // gid
+        _oct_field(hdr, 124, size, 12);
+        _oct_field(hdr, 136, mtime, 12);
+        if is_dir { hdr[156] = 53; } else { hdr[156] = 48; }   // '5' / '0'
+        _put_str(hdr, 257, "ustar", 6);       // magic (NUL-terminated by the zero fill)
+        hdr[263] = 48;                        // version "00"
+        hdr[264] = 48;
+        _put_str(hdr, 345, parts[0], 155);
+        let sum = _cksum(hdr, 0);
+        let i = 5;
+        while i >= 0 { hdr[148 + i] = 48 + sum % 8; sum = (sum - sum % 8) / 8; i = i - 1; }
+        hdr[154] = 0;
+        hdr[155] = 32;
+        _push_all(out, hdr);
+        if data != nil {
+            _push_all(out, data);
+            let pad = _pad512(size) - size;
+            while pad > 0 { array_push(out, 0); pad = pad - 1; }
+        }
+        fi = fi + 1;
+    }
+    // end-of-archive: two zero blocks, then pad to the 10 KiB blocking factor
+    let tail = 1024;
+    while tail > 0 { array_push(out, 0); tail = tail - 1; }
+    let rec = len(out) % 10240;
+    if rec != 0 { rec = 10240 - rec; }
+    while rec > 0 { array_push(out, 0); rec = rec - 1; }
+    return out;
+}
+
+// ── tar.gz ───────────────────────────────────────────────────────────────────
+fn to_tgz(tar_bytes) { return F.gzip_encode(_as_bytes(tar_bytes)); }
+fn from_tgz(data, max_out = nil) { return F.gzip_decode(_as_bytes(data), max_out); }
+
+fn _maybe_gunzip(b, max_out) {
+    if len(b) >= 2 and b[0] == 31 and b[1] == 139 { return F.gzip_decode(b, max_out); }
+    return b;
+}
+
+// ── file helpers (auto-detect .tar vs .tar.gz by magic / extension) ──────────
+fn _ends_with(s, suf) {
+    if len(s) < len(suf) { return false; }
+    return str_slice(s, len(s) - len(suf), len(s)) == suf;
+}
+
+// create_file(path, files) — write a tar (or tgz when the path says so).
+fn create_file(path, files) {
+    let blob = create(files);
+    if _ends_with(path, ".tgz") or _ends_with(path, ".tar.gz") or _ends_with(path, ".gz") {
+        blob = to_tgz(blob);
+    }
+    fs_write_bytes(path, blob);
+    return len(blob);
+}
+
+// extract_file(path, dest_dir, max_each?) — extract .tar or .tar.gz from disk.
+fn extract_file(path, dest_dir, max_each = nil) {
+    return extract(_maybe_gunzip(fs_read_bytes(path), nil), dest_dir, max_each);
+}
+
+// list_file(path) — entry names of a .tar or .tar.gz on disk.
+fn list_file(path) {
+    let es = entries(_maybe_gunzip(fs_read_bytes(path), nil));
+    let out = [];
+    let i = 0;
+    while i < len(es) { array_push(out, es[i].name); i = i + 1; }
+    return out;
+}
+
+export entries, read, read_all, extract, create, to_tgz, from_tgz,
+       create_file, extract_file, list_file;
