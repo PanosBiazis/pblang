@@ -1,0 +1,160 @@
+// tests/semantics/persist_hardening_test.sapp — Persistence hardening:
+// storage.sapp: bounds-safe load (truncated/corrupt files -> nil, never a
+//   crash), CRC32 integrity trailer (backward compatible), duplicate-name
+//   collapse, slip-safe unpack().
+// db.sapp: c.tx (only a THROW rolls back; nil commits) + c.savepoint (nested,
+//   injection-safe name).
+// orm.sapp: tx(conn, f) that passes the connection + insert_many atomic batch.
+
+let S = import("stdlib:storage.sapp");
+let db = import("stdlib:db.sapp");
+let orm = import("stdlib:orm.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+
+let TMP = "tests/semantics/_persist_tmp";
+try fs_remove(TMP) catch nil;
+try fs_mkdirs(TMP) catch nil;
+
+// ── storage: save/load round-trip still works (now with CRC trailer) ─────────
+let st = S.create();
+S.put(st, "a.txt", "alpha");
+S.put(st, "sub/b.txt", "beta");
+let sv = S.save(st, TMP + "/ok.pbst");
+if not sv.ok { fail("save ok"); }
+let l1 = S.load(TMP + "/ok.pbst");
+if l1 == nil { fail("load ok file"); }
+eq(S.get(l1, "a.txt"), "alpha", "round-trip a");
+eq(S.get(l1, "sub/b.txt"), "beta", "round-trip b");
+
+// ── truncated file -> nil, never a crash ─────────────────────────────────────
+let raw = fs_read_bytes(TMP + "/ok.pbst");
+let cut = [];
+let i = 0;
+while i < len(raw) - 5 { array_push(cut, raw[i]); i = i + 1; }
+fs_write_bytes(TMP + "/cut.pbst", cut);
+eq(S.load(TMP + "/cut.pbst"), nil, "truncated load -> nil");
+
+let cut2 = [];
+i = 0;
+while i < 10 { array_push(cut2, raw[i]); i = i + 1; }
+fs_write_bytes(TMP + "/cut2.pbst", cut2);
+eq(S.load(TMP + "/cut2.pbst"), nil, "header-truncated load -> nil");
+
+// ── absurd entry count -> nil (no runaway loop, no OOB) ──────────────────────
+fs_write_bytes(TMP + "/bad.pbst", [80, 66, 83, 84, 255, 255, 255, 255, 0, 0]);
+eq(S.load(TMP + "/bad.pbst"), nil, "absurd count -> nil");
+
+// ── one flipped byte inside entry data -> CRC mismatch -> nil ────────────────
+let flip = [];
+i = 0;
+while i < len(raw) { array_push(flip, raw[i]); i = i + 1; }
+// header(8) + name_len(2) + "a.txt"(5) + flag(1) + orig(4) + comp(4) = 24;
+// index 25 sits inside the first entry's compressed payload.
+flip[25] = bit_xor(flip[25], 255);
+fs_write_bytes(TMP + "/flip.pbst", flip);
+eq(S.load(TMP + "/flip.pbst"), nil, "corrupted byte -> CRC mismatch -> nil");
+
+// ── legacy file without trailer still loads (backward compat) ────────────────
+let legacy = [];
+i = 0;
+while i < len(raw) - 8 { array_push(legacy, raw[i]); i = i + 1; }
+fs_write_bytes(TMP + "/legacy.pbst", legacy);
+let ll = S.load(TMP + "/legacy.pbst");
+if ll == nil { fail("legacy (no-trailer) load"); }
+eq(S.get(ll, "a.txt"), "alpha", "legacy content");
+
+// trailing garbage that is not a valid trailer -> nil
+let junk = [];
+i = 0;
+while i < len(legacy) { array_push(junk, legacy[i]); i = i + 1; }
+array_push(junk, 7); array_push(junk, 7); array_push(junk, 7);
+fs_write_bytes(TMP + "/junk.pbst", junk);
+eq(S.load(TMP + "/junk.pbst"), nil, "trailing garbage -> nil");
+
+// ── duplicate names collapse to ONE entry (last wins, no dup in order) ───────
+let sA = S.create(); S.put(sA, "x", "one"); S.save(sA, TMP + "/A.pbst");
+let sB = S.create(); S.put(sB, "x", "two"); S.save(sB, TMP + "/B.pbst");
+let ra = fs_read_bytes(TMP + "/A.pbst");
+let rb = fs_read_bytes(TMP + "/B.pbst");
+let dup = [80, 66, 83, 84, 0, 0, 0, 2];
+i = 8; while i < len(ra) - 8 { array_push(dup, ra[i]); i = i + 1; }
+i = 8; while i < len(rb) - 8 { array_push(dup, rb[i]); i = i + 1; }
+fs_write_bytes(TMP + "/dup.pbst", dup);
+let ld = S.load(TMP + "/dup.pbst");
+if ld == nil { fail("dup load"); }
+eq(len(S.list(ld)), 1, "dup names collapse");
+eq(S.get(ld, "x"), "two", "dup last wins");
+
+// ── unpack: slip-safe extraction to a folder ─────────────────────────────────
+let su = S.create();
+S.put(su, "plain.txt", "P");
+S.put(su, "nest/deep.txt", "D");
+S.put(su, "../evil.txt", "E");
+S.put(su, "/abs.txt", "A");
+let out = TMP + "/out";
+let ur = S.unpack(su, out);
+eq(len(ur.written), 2, "unpack wrote 2");
+eq(len(ur.skipped), 2, "unpack skipped 2 hostile");
+eq(bytes_to_str(fs_read_bytes(out + "/plain.txt")), "P", "unpack plain");
+eq(bytes_to_str(fs_read_bytes(out + "/nest/deep.txt")), "D", "unpack nested");
+if (try map{ ok: fs_read_bytes(TMP + "/evil.txt") } catch nil) != nil { fail("storage-slip escaped the dest dir!"); }
+
+// ── db.tx: nil return COMMITS (legacy transaction() treats nil as rollback) ──
+let c = db.sqlite.open(":memory:");
+c.exec("create table t(id integer primary key, v text)", []);
+
+let r1 = c.tx(fn(cc) { cc.exec("insert into t(v) values (?)", ["kept"]); return nil; });
+eq(r1.ok, true, "tx nil commits");
+eq(db.query_value(c, "select count(*) from t", []), 1, "tx nil row kept");
+
+let r2 = c.tx(fn(cc) { cc.exec("insert into t(v) values (?)", ["gone"]); throw "boom"; });
+eq(r2.ok, false, "tx throw -> ok false");
+eq(db.query_value(c, "select count(*) from t", []), 1, "tx throw rolled back");
+
+// ── db.savepoint: nested failure keeps outer work ────────────────────────────
+let r3 = c.tx(fn(cc) {
+    cc.exec("insert into t(v) values (?)", ["outer"]);
+    let sp = cc.savepoint("sp1", fn(c2) {
+        c2.exec("insert into t(v) values (?)", ["inner"]);
+        throw "inner-fail";
+    });
+    if sp.ok { throw "savepoint should have failed"; }
+    return true;
+});
+eq(r3.ok, true, "outer tx ok");
+eq(db.query_value(c, "select count(*) from t where v = ?", ["outer"]), 1, "outer kept");
+eq(db.query_value(c, "select count(*) from t where v = ?", ["inner"]), 0, "inner rolled back");
+
+// savepoint success path + hostile name is quoted, not injected
+let r4 = c.savepoint("weird \"name\"; drop table t", fn(c2) {
+    c2.exec("insert into t(v) values (?)", ["sp-ok"]);
+    return 42;
+});
+eq(r4.ok, true, "savepoint ok");
+eq(r4.value, 42, "savepoint value");
+eq(db.query_value(c, "select count(*) from t where v = ?", ["sp-ok"]), 1, "savepoint committed");
+eq(db.query_value(c, "select count(*) from t", []), 3, "table survived hostile savepoint name");
+
+// ── orm.tx: passes the connection; only a throw rolls back ───────────────────
+let r5 = orm.tx(c, fn(cc) { cc.exec("insert into t(v) values (?)", ["orm-nil"]); return nil; });
+eq(r5.ok, true, "orm.tx nil commits");
+eq(db.query_value(c, "select count(*) from t where v = ?", ["orm-nil"]), 1, "orm.tx row kept");
+let r6 = orm.tx(c, fn(cc) { cc.exec("insert into t(v) values (?)", ["orm-gone"]); throw "x"; });
+eq(r6.ok, false, "orm.tx throw");
+eq(db.query_value(c, "select count(*) from t where v = ?", ["orm-gone"]), 0, "orm.tx rolled back");
+
+// ── orm.insert_many: atomic batch (all rows or none) ─────────────────────────
+let rm = orm.insert_many(c, "t", [map{ v: "m1" }, map{ v: "m2" }, map{ v: "m3" }]);
+eq(rm.ok, true, "insert_many ok");
+eq(rm.value, 3, "insert_many count");
+eq(db.query_value(c, "select count(*) from t where v like ?", ["m%"]), 3, "insert_many rows");
+
+let rbad = orm.insert_many(c, "t", [map{ v: "good-batch" }, map{ nosuchcol: "x" }]);
+eq(rbad.ok, false, "insert_many bad row fails");
+eq(db.query_value(c, "select count(*) from t where v = ?", ["good-batch"]), 0, "insert_many atomic rollback");
+
+c.close();
+try fs_remove(TMP) catch nil;
+print "persist_hardening_pass";

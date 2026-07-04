@@ -18,6 +18,7 @@
 let Z  = import("stdlib:pbz.sapp");
 let C  = import("stdlib:codec.sapp");
 let FS = import("stdlib:fs.sapp");
+let F  = import("stdlib:flate.sapp");
 
 let MAGIC = [80, 66, 83, 84];   // "PBST"
 
@@ -161,6 +162,12 @@ fn save(st, path) {
         while c < len(en.comp) { array_push(out, en.comp[c]); c = c + 1; }
         e = e + 1;
     }
+    // Integrity trailer: "PBSX" marker + CRC32 of everything before it.
+    // Old loaders stop after `count` entries, so they simply ignore these
+    // 8 bytes; the hardened load() verifies them when present.
+    let crc = F.crc32(out);
+    array_push(out, 80); array_push(out, 66); array_push(out, 83); array_push(out, 88);
+    _w32(out, crc);
     let ok = try fs_write_bytes(path, out) catch false;
     return map{ ok: ok != false, path: path, bytes: len(out), entries: len(st.order) };
 }
@@ -175,8 +182,10 @@ fn _r16(b, pos) {
     pos.i = pos.i + 2;
     return v;
 }
-fn _rstr(b, pos) {
-    let n = _r16(b, pos);
+// _rstr_n(b, pos, n) — read an n-byte string; the caller has already
+// bounds-checked n against len(b) (that is the whole point of splitting
+// the length read from the byte copy).
+fn _rstr_n(b, pos, n) {
     let sub = [];
     let i = 0;
     while i < n { array_push(sub, b[pos.i + i]); i = i + 1; }
@@ -184,29 +193,113 @@ fn _rstr(b, pos) {
     return bytes_to_str(sub);
 }
 
+// load(path) — hardened: every read is bounds-checked, so a truncated or
+// crafted file returns nil instead of crashing. After the entries, exactly
+// one of two endings is accepted: nothing (legacy files) or the 8-byte
+// "PBSX"+CRC32 trailer, which must match the bytes before it. Anything
+// else (trailing garbage, flipped bytes) -> nil. Duplicate entry names
+// collapse to one entry (last one wins), never duplicating `order`.
 fn load(path) {
     let b = try fs_read_bytes(path) catch nil;
     if b == nil or len(b) < 8 { return nil; }
     if b[0] != MAGIC[0] or b[1] != MAGIC[1] or b[2] != MAGIC[2] or b[3] != MAGIC[3] { return nil; }
+    let total = len(b);
     let st = create();
     let pos = map{ i: 4 };
     let count = _r32(b, pos);
     let e = 0;
     while e < count {
-        let nm = _rstr(b, pos);
+        if pos.i + 2 > total { return nil; }
+        let nlen = _r16(b, pos);
+        if pos.i + nlen > total { return nil; }
+        let nm = _rstr_n(b, pos, nlen);
+        if pos.i + 9 > total { return nil; }
         let is_text = b[pos.i] == 1;
         pos.i = pos.i + 1;
         let orig_len = _r32(b, pos);
         let comp_len = _r32(b, pos);
+        if pos.i + comp_len > total { return nil; }
         let comp = [];
         let c = 0;
         while c < comp_len { array_push(comp, b[pos.i + c]); c = c + 1; }
         pos.i = pos.i + comp_len;
-        array_push(st.order, nm);
+        if not map_has(st.entries, nm) { array_push(st.order, nm); }
         st.entries[nm] = map{ orig_len: orig_len, comp_len: comp_len, comp: comp, text: is_text };
         e = e + 1;
     }
+    let rem = total - pos.i;
+    if rem == 0 { return st; }
+    if rem != 8 { return nil; }
+    if b[pos.i] != 80 or b[pos.i + 1] != 66 or b[pos.i + 2] != 83 or b[pos.i + 3] != 88 { return nil; }
+    let want = b[pos.i + 4] * 16777216 + b[pos.i + 5] * 65536 + b[pos.i + 6] * 256 + b[pos.i + 7];
+    let body = [];
+    let k = 0;
+    while k < pos.i { array_push(body, b[k]); k = k + 1; }
+    if F.crc32(body) != want { return nil; }
     return st;
 }
 
-export create, put, put_file, put_folder, has, get, get_bytes, remove, list, stats, save, load;
+// ── safe unpack to disk ─────────────────────────────────────────────────────
+// _safe_name(name) — nil when the entry name is a traversal attempt
+// (absolute path, drive letter, `..` segment, NUL, backslash tricks).
+// Same policy as zipfile.extract / tar.extract.
+fn _safe_name(name) {
+    if type(name) != "string" or len(name) == 0 { return nil; }
+    let norm = "";
+    let i = 0;
+    while i < len(name) {
+        let ch = name[i];
+        if ch == str_from_char_code(0) { return nil; }
+        if ch == str_from_char_code(92) { norm = norm + "/"; } else { norm = norm + ch; }
+        i = i + 1;
+    }
+    if norm[0] == "/" { return nil; }
+    if len(norm) >= 2 and norm[1] == ":" { return nil; }
+    let seg = "";
+    i = 0;
+    while i <= len(norm) {
+        let end = i == len(norm);
+        if end or norm[i] == "/" {
+            if seg == ".." { return nil; }
+            seg = "";
+        } else { seg = seg + norm[i]; }
+        i = i + 1;
+    }
+    return norm;
+}
+
+fn _parent_dir(path) {
+    let last = 0 - 1;
+    let i = 0;
+    while i < len(path) {
+        if path[i] == "/" { last = i; }
+        i = i + 1;
+    }
+    if last <= 0 { return nil; }
+    return str_slice(path, 0, last);
+}
+
+// unpack(st, dest_dir) — write every entry under dest_dir, refusing
+// storage-slip names. Returns map{ written: [paths], skipped: [names] }.
+fn unpack(st, dest_dir) {
+    let written = [];
+    let skipped = [];
+    let i = 0;
+    while i < len(st.order) {
+        let nm = st.order[i];
+        let safe = _safe_name(nm);
+        if safe == nil {
+            array_push(skipped, nm);
+        } else {
+            let path = dest_dir + "/" + safe;
+            let dir = _parent_dir(path);
+            if dir != nil { try fs_mkdirs(dir) catch nil; }
+            let r = try map{ ok: fs_write_bytes(path, get_bytes(st, nm)) } catch nil;
+            if r == nil { array_push(skipped, nm); } else { array_push(written, path); }
+        }
+        i = i + 1;
+    }
+    return map{ written: written, skipped: skipped };
+}
+
+export create, put, put_file, put_folder, has, get, get_bytes, remove, list, stats, save, load, unpack;
