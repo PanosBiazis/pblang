@@ -1,0 +1,202 @@
+// stdlib/gpu3d.sapp — the 3D extension of pblang's GPU stack.
+//
+// A triangle-mesh IR that mirrors gpu2d, one dimension up: build triangles / quads / boxes,
+// each vertex carrying position + an auto-computed face NORMAL + colour (10 floats:
+// [x,y,z, nx,ny,nz, r,g,b,a]). The emitted shaders multiply by an MVP matrix (mat4.sapp)
+// and shade with simple Lambert lighting. Parallel bake via stdlib/parallel. Pure codegen —
+// a wgpu/OpenGL host (gpu2d_host-style) runs it; the CPU path can raster it via a software
+// projector. Same philosophy throughout: pblang produces the real payload + program.
+//
+//   let G3 = import("stdlib/gpu3d.sapp");
+//   let m = G3.new();  G3.box(m, 0,0,0, 1,1,1, color);
+//   let buf = G3.to_vertex_f32(m);   // upload; draw G3.vertices(m) verts with G3.wgsl()
+
+let P = import("stdlib:parallel.sapp");
+let MA = import("stdlib:math.sapp");   // sin/cos/PI for sphere/cylinder
+
+fn new() { return map{ verts: [] }; }
+
+fn _sub(a, b) { return map{ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+fn _cross(a, b) { return map{ x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x }; }
+fn _norm(v) {
+    let ln = num_sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if ln == 0 { return map{ x: 0.0, y: 0.0, z: 0.0 }; }
+    return map{ x: v.x / ln, y: v.y / ln, z: v.z / ln };
+}
+fn _col(c) {
+    let a = 255;
+    if map_has(c, "a") { a = c.a; }
+    return map{ r: c.r / 255.0, g: c.g / 255.0, b: c.b / 255.0, a: a / 255.0 };
+}
+fn _vert(m, p, n, cn) {
+    array_push(m.verts, p.x * 1.0); array_push(m.verts, p.y * 1.0); array_push(m.verts, p.z * 1.0);
+    array_push(m.verts, n.x); array_push(m.verts, n.y); array_push(m.verts, n.z);
+    array_push(m.verts, cn.r); array_push(m.verts, cn.g); array_push(m.verts, cn.b); array_push(m.verts, cn.a);
+}
+
+// tri(m, p0, p1, p2, col) — a triangle; the flat face normal is computed automatically.
+fn tri(m, p0, p1, p2, col) {
+    let n = _norm(_cross(_sub(p1, p0), _sub(p2, p0)));
+    let cn = _col(col);
+    _vert(m, p0, n, cn); _vert(m, p1, n, cn); _vert(m, p2, n, cn);
+    return m;
+}
+// quad(m, p0..p3, col) — two triangles (p0,p1,p2)+(p0,p2,p3).
+fn quad(m, p0, p1, p2, p3, col) {
+    tri(m, p0, p1, p2, col);
+    tri(m, p0, p2, p3, col);
+    return m;
+}
+fn _v(x, y, z) { return map{ x: x, y: y, z: z }; }
+// box(m, cx,cy,cz, sx,sy,sz, col) — an axis-aligned box (6 faces, CCW outward).
+fn box(m, cx, cy, cz, sx, sy, sz, col) {
+    let hx = sx / 2.0;
+    let hy = sy / 2.0;
+    let hz = sz / 2.0;
+    let x0 = cx - hx; let x1 = cx + hx;
+    let y0 = cy - hy; let y1 = cy + hy;
+    let z0 = cz - hz; let z1 = cz + hz;
+    quad(m, _v(x0, y0, z1), _v(x1, y0, z1), _v(x1, y1, z1), _v(x0, y1, z1), col);   // +Z front
+    quad(m, _v(x1, y0, z0), _v(x0, y0, z0), _v(x0, y1, z0), _v(x1, y1, z0), col);   // -Z back
+    quad(m, _v(x1, y0, z1), _v(x1, y0, z0), _v(x1, y1, z0), _v(x1, y1, z1), col);   // +X right
+    quad(m, _v(x0, y0, z0), _v(x0, y0, z1), _v(x0, y1, z1), _v(x0, y1, z0), col);   // -X left
+    quad(m, _v(x0, y1, z1), _v(x1, y1, z1), _v(x1, y1, z0), _v(x0, y1, z0), col);   // +Y top
+    quad(m, _v(x0, y0, z0), _v(x1, y0, z0), _v(x1, y0, z1), _v(x0, y0, z1), col);   // -Y bottom
+    return m;
+}
+
+// plane(m, cx,cy,cz, sx,sz, col) — a flat quad in the XZ plane, normal +Y.
+fn plane(m, cx, cy, cz, sx, sz, col) {
+    let hx = sx / 2.0;
+    let hz = sz / 2.0;
+    quad(m, _v(cx - hx, cy, cz - hz), _v(cx - hx, cy, cz + hz), _v(cx + hx, cy, cz + hz), _v(cx + hx, cy, cz - hz), col);
+    return m;
+}
+
+fn _sphere_pt(cx, cy, cz, r, theta, phi) {
+    let st = MA.sin(theta);
+    return _v(cx + r * st * MA.cos(phi), cy + r * MA.cos(theta), cz + r * st * MA.sin(phi));
+}
+// sphere(m, cx,cy,cz, radius, segments, rings, col) — a UV sphere.
+fn sphere(m, cx, cy, cz, radius, segments, rings, col) {
+    let i = 0;
+    while i < rings {
+        let t0 = MA.PI * i / rings;
+        let t1 = MA.PI * (i + 1) / rings;
+        let j = 0;
+        while j < segments {
+            let p0 = 2.0 * MA.PI * j / segments;
+            let p1 = 2.0 * MA.PI * (j + 1) / segments;
+            quad(m, _sphere_pt(cx, cy, cz, radius, t0, p0), _sphere_pt(cx, cy, cz, radius, t1, p0),
+                _sphere_pt(cx, cy, cz, radius, t1, p1), _sphere_pt(cx, cy, cz, radius, t0, p1), col);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+// cylinder(m, cx,cy,cz, radius, height, segments, col) — the side wall (open ends).
+fn cylinder(m, cx, cy, cz, radius, height, segments, col) {
+    let hy = height / 2.0;
+    let j = 0;
+    while j < segments {
+        let a0 = 2.0 * MA.PI * j / segments;
+        let a1 = 2.0 * MA.PI * (j + 1) / segments;
+        let x0 = cx + radius * MA.cos(a0);
+        let z0 = cz + radius * MA.sin(a0);
+        let x1 = cx + radius * MA.cos(a1);
+        let z1 = cz + radius * MA.sin(a1);
+        quad(m, _v(x0, cy - hy, z0), _v(x1, cy - hy, z1), _v(x1, cy + hy, z1), _v(x0, cy + hy, z0), col);
+        j = j + 1;
+    }
+    return m;
+}
+
+fn vertices(m) { return len(m.verts) / 10; }
+fn triangles(m) { return len(m.verts) / 30; }
+fn to_vertex_f32(m) { return m.verts; }
+fn clear(m) { m.verts = []; return m; }
+fn stats(m) {
+    return map{ vertices: len(m.verts) / 10, triangles: len(m.verts) / 30, floats: len(m.verts), draw_calls: 1 };
+}
+
+// parallel bake: split the vertex float list across cores (already flat; chunk + rejoin).
+fn to_vertex_f32_par(m) {
+    let per = 300;   // ~30 verts per chunk
+    let chunks = [];
+    let i = 0;
+    while i < len(m.verts) {
+        let c = [];
+        let j = 0;
+        while j < per and i + j < len(m.verts) { array_push(c, m.verts[i + j]); j = j + 1; }
+        array_push(chunks, c);
+        i = i + per;
+    }
+    let baked = P.par_map(chunks, fn(c) { return c; });
+    let out = [];
+    let ci = 0;
+    while ci < len(baked) {
+        let c = baked[ci];
+        let k = 0;
+        while k < len(c) { array_push(out, c[k]); k = k + 1; }
+        ci = ci + 1;
+    }
+    return out;
+}
+
+// ── shader (MVP + Lambert) + vertex layout ──────────────────────────────────────────
+fn vertex_layout() {
+    return map{ stride: 40, step: "vertex", attributes: [
+        map{ location: 0, offset: 0,  floats: 3, name: "pos",    format: "float32x3" },
+        map{ location: 1, offset: 12, floats: 3, name: "normal", format: "float32x3" },
+        map{ location: 2, offset: 24, floats: 4, name: "color",  format: "float32x4" }
+    ]};
+}
+let _W = nil;
+fn wgsl() {
+    if _W != nil { return _W; }
+    let L = [
+        "// gpu3d WGSL — MVP transform + Lambert lighting.",
+        "struct U { mvp: mat4x4<f32>, light: vec4<f32> };",
+        "@group(0) @binding(0) var<uniform> u: U;",
+        "struct VOut { @builtin(position) pos: vec4<f32>, @location(0) normal: vec3<f32>, @location(1) color: vec4<f32> };",
+        "@vertex",
+        "fn vs_main(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) col: vec4<f32>) -> VOut {",
+        "  var o: VOut; o.pos = u.mvp * vec4<f32>(p, 1.0); o.normal = n; o.color = col; return o;",
+        "}",
+        "@fragment",
+        "fn fs_main(in: VOut) -> @location(0) vec4<f32> {",
+        "  let Ld = normalize(u.light.xyz);",
+        "  let d = max(dot(normalize(in.normal), Ld), 0.0);",
+        "  let shade = 0.2 + 0.8 * d;",
+        "  return vec4<f32>(in.color.rgb * shade, in.color.a);",
+        "}"
+    ];
+    _W = str_join(L, "\n");
+    return _W;
+}
+fn glsl_vertex() {
+    return str_join([
+        "#version 330 core",
+        "layout(location=0) in vec3 i_pos;",
+        "layout(location=1) in vec3 i_normal;",
+        "layout(location=2) in vec4 i_color;",
+        "uniform mat4 u_mvp;",
+        "out vec3 v_normal; out vec4 v_color;",
+        "void main() { gl_Position = u_mvp * vec4(i_pos, 1.0); v_normal = i_normal; v_color = i_color; }"
+    ], "\n");
+}
+fn glsl_fragment() {
+    return str_join([
+        "#version 330 core",
+        "in vec3 v_normal; in vec4 v_color; uniform vec3 u_light; out vec4 fragColor;",
+        "void main() {",
+        "  float d = max(dot(normalize(v_normal), normalize(u_light)), 0.0);",
+        "  fragColor = vec4(v_color.rgb * (0.2 + 0.8*d), v_color.a);",
+        "}"
+    ], "\n");
+}
+
+export new, tri, quad, box, plane, sphere, cylinder, vertices, triangles, to_vertex_f32, to_vertex_f32_par, clear, stats;
+export vertex_layout, wgsl, glsl_vertex, glsl_fragment;

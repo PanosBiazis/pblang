@@ -1,0 +1,125 @@
+// stdlib/risk_gate.sapp — a deterministic, unbypassable trading risk cage.
+//
+// Harvested from the ibkr trading project. The design principle it carries:
+// POLICY (what to trade) can come from anywhere — a strategy, an AI, a human —
+// but MECHANISM (whether an order is permitted) is decided HERE, by a pure
+// function with no I/O, so every rule is exhaustively unit-testable and the
+// cage behaves identically on paper and on a real account.
+//
+//   let RG = import("stdlib:risk_gate.sapp");
+//   let d = RG.check(order, state, config, live_confirmed);
+//   if d.allow { place(order); } else { log(d.rule, d.reason); }
+//
+// order:  { symbol, side ("BUY"/"SELL"), quantity, est_cost, est_proceeds }
+// state:  { cash, positions: {sym: shares}, day_open_equity, current_equity, kill_switch }
+// config: { is_live, whitelist: [sym], daily_loss_limit_pct, budget,
+//           cash_buffer_pct, max_position_pct }
+//
+// Rules, in priority order (first violated rule wins). SELL orders that merely
+// close existing positions are deliberately allowed even under the kill switch
+// or a breached loss limit — you can ALWAYS exit.
+
+let EPS = 0.000000001;
+
+fn _deny(rule, reason) { return map{ allow: false, reason: reason, rule: rule }; }
+
+// daily_drawdown(state) — signed fractional change vs day-open equity
+// (-0.05 == down 5%). Zero when day-open equity is unset/non-positive.
+fn daily_drawdown(state) {
+    if state.day_open_equity <= 0 { return 0.0; }
+    return (state.current_equity - state.day_open_equity) / state.day_open_equity;
+}
+
+// loss_limit_breached(state, pct) — kill switch OR drawdown at/past -|pct|.
+fn loss_limit_breached(state, pct) {
+    let p = pct;
+    if p < 0 { p = 0 - p; }
+    return state.kill_switch or daily_drawdown(state) <= (0 - p);
+}
+
+// size_for(budget, price, max_position_pct) — whole shares that fit the
+// per-position cap. Never fractional, never negative.
+fn size_for(budget, price, max_position_pct) {
+    if price <= 0 { return 0; }
+    let cap = budget * max_position_pct;
+    let n = num_floor(cap / price);
+    if n < 0 { return 0; }
+    return n;
+}
+
+// check(order, state, config, live_confirmed) -> { allow, reason, rule }.
+fn check(order, state, config, live_confirmed) {
+    let side = str_upper(str(order.side));
+
+    // live-trading guard: highest priority — on a real account refuse
+    // everything unless a human explicitly armed it.
+    let is_live = false;
+    if map_has(config, "is_live") { is_live = config.is_live; }
+    if is_live and not live_confirmed {
+        return _deny("live_guard", "is_live but live trading is not confirmed; refusing all orders");
+    }
+
+    // whitelist only (tradeability guarantee).
+    let wl = config.whitelist;
+    let listed = false;
+    let i = 0;
+    while i < len(wl) { if wl[i] == order.symbol { listed = true; } i = i + 1; }
+    if not listed { return _deny("whitelist", str(order.symbol) + " is not on the whitelist"); }
+
+    // side must be a known long-only action.
+    if side != "BUY" and side != "SELL" {
+        return _deny("side", "unknown side '" + str(order.side) + "'; only BUY/SELL");
+    }
+
+    // no fractional shares.
+    if order.quantity != num_floor(order.quantity) {
+        return _deny("fractional", "fractional quantity " + str(order.quantity) + " not allowed; whole shares only");
+    }
+    let qty = order.quantity;
+
+    // positive size.
+    if qty <= 0 { return _deny("quantity", "quantity must be >= 1, got " + str(qty)); }
+
+    let held = 0;
+    if map_has(state.positions, order.symbol) { held = state.positions[order.symbol]; }
+
+    if side == "SELL" {
+        // no shorting: cannot sell more than held.
+        if qty > held {
+            return _deny("no_short", "cannot SELL " + str(qty) + " of " + str(order.symbol)
+                + "; only " + str(held) + " held (no shorting)");
+        }
+        // closing orders are ALWAYS permitted, even under the kill switch.
+        return map{ allow: true, reason: "sell within held quantity", rule: "" };
+    }
+
+    // --- BUY path ---
+
+    // daily loss limit: no new exposure once breached.
+    if loss_limit_breached(state, config.daily_loss_limit_pct) {
+        return _deny("daily_loss_limit", "daily loss limit hit (drawdown "
+            + str(daily_drawdown(state)) + "); no new BUYs today");
+    }
+
+    let budget = config.budget;
+    let buffer = config.cash_buffer_pct * budget;
+    let max_position = config.max_position_pct * budget;
+
+    // single-order size sanity.
+    if order.est_cost > max_position + EPS {
+        return _deny("max_position", "order cost " + str(order.est_cost)
+            + " exceeds max position " + str(max_position));
+    }
+
+    // affordability with the cash buffer preserved.
+    let investable = state.cash - buffer;
+    if order.est_cost > investable + EPS {
+        return _deny("buffer", "order cost " + str(order.est_cost)
+            + " would breach cash buffer (cash " + str(state.cash)
+            + ", must keep " + str(buffer) + ", investable " + str(investable) + ")");
+    }
+
+    return map{ allow: true, reason: "buy within all limits", rule: "" };
+}
+
+export daily_drawdown, loss_limit_breached, size_for, check;

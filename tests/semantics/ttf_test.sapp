@@ -1,0 +1,159 @@
+// tests/semantics/ttf_test.sapp — stdlib/ttf.sapp
+//
+// The TrueType decode core: big-endian byte readers, the sfnt table directory, and the
+// 'glyf' SIMPLE-glyph outline decoder (flags + delta-encoded coords -> contours). Feeds the
+// outlines straight into glyph_raster to fill the atlas. Tested with hand-built bytes (a
+// triangle glyph), so no font fixture is required. Pure + deterministic.
+
+let TTF = import("stdlib/ttf.sapp");
+let GR = import("stdlib/glyph_raster.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=[" + str(a) + "] want=[" + str(b) + "]"); } }
+fn truthy(c, m) { if c != true { fail(m); } }
+
+// ── big-endian readers ──────────────────────────────────────────────────────────────
+let b = [0x00, 0x12, 0xFF, 0xFE, 0x00, 0x00, 0x00, 0x05];
+eq(TTF.u8(b, 1), 0x12, "u8");
+eq(TTF.u16(b, 0), 18, "u16 big-endian");
+eq(TTF.u16(b, 2), 65534, "u16 0xFFFE");
+eq(TTF.i16(b, 2), 0 - 2, "i16 signed -2");
+eq(TTF.u32(b, 4), 5, "u32 = 5");
+
+// ── table directory: 12-byte sfnt header + one 16-byte 'glyf' record ────────────────
+let hdr = [
+    0x00, 0x01, 0x00, 0x00,     // sfnt version 1.0
+    0x00, 0x01,                 // numTables = 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // searchRange/entrySelector/rangeShift
+    0x67, 0x6C, 0x79, 0x66,     // tag "glyf"
+    0x00, 0x00, 0x00, 0x00,     // checksum
+    0x00, 0x00, 0x00, 0x1C,     // offset = 28
+    0x00, 0x00, 0x00, 0x64      // length = 100
+];
+let dir = TTF.read_table_directory(hdr);
+eq(dir.num_tables, 1, "one table");
+truthy(map_has(dir.tables, "glyf"), "glyf table found");
+eq(dir.tables["glyf"].offset, 28, "glyf offset");
+eq(dir.tables["glyf"].length, 100, "glyf length");
+
+// ── a simple glyph: a triangle (10,10)-(50,10)-(10,50), all on-curve ────────────────
+let glyph = [
+    0x00, 0x01,                             // numberOfContours = 1
+    0x00, 0x0A, 0x00, 0x0A, 0x00, 0x32, 0x00, 0x32,   // xMin,yMin,xMax,yMax
+    0x00, 0x02,                             // endPtsOfContours[0] = 2  (=> 3 points)
+    0x00, 0x00,                             // instructionLength = 0
+    0x37, 0x37, 0x27,                       // flags: on-curve + short coords
+    10, 40, 40,                             // x deltas: +10, +40, -40
+    10, 0, 40                               // y deltas: +10,  +0, +40
+];
+let g = TTF.parse_simple_glyph(glyph, 0);
+eq(len(g.contours), 1, "one contour");
+eq(len(g.contours[0]), 3, "three points");
+eq(g.contours[0][0].x, 10, "p0.x"); eq(g.contours[0][0].y, 10, "p0.y");
+eq(g.contours[0][1].x, 50, "p1.x"); eq(g.contours[0][1].y, 10, "p1.y");
+eq(g.contours[0][2].x, 10, "p2.x"); eq(g.contours[0][2].y, 50, "p2.y");
+truthy(g.contours[0][0].on_curve, "p0 on-curve");
+
+// ── end-to-end: decode -> rasterize -> a pixel inside the triangle is filled ─────────
+let bmp = GR.rasterize(g.contours, 60, 60);
+truthy(GR.get(bmp, 15, 15) > 0, "glyph interior rasterized");
+eq(GR.get(bmp, 45, 45), 0, "outside the triangle is empty");
+
+// ── cmap format 4: char code -> glyph index ─────────────────────────────────────────
+// one real segment: chars 65..67 map via idDelta -29 (so 'A'=65 -> glyph 36), then the
+// mandatory 0xFFFF terminator segment.
+let cmap = [
+    0x00, 0x04,             // format 4
+    0x00, 0x00,             // length (ignored here)
+    0x00, 0x00,             // language
+    0x00, 0x04,             // segCountX2 = 4 -> segCount 2
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // searchRange/entrySelector/rangeShift
+    0x00, 0x43, 0xFF, 0xFF, // endCode   = [67, 65535]
+    0x00, 0x00,             // reservedPad
+    0x00, 0x41, 0xFF, 0xFF, // startCode = [65, 65535]
+    0xFF, 0xE3, 0x00, 0x01, // idDelta   = [-29, 1]
+    0x00, 0x00, 0x00, 0x00  // idRangeOffset = [0, 0]
+];
+let cm = TTF.parse_cmap4(cmap, 0);
+eq(cm.seg_count, 2, "two segments");
+eq(TTF.cmap_lookup(cm, 65), 36, "'A' (65) -> glyph 36 via idDelta -29");
+eq(TTF.cmap_lookup(cm, 66), 37, "66 -> 37");
+eq(TTF.cmap_lookup(cm, 67), 38, "67 -> 38");
+eq(TTF.cmap_lookup(cm, 200), 0, "unmapped char -> .notdef (0)");
+
+// ── composite glyph: one component referencing glyph 5 at offset (10,20) ─────────────
+let comp = [
+    0xFF, 0xFF,             // numberOfContours = -1 (composite)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // bbox
+    0x00, 0x03,             // flags = ARGS_ARE_XY (0x02) | ARG_WORDS (0x01)
+    0x00, 0x05,             // glyphIndex = 5
+    0x00, 0x0A,             // arg1 = dx = 10
+    0x00, 0x14              // arg2 = dy = 20
+];
+let cg = TTF.parse_composite_glyph(comp, 0);
+truthy(cg.composite, "flagged composite");
+eq(len(cg.components), 1, "one component");
+eq(cg.components[0].glyph_index, 5, "component glyph index");
+eq(cg.components[0].dx, 10, "component dx");
+eq(cg.components[0].dy, 20, "component dy");
+
+// parse_glyph dispatches simple vs composite by the contour-count sign
+eq(TTF.parse_glyph(comp, 0).composite, true, "parse_glyph routes composite");
+eq(TTF.parse_glyph(glyph, 0).composite, false, "parse_glyph routes simple");
+
+// ── robustness: validate() rejects malformed/truncated fonts up front ───────────────
+// (and because pblang is memory-safe, a bad offset THROWS — catchable — never corrupts.)
+truthy(TTF.validate(hdr).ok, "a well-formed header validates");
+truthy(not TTF.validate([0, 1, 0]).ok, "a 3-byte 'font' is rejected");
+truthy(not TTF.validate([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).ok, "bad sfnt version rejected");
+// parsing garbage throws rather than reads out of bounds
+let threw = (try TTF.parse_simple_glyph([0, 1], 0) catch "SAFE-THROW");
+eq(threw, "SAFE-THROW", "truncated glyph throws safely (memory-safe)");
+
+// ── head / loca / hmtx (synthetic) ──────────────────────────────────────────────────
+// head: unitsPerEm (u16 @18) and indexToLocFormat (i16 @50)
+let head = [];
+let hi = 0; while hi < 54 { array_push(head, 0); hi = hi + 1; }
+head[18] = 0x08; head[19] = 0x00;   // unitsPerEm = 2048
+head[50] = 0x00; head[51] = 0x01;   // indexToLocFormat = 1 (long)
+let hd = TTF.parse_head(head, 0);
+eq(hd.units_per_em, 2048, "unitsPerEm"); eq(hd.index_to_loc_format, 1, "loca long format");
+
+// loca (long): offsets for 2 glyphs -> 3 entries
+let loca = [0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x64,  0x00, 0x00, 0x00, 0xF0];
+let lo = TTF.parse_loca(loca, 0, 2, true);
+eq(len(lo), 3, "numGlyphs+1 offsets"); eq(lo[1], 100, "glyph0 ends at 100"); eq(lo[2], 240, "glyph1 ends at 240");
+
+// hmtx: 2 long metrics, then 1 mono-spaced glyph sharing the last advance
+let hmtx = [0x00, 0x30, 0x00, 0x05,  0x00, 0x28, 0x00, 0x03,  0x00, 0x02];
+let hm = TTF.parse_hmtx(hmtx, 0, 2, 3);
+eq(len(hm), 3, "one metric per glyph");
+eq(hm[0].advance_width, 48, "glyph0 advance"); eq(hm[0].lsb, 5, "glyph0 lsb");
+eq(hm[2].advance_width, 40, "glyph2 inherits last advance"); eq(hm[2].lsb, 2, "glyph2 lsb only");
+
+// ── end-to-end against a REAL installed font (skips if none present) ─────────────────
+let candidates = [
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
+];
+let bytes = nil;
+let ci = 0;
+while ci < len(candidates) and bytes == nil {
+    bytes = try fs_read_bytes(candidates[ci]) catch nil;
+    ci = ci + 1;
+}
+if bytes == nil {
+    print "ttf real-font: skipped (no system font found)";
+} else {
+    let font = TTF.load_font(bytes);
+    truthy(font.num_glyphs > 0, "font has glyphs");
+    let gi = TTF.font_glyph_index(font, 65);   // 'A'
+    truthy(gi > 0, "'A' maps to a real glyph index");
+    truthy(TTF.font_advance(font, 65) > 0, "'A' has a positive advance width");
+    let g = TTF.font_glyph(font, 65);
+    truthy(len(g.contours) > 0 or g.composite, "'A' has an outline");
+    print "ttf real-font: rendered 'A' (glyph " + str(gi) + ")";
+}
+
+print "ttf_pass";
