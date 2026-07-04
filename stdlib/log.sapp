@@ -1,21 +1,25 @@
 // stdlib/log.sapp — Structured, leveled logging for pblang.
 //
-// Supports: DEBUG, INFO, WARN, ERROR levels. JSON and text output formats.
-// Global logger + per-module loggers.
+// Supports: TRACE, DEBUG, INFO, WARN, ERROR, FATAL levels. JSON and text
+// output formats. Global logger + per-module loggers with their own levels.
+// Field values whose keys look secret (password/token/...) are redacted by
+// default; messages and field values are sanitized against log injection.
 //
 // Usage:
 //   let log = import("stdlib:log.sapp");
 //   log.info("Server started", map{ port: 8080 });
-//   log.error("Database error", map{ query: "SELECT ...", err: "timeout" });
-//   let mylog = log.new_logger("my-module", "json");
+//   log.log_error("Database error", map{ query: "SELECT ...", err: "timeout" });
+//   let mylog = log.new_logger("my-module", "json", "debug");
 //   mylog.debug("Detailed trace");
 
-let _LEVEL_DEBUG = 0;
-let _LEVEL_INFO  = 1;
-let _LEVEL_WARN  = 2;
-let _LEVEL_ERROR = 3;
+let _LEVEL_TRACE = 0;
+let _LEVEL_DEBUG = 1;
+let _LEVEL_INFO  = 2;
+let _LEVEL_WARN  = 3;
+let _LEVEL_ERROR = 4;
+let _LEVEL_FATAL = 5;
 
-let _level_names = ["DEBUG", "INFO", "WARN", "ERROR"];
+let _level_names = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"];
 
 // Global state
 let _global_min_level = _LEVEL_INFO;
@@ -26,21 +30,105 @@ let _memory_logs = [];
 let _counters = map{};
 let _timers = map{};
 
-// set_level(level) — set global minimum level. Level: "debug","info","warn","error"
-fn set_level(level) {
-    let lower = str_lower(level);
-    if lower == "debug" { _global_min_level = _LEVEL_DEBUG; }
-    else if lower == "info"  { _global_min_level = _LEVEL_INFO; }
-    else if lower == "warn"  { _global_min_level = _LEVEL_WARN; }
-    else if lower == "error" { _global_min_level = _LEVEL_ERROR; }
+// ── security: sanitization + redaction ──────────────────────────────────────
+// C0 control chars + DEL. A message or field value containing a newline can
+// forge extra log lines (CWE-117); ESC opens terminal escape injection
+// (CWE-150). Text output escapes \n/\r/\t visibly and strips the rest.
+fn _build_ctrl() {
+    let s = "";
+    let i = 0;
+    while i <= 31 { s = s + str_from_char_code(i); i = i + 1; }
+    return s + str_from_char_code(127);
+}
+let _CTRL_ALL = _build_ctrl();
+let _NL  = str_from_char_code(10);
+let _CR  = str_from_char_code(13);
+let _TAB = str_from_char_code(9);
+
+fn _has_ctrl(s) {
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        if str_index_of(_CTRL_ALL, str_slice(s, i, i + 1)) >= 0 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// sanitize(v) — render v as a single safe log token: \n/\r/\t become visible
+// escapes, all other control chars are dropped. Public so other log-adjacent
+// modules (logger.sapp, custom sinks) share one injection defense.
+fn sanitize(v) { return _sanitize(v); }
+
+fn _sanitize(v) {
+    let s = str(v);
+    if _has_ctrl(s) == false { return s; }
+    let out = "";
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        let c = str_slice(s, i, i + 1);
+        if c == _NL { out = out + "\\n"; }
+        else if c == _CR { out = out + "\\r"; }
+        else if c == _TAB { out = out + "\\t"; }
+        else if str_index_of(_CTRL_ALL, c) >= 0 { }
+        else { out = out + c; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Default-on redaction: any field whose key contains one of these fragments
+// (case-insensitive) has its value replaced by "[REDACTED]" before formatting.
+let _redact_on = true;
+let _default_redact = ["password", "passwd", "pwd", "secret", "token",
+                       "api_key", "apikey", "authorization", "private_key",
+                       "access_key", "session", "cookie", "credential"];
+let _extra_redact = [];
+
+// set_redact_keys(keys) — ADD key fragments to the default redaction list.
+fn set_redact_keys(keys) { _extra_redact = keys; }
+
+// set_redaction(on) — disable/enable redaction (debugging escape hatch).
+fn set_redaction(on) { _redact_on = on; }
+
+fn _is_secret_key(k) {
+    let lk = str_lower(str(k));
+    for i len(_default_redact) {
+        if str_index_of(lk, _default_redact[i]) >= 0 { return true; }
+    }
+    for j len(_extra_redact) {
+        if str_index_of(lk, str_lower(str(_extra_redact[j]))) >= 0 { return true; }
+    }
+    return false;
+}
+
+fn _redact_fields(fields) {
+    if fields == nil { return nil; }
+    let out = map{};
+    let keys = map_keys(fields);
+    for i len(keys) {
+        let k = keys[i];
+        if _is_secret_key(k) { out[k] = "[REDACTED]"; }
+        else { out[k] = fields[k]; }
+    }
+    return out;
 }
 
 fn _level_num(level) {
     let lower = str_lower(level);
+    if lower == "trace" { return _LEVEL_TRACE; }
     if lower == "debug" { return _LEVEL_DEBUG; }
     if lower == "warn"  { return _LEVEL_WARN; }
     if lower == "error" { return _LEVEL_ERROR; }
+    if lower == "fatal" { return _LEVEL_FATAL; }
     return _LEVEL_INFO;
+}
+
+// set_level(level) — set global minimum level:
+// "trace","debug","info","warn","error","fatal"
+fn set_level(level) {
+    _global_min_level = _level_num(level);
 }
 
 // get_level() — current global minimum level as a lowercase name.
@@ -50,7 +138,7 @@ fn get_level() { return str_lower(_level_names[_global_min_level]); }
 fn is_enabled(level) { return _level_num(level) >= _global_min_level; }
 
 // levels() — the level names, lowest to highest severity.
-fn levels() { return ["debug", "info", "warn", "error"]; }
+fn levels() { return ["trace", "debug", "info", "warn", "error", "fatal"]; }
 
 // set_format(format) — "text" or "json"
 fn set_format(format) {
@@ -60,6 +148,7 @@ fn set_format(format) {
 // set_output(output) — "stdout", "stderr", or a file path
 fn set_output(output) {
     _global_output = output;
+    _rot_size = nil;
     if output != "stdout" and output != "stderr" {
         _log_file_path = output;
     } else {
@@ -73,6 +162,41 @@ fn use_memory_output() {
     _memory_logs = [];
 }
 
+// Bounded memory sink: keep at most _memory_limit entries (oldest dropped).
+// An unbounded sink is a slow memory leak in any long-running server.
+let _memory_limit = 1000;
+
+// set_memory_limit(n) — cap the in-memory log buffer at n entries.
+fn set_memory_limit(n) {
+    if n < 1 { n = 1; }
+    _memory_limit = n;
+}
+
+// File rotation: when the live log file reaches _max_file_size bytes it is
+// renamed to <path>.1 (replacing any previous .1) and a fresh file starts.
+// 0 disables rotation. Size is tracked incrementally, not re-stat'ed per line.
+let _max_file_size = 0;
+let _rot_size = nil;
+
+// set_max_file_size(bytes) — rotate the log file at this size; 0 = never.
+fn set_max_file_size(bytes) {
+    _max_file_size = bytes;
+    _rot_size = nil;
+}
+
+fn _rotate_if_needed(line_len) {
+    if _max_file_size <= 0 { return; }
+    if _rot_size == nil {
+        _rot_size = len(try fs_read(_log_file_path) catch "");
+    }
+    if _rot_size >= _max_file_size {
+        try fs_remove(_log_file_path + ".1") catch nil;
+        try fs_rename(_log_file_path, _log_file_path + ".1") catch nil;
+        _rot_size = 0;
+    }
+    _rot_size = _rot_size + line_len + 1;
+}
+
 fn memory_entries() { return _memory_logs; }
 
 fn clear_memory() { _memory_logs = []; }
@@ -83,11 +207,11 @@ fn _now_iso() {
 
 fn _format_text(level_name, message, fields) {
     let ts = _now_iso();
-    let line = "[" + ts + "] [" + level_name + "] " + message;
+    let line = "[" + ts + "] [" + level_name + "] " + _sanitize(message);
     if fields != nil {
         let keys = map_keys(fields);
         for i len(keys) {
-            line = line + " " + keys[i] + "=" + str(fields[keys[i]]);
+            line = line + " " + _sanitize(keys[i]) + "=" + _sanitize(fields[keys[i]]);
         }
     }
     return line;
@@ -99,14 +223,24 @@ fn _format_json(level_name, message, fields, source) {
     if fields != nil {
         let keys = map_keys(fields);
         for i len(keys) {
-            entry[keys[i]] = fields[keys[i]];
+            let k = keys[i];
+            // reserved envelope keys can't be forged by caller fields; the
+            // colliding value is kept, namespaced under field_<key>
+            if k == "ts" or k == "level" or k == "msg" or k == "source" {
+                entry["field_" + k] = fields[k];
+            } else {
+                entry[k] = fields[k];
+            }
         }
     }
     return json_stringify(entry);
 }
 
-fn _write_log(level_num, level_name, message, fields, source, format, output) {
-    if level_num < _global_min_level { return; }
+fn _write_log(level_num, level_name, message, fields, source, format, output, min_level = nil) {
+    let threshold = _global_min_level;
+    if min_level != nil { threshold = min_level; }
+    if level_num < threshold { return; }
+    if _redact_on { fields = _redact_fields(fields); }
     let line = "";
     if format == "json" {
         line = _format_json(level_name, message, fields, source);
@@ -114,12 +248,21 @@ fn _write_log(level_num, level_name, message, fields, source, format, output) {
         line = _format_text(level_name, message, fields);
     }
     if _log_file_path != nil {
+        _rotate_if_needed(len(line));
         try fs_append(_log_file_path, line + "\n") catch nil;
     } else if output == "memory" {
         array_push(_memory_logs, map{ level: level_name, message: message, fields: fields, source: source, line: line });
+        if len(_memory_logs) > _memory_limit {
+            _memory_logs = slice(_memory_logs, len(_memory_logs) - _memory_limit, nil);
+        }
     } else {
         print line;
     }
+}
+
+// trace(msg, fields) — log at TRACE level (finest detail)
+fn trace(msg, fields) {
+    _write_log(_LEVEL_TRACE, "TRACE", msg, fields, nil, _global_format, _global_output);
 }
 
 // debug(msg, fields) — log at DEBUG level
@@ -142,26 +285,66 @@ fn log_error(msg, fields) {
     _write_log(_LEVEL_ERROR, "ERROR", msg, fields, nil, _global_format, _global_output);
 }
 
-// new_logger(source, format) — create a named logger
-fn new_logger(source, format = nil) {
+// fatal(msg, fields) — log at FATAL level (never below any threshold in use)
+fn fatal(msg, fields) {
+    _write_log(_LEVEL_FATAL, "FATAL", msg, fields, nil, _global_format, _global_output);
+}
+
+// new_logger(source, format, level) — create a named logger. `level` (e.g.
+// "debug") overrides the global threshold for THIS logger only; nil follows
+// the global level.
+fn new_logger(source, format = nil, level = nil) {
     if format == nil { format = _global_format; }
+    let own_level = nil;
+    if level != nil { own_level = _level_num(level); }
     return map{
         source: source,
         format: format,
-        min_level: _global_min_level,
+        min_level: own_level,
+        trace: fn(msg, fields) {
+            _write_log(_LEVEL_TRACE, "TRACE", msg, fields, source, format, _global_output, own_level);
+        },
         debug: fn(msg, fields) {
-            _write_log(_LEVEL_DEBUG, "DEBUG", msg, fields, source, format, _global_output);
+            _write_log(_LEVEL_DEBUG, "DEBUG", msg, fields, source, format, _global_output, own_level);
         },
         info: fn(msg, fields) {
-            _write_log(_LEVEL_INFO, "INFO", msg, fields, source, format, _global_output);
+            _write_log(_LEVEL_INFO, "INFO", msg, fields, source, format, _global_output, own_level);
         },
         warn: fn(msg, fields) {
-            _write_log(_LEVEL_WARN, "WARN", msg, fields, source, format, _global_output);
+            _write_log(_LEVEL_WARN, "WARN", msg, fields, source, format, _global_output, own_level);
         },
         error: fn(msg, fields) {
-            _write_log(_LEVEL_ERROR, "ERROR", msg, fields, source, format, _global_output);
+            _write_log(_LEVEL_ERROR, "ERROR", msg, fields, source, format, _global_output, own_level);
+        },
+        fatal: fn(msg, fields) {
+            _write_log(_LEVEL_FATAL, "FATAL", msg, fields, source, format, _global_output, own_level);
         }
     };
+}
+
+// log_every(name, n, level, msg, fields) — sampled logging for hot loops:
+// emits the 1st, (n+1)th, (2n+1)th... call per `name`. Returns true if emitted.
+let _sample_counts = map{};
+
+fn log_every(name, n, level, msg, fields) {
+    if n < 1 { n = 1; }
+    let count = try _sample_counts[name] catch 0;
+    _sample_counts[name] = count + 1;
+    if count % n != 0 { return false; }
+    let num = _level_num(level);
+    _write_log(num, _level_names[num], msg, fields, nil, _global_format, _global_output);
+    return true;
+}
+
+// catch_and_log(label, fn_) — run fn_; on throw, log an ERROR naming `label`
+// and return map{ ok: false }. On success return map{ ok: true, value: ... }.
+// (pblang catch binds no error name, so the log carries the label, not the message.)
+fn catch_and_log(label, fn_) {
+    let out = try map{ ok: true, value: fn_() } catch map{ ok: false };
+    if out.ok == false {
+        _write_log(_LEVEL_ERROR, "ERROR", "exception in " + str(label), map{ op: label }, nil, _global_format, _global_output);
+    }
+    return out;
 }
 
 // timed(label, fn) — measure and log execution time
@@ -178,7 +361,7 @@ fn counter(name, delta, fields) {
     let cur = try _counters[name] catch nil;
     if cur == nil { _counters[name] = 0; }
     _counters[name] = _counters[name] + delta;
-    _write_log(_LEVEL_INFO, "INFO", "counter " + name, map{ value: _counters[name], delta: delta, fields: fields }, nil, _global_format, _global_output);
+    _write_log(_LEVEL_INFO, "INFO", "counter " + name, _merge_fields(map{ value: _counters[name], delta: delta }, fields), nil, _global_format, _global_output);
     return _counters[name];
 }
 
@@ -187,6 +370,17 @@ fn counter_value(name) {
     if cur == nil { return 0; }
     return _counters[name];
 }
+
+// counters() — snapshot copy of all counter totals.
+fn counters() {
+    let out = map{};
+    let keys = map_keys(_counters);
+    for i len(keys) { out[keys[i]] = _counters[keys[i]]; }
+    return out;
+}
+
+// reset_counters() — zero every counter.
+fn reset_counters() { _counters = map{}; }
 
 fn timer_start(name) {
     _timers[name] = clock();
@@ -198,7 +392,7 @@ fn timer_stop(name, fields) {
     if started == nil { return nil; }
     let elapsed_ms = (clock() - _timers[name]) * 1000.0;
     _timers[name] = nil;
-    _write_log(_LEVEL_INFO, "INFO", "timer " + name, map{ elapsed_ms: elapsed_ms, fields: fields }, nil, _global_format, _global_output);
+    _write_log(_LEVEL_INFO, "INFO", "timer " + name, _merge_fields(map{ elapsed_ms: elapsed_ms }, fields), nil, _global_format, _global_output);
     return elapsed_ms;
 }
 
@@ -207,7 +401,7 @@ fn span(name, fields, fn_) {
     _write_log(_LEVEL_DEBUG, "DEBUG", "span.start " + name, fields, nil, _global_format, _global_output);
     let result = fn_();
     let elapsed_ms = (clock() - start) * 1000.0;
-    _write_log(_LEVEL_INFO, "INFO", "span.end " + name, map{ elapsed_ms: elapsed_ms, fields: fields }, nil, _global_format, _global_output);
+    _write_log(_LEVEL_INFO, "INFO", "span.end " + name, _merge_fields(map{ elapsed_ms: elapsed_ms }, fields), nil, _global_format, _global_output);
     return result;
 }
 
@@ -244,8 +438,11 @@ fn _merge_fields(a, b) {
 }
 
 export set_level, set_format, set_output,
-       debug, info, warn, log_error,
+       trace, debug, info, warn, log_error, fatal,
        new_logger, timed;
-export use_memory_output, memory_entries, clear_memory;
-export counter, counter_value, timer_start, timer_stop, span, with_fields;
+export use_memory_output, memory_entries, clear_memory, set_memory_limit;
+export counter, counter_value, counters, reset_counters,
+       timer_start, timer_stop, span, with_fields;
 export get_level, is_enabled, levels;
+export set_redact_keys, set_redaction;
+export log_every, catch_and_log, set_max_file_size, sanitize;
