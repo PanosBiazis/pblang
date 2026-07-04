@@ -1,0 +1,107 @@
+// tests/semantics/http_server_multipart_test.sapp
+//
+// HTTP request robustness for the self-hosted server:
+//   1. req_header(): case-insensitive header lookup. http_parse_request keeps
+//      the ORIGINAL header casing, so cookies() reading req.headers.Cookie
+//      SILENTLY DROPPED a lowercase `cookie:` header (legal per HTTP) — a real
+//      bug that lost every session cookie sent by a lowercasing client.
+//   2. multipart/form-data parsing (file uploads) — was entirely missing;
+//      form_data() only handled x-www-form-urlencoded.
+//   3. chunked Transfer-Encoding request-body decoding — was missing.
+
+let srv = import("stdlib:http_server.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=[" + str(a) + "] want=[" + str(b) + "]"); } }
+fn truthy(c, m) { if c != true { fail(m); } }
+
+// ── 1. case-insensitive header lookup ─────────────────────────────────────────
+let req = map{ headers: map{ "content-type": "text/plain", "X-Custom": "yes" } };
+eq(srv.req_header(req, "Content-Type"), "text/plain", "finds a lowercase-stored header");
+eq(srv.req_header(req, "x-custom"), "yes", "finds a mixed-case-stored header");
+eq(srv.req_header(req, "Missing"), nil, "absent header -> nil");
+
+// the cookie bug: a lowercase `cookie:` header must still yield cookies
+let req_lc = map{ headers: map{ "cookie": "sid=abc; theme=dark" } };
+let cs = srv.cookies(req_lc);
+eq(cs.sid, "abc", "lowercase cookie header is parsed");
+eq(cs.theme, "dark", "second cookie parsed");
+eq(srv.cookie_get(req_lc, "sid", "none"), "abc", "cookie_get works with lowercase header");
+
+// ── 2. multipart/form-data ────────────────────────────────────────────────────
+eq(srv.multipart_boundary("multipart/form-data; boundary=XYZ123"), "XYZ123",
+   "boundary extracted from content-type");
+eq(srv.multipart_boundary("multipart/form-data; boundary=\"quoted-bnd\""), "quoted-bnd",
+   "quoted boundary is unquoted");
+eq(srv.multipart_boundary("application/json"), nil, "non-multipart -> nil boundary");
+
+let bnd = "----pbBoundary";
+let body = "--" + bnd + "\r\n"
+    + "Content-Disposition: form-data; name=\"title\"\r\n\r\n"
+    + "Hello World\r\n"
+    + "--" + bnd + "\r\n"
+    + "Content-Disposition: form-data; name=\"upload\"; filename=\"a.txt\"\r\n"
+    + "Content-Type: text/plain\r\n\r\n"
+    + "file body line1\r\nline2\r\n"
+    + "--" + bnd + "--\r\n";
+let parts = srv.multipart_parse(body, bnd);
+eq(len(parts), 2, "two parts parsed");
+eq(parts[0].name, "title", "first part field name");
+eq(parts[0].data, "Hello World", "first part value");
+eq(try parts[0].filename catch nil, nil, "first part is not a file");
+eq(parts[1].name, "upload", "second part field name");
+eq(parts[1].filename, "a.txt", "second part filename");
+eq(parts[1].content_type, "text/plain", "second part content-type");
+eq(parts[1].data, "file body line1\r\nline2", "file data preserves its internal CRLFs");
+
+// multipart_form(req) — split fields vs files off a full request
+let mreq = map{ headers: map{ "Content-Type": "multipart/form-data; boundary=" + bnd }, body: body };
+let mf = srv.multipart_form(mreq);
+eq(mf.fields.title, "Hello World", "field collected in .fields");
+eq(len(mf.files), 1, "one file collected");
+eq(mf.files[0].filename, "a.txt", "file filename in .files");
+eq(mf.files[0].name, "upload", "file field name");
+
+// ── 3. chunked transfer-encoding decode ───────────────────────────────────────
+// "Wiki" + "pedia" in two chunks, then a zero-length terminator.
+let chunked = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+eq(srv.decode_chunked(chunked), "Wikipedia", "two chunks decode and concatenate");
+eq(srv.decode_chunked("0\r\n\r\n"), "", "empty chunked body -> empty string");
+// hex chunk sizes
+eq(srv.decode_chunked("A\r\n0123456789\r\n0\r\n\r\n"), "0123456789", "hex chunk size (A=10)");
+// chunk extensions on the size line are ignored
+eq(srv.decode_chunked("4;ext=1\r\nWiki\r\n0\r\n\r\n"), "Wiki", "chunk-size extension ignored");
+
+// is_chunked detection (case-insensitive, comma list)
+truthy(srv.is_chunked(map{ headers: map{ "transfer-encoding": "chunked" } }), "lowercase te header");
+truthy(srv.is_chunked(map{ headers: map{ "Transfer-Encoding": "gzip, chunked" } }), "comma list");
+eq(srv.is_chunked(map{ headers: map{ "Content-Length": "5" } }), false, "no TE -> not chunked");
+
+// ── 4. mw_require_header is case-insensitive (same header bug class) ───────────
+let guard = srv.mw_require_header("X-Api-Key", "secret");
+// client sent the header lowercased — must still be accepted, not 401'd
+eq(guard(map{ headers: map{ "x-api-key": "secret" } }), nil, "lowercase header passes the guard");
+let blocked = guard(map{ headers: map{ } });
+eq(blocked.status, 401, "missing header -> 401");
+let wrong = guard(map{ headers: map{ "X-Api-Key": "nope" } });
+eq(wrong.status, 403, "wrong value -> 403");
+
+// ── 5. response helpers: html + redirect with status ──────────────────────────
+let h = srv.res_html(200, "<h1>hi</h1>");
+eq(h.status, 200, "res_html status");
+truthy(str_contains(h.content_type, "text/html"), "res_html content-type");
+eq(h.body, "<h1>hi</h1>", "res_html body");
+
+let rd = srv.res_redirect("/login");
+eq(rd.status, 302, "default redirect is 302");
+eq(rd.headers.Location, "/login", "redirect Location header");
+let rd308 = srv.res_redirect("/new", 308);
+eq(rd308.status, 308, "permanent redirect status honored");
+
+// end-to-end: the response helpers render to real HTTP responses
+let html_http = srv.to_http_response(h);
+truthy(str_contains(html_http, "text/html"), "rendered html response carries the content-type");
+let redir_http = srv.to_http_response(rd);
+truthy(str_contains(redir_http, "Location: /login"), "rendered redirect carries the Location header");
+
+print "http_server_multipart_pass";

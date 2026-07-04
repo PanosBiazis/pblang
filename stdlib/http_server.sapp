@@ -344,13 +344,23 @@ fn app_handle(app, req) {
 
 fn res_json(status, value) { return map{ status: status, json: value }; }
 fn res_text(status, body) { return map{ status: status, body: body, content_type: "text/plain" }; }
+fn res_html(status, body) { return map{ status: status, body: body, content_type: "text/html; charset=utf-8" }; }
+
+// res_redirect(location, status?) — a redirect response. Default 302 (Found);
+// pass 301/307/308 for permanent/method-preserving redirects.
+fn res_redirect(location, status = 302) {
+    return map{ status: status, body: "", headers: map{ "Location": str(location) } };
+}
 
 let res = map{
     json: fn(status, value) { return res_json(status, value); },
     text: fn(status, body) { return res_text(status, body); },
+    html: fn(status, body) { return res_html(status, body); },
     ok_json: fn(value) { return res_json(200, value); },
     ok_text: fn(body) { return res_text(200, body); },
-    redirect: fn(url) { return map{ status: 302, body: "", headers: map{ "Location": url } }; }
+    ok_html: fn(body) { return res_html(200, body); },
+    redirect: fn(url) { return res_redirect(url, 302); },
+    redirect_status: fn(url, status) { return res_redirect(url, status); }
 };
 
 fn mw_log() {
@@ -362,9 +372,11 @@ fn mw_log() {
 }
 
 fn mw_require_header(name, expected) {
-    // Middleware που μπορεί να μπλοκάρει το request.
+    // Middleware που μπορεί να μπλοκάρει το request. Header lookup is
+    // case-insensitive (a client may send the name lowercased) — a direct
+    // req.headers[name] read used to 401 legitimately-cased requests.
     return fn(req) {
-        let v = try req.headers[name] catch nil;
+        let v = req_header(req, name);
         if v == nil { return res_text(401, "unauthorized"); }
         if v != expected { return res_text(403, "forbidden"); }
         return nil;
@@ -380,8 +392,7 @@ fn get_max_body() { return _CFG.max_body; }
 
 // _content_length(req) — the request's Content-Length (0 if absent / unparseable).
 fn _content_length(req) {
-    let h = try req.headers["Content-Length"] catch nil;
-    if h == nil { h = try req.headers["content-length"] catch nil; }
+    let h = req_header(req, "Content-Length");
     if h == nil { return 0; }
     let n = try parse_number(str_trim(str(h))) catch nil;
     if n == nil { return 0; }
@@ -410,6 +421,16 @@ fn body_read_plan(content_length, have) {
 fn _recv_request(s) {
     let raw = tcp_read_until(s, "\r\n\r\n", 65536);
     let req = http_parse_request(raw);
+
+    // Chunked bodies carry no Content-Length: read up to the terminator chunk
+    // (bounded by max_body) and decode. The header read leaves any buffered
+    // chunk bytes in `req.body`, so prepend them before decoding.
+    if is_chunked(req) {
+        let rest = try tcp_read_until(s, "0\r\n\r\n", _CFG.max_body) catch "";
+        req.body = decode_chunked((try req.body catch "") + rest);
+        return req;
+    }
+
     let have = len(try req.body catch "");
     let total = _content_length(req);
     // Bound the body read by max_body so a malicious Content-Length can't force an
@@ -472,8 +493,33 @@ fn serve_forever(addr, handler) {
 
 // ---- Added: cookies, cookie_get, static_file_response, mw_rate_limit, serve_once_timeout ----
 
+// req_header(req, name) — case-insensitive header lookup. http_parse_request
+// preserves the wire casing of header names (e.g. a client may send `cookie:`
+// or `Cookie:`), so every header read MUST be case-insensitive or it silently
+// misses legally-cased headers.
+fn req_header(req, name) {
+    let hs = try req.headers catch nil;
+    if hs == nil { return nil; }
+    let target = str_lower(str(name));
+    let ks = map_keys(hs);
+    let i = 0;
+    while i < len(ks) {
+        if str_lower(ks[i]) == target { return hs[ks[i]]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// content_type(req) — the request's Content-Type header (case-insensitive), "".
+fn content_type(req) {
+    let ct = req_header(req, "Content-Type");
+    if ct == nil { return ""; }
+    return str(ct);
+}
+
 fn cookies(req) {
-    let cookie_header = try req.headers.Cookie catch "";
+    let cookie_header = req_header(req, "Cookie");
+    if cookie_header == nil { cookie_header = ""; }
     if cookie_header == "" { return map{}; }
     let pairs = str_split(cookie_header, ";");
     let result = map{};
@@ -511,6 +557,152 @@ fn form_data(req) {
     let b = try req.body catch "";
     if b == nil { return map{}; }
     return _parse_query(b);
+}
+
+// ── multipart/form-data (file uploads) ───────────────────────────────────────
+
+// multipart_boundary(content_type) — the boundary token from a
+// "multipart/form-data; boundary=..." header, unquoting a quoted value, or nil.
+fn multipart_boundary(content_type) {
+    let ct = str(content_type);
+    let at = str_index_of(str_lower(ct), "boundary=");
+    if at < 0 { return nil; }
+    let b = str_trim(str_slice(ct, at + 9, len(ct)));
+    // a boundary ends at the next ';' parameter if any
+    let semi = str_index_of(b, ";");
+    if semi >= 0 { b = str_trim(str_slice(b, 0, semi)); }
+    if str_starts_with(b, "\"") and str_ends_with(b, "\"") and len(b) >= 2 {
+        b = str_slice(b, 1, len(b) - 1);
+    }
+    if b == "" { return nil; }
+    return b;
+}
+
+// _cd_param(disposition, key) — the value of a `key="..."` parameter in a
+// Content-Disposition header (name, filename), or nil.
+fn _cd_param(disposition, key) {
+    let needle = key + "=\"";
+    let at = str_index_of(disposition, needle);
+    if at < 0 { return nil; }
+    let start = at + len(needle);
+    let end = str_index_of(str_slice(disposition, start, len(disposition)), "\"");
+    if end < 0 { return nil; }
+    return str_slice(disposition, start, start + end);
+}
+
+// multipart_parse(body, boundary) → array of parts:
+//   { name, filename?, content_type?, data }
+// A part with a filename is a file upload; without one it is a plain field.
+// Data preserves its internal CRLFs (only the framing CRLFs are stripped).
+fn multipart_parse(body, boundary) {
+    let delim = "--" + boundary;
+    let segments = str_split(str(body), delim);
+    let parts = [];
+    let i = 1;   // segments[0] is the (usually empty) preamble
+    while i < len(segments) {
+        let seg = segments[i];
+        i = i + 1;
+        if str_starts_with(seg, "--") { break; }        // closing delimiter "--boundary--"
+        if str_starts_with(seg, "\r\n") { seg = str_slice(seg, 2, len(seg)); }
+        if str_ends_with(seg, "\r\n") { seg = str_slice(seg, 0, len(seg) - 2); }
+        let hdr_end = str_index_of(seg, "\r\n\r\n");
+        if hdr_end < 0 { continue; }
+        let header_block = str_slice(seg, 0, hdr_end);
+        let data = str_slice(seg, hdr_end + 4, len(seg));
+
+        let disposition = "";
+        let ctype = nil;
+        let lines = str_split(header_block, "\r\n");
+        let li = 0;
+        while li < len(lines) {
+            let line = lines[li];
+            li = li + 1;
+            let colon = str_index_of(line, ":");
+            if colon < 0 { continue; }
+            let hn = str_lower(str_trim(str_slice(line, 0, colon)));
+            let hv = str_trim(str_slice(line, colon + 1, len(line)));
+            if hn == "content-disposition" { disposition = hv; }
+            else if hn == "content-type" { ctype = hv; }
+        }
+
+        let part = map{ name: try _cd_param(disposition, "name") catch nil, data: data };
+        let fname = _cd_param(disposition, "filename");
+        if fname != nil { part.filename = fname; }
+        if ctype != nil { part.content_type = ctype; }
+        array_push(parts, part);
+    }
+    return parts;
+}
+
+// multipart_form(req) → { fields: map<name,value>, files: [ {name, filename,
+// content_type, data} ] } for a multipart/form-data request. Empty when the
+// request is not multipart.
+fn multipart_form(req) {
+    let boundary = multipart_boundary(content_type(req));
+    if boundary == nil { return map{ fields: map{}, files: [] }; }
+    let parts = multipart_parse(try req.body catch "", boundary);
+    let fields = map{};
+    let files = [];
+    let i = 0;
+    while i < len(parts) {
+        let p = parts[i];
+        i = i + 1;
+        if map_has(p, "filename") {
+            array_push(files, p);
+        } else if p.name != nil {
+            fields[p.name] = p.data;
+        }
+    }
+    return map{ fields: fields, files: files };
+}
+
+// ── chunked Transfer-Encoding ────────────────────────────────────────────────
+
+// _hex_to_num(s) — parse a hex string (chunk size), or 0.
+fn _hex_to_num(s) {
+    let t = str_trim(str(s));
+    // a chunk-size line may carry ";ext" chunk extensions — ignore them
+    let semi = str_index_of(t, ";");
+    if semi >= 0 { t = str_trim(str_slice(t, 0, semi)); }
+    let n = 0;
+    let i = 0;
+    while i < len(t) {
+        let c = str_lower(str_slice(t, i, i + 1));
+        let d = str_index_of("0123456789abcdef", c);
+        if d < 0 { return n; }
+        n = n * 16 + d;
+        i = i + 1;
+    }
+    return n;
+}
+
+// is_chunked(req) — true if the request declares Transfer-Encoding: chunked
+// (case-insensitive; a comma list like "gzip, chunked" also counts).
+fn is_chunked(req) {
+    let te = req_header(req, "Transfer-Encoding");
+    if te == nil { return false; }
+    return str_contains(str_lower(str(te)), "chunked");
+}
+
+// decode_chunked(body) — decode an HTTP/1.1 chunked Transfer-Encoding body into
+// the assembled payload. Stops at the zero-length terminator chunk.
+fn decode_chunked(body) {
+    let s = str(body);
+    let out = "";
+    let pos = 0;
+    let n = len(s);
+    while pos < n {
+        let line_end = str_index_of(str_slice(s, pos, n), "\r\n");
+        if line_end < 0 { break; }
+        let size_line = str_slice(s, pos, pos + line_end);
+        let size = _hex_to_num(size_line);
+        pos = pos + line_end + 2;         // past the size line's CRLF
+        if size == 0 { break; }           // terminator
+        if pos + size > n { break; }      // truncated
+        out = out + str_slice(s, pos, pos + size);
+        pos = pos + size + 2;             // past the chunk data + its trailing CRLF
+    }
+    return out;
 }
 
 fn _mime_type(filename) {
@@ -633,4 +825,4 @@ fn res_sse_headers() {
     };
 }
 
-export app_new, app_use, app_get, app_post, app_put, app_delete, app_patch, app_route, app_route_mw, app_get_mw, app_post_mw, app_handle, res, res_json, res_text, to_http_response, mw_log, mw_require_header, serve_once, serve_forever, serve_once_app, serve_forever_app, cookies, cookie_get, body_json, form_data, static_file_response, mw_rate_limit, serve_once_timeout, serve_forever_timeout, sse_event, res_sse_headers, url_decode, _path_safe, set_max_body, get_max_body, body_read_plan;
+export app_new, app_use, app_get, app_post, app_put, app_delete, app_patch, app_route, app_route_mw, app_get_mw, app_post_mw, app_handle, res, res_json, res_text, res_html, res_redirect, to_http_response, mw_log, mw_require_header, serve_once, serve_forever, serve_once_app, serve_forever_app, cookies, cookie_get, body_json, form_data, static_file_response, mw_rate_limit, serve_once_timeout, serve_forever_timeout, sse_event, res_sse_headers, url_decode, _path_safe, set_max_body, get_max_body, body_read_plan, req_header, content_type, multipart_boundary, multipart_parse, multipart_form, decode_chunked, is_chunked;

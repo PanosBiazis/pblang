@@ -339,7 +339,7 @@ The VM core is stable and battle-tested:
 | `memory_safety.sapp` | ✅ Runtime-safe wrapper | Box/NonNull/borrow guards/Pin/Rc/Weak/checked slices/arenas over the VM memory-safety builtins |
 | `async_await.sapp` | ✅ Added | async_spawn, await, await_all, await_any, map, then |
 | `http.sapp` | ✅ Stable | GET, POST, streaming, SSE |
-| `http_server.sapp` | ✅ Stable | TCP server, routing, middleware, timeouts |
+| `http_server.sapp` | ✅ Stable | TCP server, routing, middleware, timeouts, case-insensitive headers, multipart/form-data uploads, chunked decode, html/redirect helpers |
 | `json.sapp` | ✅ Stable | parse, stringify |
 | `crypto.sapp` | ✅ Stable | SHA256, base64, random bytes |
 | `db.sapp` | ✅ Stable | SQLite wrapper, migrations |
