@@ -156,19 +156,20 @@ pub(super) fn sqlite_exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Val
 
     let changed = match with_db_table(host, |t| t.remove(&id))? {
         Some(DbResource::Sqlite(conn)) => {
+            // Run the SQL, then ALWAYS re-insert the connection before
+            // surfacing any error — an early return here would drop (close)
+            // the connection, invalidating the handle and killing any open
+            // transaction, which makes rollback-after-error impossible.
             let out = if tosql.is_empty() {
                 // execute_batch lets multi-statement SQL (e.g. migration scripts
                 // like "CREATE TABLE t(...); INSERT INTO t VALUES (1);") run
                 // fully. It does not return a row count, so we report 0.
-                conn.execute_batch(sql)
-                    .map_err(|e| host.err(format!("sqlite_exec(): {e}")))?;
-                0usize
+                conn.execute_batch(sql).map(|_| 0usize)
             } else {
                 conn.execute(sql, rusqlite::params_from_iter(tosql.iter()))
-                    .map_err(|e| host.err(format!("sqlite_exec(): {e}")))?
             };
             let _ = with_db_table(host, |t| t.insert(id, DbResource::Sqlite(conn)));
-            out
+            out.map_err(|e| host.err(format!("sqlite_exec(): {e}")))?
         }
         None => return Err(host.err("sqlite_exec(): invalid handle".into())),
     };
@@ -194,30 +195,24 @@ pub(super) fn sqlite_query(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
 
     let rows = match with_db_table(host, |t| t.remove(&id))? {
         Some(DbResource::Sqlite(conn)) => {
-            let out_rows = {
-                let mut stmt = conn
-                    .prepare(sql)
-                    .map_err(|e| host.err(format!("sqlite_query(): {e}")))?;
+            // As in sqlite_exec: run the query, then ALWAYS re-insert the
+            // connection before surfacing any error, so a bad statement
+            // can never close the connection out from under the script.
+            let out_rows = (|| -> Result<Vec<Value>, rusqlite::Error> {
+                let mut stmt = conn.prepare(sql)?;
                 let col_count = stmt.column_count();
                 let col_names = (0..col_count)
                     .map(|i| stmt.column_name(i).unwrap_or("").to_string())
                     .collect::<Vec<_>>();
 
                 let mut out_rows: Vec<Value> = vec![];
-                let mut rows = stmt
-                    .query(rusqlite::params_from_iter(tosql.iter()))
-                    .map_err(|e| host.err(format!("sqlite_query(): {e}")))?;
+                let mut rows = stmt.query(rusqlite::params_from_iter(tosql.iter()))?;
 
-                while let Some(row) = rows
-                    .next()
-                    .map_err(|e| host.err(format!("sqlite_query(): {e}")))?
-                {
+                while let Some(row) = rows.next()? {
                     let mut m = HashMap::<String, Value>::new();
                     for (i, name) in col_names.iter().enumerate() {
                         let name = name.clone();
-                        let v: rusqlite::types::Value = row
-                            .get(i)
-                            .map_err(|e| host.err(format!("sqlite_query(): {e}")))?;
+                        let v: rusqlite::types::Value = row.get(i)?;
                         let sv = match v {
                             rusqlite::types::Value::Null => Value::Nil,
                             rusqlite::types::Value::Integer(n) => Value::Number(n as f64),
@@ -235,11 +230,11 @@ pub(super) fn sqlite_query(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
                     }
                     out_rows.push(alloc_map(m));
                 }
-                out_rows
-            };
+                Ok(out_rows)
+            })();
 
             let _ = with_db_table(host, |t| t.insert(id, DbResource::Sqlite(conn)));
-            out_rows
+            out_rows.map_err(|e| host.err(format!("sqlite_query(): {e}")))?
         }
         None => return Err(host.err("sqlite_query(): invalid handle".into())),
     };
