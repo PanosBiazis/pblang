@@ -1,0 +1,470 @@
+// stdlib/flate.sapp — DEFLATE / gzip / zlib in pure pblang (RFC 1950/1951/1952).
+//
+// Zero dependencies: pblang can now READ and WRITE .gz / zlib / raw-deflate data
+// without shelling out to gzip/zstd binaries. The decoder (inflate) is complete —
+// stored, fixed-Huffman and dynamic-Huffman blocks — so it decodes output from any
+// standard compressor. The encoder emits a single fixed-Huffman block with LZ77
+// matching (window 8192, match 3..258): valid DEFLATE readable by every gunzip,
+// with a good ratio on text/code (it won't beat zstd; see codec.sapp for that).
+//
+// Security: every decode path takes an optional max_out byte cap (decompression-
+// bomb guard), gzip/zlib trailers (CRC32 / adler32 / ISIZE) are verified, and
+// malformed or truncated input raises an error instead of crashing or hanging.
+//
+//   let F = import("stdlib:flate.sapp");
+//   let gz  = F.gzip_encode(str_to_bytes("hello"));
+//   let raw = F.gzip_decode(gz);            // byte array, CRC-checked
+//   F.crc32("123456789");                    // 3421780262 (0xCBF43926)
+
+fn _as_bytes(data) { if type(data) == "string" { return str_to_bytes(data); } return data; }
+
+// ── crc32 (IEEE, reflected, poly 0xEDB88320) ─────────────────────────────────
+fn _build_crc_table() {
+    let t = [];
+    let n = 0;
+    while n < 256 {
+        let c = n;
+        let k = 0;
+        while k < 8 {
+            if bit_and(c, 1) == 1 { c = bit_xor(bit_shr(c, 1), 3988292384); }
+            else { c = bit_shr(c, 1); }
+            k = k + 1;
+        }
+        array_push(t, c);
+        n = n + 1;
+    }
+    return t;
+}
+let _CRC_T = _build_crc_table();
+
+fn crc32(data) {
+    let b = _as_bytes(data);
+    let c = 4294967295;
+    let i = 0;
+    let n = len(b);
+    while i < n {
+        c = bit_xor(bit_shr(c, 8), _CRC_T[bit_and(bit_xor(c, b[i]), 255)]);
+        i = i + 1;
+    }
+    return bit_xor(c, 4294967295);
+}
+
+// ── adler32 (RFC 1950) ───────────────────────────────────────────────────────
+fn adler32(data) {
+    let b = _as_bytes(data);
+    let a = 1;
+    let s = 0;
+    let i = 0;
+    let n = len(b);
+    while i < n {
+        a = (a + b[i]) % 65521;
+        s = (s + a) % 65521;
+        i = i + 1;
+    }
+    return s * 65536 + a;
+}
+
+// ── bit reader (LSB-first, as DEFLATE requires) ──────────────────────────────
+fn _mk_reader(bytes, start) {
+    return map{ b: bytes, pos: start, n: len(bytes), acc: 0, nb: 0 };
+}
+fn _need(st, k) {
+    while st.nb < k {
+        if st.pos >= st.n { error("flate: unexpected end of input"); }
+        st.acc = st.acc + bit_shl(st.b[st.pos], st.nb);
+        st.pos = st.pos + 1;
+        st.nb = st.nb + 8;
+    }
+}
+fn _bits(st, k) {
+    if k == 0 { return 0; }
+    _need(st, k);
+    let v = bit_and(st.acc, bit_shl(1, k) - 1);
+    st.acc = bit_shr(st.acc, k);
+    st.nb = st.nb - k;
+    return v;
+}
+// bytes consumed so far (whole unread bytes still in acc don't count)
+fn _consumed(st) { return st.pos - (st.nb - (st.nb % 8)) / 8; }
+
+// ── canonical Huffman decoding (puff-style: count[] + sorted symbols[]) ──────
+fn _huff_build(lengths) {
+    let count = [];
+    let l = 0;
+    while l <= 15 { array_push(count, 0); l = l + 1; }
+    let i = 0;
+    while i < len(lengths) {
+        count[lengths[i]] = count[lengths[i]] + 1;
+        i = i + 1;
+    }
+    let symbols = [];
+    l = 1;
+    while l <= 15 {
+        i = 0;
+        while i < len(lengths) {
+            if lengths[i] == l { array_push(symbols, i); }
+            i = i + 1;
+        }
+        l = l + 1;
+    }
+    return map{ count: count, symbols: symbols };
+}
+fn _huff_decode(st, h) {
+    let code = 0;
+    let first = 0;
+    let index = 0;
+    let l = 1;
+    while l <= 15 {
+        code = code + _bits(st, 1);
+        let c = h.count[l];
+        if code - first < c { return h.symbols[index + code - first]; }
+        index = index + c;
+        first = (first + c) * 2;
+        code = code * 2;
+        l = l + 1;
+    }
+    return error("flate: invalid huffman code");
+}
+
+// ── fixed tables & length/distance bases (RFC 1951 §3.2.5/3.2.6) ────────────
+let _LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+              67, 83, 99, 115, 131, 163, 195, 227, 258];
+let _LEXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+               4, 4, 4, 4, 5, 5, 5, 5, 0];
+let _DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385,
+              513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+let _DEXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+               9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+let _CLORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+let _fixed = map{ lit: nil, dist: nil };
+fn _fixed_tables() {
+    if _fixed.lit != nil { return _fixed; }
+    let ll = [];
+    let s = 0;
+    while s <= 143 { array_push(ll, 8); s = s + 1; }
+    while s <= 255 { array_push(ll, 9); s = s + 1; }
+    while s <= 279 { array_push(ll, 7); s = s + 1; }
+    while s <= 287 { array_push(ll, 8); s = s + 1; }
+    let dl = [];
+    s = 0;
+    while s < 30 { array_push(dl, 5); s = s + 1; }
+    _fixed.lit = _huff_build(ll);
+    _fixed.dist = _huff_build(dl);
+    return _fixed;
+}
+
+// ── inflate core ─────────────────────────────────────────────────────────────
+fn _check_cap(out, max_out) {
+    if max_out != nil and len(out) > max_out { error("flate: output exceeds max_out cap"); }
+}
+
+fn _inflate_block_codes(st, out, lit, dist, max_out) {
+    while true {
+        let sym = _huff_decode(st, lit);
+        if sym < 256 {
+            array_push(out, sym);
+            _check_cap(out, max_out);
+        } else {
+            if sym == 256 { return nil; }
+            if sym > 285 { error("flate: invalid length symbol"); }
+            let li = sym - 257;
+            let length = _LBASE[li] + _bits(st, _LEXTRA[li]);
+            let ds = _huff_decode(st, dist);
+            if ds > 29 { error("flate: invalid distance symbol"); }
+            let d = _DBASE[ds] + _bits(st, _DEXTRA[ds]);
+            if d > len(out) { error("flate: distance beyond output start"); }
+            let src = len(out) - d;
+            let k = 0;
+            while k < length {
+                array_push(out, out[src + k]);
+                k = k + 1;
+            }
+            _check_cap(out, max_out);
+        }
+    }
+    return nil;
+}
+
+fn _read_dynamic_tables(st) {
+    let hlit = _bits(st, 5) + 257;
+    let hdist = _bits(st, 5) + 1;
+    let hclen = _bits(st, 4) + 4;
+    let cl = [];
+    let i = 0;
+    while i < 19 { array_push(cl, 0); i = i + 1; }
+    i = 0;
+    while i < hclen {
+        cl[_CLORDER[i]] = _bits(st, 3);
+        i = i + 1;
+    }
+    let clh = _huff_build(cl);
+    let lengths = [];
+    while len(lengths) < hlit + hdist {
+        let sym = _huff_decode(st, clh);
+        if sym < 16 { array_push(lengths, sym); }
+        else {
+            let rep = 0;
+            let val = 0;
+            if sym == 16 {
+                if len(lengths) == 0 { error("flate: repeat with no previous length"); }
+                val = lengths[len(lengths) - 1];
+                rep = 3 + _bits(st, 2);
+            }
+            if sym == 17 { rep = 3 + _bits(st, 3); }
+            if sym == 18 { rep = 11 + _bits(st, 7); }
+            while rep > 0 { array_push(lengths, val); rep = rep - 1; }
+        }
+    }
+    if len(lengths) != hlit + hdist { error("flate: code length overflow"); }
+    let ll = slice(lengths, 0, hlit);
+    let dl = slice(lengths, hlit, nil);
+    return map{ lit: _huff_build(ll), dist: _huff_build(dl) };
+}
+
+fn _inflate_stream(st, max_out) {
+    let out = [];
+    let done = false;
+    while not done {
+        if _bits(st, 1) == 1 { done = true; }
+        let btype = _bits(st, 2);
+        if btype == 0 {
+            _bits(st, st.nb % 8);   // discard to byte boundary
+            let length = _bits(st, 16);
+            let nlen = _bits(st, 16);
+            if bit_xor(length, 65535) != nlen { error("flate: stored block LEN/NLEN mismatch"); }
+            let k = 0;
+            while k < length {
+                array_push(out, _bits(st, 8));
+                k = k + 1;
+            }
+            _check_cap(out, max_out);
+        } else {
+            if btype == 1 {
+                let f = _fixed_tables();
+                _inflate_block_codes(st, out, f.lit, f.dist, max_out);
+            } else {
+                if btype != 2 { error("flate: invalid block type"); }
+                let t = _read_dynamic_tables(st);
+                _inflate_block_codes(st, out, t.lit, t.dist, max_out);
+            }
+        }
+    }
+    return out;
+}
+
+// inflate(data, max_out?) — decode a raw DEFLATE stream to a byte array.
+fn inflate(data, max_out = nil) {
+    let b = _as_bytes(data);
+    return _inflate_stream(_mk_reader(b, 0), max_out);
+}
+
+// ── bit writer + fixed-Huffman encoder ───────────────────────────────────────
+fn _mk_writer() { return map{ out: [], acc: 0, nb: 0 }; }
+fn _wbits(w, v, k) {
+    w.acc = w.acc + bit_shl(v, w.nb);
+    w.nb = w.nb + k;
+    while w.nb >= 8 {
+        array_push(w.out, bit_and(w.acc, 255));
+        w.acc = bit_shr(w.acc, 8);
+        w.nb = w.nb - 8;
+    }
+    return nil;
+}
+fn _whuff(w, code, k) {
+    // Huffman codes are packed MSB-first — reverse before the LSB-first writer.
+    let r = 0;
+    let i = 0;
+    while i < k {
+        r = r * 2 + bit_and(bit_shr(code, i), 1);
+        i = i + 1;
+    }
+    return _wbits(w, r, k);
+}
+fn _wflush(w) {
+    if w.nb > 0 { array_push(w.out, bit_and(w.acc, 255)); w.acc = 0; w.nb = 0; }
+    return nil;
+}
+
+fn _fixed_lit_code(s) {
+    if s <= 143 { return map{ c: 48 + s, k: 8 }; }
+    if s <= 255 { return map{ c: 400 + s - 144, k: 9 }; }
+    if s <= 279 { return map{ c: s - 256, k: 7 }; }
+    return map{ c: 192 + s - 280, k: 8 };
+}
+
+fn _emit_lit(w, s) {
+    let e = _fixed_lit_code(s);
+    return _whuff(w, e.c, e.k);
+}
+fn _emit_match(w, length, d) {
+    let li = len(_LBASE) - 1;
+    while _LBASE[li] > length { li = li - 1; }
+    let e = _fixed_lit_code(257 + li);
+    _whuff(w, e.c, e.k);
+    _wbits(w, length - _LBASE[li], _LEXTRA[li]);
+    let di = len(_DBASE) - 1;
+    while _DBASE[di] > d { di = di - 1; }
+    _whuff(w, di, 5);
+    return _wbits(w, d - _DBASE[di], _DEXTRA[di]);
+}
+
+let _WIN = 8192;
+let _MAXM = 258;
+let _CHAIN = 32;
+
+fn _dkey(b, i) { return str(b[i] * 65536 + b[i + 1] * 256 + b[i + 2]); }
+
+// deflate(data) — raw DEFLATE: one final fixed-Huffman block with LZ77 matches.
+fn deflate(data) {
+    let b = _as_bytes(data);
+    let n = len(b);
+    let w = _mk_writer();
+    _wbits(w, 1, 1);   // BFINAL
+    _wbits(w, 1, 2);   // BTYPE=01 fixed
+    let heads = map{};
+    let i = 0;
+    while i < n {
+        let best = 0;
+        let bestd = 0;
+        if i + 2 < n {
+            let k = _dkey(b, i);
+            if map_has(heads, k) {
+                let cand = heads[k];
+                let ci = len(cand) - 1;
+                let tries = 0;
+                while ci >= 0 and tries < _CHAIN {
+                    let p = cand[ci];
+                    if i - p > _WIN { ci = -1; }
+                    else {
+                        let m = 0;
+                        let lim = n - i;
+                        if lim > _MAXM { lim = _MAXM; }
+                        while m < lim and b[p + m] == b[i + m] { m = m + 1; }
+                        if m > best { best = m; bestd = i - p; }
+                        ci = ci - 1;
+                    }
+                    tries = tries + 1;
+                }
+            }
+        }
+        if best >= 3 {
+            _emit_match(w, best, bestd);
+            let e = i + best;
+            while i < e {
+                if i + 2 < n { _insert_pos(heads, _dkey(b, i), i); }
+                i = i + 1;
+            }
+        } else {
+            _emit_lit(w, b[i]);
+            if i + 2 < n { _insert_pos(heads, _dkey(b, i), i); }
+            i = i + 1;
+        }
+    }
+    _whuff(w, 0, 7);   // end-of-block (symbol 256, fixed code 0000000)
+    _wflush(w);
+    return w.out;
+}
+
+fn _insert_pos(heads, k, pos) {
+    if not map_has(heads, k) { heads[k] = []; }
+    array_push(heads[k], pos);
+    return nil;
+}
+
+// ── gzip (RFC 1952) ──────────────────────────────────────────────────────────
+fn _push_le32(out, v) {
+    array_push(out, bit_and(v, 255));
+    array_push(out, bit_and(bit_shr(v, 8), 255));
+    array_push(out, bit_and(bit_shr(v, 16), 255));
+    array_push(out, bit_and(bit_shr(v, 24), 255));
+    return nil;
+}
+fn _le32(b, i) { return b[i] + b[i + 1] * 256 + b[i + 2] * 65536 + b[i + 3] * 16777216; }
+
+// gzip_encode(data) — standard .gz member (mtime 0, OS 255) any gunzip can read.
+fn gzip_encode(data) {
+    let b = _as_bytes(data);
+    let out = [31, 139, 8, 0, 0, 0, 0, 0, 0, 255];
+    let body = deflate(b);
+    let i = 0;
+    while i < len(body) { array_push(out, body[i]); i = i + 1; }
+    _push_le32(out, crc32(b));
+    _push_le32(out, len(b) % 4294967296);
+    return out;
+}
+
+// gzip_decode(data, max_out?) — parse header (FEXTRA/FNAME/FCOMMENT/FHCRC),
+// inflate, verify CRC32 + ISIZE.
+fn gzip_decode(data, max_out = nil) {
+    let b = _as_bytes(data);
+    if len(b) < 18 { error("flate: gzip data too short"); }
+    if b[0] != 31 or b[1] != 139 { error("flate: not gzip data (bad magic)"); }
+    if b[2] != 8 { error("flate: unsupported gzip method"); }
+    let flg = b[3];
+    let p = 10;
+    if bit_and(flg, 4) != 0 {   // FEXTRA
+        if p + 2 > len(b) { error("flate: truncated gzip FEXTRA"); }
+        p = p + 2 + b[p] + b[p + 1] * 256;
+    }
+    if bit_and(flg, 8) != 0 {   // FNAME (NUL-terminated)
+        while p < len(b) and b[p] != 0 { p = p + 1; }
+        p = p + 1;
+    }
+    if bit_and(flg, 16) != 0 {  // FCOMMENT
+        while p < len(b) and b[p] != 0 { p = p + 1; }
+        p = p + 1;
+    }
+    if bit_and(flg, 2) != 0 { p = p + 2; }   // FHCRC
+    if p >= len(b) { error("flate: truncated gzip header"); }
+    let st = _mk_reader(b, p);
+    let out = _inflate_stream(st, max_out);
+    let tp = _consumed(st);
+    if tp + 8 > len(b) { error("flate: truncated gzip trailer"); }
+    if _le32(b, tp) != crc32(out) { error("flate: gzip CRC32 mismatch"); }
+    if _le32(b, tp + 4) != len(out) % 4294967296 { error("flate: gzip ISIZE mismatch"); }
+    return out;
+}
+
+// ── zlib (RFC 1950) ──────────────────────────────────────────────────────────
+fn zlib_encode(data) {
+    let b = _as_bytes(data);
+    let out = [120, 156];   // CMF=0x78, FLG=0x9C (level 2, no dict, %31==0)
+    let body = deflate(b);
+    let i = 0;
+    while i < len(body) { array_push(out, body[i]); i = i + 1; }
+    let a = adler32(b);
+    array_push(out, bit_and(bit_shr(a, 24), 255));
+    array_push(out, bit_and(bit_shr(a, 16), 255));
+    array_push(out, bit_and(bit_shr(a, 8), 255));
+    array_push(out, bit_and(a, 255));
+    return out;
+}
+
+fn zlib_decode(data, max_out = nil) {
+    let b = _as_bytes(data);
+    if len(b) < 6 { error("flate: zlib data too short"); }
+    if bit_and(b[0], 15) != 8 { error("flate: unsupported zlib method"); }
+    if (b[0] * 256 + b[1]) % 31 != 0 { error("flate: bad zlib header check"); }
+    if bit_and(b[1], 32) != 0 { error("flate: zlib preset dictionary unsupported"); }
+    let st = _mk_reader(b, 2);
+    let out = _inflate_stream(st, max_out);
+    let tp = _consumed(st);
+    if tp + 4 > len(b) { error("flate: truncated zlib trailer"); }
+    let want = b[tp] * 16777216 + b[tp + 1] * 65536 + b[tp + 2] * 256 + b[tp + 3];
+    if want != adler32(out) { error("flate: zlib adler32 mismatch"); }
+    return out;
+}
+
+// ── file helpers ─────────────────────────────────────────────────────────────
+// gzip_read_file(path, max_out?) — read and decode a .gz file.
+fn gzip_read_file(path, max_out = nil) { return gzip_decode(fs_read_bytes(path), max_out); }
+// gzip_write_file(path, data) — write data as a .gz file; returns byte count written.
+fn gzip_write_file(path, data) {
+    let blob = gzip_encode(data);
+    fs_write_bytes(path, blob);
+    return len(blob);
+}
+
+export crc32, adler32, inflate, deflate, gzip_encode, gzip_decode,
+       zlib_encode, zlib_decode, gzip_read_file, gzip_write_file;
