@@ -13,17 +13,15 @@ Create `examples/tutorial_cli/main.sapp`:
 ```sapp
 let os = import("stdlib:os.sapp");
 
-let args = os.args();
+let args = os.script_args(); // os.args() is the RAW argv ("run", path, flags...)
 let cmd = if len(args) > 0 { args[0] } else { "help" };
 
 let db_file = "notes.txt";
 
 fn read_notes() {
-    try {
-        return fs_read(db_file);
-    } catch e {
-        return "";
-    }
+    // catch binds no name in pblang — `catch e { ... }` would crash the
+    // handler with "undefined global 'e'". Use the expression form:
+    return try fs_read(db_file) catch "";
 }
 
 fn write_notes(s) {
@@ -55,7 +53,7 @@ pblang run examples/tutorial_cli/main.sapp -- list
 
 What you learned:
 
-- `os.args()` for CLI args
+- `os.script_args()` for CLI args (`os.args()` is the raw argv)
 - simple file I/O (`fs_read`, `fs_write`)
 - basic control flow
 

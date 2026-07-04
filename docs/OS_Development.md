@@ -40,6 +40,21 @@ where those meet real hardware.
 already lowers to C and LLVM. The missing pieces are a **freestanding codegen mode**, a
 **kernel-grade runtime**, and **real low-level intrinsics**.
 
+### Checking kernel code with `pblang check`
+
+Kernel modules call intrinsics (`outb`, `kmalloc`, `poke32`, …) that only exist in the
+ctranspiler's freestanding preamble — not in the VM — and several modules are linked
+into one translation unit (`gc.sapp` uses `heap.sapp`'s `heap_alloc`). Two source
+pragmas keep the checker sound for them (see `stdlib/diagnostics.sapp`):
+
+```
+// pblang:target=kernel          -> the ctranspile intrinsics are defined names
+// pblang:extern heap_alloc ...  -> declared cross-unit symbols are defined
+```
+
+Typos still flag (`kmaloc` stays an error), and files WITHOUT the pragma keep the
+strict rules — `pblang check stdlib/kernel/*.sapp` runs clean today.
+
 ---
 
 ## 3. The three things that must become real
