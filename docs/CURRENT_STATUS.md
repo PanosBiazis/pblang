@@ -349,7 +349,7 @@ The VM core is stable and battle-tested:
 | `collections.sapp` | ✅ Stable | Stack, queue, set helpers; `array.sapp` and `map.sapp` expose richer data-structure helpers |
 | `math.sapp` | ✅ Stable | Complex, lerp, clamp, smoothstep |
 | `csv.sapp` | ✅ Stable | Quote-aware CSV records, CRLF, header maps, stringify helpers |
-| `dataframe.sapp` | ✅ Stable | Normalized tables, quote-aware CSV I/O, schema/validation helpers |
+| `dataframe.sapp` | ✅ Stable | Normalized tables, quote-aware CSV I/O, schema/validation, group_by (per-column + multi-key aggregation), pivot/melt, cumsum/pct_change/rolling_mean, median/std/var |
 | `template.sapp` | ✅ Stable | Isolated loops, chained filters, condition helpers, strict missing-var checks |
 | `validate.sapp` | ✅ Stable | Nested schemas, defaults, strict fields, batch validation |
 | `config.sapp` | ✅ Stable | Layered config, typed schema maps, validation bridge |
