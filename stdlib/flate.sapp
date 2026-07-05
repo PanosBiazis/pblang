@@ -286,42 +286,21 @@ fn _wflush(w) {
     return nil;
 }
 
-fn _fixed_lit_code(s) {
-    if s <= 143 { return map{ c: 48 + s, k: 8 }; }
-    if s <= 255 { return map{ c: 400 + s - 144, k: 9 }; }
-    if s <= 279 { return map{ c: s - 256, k: 7 }; }
-    return map{ c: 192 + s - 280, k: 8 };
-}
-
-fn _emit_lit(w, s) {
-    let e = _fixed_lit_code(s);
-    return _whuff(w, e.c, e.k);
-}
-fn _emit_match(w, length, d) {
-    let li = len(_LBASE) - 1;
-    while _LBASE[li] > length { li = li - 1; }
-    let e = _fixed_lit_code(257 + li);
-    _whuff(w, e.c, e.k);
-    _wbits(w, length - _LBASE[li], _LEXTRA[li]);
-    let di = len(_DBASE) - 1;
-    while _DBASE[di] > d { di = di - 1; }
-    _whuff(w, di, 5);
-    return _wbits(w, d - _DBASE[di], _DEXTRA[di]);
-}
-
 let _WIN = 8192;
 let _MAXM = 258;
 let _CHAIN = 32;
 
 fn _dkey(b, i) { return str(b[i] * 65536 + b[i + 1] * 256 + b[i + 2]); }
 
-// deflate(data) — raw DEFLATE: one final fixed-Huffman block with LZ77 matches.
-fn deflate(data) {
-    let b = _as_bytes(data);
+fn _lindex(L) { let li = len(_LBASE) - 1; while _LBASE[li] > L { li = li - 1; } return li; }
+fn _dindex(D) { let di = len(_DBASE) - 1; while _DBASE[di] > D { di = di - 1; } return di; }
+
+// _lz77(b) — LZ77-parse into a token stream reused by every block encoder.
+// Literal token: map{ m: 0, lit: byte }. Match token: map{ m: 1, li, di, lx, dx }
+// with li/di the length/distance symbol indices and lx/dx their extra bits.
+fn _lz77(b) {
     let n = len(b);
-    let w = _mk_writer();
-    _wbits(w, 1, 1);   // BFINAL
-    _wbits(w, 1, 2);   // BTYPE=01 fixed
+    let tokens = [];
     let heads = map{};
     let i = 0;
     while i < n {
@@ -337,11 +316,18 @@ fn deflate(data) {
                     let p = cand[ci];
                     if i - p > _WIN { ci = -1; }
                     else {
-                        let m = 0;
-                        let lim = n - i;
-                        if lim > _MAXM { lim = _MAXM; }
-                        while m < lim and b[p + m] == b[i + m] { m = m + 1; }
-                        if m > best { best = m; bestd = i - p; }
+                        // Quick reject (zlib): a candidate can only beat the
+                        // current best if it matches at position `best` — this
+                        // skips the full extension for the overwhelming majority
+                        // of chain entries on repetitive data. The chosen match
+                        // is unchanged (we still keep the longest, most-recent).
+                        if best == 0 or (i + best < n and b[p + best] == b[i + best]) {
+                            let m = 0;
+                            let lim = n - i;
+                            if lim > _MAXM { lim = _MAXM; }
+                            while m < lim and b[p + m] == b[i + m] { m = m + 1; }
+                            if m > best { best = m; bestd = i - p; }
+                        }
                         ci = ci - 1;
                     }
                     tries = tries + 1;
@@ -349,21 +335,354 @@ fn deflate(data) {
             }
         }
         if best >= 3 {
-            _emit_match(w, best, bestd);
+            let li = _lindex(best);
+            let di = _dindex(bestd);
+            array_push(tokens, map{ m: 1, li: li, di: di,
+                                    lx: best - _LBASE[li], dx: bestd - _DBASE[di] });
             let e = i + best;
             while i < e {
                 if i + 2 < n { _insert_pos(heads, _dkey(b, i), i); }
                 i = i + 1;
             }
         } else {
-            _emit_lit(w, b[i]);
+            array_push(tokens, map{ m: 0, lit: b[i] });
             if i + 2 < n { _insert_pos(heads, _dkey(b, i), i); }
             i = i + 1;
         }
     }
-    _whuff(w, 0, 7);   // end-of-block (symbol 256, fixed code 0000000)
+    return tokens;
+}
+
+// _emit_tokens — write the LZ77 stream + end-of-block using the given code
+// tables (llc/lll = lit/len codes+lengths, dc/dl = distance codes+lengths).
+fn _emit_tokens(w, tokens, llc, lll, dc, dl) {
+    let i = 0;
+    while i < len(tokens) {
+        let t = tokens[i];
+        if t.m == 0 {
+            _whuff(w, llc[t.lit], lll[t.lit]);
+        } else {
+            let sym = 257 + t.li;
+            _whuff(w, llc[sym], lll[sym]);
+            if _LEXTRA[t.li] > 0 { _wbits(w, t.lx, _LEXTRA[t.li]); }
+            _whuff(w, dc[t.di], dl[t.di]);
+            if _DEXTRA[t.di] > 0 { _wbits(w, t.dx, _DEXTRA[t.di]); }
+        }
+        i = i + 1;
+    }
+    _whuff(w, llc[256], lll[256]);
+    return nil;
+}
+
+// _huff_lengths(freq, maxlen) — optimal code lengths per symbol, length-limited
+// to maxlen. O(n^2) Huffman for the depths, then zlib's bl_count overflow
+// repair + frequency-ordered reassignment when any depth exceeds maxlen.
+fn _huff_lengths(freq, maxlen) {
+    let n = len(freq);
+    let lengths = [];
+    let i = 0;
+    while i < n { array_push(lengths, 0); i = i + 1; }
+    let active = [];
+    i = 0;
+    while i < n { if freq[i] > 0 { array_push(active, i); } i = i + 1; }
+    let na = len(active);
+    if na == 0 { return lengths; }
+    if na == 1 { lengths[active[0]] = 1; return lengths; }
+
+    let nodes = [];
+    i = 0;
+    while i < na { array_push(nodes, map{ w: freq[active[i]], mem: [active[i]] }); i = i + 1; }
+    while len(nodes) > 1 {
+        let a1 = 0;
+        let j = 1;
+        while j < len(nodes) { if nodes[j].w < nodes[a1].w { a1 = j; } j = j + 1; }
+        let a2 = 0 - 1;
+        j = 0;
+        while j < len(nodes) {
+            if j != a1 {
+                if a2 == 0 - 1 { a2 = j; }
+                else { if nodes[j].w < nodes[a2].w { a2 = j; } }
+            }
+            j = j + 1;
+        }
+        let mem = [];
+        let x = 0;
+        while x < len(nodes[a1].mem) { array_push(mem, nodes[a1].mem[x]); x = x + 1; }
+        x = 0;
+        while x < len(nodes[a2].mem) { array_push(mem, nodes[a2].mem[x]); x = x + 1; }
+        x = 0;
+        while x < len(mem) { lengths[mem[x]] = lengths[mem[x]] + 1; x = x + 1; }
+        let neww = nodes[a1].w + nodes[a2].w;
+        let nn = [];
+        j = 0;
+        while j < len(nodes) {
+            if j != a1 and j != a2 { array_push(nn, nodes[j]); }
+            j = j + 1;
+        }
+        array_push(nn, map{ w: neww, mem: mem });
+        nodes = nn;
+    }
+
+    // Cap over-long depths at maxlen (zlib gen_bitlen), counting the overflow.
+    let overflow = 0;
+    i = 0;
+    while i < na {
+        if lengths[active[i]] > maxlen { lengths[active[i]] = maxlen; overflow = overflow + 1; }
+        i = i + 1;
+    }
+    if overflow == 0 { return lengths; }
+
+    let bl = [];
+    i = 0;
+    while i <= maxlen { array_push(bl, 0); i = i + 1; }
+    i = 0;
+    while i < na { bl[lengths[active[i]]] = bl[lengths[active[i]]] + 1; i = i + 1; }
+    while overflow > 0 {
+        let bb = maxlen - 1;
+        while bl[bb] == 0 { bb = bb - 1; }
+        bl[bb] = bl[bb] - 1;
+        bl[bb + 1] = bl[bb + 1] + 2;
+        bl[maxlen] = bl[maxlen] - 1;
+        overflow = overflow - 2;
+    }
+
+    // Reassign: shortest codes to the most frequent symbols.
+    let order = [];
+    i = 0;
+    while i < na { array_push(order, active[i]); i = i + 1; }
+    i = 0;
+    while i < na {
+        let mx = i;
+        let j2 = i + 1;
+        while j2 < na { if freq[order[j2]] > freq[order[mx]] { mx = j2; } j2 = j2 + 1; }
+        if mx != i { let tmp = order[i]; order[i] = order[mx]; order[mx] = tmp; }
+        i = i + 1;
+    }
+    let p = 0;
+    let L = 1;
+    while L <= maxlen {
+        let c = bl[L];
+        while c > 0 { lengths[order[p]] = L; p = p + 1; c = c - 1; }
+        L = L + 1;
+    }
+    return lengths;
+}
+
+// _canonical_codes(lengths, maxbits) — RFC 1951 §3.2.2 canonical codes
+// (MSB-first) per symbol; _whuff reverses them for the LSB-first writer.
+fn _canonical_codes(lengths, maxbits) {
+    let n = len(lengths);
+    let bl = [];
+    let i = 0;
+    while i <= maxbits { array_push(bl, 0); i = i + 1; }
+    i = 0;
+    while i < n { if lengths[i] > 0 { bl[lengths[i]] = bl[lengths[i]] + 1; } i = i + 1; }
+    let nextc = [];
+    i = 0;
+    while i <= maxbits { array_push(nextc, 0); i = i + 1; }
+    let code = 0;
+    let bits = 1;
+    while bits <= maxbits {
+        code = (code + bl[bits - 1]) * 2;
+        nextc[bits] = code;
+        bits = bits + 1;
+    }
+    let codes = [];
+    i = 0;
+    while i < n { array_push(codes, 0); i = i + 1; }
+    i = 0;
+    while i < n {
+        if lengths[i] > 0 { codes[i] = nextc[lengths[i]]; nextc[lengths[i]] = nextc[lengths[i]] + 1; }
+        i = i + 1;
+    }
+    return codes;
+}
+
+// _rle_codelengths(seq) — RFC 1951 §3.2.7 run-length coding of the combined
+// code-length sequence into CL symbols 0..18. Each op: map{ sym, extra, ebits }.
+fn _rle_codelengths(seq) {
+    let ops = [];
+    let n = len(seq);
+    let i = 0;
+    while i < n {
+        let cur = seq[i];
+        let run = 1;
+        while i + run < n and seq[i + run] == cur { run = run + 1; }
+        i = i + run;   // advance past the whole run BEFORE consuming `run` below
+        if cur == 0 {
+            while run >= 11 {
+                let r = run;
+                if r > 138 { r = 138; }
+                array_push(ops, map{ sym: 18, extra: r - 11, ebits: 7 });
+                run = run - r;
+            }
+            while run >= 3 {
+                let r = run;
+                if r > 10 { r = 10; }
+                array_push(ops, map{ sym: 17, extra: r - 3, ebits: 3 });
+                run = run - r;
+            }
+            while run > 0 { array_push(ops, map{ sym: 0, extra: 0, ebits: 0 }); run = run - 1; }
+        } else {
+            array_push(ops, map{ sym: cur, extra: 0, ebits: 0 });
+            let rem = run - 1;
+            while rem >= 3 {
+                let r = rem;
+                if r > 6 { r = 6; }
+                array_push(ops, map{ sym: 16, extra: r - 3, ebits: 2 });
+                rem = rem - r;
+            }
+            while rem > 0 { array_push(ops, map{ sym: cur, extra: 0, ebits: 0 }); rem = rem - 1; }
+        }
+    }
+    return ops;
+}
+
+// _stored(b) — one or more BFINAL stored blocks (byte-aligned, ≤ 65535 each);
+// the guaranteed ≤ ~byte-per-byte fallback for incompressible data.
+fn _stored(b) {
+    let n = len(b);
+    let out = [];
+    if n == 0 { return [1, 0, 0, 255, 255]; }
+    let pos = 0;
+    while pos < n {
+        let chunk = n - pos;
+        if chunk > 65535 { chunk = 65535; }
+        let fin = 0;
+        if pos + chunk >= n { fin = 1; }
+        array_push(out, fin);
+        array_push(out, bit_and(chunk, 255));
+        array_push(out, bit_and(bit_shr(chunk, 8), 255));
+        let nlen = bit_xor(chunk, 65535);
+        array_push(out, bit_and(nlen, 255));
+        array_push(out, bit_and(bit_shr(nlen, 8), 255));
+        let j = 0;
+        while j < chunk { array_push(out, b[pos + j]); j = j + 1; }
+        pos = pos + chunk;
+    }
+    return out;
+}
+
+// Fixed-Huffman code tables (RFC 1951 §3.2.6), built once and run through the
+// same generic emitter as the dynamic path.
+let _fenc = map{ ready: false, llc: nil, lll: nil, dc: nil, dl: nil };
+fn _fixed_enc() {
+    if _fenc.ready { return _fenc; }
+    let lll = [];
+    let s = 0;
+    while s <= 143 { array_push(lll, 8); s = s + 1; }
+    while s <= 255 { array_push(lll, 9); s = s + 1; }
+    while s <= 279 { array_push(lll, 7); s = s + 1; }
+    while s <= 287 { array_push(lll, 8); s = s + 1; }
+    let dl = [];
+    s = 0;
+    while s < 30 { array_push(dl, 5); s = s + 1; }
+    _fenc.lll = lll;
+    _fenc.dl = dl;
+    _fenc.llc = _canonical_codes(lll, 15);
+    _fenc.dc = _canonical_codes(dl, 15);
+    _fenc.ready = true;
+    return _fenc;
+}
+
+// _deflate_fixed / _deflate_dynamic — encode the token stream as a single
+// BFINAL block of the named type; each returns a complete DEFLATE byte array.
+fn _deflate_fixed(tokens) {
+    let f = _fixed_enc();
+    let w = _mk_writer();
+    _wbits(w, 1, 1);   // BFINAL
+    _wbits(w, 1, 2);   // BTYPE=01 fixed
+    _emit_tokens(w, tokens, f.llc, f.lll, f.dc, f.dl);
     _wflush(w);
     return w.out;
+}
+
+fn _deflate_dynamic(tokens) {
+    // symbol frequencies
+    let ll_freq = [];
+    let i = 0;
+    while i < 286 { array_push(ll_freq, 0); i = i + 1; }
+    let d_freq = [];
+    i = 0;
+    while i < 30 { array_push(d_freq, 0); i = i + 1; }
+    i = 0;
+    while i < len(tokens) {
+        let t = tokens[i];
+        if t.m == 0 { ll_freq[t.lit] = ll_freq[t.lit] + 1; }
+        else {
+            ll_freq[257 + t.li] = ll_freq[257 + t.li] + 1;
+            d_freq[t.di] = d_freq[t.di] + 1;
+        }
+        i = i + 1;
+    }
+    ll_freq[256] = ll_freq[256] + 1;   // end-of-block symbol
+
+    // DEFLATE needs at least one distance code defined even when unused.
+    let d_used = 0;
+    i = 0;
+    while i < 30 { if d_freq[i] > 0 { d_used = d_used + 1; } i = i + 1; }
+    if d_used == 0 { d_freq[0] = 1; }
+
+    let ll_len = _huff_lengths(ll_freq, 15);
+    let d_len = _huff_lengths(d_freq, 15);
+    let ll_codes = _canonical_codes(ll_len, 15);
+    let d_codes = _canonical_codes(d_len, 15);
+
+    let hlit = 286;
+    while hlit > 257 and ll_len[hlit - 1] == 0 { hlit = hlit - 1; }
+    let hdist = 30;
+    while hdist > 1 and d_len[hdist - 1] == 0 { hdist = hdist - 1; }
+
+    let seq = [];
+    i = 0;
+    while i < hlit { array_push(seq, ll_len[i]); i = i + 1; }
+    i = 0;
+    while i < hdist { array_push(seq, d_len[i]); i = i + 1; }
+
+    let ops = _rle_codelengths(seq);
+    let cl_freq = [];
+    i = 0;
+    while i < 19 { array_push(cl_freq, 0); i = i + 1; }
+    i = 0;
+    while i < len(ops) { cl_freq[ops[i].sym] = cl_freq[ops[i].sym] + 1; i = i + 1; }
+    let cl_len = _huff_lengths(cl_freq, 7);
+    let cl_codes = _canonical_codes(cl_len, 7);
+
+    let hclen = 19;
+    while hclen > 4 and cl_len[_CLORDER[hclen - 1]] == 0 { hclen = hclen - 1; }
+
+    let w = _mk_writer();
+    _wbits(w, 1, 1);   // BFINAL
+    _wbits(w, 2, 2);   // BTYPE=10 dynamic
+    _wbits(w, hlit - 257, 5);
+    _wbits(w, hdist - 1, 5);
+    _wbits(w, hclen - 4, 4);
+    i = 0;
+    while i < hclen { _wbits(w, cl_len[_CLORDER[i]], 3); i = i + 1; }
+    i = 0;
+    while i < len(ops) {
+        let op = ops[i];
+        _whuff(w, cl_codes[op.sym], cl_len[op.sym]);
+        if op.ebits > 0 { _wbits(w, op.extra, op.ebits); }
+        i = i + 1;
+    }
+    _emit_tokens(w, tokens, ll_codes, ll_len, d_codes, d_len);
+    _wflush(w);
+    return w.out;
+}
+
+// deflate(data) — raw DEFLATE: LZ77 once, then emit whichever of
+// {stored, fixed-Huffman, dynamic-Huffman} is smallest so the ratio never
+// regresses and improves on skewed data.
+fn deflate(data) {
+    let b = _as_bytes(data);
+    let tokens = _lz77(b);
+    let best = _deflate_fixed(tokens);
+    let dyn = _deflate_dynamic(tokens);
+    if len(dyn) < len(best) { best = dyn; }
+    let st = _stored(b);
+    if len(st) < len(best) { best = st; }
+    return best;
 }
 
 fn _insert_pos(heads, k, pos) {
