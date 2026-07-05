@@ -1,0 +1,379 @@
+// fuzz.sapp — mutation-based fuzzing for the pblang QA stack.
+//
+// The fuzzer feeds a target function randomly generated and mutated inputs
+// (strings or byte arrays) and records every throw as a crash. Found crashes
+// are shrunk to a minimal reproducer by greedy chunk removal followed by
+// element simplification. Deterministic: the same seed always replays the
+// same inputs, so a red fuzz run is reproducible.
+//
+//   let F = import("stdlib:fuzz.sapp");
+//   let r = F.fuzz(target, map{ seed: 1, runs: 500, max_len: 32 });
+//   // r = map{runs, crash_count, first_crash, crashes, shrunk}
+//   F.fuzz(target, map{ seed: 1, runs: 500, mode: "bytes" });
+//   F.fuzz(target, map{ seed: 1, runs: 500, dict: ["ROOT", "admin"] });
+//   F.diff_fuzz(impl_a, impl_b, opts);   // cross-check two implementations
+//   F.round_trip(enc, dec, opts);        // dec(enc(x)) == x
+//   F.shrink_str(target, input);         // minimal crashing substring
+//
+// pblang's catch binds no error value, so crashes are tracked by input, not
+// by message; two different bugs hit by the same input count as one crash.
+
+let R = import("stdlib:random.sapp");
+
+// Generation charset: letters, digits, whitespace and the structural
+// characters parsers care about. Small on purpose — with ~78 symbols a
+// planted single-character bug is hit within a few hundred runs.
+let _CHARSET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \t\n{}[]\",:\\.-_+/";
+
+// Byte values that historically trigger bugs: NUL, control chars, quote,
+// backslash, braces, DEL, sign-bit edge, max.
+let _INTERESTING = [0, 1, 9, 10, 13, 32, 34, 92, 123, 125, 127, 128, 255];
+
+let _CORPUS_CAP = 64;
+let _CRASH_CAP = 10;
+let _SHRINK_STEPS = 2000;
+
+fn _opt(m, k, d) {
+    if map_has(m, k) { return m[k]; }
+    return d;
+}
+
+// ── array helpers ────────────────────────────────────────────────────────────
+
+fn _copy_arr(a) {
+    let out = [];
+    let i = 0;
+    while i < len(a) { array_push(out, a[i]); i = i + 1; }
+    return out;
+}
+
+fn _slice_arr(a, s, e) {
+    let out = [];
+    let i = s;
+    while i < e { array_push(out, a[i]); i = i + 1; }
+    return out;
+}
+
+fn _insert_arr(a, at, v) {
+    let out = [];
+    let i = 0;
+    while i < len(a) {
+        if i == at { array_push(out, v); }
+        array_push(out, a[i]);
+        i = i + 1;
+    }
+    if at >= len(a) { array_push(out, v); }
+    return out;
+}
+
+fn _remove_arr(a, at, k) {
+    let out = [];
+    let i = 0;
+    while i < len(a) {
+        if i < at or i >= at + k { array_push(out, a[i]); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── deterministic generation ─────────────────────────────────────────────────
+
+// new(seed) — fuzzer state; the same seed replays the same input sequence.
+fn new(seed_val) {
+    return map{ g: R.seed(seed_val), dict: [] };
+}
+
+fn _rand_char(g) {
+    let k = R.randint(g, 0, len(_CHARSET) - 1);
+    return str_slice(_CHARSET, k, k + 1);
+}
+
+// gen_str(fz, max_len) — random string, length uniform in [0, max_len].
+fn gen_str(fz, max_len) {
+    let g = fz["g"];
+    let n = R.randint(g, 0, max_len);
+    let out = "";
+    let i = 0;
+    while i < n { out = out + _rand_char(g); i = i + 1; }
+    return out;
+}
+
+// gen_bytes(fz, max_len) — random byte array, length uniform in [0, max_len].
+fn gen_bytes(fz, max_len) {
+    let g = fz["g"];
+    let n = R.randint(g, 0, max_len);
+    let out = [];
+    let i = 0;
+    while i < n { array_push(out, R.randint(g, 0, 255)); i = i + 1; }
+    return out;
+}
+
+// ── mutation ─────────────────────────────────────────────────────────────────
+
+// mutate_str(fz, s) — one random mutation; the input string is not modified.
+// Ops: insert char, delete char, replace char, duplicate slice, truncate,
+// dictionary token insertion (when the state carries a dict).
+fn mutate_str(fz, s) {
+    let g = fz["g"];
+    let dict = fz["dict"];
+    let n = len(s);
+    let op = R.randint(g, 0, 5);
+    if op == 5 and len(dict) == 0 { op = 0; }
+    if op == 0 {
+        let i = R.randint(g, 0, n);
+        return str_slice(s, 0, i) + _rand_char(g) + str_slice(s, i, n);
+    }
+    if op == 1 {
+        if n == 0 { return _rand_char(g); }
+        let i = R.randint(g, 0, n - 1);
+        return str_slice(s, 0, i) + str_slice(s, i + 1, n);
+    }
+    if op == 2 {
+        if n == 0 { return _rand_char(g); }
+        let i = R.randint(g, 0, n - 1);
+        return str_slice(s, 0, i) + _rand_char(g) + str_slice(s, i + 1, n);
+    }
+    if op == 3 {
+        if n == 0 { return _rand_char(g); }
+        let a = R.randint(g, 0, n - 1);
+        let b = R.randint(g, a + 1, n);
+        return str_slice(s, 0, b) + str_slice(s, a, b) + str_slice(s, b, n);
+    }
+    if op == 4 {
+        if n == 0 { return s; }
+        let keep = R.randint(g, 0, n - 1);
+        return str_slice(s, 0, keep);
+    }
+    let tok = R.choice(g, dict);
+    let i = R.randint(g, 0, n);
+    return str_slice(s, 0, i) + tok + str_slice(s, i, n);
+}
+
+// mutate_bytes(fz, b) — one random mutation; the input array is not modified.
+// Ops: bit flip, interesting-value insertion, delete, replace, truncate.
+fn mutate_bytes(fz, b) {
+    let g = fz["g"];
+    let n = len(b);
+    let out = _copy_arr(b);
+    let op = R.randint(g, 0, 4);
+    if op == 0 {
+        if n == 0 { return [R.choice(g, _INTERESTING)]; }
+        let i = R.randint(g, 0, n - 1);
+        out[i] = bit_xor(out[i], bit_shl(1, R.randint(g, 0, 7)));
+        return out;
+    }
+    if op == 1 {
+        let v = R.choice(g, _INTERESTING);
+        let i = R.randint(g, 0, n);
+        return _insert_arr(out, i, v);
+    }
+    if op == 2 {
+        if n == 0 { return [R.choice(g, _INTERESTING)]; }
+        let i = R.randint(g, 0, n - 1);
+        return _remove_arr(out, i, 1);
+    }
+    if op == 3 {
+        if n == 0 { return [R.choice(g, _INTERESTING)]; }
+        let i = R.randint(g, 0, n - 1);
+        out[i] = R.randint(g, 0, 255);
+        return out;
+    }
+    if n == 0 { return out; }
+    let keep = R.randint(g, 0, n - 1);
+    return _slice_arr(out, 0, keep);
+}
+
+// ── shrinking ────────────────────────────────────────────────────────────────
+
+fn _remove_span(x, at, k, is_b) {
+    if is_b { return _remove_arr(x, at, k); }
+    return str_slice(x, 0, at) + str_slice(x, at + k, len(x));
+}
+
+// Replace one element with the simplest value ("a" / 0); nil when already
+// simplest, so the caller can skip the probe.
+fn _simplify_at(x, at, is_b) {
+    if is_b {
+        if x[at] == 0 { return nil; }
+        let out = _copy_arr(x);
+        out[at] = 0;
+        return out;
+    }
+    let ch = str_slice(x, at, at + 1);
+    if ch == "a" { return nil; }
+    return str_slice(x, 0, at) + "a" + str_slice(x, at + 1, len(x));
+}
+
+// Greedy shrink: remove chunks (halving sizes down to 1, chunk-1 passes to a
+// fixpoint), then simplify surviving elements. pred(x) == true means "still
+// exhibits the failure"; every accepted candidate keeps it true.
+fn _shrink_with(pred, x0, is_b) {
+    if pred(x0) != true { return x0; }
+    let cur = x0;
+    let steps = 0;
+    let chunk = num_floor(len(cur) / 2);
+    if chunk < 1 { chunk = 1; }
+    while chunk >= 1 and steps < _SHRINK_STEPS {
+        let i = 0;
+        let changed = false;
+        while i + chunk <= len(cur) and steps < _SHRINK_STEPS {
+            let cand = _remove_span(cur, i, chunk, is_b);
+            steps = steps + 1;
+            if pred(cand) == true { cur = cand; changed = true; } else { i = i + 1; }
+        }
+        if chunk == 1 {
+            if changed == false { break; }
+        } else {
+            chunk = num_floor(chunk / 2);
+        }
+    }
+    let j = 0;
+    while j < len(cur) and steps < _SHRINK_STEPS {
+        let cand2 = _simplify_at(cur, j, is_b);
+        if cand2 != nil {
+            steps = steps + 1;
+            if pred(cand2) == true { cur = cand2; }
+        }
+        j = j + 1;
+    }
+    return cur;
+}
+
+fn _crash_pred(target) {
+    return fn(x) {
+        let r = try map{ ok: true, v: target(x) } catch map{ ok: false };
+        return r["ok"] == false;
+    };
+}
+
+// shrink_str(target, s) — minimal substring of s that still makes target
+// throw; s itself when it does not crash.
+fn shrink_str(target, s) {
+    return _shrink_with(_crash_pred(target), s, false);
+}
+
+// shrink_bytes(target, b) — byte-array counterpart of shrink_str.
+fn shrink_bytes(target, b) {
+    return _shrink_with(_crash_pred(target), b, true);
+}
+
+// ── fuzzing loops ────────────────────────────────────────────────────────────
+
+fn _next_input(fz, corpus, max_len, is_b) {
+    let g = fz["g"];
+    if len(corpus) > 0 and R.bernoulli(g, 0.7) == 1 {
+        let base = R.choice(g, corpus);
+        if is_b { return mutate_bytes(fz, base); }
+        return mutate_str(fz, base);
+    }
+    if is_b { return gen_bytes(fz, max_len); }
+    return gen_str(fz, max_len);
+}
+
+// fuzz(target, opts) — run the fuzz loop against target.
+// opts: seed, runs, max_len, mode ("str"|"bytes"), dict (string tokens).
+// Returns map{runs, crash_count, first_crash, crashes, shrunk} where shrunk
+// is the minimal reproducer of the first crash (nil when no crash).
+fn fuzz(target, opts) {
+    let runs = _opt(opts, "runs", 200);
+    let max_len = _opt(opts, "max_len", 32);
+    let is_b = _opt(opts, "mode", "str") == "bytes";
+    let fz = new(_opt(opts, "seed", 1));
+    fz["dict"] = _opt(opts, "dict", []);
+    let corpus = [];
+    let crashes = [];
+    let first_crash = nil;
+    let crash_count = 0;
+    let i = 0;
+    while i < runs {
+        let x = _next_input(fz, corpus, max_len, is_b);
+        let r = try map{ ok: true, v: target(x) } catch map{ ok: false };
+        if r["ok"] == false {
+            crash_count = crash_count + 1;
+            if first_crash == nil { first_crash = x; }
+            if len(crashes) < _CRASH_CAP { array_push(crashes, x); }
+        } else {
+            if len(corpus) < _CORPUS_CAP { array_push(corpus, x); }
+        }
+        i = i + 1;
+    }
+    let shrunk = nil;
+    if first_crash != nil {
+        shrunk = _shrink_with(_crash_pred(target), first_crash, is_b);
+    }
+    return map{
+        runs: runs,
+        crash_count: crash_count,
+        first_crash: first_crash,
+        crashes: crashes,
+        shrunk: shrunk,
+    };
+}
+
+// Two implementations agree when both throw, or both return equal values.
+fn _agree(fa, fb, x) {
+    let ra = try map{ ok: true, v: fa(x) } catch map{ ok: false };
+    let rb = try map{ ok: true, v: fb(x) } catch map{ ok: false };
+    if ra["ok"] != rb["ok"] { return false; }
+    if ra["ok"] == false { return true; }
+    return ra["v"] == rb["v"];
+}
+
+fn _disagree_pred(fa, fb) {
+    return fn(x) { return _agree(fa, fb, x) == false; };
+}
+
+// diff_fuzz(fa, fb, opts) — feed both implementations the same inputs until
+// they disagree. Returns map{ok, runs, input, shrunk}; ok == true means no
+// divergence was found within the run budget.
+fn diff_fuzz(fa, fb, opts) {
+    let runs = _opt(opts, "runs", 200);
+    let max_len = _opt(opts, "max_len", 32);
+    let fz = new(_opt(opts, "seed", 1));
+    fz["dict"] = _opt(opts, "dict", []);
+    let corpus = [];
+    let i = 0;
+    while i < runs {
+        let x = _next_input(fz, corpus, max_len, false);
+        if _agree(fa, fb, x) == false {
+            let shrunk = _shrink_with(_disagree_pred(fa, fb), x, false);
+            return map{ ok: false, runs: i + 1, input: x, shrunk: shrunk };
+        }
+        if len(corpus) < _CORPUS_CAP { array_push(corpus, x); }
+        i = i + 1;
+    }
+    return map{ ok: true, runs: runs, input: nil, shrunk: nil };
+}
+
+fn _rt_fail_pred(enc_fn, dec_fn) {
+    return fn(x) {
+        let r = try map{ ok: true, v: dec_fn(enc_fn(x)) } catch map{ ok: false };
+        if r["ok"] == false { return true; }
+        return r["v"] != x;
+    };
+}
+
+// round_trip(enc_fn, dec_fn, opts) — check dec(enc(x)) == x on random
+// strings; the canonical codec property. Returns map{ok, runs, input, shrunk}.
+fn round_trip(enc_fn, dec_fn, opts) {
+    let runs = _opt(opts, "runs", 200);
+    let max_len = _opt(opts, "max_len", 32);
+    let fz = new(_opt(opts, "seed", 1));
+    fz["dict"] = _opt(opts, "dict", []);
+    let fails = _rt_fail_pred(enc_fn, dec_fn);
+    let corpus = [];
+    let i = 0;
+    while i < runs {
+        let x = _next_input(fz, corpus, max_len, false);
+        if fails(x) == true {
+            let shrunk = _shrink_with(fails, x, false);
+            return map{ ok: false, runs: i + 1, input: x, shrunk: shrunk };
+        }
+        if len(corpus) < _CORPUS_CAP { array_push(corpus, x); }
+        i = i + 1;
+    }
+    return map{ ok: true, runs: runs, input: nil, shrunk: nil };
+}
+
+export new, gen_str, gen_bytes, mutate_str, mutate_bytes,
+       fuzz, shrink_str, shrink_bytes, diff_fuzz, round_trip;
