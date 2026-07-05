@@ -1,0 +1,222 @@
+// snapshot.sapp — golden-file snapshot testing for the pblang QA stack.
+//
+// A snapshot serializes any JSON-like value canonically (sorted map keys,
+// JSON-escaped strings, 2-space indent) and compares it byte-for-byte against
+// a golden file under the snapshot directory. The first run creates the
+// golden; later runs must match or fail with a line diff. Update mode
+// (set_update) rewrites goldens in place, and prune() deletes goldens no test
+// touched this run — but only in update mode, so a partial test run can never
+// destroy snapshots by accident.
+//
+// Snapshot names are sanitized to a strict character whitelist before they
+// become file names, so a name like "../../etc/passwd" cannot escape the
+// snapshot directory.
+//
+//   let S = import("stdlib:snapshot.sapp");
+//   let st = S.new("tests/__snapshots__");
+//   let r = S.snap(st, "user profile", value);   // map{ok, created, updated, path, diff}
+//   S.assert_snap(st, "user profile", value);    // throws on mismatch
+//   S.obsolete(st);                              // goldens not seen this run
+//   S.prune(st);                                 // delete them (update mode only)
+
+let FS = import("stdlib:fs.sapp");
+
+let _MAX_DEPTH = 64;
+let _MAX_NAME = 100;
+let _ALLOWED = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.";
+
+// ── canonical serialization ──────────────────────────────────────────────────
+
+fn _pad(n) {
+    let s = "";
+    let i = 0;
+    while i < n { s = s + " "; i = i + 1; }
+    return s;
+}
+
+fn _ser(v, indent, depth) {
+    if depth > _MAX_DEPTH { return error("snapshot.serialize: max depth exceeded (cycle?)"); }
+    if is_array(v) {
+        if len(v) == 0 { return "[]"; }
+        let inner = _pad(indent + 2);
+        let out = "[";
+        let i = 0;
+        while i < len(v) {
+            out = out + "\n" + inner + _ser(v[i], indent + 2, depth + 1);
+            if i + 1 < len(v) { out = out + ","; }
+            i = i + 1;
+        }
+        return out + "\n" + _pad(indent) + "]";
+    }
+    if is_map(v) {
+        let ks = map_keys(v);  // builtin returns keys sorted → canonical order
+        if len(ks) == 0 { return "{}"; }
+        let inner = _pad(indent + 2);
+        let out = "{";
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            out = out + "\n" + inner + json_stringify(k) + ": " + _ser(v[k], indent + 2, depth + 1);
+            if i + 1 < len(ks) { out = out + ","; }
+            i = i + 1;
+        }
+        return out + "\n" + _pad(indent) + "}";
+    }
+    // scalars; json_stringify throws on closures/handles, which is exactly
+    // the rejection we want for unserializable values
+    return json_stringify(v);
+}
+
+// serialize(v) — canonical, deterministic text form of a JSON-like value.
+// Equal values (regardless of map insertion order) serialize identically.
+fn serialize(v) { return _ser(v, 0, 0); }
+
+// ── name sanitization (defense in depth against path traversal) ─────────────
+
+fn _sanitize(name) {
+    let s = str(name);
+    let out = "";
+    let i = 0;
+    let n = len(s);
+    while i < n and len(out) < _MAX_NAME {
+        let ch = str_slice(s, i, i + 1);
+        if str_contains(_ALLOWED, ch) and (ch != "." or len(out) > 0) {
+            // '.' allowed only after the first char: no hidden files, and a
+            // run of leading dots can never survive to form ".."
+            if ch == "." and str_ends_with(out, ".") {
+                out = out + "_";  // collapse ".." inside the name too
+            } else {
+                out = out + ch;
+            }
+        } else {
+            out = out + "_";
+        }
+        i = i + 1;
+    }
+    if len(out) == 0 { out = "snapshot"; }
+    return out;
+}
+
+// ── snapshot store ───────────────────────────────────────────────────────────
+
+// new(dir) — snapshot context rooted at dir (created lazily on first write).
+fn new(dir) {
+    return map{
+        dir: dir,
+        update: false,
+        seen: map{},
+        created: 0,
+        matched: 0,
+        mismatched: 0,
+        updated: 0,
+    };
+}
+
+// set_update(st, on) — toggle update mode (rewrite goldens on mismatch).
+fn set_update(st, on) { st["update"] = on == true; return st; }
+
+// diff(expected, actual) — line diff between two texts; "" when equal.
+// Reports the first differing line with up to two lines of leading context.
+fn diff(expected, actual) {
+    if expected == actual { return ""; }
+    let el = str_split(expected, "\n");
+    let al = str_split(actual, "\n");
+    let n = len(el);
+    if len(al) < n { n = len(al); }
+    let i = 0;
+    while i < n and el[i] == al[i] { i = i + 1; }
+    let out = "snapshot mismatch at line " + str(i + 1) + ":\n";
+    let c = i - 2;
+    if c < 0 { c = 0; }
+    while c < i {
+        out = out + "  " + el[c] + "\n";
+        c = c + 1;
+    }
+    if i < len(el) { out = out + "- " + el[i] + "\n"; } else { out = out + "- <end of snapshot>\n"; }
+    if i < len(al) { out = out + "+ " + al[i] + "\n"; } else { out = out + "+ <end of value>\n"; }
+    if len(el) != len(al) {
+        out = out + "  (golden has " + str(len(el)) + " lines, value has " + str(len(al)) + ")\n";
+    }
+    return out;
+}
+
+// snap(st, name, value) — compare value against the golden for name.
+// Returns map{ok, created, updated, path, diff}. Creates the golden when
+// missing; in update mode a mismatch rewrites it instead of failing.
+fn snap(st, name, value) {
+    let nm = _sanitize(name);
+    let txt = serialize(value) + "\n";
+    let file = nm + ".snap";
+    let path = st["dir"] + "/" + file;
+    st["seen"][file] = true;
+    if FS.exists(path) == false {
+        try FS.mkdirs(st["dir"]) catch nil;
+        FS.write(path, txt);
+        st["created"] = st["created"] + 1;
+        return map{ ok: true, created: true, updated: false, path: path, diff: "" };
+    }
+    let old = FS.read(path);
+    if old == txt {
+        st["matched"] = st["matched"] + 1;
+        return map{ ok: true, created: false, updated: false, path: path, diff: "" };
+    }
+    if st["update"] == true {
+        FS.write(path, txt);
+        st["updated"] = st["updated"] + 1;
+        return map{ ok: true, created: false, updated: true, path: path, diff: "" };
+    }
+    st["mismatched"] = st["mismatched"] + 1;
+    return map{ ok: false, created: false, updated: false, path: path, diff: diff(old, txt) };
+}
+
+// assert_snap(st, name, value) — snap() that throws on mismatch, for use
+// inside testing.sapp test bodies.
+fn assert_snap(st, name, value) {
+    let r = snap(st, name, value);
+    if r["ok"] == false {
+        return error("snapshot '" + str(name) + "' mismatch (" + r["path"] + ")\n" + r["diff"]);
+    }
+    return r;
+}
+
+// obsolete(st) — golden files in dir that no snap() call touched this run.
+fn obsolete(st) {
+    let out = [];
+    let names = try FS.listdir(st["dir"]) catch [];
+    let i = 0;
+    while i < len(names) {
+        let f = names[i];
+        if str_ends_with(f, ".snap") and map_has(st["seen"], f) == false {
+            array_push(out, f);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// prune(st) — delete obsolete goldens; only acts in update mode so a partial
+// test run can never destroy snapshots. Returns the number deleted.
+fn prune(st) {
+    if st["update"] != true { return 0; }
+    let dead = obsolete(st);
+    let n = 0;
+    let i = 0;
+    while i < len(dead) {
+        let r = try map{ ok: FS.remove(st["dir"] + "/" + dead[i]) } catch nil;
+        if r != nil { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// summary(st) — counters for reporting.
+fn summary(st) {
+    return map{
+        created: st["created"],
+        matched: st["matched"],
+        mismatched: st["mismatched"],
+        updated: st["updated"],
+    };
+}
+
+export new, set_update, serialize, diff, snap, assert_snap, obsolete, prune, summary;
