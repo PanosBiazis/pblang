@@ -1,0 +1,80 @@
+// Test: parser hardening found by fuzzing round 2 (fuzz.sapp vs stdlib parsers).
+//
+// Covers two real bugs:
+//  1. url.parse_query / parse_query_all called the strict url_decode builtin,
+//     which throws on malformed percent-escapes — so url.parse (documented
+//     "lenient ... never throws") crashed on any URL with "%" garbage in the
+//     query. WHATWG behavior: invalid escapes pass through as literal text.
+//  2. config dotenv escaping was asymmetric: dump_dotenv escaped '"' as '\"'
+//     but parse_dotenv only stripped the outer quotes without unescaping, and
+//     values containing newlines / quotes / backslashes / edge whitespace did
+//     not survive a dump -> parse round trip.
+
+let F = import("stdlib:fuzz.sapp");
+let U = import("stdlib:url.sapp");
+let CFG = import("stdlib:config.sapp");
+
+fn eq(a, b, msg) {
+    if a != b { return error("FAIL " + msg + ": got " + str(a) + ", want " + str(b)); }
+}
+
+// ── 1. url query parsing is lenient (WHATWG: bad escapes are literals) ──────
+eq(U.parse_query("%"), map{ "%": "" }, "bare % is a literal key");
+eq(U.parse_query("a=%zz")["a"], "%zz", "invalid escape passes through");
+eq(U.parse_query("a=%2")["a"], "%2", "truncated escape passes through");
+eq(U.parse_query("a=%20b+c")["a"], " b c", "valid escapes and + still decode");
+eq(U.parse_query("a=%FF")["a"], "%FF", "invalid UTF-8 escape falls back to raw");
+eq(U.parse_query_all("a=%zz&a=%2B")["a"], ["%zz", "+"], "parse_query_all is lenient too");
+
+let u = U.parse("http://h/p?x=%zz&y=1");
+eq(u["host"], "h", "host parsed despite bad escape in query");
+eq(u["params"]["x"], "%zz", "url.parse no longer throws on malformed query escape");
+eq(u["params"]["y"], "1", "other params unaffected");
+
+// fuzz: parse_query must never crash (same seed that found the bug)
+let url_dict = ["http://", "://", "%", "%2", "%zz", "?", "#", "@", "&", "=", "+", "%FF"];
+fn t_pq(s) { U.parse_query(s); U.parse_query_all(s); return true; }
+let r_pq = F.fuzz(t_pq, map{ seed: 102, runs: 500, max_len: 24, dict: url_dict });
+eq(r_pq["crash_count"], 0, "fuzz: parse_query never throws");
+
+fn t_parse(s) { U.parse(s); return true; }
+let r_up = F.fuzz(t_parse, map{ seed: 101, runs: 400, max_len: 24, dict: url_dict });
+eq(r_up["crash_count"], 0, "fuzz: url.parse never throws");
+
+// ── 2. dotenv round trip ────────────────────────────────────────────────────
+fn rt(v) {
+    let cfg = CFG.new();
+    CFG.set(cfg, "K", v);
+    return CFG.parse_dotenv(CFG.dump_dotenv(cfg))["K"];
+}
+eq(rt("\""), "\"", "a lone double quote survives");
+eq(rt("a\"b"), "a\"b", "embedded double quote survives");
+eq(rt("'abc'"), "'abc'", "single-quote-wrapped value survives");
+eq(rt("line1\nline2"), "line1\nline2", "newline survives (escaped in dump)");
+eq(rt("a\\b"), "a\\b", "backslash survives");
+eq(rt("a\\"), "a\\", "trailing backslash survives");
+eq(rt("\tx"), "\tx", "leading tab survives");
+eq(rt("x "), "x ", "trailing space survives");
+eq(rt("hello"), "hello", "plain value round trips");
+eq(rt(""), "", "empty value round trips");
+
+// plain values still dump unquoted; existing parse semantics keep working
+let c1 = CFG.new();
+CFG.set(c1, "K", "hello");
+eq(CFG.dump_dotenv(c1), "K=hello\n", "plain values stay unquoted");
+eq(CFG.parse_dotenv("K='a b'")["K"], "a b", "single quotes stripped, content literal");
+eq(CFG.parse_dotenv("K='a\\nb'")["K"], "a\\nb", "no escape processing inside single quotes");
+eq(CFG.parse_dotenv("K=\"a\\nb\"")["K"], "a\nb", "\\n unescaped inside double quotes");
+eq(CFG.parse_dotenv("# c\nexport A=1\nB=2")["A"], "1", "comments and export still handled");
+
+// fuzz: dotenv round trip (same seed that found the bug)
+fn denc(s) {
+    let cfg = CFG.new();
+    CFG.set(cfg, "K", s);
+    return CFG.dump_dotenv(cfg);
+}
+fn ddec(text) { return CFG.parse_dotenv(text)["K"]; }
+let r_de = F.round_trip(denc, ddec, map{ seed: 104, runs: 400, max_len: 16, dict: ["\"", "'", "#", " ", "=", "export ", "\n", "\\"] });
+eq(r_de["ok"], true, "fuzz: dotenv value round trip");
+
+print "parser_hardening_pass";
