@@ -1,0 +1,99 @@
+// Test: codec hardening found by fuzzing (fuzz.sapp applied to stdlib codecs).
+//
+// Covers four real bugs:
+//  1. fuzz.sapp diff_fuzz/round_trip ignored mode:"bytes" (always generated
+//     strings), so byte codecs could never be fuzzed through those APIs.
+//  2. encoding.url_encode emitted "+" for space while documented as RFC 3986
+//     and while the native builtin emits "%20"; url_decode silently passed
+//     malformed percent-escapes through (filter-bypass class) while the
+//     builtin rejects them.
+//  3. encoding.csv_decode split records on raw newlines before quote parsing,
+//     so a quoted field containing "\n" broke into two rows.
+//  4. csv.stringify serialized a single-empty-field row [[""]] as a blank
+//     line, which parse() then dropped — the row vanished on round trip.
+
+let F = import("stdlib:fuzz.sapp");
+let E = import("stdlib:encoding.sapp");
+let C = import("stdlib:csv.sapp");
+
+fn eq(a, b, msg) {
+    if a != b { return error("FAIL " + msg + ": got " + str(a) + ", want " + str(b)); }
+}
+
+// ── 1. fuzz.sapp honors mode:"bytes" in round_trip and diff_fuzz ────────────
+fn benc(b) {
+    let out = [];
+    let i = 0;
+    while i < len(b) { push(out, num_mod(b[i] + 1, 256)); i = i + 1; }
+    return out;
+}
+fn bdec(b) {
+    let out = [];
+    let i = 0;
+    while i < len(b) { push(out, num_mod(b[i] + 255, 256)); i = i + 1; }
+    return out;
+}
+let rtb = F.round_trip(benc, bdec, map{ seed: 21, runs: 60, max_len: 12, mode: "bytes" });
+eq(rtb["ok"], true, "bytes-mode round_trip feeds byte arrays to the codec");
+
+fn dfa(b) { return len(b); }
+fn dfb(b) {
+    let i = 0;
+    while i < len(b) {
+        if b[i] == 0 { return len(b) + 1; }
+        i = i + 1;
+    }
+    return len(b);
+}
+let dfr = F.diff_fuzz(dfa, dfb, map{ seed: 22, runs: 300, max_len: 10, mode: "bytes" });
+eq(dfr["ok"], false, "bytes-mode diff_fuzz finds the zero-byte divergence");
+eq(dfr["shrunk"], [0], "bytes-mode divergence shrunk to a single zero byte");
+
+// ── 2. encoding.url_encode/url_decode match the native builtins ─────────────
+eq(E.url_encode(" "), "%20", "RFC 3986: space encodes as %20, not +");
+eq(E.url_encode("a b+c"), "a%20b%2Bc", "space and plus both escaped");
+eq(E.url_decode("+"), " ", "form-tolerant decode: + means space (as builtin)");
+eq(E.url_decode("%2B"), "+", "escaped plus decodes to literal +");
+eq(E.url_decode("%C3%A9"), "é", "multi-byte UTF-8 escape decodes");
+
+// full parity with the native builtin over printable ASCII
+let c = 32;
+while c <= 126 {
+    let ch = strfromcharcode(c);
+    eq(E.url_encode(ch), url_encode(ch), "url_encode parity for code " + str(c));
+    c = c + 1;
+}
+
+// malformed escapes are rejected, exactly like the builtin
+let m1 = try map{ ok: true, v: E.url_decode("%") } catch map{ ok: false };
+eq(m1["ok"], false, "bare % rejected");
+let m2 = try map{ ok: true, v: E.url_decode("%2") } catch map{ ok: false };
+eq(m2["ok"], false, "truncated escape %2 rejected");
+let m3 = try map{ ok: true, v: E.url_decode("a%zzb") } catch map{ ok: false };
+eq(m3["ok"], false, "non-hex escape %zz rejected");
+
+// query strings still work end-to-end (browsers send + for space)
+eq(E.query_decode("k=a+b")["k"], "a b", "query_decode keeps form + semantics");
+eq(E.query_encode(map{ b: "x y" }), "b=x+y", "query_encode stays form-canonical: space -> +");
+eq(E.query_decode(E.query_encode(map{ k: "a b&=c" }))["k"], "a b&=c", "query round trip");
+
+// ── 3. encoding.csv handles quoted newlines and special chars ───────────────
+eq(E.csv_decode(E.csv_encode([["a\nb"]])), [["a\nb"]], "quoted newline survives");
+eq(E.csv_decode(E.csv_encode([["a\rb"]])), [["a\rb"]], "quoted CR survives");
+eq(E.csv_decode(E.csv_encode([[""]])), [[""]], "single empty field survives");
+eq(E.csv_decode(E.csv_encode([["\t"]])), [["\t"]], "whitespace-only field survives");
+eq(E.csv_decode(E.csv_encode([[" "]])), [[" "]], "space-only field survives");
+let tricky = [["x", "a\"b"], ["c,d", "line1\nline2"]];
+eq(E.csv_decode(E.csv_encode(tricky)), tricky, "quotes, commas and newlines together");
+eq(E.csv_decode("a,b\n\nc,d"), [["a", "b"], ["c", "d"]], "blank lines still skipped");
+
+// ── 4. csv.sapp round-trips the single-empty-field row ──────────────────────
+eq(C.stringify([[""]]), "\"\"\n", "sole empty field emitted as quoted empty");
+eq(C.parse(C.stringify([[""]])), [[""]], "[[\"\"]] survives the round trip");
+eq(C.parse(C.stringify([["x"], [""], ["y"]])), [["x"], [""], ["y"]], "empty row mid-file survives");
+eq(C.parse(C.stringify([["\t"]])), [["\t"]], "csv.sapp: whitespace-only field survives");
+eq(C.stringify([["a", ""]]), "a,\n", "empty field beside others stays unquoted");
+eq(C.parse("a,\n"), [["a", ""]], "trailing empty field parsed");
+eq(C.parse("a\n\nb\n"), [["a"], ["b"]], "truly blank lines still skipped");
+
+print "codec_hardening_pass";
