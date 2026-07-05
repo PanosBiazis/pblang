@@ -1,0 +1,142 @@
+// Test: fuzz.sapp — mutation-based fuzzing for the pblang QA stack.
+//
+// The fuzzer generates random inputs (strings or byte arrays), mutates them
+// (bit flips, insert/delete, dictionary splices), feeds them to a target and
+// records crashes (throws). Crashing inputs are shrunk to a minimal
+// reproducer. diff_fuzz cross-checks two implementations; round_trip checks
+// decode(encode(x)) == x — the canonical codec property.
+
+let F = import("stdlib:fuzz.sapp");
+
+fn eq(a, b, msg) {
+    if a != b { return error("FAIL " + msg + ": got " + str(a) + ", want " + str(b)); }
+}
+
+// ── deterministic generation ─────────────────────────────────────────────────
+let fz = F.new(42);
+let b = F.gen_bytes(fz, 16);
+eq(is_array(b), true, "gen_bytes returns array");
+eq(len(b) <= 16, true, "gen_bytes respects max_len");
+let bi = 0;
+while bi < len(b) {
+    eq(b[bi] >= 0 and b[bi] <= 255, true, "byte in range");
+    bi = bi + 1;
+}
+let s = F.gen_str(fz, 20);
+eq(type(s), "string", "gen_str returns string");
+eq(len(s) <= 20, true, "gen_str respects max_len");
+
+// same seed → identical sequence
+let fa = F.new(7);
+let fb = F.new(7);
+eq(F.gen_str(fa, 10), F.gen_str(fb, 10), "same seed, same first string");
+eq(F.gen_str(fa, 10), F.gen_str(fb, 10), "same seed, same second string");
+
+// ── mutation preserves the original and stays in range ──────────────────────
+let orig = [1, 2, 3, 4];
+let mfz = F.new(9);
+let mi = 0;
+while mi < 30 {
+    let m = F.mutate_bytes(mfz, orig);
+    eq(is_array(m), true, "mutate_bytes returns array");
+    let mj = 0;
+    while mj < len(m) {
+        eq(m[mj] >= 0 and m[mj] <= 255, true, "mutated byte in range");
+        mj = mj + 1;
+    }
+    mi = mi + 1;
+}
+eq(orig, [1, 2, 3, 4], "mutate_bytes does not touch the input");
+
+let sorig = "hello";
+let msi = 0;
+while msi < 30 {
+    let ms = F.mutate_str(mfz, sorig);
+    eq(type(ms), "string", "mutate_str returns string");
+    msi = msi + 1;
+}
+eq(sorig, "hello", "mutate_str does not touch the input");
+
+// ── fuzz finds a planted crash and shrinks it to the minimal input ──────────
+fn crash_on_a(x) {
+    if str_contains(x, "a") { return error("boom"); }
+    return len(x);
+}
+let res = F.fuzz(crash_on_a, map{ seed: 5, runs: 300, max_len: 12 });
+eq(res["runs"], 300, "all runs executed");
+eq(res["crash_count"] > 0, true, "planted crash found");
+eq(res["first_crash"] != nil, true, "first crash recorded");
+eq(res["shrunk"], "a", "crash shrunk to the single crashing char");
+
+// robust target → clean report
+fn robust(x) { return len(x); }
+let res_ok = F.fuzz(robust, map{ seed: 5, runs: 50, max_len: 8 });
+eq(res_ok["crash_count"], 0, "no crashes on robust target");
+eq(res_ok["first_crash"], nil, "no first crash");
+eq(res_ok["shrunk"], nil, "nothing to shrink");
+
+// bytes mode: crash on a zero byte
+fn crash_on_zero(bytes) {
+    let i = 0;
+    while i < len(bytes) {
+        if bytes[i] == 0 { return error("zero"); }
+        i = i + 1;
+    }
+    return len(bytes);
+}
+let resb = F.fuzz(crash_on_zero, map{ seed: 11, runs: 300, max_len: 10, mode: "bytes" });
+eq(resb["crash_count"] > 0, true, "zero-byte crash found");
+eq(resb["shrunk"], [0], "byte crash shrunk to single zero byte");
+
+// ── dictionary tokens reach the target ───────────────────────────────────────
+fn crash_on_root(x) {
+    if str_contains(x, "ROOT") { return error("magic"); }
+    return 0;
+}
+let resd = F.fuzz(crash_on_root, map{ seed: 3, runs: 400, max_len: 12, dict: ["ROOT", "admin"] });
+eq(resd["crash_count"] > 0, true, "dictionary token reached the target");
+eq(resd["shrunk"], "ROOT", "shrunk to the magic token alone");
+
+// ── direct shrinking API ─────────────────────────────────────────────────────
+fn crash_on_x(v) {
+    if str_contains(v, "X") { return error("x"); }
+    return 0;
+}
+eq(F.shrink_str(crash_on_x, "qqqXqq"), "X", "shrink_str reaches minimal reproducer");
+eq(F.shrink_str(crash_on_x, "clean"), "clean", "non-crashing input returned unchanged");
+eq(F.shrink_bytes(crash_on_zero, [7, 9, 0, 4, 2]), [0], "shrink_bytes reaches minimal reproducer");
+
+// ── differential fuzzing ─────────────────────────────────────────────────────
+fn impl_a(x) { return len(x); }
+fn impl_b(x) { return len(x); }
+let d1 = F.diff_fuzz(impl_a, impl_b, map{ seed: 8, runs: 100, max_len: 10 });
+eq(d1["ok"], true, "identical implementations agree");
+
+fn impl_bad(x) {
+    if len(x) > 5 { return len(x) + 1; }
+    return len(x);
+}
+let d2 = F.diff_fuzz(impl_a, impl_bad, map{ seed: 8, runs: 200, max_len: 12 });
+eq(d2["ok"], false, "divergent implementation caught");
+eq(len(d2["shrunk"]), 6, "divergence shrunk to minimal length");
+
+// both throwing counts as agreement
+fn always_throws(x) { return error("nope"); }
+let d3 = F.diff_fuzz(always_throws, always_throws, map{ seed: 8, runs: 30, max_len: 6 });
+eq(d3["ok"], true, "matching throws agree");
+
+// ── round-trip property ──────────────────────────────────────────────────────
+fn enc(x) { return x + "|"; }
+fn dec(t) { return str_slice(t, 0, len(t) - 1); }
+let rt1 = F.round_trip(enc, dec, map{ seed: 4, runs: 100, max_len: 10 });
+eq(rt1["ok"], true, "correct codec round-trips");
+
+fn dec_bad(t) {
+    if len(t) > 4 { return str_slice(t, 1, len(t) - 1); }
+    return str_slice(t, 0, len(t) - 1);
+}
+let rt2 = F.round_trip(enc, dec_bad, map{ seed: 4, runs: 200, max_len: 10 });
+eq(rt2["ok"], false, "broken codec caught");
+eq(rt2["input"] != nil, true, "failing input reported");
+
+print "fuzz_pass";
