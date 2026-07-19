@@ -1,0 +1,1023 @@
+// stdlib/codegen_arm64_ast.sapp — real pblang AST → ARM64 machine code (+ ELF). Extracted from the exec test so
+// it's reusable: compile_ast(src) returns raw AArch64 code; compile_elf(src) wraps it in a runnable EM_AARCH64
+// ELF. Integer subset: fn/params, let/const/assign, if/else, while, return, +-*/% with precedence, comparisons,
+// calls, recursion. Std AArch64 convention: args x0..x7, result x0, x29=frame ptr, x30=link; locals at
+// [x29,#8*slot]; expression temporaries on a push/pop stack below sp. Verified by execution in the exec test.
+
+let _A = import("stdlib/codegen_arm64.sapp");   // elf64_exec (EM_AARCH64 wrapper)
+let _tok = import("stdlib/compiler/tokenizer.sapp");
+let _par = import("stdlib/compiler/parser.sapp");
+
+fn fail(m) { throw "FAIL arm64-ast: " + m; }
+fn _stmts_of(b) { if is_array(b) { return b; } if is_map(b) and map_has(b, "stmts") { return b.stmts; } return []; }
+fn _pname(p) { if is_map(p) { return p.name; } return p; }
+fn _nkeys(m) { return len(map_keys(m)); }
+
+// ── word emit / patch ─────────────────────────────────────────────────────────────────────────────────────────
+fn _w32(word) { return [word % 256, num_floor(word / 256) % 256, num_floor(word / 65536) % 256, num_floor(word / 16777216) % 256]; }
+fn _e(code, word) { let b = _w32(word); push(code, b[0]); push(code, b[1]); push(code, b[2]); push(code, b[3]); }
+fn _wpos(code) { return num_floor(len(code) / 4); }
+fn _patch(code, at, word) { let b = at * 4; let w = _w32(word); code[b] = w[0]; code[b + 1] = w[1]; code[b + 2] = w[2]; code[b + 3] = w[3]; }
+fn _imm19(off) { if off < 0 { return off + 524288; } return off; }
+fn _imm26(off) { if off < 0 { return off + 67108864; } return off; }
+
+// ── compact instruction encoders (used by the heap helpers; keep hand-hex out of loops) ──
+fn _addi_(d, n, imm) { return 0x91000000 + imm * 1024 + n * 32 + d; }   // add  Xd,Xn,#imm
+fn _subi_(d, n, imm) { return 0xD1000000 + imm * 1024 + n * 32 + d; }   // sub  Xd,Xn,#imm
+fn _addr_(d, n, m) { return 0x8B000000 + m * 65536 + n * 32 + d; }      // add  Xd,Xn,Xm
+fn _subr_(d, n, m) { return 0xCB000000 + m * 65536 + n * 32 + d; }      // sub  Xd,Xn,Xm
+fn _movr_(d, s) { return 0xAA0003E0 + s * 65536 + d; }                  // mov  Xd,Xs
+fn _strw_(t, n, u) { return 0xF9000000 + u * 1024 + n * 32 + t; }       // str  Xt,[Xn,#u*8]
+fn _ldrw_(t, n, u) { return 0xF9400000 + u * 1024 + n * 32 + t; }       // ldr  Xt,[Xn,#u*8]
+fn _strb_(t, n) { return 0x39000000 + n * 32 + t; }                     // strb Wt,[Xn]
+fn _ldrb_(t, n) { return 0x39400000 + n * 32 + t; }                     // ldrb Wt,[Xn]
+fn _movz_(d, imm) { return 0xD2800000 + imm * 32 + d; }                 // movz Xd,#imm
+fn _movz16_(d, imm) { return 0xD2A00000 + imm * 32 + d; }               // movz Xd,#imm,lsl#16
+fn _cbz_(t, off) { return 0xB4000000 + _imm19(off) * 32 + t; }
+fn _cbnz_(t, off) { return 0xB5000000 + _imm19(off) * 32 + t; }
+fn _bb_(off) { return 0x14000000 + _imm26(off); }
+fn _addlsl_(d, n, m, sh) { return 0x8B000000 + sh * 1024 + m * 65536 + n * 32 + d; }  // add Xd,Xn,Xm,lsl#sh
+
+// arrays are heap objects [count(8)][cap(8)][elem0][elem1]…  __push(arr,v) → the (possibly reallocated) array.
+fn _emit_push_helper() {
+    let c = [];
+    _e(c, _ldrw_(2, 0, 0));                 // x2 = count
+    _e(c, _ldrw_(3, 0, 1));                 // x3 = cap
+    _e(c, _subr_(4, 2, 3));                 // count - cap
+    let jgrow = _wpos(c); _e(c, _cbz_(4, 0));
+    _e(c, _addi_(5, 0, 16)); _e(c, _addlsl_(5, 5, 2, 3));   // &arr[count]
+    _e(c, _strw_(1, 5, 0));                 // store v
+    _e(c, _addi_(2, 2, 1)); _e(c, _strw_(2, 0, 0));         // count++
+    _e(c, 0xD65F03C0);                      // ret
+    _patch(c, jgrow, _cbz_(4, _wpos(c) - jgrow));
+    _e(c, _addi_(6, 0, 16)); _e(c, _addlsl_(6, 6, 3, 3));   // x6 = end = arr+16+cap*8
+    _e(c, _subr_(7, 6, 28));                // end - bump
+    let jtop = _wpos(c); _e(c, _cbz_(7, 0));
+    // ── realloc (array not at arena top): new array of count+1, copy, append ──
+    _e(c, _movr_(9, 28));                   // x9 = new
+    _e(c, _addi_(11, 2, 1));                // newsize = count+1
+    _e(c, _strw_(11, 9, 0)); _e(c, _strw_(11, 9, 1));
+    _e(c, _addi_(28, 28, 16)); _e(c, _addlsl_(28, 28, 11, 3));  // bump
+    _e(c, _addi_(12, 0, 16)); _e(c, _addi_(13, 9, 16)); _e(c, _movr_(14, 2));  // src,dst,cnt
+    let cl = _wpos(c); _e(c, _cbz_(14, 0));
+    _e(c, _ldrw_(15, 12, 0)); _e(c, _strw_(15, 13, 0));
+    _e(c, _addi_(12, 12, 8)); _e(c, _addi_(13, 13, 8)); _e(c, _subi_(14, 14, 1));
+    _e(c, _bb_(cl - _wpos(c)));
+    _patch(c, cl, _cbz_(14, _wpos(c) - cl));
+    _e(c, _addi_(15, 9, 16)); _e(c, _addlsl_(15, 15, 2, 3)); _e(c, _strw_(1, 15, 0));  // new[count] = v
+    _e(c, _movr_(0, 9)); _e(c, 0xD65F03C0);
+    _patch(c, jtop, _cbz_(7, _wpos(c) - jtop));
+    // ── grow in place (arr is at the arena top): x28 == &arr[cap] ──
+    _e(c, _strw_(1, 28, 0));                // store v at the top
+    _e(c, _addi_(28, 28, 8));               // bump
+    _e(c, _addi_(2, 2, 1)); _e(c, _strw_(2, 0, 0));   // count++
+    _e(c, _addi_(3, 3, 1)); _e(c, _strw_(3, 0, 1));   // cap++
+    _e(c, 0xD65F03C0);                      // ret (x0 already = arr)
+    return c;
+}
+
+// heap: mmap 16 MiB (PROT_RW, MAP_PRIVATE|ANON) into x28 = the bump pointer (a reserved global, never clobbered).
+fn _emit_heap_setup(c) {
+    _e(c, _movz_(0, 0));            // movz x0,#0    (addr: kernel chooses)
+    _e(c, _movz16_(1, 256));       // movz x1,#256,lsl#16  (= 16 MiB)
+    _e(c, _movz_(2, 3));           // movz x2,#3    (PROT_READ|WRITE)
+    _e(c, _movz_(3, 34));          // movz x3,#34   (MAP_PRIVATE|MAP_ANON)
+    _e(c, 0x92800004);             // movn x4,#0    (fd = -1)
+    _e(c, _movz_(5, 0));           // movz x5,#0    (offset)
+    _e(c, _movz_(8, 222));         // movz x8,#222  (mmap)
+    _e(c, 0xD4000001);             // svc #0
+    _e(c, _movr_(28, 0));          // mov x28,x0    (bump pointer)
+}
+// __str(n): integer x0 → heap string [len(8)][digits] ; returns address in x0. (itoa to a stack buffer, then copy)
+fn _emit_str_helper() {
+    let c = [];
+    _e(c, _subi_(31, 31, 32));     // sub sp,sp,#32
+    _e(c, _addi_(11, 31, 31));     // add x11,sp,#31   (write ptr, backward)
+    _e(c, _movz_(10, 10));         // movz x10,#10
+    _e(c, 0xEB1F001F);             // cmp x0,xzr
+    _e(c, 0x9A9FA7ED);             // cset x13,lt
+    let jneg = _wpos(c); _e(c, _cbz_(13, 0));
+    _e(c, 0xCB0003E0);             // neg x0
+    _patch(c, jneg, _cbz_(13, _wpos(c) - jneg));
+    let loop = _wpos(c);
+    _e(c, 0x9ACA0C02);             // sdiv x2,x0,x10
+    _e(c, 0x9B0A8043);             // msub x3,x2,x10,x0
+    _e(c, _addi_(3, 3, 48));       // add x3,x3,#48
+    _e(c, _strb_(3, 11));          // strb w3,[x11]
+    _e(c, _subi_(11, 11, 1));      // sub x11,x11,#1
+    _e(c, _movr_(0, 2));           // mov x0,x2
+    let back = _wpos(c); _e(c, _cbnz_(0, loop - back));
+    let jmin = _wpos(c); _e(c, _cbz_(13, 0));
+    _e(c, _movz_(9, 45));          // movz x9,#45   ('-')
+    _e(c, _strb_(9, 11));          // strb w9,[x11]
+    _e(c, _subi_(11, 11, 1));
+    _patch(c, jmin, _cbz_(13, _wpos(c) - jmin));
+    _e(c, _addi_(4, 11, 1));       // x4 = digits start
+    _e(c, _addi_(5, 31, 32));      // x5 = sp+32
+    _e(c, _subr_(6, 5, 4));        // x6 = length
+    _e(c, _movr_(7, 28));          // x7 = result = x28
+    _e(c, _strw_(6, 7, 0));        // str x6,[x7]   (length)
+    _e(c, _addi_(28, 28, 8));      // x28 += 8
+    _e(c, _addr_(28, 28, 6));      // x28 += length
+    _e(c, _addi_(1, 7, 8));        // x1 = dest = x7+8  (x6 = length still live; bump above already used it)
+    let cl = _wpos(c); _e(c, _cbz_(6, 0));    // copyloop: cbz x6, done
+    _e(c, _ldrb_(2, 4));           // ldrb w2,[x4]
+    _e(c, _strb_(2, 1));           // strb w2,[x1]
+    _e(c, _addi_(4, 4, 1));
+    _e(c, _addi_(1, 1, 1));
+    _e(c, _subi_(6, 6, 1));
+    _e(c, _bb_(cl - _wpos(c)));
+    _patch(c, cl, _cbz_(6, _wpos(c) - cl));    // cbz x6, done
+    _e(c, _movr_(0, 7));           // return result
+    _e(c, _addi_(31, 31, 32));     // add sp,sp,#32
+    _e(c, 0xD65F03C0);             // ret
+    return c;
+}
+// __concat(a,b): string addresses x0,x1 → new heap string x0. (allocate len(a)+len(b), copy both)
+fn _emit_concat_helper() {
+    let c = [];
+    _e(c, _ldrw_(2, 0, 0));        // x2 = lenA
+    _e(c, _ldrw_(3, 1, 0));        // x3 = lenB
+    _e(c, _addr_(4, 2, 3));        // x4 = total
+    _e(c, _movr_(7, 28));          // x7 = result
+    _e(c, _strw_(4, 7, 0));        // str total
+    _e(c, _addi_(28, 28, 8));      // bump += 8
+    _e(c, _addr_(28, 28, 4));      // bump += total
+    _e(c, _addi_(5, 7, 8));        // x5 = dest
+    _e(c, _addi_(6, 0, 8));        // x6 = srcA
+    let la = _wpos(c); _e(c, _cbz_(2, 0));
+    _e(c, _ldrb_(9, 6)); _e(c, _strb_(9, 5)); _e(c, _addi_(6, 6, 1)); _e(c, _addi_(5, 5, 1)); _e(c, _subi_(2, 2, 1));
+    _e(c, _bb_(la - _wpos(c)));
+    _patch(c, la, _cbz_(2, _wpos(c) - la));
+    _e(c, _addi_(6, 1, 8));        // x6 = srcB
+    let lb = _wpos(c); _e(c, _cbz_(3, 0));
+    _e(c, _ldrb_(9, 6)); _e(c, _strb_(9, 5)); _e(c, _addi_(6, 6, 1)); _e(c, _addi_(5, 5, 1)); _e(c, _subi_(3, 3, 1));
+    _e(c, _bb_(lb - _wpos(c)));
+    _patch(c, lb, _cbz_(3, _wpos(c) - lb));
+    _e(c, _movr_(0, 7));           // return result
+    _e(c, 0xD65F03C0);             // ret
+    return c;
+}
+// ── interprocedural TYPE inference (fixpoint) ──  each expr/param/return is typed "num"|"str"|"arr"|"map".
+fn _val_ty(node, locals, params, fnret) {
+    if node == nil { return "num"; }
+    let k = node.kind;
+    if k == "string" { return "str"; }
+    if k == "array" { return "arr"; }
+    if k == "map" { return "map"; }
+    if k == "ident" { if map_has(locals, node.name) { return locals[node.name]; } if map_has(params, node.name) { return params[node.name]; } return "num"; }
+    if k == "call" { let fnn = try node.func.name catch nil; if fnn == "str" or fnn == "strfromcharcode" or fnn == "str_slice" { return "str"; } if fnn == "str_split" { return "arr"; } if fnn != nil and map_has(fnret, fnn) { return fnret[fnn]; } return "num"; }
+    if k == "index" { if _val_ty(node.obj, locals, params, fnret) == "str" { return "str"; } return "num"; }   // s[i]→str; a[i]/m[k] element unknown→num
+    if k == "binary" and node.op == "+" { if _val_ty(node.left, locals, params, fnret) == "str" or _val_ty(node.right, locals, params, fnret) == "str" { return "str"; } return "num"; }
+    return "num";
+}
+fn _walk_expr_ty(node, locals, params, fnret, fnptype, res) {
+    if node == nil or not is_map(node) { return; }
+    let k = try node.kind catch nil;
+    if k == "call" {
+        let fnn = try node.func.name catch nil;
+        if fnn != nil and map_has(fnptype, fnn) {
+            let args = node.args; let i = 0;
+            while i < len(args) {
+                if i < len(fnptype[fnn]) { let ty = _val_ty(args[i], locals, params, fnret); if ty != "num" and fnptype[fnn][i] == "num" { fnptype[fnn][i] = ty; res.changed = true; } }
+                i = i + 1;
+            }
+        }
+        let a = node.args; let j = 0; while j < len(a) { _walk_expr_ty(a[j], locals, params, fnret, fnptype, res); j = j + 1; }
+    } elif k == "binary" { _walk_expr_ty(node.left, locals, params, fnret, fnptype, res); _walk_expr_ty(node.right, locals, params, fnret, fnptype, res); }
+    elif k == "unary" { let op = try node.operand catch nil; if op == nil { op = try node.expr catch nil; } _walk_expr_ty(op, locals, params, fnret, fnptype, res); }
+    elif k == "index" { _walk_expr_ty(node.obj, locals, params, fnret, fnptype, res); _walk_expr_ty(node.index, locals, params, fnret, fnptype, res); }
+    elif k == "array" { let it = node.items; let j = 0; while j < len(it) { _walk_expr_ty(it[j], locals, params, fnret, fnptype, res); j = j + 1; } }
+    elif k == "map" { let en = node.entries; let j = 0; while j < len(en) { _walk_expr_ty(en[j].value, locals, params, fnret, fnptype, res); j = j + 1; } }
+    elif k == "member" { _walk_expr_ty(node.obj, locals, params, fnret, fnptype, res); }
+    elif k == "assign_to" { _walk_expr_ty(node.target, locals, params, fnret, fnptype, res); _walk_expr_ty(node.value, locals, params, fnret, fnptype, res); }
+    elif k == "assign" { _walk_expr_ty(node.value, locals, params, fnret, fnptype, res); }
+}
+fn _walk_stmts_ty(stmts, locals, params, fnret, fnptype, res) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i]; let k = s.kind;
+        if k == "let" or k == "const" { _walk_expr_ty(s.value, locals, params, fnret, fnptype, res); locals[s.name] = _val_ty(s.value, locals, params, fnret); }
+        elif k == "expr_stmt" { let e = s.expr; _walk_expr_ty(e, locals, params, fnret, fnptype, res); if e.kind == "assign" { locals[e.name] = _val_ty(e.value, locals, params, fnret); } }
+        elif k == "return" { _walk_expr_ty(s.value, locals, params, fnret, fnptype, res); let t = _val_ty(s.value, locals, params, fnret); if t != "num" and res.rettype == "num" { res.rettype = t; } }
+        elif k == "if" {
+            _walk_stmts_ty(_stmts_of(s.then), locals, params, fnret, fnptype, res);
+            let elifs = try s.elifs catch nil; if elifs != nil { let j = 0; while j < len(elifs) { _walk_expr_ty(elifs[j].cond, locals, params, fnret, fnptype, res); _walk_stmts_ty(_stmts_of(elifs[j].body), locals, params, fnret, fnptype, res); j = j + 1; } }
+            let el = try s.else catch nil; if el != nil { _walk_stmts_ty(_stmts_of(el), locals, params, fnret, fnptype, res); }
+        }
+        elif k == "while" { _walk_expr_ty(s.cond, locals, params, fnret, fnptype, res); _walk_stmts_ty(_stmts_of(s.body), locals, params, fnret, fnptype, res); }
+        elif k == "print" { _walk_expr_ty(s.value, locals, params, fnret, fnptype, res); }
+        elif k == "block" { _walk_stmts_ty(_stmts_of(s), locals, params, fnret, fnptype, res); }
+        i = i + 1;
+    }
+}
+fn _infer_types(fns) {
+    let fnret = map{}; let fnptype = map{}; let fi = 0;
+    while fi < len(fns) { fnret[fns[fi].name] = "num"; let ps = []; let p = 0; while p < len(fns[fi].params) { push(ps, "num"); p = p + 1; } fnptype[fns[fi].name] = ps; fi = fi + 1; }
+    let changed = true; let guard = 0;
+    while changed and guard < 200 {
+        changed = false; guard = guard + 1; let f = 0;
+        while f < len(fns) {
+            let F = fns[f]; let params = map{}; let pl = F.params; let pi = 0;
+            while pi < len(pl) { params[_pname(pl[pi])] = fnptype[F.name][pi]; pi = pi + 1; }
+            let res = map{ rettype: "num", changed: false };
+            _walk_stmts_ty(_stmts_of(F.body), map{}, params, fnret, fnptype, res);
+            if res.rettype != "num" and fnret[F.name] == "num" { fnret[F.name] = res.rettype; changed = true; }
+            if res.changed { changed = true; }
+            f = f + 1;
+        }
+    }
+    return map{ fnret: fnret, fnptype: fnptype };
+}
+
+// __streq(a,b): string addresses → x0 = 1 if byte-equal else 0. (length check, then byte loop)
+fn _emit_streq_helper() {
+    let c = [];
+    _e(c, _ldrw_(2, 0, 0));       // x2 = lenA
+    _e(c, _ldrw_(3, 1, 0));       // x3 = lenB
+    _e(c, _subr_(4, 2, 3));       // x4 = lenA - lenB
+    let jsame = _wpos(c); _e(c, _cbz_(4, 0));
+    _e(c, _movz_(0, 0)); _e(c, 0xD65F03C0);           // lengths differ → 0
+    _patch(c, jsame, _cbz_(4, _wpos(c) - jsame));
+    _e(c, _addi_(5, 0, 8));       // x5 = a bytes
+    _e(c, _addi_(6, 1, 8));       // x6 = b bytes
+    let cl = _wpos(c); _e(c, _cbz_(2, 0));             // cmploop: all bytes done?
+    _e(c, _ldrb_(7, 5)); _e(c, _ldrb_(8, 6)); _e(c, _subr_(9, 7, 8));
+    let jne = _wpos(c); _e(c, _cbz_(9, 0));            // bytes equal → next
+    _e(c, _movz_(0, 0)); _e(c, 0xD65F03C0);           // differ → 0
+    _patch(c, jne, _cbz_(9, _wpos(c) - jne));
+    _e(c, _addi_(5, 5, 1)); _e(c, _addi_(6, 6, 1)); _e(c, _subi_(2, 2, 1));
+    _e(c, _bb_(cl - _wpos(c)));
+    _patch(c, cl, _cbz_(2, _wpos(c) - cl));
+    _e(c, _movz_(0, 1)); _e(c, 0xD65F03C0);           // all matched → 1
+    return c;
+}
+// __charat(s,i): → new 1-char heap string [1][byte s[i]]
+fn _emit_charat_helper() {
+    let c = [];
+    _e(c, _addi_(2, 0, 8));       // x2 = s+8
+    _e(c, _addr_(2, 2, 1));       // x2 = s+8+i
+    _e(c, _ldrb_(3, 2));          // x3 = s[i]
+    _e(c, _movr_(7, 28));         // result
+    _e(c, _movz_(4, 1)); _e(c, _strw_(4, 7, 0));      // length = 1
+    _e(c, _addi_(28, 28, 8)); _e(c, _addi_(28, 28, 1)); // bump 9
+    _e(c, _addi_(5, 7, 8)); _e(c, _strb_(3, 5));      // store char
+    _e(c, _movr_(0, 7)); _e(c, 0xD65F03C0);           // return
+    return c;
+}
+
+// __fromcode(code) → new 1-char heap string [1][byte=code]
+fn _emit_fromcode_helper() {
+    let c = [];
+    _e(c, _movr_(3, 0)); _e(c, _movr_(7, 28));            // save code, result
+    _e(c, _movz_(4, 1)); _e(c, _strw_(4, 7, 0));          // len = 1
+    _e(c, _addi_(28, 28, 8)); _e(c, _addi_(28, 28, 1));   // bump 9
+    _e(c, _addi_(5, 7, 8)); _e(c, _strb_(3, 5));          // store char
+    _e(c, _movr_(0, 7)); _e(c, 0xD65F03C0);
+    return c;
+}
+// __slice(s,a,b) → new heap string of s[a..b)
+fn _emit_slice_helper() {
+    let c = [];
+    _e(c, _subr_(3, 2, 1));                               // len = b - a
+    _e(c, _movr_(7, 28)); _e(c, _strw_(3, 7, 0));         // result ; store len
+    _e(c, _addi_(28, 28, 8)); _e(c, _addr_(28, 28, 3));   // bump 8 + len
+    _e(c, _addi_(4, 0, 8)); _e(c, _addr_(4, 4, 1));       // src = s+8+a
+    _e(c, _addi_(5, 7, 8));                               // dst = result+8
+    let cl = _wpos(c); _e(c, _cbz_(3, 0));
+    _e(c, _ldrb_(6, 4)); _e(c, _strb_(6, 5)); _e(c, _addi_(4, 4, 1)); _e(c, _addi_(5, 5, 1)); _e(c, _subi_(3, 3, 1));
+    _e(c, _bb_(cl - _wpos(c)));
+    _patch(c, cl, _cbz_(3, _wpos(c) - cl));
+    _e(c, _movr_(0, 7)); _e(c, 0xD65F03C0);
+    return c;
+}
+// __split token emitter (shared by the two emit sites): copy s[x4..x14) into a fresh heap string,
+// store its pointer at arr elem x13, then k++ and start=i+1. Regs: x3 tlen, x5 dst, x6 byte, x7 str
+// base, x8 src, x9 elem addr — all scratch at the emit points; x10 s, x11 slen, x12 sep, x15 arr live.
+fn _split_tok(c) {
+    _e(c, _subr_(3, 14, 4));                             // tlen = i - start
+    _e(c, _movr_(7, 28)); _e(c, _strw_(3, 7, 0));        // str base ; [len]
+    _e(c, _addi_(28, 28, 8)); _e(c, _addr_(28, 28, 3));  // bump 8 + tlen
+    _e(c, _addi_(8, 10, 8)); _e(c, _addr_(8, 8, 4));     // src = s + 8 + start
+    _e(c, _addi_(5, 7, 8));                              // dst = str + 8
+    let cl = _wpos(c); _e(c, _cbz_(3, 0));
+    _e(c, _ldrb_(6, 8)); _e(c, _strb_(6, 5)); _e(c, _addi_(8, 8, 1)); _e(c, _addi_(5, 5, 1)); _e(c, _subi_(3, 3, 1));
+    _e(c, _bb_(cl - _wpos(c)));
+    _patch(c, cl, _cbz_(3, _wpos(c) - cl));
+    _e(c, _addlsl_(9, 15, 13, 3));                       // x9 = arr + k*8
+    _e(c, _strw_(7, 9, 2));                              // elems[k] = str ptr   ([x9+16])
+    _e(c, _addi_(13, 13, 1));                            // k++
+    _e(c, _addi_(4, 14, 1));                             // start = i + 1
+}
+// __split(s x0, sep x1) → array of heap strings, split on sep's FIRST byte (single-char separator).
+// Two passes: count separators (exact array size), then allocate the array and emit each token.
+fn _emit_split_helper() {
+    let c = [];
+    _e(c, _movr_(10, 0)); _e(c, _ldrw_(11, 10, 0));      // x10 = s, x11 = slen
+    _e(c, _addi_(8, 1, 8)); _e(c, _ldrb_(12, 8));        // x12 = sep char (byte 0)
+    _e(c, _movz_(13, 1)); _e(c, _movz_(14, 0));          // cnt = 1, i = 0
+    let l1 = _wpos(c); _e(c, _subr_(9, 11, 14)); let j1 = _wpos(c); _e(c, _cbz_(9, 0));   // i == slen → done
+    _e(c, _addi_(8, 10, 8)); _e(c, _addr_(8, 8, 14)); _e(c, _ldrb_(7, 8));
+    _e(c, _subr_(6, 7, 12)); let js = _wpos(c); _e(c, _cbnz_(6, 0));
+    _e(c, _addi_(13, 13, 1));                            // separator → cnt++
+    _patch(c, js, _cbnz_(6, _wpos(c) - js));
+    _e(c, _addi_(14, 14, 1)); _e(c, _bb_(l1 - _wpos(c)));
+    _patch(c, j1, _cbz_(9, _wpos(c) - j1));
+    _e(c, _movr_(15, 28)); _e(c, _strw_(13, 15, 0)); _e(c, _strw_(13, 15, 1));   // arr: count = cap = cnt
+    _e(c, _addi_(28, 28, 16)); _e(c, _addlsl_(28, 28, 13, 3));                   // bump 16 + cnt*8
+    _e(c, _movz_(13, 0)); _e(c, _movz_(14, 0)); _e(c, _movz_(4, 0));             // k = 0, i = 0, start = 0
+    let l2 = _wpos(c); _e(c, _subr_(9, 11, 14)); let j2 = _wpos(c); _e(c, _cbz_(9, 0));   // i == slen → last token
+    _e(c, _addi_(8, 10, 8)); _e(c, _addr_(8, 8, 14)); _e(c, _ldrb_(7, 8));
+    _e(c, _subr_(6, 7, 12)); let jn = _wpos(c); _e(c, _cbnz_(6, 0));             // not sep → advance
+    _split_tok(c);                                       // sep at i → emit token [start, i)
+    _patch(c, jn, _cbnz_(6, _wpos(c) - jn));
+    _e(c, _addi_(14, 14, 1)); _e(c, _bb_(l2 - _wpos(c)));
+    _patch(c, j2, _cbz_(9, _wpos(c) - j2));
+    _split_tok(c);                                       // final token [start, slen)
+    _e(c, _movr_(0, 15)); _e(c, 0xD65F03C0);             // return the array
+    return c;
+}
+// maps are heap objects [count(8)][cap(8)][key0ptr][val0][key1ptr][val1]…  (each pair 16 bytes, key a string ptr).
+// The scan helpers bl __streq to compare keys; they keep scan state in x10..x15 (which __streq, using only x0..x9,
+// never clobbers) and save x30. __mget/__mhas return {bytes,fixups} because they call __streq.
+fn _emit_mget_helper(want_bool) {   // want_bool: 0 → return value / 1 → return 1/0 (map_has)
+    let c = []; let fx = [];
+    _e(c, 0xA9BF7BFD);            // stp x29,x30,[sp,#-16]!  (0xA9800000 + 0x7E*32768 + 30*1024 + 31*32 + 29)
+    _e(c, _movr_(10, 0)); _e(c, _movr_(11, 1));    // x10=m, x11=key
+    _e(c, _ldrw_(12, 10, 0)); _e(c, _addi_(13, 10, 16));   // x12=count, x13=&pair0
+    let loop = _wpos(c); _e(c, _cbz_(12, 0));      // loop: none left → miss
+    _e(c, _ldrw_(0, 13, 0)); _e(c, _movr_(1, 11));  // x0=pair.key, x1=query
+    let bp = _wpos(c); _e(c, 0x94000000); push(fx, map{ pos: bp, name: "__streq" });  // bl __streq
+    let jf = _wpos(c); _e(c, _cbnz_(0, 0));        // equal → found
+    _e(c, _addi_(13, 13, 16)); _e(c, _subi_(12, 12, 1)); _e(c, _bb_(loop - _wpos(c)));
+    _patch(c, jf, _cbnz_(0, _wpos(c) - jf));       // found:
+    if want_bool == 1 { _e(c, _movz_(0, 1)); } else { _e(c, _ldrw_(0, 13, 1)); }   // 1 / pair.value
+    _e(c, 0xA8C17BFD); _e(c, 0xD65F03C0);          // ldp x29,x30,[sp],#16 ; ret  (0xA8C00000 + 2*32768 + 30*1024 + 31*32 + 29)
+    _patch(c, loop, _cbz_(12, _wpos(c) - loop));   // miss:
+    _e(c, _movz_(0, 0));                           // 0 (both miss-value and has=false)
+    _e(c, 0xA8C17BFD); _e(c, 0xD65F03C0);
+    return map{ bytes: c, fixups: fx };
+}
+fn _emit_mset_helper() {   // __mset(m x0, key x1, v x2) → (possibly reallocated) map addr in x0
+    let c = []; let fx = [];
+    _e(c, 0xA9BF7BFD);            // stp x29,x30,[sp,#-16]!
+    _e(c, _movr_(10, 0)); _e(c, _movr_(11, 1)); _e(c, _movr_(14, 2));  // m,key,v (v in x14; x2 is clobbered by streq)
+    _e(c, _ldrw_(12, 10, 0)); _e(c, _addi_(13, 10, 16));   // count, &pair0
+    let loop = _wpos(c); _e(c, _cbz_(12, 0));
+    _e(c, _ldrw_(0, 13, 0)); _e(c, _movr_(1, 11));
+    let bp = _wpos(c); _e(c, 0x94000000); push(fx, map{ pos: bp, name: "__streq" });
+    let jo = _wpos(c); _e(c, _cbnz_(0, 0));        // found → overwrite
+    _e(c, _addi_(13, 13, 16)); _e(c, _subi_(12, 12, 1)); _e(c, _bb_(loop - _wpos(c)));
+    _patch(c, jo, _cbnz_(0, _wpos(c) - jo));       // overwrite:
+    _e(c, _strw_(14, 13, 1)); _e(c, _movr_(0, 10)); _e(c, 0xA8C17BFD); _e(c, 0xD65F03C0);  // pair.value=v ; return m
+    _patch(c, loop, _cbz_(12, _wpos(c) - loop));   // append:
+    _e(c, _ldrw_(12, 10, 0)); _e(c, _ldrw_(15, 10, 1));    // count, cap (reload)
+    _e(c, _subr_(0, 12, 15));
+    let jg = _wpos(c); _e(c, _cbz_(0, 0));         // count==cap → grow
+    _e(c, _addi_(13, 10, 16)); _e(c, _addlsl_(13, 13, 12, 4));  // &pair[count]  (count*16)
+    _e(c, _strw_(11, 13, 0)); _e(c, _strw_(14, 13, 1)); _e(c, _addi_(12, 12, 1)); _e(c, _strw_(12, 10, 0));
+    _e(c, _movr_(0, 10)); _e(c, 0xA8C17BFD); _e(c, 0xD65F03C0);
+    _patch(c, jg, _cbz_(0, _wpos(c) - jg));        // grow:
+    _e(c, _addi_(13, 10, 16)); _e(c, _addlsl_(13, 13, 15, 4)); _e(c, _subr_(0, 13, 28));   // end == x28 ?
+    let jt = _wpos(c); _e(c, _cbz_(0, 0));         // at top → grow in place
+    // realloc: new [count+1][count+1], copy count pairs (count*2 words), append
+    _e(c, _movr_(9, 28)); _e(c, _addi_(0, 12, 1));         // x9=new, x0=count+1
+    _e(c, _strw_(0, 9, 0)); _e(c, _strw_(0, 9, 1));
+    _e(c, _addi_(28, 28, 16)); _e(c, _addlsl_(28, 28, 0, 4));   // bump 16 + newsize*16
+    _e(c, _addi_(1, 10, 16)); _e(c, _addi_(2, 9, 16)); _e(c, _addlsl_(3, 12, 12, 0));  // src,dst, x3=count*2 (count+count)
+    let cl = _wpos(c); _e(c, _cbz_(3, 0));
+    _e(c, _ldrw_(4, 1, 0)); _e(c, _strw_(4, 2, 0)); _e(c, _addi_(1, 1, 8)); _e(c, _addi_(2, 2, 8)); _e(c, _subi_(3, 3, 1));
+    _e(c, _bb_(cl - _wpos(c)));
+    _patch(c, cl, _cbz_(3, _wpos(c) - cl));
+    _e(c, _addi_(2, 9, 16)); _e(c, _addlsl_(2, 2, 12, 4));  // &new pair[count]
+    _e(c, _strw_(11, 2, 0)); _e(c, _strw_(14, 2, 1)); _e(c, _movr_(0, 9)); _e(c, 0xA8C17BFD); _e(c, 0xD65F03C0);
+    _patch(c, jt, _cbz_(0, _wpos(c) - jt));        // grow in place:
+    _e(c, _strw_(11, 28, 0)); _e(c, _strw_(14, 28, 1)); _e(c, _addi_(28, 28, 16));   // store pair at top, bump
+    _e(c, _addi_(12, 12, 1)); _e(c, _strw_(12, 10, 0)); _e(c, _addi_(15, 15, 1)); _e(c, _strw_(15, 10, 1));  // count++,cap++
+    _e(c, _movr_(0, 10)); _e(c, 0xA8C17BFD); _e(c, 0xD65F03C0);
+    return map{ bytes: c, fixups: fx };
+}
+
+fn _appendhelper(code, allfix, h, base) {   // push a {bytes,fixups} helper subroutine, relocating its calls
+    let i = 0; while i < len(h.bytes) { push(code, h.bytes[i]); i = i + 1; }
+    let j = 0; while j < len(h.fixups) { push(allfix, map{ pos: base + h.fixups[j].pos, name: h.fixups[j].name }); j = j + 1; }
+}
+// does the program use any string/array/map → needs the heap + helper subroutines?
+fn _has_str_node(node) {
+    if is_array(node) { let i = 0; while i < len(node) { if _has_str_node(node[i]) { return true; } i = i + 1; } return false; }
+    if not is_map(node) { return false; }
+    let kd = try node.kind catch nil;
+    if kd == "string" or kd == "array" or kd == "map" { return true; }   // strings/arrays/maps all need the heap
+    if kd == "call" { let fnn = try node.func.name catch nil; if fnn == "str" or fnn == "push" or fnn == "strfromcharcode" or fnn == "str_slice" or fnn == "str_split" { return true; } }
+    let ks = map_keys(node); let i = 0;
+    while i < len(ks) { let ch = node[ks[i]]; if (is_map(ch) or is_array(ch)) and _has_str_node(ch) { return true; } i = i + 1; }
+    return false;
+}
+// is this value node statically an ARRAY? (array literal, or a local tracked as an array)
+fn _is_arr(node, slots) {
+    if node == nil { return false; }
+    if node.kind == "array" { return true; }
+    if node.kind == "ident" { let av = try slots["@arrvars"] catch nil; if av != nil and map_has(av, node.name) and av[node.name] { return true; } return false; }
+    if node.kind == "call" { let fnn = try node.func.name catch nil; if fnn == "str_split" { return true; } let fr = try slots["@fnret"] catch nil; if fr != nil and fnn != nil and map_has(fr, fnn) and fr[fnn] == "arr" { return true; } return false; }
+    return false;
+}
+// statically an ARRAY OF STRINGS? (str_split result, an alias of one, or an all-string array literal).
+// Lets s-array elements be string-typed statically: len(parts[i]), "x " + parts[i], parts[i] == "y".
+fn _is_strarr(node, slots) {
+    if node == nil { return false; }
+    if node.kind == "call" { let fnn = try node.func.name catch nil; return fnn == "str_split"; }
+    if node.kind == "ident" { let sa = try slots["@strarrvars"] catch nil; if sa != nil and map_has(sa, node.name) and sa[node.name] { return true; } return false; }
+    if node.kind == "array" { let it = node.items; if len(it) == 0 { return false; } let i = 0; while i < len(it) { if not _is_str(it[i], slots) { return false; } i = i + 1; } return true; }
+    return false;
+}
+fn _is_map_v(node, slots) {   // statically a MAP? (map literal, a local, or a map-returning call)
+    if node == nil { return false; }
+    if node.kind == "map" { return true; }
+    if node.kind == "ident" { let mv = try slots["@mapvars"] catch nil; if mv != nil and map_has(mv, node.name) and mv[node.name] { return true; } return false; }
+    if node.kind == "call" { let fr = try slots["@fnret"] catch nil; let fnn = try node.func.name catch nil; if fr != nil and fnn != nil and map_has(fr, fnn) and fr[fnn] == "map" { return true; } return false; }
+    return false;
+}
+
+// ── instruction emitters ──────────────────────────────────────────────────────────────────────────────────────
+fn _seti(code, reg, v) {
+    let lo = v % 65536; let hi = num_floor(v / 65536) % 65536;
+    _e(code, 0xD2800000 + lo * 32 + reg);                      // movz reg, #lo
+    if hi > 0 { _e(code, 0xF2A00000 + hi * 32 + reg); }        // movk reg, #hi, lsl #16
+}
+fn _push0(code) { _e(code, 0xD10043FF); _e(code, 0xF90003E0); }              // sub sp,sp,#16 ; str x0,[sp]
+fn _pop(code, reg) { _e(code, 0xF94003E0 + reg); _e(code, 0x910043FF); }     // ldr xreg,[sp] ; add sp,sp,#16
+fn _mov(code, d, s) { _e(code, 0xAA0003E0 + s * 65536 + d); }                // mov Xd, Xs (orr Xd,xzr,Xs)
+fn _ldr_fp(code, reg, slot) { _e(code, 0xF9400000 + slot * 1024 + 29 * 32 + reg); }   // ldr xreg,[x29,#8*slot]
+fn _str_fp(code, reg, slot) { _e(code, 0xF9000000 + slot * 1024 + 29 * 32 + reg); }   // str xreg,[x29,#8*slot]
+fn _cmpcond(op) {   // op → the cset condition field (already the INVERSE the encoding wants), for cmp x0,x1
+    if op == "==" { return 1; } if op == "!=" { return 0; }
+    if op == "<" { return 10; } if op == ">=" { return 11; }
+    if op == ">" { return 13; } if op == "<=" { return 12; }
+    throw "arm64-ast: bad compare op " + op;
+}
+fn _binop(code, op) {                                    // x0 = x0 <op> x1
+    if op == "+" { _e(code, 0x8B010000); return; }       // add x0,x0,x1
+    if op == "-" { _e(code, 0xCB010000); return; }       // sub x0,x0,x1
+    if op == "*" { _e(code, 0x9B017C00); return; }       // madd x0,x0,x1,xzr
+    if op == "/" { _e(code, 0x9AC10C00); return; }       // sdiv x0,x0,x1
+    if op == "%" { _e(code, 0x9AC10C09); _e(code, 0x9B018120); return; }   // sdiv x9,x0,x1 ; msub x0,x9,x1,x0
+    _e(code, 0xEB01001F);                                // cmp x0,x1 (subs xzr,x0,x1)
+    _e(code, 0x9A9F07E0 + _cmpcond(op) * 4096);          // cset x0, <cond>
+}
+// print the SIGNED integer in x0 as decimal + '\n' via write(1, buf, len). Digits go backward into a 32-byte
+// stack scratch (do-while so 0 prints "0"); negatives: remember the sign in x13, negate to the magnitude, itoa,
+// then prepend '-'. Clobbers x0..x3,x8..x13 (all dead at a print statement).
+fn _emit_print(code) {
+    _e(code, 0xD10083FF);                 // sub sp,sp,#32   (scratch)
+    _e(code, 0x91007FEB);                 // add x11,sp,#31  (buf end, write pointer)
+    _e(code, 0xD280014A);                 // movz x10,#10
+    _e(code, 0x3900016A);                 // strb w10,[x11]  ('\n')
+    _e(code, 0xD100056B);                 // sub x11,x11,#1
+    _e(code, 0xEB1F001F);                 // cmp x0, xzr
+    _e(code, 0x9A9FA7ED);                 // cset x13, lt     (x13 = x0<0 ? 1 : 0)
+    let jneg = _wpos(code); _e(code, 0xB4000000 + 13);     // cbz x13, +after-neg
+    _e(code, 0xCB0003E0);                 // neg x0          (x0 = |x0|)
+    _patch(code, jneg, 0xB4000000 + _imm19(_wpos(code) - jneg) * 32 + 13);
+    let loop = _wpos(code);
+    _e(code, 0x9ACA0C02);                 // sdiv x2,x0,x10
+    _e(code, 0x9B0A8043);                 // msub x3,x2,x10,x0  (rem = x0 - x2*10)
+    _e(code, 0x9100C063);                 // add x3,x3,#48      ('0'+digit)
+    _e(code, 0x39000163);                 // strb w3,[x11]  (Rt=3, Rn=11)
+    _e(code, 0xD100056B);                 // sub x11,x11,#1
+    _e(code, 0xAA0203E0);                 // mov x0,x2
+    let back = _wpos(code);
+    _e(code, 0xB5000000 + _imm19(loop - back) * 32 + 0);   // cbnz x0, loop
+    let jmin = _wpos(code); _e(code, 0xB4000000 + 13);     // cbz x13, +after-minus (skip '-' if non-negative)
+    _e(code, 0xD28005A9);                 // movz x9,#45     ('-')
+    _e(code, 0x39000169);                 // strb w9,[x11]  (Rt=9, Rn=11)
+    _e(code, 0xD100056B);                 // sub x11,x11,#1
+    _patch(code, jmin, 0xB4000000 + _imm19(_wpos(code) - jmin) * 32 + 13);
+    _e(code, 0x91000561);                 // add x1,x11,#1   (buf start)
+    _e(code, 0x910083EC);                 // add x12,sp,#32
+    _e(code, 0xCB010182);                 // sub x2,x12,x1   (len)
+    _e(code, 0xD2800020);                 // movz x0,#1      (fd stdout)
+    _e(code, 0xD2800808);                 // movz x8,#64     (sys_write)
+    _e(code, 0xD4000001);                 // svc #0
+    _e(code, 0x910083FF);                 // add sp,sp,#32
+}
+// print a STRING whose address (→ [len(8)][bytes]) is in x0: write(1, bytes, len) then a newline.
+fn _emit_print_str(code) {
+    _mov(code, 1, 0);                     // x1 = string address
+    _e(code, 0xF9400022);                 // ldr x2, [x1]     (x2 = length)
+    _e(code, 0x91002021);                 // add x1, x1, #8   (x1 = bytes pointer)
+    _e(code, 0xD2800020);                 // movz x0, #1      (stdout)
+    _e(code, 0xD2800808);                 // movz x8, #64     (write)
+    _e(code, 0xD4000001);                 // svc #0
+    _e(code, 0xD10043FF);                 // sub sp,sp,#16
+    _e(code, 0xD280014A);                 // movz x10,#10     ('\n')
+    _e(code, 0x390003EA);                 // strb w10,[sp]
+    _e(code, 0x910003E1);                 // mov x1, sp
+    _e(code, 0xD2800022);                 // movz x2, #1
+    _e(code, 0xD2800020);                 // movz x0, #1
+    _e(code, 0xD2800808);                 // movz x8, #64
+    _e(code, 0xD4000001);                 // svc #0
+    _e(code, 0x910043FF);                 // add sp,sp,#16
+}
+// ── runtime-dispatched print (for values whose type isn't statically known: map values, array elements) ──
+fn _emit_pnum_helper() { let c = []; _emit_print(c); _e(c, 0xD65F03C0); return c; }       // print x0 as number, ret
+fn _emit_pstr_helper() { let c = []; _emit_print_str(c); _e(c, 0xD65F03C0); return c; }   // print x0 as string, ret
+fn _emit_printdyn_helper() {   // if x0 looks like a heap/data pointer → string, else → number
+    let c = []; let fx = [];
+    _e(c, 0xA9BF7BFD);                    // stp x29,x30,[sp,#-16]!
+    _e(c, _movz16_(9, 64));               // x9 = 0x400000 (LOAD base)
+    _e(c, 0xEB09001F);                    // cmp x0, x9
+    _e(c, 0x9A9FB7EA);                    // cset x10, ge   (x0 >= 0x400000)  [invcond field 11]
+    _e(c, _movz16_(11, 8192));            // x11 = 0x20000000 (well above heap)
+    _e(c, 0xEB0B001F);                    // cmp x0, x11
+    _e(c, 0x9A9FA7EC);                    // cset x12, lt   (x0 < 0x20000000)
+    _e(c, 0x8A0C013A);                    // and x10, x10, x12  (in the pointer window?)
+    let jn = _wpos(c); _e(c, _cbz_(10, 0));
+    let bs = _wpos(c); _e(c, 0x94000000); push(fx, map{ pos: bs, name: "__printstr" });
+    let jd = _wpos(c); _e(c, 0x14000000);
+    _patch(c, jn, _cbz_(10, _wpos(c) - jn));
+    let bn = _wpos(c); _e(c, 0x94000000); push(fx, map{ pos: bn, name: "__printnum" });
+    _patch(c, jd, 0x14000000 + _imm26(_wpos(c) - jd));
+    _e(c, 0xA8C17BFD); _e(c, 0xD65F03C0); // ldp x29,x30,[sp],#16 ; ret
+    return map{ bytes: c, fixups: fx };
+}
+// a value whose runtime type isn't statically known (needs __printdyn): a map field, or a map/array element.
+fn _is_dynval(node, slots) {
+    if node == nil { return false; }
+    let k = node.kind;
+    if k == "member" { return true; }
+    if k == "index" { return _is_arr(node.obj, slots) or _is_map_v(node.obj, slots); }
+    return false;
+}
+
+// is this value node statically a string? (a string literal, or an ident currently tracked as a string)
+fn _is_str(node, slots) {
+    if node == nil { return false; }
+    let k = node.kind;
+    if k == "string" { return true; }
+    if k == "ident" { let sv = slots["@strvars"]; return map_has(sv, node.name) and sv[node.name]; }
+    if k == "call" { let fnn = try node.func.name catch nil; if fnn == "str" or fnn == "strfromcharcode" or fnn == "str_slice" { return true; } let fr = try slots["@fnret"] catch nil; if fr != nil and fnn != nil and map_has(fr, fnn) and fr[fnn] == "str" { return true; } return false; }  // str()/string builtins/string-returning fn
+    if k == "index" { return _is_str(node.obj, slots) or _is_strarr(node.obj, slots); }   // s[i] is a 1-char string; strarr[i] is a string
+    if k == "binary" and node.op == "+" { return _is_str(node.left, slots) or _is_str(node.right, slots); }  // concat
+    return false;
+}
+// materialize a string literal `s` into the data blob and load its (link-time) address into x0.
+fn _emit_str_lit(code, slots, s) {
+    let sd = slots["@sdata"]; let bytes = str_to_bytes(s); let ln = len(bytes);
+    let off = len(sd);
+    push(sd, ln % 256); push(sd, num_floor(ln / 256) % 256); push(sd, num_floor(ln / 65536) % 256); push(sd, num_floor(ln / 16777216) % 256);
+    push(sd, 0); push(sd, 0); push(sd, 0); push(sd, 0);
+    let j = 0; while j < ln { push(sd, bytes[j]); j = j + 1; }
+    let pos = _wpos(code);
+    _e(code, 0xD2800000);              // movz x0, #0   (patched → address lo16)
+    _e(code, 0xF2A00000);              // movk x0, #0, lsl #16  (patched → address hi16)
+    push(slots["@spatch"], map{ pos: pos, off: off });
+}
+fn _epilogue(code, frame) {
+    _e(code, 0x910003BF + frame * 1024);                 // add sp, x29, #frame
+    _e(code, 0xA8C00000 + 2 * 32768 + 30 * 1024 + 31 * 32 + 29);  // ldp x29,x30,[sp],#16
+    _e(code, 0xD65F03C0);                                // ret
+}
+
+// ── slot collection (params first, then every let/const, incl. nested blocks) ──
+fn _collect_slots(stmts, slots) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i]; let k = s.kind;
+        if k == "let" or k == "const" { if not map_has(slots, s.name) { slots[s.name] = _nkeys(slots); } }
+        else if k == "if" {
+            _collect_slots(_stmts_of(s.then), slots);
+            let elifs = try s.elifs catch nil;
+            if elifs != nil { let j = 0; while j < len(elifs) { _collect_slots(_stmts_of(elifs[j].body), slots); j = j + 1; } }
+            let el = try s.else catch nil; if el != nil { _collect_slots(_stmts_of(el), slots); }
+        }
+        else if k == "while" { _collect_slots(_stmts_of(s.body), slots); }
+        else if k == "block" { _collect_slots(_stmts_of(s), slots); }
+        i = i + 1;
+    }
+}
+
+// ── expression → x0 ──
+fn _ce(node, code, fx, slots) {
+    let k = node.kind;
+    if k == "number" { _seti(code, 0, num_floor(parse_number(node.value))); return; }
+    if k == "string" { _emit_str_lit(code, slots, node.value); return; }
+    if k == "ident" { if not map_has(slots, node.name) { throw "arm64-ast: unknown var " + node.name; } _ldr_fp(code, 0, slots[node.name]); return; }
+    if k == "unary" { let operand = try node.operand catch nil; if operand == nil { operand = node.expr; } _ce(operand, code, fx, slots); if node.op == "-" { _e(code, 0xCB0003E0); } return; }  // neg x0
+    if k == "binary" {
+        if node.op == "and" {                  // short-circuit: a falsy → result a (0), else result b
+            _ce(node.left, code, fx, slots);
+            let je = _wpos(code); _e(code, 0xB4000000);          // cbz x0, end
+            _ce(node.right, code, fx, slots);
+            _patch(code, je, 0xB4000000 + _imm19(_wpos(code) - je) * 32 + 0);
+            return;
+        }
+        if node.op == "or" {                   // short-circuit: a truthy → result a, else result b
+            _ce(node.left, code, fx, slots);
+            let je = _wpos(code); _e(code, 0xB5000000);          // cbnz x0, end
+            _ce(node.right, code, fx, slots);
+            _patch(code, je, 0xB5000000 + _imm19(_wpos(code) - je) * 32 + 0);
+            return;
+        }
+        if (node.op == "==" or node.op == "!=") and _is_str(node.left, slots) and _is_str(node.right, slots) {
+            // STRING COMPARISON by value: __streq → 0/1 ; != flips it
+            _ce(node.left, code, fx, slots);
+            _push0(code);
+            _ce(node.right, code, fx, slots);
+            _mov(code, 1, 0);                  // x1 = right
+            _pop(code, 0);                     // x0 = left
+            let pe = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: pe, name: "__streq" });
+            if node.op == "!=" { _e(code, _movz_(1, 1)); _e(code, _subr_(0, 1, 0)); }   // x0 = 1 - eq
+            return;
+        }
+        if node.op == "+" and (_is_str(node.left, slots) or _is_str(node.right, slots)) {
+            // STRING CONCATENATION: each operand becomes a string (numbers coerced via __str), then __concat
+            _ce(node.left, code, fx, slots);
+            if not _is_str(node.left, slots) { let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__str" }); }
+            _push0(code);
+            _ce(node.right, code, fx, slots);
+            if not _is_str(node.right, slots) { let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__str" }); }
+            _mov(code, 1, 0);                  // x1 = right string
+            _pop(code, 0);                     // x0 = left string
+            let pc = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: pc, name: "__concat" });
+            return;
+        }
+        _ce(node.left, code, fx, slots);
+        _push0(code);                          // stack: [left]
+        _ce(node.right, code, fx, slots);
+        _mov(code, 1, 0);                      // x1 = right
+        _pop(code, 0);                         // x0 = left
+        _binop(code, node.op);                 // x0 = left <op> right
+        return;
+    }
+    if k == "call" {
+        let fname = node.func.name;
+        if fname == "str" and len(node.args) == 1 {         // str(n): number → heap string via __str
+            _ce(node.args[0], code, fx, slots);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__str" });
+            return;
+        }
+        if fname == "len" and len(node.args) == 1 and (_is_str(node.args[0], slots) or _is_arr(node.args[0], slots)) {  // len(str|array) → size word at [x0]
+            _ce(node.args[0], code, fx, slots);
+            _e(code, _ldrw_(0, 0, 0));                       // ldr x0, [x0]
+            return;
+        }
+        if fname == "push" and len(node.args) == 2 and node.args[0].kind == "ident" {   // push(a, v) → a = __push(a, v)
+            _ce(node.args[0], code, fx, slots); _push0(code);
+            _ce(node.args[1], code, fx, slots); _mov(code, 1, 0); _pop(code, 0);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__push" });
+            _str_fp(code, 0, slots[node.args[0].name]);      // store the (possibly reallocated) array back
+            return;
+        }
+        if fname == "map_has" and len(node.args) == 2 {   // map_has(m, key) → __mhas
+            _ce(node.args[0], code, fx, slots); _push0(code);
+            _ce(node.args[1], code, fx, slots); _mov(code, 1, 0); _pop(code, 0);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__mhas" });
+            return;
+        }
+        if fname == "strcharcodeat" and len(node.args) == 2 {   // strcharcodeat(s,i) → byte at s+8+i
+            _ce(node.args[0], code, fx, slots); _push0(code);
+            _ce(node.args[1], code, fx, slots); _mov(code, 1, 0); _pop(code, 0);
+            _e(code, _addi_(0, 0, 8)); _e(code, _addr_(0, 0, 1)); _e(code, _ldrb_(0, 0));
+            return;
+        }
+        if fname == "strfromcharcode" and len(node.args) == 1 {   // code → 1-char string
+            _ce(node.args[0], code, fx, slots);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__fromcode" });
+            return;
+        }
+        if fname == "str_split" and len(node.args) == 2 {         // str_split(s, sep) → array of heap strings
+            _ce(node.args[0], code, fx, slots); _push0(code);
+            _ce(node.args[1], code, fx, slots); _mov(code, 1, 0); _pop(code, 0);
+            let psp = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: psp, name: "__split" });
+            return;
+        }
+        if fname == "str_slice" and len(node.args) == 3 {         // str_slice(s,a,b) → substring
+            _ce(node.args[0], code, fx, slots); _push0(code);
+            _ce(node.args[1], code, fx, slots); _push0(code);
+            _ce(node.args[2], code, fx, slots); _mov(code, 2, 0); _pop(code, 1); _pop(code, 0);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__slice" });
+            return;
+        }
+        // bitwise builtins are desugared calls (pblang has no & | ^ operators) → inline, no bl
+        if (fname == "bit_and" or fname == "bit_or" or fname == "bit_xor") and len(node.args) == 2 {
+            _ce(node.args[0], code, fx, slots);
+            _push0(code);
+            _ce(node.args[1], code, fx, slots);
+            _mov(code, 1, 0);                  // x1 = b
+            _pop(code, 0);                     // x0 = a
+            if fname == "bit_and" { _e(code, 0x8A010000); }        // and x0,x0,x1
+            else if fname == "bit_or" { _e(code, 0xAA010000); }    // orr x0,x0,x1
+            else { _e(code, 0xCA010000); }                         // eor x0,x0,x1
+            return;
+        }
+        let args = node.args; let n = len(args); let i = 0;
+        while i < n { _ce(args[i], code, fx, slots); _push0(code); i = i + 1; }  // eval + stage each arg
+        if n > 8 {                             // AAPCS64: args 0-7 in x0-x7, args 8+ on the stack at [sp,#8*(j-8)]
+            let extra8 = (n - 8) * 8; let r16 = extra8 % 16; if r16 != 0 { extra8 = extra8 + (16 - r16); }
+            _e(code, _subi_(31, 31, extra8));  // carve the outgoing-arg area below the staged temps
+            let j = 8;
+            while j < n {                      // temp for arg j sits at [sp, #extra8 + 16*(n-1-j)]
+                _e(code, _ldrw_(9, 31, num_floor(extra8 / 8) + 2 * (n - 1 - j)));
+                _e(code, _strw_(9, 31, j - 8));
+                j = j + 1;
+            }
+            j = 0;
+            while j < 8 { _e(code, _ldrw_(j, 31, num_floor(extra8 / 8) + 2 * (n - 1 - j))); j = j + 1; }
+            let pos8 = _wpos(code);
+            _e(code, 0x94000000);              // bl <fn> (patched)
+            push(fx, map{ pos: pos8, name: fname });
+            _e(code, _addi_(31, 31, extra8 + 16 * n));   // free outgoing area + all staged temps
+            return;
+        }
+        i = n - 1; while i >= 0 { _pop(code, i); i = i - 1; }                    // pop into x(n-1)..x0
+        let pos = _wpos(code);
+        _e(code, 0x94000000);                  // bl <fn> (patched)
+        push(fx, map{ pos: pos, name: fname });
+        return;
+    }
+    if k == "array" {                          // [e0,e1,…] → heap [count][cap][elems]
+        let items = node.items; let n = len(items); let i = 0;
+        while i < n { _ce(items[i], code, fx, slots); _push0(code); i = i + 1; }   // stage each element
+        _e(code, _movr_(9, 28));               // x9 = array base = bump
+        _e(code, _addi_(28, 28, 16)); if n > 0 { _e(code, _addi_(28, 28, n * 8)); }  // bump past header + elems
+        _e(code, _movz_(10, n)); _e(code, _strw_(10, 9, 0)); _e(code, _strw_(10, 9, 1));  // count = cap = n
+        i = n - 1;
+        while i >= 0 { _pop(code, 0); _e(code, _strw_(0, 9, 2 + i)); i = i - 1; }   // pop elems in reverse → a[i]
+        _e(code, _movr_(0, 9));                // return array address
+        return;
+    }
+    if k == "map" {                            // map{k:v,…} → heap [count][cap][keyptr,val …]
+        let entries = node.entries; let n = len(entries); let i = 0;
+        while i < n { _emit_str_lit(code, slots, entries[i].key); _push0(code); _ce(entries[i].value, code, fx, slots); _push0(code); i = i + 1; }
+        _e(code, _movr_(9, 28));
+        _e(code, _addi_(28, 28, 16)); if n > 0 { _e(code, _addi_(28, 28, n * 16)); }
+        _e(code, _movz_(10, n)); _e(code, _strw_(10, 9, 0)); _e(code, _strw_(10, 9, 1));
+        i = n - 1;
+        while i >= 0 { _pop(code, 0); _e(code, _strw_(0, 9, 3 + i * 2)); _pop(code, 0); _e(code, _strw_(0, 9, 2 + i * 2)); i = i - 1; }   // val then key, in reverse
+        _e(code, _movr_(0, 9));
+        return;
+    }
+    if k == "member" {                         // m.k → __mget(m, "k")
+        if not _is_map_v(node.obj, slots) { throw "arm64-ast: member access only on maps"; }
+        _ce(node.obj, code, fx, slots); _push0(code);
+        _emit_str_lit(code, slots, node.name); _mov(code, 1, 0); _pop(code, 0);
+        let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__mget" });
+        return;
+    }
+    if k == "index" {
+        if _is_map_v(node.obj, slots) {        // m[k] → __mget(m, k)
+            _ce(node.obj, code, fx, slots); _push0(code);
+            _ce(node.index, code, fx, slots); _mov(code, 1, 0); _pop(code, 0);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__mget" });
+            return;
+        }
+        if _is_str(node.obj, slots) {          // s[i] → new 1-char heap string via __charat
+            _ce(node.obj, code, fx, slots); _push0(code);
+            _ce(node.index, code, fx, slots); _mov(code, 1, 0); _pop(code, 0);
+            let pi = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: pi, name: "__charat" });
+            return;
+        }
+        if _is_arr(node.obj, slots) {          // a[i] → element load
+            _ce(node.obj, code, fx, slots); _push0(code);
+            _ce(node.index, code, fx, slots); _mov(code, 1, 0); _pop(code, 0);
+            _e(code, _addi_(0, 0, 16)); _e(code, _addlsl_(0, 0, 1, 3)); _e(code, _ldrw_(0, 0, 0));  // load a[i]
+            return;
+        }
+        throw "arm64-ast: indexing only supported on strings and arrays";
+    }
+    if k == "assign_to" {                      // a[i]=v / m.k=v / m[k]=v  (reaches _ce via expr_stmt)
+        let tgt = node.target;
+        if tgt.kind == "index" and _is_arr(tgt.obj, slots) {
+            _ce(tgt.obj, code, fx, slots); _push0(code);        // a
+            _ce(tgt.index, code, fx, slots); _push0(code);      // i
+            _ce(node.value, code, fx, slots);                   // v → x0
+            _pop(code, 1); _pop(code, 2);                       // i → x1, a → x2
+            _e(code, _addi_(2, 2, 16)); _e(code, _addlsl_(2, 2, 1, 3));   // &a[i]
+            _e(code, _strw_(0, 2, 0));                          // store v
+            return;
+        }
+        if tgt.kind == "member" and _is_map_v(tgt.obj, slots) {   // m.k = v  → m = __mset(m,"k",v)
+            _ce(tgt.obj, code, fx, slots); _push0(code);
+            _emit_str_lit(code, slots, tgt.name); _push0(code);
+            _ce(node.value, code, fx, slots); _mov(code, 2, 0); _pop(code, 1); _pop(code, 0);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__mset" });
+            if tgt.obj.kind == "ident" { _str_fp(code, 0, slots[tgt.obj.name]); }
+            return;
+        }
+        if tgt.kind == "index" and _is_map_v(tgt.obj, slots) {    // m[k] = v
+            _ce(tgt.obj, code, fx, slots); _push0(code);
+            _ce(tgt.index, code, fx, slots); _push0(code);
+            _ce(node.value, code, fx, slots); _mov(code, 2, 0); _pop(code, 1); _pop(code, 0);
+            let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__mset" });
+            if tgt.obj.kind == "ident" { _str_fp(code, 0, slots[tgt.obj.name]); }
+            return;
+        }
+        throw "arm64-ast: unsupported assignment target";
+    }
+    if k == "assign" {                         // `x = e` used as an expression (parser wraps stmts as expr_stmt(assign))
+        _ce(node.value, code, fx, slots);      // value → x0 (also the expression's result)
+        if not map_has(slots, node.name) { throw "arm64-ast: assign to unknown var " + node.name; }
+        _str_fp(code, 0, slots[node.name]);
+        slots["@strvars"][node.name] = _is_str(node.value, slots);
+        return;
+    }
+    throw "arm64-ast: unhandled expr kind " + k;
+}
+
+// ── statement ──
+fn _cs(node, code, fx, slots, frame) {
+    let k = node.kind;
+    if k == "expr_stmt" { _ce(node.expr, code, fx, slots); return; }
+    if k == "let" or k == "const" {
+        if node.value != nil { _ce(node.value, code, fx, slots); } else { _seti(code, 0, 0); }
+        _str_fp(code, 0, slots[node.name]);
+        slots["@strvars"][node.name] = _is_str(node.value, slots);   // track string-typed locals for print dispatch
+        slots["@arrvars"][node.name] = _is_arr(node.value, slots);   // track array-typed locals for index dispatch
+        slots["@mapvars"][node.name] = _is_map_v(node.value, slots); // track map-typed locals for member/index dispatch
+        slots["@strarrvars"][node.name] = _is_strarr(node.value, slots); // track arrays-of-strings (string-typed elements)
+        return;
+    }
+    if k == "assign" { _ce(node.value, code, fx, slots); _str_fp(code, 0, slots[node.name]); slots["@strvars"][node.name] = _is_str(node.value, slots); slots["@arrvars"][node.name] = _is_arr(node.value, slots); slots["@mapvars"][node.name] = _is_map_v(node.value, slots); slots["@strarrvars"][node.name] = _is_strarr(node.value, slots); return; }
+    if k == "return" {
+        if node.value != nil { _ce(node.value, code, fx, slots); } else { _seti(code, 0, 0); }
+        _epilogue(code, frame); return;
+    }
+    if k == "if" {
+        // if cond {then} [elif c {b}]* [else {e}] — a chain of (cond; cbz next; body; b END) arms.
+        let endjumps = [];
+        _ce(node.cond, code, fx, slots);
+        let jn = _wpos(code); _e(code, 0xB4000000);              // cbz x0, next
+        _cblock(_stmts_of(node.then), code, fx, slots, frame);
+        push(endjumps, _wpos(code)); _e(code, 0x14000000);       // b END
+        _patch(code, jn, 0xB4000000 + _imm19(_wpos(code) - jn) * 32 + 0);
+        let elifs = try node.elifs catch nil;
+        if elifs != nil {
+            let ei = 0;
+            while ei < len(elifs) {
+                _ce(elifs[ei].cond, code, fx, slots);
+                let jn2 = _wpos(code); _e(code, 0xB4000000);     // cbz x0, next
+                _cblock(_stmts_of(elifs[ei].body), code, fx, slots, frame);
+                push(endjumps, _wpos(code)); _e(code, 0x14000000);   // b END
+                _patch(code, jn2, 0xB4000000 + _imm19(_wpos(code) - jn2) * 32 + 0);
+                ei = ei + 1;
+            }
+        }
+        let el = try node.else catch nil;
+        if el != nil { _cblock(_stmts_of(el), code, fx, slots, frame); }
+        let endw = _wpos(code);
+        let j = 0; while j < len(endjumps) { _patch(code, endjumps[j], 0x14000000 + _imm26(endw - endjumps[j])); j = j + 1; }
+        return;
+    }
+    if k == "print" {
+        _ce(node.value, code, fx, slots);            // value → x0 (string address, number, or dynamic)
+        if _is_str(node.value, slots) { _emit_print_str(code); }
+        elif _is_dynval(node.value, slots) { let p = _wpos(code); _e(code, 0x94000000); push(fx, map{ pos: p, name: "__printdyn" }); }
+        else { _emit_print(code); }
+        return;
+    }
+    if k == "while" {
+        let lstart = _wpos(code);
+        _ce(node.cond, code, fx, slots);
+        let je = _wpos(code); _e(code, 0xB4000000);              // cbz x0, end (patch)
+        _cblock(_stmts_of(node.body), code, fx, slots, frame);
+        let jb = _wpos(code); _e(code, 0x14000000 + _imm26(lstart - jb));  // b lstart
+        let endw = _wpos(code);
+        _patch(code, je, 0xB4000000 + _imm19(endw - je) * 32 + 0);
+        return;
+    }
+    if k == "block" { _cblock(_stmts_of(node), code, fx, slots, frame); return; }
+    throw "arm64-ast: unhandled stmt kind " + k;
+}
+fn _cblock(stmts, code, fx, slots, frame) { let i = 0; while i < len(stmts) { _cs(stmts[i], code, fx, slots, frame); i = i + 1; } }
+
+// ── function ──
+fn _cfn(fn, sdata, fnret, fnptype) {
+    let code = []; let fx = [];
+    let params = fn.params; let stmts = _stmts_of(fn.body);
+    let slots = map{};
+    let p = 0; while p < len(params) { let nm = _pname(params[p]); if not map_has(slots, nm) { slots[nm] = _nkeys(slots); } p = p + 1; }
+    _collect_slots(stmts, slots);
+    let nslots = _nkeys(slots);
+    slots["@sdata"] = sdata;        // shared string-data blob (append literal bytes here)
+    slots["@spatch"] = [];          // per-function string address-load patch sites
+    slots["@strvars"] = map{};      // names of locals currently holding a string (for print dispatch)
+    slots["@arrvars"] = map{};      // names of locals currently holding an array
+    slots["@mapvars"] = map{};      // names of locals currently holding a map
+    slots["@strarrvars"] = map{};   // names of locals holding an array OF STRINGS (str_split result etc.)
+    slots["@fnret"] = fnret;        // user fn return types (for call-result typing)
+    let sp2 = 0;                    // seed params by their inferred type
+    while sp2 < len(params) {
+        let pt = fnptype[fn.name][sp2]; let pn = _pname(params[sp2]);
+        if pt == "str" { slots["@strvars"][pn] = true; } elif pt == "arr" { slots["@arrvars"][pn] = true; } elif pt == "map" { slots["@mapvars"][pn] = true; }
+        sp2 = sp2 + 1;
+    }
+    let frame = 8 * nslots; let rr = frame % 16; if rr != 0 { frame = frame + (16 - rr); }
+    _e(code, 0xA9800000 + 0x7E * 32768 + 30 * 1024 + 31 * 32 + 29);   // stp x29,x30,[sp,#-16]!
+    if frame > 0 { _e(code, 0xD10003FF + frame * 1024); }             // sub sp,sp,#frame
+    _e(code, 0x910003FD);                                            // mov x29,sp
+    let pi = 0;                              // spill params to slots: 0-7 arrive in x0-x7, 8+ on the caller's stack
+    while pi < len(params) {
+        if pi < 8 { _str_fp(code, pi, slots[_pname(params[pi])]); }
+        else {                               // incoming stack arg pi is at [x29, #frame+16+8*(pi-8)]
+            _e(code, _ldrw_(9, 29, num_floor(frame / 8) + 2 + (pi - 8)));
+            _str_fp(code, 9, slots[_pname(params[pi])]);
+        }
+        pi = pi + 1;
+    }
+    _cblock(stmts, code, fx, slots, frame);
+    _seti(code, 0, 0); _epilogue(code, frame);                       // fall-through: return 0
+    return map{ bytes: code, fixups: fx, spatch: slots["@spatch"] };
+}
+
+// ── whole program ──  entry stub calls main, exits with x0; user fns relocated by name.
+fn compile_ast(src) {
+    let ast = _par.parse(_tok.tokenize(src));
+    // Entry convention matches the x64 backend: TOP-LEVEL statements are the program body ("main"); a bare
+    // `fn main()` is the fallback only when there is no top-level code (so both styles run the same on both
+    // targets). Defining both is ambiguous → error.
+    let userfns = []; let toplevel = []; let usermain = nil; let i = 0;
+    while i < len(ast.stmts) {
+        let s = ast.stmts[i];
+        if s.kind == "fn" { if s.name == "main" { usermain = s; } else { push(userfns, s); } } else { push(toplevel, s); }
+        i = i + 1;
+    }
+    let fns = [];
+    if len(toplevel) > 0 {
+        if usermain != nil { throw "codegen_arm64_ast: use EITHER top-level statements OR fn main(), not both"; }
+        push(fns, map{ kind: "fn", name: "main", params: [], body: map{ kind: "block", stmts: toplevel } });
+    } else {
+        if usermain == nil { throw "codegen_arm64_ast: no entry — add top-level statements or a fn main()"; }
+        push(fns, usermain);
+    }
+    let u = 0; while u < len(userfns) { push(fns, userfns[u]); u = u + 1; }
+    let needsheap = _has_str_node(ast.stmts);      // programs with strings get the mmap arena + __str/__concat
+    let types = _infer_types(fns);                 // interprocedural: return + param types (num/str/arr/map)
+    let fnret = types.fnret; let fnptype = types.fnptype;
+    let code = [];
+    if needsheap { _emit_heap_setup(code); }       // startup: mmap arena → x28, runs before bl main
+    let blpos = _wpos(code);
+    _e(code, 0x94000000);                          // bl main (patched)
+    let allfix = [map{ pos: blpos, name: "main" }];
+    _e(code, 0xD2800000 + 93 * 32 + 8);            // movz x8,#93
+    _e(code, 0xD4000001);                          // svc  (exit x0)
+    let offsets = map{};
+    let sdata = [];                                // string-literal data blob (appended after all code)
+    let allspatch = [];                            // string address-load sites to patch: {pos, off}
+    let f = 0;
+    while f < len(fns) {
+        let base = _wpos(code);
+        offsets[fns[f].name] = base;
+        let r = _cfn(fns[f], sdata, fnret, fnptype);
+        let bi = 0; while bi < len(r.bytes) { push(code, r.bytes[bi]); bi = bi + 1; }
+        let xi = 0; while xi < len(r.fixups) { push(allfix, map{ pos: base + r.fixups[xi].pos, name: r.fixups[xi].name }); xi = xi + 1; }
+        let pi = 0; while pi < len(r.spatch) { push(allspatch, map{ pos: base + r.spatch[pi].pos, off: r.spatch[pi].off }); pi = pi + 1; }
+        f = f + 1;
+    }
+    if needsheap {                                 // append the heap helper subroutines with known labels
+        offsets["__str"] = _wpos(code);
+        let hs = _emit_str_helper(); let a = 0; while a < len(hs) { push(code, hs[a]); a = a + 1; }
+        offsets["__concat"] = _wpos(code);
+        let hc = _emit_concat_helper(); let b = 0; while b < len(hc) { push(code, hc[b]); b = b + 1; }
+        offsets["__streq"] = _wpos(code);
+        let he = _emit_streq_helper(); let e2 = 0; while e2 < len(he) { push(code, he[e2]); e2 = e2 + 1; }
+        offsets["__charat"] = _wpos(code);
+        let ha = _emit_charat_helper(); let a2 = 0; while a2 < len(ha) { push(code, ha[a2]); a2 = a2 + 1; }
+        offsets["__push"] = _wpos(code);
+        let hp = _emit_push_helper(); let a3 = 0; while a3 < len(hp) { push(code, hp[a3]); a3 = a3 + 1; }
+        offsets["__fromcode"] = _wpos(code); let hfc = _emit_fromcode_helper(); let a4 = 0; while a4 < len(hfc) { push(code, hfc[a4]); a4 = a4 + 1; }
+        offsets["__slice"] = _wpos(code); let hsl = _emit_slice_helper(); let a5 = 0; while a5 < len(hsl) { push(code, hsl[a5]); a5 = a5 + 1; }
+        offsets["__split"] = _wpos(code); let hsp = _emit_split_helper(); let a6 = 0; while a6 < len(hsp) { push(code, hsp[a6]); a6 = a6 + 1; }
+        offsets["__mget"] = _wpos(code); let hmg = _emit_mget_helper(0); _appendhelper(code, allfix, hmg, offsets["__mget"]);
+        offsets["__mhas"] = _wpos(code); let hmh = _emit_mget_helper(1); _appendhelper(code, allfix, hmh, offsets["__mhas"]);
+        offsets["__mset"] = _wpos(code); let hms = _emit_mset_helper(); _appendhelper(code, allfix, hms, offsets["__mset"]);
+        offsets["__printnum"] = _wpos(code); let hpn = _emit_pnum_helper(); let q1 = 0; while q1 < len(hpn) { push(code, hpn[q1]); q1 = q1 + 1; }
+        offsets["__printstr"] = _wpos(code); let hps = _emit_pstr_helper(); let q2 = 0; while q2 < len(hps) { push(code, hps[q2]); q2 = q2 + 1; }
+        offsets["__printdyn"] = _wpos(code); let hpd = _emit_printdyn_helper(); _appendhelper(code, allfix, hpd, offsets["__printdyn"]);
+    }
+    let k = 0;
+    while k < len(allfix) {
+        let fxx = allfix[k];
+        if not map_has(offsets, fxx.name) { throw "arm64-ast: call to undefined function '" + fxx.name + "'"; }
+        _patch(code, fxx.pos, 0x94000000 + _imm26(offsets[fxx.name] - fxx.pos));
+        k = k + 1;
+    }
+    // string data lands right after the code (same RWX segment). Its absolute base = LOAD(0x400000) + HSIZE(120)
+    // + code_len; patch each movz/movk that loads a string address, then append the blob.
+    let base_data = 4194304 + 120 + len(code);
+    let si = 0;
+    while si < len(allspatch) {
+        let a = base_data + allspatch[si].off;
+        let lo = a % 65536; let hi = num_floor(a / 65536) % 65536;
+        _patch(code, allspatch[si].pos, 0xD2800000 + lo * 32 + 0);          // movz x0, #lo
+        _patch(code, allspatch[si].pos + 1, 0xF2A00000 + hi * 32 + 0);      // movk x0, #hi, lsl #16
+        si = si + 1;
+    }
+    let di = 0; while di < len(sdata) { push(code, sdata[di]); di = di + 1; }
+    return code;
+}
+
+
+// compile_elf(src) — a complete, runnable AArch64 ELF for the compiled program (exit code = program result).
+fn compile_elf(src) { return _A.elf64_exec(compile_ast(src)); }
+
+export compile_ast, compile_elf;

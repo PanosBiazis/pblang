@@ -1,0 +1,201 @@
+// stdlib/project_text_audit.sapp -- bounded safe-text project audit.
+//
+// This module is the explicit content-reading layer above project_inventory.
+// It only reads small, text-like files from caller-approved roots, skips
+// sensitive/cache/build/local assistant paths, and feeds records into
+// stdlib:project_audit.sapp.
+
+let INV = import("stdlib:project_inventory.sapp");
+let AUDIT = import("stdlib:project_audit.sapp");
+
+fn _str(x) { return str(x ?? ""); }
+fn _lower(x) { return str_lower(_str(x)); }
+
+fn _base(path) {
+    let parts = str_split(_str(path), "/");
+    if len(parts) == 0 { return ""; }
+    let b = parts[len(parts) - 1];
+    if b == "" and len(parts) > 1 { b = parts[len(parts) - 2]; }
+    return b;
+}
+
+fn _ext(path) {
+    let name = _lower(_base(path));
+    let i = len(name) - 1;
+    while i >= 0 {
+        if str_slice(name, i, i + 1) == "." { return str_slice(name, i, len(name)); }
+        i = i - 1;
+    }
+    return "";
+}
+
+fn text_like_path(path) {
+    let name = _lower(_base(path));
+    let ext = _ext(path);
+    if ext == ".sapp" or ext == ".sap" or ext == ".bpx" { return true; }
+    if ext == ".md" or ext == ".txt" or ext == ".rst" or ext == ".adoc" { return true; }
+    if ext == ".toml" or ext == ".json" or ext == ".yaml" or ext == ".yml" { return true; }
+    if ext == ".rs" or ext == ".c" or ext == ".h" or ext == ".cpp" or ext == ".hpp" { return true; }
+    if ext == ".js" or ext == ".ts" or ext == ".html" or ext == ".css" { return true; }
+    if ext == ".py" or ext == ".sh" or ext == ".bat" or ext == ".ps1" { return true; }
+    if name == "readme" or name == "license" or name == "changelog" { return true; }
+    return false;
+}
+
+fn audit_policy() {
+    return map{
+        format: "pblang.project_text_audit.policy.v1",
+        read_scope: "caller-approved roots only",
+        write_scope: "none; audit never writes files",
+        external_disk_policy: "external disks and Ventoy-style boot media are read-only idea sources unless an operator explicitly scopes a write task",
+        content_policy: "small text-like files only; sensitive/cache/build/generated-output/local assistant paths skipped; summaries do not print source contents"
+    };
+}
+
+fn _safe_record_path(path) {
+    if INV.should_skip_path(path) { return false; }
+    if not text_like_path(path) { return false; }
+    return true;
+}
+
+fn _historical_snapshot_doc(path, text) {
+    let ext = _ext(path);
+    if ext != ".md" and ext != ".txt" and ext != ".rst" and ext != ".adoc" { return false; }
+    let t = _lower(text);
+    if str_contains(t, "> historical snapshot.") { return true; }
+    if str_contains(t, "**superseded / historical") { return true; }
+    if str_contains(t, "superseded / historical") and str_contains(t, "canonical current status") { return true; }
+    return false;
+}
+
+fn collect_text_records(roots, options = nil) {
+    if options == nil { options = map{}; }
+    let max_files = try options.max_files catch 120;
+    let max_bytes = try options.max_file_bytes catch 20000;
+    let max_depth = try options.max_depth catch 4;
+    let max_entries = try options.max_entries catch 1000;
+    let max_children = try options.max_children_per_dir catch 160;
+    let skip_historical = try options.skip_historical_snapshots catch true;
+    if max_files == nil or max_files < 1 { max_files = 120; }
+    if max_bytes == nil or max_bytes < 1000 { max_bytes = 1000; }
+
+    let inv = INV.inventory_roots(roots, map{
+        max_depth: max_depth,
+        max_entries: max_entries,
+        max_children_per_dir: max_children,
+        include_files: true,
+        include_dirs: true
+    });
+    let records = [];
+    let skipped = [];
+    let rows = try inv.records catch [];
+    let i = 0;
+    while i < len(rows) and len(records) < max_files {
+        let rec = rows[i];
+        let path = _str(try rec.path catch "");
+        let kind = _str(try rec.kind catch "");
+        if kind != "file" {
+            i = i + 1;
+            continue;
+        }
+        if not _safe_record_path(path) {
+            array_push(skipped, map{ path: path, reason: "not safe text-like path" });
+            i = i + 1;
+            continue;
+        }
+        let text = try fs_read(path) catch nil;
+        if type(text) != "string" {
+            array_push(skipped, map{ path: path, reason: "unreadable text file" });
+            i = i + 1;
+            continue;
+        }
+        if len(text) > max_bytes {
+            array_push(skipped, map{ path: path, reason: "file exceeds max_file_bytes after read" });
+            i = i + 1;
+            continue;
+        }
+        if skip_historical and _historical_snapshot_doc(path, text) {
+            array_push(skipped, map{ path: path, reason: "historical snapshot doc excluded from active audit" });
+            i = i + 1;
+            continue;
+        }
+        array_push(records, map{ path: path, text: text });
+        i = i + 1;
+    }
+    let truncated = false;
+    if i < len(rows) { truncated = true; }
+    return map{
+        format: "pblang.project_text_audit.records.v1",
+        inventory: inv,
+        records: records,
+        record_count: len(records),
+        skipped: skipped,
+        skipped_count: len(skipped),
+        truncated: truncated,
+        policy: "bounded text-like file audit; read-only caller-approved roots; sensitive/cache/build/generated-output/local assistant paths skipped; file contents are not printed by line summaries",
+        policy_contract: audit_policy()
+    };
+}
+
+fn audit_roots(project, roots, options = nil) {
+    if options == nil { options = map{}; }
+    let collected = collect_text_records(roots, options);
+    let max_findings = try options.max_findings catch 200;
+    let suppress_fixtures = try options.suppress_test_fixtures catch true;
+    let audit = AUDIT.audit_project(project, collected.records, max_findings, map{
+        suppress_test_fixtures: suppress_fixtures
+    });
+    let gate = AUDIT.quality_gate(audit.report, map{
+        max_high: try options.max_high catch 0,
+        max_medium: try options.max_medium catch 8,
+        max_total: try options.max_total catch 80,
+        max_source_high: try options.max_source_high catch 0,
+        max_source_medium: try options.max_source_medium catch 4,
+        max_source_total: try options.max_source_total catch 40,
+        source_only_blockers: try options.source_only_blockers catch true,
+        allow_roadmap: try options.allow_roadmap catch true
+    });
+    let backlog = AUDIT.backlog(audit.report, try options.backlog_limit catch 10);
+    return map{
+        format: "pblang.project_text_audit.report.v1",
+        project: project,
+        collected: collected,
+        audit: audit,
+        quality_gate: gate,
+        backlog: backlog,
+        status: gate.status,
+        policy: collected.policy,
+        policy_contract: collected.policy_contract
+    };
+}
+
+fn audit_lines(report, limit = 16) {
+    if limit == nil or limit < 1 { limit = 16; }
+    let r = try report catch map{};
+    let collected = try r.collected catch map{};
+    let audit = try r.audit catch map{};
+    let rep = try audit.report catch map{};
+    let gate = try r.quality_gate catch map{};
+    let lines = [
+        "Project text audit: " + str(try r.project catch "project") + " · " + str(try r.status catch "unknown"),
+        "records=" + str(try collected.record_count catch 0) + " findings=" + str(try rep.finding_count catch 0) + " skipped=" + str(try collected.skipped_count catch 0),
+        "roles: source=" + str(try rep.counts_role.source catch 0) + " docs=" + str(try rep.counts_role.docs catch 0) + " test=" + str(try rep.counts_role.test catch 0) + " config=" + str(try rep.counts_role.config catch 0),
+        "gate: " + str(try gate.status catch "unknown") + " · policy: " + str(try r.policy catch "bounded text")
+    ];
+    let recs = try audit.recommendations catch [];
+    let i = 0;
+    while i < len(recs) and len(lines) < limit {
+        array_push(lines, "- " + str(recs[i]));
+        i = i + 1;
+    }
+    let tasks = try r.backlog.tasks catch [];
+    let j = 0;
+    while j < len(tasks) and len(lines) < limit {
+        let t = tasks[j];
+        array_push(lines, "! " + str(try t.severity catch "?") + " " + str(try t.role catch "?") + "/" + str(try t.kind catch "?") + " " + str(try t.path catch "") + ":" + str(try t.line catch 0));
+        j = j + 1;
+    }
+    return lines;
+}
+
+export text_like_path, audit_policy, collect_text_records, audit_roots, audit_lines;

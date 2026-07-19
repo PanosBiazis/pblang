@@ -1,0 +1,101 @@
+// tools/pbc.sapp — compile a pblang program to a SELF-CONTAINED native binary, one command.
+//
+//   pblang run tools/pbc.sapp <program.sapp> [--out <bin>] [--target x64|arm64|wasm] [--safe] [--overflow]
+//
+// --target arm64 CROSS-COMPILES from x86-64 to a static AArch64/ARM64 ELF using the pure-pblang arm64 backend
+// (stdlib/codegen_arm64_ast.sapp) — no cross-toolchain needed. Integer subset (fn/if/elif/while/arith/print/
+// calls/recursion); copy the result to any arm64 device (Pi, phone, arm64 server, Apple-silicon VM) and run it.
+//
+// Uses the pure-pblang code generator (stdlib/native/codegen_x64.sapp) to emit a minimal static ELF —
+// no libc, no runtime, no external toolchain. The result is a tiny, fast, memory-safe binary you can run
+// directly. --safe additionally certifies it (compile_safe): out-of-range array/map access TRAPS (exit
+// 134) instead of corrupting memory, so even "unsafe-looking" source lowers to a safe binary.
+// --overflow turns on CHECKED ARITHMETIC: every signed add/sub/mul/neg traps (SIGILL, exit 132) on i64
+// overflow instead of silently wrapping. Composes with --safe (memory + arithmetic safety together).
+//
+// Supported source is the codegen subset (numbers, strings + str()/concat/slice/char, if/elif/else,
+// while, functions + recursion, closures, arrays + push, maps). Unsupported constructs fail loud.
+
+let cg = import("stdlib/native/codegen_x64.sapp");
+
+fn _is_flag(a) { return len(a) > 0 and strcharcodeat(a, 0) == 45; }
+fn _has_suffix(f, ext) { if len(f) <= len(ext) { return false; } return str_slice(f, len(f) - len(ext), len(f)) == ext; }
+fn _default_out(src) {
+    // strip directory and the trailing ".sapp"
+    let parts = str_split(src, "/");
+    let base = parts[len(parts) - 1];
+    if _has_suffix(base, ".sapp") { return str_slice(base, 0, len(base) - 5); }
+    return base;
+}
+
+fn main() {
+    let a = os_args();
+    let src = nil; let out = nil; let safe = false; let overflow = false; let target = "x64"; let i = 0;
+    while i < len(a) {
+        let arg = a[i];
+        if arg == "--out" and i + 1 < len(a) { out = a[i + 1]; i = i + 1; }
+        elif arg == "--target" and i + 1 < len(a) { target = a[i + 1]; i = i + 1; }
+        elif arg == "--safe" { safe = true; }
+        elif arg == "--overflow" or arg == "--checked-arith" { overflow = true; }
+        elif not _is_flag(arg) and arg != "run" and _has_suffix(arg, ".sapp") and not _has_suffix(arg, "pbc.sapp") { src = arg; }
+        i = i + 1;
+    }
+    if src == nil {
+        print "usage: pblang run tools/pbc.sapp <program.sapp> [--out <bin>] [--target x64|arm64|wasm] [--safe] [--overflow]";
+        return nil;
+    }
+    if target != "x64" and target != "arm64" and target != "wasm" {
+        print "pbc: unknown --target '" + target + "' (supported: x64, arm64, wasm)";
+        return nil;
+    }
+    if out == nil { out = _default_out(src); }
+
+    let source = fs_read(src);
+
+    // ── WASM: pure-pblang WebAssembly backend → a .wasm module exporting main() → i64. Runs in every
+    // browser and wasm runtime (node, wasmtime, wasmer, deno) — pblang's universal-runtime / web target.
+    if target == "wasm" {
+        if safe or overflow { print "  note: --safe/--overflow are x64-only; wasm gets the engine's own sandboxing"; }
+        let wcg = import("stdlib/codegen_wasm.sapp");
+        let wbin = wcg.compile_wasm(source);
+        fs_write_bytes(out, wbin);
+        print "pbc: compiled '" + src + "' → '" + out + "' (" + str(len(wbin)) + " bytes, WebAssembly module)";
+        print "  run it:  node -e \"WebAssembly.instantiate(require('fs').readFileSync('" + out + "')).then(r=>console.log(String(r.instance.exports.main())))\"";
+        return nil;
+    }
+
+    // ── ARM64 cross-compile: pure-pblang AArch64 backend → a static EM_AARCH64 ELF (runs on real arm64 HW).
+    // Integer subset: fn/params, let/assign, if/elif/else, while, +-*/%, comparisons, and/or, bitwise, print,
+    // calls, recursion. No external toolchain — one command from x86-64 to an ARM64 binary.
+    if target == "arm64" {
+        if safe or overflow { print "  note: --safe/--overflow are x64-only; the arm64 backend emits a plain integer ELF"; }
+        let acg = import("stdlib/codegen_arm64_ast.sapp");
+        let bin = acg.compile_elf(source);
+        fs_write_bytes(out, bin);
+        print "pbc: compiled '" + src + "' → '" + out + "' (" + str(len(bin)) + " bytes, static AArch64/ARM64 ELF)";
+        print "  run on arm64 hardware:  chmod +x " + out + " && ./" + out + " ; echo $?";
+        return nil;
+    }
+
+    // ── x86-64 (default) ──
+    // Checked arithmetic is a global codegen mode; set it BEFORE emitting so it reaches every
+    // add/sub/mul/neg site (shared by both the plain and --safe lowering paths).
+    cg.set_overflow_check(overflow);
+    if safe {
+        let r = cg.compile_safe(source);
+        fs_write_bytes(out, r.binary);
+        print "pbc: compiled '" + src + "' → '" + out + "' (" + str(len(r.binary)) + " bytes, CERTIFIED SAFE)";
+        let g = r.guarantees; let k = 0;
+        while k < len(g) { print "  ✓ " + g[k]; k = k + 1; }
+    } else {
+        let bin = cg.compile_fns(source);
+        fs_write_bytes(out, bin);
+        print "pbc: compiled '" + src + "' → '" + out + "' (" + str(len(bin)) + " bytes, static native ELF)";
+    }
+    if overflow { print "  ✓ signed integer arithmetic is overflow-checked — add/sub/mul/neg trap (SIGILL, exit 132) instead of wrapping"; }
+    cg.set_overflow_check(false);   // reset the global so a reused module never leaks the mode
+    print "run it:  chmod +x " + out + " && ./" + out;
+    return nil;
+}
+
+main();

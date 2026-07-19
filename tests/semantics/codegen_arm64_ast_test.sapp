@@ -1,0 +1,239 @@
+// codegen_arm64_ast_test.sapp — REAL pblang AST → ARM64 machine code, end-to-end, execution-verified.
+//
+// The compiler now lives in stdlib/codegen_arm64_ast.sapp; this file imports it, RUNS its output on an in-pblang
+// AArch64 interpreter, and checks the exit code — so the very compiler the ELF builder uses is the one proven
+// correct here. Turns the ARM64 backend from "hand-fed IR" into a real end-to-end compiler path.
+
+let AST = import("stdlib/codegen_arm64_ast.sapp");
+
+fn fail(m) { throw "FAIL arm64-ast: " + m; }
+
+// ── in-pblang AArch64 interpreter (executes what the compiler emits; halts on svc x8==93 → x0&255) ──
+fn _word(code, off) { return code[off] + code[off + 1] * 256 + code[off + 2] * 65536 + code[off + 3] * 16777216; }
+fn _idiv(n, m) { let q = n / m; if q >= 0 { return num_floor(q); } return 0 - num_floor(0 - q); }
+fn _pw2(s) { let r = 1; let i = 0; while i < s { r = r * 2; i = i + 1; } return r; }
+fn _holds(cc, r) { if cc == 0 { return r == 0; } if cc == 1 { return r != 0; } if cc == 10 { return r >= 0; } if cc == 11 { return r < 0; } if cc == 12 { return r > 0; } if cc == 13 { return r <= 0; } return false; }
+fn arm64_run(code) {
+    let x = []; let r = 0; while r < 32 { push(x, 0); r = r + 1; }
+    let sp = 1048576; let mem = map{}; let bmem = map{}; let cmpres = 0; let out = "";
+    let imgbase = 4194424; let imglen = len(code);   // loaded image: entry 0x400078; string data lives after the code
+    let nwords = num_floor(len(code) / 4); let pc = 0; let guard = 0; let result = 0; let halted = false;
+    while pc >= 0 and pc < nwords and guard < 200000000 and not halted {
+        guard = guard + 1;
+        let word = _word(code, pc * 4);
+        let top = num_floor(word / 16777216) % 256;
+        let op6 = num_floor(word / 67108864) % 64;
+        let rd = word % 32; let rn = num_floor(word / 32) % 32; let ra = num_floor(word / 1024) % 32; let rm = num_floor(word / 65536) % 32;
+        let next = pc + 1;
+        if op6 == 5 { let o = word % 67108864; if o >= 33554432 { o = o - 67108864; } next = pc + o; }                       // b
+        else if op6 == 37 { let o = word % 67108864; if o >= 33554432 { o = o - 67108864; } x[30] = pc + 1; next = pc + o; } // bl
+        else if top == 210 { let hw = num_floor(word / 2097152) % 2; let imm = num_floor(word / 32) % 65536; if rd != 31 { if hw == 1 { x[rd] = imm * 65536; } else { x[rd] = imm; } } }  // movz (hw=1 → lsl#16)
+        else if top == 146 { let imm = num_floor(word / 32) % 65536; if rd != 31 { x[rd] = 0 - imm - 1; } }                  // movn Xd,#imm (~imm; movn x,#0 = -1)
+        else if top == 242 { let imm = num_floor(word / 32) % 65536; if rd != 31 { x[rd] = (x[rd] % 65536) + imm * 65536; } }// movk hi
+        else if top == 139 { let sh = num_floor(word / 1024) % 64; if rd != 31 { x[rd] = x[rn] + x[rm] * _pw2(sh); } }        // add (shifted reg: lsl#sh)
+        else if top == 203 { if rd != 31 { x[rd] = x[rn] - x[rm]; } }                                                        // sub
+        else if top == 138 { if rd != 31 { x[rd] = bit_and(x[rn], x[rm]); } }                                                // and
+        else if top == 202 { if rd != 31 { x[rd] = bit_xor(x[rn], x[rm]); } }                                                // eor
+        else if top == 235 { cmpres = x[rn] - x[rm]; }                                                                       // cmp
+        else if top == 155 { let ms = num_floor(word / 32768) % 2; if rd != 31 { if ms == 1 { x[rd] = x[ra] - x[rn] * x[rm]; } else { x[rd] = x[rn] * x[rm] + x[ra]; } } } // madd/msub
+        else if top == 154 { let isd = num_floor(word / 2048) % 2; if isd == 1 { if rd != 31 { x[rd] = _idiv(x[rn], x[rm]); } } else { let cc = num_floor(word / 4096) % 16; let v = 0; if not _holds(cc, cmpres) { v = 1; } if rd != 31 { x[rd] = v; } } } // sdiv/cset
+        else if top == 145 { let imm = num_floor(word / 1024) % 4096; let base = sp; if rn != 31 { base = x[rn]; } let v = base + imm; if rd == 31 { sp = v; } else { x[rd] = v; } } // add imm (reg31=SP)
+        else if top == 209 { let imm = num_floor(word / 1024) % 4096; let base = sp; if rn != 31 { base = x[rn]; } let v = base - imm; if rd == 31 { sp = v; } else { x[rd] = v; } } // sub imm
+        else if top == 249 { let l = num_floor(word / 4194304) % 2; let off = num_floor(word / 1024) % 4096 * 8; let base = sp; if rn != 31 { base = x[rn]; } let a = base + off;
+            if l == 1 { if rd != 31 { if a >= imgbase and a < imgbase + imglen { let p = a - imgbase; x[rd] = code[p] + code[p + 1] * 256 + code[p + 2] * 65536 + code[p + 3] * 16777216; } else { x[rd] = mem[str(a)]; } } } else { mem[str(a)] = x[rd]; } }  // ldr/str (ldr reads string length from the data image)
+        else if top == 169 { sp = sp - 16; mem[str(sp)] = x[rd]; mem[str(sp + 8)] = x[ra]; }                                 // stp [sp,#-16]!
+        else if top == 168 { if rd != 31 { x[rd] = mem[str(sp)]; } if ra != 31 { x[ra] = mem[str(sp + 8)]; } sp = sp + 16; } // ldp [sp],#16
+        else if top == 170 { if rd != 31 { if rn == 31 { x[rd] = x[rm]; } else { x[rd] = bit_or(x[rn], x[rm]); } } }         // mov/orr
+        else if top == 57 { let l = num_floor(word / 4194304) % 2; let imm = num_floor(word / 1024) % 4096; let base = sp; if rn != 31 { base = x[rn]; } let a = base + imm;  // strb (L=0) / ldrb (L=1)
+            if l == 1 { let bb = 0; if a >= imgbase and a < imgbase + imglen { bb = code[a - imgbase]; } elif map_has(bmem, str(a)) { bb = bmem[str(a)]; } if rd != 31 { x[rd] = bb; } }
+            else { bmem[str(a)] = x[rd] % 256; } }
+        else if top == 180 { let o = num_floor(word / 32) % 524288; if o >= 262144 { o = o - 524288; } if x[rd] == 0 { next = pc + o; } } // cbz
+        else if top == 181 { let o = num_floor(word / 32) % 524288; if o >= 262144 { o = o - 524288; } if x[rd] != 0 { next = pc + o; } } // cbnz
+        else if top == 214 { next = x[30]; }                                                                                // ret
+        else if top == 212 {                                                                                                // svc
+            if x[8] == 93 { result = x[0]; halted = true; }                                                                 //   exit(x0)
+            else if x[8] == 222 { x[0] = 268435456; }                                                                       //   mmap → fixed heap base 0x10000000
+            else if x[8] == 64 { let bf = x[1]; let ln = x[2]; let ii = 0; while ii < ln { let a = bf + ii; let bb = 0; if a >= imgbase and a < imgbase + imglen { bb = code[a - imgbase]; } elif map_has(bmem, str(a)) { bb = bmem[str(a)]; } out = out + strfromcharcode(bb); ii = ii + 1; } }  // write(fd, buf, len): bytes from the data image or the byte-mem'd stack
+        }
+        else { throw "arm64_run: unmodeled instruction word " + str(word); }
+        x[31] = 0;
+        pc = next;
+    }
+    if not halted { fail("ran off the end without svc-exit"); }
+    let e = result % 256; if e < 0 { e = e + 256; } return map{ exit: e, out: out };
+}
+
+fn eq(g, w, m) { if g != w { fail(m + ": got " + str(g) + " want " + str(w)); } }
+fn runsrc(src) { return arm64_run(AST.compile_ast(src)).exit; }
+fn runout(src) { return arm64_run(AST.compile_ast(src)).out; }
+
+// ── real pblang source → ARM64 → executed, exit code checked ──
+eq(runsrc("fn main() { return 3 * 4 + 2; }"),                                                     14, "arith + precedence");
+eq(runsrc("fn main() { return 2 + 3 * 4; }"),                                                     14, "precedence (mul before add)");
+eq(runsrc("fn main() { let a = 3; let b = 4; return a * b; }"),                                   12, "variables");
+eq(runsrc("fn main() { return 20 / 3; }"),                                                         6, "division");
+eq(runsrc("fn main() { return 20 % 3; }"),                                                         2, "modulo");
+eq(runsrc("fn main() { let x = 8; if x > 5 { return 1; } else { return 0; } }"),                   1, "if/else true");
+eq(runsrc("fn main() { let x = 2; if x > 5 { return 1; } else { return 0; } }"),                   0, "if/else false");
+eq(runsrc("fn main() { let i = 0; let s = 0; while i < 5 { s = s + i; i = i + 1; } return s; }"), 10, "while loop sum 0..4");
+eq(runsrc("fn add(a, b) { return a + b; } fn main() { return add(3, 4); }"),                       7, "function call");
+eq(runsrc("fn add(a, b) { return a + b; } fn main() { return add(add(1, 2), add(3, 4)); }"),      10, "nested calls");
+eq(runsrc("fn fact(n) { if n < 2 { return 1; } return n * fact(n - 1); } fn main() { return fact(5); }"),      120, "recursion: 5!");
+eq(runsrc("fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fn main() { return fib(10); }"), 55, "recursion: fib(10)");
+// the exact programs shipped as ELFs in demo/arm64/ (so every emitted binary corresponds to a verified result)
+eq(runsrc("fn main() { let i = 0; let s = 0; while i < 10 { s = s + i; i = i + 1; } return s; }"),             45, "ELF loopsum 0..9");
+eq(runsrc("fn gcd(a, b) { if b == 0 { return a; } return gcd(b, a % b); } fn main() { return gcd(48, 36); }"), 12, "ELF gcd(48,36) — recursion+mod+multi-arg");
+
+// ── widened subset: and/or (short-circuit), elif, bitwise (bit_and/or/xor), print ──
+eq(runsrc("fn main() { let a = 1; let b = 0; if a and b { return 1; } return 2; }"),               2, "and: 1 and 0 → false");
+eq(runsrc("fn main() { let a = 3; let b = 5; if a and b { return 1; } return 2; }"),               1, "and: both truthy");
+eq(runsrc("fn main() { if 0 or 7 { return 1; } return 2; }"),                                       1, "or: 0 or 7 → truthy");
+eq(runsrc("fn main() { if 0 or 0 { return 1; } return 2; }"),                                       2, "or: both falsy");
+// short-circuit must NOT evaluate the divide-by-zero on the right when left decides it
+eq(runsrc("fn bad() { return 1 / 0; } fn main() { if 0 and bad() { return 9; } return 5; }"),       5, "and short-circuits (rhs not run)");
+eq(runsrc("fn main() { let x = 2; if x == 1 { return 10; } elif x == 2 { return 20; } else { return 30; } }"),  20, "elif: middle arm");
+eq(runsrc("fn main() { let x = 9; if x == 1 { return 10; } elif x == 2 { return 20; } else { return 30; } }"),  30, "elif: else arm");
+eq(runsrc("fn main() { let x = 1; if x == 1 { return 10; } elif x == 2 { return 20; } else { return 30; } }"),  10, "elif: first arm");
+eq(runsrc("fn main() { return bit_and(12, 10); }"),                                                 8, "bitwise and 12&10");
+eq(runsrc("fn main() { return bit_or(12, 10); }"),                                                 14, "bitwise or 12|10");
+eq(runsrc("fn main() { return bit_xor(12, 10); }"),                                                 6, "bitwise xor 12^10");
+eq(runsrc("fn main() { return bit_and(bit_or(5, 2), 6); }"),                                        6, "bitwise nested (5|2)&6");
+
+// print → write syscall → captured stdout
+fn eqout(g, w, m) { if g != w { fail(m + ": got '" + g + "' want '" + w + "'"); } }
+eqout(runout("fn main() { print 42; return 0; }"),                                          "42\n", "print 42");
+eqout(runout("fn main() { print 0; return 0; }"),                                            "0\n", "print 0 (do-while)");
+eqout(runout("fn main() { print 7 * 6; return 0; }"),                                       "42\n", "print expression");
+eqout(runout("fn main() { let i = 1; while i <= 3 { print i; i = i + 1; } return 0; }"), "1\n2\n3\n", "print in a loop");
+eqout(runout("fn sq(n) { return n * n; } fn main() { print sq(12); return 0; }"),          "144\n", "print multi-digit call result");
+eqout(runout("fn main() { let i = 1; while i <= 10 { print i * i; i = i + 1; } return 0; }"), "1\n4\n9\n16\n25\n36\n49\n64\n81\n100\n", "squares.elf program (shipped)");
+// signed / negative print
+eqout(runout("fn main() { print 0 - 5; return 0; }"),                                      "-5\n", "print negative (0-5)");
+eqout(runout("fn main() { print 3 - 10; return 0; }"),                                      "-7\n", "print negative expr (3-10)");
+eqout(runout("fn main() { print -42; return 0; }"),                                        "-42\n", "print unary-minus literal");
+eqout(runout("fn main() { let x = 0 - 123; print x; return 0; }"),                        "-123\n", "print negative multi-digit var");
+eqout(runout("fn main() { print 7; print 0 - 7; print 0; return 0; }"),               "7\n-7\n0\n", "print mixed signs incl 0");
+eqout(runout("fn sq(n) { return n * n; } fn main() { print 0 - sq(9); return 0; }"),      "-81\n", "print negated call result");
+eqout(runout("fn main() { let i = 5; while i >= 0 - 5 { print i; i = i - 1; } return 0; }"), "5\n4\n3\n2\n1\n0\n-1\n-2\n-3\n-4\n-5\n", "countdown.elf program (shipped)");
+// TOP-LEVEL entry style (x64-consistent): no fn main; top-level code is the program body, calls a user fn
+eqout(runout("fn fib(n) { if n < 2 { return n; } return fib(n-1) + fib(n-2); } let i = 0; while i < 10 { print fib(i); i = i + 1; }"), "0\n1\n1\n2\n3\n5\n8\n13\n21\n34\n", "top-level entry + fib (pbc --target arm64 demo)");
+// ── strings / character output ──
+eqout(runout("print \"hello\";"),                                                     "hello\n", "print string literal");
+eqout(runout("print \"hi\"; print \"there\";"),                                  "hi\nthere\n", "two string prints");
+eqout(runout("let s = \"world\"; print s;"),                                          "world\n", "print string variable");
+eqout(runout("print \"answer:\"; print 42;"),                                    "answer:\n42\n", "mixed string + number print");
+eqout(runout("let msg = \"pblang on arm64\"; print msg; print msg;"), "pblang on arm64\npblang on arm64\n", "string var printed twice (shared literal)");
+eqout(runout("let g = \"\"; print g; print \"x\";"),                                       "\nx\n", "empty string prints just newline");
+eqout(runout("fn main() { print \"from main\"; return 0; }"),                     "from main\n", "print string from fn main entry");
+// ── heap + tagged strings: str() and concatenation ──
+eqout(runout("print str(42);"),                                                          "42\n", "str(42) → heap string");
+eqout(runout("print str(0);"),                                                            "0\n", "str(0)");
+eqout(runout("print str(0 - 7);"),                                                       "-7\n", "str(negative)");
+eqout(runout("print \"a\" + \"b\";"),                                                     "ab\n", "concat two literals");
+eqout(runout("print \"hello \" + \"world\";"),                                  "hello world\n", "concat with space");
+eqout(runout("print \"count: \" + str(5);"),                                     "count: 5\n", "concat string + str(number)");
+eqout(runout("print \"x\" + 42;"),                                                      "x42\n", "concat coerces number operand");
+eqout(runout("print 7 + \"up\";"),                                                     "7up\n", "concat coerces left number");
+eqout(runout("let s = \"a\"; let t = s + \"b\"; print t;"),                              "ab\n", "concat via string variable");
+eqout(runout("print str(1) + str(2) + str(3);"),                                       "123\n", "nested concat of str()");
+eqout(runout("fn sq(n){ return n*n; } let i=1; while i<=3 { print \"sq=\" + str(sq(i)); i=i+1; }"), "sq=1\nsq=4\nsq=9\n", "concat in a loop w/ call");
+eqout(runout("fn sq(n) { return n * n; } let i = 1; while i <= 5 { print \"sq(\" + str(i) + \") = \" + str(sq(i)); i = i + 1; }"), "sq(1) = 1\nsq(2) = 4\nsq(3) = 9\nsq(4) = 16\nsq(5) = 25\n", "greet.elf program (shipped): multi-way concat");
+// ── string function PARAMETERS and RETURNS (interprocedural typing) ──
+eqout(runout("fn greet(name) { print \"Hi, \" + name; } greet(\"Bob\");"),            "Hi, Bob\n", "string param used in concat");
+eqout(runout("fn p(s) { print s; } p(\"direct\");"),                                  "direct\n", "string param printed directly");
+eqout(runout("fn tag(n) { return \"n=\" + str(n); } print tag(5);"),                     "n=5\n", "string RETURN value");
+eqout(runout("fn wrap(s) { return \"[\" + s + \"]\"; } print wrap(\"x\");"),             "[x]\n", "string param in + string return");
+eqout(runout("fn ex(s) { return s + \"!\"; } print ex(ex(\"hi\"));"),                   "hi!!\n", "chained string param+return");
+eqout(runout("fn a(s) { return b(s); } fn b(s) { return s + \"?\"; } print a(\"q\");"),  "q?\n", "fixpoint: a→b string propagation");
+eqout(runout("fn label(k, v) { return k + \": \" + str(v); } print label(\"x\", 7);"), "x: 7\n", "mixed string+number params");
+// ── string comparison & indexing ──
+eq(runsrc("fn main() { if \"a\" == \"a\" { return 1; } return 0; }"),                    1, "== equal");
+eq(runsrc("fn main() { if \"ab\" == \"abc\" { return 1; } return 0; }"),                 0, "== different length");
+eq(runsrc("fn main() { if \"abc\" == \"abd\" { return 1; } return 0; }"),                0, "== same length, differ");
+eq(runsrc("fn main() { if \"abc\" != \"abd\" { return 1; } return 0; }"),                1, "!= true");
+eq(runsrc("fn main() { let s = \"hi\"; if s == \"hi\" { return 1; } return 0; }"),       1, "== on a string variable");
+eqout(runout("print \"hello\"[1];"),                                                 "e\n", "index s[1] → 'e'");
+eqout(runout("print \"hello\"[0];"),                                                 "h\n", "index s[0] → 'h'");
+eqout(runout("let s = \"world\"; print s[4];"),                                       "d\n", "index string variable");
+eqout(runout("print \"ab\"[0] + \"ab\"[1];"),                                        "ab\n", "index results concatenated");
+eq(runsrc("fn main() { return len(\"hello\"); }"),                                       5, "len(string)");
+eq(runsrc("fn main() { return strcharcodeat(\"abc\", 1); }"),                           98, "strcharcodeat → code");
+// a real use: does a string start with a given char?
+eqout(runout("fn first(s) { return s[0]; } print first(\"zebra\");"),                 "z\n", "index in a string-returning fn");
+eqout(runout("let s = \"racecar\"; let i = 0; while i < len(s) { print s[i]; i = i + 1; }"), "r\na\nc\ne\nc\na\nr\n", "iterate chars via len + index");
+eqout(runout("fn ispal(s) { let i = 0; let n = len(s); while i < n { if s[i] != s[n - 1 - i] { return \"no\"; } i = i + 1; } return \"yes\"; } print \"racecar -> \" + ispal(\"racecar\"); print \"hello -> \" + ispal(\"hello\"); print \"level -> \" + ispal(\"level\");"), "racecar -> yes\nhello -> no\nlevel -> yes\n", "palindrome.elf (shipped): index+compare+len+concat");
+// ── arrays: literal, index read/write, len, push (grow), iteration ──
+eq(runsrc("fn main() { let a = [10, 20, 30]; return a[0] + a[2]; }"),                   40, "array literal + index read");
+eq(runsrc("fn main() { let a = [10, 20, 30]; return len(a); }"),                         3, "len(array)");
+eq(runsrc("fn main() { let a = [1, 2, 3]; a[1] = 99; return a[1]; }"),                  99, "array index write");
+eq(runsrc("fn main() { let a = [5, 6, 7]; let s = 0; let i = 0; while i < len(a) { s = s + a[i]; i = i + 1; } return s; }"), 18, "sum via len + index");
+eq(runsrc("fn main() { let a = [1, 2, 3]; push(a, 4); return len(a); }"),                4, "push grows length");
+eq(runsrc("fn main() { let a = [1, 2, 3]; push(a, 40); return a[3]; }"),                40, "push element readable");
+eq(runsrc("fn main() { let e = []; push(e, 5); push(e, 6); return e[0] + e[1]; }"),     11, "empty literal + two pushes");
+eq(runsrc("fn main() { let a = []; let i = 0; while i < 5 { push(a, i * i); i = i + 1; } return a[4]; }"), 16, "build array by pushing squares");
+eq(runsrc("fn main() { let a = []; let i = 0; while i < 6 { push(a, i); i = i + 1; } let s = 0; let j = 0; while j < len(a) { s = s + a[j]; j = j + 1; } return s; }"), 15, "push-build then sum (0..5)");
+// push a computed value (str/heap alloc between) forces the realloc path, not grow-in-place
+eq(runsrc("fn main() { let a = [1]; let b = [2, 3]; push(a, 9); return a[1] + a[0] + b[0]; }"), 12, "push after another alloc (realloc path)");
+eqout(runout("let a = [3, 1, 2]; let i = 0; while i < len(a) { print a[i]; i = i + 1; }"), "3\n1\n2\n", "print array elements");
+eqout(runout("let a = [5, 2, 8, 1, 9, 3]; let n = len(a); let i = 0; while i < n { let j = 0; while j < n - 1 - i { if a[j] > a[j + 1] { let t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; } j = j + 1; } i = i + 1; } let k = 0; while k < n { print a[k]; k = k + 1; }"), "1\n2\n3\n5\n8\n9\n", "sort.elf (shipped): bubble sort");
+// ── maps: literal, member/index get, set, map_has ──
+eq(runsrc("fn main() { let m = map{ x: 1, y: 2 }; return m.x + m.y; }"),                 3, "map literal + member get");
+eq(runsrc("fn main() { let m = map{ a: 10, b: 20, c: 30 }; return m.b; }"),             20, "member get middle key");
+eq(runsrc("fn main() { let m = map{ x: 5 }; m.x = 99; return m.x; }"),                   99, "member set overwrites");
+eq(runsrc("fn main() { let m = map{ x: 1 }; m.y = 7; return m.y; }"),                     7, "member set adds new key (grow)");
+eq(runsrc("fn main() { let m = map{ x: 1 }; m.y = 7; return m.x + m.y; }"),               8, "old + new key after grow");
+eq(runsrc("fn main() { let m = map{ k: 42 }; return m[\"k\"]; }"),                       42, "index get with string key");
+eq(runsrc("fn main() { let m = map{}; m[\"a\"] = 3; m[\"b\"] = 4; return m[\"a\"] + m[\"b\"]; }"), 7, "empty map + index set");
+eq(runsrc("fn main() { let m = map{ x: 1 }; if map_has(m, \"x\") { return 1; } return 0; }"),  1, "map_has present");
+eq(runsrc("fn main() { let m = map{ x: 1 }; if map_has(m, \"z\") { return 1; } return 0; }"),  0, "map_has absent");
+eq(runsrc("fn main() { let m = map{}; let i = 0; while i < 5 { m[\"n\"] = i; i = i + 1; } return m[\"n\"]; }"), 4, "repeated set (overwrite in loop)");
+// word-frequency style: count occurrences
+eq(runsrc("fn main() { let m = map{ a: 0 }; let i = 0; while i < 3 { m.a = m.a + 1; i = i + 1; } return m.a; }"), 3, "map used as a counter");
+eqout(runout("let m = map{ small: 0, big: 0 }; let nums = [3, 12, 7, 20, 5, 100]; let i = 0; while i < len(nums) { if nums[i] < 10 { m.small = m.small + 1; } else { m.big = m.big + 1; } i = i + 1; } print \"small: \" + str(m.small); print \"big: \" + str(m.big);"), "small: 3\nbig: 3\n", "tally.elf (shipped): map counters + array");
+// ── string/mixed VALUES in containers (runtime print dispatch) ──
+eqout(runout("let m = map{ name: \"bob\", age: 30 }; print m.name; print m.age;"), "bob\n30\n", "map string value + number value");
+eqout(runout("let a = [\"hi\", \"yo\", \"hey\"]; print a[0]; print a[2];"),          "hi\nhey\n", "array of strings, indexed print");
+eqout(runout("let a = [1, 2, 3]; print a[0]; print a[2];"),                             "1\n3\n", "array of numbers still prints as numbers");
+eqout(runout("let m = map{ tag: \"ok\" }; print m[\"tag\"];"),                             "ok\n", "map string value via index");
+eqout(runout("let a = [\"x\"]; let i = 0; while i < len(a) { print a[i]; i = i + 1; }"),    "x\n", "iterate string array");
+// ── container function PARAMETERS and RETURNS (interprocedural type inference) ──
+eq(runsrc("fn sum(a) { let s = 0; let i = 0; while i < len(a) { s = s + a[i]; i = i + 1; } return s; } fn main() { return sum([10, 20, 30]); }"), 60, "array parameter (sum)");
+eq(runsrc("fn first(a) { return a[0]; } fn main() { return first([7, 8, 9]); }"),         7, "array param, index inside");
+eq(runsrc("fn get(m, k) { return m[k]; } fn main() { let m = map{ a: 5, b: 6 }; return get(m, \"b\"); }"), 6, "map parameter (get)");
+eq(runsrc("fn make() { return [1, 2, 3]; } fn main() { let a = make(); return a[1] + len(a); }"), 5, "array-returning fn");
+eq(runsrc("fn build() { let m = map{ x: 40 }; m.y = 2; return m; } fn main() { let m = build(); return m.x + m.y; }"), 42, "map-returning fn");
+eqout(runout("fn greet(names) { let i = 0; while i < len(names) { print names[i]; i = i + 1; } } greet([\"al\", \"bo\"]);"), "al\nbo\n", "string-array param, elements printed (dynamic dispatch)");
+// ── string builtins: strfromcharcode, str_slice ──
+eqout(runout("print strfromcharcode(98);"),                                              "b\n", "strfromcharcode(98) → 'b'");
+eqout(runout("print strfromcharcode(65) + strfromcharcode(66);"),                       "AB\n", "strfromcharcode concat");
+eqout(runout("print str_slice(\"hello\", 1, 4);"),                                     "ell\n", "str_slice mid");
+eqout(runout("print str_slice(\"hello\", 0, 2);"),                                      "he\n", "str_slice prefix");
+eqout(runout("print str_slice(\"hello\", 2, 5);"),                                     "llo\n", "str_slice suffix");
+eq(runsrc("fn main() { return len(str_slice(\"abcdef\", 1, 4)); }"),                        3, "str_slice length");
+// build a string char-by-char (Caesar-ish: shift each letter code +1)
+eqout(runout("let s = \"abc\"; let out = \"\"; let i = 0; while i < len(s) { out = out + strfromcharcode(strcharcodeat(s, i) + 1); i = i + 1; } print out;"), "bcd\n", "rebuild string via charcode +1");
+// uppercase first letter using slice + charcode
+eqout(runout("let s = \"hello\"; print strfromcharcode(strcharcodeat(s, 0) - 32) + str_slice(s, 1, len(s));"), "Hello\n", "capitalize via slice + charcode");
+eqout(runout("fn shift(s, n) { let out = \"\"; let i = 0; while i < len(s) { out = out + strfromcharcode(strcharcodeat(s, i) + n); i = i + 1; } return out; } let enc = shift(\"hello world\", 3); print \"encrypted: \" + enc; print \"decrypted: \" + shift(enc, 0 - 3);"), "encrypted: khoor#zruog\ndecrypted: hello world\n", "caesar.elf (shipped): cipher via charcode/fromcode");
+
+// ── str_split: string → array of heap strings (single-char separator) ──
+eq(runsrc("fn main() { let p = str_split(\"a,bb,ccc\", \",\"); return len(p); }"),            3, "str_split count");
+eq(runsrc("fn main() { let p = str_split(\"a,bb,ccc\", \",\"); return len(p[1]); }"),         2, "str_split element length (strarr typing)");
+eqout(runout("let p = str_split(\"a,bb,ccc\", \",\"); print p[0]; print p[1]; print p[2];"), "a\nbb\nccc\n", "str_split elements printed");
+eqout(runout("let p = str_split(\"red;green;blue\", \";\"); let i = 0; while i < len(p) { print \"got \" + p[i]; i = i + 1; }"), "got red\ngot green\ngot blue\n", "str_split element in concat (strarr typing)");
+eq(runsrc("fn main() { let p = str_split(\"a,,b\", \",\"); if p[1] == \"\" { return len(p); } return 0; }"), 3, "empty token kept (a,,b)");
+eq(runsrc("fn main() { let p = str_split(\"\", \",\"); return len(p); }"),                    1, "empty string → one empty token");
+eq(runsrc("fn main() { let p = str_split(\"x,\", \",\"); return len(p); }"),                  2, "trailing separator → empty last token");
+eqout(runout("let p = str_split(\"one two three\", \" \"); print p[2] + \"-\" + p[0];"),   "three-one\n", "split on space, reordered concat");
+
+eqout(runout("let csv = str_split(\"ada,grace,alan,linus\", \",\"); let i = 0; while i < len(csv) { print \"name \" + str(i) + \": \" + csv[i]; i = i + 1; } let w = str_split(\"pblang runs on every device\", \" \"); print \"words: \" + str(len(w)); print w[len(w) - 1] + \" \" + w[1];"), "name 0: ada\nname 1: grace\nname 2: alan\nname 3: linus\nwords: 5\ndevice runs\n", "words.elf (shipped): csv + sentence split");
+
+// ── >8 arguments: AAPCS64 stack-passed args (x0-x7 + [sp,#0..]) ──
+eq(runsrc("fn f9(a,b,c,d,e,f,g,h,i) { return a+b+c+d+e+f+g+h+i; } fn main() { return f9(1,2,3,4,5,6,7,8,9); }"), 45, "9 args: sum");
+eq(runsrc("fn f9(a,b,c,d,e,f,g,h,i) { return i; } fn main() { return f9(1,2,3,4,5,6,7,8,9); }"),                   9, "9 args: 9th (stack) arg alone");
+eq(runsrc("fn f10(a,b,c,d,e,f,g,h,i,j) { return i * 10 + j; } fn main() { return f10(0,0,0,0,0,0,0,0,4,7); }"),  47, "10 args: order of the two stack args");
+eq(runsrc("fn f12(a,b,c,d,e,f,g,h,i,j,k,l) { return a + h + i + l; } fn main() { return f12(1,0,0,0,0,0,0,2,3,0,0,4); }"), 10, "12 args: reg edge (h) + stack edges (i, l)");
+eq(runsrc("fn f9(a,b,c,d,e,f,g,h,i) { return h - i; } fn f2(x, y) { return x * y; } fn main() { return f9(1,1,1,1,1,1,1,f2(4,5),f2(2,3)); }"), 14, "nested calls as reg + stack args");
+eq(runsrc("fn f9(a,b,c,d,e,f,g,h,i) { if a == 0 { return i; } return f9(a - 1, b, c, d, e, f, g, h, i + 1); } fn main() { return f9(3,0,0,0,0,0,0,0,10); }"), 13, "recursion with 9 args (stack arg threaded)");
+
+print "codegen_arm64_ast: real pblang source (fn/if/while/and-or/elif/bitwise/print/calls/recursion) → ARM64, executed correctly";

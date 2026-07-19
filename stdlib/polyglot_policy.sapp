@@ -5,7 +5,8 @@
 // and delegates to a runner YOU pass in (e.g. polyglot.run or a container runner), so the
 // dangerous modes are always explicit and caller-controlled.
 //
-//   secure       (default) scan; run ONLY if safe, else block. Malicious-code-proof.
+//   secure       (default) scan; run ONLY if safe, else block. Defense in depth;
+//                the scanner is not a substitute for process isolation.
 //   sandbox      scan; run EVERYTHING, but through a caller-supplied isolated runner
 //                (no network / scratch FS — the isolation is the runner's job).
 //   audit        run EVERYTHING, attach the findings so the risk is logged, not hidden.
@@ -18,50 +19,103 @@
 //   X.execute(X.new("unrestricted", POLY.run), l, c);                     // run anything
 
 let PG = import("stdlib:polyglot_guard.sapp");
+let _REPORT_CFG = nil;
 
 fn modes() { return ["secure", "sandbox", "audit", "unrestricted", "report"]; }
 fn is_mode(m) {
-    let all = modes();
+    return m == "secure" or m == "sandbox" or m == "audit"
+        or m == "unrestricted" or m == "report";
+}
+
+fn _callable(v) {
+    let t = type(v);
+    return t == "closure" or t == "function" or t == "builtin";
+}
+
+fn _limit(options, key, fallback, hard_max) {
+    let n = fallback;
+    if options != nil and map_has(options, key) { n = options[key]; }
+    if not is_number(n) or n != num_floor(n) or n < 1 or n > hard_max {
+        throw "polyglot_policy: " + key + " must be an integer in 1.." + str(hard_max);
+    }
+    return n;
+}
+
+fn _language_allowed(cfg, lang) {
+    if cfg.allowed_languages == nil { return true; }
+    let wanted = str_lower(str_trim(str(lang)));
     let i = 0;
-    while i < len(all) { if all[i] == m { return true; } i = i + 1; }
+    while i < len(cfg.allowed_languages) {
+        if str_lower(str_trim(str(cfg.allowed_languages[i]))) == wanted { return true; }
+        i = i + 1;
+    }
     return false;
 }
 
-// new(mode, runner) — a policy config. runner(lang, code) does the actual execution.
-fn new(mode, runner) {
+// new(mode, runner, options) — runner(lang, code) does the actual execution.
+// max_code_bytes is enforced even in unrestricted mode; allowed_languages is
+// an optional exact allowlist. These resource/capability limits cannot be
+// disabled by choosing a less restrictive scan mode.
+fn new(mode, runner, options = nil) {
     if not is_mode(mode) { throw "polyglot_policy: unknown mode '" + str(mode) + "'"; }
-    return map{ mode: mode, runner: runner, sandbox: nil };
+    if options != nil and not is_map(options) { throw "polyglot_policy: options must be a map"; }
+    if mode != "report" and not _callable(runner) { throw "polyglot_policy: execution mode requires a callable runner"; }
+    let allowed = nil;
+    if options != nil and map_has(options, "allowed_languages") {
+        allowed = options.allowed_languages;
+        if type(allowed) != "array" { throw "polyglot_policy: allowed_languages must be an array"; }
+    }
+    return map{
+        format: "pblang.polyglot.policy.v2", mode: mode, runner: runner,
+        sandbox: nil, allowed_languages: allowed,
+        max_code_bytes: _limit(options, "max_code_bytes", 1048576, 16777216),
+    };
 }
-fn with_sandbox(cfg, sandbox_runner) { cfg.sandbox = sandbox_runner; return cfg; }
+fn with_sandbox(cfg, sandbox_runner) {
+    if not _callable(sandbox_runner) { throw "polyglot_policy: sandbox runner must be callable"; }
+    cfg.sandbox = sandbox_runner;
+    return cfg;
+}
 
-fn _result(mode, ran, blocked, safe, findings, result, sandboxed) {
+fn _result(mode, ran, blocked, safe, findings, result, sandboxed, reason) {
     return map{ mode: mode, ran: ran, blocked: blocked, safe: safe,
-        findings: findings, result: result, sandboxed: sandboxed };
+        findings: findings, result: result, sandboxed: sandboxed, reason: reason };
 }
 
 // execute(cfg, lang, code) -> result map {mode, ran, blocked, safe, findings, result, sandboxed}.
 fn execute(cfg, lang, code) {
+    if cfg == nil or not is_map(cfg) or (try cfg.format catch "") != "pblang.polyglot.policy.v2" {
+        throw "polyglot_policy: invalid policy config";
+    }
     let mode = cfg.mode;
+    if not is_mode(mode) { throw "polyglot_policy: invalid config mode"; }
+    let source = if code == nil { "" } else { str(code) };
+    if len(source) > cfg.max_code_bytes {
+        return _result(mode, false, true, false, [], nil, false, "code_limit_exceeded");
+    }
+    if not _language_allowed(cfg, lang) {
+        return _result(mode, false, true, false, [], nil, false, "language_not_allowed");
+    }
     // unrestricted: run with no scan at all.
     if mode == "unrestricted" {
-        return _result(mode, true, false, nil, [], cfg.runner(lang, code), false);
+        return _result(mode, true, false, nil, [], cfg.runner(lang, source), false, "unrestricted_explicit");
     }
-    let scan = PG.scan(code, lang);
+    let scan = PG.scan(source, lang);
     if mode == "report" {
-        return _result(mode, false, false, scan.safe, scan.findings, nil, false);
+        return _result(mode, false, false, scan.safe, scan.findings, nil, false, "report_only");
     }
     if mode == "secure" {
         if not scan.safe {
-            return _result(mode, false, true, false, scan.findings, nil, false);
+            return _result(mode, false, true, false, scan.findings, nil, false, "blocked_by_scan");
         }
-        return _result(mode, true, false, true, scan.findings, cfg.runner(lang, code), false);
+        return _result(mode, true, false, true, scan.findings, cfg.runner(lang, source), false, "safe_scan");
     }
     if mode == "audit" {
-        return _result(mode, true, false, scan.safe, scan.findings, cfg.runner(lang, code), false);
+        return _result(mode, true, false, scan.safe, scan.findings, cfg.runner(lang, source), false, "audit_explicit");
     }
     if mode == "sandbox" {
         if cfg.sandbox == nil { throw "polyglot_policy: sandbox mode requires with_sandbox(runner)"; }
-        return _result(mode, true, false, scan.safe, scan.findings, cfg.sandbox(lang, code), true);
+        return _result(mode, true, false, scan.safe, scan.findings, cfg.sandbox(lang, source), true, "sandbox_explicit");
     }
     throw "polyglot_policy: unhandled mode '" + str(mode) + "'";
 }
@@ -70,6 +124,9 @@ fn execute(cfg, lang, code) {
 fn secure(runner, lang, code) { return execute(new("secure", runner), lang, code); }
 fn unrestricted(runner, lang, code) { return execute(new("unrestricted", runner), lang, code); }
 fn audit(runner, lang, code) { return execute(new("audit", runner), lang, code); }
-fn report(lang, code) { return execute(new("report", nil), lang, code); }
+fn report(lang, code) {
+    if _REPORT_CFG == nil { _REPORT_CFG = new("report", nil); }
+    return execute(_REPORT_CFG, lang, code);
+}
 
 export modes, is_mode, new, with_sandbox, execute, secure, unrestricted, audit, report;

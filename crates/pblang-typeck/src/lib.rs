@@ -722,6 +722,7 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("gfxclear", fn1(nil.clone())),
         ("gfxdrawline", fn1(nil.clone())),
         ("gfxdrawrect", fn1(nil.clone())),
+        ("gfxdrawrects", fn1(nil.clone())),
         ("gfxdrawpoint", fn1(nil.clone())),
         ("gfxpresent", fn1(nil.clone())),
         ("gfxpollevents", fn1(any.clone())),

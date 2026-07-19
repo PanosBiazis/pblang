@@ -1,0 +1,88 @@
+let Small = import("stdlib:codegen_x64.sapp");
+let Full = import("stdlib/native/codegen_x64.sapp");
+
+fn fail(m) { throw "FAIL codegen-x64-hardening: " + m; }
+fn has_bytes(haystack, needle) {
+    let i = 0;
+    while i + len(needle) <= len(haystack) {
+        let ok = true; let j = 0;
+        while j < len(needle) { if haystack[i + j] != needle[j] { ok = false; } j = j + 1; }
+        if ok { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+let rx = Small.compile_program([["seti", 0, 7]]);
+if rx[68] != 5 { fail("ordinary program segment is not RX"); }
+
+// Value-return programs write their result buffer, so the compatibility builder
+// intentionally remains writable. This explicit boundary prevents accidental W^X drift.
+let mutable = Small.build_value([["seti", 0, 7]]);
+if mutable[68] != 7 { fail("mutable result buffer lost its writable mapping"); }
+
+let default_heap = Full.heap_reserve_bytes();
+let compact_heap = Full.set_heap_reserve(16 * 1024 * 1024 + 1);
+if compact_heap != 16 * 1024 * 1024 + 4096 { fail("heap reserve is not rounded to a page"); }
+let certified = Full.compile_safe("return 7;");
+Full.set_heap_reserve(default_heap);
+if not certified.safe { fail("compile_safe did not certify valid source"); }
+if certified.heap_reserve_bytes != compact_heap { fail("safety metadata omitted selected heap reserve"); }
+let mmap_guard = [15, 5, 72, 133, 192, 121, 2, 15, 11, 73, 137, 199];
+if not has_bytes(certified.binary, mmap_guard) { fail("native arena mmap failure guard missing"); }
+let guarantees = str_join(certified.guarantees, "\n");
+if not str_contains(guarantees, "1024 slots") or not str_contains(guarantees, "mmap failure") { fail("safety guarantees are stale"); }
+
+let bad_heap = try Full.set_heap_reserve(4096) catch nil;
+if bad_heap != nil { fail("unsafe tiny heap reserve was accepted"); }
+
+// The exact side-effect-free additive recurrence lowers to a frame-free linear
+// register loop. Its base case stays compact and the loop uses adjacent values
+// in rax/rcx with no recursive calls, spills, or heap traffic.
+let fib = Full.compile_fns("fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } return fib(10);");
+let compact_fib_guard = [72, 131, 255, 2, 125, 4, 72, 137, 248, 195];
+if not has_bytes(fib, compact_fib_guard) { fail("recursive guard did not use compact direct-register encoding"); }
+let old_fib_guard = [72, 137, 248, 72, 61, 2, 0, 0, 0, 15, 141];
+if has_bytes(fib, old_fib_guard) { fail("recursive guard retained move/imm32/rel32 overhead"); }
+let linear_loop = [49, 192, 185, 1, 0, 0, 0, 72, 1, 193, 72, 145, 72, 255, 207, 117, 246, 195];
+if not has_bytes(fib, linear_loop) { fail("proven additive recurrence did not lower to the linear register loop"); }
+if len(fib) > 425 { fail("proven-return function retained an unreachable compatibility epilogue"); }
+
+let swapped_fib = Full.compile_fns("fn fib(n) { if n < 2 { return n; } return fib(n - 2) + fib(n - 1); } return fib(10);");
+if not has_bytes(swapped_fib, linear_loop) { fail("swapped additive recurrence was not recognized"); }
+
+// A semantically equivalent but non-canonical argument shape must fail closed
+// to the existing TRMA/general path. Checked overflow must also preserve the
+// recursive evaluation tree so first-trap ordering cannot change.
+let near_match = Full.compile_fns("fn fib(n) { if n < 2 { return n; } return fib((n - 1) + 0) + fib(n - 2); } return fib(10);");
+if has_bytes(near_match, linear_loop) { fail("near-match recurrence was transformed speculatively"); }
+Full.set_overflow_check(true);
+let checked_fib = Full.compile_fns("fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } return fib(10);");
+Full.set_overflow_check(false);
+if has_bytes(checked_fib, linear_loop) { fail("checked-overflow recurrence changed trap ordering"); }
+
+// Framed source functions and outgoing stack arguments select signed-imm8
+// stack adjustments when possible. Ten arguments require a 32-byte outgoing
+// area and release 112 bytes (outgoing area + staged temporaries).
+let framed = Full.compile_fns("fn f10(a,b,c,d,e,f,g,h,i,j) { let x = a + b; if x > 0 { x = x + j; } return x + g + h + i; } return f10(1,2,3,4,5,6,7,8,9,10);");
+if not has_bytes(framed, [72, 131, 236, 32]) { fail("stack-argument staging did not use sub rsp,imm8"); }
+if not has_bytes(framed, [72, 131, 196, 112]) { fail("stack-argument release did not use add rsp,imm8"); }
+if not has_bytes(framed, [85, 72, 137, 229, 72, 131, 236]) { fail("small framed function did not use compact stack allocation"); }
+
+// Shared-IR call units obey the same encoding contract. Entry has no locals,
+// so it must omit sub rsp,0; the small function uses imm8 and leave;ret. A
+// larger frame remains on the imm32 form to avoid signed-imm8 truncation.
+let small_ir = Small.compile_call_unit([
+    map{ name: "small", nparams: 1, nlocals: 8, body: [["lget", 0], ["ret"]] }
+], map{ nlocals: 0, body: [["seti", 0, 7], ["call", "small"]] });
+if has_bytes(small_ir, [72, 129, 236, 0, 0, 0, 0]) { fail("zero-sized IR frame retained sub rsp,0"); }
+if not has_bytes(small_ir, [72, 131, 236, 64]) { fail("small IR frame did not use sub rsp,imm8"); }
+if not has_bytes(small_ir, [201, 195]) { fail("IR epilogue did not use leave;ret"); }
+if has_bytes(small_ir, [72, 137, 236, 93, 195]) { fail("IR epilogue retained expanded teardown"); }
+
+let large_ir = Small.compile_call_unit([
+    map{ name: "large", nparams: 1, nlocals: 32, body: [["lget", 0], ["ret"]] }
+], map{ nlocals: 0, body: [["seti", 0, 7], ["call", "large"]] });
+if not has_bytes(large_ir, [72, 129, 236, 0, 1, 0, 0]) { fail("large IR frame lost imm32 stack allocation"); }
+
+print "codegen_x64_hardening_pass";

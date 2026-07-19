@@ -1,0 +1,93 @@
+// Measures project-level cold import amortization: N independent compiler
+// processes versus one PBLang compile session that emits N verified ELFs.
+let BENCH = import("stdlib/benchmark.sapp");
+let CACHE = import("stdlib/native/artifact_cache.sapp");
+let UUID = import("stdlib/uuid.sapp");
+
+let PBLANG = "./target/release/pblang";
+let JOBS = 6;
+let REPS = 9;
+let root = "/tmp/pblang_x64_batch_" + UUID.v4();
+let request_path = root + "_request.json";
+let request_jobs = [];
+let sources = [];
+let outputs = [];
+let i = 0;
+while i < JOBS {
+    let source_path = root + "_source_" + str(i) + ".sapp";
+    let output_path = root + "_output_" + str(i) + ".elf";
+    let source = "let s = " + str(i) + "; let n = 0; while n < " + str(1000 + i)
+        + " { s = (s + n * 17 + 3) % 1000003; n = n + 1; } print s;";
+    fs_write(source_path, source);
+    array_push(sources, source_path); array_push(outputs, output_path);
+    array_push(request_jobs, map{ source_path: source_path, output: output_path });
+    i = i + 1;
+}
+
+fn verify_outputs() {
+    let j = 0;
+    while j < len(outputs) {
+        let bytes = try fs_read_bytes(outputs[j]) catch nil;
+        if not CACHE.valid_x64_elf(bytes) { throw "x64 batch benchmark: invalid output " + str(j); }
+        j = j + 1;
+    }
+}
+
+fn emit_stats(name, samples) {
+    let stats = BENCH.stats(name, samples);
+    print "X64_BATCH|" + name + "|" + str(stats.median_ms) + "|" + str(stats.p95_ms)
+        + "|" + str(stats.median_ms / JOBS) + "|" + str(samples);
+    return stats;
+}
+
+let independent_samples = [];
+i = 0;
+while i < REPS {
+    let t0 = now_ms();
+    let j = 0;
+    while j < JOBS {
+        let child = proc_spawn_wait(PBLANG, ["run", "bench/drivers/repro_codegen_x64.sapp", "--allow-all", "--", sources[j], outputs[j]]);
+        if child.exit_code != 0 { throw "x64 batch benchmark independent compile failed: " + child.stderr; }
+        j = j + 1;
+    }
+    array_push(independent_samples, now_ms() - t0);
+    verify_outputs(); i = i + 1;
+}
+
+fn batch_samples(name, cache_root, warm) {
+    fs_write(request_path, json_stringify(map{ jobs: request_jobs, cache_root: cache_root, cache: true }));
+    if warm {
+        let prime = proc_spawn_wait(PBLANG, ["run", "bench/drivers/repro_codegen_x64_batch.sapp", "--allow-all", "--", request_path]);
+        if prime.exit_code != 0 { throw "x64 batch benchmark prime failed: " + prime.stderr; }
+    }
+    let samples = []; let k = 0;
+    while k < REPS {
+        let one_root = if warm { cache_root } else { cache_root + "_" + str(k) };
+        fs_write(request_path, json_stringify(map{ jobs: request_jobs, cache_root: one_root, cache: true }));
+        let t0 = now_ms();
+        let child = proc_spawn_wait(PBLANG, ["run", "bench/drivers/repro_codegen_x64_batch.sapp", "--allow-all", "--", request_path]);
+        let elapsed = now_ms() - t0;
+        if child.exit_code != 0 { throw "x64 batch benchmark session failed: " + child.stderr; }
+        let result = try json_parse(str_trim(child.stdout)) catch nil;
+        if type(result) != "map" or result.jobs != JOBS { throw "x64 batch benchmark invalid result"; }
+        if warm and (result.hits != JOBS or result.compiled != 0) { throw "x64 batch benchmark warm cache mismatch"; }
+        if not warm and (result.misses != JOBS or result.compiled != JOBS) { throw "x64 batch benchmark cold cache mismatch"; }
+        array_push(samples, elapsed); verify_outputs();
+        if not warm { try proc_spawn_wait("rm", ["-rf", "--", one_root]) catch nil; }
+        k = k + 1;
+    }
+    return emit_stats(name, samples);
+}
+
+print "X64_BATCH_SCHEMA|mode|median_total_ms|p95_total_ms|median_per_artifact_ms|samples_ms";
+let independent = emit_stats("independent_processes", independent_samples);
+let cold = batch_samples("one_process_cold_artifacts", root + "_cold_cache", false);
+let warm = batch_samples("one_process_warm_artifacts", root + "_warm_cache", true);
+print "X64_BATCH_SPEEDUP|cold_vs_independent|" + str(independent.median_ms / cold.median_ms);
+print "X64_BATCH_SPEEDUP|warm_vs_independent|" + str(independent.median_ms / warm.median_ms);
+
+i = 0;
+while i < JOBS { try fs_remove(sources[i]) catch nil; try fs_remove(outputs[i]) catch nil; i = i + 1; }
+try fs_remove(request_path) catch nil;
+try proc_spawn_wait("rm", ["-rf", "--", root + "_warm_cache"]) catch nil;
+print "X64_BATCH_SUITE|ok";

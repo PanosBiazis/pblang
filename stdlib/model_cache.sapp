@@ -1,0 +1,129 @@
+// stdlib/model_cache.sapp - bounded, validated, crash-safe JSON model caches.
+
+let OS = import("stdlib:os.sapp");
+
+let _MAX_MODEL_BYTES = 4194304;
+let _MAX_WEIGHT_ABS = 1000000;
+
+fn _safe_name(name) {
+    if type(name) != "string" or len(name) == 0 or len(name) > 160 { return false; }
+    if str_contains(name, "..") or str_contains(name, "/") or str_contains(name, "\\") { return false; }
+    return true;
+}
+
+// path(name, env_name) - return an override or a versioned per-user cache path.
+fn path(name, env_name = "PBLANG_MODEL_CACHE") {
+    let override = OS.getenv(env_name, "");
+    if type(override) == "string" and override != "" { return override; }
+    if not _safe_name(name) { return error("model_cache.path: unsafe cache name"); }
+
+    let home = OS.home_dir();
+    if type(home) == "string" and home != "" {
+        return path_join(home, ".pblang", "cache", name);
+    }
+    return path_join(OS.temp_dir(), "pblang-cache", name);
+}
+
+fn _safe_number(value) {
+    if type(value) != "number" or value != value { return false; }
+    return value >= 0 - _MAX_WEIGHT_ABS and value <= _MAX_WEIGHT_ABS;
+}
+
+fn _valid_layer(layer, n_in, n_out) {
+    if type(layer) != "map" { return false; }
+    if (try layer.n_in catch nil) != n_in or (try layer.n_out catch nil) != n_out { return false; }
+    let weights = try layer.w catch nil;
+    let biases = try layer.b catch nil;
+    if type(weights) != "array" or len(weights) != n_out { return false; }
+    if type(biases) != "array" or len(biases) != n_out { return false; }
+
+    let row = 0;
+    while row < n_out {
+        if type(weights[row]) != "array" or len(weights[row]) != n_in { return false; }
+        let col = 0;
+        while col < n_in {
+            if not _safe_number(weights[row][col]) { return false; }
+            col = col + 1;
+        }
+        if not _safe_number(biases[row]) { return false; }
+        row = row + 1;
+    }
+    return true;
+}
+
+// valid_mlp(model, ...) - reject malformed, stale, oversized-dimension models.
+fn valid_mlp(model, n_in, n_hidden, n_out, version) {
+    if type(model) != "map" { return false; }
+    if (try model.pbai_version catch nil) != version { return false; }
+    return _valid_layer(try model.l1 catch nil, n_in, n_hidden)
+        and _valid_layer(try model.l2 catch nil, n_hidden, n_out);
+}
+
+// load_mlp(...) - bounded parse plus structural validation. Invalid data is a miss.
+fn load_mlp(filename, n_in, n_hidden, n_out, version) {
+    let payload = try fs_read(filename) catch nil;
+    if type(payload) != "string" or len(payload) == 0 or len(payload) > _MAX_MODEL_BYTES { return nil; }
+    let model = try json_parse(payload) catch nil;
+    if not valid_mlp(model, n_in, n_hidden, n_out, version) { return nil; }
+    return model;
+}
+
+fn _nonce() {
+    let bytes = random_bytes(12);
+    let hex = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while i < len(bytes) {
+        let b = bytes[i];
+        out = out + hex[num_floor(b / 16)] + hex[b % 16];
+        i = i + 1;
+    }
+    return out;
+}
+
+// store_json(path, value) - publish a complete file or preserve the old one.
+fn store_json(filename, value) {
+    let payload = try json_stringify(value) catch nil;
+    if type(payload) != "string" or len(payload) == 0 or len(payload) > _MAX_MODEL_BYTES {
+        return map{ ok: false, error: "model cache payload is invalid or too large" };
+    }
+
+    let parent = path_dirname(filename);
+    let made = try { fs_mkdirs(parent); true } catch false;
+    if not made { return map{ ok: false, error: "model cache directory creation failed" }; }
+
+    let staged = filename + ".tmp-" + _nonce();
+    let backup = filename + ".bak";
+    let wrote = try { fs_write(staged, payload); true } catch false;
+    if not wrote { return map{ ok: false, error: "model cache stage write failed" }; }
+    let verified = try fs_read(staged) == payload catch false;
+    if not verified {
+        try fs_remove(staged) catch nil;
+        return map{ ok: false, error: "model cache stage verification failed" };
+    }
+
+    // POSIX replaces atomically. This also handles concurrent trainers safely.
+    let published = try { fs_rename(staged, filename); true } catch false;
+    if published { return map{ ok: true, mode: "atomic-rename" }; }
+
+    // Windows may reject replacing an existing file. Preserve it until publish succeeds.
+    try fs_remove(backup) catch nil;
+    let moved_old = false;
+    if try fs_exists(filename) catch false {
+        moved_old = try { fs_rename(filename, backup); true } catch false;
+        if not moved_old {
+            try fs_remove(staged) catch nil;
+            return map{ ok: false, error: "model cache backup publish failed" };
+        }
+    }
+    let replaced = try { fs_rename(staged, filename); true } catch false;
+    if not replaced {
+        if moved_old { try fs_rename(backup, filename) catch nil; }
+        try fs_remove(staged) catch nil;
+        return map{ ok: false, error: "model cache publish failed" };
+    }
+    if moved_old { try fs_remove(backup) catch nil; }
+    return map{ ok: true, mode: "backup-replace" };
+}
+
+export path, valid_mlp, load_mlp, store_json;

@@ -1,9 +1,9 @@
 //! Intermediate representation shared between the pblang compiler, VM, and
 //! out-of-process consumers (FFI, AOT, JIT).
 //!
-//! This crate is the **interface boundary** between the front end (parser
-//! + typecker, in `pblang-core`) and the runtime (`pblang-vm`, plus the
-//! optional `pblang-cranelift` JIT/AOT and the `pblang-ffi` embedding C ABI).
+//! This crate is the **interface boundary** between the front end (parser and
+//! typechecker, in `pblang-core`) and the runtime (`pblang-vm`, plus the optional
+//! `pblang-cranelift` JIT/AOT and the `pblang-ffi` embedding C ABI).
 //! Anything that crosses that boundary lives here.
 //!
 //! # Type hierarchy
@@ -36,10 +36,18 @@
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{Signed, ToPrimitive, Zero};
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+
+/// Storage for a module's global namespace and its exports. Uses FxHash (rustc-hash) instead of the
+/// std default SipHash: global names are short (`"i"`, `"h"`, `"print"`) and read on every `OpGetGlobal`,
+/// which is the interpreter's hottest op in loops that touch top-level variables. FxHash has no random
+/// seed and a far cheaper mix, so short-key lookups get materially faster with no API change (it is a
+/// `HashMap` with a different hasher — get/insert/contains_key/iter all identical).
+pub type GlobalMap = FxHashMap<String, Value>;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A binary arithmetic operation, used by [`Value::arith`] to share one
@@ -933,9 +941,9 @@ pub enum Upvalue {
 /// publishing the `exports` map to the caller.
 #[derive(Debug, Default)]
 pub struct Module {
-    pub globals: HashMap<String, Value>,
+    pub globals: GlobalMap,
     pub parent: Option<Rc<RefCell<Module>>>,
-    pub exports: HashMap<String, Value>,
+    pub exports: GlobalMap,
 }
 
 impl PartialEq for Value {

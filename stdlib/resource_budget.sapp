@@ -1,0 +1,449 @@
+// stdlib/resource_budget.sapp -- bounded resource admission and backpressure.
+//
+// Pure policy module: it never sleeps, allocates requested memory, touches storage,
+// starts workers, or probes devices. Products supply usage and receive deterministic
+// admission, remaining-capacity, pressure, and adaptive-action records.
+
+let RESOURCES = import("stdlib:resources.sapp");
+
+let METRICS = [
+    "elapsed_ms", "memory_bytes", "storage_bytes", "network_bytes", "output_bytes",
+    "items", "workers", "allocations", "locations", "frames", "frame_ms",
+    "tokens", "restarts"
+];
+let MAX_QUANTITY = 9000000000000000;
+let METRIC_SET = map{};
+let _metric_index = 0;
+while _metric_index < len(METRICS) {
+    METRIC_SET[METRICS[_metric_index]] = true;
+    _metric_index = _metric_index + 1;
+}
+
+fn metrics() {
+    let out = [];
+    let i = 0;
+    while i < len(METRICS) { array_push(out, METRICS[i]); i = i + 1; }
+    return out;
+}
+
+fn _known_metric(key) {
+    return map_has(METRIC_SET, str(key));
+}
+
+fn _unknown_keys(raw) {
+    if raw == nil { return []; }
+    let keys = try map_keys(raw) catch [];
+    let out = [];
+    let i = 0;
+    while i < len(keys) {
+        if not _known_metric(str(keys[i])) { array_push(out, str(keys[i])); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _number(value, fallback = 0) {
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or text == "+nan" or text == "-nan" or
+       text == "inf" or text == "+inf" or text == "-inf" or
+       text == "infinity" or text == "+infinity" or text == "-infinity" {
+        return fallback;
+    }
+    let n = try parse_number(str(value)) catch fallback;
+    if n == nil { n = fallback; }
+    if n < 0 { n = 0; }
+    if n > MAX_QUANTITY { n = MAX_QUANTITY; }
+    return n;
+}
+
+fn _add_quantity(a, b) {
+    a = _number(a, 0);
+    b = _number(b, 0);
+    if b > MAX_QUANTITY - a {
+        return map{ ok: false, value: MAX_QUANTITY };
+    }
+    return map{ ok: true, value: a + b };
+}
+
+fn _values(raw) {
+    if raw == nil { raw = map{}; }
+    let out = map{};
+    let i = 0;
+    while i < len(METRICS) {
+        let key = METRICS[i];
+        let value = try raw[key] catch nil;
+        if value != nil { out[key] = _number(value, 0); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn budget(name, limits, options = nil) {
+    if options == nil { options = map{}; }
+    let safe_name = str(name ?? "resource-budget");
+    if len(safe_name) > 96 { safe_name = str_slice(safe_name, 0, 96); }
+    if str_trim(safe_name) == "" { safe_name = "resource-budget"; }
+    return map{
+        format: "pblang.resource_budget.v1",
+        name: safe_name,
+        limits: _values(limits),
+        unknown_metrics: _unknown_keys(limits),
+        mode: str(try options.mode catch "hard"),
+        scope: str(try options.scope catch "operation"),
+        policy: "known non-negative metrics only; hard limits reject reservations; no side effects"
+    };
+}
+
+fn profile(kind) {
+    let k = str_lower(str(kind ?? "interactive"));
+    if k == "micro" {
+        return budget("micro", map{ elapsed_ms: 5000, memory_bytes: 65536, storage_bytes: 262144, output_bytes: 16384, items: 1024, workers: 1, tokens: 2048, restarts: 1 }, map{ scope: "small-device" });
+    }
+    if k == "untrusted" {
+        return budget("untrusted", map{ elapsed_ms: 10000, memory_bytes: 67108864, storage_bytes: 16777216, network_bytes: 0, output_bytes: 1048576, items: 10000, workers: 2, allocations: 1000000, tokens: 32768, restarts: 0 }, map{ scope: "sandbox" });
+    }
+    if k == "batch" {
+        return budget("batch", map{ elapsed_ms: 3600000, memory_bytes: 4294967296, storage_bytes: 8589934592, network_bytes: 1073741824, output_bytes: 67108864, items: 1000000, workers: 64, allocations: 100000000, tokens: 16777216, restarts: 2 }, map{ scope: "batch-job" });
+    }
+    if k == "server" {
+        return budget("server", map{ elapsed_ms: 86400000, memory_bytes: 2147483648, storage_bytes: 17179869184, network_bytes: 8589934592, output_bytes: 16777216, items: 10000000, workers: 32, allocations: 100000000, tokens: 1048576, restarts: 8 }, map{ scope: "service" });
+    }
+    return budget("interactive", map{ elapsed_ms: 120000, memory_bytes: 536870912, storage_bytes: 1073741824, network_bytes: 268435456, output_bytes: 4194304, items: 100000, workers: 8, allocations: 10000000, frames: 216000, frame_ms: 33, tokens: 262144, restarts: 2 }, map{ scope: "interactive" });
+}
+
+fn usage(values) {
+    return map{ format: "pblang.resource_usage.v1", values: _values(values), unknown_metrics: _unknown_keys(values) };
+}
+
+fn evaluate(resource_budget, resource_usage) {
+    let b = try resource_budget catch budget("invalid", map{});
+    let u = try resource_usage catch usage(map{});
+    let limits = _values(try b.limits catch map{});
+    let values = _values(try u.values catch u);
+    let remaining = map{};
+    let percentages = map{};
+    let violations = [];
+    let max_percent = 0;
+    let checked = 0;
+    let unknown_limits = try b.unknown_metrics catch [];
+    let unknown_usage = try u.unknown_metrics catch [];
+    let ui = 0;
+    while ui < len(unknown_limits) {
+        array_push(violations, map{ metric: "unknown-limit:" + str(unknown_limits[ui]), used: 0, limit: 0, excess: 0 });
+        ui = ui + 1;
+    }
+    let uj = 0;
+    while uj < len(unknown_usage) {
+        array_push(violations, map{ metric: "unknown-usage:" + str(unknown_usage[uj]), used: 0, limit: 0, excess: 0 });
+        uj = uj + 1;
+    }
+    if len(violations) > 0 { max_percent = 101; }
+    let i = 0;
+    while i < len(METRICS) {
+        let key = METRICS[i];
+        let limit = try limits[key] catch nil;
+        if limit != nil {
+            let used = try values[key] catch 0;
+            let left = limit - used;
+            if left < 0 { left = 0; }
+            remaining[key] = left;
+            let percent = 0;
+            if limit == 0 {
+                if used > 0 { percent = 101; }
+            } else {
+                // Divide first so large byte counters cannot overflow or lose
+                // avoidable precision in an intermediate used * 100 value.
+                percent = num_floor((used / limit) * 100);
+            }
+            percentages[key] = percent;
+            if percent > max_percent { max_percent = percent; }
+            if used > limit {
+                array_push(violations, map{ metric: key, used: used, limit: limit, excess: used - limit });
+            }
+            checked = checked + 1;
+        }
+        i = i + 1;
+    }
+    let pressure = "nominal";
+    if max_percent > 100 { pressure = "blocked"; }
+    else if max_percent >= 90 { pressure = "critical"; }
+    else if max_percent >= 70 { pressure = "watch"; }
+    return map{
+        format: "pblang.resource_budget.evaluation.v1",
+        name: str(try b.name catch "resource-budget"),
+        allowed: len(violations) == 0,
+        pressure: pressure,
+        max_percent: max_percent,
+        checked_metrics: checked,
+        usage: values,
+        limits: limits,
+        remaining: remaining,
+        percentages: percentages,
+        violations: violations
+    };
+}
+
+fn reserve(resource_budget, current_usage, request_usage) {
+    let current_record = try current_usage catch usage(map{});
+    if (try current_record.format catch "") != "pblang.resource_usage.v1" { current_record = usage(current_record); }
+    let request_record = try request_usage catch usage(map{});
+    if (try request_record.format catch "") != "pblang.resource_usage.v1" { request_record = usage(request_record); }
+    let current = _values(current_record.values);
+    let request = _values(request_record.values);
+    let next = map{};
+    let overflow_metrics = [];
+    let i = 0;
+    while i < len(METRICS) {
+        let key = METRICS[i];
+        let a = try current[key] catch 0;
+        let b = try request[key] catch 0;
+        if a != 0 or b != 0 {
+            let sum = _add_quantity(a, b);
+            next[key] = sum.value;
+            if sum.ok != true { array_push(overflow_metrics, key); }
+        }
+        i = i + 1;
+    }
+    let next_usage = usage(next);
+    next_usage.unknown_metrics = [];
+    let unknown_current = try current_record.unknown_metrics catch [];
+    let unknown_request = try request_record.unknown_metrics catch [];
+    let ui = 0;
+    while ui < len(unknown_current) { array_push(next_usage.unknown_metrics, unknown_current[ui]); ui = ui + 1; }
+    let uj = 0;
+    while uj < len(unknown_request) { array_push(next_usage.unknown_metrics, unknown_request[uj]); uj = uj + 1; }
+    let evaluation = evaluate(resource_budget, next_usage);
+    let oi = 0;
+    while oi < len(overflow_metrics) {
+        let key = overflow_metrics[oi];
+        array_push(evaluation.violations, map{
+            metric: key,
+            used: MAX_QUANTITY,
+            limit: try evaluation.limits[key] catch MAX_QUANTITY,
+            excess: 1,
+            reason: "quantity overflow"
+        });
+        oi = oi + 1;
+    }
+    if len(overflow_metrics) > 0 {
+        evaluation.allowed = false;
+        evaluation.pressure = "blocked";
+        evaluation.max_percent = 101;
+    }
+    return map{
+        format: "pblang.resource_budget.reservation.v1",
+        accepted: evaluation.allowed,
+        current: current,
+        request: request,
+        next: if evaluation.allowed { next } else { current },
+        evaluation: evaluation
+    };
+}
+
+// release() is the inverse transaction. It never underflows below zero and
+// rejects unknown metrics, but permits cleanup even when the remaining usage
+// is still above a limit.
+fn release(resource_budget, current_usage, release_usage) {
+    let current_record = try current_usage catch usage(map{});
+    if (try current_record.format catch "") != "pblang.resource_usage.v1" { current_record = usage(current_record); }
+    let release_record = try release_usage catch usage(map{});
+    if (try release_record.format catch "") != "pblang.resource_usage.v1" { release_record = usage(release_record); }
+    let unknown = try release_record.unknown_metrics catch [];
+    let current = _values(current_record.values);
+    let requested = _values(release_record.values);
+    let next = map{};
+    let i = 0;
+    while i < len(METRICS) {
+        let key = METRICS[i];
+        let before = try current[key] catch 0;
+        let amount = try requested[key] catch 0;
+        let after = before - amount;
+        if after < 0 { after = 0; }
+        if before != 0 or amount != 0 { next[key] = after; }
+        i = i + 1;
+    }
+    let next_usage = usage(next);
+    let evaluation = evaluate(resource_budget, next_usage);
+    return map{
+        format: "pblang.resource_budget.release.v1",
+        accepted: len(unknown) == 0,
+        current: current,
+        request: requested,
+        next: if len(unknown) == 0 { next } else { current },
+        evaluation: evaluation,
+        unknown_metrics: unknown
+    };
+}
+
+// A ledger makes the common reserve/commit/release workflow one call while
+// retaining the pure evaluate/reserve functions. It is intended for one owner;
+// synchronize externally when sharing a ledger between workers.
+fn ledger(resource_budget, initial_usage = nil) {
+    if initial_usage == nil { initial_usage = usage(map{}); }
+    let initial_record = try initial_usage catch usage(map{});
+    if (try initial_record.format catch "") != "pblang.resource_usage.v1" { initial_record = usage(initial_record); }
+    let evaluation = evaluate(resource_budget, initial_record);
+    if evaluation.allowed != true {
+        throw "resource_budget: initial ledger usage exceeds budget";
+    }
+    return map{
+        format: "pblang.resource_budget.ledger.v1",
+        budget: resource_budget,
+        usage: initial_record,
+        version: 0
+    };
+}
+
+fn ledger_reserve(state, request_usage) {
+    if state == nil or (try state.format catch "") != "pblang.resource_budget.ledger.v1" {
+        throw "resource_budget: invalid ledger";
+    }
+    let result = reserve(state.budget, state.usage, request_usage);
+    if result.accepted {
+        state.usage = usage(result.next);
+        state.version = state.version + 1;
+    }
+    result.version = state.version;
+    return result;
+}
+
+fn ledger_release(state, release_usage) {
+    if state == nil or (try state.format catch "") != "pblang.resource_budget.ledger.v1" {
+        throw "resource_budget: invalid ledger";
+    }
+    let result = release(state.budget, state.usage, release_usage);
+    if result.accepted {
+        state.usage = usage(result.next);
+        state.version = state.version + 1;
+    }
+    result.version = state.version;
+    return result;
+}
+
+fn _ledger_request_values(request_usage) {
+    if request_usage == nil { return map{}; }
+    if (try request_usage.format catch "") == "pblang.resource_usage.v1" {
+        return try request_usage.values catch map{};
+    }
+    return request_usage;
+}
+
+// Fast boolean admission for packet/frame/token hot loops. It validates only
+// the requested keys, performs a no-state-mutation first pass, and mutates the
+// ledger only after every metric is known, non-overflowing, and within limit.
+// Use ledger_reserve when a full diagnostic record is required.
+fn ledger_try_reserve(state, request_usage) {
+    if state == nil or (try state.format catch "") != "pblang.resource_budget.ledger.v1" {
+        return false;
+    }
+    let raw = _ledger_request_values(request_usage);
+    let keys = try map_keys(raw) catch [];
+    let i = 0;
+    while i < len(keys) {
+        let key = str(keys[i]);
+        if not _known_metric(key) { return false; }
+        let amount = _number(try raw[key] catch 0, 0);
+        let current = _number(try state.usage.values[key] catch 0, 0);
+        if amount > MAX_QUANTITY - current { return false; }
+        let limit = try state.budget.limits[key] catch nil;
+        if limit != nil and current + amount > limit { return false; }
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(keys) {
+        let key = str(keys[j]);
+        let amount = _number(try raw[key] catch 0, 0);
+        let current = _number(try state.usage.values[key] catch 0, 0);
+        state.usage.values[key] = current + amount;
+        j = j + 1;
+    }
+    state.version = state.version + 1;
+    return true;
+}
+
+fn ledger_try_release(state, release_usage) {
+    if state == nil or (try state.format catch "") != "pblang.resource_budget.ledger.v1" {
+        return false;
+    }
+    let raw = _ledger_request_values(release_usage);
+    let keys = try map_keys(raw) catch [];
+    let i = 0;
+    while i < len(keys) {
+        if not _known_metric(str(keys[i])) { return false; }
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(keys) {
+        let key = str(keys[j]);
+        let amount = _number(try raw[key] catch 0, 0);
+        let current = _number(try state.usage.values[key] catch 0, 0);
+        let next = current - amount;
+        if next < 0 { next = 0; }
+        state.usage.values[key] = next;
+        j = j + 1;
+    }
+    state.version = state.version + 1;
+    return true;
+}
+
+fn adaptive_plan(evaluation) {
+    let e = try evaluation catch map{};
+    let actions = [];
+    let violations = try e.violations catch [];
+    let i = 0;
+    while i < len(violations) {
+        let metric = str(try violations[i].metric catch "resource");
+        if metric == "workers" { array_push(actions, "reduce parallel workers"); }
+        else if metric == "memory_bytes" or metric == "allocations" or metric == "locations" { array_push(actions, "reduce batch size and collect reusable buffers"); }
+        else if metric == "frame_ms" or metric == "frames" { array_push(actions, "lower frame rate and render only dirty regions"); }
+        else if metric == "tokens" or metric == "items" { array_push(actions, "chunk input and apply bounded streaming"); }
+        else if metric == "output_bytes" or metric == "network_bytes" or metric == "storage_bytes" { array_push(actions, "truncate, compress, or page output"); }
+        else if metric == "restarts" { array_push(actions, "stop restart loop and require operator review"); }
+        else { array_push(actions, "cancel or split the operation"); }
+        i = i + 1;
+    }
+    if len(actions) == 0 {
+        let pressure = str(try e.pressure catch "nominal");
+        if pressure == "critical" { array_push(actions, "avoid new work until pressure drops"); }
+        else if pressure == "watch" { array_push(actions, "keep current route and sample resource usage"); }
+        else { array_push(actions, "continue with current resource route"); }
+    }
+    return map{
+        format: "pblang.resource_budget.adaptive_plan.v1",
+        allowed: (try e.allowed catch false) == true,
+        pressure: str(try e.pressure catch "unknown"),
+        actions: actions
+    };
+}
+
+fn from_resource_diff(diff) {
+    let d = try diff catch map{};
+    return usage(map{
+        elapsed_ms: try d.elapsed_ms catch 0,
+        allocations: try d.total_allocs catch 0,
+        locations: try d.locations catch 0
+    });
+}
+
+fn measure(name, resource_budget, work_fn) {
+    let measured = RESOURCES.measure(name, work_fn);
+    let resource_usage = from_resource_diff(measured);
+    return map{
+        format: "pblang.resource_budget.measurement.v1",
+        measurement: measured,
+        usage: resource_usage,
+        evaluation: evaluate(resource_budget, resource_usage)
+    };
+}
+
+fn summary(evaluation) {
+    let e = try evaluation catch map{};
+    return str(try e.name catch "resource-budget") + " " + str(try e.pressure catch "unknown") +
+        " allowed=" + str(try e.allowed catch false) + " peak=" + str(try e.max_percent catch 0) +
+        "% violations=" + str(len(try e.violations catch []));
+}
+
+export metrics, budget, profile, usage, evaluate, reserve, release,
+       ledger, ledger_reserve, ledger_release, ledger_try_reserve, ledger_try_release,
+       adaptive_plan,
+       from_resource_diff, measure, summary;

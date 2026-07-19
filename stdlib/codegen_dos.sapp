@@ -1,0 +1,142 @@
+// stdlib/codegen_dos.sapp -- 16-bit DOS .COM backend for the shared register IR.
+//
+// Emits raw 8086 machine code loaded by DOS at CS:0100. The program returns r0's
+// low byte through INT 21h/AH=4Ch. No assembler, linker, C compiler, or Rust is
+// involved. Virtual r0..r3 map to AX,CX,DX,BX. Hidden SI/DI plus the DOS stack
+// preserve virtual-register semantics for unsigned 16-bit multiplication.
+
+let IR = import("stdlib:codegen_ir.sapp");
+
+fn _app(dst, src) { let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; } return dst; }
+fn _reg(r) { if not is_number(r) or r < 0 or r > 3 { throw "codegen_dos: register out of range 0..3"; } return r; }
+fn _imm16(n) {
+    if not is_number(n) or n < 0 or n > 65535 or n != num_floor(n) {
+        throw "codegen_dos: immediate outside unsigned 16-bit range: " + str(n);
+    }
+    return n;
+}
+fn _le16(n) { n = _imm16(n); return [n % 256, num_floor(n / 256) % 256]; }
+fn _rel16(n) {
+    if n < -32768 or n > 32767 { throw "codegen_dos: branch exceeds 16-bit COM range"; }
+    if n < 0 { n = 65536 + n; }
+    return [n % 256, num_floor(n / 256) % 256];
+}
+fn _rel8(n) {
+    if n < -128 or n > 127 { throw "codegen_dos: branch exceeds 8-bit range"; }
+    if n < 0 { n = 256 + n; }
+    return n;
+}
+
+fn mov_imm16_r(r, n) { return _app([0xB8 + _reg(r)], _le16(n)); }
+fn mov_rr(a, b) { return [0x89, 0xC0 + _reg(b) * 8 + _reg(a)]; }
+fn add_rr(a, b) { return [0x01, 0xC0 + _reg(b) * 8 + _reg(a)]; }
+fn sub_rr(a, b) { return [0x29, 0xC0 + _reg(b) * 8 + _reg(a)]; }
+fn test_rr(r) { r = _reg(r); return [0x85, 0xC0 + r * 8 + r]; }
+fn dec_r(r) { return [0x48 + _reg(r)]; }
+fn addi_r(r, n) {
+    r = _reg(r); n = _imm16(n);
+    if n == 1 { return [0x40 + r]; }
+    if n <= 127 { return [0x83, 0xC0 + r, n]; }
+    return _app([0x81, 0xC0 + r], _le16(n));
+}
+
+// 8086 MUL has an implicit AX input and DX:AX output. SI/DI are outside the
+// four-register IR, so they safely hold the multiplier and low-word result.
+fn mul_rr(a, b) {
+    a = _reg(a); b = _reg(b);
+    let out = [0x50, 0x52];                         // push ax; push dx
+    _app(out, [0x89, 0xC0 + b * 8 + 7]);           // mov di, source
+    _app(out, [0x89, 0xC0 + a * 8]);               // mov ax, target
+    _app(out, [0xF7, 0xE7]);                       // mul di
+    _app(out, [0x89, 0xC6]);                       // mov si, ax
+    _app(out, [0x5A, 0x58]);                       // pop dx; pop ax
+    _app(out, [0x89, 0xF0 + a]);                   // mov target, si
+    return out;
+}
+
+fn _jz_forward(n) {
+    if n <= 127 { return [0x74, n]; }
+    // JNZ over a near JMP. 8086 has no near conditional branch.
+    let out = [0x75, 3, 0xE9]; _app(out, _rel16(n)); return out;
+}
+fn _jmp_forward(n) {
+    if n <= 127 { return [0xEB, n]; }
+    let out = [0xE9]; _app(out, _rel16(n)); return out;
+}
+fn _jnz_back(n) {
+    if n >= -128 { return [0x75, _rel8(n)]; }
+    let out = [0x74, 3, 0xE9]; _app(out, _rel16(n)); return out;
+}
+
+fn _emit_ifnz(reg, thenb, elseb) {
+    let out = []; _app(out, test_rr(reg));
+    let tail = if len(elseb) == 0 { [] } else { _jmp_forward(len(elseb)) };
+    _app(out, _jz_forward(len(thenb) + len(tail)));
+    _app(out, thenb); _app(out, tail); _app(out, elseb);
+    return out;
+}
+fn _emit_loop(reg, body) {
+    let out = []; _app(out, test_rr(reg));
+    // Resolve jump sizes to a fixed point; each encoder has only short/near forms.
+    let back_len = 2;
+    let forward = _jz_forward(len(body) + 1 + back_len);
+    let back = _jnz_back(0 - (len(body) + 1 + back_len));
+    if len(back) != back_len {
+        back_len = len(back);
+        forward = _jz_forward(len(body) + 1 + back_len);
+        back = _jnz_back(0 - (len(body) + 1 + back_len));
+    }
+    _app(out, forward); _app(out, body); _app(out, dec_r(reg)); _app(out, back);
+    return out;
+}
+
+fn _validate_dos_ir(ir, depth) {
+    if depth > 64 { throw "codegen_dos: control-flow nesting exceeds 64"; }
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i]; let op = ins[0];
+        if op == "seti" or op == "addi" { _reg(ins[1]); _imm16(ins[2]); }
+        elif op == "add" or op == "sub" or op == "mul" or op == "movr" { _reg(ins[1]); _reg(ins[2]); }
+        elif op == "loop" { _reg(ins[1]); _validate_dos_ir(ins[2], depth + 1); }
+        elif op == "ifnz" { _reg(ins[1]); _validate_dos_ir(ins[2], depth + 1); _validate_dos_ir(ins[3], depth + 1); }
+        else { throw "codegen_dos: IR op is not available in DOS COM backend: " + str(op); }
+        i = i + 1;
+    }
+}
+
+fn compile_ir(ir) {
+    IR.assert_valid(ir); _validate_dos_ir(ir, 0);
+    let code = []; let i = 0;
+    while i < len(ir) {
+        let ins = ir[i]; let op = ins[0];
+        if op == "seti" { _app(code, mov_imm16_r(ins[1], ins[2])); }
+        elif op == "add" { _app(code, add_rr(ins[1], ins[2])); }
+        elif op == "sub" { _app(code, sub_rr(ins[1], ins[2])); }
+        elif op == "mul" { _app(code, mul_rr(ins[1], ins[2])); }
+        elif op == "movr" { _app(code, mov_rr(ins[1], ins[2])); }
+        elif op == "addi" { _app(code, addi_r(ins[1], ins[2])); }
+        elif op == "loop" { _app(code, _emit_loop(ins[1], compile_ir(ins[2]))); }
+        elif op == "ifnz" { _app(code, _emit_ifnz(ins[1], compile_ir(ins[2]), compile_ir(ins[3]))); }
+        i = i + 1;
+    }
+    if len(code) > 65277 { throw "codegen_dos: program exceeds DOS COM 64 KiB image"; }
+    return code;
+}
+
+fn compile_program(ir) {
+    let code = compile_ir(ir);
+    _app(code, [0xB4, 0x4C, 0xCD, 0x21]);          // mov ah,4Ch; int 21h
+    if len(code) > 65280 { throw "codegen_dos: program exceeds DOS COM 64 KiB image"; }
+    return code;
+}
+
+fn metadata() {
+    return map{
+        os: "dos", arch: "x86", cpu_min: "8086", format: "com",
+        os_min: "2.0", memory_model: "tiny", load_offset: 0x100,
+        status: "execution-model-verified"
+    };
+}
+
+export compile_ir, compile_program, metadata;
+export mov_imm16_r, mov_rr, add_rr, sub_rr, mul_rr, addi_r, dec_r, test_rr;

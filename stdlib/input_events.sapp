@@ -1,0 +1,192 @@
+// stdlib/input_events.sapp -- portable, deterministic input-event contract.
+//
+// Event validation and virtual-device replay are pure PBLang. Host actuation is
+// deliberately separate: backend_plan() emits argv for a reviewed adapter and
+// never executes it. This lets every OS/device emulator test identical input.
+
+let UnicodeEncoding = import("stdlib:unicode_encoding.sapp");
+
+let FORMAT = "pblang.input.event.v1";
+let DEVICE_FORMAT = "pblang.input.device.v1";
+let MAX_TEXT = 4096;
+let SAFE_KEYS = ["Enter", "Tab", "Escape", "Backspace", "Delete", "Space",
+                 "Up", "Down", "Left", "Right", "Home", "End", "PageUp", "PageDown"];
+
+fn _contains(values, wanted) {
+    let i = 0; while i < len(values) { if values[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn canonical_key(value) {
+    let raw = str(value ?? ""); let lower = str_lower(raw);
+    if lower == "return" or lower == "enter" { return "Enter"; }
+    if lower == "backspace" or lower == "back_space" { return "Backspace"; }
+    if lower == "esc" or lower == "escape" { return "Escape"; }
+    if lower == "space" or lower == "spacebar" { return "Space"; }
+    if lower == "page_up" or lower == "pageup" { return "PageUp"; }
+    if lower == "page_down" or lower == "pagedown" { return "PageDown"; }
+    let i = 0; while i < len(SAFE_KEYS) { if str_lower(SAFE_KEYS[i]) == lower { return SAFE_KEYS[i]; } i = i + 1; }
+    return nil;
+}
+
+fn _finite_int(value, low, high) {
+    if type(value) != "number" { return nil; }
+    let n = num_floor(value);
+    if n != value or n < low or n > high { return nil; }
+    return n;
+}
+
+fn type_event(text) {
+    if type(text) != "string" or len(text) > MAX_TEXT or str_index_of(text, "\x00") >= 0 {
+        return map{ ok: false, error: "invalid or oversized input text" };
+    }
+    return map{ ok: true, event: map{ format: FORMAT, kind: "type", text: text } };
+}
+
+fn type_encoded_event(bytes, encoding) {
+    let decoded = UnicodeEncoding.decode(bytes, encoding);
+    if not decoded.ok { return decoded; }
+    let event = type_event(decoded.text);
+    if not event.ok { return event; }
+    event.event.source_encoding = decoded.encoding;
+    event.event.scalar_count = decoded.scalars;
+    return event;
+}
+
+fn supported_encodings() { return UnicodeEncoding.supported(); }
+
+fn key_event(key) {
+    let canonical = canonical_key(key);
+    if canonical == nil { return map{ ok: false, error: "key is not in the portable allowlist" }; }
+    return map{ ok: true, event: map{ format: FORMAT, kind: "key", key: canonical } };
+}
+
+fn pointer_event(x, y) {
+    let px = _finite_int(x, 0, 32767); let py = _finite_int(y, 0, 32767);
+    if px == nil or py == nil { return map{ ok: false, error: "pointer coordinates must be integers in 0..32767" }; }
+    return map{ ok: true, event: map{ format: FORMAT, kind: "pointer", x: px, y: py } };
+}
+
+fn pointer_delta_event(dx, dy) {
+    let px = _finite_int(dx, -32767, 32767); let py = _finite_int(dy, -32767, 32767);
+    if px == nil or py == nil { return map{ ok: false, error: "pointer deltas must be integers in -32767..32767" }; }
+    return map{ ok: true, event: map{ format: FORMAT, kind: "pointer_delta", dx: px, dy: py } };
+}
+
+fn click_event(button = 1) {
+    let b = _finite_int(button, 1, 3);
+    if b == nil { return map{ ok: false, error: "button must be 1, 2, or 3" }; }
+    return map{ ok: true, event: map{ format: FORMAT, kind: "click", button: b } };
+}
+
+fn validate(event) {
+    if not is_map(event) or (try event.format catch "") != FORMAT { return map{ ok: false, error: "invalid input event" }; }
+    if event.kind == "type" { return type_event(try event.text catch nil); }
+    if event.kind == "key" { return key_event(try event.key catch nil); }
+    if event.kind == "pointer" { return pointer_event(try event.x catch nil, try event.y catch nil); }
+    if event.kind == "pointer_delta" { return pointer_delta_event(try event.dx catch nil, try event.dy catch nil); }
+    if event.kind == "click" { return click_event(try event.button catch nil); }
+    return map{ ok: false, error: "unknown input event kind" };
+}
+
+fn _xdotool_key(key) {
+    if key == "Enter" { return "Return"; }
+    if key == "Backspace" { return "BackSpace"; }
+    if key == "Space" { return "space"; }
+    if key == "PageUp" { return "Page_Up"; }
+    if key == "PageDown" { return "Page_Down"; }
+    return key;
+}
+
+fn _ydotool_key(key) {
+    if key == "PageUp" { return "PageUp"; }
+    if key == "PageDown" { return "PageDown"; }
+    return key;
+}
+
+fn backend_plan(backend, event) {
+    let checked = validate(event);
+    if not checked.ok { return checked; }
+    let e = checked.event; let name = str_lower(str(backend ?? "")); let args = [];
+    if name == "xdotool" {
+        if e.kind == "type" { args = ["type", "--delay", "1", "--", e.text]; }
+        if e.kind == "key" { args = ["key", _xdotool_key(e.key)]; }
+        if e.kind == "pointer" { args = ["mousemove", str(e.x), str(e.y)]; }
+        if e.kind == "pointer_delta" { args = ["mousemove_relative", "--", str(e.dx), str(e.dy)]; }
+        if e.kind == "click" { args = ["click", str(e.button)]; }
+        return map{ ok: true, backend: name, command: "xdotool", args: args, requires_daemon: false };
+    }
+    if name == "ydotool" {
+        // --args 1 makes one following text argument literal, including leading '-'.
+        if e.kind == "type" { args = ["type", "--key-delay", "12", "--args", "1", e.text]; }
+        if e.kind == "key" { args = ["key", "--key-delay", "12", _ydotool_key(e.key)]; }
+        if e.kind == "pointer" { return map{ ok: false, error: "ydotool does not expose absolute pointer movement" }; }
+        if e.kind == "pointer_delta" { args = ["mousemove", "--delay", "0", str(e.dx), str(e.dy)]; }
+        if e.kind == "click" { args = ["click", "--delay", "0", str(e.button)]; }
+        return map{ ok: true, backend: name, command: "ydotool", args: args,
+                    requires_daemon: true, socket: "/tmp/.ydotool_socket" };
+    }
+    return map{ ok: false, error: "unsupported input backend" };
+}
+
+fn new_device(width = 1920, height = 1080, options = nil) {
+    let w = _finite_int(width, 1, 32768); let h = _finite_int(height, 1, 32768);
+    if w == nil or h == nil { throw "input_events.new_device: invalid dimensions"; }
+    let max_events = 10000; let max_text = 65536;
+    if options != nil and is_map(options) {
+        if map_has(options, "max_events") { max_events = _finite_int(options.max_events, 1, 1000000); }
+        if map_has(options, "max_text") { max_text = _finite_int(options.max_text, 1, 1048576); }
+    }
+    if max_events == nil or max_text == nil { throw "input_events.new_device: invalid limits"; }
+    return map{ format: DEVICE_FORMAT, width: w, height: h, x: 0, y: 0, text: "",
+                event_count: 0, click_count: 0, last_button: 0, last_key: "",
+                limits: map{ max_events: max_events, max_text: max_text } };
+}
+
+fn apply(device, event) {
+    if not is_map(device) or (try device.format catch "") != DEVICE_FORMAT { return map{ ok: false, error: "invalid virtual input device" }; }
+    if device.event_count >= device.limits.max_events { return map{ ok: false, error: "input event budget exceeded" }; }
+    let checked = validate(event); if not checked.ok { return checked; }
+    let e = checked.event;
+    if e.kind == "pointer" {
+        if e.x >= device.width or e.y >= device.height { return map{ ok: false, error: "pointer outside virtual display" }; }
+        device.x = e.x; device.y = e.y;
+    }
+    if e.kind == "pointer_delta" {
+        let nx = device.x + e.dx; let ny = device.y + e.dy;
+        if nx < 0 or ny < 0 or nx >= device.width or ny >= device.height { return map{ ok: false, error: "relative pointer leaves virtual display" }; }
+        device.x = nx; device.y = ny;
+    }
+    if e.kind == "click" { device.click_count = device.click_count + 1; device.last_button = e.button; }
+    if e.kind == "type" {
+        if len(device.text) + len(e.text) > device.limits.max_text { return map{ ok: false, error: "virtual text buffer exceeded" }; }
+        device.text = device.text + e.text;
+    }
+    if e.kind == "key" {
+        device.last_key = e.key;
+        if e.key == "Enter" { device.text = device.text + "\n"; }
+        if e.key == "Space" { device.text = device.text + " "; }
+        if e.key == "Backspace" and len(device.text) > 0 { device.text = str_slice(device.text, 0, len(device.text) - 1); }
+        if len(device.text) > device.limits.max_text { return map{ ok: false, error: "virtual text buffer exceeded" }; }
+    }
+    device.event_count = device.event_count + 1;
+    return map{ ok: true, event_count: device.event_count };
+}
+
+fn replay(device, events) {
+    if not is_array(events) { return map{ ok: false, error: "events must be an array" }; }
+    let i = 0;
+    while i < len(events) { let result = apply(device, events[i]); if not result.ok { return map{ ok: false, index: i, error: result.error }; } i = i + 1; }
+    return map{ ok: true, count: len(events), state: snapshot(device) };
+}
+
+fn snapshot(device) {
+    return map{ format: "pblang.input.snapshot.v1", width: device.width, height: device.height,
+                x: device.x, y: device.y, text: device.text, event_count: device.event_count,
+                click_count: device.click_count, last_button: device.last_button, last_key: device.last_key };
+}
+
+fn safe_keys() { return SAFE_KEYS; }
+
+export FORMAT, DEVICE_FORMAT, MAX_TEXT, type_event, type_encoded_event, supported_encodings, key_event, pointer_event, pointer_delta_event, click_event,
+       validate, canonical_key, backend_plan, new_device, apply, replay, snapshot, safe_keys;

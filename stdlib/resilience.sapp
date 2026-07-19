@@ -1,0 +1,276 @@
+// stdlib/resilience.sapp -- deterministic operation lifecycle policies.
+//
+// This module is a pure state machine. It does not spawn work, sleep, read a clock,
+// or catch errors. Callers supply timestamps and apply the returned decisions. That
+// makes the same bounded retry, deadline, cancellation, and circuit-breaker contract
+// usable by the interpreter, GUI applications, services, AI jobs, and MCP handlers.
+
+let OPTION_KEYS = [
+    "max_attempts", "base_delay_ms", "multiplier", "max_delay_ms",
+    "timeout_ms", "failure_threshold", "recovery_ms", "jitter_percent"
+];
+
+fn _text(value, fallback, limit) {
+    let out = str(value ?? fallback);
+    if len(out) > limit { out = str_slice(out, 0, limit); }
+    return out;
+}
+
+fn _number(value, fallback, minimum, maximum) {
+    let n = try parse_number(str(value)) catch fallback;
+    if n == nil { n = fallback; }
+    n = num_floor(n);
+    if n < minimum { n = minimum; }
+    if n > maximum { n = maximum; }
+    return n;
+}
+
+fn _option(options, key, fallback) {
+    if options == nil or not map_has(options, key) { return fallback; }
+    return options[key];
+}
+
+fn _known_option(key) {
+    let i = 0;
+    while i < len(OPTION_KEYS) {
+        if OPTION_KEYS[i] == key { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _unknown_options(options) {
+    if options == nil { return []; }
+    let keys = try map_keys(options) catch [];
+    let out = [];
+    let i = 0;
+    while i < len(keys) {
+        if not _known_option(str(keys[i])) { array_push(out, str(keys[i])); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// policy(...) normalizes every numeric input into a conservative hard range.
+// Unknown keys make the policy invalid so misspelled safety settings fail closed.
+fn policy(name, options = nil) {
+    if options == nil { options = map{}; }
+    let attempts = _number(_option(options, "max_attempts", 3), 3, 1, 100);
+    let base = _number(_option(options, "base_delay_ms", 0), 0, 0, 60000);
+    let multiplier = _number(_option(options, "multiplier", 2), 2, 1, 16);
+    let maximum = _number(_option(options, "max_delay_ms", 30000), 30000, 0, 300000);
+    if maximum < base { maximum = base; }
+    let timeout = _number(_option(options, "timeout_ms", 30000), 30000, 1, 3600000);
+    let threshold = _number(_option(options, "failure_threshold", attempts), attempts, 1, 100);
+    if threshold > attempts { threshold = attempts; }
+    let recovery = _number(_option(options, "recovery_ms", 30000), 30000, 1, 3600000);
+    let jitter = _number(_option(options, "jitter_percent", 0), 0, 0, 50);
+    let unknown = _unknown_options(options);
+    return map{
+        format: "pblang.resilience.policy.v1",
+        name: _text(name, "operation", 96),
+        valid: len(unknown) == 0,
+        unknown_options: unknown,
+        max_attempts: attempts,
+        base_delay_ms: base,
+        multiplier: multiplier,
+        max_delay_ms: maximum,
+        timeout_ms: timeout,
+        failure_threshold: threshold,
+        recovery_ms: recovery,
+        jitter_percent: jitter,
+        policy: "bounded attempts and delay; cooperative deadline; explicit cancellation; unknown options fail closed"
+    };
+}
+
+fn initial(resilience_policy, started_ms = 0) {
+    let start = _number(started_ms, 0, 0, 9000000000000000);
+    return map{
+        format: "pblang.resilience.state.v1",
+        name: _text(try resilience_policy.name catch "operation", "operation", 96),
+        status: "closed",
+        attempts: 0,
+        consecutive_failures: 0,
+        started_ms: start,
+        last_event_ms: start,
+        next_attempt_ms: start,
+        opened_at_ms: nil,
+        completed: false,
+        cancelled: false,
+        reason: "",
+        last_error: ""
+    };
+}
+
+fn _copy(state) {
+    return map{
+        format: "pblang.resilience.state.v1",
+        name: _text(try state.name catch "operation", "operation", 96),
+        status: str(try state.status catch "invalid"),
+        attempts: _number(try state.attempts catch 0, 0, 0, 100),
+        consecutive_failures: _number(try state.consecutive_failures catch 0, 0, 0, 100),
+        started_ms: _number(try state.started_ms catch 0, 0, 0, 9000000000000000),
+        last_event_ms: _number(try state.last_event_ms catch 0, 0, 0, 9000000000000000),
+        next_attempt_ms: _number(try state.next_attempt_ms catch 0, 0, 0, 9000000000000000),
+        opened_at_ms: try state.opened_at_ms catch nil,
+        completed: (try state.completed catch false) == true,
+        cancelled: (try state.cancelled catch false) == true,
+        reason: _text(try state.reason catch "", "", 160),
+        last_error: _text(try state.last_error catch "", "", 256)
+    };
+}
+
+// Overflow-safe exponential delay with optional deterministic jitter. `entropy`
+// is caller supplied, making tests and replay deterministic; no random source is read.
+fn backoff_ms(resilience_policy, attempt, entropy = 0) {
+    let p = resilience_policy;
+    let n = _number(attempt, 1, 1, 100);
+    let delay = _number(try p.base_delay_ms catch 0, 0, 0, 60000);
+    let maximum = _number(try p.max_delay_ms catch 30000, 30000, 0, 300000);
+    let multiplier = _number(try p.multiplier catch 2, 2, 1, 16);
+    let i = 1;
+    while i < n and delay < maximum {
+        if multiplier > 1 and delay > num_floor(maximum / multiplier) { delay = maximum; }
+        else { delay = delay * multiplier; }
+        if delay > maximum { delay = maximum; }
+        i = i + 1;
+    }
+    let jitter = _number(try p.jitter_percent catch 0, 0, 0, 50);
+    if jitter == 0 or delay == 0 { return delay; }
+    let span = num_floor((delay * jitter) / 100);
+    let seed = _number(entropy, 0, 0, 9000000000000000);
+    let bucket = num_mod(seed, 201) - 100;
+    let out = delay + num_floor((span * bucket) / 100);
+    if out < 0 { return 0; }
+    if out > maximum { return maximum; }
+    return out;
+}
+
+fn decision(resilience_policy, state, now_ms) {
+    let p = try resilience_policy catch map{};
+    let s = try state catch map{};
+    let now = _number(now_ms, 0, 0, 9000000000000000);
+    if (try p.format catch "") != "pblang.resilience.policy.v1" or not (try p.valid catch false) {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "invalid-policy", mode: "blocked", retry_after_ms: 0 };
+    }
+    if (try s.format catch "") != "pblang.resilience.state.v1" {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "invalid-state", mode: "blocked", retry_after_ms: 0 };
+    }
+    if now < (try s.started_ms catch 0) or now < (try s.last_event_ms catch 0) {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "clock-regression", mode: "blocked", retry_after_ms: 0 };
+    }
+    if (try s.cancelled catch false) {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "cancelled", mode: "blocked", retry_after_ms: 0 };
+    }
+    if (try s.completed catch false) {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "completed", mode: "blocked", retry_after_ms: 0 };
+    }
+    let elapsed = now - s.started_ms;
+    if elapsed >= p.timeout_ms {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "deadline-exceeded", mode: "blocked", retry_after_ms: 0 };
+    }
+    if s.attempts >= p.max_attempts {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "attempts-exhausted", mode: "blocked", retry_after_ms: 0 };
+    }
+    if s.status == "open" {
+        let opened = try s.opened_at_ms catch now;
+        let wait = p.recovery_ms - (now - opened);
+        if wait > 0 {
+            return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "circuit-open", mode: "blocked", retry_after_ms: wait };
+        }
+        return map{ format: "pblang.resilience.decision.v1", allowed: true, reason: "recovery-probe", mode: "half-open", retry_after_ms: 0 };
+    }
+    if now < s.next_attempt_ms {
+        return map{ format: "pblang.resilience.decision.v1", allowed: false, reason: "backoff", mode: "waiting", retry_after_ms: s.next_attempt_ms - now };
+    }
+    return map{ format: "pblang.resilience.decision.v1", allowed: true, reason: "admitted", mode: "closed", retry_after_ms: 0 };
+}
+
+fn begin_attempt(resilience_policy, state, now_ms) {
+    let d = decision(resilience_policy, state, now_ms);
+    if not d.allowed {
+        return map{ format: "pblang.resilience.begin.v1", accepted: false, state: _copy(state), decision: d };
+    }
+    let out = _copy(state);
+    out.attempts = out.attempts + 1;
+    out.last_event_ms = _number(now_ms, out.last_event_ms, out.last_event_ms, 9000000000000000);
+    out.status = if d.mode == "half-open" { "half-open" } else { "running" };
+    out.reason = "attempt-started";
+    return map{ format: "pblang.resilience.begin.v1", accepted: true, state: out, decision: d };
+}
+
+fn record_success(state, now_ms) {
+    let out = _copy(state);
+    let now = _number(now_ms, out.last_event_ms, out.last_event_ms, 9000000000000000);
+    out.status = "succeeded";
+    out.completed = true;
+    out.consecutive_failures = 0;
+    out.last_event_ms = now;
+    out.next_attempt_ms = now;
+    out.opened_at_ms = nil;
+    out.reason = "completed";
+    out.last_error = "";
+    return out;
+}
+
+fn record_failure(resilience_policy, state, now_ms, error_value = "runtime error", retryable = true, entropy = 0) {
+    let p = resilience_policy;
+    let out = _copy(state);
+    let now = _number(now_ms, out.last_event_ms, out.last_event_ms, 9000000000000000);
+    out.last_event_ms = now;
+    if (try p.format catch "") != "pblang.resilience.policy.v1" or not (try p.valid catch false) {
+        out.status = "failed";
+        out.completed = true;
+        out.reason = "invalid-policy";
+        out.last_error = "invalid resilience policy";
+        return out;
+    }
+    out.consecutive_failures = out.consecutive_failures + 1;
+    out.last_error = _text(error_value, "runtime error", 256);
+    if retryable != true {
+        out.status = "failed";
+        out.completed = true;
+        out.reason = "non-retryable";
+        return out;
+    }
+    if out.attempts >= p.max_attempts {
+        out.status = "exhausted";
+        out.completed = true;
+        out.reason = "attempts-exhausted";
+        return out;
+    }
+    if out.consecutive_failures >= p.failure_threshold {
+        out.status = "open";
+        out.opened_at_ms = now;
+        out.next_attempt_ms = now + p.recovery_ms;
+        out.reason = "failure-threshold";
+        return out;
+    }
+    let delay = backoff_ms(p, out.attempts, entropy);
+    out.status = "backoff";
+    out.next_attempt_ms = now + delay;
+    out.reason = "retry-scheduled";
+    return out;
+}
+
+fn cancel(state, reason = "cancelled", now_ms = nil) {
+    let out = _copy(state);
+    let now = out.last_event_ms;
+    if now_ms != nil { now = _number(now_ms, now, now, 9000000000000000); }
+    out.status = "cancelled";
+    out.cancelled = true;
+    out.completed = true;
+    out.reason = _text(reason, "cancelled", 160);
+    out.last_event_ms = now;
+    return out;
+}
+
+fn summary(resilience_policy, state, now_ms) {
+    let d = decision(resilience_policy, state, now_ms);
+    return str(try resilience_policy.name catch "operation") + " status=" + str(try state.status catch "invalid")
+        + " attempts=" + str(try state.attempts catch 0) + "/" + str(try resilience_policy.max_attempts catch 0)
+        + " allowed=" + str(d.allowed) + " reason=" + d.reason;
+}
+
+export policy, initial, backoff_ms, decision, begin_attempt,
+       record_success, record_failure, cancel, summary;

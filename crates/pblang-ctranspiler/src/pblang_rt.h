@@ -18,6 +18,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#include <sys/stat.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#endif
 #include <setjmp.h>
 #include <time.h>
 #include <ctype.h>
@@ -415,6 +421,8 @@ static PbVal pb_dec_mul(PbVal a, PbVal b) {
 }
 static PbVal pb_builtin_decimal(PbVal v) { return _dec_promote(v); }
 
+static void pb__render(PbVal v, char** buf, size_t* len, size_t* cap);  /* fwd */
+
 static PbVal pb_to_str(PbVal v) {
     char buf[64];
     switch (v.tag) {
@@ -428,11 +436,45 @@ static PbVal pb_to_str(PbVal v) {
             else
                 pb_fmt_double(buf, sizeof(buf), v.num);
             return pb_str_lit(buf);
-        case PB_TAG_ARR:  return PB_STR("[array]");
-        case PB_TAG_MAP:  return PB_STR("[map]");
+        case PB_TAG_ARR:
+        case PB_TAG_MAP: {
+            /* Recursively render like the interpreter: arrays as `[e, e]`, maps as
+               `map{k: v, k: v}`, with strings bare (no quotes) at every level. */
+            size_t cap = 64, len = 0; char* b = (char*)malloc(cap); b[0] = '\0';
+            pb__render(v, &b, &len, &cap);
+            PbVal r; r.tag = PB_TAG_STR; r.str = b; return r;
+        }
         case PB_TAG_FN:   return PB_STR("[fn]");
         case PB_TAG_ERR:  { char eb[256]; snprintf(eb,256,"[error: %s]",v.str); return pb_str_lit(eb); }
         default:          return PB_STR("[unknown]");
+    }
+}
+
+static void pb__str_append(char** buf, size_t* len, size_t* cap, const char* s) {
+    size_t sl = strlen(s);
+    while (*len + sl + 1 >= *cap) { *cap = (*cap) * 2 + sl; *buf = (char*)realloc(*buf, *cap); }
+    memcpy(*buf + *len, s, sl); *len += sl; (*buf)[*len] = '\0';
+}
+static void pb__render(PbVal v, char** buf, size_t* len, size_t* cap) {
+    if (v.tag == PB_TAG_ARR) {
+        pb__str_append(buf, len, cap, "[");
+        for (size_t i = 0; i < v.arr->len; i++) {
+            if (i) pb__str_append(buf, len, cap, ", ");
+            pb__render(v.arr->data[i], buf, len, cap);
+        }
+        pb__str_append(buf, len, cap, "]");
+    } else if (v.tag == PB_TAG_MAP) {
+        pb__str_append(buf, len, cap, "map{");
+        for (size_t i = 0; i < v.map->len; i++) {
+            if (i) pb__str_append(buf, len, cap, ", ");
+            pb__str_append(buf, len, cap, v.map->entries[i].key);
+            pb__str_append(buf, len, cap, ": ");
+            pb__render(v.map->entries[i].val, buf, len, cap);
+        }
+        pb__str_append(buf, len, cap, "}");
+    } else {
+        PbVal s = pb_to_str(v);  /* scalar → bare string */
+        pb__str_append(buf, len, cap, s.str ? s.str : "");
     }
 }
 
@@ -602,6 +644,43 @@ static void pb_throw(PbVal v) {
 }
 
 static PbVal pb_result_unwrap(PbVal v) { return v; }
+
+static int pb_map_has(PbVal map, PbVal key) {
+    if (map.tag != PB_TAG_MAP || key.tag != PB_TAG_STR) return 0;
+    for (size_t i = 0; i < map.map->len; i++)
+        if (strcmp(map.map->entries[i].key, key.str) == 0) return 1;
+    return 0;
+}
+/* User-level obj[idx] / obj.attr MATCH the interpreter: a missing map key or an
+   out-of-bounds array index THROWS (the VM raises "undefined key '<k>'" /
+   "array index out of bounds"), so the `try obj[k] catch fallback` idiom works
+   natively. pb_index / pb_map_get / pb_safe_* stay nil-returning for internal use
+   and the safe operators (?. / ?[]). */
+static PbVal pb_index_get(PbVal obj, PbVal idx) {
+    if (obj.tag == PB_TAG_MAP) {
+        if (!pb_map_has(obj, idx)) {
+            PbVal k = pb_to_str(idx);
+            char msg[256];
+            snprintf(msg, sizeof(msg), "undefined key '%s'", k.str ? k.str : "");
+            pb_throw(pb_str_lit(msg));
+        }
+        return pb_map_get(obj, idx);
+    }
+    if (obj.tag == PB_TAG_ARR && idx.tag == PB_TAG_NUM) {
+        if (idx.num < 0 || idx.num >= (double)obj.arr->len)
+            pb_throw(PB_STR("array index out of bounds"));
+    }
+    return pb_index(obj, idx);
+}
+static PbVal pb_attr_get(PbVal obj, PbVal key) {
+    if (obj.tag == PB_TAG_MAP && !pb_map_has(obj, key)) {
+        PbVal k = pb_to_str(key);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "undefined key '%s'", k.str ? k.str : "");
+        pb_throw(pb_str_lit(msg));
+    }
+    return pb_map_get(obj, key);
+}
 
 /* ─── Builtins ───────────────────────────────────────────────────── */
 static PbVal pb_builtin_len(PbVal v) {
@@ -1056,13 +1135,53 @@ static PbVal pb_builtin_str_slice(PbVal s, PbVal start, PbVal end) {
     memcpy(out, s.str + i, j - i); out[j-i] = 0;
     PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
 }
+/* slice(seq, start, end): polymorphic like the VM — a string OR array subrange.
+   start/end may be nil (→ 0 / len) or a non-negative number; clamped; start>=end → empty.
+   (String indexing is byte-based, consistent with str_slice; pblang source is ASCII.) */
+static PbVal pb_builtin_slice(PbVal seq, PbVal start, PbVal end) {
+    if (seq.tag == PB_TAG_STR) {
+        size_t slen = strlen(seq.str);
+        size_t i = (start.tag == PB_TAG_NUM) ? (size_t)start.num : 0; if (i > slen) i = slen;
+        size_t j = (end.tag == PB_TAG_NUM) ? (size_t)end.num : slen; if (j > slen) j = slen; if (j < i) j = i;
+        char* out = (char*)malloc(j - i + 1);
+        memcpy(out, seq.str + i, j - i); out[j - i] = 0;
+        PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
+    }
+    if (seq.tag == PB_TAG_ARR) {
+        size_t n = seq.arr->len;
+        size_t i = (start.tag == PB_TAG_NUM) ? (size_t)start.num : 0; if (i > n) i = n;
+        size_t j = (end.tag == PB_TAG_NUM) ? (size_t)end.num : n; if (j > n) j = n; if (j < i) j = i;
+        PbVal out = pb_arr_new((j - i) ? (j - i) : 1); out.arr->len = j - i;
+        for (size_t k = i; k < j; k++) out.arr->data[k - i] = seq.arr->data[k];
+        return out;
+    }
+    return PB_NIL;
+}
 static PbVal pb_builtin_str_split(PbVal s, PbVal delim) {
     if (s.tag != PB_TAG_STR || delim.tag != PB_TAG_STR) return pb_arr_new(0);
     PbArr* a = pb_arr_alloc(8);
     const char* p = s.str;
     const char* d = delim.str;
     size_t dl = strlen(d);
-    if (dl == 0) { PbVal v; v.tag=PB_TAG_ARR; v.arr=a; return v; }
+    if (dl == 0) {
+        /* Empty delimiter → split into individual UTF-8 codepoints (matches the VM).
+           Returning an empty array here (the previous behavior) broke `str_split(src, "")`,
+           which the self-hosting tokenizer uses to turn source into a char array. */
+        const unsigned char* q = (const unsigned char*)s.str;
+        while (*q) {
+            int clen = 1;
+            if      ((*q & 0x80) == 0x00) clen = 1;
+            else if ((*q & 0xE0) == 0xC0) clen = 2;
+            else if ((*q & 0xF0) == 0xE0) clen = 3;
+            else if ((*q & 0xF8) == 0xF0) clen = 4;
+            char* seg = (char*)malloc(clen + 1);
+            memcpy(seg, q, clen); seg[clen] = 0;
+            PbVal sv; sv.tag = PB_TAG_STR; sv.str = seg;
+            pb_arr_push((PbVal){.tag=PB_TAG_ARR,.arr=a}, sv);
+            q += clen;
+        }
+        PbVal v; v.tag=PB_TAG_ARR; v.arr=a; return v;
+    }
     const char* found;
     while ((found = strstr(p, d)) != NULL) {
         size_t len = found - p;
@@ -1339,7 +1458,463 @@ static PbVal pb_builtin_json_stringify(PbVal v) {
     pb_json_stringify_value(&out, v, 0);
     PbVal s; s.tag = PB_TAG_STR; s.str = out.data; return s;
 }
-static PbVal pb_builtin_sha256(PbVal s) { (void)s; return PB_STR("0000000000000000000000000000000000000000000000000000000000000000"); }
+/* ─── 32/64-bit bitwise builtins (match the interpreter: cast f64 -> i64, op, back) ─── */
+static PbVal pb_builtin_bit_and(PbVal a, PbVal b) { if (a.tag!=PB_TAG_NUM||b.tag!=PB_TAG_NUM) return PB_NIL; return PB_NUM((double)((int64_t)a.num & (int64_t)b.num)); }
+static PbVal pb_builtin_bit_or (PbVal a, PbVal b) { if (a.tag!=PB_TAG_NUM||b.tag!=PB_TAG_NUM) return PB_NIL; return PB_NUM((double)((int64_t)a.num | (int64_t)b.num)); }
+static PbVal pb_builtin_bit_xor(PbVal a, PbVal b) { if (a.tag!=PB_TAG_NUM||b.tag!=PB_TAG_NUM) return PB_NIL; return PB_NUM((double)((int64_t)a.num ^ (int64_t)b.num)); }
+static PbVal pb_builtin_bit_shl(PbVal a, PbVal b) { if (a.tag!=PB_TAG_NUM||b.tag!=PB_TAG_NUM) return PB_NIL; return PB_NUM((double)((int64_t)a.num << (int64_t)b.num)); }
+static PbVal pb_builtin_bit_shr(PbVal a, PbVal b) { if (a.tag!=PB_TAG_NUM||b.tag!=PB_TAG_NUM) return PB_NIL; return PB_NUM((double)((int64_t)a.num >> (int64_t)b.num)); }
+static PbVal pb_builtin_bit_not(PbVal a)          { if (a.tag!=PB_TAG_NUM) return PB_NIL; return PB_NUM((double)(~(int64_t)a.num)); }
+
+/* ─── str_to_bytes: UTF-8 bytes of a string as a number array ─── */
+static PbVal pb_builtin_str_to_bytes(PbVal s) {
+    if (s.tag != PB_TAG_STR) return PB_NIL;
+    size_t n = strlen(s.str);
+    PbVal v = pb_arr_new(n ? n : 1);
+    v.arr->len = n;
+    for (size_t i = 0; i < n; i++) v.arr->data[i] = PB_NUM((double)(unsigned char)s.str[i]);
+    return v;
+}
+
+/* ─── real SHA-256 (FIPS 180-4), replacing the earlier zero-returning stub ─── */
+static void pb__sha256(const unsigned char* data, size_t len, char out[65]) {
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    uint64_t bitlen = (uint64_t)len * 8;
+    size_t padded = ((len + 8) / 64 + 1) * 64;
+    unsigned char* m = (unsigned char*)calloc(padded, 1);
+    memcpy(m, data, len);
+    m[len] = 0x80;
+    for (int i = 0; i < 8; i++) m[padded - 1 - i] = (unsigned char)(bitlen >> (8 * i));
+    for (size_t off = 0; off < padded; off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++)
+            w[i] = ((uint32_t)m[off+i*4]<<24)|((uint32_t)m[off+i*4+1]<<16)|((uint32_t)m[off+i*4+2]<<8)|(uint32_t)m[off+i*4+3];
+        for (int i = 16; i < 64; i++) {
+            uint32_t x = w[i-15], y = w[i-2];
+            uint32_t s0 = ((x>>7)|(x<<25)) ^ ((x>>18)|(x<<14)) ^ (x>>3);
+            uint32_t s1 = ((y>>17)|(y<<15)) ^ ((y>>19)|(y<<13)) ^ (y>>10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int i = 0; i < 64; i++) {
+            uint32_t S1 = ((e>>6)|(e<<26)) ^ ((e>>11)|(e<<21)) ^ ((e>>25)|(e<<7));
+            uint32_t ch = (e & f) ^ ((~e) & g);
+            uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+            uint32_t S0 = ((a>>2)|(a<<30)) ^ ((a>>13)|(a<<19)) ^ ((a>>22)|(a<<10));
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t t2 = S0 + maj;
+            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    free(m);
+    for (int i = 0; i < 8; i++) sprintf(out + i*8, "%08x", h[i]);
+    out[64] = 0;
+}
+static PbVal pb_builtin_sha256(PbVal s) {
+    if (s.tag != PB_TAG_STR) return PB_NIL;
+    char out[65];
+    pb__sha256((const unsigned char*)s.str, strlen(s.str), out);
+    return pb_str_lit(out);
+}
+
+/* ─── Filesystem (native binaries have no capability sandbox: raw file I/O) ─── */
+static PbVal pb_builtin_fs_read(PbVal path) {
+    if (path.tag != PB_TAG_STR) return PB_NIL;
+    FILE* f = fopen(path.str, "rb");
+    if (!f) return PB_NIL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return PB_NIL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return PB_NIL; }
+    rewind(f);
+    char* buf = (char*)malloc((size_t)sz + 1);
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = '\0';
+    PbVal v; v.tag = PB_TAG_STR; v.str = buf; return v;
+}
+static PbVal pb_builtin_fs_write(PbVal path, PbVal content) {
+    if (path.tag != PB_TAG_STR || content.tag != PB_TAG_STR) return pb_bool(false);
+    FILE* f = fopen(path.str, "wb");
+    if (!f) return pb_bool(false);
+    size_t n = strlen(content.str);
+    size_t wr = fwrite(content.str, 1, n, f);
+    fclose(f);
+    return pb_bool(wr == n);
+}
+static PbVal pb_builtin_env_get(PbVal name) {
+    if (name.tag != PB_TAG_STR) return PB_NIL;
+    const char* v = getenv(name.str);
+    return v ? pb_str_lit(v) : PB_NIL;
+}
+static PbVal pb_builtin_fs_exists(PbVal path) {
+    if (path.tag != PB_TAG_STR) return pb_bool(false);
+    struct stat st;
+    return pb_bool(stat(path.str, &st) == 0);
+}
+static PbVal pb_builtin_fs_remove(PbVal path) {
+    if (path.tag != PB_TAG_STR) return pb_bool(false);
+    return pb_bool(remove(path.str) == 0);
+}
+static PbVal pb_builtin_fs_append(PbVal path, PbVal content) {
+    if (path.tag != PB_TAG_STR || content.tag != PB_TAG_STR) return pb_bool(false);
+    FILE* f = fopen(path.str, "ab");
+    if (!f) return pb_bool(false);
+    size_t n = strlen(content.str), wr = fwrite(content.str, 1, n, f);
+    fclose(f);
+    return pb_bool(wr == n);
+}
+static PbVal pb_builtin_fs_read_bytes(PbVal path) {
+    if (path.tag != PB_TAG_STR) return PB_NIL;
+    FILE* f = fopen(path.str, "rb");
+    if (!f) return PB_NIL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return PB_NIL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return PB_NIL; }
+    rewind(f);
+    PbVal v = pb_arr_new((size_t)sz ? (size_t)sz : 1);
+    unsigned char* tmp = (unsigned char*)malloc((size_t)sz + 1);
+    size_t rd = fread(tmp, 1, (size_t)sz, f);
+    fclose(f);
+    v.arr->len = rd;
+    for (size_t i = 0; i < rd; i++) v.arr->data[i] = PB_NUM((double)tmp[i]);
+    free(tmp);
+    return v;
+}
+static PbVal pb_builtin_fs_write_bytes(PbVal path, PbVal arr) {
+    if (path.tag != PB_TAG_STR || arr.tag != PB_TAG_ARR) return pb_bool(false);
+    FILE* f = fopen(path.str, "wb");
+    if (!f) return pb_bool(false);
+    for (size_t i = 0; i < arr.arr->len; i++)
+        fputc((unsigned char)(int)arr.arr->data[i].num, f);
+    fclose(f);
+    return pb_bool(true);
+}
+static PbVal pb_builtin_bytes_to_str(PbVal arr) {
+    if (arr.tag != PB_TAG_ARR) return PB_NIL;
+    size_t n = arr.arr->len;
+    char* buf = (char*)malloc(n + 1);
+    for (size_t i = 0; i < n; i++) buf[i] = (char)(unsigned char)(int)arr.arr->data[i].num;
+    buf[n] = '\0';
+    PbVal v; v.tag = PB_TAG_STR; v.str = buf; return v;
+}
+static PbVal pb_builtin_fs_mkdirs(PbVal path) {
+    if (path.tag != PB_TAG_STR) return pb_bool(false);
+#ifdef _WIN32
+    return pb_bool(false);
+#else
+    size_t len = strlen(path.str);
+    char* tmp = (char*)malloc(len + 1);
+    memcpy(tmp, path.str, len + 1);
+    for (size_t i = 1; i < len; i++) {
+        if (tmp[i] == '/') { tmp[i] = '\0'; mkdir(tmp, 0777); tmp[i] = '/'; }
+    }
+    mkdir(tmp, 0777);
+    free(tmp);
+    return pb_bool(true);
+#endif
+}
+static PbVal pb_builtin_fs_listdir(PbVal path) {
+    if (path.tag != PB_TAG_STR) return PB_NIL;
+#ifdef _WIN32
+    return pb_arr_new(1);
+#else
+    DIR* d = opendir(path.str);
+    if (!d) return PB_NIL;
+    PbVal v = pb_arr_new(8);
+    v.arr->len = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        if (v.arr->len >= v.arr->cap) {
+            v.arr->cap *= 2;
+            v.arr->data = (PbVal*)realloc(v.arr->data, v.arr->cap * sizeof(PbVal));
+        }
+        v.arr->data[v.arr->len++] = pb_str_lit(e->d_name);
+    }
+    closedir(d);
+    return v;
+#endif
+}
+
+/* ─── Tensor kernels (a tensor is map{ shape:[...], data:[flat row-major], dtype }) ─── */
+static PbVal pb_builtin_tensor_argmax(PbVal t) {
+    if (t.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal d = pb_map_get(t, PB_STR("data"));
+    if (d.tag != PB_TAG_ARR || d.arr->len == 0) return PB_NUM(0.0);
+    size_t best = 0; double bv = d.arr->data[0].num;
+    for (size_t i = 1; i < d.arr->len; i++)
+        if (d.arr->data[i].num > bv) { bv = d.arr->data[i].num; best = i; }
+    return PB_NUM((double)best);
+}
+static PbVal pb_builtin_tensor_matmul(PbVal A, PbVal B) {
+    if (A.tag != PB_TAG_MAP || B.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal sa = pb_map_get(A, PB_STR("shape")), da = pb_map_get(A, PB_STR("data"));
+    PbVal sb = pb_map_get(B, PB_STR("shape")), db = pb_map_get(B, PB_STR("data"));
+    if (sa.tag != PB_TAG_ARR || sb.tag != PB_TAG_ARR || da.tag != PB_TAG_ARR || db.tag != PB_TAG_ARR) return PB_NIL;
+    if (sa.arr->len != 2 || sb.arr->len != 2) return PB_NIL;
+    size_t m = (size_t)sa.arr->data[0].num, k = (size_t)sa.arr->data[1].num;
+    size_t k2 = (size_t)sb.arr->data[0].num, n = (size_t)sb.arr->data[1].num;
+    if (k != k2) return PB_NIL;
+    size_t olen = m * n ? m * n : 1;
+    PbVal out = pb_arr_new(olen); out.arr->len = m * n;
+    for (size_t i = 0; i < m; i++)
+        for (size_t j = 0; j < n; j++) {
+            double s = 0.0;
+            for (size_t p = 0; p < k; p++)
+                s += da.arr->data[i * k + p].num * db.arr->data[p * n + j].num;
+            out.arr->data[i * n + j] = PB_NUM(s);
+        }
+    PbVal shape = pb_arr_new(2); shape.arr->len = 2;
+    shape.arr->data[0] = PB_NUM((double)m); shape.arr->data[1] = PB_NUM((double)n);
+    PbVal r = pb_map_new();
+    pb_map_set(r, PB_STR("shape"), shape);
+    pb_map_set(r, PB_STR("data"), out);
+    pb_map_set(r, PB_STR("dtype"), PB_STR("f32"));
+    return r;
+}
+static PbVal pb_builtin_tensor_add(PbVal A, PbVal B) {
+    if (A.tag != PB_TAG_MAP || B.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal sa = pb_map_get(A, PB_STR("shape")), da = pb_map_get(A, PB_STR("data"));
+    PbVal db = pb_map_get(B, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR || db.tag != PB_TAG_ARR || da.arr->len != db.arr->len) return PB_NIL;
+    PbVal out = pb_arr_new(da.arr->len ? da.arr->len : 1); out.arr->len = da.arr->len;
+    for (size_t i = 0; i < da.arr->len; i++)
+        out.arr->data[i] = PB_NUM(da.arr->data[i].num + db.arr->data[i].num);
+    PbVal r = pb_map_new();
+    pb_map_set(r, PB_STR("shape"), sa);
+    pb_map_set(r, PB_STR("data"), out);
+    pb_map_set(r, PB_STR("dtype"), PB_STR("f32"));
+    return r;
+}
+
+static PbVal pb__tensor_wrap(PbVal shape, PbVal data) {
+    PbVal r = pb_map_new();
+    pb_map_set(r, PB_STR("shape"), shape);
+    pb_map_set(r, PB_STR("data"), data);
+    pb_map_set(r, PB_STR("dtype"), PB_STR("f32"));
+    return r;
+}
+static PbVal pb_builtin_tensor_backend(void) {
+    /* native c-transpiler: single-threaded CPU f64, sequential (no rayon/GPU) */
+    PbVal m = pb_map_new();
+    pb_map_set(m, PB_STR("cpu_threads"), PB_NUM(1.0));
+    pb_map_set(m, PB_STR("gpu_available"), pb_bool(0));
+    pb_map_set(m, PB_STR("gpu_enabled"), pb_bool(0));
+    pb_map_set(m, PB_STR("gpu_feature"), pb_bool(0));
+    pb_map_set(m, PB_STR("gpu_mode"), PB_STR("off"));
+    pb_map_set(m, PB_STR("gpu_adapter"), PB_STR("none (native c-transpiler)"));
+    pb_map_set(m, PB_STR("gpu_adapter_type"), PB_STR("none"));
+    pb_map_set(m, PB_STR("parallel_matmul"), pb_bool(0));
+    pb_map_set(m, PB_STR("note"), PB_STR("native c-transpiler backend: single-threaded CPU"));
+    return m;
+}
+static PbVal pb_builtin_tensor_sum(PbVal A) {
+    if (A.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal da = pb_map_get(A, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR) return PB_NIL;
+    double s = 0.0; for (size_t i = 0; i < da.arr->len; i++) s += da.arr->data[i].num;
+    return PB_NUM(s);
+}
+static PbVal pb_builtin_tensor_dot(PbVal A, PbVal B) {
+    if (A.tag != PB_TAG_MAP || B.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal da = pb_map_get(A, PB_STR("data")), db = pb_map_get(B, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR || db.tag != PB_TAG_ARR || da.arr->len != db.arr->len) return PB_NIL;
+    double s = 0.0; for (size_t i = 0; i < da.arr->len; i++) s += da.arr->data[i].num * db.arr->data[i].num;
+    return PB_NUM(s);
+}
+static PbVal pb_builtin_tensor_sub(PbVal A, PbVal B) {
+    if (A.tag != PB_TAG_MAP || B.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal sa = pb_map_get(A, PB_STR("shape")), da = pb_map_get(A, PB_STR("data")), db = pb_map_get(B, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR || db.tag != PB_TAG_ARR || da.arr->len != db.arr->len) return PB_NIL;
+    PbVal out = pb_arr_new(da.arr->len ? da.arr->len : 1); out.arr->len = da.arr->len;
+    for (size_t i = 0; i < da.arr->len; i++) out.arr->data[i] = PB_NUM(da.arr->data[i].num - db.arr->data[i].num);
+    return pb__tensor_wrap(sa, out);
+}
+static PbVal pb_builtin_tensor_scale(PbVal A, PbVal k) {
+    if (A.tag != PB_TAG_MAP || k.tag != PB_TAG_NUM) return PB_NIL;
+    PbVal sa = pb_map_get(A, PB_STR("shape")), da = pb_map_get(A, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR) return PB_NIL;
+    PbVal out = pb_arr_new(da.arr->len ? da.arr->len : 1); out.arr->len = da.arr->len;
+    for (size_t i = 0; i < da.arr->len; i++) out.arr->data[i] = PB_NUM(da.arr->data[i].num * k.num);
+    return pb__tensor_wrap(sa, out);
+}
+static PbVal pb_builtin_tensor_relu(PbVal A) {
+    if (A.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal sa = pb_map_get(A, PB_STR("shape")), da = pb_map_get(A, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR) return PB_NIL;
+    PbVal out = pb_arr_new(da.arr->len ? da.arr->len : 1); out.arr->len = da.arr->len;
+    for (size_t i = 0; i < da.arr->len; i++) { double x = da.arr->data[i].num; out.arr->data[i] = PB_NUM(x > 0 ? x : 0); }
+    return pb__tensor_wrap(sa, out);
+}
+static PbVal pb_builtin_tensor_softmax(PbVal A) {
+    if (A.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal sa = pb_map_get(A, PB_STR("shape")), da = pb_map_get(A, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR || da.arr->len == 0) return PB_NIL;
+    size_t n = da.arr->len; double mx = da.arr->data[0].num;
+    for (size_t i = 1; i < n; i++) if (da.arr->data[i].num > mx) mx = da.arr->data[i].num;
+    PbVal out = pb_arr_new(n); out.arr->len = n; double sum = 0.0;
+    for (size_t i = 0; i < n; i++) { double e = exp(da.arr->data[i].num - mx); out.arr->data[i] = PB_NUM(e); sum += e; }
+    if (!(sum > 0)) sum = 1.0;
+    for (size_t i = 0; i < n; i++) out.arr->data[i] = PB_NUM(out.arr->data[i].num / sum);
+    return pb__tensor_wrap(sa, out);
+}
+static PbVal pb_builtin_tensor_gelu(PbVal A) {
+    /* GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))) — matches the VM exactly. */
+    if (A.tag != PB_TAG_MAP) return PB_NIL;
+    PbVal sa = pb_map_get(A, PB_STR("shape")), da = pb_map_get(A, PB_STR("data"));
+    if (da.tag != PB_TAG_ARR) return PB_NIL;
+    const double c = 0.7978845608028654; /* sqrt(2/pi) */
+    PbVal out = pb_arr_new(da.arr->len ? da.arr->len : 1); out.arr->len = da.arr->len;
+    for (size_t i = 0; i < da.arr->len; i++) {
+        double x = da.arr->data[i].num;
+        out.arr->data[i] = PB_NUM(0.5 * x * (1.0 + tanh(c * (x + 0.044715 * x * x * x))));
+    }
+    return pb__tensor_wrap(sa, out);
+}
+
+/* ─── Concurrency: SEQUENTIAL emulation in native binaries (correct results, no real OS
+   threads — parallel best-of-N training runs serially). spawn(thunk) runs the 0-arg closure
+   immediately and returns its result; join_all(handles) returns them unchanged. ─── */
+static PbVal pb_builtin_spawn(PbVal thunk) {
+    if (thunk.tag != PB_TAG_FN) return PB_NIL;
+    return pb_call(thunk, NULL, 0);
+}
+static PbVal pb_builtin_join_all(PbVal handles) {
+    return handles;
+}
+
+/* ─── Type predicates + reflection ─── */
+static PbVal pb_builtin_is_map(PbVal v)    { return pb_bool(v.tag == PB_TAG_MAP); }
+static PbVal pb_builtin_is_array(PbVal v)  { return pb_bool(v.tag == PB_TAG_ARR); }
+static PbVal pb_builtin_is_string(PbVal v) { return pb_bool(v.tag == PB_TAG_STR); }
+static PbVal pb_builtin_is_number(PbVal v) { return pb_bool(v.tag == PB_TAG_NUM || v.tag == PB_TAG_DEC); }
+static PbVal pb_builtin_is_bool(PbVal v)   { return pb_bool(v.tag == PB_TAG_BOOL); }
+static PbVal pb_builtin_is_nil(PbVal v)    { return pb_bool(v.tag == PB_TAG_NIL); }
+static PbVal pb_builtin_is_fn(PbVal v)     { return pb_bool(v.tag == PB_TAG_FN); }
+static PbVal pb_builtin_is_int(PbVal v)    { return pb_bool(v.tag == PB_TAG_NUM && v.num == (double)(long long)v.num); }
+static PbVal pb_builtin_is_float(PbVal v)  { return pb_bool(v.tag == PB_TAG_NUM); }
+static PbVal pb_builtin_typeof(PbVal v) {
+    switch (v.tag) {
+        case PB_TAG_NIL:  return PB_STR("nil");
+        case PB_TAG_BOOL: return PB_STR("bool");
+        case PB_TAG_NUM:  return PB_STR("number");
+        case PB_TAG_STR:  return PB_STR("string");
+        case PB_TAG_ARR:  return PB_STR("array");
+        case PB_TAG_MAP:  return PB_STR("map");
+        case PB_TAG_FN:   return PB_STR("function");
+        case PB_TAG_ERR:  return PB_STR("error");
+        case PB_TAG_DEC:  return PB_STR("decimal");
+        default:          return PB_STR("unknown");
+    }
+}
+static PbVal pb_builtin_platform(void) {
+#ifdef _WIN32
+    return PB_STR("windows");
+#elif defined(__APPLE__)
+    return PB_STR("macos");
+#else
+    return PB_STR("linux");
+#endif
+}
+static PbVal pb_builtin_now_iso(void) {
+    time_t t = time(NULL);
+    struct tm* g = gmtime(&t);
+    char buf[32];
+    if (g && strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", g)) return pb_str_lit(buf);
+    return PB_STR("");
+}
+
+/* ─── Process execution ───────────────────────────────────────────────
+   exec(cmd) matches the INTERPRETER's hardened contract exactly (crates/
+   pblang-vm/src/vm/runtime.rs): reject whitespace + shell metacharacters
+   (single-token commands only — use proc_spawn_wait for arguments), run the
+   binary DIRECTLY with no shell (execvp, not system/popen → no shell injection)
+   and inherited stdio, and return the process EXIT CODE as a number. Returning
+   a string here (as an earlier draft did) diverged from the interpreter and
+   made `exec(cmd) + n` throw "type error in +" natively. */
+static int pb__exec_unsafe_char(char c) {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f') return 1;
+    switch (c) {
+        case ';': case '&': case '|': case '$': case '`': case '>': case '<':
+        case '!': case '{': case '}': case '(': case ')': case '\'': case '"':
+        case '\\': case '*': case '?': case '[': case ']': case '#': case '~':
+            return 1;
+        default: return 0;
+    }
+}
+static PbVal pb_builtin_exec(PbVal cmd) {
+    if (cmd.tag != PB_TAG_STR) return PB_NIL;
+    for (const char* p = cmd.str; *p; p++) {
+        if (pb__exec_unsafe_char(*p)) {
+            pb_throw(PB_STR("exec(): command contains shell metacharacters or whitespace — use proc_spawn_wait(cmd, args_array) instead."));
+        }
+    }
+#ifndef _WIN32
+    pid_t pid = fork();
+    if (pid < 0) return PB_NUM(1.0);
+    if (pid == 0) {
+        char* argv[2]; argv[0] = cmd.str; argv[1] = NULL;
+        execvp(cmd.str, argv);
+        _exit(127);
+    }
+    int status = 0; waitpid(pid, &status, 0);
+    return PB_NUM((double)(WIFEXITED(status) ? WEXITSTATUS(status) : 1));
+#else
+    int rc = system(cmd.str);
+    return PB_NUM((double)(rc == -1 ? 1 : rc));
+#endif
+}
+#ifndef _WIN32
+static PbVal pb_builtin_proc_spawn_wait(PbVal cmd, PbVal args) {
+    if (cmd.tag != PB_TAG_STR) return PB_NIL;
+    size_t na = (args.tag == PB_TAG_ARR) ? args.arr->len : 0;
+    char** argv = (char**)malloc((na + 2) * sizeof(char*));
+    argv[0] = cmd.str;
+    for (size_t i = 0; i < na; i++) {
+        PbVal a = args.arr->data[i];
+        argv[i + 1] = (a.tag == PB_TAG_STR) ? a.str : (char*)"";
+    }
+    argv[na + 1] = NULL;
+    int op[2];
+    if (pipe(op) != 0) { free(argv); return PB_NIL; }
+    pid_t pid = fork();
+    if (pid < 0) { free(argv); close(op[0]); close(op[1]); return PB_NIL; }
+    if (pid == 0) {
+        dup2(op[1], STDOUT_FILENO);
+        close(op[0]); close(op[1]);
+        execvp(cmd.str, argv);
+        _exit(127);
+    }
+    close(op[1]);
+    size_t cap = 256, len = 0; char* buf = (char*)malloc(cap); char rb[256]; ssize_t r;
+    while ((r = read(op[0], rb, sizeof(rb))) > 0) {
+        while (len + (size_t)r + 1 >= cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+        memcpy(buf + len, rb, (size_t)r); len += (size_t)r;
+    }
+    buf[len] = '\0'; close(op[0]);
+    int status = 0; waitpid(pid, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    free(argv);
+    PbVal so; so.tag = PB_TAG_STR; so.str = buf;
+    PbVal m = pb_map_new();
+    pb_map_set(m, PB_STR("exit_code"), PB_NUM((double)code));
+    pb_map_set(m, PB_STR("stdout"), so);
+    pb_map_set(m, PB_STR("stderr"), PB_STR(""));
+    return m;
+}
+#else
+static PbVal pb_builtin_proc_spawn_wait(PbVal cmd, PbVal args) { (void)cmd; (void)args; return PB_NIL; }
+#endif
 
 /* ─── Init / Shutdown ────────────────────────────────────────────── */
 static void pb_init(void)     { /* no-op for now */ }

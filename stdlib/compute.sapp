@@ -19,15 +19,86 @@ let P = import("stdlib:parallel.sapp");
 let OS = import("stdlib:os.sapp");
 let W = import("stdlib:watch.sapp");
 let NAT = import("stdlib:native.sapp");   // native-code execution mode (real machine code)
+let A = import("stdlib:accelerator.sapp");
 
-fn cpu_cores() { return try OS.cpu_count() catch 1; }
+let MAX_WORKERS = 64;
+let MAX_DEVICES = 64;
+let MAX_ITEMS = 1000000000;
+let MAX_COST = 9007199254740991;
+let MAX_UNIT_HINT = 1000000000;
+let MAX_OVERHEAD_HINT = 1000000000000;
+let MAX_IO_PATHS = 10000;
+let MAX_PATH_BYTES = 4096;
 
-fn _avail(probe) {
-    let r = try probe() catch nil;
-    if r == nil { return false; }
-    let a = try r.available catch false;
-    if a == nil { return false; }
-    return a;
+fn _option(options, key, fallback) {
+    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+
+fn _positive_int(value, name, fallback, hard_max) {
+    let n = value;
+    if n == nil { n = fallback; }
+    if not is_number(n) or n != num_floor(n) or n < 1 or n > hard_max {
+        throw "compute: " + name + " must be an integer in 1.." + str(hard_max);
+    }
+    return n;
+}
+
+fn _nonnegative_int(value, name) {
+    if not is_number(value) or value != num_floor(value) or value < 0 or value > MAX_ITEMS {
+        throw "compute: " + name + " must be an integer in 0.." + str(MAX_ITEMS);
+    }
+    return value;
+}
+
+fn _bounded_nonnegative_int(value, name, fallback, hard_max) {
+    let n = value;
+    if n == nil { n = fallback; }
+    if not is_number(n) or n != num_floor(n) or n < 0 or n > hard_max {
+        throw "compute: " + name + " must be an integer in 0.." + str(hard_max);
+    }
+    return n;
+}
+
+fn _sat_add(a, b) {
+    if a >= MAX_COST or b >= MAX_COST or a > MAX_COST - b { return MAX_COST; }
+    return a + b;
+}
+
+fn _sat_mul(a, b) {
+    if a == 0 or b == 0 { return 0; }
+    if a >= MAX_COST or b >= MAX_COST or b > num_floor(MAX_COST / a) { return MAX_COST; }
+    return a * b;
+}
+
+fn _ceil_div(a, b) {
+    if a <= 0 { return 0; }
+    return 1 + num_floor((a - 1) / b);
+}
+
+// Relative deterministic defaults. They are routing hints, not claims about a
+// particular machine; callers can replace them with values from local benchmarks.
+fn _workload_profile(workload) {
+    if workload == "numeric" { return map{ work: 16, transfer: 16 }; }
+    if workload == "vector" { return map{ work: 32, transfer: 16 }; }
+    if workload == "matmul" or workload == "tensor" { return map{ work: 4096, transfer: 16 }; }
+    if workload == "image" { return map{ work: 64, transfer: 8 }; }
+    if workload == "training" { return map{ work: 8192, transfer: 16 }; }
+    if workload == "inference" or workload == "onnx" { return map{ work: 4096, transfer: 8 }; }
+    if workload == "distributed" or workload == "batch" { return map{ work: 64, transfer: 64 }; }
+    return map{ work: 1, transfer: 8 };
+}
+
+fn _callable(v) {
+    let t = type(v);
+    return t == "closure" or t == "function" or t == "builtin";
+}
+
+fn cpu_cores() {
+    let cores = try OS.cpu_count() catch 1;
+    if not is_number(cores) or cores != cores or cores != num_floor(cores) or
+       cores < 1 or cores > MAX_ITEMS { return 1; }
+    return cores;
 }
 
 // devices() — enumerate compute + memory resources with a scheduling `weight` (relative
@@ -36,32 +107,106 @@ fn _avail(probe) {
 fn devices() {
     let out = [];
     let cores = cpu_cores();
-    array_push(out, map{ kind: "cpu", units: cores, available: true, weight: cores });
-    let gpu_ok = _avail(W.gpus);
-    let gw = 0; if gpu_ok { gw = 4 * cores; }                 // a GPU, when usable, is worth many cores
-    array_push(out, map{ kind: "gpu", units: 1, available: gpu_ok, weight: gw });
-    let npu_ok = _avail(W.npu);
-    let nw = 0; if npu_ok { nw = 2 * cores; }
-    array_push(out, map{ kind: "npu", units: 1, available: npu_ok, weight: nw });
-    array_push(out, map{ kind: "ram", units: 1, available: true, weight: 0 });
-    array_push(out, map{ kind: "storage", units: 1, available: true, weight: 0 });
+    array_push(out, map{
+        kind: "cpu", units: cores, present: true, usable: true,
+        available: true, weight: cores, reason: "portable_cpu_runtime",
+    });
+    let detected = try A.detect() catch [];
+    let detected_cpu_accel = map{};
+    let di = 0;
+    while di < len(detected) {
+        if (try detected[di].kind catch "") == "cpu" {
+            detected_cpu_accel = try detected[di].ai_features catch map{};
+        }
+        di = di + 1;
+    }
+    let kinds = ["gpu", "npu", "simd", "distributed"];
+    let k = 0;
+    while k < len(kinds) {
+        let kind = kinds[k];
+        let present = false;
+        let name = str_upper(kind);
+        let i = 0;
+        while i < len(detected) {
+            if detected[i].kind == kind {
+                present = try detected[i].present catch false;
+                name = try detected[i].name catch name;
+            }
+            i = i + 1;
+        }
+        if kind == "simd" {
+            present = (try detected_cpu_accel.avx2 catch false) or
+                      (try detected_cpu_accel.avx512 catch false) or
+                      (try detected_cpu_accel.amx catch false);
+            name = try detected_cpu_accel.name catch "CPU SIMD";
+        }
+        // Generic compute dispatch requires an explicitly registered equivalent
+        // kernel. Hardware presence or a specialized built-in kernel is not enough.
+        let usable = A.has_runtime(kind);
+        if usable { present = true; }
+        let weight = 0;
+        if usable {
+            weight = 2 * cores;
+            if kind == "gpu" { weight = 4 * cores; }
+            elif kind == "simd" { weight = cores; }
+        }
+        array_push(out, map{
+            kind: kind, name: name, units: 1, present: present, usable: usable,
+            available: usable, weight: weight,
+            reason: if usable { "registered_runtime" } else { "runtime_not_registered" },
+        });
+        k = k + 1;
+    }
+    array_push(out, map{ kind: "ram", units: 1, present: true, usable: false, available: true, weight: 0 });
+    array_push(out, map{ kind: "storage", units: 1, present: true, usable: false, available: true, weight: 0 });
     return out;
+}
+
+fn _device_usable(device) {
+    if not is_map(device) { return false; }
+    if map_has(device, "usable") { return device.usable == true; }
+    return (try device.available catch false) == true;
+}
+
+fn _device_weight(device) {
+    if not is_map(device) { return 0; }
+    let weight = try device.weight catch 0;
+    if not is_number(weight) or weight != weight or weight <= 0 { return 0; }
+    if weight > MAX_UNIT_HINT { return MAX_UNIT_HINT; }
+    return weight;
 }
 
 // plan(n, devs) — split n tasks across the AVAILABLE executor devices (weight>0),
 // proportionally to weight; remainder goes to the heaviest. Returns [{kind, count}] that
-// sums to n. (GPU/NPU shares fall back to CPU at run time unless a native hook exists.)
+// sums to n. Only executable devices receive work. A malformed/injected device
+// list with no usable executor receives an explicit synthetic CPU fallback.
 fn plan(n, devs) {
+    n = _nonnegative_int(n, "task count");
+    if type(devs) != "array" or len(devs) > MAX_DEVICES {
+        throw "compute: devices must be an array with at most " + str(MAX_DEVICES) + " entries";
+    }
     let tw = 0;
     let i = 0;
-    while i < len(devs) { if devs[i].available and devs[i].weight > 0 { tw = tw + devs[i].weight; } i = i + 1; }
+    while i < len(devs) {
+        if _device_usable(devs[i]) { tw = _sat_add(tw, _device_weight(devs[i])); }
+        i = i + 1;
+    }
+    if tw <= 0 {
+        return [map{ kind: "cpu", count: n, usable: true, fallback_used: true }];
+    }
     let out = [];
     let assigned = 0;
     let j = 0;
     while j < len(devs) {
         let cnt = 0;
-        if devs[j].available and devs[j].weight > 0 and tw > 0 { cnt = num_floor(n * devs[j].weight / tw); }
-        array_push(out, map{ kind: devs[j].kind, count: cnt });
+        let weight = _device_weight(devs[j]);
+        if _device_usable(devs[j]) and weight > 0 and tw > 0 {
+            // Normalize before multiplying so both intermediate values remain
+            // within the exact task-count range even for hostile weights.
+            cnt = num_floor(n * (weight / tw));
+            if cnt > n - assigned { cnt = n - assigned; }
+        }
+        array_push(out, map{ kind: try devs[j].kind catch "unknown", count: cnt, usable: _device_usable(devs[j]) });
         assigned = assigned + cnt;
         j = j + 1;
     }
@@ -69,7 +214,11 @@ fn plan(n, devs) {
         let best = 0 - 1;
         let bestw = 0;
         let k = 0;
-        while k < len(devs) { if devs[k].available and devs[k].weight > bestw { bestw = devs[k].weight; best = k; } k = k + 1; }
+        while k < len(devs) {
+            let weight = _device_weight(devs[k]);
+            if _device_usable(devs[k]) and weight > bestw { bestw = weight; best = k; }
+            k = k + 1;
+        }
         if best >= 0 { out[best].count = out[best].count + (n - assigned); }
     }
     return out;
@@ -78,7 +227,276 @@ fn plan(n, devs) {
 // run(items, worker) — execute worker over every item using ALL CPU cores. `worker` must
 // be SELF-CONTAINED (its argument + builtins only — no upvalues / imported fns), because
 // each runs on its own VM thread. Results come back in input order.
-fn run(items, worker) { return P.par_map(items, worker); }
+fn _serial_map(items, worker) {
+    let out = [];
+    let i = 0;
+    while i < len(items) { array_push(out, worker(items[i])); i = i + 1; }
+    return out;
+}
+
+fn _cpu_map(items, worker, workers, parallel) {
+    if not parallel or workers <= 1 or len(items) <= 1 { return _serial_map(items, worker); }
+    return P.par_map_chunked(items, worker, workers);
+}
+
+fn policy(options = nil) {
+    if options != nil and not is_map(options) { throw "compute: policy options must be a map"; }
+    let preferred = str_lower(str(_option(options, "preferred_device", "auto")));
+    let valid = ["auto", "cpu", "sequential", "gpu", "npu", "simd", "distributed"];
+    let known = false;
+    let i = 0;
+    while i < len(valid) { if valid[i] == preferred { known = true; } i = i + 1; }
+    if not known { throw "compute: unknown preferred device '" + preferred + "'"; }
+    let workload = str_lower(str(_option(options, "workload", "generic")));
+    let profile = _workload_profile(workload);
+    let cores = cpu_cores();
+    if cores > MAX_WORKERS { cores = MAX_WORKERS; }
+    return map{
+        format: "pblang.compute.policy.v1",
+        preferred_device: preferred,
+        workload: workload,
+        allow_parallel: _option(options, "allow_parallel", true) == true,
+        allow_accelerators: _option(options, "allow_accelerators", true) == true,
+        fallback_to_cpu: _option(options, "fallback_to_cpu", true) == true,
+        max_workers: _positive_int(_option(options, "max_workers", cores), "max_workers", cores, MAX_WORKERS),
+        min_parallel_items: _positive_int(_option(options, "min_parallel_items", 32), "min_parallel_items", 32, 100000000),
+        min_accelerator_items: _positive_int(_option(options, "min_accelerator_items", 256), "min_accelerator_items", 256, 100000000),
+        work_units_per_item: _positive_int(_option(options, "work_units_per_item", profile.work), "work_units_per_item", profile.work, MAX_UNIT_HINT),
+        transfer_bytes_per_item: _bounded_nonnegative_int(_option(options, "transfer_bytes_per_item", profile.transfer), "transfer_bytes_per_item", profile.transfer, MAX_UNIT_HINT),
+        parallel_overhead_units: _bounded_nonnegative_int(_option(options, "parallel_overhead_units", 4096), "parallel_overhead_units", 4096, MAX_OVERHEAD_HINT),
+        min_work_units_per_worker: _positive_int(_option(options, "min_work_units_per_worker", 512), "min_work_units_per_worker", 512, MAX_UNIT_HINT),
+        gpu_overhead_units: _bounded_nonnegative_int(_option(options, "gpu_overhead_units", 2048), "gpu_overhead_units", 2048, MAX_OVERHEAD_HINT),
+        npu_overhead_units: _bounded_nonnegative_int(_option(options, "npu_overhead_units", 1024), "npu_overhead_units", 1024, MAX_OVERHEAD_HINT),
+        simd_overhead_units: _bounded_nonnegative_int(_option(options, "simd_overhead_units", 32), "simd_overhead_units", 32, MAX_OVERHEAD_HINT),
+        distributed_overhead_units: _bounded_nonnegative_int(_option(options, "distributed_overhead_units", 8192), "distributed_overhead_units", 8192, MAX_OVERHEAD_HINT),
+        transfer_bytes_per_work_unit: _positive_int(_option(options, "transfer_bytes_per_work_unit", 64), "transfer_bytes_per_work_unit", 64, MAX_UNIT_HINT),
+        max_accelerator_transfer_bytes: _bounded_nonnegative_int(_option(options, "max_accelerator_transfer_bytes", 1073741824), "max_accelerator_transfer_bytes", 1073741824, MAX_COST),
+        cost_model: "pblang.compute.cost.v1",
+        deterministic: true,
+    };
+}
+
+fn estimate_work(n, cfg) {
+    n = _nonnegative_int(n, "item count");
+    if cfg == nil or not is_map(cfg) or (try cfg.format catch "") != "pblang.compute.policy.v1" {
+        throw "compute: invalid execution policy";
+    }
+    let profile = _workload_profile(try cfg.workload catch "generic");
+    let work_per_item = _positive_int(
+        try cfg.work_units_per_item catch profile.work,
+        "work_units_per_item", profile.work, MAX_UNIT_HINT);
+    let transfer_per_item = _bounded_nonnegative_int(
+        try cfg.transfer_bytes_per_item catch profile.transfer,
+        "transfer_bytes_per_item", profile.transfer, MAX_UNIT_HINT);
+    let work_units = _sat_mul(n, work_per_item);
+    let transfer_bytes = _sat_mul(n, transfer_per_item);
+    return map{
+        format: "pblang.compute.estimate.v1",
+        items: n,
+        work_units_per_item: work_per_item,
+        transfer_bytes_per_item: transfer_per_item,
+        work_units: work_units,
+        transfer_bytes: transfer_bytes,
+        saturated: work_units == MAX_COST or transfer_bytes == MAX_COST,
+    };
+}
+
+fn _find_device(devs, kind) {
+    let i = 0;
+    while i < len(devs) {
+        if is_map(devs[i]) and (try devs[i].kind catch "") == kind { return devs[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _matches(workload, kind) {
+    if kind == "gpu" { return workload == "matmul" or workload == "tensor" or workload == "image" or workload == "training"; }
+    if kind == "npu" { return workload == "inference" or workload == "onnx"; }
+    if kind == "simd" { return workload == "numeric" or workload == "vector" or workload == "matmul"; }
+    if kind == "distributed" { return workload == "distributed" or workload == "batch"; }
+    return true;
+}
+
+fn _cpu_route(n, cfg, reason, fallback_used) {
+    let estimate = estimate_work(n, cfg);
+    let parallel_overhead = _bounded_nonnegative_int(
+        try cfg.parallel_overhead_units catch 4096,
+        "parallel_overhead_units", 4096, MAX_OVERHEAD_HINT);
+    let min_work_per_worker = _positive_int(
+        try cfg.min_work_units_per_worker catch 512,
+        "min_work_units_per_worker", 512, MAX_UNIT_HINT);
+    let max_workers = _positive_int(
+        try cfg.max_workers catch 1, "max_workers", 1, MAX_WORKERS);
+    let min_parallel_items = _positive_int(
+        try cfg.min_parallel_items catch 32,
+        "min_parallel_items", 32, 100000000);
+    let workers = 1;
+    let parallel_reason = "parallel_disabled";
+    if (try cfg.allow_parallel catch true) == true {
+        if n < min_parallel_items { parallel_reason = "below_parallel_item_threshold"; }
+        else {
+            parallel_reason = "parallel_overhead_not_amortized";
+            let limit = max_workers;
+            if limit > n { limit = n; }
+            let per_worker = _sat_add(parallel_overhead, min_work_per_worker);
+            let capacity = num_floor(_sat_add(estimate.work_units, parallel_overhead) / per_worker);
+            workers = capacity;
+            if workers > limit { workers = limit; }
+            if workers < 2 { workers = 1; }
+            if workers > 1 { parallel_reason = "parallel_cost_amortized"; }
+        }
+    }
+    let parallel = workers > 1;
+    return map{
+        format: "pblang.compute.route.v1", ok: true,
+        device: "cpu", mode: if parallel { "parallel" } else { "sequential" },
+        workers: workers, fallback_used: fallback_used, reason: reason,
+        parallel_reason: parallel_reason, estimate: estimate,
+    };
+}
+
+fn _accelerator_cost(kind, estimate, cfg) {
+    let overhead = _bounded_nonnegative_int(
+        try cfg.gpu_overhead_units catch 2048,
+        "gpu_overhead_units", 2048, MAX_OVERHEAD_HINT);
+    if kind == "npu" { overhead = _bounded_nonnegative_int(try cfg.npu_overhead_units catch 1024, "npu_overhead_units", 1024, MAX_OVERHEAD_HINT); }
+    elif kind == "simd" { overhead = _bounded_nonnegative_int(try cfg.simd_overhead_units catch 32, "simd_overhead_units", 32, MAX_OVERHEAD_HINT); }
+    elif kind == "distributed" { overhead = _bounded_nonnegative_int(try cfg.distributed_overhead_units catch 8192, "distributed_overhead_units", 8192, MAX_OVERHEAD_HINT); }
+    let transfer_ratio = _positive_int(
+        try cfg.transfer_bytes_per_work_unit catch 64,
+        "transfer_bytes_per_work_unit", 64, MAX_UNIT_HINT);
+    let transfer_units = _ceil_div(estimate.transfer_bytes, transfer_ratio);
+    let required = _sat_add(overhead, transfer_units);
+    return map{
+        format: "pblang.compute.accelerator_cost.v1",
+        device: kind,
+        overhead_units: overhead,
+        transfer_units: transfer_units,
+        required_work_units: required,
+        estimated_work_units: estimate.work_units,
+        estimated_transfer_bytes: estimate.transfer_bytes,
+        amortized: estimate.work_units >= required,
+    };
+}
+
+fn select_device(n, devs, cfg) {
+    n = _nonnegative_int(n, "item count");
+    if cfg == nil or not is_map(cfg) or (try cfg.format catch "") != "pblang.compute.policy.v1" {
+        throw "compute: invalid execution policy";
+    }
+    if type(devs) != "array" or len(devs) > MAX_DEVICES {
+        throw "compute: devices must be an array with at most " + str(MAX_DEVICES) + " entries";
+    }
+    if n == 0 { return _cpu_route(n, cfg, "empty_workload", false); }
+    let preferred = cfg.preferred_device;
+    let known_preferred = false;
+    let valid_preferred = ["auto", "cpu", "sequential", "gpu", "npu", "simd", "distributed"];
+    let pi = 0;
+    while pi < len(valid_preferred) {
+        if preferred == valid_preferred[pi] { known_preferred = true; }
+        pi = pi + 1;
+    }
+    if not known_preferred { throw "compute: invalid preferred device in policy"; }
+    let workload = try cfg.workload catch "generic";
+    let allow_accelerators = (try cfg.allow_accelerators catch true) == true;
+    let fallback_to_cpu = (try cfg.fallback_to_cpu catch true) == true;
+    let min_accelerator_items = _positive_int(
+        try cfg.min_accelerator_items catch 256,
+        "min_accelerator_items", 256, 100000000);
+    let max_transfer = _bounded_nonnegative_int(
+        try cfg.max_accelerator_transfer_bytes catch 1073741824,
+        "max_accelerator_transfer_bytes", 1073741824, MAX_COST);
+    if preferred == "sequential" {
+        let route = _cpu_route(n, cfg, "sequential_requested", false);
+        route.mode = "sequential";
+        route.workers = 1;
+        route.parallel_reason = "sequential_requested";
+        return route;
+    }
+    if preferred == "cpu" { return _cpu_route(n, cfg, "cpu_requested", false); }
+
+    let candidates = if preferred == "auto" { ["npu", "gpu", "simd", "distributed"] } else { [preferred] };
+    let rejected = [];
+    let estimate = estimate_work(n, cfg);
+    let i = 0;
+    while i < len(candidates) {
+        let kind = candidates[i];
+        let d = _find_device(devs, kind);
+        let cost = _accelerator_cost(kind, estimate, cfg);
+        let reason = "runtime_unavailable";
+        if not allow_accelerators { reason = "accelerators_disabled"; }
+        elif not _matches(workload, kind) { reason = "workload_not_supported"; }
+        elif n < min_accelerator_items { reason = "below_accelerator_threshold"; }
+        elif d == nil or not _device_usable(d) { reason = "runtime_unavailable"; }
+        elif estimate.transfer_bytes > max_transfer { reason = "accelerator_transfer_budget_exceeded"; }
+        elif not cost.amortized { reason = "accelerator_overhead_not_amortized"; }
+        else {
+            return map{
+                format: "pblang.compute.route.v1", ok: true, device: kind,
+                mode: "accelerator", workers: 1, fallback_used: false,
+                reason: "usable_runtime_selected", rejected: rejected,
+                estimate: estimate, cost: cost,
+            };
+        }
+        array_push(rejected, map{
+            device: kind, reason: reason,
+            required_work_units: cost.required_work_units,
+            estimated_work_units: estimate.work_units,
+            estimated_transfer_bytes: estimate.transfer_bytes,
+        });
+        i = i + 1;
+    }
+    if preferred != "auto" and not fallback_to_cpu {
+        return map{
+            format: "pblang.compute.route.v1", ok: false, device: preferred,
+            mode: "blocked", workers: 0, fallback_used: false,
+            reason: rejected[0].reason, rejected: rejected,
+        };
+    }
+    let reason = if preferred == "auto" { "portable_cpu_selected" } else { rejected[0].reason + "_cpu_fallback" };
+    let route = _cpu_route(n, cfg, reason, preferred != "auto");
+    route.rejected = rejected;
+    return route;
+}
+
+// run_controlled returns an auditable envelope. Specialized runtimes receive
+// options.payload (or the item array) and must implement the same observable
+// result contract as the CPU worker. Runtime failure follows the explicit policy.
+fn run_controlled(items, worker, options = nil) {
+    if type(items) != "array" { throw "compute: items must be an array"; }
+    if not _callable(worker) { throw "compute: worker must be callable"; }
+    let cfg = policy(options);
+    let devs = _option(options, "devices", nil);
+    if devs == nil { devs = devices(); }
+    if type(devs) != "array" { throw "compute: devices must be an array"; }
+    let route = select_device(len(items), devs, cfg);
+    if not route.ok {
+        return map{ format: "pblang.compute.result.v1", ok: false, route: route, results: nil };
+    }
+    if route.mode == "accelerator" {
+        let payload = _option(options, "payload", items);
+        let cpu_fallback_route = _cpu_route(len(items), cfg, "accelerator_cpu_fallback", true);
+        let fallback = fn(_ignored) { return _cpu_map(items, worker, cpu_fallback_route.workers, cpu_fallback_route.mode == "parallel"); };
+        let dispatched = A.dispatch(route.device, payload, fallback, cfg.fallback_to_cpu);
+        if not dispatched.ok {
+            return map{ format: "pblang.compute.result.v1", ok: false, route: route, dispatch: dispatched, results: nil };
+        }
+        if dispatched.fallback_used {
+            let attempted = route.device;
+            route = cpu_fallback_route;
+            route.reason = dispatched.reason;
+            route.accelerator_attempt = attempted;
+        }
+        return map{ format: "pblang.compute.result.v1", ok: true, route: route, dispatch: dispatched, results: dispatched.value };
+    }
+    let results = _cpu_map(items, worker, route.workers, route.mode == "parallel");
+    return map{ format: "pblang.compute.result.v1", ok: true, route: route, results: results };
+}
+
+// Backward-compatible result-only helper, now bounded instead of spawning one
+// OS thread per element.
+fn run(items, worker) { return run_controlled(items, worker).results; }
 
 // run_chunked(items, worker, chunk_size) — RAM-aware: process the data chunk-by-chunk
 // (each chunk run in parallel), so a dataset bigger than one chunk still fits.
@@ -87,7 +505,7 @@ fn run_chunked(items, worker, chunk_size) {
     let cs = chunk(items, chunk_size);
     let c = 0;
     while c < len(cs) {
-        let part = P.par_map(cs[c], worker);
+        let part = run(cs[c], worker);
         let i = 0;
         while i < len(part) { array_push(out, part[i]); i = i + 1; }
         c = c + 1;
@@ -110,9 +528,50 @@ fn chunk(items, size) {
     return out;
 }
 
-// storage_read_parallel(paths) — read many files at once (parallel storage I/O). fs_read
-// is a builtin, so the worker is self-contained.
-fn storage_read_parallel(paths) { return P.par_map(paths, fn(p) { return fs_read(p); }); }
+// Bounded storage reader: tiny batches stay serial; larger batches use a fixed
+// number of contiguous worker chunks instead of one OS thread per path.
+fn storage_read_controlled(paths, options = nil) {
+    if type(paths) != "array" or len(paths) > MAX_IO_PATHS {
+        throw "compute: paths must be an array with at most " + str(MAX_IO_PATHS) + " entries";
+    }
+    if options != nil and not is_map(options) { throw "compute: storage options must be a map"; }
+    let default_workers = cpu_cores();
+    if default_workers > 8 { default_workers = 8; }
+    let workers = _positive_int(_option(options, "max_workers", default_workers), "storage max_workers", default_workers, MAX_WORKERS);
+    let min_parallel = _positive_int(_option(options, "min_parallel_files", 4), "min_parallel_files", 4, MAX_IO_PATHS);
+    let i = 0;
+    while i < len(paths) {
+        if type(paths[i]) != "string" or len(paths[i]) == 0 or len(str_to_bytes(paths[i])) > MAX_PATH_BYTES {
+            throw "compute: every storage path must be a non-empty string up to " + str(MAX_PATH_BYTES) + " bytes";
+        }
+        i = i + 1;
+    }
+    let actual_workers = workers;
+    if actual_workers > len(paths) { actual_workers = len(paths); }
+    if len(paths) == 0 {
+        return map{
+            format: "pblang.compute.storage_result.v1",
+            mode: "sequential", workers: 0, files: 0, results: [],
+        };
+    }
+    let results = [];
+    if len(paths) < min_parallel or actual_workers <= 1 {
+        i = 0;
+        while i < len(paths) { array_push(results, fs_read(paths[i])); i = i + 1; }
+        return map{
+            format: "pblang.compute.storage_result.v1",
+            mode: "sequential", workers: 1, files: len(paths), results: results,
+        };
+    }
+    results = P.par_map_chunked(paths, fn(path) { return fs_read(path); }, actual_workers);
+    return map{
+        format: "pblang.compute.storage_result.v1",
+        mode: "parallel", workers: actual_workers,
+        files: len(paths), results: results,
+    };
+}
+
+fn storage_read_parallel(paths) { return storage_read_controlled(paths).results; }
 
 // hardware() — full device survey (CPU/GPU/NPU/storage/network) via the watcher.
 fn hardware() { return try W.hardware() catch map{ available: false }; }
@@ -122,7 +581,10 @@ fn summary(devs) {
     let s = "compute:";
     let i = 0;
     while i < len(devs) {
-        if devs[i].available { s = s + " " + devs[i].kind + "(" + str(devs[i].units) + ")"; }
+        if (try devs[i].present catch devs[i].available) {
+            let state = if _device_usable(devs[i]) { "usable" } else { "present" };
+            s = s + " " + devs[i].kind + "(" + state + "," + str(devs[i].units) + ")";
+        }
         i = i + 1;
     }
     return s;
@@ -145,5 +607,7 @@ fn native_value(ir) {
 }
 fn native_info() { return try NAT.info() catch map{ supported: false }; }
 
-export cpu_cores, devices, plan, run, run_chunked, chunk, storage_read_parallel, hardware, summary;
+export cpu_cores, devices, plan, policy, estimate_work, select_device, run_controlled,
+       run, run_chunked, chunk, storage_read_controlled, storage_read_parallel,
+       hardware, summary;
 export native_available, native_arch, native_run, native_value, native_info;

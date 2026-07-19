@@ -8,7 +8,8 @@
 // a GC + heap runtime). This is the MINIMAL core: a numeric subset (numbers as
 // C `double`, matching pblang's f64) covering functions, arithmetic, comparison,
 // if/while, and return — enough to transpile real straight-line/looping/recursive
-// code. Maps/strings/closures/GC come later; this establishes the lowering.
+// code. Hosted numeric closures, arrays, maps, and strings are supported;
+// general GC-managed values and freestanding closure lifetimes come later.
 //
 //   let ct = import("stdlib/compiler/ctranspile.sapp");
 //   ct.transpile("fn add(a, b) { return a + b; }")   // -> C source string
@@ -17,6 +18,11 @@
 
 let _NL = "
 ";
+let _SOURCE_LINKER = nil;
+fn _source_linker() {
+    if _SOURCE_LINKER == nil { _SOURCE_LINKER = import("stdlib:source_inliner.sapp"); }
+    return _SOURCE_LINKER;
+}
 
 // ── Struct/map field-layout registry ────────────────────────────────────────────────
 // Structs desugar to string-keyed maps; to lower `obj.field` to a fixed C offset we
@@ -47,8 +53,9 @@ fn _field_slot(name) {
 // division and the long-casts already on bitwise/% ops are harmless no-ops, which is
 // exactly what OS code (ports, masks, addresses, slot indices) wants. (Module-level
 // mutable state — `_MODE` is a shared map, set/reset per transpile.)
-let _MODE = map{ intmode: false };
+let _MODE = map{ intmode: false, hosted: false };
 fn _set_intmode(b) { _MODE.intmode = b; }
+fn _set_hosted(b) { _MODE.hosted = b; }
 
 // The C type a pblang number lowers to.
 fn _numty() { if _MODE.intmode { return "long"; } return "double"; }
@@ -79,8 +86,254 @@ let _CKEYWORDS = map{
     _Static_assert: true, _Thread_local: true
 };
 fn _cid(name) {
+    // A hosted translation unit owns the C `main` symbol. Keep a user pblang
+    // `fn main()` callable without colliding with the generated entry point.
+    if _MODE.hosted and name == "main" { return "pb_main"; }
     if map_has(_CKEYWORDS, name) { return name + "_pbkw"; }
     return name;
+}
+
+fn _unsupported(kind, category) {
+    throw "ctranspile: unsupported " + category + " kind: " + str(kind);
+}
+
+// Hosted C99 closure conversion. Closure values are small validated numeric
+// handles, never raw C pointers. Each function literal becomes a generated C
+// function plus a heap environment containing captures by value. Captured
+// writes update that private environment, matching the self-hosted VM.
+let _CLOSURE = map{ next: 0, nodes: [], top_fns: map{}, top_nodes: map{}, top_values: map{}, named_values: map{}, needs_runtime: false };
+let _EMIT_CTX = map{ stack: [] };
+
+fn _map_copy(source) {
+    let out = map{};
+    let ks = map_keys(source);
+    let i = 0;
+    while i < len(ks) { out[ks[i]] = source[ks[i]]; i = i + 1; }
+    return out;
+}
+
+fn _closure_reset() {
+    _CLOSURE.next = 0;
+    _CLOSURE.nodes = [];
+    _CLOSURE.top_fns = map{};
+    _CLOSURE.top_nodes = map{};
+    _CLOSURE.top_values = map{};
+    _CLOSURE.named_values = map{};
+    _CLOSURE.needs_runtime = false;
+    _EMIT_CTX.stack = [];
+}
+
+fn _analysis_ctx(locals, outer, capture_set, captures) {
+    return map{ locals: locals, outer: outer, capture_set: capture_set, captures: captures };
+}
+
+fn _analysis_child_scope(ctx) {
+    return _analysis_ctx(_map_copy(ctx.locals), ctx.outer, ctx.capture_set, ctx.captures);
+}
+
+fn _capture_name(ctx, name) {
+    if map_has(ctx.locals, name) { return; }
+    if map_has(ctx.outer, name) and not map_has(ctx.capture_set, name) {
+        ctx.capture_set[name] = true;
+        array_push(ctx.captures, name);
+    }
+}
+
+fn _analyze_expr(node, ctx) {
+    if node == nil { return; }
+    let k = try node.kind catch "";
+    if k == "ident" {
+        if not map_has(ctx.locals, node.name) and not map_has(ctx.outer, node.name)
+            and map_has(_CLOSURE.top_fns, node.name) {
+            _CLOSURE.named_values[node.name] = true;
+            _CLOSURE.needs_runtime = true;
+            return;
+        }
+        _capture_name(ctx, node.name);
+        return;
+    }
+    if k == "number" or k == "string" or k == "bool" or k == "nil" { return; }
+    if k == "binary" { _analyze_expr(node.left, ctx); _analyze_expr(node.right, ctx); return; }
+    if k == "unary" { _analyze_expr(node.operand, ctx); return; }
+    if k == "assign" { _capture_name(ctx, node.name); _analyze_expr(node.value, ctx); return; }
+    if k == "assign_to" { _analyze_expr(node.target, ctx); _analyze_expr(node.value, ctx); return; }
+    if k == "index" { _analyze_expr(node.obj, ctx); _analyze_expr(node.index, ctx); return; }
+    if k == "member" { _analyze_expr(node.obj, ctx); return; }
+    if k == "array" {
+        let items = try node.items catch [];
+        let i = 0; while i < len(items) { _analyze_expr(items[i], ctx); i = i + 1; }
+        return;
+    }
+    if k == "map" {
+        let entries = try node.entries catch [];
+        let i = 0; while i < len(entries) { _analyze_expr(entries[i].value, ctx); i = i + 1; }
+        return;
+    }
+    if k == "call" {
+        let fk = try node.func.kind catch "";
+        let callee_name = try node.func.name catch "";
+        let lexical_call = fk != "ident" or map_has(ctx.locals, callee_name)
+            or map_has(ctx.outer, callee_name) or map_has(_CLOSURE.top_values, callee_name);
+        if lexical_call {
+            _CLOSURE.needs_runtime = true;
+            _analyze_expr(node.func, ctx);
+        }
+        let args = try node.args catch [];
+        let i = 0; while i < len(args) { _analyze_expr(args[i], ctx); i = i + 1; }
+        return;
+    }
+    if k == "if_expr" {
+        _analyze_expr(node.cond, ctx);
+        _analyze_block(try node.then catch nil, _analysis_child_scope(ctx));
+        let els = try node.else catch nil;
+        if els != nil {
+            if (try els.kind catch "") == "if_expr" { _analyze_expr(els, ctx); }
+            else { _analyze_block(els, _analysis_child_scope(ctx)); }
+        }
+        return;
+    }
+    if k == "fn_lit" { _analyze_fnlit(node, ctx); return; }
+}
+
+fn _analyze_stmt(node, ctx) {
+    let k = try node.kind catch "";
+    if k == "let" or k == "const" {
+        _analyze_expr(try node.value catch nil, ctx);
+        ctx.locals[node.name] = true;
+        return;
+    }
+    if k == "return" or k == "print" { _analyze_expr(try node.value catch nil, ctx); return; }
+    if k == "expr_stmt" { _analyze_expr(node.expr, ctx); return; }
+    if k == "if" {
+        _analyze_expr(node.cond, ctx);
+        _analyze_block(try node.then catch nil, _analysis_child_scope(ctx));
+        let elifs = try node.elifs catch [];
+        let i = 0;
+        while i < len(elifs) {
+            _analyze_expr(try elifs[i].cond catch nil, ctx);
+            let b = try elifs[i].block catch nil;
+            if b == nil { b = try elifs[i].then catch nil; }
+            _analyze_block(b, _analysis_child_scope(ctx));
+            i = i + 1;
+        }
+        let els = try node.else catch nil;
+        if els != nil { _analyze_block(els, _analysis_child_scope(ctx)); }
+        return;
+    }
+    if k == "while" {
+        _analyze_expr(node.cond, ctx);
+        _analyze_block(try node.body catch nil, _analysis_child_scope(ctx));
+        return;
+    }
+    if k == "for" {
+        _analyze_expr(try node.end catch nil, ctx);
+        let child = _analysis_child_scope(ctx);
+        child.locals[node.name] = true;
+        _analyze_block(try node.body catch nil, child);
+        return;
+    }
+    if k == "fn" { throw "hosted C99: nested named functions require fn literals"; }
+}
+
+fn _analyze_block(block, ctx) {
+    if block == nil { return; }
+    let stmts = try block.stmts catch [];
+    let i = 0;
+    while i < len(stmts) { _analyze_stmt(stmts[i], ctx); i = i + 1; }
+}
+
+fn _analyze_fnlit(node, parent) {
+    let existing = try node.__c99_closure_id catch nil;
+    if existing != nil { return; }
+    let id = _CLOSURE.next;
+    _CLOSURE.next = id + 1;
+    _CLOSURE.needs_runtime = true;
+    node.__c99_closure_id = id;
+
+    let outer = _map_copy(parent.outer);
+    let pks = map_keys(parent.locals);
+    let oi = 0; while oi < len(pks) { outer[pks[oi]] = true; oi = oi + 1; }
+    let locals = map{};
+    let params = try node.params catch [];
+    let pi = 0; while pi < len(params) { locals[params[pi]] = true; pi = pi + 1; }
+    let child = _analysis_ctx(locals, outer, map{}, []);
+    _analyze_block(try node.body catch nil, child);
+    node.__c99_captures = child.captures;
+    array_push(_CLOSURE.nodes, node);
+
+    // A grandchild may need a variable from the parent's own outer scope. The
+    // parent must capture it too so it can construct the child environment.
+    let ci = 0;
+    while ci < len(child.captures) {
+        let name = child.captures[ci];
+        if not map_has(parent.locals, name) { _capture_name(parent, name); }
+        ci = ci + 1;
+    }
+}
+
+fn _analyze_program(stmts) {
+    _closure_reset();
+    let i = 0;
+    while i < len(stmts) {
+        let kind = try stmts[i].kind catch "";
+        if kind == "fn" {
+            _CLOSURE.top_fns[stmts[i].name] = true;
+            _CLOSURE.top_nodes[stmts[i].name] = stmts[i];
+        } elif kind == "let" or kind == "const" {
+            _CLOSURE.top_values[stmts[i].name] = true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(stmts) {
+        if (try stmts[i].kind catch "") == "fn" {
+            let locals = map{};
+            let params = try stmts[i].params catch [];
+            let p = 0; while p < len(params) { locals[params[p].name] = true; p = p + 1; }
+            _analyze_block(try stmts[i].body catch nil, _analysis_ctx(locals, map{}, map{}, []));
+        }
+        i = i + 1;
+    }
+    let main_ctx = _analysis_ctx(map{}, map{}, map{}, []);
+    i = 0;
+    while i < len(stmts) {
+        let k = try stmts[i].kind catch "";
+        if k != "fn" and k != "struct" and k != "export" and k != "import" {
+            _analyze_stmt(stmts[i], main_ctx);
+        }
+        i = i + 1;
+    }
+}
+
+fn _ctx_push(bindings) { array_push(_EMIT_CTX.stack, bindings); }
+fn _ctx_pop() { if len(_EMIT_CTX.stack) > 0 { array_pop(_EMIT_CTX.stack); } }
+fn _ctx_current() {
+    if len(_EMIT_CTX.stack) == 0 { return nil; }
+    return _EMIT_CTX.stack[len(_EMIT_CTX.stack) - 1];
+}
+fn _ctx_has(name) {
+    let current = _ctx_current();
+    return current != nil and map_has(current, name);
+}
+fn _ctx_resolve(name) {
+    let current = _ctx_current();
+    if current != nil and map_has(current, name) { return current[name]; }
+    return _cid(name);
+}
+fn _ctx_bind(name, expression) {
+    let current = _ctx_current();
+    if current != nil { current[name] = expression; }
+}
+
+// Value-producing C conditional expressions are intentionally limited to
+// single expression statements. More complex value blocks need scope/result
+// lowering; rejecting them is safer than silently changing their semantics.
+fn _value_block_expr(block) {
+    let stmts = try block.stmts catch [];
+    if len(stmts) != 1 or (try stmts[0].kind catch "") != "expr_stmt" {
+        throw "ctranspile: if-expression branch must contain exactly one value expression";
+    }
+    return transpile_expr(stmts[0].expr);
 }
 
 // ── Expressions → C ────────────────────────────────────────────────────────────────
@@ -88,7 +341,12 @@ fn transpile_expr(node) {
     if node == nil { return "0"; }
     let k = node.kind;
     if k == "number" { return str(node.value); }
-    if k == "ident" { return _cid(node.name); }
+    if k == "ident" {
+        if not _ctx_has(node.name) and _MODE.hosted and map_has(_CLOSURE.named_values, node.name) {
+            return "pb_named_value_" + _cid(node.name) + "()";
+        }
+        return _ctx_resolve(node.name);
+    }
     if k == "bool" { if node.value { return "1"; } return "0"; }
     if k == "nil" { return "0"; }
     // Array literal → a length-prefixed block on the bump allocator: slot 0 holds
@@ -152,9 +410,23 @@ fn transpile_expr(node) {
     }
     if k == "binary" {
         let op = node.op;
-        // C `%` is integer-only, so modulo needs long casts.
+        // C `%` is integer-only. Literal non-zero divisors stay visible to the
+        // C optimizer; dynamic hosted divisors use the checked helper so zero
+        // and LONG_MIN%-1 fail closed instead of invoking C undefined behavior.
         if op == "%" {
-            return "((long)" + transpile_expr(node.left) + " % (long)" + transpile_expr(node.right) + ")";
+            let left = transpile_expr(node.left); let right = transpile_expr(node.right);
+            let divisor = nil;
+            if (try node.right.kind catch "") == "number" { divisor = try parse_number(node.right.value) catch nil; }
+            if divisor != nil and divisor == 0 { throw "ctranspile: modulo by literal zero"; }
+            if divisor != nil {
+                if _MODE.intmode { return "(" + left + " % " + right + ")"; }
+                return "((long)" + left + " % (long)" + right + ")";
+            }
+            if _MODE.hosted {
+                if _MODE.intmode { return "pb_mod_checked(" + left + ", " + right + ")"; }
+                return "pb_mod_checked((long)" + left + ", (long)" + right + ")";
+            }
+            return "((long)" + left + " % (long)" + right + ")";
         }
         // Map pblang logical keywords to C operators.
         if op == "and" { op = "&&"; }
@@ -164,12 +436,55 @@ fn transpile_expr(node) {
     if k == "unary" {
         if node.op == "-" { return "(-" + transpile_expr(node.operand) + ")"; }
         if node.op == "not" or node.op == "!" { return "(!" + transpile_expr(node.operand) + ")"; }
-        return transpile_expr(node.operand);
+        return _unsupported(node.op, "unary operator");
+    }
+    if k == "assign" {
+        return "(" + _ctx_resolve(node.name) + " = " + transpile_expr(node.value) + ")";
+    }
+    if k == "assign_to" {
+        let target_kind = try node.target.kind catch "";
+        if target_kind != "index" and target_kind != "member" {
+            return _unsupported(target_kind, "assignment target");
+        }
+        return "(" + transpile_expr(node.target) + " = " + transpile_expr(node.value) + ")";
+    }
+    if k == "if_expr" {
+        let yes = _value_block_expr(node.then);
+        let no = "0";
+        let els = try node.else catch nil;
+        if els != nil {
+            if (try els.kind catch "") == "if_expr" { no = transpile_expr(els); }
+            else { no = _value_block_expr(els); }
+        }
+        return "(" + transpile_expr(node.cond) + " ? " + yes + " : " + no + ")";
+    }
+    if k == "fn_lit" {
+        if not _MODE.hosted { throw "ctranspile: closures require the hosted C99 runtime"; }
+        let id = try node.__c99_closure_id catch nil;
+        if id == nil { throw "hosted C99: closure was not analyzed"; }
+        let captures = try node.__c99_captures catch [];
+        let cap_values = "0";
+        if len(captures) > 0 {
+            cap_values = "(const " + _numty() + "[]){";
+            let ci = 0;
+            while ci < len(captures) {
+                if ci > 0 { cap_values = cap_values + ", "; }
+                cap_values = cap_values + _ctx_resolve(captures[ci]);
+                ci = ci + 1;
+            }
+            cap_values = cap_values + "}";
+        }
+        return "pb_closure_new(pb_lambda_" + str(id) + ", "
+            + str(len(try node.params catch [])) + ", " + str(len(captures))
+            + ", " + cap_values + ")";
     }
     if k == "call" {
         let fname = "";
         if (try node.func.kind catch "") == "ident" { fname = node.func.name; }
         let args = try node.args catch [];
+        if fname == "import" {
+            throw "ctranspile: imports require prior module resolution/inlining";
+        }
         // Bitwise / modulo builtins lower to C operators (integers via long casts),
         // so bit-twiddling and masks transpile to real native ops — essential for
         // OS code (ports, flags, addresses).
@@ -187,8 +502,26 @@ fn transpile_expr(node) {
         if fname == "addr_of" and len(args) == 1 and (try args[0].kind catch "") == "string" {
             return _vcast() + "&" + _cid(args[0].value);
         }
-        // generic call
-        let s = transpile_expr(node.func) + "(";
+        // An identifier bound in the current lexical context is a numeric
+        // closure handle. Everything else keeps the direct C call path used by
+        // named pblang functions and OS intrinsics.
+        let dynamic = fname == "" or _ctx_has(fname) or map_has(_CLOSURE.top_values, fname);
+        if dynamic {
+            if not _MODE.hosted { throw "ctranspile: dynamic calls require the hosted C99 runtime"; }
+            // GNU99 statement expression fixes pblang's callee-first,
+            // left-to-right argument evaluation instead of relying on C's
+            // unspecified function-argument order.
+            let s = "({ " + _numty() + " _pb_fn = " + transpile_expr(node.func) + ";";
+            if len(args) == 0 { return s + " pb_closure_call(_pb_fn, 0, 0); })"; }
+            s = s + " " + _numty() + " _pb_args[" + str(len(args)) + "];";
+            let i = 0;
+            while i < len(args) {
+                s = s + " _pb_args[" + str(i) + "] = " + transpile_expr(args[i]) + ";";
+                i = i + 1;
+            }
+            return s + " pb_closure_call(_pb_fn, " + str(len(args)) + ", _pb_args); })";
+        }
+        let s = _cid(fname) + "(";
         let i = 0;
         while i < len(args) {
             if i > 0 { s = s + ", "; }
@@ -197,7 +530,7 @@ fn transpile_expr(node) {
         }
         return s + ")";
     }
-    return "0";   // unsupported expr → placeholder (subset)
+    return _unsupported(k, "expression");
 }
 
 // ── Statements → C (indented) ──────────────────────────────────────────────────────
@@ -212,17 +545,33 @@ fn transpile_stmt(node, depth) {
     let pad = _indent(depth);
     let k = node.kind;
     if k == "let" or k == "const" {
-        return pad + _numty() + " " + _cid(node.name) + " = " + transpile_expr(try node.value catch nil) + ";";
+        let value = transpile_expr(try node.value catch nil);
+        let cname = _cid(node.name);
+        _ctx_bind(node.name, cname);
+        return pad + _numty() + " " + cname + " = " + value + ";";
     }
     if k == "return" {
         let rv = try node.value catch nil;
         if rv == nil { return pad + "return;"; }   // bare return (void-safe for ISRs)
         return pad + "return " + transpile_expr(rv) + ";";
     }
+    if k == "print" {
+        if not _MODE.hosted { throw "ctranspile: print requires the hosted C99 profile"; }
+        let value = try node.value catch nil;
+        if value == nil { return pad + "fputc('\\n', stdout);"; }
+        // Literal strings retain their exact bytes through the existing
+        // allocator-backed string lowering. Other supported expressions are
+        // numbers and use enough digits to round-trip an IEEE-754 double.
+        if (try value.kind catch "") == "string" {
+            return pad + "puts((const char*)(uintptr_t)(" + transpile_expr(value) + "));";
+        }
+        if _MODE.intmode { return pad + "printf(\"%ld\\n\", (long)(" + transpile_expr(value) + "));"; }
+        return pad + "printf(\"%.17g\\n\", (double)(" + transpile_expr(value) + "));";
+    }
     if k == "expr_stmt" {
         let e = node.expr;
         if is_map(e) and (try e.kind catch "") == "assign" {
-            return pad + _cid(e.name) + " = " + transpile_expr(e.value) + ";";
+            return pad + _ctx_resolve(e.name) + " = " + transpile_expr(e.value) + ";";
         }
         // `arr[i] = v` — index store into a length-prefixed array block.
         if is_map(e) and (try e.kind catch "") == "assign_to" {
@@ -236,6 +585,7 @@ fn transpile_stmt(node, depth) {
                 return pad + "(" + _pcast() + "(" + transpile_expr(tgt.obj) + "))["
                     + str(_field_slot(tgt.name)) + "] = " + transpile_expr(e.value) + ";";
             }
+            return _unsupported(try tgt.kind catch "", "assignment target");
         }
         return pad + transpile_expr(e) + ";";
     }
@@ -278,19 +628,23 @@ fn transpile_stmt(node, depth) {
     }
     if k == "break" { return pad + "break;"; }
     if k == "continue" { return pad + "continue;"; }
-    return pad + "/* unsupported stmt: " + k + " */";
+    return _unsupported(k, "statement");
 }
 
 fn transpile_block(blk, depth) {
     if blk == nil { return ""; }
     let stmts = try blk.stmts catch nil;
     if stmts == nil { return ""; }
+    let parent = _ctx_current();
+    if parent == nil { _ctx_push(map{}); }
+    else { _ctx_push(_map_copy(parent)); }
     let out = "";
     let i = 0;
     while i < len(stmts) {
         out = out + transpile_stmt(stmts[i], depth) + _NL;
         i = i + 1;
     }
+    _ctx_pop();
     return out;
 }
 
@@ -303,22 +657,31 @@ fn transpile_fn(node) {
     // This is the language feature that makes IDT/exception/IRQ handlers writable
     // in pblang; the body uses the OS intrinsics (inb/outb/poke/peek) as usual.
     if str_starts_with(name, "isr") {
+        _ctx_push(map{});
         let s = "__attribute__((interrupt)) void " + _cid(name) + "(void* _frame) {" + _NL;
         s = s + transpile_block(try node.body catch nil, 1);
         s = s + "}" + _NL;
+        _ctx_pop();
         return s;
     }
+    let bindings = map{};
     let s = _numty() + " " + _cid(name) + "(";
     let params = try node.params catch [];
     let i = 0;
     while i < len(params) {
         if i > 0 { s = s + ", "; }
         s = s + _numty() + " " + _cid(params[i].name);
+        bindings[params[i].name] = _cid(params[i].name);
         i = i + 1;
     }
     s = s + ") {" + _NL;
+    _ctx_push(bindings);
     s = s + transpile_block(try node.body catch nil, 1);
+    // Falling off a pblang function yields nil; numeric C profiles represent
+    // nil as zero. Emitting this explicitly avoids C undefined behavior.
+    s = s + "    return 0;" + _NL;
     s = s + "}" + _NL;
+    _ctx_pop();
     return s;
 }
 
@@ -341,6 +704,64 @@ fn _proto_fn(node) {
     return s + ");" + _NL;
 }
 
+fn _lambda_proto(node) {
+    return "static " + _numty() + " pb_lambda_" + str(node.__c99_closure_id)
+        + "(pb_closure* _cl, const " + _numty() + "* _args, size_t _argc);" + _NL;
+}
+
+fn _lambda_definition(node) {
+    let captures = try node.__c99_captures catch [];
+    let params = try node.params catch [];
+    let bindings = map{};
+    let i = 0;
+    while i < len(captures) {
+        bindings[captures[i]] = "_cl->caps[" + str(i) + "]";
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(params) {
+        bindings[params[i]] = "_args[" + str(i) + "]";
+        i = i + 1;
+    }
+    _ctx_push(bindings);
+    let out = "static " + _numty() + " pb_lambda_" + str(node.__c99_closure_id)
+        + "(pb_closure* _cl, const " + _numty() + "* _args, size_t _argc) {" + _NL;
+    out = out + "    (void)_argc;" + _NL;
+    out = out + transpile_block(try node.body catch nil, 1);
+    out = out + "    return 0;" + _NL + "}" + _NL;
+    _ctx_pop();
+    return out;
+}
+
+fn _named_adapter_proto(node) {
+    let safe = _cid(node.name);
+    return "static " + _numty() + " pb_named_adapter_" + safe
+        + "(pb_closure* _cl, const " + _numty() + "* _args, size_t _argc);" + _NL
+        + "static " + _numty() + " pb_named_value_" + safe + "(void);" + _NL;
+}
+
+fn _named_adapter_definition(node) {
+    let safe = _cid(node.name);
+    let params = try node.params catch [];
+    let out = "static " + _numty() + " pb_named_adapter_" + safe
+        + "(pb_closure* _cl, const " + _numty() + "* _args, size_t _argc) {" + _NL
+        + "    (void)_cl; (void)_argc;" + _NL
+        + "    return " + safe + "(";
+    let i = 0;
+    while i < len(params) {
+        if i > 0 { out = out + ", "; }
+        out = out + "_args[" + str(i) + "]";
+        i = i + 1;
+    }
+    out = out + ");" + _NL + "}" + _NL;
+    out = out + "static " + _numty() + " pb_named_value_" + safe + "(void) {" + _NL
+        + "    static " + _numty() + " handle = 0;" + _NL
+        + "    if (!handle) handle = pb_closure_new(pb_named_adapter_" + safe + ", "
+        + str(len(params)) + ", 0, 0);" + _NL
+        + "    return handle;" + _NL + "}" + _NL;
+    return out;
+}
+
 // _emit_fns(source, preamble) — the shared core: parse `source`, emit `preamble`,
 // then forward declarations for every top-level `fn`, then each `fn` transpiled under
 // the CURRENT numeric mode. Callers set the mode (and compute the preamble under it)
@@ -351,12 +772,17 @@ fn _emit_fns(source, preamble) {
     let tok = import("stdlib/compiler/tokenizer.sapp");
     let par = import("stdlib/compiler/parser.sapp");
     let ast = par.parse(tok.tokenize(source));
+    let errors = try ast.errors catch [];
+    if len(errors) != 0 { throw "ctranspile: source has parser diagnostics"; }
     let stmts = try ast.stmts catch [];
     let out = preamble;
     // forward declarations (any call order / mutual recursion)
     let i = 0;
     while i < len(stmts) {
         if stmts[i].kind == "fn" { out = out + _proto_fn(stmts[i]); }
+        elif stmts[i].kind != "struct" and stmts[i].kind != "export" {
+            throw "ctranspile: freestanding profile rejects top-level " + str(stmts[i].kind);
+        }
         i = i + 1;
     }
     out = out + _NL;
@@ -373,7 +799,446 @@ fn _emit_fns(source, preamble) {
 // numeric subset, numbers as `double`). Returns the C source string.
 fn transpile(source) {
     _set_intmode(false);
-    return _emit_fns(source, "/* generated by stdlib/compiler/ctranspile.sapp (pblang -> C, numeric subset) */" + _NL);
+    _set_hosted(false);
+    let out = nil; let failed = false;
+    try { out = _emit_fns(source, "/* generated by stdlib/compiler/ctranspile.sapp (pblang -> C, numeric subset) */" + _NL); }
+    catch { failed = true; }
+    _set_hosted(false); _set_intmode(false);
+    if failed { throw "ctranspile: freestanding translation rejected source"; }
+    return out;
+}
+
+// ── Hosted C99 profile ─────────────────────────────────────────────────────────────
+// A complete userspace translation unit: libc-backed allocation, deterministic
+// numeric/string printing, all top-level functions, and a generated C `main` for
+// top-level pblang statements. This is intentionally separate from the freestanding
+// and kernel profiles, which must never acquire a libc dependency.
+fn _closure_runtime() {
+    if not _CLOSURE.needs_runtime { return ""; }
+    let nt = _numty();
+    let handle_guard = "_pb_closure_count >= (size_t)9007199254740991ULL";
+    if _MODE.intmode { handle_guard = "_pb_closure_count >= (size_t)LONG_MAX"; }
+    return "typedef struct pb_closure pb_closure;" + _NL
+        + "typedef " + nt + " (*pb_closure_code)(pb_closure*, const " + nt + "*, size_t);" + _NL
+        + "struct pb_closure { pb_closure_code code; size_t arity; size_t capture_count; " + nt + " caps[]; };" + _NL
+        + "static pb_closure** _pb_closure_table = 0;" + _NL
+        + "static size_t _pb_closure_count = 0, _pb_closure_capacity = 0;" + _NL
+        + "static int _pb_closure_cleanup_registered = 0;" + _NL
+        + "static void pb_closure_fail(const char* why){ fputs(why, stderr); fputc('\\n', stderr); exit(72); }" + _NL
+        + "static void pb_closure_cleanup(void){" + _NL
+        + "    for (size_t i = 0; i < _pb_closure_count; ++i) free(_pb_closure_table[i]);" + _NL
+        + "    free(_pb_closure_table); _pb_closure_table = 0; _pb_closure_count = 0; _pb_closure_capacity = 0;" + _NL
+        + "}" + _NL
+        + "static " + nt + " pb_closure_new(pb_closure_code code, size_t arity, size_t capture_count, const " + nt + "* captures){" + _NL
+        + "    if (!code || (capture_count && !captures)) pb_closure_fail(\"pblang: invalid closure construction\");" + _NL
+        + "    if (capture_count > (SIZE_MAX - sizeof(pb_closure)) / sizeof(" + nt + ")) pb_closure_fail(\"pblang: closure capture overflow\");" + _NL
+        + "    if (" + handle_guard + ") pb_closure_fail(\"pblang: closure handle space exhausted\");" + _NL
+        + "    if (!_pb_closure_cleanup_registered) { if (atexit(pb_closure_cleanup) != 0) pb_closure_fail(\"pblang: closure cleanup registration failed\"); _pb_closure_cleanup_registered = 1; }" + _NL
+        + "    size_t bytes = sizeof(pb_closure) + capture_count * sizeof(" + nt + ");" + _NL
+        + "    pb_closure* closure = (pb_closure*)(uintptr_t)kmalloc((" + nt + ")bytes);" + _NL
+        + "    closure->code = code; closure->arity = arity; closure->capture_count = capture_count;" + _NL
+        + "    for (size_t i = 0; i < capture_count; ++i) closure->caps[i] = captures[i];" + _NL
+        + "    if (_pb_closure_count == _pb_closure_capacity) {" + _NL
+        + "        size_t next = _pb_closure_capacity ? _pb_closure_capacity * 2 : 16;" + _NL
+        + "        if (next < _pb_closure_capacity || next > SIZE_MAX / sizeof(*_pb_closure_table)) pb_closure_fail(\"pblang: closure table overflow\");" + _NL
+        + "        void* grown = realloc(_pb_closure_table, next * sizeof(*_pb_closure_table));" + _NL
+        + "        if (!grown) pb_closure_fail(\"pblang: closure table allocation failed\");" + _NL
+        + "        _pb_closure_table = (pb_closure**)grown; _pb_closure_capacity = next;" + _NL
+        + "    }" + _NL
+        + "    _pb_closure_table[_pb_closure_count++] = closure;" + _NL
+        + "    return (" + nt + ")_pb_closure_count;" + _NL
+        + "}" + _NL
+        + "static " + nt + " pb_closure_call(" + nt + " raw, size_t argc, const " + nt + "* args){" + _NL
+        + "    if (!(raw >= (" + nt + ")1) || raw > (" + nt + ")_pb_closure_count || raw != (" + nt + ")(size_t)raw) pb_closure_fail(\"pblang: invalid closure handle\");" + _NL
+        + "    pb_closure* closure = _pb_closure_table[(size_t)raw - 1];" + _NL
+        + "    if (!closure || !closure->code || closure->arity != argc || (argc && !args)) pb_closure_fail(\"pblang: closure arity mismatch\");" + _NL
+        + "    return closure->code(closure, args, argc);" + _NL
+        + "}" + _NL + _NL;
+}
+
+fn hosted_preamble() {
+    let nt = _numty();
+    let allocation_guard = "n < 0 || (u64)n > (u64)SIZE_MAX";
+    if not _MODE.intmode { allocation_guard = "!(n >= 0) || (long double)n > (long double)SIZE_MAX"; }
+    return "/* generated by pblang self-hosted C99 backend (hosted numeric subset) */" + _NL
+        + "#include <stdint.h>" + _NL
+        + "#include <stddef.h>" + _NL
+        + "#include <limits.h>" + _NL
+        + "#include <stdio.h>" + _NL
+        + "#include <stdlib.h>" + _NL
+        + "typedef uintptr_t u64;" + _NL
+        + "static inline long pb_mod_checked(long a, long b){" + _NL
+        + "    if (b == 0 || (a == LONG_MIN && b == -1)) { fputs(\"pblang: invalid modulo\\n\", stderr); exit(73); }" + _NL
+        + "    return a % b;" + _NL
+        + "}" + _NL
+        + "static " + nt + " kmalloc(" + nt + " n){" + _NL
+        + "    if (" + allocation_guard + ") { fputs(\"pblang: invalid allocation\\n\", stderr); exit(70); }" + _NL
+        + "    size_t z = (size_t)n; void* p = calloc(z ? z : 1, 1);" + _NL
+        + "    if (!p) { fputs(\"pblang: out of memory\\n\", stderr); exit(71); }" + _NL
+        + "    return (" + nt + ")(uintptr_t)p;" + _NL
+        + "}" + _NL + _NL
+        + _closure_runtime();
+}
+
+fn _validate_hosted_symbols(stmts) {
+    let seen = map{};
+    let reserved = map{
+        u64: true, kmalloc: true, pb_mod_checked: true, pb_closure: true, pb_closure_fail: true,
+        pb_closure_cleanup: true, pb_closure_new: true, pb_closure_call: true
+    };
+    let i = 0;
+    while i < len(stmts) {
+        let kind = try stmts[i].kind catch "";
+        if kind == "fn" or kind == "let" or kind == "const" {
+            let source_name = stmts[i].name;
+            let cname = _cid(source_name);
+            if map_has(seen, cname) {
+                throw "hosted C99: top-level C identifier collision between " + seen[cname] + " and " + source_name;
+            }
+            if map_has(reserved, cname) or str_starts_with(cname, "_pb_")
+                or str_starts_with(cname, "pb_lambda_")
+                or str_starts_with(cname, "pb_named_adapter_")
+                or str_starts_with(cname, "pb_named_value_") {
+                throw "hosted C99: top-level name conflicts with generated runtime: " + source_name;
+            }
+            seen[cname] = source_name;
+        }
+        i = i + 1;
+    }
+}
+
+fn _emit_hosted(source) {
+    _reset_fields();
+    let tok = import("stdlib/compiler/tokenizer.sapp");
+    let par = import("stdlib/compiler/parser.sapp");
+    let ast = par.parse(tok.tokenize(source));
+    let errors = try ast.errors catch [];
+    if len(errors) != 0 { throw "hosted C99: source has parser diagnostics"; }
+    let stmts = try ast.stmts catch [];
+    _analyze_program(stmts);
+    _validate_hosted_symbols(stmts);
+    let out = hosted_preamble();
+    let has_pb_main = false;
+    let pb_main_arity = 0;
+
+    let i = 0;
+    // Hosted pblang top-level bindings have translation-unit lifetime. They are
+    // declared before functions so module and ordinary functions can read/write
+    // them, then initialized in source order from generated main.
+    while i < len(stmts) {
+        let kind = try stmts[i].kind catch "";
+        if kind == "let" or kind == "const" {
+            out = out + "static " + _numty() + " " + _cid(stmts[i].name) + " = 0;" + _NL;
+        }
+        i = i + 1;
+    }
+    if len(map_keys(_CLOSURE.top_values)) > 0 { out = out + _NL; }
+    i = 0;
+    while i < len(stmts) {
+        if stmts[i].kind == "fn" {
+            out = out + _proto_fn(stmts[i]);
+            if stmts[i].name == "main" {
+                has_pb_main = true;
+                pb_main_arity = len(try stmts[i].params catch []);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(_CLOSURE.nodes) {
+        out = out + _lambda_proto(_CLOSURE.nodes[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(stmts) {
+        if (try stmts[i].kind catch "") == "fn" and map_has(_CLOSURE.named_values, stmts[i].name) {
+            out = out + _named_adapter_proto(stmts[i]);
+        }
+        i = i + 1;
+    }
+    out = out + _NL;
+    i = 0;
+    while i < len(_CLOSURE.nodes) {
+        out = out + _lambda_definition(_CLOSURE.nodes[i]) + _NL;
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(stmts) {
+        if (try stmts[i].kind catch "") == "fn" and map_has(_CLOSURE.named_values, stmts[i].name) {
+            out = out + _named_adapter_definition(stmts[i]) + _NL;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(stmts) {
+        if stmts[i].kind == "fn" { out = out + transpile_fn(stmts[i]) + _NL; }
+        i = i + 1;
+    }
+
+    let top_count = 0;
+    out = out + "int main(void) {" + _NL;
+    let global_bindings = map{};
+    let global_names = map_keys(_CLOSURE.top_values);
+    i = 0;
+    while i < len(global_names) {
+        global_bindings[global_names[i]] = _cid(global_names[i]);
+        i = i + 1;
+    }
+    _ctx_push(global_bindings);
+    i = 0;
+    while i < len(stmts) {
+        let kind = stmts[i].kind;
+        if kind == "import" { throw "hosted C99: imports require prior module resolution/inlining"; }
+        if kind == "let" or kind == "const" {
+            out = out + "    " + _cid(stmts[i].name) + " = "
+                + transpile_expr(try stmts[i].value catch nil) + ";" + _NL;
+            top_count = top_count + 1;
+        } elif kind != "fn" and kind != "struct" and kind != "export" {
+            out = out + transpile_stmt(stmts[i], 1) + _NL;
+            top_count = top_count + 1;
+        }
+        i = i + 1;
+    }
+    if top_count == 0 and has_pb_main {
+        if pb_main_arity != 0 { throw "hosted C99: fn main must have zero parameters"; }
+        out = out + "    return (int)pb_main();" + _NL;
+    } else {
+        out = out + "    return 0;" + _NL;
+    }
+    _ctx_pop();
+    return out + "}" + _NL;
+}
+
+// transpile_program(source) — complete hosted C99 source, including `main`.
+fn transpile_program(source) {
+    _set_intmode(false);
+    _set_hosted(true);
+    let out = nil; let failed = false;
+    try { out = _emit_hosted(source); } catch { failed = true; }
+    _set_hosted(false); _set_intmode(false);
+    if failed { throw "hosted C99: translation rejected source"; }
+    return out;
+}
+
+// Explicit integer-specialized hosted mode. It is never selected implicitly:
+// division and non-integral values differ from normal f64 pblang semantics.
+fn transpile_program_int(source) {
+    _set_intmode(true);
+    _set_hosted(true);
+    let out = nil; let failed = false;
+    try { out = _emit_hosted(source); } catch { failed = true; }
+    _set_hosted(false); _set_intmode(false);
+    if failed { throw "hosted C99 integer: translation rejected source"; }
+    return out;
+}
+
+// Resolve an immutable virtual project snapshot before hosted C99 lowering.
+// Module top-level values use the same translation-unit storage and ordered
+// initialization as ordinary hosted source. Linking remains an in-memory,
+// capability-free operation; C lowering happens only after a successful link.
+fn link_program(source, modules, options = nil) {
+    let linked = _source_linker().link_modules(source, modules, options);
+    return linked;
+}
+
+fn _link_summary(linked) {
+    return map{ modules: linked.modules, module_order: linked.module_order,
+        module_bytes: linked.module_bytes, input_bytes: linked.input_bytes,
+        supplied_bytes: linked.supplied_bytes, output_bytes: linked.output_bytes,
+        entry_path: linked.entry_path, namespace: linked.namespace, limits: linked.limits };
+}
+
+fn transpile_program_linked(source, modules, options = nil) {
+    let linked = link_program(source, modules, options);
+    if not linked.ok { return linked; }
+    let numeric = _option(options, "numeric", "float");
+    if numeric != "float" and numeric != "integer" {
+        return map{ ok: false, reason: "unknown numeric profile: " + str(numeric) };
+    }
+    let artifact = nil;
+    if numeric == "integer" { artifact = try transpile_program_int(linked.source) catch nil; }
+    else { artifact = try transpile_program(linked.source) catch nil; }
+    if artifact == nil { return map{ ok: false, reason: "C99 translation rejected linked source" }; }
+    return map{ ok: true, source: artifact, link: _link_summary(linked) };
+}
+
+fn _option(options, key, fallback) {
+    if options == nil or not is_map(options) or not map_has(options, key) { return fallback; }
+    return options[key];
+}
+
+fn _bool_option(options, key) {
+    let value = _option(options, key, false);
+    if type(value) != "bool" { return false; }
+    return value;
+}
+
+fn _safe_build_path(path) {
+    if type(path) != "string" or len(path) == 0 { return false; }
+    // c_path is passed in compiler option position. A leading dash would be
+    // interpreted as an option even though process execution is argv-only.
+    if str_starts_with(path, "-") { return false; }
+    let i = 0;
+    while i < len(path) {
+        let c = strcharcodeat(path, i);
+        if c == 0 or c == 10 or c == 13 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _compiler_works(name) {
+    if not _safe_build_path(name) { return false; }
+    let r = try proc_spawn_wait(name, ["--version"]) catch nil;
+    return r != nil and (try r.exit_code catch 1) == 0;
+}
+
+// find_c_compiler(preferred) — exact executable/path only; no shell fragments.
+fn find_c_compiler(preferred = nil) {
+    if preferred != nil { if _compiler_works(preferred) { return preferred; } return nil; }
+    let cc = try env_get("CC") catch nil;
+    if cc != nil and _compiler_works(cc) { return cc; }
+    let candidates = ["cc", "gcc", "clang"];
+    let i = 0;
+    while i < len(candidates) {
+        if _compiler_works(candidates[i]) { return candidates[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _compile_args(profile, c_path, output, aggressive) {
+    let args = ["-std=gnu99"];
+    array_push(args, "-Werror=implicit-function-declaration");
+    array_push(args, "-Werror=return-type");
+    if profile == "size" {
+        array_push(args, "-Os");
+        if aggressive {
+            array_push(args, "-flto"); array_push(args, "-ffunction-sections"); array_push(args, "-fdata-sections");
+            array_push(args, "-Wl,--gc-sections"); array_push(args, "-s");
+        }
+    } elif profile == "portable" {
+        array_push(args, "-O2");
+    } else {
+        array_push(args, "-O3");
+        if aggressive { array_push(args, "-flto"); array_push(args, "-fomit-frame-pointer"); }
+    }
+    array_push(args, "-DNDEBUG");
+    array_push(args, c_path);
+    array_push(args, "-o");
+    array_push(args, output);
+    return args;
+}
+
+// build_program(source, output, options) — one-call pblang -> optimized native
+// executable through the pblang-written C99 lowering. Process execution is argv-only.
+// options: {profile:"speed"|"size"|"portable", numeric:"float"|"integer",
+//           compiler, keep_c, c_path}. Integer mode is explicit because `/` differs.
+fn build_program(source, output, options = nil) {
+    if not _safe_build_path(output) { return map{ ok: false, error: "invalid output path" }; }
+    let profile = _option(options, "profile", "speed");
+    if profile != "speed" and profile != "size" and profile != "portable" {
+        return map{ ok: false, error: "unknown build profile: " + str(profile) };
+    }
+    let c_path = _option(options, "c_path", output + ".c");
+    if not _safe_build_path(c_path) { return map{ ok: false, error: "invalid C output path" }; }
+    let compiler = find_c_compiler(_option(options, "compiler", nil));
+    if compiler == nil { return map{ ok: false, error: "no usable C99 compiler found" }; }
+
+    let numeric = _option(options, "numeric", "float");
+    if numeric != "float" and numeric != "integer" {
+        return map{ ok: false, error: "unknown numeric profile: " + str(numeric) };
+    }
+    let linked = nil; let build_source = source;
+    let modules = _option(options, "modules", nil);
+    if modules != nil {
+        linked = link_program(source, modules, options);
+        if not linked.ok { return map{ ok: false, error: "module linking failed", reason: linked.reason }; }
+        build_source = linked.source;
+    }
+    let t0 = now_ms();
+    let c_source = nil;
+    if numeric == "integer" { c_source = try transpile_program_int(build_source) catch nil; }
+    else { c_source = try transpile_program(build_source) catch nil; }
+    if c_source == nil {
+        return map{ ok: false, error: "C99 translation rejected unsupported or invalid source" };
+    }
+    let transpile_ms = now_ms() - t0;
+    let wrote = try fs_write(c_path, c_source) catch false;
+    if type(wrote) == "bool" and not wrote {
+        return map{ ok: false, error: "could not write generated C", c_path: c_path };
+    }
+
+    let c0 = now_ms();
+    let args = _compile_args(profile, c_path, output, profile != "portable");
+    let result = try proc_spawn_wait(compiler, args) catch nil;
+    let fallback = false;
+    if result == nil or (try result.exit_code catch 1) != 0 {
+        fallback = profile != "portable";
+        if fallback { result = try proc_spawn_wait(compiler, _compile_args("portable", c_path, output, false)) catch nil; }
+    }
+    let compile_ms = now_ms() - c0;
+    let keep_c = _bool_option(options, "keep_c");
+    if not keep_c { try fs_remove(c_path) catch nil; }
+    if result == nil or (try result.exit_code catch 1) != 0 {
+        try fs_remove(output) catch nil;
+        return map{ ok: false, error: "C99 compiler failed", compiler: compiler,
+            exit_code: try result.exit_code catch 0 - 1, stderr: try result.stderr catch "",
+            transpile_ms: transpile_ms, compile_ms: compile_ms, c_path: c_path, kept_c: keep_c };
+    }
+    let artifact = try fs_read_bytes(output) catch [];
+    return map{ ok: true, output: output, c_path: c_path, kept_c: keep_c,
+        compiler: compiler, profile: profile, numeric: numeric, portable_fallback: fallback,
+        root_source_bytes: len(source), source_bytes: len(build_source),
+        c_bytes: len(c_source), artifact_bytes: len(artifact), link: if linked == nil { nil } else { _link_summary(linked) },
+        transpile_ms: transpile_ms, compile_ms: compile_ms };
+}
+
+// run_program(source, options) — bounded compile-and-run convenience. GNU/coreutils
+// `timeout` is used as a watchdog; unbounded execution requires explicit opt-in.
+fn run_program(source, options = nil) {
+    let os = import("stdlib/os.sapp");
+    let uuid = import("stdlib/uuid.sapp");
+    let output = os.temp_dir() + "/pblang_c99_" + uuid.v4();
+    let build_options = map{
+        profile: _option(options, "profile", "speed"),
+        numeric: _option(options, "numeric", "float"),
+        compiler: _option(options, "compiler", nil), keep_c: false,
+        modules: _option(options, "modules", nil), entry_path: _option(options, "entry_path", "main.sapp"),
+        max_modules: _option(options, "max_modules", 256),
+        max_module_depth: _option(options, "max_module_depth", 64),
+        max_module_source_bytes: _option(options, "max_module_source_bytes", 1048576),
+        max_total_source_bytes: _option(options, "max_total_source_bytes", 8388608),
+        max_linked_source_bytes: _option(options, "max_linked_source_bytes", 16777216),
+        max_path_bytes: _option(options, "max_path_bytes", 1024)
+    };
+    let built = build_program(source, output, build_options);
+    if not built.ok { return built; }
+
+    let timeout_ms = _option(options, "timeout_ms", 10000);
+    if type(timeout_ms) != "number" or timeout_ms < 1 or timeout_ms > 300000 {
+        try fs_remove(output) catch nil;
+        return map{ ok: false, error: "timeout_ms must be between 1 and 300000" };
+    }
+    let watchdog = find_c_compiler("timeout");
+    let allow_unbounded = _bool_option(options, "allow_unbounded");
+    let run = nil;
+    let r0 = now_ms();
+    if watchdog != nil {
+        let seconds = str(timeout_ms / 1000);
+        run = try proc_spawn_wait("timeout", ["--signal=TERM", "--kill-after=1s", seconds + "s", output]) catch nil;
+    } elif allow_unbounded {
+        run = try proc_spawn_wait(output, []) catch nil;
+    }
+    let run_ms = now_ms() - r0;
+    try fs_remove(output) catch nil;
+    if run == nil {
+        return map{ ok: false, error: "bounded runner unavailable; install `timeout` or explicitly allow_unbounded", build: built };
+    }
+    let code = try run.exit_code catch 0 - 1;
+    return map{ ok: code == 0, exit_code: code, stdout: try run.stdout catch "",
+        stderr: try run.stderr catch "", timed_out: code == 124 or code == 137,
+        run_ms: run_ms, build: built };
 }
 
 // ── Freestanding profile (OS-dev) ──────────────────────────────────────────────────
@@ -403,7 +1268,12 @@ fn freestanding_preamble() {
 // `gcc -ffreestanding -nostdlib`.
 fn transpile_freestanding(source) {
     _set_intmode(false);
-    return _emit_fns(source, freestanding_preamble());
+    _set_hosted(false);
+    let out = nil; let failed = false;
+    try { out = _emit_fns(source, freestanding_preamble()); } catch { failed = true; }
+    _set_hosted(false); _set_intmode(false);
+    if failed { throw "ctranspile: freestanding translation rejected source"; }
+    return out;
 }
 
 // ── Bootable kernel profile (multiboot + GC-free memory) ────────────────────────────
@@ -476,7 +1346,14 @@ fn kernel_preamble() {
     // so an int-mode kernel never touches a float.
     let nt = _numty();
     s = s + "static u8 _kheap[262144]; static u64 _koff = 0;" + nl;
-    s = s + "static " + nt + " kmalloc(" + nt + " n){ u64 o=_koff; _koff += ((u64)n + 7) & ~7UL; return (" + nt + ")(u64)&_kheap[o]; }" + nl;
+    s = s + "__attribute__((noreturn)) static void _kalloc_fail(void){ cli(); for(;;) hlt(); }" + nl;
+    let heap_guard = "n < 0 || (u64)n > 262144UL";
+    if not _MODE.intmode { heap_guard = "!(n >= 0) || n > 262144"; }
+    s = s + "static " + nt + " kmalloc(" + nt + " n){"
+        + " if (" + heap_guard + ") _kalloc_fail();"
+        + " u64 need=((u64)n + 7UL) & ~7UL;"
+        + " if (need > 262144UL - _koff) _kalloc_fail();"
+        + " u64 o=_koff; _koff += need; return (" + nt + ")(u64)&_kheap[o]; }" + nl;
     s = s + "static void kfree(" + nt + " p){ (void)p; }" + nl;       // bump: no per-object free
     s = s + "static void kreset(void){ _koff = 0; }" + nl;
     // stack + entry: _start sets esp, calls kmain, halts forever
@@ -491,7 +1368,12 @@ fn kernel_preamble() {
 // functions. `source` must define `fn kmain() { ... }` (the kernel entry).
 fn transpile_kernel(source) {
     _set_intmode(false);
-    return _emit_fns(source, kernel_preamble());
+    _set_hosted(false);
+    let out = nil; let failed = false;
+    try { out = _emit_fns(source, kernel_preamble()); } catch { failed = true; }
+    _set_hosted(false); _set_intmode(false);
+    if failed { throw "ctranspile: kernel translation rejected source"; }
+    return out;
 }
 
 // transpile_kernel_int(source) — the SAME bootable multiboot kernel, but in INTEGER
@@ -503,8 +1385,11 @@ fn transpile_kernel(source) {
 //   ld -m elf_i386 -T kernel.ld -o kernel.elf k.o
 fn transpile_kernel_int(source) {
     _set_intmode(true);
-    let out = _emit_fns(source, kernel_preamble());
-    _set_intmode(false);   // restore default (module state persists across calls)
+    _set_hosted(false);
+    let out = nil; let failed = false;
+    try { out = _emit_fns(source, kernel_preamble()); } catch { failed = true; }
+    _set_hosted(false); _set_intmode(false);
+    if failed { throw "ctranspile: integer kernel translation rejected source"; }
     return out;
 }
 
@@ -513,8 +1398,11 @@ fn transpile_kernel_int(source) {
 // `gcc -ffreestanding -nostdlib -mgeneral-regs-only`.
 fn transpile_freestanding_int(source) {
     _set_intmode(true);
-    let out = _emit_fns(source, freestanding_preamble());
-    _set_intmode(false);
+    _set_hosted(false);
+    let out = nil; let failed = false;
+    try { out = _emit_fns(source, freestanding_preamble()); } catch { failed = true; }
+    _set_hosted(false); _set_intmode(false);
+    if failed { throw "ctranspile: integer freestanding translation rejected source"; }
     return out;
 }
 
@@ -532,6 +1420,8 @@ fn kernel_linker_script() {
 }
 
 export transpile_expr, transpile_stmt, transpile_block, transpile_fn, transpile;
+export hosted_preamble, transpile_program, transpile_program_int, link_program, transpile_program_linked;
+export find_c_compiler, build_program, run_program;
 export freestanding_preamble, transpile_freestanding, transpile_freestanding_int;
 export kernel_preamble, transpile_kernel, transpile_kernel_int, kernel_linker_script;
 export _set_intmode, _numty;

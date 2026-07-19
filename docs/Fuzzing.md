@@ -28,7 +28,7 @@ the toolchain:
 stream is filtered to valid UTF-8 before being fed in. `registry_index`
 takes `&[u8]` directly — that mirrors the HTTP path. In all four
 targets, either we get an `Ok(...)` value or an `Err(...)` / parse-error
-vec; a `panic!` / `unwrap` failure / arithmetic overflow is a fuzzing
+vec; a host crash / forced unwrap / arithmetic overflow is a fuzzing
 finding.
 
 ## One-time setup

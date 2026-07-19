@@ -62,7 +62,8 @@ pub(super) fn ffi_load(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
     // (defaults deny everything), and the whole builtin is gated by
     // `host.allow_ffi()`. The returned Library is owned by the FFI
     // table; drop = unload.
-    let lib = unsafe { Library::new(path) }.map_err(|e| host.err(format!("ffi_load(): {e}")))?;
+    let lib = unsafe { Library::new(path) }
+        .map_err(|e| host.err(format!("ffi_load(): failed to load library {path:?}: {e}")))?;
     let id = with_ffi_table(host, |t| {
         let id = FFI_NEXT.fetch_add(1, Ordering::Relaxed);
         t.insert(id, FfiResource::Library(lib));
@@ -136,31 +137,31 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
                     0 => {
                         let f: libloading::Symbol<unsafe extern "C" fn() -> f64> = lib
                             .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
                         f()
                     }
                     1 => {
                         let f: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> = lib
                             .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
                         f(nums[0])
                     }
                     2 => {
                         let f: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> = lib
                             .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
                         f(nums[0], nums[1])
                     }
                     3 => {
                         let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64) -> f64> = lib
                             .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
                         f(nums[0], nums[1], nums[2])
                     }
                     4 => {
                         let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64, f64) -> f64> =
                             lib.get(sym.as_bytes())
-                                .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                                .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
                         f(nums[0], nums[1], nums[2], nums[3])
                     }
                     5 => {
@@ -168,7 +169,7 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
                             unsafe extern "C" fn(f64, f64, f64, f64, f64) -> f64,
                         > = lib
                             .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
                         f(nums[0], nums[1], nums[2], nums[3], nums[4])
                     }
                     6 => {
@@ -176,7 +177,7 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
                             unsafe extern "C" fn(f64, f64, f64, f64, f64, f64) -> f64,
                         > = lib
                             .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): {e}")))?;
+                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
                         f(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5])
                     }
                     n => {

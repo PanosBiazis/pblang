@@ -623,7 +623,13 @@ impl VM {
     // GC methods (gc_collect_cycles_impl, gc_mark_*, gc_sweep_*) moved to vm/gc.rs
 
     fn get_global_from(module: &Rc<RefCell<Module>>, name: &str) -> Option<Value> {
-        let mut cur = Some(module.clone());
+        // Fast path: resolve in THIS module without cloning the Rc — one borrow, one (FxHash) probe.
+        // The vast majority of hot global reads (loop variables, local top-level fns) hit here and never
+        // touch the parent chain. Only builtins/imported names fall through to the Rc-walking slow path.
+        if let Some(v) = module.borrow().globals.get(name).cloned() {
+            return Some(v);
+        }
+        let mut cur = module.borrow().parent.clone();
         while let Some(m) = cur {
             if let Some(v) = m.borrow().globals.get(name).cloned() {
                 return Some(v);
@@ -634,11 +640,26 @@ impl VM {
     }
 
     fn set_global_in_chain(module: &Rc<RefCell<Module>>, name: &str, v: Value) -> bool {
-        let mut cur = Some(module.clone());
-        while let Some(m) = cur {
-            if m.borrow().globals.contains_key(name) {
-                m.borrow_mut().globals.insert(name.to_string(), v);
+        // Update the existing slot IN PLACE via get_mut: one hash probe, and crucially NO
+        // `name.to_string()` key allocation (the old contains_key + insert path allocated a fresh
+        // String on every assignment). OpSetGlobal is the hottest op in loops that write globals —
+        // `i = i + 1` fired this per iteration, so this removes an allocation from the inner loop.
+        // Fast path: assign in THIS module without cloning the Rc (the common case for loop writes).
+        {
+            let mut mb = module.borrow_mut();
+            if let Some(slot) = mb.globals.get_mut(name) {
+                *slot = v;
                 return true;
+            }
+        }
+        let mut cur = module.borrow().parent.clone();
+        while let Some(m) = cur {
+            {
+                let mut mb = m.borrow_mut();
+                if let Some(slot) = mb.globals.get_mut(name) {
+                    *slot = v;
+                    return true;
+                }
             }
             cur = m.borrow().parent.clone();
         }
@@ -961,9 +982,9 @@ impl VM {
         VM::install_builtins_into(&builtins, None);
         MODULE_ALLOCS.fetch_add(1, Ordering::Relaxed);
         let module = Rc::new(RefCell::new(Module {
-            globals: HashMap::new(),
+            globals: Default::default(),
             parent: Some(builtins.clone()),
-            exports: HashMap::new(),
+            exports: Default::default(),
         }));
         gc_register_module(&module);
         VM {
@@ -999,9 +1020,9 @@ impl VM {
         VM::install_builtins_into(&builtins, Some(&config));
         MODULE_ALLOCS.fetch_add(1, Ordering::Relaxed);
         let module = Rc::new(RefCell::new(Module {
-            globals: HashMap::new(),
+            globals: Default::default(),
             parent: Some(builtins.clone()),
-            exports: HashMap::new(),
+            exports: Default::default(),
         }));
         gc_register_module(&module);
         VM {
@@ -1125,22 +1146,227 @@ impl VM {
                 gil_reg.gil.yield_point();
             }
 
-            let op = {
+            // Fetch WITHOUT cloning the opcode: clone the function Rc (one refcount
+            // bump) so `op` can be a plain reference while the dispatch arms below
+            // freely mutate self.stack / self.frames. The enum clone (it carries a
+            // Vec in the OpClosure variant, so it's a 32-byte copy + branch) now
+            // happens only on the slow fall-through path.
+            let (cur_fn, cur_ip) = {
                 let frame = match self.frames.last_mut() {
                     Some(f) => f,
                     None => return Err(self.err("no current frame")),
                 };
-                let code = &frame.closure.function.chunk.instructions;
-
-                if frame.ip >= code.len() {
-                    return Err(self.err("instruction pointer out of bounds"));
-                }
-
-                //let op = code[frame.ip];
-                let op = code[frame.ip].clone();
+                let ip = frame.ip;
                 frame.ip += 1;
-                op
+                (frame.closure.function.clone(), ip)
             };
+            let op = match cur_fn.chunk.instructions.get(cur_ip) {
+                Some(o) => o,
+                None => return Err(self.err("instruction pointer out of bounds")),
+            };
+
+            // ---- fast-path dispatch for the hottest opcodes ----
+            // Measured (fib/loop micro-benches): the dominant per-op cost is not the
+            // handler work but the machinery around it — a closure returning Result,
+            // plus 2-3 redundant `frames.last()` lookups per instruction. This block
+            // handles the COMMON CASE of the most frequent opcodes with one frame
+            // borrow and zero Result plumbing. Anything unusual (non-number operands,
+            // NaN compares, missing globals/locals, stack underflow) leaves the stack
+            // untouched and falls through to the general match below, which owns all
+            // error paths — so try/catch and error messages behave identically.
+            {
+                let mut handled = true;
+                match op {
+                    OpCode::OpGetLocal(slot) => {
+                        if let Some(frame) = self.frames.last() {
+                            let idx = frame.stack_base + 1 + slot;
+                            if idx < self.stack.len() {
+                                let v = self.stack[idx].clone();
+                                self.stack.push(v);
+                            } else {
+                                handled = false;
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpSetLocal(slot) => {
+                        if let Some(frame) = self.frames.last() {
+                            let idx = frame.stack_base + 1 + slot;
+                            let n = self.stack.len();
+                            // idx must be valid AFTER the pop (mirrors the general handler)
+                            if n >= 1 && idx < n - 1 {
+                                if let Some(v) = self.stack.pop() {
+                                    self.stack[idx] = v;
+                                } else {
+                                    handled = false;
+                                }
+                            } else {
+                                handled = false;
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpConstant(i) => {
+                        let v = self
+                            .frames
+                            .last()
+                            .and_then(|f| f.closure.function.chunk.constants.get(*i))
+                            .cloned();
+                        if let Some(v) = v {
+                            self.stack.push(v);
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpGetGlobal(idx) => {
+                        let mut pushed = false;
+                        if let Some(frame) = self.frames.last() {
+                            if let Some(Ok(name)) = frame
+                                .closure
+                                .function
+                                .chunk
+                                .constants
+                                .get(*idx)
+                                .map(|c| c.as_str())
+                            {
+                                if let Some(v) =
+                                    Self::get_global_from(&frame.closure.module, name)
+                                {
+                                    self.stack.push(v);
+                                    pushed = true;
+                                }
+                            }
+                        }
+                        handled = pushed;
+                    }
+                    OpCode::OpJump(target) => {
+                        if let Some(frame) = self.frames.last_mut() {
+                            frame.ip = *target;
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpJumpIfFalse(target) => {
+                        // NOTE: condition stays on the stack (the compiler emits an
+                        // explicit OpPop), exactly like the general handler.
+                        if let Some(cond) = self.stack.last() {
+                            if !Self::is_truthy(cond) {
+                                if let Some(frame) = self.frames.last_mut() {
+                                    frame.ip = *target;
+                                } else {
+                                    handled = false;
+                                }
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpJumpIfTrue(target) => {
+                        if let Some(cond) = self.stack.last() {
+                            if Self::is_truthy(cond) {
+                                if let Some(frame) = self.frames.last_mut() {
+                                    frame.ip = *target;
+                                } else {
+                                    handled = false;
+                                }
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpPop => {
+                        if self.stack.pop().is_none() {
+                            handled = false; // underflow: general handler raises the error
+                        }
+                    }
+                    OpCode::OpAdd | OpCode::OpSub | OpCode::OpMul | OpCode::OpDiv => {
+                        // Unboxed f64 × f64 only — identical to Value::arith's fast
+                        // path (apply_f64). Everything else (strings, bigints,
+                        // decimals, overloads) falls through untouched.
+                        let n = self.stack.len();
+                        if n >= 2 {
+                            if let (Value::Number(a), Value::Number(b)) =
+                                (&self.stack[n - 2], &self.stack[n - 1])
+                            {
+                                let r = match op {
+                                    OpCode::OpAdd => a + b,
+                                    OpCode::OpSub => a - b,
+                                    OpCode::OpMul => a * b,
+                                    _ => a / b,
+                                };
+                                self.stack.truncate(n - 1);
+                                self.stack[n - 2] = Value::Number(r);
+                            } else {
+                                handled = false;
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpLt | OpCode::OpLe | OpCode::OpGt | OpCode::OpGe => {
+                        let n = self.stack.len();
+                        if n >= 2 {
+                            if let (Value::Number(a), Value::Number(b)) =
+                                (&self.stack[n - 2], &self.stack[n - 1])
+                            {
+                                // partial_cmp mirrors num_cmp's Number fast path;
+                                // NaN (None) falls through to the general handler.
+                                if let Some(ord) = a.partial_cmp(b) {
+                                    use std::cmp::Ordering::*;
+                                    let r = match op {
+                                        OpCode::OpLt => ord == Less,
+                                        OpCode::OpLe => ord != Greater,
+                                        OpCode::OpGt => ord == Greater,
+                                        _ => ord != Less,
+                                    };
+                                    self.stack.truncate(n - 1);
+                                    self.stack[n - 2] = Value::Bool(r);
+                                    // NOTE: fusing the following OpJumpIfFalse into this
+                                    // dispatch was tried and MEASURED SLOWER (~15-20%,
+                                    // interleaved A/B) — the peek perturbed the dispatch
+                                    // loop's code layout. Don't re-add without re-measuring.
+                                } else {
+                                    handled = false;
+                                }
+                            } else {
+                                handled = false;
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    OpCode::OpEq | OpCode::OpNotEq => {
+                        let n = self.stack.len();
+                        if n >= 2 {
+                            if let (Value::Number(a), Value::Number(b)) =
+                                (&self.stack[n - 2], &self.stack[n - 1])
+                            {
+                                let r = if matches!(op, OpCode::OpEq) {
+                                    a == b
+                                } else {
+                                    a != b
+                                };
+                                self.stack.truncate(n - 1);
+                                self.stack[n - 2] = Value::Bool(r);
+                            } else {
+                                handled = false;
+                            }
+                        } else {
+                            handled = false;
+                        }
+                    }
+                    _ => handled = false,
+                }
+                if handled {
+                    continue;
+                }
+            }
+
+            // Slow path: clone the opcode so the general match below can bind
+            // payloads by value (OpClosure's captures Vec etc.) exactly as before.
+            let op = op.clone();
 
             let step: Result<(), RuntimeError> = (|| {
                 match op {
@@ -2937,9 +3163,9 @@ impl VmHost for VM {
             chunk.source = Some(Rc::new(src));
 
             let module_rc = Rc::new(RefCell::new(Module {
-                globals: HashMap::new(),
+                globals: Default::default(),
                 parent: Some(self.builtins.clone()),
-                exports: HashMap::new(),
+                exports: Default::default(),
             }));
             MODULE_ALLOCS.fetch_add(1, Ordering::Relaxed);
             gc_register_module(&module_rc);

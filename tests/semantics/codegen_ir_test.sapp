@@ -5,10 +5,23 @@
 
 let IR = import("stdlib/codegen_ir.sapp");
 let X = import("stdlib/codegen_x64.sapp");
+let X86 = import("stdlib/codegen_x86.sapp");
+let A64 = import("stdlib/codegen_arm64.sapp");
 
 fn fail(m) { throw "FAIL " + m; }
 fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
 fn has(s, sub, m) { if str_index_of(s, sub) < 0 { fail(m + " : <<" + s + ">>"); } }
+fn count_op(ir, wanted) {
+    let count = 0; let i = 0;
+    while i < len(ir) {
+        let op = ir[i][0];
+        if op == wanted { count = count + 1; }
+        if op == "loop" { count = count + count_op(ir[i][2], wanted); }
+        elif op == "ifnz" { count = count + count_op(ir[i][2], wanted) + count_op(ir[i][3], wanted); }
+        i = i + 1;
+    }
+    return count;
+}
 
 let arith = [
     ["seti", 0, 2], ["seti", 1, 3], ["add", 0, 1],
@@ -36,6 +49,230 @@ eq(X.compile_program(opt)[0], 0x7F, "optimized IR still produces a valid ELF");
 // programs with loops are preserved (can't be folded blindly)
 eq(len(IR.optimize(loopsum)), 3, "loop program is preserved");
 eq(IR.eval(IR.optimize(loopsum)), 55, "optimized loop program still correct");
+
+// Structured peepholes shared by every register-IR backend.
+let noisy = [
+    ["seti", 0, 1], ["addi", 0, 2], ["movr", 1, 1],
+    ["seti", 2, 1], ["ifnz", 2, [["addi", 0, 4]], [["addi", 0, 100]]],
+    ["seti", 3, 2], ["loop", 3, [["addi", 0, 1]]]
+];
+let clean = IR.optimize(noisy);
+eq(IR.eval(noisy), 9, "noisy structured IR reference result");
+eq(IR.eval(clean), 9, "peepholes preserve structured IR result");
+if len(clean) >= len(noisy) { fail("peepholes must reduce shared IR instruction count"); }
+let backend_noisy = [
+    ["seti", 0, 1], ["addi", 0, 2],
+    ["seti", 2, 1], ["ifnz", 2, [["addi", 0, 4]], [["addi", 0, 100]]],
+    ["seti", 3, 2], ["loop", 3, [["addi", 0, 1]]]
+];
+let backend_clean = IR.optimize(backend_noisy);
+if len(X.compile_program(backend_clean)) >= len(X.compile_program(backend_noisy)) { fail("peepholes must shrink x86-64 artifact"); }
+if len(X86.compile_program(backend_clean)) >= len(X86.compile_program(backend_noisy)) { fail("peepholes must shrink i386 artifact"); }
+if len(A64.compile_program(backend_clean)) >= len(A64.compile_program(backend_noisy)) { fail("peepholes must shrink ARM64 artifact"); }
+
+// External effects are never compile-time evaluated or collapsed.
+let effectful = [["seti", 1, 7], ["syscall", 60, [1]]];
+let effectful_opt = IR.optimize(effectful);
+eq(len(effectful_opt), 2, "optimizer preserves syscall programs");
+eq(effectful_opt[0][0], "seti", "syscall argument definition stays live");
+
+// Loop-carried values must reach the next iteration even when dead after loop.
+let carried = [
+    ["seti", 0, 0], ["seti", 1, 3], ["seti", 2, 1],
+    ["loop", 1, [["add", 0, 2], ["addi", 2, 1]]]
+];
+eq(IR.eval(carried), 6, "loop-carried baseline");
+eq(IR.eval(IR.optimize(carried)), 6, "loop-carried value remains live");
+
+// Pure arithmetic whose destination is dead has no observable effect. DSE must
+// remove it inside loops while retaining the live r0 update and loop-carried
+// dependencies above.
+let dead_arith = [
+    ["seti", 0, 1], ["seti", 1, 20],
+    ["loop", 1, [
+        ["addi", 0, 1],
+        ["seti", 2, 10], ["addi", 2, 5], ["mul", 2, 0],
+        ["seti", 3, 7], ["sub", 3, 0]
+    ]]
+];
+let dead_arith_opt = IR.optimize(dead_arith);
+eq(IR.eval(dead_arith), 21, "dead arithmetic baseline");
+eq(IR.eval(dead_arith_opt), 21, "dead arithmetic DSE result");
+eq(len(dead_arith_opt[2][2]), 1, "dead loop arithmetic removed");
+eq(dead_arith_opt[2][2][0][0], "addi", "live loop update remains");
+if len(X.compile_program(dead_arith_opt)) >= len(X.compile_program(dead_arith)) { fail("dead arithmetic must shrink x86-64 artifact"); }
+if len(X86.compile_program(dead_arith_opt)) >= len(X86.compile_program(dead_arith)) { fail("dead arithmetic must shrink i386 artifact"); }
+if len(A64.compile_program(dead_arith_opt)) >= len(A64.compile_program(dead_arith)) { fail("dead arithmetic must shrink ARM64 artifact"); }
+if len(IR.emit_c(dead_arith_opt)) >= len(IR.emit_c(dead_arith)) { fail("dead arithmetic must shrink portable C99 output"); }
+if str_contains(IR.emit_c(dead_arith_opt), "r2 = 10") { fail("dead register work leaked into C99 output"); }
+
+// Arithmetic feeding a later branch condition is live even when the register
+// is not part of the final result.
+let branch_live = [
+    ["seti", 0, 0], ["seti", 1, 2], ["seti", 2, 0],
+    ["loop", 1, [
+        ["addi", 2, 1],
+        ["ifnz", 2, [["addi", 0, 3]], [["addi", 0, 100]]]
+    ]]
+];
+eq(IR.eval(branch_live), 6, "branch-condition arithmetic baseline");
+eq(IR.eval(IR.optimize(branch_live)), 6, "branch-condition arithmetic remains live");
+
+// Both dynamic branch definitions feed a value used after the merge.
+let merged = [
+    ["seti", 0, 0], ["seti", 1, 2], ["loop", 1, [["addi", 0, 1]]],
+    ["ifnz", 0, [["seti", 2, 5]], [["seti", 2, 7]]], ["add", 0, 2]
+];
+eq(IR.eval(merged), 7, "branch-merge baseline");
+eq(IR.eval(IR.optimize(merged)), 7, "branch-merge definitions remain live");
+
+// A known condition survives unrelated instructions and selects its branch.
+let propagated = [
+    ["seti", 0, 0], ["seti", 2, 1], ["seti", 3, 2],
+    ["ifnz", 2, [["addi", 0, 4]], [["addi", 0, 100]]],
+    ["loop", 3, [["addi", 0, 1]]]
+];
+let propagated_opt = IR.optimize(propagated);
+eq(IR.eval(propagated_opt), 6, "inter-block constant propagation result");
+eq(len(propagated_opt), 3, "constant substitution exposes both dead definitions");
+let pi = 0;
+while pi < len(propagated_opt) {
+    if propagated_opt[pi][0] == "ifnz" { fail("known non-adjacent branch must be eliminated"); }
+    pi = pi + 1;
+}
+if str_contains(IR.emit_c(propagated_opt), "if (") { fail("known branch must also disappear from portable C99 output"); }
+
+// Copying a known constant materializes it at the destination. This exposes
+// both the source write and intermediate destination writes to shared DSE.
+let copied_constant = [
+    ["seti", 0, 0], ["seti", 1, 41], ["movr", 2, 1],
+    ["seti", 3, 1], ["loop", 3, [["addi", 0, 1]]],
+    ["addi", 2, 1], ["movr", 0, 2]
+];
+let copied_constant_opt = IR.optimize(copied_constant);
+eq(IR.eval(copied_constant), 42, "constant-copy baseline");
+eq(IR.eval(copied_constant_opt), 42, "constant-copy propagation result");
+if len(copied_constant_opt) >= len(copied_constant) { fail("constant-copy propagation must shrink shared IR"); }
+if len(X.compile_program(copied_constant_opt)) >= len(X.compile_program(copied_constant)) { fail("constant-copy propagation must shrink x86-64 artifact"); }
+if len(X86.compile_program(copied_constant_opt)) >= len(X86.compile_program(copied_constant)) { fail("constant-copy propagation must shrink i386 artifact"); }
+if len(A64.compile_program(copied_constant_opt)) >= len(A64.compile_program(copied_constant)) { fail("constant-copy propagation must shrink ARM64 artifact"); }
+if len(IR.emit_c(copied_constant_opt)) >= len(IR.emit_c(copied_constant)) { fail("constant-copy propagation must shrink portable C99 output"); }
+if str_contains(IR.emit_c(copied_constant_opt), "r1 = 41") { fail("dead source constant leaked into C99 output"); }
+
+// Non-adjacent zero/one identities are removed in shared IR, so every backend
+// benefits without maintaining architecture-specific copies of the rule.
+let identities = [
+    ["seti", 0, 5], ["seti", 2, 0], ["seti", 3, 1],
+    ["seti", 1, 2], ["loop", 1, [
+        ["add", 0, 2], ["sub", 0, 2], ["mul", 0, 3], ["addi", 0, 1]
+    ]]
+];
+let identities_opt = IR.optimize(identities);
+eq(IR.eval(identities), 7, "algebraic identities baseline");
+eq(IR.eval(identities_opt), 7, "algebraic identities result");
+eq(count_op(identities_opt, "add"), 0, "zero-add identity removed");
+eq(count_op(identities_opt, "sub"), 0, "zero-sub identity removed");
+eq(count_op(identities_opt, "mul"), 0, "one-multiply identity removed");
+eq(count_op(identities_opt, "addi"), 1, "loop keeps only the effective update");
+if len(X.compile_program(identities_opt)) >= len(X.compile_program(identities)) { fail("identities must shrink x86-64 artifact"); }
+if len(X86.compile_program(identities_opt)) >= len(X86.compile_program(identities)) { fail("identities must shrink i386 artifact"); }
+if len(A64.compile_program(identities_opt)) >= len(A64.compile_program(identities)) { fail("identities must shrink ARM64 artifact"); }
+if len(IR.emit_c(identities_opt)) >= len(IR.emit_c(identities)) { fail("identities must shrink C99 output"); }
+
+// Equal dynamic branches execute the same body regardless of the condition.
+// Removing the branch also avoids duplicating its body in native artifacts.
+let equal_branches = [
+    ["seti", 0, 0], ["seti", 1, 2], ["loop", 1, [["addi", 0, 1]]],
+    ["ifnz", 0, [["addi", 0, 5]], [["addi", 0, 5]]]
+];
+let equal_branches_opt = IR.optimize(equal_branches);
+eq(IR.eval(equal_branches), 7, "equal-branch baseline");
+eq(IR.eval(equal_branches_opt), 7, "equal-branch result");
+let ebi = 0;
+while ebi < len(equal_branches_opt) {
+    if equal_branches_opt[ebi][0] == "ifnz" { fail("identical branches must collapse"); }
+    ebi = ebi + 1;
+}
+
+// Stack and local-store consumers make their source register definitions live.
+let stateful = [
+    ["seti", 0, 11], ["pushr", 0], ["seti", 0, 3], ["lset", 0],
+    ["popr", 2], ["lget", 0], ["add", 0, 2]
+];
+eq(IR.eval(stateful), 14, "stack/local baseline");
+eq(IR.eval(IR.optimize(stateful)), 14, "stack/local effects remain ordered");
+
+// The evaluator stack is a true LIFO and stack underflow is deterministic.
+let lifo = [
+    ["seti", 0, 11], ["pushr", 0], ["seti", 0, 22], ["pushr", 0],
+    ["popr", 1], ["popr", 2], ["seti", 3, 100],
+    ["mul", 1, 3], ["add", 1, 2], ["movr", 0, 1]
+];
+eq(IR.eval(lifo), 2211, "stack pops in reverse push order");
+let underflow = try IR.eval([["popr", 0]]) catch "caught";
+eq(underflow, "caught", "empty stack pop throws");
+
+// Exercise stack growth and complete draining without relying on optimizer
+// folding. This catches stale-tail and accidental stack-copy regressions.
+let deep_stack = [["seti", 2, 0]];
+let si = 0;
+while si < 256 {
+    array_push(deep_stack, ["seti", 0, si]);
+    array_push(deep_stack, ["pushr", 0]);
+    si = si + 1;
+}
+si = 0;
+while si < 256 {
+    array_push(deep_stack, ["popr", 1]);
+    array_push(deep_stack, ["add", 2, 1]);
+    si = si + 1;
+}
+array_push(deep_stack, ["movr", 0, 2]);
+eq(IR.eval(deep_stack), 32640, "deep stack drains without losing values");
+
+// Bounded execution is the safe oracle for IDE previews and generated IR.
+let bounded = IR.eval_bounded(loopsum, map{ max_steps: 1000, max_stack: 8, max_locals: 8 });
+eq(bounded.value, 55, "bounded evaluator result");
+if bounded.steps < 10 { fail("bounded evaluator must account for loop work"); }
+eq(bounded.peak_stack, 0, "bounded evaluator reports peak stack");
+let step_limited = try IR.eval_bounded(loopsum, map{ max_steps: 5 }) catch "caught";
+eq(step_limited, "caught", "bounded evaluator rejects excessive execution");
+let stack_limited = try IR.eval_bounded([
+    ["seti", 0, 1], ["pushr", 0], ["pushr", 0]
+], map{ max_stack: 1 }) catch "caught";
+eq(stack_limited, "caught", "bounded evaluator rejects excessive stack growth");
+
+// Whole-program folding may only materialize values representable by seti.
+// A negative result remains structured instead of becoming invalid output.
+let negative = [["seti", 0, 1], ["seti", 1, 2], ["sub", 0, 1]];
+let negative_opt = IR.optimize(negative);
+eq(IR.validate(negative_opt).ok, true, "optimizer always emits valid IR");
+eq(IR.eval(negative_opt), -1, "negative result survives safe structured optimization");
+
+// Known arithmetic before dynamic control flow is folded in the shared IR,
+// and a statically zero loop disappears completely.
+let shared_constants = [
+    ["seti", 0, 2], ["seti", 2, 3], ["add", 0, 2],
+    ["seti", 1, 1], ["loop", 1, [["addi", 0, 1]]]
+];
+let shared_constants_opt = IR.optimize(shared_constants);
+eq(IR.eval(shared_constants_opt), 6, "known arithmetic propagation remains correct");
+if IR.instruction_count(shared_constants_opt) >= IR.instruction_count(shared_constants) {
+    fail("known arithmetic propagation must reduce shared IR");
+}
+let zero_loop = [
+    ["seti", 0, 7], ["seti", 1, 0], ["loop", 1, [["addi", 0, 100]]],
+    ["seti", 2, 1], ["loop", 2, [["addi", 0, 1]]]
+];
+let zero_loop_opt = IR.optimize(zero_loop);
+eq(IR.eval(zero_loop_opt), 8, "zero-loop elimination result");
+eq(IR.instruction_count(zero_loop_opt), 4, "zero loop and its dead counter are eliminated");
+let report = IR.optimize_report(shared_constants);
+eq(report.before, IR.instruction_count(shared_constants), "optimizer report input count");
+eq(report.after, IR.instruction_count(report.ir), "optimizer report output count");
+if report.removed < 1 { fail("optimizer report must expose eliminated instructions"); }
+eq(report.removed, report.peephole_removed + report.constant_removed + report.dead_store_removed + report.cleanup_removed,
+   "optimizer phase deltas sum to total removal");
 
 // ── portable C backend (any C compiler = oldest..future classical devices) ──────────
 let c = IR.emit_c(arith);

@@ -1,0 +1,140 @@
+let T = import("stdlib:thread.sapp");
+
+// Lock the exact spawn-wire shape used by the supervisor before exercising its
+// state machine: callable + mode + channel handle are all transferable values.
+let direct_done = channel_buffered(1);
+let direct_sender = direct_done.sender;
+let direct_task = fn() { return 42; };
+let direct_mode = "plain";
+let direct_worker = fn() {
+    let outcome = if direct_mode == "plain" {
+        try map{ ok: true, value: direct_task() } catch map{ ok: false, value: nil }
+    } else { map{ ok: false, value: nil } };
+    send(direct_sender, map{ ok: outcome.ok, finished_ms: now_ms() });
+    channel_close(direct_sender);
+    return outcome;
+};
+let direct_handle = spawn(direct_worker);
+assert(recv_timeout(direct_done.receiver, 1000).ok, "supervisor completion signal shape crosses spawn wire");
+assert(join(direct_handle).value == 42, "supervisor worker result shape crosses join wire");
+
+let sup = T.supervisor();
+
+// Preserve both method-call forms used by existing pblang libraries.
+let colon_sup = T.supervisor();
+let colon_id = colon_sup:spawn(fn() { return "colon"; }, 1000);
+assert(colon_sup:wait(colon_id, 1000).status == "completed",
+       "supervisor supports colon method dispatch");
+assert(colon_sup:reap() == 1, "colon-dispatch supervisor reaps its worker");
+
+let completed_id = sup.spawn(fn() { return 42; }, 1000);
+let completed = sup.wait(completed_id, 1000);
+assert(completed.found and completed.status == "completed" and completed.reaped,
+       "supervisor harvests successful completion");
+
+let args_id = sup.spawn_with_args(fn(values) { return values[0] + values[1]; }, [20, 22], 1000);
+let args_done = sup.wait(args_id, 1000);
+assert(args_done.status == "completed", "supervisor supports argument-bearing workers");
+
+let failed_id = sup.spawn(fn() { throw "expected failure"; }, 1000);
+let failed = sup.wait(failed_id, 1000);
+assert(failed.status == "failed" and failed.error == "supervised task failed",
+       "supervisor records worker failure without corrupting parent state");
+
+let timeout_id = sup.spawn(fn() {
+    let blocker = channel_buffered(1);
+    recv_timeout(blocker.receiver, 40);
+    return 1;
+}, 5);
+sleep_ms(10);
+let timed_out = sup.status(timeout_id);
+assert(timed_out.status == "timed-out" and not timed_out.active and not timed_out.reaped,
+       "deadline removes an uncooperative worker from active accounting: " + str(timed_out));
+let timeout_stats = sup.stats();
+assert(timeout_stats.detached == 1 and timeout_stats.unreaped == 1,
+       "stats expose timed-out workers that still require cleanup");
+sleep_ms(45);
+sup.check_all();
+let late = sup.status(timeout_id);
+assert(late.status == "timed-out" and late.reaped,
+       "timed-out worker is joined when it eventually exits");
+
+let cooperative_id = sup.spawn_cooperative(fn(token) {
+    let pause = channel_buffered(1);
+    while not token.requested(token) { recv_timeout(pause.receiver, 1); }
+    return "stopped";
+}, 1000);
+assert(sup.cancel(cooperative_id, "test-stop"), "cooperative cancellation request is accepted");
+let cancelled = sup.wait(cooperative_id, 1000);
+assert(cancelled.status == "cancelled" and cancelled.cancel_reason == "test-stop",
+       "cooperative worker exits with explicit cancellation status");
+
+let failed_after_cancel_id = sup.spawn_cooperative(fn(token) {
+    let pause = channel_buffered(1);
+    while not token.requested(token) { recv_timeout(pause.receiver, 1); }
+    throw "cleanup failed";
+}, 1000);
+assert(sup.cancel(failed_after_cancel_id, "failure-path"),
+       "failing cooperative worker receives cancellation");
+let failed_after_cancel = sup.wait(failed_after_cancel_id, 1000);
+assert(failed_after_cancel.status == "failed" and
+       failed_after_cancel.error == "supervised task failed after cancellation request",
+       "worker failure after observed cancellation remains a failure");
+
+let cooperative_args_id = sup.spawn_cooperative_with_args(fn(token, values) {
+    return values[0] + values[1] + if token.requested(token) { 1 } else { 0 };
+}, [20, 22], 1000);
+assert(sup.wait(cooperative_args_id, 1000).status == "completed",
+       "cooperative workers accept explicit transferable arguments");
+
+let kill_a = sup.spawn_cooperative(fn(token) {
+    let pause = channel_buffered(1);
+    while not token.requested(token) { recv_timeout(pause.receiver, 1); }
+    return 1;
+}, 1000);
+let kill_b = sup.spawn_cooperative(fn(token) {
+    let pause = channel_buffered(1);
+    while not token.requested(token) { recv_timeout(pause.receiver, 1); }
+    return 2;
+}, 1000);
+let stop_all = sup.kill_all();
+assert(stop_all.requested == 2 and not stop_all.preemptive,
+       "compatibility kill_all reports cooperative semantics honestly");
+assert(sup.wait(kill_a, 1000).status == "cancelled", "first stop-all worker exits");
+assert(sup.wait(kill_b, 1000).status == "cancelled", "second stop-all worker exits");
+
+let ignored_cancel_id = sup.spawn(fn() {
+    let pause = channel_buffered(1);
+    recv_timeout(pause.receiver, 10);
+    return 1;
+}, 1000);
+assert(sup.cancel(ignored_cancel_id, "plain-worker"), "plain worker accepts lifecycle cancellation request");
+assert(sup.wait(ignored_cancel_id, 1000).status == "completed",
+       "successful worker that did not observe cancellation remains completed");
+
+let stats = sup.stats();
+assert(stats.format == "pblang.thread.supervisor.stats.v1", "supervisor stats are versioned");
+assert(stats.spawned == 10 and stats.completed == 4 and stats.failed == 2,
+       "supervisor completion counters are parent-side and deterministic");
+assert(stats.timed_out == 1 and stats.late_completed == 1,
+       "timeout and late completion are counted once");
+assert(stats.cancelled == 3 and stats.cancel_requested == 6 and stats.killed == 0,
+       "cancellation metrics do not claim unsupported thread kills");
+assert(stats.cancel_not_observed == 1,
+       "cancellation status requires proof that the worker observed the signal");
+assert(stats.active == 0 and sup.active_count() == 0 and stats.max_tracked == 1024,
+       "all finished workers leave bounded active accounting");
+assert(stats.detached == 0 and stats.unreaped == 0,
+       "all workers were joined after cooperative or natural exit");
+
+assert(T.cancellation_requested(map{}), "malformed cancellation tokens fail closed");
+
+let invalid_callable = try sup.spawn(123, 100) catch "rejected";
+assert(invalid_callable == "rejected", "non-callable tasks fail closed");
+let invalid_timeout = try sup.spawn(fn() { return 0; }, "NaN") catch "rejected";
+assert(invalid_timeout == "rejected", "non-finite timeout fails closed");
+
+let removed = sup.reap();
+assert(removed == 10 and sup.stats().tracked == 0, "terminal records can be reaped deterministically");
+
+print "thread_supervisor_pass";

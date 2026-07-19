@@ -1,0 +1,928 @@
+// interp.sapp — a pblang interpreter written IN pblang.
+//
+// Front end reuses the self-hosting tokenizer + parser (both native-capable);
+// this file is the tree-walking EVALUATOR over the parser's AST. Together they
+// form "pblang running pblang, in pblang" — and since all three are pblang, the
+// whole interpreter native-compiles. This is the first stage of rewriting the
+// (currently Rust) interpreter in pblang itself.
+//
+// Supported subset (grows over time): let/const, fn (recursion + closures),
+// return, if/elif/else, while, print, expression statements, assignment;
+// number/string/bool/nil/ident literals, binary/unary ops, calls, arrays,
+// indexing, member access; a curated set of host builtins (str/len/push/...).
+
+let _tok = import("stdlib/compiler/tokenizer.sapp");
+let _par = import("stdlib/compiler/parser.sapp");
+
+// ── environment: a scope chain of {vars, parent} ──────────────────────────────
+// FLAT environment: variables live DIRECTLY in the scope map (was a nested `vars` map + a `parent` field —
+// two map allocations per scope and a `.vars` indirection on every lookup). Now one map per scope, and the
+// parent link is stored under "@p" — `@` can't appear in a pblang identifier, so it never collides with a
+// user variable name. Env creation is the per-CALL hot path (fib allocates one scope per invocation), so
+// halving the allocations there is the highest-leverage structural win in the tree-walker.
+fn _env_new(parent) { let e = map{}; e["@p"] = parent; return e; }
+
+// map_has (a cheap presence check) instead of `try m[k] catch SENTINEL` (which sets up exception machinery
+// on every variable lookup). One map probe per scope level now, not two.
+fn _env_get(env, name) {
+    let e = env;
+    while e != nil {
+        if map_has(e, name) { return e[name]; }
+        e = e["@p"];
+    }
+    throw "undefined variable: " + name;
+}
+
+// Identifier nodes are immutable after preparation and always execute at the
+// same lexical depth. Resolve that depth once, then use direct map indexing on
+// the hot path. Depths 0 and 1 cover local parameters and recursive/global
+// function names without allocating a resolver object or probing every scope.
+fn _env_resolve_node(env, node) {
+    let e = env;
+    let depth = 0;
+    while e != nil {
+        if map_has(e, node.name) {
+            node["@ed"] = depth;
+            return e[node.name];
+        }
+        e = e["@p"];
+        depth = depth + 1;
+    }
+    throw "undefined variable: " + node.name;
+}
+
+fn _env_get_node(env, node) {
+    let depth = node["@ed"];
+    if depth == 0 { return env[node.name]; }
+    if depth == 1 { return env["@p"][node.name]; }
+    if depth < 0 { return _env_resolve_node(env, node); }
+    let e = env;
+    let i = 0;
+    while i < depth { e = e["@p"]; i = i + 1; }
+    return e[node.name];
+}
+
+fn _env_assign_node(env, node, val) {
+    let depth = node["@ed"];
+    if depth == 0 { env[node.name] = val; return; }
+    if depth == 1 { env["@p"][node.name] = val; return; }
+    if depth < 0 {
+        let e = env;
+        let d = 0;
+        while e != nil {
+            if map_has(e, node.name) {
+                node["@ed"] = d;
+                e[node.name] = val;
+                return;
+            }
+            e = e["@p"];
+            d = d + 1;
+        }
+        throw "assign to undefined variable: " + node.name;
+    }
+    let e = env;
+    let i = 0;
+    while i < depth { e = e["@p"]; i = i + 1; }
+    e[node.name] = val;
+}
+
+fn _env_has(env, name) {
+    let e = env;
+    while e != nil {
+        if map_has(e, name) { return true; }
+        e = e["@p"];
+    }
+    return false;
+}
+fn _env_define(env, name, val) { env[name] = val; }
+fn _env_assign(env, name, val) {
+    let e = env;
+    while e != nil {
+        if map_has(e, name) { e[name] = val; return; }
+        e = e["@p"];
+    }
+    throw "assign to undefined variable: " + name;
+}
+
+fn _param_name(p) { if is_map(p) { return p.name; } return p; }
+
+// Compact private closure layout. Calls dominate the tree interpreter, and
+// array slots avoid repeated hash lookups for closure metadata on every call.
+// This representation never escapes through a public interpreter API.
+let _FN_TAG = 9173;
+let _FN_PARAMS = 1; let _FN_ARITY = 2; let _FN_BODY = 3; let _FN_ENV = 4;
+
+// Normalize immutable call metadata once when a closure is created. The old
+// path decoded parameter nodes and unwrapped the body block on every call.
+fn _make_closure(params, body, env) {
+    let names = [];
+    let i = 0;
+    while i < len(params) { push(names, _param_name(params[i])); i = i + 1; }
+    let stmts = [];
+    if is_array(body) { stmts = body; }
+    elif is_map(body) and map_has(body, "stmts") { stmts = body.stmts; }
+    return [_FN_TAG, names, len(names), stmts, env];
+}
+
+// ── host builtin dispatch (a curated bridge to the real runtime) ──────────────
+fn _call_builtin(name, a) {
+    if name == "str" { return str(a[0]); }
+    if name == "len" { return len(a[0]); }
+    if name == "push" { push(a[0], a[1]); return a[0]; }
+    if name == "pop" { return pop(a[0]); }
+    if name == "abs" { if a[0] < 0 { return 0 - a[0]; } return a[0]; }
+    if name == "str_slice" { return str_slice(a[0], a[1], a[2]); }
+    if name == "strcharcodeat" { return strcharcodeat(a[0], a[1]); }
+    if name == "strfromcharcode" { return strfromcharcode(a[0]); }
+    if name == "str_split" { return str_split(a[0], a[1]); }
+    if name == "parse_number" { return parse_number(a[0]); }
+    if name == "map_has" { if map_has(a[0], a[1]) { return true; } return false; }
+    if name == "map_keys" { return map_keys(a[0]); }
+    if name == "str_trim" { return str_trim(a[0]); }
+    if name == "str_starts_with" { return str_starts_with(a[0], a[1]); }
+    if name == "str_replace_all" { return str_replace_all(a[0], a[1], a[2]); }
+    if name == "num_pow" { return num_pow(a[0], a[1]); }   // `a ** b` desugars to this
+    throw "unknown builtin: " + name;
+}
+// Scalar dispatch for the dominant builtin arities avoids allocating and
+// populating a temporary args array on every interpreted len/map/string call.
+// Mismatched arities retain the generic path and its existing index errors.
+fn _call_builtin1(name, a0) {
+    if name == "str" { return str(a0); }
+    if name == "len" { return len(a0); }
+    if name == "pop" { return pop(a0); }
+    if name == "abs" { if a0 < 0 { return 0 - a0; } return a0; }
+    if name == "parse_number" { return parse_number(a0); }
+    if name == "map_keys" { return map_keys(a0); }
+    if name == "str_trim" { return str_trim(a0); }
+    return _call_builtin(name, [a0]);
+}
+fn _call_builtin2(name, a0, a1) {
+    if name == "push" { push(a0, a1); return a0; }
+    if name == "strcharcodeat" { return strcharcodeat(a0, a1); }
+    if name == "str_split" { return str_split(a0, a1); }
+    if name == "map_has" { if map_has(a0, a1) { return true; } return false; }
+    if name == "str_starts_with" { return str_starts_with(a0, a1); }
+    if name == "num_pow" { return num_pow(a0, a1); }
+    return _call_builtin(name, [a0, a1]);
+}
+
+let _BUILTINS = map{ str: true, len: true, push: true, pop: true, abs: true,
+    str_slice: true, strcharcodeat: true, strfromcharcode: true, str_split: true, parse_number: true,
+    map_has: true, map_keys: true, str_trim: true, str_starts_with: true, str_replace_all: true, num_pow: true };
+fn _is_builtin(name) { return map_has(_BUILTINS, name); }
+
+// ── private interpreter tags ─────────────────────────────────────────────────
+// Parser ASTs keep their public string fields unchanged. The interpreter adds
+// numeric tags under `@` keys (not valid identifier names) once per AST, so hot
+// recursive execution compares numbers instead of repeatedly comparing strings.
+let _E_NUMBER = 1; let _E_STRING = 2; let _E_BOOL = 3; let _E_NIL = 4;
+let _E_IDENT = 5; let _E_BINARY = 6; let _E_CALL = 7; let _E_ASSIGN = 8;
+let _E_ASSIGN_TO = 9; let _E_UNARY = 10; let _E_ARRAY = 11; let _E_MAP = 12;
+let _E_INDEX = 13; let _E_MEMBER = 14; let _E_FN_LIT = 15;
+let _E_LEAF_BINARY = 16;
+
+let _S_EXPR = 1; let _S_RETURN = 2; let _S_LET = 3; let _S_CONST = 4;
+let _S_FN = 5; let _S_PRINT = 6; let _S_BLOCK = 7; let _S_IF = 8;
+let _S_WHILE = 9; let _S_FOR = 10; let _S_FOR_RANGE = 11; let _S_FOR_IN = 12;
+let _S_FOR_MAP = 13; let _S_BREAK = 14; let _S_CONTINUE = 15;
+let _S_IMPORT = 16; let _S_EXPORT = 17;
+
+let _O_AND = 1; let _O_OR = 2; let _O_ADD = 3; let _O_LT = 4;
+let _O_SUB = 5; let _O_MUL = 6; let _O_EQ = 7; let _O_MOD = 8;
+let _O_GT = 9; let _O_LE = 10; let _O_GE = 11; let _O_DIV = 12; let _O_NE = 13;
+
+fn _expr_tag(k) {
+    if k == "number" { return _E_NUMBER; } if k == "string" { return _E_STRING; }
+    if k == "bool" { return _E_BOOL; } if k == "nil" { return _E_NIL; }
+    if k == "ident" { return _E_IDENT; } if k == "binary" { return _E_BINARY; }
+    if k == "call" { return _E_CALL; } if k == "assign" { return _E_ASSIGN; }
+    if k == "assign_to" { return _E_ASSIGN_TO; } if k == "unary" { return _E_UNARY; }
+    if k == "array" { return _E_ARRAY; } if k == "map" { return _E_MAP; }
+    if k == "index" { return _E_INDEX; } if k == "member" { return _E_MEMBER; }
+    if k == "fn_lit" { return _E_FN_LIT; }
+    return 0;
+}
+
+fn _stmt_tag(k) {
+    if k == "expr_stmt" { return _S_EXPR; } if k == "return" { return _S_RETURN; }
+    if k == "let" { return _S_LET; } if k == "const" { return _S_CONST; }
+    if k == "fn" { return _S_FN; } if k == "print" { return _S_PRINT; }
+    if k == "block" { return _S_BLOCK; } if k == "if" { return _S_IF; }
+    if k == "while" { return _S_WHILE; } if k == "for" { return _S_FOR; }
+    if k == "for_range" { return _S_FOR_RANGE; } if k == "for_in" { return _S_FOR_IN; }
+    if k == "for_map" { return _S_FOR_MAP; } if k == "break" { return _S_BREAK; }
+    if k == "continue" { return _S_CONTINUE; } if k == "import" { return _S_IMPORT; }
+    if k == "export" { return _S_EXPORT; }
+    return 0;
+}
+
+fn _operator_tag(op) {
+    if op == "and" { return _O_AND; } if op == "or" { return _O_OR; }
+    if op == "+" { return _O_ADD; } if op == "<" { return _O_LT; }
+    if op == "-" { return _O_SUB; } if op == "*" { return _O_MUL; }
+    if op == "==" { return _O_EQ; } if op == "%" { return _O_MOD; }
+    if op == ">" { return _O_GT; } if op == "<=" { return _O_LE; }
+    if op == ">=" { return _O_GE; } if op == "/" { return _O_DIV; }
+    if op == "!=" { return _O_NE; }
+    return 0;
+}
+
+// A leaf binary has two immutable literal/identifier operands. Cache a compact
+// execution plan once so numeric loops do not recursively redispatch the same
+// three AST nodes on every iteration. Operators keep the ordinary PBLang value
+// operations; this is dispatch removal, not an integer-only semantic shortcut.
+fn _leaf_binary_plan(node) {
+    let op = node["@io"];
+    if op == _O_AND or op == _O_OR or op == 0 { return nil; }
+    let lk = node.left["@ie"]; let rk = node.right["@ie"];
+    if (lk != _E_IDENT and lk != _E_NUMBER) or (rk != _E_IDENT and rk != _E_NUMBER) { return nil; }
+    let lv = if lk == _E_NUMBER { node.left.nval } else { node.left };
+    let rv = if rk == _E_NUMBER { node.right.nval } else { node.right };
+    return [op, lk, lv, rk, rv];
+}
+
+// Conservatively collect every supported binding whose name is also a builtin
+// before preparing calls. If that name appears anywhere as a variable,
+// function, parameter, or loop binding, its calls retain dynamic scope lookup.
+// Only names that cannot be shadowed take the allocation-free direct path.
+fn _collect_binding(name, bindings) {
+    if _is_builtin(name) { bindings[name] = true; }
+}
+
+fn _collect_param_bindings(params, bindings) {
+    let i = 0;
+    while i < len(params) {
+        _collect_binding(_param_name(params[i]), bindings);
+        i = i + 1;
+    }
+}
+
+fn _collect_expr_bindings(node, bindings) {
+    if node == nil or not is_map(node) or not map_has(node, "kind") { return; }
+    let k = node.kind;
+    if k == "binary" {
+        _collect_expr_bindings(node.left, bindings);
+        _collect_expr_bindings(node.right, bindings);
+        return;
+    }
+    if k == "call" {
+        _collect_expr_bindings(node.func, bindings);
+        let i = 0;
+        while i < len(node.args) { _collect_expr_bindings(node.args[i], bindings); i = i + 1; }
+        return;
+    }
+    if k == "assign" { _collect_expr_bindings(node.value, bindings); return; }
+    if k == "assign_to" {
+        _collect_expr_bindings(node.target, bindings);
+        _collect_expr_bindings(node.value, bindings);
+        return;
+    }
+    if k == "unary" { _collect_expr_bindings(node.operand, bindings); return; }
+    if k == "array" {
+        let i = 0;
+        while i < len(node.items) { _collect_expr_bindings(node.items[i], bindings); i = i + 1; }
+        return;
+    }
+    if k == "map" {
+        let i = 0;
+        while i < len(node.entries) { _collect_expr_bindings(node.entries[i].value, bindings); i = i + 1; }
+        return;
+    }
+    if k == "index" {
+        _collect_expr_bindings(node.obj, bindings);
+        _collect_expr_bindings(node.index, bindings);
+        return;
+    }
+    if k == "member" { _collect_expr_bindings(node.obj, bindings); return; }
+    if k == "fn_lit" {
+        _collect_param_bindings(node.params, bindings);
+        _collect_stmt_bindings(node.body, bindings);
+    }
+}
+
+fn _collect_stmt_bindings(node, bindings) {
+    if node == nil or not is_map(node) or not map_has(node, "kind") { return; }
+    let k = node.kind;
+    if k == "expr_stmt" { _collect_expr_bindings(node.expr, bindings); return; }
+    if k == "return" or k == "print" {
+        if node.value != nil { _collect_expr_bindings(node.value, bindings); }
+        return;
+    }
+    if k == "let" or k == "const" {
+        _collect_binding(node.name, bindings);
+        if node.value != nil { _collect_expr_bindings(node.value, bindings); }
+        return;
+    }
+    if k == "fn" {
+        _collect_binding(node.name, bindings);
+        _collect_param_bindings(node.params, bindings);
+        _collect_stmt_bindings(node.body, bindings);
+        return;
+    }
+    if k == "block" { _collect_block_bindings(node, bindings); return; }
+    if k == "if" {
+        _collect_expr_bindings(node.cond, bindings);
+        _collect_stmt_bindings(node.then, bindings);
+        let i = 0;
+        while i < len(node.elifs) {
+            _collect_expr_bindings(node.elifs[i].cond, bindings);
+            _collect_stmt_bindings(node.elifs[i].body, bindings);
+            i = i + 1;
+        }
+        if node.else != nil { _collect_stmt_bindings(node.else, bindings); }
+        return;
+    }
+    if k == "while" {
+        _collect_expr_bindings(node.cond, bindings);
+        _collect_stmt_bindings(node.body, bindings);
+        return;
+    }
+    if k == "for" {
+        _collect_binding(node.name, bindings);
+        _collect_expr_bindings(node.end, bindings);
+        _collect_stmt_bindings(node.body, bindings);
+        return;
+    }
+    if k == "for_range" {
+        _collect_binding(node.name, bindings);
+        _collect_expr_bindings(node.start, bindings);
+        _collect_expr_bindings(node.end, bindings);
+        _collect_stmt_bindings(node.body, bindings);
+        return;
+    }
+    if k == "for_in" {
+        _collect_binding(node.name, bindings);
+        _collect_expr_bindings(node.iter, bindings);
+        _collect_stmt_bindings(node.body, bindings);
+        return;
+    }
+    if k == "for_map" {
+        _collect_binding(node.key, bindings);
+        _collect_binding(node.val, bindings);
+        _collect_expr_bindings(node.iter, bindings);
+        _collect_stmt_bindings(node.body, bindings);
+    }
+}
+
+fn _collect_block_bindings(block, bindings) {
+    let stmts = [];
+    if is_array(block) { stmts = block; }
+    elif is_map(block) and map_has(block, "stmts") { stmts = block.stmts; }
+    let i = 0;
+    while i < len(stmts) { _collect_stmt_bindings(stmts[i], bindings); i = i + 1; }
+}
+
+fn _binding_names(block) {
+    let bindings = map{};
+    _collect_block_bindings(block, bindings);
+    return bindings;
+}
+
+fn _prepare_expr(node, bindings) {
+    if node == nil or not is_map(node) or not map_has(node, "kind") { return; }
+    let tag = _expr_tag(node.kind);
+    node["@ie"] = tag;
+    if tag == _E_NUMBER { node.nval = parse_number(node.value); return; }
+    if tag == _E_IDENT { node["@ed"] = 0 - 1; return; }
+    if tag == _E_BINARY {
+        node["@io"] = _operator_tag(node.op);
+        _prepare_expr(node.left, bindings); _prepare_expr(node.right, bindings);
+        node["@ip"] = _leaf_binary_plan(node);
+        if node["@ip"] != nil { node["@ie"] = _E_LEAF_BINARY; }
+        return;
+    }
+    if tag == _E_CALL {
+        _prepare_expr(node.func, bindings);
+        let i = 0; while i < len(node.args) { _prepare_expr(node.args[i], bindings); i = i + 1; }
+        node["@ia"] = len(node.args);
+        let builtin_candidate = node.func["@ie"] == _E_IDENT and _is_builtin(node.func.name);
+        node["@ib"] = builtin_candidate;
+        node["@iu"] = builtin_candidate and not map_has(bindings, node.func.name);
+        return;
+    }
+    if tag == _E_ASSIGN { node["@ed"] = 0 - 1; _prepare_expr(node.value, bindings); return; }
+    if tag == _E_ASSIGN_TO { _prepare_expr(node.target, bindings); _prepare_expr(node.value, bindings); return; }
+    if tag == _E_UNARY { _prepare_expr(node.operand, bindings); return; }
+    if tag == _E_ARRAY {
+        let i = 0; while i < len(node.items) { _prepare_expr(node.items[i], bindings); i = i + 1; }
+        return;
+    }
+    if tag == _E_MAP {
+        let i = 0; while i < len(node.entries) { _prepare_expr(node.entries[i].value, bindings); i = i + 1; }
+        return;
+    }
+    if tag == _E_INDEX { _prepare_expr(node.obj, bindings); _prepare_expr(node.index, bindings); return; }
+    if tag == _E_MEMBER { _prepare_expr(node.obj, bindings); return; }
+    if tag == _E_FN_LIT { _prepare_stmt(node.body, bindings); }
+}
+
+fn _prepare_stmt(node, bindings) {
+    if node == nil or not is_map(node) or not map_has(node, "kind") { return; }
+    let tag = _stmt_tag(node.kind);
+    node["@is"] = tag;
+    node["@ic"] = false;
+    if tag == _S_EXPR {
+        _prepare_expr(node.expr, bindings);
+        node["@sa"] = nil;
+        if node.expr["@ie"] == _E_ASSIGN { node["@sa"] = node.expr; }
+        return;
+    }
+    if tag == _S_RETURN or tag == _S_LET or tag == _S_CONST or tag == _S_PRINT {
+        if node.value != nil { _prepare_expr(node.value, bindings); }
+        if tag == _S_RETURN { node["@ic"] = true; }
+        return;
+    }
+    if tag == _S_FN { _prepare_stmt(node.body, bindings); return; }
+    if tag == _S_BLOCK { _prepare_block(node, bindings); return; }
+    if tag == _S_IF {
+        _prepare_expr(node.cond, bindings); _prepare_stmt(node.then, bindings);
+        node["@it"] = node.then.stmts; node["@itd"] = node.then["@id"];
+        node["@ic"] = node.then["@ic"];
+        // Numeric/recursive code commonly uses a guard-only if followed by a
+        // return. Cache that there are no elif/else branches so the false hot
+        // path avoids repeated map_has probes on every invocation.
+        node["@inf"] = len(node.elifs) == 0 and node.else == nil;
+        let i = 0;
+        while i < len(node.elifs) {
+            let branch = node.elifs[i];
+            _prepare_expr(branch.cond, bindings); _prepare_stmt(branch.body, bindings);
+            branch["@ib"] = branch.body.stmts; branch["@id"] = branch.body["@id"];
+            if branch.body["@ic"] { node["@ic"] = true; }
+            i = i + 1;
+        }
+        if node.else != nil {
+            _prepare_stmt(node.else, bindings);
+            node["@ieb"] = node.else.stmts; node["@ied"] = node.else["@id"];
+            if node.else["@ic"] { node["@ic"] = true; }
+        }
+        return;
+    }
+    if tag == _S_WHILE {
+        _prepare_expr(node.cond, bindings); _prepare_stmt(node.body, bindings);
+        node["@wb"] = node.body.stmts; node["@wd"] = node.body["@id"];
+        node["@wq"] = not node.body["@ic"];
+        node["@ic"] = node.body["@ic"];
+        return;
+    }
+    if tag == _S_FOR {
+        _prepare_expr(node.end, bindings); _prepare_stmt(node.body, bindings);
+        node["@fb"] = node.body.stmts; node["@fq"] = not node.body["@ic"];
+        node["@ic"] = node.body["@ic"];
+        return;
+    }
+    if tag == _S_FOR_RANGE {
+        _prepare_expr(node.start, bindings); _prepare_expr(node.end, bindings); _prepare_stmt(node.body, bindings);
+        node["@fb"] = node.body.stmts; node["@fq"] = not node.body["@ic"];
+        node["@ic"] = node.body["@ic"];
+        return;
+    }
+    if tag == _S_FOR_IN or tag == _S_FOR_MAP {
+        _prepare_expr(node.iter, bindings); _prepare_stmt(node.body, bindings);
+        node["@fb"] = node.body.stmts; node["@fq"] = not node.body["@ic"];
+        node["@ic"] = node.body["@ic"];
+        return;
+    }
+    if tag == _S_BREAK or tag == _S_CONTINUE { node["@ic"] = true; }
+}
+
+fn _prepare_block(block, bindings) {
+    let stmts = [];
+    if is_array(block) { stmts = block; }
+    elif is_map(block) and map_has(block, "stmts") { stmts = block.stmts; }
+    let declares = false;
+    let controls = false;
+    let i = 0;
+    while i < len(stmts) {
+        _prepare_stmt(stmts[i], bindings);
+        let k = stmts[i]["@is"];
+        if k == _S_LET or k == _S_CONST or k == _S_FN { declares = true; }
+        if stmts[i]["@ic"] { controls = true; }
+        i = i + 1;
+    }
+    // Block structure is immutable after parsing. Cache its scope requirement
+    // once instead of rescanning the same statements on every recursive branch.
+    if is_map(block) { block["@id"] = declares; block["@ic"] = controls; }
+}
+
+// ── expression evaluation ─────────────────────────────────────────────────────
+fn _eval_leaf_binary(plan, env) {
+    let l = if plan[1] == _E_NUMBER { plan[2] } else { _env_get_node(env, plan[2]) };
+    let r = if plan[3] == _E_NUMBER { plan[4] } else { _env_get_node(env, plan[4]) };
+    let op = plan[0];
+    if op == _O_ADD { return l + r; }
+    if op == _O_LT { return l < r; }
+    if op == _O_SUB { return l - r; }
+    if op == _O_MUL { return l * r; }
+    if op == _O_EQ { return l == r; }
+    if op == _O_MOD { return l % r; }
+    if op == _O_GT { return l > r; }
+    if op == _O_LE { return l <= r; }
+    if op == _O_GE { return l >= r; }
+    if op == _O_DIV { return l / r; }
+    return l != r;
+}
+
+fn _eval_expr(node, env) {
+    let k = node["@ie"];
+    // The parser stores a number literal as its source TEXT. Parsing it on EVERY evaluation is pure waste —
+    // in a loop the same literal node (`2` in `n<2`) is re-parsed each iteration. Cache the parsed value in
+    // the node on first touch; thereafter it's a single map_has instead of a char-by-char parse.
+    if k == _E_NUMBER { return node.nval; }
+    if k == _E_STRING { return node.value; }
+    if k == _E_BOOL { return node.value; }
+    if k == _E_NIL { return nil; }
+    if k == _E_IDENT { return _env_get_node(env, node); }
+    if k == _E_LEAF_BINARY { return _eval_leaf_binary(node["@ip"], env); }
+    // HOT KINDS FIRST: binary and call dominate compute-heavy code; check them before the colder kinds below
+    // so the common path walks the fewest string comparisons.
+    if k == _E_BINARY {
+        let op = node["@io"];
+        // short-circuit boolean ops
+        if op == _O_AND { let l = _eval_expr(node.left, env); if l { return _eval_expr(node.right, env); } return l; }
+        if op == _O_OR  { let l = _eval_expr(node.left, env); if l { return l; } return _eval_expr(node.right, env); }
+        let l = _eval_expr(node.left, env);
+        let r = _eval_expr(node.right, env);
+        if op == _O_ADD { return l + r; }
+        if op == _O_LT { return l < r; }
+        if op == _O_SUB { return l - r; }
+        if op == _O_MUL { return l * r; }
+        if op == _O_EQ { return l == r; }
+        if op == _O_MOD { return l % r; }
+        if op == _O_GT { return l > r; }
+        if op == _O_LE { return l <= r; }
+        if op == _O_GE { return l >= r; }
+        if op == _O_DIV { return l / r; }
+        if op == _O_NE { return l != r; }
+        throw "bad binary op: " + node.op;
+    }
+    if k == _E_CALL {
+        let f = node.func;
+        let argc = node["@ia"];
+        let builtin_candidate = node["@ib"];
+        let builtin_unshadowed = node["@iu"];
+        // User calls with zero, one, or two arguments dominate recursive numeric code.
+        // Keep values scalar on these paths instead of allocating an args array
+        // for every call. Arguments are still evaluated before the callee.
+        if argc == 0 {
+            if builtin_candidate and (builtin_unshadowed or not _env_has(env, f.name)) {
+                return _call_builtin(f.name, []);
+            }
+            return _apply0(_eval_expr(f, env));
+        }
+        if argc == 1 {
+            let a0 = _eval_expr(node.args[0], env);
+            if builtin_candidate and (builtin_unshadowed or not _env_has(env, f.name)) {
+                return _call_builtin1(f.name, a0);
+            }
+            return _apply1(_eval_expr(f, env), a0);
+        }
+        if argc == 2 {
+            let a0 = _eval_expr(node.args[0], env);
+            let a1 = _eval_expr(node.args[1], env);
+            if builtin_candidate and (builtin_unshadowed or not _env_has(env, f.name)) {
+                return _call_builtin2(f.name, a0, a1);
+            }
+            return _apply2(_eval_expr(f, env), a0, a1);
+        }
+        let args = [];
+        let i = 0;
+        while i < argc { push(args, _eval_expr(node.args[i], env)); i = i + 1; }
+        // direct builtin call by name (only if not shadowed by a user variable)
+        if builtin_candidate and (builtin_unshadowed or not _env_has(env, f.name)) {
+            return _call_builtin(f.name, args);
+        }
+        let callee = _eval_expr(f, env);
+        return _apply(callee, args);
+    }
+    if k == _E_ASSIGN {
+        let v = _eval_expr(node.value, env);
+        _env_assign_node(env, node, v);
+        return v;
+    }
+    if k == _E_ASSIGN_TO {
+        // `target[idx] = v` / `target.field = v` — evaluate the value, then store into the array/map in place.
+        let v = _eval_expr(node.value, env);
+        let tgt = node.target;
+        if tgt["@ie"] == _E_INDEX {
+            let o = _eval_expr(tgt.obj, env);
+            let ix = _eval_expr(tgt.index, env);
+            o[ix] = v;
+            return v;
+        }
+        if tgt["@ie"] == _E_MEMBER {
+            let o = _eval_expr(tgt.obj, env);
+            o[tgt.name] = v;
+            return v;
+        }
+        if tgt["@ie"] == _E_IDENT { _env_assign_node(env, tgt, v); return v; }
+        throw "bad assignment target: " + tgt.kind;
+    }
+    if k == _E_UNARY {
+        let v = _eval_expr(node.operand, env);
+        if node.op == "-" { return 0 - v; }
+        if node.op == "not" or node.op == "!" { if v { return false; } return true; }
+        throw "bad unary op: " + node.op;
+    }
+    if k == _E_ARRAY {
+        let out = [];
+        let i = 0;
+        while i < len(node.items) { push(out, _eval_expr(node.items[i], env)); i = i + 1; }
+        return out;
+    }
+    if k == _E_MAP {
+        let out = map{};
+        let i = 0;
+        while i < len(node.entries) {
+            let ent = node.entries[i];
+            out[ent.key] = _eval_expr(ent.value, env);
+            i = i + 1;
+        }
+        return out;
+    }
+    if k == _E_INDEX {
+        let obj = _eval_expr(node.obj, env);
+        let idx = _eval_expr(node.index, env);
+        return obj[idx];
+    }
+    if k == _E_MEMBER {
+        let obj = _eval_expr(node.obj, env);
+        return obj[node.name];
+    }
+    if k == _E_FN_LIT {
+        return _make_closure(node.params, node.body, env);
+    }
+    throw "cannot evaluate expr kind: " + k;
+}
+
+// ── apply a callable value to already-evaluated args ──────────────────────────
+fn _apply0(callee) {
+    if not is_array(callee) or len(callee) < 5 or callee[0] != _FN_TAG { throw "not callable"; }
+    let params = callee[_FN_PARAMS];
+    let arity = callee[_FN_ARITY];
+    let fenv = _env_new(callee[_FN_ENV]);
+    let i = 0;
+    while i < arity { _env_define(fenv, params[i], nil); i = i + 1; }
+    let sig = _eval_block(callee[_FN_BODY], fenv);
+    if is_array(sig) { return sig[0]; }
+    return nil;
+}
+fn _apply1(callee, a0) {
+    if not is_array(callee) or len(callee) < 5 or callee[0] != _FN_TAG { throw "not callable"; }
+    let params = callee[_FN_PARAMS];
+    let param_count = callee[_FN_ARITY];
+    let fenv = _env_new(callee[_FN_ENV]);
+    if param_count == 1 {
+        // Dominant recursive-call path: one hash assignment, with no loop,
+        // repeated length checks, or temporary nil value.
+        fenv[params[0]] = a0;
+    } else {
+        let i = 0;
+        while i < param_count {
+            let av = nil; if i == 0 { av = a0; }
+            _env_define(fenv, params[i], av);
+            i = i + 1;
+        }
+    }
+    let sig = _eval_block(callee[_FN_BODY], fenv);
+    if is_array(sig) { return sig[0]; }
+    return nil;
+}
+fn _apply2(callee, a0, a1) {
+    if not is_array(callee) or len(callee) < 5 or callee[0] != _FN_TAG { throw "not callable"; }
+    let params = callee[_FN_PARAMS];
+    let param_count = callee[_FN_ARITY];
+    let fenv = _env_new(callee[_FN_ENV]);
+    if param_count == 2 {
+        fenv[params[0]] = a0;
+        fenv[params[1]] = a1;
+    } else {
+        let i = 0;
+        while i < param_count {
+            let av = nil;
+            if i == 0 { av = a0; }
+            elif i == 1 { av = a1; }
+            _env_define(fenv, params[i], av);
+            i = i + 1;
+        }
+    }
+    let sig = _eval_block(callee[_FN_BODY], fenv);
+    if is_array(sig) { return sig[0]; }
+    return nil;
+}
+fn _apply(callee, args) {
+    if not is_array(callee) or len(callee) < 5 or callee[0] != _FN_TAG { throw "not callable"; }
+    let params = callee[_FN_PARAMS];
+    let arity = callee[_FN_ARITY];
+    let fenv = _env_new(callee[_FN_ENV]);
+    let i = 0;
+    while i < arity {
+        let av = nil;
+        if i < len(args) { av = args[i]; }
+        _env_define(fenv, params[i], av);
+        i = i + 1;
+    }
+    let sig = _eval_block(callee[_FN_BODY], fenv);
+    if is_array(sig) { return sig[0]; }
+    return nil;
+}
+
+// ── statement / block evaluation. Returns a control signal map or nil ─────────
+// return signal: [value]. Loop-control signals remain maps. The one-slot array
+// is cheaper than allocating/hash-populating a map on every function return.
+fn _eval_block(stmts, env) {
+    let i = 0;
+    let count = len(stmts);
+    while i < count {
+        let sig = _eval_stmt(stmts[i], env);
+        if sig != nil { return sig; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// Prepared blocks that cannot reach return/break/continue do not need to
+// materialize or inspect a signal after every statement. This is the dominant
+// numeric-loop path. The conservative @ic analysis keeps all uncertain blocks
+// on _eval_block, preserving the full control-flow semantics.
+fn _eval_block_plain(stmts, env) {
+    let i = 0;
+    let count = len(stmts);
+    while i < count {
+        let stmt = stmts[i];
+        let assign = nil;
+        if stmt["@is"] == _S_EXPR { assign = stmt["@sa"]; }
+        if assign != nil {
+            let rhs = assign.value; let plan = try rhs["@ip"] catch nil;
+            let value = if plan == nil { _eval_expr(rhs, env) } else { _eval_leaf_binary(plan, env) };
+            _env_assign_node(env, assign, value);
+        } else { _eval_stmt(stmt, env); }
+        i = i + 1;
+    }
+}
+
+fn _stmts_of(block) {
+    // a block node is map{kind:"block", stmts:[...]}; also accept a raw list.
+    if is_array(block) { return block; }
+    if is_map(block) and map_has(block, "stmts") { return block.stmts; }
+    return [];
+}
+
+fn _eval_stmt(node, env) {
+    let k = node["@is"];
+    // HOT statement kinds first: loop bodies are dominated by expr_stmt (assignments) and if; recursion by
+    // return. (`if` is handled below at its original position; expr_stmt/return moved to the front here.)
+    if k == _S_EXPR { _eval_expr(node.expr, env); return nil; }
+    if k == _S_RETURN {
+        let v = nil;
+        if node.value != nil { v = _eval_expr(node.value, env); }
+        return [v];
+    }
+    if k == _S_LET or k == _S_CONST {
+        let v = nil;
+        if node.value != nil { v = _eval_expr(node.value, env); }
+        _env_define(env, node.name, v);
+        return nil;
+    }
+    if k == _S_FN {
+        _env_define(env, node.name, _make_closure(node.params, node.body, env));
+        return nil;
+    }
+    if k == _S_PRINT {
+        let v = _eval_expr(node.value, env);
+        print v;
+        return nil;
+    }
+    if k == _S_BLOCK {
+        let benv = env; if node["@id"] { benv = _env_new(env); }
+        return _eval_block(node.stmts, benv);
+    }
+    if k == _S_IF {
+        if _eval_expr(node.cond, env) {
+            let benv = env; if node["@itd"] { benv = _env_new(env); }
+            return _eval_block(node["@it"], benv);
+        }
+        if node["@inf"] { return nil; }
+        let elifs = nil; if map_has(node, "elifs") { elifs = node.elifs; }
+        if elifs != nil {
+            let i = 0;
+            while i < len(elifs) {
+                let branch = elifs[i];
+                if _eval_expr(branch.cond, env) {
+                    let benv = env; if branch["@id"] { benv = _env_new(env); }
+                    return _eval_block(branch["@ib"], benv);
+                }
+                i = i + 1;
+            }
+        }
+        let els = nil; if map_has(node, "else") { els = node.else; }
+        if els != nil {
+            let benv = env; if node["@ied"] { benv = _env_new(env); }
+            return _eval_block(node["@ieb"], benv);
+        }
+        return nil;
+    }
+    if k == _S_WHILE {
+        // Hoist the loop-INVARIANT work out of the iteration: the body statement list and whether it declares
+        // a binding never change, so compute them once. A non-declaring body (the common case) then reuses the
+        // parent env with ZERO per-iteration scope allocation or _declares rescan.
+        let b = node["@wb"];
+        let decl = node["@wd"];
+        let plain = node["@wq"];
+        let cond_plan = try node.cond["@ip"] catch nil;
+        while (if cond_plan == nil { _eval_expr(node.cond, env) } else { _eval_leaf_binary(cond_plan, env) }) {
+            let benv = env; if decl { benv = _env_new(env); }
+            if plain { _eval_block_plain(b, benv); continue; }
+            let sig = _eval_block(b, benv);
+            if is_array(sig) { return sig; }
+            if is_map(sig) {
+                if map_has(sig, "brk") { return nil; }       // break -> exit the loop
+                if not map_has(sig, "cont") { return sig; }  // return -> propagate; continue -> fall through
+            }
+        }
+        return nil;
+    }
+    // `for i N` (0..N-1), `for i in LO to HI` (inclusive), `for x in <array>` — all desugar to a counted loop
+    // that binds the loop variable in a fresh scope each iteration and honours break/continue/return signals.
+    if k == _S_FOR or k == _S_FOR_RANGE or k == _S_FOR_IN {
+        let arr = nil; let lo = 0; let hi = 0;
+        if k == _S_FOR       { hi = _eval_expr(node.end, env); }                                  // i < N
+        if k == _S_FOR_RANGE { lo = _eval_expr(node.start, env); hi = _eval_expr(node.end, env); }// LO..HI incl
+        if k == _S_FOR_IN    { arr = _eval_expr(node.iter, env); hi = len(arr); }                 // 0..len-1
+        let fbody = node["@fb"];                                                                 // prepared loop-invariant
+        let plain = node["@fq"];
+        let i = lo;
+        while true {
+            if k == _S_FOR_RANGE { if i > hi { return nil; } } else { if i >= hi { return nil; } }
+            let fenv = _env_new(env);
+            if k == _S_FOR_IN { _env_define(fenv, node.name, arr[i]); } else { _env_define(fenv, node.name, i); }
+            if plain { _eval_block_plain(fbody, fenv); i = i + 1; continue; }
+            let sig = _eval_block(fbody, fenv);
+            if is_array(sig) { return sig; }
+            if is_map(sig) {
+                if map_has(sig, "brk") { return nil; }
+                if not map_has(sig, "cont") { return sig; }
+            }
+            i = i + 1;
+        }
+        return nil;
+    }
+    if k == _S_FOR_MAP {
+        // for k, v in map — iterate the map's keys, binding node.key=key and node.val=map[key] each turn.
+        let m = _eval_expr(node.iter, env);
+        let ks = map_keys(m);
+        let i = 0;
+        let fbody = node["@fb"];
+        let plain = node["@fq"];
+        while i < len(ks) {
+            let fenv = _env_new(env);
+            _env_define(fenv, node.key, ks[i]);
+            _env_define(fenv, node.val, m[ks[i]]);
+            if plain { _eval_block_plain(fbody, fenv); i = i + 1; continue; }
+            let sig = _eval_block(fbody, fenv);
+            if is_array(sig) { return sig; }
+            if is_map(sig) {
+                if map_has(sig, "brk") { return nil; }
+                if not map_has(sig, "cont") { return sig; }
+            }
+            i = i + 1;
+        }
+        return nil;
+    }
+    if k == _S_BREAK    { return map{ brk: true }; }
+    if k == _S_CONTINUE { return map{ cont: true }; }
+    if k == _S_IMPORT or k == _S_EXPORT { return nil; }   // no-ops in the mini-interp
+    throw "cannot evaluate stmt kind: " + node.kind;
+}
+
+// ── entry points: prepare once, evaluate repeatedly, or run end-to-end ────────
+fn compile_program(src) {
+    let toks = _tok.tokenize(src);
+    let ast = _par.parse(toks);
+    let errs = try ast.errors catch [];
+    if len(errs) > 0 { throw "parse error: " + str(errs[0]); }
+    let bindings = _binding_names(ast.stmts);
+    _prepare_block(ast.stmts, bindings);
+    ast["@interp_prepared"] = 2;
+    return ast;
+}
+
+fn eval_ast(ast) {
+    if not is_map(ast) or not map_has(ast, "stmts") or not is_array(ast.stmts) {
+        throw "invalid program AST";
+    }
+    if not map_has(ast, "@interp_prepared") or ast["@interp_prepared"] != 2 {
+        let bindings = _binding_names(ast.stmts);
+        _prepare_block(ast.stmts, bindings);
+        ast["@interp_prepared"] = 2;
+    }
+    let env = _env_new(nil);
+    _eval_block(ast.stmts, env);
+    return true;
+}
+
+fn eval_program(src) { return eval_ast(compile_program(src)); }
+
+export compile_program;
+export eval_ast;
+export eval_program;

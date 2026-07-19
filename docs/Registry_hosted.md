@@ -45,7 +45,7 @@ Define the HTTP API and auth model for a **hosted** pblang package registry (as 
     - `tarball` — raw tar.gz bytes, filename `<name>-<version>.tar.gz`, `Content-Type: application/gzip`.
     - `sha256` — hex-encoded sha256 of the tarball.
     - `metadata` — JSON object `{ "name": "<name>", "version": "<version>", "description": "<desc>" }`.
-  - Auth: Bearer token via `Authorization: Bearer <token>` header, where the token is read from
+  - Auth: bearer token via the request auth header, where the token is read from
     `PBLANG_REGISTRY_TOKEN` or optional CLI flag `--registry-token=<token>`.
   - Server is expected to enforce immutability per `<name> + <version>` and may reject
     mismatched content.

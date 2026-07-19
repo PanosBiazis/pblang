@@ -1,10 +1,9 @@
 // stdlib/compiler/selfhost_frontend.sapp
 //
-// First migration step from Rust -> pblang:
-// a pblang-owned frontend driver that provides deterministic source analysis
-// metrics and structured diagnostics. This remains lightweight by design and
-// can be upgraded to full self-hosted parse passes once parser runtime parity
-// is fully stabilized.
+// Pblang-owned frontend driver with deterministic source analysis and
+// structured diagnostics from the real self-hosted tokenizer/parser.
+
+let _DIAGNOSTIC_SUGGEST = import("stdlib/compiler/diagnostic_suggestions.sapp");
 
 fn frontend_analyze(source) {
     if source == nil {
@@ -17,8 +16,7 @@ fn frontend_analyze(source) {
         };
     }
 
-    let trimmed = str_trim(source);
-    if trimmed == "" {
+    if str_trim(source) == "" {
         return map{
             ok: false,
             error: "frontend_analyze: source is empty",
@@ -29,29 +27,13 @@ fn frontend_analyze(source) {
         };
     }
 
-    // Lightweight tokenization by whitespace (stable and fast).
-    let raw_tokens = str_split(trimmed, " ");
-    let tokens = [];
-    let i = 0;
-    while i < len(raw_tokens) {
-        let t = str_trim(raw_tokens[i]);
-        if t != "" {
-            array_push(tokens, t);
-        }
-        i = i + 1;
-    }
-
-    // Statement heuristic: semicolon-separated statements.
-    let parts = str_split(trimmed, ";");
-    let stmt_count = len(parts) - 1;
-    if stmt_count < 0 { stmt_count = 0; }
-
-    // Lightweight syntax sanity: if we see assignment without rhs, flag it.
-    let errors = [];
-    if str_contains(trimmed, "= ;") or str_contains(trimmed, "=\n;") {
-        array_push(errors, "assignment appears to miss right-hand expression");
-    }
-    let ok = len(tokens) > 0 and len(errors) == 0;
+    let tok = import("stdlib/compiler/tokenizer.sapp");
+    let par = import("stdlib/compiler/parser.sapp");
+    let tokens = tok.tokenize(source);
+    let ast = par.parse(tokens);
+    let errors = ast.errors;
+    let stmt_count = len(ast.stmts);
+    let ok = len(tokens) > 0 and stmt_count > 0 and len(errors) == 0;
 
     return map{
         ok: ok,
@@ -220,17 +202,22 @@ fn frontend_compile(source) {
     let tokens = tok.tokenize(source);
     let ast = par.parse(tokens);
     let diagnostics = [];
-
-    if ast.stmts != nil {
-        // The self-hosted typechecker is still partial; treat it as advisory and
-        // never let a gap in it abort code generation.
-        diagnostics = try tck.type_check(ast.stmts) catch [];
+    if ast.errors != nil {
+        let ei = 0;
+        while ei < len(ast.errors) {
+            array_push(diagnostics, map{ stage: "parse", code: "parse-error", message: ast.errors[ei] });
+            ei = ei + 1;
+        }
     }
+    if len(diagnostics) == 0 and ast.stmts != nil { diagnostics = tck.type_check(ast.stmts); }
 
-    let chunk = cg.compile_stmts(ast.stmts);
+    // Preserve bytecode for well-parsed programs even when static diagnostics
+    // exist. Low-level VM/debugging tools may inspect it explicitly, while `ok`
+    // remains false and frontend_run refuses to execute it implicitly.
+    let chunk = if ast.errors == nil or len(ast.errors) == 0 { cg.compile_stmts(ast.stmts) } else { cg.Chunk() };
 
     return map{
-        ok: len(ast.stmts) > 0 and len(chunk.instructions) > 0,
+        ok: len(ast.stmts) > 0 and len(chunk.instructions) > 0 and len(diagnostics) == 0,
         ast: ast,
         chunk: chunk,
         tokens: tokens,
@@ -345,8 +332,35 @@ fn _find_imports(source) {
 // top-level globals) into `cache`. Dependencies are resolved first; failures
 // leave an empty exports map (graceful). `cache[path]` is pre-set empty as a
 // cycle guard.
-fn _resolve_module(path, cache) {
+fn _frontend_limit(options, key, fallback, hard_max) {
+    let value = fallback;
+    if options != nil and is_map(options) and map_has(options, key) { value = options[key]; }
+    if not is_number(value) or value < 1 or value != num_floor(value) or value > hard_max {
+        throw "frontend_run_bounded: " + key + " must be a positive integer <= " + str(hard_max);
+    }
+    return value;
+}
+
+fn _module_cache_state(options) {
+    if options == nil or not is_map(options) { return nil; }
+    let enabled = map_has(options, "module_cache") and options.module_cache == true;
+    let root = nil;
+    if map_has(options, "module_cache_root") {
+        root = options.module_cache_root;
+        if type(root) != "string" or root == "" or len(root) > 4096 {
+            throw "frontend_run_bounded: module_cache_root must be non-empty text <= 4096 bytes";
+        }
+        enabled = true;
+    }
+    if not enabled { return nil; }
+    let api = import("stdlib/compiler/module_cache.sapp");
+    return map{ api: api, context: api.context(root) };
+}
+
+fn _resolve_module(path, cache, runtime_options = nil, bytecode_cache = nil) {
     if map_has(cache, path) { return cache[path]; }
+    let max_modules = _frontend_limit(runtime_options, "max_modules", 256, 4096);
+    if len(map_keys(cache)) >= max_modules { throw "frontend_run_bounded: module limit exceeded"; }
     cache[path] = map{};
     let file = _resolve_import_path(path);
     // `_find_imports` is a naive text scan that also matches `import("...")`
@@ -357,18 +371,41 @@ fn _resolve_module(path, cache) {
     if not fs_exists(file) { return cache[path]; }
     let src = fs_read(file);
     if src == nil or src == "" { return cache[path]; }
+    let source_limit = _frontend_limit(runtime_options, "max_source_bytes", 1048576, 16777216);
+    if len(str_to_bytes(src)) > source_limit {
+        throw "frontend_run_bounded: imported module source limit exceeded";
+    }
     let deps = _find_imports(src);
     let di = 0;
     while di < len(deps) {
-        if not map_has(cache, deps[di]) { _resolve_module(deps[di], cache); }
+        if not map_has(cache, deps[di]) { _resolve_module(deps[di], cache, runtime_options, bytecode_cache); }
         di = di + 1;
     }
     let gp = import("stdlib/compiler/guard_preprocessor.sapp");
     let processed = gp.preprocess(src);
-    let cr = frontend_compile(processed);
-    if not cr.ok { return cache[path]; }
+    let chunk = nil;
+    let key = nil;
+    if bytecode_cache != nil {
+        key = bytecode_cache.api.cache_key(bytecode_cache.context, file, processed);
+        let cached = bytecode_cache.api.load(bytecode_cache.context, key);
+        if cached.hit { chunk = cached.chunk; }
+    }
+    if chunk == nil {
+        let cr = frontend_compile(processed);
+        if not cr.ok { return cache[path]; }
+        chunk = cr.chunk;
+        if bytecode_cache != nil {
+            // Cache publication is an optimization. A read-only cache directory or
+            // interrupted writer must never change otherwise-correct execution.
+            try bytecode_cache.api.store(bytecode_cache.context, key, chunk) catch nil;
+        }
+    }
     let interp = import("stdlib/compiler/vm.sapp");
-    let res = interp.run_seeded(cr.chunk, map{ __import_cache__: cache });
+    let res = if runtime_options == nil {
+        interp.run_seeded(chunk, map{ __import_cache__: cache })
+    } else {
+        interp.run_seeded_bounded(chunk, map{ __import_cache__: cache }, runtime_options)
+    };
     let exports = map{};
     // Real `export` semantics: if the module declared `__exports__` (a list of
     // exported names), expose ONLY those. Otherwise (no export statement) fall
@@ -394,15 +431,20 @@ fn _resolve_module(path, cache) {
 }
 
 // Build the import cache for `source` (resolves every imported module).
-fn _build_import_cache(source) {
+fn _build_import_cache_state(source, runtime_options = nil) {
     let cache = map{};
+    let bytecode_cache = _module_cache_state(runtime_options);
     let paths = _find_imports(source);
     let i = 0;
     while i < len(paths) {
-        _resolve_module(paths[i], cache);
+        _resolve_module(paths[i], cache, runtime_options, bytecode_cache);
         i = i + 1;
     }
-    return cache;
+    return map{ modules: cache, bytecode_cache: bytecode_cache };
+}
+
+fn _build_import_cache(source, runtime_options = nil) {
+    return _build_import_cache_state(source, runtime_options).modules;
 }
 
 // Read a .sapp file from disk and run it end-to-end through the self-hosted
@@ -483,6 +525,41 @@ fn _collect_global_decls(stmts) {
     return decls;
 }
 
+fn _collect_lint_scope_names(scope, candidates, seen) {
+    if scope == nil or len(candidates) >= _DIAGNOSTIC_SUGGEST.MAX_CANDIDATES { return; }
+    let symbols = try scope.symbols catch map{};
+    let names = map_keys(symbols); let i = 0;
+    while i < len(names) and len(candidates) < _DIAGNOSTIC_SUGGEST.MAX_CANDIDATES {
+        if not map_has(seen, names[i]) {
+            seen[names[i]] = true; array_push(candidates, names[i]);
+        }
+        i = i + 1;
+    }
+    let children = try scope.children catch []; i = 0;
+    while i < len(children) and len(candidates) < _DIAGNOSTIC_SUGGEST.MAX_CANDIDATES {
+        _collect_lint_scope_names(children[i], candidates, seen); i = i + 1;
+    }
+}
+
+fn _lint_name_candidates(builtins, decls, table) {
+    let candidates = []; let seen = map{};
+    let sources = [map_keys(builtins), map_keys(decls)]; let si = 0;
+    while si < len(sources) {
+        let names = sources[si]; let i = 0;
+        while i < len(names) and len(candidates) < _DIAGNOSTIC_SUGGEST.MAX_CANDIDATES {
+            if not map_has(seen, names[i]) {
+                seen[names[i]] = true; array_push(candidates, names[i]);
+            }
+            i = i + 1;
+        }
+        si = si + 1;
+    }
+    if table != nil {
+        _collect_lint_scope_names(try table.global_scope catch nil, candidates, seen);
+    }
+    return candidates;
+}
+
 // frontend_lint(source) — returns { ok, diagnostics:[{kind,message}], count }.
 fn frontend_lint(source) {
     let tok = import("stdlib/compiler/tokenizer.sapp");
@@ -505,6 +582,7 @@ fn frontend_lint(source) {
         let decls = _collect_global_decls(stmts);
         let tbl_u = try sem_u.analyze(ast) catch nil;
         if tbl_u != nil {
+            let candidates = _lint_name_candidates(builtins, decls, tbl_u);
             let fvs = try tbl_u.free_variables catch nil;
             if fvs != nil {
                 let fi = 0;
@@ -513,7 +591,18 @@ fn frontend_lint(source) {
                     let is_b = (try builtins[nm] catch nil) == true;
                     let is_d = (try decls[nm] catch nil) == true;
                     if not is_b and not is_d {
-                        array_push(diags, map{ kind: "error", message: "undefined name '" + nm + "'" });
+                        let suggestion = _DIAGNOSTIC_SUGGEST.suggest_name(nm, candidates);
+                        let diagnostic = map{
+                            kind: "error", code: "undefined-name",
+                            message: "undefined name '" + nm + "'", name: nm,
+                            suggestion: suggestion,
+                            help: _DIAGNOSTIC_SUGGEST.help_for(suggestion),
+                            fix: nil,
+                        };
+                        if suggestion != nil {
+                            diagnostic.fix = map{ kind: "replace_identifier", from: nm, to: suggestion };
+                        }
+                        array_push(diags, diagnostic);
                     }
                     fi = fi + 1;
                 }
@@ -577,12 +666,50 @@ fn frontend_run(source) {
     };
 }
 
+fn frontend_run_bounded(source, options = nil) {
+    if not is_string(source) { throw "frontend_run_bounded: source must be text"; }
+    if options != nil and not is_map(options) { throw "frontend_run_bounded: options must be a map"; }
+    let source_limit = _frontend_limit(options, "max_source_bytes", 1048576, 16777216);
+    if len(str_to_bytes(source)) > source_limit { throw "frontend_run_bounded: source limit exceeded"; }
+    let r = frontend_compile(source);
+    if not r.ok {
+        return map{ ok: false, error: "frontend_run_bounded: compilation failed", output: [], chunk: r.chunk, diagnostics: r.diagnostics };
+    }
+    let opt = import("stdlib/compiler/optimizer.sapp");
+    let optimized = opt.optimize_safe(r.chunk);
+    let cache_state = _build_import_cache_state(source, options);
+    let cache = cache_state.modules;
+    let interp = import("stdlib/compiler/vm.sapp");
+    let res = interp.run_seeded_bounded(optimized.chunk, map{ __import_cache__: cache }, options);
+    return map{
+        ok: true, output: res.output, locals: res.locals, globals: res.globals,
+        value: res.value, runtime: res.runtime, chunk: optimized.chunk,
+        optimization: optimized.stats,
+        module_cache: if cache_state.bytecode_cache == nil {
+            map{
+                enabled: false, hits: 0, misses: 0, stores: 0, corruptions: 0,
+                store_failures: 0, last_error: ""
+            }
+        } else {
+            cache_state.bytecode_cache.api.snapshot(cache_state.bytecode_cache.context)
+        }
+    };
+}
+
+fn frontend_run_file_bounded(path, options = nil) {
+    if path == nil or path == "" { return map{ ok: false, error: "frontend_run_file_bounded: path is empty" }; }
+    let src = fs_read(path);
+    if src == nil or src == "" { return map{ ok: false, error: "frontend_run_file_bounded: cannot read file: " + path }; }
+    let gp = import("stdlib/compiler/guard_preprocessor.sapp");
+    return frontend_run_bounded(gp.preprocess(src), options);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // File-level and project-level compilation
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Compile a single .sapp file from disk: read → preprocess → tokenize → parse → typecheck → codegen
-fn frontend_compile_file(path) {
+fn frontend_compile_file(path, type_options = nil) {
     if path == nil or path == "" {
         return map{
             ok: false,
@@ -620,9 +747,9 @@ fn frontend_compile_file(path) {
     }
 
     if ast.stmts != nil {
-        // The self-hosted typechecker is still partial; treat it as advisory and
-        // never let a gap in it abort compilation (matches frontend_compile()).
-        let type_diags = try tck.type_check(ast.stmts) catch [];
+        // The checker returns structured diagnostics, including malformed-AST and
+        // resource-limit failures. Do not turn an internal failure into success.
+        let type_diags = tck.type_check(ast.stmts, type_options);
         let ti = 0;
         while ti < len(type_diags) {
             array_push(diagnostics, type_diags[ti]);
@@ -676,12 +803,12 @@ fn _file_result_wire_safe(r) {
 /// `paths` array plus its own index. Falls back to sequential compilation if the
 /// runtime rejects the spawned closures, so correctness never depends on threading.
 /// Results omit `symbol_table` (see _file_result_wire_safe).
-fn frontend_compile_file_many(paths) {
+fn frontend_compile_file_many(paths, type_options = nil) {
     let n = len(paths);
     let results = [];
     if n == 0 { return results; }
     if n == 1 {
-        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[0])));
+        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[0], type_options)));
         return results;
     }
 
@@ -690,7 +817,7 @@ fn frontend_compile_file_many(paths) {
     let i = 0;
     while i < n {
         let idx = i;
-        let h = try spawn(fn() { return _file_result_wire_safe(frontend_compile_file(paths[idx])); }) catch nil;
+        let h = try spawn(fn() { return _file_result_wire_safe(frontend_compile_file(paths[idx], type_options)); }) catch nil;
         if h == nil { parallel = false; break; }
         array_push(handles, h);
         i = i + 1;
@@ -710,10 +837,37 @@ fn frontend_compile_file_many(paths) {
 
     let k = 0;
     while k < n {
-        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[k])));
+        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[k], type_options)));
         k = k + 1;
     }
     return results;
+}
+
+fn _project_external_names(paths) {
+    let names = map{}; let ordered = []; let limit = 16384;
+    let gp = import("stdlib/compiler/guard_preprocessor.sapp");
+    let tok = import("stdlib/compiler/tokenizer.sapp");
+    let par = import("stdlib/compiler/parser.sapp");
+    let i = 0;
+    while i < len(paths) {
+        let source = try fs_read(paths[i]) catch nil;
+        if source != nil and source != "" {
+            let ast = try par.parse(tok.tokenize(gp.preprocess(source))) catch nil;
+            if ast != nil {
+                let declarations = _collect_global_decls(try ast.stmts catch []);
+                let declared = map_keys(declarations); let j = 0;
+                while j < len(declared) {
+                    if not map_has(names, declared[j]) {
+                        names[declared[j]] = true; array_push(ordered, declared[j]);
+                        if len(ordered) > limit { return ordered; }
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return ordered;
 }
 
 /// Compile a project directory: find all .sapp files and compile them.
@@ -754,7 +908,11 @@ fn frontend_compile_project(dir) {
         fi = fi + 1;
     }
 
-    let compiled = frontend_compile_file_many(paths);
+    // The files remain separate translation units, but the type checker receives
+    // a bounded project symbol index so valid cross-file references are not
+    // mistaken for typos. Actual linker/module resolution remains a later stage.
+    let external_names = _project_external_names(paths);
+    let compiled = frontend_compile_file_many(paths, map{ extern_names: external_names });
     let ci = 0;
     while ci < len(compiled) {
         let result = compiled[ci];
@@ -922,3 +1080,4 @@ export frontend_parse_full, frontend_parse_safe, frontend_typecheck, frontend_co
 export frontend_compile_file, frontend_compile_file_many, frontend_compile_project, frontend_analyze_file;
 export frontend_compile_with_guard_prep;
 export frontend_run, frontend_run_file, frontend_lint;
+export frontend_run_bounded, frontend_run_file_bounded;

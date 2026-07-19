@@ -56,5 +56,5 @@ print sorted;
 ## Verification
 
 ```sh
-pblang run tests/semantics/bend_stdlib_test.sapp --allow-all
+pblang run tests/semantics/bend_stdlib_test.sapp
 ```

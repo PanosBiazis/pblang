@@ -1,0 +1,88 @@
+// web_security_test.sapp — verifies the web hardening layer (headers, scraper shield, rate guard)
+// end to end through the framework's socket-free `handle`. No network needed.
+
+let web = import("stdlib:web_framework.sapp");
+let sec = import("stdlib:web_security.sapp");
+
+fn fail(m) { throw "FAIL web-security: " + m; }
+fn eq(g, w, m) { if g != w { fail(m + ": got " + str(g) + " want " + str(w)); } }
+fn truthy(g, m) { if not g { fail(m + ": expected truthy"); } }
+fn hget(res, name) {                              // case-insensitive header read from a response
+    let h = try res.headers catch map{}; let ks = map_keys(h); let i = 0;
+    while i < len(ks) { if str_lower(ks[i]) == str_lower(name) { return h[ks[i]]; } i = i + 1; }
+    return nil;
+}
+fn browser(path) { return map{ method: "GET", path: path, headers: map{ "user-agent": "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0" }, body: "" }; }
+
+// ── 1. security headers on every response ──
+let app = web.create_app(map{});
+web.get(app, "/", fn(ctx) { return ctx.html("<h1>pblang</h1>"); });
+let handle = sec.secure(app, sec.strict());
+let r = handle(browser("/"));
+eq(r.status, 200, "browser reaches the page");
+truthy(str_index_of(hget(r, "Content-Security-Policy"), "default-src 'self'") >= 0, "CSP present");
+truthy(str_index_of(hget(r, "Strict-Transport-Security"), "max-age=63072000") >= 0, "HSTS max-age");
+truthy(str_index_of(hget(r, "Strict-Transport-Security"), "preload") >= 0, "HSTS preload");
+eq(hget(r, "X-Frame-Options"), "DENY", "X-Frame-Options");
+eq(hget(r, "X-Content-Type-Options"), "nosniff", "nosniff");
+eq(hget(r, "Referrer-Policy"), "strict-origin-when-cross-origin", "Referrer-Policy");
+truthy(hget(r, "Permissions-Policy") != nil, "Permissions-Policy present");
+eq(hget(r, "Cross-Origin-Opener-Policy"), "same-origin", "COOP");
+eq(hget(r, "Cross-Origin-Embedder-Policy"), "require-corp", "COEP");
+eq(hget(r, "Cross-Origin-Resource-Policy"), "same-origin", "CORP");
+
+// ── 2. scraper shield blocks bots, lets humans (incl. View Source) through ──
+fn probe(ua, path) { return sec.classify(map{ method: "GET", path: path, headers: map{ "user-agent": ua } }, sec.strict()); }
+eq(probe("Mozilla/5.0 Firefox/128.0", "/"), nil, "real browser allowed");
+eq(probe("Mozilla/5.0 (view-source)", "/"), nil, "human viewing source allowed");
+truthy(probe("python-requests/2.31", "/") != nil, "python-requests blocked");
+truthy(probe("curl/8.4.0", "/") != nil, "curl blocked");
+truthy(probe("Scrapy/2.11 (+https://scrapy.org)", "/") != nil, "Scrapy blocked");
+truthy(probe("GPTBot/1.1", "/") != nil, "GPTBot (AI scraper) blocked");
+truthy(probe("AhrefsBot/7.0", "/") != nil, "AhrefsBot blocked");
+truthy(probe("", "/") != nil, "missing user-agent blocked");
+// honeypot paths: bot-only, blocked even with a browser UA
+truthy(probe("Mozilla/5.0", "/wp-login.php") != nil, "honeypot /wp-login.php blocked");
+truthy(probe("Mozilla/5.0", "/.env") != nil, "honeypot /.env blocked");
+eq(probe("Mozilla/5.0", "/about"), nil, "normal path allowed");
+// the reason code is surfaced for logging
+let blk = probe("sqlmap/1.8", "/"); truthy(str_index_of(blk.reason, "bot-user-agent") == 0, "block reason code");
+
+// through the full handler, a scraper gets 403 and NO page body
+let app2 = web.create_app(map{});
+web.get(app2, "/", fn(ctx) { return ctx.html("SECRET"); });
+let handle2 = sec.secure(app2, sec.strict());
+let bot = handle2(map{ method: "GET", path: "/", headers: map{ "user-agent": "python-requests/2.31" }, body: "" });
+eq(bot.status, 403, "scraper gets 403 through the stack");
+truthy(str_index_of(bot.body, "SECRET") < 0, "scraper never sees the page body");
+eq(hget(bot, "X-Blocked-Reason"), "bot-user-agent:python-requests", "block reason header");
+
+// ── 3. rate guard: a burst of requests eventually 429s ──
+let guard = sec.rate_guard(map{ rate_enabled: true, rate_burst: 5, rate_per_sec: 1 });
+let req5 = map{ method: "GET", path: "/", headers: map{ "x-forwarded-for": "203.0.113.9" } };
+let allowed = 0; let blocked = 0; let n = 0;
+while n < 8 {
+    let g = guard(req5);
+    if g == nil { allowed = allowed + 1; } else { eq(g.status, 429, "over-limit is 429"); truthy(hget(g, "Retry-After") != nil, "Retry-After present"); blocked = blocked + 1; }
+    n = n + 1;
+}
+eq(allowed, 5, "burst of 5 allowed");
+eq(blocked, 3, "remaining 3 rate-limited");
+// a DIFFERENT client has its own bucket
+let other = guard(map{ method: "GET", path: "/", headers: map{ "x-forwarded-for": "198.51.100.7" } });
+eq(other, nil, "separate client not affected by the first client's flood");
+
+// ── 4. relaxed preset differs sensibly ──
+let rx = sec.relaxed();
+eq(rx.frame, "SAMEORIGIN", "relaxed allows same-origin framing");
+truthy(rx.coep == nil, "relaxed drops COEP (no forced isolation)");
+
+// ── 5. route headers override the security defaults (intentional escape hatch) ──
+let app3 = web.create_app(map{});
+web.get(app3, "/embed", fn(ctx) { return map{ status: 200, body: "widget", headers: map{ "X-Frame-Options": "ALLOWALL" } }; });
+let h3 = sec.secure(app3, sec.strict());
+let emb = h3(browser("/embed"));
+eq(hget(emb, "X-Frame-Options"), "ALLOWALL", "route header overrides default");
+truthy(hget(emb, "Content-Security-Policy") != nil, "other security headers still applied");
+
+print "web_security: headers (A+ set), scraper shield (bots blocked, humans + view-source allowed), rate guard, overrides — all correct";

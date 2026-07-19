@@ -1,0 +1,207 @@
+// stdlib/x11_input.sapp -- PBLang-native X11/XTest input adapter.
+// System libraries are the OS boundary; no xdotool process or generated wrapper.
+// Execution is intended only through input_control's explicit approval pipeline.
+
+let Events = import("stdlib:input_events.sapp");
+let Unicode = import("stdlib:unicode.sapp");
+
+let X11_PATHS = [
+    "/usr/lib/x86_64-linux-gnu/libX11.so.6", "/usr/lib64/libX11.so.6",
+    "/usr/lib/aarch64-linux-gnu/libX11.so.6", "/usr/lib/libX11.so.6"
+];
+let XTST_PATHS = [
+    "/usr/lib/x86_64-linux-gnu/libXtst.so.6", "/usr/lib64/libXtst.so.6",
+    "/usr/lib/aarch64-linux-gnu/libXtst.so.6", "/usr/lib/libXtst.so.6"
+];
+
+fn _first_existing(paths) {
+    let i = 0; while i < len(paths) { if try fs_exists(paths[i]) catch false { return paths[i]; } i = i + 1; }
+    return nil;
+}
+fn _keysym_name(key) {
+    if key == "Enter" { return "Return"; } if key == "Backspace" { return "BackSpace"; }
+    if key == "Space" { return "space"; } if key == "PageUp" { return "Prior"; }
+    if key == "PageDown" { return "Next"; } return key;
+}
+
+fn _padded_hex(cp) {
+    let value = Unicode.hex_codepoint(cp);
+    while len(value) < 4 { value = "0" + value; }
+    return value;
+}
+
+// Convert one Unicode scalar to an X11 keysym plus the modifier needed for
+// common US-layout ASCII. Non-ASCII uses X11's standard Uxxxx keysym name and
+// succeeds only when the active server keymap exposes that keysym.
+fn _text_stroke(cp) {
+    if cp >= 97 and cp <= 122 { return map{ keysym: strfromcharcode(cp), shift: false }; }
+    if cp >= 65 and cp <= 90 { return map{ keysym: strfromcharcode(cp + 32), shift: true }; }
+    if cp >= 48 and cp <= 57 { return map{ keysym: strfromcharcode(cp), shift: false }; }
+    if cp == 32 { return map{ keysym: "space", shift: false }; }
+    if cp == 9 { return map{ keysym: "Tab", shift: false }; }
+    if cp == 10 or cp == 13 { return map{ keysym: "Return", shift: false }; }
+    let plain_codes = [45,61,91,93,59,39,96,92,44,46,47];
+    let plain_names = ["minus","equal","bracketleft","bracketright","semicolon","apostrophe","grave","backslash","comma","period","slash"];
+    let shift_codes = [33,64,35,36,37,94,38,42,40,41,95,43,123,125,58,34,126,124,60,62,63];
+    let shift_names = ["1","2","3","4","5","6","7","8","9","0","minus","equal","bracketleft","bracketright","semicolon","apostrophe","grave","backslash","comma","period","slash"];
+    let i = 0;
+    while i < len(plain_codes) {
+        if cp == plain_codes[i] { return map{ keysym: plain_names[i], shift: false }; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(shift_codes) {
+        if cp == shift_codes[i] { return map{ keysym: shift_names[i], shift: true }; }
+        i = i + 1;
+    }
+    if Unicode.is_valid_scalar(cp) and not Unicode.is_control(cp) {
+        return map{ keysym: "U" + _padded_hex(cp), shift: false, codepoint: cp };
+    }
+    return nil;
+}
+
+fn text_plan(text) {
+    let checked = Events.type_event(text); if not checked.ok { return checked; }
+    let strokes = []; let i = 0;
+    while i < len(text) {
+        let stroke = _text_stroke(strcharcodeat(text, i));
+        if stroke == nil { return map{ ok: false, error: "X11 text contains an unsupported control character", index: i }; }
+        array_push(strokes, stroke); i = i + 1;
+    }
+    return map{ ok: true, text: text, strokes: strokes, keymap_dependent_unicode: true };
+}
+
+// Linux desktop Unicode entry sequence used by GTK/IBus and several other
+// toolkits. This is deliberately an explicit fallback: unsupported clients may
+// interpret it literally, so callers must opt in after identifying a compatible
+// target application.
+fn compose_plan(text) {
+    let checked = Events.type_event(text); if not checked.ok { return checked; }
+    let sequences = []; let i = 0;
+    while i < len(text) {
+        let cp = strcharcodeat(text, i); let direct = _text_stroke(cp);
+        if direct == nil { return map{ ok: false, error: "Unicode compose rejects unsupported control characters", index: i }; }
+        if cp < 128 {
+            array_push(sequences, map{ mode: "direct", codepoint: cp, stroke: direct });
+        } else {
+            let hex = str_lower(Unicode.hex_codepoint(cp)); let keys = []; let j = 0;
+            while j < len(hex) { array_push(keys, strfromcharcode(strcharcodeat(hex, j))); j = j + 1; }
+            array_push(sequences, map{ mode: "linux-unicode-compose", codepoint: cp, hex: hex,
+                keys: keys, prefix: ["Control_L", "Shift_L", "u"], commit: "Return" });
+        }
+        i = i + 1;
+    }
+    return map{ ok: true, format: "pblang.x11.unicode-compose.v1", text: text,
+                sequences: sequences, application_compatibility_required: true };
+}
+
+fn _keycode(x11, display, name) {
+    let sym = try ffi_call_typed(x11, "XStringToKeysym", "string->i64", [name]) catch 0;
+    if sym == 0 { return 0; }
+    return try ffi_call_typed(x11, "XKeysymToKeycode", "ptr,i64->i64", [display, sym]) catch 0;
+}
+
+fn _fake_key(xtst, display, code, down) {
+    return (try ffi_call_typed(xtst, "XTestFakeKeyEvent", "ptr,i64,i64,i64->i64", [display, code, down, 0]) catch 0) != 0;
+}
+
+fn available() {
+    let display = try env_get("DISPLAY") catch nil;
+    let x11 = _first_existing(X11_PATHS); let xtst = _first_existing(XTST_PATHS);
+    return map{
+        ok: platform() == "linux" and type(display) == "string" and display != "" and x11 != nil and xtst != nil,
+        display: display, x11: x11, xtst: xtst, trusted_absolute_paths: true
+    };
+}
+
+fn plan(event) {
+    let checked = Events.validate(event); if not checked.ok { return checked; }
+    let e = checked.event;
+    if e.kind == "key" {
+        return map{ ok: true, backend: "pblang-x11-xtest", event: e,
+                    calls: ["XOpenDisplay", "XStringToKeysym", "XKeysymToKeycode", "XTestFakeKeyEvent", "XFlush", "XCloseDisplay"] };
+    }
+    if e.kind == "click" {
+        return map{ ok: true, backend: "pblang-x11-xtest", event: e,
+                    calls: ["XOpenDisplay", "XTestFakeButtonEvent", "XFlush", "XCloseDisplay"] };
+    }
+    if e.kind == "pointer_delta" {
+        return map{ ok: true, backend: "pblang-x11-xtest", event: e,
+                    calls: ["XOpenDisplay", "XTestFakeRelativeMotionEvent", "XFlush", "XCloseDisplay"] };
+    }
+    if e.kind == "type" {
+        let text = text_plan(e.text); if not text.ok { return text; }
+        return map{ ok: true, backend: "pblang-x11-xtest", event: e, text: text,
+                    calls: ["XOpenDisplay", "XStringToKeysym", "XKeysymToKeycode", "XTestFakeKeyEvent", "XFlush", "XCloseDisplay"] };
+    }
+    return map{ ok: false, error: "native X11 adapter supports key, click, relative pointer, and current-keymap text events" };
+}
+
+fn _tap(xtst, display, code) { return code != 0 and _fake_key(xtst, display, code, 1) and _fake_key(xtst, display, code, 0); }
+
+fn _compose_scalar(x11, xtst, display, cp) {
+    let control = _keycode(x11, display, "Control_L"); let shift = _keycode(x11, display, "Shift_L");
+    let u = _keycode(x11, display, "u"); let enter = _keycode(x11, display, "Return");
+    if control == 0 or shift == 0 or u == 0 or enter == 0 { return false; }
+    let ok = _fake_key(xtst, display, control, 1) and _fake_key(xtst, display, shift, 1) and _tap(xtst, display, u);
+    ok = _fake_key(xtst, display, shift, 0) and _fake_key(xtst, display, control, 0) and ok;
+    let hex = str_lower(Unicode.hex_codepoint(cp)); let i = 0;
+    while i < len(hex) and ok { ok = _tap(xtst, display, _keycode(x11, display, strfromcharcode(strcharcodeat(hex, i)))); i = i + 1; }
+    return ok and _tap(xtst, display, enter);
+}
+
+fn execute(event, options = nil) {
+    let p = plan(event); if not p.ok { return p; }
+    let host = available(); if not host.ok { return map{ ok: false, error: "trusted X11/XTest libraries or DISPLAY unavailable" }; }
+    let x11 = try ffi_load(host.x11) catch nil; if x11 == nil { return map{ ok: false, error: "cannot load trusted libX11" }; }
+    let xtst = try ffi_load(host.xtst) catch nil;
+    if xtst == nil { ffi_close(x11); return map{ ok: false, error: "cannot load trusted libXtst" }; }
+    let display = try ffi_call_typed(x11, "XOpenDisplay", "string->ptr", [host.display]) catch 0;
+    if display == 0 { ffi_close(xtst); ffi_close(x11); return map{ ok: false, error: "XOpenDisplay failed" }; }
+    let ok = false; let e = p.event;
+    let allow_compose = try options.unicode_compose catch false;
+    if e.kind == "key" {
+        let code = _keycode(x11, display, _keysym_name(e.key));
+        if code != 0 {
+            ok = _fake_key(xtst, display, code, 1) and _fake_key(xtst, display, code, 0);
+        }
+    } elif e.kind == "click" {
+        let down = try ffi_call_typed(xtst, "XTestFakeButtonEvent", "ptr,i64,i64,i64->i64", [display, e.button, 1, 0]) catch 0;
+        let up = try ffi_call_typed(xtst, "XTestFakeButtonEvent", "ptr,i64,i64,i64->i64", [display, e.button, 0, 0]) catch 0;
+        ok = down != 0 and up != 0;
+    } elif e.kind == "pointer_delta" {
+        ok = (try ffi_call_typed(xtst, "XTestFakeRelativeMotionEvent", "ptr,i64,i64,i64->i64", [display, e.dx, e.dy, 0]) catch 0) != 0;
+    } elif e.kind == "type" {
+        ok = true;
+        let shift_code = _keycode(x11, display, "Shift_L"); let i = 0;
+        while i < len(p.text.strokes) and ok {
+            let stroke = p.text.strokes[i]; let code = _keycode(x11, display, stroke.keysym);
+            if code == 0 and allow_compose and strcharcodeat(e.text, i) >= 128 {
+                ok = _compose_scalar(x11, xtst, display, strcharcodeat(e.text, i));
+            } else if code == 0 or (stroke.shift and shift_code == 0) { ok = false; }
+            else {
+                if stroke.shift { ok = _fake_key(xtst, display, shift_code, 1); }
+                if ok { ok = _fake_key(xtst, display, code, 1) and _fake_key(xtst, display, code, 0); }
+                if stroke.shift {
+                    let released = _fake_key(xtst, display, shift_code, 0);
+                    ok = ok and released;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    try ffi_call_typed(x11, "XFlush", "ptr->i64", [display]) catch nil;
+    try ffi_call_typed(x11, "XCloseDisplay", "ptr->i64", [display]) catch nil;
+    ffi_close(xtst); ffi_close(x11);
+    if not ok { return map{ ok: false, error: "XTest request failed" }; }
+    return map{ ok: true, backend: "pblang-x11-xtest", event: e.kind };
+}
+
+fn capabilities() {
+    return map{ key: true, click: true, relative_pointer: true, absolute_pointer: false,
+                text: true, text_ascii: true, text_unicode_current_keymap: true,
+                unicode_compose_opt_in: true, unicode_compose_application_dependent: true,
+                changes_keyboard_layout: false, external_xdotool_required: false, system_api: "X11/XTest" };
+}
+
+export available, plan, text_plan, compose_plan, execute, capabilities;

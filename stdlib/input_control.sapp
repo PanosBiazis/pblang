@@ -13,14 +13,21 @@
 //        let res = ic.run(req.id, nonce);   // human approves, then it actuates
 
 let mc = import("stdlib:master_control.sapp");
+let events = import("stdlib:input_events.sapp");
+let uinput = import("stdlib:linux_uinput.sapp");
+let x11input = import("stdlib:x11_input.sapp");
+let tool_probe = import("stdlib:tool_probe.sapp");
 
 let _execs = map{};
-let MAX_TEXT = 4096;
-let _SAFE_KEYS = ["Return", "Enter", "Tab", "Escape", "BackSpace", "Delete", "space",
-                  "Up", "Down", "Left", "Right", "Home", "End", "Page_Up", "Page_Down"];
+let MAX_TEXT = events.MAX_TEXT;
+let _SAFE_KEYS = events.safe_keys();
 
 fn _input_enabled() {
     let v = try env_get("PB_INPUT_CONTROL") catch nil;
+    return v == "1" or v == "true" or v == "on";
+}
+fn _unicode_compose_enabled() {
+    let v = try env_get("PB_INPUT_UNICODE_COMPOSE") catch nil;
     return v == "1" or v == "true" or v == "on";
 }
 
@@ -28,50 +35,100 @@ fn _input_enabled() {
 // with a parenthesized `try ... catch` inside a compound boolean.
 fn _ec(r) { if r == nil { return 1; } let e = try r.exit_code catch 1; return e; }
 
+fn _tool_path(name) {
+    return tool_probe.trusted_path(name);
+}
+
 fn _has_tool(name) {
-    let r = try proc_spawn_wait("which", [name]) catch nil;
-    return r != nil and _ec(r) == 0;
+    return _tool_path(name) != nil;
+}
+fn _native_arch() {
+    let b = try fs_read_bytes("/proc/self/exe") catch nil;
+    if not is_array(b) or len(b) < 20 or b[0] != 0x7F or b[1] != 0x45 or b[2] != 0x4C or b[3] != 0x46 { return nil; }
+    let machine = b[18] + b[19] * 256;
+    if machine == 0x3E { return "x86_64"; }
+    if machine == 0xB7 { return "arm64"; }
+    return nil;
+}
+fn _native_uinput_available() {
+    return platform() == "linux" and _native_arch() != nil and (try fs_exists("/dev/uinput") catch false);
+}
+fn _stage_native(path, bytes) {
+    return try { fs_write_bytes(path, bytes); true } catch false;
 }
 fn _tool() {
+    let wayland = try env_get("WAYLAND_DISPLAY") catch nil;
+    let display = try env_get("DISPLAY") catch nil;
+    let ysocket = try fs_exists("/tmp/.ydotool_socket") catch false;
+    if type(wayland) == "string" and wayland != "" and _has_tool("ydotool") and ysocket { return "ydotool"; }
+    if type(display) == "string" and display != "" and _has_tool("xdotool") { return "xdotool"; }
+    if _has_tool("ydotool") and ysocket { return "ydotool"; }
     if _has_tool("xdotool") { return "xdotool"; }
-    if _has_tool("ydotool") { return "ydotool"; }
     return nil;
 }
 fn backends() {
+    let socket = try fs_exists("/tmp/.ydotool_socket") catch false;
     return map{ xdotool: _has_tool("xdotool"), ydotool: _has_tool("ydotool"),
-                available: _tool() != nil, enabled: _input_enabled() };
+                ydotoold: _has_tool("ydotoold"), ydotool_socket: socket,
+                pblang_uinput: _native_uinput_available(),
+                pblang_uinput_arch: _native_arch(),
+                pblang_x11: x11input.available().ok,
+                unicode_compose_enabled: _unicode_compose_enabled(),
+                selected: if _native_uinput_available() { "pblang-uinput" } else { _tool() },
+                available: _native_uinput_available() or _tool() != nil, enabled: _input_enabled(),
+                pblang_event_contract: true,
+                pblang_native_syscalls: true,
+                trusted_system_paths: true,
+                pointer: map{ absolute_xdotool: true, absolute_ydotool: false, relative: true } };
 }
 
 // ── actuation backends (run inside an approved master-control execute) ────────
-fn _do_type(text) {
+fn _execute_event(event) {
+    if _native_uinput_available() and (event.kind == "key" or event.kind == "click" or event.kind == "pointer_delta" or event.kind == "pointer" or event.kind == "type") {
+        let artifact = uinput.build_event_for_arch(event, _native_arch());
+        if not artifact.ok { return map{ available: false, tool: "pblang-uinput", note: artifact.error }; }
+        let token = str_slice(sha256(base64_encode_bytes(random_bytes(16))), 0, 24);
+        let path = "/tmp/pblang-uinput-" + token;
+        if not _stage_native(path, artifact.bytes) { return map{ available: false, tool: "pblang-uinput", note: "cannot stage native artifact" }; }
+        let chmod = try proc_spawn_wait("/bin/chmod", ["0700", path]) catch nil;
+        let result = nil;
+        if chmod != nil and _ec(chmod) == 0 { result = try proc_spawn_wait(path, []) catch nil; }
+        try fs_remove(path) catch nil;
+        if result == nil or _ec(result) != 0 {
+            return map{ available: false, tool: "pblang-uinput", note: "native uinput failed or permission was denied" };
+        }
+        return map{ available: true, tool: "pblang-uinput", event: event.kind, native: true };
+    }
+    if x11input.available().ok and (event.kind == "key" or event.kind == "click" or event.kind == "pointer_delta" or event.kind == "type") {
+        let native_x11 = x11input.execute(event, map{ unicode_compose: _unicode_compose_enabled() });
+        if native_x11.ok { return map{ available: true, tool: native_x11.backend, event: event.kind, native: true }; }
+    }
     let t = _tool();
     if t == nil { return map{ available: false, note: "no input tool (xdotool/ydotool)" }; }
-    let r = nil;
-    if t == "xdotool" { r = try proc_spawn_wait("xdotool", ["type", "--", text]) catch nil; }
-    else { r = try proc_spawn_wait("ydotool", ["type", text]) catch nil; }
-    if r == nil or _ec(r) != 0 { return map{ available: false, tool: t, note: "type failed (no display?)" }; }
-    return map{ available: true, tool: t, typed_chars: len(text) };
+    let plan = events.backend_plan(t, event);
+    if not plan.ok { return map{ available: false, tool: t, note: plan.error }; }
+    let executable = _tool_path(plan.command);
+    if executable == nil { return map{ available: false, tool: t, note: "input backend is not in a trusted system path" }; }
+    let r = try proc_spawn_wait(executable, plan.args) catch nil;
+    if r == nil or _ec(r) != 0 { return map{ available: false, tool: t, note: "input backend failed (display/daemon unavailable)" }; }
+    return map{ available: true, tool: t, event: event.kind };
 }
+fn _do_type(text) { let e = events.type_event(text); if not e.ok { return map{ available: false, note: e.error }; } let r = _execute_event(e.event); r.typed_chars = len(text); return r; }
 fn _do_key(name) {
-    let t = _tool();
-    if t == nil { return map{ available: false, note: "no input tool" }; }
-    let r = try proc_spawn_wait(t, ["key", name]) catch nil;
-    if r == nil or _ec(r) != 0 { return map{ available: false, tool: t, note: "key failed" }; }
-    return map{ available: true, tool: t, key: name };
+    let e = events.key_event(name); if not e.ok { return map{ available: false, note: e.error }; }
+    let r = _execute_event(e.event); r.key = e.event.key; return r;
 }
 fn _do_mouse_move(x, y) {
-    let t = _tool();
-    if t == nil { return map{ available: false, note: "no input tool" }; }
-    let r = try proc_spawn_wait(t, ["mousemove", str(x), str(y)]) catch nil;
-    if r == nil or _ec(r) != 0 { return map{ available: false, tool: t, note: "mousemove failed" }; }
-    return map{ available: true, tool: t, x: x, y: y };
+    let e = events.pointer_event(x, y); if not e.ok { return map{ available: false, note: e.error }; }
+    let r = _execute_event(e.event); r.x = x; r.y = y; return r;
+}
+fn _do_mouse_move_relative(dx, dy) {
+    let e = events.pointer_delta_event(dx, dy); if not e.ok { return map{ available: false, note: e.error }; }
+    let r = _execute_event(e.event); r.dx = dx; r.dy = dy; return r;
 }
 fn _do_click(button) {
-    let t = _tool();
-    if t == nil { return map{ available: false, note: "no input tool" }; }
-    let r = try proc_spawn_wait(t, ["click", str(button)]) catch nil;
-    if r == nil or _ec(r) != 0 { return map{ available: false, tool: t, note: "click failed" }; }
-    return map{ available: true, tool: t, button: button };
+    let e = events.click_event(button); if not e.ok { return map{ available: false, note: e.error }; }
+    let r = _execute_event(e.event); r.button = button; return r;
 }
 
 // ── stricter gate: separate enable flag, THEN the full master-control pipeline ─
@@ -92,19 +149,28 @@ fn type_text(text) {
 }
 
 fn key(name) {
-    let ok = false;
-    let i = 0;
-    while i < len(_SAFE_KEYS) { if _SAFE_KEYS[i] == name { ok = true; } i = i + 1; }
-    if not ok { return map{ status: "denied", reason: "key not in allowlist: " + str(name) }; }
-    return _gate_input(map{ kind: "input", subkind: "key", key: name }, fn() { return _do_key(name); });
+    let checked = events.key_event(name);
+    if not checked.ok { return map{ status: "denied", reason: "key not in allowlist: " + str(name) }; }
+    let canonical = checked.event.key;
+    return _gate_input(map{ kind: "input", subkind: "key", key: canonical }, fn() { return _do_key(canonical); });
 }
 
 fn mouse_move(x, y) {
+    let checked = events.pointer_event(x, y);
+    if not checked.ok { return map{ status: "denied", reason: checked.error }; }
     return _gate_input(map{ kind: "input", subkind: "mouse_move", x: x, y: y }, fn() { return _do_mouse_move(x, y); });
+}
+
+fn mouse_move_relative(dx, dy) {
+    let checked = events.pointer_delta_event(dx, dy);
+    if not checked.ok { return map{ status: "denied", reason: checked.error }; }
+    return _gate_input(map{ kind: "input", subkind: "mouse_move_relative", dx: dx, dy: dy }, fn() { return _do_mouse_move_relative(dx, dy); });
 }
 
 fn click(button) {
     if button == nil { button = 1; }
+    let checked = events.click_event(button);
+    if not checked.ok { return map{ status: "denied", reason: checked.error }; }
     return _gate_input(map{ kind: "input", subkind: "click", button: button }, fn() { return _do_click(button); });
 }
 
@@ -122,4 +188,4 @@ fn run(id, nonce) {
     return r;
 }
 
-export backends, type_text, key, mouse_move, click, safe_keys, run;
+export backends, type_text, key, mouse_move, mouse_move_relative, click, safe_keys, run;

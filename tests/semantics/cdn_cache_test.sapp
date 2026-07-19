@@ -1,0 +1,190 @@
+let CDN = import("stdlib:cdn_cache.sapp");
+let CACHE = import("stdlib:cache.sapp");
+let HTTP = import("stdlib:http_server.sapp");
+
+fn header(headers, name) {
+    let keys = map_keys(headers);
+    let wanted = str_lower(name);
+    let i = 0;
+    while i < len(keys) {
+        if str_lower(keys[i]) == wanted { return headers[keys[i]]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// Cache-Control builders and parser retain browser/shared distinctions.
+let public = CDN.public_policy(60000, map{
+    browser_ttl_ms: 10000, shared_ttl_ms: 60000,
+    stale_while_revalidate_ms: 30000, stale_if_error_ms: 120000
+});
+let public_header = CDN.cache_control(public);
+assert(str_contains(public_header, "public") and str_contains(public_header, "max-age=10"), "public policy emits browser TTL");
+assert(str_contains(public_header, "s-maxage=60") and str_contains(public_header, "stale-while-revalidate=30"), "public policy emits shared and SWR TTL");
+let parsed = CDN.parse_cache_control("public, max-age=10, s-maxage=60, stale-if-error=120, immutable");
+assert(parsed.public and parsed.max_age_ms == 10000 and parsed.s_maxage_ms == 60000, "Cache-Control parser reads public TTLs");
+assert(parsed.stale_if_error_ms == 120000 and parsed.immutable, "Cache-Control parser reads stale and immutable directives");
+assert(CDN.parse_cache_control("public, max-age=10, max-age=20").invalid, "duplicate Cache-Control TTL fails closed");
+assert(CDN.parse_cache_control("public, max-age=invalid").invalid, "malformed Cache-Control TTL fails closed");
+let strict_policy = CDN.public_policy(1000, map{ must_revalidate: true, stale_while_revalidate_ms: 5000, stale_if_error_ms: 5000 });
+assert(strict_policy.stale_while_revalidate_ms == 0 and strict_policy.stale_if_error_ms == 0, "must-revalidate cannot retain contradictory stale windows");
+assert(CDN.cache_control(CDN.no_store_policy()) == "no-store", "no-store policy is explicit");
+assert(str_starts_with(CDN.cache_control(CDN.private_policy(5000)), "private"), "private policy never becomes shared");
+assert(CDN.is_hashed_asset("/assets/app.34f9a123.js") and not CDN.is_hashed_asset("/assets/app.js"), "content-hashed filenames are detected conservatively");
+let immutable_asset = CDN.static_asset_policy("/assets/app.34f9a123.js");
+assert(immutable_asset.immutable and immutable_asset.shared_ttl_ms == 31536000000, "hashed assets receive the immutable one-year policy");
+
+let base = now_ms();
+let layer = CDN.create(map{
+    allowed_hosts: ["example.com"],
+    edge_max_entries: 8, regional_max_entries: 16,
+    edge_max_units: 100000, regional_max_units: 200000,
+    policy: map{
+        scope: "public", ttl_ms: 1000,
+        stale_while_revalidate_ms: 2000, stale_if_error_ms: 5000
+    }
+});
+
+let req = map{
+    method: "GET", scheme: "https", host: "example.com",
+    path: "/assets/app.js?b=2&a=1",
+    headers: map{ "Accept-Encoding": "gzip", "Accept-Language": "en" }
+};
+let reordered = map{
+    method: "GET", scheme: "https", host: "example.com",
+    path: "/assets/app.js?a=1&b=2",
+    headers: map{ "accept-encoding": "gzip", "accept-language": "en" }
+};
+let key1 = CDN.request_key(layer, req);
+let key2 = CDN.request_key(layer, reordered);
+assert(key1.ok and key1.key == key2.key, "query order and header casing do not fragment cache keys");
+let varied = map{
+    method: "GET", scheme: "https", host: "example.com",
+    path: "/assets/app.js?a=1&b=2",
+    headers: map{ "Accept-Encoding": "br", "Accept-Language": "en" }
+};
+assert(CDN.request_key(layer, varied).key != key1.key, "configured Vary dimensions are part of the cache key");
+assert(not CDN.request_key(layer, map{ method: "POST", host: "example.com", path: "/", headers: map{} }).ok, "non-idempotent methods bypass cache");
+assert(not CDN.request_key(layer, map{ method: "GET", host: "example.com", path: "/", headers: map{ "Authorization": "Bearer secret" } }).ok, "authorized requests bypass by default");
+assert(not CDN.request_key(layer, map{ method: "GET", host: "evil.example", path: "/", headers: map{} }).ok, "host allowlist prevents host-header cache pollution");
+assert(not CDN.request_key(layer, map{ method: "GET", host: "example.com\r\nX-Evil: 1", path: "/", headers: map{} }).ok, "control characters cannot enter cache keys");
+assert(not CDN.request_key(layer, map{ method: "GET", host: "example.com", path: "/", headers: map{ "Host": "other.example" } }).ok, "explicit and header hosts cannot disagree");
+assert(not CDN.request_key(layer, map{ method: "GET", host: "example.com", path: "/", headers: map{ "Accept-Encoding": "gzip\r\nX-Evil: 1" } }).ok, "unsafe Vary values cannot enter cache keys");
+
+let origin_calls = 0;
+let origin = fn(request) {
+    origin_calls = origin_calls + 1;
+    return map{
+        status: 200, body: "asset-v1", content_type: "application/javascript",
+        headers: map{ "Surrogate-Key": "assets release-1", "Vary": "Accept-Encoding" }
+    };
+};
+
+let first = CDN.fetch(layer, req, origin, map{ now_ms: base });
+assert(first.status == 200 and first.body == "asset-v1" and first.cdn.source == "MISS", "first request reaches origin and is admitted");
+assert(origin_calls == 1 and header(first.headers, "ETag") != nil, "origin response receives an ETag");
+let second = CDN.fetch(layer, req, origin, map{ now_ms: base + 100 });
+assert(second.cdn.source == "EDGE-HIT" and origin_calls == 1, "fresh edge hit shields the origin");
+
+// Conditional GET uses weak comparison and produces an empty 304 response.
+let conditional = map{
+    method: "GET", scheme: "https", host: "example.com", path: req.path,
+    headers: map{
+        "Accept-Encoding": "gzip", "Accept-Language": "en",
+        "If-None-Match": "W/" + header(first.headers, "ETag")
+    }
+};
+let not_modified = CDN.fetch(layer, conditional, origin, map{ now_ms: base + 200 });
+assert(not_modified.status == 304 and not_modified.body == "" and origin_calls == 1, "If-None-Match is answered from the edge");
+
+// A regional hit promotes the object back to edge without touching origin.
+CACHE.delete(layer.edge, key1.key);
+let regional = CDN.fetch(layer, req, origin, map{ now_ms: base + 300 });
+assert(regional.cdn.source == "REGIONAL-HIT" and origin_calls == 1, "regional shield handles edge miss");
+let promoted = CDN.fetch(layer, req, origin, map{ now_ms: base + 400 });
+assert(promoted.cdn.source == "EDGE-HIT", "regional response is promoted to edge");
+
+// SWR serves immediately and gives the caller a deterministic revalidation token.
+let stale = CDN.fetch(layer, req, origin, map{ now_ms: base + 1500 });
+assert(stale.cdn.state == "stale-while-revalidate" and stale.cdn.needs_revalidate, "SWR returns stale content without blocking");
+assert(stale.cdn.revalidation.format == "pblang.cdn.revalidation.v1" and origin_calls == 1, "SWR exposes explicit revalidation work");
+let refresh_origin = fn(request) {
+    origin_calls = origin_calls + 1;
+    return map{ status: 200, body: "asset-v2", content_type: "application/javascript", headers: map{ "Surrogate-Key": "assets release-2" } };
+};
+let refreshed = CDN.revalidate(layer, req, refresh_origin, map{ now_ms: base + 1600 });
+assert(refreshed.ok and refreshed.response.body == "asset-v2" and origin_calls == 2, "explicit revalidation refreshes both cache tiers");
+let after_refresh = CDN.fetch(layer, req, origin, map{ now_ms: base + 1700 });
+assert(after_refresh.body == "asset-v2" and after_refresh.cdn.source == "EDGE-HIT", "revalidated value becomes the edge value");
+
+// A request no-cache performs a blocking revalidation instead of reusing fresh data.
+let no_cache_req = map{
+    method: "GET", scheme: "https", host: "example.com", path: req.path,
+    headers: map{ "Accept-Encoding": "gzip", "Accept-Language": "en", "Cache-Control": "no-cache" }
+};
+let forced = CDN.fetch(layer, no_cache_req, refresh_origin, map{ now_ms: base + 1800 });
+assert(forced.cdn.source == "MISS" and origin_calls == 3, "request no-cache revalidates through origin");
+
+// stale-if-error only activates when the policy grants an error window.
+let resilient = CDN.create(map{
+    allowed_hosts: ["example.com"], edge_max_entries: 4, regional_max_entries: 4,
+    edge_max_units: 10000, regional_max_units: 10000,
+    policy: map{ scope: "public", ttl_ms: 100, stale_if_error_ms: 1000 }
+});
+let stable_origin = fn(request) { return map{ status: 200, body: "last-known-good", headers: map{} }; };
+CDN.fetch(resilient, map{ method: "GET", host: "example.com", path: "/api/public", headers: map{} }, stable_origin, map{ now_ms: base });
+let failing_origin = fn(request) { return nil; };
+let fallback = CDN.fetch(resilient, map{ method: "GET", host: "example.com", path: "/api/public", headers: map{} }, failing_origin, map{ now_ms: base + 200 });
+assert(fallback.body == "last-known-good" and fallback.cdn.state == "stale-if-error", "origin failure serves bounded last-known-good data");
+
+// Private, cookie-bearing, unrepresented Vary, and oversized responses are rejected.
+let rejects = CDN.create(map{
+    allowed_hosts: ["example.com"], edge_max_entries: 4, regional_max_entries: 4,
+    edge_max_units: 2000, regional_max_units: 4000, max_object_units: 512,
+    policy: map{ scope: "public", ttl_ms: 1000 }
+});
+let reject_req = map{ method: "GET", host: "example.com", path: "/reject", headers: map{} };
+let private_calls = 0;
+let private_origin = fn(request) { private_calls = private_calls + 1; return map{ status: 200, body: "private", headers: map{ "Cache-Control": "private, max-age=60" } }; };
+CDN.fetch(rejects, reject_req, private_origin);
+CDN.fetch(rejects, reject_req, private_origin);
+assert(private_calls == 2, "private responses are never shared");
+let cookie_origin = fn(request) { return map{ status: 200, body: "cookie", headers: map{ "Set-Cookie": "session=secret" } }; };
+let cookie_response = CDN.fetch(rejects, map{ method: "GET", host: "example.com", path: "/cookie", headers: map{} }, cookie_origin);
+assert(cookie_response.cdn.reason == "Set-Cookie response bypass", "Set-Cookie blocks shared admission");
+let bad_vary_origin = fn(request) { return map{ status: 200, body: "vary", headers: map{ "Vary": "X-User" } }; };
+let bad_vary = CDN.fetch(rejects, map{ method: "GET", host: "example.com", path: "/vary", headers: map{} }, bad_vary_origin);
+assert(bad_vary.cdn.reason == "Vary is not represented in the cache key", "unrepresented Vary cannot poison a shared key");
+let malformed_control_origin = fn(request) { return map{ status: 200, body: "unsafe", headers: map{ "Cache-Control": "public, max-age=60\r\nX-Evil: 1" } }; };
+let malformed_control = CDN.fetch(rejects, map{ method: "GET", host: "example.com", path: "/unsafe-control", headers: map{} }, malformed_control_origin);
+assert(malformed_control.cdn.reason == "origin headers are unsafe", "invalid origin cache headers fail closed instead of falling back to public policy");
+let large_origin = fn(request) { return map{ status: 200, body: "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz", headers: map{} }; };
+let large = CDN.fetch(rejects, map{ method: "GET", host: "example.com", path: "/large", headers: map{} }, large_origin);
+assert(large.cdn.reason == "response exceeds object limit", "oversized objects are not admitted");
+
+let auth_origin = fn(request) { return map{ status: 200, body: "account-data", headers: map{ "Cache-Control": "public, max-age=60" } }; };
+let auth_response = CDN.fetch(rejects, map{ method: "GET", host: "example.com", path: "/me", headers: map{ "Authorization": "Bearer x" } }, auth_origin);
+assert(auth_response.cdn.state == "bypass" and header(auth_response.headers, "Cache-Control") == "private, no-store", "sensitive bypass cannot leak through a downstream cache");
+
+// Purge APIs scan only bounded caches and invalidate both edge and regional.
+let tagged_purge = CDN.purge_tag(layer, "release-2");
+assert(tagged_purge.ok and tagged_purge.removed >= 2, "tag purge invalidates edge and regional copies");
+CDN.fetch(layer, req, origin, map{ now_ms: base + 2000 });
+let exact_purge = CDN.purge_request(layer, req);
+assert(exact_purge.ok and exact_purge.removed >= 2, "request purge invalidates both hierarchy levels");
+CDN.fetch(layer, req, origin, map{ now_ms: base + 2100 });
+let path_purge = CDN.purge_path(layer, "/assets", true);
+assert(path_purge.ok and path_purge.removed >= 2, "prefix path purge invalidates an asset subtree");
+assert(not CDN.purge_tag(layer, "bad tag with spaces").ok, "invalid purge tags are rejected");
+
+let final_stats = CDN.stats(layer);
+assert(final_stats.format == "pblang.cdn.stats.v1" and final_stats.metrics.edge_hits >= 3, "CDN metrics expose edge activity");
+assert(final_stats.metrics.regional_hits >= 1 and final_stats.metrics.origin_fetches >= 3, "CDN metrics expose shielding and origin work");
+
+// HTTP serialization uses byte Content-Length and the correct 304 reason.
+let unicode_wire = HTTP.to_http_response(map{ status: 200, body: "α", content_type: "text/plain", headers: map{ "ETag": "\"x\"" } });
+assert(str_contains(unicode_wire, "Content-Length: 2\r\n"), "HTTP Content-Length counts UTF-8 bytes");
+let not_modified_wire = HTTP.to_http_response(map{ status: 304, body: "", headers: map{ "ETag": "\"x\"" } });
+assert(str_starts_with(not_modified_wire, "HTTP/1.1 304 Not Modified"), "HTTP serializer emits the standard 304 reason");
+
+print "cdn_cache_pass";

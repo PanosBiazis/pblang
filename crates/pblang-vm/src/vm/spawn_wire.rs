@@ -297,9 +297,9 @@ pub(super) fn spawn_value_from_wire(
             // (see vm/spawn.rs around line 141); we piggy-back on it.
             let builtins_parent = module.borrow().parent.clone();
             let new_mod = Rc::new(RefCell::new(Module {
-                globals: HashMap::new(),
+                globals: Default::default(),
                 parent: builtins_parent,
-                exports: HashMap::new(),
+                exports: Default::default(),
             }));
             // Recursively hydrate the contained values into a Vec
             // *before* taking the mutable borrow on `new_mod`, because

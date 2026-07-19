@@ -1,0 +1,126 @@
+// Deterministic, bounded polyglot/FFI/parallel/device execution policies.
+
+let TP = import("stdlib:thread_pool.sapp");
+let CP = import("stdlib:compute.sapp");
+let A = import("stdlib:accelerator.sapp");
+let PP = import("stdlib:polyglot_policy.sapp");
+let FU = import("stdlib:ffi_universal.sapp");
+
+fn fail(message) { throw "FAIL " + message; }
+fn require(ok, message) { if not ok { fail(message); } }
+fn eq(actual, expected, message) {
+    if actual != expected { fail(message + " got=" + str(actual) + " expected=" + str(expected)); }
+}
+
+// Parallel workers return immutable outcomes; the parent owns task-state updates.
+let pool = TP.new_thread_pool(2);
+eq(TP.new().size, 4, "documented default constructor");
+let low_id = TP.submit_priority(pool, fn() { return "low"; }, 1);
+let fail_id = TP.submit_priority(pool, fn() { throw "intentional"; }, 5);
+let high_id = TP.submit_priority(pool, fn() { return "high"; }, 10);
+let parallel = TP.run_parallel(pool);
+eq(parallel.completed, 2, "parallel success accounting");
+eq(parallel.failed, 1, "parallel failure accounting");
+eq(parallel.results[0], "high", "successful results preserve priority order");
+eq(parallel.results[1], "low", "lower-priority success follows");
+eq(TP.get_status(pool, high_id), "done", "parent records completed status");
+eq(TP.get_status(pool, fail_id), "failed", "parent records failed status");
+eq(TP.get_status(pool, low_id), "done", "all parent statuses updated");
+eq(TP.stats(pool).failed, 1, "pool statistics include parallel failures");
+
+TP.shutdown(pool);
+let submit_after_shutdown = try map{ ok: true, id: TP.submit(pool, fn() { return 1; }) }
+    catch map{ ok: false };
+require(not submit_after_shutdown.ok, "submission after shutdown fails closed");
+let excessive_workers = try map{ ok: true, pool: TP.new_thread_pool(65) }
+    catch map{ ok: false };
+require(not excessive_workers.ok, "worker hard limit enforced");
+
+// A captured loop index must not leak into race workers.
+let raced = TP.race([fn() { return 1; }, fn() { return 2; }], 100);
+require(raced == 1 or raced == 2, "race returns a task result without capture failure");
+
+// Deterministic device policy: present-but-unusable hardware cannot receive work.
+let devices_unusable = [
+    map{ kind: "cpu", present: true, usable: true, available: true, units: 4, weight: 4 },
+    map{ kind: "gpu", present: true, usable: false, available: false, units: 1, weight: 0 },
+];
+let gpu_policy = CP.policy(map{
+    preferred_device: "gpu", workload: "tensor", min_accelerator_items: 1,
+    min_parallel_items: 1, max_workers: 2, fallback_to_cpu: true,
+});
+let fallback_route = CP.select_device(8, devices_unusable, gpu_policy);
+eq(fallback_route.device, "cpu", "unusable GPU routes to CPU");
+require(fallback_route.fallback_used, "explicit GPU fallback is reported");
+
+let strict_policy = CP.policy(map{
+    preferred_device: "gpu", workload: "tensor", min_accelerator_items: 1,
+    fallback_to_cpu: false,
+});
+require(not CP.select_device(8, devices_unusable, strict_policy).ok,
+    "strict accelerator request fails instead of silently changing device");
+let no_executor_plan = CP.plan(3, [map{ kind: "gpu", usable: false, available: false, weight: 0 }]);
+eq(no_executor_plan[0].kind, "cpu", "legacy planner retains portable fallback");
+eq(no_executor_plan[0].count, 3, "legacy fallback still assigns every task");
+
+// Registered runtimes are executable; failure follows the explicit CPU policy.
+A.clear_runtimes();
+A.register_runtime("gpu", fn(payload) { return [payload[0] + 1, payload[1] + 1]; });
+let devices_usable = [
+    map{ kind: "cpu", present: true, usable: true, available: true, units: 4, weight: 4 },
+    map{ kind: "gpu", present: true, usable: true, available: true, units: 1, weight: 16 },
+];
+let accelerated = CP.run_controlled([1, 2], fn(x) { return x * x; }, map{
+    devices: devices_usable, preferred_device: "gpu", workload: "tensor",
+    min_accelerator_items: 1, payload: [40, 41], fallback_to_cpu: true,
+});
+require(accelerated.ok and accelerated.route.device == "gpu", "registered GPU runtime selected");
+eq(accelerated.results[0], 41, "accelerator result returned");
+require(not accelerated.route.fallback_used, "successful runtime does not report fallback");
+
+A.register_runtime("gpu", fn(_payload) { throw "runtime failed"; });
+let recovered = CP.run_controlled([2, 3], fn(x) { return x * x; }, map{
+    devices: devices_usable, preferred_device: "gpu", workload: "tensor",
+    min_accelerator_items: 1, min_parallel_items: 10, fallback_to_cpu: true,
+});
+require(recovered.ok and recovered.route.device == "cpu", "runtime failure uses CPU fallback");
+require(recovered.route.fallback_used, "runtime failure fallback is observable");
+eq(recovered.results[0], 4, "CPU fallback uses equivalent worker");
+eq(recovered.results[1], 9, "CPU fallback preserves order");
+A.clear_runtimes();
+
+let invalid_runtime = try map{ ok: true, value: A.register_runtime("quantum", fn(x) { return x; }) }
+    catch map{ ok: false };
+require(not invalid_runtime.ok, "unknown accelerator runtime kind rejected");
+
+// Polyglot policy retains capability/resource limits in every scan mode.
+fn runner(lang, code) { return lang + ":" + code; }
+let language_cfg = PP.new("secure", runner, map{ allowed_languages: ["python"], max_code_bytes: 16 });
+let language_denied = PP.execute(language_cfg, "javascript", "print(1)");
+require(language_denied.blocked and language_denied.reason == "language_not_allowed",
+    "language allowlist is exact");
+let oversized = PP.execute(language_cfg, "python", "0123456789abcdefX");
+require(oversized.blocked and oversized.reason == "code_limit_exceeded", "polyglot code bound enforced");
+let missing_runner = try map{ ok: true, cfg: PP.new("secure", nil) } catch map{ ok: false };
+require(not missing_runner.ok, "execution policy requires a runner");
+require(not PP.report("python", "print(1)").ran, "report mode remains runner-free");
+let unrestricted_limited = PP.new("unrestricted", runner, map{ max_code_bytes: 4 });
+let unrestricted_oversized = PP.execute(unrestricted_limited, "python", "12345");
+require(unrestricted_oversized.blocked and not unrestricted_oversized.ran,
+    "unrestricted mode cannot disable resource limits");
+
+// Safe FFI wrapper is exact and can only narrow the native VM FfiPolicy.
+let ffi_cfg = FU.ffi_policy(["/opt/pblang/libmath.so"], ["add_i64"], map{ max_args: 2 });
+require(FU.decide_load(ffi_cfg, "/opt/pblang/libmath.so").allowed, "exact library allowed");
+require(not FU.decide_load(ffi_cfg, "libmath.so").allowed, "search-path alias denied");
+require(FU.decide_call(ffi_cfg, "add_i64", [1, 2], ["i64", "i64"], "i64").allowed,
+    "exact typed symbol allowed");
+eq(FU.decide_call(ffi_cfg, "system", ["id"], ["str"], "i64").reason,
+    "symbol_not_allowed", "unknown symbol denied");
+eq(FU.decide_call(ffi_cfg, "add_i64", [1], ["i64", "i64"], "i64").reason,
+    "signature_arity_mismatch", "FFI arity mismatch denied");
+let pointer_cfg = FU.ffi_policy(["x.so"], ["peek"], map{ max_args: 1 });
+eq(FU.decide_call(pointer_cfg, "peek", [1], ["ptr"], "i64").reason,
+    "raw_pointer_denied", "raw pointers require explicit opt-in");
+
+print "controlled_execution_pass";

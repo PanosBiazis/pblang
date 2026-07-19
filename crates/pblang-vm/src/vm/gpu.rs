@@ -153,6 +153,24 @@ pub fn adapter_type() -> Option<String> {
     ctx().map(|c| c.adapter_type.clone())
 }
 
+/// Share the already-initialized wgpu `Device` + `Queue` so a *renderer* (e.g. the
+/// experimental `wgpu-render` backend in `pblang-graphics`) can reuse the exact same
+/// device this compute path spun up, instead of creating a second, competing one.
+///
+/// This is a pure read-only accessor: it does NOT change how `ctx()`, `matmul()`, or
+/// any existing behavior works. `wgpu::Device` and `wgpu::Queue` are cheaply `Clone`
+/// (both are `Arc`-backed handles internally), so cloning here hands out a shareable
+/// copy without deep-copying any GPU resources. Returns `None` when no GPU initialized.
+///
+/// Only present under the `gpu` feature (this whole module is), so the default build is
+/// unaffected. NOTE: the compute device is requested with `compatible_surface: None`,
+/// so it is not guaranteed to be presentable to an arbitrary window surface; a renderer
+/// should treat this as a best-effort fast path and fall back to its own device if the
+/// surface is incompatible.
+pub fn shared_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    ctx().map(|c| (c.device.clone(), c.queue.clone()))
+}
+
 /// GPU matmul: (m x k) * (k x n) -> (m x n), computed in f32 on the GPU. Returns None if
 /// no GPU is available. Results are deterministic for a given device but differ from the
 /// CPU f64 path at f32 precision.

@@ -49,6 +49,8 @@ let OP_SET_ATTR = 30;
 // that removes instructions, exactly like the plain jumps above).
 let OP_JUMP_IF_FALSE_PEEK = 33;
 let OP_JUMP_IF_TRUE_PEEK = 34;
+let OP_ADD_LOCAL_CONST = 41;
+let OP_ADD_LOCAL_LOCAL = 42;
 
 // opcode_name(op) — debug name for every opcode this optimizer reasons about
 // (turns the constant table into a real tracing surface for stats output).
@@ -87,6 +89,8 @@ fn opcode_name(op) {
     if op == OP_SET_ATTR { return "OpSetAttr"; }
     if op == OP_JUMP_IF_FALSE_PEEK { return "OpJumpIfFalsePeek"; }
     if op == OP_JUMP_IF_TRUE_PEEK { return "OpJumpIfTruePeek"; }
+    if op == OP_ADD_LOCAL_CONST { return "OpAddLocalConst"; }
+    if op == OP_ADD_LOCAL_LOCAL { return "OpAddLocalLocal"; }
     return "Op?" + str(op);
 }
 let OP_JUMP_IF_NIL_PEEK = 36;
@@ -101,17 +105,43 @@ fn copy_instructions(src) {
     let i = 0;
     while i < len(src) {
         let inst = src[i];
-        array_push(out, map{ op: inst.op, operand: inst.operand });
+        let copied = map{ op: inst.op, operand: inst.operand };
+        if map_has(inst, "direct_builtin_call") {
+            copied.direct_builtin_call = inst.direct_builtin_call;
+        }
+        array_push(out, copied);
         i = i + 1;
     }
     return out;
+}
+
+fn _copy_value(value, depth) {
+    if depth > 128 { throw "optimizer: constant nesting exceeds 128"; }
+    if is_array(value) {
+        let out = [];
+        let i = 0;
+        while i < len(value) { array_push(out, _copy_value(value[i], depth + 1)); i = i + 1; }
+        return out;
+    }
+    if is_map(value) {
+        let out = map{};
+        let keys = map_keys(value);
+        let i = 0;
+        while i < len(keys) {
+            let key = keys[i];
+            out[key] = _copy_value(value[key], depth + 1);
+            i = i + 1;
+        }
+        return out;
+    }
+    return value;
 }
 
 fn copy_constants(src) {
     let out = [];
     let i = 0;
     while i < len(src) {
-        array_push(out, src[i]);
+        array_push(out, _copy_value(src[i], 0));
         i = i + 1;
     }
     return out;
@@ -466,6 +496,48 @@ fn jump_to_next_pass(chunk) {
     return removed;
 }
 
+// Fuse the dominant local-update bytecode patterns into one dispatch while
+// preserving overloaded addition through the VM's normal _op_add slow path.
+// A sequence is never fused when a jump can enter its middle.
+fn local_fusion_pass(chunk) {
+    let fused = 0;
+    let targets = _jump_target_set(chunk);
+    let i = 0;
+    while i + 3 < chunk_len(chunk) {
+        if map_has(targets, str(i + 1)) or map_has(targets, str(i + 2)) or map_has(targets, str(i + 3)) {
+            i = i + 1;
+            continue;
+        }
+        let lhs = inst_at(chunk, i);
+        let rhs = inst_at(chunk, i + 1);
+        let add = inst_at(chunk, i + 2);
+        let set = inst_at(chunk, i + 3);
+        if lhs.op == OP_GET_LOCAL and add.op == OP_ADD and set.op == OP_SET_LOCAL and set.operand == lhs.operand {
+            if rhs.op == OP_CONSTANT {
+                set_inst(chunk, i, make_inst(OP_ADD_LOCAL_CONST, map{ slot: lhs.operand, constant: rhs.operand }));
+                set_inst(chunk, i + 1, make_inst(-1, 0));
+                set_inst(chunk, i + 2, make_inst(-1, 0));
+                set_inst(chunk, i + 3, make_inst(-1, 0));
+                fused = fused + 1;
+                i = i + 4;
+                continue;
+            }
+            if rhs.op == OP_GET_LOCAL {
+                set_inst(chunk, i, make_inst(OP_ADD_LOCAL_LOCAL, map{ slot: lhs.operand, rhs: rhs.operand }));
+                set_inst(chunk, i + 1, make_inst(-1, 0));
+                set_inst(chunk, i + 2, make_inst(-1, 0));
+                set_inst(chunk, i + 3, make_inst(-1, 0));
+                fused = fused + 1;
+                i = i + 4;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    if fused > 0 { _compact_and_remap(chunk); }
+    return fused;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Main optimize entry point: run all passes
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -482,11 +554,31 @@ fn _optimize_fixpoint(working, stats, max_iters) {
         let dc = dead_code_pass(working);
         let jo = jump_optimization_pass(working);
         let jn = jump_to_next_pass(working);
+        let lf = local_fusion_pass(working);
         stats.constant_folded = stats.constant_folded + cf;
         stats.dead_code_removed = stats.dead_code_removed + dc;
         stats.jumps_optimized = stats.jumps_optimized + jo + jn;
-        if cf + dc + jo + jn == 0 { return; }
+        stats.locals_fused = stats.locals_fused + lf;
+        if cf + dc + jo + jn + lf == 0 { return; }
         iters = iters + 1;
+    }
+}
+
+fn _optimize_nested(working, stats) {
+    let i = 0;
+    while i < len(working.constants) {
+        let value = working.constants[i];
+        if is_map(value) and map_has(value, "chunk") {
+            _optimize_fixpoint(value.chunk, stats, 6);
+            _optimize_nested(value.chunk, stats);
+        }
+        if is_map(value) and map_has(value, "try_chunk") and map_has(value, "catch_chunk") {
+            _optimize_fixpoint(value.try_chunk, stats, 6);
+            _optimize_fixpoint(value.catch_chunk, stats, 6);
+            _optimize_nested(value.try_chunk, stats);
+            _optimize_nested(value.catch_chunk, stats);
+        }
+        i = i + 1;
     }
 }
 
@@ -497,8 +589,10 @@ fn optimize(chunk) {
         dead_code_removed: 0,
         jumps_optimized: 0,
         strength_reduced: 0,
+        locals_fused: 0,
     };
     _optimize_fixpoint(working, stats, 6);
+    _optimize_nested(working, stats);
     // Strength reduction is unsound under operator overloading, so it runs last
     // and only in the non-safe variant.
     stats.strength_reduced = strength_reduction_pass(working);
@@ -516,8 +610,9 @@ fn optimize(chunk) {
 // sequences. Used by frontend_run to speed up self-hosted code without risk.
 fn optimize_safe(chunk) {
     let working = copy_chunk(chunk);
-    let stats = map{ constant_folded: 0, dead_code_removed: 0, jumps_optimized: 0, strength_reduced: 0 };
+    let stats = map{ constant_folded: 0, dead_code_removed: 0, jumps_optimized: 0, strength_reduced: 0, locals_fused: 0 };
     _optimize_fixpoint(working, stats, 6);
+    _optimize_nested(working, stats);
     return map{ chunk: working, stats: stats };
 }
 
@@ -525,9 +620,11 @@ fn stats_to_string(stats) {
     return "folded:" + str(stats.constant_folded)
         + " dead:" + str(stats.dead_code_removed)
         + " jumps:" + str(stats.jumps_optimized)
-        + " strength:" + str(stats.strength_reduced);
+        + " strength:" + str(stats.strength_reduced)
+        + " fused:" + str(stats.locals_fused);
 }
 
 export optimize, optimize_safe, constant_folding_pass, dead_code_pass, jump_optimization_pass;
 export opcode_name;
 export jump_to_next_pass, strength_reduction_pass, stats_to_string, copy_chunk;
+export local_fusion_pass;

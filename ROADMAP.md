@@ -92,7 +92,7 @@ native executable bundler are in early stages.
 
 ## Priority Order
 
-1. TLS/HTTPS server (W4-gamma — production blocker)
+1. TLS/HTTPS server (W4-gamma — production release gate)
 2. Self-extracting binary (E5-gamma)
 3. Match guard fix (SP1-gamma — parser improvement)
 4. LSP semantic tokens (L4-alpha)
@@ -115,7 +115,7 @@ native executable bundler are in early stages.
 | TLS `DangerousAllowAllVerifier` — accepted ANY certificate | 🔴 Critical | ✅ **Fixed** — replaced with `webpki-roots` + `rustls-native-certs` proper CA chain |
 | Path traversal in `static_file_response()` | 🟠 High | ✅ **Fixed** — `_path_safe()` strips `../`, URL-decodes, returns 403 on traversal |
 | Command injection in `os.which()` | 🟡 Medium | ✅ **Fixed** — new `os_which` builtin searches PATH entries directly (no shell) |
-| `fs.sapp` zero input validation | 🟠 High | ✅ **Fixed** — absolute path and `../` blocked by default; opt-in `*_abs()` variants |
+| `fs.sapp` zero input validation | 🟠 High | ✅ **Fixed** — absolute path and `../` denied by default; opt-in `*_abs()` variants |
 | URL query parameters not decoded | 🟡 Medium | ✅ **Fixed** — `_parse_query` now calls `url_decode()` on keys and values |
 | `NonNull` (T!) type constraint erased in typechecker | 🟡 Medium | ✅ **Fixed** — `Ty::NonNull` preserved; nil assignments to T! now emit diagnostics |
 | `http_response` missing 50+ status codes | 🟡 Medium | ✅ **Fixed** — full RFC 7231 reason phrase table via `http_status_reason()` |
@@ -140,4 +140,3 @@ native executable bundler are in early stages.
 | `os_which(cmd)` | Safe PATH search without shell injection |
 | `str_from_char_code(n)` | Alias for `strfromcharcode` (used by stdlib) |
 | Full HTTP status codes | `http_status_reason(code)` covers all 60+ RFC 7231 codes |
-

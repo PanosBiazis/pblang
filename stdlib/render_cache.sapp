@@ -51,23 +51,83 @@ fn rect_clip(r, w, h) {
 // COVERAGE_FULL — once coalesced dirty area exceeds this fraction of the surface, a single
 // full repaint is cheaper (and simpler) than juggling many regions.
 let COVERAGE_FULL = 0.6;
+let DEFAULT_MAX_RECTS = 128;
+let HARD_MAX_RECTS = 512;
+let MAX_DIMENSION = 10000000;
 
-fn new(w, h) {
-    return map{ w: w, h: h, rects: [], full: false };
+fn _number(value, fallback = 0) {
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or text == "+nan" or text == "-nan" or
+       text == "inf" or text == "+inf" or text == "-inf" or
+       text == "infinity" or text == "+infinity" or text == "-infinity" {
+        return fallback;
+    }
+    let n = try parse_number(text) catch fallback;
+    if n == nil { n = fallback; }
+    return n;
+}
+
+fn _dimension(value) {
+    let n = num_floor(_number(value, 0));
+    if n < 0 { return 0; }
+    if n > MAX_DIMENSION { return MAX_DIMENSION; }
+    return n;
+}
+
+fn _rect_limit(value) {
+    let n = num_floor(_number(value, DEFAULT_MAX_RECTS));
+    if n < 1 { return 1; }
+    if n > HARD_MAX_RECTS { return HARD_MAX_RECTS; }
+    return n;
+}
+
+fn new(w, h, max_rects = 128) {
+    return map{
+        w: _dimension(w), h: _dimension(h), rects: [], full: false,
+        dirty_area: 0, max_rects: _rect_limit(max_rects), coalesces: 0
+    };
 }
 
 // mark(dc, x, y, w, h) — record a changed region (clipped to the surface). Zero-area
 // (out-of-bounds) marks are ignored. Promotes to a full repaint past the coverage cap.
 fn mark(dc, x, y, w, h) {
     if dc.full { return dc; }
-    let r = rect_clip(map{ x: x, y: y, w: w, h: h }, dc.w, dc.h);
+    let r = rect_clip(map{
+        x: _number(x, 0), y: _number(y, 0),
+        w: _number(w, 0), h: _number(h, 0)
+    }, dc.w, dc.h);
     if r.w <= 0 or r.h <= 0 { return dc; }
+
+    // Repeated invalidation of the exact same widget is common during event
+    // bursts; deduplicate it in O(n) without running a full coalescing pass.
+    let i = 0;
+    while i < len(dc.rects) {
+        let old = dc.rects[i];
+        if old.x == r.x and old.y == r.y and old.w == r.w and old.h == r.h { return dc; }
+        i = i + 1;
+    }
     array_push(dc.rects, r);
+    dc.dirty_area = dc.dirty_area + rect_area(r);
     _maybe_promote(dc);
     return dc;
 }
 
-fn mark_full(dc) { dc.full = true; dc.rects = []; return dc; }
+fn mark_many(dc, rects) {
+    let i = 0;
+    while i < len(rects) and not dc.full {
+        let r = rects[i];
+        mark(dc, try r.x catch 0, try r.y catch 0, try r.w catch 0, try r.h catch 0);
+        i = i + 1;
+    }
+    return dc;
+}
+
+fn mark_full(dc) {
+    dc.full = true;
+    dc.rects = [];
+    dc.dirty_area = dc.w * dc.h;
+    return dc;
+}
 
 fn is_full(dc) { return dc.full; }
 fn is_dirty(dc) { return dc.full or len(dc.rects) > 0; }
@@ -107,15 +167,22 @@ fn _coalesce(rects) {
     return work;
 }
 
-// _maybe_promote(dc) — if the coalesced dirty area now dominates the surface, collapse to
-// a full repaint.
+// _maybe_promote(dc) — ordinary marks are O(1) after bounded duplicate checking.
+// Coalescing runs only when summed area crosses the repaint threshold, rather
+// than after every mark. A hard region budget prevents adversarial growth.
 fn _maybe_promote(dc) {
-    let regs = _coalesce(dc.rects);
-    let area = 0;
-    let i = 0;
-    while i < len(regs) { area = area + rect_area(regs[i]); i = i + 1; }
     let total = dc.w * dc.h;
-    if total > 0 and area / total > COVERAGE_FULL { mark_full(dc); }
+    if len(dc.rects) >= dc.max_rects { return mark_full(dc); }
+    if total <= 0 or dc.dirty_area / total <= COVERAGE_FULL { return dc; }
+
+    let regs = _coalesce(dc.rects);
+    dc.coalesces = dc.coalesces + 1;
+    let exact_area = 0;
+    let i = 0;
+    while i < len(regs) { exact_area = exact_area + rect_area(regs[i]); i = i + 1; }
+    dc.rects = regs;
+    dc.dirty_area = exact_area;
+    if exact_area / total > COVERAGE_FULL { mark_full(dc); }
     return dc;
 }
 
@@ -137,16 +204,32 @@ fn coverage(dc) {
     return area / total;
 }
 
+fn stats(dc) {
+    let estimated = 0;
+    let total = dc.w * dc.h;
+    if total > 0 { estimated = dc.dirty_area / total; }
+    if estimated > 1 { estimated = 1; }
+    return map{
+        format: "pblang.render_cache.stats.v1",
+        dirty: is_dirty(dc), full: dc.full, queued_rects: len(dc.rects),
+        max_rects: dc.max_rects, estimated_coverage: estimated,
+        coalesces: dc.coalesces
+    };
+}
+
 // clear_dirty(dc) — reset after a present.
-fn clear_dirty(dc) { dc.rects = []; dc.full = false; return dc; }
+fn clear_dirty(dc) { dc.rects = []; dc.full = false; dc.dirty_area = 0; return dc; }
 
 // ── frame governor ───────────────────────────────────────────────────────────────────
 // Renders only when something changed (input event or a new state hash) AND at most once
 // per frame interval — so an idle UI costs ~0 and an active one is capped to target fps.
 fn governor_new(fps) {
-    let interval = 16;
-    if fps > 0 { interval = num_floor(1000 / fps); }
-    return map{ fps: fps, interval: interval, last: 0 - 1000000, hash: nil, started: false };
+    let safe_fps = _number(fps, 60);
+    if safe_fps <= 0 { safe_fps = 60; }
+    if safe_fps > 1000 { safe_fps = 1000; }
+    let interval = num_floor(1000 / safe_fps);
+    if interval < 1 { interval = 1; }
+    return map{ fps: safe_fps, interval: interval, last: 0 - 1000000, hash: nil, started: false };
 }
 
 // should_render(gov, now_ms, state_hash, had_event) — returns { render, gov }. `render` is
@@ -168,5 +251,5 @@ fn should_render(gov, now_ms, state_hash, had_event) {
 }
 
 export rect_area, rect_overlaps, rect_union, rect_clip;
-export new, mark, mark_full, is_full, is_dirty, regions, coverage, clear_dirty;
+export new, mark, mark_many, mark_full, is_full, is_dirty, regions, coverage, stats, clear_dirty;
 export governor_new, should_render;

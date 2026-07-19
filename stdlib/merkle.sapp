@@ -1,0 +1,160 @@
+// stdlib/merkle.sapp — a binary Merkle tree over SHA-256 hex digests, with
+// RFC-6962-style domain separation and O(log n) inclusion proofs.
+//
+// Import: let merkle = import("stdlib:merkle.sapp");
+//
+// ════════════════════════════════════════════════════════════════════════════════
+// DOMAIN SEPARATION (second-preimage defence)
+//
+// A naive Merkle tree that hashes leaves and internal nodes the same way is
+// vulnerable to a second-preimage attack: an attacker can present an internal
+// node's two children as if they were a single leaf, because H(a || b) is
+// indistinguishable from H(leaf_data). RFC 6962 (Certificate Transparency)
+// prevents this by prefixing every hash input with a distinct domain tag:
+//   - leaves   are hashed as  H(0x00 || data)
+//   - internal are hashed as  H(0x01 || left || right)
+//
+// pblang's sha256() builtin hashes a STRING (its UTF-8 bytes) and returns a
+// 64-char lowercase hex digest. Since our inputs are strings, we use printable
+// ASCII domain-tag PREFIXES that play the same role as RFC 6962's 0x00 / 0x01:
+//   - LEAF PREFIX     "L:"  → leaf_hash(data)      = sha256("L:" + data)
+//   - INTERNAL PREFIX "N:"  → node_hash(l, r)      = sha256("N:" + l + r)
+// Because left and right are each fixed-width 64-hex-char digests, the "N:" input
+// is unambiguously parseable, so distinct child pairs never collide by framing.
+// These two prefixes are disjoint, so no leaf hash can ever equal a node hash.
+//
+// ODD NODE COUNTS
+//   When a level has an odd number of nodes, the lone final node is DUPLICATED
+//   (paired with itself): node_hash(last, last). This is the Bitcoin convention.
+//   It is simple and consistent; we document it so proofs fold identically. (RFC
+//   6962 instead PROMOTES a lone node unchanged; we deliberately choose Bitcoin-
+//   style duplication and apply it uniformly in build(), prove(), and verify().)
+//
+// EMPTY TREE
+//   The canonical empty-tree root is defined as sha256("L:") — i.e. the leaf hash
+//   of the empty string under our leaf domain tag. This is a fixed, documented
+//   constant so an empty tree has a well-defined, reproducible root instead of ""
+//   (which could collide with error handling). build([]) returns this root.
+// ════════════════════════════════════════════════════════════════════════════════
+
+// leaf_hash(data) — H("L:" + data). `data` is a string.
+fn leaf_hash(data) {
+    return sha256("L:" + data);
+}
+
+// node_hash(left, right) — H("N:" + left + right). `left`/`right` are hex digests.
+fn node_hash(left, right) {
+    return sha256("N:" + left + right);
+}
+
+// empty_root() — the canonical root of an empty tree (documented above).
+fn empty_root() {
+    return sha256("L:");
+}
+
+// _next_level(level) — fold one level of node hashes into the parent level,
+// duplicating a lone final node (Bitcoin convention).
+fn _next_level(level) {
+    let parent = [];
+    let i = 0;
+    while i < len(level) {
+        let left = level[i];
+        let right = left;
+        if i + 1 < len(level) { right = level[i + 1]; }
+        array_push(parent, node_hash(left, right));
+        i = i + 2;
+    }
+    return parent;
+}
+
+// build(items) — items is an array of strings. Returns a tree map holding every
+// level (bottom-up): levels[0] is the array of leaf hashes, levels[top] is a
+// single-element array [root]. Also stores the leaf count and the root for
+// convenience. O(n) total work.
+fn build(items) {
+    let leaves = [];
+    let i = 0;
+    while i < len(items) {
+        array_push(leaves, leaf_hash(items[i]));
+        i = i + 1;
+    }
+    if len(leaves) == 0 {
+        // Canonical empty tree: one level containing only the empty root.
+        return map{ levels: [[empty_root()]], count: 0, root: empty_root() };
+    }
+    let levels = [leaves];
+    let current = leaves;
+    while len(current) > 1 {
+        let nxt = _next_level(current);
+        array_push(levels, nxt);
+        current = nxt;
+    }
+    let top = levels[len(levels) - 1];
+    return map{ levels: levels, count: len(leaves), root: top[0] };
+}
+
+// root(tree) — the Merkle root hex digest.
+fn root(tree) {
+    return tree["root"];
+}
+
+// prove(tree, index) — inclusion proof for leaf `index`: an array of sibling
+// steps {hash, side} from the leaf up to the root, where `side` is "left" if the
+// sibling sits on the LEFT of the current node (so folding is node_hash(sibling,
+// current)) and "right" if it sits on the RIGHT (node_hash(current, sibling)).
+// O(log n). Throws on an out-of-range index or on the empty tree.
+fn prove(tree, index) {
+    let count = tree["count"];
+    if count == 0 { throw "merkle.prove: cannot prove membership in an empty tree"; }
+    if index < 0 or index >= count {
+        throw "merkle.prove: index out of range: " + str(index);
+    }
+    let levels = tree["levels"];
+    let proof = [];
+    let idx = index;
+    let li = 0;
+    // Walk every level except the top (root) level.
+    while li < len(levels) - 1 {
+        let level = levels[li];
+        // Determine this node's sibling, applying the same lone-node duplication
+        // rule used in _next_level.
+        if idx % 2 == 0 {
+            // We are a left child; sibling is the node to our right, or ourselves
+            // if we are the lone final node (duplicated).
+            let sib = level[idx];
+            if idx + 1 < len(level) { sib = level[idx + 1]; }
+            array_push(proof, map{ hash: sib, side: "right" });
+        } else {
+            // We are a right child; sibling is the node to our left.
+            array_push(proof, map{ hash: level[idx - 1], side: "left" });
+        }
+        idx = num_floor(idx / 2);
+        li = li + 1;
+    }
+    return proof;
+}
+
+// verify(root_hex, data, index, proof) — recompute leaf_hash(data) and fold the
+// proof steps, applying node_hash with the ordering dictated by each step's
+// `side`, then constant-time compare the result against root_hex. Returns bool.
+// `index` is accepted for API symmetry / documentation; the fold order is fully
+// determined by the `side` fields, so a tampered index alone still fails unless
+// the caller also supplies a matching altered proof.
+fn verify(root_hex, data, index, proof) {
+    let acc = leaf_hash(data);
+    let i = 0;
+    while i < len(proof) {
+        let step = proof[i];
+        let sib = step["hash"];
+        if step["side"] == "left" {
+            acc = node_hash(sib, acc);
+        } else {
+            acc = node_hash(acc, sib);
+        }
+        i = i + 1;
+    }
+    return constant_time_eq(acc, root_hex);
+}
+
+export leaf_hash, node_hash, empty_root;
+export build, root, prove, verify;

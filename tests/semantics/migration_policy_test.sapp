@@ -1,0 +1,179 @@
+// Test: strict PBLang-only implementation and migration lifecycle policy.
+
+let P = import("stdlib:migration_policy.sapp");
+
+fn fail(message) { throw "FAIL " + message; }
+fn assert_true(value, message) { if value != true { fail(message); } }
+fn assert_false(value, message) { if value == true { fail(message); } }
+
+fn has_code(report, code) {
+    let i = 0;
+    while i < len(report.violations) {
+        if report.violations[i].code == code { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn manifest(changes, exceptions = nil, migrations = nil) {
+    return map{
+        format: P.MANIFEST_FORMAT,
+        today: "2026-07-17",
+        changes: changes,
+        exceptions: exceptions ?? [],
+        migrations: migrations ?? []
+    };
+}
+
+fn exception(path, max_added = 20) {
+    return map{
+        id: "boundary-" + str(max_added), path: path, kind: "system-api", status: "active",
+        reason: "The operating system boundary has no native PBLang ABI yet.",
+        owner: "runtime-team",
+        removal_plan: "Replace this exact boundary after the PBLang system ABI reaches parity.",
+        review_by: "2026-12-31", max_added_lines: max_added,
+        verification: ["tests/semantics/system_boundary_test.sapp"]
+    };
+}
+
+assert_true(P.classify_path("stdlib/app.sapp") == "pblang", "classifies PBLang source");
+assert_true(P.classify_path("src/main.rs") == "rust-legacy", "classifies Rust as legacy");
+assert_true(P.classify_path("runtime/bridge.c") == "foreign-code", "classifies foreign implementation code");
+assert_true(P.classify_path("docs/status.md") == "data-or-docs", "classifies documentation");
+assert_true(P.classify_path("../escape.sapp") == "invalid", "rejects parent traversal");
+assert_true(P.classify_path("/tmp/escape.sapp") == "invalid", "rejects absolute path");
+assert_true(P.classify_path("bad\x00name.sapp") == "invalid", "rejects embedded NUL");
+
+let native = P.evaluate_manifest(manifest([
+    map{ path: "stdlib/new_api.sapp", change: "added", added_lines: 40, removed_lines: 0 },
+    map{ path: "docs/new_api.md", change: "added", added_lines: 20, removed_lines: 0 },
+    map{ path: "src/legacy.rs", change: "modified", added_lines: 0, removed_lines: 12 }
+]));
+assert_true(native.passed, "PBLang additions, docs, and Rust deletion-only migration pass");
+assert_true(native.counts.pblang == 1 and native.counts.rust_legacy == 1, "report counts path classes");
+
+let new_rust = P.evaluate_manifest(manifest([
+    map{ path: "src/new_feature.rs", change: "added", added_lines: 10, removed_lines: 0 }
+], [exception("src/new_feature.rs", 20)]));
+assert_false(new_rust.passed, "new Rust file is blocked even with an exception");
+assert_true(has_code(new_rust, "rust.addition_forbidden"), "new Rust blocker is explicit");
+assert_true(has_code(new_rust, "exception.exception.rust_forbidden"), "Rust exception itself is invalid");
+
+let changed_rust = P.evaluate_manifest(manifest([
+    map{ path: "src/compiler.rs", change: "modified", added_lines: 1, removed_lines: 20 }
+]));
+assert_false(changed_rust.passed, "added line in existing Rust is blocked");
+assert_true(has_code(changed_rust, "rust.addition_forbidden"), "Rust line blocker is explicit");
+
+let foreign_missing = P.evaluate_manifest(manifest([
+    map{ path: "runtime/os_bridge.c", change: "modified", added_lines: 4, removed_lines: 0 }
+]));
+assert_false(foreign_missing.passed, "foreign addition needs exception");
+assert_true(has_code(foreign_missing, "foreign.exception_required"), "missing foreign exception is explicit");
+
+let foreign_allowed = P.evaluate_manifest(manifest([
+    map{ path: "runtime/os_bridge.c", change: "modified", added_lines: 4, removed_lines: 0 }
+], [exception("runtime/os_bridge.c", 4)]));
+assert_true(foreign_allowed.passed, "bounded exact host-boundary exception passes");
+assert_true(foreign_allowed.warning_count == 0, "used exception is not reported as stale");
+
+let foreign_over = P.evaluate_manifest(manifest([
+    map{ path: "runtime/os_bridge.c", change: "modified", added_lines: 5, removed_lines: 0 }
+], [exception("runtime/os_bridge.c", 4)]));
+assert_false(foreign_over.passed, "exception line cap is enforced");
+assert_true(has_code(foreign_over, "foreign.line_limit"), "line-cap blocker is explicit");
+
+let malformed_exception = exception("runtime/*.c", 4);
+malformed_exception.reason = "short";
+malformed_exception.removal_plan = "later";
+malformed_exception.review_by = "2026-01-01";
+let malformed = P.evaluate_manifest(manifest([], [malformed_exception]));
+assert_false(malformed.passed, "wildcard, incomplete, expired exception fails closed");
+assert_true(has_code(malformed, "exception.exception.path_wildcard"), "wildcard exception blocker");
+assert_true(has_code(malformed, "exception.exception.expired"), "expired exception blocker");
+
+let reference = map{
+    format: P.MIGRATION_FORMAT, id: "parser-port", legacy_path: "src/parser.rs",
+    pblang_path: "stdlib/selfhost_parser.sapp", stage: "reference",
+    fallback_retained: true, legacy_removed: false, verified_before_retirement: false,
+    behavior_tests: [], regression_tests: [], parity_evidence: ""
+};
+assert_true(P.validate_migration(reference).valid, "reference stage retains legacy implementation");
+assert_false(P.retirement_ready(reference), "reference stage cannot retire");
+
+let parity = map{
+    format: P.MIGRATION_FORMAT, id: "parser-port", legacy_path: "src/parser.rs",
+    pblang_path: "stdlib/selfhost_parser.sapp", stage: "parity",
+    fallback_retained: true, legacy_removed: false, verified_before_retirement: false,
+    behavior_tests: ["tests/semantics/selfhost_parser_test.sapp"],
+    regression_tests: [], parity_evidence: ""
+};
+assert_true(P.validate_migration(parity).valid, "parity stage needs behavior tests and keeps fallback");
+assert_false(P.retirement_ready(parity), "parity stage cannot retire");
+
+let premature = map{
+    format: P.MIGRATION_FORMAT, id: "parser-port", legacy_path: "src/parser.rs",
+    pblang_path: "stdlib/selfhost_parser.sapp", stage: "verified",
+    fallback_retained: false, legacy_removed: true, verified_before_retirement: false,
+    behavior_tests: ["tests/semantics/selfhost_parser_test.sapp"], regression_tests: [],
+    parity_evidence: "not enough"
+};
+assert_false(P.validate_migration(premature).valid, "verified stage cannot remove fallback or omit regressions");
+
+let verified = map{
+    format: P.MIGRATION_FORMAT, id: "parser-port", legacy_path: "src/parser.rs",
+    pblang_path: "stdlib/selfhost_parser.sapp", stage: "verified",
+    fallback_retained: true, legacy_removed: false, verified_before_retirement: false,
+    behavior_tests: ["tests/semantics/selfhost_parser_test.sapp"],
+    regression_tests: ["pblang test tests/semantics"],
+    parity_evidence: "Differential parser output and complete semantic suite match."
+};
+assert_true(P.validate_migration(verified).valid, "verified stage records parity and retains fallback");
+assert_true(P.retirement_ready(verified), "verified record can enter separately reviewed retirement");
+
+let retired = map{
+    format: P.MIGRATION_FORMAT, id: "parser-port", legacy_path: "src/parser.rs",
+    pblang_path: "stdlib/selfhost_parser.sapp", stage: "retired",
+    fallback_retained: false, legacy_removed: true, verified_before_retirement: true,
+    behavior_tests: ["tests/semantics/selfhost_parser_test.sapp"],
+    regression_tests: ["pblang test tests/semantics"],
+    parity_evidence: "Differential parser output and complete semantic suite match."
+};
+assert_true(P.validate_migration(retired).valid, "retired stage requires explicit prior verification");
+
+let lifecycle = P.evaluate_manifest(manifest([], [], [verified]));
+assert_true(lifecycle.passed, "valid migration evidence participates in gate");
+let bad_lifecycle = P.evaluate_manifest(manifest([], [], [premature]));
+assert_false(bad_lifecycle.passed, "invalid migration lifecycle blocks manifest");
+
+let duplicate_exception = P.evaluate_manifest(manifest([], [
+    exception("runtime/a.c", 2), exception("runtime/a.c", 3)
+]));
+assert_false(duplicate_exception.passed, "duplicate exception path is blocked");
+assert_true(has_code(duplicate_exception, "exception.duplicate_path"), "duplicate path blocker is explicit");
+
+let bad_change = P.evaluate_manifest(manifest([
+    map{ path: "../bad.sapp", change: "added", added_lines: 1, removed_lines: 0 },
+    map{ path: "stdlib/bad.sapp", change: "deleted", added_lines: 1, removed_lines: 2 }
+]));
+assert_false(bad_change.passed, "malformed change records fail closed");
+assert_true(has_code(bad_change, "manifest.change.path"), "unsafe change path blocker");
+assert_true(has_code(bad_change, "manifest.change.deleted_added"), "inconsistent line counts blocker");
+
+let too_many_changes = [];
+let cap_i = 0;
+while cap_i < 10001 {
+    array_push(too_many_changes, map{
+        path: "stdlib/generated_" + str(cap_i) + ".sapp",
+        change: "added", added_lines: 1, removed_lines: 0
+    });
+    cap_i = cap_i + 1;
+}
+let capped = P.evaluate_manifest(manifest(too_many_changes));
+assert_false(capped.passed, "change manifest hard cap blocks oversized input");
+assert_true(has_code(capped, "manifest.change_limit"), "change-cap blocker is explicit");
+
+let lines = P.report_lines(new_rust, 8);
+assert_true(len(lines) >= 4 and str_contains(lines[0], "BLOCKED"), "human report exposes blocked status");
+
+print "PASS migration_policy";

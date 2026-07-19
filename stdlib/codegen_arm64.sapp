@@ -11,7 +11,10 @@
 let X = import("stdlib:codegen_x64.sapp");   // reuse le16/le32 byte encoders
 
 fn _app(dst, src) { let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; } return dst; }
-fn _vreg(r) { if r < 0 or r > 3 { throw "codegen_arm64: register out of range 0..3: " + str(r); } return r; }
+// IR registers r0..r7 map to x0..x7 (the AArch64 argument registers). r0 = arg0 / result. The call machinery
+// caller-saves x1,x2,x3 across each bl (so those survive a call, incl. recursion); x0 and x4..x7 are arg/temp
+// (call-clobbered) — a value needed past a call in x0/x4..x7 must be spilled to a local (step 3) first.
+fn _vreg(r) { if r < 0 or r > 7 { throw "codegen_arm64: register out of range 0..7: " + str(r); } return r; }
 fn _w(word) { return X.le32(word); }   // emit a 32-bit instruction word, little-endian
 
 // ── instruction encoders (fields combined by addition; they never overlap) ───────────
@@ -23,6 +26,29 @@ fn mul_rr(a, b) { return _w(0x9B000000 + _vreg(b) * 65536 + 31 * 1024 + _vreg(a)
 fn addi_r(a, imm12) { return _w(0x91000000 + imm12 * 1024 + _vreg(a) * 32 + _vreg(a)); } // add Xa,Xa,#imm12
 fn _subi1(c) { return _w(0xD1000000 + 1 * 1024 + _vreg(c) * 32 + _vreg(c)); }        // sub Xc,Xc,#1
 fn svc0() { return _w(0xD4000001); }                                                 // svc #0
+
+// ── step 2: bitwise / division / comparison (Xa is dst=src1, Xb is src2) ──────────────
+fn and_rr(a, b) { return _w(0x8A000000 + _vreg(b) * 65536 + _vreg(a) * 32 + _vreg(a)); }  // and Xa,Xa,Xb
+fn orr_rr(a, b) { return _w(0xAA000000 + _vreg(b) * 65536 + _vreg(a) * 32 + _vreg(a)); }  // orr Xa,Xa,Xb (Rn=a, not xzr)
+fn eor_rr(a, b) { return _w(0xCA000000 + _vreg(b) * 65536 + _vreg(a) * 32 + _vreg(a)); }  // eor Xa,Xa,Xb
+fn sdiv_rr(a, b) { return _w(0x9AC00C00 + _vreg(b) * 65536 + _vreg(a) * 32 + _vreg(a)); } // sdiv Xa,Xa,Xb (signed, trunc)
+fn _msub(d, n, m, ra) { return _w(0x9B008000 + m * 65536 + ra * 1024 + n * 32 + d); }     // msub Xd,Xn,Xm,Xra
+fn mod_rr(a, b) {                                                                          // Xa = Xa - (Xa/Xb)*Xb via x9
+    let out = _w(0x9AC00C00 + _vreg(b) * 65536 + _vreg(a) * 32 + 9);                       // sdiv x9, Xa, Xb
+    _app(out, _msub(_vreg(a), 9, _vreg(b), _vreg(a)));                                     // msub Xa, x9, Xb, Xa
+    return out;
+}
+fn _invcond(name) {                                    // condition for cset is the INVERSE of the wanted test
+    if name == "eq" { return 1; } if name == "ne" { return 0; }
+    if name == "lt" { return 10; } if name == "ge" { return 11; }
+    if name == "gt" { return 13; } if name == "le" { return 12; }
+    throw "codegen_arm64: unknown condition '" + name + "'";
+}
+fn cmp_set(a, b, cond) {                               // Xa = (Xa <cond> Xb) ? 1 : 0
+    let out = _w(0xEB000000 + _vreg(b) * 65536 + _vreg(a) * 32 + 31);   // cmp Xa,Xb (subs xzr,Xa,Xb)
+    _app(out, _w(0x9A9F07E0 + _invcond(cond) * 4096 + _vreg(a)));       // cset Xa,cond
+    return out;
+}
 
 // conditional compare-and-branch; off is a signed instruction count (×4 bytes). cbz/cbnz
 // carry a SIGNED 19-bit offset; guard against overflow so a huge loop body can't silently
@@ -109,7 +135,14 @@ fn compile_ir(ir) {
         else if op == "add" { _app(code, add_rr(ins[1], ins[2])); }
         else if op == "sub" { _app(code, sub_rr(ins[1], ins[2])); }
         else if op == "mul" { _app(code, mul_rr(ins[1], ins[2])); }
+        else if op == "movr" { _app(code, _mov_rr_raw(_vreg(ins[1]), _vreg(ins[2]))); }
         else if op == "addi" { _app(code, addi_r(ins[1], ins[2])); }
+        else if op == "and" { _app(code, and_rr(ins[1], ins[2])); }
+        else if op == "or" { _app(code, orr_rr(ins[1], ins[2])); }
+        else if op == "xor" { _app(code, eor_rr(ins[1], ins[2])); }
+        else if op == "div" { _app(code, sdiv_rr(ins[1], ins[2])); }
+        else if op == "mod" { _app(code, mod_rr(ins[1], ins[2])); }
+        else if op == "cmp" { _app(code, cmp_set(ins[1], ins[2], ins[3])); }
         else if op == "loop" { _app(code, _emit_loop(_vreg(ins[1]), compile_ir(ins[2]))); }
         else if op == "ifnz" { _app(code, _emit_ifnz(_vreg(ins[1]), compile_ir(ins[2]), compile_ir(ins[3]))); }
         else if op == "syscall" { _app(code, _syscall_op(ins[1], ins[2])); }
@@ -142,7 +175,7 @@ fn elf64_exec(code) {
     _app(out, X.le16(0));            // e_shnum
     _app(out, X.le16(0));            // e_shstrndx
     _app(out, X.le32(1));            // p_type PT_LOAD
-    _app(out, X.le32(7));            // p_flags RWX
+    _app(out, X.le32(5));            // p_flags R|X; generated code has no writable data
     _app(out, X.le64(0));            // p_offset
     _app(out, X.le64(_LOAD));        // p_vaddr
     _app(out, X.le64(_LOAD));        // p_paddr
@@ -173,7 +206,18 @@ fn _bl_off(off) {                                       // bl with signed 26-bit
     return _w(0x94000000 + v);
 }
 
-fn _ucbody(ir) {
+// ── step 3: locals via a stack frame ──────────────────────────────────────────────────
+// A function with N locals reserves a 16-byte-aligned frame: `sub sp,sp,#frame` on entry,
+// `add sp,sp,#frame` before every ret. Local slot s lives at [sp,#8*s]; str/ldr access it.
+// Because the caller-save stp/ldp around each `call` push BELOW sp and restore it, and a
+// callee allocates its own frame lower still, a local survives across calls (incl. recursion).
+fn _frame_bytes(nlocals) { if nlocals <= 0 { return 0; } let b = 8 * nlocals; let r = b % 16; if r != 0 { b = b + (16 - r); } return b; }
+fn _sub_sp(frame) { if frame < 0 or frame > 4095 { throw "codegen_arm64: frame out of imm12 range"; } return _w(0xD10003FF + frame * 1024); } // sub sp,sp,#frame
+fn _add_sp(frame) { return _w(0x910003FF + frame * 1024); }                        // add sp,sp,#frame
+fn _str_local(reg, slot) { return _w(0xF90003E0 + slot * 1024 + _vreg(reg)); }     // str Xreg,[sp,#8*slot]
+fn _ldr_local(reg, slot) { return _w(0xF94003E0 + slot * 1024 + _vreg(reg)); }     // ldr Xreg,[sp,#8*slot]
+
+fn _ucbody(ir, frame) {
     let bytes = [];
     let fixups = [];
     let i = 0;
@@ -189,15 +233,20 @@ fn _ucbody(ir) {
             _app(bytes, _ldp_post(3, 30));             // restore x3,x30
             _app(bytes, _ldp_post(1, 2));              // restore x1,x2
         } else if op == "ret" {
+            if frame > 0 { _app(bytes, _add_sp(frame)); }   // deallocate the frame before returning
             _app(bytes, _ret());
+        } else if op == "store" {
+            _app(bytes, _str_local(ins[2], ins[1]));        // local[slot=ins[1]] = Xreg(ins[2])
+        } else if op == "load" {
+            _app(bytes, _ldr_local(ins[1], ins[2]));        // Xreg(ins[1]) = local[slot=ins[2]]
         } else if op == "loop" {
-            let sub = _ucbody(ins[2]);
+            let sub = _ucbody(ins[2], frame);
             let base = num_floor(len(bytes) / 4) + 1;  // arm64 loop prefix: cbz (1 instr)
             _app(bytes, _emit_loop(_vreg(ins[1]), sub.bytes));
             _umerge(fixups, sub.fixups, base);
         } else if op == "ifnz" {
-            let st = _ucbody(ins[2]);
-            let se = _ucbody(ins[3]);
+            let st = _ucbody(ins[2], frame);
+            let se = _ucbody(ins[3], frame);
             let then_base = num_floor(len(bytes) / 4) + 1;                          // cbz(1)
             let else_base = num_floor(len(bytes) / 4) + 1 + num_floor(len(st.bytes) / 4) + 1;  // +then+b(1)
             _app(bytes, _emit_ifnz(_vreg(ins[1]), st.bytes, se.bytes));
@@ -253,9 +302,11 @@ fn build_value(ir) {
     return elf64_exec(code);
 }
 
-// compile_unit(funcs, main) — AArch64 native ELF with named bl/ret subroutines.
-fn compile_unit(funcs, main) {
-    let mainr = _ucbody(main);
+// compile_unit_code(funcs, main) — raw AArch64 machine code (main, exit, then bl/ret subroutines
+// with a relocation pass). Split out from compile_unit so the in-pblang interpreter can EXECUTE it
+// (arm64_run starts at word 0); compile_unit just wraps this in an ELF.
+fn compile_unit_code(funcs, main) {
+    let mainr = _ucbody(main, 0);                      // main runs frame-less (exits, never rets)
     let code = mainr.bytes;
     _app(code, _w(0xD2800000 + 93 * 32 + 8));          // movz x8,#93 ; svc (exit r0)
     _app(code, svc0());
@@ -264,12 +315,16 @@ fn compile_unit(funcs, main) {
     let offsets = map{};
     let f = 0;
     while f < len(funcs) {
-        let fb = _ucbody(funcs[f].body);
-        let base = num_floor(len(code) / 4);
+        let frame = _frame_bytes(try funcs[f].locals catch 0);
+        let base = num_floor(len(code) / 4);           // fn label points at the prologue (bl lands here)
         offsets[funcs[f].name] = base;
+        if frame > 0 { _app(code, _sub_sp(frame)); }   // prologue: reserve the local frame
+        let bodybase = num_floor(len(code) / 4);       // body starts after the prologue → fixups anchor here
+        let fb = _ucbody(funcs[f].body, frame);
         _app(code, fb.bytes);
+        if frame > 0 { _app(code, _add_sp(frame)); }   // epilogue for a fall-through return
         _app(code, _ret());
-        _umerge(allfix, fb.fixups, base);
+        _umerge(allfix, fb.fixups, bodybase);
         f = f + 1;
     }
     let k = 0;
@@ -279,8 +334,12 @@ fn compile_unit(funcs, main) {
         _patch_bl(code, fx.pos, offsets[fx.name] - fx.pos);
         k = k + 1;
     }
-    return elf64_exec(code);
+    return code;
 }
 
+// compile_unit(funcs, main) — AArch64 native ELF with named bl/ret subroutines.
+fn compile_unit(funcs, main) { return elf64_exec(compile_unit_code(funcs, main)); }
+
 export movz_imm16, add_rr, sub_rr, mul_rr, addi_r, svc0, seti_bytes;
-export compile_ir, compile_program, compile_unit, build_value, elf64_exec;
+export and_rr, orr_rr, eor_rr, sdiv_rr, mod_rr, cmp_set;
+export compile_ir, compile_program, compile_unit, compile_unit_code, build_value, elf64_exec;

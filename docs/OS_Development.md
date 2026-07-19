@@ -29,12 +29,12 @@ where those meet real hardware.
 
 | Piece | State | Notes |
 |-------|-------|-------|
-| `stdlib/systems.sapp` (28 fns) | **sketch** | The intended OS-primitive API: `asm_hlt/nop/cli/sti`, `port_out_byte`/`port_in_byte`, `mmio_read32`/`mmio_write32`, `ptr_null`/`ptr_is_null`, `interrupt_disable/enable`, `page_table_entry`, `gdt_kernel_code`/`gdt_kernel_data`, `multiboot_header`, `detect_cpu_features`, `detect_memory_map`, plus byte/buffer/pack helpers. **They model the shapes but do not yet lower to instructions.** |
+| `stdlib/systems.sapp` (28 fns) | **sketch** | The intended OS-primitive API: `asm_hlt/nop/cli/sti`, `port_out_byte`/`port_in_byte`, `mmio_read32`/`mmio_write32`, `ptr_null`/`ptr_is_null`, `interrupt_disable/enable`, `page_table_entry`, `gdt_kernel_code`/`gdt_kernel_data`, `multiboot_header`, `detect_cpu_features`, `detect_memory_map`, plus byte/buffer/pack helpers. **They model the shapes; instruction lowering is a separate backend contract.** |
 | Byte/buffer primitives | **today** | `buffer_new`, `buffer_from/to_string`, `buffer_to/from_hex`, `pack_u`/`unpack_u`, `str_to_bytes`/`bytes_to_str` — real, and the basis for driver/struct (de)serialization. |
 | `pblang-ctranspiler` (AST → C99) | **today (hosted)** | Emits C with a runtime header (`pblang_rt.h`). Today it targets a hosted runtime; a **freestanding** mode is the key enabler for OS-dev (see [§4](#4-the-compilation-path)). |
 | `pblang-llvm` (LLVM IR) | **today (prototype)** | Text LLVM IR → clang. A second viable freestanding route. |
 | `pblang-cranelift` (JIT/AOT) | **today** | Native object emission; relevant for AOT, less so for freestanding kernels initially. |
-| FFI (`pblang-ffi`) | **today** | C ABI calls — useful for linking against existing freestanding C (bootloader shims, asm stubs). |
+| FFI (`pblang-ffi`) | **today** | C ABI calls — useful for linking against existing freestanding C (bootloader shims, asm routines). |
 
 **Takeaway:** the *vocabulary* of OS-dev is sketched in `systems.sapp`, and pblang
 already lowers to C and LLVM. The missing pieces are a **freestanding codegen mode**, a
@@ -68,7 +68,7 @@ strict rules — `pblang check stdlib/kernel/*.sapp` runs clean today.
    no host `fs`/`net`, GC optional/replaced).
 3. **Real intrinsics** — `asm_*`, `port_*`, `mmio_*`, interrupts, control registers must
    **lower to actual instructions** (inline asm in the C/LLVM backend), replacing the
-   current `systems.sapp` stubs. This is where `systems.sapp` graduates from sketch to
+   current `systems.sapp` sketch layer. This is where `systems.sapp` graduates from sketch to
    contract.
 
 ---
@@ -123,9 +123,9 @@ Each phase is gated the pblang way: locked by tests (QEMU smoke tests + a new
 
 ## 6. Honesty about scope
 
-OS-dev is the **hardest** item on the roadmap and the furthest from done:
+OS-dev is the **hardest** item on the plan and the furthest from complete:
 
-- The current `systems.sapp` functions are **stubs that model the API** — they let you
+- The current `systems.sapp` functions are **contracts that model the API** — they let you
   write OS-shaped pblang and reason about it, but running them does nothing to hardware.
 - There is **no freestanding codegen yet**; that backend mode is the gating work.
 - The kernel runtime (allocator, no-GC subset, panic handler) does not exist yet.

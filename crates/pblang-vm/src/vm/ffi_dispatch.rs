@@ -71,7 +71,7 @@ pub(super) unsafe fn dispatch_ffi(
     // We encode types as i=integer/bool/ptr, d=double, s=string, v=void.
     // Supported shapes: explicit list keeps trampoline count bounded.
     let bytes = sym.as_bytes();
-    let get_err = |e: libloading::Error| format!("{e}");
+    let get_err = |e: libloading::Error| format!("symbol {sym:?} not found in loaded library: {e}");
     match key {
         // 0-arg returns
         "->i" => {

@@ -1,0 +1,319 @@
+// stdlib/product_health.sapp -- deterministic health contracts for pblang products.
+//
+// Product modules publish bounded checks through this library. PBIDE, pbAI, pbOS and
+// pb-mcp-server can then consume the same versioned shape without sharing mutable state,
+// probing the network, or interpreting product-specific status strings.
+
+fn _text(value, fallback, limit) {
+    let out = str(value ?? fallback);
+    if len(out) > limit { out = str_slice(out, 0, limit); }
+    return out;
+}
+
+fn _status(value) {
+    let s = str_lower(str(value ?? "unknown"));
+    if s == "ready" or s == "healthy" or s == "pass" or s == "passed" or s == "ok" or s == "running" or s == "active" { return "ready"; }
+    if s == "degraded" or s == "warn" or s == "warning" or s == "partial" or s == "needs-work" or s == "needs-data" or s == "restarting" { return "degraded"; }
+    if s == "blocked" or s == "failed" or s == "fail" or s == "error" or s == "down" or s == "given_up" { return "blocked"; }
+    return "unknown";
+}
+
+fn _clamp_score(value) {
+    let n = try parse_number(str(value)) catch 0;
+    if n == nil { n = 0; }
+    n = num_floor(n);
+    if n < 0 { return 0; }
+    if n > 100 { return 100; }
+    return n;
+}
+
+fn _contains(values, wanted) {
+    let i = 0;
+    while i < len(values) {
+        if values[i] == wanted { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _bounded_list(values, limit) {
+    if values == nil { return []; }
+    let out = [];
+    let i = 0;
+    while i < len(values) and i < limit {
+        array_push(out, values[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _bounded_text_list(values, limit, text_limit) {
+    let raw = _bounded_list(values, limit);
+    let out = [];
+    let i = 0;
+    while i < len(raw) {
+        array_push(out, _text(raw[i], "", text_limit));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check(name, status, detail = "", options = nil) {
+    if options == nil { options = map{}; }
+    let safe_name = _text(name, "", 96);
+    if str_trim(safe_name) == "" { throw "product_health.check: name is required"; }
+    let canonical = _status(status);
+    let required = try options.required catch true;
+    let latency_ms = try options.latency_ms catch nil;
+    let budget_ms = try options.budget_ms catch nil;
+    let within_budget = true;
+    if latency_ms != nil {
+        latency_ms = try parse_number(str(latency_ms)) catch 0;
+        if latency_ms == nil or latency_ms < 0 { latency_ms = 0; }
+    }
+    if budget_ms != nil {
+        budget_ms = try parse_number(str(budget_ms)) catch 0;
+        if budget_ms == nil or budget_ms < 0 { budget_ms = 0; }
+    }
+    if latency_ms != nil and budget_ms != nil and latency_ms > budget_ms { within_budget = false; }
+    if canonical == "ready" and not within_budget { canonical = "degraded"; }
+    let sensitive = (try options.security_sensitive catch false) == true;
+    let evidence = _bounded_text_list(try options.evidence catch [], 32, 160);
+    if sensitive { evidence = []; }
+    return map{
+        format: "pblang.product_health.check.v1",
+        name: safe_name,
+        status: canonical,
+        required: required == true,
+        category: _text(try options.category catch "general", "general", 48),
+        detail: _text(detail, "", 512),
+        latency_ms: latency_ms,
+        budget_ms: budget_ms,
+        within_budget: within_budget,
+        security_sensitive: sensitive,
+        evidence: evidence
+    };
+}
+
+fn _check_score(c) {
+    if c.status == "ready" { return 100; }
+    if c.status == "degraded" { return 60; }
+    if c.status == "unknown" { return 20; }
+    return 0;
+}
+
+fn report(product, version, checks, options = nil) {
+    if options == nil { options = map{}; }
+    if checks == nil { checks = []; }
+    let safe_product = _text(product, "", 96);
+    if str_trim(safe_product) == "" { throw "product_health.report: product is required"; }
+    if len(checks) > 256 { throw "product_health.report: at most 256 checks are allowed"; }
+    let normalized = [];
+    let names = [];
+    let ready = 0;
+    let degraded = 0;
+    let blocked = 0;
+    let unknown = 0;
+    let required_failed = 0;
+    let total_score = 0;
+    let i = 0;
+    while i < len(checks) {
+        let raw = checks[i];
+        let c = check(
+            try raw.name catch "",
+            try raw.status catch "unknown",
+            try raw.detail catch "",
+            map{
+                required: try raw.required catch true,
+                category: try raw.category catch "general",
+                latency_ms: try raw.latency_ms catch nil,
+                budget_ms: try raw.budget_ms catch nil,
+                security_sensitive: try raw.security_sensitive catch false,
+                evidence: try raw.evidence catch []
+            }
+        );
+        if _contains(names, c.name) { throw "product_health.report: duplicate check '" + c.name + "'"; }
+        array_push(names, c.name);
+        array_push(normalized, c);
+        if c.status == "ready" { ready = ready + 1; }
+        else if c.status == "degraded" { degraded = degraded + 1; }
+        else if c.status == "blocked" { blocked = blocked + 1; }
+        else { unknown = unknown + 1; }
+        if c.required and (c.status == "blocked" or c.status == "unknown") { required_failed = required_failed + 1; }
+        total_score = total_score + _check_score(c);
+        i = i + 1;
+    }
+    let score = 0;
+    if len(normalized) > 0 { score = num_floor(total_score / len(normalized)); }
+    let minimum_score = _clamp_score(try options.minimum_score catch 80);
+    let status = "ready";
+    if len(normalized) == 0 { status = "unknown"; }
+    else if required_failed > 0 { status = "blocked"; }
+    else if blocked > 0 or unknown > 0 or degraded > 0 or score < minimum_score { status = "degraded"; }
+    return map{
+        format: "pblang.product_health.report.v1",
+        product: safe_product,
+        version: _text(version, "unknown", 64),
+        status: status,
+        score: score,
+        minimum_score: minimum_score,
+        ready: ready,
+        degraded: degraded,
+        blocked: blocked,
+        unknown: unknown,
+        required_failed: required_failed,
+        checks: normalized,
+        capabilities: _bounded_text_list(try options.capabilities catch [], 64, 96),
+        dependencies: _bounded_list(try options.dependencies catch [], 64),
+        policy: "required checks fail closed; optional failures degrade; inputs and output text are bounded"
+    };
+}
+
+fn dependency(name, product_report, required = true) {
+    let r = try product_report catch map{};
+    let status = _status(try r.status catch "unknown");
+    return map{
+        format: "pblang.product_health.dependency.v1",
+        name: _text(name, "unknown", 96),
+        product: _text(try r.product catch name, "unknown", 96),
+        version: _text(try r.version catch "unknown", "unknown", 64),
+        status: status,
+        score: _clamp_score(try r.score catch 0),
+        required: required == true
+    };
+}
+
+fn portfolio(reports, options = nil) {
+    if reports == nil { reports = []; }
+    if options == nil { options = map{}; }
+    if len(reports) > 128 { throw "product_health.portfolio: at most 128 reports are allowed"; }
+    let products = [];
+    let rows = [];
+    let ready = 0;
+    let degraded = 0;
+    let blocked = 0;
+    let unknown = 0;
+    let total_score = 0;
+    let i = 0;
+    while i < len(reports) {
+        let r = reports[i];
+        if (try r.format catch "") != "pblang.product_health.report.v1" { throw "product_health.portfolio: invalid report at index " + str(i); }
+        let product = _text(try r.product catch "", "", 96);
+        if product == "" { throw "product_health.portfolio: report product is required"; }
+        if _contains(products, product) { throw "product_health.portfolio: duplicate product '" + product + "'"; }
+        array_push(products, product);
+        array_push(rows, r);
+        let s = _status(try r.status catch "unknown");
+        if s == "ready" { ready = ready + 1; }
+        else if s == "degraded" { degraded = degraded + 1; }
+        else if s == "blocked" { blocked = blocked + 1; }
+        else { unknown = unknown + 1; }
+        total_score = total_score + _clamp_score(try r.score catch 0);
+        i = i + 1;
+    }
+    let score = 0;
+    if len(rows) > 0 { score = num_floor(total_score / len(rows)); }
+    let status = "ready";
+    if len(rows) == 0 { status = "unknown"; }
+    else if blocked > 0 { status = "blocked"; }
+    else if degraded > 0 or unknown > 0 { status = "degraded"; }
+    return map{
+        format: "pblang.product_health.portfolio.v1",
+        name: _text(try options.name catch "pblang-ecosystem", "pblang-ecosystem", 96),
+        status: status,
+        score: score,
+        ready: ready,
+        degraded: degraded,
+        blocked: blocked,
+        unknown: unknown,
+        reports: rows,
+        policy: "aggregate only versioned product-health reports; blocked products block the portfolio"
+    };
+}
+
+fn release_gate(product_report, minimum_score = 80) {
+    let r = try product_report catch map{};
+    let threshold = _clamp_score(minimum_score);
+    let reasons = [];
+    if (try r.format catch "") != "pblang.product_health.report.v1" { array_push(reasons, "invalid report format"); }
+    if (try r.required_failed catch 1) > 0 { array_push(reasons, "required checks failed"); }
+    if _clamp_score(try r.score catch 0) < threshold { array_push(reasons, "score below " + str(threshold)); }
+    if _status(try r.status catch "unknown") == "blocked" { array_push(reasons, "product status is blocked"); }
+    return map{
+        format: "pblang.product_health.release_gate.v1",
+        product: _text(try r.product catch "unknown", "unknown", 96),
+        passed: len(reasons) == 0,
+        score: _clamp_score(try r.score catch 0),
+        minimum_score: threshold,
+        reasons: reasons
+    };
+}
+
+fn transition(previous, current) {
+    let a = try previous catch map{};
+    let b = try current catch map{};
+    if (try a.product catch "") != (try b.product catch "") { throw "product_health.transition: reports must describe the same product"; }
+    let before = _clamp_score(try a.score catch 0);
+    let after = _clamp_score(try b.score catch 0);
+    let direction = "unchanged";
+    if after > before { direction = "improved"; }
+    else if after < before { direction = "regressed"; }
+    let old_status = map{};
+    let old_checks = try a.checks catch [];
+    let i = 0;
+    while i < len(old_checks) { old_status[str(old_checks[i].name)] = old_checks[i].status; i = i + 1; }
+    let changed = [];
+    let new_checks = try b.checks catch [];
+    let j = 0;
+    while j < len(new_checks) {
+        let c = new_checks[j];
+        let was = try old_status[str(c.name)] catch "missing";
+        if was != c.status { array_push(changed, map{ name: c.name, before: was, after: c.status }); }
+        j = j + 1;
+    }
+    return map{
+        format: "pblang.product_health.transition.v1",
+        product: _text(try b.product catch "unknown", "unknown", 96),
+        direction: direction,
+        score_delta: after - before,
+        status_before: _status(try a.status catch "unknown"),
+        status_after: _status(try b.status catch "unknown"),
+        changed_checks: changed
+    };
+}
+
+fn report_lines(product_report, limit = 12) {
+    if limit == nil or limit < 2 { limit = 2; }
+    let r = try product_report catch map{};
+    let lines = [
+        str(try r.product catch "unknown") + " " + str(try r.status catch "unknown") + " score=" + str(try r.score catch 0),
+        "checks ready=" + str(try r.ready catch 0) + " degraded=" + str(try r.degraded catch 0) + " blocked=" + str(try r.blocked catch 0) + " unknown=" + str(try r.unknown catch 0)
+    ];
+    let checks = try r.checks catch [];
+    let i = 0;
+    while i < len(checks) and len(lines) < limit {
+        let c = checks[i];
+        array_push(lines, "- " + str(c.name) + " " + str(c.status) + if c.required { " required" } else { " optional" } + " :: " + str(c.detail));
+        i = i + 1;
+    }
+    return lines;
+}
+
+fn portfolio_lines(product_portfolio, limit = 12) {
+    if limit == nil or limit < 2 { limit = 2; }
+    let p = try product_portfolio catch map{};
+    let lines = [
+        str(try p.name catch "pblang-ecosystem") + " " + str(try p.status catch "unknown") + " score=" + str(try p.score catch 0),
+        "products ready=" + str(try p.ready catch 0) + " degraded=" + str(try p.degraded catch 0) + " blocked=" + str(try p.blocked catch 0) + " unknown=" + str(try p.unknown catch 0)
+    ];
+    let reports = try p.reports catch [];
+    let i = 0;
+    while i < len(reports) and len(lines) < limit {
+        let r = reports[i];
+        array_push(lines, "- " + str(r.product) + " " + str(r.status) + " score=" + str(r.score));
+        i = i + 1;
+    }
+    return lines;
+}
+
+export check, report, dependency, portfolio, release_gate, transition, report_lines, portfolio_lines;

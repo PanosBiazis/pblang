@@ -50,9 +50,40 @@
 > `stdlib:project_audit.sapp` now complements it with a pure text/record audit
 > contract for TODO, placeholder, not-implemented, security, reliability, and
 > performance markers. It lets IDE/MCP/pbAI/pbOS tooling prioritize gaps without
-> doing its own unbounded grep or filesystem walk.
+> doing its own unbounded grep or filesystem walk. The same module now exposes
+> `quality_gate(...)`, `backlog(...)`, and `release_readiness(...)`, so bounded
+> audits can become explicit pass / needs-review / blocked release decisions and
+> ordered implementation tasks. Explicit suppression support was added for
+> known fixtures/snapshots (`project-audit:ignore`, suppress paths, or
+> `suppress_test_fixtures`), and every suppression is reported with a reason so
+> false-positive reduction stays auditable. The latest pass adds
+> `compare_reports(...)` and `progress_gate(...)` for before/after audit
+> regression tracking: fixed/new/unchanged findings are counted, and new
+> high/security/reliability/performance findings block by default. The current
+> follow-up extends `stdlib:project_survey.sapp` with action planning:
+> `category_protocols(...)`, `project_improvement_tasks(...)`,
+> `portfolio_action_plan(...)`, and `portfolio_action_lines(...)` turn safe path
+> metadata into ranked tasks with impact/effort/risk, device routes, protocols,
+> algorithms, and verification gates for pblang, pbAI, pbOS, PBIDE, and
+> pb-mcp-server.
+> `stdlib:project_inventory.sapp` and `tools/pbportfolio.sapp` now provide a
+> bounded pblang-only metadata inventory path that feeds those action plans from
+> caller-approved roots without reading file contents, while pruning
+> secret/cache/build locations.
+> `stdlib:project_text_audit.sapp` and `tools/pbaudit.sapp` now provide the
+> explicit safe text-reading bridge: caller-approved roots are inventoried with
+> the same pruning policy, only capped text-like files are read, raw finding
+> lines are not printed by summaries, and `project_audit` quality gates turn
+> real project scans into pass / needs-review / blocked outcomes.
 > Historical snapshots are preserved in place; prefer the newest numbered
 > section when a metric or capability appears in multiple places.
+> The current security-audit follow-up extends that text audit with explicit
+> host-boundary markers for `PBLANG_ALLOW_*` capability escalation, shell
+> process launch, host/browser renderer fallback, wildcard CORS, broad
+> `--allow-all` examples, and Ventoy/external boot-media write targets. The
+> bounded text-audit bridge now also exposes its read-only policy contract, so
+> disks outside the approved project scope can be used as idea sources without
+> becoming accidental write targets.
 
 ---
 
@@ -1058,7 +1089,7 @@ match s.chars().nth(idx) {
 
 Locked by extending `tests/semantics.rs::sort_and_numeric_builtins_pass` with non-ASCII cases: `strcharcodeat("é", 0) == 233` (scalar, not first byte 195), codepoint indexing across a multibyte char (`"aλb"` → idx 1 = 955, idx 2 = 98), and the `strfromcharcode(strcharcodeat("λ", 0)) == "λ"` round-trip. Suites green: `semantics` 189/0/1, `selfhost_drift` 26/0/1, `modules` 28/0, `typeck_compiler` 5/0, `pblang-vm` lib 2/0.
 
-**No remaining items.** Every documented language gap and the string-API consistency nit are closed; the self-host frontier is now purely breadth/perf (run a real stdlib module through `frontend_run` and diff vs the Rust VM; speed up the self-hosted parser to drop the `#[ignore]` on the full-parser drift test).
+**No remaining grammar items.** Every documented language gap and the string-API consistency nit are closed. The full-parser performance gate was resolved on 2026-07-14: the five-snippet Rust oracle passed in 0.96s and a strict pblang-native drift test is default-on. The self-host frontier is now real-module breadth and interpreter execution throughput.
 
 ## 46. Current status snapshot + north-star goals (2026-05-30)
 
@@ -1066,7 +1097,7 @@ Locked by extending `tests/semantics.rs::sort_and_numeric_builtins_pass` with no
 
 **Immediate self-host frontier (breadth/perf, not grammar):**
 1. Run a real `stdlib/*.sapp` module through `frontend_run` and diff output vs the Rust VM.
-2. Speed up the self-hosted parser enough to drop the `#[ignore]` on the full-parser `selfhost_drift` case.
+2. Improve self-hosted interpreter execution throughput; tokenize/parse are sub-millisecond on the measured pipeline while tree-walker execution dominates.
 3. Bootstrap probe — feed `frontend_compile`'s own source through `frontend_run`.
 
 **North-star goals (roadmap, documented honestly as not-yet-shipped):**
@@ -3695,6 +3726,323 @@ Result: focused LLM subset verification passed **3 passed / 0 failed /
 186 filtered out**. The full canonical `.sapp` suite passed **189 passed /
 0 failed / 0 ignored** after the final cross-repo Max training run.
 
+## 182. Pure-pblang tree interpreter compact closures (2026-07-14)
+
+The tree interpreter now uses a private fixed-slot closure representation
+`[tag, params, arity, body, env]`. This replaces repeated string-keyed metadata
+lookups in every zero-, one-, two-, and generic-arity call while preserving the
+public AST and interpreted language behavior. Guard-only `if` metadata and a
+hoisted block statement count remove two additional repeated dispatch costs.
+
+The change is regression-locked for recursion, closure capture and mutation,
+missing/extra arguments, builtin shadowing, argument-before-callee evaluation,
+nested-scope returns, nil returns, and reusable prepared ASTs. The pblang-only
+native self-host interpreter also passed all 28 fixtures.
+
+Five fresh CPU-pinned representation runs measured 4.23-4.70% lower median
+metadata-read time for the array layout. Independent phase-suite runs measured
+the same direction. A scalar return-signal prototype passed focused correctness
+but regressed recursive throughput and was fully reverted. Verification:
+**652/652** semantic tests, **254/254** native codegen smoke cases, all ten
+emulator gates, polyglot control-plane checks, and the broad local competitor
+suite. Evidence is under
+`bench/results/2026-07-14-interpreter-compact-closures/`.
+
+## 181. Complete self-hosted hosted C99 + compact app facade (2026-07-14)
+
+This increment closes two concrete pblang-only gaps without modifying the Rust
+implementation. `stdlib/compiler/ctranspile.sapp` previously emitted only
+function definitions and discarded top-level statements. It now emits complete
+hosted numeric programs, builds optimized executables with argv-only compiler
+invocation, and offers a bounded compile-and-run helper with cleanup. The
+freestanding/kernel profiles remain libc-free and regression-locked.
+
+The default hosted profile preserves f64 arithmetic. Integer lowering is
+available only through an explicit profile because its division semantics
+differ. Size builds add LTO, section GC, and stripping with a portable fallback;
+the measured `fib(32)` size profile was 14,464 bytes versus 15,992 bytes for the
+speed profile on this host.
+
+`stdlib/app.sapp` also exposes compact `cli`, `gui`, `web`, and `fullstack`
+helpers. They delegate to the existing validated facade, so preview behavior,
+localhost/public-bind policy, web hardening, and widget/route limits remain one
+implementation rather than a parallel shortcut.
+
+Verification: **652/652** `.sapp` semantics tests, **254/254** native codegen
+smoke cases, all ten emulator gates, hosted compiler/run/watchdog tests, app
+facade tests, polyglot control-plane benchmark, and the broad local competitor
+suite. Raw evidence and methodology are under
+`bench/results/2026-07-14-selfhost-c99-app/`.
+
+## 175. PBIDE app-run safety contract (2026-07-05)
+
+This pass hardens the PBIDE GUI/web run path without adding Rust code. The goal
+is to keep PBIDE and the desktop responsive when a native GUI example, web app,
+or calculator-style child app is launched from the IDE.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Shared app safety contract | **ADDED** | `stdlib:ide_features.sapp` now exposes `app_run_safety_profile(profile, options)` and `app_run_safety_summary(...)`. |
+| GUI/web watchdog defaults | **ADDED** | Native child apps now have explicit launch mode, timeout, target FPS, max frame count, env vars, gates, and risk notes. GUI defaults to detached guarded 30fps; web apps get a longer guarded timeout and 10fps status budget. |
+| PBIDE launcher integration | **WIRED** | `_run_detached_native_app(...)` now reads the shared safety profile and passes `PBIDE_CHILD_APP`, `PBLANG_GRAPHICS_MAX_MS`, `PBLANG_GRAPHICS_MAX_FRAMES`, and `PBLANG_GRAPHICS_TARGET_FPS` to child processes. |
+| Regression coverage | **EXPANDED** | `ide_features_test.sapp` locks CLI/GUI/web safety profiles and summary text. `pbide_ui_test.sapp` locks the shared safety-profile call and target-FPS env propagation. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+git diff --check -- stdlib/ide_features.sapp editors/ide/pbide.sapp tests/semantics/ide_features_test.sapp tests/semantics/pbide_ui_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md
+```
+
+## 176. PBIDE least-privilege child app launch (2026-07-05)
+
+This pass tightens the previous guarded child-process runner. PBIDE still needs
+host `exec` permission to spawn a GUI/web example, but the launched pblang app
+should not automatically receive `--allow-all`.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Capability contract | **ADDED** | `ide_features.app_run_capability_plan(profile)` records needed child capabilities and explicitly states that exec/ffi/all grants are false by default. |
+| PBIDE child launch | **HARDENED** | `_run_native_app_source(...)` now builds args through `_native_app_run_args(...)` and no longer appends `--allow-all` to run-path or temp-launcher child apps. |
+| Safety summary | **EXPANDED** | `app_run_profile_summary(...)` now includes both the safety profile and capability summary, so Run/Preview output shows the runtime boundary. |
+| Regression coverage | **EXPANDED** | `ide_features_test.sapp` locks capability plans for CLI/GUI/web apps. `pbide_ui_test.sapp` fails if the old `--allow-all` child launch lines return. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+git diff --check -- stdlib/ide_features.sapp editors/ide/pbide.sapp tests/semantics/ide_features_test.sapp tests/semantics/pbide_ui_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md
+```
+
+## 177. PBIDE child env capability guard (2026-07-05)
+
+This pass closes the remaining inherited-environment gap in the native PBIDE
+GUI/web run path. Removing `--allow-all` from child app arguments is not enough
+if the parent terminal was started with `PBLANG_ALLOW_ALL=1`,
+`PBLANG_ALLOW_EXEC=1`, or `PBLANG_ALLOW_FFI=1`; those env fallbacks could still
+make the child process broader than the visible launch command suggests.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Capability env contract | **ADDED** | `ide_features.app_run_capability_plan(profile)` now carries `env_overrides` with `PBIDE_CHILD_CAPS=least-privilege` and `PBLANG_ALLOW_ALL/EXEC/FFI=0`. |
+| POSIX child launch | **HARDENED** | `_run_detached_native_app(...)` now injects the capability env guard into the `env ... timeout ... pblang run ...` launcher path. |
+| Windows child launch | **HARDENED** | The PowerShell `Start-Process` launcher now sets the same env guard before starting the child app. |
+| Regression coverage | **EXPANDED** | `ide_features_test.sapp` locks the shared env override contract. `pbide_ui_test.sapp` locks the PBIDE launcher strings for POSIX and Windows. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+git diff --check -- stdlib/ide_features.sapp editors/ide/pbide.sapp tests/semantics/ide_features_test.sapp tests/semantics/pbide_ui_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md
+```
+
+## 178. PBIDE render device policy (2026-07-05)
+
+This pass continues the PBIDE rendering work in pblang code only. The goal is
+to make the IDE explicit about which device route it is actually using and what
+safe upgrade path exists for faster graphics.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Device policy contract | **ADDED** | `graphics.render_device_policy(profile, options)` reports CPU framebuffer, forced software, or SDL2 GPU-present status, plus safe launch env and next steps. |
+| Honest GPU wording | **LOCKED** | The policy records `gpu_present` separately from `gpu_raster_ui=false`, so PBIDE can recommend GPU-present without claiming full GPU UI rasterization. |
+| PBIDE Management/Settings | **WIRED** | Management -> Graphics and Settings -> Graphics now include `graphics.render_device_policy_status(...)`, launch env, and device next-step lines. |
+| Regression coverage | **EXPANDED** | `graphics_helpers_test.sapp` covers CPU, GPU-present, and forced-software policies. `pbide_ui_test.sapp` locks PBIDE source usage. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/graphics.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/graphics_helpers_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+git diff --check -- stdlib/graphics.sapp editors/ide/pbide.sapp tests/semantics/graphics_helpers_test.sapp tests/semantics/pbide_ui_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md
+```
+
+## 179. PBIDE render startup profiles (2026-07-05)
+
+This pass turns the render device policy into practical startup modes that PBIDE
+can show to users without requiring them to remember every env var.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Startup profile contract | **ADDED** | `graphics.render_startup_profile(mode, profile, options)` exposes `auto`/`fast`/`cpu`/`retro` profiles with deterministic env maps. |
+| Deterministic env lines | **ADDED** | `graphics.render_startup_env_lines(...)` prints stable restart env such as `PBIDE_RENDER_PROFILE=fast PBIDE_GPU_BUILD=1 PBLANG_GFX=sdl2`. |
+| PBIDE Management/Settings | **WIRED** | Graphics rows now show startup profile status and startup env alongside route/device policy and frame/runtime metrics. |
+| Regression coverage | **EXPANDED** | `graphics_helpers_test.sapp` covers fast/cpu/retro profiles. `pbide_ui_test.sapp` locks the PBIDE source wiring. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/graphics.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/graphics_helpers_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+git diff --check -- stdlib/graphics.sapp editors/ide/pbide.sapp tests/semantics/graphics_helpers_test.sapp tests/semantics/pbide_ui_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md
+```
+
+## 175. Project audit security-boundary markers (2026-07-05)
+
+This pass hardens the pblang-native audit layer that feeds PBIDE/pbAI/pbOS/MCP
+status tooling. It does not claim a full external scanner run; it adds concrete
+local rules for the dangerous patterns that have repeatedly mattered in AAP:
+least-privilege child launch, shell-mediated host process calls, external
+renderer fallbacks, wildcard local APIs, and external boot-media write targets.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Capability escalation markers | **ADDED** | `project_audit` detects `PBLANG_ALLOW_ALL=1`, `PBLANG_ALLOW_EXEC=1`, `PBLANG_ALLOW_FFI=1`, and equivalent true-valued allow flags as high-severity security findings. |
+| Host process markers | **ADDED** | Shell-mediated launch patterns such as `bash -lc`, `sh -c`, `cmd /c`, `powershell -command`, and direct `proc_spawn(_wait)` shell calls are medium-severity security findings. |
+| PBIDE/browser host-boundary markers | **ADDED** | Host/external browser renderer fallback wording is now a medium-severity review item instead of disappearing into docs or code. |
+| External boot-media boundary | **ADDED** | Ventoy/external boot-media write/copy/format target lines are high-severity findings; reading those disks for ideas remains allowed through the bounded inventory/text-audit policy. |
+| Marker catalog | **EXPOSED** | `security_policy_markers()` returns the stable marker catalog for PBIDE, MCP, docs, or CI summaries. |
+| Read-only text audit policy | **EXPOSED** | `project_text_audit.audit_policy()` states caller-approved roots, zero writes, read-only external-disk idea sources, and no raw source text in summaries. |
+| Local assistant state pruning | **ADDED** | `project_inventory.should_skip_path(...)` now skips `.claude` and `.codex` paths, so local assistant permission/state files are not read or reported as project findings. |
+| Generated graph output pruning | **ADDED** | `project_inventory.should_skip_path(...)` now skips `graphify-out`, so generated graph reports/caches are not treated as active source/config findings. |
+| Accelerator shell probes | **REMOVED** | `stdlib:accelerator.sapp` no longer uses `bash -c` for `lspci` or `/proc/cpuinfo`; NPU PCI detection spawns `lspci` directly and CPU flags are read through `fs_read`. |
+| Audit precision | **IMPROVED** | FFI policy docs for ``allow_all: true``, `safety.expect(...)` examples, Bend defensive unbounded-thread bounds, Bend partial-result wording, cache eviction notes, fixed/security changelog wording, and AAP status labels about partial/placeholder implementation work are no longer misreported as active source/security/reliability findings. |
+| PBIDE AI gateway CORS | **HARDENED** | `editors/ide/tools/ai/gateway.sapp` no longer emits wildcard `Access-Control-Allow-Origin: *`; it allows loopback/file IDE origins by default, supports explicit `PB_AI_GATEWAY_ALLOWED_ORIGINS`, rejects disallowed browser origins, and sends `Vary: Origin`. |
+| pblang pb-mcp API CORS | **HARDENED** | The pblang-native `pb-mcp-server/src/server.sapp` now uses the same loopback/file default CORS policy, supports `PB_MCP_ALLOWED_ORIGINS`, rejects disallowed browser origins, and avoids wildcard ACAO for denied requests. |
+| Audit CLI depth | **IMPROVED** | `tools/pbaudit.sapp` now accepts `--backlog-limit=N`, so deeper redacted triage can reveal more source/docs/config tasks without widening file reads or printing raw finding lines. |
+| Audit commands | **HARDENED** | `stdlib:aap_status.sapp`, `tools/pbaudit.sapp`, and `tools/pbaap_status.sapp` no longer recommend `--allow-all`; the bounded audit only needs the default filesystem capability, not exec/ffi/full-capability escalation. |
+| Regression coverage | **EXPANDED** | `project_audit_test.sapp`, `project_inventory_test.sapp`, and `project_text_audit_test.sapp` lock marker severity, fixture suppression, local assistant state pruning, read-only policy, and report policy propagation. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/project_audit.sapp
+./target/debug/pblang --check --via-pblang stdlib/project_text_audit.sapp
+./target/debug/pblang --check --via-pblang stdlib/accelerator.sapp
+./target/debug/pblang run tests/semantics/project_audit_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/project_text_audit_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/accelerator_test.sapp --allow-all
+./target/debug/pblang --check --via-pblang editors/ide/tools/ai/gateway.sapp
+./target/debug/pblang run tests/semantics/pbide_ai_gateway_security_test.sapp --allow-all
+./target/debug/pblang --check --via-pblang editors/ide/tools/mcpservers/pb-mcp-server/src/server.sapp
+./target/debug/pblang run tests/semantics/pb_mcp_server_cors_test.sapp --allow-all
+./target/debug/pblang --check --via-pblang tools/pbaudit.sapp
+./target/debug/pblang run tests/semantics/pbaudit_cli_test.sapp --allow-all
+git diff --check -- stdlib/project_audit.sapp stdlib/project_text_audit.sapp stdlib/accelerator.sapp editors/ide/tools/ai/gateway.sapp editors/ide/tools/mcpservers/pb-mcp-server/src/server.sapp tools/pbaudit.sapp tests/semantics/project_audit_test.sapp tests/semantics/project_text_audit_test.sapp tests/semantics/accelerator_test.sapp tests/semantics/pbide_ai_gateway_security_test.sapp tests/semantics/pb_mcp_server_cors_test.sapp tests/semantics/pbaudit_cli_test.sapp docs/Tooling.md docs/PrjAnalysis.md
+```
+
+## 174. AAP/PBIDE category-health planning (2026-07-05)
+
+This pass continues the cross-project improvement tooling without widening the
+unsafe scan surface. The new contract turns the user's broad pblang / pbAI /
+pbOS / pb-mcp-server / PBIDE improvement request into a metadata-only category
+matrix that PBIDE can show and search.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Category health contract | **ADDED** | `stdlib:project_survey.sapp` exposes `project_category_health(...)`, `portfolio_category_health(...)`, and `portfolio_category_health_lines(...)`. |
+| Priority and risk model | **ADDED** | Every row reports project, category, present/missing status, high-risk markers, priority score, device route, category protocols, required gates, and the next safe step. |
+| PBIDE Management integration | **WIRED** | `ide_features.project_category_health_board(...)` / `project_category_health_lines(...)` expose the matrix to PBIDE, and the native Management panel now has an `AAP category health` row. |
+| Safety boundary | **KEPT** | The matrix uses path metadata only and continues to skip secret/cache/build paths; source/content auditing remains in the explicit bounded text-audit path. |
+| Regression coverage | **EXPANDED** | `project_survey_test.sapp` and `ide_features_test.sapp` lock the pblang contract, PBIDE board, Management search row, GPU-present route text, and AI/MCP category coverage. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/project_survey.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/project_survey_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+git diff --check -- stdlib/project_survey.sapp stdlib/ide_features.sapp editors/ide/pbide.sapp tests/semantics/project_survey_test.sapp tests/semantics/ide_features_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md
+```
+
+## 160. Cross-project readiness category: safe AAP portfolio contract (2026-07-05)
+
+This pass adds a shared, pblang-native readiness layer for the current AAP
+portfolio without unsafe filesystem crawling. It answers the repeated
+cross-project improvement request with a bounded contract: inspect path/name
+metadata only, skip secrets/caches/build outputs, rank useful project focus
+areas, and expose device-route/gate information before any ingestion, tool
+execution, OS/device work, or model training.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Shared readiness | **ADDED** | `stdlib:project_survey.sapp` now exposes `portfolio_readiness(...)` and `portfolio_readiness_lines(...)` for pblang, pbAI, pbOS, PBIDE, and pb-mcp-server. |
+| PBIDE visibility | **WIRED** | `ide_features.project_portfolio_board(...)` and PBIDE Management now show AAP portfolio readiness with scores, missing focus categories, device routes, top priorities, and safety gates. |
+| pbAI-Max intake | **WIRED** | `AAP/ai/pbai` now includes shared portfolio readiness in `max_project_intake_plan(...)` and exposes `max_portfolio_readiness(...)`; raw paths still cannot become training data without `llm_data` sanitization and verifier/benchmark gates. |
+| pbOS roadmap | **WIRED** | `AAP/os-dev/pbos` now carries the same portfolio readiness in `project_intake_plan(...)` while preserving the freestanding/kernel backend gates. |
+| pblang pb-mcp port | **WIRED** | `project_safe_idea_survey` now returns portfolio readiness while remaining read-only and metadata-only. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/project_survey.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/project_survey_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+cd ../../ai/pbai && pblang --check --via-pblang stdlib/pbai_max.sapp
+cd ../../ai/pbai && pblang run tests/semantics/pbai_project_intake_test.sapp --allow-all
+cd ../../os-dev/pbos && pblang run tests/project_intake_test.sapp --allow-all
+cd ../../tools/pblang/pb-mcp-server && pblang run tests/semantics/pb_mcp_port_test.sapp --allow-all
+```
+
+Result: all focused checks above passed. A broader
+`pblang run tests/semantics/pbai_max_test.sapp --allow-all` smoke was started
+but stopped after more than three minutes without output; the changed Max intake
+surface is covered by `pbai_project_intake_test.sapp` plus the self-hosted
+`pbai_max.sapp` check.
+
+## 169. PBIDE Settings tab and CPU render guard (2026-07-05)
+
+This pass adds the requested Settings tab button as a real PBIDE panel and
+addresses a practical CPU-render failure mode in the default minifb backend.
+
+| Item | Status | What changed |
+|---|---|---|
+| Settings tab | **ADDED** | `editors/ide/pbide.sapp` now includes a visible `Settings` panel tab. It has search, list navigation, scrollbar/wheel support, click/Enter activation, and command-palette routing through `panel_settings`. |
+| Settings actions | **ADDED** | The panel exposes theme, style, responsive density, density refresh, Debug/Release mode, watcher, Browser security/search, Files roots, History storage, font/text renderer, command palette, and Graphics/GPU/CPU render status. Rows reuse existing PBIDE handlers instead of duplicating behavior. |
+| CPU framebuffer resize sync | **FIXED** | `pblang-graphics` now synchronizes the minifb CPU framebuffer with the live window size from a shared helper before `gfxsize`, `gfxpresent`, and event polling. This prevents stale-buffer rendering after resize and avoids unbounded framebuffer growth with an explicit 8192x8192 guard. |
+| CPU render visibility | **ADDED** | `stdlib/graphics.sapp` exposes `cpu_render_status(...)`, and PBIDE Settings/Management show the current CPU framebuffer, GPU-present, or forced-software route with rect-fill and framebuffer guard details. |
+| Documentation | **UPDATED** | `docs/PB_IDE.md` now lists Settings as a native panel and records the CPU/GPU render-route surface. |
+| Regression coverage | **EXPANDED** | `ide_features_test.sapp`, `pbide_ui_test.sapp`, and `graphics_helpers_test.sapp` lock Settings command/tab wiring and CPU-render health reporting. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang stdlib/graphics.sapp
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/graphics_helpers_test.sapp --allow-all
+cargo test -p pblang-graphics --lib
+git diff --check -- editors/ide/pbide.sapp stdlib/ide_features.sapp stdlib/graphics.sapp crates/pblang-graphics/src/graphics.rs tests/semantics/ide_features_test.sapp tests/semantics/pbide_ui_test.sapp tests/semantics/graphics_helpers_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md
+```
+
+Result: focused PBIDE Settings / CPU-render checks passed.
+
 ## 159. LLM eval category: teacher-data quality gates (2026-06-19)
 
 This pass adds shared pblang-native quality gates for distillation teacher
@@ -4190,6 +4538,426 @@ bash -n editors/ide/run.sh
 
 Result: focused PBIDE checks passed.
 
+## 165. Native IDE frame scheduler and GPU-present planning (2026-07-04)
+
+This pass adds a pblang-owned frame scheduling contract for PBIDE instead of
+leaving GPU-present optimization as an informal status string. The current
+renderer boundary remains honest: PBIDE still builds UI commands in pblang and
+CPU-rasterizes them, while the SDL2 backend can use GPU-assisted texture
+present. The new layer makes the next renderer work measurable by classifying
+dirty regions, batching draw commands, and exposing safe pblang parallel and
+polyglot/native-kernel lanes.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Dirty region scheduler | **ADDED** | `graphics.dirty_region_plan(...)` clamps dirty rectangles to the frame, converts them to bounded tiles, reports coverage, and chooses `skip-present`, `partial`, or `full-frame` mode. |
+| Render batch planner | **ADDED** | `graphics.render_batch_plan(...)` counts rect/text/line/image work, estimates weight, and flags native rect batching plus text/image cache opportunities. |
+| Frame schedule contract | **ADDED** | `graphics.frame_schedule(...)` combines backend route, dirty plan, batch plan, target frame budget, GPU-present status, parallel preparation, safe lanes, warnings, and backward-compatible fallback policy. |
+| PBIDE integration | **IMPROVED** | `ide_features.ide_render_frame_plan(...)` exposes the schedule as `pbide.render.frame_plan.v1`, and PBIDE Management appends the compact frame summary to the Graphics/GPU row. Opening the Graphics row now shows detailed render-frame lanes/warnings. |
+| Parallel/polyglot readiness | **IMPROVED** | The schedule marks background pblang precompute work separately from future native/polyglot kernels, so optimizations can be staged without changing the UI contract. |
+| Regression coverage | **EXPANDED** | `graphics_helpers_test.sapp` locks dirty-region, batch, frame-schedule, GPU-present, and skip-present behavior. `ide_features_test.sapp` locks the PBIDE render-frame wrapper and readable management lines. |
+| Documentation | **UPDATED** | `docs/PB_IDE.md` now records the explicit frame scheduler and clarifies that it is a scheduler/diagnostics contract, not yet a full GPU UI renderer. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/graphics.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/graphics_helpers_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+```
+
+Result: focused PBIDE frame-scheduler checks passed.
+
+## 174. One-command AAP project status runner (2026-07-05)
+
+This pass adds a single pblang-native status command for the repeated
+multi-project improvement workflow. It composes bounded source/docs audits and
+metadata-only portfolio planning for pblang/PBIDE, pbAI, pbOS, the pblang
+pb-mcp-server port, and the Rust pb-mcp-server without raw source echoing or
+unbounded private-data ingestion.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Shared status library | **ADDED** | `stdlib:aap_status.sapp` exposes `project(...)`, `default_projects()`, `status_report(...)`, and `status_lines(...)`. |
+| One-command CLI | **ADDED** | `tools/pbaap_status.sapp` runs the five-project status from the pblang checkout with source-aware/strict gates, traversal/file caps, optional portfolio output, and nonzero exit only for true `blocked` results. |
+| PBIDE Management integration | **ADDED** | `ide_features.project_aap_status_board(...)` / `project_aap_status_lines(...)` expose the same status contract to PBIDE, and the native Management panel now includes a lazy `AAP project status` row. The row runs the bounded scan only when opened so normal Management redraws stay fast. |
+| Ranked next focus | **ADDED** | `status_report(...)` now returns `next_focus` / `focus_count`, and `status_lines(...)` prints a ranked project/category queue such as security, reliability, performance, implementation, docs, roadmap, config, or tests. This turns the safe multi-project scan into a concrete next-action selector without exposing raw source lines. |
+| Focus classification | **IMPROVED** | Non-blocking source-held roadmap/implementation records are now classified as `roadmap` / `implementation` instead of generic `source-review`; source security/reliability/performance blockers still win when present. |
+| Safe focus drill-down | **ADDED** | `focus_detail(...)` / `focus_detail_lines(...)` return redacted detail for the top-ranked focus and the recommended `pbaudit` follow-up command. `tools/pbaap_status.sapp --drill` and PBIDE Management both use this so the next task is actionable without dumping source text. |
+| Bounded safety | **KEPT** | Text content still flows only through `project_text_audit` caps; output summarizes counts, statuses, and backlog metadata without printing raw source lines or secret values. |
+| Portfolio bridge | **WIRED** | The report can append metadata-only `project_inventory`/`project_survey` action lines so one command gives both health status and next-task direction. |
+| Regression coverage | **ADDED** | `aap_status_test.sapp` builds a small AAP-like fixture tree and verifies blocked/needs-review/passed aggregation, portfolio inclusion, raw-source redaction, and optional portfolio disablement. |
+| Documentation | **UPDATED** | `docs/Tooling.md` documents the CLI and reusable stdlib module. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/aap_status.sapp
+./target/debug/pblang --check --via-pblang tools/pbaap_status.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/aap_status_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+```
+
+Result: focused AAP status runner checks passed.
+
+## 173. Bounded pblang-only project text audit and CLI (2026-07-05)
+
+This pass adds the missing safe bridge between metadata-only project inventory
+and the caller-provided `project_audit` text analyzer. It is intended for
+PBIDE/Watchers/pbAI/MCP workflows that need to scan real project files for
+TODO/not-implemented/security/reliability/performance markers without turning
+the tool into an unbounded private-data reader.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Safe text audit bridge | **ADDED** | `stdlib:project_text_audit.sapp` exposes `collect_text_records(...)`, `audit_roots(...)`, and `audit_lines(...)`. |
+| Bounded reads | **ADDED** | The bridge uses `project_inventory` first, skips sensitive/cache/build paths, accepts only text-like files, caps file count and file bytes, and skips unreadable/oversized files. |
+| Redacted output | **ADDED** | `audit_lines(...)` prints project status, counts, recommendations, and backlog path/line/kind/severity without echoing raw source or secret values. |
+| Strict/default policy | **ADDED** | Default fixture suppression keeps synthetic test secrets/panics from blocking fixture scans while still reporting roadmap review findings; strict mode can disable fixture suppression for real blocking checks. |
+| Audit precision | **FIXED** | The performance/reliability/security heuristics no longer flag safe `factorial(...)` declarations/exports, `headroom`, `Zoom`, `changes`, tokenizer/tokens docs, path examples, safe key-name policy, runtime token variables, or ordinary intentional `try ... catch nil` fallbacks as findings; explicit `O(n!)` / factorial-time / can-hang/deadlock / silent-error / real leaked-secret wording still triggers those classes. |
+| Secret-scan precision | **FIXED** | `secscan.detect_secrets(...)` no longer treats path-like mixed-case identifiers containing `/` as generic high-entropy secrets, while preserving GitHub/AWS/JWT/Slack/private-key detection and normal high-entropy token detection. |
+| Inventory root handling | **FIXED** | `project_inventory.should_skip_path(...)` now accepts caller-approved `.` and `..` roots instead of pruning them as hidden names, so `pbaudit .` and local project scans produce records. Sensitive child paths such as `.git`, `.ssh`, `target`, and token/secret-like names remain pruned. |
+| Fixture/docs suppression | **IMPROVED** | Benchmark/demo/test unwraps can be suppressed when `suppress_test_fixtures` is enabled, resolved historical `**Fixed**` lines in analysis/changelog-style docs are reported as suppressions instead of active blockers, and explicit `Historical snapshot` / `SUPERSEDED / HISTORICAL` markdown/text docs are skipped by default as archived history rather than active backlog. |
+| Benign docs guidance | **IMPROVED** | Documentation-only guidance such as "prefer explicit error handling over `.unwrap()`", bounded/unbounded channel descriptions, deadlock diagnostics, and timeout/prevention wording no longer becomes a high-severity active finding. The scanner still flags actual source panic/unwrap/OOM/deadlock markers. |
+| CLI tool | **ADDED** | `tools/pbaudit.sapp` runs the bounded text audit from the command line with `--project`, depth/entry/file/byte/finding caps, and nonzero exit on blocked quality gates. |
+| PBIDE Management wrapper | **ADDED** | `ide_features.project_text_audit_board(...)` / `project_text_audit_lines(...)` expose the same report to native Management with redacted summaries and searchable status. |
+| Regression coverage | **ADDED** | `project_text_audit_test.sapp` verifies text-like filtering, `.ssh`/`target` pruning, default fixture suppression, strict blocking, and redacted summaries that do not print raw secret tokens. |
+| Documentation | **UPDATED** | `docs/Tooling.md`, `docs/PB_IDE.md`, and this analysis file document the safe audit flow and its limits. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/project_text_audit.sapp
+./target/debug/pblang --check --via-pblang stdlib/project_audit.sapp
+./target/debug/pblang --check --via-pblang stdlib/project_inventory.sapp
+./target/debug/pblang --check --via-pblang stdlib/secscan.sapp
+./target/debug/pblang --check --via-pblang tools/pbaudit.sapp
+./target/debug/pblang run tests/semantics/project_audit_test.sapp --allow-all
+./target/debug/pblang --check --via-pblang tests/semantics/project_text_audit_test.sapp
+./target/debug/pblang run tests/semantics/project_text_audit_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/project_inventory_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/secscan_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+```
+
+Result: focused project text-audit checks passed.
+
+## 172. Bounded pblang-only project inventory and portfolio CLI (2026-07-05)
+
+This pass makes the cross-project action planner runnable against real local
+folders without unsafe file-content ingestion. The new inventory layer walks
+directory/file names only, skips sensitive/cache/build paths, caps traversal, and
+feeds the existing `project_survey` action planner.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Metadata-only inventory | **ADDED** | `stdlib:project_inventory.sapp` exposes `inventory_roots(...)`, `inventory_paths(...)`, and `inventory_lines(...)`. It uses `fs_listdir` only, never `fs_read`, and returns `pblang.project_inventory.report.v1`. |
+| Sensitive/build pruning | **ADDED** | The walker skips `.git`, `.ssh`, `.cache`, `target`, `node_modules`, `build`, `dist`, `bin`, `obj`, key/certificate names, token/password/secret-like paths, and all paths rejected by `project_survey.sensitive_path(...)`. |
+| Bounded traversal | **ADDED** | Callers can cap depth, total records, and children per directory. The report records skipped count and truncation status. |
+| Portfolio bridge | **ADDED** | `portfolio_action_from_roots(...)` runs the inventory and then produces a ranked five-project action plan for pblang, pbAI, pbOS, PBIDE, and pb-mcp-server. |
+| CLI tool | **ADDED** | `tools/pbportfolio.sapp` prints inventory summaries and ranked portfolio tasks through `pblang run ... --allow-all`, with `--max-depth`, `--max-entries`, `--max-children`, `--limit`, `--lines`, and `--inventory` controls. |
+| Documentation | **UPDATED** | `docs/Tooling.md`, `docs/PB_IDE.md`, and this analysis file now document the safe inventory and CLI flow. |
+| Regression coverage | **ADDED** | `project_inventory_test.sapp` builds a small fixture tree, verifies `.ssh`/`target` pruning, checks that safe project path metadata remains visible, and confirms portfolio action tasks are generated. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/project_inventory.sapp
+./target/debug/pblang --check --via-pblang tools/pbportfolio.sapp
+./target/debug/pblang run tests/semantics/project_inventory_test.sapp --allow-all
+./target/debug/pblang run tools/pbportfolio.sapp --allow-all --max-depth=2 --max-entries=120 --max-children=80 --limit=3 --lines=14 --inventory . ../../ai/pbai ../../os-dev/pbos ../../tools/rust/pb-mcp-server
+```
+
+Result: focused project-inventory and portfolio CLI checks passed.
+
+## 172. PBIDE live render-quality governor (2026-07-05)
+
+This pass continues the PBIDE performance work without claiming a complete GPU
+UI renderer. The existing frame scheduler already reports dirty regions,
+batching, GPU-present route, and adaptive FPS pressure. PBIDE now also has a
+pblang-side render-quality governor that turns live frame counters into direct
+low-risk actions for slow devices.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Render-quality policy | **ADDED** | `ide_features.ide_render_quality_policy(...)` classifies live draw/text counters into `ok`, `watch`, `high`, or `critical` pressure. |
+| Runtime throttle plan | **ADDED** | `ide_features.ide_render_runtime_plan(...)` converts the quality policy into adaptive idle cadence, non-input redraw minimum-gap, input grace window, text-mode, and readable throttle summary. |
+| Practical mitigation hints | **ADDED** | The policy recommends dirty redraw, partial present, idle-present skip, text/layout caching, rectangle batching, hidden-panel deferral, lower target FPS, or bitmap fallback depending on pressure. |
+| Frame-plan bridge | **IMPROVED** | `ide_render_frame_plan(...)` now embeds `quality_policy` and `runtime_plan` plus compact quality/runtime fields. |
+| PBIDE runtime use | **WIRED** | The draw loop stores `state.render_runtime`, stretches idle redraw cadence from the runtime plan, and defers rapid non-input redraws under high/critical pressure while keeping input events immediate with `last_input_ms`. |
+| PBIDE visibility | **IMPROVED** | Management -> Graphics and Settings -> Graphics now show render-quality/runtime summaries beside backend, text-render, event, route, frame, and perf counters. Opening the Graphics row prints readable quality and runtime lines. |
+| Safety boundary | **KEPT** | This is a pblang-side governor over the current renderer route. It does not pretend that PBIDE has a full GPU UI renderer yet. |
+| Regression coverage | **EXPANDED** | `ide_features_test.sapp` locks critical-pressure classification, runtime throttling, and the frame-plan policy bridge. `pbide_ui_test.sapp` locks the draw-loop runtime policy hooks. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+```
+
+Result: focused PBIDE render-governor checks passed.
+
+## 171. Cross-project action planning for pblang, pbAI, pbOS, PBIDE, and pb-mcp (2026-07-05)
+
+This pass continues the multi-project improvement direction without doing unsafe
+raw filesystem ingestion. The existing `project_survey` module already classified
+safe path metadata and produced portfolio readiness. It now also produces ranked
+implementation tasks so PBIDE, pbAI, pbOS, pblang, and pb-mcp tooling can choose
+the next focused improvement slice instead of only listing ideas.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Protocol/algorithm hints | **ADDED** | `project_survey.category_protocols(category)` returns category-specific protocol/algorithm candidates: graphics batching/GPU-present/frame scheduling, AI corpus filtering/eval loops, MCP tool gates, OS capability/syscall/QEMU contracts, browser URL/origin/JS-DOM profiles, database backup/transaction gates, and more. |
+| Per-project action plans | **ADDED** | `project_improvement_tasks(project, records, limit)` turns safe metadata records into ranked project tasks with impact, effort, risk, score, device route, protocols, gates, and planned status. |
+| Portfolio action plan | **ADDED** | `portfolio_action_plan(paths, projects, limit_per_project)` builds a five-project action board for pblang, pbAI, pbOS, PBIDE, and pb-mcp-server. |
+| Human-readable lines | **ADDED** | `portfolio_action_lines(plan, limit)` emits compact Management/pbAI/MCP-friendly summaries for the highest-priority tasks. |
+| PBIDE Management integration | **ADDED** | `ide_features.project_action_board(...)` / `project_action_lines(...)` wrap the shared planner for PBIDE, and the native Management panel now exposes an `AAP portfolio action plan` row that opens the ranked tasks. |
+| Security boundary | **KEPT** | The planner still reads path/name metadata only, skips secret/cache/build paths, and requires focused tests before any task can be called implemented. |
+| Documentation | **UPDATED** | `docs/Tooling.md`, `docs/PB_IDE.md`, and this analysis file now document the action-planning contract. |
+| Regression coverage | **EXPANDED** | `project_survey_test.sapp` now locks graphics/security protocol hints plus portfolio action tasks for pbAI curated data, PBIDE GPU-present rendering, and pb-mcp tool classification. `ide_features_test.sapp` locks the PBIDE action board and Management search row. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/project_survey.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/project_survey_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+```
+
+Result: focused cross-project action-planning checks passed.
+
+## 171. PBIDE examples and Browser tabs parity (2026-07-05)
+
+This pass expands PBIDE examples from single snippets into small project
+workspaces that can open Code, Designer, and Browser context together.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| GUI examples | **ADDED** | `examples/gui_dashboard/` is a bounded micro-GUI dashboard project with `main.sapp`, `screens.sapp`, and README. It is safe to run from PBIDE because it prints an optimized render plan instead of starting an unbounded window loop. |
+| Web examples | **ADDED** | `examples/web_notes_app/` builds deterministic HTML from pblang modules and opens in PBIDE as a web-app example with Browser tabs. |
+| Composite example | **ADDED** | `examples/fullstack_designer_browser/` combines Code tabs, Designer metadata, and Browser preview/reference URLs in one example entry. |
+| Browser tabs | **ADDED** | PBIDE Browser now has editor-style page tabs. Tabs preserve input URL, resolved URL, title, mode, security, Tor flag, scroll, history, reader/page/source/inspect/form state, and render output. |
+| Example metadata | **EXPANDED** | Example entries can now include `browser_urls`, which hydrate Browser tabs without automatically fetching network content. `ide_features.filter_examples(...)` searches those URLs along with titles, code, paths, project roots, and files. |
+| Regression coverage | **EXPANDED** | `pbide_ui_test.sapp` locks Browser tab wiring and new catalog entries, `ide_features_test.sapp` locks URL-search behavior, and `examples_runnable_test.sapp` runs all three new examples plus GUI dashboard screen metadata. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang run examples/gui_dashboard/main.sapp --allow-all
+./target/debug/pblang run examples/gui_dashboard/screens.sapp --allow-all
+./target/debug/pblang run examples/web_notes_app/main.sapp --allow-all
+./target/debug/pblang run examples/fullstack_designer_browser/main.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/examples_runnable_test.sapp --allow-all
+```
+
+Result: focused PBIDE example/browser-tab checks passed.
+
+## 170. PBIDE Safe calculator Designer parity (2026-07-05)
+
+This pass fixes the Safe calculator example preview in PBIDE Designer. The
+previous Designer component was a small symbolic calculator mock, while Run
+launched a richer native GUI from `examples/safe_calculator/gui.sapp`. The
+Designer preset now mirrors that real form instead of showing a different
+application.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Calculator form parity | **FIXED** | `stdlib:ide_features.sapp` now builds the `safe_calculator` preset with the same 860x820 shell, title/subtitle, display, status/memory row, right History panel, and 11-row keypad structure used by the native GUI. |
+| Full control surface | **EXPANDED** | The preset now includes memory buttons, parentheses/backspace, arithmetic buttons, `%`/`mod`/power/sqrt, trig/log/constants/factorial controls, and Theme/History/Clear History/Close actions. |
+| Regression coverage | **EXPANDED** | `ide_features_test.sapp` now fails if the calculator preset drops back to a small mock, loses the native window size, or omits history, memory, scientific, or bottom action controls. |
+| Documentation | **UPDATED** | `docs/PB_IDE.md` and `examples/safe_calculator/README.md` now state that the Designer preview is expected to match the runnable native calculator GUI. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_examples_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_designer_codegen_test.sapp --allow-all
+git diff --check -- stdlib/ide_features.sapp tests/semantics/ide_features_test.sapp docs/PB_IDE.md docs/PrjAnalysis.md examples/safe_calculator/README.md
+```
+
+Result: focused PBIDE Safe calculator Designer parity checks passed.
+
+## 169. PBIDE editor-style file tabs and full example catalog (2026-07-05)
+
+This pass closes the next native-IDE workflow gap: examples and projects should
+open like a normal editor workspace, with visible file tabs and exact paths for
+every file in the loaded project/example.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Editor file tabs | **ADDED** | PBIDE now tracks open files as tab records with path, title, dirty state, preview profile, project root, and project-file list. The Code panel draws a tab strip above the editor and routes tab clicks before caret placement. |
+| Tab-aware editor hit testing | **FIXED** | Code drawing, mouse-to-caret mapping, and editor scrollbar hit testing now start below the file-tab strip so clicking a tab cannot accidentally move the text cursor or start selection drag. |
+| Calculator project files | **EXPANDED** | The Safe calculator example exposes `main.sapp`, `lib.sapp`, `gui.sapp`, and `README.md` as tabs, while keeping Designer hydration and native GUI Run behavior. |
+| Missing examples | **ADDED** | PBIDE's Examples picker now includes the remaining `examples/` projects: tutorials, web app/server, web IDE, data science, ML, memory safety, concurrency/threading, micro GUI, ORM, quantum, AI, plugin/bridge, polyglot, self-host, hello world, and Rust embedding host entries. |
+| Project-file visibility | **ADDED** | Loading an example prints a `project files (...)` list with exact paths, and the Examples picker displays each entry's main path plus file count. |
+| Example search | **IMPROVED** | `ide_features.filter_examples(...)` now searches titles, code, main/run paths, project roots, and file paths. |
+| Regression coverage | **EXPANDED** | `pbide_ui_test.sapp` locks the tab-strip/hit-test/source wiring and new catalog entries; `ide_features_test.sapp` locks example filtering by project/file path. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+```
+
+Result: focused PBIDE file-tab/example-catalog checks passed.
+
+## 168. PBIDE font and calculator Designer/theme polish (2026-07-05)
+
+This pass closes the next practical polish request for PBIDE and the calculator
+example: text should look less strange, the calculator should be available
+visually in the Designer, and the native calculator GUI should support
+Light/Dark mode.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Default text font | **IMPROVED** | `stdlib/graphics.sapp` now resolves `PBIDE_FONT` / `PBLANG_FONT` first, then tries a pblang-owned readable UI font stack such as Inter, Noto Sans, DejaVu Sans, Liberation Sans, Ubuntu, Cantarell, Segoe UI, Calibri, and Arial before falling back to the backend default. |
+| Font diagnostics | **ADDED** | `graphics.text_font_candidates()` and `graphics.text_font_path()` expose the candidate stack and resolved path for tests and Management/debugging surfaces. |
+| Calculator GUI theme | **ADDED** | `examples/safe_calculator/gui.sapp` now has a `Theme` button and Light/Dark palettes for the window, display, keypad, function keys, history panel, and status text while keeping the shared safe parser/history engine. |
+| Designer calculator preset | **ADDED** | `stdlib/ide_features.sapp` adds a reusable `Safe calculator` component preset. Searching `calculator` in the Designer component library inserts a visual calculator layout into the canvas, then the normal Designer code-generation path can emit runnable pblang GUI placeholder code. |
+| Documentation | **UPDATED** | `docs/PB_IDE.md` and `examples/safe_calculator/README.md` now record the font preference change, calculator theme toggle, and Designer component-library integration. |
+| Regression coverage | **EXPANDED** | `graphics_helpers_test.sapp` locks the font candidate/path helpers, `ide_features_test.sapp` locks the calculator Designer preset, and `examples_runnable_test.sapp` checks that the native calculator GUI source keeps the Light/Dark theme toggle. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/graphics.sapp
+./target/debug/pblang --check --via-pblang stdlib/ide_features.sapp
+./target/debug/pblang --check --via-pblang examples/safe_calculator/gui.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/graphics_helpers_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/ide_features_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/examples_runnable_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_designer_codegen_test.sapp --allow-all
+git diff --check -- stdlib/graphics.sapp stdlib/ide_features.sapp examples/safe_calculator docs/PB_IDE.md docs/PrjAnalysis.md tests/semantics/graphics_helpers_test.sapp tests/semantics/ide_features_test.sapp tests/semantics/examples_runnable_test.sapp
+```
+
+Result: focused font/calculator/PBIDE checks passed.
+
+## 167. PyCalculator-derived safe pblang/PBIDE example (2026-07-05)
+
+This pass imports the useful idea from the external `PyCalculator` project into
+pblang without copying its unsafe implementation model. The pblang example is
+calculator/history oriented, but it uses deterministic parsing and a portable
+micro-GUI render plan instead of Python `eval`, hard-coded database credentials,
+or subprocess launch coupling.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| pblang calculator example | **EXPANDED** | `examples/safe_calculator/main.sapp` now uses a shared safe parser for `+`, `-`, `*`, `/`, `^`, `%`/`mod`, decimals, parentheses, constants, unary signs, common functions (`sqrt`, trig, logs, `abs`, `floor`, `fact`), divide/modulo/domain error reporting, history records, and a small `micro_gui` render-plan summary. |
+| Native calculator GUI | **ADDED** | `examples/safe_calculator/gui.sapp` opens a pblang-native graphics window modeled after the Python/Tkinter and desktop-app calculator layouts: display, memory keys, keypad, scientific rows, keyboard input, mouse hit-testing, live status, and scrollable in-memory history. |
+| desktop-apps review | **DONE** | Reviewed the calculator implementations under `AAP/desktop-apps` across Python/Tkinter, Python CLI, C#/Avalonia, Java/Swing, Delphi/Lazarus, and Rust/egui/CLI, then carried their useful common features into the pblang example without importing unsafe `eval`, hard-coded database paths, or framework-specific persistence assumptions. |
+| PBIDE embedded example | **ADDED** | The native IDE Examples picker now includes `Safe calculator`, a compact no-`eval` calculator/history snippet that runs through the same self-host frontend as F5. |
+| Example documentation | **UPDATED** | `examples/safe_calculator/README.md` records the broader desktop-apps review, the native GUI command, and the explicit safety improvements over the Python prototype. |
+| Regression coverage | **EXPANDED** | `pbide_examples_test.sapp` runs the embedded calculator example; `examples_runnable_test.sapp` runs the standalone calculator and checks precedence, power, modulo, scientific functions, divide-by-zero, domain errors, UI-plan output, history count, plus a check-only pass for the native GUI file. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang examples/safe_calculator/main.sapp
+./target/debug/pblang run examples/safe_calculator/main.sapp --allow-all
+./target/debug/pblang --check --via-pblang examples/safe_calculator/gui.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/pbide_examples_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/examples_runnable_test.sapp --allow-all
+```
+
+Result: focused calculator/PBIDE example checks passed.
+
+## 166. Native IDE text-render hot path and diagnostics (2026-07-04)
+
+This pass targets another visible PBIDE rendering cost: text drawing. The IDE
+keeps native anti-aliased text as the default because it fixes the old pixelated
+look, but text is also one of the most frequent draw operations in Code,
+Management, Browser, Files, Problems, and modal panels. The improvement stays
+pblang-side and backward-compatible: cache stable renderer inputs, skip invisible
+text, and expose an adaptive policy instead of silently overworking slow devices.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Font path lookup | **IMPROVED** | `graphics.draw_text_aa(...)` now resolves `PBIDE_FONT` / `PBLANG_FONT` once at module import instead of reading environment variables for every label draw. |
+| Native font cache | **FIXED** | `pblang-graphics` no longer reads the font file and rebuilds `fontdue::Font` for every `gfxdrawtextaa(...)` call; it caches resolved font paths and keeps a bounded loaded-font cache shared by minifb and SDL2 text drawing. |
+| Native glyph cache | **ADDED** | `pblang-graphics` now keeps a bounded cache of rasterized glyph metrics/bitmaps keyed by font path, pixel size, and character, so repeated PBIDE labels/buttons/panels do not call `font.rasterize(ch, px)` every frame. |
+| SDL2 present row-copy | **IMPROVED** | The SDL2 GPU-present path now copies the ARGB framebuffer row-by-row with pitch-aware chunks instead of doing division/modulo for every pixel during texture upload; backend/profile diagnostics expose `present_copy`. |
+| SDL2 event pump cache | **IMPROVED** | The SDL2 backend now creates one `EventPump` per window and reuses it for every `gfxpollevents(...)` call, removing repeated event-pump setup from the input hot path; backend/profile diagnostics expose `event_pump`. |
+| Row-slice rectangle fill | **IMPROVED** | `gfxdrawrect(...)`, `gfxdrawrects(...)`, and SDL2 rectangle drawing now share an overflow-safe clipped row-slice fill kernel instead of nested per-pixel loops; backend/profile diagnostics expose `rect_fill`. |
+| PBIDE border batching | **IMPROVED** | The common `_box(...)` outline helper now sends its four edge rectangles through `_draw_rects(...)` / `Window.rects(...)`, preserving fallback behavior while reducing VM-to-backend calls for Designer widgets, modals, and panel outlines. |
+| Designer grid batching/cache | **IMPROVED** | The Designer canvas dot grid now builds one cached rect list per canvas/density geometry and draws it through `_draw_rects(...)`, so large/high-density canvases avoid one backend call per dot and avoid rebuilding the same geometry every repaint. |
+| Rounded-fill batching | **IMPROVED** | `_fill_round(...)` now routes cached rounded geometry through `_draw_rects(...)`, and legacy card elevation shadows use the same batch path, reducing per-band draw calls across scrollbars, highlights, chips, cards, and modal chrome. |
+| Elevation geometry cache | **IMPROVED** | PBIDE card helpers now cache origin-relative `UIK.elevation(...)` geometry by size/scale and translate it at draw time, cutting repeated pblang-side allocation for panel, modal, command-palette, and management card shadows. |
+| Designer widget primitive batching | **IMPROVED** | Designer badge-card specs are now a stable pblang table instead of a per-widget repaint allocation, and chart bars, document-page guides, and document-table grid placeholders route through `_draw_rects(...)` to reduce VM-to-backend calls on Designer-heavy canvases. |
+| Project audit source gate | **ADDED** | `stdlib/project_audit.sapp` now tags findings by path role (`source`, `docs`, `test`, `config`) and `tools/pbaudit.sapp` defaults to a source-aware quality gate. Historical docs/backlog findings and low-severity source usage notes now surface as `needs-review` instead of blocking builds, while real source high/medium thresholds still fail. `--strict-gate` restores all-role blocking for release audits. |
+| HTML placeholder false positive | **FIXED** | The audit no longer treats normal HTML `placeholder="..."` or `placeholder='...'` attributes as incomplete implementation markers, which keeps pbAI/PBIDE website text fields from looking like TODO/stub work. A regression in `project_audit_test.sapp` locks this behavior. |
+| Source test-region precision | **ADDED** | Rust-style `#[cfg(test)] mod tests` regions inside source files are now suppressible when `suppress_test_fixtures` is enabled, so test-only `unwrap()` assertions in repos like `pb-mcp-server` no longer appear as production reliability blockers. |
+| Defensive timeout docs precision | **FIXED** | Source doc comments that describe timeout protection, such as "preventing hanging operations" and "timeout enforcement", no longer appear as performance blockers. Explicit "may hang"/"unbounded"/"O(n!)" risk markers still trigger performance findings. |
+| Text policy contract | **ADDED** | `graphics.text_render_plan(...)` reports native-AA, forced bitmap, bitmap fallback, and slow-frame bitmap hot-path recommendations from renderer profile, frame budget, draw timing, and text-call counts. |
+| Readable status | **ADDED** | `graphics.text_render_status(...)` provides the Management/diagnostic string for renderer, budget, average draw time, text calls, shape-cache size, native font-cache counters, and native glyph-cache counters. |
+| Blank text skip | **IMPROVED** | PBIDE `_dt(...)` now returns before shaping/rasterization for empty or whitespace-only text, cutting useless AA/bitmap calls from clipped rows and blank labels. |
+| Runtime counters | **ADDED** | PBIDE resets per-frame text counters before `_draw(...)`, records calls/skips/AA/bitmap counts into `state.perf`, and includes text counts in `_perf_summary(...)`. |
+| Management visibility | **IMPROVED** | Management -> Graphics now shows the text-render policy next to backend route, frame schedule, draw timing, parallel lane, and polyglot lane. |
+| Strict graphics lint | **FIXED** | The scoped `pblang-graphics` clippy gate now passes with SDL2 after cleaning the graphics crate doc header, the `pblang-ir` dependency doc continuation, and local allowances for stable backend text entry points with fixed public/builtin argument shape. |
+| Regression coverage | **EXPANDED** | `graphics_helpers_test.sapp` locks text-render plan/status behavior. `pbide_ui_test.sapp` locks PBIDE source guards for blank-text skip, per-frame counters, and Management text policy reporting. |
+
+Verification:
+
+```sh
+./target/debug/pblang --check --via-pblang stdlib/graphics.sapp
+./target/debug/pblang --check --via-pblang editors/ide/pbide.sapp
+./target/debug/pblang run tests/semantics/graphics_helpers_test.sapp --allow-all
+./target/debug/pblang run tests/semantics/pbide_ui_test.sapp --allow-all
+cargo check -p pblang-graphics
+cargo check -p pblang-graphics --features sdl2
+cargo test -p pblang-graphics --lib
+cargo clippy -p pblang-graphics --features sdl2 -- -D warnings
+cargo build -p pblang --features pblang-graphics/sdl2
+```
+
+Result: focused PBIDE text-render checks passed.
+
 ## 162. Native IDE click targets and graphics backend check (2026-07-03)
 
 This pass expands PBIDE's invisible button hit areas without changing the visual
@@ -4247,6 +5015,316 @@ git diff --check -- editors/ide/pbide.sapp tests/semantics/pbide_examples_test.s
 ```
 
 Result: focused PBIDE checks passed.
+
+## 183. Cross-language category evidence and platform/ABI emulator (2026-07-15)
+
+This pass adds two pure-pblang foundations. `stdlib:language_benchmark.sapp`
+generates and executes checksum-equivalent fixtures for 15 languages across
+six independent runtime categories. Its registry is closed to caller-provided
+commands, subprocesses have a 1..300 second bound, repetitions have a 1..20
+bound, unavailable toolchains remain visible, and any timeout, nonzero exit, or
+wrong result fails the benchmark. `bench/language_category_matrix.sapp`
+provides stable pipe-delimited raw evidence rather than a single composite
+score.
+
+`stdlib:platform_emulator.sapp` adds OS/version/architecture resolution for
+Linux, Windows, macOS, Android, iOS, FreeBSD, and WASI. It validates historical
+architecture floors, ABI/executable/libc contracts, same-family backward
+compatibility, virtual-root path normalization, bounded memory/files/output,
+deterministic clock/random services, and fail-closed portable syscall dispatch.
+The profile-to-ISA mapping links to the existing executable conformance tests.
+The documented boundary is userspace/ABI verification, not complete kernel,
+driver, graphics-stack, or proprietary-framework emulation.
+
+On this host the category matrix had **90 rows: 54 passed, 36 unavailable, 0
+failed**. The installed set was pblang, Python, Node, Ruby, Perl, Lua, Tcl, AWK,
+and Bash. Wall time includes process startup. The pblang interpreter median was
+1.736 ms startup, 9.133 ms recursion, 31.681 ms integer loop, 13.260 ms array,
+3.304 ms string, and 6.236 ms hash map. These numbers identify optimization
+targets; they are not native-codegen results or universal language rankings.
+
+The expanded phase suite passed all ten ISA/quantum checks plus the platform
+model. Canonical semantics verification passed **654/654**. Raw samples,
+resource metrics, phase output, and the complete methodology are under
+`bench/results/2026-07-15-language-platform-matrix/`.
+
+## 180. AAP audit precision: status/policy labels are not active source gaps (2026-07-06)
+
+This pass tightens the pblang-native project auditor used by PBIDE/management
+and AAP status reports. The remaining bounded audit output had useful docs
+backlog plus several noisy source-held status strings, such as browser policy
+block messages and source-only gate option names. Those are not implementation
+gaps, security issues, or active roadmap defects.
+
+Fixes:
+
+| Item | Status | What changed |
+|---|---|---|
+| Browser policy text | **FIXED** | `blocked by browser policy` is treated as an enforced safety decision, not a roadmap blocker. |
+| Source gate option names | **FIXED** | `source_only_blockers` and blocker counters are treated as audit/status plumbing. |
+| Roadmap task labels | **FIXED** | `Convert roadmap gaps into tested exit tasks` remains a status label, not an active source finding. |
+| pbOS gap-contract plumbing | **FIXED** | Gap-status helper/rule strings stay out of the active source backlog while the actual phase-0 gap rows remain visible. |
+| Regression coverage | **EXPANDED** | `project_audit_test.sapp` locks the status/policy-label suppressions. |
+
+Verification:
+
+```sh
+./target/debug/pblang run tests/semantics/project_audit_test.sapp --allow-all
+./target/debug/pblang --check --via-pblang stdlib/project_audit.sapp
+```
+
+Result: focused project-audit checks passed.
+
+## 172. Self-hosted VM direct builtin descriptors (2026-07-13)
+
+- Added `stdlib/compiler/vm_builtins.sapp`, a pure-pblang registry shared by
+  self-hosted bytecode codegen and `vm.sapp`. It is intentionally the smaller
+  VM-supported subset rather than the complete host builtin catalog.
+- Direct global calls to supported builtins retain the normal `OP_GET_GLOBAL`
+  opcode and operand but carry an optional private descriptor. The pblang VM
+  consumes that descriptor only when no runtime global shadows the name. Other
+  VMs and PBCK serializers can ignore the metadata and execute unchanged
+  bytecode. First-class builtin values still receive independent mutable maps.
+- `optimizer.sapp` preserves the metadata in copied and recursively optimized
+  chunks. Tests cover top-level and nested call sites, optimizer survival,
+  user-global shadowing, independent aliases, and callee-before-argument
+  evaluation when an argument installs a later shadow.
+- Seven CPU-3-pinned alternating A/B processes each ran six fallback/direct
+  pairs over 10,000 calls. Median direct throughput improved 4.19% for `len`
+  and 4.44% for `bit_shr`; paired ordering controls thermal/frequency drift.
+  Seven separate final processes had 13,500 KiB median peak RSS versus 22,612
+  KiB for the pre-change baseline, a 40.30% reduction. Raw evidence is under
+  `bench/results/2026-07-13-selfhost-vm-direct-builtins/`. This remains a
+  scoped VM-call result, not a universal language ranking.
+
+## 171. Heap shortest paths and shared min-priority queue (2026-07-13)
+
+- Added `stdlib/min_priority_queue.sapp`, a reusable binary min-heap written
+  entirely in pblang. It provides O(log n) push/pop, O(1) peek, deterministic
+  empty behavior, and rejects non-number, NaN, and infinite priorities.
+- Both public Dijkstra implementations now share that queue. The higher-level
+  `graph.dijkstra` changed from an O(V^2+E) scan over an unvisited map to
+  O((V+E) log V), while retaining its historical `999999999.0` sentinel for
+  unreachable declared nodes. Malformed and negative edge weights fail closed.
+- `graph.topological_sort` now uses a head-index queue for O(V+E) behavior, and
+  undirected cycle detection uses an explicit parent stack instead of recursive
+  host calls. Regression coverage includes deep chains, large DAG ordering,
+  unreachable nodes, cycles, and invalid weights.
+- On seven fresh release-runtime processes pinned to logical CPU 3, two
+  checksum-verified shortest-path runs over a 600-edge sparse chain improved
+  from a 443.201 ms median to 5.278 ms: 83.97x throughput and 98.81% lower
+  elapsed time. Median process peak RSS changed from 11,820 to 12,068 KiB
+  (+2.10%). Raw samples and method are in
+  `bench/results/2026-07-13-graph-shortest-path/`; this is an isolated workload,
+  not a universal or cross-language performance claim.
+
+## 172. Pure-pblang lexical lookup and two-argument VM calls (2026-07-14)
+
+The tree interpreter now records an identifier node's lexical environment depth
+on first successful resolution. Repeated reads and assignments use direct map
+indexing for depths 0 and 1 and a bounded parent walk for deeper captures. The
+public AST remains unchanged; private `@ed` metadata follows the interpreter's
+existing immutable-prepared-AST contract. Undefined reads/writes still fail,
+and reusable ASTs, recursion, shadowing, and captured mutation have dedicated
+semantic coverage.
+
+In three long, CPU-pinned final processes, same-process lookup controls improved
+by **2.15x at depth 0**, **2.90x at depth 1**, and **3.52x at depth 2**. Against
+the preceding three-process long-batch baseline, median full execution moved
+from 162.496 to 147.710 ms for `fib18` (9.10% lower), 330.333 to 326.558 ms for
+`choose(15,7)` (1.14% lower), and 6.343 to 5.816 ms for a captured-assignment
+workload (8.31% lower). Wall-clock process variance remains material, so the
+paired lookup controls are the strongest microarchitectural evidence.
+
+The pblang-written bytecode VM now bypasses generic argument-array fill and
+reverse-pop loops only for exact two-argument closure calls. Zero-argument and
+unary experiments were neutral or noisy and remain on the original path. The
+accepted workload median moved from 84.556 to 73.914 ms (12.59% lower), with
+direct, captured, repeated, arity, globals, upvalue, and import-cache semantics
+covered. Complete evidence is under
+`bench/results/2026-07-14-interpreter-vm-cache/`.
+
+## 170. Linear graph traversal and advanced algorithm repair (2026-07-13)
+
+The pure-pblang `graph` and `algorithms_advanced` libraries no longer rebuild
+their queue after every BFS dequeue. Head-index queues make traversal O(V+E),
+and DFS uses constant-time stack mutation; the advanced DFS is iterative to
+avoid call-stack depth limits. On seven pinned processes, three verified BFS
+traversals of a 2,000-leaf star moved from **1592.228 ms** to **13.802 ms**
+(**115.36x**), while median peak RSS moved from **15,624 KiB** to **15,020 KiB**.
+
+The pass also established the first complete runtime suite for all ten advanced
+algorithm exports. It exposed and fixed invalid minified control flow,
+fractional midpoint indices, missing-key leaf crashes, early-visited Dijkstra
+results, and excessive knapsack storage. Dijkstra now uses a binary min-heap,
+supports repeated relaxation, and rejects malformed or negative-weight edges.
+Raw evidence is under `bench/results/2026-07-13-graph-traversal/`; the permanent
+phase metric is `graph_bfs_wide`.
+
+## 169. Portable register IR: constant-time evaluator stack pop (2026-07-13)
+
+The pure-pblang portable register-IR evaluator no longer rebuilds its complete
+value stack after every `popr`. It performs an explicit underflow check and then
+mutates the existing array with `array_pop`. This changes stack draining from
+quadratic copying and repeated allocation to constant work per pop while
+preserving predictable errors.
+
+Seven fresh release processes pinned to CPU 3 ran three complete 2,000-value
+push/drain rounds. The median moved from **1643.439 ms** to **10.910 ms**
+(**150.63x**), and median process peak RSS moved from **11,568 KiB** to
+**10,780 KiB** (**6.81% lower**). LIFO, underflow, and deep-drain regressions
+cover behavior; `portable_ir_stack_push_pop` keeps the workload in the phase
+suite. Raw samples and methodology are under
+`bench/results/2026-07-13-portable-ir-stack-pop/`. This is a scoped portable
+evaluator result, not a claim about every backend or language benchmark.
+
+## 168. Shared native IR: dead pure arithmetic elimination (2026-07-13)
+
+The pblang-only structured DSE pass now removes `add`, `sub`, `mul`, and `addi`
+when backward liveness proves the destination register dead. These operations
+cannot affect IR-visible state without a live result. Stack/local effects,
+syscalls, branch conditions, loop counters, and loop-carried values remain
+conservative dependencies. Tests cover both removal and the live branch/loop
+cases, then compile the result through x86-64, i386, ARM64, and C99.
+
+The pinned loop fixture's optimized body moved from five instructions to one.
+x86-64/i386/ARM64 output fell by 10.0%/11.9%/9.5%, C99 source by 24.1%, and
+seven-run native codegen medians by 19.1-19.5%. The optimizer's own fixture
+median improved 12.45% because later passes process less IR. Full methodology is
+under `bench/results/2026-07-13-shared-ir-dead-arithmetic/`, and the permanent
+phase suite reports `shared_ir_optimize_dead_arithmetic`.
+
+## 167. Pure-pblang VM: indexed and scalar builtin dispatch (2026-07-13)
+
+The self-hosted bytecode VM now builds its builtin membership registry once at
+module load instead of scanning a long string-comparison chain on every
+unresolved global. The registry stores only membership booleans; each builtin
+lookup still creates an independent descriptor, preserving first-class alias
+and mutation behavior.
+
+Normal one-, two-, and three-argument builtin calls now consume scalar stack
+values directly. This avoids the temporary argument-array allocation while
+keeping user closures, raw legacy constants, zero/large arities, and mismatch
+errors on the general path. Tests lock late-name lookup, user shadowing,
+first-class aliases, descriptor independence, three-argument calls, print
+ordering, and unknown globals.
+
+Seven fresh release processes pinned to CPU 3 produced these medians for 10,000
+calls: `len` moved from **215.466 ms** to **207.677 ms** (**3.62% lower**), and
+`bit_shr` from **246.038 ms** to **197.581 ms** (**19.69% lower**). The permanent
+phase suite now reports both workloads. Raw method and metrics are under
+`bench/results/2026-07-13-selfhost-vm-builtins/`; the claim is limited to this
+self-hosted VM path and machine.
+
+## 168. Pure-pblang interpreter: prepared block execution (2026-07-14)
+
+The existing AST preparation pass now records private immutable body arrays and
+declaration bits for `if`, `elif`, `else`, and `while`. Hot recursive branches
+therefore avoid repeated block-shape checks, statement extraction, and lexical
+declaration scans. Declaring blocks still allocate child scopes; non-declaring
+blocks still reuse their parent, and public parser fields remain unchanged.
+
+Two seven-process CPU-pinned A-B-A-B rounds reduced `fib18` execution by
+8.12% and 5.63%, `choose(15,7)` by 6.14% and 5.40%, and end-to-end `fib18` by
+7.27% and 5.97%. The one-time preparation cost rose by 0.61-0.81%, while median
+RSS changed by only 16 KiB. A separate shared return-sentinel design was
+rejected after a 3.78-5.63% regression. Full samples, safety coverage, and
+methodology are under `bench/results/2026-07-14-tree-interpreter-scope-cache/`.
+
+## 165. CLI bare-script dispatch and bounded EOF behavior (2026-07-13)
+
+The host CLI now treats bare `.sap`, `.sapp`, `.bpx`, `.pbck`, and package
+directory arguments as the short form of `pblang run`, including when explicit
+capability flags precede the path. Previously these invocations fell
+through clap's legacy fallback into the REPL. The REPL now checks `read_line`
+for `Ok(0)` and terminates immediately at EOF; banners and prompts are emitted
+only when both stdin and stdout are terminals. Piped pblang remains supported
+and produces only program output. Bounded integration tests cover bare script
+and package execution, closed stdin, piped source, and unknown-command rejection,
+preventing another runaway prompt stream, ignored typo, or orphaned process.
+
+## 166. Pure-pblang interpreter: reusable AST and scalar builtins (2026-07-13)
+
+The tree interpreter now exposes `compile_program(source)` and `eval_ast(ast)`.
+The first validates and returns the self-hosted parser AST; the second rejects
+malformed AST values and executes a prepared tree in a fresh environment. This
+separates front-end and evaluator costs and allows safe repeated execution
+without tokenize/parse work.
+
+Matching one- and two-argument builtins now dispatch through scalar values.
+Common operations such as `len`, `str`, `push`, `map_has`, and string predicates
+no longer allocate an argument array on every interpreted call. Seven pinned
+release processes running 5,000 `len` calls moved from a **64.110 ms** median to
+**61.641 ms**, a **3.85% reduction**. Regression coverage verifies scalar array,
+map, and string builtins, reusable AST execution, and malformed-AST rejection.
+
+Two earlier block-scope caching designs were measured and rejected. Lazy
+metadata was within noise; the first eager annotation produced mixed A-B-A
+results and added a separate tree walk. Neither design remains in production.
+The later accepted design in section 168 instead extends the mandatory AST
+preparation pass and caches both body arrays and declaration bits. Evidence for
+the rejected designs remains under
+`bench/results/2026-07-13-tree-interpreter-builtins/`.
+
+## 165. Pure-pblang interpreter: scalar two-argument calls (2026-07-13)
+
+The self-hosted tree interpreter now keeps two user-call arguments in scalar
+locals and directly binds the exact two-parameter case. This removes one array
+allocation, two pushes, and the generic parameter loop from every matching
+call. Builtins still receive their documented argument array, and generic
+fallbacks preserve missing and extra parameter behavior.
+
+The new permanent `tree_interpreter_choose15_7` phase metric exercises
+two-argument recursion. Seven-process pinned A/B samples were normalized against
+the unchanged one-argument `fib(18)` control in the same process: the median
+workload/control ratio moved from **2.3546** to **2.0842**, an **11.5% reduction**.
+Absolute workload medians moved from 276.72 ms to 227.36 ms, while the control
+also moved by 5.0%, which is why the normalized result is the accepted claim.
+Correctness and raw evidence are under
+`bench/results/2026-07-13-tree-interpreter-apply2/`.
+
+## 164. Shared native IR: inter-block constants and compact x86 increments (2026-07-13)
+
+The pblang-only optimizer now propagates proven register constants across
+unrelated instructions, resolves known non-adjacent `ifnz` branches, substitutes
+known `addi` results, and feeds the result into structured DSE. Unknown branch
+joins keep only constants proven equal on both exits; loops and syscalls use
+conservative invalidation. Recursive `ifnz` gating avoids running this pass for
+loop-only programs. Backend instruction selection now emits compact `inc` for
+`addi r,1` on x86-64 and i386, with exact-byte regressions.
+
+The non-adjacent branch benchmark shrank from 5 to 3 IR instructions, with
+x86-64/i386/ARM64 artifacts reduced by 11.6%/13.3%/11.6% and portable C99 by
+28.0%. Five-run release medians and the honest scope are recorded under
+`bench/results/2026-07-13-shared-ir-constprop/`.
+
+## 163. Shared native IR: control-flow-aware dead stores (2026-07-13)
+
+The pblang-only IR optimizer now performs backward four-register liveness with
+branch unions, loop fixed points, syscall argument barriers, and stack/local
+dependencies. It removes only dead `seti`/`movr` writes. Relative to the prior
+peephole result, codegen medians improved 5.5% on x86-64, 5.8% on i386, and
+9.6% on ARM64; final artifacts are 15–17% smaller than the original kernel.
+The same tests fixed numeric local-slot normalization in the portable evaluator.
+Evidence is under `bench/results/2026-07-13-shared-ir-dse/`.
+
+## 162. Shared native IR: safe structured peepholes (2026-07-13)
+
+The pblang-only register-IR optimizer now applies validated `movr r,r`,
+`seti+addi`, and known-branch cleanups recursively while treating syscalls as
+non-foldable external effects. One shared kernel shrank by 10.4% on x86-64,
+11.0% on i386, and 11.1% on ARM64. Reproducible release metrics are under
+`bench/results/2026-07-13-shared-ir-peepholes/`.
+
+## 161. Pure-pblang interpreter: direct single-parameter calls (2026-07-13)
+
+The tree interpreter's already specialized one-argument call path still looped
+over the complete parameter list. It now directly binds the common exact
+one-parameter case and retains the generic loop for zero/multiple parameters.
+Pinned release A/B medians on `fib(18)` moved from **117.98 ms** to
+**109.63 ms**, a **7.1% reduction**. The bytecode-VM small-arity candidate was
+reverted because it did not clear the benchmark gate. Full evidence is under
+`bench/results/2026-07-13-tree-interpreter-apply1/`.
 
 ## 160. LLM training category: parallel sharded LM-head training (2026-06-15)
 

@@ -1,0 +1,106 @@
+let MEM = import("stdlib:memory_safety.sapp");
+let MEMORY = import("stdlib:memory.sapp");
+let BUDGET = import("stdlib:resource_budget.sapp");
+let DEVICE = import("stdlib:device.sapp");
+let HARDEN = import("stdlib:harden.sapp");
+let SAFETY = import("stdlib:safety.sapp");
+
+fn fail(message) { throw "FAIL " + message; }
+
+// Lifetime cleanup must happen on success and failure, without turning failure
+// into a successful nil value.
+let before_depth = MEM.stats().lifetime_depth;
+let scoped_ok = MEM.scope_result(fn() { return 42; });
+assert(scoped_ok.ok and scoped_ok.value == 42, "scope_result keeps successful value");
+let scoped_err = MEM.scope_result(fn() { throw "boom"; });
+assert(not scoped_err.ok, "scope_result keeps failure state");
+assert(MEM.stats().lifetime_depth == before_depth, "scope_result always restores lifetime depth");
+let scope_throw = try MEM.scope(fn() { throw "boom"; }) catch "caught";
+assert(scope_throw == "caught", "scope propagates failure after cleanup");
+let memory_err = MEMORY.scope_result(fn() { throw "boom"; });
+assert(not memory_err.ok, "memory convenience scope exposes failure result");
+
+// Bounded arenas avoid unbounded parser/device/AI batch growth and can cheaply
+// discard speculative allocations back to a checkpoint.
+let arena = MEM.bounded_arena("bounded-parser", 3, 5);
+let first = MEM.arena_alloc_sized(arena, "header", 2);
+let checkpoint = MEM.arena_checkpoint(arena);
+let second = MEM.arena_alloc_sized(arena, "body", 3);
+let full = MEM.arena_stats(arena);
+assert(full.allocations == 2 and full.used_units == 5, "arena accounts allocation units");
+let quota_err = try MEM.arena_alloc(arena, "overflow") catch "quota";
+assert(quota_err == "quota", "arena rejects unit quota overflow before allocation");
+assert(MEM.arena_rewind(arena, checkpoint) == 1, "arena rewinds speculative allocation");
+assert(MEM.box_read(first) == "header", "checkpoint keeps earlier owner alive");
+let rewound = try MEM.box_read(second) catch "released";
+assert(rewound == "released", "rewind deallocates later owner");
+let remaining = MEM.arena_stats(arena);
+assert(remaining.allocations == 1 and remaining.used_units == 2 and remaining.remaining_units == 3,
+       "arena reports remaining capacity");
+let stale = try MEM.arena_rewind(arena, checkpoint) catch "stale";
+assert(stale == "stale", "arena rejects stale checkpoints");
+MEM.arena_drop_all(arena);
+
+// Resource counters use subtraction-first admission and transactional state.
+let maxq = 9000000000000000;
+let huge = BUDGET.budget("huge", map{ items: maxq });
+let overflow = BUDGET.reserve(huge, BUDGET.usage(map{ items: maxq }), BUDGET.usage(map{ items: 1 }));
+assert(not overflow.accepted and overflow.evaluation.pressure == "blocked",
+       "quantity overflow fails closed");
+let exact = BUDGET.evaluate(huge, BUDGET.usage(map{ items: maxq }));
+assert(exact.allowed and exact.percentages.items == 100, "large percentages avoid multiply-first overflow");
+
+let ledger = BUDGET.ledger(BUDGET.budget("queue", map{ items: 10 }), BUDGET.usage(map{ items: 2 }));
+let reserve_ok = BUDGET.ledger_reserve(ledger, BUDGET.usage(map{ items: 3 }));
+assert(reserve_ok.accepted and ledger.usage.values.items == 5 and ledger.version == 1,
+       "ledger commits accepted reservation");
+let reserve_no = BUDGET.ledger_reserve(ledger, BUDGET.usage(map{ items: 6 }));
+assert(not reserve_no.accepted and ledger.usage.values.items == 5 and ledger.version == 1,
+       "ledger leaves state unchanged after rejection");
+let release_ok = BUDGET.ledger_release(ledger, BUDGET.usage(map{ items: 4 }));
+assert(release_ok.accepted and ledger.usage.values.items == 1 and ledger.version == 2,
+       "ledger release cannot underflow and commits atomically");
+assert(BUDGET.ledger_try_reserve(ledger, map{ items: 8 }), "fast ledger admits bounded raw-map request");
+assert(not BUDGET.ledger_try_reserve(ledger, map{ items: 2 }), "fast ledger rejects over-budget request atomically");
+assert(ledger.usage.values.items == 9, "fast ledger rejection leaves usage unchanged");
+assert(BUDGET.ledger_try_release(ledger, map{ items: 99 }) and ledger.usage.values.items == 0,
+       "fast ledger release saturates at zero");
+assert(not BUDGET.ledger_try_reserve(ledger, map{ itemz: 1 }), "fast ledger rejects unknown metrics");
+
+// Safe device access is deny-by-default and bounded. Raw helpers remain an
+// explicitly trusted compatibility layer.
+let readonly = DEVICE.policy("readonly");
+assert(DEVICE.decide(map{ path: "/proc/version", action: "read", policy: readonly }).allowed,
+       "readonly policy admits finite allowlisted procfs data");
+assert(not DEVICE.decide(map{ path: "/dev/null", action: "write", policy: readonly, bytes: 1 }).allowed,
+       "readonly policy rejects device writes");
+assert(not DEVICE.decide(map{ path: "/sys/../dev/null", action: "read", policy: readonly }).allowed,
+       "device policy rejects traversal");
+let test_policy = DEVICE.policy("device-test");
+assert(DEVICE.decide(map{ path: "/dev/null", action: "write", policy: test_policy, bytes: 16 }).allowed,
+       "explicit write allowlist admits bounded device write");
+assert(not DEVICE.decide(map{ path: "/dev/null", action: "write", policy: test_policy, bytes: 70000 }).allowed,
+       "device policy rejects oversized write");
+assert(DEVICE.safe_discard([1, 2, 3, 4], 4) == 4, "bounded discard writes valid bytes");
+let byte_err = try DEVICE.safe_discard([256], 4) catch "invalid-byte";
+assert(byte_err == "invalid-byte", "device writer rejects invalid byte values");
+assert(str_contains(DEVICE.safe_procfs("/proc/version", 4096), "Linux"),
+       "safe procfs reader enforces exact allowlist and output cap");
+
+// Secret buffers are scrubbed on both callback outcomes.
+let secret = [11, 22, 33, 44];
+let secret_err = HARDEN.with_secret_result(secret, fn(bytes) { throw "failure"; });
+assert(not secret_err.ok and secret == [0, 0, 0, 0], "secret is scrubbed after callback failure");
+let secret_ok_buf = [7, 8, 9];
+let secret_ok = HARDEN.with_secret_result(secret_ok_buf, fn(bytes) { return bytes[0] + bytes[1]; });
+assert(secret_ok.ok and secret_ok.value == 15 and secret_ok_buf == [0, 0, 0],
+       "secret is scrubbed after callback success");
+
+// Result-based indexing distinguishes an in-range nil from an invalid index.
+let nil_item = SAFETY.checked_index([nil], 0);
+assert(nil_item.ok and nil_item.value == nil, "checked index preserves legitimate nil element");
+assert(not SAFETY.checked_index([1], 2).ok, "checked index reports bounds failure");
+let bound_err = try SAFETY.require_bounded_length([1, 2, 3], 2, "batch") catch "bounded";
+assert(bound_err == "bounded", "bounded length rejects oversized work before processing");
+
+print "safety_resource_device_hardening_pass";
