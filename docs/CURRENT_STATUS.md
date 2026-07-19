@@ -1,16 +1,512 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-06-15
-**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 179 Stdlib Modules + **Complete Self-Hosting Compiler (tokenize→parse→compile→RUN, all in pblang)** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
-**Test Suite**: canonical `.sapp` corpus = **189 passed / 0 failed / 0 ignored** via `pblang test semantics` (expands to `tests/semantics --allow-all --quiet --jobs smart`). The Rust `cargo test --test semantics` harness keeps exactly **one** ignored test — `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit; `std::env::set_var` is unsound in multi-threaded programs). The former match-guard parser limitation is **resolved** — `match_guard_pass` and the `:`/`~`-separator variants all pass.
+**Last Updated**: 2026-07-19
+**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 313 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+The latest complete pblang semantic run on 2026-07-19 passed **698/698 tests**
+with zero failures, ignored tests, or filtered tests. The separate release Rust
+semantics harness passed 203 tests with zero failures and one documented
+security ignore; these runner counts are not combined.
+Product suites also passed: pbAI 23/23 (the two training-heavy tests required
+more than 90 seconds), pbOS 17/17, and pb-mcp-server 11/11. The Rust
+`cargo test --test semantics` harness keeps exactly **one** ignored test —
+`os_env_set_pass` (`env_set` was disabled in the v0.5 security audit;
+`std::env::set_var` is unsound in multi-threaded programs).
 
 ---
 
 Canonical status is the top summary and `Test Results` section in this file. Older milestone snapshots below are kept for historical context and may reflect prior counts/plans.
 
-## ⭐ 2026-05-30 — Self-hosting is COMPLETE (the headline)
+## 2026-07-19 - Verified compiler caches and batch direct codegen
 
-The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, compiles, and RUNS** pblang end-to-end, entirely in pblang. `selfhost_frontend.frontend_run(source)` drives source → tokenize → parse → typecheck → codegen → `vm.sapp` bytecode interpreter and returns `{output, locals, globals}`. **Every core language feature self-hosts**: let/const, arithmetic/comparison, logical short-circuit, arrays/maps, `if`/`else if`/inline-`if` expressions, `while`/`for`/`for_in`, `break`/`continue`, functions (recursion + default params), index/member read+assign, `try`/`catch`, ~30 host builtins, module globals, nil-safe `??`/`?.`/`?[`, `match`, `struct`/`enum`, `fn_lit` (closures), member/index callees (`obj.f(args)`, `tbl[i]()`), and `class` + colon-call `obj:method(args)`. **No language gaps remain**; the last consistency item (`strcharcodeat` byte-vs-codepoint alignment) is closed — the self-host frontier is now breadth/perf. Locked by `tests/selfhost_drift.rs` (26 active + 1 ignored perf case) and `tests/typeck_compiler.rs` (5/0). See `docs/PrjAnalysis.md` §§40–45.
+PBCS v2 now persists optimizer fused operands, reads v1 artifacts, validates
+resource budgets and all references, rejects trailing bytes, and fixes u32
+encoding for chunks above 255 entries. Public loader entry points use the
+bounded self-host VM by default.
+
+The self-hosted frontend has an opt-in persistent imported-module cache keyed by
+processed source plus the current compiler/VM revision. Hits verify metadata,
+SHA-256, byte length, and the full PBCS structure. The direct x86-64 backend has
+a PBLang-only multi-file compile session that imports/fingerprints once, compiles
+and validates all jobs before output publication, and reports cache failures
+without changing compile correctness.
+
+Six independent compiler processes measured 445.675 ms median versus 102.972 ms
+for one cold-artifact session (4.33x) and 81.758 ms for verified warm artifacts
+(5.45x). A 300-function imported module measured 128.271 ms uncached, 84.549 ms
+warm (1.52x), and 271.464 ms for its first verified store. The cold store is
+therefore an explicit cost, not hidden as an improvement. Build, all phase
+suites, 698/698 PBLang semantics, and 203/0/1 release Rust oracle tests pass.
+Checked-in bootstrap snapshots and their freshness CI gate remain unimplemented;
+the runtime cache is not represented as a substitute. No Rust code was added.
+
+## 2026-07-18 - Compile/import, C99 modulo, and interpreter dispatch
+
+The direct Linux x86-64 driver now has a PBLang-written, content-addressed
+artifact cache. Its key includes source and backend dependencies; hits validate
+metadata, SHA-256 bytes, size, and ELF64/Linux/x86-64 structure before atomic
+publication. The initial same-turn uncached median moved from 120.057 to
+78.954 ms (34.24% lower). An independently saved run measured 97.660 ms
+uncached and 23.998 ms for a verified warm hit. Cold backend import remains the
+dominant phase and cache hits are not presented as cold-compiler results.
+
+Hosted C99 integer-profile modulo now exposes safe nonzero constants to the C
+optimizer and uses a checked helper for dynamic zero and `LONG_MIN % -1`.
+Literal zero rejects during transpilation. A paired 19-sample run measured
+14.675 ms for the floating profile and 5.915 ms for integer mode (59.69% lower)
+with identical 16,008-byte artifacts. Integer mode remains explicit because it
+does not preserve fractional-number semantics.
+
+The PBLang-written tree interpreter prepares compact safe leaf-binary plans and
+consumes them directly in plain assignments and while conditions. The saved
+same-process loop control measured 170.536 ms optimized versus 223.439 ms with
+plan metadata disabled (23.68% lower). Generic nested expressions, strings,
+short-circuit operations, and control flow retain the prior fallback. This does
+not modify the Rust host VM represented by the broad interpreter benchmark.
+
+The refreshed fixed matrix completed 22 rows, with two explicit Zig-unavailable
+rows and zero failures. Direct x86-64 compile remained 1.32x slower than C in
+that run; runtime medians and all load-sensitive reversals are reported without
+a universal winner claim. PBLang build, phase suites, focused tests, 203/0/1
+release Rust semantics tests, and the canonical 695/695 PBLang suite pass. Raw
+evidence and limitations are under
+`bench/results/2026-07-18-compile-c99-interpreter/`.
+
+## 2026-07-18 - Reproducible cross-language benchmark core
+
+The new pure-PBLang `stdlib:repro_benchmark.sapp` runner uses a fixed internal
+registry for the PBLang interpreter, hosted C99, direct Linux x86-64 codegen,
+C, C++, Rust, Go, Java, C#/Mono, Python, Node.js, and Zig. It bounds repetitions,
+timeouts, output, and temporary state;
+uses random UUID workspaces; rejects nonzero exits and checksum mismatches; and
+records first/cold runs separately from warmed median/p95/raw samples. Release
+artifacts are stripped where supported. Environment, toolchain, wall, CPU,
+peak-RSS, artifact, and correctness evidence remain separate metrics.
+
+The local i7-1195G7 matrix produced 22 successful rows, 2 explicit unavailable
+Zig rows, and no failures. On the one-million-iteration integer fixture, direct
+PBLang x86-64 codegen measured 5.361 ms median versus C at 4.011 ms and hosted
+C99 at 15.386 ms. The 487-byte generated ELF was 96.6% smaller than the
+14,472-byte C artifact. The PBLang interpreter measured 277.461 ms versus Python
+at 126.454 ms. These are measured strengths and optimization gaps, not a
+fastest-language claim. The 22-category ledger explicitly identifies
+partial, conditional, and not-yet-comparable areas instead of fabricating rows.
+The full methodology and raw samples are under
+`bench/results/2026-07-18-reproducible-core-matrix/`.
+
+The direct row is correctness-gated by its PBLang safety certificate, ELF header,
+process result, output bound, and exact checksum. Unsupported hosts remain
+explicitly unavailable. A working example is in
+`examples/repro_codegen_benchmark/`; the project now also has the PBLang-native
+`src/main.sapp` entry declared by `pblang.toml`, so self-hosted `pblang build .`
+has a real entrypoint. All focused benchmark contracts and the canonical
+semantic suite pass: 689/689, with zero failed, ignored, or filtered tests, in
+205.21 seconds and 1,801,672 KiB whole-runner peak RSS. The clean 24-row matrix
+completed in 16.06 seconds with 95,236 KiB process peak RSS. The additional
+six-category interpreter matrix produced 54 passing, 36 unavailable, and zero
+failed rows. No Rust code was
+added.
+
+## 2026-07-18 - Cost-aware hardware and bounded storage routing
+
+The pure-PBLang compute scheduler no longer sends work to CPU threads or a
+registered accelerator from item count alone. Versioned policies now carry
+bounded work, transfer, thread-launch, device-launch, and minimum-useful-work
+hints. Arithmetic saturates at the exact-number ceiling, CPU worker count adapts
+to useful work, and GPU/NPU/SIMD/distributed routes require both a compatible
+registered runtime and enough work to amortize launch plus transfer cost.
+Accelerator failures use the same CPU decision instead of maximum parallelism.
+
+Device arrays, weights, task counts, policy mutation, transfer budgets, and
+storage paths fail closed under hard limits. `storage_read_controlled` keeps
+small batches serial and uses bounded contiguous chunks for larger batches;
+the existing result-only helper remains source-compatible. It bounds path and
+worker metadata, not whole-file bytes returned by the current `fs_read` builtin.
+
+Focused compute/control tests, the new hardware-routing semantic test, runnable
+example, and two correctness-gated benchmarks pass. Nine warm, interleaved local
+samples of the cheap 128-item kernel measured 42.397 ms median for cost-aware
+serial execution and 43.533 ms for forced four-worker execution (about 2.6%
+lower median), with 52.884 and 53.404 ms p95 respectively. These measurements describe this VM/thread
+workload on the recorded i7-1195G7 only; no general language-speed claim is made.
+The canonical eight-worker semantic run passed 685/685 in 265.61 seconds with
+1,727,616 KiB whole-runner peak RSS. No Rust code was added.
+
+## 2026-07-18 - Bounded pure-PBLang thread supervision
+
+The previous `thread.supervisor()` retained timeout values without enforcing
+them, reported every retained handle as alive, let child VMs mutate parent-owned
+maps, and cleared records while claiming workers had been killed. The replacement
+keeps lifecycle state in the parent VM, caps retained records at 1,024, validates
+and clamps deadlines, distinguishes completion/failure/timeout/cancellation, and
+supports deterministic status, waiting, late cleanup, and reaping.
+
+Cooperative cancellation now crosses the VM boundary through a buffered channel
+instead of a non-transferable atomic handle. The child-local token latches the
+signal and reports whether it actually observed cancellation. A successful task
+that ignored a request stays `completed`; a failing task stays `failed`; neither
+is mislabeled as cancelled. `kill_all` remains source-compatible but reports
+`preemptive: false`, while `unreaped` and `detached` expose workers still needing
+cleanup. Blocking native calls still require timeout support or disposable
+process isolation at their own boundary.
+
+The design was informed by timeout/watchdog and supervisor references elsewhere
+in AAP, then reimplemented in PBLang. The focused semantic test, 15 adjacent
+concurrency tests, runnable example, and correctness-gated phase benchmark pass.
+The final canonical suite passes 684/684 in 328.52 seconds with 1,766,092 KiB
+whole-runner peak RSS. No Rust code was added.
+
+## 2026-07-18 - Controlled polyglot, FFI, parallel, and device execution
+
+The PBLang-written thread pool now bounds workers and queued tasks, rejects
+submission after shutdown, creates transferable worker closures through
+top-level factories, and applies immutable worker outcomes to parent-owned task
+state. Parallel successes, failures, status, and priority-ordered results are
+therefore counted consistently. `race` no longer depends on exec-gated sleep
+and terminates when every candidate fails.
+
+`compute.sapp` now distinguishes detected hardware from a registered,
+executable generic runtime. Its versioned policy supports deterministic dry-run
+routing, serial/parallel thresholds, bounded CPU workers, workload-compatible
+accelerators, strict no-fallback mode, and observable CPU fallback.
+`accelerator.sapp` validates runtime kinds and hooks and contains runtime
+failure in a structured dispatch envelope.
+
+Polyglot policies require callable execution runners, enforce language and
+source-size limits in every mode, and retain runner-free report mode. The safe
+FFI control plane uses exact library/symbol allowlists, validates arity/types,
+bounds argument count, and denies raw pointers unless explicitly enabled. It
+only narrows the native host `FfiPolicy`. Focused tests, a runnable example, and
+the correctness-gated benchmark pass. The canonical eight-worker semantic run
+passed 682/682 in 163.68 seconds with 1,698,940 KiB process peak RSS.
+
+## 2026-07-17 - Bounded compiler suggestions and cross-file name resolution
+
+The PBLang-written type checker no longer silently turns an unbound identifier
+into `any`. It emits `undefined-name`, `unknown-field`, or `unknown-variant`
+diagnostics and uses the shared pure-PBLang
+`compiler/diagnostic_suggestions.sapp` engine for optional fix guidance. The
+engine caps names at 128 characters, candidates at 4,096, and edit distance at
+three, de-duplicates candidates, exits distant rows early, and resolves equal
+matches lexically so map iteration order cannot change the result.
+
+Generic builtin lookup now reuses one registry map per type environment instead
+of reconstructing the full map at each identifier. Across seven local samples,
+5,000 isolated legacy rebuild lookups had a 388.6189 ms median and cached
+lookups had a 1.9385 ms median (200.48x). The 128-statement generic-builtin
+typecheck phase measured 6.4327 ms/check median. One full measured process used
+21,056 KiB peak RSS. These figures describe this compiler workload only.
+
+Project compilation now performs a bounded declaration prepass and passes the
+result through the explicit `extern_names` typecheck option. Valid cross-file
+calls remain accepted, but a name absent from every translation unit still
+fails closed. Missing globals inside a protected `try` body remain catchable at
+runtime, and parser-desugared recursive class tables are predeclared before
+their methods are checked. Frontend lint and `stdlib:diagnostics.sapp` share the same bounded
+suggestion policy and fix-it shape. Focused suites, project/parallel compilation,
+and the canonical semantic suite pass, the latter at 681/681. Evidence and raw samples are in
+`bench/results/2026-07-17-bounded-diagnostics/`.
+
+## 2026-07-17 - Bounded one-line application facades
+
+The pure-PBLang `stdlib:app.sapp` facade now exposes compact CLI, GUI, web,
+REST, desktop, full-stack, game, multimedia, database, networking, automation,
+AI, and ML entry points. REST reuses the hardened web framework and desktop
+reuses the real GUI form builder. The new `stdlib:app_domains.sapp` lazy-loads
+the existing game, image processing, database, networking/HTTP, workflow, AI,
+ML, and metrics modules and gives advanced callers their complete APIs through
+`ctx.modules`.
+
+Domain previews are plan-only unless `preview_execute: true` is explicit.
+Actions, names, options, input sizes, step counts, and collected output are
+bounded; only game and automation profiles may repeat. Database, networking,
+and AI execution fails closed without `allow_io: true`. The facade does not
+claim audio/video support: image processing is the only current multimedia
+provider.
+
+Focused adapter/domain tests and the terminating PBIDE-catalog example pass;
+the complete eight-worker semantic regression passed 680/680 with zero
+failures, ignored tests, or filtered tests.
+The seven-sample internal benchmark reduced median plan cost for all seven
+domain profiles from 0.6806 to 0.3296 ms per batch (-51.6%), whole-process time
+from 11.91 to 8.19 seconds (-31.2%), and peak RSS from 207,088 to 149,388 KiB
+(-27.9%) after removing duplicate validation and profile-array allocation. The
+desktop result remained within noise and image p95 regressed, both recorded
+without a performance claim under
+`bench/results/2026-07-17-app-domain-facade/`.
+
+## 2026-07-17 - Executable PBLang-only migration policy
+
+The new pure-PBLang `stdlib:migration_policy.sapp` and
+`tools/pbmigrate.sapp` replace the previous file-extension evidence with a
+bounded, fail-closed change-manifest gate. New Rust files and every added Rust
+line are rejected without an override path. Necessary non-Rust bootstrap,
+system API, ABI shim, and generated-artifact changes require an exact path,
+owner, line cap, verification checks, removal plan, and non-expired review
+date. Unsafe paths, malformed/oversized manifests, duplicate exceptions, and
+invalid migration evidence block the gate.
+
+Migration records enforce the ordered `reference -> parity -> verified ->
+retired` lifecycle. The legacy fallback remains present through verified
+parity and can be removed only in a separate retirement record backed by
+behavior and full regression evidence. This does not claim that the existing
+compiler bootstrap is already Rust-free; it prevents new drift while ports are
+verified incrementally.
+
+Focused policy, lifecycle, CLI, example-manifest, and vision-ledger checks pass.
+The complete eight-worker semantic run passed `679/679` with zero failures,
+ignored tests, or filtered tests. No Rust implementation was added.
+
+## 2026-07-17 - Recursive type grammar, generics, and typed ADTs
+
+The PBLang-written parser now handles canonical, bounded `array<T>`,
+`map<K,V>`, `result<T,E>`, legacy `[T]`, `T?`, and `T!` annotations. Nested
+`>>` tokens are consumed without mutating tokenizer output, so the same token
+array can be parsed repeatedly. Type text is capped at 4,096 bytes and nesting
+at 64 levels; extra generic delimiters produce parser diagnostics.
+
+The self-hosted checker now models `bigint`, `rational`, `decimal`, result,
+non-null, struct, enum namespace, and enum instance types. Struct fields and
+enum payload types survive parser desugaring; generic call arguments and return
+types are substituted recursively; ADT names are predeclared for forward
+struct/enum cross-references. Unknown fields/variants, payload mismatches,
+conflicting generic arguments, non-null violations, and non-exhaustive enum
+matches have structured diagnostics. Field/variant metadata is capped at 4,096
+members before scanning.
+
+All `44/44` self-host tests and the complete `677/677` semantic suite pass with
+zero failures, ignored tests, or filtered tests. Seven fresh CPU-pinned legacy
+samples measured a final median of `0.266436 ms/check`, 13.32% below the first
+recursive-type draft and 7.94% above the prior bounded checker; the latter is
+reported as feature cost. The dedicated 30-sample benchmark reports p50 values
+of 7.1533 ms for 112-statement recursive-type parsing, 7.6194 ms for valid typed
+ADTs, and 6.7209 ms for 96 statements producing 48 deterministic diagnostics,
+at 27,136 KiB peak RSS. Evidence is under
+`bench/results/2026-07-17-selfhost-type-system-parity/`.
+
+This does not establish general performance leadership. Postfix Result
+propagation, richer typo suggestions, generic constraints, and full differential
+parity with the legacy checker remain active work.
+
+## 2026-07-17 - Bounded self-hosted type checking and real frontend analysis
+
+The PBLang-written type checker now tracks lexical bindings and inferred or
+declared types, hoists function signatures, understands scalar and nested-array
+annotations, checks assignments, default values, call arity/arguments, and
+declared returns, and traverses the core collection/access/control-flow AST.
+Malformed ASTs, including recognized nodes with missing/invalid required fields,
+and configurable node/depth exhaustion produce structured diagnostics instead
+of host exceptions. `frontend_compile` and file compilation no longer convert
+checker failures to an empty diagnostic array.
+
+`frontend_analyze` now uses the actual self-hosted tokenizer/parser. The removed
+whitespace/semicolon heuristic falsely rejected `selfhost_frontend.sapp` itself
+because its source contained the string fixture `"= ;"`; self-check now passes
+with 35 top-level statements and 5,045 tokens. The expanded suite now has 44
+self-host tests and the complete 677-test semantic suite passes.
+
+Seven pinned samples on the existing four-statement phase fixture changed from
+the old shallow checker's 0.033049 ms/check median to 0.246829 ms/check for the
+final fail-closed checker, an explicit 0.213779 ms/check cost. Replacing temporary
+field-name arrays with arity-specific validators reduced the first safety draft
+from 0.269739 to 0.246829 ms/check (-8.49%). The dedicated fixture reports
+0.248713 ms/check for the legacy-compatible AST, 4.519775 ms/check for 128 typed
+statements, and 4.857402 ms/check while deterministically producing 64
+diagnostics. This is a
+compiler-phase measurement, not a cross-language performance claim. Evidence is
+under `bench/results/2026-07-17-selfhost-typecheck-parity/`.
+
+## 2026-07-17 - Conservative builtin resolution for the tree interpreter
+
+The pblang-only tree interpreter now scans supported lexical bindings during
+AST preparation and marks a builtin call as statically direct only when no
+source binding can shadow that builtin name. Programs that bind the same name
+anywhere retain dynamic scope lookup, preserving global/local/function,
+parameter, function-literal, and loop shadowing plus call-before-declaration
+behavior. Prepared metadata is versioned and stale ASTs are rebuilt.
+
+Seven fresh CPU-pinned paired-control processes measured median reductions of
+7.87% (`len`), 6.95% (`map_has`), 7.42% (`str_starts_with`), and 11.52%
+(mixed collection calls). The extra conservative preparation scan measured a
+0.0308 ms median cost on the small `fib18` compile fixture. These are local
+workload results, not a general language-performance claim; absolute process
+comparisons were discarded due visible frequency drift. Full method and raw
+evidence are in
+`bench/results/2026-07-17-tree-interpreter-builtin-resolution/REPORT.md`.
+
+## 2026-07-16 — Bounded project module linking for hosted C99 and PBIDE
+
+`stdlib:source_inliner.sapp` now exposes `link_modules(...)`, a pblang-only,
+in-memory project linker with canonical relative/`stdlib:` virtual paths,
+dependency-first ordering, per-module namespaces, collision isolation, and no
+filesystem/network access. It rejects traversal, absolute/backslash/foreign
+paths, cycles, duplicate canonical paths, nested imports, bare module values,
+reserved generated names, and invalid input types. Hard ceilings cover supplied
+and reachable module count, depth, per-module bytes, total project bytes, linked
+output bytes, and path length, including unused supplied modules.
+
+The hosted C99 backend, shared execution pipeline, and PBIDE source-build facade
+now accept `modules` plus `entry_path`, return compact link metadata, and build
+multi-module projects including module `let`/`const`, dependency-ordered
+initialization, cross-module closures, mutable module state, and global named
+function values. Hosted top-level values now have C translation-unit storage and
+are initialized in source order inside generated `main`, so module functions see
+the same persistent state instead of an invalid local. Generated-runtime symbol
+collisions fail before an artifact is returned. Native differential and
+ASan/UBSan regression execution produced `41` then `42`; the updated local staged
+baseline measured 100 two-module links at 2.40 ms/link, subsequent C99 lowering
+at 1.23 ms, a 16,752-byte executable, and 0.37 ms/process run. These are
+host-specific phase measurements, not cross-language leadership claims.
+
+## 2026-07-16 — Bounded self-hosted VM and loop superinstructions
+
+The pblang-written VM now has opt-in bounded execution with validated hard
+ceilings for steps, frames, operand stack, locals, captured output, imported
+modules, and individual string/container values. One sticky budget follows
+recursive calls, closures, operator overloads, and try/catch chunks, preventing
+source-level exception handling from bypassing a resource failure. Existing
+`run` and `run_seeded` remain compatible; product previews use
+`frontend_run_bounded` through the shared execution pipeline.
+
+The self-hosted optimizer now deep-copies constants, recursively optimizes
+nested function and try/catch chunks, and emits semantics-preserving local-add
+superinstructions without crossing jump targets. The 20,000-iteration fixture
+changed from 25 to 19 total instructions and 260,016 to 140,016 dispatch steps;
+two measured local runs changed from 643-653 ms to 405-418 ms, with 13,728 KiB
+peak RSS for the latest whole benchmark process. PBIDE, pbAI and pbOS expose
+bounded source previews, while pb-mcp-server remains read-only and only reports
+the limits and target plan.
+
+## 2026-07-16 — Bounded multi-backend execution pipeline
+
+`stdlib:execution_pipeline.sapp` now provides one lazy-loaded, pblang-only
+contract for bounded register-IR evaluation, x86-64/i386/ARM64 ELF builds,
+portable C99, self-hosted bytecode, WebAssembly, and validated platform plans.
+Source, IR, artifact, evaluator-step, stack, and locals budgets have finite hard
+ceilings; syscalls are deny-by-default and native artifacts are never executed
+implicitly. PBIDE, pbAI, pbOS, and the pblang MCP server publish this same
+planning/safety boundary instead of maintaining divergent target claims.
+
+The shared IR optimizer now folds known `add/sub/mul`, removes statically zero
+loops, reports each optimization stage, and avoids the previous invalid
+negative-`seti` result. On the permanent known-arithmetic fixture, shared IR
+changed from `9→4` instructions, x86-64 ELF `181→153 B`, i386 ELF `134→111 B`,
+ARM64 ELF `180→152 B`, and C99 source `242→167 B`. These are fixture-specific
+artifact results, not a claim that pblang wins every program or workload. See
+`docs/Execution_pipeline.md` for the runtime and hardware security boundary.
+
+The next shared pass propagates constants into a loop only when the body does
+not write that register, then removes zero/one arithmetic identities and
+identical branches. Its pinned fixture changes `12→5` IR instructions,
+x86-64 `188→157 B`, i386 `140→114 B`, ARM64 `188→156 B`, and C99 `283→179`
+characters. `optimization_matrix(ir)` checks bounded raw/optimized equivalence,
+rejects syscalls, reports all four artifact deltas, and never runs native code.
+The ordinary ARM64 ELF segment is now `R|X`, with a header regression test.
+The 17-item pblang-native requirement ledger is executable through
+`tools/pbvision.sapp`; broad goals remain active until their exit criteria pass.
+
+## 2026-07-16 — Bounded shared caches and dirty-region rendering
+
+The pblang-only `stdlib:cache.sapp` preserves its original API while adding
+hard entry/unit quotas, safe TTL arithmetic, generation-safe FIFO eviction,
+O(1) size/accounting, cached-nil support, and operational metrics. The shared
+pbAI ensemble uses fixed-size SHA-256 prompt keys with bounded native (512) and
+voter (256) caches. The pblang pb-mcp-server router uses a bounded handler-index
+cache, rejects tool names over 256 bytes, and publishes dispatch-cache metrics.
+
+`stdlib:render_cache.sapp` now bounds dirty regions (128 default, 512 maximum),
+deduplicates identical marks, defers coalescing until area pressure or frame
+consumption, exposes metrics, and normalizes dimensions/FPS. Coverage is in
+`cache_bounded_test.sapp`, `pbai_ensemble_cache_test.sapp`,
+`render_cache_test.sapp`, the MCP runtime-guard test, and the pblang-only
+`cache_render_stages.sapp` benchmark.
+
+The platform emulator now validates memory writes transactionally, uses
+subtraction-first finite address checks, tracks sparse cells/files/storage/env
+usage in O(1), and enforces aggregate storage/environment byte quotas. New
+quota-safe list/delete/unset operations and `machine_stats()` extend the portable
+userspace contract; `platform_resource_stages.sapp` measures the accounting hot
+paths and locks malformed-batch atomicity.
+
+## 2026-07-18 — Unified bounded data stores and verified pbAI cache
+
+`stdlib:data_store.sapp` now provides one namespaced API over bounded memory,
+native SQLite, and Redis. `stdlib:redis.sapp` is a PBLang RESP2 client rather
+than a `redis-cli` shell wrapper: requests/responses are bounded, TLS and AUTH
+are supported, and server errors remain typed. Memory defaults to lower-cost
+FIFO; exact LRU is opt-in through `cache.bounded_policy`.
+
+The persistent pbAI cache now publishes v2 entries with domain-separated
+SHA-256 metadata verification, cached-nil support, TTL, per-kind quotas, staged
+rename, and interrupted-replacement recovery. Legacy 31-bit entries remain
+readable but are surfaced as unverified. Tests, example, benchmark, and limits
+are documented in `docs/Data_Storage.md`.
+
+## 2026-07-18 — Pure-PBLang CDN cache and origin shielding
+
+`stdlib:cdn_cache.sapp` now provides provider-neutral browser/edge/regional/origin
+cache semantics with bounded stores, SHA-256 request keys, hot-key memoization,
+Cache-Control policy, ETag/304, SWR, explicit or blocking revalidation,
+stale-if-error, regional promotion, immutable hashed assets, purge, and metrics.
+Private/authenticated/cookie/range and unsafe response paths fail closed. This
+is deployable cache behavior, not a claim that a local process creates global
+POPs; provider deployment and authenticated purge adapters remain external.
+
+`cdn_cache_test.sapp` passes, `examples/cdn_cache` exercises static origin ->
+edge -> 304 -> purge, and `cdn_cache_stages.sapp` records nine-sample medians.
+The local edge-hit median improved from about 3.68 ms/op to 0.108 ms/op after
+bounded canonical-key memoization. HTTP serialization now uses UTF-8 byte
+Content-Length and emits the proper 304 reason phrase.
+
+The canonical eight-worker semantic suite passes 689/689 with zero failures,
+ignored, or filtered tests in 205.21 seconds; whole-runner peak RSS was
+1,801,672 KiB. This is suite-level evidence, not per-CDN-request memory usage.
+
+## 2026-07-15 — Robust benchmark gates and shared IR constant-copy lowering
+
+The pblang-only benchmark path now reports interpolated p90/p95/p99, standard
+deviation, MAD, IQR, coefficient of variation, outliers, and evidence stability
+instead of relying only on average/min/max. New
+`stdlib:performance_budget.sapp` applies fail-closed, multi-metric regression
+budgets to latency, memory, artifact size, throughput, or custom numeric fields.
+
+The common register-IR optimizer now materializes a known `movr` value as a
+constant destination write, allowing shared DSE to remove dead source and
+intermediate writes. The instruction contract was completed for i386, ARM64,
+and portable C99 lowering; x86-64 already supported it. On the permanent
+correctness fixture, optimized IR changed from 7 to 3 instructions, with
+x86-64 ELF `167→150 B`, i386 ELF `121→110 B`, ARM64 ELF `168→148 B`, and C99
+source `210→154 B`. These are fixture-specific artifact results, not universal
+application-speed claims.
+
+## 2026-07-15 — Category benchmarks and bounded platform emulation
+
+Two new pblang-only modules turn broad portability/performance goals into
+correctness-gated evidence:
+
+- `stdlib:language_benchmark.sapp` defines identical startup, recursion,
+  integer-loop, array, string, and hash-map workloads for 15 runtimes. It
+  auto-detects toolchains, uses bounded subprocess execution, verifies exact
+  checksums, preserves every sample, and rejects caller-supplied process specs.
+- `stdlib:platform_emulator.sapp` resolves validated Linux, Windows, macOS,
+  Android, iOS, FreeBSD, and WASI version/architecture profiles and executes a
+  bounded userspace contract: byte memory, virtual files/environment,
+  normalized sandboxed paths, captured output, deterministic clock/random, and
+  fail-closed portable syscalls. It maps profiles to existing checked ISA or
+  native codegen models without claiming complete kernel/framework emulation.
+
+The local baseline produced 90 language/category rows: **54 passed, 36
+unavailable, 0 failed**. All 11 execution gates passed (ten ISA/quantum models
+plus the platform/ABI model). Raw evidence and methodology are under
+`bench/results/2026-07-15-language-platform-matrix/`.
+
+## 2026-05-30 historical milestone - runnable self-hosted pipeline
+
+This milestone established that the pblang-written compiler under
+`stdlib/compiler/` can tokenize, parse, compile, and run representative pblang
+programs end-to-end. It did not establish complete parser, checker, backend, or
+stdlib parity with the legacy host. Later parity work is recorded in the dated
+sections above and in `docs/VISION_LEDGER.md`; the broad self-host item remains
+active until its differential exit criteria pass.
 
 ## 🤖 v0.5.6 AI Integration
 
@@ -54,9 +550,21 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | **VM builtins wired** | `allocate`, `borrow_immutable`, `borrow_mutable`, `borrow_unique`, `release_borrow`, `load`, `store`, `deallocate`, `push_lifetime`, `pop_lifetime`, `memory_stats` |
 | Borrow rules | Mutable borrows exclusive; multiple immutable borrows allowed; `store` rejects active borrows; `borrow_unique` = use-after-move |
 | Lifetime scoping | `push_lifetime` / `pop_lifetime` invalidate values allocated in popped scopes |
-| Safe pointer stdlib | `memory_safety.sapp` now wraps the builtins with Box, NonNull, borrow guards, Pin, Rc/Weak, checked slices, and arenas |
+| Safe pointer stdlib | `memory_safety.sapp` wraps the builtins with Box, NonNull, borrow guards, Pin, Rc/Weak, checked slices, failure-reporting scopes, and quota/checkpoint/rewind arenas |
 | Tests | `tests/semantics/memory_safety_builtins_test.sapp`, `tests/semantics/memory_safety_stdlib_test.sapp`, and Rust unit tests on `MemoryTracker` |
 | **Not yet** | Compile-time borrow checking for ordinary values; the current safety layer is runtime-enforced |
+
+## Bounded product runtime
+
+`stdlib/product_runtime.sapp` now gives pblang, PBIDE, pbAI, pbOS, and
+pb-mcp-server one pblang-native admission/lifecycle contract. Product profiles
+reject unknown workloads, permit only limit-tightening overrides, account known
+resources transactionally, contain callback failures, release scoped memory on
+all outcomes, and return stable defensive snapshots. This is policy-level
+protection; hard process and device quotas still require launcher/kernel support.
+
+Coverage: `tests/semantics/product_runtime_test.sapp`, PBIDE profile assertions,
+and product suites in pbAI, pbOS, and pb-mcp-server.
 
 ## 🔒 v0.5.1 Security Fixes (Comprehensive Audit)
 
@@ -83,7 +591,7 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | Jump Threading | Multi-pass jump-to-jump resolution for branch optimization |
 | `bitops.sapp` | 26 bit-level operations: AND/OR/XOR/NOT/SHL/SHR, popcount, CLZ/CTZ, bit test/set/clear/toggle, rotations, byte swap, binary/hex conversion |
 | `compression.sapp` | Gzip, Zstd, Brotli compress/decompress + auto-detect |
-| `serialization.sapp` | Safe JSON validation, nested TOML/YAML stringify, quote-aware CSV, format detect/convert |
+| `serialization.sapp` | Versioned bounded parse/stringify/convert results, strict documented TOML/YAML subsets, safe JSON validation, quote-aware CSV, XML text escaping, deterministic output, legacy trusted-input compatibility |
 
 
 ## 🚀 v0.5.6 — Generic Types + 6 New Stdlib Modules + Full Algorithm Suite
@@ -96,7 +604,8 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | `networking_advanced.sapp` | 12 functions: ping, dns_lookup, whois, port_scan, ssl_expiry, http_download, url parse/encode/decode |
 | `data_structures.sapp` | 28 functions: Stack, Queue, PriorityQueue, LinkedList, Trie, LRU Cache, DisjointSet (Union-Find) |
 | `image_processing.sapp` | 10 functions: grayscale, ASCII art, bilinear resize, box blur, Sobel edges, threshold, invert, brightness/contrast |
-| `algorithms_advanced.sapp` | 10 functions: binary_search, quick_sort, merge_sort, levenshtein, LCS, BFS, DFS, fibonacci_dp, knapsack, dijkstra |
+| `algorithms_advanced.sapp` | 10 tested functions: balanced 3-way quicksort, merge sort, memory-bounded Levenshtein/knapsack, O(V+E) BFS/iterative DFS, heap-based validated Dijkstra, binary search, LCS, Fibonacci DP |
+| `min_priority_queue.sapp` | Reusable pure-pblang binary min-heap: O(log n) push/pop, O(1) peek, encapsulated storage, finite numeric priorities, and deterministic empty behavior |
 
 
 ## 🚀 v0.5.6 — LSP Goto-Def + Self-Hosting Type Checker + OS Groundwork
@@ -116,7 +625,7 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 |-----------|--------|-------|
 | Core VM | ✅ Stable | Bytecode, GC, sandboxing, error handling |
 | Package Manager | ✅ Functional | Lockfile, semver, file/hosted registry, HMAC verify |
-| Stdlib | ✅ 179 top-level modules | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor, graphics, blocks, machine optimization, linker, LLM offload, cross-language helpers |
+| Stdlib | ✅ 313 top-level `.sapp` files | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor, graphics, blocks, machine optimization, linker, LLM offload, category benchmarks, platform emulation, cross-language helpers |
 | Threading | ✅ Working | VM-per-thread, channels, select, thread pool |
 | OOP/Types | ✅ Working | class, struct, enum modules with full test coverage |
 | New Stdlib | ✅ Added | testing, orm, async, env, log, jwt, template, graph, benchmark, crypto_advanced, class, struct, enum, http_client |
@@ -133,6 +642,7 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 | WASM Backend | ✅ Prototype | `pblang-wasm` crate: compile pblang AST → WAT (.wat); functions, arithmetic, strings, exports |
 | LLVM Backend | ✅ Prototype | `pblang-llvm` crate: LLVM IR text emitter → compile with clang; `pblang compile --llvm`; functions, if/else, while, for, comparisons |
 | Self-Hosting | ✅ **Complete** | `stdlib/compiler/` (tokenizer→parser→semantic→typeck→ir→optimizer→codegen + `selfhost_frontend.sapp` entry + `vm.sapp` interpreter, ~5,300 lines) tokenizes, parses, compiles **and runs** pblang end-to-end. All language features self-host (incl. `match`, `struct`/`enum`, `class`+colon-call, closures, nil-safe ops). Frontier is now breadth/perf |
+| Self-host VM direct builtins | ✅ Optimized | Shared pure-pblang builtin registry plus optional call-site descriptors remove per-call descriptor allocation and registry lookup without changing opcodes, global shadowing, first-class builtin mutability, or Rust VM/PBCK compatibility |
 | Polyglot Build | ✅ Bridge | `pblang build-polyglot`: extracts @python/@rust/@js blocks from .sapp files, compiles to .so/.pyc, generates manifest |
 | Math Library | ✅ Enhanced | `math.sapp`: trig (sin/cos/tan), hyperbolic, exported `math.stats` (sum/mean/median/stddev/variance/min/max/range), native tensor-backed large vector/matrix routes, constants (PI/E/TAU/PHI), number theory (gcd/lcm/is_prime) |
 | New Stdlib | ✅ Added | `units.sapp` (150+ conversions), `functional.sapp` (map/filter/reduce/compose/pipe/curry/memoize), `encoding.sapp` (hex/URL/CSV/base64/JSON), `colors.sapp` (HEX/RGB/HSL/blending/palettes) |
@@ -144,10 +654,10 @@ The pblang-written compiler under `stdlib/compiler/` now **tokenizes, parses, co
 ## ✅ Test Results
 
 ```
-pblang test tests/semantics --allow-all → 189 passed; 0 failed; 0 ignored   (canonical .sapp corpus, no recompile)
+pblang test tests/semantics --allow-all --jobs 8 --quiet → 685 passed; 0 failed; 0 ignored; 0 filtered (265.61 s, 1,727,616 KiB process peak RSS; complete .sapp corpus including cost-aware CPU/accelerator/storage routing, bounded channel-backed thread supervision, PBIDE render-policy caching, non-executing polyglot tool discovery, controlled polyglot/FFI/parallel/device execution, PBLang-only migration, hosted self-C99, GUI/GPU, pbAI, MCP, security, ten ISA/quantum emulator tests, and the platform/ABI emulator; 2026-07-18)
 pblang test tests/semantics --allow-all --quiet → same suite with script print output captured/suppressed for faster, cleaner CI logs
 pblang test tests/semantics --allow-all --jobs auto --quiet → run independent test files in isolated VM workers
-pblang test semantics → shorthand for tests/semantics + allow-all + quiet + resource-aware jobs; 189 passed; 0 failed; 0 ignored
+pblang test semantics → shorthand for tests/semantics + allow-all + quiet + resource-aware jobs
 pblang test llm → shorthand for the LLM subset + timings; 3 passed; 0 failed; 186 filtered out
 pblang test tests/semantics --allow-all --timings --slow 10 --quiet → show per-test durations and the slowest tests
 pblang test tests/semantics --filter llm --allow-all --quiet --timings --slow 3 → LLM subset passes; pbAI-Max diagnostics use bounded samples plus native LLM-core tensor/activation routing (~4.0s Max fixture)
@@ -156,7 +666,7 @@ pblang test tests/semantics --exact <id> --quiet → rerun one exact discovered 
 pblang test tests/semantics --skip <substr> --quiet → run everything except matching discovered test ids
 pblang test tests/semantics --fail-fast → stop after the first failure for faster debug loops
 cargo test --test semantics      → 192 passed; 0 failed; 1 ignored (os_env_set_pass)
-cargo test --test selfhost_drift → 26 passed; 0 failed; 1 ignored
+cargo test --test selfhost_drift selfhost_drift_full_parser_matches_statement_count -- --ignored --exact → 1 passed in 0.96s (legacy Rust oracle; explicit run, 2026-07-14)
 cargo test --test modules        → 28 passed; 0 failed
 cargo test --test typeck_compiler→ 5 passed; 0 failed
 cargo test -p pblang-typeck      → 46 passed; 0 failed
@@ -167,7 +677,7 @@ cargo test -p pblang-vm --lib    → 2 passed; 0 failed
 
 Ignored tests are currently:
 - **semantics:** `os_env_set_pass` — kept ignored because `env_set()` stays disabled in v0.5 security hardening (`std::env::set_var` is unsound in multi-threaded programs). This is the *only* ignored semantics test.
-- **selfhost_drift:** one perf-gated case — running the full `stdlib/compiler/parser.sapp` *on the self-hosted interpreter* takes >60s per snippet; un-ignore once the self-hosted parser is fast enough to default-on.
+- **selfhost_drift:** the legacy Rust oracle still carries its historical `#[ignore]`, but the old >60s claim is obsolete: its explicit five-snippet run completes in 0.96s. The equivalent strict pblang-native `selfhost_full_parser_drift_test.sapp` is default-on and passed in the canonical suite.
 
 > The former match-guard limitation (arm guards + `:` separator vs. the `obj:method()` colon-call postfix) is **resolved**: `match_guard_pass`, `match_guard_accepts_colon_separator`, and `match_guard_still_accepts_tilde_separator` all pass. Guards work with `:`, `then`, and `#` separators.
 
@@ -202,17 +712,47 @@ Ignored tests are currently:
 | ~~Native executables incomplete~~ | **✅ DONE** | `bundle --self-extract` ships on Linux (Windows CI follow-up) |
 | ~~Match guard body separator ambiguity~~ | **✅ RESOLVED** | Guards work with `:`/`then`/`#`; all match-guard tests pass |
 | ~~Type system stub~~ | **✅ N/A** | Real prelude + generic substitution + fn-literal checks; struct/enum/class supported |
-| Self-hosted parser perf | LOW | Speed up `parser.sapp` on the interpreter to drop the `selfhost_drift` `#[ignore]` |
+| ~~Self-hosted parser default-CI perf~~ | **✅ RESOLVED in pblang suite** | Direct AST construction is allocation-efficient; strict full-parser drift is default-on. Legacy Rust test metadata remains historical. |
 
 ## 📋 Recommended Next Steps
 
 The self-host frontier is now **breadth/perf**, not grammar (all language features self-host):
 
 1. **Differential run** — run a real `stdlib/*.sapp` module through `frontend_run` and diff output against the Rust VM.
-2. **Self-hosted parser speedup** — get `parser.sapp` fast enough on the interpreter to drop the `#[ignore]` on the full-parser `selfhost_drift` case.
+2. **Interpreter throughput** — profile tree-walker calls, scopes, and builtin dispatch; current phase data shows execution, not tokenize/parse, is the dominant self-host cost.
 3. **Bootstrap probe** — feed `frontend_compile`'s own source through `frontend_run` and measure how far the pblang compiler gets toward compiling itself.
 4. **Cranelift JIT expansion** (N2-beta+) — the backend is wired and handles a numeric subset; calls/recursion/globals/closures/collections still fall back to the VM and are tracked as backend work.
 5. **LSP depth** — semantic tokens, richer type-aware hover, cross-file intelligence.
+6. **Hosted C99 breadth** — `ctranspile.sapp` now owns complete numeric hosted
+   programs, optimized/size builds, explicit integer specialization, and bounded
+   execution. Unknown AST, unresolved imports, and profile-invalid operations
+   now fail closed instead of producing `0`/comments. Simple if/ternary and
+   assignment expressions lower natively; mode state recovers after rejection;
+   numeric fallthrough returns deterministic zero; compiler option-like C paths
+   are rejected; and the fixed kernel heap checks every allocation before
+   advancing. Hosted numeric closures and named function values now use pblang-
+   generated closure conversion with transitive capture-by-value, persistent
+   private captured mutation, higher-order dispatch, exact validated handles,
+   arity checks, overflow guards, and deterministic exit cleanup. Forged numeric
+   handles terminate with exit code 72 instead of becoming C pointers.
+   The bounded source linker now resolves dependency-ordered project modules,
+   gives top-level values persistent translation-unit storage, initializes them
+   deterministically in source order, and routes global closure calls through the
+   checked runtime. Freestanding/kernel closure lifetimes, GC-managed general
+   values, thread-safe module initialization, filesystem/package loading, and
+   full stdlib parity remain outside this backend subset.
+
+   The common product execution facade publishes this pblang-written source path
+   as build-only target `c99-hosted`. The 2026-07-16 focused run passed 16/16
+   C99/kernel suites, all then-current 42 pblang-native self-host suites, 7/7 linker/pipeline/
+   PBIDE/ledger suites, and 4/4 shared product-boundary suites. The linked project
+   fixture covered dependency constants, mutable module state, and a global
+   closure; it matched VM and native output (`41`, `42`) and passed the available
+   ASan+UBSan path. The same run measured 2.397 ms average bounded linking,
+   1.228 ms average linked C99 lowering, 70.431 ms C compilation, a 16,752-byte
+   executable, and 0.367 ms average verified process execution over five runs.
+   Timings are host/run specific; see the dated benchmark report for methodology
+   and the separate language-category baseline.
 
 **Longer-term vision:** **pbAI** — a native AI model family (a flagship pbAI-Max plus
 distilled, efficient sub-models) **written in pblang**, used as a coding/debugging agent
@@ -340,7 +880,7 @@ The VM core is stable and battle-tested:
 | `async_await.sapp` | ✅ Added | async_spawn, await, await_all, await_any, map, then |
 | `http.sapp` | ✅ Stable | GET, POST, streaming, SSE |
 | `http_server.sapp` | ✅ Stable | TCP server, routing, middleware, timeouts, case-insensitive headers, multipart/form-data uploads, chunked decode, html/redirect helpers |
-| `json.sapp` | ✅ Stable | parse, stringify |
+| `json.sapp` | ✅ Stable | Parse/stringify, deep helpers, pretty/JSON Lines, bounded line APIs, chunked output |
 | `crypto.sapp` | ✅ Stable | SHA256, base64, random bytes |
 | `db.sapp` | ✅ Stable | SQLite wrapper, migrations |
 | `tensor.sapp` | ✅ Working | Basic tensor operations |
@@ -348,8 +888,8 @@ The VM core is stable and battle-tested:
 | `quantum_sim.sapp` | ✅ Working | Measurement, histogram, ECC helpers |
 | `collections.sapp` | ✅ Stable | Stack, queue, set helpers; `array.sapp` and `map.sapp` expose richer data-structure helpers |
 | `math.sapp` | ✅ Stable | Complex, lerp, clamp, smoothstep |
-| `csv.sapp` | ✅ Stable | Quote-aware CSV records, CRLF, header maps, stringify helpers |
-| `dataframe.sapp` | ✅ Stable | Normalized tables, quote-aware CSV I/O, schema/validation, group_by (per-column + multi-key aggregation), pivot/melt, cumsum/pct_change/rolling_mean, median/std/var |
+| `csv.sapp` | ✅ Stable | Quote-aware CSV/CRLF, native unquoted fast paths, linear header inference, native quote escaping, typed/safe/bounded option APIs |
+| `dataframe.sapp` | ✅ Stable | Normalized tables, stable merge sort, indexed joins/pivot, linear rolling windows/column inference, quote-aware CSV, grouping/reshape/statistics/schema |
 | `template.sapp` | ✅ Stable | Isolated loops, chained filters, condition helpers, strict missing-var checks |
 | `validate.sapp` | ✅ Stable | Nested schemas, defaults, strict fields, batch validation |
 | `config.sapp` | ✅ Stable | Layered config, typed schema maps, validation bridge |

@@ -35,7 +35,11 @@ if not "%PBLANG_BIN%"=="" (
     )
 )
 
-echo pbIDE launcher: %PBLANG% 1>&2
+rem Prefer the SDL2 backend when the binary was built with it. If not, pblang's
+rem compile-aware graphics profile reports/falls back to minifb honestly.
+if "%PBLANG_GFX%"=="" set "PBLANG_GFX=sdl2"
+
+echo pbIDE launcher: %PBLANG%  gfx=%PBLANG_GFX% 1>&2
 "%PBLANG%" ide %*
 set "RC=%ERRORLEVEL%"
 popd

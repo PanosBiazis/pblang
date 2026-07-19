@@ -1,0 +1,134 @@
+// Multi-file direct x86-64 compile session. Backend modules and their content
+// fingerprint are loaded once, amortizing cold import work across a project build.
+
+let X64 = import("stdlib/native/codegen_x64.sapp");
+let CACHE = import("stdlib/native/artifact_cache.sapp");
+
+let MAX_JOBS = 256;
+let MAX_SOURCE_BYTES = 16777216;
+let MAX_TOTAL_SOURCE_BYTES = 67108864;
+let MAX_TOTAL_ARTIFACT_BYTES = 67108864;
+let DEFAULT_PROFILE = "compile_safe;overflow=default;heap=default";
+let DEFAULT_DEPENDENCIES = [
+    "stdlib/native/codegen_x64.sapp",
+    "stdlib/compiler/tokenizer.sapp",
+    "stdlib/compiler/parser.sapp",
+    "stdlib/native/elf_x64.sapp"
+];
+
+fn session(options = nil) {
+    if options != nil and type(options) != "map" { throw "compile_session: options must be a map"; }
+    let root = if options != nil and map_has(options, "cache_root") { options.cache_root } else { CACHE.default_root() };
+    let profile = if options != nil and map_has(options, "profile") { options.profile } else { DEFAULT_PROFILE };
+    let dependencies = if options != nil and map_has(options, "dependencies") { options.dependencies } else { DEFAULT_DEPENDENCIES };
+    let use_cache = not (options != nil and map_has(options, "cache") and options.cache == false);
+    if type(root) != "string" or root == "" or len(root) > 4096 { throw "compile_session: invalid cache root"; }
+    if type(profile) != "string" or profile == "" or len(profile) > 128 { throw "compile_session: invalid profile"; }
+    return map{
+        cache_root: root,
+        profile: profile,
+        dependency_fingerprint: CACHE.dependency_fingerprint(dependencies),
+        cache: use_cache,
+        hits: 0, misses: 0, stores: 0, cache_errors: 0, last_cache_error: "",
+        compiled: 0, published: 0
+    };
+}
+
+fn _fail(index, error, results) {
+    return map{ ok: false, index: index, error: error, results: results };
+}
+
+fn compile_many(state, jobs) {
+    if type(state) != "map" or type(try state.dependency_fingerprint catch nil) != "string" {
+        throw "compile_session: invalid session";
+    }
+    if type(jobs) != "array" or len(jobs) == 0 or len(jobs) > MAX_JOBS {
+        throw "compile_session: jobs must contain 1.." + str(MAX_JOBS) + " entries";
+    }
+
+    let outputs = map{};
+    let total_source = 0;
+    let i = 0;
+    while i < len(jobs) {
+        let job = jobs[i];
+        if type(job) != "map" or type(try job.source catch nil) != "string"
+            or type(try job.output catch nil) != "string" or job.output == "" or len(job.output) > 4096 {
+            return _fail(i, "invalid compile job", []);
+        }
+        let source_bytes = len(str_to_bytes(job.source));
+        if source_bytes > MAX_SOURCE_BYTES { return _fail(i, "source limit exceeded", []); }
+        total_source = total_source + source_bytes;
+        if total_source > MAX_TOTAL_SOURCE_BYTES { return _fail(i, "total source limit exceeded", []); }
+        if map_has(outputs, job.output) { return _fail(i, "duplicate output path", []); }
+        outputs[job.output] = true;
+        i = i + 1;
+    }
+
+    // Compile and validate every job before publishing any output. This prevents a
+    // late syntax/safety failure from leaving a partly rebuilt output set.
+    let prepared = [];
+    let summaries = [];
+    let total_artifact = 0;
+    i = 0;
+    while i < len(jobs) {
+        let job = jobs[i];
+        let key = CACHE.cache_key_with_fingerprint(job.source, state.dependency_fingerprint, state.profile);
+        let binary = nil;
+        let mode = "compiled";
+        if state.cache {
+            let cached = try CACHE.load(state.cache_root, key) catch nil;
+            if cached == nil {
+                state.cache_errors = state.cache_errors + 1;
+                state.last_cache_error = "cache load failed";
+                state.misses = state.misses + 1;
+            } else if cached.hit {
+                binary = cached.binary; mode = "cache-hit"; state.hits = state.hits + 1;
+            } else {
+                state.misses = state.misses + 1;
+            }
+        }
+        if binary == nil {
+            let certificate = try X64.compile_safe(job.source) catch nil;
+            if certificate == nil or not (try certificate.safe catch false)
+                or not CACHE.valid_x64_elf(try certificate.binary catch nil) {
+                return _fail(i, "x86-64 safety-certified compilation failed", summaries);
+            }
+            binary = certificate.binary;
+            state.compiled = state.compiled + 1;
+            if state.cache {
+                let stored = try CACHE.store(state.cache_root, key, binary) catch map{ ok: false };
+                if stored.ok and not stored.reused { state.stores = state.stores + 1; }
+                if not stored.ok {
+                    state.cache_errors = state.cache_errors + 1;
+                    state.last_cache_error = try stored.error catch "cache store failed";
+                }
+            }
+        }
+        total_artifact = total_artifact + len(binary);
+        if total_artifact > MAX_TOTAL_ARTIFACT_BYTES { return _fail(i, "total artifact limit exceeded", summaries); }
+        array_push(prepared, map{ output: job.output, binary: binary, key: key, mode: mode });
+        array_push(summaries, map{ output: job.output, cache_key: key, mode: mode, byte_len: len(binary) });
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < len(prepared) {
+        let published = CACHE.publish(prepared[i].output, prepared[i].binary);
+        if not published.ok { return _fail(i, "artifact publication failed: " + published.error, summaries); }
+        state.published = state.published + 1;
+        i = i + 1;
+    }
+    return map{
+        ok: true, results: summaries, jobs: len(jobs), total_source_bytes: total_source,
+        total_artifact_bytes: total_artifact, hits: state.hits, misses: state.misses,
+        stores: state.stores, cache_errors: state.cache_errors, last_cache_error: state.last_cache_error,
+        compiled: state.compiled, published: state.published
+    };
+}
+
+fn compile_one(state, source, output) {
+    return compile_many(state, [map{ source: source, output: output }]);
+}
+
+export MAX_JOBS, DEFAULT_DEPENDENCIES, DEFAULT_PROFILE;
+export session, compile_one, compile_many;

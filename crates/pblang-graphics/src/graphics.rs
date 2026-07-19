@@ -23,21 +23,41 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const FALLBACK_FONT_PATHS: &[&str] = &[
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+    "/usr/share/fonts/opentype/cantarell/Cantarell-Regular.otf",
+    "/usr/share/fonts/truetype/inter/Inter-Regular.ttf",
+    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Arial.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "C:\\Windows\\Fonts\\calibri.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/truetype/ubuntu/UbuntuMono[wght].ttf",
-    "/usr/share/fonts/opentype/cantarell/Cantarell-Regular.otf",
     "C:\\Windows\\Fonts\\consola.ttf",
-    "C:\\Windows\\Fonts\\segoeui.ttf",
     "/System/Library/Fonts/Menlo.ttc",
     "/System/Library/Fonts/SFNSMono.ttf",
 ];
 
 thread_local! {
     static GFX_WINDOWS: RefCell<HashMap<usize, GfxWindow>> = RefCell::new(HashMap::new());
+    static TEXT_FONT_PATH_CACHE: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
+    static TEXT_FONT_CACHE: RefCell<HashMap<String, Rc<fontdue::Font>>> = RefCell::new(HashMap::new());
+    static TEXT_GLYPH_CACHE: RefCell<HashMap<String, CachedGlyph>> = RefCell::new(HashMap::new());
 }
 static GFX_NEXT: AtomicUsize = AtomicUsize::new(1);
+static TEXT_FONT_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static TEXT_FONT_CACHE_LOADS: AtomicUsize = AtomicUsize::new(0);
+static TEXT_GLYPH_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static TEXT_GLYPH_CACHE_LOADS: AtomicUsize = AtomicUsize::new(0);
 
 struct GfxWindow {
     win: Window,
@@ -47,6 +67,36 @@ struct GfxWindow {
     last_mouse: Option<(f32, f32)>,
     last_left: bool,
     last_right: bool,
+}
+
+const MAX_FRAMEBUFFER_DIM: usize = 8192;
+const MAX_FRAMEBUFFER_PIXELS: usize = MAX_FRAMEBUFFER_DIM * MAX_FRAMEBUFFER_DIM;
+
+fn sync_window_buffer(gw: &mut GfxWindow) -> Option<(usize, usize)> {
+    let (cw, ch) = gw.win.get_size();
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    if cw > MAX_FRAMEBUFFER_DIM || ch > MAX_FRAMEBUFFER_DIM {
+        return None;
+    }
+    let pixels = cw.checked_mul(ch)?;
+    if pixels > MAX_FRAMEBUFFER_PIXELS {
+        return None;
+    }
+    if cw != gw.w || ch != gw.h {
+        gw.w = cw;
+        gw.h = ch;
+        gw.buf.resize(pixels, 0);
+        return Some((cw, ch));
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct CachedGlyph {
+    metrics: fontdue::Metrics,
+    bitmap: Rc<Vec<u8>>,
 }
 
 fn handle_from_value(host: &mut dyn VmHost, v: Value, what: &str) -> Result<usize, RuntimeError> {
@@ -90,7 +140,74 @@ fn color_from_value(host: &mut dyn VmHost, v: &Value, what: &str) -> Result<u32,
     Ok(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
 }
 
-fn text_font_path(requested: &str) -> Option<String> {
+fn rect_from_value(
+    host: &mut dyn VmHost,
+    v: &Value,
+    what: &str,
+) -> Result<Option<(i64, i64, i64, i64)>, RuntimeError> {
+    let m = match v {
+        Value::Map(m) => m.borrow(),
+        _ => return Err(host.err(format!("{what}: expected rect map {{x,y,w,h}}"))),
+    };
+    let mut get = |name: &str| -> Result<i64, RuntimeError> {
+        let val = m
+            .get(name)
+            .ok_or_else(|| host.err(format!("{what}: rect missing {name}")))?;
+        Ok(number(host, val, &format!("{what} {name}"))? as i64)
+    };
+    let x = get("x")?;
+    let y = get("y")?;
+    let w = get("w")?;
+    let h = get("h")?;
+    if w <= 0 || h <= 0 {
+        return Ok(None);
+    }
+    Ok(Some((x, y, w, h)))
+}
+
+fn clipped_rect_bounds(
+    w: usize,
+    h: usize,
+    x: i64,
+    y: i64,
+    rw: i64,
+    rh: i64,
+) -> Option<(usize, usize, usize, usize)> {
+    if w == 0 || h == 0 || rw <= 0 || rh <= 0 {
+        return None;
+    }
+    let fw = w as i64;
+    let fh = h as i64;
+    let x0 = x.clamp(0, fw);
+    let y0 = y.clamp(0, fh);
+    let x1 = x.saturating_add(rw).clamp(0, fw);
+    let y1 = y.saturating_add(rh).clamp(0, fh);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0 as usize, y0 as usize, x1 as usize, y1 as usize))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_rect_into(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    x: i64,
+    y: i64,
+    rw: i64,
+    rh: i64,
+    color: u32,
+) {
+    if let Some((x0, y0, x1, y1)) = clipped_rect_bounds(w, h, x, y, rw, rh) {
+        for yy in y0..y1 {
+            let row = yy * w;
+            buf[row + x0..row + x1].fill(color);
+        }
+    }
+}
+
+fn text_font_path_uncached(requested: &str) -> Option<String> {
     let requested = requested.trim();
     if !requested.is_empty() && Path::new(requested).is_file() {
         return Some(requested.to_string());
@@ -109,6 +226,30 @@ fn text_font_path(requested: &str) -> Option<String> {
         .map(|p| (*p).to_string())
 }
 
+fn text_font_path(requested: &str) -> Option<String> {
+    let key = requested.trim().to_string();
+    if let Some(cached) = TEXT_FONT_PATH_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let resolved = text_font_path_uncached(&key);
+    TEXT_FONT_PATH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() > 32 {
+            cache.clear();
+        }
+        cache.insert(key, resolved.clone());
+    });
+    resolved
+}
+
+fn text_font_cache_size() -> usize {
+    TEXT_FONT_CACHE.with(|cache| cache.borrow().len())
+}
+
+fn text_glyph_cache_size() -> usize {
+    TEXT_GLYPH_CACHE.with(|cache| cache.borrow().len())
+}
+
 fn text_profile_map(font_path: Option<String>) -> Value {
     let mut m = HashMap::new();
     m.insert(
@@ -118,6 +259,30 @@ fn text_profile_map(font_path: Option<String>) -> Value {
     m.insert("renderer".into(), alloc_string("native-aa-fontdue"));
     m.insert("fallback".into(), alloc_string("bitmap-font"));
     m.insert("antialias".into(), Value::Bool(true));
+    m.insert(
+        "font_cache_size".into(),
+        Value::Number(text_font_cache_size() as f64),
+    );
+    m.insert(
+        "font_cache_hits".into(),
+        Value::Number(TEXT_FONT_CACHE_HITS.load(Ordering::Relaxed) as f64),
+    );
+    m.insert(
+        "font_cache_loads".into(),
+        Value::Number(TEXT_FONT_CACHE_LOADS.load(Ordering::Relaxed) as f64),
+    );
+    m.insert(
+        "glyph_cache_size".into(),
+        Value::Number(text_glyph_cache_size() as f64),
+    );
+    m.insert(
+        "glyph_cache_hits".into(),
+        Value::Number(TEXT_GLYPH_CACHE_HITS.load(Ordering::Relaxed) as f64),
+    );
+    m.insert(
+        "glyph_cache_loads".into(),
+        Value::Number(TEXT_GLYPH_CACHE_LOADS.load(Ordering::Relaxed) as f64),
+    );
     match font_path {
         Some(p) => {
             m.insert("available".into(), Value::Bool(true));
@@ -129,6 +294,90 @@ fn text_profile_map(font_path: Option<String>) -> Value {
         }
     }
     alloc_map(m)
+}
+
+fn load_text_font(requested_font_path: &str) -> Result<(String, Rc<fontdue::Font>, bool), String> {
+    let font_path = text_font_path(requested_font_path)
+        .ok_or_else(|| "no usable TrueType/OpenType font found".to_string())?;
+    if let Some(font) = TEXT_FONT_CACHE.with(|cache| cache.borrow().get(&font_path).cloned()) {
+        TEXT_FONT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok((font_path, font, true));
+    }
+    let font_bytes = fs::read(&font_path).map_err(|e| format!("read font {font_path}: {e}"))?;
+    let font = Rc::new(
+        fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
+            .map_err(|e| format!("load font {font_path}: {e}"))?,
+    );
+    TEXT_FONT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 8 {
+            cache.clear();
+        }
+        cache.insert(font_path.clone(), Rc::clone(&font));
+    });
+    TEXT_FONT_CACHE_LOADS.fetch_add(1, Ordering::Relaxed);
+    Ok((font_path, font, false))
+}
+
+fn glyph_cache_key(font_path: &str, ch: char, px: f32) -> String {
+    format!("{font_path}\u{1f}{:.2}\u{1f}{:x}", px, ch as u32)
+}
+
+fn rasterize_cached_glyph(font_path: &str, font: &fontdue::Font, ch: char, px: f32) -> CachedGlyph {
+    let key = glyph_cache_key(font_path, ch, px);
+    if let Some(cached) = TEXT_GLYPH_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        TEXT_GLYPH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return cached;
+    }
+    let (metrics, bitmap) = font.rasterize(ch, px);
+    let cached = CachedGlyph {
+        metrics,
+        bitmap: Rc::new(bitmap),
+    };
+    TEXT_GLYPH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, cached.clone());
+    });
+    TEXT_GLYPH_CACHE_LOADS.fetch_add(1, Ordering::Relaxed);
+    cached
+}
+
+/// One rasterized glyph destined for a GPU atlas: the resolved font path plus the R8 coverage
+/// bitmap and the metrics the GPU text layout needs. Reuses the same font + glyph caches as the
+/// CPU `draw_text_aa_into` path, so GPU and CPU text rasterize identically. Lives here (not in
+/// `wgpu_backend`) so it compiles with or without the `wgpu-render` feature.
+#[allow(dead_code)]
+pub(crate) struct GlyphRaster {
+    pub font_path: String,
+    pub width: usize,
+    pub height: usize,
+    pub xmin: i32,
+    pub advance_width: f32,
+    pub bitmap: Rc<Vec<u8>>,
+}
+
+/// Resolve `requested_font_path` and rasterize `ch` at `px`, returning the coverage bitmap +
+/// metrics for atlas upload. `px` is clamped to the same 6..256 range as the CPU path.
+#[allow(dead_code)]
+pub(crate) fn rasterize_glyph_for_atlas(
+    requested_font_path: &str,
+    ch: char,
+    px: f32,
+) -> Result<GlyphRaster, String> {
+    let px = px.clamp(6.0, 256.0);
+    let (font_path, font, _hit) = load_text_font(requested_font_path)?;
+    let cached = rasterize_cached_glyph(&font_path, font.as_ref(), ch, px);
+    Ok(GlyphRaster {
+        font_path,
+        width: cached.metrics.width,
+        height: cached.metrics.height,
+        xmin: cached.metrics.xmin,
+        advance_width: cached.metrics.advance_width,
+        bitmap: cached.bitmap,
+    })
 }
 
 fn blend_argb(dst: u32, src: u32, coverage: u8) -> u32 {
@@ -160,8 +409,12 @@ pub(crate) struct TextDrawStats {
     pub height: i64,
     pub glyphs: usize,
     pub font_path: String,
+    pub font_cache_hit: bool,
+    pub glyph_cache_hits: usize,
+    pub glyph_cache_loads: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_text_aa_into(
     buf: &mut [u32],
     w: usize,
@@ -180,14 +433,15 @@ pub(crate) fn draw_text_aa_into(
             height: 0,
             glyphs: 0,
             font_path: String::new(),
+            font_cache_hit: false,
+            glyph_cache_hits: 0,
+            glyph_cache_loads: 0,
         });
     }
     let px = px.clamp(6.0, 256.0);
-    let font_path = text_font_path(requested_font_path)
-        .ok_or_else(|| "no usable TrueType/OpenType font found".to_string())?;
-    let font_bytes = fs::read(&font_path).map_err(|e| format!("read font {font_path}: {e}"))?;
-    let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
-        .map_err(|e| format!("load font {font_path}: {e}"))?;
+    let (font_path, font, font_cache_hit) = load_text_font(requested_font_path)?;
+    let glyph_hits_before = TEXT_GLYPH_CACHE_HITS.load(Ordering::Relaxed);
+    let glyph_loads_before = TEXT_GLYPH_CACHE_LOADS.load(Ordering::Relaxed);
     let mut cursor = x as f32;
     let mut glyphs = 0usize;
     let mut max_right = x;
@@ -196,7 +450,9 @@ pub(crate) fn draw_text_aa_into(
         if ch == '\n' || ch == '\r' {
             continue;
         }
-        let (metrics, bitmap) = font.rasterize(ch, px);
+        let cached = rasterize_cached_glyph(&font_path, font.as_ref(), ch, px);
+        let metrics = cached.metrics;
+        let bitmap = cached.bitmap;
         if metrics.width > 0 && metrics.height > 0 {
             let gx = cursor.round() as i64 + metrics.xmin as i64;
             // PBIDE uses top-left cell coordinates. Keep glyphs vertically centered in
@@ -235,6 +491,13 @@ pub(crate) fn draw_text_aa_into(
         height: (max_bottom - y).max(px as i64),
         glyphs,
         font_path,
+        font_cache_hit,
+        glyph_cache_hits: TEXT_GLYPH_CACHE_HITS
+            .load(Ordering::Relaxed)
+            .saturating_sub(glyph_hits_before),
+        glyph_cache_loads: TEXT_GLYPH_CACHE_LOADS
+            .load(Ordering::Relaxed)
+            .saturating_sub(glyph_loads_before),
     })
 }
 
@@ -290,6 +553,14 @@ pub fn gfxcreatewindow(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
     }
     let title = string_val(host, &args[2], "gfxcreatewindow title")?;
 
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::use_wgpu() {
+        let id = GFX_NEXT.fetch_add(1, Ordering::Relaxed);
+        let win = crate::wgpu_backend::create(host, w as u32, h as u32, &title)?;
+        crate::wgpu_backend::insert(id, win);
+        return Ok(Value::Number(id as f64));
+    }
+
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::use_sdl2() {
         let id = GFX_NEXT.fetch_add(1, Ordering::Relaxed);
@@ -330,6 +601,12 @@ pub fn gfxisopen(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runti
         return Err(host.err(format!("gfxisopen expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxisopen")?;
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxisopen", |w| {
+            Ok(Value::Bool(w.is_open()))
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxisopen", |w| {
@@ -346,6 +623,11 @@ pub fn gfxclose(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runtim
         return Err(host.err(format!("gfxclose expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxclose")?;
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        crate::wgpu_backend::remove(id);
+        return Ok(Value::Nil);
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         crate::sdl2_backend::remove(id);
@@ -363,6 +645,16 @@ pub fn gfxsize(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runtime
         return Err(host.err(format!("gfxsize expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxsize")?;
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxsize", |w| {
+            let (ww, hh) = w.size();
+            let mut m = HashMap::new();
+            m.insert("w".into(), Value::Number(ww as f64));
+            m.insert("h".into(), Value::Number(hh as f64));
+            Ok(alloc_map(m))
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxsize", |w| {
@@ -376,12 +668,7 @@ pub fn gfxsize(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runtime
     with_window_mut(host, id, "gfxsize", |gw| {
         // Report the LIVE window size (and keep the framebuffer matched), so callers see the
         // current size after a resize rather than the size the window was created at.
-        let (cw, ch) = gw.win.get_size();
-        if cw > 0 && ch > 0 && (cw != gw.w || ch != gw.h) {
-            gw.w = cw;
-            gw.h = ch;
-            gw.buf.resize(cw * ch, 0);
-        }
+        let _ = sync_window_buffer(gw);
         let mut m = HashMap::new();
         m.insert("w".into(), Value::Number(gw.w as f64));
         m.insert("h".into(), Value::Number(gw.h as f64));
@@ -396,6 +683,13 @@ pub fn gfxclear(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runtim
     }
     let id = handle_from_value(host, args[0].clone(), "gfxclear")?;
     let c = color_from_value(host, &args[1], "gfxclear")?;
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxclear", |w| {
+            w.clear(c);
+            Ok(Value::Nil)
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxclear", |w| {
@@ -428,6 +722,13 @@ pub fn gfxdrawrect(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
         return Ok(Value::Nil);
     }
 
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxdrawrect", |w| {
+            w.draw_rect(x, y, rw, rh, c);
+            Ok(Value::Nil)
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxdrawrect", |w| {
@@ -436,16 +737,55 @@ pub fn gfxdrawrect(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
         });
     }
     with_window_mut(host, id, "gfxdrawrect", |gw| {
-        let x0 = x.max(0) as usize;
-        let y0 = y.max(0) as usize;
-        let x1 = (x + rw).min(gw.w as i64).max(0) as usize;
-        let y1 = (y + rh).min(gw.h as i64).max(0) as usize;
+        fill_rect_into(&mut gw.buf, gw.w, gw.h, x, y, rw, rh, c);
+        Ok(Value::Nil)
+    })
+}
 
-        for yy in y0..y1 {
-            let row = yy * gw.w;
-            for xx in x0..x1 {
-                gw.buf[row + xx] = c;
-            }
+// --- gfxdrawrects(handle, rects, color)
+pub fn gfxdrawrects(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if args.len() != 3 {
+        return Err(host.err(format!(
+            "gfxdrawrects expects 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    let id = handle_from_value(host, args[0].clone(), "gfxdrawrects")?;
+    let rects_value = match &args[1] {
+        Value::Array(a) => a.borrow(),
+        _ => return Err(host.err("gfxdrawrects rects: expected array of rect maps".to_string())),
+    };
+    if rects_value.len() > 100_000 {
+        return Err(host.err("gfxdrawrects rects: too many rects (max 100000)".to_string()));
+    }
+    let c = color_from_value(host, &args[2], "gfxdrawrects")?;
+    let mut rects = Vec::with_capacity(rects_value.len().min(4096));
+    for v in rects_value.iter() {
+        if let Some(rect) = rect_from_value(host, v, "gfxdrawrects rect")? {
+            rects.push(rect);
+        }
+    }
+    if rects.is_empty() {
+        return Ok(Value::Nil);
+    }
+
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxdrawrects", |w| {
+            w.draw_rects(&rects, c);
+            Ok(Value::Nil)
+        });
+    }
+    #[cfg(feature = "sdl2")]
+    if crate::sdl2_backend::has(id) {
+        return crate::sdl2_backend::with_window_mut(host, id, "gfxdrawrects", |w| {
+            w.draw_rects(&rects, c);
+            Ok(Value::Nil)
+        });
+    }
+    with_window_mut(host, id, "gfxdrawrects", |gw| {
+        for (x, y, rw, rh) in rects {
+            fill_rect_into(&mut gw.buf, gw.w, gw.h, x, y, rw, rh, c);
         }
         Ok(Value::Nil)
     })
@@ -464,6 +804,13 @@ pub fn gfxdrawpoint(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Ru
     let y = number(host, &args[2], "gfxdrawpoint y")? as i64;
     let c = color_from_value(host, &args[3], "gfxdrawpoint")?;
 
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxdrawpoint", |w| {
+            w.draw_rect(x, y, 1, 1, c);
+            Ok(Value::Nil)
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxdrawpoint", |w| {
@@ -496,6 +843,13 @@ pub fn gfxdrawline(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
     let y2 = number(host, &args[4], "gfxdrawline y2")? as i64;
     let c = color_from_value(host, &args[5], "gfxdrawline")?;
 
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxdrawline", |w| {
+            w.draw_line(x1, y1, x2, y2, c);
+            Ok(Value::Nil)
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxdrawline", |w| {
@@ -661,6 +1015,32 @@ pub fn gfxdrawtextaa(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
     let font_path = string_val(host, &args[6], "gfxdrawtextaa font_path")?;
     let advance = number(host, &args[7], "gfxdrawtextaa advance")? as f32;
 
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        // M2: rasterize glyphs into the wgpu R8 atlas and queue one instance per glyph. Cache
+        // deltas are read off the shared glyph-cache counters (the atlas reuses the same
+        // fontdue rasterization as the CPU path, so these are accurate).
+        let hits_before = TEXT_GLYPH_CACHE_HITS.load(Ordering::Relaxed);
+        let loads_before = TEXT_GLYPH_CACHE_LOADS.load(Ordering::Relaxed);
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxdrawtextaa", |w| {
+            let (glyphs, width, height, resolved_font) =
+                w.draw_text(x, y, &text, c, px, &font_path, advance);
+            let stats = TextDrawStats {
+                width,
+                height,
+                glyphs,
+                font_path: resolved_font,
+                font_cache_hit: false,
+                glyph_cache_hits: TEXT_GLYPH_CACHE_HITS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(hits_before),
+                glyph_cache_loads: TEXT_GLYPH_CACHE_LOADS
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(loads_before),
+            };
+            Ok(text_draw_result(Ok(stats)))
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxdrawtextaa", |w| {
@@ -699,6 +1079,15 @@ fn text_draw_result(stats: Result<TextDrawStats, String>) -> Value {
             m.insert("width".into(), Value::Number(s.width as f64));
             m.insert("height".into(), Value::Number(s.height as f64));
             m.insert("glyphs".into(), Value::Number(s.glyphs as f64));
+            m.insert("font_cache_hit".into(), Value::Bool(s.font_cache_hit));
+            m.insert(
+                "glyph_cache_hits".into(),
+                Value::Number(s.glyph_cache_hits as f64),
+            );
+            m.insert(
+                "glyph_cache_loads".into(),
+                Value::Number(s.glyph_cache_loads as f64),
+            );
             m.insert("error".into(), alloc_string(""));
         }
         Err(e) => {
@@ -708,6 +1097,9 @@ fn text_draw_result(stats: Result<TextDrawStats, String>) -> Value {
             m.insert("width".into(), Value::Number(0.0));
             m.insert("height".into(), Value::Number(0.0));
             m.insert("glyphs".into(), Value::Number(0.0));
+            m.insert("font_cache_hit".into(), Value::Bool(false));
+            m.insert("glyph_cache_hits".into(), Value::Number(0.0));
+            m.insert("glyph_cache_loads".into(), Value::Number(0.0));
             m.insert("error".into(), alloc_string(e));
         }
     }
@@ -725,12 +1117,146 @@ pub fn gfxtextprofile(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, 
     Ok(text_profile_map(text_font_path("")))
 }
 
+// --- gfxbackendprofile() -> map
+pub fn gfxbackendprofile(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if !args.is_empty() {
+        return Err(host.err(format!(
+            "gfxbackendprofile expects 0 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let requested = std::env::var("PBLANG_GFX").unwrap_or_default();
+    let software_forced = std::env::var("PBLANG_GFX_SOFTWARE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let compiled_sdl2 = cfg!(feature = "sdl2");
+    let selected_sdl2 = compiled_sdl2 && requested == "sdl2";
+
+    // Experimental wgpu render backend introspection (only meaningful when the feature is
+    // compiled in; the `use_wgpu()` env gate accepts PBIDE_GRAPHICS=wgpu or PBLANG_GFX=wgpu).
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::use_wgpu() {
+        let mut m = HashMap::new();
+        m.insert(
+            "format".into(),
+            alloc_string("pblang.graphics.backend.profile.v1"),
+        );
+        m.insert("requested".into(), alloc_string("wgpu"));
+        m.insert("backend".into(), alloc_string("wgpu"));
+        m.insert("present".into(), alloc_string("gpu-surface-present"));
+        m.insert("present_copy".into(), alloc_string("swapchain"));
+        m.insert("event_pump".into(), alloc_string("native-window-poll"));
+        m.insert("rect_fill".into(), alloc_string("instanced-quad"));
+        m.insert("gpu_present".into(), Value::Bool(true));
+        m.insert("compiled_sdl2".into(), Value::Bool(compiled_sdl2));
+        m.insert("compiled_wgpu".into(), Value::Bool(true));
+        m.insert("software_forced".into(), Value::Bool(false));
+        m.insert("cpu_raster_ui".into(), Value::Bool(false));
+        m.insert("text_supported".into(), Value::Bool(true));
+        m.insert(
+            "note".into(),
+            alloc_string(
+                "EXPERIMENTAL wgpu render (M1: surface+clear+rects+lines; M2: glyph-atlas text). GPU-untested.",
+            ),
+        );
+        return Ok(alloc_map(m));
+    }
+
+    let (backend, present, gpu_present, note) = if selected_sdl2 && software_forced {
+        (
+            "sdl2",
+            "sdl2-software-present",
+            false,
+            "SDL2 compiled and requested, but PBLANG_GFX_SOFTWARE=1 forces software canvas",
+        )
+    } else if selected_sdl2 {
+        (
+            "sdl2",
+            "gpu-assisted-texture-present",
+            true,
+            "SDL2 compiled and requested; pblang still CPU-rasterizes UI into a texture",
+        )
+    } else if requested == "sdl2" {
+        (
+            "minifb",
+            "cpu-framebuffer",
+            false,
+            "PBLANG_GFX=sdl2 requested, but this binary was not built with pblang-graphics/sdl2",
+        )
+    } else {
+        (
+            "minifb",
+            "cpu-framebuffer",
+            false,
+            "default native framebuffer; pure CPU present path",
+        )
+    };
+
+    let mut m = HashMap::new();
+    m.insert(
+        "format".into(),
+        alloc_string("pblang.graphics.backend.profile.v1"),
+    );
+    m.insert("requested".into(), alloc_string(requested));
+    m.insert("backend".into(), alloc_string(backend));
+    m.insert("present".into(), alloc_string(present));
+    m.insert(
+        "present_copy".into(),
+        alloc_string(if backend == "sdl2" {
+            "row-copy-argb8888"
+        } else {
+            "native-framebuffer"
+        }),
+    );
+    m.insert(
+        "event_pump".into(),
+        alloc_string(if backend == "sdl2" {
+            "cached-window-event-pump"
+        } else {
+            "native-window-poll"
+        }),
+    );
+    m.insert("rect_fill".into(), alloc_string("row-slice-fill"));
+    m.insert("gpu_present".into(), Value::Bool(gpu_present));
+    m.insert("compiled_sdl2".into(), Value::Bool(compiled_sdl2));
+    m.insert("software_forced".into(), Value::Bool(software_forced));
+    m.insert("cpu_raster_ui".into(), Value::Bool(true));
+    m.insert("idle_present_skip".into(), Value::Bool(true));
+    m.insert("present_resize_sync".into(), Value::Bool(true));
+    m.insert(
+        "max_framebuffer_dim".into(),
+        Value::Number(MAX_FRAMEBUFFER_DIM as f64),
+    );
+    m.insert(
+        "max_framebuffer_pixels".into(),
+        Value::Number(MAX_FRAMEBUFFER_PIXELS as f64),
+    );
+    m.insert(
+        "event_contract".into(),
+        alloc_string("pblang.graphics.events.v1"),
+    );
+    m.insert("resize_events".into(), Value::Bool(true));
+    m.insert("mouse_xy_events".into(), Value::Bool(true));
+    m.insert("scroll_events".into(), Value::Bool(true));
+    m.insert("scroll_event".into(), alloc_string("scroll"));
+    m.insert("note".into(), alloc_string(note));
+    Ok(alloc_map(m))
+}
+
 // --- gfxpresent(handle)
 pub fn gfxpresent(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
     if args.len() != 1 {
         return Err(host.err(format!("gfxpresent expects 1 argument, got {}", args.len())));
     }
     let id = handle_from_value(host, args[0].clone(), "gfxpresent")?;
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxpresent", |w| {
+            w.present()?;
+            Ok(Value::Nil)
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxpresent", |w| {
@@ -739,6 +1265,7 @@ pub fn gfxpresent(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Runt
         });
     }
     with_window_mut(host, id, "gfxpresent", |gw| {
+        let _ = sync_window_buffer(gw);
         gw.win
             .update_with_buffer(&gw.buf, gw.w, gw.h)
             .map_err(|e| RuntimeError {
@@ -762,6 +1289,12 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
     }
     let id = handle_from_value(host, args[0].clone(), "gfxpollevents")?;
 
+    #[cfg(feature = "wgpu-render")]
+    if crate::wgpu_backend::has(id) {
+        return crate::wgpu_backend::with_window_mut(host, id, "gfxpollevents", |w| {
+            w.poll_events(alloc_array, alloc_map)
+        });
+    }
     #[cfg(feature = "sdl2")]
     if crate::sdl2_backend::has(id) {
         return crate::sdl2_backend::with_window_mut(host, id, "gfxpollevents", |w| {
@@ -782,18 +1315,12 @@ pub fn gfxpollevents(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, R
         // the real resolution and REFLOWS, instead of minifb stretching a fixed buffer (blurry,
         // never relayouts). Emit a "resize" event so the app can recompute its layout. After
         // this, buffer == window so the mouse maps 1:1.
-        {
-            let (cur_w, cur_h) = gw.win.get_size();
-            if cur_w > 0 && cur_h > 0 && (cur_w != gw.w || cur_h != gw.h) {
-                gw.w = cur_w;
-                gw.h = cur_h;
-                gw.buf.resize(cur_w * cur_h, 0);
-                let mut m = HashMap::new();
-                m.insert("type".into(), alloc_string("resize"));
-                m.insert("w".into(), Value::Number(cur_w as f64));
-                m.insert("h".into(), Value::Number(cur_h as f64));
-                out.push(alloc_map(m));
-            }
+        if let Some((cur_w, cur_h)) = sync_window_buffer(gw) {
+            let mut m = HashMap::new();
+            m.insert("type".into(), alloc_string("resize"));
+            m.insert("w".into(), Value::Number(cur_w as f64));
+            m.insert("h".into(), Value::Number(cur_h as f64));
+            out.push(alloc_map(m));
         }
 
         // Mouse is in window space; with the buffer kept equal to the window above these are
@@ -953,6 +1480,11 @@ pub fn gfx_builtins() -> Vec<pblang_ir::BuiltinFn> {
             fun: gfxdrawrect,
         },
         pblang_ir::BuiltinFn {
+            name: "gfxdrawrects",
+            arity: Some(3),
+            fun: gfxdrawrects,
+        },
+        pblang_ir::BuiltinFn {
             name: "gfxdrawpoint",
             arity: Some(4),
             fun: gfxdrawpoint,
@@ -971,6 +1503,11 @@ pub fn gfx_builtins() -> Vec<pblang_ir::BuiltinFn> {
             name: "gfxtextprofile",
             arity: Some(0),
             fun: gfxtextprofile,
+        },
+        pblang_ir::BuiltinFn {
+            name: "gfxbackendprofile",
+            arity: Some(0),
+            fun: gfxbackendprofile,
         },
         pblang_ir::BuiltinFn {
             name: "gfxpresent",
@@ -1049,5 +1586,28 @@ mod tests {
         for x in 0..w {
             assert_eq!(buf[x], 0xABCDEF, "pixel ({x},0) should be drawn");
         }
+    }
+
+    #[test]
+    fn fill_rect_into_clips_and_fills_by_rows() {
+        let (w, h) = (4usize, 4usize);
+        let mut buf = vec![0u32; w * h];
+        fill_rect_into(&mut buf, w, h, -1, -1, 3, 3, 0xCAFE_BABE);
+        assert_eq!(buf[0], 0xCAFE_BABE);
+        assert_eq!(buf[1], 0xCAFE_BABE);
+        assert_eq!(buf[4], 0xCAFE_BABE);
+        assert_eq!(buf[5], 0xCAFE_BABE);
+        assert_eq!(buf[2], 0);
+        assert_eq!(buf[8], 0);
+    }
+
+    #[test]
+    fn fill_rect_into_ignores_offscreen_and_overflowing_rects() {
+        let (w, h) = (4usize, 4usize);
+        let mut buf = vec![0x11u32; w * h];
+        fill_rect_into(&mut buf, w, h, i64::MAX - 2, 0, 16, 2, 0x22);
+        fill_rect_into(&mut buf, w, h, 0, i64::MAX - 2, 2, 16, 0x22);
+        fill_rect_into(&mut buf, w, h, 1, 1, 0, 8, 0x22);
+        assert!(buf.iter().all(|&p| p == 0x11));
     }
 }

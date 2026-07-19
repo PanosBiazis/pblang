@@ -1,232 +1,1194 @@
-//! compiler/typeck.sapp — Self-hosting type checker for pblang
-//! Completes the 4-stage compiler pipeline: tokenizer → parser → type_checker → codegen
+//! compiler/typeck.sapp - bounded self-hosted type checker for pblang.
+//!
+//! This checker intentionally uses gradual typing: `any` suppresses comparisons
+//! that cannot be proved, while concrete annotations, function signatures and
+//! lexical bindings are checked deterministically.
 
 fn Ty(kind, inner) { return map{ kind: kind, inner: inner }; }
-fn ty_any() { return Ty("any", nil); }
-fn ty_number() { return Ty("number", nil); }
-fn ty_bool() { return Ty("bool", nil); }
-fn ty_string() { return Ty("string", nil); }
-fn ty_nil() { return Ty("nil", nil); }
+let _TY_ANY = Ty("any", nil);
+let _TY_NUMBER = Ty("number", nil);
+let _TY_BIGINT = Ty("bigint", nil);
+let _TY_RATIONAL = Ty("rational", nil);
+let _TY_DECIMAL = Ty("decimal", nil);
+let _TY_BOOL = Ty("bool", nil);
+let _TY_STRING = Ty("string", nil);
+let _TY_NIL = Ty("nil", nil);
+let _BUILTINS = import("stdlib/compiler/builtins_list.sapp");
+let _SUGGEST = import("stdlib/compiler/diagnostic_suggestions.sapp");
+let MAX_TYPE_TEXT = 4096;
+let MAX_TYPE_DEPTH = 64;
+let MAX_TYPE_MEMBERS = 4096;
+let MAX_EXTERN_NAMES = 16384;
+let _NO_EXTERNAL_NAMES = map{
+    names: map{}, ordered: [], truncated: false, invalid: false
+};
+
+fn ty_any() { return _TY_ANY; }
+fn ty_number() { return _TY_NUMBER; }
+fn ty_bigint() { return _TY_BIGINT; }
+fn ty_rational() { return _TY_RATIONAL; }
+fn ty_decimal() { return _TY_DECIMAL; }
+fn ty_bool() { return _TY_BOOL; }
+fn ty_string() { return _TY_STRING; }
+fn ty_nil() { return _TY_NIL; }
 fn ty_array(inner) { return Ty("array", inner); }
 fn ty_map(k, v) { return Ty("map", map{ key: k, value: v }); }
-fn ty_fn(params, ret) { return Ty("fn", map{ params: params, ret: ret }); }
+fn ty_fn(params, ret, min_arity = nil, has_generics = false) {
+    if min_arity == nil { min_arity = len(params); }
+    return Ty("fn", map{ params: params, ret: ret, min_arity: min_arity, has_generics: has_generics });
+}
 fn ty_option(inner) { return Ty("option", inner); }
+fn ty_result(ok, err) { return Ty("result", map{ ok: ok, err: err }); }
+fn ty_nonnull(inner) { return Ty("nonnull", inner); }
 fn ty_generic(name) { return Ty("generic", name); }
+fn ty_struct(name, fields) { return Ty("struct", map{ name: name, fields: fields }); }
+fn ty_enum(name, variants) { return Ty("enum", map{ name: name, variants: variants }); }
+fn ty_enum_instance(name) { return Ty("enum_instance", name); }
+
+fn _is_ty(t) {
+    return is_map(t) and map_has(t, "kind") and map_has(t, "inner");
+}
 
 fn ty_to_string(t) {
-    if t["kind"] == "any" { return "any"; }
-    if t["kind"] == "number" { return "number"; }
-    if t["kind"] == "bool" { return "bool"; }
-    if t["kind"] == "string" { return "string"; }
-    if t["kind"] == "nil" { return "nil"; }
-    if t["kind"] == "array" { return "array<" + ty_to_string(t["inner"]) + ">"; }
-    if t["kind"] == "map" {
-        return "map<" + ty_to_string(t["inner"]["key"]) + "," + ty_to_string(t["inner"]["value"]) + ">";
-    }
-    if t["kind"] == "fn" {
+    if not _is_ty(t) { return "?"; }
+    let k = t.kind;
+    if k == "any" or k == "number" or k == "bigint" or k == "rational" or k == "decimal"
+       or k == "bool" or k == "string" or k == "nil" { return k; }
+    if k == "array" { return "array<" + ty_to_string(t.inner) + ">"; }
+    if k == "map" { return "map<" + ty_to_string(t.inner.key) + "," + ty_to_string(t.inner.value) + ">"; }
+    if k == "fn" {
         let ps = ""; let i = 0;
-        while i < len(t["inner"]["params"]) {
+        while i < len(t.inner.params) {
             if i > 0 { ps = ps + ","; }
-            ps = ps + ty_to_string(t["inner"]["params"][i]);
+            ps = ps + ty_to_string(t.inner.params[i]);
             i = i + 1;
         }
-        return "fn(" + ps + ")->" + ty_to_string(t["inner"]["ret"]);
+        return "fn(" + ps + ")->" + ty_to_string(t.inner.ret);
     }
-    if t["kind"] == "option" { return ty_to_string(t["inner"]) + "?"; }
-    if t["kind"] == "generic" { return t["inner"]; }
+    if k == "option" { return ty_to_string(t.inner) + "?"; }
+    if k == "result" { return "result<" + ty_to_string(t.inner.ok) + "," + ty_to_string(t.inner.err) + ">"; }
+    if k == "nonnull" { return ty_to_string(t.inner) + "!"; }
+    if k == "generic" { return str(t.inner); }
+    if k == "struct" or k == "enum" { return str(t.inner.name); }
+    if k == "enum_instance" { return str(t.inner); }
     return "?";
 }
 
-fn ty_eq(a, b) {
-    if a["kind"] == "any" or b["kind"] == "any" { return true; }
-    if a["kind"] == b["kind"] {
-        if a["kind"] == "number" or a["kind"] == "bool" or a["kind"] == "string" or a["kind"] == "nil" { return true; }
-        if a["kind"] == "array" { return ty_eq(a["inner"], b["inner"]); }
-        if a["kind"] == "map" { return ty_eq(a["inner"]["key"], b["inner"]["key"]) and ty_eq(a["inner"]["value"], b["inner"]["value"]); }
-        if a["kind"] == "fn" {
-            if len(a["inner"]["params"]) != len(b["inner"]["params"]) { return false; }
-            let i = 0;
-            while i < len(a["inner"]["params"]) {
-                if not ty_eq(a["inner"]["params"][i], b["inner"]["params"][i]) { return false; }
-                i = i + 1;
-            }
-            return ty_eq(a["inner"]["ret"], b["inner"]["ret"]);
+fn _ty_same(a, b) {
+    if not _is_ty(a) or not _is_ty(b) or a.kind != b.kind { return false; }
+    let k = a.kind;
+    if k == "any" or k == "number" or k == "bigint" or k == "rational" or k == "decimal"
+       or k == "bool" or k == "string" or k == "nil" { return true; }
+    if k == "generic" { return a.inner == b.inner; }
+    if k == "array" or k == "option" { return _ty_same(a.inner, b.inner); }
+    if k == "nonnull" { return _ty_same(a.inner, b.inner); }
+    if k == "result" { return _ty_same(a.inner.ok, b.inner.ok) and _ty_same(a.inner.err, b.inner.err); }
+    if k == "map" { return _ty_same(a.inner.key, b.inner.key) and _ty_same(a.inner.value, b.inner.value); }
+    if k == "fn" {
+        if len(a.inner.params) != len(b.inner.params) { return false; }
+        let i = 0;
+        while i < len(a.inner.params) {
+            if not _ty_same(a.inner.params[i], b.inner.params[i]) { return false; }
+            i = i + 1;
         }
-        if a["kind"] == "option" { return ty_eq(a["inner"], b["inner"]); }
-        if a["kind"] == "generic" { return a["inner"] == b["inner"]; }
+        return _ty_same(a.inner.ret, b.inner.ret);
     }
-    if a["kind"] == "nil" and b["kind"] == "option" { return true; }
+    if k == "struct" or k == "enum" { return a.inner.name == b.inner.name; }
+    if k == "enum_instance" { return a.inner == b.inner; }
     return false;
 }
 
-fn TypeEnv() {
-    return map{ generics: map{}, diagnostics: [] };
+// Compatibility equality: `any` and generic placeholders remain gradual.
+fn ty_eq(a, b) {
+    if not _is_ty(a) or not _is_ty(b) { return false; }
+    if a.kind == "any" or b.kind == "any" or a.kind == "generic" or b.kind == "generic" { return true; }
+    if _ty_same(a, b) { return true; }
+    if a.kind == "nil" and b.kind == "option" { return true; }
+    if b.kind == "nil" and a.kind == "option" { return true; }
+    return false;
 }
 
-fn env_bind(env, name, ty) { env["generics"][name] = ty; }
-
-fn env_resolve(env, ty) {
-    if ty["kind"] == "generic" {
-        let b = env["generics"][ty["inner"]];
-        if b != nil { return b; }
-    }
-    if ty["kind"] == "array" { return ty_array(env_resolve(env, ty["inner"])); }
-    if ty["kind"] == "map" { return ty_map(env_resolve(env, ty["inner"]["key"]), env_resolve(env, ty["inner"]["value"])); }
-    if ty["kind"] == "fn" {
-        let rp = []; let i = 0;
-        while i < len(ty["inner"]["params"]) { array_push(rp, env_resolve(env, ty["inner"]["params"][i])); i = i + 1; }
-        return ty_fn(rp, env_resolve(env, ty["inner"]["ret"]));
-    }
-    if ty["kind"] == "option" { return ty_option(env_resolve(env, ty["inner"])); }
-    return ty;
+fn _numeric_rank(ty) {
+    if not _is_ty(ty) { return 0; }
+    if ty.kind == "number" { return 1; }
+    if ty.kind == "bigint" { return 2; }
+    if ty.kind == "rational" { return 3; }
+    if ty.kind == "decimal" { return 4; }
+    return 0;
 }
 
-fn env_err(env, msg, span) { array_push(env["diagnostics"], map{ message: msg, span: span }); }
+fn _numeric_widen(a, b) {
+    let rank = num_max(_numeric_rank(a), _numeric_rank(b));
+    if rank == 1 { return ty_number(); }
+    if rank == 2 { return ty_bigint(); }
+    if rank == 3 { return ty_rational(); }
+    if rank == 4 { return ty_decimal(); }
+    return ty_any();
+}
 
-fn infer_expr(env, node) {
-    if node == nil { return ty_nil(); }
-    let k = node["kind"];
-    if k == "number" { return ty_number(); }
-    if k == "string" { return ty_string(); }
-    if k == "bool" { return ty_bool(); }
-    if k == "nil" { return ty_nil(); }
-    // The parser emits "ident" for variable references; this simple checker does
-    // not track per-variable types, so a reference infers to `any`.
-    if k == "ident" { return ty_any(); }
-    if k == "binary" {
-        let op = node["op"];
-        if op == "+" or op == "-" or op == "*" or op == "/" { return ty_number(); }
-        if op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=" or op == "and" or op == "or" { return ty_bool(); }
-        return ty_any();
+fn ty_assignable(src, dst) {
+    if not _is_ty(src) or not _is_ty(dst) { return true; }
+    if src.kind == "any" or dst.kind == "any" or src.kind == "generic" or dst.kind == "generic" { return true; }
+    if _ty_same(src, dst) { return true; }
+    if _numeric_rank(src) > 0 and _numeric_rank(dst) > 0 { return true; }
+    if dst.kind == "nonnull" {
+        if src.kind == "nil" { return false; }
+        if src.kind == "nonnull" { return ty_assignable(src.inner, dst.inner); }
+        return ty_assignable(src, dst.inner);
     }
-    if k == "call" {
-        let ft = infer_expr(env, node["func"]);
-        if ft["kind"] == "fn" {
-            let i = 0;
-            while i < len(node["args"]) and i < len(ft["inner"]["params"]) {
-                let at = infer_expr(env, node["args"][i]);
-                let pt = ft["inner"]["params"][i];
-                if pt["kind"] == "generic" { env_bind(env, pt["inner"], at); }
-                i = i + 1;
-            }
-            return env_resolve(env, ft["inner"]["ret"]);
-        }
-        return ty_any();
+    if src.kind == "nonnull" { return ty_assignable(src.inner, dst); }
+    if dst.kind == "option" {
+        if src.kind == "nil" { return true; }
+        return ty_assignable(src, dst.inner);
     }
-    if k == "array" {
-        if len(node["items"]) == 0 { return ty_array(ty_any()); }
-        return ty_array(infer_expr(env, node["items"][0]));
+    if src.kind == "option" and dst.kind == "option" { return ty_assignable(src.inner, dst.inner); }
+    if src.kind == "array" and dst.kind == "array" { return ty_assignable(src.inner, dst.inner); }
+    if src.kind == "map" and dst.kind == "map" {
+        return ty_assignable(src.inner.key, dst.inner.key) and ty_assignable(src.inner.value, dst.inner.value);
     }
-    if k == "map" {
-        if len(node["entries"]) == 0 { return ty_map(ty_any(), ty_any()); }
-        // A map-literal entry's `key` is a raw STRING (the field name), NOT an
-        // expression node — inferring it would index a string with ["kind"]
-        // ("string index must be number"). Keys are strings; infer the value type.
-        return ty_map(ty_string(), infer_expr(env, node["entries"][0]["value"]));
+    if src.kind == "result" and dst.kind == "result" {
+        return ty_assignable(src.inner.ok, dst.inner.ok) and ty_assignable(src.inner.err, dst.inner.err);
+    }
+    if (src.kind == "struct" or src.kind == "enum_instance") and dst.kind == "map" { return true; }
+    if src.kind == "map" and (dst.kind == "struct" or dst.kind == "enum_instance") { return true; }
+    return false;
+}
+
+fn ty_widen(a, b) {
+    if not _is_ty(a) { return b; }
+    if not _is_ty(b) { return a; }
+    if _ty_same(a, b) { return a; }
+    if a.kind == "any" or b.kind == "any" { return ty_any(); }
+    if _numeric_rank(a) > 0 and _numeric_rank(b) > 0 { return _numeric_widen(a, b); }
+    if a.kind == "nil" { return ty_option(b); }
+    if b.kind == "nil" { return ty_option(a); }
+    if a.kind == "option" and b.kind == "option" { return ty_option(ty_widen(a.inner, b.inner)); }
+    if a.kind == "option" { return ty_option(ty_widen(a.inner, b)); }
+    if b.kind == "option" { return ty_option(ty_widen(a, b.inner)); }
+    if a.kind == "array" and b.kind == "array" { return ty_array(ty_widen(a.inner, b.inner)); }
+    if a.kind == "map" and b.kind == "map" {
+        return ty_map(ty_widen(a.inner.key, b.inner.key), ty_widen(a.inner.value, b.inner.value));
+    }
+    if a.kind == "nonnull" and b.kind == "nonnull" {
+        let inner = ty_widen(a.inner, b.inner);
+        if inner.kind == "any" { return inner; }
+        return ty_nonnull(inner);
+    }
+    if a.kind == "nonnull" { return ty_widen(a.inner, b); }
+    if b.kind == "nonnull" { return ty_widen(a, b.inner); }
+    if a.kind == "result" and b.kind == "result" {
+        return ty_result(ty_widen(a.inner.ok, b.inner.ok), ty_widen(a.inner.err, b.inner.err));
     }
     return ty_any();
 }
 
-// Parser type annotations are plain strings ("number", "string", …), not Ty
-// maps. Only the scalar names are unambiguous enough to compare safely; complex
-// annotations vary in spelling, so we don't flag them (avoids false positives).
-fn _is_scalar_ty_name(s) {
-    return s == "number" or s == "string" or s == "bool" or s == "nil";
+fn _type_pair(text) {
+    let depth = 0; let i = 0;
+    while i < len(text) {
+        let ch = slice(text, i, i + 1);
+        if ch == "<" { depth = depth + 1; }
+        elif ch == ">" { depth = depth - 1; }
+        elif ch == "," and depth == 0 {
+            return [str_trim(slice(text, 0, i)), str_trim(slice(text, i + 1, len(text)))];
+        }
+        i = i + 1;
+    }
+    return nil;
 }
 
-// Walk a `block` node's statements. The parser gives fn/if/while/else bodies as
-// block nodes (`{ kind: "block", stmts: [...] }`), NOT bare statement lists.
-fn check_block_node(env, blk) {
-    if blk == nil { return; }
-    if not map_has(blk, "stmts") { return; }
-    let stmts = blk["stmts"];
-    if stmts == nil { return; }
+fn _ty_from_name(name, depth) {
+    if is_map(name) and _is_ty(name) { return name; }
+    if name == nil or name == "" or name == "any" { return ty_any(); }
+    name = str_trim(str(name));
+    if len(name) > MAX_TYPE_TEXT or depth > MAX_TYPE_DEPTH { return ty_any(); }
+    if len(name) > 1 and str_ends_with(name, "?") {
+        return ty_option(_ty_from_name(slice(name, 0, len(name) - 1), depth + 1));
+    }
+    if len(name) > 1 and str_ends_with(name, "!") {
+        return ty_nonnull(_ty_from_name(slice(name, 0, len(name) - 1), depth + 1));
+    }
+    if name == "number" { return ty_number(); }
+    if name == "bigint" { return ty_bigint(); }
+    if name == "rational" { return ty_rational(); }
+    if name == "decimal" { return ty_decimal(); }
+    if name == "bool" { return ty_bool(); }
+    if name == "string" { return ty_string(); }
+    if name == "nil" { return ty_nil(); }
+    if str_starts_with(name, "array<") and str_ends_with(name, ">") and len(name) > 7 {
+        return ty_array(_ty_from_name(slice(name, 6, len(name) - 1), depth + 1));
+    }
+    if str_starts_with(name, "map<") and str_ends_with(name, ">") and len(name) > 5 {
+        let parts = _type_pair(slice(name, 4, len(name) - 1));
+        if parts != nil {
+            return ty_map(_ty_from_name(parts[0], depth + 1), _ty_from_name(parts[1], depth + 1));
+        }
+        return ty_any();
+    }
+    if str_starts_with(name, "result<") and str_ends_with(name, ">") and len(name) > 8 {
+        let parts = _type_pair(slice(name, 7, len(name) - 1));
+        if parts != nil {
+            return ty_result(_ty_from_name(parts[0], depth + 1), _ty_from_name(parts[1], depth + 1));
+        }
+        return ty_any();
+    }
+    return ty_generic(name);
+}
+
+fn _type_text_within_limits(text) {
+    let depth = 0; let i = 0;
+    while i < len(text) {
+        let ch = slice(text, i, i + 1);
+        if ch == "<" {
+            depth = depth + 1;
+            if depth > MAX_TYPE_DEPTH { return false; }
+        } elif ch == ">" {
+            depth = depth - 1;
+            if depth < 0 { return false; }
+        }
+        i = i + 1;
+    }
+    return depth == 0;
+}
+
+fn ty_from_name(name) {
+    if is_map(name) and _is_ty(name) { return name; }
+    if name == nil or name == "" { return ty_any(); }
+    let text = str_trim(str(name));
+    if len(text) > MAX_TYPE_TEXT or not _type_text_within_limits(text) { return ty_any(); }
+    return _ty_from_name(text, 0);
+}
+
+fn _limit_value(options, key, fallback, hard_max) {
+    if options == nil or not is_map(options) or not map_has(options, key) { return fallback; }
+    let v = options[key];
+    if not is_number(v) or v < 1 or num_floor(v) != v { return fallback; }
+    if v > hard_max { return hard_max; }
+    return v;
+}
+
+fn _extern_names_option(options) {
+    if options == nil or not is_map(options) or not map_has(options, "extern_names") {
+        return _NO_EXTERNAL_NAMES;
+    }
+    let result = map{ names: map{}, ordered: [], truncated: false, invalid: false };
+    let names = options.extern_names;
+    if type(names) != "array" { result.invalid = true; return result; }
+    if len(names) > MAX_EXTERN_NAMES { result.truncated = true; }
     let i = 0;
-    while i < len(stmts) { check_stmt(env, stmts[i]); i = i + 1; }
+    while i < len(names) and i < MAX_EXTERN_NAMES {
+        let name = names[i];
+        if is_string(name) and len(name) > 0 and len(name) <= _SUGGEST.MAX_NAME_LENGTH
+           and not map_has(result.names, name) {
+            result.names[name] = true; array_push(result.ordered, name);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn TypeEnv(options = nil) {
+    let suggestions = true;
+    if options != nil and is_map(options) and map_has(options, "suggestions")
+       and options.suggestions == false { suggestions = false; }
+    let external = _extern_names_option(options);
+    return map{
+        generics: map{}, enums: map{}, structs: map{}, enum_decls: nil, struct_decls: nil,
+        scopes: [map{}], diagnostics: [], returns: [],
+        builtins: nil, builtin_names: nil, suggestions: suggestions,
+        externs: external.names, extern_names: external.ordered,
+        externs_truncated: external.truncated, externs_invalid: external.invalid,
+        nodes: 0, depth: 0, catch_depth: 0, tripped: false,
+        max_nodes: _limit_value(options, "max_nodes", 200000, 1000000),
+        max_depth: _limit_value(options, "max_depth", 256, 1024),
+    };
+}
+
+fn env_push(env) { array_push(env.scopes, map{}); }
+fn env_pop(env) { if len(env.scopes) > 1 { array_pop(env.scopes); } }
+fn env_bind(env, name, ty) { env.scopes[len(env.scopes) - 1][name] = ty; }
+fn env_lookup(env, name) {
+    let i = len(env.scopes) - 1;
+    while i >= 0 {
+        if map_has(env.scopes[i], name) { return env.scopes[i][name]; }
+        i = i - 1;
+    }
+    return nil;
+}
+fn env_bind_generic(env, name, ty) { env.generics[name] = ty; }
+
+fn env_resolve(env, ty) {
+    if not _is_ty(ty) { return ty_any(); }
+    if ty.kind == "generic" {
+        if map_has(env.generics, ty.inner) { return env.generics[ty.inner]; }
+        if map_has(env.enums, ty.inner) { return ty_enum_instance(ty.inner); }
+        if map_has(env.structs, ty.inner) { return env.structs[ty.inner]; }
+        return ty;
+    }
+    if ty.kind == "array" { return ty_array(env_resolve(env, ty.inner)); }
+    if ty.kind == "map" { return ty_map(env_resolve(env, ty.inner.key), env_resolve(env, ty.inner.value)); }
+    if ty.kind == "fn" {
+        let rp = []; let i = 0;
+        while i < len(ty.inner.params) { array_push(rp, env_resolve(env, ty.inner.params[i])); i = i + 1; }
+        let generic = map_has(ty.inner, "has_generics") and ty.inner.has_generics;
+        return ty_fn(rp, env_resolve(env, ty.inner.ret), ty.inner.min_arity, generic);
+    }
+    if ty.kind == "option" { return ty_option(env_resolve(env, ty.inner)); }
+    if ty.kind == "nonnull" { return ty_nonnull(env_resolve(env, ty.inner)); }
+    if ty.kind == "result" { return ty_result(env_resolve(env, ty.inner.ok), env_resolve(env, ty.inner.err)); }
+    return ty;
+}
+
+fn env_err(env, msg, span = nil, code = "type-error", suggestion = nil) {
+    let diagnostic = map{ message: msg, span: span, code: code };
+    if suggestion != nil {
+        diagnostic.suggestion = suggestion;
+        diagnostic.help = _SUGGEST.help_for(suggestion);
+    }
+    array_push(env.diagnostics, diagnostic);
+}
+
+fn _append_candidate(out, seen, name, skip_private) {
+    if len(out) >= _SUGGEST.MAX_CANDIDATES or not is_string(name) or len(name) == 0
+       or len(name) > _SUGGEST.MAX_CANDIDATE_LENGTH or map_has(seen, name) { return; }
+    if skip_private and str_starts_with(name, "__") { return; }
+    seen[name] = true; array_push(out, name);
+}
+
+fn _ensure_builtins(env) {
+    if env.builtins == nil { env.builtins = _BUILTINS.builtin_set(); }
+    return env.builtins;
+}
+
+fn _candidate_names(env, extra = nil, skip_private = false) {
+    let out = []; let seen = map{}; let i = len(env.scopes) - 1;
+    while i >= 0 and len(out) < _SUGGEST.MAX_CANDIDATES {
+        let names = map_keys(env.scopes[i]); let j = 0;
+        while j < len(names) and len(out) < _SUGGEST.MAX_CANDIDATES {
+            _append_candidate(out, seen, names[j], skip_private); j = j + 1;
+        }
+        i = i - 1;
+    }
+    if extra != nil and is_map(extra) {
+        let names = map_keys(extra); i = 0;
+        while i < len(names) and len(out) < _SUGGEST.MAX_CANDIDATES {
+            _append_candidate(out, seen, names[i], skip_private); i = i + 1;
+        }
+    }
+    if env.builtin_names == nil { env.builtin_names = map_keys(_ensure_builtins(env)); }
+    i = 0;
+    while i < len(env.extern_names) and len(out) < _SUGGEST.MAX_CANDIDATES {
+        _append_candidate(out, seen, env.extern_names[i], skip_private); i = i + 1;
+    }
+    i = 0;
+    while i < len(env.builtin_names) and len(out) < _SUGGEST.MAX_CANDIDATES {
+        _append_candidate(out, seen, env.builtin_names[i], skip_private); i = i + 1;
+    }
+    return out;
+}
+
+fn _suggest_name(env, name, extra = nil, skip_private = false) {
+    if not env.suggestions { return nil; }
+    return _SUGGEST.suggest_name(name, _candidate_names(env, extra, skip_private));
+}
+
+fn _suggest_member(env, name, members) {
+    if not env.suggestions or members == nil or not is_map(members) { return nil; }
+    let candidates = []; let names = map_keys(members); let i = 0;
+    while i < len(names) and len(candidates) < _SUGGEST.MAX_CANDIDATES {
+        if not str_starts_with(names[i], "__") { array_push(candidates, names[i]); }
+        i = i + 1;
+    }
+    return _SUGGEST.suggest_name(name, candidates);
+}
+
+fn _node_span(node) {
+    if is_map(node) and map_has(node, "span") { return node.span; }
+    if is_map(node) and map_has(node, "line") { return map{ line: node.line }; }
+    return nil;
+}
+
+fn _malformed(env, node, label) {
+    env_err(env, "malformed " + label, _node_span(node), "malformed-ast");
+    return false;
+}
+
+fn _require1(env, node, a, label) {
+    if not map_has(node, a) { return _malformed(env, node, label + ": missing '" + a + "'"); }
+    return true;
+}
+
+fn _require2(env, node, a, b, label) {
+    return _require1(env, node, a, label) and _require1(env, node, b, label);
+}
+
+fn _require3(env, node, a, b, c, label) {
+    return _require1(env, node, a, label) and _require1(env, node, b, label)
+        and _require1(env, node, c, label);
+}
+
+fn _require4(env, node, a, b, c, d, label) {
+    return _require1(env, node, a, label) and _require1(env, node, b, label)
+        and _require1(env, node, c, label) and _require1(env, node, d, label);
+}
+
+fn _require_array_field(env, node, field, label) {
+    if not _require1(env, node, field, label) { return false; }
+    if type(node[field]) != "array" {
+        return _malformed(env, node, label + ": '" + field + "' must be an array");
+    }
+    return true;
+}
+
+fn _enter(env, node_kind) {
+    if env.tripped { return false; }
+    env.nodes = env.nodes + 1;
+    if env.nodes > env.max_nodes {
+        env.tripped = true;
+        env_err(env, "typecheck resource limit exceeded: AST node budget", nil, "resource-limit");
+        return false;
+    }
+    env.depth = env.depth + 1;
+    if env.depth > env.max_depth {
+        env.tripped = true;
+        env_err(env, "typecheck resource limit exceeded: AST depth", nil, "resource-limit");
+        env.depth = env.depth - 1;
+        return false;
+    }
+    return true;
+}
+fn _leave(env) { if env.depth > 0 { env.depth = env.depth - 1; } }
+
+fn _builtin_type(name) {
+    let any = ty_any(); let num = ty_number(); let strty = ty_string(); let boolty = ty_bool(); let nilty = ty_nil();
+    if name == "len" { return ty_fn([any], num); }
+    if name == "str" or name == "type" or name == "json_stringify" { return ty_fn([any], strty); }
+    if name == "parse_number" { return ty_fn([strty], num); }
+    if name == "parse_bool" { return ty_fn([strty], boolty); }
+    if name == "bigint" { return ty_fn([any], ty_bigint()); }
+    if name == "rational" { return ty_fn([any, any], ty_rational(), 1); }
+    if name == "decimal" { return ty_fn([any], ty_decimal()); }
+    if name == "map_keys" { return ty_fn([any], ty_array(strty)); }
+    if name == "map_has" or name == "str_contains" or name == "str_starts_with" or name == "str_ends_with" {
+        return ty_fn([any, any], boolty);
+    }
+    if name == "is_array" or name == "is_bool" or name == "is_fn" or name == "is_map"
+       or name == "is_nil" or name == "is_number" or name == "is_string" { return ty_fn([any], boolty); }
+    if name == "bit_not" or name == "num_abs" or name == "num_floor" or name == "num_ceil" or name == "num_sqrt" {
+        return ty_fn([num], num);
+    }
+    if name == "bit_and" or name == "bit_or" or name == "bit_xor" or name == "bit_shl" or name == "bit_shr"
+       or name == "num_pow" or name == "num_mod" or name == "num_min" or name == "num_max" {
+        return ty_fn([num, num], num);
+    }
+    if name == "range" { return ty_fn([num], ty_array(num)); }
+    if name == "array_push" or name == "push" or name == "send" { return ty_fn([any, any], nilty); }
+    if name == "array_pop" or name == "pop" or name == "recv" or name == "join" { return ty_fn([any], any); }
+    if name == "import" { return ty_fn([strty], any); }
+    return nil;
+}
+
+fn _known_builtin(env, name) {
+    let precise = _builtin_type(name);
+    if precise != nil { return precise; }
+    if map_has(_ensure_builtins(env), name) { return ty_any(); }
+    return nil;
+}
+
+fn _map_value(node, key) {
+    if not is_map(node) or not map_has(node, "kind") or node.kind != "map"
+       or not map_has(node, "entries") or type(node.entries) != "array" { return nil; }
+    let i = 0;
+    while i < len(node.entries) {
+        let entry = node.entries[i];
+        if is_map(entry) and map_has(entry, "key") and entry.key == key and map_has(entry, "value") { return entry.value; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _map_string(node, key) {
+    let value = _map_value(node, key);
+    if is_map(value) and map_has(value, "kind") and value.kind == "string" and map_has(value, "value") { return value.value; }
+    return nil;
+}
+
+fn _struct_ctor_name(stmt) {
+    if not is_map(stmt) or not map_has(stmt, "body") or not is_map(stmt.body)
+       or not map_has(stmt.body, "stmts") or type(stmt.body.stmts) != "array"
+       or len(stmt.body.stmts) != 1 { return nil; }
+    let ret = stmt.body.stmts[0];
+    if not is_map(ret) or not map_has(ret, "kind") or ret.kind != "return"
+       or not map_has(ret, "value") { return nil; }
+    return _map_string(ret.value, "__struct");
+}
+
+fn _struct_ctor_type(env, stmt) {
+    let name = _struct_ctor_name(stmt);
+    if name == nil { return nil; }
+    if len(stmt.params) > MAX_TYPE_MEMBERS {
+        env.tripped = true;
+        env_err(env, "typecheck resource limit exceeded: struct field count", _node_span(stmt), "resource-limit");
+        return nil;
+    }
+    let fields = map{ __struct: _TY_STRING }; let i = 0;
+    while i < len(stmt.params) {
+        let p = stmt.params[i];
+        if not is_map(p) or not map_has(p, "name") { return nil; }
+        let ptype = if map_has(p, "type") { env_resolve(env, ty_from_name(p.type)) } else { ty_any() };
+        fields[p.name] = ptype; i = i + 1;
+    }
+    return ty_struct(name, fields);
+}
+
+fn _enum_decl_name(node) {
+    if not is_map(node) or not map_has(node, "kind") or node.kind != "map"
+       or not map_has(node, "entries") or type(node.entries) != "array"
+       or len(node.entries) == 0 { return nil; }
+    let entry = node.entries[0];
+    if not is_map(entry) or not map_has(entry, "key") or not is_string(entry.key)
+       or not map_has(entry, "value") { return nil; }
+    let value = entry.value;
+    if is_map(value) and map_has(value, "kind") and value.kind == "map" {
+        if _map_string(value, "__variant") == nil { return nil; }
+        return _map_string(value, "__enum");
+    }
+    if is_map(value) and map_has(value, "kind") and value.kind == "fn_lit"
+       and map_has(value, "enum_name") and is_string(value.enum_name) { return value.enum_name; }
+    return nil;
+}
+
+fn _class_decl_name(node) {
+    if not is_map(node) or not map_has(node, "kind") or node.kind != "map" { return nil; }
+    return _map_string(node, "__class_name");
+}
+
+fn _function_has_annotations(stmt) {
+    if map_has(stmt, "ret") and stmt.ret != nil { return true; }
+    if not map_has(stmt, "params") or type(stmt.params) != "array" { return false; }
+    let i = 0;
+    while i < len(stmt.params) {
+        let p = stmt.params[i];
+        if is_map(p) and map_has(p, "type") and p.type != nil { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _enum_decl_type(env, node) {
+    if not is_map(node) or not map_has(node, "kind") or node.kind != "map"
+       or not map_has(node, "entries") or type(node.entries) != "array"
+       or len(node.entries) == 0 { return nil; }
+    if len(node.entries) > MAX_TYPE_MEMBERS {
+        env.tripped = true;
+        env_err(env, "typecheck resource limit exceeded: enum variant count", _node_span(node), "resource-limit");
+        return nil;
+    }
+    let enum_name = nil; let variants = map{}; let i = 0;
+    while i < len(node.entries) {
+        let entry = node.entries[i];
+        if not is_map(entry) or not map_has(entry, "key") or not is_string(entry.key)
+           or not map_has(entry, "value") { return nil; }
+        let value = entry.value; let found_name = nil; let variant_ty = nil;
+        if is_map(value) and map_has(value, "kind") and value.kind == "map" {
+            found_name = _map_string(value, "__enum");
+            if found_name == nil or _map_string(value, "__variant") == nil { return nil; }
+            variant_ty = ty_enum_instance(found_name);
+        } elif is_map(value) and map_has(value, "kind") and value.kind == "fn_lit" {
+            if not map_has(value, "params") or type(value.params) != "array" { return nil; }
+            if map_has(value, "enum_name") and is_string(value.enum_name) { found_name = value.enum_name; }
+            if found_name == nil { return nil; }
+            if map_has(value, "param_types") and type(value.param_types) != "array" { return nil; }
+            let ptypes = []; let pi = 0;
+            while pi < len(value.params) {
+                let annotation = nil;
+                if map_has(value, "param_types") and type(value.param_types) == "array" and pi < len(value.param_types) {
+                    annotation = value.param_types[pi];
+                }
+                array_push(ptypes, env_resolve(env, ty_from_name(annotation))); pi = pi + 1;
+            }
+            variant_ty = ty_fn(ptypes, ty_enum_instance(found_name));
+        } else { return nil; }
+        if enum_name == nil { enum_name = found_name; }
+        elif enum_name != found_name { return nil; }
+        variants[entry.key] = variant_ty; i = i + 1;
+    }
+    return ty_enum(enum_name, variants);
+}
+
+fn _hoist_type_names(env, stmts) {
+    let pending: any = nil;
+    if type(stmts) != "array" { return pending; }
+    let i = 0;
+    while i < len(stmts) {
+        if env.tripped { return pending; }
+        let stmt = stmts[i];
+        if is_map(stmt) and map_has(stmt, "kind") and stmt.kind == "let"
+           and map_has(stmt, "name") and is_string(stmt.name) and map_has(stmt, "value") {
+            let class_name = _class_decl_name(stmt.value);
+            if class_name != nil and class_name == stmt.name {
+                // Class methods and the generated `new` closure refer back to
+                // their class table while its initializer is being checked.
+                env_bind(env, stmt.name, ty_map(ty_string(), ty_any()));
+            }
+            let enum_name = _enum_decl_name(stmt.value);
+            if enum_name != nil {
+                if env.enum_decls == nil { env.enum_decls = map{}; }
+                env.enum_decls[stmt.name] = enum_name;
+                env.enums[enum_name] = ty_enum(enum_name, map{});
+                if pending == nil { pending = []; }
+                array_push(pending, stmt);
+            }
+        }
+        if is_map(stmt) and map_has(stmt, "kind") and stmt.kind == "fn"
+           and map_has(stmt, "name") and is_string(stmt.name) {
+            let struct_name = _struct_ctor_name(stmt);
+            if struct_name != nil {
+                if env.struct_decls == nil { env.struct_decls = map{}; }
+                env.struct_decls[stmt.name] = struct_name;
+                env.structs[struct_name] = ty_struct(struct_name, map{});
+            }
+            if map_has(stmt, "params") and type(stmt.params) == "array" {
+                if struct_name == nil and not _function_has_annotations(stmt) {
+                    env_bind(env, stmt.name, _function_type(env, stmt));
+                } else {
+                    if pending == nil { pending = []; }
+                    array_push(pending, stmt);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return pending;
+}
+
+fn _function_type(env, stmt) {
+    let params = []; let min_arity = 0; let saw_default = false; let has_generics = false; let i = 0;
+    while i < len(stmt.params) {
+        let p = stmt.params[i];
+        let annotated = is_map(p) and map_has(p, "type") and p.type != nil;
+        let ptype = if annotated { env_resolve(env, ty_from_name(p.type)) } else { ty_any() };
+        if annotated and _ty_has_generic(ptype) { has_generics = true; }
+        array_push(params, ptype);
+        let has_default = is_map(p) and map_has(p, "default") and p.default != nil;
+        if has_default { saw_default = true; }
+        if not saw_default { min_arity = min_arity + 1; }
+        i = i + 1;
+    }
+    let ret = ty_any();
+    if env.struct_decls != nil and map_has(env.struct_decls, stmt.name) {
+        ret = env.structs[env.struct_decls[stmt.name]];
+    } elif map_has(stmt, "ret") and stmt.ret != nil {
+        ret = env_resolve(env, ty_from_name(stmt.ret));
+        if _ty_has_generic(ret) { has_generics = true; }
+    }
+    return ty_fn(params, ret, min_arity, has_generics);
+}
+
+fn _hoist_declarations(env, stmts) {
+    if type(stmts) != "array" { return; }
+    let pending = _hoist_type_names(env, stmts);
+    if pending == nil { return; }
+    let i = 0;
+    while i < len(pending) {
+        if env.tripped { return; }
+        let stmt = pending[i];
+        if is_map(stmt) and map_has(stmt, "kind") and stmt.kind == "let"
+           and env.enum_decls != nil and map_has(stmt, "name") and map_has(env.enum_decls, stmt.name) {
+            let enum_ty = _enum_decl_type(env, stmt.value);
+            if enum_ty != nil { env.enums[enum_ty.inner.name] = enum_ty; env_bind(env, stmt.name, enum_ty); }
+        }
+        if is_map(stmt) and map_has(stmt, "kind") and stmt.kind == "fn"
+           and map_has(stmt, "name") and is_string(stmt.name)
+           and map_has(stmt, "params") and type(stmt.params) == "array" {
+            if env.struct_decls != nil and map_has(env.struct_decls, stmt.name) {
+                let struct_ty = _struct_ctor_type(env, stmt);
+                if struct_ty != nil { env.structs[struct_ty.inner.name] = struct_ty; }
+            }
+            env_bind(env, stmt.name, _function_type(env, stmt));
+        }
+        i = i + 1;
+    }
+}
+
+fn _check_assignable(env, got, expected, label, node) {
+    if not ty_assignable(got, expected) {
+        env_err(env, label + ": got " + ty_to_string(got) + ", expected " + ty_to_string(expected), _node_span(node));
+    }
+}
+
+fn _bind_type_generics(param, arg, subst) {
+    if param.kind == "generic" {
+        if not map_has(subst, param.inner) { subst[param.inner] = arg; }
+        return;
+    }
+    if (param.kind == "array" or param.kind == "option" or param.kind == "nonnull")
+       and arg.kind == param.kind { _bind_type_generics(param.inner, arg.inner, subst); return; }
+    if param.kind == "map" and arg.kind == "map" {
+        _bind_type_generics(param.inner.key, arg.inner.key, subst);
+        _bind_type_generics(param.inner.value, arg.inner.value, subst); return;
+    }
+    if param.kind == "result" and arg.kind == "result" {
+        _bind_type_generics(param.inner.ok, arg.inner.ok, subst);
+        _bind_type_generics(param.inner.err, arg.inner.err, subst);
+    }
+}
+
+fn _ty_has_generic(ty) {
+    if not _is_ty(ty) { return false; }
+    if ty.kind == "generic" { return true; }
+    if ty.kind == "array" or ty.kind == "option" or ty.kind == "nonnull" {
+        return _ty_has_generic(ty.inner);
+    }
+    if ty.kind == "map" { return _ty_has_generic(ty.inner.key) or _ty_has_generic(ty.inner.value); }
+    if ty.kind == "result" { return _ty_has_generic(ty.inner.ok) or _ty_has_generic(ty.inner.err); }
+    return false;
+}
+
+fn _substitute_type(ty, subst) {
+    if ty.kind == "generic" and map_has(subst, ty.inner) { return subst[ty.inner]; }
+    if ty.kind == "array" { return ty_array(_substitute_type(ty.inner, subst)); }
+    if ty.kind == "option" { return ty_option(_substitute_type(ty.inner, subst)); }
+    if ty.kind == "nonnull" { return ty_nonnull(_substitute_type(ty.inner, subst)); }
+    if ty.kind == "map" { return ty_map(_substitute_type(ty.inner.key, subst), _substitute_type(ty.inner.value, subst)); }
+    if ty.kind == "result" { return ty_result(_substitute_type(ty.inner.ok, subst), _substitute_type(ty.inner.err, subst)); }
+    if ty.kind == "fn" {
+        let params = []; let i = 0;
+        while i < len(ty.inner.params) { array_push(params, _substitute_type(ty.inner.params[i], subst)); i = i + 1; }
+        let generic = map_has(ty.inner, "has_generics") and ty.inner.has_generics;
+        return ty_fn(params, _substitute_type(ty.inner.ret, subst), ty.inner.min_arity, generic);
+    }
+    return ty;
+}
+
+fn _check_enum_exhaustiveness(env, node) {
+    if node.melse != nil { return; }
+    let catch_all = false; let covered = map{}; let i = 0;
+    while i < len(node.arms) {
+        let arm = node.arms[i];
+        if is_map(arm) and map_has(arm, "pattern") and is_map(arm.pattern) and map_has(arm.pattern, "ptype") {
+            if arm.pattern.ptype == "wildcard" or arm.pattern.ptype == "bind" { catch_all = true; }
+            elif arm.pattern.ptype == "literal" and map_has(arm.pattern, "value") {
+                let value = arm.pattern.value;
+                if is_map(value) and map_has(value, "kind") and value.kind == "string" and map_has(value, "value") {
+                    covered[value.value] = true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if catch_all { return; }
+    let scrutinee = node.scrutinee;
+    if not is_map(scrutinee) or not map_has(scrutinee, "kind") or scrutinee.kind != "member"
+       or not map_has(scrutinee, "name") or scrutinee.name != "__variant"
+       or not map_has(scrutinee, "obj") { return; }
+    let owner = infer_expr(env, scrutinee.obj);
+    if owner.kind != "enum_instance" or not map_has(env.enums, owner.inner) { return; }
+    let variants = env.enums[owner.inner].inner.variants; let missing = [];
+    let names = map_keys(variants); i = 0;
+    while i < len(names) {
+        if not map_has(covered, names[i]) { array_push(missing, names[i]); }
+        i = i + 1;
+    }
+    if len(missing) > 0 {
+        env_err(env, "non-exhaustive match on enum '" + owner.inner + "': missing variant(s) "
+            + str_join(missing, ", "), _node_span(node), "non-exhaustive-match");
+    }
+}
+
+fn _infer_block_value(env, block) {
+    if not is_map(block) or not map_has(block, "stmts") or type(block.stmts) != "array" { return ty_any(); }
+    env_push(env); _hoist_declarations(env, block.stmts);
+    let out = ty_nil(); let i = 0;
+    while i < len(block.stmts) {
+        let stmt = block.stmts[i];
+        if i == len(block.stmts) - 1 and is_map(stmt) and map_has(stmt, "kind") and stmt.kind == "expr_stmt" {
+            out = infer_expr(env, stmt.expr);
+        } else { check_stmt(env, stmt); }
+        i = i + 1;
+    }
+    env_pop(env);
+    return out;
+}
+
+fn _infer_expr(env, node) {
+    if node == nil { return ty_nil(); }
+    if not is_map(node) or not map_has(node, "kind") {
+        env_err(env, "malformed expression node", nil, "malformed-ast");
+        return ty_any();
+    }
+    let k = node.kind;
+    if k == "number" { return ty_number(); }
+    if k == "string" { return ty_string(); }
+    if k == "bool" { return ty_bool(); }
+    if k == "nil" { return ty_nil(); }
+    if k == "ident" {
+        if not _require1(env, node, "name", "identifier expression") { return ty_any(); }
+        let found = env_lookup(env, node.name);
+        if found != nil { return found; }
+        if map_has(env.externs, node.name) { return ty_any(); }
+        let builtin = _known_builtin(env, node.name);
+        if builtin != nil { return builtin; }
+        // Missing globals are runtime errors and therefore catchable by the
+        // language's try/catch expression. Outside a protected body they remain
+        // fail-closed static errors.
+        if env.catch_depth > 0 { return ty_any(); }
+        let suggestion = _suggest_name(env, node.name);
+        env_err(env, "cannot find name '" + node.name + "' in this scope",
+            _node_span(node), "undefined-name", suggestion);
+        return ty_any();
+    }
+    if k == "binary" {
+        if not _require3(env, node, "left", "right", "op", "binary expression") { return ty_any(); }
+        let left = infer_expr(env, node.left); let right = infer_expr(env, node.right); let op = node.op;
+        if op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=" or op == "and" or op == "or" { return ty_bool(); }
+        if op == "+" and (left.kind == "string" or right.kind == "string") { return ty_string(); }
+        if left.kind == "any" or right.kind == "any" { return ty_any(); }
+        if left.kind == "number" and right.kind == "number" { return ty_number(); }
+        if _numeric_rank(left) > 0 and _numeric_rank(right) > 0 { return _numeric_widen(left, right); }
+        return ty_number();
+    }
+    if k == "unary" {
+        if not _require2(env, node, "operand", "op", "unary expression") { return ty_any(); }
+        let operand = infer_expr(env, node.operand);
+        if node.op == "not" or node.op == "!" { return ty_bool(); }
+        if operand.kind == "any" { return ty_any(); }
+        return ty_number();
+    }
+    if k == "call" {
+        if not _require1(env, node, "func", "call expression")
+           or not _require_array_field(env, node, "args", "call expression") { return ty_any(); }
+        let ft = infer_expr(env, node.func); let args = node.args; let arg_types = []; let i = 0;
+        while i < len(args) { array_push(arg_types, infer_expr(env, args[i])); i = i + 1; }
+        if ft.kind == "fn" {
+            let min_arity = ft.inner.min_arity; let max_arity = len(ft.inner.params);
+            if len(args) < min_arity or len(args) > max_arity {
+                env_err(env, "call arity mismatch: got " + str(len(args)) + ", expected " + str(min_arity) + ".." + str(max_arity), _node_span(node), "arity");
+            }
+            let generic = map_has(ft.inner, "has_generics") and ft.inner.has_generics;
+            if not generic {
+                i = 0;
+                while i < len(arg_types) and i < max_arity {
+                    _check_assignable(env, arg_types[i], ft.inner.params[i], "argument " + str(i + 1) + " type mismatch", args[i]);
+                    i = i + 1;
+                }
+                return env_resolve(env, ft.inner.ret);
+            }
+            let subst = map{}; i = 0;
+            while i < len(arg_types) and i < max_arity {
+                _bind_type_generics(ft.inner.params[i], arg_types[i], subst);
+                let expected = _substitute_type(ft.inner.params[i], subst);
+                _check_assignable(env, arg_types[i], expected, "argument " + str(i + 1) + " type mismatch", args[i]);
+                i = i + 1;
+            }
+            return env_resolve(env, _substitute_type(ft.inner.ret, subst));
+        }
+        return ty_any();
+    }
+    if k == "array" {
+        if not _require_array_field(env, node, "items", "array expression") { return ty_any(); }
+        if len(node.items) == 0 { return ty_array(ty_any()); }
+        let item_ty = infer_expr(env, node.items[0]); let i = 1;
+        while i < len(node.items) { item_ty = ty_widen(item_ty, infer_expr(env, node.items[i])); i = i + 1; }
+        return ty_array(item_ty);
+    }
+    if k == "map" {
+        if not _require_array_field(env, node, "entries", "map expression") { return ty_any(); }
+        if len(node.entries) == 0 { return ty_map(ty_string(), ty_any()); }
+        let entry = node.entries[0];
+        if not is_map(entry) or not _require1(env, entry, "value", "map entry") { return ty_any(); }
+        let value_ty = infer_expr(env, node.entries[0].value); let i = 1;
+        while i < len(node.entries) {
+            entry = node.entries[i];
+            if not is_map(entry) or not _require1(env, entry, "value", "map entry") { return ty_any(); }
+            value_ty = ty_widen(value_ty, infer_expr(env, entry.value)); i = i + 1;
+        }
+        return ty_map(ty_string(), value_ty);
+    }
+    if k == "index" or k == "opt_index" {
+        if not _require2(env, node, "obj", "index", "index expression") { return ty_any(); }
+        let obj = infer_expr(env, node.obj); let _idx = infer_expr(env, node.index); let out = ty_any();
+        if obj.kind == "array" { out = obj.inner; }
+        elif obj.kind == "map" { out = obj.inner.value; }
+        elif obj.kind == "string" { out = ty_string(); }
+        if k == "opt_index" { return ty_option(out); }
+        return out;
+    }
+    if k == "member" or k == "opt_member" {
+        if not _require2(env, node, "obj", "name", "member expression") { return ty_any(); }
+        let obj = infer_expr(env, node.obj); let out = ty_any();
+        if obj.kind == "map" { out = obj.inner.value; }
+        elif obj.kind == "struct" {
+            if map_has(obj.inner.fields, node.name) { out = obj.inner.fields[node.name]; }
+            else {
+                let suggestion = _suggest_member(env, node.name, obj.inner.fields);
+                env_err(env, "no field '" + node.name + "' on struct '" + obj.inner.name + "'",
+                    _node_span(node), "unknown-field", suggestion);
+            }
+        }
+        elif obj.kind == "enum" {
+            if map_has(obj.inner.variants, node.name) { out = obj.inner.variants[node.name]; }
+            else {
+                let suggestion = _suggest_member(env, node.name, obj.inner.variants);
+                env_err(env, "no variant '" + node.name + "' on enum '" + obj.inner.name + "'",
+                    _node_span(node), "unknown-variant", suggestion);
+            }
+        }
+        elif obj.kind == "enum_instance" {
+            if node.name == "__variant" or node.name == "__enum" { out = ty_string(); }
+            elif node.name == "values" { out = ty_array(ty_any()); }
+        }
+        if k == "opt_member" { return ty_option(out); }
+        return out;
+    }
+    if k == "coalesce" {
+        if not _require2(env, node, "left", "right", "coalesce expression") { return ty_any(); }
+        let left = infer_expr(env, node.left); let right = infer_expr(env, node.right);
+        if left.kind == "option" { return ty_widen(left.inner, right); }
+        return ty_widen(left, right);
+    }
+    if k == "try" {
+        if not _require2(env, node, "body", "handler", "try expression") { return ty_any(); }
+        env.catch_depth = env.catch_depth + 1;
+        let body_ty = infer_expr(env, node.body);
+        env.catch_depth = env.catch_depth - 1;
+        return ty_widen(body_ty, infer_expr(env, node.handler));
+    }
+    if k == "throw" {
+        if not _require1(env, node, "value", "throw expression") { return ty_any(); }
+        let _ = infer_expr(env, node.value); return ty_any();
+    }
+    if k == "if_expr" {
+        if not _require3(env, node, "cond", "then", "else", "if expression") { return ty_any(); }
+        let _cond = infer_expr(env, node.cond);
+        let then_ty = _infer_block_value(env, node.then); let else_ty = ty_nil();
+        if node["else"] != nil {
+            if is_map(node["else"]) and map_has(node["else"], "kind") and node["else"].kind == "if_expr" { else_ty = infer_expr(env, node["else"]); }
+            else { else_ty = _infer_block_value(env, node["else"]); }
+        }
+        return ty_widen(then_ty, else_ty);
+    }
+    if k == "match" {
+        if not _require2(env, node, "scrutinee", "melse", "match expression")
+           or not _require_array_field(env, node, "arms", "match expression") { return ty_any(); }
+        let scrutinee_ty = infer_expr(env, node.scrutinee); _check_enum_exhaustiveness(env, node);
+        let out = nil; let i = 0;
+        while i < len(node.arms) {
+            let arm = node.arms[i];
+            if not is_map(arm) or not _require3(env, arm, "pattern", "guard", "body", "match arm") { return ty_any(); }
+            if not is_map(arm.pattern) or not _require1(env, arm.pattern, "ptype", "match pattern") { return ty_any(); }
+            env_push(env);
+            if arm.pattern.ptype == "bind" and not _require1(env, arm.pattern, "name", "bind pattern") { env_pop(env); return ty_any(); }
+            if arm.pattern.ptype == "literal" and not _require1(env, arm.pattern, "value", "literal pattern") { env_pop(env); return ty_any(); }
+            if arm.pattern.ptype == "bind" { env_bind(env, arm.pattern.name, scrutinee_ty); }
+            elif arm.pattern.ptype == "literal" { let _pattern = infer_expr(env, arm.pattern.value); }
+            if arm.guard != nil { let _guard = infer_expr(env, arm.guard); }
+            let arm_ty = infer_expr(env, arm.body); out = if out == nil { arm_ty } else { ty_widen(out, arm_ty) };
+            env_pop(env); i = i + 1;
+        }
+        if node.melse != nil { let else_ty = infer_expr(env, node.melse); out = if out == nil { else_ty } else { ty_widen(out, else_ty) }; }
+        if out == nil { return ty_nil(); }
+        return out;
+    }
+    if k == "fn_lit" {
+        if not _require_array_field(env, node, "params", "function literal")
+           or not _require1(env, node, "body", "function literal") { return ty_any(); }
+        env_push(env); let params = []; let i = 0;
+        while i < len(node.params) {
+            let ptype = ty_any();
+            if map_has(node, "param_types") and type(node.param_types) == "array" and i < len(node.param_types) {
+                ptype = env_resolve(env, ty_from_name(node.param_types[i]));
+            }
+            env_bind(env, node.params[i], ptype); array_push(params, ptype); i = i + 1;
+        }
+        let ret_type = if map_has(node, "enum_name") { ty_enum_instance(node.enum_name) } else { ty_any() };
+        array_push(env.returns, ret_type);
+        if is_map(node.body) and map_has(node.body, "stmts") { _hoist_declarations(env, node.body.stmts); i = 0; while i < len(node.body.stmts) { check_stmt(env, node.body.stmts[i]); i = i + 1; } }
+        array_pop(env.returns); env_pop(env);
+        return ty_fn(params, ret_type);
+    }
+    if k == "assign" {
+        if not _require2(env, node, "name", "value", "assignment expression") { return ty_any(); }
+        let value_ty = infer_expr(env, node.value); let old = env_lookup(env, node.name);
+        if old != nil { _check_assignable(env, value_ty, old, "assignment type mismatch for '" + node.name + "'", node); }
+        return value_ty;
+    }
+    if k == "assign_to" {
+        if not _require2(env, node, "target", "value", "target assignment expression") { return ty_any(); }
+        let target_ty = infer_expr(env, node.target); let value_ty = infer_expr(env, node.value);
+        _check_assignable(env, value_ty, target_ty, "indexed/member assignment type mismatch", node);
+        return value_ty;
+    }
+    env_err(env, "unsupported expression kind in self-hosted typechecker: " + str(k), _node_span(node), "unsupported-ast");
+    return ty_any();
+}
+
+fn infer_expr(env, node) {
+    if not _enter(env, "expr") { return ty_any(); }
+    let out = _infer_expr(env, node); _leave(env); return out;
+}
+
+fn _check_block(env, block) {
+    if not is_map(block) or not map_has(block, "stmts") or type(block.stmts) != "array" {
+        env_err(env, "malformed block node", _node_span(block), "malformed-ast"); return;
+    }
+    env_push(env); _hoist_declarations(env, block.stmts);
+    let i = 0; while i < len(block.stmts) { check_stmt(env, block.stmts[i]); i = i + 1; }
+    env_pop(env);
+}
+
+fn _check_binding(env, stmt, is_const) {
+    if not _require3(env, stmt, "name", "value", "type", "binding statement") { return; }
+    if stmt.type == nil and env.enum_decls != nil and map_has(env.enum_decls, stmt.name) {
+        let enum_name = env.enum_decls[stmt.name];
+        if map_has(env.enums, enum_name) { env_bind(env, stmt.name, env.enums[enum_name]); return; }
+    }
+    let value_ty = infer_expr(env, stmt.value); let declared = ty_any();
+    if is_const and value_ty.kind == "nil" {
+        env_err(env, "const '" + stmt.name + "' cannot be initialized to nil", _node_span(stmt), "const-nil");
+    }
+    if stmt.type != nil {
+        declared = env_resolve(env, ty_from_name(stmt.type));
+        if declared.kind == "nonnull" and value_ty.kind == "nil" {
+            env_err(env, "non-null constraint violated for '" + stmt.name + "'", _node_span(stmt), "non-null");
+        } else { _check_assignable(env, value_ty, declared, "type mismatch for '" + stmt.name + "'", stmt); }
+        env_bind(env, stmt.name, declared);
+    } else {
+        let enum_ty = _enum_decl_type(env, stmt.value);
+        if enum_ty != nil {
+            env.enums[enum_ty.inner.name] = enum_ty; env_bind(env, stmt.name, enum_ty);
+        } else { env_bind(env, stmt.name, value_ty); }
+    }
+}
+
+fn _check_function(env, stmt) {
+    if not _require3(env, stmt, "name", "body", "ret", "function statement")
+       or not _require_array_field(env, stmt, "params", "function statement") { return; }
+    let shape_i = 0;
+    while shape_i < len(stmt.params) {
+        let shape_p = stmt.params[shape_i];
+        if not is_map(shape_p) or not _require3(env, shape_p, "name", "type", "default", "function parameter") { return; }
+        shape_i = shape_i + 1;
+    }
+    let signature = env_lookup(env, stmt.name);
+    if signature == nil { signature = _function_type(env, stmt); env_bind(env, stmt.name, signature); }
+    env_push(env); let i = 0;
+    while i < len(stmt.params) {
+        let p = stmt.params[i]; let pty = signature.inner.params[i]; env_bind(env, p.name, pty);
+        if p.default != nil {
+            let default_ty = infer_expr(env, p.default);
+            _check_assignable(env, default_ty, pty, "default value type mismatch for parameter '" + p.name + "'", p.default);
+        }
+        i = i + 1;
+    }
+    array_push(env.returns, signature.inner.ret);
+    if is_map(stmt.body) and map_has(stmt.body, "stmts") {
+        _hoist_declarations(env, stmt.body.stmts); i = 0;
+        while i < len(stmt.body.stmts) { check_stmt(env, stmt.body.stmts[i]); i = i + 1; }
+    } else { env_err(env, "malformed function body", _node_span(stmt), "malformed-ast"); }
+    array_pop(env.returns); env_pop(env);
+}
+
+fn _check_stmt(env, stmt) {
+    if stmt == nil { return; }
+    if not is_map(stmt) or not map_has(stmt, "kind") {
+        env_err(env, "malformed statement node", nil, "malformed-ast"); return;
+    }
+    let k = stmt.kind;
+    if k == "let" { _check_binding(env, stmt, false); return; }
+    if k == "const" { _check_binding(env, stmt, true); return; }
+    if k == "fn" { _check_function(env, stmt); return; }
+    if k == "return" {
+        if not _require1(env, stmt, "value", "return statement") { return; }
+        let got = if stmt.value == nil { ty_nil() } else { infer_expr(env, stmt.value) };
+        if len(env.returns) > 0 { _check_assignable(env, got, env.returns[len(env.returns) - 1], "return type mismatch", stmt); }
+        return;
+    }
+    if k == "if" {
+        if not _require3(env, stmt, "cond", "then", "else", "if statement")
+           or not _require_array_field(env, stmt, "elifs", "if statement") { return; }
+        let _cond = infer_expr(env, stmt.cond); _check_block(env, stmt.then); let i = 0;
+        while i < len(stmt.elifs) {
+            let branch = stmt.elifs[i];
+            if not is_map(branch) or not _require2(env, branch, "cond", "body", "elif branch") { return; }
+            let _elif_cond = infer_expr(env, branch.cond); _check_block(env, branch.body); i = i + 1;
+        }
+        if stmt["else"] != nil { _check_block(env, stmt["else"]); }
+        return;
+    }
+    if k == "while" {
+        if not _require2(env, stmt, "cond", "body", "while statement") { return; }
+        let _cond = infer_expr(env, stmt.cond); _check_block(env, stmt.body); return;
+    }
+    if k == "for" {
+        if not _require3(env, stmt, "end", "name", "body", "for statement") { return; }
+        let _end = infer_expr(env, stmt.end); env_push(env); env_bind(env, stmt.name, ty_number());
+        if is_map(stmt.body) and map_has(stmt.body, "stmts") { _hoist_declarations(env, stmt.body.stmts); let i = 0; while i < len(stmt.body.stmts) { check_stmt(env, stmt.body.stmts[i]); i = i + 1; } }
+        env_pop(env); return;
+    }
+    if k == "for_range" {
+        if not _require4(env, stmt, "start", "end", "name", "body", "for-range statement") { return; }
+        let _start = infer_expr(env, stmt.start); let _end = infer_expr(env, stmt.end); env_push(env); env_bind(env, stmt.name, ty_number());
+        if is_map(stmt.body) and map_has(stmt.body, "stmts") { _hoist_declarations(env, stmt.body.stmts); let i = 0; while i < len(stmt.body.stmts) { check_stmt(env, stmt.body.stmts[i]); i = i + 1; } }
+        env_pop(env); return;
+    }
+    if k == "for_in" {
+        if not _require3(env, stmt, "iter", "name", "body", "for-in statement") { return; }
+        let collection = infer_expr(env, stmt.iter); let elem = ty_any();
+        if collection.kind == "array" { elem = collection.inner; } elif collection.kind == "map" { elem = collection.inner.key; }
+        env_push(env); env_bind(env, stmt.name, elem);
+        if is_map(stmt.body) and map_has(stmt.body, "stmts") { _hoist_declarations(env, stmt.body.stmts); let i = 0; while i < len(stmt.body.stmts) { check_stmt(env, stmt.body.stmts[i]); i = i + 1; } }
+        env_pop(env); return;
+    }
+    if k == "for_map" {
+        if not _require4(env, stmt, "iter", "key", "val", "body", "for-map statement") { return; }
+        let collection = infer_expr(env, stmt.iter); let key_ty = ty_any(); let value_ty = ty_any();
+        if collection.kind == "map" { key_ty = collection.inner.key; value_ty = collection.inner.value; }
+        env_push(env); env_bind(env, stmt.key, key_ty); env_bind(env, stmt.val, value_ty);
+        if is_map(stmt.body) and map_has(stmt.body, "stmts") { _hoist_declarations(env, stmt.body.stmts); let i = 0; while i < len(stmt.body.stmts) { check_stmt(env, stmt.body.stmts[i]); i = i + 1; } }
+        env_pop(env); return;
+    }
+    if k == "expr_stmt" {
+        if not _require1(env, stmt, "expr", "expression statement") { return; }
+        let _expr = infer_expr(env, stmt.expr); return;
+    }
+    if k == "print" {
+        if not _require1(env, stmt, "value", "print statement") { return; }
+        if stmt.value != nil { let _value = infer_expr(env, stmt.value); } return;
+    }
+    if k == "block" { _check_block(env, stmt); return; }
+    if k == "import" or k == "export" or k == "break" or k == "continue" { return; }
+    env_err(env, "unsupported statement kind in self-hosted typechecker: " + str(k), _node_span(stmt), "unsupported-ast");
 }
 
 fn check_stmt(env, stmt) {
-    if stmt == nil { return; }
-    let k = stmt["kind"];
-
-    if k == "let" or k == "const" {
-        let vt = infer_expr(env, stmt["value"]);
-        let at = stmt["type"]; // a type-name string, or nil
-        // Flag only a concrete scalar-vs-scalar disagreement; skip when the
-        // value type is unknown (`any`) so untyped/complex values never
-        // false-positive.
-        if at != nil and _is_scalar_ty_name(at) {
-            let vts = ty_to_string(vt);
-            if _is_scalar_ty_name(vts) and vts != at {
-                // Parser nodes don't carry a `span` field; read it defensively.
-                let sp = if map_has(stmt, "span") { stmt["span"] } else { nil };
-                env_err(env, "type mismatch: declared " + at + " but value is " + vts, sp);
-            }
-        }
-        return;
-    }
-
-    if k == "fn" {
-        let be = TypeEnv();
-        let i = 0;
-        while i < len(stmt["params"]) {
-            let p = stmt["params"][i];
-            // Params may be maps {name,type} or bare name strings.
-            let pname = if type(p) == "map" { p["name"] } else { p };
-            env_bind(be, pname, ty_any());
-            i = i + 1;
-        }
-        check_block_node(be, stmt["body"]);
-        let d = 0;
-        while d < len(be["diagnostics"]) { array_push(env["diagnostics"], be["diagnostics"][d]); d = d + 1; }
-        return;
-    }
-
-    if k == "if" {
-        let _ = infer_expr(env, stmt["cond"]);
-        check_block_node(env, stmt["then"]);
-        let elifs = stmt["elifs"];
-        if elifs != nil {
-            let ei = 0;
-            while ei < len(elifs) {
-                let _e = infer_expr(env, elifs[ei]["cond"]);
-                check_block_node(env, elifs[ei]["body"]);
-                ei = ei + 1;
-            }
-        }
-        if stmt["else"] != nil { check_block_node(env, stmt["else"]); }
-        return;
-    }
-
-    if k == "while" {
-        let _ = infer_expr(env, stmt["cond"]);
-        check_block_node(env, stmt["body"]);
-        return;
-    }
-
-    if k == "return" {
-        if stmt["value"] != nil { let _ = infer_expr(env, stmt["value"]); }
-        return;
-    }
-
-    if k == "expr_stmt" { let _ = infer_expr(env, stmt["expr"]); return; }
-
-    if k == "block" {
-        let i = 0;
-        while i < len(stmt["stmts"]) { check_stmt(env, stmt["stmts"][i]); i = i + 1; }
-        return;
-    }
+    if not _enter(env, "stmt") { return; }
+    _check_stmt(env, stmt); _leave(env);
 }
 
-fn type_check(stmts) {
-    let env = TypeEnv();
-    let i = 0;
-    while i < len(stmts) { check_stmt(env, stmts[i]); i = i + 1; }
-    return env["diagnostics"];
+fn type_check(stmts, options = nil) {
+    let env = TypeEnv(options);
+    if type(stmts) != "array" {
+        env_err(env, "type_check expects an array of statements", nil, "malformed-ast");
+        return env.diagnostics;
+    }
+    if env.externs_invalid {
+        env_err(env, "typecheck option 'extern_names' must be an array", nil, "invalid-option");
+        return env.diagnostics;
+    }
+    if env.externs_truncated {
+        env_err(env, "typecheck resource limit exceeded: external symbol count", nil, "resource-limit");
+        return env.diagnostics;
+    }
+    _hoist_declarations(env, stmts);
+    let i = 0; while i < len(stmts) { check_stmt(env, stmts[i]); i = i + 1; }
+    return env.diagnostics;
 }
 
-export Ty; export ty_any; export ty_number; export ty_bool; export ty_string; export ty_nil;
-export ty_array; export ty_map; export ty_fn; export ty_option; export ty_generic;
-export ty_to_string; export ty_eq;
-export TypeEnv; export env_bind; export env_resolve; export env_err;
+export Ty; export ty_any; export ty_number; export ty_bigint; export ty_rational; export ty_decimal;
+export ty_bool; export ty_string; export ty_nil;
+export ty_array; export ty_map; export ty_fn; export ty_option; export ty_result; export ty_nonnull;
+export ty_generic; export ty_struct; export ty_enum; export ty_enum_instance;
+export ty_to_string; export ty_eq; export ty_assignable; export ty_widen; export ty_from_name;
+export TypeEnv; export env_bind; export env_lookup; export env_resolve; export env_err;
 export infer_expr; export check_stmt; export type_check;
+export MAX_EXTERN_NAMES;

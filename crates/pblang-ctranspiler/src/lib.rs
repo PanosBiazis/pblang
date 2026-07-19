@@ -111,6 +111,9 @@ struct TranspileCtx {
     opts: TranspileOptions,
     /// Forward declarations for all user functions.
     forward_decls: String,
+    /// Global declarations for module-level (file-scope) `let`/`const` bindings, so top-level
+    /// functions can reference them (they are declared here and initialized in order in main).
+    global_decls: String,
     /// Function definitions.
     functions: String,
     /// Main function body.
@@ -148,6 +151,7 @@ impl TranspileCtx {
         TranspileCtx {
             opts,
             forward_decls: String::new(),
+            global_decls: String::new(),
             functions: String::new(),
             main_body: String::new(),
             indent: 1,
@@ -319,7 +323,7 @@ impl TranspileCtx {
                 let arity = params.len();
                 self.function_arities.insert(name.clone(), arity);
                 let param_str = (0..arity)
-                    .map(|i| format!("PbVal a{i}"))
+                    .map(|i| format!("PbVal __pba{i}"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.forward_decls
@@ -349,19 +353,33 @@ impl TranspileCtx {
         match stmt.kind {
             StmtKind::Let(name, _ty, init) => {
                 let rhs = self.emit_expr_str(&init.kind);
-                if self.boxed.contains(&name) {
-                    self.emit(&format!("PbVal {name} = pb_arr_lit(1, {rhs});"));
+                let value = if self.boxed.contains(&name) {
+                    format!("pb_arr_lit(1, {rhs})")
                 } else {
-                    self.emit(&format!("PbVal {name} = {rhs};"));
+                    rhs
+                };
+                // A file-scope let (target==Main at the outermost scope) becomes a C global so
+                // top-level functions can see it; it is initialized here, in order, inside main.
+                if self.target == OutputTarget::Main && self.scopes.len() == 1 {
+                    self.global_decls.push_str(&format!("static PbVal {name};\n"));
+                    self.emit(&format!("{name} = {value};"));
+                } else {
+                    self.emit(&format!("PbVal {name} = {value};"));
                 }
                 self.declare_var(&name);
             }
             StmtKind::Const(name, _ty, init) => {
                 let rhs = self.emit_expr_str(&init.kind);
-                if self.boxed.contains(&name) {
-                    self.emit(&format!("PbVal {name} = pb_arr_lit(1, {rhs}); /* const */"));
+                let value = if self.boxed.contains(&name) {
+                    format!("pb_arr_lit(1, {rhs})")
                 } else {
-                    self.emit(&format!("PbVal {name} = {rhs}; /* const */"));
+                    rhs
+                };
+                if self.target == OutputTarget::Main && self.scopes.len() == 1 {
+                    self.global_decls.push_str(&format!("static PbVal {name};\n"));
+                    self.emit(&format!("{name} = {value}; /* const */"));
+                } else {
+                    self.emit(&format!("PbVal {name} = {value}; /* const */"));
                 }
                 self.declare_var(&name);
             }
@@ -544,7 +562,7 @@ impl TranspileCtx {
 
                 // Generate function signature
                 let param_str = (0..named_arity)
-                    .map(|i| format!("PbVal a{i}"))
+                    .map(|i| format!("PbVal __pba{i}"))
                     .chain(if is_vararg {
                         Some("PbVal __varargs".to_string())
                     } else {
@@ -573,9 +591,9 @@ impl TranspileCtx {
                         .map(|d| self.emit_expr_str(&d.kind))
                         .unwrap_or_else(|| "PB_NIL".to_string());
                     let value = if p.default.is_some() {
-                        format!("pb_is_nil(a{i}) ? {default_expr} : a{i}")
+                        format!("pb_is_nil(__pba{i}) ? {default_expr} : __pba{i}")
                     } else {
-                        format!("a{i}")
+                        format!("__pba{i}")
                     };
                     if self.boxed.contains(&p.name) {
                         self.emit(&format!("PbVal {pn} = pb_arr_lit(1, {value});", pn = p.name));
@@ -676,10 +694,13 @@ impl TranspileCtx {
                 format!("PB_STR(\"{}\")", escaped)
             }
             ExprKind::Var(name) => {
-                if let Some(b) = builtin_c_name(name) {
-                    b.to_string()
-                } else if self.is_local_var(name) {
+                // A declared variable (local OR module-level global) SHADOWS a builtin of the same
+                // name — check scope first. Otherwise `let sum = 0; sum = sum + e` would emit the
+                // builtin function pointer `pb_builtin_sum` instead of the variable (a C type error).
+                if self.is_local_var(name) {
                     self.read_var(name)
+                } else if let Some(b) = builtin_c_name(name) {
+                    b.to_string()
                 } else if self.function_names.contains(name) {
                     // A top-level function used as a VALUE -> the static closure
                     // singleton (no heap allocation).
@@ -816,7 +837,7 @@ impl TranspileCtx {
             }
             ExprKind::GetAttr(obj, attr) => {
                 let obj_s = self.emit_expr_str(&obj.kind);
-                format!("pb_map_get({obj_s}, PB_STR(\"{attr}\"))")
+                format!("pb_attr_get({obj_s}, PB_STR(\"{attr}\"))")
             }
             ExprKind::SafeGetAttr(obj, attr) => {
                 let obj_s = self.emit_expr_str(&obj.kind);
@@ -825,7 +846,7 @@ impl TranspileCtx {
             ExprKind::Index(obj, idx) => {
                 let obj_s = self.emit_expr_str(&obj.kind);
                 let idx_s = self.emit_expr_str(&idx.kind);
-                format!("pb_index({obj_s}, {idx_s})")
+                format!("pb_index_get({obj_s}, {idx_s})")
             }
             ExprKind::SafeIndex(obj, idx) => {
                 let obj_s = self.emit_expr_str(&obj.kind);
@@ -863,9 +884,40 @@ impl TranspileCtx {
                 }
             }
             ExprKind::Try(try_expr, catch_expr) => {
+                // `pb_try(t, c)` was wrong: C evaluates the arguments EAGERLY, so a try-expr that
+                // THROWS (longjmp) ran before any setjmp handler was installed and escaped the
+                // catch. Emit an inline setjmp block instead, evaluating the try-expr only AFTER
+                // installing the handler (mirrors the VM). Returns a temp holding the result.
+                let tmp = self.fresh_tmp();
+                let jb = format!("{tmp}_jb");
+                let prev = format!("{tmp}_prev");
+                let caught = format!("{tmp}_caught");
+                self.emit(&format!("PbVal {tmp} = PB_NIL;"));
+                self.emit(&format!("int {caught} = 0;"));
+                self.emit(&format!(
+                    "{{ jmp_buf {jb}; jmp_buf* {prev} = pb__catch_buf; pb__catch_buf = &{jb};"
+                ));
+                self.indent += 1;
+                self.emit(&format!("if (setjmp({jb}) == 0) {{"));
+                self.indent += 1;
                 let t = self.emit_expr_str(&try_expr.kind);
+                self.emit(&format!("{tmp} = {t};"));
+                // Also treat a returned error VALUE (from error("...")) as caught, matching the VM.
+                self.emit(&format!("if ({tmp}.tag == PB_TAG_ERR) {caught} = 1;"));
+                self.indent -= 1;
+                self.emit(&format!("}} else {{ {caught} = 1; }}"));
+                // Restore the outer handler BEFORE running the catch (so a throw in the catch
+                // propagates outward, not back into this handler).
+                self.emit(&format!("pb__catch_buf = {prev};"));
+                self.emit(&format!("if ({caught}) {{"));
+                self.indent += 1;
                 let c = self.emit_expr_str(&catch_expr.kind);
-                format!("pb_try({t}, {c})")
+                self.emit(&format!("{tmp} = {c};"));
+                self.indent -= 1;
+                self.emit("}");
+                self.indent -= 1;
+                self.emit("}");
+                tmp
             }
             ExprKind::FnLit(_name, params, _ret, body) => self.emit_closure(params, body),
             ExprKind::IfExpr(cond, then_br, else_br) => {
@@ -998,6 +1050,14 @@ impl TranspileCtx {
             out.push('\n');
         }
 
+        // Module-level (file-scope) globals: declared here so functions can reference them;
+        // their initializers run in order at the top of main.
+        if !self.global_decls.is_empty() {
+            out.push_str("/* Module-level globals */\n");
+            out.push_str(&self.global_decls);
+            out.push('\n');
+        }
+
         // Function definitions
         if !self.functions.is_empty() {
             out.push_str("/* Function definitions */\n");
@@ -1109,6 +1169,51 @@ fn builtin_c_name(name: &str) -> Option<&'static str> {
         "json_parse" => "pb_builtin_json_parse",
         "json_stringify" => "pb_builtin_json_stringify",
         "sha256" => "pb_builtin_sha256",
+        "bit_and" => "pb_builtin_bit_and",
+        "bit_or" => "pb_builtin_bit_or",
+        "bit_xor" => "pb_builtin_bit_xor",
+        "bit_shl" => "pb_builtin_bit_shl",
+        "bit_shr" => "pb_builtin_bit_shr",
+        "bit_not" => "pb_builtin_bit_not",
+        "str_to_bytes" => "pb_builtin_str_to_bytes",
+        "fs_read" => "pb_builtin_fs_read",
+        "fs_write" => "pb_builtin_fs_write",
+        "fs_append" => "pb_builtin_fs_append",
+        "fs_exists" => "pb_builtin_fs_exists",
+        "fs_remove" => "pb_builtin_fs_remove",
+        "fs_read_bytes" => "pb_builtin_fs_read_bytes",
+        "fs_write_bytes" => "pb_builtin_fs_write_bytes",
+        "fs_mkdirs" => "pb_builtin_fs_mkdirs",
+        "fs_listdir" => "pb_builtin_fs_listdir",
+        "bytes_to_str" => "pb_builtin_bytes_to_str",
+        "env_get" => "pb_builtin_env_get",
+        "tensor_matmul" => "pb_builtin_tensor_matmul",
+        "tensor_argmax" => "pb_builtin_tensor_argmax",
+        "tensor_add" => "pb_builtin_tensor_add",
+        "tensor_sub" => "pb_builtin_tensor_sub",
+        "tensor_scale" => "pb_builtin_tensor_scale",
+        "tensor_sum" => "pb_builtin_tensor_sum",
+        "tensor_dot" => "pb_builtin_tensor_dot",
+        "tensor_relu" => "pb_builtin_tensor_relu",
+        "tensor_softmax" => "pb_builtin_tensor_softmax",
+        "tensor_gelu" => "pb_builtin_tensor_gelu",
+        "tensor_backend" => "pb_builtin_tensor_backend",
+        "spawn" => "pb_builtin_spawn",
+        "join_all" => "pb_builtin_join_all",
+        "is_map" => "pb_builtin_is_map",
+        "is_array" => "pb_builtin_is_array",
+        "is_string" => "pb_builtin_is_string",
+        "is_number" => "pb_builtin_is_number",
+        "is_bool" => "pb_builtin_is_bool",
+        "is_nil" => "pb_builtin_is_nil",
+        "is_fn" => "pb_builtin_is_fn",
+        "is_int" => "pb_builtin_is_int",
+        "is_float" => "pb_builtin_is_float",
+        "typeof" => "pb_builtin_typeof",
+        "platform" => "pb_builtin_platform",
+        "now_iso" => "pb_builtin_now_iso",
+        "exec" => "pb_builtin_exec",
+        "proc_spawn_wait" => "pb_builtin_proc_spawn_wait",
         "sleep_ms" => "pb_builtin_sleep_ms",
         "clock" => "pb_builtin_clock",
         "now_ms" => "pb_builtin_now_ms",
@@ -1122,6 +1227,7 @@ fn builtin_c_name(name: &str) -> Option<&'static str> {
         "str_starts_with" => "pb_builtin_str_starts_with",
         "str_ends_with" => "pb_builtin_str_ends_with",
         "str_slice" => "pb_builtin_str_slice",
+        "slice" => "pb_builtin_slice",
         "str_split" => "pb_builtin_str_split",
         "str_trim" => "pb_builtin_str_trim",
         "str_upper" => "pb_builtin_str_upper",

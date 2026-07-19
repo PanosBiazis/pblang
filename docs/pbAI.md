@@ -383,6 +383,11 @@ deterministic skills:
 
 - `classify(prompt)` routes to explain/bugs/improve/comment/general through the cached
   neural intent classifier.
+- The classifier treats `stdlib/pbai_model.json` as a read-only bundled model.
+  A retrained model is strictly validated and published atomically under the
+  per-user PBLang cache; `PBLANG_PBAI_MODEL_CACHE` can select an explicit path.
+  This prevents parallel tests or applications from changing locked stdlib
+  dependency hashes at runtime.
 - `classify_scores(prompt)` returns the intent name and raw score vector for IDE/tooling
   diagnostics.
 - `analyze(prompt)` returns structured metadata: intent, scores, whether code was found,
@@ -393,8 +398,8 @@ deterministic skills:
 - The native IDE exposes this through EXPLAIN / BUGS / IMPROVE / QUALITY / COMMENT
   quick actions.
 
-Locked by `tests/semantics/pbai_test.sapp`, `pbai_lm_test.sapp`, and the native
-IDE UI smoke test.
+Locked by `tests/semantics/pbai_test.sapp`, `pbai_model_cache_test.sapp`,
+`model_cache_test.sapp`, `pbai_lm_test.sapp`, and the native IDE UI smoke test.
 
 ## 9.2 pblang-native MCP bridge
 

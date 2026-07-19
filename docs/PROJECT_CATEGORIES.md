@@ -92,7 +92,8 @@ native multi-module builds), `linker.sapp`, `dist.sapp`
 - **System / OS:** os, fs, path, process, env, hwinfo, systems, time, date, datetime,
   duration, log, logger, profiler, benchmark
 - **Polyglot / Interop:** polyglot, polyglot_build, polyglot_db, polyglot_web,
-  polyglot_registry, interop, ffi, ffi_universal, ptr, build, pkg, dist
+  polyglot_registry, polyglot_router, polyglot_guard, polyglot_policy, interop,
+  ffi, ffi_universal, ptr, build, pkg, dist
 - **Language core / utilities:** array, map, set, deque, heap, graph, collections,
   data_structures, iter, functional, generics, typeclass, enum, struct, class,
   option, result, validate, format, strings, unicode, uuid, money, semver

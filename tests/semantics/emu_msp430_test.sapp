@@ -1,0 +1,107 @@
+// emu_msp430_test.sapp — a verified TI MSP430 execution model in pblang (16-bit ultra-low-power MCU).
+//
+// The MSP430 runs watches, calculators, utility meters, medical sensors, TV remotes — devices that live for
+// YEARS on a coin cell. It's the suite's 16-bit word machine (vs the 8-bit 6502/AVR/Z80 and 32/64-bit
+// MIPS/ARM64/RISC-V): 16 registers (r0=PC, r1=SP, r2=SR, r4-r15 general), format-I two-operand ops with
+// real addressing-mode bits, format-III relative jumps, and NO multiply instruction (real MSP430s multiply
+// in software — the loop test below does exactly that). Faithful halt: BIS #0x10,SR sets the CPUOFF bit,
+// the CPU sleeps, and the "exit code" convention is r15. Verified by COMPUTED RESULT.
+
+fn fail(m) { throw "FAIL emu-msp430: " + m; }
+fn _cat(a, b) { let i = 0; while i < len(b) { push(a, b[i]); i = i + 1; } return a; }
+fn _u16(v) { let r = v % 65536; if r < 0 { r = r + 65536; } return r; }
+fn _o10(d) { let r = d % 1024; if r < 0 { r = r + 1024; } return r; }   // 10-bit signed jump offset
+
+// ── encoder (word stream; format I: op<<12 | src<<8 | Ad<<7 | bw<<6 | As<<4 | dst) ──
+fn MOVI(n, rd) { return [16432 + rd, _u16(n)]; }        // MOV #n, Rd    (0x4030|rd, #n)  As=11 src=PC
+fn MOVR(rs, rd) { return [16384 + rs * 256 + rd]; }     // MOV Rs, Rd    (0x4000)
+fn ADDI(n, rd) { return [20528 + rd, _u16(n)]; }        // ADD #n, Rd    (0x5030|rd)
+fn ADDR(rs, rd) { return [20480 + rs * 256 + rd]; }     // ADD Rs, Rd    (0x5000)
+fn SUBI(n, rd) { return [32816 + rd, _u16(n)]; }        // SUB #n, Rd    (0x8030|rd)
+fn SUBR(rs, rd) { return [32768 + rs * 256 + rd]; }     // SUB Rs, Rd    (0x8000)
+fn CMPI(n, rd) { return [36912 + rd, _u16(n)]; }        // CMP #n, Rd    (0x9030|rd)
+fn JMP(d) { return [15360 + _o10(d)]; }                 // 0x3C00 | off  (cond=111)
+fn JNZ(d) { return [8192 + _o10(d)]; }                  // 0x2000 | off  (cond=000: Z==0)
+fn JZ(d)  { return [9216 + _o10(d)]; }                  // 0x2400 | off  (cond=001: Z==1)
+fn HALT() { return [53298, 16]; }                       // BIS #0x10, SR (0xD032 0x0010) — set CPUOFF, sleep
+
+// ── interpreter (pc counts WORDS; flags Z/N/C; halt = CPUOFF bit lands in r2) ──
+fn msp430_run(code) {
+    let r = []; let ri = 0; while ri < 16 { push(r, 0); ri = ri + 1; }
+    let zf = 0; let nf = 0; let cf = 0;
+    let pc = 0; let guard = 0;
+    while pc >= 0 and pc < len(code) and guard < 1000000 {
+        guard = guard + 1;
+        let w = code[pc];
+        let top3 = num_floor(w / 8192);
+        if top3 == 1 {                                             // format III: 001 cond(3) off(10)
+            let cond = num_floor(w / 1024) % 8;
+            let off = w % 1024; if off >= 512 { off = off - 1024; }
+            let take = false;
+            if cond == 7 { take = true; }                          // JMP
+            elif cond == 0 { take = zf == 0; }                     // JNZ
+            elif cond == 1 { take = zf == 1; }                     // JZ
+            else { throw "msp430_run: unmodeled jump cond " + str(cond); }
+            pc = pc + 1; if take { pc = pc + off; }
+        } else {
+            let op = num_floor(w / 4096);
+            let src = num_floor(w / 256) % 16;
+            let as_ = num_floor(w / 16) % 4;
+            let dst = w % 16;
+            let v = 0;
+            if as_ == 0 { v = r[src]; pc = pc + 1; }               // register mode
+            elif as_ == 3 and src == 0 { v = code[pc + 1]; pc = pc + 2; }   // #imm (@PC+)
+            else { throw "msp430_run: unmodeled addressing As=" + str(as_) + " src=" + str(src); }
+            if op == 4 { r[dst] = v; }                             // MOV
+            elif op == 5 {                                         // ADD
+                let t = r[dst] + v; cf = 0; if t > 65535 { cf = 1; }
+                r[dst] = _u16(t); zf = 0; if r[dst] == 0 { zf = 1; } nf = 0; if r[dst] >= 32768 { nf = 1; }
+            }
+            elif op == 8 or op == 9 {                              // SUB / CMP (C = no-borrow)
+                let t = r[dst] - v; cf = 1; if t < 0 { cf = 0; }
+                let res = _u16(t);
+                if op == 8 { r[dst] = res; }
+                zf = 0; if res == 0 { zf = 1; } nf = 0; if res >= 32768 { nf = 1; }
+            }
+            elif op == 13 {                                        // BIS (or) — used by HALT for CPUOFF
+                r[dst] = bit_or(r[dst], v);
+                if dst == 2 and bit_and(r[2], 16) == 16 { return r[15]; }   // CPUOFF set → sleep; result = r15
+            }
+            else { throw "msp430_run: unmodeled opcode " + str(op); }
+        }
+    }
+    if guard >= 1000000 { throw "msp430_run: instruction budget exceeded"; }
+    throw "msp430_run: ran off the end (no CPUOFF halt)";
+}
+
+fn prog(parts) { let c = []; let i = 0; while i < len(parts) { _cat(c, parts[i]); i = i + 1; } return c; }
+fn eq(got, want, m) { if got != want { fail(m + ": got " + str(got) + " want " + str(want)); } }
+
+// encoder spot-checks against the real ISA encodings
+let enc = MOVI(5, 15); eq(enc[0], 16447, "MOV #n,R15 encodes 0x403F"); eq(enc[1], 5, "imm word follows");
+eq(HALT()[0], 53298, "BIS #0x10,SR encodes 0xD032");
+eq(JMP(0 - 1)[0], 16383, "JMP -1 encodes 0x3FFF");
+
+// ── straight-line arithmetic ──
+eq(msp430_run(prog([MOVI(21, 15), HALT()])),                                    21, "MOV #imm");
+eq(msp430_run(prog([MOVI(20, 4), ADDI(22, 4), MOVR(4, 15), HALT()])),           42, "ADD #imm");
+eq(msp430_run(prog([MOVI(30, 4), MOVI(12, 5), ADDR(5, 4), MOVR(4, 15), HALT()])), 42, "ADD Rs,Rd");
+eq(msp430_run(prog([MOVI(50, 4), SUBI(8, 4), MOVR(4, 15), HALT()])),            42, "SUB #imm");
+eq(msp430_run(prog([MOVI(65530, 4), ADDI(10, 4), MOVR(4, 15), HALT()])),         4, "16-bit wrap (65530+10)");
+
+// ── CMP + JZ: r15 = 1 if r4 == 5 else 99 ──
+eq(msp430_run(prog([MOVI(5, 4), MOVI(1, 15), CMPI(5, 4), JZ(2), MOVI(99, 15), HALT()])),  1, "CMP equal → JZ skips");
+eq(msp430_run(prog([MOVI(6, 4), MOVI(1, 15), CMPI(5, 4), JZ(2), MOVI(99, 15), HALT()])), 99, "CMP unequal → falls through");
+
+// ── software multiply 6×7 (the real MSP430 has NO mul instruction): r15 += r5, r4 times ──
+// words: [0-1]MOVI 0,r15 [2-3]MOVI 6,r4 [4-5]MOVI 7,r5 [6]ADDR r5,r15 [7-8]SUBI 1,r4 [9]JNZ -4 [10-11]HALT
+eq(msp430_run(prog([MOVI(0, 15), MOVI(6, 4), MOVI(7, 5),
+                    ADDR(5, 15), SUBI(1, 4), JNZ(0 - 4),
+                    HALT()])),                                                  42, "software multiply 6*7 (add loop)");
+
+// ── sum 1..10 = 55: countdown accumulate ──
+eq(msp430_run(prog([MOVI(0, 15), MOVI(10, 4),
+                    ADDR(4, 15), SUBI(1, 4), JNZ(0 - 4),
+                    HALT()])),                                                  55, "sum 1..10 via countdown");
+
+print "emu_msp430: 16-bit low-power MCU — format-I ops, #imm mode, JNZ/JZ, software multiply, CPUOFF halt all correct";

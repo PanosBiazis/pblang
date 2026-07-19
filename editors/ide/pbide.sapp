@@ -54,6 +54,7 @@ let CANVAS = import("stdlib/canvas.sapp");  // renderer-agnostic draw-command bu
 let DOCX = import("stdlib/doc_export.sapp");// page -> markdown/text/html exporter
 let UIK = import("stdlib/ui_kit.sapp");     // modern widget geometry: rounded cards/pills/elevation
 let WP = import("stdlib/window_probe.sapp");// pblang-only live OS window size probe (X11 tools)
+let GATE = import("stdlib/frame_gate.sapp");// pure repaint policy: skip idle/no-change frames (CPU saver)
 
 let PBIDE_TITLE = "pblang IDE - Smart Code Editor";
 
@@ -250,6 +251,19 @@ let TEXT_AA_READY = TEXT_MODE != "bitmap" and (try TEXT_PROFILE.available catch 
 let TEXT_SHAPE_CACHE = map{};
 let TEXT_SHAPE_CACHE_KEYS = [];
 let TEXT_SHAPE_CACHE_LIMIT = 512;
+let TEXT_FRAME_CALLS = 0;
+let TEXT_FRAME_SKIPS = 0;
+let TEXT_FRAME_AA = 0;
+let TEXT_FRAME_BITMAP = 0;
+let ROUND_RECT_CACHE = map{};
+let ROUND_RECT_CACHE_KEYS = [];
+let ROUND_RECT_CACHE_LIMIT = 256;
+let ELEVATION_CACHE = map{};
+let ELEVATION_CACHE_KEYS = [];
+let ELEVATION_CACHE_LIMIT = 128;
+let DESIGN_GRID_CACHE = map{};
+let DESIGN_GRID_CACHE_KEYS = [];
+let DESIGN_GRID_CACHE_LIMIT = 64;
 
 fn _density_status(sz, manual) {
     let d = IDE.ide_responsive_density(try sz.w catch 0, try sz.h catch 0, manual);
@@ -277,6 +291,189 @@ fn _graphics_status() {
     return s + " · text " + str(tr) + "+pblang-shape cache " + str(len(TEXT_SHAPE_CACHE_KEYS));
 }
 
+fn _graphics_event_status() {
+    let s = try gfx.backend_event_status() catch nil;
+    if s != nil { return str(s); }
+    let p = try gfx.backend_profile() catch nil;
+    if p == nil { return "events unknown"; }
+    let items = [];
+    if try p.resize_events catch false { array_push(items, "resize"); }
+    if try p.mouse_xy_events catch false { array_push(items, "mouse-xy"); }
+    if try p.scroll_events catch false { array_push(items, str(try p.scroll_event catch "scroll")); }
+    let body = "none";
+    if len(items) > 0 { body = str_join(items, ","); }
+    return "events " + str(try p.event_contract catch "unknown") + " [" + body + "]";
+}
+
+fn _graphics_short_status() {
+    let p = try gfx.backend_profile() catch nil;
+    if p == nil { return "gfx ?"; }
+    let gpu = "cpu";
+    if try p.gpu_present catch false { gpu = "gpu"; }
+    return "gfx " + str(try p.backend catch "?") + "/" + gpu;
+}
+
+fn _text_render_plan_for_state(state) {
+    let p = try state.perf catch map{};
+    return try gfx.text_render_plan(TEXT_PROFILE, p, map{
+        mode: TEXT_MODE,
+        target_fps: 60,
+        shape_cache: len(TEXT_SHAPE_CACHE_KEYS)
+    }) catch map{ decision: "unknown", renderer: "unknown", warnings: [] };
+}
+
+fn _text_render_status_for_state(state) {
+    return try gfx.text_render_status(_text_render_plan_for_state(state)) catch "text unknown";
+}
+
+fn _perf_record_draw(state, ms) {
+    if (try state.perf catch nil) == nil {
+        state.perf = map{ draws: 0, skips: 0, last_draw_ms: 0, avg_draw_ms: 0 };
+    }
+    state.perf.draws = (try state.perf.draws catch 0) + 1;
+    state.perf.last_draw_ms = ms;
+    let avg = try state.perf.avg_draw_ms catch ms;
+    state.perf.avg_draw_ms = avg * 0.8 + ms * 0.2;
+    return 0;
+}
+
+fn _perf_record_skip(state) {
+    if (try state.perf catch nil) == nil {
+        state.perf = map{ draws: 0, skips: 0, last_draw_ms: 0, avg_draw_ms: 0 };
+    }
+    state.perf.skips = (try state.perf.skips catch 0) + 1;
+    return 0;
+}
+
+fn _perf_ms(v) {
+    return num_floor(v * 10 + 0.5) / 10;
+}
+
+fn _perf_summary(state) {
+    let p = try state.perf catch map{};
+    let runtime_cache = try state.render_runtime_cache catch map{ reason: "uninitialized" };
+    return "frames draw=" + str(try p.draws catch 0) +
+        " skip=" + str(try p.skips catch 0) +
+        " last=" + str(_perf_ms(try p.last_draw_ms catch 0)) + "ms" +
+        " avg=" + str(_perf_ms(try p.avg_draw_ms catch 0)) + "ms" +
+        " text=" + str(try p.text_calls catch 0) +
+        "/" + str(try p.text_skips catch 0) +
+        " policy=" + str(try state.render_runtime_refreshes catch 0) +
+        "/" + str(try runtime_cache.reason catch "uninitialized");
+}
+
+fn _frame_command_estimate(state) {
+    let cmds = [
+        map{ op: "box", x: 0, y: 0, w: 1280, h: TBH },
+        map{ op: "text", x: PAD, y: PAD, text: str(try state.panel catch "code") }
+    ];
+    let rows = try state.rows catch 40;
+    if state.panel == "code" {
+        let n = rows;
+        if n > 80 { n = 80; }
+        let i = 0;
+        while i < n {
+            array_push(cmds, map{ op: "text", x: GUTTERX, y: TOP + i * CH, text: "code-row" });
+            i = i + 1;
+        }
+    } else if state.panel == "web" or state.panel == "files" or state.panel == "hist" or state.panel == "manage" or state.panel == "settings" {
+        let i = 0;
+        while i < 32 {
+            array_push(cmds, map{ op: "box", x: PAD, y: TOP + i * CH, w: 360, h: CH });
+            array_push(cmds, map{ op: "text", x: PAD * 2, y: TOP + i * CH, text: "row" });
+            i = i + 1;
+        }
+    } else {
+        array_push(cmds, map{ op: "box", x: PAD, y: TOP, w: 320, h: 220 });
+        array_push(cmds, map{ op: "text", x: PAD * 2, y: TOP + PAD, text: "panel" });
+    }
+    return cmds;
+}
+
+fn _frame_schedule_for_state(state, gp) {
+    let sz = try state.winsz catch try state.live_winsz catch map{ w: 1280, h: 860 };
+    let dirty = [];
+    if try state.redraw catch true {
+        array_push(dirty, map{ x: 0, y: 0, w: try sz.w catch 1280, h: try sz.h catch 860 });
+    }
+    return IDE.ide_render_frame_plan(try sz.w catch 1280, try sz.h catch 860, gp, dirty, _frame_command_estimate(state), map{ target_fps: 60, parallel: true, perf: try state.perf catch map{} });
+}
+
+fn _render_runtime_for_state(state, gp = nil) {
+    // Runtime throttling depends on measured draw/text performance, not on a
+    // synthetic frame command list. Keep the full frame scheduler on the
+    // on-demand Graphics panel and use the smaller quality path here.
+    let perf = try state.perf catch map{};
+    let quality = IDE.ide_render_quality_policy(perf, perf, map{ target_fps: 60 });
+    return IDE.ide_render_runtime_plan(quality, map{ target_fps: 60, idle_ms: _idle_redraw_interval_ms() });
+}
+
+fn _render_runtime_refresh_interval_ms() {
+    let raw = try env_get("PBIDE_RENDER_POLICY_MS") catch "";
+    let n = try parse_number(raw) catch 1000;
+    if n == nil { n = 1000; }
+    n = num_floor(n);
+    if n < 100 { return 100; }
+    if n > 5000 { return 5000; }
+    return n;
+}
+
+fn _render_runtime_current(state) {
+    let current = try state.render_runtime catch nil;
+    if current != nil { return current; }
+    return IDE.ide_render_runtime_plan(nil, map{ target_fps: 60, idle_ms: _idle_redraw_interval_ms() });
+}
+
+fn _render_runtime_refresh(state, now, force = false) {
+    let perf = try state.perf catch map{};
+    let decision = IDE.ide_render_runtime_cache_policy(
+        try state.render_runtime_last_ms catch 0,
+        now,
+        try state.render_runtime_last_draws catch 0,
+        try perf.draws catch 0,
+        map{
+            interval_ms: _render_runtime_refresh_interval_ms(),
+            initialized: (try state.render_runtime_refreshes catch 0) > 0,
+            force: force
+        }
+    );
+    state.render_runtime_cache = decision;
+    if not decision.refresh { return _render_runtime_current(state); }
+    let runtime = _render_runtime_for_state(state);
+    runtime.cache_reason = decision.reason;
+    runtime.cache_interval_ms = decision.interval_ms;
+    state.render_runtime = runtime;
+    state.render_runtime_last_ms = now;
+    state.render_runtime_last_draws = try perf.draws catch 0;
+    state.render_runtime_refreshes = (try state.render_runtime_refreshes catch 0) + 1;
+    return runtime;
+}
+
+fn _adaptive_idle_redraw_interval_ms(state) {
+    let base = _idle_redraw_interval_ms();
+    let rt = try state.render_runtime catch nil;
+    if rt == nil { return base; }
+    let n = try rt.idle_ms catch base;
+    if n == nil { return base; }
+    n = num_floor(n);
+    if n < 0 { return 0; }
+    if n > 5000 { return 5000; }
+    return n;
+}
+
+fn _defer_non_input_redraw(state, now, runtime) {
+    if not (try state.redraw catch false) { return false; }
+    if now == 0 { return false; }
+    let gap = try runtime.min_draw_gap_ms catch 0;
+    if gap == nil or gap <= 0 { return false; }
+    let last_input = try state.last_input_ms catch 0;
+    let grace = try runtime.input_grace_ms catch 60;
+    if last_input != 0 and now - last_input <= grace { return false; }
+    let last_present = try state.last_present_ms catch 0;
+    if last_present != 0 and now - last_present < gap { return true; }
+    return false;
+}
+
 fn _debug_events_enabled() {
     let v = try env_get("PBIDE_DEBUG_EVENTS") catch "";
     return v == "1" or v == "true" or v == "on";
@@ -291,6 +488,7 @@ fn _debug_event(text) {
 fn _record_input_event(state, text) {
     state.event_count = (try state.event_count catch 0) + 1;
     state.last_event = str(text);
+    state.last_input_ms = try now_ms() catch try state.last_input_ms catch 0;
     _debug_event(text);
     return 0;
 }
@@ -313,6 +511,46 @@ fn _idle_redraw_interval_ms() {
     if n < 0 { return 0; }
     if n > 5000 { return 5000; }
     return n;
+}
+
+// _frame_sig(state) — a compact signature of everything currently VISIBLE, so the frame
+// gate (stdlib/frame_gate.sapp) can skip a repaint when the picture would be identical.
+// Cheap: only scalars + already-cached content hashes (never re-hashes the document).
+// Event-driven changes still force a repaint regardless (see the loop's draw callback),
+// so this only needs to catch state that changes WITHOUT an input event — chiefly a live
+// window resize / density-probe update — but it lists the visible fields generously.
+fn _frame_sig(state) {
+    let ed = state.ed;
+    let ws = try state.window_size catch map{ w: 0, h: 0 };
+    let lw = try state.live_winsz catch ws;
+    let parts = [
+        str(state.panel),
+        str(try ed.row catch 0), str(try ed.col catch 0), str(try ed.scroll catch 0),
+        str((try ed.anchor catch nil) != nil),
+        str(try state.syntax_hash catch ""),
+        str(try state.hover_tab catch ""),
+        str(try state.theme catch ""), str(try state.style catch ""), str(try state.density_scale catch 0),
+        str(try ws.w catch 0), str(try ws.h catch 0), str(try lw.w catch 0), str(try lw.h catch 0),
+        str(try state.help catch false),
+        str(try state.examples_mode catch false), str(try state.command_mode catch false),
+        str(try state.quick_open_mode catch false), str(try state.goto_line_mode catch false),
+        str(try state.find_mode catch false), str(try state.replace_mode catch false),
+        str(try state.open_mode catch false), str(try state.save_as_mode catch false),
+        str(try state.output catch ""),
+        str(len(try state.diagnostics catch [])), str(try state.diag_index catch 0),
+        str(try state.term.input catch ""), str(len(try state.term.lines catch [])),
+        str(try state.ai.input catch ""), str(len(try state.ai.lines catch [])), str(try state.ai.last_cue catch ""),
+        str(try state.web.url catch ""), str(try state.web.mode catch ""), str(try state.web.scroll catch 0),
+        str(try state.design.sel catch 0), str(try state.design.counter catch 0), str(len(try state.design.widgets catch [])),
+        str(try state.design_tab_sel catch 0), str(len(try state.design_tabs catch [])),
+        str(try state.files.sel catch 0), str(try state.files.query catch ""),
+        str(try state.outline.sel catch 0), str(try state.problems.sel catch 0), str(try state.manage.sel catch 0),
+        str(try state.settings.sel catch 0), str(try state.settings.query catch ""),
+        str(try state.command_query catch ""), str(try state.command_sel catch 0),
+        str(try state.quick_query catch ""), str(try state.quick_sel catch 0),
+        str(try state.query catch ""),
+    ];
+    return str_join(parts, "|");
 }
 
 fn _density_set_manual(state, scale) {
@@ -470,6 +708,7 @@ let PANELS = [
     map{ id: "problems",label: "Prob" },
     map{ id: "hist",    label: "Hist" },
     map{ id: "manage",  label: "Manage" },
+    map{ id: "settings",label: "Settings" },
 ];
 
 let EXAMPLES = [
@@ -521,9 +760,348 @@ let EXAMPLES = [
         title: "Table rows",
         code: "// Array of maps as table rows\nlet rows = [\n    map{ name: \"Ada\", lang: \"math\" },\n    map{ name: \"Grace\", lang: \"compiler\" },\n    map{ name: \"Linus\", lang: \"kernel\" }\n];\n\nfor row in rows {\n    print row.name + \" -> \" + row.lang;\n}\n"
     },
+    map{
+        title: "Safe calculator",
+        app_kind: "gui",
+        project_root: "examples/safe_calculator",
+        main_path: "examples/safe_calculator/main.sapp",
+        design_preset: "safe_calculator",
+        design_target: "gui",
+        open_panel: "design",
+        run_path: "examples/safe_calculator/gui.sapp",
+        files: [
+            "examples/safe_calculator/main.sapp",
+            "examples/safe_calculator/lib.sapp",
+            "examples/safe_calculator/gui.sapp",
+            "examples/safe_calculator/README.md"
+        ],
+        code: "// Safe calculator core inspired by PyCalculator, but pblang-native and no eval()\nfn ok(value) { return map{ ok: true, value: value, message: \"\" }; }\nfn fail(message) { return map{ ok: false, value: 0, message: message }; }\n\nfn calc(a, symbol, b) {\n    if symbol == \"+\" { return ok(a + b); }\n    if symbol == \"-\" { return ok(a - b); }\n    if symbol == \"*\" { return ok(a * b); }\n    if symbol == \"/\" {\n        if b == 0 { return fail(\"division by zero\"); }\n        return ok(a / b);\n    }\n    return fail(\"unknown operator: \" + symbol);\n}\n\nlet keypad = [[\"7\", \"8\", \"9\", \"/\"], [\"4\", \"5\", \"6\", \"*\"], [\"1\", \"2\", \"3\", \"-\"], [\"0\", \".\", \"=\", \"+\"]];\nlet history = [];\nlet jobs = [\n    map{ a: 1, symbol: \"+\", b: 1 },\n    map{ a: 7, symbol: \"*\", b: 3 },\n    map{ a: 27, symbol: \"/\", b: 9 },\n    map{ a: 8, symbol: \"/\", b: 0 }\n];\n\nfor job in jobs {\n    let r = calc(job.a, job.symbol, job.b);\n    let expr = str(job.a) + \" \" + job.symbol + \" \" + str(job.b);\n    if r.ok {\n        let line = expr + \" = \" + str(r.value);\n        push(history, line);\n        print line;\n    } else {\n        print expr + \" -> Error: \" + r.message;\n    }\n}\n\nprint \"keypad rows=\" + str(len(keypad));\nprint \"history_count=\" + str(len(history));\n"
+    },
+    map{
+        title: "GUI dashboard project",
+        app_kind: "gui",
+        project_root: "examples/gui_dashboard",
+        main_path: "examples/gui_dashboard/main.sapp",
+        design_preset: "app_shell",
+        design_target: "gui",
+        open_panel: "design",
+        run_path: "examples/gui_dashboard/main.sapp",
+        browser_urls: ["example.com", "https://www.iana.org/domains/example"],
+        files: [
+            "examples/gui_dashboard/main.sapp",
+            "examples/gui_dashboard/screens.sapp",
+            "examples/gui_dashboard/README.md"
+        ],
+        code: "// Opens examples/gui_dashboard/main.sapp with Code + Designer + Browser context.\nprint \"gui_dashboard example\";\n"
+    },
+    map{
+        title: "Web notes app",
+        app_kind: "web",
+        project_root: "examples/web_notes_app",
+        main_path: "examples/web_notes_app/main.sapp",
+        design_preset: "form_stack",
+        design_target: "web",
+        open_panel: "web",
+        run_path: "examples/web_notes_app/main.sapp",
+        browser_urls: ["example.com", "https://www.iana.org/domains/reserved"],
+        files: [
+            "examples/web_notes_app/main.sapp",
+            "examples/web_notes_app/page.sapp",
+            "examples/web_notes_app/README.md"
+        ],
+        code: "// Opens examples/web_notes_app/main.sapp with web-app Browser tabs.\nprint \"web_notes_app example\";\n"
+    },
+    map{
+        title: "Code Designer Browser starter",
+        app_kind: "both",
+        project_root: "examples/fullstack_designer_browser",
+        main_path: "examples/fullstack_designer_browser/main.sapp",
+        design_preset: "web_embed",
+        design_target: "both",
+        open_panel: "web",
+        run_path: "examples/fullstack_designer_browser/main.sapp",
+        browser_urls: ["example.com", "https://www.iana.org/domains/example", "https://example.com/?pbide=composite"],
+        files: [
+            "examples/fullstack_designer_browser/main.sapp",
+            "examples/fullstack_designer_browser/web.sapp",
+            "examples/fullstack_designer_browser/README.md"
+        ],
+        code: "// Composite example: Code tabs + Designer preset + Browser tabs.\nprint \"fullstack_designer_browser example\";\n"
+    },
+    map{
+        title: "One-line apps: CLI, GUI, Web, Data, AI",
+        app_kind: "both",
+        project_root: "examples/one_line_apps",
+        main_path: "examples/one_line_apps/main.sapp",
+        design_preset: "app_shell",
+        design_target: "both",
+        open_panel: "design",
+        run_path: "examples/one_line_apps/main.sapp",
+        browser_urls: ["http://127.0.0.1:8080", "example.com"],
+        files: [
+            "examples/one_line_apps/main.sapp",
+            "examples/one_line_apps/gui.sapp",
+            "examples/one_line_apps/gui_live.sapp",
+            "examples/one_line_apps/web.sapp",
+            "examples/one_line_apps/web_live.sapp",
+            "examples/one_line_apps/fullstack.sapp",
+            "examples/one_line_apps/universal.sapp",
+            "examples/one_line_apps/domains.sapp",
+            "examples/one_line_apps/README.md"
+        ],
+        code: "// One declarative pblang API for CLI, GUI, Web, Designer, and Browser preview.\nprint \"one_line_apps example\";\n"
+    },
+    map{ title: "Hello world project", project_root: "examples/hello_world", main_path: "examples/hello_world/main.sapp", run_path: "examples/hello_world/main.sapp", files: ["examples/hello_world/main.sapp", "examples/hello_world/pblang.toml"], code: "// Opens examples/hello_world/main.sapp in file tabs.\nprint \"Hello from the PBIDE example catalog\";\n" },
+    map{ title: "Tutorial CLI notes", project_root: "examples/tutorial_cli", main_path: "examples/tutorial_cli/main.sapp", run_path: "examples/tutorial_cli/main.sapp", files: ["examples/tutorial_cli/main.sapp", "examples/tutorial_cli/README.md"], code: "// Opens examples/tutorial_cli/main.sapp in file tabs.\nprint \"tutorial_cli example\";\n" },
+    map{ title: "Tutorial user input", project_root: "examples/tutorial_user_input", main_path: "examples/tutorial_user_input/main.sapp", run_path: "examples/tutorial_user_input/main.sapp", files: ["examples/tutorial_user_input/main.sapp", "examples/tutorial_user_input/README.md"], code: "// Opens examples/tutorial_user_input/main.sapp in file tabs.\nprint \"tutorial_user_input example\";\n" },
+    map{ title: "Tutorial concurrency", project_root: "examples/tutorial_concurrency", main_path: "examples/tutorial_concurrency/main.sapp", run_path: "examples/tutorial_concurrency/main.sapp", files: ["examples/tutorial_concurrency/main.sapp", "examples/tutorial_concurrency/README.md"], code: "// Opens examples/tutorial_concurrency/main.sapp in file tabs.\nprint \"tutorial_concurrency example\";\n" },
+    map{ title: "Concurrent tasks", project_root: "examples/concurrent_tasks", main_path: "examples/concurrent_tasks/main.sapp", run_path: "examples/concurrent_tasks/main.sapp", files: ["examples/concurrent_tasks/main.sapp"], code: "// Opens examples/concurrent_tasks/main.sapp in file tabs.\nprint \"concurrent_tasks example\";\n" },
+    map{ title: "Thread pool", project_root: "examples/thread_pool", main_path: "examples/thread_pool/main.sapp", run_path: "examples/thread_pool/main.sapp", files: ["examples/thread_pool/main.sapp"], code: "// Opens examples/thread_pool/main.sapp in file tabs.\nprint \"thread_pool example\";\n" },
+    map{ title: "Bend-style parallel", project_root: "examples/bend_style_parallel", main_path: "examples/bend_style_parallel/main.sapp", run_path: "examples/bend_style_parallel/main.sapp", files: ["examples/bend_style_parallel/main.sapp"], code: "// Opens examples/bend_style_parallel/main.sapp in file tabs.\nprint \"bend_style_parallel example\";\n" },
+    map{ title: "Micro GUI counter", app_kind: "gui", project_root: "examples/micro_gui_counter", main_path: "examples/micro_gui_counter/main.sapp", run_path: "examples/micro_gui_counter/main.sapp", files: ["examples/micro_gui_counter/main.sapp"], code: "// Opens examples/micro_gui_counter/main.sapp in file tabs.\nprint \"micro_gui_counter example\";\n" },
+    map{ title: "Tutorial web app", app_kind: "web", project_root: "examples/tutorial_web_app", main_path: "examples/tutorial_web_app/main.sapp", run_path: "examples/tutorial_web_app/main.sapp", files: ["examples/tutorial_web_app/main.sapp", "examples/tutorial_web_app/README.md"], code: "// Opens examples/tutorial_web_app/main.sapp in file tabs.\nprint \"tutorial_web_app example\";\n" },
+    map{ title: "Tutorial HTTP server", app_kind: "web", project_root: "examples/tutorial_http", main_path: "examples/tutorial_http/main.sapp", run_path: "examples/tutorial_http/main.sapp", files: ["examples/tutorial_http/main.sapp", "examples/tutorial_http/README.md"], code: "// Opens examples/tutorial_http/main.sapp in file tabs.\nprint \"tutorial_http example\";\n" },
+    map{ title: "Web server", app_kind: "web", project_root: "examples/web_server", main_path: "examples/web_server/main.sapp", run_path: "examples/web_server/main.sapp", files: ["examples/web_server/main.sapp", "examples/web_server/pblang.toml"], code: "// Opens examples/web_server/main.sapp in file tabs.\nprint \"web_server example\";\n" },
+    map{ title: "Web IDE", app_kind: "web", project_root: "examples/web_ide", main_path: "examples/web_ide/main.sapp", run_path: "examples/web_ide/main.sapp", files: ["examples/web_ide/main.sapp"], code: "// Opens examples/web_ide/main.sapp in file tabs.\nprint \"web_ide example\";\n" },
+    map{ title: "Tutorial data science", project_root: "examples/tutorial_data_science", main_path: "examples/tutorial_data_science/main.sapp", run_path: "examples/tutorial_data_science/main.sapp", files: ["examples/tutorial_data_science/main.sapp", "examples/tutorial_data_science/README.md"], code: "// Opens examples/tutorial_data_science/main.sapp in file tabs.\nprint \"tutorial_data_science example\";\n" },
+    map{ title: "Tutorial machine learning", project_root: "examples/tutorial_machine_learning", main_path: "examples/tutorial_machine_learning/main.sapp", run_path: "examples/tutorial_machine_learning/main.sapp", files: ["examples/tutorial_machine_learning/main.sapp", "examples/tutorial_machine_learning/README.md"], code: "// Opens examples/tutorial_machine_learning/main.sapp in file tabs.\nprint \"tutorial_machine_learning example\";\n" },
+    map{ title: "Tutorial memory safety", project_root: "examples/tutorial_memory_safety", main_path: "examples/tutorial_memory_safety/main.sapp", run_path: "examples/tutorial_memory_safety/main.sapp", files: ["examples/tutorial_memory_safety/main.sapp", "examples/tutorial_memory_safety/README.md"], code: "// Opens examples/tutorial_memory_safety/main.sapp in file tabs.\nprint \"tutorial_memory_safety example\";\n" },
+    map{ title: "ORM database example", project_root: "examples/orm_example", main_path: "examples/orm_example/main.sapp", run_path: "examples/orm_example/main.sapp", files: ["examples/orm_example/main.sapp"], code: "// Opens examples/orm_example/main.sapp in file tabs.\nprint \"orm_example example\";\n" },
+    map{ title: "Quantum BB84", project_root: "examples/quantum_bb84", main_path: "examples/quantum_bb84/main.sapp", run_path: "examples/quantum_bb84/main.sapp", files: ["examples/quantum_bb84/main.sapp"], code: "// Opens examples/quantum_bb84/main.sapp in file tabs.\nprint \"quantum_bb84 example\";\n" },
+    map{ title: "Quantum bridge minimal", project_root: "examples/quantum_bridge_minimal", main_path: "examples/quantum_bridge_minimal/app/main.sapp", run_path: "examples/quantum_bridge_minimal/app/main.sapp", files: ["examples/quantum_bridge_minimal/app/main.sapp", "examples/quantum_bridge_minimal/app/sapphire.toml", "examples/quantum_bridge_minimal/plugin/lib.sapp", "examples/quantum_bridge_minimal/plugin/sapphire.toml"], code: "// Opens the quantum bridge app/plugin files in tabs.\nprint \"quantum_bridge_minimal example\";\n" },
+    map{ title: "AI HTTP provider", project_root: "examples/ai_http_provider", main_path: "examples/ai_http_provider/main.sapp", run_path: "examples/ai_http_provider/main.sapp", files: ["examples/ai_http_provider/main.sapp"], code: "// Opens examples/ai_http_provider/main.sapp in file tabs.\nprint \"ai_http_provider example\";\n" },
+    map{ title: "AI chat tool calls", project_root: "examples/ai_chat_toolcall", main_path: "examples/ai_chat_toolcall/main.sapp", run_path: "examples/ai_chat_toolcall/main.sapp", files: ["examples/ai_chat_toolcall/main.sapp"], code: "// Opens examples/ai_chat_toolcall/main.sapp in file tabs.\nprint \"ai_chat_toolcall example\";\n" },
+    map{ title: "AI plugin minimal", project_root: "examples/ai_plugin_minimal", main_path: "examples/ai_plugin_minimal/app/main.sapp", run_path: "examples/ai_plugin_minimal/app/main.sapp", files: ["examples/ai_plugin_minimal/app/main.sapp", "examples/ai_plugin_minimal/app/sapphire.toml", "examples/ai_plugin_minimal/plugin/lib.sapp", "examples/ai_plugin_minimal/plugin/sapphire.toml"], code: "// Opens the AI plugin app/plugin files in tabs.\nprint \"ai_plugin_minimal example\";\n" },
+    map{ title: "Polyglot demo", project_root: "examples/polyglot_demo", main_path: "examples/polyglot_demo/main.sapp", run_path: "examples/polyglot_demo/main.sapp", files: ["examples/polyglot_demo/main.sapp"], code: "// Opens examples/polyglot_demo/main.sapp in file tabs.\nprint \"polyglot_demo example\";\n" },
+    map{ title: "Polyglot full", project_root: "examples/polyglot_full", main_path: "examples/polyglot_full/main.sapp", run_path: "examples/polyglot_full/main.sapp", files: ["examples/polyglot_full/main.sapp"], code: "// Opens examples/polyglot_full/main.sapp in file tabs.\nprint \"polyglot_full example\";\n" },
+    map{ title: "Self-host compiler demo", project_root: "examples/self_host_demo", main_path: "examples/self_host_demo/main.sapp", run_path: "examples/self_host_demo/main.sapp", files: ["examples/self_host_demo/main.sapp"], code: "// Opens examples/self_host_demo/main.sapp in file tabs.\nprint \"self_host_demo example\";\n" },
+    map{
+        title: "Rust embedding host",
+        project_root: "examples",
+        main_path: "examples/embed.rs",
+        files: ["examples/embed.rs"],
+        code: "// Opens examples/embed.rs in a tab. This is a Rust host embedding example, not pblang source.\nprint \"embed host example is stored at examples/embed.rs\";\n"
+    },
 ];
 fn _starter_code() {
     return EXAMPLES[0].code;
+}
+
+fn _file_tab_title(path) {
+    let p = str(try path catch "");
+    if str_trim(p) == "" { return "untitled.sapp"; }
+    let b = try path_basename(p) catch p;
+    if b == nil or str(b) == "" { return p; }
+    return str(b);
+}
+
+fn _array_has_text(xs, value) {
+    let v = str(value);
+    let i = 0;
+    while xs != nil and i < len(xs) {
+        if str(xs[i]) == v { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _example_main_path(ex) {
+    let p = str(try ex.main_path catch "");
+    if p == "" { p = str(try ex.run_path catch ""); }
+    return p;
+}
+
+fn _example_project_files(ex) {
+    let out = [];
+    let files = try ex.files catch [];
+    let i = 0;
+    while files != nil and i < len(files) {
+        let p = str(files[i]);
+        if p != "" and not _array_has_text(out, p) { array_push(out, p); }
+        i = i + 1;
+    }
+    let main = _example_main_path(ex);
+    if main != "" and not _array_has_text(out, main) { array_push(out, main); }
+    return out;
+}
+
+fn _project_files_text(files) {
+    if files == nil or len(files) == 0 { return ""; }
+    let out = "project files (" + str(len(files)) + "):";
+    let i = 0;
+    while i < len(files) and i < 18 {
+        out = out + "\n- " + str(files[i]);
+        i = i + 1;
+    }
+    if len(files) > 18 { out = out + "\n- ... +" + str(len(files) - 18) + " more"; }
+    return out;
+}
+
+fn _example_code(ex) {
+    let p = _example_main_path(ex);
+    if p != "" {
+        let raw = try fs_read(p) catch nil;
+        if raw != nil { return raw; }
+    }
+    return str(try ex.code catch "");
+}
+
+fn _current_file_tab(state) {
+    let p = str(try state.path catch "");
+    return map{
+        title: _file_tab_title(p),
+        path: p,
+        code: E.text(state.ed),
+        dirty: try state.dirty catch false,
+        file_profile: try state.file_profile catch IDE.editor_asset_profile(p),
+        preview_mode: str(try state.preview_mode catch "text"),
+        project_root: str(try state.project_root catch ""),
+        project_files: try state.project_files catch [],
+        example_run_path: str(try state.example_run_path catch ""),
+        example_app_kind: str(try state.example_app_kind catch ""),
+        example_title: str(try state.example_title catch "")
+    };
+}
+
+fn _file_tab_for_path(path, fallback_code, dirty, project_root, project_files, ex) {
+    let p = str(path);
+    let profile = IDE.editor_asset_profile(p);
+    let text = str(fallback_code);
+    if p != "" {
+        let loaded = try fs_read(p) catch nil;
+        if loaded != nil { text = str(loaded); }
+    }
+    let mode = str(try profile.preview catch "text");
+    return map{
+        title: _file_tab_title(p),
+        path: p,
+        code: text,
+        dirty: dirty,
+        file_profile: profile,
+        preview_mode: mode,
+        project_root: str(project_root),
+        project_files: project_files,
+        example_run_path: str(try ex.run_path catch ""),
+        example_app_kind: str(try ex.app_kind catch ""),
+        example_title: str(try ex.title catch "")
+    };
+}
+
+fn _file_tabs_sync_current(state) {
+    let tabs = try state.file_tabs catch [];
+    if tabs == nil or len(tabs) == 0 { return 0; }
+    let sel = try state.file_tab_sel catch 0;
+    if sel < 0 { sel = 0; }
+    if sel >= len(tabs) { sel = len(tabs) - 1; }
+    tabs[sel] = _current_file_tab(state);
+    state.file_tabs = tabs;
+    state.file_tab_sel = sel;
+    return 0;
+}
+
+fn _file_tabs_add_current(state) {
+    let tabs = try state.file_tabs catch [];
+    if tabs == nil { tabs = []; }
+    let cur = _current_file_tab(state);
+    let p = str(try cur.path catch "");
+    let found = 0 - 1;
+    let i = 0;
+    while i < len(tabs) {
+        if p != "" and str(try tabs[i].path catch "") == p { found = i; }
+        i = i + 1;
+    }
+    if found >= 0 {
+        tabs[found] = cur;
+        state.file_tab_sel = found;
+    } else {
+        array_push(tabs, cur);
+        state.file_tab_sel = len(tabs) - 1;
+    }
+    state.file_tabs = tabs;
+    return 0;
+}
+
+fn _file_tabs_load(state, idx) {
+    let tabs = try state.file_tabs catch [];
+    if tabs == nil or idx < 0 or idx >= len(tabs) { return false; }
+    _file_tabs_sync_current(state);
+    tabs = state.file_tabs;
+    let tab = tabs[idx];
+    state.ed = E.new(str(try tab.code catch ""));
+    state.path = str(try tab.path catch "");
+    state.dirty = try tab.dirty catch false;
+    state.file_profile = try tab.file_profile catch IDE.editor_asset_profile(state.path);
+    state.preview_mode = str(try tab.preview_mode catch try state.file_profile.preview catch "text");
+    state.preview_path = "";
+    state.tokens = nil;
+    state.token_lines = nil;
+    state.syntax_hash = "";
+    state.syntax_rev = 0 - 1;
+    state.syntax_status = "";
+    state.last = "other";
+    state.project_root = str(try tab.project_root catch "");
+    state.project_files = try tab.project_files catch [];
+    state.example_run_path = str(try tab.example_run_path catch "");
+    state.example_app_kind = str(try tab.example_app_kind catch "");
+    state.example_title = str(try tab.example_title catch "");
+    state.file_tab_sel = idx;
+    state.panel = "code";
+    _refresh_watcher(state, "file-tab");
+    state.output = "tab: " + _file_tab_title(state.path);
+    let listing = _project_files_text(try state.project_files catch []);
+    if listing != "" { state.output = state.output + "\n" + listing; }
+    return true;
+}
+
+fn _file_tabs_reset_for_example(state, ex, main_code) {
+    let files = _example_project_files(ex);
+    let root = str(try ex.project_root catch "");
+    let tabs = [];
+    let main = _example_main_path(ex);
+    let selected = 0;
+    if len(files) == 0 {
+        state.project_root = root;
+        state.project_files = [];
+        _file_tabs_add_current(state);
+        return 0;
+    }
+    let i = 0;
+    while i < len(files) {
+        let p = str(files[i]);
+        let fallback = "";
+        if p == main { fallback = main_code; }
+        let tab = _file_tab_for_path(p, fallback, false, root, files, ex);
+        array_push(tabs, tab);
+        if p == main { selected = i; }
+        i = i + 1;
+    }
+    state.file_tabs = tabs;
+    state.file_tab_sel = selected;
+    state.project_root = root;
+    state.project_files = files;
+    if selected >= 0 and selected < len(tabs) {
+        let tab = tabs[selected];
+        state.ed = E.new(str(try tab.code catch main_code));
+        state.path = str(try tab.path catch main);
+        state.file_profile = try tab.file_profile catch IDE.editor_asset_profile(state.path);
+        state.preview_mode = str(try tab.preview_mode catch try state.file_profile.preview catch "text");
+        state.dirty = false;
+        state.tokens = nil;
+        state.token_lines = nil;
+        state.syntax_hash = "";
+        state.syntax_rev = 0 - 1;
+    }
+    return 0;
+}
+
+fn _file_tabs_height(state) {
+    let tabs = try state.file_tabs catch [];
+    if tabs == nil or len(tabs) == 0 { return 0; }
+    return CH + PAD;
+}
+
+fn _code_content_top(state) {
+    return TOP + _file_tabs_height(state);
 }
 
 fn _style_name(state) {
@@ -941,6 +1519,42 @@ fn _panel_bounds(idx, sz) {
     return map{ x: x, w: (len(label) + 2) * CW };
 }
 
+fn _toolbar_layout_sig(sz) {
+    if sz == nil { return "nil"; }
+    return str(try sz.w catch 0) + "x" + str(try sz.h catch 0) + "@" + str(SCALE) + ":" + str(CW) + ":" + str(CH);
+}
+
+fn _toolbar_layout(state, sz) {
+    let sig = _toolbar_layout_sig(sz);
+    let cached = try state.toolbar_layout catch nil;
+    if cached != nil and (try cached.sig catch "") == sig { return cached; }
+    _apply_toolbar_metrics(sz);
+    let rows = _toolbar_rows(sz);
+    let actionY = PAD;
+    if rows > 1 { actionY = PAD + CH + 2 * PAD; }
+    let panelY = PAD;
+    let panelStart = sz.w - PAD - _panel_total_w_for(sz);
+    if panelStart < PAD { panelStart = PAD; }
+    let actions = [];
+    let i = 0;
+    while i < len(ACTIONS) {
+        let b = _action_bounds_for(i, sz);
+        let visible = rows > 1 or b.x + b.w + PAD < panelStart;
+        array_push(actions, map{ id: ACTIONS[i].id, index: i, x: b.x, y: actionY, w: b.w, h: CH + PAD, visible: visible });
+        i = i + 1;
+    }
+    let panels = [];
+    i = 0;
+    while i < len(PANELS) {
+        let b = _panel_bounds(i, sz);
+        array_push(panels, map{ id: PANELS[i].id, index: i, x: b.x, y: panelY, w: b.w, h: CH + PAD, label: _panel_label_for(i, sz) });
+        i = i + 1;
+    }
+    let out = map{ format: "pbide.toolbar.layout.v1", sig: sig, rows: rows, panel_start: panelStart, action_y: actionY, panel_y: panelY, actions: actions, panels: panels };
+    if state != nil { state.toolbar_layout = out; }
+    return out;
+}
+
 fn _panel_by_index(state, idx) {
     if idx < 0 or idx >= len(PANELS) { return false; }
     let id = PANELS[idx].id;
@@ -1009,6 +1623,7 @@ fn _new_buffer_path() {
 }
 
 fn _new_buffer(state) {
+    _file_tabs_sync_current(state);
     let p = _new_buffer_path();
     state.panel = "code";
     state.path = p;
@@ -1028,6 +1643,18 @@ fn _new_buffer(state) {
     state.open_mode = false;
     state.quick_open_mode = false;
     state.examples_mode = false;
+    state.project_root = "";
+    state.project_files = [];
+    state.example_run_path = "";
+    state.example_app_kind = "";
+    state.example_title = "";
+    state.design = _design_blank(p);
+    state.design_tabs = [];
+    _design_tabs_reset_for_project(state);
+    state.file_profile = IDE.editor_asset_profile(p);
+    state.preview_path = "";
+    state.preview_mode = str(try state.file_profile.preview catch "text");
+    _file_tabs_add_current(state);
     state.watch = IDE.watcher_new(p, E.text(state.ed));
     _refresh_watcher(state, "new");
     state.output = "new buffer: " + p;
@@ -1052,6 +1679,211 @@ fn _run(ed) {
         i = i + 1;
     }
     return s;
+}
+
+fn _pblang_bin() {
+    if try fs_exists("./target/debug/pblang") catch false { return "./target/debug/pblang"; }
+    return "pblang";
+}
+
+fn _app_profile_for_state(state) {
+    let p = IDE.app_run_profile(E.text(state.ed), try state.path catch "");
+    let ex_kind = str(try state.example_app_kind catch "");
+    if ex_kind != "" and (try p.kind catch "cli") == "cli" {
+        p.kind = ex_kind;
+        if ex_kind == "gui" {
+            p.has_gui = true;
+            p.can_native_run = true;
+            p.run_method = "pblang-native-gui";
+            p.preview_method = "designer/native GUI preview";
+            if not str_contains(str_join(try p.requires catch [], "\n"), "display") {
+                array_push(p.requires, "display and graphics backend");
+            }
+        } elif ex_kind == "web" {
+            p.has_web = true;
+            p.run_method = "preview-only-web-metadata";
+        }
+    }
+    return p;
+}
+
+fn _app_launcher_source(source, profile) {
+    let src = str(source);
+    let low = str_lower(src);
+    if (try profile.has_gui catch false) and str_contains(low, "fn run_gui(") and not str_contains(low, "\nrun_gui();") {
+        src = src + "\n// pbide native app launcher\nrun_gui();\n";
+    }
+    return src;
+}
+
+fn _native_app_result_text(r, cmd, args) {
+    if r == nil { return "native app run failed: process launch unavailable. Relaunch PBIDE with --allow-exec or --allow-all."; }
+    let out = "native app command: " + cmd + " " + str_join(args, " ") + "\nexit: " + str(try r.exit_code catch "?");
+    let so = str(try r.stdout catch "");
+    let se = str(try r.stderr catch "");
+    if str_trim(so) != "" { out = out + "\nstdout:\n" + so; }
+    if str_trim(se) != "" { out = out + "\nstderr:\n" + se; }
+    if str_trim(so) == "" and str_trim(se) == "" { out = out + "\n(no process output; GUI apps usually show their result in the window)"; }
+    return out;
+}
+
+fn _pbide_app_limit_ms() {
+    let raw = try env_get("PBIDE_APP_MAX_MS") catch "";
+    let n = try parse_number(str(raw)) catch 120000;
+    if n == nil or n <= 0 { n = 120000; }
+    if n < 5000 { n = 5000; }
+    if n > 3600000 { n = 3600000; }
+    return num_floor(n);
+}
+
+fn _pbide_temp_dir() {
+    let d = try env_get("TMPDIR") catch "";
+    if d == nil or str(d) == "" { d = try env_get("TEMP") catch ""; }
+    if d == nil or str(d) == "" { d = try env_get("TMP") catch ""; }
+    if d == nil or str(d) == "" { d = "/tmp"; }
+    return str(d);
+}
+
+fn _pbide_log_path(tag) {
+    return _pbide_temp_dir() + "/pbide_" + str(tag) + "_" + str(try now_ms() catch 0) + ".log";
+}
+
+fn _psq(s) {
+    return "'" + str_replace_all(str(s), "'", "''") + "'";
+}
+
+fn _ps_args(args) {
+    let parts = [];
+    let i = 0;
+    while i < len(args) {
+        array_push(parts, _psq(args[i]));
+        i = i + 1;
+    }
+    return "@(" + str_join(parts, ",") + ")";
+}
+
+fn _argv_shell(args) {
+    let out = "";
+    let i = 0;
+    while i < len(args) {
+        out = out + " " + _shq(args[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _detached_native_app_result(r, cmd, args, log_path, err_path, limit_ms) {
+    if r == nil { return "native app launch blocked: process launch unavailable. Relaunch PBIDE with --allow-exec or --allow-all."; }
+    let out = "native app launched detached and guarded\n" +
+        "command: " + cmd + " " + str_join(args, " ") + "\n" +
+        "max runtime: " + str(limit_ms) + "ms\n" +
+        "stdout log: " + log_path;
+    if err_path != "" { out = out + "\nstderr log: " + err_path; }
+    let so = str_trim(str(try r.stdout catch ""));
+    let se = str_trim(str(try r.stderr catch ""));
+    if so != "" { out = out + "\nlauncher stdout: " + so; }
+    if se != "" { out = out + "\nlauncher stderr: " + se; }
+    if (try r.exit_code catch 0) != 0 {
+        out = out + "\nlauncher exit: " + str(try r.exit_code catch "?");
+    }
+    out = out + "\nPBIDE stays interactive; close the child app normally or wait for the guard.";
+    return out;
+}
+
+fn _run_detached_native_app(cmd, args, profile) {
+    let limit_ms = _pbide_app_limit_ms();
+    let safety = try IDE.app_run_safety_profile(profile, map{ timeout_ms: limit_ms }) catch map{ timeout_ms: limit_ms, max_frames: num_floor(limit_ms / 16), target_fps: 30 };
+    limit_ms = try safety.timeout_ms catch limit_ms;
+    let max_frames = try safety.max_frames catch num_floor(limit_ms / 16);
+    if max_frames < 60 { max_frames = 60; }
+    let target_fps = try safety.target_fps catch 30;
+    let cap_env = _native_app_cap_env(profile);
+    let child_caps = _native_app_env_value(cap_env, "PBIDE_CHILD_CAPS", "least-privilege");
+    let allow_all = _native_app_env_value(cap_env, "PBLANG_ALLOW_ALL", "0");
+    let allow_exec = _native_app_env_value(cap_env, "PBLANG_ALLOW_EXEC", "0");
+    let allow_ffi = _native_app_env_value(cap_env, "PBLANG_ALLOW_FFI", "0");
+    let log_path = _pbide_log_path("app");
+    let os = try platform() catch "unknown";
+    if os == "windows" {
+        let err_path = log_path + ".err";
+        let cwd0 = try cwd() catch ".";
+        let ps = "$env:PBIDE_CHILD_APP='1'; " +
+            "$env:PBIDE_CHILD_CAPS=" + _psq(child_caps) + "; " +
+            "$env:PBLANG_ALLOW_ALL=" + _psq(allow_all) + "; " +
+            "$env:PBLANG_ALLOW_EXEC=" + _psq(allow_exec) + "; " +
+            "$env:PBLANG_ALLOW_FFI=" + _psq(allow_ffi) + "; " +
+            "$env:PBLANG_GRAPHICS_MAX_MS=" + _psq(str(limit_ms)) + "; " +
+            "$env:PBLANG_GRAPHICS_MAX_FRAMES=" + _psq(str(max_frames)) + "; " +
+            "$env:PBLANG_GRAPHICS_TARGET_FPS=" + _psq(str(target_fps)) + "; " +
+            "Start-Process -FilePath " + _psq(cmd) +
+            " -ArgumentList " + _ps_args(args) +
+            " -WorkingDirectory " + _psq(cwd0) +
+            " -RedirectStandardOutput " + _psq(log_path) +
+            " -RedirectStandardError " + _psq(err_path) +
+            "; Write-Output 'started'";
+        let r = try proc_spawn_wait("powershell", ["-NoProfile", "-Command", ps]) catch nil;
+        return IDE.app_run_profile_summary(profile) + "\n" + _detached_native_app_result(r, cmd, args, log_path, err_path, limit_ms);
+    }
+    let cwd0 = try cwd() catch ".";
+    let limit_s = num_floor(limit_ms / 1000);
+    if limit_s < 1 { limit_s = 1; }
+    let envp = "env PBIDE_CHILD_APP=1 PBIDE_CHILD_CAPS=" + _shq(child_caps) +
+        " PBLANG_ALLOW_ALL=" + _shq(allow_all) +
+        " PBLANG_ALLOW_EXEC=" + _shq(allow_exec) +
+        " PBLANG_ALLOW_FFI=" + _shq(allow_ffi) +
+        " PBLANG_GRAPHICS_MAX_MS=" + str(limit_ms) +
+        " PBLANG_GRAPHICS_MAX_FRAMES=" + str(max_frames) +
+        " PBLANG_GRAPHICS_TARGET_FPS=" + str(target_fps);
+    let run_cmd = envp + " " + _shq(cmd) + _argv_shell(args);
+    let guarded = "if command -v timeout >/dev/null 2>&1; then timeout -k 2s " + str(limit_s) + "s " + run_cmd + "; else " + run_cmd + "; fi";
+    let script = "cd " + _shq(cwd0) + " 2>/dev/null || exit 1; (" + guarded + ") > " + _shq(log_path) + " 2>&1 < /dev/null & echo $!";
+    let r = try proc_spawn_wait("bash", ["-lc", script]) catch nil;
+    return IDE.app_run_profile_summary(profile) + "\n" + _detached_native_app_result(r, cmd, args, log_path, "", limit_ms);
+}
+
+fn _native_app_cap_env(profile) {
+    let plan = try IDE.app_run_capability_plan(profile) catch map{ env_overrides: map{} };
+    return try plan.env_overrides catch map{};
+}
+
+fn _native_app_env_value(env, key, fallback) {
+    return str(try env[str(key)] catch fallback);
+}
+
+fn _native_app_cap_args(profile) {
+    let plan = try IDE.app_run_capability_plan(profile) catch map{ cli_args: [] };
+    return try plan.cli_args catch [];
+}
+
+fn _native_app_run_args(path, profile) {
+    let args = ["run", str(path)];
+    let caps = _native_app_cap_args(profile);
+    let i = 0;
+    while i < len(caps) {
+        array_push(args, caps[i]);
+        i = i + 1;
+    }
+    return args;
+}
+
+fn _run_native_app_source(state, profile) {
+    let run_path = str(try state.example_run_path catch "");
+    let cmd = _pblang_bin();
+    let args = [];
+    if run_path != "" {
+        args = _native_app_run_args(run_path, profile);
+    } else {
+        let tmp = "/tmp/pbide_app_" + str(try now_ms() catch 0) + ".sapp";
+        let src = _app_launcher_source(E.text(state.ed), profile);
+        let ok = try fs_write(tmp, src) catch false;
+        if ok == false or ok == nil { return "native app run failed: could not write temp launcher " + tmp; }
+        args = _native_app_run_args(tmp, profile);
+    }
+    if (try profile.has_gui catch false) or (try profile.has_web_runtime catch false) or str(try profile.kind catch "") == "web" {
+        return _run_detached_native_app(cmd, args, profile);
+    }
+    let r = try proc_spawn_wait(cmd, args) catch nil;
+    return IDE.app_run_profile_summary(profile) + "\n" + _native_app_result_text(r, cmd, args);
 }
 // F6 — static lint via the self-hosted analyzer: undefined names, unreachable code,
 // undeclared assignment. Lists up to 6 problems, one per line.
@@ -1088,10 +1920,15 @@ fn _save(state) {
         if ok2 == nil { return "save FAILED: " + state.path + " and " + fb; }
         state.path = fb;
         state.dirty = false;
+        state.file_profile = IDE.editor_asset_profile(fb);
+        state.preview_path = "";
+        state.preview_mode = str(try state.file_profile.preview catch "text");
+        _file_tabs_add_current(state);
         _refresh_watcher(state, "save");
         return "saved fallback " + fb;
     }
     state.dirty = false;
+    _file_tabs_add_current(state);
     _refresh_watcher(state, "save");
     return "saved " + state.path;
 }
@@ -1109,6 +1946,10 @@ fn _save_as_path(state, path) {
     state.dirty = false;
     state.panel = "code";
     state.recent_files = IDE.recent_files_push(try state.recent_files catch [], p, 40);
+    state.file_profile = IDE.editor_asset_profile(p);
+    state.preview_path = "";
+    state.preview_mode = str(try state.file_profile.preview catch "text");
+    _file_tabs_add_current(state);
     _refresh_watcher(state, "save-as");
     return "saved as " + p;
 }
@@ -1150,7 +1991,40 @@ fn _profile_preview_text(profile, text, mode) {
     return str_join(lines, "\n");
 }
 
+fn _preview_current_app(state) {
+    let profile = _app_profile_for_state(state);
+    let run_path = str(try state.example_run_path catch "");
+    let design_active = (try state.panel catch "") == "design" and len(try state.design.widgets catch []) > 0;
+    if (try profile.kind catch "cli") == "cli" and run_path == "" and not design_active {
+        return nil;
+    }
+    let lines = [IDE.app_run_profile_summary(profile)];
+    if run_path != "" {
+        array_push(lines, "Run path: " + run_path);
+    }
+    if len(try state.design.widgets catch []) > 0 {
+        state.panel = "design";
+        array_push(lines, "Designer form: " + str(len(state.design.widgets)) + " item(s), target=" + str(try state.design.target catch "gui"));
+        array_push(lines, "Preview mode: live Designer canvas. Press Run to launch the native GUI app.");
+    } else {
+        state.panel = "code";
+    }
+    if try profile.has_preview catch false {
+        let headless = _run(state.ed);
+        array_push(lines, "Headless preview output:");
+        array_push(lines, headless);
+    } elif (try profile.has_web_runtime catch false) {
+        array_push(lines, "Web preview: Press Run to start the guarded detached pblang web process.");
+    } elif (try profile.can_native_run catch false) {
+        array_push(lines, "Native preview: Press Run to open the guarded detached app window.");
+    }
+    state.output = str_join(lines, "\n");
+    return state.output;
+}
+
 fn _preview_current_file(state) {
+    let app = _preview_current_app(state);
+    if app != nil { return app; }
     let profile = IDE.editor_asset_profile(try state.path catch "");
     let current = str(try state.preview_mode catch "");
     if str(try state.preview_path catch "") == str(try state.path catch "") and current != "" {
@@ -1167,6 +2041,7 @@ fn _preview_current_file(state) {
 }
 
 fn _open_binary_asset_preview(state, path, target, profile) {
+    _file_tabs_sync_current(state);
     if path != str(try state.path catch "") {
         state.nav_back = [];
         state.nav_forward = [];
@@ -1181,6 +2056,12 @@ fn _open_binary_asset_preview(state, path, target, profile) {
     let previewText = _profile_preview_text(profile, "", state.preview_mode);
     _replace_editor(state, previewText);
     state.dirty = false;
+    state.project_root = "";
+    state.project_files = [path];
+    state.design = _design_blank(path);
+    state.design_tabs = [];
+    _design_tabs_reset_for_project(state);
+    _file_tabs_add_current(state);
     _refresh_watcher(state, "open-preview");
     let opened = "opened preview " + IDE.open_path_target_status(target);
     state.output = opened + "\n" + previewText;
@@ -1188,6 +2069,7 @@ fn _open_binary_asset_preview(state, path, target, profile) {
 }
 
 fn _open_path(state, path) {
+    _file_tabs_sync_current(state);
     let target = IDE.open_path_target(path);
     let p = str_trim(str(try target.path catch path));
     if p == "" { p = state.path; }
@@ -1215,7 +2097,13 @@ fn _open_path(state, path) {
     state.preview_mode = str(try profile.preview catch "text");
     state.dirty = false;
     state.panel = "code";
+    state.project_root = "";
+    state.project_files = [p];
+    state.design = _design_blank(p);
+    state.design_tabs = [];
+    _design_tabs_reset_for_project(state);
     state.recent_files = IDE.recent_files_push(try state.recent_files catch [], p, 40);
+    _file_tabs_add_current(state);
     _refresh_watcher(state, "open");
     let opened = "opened " + IDE.open_path_target_status(target);
     if str(try profile.family catch "code") != "code" {
@@ -1407,21 +2295,43 @@ fn _ui_snapshot(state, sz) {
     return UIO.surface_snapshot_contract("pbide", "pblang native IDE", sz, state.panel, _ui_regions(state, sz), signals, _ui_required_regions(state), _ui_required_actions(state));
 }
 
-fn _ui_snapshot_report(state, limit) {
+fn _ui_snapshot_sig(state, sz) {
+    let modal = _modal_region_name(state);
+    return str(state.panel) + "|" +
+        str(try sz.w catch 0) + "x" + str(try sz.h catch 0) + "|" +
+        str(try state.theme catch "") + "|" +
+        str(try state.style catch "") + "|" +
+        str(try state.density_scale catch 0) + "|" +
+        str(modal) + "|" +
+        str(try state.dirty catch false) + "|" +
+        str(_watch_badge(state)) + "|" +
+        str(try state.build_mode catch "debug") + "|" +
+        str(try state.hover_tab catch "") + "|" +
+        str(try state.event_count catch 0);
+}
+
+fn _ui_snapshot_cached(state, sz) {
+    let sig = _ui_snapshot_sig(state, sz);
     let snap = try state.ui_snapshot catch nil;
-    if snap == nil {
-        let sz = try state.winsz catch map{ w: 0, h: 0 };
-        snap = _ui_snapshot(state, sz);
-        state.ui_snapshot = snap;
+    if snap != nil and (try state.ui_snapshot_sig catch "") == sig {
+        return snap;
     }
+    let fresh = _ui_snapshot(state, sz);
+    state.ui_snapshot = fresh;
+    state.ui_snapshot_sig = sig;
+    return fresh;
+}
+
+fn _ui_snapshot_report(state, limit) {
+    let sz = try state.winsz catch map{ w: 0, h: 0 };
+    let snap = _ui_snapshot_cached(state, sz);
     return str_join(UIO.snapshot_lines(snap, limit), "\n");
 }
 
 fn _show_ui_snapshot(state) {
     _ui_event(state, "ui snapshot report");
     let sz = try state.winsz catch map{ w: 0, h: 0 };
-    let snap = _ui_snapshot(state, sz);
-    state.ui_snapshot = snap;
+    let snap = _ui_snapshot_cached(state, sz);
     state.panel = "code";
     state.output = str_join(UIO.snapshot_lines(snap, 12), "\n");
     return 0;
@@ -1476,6 +2386,8 @@ fn _code_status_line(state) {
         + "  |  scope " + str(try IDE.current_symbol(code, ed.row + 1).label catch "top-level")
         + lineDiagText
         + "  |  sym " + str(len(IDE.outline(code)))
+        + "  |  tabs " + str(len(try state.file_tabs catch []))
+        + " files " + str(len(try state.project_files catch []))
         + "  |  nav " + str(len(try state.nav_back catch [])) + "/" + str(len(try state.nav_forward catch []))
         + "  |  self-host"
         + "  |  F5 Run  F6 Check  F11 Mode  F12 Watch";
@@ -1912,6 +2824,21 @@ fn _line_tokens(toks, lineno) {
     return out;
 }
 
+fn _token_lines_index(toks) {
+    let out = map{};
+    let i = 0;
+    while toks != nil and i < len(toks) {
+        let t = toks[i];
+        let key = str(try t.line catch 0);
+        let row = [];
+        if map_has(out, key) { row = out[key]; }
+        array_push(row, t);
+        out[key] = row;
+        i = i + 1;
+    }
+    return out;
+}
+
 fn _code_diag_y() { return TOP + CH * 14 + PAD; }
 fn _code_tool_y() { return _code_diag_y() + CH * 6 + PAD; }
 fn _code_watch_y() { return _code_tool_y() + CH * 5; }
@@ -2023,6 +2950,7 @@ fn _dt_bitmap(win, x, y, s, color) {
 
 fn _shape_text_cached(s) {
     let raw = str(s);
+    if not _text_needs_shape(raw) { return raw; }
     if map_has(TEXT_SHAPE_CACHE, raw) { return TEXT_SHAPE_CACHE[raw]; }
     if len(TEXT_SHAPE_CACHE_KEYS) >= TEXT_SHAPE_CACHE_LIMIT {
         TEXT_SHAPE_CACHE = map{};
@@ -2034,44 +2962,160 @@ fn _shape_text_cached(s) {
     return shown;
 }
 
+fn _text_needs_shape(raw) {
+    if str_contains(raw, "->") or str_contains(raw, "=>") or str_contains(raw, "<-") { return true; }
+    if str_contains(raw, "<=") or str_contains(raw, ">=") or str_contains(raw, "!=") { return true; }
+    if str_contains(raw, "==") or str_contains(raw, "::") or str_contains(raw, "...") { return true; }
+    let i = 0;
+    while i < len(raw) {
+        let cp = strcharcodeat(raw, i);
+        if cp > 126 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _text_is_blank(raw) {
+    if len(raw) == 0 { return true; }
+    let i = 0;
+    while i < len(raw) {
+        let cp = strcharcodeat(raw, i);
+        if cp > 32 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
 // Smooth text uses the native fontdue-backed renderer in pblang-graphics. It keeps the
 // same fixed cell advance as the bitmap path, so cursor positioning, hit testing, and
 // responsive panel layout stay unchanged. PBIDE_TEXT_RENDER=bitmap restores the old path.
 fn _dt(win, x, y, s, color) {
-    let shown = _shape_text_cached(s);
+    TEXT_FRAME_CALLS = TEXT_FRAME_CALLS + 1;
+    let raw = str(s);
+    if _text_is_blank(raw) {
+        TEXT_FRAME_SKIPS = TEXT_FRAME_SKIPS + 1;
+        return 0;
+    }
+    let shown = _shape_text_cached(raw);
     if TEXT_AA_READY {
         let r = try win.textAA(x, y - SCALE, shown, color, CH + SCALE, CW) catch nil;
         if r != nil and (try r.ok catch false) {
+            TEXT_FRAME_AA = TEXT_FRAME_AA + 1;
             return 0;
         }
     }
+    TEXT_FRAME_BITMAP = TEXT_FRAME_BITMAP + 1;
     return _dt_bitmap(win, x, y, shown, color);
 }
 
 // ── modern UI primitives (rounded chips/cards/elevation) via stdlib/ui_kit.sapp ───
 // A rounded filled rect — corners beveled by radius r so chrome looks contemporary.
-fn _fill_round(win, x, y, w, h, color, r) {
-    let rs = UIK.rounded_rect(x, y, w, h, r);
+fn _round_rect_key(w, h, r) {
+    return str(num_floor(w)) + "x" + str(num_floor(h)) + "r" + str(num_floor(r));
+}
+
+fn _round_rect_cached(x, y, w, h, r) {
+    if w <= 0 or h <= 0 { return []; }
+    if r <= 0 { return [map{ x: x, y: y, w: w, h: h }]; }
+    w = num_floor(w);
+    h = num_floor(h);
+    r = num_floor(r);
+    let key = _round_rect_key(w, h, r);
+    if not map_has(ROUND_RECT_CACHE, key) {
+        if len(ROUND_RECT_CACHE_KEYS) >= ROUND_RECT_CACHE_LIMIT {
+            ROUND_RECT_CACHE = map{};
+            ROUND_RECT_CACHE_KEYS = [];
+        }
+        ROUND_RECT_CACHE[key] = UIK.rounded_rect(0, 0, w, h, r);
+        array_push(ROUND_RECT_CACHE_KEYS, key);
+    }
+    let base = ROUND_RECT_CACHE[key];
+    let out = [];
     let i = 0;
-    while i < len(rs) { let b = rs[i]; win.rect(b.x, b.y, b.w, b.h, color); i = i + 1; }
+    while i < len(base) {
+        let b = base[i];
+        array_push(out, map{ x: x + b.x, y: y + b.y, w: b.w, h: b.h });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _elevation_key(w, h, t) {
+    return str(num_floor(w)) + "x" + str(num_floor(h)) + "t" + str(num_floor(t));
+}
+
+fn _elevation_cached(x, y, w, h, t) {
+    if w <= 0 or h <= 0 or t <= 0 { return []; }
+    w = num_floor(w);
+    h = num_floor(h);
+    t = num_floor(t);
+    let key = _elevation_key(w, h, t);
+    if not map_has(ELEVATION_CACHE, key) {
+        if len(ELEVATION_CACHE_KEYS) >= ELEVATION_CACHE_LIMIT {
+            ELEVATION_CACHE = map{};
+            ELEVATION_CACHE_KEYS = [];
+        }
+        ELEVATION_CACHE[key] = UIK.elevation(0, 0, w, h, t);
+        array_push(ELEVATION_CACHE_KEYS, key);
+    }
+    let base = ELEVATION_CACHE[key];
+    let out = [];
+    let i = 0;
+    while i < len(base) {
+        let b = base[i];
+        array_push(out, map{ x: x + b.x, y: y + b.y, w: b.w, h: b.h });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _design_grid_key(sz_w, canvTop, canvBot) {
+    return str(num_floor(sz_w)) + "x" + str(num_floor(canvTop)) + "-" + str(num_floor(canvBot)) + "@" + str(SCALE) + "/" + str(CW) + "/" + str(CH);
+}
+
+fn _design_grid_rects(sz_w, canvTop, canvBot) {
+    if sz_w <= 0 or canvBot <= canvTop { return []; }
+    let key = _design_grid_key(sz_w, canvTop, canvBot);
+    if not map_has(DESIGN_GRID_CACHE, key) {
+        if len(DESIGN_GRID_CACHE_KEYS) >= DESIGN_GRID_CACHE_LIMIT {
+            DESIGN_GRID_CACHE = map{};
+            DESIGN_GRID_CACHE_KEYS = [];
+        }
+        let rs = [];
+        let gx = PAD;
+        while gx < sz_w {
+            let gy = canvTop;
+            while gy < canvBot {
+                array_push(rs, map{ x: gx, y: gy, w: SCALE, h: SCALE });
+                gy = gy + CH * 2;
+            }
+            gx = gx + CW * 4;
+        }
+        DESIGN_GRID_CACHE[key] = rs;
+        array_push(DESIGN_GRID_CACHE_KEYS, key);
+    }
+    return DESIGN_GRID_CACHE[key];
+}
+
+fn _fill_round(win, x, y, w, h, color, r) {
+    let rs = _round_rect_cached(x, y, w, h, r);
+    _draw_rects(win, rs, color);
     return 0;
 }
 // A rounded card: soft drop shadow + border ring + inset fill (elevated panel look).
 fn _card(win, x, y, w, h, fill, border, r) {
-    let sh = UIK.elevation(x, y, w, h, SCALE);
-    let i = 0;
-    while i < len(sh) { let b = sh[i]; win.rect(b.x, b.y, b.w, b.h, GUTTERBG); i = i + 1; }
+    let sh = _elevation_cached(x, y, w, h, SCALE);
+    _draw_rects(win, sh, GUTTERBG);
     _fill_round(win, x, y, w, h, border, r);
     _fill_round(win, x + SCALE, y + SCALE, w - 2 * SCALE, h - 2 * SCALE, fill, r);
     return 0;
 }
 fn _card_state(state, win, x, y, w, h, fill, border, r) {
     if w <= 0 or h <= 0 { return 0; }
-    let sh = UIK.elevation(x, y, w, h, SCALE);
+    let sh = _elevation_cached(x, y, w, h, SCALE);
     _draw_rects(win, sh, _style_shadow(state));
-    let c = UIK.card(x, y, w, h, r, SCALE);
-    _draw_rects(win, c.border, border);
-    _draw_rects(win, c.fill, fill);
+    _draw_rects(win, _round_rect_cached(x, y, w, h, r), border);
+    _draw_rects(win, _round_rect_cached(x + SCALE, y + SCALE, w - 2 * SCALE, h - 2 * SCALE, r - SCALE), fill);
     return 0;
 }
 fn _button_face(state, win, x, y, w, h, fill, active) {
@@ -2114,11 +3158,23 @@ fn _panel_head(state, win, sz, y) {
 // panels (files/outline/problems/history/manage) share — keeps them pixel-identical
 // and makes restyling a one-line change.
 fn _panel_header_chrome(state, win, sz, m) {
-    _panel_header_chrome(state, win, sz, m);
+    let headerH = try m.header_h catch CH + 3 * PAD;
+    let bottom = try m.body_top catch TOP + headerH + CH + 2 * PAD;
+    if bottom < TOP + headerH { bottom = TOP + headerH; }
+    win.rect(0, TOP, sz.w, bottom - TOP, _style_bg(state));
+    win.rect(0, TOP, sz.w, headerH, _style_surface(state));
+    win.rect(0, TOP + headerH, sz.w, SCALE, _style_border(state));
+    _fill_round(win, PAD, TOP + PAD, 2 * SCALE, CH - PAD, _style_accent(state), SCALE);
     return 0;
 }
 fn _panel_footer_chrome(state, win, sz, footerY) {
-    _panel_footer_chrome(state, win, sz, footerY);
+    let fy = try parse_number(str(footerY)) catch sz.h - STATUSH;
+    if fy == nil { fy = sz.h - STATUSH; }
+    if fy < TOP { fy = TOP; }
+    let fh = sz.h - fy;
+    if fh <= 0 { return 0; }
+    win.rect(0, fy, sz.w, fh, _style_surface(state));
+    win.rect(0, fy, sz.w, SCALE, _style_border(state));
     return 0;
 }
 
@@ -2157,6 +3213,62 @@ fn _draw_panel_scrollbar(state, win, sz, m, total, rows, offset) {
     return 0;
 }
 
+fn _scrollbar_hit_index(mx, my, x, y, h, total, rows, offset, thick) {
+    if total <= rows or rows < 1 or total < 1 { return -1; }
+    if h <= CH { return -1; }
+    let sb = UIK.scrollbar(x, y, h, total, rows, offset, thick);
+    if not _hit_rect(mx, my, sb.track.x, sb.track.y, sb.track.w, sb.track.h, _button_hit_slop() / 2) { return -1; }
+    if my < sb.thumb.y { return _list_start_for(offset - rows, total, rows); }
+    if my > sb.thumb.y + sb.thumb.h { return _list_start_for(offset + rows, total, rows); }
+    let maxoff = total - rows;
+    if maxoff <= 0 { return 0; }
+    let span = h - sb.thumb.h;
+    if span <= 0 { return _list_start_for(offset, total, rows); }
+    let rel = my - y - sb.thumb.h / 2;
+    if rel < 0 { rel = 0; }
+    if rel > span { rel = span; }
+    let target = num_floor(rel * maxoff / span);
+    return _list_start_for(target, total, rows);
+}
+
+fn _panel_scrollbar_hit_index(state, m, total, rows, offset, mx, my) {
+    if state.winsz == nil { return -1; }
+    let h = m.footer_y - m.body_top - PAD;
+    let thick = _scrollbar_thickness();
+    return _scrollbar_hit_index(mx, my, state.winsz.w - PAD - thick, m.body_top, h, total, rows, offset, thick);
+}
+
+fn _scroll_event_delta(e) {
+    let dy = try parse_number(str(try e.dy catch 0)) catch 0;
+    if dy == nil or dy == 0 { return 0; }
+    if dy > 0 {
+        let n = num_floor(dy);
+        if n < 1 { n = 1; }
+        return 0 - n * 3;
+    }
+    let n = num_floor(0 - dy);
+    if n < 1 { n = 1; }
+    return n * 3;
+}
+
+fn _clamp_index(v, total) {
+    if total <= 0 { return 0; }
+    v = num_floor(v);
+    if v < 0 { return 0; }
+    if v >= total { return total - 1; }
+    return v;
+}
+
+fn _clamp_scroll(v, total, rows) {
+    if rows < 1 { rows = 1; }
+    if total <= rows { return 0; }
+    v = num_floor(v);
+    if v < 0 { return 0; }
+    let maxv = total - rows;
+    if v > maxv { return maxv; }
+    return v;
+}
+
 fn _scrollbar_thickness() {
     let thick = 3 * SCALE;
     if thick < 6 { thick = 6; }
@@ -2179,9 +3291,45 @@ fn _hit_slop() {
     return s;
 }
 
+fn _button_hit_slop() {
+    let s = _hit_slop() + 2 * SCALE;
+    if s < 16 { s = 16; }
+    if s > 30 { s = 30; }
+    return s;
+}
+
+fn _hit_button(mx, my, x, y, w, h) {
+    return _hit_rect(mx, my, x, y, w, h, _button_hit_slop());
+}
+
 fn _hit_row(my, y, h) {
     let s = _hit_slop() / 2;
     return my >= y - s and my < y + h + s;
+}
+
+fn _toolbar_hit_best(items, mx, my, slop) {
+    let best = nil;
+    let best_score = 999999999;
+    let i = 0;
+    while i < len(items) {
+        let b = items[i];
+        if (try b.visible catch true) and _hit_rect(mx, my, b.x, b.y, b.w, b.h, slop) {
+            let cx = b.x + b.w / 2;
+            let cy = b.y + b.h / 2;
+            let dx = mx - cx;
+            if dx < 0 { dx = 0 - dx; }
+            let dy = my - cy;
+            if dy < 0 { dy = 0 - dy; }
+            let score = dx + dy;
+            if score < best_score {
+                best_score = score;
+                best = b;
+            }
+        }
+        i = i + 1;
+    }
+    if best == nil { return nil; }
+    return try best.id catch nil;
 }
 fn _panel_search_box(state, win, m) {
     _fill_round(win, PAD, m.search_y, m.content_w, m.search_h, _style_surface2(state), RAD);
@@ -2190,6 +3338,10 @@ fn _panel_search_box(state, win, m) {
 }
 // Draw a list of ui_kit rects in one color (small convenience for cards/segments/bars).
 fn _draw_rects(win, rs, color) {
+    if len(rs) > 1 {
+        let batched = try win.rects(rs, color) catch nil;
+        if batched != nil { return 0; }
+    }
     let i = 0;
     while i < len(rs) { let b = rs[i]; win.rect(b.x, b.y, b.w, b.h, color); i = i + 1; }
     return 0;
@@ -2213,44 +3365,116 @@ fn _side_section(state, win, x, y, w, h, title, accent, title_color) {
 fn _side_content_x(px) { return px + 2 * PAD; }
 fn _side_content_y(y) { return y + CH + PAD; }
 
+fn _draw_file_tabs(state, win, editorW) {
+    _file_tabs_sync_current(state);
+    let tabs = try state.file_tabs catch [];
+    if tabs == nil or len(tabs) == 0 { state.file_tab_layout = []; return 0; }
+    let h = _file_tabs_height(state);
+    if h <= 0 { state.file_tab_layout = []; return 0; }
+    win.rect(0, TOP, editorW, h, _style_bg(state));
+    win.rect(0, TOP + h - SCALE, editorW, SCALE, _style_border(state));
+    let x = PAD;
+    let maxX = editorW - PAD;
+    let layout = [];
+    let i = try state.file_tab_scroll catch 0;
+    if i < 0 { i = 0; }
+    while i < len(tabs) and x < maxX - 8 * CW {
+        let tab = tabs[i];
+        let title = str(try tab.title catch _file_tab_title(try tab.path catch ""));
+        if try tab.dirty catch false { title = "* " + title; }
+        let tw = len(title) * CW + 3 * PAD;
+        let minW = 14 * CW;
+        let maxW = 28 * CW;
+        if tw < minW { tw = minW; }
+        if tw > maxW { tw = maxW; }
+        if x + tw > maxX { break; }
+        let active = i == (try state.file_tab_sel catch 0);
+        let fill = _style_surface(state);
+        let txt = _style_muted(state);
+        if active {
+            fill = _style_panel(state);
+            txt = _style_text(state);
+        }
+        _button_face(state, win, x, TOP + PAD / 2, tw, CH + PAD / 2, fill, active);
+        if active { _fill_round(win, x + PAD / 2, TOP + h - 2 * SCALE, tw - PAD, 2 * SCALE, _style_accent(state), SCALE); }
+        let shown = str_slice(title, 0, (tw - 2 * PAD) / CW);
+        _dt(win, x + PAD, TOP + PAD, shown, txt);
+        array_push(layout, map{ index: i, x: x, y: TOP, w: tw, h: h });
+        x = x + tw + SCALE;
+        i = i + 1;
+    }
+    let files = try state.project_files catch [];
+    if files != nil and len(files) > 1 and maxX - x > 16 * CW {
+        let badge = str(len(files)) + " files";
+        _fill_round(win, maxX - 12 * CW, TOP + PAD / 2, 11 * CW, CH + PAD / 2, _style_surface2(state), RAD);
+        _dt(win, maxX - 11 * CW, TOP + PAD, badge, _style_focus(state));
+    }
+    state.file_tab_layout = layout;
+    return 0;
+}
+
+fn _file_tab_click(state, mx, my) {
+    if (try state.panel catch "") != "code" { return false; }
+    let h = _file_tabs_height(state);
+    if h <= 0 { return false; }
+    if my < TOP - _button_hit_slop() or my > TOP + h + _button_hit_slop() { return false; }
+    let layout = try state.file_tab_layout catch [];
+    let i = 0;
+    while layout != nil and i < len(layout) {
+        let b = layout[i];
+        if _hit_rect(mx, my, b.x, b.y, b.w, b.h, _button_hit_slop()) {
+            _file_tabs_load(state, b.index);
+            return true;
+        }
+        i = i + 1;
+    }
+    return my >= TOP and my < TOP + h;
+}
+
 fn _draw_code(state, win, sz) {
     let ed = state.ed;
     let outw = _code_output_w_state(state, sz);
     let splitw = SCALE * 3;
     let editorW = sz.w - outw - splitw;
-    let rows = num_floor((sz.h - STATUSH - TOP) / CH);
+    _draw_file_tabs(state, win, editorW);
+    let codeTop = _code_content_top(state);
+    let rows = num_floor((sz.h - STATUSH - codeTop) / CH);
     state.rows = rows;
     ed.row = num_floor(ed.row);
     ed.col = num_floor(ed.col);
     ed.scroll = num_floor(ed.scroll);
     E.ensure_visible(ed, rows);
 
-    // Re-tokenize only when the buffer changed (cached across frames). Very large files
-    // stay editable by temporarily disabling syntax coloring instead of parsing on frame.
-    let src_now = E.text(ed);
-    let src_hash = IDE.code_hash(src_now);
-    if (try state.syntax_hash catch "") != src_hash {
+    // Re-tokenize only when the editor revision changes. Older PBIDE builds
+    // hashed the whole buffer every repaint; the editor model now bumps `rev`
+    // on text mutations, so idle redraws do not need full-buffer work.
+    let syntax_rev = try ed.rev catch 0;
+    if (try state.syntax_rev catch (0 - 1)) != syntax_rev or (try state.syntax_hash catch "") == "" {
+        let src_now = E.text(ed);
         if len(src_now) > TOKEN_CHAR_LIMIT {
             state.tokens = nil;
+            state.token_lines = nil;
             state.syntax_status = "syntax paused: large file";
         } else {
             state.tokens = try H.tokens(src_now) catch nil;
+            state.token_lines = _token_lines_index(state.tokens);
             state.syntax_status = "";
         }
-        state.syntax_hash = src_hash;
+        state.syntax_rev = syntax_rev;
+        state.syntax_hash = "rev:" + str(syntax_rev);
     }
     let toks = state.tokens;
     let selr = E.selection_range(ed);
     let scr = ed.scroll;
 
     // gutter background strip
-    win.rect(0, TOP, GUTTERX - SCALE, sz.h - STATUSH - TOP, _style_gutter(state));
+    win.rect(0, codeTop, GUTTERX - SCALE, sz.h - STATUSH - codeTop, _style_gutter(state));
 
     let vr = 0;
     while vr < rows {
         let r = scr + vr;
         if r < E.line_count(ed) {
-            let y = TOP + vr * CH;
+            let y = codeTop + vr * CH;
             // current-line highlight (behind the text, across the editor area)
             if r == ed.row { win.rect(GUTTERX - SCALE, y - SCALE, editorW - GUTTERX + SCALE, CH, _style_currow(state)); }
             // selection highlight (behind the text)
@@ -2275,19 +3499,24 @@ fn _draw_code(state, win, sz) {
         vr = vr + 1;
     }
 
-    // Syntax tokens are drawn in one pass over the token array. The old code searched
-    // the whole token list once per visible line, which made larger files feel laggy.
+    // Syntax tokens are indexed by line when tokenized. Drawing now visits only visible
+    // rows instead of scanning the whole token array every repaint.
     if toks != nil {
-        let ti = 0;
-        let end_line = scr + rows + 1;
-        while ti < len(toks) {
-            let t = toks[ti];
-            if t.line >= scr + 1 and t.line < end_line {
-                let y = TOP + (t.line - scr - 1) * CH;
+        let indexed = try state.token_lines catch nil;
+        let vr2 = 0;
+        while vr2 < rows {
+            let line_no = scr + vr2 + 1;
+            let row_toks = [];
+            if indexed != nil and map_has(indexed, str(line_no)) { row_toks = indexed[str(line_no)]; }
+            let ti = 0;
+            while ti < len(row_toks) {
+                let t = row_toks[ti];
+                let y = codeTop + vr2 * CH;
                 let rgb = H.kind_color_theme(t.kind, _theme_name(state));
                 _dt(win, GUTTERX + (t.col - 1) * CW, y, t.text, gfx.rgb(rgb[0], rgb[1], rgb[2]));
+                ti = ti + 1;
             }
-            ti = ti + 1;
+            vr2 = vr2 + 1;
         }
     }
 
@@ -2297,15 +3526,15 @@ fn _draw_code(state, win, sz) {
         if visible_cols < 1 { visible_cols = 1; }
         let cur_col = ed.col;
         if cur_col > visible_cols { cur_col = visible_cols; }
-        win.rect(GUTTERX + cur_col * CW, TOP + curscreen * CH, SCALE, CH - SCALE, CURSOR);
+        win.rect(GUTTERX + cur_col * CW, codeTop + curscreen * CH, SCALE, CH - SCALE, CURSOR);
     }
 
     // editor scrollbar (drawn over the content, at the right edge of the code area)
     let edTotal = E.line_count(ed);
     if edTotal > rows {
-        let sbH = sz.h - STATUSH - TOP;
+        let sbH = sz.h - STATUSH - codeTop;
         let thick = _scrollbar_thickness();
-        let sb = UIK.scrollbar(editorW - PAD - thick, TOP, sbH, edTotal, rows, scr, thick);
+        let sb = UIK.scrollbar(editorW - PAD - thick, codeTop, sbH, edTotal, rows, scr, thick);
         _fill_round(win, sb.track.x, sb.track.y, sb.track.w, sb.track.h, _style_surface2(state), thick / 2);
         _fill_round(win, sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h, _style_accent(state), thick / 2);
     }
@@ -2397,6 +3626,7 @@ fn _draw_code(state, win, sz) {
     if sz.w > 1040 {
         let chip = _style_name(state) + "/" + _theme_name(state) + " · " + _window_probe_status(state) + _event_status(state);
         if sz.w > 1500 { chip = chip + " · " + _graphics_status(); }
+        else { chip = chip + " · " + _graphics_short_status(); }
         if len(chip) * CW > sz.w / 2 { chip = str_slice(chip, 0, (sz.w / 2) / CW); }
         let chipW = len(chip) * CW + 2 * PAD;
         _fill_round(win, sz.w - chipW - PAD, sy + PAD / 2, chipW, CH + PAD / 2, _style_panel(state), RAD);
@@ -2408,7 +3638,7 @@ fn _draw_code(state, win, sz) {
 
 // ── toolbar (top tab strip) ──────────────────────────────────────────────────────
 fn _draw_toolbar(state, win, sz) {
-    _apply_toolbar_metrics(sz);
+    let layout = _toolbar_layout(state, sz);
     win.rect(0, 0, sz.w, TBH, _style_rail(state));
     win.rect(0, 0, sz.w, SCALE, _style_focus(state));
     win.rect(0, TBH - SCALE, sz.w, SCALE, _style_border(state));
@@ -2424,41 +3654,39 @@ fn _draw_toolbar(state, win, sz) {
     if brandW >= 18 * CW and sz.w > 900 {
         _dt(win, PAD + 7 * CW, PAD + SCALE, "native studio", _style_muted(state));
     }
-    let rows = _toolbar_rows(sz);
-    let actionY = PAD;
-    if rows > 1 { actionY = PAD + CH + 2 * PAD; }
-    let panelY = PAD;
+    let rows = try layout.rows catch _toolbar_rows(sz);
+    let actionY = try layout.action_y catch PAD;
+    let panelY = try layout.panel_y catch PAD;
     let i = 0;
-    let panelStart = sz.w - PAD - _panel_total_w_for(sz);
-    if panelStart < PAD { panelStart = PAD; }
+    let panelStart = try layout.panel_start catch sz.w - PAD - _panel_total_w_for(sz);
     while i < len(ACTIONS) {
-        let b = _action_bounds_for(i, sz);
+        let b = layout.actions[i];
         let id = ACTIONS[i].id;
-        if rows > 1 or b.x + b.w + PAD < panelStart {
+        if try b.visible catch true {
             let bg = _toolbar_action_bg(state, id);
             if id == "watch" { bg = _toolbar_watch_state_bg(state, _watch_badge(state)); }
             if id == (try state.hover_tab catch nil) { bg = _style_surface2(state); }
-            _button_face(state, win, b.x, actionY, b.w, CH + PAD, bg, id == "run");
+            _button_face(state, win, b.x, b.y, b.w, b.h, bg, id == "run");
             let fg = _toolbar_action_fg(state, id);
             let label = ACTIONS[i].label;
             if id == "mode" { label = _mode_label(state); }
             if id == "watch" { label = _watch_toolbar_label(state); }
             if id == "style" { label = str_upper(str_slice(_style_name(state), 0, 1)) + str_slice(_style_name(state), 1, len(_style_name(state))); }
             if id == "theme" { label = _theme_label(state); }
-            _dt(win, b.x + CW, actionY + PAD / 2, label, fg);
-            if id == "run" { win.rect(b.x + RAD, actionY + CH + PAD - SCALE, b.w - 2 * RAD, SCALE, _style_focus(state)); }
+            _dt(win, b.x + CW, b.y + PAD / 2, label, fg);
+            if id == "run" { win.rect(b.x + RAD, b.y + CH + PAD - SCALE, b.w - 2 * RAD, SCALE, _style_focus(state)); }
         }
         i = i + 1;
     }
     i = 0;
     while i < len(PANELS) {
-        let b = _panel_bounds(i, sz);
+        let b = layout.panels[i];
         let id = PANELS[i].id;
         let active = id == state.panel;
         let bg = _toolbar_panel_bg(state, active);
         let hovered = not active and id == (try state.hover_tab catch nil);
         if hovered { bg = _style_surface2(state); }
-        _button_face(state, win, b.x, panelY, b.w, CH + PAD, bg, active);
+        _button_face(state, win, b.x, b.y, b.w, b.h, bg, active);
         // hovered tab: a soft accent underline hints "clickable" before commit
         if hovered { win.rect(b.x + RAD, TBH - SCALE, b.w - 2 * RAD, SCALE, _style_surface2(state)); }
         // active panel tab: an accent underline at the toolbar baseline (modern tab cue)
@@ -2467,7 +3695,7 @@ fn _draw_toolbar(state, win, sz) {
             win.rect(b.x + RAD, TBH - 2 * SCALE, b.w - 2 * RAD, 2 * SCALE, _style_focus(state));
         }
         let fg = _toolbar_panel_fg(state, active);
-        _dt(win, b.x + CW, panelY + PAD / 2, _panel_label_for(i, sz), fg);
+        _dt(win, b.x + CW, b.y + PAD / 2, b.label, fg);
         i = i + 1;
     }
     if sz.w > 1180 and rows == 1 {
@@ -2479,31 +3707,20 @@ fn _draw_toolbar(state, win, sz) {
     }
 }
 // toolbar hit-test: pixel → tab id (nil if not on the toolbar).
-fn _toolbar_hit(mx, my, sz) {
+fn _toolbar_hit(state, mx, my, sz) {
     if sz == nil { return nil; }
-    _apply_toolbar_metrics(sz);
-    let rows = _toolbar_rows(sz);
-    let slop = _hit_slop();
-    let panelY = PAD;
-    let actionY = PAD;
-    if rows > 1 { actionY = PAD + CH + 2 * PAD; }
-    let i = 0;
+    let layout = _toolbar_layout(state, sz);
+    let rows = try layout.rows catch _toolbar_rows(sz);
+    let slop = _button_hit_slop();
+    let panelY = try layout.panel_y catch PAD;
+    let actionY = try layout.action_y catch PAD;
     if my >= panelY - slop and my < panelY + CH + PAD + slop {
-        while i < len(PANELS) {
-            let b = _panel_bounds(i, sz);
-            if _hit_rect(mx, my, b.x, panelY, b.w, CH + PAD, slop) { return PANELS[i].id; }
-            i = i + 1;
-        }
+        let p = _toolbar_hit_best(try layout.panels catch [], mx, my, slop);
+        if p != nil { return p; }
     }
-    let panelStart = sz.w - PAD - _panel_total_w_for(sz);
-    if panelStart < PAD { panelStart = PAD; }
-    i = 0;
     if my >= actionY - slop and my < actionY + CH + PAD + slop {
-        while i < len(ACTIONS) {
-            let b = _action_bounds_for(i, sz);
-            if (rows > 1 or b.x + b.w + PAD < panelStart) and _hit_rect(mx, my, b.x, actionY, b.w, CH + PAD, slop) { return ACTIONS[i].id; }
-            i = i + 1;
-        }
+        let a = _toolbar_hit_best(try layout.actions catch [], mx, my, slop);
+        if a != nil { return a; }
     }
     return nil;
 }
@@ -2514,6 +3731,53 @@ fn _replace_editor(state, code) {
     state.tokens = nil;
     state.syntax_hash = "";
     state.last = "other";
+    state.example_run_path = "";
+    state.example_app_kind = "";
+    state.example_title = "";
+}
+
+fn _apply_example_metadata(state, ex) {
+    state.example_title = str(try ex.title catch "");
+    state.example_run_path = str(try ex.run_path catch "");
+    state.example_app_kind = str(try ex.app_kind catch "");
+    let preset_id = str(try ex.design_preset catch "");
+    let loaded = "";
+    if preset_id != "" {
+        let target = str(try ex.design_target catch "gui");
+        state.design.target = target;
+        state.design.widgets = [];
+        state.design.sel = 0 - 1;
+        state.design.counter = 0;
+        let preset = IDE.designer_component_preset(preset_id, PAD * 2, _design_content_top(state) + PAD);
+        if try preset.ok catch false {
+            let items = try preset.items catch [];
+            let i = 0;
+            while i < len(items) {
+                let w = _design_apply_preset_item(state, items[i]);
+                if w != nil {
+                    array_push(state.design.widgets, w);
+                    state.design.sel = len(state.design.widgets) - 1;
+                }
+                i = i + 1;
+            }
+            _design_apply_layout(state);
+            loaded = "designer form: " + str(try preset.title catch preset_id) + " (" + str(len(state.design.widgets)) + " item(s))";
+        } else {
+            loaded = "designer form unavailable: " + str(try preset.summary catch preset_id);
+        }
+    }
+    let browser_urls = try ex.browser_urls catch [];
+    if browser_urls != nil and len(browser_urls) > 0 {
+        _web_tabs_set_from_urls(state, browser_urls);
+        let msg = "browser tabs: " + str(len(browser_urls)) + " URL(s)";
+        if loaded == "" { loaded = msg; }
+        else { loaded = loaded + "\n" + msg; }
+    }
+    let open_panel = str(try ex.open_panel catch "");
+    if open_panel == "design" or open_panel == "code" or open_panel == "web" or open_panel == "term" {
+        state.panel = open_panel;
+    }
+    return loaded;
 }
 
 fn _format_editor(state) {
@@ -2652,7 +3916,13 @@ fn _run_action(state) {
             return blocked;
         }
     }
-    let out = _run(state.ed);
+    let app_profile = _app_profile_for_state(state);
+    let out = "";
+    if (try app_profile.can_native_run catch false) or str(try state.example_run_path catch "") != "" {
+        out = _run_native_app_source(state, app_profile);
+    } else {
+        out = _run(state.ed);
+    }
     let tagged = _mode_label(state) + " run\n" + out;
     state.output = tagged;
     _history_push(state, "run", tagged);
@@ -2762,10 +4032,11 @@ fn _diagnostic_click(state, mx, my) {
     let sz = state.winsz;
     let outw = _code_output_w_state(state, sz);
     let px = sz.w - outw;
-    if mx < px - _hit_slop() { return false; }
+    let slop = _button_hit_slop();
+    if mx < px - slop { return false; }
     let diagY = _code_diag_y();
     let rowTop = diagY + CH + PAD;
-    if my < rowTop - _hit_slop() or my >= rowTop + 4 * CH + _hit_slop() { return false; }
+    if my < rowTop - slop or my >= rowTop + 4 * CH + slop { return false; }
     let idx = num_floor((my - rowTop) / CH);
     if idx < 0 or idx >= len(state.diagnostics) { return false; }
     state.diag_index = idx;
@@ -2778,10 +4049,11 @@ fn _watcher_click(state, mx, my) {
     let sz = state.winsz;
     let outw = _code_output_w_state(state, sz);
     let px = sz.w - outw;
-    if mx < px - _hit_slop() { return false; }
+    let slop = _button_hit_slop();
+    if mx < px - slop { return false; }
     let watchY = _code_watch_y();
     let rowTop = watchY + CH + PAD;
-    if my < rowTop - _hit_slop() or my >= rowTop + 4 * CH + _hit_slop() { return false; }
+    if my < rowTop - slop or my >= rowTop + 4 * CH + slop { return false; }
     let idx = num_floor((my - rowTop) / CH);
     if idx != 1 { return false; }
     state.panel = "code";
@@ -2794,10 +4066,11 @@ fn _ui_observer_click(state, mx, my) {
     let sz = state.winsz;
     let outw = _code_output_w_state(state, sz);
     let px = sz.w - outw;
-    if mx < px - _hit_slop() { return false; }
+    let slop = _button_hit_slop();
+    if mx < px - slop { return false; }
     let uiY = _code_ui_y();
     let blockH = CH * 4 + PAD;
-    if my < uiY - _hit_slop() or my >= uiY + blockH + _hit_slop() { return false; }
+    if my < uiY - slop or my >= uiY + blockH + slop { return false; }
     _show_ui_snapshot(state);
     return true;
 }
@@ -2822,11 +4095,22 @@ fn _load_next_example(state) {
     let idx = try state.example_idx catch 0;
     if idx < 0 or idx >= len(EXAMPLES) { idx = 0; }
     let ex = EXAMPLES[idx];
-    _replace_editor(state, ex.code);
+    _file_tabs_sync_current(state);
+    let code = _example_code(ex);
+    _replace_editor(state, code);
     state.panel = "code";
+    let meta = _apply_example_metadata(state, ex);
+    _file_tabs_reset_for_example(state, ex, code);
+    _design_tabs_reset_for_project(state);
+    _refresh_watcher(state, "example");
     state.example_idx = idx + 1;
     if state.example_idx >= len(EXAMPLES) { state.example_idx = 0; }
-    return "loaded example: " + ex.title + " (" + str(idx + 1) + "/" + str(len(EXAMPLES)) + ")";
+    let msg = "loaded example: " + ex.title + " (" + str(idx + 1) + "/" + str(len(EXAMPLES)) + ")";
+    if meta != "" { msg = msg + "\n" + meta; }
+    let listing = _project_files_text(try state.project_files catch []);
+    if listing != "" { msg = msg + "\n" + listing; }
+    state.output = msg;
+    return msg;
 }
 
 fn _example_hits(state) {
@@ -2836,10 +4120,19 @@ fn _example_hits(state) {
 fn _load_example_index(state, idx) {
     if idx < 0 or idx >= len(EXAMPLES) { return "example: invalid selection"; }
     let ex = EXAMPLES[idx];
-    _replace_editor(state, ex.code);
+    _file_tabs_sync_current(state);
+    let code = _example_code(ex);
+    _replace_editor(state, code);
     state.panel = "code";
+    let meta = _apply_example_metadata(state, ex);
+    _file_tabs_reset_for_example(state, ex, code);
+    _design_tabs_reset_for_project(state);
+    _refresh_watcher(state, "example");
     state.examples_mode = false;
     state.output = "loaded example: " + ex.title + " (" + str(idx + 1) + "/" + str(len(EXAMPLES)) + ")";
+    if meta != "" { state.output = state.output + "\n" + meta; }
+    let listing = _project_files_text(try state.project_files catch []);
+    if listing != "" { state.output = state.output + "\n" + listing; }
     return state.output;
 }
 
@@ -2905,9 +4198,10 @@ fn _open_buffer(state) {
 
 fn _toolbar_click(state, id) {
     _ui_event(state, "toolbar " + str(id));
-    if id == "code" or id == "ai" or id == "design" or id == "web" or id == "term" or id == "hist" or id == "manage" or id == "outline" or id == "files" or id == "problems" {
+    if id == "code" or id == "ai" or id == "design" or id == "web" or id == "term" or id == "hist" or id == "manage" or id == "settings" or id == "outline" or id == "files" or id == "problems" {
         state.panel = id;
         if id == "files" { _files_refresh(state); }
+        if id == "design" { _design_tabs_focus_path(state, try state.path catch ""); }
         return 0;
     }
     if id == "run" { state.panel = "code"; _run_action(state); return 0; }
@@ -2951,7 +4245,7 @@ fn _open_command_palette(state) {
 }
 
 fn _command_hits(state) {
-    return IDE.filter_commands(try state.command_query catch "", 12);
+    return IDE.filter_commands(try state.command_query catch "", 200);
 }
 
 fn _command_clamp(state) {
@@ -3004,6 +4298,7 @@ fn _command_execute(state, id) {
     if id == "panel_problems" { _panel_by_index(state, 7); return 0; }
     if id == "panel_hist" { _panel_by_index(state, 8); return 0; }
     if id == "panel_manage" { _panel_by_index(state, 9); return 0; }
+    if id == "panel_settings" { _panel_by_index(state, 10); return 0; }
     if id == "panel_next" { _panel_step(state, 1); return 0; }
     if id == "panel_prev" { _panel_step(state, 0 - 1); return 0; }
     if id == "new" { _new_buffer(state); return 0; }
@@ -3365,12 +4660,18 @@ let DPAL = [
     map{ id: "gencode",  label: "->CODE", act: true },
     map{ id: "clear",    label: "CLEAR",  act: true },
 ];
+fn _design_tabs_height() {
+    return CH + PAD;
+}
+fn _design_palette_top() {
+    return TOP + _design_tabs_height();
+}
 // x/y/width of palette chip `idx` (wrapped — same math in draw + hit-test).
 fn _pal_bounds(idx, sz = nil) {
     let maxx = 10000000;
     if sz != nil { maxx = sz.w - PAD; }
     let x = PAD;
-    let y = TOP;
+    let y = _design_palette_top();
     let i = 0;
     while i < idx {
         let bw = (len(DPAL[i].label) + 2) * CW;
@@ -3393,17 +4694,21 @@ fn _pal_hit(mx, my, sz) {
     let i = 0;
     while i < len(DPAL) {
         let b = _pal_bounds(i, sz);
-        if _hit_rect(mx, my, b.x, b.y, b.w, CH + SCALE, _hit_slop() / 2) { return DPAL[i].id; }
+        if _hit_button(mx, my, b.x, b.y, b.w, CH + SCALE) { return DPAL[i].id; }
         i = i + 1;
     }
     return nil;
 }
 // rectangle outline (the toolkit only fills rects, so a border is four thin rects).
 fn _box(win, x, y, w, h, c) {
-    win.rect(x, y, w, SCALE, c);
-    win.rect(x, y + h - SCALE, w, SCALE, c);
-    win.rect(x, y, SCALE, h, c);
-    win.rect(x + w - SCALE, y, SCALE, h, c);
+    if w <= 0 or h <= 0 { return 0; }
+    _draw_rects(win, [
+        map{ x: x, y: y, w: w, h: SCALE },
+        map{ x: x, y: y + h - SCALE, w: w, h: SCALE },
+        map{ x: x, y: y, w: SCALE, h: h },
+        map{ x: x + w - SCALE, y: y, w: SCALE, h: h }
+    ], c);
+    return 0;
 }
 // which widget property holds its editable label (so typing edits the right field).
 fn _w_textkey(w) {
@@ -3579,26 +4884,53 @@ fn _draw_sphere3d(state, win, w, sel) {
     _dt(win, w.x + PAD, w.y + w.h + PAD, w.text, _style_text(state));
     if sel { _box(win, w.x - SCALE, w.y - SCALE, w.w + 2 * SCALE, w.h + 2 * SCALE, CURSOR); }
 }
-// Badge-card Designer widgets: caption + subtitle on the shared card chrome. One
-// table row per kind replaces a whole draw branch — new kinds are a one-line add.
-fn _badge_card_specs() {
-    return map{
-        docmedia:  map{ caption: "MEDIA",         sub: "audio/video player",      sub_style: "text", accent_line: true },
-        webcomp:   map{ caption: "WEB component", sub: "HTML/CSS/JS metadata",    sub_style: "muted" },
-        scan3d:    map{ caption: "SCAN 3D",       sub: "obj/ply/stl/point cloud", sub_style: "muted" },
-        camera:    map{ caption: "CAMERA",        sub: "fov 60  perspective",     sub_style: "muted" },
-        light:     map{ caption: "LIGHT",         sub: "directional / point",     sub_style: "muted" },
-        material:  map{ caption: "MATERIAL",      sub: "pbr-lite roughness",      sub_style: "muted" },
-        terrain:   map{ caption: "TERRAIN",       sub: "heightfield / LOD",       sub_style: "muted" },
-        particles: map{ caption: "PARTICLES",     sub: "emitter rate lifetime",   sub_style: "muted" },
-        physics:   map{ caption: "PHYSICS",       sub: "body collider mass",      sub_style: "muted" },
-        prefab:    map{ caption: "PREFAB",        sub: "entity/component asset",  sub_style: "muted" },
-        backend:   map{ caption: "VK/GL TARGET",  sub: "plan-only renderer",      sub_style: "muted" },
-        // body:"slice_text" -> the subtitle is the widget's own text, clipped to width
-        doctext:   map{ caption: "RICH TEXT",     sub: "", body: "slice_text" },
-        custom:    map{ caption: "CUSTOM",        sub: "", body: "slice_text" },
-    };
+// Badge-card Designer widgets: caption + subtitle on the shared card chrome. This
+// is a stable table, not a per-widget allocation during every Designer repaint.
+let BADGE_CARD_SPECS = map{
+    docmedia:  map{ caption: "MEDIA",         sub: "audio/video player",      sub_style: "text", accent_line: true },
+    webcomp:   map{ caption: "WEB component", sub: "HTML/CSS/JS metadata",    sub_style: "muted" },
+    scan3d:    map{ caption: "SCAN 3D",       sub: "obj/ply/stl/point cloud", sub_style: "muted" },
+    camera:    map{ caption: "CAMERA",        sub: "fov 60  perspective",     sub_style: "muted" },
+    light:     map{ caption: "LIGHT",         sub: "directional / point",     sub_style: "muted" },
+    material:  map{ caption: "MATERIAL",      sub: "pbr-lite roughness",      sub_style: "muted" },
+    terrain:   map{ caption: "TERRAIN",       sub: "heightfield / LOD",       sub_style: "muted" },
+    particles: map{ caption: "PARTICLES",     sub: "emitter rate lifetime",   sub_style: "muted" },
+    physics:   map{ caption: "PHYSICS",       sub: "body collider mass",      sub_style: "muted" },
+    prefab:    map{ caption: "PREFAB",        sub: "entity/component asset",  sub_style: "muted" },
+    backend:   map{ caption: "VK/GL TARGET",  sub: "plan-only renderer",      sub_style: "muted" },
+    // body:"slice_text" -> the subtitle is the widget's own text, clipped to width
+    doctext:   map{ caption: "RICH TEXT",     sub: "", body: "slice_text" },
+    custom:    map{ caption: "CUSTOM",        sub: "", body: "slice_text" },
+};
+fn _badge_card_specs() { return BADGE_CARD_SPECS; }
+
+fn _designer_chart_bar_rects(w) {
+    return [
+        map{ x: w.x + 3 * PAD, y: w.y + w.h - 5 * CH, w: SCALE, h: 3 * CH },
+        map{ x: w.x + 8 * PAD, y: w.y + w.h - 7 * CH, w: SCALE, h: 5 * CH },
+        map{ x: w.x + 13 * PAD, y: w.y + w.h - 6 * CH, w: SCALE, h: 4 * CH }
+    ];
 }
+
+fn _designer_docpage_line_rects(w, shrink) {
+    return [map{ x: w.x + 2 * PAD, y: w.y + shrink, w: w.w - 4 * PAD, h: SCALE }];
+}
+
+fn _designer_table_grid_rects(w) {
+    let rs = [];
+    let tx = w.x + PAD;
+    while tx < w.x + w.w - PAD {
+        array_push(rs, map{ x: tx, y: w.y + 3 * CH, w: SCALE, h: w.h - 4 * CH });
+        tx = tx + (w.w - 2 * PAD) / 3;
+    }
+    let ty = w.y + 3 * CH;
+    while ty < w.y + w.h - PAD {
+        array_push(rs, map{ x: w.x + PAD, y: ty, w: w.w - 2 * PAD, h: SCALE });
+        ty = ty + CH * 2;
+    }
+    return rs;
+}
+
 fn _draw_dwidget(state, win, w, sel) {
     let k = w.kind;
     let bd = _style_muted(state);
@@ -3671,16 +5003,16 @@ fn _draw_dwidget(state, win, w, sel) {
         _box(win, w.x, w.y, w.w, w.h, bd);
         _dt(win, w.x + PAD, w.y + PAD, w.text, text);
         win.rect(w.x + 2 * PAD, w.y + w.h - 4 * CH, w.w - 4 * PAD, SCALE, muted);
-        win.rect(w.x + 3 * PAD, w.y + w.h - 5 * CH, SCALE, 3 * CH, accent);
-        win.rect(w.x + 8 * PAD, w.y + w.h - 7 * CH, SCALE, 5 * CH, accent);
-        win.rect(w.x + 13 * PAD, w.y + w.h - 6 * CH, SCALE, 4 * CH, accent);
+        _draw_rects(win, _designer_chart_bar_rects(w), accent);
     } else if k == "docpage" {
         win.rect(w.x, w.y, w.w, w.h, gfx.rgb(250, 250, 248));
         _box(win, w.x, w.y, w.w, w.h, bd);
         _dt(win, w.x + PAD, w.y + PAD, "PAGE", gfx.rgb(30, 36, 52));
-        win.rect(w.x + 2 * PAD, w.y + 4 * CH, w.w - 4 * PAD, SCALE, gfx.rgb(200, 205, 216));
-        win.rect(w.x + 2 * PAD, w.y + 6 * CH, w.w - 8 * PAD, SCALE, gfx.rgb(210, 215, 226));
-        win.rect(w.x + 2 * PAD, w.y + 8 * CH, w.w - 6 * PAD, SCALE, gfx.rgb(210, 215, 226));
+        _draw_rects(win, _designer_docpage_line_rects(w, 4 * CH), gfx.rgb(200, 205, 216));
+        _draw_rects(win, [
+            map{ x: w.x + 2 * PAD, y: w.y + 6 * CH, w: w.w - 8 * PAD, h: SCALE },
+            map{ x: w.x + 2 * PAD, y: w.y + 8 * CH, w: w.w - 6 * PAD, h: SCALE }
+        ], gfx.rgb(210, 215, 226));
     } else if k == "docimage" {
         win.rect(w.x, w.y, w.w, w.h, card);
         _box(win, w.x, w.y, w.w, w.h, bd);
@@ -3691,10 +5023,7 @@ fn _draw_dwidget(state, win, w, sel) {
         win.rect(w.x, w.y, w.w, w.h, card);
         _box(win, w.x, w.y, w.w, w.h, bd);
         _dt(win, w.x + PAD, w.y + PAD, "TABLE", badge);
-        let tx = w.x + PAD;
-        while tx < w.x + w.w - PAD { win.rect(tx, w.y + 3 * CH, SCALE, w.h - 4 * CH, muted); tx = tx + (w.w - 2 * PAD) / 3; }
-        let ty = w.y + 3 * CH;
-        while ty < w.y + w.h - PAD { win.rect(w.x + PAD, ty, w.w - 2 * PAD, SCALE, muted); ty = ty + CH * 2; }
+        _draw_rects(win, _designer_table_grid_rects(w), muted);
     } else if k == "nditem" {
         win.rect(w.x, w.y, w.w, w.h, card);
         _box(win, w.x, w.y, w.w, w.h, bd);
@@ -3707,6 +5036,7 @@ fn _draw_dwidget(state, win, w, sel) {
     }
 }
 fn _draw_design(state, win, sz) {
+    _draw_design_tabs(state, win, sz);
     let d = state.design;
     let layout = try d.layout catch "free";
     let target = try d.target catch "gui";
@@ -3730,12 +5060,8 @@ fn _draw_design(state, win, sz) {
     let inspectH = CH * 7 + 2 * PAD;
     let canvBot = sz.h - inspectH;
     win.rect(0, canvTop, sz.w, canvBot - canvTop, _design_canvas_bg(state));
-    let gx = PAD;
-    while gx < sz.w {
-        let gy = canvTop;
-        while gy < canvBot { win.rect(gx, gy, SCALE, SCALE, _design_grid_dot(state)); gy = gy + CH * 2; }
-        gx = gx + CW * 4;
-    }
+    let grid_rs = _design_grid_rects(sz.w, canvTop, canvBot);
+    _draw_rects(win, grid_rs, _design_grid_dot(state));
     if layout != "free" {
         _dt(win, PAD, canvTop + PAD, "responsive layout: " + layout + "  (LAYOUT cycles free/grid/stack)", _style_text(state));
     }
@@ -4059,6 +5385,223 @@ fn _design_copy_value(v) {
     }
     return v;
 }
+fn _design_blank(path) {
+    return map{
+        tool: "button",
+        target: "gui",
+        layout: "free",
+        widgets: [],
+        sel: 0 - 1,
+        drag: false,
+        dx: 0,
+        dy: 0,
+        counter: 0,
+        path: str(try path catch ""),
+        title: _file_tab_title(str(try path catch ""))
+    };
+}
+fn _design_tab_record(path, design) {
+    let d = design;
+    if d == nil { d = _design_blank(path); }
+    d.path = str(try path catch try d.path catch "");
+    d.title = _file_tab_title(str(try d.path catch ""));
+    d.drag = false;
+    d.dx = 0;
+    d.dy = 0;
+    return map{
+        title: str(try d.title catch _file_tab_title(path)),
+        path: str(try d.path catch path),
+        design: _design_copy_value(d),
+        dirty: len(try d.widgets catch []) > 0,
+        kind: IDE.designer_screen_kind(str(try d.path catch path))
+    };
+}
+fn _design_tabs_store_current(state) {
+    let tabs = try state.design_tabs catch [];
+    if tabs == nil or len(tabs) == 0 { return 0; }
+    let sel = try state.design_tab_sel catch 0;
+    if sel < 0 { sel = 0; }
+    if sel >= len(tabs) { sel = len(tabs) - 1; }
+    let p = str(try tabs[sel].path catch try state.design.path catch try state.path catch "");
+    tabs[sel] = _design_tab_record(p, state.design);
+    state.design_tabs = tabs;
+    state.design_tab_sel = sel;
+    return 0;
+}
+fn _design_tabs_ensure(state) {
+    let candidates = IDE.designer_screen_tabs_from_files(try state.project_files catch [], try state.path catch "");
+    let tabs = try state.design_tabs catch [];
+    if tabs == nil { tabs = []; }
+    if len(tabs) == 0 {
+        let i = 0;
+        while i < len(candidates) {
+            let c = candidates[i];
+            let p = str(try c.path catch "");
+            let d = _design_blank(p);
+            if i == 0 {
+                d = _design_copy_value(state.design);
+                d.path = p;
+                d.title = _file_tab_title(p);
+            }
+            array_push(tabs, _design_tab_record(p, d));
+            i = i + 1;
+        }
+        state.design_tabs = tabs;
+        state.design_tab_sel = 0;
+        if len(tabs) > 0 { state.design = _design_copy_value(tabs[0].design); }
+        return 0;
+    }
+    _design_tabs_store_current(state);
+    tabs = state.design_tabs;
+    let ci = 0;
+    while ci < len(candidates) {
+        let p = str(try candidates[ci].path catch "");
+        let found = false;
+        let ti = 0;
+        while ti < len(tabs) {
+            if str(try tabs[ti].path catch "") == p { found = true; }
+            ti = ti + 1;
+        }
+        if not found { array_push(tabs, _design_tab_record(p, _design_blank(p))); }
+        ci = ci + 1;
+    }
+    state.design_tabs = tabs;
+    let sel = try state.design_tab_sel catch 0;
+    if sel < 0 { sel = 0; }
+    if sel >= len(tabs) { sel = len(tabs) - 1; }
+    state.design_tab_sel = sel;
+    return 0;
+}
+fn _design_tabs_reset_for_project(state) {
+    let current = _design_copy_value(state.design);
+    let candidates = IDE.designer_screen_tabs_from_files(try state.project_files catch [], try state.path catch "");
+    let preferred = str(try current.path catch "");
+    let runp = str(try state.example_run_path catch "");
+    if len(try current.widgets catch []) > 0 and runp != "" { preferred = runp; }
+    if preferred == "" { preferred = str(try state.path catch ""); }
+    let tabs = [];
+    let selected = 0;
+    let used_current = false;
+    let i = 0;
+    while i < len(candidates) {
+        let p = str(try candidates[i].path catch "");
+        let d = _design_blank(p);
+        if p == preferred {
+            d = current;
+            d.path = p;
+            d.title = _file_tab_title(p);
+            selected = len(tabs);
+            used_current = true;
+        }
+        array_push(tabs, _design_tab_record(p, d));
+        i = i + 1;
+    }
+    if len(tabs) == 0 { array_push(tabs, _design_tab_record(str(try state.path catch ""), current)); }
+    if not used_current and len(tabs) > 0 {
+        current.path = str(try tabs[0].path catch try state.path catch "");
+        current.title = _file_tab_title(current.path);
+        tabs[0] = _design_tab_record(current.path, current);
+        selected = 0;
+    }
+    state.design_tabs = tabs;
+    if selected < 0 or selected >= len(tabs) { selected = 0; }
+    state.design_tab_sel = selected;
+    state.design_tab_scroll = 0;
+    state.design_tab_layout = [];
+    state.design = _design_copy_value(tabs[selected].design);
+    return 0;
+}
+fn _design_tabs_activate(state, idx) {
+    _design_tabs_ensure(state);
+    let tabs = try state.design_tabs catch [];
+    if tabs == nil or idx < 0 or idx >= len(tabs) { return false; }
+    _design_tabs_store_current(state);
+    tabs = state.design_tabs;
+    state.design = _design_copy_value(tabs[idx].design);
+    state.design.drag = false;
+    state.design_tab_sel = idx;
+    state.panel = "design";
+    state.output = "designer tab: " + str(try tabs[idx].title catch _file_tab_title(try tabs[idx].path catch "")) + " (" + str(idx + 1) + "/" + str(len(tabs)) + ")";
+    return true;
+}
+fn _design_tabs_focus_path(state, path) {
+    let p = str(try path catch "");
+    if p == "" { return false; }
+    _design_tabs_ensure(state);
+    let tabs = try state.design_tabs catch [];
+    let i = 0;
+    while tabs != nil and i < len(tabs) {
+        if str(try tabs[i].path catch "") == p { return _design_tabs_activate(state, i); }
+        i = i + 1;
+    }
+    return false;
+}
+fn _design_tab_step(state, delta) {
+    _design_tabs_ensure(state);
+    let tabs = try state.design_tabs catch [];
+    let n = len(try tabs catch []);
+    if n <= 1 { state.output = "designer tabs: " + str(n) + " screen"; return 0; }
+    let sel = try state.design_tab_sel catch 0;
+    sel = num_mod(sel + delta + n, n);
+    _design_tabs_activate(state, sel);
+    return 0;
+}
+fn _draw_design_tabs(state, win, sz) {
+    _design_tabs_ensure(state);
+    let tabs = try state.design_tabs catch [];
+    let h = _design_tabs_height();
+    win.rect(0, TOP, sz.w, h, _style_bg(state));
+    win.rect(0, TOP + h - SCALE, sz.w, SCALE, _style_border(state));
+    let x = PAD;
+    let maxX = sz.w - PAD;
+    let layout = [];
+    let i = try state.design_tab_scroll catch 0;
+    if i < 0 { i = 0; }
+    while i < len(tabs) and x < maxX - 8 * CW {
+        let tab = tabs[i];
+        let title = str(try tab.title catch _file_tab_title(try tab.path catch ""));
+        if try tab.dirty catch false { title = "* " + title; }
+        let tw = len(title) * CW + 3 * PAD;
+        let minW = 12 * CW;
+        let maxW = 26 * CW;
+        if tw < minW { tw = minW; }
+        if tw > maxW { tw = maxW; }
+        if x + tw > maxX { break; }
+        let active = i == (try state.design_tab_sel catch 0);
+        let fill = _style_surface(state);
+        let txt = _style_muted(state);
+        if active { fill = _style_panel(state); txt = _style_text(state); }
+        _button_face(state, win, x, TOP + PAD / 2, tw, CH + PAD / 2, fill, active);
+        if active { _fill_round(win, x + PAD / 2, TOP + h - 2 * SCALE, tw - PAD, 2 * SCALE, _style_accent(state), SCALE); }
+        _dt(win, x + PAD, TOP + PAD, str_slice(title, 0, (tw - 2 * PAD) / CW), txt);
+        array_push(layout, map{ index: i, x: x, y: TOP, w: tw, h: h });
+        x = x + tw + SCALE;
+        i = i + 1;
+    }
+    if len(tabs) > 1 and maxX - x > 16 * CW {
+        let badge = str(len(tabs)) + " screens";
+        _fill_round(win, maxX - 14 * CW, TOP + PAD / 2, 13 * CW, CH + PAD / 2, _style_surface2(state), RAD);
+        _dt(win, maxX - 13 * CW, TOP + PAD, badge, _style_focus(state));
+    }
+    state.design_tab_layout = layout;
+    return 0;
+}
+fn _design_tab_click(state, mx, my) {
+    _design_tabs_ensure(state);
+    let h = _design_tabs_height();
+    if my < TOP - _button_hit_slop() or my > TOP + h + _button_hit_slop() { return false; }
+    let layout = try state.design_tab_layout catch [];
+    let i = 0;
+    while layout != nil and i < len(layout) {
+        let b = layout[i];
+        if _hit_rect(mx, my, b.x, b.y, b.w, b.h, _button_hit_slop()) {
+            _design_tabs_activate(state, b.index);
+            return true;
+        }
+        i = i + 1;
+    }
+    return my >= TOP and my < TOP + h;
+}
 fn _design_select_delta(state, delta) {
     let d = state.design;
     let n = len(d.widgets);
@@ -4141,6 +5684,7 @@ fn _design_clear(state) {
     return 0;
 }
 fn _design_generate_to_editor(state) {
+    _design_tabs_store_current(state);
     let code = _design_code(state);
     let parsed = FE.frontend_parse_safe(code);
     if not parsed.ok {
@@ -4237,6 +5781,7 @@ fn _design_command(state, action) {
 }
 // a click in the Designer: palette action, select+drag an existing widget, or place one.
 fn _design_click(state, mx, my) {
+    if _design_tab_click(state, mx, my) { return 0; }
     let d = state.design;
     let p = _pal_hit(mx, my, state.winsz);
         if p != nil {
@@ -4279,6 +5824,10 @@ fn _design_click(state, mx, my) {
 }
 fn _design_key(state, key, shift) {
     let d = state.design;
+    if try state.ctrl catch false {
+        if key == "PageDown" { _design_tab_step(state, 1); return 0; }
+        if key == "PageUp" { _design_tab_step(state, 0 - 1); return 0; }
+    }
     if key == "Tab" { if shift { _design_select_delta(state, 0 - 1); } else { _design_select_delta(state, 1); } return 0; }
     if d.sel < 0 { return 0; }
     let w = d.widgets[d.sel];
@@ -4344,7 +5893,7 @@ fn _ai_hit(mx, my) {
     let i = 0;
     while i < len(AIPAL) {
         let b = _ai_bounds(i);
-        if _hit_rect(mx, my, b.x, TOP, b.w, CH, _hit_slop() / 2) { return AIPAL[i].id; }
+        if _hit_button(mx, my, b.x, TOP, b.w, CH) { return AIPAL[i].id; }
         i = i + 1;
     }
     return nil;
@@ -4814,9 +6363,216 @@ fn _page_lines(page, cols) {
     return out;
 }
 
+fn _web_default_page_lines(input) {
+    let u = str(input);
+    if str_trim(u) == "" { u = "example.com"; }
+    return [
+        "Browser tab ready: " + u,
+        "Press Enter or Reload to load this tab through the current security profile.",
+        "Use Ctrl+PageDown / Ctrl+PageUp to switch browser tabs, Ctrl+T for a new tab."
+    ];
+}
+
+fn _web_tab_title(tab) {
+    let t = str_trim(str(try tab.title catch ""));
+    if t == "" or str_starts_with(t, "loading ") { t = str_trim(str(try tab.input catch "")); }
+    if t == "" { t = str_trim(str(try tab.url catch "")); }
+    if t == "" { t = "new tab"; }
+    if len(t) > 22 { t = str_slice(t, 0, 19) + "..."; }
+    return t;
+}
+
+fn _web_tab_snapshot(state) {
+    let w = state.web;
+    return map{
+        title: str(try w.title catch ""),
+        input: str(try w.input catch ""),
+        url: str(try w.url catch ""),
+        mode: str(try w.mode catch "live"),
+        security: str(try w.security catch "safe"),
+        tor: try w.tor catch false,
+        status: str(try w.status catch "safe"),
+        scroll: try w.scroll catch 0,
+        history: try w.history catch [],
+        forward: try w.forward catch [],
+        bookmarks: try w.bookmarks catch [],
+        download_plans: try w.download_plans catch [],
+        search_engine: str(try w.search_engine catch "duckduckgo"),
+        home: str(try w.home catch "example.com"),
+        find_query: str(try w.find_query catch ""),
+        page_obj: try w.page_obj catch nil,
+        page: try w.page catch _web_default_page_lines(try w.input catch "example.com"),
+        reader: try w.reader catch _web_default_page_lines(try w.input catch "example.com"),
+        links: try w.links catch [],
+        forms: try w.forms catch ["No forms loaded."],
+        form_sel: try w.form_sel catch 0,
+        form_field_sel: try w.form_field_sel catch 0,
+        form_values: try w.form_values catch map{},
+        source: try w.source catch ["No source loaded."],
+        inspect: try w.inspect catch ["No inspector details loaded."],
+        render_img: try w.render_img catch nil,
+        render_path: str(try w.render_path catch ""),
+        render_lines: try w.render_lines catch ["Host mode: switch security to Trusted or JS/DOM, enter a URL, click Host."],
+        lines: try w.lines catch _web_default_page_lines(try w.input catch "example.com")
+    };
+}
+
+fn _web_tab_blank(input) {
+    let u = str(input);
+    if str_trim(u) == "" { u = "example.com"; }
+    let lines = _web_default_page_lines(u);
+    return map{
+        title: "",
+        input: u,
+        url: u,
+        mode: "live",
+        security: "safe",
+        tor: false,
+        status: "ready",
+        scroll: 0,
+        history: [],
+        forward: [],
+        bookmarks: [],
+        download_plans: [],
+        search_engine: "duckduckgo",
+        home: "example.com",
+        find_query: "",
+        page_obj: nil,
+        page: lines,
+        reader: lines,
+        links: [],
+        forms: ["No forms loaded."],
+        form_sel: 0,
+        form_field_sel: 0,
+        form_values: map{},
+        source: ["No source loaded."],
+        inspect: ["No inspector details loaded."],
+        render_img: nil,
+        render_path: "",
+        render_lines: ["Host mode: switch security to Trusted or JS/DOM, enter a URL, click Host. Needs --allow-exec and chromium/google-chrome/brave/firefox."],
+        lines: lines
+    };
+}
+
+fn _web_apply_tab(state, tab) {
+    let w = state.web;
+    w.title = str(try tab.title catch "");
+    w.input = str(try tab.input catch "example.com");
+    w.url = str(try tab.url catch "");
+    w.mode = str(try tab.mode catch "live");
+    w.security = str(try tab.security catch "safe");
+    w.tor = try tab.tor catch false;
+    w.status = str(try tab.status catch "ready");
+    w.scroll = try tab.scroll catch 0;
+    w.history = try tab.history catch [];
+    w.forward = try tab.forward catch [];
+    w.bookmarks = try tab.bookmarks catch [];
+    w.download_plans = try tab.download_plans catch [];
+    w.search_engine = str(try tab.search_engine catch "duckduckgo");
+    w.home = str(try tab.home catch "example.com");
+    w.find_query = str(try tab.find_query catch "");
+    w.page_obj = try tab.page_obj catch nil;
+    w.page = try tab.page catch _web_default_page_lines(w.input);
+    w.reader = try tab.reader catch _web_default_page_lines(w.input);
+    w.links = try tab.links catch [];
+    w.forms = try tab.forms catch ["No forms loaded."];
+    w.form_sel = try tab.form_sel catch 0;
+    w.form_field_sel = try tab.form_field_sel catch 0;
+    w.form_values = try tab.form_values catch map{};
+    w.source = try tab.source catch ["No source loaded."];
+    w.inspect = try tab.inspect catch ["No inspector details loaded."];
+    w.render_img = try tab.render_img catch nil;
+    w.render_path = str(try tab.render_path catch "");
+    w.render_lines = try tab.render_lines catch ["Host mode: switch security to Trusted or JS/DOM, enter a URL, click Host."];
+    w.lines = try tab.lines catch _web_default_page_lines(w.input);
+    state.web = w;
+    return 0;
+}
+
+fn _web_tabs_ensure(state) {
+    let tabs = try state.web.tabs catch nil;
+    if tabs == nil { tabs = []; }
+    if len(tabs) == 0 {
+        array_push(tabs, _web_tab_snapshot(state));
+        state.web.tabs = tabs;
+        state.web.tab_sel = 0;
+    }
+    if (try state.web.tab_sel catch 0) < 0 { state.web.tab_sel = 0; }
+    if state.web.tab_sel >= len(tabs) { state.web.tab_sel = len(tabs) - 1; }
+    return tabs;
+}
+
+fn _web_tabs_store_current(state) {
+    let tabs = _web_tabs_ensure(state);
+    let sel = try state.web.tab_sel catch 0;
+    if sel < 0 { sel = 0; }
+    if sel >= len(tabs) { sel = len(tabs) - 1; }
+    tabs[sel] = _web_tab_snapshot(state);
+    state.web.tabs = tabs;
+    state.web.tab_sel = sel;
+    return 0;
+}
+
+fn _web_tabs_activate(state, idx) {
+    let tabs = _web_tabs_ensure(state);
+    if idx < 0 or idx >= len(tabs) { return false; }
+    _web_tabs_store_current(state);
+    tabs = state.web.tabs;
+    state.web.tab_sel = idx;
+    _web_apply_tab(state, tabs[idx]);
+    state.web.tab_sel = idx;
+    state.web.tabs = tabs;
+    state.web.status = "tab " + str(idx + 1) + "/" + str(len(tabs));
+    return true;
+}
+
+fn _web_tabs_new(state, input) {
+    _web_tabs_store_current(state);
+    let tabs = try state.web.tabs catch [];
+    array_push(tabs, _web_tab_blank(input));
+    state.web.tabs = tabs;
+    _web_tabs_activate(state, len(tabs) - 1);
+    return 0;
+}
+
+fn _web_tabs_step(state, delta) {
+    let tabs = _web_tabs_ensure(state);
+    if len(tabs) == 0 { return 0; }
+    let idx = (try state.web.tab_sel catch 0) + delta;
+    while idx < 0 { idx = idx + len(tabs); }
+    while idx >= len(tabs) { idx = idx - len(tabs); }
+    _web_tabs_activate(state, idx);
+    return 0;
+}
+
+fn _web_tabs_set_from_urls(state, urls) {
+    let tabs = [];
+    let i = 0;
+    while urls != nil and i < len(urls) {
+        let u = str(urls[i]);
+        if str_trim(u) != "" { array_push(tabs, _web_tab_blank(u)); }
+        i = i + 1;
+    }
+    if len(tabs) == 0 { return 0; }
+    state.web.tabs = tabs;
+    state.web.tab_sel = 0;
+    state.web.tab_scroll = 0;
+    state.web.tab_layout = [];
+    _web_apply_tab(state, tabs[0]);
+    state.web.tabs = tabs;
+    state.web.tab_sel = 0;
+    state.web.status = "browser tabs ready " + str(len(tabs));
+    return 0;
+}
+
 fn _web_load_url(state, url, push_history) {
+    _web_tabs_ensure(state);
     let resolved = B.browser_input_url(url, try state.web.search_engine catch "duckduckgo");
-    if not (try resolved.ok catch false) { state.web.status = str(try resolved.reason catch "empty input"); return 0; }
+    if not (try resolved.ok catch false) {
+        state.web.status = str(try resolved.reason catch "empty input");
+        _web_tabs_store_current(state);
+        return 0;
+    }
     url = str(try resolved.url catch str_trim(url));
     let sec = B.security_profile(try state.web.security catch "safe");
     if try state.web.tor catch false { sec = B.security_profile("tor"); }
@@ -4834,6 +6590,7 @@ fn _web_load_url(state, url, push_history) {
         let why = "could not load (needs network + http; try a reachable http/https URL)";
         if page != nil { why = try page.error catch why; }
         state.web.lines = [why];
+        _web_tabs_store_current(state);
         return 0;
     }
     let current = try state.web.url catch "";
@@ -4872,6 +6629,7 @@ fn _web_load_url(state, url, push_history) {
     state.web.source = _source_lines(page, cols);
     state.web.inspect = _inspect_lines(page, cols);
     state.web.lines = pagelines;
+    _web_tabs_store_current(state);
     return 0;
 }
 
@@ -4902,6 +6660,7 @@ fn _web_apply_page(state, page, status) {
     state.web.inspect = _inspect_lines(page, cols);
     state.web.lines = state.web.page;
     state.web.scroll = 0;
+    _web_tabs_store_current(state);
     return 0;
 }
 
@@ -4948,8 +6707,7 @@ fn _web_forms_click(state, mx, my) {
     if (try state.web.mode catch "") != "forms" { return false; }
     let sz = state.winsz;
     if sz == nil { return false; }
-    let barh = _web_bar_h();
-    let bodyTop = TOP + barh + 2 * PAD;
+    let bodyTop = _web_content_top(state);
     let colW = sz.w - 8 * PAD;
     if colW > 132 * CW { colW = 132 * CW; }
     if colW < 48 * CW { colW = sz.w - 4 * PAD; }
@@ -4993,8 +6751,7 @@ fn _web_live_click(state, mx, my) {
     if page == nil { return false; }
     let sz = state.winsz;
     if sz == nil { return false; }
-    let barh = _web_bar_h();
-    let bodyTop = TOP + barh + 2 * PAD;
+    let bodyTop = _web_content_top(state);
     let colW = sz.w - 8 * PAD;
     if colW > 132 * CW { colW = 132 * CW; }
     if colW < 48 * CW { colW = sz.w - 4 * PAD; }
@@ -5327,6 +7084,9 @@ fn _web_key(state, key, shift) {
     if (try state.ctrl catch false) and (key == "Right" or key == "PageRight") { _web_forward(state); return 0; }
     if (try state.ctrl catch false) and (key == "Left" or key == "PageLeft") { _web_back(state); return 0; }
     if (try state.ctrl catch false) and (key == "Home") { _web_home(state); return 0; }
+    if (try state.ctrl catch false) and (key == "PageDown") { _web_tabs_step(state, 1); return 0; }
+    if (try state.ctrl catch false) and (key == "PageUp") { _web_tabs_step(state, 0 - 1); return 0; }
+    if (try state.ctrl catch false) and (key == "T" or key == "KeyT") { _web_tabs_new(state, try w.home catch "example.com"); return 0; }
     if (try state.ctrl catch false) and (key == "I" or key == "KeyI") { _web_stats(state); return 0; }
     if key == "Down" { w.scroll = w.scroll + 3; return 0; }
     if key == "PageDown" { w.scroll = w.scroll + 12; return 0; }
@@ -5347,23 +7107,164 @@ fn _web_button_fg(state, active) {
     if active { return gfx.rgb(245, 248, 255); }
     return _style_text(state);
 }
+
+fn _web_tabs_h(state) {
+    let tabs = try state.web.tabs catch [];
+    if tabs == nil or len(tabs) == 0 { return 0; }
+    return CH + PAD;
+}
+
+fn _web_content_top(state) {
+    return TOP + _web_bar_h() + _web_tabs_h(state) + 2 * PAD;
+}
+
+fn _draw_web_tabs(state, win, sz) {
+    let tabs = _web_tabs_ensure(state);
+    let h = _web_tabs_h(state);
+    if h <= 0 { state.web.tab_layout = []; return 0; }
+    let y = TOP + _web_bar_h();
+    win.rect(0, y, sz.w, h, _style_surface(state));
+    win.rect(0, y + h - SCALE, sz.w, SCALE, _style_border(state));
+    let layout = [];
+    let addW = 5 * CW;
+    let right = sz.w - PAD - addW - PAD;
+    let x = PAD;
+    let start = try state.web.tab_scroll catch 0;
+    if start < 0 { start = 0; }
+    if start >= len(tabs) { start = 0; }
+    let i = start;
+    while i < len(tabs) and x < right {
+        let title = _web_tab_title(tabs[i]);
+        let tw = (len(title) + 4) * CW;
+        if tw < 12 * CW { tw = 12 * CW; }
+        if tw > 28 * CW { tw = 28 * CW; }
+        if x + tw > right { break; }
+        let active = i == (try state.web.tab_sel catch 0);
+        let fill = _style_surface2(state);
+        if active { fill = _style_accent(state); }
+        _button_label(state, win, x, y + PAD / 2, tw, CH + PAD / 2, title, _web_button_fg(state, active), fill, active);
+        if active { win.rect(x + RAD, y + h - 2 * SCALE, tw - 2 * RAD, 2 * SCALE, _style_focus(state)); }
+        array_push(layout, map{ index: i, x: x, y: y + PAD / 2, w: tw, h: CH + PAD / 2 });
+        x = x + tw + PAD;
+        i = i + 1;
+    }
+    let addX = sz.w - PAD - addW;
+    _button_label(state, win, addX, y + PAD / 2, addW, CH + PAD / 2, "+", _style_text(state), _style_surface2(state), false);
+    state.web.tab_layout = layout;
+    state.web.tab_add_rect = map{ x: addX, y: y + PAD / 2, w: addW, h: CH + PAD / 2 };
+    return h;
+}
+
+fn _web_tabs_click(state, mx, my) {
+    let h = _web_tabs_h(state);
+    if h <= 0 { return false; }
+    let y = TOP + _web_bar_h();
+    if my < y or my > y + h { return false; }
+    let add = try state.web.tab_add_rect catch nil;
+    if add != nil and _hit_button(mx, my, add.x, add.y, add.w, add.h) {
+        _web_tabs_new(state, try state.web.home catch "example.com");
+        return true;
+    }
+    let layout = try state.web.tab_layout catch [];
+    let i = 0;
+    while layout != nil and i < len(layout) {
+        let b = layout[i];
+        if _hit_button(mx, my, b.x, b.y, b.w, b.h) {
+            _web_tabs_activate(state, try b.index catch i);
+            return true;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _web_body_geometry(state) {
+    let sz = try state.winsz catch nil;
+    if sz == nil { return nil; }
+    let bodyTop = _web_content_top(state);
+    let colW = sz.w - 8 * PAD;
+    if colW > 132 * CW { colW = 132 * CW; }
+    if colW < 48 * CW { colW = sz.w - 4 * PAD; }
+    let colX = (sz.w - colW) / 2;
+    if (try state.web.title catch "") != "" { bodyTop = bodyTop + CH + 3 * PAD; }
+    let rows = num_floor((sz.h - bodyTop - PAD) / CH);
+    return map{ body_top: bodyTop, col_x: colX, col_w: colW, rows: rows };
+}
+
+fn _web_text_source_for(state, colW) {
+    let w = state.web;
+    let source = try w.page catch w.reader;
+    if w.mode == "reader" { source = w.reader; }
+    if w.mode == "links" { source = w.links; }
+    if w.mode == "forms" { source = _forms_lines_state(state, colW / CW); }
+    if w.mode == "bookmarks" { source = B.bookmark_lines(try w.bookmarks catch [], 80); }
+    if w.mode == "stats" { source = B.page_stats_lines(try w.page_obj catch map{ title: "", url: "", text: "", links: [], images: [], forms: [] }); }
+    if w.mode == "find" { source = B.page_find_lines(try w.page_obj catch map{ text: "" }, try w.find_query catch "", 80); }
+    if w.mode == "source" { source = try w.source catch ["No source loaded."]; }
+    if w.mode == "inspect" { source = try w.inspect catch ["No inspector details loaded."]; }
+    if w.mode == "render" {
+        source = try w.render_lines catch ["Render mode needs --allow-exec and a Chromium-compatible browser."];
+    }
+    if source == nil { source = w.lines; }
+    return source;
+}
+
+fn _web_scrollbar_click(state, mx, my) {
+    let mode = try state.web.mode catch "live";
+    if mode == "live" or mode == "page" { return false; }
+    if mode == "render" and (try state.web.render_img catch nil) != nil { return false; }
+    let g = _web_body_geometry(state);
+    if g == nil { return false; }
+    let rows = try g.rows catch 0;
+    if rows < 1 { rows = 1; }
+    let source = _web_text_source_for(state, try g.col_w catch 80 * CW);
+    let sm = map{ body_top: try g.body_top catch TOP, footer_y: state.winsz.h - PAD, row_h: CH };
+    let scrollHit = _panel_scrollbar_hit_index(state, sm, len(source), rows, try state.web.scroll catch 0, mx, my);
+    if scrollHit < 0 { return false; }
+    state.web.scroll = scrollHit;
+    state.web.status = "scroll " + str(scrollHit + 1) + "/" + str(len(source));
+    return true;
+}
+
+fn _web_scroll_by(state, delta) {
+    let g = _web_body_geometry(state);
+    if g == nil { return false; }
+    let rows = try g.rows catch 0;
+    if rows < 1 { rows = 1; }
+    let mode = try state.web.mode catch "live";
+    let total = 0;
+    if mode == "live" or mode == "page" {
+        let page = try state.web.page_obj catch nil;
+        if page == nil { return false; }
+        let layout = B.page_layout(page, (try g.col_w catch 80 * CW) / CW);
+        total = try layout.height catch 0;
+    } else {
+        let source = _web_text_source_for(state, try g.col_w catch 80 * CW);
+        total = len(source);
+    }
+    state.web.scroll = _clamp_scroll((try state.web.scroll catch 0) + delta, total, rows);
+    state.web.status = "scroll " + str(state.web.scroll + 1) + "/" + str(total);
+    return true;
+}
+
 fn _web_click(state, mx, my) {
+    if _web_tabs_click(state, mx, my) { return 0; }
     let zone = IDE.browser_bar_zone(my, TOP, CH, PAD);
     if zone == "above" { return 0; }
     if zone == "body" {
+        if _web_scrollbar_click(state, mx, my) { return 0; }
         if not _web_live_click(state, mx, my) { _web_forms_click(state, mx, my); }
         return 0;
     }
     if zone == "summary" { return 0; }
-    let slop = _hit_slop();
     let bl = IDE.browser_header_layout(state.winsz.w, CW, PAD);
-    if _hit_rect(mx, my, bl.back.x, TOP + PAD, bl.back.w, CH + PAD, slop) { _web_back(state); return 0; }
-    if _hit_rect(mx, my, bl.reload.x, TOP + PAD, bl.reload.w, CH + PAD, slop) { _web_load(state); return 0; }
+    if _hit_button(mx, my, bl.back.x, TOP + PAD, bl.back.w, CH + PAD) { _web_back(state); return 0; }
+    if _hit_button(mx, my, bl.reload.x, TOP + PAD, bl.reload.w, CH + PAD) { _web_load(state); return 0; }
     let modes = bl.modes;
     let mi = 0;
     while mi < len(modes) {
         let b = modes[mi];
-        if _hit_rect(mx, my, b.x, TOP + PAD, b.w, CH + PAD, slop) {
+        if _hit_button(mx, my, b.x, TOP + PAD, b.w, CH + PAD) {
             if mi == 0 { state.web.mode = "live"; state.web.scroll = 0; return 0; }
             if mi == 1 { state.web.mode = "reader"; state.web.scroll = 0; return 0; }
             if mi == 2 { state.web.mode = "links"; state.web.scroll = 0; return 0; }
@@ -5374,13 +7275,13 @@ fn _web_click(state, mx, my) {
         }
         mi = mi + 1;
     }
-    if _hit_rect(mx, my, bl.security.x, TOP + PAD, bl.security.w, CH + PAD, slop) {
+    if _hit_button(mx, my, bl.security.x, TOP + PAD, bl.security.w, CH + PAD) {
         state.web.security = B.next_security_mode(try state.web.security catch "safe");
         let sec = B.security_profile(state.web.security);
         state.web.status = "security " + str(try sec.label catch state.web.security);
         return 0;
     }
-    if _hit_rect(mx, my, bl.tor.x, TOP + PAD, bl.tor.w, CH + PAD, slop) {
+    if _hit_button(mx, my, bl.tor.x, TOP + PAD, bl.tor.w, CH + PAD) {
         state.web.tor = not (try state.web.tor catch false);
         if state.web.tor { state.web.status = "Tor enabled"; }
         else { state.web.status = "Tor disabled"; }
@@ -5562,7 +7463,8 @@ fn _draw_web(state, win, sz) {
     _dt(win, PAD + CW, sumY + PAD / 2, str_slice(secSummary, 0, maxchars - 2), _style_muted(state));
     _dt(win, PAD + CW, sumY + CH + PAD, str_slice(nativeSummary, 0, maxchars - 2), _style_info(state));
 
-    let bodyTop = TOP + barh + 2 * PAD;
+    _draw_web_tabs(state, win, sz);
+    let bodyTop = _web_content_top(state);
     win.rect(0, bodyTop - PAD, sz.w, sz.h - bodyTop + PAD, _style_bg(state));
     let colW = sz.w - 8 * PAD;
     if colW > 132 * CW { colW = 132 * CW; }
@@ -5776,7 +7678,7 @@ fn _history_button_hit(state, mx, my) {
     let i = 0;
     while i < len(buttons) {
         let b = buttons[i];
-        if _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop()) { return b.id; }
+        if _hit_button(mx, my, b.x, b.y, b.w, b.h) { return b.id; }
         i = i + 1;
     }
     return "";
@@ -5855,8 +7757,14 @@ fn _history_click(state, mx, my) {
     let m = _panel_metrics(state.winsz, "history");
     let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let idx = num_floor((my - bodyTop) / m.row_h);
     let hits = _history_clamp(state);
+    let start = _list_start_for(try state.history_sel catch 0, len(hits), m.rows);
+    let scrollHit = _panel_scrollbar_hit_index(state, m, len(hits), m.rows, start, mx, my);
+    if scrollHit >= 0 {
+        state.history_sel = scrollHit;
+        return 0;
+    }
+    let idx = num_floor((my - bodyTop) / m.row_h);
     idx = idx + _list_start_for(try state.history_sel catch 0, len(hits), m.rows);
     if idx < 0 or idx >= len(hits) { return 0; }
     state.history_sel = idx;
@@ -5865,12 +7773,51 @@ fn _history_click(state, mx, my) {
 }
 
 // ── Management panel: database/storage/project management dashboard ─────────
+fn _project_portfolio_paths(state) {
+    let paths = [
+        ".",
+        "editors/ide",
+        "stdlib",
+        "tests/semantics",
+        "../../ai/pbai",
+        "../../os-dev/pbos",
+        "../../tools/pblang/pb-mcp-server",
+        "../../tools/rust/pb-mcp-server",
+        "/usr/share/vulkan",
+        "/usr/share/mesa-demos"
+    ];
+    let roots = try state.files.roots catch [];
+    let i = 0;
+    while i < len(roots) {
+        array_push(paths, roots[i]);
+        i = i + 1;
+    }
+    return paths;
+}
+
 fn _manage_records(state) {
     let hstate = IDE.history_storage_state(try state.history catch [], try state.history_mode catch "temporary", try state.history_stored catch false, _history_storage_path());
     let bstate = IDE.browser_management_state(try state.web.bookmarks catch [], try state.web.download_plans catch [], try state.web.security catch "safe", try state.web.tor catch false, try state.web.search_engine catch "duckduckgo");
     let dstate = IDE.database_management_state(try state.database.profiles catch [], try state.database.migrations catch [], try state.database.backups catch []);
     let profile = try state.file_profile catch IDE.editor_asset_profile(try state.path catch "");
     let ab = IDE.asset_backend_status(profile);
+    let gp = try gfx.backend_profile() catch map{ backend: "unknown", present: "unknown", gpu_present: false, compiled_sdl2: false, note: "graphics profile unavailable" };
+    let route = try gfx.render_route_status(gp) catch "";
+    let accel = try gfx.render_acceleration_plan(gp) catch map{ parallel_safe_path: "unknown", polyglot_safe_path: "unknown" };
+    let frame_plan = try _frame_schedule_for_state(state, gp) catch nil;
+    let device_policy = try gfx.render_device_policy(gp, map{ target_fps: 60, pressure: try frame_plan.quality_pressure catch "ok" }) catch map{ summary: "device-policy unavailable" };
+    let startup_profile = try gfx.render_startup_profile("fast", gp, map{ target_fps: 60, pressure: try frame_plan.quality_pressure catch "ok" }) catch map{ summary: "startup-profile unavailable" };
+    let frame_status = "";
+    if frame_plan != nil { frame_status = " · " + str(try frame_plan.summary catch "frame schedule unknown"); }
+    let quality_status = "";
+    if frame_plan != nil { quality_status = " · " + str(try frame_plan.quality_policy.summary catch "render quality unknown"); }
+    let runtime_status = "";
+    if frame_plan != nil { runtime_status = " · " + str(try frame_plan.runtime_plan.summary catch "render runtime unknown"); }
+    let text_status = _text_render_status_for_state(state);
+    let portfolio = IDE.project_portfolio_board(_project_portfolio_paths(state));
+    let product_health = IDE.project_product_health_board(_project_portfolio_paths(state));
+    let action = IDE.project_action_board(_project_portfolio_paths(state));
+    let category_health = IDE.project_category_health_board(_project_portfolio_paths(state));
     return IDE.management_records(map{
         database_status: str(try dstate.status catch "empty"),
         database_detail: IDE.database_management_state(try state.database.profiles catch [], try state.database.migrations catch [], try state.database.backups catch []).summary + " · actions are gated plans",
@@ -5884,7 +7831,21 @@ fn _manage_records(state) {
         asset_status: str(try ab.decode_status catch "planned") + "/" + str(try ab.export_status catch "planned"),
         asset_detail: IDE.asset_backend_summary(profile) + " · " + str_join(try ab.actions catch [], ", "),
         ai_status: "local",
-        backup_status: "planned"
+        backup_status: "planned",
+        graphics_status: str(try gp.backend catch "unknown") + "/" + str(try gp.present catch "unknown"),
+        graphics_detail: _graphics_status() + " · " + text_status + " · " + _graphics_event_status() + " · " + (try gfx.cpu_render_status(gp) catch "cpu-render unknown") + " · " + route + " · " + (try gfx.render_device_policy_status(device_policy) catch str(try device_policy.summary catch "device-policy unknown")) + " · " + (try gfx.render_startup_profile_status(startup_profile) catch str(try startup_profile.summary catch "startup-profile unknown")) + frame_status + quality_status + runtime_status + " · " + _perf_summary(state) + " · parallel=" + str(try accel.parallel_safe_path catch "unknown") + " · polyglot=" + str(try accel.polyglot_safe_path catch "unknown") + " · compiled_sdl2=" + str(try gp.compiled_sdl2 catch false) + " · " + str(try gp.note catch ""),
+        runtime_budget: map{
+            status: "active",
+            detail: "child apps use bounded resources plus attempts/backoff/deadline/cancellation/circuit policy before preview or run"
+        },
+        project_portfolio: portfolio,
+        project_product_health: product_health,
+        project_action: action,
+        project_category_health: category_health,
+        project_aap_status: map{
+            status: "on-demand",
+            detail: "press Enter to run a bounded AAP source/docs status pass"
+        }
     });
 }
 
@@ -5949,6 +7910,76 @@ fn _manage_open(state, hit) {
     if id == "models" {
         state.panel = "ai";
         state.output = "management -> local AI";
+        return 0;
+    }
+    if id == "graphics" {
+        let gp = try gfx.backend_profile() catch nil;
+        let accel = try gfx.render_acceleration_plan(gp) catch nil;
+        let frame_plan = try _frame_schedule_for_state(state, gp) catch nil;
+        let device_policy = try gfx.render_device_policy(gp, map{ target_fps: 60, pressure: try frame_plan.quality_pressure catch "ok" }) catch nil;
+        let startup_profile = try gfx.render_startup_profile("fast", gp, map{ target_fps: 60, pressure: try frame_plan.quality_pressure catch "ok" }) catch nil;
+        let steps = [];
+        if accel != nil { steps = try accel.steps catch []; }
+        let frame_lines = [];
+        if frame_plan != nil { frame_lines = IDE.ide_render_frame_lines(frame_plan, 6); }
+        let quality_lines = [];
+        if frame_plan != nil { quality_lines = IDE.ide_render_quality_policy_lines(try frame_plan.quality_policy catch nil, 6); }
+        let runtime_lines = [];
+        if frame_plan != nil { runtime_lines = IDE.ide_render_runtime_plan_lines(try frame_plan.runtime_plan catch nil, 6); }
+        let device_steps = [];
+        if device_policy != nil { device_steps = try device_policy.steps catch []; }
+        state.output = "management -> graphics runtime\n" + _graphics_status() + "\n" + _text_render_status_for_state(state) + "\n" + _graphics_event_status() + "\n" + (try gfx.cpu_render_status(gp) catch "cpu-render unknown") + "\n" + (try gfx.render_route_status(gp) catch "route unknown") + "\n" + (try gfx.render_device_policy_status(device_policy) catch "device-policy unknown") + "\nlaunch env: " + str(try device_policy.env catch map{}) + "\nstartup profile: " + (try gfx.render_startup_profile_status(startup_profile) catch "startup-profile unknown") + "\nstartup env: " + str_join(try gfx.render_startup_env_lines(startup_profile) catch [], " ") + "\n" + _perf_summary(state) + "\nparallel: " + str(try accel.parallel_safe_path catch "unknown") + "\npolyglot: " + str(try accel.polyglot_safe_path catch "unknown") + "\nnext: " + str_join(steps, " | ");
+        if len(device_steps) > 0 { state.output = state.output + "\ndevice next: " + str_join(device_steps, " | "); }
+        if len(frame_lines) > 0 { state.output = state.output + "\n" + str_join(frame_lines, "\n"); }
+        if len(quality_lines) > 0 { state.output = state.output + "\n" + str_join(quality_lines, "\n"); }
+        if len(runtime_lines) > 0 { state.output = state.output + "\n" + str_join(runtime_lines, "\n"); }
+        return 0;
+    }
+    if id == "project_portfolio" {
+        let board = IDE.project_portfolio_board(_project_portfolio_paths(state));
+        state.output = str_join(IDE.project_portfolio_lines(board, 14), "\n");
+        return 0;
+    }
+    if id == "project_product_health" {
+        let board = IDE.project_product_health_board(_project_portfolio_paths(state));
+        state.output = str_join(IDE.project_product_health_lines(board, 14), "\n");
+        return 0;
+    }
+    if id == "runtime_budget" {
+        let profile = IDE.app_run_profile(E.text(state.ed), str(try state.path catch "main.sapp"));
+        let safety = IDE.app_run_safety_profile(profile, nil);
+        let report = IDE.app_run_resource_report(safety, map{});
+        state.output = "Runtime safety\n" + str(try hit.detail catch "") + "\n" +
+            "timeout=" + str(safety.timeout_ms) + "ms workers=" + str(safety.resource_budget.limits.workers) +
+            " frames=" + str(try safety.resource_budget.limits.frames catch 0) + "\n" + str(report.summary) + "\n" +
+            "resilience attempts=" + str(safety.resilience_policy.max_attempts) +
+            " backoff=" + str(safety.resilience_policy.base_delay_ms) + ".." + str(safety.resilience_policy.max_delay_ms) + "ms" +
+            " circuit=" + str(safety.resilience_policy.failure_threshold) + "/" + str(safety.resilience_policy.recovery_ms) + "ms";
+        return 0;
+    }
+    if id == "project_action" {
+        let board = IDE.project_action_board(_project_portfolio_paths(state));
+        state.output = str_join(IDE.project_action_lines(board, 16), "\n");
+        return 0;
+    }
+    if id == "project_category_health" {
+        let board = IDE.project_category_health_board(_project_portfolio_paths(state));
+        state.output = str_join(IDE.project_category_health_lines(board, 18), "\n");
+        return 0;
+    }
+    if id == "project_aap_status" {
+        let board = IDE.project_aap_status_board(nil, map{
+            max_depth: 2,
+            max_entries: 120,
+            max_children_per_dir: 80,
+            max_files: 10,
+            max_file_bytes: 10000,
+            max_findings: 40,
+            include_portfolio: false,
+            focus_detail_lines: 8
+        });
+        state.output = str_join(IDE.project_aap_status_lines(board, 14), "\n") +
+            "\n\n" + str_join(IDE.project_aap_focus_lines(board, 10), "\n");
         return 0;
     }
     state.output = "management: " + str(try hit.title catch id) + " · " + str(try hit.detail catch "");
@@ -6032,12 +8063,221 @@ fn _manage_click(state, mx, my) {
     let m = _panel_metrics(state.winsz, "manage");
     let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let idx = num_floor((my - bodyTop) / m.row_h);
     let hits = _manage_clamp(state);
+    let start = _list_start_for(try state.manage.sel catch 0, len(hits), m.rows);
+    let scrollHit = _panel_scrollbar_hit_index(state, m, len(hits), m.rows, start, mx, my);
+    if scrollHit >= 0 {
+        state.manage.sel = scrollHit;
+        return 0;
+    }
+    let idx = num_floor((my - bodyTop) / m.row_h);
     idx = idx + _list_start_for(try state.manage.sel catch 0, len(hits), m.rows);
     if idx < 0 or idx >= len(hits) { return 0; }
     state.manage.sel = idx;
     _manage_open(state, hits[idx]);
+    return 0;
+}
+
+// ── Settings panel: searchable native IDE preferences dashboard ─────────────
+fn _settings_ensure(state) {
+    if (try state.settings catch nil) == nil { state.settings = map{ query: "", sel: 0 }; }
+    return state.settings;
+}
+
+fn _settings_density_status(state) {
+    let manual = try state.density_manual catch nil;
+    if manual != nil { return "manual " + str(manual) + "x"; }
+    return "auto " + str(try state.density_scale catch SCALE) + "x · " + _window_probe_status(state);
+}
+
+fn _settings_records(state) {
+    let gp = try gfx.backend_profile() catch map{ backend: "unknown", present: "unknown", gpu_present: false };
+    let device_policy = try gfx.render_device_policy(gp, map{ target_fps: 60, pressure: try state.render_runtime.pressure catch "ok" }) catch nil;
+    let startup_profile = try gfx.render_startup_profile("fast", gp, map{ target_fps: 60, pressure: try state.render_runtime.pressure catch "ok" }) catch nil;
+    let browser_route = str(try state.web.security catch "safe") + " / " + str(try state.web.search_engine catch "duckduckgo");
+    let text_status = _text_render_status_for_state(state);
+    return [
+        map{ id: "theme", group: "Appearance", title: "Theme", status: _theme_label(state), detail: "Click/Enter toggles Light/Dark using the same command as the toolbar Theme button." },
+        map{ id: "style", group: "Appearance", title: "Visual style", status: _style_name(state), detail: "Click/Enter cycles Web, Smooth, Crystal, and Contrast without changing the active panel." },
+        map{ id: "density_auto", group: "Display", title: "Responsive density", status: _settings_density_status(state), detail: "Click/Enter resets density to auto. Ctrl+- / Ctrl+= still adjust manual density." },
+        map{ id: "density_refresh", group: "Display", title: "Refresh window scale", status: str(try state.live_winsz.w catch "?") + "x" + str(try state.live_winsz.h catch "?"), detail: "Click/Enter reprobes the visible window/display size and reapplies responsive scaling." },
+        map{ id: "build", group: "Build", title: "Debug / Release mode", status: str(try state.build_mode catch "debug"), detail: "Click/Enter toggles the same build mode as F11. Debug checks before running; Release runs directly." },
+        map{ id: "watcher", group: "Safety", title: "Watcher", status: _watch_badge(state), detail: "Click/Enter toggles the same watcher as F12. It tracks dirty state, diagnostics, revision, and safety actions." },
+        map{ id: "browser", group: "Browser", title: "Browser security and search", status: browser_route, detail: "Opens Browser. Use command palette or Browser controls for Safe/Live/JS-DOM/Trusted/Tor and search-engine cycling." },
+        map{ id: "files", group: "Workspace", title: "Files and project roots", status: str(try state.files.mode catch "flat"), detail: "Opens Files. It manages roots, recent files, previews, transfer plans, and safe operation plans." },
+        map{ id: "history", group: "Storage", title: "History storage", status: str(try state.history_mode catch "temporary"), detail: _history_storage_summary(state) },
+        map{ id: "font", group: "Text", title: "Font and text renderer", status: str(try TEXT_PROFILE.renderer catch TEXT_MODE), detail: text_status },
+        map{ id: "graphics", group: "Runtime", title: "Graphics / GPU route", status: str(try gp.backend catch "unknown") + "/" + str(try gp.present catch "unknown"), detail: _graphics_status() + " · " + (try gfx.cpu_render_status(gp) catch "cpu-render unknown") + " · " + (try gfx.render_device_policy_status(device_policy) catch "device-policy unknown") + " · " + (try gfx.render_startup_profile_status(startup_profile) catch "startup-profile unknown") + " · " + _graphics_event_status() + " · " + str(try state.render_runtime.summary catch "runtime steady") },
+        map{ id: "commands", group: "Control", title: "Command palette", status: "Ctrl+P", detail: "Opens the searchable command palette for every IDE action." }
+    ];
+}
+
+fn _settings_hits(state) {
+    _settings_ensure(state);
+    return IDE.filter_management_records(_settings_records(state), try state.settings.query catch "", 200);
+}
+
+fn _settings_clamp(state) {
+    _settings_ensure(state);
+    let hits = _settings_hits(state);
+    if (try state.settings.sel catch 0) < 0 { state.settings.sel = 0; }
+    if len(hits) == 0 { state.settings.sel = 0; return hits; }
+    if (try state.settings.sel catch 0) >= len(hits) { state.settings.sel = len(hits) - 1; }
+    return hits;
+}
+
+fn _settings_open(state, hit) {
+    let id = str(try hit.id catch "");
+    if id == "theme" { _theme_toggle(state); state.panel = "settings"; return 0; }
+    if id == "style" {
+        state.style = _style_next(_style_name(state));
+        state.output = "style: " + state.style + " (Web/Smooth/Crystal/Contrast)";
+        state.panel = "settings";
+        return 0;
+    }
+    if id == "density_auto" { _density_auto(state); state.panel = "settings"; return 0; }
+    if id == "density_refresh" { _density_refresh(state); state.panel = "settings"; return 0; }
+    if id == "build" { _mode_toggle(state); state.panel = "settings"; return 0; }
+    if id == "watcher" { _watch_toggle(state); state.panel = "settings"; return 0; }
+    if id == "browser" { state.panel = "web"; state.output = "settings -> browser security and search"; return 0; }
+    if id == "files" { state.panel = "files"; _files_refresh(state); state.output = "settings -> files and project roots"; return 0; }
+    if id == "history" { state.panel = "hist"; state.output = _history_storage_summary(state); return 0; }
+    if id == "font" { state.output = "settings -> font/text\n" + _text_render_status_for_state(state); return 0; }
+    if id == "graphics" {
+        let gp = try gfx.backend_profile() catch nil;
+        let policy = try gfx.render_device_policy(gp, map{ target_fps: 60, pressure: try state.render_runtime.pressure catch "ok" }) catch nil;
+        let startup_profile = try gfx.render_startup_profile("fast", gp, map{ target_fps: 60, pressure: try state.render_runtime.pressure catch "ok" }) catch nil;
+        state.output = "settings -> graphics/runtime\n" + _graphics_status() + "\n" + (try gfx.cpu_render_status(gp) catch "cpu-render unknown") + "\n" + (try gfx.render_device_policy_status(policy) catch "device-policy unknown") + "\nlaunch env: " + str(try policy.env catch map{}) + "\nstartup profile: " + (try gfx.render_startup_profile_status(startup_profile) catch "startup-profile unknown") + "\nstartup env: " + str_join(try gfx.render_startup_env_lines(startup_profile) catch [], " ") + "\n" + _graphics_event_status() + "\n" + str(try state.render_runtime.summary catch "runtime steady");
+        return 0;
+    }
+    if id == "commands" { _open_command_palette(state); return 0; }
+    state.output = "settings: " + str(try hit.title catch id) + " · " + str(try hit.detail catch "");
+    return 0;
+}
+
+fn _settings_key(state, key, shift) {
+    _settings_ensure(state);
+    if key == "Escape" { state.panel = "code"; return 0; }
+    let n = len(_settings_hits(state));
+    if key == "Home" { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "home", 10); return 0; }
+    if key == "End" { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "end", 10); return 0; }
+    if (try state.ctrl catch false) and (key == "N" or key == "KeyN") { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "next", 10); return 0; }
+    if (try state.ctrl catch false) and (key == "P" or key == "KeyP") { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "previous", 10); return 0; }
+    if key == "Down" { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "down", 10); return 0; }
+    if key == "Up" { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "up", 10); return 0; }
+    if key == "PageDown" { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "page_down", 10); return 0; }
+    if key == "PageUp" { state.settings.sel = IDE.selection_move(try state.settings.sel catch 0, n, "page_up", 10); return 0; }
+    if key == "Delete" { state.settings.query = ""; state.settings.sel = 0; return 0; }
+    if key == "Backspace" {
+        if len(try state.settings.query catch "") > 0 { state.settings.query = str_slice(state.settings.query, 0, len(state.settings.query) - 1); }
+        state.settings.sel = 0;
+        return 0;
+    }
+    if _is_enter(key) {
+        let hits = _settings_clamp(state);
+        if len(hits) > 0 { _settings_open(state, hits[try state.settings.sel catch 0]); }
+        return 0;
+    }
+    let ch = K.key_to_char(key, shift);
+    if ch != "" {
+        state.settings.query = (try state.settings.query catch "") + ch;
+        state.settings.sel = 0;
+    }
+    return 0;
+}
+
+fn _settings_metrics(sz) {
+    let m = _panel_metrics(sz, "settings");
+    m.header_h = CH * 2 + 4 * PAD;
+    m.search_y = TOP + m.header_h + PAD;
+    m.search_h = CH + PAD;
+    m.body_top = m.search_y + m.search_h + 2 * PAD;
+    m.row_h = CH * 3 + PAD;
+    let rows_area = m.footer_y - m.body_top - PAD;
+    let rows = num_floor(rows_area / m.row_h);
+    if rows < 1 { rows = 1; }
+    m.rows = rows;
+    return m;
+}
+
+fn _settings_detail_lines(text, maxchars) {
+    let s = str(text);
+    let cap = try parse_number(str(maxchars)) catch 24;
+    if cap == nil or cap < 12 { cap = 12; }
+    cap = num_floor(cap);
+    if len(s) <= cap { return [s]; }
+    let first = str_slice(s, 0, cap);
+    let rest = str_trim(str_slice(s, cap, len(s)));
+    if len(rest) <= cap { return [first, rest]; }
+    return [first, str_slice(rest, 0, cap - 3) + "..."];
+}
+
+fn _draw_settings(state, win, sz) {
+    _settings_ensure(state);
+    let m = _settings_metrics(sz);
+    let maxchars = m.max_chars;
+    _panel_header_chrome(state, win, sz, m);
+    _dt(win, PAD, TOP + PAD, "Settings", _style_accent(state));
+    if m.hint_mode == "full" {
+        _dt(win, PAD, TOP + PAD + CH + PAD / 2, "theme · style · density · build · watcher · browser · graphics", _style_muted(state));
+    }
+
+    let qy = m.search_y;
+    _panel_search_box(state, win, m);
+    let records = _settings_records(state);
+    let q = "Search: " + (try state.settings.query catch "") + "   " +
+        IDE.management_filter_status(records, try state.settings.query catch "", try state.settings.sel catch 0);
+    let shown = str_slice(q, 0, maxchars - 4);
+    _dt(win, PAD + CW, qy + PAD / 2, shown, _style_text(state));
+    win.rect(PAD + CW + len(shown) * CW, qy + PAD / 2, SCALE, CH - SCALE, CURSOR);
+
+    let bodyTop = m.body_top;
+    let hits = _settings_clamp(state);
+    let i = 0;
+    if len(hits) == 0 {
+        _dt(win, PAD, bodyTop, "No settings match the filter.", _style_error(state));
+    }
+    let start = _list_start_for(try state.settings.sel catch 0, len(hits), m.rows);
+    while start + i < len(hits) and i < m.rows {
+        let y = bodyTop + i * m.row_h;
+        let actual = start + i;
+        if actual == (try state.settings.sel catch 0) { _fill_round(win, SCALE, y, sz.w - 2 * SCALE, m.row_h, _style_hilite(state), RAD); }
+        let h = hits[actual];
+        let head = str((try h.index catch actual) + 1) + ". [" + str(try h.group catch "?") + "] " + str(try h.title catch "?") +
+            " · " + str(try h.status catch "");
+        _dt(win, PAD, y + PAD / 2, str_slice(head, 0, maxchars), _style_pane_text(state));
+        let detail = _settings_detail_lines(try h.detail catch "", maxchars - 4);
+        let di = 0;
+        while di < len(detail) and di < 2 {
+            _dt(win, PAD + 2 * CW, y + CH + PAD / 2 + di * CH, str_slice(detail[di], 0, maxchars - 2), _style_muted(state));
+            di = di + 1;
+        }
+        i = i + 1;
+    }
+    _draw_panel_scrollbar(state, win, sz, m, len(hits), m.rows, start);
+
+    let footerY = m.footer_y;
+    _panel_footer_chrome(state, win, sz, footerY);
+    _dt(win, PAD, footerY + PAD / 2, "Settings: type to filter. Enter/click applies selected setting or opens its owning panel.", _style_muted(state));
+}
+
+fn _settings_click(state, mx, my) {
+    _settings_ensure(state);
+    let m = _settings_metrics(state.winsz);
+    let bodyTop = m.body_top;
+    if my < bodyTop { return 0; }
+    let hits = _settings_clamp(state);
+    let start = _list_start_for(try state.settings.sel catch 0, len(hits), m.rows);
+    let scrollHit = _panel_scrollbar_hit_index(state, m, len(hits), m.rows, start, mx, my);
+    if scrollHit >= 0 {
+        state.settings.sel = scrollHit;
+        return 0;
+    }
+    let idx = num_floor((my - bodyTop) / m.row_h);
+    idx = idx + _list_start_for(try state.settings.sel catch 0, len(hits), m.rows);
+    if idx < 0 or idx >= len(hits) { return 0; }
+    state.settings.sel = idx;
+    _settings_open(state, hits[idx]);
     return 0;
 }
 
@@ -6481,8 +8721,14 @@ fn _files_click(state, mx, my) {
     let m = _panel_metrics(state.winsz, "files");
     let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let row = num_floor((my - bodyTop) / m.row_h);
     let hits = _files_clamp(state);
+    let start = _list_start_for(try state.files.sel catch 0, len(hits), m.rows);
+    let scrollHit = _panel_scrollbar_hit_index(state, m, len(hits), m.rows, start, mx, my);
+    if scrollHit >= 0 {
+        state.files.sel = scrollHit;
+        return 0;
+    }
+    let row = num_floor((my - bodyTop) / m.row_h);
     row = row + _list_start_for(try state.files.sel catch 0, len(hits), m.rows);
     if row >= 0 and row < len(hits) {
         state.files.sel = row;
@@ -6597,8 +8843,14 @@ fn _outline_click(state, mx, my) {
     let m = _panel_metrics(state.winsz, "outline");
     let bodyTop = m.body_top;
     if my < bodyTop { return 0; }
-    let row = num_floor((my - bodyTop) / m.row_h);
     let hits = _outline_clamp(state);
+    let start = _list_start_for(try state.outline.sel catch 0, len(hits), m.rows);
+    let scrollHit = _panel_scrollbar_hit_index(state, m, len(hits), m.rows, start, mx, my);
+    if scrollHit >= 0 {
+        state.outline.sel = scrollHit;
+        return 0;
+    }
+    let row = num_floor((my - bodyTop) / m.row_h);
     row = row + _list_start_for(try state.outline.sel catch 0, len(hits), m.rows);
     if row >= 0 and row < len(hits) {
         state.outline.sel = row;
@@ -6756,6 +9008,20 @@ fn _problems_click(state, mx, my) {
         let detailY = m.detail_y;
         if my >= detailY { return false; }
     }
+    let hits = _problems_hits(state);
+    if len(hits) > 0 {
+        let rows = m.rows;
+        if rows < 1 { rows = 1; }
+        let diagSel = state.problems.sel - 1;
+        if diagSel < 0 { diagSel = 0; }
+        let start = _list_start_for(diagSel, len(hits), rows);
+        let sm = map{ body_top: bodyTop + CH + PAD, footer_y: m.detail_y, row_h: m.row_h };
+        let scrollHit = _panel_scrollbar_hit_index(state, sm, len(hits), rows, start, mx, my);
+        if scrollHit >= 0 {
+            state.problems.sel = scrollHit + 1;
+            return 0;
+        }
+    }
     let hit = IDE.problems_panel_hit(my, bodyTop, m.row_h, PAD, len(_problems_hits(state)));
     if (try hit.kind catch "") == "action" {
         state.problems.sel = 0;
@@ -6821,7 +9087,10 @@ fn _draw_examples(state, win, sz) {
         let y = b.list_y + i * CH;
         if actual == state.example_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
         let ex = EXAMPLES[hits[actual].index];
-        let line = str(actual + 1) + ". " + hits[actual].title + "   #" + str(hits[actual].index + 1);
+        let mainp = _example_main_path(ex);
+        let files = _example_project_files(ex);
+        let line = str(actual + 1) + ". " + hits[actual].title + "   #" + str(hits[actual].index + 1) +
+            "   " + str(len(files)) + " file(s)   " + mainp;
         _dt(win, b.x + 2 * PAD, y, str_slice(line, 0, (b.w - 6 * PAD) / CW), _style_pane_text(state));
         i = i + 1;
     }
@@ -6837,12 +9106,20 @@ fn _draw_examples(state, win, sz) {
 fn _examples_click(state, mx, my) {
     if not (try state.examples_mode catch false) or state.winsz == nil { return false; }
     let b = _example_box(state.winsz);
-    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop() / 2) { return false; }
+    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _button_hit_slop()) { return false; }
     if my < b.list_y { return true; }
-    let row = num_floor((my - b.list_y) / CH);
     let hits = _example_clamp(state);
     let rows = _examples_visible_rows(b);
     let start = _examples_start(state, hits, rows);
+    if len(hits) > rows {
+        let thick = _scrollbar_thickness();
+        let scrollHit = _scrollbar_hit_index(mx, my, b.x + b.w - 2 * PAD - thick, b.list_y, rows * CH, len(hits), rows, start, thick);
+        if scrollHit >= 0 {
+            state.example_sel = scrollHit;
+            return true;
+        }
+    }
+    let row = num_floor((my - b.list_y) / CH);
     let actual = start + row;
     if row >= 0 and row < rows and actual < len(hits) {
         state.example_sel = actual;
@@ -6855,6 +9132,13 @@ fn _examples_click(state, mx, my) {
 fn _command_box(sz) {
     let b = _modal_box(sz, 84 * CW, CH * 16 + 6 * PAD, 2);
     return map{ x: b.x, y: b.y, w: b.w, h: b.h, list_y: b.y + CH * 4 + 4 * PAD };
+}
+
+fn _command_visible_rows(b) {
+    let rows = num_floor((b.y + b.h - b.list_y - 2 * PAD) / CH);
+    if rows < 1 { rows = 1; }
+    if rows > 12 { rows = 12; }
+    return rows;
 }
 
 fn _draw_command_palette(state, win, sz) {
@@ -6888,11 +9172,14 @@ fn _draw_command_palette(state, win, sz) {
     _dt(win, b.x + 2 * PAD, b.list_y - SCALE, "GROUP", _style_muted(state));
     _dt(win, b.x + 13 * CW, b.list_y - SCALE, "COMMAND", _style_muted(state));
     _dt(win, b.x + b.w - 28 * CW, b.list_y - SCALE, "SHORTCUT", _style_muted(state));
+    let rows = _command_visible_rows(b);
+    let start = _list_start_for(try state.command_sel catch 0, len(hits), rows);
     let i = 0;
-    while i < len(hits) and i < 12 {
+    while i < rows and start + i < len(hits) {
+        let actual = start + i;
         let y = b.list_y + i * CH;
-        if i == state.command_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
-        let c = hits[i];
+        if actual == state.command_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
+        let c = hits[actual];
         let groupW = 11 * CW;
         let shortcutW = 26 * CW;
         let titleX = b.x + 2 * PAD + groupW;
@@ -6904,19 +9191,36 @@ fn _draw_command_palette(state, win, sz) {
         _dt(win, shortcutX, y, str_slice(c.shortcut, 0, shortcutW / CW), _style_accent(state));
         i = i + 1;
     }
+    if len(hits) > rows {
+        let thick = _scrollbar_thickness();
+        let sb = UIK.scrollbar(b.x + b.w - 2 * PAD - thick, b.list_y, rows * CH, len(hits), rows, start, thick);
+        _fill_round(win, sb.track.x, sb.track.y, sb.track.w, sb.track.h, _style_surface(state), thick / 2);
+        _fill_round(win, sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h, _style_focus(state), thick / 2);
+    }
     return 0;
 }
 
 fn _command_click(state, mx, my) {
     if not (try state.command_mode catch false) or state.winsz == nil { return false; }
     let b = _command_box(state.winsz);
-    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop() / 2) { return false; }
+    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _button_hit_slop()) { return false; }
     if my < b.list_y { return true; }
-    let row = num_floor((my - b.list_y) / CH);
     let hits = _command_clamp(state);
-    if row >= 0 and row < len(hits) {
-        state.command_sel = row;
-        _command_execute(state, hits[row].id);
+    let rows = _command_visible_rows(b);
+    let start = _list_start_for(try state.command_sel catch 0, len(hits), rows);
+    if len(hits) > rows {
+        let thick = _scrollbar_thickness();
+        let scrollHit = _scrollbar_hit_index(mx, my, b.x + b.w - 2 * PAD - thick, b.list_y, rows * CH, len(hits), rows, start, thick);
+        if scrollHit >= 0 {
+            state.command_sel = scrollHit;
+            return true;
+        }
+    }
+    let row = num_floor((my - b.list_y) / CH);
+    let actual = start + row;
+    if row >= 0 and row < rows and actual < len(hits) {
+        state.command_sel = actual;
+        _command_execute(state, hits[actual].id);
     }
     return true;
 }
@@ -7008,7 +9312,7 @@ fn _quick_open_refresh(state) {
 
 fn _quick_open_hits(state) {
     let search = IDE.quick_open_search_query(try state.quick_query catch "");
-    return IDE.quick_open_with_recent(try state.quick_entries catch [], try state.recent_files catch [], search, 14);
+    return IDE.quick_open_with_recent(try state.quick_entries catch [], try state.recent_files catch [], search, 300);
 }
 
 fn _quick_open_clamp(state) {
@@ -7080,6 +9384,13 @@ fn _quick_open_box(sz) {
     return map{ x: b.x, y: b.y, w: b.w, h: b.h, list_y: b.y + CH * 4 + 4 * PAD };
 }
 
+fn _quick_open_visible_rows(b) {
+    let rows = num_floor((b.y + b.h - b.list_y - 2 * PAD) / CH);
+    if rows < 1 { rows = 1; }
+    if rows > 14 { rows = 14; }
+    return rows;
+}
+
 fn _draw_quick_open(state, win, sz) {
     let b = _quick_open_box(sz);
     win.rect(0, TOP, sz.w, sz.h - TOP, _style_modal_backdrop(state));
@@ -7114,18 +9425,27 @@ fn _draw_quick_open(state, win, sz) {
     _dt(win, b.x + 2 * PAD, b.list_y - CH * 2 - PAD / 2, str_slice(hint, 0, (b.w - 4 * PAD) / CW), _style_muted(state));
     _dt(win, b.x + 2 * PAD, b.list_y - SCALE, "NAME", _style_muted(state));
     _dt(win, b.x + 33 * CW, b.list_y - SCALE, "PATH", _style_muted(state));
+    let rows = _quick_open_visible_rows(b);
+    let start = _list_start_for(try state.quick_sel catch 0, len(hits), rows);
     let i = 0;
-    while i < len(hits) and i < 14 {
+    while i < rows and start + i < len(hits) {
+        let actual = start + i;
         let y = b.list_y + i * CH;
-        if i == state.quick_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
-        let h = hits[i];
+        if actual == state.quick_sel { _fill_round(win, b.x + PAD, y - SCALE, b.w - 2 * PAD, CH, _style_hilite(state), RAD); }
+        let h = hits[actual];
         let nameW = 30 * CW;
         let pathX = b.x + 2 * PAD + nameW + CW;
         let pathMax = (b.x + b.w - 2 * PAD - pathX) / CW;
-        let name = str(i + 1) + ". " + h.label;
+        let name = str(actual + 1) + ". " + h.label;
         _dt(win, b.x + 2 * PAD, y, str_slice(name, 0, nameW / CW), _style_pane_text(state));
         _dt(win, pathX, y, str_slice(h.path, 0, pathMax), _style_muted(state));
         i = i + 1;
+    }
+    if len(hits) > rows {
+        let thick = _scrollbar_thickness();
+        let sb = UIK.scrollbar(b.x + b.w - 2 * PAD - thick, b.list_y, rows * CH, len(hits), rows, start, thick);
+        _fill_round(win, sb.track.x, sb.track.y, sb.track.w, sb.track.h, _style_surface(state), thick / 2);
+        _fill_round(win, sb.thumb.x, sb.thumb.y, sb.thumb.w, sb.thumb.h, _style_focus(state), thick / 2);
     }
     return 0;
 }
@@ -7133,13 +9453,24 @@ fn _draw_quick_open(state, win, sz) {
 fn _quick_open_click(state, mx, my) {
     if not (try state.quick_open_mode catch false) or state.winsz == nil { return false; }
     let b = _quick_open_box(state.winsz);
-    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _hit_slop() / 2) { return false; }
+    if not _hit_rect(mx, my, b.x, b.y, b.w, b.h, _button_hit_slop()) { return false; }
     if my < b.list_y { return true; }
-    let row = num_floor((my - b.list_y) / CH);
     let hits = _quick_open_clamp(state);
-    if row >= 0 and row < len(hits) {
-        state.quick_sel = row;
-        _quick_open_accept(state, hits[row]);
+    let rows = _quick_open_visible_rows(b);
+    let start = _list_start_for(try state.quick_sel catch 0, len(hits), rows);
+    if len(hits) > rows {
+        let thick = _scrollbar_thickness();
+        let scrollHit = _scrollbar_hit_index(mx, my, b.x + b.w - 2 * PAD - thick, b.list_y, rows * CH, len(hits), rows, start, thick);
+        if scrollHit >= 0 {
+            state.quick_sel = scrollHit;
+            return true;
+        }
+    }
+    let row = num_floor((my - b.list_y) / CH);
+    let actual = start + row;
+    if row >= 0 and row < rows and actual < len(hits) {
+        state.quick_sel = actual;
+        _quick_open_accept(state, hits[actual]);
     }
     return true;
 }
@@ -7232,7 +9563,7 @@ fn _apply_event_modifiers(state, e) {
 let HELP = [
     "pblang IDE  -  KEYBOARD SHORTCUTS            F1 or Esc to close",
     "",
-    "GLOBAL    click Code/Term/AI/Designer/Browser/Files/Out/Prob/Hist/Manage to switch panels",
+    "GLOBAL    click Code/Term/AI/Designer/Browser/Files/Out/Prob/Hist/Manage/Settings to switch panels",
     "          F2 Code   F3 Terminal   F4 Designer   F7 AI   F9 History   F10 Browser",
     "          Ctrl+1..9/Ctrl+0 switch panel strip left-to-right",
     "          tabs compact to 1C/2T/3A... when needed to keep actions usable",
@@ -7241,6 +9572,7 @@ let HELP = [
     "",
     "CODE      F5 run    F6 check    Ctrl+G go to line    F8 next diagnostic",
     "          Shift+F8 previous diagnostic",
+    "          file tabs show every project/example file; click a tab to switch buffers",
     "          Alt+Left / Alt+Right navigate jump history",
     "          Ctrl+N new buffer    Ctrl+S save    Ctrl+Shift+S Save As",
     "          Ctrl+O Quick Open    Ctrl+F find",
@@ -7273,6 +9605,7 @@ let HELP = [
     "HISTORY   run/check snapshots mirror the web IDE; click a row to restore code",
     "          S toggles Temporary/Permanent; Ctrl+S saves; C/footer clears history",
     "MANAGE    database/storage/files/browser/AI/backups dashboard; Enter opens area",
+    "SETTINGS  theme/style/density/build/watcher/browser/font/graphics; Enter applies",
     "FILES     type filter   Tab flat/tree/recent   Ctrl+/- tree depth   Enter open/dir",
     "          Backspace up   Ctrl+R refresh",
     "          Ctrl+Left/Right roots   Ctrl+H/L roots   Ctrl+B bookmark current dir",
@@ -7292,7 +9625,7 @@ let HELP = [
     "Launch from a shell with:   pblang ide   (or ./editors/ide/run.sh ; Windows: run.bat)",
     "UI density uses the pblang window probe when available; PBIDE_SCALE=1..4 overrides.",
     "Set PBIDE_WINDOW_PROBE=0 to disable probing or PBIDE_WINDOW_PROBE_MS=1200 to tune it.",
-    "Renderer: default minifb CPU framebuffer; use PBLANG_GFX=sdl2 for SDL2 GPU-present builds.",
+    "Renderer: Settings -> Graphics shows startup env; fast profile uses PBLANG_GFX=sdl2.",
 ];
 fn _draw_help(state, win, sz) {
     win.clear(_style_modal_backdrop(state));                  // modal backdrop
@@ -7316,6 +9649,10 @@ fn _draw_help(state, win, sz) {
 
 // top-level draw: clear, toolbar, then the active panel.
 fn _draw(state, win) {
+    TEXT_FRAME_CALLS = 0;
+    TEXT_FRAME_SKIPS = 0;
+    TEXT_FRAME_AA = 0;
+    TEXT_FRAME_BITMAP = 0;
     let frame = win.size();
     let live = try state.live_winsz catch frame;
     _apply_live_density(state, live);
@@ -7325,7 +9662,7 @@ fn _draw(state, win) {
     state.winsz = sz;                 // cached for mouse → buffer-position mapping
     state.window_size = live;
     state.viewport_layout = _viewport_layout_for(live);
-    state.ui_snapshot = _ui_snapshot(state, sz);
+    _ui_snapshot_cached(state, sz);
     _refresh_watcher_draw(state);
     _draw_toolbar(state, win, sz);
     if state.panel == "code" { _draw_code(state, win, sz); }
@@ -7338,26 +9675,34 @@ fn _draw(state, win) {
     else if state.panel == "problems" { _draw_problems(state, win, sz); }
     else if state.panel == "hist" { _draw_history(state, win, sz); }
     else if state.panel == "manage" { _draw_manage(state, win, sz); }
+    else if state.panel == "settings" { _draw_settings(state, win, sz); }
     if try state.examples_mode catch false { _draw_examples(state, win, sz); }
     if try state.command_mode catch false { _draw_command_palette(state, win, sz); }
     if try state.quick_open_mode catch false { _draw_quick_open(state, win, sz); }
     if try state.goto_line_mode catch false { _draw_goto_line(state, win, sz); }
     if state.help { _draw_help(state, win, sz); }     // modal overlay, drawn last (on top)
+    if (try state.perf catch nil) == nil { state.perf = map{}; }
+    state.perf.text_calls = TEXT_FRAME_CALLS;
+    state.perf.text_skips = TEXT_FRAME_SKIPS;
+    state.perf.text_aa = TEXT_FRAME_AA;
+    state.perf.text_bitmap = TEXT_FRAME_BITMAP;
     return true;
 }
 
 // mouse → buffer position. Maps a pixel (mx,my) in the editor area to (row,col), using the
-// SAME layout math as _draw: row r sits at y = TOP + (r - scroll)*CH, text starts at GUTTERX.
+// SAME layout math as _draw: row r sits under the file tab strip, text starts at GUTTERX.
 // Returns nil for clicks outside the editor area (e.g. on the output pane).
 fn _mouse_pos(state, mx, my) {
     let ed = state.ed;
     let sz = state.winsz;
+    let codeTop = _code_content_top(state);
     if sz != nil {
         if my >= sz.h - STATUSH { return nil; }
         let editorW = sz.w - _code_output_w_state(state, sz) - SCALE * 3;
         if mx >= editorW { return nil; }
     }
-    let vr = (my - TOP) / CH;
+    if my < codeTop { return nil; }
+    let vr = (my - codeTop) / CH;
     vr = num_floor(vr);
     if vr < 0 { vr = 0; }
     let row = ed.scroll + vr;
@@ -7366,14 +9711,109 @@ fn _mouse_pos(state, mx, my) {
     return map{ row: row, col: col };
 }
 
+fn _editor_scrollbar_click(state, mx, my) {
+    let sz = try state.winsz catch nil;
+    if sz == nil { return false; }
+    let ed = state.ed;
+    let outw = _code_output_w_state(state, sz);
+    let editorW = sz.w - outw - SCALE * 3;
+    let codeTop = _code_content_top(state);
+    let rows = num_floor((sz.h - STATUSH - codeTop) / CH);
+    if rows < 1 { return false; }
+    let total = E.line_count(ed);
+    let thick = _scrollbar_thickness();
+    let hit = _scrollbar_hit_index(mx, my, editorW - PAD - thick, codeTop, sz.h - STATUSH - codeTop, total, rows, try ed.scroll catch 0, thick);
+    if hit < 0 { return false; }
+    ed.scroll = hit;
+    if ed.row < ed.scroll { ed.row = ed.scroll; }
+    if ed.row >= ed.scroll + rows { ed.row = ed.scroll + rows - 1; }
+    if ed.row >= total { ed.row = total - 1; }
+    if ed.row < 0 { ed.row = 0; }
+    if ed.col < 0 { ed.col = 0; }
+    state.output = "editor scroll " + str(ed.scroll + 1) + "/" + str(total);
+    return true;
+}
+
+fn _editor_scroll_by(state, delta) {
+    let sz = try state.winsz catch nil;
+    if sz == nil { return false; }
+    let ed = state.ed;
+    let rows = num_floor((sz.h - STATUSH - _code_content_top(state)) / CH);
+    if rows < 1 { return false; }
+    let total = E.line_count(ed);
+    ed.scroll = _clamp_scroll((try ed.scroll catch 0) + delta, total, rows);
+    if ed.row < ed.scroll { ed.row = ed.scroll; }
+    if ed.row >= ed.scroll + rows { ed.row = ed.scroll + rows - 1; }
+    if ed.row >= total { ed.row = total - 1; }
+    if ed.row < 0 { ed.row = 0; }
+    state.output = "editor scroll " + str(ed.scroll + 1) + "/" + str(total);
+    return true;
+}
+
+fn _scroll_active_surface(state, e) {
+    let delta = _scroll_event_delta(e);
+    if delta == 0 { return false; }
+    if try state.examples_mode catch false {
+        let hits = _example_clamp(state);
+        state.example_sel = _clamp_index((try state.example_sel catch 0) + delta, len(hits));
+        return true;
+    }
+    if try state.command_mode catch false {
+        let hits = _command_clamp(state);
+        state.command_sel = _clamp_index((try state.command_sel catch 0) + delta, len(hits));
+        return true;
+    }
+    if try state.quick_open_mode catch false {
+        let hits = _quick_open_clamp(state);
+        state.quick_sel = _clamp_index((try state.quick_sel catch 0) + delta, len(hits));
+        return true;
+    }
+    if state.panel == "code" { return _editor_scroll_by(state, delta); }
+    if state.panel == "web" { return _web_scroll_by(state, delta); }
+    if state.panel == "files" {
+        let hits = _files_clamp(state);
+        state.files.sel = _clamp_index((try state.files.sel catch 0) + delta, len(hits));
+        return true;
+    }
+    if state.panel == "outline" {
+        let hits = _outline_clamp(state);
+        state.outline.sel = _clamp_index((try state.outline.sel catch 0) + delta, len(hits));
+        return true;
+    }
+    if state.panel == "problems" {
+        state.problems.sel = _clamp_index((try state.problems.sel catch 0) + delta, _problems_count(state));
+        return true;
+    }
+    if state.panel == "hist" {
+        let hits = _history_clamp(state);
+        state.history_sel = _clamp_index((try state.history_sel catch 0) + delta, len(hits));
+        return true;
+    }
+    if state.panel == "manage" {
+        let hits = _manage_clamp(state);
+        state.manage.sel = _clamp_index((try state.manage.sel catch 0) + delta, len(hits));
+        return true;
+    }
+    if state.panel == "settings" {
+        let hits = _settings_clamp(state);
+        state.settings.sel = _clamp_index((try state.settings.sel catch 0) + delta, len(hits));
+        return true;
+    }
+    return false;
+}
+
 // place the caret at the mouse, optionally extending the selection (drag).
 fn _mouse_place(state, mx, my, extend) {
     let p = _mouse_pos(state, mx, my);
-    if p == nil { return 0; }
+    if p == nil { return false; }
     let ed = state.ed;
+    let old_row = try ed.row catch 0;
+    let old_col = try ed.col catch 0;
+    let old_anchor = try ed.anchor catch nil;
     if extend { if ed.anchor == nil { E.set_anchor(ed); } } else { E.clear_selection(ed); }
     E.set_cursor(ed, p.row, p.col);
-    return 0;
+    let next_anchor = try ed.anchor catch nil;
+    return old_row != ed.row or old_col != ed.col or str(old_anchor) != str(next_anchor);
 }
 
 fn main() {
@@ -7416,7 +9856,10 @@ fn main() {
         replace_mode: false, replace_text: "", replace_focus: "find",
         rows: 40, path: path0, last: "other",
         file_profile: IDE.editor_asset_profile(path0), preview_mode: "syntax", preview_path: "",
-        tokens: nil, syntax_hash: "", dirty: true, redraw: true, syntax_status: "",
+        tokens: nil, token_lines: nil, syntax_rev: 0 - 1, syntax_hash: "", dirty: true, redraw: true, syntax_status: "",
+        project_root: "", project_files: [path0],
+        file_tabs: [map{ title: _file_tab_title(path0), path: path0, code: E.text(ed0), dirty: true, file_profile: IDE.editor_asset_profile(path0), preview_mode: "syntax", project_root: "", project_files: [path0], example_run_path: "", example_app_kind: "", example_title: "" }],
+        file_tab_sel: 0, file_tab_scroll: 0, file_tab_layout: [],
         build_mode: "debug", watch_enabled: true, watch: IDE.watcher_new(path0, E.text(ed0)),
         open_mode: false, open_path: "", save_as_mode: false, save_as_path: "",
         quick_open_mode: false, quick_query: "", quick_sel: 0, quick_dir: cwd0, quick_entries: [],
@@ -7426,18 +9869,23 @@ fn main() {
         outline: map{ query: "", sel: 0 },
         problems: map{ sel: 0, query: "" },
         manage: map{ query: "", sel: 0 },
-        examples_mode: false, example_query: "", example_sel: 0,
+        settings: map{ query: "", sel: 0 },
+        examples_mode: false, example_query: "", example_sel: 0, example_run_path: "", example_app_kind: "", example_title: "",
         command_mode: false, command_query: "", command_sel: 0,
-        mx: 0, my: 0, mdown: false, split_drag: false, winsz: nil, outw: 30 * CW, ui_snapshot: nil, ui_events: [], hover_tab: nil,
+        mx: 0, my: 0, mdown: false, split_drag: false, code_scroll_drag: false, winsz: nil, outw: 30 * CW, ui_snapshot: nil, ui_snapshot_sig: "", ui_events: [], hover_tab: nil, toolbar_layout: nil,
         style: "crystal", theme: "dark", density_scale: SCALE, window_size: initialFrame,
         live_winsz: initialFrame, display_winsz: DISPLAY, viewport_layout: _viewport_layout_for(initialFrame),
         window_probe_enabled: _window_probe_default(), monitor_probe_enabled: _monitor_probe_default(),
         window_probe_last_ms: 0, window_monitor_probe_last_ms: 0,
-        event_count: 0, last_event: "none", last_present_ms: 0, watch_draw_last_ms: 0,
+        event_count: 0, last_event: "none", last_input_ms: 0, last_present_ms: 0, last_frame_sig: nil, watch_draw_last_ms: 0,
+        render_runtime: map{ format: "pbide.render.runtime_plan.v1", pressure: "ok", throttle: "none", idle_ms: 500, min_draw_gap_ms: 0, input_grace_ms: 60, summary: "runtime none idle 500ms min-gap 0ms fps 60" },
+        render_runtime_last_ms: 0, render_runtime_last_draws: 0, render_runtime_refreshes: 0, render_runtime_cache: nil,
+        perf: map{ draws: 0, skips: 0, last_draw_ms: 0, avg_draw_ms: 0 },
         term: map{ cwd: cwd0, input: "", lines: ["pblang terminal — runs real PC commands (needs --allow-exec). Try: ls, pwd, cd .."], cmd_history: [], hist_pos: 0, hist_draft: "" },
-        design: map{ tool: "button", target: "gui", layout: "free", widgets: [], sel: 0 - 1, drag: false, dx: 0, dy: 0, counter: 0 },
+        design: map{ tool: "button", target: "gui", layout: "free", widgets: [], sel: 0 - 1, drag: false, dx: 0, dy: 0, counter: 0, path: path0, title: _file_tab_title(path0) },
+        design_tabs: [], design_tab_sel: 0, design_tab_scroll: 0, design_tab_layout: [],
         ai: map{ input: "", last_response: "", last_cue: "", prompt_history: [], hist_pos: 0, hist_draft: "", lines: ["pbAI — pblang's own assistant (no network, no Ollama). Type a question + Enter,", "or use EXPLAIN / BUGS / IMPROVE / QUALITY / COMMENT / DIAG, then INSERT the last answer."] },
-        web: map{ input: "example.com", url: "", title: "", mode: "live", security: "safe", tor: false, status: "safe", scroll: 0, history: [], forward: [], bookmarks: [], download_plans: [], search_engine: "duckduckgo", home: "example.com", find_query: "", page_obj: nil, page: ["pblang browser - type a URL + Enter to load. Live/Reader/Links/Forms/Source/Inspect/Host modes."], reader: ["pblang browser - type a URL + Enter to load. Up/Down scroll."], links: [], forms: ["No forms loaded."], form_sel: 0, form_field_sel: 0, form_values: map{}, source: ["No source loaded."], inspect: ["No inspector details loaded."], render_img: nil, render_path: "", render_lines: ["Host mode: switch security to Trusted or JS/DOM, enter a URL, click Host. Needs --allow-exec and chromium/google-chrome/brave/firefox."], lines: ["pblang browser - type a URL + Enter to load. Up/Down scroll."] },
+        web: map{ input: "example.com", url: "", title: "", mode: "live", security: "safe", tor: false, status: "safe", scroll: 0, history: [], forward: [], bookmarks: [], download_plans: [], search_engine: "duckduckgo", home: "example.com", find_query: "", tabs: [], tab_sel: 0, tab_scroll: 0, tab_layout: [], tab_add_rect: nil, page_obj: nil, page: ["pblang browser - type a URL + Enter to load. Live/Reader/Links/Forms/Source/Inspect/Host modes."], reader: ["pblang browser - type a URL + Enter to load. Up/Down scroll."], links: [], forms: ["No forms loaded."], form_sel: 0, form_field_sel: 0, form_values: map{}, source: ["No source loaded."], inspect: ["No inspector details loaded."], render_img: nil, render_path: "", render_lines: ["Host mode: switch security to Trusted or JS/DOM, enter a URL, click Host. Needs --allow-exec and chromium/google-chrome/brave/firefox."], lines: ["pblang browser - type a URL + Enter to load. Up/Down scroll."] },
         diagnostics: [],
         diag_index: 0 - 1,
         nav_back: [], nav_forward: [],
@@ -7486,7 +9934,7 @@ fn main() {
                     else if e.key == "F12" { _watch_toggle(s); }
                     else if e.key == "F2" { s.panel = "code"; }
                     else if e.key == "F3" { s.panel = "term"; }
-                    else if e.key == "F4" { s.panel = "design"; }
+                    else if e.key == "F4" { s.panel = "design"; _design_tabs_focus_path(s, try s.path catch ""); }
                     else if e.key == "F7" { s.panel = "ai"; }
                     else if e.key == "F8" {
                         let dd = 1;
@@ -7504,6 +9952,7 @@ fn main() {
                     else if s.panel == "problems" { _problems_key(s, e.key, s.shift); }
                     else if s.panel == "hist" { _history_key(s, e.key, s.shift); }
                     else if s.panel == "manage" { _manage_key(s, e.key, s.shift); }
+                    else if s.panel == "settings" { _settings_key(s, e.key, s.shift); }
                     else if s.panel == "code" { let st = _key(s, e.key); if st != "" { s.output = st; } }
                 }
                 if e.type == "keyup" {
@@ -7539,6 +9988,10 @@ fn main() {
                         s.redraw = true;
                     }
                 }
+                if e.type == "scroll" {
+                    if _debug_events_enabled() { _record_input_event(s, "scroll dx=" + str(try e.dx catch 0) + " dy=" + str(try e.dy catch 0)); }
+                    if _scroll_active_surface(s, e) { s.redraw = true; }
+                }
                 // mousedown carries no coords (like gui.sapp) — use the tracked cursor.
                 if e.type == "mousemove" {
                     if _debug_events_enabled() { _record_input_event(s, "mousemove " + str(try e.x catch "?") + "," + str(try e.y catch "?")); }
@@ -7546,13 +9999,15 @@ fn main() {
                     // hover feedback: highlight the toolbar button under the cursor (redraw
                     // only when the hovered target changes, so idle mouse motion stays free)
                     let hov = nil;
-                    if e.y < TBH + CH { hov = _toolbar_hit(e.x, e.y, s.winsz); }
+                    if e.y < TBH + CH { hov = _toolbar_hit(s, e.x, e.y, s.winsz); }
                     if hov != (try s.hover_tab catch nil) { s.hover_tab = hov; s.redraw = true; }
                     if s.split_drag {
                         _resize_output_pane(s, e.x);
                         s.redraw = true;
                     }
-                    if s.mdown and s.panel == "code" { _mouse_place(s, e.x, e.y, true); s.redraw = true; }  // drag = extend selection
+                    if s.mdown and s.panel == "code" and not (try s.code_scroll_drag catch false) {
+                        if _mouse_place(s, e.x, e.y, true) { s.redraw = true; }
+                    }  // drag = extend selection
                     if s.panel == "design" and s.design.drag and s.design.sel >= 0 {                       // drag = move widget
                         let w = s.design.widgets[s.design.sel];
                         w.x = e.x - s.design.dx; w.y = e.y - s.design.dy;
@@ -7578,7 +10033,7 @@ fn main() {
                     if not captured and _any_modal_open(s) { captured = _modal_backdrop_click(s, dx, dy); }
                     if captured { s.redraw = true; }
                     else {
-                    let tab = _toolbar_hit(dx, dy, s.winsz);
+                    let tab = _toolbar_hit(s, dx, dy, s.winsz);
                     if tab != nil { _record_input_event(s, "toolbar " + str(tab)); _toolbar_click(s, tab); s.redraw = true; }         // web-style toolbar action
                     else if _splitter_hit(s, dx, dy) {
                         s.split_drag = true;
@@ -7587,8 +10042,11 @@ fn main() {
                     }
                     else {
                         s.mdown = true;
+                        s.code_scroll_drag = false;
                         if s.panel == "code" {
-                            if not _diagnostic_click(s, dx, dy) and not _watcher_click(s, dx, dy) and not _ui_observer_click(s, dx, dy) { _mouse_place(s, dx, dy, false); }
+                            if _file_tab_click(s, dx, dy) { s.mdown = false; }
+                            else if _editor_scrollbar_click(s, dx, dy) { s.code_scroll_drag = true; }
+                            else if not _diagnostic_click(s, dx, dy) and not _watcher_click(s, dx, dy) and not _ui_observer_click(s, dx, dy) { _mouse_place(s, dx, dy, false); }
                         }       // click = place caret, diagnostic, or watcher action
                         else if s.panel == "design" { _design_click(s, dx, dy); }      // place/select a widget
                         else if s.panel == "ai" { let act = _ai_hit(dx, dy); if act != nil { _ai_action(s, act); } }  // quick action
@@ -7598,13 +10056,16 @@ fn main() {
                         else if s.panel == "problems" { _problems_click(s, dx, dy); }
                         else if s.panel == "hist" { _history_click(s, dx, dy); }
                         else if s.panel == "manage" { _manage_click(s, dx, dy); }
+                        else if s.panel == "settings" { _settings_click(s, dx, dy); }
                         s.redraw = true;
                     }
                     }
                 }
                 if e.type == "mouseup" {
                     _record_input_event(s, "mouseup " + str(try e.x catch "?") + "," + str(try e.y catch "?"));
-                    s.mdown = false; s.split_drag = false; s.design.drag = false; s.redraw = true;
+                    let had_capture = s.mdown or s.split_drag or s.design.drag or (try s.code_scroll_drag catch false);
+                    s.mdown = false; s.split_drag = false; s.design.drag = false; s.code_scroll_drag = false;
+                    if had_capture { s.redraw = true; }
                 }
                 i = i + 1;
             }
@@ -7614,18 +10075,37 @@ fn main() {
         // density/window-probe changes visible even when the backend misses a resize
         // event; PBIDE_IDLE_REDRAW_MS=0 disables it.
         fn(s, w) {
+            // Repaint policy lives in the tested stdlib/frame_gate.sapp: an input event
+            // (s.redraw) always paints; otherwise we only paint at the idle cadence AND
+            // only when the visible-state signature actually changed. That kills the old
+            // "full redraw every idle interval even when idle" CPU burn — an untouched
+            // window now does ZERO rasterization and ZERO GPU texture uploads per tick.
             let now = try now_ms() catch 0;
-            let idle = _idle_redraw_interval_ms();
-            let last = try s.last_present_ms catch 0;
-            if not s.redraw and idle > 0 {
-                if last == 0 or now == 0 or now - last >= idle { s.redraw = true; }
+            // The adaptive runtime plan is cached. Rebuilding the old synthetic
+            // frame plan here allocated dozens of maps on every 60 Hz idle tick.
+            let runtime = try _render_runtime_current(s) catch map{ idle_ms: _idle_redraw_interval_ms(), min_draw_gap_ms: 0, input_grace_ms: 60, summary: "runtime steady" };
+            let idle_ms = _adaptive_idle_redraw_interval_ms(s);
+            if not s.redraw and not GATE.due(now, idle_ms, (try s.last_present_ms catch 0)) {
+                return false;
             }
-            if s.redraw {
+            if _defer_non_input_redraw(s, now, runtime) {
+                return false;
+            }
+            let sig = _frame_sig(s);
+            let dec = GATE.decide(s.redraw, now, idle_ms,
+                (try s.last_present_ms catch 0), sig, (try s.last_frame_sig catch nil));
+            if dec.draw {
+                let draw0 = try now_ms() catch now;
                 _draw(s, w);
+                let draw1 = try now_ms() catch draw0;
+                _perf_record_draw(s, draw1 - draw0);
+                _render_runtime_refresh(s, draw1, false);
                 s.redraw = false;
                 s.last_present_ms = now;
+                s.last_frame_sig = sig;
                 return true;
             }
+            _perf_record_skip(s);
             return false;
         },
         // 60 Hz event loop: input latency drops from ~50ms (20fps) to ~16ms so clicks,

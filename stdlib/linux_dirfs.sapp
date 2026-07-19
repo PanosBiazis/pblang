@@ -1,0 +1,200 @@
+// Linux directory-handle filesystem confinement, implemented in PBLang.
+//
+// Every path component is opened relative to an already-open directory with
+// O_NOFOLLOW. Actual byte I/O uses /proc/self/fd/<fd>, which names the held
+// object rather than resolving the user-supplied path again. Namespace changes
+// after validation therefore cannot redirect an operation outside the root.
+
+let LIBC_PATHS = [
+    "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6", "/lib/i386-linux-gnu/libc.so.6",
+    "/usr/lib/libc.so.6", "/lib/libc.so.6"
+];
+
+let AT_FDCWD = -100;
+let AT_REMOVEDIR = 512;
+let O_RDONLY = 0; let O_WRONLY = 1;
+let O_CREAT = 64; let O_EXCL = 128;
+let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
+let MODE_FILE = 384; let MODE_DIR = 448;
+let MAX_PATH = 4096; let MAX_COMPONENT = 255;
+
+fn _error(message) { return map{ ok: false, error: message }; }
+fn _first_existing(paths) {
+    let i = 0;
+    while i < len(paths) { if try fs_exists(paths[i]) catch false { return paths[i]; } i = i + 1; }
+    return nil;
+}
+fn available() {
+    let libc = _first_existing(LIBC_PATHS);
+    return map{ ok: platform() == "linux" and libc != nil and (try fs_exists("/proc/self/fd") catch false),
+                libc: libc, proc_fd: try fs_exists("/proc/self/fd") catch false,
+                contract: "pblang.linux-dirfs.v1" };
+}
+
+fn _components(path, allow_root = true) {
+    if type(path) != "string" or len(path) > MAX_PATH or str_starts_with(path, "/") or
+       str_contains(path, strfromcharcode(0)) { return nil; }
+    if path == "" or path == "." or path == "root" { if allow_root { return []; } return nil; }
+    let raw = str_split(path, "/"); let out = []; let i = 0;
+    while i < len(raw) {
+        let part = raw[i];
+        if part == "" or part == "." or part == ".." or len(part) > MAX_COMPONENT { return nil; }
+        array_push(out, part); i = i + 1;
+    }
+    return out;
+}
+
+fn _call(fs, symbol, signature, args) {
+    return try ffi_call_typed(fs.libc, symbol, signature, args) catch -1;
+}
+fn _i32(value) {
+    // The current typed FFI uses an i64 trampoline for all integer returns.
+    // A C function returning int writes EAX, so normalize its unsigned 32-bit
+    // representation back to the signed result required by POSIX APIs.
+    if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; }
+    return value;
+}
+fn _close_fd(fs, fd) { if fd >= 0 { _i32(_call(fs, "close", "i32->i32", [fd])); } }
+fn _fd_path(fd) { return "/proc/self/fd/" + str(fd); }
+fn _cstring(fs, value) { return _call(fs, "strdup", "string->ptr", [value]); }
+fn _free(fs, pointer) { if pointer != nil and pointer != 0 { _call(fs, "free", "ptr->void", [pointer]); } }
+fn _openat(fs, dirfd, name, flags, mode = 0) {
+    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let result = _i32(_call(fs, "openat", "i32,ptr,i32,i32->i32", [dirfd, pointer, flags, mode]));
+    _free(fs, pointer); return result;
+}
+fn _mkdirat(fs, dirfd, name, mode) {
+    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let result = _i32(_call(fs, "mkdirat", "i32,ptr,i32->i32", [dirfd, pointer, mode]));
+    _free(fs, pointer); return result;
+}
+fn _unlinkat(fs, dirfd, name, flags) {
+    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let result = _i32(_call(fs, "unlinkat", "i32,ptr,i32->i32", [dirfd, pointer, flags]));
+    _free(fs, pointer); return result;
+}
+fn _renameat(fs, from_fd, from_name, to_fd, to_name) {
+    let from_pointer = _cstring(fs, from_name); if from_pointer == nil or from_pointer == 0 { return -1; }
+    let to_pointer = _cstring(fs, to_name);
+    if to_pointer == nil or to_pointer == 0 { _free(fs, from_pointer); return -1; }
+    let result = _i32(_call(fs, "renameat", "i32,ptr,i32,ptr->i32", [from_fd, from_pointer, to_fd, to_pointer]));
+    _free(fs, to_pointer); _free(fs, from_pointer); return result;
+}
+
+fn open(root, create = true) {
+    let host = available(); if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
+    let parts = _components(root, false); if parts == nil { return _error("root must be a safe relative path"); }
+    if create { try fs_mkdirs(root) catch nil; }
+    let libc = try ffi_load(host.libc) catch nil;
+    if libc == nil { return _error("trusted libc cannot be loaded"); }
+    let holder = map{ libc: libc };
+    let fd = _openat(holder, AT_FDCWD, root, O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+    if fd < 0 { ffi_close(libc); return _error("root cannot be opened without following links"); }
+    return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: fd,
+                libc: libc, libc_path: host.libc, closed: false };
+}
+
+fn close(fs) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) { return false; }
+    _close_fd(fs, fs.root_fd); ffi_close(fs.libc); fs.closed = true; fs.root_fd = -1; return true;
+}
+
+fn _walk_dir(fs, parts, create) {
+    if fs == nil or (try fs.closed catch true) { return _error("directory root is closed"); }
+    let current = _i32(_call(fs, "dup", "i32->i32", [fs.root_fd]));
+    if current < 0 { return _error("cannot duplicate root directory handle"); }
+    let i = 0;
+    while i < len(parts) {
+        let next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        if next < 0 and create {
+            let made = _mkdirat(fs, current, parts[i], MODE_DIR);
+            if made == 0 { next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0); }
+        }
+        _close_fd(fs, current);
+        if next < 0 { return _error("path component is missing, not a directory, or a symbolic link"); }
+        current = next; i = i + 1;
+    }
+    return map{ ok: true, fd: current };
+}
+
+fn _parent(fs, path, create) {
+    let parts = _components(path, false); if parts == nil or len(parts) == 0 { return _error("a non-root path is required"); }
+    let dirs = []; let i = 0;
+    while i + 1 < len(parts) { array_push(dirs, parts[i]); i = i + 1; }
+    let parent = _walk_dir(fs, dirs, create); if not parent.ok { return parent; }
+    parent.name = parts[len(parts) - 1]; return parent;
+}
+
+fn mkdir(fs, path) {
+    let parts = _components(path, false); if parts == nil or len(parts) == 0 { return _error("invalid directory path"); }
+    let dir = _walk_dir(fs, parts, true); if not dir.ok { return dir; }
+    _close_fd(fs, dir.fd); return map{ ok: true, path: path };
+}
+
+fn list(fs, path = "root", max_entries = 512) {
+    let parts = _components(path, true); if parts == nil { return _error("invalid directory path"); }
+    let dir = _walk_dir(fs, parts, false); if not dir.ok { return dir; }
+    let entries = try fs_listdir(_fd_path(dir.fd)) catch nil; _close_fd(fs, dir.fd);
+    if not is_array(entries) { return _error("path is not a readable directory"); }
+    let limit = num_floor(max_entries); if limit < 1 { limit = 1; } if limit > 4096 { limit = 4096; }
+    let out = []; let i = 0; while i < len(entries) and i < limit { array_push(out, entries[i]); i = i + 1; }
+    return map{ ok: true, path: path, entries: out, truncated: len(entries) > limit };
+}
+
+fn read_bytes(fs, path, max_bytes = 4194304) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NOFOLLOW + O_CLOEXEC, 0);
+    _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be opened without following links"); }
+    let bytes = try fs_read_bytes(_fd_path(fd)) catch nil; _close_fd(fs, fd);
+    if not is_array(bytes) { return _error("path is not a readable regular file"); }
+    if len(bytes) > max_bytes { return _error("file exceeds byte limit"); }
+    return map{ ok: true, path: path, bytes: bytes, size: len(bytes) };
+}
+
+fn _stage_name() { return ".pblang-stage-" + str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32); }
+
+fn write_atomic(fs, path, bytes, create_parents = true) {
+    if not is_array(bytes) { return _error("bytes must be an array"); }
+    let parent = _parent(fs, path, create_parents); if not parent.ok { return parent; }
+    let stage = _stage_name();
+    let fd = _openat(fs, parent.fd, stage, O_WRONLY + O_CREAT + O_EXCL + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
+    if fd < 0 { _close_fd(fs, parent.fd); return _error("cannot create an exclusive staging file"); }
+    let wrote = try { fs_write_bytes(_fd_path(fd), bytes); true } catch false; _close_fd(fs, fd);
+    if not wrote {
+        _unlinkat(fs, parent.fd, stage, 0);
+        _close_fd(fs, parent.fd); return _error("cannot write staged bytes");
+    }
+    let published = _renameat(fs, parent.fd, stage, parent.fd, parent.name);
+    if published != 0 { _unlinkat(fs, parent.fd, stage, 0); }
+    _close_fd(fs, parent.fd);
+    if published != 0 { return _error("cannot publish staged file atomically"); }
+    return map{ ok: true, path: path, size: len(bytes), atomic: true };
+}
+
+fn remove(fs, path) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let rc = _unlinkat(fs, parent.fd, parent.name, 0);
+    if rc != 0 { rc = _unlinkat(fs, parent.fd, parent.name, AT_REMOVEDIR); }
+    _close_fd(fs, parent.fd); if rc != 0 { return _error("file or empty directory cannot be removed"); }
+    return map{ ok: true, path: path };
+}
+
+fn move(fs, from, to, create_parents = true) {
+    let source = _parent(fs, from, false); if not source.ok { return source; }
+    let dest = _parent(fs, to, create_parents);
+    if not dest.ok { _close_fd(fs, source.fd); return dest; }
+    let rc = _renameat(fs, source.fd, source.name, dest.fd, dest.name);
+    _close_fd(fs, source.fd); _close_fd(fs, dest.fd);
+    if rc != 0 { return _error("confined rename failed"); }
+    return map{ ok: true, from: from, to: to, atomic: true };
+}
+
+fn status(fs) {
+    return map{ format: "pblang.linux-dirfs.status.v1", available: fs != nil and not (try fs.closed catch true),
+                component_openat: true, nofollow: true, cloexec: true, stable_proc_fd_io: true,
+                atomic_renameat: true, libc: try fs.libc_path catch nil };
+}
+
+export available, open, close, mkdir, list, read_bytes, write_atomic, remove, move, status;

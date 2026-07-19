@@ -1,0 +1,346 @@
+// stdlib/knowledge_graph.sapp — turn any corpus of linked notes into a navigable KNOWLEDGE GRAPH.
+//
+// This is the graphify + Obsidian idea, in pure pblang: parse [[wikilinks]] out of note bodies, build
+// nodes + edges, compute BACKLINKS (who links to me — Obsidian's core view), detect COMMUNITIES
+// (connected components — graphify's clustering), answer graph QUERIES (BFS neighbourhood / shortest
+// path), and emit three outputs: an Obsidian-style markdown VAULT, a GraphRAG-ready JSON graph, and a
+// plain-language GRAPH_REPORT.md.
+//
+//   let kg = import("stdlib:knowledge_graph.sapp");
+//   let g = kg.build(map{ "Auth": "uses [[Database]] and [[Crypto]]", "Database": "see [[Crypto]]" });
+//   kg.backlinks(g, "Crypto");        // ["Auth", "Database"]
+//   kg.query(g, "Auth", 2);           // BFS neighbourhood, depth 2
+//   kg.write_vault(g, "/tmp/vault");  // Obsidian vault + GRAPH_REPORT.md + graph.json
+//
+// It composes with stdlib/graph.sapp (raw BFS/DFS/Dijkstra primitives); this module adds the note /
+// wikilink / vault SEMANTICS on top.
+
+// ── construction ──────────────────────────────────────────────────────────────
+// kg = { notes: name → {name, content, tags}, edges: [{src, dst}], order: [names…] }
+fn kg_new() { return map{ notes: map{}, edges: [], order: [] }; }
+
+// Given the raw text inside [[ … ]], resolve it to a target note name: drop a "|alias" and a
+// "#section" suffix, then trim. So [[Design Doc#Overview|the doc]] → "Design Doc".
+fn _link_target(raw) {
+    let a = str_split(raw, "|");        // "Name|Alias" → keep the target before the pipe
+    let b = str_split(a[0], "#");       // "Name#Section" → keep the note, drop the heading
+    return str_trim(b[0]);
+}
+
+// Extract every [[wikilink]] target from a body of text, in order (duplicates kept — link count matters).
+fn parse_links(text) {
+    let out = [];
+    let n = len(text);
+    let i = 0;
+    while i < n - 1 {
+        if strcharcodeat(text, i) == 91 and strcharcodeat(text, i + 1) == 91 {   // "[["
+            let start = i + 2;
+            let j = start;
+            let close = -1;
+            while j < n - 1 {
+                if strcharcodeat(text, j) == 93 and strcharcodeat(text, j + 1) == 93 { close = j; break; }  // "]]"
+                j = j + 1;
+            }
+            if close >= 0 {
+                let inner = str_slice(text, start, close);
+                let tgt = _link_target(inner);
+                if len(tgt) > 0 { push(out, tgt); }
+                i = close + 2;
+            } else { i = i + 1; }
+        } else { i = i + 1; }
+    }
+    return out;
+}
+
+// Add / replace a note and (re)derive its outgoing edges from the [[wikilinks]] in its body.
+fn add_note(kg, name, content, tags = nil) {
+    if tags == nil { tags = []; }
+    if not map_has(kg.notes, name) { push(kg.order, name); }
+    kg.notes[name] = map{ name: name, content: content, tags: tags };
+    let links = parse_links(content);
+    let i = 0;
+    while i < len(links) { push(kg.edges, map{ src: name, dst: links[i] }); i = i + 1; }
+    return kg;
+}
+
+// Build a graph from a corpus map { note-name → body-text }.
+fn build(corpus) {
+    let kg = kg_new();
+    let names = map_keys(corpus);
+    let i = 0;
+    while i < len(names) { add_note(kg, names[i], corpus[names[i]], nil); i = i + 1; }
+    return kg;
+}
+
+// ── names & adjacency ─────────────────────────────────────────────────────────
+// Every node in the graph: the notes we hold PLUS any link target that has no note yet (Obsidian's
+// "unresolved" links — still first-class nodes so the graph stays honest about dangling references).
+fn _all_names(kg) {
+    let seen = map{}; let out = [];
+    let i = 0;
+    while i < len(kg.order) { let nm = kg.order[i]; if not map_has(seen, nm) { seen[nm] = true; push(out, nm); } i = i + 1; }
+    let e = 0;
+    while e < len(kg.edges) {
+        let s = kg.edges[e].src; if not map_has(seen, s) { seen[s] = true; push(out, s); }
+        let d = kg.edges[e].dst; if not map_has(seen, d) { seen[d] = true; push(out, d); }
+        e = e + 1;
+    }
+    return out;
+}
+
+// Undirected adjacency (name → [neighbour names]) — used by clustering and neighbourhood queries.
+fn _undirected_adj(kg) {
+    let names = _all_names(kg);
+    let adj = map{};
+    let i = 0; while i < len(names) { adj[names[i]] = []; i = i + 1; }
+    let e = 0;
+    while e < len(kg.edges) {
+        let ed = kg.edges[e];
+        push(adj[ed.src], ed.dst);
+        push(adj[ed.dst], ed.src);
+        e = e + 1;
+    }
+    return adj;
+}
+
+// Outgoing links from a note (what it references).
+fn outlinks(kg, name) {
+    let out = []; let e = 0;
+    while e < len(kg.edges) { if kg.edges[e].src == name { push(out, kg.edges[e].dst); } e = e + 1; }
+    return out;
+}
+// BACKLINKS — every note that references `name` (Obsidian's most-loved feature).
+fn backlinks(kg, name) {
+    let out = []; let e = 0;
+    while e < len(kg.edges) { if kg.edges[e].dst == name { push(out, kg.edges[e].src); } e = e + 1; }
+    return out;
+}
+// Combined degree = links in + links out (a note's connectedness).
+fn degree(kg, name) { return len(outlinks(kg, name)) + len(backlinks(kg, name)); }
+
+// ── community detection (graphify clustering) ─────────────────────────────────
+// Connected components over the undirected graph: notes that reference each other cluster together.
+// Returns { assign: name → community-id, count: N }.
+fn communities(kg) {
+    let names = _all_names(kg);
+    let adj = _undirected_adj(kg);
+    let comp = map{};
+    let cid = 0;
+    let k = 0;
+    while k < len(names) {
+        let start = names[k];
+        if not map_has(comp, start) {
+            let queue = [start]; comp[start] = cid;
+            let qi = 0;
+            while qi < len(queue) {
+                let cur = queue[qi];
+                let nb = adj[cur];
+                let m = 0;
+                while m < len(nb) {
+                    if not map_has(comp, nb[m]) { comp[nb[m]] = cid; push(queue, nb[m]); }
+                    m = m + 1;
+                }
+                qi = qi + 1;
+            }
+            cid = cid + 1;
+        }
+        k = k + 1;
+    }
+    return map{ assign: comp, count: cid };
+}
+
+// ── queries ───────────────────────────────────────────────────────────────────
+// BFS neighbourhood from `start` out to `depth` hops → [{name, dist}] in visit order (graphify's
+// "broad context" query: everything reachable within N steps, nearest first).
+fn query(kg, start, depth) {
+    let adj = _undirected_adj(kg);
+    if not map_has(adj, start) { return []; }
+    let dist = map{}; dist[start] = 0;
+    let queue = [start];
+    let out = [ map{ name: start, dist: 0 } ];
+    let qi = 0;
+    while qi < len(queue) {
+        let cur = queue[qi];
+        let d = dist[cur];
+        if d < depth {
+            let nb = adj[cur];
+            let m = 0;
+            while m < len(nb) {
+                if not map_has(dist, nb[m]) {
+                    dist[nb[m]] = d + 1;
+                    push(queue, nb[m]);
+                    push(out, map{ name: nb[m], dist: d + 1 });
+                }
+                m = m + 1;
+            }
+        }
+        qi = qi + 1;
+    }
+    return out;
+}
+
+// Shortest path between two concepts (BFS with parent tracking) → [names] inclusive, or nil if none.
+fn shortest_path(kg, a, b) {
+    let adj = _undirected_adj(kg);
+    if not map_has(adj, a) or not map_has(adj, b) { return nil; }
+    if a == b { return [a]; }
+    let parent = map{}; parent[a] = a;
+    let queue = [a]; let qi = 0;
+    while qi < len(queue) {
+        let cur = queue[qi];
+        let nb = adj[cur];
+        let m = 0;
+        while m < len(nb) {
+            if not map_has(parent, nb[m]) {
+                parent[nb[m]] = cur;
+                if nb[m] == b {
+                    // reconstruct path b → a, then reverse
+                    let rev = [b]; let node = b;
+                    while node != a { node = parent[node]; push(rev, node); }
+                    let path = []; let r = len(rev) - 1;
+                    while r >= 0 { push(path, rev[r]); r = r - 1; }
+                    return path;
+                }
+                push(queue, nb[m]);
+            }
+            m = m + 1;
+        }
+        qi = qi + 1;
+    }
+    return nil;
+}
+
+// Top-k most connected notes (hubs) → [{name, degree}] sorted descending, selection-style.
+fn hubs(kg, k) {
+    let names = _all_names(kg);
+    let scored = [];
+    let i = 0;
+    while i < len(names) { push(scored, map{ name: names[i], degree: degree(kg, names[i]) }); i = i + 1; }
+    // selection sort for the top-k (k is small; keeps it dependency-free)
+    let out = [];
+    let taken = map{};
+    let picks = k; if picks > len(scored) { picks = len(scored); }
+    let p = 0;
+    while p < picks {
+        let best = -1; let bestdeg = -1;
+        let j = 0;
+        while j < len(scored) {
+            if not map_has(taken, str(j)) and scored[j].degree > bestdeg { bestdeg = scored[j].degree; best = j; }
+            j = j + 1;
+        }
+        taken[str(best)] = true;
+        push(out, scored[best]);
+        p = p + 1;
+    }
+    return out;
+}
+
+// Notes with no links in or out (Obsidian's "orphans" pane).
+fn orphans(kg) {
+    let out = []; let i = 0;
+    while i < len(kg.order) { if degree(kg, kg.order[i]) == 0 { push(out, kg.order[i]); } i = i + 1; }
+    return out;
+}
+// Link targets that have no note of their own (Obsidian's "unresolved links").
+fn unresolved(kg) {
+    let out = []; let seen = map{}; let e = 0;
+    while e < len(kg.edges) {
+        let d = kg.edges[e].dst;
+        if not map_has(kg.notes, d) and not map_has(seen, d) { seen[d] = true; push(out, d); }
+        e = e + 1;
+    }
+    return out;
+}
+
+// ── outputs ───────────────────────────────────────────────────────────────────
+// Render one note as Obsidian markdown: its body verbatim (so [[wikilinks]] stay clickable) plus an
+// auto-generated Backlinks section — exactly what graphify writes into a vault.
+fn note_markdown(kg, name) {
+    let has_note = map_has(kg.notes, name);
+    let content = ""; if has_note { content = kg.notes[name].content; }
+    // add an H1 title only if the body doesn't already start with a markdown heading (so re-graphifying
+    // a vault in place stays clean — no stacked "# Title # Title").
+    let md = "";
+    if not (len(content) > 0 and strcharcodeat(content, 0) == 35) { md = "# " + name + "\n\n"; }
+    if has_note { md = md + content + "\n"; }
+    else { md = md + "> (unresolved link — no note yet)\n"; }
+    let back = backlinks(kg, name);
+    if len(back) > 0 {
+        md = md + "\n## Backlinks\n";
+        let i = 0;
+        while i < len(back) { md = md + "- [[" + back[i] + "]]\n"; i = i + 1; }
+    }
+    return md;
+}
+
+// The whole vault as { note-name → markdown }.
+fn to_vault(kg) {
+    let vault = map{};
+    let names = _all_names(kg);
+    let i = 0;
+    while i < len(names) { vault[names[i]] = note_markdown(kg, names[i]); i = i + 1; }
+    return vault;
+}
+
+// GraphRAG-ready JSON: { nodes:[{id,resolved,degree,community}], edges:[{source,target}] }.
+fn to_json(kg) {
+    let cm = communities(kg);
+    let names = _all_names(kg);
+    let nodes = [];
+    let i = 0;
+    while i < len(names) {
+        let nm = names[i];
+        push(nodes, map{ id: nm, resolved: map_has(kg.notes, nm), degree: degree(kg, nm), community: cm.assign[nm] });
+        i = i + 1;
+    }
+    let edges = [];
+    let e = 0;
+    while e < len(kg.edges) { push(edges, map{ source: kg.edges[e].src, target: kg.edges[e].dst }); e = e + 1; }
+    return json_stringify(map{ nodes: nodes, edges: edges, communities: cm.count });
+}
+
+// Plain-language GRAPH_REPORT.md — what graphify prints so a human can grok the corpus at a glance.
+fn report(kg) {
+    let cm = communities(kg);
+    let names = _all_names(kg);
+    let top = hubs(kg, 5);
+    let orph = orphans(kg);
+    let unres = unresolved(kg);
+    let r = "# Graph Report\n\n";
+    r = r + "- Notes: " + str(len(kg.order)) + "\n";
+    r = r + "- Nodes (incl. unresolved): " + str(len(names)) + "\n";
+    r = r + "- Links: " + str(len(kg.edges)) + "\n";
+    r = r + "- Communities: " + str(cm.count) + "\n";
+    r = r + "- Orphans: " + str(len(orph)) + "\n";
+    r = r + "- Unresolved links: " + str(len(unres)) + "\n\n";
+    r = r + "## Hubs (most connected)\n";
+    let i = 0;
+    while i < len(top) { r = r + str(i + 1) + ". " + top[i].name + " (degree " + str(top[i].degree) + ")\n"; i = i + 1; }
+    if len(unres) > 0 {
+        r = r + "\n## Unresolved links\n";
+        let u = 0; while u < len(unres) { r = r + "- " + unres[u] + "\n"; u = u + 1; }
+    }
+    return r;
+}
+
+// Write the full vault to `dir`: one <note>.md per node, plus GRAPH_REPORT.md and graph.json. Returns
+// the number of files written. (Directory is assumed to exist / be creatable by fs_write.)
+fn write_vault(kg, dir) {
+    let vault = to_vault(kg);
+    let names = map_keys(vault);
+    let count = 0;
+    let i = 0;
+    while i < len(names) {
+        fs_write(dir + "/" + names[i] + ".md", vault[names[i]]);
+        count = count + 1;
+        i = i + 1;
+    }
+    fs_write(dir + "/GRAPH_REPORT.md", report(kg));
+    fs_write(dir + "/graph.json", to_json(kg));
+    return count + 2;
+}
+
+export kg_new, parse_links, add_note, build,
+       outlinks, backlinks, degree, communities,
+       query, shortest_path, hubs, orphans, unresolved,
+       note_markdown, to_vault, to_json, report, write_vault;

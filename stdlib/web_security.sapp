@@ -1,0 +1,210 @@
+// stdlib/web_security.sapp — a batteries-included WEB HARDENING layer for pblang sites.
+//
+// Three jobs, one import:
+//   1. SECURITY HEADERS — the full set that scores A+ on securityheaders.com / Mozilla Observatory:
+//      CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy,
+//      Cross-Origin-Opener/Embedder/Resource-Policy, and removal of Server/X-Powered-By leaks.
+//   2. SCRAPER / BOT SHIELD — blocks automated harvesters (known bad user-agents, missing UA,
+//      honeypot paths, and abusive request rates) WITHOUT blocking real people. Viewing source in a
+//      browser is a human action and is never blocked (see the note on "view source" below).
+//   3. RATE GUARD — a per-client token bucket that answers 429 + Retry-After under flood.
+//
+// Everything operates on plain req/res maps, so it composes with stdlib/web_framework.sapp and is
+// fully testable with `web.handle(app, req)` — no socket required.
+//
+//   let web = import("stdlib:web_framework.sapp");
+//   let sec = import("stdlib:web_security.sapp");
+//   let app = web.create_app(map{});
+//   web.get(app, "/", fn(ctx) { return ctx.html("<h1>hi</h1>"); });
+//   let handle = sec.secure(app, sec.strict());       // installs shields + returns a hardened handler
+//   let res = handle(map{ method: "GET", path: "/", headers: map{ "user-agent": "Mozilla/5.0" }, body: "" });
+//
+// ── On "letting people view source" ──────────────────────────────────────────────────────────────
+// You CANNOT cryptographically stop a human from reading HTML/CSS/JS their own browser downloaded —
+// and pblang deliberately does not ship user-hostile anti-debugging tricks (they break accessibility
+// and screen readers, and only inconvenience honest users). The RIGHT model, which pblang makes easy:
+// keep real logic SERVER-SIDE or compiled to a .wasm binary (see demo/wasm) so "view source" shows a
+// tiny loader, not your algorithm; and stop AUTOMATED bulk copying with the scraper shield below. So
+// a curious programmer can always inspect the page (allow_view_source defaults true), while a scraper
+// farm gets a 403. That is both honest and effective.
+
+let fw = import("stdlib:web_framework.sapp");
+
+// ── header helpers ────────────────────────────────────────────────────────────────────────────────
+fn _get_ci(headers, name) {                       // case-insensitive header lookup
+    if headers == nil { return nil; }
+    let want = str_lower(name); let ks = map_keys(headers); let i = 0;
+    while i < len(ks) { if str_lower(ks[i]) == want { return headers[ks[i]]; } i = i + 1; }
+    return nil;
+}
+
+// default option set. Override any field; helpers strict()/relaxed() below give tuned presets.
+fn defaults() {
+    return map{
+        // CSP: lock everything to same-origin by default; no inline scripts (the strongest common policy).
+        csp: "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+        hsts_max_age: 63072000,                    // 2 years
+        hsts_preload: true,                        // eligible for the browser preload list
+        hsts_subdomains: true,
+        frame: "DENY",                             // clickjacking protection (X-Frame-Options)
+        referrer: "strict-origin-when-cross-origin",
+        permissions: "geolocation=(), microphone=(), camera=(), payment=(), usb=()",
+        coop: "same-origin",                       // cross-origin isolation trio
+        coep: "require-corp",
+        corp: "same-origin",
+        nosniff: true,                             // X-Content-Type-Options: nosniff
+        hide_server: true,                         // strip Server / X-Powered-By fingerprints
+        allow_view_source: true,                   // never inject anti-inspection junk (see note above)
+        // scraper shield
+        block_bots: true,
+        require_user_agent: true,                  // empty/missing UA is a strong scraper signal
+        honeypots: ["/wp-admin", "/wp-login.php", "/.env", "/.git/config", "/admin.php", "/phpmyadmin"],
+        extra_bad_agents: [],                      // caller can add more substrings to block
+        // rate guard (token bucket per client key)
+        rate_enabled: true,
+        rate_burst: 60,                            // tokens in the bucket
+        rate_per_sec: 10                           // refill rate
+    };
+}
+fn strict() { return defaults(); }
+fn relaxed() {                                     // for public sites that embed cross-origin media/CDNs
+    let o = defaults();
+    o.csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; frame-ancestors 'self'";
+    o.coep = nil;                                  // don't demand cross-origin isolation
+    o.frame = "SAMEORIGIN";
+    o.rate_burst = 240; o.rate_per_sec = 40;
+    return o;
+}
+
+// security_headers(opts) → the header map to attach to every response.
+fn security_headers(opts = nil) {
+    if opts == nil { opts = defaults(); }
+    let h = map{};
+    if opts.csp != nil { h["Content-Security-Policy"] = opts.csp; }
+    let sts = "max-age=" + str(opts.hsts_max_age);
+    if try opts.hsts_subdomains catch false { sts = sts + "; includeSubDomains"; }
+    if try opts.hsts_preload catch false { sts = sts + "; preload"; }
+    h["Strict-Transport-Security"] = sts;
+    if opts.frame != nil { h["X-Frame-Options"] = opts.frame; }
+    if try opts.nosniff catch false { h["X-Content-Type-Options"] = "nosniff"; }
+    if opts.referrer != nil { h["Referrer-Policy"] = opts.referrer; }
+    if opts.permissions != nil { h["Permissions-Policy"] = opts.permissions; }
+    if opts.coop != nil { h["Cross-Origin-Opener-Policy"] = opts.coop; }
+    if opts.coep != nil { h["Cross-Origin-Embedder-Policy"] = opts.coep; }
+    if opts.corp != nil { h["Cross-Origin-Resource-Policy"] = opts.corp; }
+    return h;
+}
+
+// harden(res, opts) → response with security headers merged in (existing headers WIN, so a route can
+// intentionally override, e.g. a page that needs a looser CSP). Also strips fingerprint headers.
+fn harden(res, opts = nil) {
+    if opts == nil { opts = defaults(); }
+    if not is_map(res) { res = map{ status: 200, body: str(res) }; }
+    let existing = try res.headers catch nil; if existing == nil { existing = map{}; }
+    let sech = security_headers(opts);
+    let merged = map{};
+    let sk = map_keys(sech); let i = 0;
+    while i < len(sk) { merged[sk[i]] = sech[sk[i]]; i = i + 1; }
+    let ek = map_keys(existing); i = 0;
+    while i < len(ek) { merged[ek[i]] = existing[ek[i]]; i = i + 1; }   // caller's headers override defaults
+    if try opts.hide_server catch false {
+        let dk = map_keys(merged); i = 0;
+        while i < len(dk) { let lk = str_lower(dk[i]); if lk == "server" or lk == "x-powered-by" { merged[dk[i]] = nil; } i = i + 1; }
+    }
+    res.headers = merged;
+    return res;
+}
+
+// ── scraper / bot shield ────────────────────────────────────────────────────────────────────────
+// Substrings matched case-insensitively against the User-Agent. These are AUTOMATED harvesters and
+// headless/library clients — NOT real browsers. Real browser UAs contain "mozilla" and pass.
+fn _bad_agents() {
+    return ["python-requests", "scrapy", "httrack", "wget", "curl", "libwww", "java/", "go-http-client",
+            "okhttp", "aiohttp", "python-urllib", "node-fetch", "axios", "phantomjs", "headlesschrome",
+            "puppeteer", "playwright", "selenium", "bytespider", "gptbot", "ccbot", "claudebot",
+            "dataforseo", "semrushbot", "ahrefsbot", "mj12bot", "dotbot", "petalbot", "megaindex",
+            "masscan", "nmap", "nikto", "sqlmap", "zgrab", "harvest", "extractor", "scraper", "spider"];
+}
+// classify(req, opts) → nil if allowed, else { reason, status }. Pure — used by shield() and tests.
+fn classify(req, opts = nil) {
+    if opts == nil { opts = defaults(); }
+    if not (try opts.block_bots catch true) { return nil; }
+    let headers = try req.headers catch map{};
+    let path = str_lower(try req.path catch (try req.raw_path catch ""));
+    // honeypot paths: only bots probe these; instant block.
+    let hp = try opts.honeypots catch []; let i = 0;
+    while i < len(hp) { if str_index_of(path, str_lower(hp[i])) == 0 { return map{ reason: "honeypot", status: 403 }; } i = i + 1; }
+    let ua = _get_ci(headers, "user-agent");
+    if ua == nil or ua == "" {
+        if try opts.require_user_agent catch true { return map{ reason: "missing-user-agent", status: 403 }; }
+        return nil;
+    }
+    let lua = str_lower(ua);
+    if str_index_of(lua, "mozilla") == 0 { return nil; }   // real browsers lead with Mozilla/… → allow (incl. View Source)
+    let bad = _bad_agents(); let extra = try opts.extra_bad_agents catch []; i = 0;
+    while i < len(extra) { push(bad, str_lower(extra[i])); i = i + 1; }
+    i = 0;
+    while i < len(bad) { if str_index_of(lua, bad[i]) >= 0 { return map{ reason: "bot-user-agent:" + bad[i], status: 403 }; } i = i + 1; }
+    return nil;
+}
+// shield(opts) → middleware: 403 for scrapers, nil (continue) for humans.
+fn shield(opts = nil) {
+    if opts == nil { opts = defaults(); }
+    return fn(req) {
+        let v = classify(req, opts);
+        if v == nil { return nil; }
+        return map{ status: v.status, body: "Forbidden", content_type: "text/plain",
+                    headers: map{ "X-Blocked-Reason": v.reason } };
+    };
+}
+
+// ── rate guard (per-client token bucket) ──────────────────────────────────────────────────────────
+fn _client_key(req) {                              // best-effort client identity for rate limiting
+    let h = try req.headers catch map{};
+    let xff = _get_ci(h, "x-forwarded-for");
+    if xff != nil and xff != "" { let c = str_index_of(xff, ","); if c > 0 { return str_trim(str_slice(xff, 0, c)); } return str_trim(xff); }
+    let rip = _get_ci(h, "x-real-ip"); if rip != nil and rip != "" { return rip; }
+    let ra = try req.remote_addr catch nil; if ra != nil { return str(ra); }
+    return "unknown";
+}
+// rate_guard(opts) → stateful middleware. Bucket state lives in a closed-over map keyed by client.
+fn rate_guard(opts = nil) {
+    if opts == nil { opts = defaults(); }
+    if not (try opts.rate_enabled catch true) { return fn(req) { return nil; }; }
+    let burst = opts.rate_burst; let rate = opts.rate_per_sec;
+    let buckets = map{};
+    return fn(req) {
+        let key = _client_key(req);
+        let now = now_ms();
+        let b = try buckets[key] catch nil;
+        if b == nil { b = map{ tokens: burst, ts: now }; }
+        let elapsed = (now - b.ts) / 1000.0;
+        b.tokens = b.tokens + elapsed * rate; if b.tokens > burst { b.tokens = burst; }
+        b.ts = now;
+        if b.tokens < 1.0 {
+            let wait = num_ceil((1.0 - b.tokens) / rate);
+            buckets[key] = b;
+            return map{ status: 429, body: "Too Many Requests", content_type: "text/plain",
+                        headers: map{ "Retry-After": str(wait), "X-Blocked-Reason": "rate-limit" } };
+        }
+        b.tokens = b.tokens - 1.0; buckets[key] = b;
+        return nil;
+    };
+}
+
+// ── one-call install ───────────────────────────────────────────────────────────────────────────
+// secure(app, opts) → registers the shields as global middleware and returns a HANDLE FUNCTION that
+// runs the app and hardens every response with security headers. Use the returned function in place
+// of web.handle / your socket loop's dispatch.
+fn secure(app, opts = nil) {
+    if opts == nil { opts = defaults(); }
+    fw.use(app, shield(opts));
+    fw.use(app, rate_guard(opts));
+    return fn(req) {
+        let res = fw.handle(app, req);
+        return harden(res, opts);
+    };
+}
+
+export defaults, strict, relaxed, security_headers, harden,
+       classify, shield, rate_guard, secure;

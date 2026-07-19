@@ -58,6 +58,28 @@ We expose `gc_collect()` as a pragmatic “cleanup” builtin:
 This is not a full moving GC heap; it’s a safe, incremental way to eliminate the most common RC-cycle leaks
 while pblang still uses `Rc` for object lifetimes.
 
+## Bounded pblang allocation policies
+
+`stdlib:memory_safety.sapp` supplies runtime-owned boxes, borrow guards,
+checked slices, and bounded arenas. `bounded_arena(name, max_allocations,
+max_units)` rejects work before allocation when either quota is exhausted.
+Callers define units as bytes, tokens, nodes, pixels, packets, or another
+quantity because the language cannot infer the retained deep byte size of an
+arbitrary object graph. `arena_checkpoint` and `arena_rewind` release
+speculative allocations in reverse order, while `arena_drop_all` removes the
+arena's retained owner records as it deallocates them.
+
+`stdlib:resource_budget.sapp` adds overflow-safe multi-resource admission and
+mutable ledgers. `ledger_reserve` returns complete diagnostics;
+`ledger_try_reserve` is the lower-allocation boolean hot path. Both reject
+unknown metrics and leave ledger state unchanged after rejection.
+
+These are runtime policies, not a proof of memory safety for every device.
+FFI/native libraries, generated syscalls, kernel drivers, DMA, firmware, and
+physical hardware remain external trust boundaries. Device operations should
+also use capability isolation and the fail-closed policies in
+`stdlib:device.sapp`.
+
 ## Next step options
 
 ### Option A: RC-first, cycle breaker later

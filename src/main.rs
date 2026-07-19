@@ -26,7 +26,7 @@ fn mask_for_parse_or_exit(src: &str, label: Option<&str>) -> String {
     strip_comments_mask(src)
 }
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 mod cli;
@@ -1108,6 +1108,7 @@ fn show_help() {
     println!("                          terminal panel needs exec); aliases: -ide, ide. Override path with PBLANG_IDE.");
     println!("  pblang run [file.sapp|file.bpx|dir] [--allow-*] [--deny-*] [--allow-all|--sandbox] [-- script-args...]");
     println!("                          Execute a script, or run the package entry from a manifest dir/current dir.");
+    println!("  pblang <file.sapp|file.bpx|dir> ...  Short alias for `pblang run ...`; never enters the REPL.");
     println!("                          Capability flags (all default to: fs+net+http+sqlite+spawn+gfx+core ON, exec+ffi OFF):");
     println!("                            --allow-exec    Enable proc_spawn_wait / exec / polyglot_exec*");
     println!("                            --allow-ffi     Enable ffi_load / ffi_call_typed / polyglot_compile_cached");
@@ -1571,8 +1572,60 @@ fn main() {
     }
 }
 
+fn is_bare_runnable_path(arg: &str) -> bool {
+    let path = Path::new(arg);
+    if path.is_dir() {
+        return true;
+    }
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("sap") | Some("sapp") | Some("bpx") | Some("pbck")
+    )
+}
+
+fn is_capability_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--allow-exec"
+            | "--allow-ffi"
+            | "--allow-net"
+            | "--allow-fs"
+            | "--allow-http"
+            | "--allow-sqlite"
+            | "--allow-spawn"
+            | "--allow-gfx"
+            | "--allow-env"
+            | "--deny-exec"
+            | "--deny-ffi"
+            | "--deny-net"
+            | "--deny-fs"
+            | "--deny-http"
+            | "--deny-sqlite"
+            | "--deny-spawn"
+            | "--deny-gfx"
+            | "--deny-env"
+            | "--allow-all"
+            | "--sandbox"
+            | "--mem-report"
+    )
+}
+
+fn normalize_bare_run(mut args: Vec<String>) -> Vec<String> {
+    let path_arg = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .find(|arg| !is_capability_flag(arg));
+    if path_arg
+        .map(|arg| is_bare_runnable_path(arg))
+        .unwrap_or(false)
+    {
+        args.insert(0, "run".to_string());
+    }
+    args
+}
+
 fn run_cli() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = normalize_bare_run(std::env::args().skip(1).collect());
     if matches!(
         args.first().map(|s| s.as_str()),
         Some("--help") | Some("-h") | Some("help")
@@ -2227,7 +2280,12 @@ fn legacy_dispatch(args: Vec<String>) {
         match locate_ide() {
             Some(script) => {
                 if let Some(root) = script.ancestors().nth(3) {
-                    let _ = std::env::set_current_dir(root);
+                    if let Err(e) = std::env::set_current_dir(root) {
+                        eprintln!(
+                            "pblang --ide: warning: could not chdir to repo root {}: {e}\n  stdlib imports may fail to resolve; continuing with current directory.",
+                            root.display()
+                        );
+                    }
                 }
                 let mut run_args = vec!["run".to_string(), "editors/ide/pbide.sapp".to_string()];
                 let mut saw_caps = false;
@@ -4627,6 +4685,55 @@ fn legacy_dispatch(args: Vec<String>) {
             eprintln!("pblang compile: cannot find '{}': {e}", args[1]);
             std::process::exit(1);
         });
+        // Pure-pblang cross backends: `--target arm64|aarch64|wasm` delegates to the SELF-HOSTED
+        // compiler driver (tools/pbc.sapp) — those code generators are written in pblang itself
+        // (stdlib/codegen_arm64_ast.sapp, stdlib/codegen_wasm.sapp). One first-class command,
+        // three architectures. Found via $PBLANG_PBC, the cwd, or the repo the binary lives in.
+        if let Some(t) = args
+            .iter()
+            .position(|a| a == "--target")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+        {
+            if matches!(t, "arm64" | "aarch64" | "wasm") {
+                let tgt = if t == "aarch64" { "arm64" } else { t };
+                let pbc = std::env::var("PBLANG_PBC")
+                    .ok()
+                    .map(PathBuf::from)
+                    .filter(|p| p.exists())
+                    .or_else(|| Some(cwd.join("tools/pbc.sapp")).filter(|p| p.exists()))
+                    .or_else(|| {
+                        std::env::current_exe().ok().and_then(|exe| {
+                            exe.ancestors()
+                                .map(|a| a.join("tools/pbc.sapp"))
+                                .find(|p| p.exists())
+                        })
+                    });
+                let Some(pbc) = pbc else {
+                    eprintln!(
+                        "pblang compile: --target {tgt} needs the self-hosted driver tools/pbc.sapp \
+                         (run from the pblang repo or set PBLANG_PBC)"
+                    );
+                    std::process::exit(1);
+                };
+                let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pblang"));
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("run")
+                    .arg(&pbc)
+                    .arg(&script_path)
+                    .arg("--target")
+                    .arg(tgt);
+                if let Some(o) = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1))
+                {
+                    cmd.arg("--out").arg(o);
+                }
+                let status = cmd.status().unwrap_or_else(|e| {
+                    eprintln!("pblang compile: failed to launch the self-hosted driver: {e}");
+                    std::process::exit(1);
+                });
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
         let default_out = if cfg!(windows) { "a.exe" } else { "a.out" };
         let out_name = args
             .iter()
@@ -5000,10 +5107,20 @@ fn legacy_dispatch(args: Vec<String>) {
     // do FFI/polyglot work, e.g. `pblang --allow-exec --allow-ffi`.
     let mut repl_args = args;
     let repl_cfg = parse_capability_flags(&mut repl_args);
+    if let Some(arg) = repl_args.first() {
+        eprintln!("pblang: unrecognized command or non-runnable path '{arg}'");
+        eprintln!("hint: use `pblang run <file>` or pass a .sap/.sapp/.bpx/.pbck path directly");
+        std::process::exit(2);
+    }
     let mut vm = VM::with_stdlib(repl_cfg);
 
-    println!("Welcome to pblang REPL!");
-    println!("Type 'help' for commands.");
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal() && io::stdout().is_terminal();
+    let mut stdin = stdin.lock();
+    if interactive {
+        println!("Welcome to pblang REPL!");
+        println!("Type 'help' for commands.");
+    }
 
     let mut buf = String::new();
     let mut brace_depth: i32 = 0;
@@ -5012,18 +5129,21 @@ fn legacy_dispatch(args: Vec<String>) {
     let mut block_comment_depth: i32 = 0;
 
     loop {
-        if buf.is_empty() {
-            print!("> ");
-        } else {
-            print!("... ");
-        }
-        if io::stdout().flush().is_err() {
-            break;
+        if interactive {
+            if buf.is_empty() {
+                print!("> ");
+            } else {
+                print!("... ");
+            }
+            if io::stdout().flush().is_err() {
+                break;
+            }
         }
 
         let mut line = String::new();
-        if io::stdin().read_line(&mut line).is_err() {
-            break;
+        match stdin.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
 
         let trimmed_end = line.trim_end();

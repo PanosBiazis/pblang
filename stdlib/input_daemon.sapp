@@ -1,0 +1,125 @@
+// stdlib/input_daemon.sapp -- authenticated, bounded local input service.
+//
+// This module owns transport authentication, replay protection, framing and
+// quotas. The caller supplies the actuator, keeping policy/approval separate
+// from transport. Only loopback listeners are accepted.
+
+let Events = import("stdlib:input_events.sapp");
+
+let FORMAT = "pblang.input-daemon.request.v1";
+let RESPONSE_FORMAT = "pblang.input-daemon.response.v1";
+
+fn _int(value, low, high) {
+    if type(value) != "number" or num_floor(value) != value or value < low or value > high { return nil; }
+    return value;
+}
+
+fn _loopback(addr) {
+    return type(addr) == "string" and (str_starts_with(addr, "127.0.0.1:") or str_starts_with(addr, "[::1]:"));
+}
+
+fn _event_payload(e) {
+    if e.kind == "type" { return "type:" + str(len(e.text)) + ":" + e.text; }
+    if e.kind == "key" { return "key:" + str(len(e.key)) + ":" + e.key; }
+    if e.kind == "click" { return "click:" + str(e.button); }
+    if e.kind == "pointer" { return "pointer:" + str(e.x) + ":" + str(e.y); }
+    return "pointer_delta:" + str(e.dx) + ":" + str(e.dy);
+}
+
+fn _signed_text(seq, event) {
+    return FORMAT + ":" + str(seq) + ":" + _event_payload(event);
+}
+
+fn new_state(token, options = nil) {
+    if type(token) != "string" or len(token) < 32 or len(token) > 4096 {
+        throw "input_daemon.new_state: token must contain 32..4096 characters";
+    }
+    let max_requests = 1024; let max_frame_chars = 16384;
+    if options != nil and is_map(options) {
+        if map_has(options, "max_requests") { max_requests = _int(options.max_requests, 1, 1000000); }
+        if map_has(options, "max_frame_chars") { max_frame_chars = _int(options.max_frame_chars, 256, 1048576); }
+    }
+    if max_requests == nil or max_frame_chars == nil { throw "input_daemon.new_state: invalid quota"; }
+    return map{ format: "pblang.input-daemon.state.v1", token: token, last_seq: -1,
+                requests: 0, rejected: 0, max_requests: max_requests,
+                max_frame_chars: max_frame_chars };
+}
+
+fn make_request(token, seq, event) {
+    if type(token) != "string" or len(token) < 32 { throw "input_daemon.make_request: weak token"; }
+    let n = _int(seq, 0, 9007199254740991); if n == nil { throw "input_daemon.make_request: invalid sequence"; }
+    let checked = Events.validate(event); if not checked.ok { throw checked.error; }
+    let e = checked.event;
+    return json_stringify(map{ format: FORMAT, seq: n, event: e,
+                               tag: hmac_sha256(_signed_text(n, e), token) });
+}
+
+fn verify_request(state, frame) {
+    if not is_map(state) or (try state.format catch "") != "pblang.input-daemon.state.v1" {
+        return map{ ok: false, error: "invalid daemon state" };
+    }
+    if type(frame) != "string" or len(frame) == 0 or len(frame) > state.max_frame_chars {
+        return map{ ok: false, error: "request frame is empty or exceeds quota" };
+    }
+    let req = try json_parse(str_trim(frame)) catch nil;
+    if not is_map(req) or (try req.format catch "") != FORMAT { return map{ ok: false, error: "invalid request envelope" }; }
+    let seq = _int(try req.seq catch nil, 0, 9007199254740991);
+    if seq == nil { return map{ ok: false, error: "invalid request sequence" }; }
+    if seq <= state.last_seq { return map{ ok: false, error: "replayed or out-of-order request" }; }
+    let checked = Events.validate(try req.event catch nil); if not checked.ok { return checked; }
+    let tag = try req.tag catch nil;
+    if type(tag) != "string" or len(tag) != 64 { return map{ ok: false, error: "invalid authentication tag" }; }
+    let expected = hmac_sha256(_signed_text(seq, checked.event), state.token);
+    if not constant_time_eq(tag, expected) { return map{ ok: false, error: "request authentication failed" }; }
+    return map{ ok: true, seq: seq, event: checked.event };
+}
+
+fn handle_frame(state, frame, actuator) {
+    if state.requests >= state.max_requests { return map{ ok: false, error: "daemon request quota exhausted" }; }
+    let verified = verify_request(state, frame);
+    if not verified.ok { state.rejected = state.rejected + 1; return verified; }
+
+    // Consume an authenticated sequence even if actuation fails. Retrying the
+    // same privileged command must never bypass replay protection.
+    state.last_seq = verified.seq; state.requests = state.requests + 1;
+    let result = try actuator(verified.event) catch nil;
+    if result == nil { return map{ ok: false, seq: verified.seq, error: "actuator failed" }; }
+    if is_map(result) and map_has(result, "ok") and not result.ok {
+        return map{ ok: false, seq: verified.seq, error: try result.error catch "actuator rejected request" };
+    }
+    return map{ ok: true, seq: verified.seq, event: verified.event.kind, result: result };
+}
+
+fn _response(result) {
+    return json_stringify(map{ format: RESPONSE_FORMAT, result: result }) + "\n";
+}
+
+// Serve a bounded number of sequential loopback connections. Set a high but
+// finite max_requests for a long-running service; process supervision remains
+// outside this module and can stop it without an in-protocol unauthenticated
+// shutdown command.
+fn serve(addr, state, actuator) {
+    if not _loopback(addr) { throw "input_daemon.serve: only loopback listeners are allowed"; }
+    let listener = tcp_listen(addr); let actual = tcp_local_addr(listener);
+    let served = 0;
+    while served < state.max_requests {
+        let socket = tcp_accept(listener);
+        let frame = try tcp_read_until(socket, "\n", state.max_frame_chars + 1) catch "";
+        let result = handle_frame(state, frame, actuator);
+        try tcp_write(socket, _response(result)) catch nil;
+        try tcp_close(socket) catch nil;
+        served = served + 1;
+    }
+    try tcp_close(listener) catch nil;
+    return map{ ok: true, address: actual, served: served, rejected: state.rejected };
+}
+
+fn status(state) {
+    return map{ format: "pblang.input-daemon.status.v1", requests: state.requests,
+                rejected: state.rejected, remaining: state.max_requests - state.requests,
+                last_seq: state.last_seq, authenticated: true, replay_protected: true,
+                loopback_only: true };
+}
+
+export FORMAT, RESPONSE_FORMAT, new_state, make_request, verify_request,
+       handle_frame, serve, status;

@@ -1,0 +1,110 @@
+// tests/semantics/codegen_wasm_test.sapp — real pblang source → WebAssembly binary module, PROVED by
+// executing each module in a REAL wasm engine (node's V8) and checking main()'s i64 result. Complements
+// the ARM64 port (where an in-pblang interpreter verifies): here the verifier is an independent,
+// production engine, so the module format AND the code are both externally validated.
+// Requires --allow-exec (spawns node). Skips (passes trivially) if node is not installed.
+
+let W = import("stdlib/codegen_wasm.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+
+let _probe = try proc_spawn_wait("node", ["--version"]) catch nil;
+let has_node = _probe != nil and str_index_of(try _probe.stdout catch "", "v") == 0;
+
+// one shared runner: provide env.print / env.print_str (harmless extras for import-free modules),
+// echo each printed line, then RET=<main()'s result> last.
+let runner = "const fs=require('fs');let mem=null;const dec=new TextDecoder();const env={print:v=>console.log(String(v)),print_str:(p,l)=>console.log(dec.decode(new Uint8Array(mem.buffer,p,l)))};WebAssembly.instantiate(fs.readFileSync(process.argv[2]),{env}).then(r=>{mem=r.instance.exports.memory;console.log('RET='+String(r.instance.exports.main()));}).catch(e=>{console.log('WASMERR '+e.message);});";
+if has_node { fs_write("pbwasm_run.js", runner); }
+
+fn runraw(src, tag) {   // → full stdout ("lines…\nRET=<v>") or nil when node is absent
+    let bytes = W.compile_wasm(src);
+    if bytes[0] != 0 or bytes[1] != 97 or bytes[2] != 115 or bytes[3] != 109 { fail(tag + ": bad wasm magic"); }
+    if not has_node { return nil; }
+    let path = "pbwasm_" + tag + ".wasm";
+    fs_write_bytes(path, bytes);
+    let r = proc_spawn_wait("node", ["pbwasm_run.js", path]);
+    fs_remove(path);
+    let out = str_trim(try r.stdout catch "");
+    if str_index_of(out, "WASMERR") >= 0 { fail(tag + ": engine rejected/trapped: " + out); }
+    return out;
+}
+fn eq(src, want, tag) {
+    let out = runraw(src, tag);
+    if out == nil { return nil; }                     // node absent → format-only check
+    let idx = str_index_of(out, "RET=");
+    if idx < 0 { fail(tag + ": no RET (<<" + out + ">>)"); }
+    let g = parse_number(str_trim(str_slice(out, idx + 4, len(out))));
+    if g != want { fail(tag + ": got " + str(g) + " want " + str(want)); }
+}
+fn eqout(src, want, tag) {                            // compare the full printed output + return marker
+    let out = runraw(src, tag);
+    if out == nil { return nil; }
+    if out != want { fail(tag + ": got <<" + out + ">> want <<" + want + ">>"); }
+}
+
+// ── constants + arithmetic ──
+eq("fn main() { return 42; }",                                       42, "const");
+eq("fn main() { return 2 + 3 * 4; }",                                14, "precedence");
+eq("fn main() { return (2 + 3) * 4; }",                              20, "parens");
+eq("fn main() { return 7 / 2; }",                                     3, "div trunc");
+eq("fn main() { return 17 % 5; }",                                    2, "rem");
+eq("fn main() { return 0 - 9 + 4; }",                             0 - 5, "negative result");
+
+// ── locals ──
+eq("fn main() { let x = 6; let y = 7; return x * y; }",              42, "locals");
+eq("fn main() { let x = 1; x = x + 41; return x; }",                 42, "assign");
+
+// ── comparisons as values, and/or ──
+eq("fn main() { return 3 < 5; }",                                     1, "lt true");
+eq("fn main() { return 5 < 3; }",                                     0, "lt false");
+eq("fn main() { return (3 < 5) + (2 == 2) + (4 != 4); }",             2, "cmp values sum");
+eq("fn main() { return 1 and 2; }",                                   1, "and truthy");
+eq("fn main() { return 0 or 3; }",                                    1, "or rhs");
+eq("fn main() { let x = 0; return (x != 0) and (10 / x > 1); }",      0, "and short-circuits (no div-by-0 trap)");
+
+// ── control flow ──
+eq("fn main() { if 1 < 2 { return 10; } return 20; }",               10, "if taken");
+eq("fn main() { if 2 < 1 { return 10; } return 20; }",               20, "if not taken");
+eq("fn main() { let n = 5; if n < 2 { return 1; } elif n < 4 { return 2; } elif n < 6 { return 3; } else { return 4; } }", 3, "elif chain");
+eq("fn main() { let i = 0; let s = 0; while i < 10 { s = s + i; i = i + 1; } return s; }", 45, "while sum");
+eq("fn main() { let i = 0; let s = 0; while i < 5 { let j = 0; while j < 5 { s = s + 1; j = j + 1; } i = i + 1; } return s; }", 25, "nested while");
+
+// ── functions, calls, recursion ──
+eq("fn sq(x) { return x * x; } fn main() { return sq(9); }",          81, "call");
+eq("fn madd(a, b, c) { return a * b + c; } fn main() { return madd(6, 7, 0); }", 42, "multi-arg");
+eq("fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fn main() { return fib(10); }", 55, "recursion fib");
+eq("fn fact(n) { if n < 2 { return 1; } return n * fact(n - 1); } fn main() { return fact(5); }", 120, "recursion fact");
+eq("fn gcd(a, b) { if b == 0 { return a; } return gcd(b, a % b); } fn main() { return gcd(48, 36); }", 12, "recursion gcd");
+eq("fn even(n) { if n == 0 { return 1; } return odd(n - 1); } fn odd(n) { if n == 0 { return 0; } return even(n - 1); } fn main() { return even(10); }", 1, "mutual recursion");
+
+// ── print: numbers via env.print, string literals via env.print_str + linear-memory data segment ──
+eqout("fn main() { print 42; return 0; }",                            "42\nRET=0", "print number");
+eqout("fn main() { print 1 + 2 * 3; print 0 - 8; return 1; }",   "7\n-8\nRET=1", "print exprs incl negative");
+eqout("fn main() { print \"hello from pblang\"; return 0; }", "hello from pblang\nRET=0", "print string literal");
+eqout("fn main() { print \"a\"; print 5; print \"b\"; return 0; }", "a\n5\nb\nRET=0", "mixed string and number prints");
+eqout("let i = 1; while i <= 5 { print i * i; i = i + 1; }", "1\n4\n9\n16\n25\nRET=0", "top-level print loop (squares)");
+eqout("fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fn main() { print \"fib:\"; let k = 0; while k < 8 { print fib(k); k = k + 1; } return 0; }", "fib:\n0\n1\n1\n2\n3\n5\n8\n13\nRET=0", "fib sequence with header");
+
+// ── heap strings: values, concat, str(), len, ==, params/returns (linear-memory bump allocator) ──
+eqout("fn main() { let s = \"hi\"; print s; return 0; }",                       "hi\nRET=0", "string local");
+eqout("fn main() { print \"a\" + \"b\" + \"c\"; return 0; }",                  "abc\nRET=0", "concat chain");
+eqout("fn main() { let s = \"go\"; s = s + \"!\"; print s; return 0; }",       "go!\nRET=0", "concat reassign");
+eqout("fn main() { print \"n = \" + str(42); return 0; }",                   "n = 42\nRET=0", "str() in concat");
+eqout("fn main() { print str(0); print str(0 - 987); return 0; }",         "0\n-987\nRET=0", "str() zero + negative");
+eq("fn main() { return len(\"hello\"); }",                                                5, "len literal");
+eq("fn main() { let s = \"ab\" + \"cde\"; return len(s); }",                              5, "len after concat");
+eq("fn main() { if \"abc\" == \"abc\" { return 1; } return 0; }",                         1, "streq true");
+eq("fn main() { if \"abc\" == \"abd\" { return 1; } return 0; }",                         0, "streq false");
+eq("fn main() { if \"ab\" != \"abc\" { return 1; } return 0; }",                          1, "strneq lengths");
+eqout("fn shout(name) { print \"hi \" + name; return 0; } fn main() { shout(\"ada\"); shout(\"bob\"); return 0; }", "hi ada\nhi bob\nRET=0", "string parameter");
+eqout("fn tag(n) { return \"#\" + str(n); } fn main() { print tag(7) + tag(8); return 0; }", "#7#8\nRET=0", "string-returning fn");
+eqout("fn sq(x) { return x * x; } let i = 1; while i <= 4 { print \"sq(\" + str(i) + \") = \" + str(sq(i)); i = i + 1; }", "sq(1) = 1\nsq(2) = 4\nsq(3) = 9\nsq(4) = 16\nRET=0", "greet-style loop (concat+str in loop)");
+eqout("fn main() { let s = \"\"; let i = 0; while i < 4 { s = s + str(i); i = i + 1; } print s; return len(s); }", "0123\nRET=4", "build string in loop");
+
+// ── entry convention: top-level statements are the program body ──
+eq("let a = 40; let b = 2; return a + b;",                            42, "top-level body");
+eq("fn f(x) { return x + 1; } let r = f(10); return r * 2;",          22, "top-level calls fn");
+
+if has_node { fs_remove("pbwasm_run.js"); }
+if has_node { print "codegen_wasm: real pblang source → wasm modules, executed by a REAL engine (node/V8), all correct"; }
+else { print "codegen_wasm: modules well-formed (node not installed — engine execution skipped)"; }

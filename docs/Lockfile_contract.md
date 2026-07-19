@@ -23,7 +23,7 @@
 
 ## What it does *not* guarantee (yet)
 
-- **Cross-machine reproducibility**: Paths in the lockfile are still absolute or environment-dependent. Rehydration makes registry/git entries more portable when their cached paths disappear, but the lockfile is not yet a full path-independent portability format.
+- **Cross-machine reproducibility**: Paths in the lockfile are still absolute or environment-dependent. Rehydration makes registry/git entries more portable when their cached paths disappear, but the lockfile is currently a runtime-aware portability format rather than a fully path-independent one.
 - **Registry versions**: Registry support adds version pins and checksums in the lockfile; semver solving and publish flow are separate.
 
 ## Commands

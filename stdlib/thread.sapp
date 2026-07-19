@@ -775,107 +775,479 @@ fn circuit_breaker(threshold, reset_ms) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 20. THREAD SUPERVISOR — tracked VM threads with timeout
+// 20. THREAD SUPERVISOR — bounded observation + cooperative cancellation
 // ─────────────────────────────────────────────────────────────────────────────
 
-// supervisor() → Supervisor — create a thread supervisor (like Erlang supervisor).
-//  supervisor.spawn(fn, timeout_ms) — spawn a tracked thread
-//  supervisor.spawn_with_args(fn, args, timeout_ms) — spawn with arguments
-//  supervisor.check(id) — check if thread is alive
-//  supervisor.kill_all() — stop all supervised threads
-//  supervisor.stats() — return {spawned, completed, timed_out, killed, active}
+let SUPERVISOR_DEFAULT_TIMEOUT_MS = 30000;
+let SUPERVISOR_MAX_TIMEOUT_MS = 3600000;
+let SUPERVISOR_MAX_TRACKED = 1024;
+let SUPERVISOR_MAX_REASON_BYTES = 256;
+
+fn _supervisor_callable(value) {
+    let kind = type(value);
+    return kind == "closure" or kind == "function" or kind == "fn" or kind == "builtin";
+}
+
+fn _supervisor_timeout(value) {
+    if value == nil { return SUPERVISOR_DEFAULT_TIMEOUT_MS; }
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or text == "+nan" or text == "-nan" or
+       text == "inf" or text == "+inf" or text == "-inf" or
+       text == "infinity" or text == "+infinity" or text == "-infinity" {
+        throw "thread.supervisor: timeout must be finite";
+    }
+    let timeout = try parse_number(text) catch nil;
+    if timeout == nil or timeout != num_floor(timeout) or timeout < 1 {
+        throw "thread.supervisor: timeout must be a positive integer in milliseconds";
+    }
+    if timeout > SUPERVISOR_MAX_TIMEOUT_MS { return SUPERVISOR_MAX_TIMEOUT_MS; }
+    return timeout;
+}
+
+fn _supervisor_find(records, id) {
+    let i = 0;
+    while i < len(records) {
+        if records[i].id == id { return records[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _supervisor_active_status(status) {
+    return status == "running" or status == "cancel-requested";
+}
+
+fn _supervisor_reason(value) {
+    let reason = str(value);
+    if len(reason) > SUPERVISOR_MAX_REASON_BYTES {
+        return str_slice(reason, 0, SUPERVISOR_MAX_REASON_BYTES);
+    }
+    return reason;
+}
+
+// Cooperative workers should poll this at safe interruption points. The
+// cancellation channel crosses the VM boundary and the child-local latch keeps
+// the result stable after the single buffered signal has been consumed.
+fn cancellation_requested(token) {
+    if token == nil or (try token.format catch "") != "pblang.thread.cancellation.v1" { return true; }
+    if (try token.cancelled catch true) { return true; }
+    let receiver = try token.receiver catch nil;
+    let signal = try recv_timeout(receiver, 0) catch true;
+    if signal != nil {
+        token.cancelled = true;
+        return true;
+    }
+    let deadline = try token.deadline_ms catch 0;
+    if deadline <= 0 {
+        token.cancelled = true;
+        return true;
+    }
+    if now_ms() >= deadline {
+        token.cancelled = true;
+        return true;
+    }
+    return false;
+}
+
+fn cancellation_remaining_ms(token) {
+    if cancellation_requested(token) { return 0; }
+    let remaining = token.deadline_ms - now_ms();
+    if remaining < 0 { return 0; }
+    return remaining;
+}
+
+fn _supervisor_snapshot(record) {
+    if record == nil {
+        return map{ format: "pblang.thread.supervisor.status.v1", found: false, active: false, status: "unknown" };
+    }
+    return map{
+        format: "pblang.thread.supervisor.status.v1",
+        found: true,
+        id: record.id,
+        status: record.status,
+        active: _supervisor_active_status(record.status),
+        cooperative: record.cooperative,
+        timeout_ms: record.timeout_ms,
+        started_ms: record.started_ms,
+        deadline_ms: record.deadline_ms,
+        finished_ms: record.finished_ms,
+        cancel_reason: record.cancel_reason,
+        reaped: record.reaped,
+        error: record.error
+    };
+}
+
+fn _supervisor_request_cancel(record, stats_map, reason, at_ms) {
+    if record == nil or not _supervisor_active_status(record.status) { return false; }
+    if record.status != "cancel-requested" {
+        try send(record.cancel_sender, true) catch nil;
+        record.status = "cancel-requested";
+        record.cancel_reason = _supervisor_reason(reason);
+        record.cancel_requested_ms = at_ms;
+        stats_map.cancel_requested = stats_map.cancel_requested + 1;
+    }
+    return true;
+}
+
+// Harvest exactly one completion signal. Worker VMs never mutate parent maps;
+// all counters and terminal states are updated here in the supervisor VM.
+fn _supervisor_refresh_record(record, stats_map, at_ms, wait_ms = 0) {
+    if record == nil or record.reaped { return false; }
+    let now = at_ms;
+    if now < record.last_poll_ms { now = record.last_poll_ms; }
+    record.last_poll_ms = now;
+    let signal = try recv_timeout(record.done_receiver, wait_ms) catch nil;
+    if signal != nil {
+        let joined = try map{ ok: true, value: join(record.handle) }
+                     catch map{ ok: false, value: nil };
+        let finished = try signal.finished_ms catch now;
+        if finished < record.started_ms { finished = now; }
+        record.finished_ms = finished;
+        record.reaped = true;
+        if record.status == "timed-out" {
+            stats_map.late_completed = stats_map.late_completed + 1;
+            return true;
+        }
+        if stats_map.active > 0 { stats_map.active = stats_map.active - 1; }
+        if finished >= record.deadline_ms {
+            record.status = "timed-out";
+            record.error = "deadline exceeded";
+            stats_map.timed_out = stats_map.timed_out + 1;
+        } elif record.status == "cancel-requested" {
+            let succeeded = (try signal.ok catch false) and joined.ok and (try joined.value.ok catch false);
+            let observed = try signal.cancel_observed catch false;
+            if succeeded and observed {
+                record.status = "cancelled";
+                stats_map.cancelled = stats_map.cancelled + 1;
+            } elif succeeded {
+                record.status = "completed";
+                stats_map.completed = stats_map.completed + 1;
+                stats_map.cancel_not_observed = stats_map.cancel_not_observed + 1;
+            } else {
+                record.status = "failed";
+                record.error = "supervised task failed after cancellation request";
+                stats_map.failed = stats_map.failed + 1;
+            }
+        } elif (try signal.ok catch false) and joined.ok and (try joined.value.ok catch false) {
+            record.status = "completed";
+            stats_map.completed = stats_map.completed + 1;
+        } else {
+            record.status = "failed";
+            record.error = "supervised task failed";
+            stats_map.failed = stats_map.failed + 1;
+        }
+        return true;
+    }
+    if _supervisor_active_status(record.status) and now >= record.deadline_ms {
+        if record.status != "cancel-requested" {
+            try send(record.cancel_sender, true) catch nil;
+            stats_map.cancel_requested = stats_map.cancel_requested + 1;
+        }
+        record.status = "timed-out";
+        record.cancel_reason = "deadline";
+        record.error = "deadline exceeded; worker may continue until it cooperates";
+        record.finished_ms = now;
+        stats_map.timed_out = stats_map.timed_out + 1;
+        if stats_map.active > 0 { stats_map.active = stats_map.active - 1; }
+        return true;
+    }
+    return false;
+}
+
+fn _supervisor_refresh_all(records, stats_map, at_ms) {
+    let i = 0;
+    while i < len(records) {
+        _supervisor_refresh_record(records[i], stats_map, at_ms, 0);
+        i = i + 1;
+    }
+}
+
+fn _supervisor_compact(records) {
+    let keep = [];
+    let i = 0;
+    while i < len(records) {
+        if not records[i].reaped { array_push(keep, records[i]); }
+        i = i + 1;
+    }
+    return keep;
+}
+
+fn _supervisor_launch(records, stats_map, next_id, fn_val, args, mode, timeout_value) {
+    if not _supervisor_callable(fn_val) { throw "thread.supervisor: task must be callable"; }
+    if len(records) >= SUPERVISOR_MAX_TRACKED { throw "thread.supervisor: tracked-task limit exceeded"; }
+    let timeout_ms = _supervisor_timeout(timeout_value);
+    let id = atomic_add(next_id, 1);
+    let started = now_ms();
+    let cancel = channel_buffered(1);
+    let done = channel_buffered(1);
+    let done_sender = done.sender;
+    let token = map{
+        format: "pblang.thread.cancellation.v1",
+        id: id,
+        receiver: cancel.receiver,
+        cancelled: false,
+        started_ms: started,
+        deadline_ms: started + timeout_ms,
+        requested: cancellation_requested,
+        remaining_ms: cancellation_remaining_ms
+    };
+    let wrapped = fn() {
+        let outcome = map{ ok: false, value: nil };
+        if mode == "args" {
+            outcome = try map{ ok: true, value: fn_val(args) } catch map{ ok: false, value: nil };
+        } elif mode == "cooperative_args" {
+            outcome = try map{ ok: true, value: fn_val(token, args) } catch map{ ok: false, value: nil };
+        } elif mode == "cooperative" {
+            outcome = try map{ ok: true, value: fn_val(token) } catch map{ ok: false, value: nil };
+        } else {
+            outcome = try map{ ok: true, value: fn_val() } catch map{ ok: false, value: nil };
+        }
+        try send(done_sender, map{
+            ok: outcome.ok,
+            finished_ms: now_ms(),
+            cancel_observed: try token.cancelled catch false
+        }) catch nil;
+        try channel_close(done_sender) catch nil;
+        return outcome;
+    };
+    let handle = try spawn(wrapped) catch nil;
+    if handle == nil {
+        try channel_close(done_sender) catch nil;
+        throw "thread.supervisor: failed to spawn task";
+    }
+    array_push(records, map{
+        format: "pblang.thread.supervisor.record.v1",
+        id: id,
+        handle: handle,
+        done_receiver: done.receiver,
+        cancel_sender: cancel.sender,
+        cooperative: mode == "cooperative" or mode == "cooperative_args",
+        status: "running",
+        timeout_ms: timeout_ms,
+        started_ms: started,
+        deadline_ms: started + timeout_ms,
+        last_poll_ms: started,
+        cancel_requested_ms: nil,
+        cancel_reason: "",
+        finished_ms: nil,
+        reaped: false,
+        error: ""
+    });
+    stats_map.spawned = stats_map.spawned + 1;
+    stats_map.active = stats_map.active + 1;
+    return id;
+}
+
+// supervisor() -> bounded supervisor. VM threads cannot be force-killed safely;
+// timeouts stop accounting immediately and signal cooperative workers, while an
+// uncooperative worker remains detached until it exits. `kill_all` is retained
+// as a compatibility name but issues cancellation requests, never fake kills.
 fn supervisor() {
-    let handles = [];
+    let records = [];
     let stats_map = map{
-        spawned: 0,
-        completed: 0,
-        timed_out: 0,
-        killed: 0,
-        active: 0
+        spawned: 0, completed: 0, failed: 0, timed_out: 0,
+        cancel_requested: 0, cancelled: 0, cancel_not_observed: 0,
+        late_completed: 0,
+        killed: 0, active: 0
     };
     let m = mutex_new();
     let next_id = atomic_new(0);
 
     return map{
-        spawn: fn(_self, fn_val, timeout_ms) {
+        spawn: fn(_self, fn_val = nil, timeout_ms = nil) {
+            if _supervisor_callable(_self) {
+                timeout_ms = fn_val;
+                fn_val = _self;
+            }
             mutex_lock(m);
-            let id = atomic_add(next_id, 1);
-            stats_map.spawned = stats_map.spawned + 1;
-            stats_map.active = stats_map.active + 1;
-
-            // Wrap fn with completion tracking
-            let wrapped = fn() {
-                let result = fn_val();
-                mutex_lock(m);
-                stats_map.completed = stats_map.completed + 1;
-                stats_map.active = stats_map.active - 1;
-                mutex_unlock(m);
-                return result;
-            };
-
-            let h = spawn(wrapped);
-            array_push(handles, map{ id: id, handle: h, timeout: timeout_ms });
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            if len(records) >= SUPERVISOR_MAX_TRACKED { records = _supervisor_compact(records); }
+            let outcome = try map{ ok: true, id: _supervisor_launch(records, stats_map, next_id, fn_val, nil, "plain", timeout_ms) }
+                          catch map{ ok: false, id: nil };
             mutex_unlock(m);
-            return id;
+            if not outcome.ok { throw "thread.supervisor: spawn rejected"; }
+            return outcome.id;
         },
 
-        spawn_with_args: fn(_self, fn_val, args, timeout_ms) {
+        spawn_with_args: fn(_self, fn_val = nil, args = nil, timeout_ms = nil) {
+            if _supervisor_callable(_self) {
+                timeout_ms = args;
+                args = fn_val;
+                fn_val = _self;
+            }
             mutex_lock(m);
-            let id = atomic_add(next_id, 1);
-            stats_map.spawned = stats_map.spawned + 1;
-            stats_map.active = stats_map.active + 1;
-
-            let wrapped = fn() {
-                let result = fn_val(args);
-                mutex_lock(m);
-                stats_map.completed = stats_map.completed + 1;
-                stats_map.active = stats_map.active - 1;
-                mutex_unlock(m);
-                return result;
-            };
-
-            let h = spawn(wrapped);
-            array_push(handles, map{ id: id, handle: h, timeout: timeout_ms });
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            if len(records) >= SUPERVISOR_MAX_TRACKED { records = _supervisor_compact(records); }
+            let outcome = try map{ ok: true, id: _supervisor_launch(records, stats_map, next_id, fn_val, args, "args", timeout_ms) }
+                          catch map{ ok: false, id: nil };
             mutex_unlock(m);
-            return id;
+            if not outcome.ok { throw "thread.supervisor: spawn_with_args rejected"; }
+            return outcome.id;
         },
 
-        check: fn(_self, id) {
+        spawn_cooperative: fn(_self, fn_val = nil, timeout_ms = nil) {
+            if _supervisor_callable(_self) {
+                timeout_ms = fn_val;
+                fn_val = _self;
+            }
+            mutex_lock(m);
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            if len(records) >= SUPERVISOR_MAX_TRACKED { records = _supervisor_compact(records); }
+            let outcome = try map{ ok: true, id: _supervisor_launch(records, stats_map, next_id, fn_val, nil, "cooperative", timeout_ms) }
+                          catch map{ ok: false, id: nil };
+            mutex_unlock(m);
+            if not outcome.ok { throw "thread.supervisor: cooperative spawn rejected"; }
+            return outcome.id;
+        },
+
+        spawn_cooperative_with_args: fn(_self, fn_val = nil, args = nil, timeout_ms = nil) {
+            if _supervisor_callable(_self) {
+                timeout_ms = args;
+                args = fn_val;
+                fn_val = _self;
+            }
+            mutex_lock(m);
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            if len(records) >= SUPERVISOR_MAX_TRACKED { records = _supervisor_compact(records); }
+            let outcome = try map{ ok: true, id: _supervisor_launch(records, stats_map, next_id, fn_val, args, "cooperative_args", timeout_ms) }
+                          catch map{ ok: false, id: nil };
+            mutex_unlock(m);
+            if not outcome.ok { throw "thread.supervisor: cooperative argument spawn rejected"; }
+            return outcome.id;
+        },
+
+        check: fn(_self, id = nil) {
+            if id == nil { id = _self; }
+            mutex_lock(m);
+            let record = _supervisor_find(records, id);
+            _supervisor_refresh_record(record, stats_map, now_ms(), 0);
+            let alive = record != nil and _supervisor_active_status(record.status);
+            mutex_unlock(m);
+            return alive;
+        },
+
+        check_all: fn(_self = nil) {
+            mutex_lock(m);
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            let active = stats_map.active;
+            mutex_unlock(m);
+            return active;
+        },
+
+        status: fn(_self, id = nil) {
+            if id == nil { id = _self; }
+            mutex_lock(m);
+            let record = _supervisor_find(records, id);
+            _supervisor_refresh_record(record, stats_map, now_ms(), 0);
+            let snapshot = _supervisor_snapshot(record);
+            mutex_unlock(m);
+            return snapshot;
+        },
+
+        wait: fn(_self, id = nil, wait_ms = nil) {
+            if type(_self) != "map" {
+                wait_ms = id;
+                id = _self;
+            }
+            mutex_lock(m);
+            let record = _supervisor_find(records, id);
+            if record == nil {
+                mutex_unlock(m);
+                return _supervisor_snapshot(nil);
+            }
+            let wait = 0;
+            if wait_ms != nil { wait = _supervisor_timeout(wait_ms); }
+            else {
+                wait = record.deadline_ms - now_ms();
+                if wait < 0 { wait = 0; }
+            }
+            if wait > record.timeout_ms { wait = record.timeout_ms; }
+            _supervisor_refresh_record(record, stats_map, now_ms(), wait);
+            _supervisor_refresh_record(record, stats_map, now_ms(), 0);
+            let snapshot = _supervisor_snapshot(record);
+            mutex_unlock(m);
+            return snapshot;
+        },
+
+        cancel: fn(_self, id = nil, reason = "cancelled") {
+            if type(_self) != "map" {
+                reason = if id == nil { "cancelled" } else { id };
+                id = _self;
+            }
+            mutex_lock(m);
+            let record = _supervisor_find(records, id);
+            _supervisor_refresh_record(record, stats_map, now_ms(), 0);
+            let requested = _supervisor_request_cancel(record, stats_map, reason, now_ms());
+            mutex_unlock(m);
+            return requested;
+        },
+
+        kill_all: fn(_self = nil) {
+            mutex_lock(m);
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            let requested = 0;
             let i = 0;
-            while i < len(handles) {
-                if handles[i].id == id { return true; }
+            while i < len(records) {
+                if _supervisor_request_cancel(records[i], stats_map, "supervisor-stop", now_ms()) {
+                    requested = requested + 1;
+                }
                 i = i + 1;
             }
-            return false;
-        },
-
-        kill_all: fn(_self) {
-            mutex_lock(m);
-            let killed_count = len(handles);
-            handles = [];
-            stats_map.killed = stats_map.killed + killed_count;
-            stats_map.active = 0;
             mutex_unlock(m);
+            return map{ requested: requested, preemptive: false, reason: "cooperative cancellation requested" };
         },
 
-        stats: fn(_self) {
+        reap: fn(_self = nil) {
             mutex_lock(m);
-            let s = map{
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            let before = len(records);
+            records = _supervisor_compact(records);
+            let removed = before - len(records);
+            mutex_unlock(m);
+            return removed;
+        },
+
+        stats: fn(_self = nil) {
+            mutex_lock(m);
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            let unreaped = 0;
+            let detached = 0;
+            let i = 0;
+            while i < len(records) {
+                if not records[i].reaped { unreaped = unreaped + 1; }
+                if records[i].status == "timed-out" and not records[i].reaped {
+                    detached = detached + 1;
+                }
+                i = i + 1;
+            }
+            let snapshot = map{
+                format: "pblang.thread.supervisor.stats.v1",
                 spawned: stats_map.spawned,
                 completed: stats_map.completed,
+                failed: stats_map.failed,
                 timed_out: stats_map.timed_out,
-                killed: stats_map.killed,
-                active: stats_map.active
+                cancel_requested: stats_map.cancel_requested,
+                cancelled: stats_map.cancelled,
+                cancel_not_observed: stats_map.cancel_not_observed,
+                late_completed: stats_map.late_completed,
+                killed: 0,
+                active: stats_map.active,
+                tracked: len(records),
+                unreaped: unreaped,
+                detached: detached,
+                max_tracked: SUPERVISOR_MAX_TRACKED,
+                preemptive_kill: false
             };
             mutex_unlock(m);
-            return s;
+            return snapshot;
         },
 
-        active_count: fn(_self) {
+        active_count: fn(_self = nil) {
             mutex_lock(m);
-            let c = len(handles);
+            _supervisor_refresh_all(records, stats_map, now_ms());
+            let count = stats_map.active;
             mutex_unlock(m);
-            return c;
+            return count;
         }
     };
 }
@@ -1024,7 +1396,7 @@ export
     scope,
     // Thread supervisor
     // Supervisor
-    supervisor,
+    supervisor, cancellation_requested, cancellation_remaining_ms,
     // Parallel map
     parallel_map,
     // Pipeline (staged)

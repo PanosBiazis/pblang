@@ -1,0 +1,98 @@
+// Bounded, strict, backward-compatible serialization pipeline regressions.
+
+let S = import("stdlib:serialization.sapp");
+let F = import("stdlib:fuzz.sapp");
+
+fn fail(message) { throw "FAIL serialization_hardening: " + message; }
+fn require(condition, message) { if not condition { fail(message); } }
+fn eq(actual, expected, message) {
+    if actual != expected { fail(message + " got=" + str(actual) + " expected=" + str(expected)); }
+}
+
+// String sentinels must never collide with successful JSON values.
+require(S.json_validate("\"__pblang_invalid_json__\""), "JSON validation has no sentinel collision");
+let detail = S.json_validate_detail("\"__pblang_invalid_json__\"");
+require(detail.ok and detail.value == "__pblang_invalid_json__", "detailed JSON validation preserves sentinel-like text");
+require(S.validate("\"__pblang_invalid__\"", "json"), "generic validation has no sentinel collision");
+
+let good_json = S.parse_safe("{\"a\":[1,2],\"b\":true}", "json");
+require(good_json.ok and len(good_json.value.a) == 2, "bounded JSON parses valid document");
+eq(good_json.schema, "pblang.serialization.result.v1", "safe result schema is stable");
+require(not S.parse_safe("[[[1]]]", "json", map{ max_depth: 2 }).ok, "JSON depth limit is enforced");
+require(not S.parse_safe("12345", "json", map{ max_input_bytes: 4 }).ok, "input byte limit is enforced");
+
+let lim = S.limits(map{ max_depth: 999999, max_items: 99999999 });
+eq(lim.max_depth, 256, "depth limit is hard-capped");
+eq(lim.max_items, 1000000, "item limit is hard-capped");
+require(len(S.formats()) >= 6, "format capability inventory is available");
+
+// Strict TOML subset rejects corruption instead of silently dropping it.
+require(S.parse_safe("name = \"pb\"\n[build]\nworkers = 4\n", "toml").ok, "strict TOML accepts supported document");
+let duplicate_toml = S.parse_safe("name = \"a\"\nname = \"b\"\n", "toml");
+require(not duplicate_toml.ok and duplicate_toml.diagnostics[0].code == "duplicate_key", "duplicate TOML key is rejected");
+require(not S.parse_safe("name pblang\n", "toml").ok, "malformed TOML assignment is rejected");
+require(not S.parse_safe("name = pblang\n", "toml").ok, "invalid bare TOML string is rejected");
+require(not S.parse_safe("[[servers]]\nname = \"a\"\n", "toml").ok, "unsupported TOML table array is explicit");
+require(not S.parse_safe("\"a=b\" = 1\n", "toml").ok, "quoted TOML keys outside the parser subset are rejected");
+require(S.parse_safe("name = pblang\n", "toml", map{ strict: false }).ok, "legacy TOML subset remains opt-in compatible");
+
+// Strict YAML subset rejects ambiguous/unsafe constructs and duplicate keys.
+let good_yaml = S.parse_safe("name: pblang\ntargets:\n  - x86_64\n  - c99\n", "yaml");
+require(good_yaml.ok and len(good_yaml.value.targets) == 2, "strict YAML accepts supported document");
+let duplicate_yaml = S.parse_safe("name: one\nname: two\n", "yaml");
+require(not duplicate_yaml.ok and duplicate_yaml.diagnostics[0].code == "duplicate_key", "duplicate YAML key is rejected");
+require(not S.parse_safe("root:\n\tchild: value\n", "yaml").ok, "YAML tab indentation is rejected");
+require(not S.parse_safe("root:\n child: value\n", "yaml").ok, "odd YAML indentation is rejected");
+require(not S.parse_safe("value: &anchor data\n", "yaml").ok, "YAML anchors are rejected explicitly");
+require(not S.parse_safe("name: pblang\n- mixed\n", "yaml").ok, "mixed YAML root kinds are rejected");
+require(not S.parse_safe("\"a:b\": value\n", "yaml").ok, "quoted YAML keys outside the parser subset are rejected");
+require(not S.parse_safe("values: [[1, 2], 3]\n", "yaml").ok, "nested YAML flow arrays are rejected instead of approximated");
+
+// Escaped strings round-trip through both native subset writers/parsers.
+let escaped = map{ text: "line1\nline2 \\\"quoted\\\" \\\\ path" };
+eq(S.toml_parse(S.toml_stringify(escaped)).text, escaped.text, "TOML escaped string round-trip");
+eq(S.yaml_parse(S.yaml_stringify(escaped)).text, escaped.text, "YAML escaped string round-trip");
+
+eq(S.detect_format("targets = [\"x86\", \"c99\"]"), "toml", "TOML inline array outranks CSV detection");
+eq(S.detect_format("targets: [x86, c99]"), "yaml", "YAML inline array outranks CSV detection");
+let unknown = try S.parse_format("x", "unknown-format") catch "blocked";
+eq(unknown, "blocked", "unknown formats fail closed");
+
+let bad_toml_value = S.stringify_safe(map{ missing: nil }, "toml");
+require(not bad_toml_value.ok and bad_toml_value.diagnostics[0].code == "unsupported_value", "safe TOML rejects null");
+require(not S.stringify_safe("abcd", "text", map{ max_output_bytes: 3 }).ok, "output limit is enforced");
+let converted = S.convert_safe("{\"name\":\"pb\"}", "json", "yaml");
+require(converted.ok and converted.source_format == "json" and str_contains(converted.value, "name: \"pb\""), "bounded conversion returns metadata");
+
+let pretty = S.json_pretty(map{ text: "slash \\\\ and quote \\\"" });
+require(S.json_validate(pretty), "pretty JSON remains valid with escaped slash/quote sequences");
+
+// Seeded campaigns keep parser robustness and escaped-string round trips
+// reproducible in the canonical suite.
+fn safe_toml(input) { let r = S.parse_safe(input, "toml"); return type(r) == "map"; }
+fn safe_yaml(input) { let r = S.parse_safe(input, "yaml"); return type(r) == "map"; }
+let fuzz_toml = F.fuzz(safe_toml, map{
+    seed: 701, runs: 250, max_len: 32,
+    dict: ["[", "]", "=", "\"", "'", "#", "\n", ".", "\\", "true", "1.5"],
+});
+let fuzz_yaml = F.fuzz(safe_yaml, map{
+    seed: 702, runs: 250, max_len: 32,
+    dict: [":", "-", "#", "\n", "  ", "\"", "'", "|", ">", "&", "*"],
+});
+eq(fuzz_toml.crash_count, 0, "strict TOML fuzz campaign never throws");
+eq(fuzz_yaml.crash_count, 0, "strict YAML fuzz campaign never throws");
+
+fn toml_encode(value) { return S.toml_stringify(map{ K: value }); }
+fn toml_decode(text) { return S.toml_parse(text).K; }
+fn yaml_encode(value) { return S.yaml_stringify(map{ K: value }); }
+fn yaml_decode(text) { return S.yaml_parse(text).K; }
+let toml_round_trip = F.round_trip(toml_encode, toml_decode, map{
+    seed: 703, runs: 200, max_len: 16, dict: ["\"", "'", "\\", "\n", "#", "=", "[", "]"],
+});
+let yaml_round_trip = F.round_trip(yaml_encode, yaml_decode, map{
+    seed: 704, runs: 200, max_len: 16, dict: ["\"", "'", ":", "-", "#", "\n", "|", "&"],
+});
+require(toml_round_trip.ok, "TOML seeded string round trips");
+require(yaml_round_trip.ok, "YAML seeded string round trips");
+
+print "serialization_hardening_pass";

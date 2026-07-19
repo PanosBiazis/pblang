@@ -1,0 +1,171 @@
+// Step-by-step pblang pipeline benchmark. All measured compiler/backend phases
+// below are implemented in pblang. Imports happen before timing so module-load
+// latency is reported separately by the shell orchestrator.
+let TOK = import("stdlib/compiler/tokenizer.sapp");
+let PAR = import("stdlib/compiler/parser.sapp");
+let SEM = import("stdlib/compiler/semantic.sapp");
+let TYP = import("stdlib/compiler/typeck.sapp");
+let BCG = import("stdlib/compiler/codegen.sapp");
+let OPT = import("stdlib/compiler/optimizer.sapp");
+let VM = import("stdlib/compiler/vm.sapp");
+let INT = import("stdlib/compiler/interp.sapp");
+let C99 = import("stdlib/compiler/ctranspile.sapp");
+let X64 = import("stdlib/native/codegen_x64.sapp");
+let RIR = import("stdlib/codegen_ir.sapp");
+let RX64 = import("stdlib/codegen_x64.sapp");
+let X86 = import("stdlib/codegen_x86.sapp");
+let A64 = import("stdlib/codegen_arm64.sapp");
+let A64AST = import("stdlib/codegen_arm64_ast.sapp");
+let WASM = import("stdlib/codegen_wasm.sapp");
+let GRAPH = import("stdlib/graph.sapp");
+
+let SOURCE = "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fn sum_to(n) { let i = 0; let s = 0; while i < n { s = s + i; i = i + 1; } return s; } let answer = fib(12) + sum_to(20); print answer;";
+let TREE_SOURCE = "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } if fib(18) != 2584 { missing(); }";
+let TREE2_SOURCE = "fn choose(n, k) { if k == 0 or k == n { return 1; } return choose(n - 1, k - 1) + choose(n - 1, k); } if choose(15, 7) != 6435 { missing(); }";
+let TREE_BUILTIN_SOURCE = "fn workload(n) { let a = [1, 2, 3]; let i = 0; let s = 0; while i < n { s = s + len(a); i = i + 1; } return s; } if workload(5000) != 15000 { missing(); }";
+let VM_LEN_SOURCE = "fn work(n) { let a = [1, 2, 3]; let i = 0; let s = 0; while i < n { s = s + len(a); i = i + 1; } print s; } work(10000);";
+let VM_SHR_SOURCE = "fn work(n) { let i = 0; let value = 0; while i < n { value = bit_shr(i, 1); i = i + 1; } print value; } work(10000);";
+let NATIVE_SOURCE = "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } print fib(20);";
+let NATIVE_STRESS_SOURCE = "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } print fib(36);";
+let MAIN_SOURCE = "fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } fn main() { return fib(12); }";
+let IR = [["seti", 0, 0], ["seti", 1, 100], ["loop", 1, [["add", 0, 1]]]];
+let IR_DEAD_ARITH = [
+    ["seti", 0, 1], ["seti", 1, 20],
+    ["loop", 1, [
+        ["addi", 0, 1],
+        ["seti", 2, 10], ["addi", 2, 5], ["mul", 2, 0],
+        ["seti", 3, 7], ["sub", 3, 0]
+    ]]
+];
+let IR_STACK_DEPTH = 2000;
+
+fn ir_stack_program(depth) {
+    let program = [["seti", 0, 1]];
+    let i = 0;
+    while i < depth { array_push(program, ["pushr", 0]); i = i + 1; }
+    i = 0;
+    while i < depth { array_push(program, ["popr", 1]); i = i + 1; }
+    array_push(program, ["movr", 0, 1]);
+    return program;
+}
+let IR_STACK = ir_stack_program(IR_STACK_DEPTH);
+let GRAPH_BFS_WIDTH = 1000;
+let GRAPH_BFS = GRAPH.new(true);
+let graph_i = 0;
+while graph_i < GRAPH_BFS_WIDTH {
+    GRAPH.add_edge(GRAPH_BFS, "root", "n" + str(graph_i), 1);
+    graph_i = graph_i + 1;
+}
+let GRAPH_DIJKSTRA_NODES = 400;
+let GRAPH_DIJKSTRA = GRAPH.new(true);
+graph_i = 0;
+while graph_i < GRAPH_DIJKSTRA_NODES {
+    GRAPH.add_edge(GRAPH_DIJKSTRA, "d" + str(graph_i), "d" + str(graph_i + 1), 1);
+    graph_i = graph_i + 1;
+}
+
+fn emit_phase(name, iterations, work_units, thunk, output_size, status) {
+    let t0 = now_ms();
+    let i = 0;
+    while i < iterations { thunk(); i = i + 1; }
+    let elapsed = now_ms() - t0;
+    let avg = elapsed / iterations;
+    let rate = 0;
+    if elapsed > 0 { rate = iterations * work_units * 1000 / elapsed; }
+    print "PHASE|" + name + "|" + str(iterations) + "|" + str(elapsed) + "|" + str(avg) + "|" + str(rate) + "|" + str(output_size) + "|" + status;
+}
+
+fn ir_instruction_count(ir) {
+    let count = 0; let i = 0;
+    while i < len(ir) {
+        count = count + 1;
+        if ir[i][0] == "loop" { count = count + ir_instruction_count(ir[i][2]); }
+        else if ir[i][0] == "ifnz" { count = count + ir_instruction_count(ir[i][2]) + ir_instruction_count(ir[i][3]); }
+        i = i + 1;
+    }
+    return count;
+}
+
+let tokens = TOK.tokenize(SOURCE);
+let parsed = PAR.parse(tokens);
+let sem = SEM.analyze(parsed);
+let types = TYP.type_check(parsed.stmts);
+let chunk = BCG.compile_stmts(parsed.stmts);
+let optimized = OPT.optimize_safe(chunk);
+let vm_probe = VM.run(optimized.chunk);
+let c_source = C99.transpile(MAIN_SOURCE);
+let c_hosted = C99.transpile_program(NATIVE_SOURCE);
+let x64_bin = X64.compile_fns(NATIVE_SOURCE);
+let x64_stress_bin = X64.compile_fns(NATIVE_STRESS_SOURCE);
+let x64_ir = RX64.compile_program(IR);
+let x86_ir = X86.compile_program(IR);
+let arm_ir = A64.compile_program(IR);
+let arm_ast = A64AST.compile_elf(MAIN_SOURCE);
+let wasm = WASM.compile_wasm(MAIN_SOURCE);
+let ir_dead_arith_clean = RIR.optimize(IR_DEAD_ARITH);
+let tree_ast = INT.compile_program(TREE_SOURCE);
+let tree2_ast = INT.compile_program(TREE2_SOURCE);
+let tree_builtin_ast = INT.compile_program(TREE_BUILTIN_SOURCE);
+let vm_len_chunk = BCG.compile_stmts(PAR.parse(TOK.tokenize(VM_LEN_SOURCE)).stmts);
+let vm_shr_chunk = BCG.compile_stmts(PAR.parse(TOK.tokenize(VM_SHR_SOURCE)).stmts);
+let vm_len_probe = VM.run(vm_len_chunk);
+let vm_shr_probe = VM.run(vm_shr_chunk);
+let graph_dijkstra_probe = GRAPH.dijkstra(GRAPH_DIJKSTRA, "d0");
+
+if len(tokens) == 0 { throw "phase benchmark: tokenizer produced no tokens"; }
+if len(try parsed.errors catch []) != 0 { throw "phase benchmark: parser diagnostics"; }
+if len(sem.diagnostics) != 0 { throw "phase benchmark: semantic diagnostics"; }
+if len(types) != 0 { throw "phase benchmark: type diagnostics"; }
+if len(chunk.instructions) == 0 { throw "phase benchmark: empty bytecode"; }
+if len(vm_probe.output) != 1 or vm_probe.output[0] != 334 { throw "phase benchmark: VM result mismatch"; }
+if len(c_source) == 0 { throw "phase benchmark: empty C99 output"; }
+if not str_contains(c_hosted, "int main(void)") { throw "phase benchmark: incomplete hosted C99 output"; }
+if x64_bin[0] != 127 or x64_bin[4] != 2 { throw "phase benchmark: invalid x86-64 ELF"; }
+if x64_stress_bin[0] != 127 or x64_stress_bin[4] != 2 { throw "phase benchmark: invalid stress x86-64 ELF"; }
+if x86_ir[4] != 1 or x86_ir[18] != 3 { throw "phase benchmark: invalid i386 ELF"; }
+if arm_ir[18] != 183 { throw "phase benchmark: invalid ARM64 ELF"; }
+if wasm[0] != 0 or wasm[1] != 97 or wasm[2] != 115 or wasm[3] != 109 { throw "phase benchmark: invalid WASM"; }
+if INT.eval_ast(tree_ast) != true or INT.eval_ast(tree2_ast) != true { throw "phase benchmark: invalid tree AST"; }
+if INT.eval_ast(tree_builtin_ast) != true { throw "phase benchmark: invalid builtin tree AST"; }
+if vm_len_probe.output[0] != 30000 or vm_shr_probe.output[0] != 4999 { throw "phase benchmark: invalid VM builtin result"; }
+if RIR.eval(IR_DEAD_ARITH) != RIR.eval(ir_dead_arith_clean) { throw "phase benchmark: invalid dead-arithmetic optimization"; }
+if RIR.eval(IR_STACK) != 1 { throw "phase benchmark: invalid portable IR stack result"; }
+if len(GRAPH.bfs(GRAPH_BFS, "root")) != GRAPH_BFS_WIDTH + 1 { throw "phase benchmark: invalid graph BFS result"; }
+if graph_dijkstra_probe["d" + str(GRAPH_DIJKSTRA_NODES)] != GRAPH_DIJKSTRA_NODES {
+    throw "phase benchmark: invalid graph Dijkstra result";
+}
+
+print "SCHEMA|phase|iterations|total_ms|avg_ms|work_units_per_s|output_bytes_or_units|status";
+emit_phase("tokenize", 300, len(SOURCE), fn() { TOK.tokenize(SOURCE); }, len(tokens), "ok");
+emit_phase("parse", 200, len(tokens), fn() { PAR.parse(tokens); }, len(parsed.stmts), "ok");
+emit_phase("semantic", 100, len(parsed.stmts), fn() { SEM.analyze(parsed); }, SEM.table_symbol_count(sem), "ok");
+emit_phase("typecheck", 100, len(parsed.stmts), fn() { TYP.type_check(parsed.stmts); }, len(types), "ok");
+emit_phase("bytecode_codegen", 100, len(parsed.stmts), fn() { BCG.compile_stmts(parsed.stmts); }, len(chunk.instructions), "ok");
+emit_phase("bytecode_optimize_safe", 100, len(chunk.instructions), fn() { OPT.optimize_safe(chunk); }, len(optimized.chunk.instructions), "ok");
+emit_phase("selfhost_vm_fib12", 10, 1, fn() { VM.run(optimized.chunk); }, len(optimized.chunk.instructions), "ok");
+emit_phase("selfhost_vm_builtin_len_10000", 2, 10000, fn() { VM.run(vm_len_chunk); }, len(vm_len_chunk.instructions), "ok");
+emit_phase("selfhost_vm_builtin_shr_10000", 2, 10000, fn() { VM.run(vm_shr_chunk); }, len(vm_shr_chunk.instructions), "ok");
+emit_phase("tree_interpreter_compile_fib18", 100, len(TREE_SOURCE), fn() { INT.compile_program(TREE_SOURCE); }, len(tree_ast.stmts), "ok");
+emit_phase("tree_interpreter_execute_fib18", 3, 1, fn() { INT.eval_ast(tree_ast); }, len(tree_ast.stmts), "ok");
+emit_phase("tree_interpreter_fib18", 3, 1, fn() { INT.eval_program(TREE_SOURCE); }, len(TREE_SOURCE), "ok");
+emit_phase("tree_interpreter_execute_choose15_7", 2, 1, fn() { INT.eval_ast(tree2_ast); }, len(tree2_ast.stmts), "ok");
+emit_phase("tree_interpreter_choose15_7", 2, 1, fn() { INT.eval_program(TREE2_SOURCE); }, len(TREE2_SOURCE), "ok");
+emit_phase("tree_interpreter_builtin_loop_5000", 3, 5000, fn() { INT.eval_ast(tree_builtin_ast); }, len(tree_builtin_ast.stmts), "ok");
+emit_phase("shared_ir_optimize_dead_arithmetic", 500, ir_instruction_count(IR_DEAD_ARITH), fn() { RIR.optimize(IR_DEAD_ARITH); }, ir_instruction_count(ir_dead_arith_clean), "ok");
+emit_phase("portable_ir_stack_push_pop", 20, IR_STACK_DEPTH * 2, fn() { RIR.eval(IR_STACK); }, len(IR_STACK), "ok");
+emit_phase("graph_bfs_wide", 20, GRAPH_BFS_WIDTH + 1, fn() { GRAPH.bfs(GRAPH_BFS, "root"); }, GRAPH_BFS_WIDTH + 1, "ok");
+emit_phase("graph_dijkstra_sparse", 20, GRAPH_DIJKSTRA_NODES + 1, fn() { GRAPH.dijkstra(GRAPH_DIJKSTRA, "d0"); }, len(map_keys(graph_dijkstra_probe)), "ok");
+emit_phase("c99_transpile", 30, len(MAIN_SOURCE), fn() { C99.transpile(MAIN_SOURCE); }, len(c_source), "ok");
+emit_phase("c99_hosted_transpile", 30, len(NATIVE_SOURCE), fn() { C99.transpile_program(NATIVE_SOURCE); }, len(c_hosted), "ok");
+emit_phase("x86_64_source_codegen", 30, len(NATIVE_SOURCE), fn() { X64.compile_fns(NATIVE_SOURCE); }, len(x64_bin), "ok");
+emit_phase("x86_64_ir_codegen", 500, len(IR), fn() { RX64.compile_program(IR); }, len(x64_ir), "ok");
+emit_phase("i386_ir_codegen", 500, len(IR), fn() { X86.compile_program(IR); }, len(x86_ir), "ok");
+emit_phase("arm64_ir_codegen", 500, len(IR), fn() { A64.compile_program(IR); }, len(arm_ir), "ok");
+emit_phase("arm64_source_codegen", 30, len(MAIN_SOURCE), fn() { A64AST.compile_elf(MAIN_SOURCE); }, len(arm_ast), "ok");
+emit_phase("wasm_source_codegen", 30, len(MAIN_SOURCE), fn() { WASM.compile_wasm(MAIN_SOURCE); }, len(wasm), "ok");
+
+fs_write_bytes("/tmp/pblang_phase_x64", x64_bin);
+fs_write_bytes("/tmp/pblang_phase_x64_stress", x64_stress_bin);
+fs_write("/tmp/pblang_phase_c99.c", c_source);
+fs_write("/tmp/pblang_phase_source.sapp", NATIVE_SOURCE);
+print "PHASE_SUITE|ok";

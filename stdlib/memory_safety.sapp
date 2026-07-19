@@ -88,11 +88,28 @@ fn release(handle) {
 
 // scope(body_fn) — execute body_fn inside a new lifetime scope
 // All allocations within the scope are automatically freed when the scope exits.
-fn scope(body_fn) {
+fn _scope_success(body_fn) {
+    return map{ ok: true, value: body_fn() };
+}
+
+// scope_result(body_fn) always closes the lifetime and reports failure instead
+// of silently converting an exception to nil. The runtime currently does not
+// expose the caught error value, so this preserves the failure state rather
+// than pretending the operation returned nil successfully.
+fn scope_result(body_fn) {
     push_lifetime();
-    let result = try body_fn() catch nil;
+    let outcome = try _scope_success(body_fn) catch map{
+        ok: false,
+        error: "memory_safety: scoped operation failed"
+    };
     pop_lifetime();
-    return result;
+    return outcome;
+}
+
+fn scope(body_fn) {
+    let outcome = scope_result(body_fn);
+    if outcome.ok != true { throw outcome.error; }
+    return outcome.value;
 }
 
 // begin_scope() — manually push a new lifetime scope
@@ -319,30 +336,141 @@ fn slice_set(s, idx, value) {
     return value;
 }
 
-// Arena/region allocation: useful for parsers/compilers. Dropping the arena
-// releases every still-live child handle in reverse creation order.
-fn arena_new(name) {
-    return map{ kind: "Arena", name: name, handles: [], alive: true };
+// Arena/region allocation: useful for parsers/compilers. Every arena carries
+// allocation and caller-defined unit quotas. A unit can represent bytes,
+// tokens, AST nodes, pixels, device packets, or another workload-specific
+// quantity; pblang cannot infer the deep byte size of an arbitrary value.
+let _ARENA_MAX_QUANTITY = 9000000000000000;
+
+fn _arena_limit(raw, name, fallback) {
+    if raw == nil { return fallback; }
+    let n = try parse_number(str(raw)) catch nil;
+    if n == nil or n < 0 or n > _ARENA_MAX_QUANTITY {
+        throw "memory_safety: invalid arena " + name;
+    }
+    return num_floor(n);
 }
 
-fn arena_alloc(arena, value) {
-    if arena.alive != true { throw "memory_safety: arena is not alive"; }
+fn arena_new(name, limits = nil) {
+    if limits == nil { limits = map{}; }
+    let max_allocations = _arena_limit(
+        try limits.max_allocations catch nil,
+        "max_allocations",
+        _ARENA_MAX_QUANTITY
+    );
+    let max_units = _arena_limit(
+        try limits.max_units catch nil,
+        "max_units",
+        _ARENA_MAX_QUANTITY
+    );
+    return map{
+        kind: "Arena",
+        name: str(name),
+        handles: [],
+        units: [],
+        allocations: 0,
+        used_units: 0,
+        max_allocations: max_allocations,
+        max_units: max_units,
+        generation: 0,
+        alive: true
+    };
+}
+
+fn bounded_arena(name, max_allocations, max_units) {
+    return arena_new(name, map{
+        max_allocations: max_allocations,
+        max_units: max_units
+    });
+}
+
+fn arena_alloc_sized(arena, value, units) {
+    if arena == nil or arena.alive != true { throw "memory_safety: arena is not alive"; }
+    units = _arena_limit(units, "allocation units", 1);
+    if arena.allocations >= arena.max_allocations {
+        throw "memory_safety: arena allocation quota exceeded";
+    }
+    // Subtraction-first admission avoids overflowing used_units + units.
+    if units > arena.max_units - arena.used_units {
+        throw "memory_safety: arena unit quota exceeded";
+    }
     let owner = Box(value);
     push(arena.handles, owner);
+    push(arena.units, units);
+    arena.allocations = arena.allocations + 1;
+    arena.used_units = arena.used_units + units;
     return owner;
 }
 
-fn arena_drop_all(arena) {
-    if arena.alive != true { return nil; }
-    let i = len(arena.handles) - 1;
-    while i >= 0 {
-        let owner = arena.handles[i];
+fn arena_alloc(arena, value) {
+    return arena_alloc_sized(arena, value, 1);
+}
+
+fn arena_stats(arena) {
+    if arena == nil { throw "memory_safety: nil arena"; }
+    return map{
+        name: arena.name,
+        alive: arena.alive,
+        allocations: arena.allocations,
+        used_units: arena.used_units,
+        remaining_allocations: arena.max_allocations - arena.allocations,
+        remaining_units: arena.max_units - arena.used_units,
+        max_allocations: arena.max_allocations,
+        max_units: arena.max_units
+    };
+}
+
+fn arena_checkpoint(arena) {
+    if arena == nil or arena.alive != true { throw "memory_safety: arena is not alive"; }
+    return map{
+        kind: "ArenaCheckpoint",
+        generation: arena.generation,
+        count: len(arena.handles),
+        used_units: arena.used_units
+    };
+}
+
+fn arena_rewind(arena, checkpoint) {
+    if arena == nil or arena.alive != true { throw "memory_safety: arena is not alive"; }
+    if checkpoint == nil or (try checkpoint.kind catch "") != "ArenaCheckpoint" {
+        throw "memory_safety: invalid arena checkpoint";
+    }
+    if checkpoint.generation != arena.generation {
+        throw "memory_safety: stale arena checkpoint";
+    }
+    let keep = try checkpoint.count catch 0 - 1;
+    if keep < 0 or keep > len(arena.handles) {
+        throw "memory_safety: invalid arena checkpoint range";
+    }
+    let released = 0;
+    while len(arena.handles) > keep {
+        let owner = array_pop(arena.handles);
+        let units = array_pop(arena.units);
         if (try owner.alive catch false) {
             deallocate(owner.handle);
             owner.alive = false;
         }
-        i = i - 1;
+        arena.used_units = arena.used_units - units;
+        released = released + 1;
     }
+    arena.allocations = len(arena.handles);
+    arena.generation = arena.generation + 1;
+    return released;
+}
+
+fn arena_drop_all(arena) {
+    if arena == nil or arena.alive != true { return nil; }
+    while len(arena.handles) > 0 {
+        let owner = array_pop(arena.handles);
+        array_pop(arena.units);
+        if (try owner.alive catch false) {
+            deallocate(owner.handle);
+            owner.alive = false;
+        }
+    }
+    arena.allocations = 0;
+    arena.used_units = 0;
+    arena.generation = arena.generation + 1;
     arena.alive = false;
     return nil;
 }
@@ -406,7 +534,7 @@ fn map_owned(handle, f) {
 export replace, take, swap, map_owned;
 export own, own_immutable, read, write, drop;
 export borrow, borrow_mut, move_val, release;
-export scope, begin_scope, end_scope;
+export scope, scope_result, begin_scope, end_scope;
 export stats;
 export Box, Rc;
 export assert_not_borrowed, try_borrow, try_borrow_mut;
@@ -416,4 +544,5 @@ export borrow_guard, borrow_mut_guard, guard_read, guard_release, unique_move;
 export rc_new, rc_clone, rc_strong_count, rc_weak_count, rc_read, rc_write, rc_release;
 export weak_new, weak_upgrade, weak_release;
 export slice_ref, slice_len, slice_get, slice_set;
-export arena_new, arena_alloc, arena_drop_all;
+export arena_new, bounded_arena, arena_alloc, arena_alloc_sized, arena_stats,
+       arena_checkpoint, arena_rewind, arena_drop_all;

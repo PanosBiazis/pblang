@@ -1,0 +1,238 @@
+// Strict byte-encoding adapters for Unicode input. The canonical result is a
+// PBLang Unicode-scalar string; malformed, overlong, surrogate, truncated and
+// oversized inputs fail closed instead of being silently replaced.
+
+let Unicode = import("stdlib:unicode.sapp");
+
+let MAX_INPUT_BYTES = 16384;
+let MAX_OUTPUT_SCALARS = 4096;
+
+fn _error(message, index = nil) { return map{ ok: false, error: message, index: index }; }
+
+fn _bytes(value) {
+    if not is_array(value) or len(value) > MAX_INPUT_BYTES { return nil; }
+    let out = []; let i = 0;
+    while i < len(value) {
+        let b = value[i];
+        if type(b) != "number" or num_floor(b) != b or b < 0 or b > 255 { return nil; }
+        array_push(out, b); i = i + 1;
+    }
+    return out;
+}
+
+fn _finish(cps, encoding) {
+    if len(cps) > MAX_OUTPUT_SCALARS { return _error("decoded text exceeds scalar limit"); }
+    let text = ""; let i = 0;
+    while i < len(cps) {
+        if not Unicode.is_valid_scalar(cps[i]) { return _error("decoded value is not a Unicode scalar", i); }
+        text = text + strfromcharcode(cps[i]); i = i + 1;
+    }
+    return map{ ok: true, text: text, encoding: encoding, scalars: len(cps), bytes: nil };
+}
+
+fn _continuation(b) { return b >= 128 and b <= 191; }
+
+fn utf8(value) {
+    let bytes = _bytes(value); if bytes == nil { return _error("invalid or oversized byte array"); }
+    let cps = []; let i = 0;
+    if len(bytes) >= 3 and bytes[0] == 239 and bytes[1] == 187 and bytes[2] == 191 { i = 3; }
+    while i < len(bytes) {
+        let b0 = bytes[i]; let cp = -1; let width = 1;
+        if b0 <= 127 { cp = b0; }
+        else if b0 >= 194 and b0 <= 223 {
+            width = 2;
+            if i + 1 >= len(bytes) or not _continuation(bytes[i + 1]) { return _error("invalid UTF-8 continuation", i); }
+            cp = (b0 - 192) * 64 + (bytes[i + 1] - 128);
+        } else if b0 >= 224 and b0 <= 239 {
+            width = 3;
+            if i + 2 >= len(bytes) or not _continuation(bytes[i + 1]) or not _continuation(bytes[i + 2]) {
+                return _error("truncated or invalid UTF-8 sequence", i);
+            }
+            if (b0 == 224 and bytes[i + 1] < 160) or (b0 == 237 and bytes[i + 1] > 159) {
+                return _error("overlong UTF-8 or surrogate encoding", i);
+            }
+            cp = (b0 - 224) * 4096 + (bytes[i + 1] - 128) * 64 + (bytes[i + 2] - 128);
+        } else if b0 >= 240 and b0 <= 244 {
+            width = 4;
+            if i + 3 >= len(bytes) or not _continuation(bytes[i + 1]) or
+               not _continuation(bytes[i + 2]) or not _continuation(bytes[i + 3]) {
+                return _error("truncated or invalid UTF-8 sequence", i);
+            }
+            if (b0 == 240 and bytes[i + 1] < 144) or (b0 == 244 and bytes[i + 1] > 143) {
+                return _error("overlong or out-of-range UTF-8 sequence", i);
+            }
+            cp = (b0 - 240) * 262144 + (bytes[i + 1] - 128) * 4096 +
+                 (bytes[i + 2] - 128) * 64 + (bytes[i + 3] - 128);
+        } else { return _error("invalid UTF-8 leading byte", i); }
+        if not Unicode.is_valid_scalar(cp) { return _error("invalid Unicode scalar", i); }
+        array_push(cps, cp);
+        if len(cps) > MAX_OUTPUT_SCALARS { return _error("decoded text exceeds scalar limit", i); }
+        i = i + width;
+    }
+    let result = _finish(cps, "utf-8"); result.bytes = len(bytes); return result;
+}
+
+fn _u16(bytes, i, little) {
+    if little { return bytes[i] + bytes[i + 1] * 256; }
+    return bytes[i] * 256 + bytes[i + 1];
+}
+
+fn utf16(value, endian = "bom") {
+    let bytes = _bytes(value); if bytes == nil { return _error("invalid or oversized byte array"); }
+    if num_mod(len(bytes), 2) != 0 { return _error("UTF-16 byte length must be even"); }
+    let little = endian == "le"; let start = 0;
+    if endian == "bom" {
+        if len(bytes) < 2 { return _error("UTF-16 BOM is required"); }
+        if bytes[0] == 255 and bytes[1] == 254 { little = true; }
+        else if bytes[0] == 254 and bytes[1] == 255 { little = false; }
+        else { return _error("UTF-16 BOM is required"); }
+        start = 2;
+    } elif endian != "le" and endian != "be" { return _error("invalid UTF-16 byte order"); }
+    let cps = []; let i = start;
+    while i < len(bytes) {
+        let first = _u16(bytes, i, little); i = i + 2;
+        if first >= 55296 and first <= 56319 {
+            if i >= len(bytes) { return _error("truncated UTF-16 surrogate pair", i - 2); }
+            let second = _u16(bytes, i, little);
+            if second < 56320 or second > 57343 { return _error("invalid UTF-16 surrogate pair", i); }
+            array_push(cps, 65536 + (first - 55296) * 1024 + (second - 56320)); i = i + 2;
+        } elif first >= 56320 and first <= 57343 { return _error("unpaired UTF-16 low surrogate", i - 2); }
+        else { array_push(cps, first); }
+        if len(cps) > MAX_OUTPUT_SCALARS { return _error("decoded text exceeds scalar limit", i); }
+    }
+    let name = if little { "utf-16le" } else { "utf-16be" };
+    let result = _finish(cps, name); result.bytes = len(bytes); return result;
+}
+
+fn _u32(bytes, i, little) {
+    if little { return bytes[i] + bytes[i + 1] * 256 + bytes[i + 2] * 65536 + bytes[i + 3] * 16777216; }
+    return bytes[i] * 16777216 + bytes[i + 1] * 65536 + bytes[i + 2] * 256 + bytes[i + 3];
+}
+
+fn utf32(value, endian = "bom") {
+    let bytes = _bytes(value); if bytes == nil { return _error("invalid or oversized byte array"); }
+    if num_mod(len(bytes), 4) != 0 { return _error("UTF-32 byte length must be divisible by four"); }
+    let little = endian == "le"; let start = 0;
+    if endian == "bom" {
+        if len(bytes) < 4 { return _error("UTF-32 BOM is required"); }
+        if bytes[0] == 255 and bytes[1] == 254 and bytes[2] == 0 and bytes[3] == 0 { little = true; }
+        else if bytes[0] == 0 and bytes[1] == 0 and bytes[2] == 254 and bytes[3] == 255 { little = false; }
+        else { return _error("UTF-32 BOM is required"); }
+        start = 4;
+    } elif endian != "le" and endian != "be" { return _error("invalid UTF-32 byte order"); }
+    let cps = []; let i = start;
+    while i < len(bytes) {
+        let cp = _u32(bytes, i, little);
+        if not Unicode.is_valid_scalar(cp) { return _error("invalid UTF-32 scalar", i); }
+        array_push(cps, cp); i = i + 4;
+        if len(cps) > MAX_OUTPUT_SCALARS { return _error("decoded text exceeds scalar limit", i); }
+    }
+    let name = if little { "utf-32le" } else { "utf-32be" };
+    let result = _finish(cps, name); result.bytes = len(bytes); return result;
+}
+
+let _CP1252 = [8364,nil,8218,402,8222,8230,8224,8225,710,8240,352,8249,338,nil,381,nil,
+               nil,8216,8217,8220,8221,8226,8211,8212,732,8482,353,8250,339,nil,382,376];
+
+let _CP1251 = [1026,1027,8218,1107,8222,8230,8224,8225,8364,8240,1033,8249,1034,1036,1035,1039,
+               1106,8216,8217,8220,8221,8226,8211,8212,nil,8482,1113,8250,1114,1116,1115,1119,
+               160,1038,1118,1032,164,1168,166,167,1025,169,1028,171,172,173,174,1031,
+               176,177,1030,1110,1169,181,182,183,1105,8470,1108,187,1112,1029,1109,1111,
+               1040,1041,1042,1043,1044,1045,1046,1047,1048,1049,1050,1051,1052,1053,1054,1055,
+               1056,1057,1058,1059,1060,1061,1062,1063,1064,1065,1066,1067,1068,1069,1070,1071,
+               1072,1073,1074,1075,1076,1077,1078,1079,1080,1081,1082,1083,1084,1085,1086,1087,
+               1088,1089,1090,1091,1092,1093,1094,1095,1096,1097,1098,1099,1100,1101,1102,1103];
+
+let _CP437 = [199,252,233,226,228,224,229,231,234,235,232,239,238,236,196,197,
+              201,230,198,244,246,242,251,249,255,214,220,162,163,165,8359,402,
+              225,237,243,250,241,209,170,186,191,8976,172,189,188,161,171,187,
+              9617,9618,9619,9474,9508,9569,9570,9558,9557,9571,9553,9559,9565,9564,9563,9488,
+              9492,9524,9516,9500,9472,9532,9566,9567,9562,9556,9577,9574,9568,9552,9580,9575,
+              9576,9572,9573,9561,9560,9554,9555,9579,9578,9496,9484,9608,9604,9612,9616,9600,
+              945,223,915,960,931,963,181,964,934,920,937,948,8734,966,949,8745,
+              8801,177,8805,8804,8992,8993,247,8776,176,8729,183,8730,8319,178,9632,160];
+
+fn _table_decode(value, encoding, table) {
+    let bytes = _bytes(value); if bytes == nil { return _error("invalid or oversized byte array"); }
+    if len(table) != 128 { return _error("internal single-byte table is incomplete"); }
+    let cps = []; let i = 0;
+    while i < len(bytes) {
+        let cp = bytes[i];
+        if cp >= 128 { cp = table[cp - 128]; }
+        if cp == nil { return _error("undefined " + encoding + " byte", i); }
+        array_push(cps, cp); i = i + 1;
+    }
+    let result = _finish(cps, encoding); result.bytes = len(bytes); return result;
+}
+
+fn single_byte(value, encoding) {
+    if encoding == "windows-1251" { return _table_decode(value, encoding, _CP1251); }
+    if encoding == "ibm437" { return _table_decode(value, encoding, _CP437); }
+    let bytes = _bytes(value); if bytes == nil { return _error("invalid or oversized byte array"); }
+    let cps = []; let i = 0;
+    while i < len(bytes) {
+        let b = bytes[i]; let cp = b;
+        if encoding == "ascii" and b > 127 { return _error("non-ASCII byte", i); }
+        if encoding == "windows-1252" and b >= 128 and b <= 159 {
+            cp = _CP1252[b - 128];
+            if cp == nil { return _error("undefined Windows-1252 byte", i); }
+        }
+        array_push(cps, cp); i = i + 1;
+    }
+    let result = _finish(cps, encoding); result.bytes = len(bytes); return result;
+}
+
+fn normalize_name(encoding) {
+    let name = str_lower(str_replace_all(str(encoding), "_", "-"));
+    if name == "utf8" { return "utf-8"; }
+    if name == "utf16" { return "utf-16"; } if name == "utf16le" { return "utf-16le"; } if name == "utf16be" { return "utf-16be"; }
+    if name == "utf32" { return "utf-32"; } if name == "utf32le" { return "utf-32le"; } if name == "utf32be" { return "utf-32be"; }
+    if name == "us-ascii" { return "ascii"; }
+    if name == "latin1" or name == "latin-1" { return "iso-8859-1"; }
+    if name == "cp1252" or name == "windows1252" { return "windows-1252"; }
+    if name == "cp1251" or name == "windows1251" { return "windows-1251"; }
+    if name == "cp437" or name == "ibm-437" or name == "oem437" { return "ibm437"; }
+    return name;
+}
+
+fn decode(value, encoding) {
+    let name = normalize_name(encoding);
+    if name == "utf-8" { return utf8(value); }
+    if name == "utf-16" { return utf16(value, "bom"); }
+    if name == "utf-16le" { return utf16(value, "le"); }
+    if name == "utf-16be" { return utf16(value, "be"); }
+    if name == "utf-32" { return utf32(value, "bom"); }
+    if name == "utf-32le" { return utf32(value, "le"); }
+    if name == "utf-32be" { return utf32(value, "be"); }
+    if name == "ascii" { return single_byte(value, "ascii"); }
+    if name == "iso-8859-1" { return single_byte(value, "iso-8859-1"); }
+    if name == "windows-1252" or name == "windows-1251" or name == "ibm437" { return single_byte(value, name); }
+    return _error("unsupported text encoding: " + name);
+}
+
+fn decode_auto(value) {
+    let bytes = _bytes(value); if bytes == nil { return _error("invalid or oversized byte array"); }
+    if len(bytes) >= 4 and ((bytes[0] == 255 and bytes[1] == 254 and bytes[2] == 0 and bytes[3] == 0) or
+                            (bytes[0] == 0 and bytes[1] == 0 and bytes[2] == 254 and bytes[3] == 255)) { return utf32(bytes, "bom"); }
+    if len(bytes) >= 2 and ((bytes[0] == 255 and bytes[1] == 254) or (bytes[0] == 254 and bytes[1] == 255)) { return utf16(bytes, "bom"); }
+    // UTF-8 is the only safe no-BOM default. Legacy encodings are deliberately
+    // never guessed because many byte sequences are valid in several charsets.
+    return utf8(bytes);
+}
+
+fn describe(encoding) {
+    let name = normalize_name(encoding); let known = false; let family = "unknown";
+    let values = supported(); let i = 0; while i < len(values) { if values[i] == name { known = true; } i = i + 1; }
+    if str_starts_with(name, "utf-") { family = "unicode"; }
+    else if known { family = "legacy-single-byte"; }
+    return map{ format: "pblang.encoding.info.v1", name: name, supported: known, family: family,
+                strict: true, replacement_character: false, requires_explicit_legacy_name: family == "legacy-single-byte" };
+}
+
+fn supported() {
+    return ["utf-8", "utf-16", "utf-16le", "utf-16be", "utf-32", "utf-32le", "utf-32be",
+            "ascii", "iso-8859-1", "windows-1252", "windows-1251", "ibm437"];
+}
+
+export MAX_INPUT_BYTES, MAX_OUTPUT_SCALARS, utf8, utf16, utf32, single_byte,
+       normalize_name, decode, decode_auto, describe, supported;

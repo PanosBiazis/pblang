@@ -44,14 +44,17 @@ fn _last_index_of(s, sub) {
     return last;
 }
 
-// The identifier `let <ident> = import(...)` binds, found by backtracking from the
-// `import(` offset to the nearest preceding `let `.
+// The identifier `let|const <ident> = import(...)` binds, found by backtracking
+// from the `import(` offset to the nearest preceding declaration keyword.
 fn _var_before(src, idx) {
     let before = str_slice(src, 0, idx);
-    let p = _last_index_of(before, "let ");
+    let lp = _last_index_of(before, "let ");
+    let cp = _last_index_of(before, "const ");
+    let p = lp; let skip = 4;
+    if cp > lp { p = cp; skip = 6; }
     if p < 0 { return nil; }
     let nn = len(before);
-    let j = p + 4;
+    let j = p + skip;
     while j < nn and str_slice(before, j, j + 1) == " " { j = j + 1; }
     let st = j;
     while j < nn and _is_alnum(str_slice(before, j, j + 1)) { j = j + 1; }
@@ -149,7 +152,7 @@ fn _transform(src, varset) {
             let id = str_slice(src, start, i);
             if depth == 0 and id == "export" {
                 i = _to_semi(src, i);                       // drop `export ...;`
-            } else if depth == 0 and id == "let" {
+            } else if depth == 0 and (id == "let" or id == "const") {
                 let k = _skip_spaces(src, i);
                 let nm = _read_ident(src, k);
                 let k2 = _skip_spaces(src, k + len(nm));
@@ -161,7 +164,7 @@ fn _transform(src, varset) {
                 if is_import {
                     i = _to_semi(src, i);                   // drop `let v = import(...);`
                 } else {
-                    out = out + id;                         // keep `let`, record the name
+                    out = out + id;                         // keep declaration, record the name
                     if nm != "" { array_push(names, nm); }
                 }
             } else if depth == 0 and id == "fn" {
@@ -247,11 +250,543 @@ fn inline_source(main_src, resolve) {
     return map{ ok: true, source: str_join(pieces, "\n"), modules: len(order) };
 }
 
+// _read_module(p) — read a module's source, resolving the `stdlib:X` alias (an import of the
+// pblang stdlib) to a real file. The direct path is tried first; on a `stdlib:` prefix we try
+// $PBLANG_STDLIB_DIR then the usual sibling-checkout relative layouts. nil if unresolvable.
+fn _read_module(p) {
+    let direct = try bytes_to_str(fs_read_bytes(p)) catch nil;
+    if direct != nil { return direct; }
+    if len(p) > 7 and str_slice(p, 0, 7) == "stdlib:" {
+        let rest = str_slice(p, 7, len(p));
+        let cands = [];
+        let dir = try env_get("PBLANG_STDLIB_DIR") catch nil;
+        if dir != nil and dir != "" { push(cands, str(dir) + "/" + rest); }
+        push(cands, "../../pl-dev/pblang/stdlib/" + rest);
+        push(cands, "../../../pl-dev/pblang/stdlib/" + rest);
+        let i = 0;
+        while i < len(cands) {
+            let s = try bytes_to_str(fs_read_bytes(cands[i])) catch nil;
+            if s != nil { return s; }
+            i = i + 1;
+        }
+    }
+    // `stdlib/X` (slash form): a bare stdlib import that the project doesn't shadow
+    // (direct read above already tried project-relative). Fall back to the pblang
+    // stdlib dir, exactly like the interpreter roots bare `stdlib/...` there.
+    if len(p) > 7 and str_slice(p, 0, 7) == "stdlib/" {
+        let rest = str_slice(p, 7, len(p));
+        let cands = [];
+        let dir = try env_get("PBLANG_STDLIB_DIR") catch nil;
+        if dir != nil and dir != "" { push(cands, str(dir) + "/" + rest); }
+        push(cands, "../../pl-dev/pblang/stdlib/" + rest);
+        push(cands, "../../../pl-dev/pblang/stdlib/" + rest);
+        let i = 0;
+        while i < len(cands) {
+            let s = try bytes_to_str(fs_read_bytes(cands[i])) catch nil;
+            if s != nil { return s; }
+            i = i + 1;
+        }
+    }
+    return nil;
+}
+
 fn inline_file(main_path) {
-    let src = try bytes_to_str(fs_read_bytes(main_path)) catch nil;
+    let src = _read_module(main_path);
     if src == nil { return _err("cannot read main: " + str(main_path)); }
-    fn resolve(p) { return try bytes_to_str(fs_read_bytes(p)) catch nil; }
+    fn resolve(p) { return _read_module(p); }
     return inline_source(src, resolve);
 }
 
-export inline_source, inline_file;
+// ═══ Prefixed namespacing — handles modules with COLLIDING top-level names ═══════════════
+// inline_source (above) uses a SHARED namespace and rejects two modules that define the same
+// top-level name (e.g. pbos's syscall_filter.new and audit_log.new). This variant instead gives
+// each module a unique prefix and renames its top-level names + every reference to them, so
+// colliding names coexist and whole-project native compilation becomes possible.
+//
+// SAFETY (correctness over reach — a linker that silently miscompiles is worse than one that
+// cleanly rejects). Renaming is applied ONLY to a bare identifier that equals one of THIS
+// module's top-level names and is NOT a member access (`x.name`) and NOT a map key (`name:`).
+// That is correct only when no LOCAL binding (a fn parameter or a nested `let`) shadows a
+// top-level name — otherwise a bare reference could mean the local, not the top-level. Any such
+// shadowing is DETECTED and the link REJECTED. Import-var members (`L.member`) are rewritten to
+// the imported module's prefix.
+
+fn _module_prefix(idx) { return "__pbi" + str(idx) + "_"; }
+
+// Collect param names of the fn whose '(' is at `op`, into `locals`. Returns index past ')'.
+fn _collect_params(src, op, locals) {
+    let n = len(src); let k = op + 1; let depth = 1; let want_name = true;
+    while k < n and depth > 0 {
+        let c = str_slice(src, k, k + 1);
+        if c == "(" { depth = depth + 1; k = k + 1; }
+        else if c == ")" { depth = depth - 1; k = k + 1; }
+        else if c == "," and depth == 1 { want_name = true; k = k + 1; }
+        else if _is_alpha(c) {
+            let st = k;
+            while k < n and _is_alnum(str_slice(src, k, k + 1)) { k = k + 1; }
+            if want_name { locals[str_slice(src, st, k)] = true; want_name = false; }
+            // any further idents in this param slot are a default-value expr — ignore.
+        } else { k = k + 1; }
+    }
+    return k;
+}
+
+// Scan a module (string/comment-aware): top-level fn/let names, all local binding names
+// (fn params + nested lets), and whether a nested (non-top-level) import appears.
+fn _scan_defs_and_locals(src) {
+    let n = len(src); let i = 0; let depth = 0;
+    let toplevel = []; let top_values = []; let locals = map{}; let nested = false;
+    while i < n {
+        let c = str_slice(src, i, i + 1);
+        let c2 = ""; if i + 1 < n { c2 = str_slice(src, i + 1, i + 2); }
+        if c == "\"" {
+            i = i + 1; let go = true;
+            while go and i < n {
+                let d = str_slice(src, i, i + 1);
+                if d == "\\" and i + 1 < n { i = i + 2; }
+                else { i = i + 1; if d == "\"" { go = false; } }
+            }
+        } else if c == "/" and c2 == "/" {
+            while i < n and str_slice(src, i, i + 1) != "\n" { i = i + 1; }
+        } else if c == "/" and c2 == "*" {
+            i = i + 2; let go = true;
+            while go and i < n {
+                if str_slice(src, i, i + 1) == "*" and i + 1 < n and str_slice(src, i + 1, i + 2) == "/" { i = i + 2; go = false; }
+                else { i = i + 1; }
+            }
+        } else if _is_alpha(c) {
+            let start = i;
+            while i < n and _is_alnum(str_slice(src, i, i + 1)) { i = i + 1; }
+            let id = str_slice(src, start, i);
+            if id == "fn" {
+                let k = _skip_spaces(src, i);
+                let nm = _read_ident(src, k);
+                if depth == 0 and nm != "" { array_push(toplevel, nm); }
+                let pk = _skip_spaces(src, k + len(nm));
+                if pk < n and str_slice(src, pk, pk + 1) == "(" { i = _collect_params(src, pk, locals); }
+            } else if id == "let" or id == "const" {
+                let k = _skip_spaces(src, i);
+                let nm = _read_ident(src, k);
+                let k2 = _skip_spaces(src, k + len(nm));
+                let is_imp = false;
+                if k2 < n and str_slice(src, k2, k2 + 1) == "=" {
+                    let k3 = _skip_spaces(src, k2 + 1);
+                    if k3 + 7 <= n and str_slice(src, k3, k3 + 7) == "import(" { is_imp = true; }
+                }
+                if depth == 0 {
+                    if nm != "" and not is_imp {
+                        array_push(toplevel, nm);
+                        array_push(top_values, nm);
+                    }
+                }
+                else { if nm != "" { locals[nm] = true; } }
+            } else if id == "import" and depth > 0 {
+                nested = true;
+            }
+        } else if c == "{" { depth = depth + 1; i = i + 1; }
+        else if c == "}" { depth = depth - 1; i = i + 1; }
+        else { i = i + 1; }
+    }
+    return map{ toplevel: toplevel, top_values: top_values, locals: locals, nested: nested };
+}
+
+fn _in_scopes(scopes, id) {
+    let i = len(scopes) - 1;
+    while i >= 0 { if map_has(scopes[i], id) { return true; } i = i - 1; }
+    return false;
+}
+
+// Rewrite ONE module's source with `prefix` applied to its top-level names, `L.member`
+// rewritten via `var2pref` (import-var -> imported module prefix), import/export stripped.
+// `tl` is the set (map) of this module's top-level names. SCOPE-AWARE: a bare top-level name is
+// renamed only where it is NOT shadowed by a local (fn param or nested `let`) in scope — so a
+// local `let head` inside a function that also has a top-level `fn head` is left untouched.
+// Param lists are emitted verbatim (their names become locals for the body); a default-value
+// that references a top-level const is left unprefixed and would fail to COMPILE loudly (not a
+// silent miscompile) — acceptable, and absent in the target code.
+fn _transform_prefixed(src, prefix, var2pref, tl) {
+    let out = ""; let n = len(src); let i = 0; let depth = 0;
+    let scopes = [ map{} ];
+    let pending = map{}; let have_pending = false;
+    while i < n {
+        let c = str_slice(src, i, i + 1);
+        let c2 = ""; if i + 1 < n { c2 = str_slice(src, i + 1, i + 2); }
+        if c == "\"" {
+            out = out + c; i = i + 1; let go = true;
+            while go and i < n {
+                let d = str_slice(src, i, i + 1);
+                if d == "\\" and i + 1 < n { out = out + d + str_slice(src, i + 1, i + 2); i = i + 2; }
+                else { out = out + d; i = i + 1; if d == "\"" { go = false; } }
+            }
+        } else if c == "/" and c2 == "/" {
+            let go = true;
+            while go and i < n { let d = str_slice(src, i, i + 1); out = out + d; i = i + 1; if d == "\n" { go = false; } }
+        } else if c == "/" and c2 == "*" {
+            out = out + c + c2; i = i + 2; let go = true;
+            while go and i < n {
+                let d = str_slice(src, i, i + 1);
+                if d == "*" and i + 1 < n and str_slice(src, i + 1, i + 2) == "/" { out = out + "*/"; i = i + 2; go = false; }
+                else { out = out + d; i = i + 1; }
+            }
+        } else if _is_alpha(c) {
+            let start = i;
+            let member = false;
+            let b = start - 1;
+            while b >= 0 and _is_space(str_slice(src, b, b + 1)) { b = b - 1; }
+            if b >= 0 and str_slice(src, b, b + 1) == "." { member = true; }
+            while i < n and _is_alnum(str_slice(src, i, i + 1)) { i = i + 1; }
+            let id = str_slice(src, start, i);
+            if depth == 0 and id == "export" and (not member) {
+                i = _to_semi(src, i);
+            } else if id == "fn" and (not member) {
+                // named or anonymous fn: prefix a TOP-LEVEL name; collect params (verbatim) as locals.
+                let k = _skip_spaces(src, i);
+                if k < n and str_slice(src, k, k + 1) == "(" {
+                    out = out + "fn"; i = k;                                  // anonymous
+                } else {
+                    let nm = _read_ident(src, k);
+                    if depth == 0 { out = out + "fn " + prefix + nm; }
+                    else { out = out + "fn " + nm; scopes[len(scopes) - 1][nm] = true; }
+                    i = k + len(nm);
+                }
+                let pk = _skip_spaces(src, i);
+                if pk < n and str_slice(src, pk, pk + 1) == "(" {
+                    out = out + str_slice(src, i, pk);                        // spaces before '('
+                    pending = map{};
+                    let ep = _collect_params(src, pk, pending);              // fills params, returns index past ')'
+                    have_pending = true;
+                    out = out + str_slice(src, pk, ep);                       // emit param list verbatim
+                    i = ep;
+                }
+            } else if (id == "let" or id == "const") and (not member) {
+                let k = _skip_spaces(src, i);
+                let nm = _read_ident(src, k);
+                let k2 = _skip_spaces(src, k + len(nm));
+                let is_imp = false;
+                if k2 < n and str_slice(src, k2, k2 + 1) == "=" {
+                    let k3 = _skip_spaces(src, k2 + 1);
+                    if k3 + 7 <= n and str_slice(src, k3, k3 + 7) == "import(" { is_imp = true; }
+                }
+                if depth == 0 {
+                    if is_imp { i = _to_semi(src, i); }
+                    else { out = out + id + " " + prefix + nm; i = k + len(nm); }
+                } else {
+                    // local let: name stays as-is and shadows any top-level with that name.
+                    if nm != "" { scopes[len(scopes) - 1][nm] = true; }
+                    out = out + id + " " + nm; i = k + len(nm);
+                }
+            } else if (not member) and map_has(var2pref, id) and (not _in_scopes(scopes, id)) {
+                let k = _skip_spaces(src, i);
+                if k < n and str_slice(src, k, k + 1) == "." {
+                    let mk = _skip_spaces(src, k + 1);
+                    let mnm = _read_ident(src, mk);
+                    out = out + var2pref[id] + mnm; i = mk + len(mnm);
+                } else {
+                    out = out + "\x00BARE\x00";
+                }
+            } else if (not member) and map_has(tl, id) and (not _in_scopes(scopes, id)) {
+                let k = _skip_spaces(src, i);
+                if k < n and str_slice(src, k, k + 1) == ":" { out = out + id; }   // map key
+                else { out = out + prefix + id; }
+            } else {
+                out = out + id;
+            }
+        } else if c == "{" {
+            depth = depth + 1; out = out + c; i = i + 1;
+            let sc = map{};
+            if have_pending {
+                let pk = map_keys(pending); let pj = 0;
+                while pj < len(pk) { sc[pk[pj]] = true; pj = pj + 1; }
+                have_pending = false;
+            }
+            array_push(scopes, sc);
+        } else if c == "}" {
+            depth = depth - 1; out = out + c; i = i + 1;
+            if len(scopes) > 1 { pop(scopes); }
+        } else { out = out + c; i = i + 1; }
+    }
+    return out;
+}
+
+// _prep_module(path→prefix): build var2pref for a module from its import bindings.
+fn _var2pref(src, path2pref) {
+    let m = map{};
+    for v in _find_import_bindings(src) {
+        if v.var != nil and v.var != "" {
+            let pf = try path2pref[v.path] catch nil;
+            if pf != nil { m[v.var] = pf; }
+        }
+    }
+    return m;
+}
+
+// inline_source_prefixed(main_src, resolve) — like inline_source but with per-module prefixing,
+// so modules with colliding top-level names link cleanly. Same { ok, source, modules } contract.
+fn inline_source_prefixed(main_src, resolve) {
+    let errbox = map{ err: nil };
+    let reg = map{}; let visiting = map{}; let order = [];
+    for imp in _find_import_bindings(main_src) {
+        _collect(imp.path, resolve, reg, visiting, order, errbox);
+        if errbox.err != nil { return _err(errbox.err); }
+    }
+    // assign a prefix per module path (dep order)
+    let path2pref = map{};
+    let idx = 0;
+    while idx < len(order) { path2pref[order[idx]] = _module_prefix(idx); idx = idx + 1; }
+
+    let pieces = [];
+    let mi = 0;
+    while mi < len(order) {
+        let p = order[mi];
+        let src = reg[p];
+        let prefix = path2pref[p];
+        let sc = _scan_defs_and_locals(src);
+        if sc.nested { return _err("nested/non-top-level import unsupported (in " + p + ")"); }
+        // build the top-level set + shadow / builtin checks
+        let tl = map{};
+        for nm in sc.toplevel {
+            // A top-level def shadows the builtin of the same name for the WHOLE module (pblang
+            // hoists top-level fns/lets), so every in-module bare reference to `nm` means the local
+            // def — prefix it like any other top-level name. `_transform_prefixed` renames only
+            // in-module references (via `tl`), leaving other modules' builtin uses untouched; the
+            // fn DEFINITION is prefixed unconditionally. Modules that truly need the builtin use its
+            // canonical name (e.g. `array_push`, not a redefined `push`). Previously this whole
+            // module was rejected as "unsafe to prefix"; the prefixing is in fact correct, and this
+            // is what lets the self-hosting compiler modules (tokenizer/parser/...) link natively.
+            tl[nm] = true;
+        }
+        let body = _transform_prefixed(src, prefix, _var2pref(src, path2pref), tl);
+        if _contains(body, "\x00BARE\x00") { return _err("import variable used without .member access (unsupported, in " + p + ")"); }
+        array_push(pieces, body);
+        mi = mi + 1;
+    }
+    // main: keep its own top-level names unprefixed (root), but rewrite import-var members.
+    let msc = _scan_defs_and_locals(main_src);
+    if msc.nested { return _err("nested/non-top-level import unsupported (in <main>)"); }
+    let mtl = map{};   // empty: main names are not prefixed
+    let mbody = _transform_prefixed(main_src, "", _var2pref(main_src, path2pref), mtl);
+    if _contains(mbody, "\x00BARE\x00") { return _err("import variable used without .member access (unsupported, in <main>)"); }
+    array_push(pieces, mbody);
+    return map{ ok: true, source: str_join(pieces, "\n"), modules: len(order) };
+}
+
+fn inline_file_prefixed(main_path) {
+    let src = _read_module(main_path);
+    if src == nil { return _err("cannot read main: " + str(main_path)); }
+    fn resolve(p) { return _read_module(p); }
+    return inline_source_prefixed(src, resolve);
+}
+
+// ═══ Bounded product linker ═══════════════════════════════════════════════════
+// The compatibility APIs above accept a resolver closure and retain their old
+// behavior. Product code uses link_modules(), whose complete dependency graph is
+// supplied as immutable in-memory text. Paths are canonical virtual paths, so no
+// module can escape a project root or trigger filesystem/network access.
+
+fn _link_option(options, key, fallback) {
+    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+
+fn _link_limit(options, key, fallback, hard_max) {
+    let value = _link_option(options, key, fallback);
+    if not is_number(value) or value < 1 or value != num_floor(value) or value > hard_max {
+        throw "source linker: " + key + " must be a positive integer <= " + str(hard_max);
+    }
+    return value;
+}
+
+fn link_limits(options = nil) {
+    if options != nil and not is_map(options) { throw "source linker: options must be a map"; }
+    return map{
+        max_modules: _link_limit(options, "max_modules", 256, 4096),
+        max_module_depth: _link_limit(options, "max_module_depth", 64, 256),
+        max_module_source_bytes: _link_limit(options, "max_module_source_bytes", 1048576, 16777216),
+        max_total_source_bytes: _link_limit(options, "max_total_source_bytes", 8388608, 67108864),
+        max_linked_source_bytes: _link_limit(options, "max_linked_source_bytes", 16777216, 134217728),
+        max_path_bytes: _link_limit(options, "max_path_bytes", 1024, 4096)
+    };
+}
+
+fn _virtual_dir(path) {
+    let slash = _last_index_of(path, "/");
+    if slash < 0 { return ""; }
+    return str_slice(path, 0, slash);
+}
+
+// Resolve raw relative to importer while preserving the stdlib: virtual scheme.
+// Absolute paths, backslashes, foreign schemes, controls, and root traversal are
+// rejected. `a/../b.sapp` is canonicalized to `b.sapp`.
+fn _canonical_module_path(raw, importer) {
+    if not is_string(raw) or len(raw) == 0 or len(raw) > 4096 { return nil; }
+    let i = 0;
+    while i < len(raw) {
+        let code = strcharcodeat(raw, i);
+        if code < 32 or code == 127 { return nil; }
+        i = i + 1;
+    }
+    if str_starts_with(raw, "/") or _contains(raw, "\\") { return nil; }
+
+    let scheme = ""; let rel = raw; let parent = importer;
+    if str_starts_with(raw, "stdlib:") {
+        scheme = "stdlib:"; rel = str_slice(raw, 7, len(raw)); parent = "";
+    } elif str_starts_with(importer, "stdlib:") {
+        scheme = "stdlib:"; parent = str_slice(importer, 7, len(importer));
+    } elif _contains(raw, ":") {
+        return nil;
+    }
+    let combined = rel;
+    let base = _virtual_dir(parent);
+    if base != "" { combined = base + "/" + rel; }
+    let parts = str_split(combined, "/");
+    let clean = [];
+    i = 0;
+    while i < len(parts) {
+        let part = parts[i];
+        if part == "" or part == "." { /* normalize */ }
+        elif part == ".." {
+            if len(clean) == 0 { return nil; }
+            array_pop(clean);
+        } else {
+            if part == "." or part == ".." or _contains(part, ":") { return nil; }
+            array_push(clean, part);
+        }
+        i = i + 1;
+    }
+    if len(clean) == 0 { return nil; }
+    return scheme + str_join(clean, "/");
+}
+
+fn _canonical_modules(modules, limits) {
+    if not is_map(modules) { return _err("modules must be a map of virtual path -> source text"); }
+    let out = map{};
+    let keys = map_keys(modules);
+    if len(keys) > limits.max_modules { return _err("supplied module count limit exceeded"); }
+    let supplied_bytes = 0;
+    let i = 0;
+    while i < len(keys) {
+        let path = _canonical_module_path(keys[i], "");
+        if path == nil or len(path) > limits.max_path_bytes { return _err("invalid module path: " + str(keys[i])); }
+        if map_has(out, path) { return _err("duplicate canonical module path: " + path); }
+        if not is_string(modules[keys[i]]) { return _err("module source must be text: " + path); }
+        if len(modules[keys[i]]) > limits.max_module_source_bytes { return _err("module source limit exceeded: " + path); }
+        supplied_bytes = supplied_bytes + len(modules[keys[i]]);
+        if supplied_bytes > limits.max_total_source_bytes { return _err("supplied module source limit exceeded"); }
+        out[path] = modules[keys[i]];
+        i = i + 1;
+    }
+    return map{ ok: true, modules: out, supplied_bytes: supplied_bytes };
+}
+
+fn _collect_bounded(raw_path, importer, modules, limits, state, depth) {
+    if state.err != nil { return; }
+    if depth > limits.max_module_depth { state.err = "module depth limit exceeded"; return; }
+    let path = _canonical_module_path(raw_path, importer);
+    if path == nil or len(path) > limits.max_path_bytes { state.err = "invalid or escaping import path: " + str(raw_path); return; }
+    if map_has(state.reg, path) { return; }
+    if try state.visiting[path] catch false { state.err = "import cycle at " + path; return; }
+    if not map_has(state.discovered, path) {
+        state.discovered[path] = true;
+        state.module_count = state.module_count + 1;
+        if state.module_count > limits.max_modules { state.err = "module count limit exceeded"; return; }
+    }
+    let src = try modules[path] catch nil;
+    if src == nil { state.err = "cannot resolve import: " + path; return; }
+    if len(src) > limits.max_module_source_bytes { state.err = "module source limit exceeded: " + path; return; }
+    if state.total_bytes + len(src) > limits.max_total_source_bytes { state.err = "total module source limit exceeded"; return; }
+    state.total_bytes = state.total_bytes + len(src);
+    state.visiting[path] = true;
+    for imp in _find_import_bindings(src) {
+        _collect_bounded(imp.path, path, modules, limits, state, depth + 1);
+        if state.err != nil { return; }
+    }
+    state.visiting[path] = false;
+    state.reg[path] = src;
+    state.module_bytes[path] = len(src);
+    array_push(state.order, path);
+}
+
+fn _var2pref_canonical(src, importer, path2pref) {
+    let out = map{};
+    for binding in _find_import_bindings(src) {
+        if binding.var != nil and binding.var != "" {
+            let path = _canonical_module_path(binding.path, importer);
+            let prefix = try path2pref[path] catch nil;
+            if prefix != nil { out[binding.var] = prefix; }
+        }
+    }
+    return out;
+}
+
+fn _reserved_toplevel(scan) {
+    let i = 0;
+    while i < len(scan.toplevel) {
+        if str_starts_with(scan.toplevel[i], "__pbi") { return scan.toplevel[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// link_modules(main_source, modules, options) -> flattened, namespaced source.
+// `modules` is an in-memory project snapshot; linking performs no I/O.
+fn link_modules(main_source, modules, options = nil) {
+    if not is_string(main_source) { return _err("main source must be text"); }
+    let limits = link_limits(options);
+    if len(main_source) > limits.max_module_source_bytes { return _err("main source limit exceeded"); }
+    let prepared = _canonical_modules(modules, limits);
+    if not prepared.ok { return prepared; }
+    if len(main_source) + prepared.supplied_bytes > limits.max_total_source_bytes {
+        return _err("total project source limit exceeded");
+    }
+    let entry_path = _canonical_module_path(_link_option(options, "entry_path", "main.sapp"), "");
+    if entry_path == nil or len(entry_path) > limits.max_path_bytes { return _err("invalid entry_path"); }
+
+    let state = map{ err: nil, reg: map{}, visiting: map{}, discovered: map{}, order: [],
+        module_bytes: map{}, module_count: 0, total_bytes: len(main_source) };
+    for imp in _find_import_bindings(main_source) {
+        _collect_bounded(imp.path, entry_path, prepared.modules, limits, state, 1);
+        if state.err != nil { return _err(state.err); }
+    }
+
+    let path2pref = map{};
+    let i = 0;
+    while i < len(state.order) { path2pref[state.order[i]] = _module_prefix(i); i = i + 1; }
+    let pieces = []; let module_value_definitions = map{};
+    let linked_bytes = 0;
+    i = 0;
+    while i < len(state.order) {
+        let path = state.order[i]; let src = state.reg[path];
+        let scan = _scan_defs_and_locals(src);
+        if scan.nested { return _err("nested/non-top-level import unsupported (in " + path + ")"); }
+        let reserved = _reserved_toplevel(scan);
+        if reserved != nil { return _err("module uses reserved linker namespace: " + reserved); }
+        if len(scan.top_values) > 0 { module_value_definitions[path] = scan.top_values; }
+        let top = map{};
+        for name in scan.toplevel { top[name] = true; }
+        let body = _transform_prefixed(src, path2pref[path], _var2pref_canonical(src, path, path2pref), top);
+        if _contains(body, "\x00BARE\x00") { return _err("import variable used without .member access (in " + path + ")"); }
+        linked_bytes = linked_bytes + len(body) + 1;
+        if linked_bytes > limits.max_linked_source_bytes { return _err("linked source limit exceeded"); }
+        array_push(pieces, body);
+        i = i + 1;
+    }
+
+    let main_scan = _scan_defs_and_locals(main_source);
+    if main_scan.nested { return _err("nested/non-top-level import unsupported (in <main>)"); }
+    let main_reserved = _reserved_toplevel(main_scan);
+    if main_reserved != nil { return _err("main uses reserved linker namespace: " + main_reserved); }
+    let main_body = _transform_prefixed(main_source, "", _var2pref_canonical(main_source, entry_path, path2pref), map{});
+    if _contains(main_body, "\x00BARE\x00") { return _err("import variable used without .member access (in <main>)"); }
+    linked_bytes = linked_bytes + len(main_body);
+    if linked_bytes > limits.max_linked_source_bytes { return _err("linked source limit exceeded"); }
+    array_push(pieces, main_body);
+    return map{ ok: true, source: str_join(pieces, "\n"), modules: state.module_count,
+        module_order: state.order, module_bytes: state.module_bytes,
+        module_value_definitions: module_value_definitions,
+        input_bytes: state.total_bytes, supplied_bytes: prepared.supplied_bytes,
+        output_bytes: linked_bytes, entry_path: entry_path,
+        namespace: "prefixed", limits: limits };
+}
+
+export inline_source, inline_file, inline_source_prefixed, inline_file_prefixed;
+export link_limits, link_modules;

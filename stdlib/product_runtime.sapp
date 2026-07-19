@@ -1,0 +1,295 @@
+// stdlib/product_runtime.sapp -- shared bounded execution for pblang products.
+//
+// Product profiles provide conservative admission defaults. Callers may only
+// tighten them. The guard accounts resources before work starts, releases the
+// reservation on every callback outcome, and executes the callback in a
+// memory-safety lifetime. It is policy, not an OS quota mechanism: launchers
+// must still enforce process RSS, CPU, filesystem, network, and device limits.
+
+let RESOURCE = import("stdlib:resource_budget.sapp");
+let MEMORY = import("stdlib:memory_safety.sapp");
+
+let _METRIC_SET = map{};
+let _metrics = RESOURCE.metrics();
+let _metric_i = 0;
+while _metric_i < len(_metrics) {
+    _METRIC_SET[_metrics[_metric_i]] = true;
+    _metric_i = _metric_i + 1;
+}
+
+fn _id(value) { return str_lower(str_trim(str(value ?? ""))); }
+
+fn _limit_number(value) {
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or text == "+nan" or text == "-nan" or
+       text == "inf" or text == "+inf" or text == "-inf" or
+       text == "infinity" or text == "+infinity" or text == "-infinity" {
+        return -1;
+    }
+    let number = try parse_number(text) catch -1;
+    if number == nil { return -1; }
+    return num_floor(number);
+}
+
+fn _copy_map(source) {
+    let out = map{};
+    let keys = try map_keys(source) catch [];
+    let i = 0;
+    while i < len(keys) {
+        let key = str(keys[i]);
+        out[key] = source[key];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _definition(product, workload) {
+    let p = _id(product);
+    let w = _id(workload);
+    if p == "pblang" and (w == "compile" or w == "codegen") {
+        return map{ known: true, scope: "compiler", limits: map{
+            elapsed_ms: 300000, memory_bytes: 2147483648, storage_bytes: 1073741824,
+            output_bytes: 67108864, items: 2000000, workers: 64,
+            allocations: 100000000, tokens: 2097152, restarts: 1
+        }};
+    }
+    if p == "pbide" and (w == "preview" or w == "run") {
+        return map{ known: true, scope: "guarded-child", limits: map{
+            elapsed_ms: 3600000, memory_bytes: 1073741824, storage_bytes: 1073741824,
+            network_bytes: 536870912, output_bytes: 16777216, items: 1000000,
+            workers: 2, allocations: 100000000, frames: 216000,
+            frame_ms: 100, tokens: 1048576, restarts: 2
+        }};
+    }
+    if p == "pbai" and (w == "inference" or w == "generate") {
+        return map{ known: true, scope: "model-inference", limits: map{
+            elapsed_ms: 120000, memory_bytes: 4294967296, output_bytes: 67108864,
+            items: 1000000, workers: 64, allocations: 200000000,
+            tokens: 1048576, restarts: 1
+        }};
+    }
+    if p == "pbai" and (w == "learning" or w == "ingest" or w == "training") {
+        return map{ known: true, scope: "model-learning", limits: map{
+            elapsed_ms: 3600000, memory_bytes: 4294967296, storage_bytes: 8589934592,
+            output_bytes: 67108864, items: 1000000, workers: 64,
+            allocations: 500000000, tokens: 16777216, restarts: 1
+        }};
+    }
+    if p == "pbos" and (w == "service" or w == "restart") {
+        return map{ known: true, scope: "service-supervisor", limits: map{
+            elapsed_ms: 86400000, memory_bytes: 2147483648, storage_bytes: 17179869184,
+            network_bytes: 8589934592, output_bytes: 16777216, items: 10000000,
+            workers: 32, allocations: 100000000, restarts: 8
+        }};
+    }
+    if (p == "pb-mcp-server" or p == "pb_mcp_server") and
+       (w == "request" or w == "dispatch") {
+        return map{ known: true, scope: "tool-dispatch", limits: map{
+            elapsed_ms: 30000, memory_bytes: 268435456, storage_bytes: 67108864,
+            network_bytes: 16777216, output_bytes: 4194304, items: 100000,
+            workers: 4, allocations: 10000000, tokens: 262144, restarts: 0
+        }};
+    }
+    return map{ known: false, scope: "denied", limits: map{} };
+}
+
+fn supported() {
+    return [
+        map{ product: "pblang", workloads: ["compile", "codegen"] },
+        map{ product: "pbide", workloads: ["preview", "run"] },
+        map{ product: "pbai", workloads: ["inference", "generate", "learning", "ingest", "training"] },
+        map{ product: "pbos", workloads: ["service", "restart"] },
+        map{ product: "pb-mcp-server", workloads: ["request", "dispatch"] }
+    ];
+}
+
+fn profile(product, workload, options = nil) {
+    if options == nil { options = map{}; }
+    let p = _id(product);
+    let w = _id(workload);
+    let def = _definition(p, w);
+    if def.known != true {
+        return map{
+            format: "pblang.product_runtime.profile.v1", ok: false,
+            product: p, workload: w, error: "unknown product/workload; admission denied",
+            refused_adjustments: [], budget: RESOURCE.budget("denied", map{})
+        };
+    }
+
+    let limits = map{};
+    let base_keys = map_keys(def.limits);
+    let i = 0;
+    while i < len(base_keys) {
+        let key = str(base_keys[i]);
+        limits[key] = def.limits[key];
+        i = i + 1;
+    }
+
+    let requested = try options.limits catch map{};
+    let requested_keys = try map_keys(requested) catch [];
+    let refused = [];
+    let j = 0;
+    while j < len(requested_keys) {
+        let key = str(requested_keys[j]);
+        let candidate = _limit_number(requested[key]);
+        let known = try _METRIC_SET[key] catch false;
+        let base = try limits[key] catch nil;
+        if not known or base == nil {
+            array_push(refused, map{ metric: key, reason: "metric is not enabled by this product profile" });
+        } elif candidate < 0 {
+            array_push(refused, map{ metric: key, reason: "limit must be a finite non-negative number" });
+        } elif candidate > base {
+            array_push(refused, map{ metric: key, reason: "product overrides may tighten but never expand defaults" });
+        } else {
+            limits[key] = candidate;
+        }
+        j = j + 1;
+    }
+
+    let b = RESOURCE.budget(p + "-" + w, limits, map{ scope: def.scope });
+    return map{
+        format: "pblang.product_runtime.profile.v1",
+        ok: len(refused) == 0,
+        product: p,
+        workload: w,
+        scope: def.scope,
+        error: if len(refused) == 0 { "" } else { "unsafe or unsupported limit override" },
+        refused_adjustments: refused,
+        budget: b
+    };
+}
+
+fn runtime(product, workload, options = nil) {
+    if options == nil { options = map{}; }
+    let configured = profile(product, workload, options);
+    let initial = RESOURCE.usage(try options.initial_usage catch map{});
+    let state = map{
+        format: "pblang.product_runtime.v1",
+        product: configured.product,
+        workload: configured.workload,
+        ready: configured.ok,
+        cancelled: false,
+        error: configured.error,
+        profile: configured,
+        budget: configured.budget,
+        ledger: nil,
+        admitted: 0,
+        denied: 0,
+        completed: 0,
+        failed: 0
+    };
+    if configured.ok {
+        state.ledger = try RESOURCE.ledger(configured.budget, initial) catch nil;
+        if state.ledger == nil {
+            state.ready = false;
+            state.error = "initial usage exceeds the product budget";
+        }
+    }
+    return state;
+}
+
+fn _denied(state, reason) {
+    state.denied = state.denied + 1;
+    return map{
+        format: "pblang.product_runtime.admission.v1", accepted: false,
+        product: state.product, workload: state.workload, reason: reason,
+        version: try state.ledger.version catch 0
+    };
+}
+
+fn admit(state, request) {
+    if state == nil or (try state.format catch "") != "pblang.product_runtime.v1" {
+        return map{ format: "pblang.product_runtime.admission.v1", accepted: false, reason: "invalid runtime" };
+    }
+    if state.ready != true { return _denied(state, state.error); }
+    if state.cancelled { return _denied(state, "runtime cancelled"); }
+    let reservation = RESOURCE.ledger_reserve(state.ledger, RESOURCE.usage(request));
+    if reservation.accepted { state.admitted = state.admitted + 1; }
+    else { state.denied = state.denied + 1; }
+    return map{
+        format: "pblang.product_runtime.admission.v1",
+        accepted: reservation.accepted,
+        product: state.product,
+        workload: state.workload,
+        reason: if reservation.accepted { "admitted" } else { RESOURCE.summary(reservation.evaluation) },
+        reservation: reservation,
+        version: state.ledger.version
+    };
+}
+
+fn try_admit(state, request) {
+    if state == nil or (try state.format catch "") != "pblang.product_runtime.v1" or
+       state.ready != true or state.cancelled {
+        if state != nil { state.denied = (try state.denied catch 0) + 1; }
+        return false;
+    }
+    let accepted = RESOURCE.ledger_try_reserve(state.ledger, request);
+    if accepted { state.admitted = state.admitted + 1; }
+    else { state.denied = state.denied + 1; }
+    return accepted;
+}
+
+fn release(state, usage) {
+    if state == nil or (try state.format catch "") != "pblang.product_runtime.v1" or state.ledger == nil {
+        return false;
+    }
+    return RESOURCE.ledger_try_release(state.ledger, usage);
+}
+
+fn run(state, request, body_fn) {
+    let admission = admit(state, request);
+    if admission.accepted != true {
+        return map{
+            format: "pblang.product_runtime.run.v1", ok: false,
+            admitted: false, error: admission.reason, admission: admission
+        };
+    }
+    let outcome = MEMORY.scope_result(body_fn);
+    let released = release(state, request);
+    if outcome.ok {
+        state.completed = state.completed + 1;
+        return map{
+            format: "pblang.product_runtime.run.v1", ok: true, admitted: true,
+            value: outcome.value, released: released, admission: admission
+        };
+    }
+    state.failed = state.failed + 1;
+    return map{
+        format: "pblang.product_runtime.run.v1", ok: false, admitted: true,
+        error: "guarded product operation failed", released: released, admission: admission
+    };
+}
+
+fn run_once(product, workload, request, body_fn, options = nil) {
+    return run(runtime(product, workload, options), request, body_fn);
+}
+
+fn cancel(state, reason = "cancelled") {
+    if state != nil {
+        state.cancelled = true;
+        state.error = str(reason);
+    }
+    return state;
+}
+
+fn snapshot(state) {
+    if state == nil {
+        return map{ format: "pblang.product_runtime.snapshot.v1", ready: false, error: "invalid runtime" };
+    }
+    let usage = map{};
+    let version = 0;
+    if state.ledger != nil {
+        usage = _copy_map(try state.ledger.usage.values catch map{});
+        version = try state.ledger.version catch 0;
+    }
+    return map{
+        format: "pblang.product_runtime.snapshot.v1",
+        product: state.product, workload: state.workload,
+        ready: state.ready, cancelled: state.cancelled, error: state.error,
+        usage: usage, limits: _copy_map(try state.budget.limits catch map{}), version: version,
+        admitted: state.admitted, denied: state.denied,
+        completed: state.completed, failed: state.failed
+    };
+}
+
+export supported, profile, runtime, admit, try_admit, release, run, run_once, cancel, snapshot;

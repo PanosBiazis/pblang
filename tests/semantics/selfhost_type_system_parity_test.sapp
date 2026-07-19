@@ -1,0 +1,155 @@
+// Self-hosted type-expression, generic, struct, enum and exhaustiveness parity.
+let T = import("stdlib/compiler/tokenizer.sapp");
+let P = import("stdlib/compiler/parser.sapp");
+let C = import("stdlib/compiler/typeck.sapp");
+
+fn fail(message) { throw "FAIL selfhost-type-system-parity: " + message; }
+fn parse(source) { return P.parse(T.tokenize(source)); }
+fn check(source) {
+    let ast = parse(source);
+    if len(ast.errors) != 0 { fail("fixture parse error: " + str(ast.errors)); }
+    return C.type_check(ast.stmts);
+}
+fn has(diags, needle) {
+    let i = 0;
+    while i < len(diags) {
+        if str_contains(diags[i].message, needle) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+fn has_code(diags, code) {
+    let i = 0;
+    while i < len(diags) {
+        if diags[i].code == code { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Canonical strings preserve the public AST while covering the full recursive grammar.
+let typed = parse("let a: number? = nil; let b: array<number?> = [1, nil]; let c: map<string,array<number!>> = map{}; let d: result<array<number>,string> = nil;");
+if len(typed.errors) != 0 { fail("recursive type syntax was rejected: " + str(typed.errors)); }
+if typed.stmts[0].type != "number?" { fail("option annotation was not canonical"); }
+if typed.stmts[1].type != "array<number?>" { fail("nested option annotation was not canonical"); }
+if typed.stmts[2].type != "map<string,array<number!>>" { fail("nested map/non-null annotation was not canonical"); }
+if typed.stmts[3].type != "result<array<number>,string>" { fail("result annotation was not canonical"); }
+let reusable_tokens = T.tokenize("let x: map<string,array<number>> = map{};");
+let reusable_first = P.parse(reusable_tokens); let reusable_second = P.parse(reusable_tokens);
+if len(reusable_first.errors) != 0 or len(reusable_second.errors) != 0
+   or reusable_first.stmts[0].type != reusable_second.stmts[0].type {
+    fail("parser mutated reusable nested-type tokens");
+}
+
+let nested = C.ty_from_name("map<string,result<array<number?>,string>>");
+if C.ty_to_string(nested) != "map<string,result<array<number?>,string>>" { fail("type model roundtrip failed"); }
+if C.ty_to_string(C.ty_from_name("decimal!")) != "decimal!" { fail("non-null precision type roundtrip failed"); }
+if C.ty_to_string(C.ty_result(C.ty_bigint(), C.ty_string())) != "result<bigint,string>" {
+    fail("public precision/result type constructors are unavailable");
+}
+
+// Option/non-null/result and precision annotations have concrete assignment rules.
+if len(check("let x: number? = nil; let y: bigint = bigint(3); let z: decimal = decimal(\"3.5\");")) != 0 {
+    fail("valid option/precision annotations were rejected");
+}
+if len(check("let d: decimal = decimal(\"1\") + bigint(2); let r: rational = rational(1, 2) + bigint(1);")) != 0 {
+    fail("numeric precision widening was rejected");
+}
+if not has_code(check("let x: number! = nil;"), "non-null") { fail("non-null nil initializer was accepted"); }
+if not has(check("let x: number! = 1; x = nil;"), "assignment type mismatch") { fail("non-null reassignment was accepted"); }
+if not has(check("let x: result<number,string> = 1;"), "type mismatch") { fail("plain value was accepted as result"); }
+
+// Generic substitution works for direct and nested parameter/return positions.
+let generic_good = "fn id(x: T): T { return x; } fn first(xs: array<T>): T { return xs[0]; } let n: number = id(3); let s: string = id(\"ok\"); let f: number = first([1, 2]);";
+if len(check(generic_good)) != 0 { fail("valid generic substitution produced diagnostics"); }
+if not has(check("fn pair(a: T, b: T): T { return a; } let bad = pair(1, \"x\");"), "argument 2 type mismatch") {
+    fail("conflicting generic arguments were accepted");
+}
+
+// Struct constructor arguments and fields retain their declared types.
+let struct_bad = check("struct Point { x: number, label: string } let p = Point(1, 2); let wrong: string = p.x; let absent = p.z;");
+if not has(struct_bad, "argument 2 type mismatch") { fail("struct constructor type was discarded"); }
+if not has(struct_bad, "type mismatch for 'wrong'") { fail("struct field type was not inferred"); }
+if not has_code(struct_bad, "unknown-field") { fail("unknown struct field was accepted"); }
+if len(check("struct Point { x: number, label: string } let p = Point(1, \"ok\"); let x: number = p.x; let s: string = p.label;")) != 0 {
+    fail("valid typed struct was rejected");
+}
+
+// Enum namespaces retain variants and typed data-constructor parameters.
+let enum_bad = check("enum Shape { Empty, Circle(number) } let c = Shape.Circle(\"bad\"); let missing = Shape.Rect;");
+if not has(enum_bad, "argument 1 type mismatch") { fail("enum payload type was discarded"); }
+if not has_code(enum_bad, "unknown-variant") { fail("unknown enum variant was accepted"); }
+if len(check("enum Shape { Empty, Circle(number) } let c: Shape = Shape.Circle(2);")) != 0 {
+    fail("valid typed enum instance was rejected");
+}
+let cross_adt = "struct Node { shape: Shape } enum Shape { Empty, Box(Node) } "
+    + "let leaf = Node(Shape.Empty); let boxed: Shape = Shape.Box(leaf);";
+if len(check(cross_adt)) != 0 {
+    fail("forward struct/enum cross-reference was rejected");
+}
+
+let non_exhaustive = check("enum Color { Red, Green, Blue } fn code(c: Color): number { return match c.__variant { case \"Red\": 1; case \"Green\": 2; }; }");
+if not has_code(non_exhaustive, "non-exhaustive-match") or not has(non_exhaustive, "Blue") {
+    fail("missing enum variant was not diagnosed");
+}
+if len(check("enum Color { Red, Green, Blue } fn code(c: Color): number { return match c.__variant { case \"Red\": 1; case \"Green\": 2; case \"Blue\": 3; }; }")) != 0 {
+    fail("exhaustive enum match was rejected");
+}
+if len(check("enum Color { Red, Green, Blue } fn code(c: Color): number { return match c.__variant { case \"Red\": 1; else: 0 }; }")) != 0 {
+    fail("enum match with else was rejected");
+}
+
+// Malformed and pathological annotations produce parser errors, never loops/crashes.
+if len(parse("let x: map<number> = map{};").errors) == 0 { fail("malformed map type was accepted"); }
+if len(parse("let x: array<number>> = [];").errors) == 0 { fail("extra generic delimiter was accepted"); }
+let deep = "let x: "; let depth_i = 0;
+while depth_i < 70 { deep = deep + "array<"; depth_i = depth_i + 1; }
+deep = deep + "number"; depth_i = 0;
+while depth_i < 70 { deep = deep + ">"; depth_i = depth_i + 1; }
+deep = deep + " = [];";
+if len(parse(deep).errors) == 0 { fail("type nesting budget was not enforced"); }
+
+let deep_model = "number"; depth_i = 0;
+while depth_i < 70 { deep_model = "array<" + deep_model + ">"; depth_i = depth_i + 1; }
+if C.ty_to_string(C.ty_from_name(deep_model)) != "any" { fail("type-model nesting budget was not enforced"); }
+let long_model = "T"; depth_i = 0;
+while depth_i < 4200 { long_model = long_model + "x"; depth_i = depth_i + 1; }
+if C.ty_to_string(C.ty_from_name(long_model)) != "any" { fail("type-model text budget was not enforced"); }
+
+let malformed_enum = [map{
+    kind: "let", name: "Broken", type: nil,
+    value: map{ kind: "map", entries: [map{ key: "A", value: map{ kind: "fn_lit" } }] }
+}];
+if not has_code(C.type_check(malformed_enum), "malformed-ast") {
+    fail("malformed enum constructor metadata was not diagnosed");
+}
+
+let huge_entries = []; depth_i = 0;
+while depth_i < 4097 {
+    array_push(huge_entries, map{ key: "V" + str(depth_i), value: map{ kind: "map", entries: [] } });
+    depth_i = depth_i + 1;
+}
+let huge_enum = [map{ kind: "let", name: "HugeEnum", type: nil, value: map{ kind: "map", entries: huge_entries } }];
+if not has_code(C.type_check(huge_enum), "resource-limit") {
+    fail("enum member budget was not enforced");
+}
+
+let huge_params = []; depth_i = 0;
+while depth_i < 4097 {
+    array_push(huge_params, map{ name: "p" + str(depth_i), type: "number", default: nil });
+    depth_i = depth_i + 1;
+}
+let huge_struct = [map{
+    kind: "fn", name: "HugeStruct", params: huge_params, ret: nil,
+    body: map{ kind: "block", stmts: [map{
+        kind: "return",
+        value: map{ kind: "map", entries: [map{
+            key: "__struct", value: map{ kind: "string", value: "HugeStruct" }
+        }] }
+    }] }
+}];
+if not has_code(C.type_check(huge_struct), "resource-limit") {
+    fail("struct member budget was not enforced");
+}
+
+print "selfhost_type_system_parity_pass";

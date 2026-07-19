@@ -1,0 +1,470 @@
+// stdlib/redis.sapp -- bounded, shell-free Redis RESP2 client in PBLang.
+//
+// The client speaks RESP2 directly over the existing capability-gated TCP/TLS
+// builtins. It never invokes redis-cli and never builds shell commands. Values
+// are UTF-8 strings; callers that need structured values should JSON-encode them.
+// Every read is bounded by max_response_bytes/max_bulk_bytes/max_array_items and
+// max_depth. TLS certificate verification is provided by tcp_connect_tls.
+
+let NET = import("stdlib:net.sapp");
+
+let DEFAULT_MAX_ARGUMENT_BYTES = 1048576;
+let DEFAULT_MAX_RESPONSE_BYTES = 16777216;
+let DEFAULT_MAX_BULK_BYTES = 8388608;
+let DEFAULT_MAX_ARRAY_ITEMS = 4096;
+let DEFAULT_MAX_DEPTH = 32;
+let DEFAULT_MAX_LINE_BYTES = 65536;
+let MAX_SAFE_INTEGER = 9007199254740991;
+
+fn _option(options, name, fallback) {
+    if type(options) == "map" and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _quantity(value, fallback, minimum, maximum) {
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or str_contains(text, "inf") { return fallback; }
+    let n = try parse_number(text) catch fallback;
+    if n == nil { n = fallback; }
+    n = num_floor(n);
+    if n < minimum { n = minimum; }
+    if n > maximum { n = maximum; }
+    return n;
+}
+
+fn _byte_length(text) { return len(str_to_bytes(str(text))); }
+
+fn _port(value) {
+    let n = try parse_number(str_trim(str(value))) catch nil;
+    if n == nil or num_floor(n) != n or n < 1 or n > 65535 { return nil; }
+    return n;
+}
+
+fn _arg_text(value) {
+    let kind = type(value);
+    if kind == "string" or kind == "number" or kind == "bool" { return str(value); }
+    throw "redis.encode: arguments must be strings, numbers, or booleans";
+}
+
+// encode(args, max_argument_bytes?) -> one RESP2 array command.
+fn encode(args, max_argument_bytes = nil) {
+    if type(args) != "array" or len(args) == 0 { throw "redis.encode: non-empty argument array required"; }
+    if len(args) > DEFAULT_MAX_ARRAY_ITEMS { throw "redis.encode: too many arguments"; }
+    let limit = DEFAULT_MAX_ARGUMENT_BYTES;
+    if max_argument_bytes != nil {
+        limit = _quantity(max_argument_bytes, DEFAULT_MAX_ARGUMENT_BYTES, 1, DEFAULT_MAX_RESPONSE_BYTES);
+    }
+    let out = "*" + str(len(args)) + "\r\n";
+    let i = 0;
+    while i < len(args) {
+        let text = _arg_text(args[i]);
+        let bytes = _byte_length(text);
+        if bytes > limit { throw "redis.encode: argument exceeds byte limit"; }
+        out = out + "$" + str(bytes) + "\r\n" + text + "\r\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _encode_value(value, depth, max_depth, max_bulk) {
+    if depth > max_depth { throw "redis.encode_value: nesting exceeds limit"; }
+    if value == nil { return "$-1\r\n"; }
+    let kind = type(value);
+    if kind == "number" {
+        let n = num_floor(value);
+        if n != value or n > MAX_SAFE_INTEGER or n < 0 - MAX_SAFE_INTEGER {
+            throw "redis.encode_value: RESP2 integer must be an exact safe integer";
+        }
+        return ":" + str(n) + "\r\n";
+    }
+    if kind == "string" {
+        let bytes = _byte_length(value);
+        if bytes > max_bulk { throw "redis.encode_value: bulk value exceeds limit"; }
+        return "$" + str(bytes) + "\r\n" + value + "\r\n";
+    }
+    if kind == "array" {
+        if len(value) > DEFAULT_MAX_ARRAY_ITEMS { throw "redis.encode_value: array exceeds limit"; }
+        let out = "*" + str(len(value)) + "\r\n";
+        let i = 0;
+        while i < len(value) { out = out + _encode_value(value[i], depth + 1, max_depth, max_bulk); i = i + 1; }
+        return out;
+    }
+    if kind == "map" and (try value.__redis_error catch false) {
+        let message = str(try value.message catch "ERR");
+        if str_contains(message, "\r") or str_contains(message, "\n") { throw "redis.encode_value: error contains line break"; }
+        return "-" + message + "\r\n";
+    }
+    throw "redis.encode_value: unsupported response value";
+}
+
+// encode_value is primarily useful for RESP-compatible servers and protocol
+// tests. Client commands should use encode(), which always emits bulk arguments.
+fn encode_value(value, options = nil) {
+    let limits = _limits(options);
+    return _encode_value(value, 0, limits.max_depth, limits.max_bulk);
+}
+
+fn _slice_text(bytes, start, end) {
+    let part = [];
+    let i = start;
+    while i < end { array_push(part, bytes[i]); i = i + 1; }
+    return bytes_to_str(part);
+}
+
+fn _line(bytes, start, max_line) {
+    let i = start;
+    while i + 1 < len(bytes) and i - start <= max_line {
+        if bytes[i] == 13 and bytes[i + 1] == 10 {
+            return map{ ok: true, text: _slice_text(bytes, start, i), next: i + 2 };
+        }
+        i = i + 1;
+    }
+    if i - start > max_line { return map{ ok: false, error: "RESP line exceeds limit" }; }
+    return map{ ok: false, error: "incomplete RESP line", incomplete: true };
+}
+
+fn _integer_text(text) {
+    if len(text) == 0 { return nil; }
+    let i = 0;
+    if text[0] == "-" or text[0] == "+" {
+        if len(text) == 1 { return nil; }
+        i = 1;
+    }
+    while i < len(text) {
+        let c = strcharcodeat(text, i);
+        if c < 48 or c > 57 { return nil; }
+        i = i + 1;
+    }
+    let n = try parse_number(text) catch nil;
+    if n == nil { return nil; }
+    if n > MAX_SAFE_INTEGER or n < 0 - MAX_SAFE_INTEGER { return text; }
+    return n;
+}
+
+fn _length(text, maximum) {
+    let value = _integer_text(text);
+    if type(value) != "number" or value < -1 or value > maximum { return nil; }
+    return value;
+}
+
+fn _limits(options) {
+    return map{
+        max_response: _quantity(_option(options, "max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES), DEFAULT_MAX_RESPONSE_BYTES, 64, 268435456),
+        max_bulk: _quantity(_option(options, "max_bulk_bytes", DEFAULT_MAX_BULK_BYTES), DEFAULT_MAX_BULK_BYTES, 1, 268435456),
+        max_array: _quantity(_option(options, "max_array_items", DEFAULT_MAX_ARRAY_ITEMS), DEFAULT_MAX_ARRAY_ITEMS, 1, 1000000),
+        max_depth: _quantity(_option(options, "max_depth", DEFAULT_MAX_DEPTH), DEFAULT_MAX_DEPTH, 1, 128),
+        max_line: _quantity(_option(options, "max_line_bytes", DEFAULT_MAX_LINE_BYTES), DEFAULT_MAX_LINE_BYTES, 16, 1048576)
+    };
+}
+
+fn _bad(message, incomplete = false) {
+    return map{ ok: false, error: message, incomplete: incomplete };
+}
+
+fn _parse_at(bytes, pos, depth, limits) {
+    if depth > limits.max_depth { return _bad("RESP nesting exceeds limit"); }
+    if pos >= len(bytes) { return _bad("incomplete RESP value", true); }
+    let prefix = bytes[pos];
+    let line = _line(bytes, pos + 1, limits.max_line);
+    if not line.ok { return line; }
+
+    if prefix == 43 { return map{ ok: true, value: line.text, next: line.next }; } // +
+    if prefix == 45 { // -
+        return map{ ok: true, value: map{ format: "pblang.redis.error.v1", __redis_error: true, message: line.text }, next: line.next };
+    }
+    if prefix == 58 { // :
+        let value = _integer_text(line.text);
+        if value == nil { return _bad("invalid RESP integer"); }
+        return map{ ok: true, value: value, next: line.next };
+    }
+    if prefix == 36 { // $
+        let count = _length(line.text, limits.max_bulk);
+        if count == nil { return _bad("invalid or oversized RESP bulk length"); }
+        if count == -1 { return map{ ok: true, value: nil, next: line.next }; }
+        let end = line.next + count;
+        if end + 2 > len(bytes) { return _bad("incomplete RESP bulk value", true); }
+        if bytes[end] != 13 or bytes[end + 1] != 10 { return _bad("RESP bulk value missing terminator"); }
+        return map{ ok: true, value: _slice_text(bytes, line.next, end), next: end + 2 };
+    }
+    if prefix == 42 { // *
+        let count = _length(line.text, limits.max_array);
+        if count == nil { return _bad("invalid or oversized RESP array length"); }
+        if count == -1 { return map{ ok: true, value: nil, next: line.next }; }
+        let values = [];
+        let next = line.next;
+        let i = 0;
+        while i < count {
+            let item = _parse_at(bytes, next, depth + 1, limits);
+            if not item.ok { return item; }
+            array_push(values, item.value);
+            next = item.next;
+            i = i + 1;
+        }
+        return map{ ok: true, value: values, next: next };
+    }
+    return _bad("unsupported RESP2 prefix");
+}
+
+// parse(raw, options?) validates that raw contains exactly one complete frame.
+fn parse(raw, options = nil) {
+    if type(raw) != "string" { return _bad("RESP input must be a string"); }
+    let bytes = str_to_bytes(raw);
+    let limits = _limits(options);
+    if len(bytes) > limits.max_response { return _bad("RESP response exceeds limit"); }
+    let result = _parse_at(bytes, 0, 0, limits);
+    if not result.ok { return result; }
+    if result.next != len(bytes) { return _bad("trailing bytes after RESP value"); }
+    return map{ ok: true, value: result.value, consumed_bytes: result.next };
+}
+
+fn _consume(budget, count) {
+    budget.left = budget.left - count;
+    return budget.left >= 0;
+}
+
+fn _socket_line(client, budget) {
+    let raw = try NET.tcp_read_until(client.handle, "\r\n", client.max_line + 2) catch nil;
+    if raw == nil or not str_ends_with(raw, "\r\n") { return _bad("incomplete Redis response line", true); }
+    let bytes = _byte_length(raw);
+    if bytes > client.max_line + 2 or not _consume(budget, bytes) { return _bad("Redis response exceeds limit"); }
+    return map{ ok: true, text: str_slice(raw, 0, len(raw) - 2) };
+}
+
+fn _read_socket(client, depth, budget) {
+    if depth > client.max_depth { return _bad("Redis nesting exceeds limit"); }
+    let marker = try NET.tcp_read(client.handle, 1) catch nil;
+    if marker == nil or _byte_length(marker) != 1 { return _bad("incomplete Redis response", true); }
+    if not _consume(budget, 1) { return _bad("Redis response exceeds limit"); }
+    let line = _socket_line(client, budget);
+    if not line.ok { return line; }
+
+    if marker == "+" { return map{ ok: true, value: line.text }; }
+    if marker == "-" { return map{ ok: true, value: map{ format: "pblang.redis.error.v1", __redis_error: true, message: line.text } }; }
+    if marker == ":" {
+        let value = _integer_text(line.text);
+        if value == nil { return _bad("invalid Redis integer"); }
+        return map{ ok: true, value: value };
+    }
+    if marker == "$" {
+        let count = _length(line.text, client.max_bulk);
+        if count == nil { return _bad("invalid or oversized Redis bulk length"); }
+        if count == -1 { return map{ ok: true, value: nil }; }
+        if count + 2 > budget.left { return _bad("Redis bulk value exceeds response limit"); }
+        let payload = try NET.tcp_read(client.handle, count) catch nil;
+        if payload == nil or _byte_length(payload) != count { return _bad("incomplete Redis bulk value", true); }
+        let ending = try NET.tcp_read(client.handle, 2) catch nil;
+        if ending != "\r\n" { return _bad("Redis bulk value missing terminator"); }
+        if not _consume(budget, count + 2) { return _bad("Redis response exceeds limit"); }
+        return map{ ok: true, value: payload };
+    }
+    if marker == "*" {
+        let count = _length(line.text, client.max_array);
+        if count == nil { return _bad("invalid or oversized Redis array length"); }
+        if count == -1 { return map{ ok: true, value: nil }; }
+        let values = [];
+        let i = 0;
+        while i < count {
+            let item = _read_socket(client, depth + 1, budget);
+            if not item.ok { return item; }
+            array_push(values, item.value);
+            i = i + 1;
+        }
+        return map{ ok: true, value: values };
+    }
+    return _bad("unsupported Redis RESP2 prefix");
+}
+
+// read_frame(handle, options?) decodes one bounded RESP2 frame from an existing
+// stream without taking ownership of the handle. This supports PBLang-written
+// protocol servers and deterministic loopback tests.
+fn read_frame(handle, options = nil) {
+    let limits = _limits(options);
+    let reader = map{ handle: handle, max_response: limits.max_response,
+                      max_bulk: limits.max_bulk, max_array: limits.max_array,
+                      max_depth: limits.max_depth, max_line: limits.max_line };
+    return _read_socket(reader, 0, map{ left: limits.max_response });
+}
+
+fn _valid_host(host) {
+    if type(host) != "string" or len(host) == 0 or _byte_length(host) > 255 { return false; }
+    if str_contains(host, "\r") or str_contains(host, "\n") or str_contains(host, "\x00") { return false; }
+    let bytes = str_to_bytes(host); let i = 0;
+    while i < len(bytes) {
+        if bytes[i] <= 32 or bytes[i] == 127 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _new_client(handle, options, host, port, use_tls) {
+    let limits = _limits(options);
+    return map{
+        format: "pblang.redis.client.v1", handle: handle, open: true,
+        host: host, port: port, tls: use_tls,
+        max_argument: _quantity(_option(options, "max_argument_bytes", DEFAULT_MAX_ARGUMENT_BYTES), DEFAULT_MAX_ARGUMENT_BYTES, 1, 268435456),
+        max_response: limits.max_response, max_bulk: limits.max_bulk,
+        max_array: limits.max_array, max_depth: limits.max_depth, max_line: limits.max_line,
+        commands: 0, failures: 0
+    };
+}
+
+fn close(client) {
+    if type(client) != "map" or not (try client.open catch false) { return false; }
+    let ok = try { NET.tcp_close(client.handle); true } catch false;
+    client.open = false;
+    return ok;
+}
+
+fn command(client, args) {
+    if type(client) != "map" or not (try client.open catch false) {
+        return map{ ok: false, error: "Redis client is closed" };
+    }
+    let frame = try encode(args, client.max_argument) catch nil;
+    if frame == nil { client.failures = client.failures + 1; return map{ ok: false, error: "invalid Redis command arguments" }; }
+    let wrote = try NET.tcp_write(client.handle, frame) catch nil;
+    if wrote == nil { client.failures = client.failures + 1; close(client); return map{ ok: false, error: "Redis write failed" }; }
+    let budget = map{ left: client.max_response };
+    let response = try _read_socket(client, 0, budget) catch nil;
+    if response == nil or not response.ok {
+        client.failures = client.failures + 1;
+        close(client);
+        return map{ ok: false, error: try response.error catch "Redis response failed" };
+    }
+    client.commands = client.commands + 1;
+    if type(response.value) == "map" and (try response.value.__redis_error catch false) {
+        client.failures = client.failures + 1;
+        return map{ ok: false, error: response.value.message, redis_error: true };
+    }
+    return map{ ok: true, value: response.value };
+}
+
+fn pipeline(client, commands) {
+    if type(client) != "map" or not (try client.open catch false) { return map{ ok: false, error: "Redis client is closed" }; }
+    if type(commands) != "array" or len(commands) == 0 or len(commands) > 256 {
+        return map{ ok: false, error: "Redis pipeline requires 1..256 commands" };
+    }
+    let frame = "";
+    let i = 0;
+    while i < len(commands) {
+        let encoded = try encode(commands[i], client.max_argument) catch nil;
+        if encoded == nil { return map{ ok: false, error: "invalid Redis pipeline command" }; }
+        if _byte_length(frame) + _byte_length(encoded) > client.max_response {
+            return map{ ok: false, error: "Redis pipeline request exceeds limit" };
+        }
+        frame = frame + encoded;
+        i = i + 1;
+    }
+    let wrote = try NET.tcp_write(client.handle, frame) catch nil;
+    if wrote == nil { client.failures = client.failures + 1; close(client); return map{ ok: false, error: "Redis pipeline write failed" }; }
+    let results = [];
+    let budget = map{ left: client.max_response };
+    i = 0;
+    while i < len(commands) {
+        let response = try _read_socket(client, 0, budget) catch nil;
+        if response == nil or not response.ok {
+            client.failures = client.failures + 1; close(client);
+            return map{ ok: false, error: try response.error catch "Redis pipeline response failed" };
+        }
+        if type(response.value) == "map" and (try response.value.__redis_error catch false) {
+            array_push(results, map{ ok: false, error: response.value.message, redis_error: true });
+            client.failures = client.failures + 1;
+        } else {
+            array_push(results, map{ ok: true, value: response.value });
+        }
+        client.commands = client.commands + 1;
+        i = i + 1;
+    }
+    return map{ ok: true, results: results };
+}
+
+// connect(options) returns {ok, client|error}; open(options) throws on failure.
+// options: host, port, tls, username, password, database and all parser limits.
+fn connect(options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return map{ ok: false, error: "Redis options must be a map" }; }
+    let host = _option(options, "host", "127.0.0.1");
+    let port = _port(_option(options, "port", 6379));
+    if not _valid_host(host) { return map{ ok: false, error: "invalid Redis host" }; }
+    if port == nil { return map{ ok: false, error: "invalid Redis port" }; }
+    let use_tls = _option(options, "tls", false) == true;
+    let handle = nil;
+    if use_tls { handle = try NET.tcp_connect_tls(host, port) catch nil; }
+    else { handle = try NET.tcp_connect(NET.host_port(host, port)) catch nil; }
+    if handle == nil { return map{ ok: false, error: "could not connect to Redis" }; }
+    let client = _new_client(handle, options, host, port, use_tls);
+
+    let password = _option(options, "password", nil);
+    if password != nil {
+        let username = _option(options, "username", nil);
+        let auth = nil;
+        if username == nil { auth = command(client, ["AUTH", str(password)]); }
+        else { auth = command(client, ["AUTH", str(username), str(password)]); }
+        if not auth.ok { close(client); return map{ ok: false, error: "Redis authentication failed" }; }
+    }
+    let database = _quantity(_option(options, "database", 0), 0, 0, 2147483647);
+    if database != 0 {
+        let selected = command(client, ["SELECT", database]);
+        if not selected.ok { close(client); return map{ ok: false, error: "Redis database selection failed" }; }
+    }
+    return map{ ok: true, client: client };
+}
+
+fn open(options = nil) {
+    let result = connect(options);
+    if not result.ok { throw "redis.open: " + result.error; }
+    return result.client;
+}
+
+fn ping(client, message = nil) {
+    if message == nil { return command(client, ["PING"]); }
+    return command(client, ["PING", message]);
+}
+fn get(client, key) { return command(client, ["GET", key]); }
+fn set(client, key, value, options = nil) {
+    let args = ["SET", key, value];
+    if type(options) == "map" {
+        let ttl = _quantity(_option(options, "ttl_ms", 0), 0, 0, MAX_SAFE_INTEGER);
+        if ttl > 0 { array_push(args, "PX"); array_push(args, ttl); }
+        if _option(options, "nx", false) == true { array_push(args, "NX"); }
+        if _option(options, "xx", false) == true { array_push(args, "XX"); }
+    }
+    return command(client, args);
+}
+fn remove(client, keys) {
+    if type(keys) != "array" { keys = [keys]; }
+    if len(keys) == 0 { return map{ ok: true, value: 0 }; }
+    let args = ["DEL"]; let i = 0;
+    while i < len(keys) { array_push(args, keys[i]); i = i + 1; }
+    return command(client, args);
+}
+fn exists(client, key) { return command(client, ["EXISTS", key]); }
+fn expire(client, key, ttl_ms) { return command(client, ["PEXPIRE", key, ttl_ms]); }
+fn ttl(client, key) { return command(client, ["PTTL", key]); }
+fn scan(client, cursor = 0, pattern = nil, count = 100) {
+    let args = ["SCAN", cursor];
+    if pattern != nil { array_push(args, "MATCH"); array_push(args, pattern); }
+    array_push(args, "COUNT"); array_push(args, _quantity(count, 100, 1, 10000));
+    return command(client, args);
+}
+
+fn stats(client) {
+    return map{
+        format: "pblang.redis.client.stats.v1", open: try client.open catch false,
+        host: try client.host catch "", port: try client.port catch 0,
+        tls: try client.tls catch false, commands: try client.commands catch 0,
+        failures: try client.failures catch 0,
+        max_response_bytes: try client.max_response catch 0,
+        max_bulk_bytes: try client.max_bulk catch 0
+    };
+}
+
+fn with_client(options, body) {
+    let result = connect(options);
+    if not result.ok { return result; }
+    let outcome = try map{ ok: true, value: body(result.client) } catch map{ ok: false, error: "Redis body failed" };
+    close(result.client);
+    return outcome;
+}
+
+export encode, encode_value, parse, read_frame, connect, open, close, command, pipeline;
+export ping, get, set, remove, exists, expire, ttl, scan, stats, with_client;

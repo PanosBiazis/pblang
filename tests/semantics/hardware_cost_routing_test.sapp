@@ -1,0 +1,135 @@
+let CP = import("stdlib:compute.sapp");
+let A = import("stdlib:accelerator.sapp");
+
+fn require(ok, message) { if not ok { throw "FAIL " + message; } }
+fn eq(actual, expected, message) {
+    if actual != expected { throw "FAIL " + message + " got=" + str(actual) + " expected=" + str(expected); }
+}
+
+let cpu_devices = [
+    map{ kind: "cpu", present: true, usable: true, available: true, units: 8, weight: 8 },
+];
+
+let cheap = CP.policy(map{
+    preferred_device: "cpu", min_parallel_items: 1, max_workers: 8,
+    workload: "generic",
+});
+let cheap_route = CP.select_device(128, cpu_devices, cheap);
+eq(cheap_route.mode, "sequential", "cheap generic work stays serial");
+eq(cheap_route.parallel_reason, "parallel_overhead_not_amortized", "serial route explains overhead");
+eq(cheap_route.workers, 1, "serial route uses one worker");
+
+let heavy = CP.policy(map{
+    preferred_device: "cpu", min_parallel_items: 1, max_workers: 8,
+    work_units_per_item: 4096,
+});
+let heavy_route = CP.select_device(8, cpu_devices, heavy);
+eq(heavy_route.mode, "parallel", "heavy CPU work amortizes thread overhead");
+eq(heavy_route.workers, 8, "worker count scales only to useful work and items");
+
+let saturated_cfg = CP.policy(map{
+    work_units_per_item: 1000000000,
+    transfer_bytes_per_item: 1000000000,
+});
+let saturated = CP.estimate_work(1000000000, saturated_cfg);
+require(saturated.saturated, "cost arithmetic saturates instead of overflowing");
+eq(saturated.work_units, 9007199254740991, "work saturation uses exact-number ceiling");
+
+let large_plan = CP.plan(1000000000, [
+    map{ kind: "cpu", usable: true, weight: 1000000000 },
+    map{ kind: "simd", usable: true, weight: 1000000000 },
+]);
+eq(large_plan[0].count, 500000000, "large proportional plan keeps exact first share");
+eq(large_plan[0].count + large_plan[1].count, 1000000000,
+   "large proportional plan neither overflows nor loses work");
+let infinite_weight = num_pow(2.0, 1100.0);
+let invalid_weight_plan = CP.plan(3, [
+    map{ kind: "gpu", usable: true, weight: infinite_weight - infinite_weight },
+]);
+eq(invalid_weight_plan[0].kind, "cpu", "NaN device weight triggers safe CPU fallback");
+eq(invalid_weight_plan[0].count, 3, "NaN device weight cannot lose planned work");
+
+let accelerated_devices = [
+    map{ kind: "cpu", present: true, usable: true, available: true, units: 8, weight: 8 },
+    map{ kind: "gpu", present: true, usable: true, available: true, units: 1, weight: 32 },
+    map{ kind: "simd", present: true, usable: true, available: true, units: 1, weight: 8 },
+];
+
+let tiny_gpu = CP.policy(map{
+    preferred_device: "gpu", workload: "tensor", min_accelerator_items: 1,
+    work_units_per_item: 1, transfer_bytes_per_item: 16,
+    fallback_to_cpu: true,
+});
+let tiny_gpu_route = CP.select_device(1, accelerated_devices, tiny_gpu);
+eq(tiny_gpu_route.device, "cpu", "tiny GPU job stays on CPU");
+eq(tiny_gpu_route.rejected[0].reason, "accelerator_overhead_not_amortized", "GPU rejection names launch overhead");
+
+let tiny_gpu_strict = CP.policy(map{
+    preferred_device: "gpu", workload: "tensor", min_accelerator_items: 1,
+    work_units_per_item: 1, transfer_bytes_per_item: 16,
+    fallback_to_cpu: false,
+});
+require(not CP.select_device(1, accelerated_devices, tiny_gpu_strict).ok,
+        "strict tiny accelerator request fails instead of silently moving");
+
+let heavy_gpu = CP.policy(map{
+    preferred_device: "gpu", workload: "tensor", min_accelerator_items: 1,
+});
+let heavy_gpu_route = CP.select_device(2, accelerated_devices, heavy_gpu);
+eq(heavy_gpu_route.device, "gpu", "heavy tensor work amortizes GPU routing");
+require(heavy_gpu_route.cost.amortized, "accelerator route exposes positive cost decision");
+
+let transfer_limited = CP.policy(map{
+    preferred_device: "gpu", workload: "tensor", min_accelerator_items: 1,
+    work_units_per_item: 10000, transfer_bytes_per_item: 1024,
+    max_accelerator_transfer_bytes: 100,
+});
+let transfer_route = CP.select_device(1, accelerated_devices, transfer_limited);
+eq(transfer_route.rejected[0].reason, "accelerator_transfer_budget_exceeded", "transfer budget blocks device copy");
+
+let simd_policy = CP.policy(map{
+    preferred_device: "auto", workload: "vector", min_accelerator_items: 1,
+});
+eq(CP.select_device(2, accelerated_devices, simd_policy).device, "simd",
+   "auto routing can select a registered SIMD executor");
+
+// Accelerator failure must use the same cost-aware CPU route, not max_workers.
+A.clear_runtimes();
+A.register_runtime("gpu", fn(_payload) { throw "expected runtime failure"; });
+let recovered = CP.run_controlled([1, 2, 3, 4], fn(x) { return x + 1; }, map{
+    devices: accelerated_devices,
+    preferred_device: "gpu", workload: "tensor",
+    min_accelerator_items: 1, gpu_overhead_units: 0,
+    work_units_per_item: 1, transfer_bytes_per_item: 0,
+    min_parallel_items: 1, max_workers: 8, fallback_to_cpu: true,
+});
+require(recovered.ok and recovered.route.fallback_used, "runtime failure uses explicit CPU fallback");
+eq(recovered.route.mode, "sequential", "cheap CPU fallback does not inherit max parallelism");
+eq(recovered.route.accelerator_attempt, "gpu", "fallback records attempted accelerator");
+eq(recovered.results[3], 5, "CPU fallback preserves equivalent result");
+A.clear_runtimes();
+
+let empty_storage = CP.storage_read_controlled([], map{ max_workers: 4, min_parallel_files: 2 });
+eq(empty_storage.workers, 0, "empty storage batch starts no worker");
+eq(len(empty_storage.results), 0, "empty storage batch returns empty results");
+
+let one_storage = CP.storage_read_controlled(["stdlib/compute.sapp"], map{
+    max_workers: 4, min_parallel_files: 2,
+});
+eq(one_storage.mode, "sequential", "single file avoids thread overhead");
+
+let two_storage = CP.storage_read_controlled([
+    "stdlib/compute.sapp", "stdlib/parallel.sapp",
+], map{ max_workers: 2, min_parallel_files: 2 });
+eq(two_storage.mode, "parallel", "larger file batch uses bounded parallel chunks");
+eq(two_storage.workers, 2, "storage workers are capped by files and policy");
+require(str_contains(two_storage.results[0], "heterogeneous compute scheduler"), "first file read succeeds");
+
+let invalid_path = try CP.storage_read_controlled([""], nil) catch "rejected";
+eq(invalid_path, "rejected", "invalid storage path fails closed");
+let invalid_policy = CP.policy();
+invalid_policy.transfer_bytes_per_work_unit = 0;
+let invalid_ratio = try CP.select_device(1, accelerated_devices, invalid_policy) catch "rejected";
+eq(invalid_ratio, "rejected", "mutated invalid policy fails closed");
+
+print "hardware_cost_routing_pass";

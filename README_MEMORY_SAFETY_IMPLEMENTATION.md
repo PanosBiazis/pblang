@@ -1,5 +1,10 @@
 # Memory Safety Implementation for pblang
 
+> Historical snapshot. This report is kept for implementation history only and
+> is not the canonical current status. For current memory/concurrency behavior,
+> see `docs/CURRENT_STATUS.md`, `docs/PrjAnalysis.md`, `STRUCTURE.md`, and the
+> current `stdlib/memory*.sapp` / `stdlib/concurrency.sapp` modules.
+
 ## Overview
 
 This document details the Rust-like memory safety mechanisms implemented for the pblang programming language, providing ownership, borrowing, and lifetime tracking capabilities similar to Rust.

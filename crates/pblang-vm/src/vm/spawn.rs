@@ -131,9 +131,9 @@ pub(super) fn spawn_builtin(
         .stack_size(spawn_stack_size())
         .spawn(move || {
         let module = Rc::new(RefCell::new(Module {
-            globals: HashMap::new(),
+            globals: Default::default(),
             parent: None,
-            exports: HashMap::new(),
+            exports: Default::default(),
         }));
         let mut vm = VM::with_stdlib(config);
         vm.handle_registry = child_handles;

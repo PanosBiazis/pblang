@@ -1,6 +1,6 @@
 # Quantum Provider Slots Design Note
 
-## Status: design stub (Q2-delta)
+## Status: design contract (Q2-delta)
 
 ## Goal
 
@@ -16,7 +16,7 @@ A provider is a pblang map with these keys:
 | `submit` | fn(circuit) → job_id | Submits a circuit, returns opaque job ID   |
 | `poll`   | fn(job_id) → result_map | Polls for job completion, returns result |
 
-## Built-in Providers (stubs)
+## Built-in Providers (slots)
 
 ### Local simulator (default)
 
@@ -44,7 +44,7 @@ let remote_provider = fn(base_url) {
 };
 ```
 
-## Future provider stubs (not yet implemented)
+## Later provider contracts
 
 - **Qiskit-Aer**: wrap `proc_spawn_wait("python3", ["-c", qiskit_script])`
 - **IBM Quantum**: HTTP to https://api.quantum-computing.ibm.com/
@@ -54,7 +54,7 @@ let remote_provider = fn(base_url) {
 
 Two integration paths, no VM changes:
 
-1. **Exec + JSON**: Host or script spawns Python/Node process that runs Qiskit/Braket/Cirq; circuit sent as JSON (same shape as `quantum.sapp` circuit: `{ n, ops }`); process returns JSON `{ measurements: [...] }`. Use `process.spawn_wait` or a small HTTP stub that forwards to a local Python server.
+1. **Exec + JSON**: Host or script spawns Python/Node process that runs Qiskit/Braket/Cirq; circuit sent as JSON (same shape as `quantum.sapp` circuit: `{ n, ops }`); process returns JSON `{ measurements: [...] }`. Use `process.spawn_wait` or a small local HTTP bridge that forwards to a Python server.
 2. **FFI**: Thin native crate (e.g. `pblang-qiskit`) exposes C ABI: `pblang_qiskit_run(circuit_json_cstr)` → result JSON string. Script does `ffi.load("pblang_qiskit.so")` and `ffi_call("pblang_qiskit_run", circuit_json)`. Requires FfiPolicy allowlist.
 
 Provider slot contract remains: `submit(circuit)` → job_id, `poll(job_id)` → result. Bridge implementation can wrap exec or FFI behind that interface.

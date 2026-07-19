@@ -5,9 +5,17 @@ assert(clear.format == "pbai.cache.clear.v1", "cache clear contract is versioned
 
 let wrote = cache.put("semantic-test", "hello", map{ value: 42 });
 assert(wrote.ok and str_contains(wrote.path, "target/pbai-cache"), "cache writes JSON entries under target");
+assert(wrote.format == "pbai.cache.write.v1" and wrote.schema_version == 2, "cache preserves the public write envelope while identifying v2 storage");
 assert(cache.has("semantic-test", "hello"), "cache can report a hit");
 let got = cache.get("semantic-test", "hello");
 assert(got.value == 42, "cache retrieves stored JSON value");
+let verified = cache.get_entry("semantic-test", "hello");
+assert(verified.found and verified.verified and not verified.legacy, "new cache entries verify SHA-256 metadata");
+
+let nil_write = cache.put("semantic-test", "nil-value", nil);
+assert(nil_write.ok, "cache writes nil values");
+let nil_entry = cache.get_entry("semantic-test", "nil-value");
+assert(nil_entry.found and nil_entry.value == nil and cache.has("semantic-test", "nil-value"), "cached nil remains distinguishable from a miss");
 
 let safe_key = cache.key("../semantic test", "x");
 assert(str_contains(safe_key, "semantictest-") and not str_contains(safe_key, "/"), "cache normalizes kind names before using paths");
@@ -16,10 +24,62 @@ assert(str_contains(unsafe_write.path, "target/pbai-cache/semantictest/"), "cach
 assert(cache.has("semantictest", "x"), "cache normalized writes can be read by normalized kind");
 
 let st = cache.status();
-assert(st.format == "pbai.cache.status.v1" and st.total_entries >= 1, "cache status reports entries");
+assert(st.format == "pbai.cache.status.v1" and st.schema_version == 2 and st.total_entries >= 1, "cache status reports v2 entries");
+assert(st.hash == "sha256-domain-separated" and st.total_units > 0, "cache status reports integrity and byte accounting");
+
+// TTL is enforced on read and removes expired derived data.
+let expiring = cache.put_options("semantic-test", "short", "temporary", map{ ttl_ms: 1 });
+assert(expiring.ok and expiring.expires_ms > 0, "cache accepts bounded TTL");
+sleep_ms(3);
+let expired = cache.get_entry("semantic-test", "short");
+assert(not expired.found and expired.expired, "expired cache entry is invalidated");
+
+// Hard entry quota evicts the oldest entry while protecting the just-written one.
+cache.clear_kind("quota-test");
+cache.put_options("quota-test", "old", 1, map{ max_entries: 2, max_units: 100000 });
+sleep_ms(2);
+cache.put_options("quota-test", "middle", 2, map{ max_entries: 2, max_units: 100000 });
+sleep_ms(2);
+let newest = cache.put_options("quota-test", "new", 3, map{ max_entries: 2, max_units: 100000 });
+assert(newest.ok and newest.entries == 2, "cache applies hard per-kind entry quota");
+assert(not cache.has("quota-test", "old") and cache.has("quota-test", "middle") and cache.has("quota-test", "new"), "cache evicts oldest derived entry");
+
+// A staged backup left by an interrupted replacement is recovered on read.
+let recovery = cache.put("recovery-test", "entry", map{ recovered: true });
+fs_rename(recovery.path, recovery.path + ".bak");
+let recovered = cache.get_entry("recovery-test", "entry");
+assert(recovered.found and recovered.value.recovered and fs_exists(recovery.path), "cache recovers a published backup");
+
+// A corrupt primary must never cause a valid recovery backup to be discarded.
+let corrupt_recovery = cache.put("recovery-test", "corrupt-primary", map{ recovered: "backup" });
+fs_copy(corrupt_recovery.path, corrupt_recovery.path + ".bak");
+fs_write(corrupt_recovery.path, "{not-json");
+let recovered_corrupt = cache.get_entry("recovery-test", "corrupt-primary");
+assert(recovered_corrupt.found and recovered_corrupt.value.recovered == "backup", "cache restores a valid backup over a corrupt primary");
+assert(not fs_exists(corrupt_recovery.path + ".bak"), "successful recovery consumes the backup");
+
+// Quota/status scans reject unrelated JSON instead of counting it as a cache entry.
+let alien_dir = cache.root() + "/recovery-test";
+fs_write(alien_dir + "/alien.json", json_stringify(map{ arbitrary: true }));
+let recovery_prune = cache.prune_kind("recovery-test", map{ max_entries: 20, max_units: 1000000 });
+assert(recovery_prune.removed >= 1 and not fs_exists(alien_dir + "/alien.json"), "cache pruning removes structurally invalid JSON");
+
+// Tampered v2 metadata cannot be returned under another prompt key.
+let tampered = cache.put("tamper-test", "prompt", "safe");
+let raw = json_parse(fs_read(tampered.path));
+raw.source_sha256 = "00";
+fs_write(tampered.path, json_stringify(raw));
+let rejected = cache.get_entry("tamper-test", "prompt");
+assert(not rejected.found and rejected.corrupt, "cache rejects mismatched key metadata");
+
+let oversized = cache.put_options("semantic-test", "too-large", "0123456789", map{ max_entry_units: 8, max_units: 100 });
+assert(not oversized.ok and not cache.has("semantic-test", "too-large"), "oversized entry is rejected before publication");
 
 let removed = cache.clear_kind("semantic-test");
 assert(removed.removed >= 1, "cache kind clear removes entries");
 cache.clear_kind("semantictest");
+cache.clear_kind("quota-test");
+cache.clear_kind("recovery-test");
+cache.clear_kind("tamper-test");
 
 print "pbai_cache_pass";

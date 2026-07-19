@@ -34,9 +34,9 @@ This requires a thin Rust crate `pblang-tls` that exposes a C ABI.
 ## Required VM change (minimal)
 - A `pblangStream` trait (Read + Write) so both plain and TLS streams share
   the same handle type in the VM
-- `tcp_listen_tls(addr, cert_pem, key_pem)` builtin stub (sandboxed by net cap)
+- `tcp_listen_tls(addr, cert_pem, key_pem)` builtin entrypoint (sandboxed by net cap)
 
-## Status: Implemented (rustls)
+## Status: Builtins implemented; high-level API currently fail-closed
 
 As of v0.5, TLS builtins are implemented using `rustls`:
 
@@ -44,14 +44,25 @@ As of v0.5, TLS builtins are implemented using `rustls`:
 - `tcp_connect_tls(host, port)` — creates a TLS client connection (verifies certificates using `webpki-roots` + native roots)
 - `tcp_wrap_tls(handle, cert_path, key_path)` — upgrades an existing plain TCP stream to TLS server mode
 
-The `stdlib/tls.sapp` wrapper provides a high-level API that gracefully falls back to error maps
-when builtins are unavailable.
+The `stdlib/tls.sapp` wrapper provides a high-level API that returns error maps
+when builtins are unavailable or the process has not selected exactly one
+Rustls `CryptoProvider`.
 
 ### Production note
 
-TLS verification is enabled in the current runtime. For internet-facing deployments, still prefer
-standard operational hardening (certificate rotation, least-privilege network policy, reverse proxy
-termination where needed).
+Certificate verification exists in the client implementation, but a live
+2026-07-19 server test found that the current dependency graph enables both
+`ring` and `aws-lc-rs`. Calling `ServerConfig::builder()` before a process-wide
+provider is selected causes a Rustls panic. PBLang `try/catch` cannot catch a
+host panic, so `stdlib:tls.sapp` now defaults to unavailable and returns a clear
+error instead of invoking the builtin.
+
+An embedding host that has installed exactly one provider may set
+`PBLANG_TLS_PROVIDER_READY=ring` or `aws-lc-rs` before running PBLang code. This
+environment flag is a host contract, not provider installation by itself;
+setting it incorrectly can still expose the underlying runtime defect. Until
+the host startup owns provider selection globally, prefer verified external TLS
+termination or Tor for remote services.
 
 ---
 
@@ -69,26 +80,22 @@ stable TLS API surface for Stage A:
 | `serve_forever_tls` | `(addr, cert_path, key_path, handler)` | Accept connections in a loop, dispatch each to `handler` |
 | `wrap_tls` | `(tcp_handle, cert_path, key_path)` | Upgrade an existing plain TCP handle to TLS |
 
-### Original stub behaviour (historical)
+### Original fallback behaviour (historical)
 
 During Stage A these functions returned an **error map** of the form:
 
 ```pblang/stdlib/tls.sapp#L1-1
-map{ error: "TLS not yet implemented (Stage A stub)." }
+map{ error: "TLS unavailable in Stage A fallback mode." }
 ```
 
 Returning an error map (rather than `nil` or raising a runtime error) lets
-callers check the result at runtime without crashing, and makes the stub
+callers check the result at runtime without crashing, and makes the fallback
 distinguishable from a successful response. Tests in
-`tests/semantics/tls_stub_test.sapp` assert this contract.
+the TLS legacy-fallback semantic test asserts this contract.
 
-### Path to full implementation (completed)
+### Path to safe default availability
 
-The Stage A checklist above is now complete in the current runtime:
-
-1. rustls integration is in place.
-2. TLS builtins are wired and capability-gated.
-3. `stdlib/tls.sapp` delegates to implemented VM builtins.
-
-The remaining work is operational hardening and broader deployment examples, not
-core TLS feature bring-up.
+1. Keep the existing rustls builtins and capability gates.
+2. Select exactly one provider once during host startup, before any TLS call.
+3. Add live listener/client tests with CA verification and malformed-handshake cases.
+4. Remove the temporary environment contract only after startup selection is universal.

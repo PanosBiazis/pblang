@@ -1,0 +1,76 @@
+// emu_mips_test.sapp — a verified MIPS32 execution model in pblang (classic RISC; PS1/PS2, routers, SGI).
+//
+// MIPS powered the PlayStation 1/2, countless routers, SGI workstations, and early embedded systems. Fixed 32-bit
+// encoding like RISC-V, but with the signature MIPS quirk: a BRANCH DELAY SLOT — the instruction right after a
+// branch ALWAYS executes before the branch takes effect. This models that faithfully (a real MIPS backend must
+// fill delay slots), operating on decoded 32-bit words to stay endianness-neutral. Exit: syscall with $v0==4001
+// (Linux o32 SYS_exit) returns $a0 & 255.  Verified by COMPUTED RESULT.
+
+fn fail(m) { throw "FAIL emu-mips: " + m; }
+fn _sx16(v) { if v >= 32768 { return v - 65536; } return v; }
+
+// register aliases: $0=zero, $2=v0, $4=a0, $8=t0, $9=t1
+// ── encoder (produces 32-bit instruction words as numbers) ──
+fn addiu(rt, rs, imm) { let i = imm; if i < 0 { i = i + 65536; } return 9 * 67108864 + rs * 2097152 + rt * 65536 + i; } // op 9
+fn addu(rd, rs, rt) { return rs * 2097152 + rt * 65536 + rd * 2048 + 33; }                                             // op 0 funct 33
+fn subu(rd, rs, rt) { return rs * 2097152 + rt * 65536 + rd * 2048 + 35; }                                             // funct 35
+fn mul_(rd, rs, rt) { return 28 * 67108864 + rs * 2097152 + rt * 65536 + rd * 2048 + 2; }                              // op 0x1c funct 2
+fn lui(rt, imm) { return 15 * 67108864 + rt * 65536 + imm; }                                                           // op 15
+fn beq(rs, rt, off) { let o = off; if o < 0 { o = o + 65536; } return 4 * 67108864 + rs * 2097152 + rt * 65536 + o; }  // op 4
+fn bne(rs, rt, off) { let o = off; if o < 0 { o = o + 65536; } return 5 * 67108864 + rs * 2097152 + rt * 65536 + o; }  // op 5
+fn nop() { return 0; }                                                                                                  // sll $0,$0,0
+fn syscall_() { return 12; }                                                                                            // op 0 funct 12
+
+// ── interpreter (with branch delay slot) ──
+fn mips_run(code) {
+    let R = []; let i = 0; while i < 32 { push(R, 0); i = i + 1; }
+    let pc = 0; let guard = 0; let halted = false; let result = 0;
+    let armed = false; let tgt = 0;
+    while pc >= 0 and pc < len(code) and guard < 1000000 and not halted {
+        guard = guard + 1;
+        let w = code[pc];
+        let op = num_floor(w / 67108864) % 64;
+        let rs = num_floor(w / 2097152) % 32;
+        let rt = num_floor(w / 65536) % 32;
+        let rd = num_floor(w / 2048) % 32;
+        let funct = w % 64;
+        let imm = _sx16(w % 65536);
+        let branchTaken = false; let branchTgt = 0;
+        if op == 9 { R[rt] = R[rs] + imm; }                                          // addiu
+        else if op == 15 { R[rt] = (w % 65536) * 65536; }                            // lui
+        else if op == 28 { if funct == 2 { R[rd] = R[rs] * R[rt]; } }                // mul
+        else if op == 4 { if R[rs] == R[rt] { branchTaken = true; branchTgt = pc + 1 + imm; } }  // beq
+        else if op == 5 { if R[rs] != R[rt] { branchTaken = true; branchTgt = pc + 1 + imm; } }  // bne
+        else if op == 2 { branchTaken = true; branchTgt = w % 67108864; }            // j (word index)
+        else if op == 0 {
+            if funct == 33 { R[rd] = R[rs] + R[rt]; }                                // addu
+            else if funct == 35 { R[rd] = R[rs] - R[rt]; }                           // subu
+            else if funct == 12 { if R[2] == 4001 { result = R[4]; halted = true; } }// syscall (exit)
+            // funct 0 with w==0 is nop -> nothing
+        }
+        else { throw "mips_run: unmodeled op " + str(op); }
+        R[0] = 0;
+        if branchTaken { pc = pc + 1; armed = true; tgt = branchTgt; }               // run delay slot, then jump
+        else if armed { armed = false; pc = tgt; }                                   // this WAS the delay slot
+        else { pc = pc + 1; }
+    }
+    if not halted { if guard >= 1000000 { fail("instruction budget exceeded"); } fail("ran off the end without exit syscall"); }
+    let e = result % 256; if e < 0 { e = e + 256; } return e;
+}
+
+fn eq(g, w, m) { if g != w { fail(m + ": got " + str(g) + " want " + str(w)); } }
+let V0 = addiu(2, 0, 4001);   // $v0 = SYS_exit
+
+eq(mips_run([V0, addiu(4, 0, 42), syscall_()]),                                       42, "addiu const");
+eq(mips_run([V0, addiu(8, 0, 5), addiu(9, 0, 7), addu(4, 8, 9), syscall_()]),         12, "addu 5+7");
+eq(mips_run([V0, addiu(8, 0, 20), addiu(9, 0, 8), subu(4, 8, 9), syscall_()]),        12, "subu 20-8");
+eq(mips_run([V0, addiu(8, 0, 6), addiu(9, 0, 7), mul_(4, 8, 9), syscall_()]),         42, "mul 6*7");
+// loop with delay slots: sum 5..1 = 15.  layout indices in the array below:
+//  0:V0 1:acc=0 2:cnt=5 3:beq end 4:nop(ds) 5:addu acc 6:addiu cnt-1 7:beq loop 8:nop(ds) 9:addu a0 10:syscall
+eq(mips_run([V0, addiu(8, 0, 0), addiu(9, 0, 5),
+             beq(9, 0, 5), nop(),                 // if cnt==0 -> END (index 9): off = 9-(3+1)=5
+             addu(8, 8, 9), addiu(9, 9, 0 - 1),
+             beq(0, 0, 0 - 5), nop(),             // back to LOOP (index 3): off = 3-(7+1)=-5
+             addu(4, 8, 0), syscall_()]),                                             15, "delay-slot loop sum 5..1");
+
+print "emu_mips: MIPS32 with real branch delay slots — arithmetic, mul, and a delay-slot loop all correct";

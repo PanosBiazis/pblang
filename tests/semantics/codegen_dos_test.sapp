@@ -1,0 +1,87 @@
+let D = import("stdlib:codegen_dos.sapp");
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+fn u16(n) { n = n % 65536; if n < 0 { n = n + 65536; } return n; }
+fn s8(n) { if n >= 128 { return n - 256; } return n; }
+fn s16(lo, hi) { let n = lo + hi * 256; if n >= 32768 { return n - 65536; } return n; }
+fn mul_lo(a, b) { return (a * b) % 65536; }
+fn mul_hi(a, b) { return num_floor((a * b) / 65536) % 65536; }
+
+// Bounded execution model for exactly the 8086 opcodes emitted by codegen_dos.
+fn run_com(code) {
+    let r = [0, 0, 0, 0, 0, 0, 0, 0]; let stack = []; let pc = 0;
+    let zf = false; let steps = 0;
+    while pc < len(code) {
+        steps = steps + 1; if steps > 1000000 { fail("8086 model step limit"); }
+        let op = code[pc]; pc = pc + 1;
+        if op >= 0xB8 and op <= 0xBB {
+            let d = op - 0xB8; r[d] = code[pc] + code[pc + 1] * 256; pc = pc + 2;
+        } elif op == 0xB4 {
+            r[0] = (r[0] % 256) + code[pc] * 256; pc = pc + 1;
+        } elif op >= 0x40 and op <= 0x43 {
+            let d = op - 0x40; r[d] = u16(r[d] + 1);
+        } elif op >= 0x48 and op <= 0x4B {
+            let d = op - 0x48; r[d] = u16(r[d] - 1); zf = r[d] == 0;
+        } elif op == 0x50 or op == 0x52 {
+            array_push(stack, r[op - 0x50]);
+        } elif op == 0x58 or op == 0x5A {
+            if len(stack) == 0 { fail("8086 model stack underflow"); }
+            r[op - 0x58] = array_pop(stack);
+        } elif op == 0x89 or op == 0x01 or op == 0x29 or op == 0x85 {
+            let m = code[pc]; pc = pc + 1;
+            if m < 0xC0 { fail("8086 model expected register ModR/M"); }
+            let src = num_floor((m - 0xC0) / 8) % 8; let dst = (m - 0xC0) % 8;
+            if op == 0x89 { r[dst] = r[src]; }
+            elif op == 0x01 { r[dst] = u16(r[dst] + r[src]); }
+            elif op == 0x29 { r[dst] = u16(r[dst] - r[src]); }
+            else { zf = bit_and(r[dst], r[src]) == 0; }
+        } elif op == 0x83 {
+            let m = code[pc]; let n = code[pc + 1]; pc = pc + 2;
+            if m < 0xC0 or m > 0xC7 { fail("8086 model unsupported group-1 op"); }
+            let dst = m - 0xC0; r[dst] = u16(r[dst] + s8(n));
+        } elif op == 0x81 {
+            let m = code[pc]; let n = code[pc + 1] + code[pc + 2] * 256; pc = pc + 3;
+            if m < 0xC0 or m > 0xC7 { fail("8086 model unsupported group-1 op"); }
+            let dst = m - 0xC0; r[dst] = u16(r[dst] + n);
+        } elif op == 0xF7 {
+            let m = code[pc]; pc = pc + 1; if m != 0xE7 { fail("8086 model expected mul di"); }
+            r[2] = mul_hi(r[0], r[7]); r[0] = mul_lo(r[0], r[7]);
+        } elif op == 0x74 or op == 0x75 or op == 0xEB {
+            let rel = s8(code[pc]); pc = pc + 1;
+            if op == 0xEB or (op == 0x74 and zf) or (op == 0x75 and not zf) { pc = pc + rel; }
+        } elif op == 0xE9 {
+            let rel = s16(code[pc], code[pc + 1]); pc = pc + 2 + rel;
+        } elif op == 0xCD {
+            let vector = code[pc]; pc = pc + 1;
+            if vector != 0x21 or num_floor(r[0] / 256) != 0x4C { fail("unexpected DOS interrupt"); }
+            return map{ code: r[0] % 256, steps: steps, stack_depth: len(stack) };
+        } else { fail("8086 model unknown opcode " + str(op)); }
+        if pc < 0 or pc > len(code) { fail("8086 model branch outside COM image"); }
+    }
+    fail("COM image returned without INT 21h/4Ch");
+}
+
+fn verify(ir, expected, tag) {
+    let got = run_com(D.compile_program(ir));
+    eq(got.code, expected % 256, tag);
+    eq(got.stack_depth, 0, tag + " stack balanced");
+}
+
+eq(D.metadata().cpu_min, "8086", "minimum CPU");
+let probe = D.compile_program([["seti", 0, 7]]);
+eq(slice(probe, len(probe) - 4, len(probe)), [0xB4, 0x4C, 0xCD, 0x21], "DOS exit ABI");
+verify([["seti",0,2],["seti",1,3],["add",0,1],["seti",1,4],["mul",0,1],["seti",1,1],["sub",0,1]], 19, "arithmetic");
+verify([["seti",0,0],["seti",1,10],["loop",1,[["add",0,1]]]], 55, "loop sum");
+verify([["seti",0,3],["seti",1,4],["seti",2,9],["mul",1,0],["add",0,2]], 12, "mul preserves virtual registers");
+verify([["seti",0,1],["seti",1,0],["ifnz",1,[["seti",0,99]],[["addi",0,6]]]], 7, "if else");
+
+let long_body = []; let i = 0;
+while i < 90 { array_push(long_body, ["addi", 0, 1]); i = i + 1; }
+verify([["seti",0,0],["seti",1,1],["ifnz",1,long_body,[]]], 90, "near conditional branch");
+verify([["seti",0,0],["seti",1,2],["loop",1,long_body]], 180, "near loop branch");
+
+let rejected = false;
+try { D.compile_program([["seti", 0, 65536]]); } catch { rejected = true; }
+if not rejected { fail("reject immediate that DOS backend cannot represent"); }
+
+print "codegen_dos_pass";

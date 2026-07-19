@@ -18,6 +18,105 @@
 let _ffi_struct_registry_val = map{};
 let _ffi_callback_registry_val = map{};
 
+fn _contains_exact(values, wanted) {
+    let i = 0;
+    while i < len(values) { if str(values[i]) == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _known_ffi_type(name) {
+    let t = str_lower(str_trim(str(name)));
+    return _contains_exact([
+        "int", "float", "double", "char*", "void*", "int32_t", "int64_t",
+        "uint32_t", "uint64_t", "size_t", "bool", "i32", "i64", "f32", "f64",
+        "string", "str", "ptr", "pointer", "void",
+    ], t);
+}
+
+fn _raw_pointer_type(name) {
+    let t = str_lower(str_trim(str(name)));
+    return t == "void*" or t == "ptr" or t == "pointer" or t == "void";
+}
+
+// ffi_policy is a pblang-side defense-in-depth layer. It never grants the host
+// allow_ffi capability and cannot widen the VM's native FfiPolicy. Library paths
+// and symbols are exact allowlists; checked loading never guesses alternative
+// names, extensions, or search-path entries.
+fn ffi_policy(libraries, symbols, options = nil) {
+    if type(libraries) != "array" or type(symbols) != "array" {
+        throw "ffi_universal: policy libraries and symbols must be arrays";
+    }
+    if options != nil and not is_map(options) { throw "ffi_universal: policy options must be a map"; }
+    let max_args = 32;
+    let allow_pointers = false;
+    if options != nil and map_has(options, "max_args") { max_args = options.max_args; }
+    if options != nil and map_has(options, "allow_pointers") { allow_pointers = options.allow_pointers == true; }
+    if not is_number(max_args) or max_args != num_floor(max_args) or max_args < 0 or max_args > 256 {
+        throw "ffi_universal: max_args must be an integer in 0..256";
+    }
+    let libs = [];
+    let i = 0;
+    while i < len(libraries) {
+        let v = str(libraries[i]);
+        if v == "" { throw "ffi_universal: empty library path in policy"; }
+        if not _contains_exact(libs, v) { array_push(libs, v); }
+        i = i + 1;
+    }
+    let syms = [];
+    i = 0;
+    while i < len(symbols) {
+        let v = str(symbols[i]);
+        if v == "" { throw "ffi_universal: empty symbol in policy"; }
+        if not _contains_exact(syms, v) { array_push(syms, v); }
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.ffi.policy.v1", libraries: libs, symbols: syms,
+        max_args: max_args, allow_pointers: allow_pointers,
+    };
+}
+
+fn _valid_policy(policy) {
+    return policy != nil and is_map(policy)
+        and (try policy.format catch "") == "pblang.ffi.policy.v1";
+}
+
+fn decide_load(policy, lib_path) {
+    if not _valid_policy(policy) { return map{ allowed: false, reason: "invalid_policy" }; }
+    let path = str(lib_path);
+    if not _contains_exact(policy.libraries, path) {
+        return map{ allowed: false, reason: "library_not_allowed", path: path };
+    }
+    return map{ allowed: true, reason: "exact_library_allowlist", path: path };
+}
+
+fn decide_call(policy, fn_name, args, arg_types, ret_type) {
+    if not _valid_policy(policy) { return map{ allowed: false, reason: "invalid_policy" }; }
+    let symbol = str(fn_name);
+    if not _contains_exact(policy.symbols, symbol) {
+        return map{ allowed: false, reason: "symbol_not_allowed", symbol: symbol };
+    }
+    if type(args) != "array" or type(arg_types) != "array" or len(args) != len(arg_types) {
+        return map{ allowed: false, reason: "signature_arity_mismatch", symbol: symbol };
+    }
+    if len(args) > policy.max_args {
+        return map{ allowed: false, reason: "argument_limit_exceeded", symbol: symbol };
+    }
+    let i = 0;
+    while i < len(arg_types) {
+        if not _known_ffi_type(arg_types[i]) { return map{ allowed: false, reason: "unsupported_argument_type", index: i, symbol: symbol }; }
+        if not policy.allow_pointers and _raw_pointer_type(arg_types[i]) {
+            return map{ allowed: false, reason: "raw_pointer_denied", index: i, symbol: symbol };
+        }
+        i = i + 1;
+    }
+    if not _known_ffi_type(ret_type) { return map{ allowed: false, reason: "unsupported_return_type", symbol: symbol }; }
+    if not policy.allow_pointers and _raw_pointer_type(ret_type) {
+        return map{ allowed: false, reason: "raw_pointer_denied", symbol: symbol };
+    }
+    return map{ allowed: true, reason: "exact_symbol_allowlist", symbol: symbol };
+}
+
 // ── Type Registry ─────────────────────────────────────────────────────────────
 
 fn _c_type_sizes() {
@@ -165,6 +264,36 @@ fn call_typed(lib, fn_name, args, arg_types, ret_type) {
         result: marshal_from_c(result, ret_type),
         raw: result,
     };
+}
+
+fn load_checked(policy, lib_path) {
+    let decision = decide_load(policy, lib_path);
+    if not decision.allowed {
+        return map{ format: "pblang.ffi.load.v1", ok: false, decision: decision, library: nil };
+    }
+    let h = try ffi_load(decision.path) catch nil;
+    if h == nil {
+        return map{ format: "pblang.ffi.load.v1", ok: false, decision: decision, library: nil, reason: "host_load_failed" };
+    }
+    return map{
+        format: "pblang.ffi.load.v1", ok: true, decision: decision,
+        library: map{ handle: h, path: decision.path, platform: platform() },
+    };
+}
+
+fn call_checked(policy, lib, fn_name, args, arg_types, ret_type) {
+    let decision = decide_call(policy, fn_name, args, arg_types, ret_type);
+    if not decision.allowed {
+        return map{ format: "pblang.ffi.call.v1", ok: false, decision: decision, result: nil };
+    }
+    if lib == nil or (is_map(lib) and not map_has(lib, "handle")) {
+        return map{ format: "pblang.ffi.call.v1", ok: false, decision: decision, result: nil, reason: "invalid_library_handle" };
+    }
+    let called = call_typed(lib, fn_name, args, arg_types, ret_type);
+    if not (try called.ok catch false) {
+        return map{ format: "pblang.ffi.call.v1", ok: false, decision: decision, result: nil, reason: "host_call_failed" };
+    }
+    return map{ format: "pblang.ffi.call.v1", ok: true, decision: decision, result: called.result, raw: called.raw };
 }
 
 // ── Value Marshaling ──────────────────────────────────────────────────────────
@@ -444,6 +573,7 @@ fn struct_offset(fields, name) {
 
 export load_any;
 export call_typed;
+export ffi_policy, decide_load, decide_call, load_checked, call_checked;
 export marshal_to_c, marshal_from_c;
 export struct_define, struct_pack, struct_unpack;
 export callback_register, callback_invoke;

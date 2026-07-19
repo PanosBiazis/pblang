@@ -1,6 +1,50 @@
 // Enhanced Thread Pool Module for pblang
-// Provides work-stealing queue, dynamic sizing, task priorities, parallel helpers.
+// Provides bounded worker groups, task priorities, deterministic collection, and
+// parallel helpers. Tasks are distributed in stable round-robin chunks; this
+// module does not claim dynamic work stealing until a shared concurrent deque is
+// available to the isolated worker VMs.
 // Requires: stdlib/thread.sapp (base primitives)
+
+let DEFAULT_THREADS = 4;
+let MAX_THREADS = 64;
+let MAX_TASKS = 100000;
+
+fn _callable(v) {
+    let t = type(v);
+    return t == "closure" or t == "function" or t == "builtin";
+}
+
+fn _thread_count(value) {
+    let n = value;
+    if n == nil { n = DEFAULT_THREADS; }
+    if not is_number(n) or n != num_floor(n) or n < 1 or n > MAX_THREADS {
+        throw "thread_pool: worker count must be an integer in 1.." + str(MAX_THREADS);
+    }
+    return n;
+}
+
+fn _ensure_running(pool) {
+    if pool == nil or not is_map(pool) { throw "thread_pool: invalid pool"; }
+    if pool.running != true { throw "thread_pool: pool is shut down"; }
+}
+
+fn _submit(pool, task_fn, priority) {
+    _ensure_running(pool);
+    if not _callable(task_fn) { throw "thread_pool: task must be callable"; }
+    if not is_number(priority) { throw "thread_pool: priority must be numeric"; }
+    if len(pool.tasks) >= MAX_TASKS { throw "thread_pool: task limit exceeded"; }
+    let task_id = pool.next_task_id;
+    pool.next_task_id = pool.next_task_id + 1;
+    array_push(pool.tasks, map{
+        id: task_id,
+        fn: task_fn,
+        priority: priority,
+        status: "pending",
+        result: nil,
+        error: nil,
+    });
+    return task_id;
+}
 
 /// Thread pool with work-stealing and dynamic sizing.
 /// Usage:
@@ -10,47 +54,31 @@
 ///   tp.shutdown(pool);
 
 fn new_thread_pool(nthreads) {
-    if nthreads == nil or nthreads <= 0 {
-        nthreads = 4;
-    }
+    nthreads = _thread_count(nthreads);
     return map{
+        format: "pblang.thread_pool.v2",
         size: nthreads,
         tasks: [],
         results: [],
         running: true,
+        next_task_id: 1,
         tasks_completed: 0,
         tasks_failed: 0,
     };
 }
 
+// new() — documented zero-argument convenience constructor.
+fn new() { return new_thread_pool(nil); }
+
 /// Submit a task to the thread pool.
 /// Returns a task ID that can be used to retrieve results.
 fn submit(pool, task_fn) {
-    let task_id = len(pool.tasks) + 1;
-    let task = map{
-        id: task_id,
-        fn: task_fn,
-        priority: 0,
-        status: "pending",
-        result: nil,
-        error: nil,
-    };
-    array_push(pool.tasks, task);
-    return task_id;
+    return _submit(pool, task_fn, 0);
 }
 
 /// Submit a task with priority (higher = more urgent).
 fn submit_priority(pool, task_fn, priority) {
-    let task = map{
-        id: len(pool.tasks) + 1,
-        fn: task_fn,
-        priority: priority,
-        status: "pending",
-        result: nil,
-        error: nil,
-    };
-    array_push(pool.tasks, task);
-    return task.id;
+    return _submit(pool, task_fn, priority);
 }
 
 /// _pending_order(tasks) — indices of pending tasks, highest priority first
@@ -77,6 +105,7 @@ fn _pending_order(tasks) {
 /// Execute all pending tasks in the pool (on the current thread), highest
 /// priority first. Returns a map with { completed: N, failed: N, results: [...] }
 fn run_all(pool) {
+    _ensure_running(pool);
     let completed = 0;
     let failed = 0;
     let results = [];
@@ -124,61 +153,128 @@ fn try_catch(fn_to_run) {
     return result;
 }
 
+// Spawn factories close their arguments before crossing the VM-thread wire.
+// Creating these closures directly inside a scheduling loop leaves open
+// upvalues, which the runtime correctly rejects as non-transferable.
+fn _make_chunk_worker(chunk) {
+    return fn() {
+        let local_results = [];
+        let j = 0;
+        while j < len(chunk) {
+            let task = chunk[j];
+            let result = try map{ ok: true, value: task.fn(), error: "" }
+                catch map{ ok: false, value: nil, error: "task execution failed" };
+            array_push(local_results, map{
+                id: task.id, index: task.index, ok: result.ok,
+                value: result.value, error: result.error,
+            });
+            j = j + 1;
+        }
+        return local_results;
+    };
+}
+
+fn _make_map_worker(slice, map_fn) {
+    return fn() {
+        let results = [];
+        let k = 0;
+        while k < len(slice) { array_push(results, map_fn(slice[k])); k = k + 1; }
+        return results;
+    };
+}
+
+fn _make_for_worker(chunk_start, chunk_end, step, body_fn) {
+    return fn() {
+        let idx = chunk_start;
+        while idx < chunk_end { body_fn(idx); idx = idx + step; }
+        return nil;
+    };
+}
+
+fn _make_race_worker(task_fn) {
+    return fn() {
+        return try map{ ok: true, value: task_fn() }
+            catch map{ ok: false, value: nil };
+    };
+}
+
 /// Execute tasks in parallel using spawn/join.
 /// Returns combined results.
 fn run_parallel(pool) {
-    let n = len(pool.tasks);
-    if n == 0 {
+    _ensure_running(pool);
+    let order = _pending_order(pool.tasks);
+    if len(order) == 0 {
         return map{ completed: 0, failed: 0, results: [] };
     }
 
     let thread_lib = import("stdlib:thread.sapp");
-    let chunks = split_tasks(pool.tasks, pool.size);
+    let pending = [];
+    let oi = 0;
+    while oi < len(order) {
+        let task = pool.tasks[order[oi]];
+        array_push(pending, map{ index: order[oi], id: task.id, fn: task.fn });
+        oi = oi + 1;
+    }
+    let chunks = split_tasks(pending, pool.size);
 
     let handles = [];
     let i = 0;
     while i < len(chunks) {
         let chunk = chunks[i];
-        let h = thread_lib.go(fn() {
-            let local_results = [];
-            let j = 0;
-            while j < len(chunk) {
-                let task = chunk[j];
-                if task.status == "pending" {
-                    let result = try_catch(fn() { return task.fn(); });
-                    if result.ok {
-                        task.status = "done";
-                        task.result = result.value;
-                        array_push(local_results, result.value);
-                    } else {
-                        task.status = "failed";
-                        task.error = result.error;
-                    }
-                }
-                j = j + 1;
-            }
-            return local_results;
-        });
+        let h = thread_lib.go(_make_chunk_worker(chunk));
         array_push(handles, h);
         i = i + 1;
     }
 
-    // Collect results
-    let all_results = [];
-    let completed = 0;
-    let failed = 0;
+    // Worker VMs do not share mutable task maps with the parent. Collect immutable
+    // outcomes first, then update every task exactly once in the parent VM.
+    let outcomes = map{};
     let k = 0;
     while k < len(handles) {
-        let chunk_results = thread_lib.await(handles[k]);
+        let chunk_results = try thread_lib.await(handles[k]) catch nil;
         if chunk_results != nil {
             let m = 0;
             while m < len(chunk_results) {
-                array_push(all_results, chunk_results[m]);
+                outcomes[str(chunk_results[m].id)] = chunk_results[m];
                 m = m + 1;
             }
-            completed = completed + len(chunk_results);
+        } else {
+            let m = 0;
+            while m < len(chunks[k]) {
+                let task = chunks[k][m];
+                outcomes[str(task.id)] = map{
+                    id: task.id, index: task.index, ok: false, value: nil,
+                    error: "worker execution failed",
+                };
+                m = m + 1;
+            }
         }
         k = k + 1;
+    }
+
+    let all_results = [];
+    let completed = 0;
+    let failed = 0;
+    oi = 0;
+    while oi < len(order) {
+        let task = pool.tasks[order[oi]];
+        let key = str(task.id);
+        let outcome = nil;
+        if map_has(outcomes, key) { outcome = outcomes[key]; }
+        if outcome != nil and outcome.ok {
+            task.status = "done";
+            task.result = outcome.value;
+            task.error = nil;
+            array_push(all_results, outcome.value);
+            completed = completed + 1;
+        } else {
+            task.status = "failed";
+            task.result = nil;
+            task.error = if outcome == nil { "missing worker outcome" } else { outcome.error };
+            failed = failed + 1;
+        }
+        array_push(pool.results, task.result);
+        oi = oi + 1;
     }
 
     pool.tasks_completed = pool.tasks_completed + completed;
@@ -193,6 +289,9 @@ fn run_parallel(pool) {
 
 /// Split tasks into N chunks for parallel processing.
 fn split_tasks(tasks, nchunks) {
+    nchunks = _thread_count(nchunks);
+    if len(tasks) == 0 { return []; }
+    if nchunks > len(tasks) { nchunks = len(tasks); }
     let chunks = [];
     let i = 0;
     while i < nchunks {
@@ -222,10 +321,10 @@ fn auto_size(pool) {
         i = i + 1;
     }
 
-    // Scale up with workload, cap at 16
+    // Scale up with workload, bounded by the module hard limit.
     let optimal = pending / 2;
     if optimal < 1 { optimal = 1; }
-    if optimal > 16 { optimal = 16; }
+    if optimal > MAX_THREADS { optimal = MAX_THREADS; }
     pool.size = optimal;
 
     return pool.size;
@@ -269,6 +368,9 @@ fn stats(pool) {
 fn parallel_map(arr, map_fn, nthreads = 4) {
     let n = len(arr);
     if n == 0 { return []; }
+    if not _callable(map_fn) { throw "thread_pool: map function must be callable"; }
+    nthreads = _thread_count(nthreads);
+    if nthreads > n { nthreads = n; }
 
     let thread_lib = import("stdlib:thread.sapp");
     let chunk_size = (n + nthreads - 1) / nthreads;
@@ -288,15 +390,7 @@ fn parallel_map(arr, map_fn, nthreads = 4) {
             j = j + 1;
         }
 
-        let h = thread_lib.go(fn() {
-            let results = [];
-            let k = 0;
-            while k < len(slice) {
-                array_push(results, map_fn(slice[k]));
-                k = k + 1;
-            }
-            return results;
-        });
+        let h = thread_lib.go(_make_map_worker(slice, map_fn));
         array_push(handles, h);
         i = i + 1;
     }
@@ -321,9 +415,13 @@ fn parallel_map(arr, map_fn, nthreads = 4) {
 /// Parallel for-each over array range.
 fn parallel_for(start, end, step, body_fn, nthreads = 4) {
     if step == nil or step <= 0 { step = 1; }
+    if not _callable(body_fn) { throw "thread_pool: body function must be callable"; }
+    nthreads = _thread_count(nthreads);
+    if end <= start { return nil; }
 
     let thread_lib = import("stdlib:thread.sapp");
     let total = (end - start + step - 1) / step;
+    if nthreads > total { nthreads = total; }
 
     let handles = [];
     let chunk_size = (total + nthreads - 1) / nthreads;
@@ -335,14 +433,7 @@ fn parallel_for(start, end, step, body_fn, nthreads = 4) {
         let chunk_end = chunk_start + chunk_size * step;
         if chunk_end > end { chunk_end = end; }
 
-        let h = thread_lib.go(fn() {
-            let idx = chunk_start;
-            while idx < chunk_end {
-                body_fn(idx);
-                idx = idx + step;
-            }
-            return nil;
-        });
+        let h = thread_lib.go(_make_for_worker(chunk_start, chunk_end, step, body_fn));
         array_push(handles, h);
         i = i + 1;
     }
@@ -369,14 +460,19 @@ fn pipeline(data, stages, nthreads = 4) {
 
 /// Race multiple async tasks, return the result of the first to complete.
 fn race(task_fns, timeout_ms) {
+    if timeout_ms != nil and (not is_number(timeout_ms) or timeout_ms < 0) {
+        throw "thread_pool: race timeout must be non-negative";
+    }
     let thread_lib = import("stdlib:thread.sapp");
     let handles = [];
+    let finished = [];
     let i = 0;
     while i < len(task_fns) {
-        let h = thread_lib.go(fn() {
-            return task_fns[i]();
-        });
+        let task_fn = task_fns[i];
+        if not _callable(task_fn) { throw "thread_pool: race task must be callable"; }
+        let h = thread_lib.go(_make_race_worker(task_fn));
         array_push(handles, h);
+        array_push(finished, false);
         i = i + 1;
     }
 
@@ -384,17 +480,25 @@ fn race(task_fns, timeout_ms) {
     let start = now_ms();
     while true {
         let j = 0;
+        let completed = 0;
         while j < len(handles) {
-            let result = thread_lib.try_await(handles[j]);
-            if result != nil {
-                return result;
+            if finished[j] {
+                completed = completed + 1;
+            } else {
+                let ready = try thread_lib.await_timeout(handles[j], 1) catch nil;
+                if ready != nil and ready.ok {
+                    finished[j] = true;
+                    completed = completed + 1;
+                    let result = ready.value;
+                    if result != nil and result.ok { return result.value; }
+                }
             }
             j = j + 1;
         }
+        if completed == len(handles) { return nil; }
         if timeout_ms != nil and now_ms() - start > timeout_ms {
             break;
         }
-        sleep_ms(1);
     }
     return nil;
 }
@@ -431,6 +535,6 @@ fn get_status(pool, id) {
     return t.status;
 }
 
-export new_thread_pool, submit, submit_priority, submit_all, run_all, run_parallel,
+export new, new_thread_pool, submit, submit_priority, submit_all, run_all, run_parallel,
        auto_size, shutdown, stats, get_result, get_status,
        parallel_map, parallel_for, pipeline, race, try_catch, split_tasks;

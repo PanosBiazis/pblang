@@ -7,6 +7,8 @@
 // `*_GLOBAL` operands are constant indices holding the variable name; `JUMP*`
 // operands are absolute instruction indices.
 
+let _vm_builtin_module = import("stdlib/compiler/vm_builtins.sapp");
+
 let OP_CONSTANT = 0;
 let OP_ADD = 1;
 let OP_SUB = 2;
@@ -48,46 +50,111 @@ let OP_JUMP_IF_NOT_NIL_PEEK = 37;
 let OP_GET_UPVALUE = 38;
 let OP_SET_UPVALUE = 39;
 let OP_THROW = 40;
+let OP_ADD_LOCAL_CONST = 41;
+let OP_ADD_LOCAL_LOCAL = 42;
+
+fn _option(options, key, fallback) {
+    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+
+fn _limit(options, key, fallback, hard_max) {
+    let value = _option(options, key, fallback);
+    if not is_number(value) or value < 1 or value != num_floor(value) or value > hard_max {
+        throw "self-host VM: " + key + " must be a positive integer <= " + str(hard_max);
+    }
+    return value;
+}
+
+// Validated limits for untrusted or user-authored source. These protect VM-owned
+// execution state; host kernel, driver, firmware and DMA isolation remain outside
+// a language runtime's authority.
+fn runtime_limits(options = nil) {
+    if options != nil and not is_map(options) { throw "self-host VM: options must be a map"; }
+    return map{
+        max_steps: _limit(options, "max_steps", 1000000, 100000000),
+        max_frames: _limit(options, "max_frames", 256, 4096),
+        max_stack: _limit(options, "max_stack", 4096, 1048576),
+        max_locals: _limit(options, "max_locals", 65536, 1048576),
+        max_output: _limit(options, "max_output", 65536, 1048576),
+        max_value_items: _limit(options, "max_value_items", 1048576, 16777216)
+    };
+}
+
+fn _runtime(options) {
+    let lim = runtime_limits(options);
+    return map{
+        max_steps: lim.max_steps, max_frames: lim.max_frames,
+        max_stack: lim.max_stack, max_locals: lim.max_locals,
+        max_output: lim.max_output, max_value_items: lim.max_value_items,
+        steps: 0, peak_frames: 0, peak_stack: 0, peak_locals: 0, peak_output: 0,
+        tripped: false, reason: ""
+    };
+}
+
+fn _trip(runtime, reason) {
+    runtime.tripped = true;
+    runtime.reason = reason;
+    throw "self-host VM: " + reason;
+}
+
+fn _guard_value(runtime, value) {
+    if runtime == nil { return; }
+    if (is_string(value) or is_array(value) or is_map(value)) and len(value) > runtime.max_value_items {
+        _trip(runtime, "value size limit exceeded");
+    }
+}
+
+fn _runtime_tick(runtime, stack, locals) {
+    if runtime == nil { return; }
+    if runtime.tripped { throw "self-host VM: " + runtime.reason; }
+    if runtime.steps >= runtime.max_steps { _trip(runtime, "step limit exceeded"); }
+    runtime.steps = runtime.steps + 1;
+    if len(stack) > runtime.max_stack { _trip(runtime, "stack limit exceeded"); }
+    if len(locals) > runtime.max_locals { _trip(runtime, "locals limit exceeded"); }
+    if len(stack) > runtime.peak_stack { runtime.peak_stack = len(stack); }
+    if len(locals) > runtime.peak_locals { runtime.peak_locals = len(locals); }
+    if len(stack) > 0 { _guard_value(runtime, stack[len(stack) - 1]); }
+}
+
+fn _output_push(out, value, runtime) {
+    if runtime != nil and len(out) >= runtime.max_output { _trip(runtime, "output limit exceeded"); }
+    _guard_value(runtime, value);
+    array_push(out, value);
+    if runtime != nil and len(out) > runtime.peak_output { runtime.peak_output = len(out); }
+}
 
 fn _truthy(c) {
     if c == false or c == nil or c == 0 { return false; }
     return true;
 }
 
-// Host builtins callable from self-hosted code. A call to one of these names
-// (not shadowed by a user global) dispatches here instead of into a chunk.
-fn _is_builtin(name) {
-    return name == "len" or name == "str" or name == "print"
-        or name == "array_push" or name == "array_pop"
-        or name == "str_split" or name == "str_upper" or name == "str_lower"
-        or name == "str_slice" or name == "slice" or name == "str_trim" or name == "str_contains"
-        or name == "str_starts_with" or name == "str_ends_with"
-        or name == "str_index_of" or name == "str_join"
-        or name == "parse_number" or name == "parse_bool"
-        or name == "num_floor" or name == "num_abs" or name == "num_sqrt"
-        or name == "num_mod" or name == "num_max" or name == "num_min"
-        or name == "num_pow" or name == "num_ceil"
-        or name == "map_has" or name == "map_keys" or name == "map_remove"
-        or name == "strcharcodeat" or name == "strfromcharcode"
-        or name == "str_from_char_code" or name == "str_repeat"
-        or name == "is_map" or name == "is_array" or name == "is_string"
-        or name == "is_number" or name == "is_nil" or name == "type"
-        or name == "has_member"
-        or name == "bit_and" or name == "bit_or" or name == "bit_xor"
-        or name == "bit_not" or name == "bit_shl" or name == "bit_shr"
-        or name == "bigint" or name == "rational" or name == "decimal"
-        or name == "num_exp" or name == "num_ln"
-        or name == "str_replace_all" or name == "str_pad_left" or name == "str_pad_right"
-        or name == "push" or name == "pop" or name == "array_push" or name == "array_pop"
-        or name == "import"
-        or name == "error";
+// Host builtins callable from self-hosted code. Build the membership table once
+// when the module loads; OP_GET_GLOBAL executes this lookup for every builtin
+// call, so a hash lookup avoids repeatedly scanning a long string chain. The
+// table stores booleans only: each lookup still creates its own mutable builtin
+// descriptor, preserving the previous first-class-value semantics.
+let _BUILTINS = _vm_builtin_module.registry();
+
+fn _is_builtin(name) { return map_has(_BUILTINS, name); }
+
+fn _guard_allocation(runtime, requested, label) {
+    if runtime != nil and (not is_number(requested) or requested < 0 or requested > runtime.max_value_items) {
+        _trip(runtime, label + " allocation limit exceeded");
+    }
 }
 
-fn _call_builtin(name, args) {
+fn _guard_push(runtime, container, label) {
+    if runtime != nil and len(container) >= runtime.max_value_items {
+        _trip(runtime, label + " size limit exceeded");
+    }
+}
+
+fn _call_builtin(name, args, runtime = nil) {
     if name == "len" { return len(args[0]); }
     if name == "str" { return str(args[0]); }
     if name == "print" { return nil; }
-    if name == "array_push" { return array_push(args[0], args[1]); }
+    if name == "array_push" { _guard_push(runtime, args[0], "array"); return array_push(args[0], args[1]); }
     if name == "array_pop" { return array_pop(args[0]); }
     if name == "str_split" { return str_split(args[0], args[1]); }
     if name == "str_upper" { return str_upper(args[0]); }
@@ -116,7 +183,7 @@ fn _call_builtin(name, args) {
     if name == "strcharcodeat" { return strcharcodeat(args[0], args[1]); }
     if name == "strfromcharcode" { return strfromcharcode(args[0]); }
     if name == "str_from_char_code" { return str_from_char_code(args[0]); }
-    if name == "str_repeat" { return str_repeat(args[0], args[1]); }
+    if name == "str_repeat" { _guard_allocation(runtime, len(args[0]) * args[1], "str_repeat"); return str_repeat(args[0], args[1]); }
     if name == "is_map" { return is_map(args[0]); }
     if name == "is_array" { return is_array(args[0]); }
     if name == "is_string" { return is_string(args[0]); }
@@ -141,19 +208,94 @@ fn _call_builtin(name, args) {
     }
     if name == "num_exp" { return num_exp(args[0]); }
     if name == "num_ln" { return num_ln(args[0]); }
-    if name == "str_replace_all" { return str_replace_all(args[0], args[1], args[2]); }
-    if name == "str_pad_left" { return str_pad_left(args[0], args[1], args[2]); }
-    if name == "str_pad_right" { return str_pad_right(args[0], args[1], args[2]); }
-    if name == "push" { return push(args[0], args[1]); }
+    if name == "str_replace_all" { _guard_allocation(runtime, len(args[0]) * num_max(1, len(args[2])), "str_replace_all"); return str_replace_all(args[0], args[1], args[2]); }
+    if name == "str_pad_left" { _guard_allocation(runtime, args[1], "str_pad_left"); return str_pad_left(args[0], args[1], args[2]); }
+    if name == "str_pad_right" { _guard_allocation(runtime, args[1], "str_pad_right"); return str_pad_right(args[0], args[1], args[2]); }
+    if name == "push" { _guard_push(runtime, args[0], "array"); return push(args[0], args[1]); }
     if name == "pop" { return pop(args[0]); }
-    if name == "array_push" { return array_push(args[0], args[1]); }
+    if name == "array_push" { _guard_push(runtime, args[0], "array"); return array_push(args[0], args[1]); }
     if name == "array_pop" { return array_pop(args[0]); }
     if name == "error" { return error(args[0]); }
     return error("self-host VM: unknown builtin '" + name + "'");
 }
 
+// Scalar dispatch for normal builtin arities. OP_CALL uses these paths before
+// allocating a temporary argument array; unusual/mismatched arities retain the
+// generic dispatcher and therefore the same errors as before.
+fn _call_builtin1(name, a0, runtime = nil) {
+    if name == "len" { return len(a0); }
+    if name == "str" { return str(a0); }
+    if name == "array_pop" { return array_pop(a0); }
+    if name == "str_upper" { return str_upper(a0); }
+    if name == "str_lower" { return str_lower(a0); }
+    if name == "str_trim" { return str_trim(a0); }
+    if name == "parse_number" { return parse_number(a0); }
+    if name == "parse_bool" { return parse_bool(a0); }
+    if name == "num_floor" { return num_floor(a0); }
+    if name == "num_abs" { return num_abs(a0); }
+    if name == "num_sqrt" { return num_sqrt(a0); }
+    if name == "num_ceil" { return num_ceil(a0); }
+    if name == "map_keys" { return map_keys(a0); }
+    if name == "strfromcharcode" { return strfromcharcode(a0); }
+    if name == "str_from_char_code" { return str_from_char_code(a0); }
+    if name == "is_map" { return is_map(a0); }
+    if name == "is_array" { return is_array(a0); }
+    if name == "is_string" { return is_string(a0); }
+    if name == "is_number" { return is_number(a0); }
+    if name == "is_nil" { return is_nil(a0); }
+    if name == "type" { return type(a0); }
+    if name == "bit_not" { return bit_not(a0); }
+    if name == "bigint" { return bigint(a0); }
+    if name == "rational" { return rational(a0); }
+    if name == "decimal" { return decimal(a0); }
+    if name == "num_exp" { return num_exp(a0); }
+    if name == "num_ln" { return num_ln(a0); }
+    if name == "pop" { return pop(a0); }
+    if name == "error" { return error(a0); }
+    return _call_builtin(name, [a0], runtime);
+}
+
+fn _call_builtin2(name, a0, a1, runtime = nil) {
+    if name == "array_push" { _guard_push(runtime, a0, "array"); return array_push(a0, a1); }
+    if name == "map_has" { return map_has(a0, a1); }
+    if name == "bit_and" { return bit_and(a0, a1); }
+    if name == "bit_or" { return bit_or(a0, a1); }
+    if name == "bit_xor" { return bit_xor(a0, a1); }
+    if name == "bit_shl" { return bit_shl(a0, a1); }
+    if name == "bit_shr" { return bit_shr(a0, a1); }
+    if name == "str_split" { return str_split(a0, a1); }
+    if name == "str_contains" { return str_contains(a0, a1); }
+    if name == "str_starts_with" { return str_starts_with(a0, a1); }
+    if name == "str_ends_with" { return str_ends_with(a0, a1); }
+    if name == "str_index_of" { return str_index_of(a0, a1); }
+    if name == "str_join" { return str_join(a0, a1); }
+    if name == "num_mod" { return num_mod(a0, a1); }
+    if name == "num_max" { return num_max(a0, a1); }
+    if name == "num_min" { return num_min(a0, a1); }
+    if name == "num_pow" { return num_pow(a0, a1); }
+    if name == "map_remove" { return map_remove(a0, a1); }
+    if name == "strcharcodeat" { return strcharcodeat(a0, a1); }
+    if name == "str_repeat" { _guard_allocation(runtime, len(a0) * a1, "str_repeat"); return str_repeat(a0, a1); }
+    if name == "has_member" { return has_member(a0, a1); }
+    if name == "rational" { return rational(a0, a1); }
+    if name == "push" { _guard_push(runtime, a0, "array"); return push(a0, a1); }
+    return _call_builtin(name, [a0, a1], runtime);
+}
+
+fn _call_builtin3(name, a0, a1, a2, runtime = nil) {
+    if name == "str_slice" { return str_slice(a0, a1, a2); }
+    if name == "slice" { return slice(a0, a1, a2); }
+    if name == "str_replace_all" { _guard_allocation(runtime, len(a0) * num_max(1, len(a2)), "str_replace_all"); return str_replace_all(a0, a1, a2); }
+    if name == "str_pad_left" { _guard_allocation(runtime, a1, "str_pad_left"); return str_pad_left(a0, a1, a2); }
+    if name == "str_pad_right" { _guard_allocation(runtime, a1, "str_pad_right"); return str_pad_right(a0, a1, a2); }
+    return _call_builtin(name, [a0, a1, a2], runtime);
+}
+
 // Grow `arr` to at least index i+1 (nil-filled), then set arr[i] = v.
-fn _set_slot(arr, i, v) {
+fn _set_slot(arr, i, v, runtime = nil) {
+    if i < 0 { throw "self-host VM: negative local slot"; }
+    if runtime != nil and i >= runtime.max_locals { _trip(runtime, "locals limit exceeded"); }
+    _guard_value(runtime, v);
     while len(arr) <= i { array_push(arr, nil); }
     arr[i] = v;
 }
@@ -175,95 +317,89 @@ fn _lookup_member(val, name) {
 }
 
 // Invoke a method value (closure object / raw fn const / builtin) with `args`.
-fn _call_method(callee, args, globals, out) {
-    if is_map(callee) and map_has(callee, "__bi") { return _call_builtin(callee["__bi"], args); }
+fn _call_method(callee, args, globals, out, runtime, depth) {
+    if is_map(callee) and map_has(callee, "__bi") { return _call_builtin(callee["__bi"], args, runtime); }
     if is_map(callee) and map_has(callee, "__fn") {
         let call_globals = globals;
         if map_has(callee, "__globals") { call_globals = callee["__globals"]; }
         if map_has(globals, "__import_cache__") and not map_has(call_globals, "__import_cache__") {
             call_globals["__import_cache__"] = globals["__import_cache__"];
         }
-        return exec(callee["__fn"].chunk, args, call_globals, out, callee["__upvalues"]);
+        return exec(callee["__fn"].chunk, args, call_globals, out, callee["__upvalues"], runtime, depth + 1);
     }
-    if is_map(callee) and map_has(callee, "chunk") { return exec(callee.chunk, args, globals, out, []); }
+    if is_map(callee) and map_has(callee, "chunk") { return exec(callee.chunk, args, globals, out, [], runtime, depth + 1); }
     return error("operator overload target is not callable");
 }
 
 // Forward `a.dunder(a,b)` then reflected `b.rdunder(b,a)`. Returns
 // {found:true,value:..} if a method was dispatched, else {found:false}.
-fn _try_overload(a, b, dunder, rdunder, globals, out) {
+fn _try_overload(a, b, dunder, rdunder, globals, out, runtime, depth) {
     let m = _lookup_member(a, dunder);
-    if m != nil { return map{ found: true, value: _call_method(m, [a, b], globals, out) }; }
+    if m != nil { return map{ found: true, value: _call_method(m, [a, b], globals, out, runtime, depth) }; }
     let rm = _lookup_member(b, rdunder);
-    if rm != nil { return map{ found: true, value: _call_method(rm, [b, a], globals, out) }; }
+    if rm != nil { return map{ found: true, value: _call_method(rm, [b, a], globals, out, runtime, depth) }; }
     return map{ found: false };
 }
 
 // Per-operator slow-path wrappers: native fast path unless a map operand carries
 // the dunder (opt-in by presence; numbers/strings never pay the lookup). Reflected
 // dunder is the mirror op (`a>b ⟺ b<a`), so `__lt__/__le__/__eq__/__ne__` suffice.
-fn _op_add(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__add__", "__radd__", g, o); if r.found { return r.value; } } return a + b; }
-fn _op_sub(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__sub__", "__rsub__", g, o); if r.found { return r.value; } } return a - b; }
-fn _op_mul(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__mul__", "__rmul__", g, o); if r.found { return r.value; } } return a * b; }
-fn _op_div(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__div__", "__rdiv__", g, o); if r.found { return r.value; } } return a / b; }
-fn _op_mod(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__mod__", "__rmod__", g, o); if r.found { return r.value; } } return num_mod(a, b); }
-fn _op_eq(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__eq__", "__eq__", g, o); if r.found { return r.value; } } return a == b; }
-fn _op_ne(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__ne__", "__ne__", g, o); if r.found { return r.value; } } return a != b; }
-fn _op_gt(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__gt__", "__lt__", g, o); if r.found { return r.value; } } return a > b; }
-fn _op_ge(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__ge__", "__le__", g, o); if r.found { return r.value; } } return a >= b; }
-fn _op_lt(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__lt__", "__gt__", g, o); if r.found { return r.value; } } return a < b; }
-fn _op_le(a, b, g, o) { if is_map(a) or is_map(b) { let r = _try_overload(a, b, "__le__", "__ge__", g, o); if r.found { return r.value; } } return a <= b; }
+fn _op_add(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__add__", "__radd__", g, o, r, d); if x.found { return x.value; } } return a + b; }
+fn _op_sub(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__sub__", "__rsub__", g, o, r, d); if x.found { return x.value; } } return a - b; }
+fn _op_mul(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__mul__", "__rmul__", g, o, r, d); if x.found { return x.value; } } return a * b; }
+fn _op_div(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__div__", "__rdiv__", g, o, r, d); if x.found { return x.value; } } return a / b; }
+fn _op_mod(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__mod__", "__rmod__", g, o, r, d); if x.found { return x.value; } } return num_mod(a, b); }
+fn _op_eq(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__eq__", "__eq__", g, o, r, d); if x.found { return x.value; } } return a == b; }
+fn _op_ne(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__ne__", "__ne__", g, o, r, d); if x.found { return x.value; } } return a != b; }
+fn _op_gt(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__gt__", "__lt__", g, o, r, d); if x.found { return x.value; } } return a > b; }
+fn _op_ge(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__ge__", "__le__", g, o, r, d); if x.found { return x.value; } } return a >= b; }
+fn _op_lt(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__lt__", "__gt__", g, o, r, d); if x.found { return x.value; } } return a < b; }
+fn _op_le(a, b, g, o, r, d) { if is_map(a) or is_map(b) { let x = _try_overload(a, b, "__le__", "__ge__", g, o, r, d); if x.found { return x.value; } } return a <= b; }
 
 // Execute one chunk with the given local slots and shared globals map. Printed
 // values are appended to `out` (shared across calls). Returns the chunk's return
 // value (the operand of OP_RETURN, or nil if execution falls off the end).
-fn exec(chunk, locals, globals, out, upvalues) {
+fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0) {
     let ins = chunk.instructions;
     let consts = chunk.constants;
     let stack = [];
     let ip = 0;
     let n = len(ins);
 
+    if runtime != nil {
+        if runtime.tripped { throw "self-host VM: " + runtime.reason; }
+        if depth + 1 > runtime.max_frames { _trip(runtime, "frame limit exceeded"); }
+        if depth + 1 > runtime.peak_frames { runtime.peak_frames = depth + 1; }
+        if len(locals) > runtime.max_locals { _trip(runtime, "locals limit exceeded"); }
+    }
+
     while ip < n {
+        if runtime != nil { _runtime_tick(runtime, stack, locals); }
         let instr = ins[ip];
         let op = instr.op;
         let arg = instr.operand;
         ip = ip + 1;
 
         if op == OP_CONSTANT { array_push(stack, consts[arg]); }
-        else if op == OP_ADD { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_add(a, b, globals, out)); }
-        else if op == OP_SUB { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_sub(a, b, globals, out)); }
-        else if op == OP_MUL { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_mul(a, b, globals, out)); }
-        else if op == OP_DIV { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_div(a, b, globals, out)); }
-        else if op == OP_MOD { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_mod(a, b, globals, out)); }
-        else if op == OP_LEN { array_push(stack, len(array_pop(stack))); }
-        else if op == OP_EQ { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_eq(a, b, globals, out)); }
-        else if op == OP_NOT_EQ { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_ne(a, b, globals, out)); }
-        else if op == OP_GT { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_gt(a, b, globals, out)); }
-        else if op == OP_GE { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_ge(a, b, globals, out)); }
-        else if op == OP_LT { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_lt(a, b, globals, out)); }
-        else if op == OP_LE { let b = array_pop(stack); let a = array_pop(stack); array_push(stack, _op_le(a, b, globals, out)); }
-        else if op == OP_NOT { let a = array_pop(stack); array_push(stack, not _truthy(a)); }
-        else if op == OP_POP { array_pop(stack); }
-        else if op == OP_PRINT { array_push(out, array_pop(stack)); }
+        // Locals and branches dominate compiled loops and recursive functions.
+        // Keep these semantics-neutral handlers near the dispatch head so the
+        // common path avoids walking the colder operator/object cases.
         else if op == OP_GET_LOCAL {
-            // A slot not yet assigned (e.g. set only on a not-taken branch, or
-            // reused across blocks) reads as nil rather than throwing.
             if arg < len(locals) { array_push(stack, locals[arg]); }
             else { array_push(stack, nil); }
         }
-        else if op == OP_SET_LOCAL { _set_slot(locals, arg, array_pop(stack)); }
-        else if op == OP_GET_GLOBAL {
-            let name = consts[arg];
-            if map_has(globals, name) { array_push(stack, globals[name]); }
-            else if _is_builtin(name) { array_push(stack, map{ __bi: name }); }
-            else { array_push(stack, nil); }
+        else if op == OP_SET_LOCAL { _set_slot(locals, arg, array_pop(stack), runtime); }
+        else if op == OP_ADD_LOCAL_CONST {
+            let a = if arg.slot < len(locals) { locals[arg.slot] } else { nil };
+            let b = consts[arg.constant];
+            let value = if is_map(a) or is_map(b) { _op_add(a, b, globals, out, runtime, depth) } else { a + b };
+            _set_slot(locals, arg.slot, value, runtime);
         }
-        else if op == OP_DEFINE_GLOBAL {
-            globals[consts[arg]] = array_pop(stack);
-        }
-        else if op == OP_SET_GLOBAL {
-            globals[consts[arg]] = array_pop(stack);
+        else if op == OP_ADD_LOCAL_LOCAL {
+            let a = if arg.slot < len(locals) { locals[arg.slot] } else { nil };
+            let b = if arg.rhs < len(locals) { locals[arg.rhs] } else { nil };
+            let value = if is_map(a) or is_map(b) { _op_add(a, b, globals, out, runtime, depth) } else { a + b };
+            _set_slot(locals, arg.slot, value, runtime);
         }
         else if op == OP_JUMP { ip = arg; }
         else if op == OP_JUMP_IF_FALSE { if not _truthy(array_pop(stack)) { ip = arg; } }
@@ -272,16 +408,95 @@ fn exec(chunk, locals, globals, out, upvalues) {
         else if op == OP_JUMP_IF_TRUE_PEEK { if _truthy(stack[len(stack) - 1]) { ip = arg; } }
         else if op == OP_JUMP_IF_NIL_PEEK { if stack[len(stack) - 1] == nil { ip = arg; } }
         else if op == OP_JUMP_IF_NOT_NIL_PEEK { if stack[len(stack) - 1] != nil { ip = arg; } }
+        else if op == OP_ADD {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_add(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a + b); }
+        }
+        else if op == OP_SUB {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_sub(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a - b); }
+        }
+        else if op == OP_MUL {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_mul(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a * b); }
+        }
+        else if op == OP_DIV {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_div(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a / b); }
+        }
+        else if op == OP_MOD {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_mod(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, num_mod(a, b)); }
+        }
+        else if op == OP_LEN { array_push(stack, len(array_pop(stack))); }
+        else if op == OP_EQ {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_eq(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a == b); }
+        }
+        else if op == OP_NOT_EQ {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_ne(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a != b); }
+        }
+        else if op == OP_GT {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_gt(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a > b); }
+        }
+        else if op == OP_GE {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_ge(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a >= b); }
+        }
+        else if op == OP_LT {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_lt(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a < b); }
+        }
+        else if op == OP_LE {
+            let b = array_pop(stack); let a = array_pop(stack);
+            if is_map(a) or is_map(b) { array_push(stack, _op_le(a, b, globals, out, runtime, depth)); }
+            else { array_push(stack, a <= b); }
+        }
+        else if op == OP_NOT { let a = array_pop(stack); array_push(stack, not _truthy(a)); }
+        else if op == OP_POP { array_pop(stack); }
+        else if op == OP_PRINT { _output_push(out, array_pop(stack), runtime); }
+        else if op == OP_GET_GLOBAL {
+            let name = consts[arg];
+            if map_has(globals, name) { array_push(stack, globals[name]); }
+            else if map_has(instr, "direct_builtin_call") {
+                // The compiler marks only names in the shared VM builtin set.
+                // This private descriptor is consumed immediately by OP_CALL.
+                array_push(stack, instr.direct_builtin_call);
+            }
+            else if _is_builtin(name) {
+                array_push(stack, map{ __bi: name });
+            }
+            else { array_push(stack, nil); }
+        }
+        else if op == OP_DEFINE_GLOBAL {
+            globals[consts[arg]] = array_pop(stack);
+        }
+        else if op == OP_SET_GLOBAL {
+            globals[consts[arg]] = array_pop(stack);
+        }
         else if op == OP_MAKE_ARRAY {
+            if runtime != nil and arg > runtime.max_value_items { _trip(runtime, "array size limit exceeded"); }
             let items = [];
             let k = 0;
-            let tmp = [];
-            while k < arg { array_push(tmp, array_pop(stack)); k = k + 1; }
-            let j = len(tmp) - 1;
-            while j >= 0 { array_push(items, tmp[j]); j = j - 1; }
+            while k < arg { array_push(items, nil); k = k + 1; }
+            let j = arg - 1;
+            while j >= 0 { items[j] = array_pop(stack); j = j - 1; }
             array_push(stack, items);
         }
         else if op == OP_MAKE_MAP {
+            if runtime != nil and arg > runtime.max_value_items { _trip(runtime, "map size limit exceeded"); }
             let m = map{};
             let k = 0;
             while k < arg {
@@ -323,9 +538,9 @@ fn exec(chunk, locals, globals, out, upvalues) {
             // -- is returned faithfully. (A value sentinel was wrong: a body that
             // legitimately returned the sentinel string ran the handler.)
             let tc = consts[arg];
-            let wrapped = try map{ v: exec(tc.try_chunk, locals, globals, out, upvalues) } catch nil;
+            let wrapped = try map{ v: exec(tc.try_chunk, locals, globals, out, upvalues, runtime, depth + 1) } catch nil;
             let r = nil;
-            if wrapped == nil { r = exec(tc.catch_chunk, locals, globals, out, upvalues); }
+            if wrapped == nil { r = exec(tc.catch_chunk, locals, globals, out, upvalues, runtime, depth + 1); }
             else { r = wrapped.v; }
             array_push(stack, r);
         }
@@ -356,62 +571,131 @@ fn exec(chunk, locals, globals, out, upvalues) {
         else if op == OP_SET_UPVALUE { upvalues[arg] = array_pop(stack); }
         else if op == OP_THROW { throw array_pop(stack); }
         else if op == OP_CALL {
-            // Stack layout (shared with the Rust VM): callee was pushed first, then
-            // arg0..argN-1 on top. Pop the args (they come off in reverse), then the
-            // callee that sits below them.
-            let tmp = [];
-            let k = 0;
-            while k < arg { array_push(tmp, array_pop(stack)); k = k + 1; }
-            let callee = array_pop(stack);
-            let callargs = [];
-            let j = len(tmp) - 1;
-            while j >= 0 { array_push(callargs, tmp[j]); j = j - 1; }
-            if is_map(callee) and map_has(callee, "__bi") {
-                // `import(path)` resolves against a module cache that
-                // frontend_run pre-populates into globals["__import_cache__"]
-                // (path -> exports map). Other builtins dispatch normally.
-                if callee["__bi"] == "import" {
-                    let cache = nil;
-                    if map_has(globals, "__import_cache__") { cache = globals["__import_cache__"]; }
-                    let p = callargs[0];
-                    if cache != nil and map_has(cache, p) { array_push(stack, cache[p]); }
-                    else { array_push(stack, error("self-host import: module not resolved: " + str(p))); }
-                } else if callee["__bi"] == "print" {
-                    // `print` is parsed as a builtin call (no OP_PRINT is emitted),
-                    // so capture its argument(s) into the output buffer here — this is
-                    // what makes frontend_run().output non-empty (drives F5 "run").
-                    let pi = 0;
-                    while pi < len(callargs) { array_push(out, callargs[pi]); pi = pi + 1; }
-                    array_push(stack, nil);
+            if runtime != nil and arg > runtime.max_stack { _trip(runtime, "call argument limit exceeded"); }
+            // Callee sits below arg0..argN-1. Builtins with their normal scalar
+            // arities can consume those values directly, avoiding an args-array
+            // allocation in the dominant stdlib/loop path. Two-argument user
+            // closures use a fixed-shape array and skip the generic
+            // fill/reverse-pop loops while retaining the same frame contract.
+            let direct = nil;
+            let direct_closure = nil;
+            let candidate = nil;
+            if arg >= 1 and arg <= 3 { candidate = stack[len(stack) - arg - 1]; }
+            if arg >= 1 and arg <= 3 {
+                if is_map(candidate) and map_has(candidate, "__bi") { direct = candidate; }
+            }
+            if arg == 2 and is_map(candidate) and map_has(candidate, "__fn") {
+                direct_closure = candidate;
+            }
+            if direct != nil and direct["__bi"] == "import" and arg != 1 { direct = nil; }
+
+            if direct != nil {
+                let name = direct["__bi"];
+                if arg == 1 {
+                    let a0 = array_pop(stack);
+                    array_pop(stack); // callee descriptor
+                    if name == "import" {
+                        let cache = nil;
+                        if map_has(globals, "__import_cache__") { cache = globals["__import_cache__"]; }
+                        if cache != nil and map_has(cache, a0) { array_push(stack, cache[a0]); }
+                        else { array_push(stack, error("self-host import: module not resolved: " + str(a0))); }
+                    } else if name == "print" {
+                        _output_push(out, a0, runtime);
+                        array_push(stack, nil);
+                    } else {
+                        array_push(stack, _call_builtin1(name, a0, runtime));
+                    }
+                } else if arg == 2 {
+                    let a1 = array_pop(stack);
+                    let a0 = array_pop(stack);
+                    array_pop(stack); // callee descriptor
+                    if name == "print" {
+                        _output_push(out, a0, runtime); _output_push(out, a1, runtime);
+                        array_push(stack, nil);
+                    } else {
+                        array_push(stack, _call_builtin2(name, a0, a1, runtime));
+                    }
                 } else {
-                    array_push(stack, _call_builtin(callee["__bi"], callargs));
+                    let a2 = array_pop(stack);
+                    let a1 = array_pop(stack);
+                    let a0 = array_pop(stack);
+                    array_pop(stack); // callee descriptor
+                    if name == "print" {
+                        _output_push(out, a0, runtime); _output_push(out, a1, runtime); _output_push(out, a2, runtime);
+                        array_push(stack, nil);
+                    } else {
+                        array_push(stack, _call_builtin3(name, a0, a1, a2, runtime));
+                    }
                 }
-            } else if is_map(callee) and map_has(callee, "__fn") {
-                // Closure object: run its function chunk with its captured upvalues.
-                // Enforce arity like the Rust VM: fewer than min_arity or more
-                // than arity args is an error (silently filling nil / ignoring
-                // extras hid real bugs). Default params have min_arity < arity and
-                // are filled by the body, so any count in [min_arity, arity] is ok.
-                let __fnc = callee.__fn;
-                if map_has(__fnc, "min_arity") and len(callargs) < __fnc.min_arity {
-                    throw "self-host VM: function expects at least " + str(__fnc.min_arity) + " argument(s), got " + str(len(callargs));
+            } else if direct_closure != nil {
+                let a1 = array_pop(stack);
+                let a0 = array_pop(stack);
+                let callargs = [a0, a1];
+                let callee = array_pop(stack);
+                let fnc = callee.__fn;
+                if map_has(fnc, "min_arity") and arg < fnc.min_arity {
+                    throw "self-host VM: function expects at least " + str(fnc.min_arity) + " argument(s), got " + str(arg);
                 }
-                if map_has(__fnc, "arity") and len(callargs) > __fnc.arity {
-                    throw "self-host VM: function expects at most " + str(__fnc.arity) + " argument(s), got " + str(len(callargs));
+                if map_has(fnc, "arity") and arg > fnc.arity {
+                    throw "self-host VM: function expects at most " + str(fnc.arity) + " argument(s), got " + str(arg);
                 }
                 let call_globals = globals;
                 if map_has(callee, "__globals") { call_globals = callee.__globals; }
                 if map_has(globals, "__import_cache__") and not map_has(call_globals, "__import_cache__") {
                     call_globals["__import_cache__"] = globals["__import_cache__"];
                 }
-                array_push(stack, exec(callee.__fn.chunk, callargs, call_globals, out, callee.__upvalues));
+                array_push(stack, exec(fnc.chunk, callargs, call_globals, out, callee.__upvalues, runtime, depth + 1));
             } else {
-                // Backward-compat: a raw function constant {arity, chunk}.
-                array_push(stack, exec(callee.chunk, callargs, globals, out, []));
+                // General path for user closures, zero/large-arity builtins, and
+                // backward-compatible raw function constants.
+                let callargs = [];
+                let k = 0;
+                while k < arg { array_push(callargs, nil); k = k + 1; }
+                let j = arg - 1;
+                while j >= 0 { callargs[j] = array_pop(stack); j = j - 1; }
+                let callee = array_pop(stack);
+                if is_map(callee) and map_has(callee, "__bi") {
+                    // `import(path)` resolves against a module cache that
+                    // frontend_run pre-populates into globals["__import_cache__"].
+                    if callee["__bi"] == "import" {
+                        let cache = nil;
+                        if map_has(globals, "__import_cache__") { cache = globals["__import_cache__"]; }
+                        let p = callargs[0];
+                        if cache != nil and map_has(cache, p) { array_push(stack, cache[p]); }
+                        else { array_push(stack, error("self-host import: module not resolved: " + str(p))); }
+                    } else if callee["__bi"] == "print" {
+                        let pi = 0;
+                        while pi < len(callargs) { _output_push(out, callargs[pi], runtime); pi = pi + 1; }
+                        array_push(stack, nil);
+                    } else {
+                        array_push(stack, _call_builtin(callee["__bi"], callargs, runtime));
+                    }
+                } else if is_map(callee) and map_has(callee, "__fn") {
+                    let __fnc = callee.__fn;
+                    if map_has(__fnc, "min_arity") and len(callargs) < __fnc.min_arity {
+                        throw "self-host VM: function expects at least " + str(__fnc.min_arity) + " argument(s), got " + str(len(callargs));
+                    }
+                    if map_has(__fnc, "arity") and len(callargs) > __fnc.arity {
+                        throw "self-host VM: function expects at most " + str(__fnc.arity) + " argument(s), got " + str(len(callargs));
+                    }
+                    let call_globals = globals;
+                    if map_has(callee, "__globals") { call_globals = callee.__globals; }
+                    if map_has(globals, "__import_cache__") and not map_has(call_globals, "__import_cache__") {
+                        call_globals["__import_cache__"] = globals["__import_cache__"];
+                    }
+                    array_push(stack, exec(callee.__fn.chunk, callargs, call_globals, out, callee.__upvalues, runtime, depth + 1));
+                } else {
+                    array_push(stack, exec(callee.chunk, callargs, globals, out, [], runtime, depth + 1));
+                }
             }
         }
-        else if op == OP_RETURN { return array_pop(stack); }
+        else if op == OP_RETURN {
+            let value = array_pop(stack);
+            _guard_value(runtime, value);
+            return value;
+        }
     }
+    if runtime != nil and len(stack) > runtime.max_stack { _trip(runtime, "stack limit exceeded"); }
     return nil;
 }
 
@@ -434,4 +718,20 @@ fn run_seeded(chunk, globals) {
     return map{ output: out, locals: locals, globals: globals };
 }
 
+// Bounded variants for IDE previews, agents, servers and untrusted source.
+// The same runtime object is threaded through every call/closure/try frame so a
+// recursive program cannot reset its budget at function boundaries.
+fn run_bounded(chunk, options = nil) {
+    return run_seeded_bounded(chunk, map{}, options);
+}
+
+fn run_seeded_bounded(chunk, globals, options = nil) {
+    let out = [];
+    let locals = [];
+    let runtime = _runtime(options);
+    let value = exec(chunk, locals, globals, out, [], runtime, 0);
+    return map{ output: out, locals: locals, globals: globals, value: value, runtime: runtime };
+}
+
 export run, run_seeded, exec;
+export run_bounded, run_seeded_bounded, runtime_limits;

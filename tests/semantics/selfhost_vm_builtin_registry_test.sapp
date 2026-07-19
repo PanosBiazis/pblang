@@ -1,0 +1,100 @@
+// The self-hosted VM resolves host builtins through a module-level registry.
+// Keep lookup fast without changing shadowing or first-class value semantics.
+let fe = import("stdlib/compiler/selfhost_frontend.sapp");
+let vm = import("stdlib/compiler/vm.sapp");
+let opt = import("stdlib/compiler/optimizer.sapp");
+let vm_builtins = import("stdlib/compiler/vm_builtins.sapp");
+
+fn fail(message) { throw "FAIL " + message; }
+
+fn value(source) {
+    let compiled = fe.frontend_compile(source);
+    if not compiled.ok { fail("compile: " + source); }
+    let result = vm.run(compiled.chunk);
+    if len(result.output) != 1 { fail("expected one output: " + source); }
+    return result.output[0];
+}
+
+fn count_direct_markers(chunk) {
+    let count = 0;
+    for instruction in chunk.instructions {
+        if map_has(instruction, "direct_builtin_call") { count = count + 1; }
+    }
+    for constant in chunk.constants {
+        if is_map(constant) and map_has(constant, "chunk") {
+            count = count + count_direct_markers(constant.chunk);
+        }
+        if is_map(constant) and map_has(constant, "try_chunk") {
+            count = count + count_direct_markers(constant.try_chunk);
+        }
+        if is_map(constant) and map_has(constant, "catch_chunk") {
+            count = count + count_direct_markers(constant.catch_chunk);
+        }
+    }
+    return count;
+}
+
+let builtin_names = vm_builtins.registry();
+if not map_has(builtin_names, "len") or not map_has(builtin_names, "bit_shr") {
+    fail("shared VM builtin registry coverage");
+}
+if map_has(builtin_names, "definitely_not_a_builtin") { fail("shared VM registry false positive"); }
+
+// A builtin near the end of the registry remains callable.
+if value("print bit_shr(256, 3);") != 32 { fail("late builtin lookup"); }
+
+// First-class aliases use the same scalar path without requiring a direct name.
+if value("let shift = bit_shr; print shift(64, 2);") != 16 { fail("builtin alias call"); }
+
+// User globals take precedence over host builtins.
+if value("fn bit_shr(a, b) { return a + b; } print bit_shr(7, 5);") != 12 {
+    fail("user function must shadow builtin");
+}
+
+// Builtin descriptors are deliberately not shared: mutating a first-class
+// alias cannot corrupt a later lookup of the same builtin.
+if value("let alias = len; alias.__bi = \"str\"; print len([1, 2, 3]);") != 3 {
+    fail("builtin descriptors must be independent");
+}
+
+// Direct-call metadata is optional and survives safe optimization. It never
+// changes the bytecode opcode or operand consumed by other VM implementations.
+let annotated = fe.frontend_compile("print len([1, 2, 3]);").chunk;
+let direct_markers = count_direct_markers(annotated);
+if direct_markers != 1 { fail("direct builtin call must be annotated exactly once"); }
+let optimized = opt.optimize_safe(annotated).chunk;
+direct_markers = count_direct_markers(optimized);
+if direct_markers != 1 { fail("optimizer must preserve direct builtin metadata"); }
+if vm.run(optimized).output[0] != 3 { fail("optimized annotated call result"); }
+
+let nested = fe.frontend_compile("fn size(x) { return len(x); } print size([1, 2]);").chunk;
+if count_direct_markers(nested) != 1 { fail("nested direct call annotation"); }
+let nested_optimized = opt.optimize_safe(nested).chunk;
+if count_direct_markers(nested_optimized) != 1 or vm.run(nested_optimized).output[0] != 2 {
+    fail("nested optimizer metadata preservation");
+}
+
+// Callee lookup still happens before arguments. The first call captures the
+// builtin descriptor, while the argument installs a global shadow for later calls.
+let timing = vm.run(fe.frontend_compile("fn change() { len = fn(x) { return 99; }; return [1, 2]; } print len(change()); print len([0]);").chunk).output;
+if len(timing) != 2 or timing[0] != 2 or timing[1] != 99 {
+    fail("direct descriptor must preserve callee-before-arguments and later shadowing");
+}
+
+// A missing global still resolves to nil, not to a registry false-positive.
+let missing = fe.frontend_compile("print definitely_not_a_builtin;");
+if missing.ok { fail("unknown global must fail static compilation"); }
+if len(missing.diagnostics) == 0 or missing.diagnostics[0].code != "undefined-name" {
+    fail("unknown global must carry an undefined-name diagnostic");
+}
+let missing_result = vm.run(missing.chunk);
+if len(missing_result.output) != 1 or missing_result.output[0] != nil { fail("unknown global runtime value"); }
+
+// Three-argument scalar dispatch and variadic print preserve values and order.
+if value("print str_pad_right(\"x\", 3, \".\");") != "x.." { fail("three-argument builtin"); }
+let printed = vm.run(fe.frontend_compile("let emit = print; emit(1, 2, 3);").chunk).output;
+if len(printed) != 3 or printed[0] != 1 or printed[1] != 2 or printed[2] != 3 {
+    fail("multi-argument print order");
+}
+
+print "selfhost_vm_builtin_registry_pass";

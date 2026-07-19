@@ -1,0 +1,587 @@
+// stdlib/repro_benchmark.sapp -- bounded, correctness-gated competitor runner.
+//
+// The harness is implemented in pblang. Foreign snippets are fixed benchmark
+// data, never caller-provided commands, and are written only to a unique temp
+// directory. Every successful row compiles (when applicable), checks output,
+// separates first/cold from warmed runs, preserves raw samples, and reports
+// wall time, CPU time, peak RSS, and artifact size without combining them into
+// a marketing score.
+
+let BENCH = import("stdlib:benchmark.sapp");
+let OS = import("stdlib:os.sapp");
+let UUID = import("stdlib:uuid.sapp");
+
+let MAX_LANGUAGES = 16;
+let MAX_COMPILE_SAMPLES = 10;
+let MAX_RUN_SAMPLES = 20;
+let MAX_TIMEOUT_SECONDS = 300;
+let MAX_OUTPUT_BYTES = 16384;
+let KERNEL_ITEMS = 1000000;
+let _command_cache = map{};
+
+fn _lang(id, name, mode, extension, compiler, runtime) {
+    return map{
+        id: id, name: name, mode: mode, extension: extension,
+        compiler_candidates: compiler, runtime_candidates: runtime,
+    };
+}
+
+fn languages() {
+    return [
+        _lang("pblang-interpreter", "PBLang interpreter", "interpreter", "sapp", [],
+              ["target/release/pblang", "target/debug/pblang", "pblang"]),
+        _lang("pblang-c99", "PBLang portable C99 (integer profile)", "compiled", "sapp",
+              ["target/release/pblang", "target/debug/pblang", "pblang"], ["gcc", "clang"]),
+        _lang("pblang-codegen-x64", "PBLang direct x86-64 codegen", "compiled", "sapp",
+              ["target/release/pblang", "target/debug/pblang", "pblang"], ["chmod"]),
+        _lang("c", "C", "compiled", "c", ["gcc", "clang"], []),
+        _lang("cpp", "C++", "compiled", "cpp", ["g++", "clang++"], []),
+        _lang("rust", "Rust", "compiled", "rs", ["rustc"], []),
+        _lang("go", "Go", "compiled", "go", ["go"], []),
+        _lang("java", "Java", "vm", "java", ["javac"], ["java"]),
+        _lang("csharp", "C# / Mono", "vm", "cs", ["mcs"], ["mono"]),
+        _lang("python", "Python", "interpreter", "py", [], ["python3", "python"]),
+        _lang("javascript", "JavaScript / Node", "jit", "js", [], ["node"]),
+        _lang("zig", "Zig", "compiled", "zig", ["zig"], []),
+    ];
+}
+
+fn workloads() { return ["startup", "integer_kernel"]; }
+
+fn coverage() {
+    return [
+        map{ category: "compilation_time", status: "runnable", harness: "reproducible_core_matrix" },
+        map{ category: "startup_time", status: "runnable", harness: "reproducible_core_matrix" },
+        map{ category: "execution_time", status: "runnable", harness: "reproducible_core_matrix" },
+        map{ category: "memory_usage", status: "runnable", harness: "reproducible_core_matrix" },
+        map{ category: "binary_size", status: "runnable", harness: "reproducible_core_matrix" },
+        map{ category: "cpu_utilization", status: "runnable", harness: "reproducible_core_matrix" },
+        map{ category: "multicore_scaling", status: "partial", harness: "controlled_execution_stages", reason: "pblang-only scaling; cross-language worker model not yet equivalent" },
+        map{ category: "filesystem_io", status: "partial", harness: "hardware_cost_routing_stages", reason: "bounded pblang disk scheduling; no cross-language byte-throughput fixture yet" },
+        map{ category: "network_io", status: "not-comparable", harness: "none", reason: "no fixed loopback protocol and payload contract yet" },
+        map{ category: "json_processing", status: "not-comparable", harness: "none", reason: "stdlib APIs differ; canonical document and parser contract required" },
+        map{ category: "mathematical_calculations", status: "partial", harness: "reproducible_core_matrix", reason: "integer arithmetic only" },
+        map{ category: "algorithms_data_structures", status: "runnable", harness: "language_category_matrix" },
+        map{ category: "concurrency", status: "partial", harness: "controlled_execution_stages", reason: "pblang worker safety and overhead only" },
+        map{ category: "gui_rendering", status: "partial", harness: "pbide_render_runtime_cache", reason: "headless PBIDE policy model, not cross-toolkit rendering" },
+        map{ category: "web_server_throughput", status: "not-comparable", harness: "none", reason: "equivalent local server lifecycle and connection policy required" },
+        map{ category: "latency", status: "partial", harness: "reproducible_core_matrix", reason: "process latency only; network tail latency is separate" },
+        map{ category: "database_operations", status: "not-comparable", harness: "none", reason: "equivalent engine, schema, durability, and cache state required" },
+        map{ category: "polyglot_calls", status: "runnable", harness: "polyglot_control_plane_stages" },
+        map{ category: "ffi_overhead", status: "partial", harness: "controlled_execution_stages", reason: "policy overhead measured separately from native call ABI" },
+        map{ category: "interpreter_performance", status: "runnable", harness: "pblang_phase_suite" },
+        map{ category: "native_code_performance", status: "runnable", harness: "pblang_phase_suite" },
+        map{ category: "gpu_parallel_workloads", status: "conditional", harness: "hardware_cost_routing_stages", reason: "real GPU row requires a registered equivalent kernel runtime" },
+    ];
+}
+
+fn _contains(values, wanted) {
+    let i = 0;
+    while i < len(values) { if values[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _spec(id) {
+    let all = languages(); let i = 0;
+    while i < len(all) { if all[i].id == id { return all[i]; } i = i + 1; }
+    return nil;
+}
+
+fn _clip(text) {
+    let value = str(text);
+    if len(str_to_bytes(value)) <= MAX_OUTPUT_BYTES { return value; }
+    return str_slice(value, 0, MAX_OUTPUT_BYTES) + "\n[output clipped]";
+}
+
+fn _resolve(candidates) {
+    let key = str(candidates);
+    if map_has(_command_cache, key) {
+        let cached = _command_cache[key];
+        return if cached == "" { nil } else { cached };
+    }
+    let i = 0;
+    while i < len(candidates) {
+        let cmd = candidates[i];
+        if str_contains(cmd, "/") {
+            if fs_exists(cmd) { _command_cache[key] = cmd; return cmd; }
+        } else {
+            let result = try proc_spawn_wait("which", [cmd]) catch nil;
+            if result != nil and (try result.exit_code catch 1) == 0 {
+                _command_cache[key] = cmd;
+                return cmd;
+            }
+        }
+        i = i + 1;
+    }
+    _command_cache[key] = "";
+    return nil;
+}
+
+fn _toolchain(spec) {
+    let compiler = nil; let runtime = nil;
+    if len(spec.compiler_candidates) > 0 { compiler = _resolve(spec.compiler_candidates); }
+    if len(spec.runtime_candidates) > 0 { runtime = _resolve(spec.runtime_candidates); }
+    let available = true; let reason = "ok";
+    if spec.id == "pblang-c99" {
+        if compiler == nil { available = false; reason = "pblang compiler unavailable"; }
+        elif runtime == nil { available = false; reason = "C compiler unavailable"; }
+    } elif spec.id == "pblang-codegen-x64" {
+        if compiler == nil { available = false; reason = "pblang compiler unavailable"; }
+        elif runtime == nil { available = false; reason = "chmod unavailable"; }
+        elif OS.platform() != "linux" { available = false; reason = "direct codegen row requires Linux ELF execution"; }
+        else {
+            let arch_probe = try proc_spawn_wait("uname", ["-m"]) catch nil;
+            let arch = if arch_probe == nil { "" } else { str_trim(try arch_probe.stdout catch "") };
+            if arch != "x86_64" and arch != "amd64" {
+                available = false;
+                reason = "direct codegen row requires an x86-64 host";
+            }
+        }
+    } elif spec.mode == "compiled" {
+        if compiler == nil { available = false; reason = "compiler unavailable"; }
+    } elif spec.mode == "vm" {
+        if compiler == nil or runtime == nil { available = false; reason = "compiler or VM unavailable"; }
+    } else {
+        if runtime == nil { available = false; reason = "runtime unavailable"; }
+    }
+    return map{ available: available, compiler: compiler, runtime: runtime, reason: reason };
+}
+
+fn available(id) {
+    let spec = _spec(id);
+    if spec == nil { return false; }
+    return _toolchain(spec).available;
+}
+
+fn _kernel_expected() {
+    let s = 0; let i = 0;
+    while i < KERNEL_ITEMS {
+        s = (s + (i % 1000) * 17 + 3) % 1000003;
+        i = i + 1;
+    }
+    return str(s);
+}
+
+fn expected(workload) {
+    if workload == "startup" { return "1"; }
+    if workload == "integer_kernel" { return _kernel_expected(); }
+    throw "repro_benchmark.expected: unsupported workload " + str(workload);
+}
+
+fn _body_pblang(workload) {
+    if workload == "startup" { return "print 1;\n"; }
+    return "let s = 0; let i = 0; while i < 1000000 { s = (s + (i % 1000) * 17 + 3) % 1000003; i = i + 1; } print s;\n";
+}
+
+fn _body_c(workload) {
+    if workload == "startup" { return "#include <stdio.h>\nint main(void){puts(\"1\");return 0;}\n"; }
+    return "#include <stdint.h>\n#include <stdio.h>\nint main(void){uint64_t s=0;for(uint64_t i=0;i<1000000;i++)s=(s+(i%1000)*17+3)%1000003;printf(\"%llu\\n\",(unsigned long long)s);return 0;}\n";
+}
+
+fn _body_cpp(workload) {
+    if workload == "startup" { return "#include <iostream>\nint main(){std::cout<<1<<'\\n';}\n"; }
+    return "#include <cstdint>\n#include <iostream>\nint main(){std::uint64_t s=0;for(std::uint64_t i=0;i<1000000;i++)s=(s+(i%1000)*17+3)%1000003;std::cout<<s<<'\\n';}\n";
+}
+
+fn _body_rust(workload) {
+    if workload == "startup" { return "fn main(){println!(\"1\");}\n"; }
+    return "fn main(){let mut s:u64=0;for i in 0u64..1_000_000{s=(s+(i%1000)*17+3)%1_000_003;}println!(\"{}\",s);}\n";
+}
+
+fn _body_go(workload) {
+    if workload == "startup" { return "package main\nimport \"fmt\"\nfunc main(){fmt.Println(1)}\n"; }
+    return "package main\nimport \"fmt\"\nfunc main(){var s uint64;for i:=uint64(0);i<1000000;i++{s=(s+(i%1000)*17+3)%1000003};fmt.Println(s)}\n";
+}
+
+fn _body_java(workload) {
+    if workload == "startup" { return "public final class Bench{public static void main(String[]a){System.out.println(1);}}\n"; }
+    return "public final class Bench{public static void main(String[]a){long s=0;for(long i=0;i<1000000;i++)s=(s+(i%1000)*17+3)%1000003;System.out.println(s);}}\n";
+}
+
+fn _body_csharp(workload) {
+    if workload == "startup" { return "using System;public static class Bench{public static void Main(){Console.WriteLine(1);}}\n"; }
+    return "using System;public static class Bench{public static void Main(){long s=0;for(long i=0;i<1000000;i++)s=(s+(i%1000)*17+3)%1000003;Console.WriteLine(s);}}\n";
+}
+
+fn _body_python(workload) {
+    if workload == "startup" { return "print(1)\n"; }
+    return "s=0\nfor i in range(1000000):\n s=(s+(i%1000)*17+3)%1000003\nprint(s)\n";
+}
+
+fn _body_javascript(workload) {
+    if workload == "startup" { return "console.log(1);\n"; }
+    return "let s=0;for(let i=0;i<1000000;i++)s=(s+(i%1000)*17+3)%1000003;console.log(s);\n";
+}
+
+fn _body_zig(workload) {
+    if workload == "startup" { return "const std=@import(\"std\");pub fn main()!void{try std.io.getStdOut().writer().print(\"1\\n\",.{});}\n"; }
+    return "const std=@import(\"std\");pub fn main()!void{var s:u64=0;var i:u64=0;while(i<1000000):(i+=1){s=(s+(i%1000)*17+3)%1000003;}try std.io.getStdOut().writer().print(\"{d}\\n\",.{s});}\n";
+}
+
+fn source(language, workload) {
+    if not _contains(workloads(), workload) { throw "repro_benchmark.source: unsupported workload"; }
+    if language == "pblang-interpreter" or language == "pblang-c99" or language == "pblang-codegen-x64" { return _body_pblang(workload); }
+    if language == "c" { return _body_c(workload); }
+    if language == "cpp" { return _body_cpp(workload); }
+    if language == "rust" { return _body_rust(workload); }
+    if language == "go" { return _body_go(workload); }
+    if language == "java" { return _body_java(workload); }
+    if language == "csharp" { return _body_csharp(workload); }
+    if language == "python" { return _body_python(workload); }
+    if language == "javascript" { return _body_javascript(workload); }
+    if language == "zig" { return _body_zig(workload); }
+    throw "repro_benchmark.source: unsupported language " + str(language);
+}
+
+fn _metric_line(stderr) {
+    let lines = str_split(str(stderr), "\n"); let i = 0;
+    while i < len(lines) {
+        if str_starts_with(lines[i], "PBLANG_METRIC|") { return lines[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _parse_metrics(stderr, elapsed_ms) {
+    let line = _metric_line(stderr);
+    if line == nil {
+        return map{ available: false, wall_ms: elapsed_ms, user_ms: nil, system_ms: nil, max_rss_kib: nil, cpu_percent: nil };
+    }
+    let parts = str_split(line, "|");
+    if len(parts) != 5 {
+        return map{ available: false, wall_ms: elapsed_ms, user_ms: nil, system_ms: nil, max_rss_kib: nil, cpu_percent: nil };
+    }
+    let user_ms = (try parse_number(parts[2]) catch 0) * 1000.0;
+    let system_ms = (try parse_number(parts[3]) catch 0) * 1000.0;
+    let rss = try parse_number(parts[4]) catch nil;
+    let cpu = if elapsed_ms <= 0 { 0 } else { ((user_ms + system_ms) / elapsed_ms) * 100.0 };
+    return map{
+        available: true, wall_ms: elapsed_ms,
+        user_ms: user_ms, system_ms: system_ms,
+        max_rss_kib: rss, cpu_percent: cpu,
+    };
+}
+
+fn _measure(cmd, args, timeout_seconds) {
+    let timeout_cmd = _resolve(["timeout"]);
+    let time_cmd = if fs_exists("/usr/bin/time") { "/usr/bin/time" } else { _resolve(["gtime"]); };
+    if timeout_cmd == nil or time_cmd == nil {
+        return map{ ok: false, status: "measurement-tool-unavailable", exit_code: 0 - 1,
+                    stdout: "", stderr: "timeout and GNU time are required", metrics: nil };
+    }
+    let call = [str(timeout_seconds) + "s", time_cmd, "-f", "PBLANG_METRIC|%e|%U|%S|%M", cmd];
+    let i = 0;
+    while i < len(args) { array_push(call, args[i]); i = i + 1; }
+    let started = now_ms();
+    let raw = try proc_spawn_wait(timeout_cmd, call) catch nil;
+    let elapsed = now_ms() - started;
+    if raw == nil {
+        return map{ ok: false, status: "spawn-error", exit_code: 0 - 1,
+                    stdout: "", stderr: "process could not be started", metrics: nil };
+    }
+    let code = try raw.exit_code catch 1;
+    let status = if code == 0 { "ok" } else { if code == 124 { "timeout" } else { "process-error" } };
+    return map{
+        ok: code == 0, status: status, exit_code: code,
+        stdout: _clip(try raw.stdout catch ""), stderr: _clip(try raw.stderr catch ""),
+        metrics: _parse_metrics(try raw.stderr catch "", elapsed),
+    };
+}
+
+fn _paths(spec) {
+    let dir = OS.temp_dir() + "/pblang_repro_benchmark_" + UUID.v4();
+    let source_name = if spec.id == "java" { "Bench.java" } else { "bench." + spec.extension };
+    return map{
+        dir: dir, source: dir + "/" + source_name,
+        artifact: if spec.id == "java" { dir + "/Bench.class" } else { dir + "/bench.out" },
+        c_source: dir + "/bench.generated.c",
+    };
+}
+
+fn _combine(first, second, elapsed_ms) {
+    if not first.ok { return first; }
+    if not second.ok { return second; }
+    let m1 = first.metrics; let m2 = second.metrics;
+    let rss = nil;
+    if m1 != nil and m2 != nil and m1.max_rss_kib != nil and m2.max_rss_kib != nil {
+        rss = if m1.max_rss_kib > m2.max_rss_kib { m1.max_rss_kib } else { m2.max_rss_kib };
+    }
+    let user = (try m1.user_ms catch 0) + (try m2.user_ms catch 0);
+    let system = (try m1.system_ms catch 0) + (try m2.system_ms catch 0);
+    return map{
+        ok: true, status: "ok", exit_code: 0, stdout: second.stdout,
+        stderr: _clip(first.stderr + second.stderr),
+        metrics: map{
+            available: (try m1.available catch false) and (try m2.available catch false),
+            wall_ms: elapsed_ms, user_ms: user, system_ms: system,
+            max_rss_kib: rss,
+            cpu_percent: if elapsed_ms <= 0 { 0 } else { ((user + system) / elapsed_ms) * 100.0 },
+        },
+    };
+}
+
+fn _compile(spec, toolchain, paths, timeout_seconds) {
+    if spec.mode == "interpreter" or spec.mode == "jit" {
+        return map{ ok: true, status: "not-applicable", metrics: nil, stdout: "", stderr: "" };
+    }
+    if spec.id == "pblang-c99" {
+        let started = now_ms();
+        let transpile = _measure(toolchain.compiler,
+            ["run", "bench/drivers/repro_ctranspile_int.sapp", "--allow-all", "--", paths.source, paths.c_source], timeout_seconds);
+        if not transpile.ok { return transpile; }
+        let native = _measure(toolchain.runtime, ["-std=gnu99", "-O3", "-DNDEBUG", "-s", paths.c_source, "-lm", "-o", paths.artifact], timeout_seconds);
+        return _combine(transpile, native, now_ms() - started);
+    }
+    if spec.id == "pblang-codegen-x64" {
+        let started = now_ms();
+        let generated = _measure(toolchain.compiler,
+            ["run", "bench/drivers/repro_codegen_x64.sapp", "--allow-all", "--", paths.source, paths.artifact], timeout_seconds);
+        if not generated.ok { return generated; }
+        let executable = _measure(toolchain.runtime, ["700", paths.artifact], timeout_seconds);
+        return _combine(generated, executable, now_ms() - started);
+    }
+    if spec.id == "c" {
+        return _measure(toolchain.compiler, ["-O3", "-DNDEBUG", "-s", paths.source, "-o", paths.artifact], timeout_seconds);
+    }
+    if spec.id == "cpp" {
+        return _measure(toolchain.compiler, ["-O3", "-DNDEBUG", "-s", "-std=c++17", paths.source, "-o", paths.artifact], timeout_seconds);
+    }
+    if spec.id == "rust" {
+        return _measure(toolchain.compiler, ["-C", "opt-level=3", "-C", "debuginfo=0", "-C", "strip=symbols", "-o", paths.artifact, paths.source], timeout_seconds);
+    }
+    if spec.id == "go" {
+        return _measure(toolchain.compiler, ["build", "-trimpath", "-ldflags=-s -w", "-o", paths.artifact, paths.source], timeout_seconds);
+    }
+    if spec.id == "java" {
+        return _measure(toolchain.compiler, ["-g:none", "-d", paths.dir, paths.source], timeout_seconds);
+    }
+    if spec.id == "csharp" {
+        return _measure(toolchain.compiler, ["-optimize+", "-debug-", "-out:" + paths.artifact, paths.source], timeout_seconds);
+    }
+    if spec.id == "zig" {
+        return _measure(toolchain.compiler, ["build-exe", "-O", "ReleaseFast", "-fstrip", "-femit-bin=" + paths.artifact, paths.source], timeout_seconds);
+    }
+    return map{ ok: false, status: "unsupported-compiler", metrics: nil, stdout: "", stderr: "" };
+}
+
+fn _run_plan(spec, toolchain, paths) {
+    if spec.id == "pblang-interpreter" { return map{ cmd: toolchain.runtime, args: ["run", paths.source, "--allow-all"] }; }
+    if spec.id == "python" or spec.id == "javascript" { return map{ cmd: toolchain.runtime, args: [paths.source] }; }
+    if spec.id == "java" { return map{ cmd: toolchain.runtime, args: ["-cp", paths.dir, "Bench"] }; }
+    if spec.id == "csharp" { return map{ cmd: toolchain.runtime, args: [paths.artifact] }; }
+    return map{ cmd: paths.artifact, args: [] };
+}
+
+fn _artifact_size(spec, paths) {
+    if spec.mode == "interpreter" or spec.mode == "jit" { return nil; }
+    let bytes = try fs_read_bytes(paths.artifact) catch nil;
+    return if bytes == nil { nil } else { len(bytes) };
+}
+
+fn _metric_samples(samples, field) {
+    let out = []; let i = 0;
+    while i < len(samples) {
+        let metrics = samples[i].metrics;
+        let value = if metrics == nil { nil } else { try metrics[field] catch nil };
+        if value != nil { array_push(out, value); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _stats(label, values) {
+    if len(values) == 0 { return nil; }
+    return BENCH.stats(label, values);
+}
+
+fn _cleanup(paths) {
+    try fs_remove(paths.source) catch nil;
+    try fs_remove(paths.c_source) catch nil;
+    try fs_remove(paths.artifact) catch nil;
+    try fs_remove(paths.artifact + ".mdb") catch nil;
+    try fs_remove(paths.dir) catch nil;
+}
+
+fn benchmark_language(language, workload, compile_repetitions = 3, run_repetitions = 7, timeout_seconds = 30) {
+    let spec = _spec(language);
+    if spec == nil { return map{ language: str(language), workload: workload, status: "unsupported-language" }; }
+    if not _contains(workloads(), workload) { return map{ language: spec.id, workload: workload, status: "unsupported-workload" }; }
+    if not is_number(compile_repetitions) or compile_repetitions != num_floor(compile_repetitions) or
+       compile_repetitions < 1 or compile_repetitions > MAX_COMPILE_SAMPLES {
+        return map{ language: spec.id, workload: workload, status: "invalid-compile-repetitions" };
+    }
+    if not is_number(run_repetitions) or run_repetitions != num_floor(run_repetitions) or
+       run_repetitions < 3 or run_repetitions > MAX_RUN_SAMPLES {
+        return map{ language: spec.id, workload: workload, status: "invalid-run-repetitions" };
+    }
+    if not is_number(timeout_seconds) or timeout_seconds != num_floor(timeout_seconds) or
+       timeout_seconds < 1 or timeout_seconds > MAX_TIMEOUT_SECONDS {
+        return map{ language: spec.id, workload: workload, status: "invalid-timeout" };
+    }
+    let toolchain = _toolchain(spec);
+    if not toolchain.available {
+        return map{ language: spec.id, name: spec.name, mode: spec.mode,
+                    workload: workload, status: "unavailable", reason: toolchain.reason };
+    }
+    let paths = _paths(spec);
+    let program = source(spec.id, workload);
+    if fs_exists(paths.dir) {
+        return map{ language: spec.id, name: spec.name, mode: spec.mode,
+                    workload: workload, status: "setup-error", detail: "temporary workspace collision" };
+    }
+    let setup_ok = try {
+        fs_mkdirs(paths.dir);
+        fs_write(paths.source, program);
+        true
+    } catch false;
+    if not setup_ok {
+        _cleanup(paths);
+        return map{ language: spec.id, name: spec.name, mode: spec.mode,
+                    workload: workload, status: "setup-error" };
+    }
+    let cold_compile = _compile(spec, toolchain, paths, timeout_seconds);
+    if not cold_compile.ok {
+        let failure = map{ language: spec.id, name: spec.name, mode: spec.mode,
+                           workload: workload, status: "compile-error", detail: cold_compile.stderr };
+        _cleanup(paths);
+        return failure;
+    }
+    let compile_samples = [];
+    if cold_compile.status != "not-applicable" {
+        let ci = 0;
+        while ci < compile_repetitions {
+            let compiled = _compile(spec, toolchain, paths, timeout_seconds);
+            if not compiled.ok {
+                let failure = map{ language: spec.id, name: spec.name, mode: spec.mode,
+                                   workload: workload, status: "compile-error", detail: compiled.stderr };
+                _cleanup(paths);
+                return failure;
+            }
+            array_push(compile_samples, compiled);
+            ci = ci + 1;
+        }
+    }
+
+    let plan = _run_plan(spec, toolchain, paths);
+    let wanted = expected(workload);
+    let cold_run = _measure(plan.cmd, plan.args, timeout_seconds);
+    if not cold_run.ok or str_trim(cold_run.stdout) != wanted {
+        let failure = map{
+            language: spec.id, name: spec.name, mode: spec.mode, workload: workload,
+            status: if cold_run.ok { "wrong-result" } else { cold_run.status },
+            expected: wanted, actual: str_trim(cold_run.stdout), detail: cold_run.stderr,
+        };
+        _cleanup(paths);
+        return failure;
+    }
+    let warmup = _measure(plan.cmd, plan.args, timeout_seconds);
+    if not warmup.ok or str_trim(warmup.stdout) != wanted {
+        let failure = map{ language: spec.id, name: spec.name, mode: spec.mode,
+                           workload: workload, status: "warmup-failed" };
+        _cleanup(paths);
+        return failure;
+    }
+    let run_samples = []; let ri = 0;
+    while ri < run_repetitions {
+        let measured = _measure(plan.cmd, plan.args, timeout_seconds);
+        if not measured.ok or str_trim(measured.stdout) != wanted {
+            let failure = map{
+                language: spec.id, name: spec.name, mode: spec.mode, workload: workload,
+                status: if measured.ok { "wrong-result" } else { measured.status },
+                expected: wanted, actual: str_trim(measured.stdout), detail: measured.stderr,
+            };
+            _cleanup(paths);
+            return failure;
+        }
+        array_push(run_samples, measured);
+        ri = ri + 1;
+    }
+
+    let compile_wall = _metric_samples(compile_samples, "wall_ms");
+    let run_wall = _metric_samples(run_samples, "wall_ms");
+    let result = map{
+        format: "pblang.repro_benchmark.row.v1",
+        language: spec.id, name: spec.name, mode: spec.mode, workload: workload,
+        status: "ok", checksum: wanted,
+        compiler: toolchain.compiler, runtime: toolchain.runtime,
+        source_bytes: len(str_to_bytes(program)), artifact_size_bytes: _artifact_size(spec, paths),
+        compile_cold_ms: try cold_compile.metrics.wall_ms catch nil,
+        compile_warm: _stats(spec.id + "/" + workload + "/compile", compile_wall),
+        compile_samples_ms: compile_wall,
+        run_cold_ms: cold_run.metrics.wall_ms,
+        run_warm: _stats(spec.id + "/" + workload + "/run", run_wall),
+        run_samples_ms: run_wall,
+        rss_warm: _stats(spec.id + "/" + workload + "/rss", _metric_samples(run_samples, "max_rss_kib")),
+        cpu_warm: _stats(spec.id + "/" + workload + "/cpu", _metric_samples(run_samples, "cpu_percent")),
+        user_warm: _stats(spec.id + "/" + workload + "/user", _metric_samples(run_samples, "user_ms")),
+        system_warm: _stats(spec.id + "/" + workload + "/system", _metric_samples(run_samples, "system_ms")),
+    };
+    _cleanup(paths);
+    return result;
+}
+
+fn run_matrix(language_ids = nil, selected_workloads = nil, compile_repetitions = 3, run_repetitions = 7, timeout_seconds = 30) {
+    let ids = language_ids;
+    if ids == nil {
+        ids = []; let specs = languages(); let si = 0;
+        while si < len(specs) { array_push(ids, specs[si].id); si = si + 1; }
+    }
+    let selected = selected_workloads ?? workloads();
+    if type(ids) != "array" or len(ids) > MAX_LANGUAGES or type(selected) != "array" or len(selected) > len(workloads()) {
+        throw "repro_benchmark.run_matrix: invalid bounded selection";
+    }
+    let rows = []; let i = 0;
+    while i < len(ids) {
+        if _spec(ids[i]) == nil { throw "repro_benchmark.run_matrix: unknown language " + str(ids[i]); }
+        let j = 0;
+        while j < len(selected) {
+            if not _contains(workloads(), selected[j]) { throw "repro_benchmark.run_matrix: unknown workload"; }
+            array_push(rows, benchmark_language(ids[i], selected[j], compile_repetitions, run_repetitions, timeout_seconds));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return rows;
+}
+
+fn version(language) {
+    let spec = _spec(language);
+    if spec == nil { return map{ language: str(language), status: "unsupported-language" }; }
+    let tc = _toolchain(spec);
+    if not tc.available { return map{ language: spec.id, status: "unavailable", version: "" }; }
+    let cmd = if tc.compiler != nil { tc.compiler } else { tc.runtime };
+    let args = ["--version"];
+    if spec.id == "go" { args = ["version"]; }
+    elif spec.id == "java" { args = ["-version"]; }
+    elif spec.id == "csharp" { cmd = tc.runtime; args = ["--version"]; }
+    let r = try proc_spawn_wait(cmd, args) catch nil;
+    if r == nil { return map{ language: spec.id, status: "version-error", version: "" }; }
+    let text = str_trim((try r.stdout catch "") + "\n" + (try r.stderr catch ""));
+    let lines = str_split(_clip(text), "\n");
+    return map{ language: spec.id, status: "ok", version: if len(lines) == 0 { "" } else { lines[0] } };
+}
+
+fn environment() {
+    let kernel = try proc_spawn_wait("uname", ["-srmo"]) catch nil;
+    let cpu = try fs_read("/proc/cpuinfo") catch "unavailable";
+    let model = "unavailable";
+    let lines = str_split(cpu, "\n"); let i = 0;
+    while i < len(lines) {
+        if str_starts_with(lines[i], "model name") {
+            let parts = str_split(lines[i], ":");
+            if len(parts) > 1 { model = str_trim(parts[1]); }
+            i = len(lines);
+        } else { i = i + 1; }
+    }
+    return map{
+        format: "pblang.repro_benchmark.environment.v1",
+        kernel: if kernel == nil { "unavailable" } else { str_trim(try kernel.stdout catch "") },
+        cpu_model: model,
+        logical_cpus: try import("stdlib:os.sapp").cpu_count() catch 1,
+        pblang: version("pblang-interpreter").version,
+        kernel_items: KERNEL_ITEMS,
+    };
+}
+
+export languages, workloads, coverage, available, expected, source;
+export benchmark_language, run_matrix, version, environment;

@@ -1,112 +1,337 @@
-// stdlib/cache.sapp — In-memory key-value cache with TTL support.
+// stdlib/cache.sapp -- fast in-memory cache with TTL and optional hard quotas.
 //
-// Usage:
-//   let c = cache.new(60000);          // default TTL 60 seconds in ms
-//   cache.set(c, "key", "value");
-//   let v = cache.get(c, "key");       // nil if expired or missing
-//   cache.set_ttl(c, "key2", data, 5000); // custom 5s TTL
+// `new(ttl)` preserves the original unbounded API. Prefer
+// `bounded(ttl, max_entries, max_units)` for servers, IDEs, and model caches.
+// It keeps insertion-order FIFO eviction for backward compatibility. New code
+// that benefits from recency eviction can use
+// `bounded_policy(ttl, max_entries, max_units, "lru")`. Both policies provide
+// O(1) lookup/O(1) size and amortized O(1) queue maintenance. `units` are
+// caller-defined accounting units; no expensive or unreliable deep-size walk is
+// performed automatically.
 
-// new(default_ttl_ms) — create a cache; default_ttl_ms=0 means no expiry
-fn new(default_ttl_ms) {
+let MAX_QUANTITY = 9000000000000000;
+
+fn _number(value, fallback = 0) {
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or text == "+nan" or text == "-nan" or
+       text == "inf" or text == "+inf" or text == "-inf" or
+       text == "infinity" or text == "+infinity" or text == "-infinity" {
+        return fallback;
+    }
+    let value_number = try parse_number(text) catch fallback;
+    if value_number == nil { value_number = fallback; }
+    value_number = num_floor(value_number);
+    if value_number < 0 { value_number = 0; }
+    if value_number > MAX_QUANTITY { value_number = MAX_QUANTITY; }
+    return value_number;
+}
+
+fn _policy(value) {
+    let policy = str_lower(str_trim(str(value)));
+    if policy == "fifo" or policy == "lru" { return policy; }
+    throw "cache: policy must be fifo or lru";
+}
+
+fn _cache(default_ttl_ms, max_entries, max_units, policy = "fifo") {
     return map{
+        format: "pblang.cache.v2",
         __data: map{},
         __expiry: map{},
-        __ttl: default_ttl_ms
+        __entry_units: map{},
+        __generation: map{},
+        __order: [],
+        __head: 0,
+        __next_generation: 0,
+        __ttl: _number(default_ttl_ms, 0),
+        __max_entries: _number(max_entries, 0),
+        __max_units: _number(max_units, 0),
+        __policy: _policy(policy),
+        __count: 0,
+        __units: 0,
+        __hits: 0,
+        __misses: 0,
+        __evictions: 0,
+        __expired: 0
     };
 }
 
-// set(cache, key, value) — store with default TTL
-fn set(cache_obj, key, value) {
-    cache_obj.__data[key] = value;
-    if cache_obj.__ttl > 0 {
-        cache_obj.__expiry[key] = now_ms() + cache_obj.__ttl;
+// new(default_ttl_ms) keeps backward-compatible unlimited capacity.
+fn new(default_ttl_ms) { return _cache(default_ttl_ms, 0, 0); }
+
+fn bounded(default_ttl_ms, max_entries, max_units = 0) {
+    let entries = _number(max_entries, 0);
+    if entries < 1 { throw "cache.bounded: max_entries must be at least 1"; }
+    return _cache(default_ttl_ms, entries, max_units);
+}
+
+// bounded_policy(...) is the explicit policy-selecting constructor. FIFO is
+// stable insertion order; LRU treats successful get/get_entry calls and
+// overwrites as recent. has()/peek() intentionally do not change recency.
+fn bounded_policy(default_ttl_ms, max_entries, max_units = 0, policy = "fifo") {
+    let entries = _number(max_entries, 0);
+    if entries < 1 { throw "cache.bounded_policy: max_entries must be at least 1"; }
+    return _cache(default_ttl_ms, entries, max_units, policy);
+}
+
+fn _deadline(ttl_ms) {
+    let ttl = _number(ttl_ms, 0);
+    if ttl <= 0 { return nil; }
+    let now = _number(now_ms(), 0);
+    if ttl > MAX_QUANTITY - now { return MAX_QUANTITY; }
+    return now + ttl;
+}
+
+fn _remove_key(cache_obj, key) {
+    if not map_has(cache_obj.__data, key) { return false; }
+    let units = try cache_obj.__entry_units[key] catch 1;
+    map_remove(cache_obj.__data, key);
+    if map_has(cache_obj.__expiry, key) { map_remove(cache_obj.__expiry, key); }
+    if map_has(cache_obj.__entry_units, key) { map_remove(cache_obj.__entry_units, key); }
+    if map_has(cache_obj.__generation, key) { map_remove(cache_obj.__generation, key); }
+    cache_obj.__count = cache_obj.__count - 1;
+    cache_obj.__units = cache_obj.__units - units;
+    if cache_obj.__count < 0 { cache_obj.__count = 0; }
+    if cache_obj.__units < 0 { cache_obj.__units = 0; }
+    _compact_order(cache_obj);
+    return true;
+}
+
+fn _compact_order(cache_obj) {
+    let stale_pressure = len(cache_obj.__order) > cache_obj.__count * 2 + 1024;
+    let consumed_pressure = cache_obj.__head >= 1024 and cache_obj.__head * 2 >= len(cache_obj.__order);
+    if not stale_pressure and not consumed_pressure { return; }
+    let next = [];
+    let i = cache_obj.__head;
+    while i < len(cache_obj.__order) {
+        let record = cache_obj.__order[i];
+        let current_generation = try cache_obj.__generation[record.key] catch -1;
+        if current_generation == record.generation and map_has(cache_obj.__data, record.key) {
+            array_push(next, record);
+        }
+        i = i + 1;
+    }
+    cache_obj.__order = next;
+    cache_obj.__head = 0;
+}
+
+fn _evict_oldest(cache_obj, protected_key = nil) {
+    while cache_obj.__head < len(cache_obj.__order) {
+        let record = cache_obj.__order[cache_obj.__head];
+        cache_obj.__head = cache_obj.__head + 1;
+        let key = record.key;
+        let current_generation = try cache_obj.__generation[key] catch -1;
+        if current_generation == record.generation and map_has(cache_obj.__data, key) {
+            if protected_key != nil and key == protected_key {
+                // Preserve an overwritten entry atomically while making room.
+                array_push(cache_obj.__order, record);
+            } else {
+                _remove_key(cache_obj, key);
+                cache_obj.__evictions = cache_obj.__evictions + 1;
+                _compact_order(cache_obj);
+                return true;
+            }
+        }
+    }
+    _compact_order(cache_obj);
+    return false;
+}
+
+fn _expired(cache_obj, key, now) {
+    if not map_has(cache_obj.__expiry, key) { return false; }
+    if now < cache_obj.__expiry[key] { return false; }
+    if _remove_key(cache_obj, key) { cache_obj.__expired = cache_obj.__expired + 1; }
+    return true;
+}
+
+fn _mark_recent(cache_obj, key) {
+    if cache_obj.__policy != "lru" or not map_has(cache_obj.__data, key) { return; }
+    cache_obj.__next_generation = cache_obj.__next_generation + 1;
+    cache_obj.__generation[key] = cache_obj.__next_generation;
+    array_push(cache_obj.__order, map{ key: key, generation: cache_obj.__next_generation });
+    _compact_order(cache_obj);
+}
+
+fn _make_room(cache_obj, key, units, is_new) {
+    let max_entries = cache_obj.__max_entries;
+    let max_units = cache_obj.__max_units;
+    if max_units > 0 and units > max_units { return false; }
+    let old_units = 0;
+    if not is_new { old_units = try cache_obj.__entry_units[key] catch 1; }
+    let target_count = cache_obj.__count;
+    if is_new { target_count = target_count + 1; }
+    let target_units = cache_obj.__units - old_units + units;
+    while (max_entries > 0 and target_count > max_entries) or
+          (max_units > 0 and target_units > max_units) {
+        let protected_key = nil;
+        if not is_new { protected_key = key; }
+        if not _evict_oldest(cache_obj, protected_key) { return false; }
+        target_count = cache_obj.__count;
+        if is_new { target_count = target_count + 1; }
+        target_units = cache_obj.__units - old_units + units;
+    }
+    return true;
+}
+
+fn _store(cache_obj, key, value, ttl_ms, units) {
+    units = _number(units, 1);
+    if units < 1 { units = 1; }
+    let is_new = not map_has(cache_obj.__data, key);
+    if not _make_room(cache_obj, key, units, is_new) { return false; }
+
+    if is_new {
+        cache_obj.__next_generation = cache_obj.__next_generation + 1;
+        cache_obj.__generation[key] = cache_obj.__next_generation;
+        array_push(cache_obj.__order, map{ key: key, generation: cache_obj.__next_generation });
+        cache_obj.__count = cache_obj.__count + 1;
+        cache_obj.__units = cache_obj.__units + units;
     } else {
-        if map_has(cache_obj.__expiry, key) {
-            map_remove(cache_obj.__expiry, key);
-        }
+        let old_units = try cache_obj.__entry_units[key] catch 1;
+        cache_obj.__units = cache_obj.__units - old_units + units;
+        _mark_recent(cache_obj, key);
     }
-    return cache_obj;
-}
-
-// set_ttl(cache, key, value, ttl_ms) — store with custom TTL
-fn set_ttl(cache_obj, key, value, ttl_ms) {
     cache_obj.__data[key] = value;
-    if ttl_ms > 0 {
-        cache_obj.__expiry[key] = now_ms() + ttl_ms;
+    cache_obj.__entry_units[key] = units;
+    let deadline = _deadline(ttl_ms);
+    if deadline == nil {
+        if map_has(cache_obj.__expiry, key) { map_remove(cache_obj.__expiry, key); }
+    } else {
+        cache_obj.__expiry[key] = deadline;
+    }
+    return true;
+}
+
+fn set(cache_obj, key, value) {
+    if not _store(cache_obj, key, value, cache_obj.__ttl, 1) {
+        throw "cache.set: value cannot fit bounded cache";
     }
     return cache_obj;
 }
 
-// get(cache, key) — retrieve; returns nil if missing or expired
-fn get(cache_obj, key) {
-    if map_has(cache_obj.__data, key) == false { return nil; }
-    // Check TTL
-    if map_has(cache_obj.__expiry, key) {
-        if now_ms() > cache_obj.__expiry[key] {
-            // Expired — evict
-            map_remove(cache_obj.__data, key);
-            map_remove(cache_obj.__expiry, key);
-            return nil;
-        }
-    }
-    return cache_obj.__data[key];
-}
-
-// has(cache, key) — true if key exists and not expired
-fn has(cache_obj, key) {
-    return get(cache_obj, key) != nil;
-}
-
-// delete(cache, key) — remove a key
-fn delete(cache_obj, key) {
-    if map_has(cache_obj.__data, key) {
-        map_remove(cache_obj.__data, key);
-    }
-    if map_has(cache_obj.__expiry, key) {
-        map_remove(cache_obj.__expiry, key);
+fn set_ttl(cache_obj, key, value, ttl_ms) {
+    if not _store(cache_obj, key, value, ttl_ms, 1) {
+        throw "cache.set_ttl: value cannot fit bounded cache";
     }
     return cache_obj;
 }
 
-// clear(cache) — remove all entries
+fn try_set_sized(cache_obj, key, value, units, ttl_ms = nil) {
+    if ttl_ms == nil { ttl_ms = cache_obj.__ttl; }
+    return _store(cache_obj, key, value, ttl_ms, units);
+}
+
+fn set_sized(cache_obj, key, value, units, ttl_ms = nil) {
+    if not try_set_sized(cache_obj, key, value, units, ttl_ms) {
+        throw "cache.set_sized: value cannot fit bounded cache";
+    }
+    return cache_obj;
+}
+
+fn _lookup(cache_obj, key, count_stats, update_recency = false) {
+    if not map_has(cache_obj.__data, key) {
+        if count_stats { cache_obj.__misses = cache_obj.__misses + 1; }
+        return map{ found: false, value: nil };
+    }
+    if _expired(cache_obj, key, _number(now_ms(), 0)) {
+        if count_stats { cache_obj.__misses = cache_obj.__misses + 1; }
+        return map{ found: false, value: nil };
+    }
+    if count_stats { cache_obj.__hits = cache_obj.__hits + 1; }
+    if update_recency { _mark_recent(cache_obj, key); }
+    return map{ found: true, value: cache_obj.__data[key] };
+}
+
+fn get(cache_obj, key) { return _lookup(cache_obj, key, true, true).value; }
+fn get_entry(cache_obj, key) { return _lookup(cache_obj, key, true, true); }
+fn has(cache_obj, key) { return _lookup(cache_obj, key, false).found; }
+fn peek(cache_obj, key) { return _lookup(cache_obj, key, false).value; }
+
+fn delete(cache_obj, key) { _remove_key(cache_obj, key); return cache_obj; }
+
 fn clear(cache_obj) {
-    let ks = map_keys(cache_obj.__data);
-    for i len(ks) {
-        map_remove(cache_obj.__data, ks[i]);
-    }
-    let eks = map_keys(cache_obj.__expiry);
-    for i len(eks) {
-        map_remove(cache_obj.__expiry, eks[i]);
-    }
+    cache_obj.__data = map{};
+    cache_obj.__expiry = map{};
+    cache_obj.__entry_units = map{};
+    cache_obj.__generation = map{};
+    cache_obj.__order = [];
+    cache_obj.__head = 0;
+    cache_obj.__count = 0;
+    cache_obj.__units = 0;
     return cache_obj;
 }
 
-// size(cache) — number of entries (may include some expired, not yet evicted)
-fn size(cache_obj) {
-    return len(map_keys(cache_obj.__data));
+// reset_stats(cache) clears diagnostics without invalidating cached values.
+fn reset_stats(cache_obj) {
+    cache_obj.__hits = 0;
+    cache_obj.__misses = 0;
+    cache_obj.__evictions = 0;
+    cache_obj.__expired = 0;
+    return cache_obj;
 }
 
-// get_or_set(cache, key, fn) — return cached value; compute and store if missing
+fn size(cache_obj) { return cache_obj.__count; }
+
 fn get_or_set(cache_obj, key, fn_val) {
-    let v = get(cache_obj, key);
-    if v != nil { return v; }
+    let entry = get_entry(cache_obj, key);
+    if entry.found { return entry.value; }
     let computed = fn_val();
     set(cache_obj, key, computed);
     return computed;
 }
 
-// evict_expired(cache) — remove all expired entries
-fn evict_expired(cache_obj) {
-    let now = now_ms();
-    let eks = map_keys(cache_obj.__expiry);
-    for i len(eks) {
-        let k = eks[i];
-        if now > cache_obj.__expiry[k] {
-            map_remove(cache_obj.__data, k);
-            map_remove(cache_obj.__expiry, k);
-        }
+fn get_or_set_ttl(cache_obj, key, ttl_ms, fn_val) {
+    let entry = get_entry(cache_obj, key);
+    if entry.found { return entry.value; }
+    let computed = fn_val();
+    set_ttl(cache_obj, key, computed, ttl_ms);
+    return computed;
+}
+
+fn touch(cache_obj, key, ttl_ms = nil) {
+    if not has(cache_obj, key) { return false; }
+    if ttl_ms == nil { ttl_ms = cache_obj.__ttl; }
+    let deadline = _deadline(ttl_ms);
+    if deadline == nil {
+        if map_has(cache_obj.__expiry, key) { map_remove(cache_obj.__expiry, key); }
+    } else {
+        cache_obj.__expiry[key] = deadline;
     }
+    return true;
+}
+
+fn evict_expired(cache_obj) {
+    let now = _number(now_ms(), 0);
+    let keys = map_keys(cache_obj.__expiry);
+    let i = 0;
+    while i < len(keys) { _expired(cache_obj, keys[i], now); i = i + 1; }
     return cache_obj;
 }
 
-export new, set, set_ttl, get, has, delete, clear, size, get_or_set, evict_expired;
+// keys(cache) returns live keys without changing LRU order or lookup metrics.
+// Expired entries are removed before the snapshot is produced.
+fn keys(cache_obj) {
+    evict_expired(cache_obj);
+    return map_keys(cache_obj.__data);
+}
+
+fn stats(cache_obj) {
+    let lookups = cache_obj.__hits + cache_obj.__misses;
+    let hit_rate = 0;
+    if lookups > 0 { hit_rate = cache_obj.__hits / lookups; }
+    return map{
+        format: "pblang.cache.stats.v1",
+        size: cache_obj.__count,
+        units: cache_obj.__units,
+        max_entries: cache_obj.__max_entries,
+        max_units: cache_obj.__max_units,
+        policy: cache_obj.__policy,
+        hits: cache_obj.__hits,
+        misses: cache_obj.__misses,
+        hit_rate: hit_rate,
+        evictions: cache_obj.__evictions,
+        expired: cache_obj.__expired
+    };
+}
+
+export new, bounded, bounded_policy, set, set_ttl, set_sized, try_set_sized;
+export get, get_entry, has, peek, keys, delete, clear, reset_stats, size, stats;
+export get_or_set, get_or_set_ttl, touch, evict_expired;

@@ -421,7 +421,12 @@ program orchestrating these kernels.
   generation results for repeated prompts, exposes cache status in `status()` and
   checkpoint summaries, and the API exposes `cache_status` / `cache_clear`. This cache
   is intentionally not the source of truth; clearing it does not delete checkpoints,
-  weights, or live lessons.
+  weights, or live lessons. New entries use domain-separated SHA-256 metadata
+  verification, preserve cached nil, support TTL and hard per-kind entry/byte
+  quotas, and publish through staged rename with interrupted-write recovery.
+  Existing v1 entries remain compatibility-readable but are reported as
+  `legacy: true, verified: false` because their former 31-bit hash cannot prove
+  collision resistance.
   Checkpoint inspection uses the pblang-native `max_summary` action, and quality gating
   uses `max_regression` plus `max_benchmark`; neither path needs Node.js or external JSON helper scripts.
   The training corpus now pulls bounded slices from pbAI docs, stdlib, tests, and
@@ -524,6 +529,13 @@ retrieval on every response: it searches `stdlib/pbai_live_corpus.txt` for lesso
 words overlap the current prompt and can answer from those local lessons. `analyze(...)`
 and `think(...)` expose the matched live-memory entries so the website can show when a
 response is grounded in learned local state.
+
+The small intent classifier no longer writes trained weights into the installed
+or locked stdlib tree. `stdlib:model_cache.sapp` validates model version, layer
+dimensions, numeric values, and serialized-size bounds before loading, then uses
+staged publication in the per-user PBLang cache. `PBLANG_PBAI_LEGACY_MODEL_CACHE`
+can override the compatibility classifier path. The bundled
+`stdlib/pbai_model.json` is read-only reference data.
 
 This is not yet a large human-level model. It is a real pblang-written neural LM with
 live local adaptation, a versioned checkpoint format, and regression tests proving that
