@@ -1,0 +1,70 @@
+// Execute the exact AArch64 instruction subset emitted by linux_uinput.sapp.
+// Kernel calls are deterministic fakes: this verifies register ABI, branches,
+// syscall order and write length, not access to a real ARM64 /dev/uinput.
+
+let U = import("stdlib:linux_uinput.sapp");
+let E = import("stdlib:input_events.sapp");
+
+fn fail(m) { throw "FAIL linux_uinput_arm64_exec: " + m; }
+fn word(bytes, off) { return bytes[off] + bytes[off + 1] * 256 + bytes[off + 2] * 65536 + bytes[off + 3] * 16777216; }
+
+fn run_artifact(artifact) {
+    let bytes = artifact.bytes; let x = []; let i = 0;
+    while i < 32 { array_push(x, 0); i = i + 1; }
+    let pc = 120; let guard = 0; let halted = false; let exit_code = -1;
+    let cmp_result = 0; let syscalls = []; let ioctls = []; let writes = [];
+    while not halted and pc >= 120 and pc + 3 < len(bytes) and guard < 10000 {
+        guard = guard + 1;
+        let w = word(bytes, pc); let top = num_floor(w / 16777216) % 256;
+        let rd = w % 32; let rn = num_floor(w / 32) % 32; let rm = num_floor(w / 65536) % 32;
+        let next = pc + 4;
+        if top == 0x92 {                              // movn Xd,#imm16
+            let imm = num_floor(w / 32) % 65536; x[rd] = 0 - imm - 1;
+        } elif top == 0xD2 {                          // movz Xd,#imm16
+            x[rd] = num_floor(w / 32) % 65536;
+        } elif top == 0xF2 {                          // movk Xd,#imm16,lsl#16
+            let imm = num_floor(w / 32) % 65536; x[rd] = num_mod(x[rd], 65536) + imm * 65536;
+        } elif top == 0xAA {                          // mov alias: orr Xd,xzr,Xm
+            if rn != 31 { fail("unexpected non-mov ORR"); } x[rd] = x[rm];
+        } elif top == 0xEB {                          // cmp Xn,Xm
+            cmp_result = x[rn] - x[rm];
+        } elif top == 0xB7 {                          // tbnz X0,#63,error
+            let off = num_floor(w / 32) % 16384; if off >= 8192 { off = off - 16384; }
+            if x[rd] < 0 { next = pc + off * 4; }
+        } elif top == 0x54 {                          // b.cond; generator emits NE
+            let off = num_floor(w / 32) % 524288; if off >= 262144 { off = off - 524288; }
+            let cond = w % 16;
+            if (cond == 1 and cmp_result != 0) or (cond == 0 and cmp_result == 0) { next = pc + off * 4; }
+        } elif top == 0xD4 {                          // svc #0
+            let nr = x[8]; array_push(syscalls, nr);
+            if nr == 56 { x[0] = 5; }                 // openat -> synthetic fd
+            elif nr == 29 { array_push(ioctls, map{ fd: x[0], request: x[1], arg: x[2] }); x[0] = 0; }
+            elif nr == 64 { array_push(writes, map{ fd: x[0], address: x[1], length: x[2] }); x[0] = x[2]; }
+            elif nr == 57 { x[0] = 0; }               // close
+            elif nr == 93 { exit_code = x[0]; halted = true; }
+            else { fail("unexpected syscall " + str(nr)); }
+        } else { fail("unmodeled instruction " + str(w) + " at " + str(pc)); }
+        x[31] = 0; pc = next;
+    }
+    if guard >= 10000 or not halted { fail("artifact did not terminate within instruction budget"); }
+    return map{ exit_code: exit_code, syscalls: syscalls, ioctls: ioctls, writes: writes, steps: guard };
+}
+
+fn count(values, wanted) { let n = 0; let i = 0; while i < len(values) { if values[i] == wanted { n = n + 1; } i = i + 1; } return n; }
+
+let key_artifact = U.build_event_arm64(E.key_event("Enter").event);
+let key = run_artifact(key_artifact);
+if key.exit_code != 0 or key.syscalls[0] != 56 or key.syscalls[len(key.syscalls) - 1] != 93 { fail("key open/exit sequence"); }
+if count(key.syscalls, 29) != 5 or count(key.syscalls, 64) != 1 or count(key.syscalls, 57) != 1 { fail("key syscall counts"); }
+if len(key.writes) != 1 or key.writes[0].fd != 5 or key.writes[0].length != len(key_artifact.packet.bytes) { fail("key write ABI"); }
+if key.ioctls[0].fd != 5 or key.ioctls[len(key.ioctls) - 1].request != U.io("UI_DEV_DESTROY") { fail("key ioctl ABI"); }
+
+let pointer_artifact = U.build_event_arm64(E.pointer_event(123, 456).event);
+let pointer = run_artifact(pointer_artifact);
+if pointer.exit_code != 0 or count(pointer.syscalls, 29) != 8 { fail("absolute pointer ioctl sequence"); }
+if pointer.writes[0].length != len(pointer_artifact.packet.bytes) or pointer.writes[0].length != 72 { fail("absolute pointer write length"); }
+let abs_setup_count = 0; let j = 0;
+while j < len(pointer.ioctls) { if pointer.ioctls[j].request == U.io("UI_ABS_SETUP") { abs_setup_count = abs_setup_count + 1; } j = j + 1; }
+if abs_setup_count != 2 { fail("absolute axis setup calls"); }
+
+print "linux_uinput_arm64_exec_pass";

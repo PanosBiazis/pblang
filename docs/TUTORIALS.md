@@ -4,7 +4,7 @@ This page is a hands-on tutorial track for beginners.
 
 If you are new, start with `docs/USAGE_GUIDE.md`, then come back here.
 
-## Tutorial 1: CLI app (todo-like notes)
+## Tutorial 1: CLI app (notes list)
 
 Goal: build a tiny command-line script that adds and lists notes from a text file.
 

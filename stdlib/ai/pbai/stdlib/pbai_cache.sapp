@@ -1,12 +1,36 @@
-// stdlib/pbai_cache.sapp -- pblang-only persistent cache helpers for pbAI.
+// stdlib/pbai_cache.sapp -- bounded, persistent derived-data cache for pbAI.
 //
-// This cache stores derived artifacts and summaries, not source-of-truth model
-// weights. It is safe to clear: checkpoints and live lessons remain elsewhere.
+// Cache entries are not source-of-truth model weights or lessons. Version 2
+// uses a domain-separated SHA-256 key, verifies kind/key/digest on every read,
+// preserves cached nil, supports TTL and hard per-kind quotas, and publishes via
+// a staged file + rename. A backup recovery path covers platforms where rename
+// cannot atomically replace an existing destination. Legacy v1 entries remain
+// readable for compatibility, but are explicitly reported as unverified because
+// their old 31-bit hash cannot prove collision resistance.
 
 let CACHE_ROOT = "target/pbai-cache";
+let DEFAULT_MAX_ENTRIES = 4096;
+let DEFAULT_MAX_UNITS = 268435456;
+let DEFAULT_MAX_ENTRY_UNITS = 16777216;
+let MAX_QUANTITY = 9007199254740991;
 
-fn root() {
-    return CACHE_ROOT;
+fn root() { return CACHE_ROOT; }
+
+fn _option(options, name, fallback) {
+    if type(options) == "map" and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _quantity(value, fallback, minimum, maximum = nil) {
+    if maximum == nil { maximum = MAX_QUANTITY; }
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or str_contains(text, "inf") { return fallback; }
+    let n = try parse_number(text) catch fallback;
+    if n == nil { n = fallback; }
+    n = num_floor(n);
+    if n < minimum { n = minimum; }
+    if n > maximum { n = maximum; }
+    return n;
 }
 
 fn _safe_kind(kind) {
@@ -20,118 +44,431 @@ fn _safe_kind(kind) {
         let is_upper = c >= 65 and c <= 90;
         let is_lower = c >= 97 and c <= 122;
         let is_mark = ch == "_" or ch == "-";
-        if is_digit or is_upper or is_lower or is_mark {
-            out = out + ch;
-        }
+        if is_digit or is_upper or is_lower or is_mark { out = out + ch; }
         i = i + 1;
     }
     if out == "" { return "general"; }
+    if len(str_to_bytes(out)) > 64 { return str_slice(out, 0, 24) + "-" + sha256(raw); }
     return out;
 }
 
-fn _hash(text) {
+fn _legacy_hash(text) {
     let h = 5381;
     let i = 0;
-    while i < len(text) {
-        h = (h * 33 + strcharcodeat(text, i)) % 2147483647;
-        i = i + 1;
-    }
+    while i < len(text) { h = (h * 33 + strcharcodeat(text, i)) % 2147483647; i = i + 1; }
     if h < 0 { h = 0 - h; }
     return str(h);
 }
 
-fn key(kind, text) {
-    kind = _safe_kind(kind);
-    return kind + "-" + _hash(str(text));
+fn _digest(kind, text) {
+    return sha256("pbai-cache-entry-v2\x00" + kind + "\x00" + str(text));
 }
 
-fn _kind_dir(kind) {
+fn key(kind, text) {
     kind = _safe_kind(kind);
-    return CACHE_ROOT + "/" + kind;
+    return kind + "-" + _digest(kind, text);
 }
+
+fn _legacy_key(kind, text) {
+    kind = _safe_kind(kind);
+    return kind + "-" + _legacy_hash(str(text));
+}
+
+fn _kind_dir(kind) { return CACHE_ROOT + "/" + _safe_kind(kind); }
 
 fn path(kind, text) {
     kind = _safe_kind(kind);
     return _kind_dir(kind) + "/" + key(kind, text) + ".json";
 }
 
-fn put(kind, text, value) {
+fn _legacy_path(kind, text) {
     kind = _safe_kind(kind);
-    let dir = _kind_dir(kind);
-    fs_mkdirs(dir);
-    let entry = map{
-        format: "pbai.cache.entry.v1",
-        kind: kind,
-        key: key(kind, text),
-        created_ms: now_ms(),
-        value: value
+    return _kind_dir(kind) + "/" + _legacy_key(kind, text) + ".json";
+}
+
+fn _nonce() {
+    let bytes = random_bytes(12);
+    let hex = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while i < len(bytes) {
+        let b = bytes[i];
+        out = out + hex[num_floor(b / 16)] + hex[b % 16];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _write_staged(target, payload) {
+    let staged = target + ".tmp-" + _nonce();
+    let backup = target + ".bak";
+    let wrote = try { fs_write(staged, payload); true } catch false;
+    if not wrote { return map{ ok: false, error: "cache stage write failed" }; }
+    let verified = try fs_read(staged) == payload catch false;
+    if not verified { try fs_remove(staged) catch nil; return map{ ok: false, error: "cache stage verification failed" }; }
+
+    // POSIX rename replaces the destination atomically. Try that fast path first.
+    let published = try { fs_rename(staged, target); true } catch false;
+    if published { return map{ ok: true, mode: "atomic-rename" }; }
+
+    // Windows commonly refuses replacement. Keep the previous valid entry as a
+    // recoverable backup until the staged file has become the primary.
+    try fs_remove(backup) catch nil;
+    let moved_old = false;
+    if try fs_exists(target) catch false {
+        moved_old = try { fs_rename(target, backup); true } catch false;
+        if not moved_old { try fs_remove(staged) catch nil; return map{ ok: false, error: "cache backup publish failed" }; }
+    }
+    let replaced = try { fs_rename(staged, target); true } catch false;
+    if not replaced {
+        if moved_old { try fs_rename(backup, target) catch nil; }
+        try fs_remove(staged) catch nil;
+        return map{ ok: false, error: "cache publish failed" };
+    }
+    if moved_old { try fs_remove(backup) catch nil; }
+    return map{ ok: true, mode: "backup-replace" };
+}
+
+fn _entry(kind, text, value, ttl_ms) {
+    let now = now_ms();
+    let expires = 0;
+    if ttl_ms > 0 {
+        if ttl_ms > MAX_QUANTITY - now { expires = MAX_QUANTITY; }
+        else { expires = now + ttl_ms; }
+    }
+    return map{
+        format: "pbai.cache.entry.v2", kind: kind, key: key(kind, text),
+        source_sha256: _digest(kind, text), created_ms: now, updated_ms: now,
+        expires_ms: expires, value: value
     };
-    let p = path(kind, text);
-    fs_write(p, json_stringify(entry));
-    return map{ format: "pbai.cache.write.v1", ok: true, kind: kind, key: entry.key, path: p };
+}
+
+fn _valid_v2(entry, kind, text) {
+    let expected_key = key(kind, text);
+    let expected_digest = _digest(kind, text);
+    return type(entry) == "map" and (try entry.format catch "") == "pbai.cache.entry.v2" and
+           (try entry.kind catch "") == kind and (try entry.key catch "") == expected_key and
+           (try entry.source_sha256 catch "") == expected_digest;
+}
+
+fn _read_json_file(candidate) {
+    let raw = try fs_read(candidate) catch nil;
+    if type(raw) != "string" { return map{ ok: false, missing: true }; }
+    let parsed = try json_parse(raw) catch nil;
+    if type(parsed) != "map" { return map{ ok: false, corrupt: true }; }
+    return map{ ok: true, value: parsed, units: len(str_to_bytes(raw)) };
+}
+
+fn _valid_entry_file(entry, kind, filename) {
+    if type(entry) != "map" { return false; }
+    let format = try entry.format catch "";
+    let entry_kind = try entry.kind catch "";
+    let entry_key = try entry.key catch "";
+    if entry_kind != kind or filename != entry_key + ".json" { return false; }
+    if format == "pbai.cache.entry.v2" {
+        let digest = try entry.source_sha256 catch "";
+        return len(digest) == 64 and entry_key == kind + "-" + digest;
+    }
+    if format == "pbai.cache.entry.v1" {
+        return str_starts_with(entry_key, kind + "-");
+    }
+    return false;
+}
+
+fn _valid_exact_file(read, kind, text, legacy) {
+    if not read.ok { return false; }
+    if legacy {
+        return (try read.value.format catch "") == "pbai.cache.entry.v1" and
+               (try read.value.kind catch "") == kind and
+               (try read.value.key catch "") == _legacy_key(kind, text);
+    }
+    return _valid_v2(read.value, kind, text);
+}
+
+fn _recover_primary(primary, kind, text) {
+    let backup = primary + ".bak";
+    let primary_read = _read_json_file(primary);
+    if _valid_exact_file(primary_read, kind, text, false) {
+        if try fs_exists(backup) catch false { try fs_remove(backup) catch nil; }
+        return true;
+    }
+    let backup_read = _read_json_file(backup);
+    if not _valid_exact_file(backup_read, kind, text, false) {
+        if try fs_exists(backup) catch false { try fs_remove(backup) catch nil; }
+        return false;
+    }
+    if try fs_exists(primary) catch false { try fs_remove(primary) catch nil; }
+    return try { fs_rename(backup, primary); true } catch false;
+}
+
+fn get_entry(kind, text) {
+    kind = _safe_kind(kind);
+    let primary = path(kind, text);
+    _recover_primary(primary, kind, text);
+    let read = _read_json_file(primary);
+    if read.ok {
+        if _valid_v2(read.value, kind, text) {
+            let expires = try read.value.expires_ms catch 0;
+            if expires > 0 and expires <= now_ms() {
+                try fs_remove(primary) catch nil;
+                return map{ found: false, value: nil, expired: true };
+            }
+            return map{ found: true, value: read.value.value, verified: true, legacy: false,
+                        created_ms: read.value.created_ms, updated_ms: read.value.updated_ms,
+                        expires_ms: expires, units: read.units, path: primary };
+        }
+        // A v2 file at the expected path with mismatched metadata is never used.
+        if (try read.value.format catch "") == "pbai.cache.entry.v2" {
+            try fs_remove(primary) catch nil;
+            return map{ found: false, value: nil, corrupt: true };
+        }
+    }
+
+    // Compatibility-only v1 fallback. Its 31-bit key can collide, so callers can
+    // inspect verified=false/legacy=true and new writes always replace it with v2.
+    let legacy_path = _legacy_path(kind, text);
+    let legacy = _read_json_file(legacy_path);
+    if legacy.ok and (try legacy.value.format catch "") == "pbai.cache.entry.v1" and
+       (try legacy.value.kind catch "") == kind and (try legacy.value.key catch "") == _legacy_key(kind, text) {
+        return map{ found: true, value: try legacy.value.value catch nil, verified: false, legacy: true,
+                    created_ms: try legacy.value.created_ms catch 0, updated_ms: try legacy.value.created_ms catch 0,
+                    expires_ms: 0, units: legacy.units, path: legacy_path };
+    }
+    if try read.corrupt catch false { try fs_remove(primary) catch nil; return map{ found: false, value: nil, corrupt: true }; }
+    return map{ found: false, value: nil };
 }
 
 fn get(kind, text) {
-    kind = _safe_kind(kind);
-    let p = path(kind, text);
-    return try json_parse(fs_read(p)).value catch nil;
+    let entry = get_entry(kind, text);
+    if entry.found { return entry.value; }
+    return nil;
 }
 
-fn has(kind, text) {
-    kind = _safe_kind(kind);
-    return get(kind, text) != nil;
+fn has(kind, text) { return get_entry(kind, text).found; }
+
+fn _sort_oldest(entries) {
+    let i = 0;
+    while i < len(entries) {
+        let j = i + 1;
+        while j < len(entries) {
+            let swap = entries[j].updated_ms < entries[i].updated_ms or
+                       (entries[j].updated_ms == entries[i].updated_ms and entries[j].path < entries[i].path);
+            if swap { let tmp = entries[i]; entries[i] = entries[j]; entries[j] = tmp; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return entries;
 }
+
+fn _without_index(entries, remove_index) {
+    let next = [];
+    let i = 0;
+    while i < len(entries) {
+        if i != remove_index { array_push(next, entries[i]); }
+        i = i + 1;
+    }
+    return next;
+}
+
+fn _recover_kind_files(kind) {
+    let dir = _kind_dir(kind);
+    let files = try fs_listdir(dir) catch [];
+    let i = 0;
+    while i < len(files) {
+        let name = files[i];
+        let full = dir + "/" + name;
+        if str_contains(name, ".tmp-") { try fs_remove(full) catch nil; }
+        elif str_ends_with(name, ".json.bak") {
+            let primary = str_slice(full, 0, len(full) - 4);
+            let primary_name = str_slice(name, 0, len(name) - 4);
+            let primary_read = _read_json_file(primary);
+            if primary_read.ok and _valid_entry_file(primary_read.value, kind, primary_name) {
+                try fs_remove(full) catch nil;
+            } else {
+                let backup_read = _read_json_file(full);
+                if backup_read.ok and _valid_entry_file(backup_read.value, kind, primary_name) {
+                    if try fs_exists(primary) catch false { try fs_remove(primary) catch nil; }
+                    try fs_rename(full, primary) catch nil;
+                } else {
+                    try fs_remove(full) catch nil;
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _inspect_kind(kind, clean) {
+    kind = _safe_kind(kind);
+    _recover_kind_files(kind);
+    let dir = _kind_dir(kind);
+    let files = try fs_listdir(dir) catch [];
+    let entries = [];
+    let total_units = 0;
+    let expired = 0;
+    let corrupt = 0;
+    let now = now_ms();
+    let i = 0;
+    while i < len(files) {
+        if str_ends_with(files[i], ".json") {
+            let p = dir + "/" + files[i];
+            let read = _read_json_file(p);
+            if not read.ok {
+                corrupt = corrupt + 1;
+                if clean { try fs_remove(p) catch nil; }
+            } else if not _valid_entry_file(read.value, kind, files[i]) {
+                corrupt = corrupt + 1;
+                if clean { try fs_remove(p) catch nil; }
+            } else {
+                let expires = try read.value.expires_ms catch 0;
+                if expires > 0 and expires <= now {
+                    expired = expired + 1;
+                    if clean { try fs_remove(p) catch nil; }
+                } else {
+                    let updated = try read.value.updated_ms catch try read.value.created_ms catch 0;
+                    array_push(entries, map{ path: p, units: read.units, updated_ms: updated });
+                    total_units = total_units + read.units;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return map{ entries: entries, units: total_units, expired: expired, corrupt: corrupt };
+}
+
+fn prune_kind(kind, options = nil, protected_path = nil) {
+    if options == nil { options = map{}; }
+    kind = _safe_kind(kind);
+    let max_entries = _quantity(_option(options, "max_entries", DEFAULT_MAX_ENTRIES), DEFAULT_MAX_ENTRIES, 1);
+    let max_units = _quantity(_option(options, "max_units", DEFAULT_MAX_UNITS), DEFAULT_MAX_UNITS, 1);
+    let state = _inspect_kind(kind, true);
+    let entries = _sort_oldest(state.entries);
+    let units = state.units;
+    let removed = state.expired + state.corrupt;
+    let i = 0;
+    while len(entries) > max_entries or units > max_units {
+        let victim = nil;
+        let victim_index = -1;
+        i = 0;
+        while i < len(entries) and victim == nil {
+            if protected_path == nil or entries[i].path != protected_path { victim = entries[i]; victim_index = i; }
+            i = i + 1;
+        }
+        if victim == nil { break; }
+        let did_remove = try { fs_remove(victim.path); true } catch false;
+        if did_remove { removed = removed + 1; units = units - victim.units; }
+        entries = _without_index(entries, victim_index);
+    }
+    return map{ format: "pbai.cache.prune.v1", kind: kind, removed: removed,
+                entries: len(entries), units: units, max_entries: max_entries, max_units: max_units };
+}
+
+fn put_options(kind, text, value, options = nil) {
+    if options == nil { options = map{}; }
+    kind = _safe_kind(kind);
+    let ttl = _quantity(_option(options, "ttl_ms", 0), 0, 0);
+    let max_entries = _quantity(_option(options, "max_entries", DEFAULT_MAX_ENTRIES), DEFAULT_MAX_ENTRIES, 1);
+    let max_units = _quantity(_option(options, "max_units", DEFAULT_MAX_UNITS), DEFAULT_MAX_UNITS, 1);
+    let max_entry = _quantity(_option(options, "max_entry_units", DEFAULT_MAX_ENTRY_UNITS), DEFAULT_MAX_ENTRY_UNITS, 1, max_units);
+    let entry = _entry(kind, text, value, ttl);
+    let payload = json_stringify(entry);
+    let units = len(str_to_bytes(payload));
+    if units > max_entry or units > max_units {
+        return map{ format: "pbai.cache.write.v1", schema_version: 2, ok: false, error: "entry exceeds cache quota", kind: kind, units: units };
+    }
+    let dir = _kind_dir(kind);
+    let made = try { fs_mkdirs(dir); true } catch false;
+    if not made { return map{ format: "pbai.cache.write.v1", schema_version: 2, ok: false, error: "cannot create cache directory", kind: kind }; }
+    let p = path(kind, text);
+    _recover_primary(p, kind, text);
+    let published = _write_staged(p, payload);
+    if not published.ok { return map{ format: "pbai.cache.write.v1", schema_version: 2, ok: false, error: published.error, kind: kind, path: p }; }
+    let legacy = _legacy_path(kind, text);
+    if legacy != p { try fs_remove(legacy) catch nil; }
+    let pruned = prune_kind(kind, map{ max_entries: max_entries, max_units: max_units }, p);
+    return map{ format: "pbai.cache.write.v1", schema_version: 2, ok: true, kind: kind, key: entry.key, path: p,
+                units: units, expires_ms: entry.expires_ms, publish_mode: published.mode,
+                pruned: pruned.removed, entries: pruned.entries };
+}
+
+fn put(kind, text, value) { return put_options(kind, text, value, nil); }
 
 fn remove(kind, text) {
     kind = _safe_kind(kind);
-    let p = path(kind, text);
-    let ok = try fs_remove(p) catch false;
-    return map{ format: "pbai.cache.remove.v1", ok: ok, kind: kind, path: p };
+    let paths = [path(kind, text), path(kind, text) + ".bak", _legacy_path(kind, text)];
+    let removed = 0;
+    let i = 0;
+    while i < len(paths) {
+        if try fs_exists(paths[i]) catch false {
+            let ok = try { fs_remove(paths[i]); true } catch false;
+            if ok { removed = removed + 1; }
+        }
+        i = i + 1;
+    }
+    return map{ format: "pbai.cache.remove.v1", ok: removed > 0, kind: kind, path: paths[0], removed: removed };
 }
+
+fn invalidate(kind, text) { return remove(kind, text); }
 
 fn clear_kind(kind) {
     kind = _safe_kind(kind);
     let dir = _kind_dir(kind);
     let files = try fs_listdir(dir) catch [];
     let removed = 0;
+    let failed = 0;
     let i = 0;
     while i < len(files) {
-        let p = dir + "/" + files[i];
-        try fs_remove(p) catch false;
-        removed = removed + 1;
+        let ok = try { fs_remove(dir + "/" + files[i]); true } catch false;
+        if ok { removed = removed + 1; } else { failed = failed + 1; }
         i = i + 1;
     }
-    return map{ format: "pbai.cache.clear.v1", kind: kind, removed: removed };
+    return map{ format: "pbai.cache.clear.v1", kind: kind, removed: removed, failed: failed };
 }
 
 fn clear_all() {
     let kinds = try fs_listdir(CACHE_ROOT) catch [];
     let removed = 0;
+    let failed = 0;
     let i = 0;
     while i < len(kinds) {
-        let r = clear_kind(kinds[i]);
-        removed = removed + r.removed;
+        let result = clear_kind(kinds[i]);
+        removed = removed + result.removed;
+        failed = failed + result.failed;
         i = i + 1;
     }
-    return map{ format: "pbai.cache.clear_all.v1", root: CACHE_ROOT, removed: removed };
+    return map{ format: "pbai.cache.clear_all.v1", root: CACHE_ROOT, removed: removed, failed: failed };
 }
 
-fn status() {
+fn status(options = nil) {
+    if options == nil { options = map{}; }
+    let max_entries = _quantity(_option(options, "max_entries", DEFAULT_MAX_ENTRIES), DEFAULT_MAX_ENTRIES, 1);
+    let max_units = _quantity(_option(options, "max_units", DEFAULT_MAX_UNITS), DEFAULT_MAX_UNITS, 1);
     let kinds = try fs_listdir(CACHE_ROOT) catch [];
     let entries = [];
     let total = 0;
+    let total_units = 0;
+    let expired = 0;
+    let corrupt = 0;
     let i = 0;
     while i < len(kinds) {
-        let files = try fs_listdir(CACHE_ROOT + "/" + kinds[i]) catch [];
-        total = total + len(files);
-        push(entries, map{ kind: kinds[i], entries: len(files) });
+        let state = _inspect_kind(kinds[i], false);
+        total = total + len(state.entries);
+        total_units = total_units + state.units;
+        expired = expired + state.expired;
+        corrupt = corrupt + state.corrupt;
+        push(entries, map{ kind: _safe_kind(kinds[i]), entries: len(state.entries), units: state.units,
+                           expired: state.expired, corrupt: state.corrupt });
         i = i + 1;
     }
     return map{
-        format: "pbai.cache.status.v1",
-        root: CACHE_ROOT,
-        kinds: entries,
-        total_entries: total,
+        // Keep the original status format for callers; schema_version identifies
+        // the stronger entry/storage contract.
+        format: "pbai.cache.status.v1", schema_version: 2, root: CACHE_ROOT,
+        kinds: entries, total_entries: total, total_units: total_units,
+        expired_entries: expired, corrupt_entries: corrupt,
+        default_max_entries_per_kind: max_entries, default_max_units_per_kind: max_units,
+        hash: "sha256-domain-separated", publish: "staged-rename-with-backup-recovery",
         purpose: "cache derived pbAI data such as training summaries, eval reports, tokenization, retrieval, and generation metadata"
     };
 }
@@ -150,5 +487,5 @@ fn put_training_summary(name, ckpt) {
     });
 }
 
-export root, key, path, put, get, has, remove, clear_kind, clear_all, status;
-export put_training_summary;
+export root, key, path, put, put_options, get, get_entry, has, remove, invalidate;
+export clear_kind, clear_all, prune_kind, status, put_training_summary;

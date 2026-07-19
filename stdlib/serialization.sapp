@@ -1,10 +1,107 @@
 //! serialization.sapp — Multi-format serialization for pblang
-//! Supports JSON (pretty/validate), TOML, YAML, CSV, XML escaping.
-//! TOML/YAML are parsed natively in pblang — no external tools, no shelling
+//! Supports JSON (pretty/validate), bounded TOML/YAML subsets, CSV, and XML
+//! text escaping. TOML/YAML are parsed natively in pblang — no external tools or shelling
 //! out (the old `exec(... | python3 ...)` path was both a non-pblang
 //! dependency and a shell-injection vector on untrusted input).
 
 let csv_mod = import("stdlib:csv.sapp");
+let json_mod = import("stdlib:json.sapp");
+
+let _SER_RESULT = "pblang.serialization.result.v1";
+let _SER_DEFAULT_INPUT = 1048576;
+let _SER_HARD_INPUT = 16777216;
+let _SER_DEFAULT_OUTPUT = 2097152;
+let _SER_HARD_OUTPUT = 33554432;
+let _SER_DEFAULT_LINES = 100000;
+let _SER_HARD_LINES = 1000000;
+let _SER_DEFAULT_LINE = 65536;
+let _SER_HARD_LINE = 1048576;
+let _SER_DEFAULT_DEPTH = 64;
+let _SER_HARD_DEPTH = 256;
+let _SER_DEFAULT_ITEMS = 100000;
+let _SER_HARD_ITEMS = 1000000;
+
+fn _ser_limit(options, name, fallback, hard_max) {
+    let value = try options[name] catch fallback;
+    if type(value) != "number" or value <= 0 { return fallback; }
+    value = num_floor(value);
+    if value > hard_max { return hard_max; }
+    return value;
+}
+
+fn _ser_flag(options, name, fallback) {
+    let value = try options[name] catch fallback;
+    if type(value) != "bool" { return fallback; }
+    return value;
+}
+
+/// Resolve resource limits for untrusted serialization input/output. Caller
+/// values are capped at hard ceilings so a mistaken option cannot disable the
+/// safety boundary.
+fn limits(options = nil) {
+    return map{
+        max_input_bytes: _ser_limit(options, "max_input_bytes", _SER_DEFAULT_INPUT, _SER_HARD_INPUT),
+        max_output_bytes: _ser_limit(options, "max_output_bytes", _SER_DEFAULT_OUTPUT, _SER_HARD_OUTPUT),
+        max_lines: _ser_limit(options, "max_lines", _SER_DEFAULT_LINES, _SER_HARD_LINES),
+        max_line_bytes: _ser_limit(options, "max_line_bytes", _SER_DEFAULT_LINE, _SER_HARD_LINE),
+        max_depth: _ser_limit(options, "max_depth", _SER_DEFAULT_DEPTH, _SER_HARD_DEPTH),
+        max_items: _ser_limit(options, "max_items", _SER_DEFAULT_ITEMS, _SER_HARD_ITEMS),
+        strict: _ser_flag(options, "strict", true),
+        reject_duplicate_keys: _ser_flag(options, "reject_duplicate_keys", true),
+    };
+}
+
+/// Machine-readable capability inventory. XML is intentionally marked as
+/// text-only: this module escapes entities but does not claim to be a DOM parser.
+fn formats() {
+    return [
+        map{ name: "json", parse: true, stringify: true, strict: true },
+        map{ name: "toml", parse: true, stringify: true, strict: "documented-subset" },
+        map{ name: "yaml", aliases: ["yml"], parse: true, stringify: true, strict: "documented-subset" },
+        map{ name: "csv", parse: true, stringify: true, strict: true },
+        map{ name: "xml", parse: "text-only", stringify: "escaped-text", strict: false },
+        map{ name: "text", parse: true, stringify: true, strict: true },
+    ];
+}
+
+fn _ser_format(format) {
+    if format == nil { return ""; }
+    if format == "json" or format == "toml" or format == "yaml" or format == "csv"
+        or format == "xml" or format == "text" or format == "auto"
+        or format == "json_pretty" or format == "pretty_json" { return format; }
+    let fmt = str_lower(str_trim(str(format)));
+    if fmt == "yml" { return "yaml"; }
+    if fmt == "txt" { return "text"; }
+    if fmt == "xml_text" { return "xml"; }
+    return fmt;
+}
+
+fn _ser_issue(code, message, line = 0, column = 0) {
+    return map{ code: code, message: message, line: line, column: column };
+}
+
+fn _ser_failure(format, issue) {
+    return map{
+        schema: _SER_RESULT, ok: false, format: format, value: nil,
+        error: issue.message, diagnostics: [issue],
+    };
+}
+
+fn _ser_success(format, value) {
+    return map{
+        schema: _SER_RESULT, ok: true, format: format, value: value,
+        error: nil, diagnostics: [],
+    };
+}
+
+fn _ser_supported_parse(fmt) {
+    return fmt == "json" or fmt == "toml" or fmt == "yaml" or fmt == "csv"
+        or fmt == "xml" or fmt == "text";
+}
+
+fn _ser_supported_stringify(fmt) {
+    return _ser_supported_parse(fmt) or fmt == "json_pretty" or fmt == "pretty_json";
+}
 
 // ---------------------------------------------------------------------------
 // Shared scalar/structure helpers used by the native TOML + YAML parsers.
@@ -37,6 +134,30 @@ fn _ser_is_num(s) {
     return digits > 0 and dots <= 1;
 }
 
+fn _ser_unescape_quoted(s, quote) {
+    if quote == "'" { return s; }
+    if str_index_of(s, "\\") < 0 { return s; }
+    let out = "";
+    let i = 0;
+    while i < len(s) {
+        let ch = str_slice(s, i, i + 1);
+        if ch == "\\" and i + 1 < len(s) {
+            let next = str_slice(s, i + 1, i + 2);
+            if next == "n" { out = out + "\n"; }
+            elif next == "r" { out = out + "\r"; }
+            elif next == "t" { out = out + "\t"; }
+            elif next == "\\" { out = out + "\\"; }
+            elif next == "\"" { out = out + "\""; }
+            else { out = out + "\\" + next; }
+            i = i + 2;
+        } else {
+            out = out + ch;
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
 /// Strip a matching pair of surrounding quotes from a key/identifier.
 fn _ser_unquote_key(k) {
     let s = str_trim(k);
@@ -59,7 +180,7 @@ fn _ser_scalar(raw) {
     let first = str_slice(s, 0, 1);
     let last = str_slice(s, n - 1, n);
     if n >= 2 and ((first == "\"" and last == "\"") or (first == "'" and last == "'")) {
-        return str_slice(s, 1, n - 1);
+        return _ser_unescape_quoted(str_slice(s, 1, n - 1), first);
     }
     if s == "true" { return true; }
     if s == "false" { return false; }
@@ -76,11 +197,14 @@ fn _ser_split_top(s, sep) {
     let n = len(s);
     let inq = false;
     let qch = "";
+    let escaped = false;
     while i < n {
         let ch = str_slice(s, i, i + 1);
         if inq {
             cur = cur + ch;
-            if ch == qch { inq = false; }
+            if escaped { escaped = false; }
+            elif ch == "\\" and qch == "\"" { escaped = true; }
+            elif ch == qch { inq = false; }
         } else {
             if ch == "\"" or ch == "'" { inq = true; qch = ch; cur = cur + ch; }
             else if ch == sep { array_push(out, cur); cur = ""; }
@@ -99,11 +223,14 @@ fn _ser_strip_comment(s) {
     let n = len(s);
     let inq = false;
     let qch = "";
+    let escaped = false;
     while i < n {
         let ch = str_slice(s, i, i + 1);
         if inq {
             out = out + ch;
-            if ch == qch { inq = false; }
+            if escaped { escaped = false; }
+            elif ch == "\\" and qch == "\"" { escaped = true; }
+            elif ch == qch { inq = false; }
         } else {
             if ch == "\"" or ch == "'" { inq = true; qch = ch; out = out + ch; }
             else if ch == "#" { i = n; }
@@ -131,16 +258,13 @@ fn _ser_flow_array(s) {
 }
 
 fn _ser_spaces(n) {
-    let out = "";
-    let i = 0;
-    while i < n {
-        out = out + " ";
-        i = i + 1;
-    }
-    return out;
+    return str_repeat(" ", n);
 }
 
 fn _ser_escape_string(s) {
+    if str_index_of(s, "\\") < 0 and str_index_of(s, "\"") < 0
+        and str_index_of(s, "\n") < 0 and str_index_of(s, "\r") < 0
+        and str_index_of(s, "\t") < 0 { return s; }
     let out = "";
     let i = 0;
     while i < len(s) {
@@ -160,6 +284,21 @@ fn _ser_quote(s) {
     return "\"" + _ser_escape_string(str(s)) + "\"";
 }
 
+fn _ser_plain_key(key) {
+    let s = str(key);
+    if s == "" { return false; }
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        if c >= 48 and c <= 57 { i = i + 1; continue; }
+        if c >= 65 and c <= 90 { i = i + 1; continue; }
+        if c >= 97 and c <= 122 { i = i + 1; continue; }
+        if c == 95 or c == 45 { i = i + 1; continue; }
+        return false;
+    }
+    return true;
+}
+
 fn _ser_is_scalar(v) {
     let t = type(v);
     return v == nil or t == "string" or t == "number" or t == "bool";
@@ -171,7 +310,7 @@ fn _ser_scalar_out(v) {
     if t == "string" { return _ser_quote(v); }
     if t == "number" { return str(v); }
     if t == "bool" {
-        if v == true { return "true"; }
+        if v { return "true"; }
         return "false";
     }
     return _ser_quote(str(v));
@@ -194,66 +333,20 @@ fn _ser_array_out(arr) {
 
 /// Pretty-print JSON with indentation (2 spaces)
 fn json_pretty(data) {
-    let json_str = json_stringify(data);
-    // Simple pretty-printing: add newlines and indentation
-    let result = "";
-    let indent = 0;
-    let i = 0;
-    let len = len(json_str);
-    let in_string = false;
-    let prev = "";
-    
-    while i < len {
-        let ch = json_str[i..(i+1)];
-        
-        if ch == "\"" and prev != "\\" { in_string = not in_string; }
-        
-        if in_string {
-            result = result + ch;
-        } else {
-            if ch == "{" or ch == "[" {
-                result = result + ch + "\n";
-                indent = indent + 2;
-                let j = 0;
-                while j < indent { result = result + " "; j = j + 1; }
-            } else {
-                if ch == "}" or ch == "]" {
-                    indent = indent - 2;
-                    result = result + "\n";
-                    let j = 0;
-                    while j < indent { result = result + " "; j = j + 1; }
-                    result = result + ch;
-                } else {
-                    if ch == "," {
-                        result = result + ch + "\n";
-                        let j = 0;
-                        while j < indent { result = result + " "; j = j + 1; }
-                    } else {
-                        if ch == ":" { result = result + ch + " "; }
-                        else { result = result + ch; }
-                    }
-                }
-            }
-        }
-        
-        prev = ch;
-        i = i + 1;
-    }
-    return result;
+    return json_mod.pretty(data, 2);
 }
 
 /// Validate if a string is valid JSON
 fn json_validate(data) {
-    let result = try json_parse(data) catch "__pblang_invalid_json__";
-    return result != "__pblang_invalid_json__";
+    return parse_safe(data, "json").ok;
 }
 
 fn json_validate_detail(data) {
-    let result = try json_parse(data) catch "__pblang_invalid_json__";
-    if result == "__pblang_invalid_json__" {
-        return map{ ok: false, error: "invalid JSON" };
+    let result = parse_safe(data, "json");
+    if not result.ok {
+        return map{ ok: false, error: result.error, diagnostics: result.diagnostics };
     }
-    return map{ ok: true, value: result };
+    return map{ ok: true, value: result.value };
 }
 
 /// Get or create the nested table for a (possibly dotted) `[section]` name.
@@ -275,7 +368,10 @@ fn _ser_toml_table(root, name) {
 fn toml_parse(data) {
     let result = map{};
     if data == nil or data == "" { return result; }
+    if type(data) != "string" { throw "serialization.toml_parse: input must be a string"; }
+    if len(data) > _SER_HARD_INPUT { throw "serialization.toml_parse: hard input limit exceeded"; }
     let lines = str_split(data, "\n");
+    if len(lines) > _SER_HARD_LINES { throw "serialization.toml_parse: hard line limit exceeded"; }
     let cur = result;
     let i = 0;
     while i < len(lines) {
@@ -306,10 +402,11 @@ fn toml_parse(data) {
     return result;
 }
 
-fn _toml_write_table(data, prefix) {
+fn _toml_write_table(data, prefix, depth = 0) {
+    if depth > _SER_HARD_DEPTH { throw "serialization.toml_stringify: hard depth limit exceeded"; }
     let result = "";
     let nested = [];
-    let keys = map_keys(data);
+    let keys = array_sort(map_keys(data));
     let i = 0;
     while i < len(keys) {
         let key = keys[i];
@@ -331,7 +428,7 @@ fn _toml_write_table(data, prefix) {
         if prefix != "" { table_name = prefix + "." + key; }
         if result != "" { result = result + "\n"; }
         result = result + "[" + table_name + "]\n";
-        result = result + _toml_write_table(data[key], table_name);
+        result = result + _toml_write_table(data[key], table_name, depth + 1);
         n = n + 1;
     }
     return result;
@@ -341,7 +438,9 @@ fn _toml_write_table(data, prefix) {
 fn toml_stringify(data) {
     if data == nil { return ""; }
     if type(data) != "map" { return ""; }
-    return _toml_write_table(data, "");
+    let result = _toml_write_table(data, "", 0);
+    if len(result) > _SER_HARD_OUTPUT { throw "serialization.toml_stringify: hard output limit exceeded"; }
+    return result;
 }
 
 /// Indentation of the next significant (non-blank, non-comment) line, or -1.
@@ -359,7 +458,8 @@ fn _yaml_next_indent(lines, start) {
 /// Parse one YAML block (a run of lines sharing the indent of the first
 /// significant line at/after `start`). Deeper lines recurse. Returns
 /// map{ val, next } where `next` is the line index after the block.
-fn _yaml_block(lines, start) {
+fn _yaml_block(lines, start, depth = 0) {
+    if depth > _SER_HARD_DEPTH { throw "serialization.yaml_parse: hard depth limit exceeded"; }
     let n = len(lines);
     let i = start;
     while i < n {
@@ -384,7 +484,7 @@ fn _yaml_block(lines, start) {
             let item = str_trim(str_slice(t, 1, len(t)));
             i = i + 1;
             if item == "" {
-                let sub = _yaml_block(lines, i);
+                let sub = _yaml_block(lines, i, depth + 1);
                 array_push(arr, sub["val"]);
                 i = sub["next"];
             } else {
@@ -418,7 +518,7 @@ fn _yaml_block(lines, start) {
         i = i + 1;
         if valraw == "" {
             if _yaml_next_indent(lines, i) > baseIndent {
-                let sub = _yaml_block(lines, i);
+                let sub = _yaml_block(lines, i, depth + 1);
                 m[key] = sub["val"];
                 i = sub["next"];
             } else {
@@ -438,19 +538,23 @@ fn _yaml_block(lines, start) {
 /// a map (or an array if the document's top level is a sequence).
 fn yaml_parse(data) {
     if data == nil or data == "" { return map{}; }
+    if type(data) != "string" { throw "serialization.yaml_parse: input must be a string"; }
+    if len(data) > _SER_HARD_INPUT { throw "serialization.yaml_parse: hard input limit exceeded"; }
     let lines = str_split(data, "\n");
-    let res = _yaml_block(lines, 0);
+    if len(lines) > _SER_HARD_LINES { throw "serialization.yaml_parse: hard line limit exceeded"; }
+    let res = _yaml_block(lines, 0, 0);
     let v = res["val"];
     if v == nil { return map{}; }
     return v;
 }
 
-fn _yaml_write(data, indent) {
+fn _yaml_write(data, indent, depth = 0) {
+    if depth > _SER_HARD_DEPTH { throw "serialization.yaml_stringify: hard depth limit exceeded"; }
     let pad = _ser_spaces(indent);
     let t = type(data);
     if t == "map" {
         let result = "";
-        let keys = map_keys(data);
+        let keys = array_sort(map_keys(data));
         let i = 0;
         while i < len(keys) {
             let key = keys[i];
@@ -458,7 +562,7 @@ fn _yaml_write(data, indent) {
             if _ser_is_scalar(val) {
                 result = result + pad + key + ": " + _ser_scalar_out(val) + "\n";
             } else {
-                result = result + pad + key + ":\n" + _yaml_write(val, indent + 2);
+                result = result + pad + key + ":\n" + _yaml_write(val, indent + 2, depth + 1);
             }
             i = i + 1;
         }
@@ -472,7 +576,7 @@ fn _yaml_write(data, indent) {
             if _ser_is_scalar(val) {
                 result = result + pad + "- " + _ser_scalar_out(val) + "\n";
             } else {
-                result = result + pad + "-\n" + _yaml_write(val, indent + 2);
+                result = result + pad + "-\n" + _yaml_write(val, indent + 2, depth + 1);
             }
             i = i + 1;
         }
@@ -484,7 +588,9 @@ fn _yaml_write(data, indent) {
 /// YAML stringify for nested maps, arrays, and scalar values.
 fn yaml_stringify(data) {
     if data == nil { return ""; }
-    return _yaml_write(data, 0);
+    let result = _yaml_write(data, 0, 0);
+    if len(result) > _SER_HARD_OUTPUT { throw "serialization.yaml_stringify: hard output limit exceeded"; }
+    return result;
 }
 
 /// Parse CSV string into array of maps
@@ -499,19 +605,19 @@ fn csv_stringify(rows, columns) {
 
 /// Escape special XML characters
 fn xml_escape(text) {
-    let result = "";
+    let result = [];
     let i = 0;
     while i < len(text) {
         let ch = text[i..(i+1)];
-        if ch == "&" { result = result + "&amp;"; }
-        else { if ch == "<" { result = result + "&lt;"; }
-        else { if ch == ">" { result = result + "&gt;"; }
-        else { if ch == "\"" { result = result + "&quot;"; }
-        else { if ch == "'" { result = result + "&apos;"; }
-        else { result = result + ch; } } } } }
+        if ch == "&" { array_push(result, "&amp;"); }
+        elif ch == "<" { array_push(result, "&lt;"); }
+        elif ch == ">" { array_push(result, "&gt;"); }
+        elif ch == "\"" { array_push(result, "&quot;"); }
+        elif ch == "'" { array_push(result, "&apos;"); }
+        else { array_push(result, ch); }
         i = i + 1;
     }
-    return result;
+    return str_join(result, "");
 }
 
 /// Unescape XML entities. &amp; MUST be decoded LAST: decoding it first would
@@ -526,57 +632,453 @@ fn xml_unescape(text) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Bounded strict pipeline for untrusted data.
+// ---------------------------------------------------------------------------
+
+fn _ser_text_check(text, cfg) {
+    if type(text) != "string" { return _ser_issue("invalid_type", "serialization input must be a string"); }
+    if len(text) > cfg.max_input_bytes {
+        return _ser_issue("input_limit", "serialization input exceeds max_input_bytes");
+    }
+    let lines = str_split(text, "\n");
+    if len(lines) > cfg.max_lines { return _ser_issue("line_limit", "serialization input exceeds max_lines"); }
+    let i = 0;
+    while i < len(lines) {
+        if len(lines[i]) > cfg.max_line_bytes {
+            return _ser_issue("line_size_limit", "serialization line exceeds max_line_bytes", i + 1, cfg.max_line_bytes + 1);
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _ser_find_unquoted(s, target) {
+    let i = 0;
+    let quote = "";
+    let escaped = false;
+    while i < len(s) {
+        let ch = str_slice(s, i, i + 1);
+        if quote != "" {
+            if escaped { escaped = false; }
+            elif ch == "\\" and quote == "\"" { escaped = true; }
+            elif ch == quote { quote = ""; }
+        } else {
+            if ch == "\"" or ch == "'" { quote = ch; }
+            elif ch == target { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _ser_balanced_quotes(s) {
+    let quote = "";
+    let escaped = false;
+    let i = 0;
+    while i < len(s) {
+        let ch = str_slice(s, i, i + 1);
+        if quote != "" {
+            if escaped { escaped = false; }
+            elif ch == "\\" and quote == "\"" { escaped = true; }
+            elif ch == quote { quote = ""; }
+        } else if ch == "\"" or ch == "'" { quote = ch; }
+        i = i + 1;
+    }
+    return quote == "" and not escaped;
+}
+
+fn _ser_json_shape_check(text, cfg) {
+    let depth = 0;
+    let items = 0;
+    let quote = false;
+    let escaped = false;
+    let i = 0;
+    while i < len(text) {
+        let ch = str_slice(text, i, i + 1);
+        if quote {
+            if escaped { escaped = false; }
+            elif ch == "\\" { escaped = true; }
+            elif ch == "\"" { quote = false; }
+        } else {
+            if ch == "\"" { quote = true; }
+            elif ch == "{" or ch == "[" {
+                depth = depth + 1;
+                items = items + 1;
+                if depth > cfg.max_depth { return _ser_issue("depth_limit", "JSON nesting exceeds max_depth", 0, i + 1); }
+            } elif ch == "}" or ch == "]" {
+                depth = depth - 1;
+                if depth < 0 { return _ser_issue("invalid_json", "JSON closes a container that was not opened", 0, i + 1); }
+            } elif ch == "," { items = items + 1; }
+            if items > cfg.max_items { return _ser_issue("item_limit", "JSON structure exceeds max_items", 0, i + 1); }
+        }
+        i = i + 1;
+    }
+    if quote or escaped { return _ser_issue("invalid_json", "JSON contains an unterminated string"); }
+    if depth != 0 { return _ser_issue("invalid_json", "JSON contains an unterminated container"); }
+    return nil;
+}
+
+fn _ser_key_valid(raw) {
+    let key = str_trim(raw);
+    return _ser_plain_key(key);
+}
+
+fn _ser_toml_scalar_valid(raw) {
+    let value = str_trim(raw);
+    if value == "" { return false; }
+    let first = str_slice(value, 0, 1);
+    let last = str_slice(value, len(value) - 1, len(value));
+    if first == "\"" or first == "'" {
+        return last == first and _ser_balanced_quotes(value);
+    }
+    if first == "[" {
+        if last != "]" or not _ser_balanced_quotes(value) { return false; }
+        let inner = str_trim(str_slice(value, 1, len(value) - 1));
+        if inner == "" { return true; }
+        let parts = _ser_split_top(inner, ",");
+        let i = 0;
+        while i < len(parts) {
+            let item = str_trim(parts[i]);
+            if item == "" or str_slice(item, 0, 1) == "[" or not _ser_toml_scalar_valid(item) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return value == "true" or value == "false" or _ser_is_num(value);
+}
+
+fn _ser_toml_check(text, cfg) {
+    let lines = str_split(text, "\n");
+    let values = map{};
+    let tables = map{};
+    let scope = "";
+    let items = 0;
+    let i = 0;
+    while i < len(lines) {
+        let line_no = i + 1;
+        let line = str_trim(_ser_strip_comment(lines[i]));
+        i = i + 1;
+        if line == "" { continue; }
+        if not _ser_balanced_quotes(line) { return _ser_issue("invalid_toml", "unterminated quoted value", line_no, 1); }
+        if str_slice(line, 0, 1) == "[" {
+            if len(line) < 3 or str_slice(line, len(line) - 1, len(line)) != "]" {
+                return _ser_issue("invalid_toml", "malformed table header", line_no, 1);
+            }
+            if str_slice(line, 0, 2) == "[[" {
+                return _ser_issue("unsupported_toml", "arrays of tables are outside the supported TOML subset", line_no, 1);
+            }
+            let name = str_trim(str_slice(line, 1, len(line) - 1));
+            let parts = _ser_split_top(name, ".");
+            let path = "";
+            let p = 0;
+            while p < len(parts) {
+                let part = str_trim(parts[p]);
+                if not _ser_key_valid(part) { return _ser_issue("invalid_toml", "invalid table name", line_no, 2); }
+                let plain = _ser_unquote_key(part);
+                if path == "" { path = plain; } else { path = path + "." + plain; }
+                if map_has(values, path) { return _ser_issue("toml_type_conflict", "table conflicts with an existing value", line_no, 2); }
+                p = p + 1;
+            }
+            if cfg.reject_duplicate_keys and map_has(tables, path) {
+                return _ser_issue("duplicate_table", "duplicate TOML table: " + path, line_no, 2);
+            }
+            tables[path] = true;
+            scope = path;
+        } else {
+            let eq = _ser_find_unquoted(line, "=");
+            if eq <= 0 { return _ser_issue("invalid_toml", "expected key = value", line_no, 1); }
+            let raw_key = str_trim(str_slice(line, 0, eq));
+            let raw_value = str_trim(str_slice(line, eq + 1, len(line)));
+            if not _ser_key_valid(raw_key) { return _ser_issue("invalid_toml", "invalid TOML key", line_no, 1); }
+            if _ser_toml_scalar_valid(raw_value) {
+                // Supported scalar; continue with duplicate/type checks below.
+            } else {
+                return _ser_issue("unsupported_toml", "value is outside the supported TOML scalar/array subset", line_no, eq + 2);
+            }
+            let key = _ser_unquote_key(raw_key);
+            let full = key;
+            if scope != "" { full = scope + "." + key; }
+            if cfg.reject_duplicate_keys and (map_has(values, full) or map_has(tables, full)) {
+                return _ser_issue("duplicate_key", "duplicate TOML key: " + full, line_no, 1);
+            }
+            values[full] = true;
+            items = items + 1;
+            if items > cfg.max_items { return _ser_issue("item_limit", "TOML document exceeds max_items", line_no, 1); }
+        }
+    }
+    return nil;
+}
+
+fn _ser_yaml_scalar_valid(raw) {
+    let value = str_trim(raw);
+    if value == "" { return false; }
+    let first = str_slice(value, 0, 1);
+    let last = str_slice(value, len(value) - 1, len(value));
+    if first == "\"" or first == "'" { return last == first and _ser_balanced_quotes(value); }
+    if first == "[" {
+        if last != "]" or not _ser_balanced_quotes(value) { return false; }
+        let inner = str_trim(str_slice(value, 1, len(value) - 1));
+        if inner == "" { return true; }
+        let parts = _ser_split_top(inner, ",");
+        let i = 0;
+        while i < len(parts) {
+            let item = str_trim(parts[i]);
+            if item == "" or str_slice(item, 0, 1) == "[" or not _ser_yaml_scalar_valid(item) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if first == "{" or first == "&" or first == "*" or first == "!" or first == "|" or first == ">" { return false; }
+    return _ser_balanced_quotes(value);
+}
+
+fn _ser_yaml_check(text, cfg) {
+    let lines = str_split(text, "\n");
+    let scopes = ["$"];
+    let seen = map{};
+    let items = 0;
+    let root_kind = "";
+    let i = 0;
+    while i < len(lines) {
+        let line_no = i + 1;
+        let raw = lines[i];
+        i = i + 1;
+        if str_index_of(raw, "\t") >= 0 { return _ser_issue("invalid_yaml", "tabs are not allowed in strict YAML indentation", line_no, 1); }
+        let trimmed = str_trim(raw);
+        if trimmed == "" or str_slice(trimmed, 0, 1) == "#" { continue; }
+        let line = str_trim(_ser_strip_comment(trimmed));
+        if line == "" { continue; }
+        if line == "---" or line == "..." { return _ser_issue("unsupported_yaml", "multi-document markers are outside the supported YAML subset", line_no, 1); }
+        if not _ser_balanced_quotes(line) { return _ser_issue("invalid_yaml", "unterminated quoted value", line_no, 1); }
+        let indent = _ser_indent(raw);
+        if num_mod(indent, 2) != 0 { return _ser_issue("invalid_yaml", "strict YAML indentation must use two-space steps", line_no, 1); }
+        let depth = indent / 2;
+        if depth > cfg.max_depth { return _ser_issue("depth_limit", "YAML nesting exceeds max_depth", line_no, 1); }
+        while len(scopes) > depth + 1 { array_pop(scopes); }
+        if depth >= len(scopes) { return _ser_issue("invalid_yaml", "indentation has no parent mapping or sequence", line_no, 1); }
+        let parent = scopes[depth];
+        let is_list = line == "-" or str_slice(line, 0, 2) == "- ";
+        if depth == 0 {
+            let kind = if is_list { "sequence" } else { "mapping" };
+            if root_kind == "" { root_kind = kind; }
+            elif root_kind != kind { return _ser_issue("invalid_yaml", "cannot mix top-level mapping and sequence entries", line_no, 1); }
+        }
+        items = items + 1;
+        if items > cfg.max_items { return _ser_issue("item_limit", "YAML document exceeds max_items", line_no, 1); }
+        if is_list {
+            let item = str_trim(str_slice(line, 1, len(line)));
+            let child_scope = parent + "/#" + str(line_no);
+            if item == "" {
+                array_push(scopes, child_scope);
+                continue;
+            }
+            let colon = _ser_find_unquoted(item, ":");
+            if colon > 0 {
+                let raw_key = str_trim(str_slice(item, 0, colon));
+                let raw_value = str_trim(str_slice(item, colon + 1, len(item)));
+                if not _ser_key_valid(raw_key) or raw_key == "<<" { return _ser_issue("invalid_yaml", "invalid YAML mapping key", line_no, 3); }
+                if raw_value == "" { return _ser_issue("unsupported_yaml", "use '-' on its own before a nested sequence mapping", line_no, colon + 2); }
+                if not _ser_yaml_scalar_valid(raw_value) { return _ser_issue("unsupported_yaml", "value is outside the supported YAML subset", line_no, colon + 2); }
+            } elif not _ser_yaml_scalar_valid(item) {
+                return _ser_issue("unsupported_yaml", "sequence value is outside the supported YAML subset", line_no, 3);
+            }
+        } else {
+            let colon = _ser_find_unquoted(line, ":");
+            if colon <= 0 { return _ser_issue("invalid_yaml", "expected key: value", line_no, 1); }
+            let raw_key = str_trim(str_slice(line, 0, colon));
+            let raw_value = str_trim(str_slice(line, colon + 1, len(line)));
+            if not _ser_key_valid(raw_key) or raw_key == "<<" { return _ser_issue("invalid_yaml", "invalid YAML mapping key", line_no, 1); }
+            let key = _ser_unquote_key(raw_key);
+            let identity = parent + "|" + key;
+            if cfg.reject_duplicate_keys and map_has(seen, identity) {
+                return _ser_issue("duplicate_key", "duplicate YAML key: " + key, line_no, 1);
+            }
+            seen[identity] = true;
+            if raw_value == "" {
+                array_push(scopes, parent + "/" + key);
+            } elif not _ser_yaml_scalar_valid(raw_value) {
+                return _ser_issue("unsupported_yaml", "value is outside the supported YAML subset", line_no, colon + 2);
+            }
+        }
+    }
+    return nil;
+}
+
+fn _ser_value_walk(value, cfg, state, depth, format, inside_array) {
+    if state.issue != nil { return; }
+    if depth > cfg.max_depth { state.issue = _ser_issue("depth_limit", "serialized value exceeds max_depth"); return; }
+    let t = type(value);
+    if t == "map" {
+        if format == "toml" and inside_array { state.issue = _ser_issue("unsupported_value", "TOML arrays cannot contain maps in this subset"); return; }
+        let keys = map_keys(value);
+        state.items = state.items + len(keys);
+        if state.items > cfg.max_items { state.issue = _ser_issue("item_limit", "serialized value exceeds max_items"); return; }
+        let i = 0;
+        while i < len(keys) {
+            if (format == "toml" or format == "yaml") and not _ser_plain_key(keys[i]) {
+                state.issue = _ser_issue("unsupported_key", "safe TOML/YAML output requires plain alphanumeric, '_' or '-' keys");
+                return;
+            }
+            _ser_value_walk(value[keys[i]], cfg, state, depth + 1, format, false);
+            i = i + 1;
+        }
+        return;
+    }
+    if t == "array" {
+        state.items = state.items + len(value);
+        if state.items > cfg.max_items { state.issue = _ser_issue("item_limit", "serialized value exceeds max_items"); return; }
+        let i = 0;
+        while i < len(value) {
+            _ser_value_walk(value[i], cfg, state, depth + 1, format, true);
+            i = i + 1;
+        }
+        return;
+    }
+    if value == nil {
+        if format == "toml" { state.issue = _ser_issue("unsupported_value", "TOML has no null value"); }
+        return;
+    }
+    if t != "string" and t != "number" and t != "bool" {
+        state.issue = _ser_issue("unsupported_value", "format accepts only maps, arrays, strings, numbers, booleans, and supported nulls");
+        return;
+    }
+    if t == "string" and len(value) > cfg.max_line_bytes { state.issue = _ser_issue("scalar_limit", "string value exceeds max_line_bytes"); }
+}
+
+fn _ser_value_check(value, cfg, format) {
+    let state = map{ items: 0, issue: nil };
+    _ser_value_walk(value, cfg, state, 0, format, false);
+    return state.issue;
+}
+
+/// Parse untrusted text with fixed resource ceilings and structured errors.
+/// `strict:false` preserves the legacy permissive TOML/YAML subset while still
+/// enforcing all size/depth/item limits.
+fn parse_safe(text, format = "auto", options = nil) {
+    let cfg = limits(options);
+    let fmt = _ser_format(format);
+    let issue = _ser_text_check(text, cfg);
+    if issue != nil { return _ser_failure(fmt, issue); }
+    if fmt == "" or fmt == "auto" { fmt = detect_format(text); }
+    if not _ser_supported_parse(fmt) { return _ser_failure(fmt, _ser_issue("unsupported_format", "unsupported parse format: " + fmt)); }
+    if fmt == "json" {
+        issue = _ser_json_shape_check(text, cfg);
+        if issue != nil { return _ser_failure(fmt, issue); }
+        let attempt = try map{ ok: true, value: json_parse(text) } catch map{ ok: false, value: nil };
+        if not attempt.ok { return _ser_failure(fmt, _ser_issue("invalid_json", "invalid JSON document")); }
+        issue = _ser_value_check(attempt.value, cfg, fmt);
+        if issue != nil { return _ser_failure(fmt, issue); }
+        return _ser_success(fmt, attempt.value);
+    }
+    if fmt == "toml" {
+        if cfg.strict { issue = _ser_toml_check(text, cfg); if issue != nil { return _ser_failure(fmt, issue); } }
+        let attempt = try map{ ok: true, value: toml_parse(text) } catch map{ ok: false, value: nil };
+        if not attempt.ok { return _ser_failure(fmt, _ser_issue("invalid_toml", "TOML parsing failed")); }
+        issue = _ser_value_check(attempt.value, cfg, fmt);
+        if issue != nil { return _ser_failure(fmt, issue); }
+        return _ser_success(fmt, attempt.value);
+    }
+    if fmt == "yaml" {
+        if cfg.strict { issue = _ser_yaml_check(text, cfg); if issue != nil { return _ser_failure(fmt, issue); } }
+        let attempt = try map{ ok: true, value: yaml_parse(text) } catch map{ ok: false, value: nil };
+        if not attempt.ok { return _ser_failure(fmt, _ser_issue("invalid_yaml", "YAML parsing failed")); }
+        issue = _ser_value_check(attempt.value, cfg, fmt);
+        if issue != nil { return _ser_failure(fmt, issue); }
+        return _ser_success(fmt, attempt.value);
+    }
+    if fmt == "csv" {
+        let attempt = try map{ ok: true, value: csv_parse(text, ",") } catch map{ ok: false, value: nil };
+        if not attempt.ok { return _ser_failure(fmt, _ser_issue("invalid_csv", "CSV parsing failed")); }
+        issue = _ser_value_check(attempt.value, cfg, fmt);
+        if issue != nil { return _ser_failure(fmt, issue); }
+        return _ser_success(fmt, attempt.value);
+    }
+    return _ser_success(fmt, text);
+}
+
+/// Serialize a value with depth/item/output limits and structured errors.
+fn stringify_safe(data, format = "json", options = nil) {
+    let cfg = limits(options);
+    let fmt = _ser_format(format);
+    if not _ser_supported_stringify(fmt) { return _ser_failure(fmt, _ser_issue("unsupported_format", "unsupported output format: " + fmt)); }
+    let shape_format = fmt;
+    if fmt == "json_pretty" or fmt == "pretty_json" { shape_format = "json"; }
+    let issue = _ser_value_check(data, cfg, shape_format);
+    if issue != nil { return _ser_failure(fmt, issue); }
+    let attempt = try map{ ok: true, value: stringify_format(data, fmt) } catch map{ ok: false, value: nil };
+    if not attempt.ok { return _ser_failure(fmt, _ser_issue("stringify_failed", "serialization failed for format: " + fmt)); }
+    if len(attempt.value) > cfg.max_output_bytes { return _ser_failure(fmt, _ser_issue("output_limit", "serialized output exceeds max_output_bytes")); }
+    return _ser_success(fmt, attempt.value);
+}
+
+fn convert_safe(text, from_format, to_format, options = nil) {
+    let parsed = parse_safe(text, from_format, options);
+    if not parsed.ok { return parsed; }
+    let encoded = stringify_safe(parsed.value, to_format, options);
+    encoded.source_format = parsed.format;
+    return encoded;
+}
+
 fn detect_format(text) {
     let s = str_trim(text);
     if s == "" { return "text"; }
     let first = str_slice(s, 0, 1);
     if first == "{" or first == "[" { return "json"; }
     if first == "<" { return "xml"; }
-    let first_line = s;
-    let nl = str_index_of(s, "\n");
-    if nl >= 0 { first_line = str_slice(s, 0, nl); }
-    if str_index_of(first_line, ",") >= 0 { return "csv"; }
-    if str_index_of(s, "=") >= 0 { return "toml"; }
-    if str_index_of(s, ":") >= 0 { return "yaml"; }
+    let lines = str_split(s, "\n");
+    let first_line = "";
+    let i = 0;
+    while i < len(lines) and first_line == "" {
+        let candidate = str_trim(_ser_strip_comment(lines[i]));
+        if candidate != "" { first_line = candidate; }
+        i = i + 1;
+    }
+    // Assignment/mapping markers outrank commas so `a = [1, 2]` and
+    // `a: [1, 2]` are not incorrectly classified as CSV.
+    if _ser_find_unquoted(first_line, "=") > 0 or str_slice(first_line, 0, 1) == "[" { return "toml"; }
+    if _ser_find_unquoted(first_line, ":") > 0 { return "yaml"; }
+    if _ser_find_unquoted(first_line, ",") >= 0 { return "csv"; }
     return "text";
 }
 
 fn parse_format(text, format = "auto") {
-    let fmt = format;
+    let fmt = _ser_format(format);
     if fmt == nil or fmt == "" or fmt == "auto" { fmt = detect_format(text); }
     if fmt == "json" { return json_parse(text); }
     if fmt == "toml" { return toml_parse(text); }
-    if fmt == "yaml" or fmt == "yml" { return yaml_parse(text); }
+    if fmt == "yaml" { return yaml_parse(text); }
     if fmt == "csv" { return csv_parse(text, ","); }
-    return text;
+    if fmt == "xml" or fmt == "text" { return text; }
+    throw "serialization.parse_format: unsupported format: " + fmt;
 }
 
 fn stringify_format(data, format = "json") {
-    if format == "json" { return json_stringify(data); }
-    if format == "json_pretty" or format == "pretty_json" { return json_pretty(data); }
-    if format == "toml" { return toml_stringify(data); }
-    if format == "yaml" or format == "yml" { return yaml_stringify(data); }
-    if format == "csv" { return csv_stringify(data, nil); }
-    if format == "xml_text" { return xml_escape(str(data)); }
-    return str(data);
+    let fmt = _ser_format(format);
+    if fmt == "json" { return json_stringify(data); }
+    if fmt == "json_pretty" or fmt == "pretty_json" { return json_pretty(data); }
+    if fmt == "toml" { return toml_stringify(data); }
+    if fmt == "yaml" { return yaml_stringify(data); }
+    if fmt == "csv" { return csv_stringify(data, nil); }
+    if fmt == "xml" { return xml_escape(str(data)); }
+    if fmt == "text" { return str(data); }
+    throw "serialization.stringify_format: unsupported format: " + fmt;
 }
 
 fn convert(text, from_format, to_format) {
-    let data = parse_format(text, from_format);
-    return stringify_format(data, to_format);
+    let result = convert_safe(text, from_format, to_format);
+    if not result.ok { throw "serialization.convert: " + result.error; }
+    return result.value;
 }
 
-/// validate(text, format) — true if `text` parses in the given format ("auto"
-/// to detect). Note: only JSON parsing is strict; the TOML/YAML/CSV subset
-/// parsers are lenient and accept most input.
-fn validate(text, format = "auto") {
-    let r = try parse_format(text, format) catch "__pblang_invalid__";
-    return r != "__pblang_invalid__";
-}
+/// Strict, bounded validation for JSON and the documented TOML/YAML subsets.
+fn validate(text, format = "auto", options = nil) { return parse_safe(text, format, options).ok; }
 
 export json_pretty;
 export json_validate;
 export json_validate_detail;
+export limits;
+export formats;
 export toml_parse;
 export toml_stringify;
 export yaml_parse;
@@ -590,3 +1092,6 @@ export parse_format;
 export stringify_format;
 export convert;
 export validate;
+export parse_safe;
+export stringify_safe;
+export convert_safe;

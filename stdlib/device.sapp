@@ -49,6 +49,175 @@ fn random_uuid() { return str_trim(read_text("/proc/sys/kernel/random/uuid")); }
 // sysfs(attr) — read a sysfs driver attribute (trimmed).
 fn sysfs(attr) { return str_trim(read_text(attr)); }
 
+// ── fail-closed bounded access ──────────────────────────────────────────────
+// Raw helpers remain available for trusted low-level code. New code should use
+// these policy APIs. The VM currently reads a finite file before this module can
+// inspect its length, so safe reads reject /dev streaming nodes; truly bounded
+// device reads still require a generated native sized-read syscall.
+
+fn _limit(value, fallback, hard_max) {
+    let n = try parse_number(str(value)) catch fallback;
+    if n == nil or n < 1 { n = fallback; }
+    n = num_floor(n);
+    if n > hard_max { n = hard_max; }
+    return n;
+}
+
+fn _path(path) {
+    let p = str(path);
+    if p == "" or not str_starts_with(p, "/") {
+        throw "device: safe access requires an absolute path";
+    }
+    if str_contains(p, "\x00") or str_contains(p, "//") {
+        throw "device: unsafe path encoding";
+    }
+    let parts = str_split(p, "/");
+    let i = 0;
+    while i < len(parts) {
+        if parts[i] == "." or parts[i] == ".." {
+            throw "device: path traversal is not allowed";
+        }
+        i = i + 1;
+    }
+    return p;
+}
+
+fn _listed(path, exact_paths, roots) {
+    let i = 0;
+    while i < len(exact_paths) {
+        if path == exact_paths[i] { return true; }
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(roots) {
+        if str_starts_with(path, str(roots[j])) { return true; }
+        j = j + 1;
+    }
+    return false;
+}
+
+fn access_policy(read_paths = nil, read_roots = nil, write_paths = nil, options = nil) {
+    if read_paths == nil { read_paths = []; }
+    if read_roots == nil { read_roots = []; }
+    if write_paths == nil { write_paths = []; }
+    if options == nil { options = map{}; }
+    return map{
+        format: "pblang.device.policy.v1",
+        name: str(try options.name catch "custom"),
+        read_paths: read_paths,
+        read_roots: read_roots,
+        write_paths: write_paths,
+        max_read_bytes: _limit(try options.max_read_bytes catch 65536, 65536, 1048576),
+        max_write_bytes: _limit(try options.max_write_bytes catch 65536, 65536, 1048576),
+        follow_symlinks: false,
+        source_read_is_native_bounded: false
+    };
+}
+
+fn policy(profile = "readonly") {
+    let p = str_lower(str(profile));
+    let proc_paths = [
+        "/proc/version", "/proc/cpuinfo", "/proc/meminfo", "/proc/uptime",
+        "/proc/self/status", "/proc/self/stat", "/proc/sys/kernel/random/uuid"
+    ];
+    if p == "device-test" {
+        return access_policy(proc_paths, ["/sys/"], ["/dev/null"], map{
+            name: p, max_read_bytes: 262144, max_write_bytes: 65536
+        });
+    }
+    if p == "minimal" {
+        return access_policy(["/proc/sys/kernel/random/uuid"], [], [], map{
+            name: p, max_read_bytes: 4096, max_write_bytes: 4096
+        });
+    }
+    return access_policy(proc_paths, ["/sys/"], [], map{
+        name: "readonly", max_read_bytes: 262144, max_write_bytes: 4096
+    });
+}
+
+fn decide(request) {
+    let device_path = str(try request.path catch "");
+    let action_name = str(try request.action catch "");
+    let policy_value = try request.policy catch nil;
+    let requested_bytes = try request.bytes catch 0;
+    let active_policy = if policy_value == nil { policy("readonly") } else { policy_value };
+    let policy_format = try active_policy.format catch "";
+    if policy_format != "pblang.device.policy.v1" {
+        return map{ allowed: false, reason: "invalid policy", path: str(device_path), operation: str(action_name) };
+    }
+    let p = try _path(device_path) catch nil;
+    if p == nil {
+        return map{ allowed: false, reason: "unsafe path", path: str(device_path), operation: str(action_name) };
+    }
+    let op = str_lower(str(action_name));
+    if op == "read" {
+        let allowed = _listed(p, active_policy.read_paths, active_policy.read_roots);
+        return map{
+            allowed: allowed,
+            reason: if allowed { "allowed" } else { "path is not in the read allowlist" },
+            path: p, operation: op, max_bytes: active_policy.max_read_bytes
+        };
+    }
+    if op == "write" {
+        let allowed_path = _listed(p, active_policy.write_paths, []);
+        let allowed_size = requested_bytes >= 0 and requested_bytes <= active_policy.max_write_bytes;
+        let reason = "allowed";
+        if not allowed_path { reason = "path is not in the write allowlist"; }
+        elif not allowed_size { reason = "write exceeds policy limit"; }
+        return map{
+            allowed: allowed_path and allowed_size,
+            reason: reason,
+            path: p, operation: op, max_bytes: active_policy.max_write_bytes
+        };
+    }
+    return map{ allowed: false, reason: "unsupported operation", path: p, operation: op };
+}
+
+fn safe_read_text(path, access = nil) {
+    if access == nil { access = policy("readonly"); }
+    let decision = decide(map{ path: path, action: "read", policy: access, bytes: 0 });
+    if decision.allowed != true { throw "device: " + decision.reason; }
+    let text = read_text(decision.path);
+    if len(text) > access.max_read_bytes { throw "device: read exceeds policy limit"; }
+    return text;
+}
+
+fn safe_sysfs(path, max_bytes = 4096) {
+    let access = access_policy([], ["/sys/"], [], map{
+        name: "sysfs-readonly", max_read_bytes: max_bytes
+    });
+    return str_trim(safe_read_text(path, access));
+}
+
+fn safe_procfs(path, max_bytes = 65536) {
+    let access = policy("readonly");
+    access.read_roots = [];
+    access.max_read_bytes = _limit(max_bytes, 65536, 1048576);
+    return str_trim(safe_read_text(path, access));
+}
+
+fn safe_write_bytes(path, bytes, access) {
+    if type(bytes) != "array" { throw "device: safe_write_bytes requires a byte array"; }
+    let decision = decide(map{ path: path, action: "write", policy: access, bytes: len(bytes) });
+    if decision.allowed != true { throw "device: " + decision.reason; }
+    let i = 0;
+    while i < len(bytes) {
+        let b = bytes[i];
+        if type(b) != "number" or b < 0 or b > 255 or num_floor(b) != b {
+            throw "device: invalid byte at index " + str(i);
+        }
+        i = i + 1;
+    }
+    return write_bytes(decision.path, bytes);
+}
+
+fn safe_discard(bytes, max_bytes = 65536) {
+    let access = access_policy([], [], ["/dev/null"], map{
+        name: "discard-only", max_write_bytes: max_bytes
+    });
+    return safe_write_bytes("/dev/null", bytes, access);
+}
+
 // capabilities() — an HONEST map of what device access is reachable from pure pblang vs not.
 fn capabilities() {
     return map{
@@ -56,10 +225,15 @@ fn capabilities() {
         sysfs: true,                    // /sys driver attributes
         procfs: true,                   // /proc kernel interfaces
         rng_driver: true,               // /proc/sys/kernel/random/uuid
+        fail_closed_policy: true,       // allowlists + request/result limits
+        native_bounded_device_read: false, // sized read syscall is not exposed here
+        raw_file_api_requires_trust: true,
         ioctl_via_pure_pblang: false,   // needs raw ioctl() — emit via codegen syscall
         mmap_via_pure_pblang: false,    // needs raw mmap()  — emit via codegen syscall
         gpu_vendor_libs: false          // CUDA/Vulkan/oneAPI need dynamic linking (FFI)
     };
 }
 
-export exists, read_text, read_bytes, write_bytes, discard, random_uuid, sysfs, capabilities;
+export exists, read_text, read_bytes, write_bytes, discard, random_uuid, sysfs,
+       access_policy, policy, decide, safe_read_text, safe_sysfs, safe_procfs,
+       safe_write_bytes, safe_discard, capabilities;

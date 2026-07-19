@@ -131,10 +131,13 @@ pub(super) fn http_get_auth(
     if let Some(ms) = host.io_timeout_ms() {
         req = req.timeout(Duration::from_millis(ms));
     }
-    match req.call() {
-        Ok(resp) => Ok(alloc_string(resp.into_string().unwrap_or_default())),
-        Err(e) => Ok(alloc_string(format!("error: {e}"))),
-    }
+    let resp = req
+        .call()
+        .map_err(|e| host.err(format!("http_get_auth(): {e}")))?;
+    let body = resp
+        .into_string()
+        .map_err(|e| host.err(format!("http_get_auth(): {e}")))?;
+    Ok(alloc_string(body))
 }
 
 pub(super) fn http_post_auth(
@@ -174,10 +177,13 @@ pub(super) fn http_post_auth(
     } else {
         req
     };
-    match req.send_string(body_str) {
-        Ok(resp) => Ok(alloc_string(resp.into_string().unwrap_or_default())),
-        Err(e) => Ok(alloc_string(format!("error: {e}"))),
-    }
+    let resp = req
+        .send_string(body_str)
+        .map_err(|e| host.err(format!("http_post_auth(): {e}")))?;
+    let out = resp
+        .into_string()
+        .map_err(|e| host.err(format!("http_post_auth(): {e}")))?;
+    Ok(alloc_string(out))
 }
 
 // -------------------------------------------------------------------------

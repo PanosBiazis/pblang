@@ -9,6 +9,11 @@
 //   let ok = sec.verify_password("mypassword", hash);
 
 // ── Password hashing (bcrypt-like via sha256 + salt) ──────────────────────────
+//
+// NOTE: for NEW code prefer hash_password_pbkdf2 / verify_password_pbkdf2 (defined
+// below). This salted single-SHA-256 scheme is fast to brute-force offline; PBKDF2
+// applies a keyed HMAC over many iterations to slow attackers down substantially.
+// These two functions are kept unchanged for backward compatibility.
 
 fn hash_password(password) {
     let salt = random_hex(16);
@@ -234,7 +239,271 @@ fn random_pin(n) {
     return out;
 }
 
+// ── hex helpers (hmac_sha256/sha256 builtins return a HEX STRING) ─────────────────
+
+// _hex_to_bytes(hex) — decode a hex string into a byte-value array. hmac_sha256()
+// returns 64 hex chars = 32 raw bytes; HOTP dynamic truncation needs those bytes.
+fn _hex_to_bytes(hex) {
+    let h = str_lower(hex);
+    let bytes = [];
+    let i = 0;
+    while i + 1 < len(h) {
+        let hi = str_index_of("0123456789abcdef", str_slice(h, i, i + 1));
+        let lo = str_index_of("0123456789abcdef", str_slice(h, i + 1, i + 2));
+        bytes[len(bytes)] = hi * 16 + lo;
+        i = i + 2;
+    }
+    return bytes;
+}
+
+// _ipow(base, n) — exact integer base^n via repeated multiplication (avoids f64
+// rounding that num_pow would introduce for large exponents, e.g. 256^7 > 2^53).
+fn _ipow(base, n) {
+    let r = 1;
+    let i = 0;
+    while i < n { r = r * base; i = i + 1; }
+    return r;
+}
+
+// _bytes_to_hex(bytes) — encode a byte-value array as a lowercase hex string.
+fn _bytes_to_hex(bytes) {
+    let h = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while i < len(bytes) {
+        let b = bytes[i];
+        out = out + str_slice(h, num_floor(b / 16), num_floor(b / 16) + 1) + str_slice(h, b % 16, (b % 16) + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── PBKDF2-HMAC-SHA256 (RFC 2898 / RFC 8018) ─────────────────────────────────────
+//
+// Recommended over the legacy hash_password/verify_password (salted single-SHA-256)
+// for NEW code: PBKDF2 applies a keyed HMAC over many iterations, making offline
+// password cracking far slower. Built ONLY on the hmac_sha256 builtin.
+//
+// BINARY-DOMAIN NOTE: hmac_sha256 takes a STRING and hashes its UTF-8 bytes, and
+// bytes_to_str() rejects non-UTF-8, so raw HMAC digests cannot be safely fed back
+// in as messages. This implementation therefore carries the moving factor and the
+// U-chain in their HEX-STRING form (an ASCII, injective encoding of the bytes).
+// The construction is exactly PBKDF2's F-function / U-cascade over HMAC-SHA256 with
+// hex-encoded messages: deterministic, salted, iteration-hardened, and internally
+// consistent. Codes/keys will not match a byte-message reference implementation.
+//
+// pbkdf2_sha256(password, salt, iterations, dklen) — salt is a raw string,
+// iterations is the work factor, dklen is the derived-key length IN BYTES.
+// Returns the derived key as a lowercase hex string (2*dklen chars).
+fn pbkdf2_sha256(password, salt, iterations, dklen) {
+    // hLen for HMAC-SHA256 is 32 bytes. Number of blocks to cover dklen.
+    let hlen = 32;
+    let n_blocks = num_floor((dklen + hlen - 1) / hlen);   // ceil(dklen / hlen)
+    let derived = [];
+    let block = 1;
+    while block <= n_blocks {
+        // INT(block): 4-byte big-endian block index, hex-appended to the salt for U1.
+        let b0 = num_floor(block / 16777216) % 256;
+        let b1 = num_floor(block / 65536) % 256;
+        let b2 = num_floor(block / 256) % 256;
+        let b3 = block % 256;
+        let salt_block = salt + _bytes_to_hex([b0, b1, b2, b3]);
+        // U1 = HMAC(password, salt || INT(block)); T = U1. Carry U as its hex string.
+        let u_hex = hmac_sha256(salt_block, password);
+        let u = _hex_to_bytes(u_hex);
+        let t = [];
+        let k = 0;
+        while k < len(u) { t[len(t)] = u[k]; k = k + 1; }
+        // U2..Uc: fold each subsequent HMAC into T by XOR (RFC 2898 F function).
+        let it = 1;
+        while it < iterations {
+            // U_next = HMAC(password, U_prev): PRF keyed by the password over the
+            // hex-encoded previous U (ASCII message; see BINARY-DOMAIN NOTE).
+            u_hex = hmac_sha256(u_hex, password);
+            u = _hex_to_bytes(u_hex);
+            let j = 0;
+            while j < len(t) { t[j] = bit_xor(t[j], u[j]); j = j + 1; }
+            it = it + 1;
+        }
+        // Append this block's hLen bytes to the derived key.
+        let m = 0;
+        while m < len(t) { derived[len(derived)] = t[m]; m = m + 1; }
+        block = block + 1;
+    }
+    // Truncate to dklen bytes and hex-encode.
+    let out = [];
+    let i = 0;
+    while i < dklen and i < len(derived) { out[len(out)] = derived[i]; i = i + 1; }
+    return _bytes_to_hex(out);
+}
+
+// hash_password_pbkdf2(password, iterations) — produce a self-describing hash
+// string: "pbkdf2_sha256$<iters>$<salt_hex>$<dk_hex>". Preferred for new code.
+// The salt is carried as hex text and used directly as the PBKDF2 salt string.
+fn hash_password_pbkdf2(password, iterations = 100000) {
+    let salt_hex = random_hex(16);           // 16-byte random salt (hex text)
+    let dk = pbkdf2_sha256(password, salt_hex, iterations, 32);
+    return "pbkdf2_sha256$" + str(iterations) + "$" + salt_hex + "$" + dk;
+}
+
+// verify_password_pbkdf2(password, stored) — parse a hash_password_pbkdf2 string
+// and constant-time compare against a freshly derived key.
+fn verify_password_pbkdf2(password, stored) {
+    let parts = str_split(stored, "$");
+    if len(parts) != 4 { return false; }
+    if parts[0] != "pbkdf2_sha256" { return false; }
+    let iterations = parse_number(parts[1]);
+    let salt_hex = parts[2];
+    let expected = parts[3];
+    let dklen = num_floor(len(expected) / 2);
+    let computed = pbkdf2_sha256(password, salt_hex, iterations, dklen);
+    return constant_time_eq(computed, expected);
+}
+
+// ── Base32 (RFC 4648) — needed so authenticator-app secrets interoperate ─────────
+//
+// Self-contained here so 2FA works without a second import. For a full-featured
+// codec (base32hex, validation) see stdlib/base32.sapp.
+let _B32_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+// base32_decode(s) — RFC 4648 standard alphabet -> byte-value array. Uppercases,
+// ignores "=" padding and whitespace. Throws on an out-of-alphabet character.
+fn base32_decode(s) {
+    let up = str_upper(s);
+    let buffer = 0;
+    let bits = 0;
+    let out = [];
+    let i = 0;
+    while i < len(up) {
+        let c = str_slice(up, i, i + 1);
+        if c != "=" and c != " " and c != "\n" and c != "\r" and c != "\t" {
+            let v = str_index_of(_B32_ALPHA, c);
+            if v < 0 { throw "base32_decode: invalid character '" + c + "'"; }
+            buffer = buffer * 32 + v;
+            bits = bits + 5;
+            if bits >= 8 {
+                bits = bits - 8;
+                let p = _ipow(2, bits);
+                out[len(out)] = num_floor(buffer / p) % 256;
+                buffer = buffer % p;
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// base32_encode(bytes) — RFC 4648 standard alphabet with "=" padding. Accepts a
+// byte-value array.
+fn base32_encode(bytes) {
+    let out = "";
+    let buffer = 0;
+    let bits = 0;
+    let i = 0;
+    while i < len(bytes) {
+        buffer = buffer * 256 + bytes[i];
+        bits = bits + 8;
+        while bits >= 5 {
+            bits = bits - 5;
+            let p = _ipow(2, bits);
+            let idx = num_floor(buffer / p) % 32;
+            out = out + str_slice(_B32_ALPHA, idx, idx + 1);
+            buffer = buffer % p;
+        }
+        i = i + 1;
+    }
+    if bits > 0 {
+        let idx = (buffer * _ipow(2, 5 - bits)) % 32;
+        out = out + str_slice(_B32_ALPHA, idx, idx + 1);
+    }
+    while len(out) % 8 != 0 { out = out + "="; }
+    return out;
+}
+
+// ── HOTP (RFC 4226) / TOTP (RFC 6238) ────────────────────────────────────────────
+//
+// NOTE ON HASH: classic HOTP/TOTP use HMAC-SHA1. Only hmac_sha256 is available as a
+// builtin here, so this implements the HOTP construction over HMAC-SHA256. This is a
+// valid, RFC-6238-sanctioned variant (RFC 6238 §1.2 explicitly allows SHA-256/512);
+// codes will NOT match a SHA-1 authenticator. Dynamic truncation uses the low 4 bits
+// of the LAST HMAC byte as the offset, exactly as RFC 4226 §5.3 specifies.
+//
+// BINARY-DOMAIN NOTE: as in PBKDF2 above, hmac_sha256 hashes a STRING's UTF-8 bytes
+// and non-UTF-8 bytes cannot be reconstructed into a string, so the key and moving
+// factor are passed in their HEX-STRING form (ASCII, injective). Deterministic and
+// self-consistent; codes differ from a raw-byte-message reference implementation.
+
+// _hotp_secret_hex(secret) — normalise the secret to a lowercase hex string,
+// accepting either a raw byte-value array or an existing hex string.
+fn _hotp_secret_hex(secret) {
+    if is_array(secret) { return _bytes_to_hex(secret); }
+    return str_lower(secret);
+}
+
+// hotp(secret, counter, digits) — RFC 4226 HOTP over HMAC-SHA256.
+// secret: byte-value array OR hex string. counter: 8-byte big-endian moving factor.
+// Returns a zero-padded decimal string of `digits` length.
+fn hotp(secret, counter, digits = 6) {
+    let key = _hotp_secret_hex(secret);
+    // Encode counter as 8 big-endian byte values, then as a 16-char hex message.
+    let cbytes = [];
+    let shift = 7;
+    while shift >= 0 {
+        let byte = num_floor(counter / _ipow(256, shift)) % 256;
+        cbytes[len(cbytes)] = byte;
+        shift = shift - 1;
+    }
+    let msg = _bytes_to_hex(cbytes);
+    // HMAC-SHA256 (hex) -> 32 raw bytes for dynamic truncation.
+    let mac = _hex_to_bytes(hmac_sha256(msg, key));
+    // Offset = low 4 bits of the LAST byte (RFC 4226 §5.3).
+    let offset = bit_and(mac[len(mac) - 1], 15);
+    // 31-bit dynamic binary code from 4 bytes at the offset.
+    let bin = bit_and(mac[offset], 127) * 16777216
+            + mac[offset + 1] * 65536
+            + mac[offset + 2] * 256
+            + mac[offset + 3];
+    let modulo = _ipow(10, digits);
+    let code = bin % modulo;
+    // Zero-pad to `digits`.
+    let out = str(code);
+    while len(out) < digits { out = "0" + out; }
+    return out;
+}
+
+// totp(secret, unix_time, step, digits) — RFC 6238 TOTP = HOTP over the time step.
+// Pass unix_time explicitly (seconds since epoch). step defaults to 30s.
+fn totp(secret, unix_time, step = 30, digits = 6) {
+    let counter = num_floor(unix_time / step);
+    return hotp(secret, counter, digits);
+}
+
+// totp_now(secret, step, digits) — convenience using the host clock. now_ms() is the
+// only wall-clock builtin, so unix seconds = floor(now_ms()/1000).
+fn totp_now(secret, step = 30, digits = 6) {
+    let unix_time = num_floor(now_ms() / 1000);
+    return totp(secret, unix_time, step, digits);
+}
+
+// totp_verify(secret, code, unix_time, step, digits, skew) — accept `code` if it
+// matches the current window or any window within +/- skew steps. Constant-time
+// compare each candidate to avoid leaking which window matched.
+fn totp_verify(secret, code, unix_time, step = 30, digits = 6, skew = 1) {
+    let counter = num_floor(unix_time / step);
+    let w = 0 - skew;
+    let matched = false;
+    while w <= skew {
+        let candidate = hotp(secret, counter + w, digits);
+        if constant_time_eq(candidate, code) { matched = true; }
+        w = w + 1;
+    }
+    return matched;
+}
+
 export mask_secret, password_strength_score, random_pin;
+export pbkdf2_sha256, hash_password_pbkdf2, verify_password_pbkdf2;
+export base32_decode, base32_encode;
+export hotp, totp, totp_now, totp_verify;
 export hash_password, verify_password, generate_token, generate_csrf_token;
 export generate_api_key, generate_session_id;
 export sanitize_html, sanitize_sql_identifier, is_valid_email, is_strong_password;

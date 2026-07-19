@@ -19,15 +19,75 @@ let W = import("stdlib:watch.sapp");
 
 let _ACCEL = map{ runtimes: map{} };
 
+fn runtime_kinds() { return ["gpu", "npu", "simd", "distributed"]; }
+fn _runtime_kind(kind) {
+    let k = str_lower(str_trim(str(kind)));
+    let kinds = runtime_kinds();
+    let i = 0;
+    while i < len(kinds) { if kinds[i] == k { return k; } i = i + 1; }
+    throw "accelerator: unsupported runtime kind '" + k + "'";
+}
+fn _callable(v) {
+    let t = type(v);
+    return t == "closure" or t == "function" or t == "builtin";
+}
+
 // ── native-runtime hooks (FFI / vendor stacks) ────────────────────────────────────────
-fn register_runtime(kind, f) { _ACCEL.runtimes[kind] = f; return nil; }
-fn has_runtime(kind) { return map_has(_ACCEL.runtimes, kind); }
+fn register_runtime(kind, f) {
+    let k = _runtime_kind(kind);
+    if not _callable(f) { throw "accelerator: runtime hook must be callable"; }
+    _ACCEL.runtimes[k] = f;
+    return k;
+}
+fn has_runtime(kind) {
+    let k = try _runtime_kind(kind) catch nil;
+    return k != nil and map_has(_ACCEL.runtimes, k);
+}
 fn clear_runtimes() { _ACCEL.runtimes = map{}; return nil; }
 // run(kind, payload) — dispatch to the registered runtime, or nil if none (caller falls back).
 fn run(kind, payload) {
-    if not map_has(_ACCEL.runtimes, kind) { return nil; }
-    let f = _ACCEL.runtimes[kind];
+    let k = try _runtime_kind(kind) catch nil;
+    if k == nil or not map_has(_ACCEL.runtimes, k) { return nil; }
+    let f = _ACCEL.runtimes[k];
     return f(payload);
+}
+
+// dispatch(...) is the controlled execution envelope. Runtime failure never
+// silently changes devices: the returned record states whether a CPU fallback
+// ran. The fallback is caller-supplied because only the caller knows the
+// equivalent portable implementation.
+fn dispatch(kind, payload, cpu_fallback = nil, allow_fallback = true) {
+    let k = try _runtime_kind(kind) catch nil;
+    let missing = k == nil or not map_has(_ACCEL.runtimes, k);
+    if not missing {
+        let outcome = try map{ ok: true, value: _ACCEL.runtimes[k](payload) }
+            catch map{ ok: false, value: nil };
+        if outcome.ok {
+            return map{
+                format: "pblang.accelerator.dispatch.v1", ok: true,
+                device: k, value: outcome.value, fallback_used: false,
+                reason: "runtime_completed",
+            };
+        }
+        if not allow_fallback or not _callable(cpu_fallback) {
+            return map{
+                format: "pblang.accelerator.dispatch.v1", ok: false,
+                device: k, value: nil, fallback_used: false,
+                reason: "runtime_failed",
+            };
+        }
+    } else if not allow_fallback or not _callable(cpu_fallback) {
+        return map{
+            format: "pblang.accelerator.dispatch.v1", ok: false,
+            device: if k == nil { str(kind) } else { k }, value: nil,
+            fallback_used: false, reason: "runtime_unavailable",
+        };
+    }
+    return map{
+        format: "pblang.accelerator.dispatch.v1", ok: true,
+        device: "cpu", value: cpu_fallback(payload), fallback_used: true,
+        reason: if missing { "runtime_unavailable_cpu_fallback" } else { "runtime_failed_cpu_fallback" },
+    };
 }
 
 // ── detection ─────────────────────────────────────────────────────────────────────────
@@ -41,7 +101,7 @@ fn _npu_probe() {
     if (try fs_exists("/dev/accel0") catch false) == true { return map{ present: true, name: "NPU (/dev/accel0)" }; }
     if (try fs_exists("/dev/accel/accel0") catch false) == true { return map{ present: true, name: "NPU (/dev/accel)" }; }
     if (try fs_exists("/dev/gna0") catch false) == true or (try fs_exists("/dev/gna") catch false) == true { return map{ present: true, name: "Intel GNA (/dev/gna)" }; }
-    let r = try proc_spawn_wait("bash", ["-c", "lspci 2>/dev/null"]) catch nil;
+    let r = try proc_spawn_wait("lspci", []) catch nil;
     let out = "";
     if r != nil { out = try r.stdout catch ""; }
     let low = str_lower(out);
@@ -56,9 +116,7 @@ fn _npu_probe() {
 // EXPLOITED when the binary is built for this CPU (RUSTFLAGS="-C target-cpu=native", or a
 // +avx512vnni feature). We read the CPU flags (injectable for tests) and report honestly.
 fn _cpu_flags() {
-    let r = try proc_spawn_wait("bash", ["-c", "grep -m1 '^flags' /proc/cpuinfo 2>/dev/null"]) catch nil;
-    if r == nil { return ""; }
-    return str_lower(try r.stdout catch "");
+    return str_lower(try fs_read("/proc/cpuinfo") catch "");
 }
 fn _has_flag(padded, f) { return str_index_of(padded, " " + f + " ") >= 0; }
 // cpu_accel(flags) — {avx2, avx512, vnni, bf16, dl_boost, name, usable, note}. Pass a flags
@@ -125,4 +183,5 @@ fn summary() {
     return s;
 }
 
-export register_runtime, has_runtime, clear_runtimes, run, usable, detect, best, summary, cpu_accel;
+export runtime_kinds, register_runtime, has_runtime, clear_runtimes, run, dispatch,
+       usable, detect, best, summary, cpu_accel;

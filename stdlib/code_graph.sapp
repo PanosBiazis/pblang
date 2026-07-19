@@ -1,0 +1,355 @@
+// stdlib/code_graph.sapp — read and UNDERSTAND a pblang project as a code knowledge graph.
+//
+// graphify (stdlib/knowledge_graph.sapp) turns [[wikilinked]] NOTES into a graph. This module teaches the
+// same machinery to read CODE: it scans .sapp source for its structure — functions (`fn name`), module
+// imports (`import("path")`), exports, and call relationships — and lowers that structure into the SAME
+// note/wikilink corpus knowledge_graph already understands. So the whole graph toolkit (communities, hubs,
+// backlinks, BFS query, shortest-path, GRAPH_REPORT.md, graph.json, Obsidian vault) works on a codebase for
+// free: the MODULE graph's edges are imports, and hubs are the modules everything depends on.
+//
+//   let cg = import("stdlib:code_graph.sapp");
+//   let files = map{ "stdlib/tokenizer.sapp": "<source>", ... };   // path → source
+//   let a = cg.analyze(files["stdlib/tokenizer.sapp"]);            // {funcs, imports, exports, calls, loc}
+//   let g = cg.module_graph(files);                                // a knowledge_graph over module imports
+//   print cg.report(files);                                        // plain-language project understanding
+
+let kg = import("stdlib/knowledge_graph.sapp");
+
+// ── lexical helpers ────────────────────────────────────────────────────────────
+fn _is_ident(c) {                                   // [A-Za-z0-9_]
+    if c >= 97 and c <= 122 { return true; }        // a-z
+    if c >= 65 and c <= 90 { return true; }         // A-Z
+    if c >= 48 and c <= 57 { return true; }         // 0-9
+    if c == 95 { return true; }                     // _
+    return false;
+}
+// read the identifier starting at index i → the identifier text (may be empty)
+fn _ident_at(src, i) {
+    let n = len(src); let j = i;
+    while j < n { if _is_ident(strcharcodeat(src, j)) { j = j + 1; } else { break; } }
+    return str_slice(src, i, j);
+}
+// Does `word` occur at position i in src? Char-by-char via strcharcodeat — NO str_slice, so NO per-position
+// heap allocation. (Scanning a multi-MB corpus with `str_slice(src,i,i+k)==word` at every position allocates
+// millions of throwaway strings and is pathologically slow interpreted; this is the hot path.)
+fn _match_at(src, i, word) {
+    let wl = len(word);
+    if i + wl > len(src) { return false; }
+    let j = 0;
+    while j < wl { if strcharcodeat(src, i + j) != strcharcodeat(word, j) { return false; } j = j + 1; }
+    return true;
+}
+// module NAME for a path = the filename stem (drop directories and the extension). "a/b/tok.sapp" → "tok".
+fn module_name(path) {
+    let start = 0; let dot = len(path); let i = 0;
+    while i < len(path) {
+        let c = strcharcodeat(path, i);
+        if c == 47 { start = i + 1; }               // '/'  → last dir separator
+        if c == 46 { dot = i; }                     // '.'  → last dot (extension)
+        i = i + 1;
+    }
+    if dot < start { dot = len(path); }
+    return str_slice(path, start, dot);
+}
+
+// ── structural extraction from one source file ─────────────────────────────────
+// Scan for top-level `fn NAME(` definitions. Robust to any syntax: we look for the keyword `fn` bounded by
+// non-identifier chars, then the name that follows. Returns a list of function names (in source order).
+fn scan_functions(src) {
+    let out = []; let n = len(src); let i = 0;
+    while i < n - 2 {
+        // a token boundary before `fn`
+        let boundary = i == 0 or not _is_ident(strcharcodeat(src, i - 1));
+        if boundary and strcharcodeat(src, i) == 102 and strcharcodeat(src, i + 1) == 110 { // "fn"
+            let after = i + 2;
+            if after < n and not _is_ident(strcharcodeat(src, after)) {
+                // skip spaces to the name
+                let j = after; while j < n and (strcharcodeat(src, j) == 32 or strcharcodeat(src, j) == 9) { j = j + 1; }
+                let name = _ident_at(src, j);
+                if len(name) > 0 { push(out, name); i = j + len(name); }
+                else { i = i + 2; }
+            } else { i = i + 2; }
+        } else { i = i + 1; }
+    }
+    return out;
+}
+// A real import target looks like a path: only [A-Za-z0-9_/:.-], no spaces/newlines/punctuation. This
+// rejects the `import(` literals that appear inside strings and comments (e.g. this file, or docs that
+// describe the import syntax) so self-analysis and doc-heavy files don't inject garbage nodes.
+fn _looks_like_path(p) {
+    if len(p) == 0 { return false; }
+    let i = 0;
+    while i < len(p) {
+        let c = strcharcodeat(p, i);
+        let ok = _is_ident(c) or c == 47 or c == 58 or c == 46 or c == 45;   // / : . -
+        if not ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+// Every `import("PATH")` target in the file (the raw path string), validated as a real path.
+fn scan_imports(src) {
+    let out = []; let n = len(src);
+    let i = 0;
+    while i < n - 7 {
+        // cheap first-char gate ('i' = 105) before the full keyword check — most positions fail here
+        if strcharcodeat(src, i) == 105 and _match_at(src, i, "import(") {
+            let j = i + 7;
+            while j < n and (strcharcodeat(src, j) == 32 or strcharcodeat(src, j) == 34) { j = j + 1; } // skip space + quote
+            let start = j;
+            while j < n and strcharcodeat(src, j) != 34 and strcharcodeat(src, j) != 41 { j = j + 1; }  // to closing quote / )
+            let path = str_slice(src, start, j);
+            if _looks_like_path(path) { push(out, path); }
+            i = j + 1;
+        } else { i = i + 1; }
+    }
+    return out;
+}
+// Exported symbol names from a trailing `export a, b, c;` (pblang's module export form).
+fn scan_exports(src) {
+    let out = []; let n = len(src); let i = 0;
+    while i < n - 6 {
+        // 'e' = 101 gate, then keyword + boundary check — no per-position str_slice
+        if strcharcodeat(src, i) == 101 and (i == 0 or not _is_ident(strcharcodeat(src, i - 1)))
+           and _match_at(src, i, "export") and (i + 6 >= n or not _is_ident(strcharcodeat(src, i + 6))) {
+            let j = i + 6;
+            while j < n and strcharcodeat(src, j) != 59 { // to ';'
+                let c = strcharcodeat(src, j);
+                if _is_ident(c) { let nm = _ident_at(src, j); push(out, nm); j = j + len(nm); }
+                else { j = j + 1; }
+            }
+            i = j;
+        } else { i = i + 1; }
+    }
+    return out;
+}
+// Count source lines (for a size sense in the report).
+fn count_lines(src) {
+    let n = len(src); let lines = 1; let i = 0;
+    while i < n { if strcharcodeat(src, i) == 10 { lines = lines + 1; } i = i + 1; }
+    return lines;
+}
+
+// Analyze one source file → { funcs, imports, exports, loc }.
+fn analyze(src) {
+    return map{ funcs: scan_functions(src), imports: scan_imports(src), exports: scan_exports(src), loc: count_lines(src) };
+}
+// Analyze a whole corpus ONCE (path → analysis). Every downstream view (module graph, stats, report) works
+// from this so each file's source is scanned a single time — the string scan is the cost, so don't repeat it.
+fn analyze_all(files) {
+    let paths = map_keys(files);
+    let out = map{};
+    let i = 0;
+    while i < len(paths) { out[paths[i]] = analyze(files[paths[i]]); i = i + 1; }
+    return out;
+}
+
+// ── the FUNCTION CALL graph (calls as edges) ───────────────────────────────────
+// Locate every function body as {name, bstart, bend} via brace matching that SKIPS string literals and
+// // comments (so a `{` or `}` inside a string/comment doesn't unbalance the scan).
+fn _fn_bodies(src) {
+    let out = []; let n = len(src); let i = 0;
+    while i < n - 2 {
+        if (i == 0 or not _is_ident(strcharcodeat(src, i - 1))) and _match_at(src, i, "fn") and not _is_ident(strcharcodeat(src, i + 2)) {
+            let j = i + 2;
+            while j < n and (strcharcodeat(src, j) == 32 or strcharcodeat(src, j) == 9) { j = j + 1; }
+            let name = _ident_at(src, j);
+            if len(name) == 0 { i = i + 2; }
+            else {
+                let k = j + len(name);
+                while k < n and strcharcodeat(src, k) != 123 { k = k + 1; }     // to first '{'
+                if k >= n { i = j + len(name); }
+                else {
+                    let depth = 0; let m = k; let bend = 0 - 1;
+                    while m < n {
+                        let c = strcharcodeat(src, m);
+                        if c == 34 {                                            // "string" — skip (handle \")
+                            m = m + 1;
+                            while m < n { let cc = strcharcodeat(src, m); if cc == 92 { m = m + 2; } elif cc == 34 { m = m + 1; m = m; break; } else { m = m + 1; } }
+                        } elif c == 47 and m + 1 < n and strcharcodeat(src, m + 1) == 47 {  // // comment — to EOL
+                            while m < n and strcharcodeat(src, m) != 10 { m = m + 1; }
+                        } elif c == 123 { depth = depth + 1; m = m + 1; }
+                        elif c == 125 { depth = depth - 1; if depth == 0 { bend = m; m = n; } else { m = m + 1; } }
+                        else { m = m + 1; }
+                    }
+                    if bend >= 0 { push(out, map{ name: name, bstart: k + 1, bend: bend }); i = bend + 1; }
+                    else { i = k + 1; }
+                }
+            }
+        } else { i = i + 1; }
+    }
+    return out;
+}
+// Callees inside [s,e): identifiers immediately followed by `(` that name a KNOWN project function (in
+// `symtab`), excluding the function's own name (`selfname`, so trivial self-recursion isn't a hub signal).
+// Builtins/keywords are naturally excluded — they aren't in symtab. Skips strings and // comments.
+fn _calls_in(src, s, e, symtab, selfname) {
+    let out = []; let seen = map{}; let i = s;
+    while i < e {
+        let c = strcharcodeat(src, i);
+        if c == 34 {
+            i = i + 1;
+            while i < e { let cc = strcharcodeat(src, i); if cc == 92 { i = i + 2; } elif cc == 34 { i = i + 1; i = i; break; } else { i = i + 1; } }
+        } elif c == 47 and i + 1 < e and strcharcodeat(src, i + 1) == 47 {
+            while i < e and strcharcodeat(src, i) != 10 { i = i + 1; }
+        } elif _is_ident(c) and (i == s or not _is_ident(strcharcodeat(src, i - 1))) {
+            let nm = _ident_at(src, i); i = i + len(nm);
+            let k = i; while k < e and strcharcodeat(src, k) == 32 { k = k + 1; }
+            if k < e and strcharcodeat(src, k) == 40 {                          // '(' → a call site
+                if map_has(symtab, nm) and nm != selfname and not map_has(seen, nm) { seen[nm] = true; push(out, nm); }
+            }
+        } else { i = i + 1; }
+    }
+    return out;
+}
+// Build the call graph over a corpus: nodes are "module.fn", edges are resolved calls (callee → its
+// defining module). Reuses knowledge_graph via a synthesized [[wikilink]] corpus so communities/paths apply.
+fn call_graph(files) {
+    let paths = map_keys(files);
+    let symtab = map{};                       // fn name → first module that defines it
+    let i = 0;
+    while i < len(paths) {
+        let mod = module_name(paths[i]); let fns = scan_functions(files[paths[i]]);
+        let f = 0; while f < len(fns) { if not map_has(symtab, fns[f]) { symtab[fns[f]] = mod; } f = f + 1; }
+        i = i + 1;
+    }
+    let corpus = map{};
+    i = 0;
+    while i < len(paths) {
+        let src = files[paths[i]]; let mod = module_name(paths[i]);
+        let bodies = _fn_bodies(src);
+        let b = 0;
+        while b < len(bodies) {
+            let node = mod + "." + bodies[b].name;
+            let callees = _calls_in(src, bodies[b].bstart, bodies[b].bend, symtab, bodies[b].name);
+            let body = ""; let c = 0;
+            while c < len(callees) { body = body + "[[" + symtab[callees[c]] + "." + callees[c] + "]] "; c = c + 1; }
+            if not map_has(corpus, node) { corpus[node] = body; }
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    return kg.build(corpus);
+}
+// Top-k most-CALLED functions (highest in-degree = most callers), via a single edge pass then selection.
+fn _call_hubs(g, k) {
+    let indeg = map{}; let e = 0;
+    while e < len(g.edges) {
+        let d = g.edges[e].dst;
+        if map_has(indeg, d) { indeg[d] = indeg[d] + 1; } else { indeg[d] = 1; }
+        e = e + 1;
+    }
+    let keys = map_keys(indeg); let out = []; let taken = map{};
+    let picks = k; if picks > len(keys) { picks = len(keys); }
+    let p = 0;
+    while p < picks {
+        let best = 0 - 1; let bestv = 0 - 1; let j = 0;
+        while j < len(keys) {
+            if not map_has(taken, keys[j]) and indeg[keys[j]] > bestv { bestv = indeg[keys[j]]; best = j; }
+            j = j + 1;
+        }
+        if best < 0 { p = picks; } else { taken[keys[best]] = true; push(out, map{ name: keys[best], calls: bestv }); p = p + 1; }
+    }
+    return out;
+}
+// Plain-language CALL_REPORT.md — the function-level view: how many calls, and which functions are called
+// the most (the true hubs of the program, complementary to the module import graph).
+fn call_report(files) {
+    let g = call_graph(files);
+    let cm = kg.communities(g);
+    let hubs = _call_hubs(g, 12);
+    let r = "# Call Graph Report\n\n";
+    r = r + "- Functions (nodes): " + str(len(g.order)) + "\n";
+    r = r + "- Call edges: " + str(len(g.edges)) + "\n";
+    r = r + "- Call communities: " + str(cm.count) + "\n\n";
+    r = r + "## Most-called functions (call hubs)\n";
+    let i = 0;
+    while i < len(hubs) { r = r + str(i + 1) + ". " + hubs[i].name + " — " + str(hubs[i].calls) + " callers\n"; i = i + 1; }
+    return r;
+}
+
+// ── the MODULE graph (imports as edges), lowered onto knowledge_graph ──────────
+// Build a note corpus where each module's body [[wikilinks]] the modules it imports, then hand it to
+// knowledge_graph.build — so communities/hubs/query/report/vault all apply to the codebase.
+fn module_corpus(analyses) {
+    let paths = map_keys(analyses);
+    let corpus = map{};
+    let i = 0;
+    while i < len(paths) {
+        let path = paths[i];
+        let mod = module_name(path);
+        let imps = analyses[path].imports;
+        let body = "imports: ";
+        let j = 0;
+        while j < len(imps) { body = body + "[[" + module_name(imps[j]) + "]] "; j = j + 1; }
+        // if a module name repeats across dirs, keep the first (report still counts all files)
+        if not map_has(corpus, mod) { corpus[mod] = body; }
+        i = i + 1;
+    }
+    return corpus;
+}
+fn module_graph(analyses) { return kg.build(module_corpus(analyses)); }
+
+// ── project-level tallies for the report ───────────────────────────────────────
+fn project_stats(analyses) {
+    let paths = map_keys(analyses);
+    let total_fns = 0; let total_loc = 0; let total_imports = 0;
+    let per = [];       // [{mod, path, fns, loc, imports, exports}]
+    let i = 0;
+    while i < len(paths) {
+        let a = analyses[paths[i]];
+        total_fns = total_fns + len(a.funcs);
+        total_loc = total_loc + a.loc;
+        total_imports = total_imports + len(a.imports);
+        push(per, map{ mod: module_name(paths[i]), path: paths[i], fns: len(a.funcs), loc: a.loc, imports: len(a.imports), exports: len(a.exports) });
+        i = i + 1;
+    }
+    return map{ files: len(paths), functions: total_fns, loc: total_loc, imports: total_imports, per: per };
+}
+// The k modules with the most functions (the "biggest" modules) — selection-style, dependency-free.
+fn _top_by_fns(per, k) {
+    let out = []; let taken = map{};
+    let picks = k; if picks > len(per) { picks = len(per); }
+    let p = 0;
+    while p < picks {
+        let best = -1; let bestv = -1; let j = 0;
+        while j < len(per) {
+            if not map_has(taken, str(j)) and per[j].fns > bestv { bestv = per[j].fns; best = j; }
+            j = j + 1;
+        }
+        taken[str(best)] = true; push(out, per[best]); p = p + 1;
+    }
+    return out;
+}
+
+// Plain-language CODE_REPORT.md — understand a pblang project at a glance. `analyses` = analyze_all(files).
+fn report(analyses) {
+    let s = project_stats(analyses);
+    let g = module_graph(analyses);
+    let cm = kg.communities(g);
+    let hubs = kg.hubs(g, 6);
+    let big = _top_by_fns(s.per, 6);
+    let r = "# Code Graph Report\n\n";
+    r = r + "- Files (.sapp): " + str(s.files) + "\n";
+    r = r + "- Functions: " + str(s.functions) + "\n";
+    r = r + "- Lines of code: " + str(s.loc) + "\n";
+    r = r + "- Import edges: " + str(s.imports) + "\n";
+    r = r + "- Module communities: " + str(cm.count) + "\n\n";
+    r = r + "## Hub modules (most connected by imports)\n";
+    let i = 0;
+    while i < len(hubs) { r = r + str(i + 1) + ". " + hubs[i].name + " (degree " + str(hubs[i].degree) + ")\n"; i = i + 1; }
+    r = r + "\n## Biggest modules (by function count)\n";
+    let b = 0;
+    while b < len(big) { r = r + str(b + 1) + ". " + big[b].mod + " — " + str(big[b].fns) + " fns, " + str(big[b].loc) + " loc\n"; b = b + 1; }
+    let unres = kg.unresolved(g);
+    if len(unres) > 0 {
+        r = r + "\n## External / unresolved imports (" + str(len(unres)) + ")\n";
+        let u = 0; let shown = 0;
+        while u < len(unres) and shown < 15 { r = r + "- " + unres[u] + "\n"; u = u + 1; shown = shown + 1; }
+    }
+    return r;
+}
+
+export module_name, scan_functions, scan_imports, scan_exports, count_lines,
+       analyze, analyze_all, module_corpus, module_graph, project_stats, report,
+       call_graph, call_report;

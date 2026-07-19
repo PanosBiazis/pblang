@@ -1,0 +1,204 @@
+// codegen_arm64_exec_test.sapp — EXECUTION verification for the AArch64 backend.
+//
+// This x86-64 host has no arm64 emulator (no qemu, no cross-tools), so the existing arm64 test proves only
+// instruction ENCODINGS. Encoding-correct is not run-correct: a wrong branch offset, a swapped operand, or a
+// bad loop structure all encode fine yet compute the wrong answer. This file closes that gap with a tiny
+// AArch64 interpreter (models exactly the instructions the backend emits) that RUNS the compiled machine code
+// and checks the result — so arm64 codegen is now verified the same way the x64 backend is: by execution.
+
+let A = import("stdlib/codegen_arm64.sapp");
+
+fn fail(m) { throw "FAIL arm64-exec: " + m; }
+fn _idiv(n, m) { let q = n / m; if q >= 0 { return num_floor(q); } return 0 - num_floor(0 - q); }  // trunc toward 0 (sdiv)
+fn _holds(code, r) {                                    // AArch64 condition code evaluated on (Xn-Xm)
+    if code == 0 { return r == 0; }    if code == 1 { return r != 0; }     // EQ / NE
+    if code == 10 { return r >= 0; }   if code == 11 { return r < 0; }     // GE / LT
+    if code == 12 { return r > 0; }    if code == 13 { return r <= 0; }    // GT / LE
+    return false;
+}
+
+// ── minimal AArch64 interpreter ──────────────────────────────────────────────────────────────────────────────
+// Runs the byte stream `code` (little-endian 32-bit words) from word 0. Registers x0..x30 (x31 = xzr = 0).
+// Halts on `svc #0` when x8 == 93 (sys_exit), returning x0 & 255 like a real process exit code.
+fn _word(code, off) { return code[off] + code[off + 1] * 256 + code[off + 2] * 65536 + code[off + 3] * 16777216; }
+fn arm64_run(code) {
+    let x = []; let r = 0; while r < 32 { push(x, 0); r = r + 1; }
+    let sp = 1048576;        // dedicated stack pointer (reg 31 in load/store context = SP, not xzr)
+    let mem = map{};         // 8-byte-slot memory keyed by str(address); backs stp/ldp
+    let cmpres = 0;          // (Xn - Xm) from the most recent cmp; cset reads it
+    let nwords = num_floor(len(code) / 4);
+    let pc = 0; let guard = 0; let result = 0; let halted = false;
+    while pc >= 0 and pc < nwords and guard < 200000000 and not halted {
+        guard = guard + 1;
+        let word = _word(code, pc * 4);
+        let top = num_floor(word / 16777216) % 256;   // bits 31:24 uniquely select each emitted instruction
+        let op6 = num_floor(word / 67108864) % 64;     // bits 31:26 — the true opcode for b/bl (offset spills into the top byte)
+        let rd = word % 32;                            // Rd / stp-ldp Rt1  (bits 4:0)
+        let rn = num_floor(word / 32) % 32;            // Rn  (bits 9:5)
+        let ra = num_floor(word / 1024) % 32;          // Ra / stp-ldp Rt2  (bits 14:10)
+        let rm = num_floor(word / 65536) % 32;         // Rm  (bits 20:16)
+        let next = pc + 1;
+        if op6 == 5  { let o = word % 67108864; if o >= 33554432 { o = o - 67108864; } next = pc + o; }           // b  (bits31:26=000101)
+        else if op6 == 37 { let o = word % 67108864; if o >= 33554432 { o = o - 67108864; } x[30] = pc + 1; next = pc + o; }  // bl (100101), x30=return
+        else if top == 210 { let imm = num_floor(word / 32) % 65536; if rd != 31 { x[rd] = imm; } }               // D2 movz Xd,#imm16
+        else if top == 242 { let imm = num_floor(word / 32) % 65536; if rd != 31 { x[rd] = (x[rd] % 65536) + imm * 65536; } } // F2 movk Xd,#imm16,lsl#16
+        else if top == 139 { if rd != 31 { x[rd] = x[rn] + x[rm]; } }                                             // 8B add
+        else if top == 203 { if rd != 31 { x[rd] = x[rn] - x[rm]; } }                                             // CB sub
+        else if top == 138 { if rd != 31 { x[rd] = bit_and(x[rn], x[rm]); } }                                     // 8A and
+        else if top == 202 { if rd != 31 { x[rd] = bit_xor(x[rn], x[rm]); } }                                     // CA eor
+        else if top == 235 { cmpres = x[rn] - x[rm]; }                                                            // EB cmp (subs xzr,Xn,Xm)
+        else if top == 155 { let msub = num_floor(word / 32768) % 2;                                              // 9B madd (bit15=0) / msub (bit15=1)
+            if rd != 31 { if msub == 1 { x[rd] = x[ra] - x[rn] * x[rm]; } else { x[rd] = x[rn] * x[rm] + x[ra]; } } }
+        else if top == 154 { let isdiv = num_floor(word / 2048) % 2;                                              // 9A sdiv (bit11=1) / cset (bit11=0)
+            if isdiv == 1 { if rd != 31 { x[rd] = _idiv(x[rn], x[rm]); } }
+            else { let cc = num_floor(word / 4096) % 16; let v = 0; if not _holds(cc, cmpres) { v = 1; } if rd != 31 { x[rd] = v; } } }
+        else if top == 145 { let imm = num_floor(word / 1024) % 4096; let base = sp; if rn != 31 { base = x[rn]; } let v = base + imm; if rd == 31 { sp = v; } else { x[rd] = v; } }  // 91 add imm12 (reg31 = SP for add/sub-imm, incl. mov Xd,sp = add Xd,sp,#0)
+        else if top == 209 { let imm = num_floor(word / 1024) % 4096; let base = sp; if rn != 31 { base = x[rn]; } let v = base - imm; if rd == 31 { sp = v; } else { x[rd] = v; } }  // D1 sub imm12
+        else if top == 249 { let l = num_floor(word / 4194304) % 2; let off = num_floor(word / 1024) % 4096 * 8;  // F9 str(L=0)/ldr(L=1) [Rn,#imm12*8]
+            let base = sp; if rn != 31 { base = x[rn]; }
+            if l == 1 { if rd != 31 { x[rd] = mem[str(base + off)]; } } else { mem[str(base + off)] = x[rd]; } }
+        else if top == 180 { let o = num_floor(word / 32) % 524288; if o >= 262144 { o = o - 524288; } if x[rd] == 0 { next = pc + o; } }  // B4 cbz
+        else if top == 181 { let o = num_floor(word / 32) % 524288; if o >= 262144 { o = o - 524288; } if x[rd] != 0 { next = pc + o; } }  // B5 cbnz
+        else if top == 214 { next = x[30]; }                                                                      // D6 ret (-> x30)
+        else if top == 169 { sp = sp - 16; mem[str(sp)] = x[rd]; mem[str(sp + 8)] = x[ra]; }                      // A9 stp Rt1,Rt2,[sp,#-16]!
+        else if top == 168 { if rd != 31 { x[rd] = mem[str(sp)]; } if ra != 31 { x[ra] = mem[str(sp + 8)]; } sp = sp + 16; } // A8 ldp Rt1,Rt2,[sp],#16
+        else if top == 170 { if rd != 31 { if rn == 31 { x[rd] = x[rm]; } else { x[rd] = bit_or(x[rn], x[rm]); } } } // AA mov (Rn=xzr) / orr
+        else if top == 212 { if x[8] == 93 { result = x[0]; halted = true; } }                                    // D4 svc #0 (exit)
+        else { throw "arm64_run: unmodeled instruction word " + str(word); }
+        x[31] = 0;
+        pc = next;
+    }
+    if not halted { fail("program ran off the end without svc-exit"); }
+    let e = result % 256; if e < 0 { e = e + 256; }
+    return e;
+}
+
+// exit-with-r0 tail
+fn _exit0() { return ["syscall", 93, [0]]; }
+fn run(ir) { return arm64_run(A.compile_ir(ir)); }
+fn eq(got, want, m) { if got != want { fail(m + ": got " + str(got) + " want " + str(want)); } }
+
+// ── the tests: compile IR → run on the interpreter → check the computed result ──
+eq(run([["seti", 0, 42], _exit0()]),                                        42, "movz const");
+eq(run([["seti", 0, 5], ["seti", 1, 7], ["add", 0, 1], _exit0()]),          12, "add 5+7");
+eq(run([["seti", 0, 20], ["seti", 1, 8], ["sub", 0, 1], _exit0()]),         12, "sub 20-8");
+eq(run([["seti", 0, 6], ["seti", 1, 7], ["mul", 0, 1], _exit0()]),          42, "mul 6*7");
+eq(run([["seti", 0, 10], ["addi", 0, 7], _exit0()]),                        17, "addi +7");
+eq(run([["seti", 0, 70000], _exit0()]),                                    112, "movz+movk 70000 & 255");
+// loop: add the immediate 3 to r0 ten times → 30
+eq(run([["seti", 0, 0], ["seti", 1, 10], ["loop", 1, [["addi", 0, 3]]], _exit0()]),  30, "loop: 10 * (+3)");
+// loop that reads the (decrementing) counter: 5+4+3+2+1 = 15
+eq(run([["seti", 0, 0], ["seti", 1, 5], ["loop", 1, [["add", 0, 1]]], _exit0()]),    15, "loop: sum 5..1");
+// zero-trip loop leaves r0 untouched
+eq(run([["seti", 0, 9], ["seti", 1, 0], ["loop", 1, [["addi", 0, 3]]], _exit0()]),    9, "loop: zero-trip");
+// ifnz: nonzero -> then, zero -> else
+eq(run([["seti", 0, 5], ["ifnz", 0, [["seti", 0, 1]], [["seti", 0, 2]]], _exit0()]),  1, "ifnz true -> then");
+eq(run([["seti", 0, 0], ["ifnz", 0, [["seti", 0, 1]], [["seti", 0, 2]]], _exit0()]),  2, "ifnz false -> else");
+// nested: outer loop 3x, each adds inner-loop sum(1..4)=10  →  30
+eq(run([["seti", 0, 0], ["seti", 2, 3],
+        ["loop", 2, [ ["seti", 1, 4], ["loop", 1, [["add", 0, 1]]] ]], _exit0()]),   30, "nested loops 3*(4+3+2+1)");
+
+// ── step 2: bitwise / division / comparison, verified by execution ──
+eq(run([["seti", 0, 12], ["seti", 1, 10], ["and", 0, 1], _exit0()]),         8, "and 12&10");
+eq(run([["seti", 0, 12], ["seti", 1, 10], ["or", 0, 1], _exit0()]),         14, "or 12|10");
+eq(run([["seti", 0, 12], ["seti", 1, 10], ["xor", 0, 1], _exit0()]),         6, "xor 12^10");
+eq(run([["seti", 0, 20], ["seti", 1, 3], ["div", 0, 1], _exit0()]),          6, "div 20/3 (trunc)");
+eq(run([["seti", 0, 20], ["seti", 1, 3], ["mod", 0, 1], _exit0()]),          2, "mod 20%3");
+eq(run([["seti", 0, 100], ["seti", 1, 7], ["div", 0, 1], _exit0()]),        14, "div 100/7");
+eq(run([["seti", 0, 100], ["seti", 1, 7], ["mod", 0, 1], _exit0()]),         2, "mod 100%7");
+// comparisons produce a 0/1 boolean in r0
+eq(run([["seti", 0, 3], ["seti", 1, 5], ["cmp", 0, 1, "lt"], _exit0()]),     1, "cmp 3<5");
+eq(run([["seti", 0, 3], ["seti", 1, 5], ["cmp", 0, 1, "gt"], _exit0()]),     0, "cmp 3>5");
+eq(run([["seti", 0, 5], ["seti", 1, 5], ["cmp", 0, 1, "eq"], _exit0()]),     1, "cmp 5==5");
+eq(run([["seti", 0, 5], ["seti", 1, 5], ["cmp", 0, 1, "ge"], _exit0()]),     1, "cmp 5>=5");
+eq(run([["seti", 0, 7], ["seti", 1, 4], ["cmp", 0, 1, "ne"], _exit0()]),     1, "cmp 7!=4");
+eq(run([["seti", 0, 7], ["seti", 1, 4], ["cmp", 0, 1, "le"], _exit0()]),     0, "cmp 7<=4");
+// a comparison feeding a real conditional: (8 < 3) ? 100 : 200 → 200
+eq(run([["seti", 0, 8], ["seti", 1, 3], ["cmp", 0, 1, "lt"],
+        ["ifnz", 0, [["seti", 0, 100]], [["seti", 0, 200]]], _exit0()]),    200, "cmp drives ifnz");
+
+// ── FUNCTIONS & CALLS (the ARM64 port) — bl/ret with stp/ldp caller-saves, verified by EXECUTION ──
+// compile_unit_code lays out main, exit, then named subroutines; x0 carries arg in / result out.
+fn run_unit(funcs, main) { return arm64_run(A.compile_unit_code(funcs, main)); }
+
+// double(x) = x*2 : one call, result flows back through x0
+eq(run_unit([map{ name: "double", body: [["seti", 1, 2], ["mul", 0, 1], ["ret"]] }],
+            [["seti", 0, 21], ["call", "double"]]),                              42, "call: double(21)");
+
+// chained calls: inc then double : 5 -> 6 -> 12  (x0 threads through both)
+eq(run_unit([map{ name: "inc",    body: [["addi", 0, 1], ["ret"]] },
+             map{ name: "double", body: [["seti", 1, 2], ["mul", 0, 1], ["ret"]] }],
+            [["seti", 0, 5], ["call", "inc"], ["call", "double"]]),              12, "call: double(inc(5))");
+
+// a callee that itself calls another (non-leaf): quad(x)=double(double(x)) : 3 -> 12
+eq(run_unit([map{ name: "double", body: [["seti", 1, 2], ["mul", 0, 1], ["ret"]] },
+             map{ name: "quad",   body: [["call", "double"], ["call", "double"], ["ret"]] }],
+            [["seti", 0, 3], ["call", "quad"]]),                                 12, "call: quad(3) via nested calls");
+
+// RECURSION: tri(n) = n + tri(n-1), tri(0)=0.  n is kept in x1 (caller-saved across the bl) while
+// the recursive result comes back in x0 — the real test of bl/ret + the stp/ldp stack frame.
+let TRI = map{ name: "tri", body:
+    [["ifnz", 0,
+        [ ["seti", 1, 0], ["add", 1, 0],       // x1 = n
+          ["seti", 2, 1], ["sub", 0, 2],       // x0 = n - 1
+          ["call", "tri"],                      // x0 = tri(n-1)
+          ["add", 0, 1],                        // x0 = tri(n-1) + n
+          ["ret"] ],
+        [ ["seti", 0, 0], ["ret"] ] ]] };
+eq(run_unit([TRI], [["seti", 0, 5], ["call", "tri"]]),                           15, "recursion: tri(5)=5+4+3+2+1");
+eq(run_unit([TRI], [["seti", 0, 8], ["call", "tri"]]),                           36, "recursion: tri(8)=36");
+
+// ── step 3: LOCALS (stack-frame slots) — spill/reload via str/ldr, verified by execution ──
+// dsq(x) = x*x + (x+1)*(x+1), holding x*x in local[0] across the second multiply (which clobbers the regs).
+eq(run_unit([map{ name: "dsq", locals: 1, body:
+    [ ["seti", 1, 0], ["add", 1, 0], ["mul", 1, 0],   // r1 = x*x
+      ["store", 0, 1],                                 // local[0] = x*x
+      ["addi", 0, 1], ["seti", 1, 0], ["add", 1, 0], ["mul", 1, 0],  // r1 = (x+1)^2
+      ["load", 0, 0],                                  // r0 = local[0] = x*x
+      ["add", 0, 1], ["ret"] ] }],
+    [["seti", 0, 3], ["call", "dsq"]]),                              25, "locals: dsq(3)=9+16");
+eq(run_unit([map{ name: "dsq", locals: 1, body:
+    [ ["seti", 1, 0], ["add", 1, 0], ["mul", 1, 0], ["store", 0, 1],
+      ["addi", 0, 1], ["seti", 1, 0], ["add", 1, 0], ["mul", 1, 0],
+      ["load", 0, 0], ["add", 0, 1], ["ret"] ] }],
+    [["seti", 0, 6], ["call", "dsq"]]),                              85, "locals: dsq(6)=36+49");
+
+// the strong test: a LOCAL that survives a RECURSIVE call. tri3(n)=n+tri3(n-1) keeps n in local[0] (not x1)
+// across the bl — proving the frame is preserved through caller-saves + the callee's own frame.
+let TRI3 = map{ name: "tri3", locals: 1, body:
+    [["ifnz", 0,
+        [ ["store", 0, 0],                    // local[0] = n
+          ["seti", 2, 1], ["sub", 0, 2],      // r0 = n - 1
+          ["call", "tri3"],                    // r0 = tri3(n-1); local[0] must survive this
+          ["load", 1, 0],                      // r1 = local[0] = n
+          ["add", 0, 1], ["ret"] ],            // r0 = tri3(n-1) + n
+        [ ["seti", 0, 0], ["ret"] ] ]] };
+eq(run_unit([TRI3], [["seti", 0, 5], ["call", "tri3"]]),            15, "locals+recursion: tri3(5)=15");
+eq(run_unit([TRI3], [["seti", 0, 8], ["call", "tri3"]]),            36, "locals+recursion: tri3(8)=36");
+
+// ── step 4: MULTI-ARGUMENT calls — args in x0..x7 (AArch64 ABI), verified by execution ──
+// callee reads its args from x0.. ; result in x0. up to 4 args need nothing new (x0..x3); x4..x7 exercise the
+// widened register file.
+eq(run_unit([map{ name: "sum4", body: [["add", 0, 1], ["add", 0, 2], ["add", 0, 3], ["ret"]] }],
+    [["seti", 0, 1], ["seti", 1, 2], ["seti", 2, 3], ["seti", 3, 4], ["call", "sum4"]]),  10, "4-arg: sum4(1,2,3,4)");
+eq(run_unit([map{ name: "sum6", body: [["add", 0, 1], ["add", 0, 2], ["add", 0, 3], ["add", 0, 4], ["add", 0, 5], ["ret"]] }],
+    [["seti", 0, 1], ["seti", 1, 2], ["seti", 2, 3], ["seti", 3, 4], ["seti", 4, 5], ["seti", 5, 6], ["call", "sum6"]]),  21, "6-arg: uses x4,x5");
+eq(run_unit([map{ name: "sum8", body: [["add", 0, 1], ["add", 0, 2], ["add", 0, 3], ["add", 0, 4], ["add", 0, 5], ["add", 0, 6], ["add", 0, 7], ["ret"]] }],
+    [["seti", 0, 1], ["seti", 1, 2], ["seti", 2, 3], ["seti", 3, 4], ["seti", 4, 5], ["seti", 5, 6], ["seti", 6, 7], ["seti", 7, 8], ["call", "sum8"]]),  36, "8-arg: uses x4..x7");
+// args in x1,x2 must SURVIVE an internal call (caller-saved by the call machinery): f(a,b,c)=double(a)+b+c
+eq(run_unit([map{ name: "double", body: [["seti", 1, 2], ["mul", 0, 1], ["ret"]] },
+             map{ name: "f3",     body: [["call", "double"], ["add", 0, 1], ["add", 0, 2], ["ret"]] }],
+    [["seti", 0, 3], ["seti", 1, 4], ["seti", 2, 5], ["call", "f3"]]),                    15, "arg preservation: double(3)+4+5");
+// multi-arg + recursion + locals: pow(b,e) = b*pow(b,e-1), pow(b,0)=1. b kept in local[0] across the recursive call.
+let POW = map{ name: "pow", locals: 1, body:
+    [["ifnz", 1,
+        [ ["store", 0, 0],                    // local[0] = b
+          ["seti", 2, 1], ["sub", 1, 2],      // x1 = e - 1   (x0 still = b = arg0 for the recursive call)
+          ["call", "pow"],                     // x0 = pow(b, e-1)
+          ["load", 1, 0],                      // x1 = b
+          ["mul", 0, 1], ["ret"] ],            // x0 = pow(b,e-1) * b
+        [ ["seti", 0, 1], ["ret"] ] ]] };
+eq(run_unit([POW], [["seti", 0, 3], ["seti", 1, 5], ["call", "pow"]]),                   243, "pow(3,5)=243");
+eq(run_unit([POW], [["seti", 0, 2], ["seti", 1, 7], ["call", "pow"]]),                   128, "pow(2,7)=128");
+
+print "codegen_arm64_exec: all AArch64 programs — arithmetic, functions, recursion, locals, and MULTI-ARG calls (x0..x7) — verified by execution";

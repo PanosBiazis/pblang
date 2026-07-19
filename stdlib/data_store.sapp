@@ -1,0 +1,443 @@
+// stdlib/data_store.sapp -- one bounded key/value API for memory, SQLite, Redis.
+//
+// This is a cache/session/derived-data store, not an ORM replacement. Values are
+// preserved through a versioned JSON envelope on SQLite/Redis, including nil.
+// Namespaces isolate products sharing a backend. Memory and SQLite enforce hard
+// per-store entry/unit quotas; Redis enforces request/value bounds while global
+// maxmemory/eviction policy remains a Redis server responsibility.
+
+let CACHE = import("stdlib:cache.sapp");
+let DB = import("stdlib:db.sapp");
+let REDIS = import("stdlib:redis.sapp");
+
+let MAX_SAFE_INTEGER = 9007199254740991;
+let DEFAULT_MEMORY_ENTRIES = 4096;
+let DEFAULT_MEMORY_UNITS = 67108864;
+let DEFAULT_SQLITE_ENTRIES = 100000;
+let DEFAULT_SQLITE_UNITS = 1073741824;
+let DEFAULT_VALUE_UNITS = 8388608;
+let SEP = "\x1f";
+
+fn _option(options, name, fallback) {
+    if type(options) == "map" and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _quantity(value, fallback, minimum, maximum = nil) {
+    if maximum == nil { maximum = MAX_SAFE_INTEGER; }
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or str_contains(text, "inf") { return fallback; }
+    let n = try parse_number(text) catch fallback;
+    if n == nil { n = fallback; }
+    n = num_floor(n);
+    if n < minimum { n = minimum; }
+    if n > maximum { n = maximum; }
+    return n;
+}
+
+fn _safe_namespace(value) {
+    let ns = str(value);
+    if len(ns) == 0 or len(str_to_bytes(ns)) > 64 { throw "data_store: namespace must contain 1..64 ASCII bytes"; }
+    let i = 0;
+    while i < len(ns) {
+        let c = strcharcodeat(ns, i);
+        let ok = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or
+                 (c >= 97 and c <= 122) or c == 45 or c == 46 or c == 95;
+        if not ok { throw "data_store: namespace allows letters, digits, dot, dash, underscore"; }
+        i = i + 1;
+    }
+    return ns;
+}
+
+fn _safe_key(value) {
+    if type(value) != "string" { throw "data_store: key must be a string"; }
+    let bytes = len(str_to_bytes(value));
+    if bytes == 0 or bytes > 4096 { throw "data_store: key must contain 1..4096 UTF-8 bytes"; }
+    if str_contains(value, "\x00") { throw "data_store: key cannot contain NUL"; }
+    return value;
+}
+
+fn _ttl(options, fallback) {
+    return _quantity(_option(options, "ttl_ms", fallback), fallback, 0);
+}
+
+fn _deadline(ttl_ms, now) {
+    if ttl_ms <= 0 { return 0; }
+    if ttl_ms > MAX_SAFE_INTEGER - now { return MAX_SAFE_INTEGER; }
+    return now + ttl_ms;
+}
+
+fn _envelope(namespace, key, value, ttl_ms) {
+    let now = now_ms();
+    return map{
+        format: "pblang.data_store.value.v1", namespace: namespace, key: key,
+        created_ms: now, updated_ms: now, expires_ms: _deadline(ttl_ms, now),
+        value: value
+    };
+}
+
+fn _encoded(envelope, max_value_units) {
+    let payload = json_stringify(envelope);
+    let units = len(str_to_bytes(payload));
+    if units > max_value_units { return map{ ok: false, error: "value exceeds store limit", units: units }; }
+    return map{ ok: true, payload: payload, units: units };
+}
+
+fn _valid_envelope(value, namespace, key) {
+    return type(value) == "map" and (try value.format catch "") == "pblang.data_store.value.v1" and
+           (try value.namespace catch "") == namespace and (try value.key catch "") == key;
+}
+
+fn _memory_key(namespace, key) { return namespace + SEP + key; }
+fn _redis_key(store, key) { return store.prefix + ":" + store.namespace + ":" + key; }
+
+fn memory(options = nil) {
+    if options == nil { options = map{}; }
+    let namespace = _safe_namespace(_option(options, "namespace", "default"));
+    let max_entries = _quantity(_option(options, "max_entries", DEFAULT_MEMORY_ENTRIES), DEFAULT_MEMORY_ENTRIES, 1);
+    let max_units = _quantity(_option(options, "max_units", DEFAULT_MEMORY_UNITS), DEFAULT_MEMORY_UNITS, 1);
+    let max_value = _quantity(_option(options, "max_value_units", DEFAULT_VALUE_UNITS), DEFAULT_VALUE_UNITS, 1, max_units);
+    let policy = str_lower(str(_option(options, "policy", "fifo")));
+    let ttl = _ttl(options, 0);
+    return map{
+        format: "pblang.data_store.v1", backend: "memory", namespace: namespace,
+        default_ttl_ms: ttl, max_value_units: max_value,
+        cache: CACHE.bounded_policy(ttl, max_entries, max_units, policy), closed: false
+    };
+}
+
+fn sqlite(path, options = nil) {
+    if options == nil { options = map{}; }
+    if type(path) != "string" or len(path) == 0 { throw "data_store.sqlite: path is required"; }
+    let namespace = _safe_namespace(_option(options, "namespace", "default"));
+    let max_entries = _quantity(_option(options, "max_entries", DEFAULT_SQLITE_ENTRIES), DEFAULT_SQLITE_ENTRIES, 1);
+    let max_units = _quantity(_option(options, "max_units", DEFAULT_SQLITE_UNITS), DEFAULT_SQLITE_UNITS, 1);
+    let max_value = _quantity(_option(options, "max_value_units", DEFAULT_VALUE_UNITS), DEFAULT_VALUE_UNITS, 1, max_units);
+    let conn = DB.sqlite.open(path);
+    conn.exec("PRAGMA busy_timeout=5000", []);
+    if path != ":memory:" and _option(options, "wal", true) == true {
+        try conn.exec("PRAGMA journal_mode=WAL", []) catch nil;
+    }
+    conn.exec("CREATE TABLE IF NOT EXISTS __pblang_data_store (namespace TEXT NOT NULL, cache_key TEXT NOT NULL, value_json TEXT NOT NULL, expires_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, units INTEGER NOT NULL, PRIMARY KEY(namespace, cache_key))", []);
+    conn.exec("CREATE INDEX IF NOT EXISTS __pblang_data_store_expiry ON __pblang_data_store(namespace, expires_ms)", []);
+    conn.exec("CREATE INDEX IF NOT EXISTS __pblang_data_store_lru ON __pblang_data_store(namespace, updated_ms)", []);
+    return map{
+        format: "pblang.data_store.v1", backend: "sqlite", namespace: namespace,
+        path: path, conn: conn, default_ttl_ms: _ttl(options, 0),
+        max_entries: max_entries, max_units: max_units, max_value_units: max_value,
+        evictions: 0, expired: 0, hits: 0, misses: 0, closed: false
+    };
+}
+
+fn redis(options = nil) {
+    if options == nil { options = map{}; }
+    let namespace = _safe_namespace(_option(options, "namespace", "default"));
+    let prefix = _safe_namespace(_option(options, "prefix", "pblang"));
+    let connection = REDIS.connect(options);
+    if not connection.ok { throw "data_store.redis: " + connection.error; }
+    return map{
+        format: "pblang.data_store.v1", backend: "redis", namespace: namespace,
+        prefix: prefix, client: connection.client, default_ttl_ms: _ttl(options, 0),
+        max_value_units: _quantity(_option(options, "max_value_units", DEFAULT_VALUE_UNITS), DEFAULT_VALUE_UNITS, 1, 268435456),
+        max_scan_keys: _quantity(_option(options, "max_scan_keys", 10000), 10000, 1, 1000000),
+        max_scan_rounds: _quantity(_option(options, "max_scan_rounds", 10000), 10000, 1, 1000000),
+        hits: 0, misses: 0, closed: false
+    };
+}
+
+fn open(options = nil) {
+    if options == nil { options = map{}; }
+    let backend = str_lower(str(_option(options, "backend", "memory")));
+    if backend == "memory" { return memory(options); }
+    if backend == "sqlite" { return sqlite(_option(options, "path", ":memory:"), options); }
+    if backend == "redis" { return redis(options); }
+    throw "data_store.open: backend must be memory, sqlite, or redis";
+}
+
+fn _ensure_open(store) {
+    if type(store) != "map" or (try store.format catch "") != "pblang.data_store.v1" { throw "data_store: invalid store"; }
+    if try store.closed catch true { throw "data_store: store is closed"; }
+}
+
+fn _sqlite_expire(store, now) {
+    let changed = store.conn.exec("DELETE FROM __pblang_data_store WHERE namespace=? AND expires_ms>0 AND expires_ms<=?", [store.namespace, now]);
+    store.expired = store.expired + changed;
+    return changed;
+}
+
+fn _sqlite_usage(store, conn) {
+    let row = DB.query_one(conn, "SELECT COUNT(*) AS entries, COALESCE(SUM(units),0) AS units FROM __pblang_data_store WHERE namespace=?", [store.namespace]);
+    return map{ entries: try row.entries catch 0, units: try row.units catch 0 };
+}
+
+fn _sqlite_make_room(store, conn, key, units) {
+    if units > store.max_units { return false; }
+    let existing = DB.query_one(conn, "SELECT units FROM __pblang_data_store WHERE namespace=? AND cache_key=?", [store.namespace, key]);
+    let existing_units = if existing == nil { 0 } else { existing.units };
+    let usage = _sqlite_usage(store, conn);
+    let target_entries = usage.entries;
+    if existing == nil { target_entries = target_entries + 1; }
+    let target_units = usage.units - existing_units + units;
+    while target_entries > store.max_entries or target_units > store.max_units {
+        let oldest = DB.query_one(conn, "SELECT cache_key, units FROM __pblang_data_store WHERE namespace=? AND cache_key<>? ORDER BY updated_ms ASC, cache_key ASC LIMIT 1", [store.namespace, key]);
+        if oldest == nil { return false; }
+        conn.exec("DELETE FROM __pblang_data_store WHERE namespace=? AND cache_key=?", [store.namespace, oldest.cache_key]);
+        store.evictions = store.evictions + 1;
+        target_entries = target_entries - 1;
+        target_units = target_units - oldest.units;
+    }
+    return true;
+}
+
+fn set(store, key, value, options = nil) {
+    _ensure_open(store); key = _safe_key(key);
+    if options == nil { options = map{}; }
+    let ttl = _ttl(options, store.default_ttl_ms);
+    let envelope = _envelope(store.namespace, key, value, ttl);
+    let encoded = _encoded(envelope, store.max_value_units);
+    if not encoded.ok { return encoded; }
+
+    if store.backend == "memory" {
+        let admitted = CACHE.try_set_sized(store.cache, _memory_key(store.namespace, key), envelope, encoded.units, ttl);
+        if not admitted { return map{ ok: false, error: "store quota exceeded", units: encoded.units }; }
+        return map{ ok: true, backend: "memory", units: encoded.units, expires_ms: envelope.expires_ms };
+    }
+    if store.backend == "sqlite" {
+        let now = now_ms();
+        let outcome = store.conn.tx(fn(conn) {
+            _sqlite_expire(store, now);
+            if not _sqlite_make_room(store, conn, key, encoded.units) { throw "quota"; }
+            conn.exec("INSERT INTO __pblang_data_store(namespace,cache_key,value_json,expires_ms,updated_ms,units) VALUES (?,?,?,?,?,?) ON CONFLICT(namespace,cache_key) DO UPDATE SET value_json=excluded.value_json,expires_ms=excluded.expires_ms,updated_ms=excluded.updated_ms,units=excluded.units", [store.namespace, key, encoded.payload, envelope.expires_ms, now, encoded.units]);
+            return true;
+        });
+        if not outcome.ok { return map{ ok: false, error: "store quota or SQLite transaction failure", units: encoded.units }; }
+        return map{ ok: true, backend: "sqlite", units: encoded.units, expires_ms: envelope.expires_ms };
+    }
+    if store.backend == "redis" {
+        let result = REDIS.set(store.client, _redis_key(store, key), encoded.payload, map{ ttl_ms: ttl });
+        if not result.ok { return result; }
+        return map{ ok: true, backend: "redis", units: encoded.units, expires_ms: envelope.expires_ms };
+    }
+    return map{ ok: false, error: "unsupported store backend" };
+}
+
+fn _missing(store) {
+    if map_has(store, "misses") { store.misses = store.misses + 1; }
+    return map{ found: false, value: nil };
+}
+
+fn _found(store, envelope) {
+    if map_has(store, "hits") { store.hits = store.hits + 1; }
+    return map{ found: true, value: envelope.value, created_ms: envelope.created_ms,
+                updated_ms: envelope.updated_ms, expires_ms: envelope.expires_ms };
+}
+
+fn get_entry(store, key) {
+    _ensure_open(store); key = _safe_key(key);
+    if store.backend == "memory" {
+        let result = CACHE.get_entry(store.cache, _memory_key(store.namespace, key));
+        if not result.found { return map{ found: false, value: nil }; }
+        if not _valid_envelope(result.value, store.namespace, key) {
+            CACHE.delete(store.cache, _memory_key(store.namespace, key));
+            return map{ found: false, value: nil, corrupt: true };
+        }
+        return _found(store, result.value);
+    }
+    if store.backend == "sqlite" {
+        let now = now_ms();
+        let row = DB.query_one(store.conn, "SELECT value_json,expires_ms FROM __pblang_data_store WHERE namespace=? AND cache_key=?", [store.namespace, key]);
+        if row == nil { return _missing(store); }
+        if row.expires_ms > 0 and row.expires_ms <= now {
+            store.conn.exec("DELETE FROM __pblang_data_store WHERE namespace=? AND cache_key=?", [store.namespace, key]);
+            store.expired = store.expired + 1;
+            return _missing(store);
+        }
+        let envelope = try json_parse(row.value_json) catch nil;
+        if not _valid_envelope(envelope, store.namespace, key) {
+            store.conn.exec("DELETE FROM __pblang_data_store WHERE namespace=? AND cache_key=?", [store.namespace, key]);
+            return map{ found: false, value: nil, corrupt: true };
+        }
+        store.conn.exec("UPDATE __pblang_data_store SET updated_ms=? WHERE namespace=? AND cache_key=?", [now, store.namespace, key]);
+        envelope.updated_ms = now;
+        return _found(store, envelope);
+    }
+    if store.backend == "redis" {
+        let result = REDIS.get(store.client, _redis_key(store, key));
+        if not result.ok { return map{ found: false, value: nil, error: result.error }; }
+        if result.value == nil { return _missing(store); }
+        let envelope = try json_parse(result.value) catch nil;
+        if not _valid_envelope(envelope, store.namespace, key) {
+            REDIS.remove(store.client, _redis_key(store, key));
+            return map{ found: false, value: nil, corrupt: true };
+        }
+        if envelope.expires_ms > 0 and envelope.expires_ms <= now_ms() {
+            REDIS.remove(store.client, _redis_key(store, key));
+            return _missing(store);
+        }
+        return _found(store, envelope);
+    }
+    return map{ found: false, value: nil, error: "unsupported store backend" };
+}
+
+fn get(store, key, fallback = nil) {
+    let entry = get_entry(store, key);
+    if entry.found { return entry.value; }
+    return fallback;
+}
+fn has(store, key) { return get_entry(store, key).found; }
+
+fn remove(store, key) {
+    _ensure_open(store); key = _safe_key(key);
+    if store.backend == "memory" {
+        let present = CACHE.has(store.cache, _memory_key(store.namespace, key));
+        CACHE.delete(store.cache, _memory_key(store.namespace, key));
+        return map{ ok: true, removed: if present { 1 } else { 0 } };
+    }
+    if store.backend == "sqlite" {
+        return map{ ok: true, removed: store.conn.exec("DELETE FROM __pblang_data_store WHERE namespace=? AND cache_key=?", [store.namespace, key]) };
+    }
+    if store.backend == "redis" {
+        let result = REDIS.remove(store.client, _redis_key(store, key));
+        if not result.ok { return result; }
+        return map{ ok: true, removed: result.value };
+    }
+    return map{ ok: false, error: "unsupported store backend" };
+}
+
+fn _redis_scan_keys(store) {
+    let out = [];
+    let cursor = "0";
+    let first = true;
+    let rounds = 0;
+    while first or cursor != "0" {
+        first = false;
+        rounds = rounds + 1;
+        if rounds > store.max_scan_rounds { return map{ ok: false, error: "Redis SCAN round limit exceeded" }; }
+        let result = REDIS.scan(store.client, cursor, store.prefix + ":" + store.namespace + ":*", 256);
+        if not result.ok or type(result.value) != "array" or len(result.value) != 2 { return map{ ok: false, error: try result.error catch "invalid Redis SCAN response" }; }
+        cursor = str(result.value[0]);
+        let batch = result.value[1];
+        if type(batch) != "array" { return map{ ok: false, error: "invalid Redis SCAN key batch" }; }
+        let i = 0;
+        while i < len(batch) {
+            if len(out) >= store.max_scan_keys { return map{ ok: false, error: "Redis SCAN key limit exceeded" }; }
+            array_push(out, batch[i]); i = i + 1;
+        }
+    }
+    return map{ ok: true, keys: out };
+}
+
+fn _redis_scan_count(store) {
+    let cursor = "0"; let first = true; let rounds = 0; let count = 0;
+    while first or cursor != "0" {
+        first = false; rounds = rounds + 1;
+        if rounds > store.max_scan_rounds { return map{ ok: false, error: "Redis SCAN round limit exceeded" }; }
+        let result = REDIS.scan(store.client, cursor, store.prefix + ":" + store.namespace + ":*", 256);
+        if not result.ok or type(result.value) != "array" or len(result.value) != 2 {
+            return map{ ok: false, error: try result.error catch "invalid Redis SCAN response" };
+        }
+        cursor = str(result.value[0]);
+        let batch = result.value[1];
+        if type(batch) != "array" { return map{ ok: false, error: "invalid Redis SCAN key batch" }; }
+        count = count + len(batch);
+        if count > store.max_scan_keys { return map{ ok: false, error: "Redis SCAN key limit exceeded" }; }
+    }
+    return map{ ok: true, count: count };
+}
+
+fn clear(store) {
+    _ensure_open(store);
+    if store.backend == "memory" {
+        let all = CACHE.keys(store.cache); let removed = 0; let prefix = store.namespace + SEP; let i = 0;
+        while i < len(all) {
+            if str_starts_with(all[i], prefix) { CACHE.delete(store.cache, all[i]); removed = removed + 1; }
+            i = i + 1;
+        }
+        return map{ ok: true, removed: removed };
+    }
+    if store.backend == "sqlite" {
+        return map{ ok: true, removed: store.conn.exec("DELETE FROM __pblang_data_store WHERE namespace=?", [store.namespace]) };
+    }
+    if store.backend == "redis" {
+        let scanned = _redis_scan_keys(store);
+        if not scanned.ok { return scanned; }
+        let removed = 0; let i = 0;
+        while i < len(scanned.keys) {
+            let batch = []; let j = 0;
+            while i < len(scanned.keys) and j < 256 { array_push(batch, scanned.keys[i]); i = i + 1; j = j + 1; }
+            let result = REDIS.remove(store.client, batch);
+            if not result.ok { return result; }
+            removed = removed + result.value;
+        }
+        return map{ ok: true, removed: removed };
+    }
+    return map{ ok: false, error: "unsupported store backend" };
+}
+
+fn touch(store, key, ttl_ms = nil) {
+    _ensure_open(store); key = _safe_key(key);
+    if ttl_ms == nil { ttl_ms = store.default_ttl_ms; }
+    ttl_ms = _quantity(ttl_ms, store.default_ttl_ms, 0);
+    if store.backend == "memory" { return CACHE.touch(store.cache, _memory_key(store.namespace, key), ttl_ms); }
+    if store.backend == "sqlite" {
+        let now = now_ms(); let deadline = _deadline(ttl_ms, now);
+        return store.conn.exec("UPDATE __pblang_data_store SET expires_ms=?,updated_ms=? WHERE namespace=? AND cache_key=?", [deadline, now, store.namespace, key]) > 0;
+    }
+    if store.backend == "redis" {
+        let redis_key = _redis_key(store, key);
+        let result = nil;
+        if ttl_ms <= 0 { result = REDIS.command(store.client, ["PERSIST", redis_key]); }
+        else { result = REDIS.expire(store.client, redis_key, ttl_ms); }
+        return result.ok and result.value > 0;
+    }
+    return false;
+}
+
+fn get_or_set(store, key, producer, options = nil) {
+    let entry = get_entry(store, key);
+    if entry.found { return entry.value; }
+    let value = producer();
+    let result = set(store, key, value, options);
+    if not result.ok { throw "data_store.get_or_set: " + result.error; }
+    return value;
+}
+
+fn stats(store) {
+    _ensure_open(store);
+    if store.backend == "memory" {
+        let result = CACHE.stats(store.cache);
+        result.format = "pblang.data_store.stats.v1"; result.backend = "memory"; result.namespace = store.namespace;
+        return result;
+    }
+    if store.backend == "sqlite" {
+        _sqlite_expire(store, now_ms());
+        let usage = _sqlite_usage(store, store.conn);
+        let lookups = store.hits + store.misses;
+        return map{ format: "pblang.data_store.stats.v1", backend: "sqlite", namespace: store.namespace,
+                    size: usage.entries, units: usage.units, max_entries: store.max_entries, max_units: store.max_units,
+                    hits: store.hits, misses: store.misses, hit_rate: if lookups == 0 { 0 } else { store.hits / lookups },
+                    evictions: store.evictions, expired: store.expired };
+    }
+    if store.backend == "redis" {
+        let scanned = _redis_scan_count(store); let count = if scanned.ok { scanned.count } else { nil };
+        let client_stats = REDIS.stats(store.client);
+        return map{ format: "pblang.data_store.stats.v1", backend: "redis", namespace: store.namespace,
+                    size: count, units: nil, quota_scope: "Redis server maxmemory policy",
+                    hits: store.hits, misses: store.misses, commands: client_stats.commands,
+                    failures: client_stats.failures, tls: client_stats.tls,
+                    scan_ok: scanned.ok, scan_error: try scanned.error catch nil };
+    }
+    return map{ format: "pblang.data_store.stats.v1", backend: "unknown" };
+}
+
+fn close(store) {
+    if type(store) != "map" or (try store.closed catch true) { return false; }
+    let ok = true;
+    if store.backend == "sqlite" { ok = (try { store.conn.close(); true } catch false); }
+    if store.backend == "redis" { ok = REDIS.close(store.client); }
+    store.closed = true;
+    return ok;
+}
+
+export open, memory, sqlite, redis;
+export set, get, get_entry, has, remove, clear, touch, get_or_set, stats, close;

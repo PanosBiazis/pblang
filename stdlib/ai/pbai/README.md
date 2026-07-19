@@ -36,7 +36,7 @@ keeping current-vs-roadmap claims honest.
 | `stdlib/pbai_hw.sapp` | Thin alias for the pblang machine-inventory library `stdlib:hwinfo.sapp` (CPU, RAM, SSD/HDD, every GPU, NPU, network/sound, all PnP classes; vendor-agnostic; honest compute-usability labels). |
 | `stdlib/pbai_brain.sapp` | Cognitive loop: perception, memory, planning, critique, verification, reflection. |
 | `stdlib/pbai_ingest.sapp` | Bounded local file/folder ingestion into live learning, with shared pblang `llm_data` secret-line sanitization before persistence. |
-| `stdlib/pbai_cache.sapp` | pblang-only persistent cache for derived pbAI data: training summaries, eval reports, tokenization, retrieval, and generation metadata. |
+| `stdlib/pbai_cache.sapp` | pblang-only persistent cache for derived pbAI data: verified SHA-256 keys, TTL, quotas, recovery-safe publication, training summaries, retrieval, and generation metadata. |
 | `stdlib/pbai_max.sapp` | pbAI-Max tier policy/orchestration, checkpointing, continuation, and prompt-level regression evaluation (delegates heavy LLM math to pblang `stdlib:llm_*`). |
 | `stdlib/pbai_assets.sapp` | Inventory of external data/reference assets discoverable from pblang. |
 | `stdlib/pbai_tools.sapp` | Local capability/source map. |

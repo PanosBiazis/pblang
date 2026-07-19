@@ -1,0 +1,548 @@
+// stdlib/codegen_wasm.sapp — real pblang AST → WebAssembly binary module. compile_wasm(src) returns the
+// bytes of a valid .wasm module exporting `main` (→ i64), runnable by ANY wasm engine (browser, node,
+// wasmtime, wasmer…). This is pblang's web/universal-runtime target: no HTML/CSS/JS authored by hand —
+// pblang compiles straight to the browser's native binary format.
+//
+// Step-1 subset (mirrors the ARM64 port's first milestones): numbers, let/const/assign, + - * / % with
+// precedence, unary minus, comparisons (as i64 0/1 values), short-circuit and/or, if/elif/else, while,
+// functions + params + return, calls, recursion. All values are i64. Entry convention matches the x64
+// and ARM64 backends: TOP-LEVEL statements are the program body; a bare `fn main()` is the fallback only
+// when there is no top-level code; defining both is an error. Unsupported constructs fail loud.
+
+let _tok = import("stdlib/compiler/tokenizer.sapp");
+let _par = import("stdlib/compiler/parser.sapp");
+
+fn fail(m) { throw "FAIL wasm: " + m; }
+fn _stmts_of(b) { if is_array(b) { return b; } if is_map(b) and map_has(b, "stmts") { return b.stmts; } return []; }
+fn _pname(p) { if is_map(p) { return p.name; } return p; }
+fn _nkeys(m) { return len(map_keys(m)); }
+
+// ── LEB128 ────────────────────────────────────────────────────────────────────────────────────────────
+fn _uleb(out, v) {
+    if v < 0 { fail("uleb of negative " + str(v)); }
+    while true {
+        let b = v % 128; v = num_floor(v / 128);
+        if v == 0 { push(out, b); return nil; }
+        push(out, b + 128);
+    }
+}
+fn _sleb(out, v) {
+    while true {
+        let b = v % 128; if b < 0 { b = b + 128; }          // mathematical low 7 bits
+        v = num_floor(v / 128);                              // arithmetic shift right 7
+        if (v == 0 and b < 64) or (v == 0 - 1 and b >= 64) { push(out, b); return nil; }
+        push(out, b + 128);
+    }
+}
+fn _append(dst, src) { let i = 0; while i < len(src) { push(dst, src[i]); i = i + 1; } }
+
+// ── slot collection (params first, then every let/const, incl. nested blocks) — same as the ARM64 port ──
+fn _collect_slots(stmts, slots) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i]; let k = s.kind;
+        if k == "let" or k == "const" { if not map_has(slots, s.name) { slots[s.name] = _nkeys(slots); } }
+        else if k == "if" {
+            _collect_slots(_stmts_of(s.then), slots);
+            let elifs = try s.elifs catch nil;
+            if elifs != nil { let j = 0; while j < len(elifs) { _collect_slots(_stmts_of(elifs[j].body), slots); j = j + 1; } }
+            let el = try s.else catch nil; if el != nil { _collect_slots(_stmts_of(el), slots); }
+        }
+        else if k == "while" { _collect_slots(_stmts_of(s.body), slots); }
+        else if k == "block" { _collect_slots(_stmts_of(s), slots); }
+        i = i + 1;
+    }
+}
+
+// condition: i64 on the stack → i32 (1 if non-zero) for if/br_if
+fn _cond_i32(c) { push(c, 66); push(c, 0); push(c, 82); }   // i64.const 0 ; i64.ne
+
+// intern a string literal as a HEAP-LAYOUT object in the data segment: [len (8B LE)][bytes].
+// Returns the segment-relative offset OF THE LENGTH WORD — the literal's pointer value is 8 + off.
+fn _intern_str8(slots, s) {
+    let sd = slots["@sdata"]; let bytes = str_to_bytes(s); let ln = len(bytes);
+    let off = len(sd);
+    push(sd, ln % 256); push(sd, num_floor(ln / 256) % 256); push(sd, num_floor(ln / 65536) % 256); push(sd, num_floor(ln / 16777216) % 256);
+    push(sd, 0); push(sd, 0); push(sd, 0); push(sd, 0);
+    let i = 0; while i < ln { push(sd, bytes[i]); i = i + 1; }
+    return off;
+}
+
+// ── interprocedural type inference (ported from the ARM64 backend — pure AST analysis) ──
+fn _val_ty(node, locals, params, fnret) {
+    if node == nil { return "num"; }
+    let k = node.kind;
+    if k == "string" { return "str"; }
+    if k == "ident" { if map_has(locals, node.name) { return locals[node.name]; } if map_has(params, node.name) { return params[node.name]; } return "num"; }
+    if k == "call" { let fnn = try node.func.name catch nil; if fnn == "str" { return "str"; } if fnn != nil and map_has(fnret, fnn) { return fnret[fnn]; } return "num"; }
+    if k == "binary" and node.op == "+" { if _val_ty(node.left, locals, params, fnret) == "str" or _val_ty(node.right, locals, params, fnret) == "str" { return "str"; } return "num"; }
+    return "num";
+}
+fn _walk_expr_ty(node, locals, params, fnret, fnptype, res) {
+    if node == nil { return nil; }
+    let k = node.kind;
+    if k == "call" {
+        let fnn = try node.func.name catch nil;
+        if fnn != nil and map_has(fnptype, fnn) {
+            let args = node.args; let i = 0;
+            while i < len(args) {
+                if i < len(fnptype[fnn]) { let ty = _val_ty(args[i], locals, params, fnret); if ty != "num" and fnptype[fnn][i] == "num" { fnptype[fnn][i] = ty; res.changed = true; } }
+                i = i + 1;
+            }
+        }
+        let a = node.args; let j = 0; while j < len(a) { _walk_expr_ty(a[j], locals, params, fnret, fnptype, res); j = j + 1; }
+    } elif k == "binary" { _walk_expr_ty(node.left, locals, params, fnret, fnptype, res); _walk_expr_ty(node.right, locals, params, fnret, fnptype, res); }
+    elif k == "unary" { let op = try node.operand catch nil; if op == nil { op = try node.expr catch nil; } _walk_expr_ty(op, locals, params, fnret, fnptype, res); }
+    elif k == "assign" { _walk_expr_ty(node.value, locals, params, fnret, fnptype, res); }
+    return nil;
+}
+fn _walk_stmts_ty(stmts, locals, params, fnret, fnptype, res) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i]; let k = s.kind;
+        if k == "let" or k == "const" { _walk_expr_ty(s.value, locals, params, fnret, fnptype, res); locals[s.name] = _val_ty(s.value, locals, params, fnret); }
+        elif k == "expr_stmt" { let e = s.expr; _walk_expr_ty(e, locals, params, fnret, fnptype, res); if e.kind == "assign" { locals[e.name] = _val_ty(e.value, locals, params, fnret); } }
+        elif k == "assign" { _walk_expr_ty(s.value, locals, params, fnret, fnptype, res); locals[s.name] = _val_ty(s.value, locals, params, fnret); }
+        elif k == "return" { _walk_expr_ty(s.value, locals, params, fnret, fnptype, res); let t = _val_ty(s.value, locals, params, fnret); if t != "num" and res.rettype == "num" { res.rettype = t; } }
+        elif k == "if" {
+            _walk_expr_ty(s.cond, locals, params, fnret, fnptype, res);
+            _walk_stmts_ty(_stmts_of(s.then), locals, params, fnret, fnptype, res);
+            let elifs = try s.elifs catch nil; if elifs != nil { let j = 0; while j < len(elifs) { _walk_expr_ty(elifs[j].cond, locals, params, fnret, fnptype, res); _walk_stmts_ty(_stmts_of(elifs[j].body), locals, params, fnret, fnptype, res); j = j + 1; } }
+            let el = try s.else catch nil; if el != nil { _walk_stmts_ty(_stmts_of(el), locals, params, fnret, fnptype, res); }
+        }
+        elif k == "while" { _walk_expr_ty(s.cond, locals, params, fnret, fnptype, res); _walk_stmts_ty(_stmts_of(s.body), locals, params, fnret, fnptype, res); }
+        elif k == "print" { _walk_expr_ty(s.value, locals, params, fnret, fnptype, res); }
+        elif k == "block" { _walk_stmts_ty(_stmts_of(s), locals, params, fnret, fnptype, res); }
+        i = i + 1;
+    }
+}
+fn _infer_types(fns) {
+    let fnret = map{}; let fnptype = map{}; let fi = 0;
+    while fi < len(fns) { fnret[fns[fi].name] = "num"; let ps = []; let p = 0; while p < len(fns[fi].params) { push(ps, "num"); p = p + 1; } fnptype[fns[fi].name] = ps; fi = fi + 1; }
+    let changed = true; let guard = 0;
+    while changed and guard < 200 {
+        changed = false; guard = guard + 1; let f = 0;
+        while f < len(fns) {
+            let F = fns[f]; let params = map{}; let pl = F.params; let pi = 0;
+            while pi < len(pl) { params[_pname(pl[pi])] = fnptype[F.name][pi]; pi = pi + 1; }
+            let res = map{ rettype: "num", changed: false };
+            _walk_stmts_ty(_stmts_of(F.body), map{}, params, fnret, fnptype, res);
+            if res.rettype != "num" and fnret[F.name] == "num" { fnret[F.name] = res.rettype; changed = true; }
+            if res.changed { changed = true; }
+            f = f + 1;
+        }
+    }
+    return map{ fnret: fnret, fnptype: fnptype };
+}
+// statically a STRING? (literal, tracked local, str()/string-returning call, or concat)
+fn _is_str(node, slots) {
+    if node == nil { return false; }
+    let k = node.kind;
+    if k == "string" { return true; }
+    if k == "ident" { let sv = slots["@strvars"]; return map_has(sv, node.name) and sv[node.name]; }
+    if k == "call" { let fnn = try node.func.name catch nil; if fnn == "str" { return true; } let fr = try slots["@fnret"] catch nil; if fr != nil and fnn != nil and map_has(fr, fnn) and fr[fnn] == "str" { return true; } return false; }
+    if k == "binary" and node.op == "+" { return _is_str(node.left, slots) or _is_str(node.right, slots); }
+    return false;
+}
+// does the program use strings at all (literals or str())? → heap + memory + helper fns
+fn _has_str_node(node) {
+    if is_array(node) { let i = 0; while i < len(node) { if _has_str_node(node[i]) { return true; } i = i + 1; } return false; }
+    if not is_map(node) { return false; }
+    let kd = try node.kind catch nil;
+    if kd == "string" { return true; }
+    if kd == "call" { let fnn = try node.func.name catch nil; if fnn == "str" { return true; } }
+    let ks = map_keys(node); let i = 0;
+    while i < len(ks) { let ch = node[ks[i]]; if (is_map(ch) or is_array(ch)) and _has_str_node(ch) { return true; } i = i + 1; }
+    return false;
+}
+// does the AST use print at all / print a string literal? (generic recursive scan)
+fn _scan_print(node, res) {
+    if is_array(node) { let i = 0; while i < len(node) { _scan_print(node[i], res); i = i + 1; } return nil; }
+    if not is_map(node) { return nil; }
+    let kd = try node.kind catch nil;
+    if kd == "print" { res.print = true; let v = try node.value catch nil; if v != nil and is_map(v) and (try v.kind catch nil) == "string" { res.pstr = true; } }
+    let ks = map_keys(node); let i = 0;
+    while i < len(ks) { let ch = node[ks[i]]; if is_map(ch) or is_array(ch) { _scan_print(ch, res); } i = i + 1; }
+    return nil;
+}
+// ── heap helper functions (hand-encoded wasm bodies). Strings are [len i64][bytes] in linear memory;
+// values are i64 pointers; a mutable i32 global (index 0) is the bump allocator, like x28 on ARM64. ──
+fn _code_entry(body) { let e = []; _uleb(e, len(body)); _append(e, body); return e; }
+// __prints(s i64): call print_str(s+8, len(s)) — the one place that unwraps a string for the host
+fn _h_prints() {
+    let b = []; _uleb(b, 0);
+    push(b, 32); push(b, 0); push(b, 167); push(b, 65); push(b, 8); push(b, 106);   // (i32)(s) + 8
+    push(b, 32); push(b, 0); push(b, 167); push(b, 41); push(b, 0); push(b, 0); push(b, 167);   // (i32) len = *s
+    push(b, 16); push(b, 1);                                                        // call print_str (import #1)
+    push(b, 11);
+    return _code_entry(b);
+}
+// __concat(a i64, b i64) → i64: fresh [la+lb][bytes a][bytes b] at the bump pointer (memory.copy = memmove)
+fn _h_concat() {
+    let b = []; _uleb(b, 1); _uleb(b, 3); push(b, 127);                              // locals: p=2, la=3, lb=4 (i32)
+    push(b, 32); push(b, 0); push(b, 167); push(b, 41); push(b, 0); push(b, 0); push(b, 167); push(b, 33); push(b, 3);   // la = (i32)*a
+    push(b, 32); push(b, 1); push(b, 167); push(b, 41); push(b, 0); push(b, 0); push(b, 167); push(b, 33); push(b, 4);   // lb = (i32)*b
+    push(b, 35); push(b, 0); push(b, 33); push(b, 2);                                // p = hp
+    push(b, 32); push(b, 2);                                                         // addr p
+    push(b, 32); push(b, 3); push(b, 32); push(b, 4); push(b, 106); push(b, 172);    // (i64)(la+lb)
+    push(b, 55); push(b, 0); push(b, 0);                                             // i64.store *p = la+lb
+    push(b, 32); push(b, 2); push(b, 65); push(b, 8); push(b, 106);                  // dst = p+8
+    push(b, 32); push(b, 0); push(b, 167); push(b, 65); push(b, 8); push(b, 106);    // src = a+8
+    push(b, 32); push(b, 3);                                                         // len = la
+    push(b, 252); push(b, 10); push(b, 0); push(b, 0);                               // memory.copy
+    push(b, 32); push(b, 2); push(b, 65); push(b, 8); push(b, 106); push(b, 32); push(b, 3); push(b, 106);   // dst = p+8+la
+    push(b, 32); push(b, 1); push(b, 167); push(b, 65); push(b, 8); push(b, 106);    // src = b+8
+    push(b, 32); push(b, 4);                                                         // len = lb
+    push(b, 252); push(b, 10); push(b, 0); push(b, 0);
+    push(b, 32); push(b, 2); push(b, 65); push(b, 8); push(b, 106); push(b, 32); push(b, 3); push(b, 106); push(b, 32); push(b, 4); push(b, 106);
+    push(b, 36); push(b, 0);                                                         // hp = p+8+la+lb
+    push(b, 32); push(b, 2); push(b, 173); push(b, 11);                              // return (i64)p
+    return _code_entry(b);
+}
+// __str(n i64) → i64: decimal digits written backwards into the scratch tail, then memmoved to p+8
+fn _h_str() {
+    let b = []; _uleb(b, 1); _uleb(b, 4); push(b, 127);                              // locals: p=1, q=2, g=3, L=4 (i32)
+    push(b, 35); push(b, 0); push(b, 33); push(b, 1);                                // p = hp
+    push(b, 32); push(b, 1); push(b, 65); push(b, 28); push(b, 106); push(b, 33); push(b, 2);   // q = p + 28 (8 hdr + 20 scratch)
+    push(b, 32); push(b, 0); push(b, 66); push(b, 0); push(b, 83); push(b, 33); push(b, 3);     // g = n < 0
+    push(b, 32); push(b, 3); push(b, 4); push(b, 64);                                // if g
+    push(b, 66); push(b, 0); push(b, 32); push(b, 0); push(b, 125); push(b, 33); push(b, 0);    //   n = 0 - n
+    push(b, 11);
+    push(b, 3); push(b, 64);                                                         // loop
+    push(b, 32); push(b, 2); push(b, 65); push(b, 1); push(b, 107); push(b, 33); push(b, 2);    //   q = q - 1
+    push(b, 32); push(b, 2);                                                         //   addr q
+    push(b, 32); push(b, 0); push(b, 66); push(b, 10); push(b, 129); push(b, 167); push(b, 65); push(b, 48); push(b, 106);   //   (i32)(n%10)+48
+    push(b, 58); push(b, 0); push(b, 0);                                             //   i32.store8
+    push(b, 32); push(b, 0); push(b, 66); push(b, 10); push(b, 127); push(b, 33); push(b, 0);   //   n = n / 10
+    push(b, 32); push(b, 0); push(b, 66); push(b, 0); push(b, 82); push(b, 13); push(b, 0);     //   br_if 0 while n ≠ 0
+    push(b, 11);                                                                     // end loop
+    push(b, 32); push(b, 3); push(b, 4); push(b, 64);                                // if g: write '-'
+    push(b, 32); push(b, 2); push(b, 65); push(b, 1); push(b, 107); push(b, 33); push(b, 2);
+    push(b, 32); push(b, 2); push(b, 65); push(b, 45); push(b, 58); push(b, 0); push(b, 0);
+    push(b, 11);
+    push(b, 32); push(b, 1); push(b, 65); push(b, 28); push(b, 106); push(b, 32); push(b, 2); push(b, 107); push(b, 33); push(b, 4);   // L = p+28 - q
+    push(b, 32); push(b, 1); push(b, 32); push(b, 4); push(b, 172); push(b, 55); push(b, 0); push(b, 0);                              // *p = L
+    push(b, 32); push(b, 1); push(b, 65); push(b, 8); push(b, 106); push(b, 32); push(b, 2); push(b, 32); push(b, 4);
+    push(b, 252); push(b, 10); push(b, 0); push(b, 0);                               // memmove(p+8, q, L)
+    push(b, 32); push(b, 1); push(b, 65); push(b, 8); push(b, 106); push(b, 32); push(b, 4); push(b, 106); push(b, 36); push(b, 0);   // hp = p+8+L
+    push(b, 32); push(b, 1); push(b, 173); push(b, 11);                              // return (i64)p
+    return _code_entry(b);
+}
+// __streq(a i64, b i64) → i64 0/1: length check, then byte loop
+fn _h_streq() {
+    let b = []; _uleb(b, 1); _uleb(b, 2); push(b, 127);                              // locals: la=2, i=3 (i32)
+    push(b, 32); push(b, 0); push(b, 167); push(b, 41); push(b, 0); push(b, 0); push(b, 167); push(b, 33); push(b, 2);   // la = (i32)*a
+    push(b, 32); push(b, 1); push(b, 167); push(b, 41); push(b, 0); push(b, 0); push(b, 167);                            // (i32)*b
+    push(b, 32); push(b, 2); push(b, 71); push(b, 4); push(b, 64);                   // if lb ≠ la
+    push(b, 66); push(b, 0); push(b, 15); push(b, 11);                               //   return 0
+    push(b, 65); push(b, 0); push(b, 33); push(b, 3);                                // i = 0
+    push(b, 2); push(b, 64); push(b, 3); push(b, 64);                                // block loop
+    push(b, 32); push(b, 3); push(b, 32); push(b, 2); push(b, 70); push(b, 13); push(b, 1);   //   i == la → equal (br 1)
+    push(b, 32); push(b, 0); push(b, 167); push(b, 32); push(b, 3); push(b, 106); push(b, 45); push(b, 0); push(b, 8);   //   a[8+i]
+    push(b, 32); push(b, 1); push(b, 167); push(b, 32); push(b, 3); push(b, 106); push(b, 45); push(b, 0); push(b, 8);   //   b[8+i]
+    push(b, 71); push(b, 4); push(b, 64); push(b, 66); push(b, 0); push(b, 15); push(b, 11);   //   ≠ → return 0
+    push(b, 32); push(b, 3); push(b, 65); push(b, 1); push(b, 106); push(b, 33); push(b, 3);   //   i++
+    push(b, 12); push(b, 0);                                                         //   br 0
+    push(b, 11); push(b, 11);                                                        // end loop ; end block
+    push(b, 66); push(b, 1); push(b, 11);                                            // return 1
+    return _code_entry(b);
+}
+
+// type-signature interning: params/rets are arrays of valtype bytes (126=i64, 127=i32) → type index
+fn _ty(types, typekey, params, rets) {
+    let key = ""; let i = 0;
+    while i < len(params) { key = key + str(params[i]) + ","; i = i + 1; }
+    key = key + "->"; i = 0;
+    while i < len(rets) { key = key + str(rets[i]) + ","; i = i + 1; }
+    if map_has(typekey, key) { return typekey[key]; }
+    let idx = len(types); push(types, map{ p: params, r: rets }); typekey[key] = idx;
+    return idx;
+}
+
+// ── expression → one i64 on the wasm stack ──
+fn _we(node, c, slots, fnidx) {
+    let k = node.kind;
+    if k == "string" { push(c, 66); _sleb(c, 8 + _intern_str8(slots, node.value)); return nil; }   // pointer into the data segment
+    if k == "number" { push(c, 66); _sleb(c, num_floor(parse_number(node.value))); return nil; }   // i64.const
+    if k == "ident" {
+        if not map_has(slots, node.name) { fail("unknown var " + node.name); }
+        push(c, 32); _uleb(c, slots[node.name]); return nil;                                       // local.get
+    }
+    if k == "unary" and node.op == "-" {
+        let opd = try node.operand catch nil; if opd == nil { opd = node.expr; }
+        push(c, 66); push(c, 0); _we(opd, c, slots, fnidx); push(c, 125); return nil;              // 0 - x (i64.sub)
+    }
+    if k == "unary" and (node.op == "not" or node.op == "!") {
+        let opd2 = try node.operand catch nil; if opd2 == nil { opd2 = node.expr; }
+        _we(opd2, c, slots, fnidx); push(c, 80); push(c, 173); return nil;                         // i64.eqz ; extend_u
+    }
+    if k == "binary" {
+        let op = node.op;
+        if op == "and" {                                    // short-circuit: a ≠ 0 ? (b ≠ 0) : 0
+            _we(node.left, c, slots, fnidx); _cond_i32(c);
+            push(c, 4); push(c, 126);                       // if (result i64)
+            _we(node.right, c, slots, fnidx); _cond_i32(c); push(c, 173);   // (b ≠ 0) as i64
+            push(c, 5); push(c, 66); push(c, 0);            // else i64.const 0
+            push(c, 11); return nil;                        // end
+        }
+        if op == "or" {                                     // short-circuit: a ≠ 0 ? 1 : (b ≠ 0)
+            _we(node.left, c, slots, fnidx); _cond_i32(c);
+            push(c, 4); push(c, 126); push(c, 66); push(c, 1);
+            push(c, 5); _we(node.right, c, slots, fnidx); _cond_i32(c); push(c, 173);
+            push(c, 11); return nil;
+        }
+        if op == "+" and (_is_str(node.left, slots) or _is_str(node.right, slots)) {   // string concat
+            _we(node.left, c, slots, fnidx); _we(node.right, c, slots, fnidx);
+            push(c, 16); _uleb(c, fnidx["__concat"]); return nil;
+        }
+        if (op == "==" or op == "!=") and (_is_str(node.left, slots) or _is_str(node.right, slots)) {   // string equality
+            _we(node.left, c, slots, fnidx); _we(node.right, c, slots, fnidx);
+            push(c, 16); _uleb(c, fnidx["__streq"]);
+            if op == "!=" { push(c, 80); push(c, 173); }    // i64.eqz → i64 (flip)
+            return nil;
+        }
+        _we(node.left, c, slots, fnidx); _we(node.right, c, slots, fnidx);
+        if op == "+" { push(c, 124); return nil; }          // i64.add
+        if op == "-" { push(c, 125); return nil; }          // i64.sub
+        if op == "*" { push(c, 126); return nil; }          // i64.mul
+        if op == "/" { push(c, 127); return nil; }          // i64.div_s
+        if op == "%" { push(c, 129); return nil; }          // i64.rem_s
+        // comparisons produce i32 → widen to an i64 0/1 value (uniform value model)
+        if op == "==" { push(c, 81); push(c, 173); return nil; }
+        if op == "!=" { push(c, 82); push(c, 173); return nil; }
+        if op == "<"  { push(c, 83); push(c, 173); return nil; }
+        if op == ">"  { push(c, 85); push(c, 173); return nil; }
+        if op == "<=" { push(c, 87); push(c, 173); return nil; }
+        if op == ">=" { push(c, 89); push(c, 173); return nil; }
+        fail("unsupported operator " + op);
+    }
+    if k == "call" {
+        let fname = try node.func.name catch nil;
+        if fname == nil { fail("unsupported call target"); }
+        if fname == "str" and len(node.args) == 1 {         // str(n): number → heap string via __str
+            _we(node.args[0], c, slots, fnidx);
+            push(c, 16); _uleb(c, fnidx["__str"]); return nil;
+        }
+        if fname == "len" and len(node.args) == 1 and _is_str(node.args[0], slots) {   // len(s) = size word at *s
+            _we(node.args[0], c, slots, fnidx);
+            push(c, 167); push(c, 41); push(c, 0); push(c, 0); return nil;             // wrap ; i64.load
+        }
+        if not map_has(fnidx, fname) { fail("unknown fn " + fname); }
+        let a = node.args; let i = 0;
+        while i < len(a) { _we(a[i], c, slots, fnidx); i = i + 1; }
+        push(c, 16); _uleb(c, fnidx[fname]); return nil;    // call <idx>
+    }
+    if k == "assign" {                                      // x = v as an expression statement
+        _we(node.value, c, slots, fnidx);
+        if not map_has(slots, node.name) { fail("unknown var " + node.name); }
+        push(c, 34); _uleb(c, slots[node.name]); return nil; // local.tee (leaves the value)
+    }
+    if k == "group" or k == "paren" { return _we(node.expr, c, slots, fnidx); }
+    fail("unhandled expr kind " + k);
+}
+
+// ── statement ──
+fn _ws(node, c, slots, fnidx) {
+    let k = node.kind;
+    if k == "expr_stmt" {
+        _we(node.expr, c, slots, fnidx); push(c, 26); return nil;           // drop the value
+    }
+    if k == "let" or k == "const" or k == "assign" {
+        if node.value != nil { _we(node.value, c, slots, fnidx); } else { push(c, 66); push(c, 0); }
+        push(c, 33); _uleb(c, slots[node.name]);                            // local.set
+        slots["@strvars"][node.name] = _is_str(node.value, slots);          // track string-typed locals
+        return nil;
+    }
+    if k == "return" {
+        if node.value != nil { _we(node.value, c, slots, fnidx); } else { push(c, 66); push(c, 0); }
+        push(c, 15); return nil;                                            // return
+    }
+    if k == "if" {
+        _we(node.cond, c, slots, fnidx); _cond_i32(c);
+        push(c, 4); push(c, 64);                                            // if (no result)
+        _wblock(_stmts_of(node.then), c, slots, fnidx);
+        let elifs = try node.elifs catch nil; let el = try node.else catch nil;
+        let arms = []; if elifs != nil { arms = elifs; }
+        let opened = 0; let ei = 0;
+        while ei < len(arms) {                                              // each elif nests in the else
+            push(c, 5);                                                     // else
+            _we(arms[ei].cond, c, slots, fnidx); _cond_i32(c);
+            push(c, 4); push(c, 64); opened = opened + 1;
+            _wblock(_stmts_of(arms[ei].body), c, slots, fnidx);
+            ei = ei + 1;
+        }
+        if el != nil { push(c, 5); _wblock(_stmts_of(el), c, slots, fnidx); }
+        while opened > 0 { push(c, 11); opened = opened - 1; }              // close nested ifs
+        push(c, 11); return nil;                                            // end
+    }
+    if k == "while" {
+        push(c, 2); push(c, 64);                                            // block
+        push(c, 3); push(c, 64);                                            // loop
+        _we(node.cond, c, slots, fnidx);
+        push(c, 80);                                                        // i64.eqz → i32 (1 when cond is 0)
+        push(c, 13); push(c, 1);                                            // br_if 1 → exit the block
+        _wblock(_stmts_of(node.body), c, slots, fnidx);
+        push(c, 12); push(c, 0);                                            // br 0 → loop start
+        push(c, 11); push(c, 11); return nil;                               // end loop ; end block
+    }
+    if k == "print" {
+        let v = node.value;
+        _we(v, c, slots, fnidx);
+        if _is_str(v, slots) { push(c, 16); _uleb(c, fnidx["__prints"]); }   // string value → __prints(s)
+        else { push(c, 16); _uleb(c, 0); }                                   // number → env.print (import #0)
+        return nil;
+    }
+    if k == "block" { _wblock(_stmts_of(node), c, slots, fnidx); return nil; }
+    fail("unhandled stmt kind " + k);
+}
+fn _wblock(stmts, c, slots, fnidx) { let i = 0; while i < len(stmts) { _ws(stmts[i], c, slots, fnidx); i = i + 1; } }
+
+// compile one function → its code-section entry (locals decl + body + end)
+fn _wfn(fname, params, stmts, fnidx, sdata, fnret, fnptype) {
+    let slots = map{};
+    let p = 0; while p < len(params) { let nm = _pname(params[p]); if not map_has(slots, nm) { slots[nm] = _nkeys(slots); } p = p + 1; }
+    _collect_slots(stmts, slots);
+    let nlocals = _nkeys(slots) - len(params);
+    slots["@sdata"] = sdata;                             // shared data segment for string literals
+    slots["@strvars"] = map{};                           // string-typed locals (static print/concat dispatch)
+    slots["@fnret"] = fnret;                             // user fn return types
+    let sp = 0;                                          // seed params by their inferred type
+    while sp < len(params) {
+        if map_has(fnptype, fname) and sp < len(fnptype[fname]) and fnptype[fname][sp] == "str" { slots["@strvars"][_pname(params[sp])] = true; }
+        sp = sp + 1;
+    }
+    let body = [];
+    if nlocals > 0 { _uleb(body, 1); _uleb(body, nlocals); push(body, 126); }   // one run of i64 locals
+    else { _uleb(body, 0); }
+    _wblock(stmts, body, slots, fnidx);
+    push(body, 66); push(body, 0); push(body, 15);       // fall-through: return 0
+    push(body, 11);                                      // end of body
+    let entry = []; _uleb(entry, len(body)); _append(entry, body);
+    return entry;
+}
+
+// ── whole module ──
+fn compile_wasm(src) {
+    let ast = _par.parse(_tok.tokenize(src));
+    let userfns = []; let toplevel = []; let usermain = nil; let i = 0;
+    while i < len(ast.stmts) {
+        let s = ast.stmts[i];
+        if s.kind == "fn" { if s.name == "main" { usermain = s; } else { push(userfns, s); } } else { push(toplevel, s); }
+        i = i + 1;
+    }
+    if len(toplevel) > 0 and usermain != nil { fail("both top-level code and fn main() defined"); }
+    let mainstmts = toplevel; let mainparams = [];
+    if len(toplevel) == 0 { if usermain == nil { fail("no top-level code and no fn main()"); } mainstmts = _stmts_of(usermain.body); }
+
+    // Capability scan. Printing imports env.print/env.print_str; strings additionally get linear memory,
+    // a bump-pointer global, and the four heap helper fns. Modules using neither stay dependency-free.
+    let uses = map{ print: false, pstr: false };
+    _scan_print(ast.stmts, uses);
+    let needsheap = _has_str_node(ast.stmts);
+    if needsheap { uses.print = true; }                   // heap helpers reference the print_str import
+    let nimp = 0; if uses.print { nimp = 2; }             // import #0 = print(i64), #1 = print_str(i32,i32)
+    let nhelp = 0; if needsheap { nhelp = 4; }            // __prints, __concat, __str, __streq
+
+    let fnidx = map{}; let f = 0;
+    while f < len(userfns) { fnidx[userfns[f].name] = nimp + f; f = f + 1; }
+    let mainidx = nimp + len(userfns); fnidx["main"] = mainidx;
+    if needsheap {
+        fnidx["__prints"] = mainidx + 1; fnidx["__concat"] = mainidx + 2;
+        fnidx["__str"] = mainidx + 3; fnidx["__streq"] = mainidx + 4;
+    }
+
+    // interprocedural inference over (synthesized main + user fns) — string params/returns
+    let ifns = [ map{ kind: "fn", name: "main", params: [], body: map{ kind: "block", stmts: mainstmts } } ];
+    let u2 = 0; while u2 < len(userfns) { push(ifns, userfns[u2]); u2 = u2 + 1; }
+    let tinfo = _infer_types(ifns);
+    let fnret = tinfo.fnret; let fnptype = tinfo.fnptype;
+
+    // type section (interned signatures; 126=i64, 127=i32)
+    let types = []; let typekey = map{};
+    let ty_print = 0; let ty_pstr = 0;
+    if uses.print { ty_print = _ty(types, typekey, [126], []); ty_pstr = _ty(types, typekey, [127, 127], []); }
+    let fntys = [];
+    f = 0;
+    while f <= len(userfns) {
+        let ar = 0; if f < len(userfns) { ar = len(userfns[f].params); }
+        let ps = []; let q = 0; while q < ar { push(ps, 126); q = q + 1; }
+        push(fntys, _ty(types, typekey, ps, [126]));
+        f = f + 1;
+    }
+    let ty_h1 = 0; let ty_h2 = 0; let ty_h3 = 0;
+    if needsheap {
+        ty_h1 = _ty(types, typekey, [126], []);            // __prints
+        ty_h2 = _ty(types, typekey, [126, 126], [126]);    // __concat / __streq
+        ty_h3 = _ty(types, typekey, [126], [126]);         // __str
+    }
+    let tsec = []; _uleb(tsec, len(types));
+    let t = 0;
+    while t < len(types) {
+        push(tsec, 96); _uleb(tsec, len(types[t].p)); _append(tsec, types[t].p);
+        _uleb(tsec, len(types[t].r)); _append(tsec, types[t].r);
+        t = t + 1;
+    }
+    // import section: env.print / env.print_str
+    let isec = [];
+    if uses.print {
+        _uleb(isec, 2);
+        _uleb(isec, 3); push(isec, 101); push(isec, 110); push(isec, 118);                       // "env"
+        _uleb(isec, 5); push(isec, 112); push(isec, 114); push(isec, 105); push(isec, 110); push(isec, 116);   // "print"
+        push(isec, 0); _uleb(isec, ty_print);
+        _uleb(isec, 3); push(isec, 101); push(isec, 110); push(isec, 118);                       // "env"
+        _uleb(isec, 9); push(isec, 112); push(isec, 114); push(isec, 105); push(isec, 110); push(isec, 116);
+        push(isec, 95); push(isec, 115); push(isec, 116); push(isec, 114);                        // "print_str"
+        push(isec, 0); _uleb(isec, ty_pstr);
+    }
+    // function section: type index per defined function (userfns…, main, helpers)
+    let fsec = []; _uleb(fsec, len(userfns) + 1 + nhelp);
+    f = 0; while f <= len(userfns) { _uleb(fsec, fntys[f]); f = f + 1; }
+    if needsheap { _uleb(fsec, ty_h1); _uleb(fsec, ty_h2); _uleb(fsec, ty_h3); _uleb(fsec, ty_h2); }
+    // memory section (16 pages = 1 MiB: literals + the bump heap)
+    let msec = [];
+    if needsheap { _uleb(msec, 1); push(msec, 0); _uleb(msec, 16); }
+    // export section: "main" (+ "memory" so the host's print_str can read the bytes)
+    let esec = []; let nexp = 1; if needsheap { nexp = 2; }
+    _uleb(esec, nexp);
+    _uleb(esec, 4);
+    push(esec, 109); push(esec, 97); push(esec, 105); push(esec, 110);    // "main"
+    push(esec, 0); _uleb(esec, mainidx);
+    if needsheap {
+        _uleb(esec, 6);
+        push(esec, 109); push(esec, 101); push(esec, 109); push(esec, 111); push(esec, 114); push(esec, 121);   // "memory"
+        push(esec, 2); _uleb(esec, 0);
+    }
+    // code section (string literals intern into the shared sdata as they're compiled)
+    let sdata = [];
+    let csec = []; _uleb(csec, len(userfns) + 1 + nhelp);
+    f = 0; while f < len(userfns) { _append(csec, _wfn(userfns[f].name, userfns[f].params, _stmts_of(userfns[f].body), fnidx, sdata, fnret, fnptype)); f = f + 1; }
+    _append(csec, _wfn("main", mainparams, mainstmts, fnidx, sdata, fnret, fnptype));
+    if needsheap { _append(csec, _h_prints()); _append(csec, _h_concat()); _append(csec, _h_str()); _append(csec, _h_streq()); }
+    // global section (assembled AFTER code so the heap base clears the final data segment)
+    let gsec = [];
+    if needsheap {
+        let hb = 8 + len(sdata); let r8 = hb % 8; if r8 != 0 { hb = hb + (8 - r8); }
+        _uleb(gsec, 1); push(gsec, 127); push(gsec, 1);   // one mutable i32
+        push(gsec, 65); _sleb(gsec, hb); push(gsec, 11);  // init: i32.const heapbase
+    }
+    // data section: one active segment at offset 8
+    let dsec = [];
+    if len(sdata) > 0 {
+        _uleb(dsec, 1); push(dsec, 0);                    // one segment, memory 0
+        push(dsec, 65); _sleb(dsec, 8); push(dsec, 11);   // offset expr: i32.const 8 ; end
+        _uleb(dsec, len(sdata)); _append(dsec, sdata);
+    }
+
+    let out = [0, 97, 115, 109, 1, 0, 0, 0];                          // \0asm, version 1
+    push(out, 1); _uleb(out, len(tsec)); _append(out, tsec);
+    if len(isec) > 0 { push(out, 2); _uleb(out, len(isec)); _append(out, isec); }
+    push(out, 3); _uleb(out, len(fsec)); _append(out, fsec);
+    if len(msec) > 0 { push(out, 5); _uleb(out, len(msec)); _append(out, msec); }
+    if len(gsec) > 0 { push(out, 6); _uleb(out, len(gsec)); _append(out, gsec); }
+    push(out, 7); _uleb(out, len(esec)); _append(out, esec);
+    push(out, 10); _uleb(out, len(csec)); _append(out, csec);
+    if len(dsec) > 0 { push(out, 11); _uleb(out, len(dsec)); _append(out, dsec); }
+    return out;
+}
+
+export compile_wasm;

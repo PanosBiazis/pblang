@@ -3,8 +3,8 @@
 //! Two interchangeable backends behind a single builtin surface:
 //!
 //! - **minifb** (default, always built): pure-Rust software framebuffer
-//!   + keyboard/mouse event polling. No system libraries needed beyond
-//!   the platform's window manager. Lives in [`graphics`].
+//!   plus keyboard/mouse event polling. No system libraries needed beyond the
+//!   platform's window manager. Lives in [`graphics`].
 //! - **SDL2** (opt-in via the `sdl2` cargo feature and the
 //!   `PBLANG_GFX=sdl2` env var at runtime): GPU-accelerated path that
 //!   adds texture rendering and richer event support. Lives in the
@@ -23,6 +23,11 @@ pub mod graphics;
 
 #[cfg(feature = "sdl2")]
 pub mod sdl2_backend;
+
+// Experimental, off-by-default GPU render backend (surface + cleared frame + solid rects).
+// Compiles to nothing unless `wgpu-render` is on. See docs/GPU_RENDER_PLAN.md.
+#[cfg(feature = "wgpu-render")]
+pub mod wgpu_backend;
 
 pub use graphics::gfx_builtins;
 

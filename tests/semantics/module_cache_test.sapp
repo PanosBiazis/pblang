@@ -1,0 +1,70 @@
+let MC = import("stdlib/compiler/module_cache.sapp");
+let FE = import("stdlib/compiler/selfhost_frontend.sapp");
+let VM = import("stdlib/compiler/vm.sapp");
+
+fn fail(message) { throw "FAIL module_cache: " + message; }
+fn uniq(tag) { return "/tmp/pblang_module_cache_" + tag + "_" + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16); }
+fn cleanup_dir(path) {
+    let entries = try fs_listdir(path) catch [];
+    let i = 0;
+    while i < len(entries) { try fs_remove(path_join(path, entries[i])) catch nil; i = i + 1; }
+    try fs_remove(path) catch nil;
+}
+
+let root = uniq("root");
+let dep = uniq("dep") + ".sapp";
+fs_write(dep, "export VALUE;");
+let first_context = MC.context(root, [dep]);
+fs_write(dep, "export VALUE2;");
+let changed_context = MC.context(root, [dep]);
+if first_context.toolchain == changed_context.toolchain { fail("toolchain edit did not invalidate revision"); }
+fs_write(dep, "export VALUE;");
+
+let context = MC.context(root, [dep]);
+let source = "let answer = 6 * 7;";
+let compiled = FE.frontend_compile(source);
+if not compiled.ok { fail("fixture compilation"); }
+let key = MC.cache_key(context, "/virtual/answer.sapp", source);
+let miss = MC.load(context, key);
+if miss.hit or context.misses != 1 { fail("initial miss accounting"); }
+let stored = MC.store(context, key, compiled.chunk);
+if not stored.ok or stored.reused or context.stores != 1 { fail("initial store"); }
+let hit = MC.load(context, key);
+if not hit.hit or context.hits != 1 { fail("verified cache hit"); }
+let executed = VM.run_seeded_bounded(hit.chunk, map{}, map{ max_steps: 100 });
+if executed.globals.answer != 42 { fail("cached bytecode execution"); }
+if key == MC.cache_key(context, "/virtual/answer.sapp", source + " ") { fail("source edit did not invalidate key"); }
+
+let artifact_path = path_join(root, key + ".pbcs");
+let damaged = fs_read_bytes(artifact_path); damaged[0] = 0; fs_write_bytes(artifact_path, damaged);
+let corrupt = MC.load(context, key);
+if corrupt.hit or context.corruptions != 1 { fail("corrupt artifact accepted"); }
+
+// End-to-end frontend integration: first run compiles and stores; second run
+// deserializes verified bytecode; an edit creates a new key and recompiles.
+let integration_root = uniq("integration");
+let module_path = uniq("module") + ".sapp";
+fs_write(module_path, "let VALUE = 41; export VALUE;");
+let main = "let m = import(\"" + module_path + "\"); let answer = m.VALUE + 1;";
+let options = map{
+    module_cache: true, module_cache_root: integration_root,
+    max_source_bytes: 1048576, max_modules: 16, max_steps: 10000
+};
+let cold = FE.frontend_run_bounded(main, options);
+if not cold.ok or cold.globals.answer != 42 { fail("cold integrated run"); }
+if not cold.module_cache.enabled or cold.module_cache.misses != 1 or cold.module_cache.stores != 1 {
+    fail("cold integrated cache accounting");
+}
+let warm = FE.frontend_run_bounded(main, options);
+if not warm.ok or warm.globals.answer != 42 or warm.module_cache.hits != 1 or warm.module_cache.stores != 0 {
+    fail("warm integrated cache hit");
+}
+fs_write(module_path, "let VALUE = 99; export VALUE;");
+let edited = FE.frontend_run_bounded(main, options);
+if not edited.ok or edited.globals.answer != 100 or edited.module_cache.misses != 1 or edited.module_cache.stores != 1 {
+    fail("source invalidation");
+}
+
+cleanup_dir(root); cleanup_dir(integration_root);
+try fs_remove(dep) catch nil; try fs_remove(module_path) catch nil;
+print "module_cache_pass";

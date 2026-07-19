@@ -27,7 +27,7 @@
 - Υπάρχει πλέον μικρό example στο `examples/ai_plugin_minimal/`.
 - Το `examples/ai_plugin_minimal/plugin/` δείχνει το package πλευρά: εκθέτει σταθερό API (`plugin_info`, `capabilities`, `build_request`, `invoke`) χωρίς να δένει τον VM πυρήνα με συγκεκριμένο AI provider.
 - Το `examples/ai_plugin_minimal/app/` δείχνει τον consumer πλευρά: local path dependency σήμερα, αλλά το ίδιο contract μπορεί αργότερα να δημοσιευτεί στο registry.
-- Το example είναι σκόπιμα **stub-first**: το package φτιάχνει normalized request envelope και ο πραγματικός host/FFI bridge μπορεί αργότερα να αναλάβει την εκτέλεση.
+- Το example είναι σκόπιμα **contract-first**: το package φτιάχνει normalized request envelope και ο πραγματικός host/FFI bridge μπορεί αργότερα να αναλάβει την εκτέλεση.
 - Το envelope περιγράφει ρητά schema/version/provider/operation/options/capabilities ώστε το επόμενο `A2` βήμα να μπορεί να συνδέσει host, FFI ή HTTP provider adapter χωρίς να αλλάξει ο VM πυρήνας.
 
 ## HTTP Provider Adapter (A3-alpha)
@@ -56,7 +56,7 @@ print res["choices"][0]["message"]["content"];
 
 ### Current HTTP capability
 
-- **Authorization:** use `stdlib:http.sapp` `post_auth(url, body, token)`. It builds `Authorization: Bearer ...` on top of the lower-level builtin `http_post_auth(url, headers_map, body)`.
+- **Provider auth:** use `stdlib:http.sapp` `post_auth(url, body, token)`. It builds the provider auth header on top of the lower-level builtin `http_post_auth(url, headers_map, body)`.
 - **Streaming:** `get_stream`, `post_stream`, and `post_stream_auth` are SSE-style shims today: they read the full response, split on blank lines, and invoke `on_chunk` for each event-sized chunk. This preserves the public API while leaving true socket-level chunk streaming as future runtime work.
 
 ### Extending to other providers

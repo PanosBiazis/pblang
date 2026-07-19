@@ -33,6 +33,158 @@ fn require_pblang_bin() -> std::path::PathBuf {
     bin
 }
 
+fn run_cli_bounded(args: &[&str], input: Option<&[u8]>) -> std::process::Output {
+    let mut command = Command::new(require_pblang_bin());
+    command
+        .args(args)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn pblang CLI");
+    if let Some(bytes) = input {
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(bytes)
+            .expect("write pblang stdin");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if child.try_wait().expect("poll pblang CLI").is_some() {
+            return child.wait_with_output().expect("collect pblang output");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = child.kill();
+    let output = child
+        .wait_with_output()
+        .expect("collect timed-out pblang output");
+    panic!(
+        "pblang CLI did not terminate after EOF; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn bare_script_path_runs_without_entering_repl() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let script = std::env::temp_dir().join(format!("pblang_bare_{nonce}.sapp"));
+    std::fs::write(&script, "print \"bare-script-ok\";\n").expect("write bare script");
+    let path = script.to_string_lossy().to_string();
+    let output = run_cli_bounded(&[&path], None);
+    let _ = std::fs::remove_file(script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout.trim(), "bare-script-ok");
+    assert!(!stdout.contains("pblang REPL") && !stdout.contains("> "));
+}
+
+#[test]
+fn bare_package_directory_runs_manifest_entry() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let package = std::env::temp_dir().join(format!("pblang_bare_pkg_{nonce}"));
+    std::fs::create_dir_all(package.join("src")).expect("create package source dir");
+    std::fs::write(
+        package.join("pblang.toml"),
+        "[package]\nname = \"bare-pkg\"\nversion = \"0.1.0\"\nentry = \"src/main.sapp\"\n",
+    )
+    .expect("write package manifest");
+    std::fs::write(
+        package.join("src/main.sapp"),
+        "print \"bare-package-ok\";\n",
+    )
+    .expect("write package entry");
+    let path = package.to_string_lossy().to_string();
+    let output = run_cli_bounded(&[&path], None);
+    let _ = std::fs::remove_dir_all(package);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "bare-package-ok"
+    );
+}
+
+#[test]
+fn capability_flag_can_precede_bare_script_path() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let script = std::env::temp_dir().join(format!("pblang_bare_caps_{nonce}.sapp"));
+    std::fs::write(&script, "print \"bare-caps-ok\";\n").expect("write bare script");
+    let path = script.to_string_lossy().to_string();
+    let output = run_cli_bounded(&["--sandbox", &path], None);
+    let _ = std::fs::remove_file(script);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "bare-caps-ok"
+    );
+}
+
+#[test]
+fn repl_exits_cleanly_when_stdin_is_closed() {
+    let output = run_cli_bounded(&[], None);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "closed non-TTY stdin must not emit prompts"
+    );
+}
+
+#[test]
+fn piped_repl_executes_then_exits_without_prompts() {
+    let output = run_cli_bounded(&[], Some(b"print \"pipe-ok\";\n"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout.trim(), "pipe-ok");
+    assert!(!stdout.contains("pblang REPL") && !stdout.contains("> "));
+}
+
+#[test]
+fn unknown_command_fails_without_entering_repl() {
+    let output = run_cli_bounded(&["rn"], None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("unrecognized command"), "stderr={stderr}");
+    assert!(!stdout.contains("pblang REPL") && !stdout.contains("> "));
+}
+
 #[test]
 fn version_flag_prints_package_version() {
     let bin = require_pblang_bin();

@@ -1,0 +1,199 @@
+// Verified, content-addressed cache for PBLang-generated x86-64 ELF artifacts.
+// Cache hits are incremental builds, never substitutes for cold-compile metrics.
+
+let FORMAT = "pblang.native.x64-cache.v2";
+let MAX_SOURCE_BYTES = 16777216;
+let MAX_DEPENDENCIES = 32;
+let MAX_DEPENDENCY_BYTES = 16777216;
+let MAX_TOTAL_KEY_BYTES = 67108864;
+let MAX_ARTIFACT_BYTES = 67108864;
+let MAX_META_BYTES = 8192;
+
+fn _utf8_len(value) { return len(str_to_bytes(value)); }
+
+fn _safe_digest(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < 64 {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _le(bytes, offset, count) {
+    let value = 0; let scale = 1; let i = 0;
+    while i < count { value = value + bytes[offset + i] * scale; scale = scale * 256; i = i + 1; }
+    return value;
+}
+
+fn valid_x64_elf(bytes) {
+    if type(bytes) != "array" or len(bytes) < 121 or len(bytes) > MAX_ARTIFACT_BYTES { return false; }
+    if bytes[0] != 127 or bytes[1] != 69 or bytes[2] != 76 or bytes[3] != 70 { return false; }
+    if bytes[4] != 2 or bytes[5] != 1 or bytes[6] != 1 { return false; }
+    if _le(bytes, 16, 2) != 2 or _le(bytes, 18, 2) != 62 or _le(bytes, 20, 4) != 1 { return false; }
+    if _le(bytes, 32, 8) != 64 or _le(bytes, 52, 2) != 64 or _le(bytes, 54, 2) != 56 or _le(bytes, 56, 2) != 1 { return false; }
+    if _le(bytes, 64, 4) != 1 or _le(bytes, 68, 4) != 5 or _le(bytes, 72, 8) != 0 { return false; }
+    let size = len(bytes);
+    if _le(bytes, 96, 8) != size or _le(bytes, 104, 8) != size or _le(bytes, 112, 8) != 4096 { return false; }
+    let entry = _le(bytes, 24, 8);
+    return entry >= 4194304 + 120 and entry < 4194304 + size;
+}
+
+fn artifact_digest(bytes) {
+    if not valid_x64_elf(bytes) { throw "artifact_cache: invalid x86-64 ELF"; }
+    return sha256(base64_encode_bytes(bytes));
+}
+
+fn dependency_fingerprint(dependency_paths) {
+    if type(dependency_paths) != "array" or len(dependency_paths) > MAX_DEPENDENCIES {
+        throw "artifact_cache: invalid dependency list";
+    }
+    let material = FORMAT + "\ndependencies:" + str(len(dependency_paths));
+    let total = 0;
+    let i = 0;
+    while i < len(dependency_paths) {
+        let path = dependency_paths[i];
+        if type(path) != "string" or len(path) == 0 or len(path) > 4096 { throw "artifact_cache: invalid dependency path"; }
+        let content = try fs_read(path) catch nil;
+        if type(content) != "string" { throw "artifact_cache: cannot read dependency " + path; }
+        let n = _utf8_len(content);
+        if n > MAX_DEPENDENCY_BYTES { throw "artifact_cache: dependency limit exceeded"; }
+        total = total + n;
+        if total > MAX_TOTAL_KEY_BYTES { throw "artifact_cache: total fingerprint limit exceeded"; }
+        material = material + "\ndep:" + str(_utf8_len(path)) + ":" + path + ":" + str(n) + ":" + sha256(content);
+        i = i + 1;
+    }
+    return sha256(material);
+}
+
+fn cache_key_with_fingerprint(source, fingerprint, profile = "safe") {
+    if type(source) != "string" { throw "artifact_cache: source must be text"; }
+    let source_bytes = _utf8_len(source);
+    if source_bytes > MAX_SOURCE_BYTES { throw "artifact_cache: source limit exceeded"; }
+    if not _safe_digest(fingerprint) { throw "artifact_cache: invalid dependency fingerprint"; }
+    if type(profile) != "string" or len(profile) == 0 or len(profile) > 128 { throw "artifact_cache: invalid profile"; }
+    return sha256(FORMAT + "\nprofile:" + str(_utf8_len(profile)) + ":" + profile
+        + "\ndependencies:" + fingerprint
+        + "\nsource:" + str(source_bytes) + ":" + source);
+}
+
+fn cache_key(source, dependency_paths, profile = "safe") {
+    return cache_key_with_fingerprint(source, dependency_fingerprint(dependency_paths), profile);
+}
+
+fn default_root() {
+    let override = try env_get("PBLANG_NATIVE_CACHE") catch nil;
+    if type(override) == "string" and override != "" { return override; }
+    let home = try env_get("HOME") catch nil;
+    if type(home) != "string" or home == "" { home = try env_get("USERPROFILE") catch nil; }
+    if type(home) == "string" and home != "" { return path_join(home, ".pblang", "cache", "native-x64-v2"); }
+    let temp = try env_get("TMPDIR") catch nil;
+    if type(temp) != "string" or temp == "" { temp = try env_get("TEMP") catch nil; }
+    if type(temp) != "string" or temp == "" { temp = "/tmp"; }
+    return path_join(temp, "pblang-cache", "native-x64-v2");
+}
+
+fn _paths(root, key) {
+    if type(root) != "string" or root == "" or len(root) > 4096 { throw "artifact_cache: invalid root"; }
+    if not _safe_digest(key) { throw "artifact_cache: invalid key"; }
+    return map{ binary: path_join(root, key + ".elf"), meta: path_join(root, key + ".json") };
+}
+
+fn _nonce() { return str_slice(sha256(str(now_ms()) + ":" + str(random_bytes(16))), 0, 24); }
+
+fn _replace(staged, final_path) {
+    if try { fs_rename(staged, final_path); true } catch false { return true; }
+    let backup = final_path + ".bak-" + _nonce();
+    let moved = false;
+    if try fs_exists(final_path) catch false {
+        moved = try { fs_rename(final_path, backup); true } catch false;
+        if not moved { return false; }
+    }
+    let installed = try { fs_rename(staged, final_path); true } catch false;
+    if not installed {
+        if moved { try fs_rename(backup, final_path) catch nil; }
+        return false;
+    }
+    if moved { try fs_remove(backup) catch nil; }
+    return true;
+}
+
+fn load(root, key) {
+    let paths = _paths(root, key);
+    let raw_meta = try fs_read(paths.meta) catch nil;
+    if type(raw_meta) != "string" or len(raw_meta) == 0 or _utf8_len(raw_meta) > MAX_META_BYTES {
+        return map{ hit: false, reason: "metadata-miss" };
+    }
+    let meta = try json_parse(raw_meta) catch nil;
+    if type(meta) != "map" or (try meta.format catch nil) != FORMAT or (try meta.cache_key catch nil) != key {
+        return map{ hit: false, reason: "metadata-invalid" };
+    }
+    let expected_len = try meta.byte_len catch nil;
+    let expected_digest = try meta.artifact_sha256 catch nil;
+    if type(expected_len) != "number" or expected_len < 121 or expected_len > MAX_ARTIFACT_BYTES
+        or expected_len != num_floor(expected_len) or not _safe_digest(expected_digest) {
+        return map{ hit: false, reason: "metadata-invalid" };
+    }
+    let bytes = try fs_read_bytes(paths.binary) catch nil;
+    if type(bytes) != "array" or len(bytes) != expected_len or not valid_x64_elf(bytes) {
+        return map{ hit: false, reason: "artifact-invalid" };
+    }
+    if artifact_digest(bytes) != expected_digest { return map{ hit: false, reason: "digest-mismatch" }; }
+    return map{ hit: true, binary: bytes, byte_len: expected_len, artifact_sha256: expected_digest };
+}
+
+fn store(root, key, bytes) {
+    let paths = _paths(root, key);
+    if not valid_x64_elf(bytes) { return map{ ok: false, error: "invalid x86-64 ELF" }; }
+    let existing = load(root, key);
+    if existing.hit { return map{ ok: true, reused: true, artifact_sha256: existing.artifact_sha256 }; }
+    let made = try { fs_mkdirs(root); true } catch false;
+    if not made { return map{ ok: false, error: "cache directory creation failed" }; }
+
+    let digest = artifact_digest(bytes);
+    let meta = json_stringify(map{ format: FORMAT, cache_key: key, byte_len: len(bytes), artifact_sha256: digest });
+    let nonce = _nonce();
+    let staged_bin = paths.binary + ".tmp-" + nonce;
+    let staged_meta = paths.meta + ".tmp-" + nonce;
+    let wrote_bin = try { fs_write_bytes(staged_bin, bytes); true } catch false;
+    let wrote_meta = wrote_bin and (try { fs_write(staged_meta, meta); true } catch false);
+    if not wrote_meta {
+        try fs_remove(staged_bin) catch nil; try fs_remove(staged_meta) catch nil;
+        return map{ ok: false, error: "cache stage write failed" };
+    }
+    let staged = try fs_read_bytes(staged_bin) catch nil;
+    if type(staged) != "array" or len(staged) != len(bytes) or not valid_x64_elf(staged) or artifact_digest(staged) != digest {
+        try fs_remove(staged_bin) catch nil; try fs_remove(staged_meta) catch nil;
+        return map{ ok: false, error: "cache stage verification failed" };
+    }
+    if not _replace(staged_bin, paths.binary) {
+        try fs_remove(staged_bin) catch nil; try fs_remove(staged_meta) catch nil;
+        return map{ ok: false, error: "cache artifact publish failed" };
+    }
+    if not _replace(staged_meta, paths.meta) {
+        try fs_remove(staged_meta) catch nil;
+        return map{ ok: false, error: "cache metadata publish failed" };
+    }
+    return map{ ok: true, reused: false, artifact_sha256: digest };
+}
+
+fn publish(output_path, bytes) {
+    if type(output_path) != "string" or output_path == "" or len(output_path) > 4096 { return map{ ok: false, error: "invalid output path" }; }
+    if not valid_x64_elf(bytes) { return map{ ok: false, error: "invalid x86-64 ELF" }; }
+    let parent = path_dirname(output_path);
+    if parent != "" and not (try { fs_mkdirs(parent); true } catch false) { return map{ ok: false, error: "output directory creation failed" }; }
+    let staged = output_path + ".tmp-" + _nonce();
+    if not (try { fs_write_bytes(staged, bytes); true } catch false) { return map{ ok: false, error: "output stage write failed" }; }
+    let check = try fs_read_bytes(staged) catch nil;
+    if type(check) != "array" or len(check) != len(bytes) or not valid_x64_elf(check) {
+        try fs_remove(staged) catch nil;
+        return map{ ok: false, error: "output stage verification failed" };
+    }
+    if not _replace(staged, output_path) { try fs_remove(staged) catch nil; return map{ ok: false, error: "output publish failed" }; }
+    return map{ ok: true, byte_len: len(bytes) };
+}
+
+export FORMAT, dependency_fingerprint, cache_key_with_fingerprint, cache_key;
+export default_root, valid_x64_elf, artifact_digest, load, store, publish;

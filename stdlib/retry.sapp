@@ -9,29 +9,73 @@
 //   if r.ok { use(r.value); } else { /* gave up after r.attempts tries */ }
 //   let v = retry.run_or(fn() { return risky(); }, map{ attempts: 3 }, fallback);
 
+let RESILIENCE = import("stdlib:resilience.sapp");
+let TIME = import("stdlib:time.sapp");
+
 fn _opt(o, k, d) {
     if o == nil { return d; }
     if not map_has(o, k) { return d; }
     return o[k];
 }
 
-// run(thunk, opts) — opts: { attempts=3, delay_ms=0, backoff=1 (multiplier) }.
-// Returns { ok, value, attempts } on success, or { ok:false, attempts } if exhausted.
+// plan(opts) converts the compatibility options into the shared bounded policy.
+// attempts<=100, delay<=60s, multiplier<=16, max delay<=300s, timeout<=1h.
+fn plan(opts = nil) {
+    let attempts = _opt(opts, "attempts", 3);
+    return RESILIENCE.policy("retry", map{
+        max_attempts: attempts,
+        base_delay_ms: _opt(opts, "delay_ms", 0),
+        multiplier: _opt(opts, "backoff", 1),
+        max_delay_ms: _opt(opts, "max_delay_ms", 30000),
+        timeout_ms: _opt(opts, "timeout_ms", 30000),
+        failure_threshold: attempts,
+        recovery_ms: _opt(opts, "recovery_ms", 30000),
+        jitter_percent: _opt(opts, "jitter_percent", 0)
+    });
+}
+
+// schedule(opts) exposes the exact bounded delays without running or sleeping.
+fn schedule(opts = nil) {
+    let p = plan(opts);
+    let out = [];
+    let i = 1;
+    while i < p.max_attempts {
+        array_push(out, RESILIENCE.backoff_ms(p, i, i));
+        i = i + 1;
+    }
+    return map{ format: "pblang.retry.schedule.v1", policy: p, delays_ms: out };
+}
+
+// run(thunk, opts) — backwards-compatible retry execution backed by the shared
+// resilience state machine. The deadline is cooperative: it is checked before
+// every attempt; an individual thunk still needs its own pre-emptive I/O timeout.
 fn run(thunk, opts) {
-    let max = _opt(opts, "attempts", 3);
-    let delay = _opt(opts, "delay_ms", 0);
-    let backoff = _opt(opts, "backoff", 1);
-    let attempt = 0;
-    let cur = delay;
-    while attempt < max {
-        attempt = attempt + 1;
+    let p = plan(opts);
+    let state = RESILIENCE.initial(p, TIME.now_ms());
+    while not state.completed {
+        let now = TIME.now_ms();
+        let begin = RESILIENCE.begin_attempt(p, state, now);
+        if not begin.accepted {
+            return map{ format: "pblang.retry.result.v1", ok: false, attempts: state.attempts, status: begin.decision.reason, policy: p };
+        }
+        state = begin.state;
         // map{v: ...} sentinel: a throw yields nil from catch, which the success wrapper
         // (always a map) can never equal — so a thunk returning nil still counts as ok.
         let wrapped = try map{ v: thunk() } catch nil;
-        if wrapped != nil { return map{ ok: true, value: wrapped.v, attempts: attempt }; }
-        if attempt < max and cur > 0 { sleep_ms(cur); cur = cur * backoff; }
+        if wrapped != nil {
+            state = RESILIENCE.record_success(state, TIME.now_ms());
+            return map{ format: "pblang.retry.result.v1", ok: true, value: wrapped.v, attempts: state.attempts, status: state.status, policy: p };
+        }
+        state = RESILIENCE.record_failure(p, state, TIME.now_ms(), "runtime error", true, state.attempts);
+        if state.completed {
+            return map{ format: "pblang.retry.result.v1", ok: false, attempts: state.attempts, status: state.status, policy: p };
+        }
+        let wait = state.next_attempt_ms - TIME.now_ms();
+        let remaining = (state.started_ms + p.timeout_ms) - TIME.now_ms();
+        if wait > remaining { wait = remaining; }
+        if wait > 0 { sleep_ms(wait); }
     }
-    return map{ ok: false, attempts: attempt };
+    return map{ format: "pblang.retry.result.v1", ok: false, attempts: state.attempts, status: state.status, policy: p };
 }
 
 // run_or(thunk, opts, default) — the value on success, else `default`.
@@ -44,4 +88,4 @@ fn run_or(thunk, opts, default) {
 // times(thunk, n) — shorthand for run with n attempts and no delay.
 fn times(thunk, n) { return run(thunk, map{ attempts: n }); }
 
-export run, run_or, times;
+export plan, schedule, run, run_or, times;

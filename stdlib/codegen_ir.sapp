@@ -98,9 +98,12 @@ fn _run(ir, st) {
         else if op == "addi" { regs[_vreg(ins[1])] = regs[_vreg(ins[1])] + ins[2]; }
         else if op == "movr" { regs[_vreg(ins[1])] = regs[_vreg(ins[2])]; }
         else if op == "pushr" { array_push(st.stack, regs[_vreg(ins[1])]); }
-        else if op == "popr" { let n = len(st.stack); regs[_vreg(ins[1])] = st.stack[n - 1]; st.stack[n - 1] = 0; st.stack = _drop_last(st.stack); }
-        else if op == "lset" { st.locals[ins[1]] = regs[0]; }
-        else if op == "lget" { regs[0] = (try st.locals[ins[1]] catch 0); }
+        else if op == "popr" {
+            if len(st.stack) == 0 { throw "codegen_ir: stack underflow"; }
+            regs[_vreg(ins[1])] = array_pop(st.stack);
+        }
+        else if op == "lset" { st.locals[str(ins[1])] = regs[0]; }
+        else if op == "lget" { regs[0] = (try st.locals[str(ins[1])] catch 0); }
         else if op == "loop" {
             let c = _vreg(ins[1]);
             while regs[c] != 0 { _run(ins[2], st); regs[c] = regs[c] - 1; }
@@ -113,23 +116,108 @@ fn _run(ir, st) {
     }
     return st;
 }
-fn _drop_last(a) {
-    let out = [];
-    let i = 0;
-    while i < len(a) - 1 { array_push(out, a[i]); i = i + 1; }
-    return out;
-}
 fn eval(ir) {
+    assert_valid(ir);
     let st = map{ regs: [0, 0, 0, 0], stack: [], locals: map{} };
     _run(ir, st);
     return st.regs[0];
 }
 
+// Bounded reference execution is the safe oracle for IDE previews, emulators,
+// benchmarks, and untrusted/generated IR. Limits are deterministic and apply
+// before the operation that would exceed them.
+fn _positive_limit(value, fallback, name) {
+    if value == nil { return fallback; }
+    if not is_number(value) or value < 1 or value != num_floor(value) {
+        throw "codegen_ir: " + name + " must be a positive integer";
+    }
+    return value;
+}
+fn _bounded_step(st) {
+    if st.steps >= st.max_steps { throw "codegen_ir: execution step limit exceeded"; }
+    st.steps = st.steps + 1;
+}
+fn _run_bounded(ir, st) {
+    let regs = st.regs; let i = 0;
+    while i < len(ir) {
+        _bounded_step(st);
+        let ins = ir[i]; let op = ins[0];
+        if op == "seti" { regs[_vreg(ins[1])] = ins[2]; }
+        elif op == "add" { regs[_vreg(ins[1])] = regs[_vreg(ins[1])] + regs[_vreg(ins[2])]; }
+        elif op == "sub" { regs[_vreg(ins[1])] = regs[_vreg(ins[1])] - regs[_vreg(ins[2])]; }
+        elif op == "mul" { regs[_vreg(ins[1])] = regs[_vreg(ins[1])] * regs[_vreg(ins[2])]; }
+        elif op == "addi" { regs[_vreg(ins[1])] = regs[_vreg(ins[1])] + ins[2]; }
+        elif op == "movr" { regs[_vreg(ins[1])] = regs[_vreg(ins[2])]; }
+        elif op == "pushr" {
+            if len(st.stack) >= st.max_stack { throw "codegen_ir: stack limit exceeded"; }
+            array_push(st.stack, regs[_vreg(ins[1])]);
+            if len(st.stack) > st.peak_stack { st.peak_stack = len(st.stack); }
+        } elif op == "popr" {
+            if len(st.stack) == 0 { throw "codegen_ir: stack underflow"; }
+            regs[_vreg(ins[1])] = array_pop(st.stack);
+        } elif op == "lset" {
+            let key = str(ins[1]);
+            if not map_has(st.locals, key) and len(map_keys(st.locals)) >= st.max_locals {
+                throw "codegen_ir: locals limit exceeded";
+            }
+            st.locals[key] = regs[0];
+        } elif op == "lget" {
+            regs[0] = (try st.locals[str(ins[1])] catch 0);
+        } elif op == "loop" {
+            let c = _vreg(ins[1]);
+            while regs[c] != 0 {
+                _run_bounded(ins[2], st);
+                _bounded_step(st); // account for the implicit counter update
+                regs[c] = regs[c] - 1;
+            }
+        } elif op == "ifnz" {
+            if regs[_vreg(ins[1])] != 0 { _run_bounded(ins[2], st); }
+            else { _run_bounded(ins[3], st); }
+        } else {
+            throw "codegen_ir: bounded evaluator does not permit op: " + str(op);
+        }
+        i = i + 1;
+    }
+    return st;
+}
+fn eval_bounded(ir, options = nil) {
+    assert_valid(ir);
+    if options == nil { options = map{}; }
+    let max_steps = _positive_limit(try options.max_steps catch nil, 1000000, "max_steps");
+    let max_stack = _positive_limit(try options.max_stack catch nil, 4096, "max_stack");
+    let max_locals = _positive_limit(try options.max_locals catch nil, 65536, "max_locals");
+    let st = map{
+        regs: [0, 0, 0, 0], stack: [], locals: map{}, steps: 0,
+        peak_stack: 0, max_steps: max_steps, max_stack: max_stack, max_locals: max_locals
+    };
+    _run_bounded(ir, st);
+    return map{
+        value: st.regs[0], steps: st.steps, peak_stack: st.peak_stack,
+        locals: len(map_keys(st.locals))
+    };
+}
+
 // _has_loop(ir) — any loop at the top level? (loops are containers, so this detects whether
 // the program has data-dependent control flow that can't be constant-folded wholesale.)
-fn _has_loop(ir) {
+fn _has_nonfoldable(ir) {
     let i = 0;
-    while i < len(ir) { if ir[i][0] == "loop" { return true; } i = i + 1; }
+    while i < len(ir) {
+        let op = ir[i][0];
+        if op == "loop" or op == "syscall" { return true; }
+        if op == "ifnz" and (_has_nonfoldable(ir[i][2]) or _has_nonfoldable(ir[i][3])) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _needs_const_prop(ir) {
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i]; let op = ins[0];
+        if op == "ifnz" or op == "movr" { return true; }
+        if op == "loop" and _needs_const_prop(ins[2]) { return true; }
+        i = i + 1;
+    }
     return false;
 }
 
@@ -138,25 +226,105 @@ fn _has_loop(ir) {
 // LOOP-FREE program can be fully evaluated at compile time and collapsed to a single
 // `seti r0, <result>` — the strongest possible fold. Programs with loops are preserved
 // (folding them would require proving termination/iteration counts; conservative = correct).
-fn optimize(ir) {
-    if _has_loop(ir) { return peephole(ir); }   // can't fold past data-dependent loops; clean up
-    return [["seti", 0, eval(ir)]];              // loop-free ⇒ fully constant ⇒ one instruction
+fn _instruction_count(ir) {
+    let total = 0; let i = 0;
+    while i < len(ir) {
+        total = total + 1;
+        if ir[i][0] == "loop" { total = total + _instruction_count(ir[i][2]); }
+        elif ir[i][0] == "ifnz" { total = total + _instruction_count(ir[i][2]) + _instruction_count(ir[i][3]); }
+        i = i + 1;
+    }
+    return total;
+}
+fn instruction_count(ir) { assert_valid(ir); return _instruction_count(ir); }
+
+fn _optimize_stages(ir) {
+    assert_valid(ir);
+    let before = _instruction_count(ir);
+    if not _has_nonfoldable(ir) {
+        let value = eval(ir);
+        if _imm_ok(value) {
+            let folded = [["seti", 0, value]];
+            return map{
+                ir: folded, mode: "whole-program-constant-fold",
+                before: before, peephole: before, constants: 1, dead_stores: 1, after: 1
+            };
+        }
+    }
+    let peeped = _peep(ir);
+    let propagated = _const_prop_block(peeped, map{}).ir;
+    let dead = _dead_store_program(propagated);
+    let final_ir = _peep(dead);
+    return map{
+        ir: final_ir, mode: "structured",
+        before: before, peephole: _instruction_count(peeped),
+        constants: _instruction_count(propagated), dead_stores: _instruction_count(dead),
+        after: _instruction_count(final_ir)
+    };
+}
+fn optimize(ir) { return _optimize_stages(ir).ir; }
+fn optimize_report(ir) {
+    let r = _optimize_stages(ir);
+    return map{
+        ir: r.ir, mode: r.mode, before: r.before, peephole: r.peephole,
+        constants: r.constants, dead_stores: r.dead_stores, after: r.after,
+        peephole_removed: r.before - r.peephole,
+        constant_removed: r.peephole - r.constants,
+        dead_store_removed: r.constants - r.dead_stores,
+        cleanup_removed: r.dead_stores - r.after,
+        removed: r.before - r.after
+    };
 }
 
-// peephole(ir) — local cleanups that are always safe: drop no-op `addi r,0`. Recurses into
-// loop/ifnz bodies. (More peepholes — identity mul/add, dead stores — can slot in here.)
+fn _tree_equal(a, b) {
+    if is_array(a) {
+        if not is_array(b) or len(a) != len(b) { return false; }
+        let i = 0;
+        while i < len(a) {
+            if not _tree_equal(a[i], b[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if is_array(b) { return false; }
+    return a == b;
+}
+
+// peephole(ir) — local cleanups that are always safe. Besides scalar no-ops,
+// identical branches collapse to their common body: reading the condition has
+// no side effect, so this is valid even when the condition is not constant.
 fn _peep(ir) {
     let out = [];
     let i = 0;
     while i < len(ir) {
         let ins = ir[i];
         let op = ins[0];
-        if op == "addi" and ins[2] == 0 {
+        let next = nil;
+        if i + 1 < len(ir) { next = ir[i + 1]; }
+        if op == "seti" and next != nil and next[0] == "addi"
+           and ins[1] == next[1] and ins[2] + next[2] <= 2147483647 {
+            array_push(out, ["seti", ins[1], ins[2] + next[2]]);
+            i = i + 1;
+        } else if op == "seti" and next != nil and next[0] == "ifnz" and ins[1] == next[1] {
+            array_push(out, ins);
+            let branch = if ins[2] != 0 { _peep(next[2]) } else { _peep(next[3]) };
+            let bi = 0;
+            while bi < len(branch) { array_push(out, branch[bi]); bi = bi + 1; }
+            i = i + 1;
+        } else if op == "addi" and ins[2] == 0 {
             // no-op: skip
+        } else if op == "movr" and ins[1] == ins[2] {
+            // self-copy: skip
         } else if op == "loop" {
             array_push(out, ["loop", ins[1], _peep(ins[2])]);
         } else if op == "ifnz" {
-            array_push(out, ["ifnz", ins[1], _peep(ins[2]), _peep(ins[3])]);
+            let yes = _peep(ins[2]); let no = _peep(ins[3]);
+            if _tree_equal(yes, no) {
+                let bi = 0;
+                while bi < len(yes) { array_push(out, yes[bi]); bi = bi + 1; }
+            } else {
+                array_push(out, ["ifnz", ins[1], yes, no]);
+            }
         } else {
             array_push(out, ins);
         }
@@ -164,7 +332,227 @@ fn _peep(ir) {
     }
     return out;
 }
-fn peephole(ir) { return _peep(ir); }
+fn peephole(ir) { assert_valid(ir); return _peep(ir); }
+
+// Conservative forward constants for branch selection across basic-block
+// instructions. No initial register value is assumed. Arithmetic other than a
+// bounded addi invalidates its destination; loops invalidate every register
+// they may write; syscalls invalidate r0.
+fn _known_copy(src) {
+    let out = map{}; let ks = map_keys(src); let i = 0;
+    while i < len(ks) { out[ks[i]] = src[ks[i]]; i = i + 1; }
+    return out;
+}
+fn _known_remove(known, r) { map_remove(known, str(r)); }
+fn _written_regs(ir, out) {
+    let i = 0;
+    while i < len(ir) {
+        let ins = ir[i]; let op = ins[0];
+        if op == "seti" or op == "addi" or op == "movr" or op == "popr" { out[str(ins[1])] = true; }
+        elif op == "add" or op == "sub" or op == "mul" { out[str(ins[1])] = true; }
+        elif op == "lget" or op == "syscall" { out["0"] = true; }
+        elif op == "ifnz" { _written_regs(ins[2], out); _written_regs(ins[3], out); }
+        elif op == "loop" { out[str(ins[1])] = true; _written_regs(ins[2], out); }
+        i = i + 1;
+    }
+}
+fn _const_prop_block(ir, incoming) {
+    let known = _known_copy(incoming); let out = []; let i = 0;
+    while i < len(ir) {
+        let ins = ir[i]; let op = ins[0];
+        if op == "seti" {
+            known[str(ins[1])] = ins[2]; array_push(out, ins);
+        } elif op == "movr" {
+            if map_has(known, str(ins[2])) {
+                known[str(ins[1])] = known[str(ins[2])];
+                // Materialize the known value at the destination. Structured
+                // DSE can then remove an otherwise-dead source definition.
+                array_push(out, ["seti", ins[1], known[str(ins[2])]]);
+            } else {
+                _known_remove(known, ins[1]); array_push(out, ins);
+            }
+        } elif op == "addi" {
+            let key = str(ins[1]);
+            if map_has(known, key) and known[key] + ins[2] <= 2147483647 {
+                known[key] = known[key] + ins[2];
+                array_push(out, ["seti", ins[1], known[key]]);
+            } else {
+                _known_remove(known, ins[1]); array_push(out, ins);
+            }
+        } elif op == "add" or op == "sub" or op == "mul" {
+            let dst = str(ins[1]); let src = str(ins[2]); let folded = 0; let can_fold = false;
+            let dst_known = map_has(known, dst); let src_known = map_has(known, src);
+            let eliminated = false; let rewritten = false;
+            // Algebraic identities preserve an unknown destination and avoid
+            // emitting work on every backend. Zero/one are tracked across the
+            // block, so these also apply when the constants are non-adjacent.
+            if src_known and known[src] == 0 and (op == "add" or op == "sub") {
+                eliminated = true;
+            } elif op == "mul" and src_known and known[src] == 1 {
+                eliminated = true;
+            } elif op == "mul" and dst_known and known[dst] == 0 {
+                eliminated = true;
+            } elif op == "mul" and src_known and known[src] == 0 {
+                known[dst] = 0; array_push(out, ["seti", ins[1], 0]); rewritten = true;
+            } elif op == "add" and dst_known and known[dst] == 0 and not src_known {
+                _known_remove(known, ins[1]); array_push(out, ["movr", ins[1], ins[2]]); rewritten = true;
+            } elif op == "mul" and dst_known and known[dst] == 1 and not src_known {
+                _known_remove(known, ins[1]); array_push(out, ["movr", ins[1], ins[2]]); rewritten = true;
+            } elif op == "sub" and ins[1] == ins[2] { folded = 0; can_fold = true; }
+            elif map_has(known, dst) and map_has(known, src) {
+                if op == "add" { folded = known[dst] + known[src]; }
+                elif op == "sub" { folded = known[dst] - known[src]; }
+                else { folded = known[dst] * known[src]; }
+                can_fold = true;
+            }
+            if eliminated or rewritten {
+                // State and output were already preserved above.
+            } elif can_fold and _imm_ok(folded) {
+                known[dst] = folded; array_push(out, ["seti", ins[1], folded]);
+            } else {
+                _known_remove(known, ins[1]); array_push(out, ins);
+            }
+        } elif op == "popr" {
+            _known_remove(known, ins[1]); array_push(out, ins);
+        } elif op == "lget" {
+            _known_remove(known, 0); array_push(out, ins);
+        } elif op == "syscall" {
+            _known_remove(known, 0); array_push(out, ins);
+        } elif op == "ifnz" {
+            let key = str(ins[1]);
+            if map_has(known, key) {
+                let chosen = if known[key] != 0 { ins[2] } else { ins[3] };
+                let branch = _const_prop_block(chosen, known);
+                let bi = 0; while bi < len(branch.ir) { array_push(out, branch.ir[bi]); bi = bi + 1; }
+                known = branch.known;
+            } else {
+                let yes = _const_prop_block(ins[2], known); let no = _const_prop_block(ins[3], known);
+                array_push(out, ["ifnz", ins[1], yes.ir, no.ir]);
+                let joined = map{}; let r = 0;
+                while r < 4 {
+                    let rk = str(r);
+                    if map_has(yes.known, rk) and map_has(no.known, rk) and yes.known[rk] == no.known[rk] { joined[rk] = yes.known[rk]; }
+                    r = r + 1;
+                }
+                known = joined;
+            }
+        } elif op == "loop" {
+            let counter = str(ins[1]);
+            if map_has(known, counter) and known[counter] == 0 {
+                // A zero-entry loop has no writes and leaves the counter known zero.
+            } else {
+                let writes = map{}; _written_regs(ins[2], writes); writes[counter] = true;
+                // Constants for registers untouched by the loop are true loop
+                // invariants. Passing only those values into the body exposes
+                // zero/one identities without assuming an iteration count.
+                let invariants = map{}; let known_keys = map_keys(known); let ki = 0;
+                while ki < len(known_keys) {
+                    let invariant_key = known_keys[ki];
+                    if not map_has(writes, invariant_key) { invariants[invariant_key] = known[invariant_key]; }
+                    ki = ki + 1;
+                }
+                let body = _const_prop_block(ins[2], invariants);
+                array_push(out, ["loop", ins[1], body.ir]);
+                let ks = map_keys(writes); let wi = 0;
+                while wi < len(ks) { map_remove(known, ks[wi]); wi = wi + 1; }
+            }
+        } else {
+            array_push(out, ins);
+        }
+        i = i + 1;
+    }
+    return map{ ir: out, known: known };
+}
+
+// ── structured dead-store elimination ─────────────────────────────────────────────
+// Liveness is a four-key map because this IR deliberately has only r0..r3.
+// Only side-effect-free seti/movr writes are removable. Branches union their
+// incoming sets; loop bodies iterate to a fixed point so loop-carried values
+// stay live; syscalls keep every argument register and overwrite r0.
+fn _live_copy(src) {
+    let out = map{}; let ks = map_keys(src); let i = 0;
+    while i < len(ks) { out[ks[i]] = true; i = i + 1; }
+    return out;
+}
+fn _live_add(live, r) { live[str(r)] = true; }
+fn _live_remove(live, r) { map_remove(live, str(r)); }
+fn _live_has(live, r) { return map_has(live, str(r)); }
+fn _live_union_into(dst, src) {
+    let ks = map_keys(src); let i = 0;
+    while i < len(ks) { dst[ks[i]] = true; i = i + 1; }
+}
+fn _live_equal(a, b) {
+    let ak = map_keys(a); let bk = map_keys(b);
+    if len(ak) != len(bk) { return false; }
+    let i = 0; while i < len(ak) { if not map_has(b, ak[i]) { return false; } i = i + 1; }
+    return true;
+}
+fn _reverse(items) {
+    let out = []; let i = len(items) - 1;
+    while i >= 0 { array_push(out, items[i]); i = i - 1; }
+    return out;
+}
+
+fn _dse_block(ir, live_out) {
+    let live = _live_copy(live_out);
+    let rev = [];
+    let i = len(ir) - 1;
+    while i >= 0 {
+        let ins = ir[i]; let op = ins[0]; let keep = true; let rewritten = ins;
+        if op == "seti" {
+            if not _live_has(live, ins[1]) { keep = false; }
+            else { _live_remove(live, ins[1]); }
+        } else if op == "movr" {
+            if not _live_has(live, ins[1]) { keep = false; }
+            else { _live_remove(live, ins[1]); _live_add(live, ins[2]); }
+        } else if op == "add" or op == "sub" or op == "mul" {
+            // Pure register arithmetic has no externally visible effect. If the
+            // destination is dead, neither operand is live because of this
+            // instruction; otherwise model the read-before-write dependency.
+            if not _live_has(live, ins[1]) { keep = false; }
+            else { _live_remove(live, ins[1]); _live_add(live, ins[1]); _live_add(live, ins[2]); }
+        } else if op == "addi" {
+            if not _live_has(live, ins[1]) { keep = false; }
+            else { _live_add(live, ins[1]); }
+        } else if op == "pushr" {
+            _live_add(live, ins[1]);
+        } else if op == "popr" {
+            _live_remove(live, ins[1]);
+        } else if op == "lset" {
+            _live_add(live, 0);
+        } else if op == "lget" {
+            _live_remove(live, 0);
+        } else if op == "syscall" {
+            _live_remove(live, 0);
+            let ai = 0; while ai < len(ins[2]) { _live_add(live, ins[2][ai]); ai = ai + 1; }
+        } else if op == "ifnz" {
+            let yes = _dse_block(ins[2], live);
+            let no = _dse_block(ins[3], live);
+            let incoming = _live_copy(yes.live_in); _live_union_into(incoming, no.live_in); _live_add(incoming, ins[1]);
+            live = incoming;
+            rewritten = ["ifnz", ins[1], yes.ir, no.ir];
+        } else if op == "loop" {
+            let seed = _live_copy(live); _live_add(seed, ins[1]);
+            let body = map{ ir: ins[2], live_in: seed };
+            let rounds = 0;
+            while rounds < 5 {
+                body = _dse_block(ins[2], seed);
+                let next = _live_copy(live); _live_union_into(next, body.live_in); _live_add(next, ins[1]);
+                if _live_equal(next, seed) { seed = next; break; }
+                seed = next; rounds = rounds + 1;
+            }
+            live = seed;
+            rewritten = ["loop", ins[1], body.ir];
+        }
+        if keep { array_push(rev, rewritten); }
+        i = i - 1;
+    }
+    return map{ ir: _reverse(rev), live_in: live };
+}
+fn _dead_store_program(ir) {
+    let live = map{}; _live_add(live, 0);
+    return _dse_block(ir, live).ir;
+}
 
 // ── portable C backend ───────────────────────────────────────────────────────────────
 fn _emit_c_body(ir, indent) {
@@ -178,6 +566,7 @@ fn _emit_c_body(ir, indent) {
         else if op == "add" { s = s + "r" + str(_vreg(ins[1])) + " += r" + str(_vreg(ins[2])) + ";\n"; }
         else if op == "sub" { s = s + "r" + str(_vreg(ins[1])) + " -= r" + str(_vreg(ins[2])) + ";\n"; }
         else if op == "mul" { s = s + "r" + str(_vreg(ins[1])) + " *= r" + str(_vreg(ins[2])) + ";\n"; }
+        else if op == "movr" { s = s + "r" + str(_vreg(ins[1])) + " = r" + str(_vreg(ins[2])) + ";\n"; }
         else if op == "addi" { s = s + "r" + str(_vreg(ins[1])) + " += " + str(ins[2]) + ";\n"; }
         else if op == "loop" {
             s = s + "while (r" + str(_vreg(ins[1])) + ") {\n";
@@ -198,6 +587,7 @@ fn _emit_c_body(ir, indent) {
     return s;
 }
 fn emit_c(ir) {
+    assert_valid(ir);
     let s = "#include <stdio.h>\n";
     s = s + "int main(void) {\n";
     s = s + "  long r0 = 0, r1 = 0, r2 = 0, r3 = 0;\n";
@@ -229,4 +619,5 @@ fn targets() {
     ];
 }
 
-export eval, optimize, emit_c, targets, validate, assert_valid;
+export eval, eval_bounded, optimize, optimize_report, instruction_count;
+export emit_c, targets, validate, assert_valid;

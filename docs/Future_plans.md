@@ -4514,8 +4514,9 @@ read+assign, try/catch, host builtins, module globals, `??`/`?.`/`?[`, `match`,
    and Update 19 closed the last non-grammar leftover — the `strcharcodeat`
    char-indexing alignment. The string API is now uniformly codepoint-based.
    Next self-host frontier is breadth/perf, not grammar: run a real stdlib module
-   through `frontend_run` and diff vs. the Rust VM, and speed up the self-hosted
-   parser enough to drop the `#[ignore]` on the full-parser drift test.
+   through `frontend_run` and diff vs. the Rust VM. The former full-parser perf
+   gate is resolved by direct AST construction plus a default-on pblang drift
+   test; interpreter execution throughput is now the primary perf frontier.
 2. Self-host a real tool through `frontend_run` (e.g. run a small `.sapp`
    program that today only the Rust VM runs) and diff output against the Rust VM.
 3. **Bootstrap probe:** feed `frontend_compile`'s *own* source through

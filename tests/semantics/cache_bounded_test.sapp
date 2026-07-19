@@ -1,0 +1,112 @@
+// Bounded cache: hard entry/unit quotas, stable FIFO eviction, nil values,
+// fixed-time accounting, and safe handling of hostile numeric inputs.
+let C = import("stdlib:cache.sapp");
+
+fn eq(actual, expected, message) {
+    if actual != expected {
+        throw "FAIL " + message + " got=" + str(actual) + " want=" + str(expected);
+    }
+}
+
+let cache = C.bounded(0, 3, 5);
+C.set_sized(cache, "a", "A", 2);
+C.set_sized(cache, "b", "B", 2);
+eq(C.size(cache), 2, "constant-time entry count");
+eq(C.stats(cache).units, 4, "caller-defined unit accounting");
+
+// Oversized values are rejected without damaging current entries.
+eq(C.try_set_sized(cache, "huge", "H", 6), false, "oversized value rejected");
+eq(C.get(cache, "a"), "A", "failed admission is atomic");
+
+// Adding two units requires FIFO eviction of a, leaving b and c.
+C.set_sized(cache, "c", "C", 2);
+eq(C.has(cache, "a"), false, "oldest entry evicted for unit quota");
+eq(C.get(cache, "b"), "B", "newer entry retained");
+eq(C.get(cache, "c"), "C", "new entry admitted");
+eq(C.stats(cache).evictions, 1, "eviction metric");
+
+// Delete/reinsert receives a fresh generation; stale queue records cannot
+// evict the replacement out of FIFO order.
+C.delete(cache, "b");
+C.set_sized(cache, "b", "B2", 1);
+C.set_sized(cache, "d", "D", 3);
+eq(C.get(cache, "c"), nil, "generation-safe FIFO order");
+eq(C.get(cache, "b"), "B2", "reinserted value survives stale record");
+
+// nil is a real cached value, distinguishable through get_entry.
+C.set(cache, "nil", nil);
+let nil_entry = C.get_entry(cache, "nil");
+eq(nil_entry.found, true, "nil entry remains present");
+eq(nil_entry.value, nil, "nil entry value");
+
+// Non-finite TTLs become permanent instead of creating invalid deadlines.
+C.set_ttl(cache, "safe-ttl", 7, "Infinity");
+eq(map_has(cache.__expiry, "safe-ttl"), false, "non-finite ttl is permanent");
+
+let before_reset = C.stats(cache);
+if before_reset.hits < 1 or before_reset.misses < 1 { throw "FAIL lookup metrics"; }
+C.reset_stats(cache);
+let after_reset = C.stats(cache);
+eq(after_reset.hits, 0, "hit metric reset");
+eq(after_reset.misses, 0, "miss metric reset");
+eq(C.size(cache) > 0, true, "metric reset keeps values");
+
+// Delete/reinsert churn must not retain an unbounded stale FIFO queue.
+let churn = C.bounded(0, 4, 4);
+let churn_i = 0;
+while churn_i < 3000 {
+    let key = "slot-" + str(churn_i % 4);
+    C.delete(churn, key);
+    C.set(churn, key, churn_i);
+    churn_i = churn_i + 1;
+}
+if len(churn.__order) > C.size(churn) * 2 + 1024 {
+    throw "FAIL stale FIFO records were not compacted";
+}
+
+// LRU is opt-in: reading a makes it newer than b, so c evicts b. has/peek do
+// not mutate recency, which keeps probes and diagnostics deterministic.
+let lru = C.bounded_policy(0, 2, 0, "lru");
+C.set(lru, "a", 1);
+C.set(lru, "b", 2);
+eq(C.get(lru, "a"), 1, "LRU access returns value");
+C.set(lru, "c", 3);
+eq(C.has(lru, "a"), true, "recent LRU entry retained");
+eq(C.has(lru, "b"), false, "least recently used entry evicted");
+eq(C.get(lru, "c"), 3, "new LRU entry retained");
+eq(C.stats(lru).policy, "lru", "LRU policy reported");
+
+let probe = C.bounded_policy(0, 2, 0, "lru");
+C.set(probe, "old", 1); C.set(probe, "new", 2);
+eq(C.peek(probe, "old"), 1, "peek reads without lookup metrics");
+eq(C.has(probe, "old"), true, "has reads without recency mutation");
+C.set(probe, "third", 3);
+eq(C.has(probe, "old"), false, "peek and has do not refresh LRU");
+
+let live_keys = C.keys(lru);
+eq(len(live_keys), 2, "keys returns live bounded entries");
+let saw_a = false; let saw_c = false; let key_i = 0;
+while key_i < len(live_keys) {
+    if live_keys[key_i] == "a" { saw_a = true; }
+    if live_keys[key_i] == "c" { saw_c = true; }
+    key_i = key_i + 1;
+}
+if not (saw_a and saw_c) {
+    throw "FAIL live keys content";
+}
+
+let bad_policy = try { C.bounded_policy(0, 1, 0, "random"); false } catch true;
+eq(bad_policy, true, "unknown eviction policy rejected");
+
+let lru_churn = C.bounded_policy(0, 4, 0, "lru");
+churn_i = 0;
+while churn_i < 20000 {
+    C.set(lru_churn, "slot-" + str(churn_i % 4), churn_i);
+    C.get(lru_churn, "slot-" + str((churn_i + 1) % 4));
+    churn_i = churn_i + 1;
+}
+if len(lru_churn.__order) > C.size(lru_churn) * 2 + 1024 {
+    throw "FAIL LRU queue exceeded stale-record watermark";
+}
+
+print "cache_bounded_pass";

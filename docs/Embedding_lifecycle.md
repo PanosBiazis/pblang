@@ -84,7 +84,7 @@ pub struct RuntimeError {
 Embedders should render `message`, then `stack` for diagnostics. `Span`
 carries `start`/`end` byte offsets into the *original source* of the
 frame that errored, which is also reachable via the topmost
-`FrameTrace`'s source name. Don't `.unwrap()` `vm.run()` in production
+`FrameTrace`'s source name. Do not discard the `vm.run()` error in production
 embeddings — every script error is recoverable.
 
 A few capability errors have stable text the host can pattern-match:
@@ -186,8 +186,8 @@ Most-overridden methods:
    a stale handle ID will fail with `invalid handle` on use — fine for
    debugging, less fine in production where you wanted a clean error
    earlier.
-4. **Set `VmLimits` before exposing untrusted code.** No limits = an
-   infinite loop in the script will pin the host thread until the
+4. **Set `VmLimits` before exposing untrusted code.** Without limits, a
+   non-terminating script can occupy the host thread until the
    process is killed.
 5. **Set an `FfiPolicy` if you grant `ffi: true`** to untrusted code.
    Without a policy, the allowlist defaults to "allow all" once the

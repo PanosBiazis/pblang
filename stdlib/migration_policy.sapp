@@ -1,0 +1,408 @@
+// stdlib/migration_policy.sapp -- deterministic PBLang-only migration gate.
+//
+// The module is pure: callers provide a bounded change manifest. It does not
+// invoke git, a shell, or a host-language helper. New Rust and added lines in
+// existing Rust files are always rejected. Other foreign-code boundaries need
+// an exact-path, expiring exception with ownership, verification, and a removal
+// plan. Legacy implementations may be retired only after recorded parity and
+// regression evidence.
+
+let POLICY_FORMAT = "pblang.migration.policy.v1";
+let MANIFEST_FORMAT = "pblang.migration.change_manifest.v1";
+let MIGRATION_FORMAT = "pblang.migration.record.v1";
+let MAX_CHANGES = 10000;
+let MAX_EXCEPTIONS = 1000;
+let MAX_MIGRATIONS = 2000;
+let MAX_PATH_BYTES = 512;
+
+fn _text(value) { return str(value ?? ""); }
+fn _lower(value) { return str_lower(_text(value)); }
+
+fn _field(row, name, fallback) {
+    if type(row) != "map" { return fallback; }
+    return try row[name] catch fallback;
+}
+
+fn _push_error(errors, code, message) {
+    array_push(errors, map{ code: code, message: message });
+}
+
+fn _contains_any(text, needles) {
+    let i = 0;
+    while i < len(needles) {
+        if str_contains(text, needles[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _one_of(value, choices) {
+    let i = 0;
+    while i < len(choices) {
+        if value == choices[i] { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _normalized_path(path) {
+    if type(path) != "string" or len(path) == 0 or len(path) > MAX_PATH_BYTES { return nil; }
+    if str_trim(path) != path { return nil; }
+    if str_starts_with(path, "/") or str_starts_with(path, "\\") { return nil; }
+    if len(path) >= 2 and str_slice(path, 1, 2) == ":" { return nil; }
+    if str_index_of(path, "\x00") >= 0 or str_contains(path, "\n") or str_contains(path, "\r") { return nil; }
+    let normalized = str_replace_all(path, "\\", "/");
+    while str_starts_with(normalized, "./") {
+        normalized = str_slice(normalized, 2, len(normalized));
+    }
+    if normalized == "" or str_ends_with(normalized, "/") or str_contains(normalized, "//") { return nil; }
+    let parts = str_split(normalized, "/");
+    let i = 0;
+    while i < len(parts) {
+        if parts[i] == "" or parts[i] == "." or parts[i] == ".." { return nil; }
+        i = i + 1;
+    }
+    return normalized;
+}
+
+fn _extension(path) {
+    let p = _lower(path);
+    let i = len(p) - 1;
+    while i >= 0 {
+        let ch = str_slice(p, i, i + 1);
+        if ch == "." { return str_slice(p, i, len(p)); }
+        if ch == "/" { return ""; }
+        i = i - 1;
+    }
+    return "";
+}
+
+fn classify_path(path) {
+    let normalized = _normalized_path(path);
+    if normalized == nil { return "invalid"; }
+    let p = _lower(normalized);
+    let ext = _extension(p);
+    if ext == ".sapp" or ext == ".sap" or ext == ".bpx" { return "pblang"; }
+    if ext == ".rs" { return "rust-legacy"; }
+    if _one_of(ext, [
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".asm", ".s",
+        ".py", ".pyx", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+        ".go", ".zig", ".java", ".kt", ".kts", ".cs", ".swift", ".m",
+        ".mm", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+        ".html", ".htm", ".css", ".scss", ".sass", ".less", ".vue", ".svelte"
+    ]) { return "foreign-code"; }
+    if _one_of(ext, [
+        ".md", ".rst", ".adoc", ".txt", ".json", ".toml", ".yaml", ".yml",
+        ".xml", ".csv", ".tsv", ".lock", ".ini", ".cfg", ".conf",
+        ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+        ".wav", ".mp3", ".ogg", ".mp4", ".woff", ".woff2", ".ttf", ".otf"
+    ]) { return "data-or-docs"; }
+    if p == "license" or p == "copying" or p == "notice" or str_ends_with(p, "/license") { return "data-or-docs"; }
+    return "unknown";
+}
+
+fn _is_count(value) {
+    return type(value) == "number" and value >= 0 and value <= 100000000 and value % 1 == 0;
+}
+
+fn _is_date(value) {
+    if type(value) != "string" or len(value) != 10 { return false; }
+    if str_slice(value, 4, 5) != "-" or str_slice(value, 7, 8) != "-" { return false; }
+    let y = try parse_number(str_slice(value, 0, 4)) catch nil;
+    let m = try parse_number(str_slice(value, 5, 7)) catch nil;
+    let d = try parse_number(str_slice(value, 8, 10)) catch nil;
+    if y == nil or m == nil or d == nil { return false; }
+    return y >= 2000 and y <= 9999 and m >= 1 and m <= 12 and d >= 1 and d <= 31;
+}
+
+fn _date_key(value) {
+    if not _is_date(value) { return nil; }
+    let y = parse_number(str_slice(value, 0, 4));
+    let m = parse_number(str_slice(value, 5, 7));
+    let d = parse_number(str_slice(value, 8, 10));
+    return y * 10000 + m * 100 + d;
+}
+
+fn _nonempty_array(value) { return type(value) == "array" and len(value) > 0; }
+
+fn _valid_string_array(value, max_items) {
+    if type(value) != "array" or len(value) == 0 or len(value) > max_items { return false; }
+    let i = 0;
+    while i < len(value) {
+        if type(value[i]) != "string" or len(str_trim(value[i])) < 3 or len(value[i]) > 512 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn validate_exception(exception, today = "") {
+    let errors = [];
+    if type(exception) != "map" {
+        _push_error(errors, "exception.type", "exception must be a map");
+        return map{ valid: false, errors: errors, path: "" };
+    }
+    let id = _text(_field(exception, "id", ""));
+    let raw_path = _field(exception, "path", nil);
+    let path = _normalized_path(raw_path);
+    let kind = _text(_field(exception, "kind", ""));
+    let status = _text(_field(exception, "status", ""));
+    let reason = str_trim(_text(_field(exception, "reason", "")));
+    let owner = str_trim(_text(_field(exception, "owner", "")));
+    let removal = str_trim(_text(_field(exception, "removal_plan", "")));
+    let review_by = _text(_field(exception, "review_by", ""));
+    let added_limit = _field(exception, "max_added_lines", nil);
+    let verification = _field(exception, "verification", nil);
+
+    if len(id) < 3 or len(id) > 96 { _push_error(errors, "exception.id", "id must contain 3..96 characters"); }
+    if path == nil { _push_error(errors, "exception.path", "path must be a canonical relative path"); }
+    elif _contains_any(path, ["*", "?", "[", "]", "{"]) { _push_error(errors, "exception.path_wildcard", "exception path must be exact and cannot contain wildcards"); }
+    if path != nil and classify_path(path) == "rust-legacy" { _push_error(errors, "exception.rust_forbidden", "Rust additions cannot be excepted"); }
+    if not _one_of(kind, ["bootstrap", "system-api", "abi-shim", "generated-artifact"]) {
+        _push_error(errors, "exception.kind", "kind must be bootstrap, system-api, abi-shim, or generated-artifact");
+    }
+    if status != "active" { _push_error(errors, "exception.status", "status must be active"); }
+    if len(reason) < 12 or len(reason) > 1000 { _push_error(errors, "exception.reason", "reason must contain 12..1000 characters"); }
+    if len(owner) < 2 or len(owner) > 120 { _push_error(errors, "exception.owner", "owner must contain 2..120 characters"); }
+    if len(removal) < 12 or len(removal) > 2000 { _push_error(errors, "exception.removal_plan", "removal_plan must contain 12..2000 characters"); }
+    if not _is_date(review_by) { _push_error(errors, "exception.review_by", "review_by must be YYYY-MM-DD"); }
+    if not _is_count(added_limit) or added_limit < 1 { _push_error(errors, "exception.max_added_lines", "max_added_lines must be a positive bounded integer"); }
+    if not _valid_string_array(verification, 64) { _push_error(errors, "exception.verification", "verification must contain 1..64 non-empty checks"); }
+    if today != "" {
+        if not _is_date(today) { _push_error(errors, "policy.today", "today must be YYYY-MM-DD"); }
+        elif _is_date(review_by) and _date_key(review_by) < _date_key(today) { _push_error(errors, "exception.expired", "exception review date has expired"); }
+    }
+    return map{ valid: len(errors) == 0, errors: errors, id: id, path: path ?? "", kind: kind };
+}
+
+fn validate_migration(record) {
+    let errors = [];
+    if type(record) != "map" {
+        _push_error(errors, "migration.type", "migration record must be a map");
+        return map{ valid: false, errors: errors };
+    }
+    let id = _text(_field(record, "id", ""));
+    let legacy_path = _normalized_path(_field(record, "legacy_path", nil));
+    let pblang_path = _normalized_path(_field(record, "pblang_path", nil));
+    let stage = _text(_field(record, "stage", ""));
+    let fallback = _field(record, "fallback_retained", nil);
+    let removed = _field(record, "legacy_removed", false);
+    let verified_before_retirement = _field(record, "verified_before_retirement", false);
+    let behavior = _field(record, "behavior_tests", nil);
+    let regressions = _field(record, "regression_tests", nil);
+    let evidence = str_trim(_text(_field(record, "parity_evidence", "")));
+
+    if _field(record, "format", "") != MIGRATION_FORMAT { _push_error(errors, "migration.format", "migration format must be " + MIGRATION_FORMAT); }
+    if len(id) < 3 or len(id) > 96 { _push_error(errors, "migration.id", "id must contain 3..96 characters"); }
+    if legacy_path == nil { _push_error(errors, "migration.legacy_path", "legacy_path must be canonical and relative"); }
+    elif classify_path(legacy_path) != "rust-legacy" and classify_path(legacy_path) != "foreign-code" {
+        _push_error(errors, "migration.legacy_kind", "legacy_path must identify host or foreign implementation code");
+    }
+    if pblang_path == nil or classify_path(pblang_path ?? "") != "pblang" { _push_error(errors, "migration.pblang_path", "pblang_path must identify PBLang source"); }
+    if stage != "reference" and stage != "parity" and stage != "verified" and stage != "retired" {
+        _push_error(errors, "migration.stage", "stage must be reference, parity, verified, or retired");
+    }
+    if stage == "reference" {
+        if fallback != true or removed == true { _push_error(errors, "migration.reference_fallback", "reference stage must retain the legacy implementation"); }
+    }
+    if stage == "parity" or stage == "verified" or stage == "retired" {
+        if not _valid_string_array(behavior, 256) { _push_error(errors, "migration.behavior_tests", "parity and later stages require behavior tests"); }
+    }
+    if stage == "parity" {
+        if fallback != true or removed == true { _push_error(errors, "migration.parity_fallback", "parity stage must retain the legacy implementation"); }
+    }
+    if stage == "verified" or stage == "retired" {
+        if not _valid_string_array(regressions, 256) { _push_error(errors, "migration.regression_tests", "verified and retired stages require regression tests"); }
+        if len(evidence) < 8 or len(evidence) > 2000 { _push_error(errors, "migration.parity_evidence", "verified and retired stages require parity evidence"); }
+    }
+    if stage == "verified" {
+        if fallback != true or removed == true { _push_error(errors, "migration.verified_fallback", "verified stage must retain the legacy implementation until retirement"); }
+    }
+    if stage == "retired" {
+        if removed != true or fallback != false or verified_before_retirement != true {
+            _push_error(errors, "migration.retirement_order", "retirement requires prior verification, legacy removal, and no retained fallback");
+        }
+    }
+    return map{ valid: len(errors) == 0, errors: errors, id: id, stage: stage };
+}
+
+fn retirement_ready(record) {
+    let checked = validate_migration(record);
+    return checked.valid and _field(record, "stage", "") == "verified" and
+        _field(record, "fallback_retained", false) == true and
+        _field(record, "legacy_removed", false) != true;
+}
+
+fn _violation(code, path, message, index = 0) {
+    return map{
+        format: "pblang.migration.violation.v1",
+        severity: "high", code: code, path: path, index: index, message: message
+    };
+}
+
+fn _add_validation_violations(out, prefix, path, index, checked) {
+    let i = 0;
+    while i < len(checked.errors) {
+        array_push(out, _violation(prefix + "." + checked.errors[i].code, path, checked.errors[i].message, index));
+        i = i + 1;
+    }
+}
+
+fn _validate_change(change, index) {
+    let errors = [];
+    if type(change) != "map" {
+        _push_error(errors, "change.type", "change must be a map");
+        return map{ valid: false, errors: errors, path: "", category: "invalid" };
+    }
+    let path = _normalized_path(_field(change, "path", nil));
+    let action = _text(_field(change, "change", ""));
+    let added = _field(change, "added_lines", nil);
+    let removed = _field(change, "removed_lines", nil);
+    if path == nil { _push_error(errors, "change.path", "path must be a canonical relative path"); }
+    if action != "added" and action != "modified" and action != "deleted" {
+        _push_error(errors, "change.action", "change must be added, modified, or deleted");
+    }
+    if not _is_count(added) { _push_error(errors, "change.added_lines", "added_lines must be a bounded non-negative integer"); }
+    if not _is_count(removed) { _push_error(errors, "change.removed_lines", "removed_lines must be a bounded non-negative integer"); }
+    if action == "added" and _is_count(removed) and removed != 0 { _push_error(errors, "change.added_removed", "an added file cannot report removed lines"); }
+    if action == "deleted" and _is_count(added) and added != 0 { _push_error(errors, "change.deleted_added", "a deleted file cannot report added lines"); }
+    let category = if path == nil { "invalid" } else { classify_path(path) };
+    return map{ valid: len(errors) == 0, errors: errors, path: path ?? "", category: category, index: index };
+}
+
+fn evaluate_manifest(manifest) {
+    let violations = [];
+    let warnings = [];
+    let counts = map{ pblang: 0, rust_legacy: 0, foreign_code: 0, data_or_docs: 0, unknown: 0, deletions: 0 };
+    if type(manifest) != "map" {
+        array_push(violations, _violation("manifest.type", "", "manifest must be a map"));
+        return map{ format: POLICY_FORMAT, passed: false, violations: violations, warnings: warnings, counts: counts };
+    }
+    if _field(manifest, "format", "") != MANIFEST_FORMAT {
+        array_push(violations, _violation("manifest.format", "", "manifest format must be " + MANIFEST_FORMAT));
+    }
+    let today = _text(_field(manifest, "today", ""));
+    if not _is_date(today) { array_push(violations, _violation("manifest.today", "", "manifest today must be YYYY-MM-DD")); }
+    let changes = _field(manifest, "changes", nil);
+    let exceptions = _field(manifest, "exceptions", []);
+    let migrations = _field(manifest, "migrations", []);
+    if type(changes) != "array" { array_push(violations, _violation("manifest.changes", "", "changes must be an array")); changes = []; }
+    if type(exceptions) != "array" { array_push(violations, _violation("manifest.exceptions", "", "exceptions must be an array")); exceptions = []; }
+    if type(migrations) != "array" { array_push(violations, _violation("manifest.migrations", "", "migrations must be an array")); migrations = []; }
+    if len(changes) > MAX_CHANGES { array_push(violations, _violation("manifest.change_limit", "", "change count exceeds " + str(MAX_CHANGES))); }
+    if len(exceptions) > MAX_EXCEPTIONS { array_push(violations, _violation("manifest.exception_limit", "", "exception count exceeds " + str(MAX_EXCEPTIONS))); }
+    if len(migrations) > MAX_MIGRATIONS { array_push(violations, _violation("manifest.migration_limit", "", "migration count exceeds " + str(MAX_MIGRATIONS))); }
+
+    let exception_by_path = map{};
+    let exception_used = map{};
+    let exception_ids = map{};
+    let ei = 0;
+    while ei < len(exceptions) and ei < MAX_EXCEPTIONS {
+        let checked = validate_exception(exceptions[ei], today);
+        let path = checked.path;
+        if not checked.valid { _add_validation_violations(violations, "exception", path, ei, checked); }
+        if checked.id != "" and (try exception_ids[checked.id] catch false) {
+            array_push(violations, _violation("exception.duplicate_id", path, "exception id must be unique", ei));
+        } else if checked.id != "" { exception_ids[checked.id] = true; }
+        if path != "" and (try exception_by_path[path] catch nil) != nil {
+            array_push(violations, _violation("exception.duplicate_path", path, "only one active exception may target a path", ei));
+        } else if checked.valid {
+            exception_by_path[path] = exceptions[ei];
+            exception_used[path] = false;
+        }
+        ei = ei + 1;
+    }
+
+    let ci = 0;
+    while ci < len(changes) and ci < MAX_CHANGES {
+        let checked = _validate_change(changes[ci], ci);
+        let path = checked.path;
+        if not checked.valid {
+            _add_validation_violations(violations, "manifest", path, ci, checked);
+            ci = ci + 1;
+            continue;
+        }
+        let action = _field(changes[ci], "change", "");
+        let added = _field(changes[ci], "added_lines", 0);
+        let category = checked.category;
+        if category == "pblang" { counts.pblang = counts.pblang + 1; }
+        elif category == "rust-legacy" { counts.rust_legacy = counts.rust_legacy + 1; }
+        elif category == "foreign-code" { counts.foreign_code = counts.foreign_code + 1; }
+        elif category == "data-or-docs" { counts.data_or_docs = counts.data_or_docs + 1; }
+        else { counts.unknown = counts.unknown + 1; }
+        if action == "deleted" { counts.deletions = counts.deletions + 1; }
+
+        if category == "rust-legacy" and (action == "added" or added > 0) {
+            array_push(violations, _violation("rust.addition_forbidden", path, "new Rust files and added Rust lines are forbidden", ci));
+        } else if (category == "foreign-code" or category == "unknown") and action != "deleted" and added > 0 {
+            let exception = try exception_by_path[path] catch nil;
+            if exception == nil {
+                array_push(violations, _violation("foreign.exception_required", path, "foreign or unknown code additions require an exact active exception", ci));
+            } else if added > _field(exception, "max_added_lines", 0) {
+                array_push(violations, _violation("foreign.line_limit", path, "added lines exceed the exception limit", ci));
+            } else {
+                exception_used[path] = true;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    let mi = 0;
+    let migration_ids = map{};
+    while mi < len(migrations) and mi < MAX_MIGRATIONS {
+        let checked = validate_migration(migrations[mi]);
+        let path = _text(_field(migrations[mi], "legacy_path", ""));
+        if not checked.valid { _add_validation_violations(violations, "migration", path, mi, checked); }
+        if checked.id != "" and (try migration_ids[checked.id] catch false) {
+            array_push(violations, _violation("migration.duplicate_id", path, "migration id must be unique", mi));
+        } else if checked.id != "" { migration_ids[checked.id] = true; }
+        mi = mi + 1;
+    }
+
+    ei = 0;
+    while ei < len(exceptions) and ei < MAX_EXCEPTIONS {
+        let path = _normalized_path(_field(exceptions[ei], "path", nil));
+        if path != nil and (try exception_by_path[path] catch nil) != nil and (try exception_used[path] catch false) != true {
+            array_push(warnings, map{ code: "exception.unused", path: path, message: "active exception was not used by this manifest" });
+        }
+        ei = ei + 1;
+    }
+
+    return map{
+        format: POLICY_FORMAT,
+        manifest_format: MANIFEST_FORMAT,
+        passed: len(violations) == 0,
+        change_count: len(changes), exception_count: len(exceptions), migration_count: len(migrations),
+        violation_count: len(violations), warning_count: len(warnings),
+        violations: violations, warnings: warnings, counts: counts,
+        policy: "new Rust and added Rust lines are forbidden; other foreign additions require exact expiring exceptions; legacy retirement requires verified parity"
+    };
+}
+
+fn report_lines(report, limit = 24) {
+    if limit == nil or limit < 4 { limit = 4; }
+    if limit > 200 { limit = 200; }
+    let status = "BLOCKED";
+    if _field(report, "passed", false) { status = "PASS"; }
+    let lines = [
+        "PBLang-only migration gate: " + status,
+        "changes=" + str(_field(report, "change_count", 0)) + " exceptions=" + str(_field(report, "exception_count", 0)) + " migrations=" + str(_field(report, "migration_count", 0)),
+        "violations=" + str(_field(report, "violation_count", 0)) + " warnings=" + str(_field(report, "warning_count", 0))
+    ];
+    let violations = _field(report, "violations", []);
+    let i = 0;
+    while i < len(violations) and len(lines) < limit {
+        array_push(lines, "- BLOCK " + violations[i].code + " " + violations[i].path + ": " + violations[i].message);
+        i = i + 1;
+    }
+    let warnings = _field(report, "warnings", []);
+    i = 0;
+    while i < len(warnings) and len(lines) < limit {
+        array_push(lines, "- REVIEW " + warnings[i].code + " " + warnings[i].path);
+        i = i + 1;
+    }
+    return lines;
+}
+
+export POLICY_FORMAT, MANIFEST_FORMAT, MIGRATION_FORMAT,
+       classify_path, validate_exception, validate_migration, retirement_ready,
+       evaluate_manifest, report_lines;

@@ -9,9 +9,8 @@
 //   * macOS/Mach-O — FORMAT-verified (valid mach_header_64 + LC_SEGMENT_64 + LC_UNIXTHREAD,
 //                    correct x86_64 exit syscall). NOT executed here; modern macOS also
 //                    REQUIRES CODE-SIGNING, so a hand-built binary needs signing to run.
-//   * Windows/PE  — FORMAT-verified (valid MZ/PE32+ headers). NOT executed here; a runnable
-//                    PE needs an IMPORT TABLE (kernel32!ExitProcess) — this is the header
-//                    scaffold the imports would attach to.
+//   * Windows/PE  — FORMAT- and IMPORT-verified for i386 PE32 and x86-64 PE32+;
+//                    both carry a real kernel32!ExitProcess import table. NOT executed here.
 //
 //   let c = import("stdlib/codegen_cross.sapp");
 //   fs_write_bytes("app",     c.build("linux",   "x86_64", ir));
@@ -84,31 +83,138 @@ fn macho64_exec(code) {
 fn _setle(arr, off, bytes) { let i = 0; while i < len(bytes) { arr[off + i] = bytes[i]; i = i + 1; } return arr; }
 fn _round_to(n, a) { return num_floor((n + a - 1) / a) * a; }
 
+// ── PE32 (Windows, i386) ─────────────────────────────────────────────────────────────
+// PE32 differs structurally from PE32+: 32-bit image/stack fields, a BaseOfData
+// field, 4-byte import thunks, and IMAGE_FILE_32BIT_MACHINE in the COFF header.
+fn _pe32_headers(code_len, data_len, entry_rva, idt_rva, idt_size, iat_rva, iat_size) {
+    let TEXT_RVA = 0x1000; let DATA_RVA = 0x2000; let FILE_ALIGN = 0x200;
+    let text_raw = _round_to(code_len, FILE_ALIGN); let data_raw = _round_to(data_len, FILE_ALIGN);
+    let out = [];
+    _app(out, [0x4D, 0x5A]); _app(out, _zeros(0x3C - 2)); _app(out, X.le32(0x40));
+    _app(out, [0x50, 0x45, 0, 0]);
+    _app(out, X.le16(0x014C)); _app(out, X.le16(2)); _app(out, X.le32(0)); _app(out, X.le32(0));
+    _app(out, X.le32(0)); _app(out, X.le16(224)); _app(out, X.le16(0x0102));
+    let opt = _zeros(224);
+    _setle(opt, 0, X.le16(0x10B)); _setle(opt, 4, X.le32(text_raw));
+    _setle(opt, 8, X.le32(data_raw)); _setle(opt, 16, X.le32(entry_rva));
+    _setle(opt, 20, X.le32(TEXT_RVA)); _setle(opt, 24, X.le32(DATA_RVA));
+    _setle(opt, 28, X.le32(0x00400000));
+    _setle(opt, 32, X.le32(0x1000)); _setle(opt, 36, X.le32(FILE_ALIGN));
+    _setle(opt, 40, X.le16(5)); _setle(opt, 42, X.le16(1));
+    _setle(opt, 48, X.le16(5)); _setle(opt, 50, X.le16(1));
+    _setle(opt, 56, X.le32(DATA_RVA + _round_to(data_len, 0x1000)));
+    _setle(opt, 60, X.le32(0x200)); _setle(opt, 68, X.le16(3));
+    _setle(opt, 72, X.le32(0x100000)); _setle(opt, 76, X.le32(0x1000));
+    _setle(opt, 80, X.le32(0x100000)); _setle(opt, 84, X.le32(0x1000));
+    _setle(opt, 92, X.le32(16));
+    _setle(opt, 104, X.le32(idt_rva)); _setle(opt, 108, X.le32(idt_size));
+    _setle(opt, 192, X.le32(iat_rva)); _setle(opt, 196, X.le32(iat_size));
+    _app(out, opt);
+    let text = _zeros(40); _setle(text, 0, str_to_bytes(".text"));
+    _setle(text, 8, X.le32(code_len)); _setle(text, 12, X.le32(TEXT_RVA));
+    _setle(text, 16, X.le32(text_raw)); _setle(text, 20, X.le32(0x200));
+    _setle(text, 36, X.le32(0x60000020));
+    _app(out, text);
+    let data = _zeros(40); _setle(data, 0, str_to_bytes(".idata"));
+    _setle(data, 8, X.le32(data_len)); _setle(data, 12, X.le32(DATA_RVA));
+    _setle(data, 16, X.le32(data_raw)); _setle(data, 20, X.le32(0x200 + text_raw));
+    _setle(data, 36, X.le32(0xC0000040));
+    _app(out, data);
+    while len(out) < 0x200 { array_push(out, 0); }
+    return map{ bytes: out, text_raw: text_raw, data_raw: data_raw };
+}
+
+fn pe32_exe(ir) {
+    let IMAGE_BASE = 0x00400000; let TEXT_RVA = 0x1000; let DATA_RVA = 0x2000;
+    let cp = X86.compile_ir(ir); let cplen = len(cp);
+    let off_idt = 0; let off_ilt = 40; let off_iat = 48; let off_hn = 56; let off_dll = 70;
+    let data_len = 84;
+    let rva_idt = DATA_RVA + off_idt; let rva_ilt = DATA_RVA + off_ilt;
+    let rva_iat = DATA_RVA + off_iat; let rva_hn = DATA_RVA + off_hn;
+    let rva_dll = DATA_RVA + off_dll;
+
+    let code = []; _app(code, cp);
+    array_push(code, 0x50);                              // push eax (ExitProcess uExitCode)
+    _app(code, [0xFF, 0x15]); _app(code, X.le32(IMAGE_BASE + rva_iat));
+
+    let idata = [];
+    _app(idata, X.le32(rva_ilt)); _app(idata, X.le32(0)); _app(idata, X.le32(0));
+    _app(idata, X.le32(rva_dll)); _app(idata, X.le32(rva_iat)); _app(idata, _zeros(20));
+    _app(idata, X.le32(rva_hn)); _app(idata, X.le32(0));
+    _app(idata, X.le32(rva_hn)); _app(idata, X.le32(0));
+    _app(idata, X.le16(0)); _app(idata, str_to_bytes("ExitProcess")); array_push(idata, 0);
+    _app(idata, str_to_bytes("kernel32.dll")); array_push(idata, 0); array_push(idata, 0);
+    if len(idata) != data_len { throw "codegen_cross: PE32 import layout mismatch"; }
+
+    let headers = _pe32_headers(len(code), data_len, TEXT_RVA, rva_idt, 40, rva_iat, 8);
+    let out = headers.bytes; _app(out, code);
+    while len(out) < 0x200 + headers.text_raw { array_push(out, 0); }
+    _app(out, idata);
+    while len(out) < 0x200 + headers.text_raw + headers.data_raw { array_push(out, 0); }
+    return out;
+}
+
+// Two-section PE header: executable code is RX and imports/IAT/data are RW.
+// This enforces W^X while still allowing the Windows loader to bind the IAT.
+fn _pe_headers(code_len, data_len, entry_rva, idt_rva, idt_size, iat_rva, iat_size) {
+    let TEXT_RVA = 0x1000; let DATA_RVA = 0x2000; let FILE_ALIGN = 0x200;
+    let text_raw = _round_to(code_len, FILE_ALIGN); let data_raw = _round_to(data_len, FILE_ALIGN);
+    let out = [];
+    _app(out, [0x4D, 0x5A]); _app(out, _zeros(0x3C - 2)); _app(out, X.le32(0x40));
+    _app(out, [0x50, 0x45, 0, 0]);
+    _app(out, X.le16(0x8664)); _app(out, X.le16(2)); _app(out, X.le32(0)); _app(out, X.le32(0));
+    _app(out, X.le32(0)); _app(out, X.le16(240)); _app(out, X.le16(0x22));
+    let opt = _zeros(240);
+    _setle(opt, 0, X.le16(0x20B)); _setle(opt, 4, X.le32(text_raw));
+    _setle(opt, 8, X.le32(data_raw)); _setle(opt, 16, X.le32(entry_rva));
+    _setle(opt, 20, X.le32(TEXT_RVA)); _setle(opt, 24, X.le64(5368709120));
+    _setle(opt, 32, X.le32(0x1000)); _setle(opt, 36, X.le32(FILE_ALIGN));
+    _setle(opt, 40, X.le16(5)); _setle(opt, 42, X.le16(2));
+    _setle(opt, 48, X.le16(5)); _setle(opt, 50, X.le16(2));
+    _setle(opt, 56, X.le32(DATA_RVA + _round_to(data_len, 0x1000)));
+    _setle(opt, 60, X.le32(0x200)); _setle(opt, 68, X.le16(3));
+    _setle(opt, 72, X.le64(0x100000)); _setle(opt, 80, X.le64(0x1000));
+    _setle(opt, 88, X.le64(0x100000)); _setle(opt, 96, X.le64(0x1000));
+    _setle(opt, 108, X.le32(16));
+    _setle(opt, 120, X.le32(idt_rva)); _setle(opt, 124, X.le32(idt_size));
+    _setle(opt, 208, X.le32(iat_rva)); _setle(opt, 212, X.le32(iat_size));
+    _app(out, opt);
+    let text = _zeros(40); _setle(text, 0, str_to_bytes(".text"));
+    _setle(text, 8, X.le32(code_len)); _setle(text, 12, X.le32(TEXT_RVA));
+    _setle(text, 16, X.le32(text_raw)); _setle(text, 20, X.le32(0x200));
+    _setle(text, 36, X.le32(0x60000020));       // CODE | EXECUTE | READ
+    _app(out, text);
+    let data = _zeros(40); _setle(data, 0, str_to_bytes(".idata"));
+    _setle(data, 8, X.le32(data_len)); _setle(data, 12, X.le32(DATA_RVA));
+    _setle(data, 16, X.le32(data_raw)); _setle(data, 20, X.le32(0x200 + text_raw));
+    _setle(data, 36, X.le32(0xC0000040));       // INITIALIZED_DATA | READ | WRITE
+    _app(out, data);
+    while len(out) < 0x200 { array_push(out, 0); }
+    return map{ bytes: out, text_raw: text_raw, data_raw: data_raw };
+}
+
 // pe64_exe(ir) — a real Windows PE: runs the IR (result in eax) and calls ExitProcess(result)
 // via a proper import table, so it actually exits with the computed value on Windows.
 fn pe64_exe(ir) {
-    let IMAGE_BASE = 5368709120;   // 0x140000000
-    let SECT_RVA = 0x1000;
-    let FILE_ALIGN = 0x200;
-    let SECT_ALIGN = 0x1000;
+    let TEXT_RVA = 0x1000; let DATA_RVA = 0x2000;
 
     // --- code: <ir>; mov ecx, eax; mov rax,[rip+disp]; call rax  (disp -> IAT entry) ---
     let cp = X.compile_ir(ir);
     let cplen = len(cp);
     let code_len = cplen + 2 + 7 + 2;       // +mov ecx,eax(2) +mov rax,[rip](7) +call rax(2)
-    // section layout offsets (from section start)
-    let off_idt = code_len;
+    // Import data occupies a separate non-executable section.
+    let off_idt = 0;
     let off_ilt = off_idt + 40;             // import descriptor + null descriptor
     let off_iat = off_ilt + 16;             // one thunk + null
     let off_hn = off_iat + 16;
     let off_dll = off_hn + 14;              // hint(2)+"ExitProcess\0"(12) = 14
-    let sect_len = off_dll + 14;            // "kernel32.dll\0"(13) padded to 14
-    let rva_idt = SECT_RVA + off_idt;
-    let rva_ilt = SECT_RVA + off_ilt;
-    let rva_iat = SECT_RVA + off_iat;
-    let rva_hn = SECT_RVA + off_hn;
-    let rva_dll = SECT_RVA + off_dll;
-    let rva_after_mov = SECT_RVA + cplen + 9;   // rip after the `mov rax,[rip+disp]`
+    let data_len = off_dll + 14;            // "kernel32.dll\0"(13) padded to 14
+    let rva_idt = DATA_RVA + off_idt;
+    let rva_ilt = DATA_RVA + off_ilt;
+    let rva_iat = DATA_RVA + off_iat;
+    let rva_hn = DATA_RVA + off_hn;
+    let rva_dll = DATA_RVA + off_dll;
+    let rva_after_mov = TEXT_RVA + cplen + 9;   // rip after the `mov rax,[rip+disp]`
     let disp = rva_iat - rva_after_mov;
 
     let code = [];
@@ -117,67 +223,24 @@ fn pe64_exe(ir) {
     _app(code, [0x48, 0x8B, 0x05]); _app(code, X.le32(disp));   // mov rax, [rip+disp] -> &ExitProcess
     _app(code, [0xFF, 0xD0]);               // call rax
 
-    // section data = code + import structures
-    let sect = [];
-    _app(sect, code);
+    let idata = [];
     // IMAGE_IMPORT_DESCRIPTOR + null
-    _app(sect, X.le32(rva_ilt)); _app(sect, X.le32(0)); _app(sect, X.le32(0)); _app(sect, X.le32(rva_dll)); _app(sect, X.le32(rva_iat));
-    _app(sect, _zeros(20));
+    _app(idata, X.le32(rva_ilt)); _app(idata, X.le32(0)); _app(idata, X.le32(0)); _app(idata, X.le32(rva_dll)); _app(idata, X.le32(rva_iat));
+    _app(idata, _zeros(20));
     // ILT: thunk -> hint/name, then null
-    _app(sect, X.le64(rva_hn)); _app(sect, X.le64(0));
+    _app(idata, X.le64(rva_hn)); _app(idata, X.le64(0));
     // IAT: thunk -> hint/name, then null (loader binds this to ExitProcess at load time)
-    _app(sect, X.le64(rva_hn)); _app(sect, X.le64(0));
+    _app(idata, X.le64(rva_hn)); _app(idata, X.le64(0));
     // hint/name: hint(0) + "ExitProcess\0"
-    _app(sect, X.le16(0)); _app(sect, str_to_bytes("ExitProcess")); array_push(sect, 0);
+    _app(idata, X.le16(0)); _app(idata, str_to_bytes("ExitProcess")); array_push(idata, 0);
     // dll name: "kernel32.dll\0" (+pad to 14)
-    _app(sect, str_to_bytes("kernel32.dll")); array_push(sect, 0); array_push(sect, 0);
-
-    let size_image = SECT_RVA + _round_to(sect_len, SECT_ALIGN);
-    let size_raw = _round_to(sect_len, FILE_ALIGN);
-
-    let out = [];
-    // DOS header
-    _app(out, [0x4D, 0x5A]); _app(out, _zeros(0x3C - 2)); _app(out, X.le32(0x40));
-    // PE signature + COFF header
-    _app(out, [0x50, 0x45, 0, 0]);
-    _app(out, X.le16(0x8664)); _app(out, X.le16(1)); _app(out, X.le32(0)); _app(out, X.le32(0));
-    _app(out, X.le32(0)); _app(out, X.le16(240)); _app(out, X.le16(0x22));
-    // Optional header PE32+ (240 bytes)
-    let opt = _zeros(240);
-    _setle(opt, 0, X.le16(0x20B));            // Magic PE32+
-    _setle(opt, 4, X.le32(_round_to(code_len, FILE_ALIGN)));  // SizeOfCode
-    _setle(opt, 16, X.le32(SECT_RVA));        // AddressOfEntryPoint
-    _setle(opt, 20, X.le32(SECT_RVA));        // BaseOfCode
-    _setle(opt, 24, X.le64(IMAGE_BASE));      // ImageBase
-    _setle(opt, 32, X.le32(SECT_ALIGN));      // SectionAlignment
-    _setle(opt, 36, X.le32(FILE_ALIGN));      // FileAlignment
-    _setle(opt, 40, X.le16(6));               // MajorOSVersion
-    _setle(opt, 48, X.le16(6));               // MajorSubsystemVersion
-    _setle(opt, 56, X.le32(size_image));      // SizeOfImage
-    _setle(opt, 60, X.le32(0x200));           // SizeOfHeaders
-    _setle(opt, 68, X.le16(3));               // Subsystem WINDOWS_CUI
-    _setle(opt, 72, X.le64(0x100000));        // SizeOfStackReserve
-    _setle(opt, 80, X.le64(0x1000));          // SizeOfStackCommit
-    _setle(opt, 88, X.le64(0x100000));        // SizeOfHeapReserve
-    _setle(opt, 96, X.le64(0x1000));          // SizeOfHeapCommit
-    _setle(opt, 108, X.le32(16));             // NumberOfRvaAndSizes
-    _setle(opt, 120, X.le32(rva_idt)); _setle(opt, 124, X.le32(40));   // DataDir[1] Import
-    _setle(opt, 208, X.le32(rva_iat)); _setle(opt, 212, X.le32(16));   // DataDir[12] IAT
-    _app(out, opt);
-    // Section header ".text"
-    let sec = _zeros(40);
-    _setle(sec, 0, str_to_bytes(".text"));
-    _setle(sec, 8, X.le32(sect_len));         // VirtualSize
-    _setle(sec, 12, X.le32(SECT_RVA));        // VirtualAddress
-    _setle(sec, 16, X.le32(size_raw));        // SizeOfRawData
-    _setle(sec, 20, X.le32(0x200));           // PointerToRawData
-    _setle(sec, 36, X.le32(0xE0000020));      // CODE | EXECUTE | READ | WRITE
-    _app(out, sec);
-    // pad headers to SizeOfHeaders (0x200)
-    while len(out) < 0x200 { array_push(out, 0); }
-    // section raw data, padded to SizeOfRawData
-    _app(out, sect);
-    while len(out) < 0x200 + size_raw { array_push(out, 0); }
+    _app(idata, str_to_bytes("kernel32.dll")); array_push(idata, 0); array_push(idata, 0);
+    if len(idata) != data_len { throw "codegen_cross: PE import layout mismatch"; }
+    let headers = _pe_headers(code_len, data_len, TEXT_RVA, rva_idt, 40, rva_iat, 16);
+    let out = headers.bytes; _app(out, code);
+    while len(out) < 0x200 + headers.text_raw { array_push(out, 0); }
+    _app(out, idata);
+    while len(out) < 0x200 + headers.text_raw + headers.data_raw { array_push(out, 0); }
     return out;
 }
 
@@ -231,58 +294,22 @@ fn _imptab(names, sect_rva, start_off) {
                idt_rva: sect_rva + idt_off, idt_size: 40, name_rva: name_rva, len: end - start_off };
 }
 
-// _pe_headers(sect_len, entry_rva, idt_rva, idt_size, iat_rva, iat_size) — 0x200-byte PE
-// header block for a single .text section (CODE|EXEC|READ|WRITE) at RVA 0x1000 / file 0x200.
-fn _pe_headers(sect_len, entry_rva, idt_rva, idt_size, iat_rva, iat_size) {
-    let out = [];
-    _app(out, [0x4D, 0x5A]); _app(out, _zeros(0x3C - 2)); _app(out, X.le32(0x40));
-    _app(out, [0x50, 0x45, 0, 0]);
-    _app(out, X.le16(0x8664)); _app(out, X.le16(1)); _app(out, X.le32(0)); _app(out, X.le32(0));
-    _app(out, X.le32(0)); _app(out, X.le16(240)); _app(out, X.le16(0x22));
-    let opt = _zeros(240);
-    _setle(opt, 0, X.le16(0x20B));
-    _setle(opt, 4, X.le32(_round_to(sect_len, 0x200)));
-    _setle(opt, 16, X.le32(entry_rva));
-    _setle(opt, 20, X.le32(0x1000));
-    _setle(opt, 24, X.le64(5368709120));   // ImageBase 0x140000000
-    _setle(opt, 32, X.le32(0x1000)); _setle(opt, 36, X.le32(0x200));
-    _setle(opt, 40, X.le16(6)); _setle(opt, 48, X.le16(6));
-    _setle(opt, 56, X.le32(0x1000 + _round_to(sect_len, 0x1000)));
-    _setle(opt, 60, X.le32(0x200));
-    _setle(opt, 68, X.le16(3));             // Subsystem CUI
-    _setle(opt, 72, X.le64(0x100000)); _setle(opt, 80, X.le64(0x1000));
-    _setle(opt, 88, X.le64(0x100000)); _setle(opt, 96, X.le64(0x1000));
-    _setle(opt, 108, X.le32(16));
-    _setle(opt, 120, X.le32(idt_rva)); _setle(opt, 124, X.le32(idt_size));   // DataDir[1] Import
-    _setle(opt, 208, X.le32(iat_rva)); _setle(opt, 212, X.le32(iat_size));   // DataDir[12] IAT
-    _app(out, opt);
-    let sec = _zeros(40);
-    _setle(sec, 0, str_to_bytes(".text"));
-    _setle(sec, 8, X.le32(sect_len)); _setle(sec, 12, X.le32(0x1000));
-    _setle(sec, 16, X.le32(_round_to(sect_len, 0x200))); _setle(sec, 20, X.le32(0x200));
-    _setle(sec, 36, X.le32(0xE0000020));
-    _app(out, sec);
-    while len(out) < 0x200 { array_push(out, 0); }
-    return out;
-}
-
 // pe64_print(msg) — a Windows PE that calls GetStdHandle(STD_OUTPUT), WriteFile(msg), and
 // ExitProcess(0). Win64 ABI (rcx,rdx,r8,r9 + 32B shadow + 16B alignment). Imports + call
 // wiring are objdump-verifiable here; the program prints on Windows.
 fn pe64_print(msg) {
     let IMAGE_BASE = 5368709120;
-    let SECT_RVA = 0x1000;
+    let TEXT_RVA = 0x1000; let DATA_RVA = 0x2000;
     let mb = str_to_bytes(msg); let mlen = len(mb);
     let names = ["GetStdHandle", "WriteFile", "ExitProcess"];
-    let code_len = 65;                       // fixed length of the print sequence below
-    let it = _imptab(names, SECT_RVA, code_len);
+    let it = _imptab(names, DATA_RVA, 0);
     let iat = it.iat_rva;
-    let msg_off = code_len + it.len;
-    let msg_va = IMAGE_BASE + SECT_RVA + msg_off;
+    let msg_off = it.len;
+    let msg_va = IMAGE_BASE + DATA_RVA + msg_off;
     // rel32 disps (call qword [rip+disp]) to each IAT slot, from the byte after each call
-    let d0 = iat + 0 - (SECT_RVA + 15);      // after instr3 (GetStdHandle)
-    let d1 = iat + 8 - (SECT_RVA + 57);      // after instr10 (WriteFile)
-    let d2 = iat + 16 - (SECT_RVA + 65);     // after instr12 (ExitProcess)
+    let d0 = iat + 0 - (TEXT_RVA + 15);      // after instr3 (GetStdHandle)
+    let d1 = iat + 8 - (TEXT_RVA + 57);      // after instr10 (WriteFile)
+    let d2 = iat + 16 - (TEXT_RVA + 65);     // after instr12 (ExitProcess)
 
     let code = [];
     _app(code, [0x48, 0x83, 0xEC, 0x38]);                 // sub rsp, 0x38
@@ -298,14 +325,12 @@ fn pe64_print(msg) {
     _app(code, [0x31, 0xC9]);                            // xor ecx, ecx (exit 0)
     _app(code, [0xFF, 0x15]); _app(code, X.le32(d2));    // call [ExitProcess]
 
-    let sect = [];
-    _app(sect, code);
-    _app(sect, it.bytes);
-    _app(sect, mb);
-    let sect_len = len(sect);
-    let out = _pe_headers(sect_len, SECT_RVA, it.idt_rva, it.idt_size, it.iat_rva, it.iat_size);
-    _app(out, sect);
-    while len(out) < 0x200 + _round_to(sect_len, 0x200) { array_push(out, 0); }
+    let data = []; _app(data, it.bytes); _app(data, mb);
+    let headers = _pe_headers(len(code), len(data), TEXT_RVA, it.idt_rva, it.idt_size, it.iat_rva, it.iat_size);
+    let out = headers.bytes; _app(out, code);
+    while len(out) < 0x200 + headers.text_raw { array_push(out, 0); }
+    _app(out, data);
+    while len(out) < 0x200 + headers.text_raw + headers.data_raw { array_push(out, 0); }
     return out;
 }
 
@@ -318,15 +343,35 @@ fn format_of(b) {
     return "unknown";
 }
 
+// FreeBSD/amd64 uses ELF64 but a different syscall ABI from Linux. The shared
+// IR leaves the result in RAX; exit(2) expects it in RDI and SYS_exit is 1.
+fn freebsd_elf64_exec(ir) {
+    IR.assert_valid(ir);
+    let code = X.compile_ir(ir);
+    _app(code, [0x48, 0x89, 0xC7]);                 // mov rdi,rax
+    _app(code, [0xB8, 0x01, 0x00, 0x00, 0x00]);   // mov eax,1 (SYS_exit)
+    _app(code, [0x0F, 0x05]);                       // syscall
+    let elf = X.elf64_exec_rx(code, []);
+    elf[7] = 9;                                      // ELFOSABI_FREEBSD
+    return elf;
+}
+
 // ── dispatcher ────────────────────────────────────────────────────────────────────────
 // build(os, arch, ir) — wrap the IR's machine code in the container for (os, arch).
 fn build(os, arch, ir) {
     IR.assert_valid(ir);
+    if arch == "x64" or arch == "amd64" { arch = "x86_64"; }
+    if arch == "x86" or arch == "i486" or arch == "i586" or arch == "i686" { arch = "i386"; }
+    if arch == "aarch64" { arch = "arm64"; }
     if os == "linux" {
         if arch == "x86_64" { return X.compile_program(ir); }
         if arch == "i386" { return X86.compile_program(ir); }
         if arch == "arm64" { return A64.compile_program(ir); }
         throw "codegen_cross: no linux backend for arch " + arch;
+    }
+    if os == "freebsd" {
+        if arch == "x86_64" { return freebsd_elf64_exec(ir); }
+        throw "codegen_cross: freebsd backend currently x86_64 only";
     }
     if os == "macos" {
         if arch == "x86_64" {
@@ -337,8 +382,9 @@ fn build(os, arch, ir) {
         throw "codegen_cross: macos backend currently x86_64 only";
     }
     if os == "windows" {
+        if arch == "i386" { return pe32_exe(ir); }
         if arch == "x86_64" { return pe64_exe(ir); }   // runnable: calls ExitProcess via import table
-        throw "codegen_cross: windows backend currently x86_64 only";
+        throw "codegen_cross: no windows backend for arch " + arch;
     }
     throw "codegen_cross: unknown os " + os;
 }
@@ -346,12 +392,14 @@ fn build(os, arch, ir) {
 // platforms() — every (os, arch, format) the codegen can emit, with honest run-status.
 fn platforms() {
     return [
-        map{ os: "linux", arch: "x86_64", format: "elf", status: "implemented", runs: "yes (verified here)" },
-        map{ os: "linux", arch: "i386", format: "elf", status: "implemented", runs: "yes (verified here)" },
-        map{ os: "linux", arch: "arm64", format: "elf", status: "implemented", runs: "on arm64 hardware" },
-        map{ os: "macos", arch: "x86_64", format: "macho", status: "format", runs: "on macOS after code-signing" },
-        map{ os: "windows", arch: "x86_64", format: "pe", status: "format", runs: "on Windows after adding an import table" }
+        map{ os: "linux", arch: "x86_64", format: "elf", status: "run-verified", runs: "yes (verified here)" },
+        map{ os: "linux", arch: "x86", format: "elf", status: "run-verified", runs: "yes (verified here)" },
+        map{ os: "linux", arch: "arm64", format: "elf", status: "execution-model-verified", runs: "on arm64 hardware" },
+        map{ os: "freebsd", arch: "x86_64", format: "elf", status: "format-and-syscall-abi-verified", runs: "requires target-host verification" },
+        map{ os: "macos", arch: "x86_64", format: "macho", status: "format-verified", runs: "requires target-host signing and verification" },
+        map{ os: "windows", arch: "x86", format: "pe", status: "format-and-import-verified", runs: "requires target-host verification" },
+        map{ os: "windows", arch: "x86_64", format: "pe", status: "format-and-import-verified", runs: "requires target-host verification" }
     ];
 }
 
-export macho64_exec, pe64_exe, pe64_print, format_of, build, platforms;
+export macho64_exec, pe32_exe, pe64_exe, pe64_print, freebsd_elf64_exec, format_of, build, platforms;

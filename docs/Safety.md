@@ -296,6 +296,37 @@ if ok.ok == false {
 }
 ```
 
+### Bounded worker supervision
+
+`stdlib:thread.sapp` provides a bounded supervisor for worker lifecycle and
+deadline accounting:
+
+```pblang
+let thread = import("stdlib:thread.sapp");
+let sup = thread.supervisor();
+let id = sup.spawn_cooperative(fn(token) {
+    while not token.requested(token) {
+        do_one_bounded_step();
+    }
+}, 5000);
+
+sup.cancel(id, "shutdown");
+let status = sup.wait(id, 1000);
+```
+
+The token-local poll function avoids capturing an imported module across the VM
+boundary; `thread.cancellation_requested(token)` is the equivalent direct API.
+Supervisor state is owned and updated by the parent VM; worker VMs receive
+cancellation over a buffered channel and send bounded completion records that
+state whether cancellation was actually observed. Timeout and cancellation
+metrics are counted once, malformed
+tokens fail closed, cancellation reasons are bounded, and at most 1,024 records
+are retained. A deadline cannot safely preempt an arbitrary VM thread:
+`stats.detached` counts timed-out workers that have not exited, and `kill_all`
+reports `preemptive: false`. Untrusted code or blocking filesystem, network,
+FFI, driver, or device calls require a bounded API at that boundary or an OS
+process that can be terminated independently.
+
 ---
 
 ## 8. Bounds Safety
@@ -447,6 +478,110 @@ The runtime's memory safety (no leaks, no cycles) is already handled by the RC +
 
 ---
 
+## 13. Bounded memory and device-facing work
+
+The runtime ownership tracker is complemented by pblang-only admission APIs:
+
+```pblang
+let mem = import("stdlib:memory_safety.sapp");
+let budget = import("stdlib:resource_budget.sapp");
+let device = import("stdlib:device.sapp");
+let runtime = import("stdlib:product_runtime.sapp");
+
+let arena = mem.bounded_arena("packet-decode", 1024, 1048576);
+let checkpoint = mem.arena_checkpoint(arena);
+let packet = mem.arena_alloc_sized(arena, decoded, packet_bytes);
+mem.arena_rewind(arena, checkpoint); // releases speculative children
+
+let ledger = budget.ledger(budget.profile("micro"));
+if not budget.ledger_try_reserve(ledger, map{ memory_bytes: 4096, items: 1 }) {
+    throw "resource budget exceeded";
+}
+
+let policy = device.policy("readonly");
+let decision = device.decide(map{
+    path: "/proc/version", action: "read", policy: policy
+});
+
+let guarded = runtime.run_once("pb-mcp-server", "request",
+    map{ workers: 1, tokens: 128 },
+    fn() { return handle_request(); });
+```
+
+`scope_result` always restores lifetime depth and preserves success/failure as a
+Result. `harden.with_secret_result` scrubs mutable byte arrays on both callback
+success and failure. Resource arithmetic uses subtraction-first admission and
+rejects quantities beyond pblang's exact integer range. Device policy is
+deny-by-default, uses lexical allowlists, validates output/request size, and
+rejects streaming `/dev` reads from the high-level safe reader.
+
+These mechanisms are portable policy code, but they do **not** prove every
+physical device or native driver safe. Raw FFI, generated syscalls, `ioctl`,
+`mmap`, DMA, vendor GPU/NPU libraries, kernels, firmware, and hardware remain
+separate trust boundaries. The current file builtin also obtains a finite file
+before the pblang policy can inspect its returned length; genuinely bounded
+streaming-device reads require a sized native read backend.
+
+`product_runtime.sapp` supplies shared profiles for pblang compile/codegen,
+PBIDE preview/run, pbAI inference/learning, pbOS services/restarts, and
+pb-mcp-server dispatch. Unknown product/workload pairs fail closed. Per-call
+overrides may only tighten enabled limits. `run` reserves resources before the
+callback and always releases both the ledger reservation and memory lifetime.
+Snapshots defensively copy mutable usage/limit maps so later accounting cannot
+rewrite previously returned diagnostics. Use `try_admit` in hot loops and
+`admit` when a full violation report is needed.
+
+The guard is deterministic pblang policy. It cannot preempt a hostile process
+or enforce physical RSS, CPU, GPU, DMA, storage, or network quotas by itself;
+PBIDE and production launchers must pair it with OS process limits, timeouts,
+capabilities, and device isolation.
+
+`compute.sapp` adds bounded, deterministic routing rather than treating detected
+hardware as permission to execute. CPU workers are capped and selected only
+when caller-provided work hints amortize launch cost. GPU/NPU/SIMD/distributed
+routes additionally require a registered equivalent runtime, compatible
+workload, bounded estimated transfer, and enough estimated work. These hints
+prevent obvious counterproductive offloads but do not measure driver queues,
+thermal throttling, NUMA, physical memory, or device isolation. The controlled
+storage reader bounds path metadata and worker count; because `fs_read` returns
+whole files, it does not impose a byte limit on file contents.
+
+`cache.sapp` provides `bounded(ttl_ms, max_entries, max_units)` for long-lived
+servers, IDEs, and model processes. It uses O(1) entry/unit counters, safe TTL
+deadline arithmetic, generation-tagged FIFO records, atomic oversized-value
+rejection, and observable hit/miss/eviction/expiry metrics. The compatible
+default remains FIFO; `bounded_policy(..., "lru")` adds exact recency eviction
+at a measured per-hit bookkeeping cost. Caller-defined
+`units` must represent the resource relevant to that cache; this avoids an
+unbounded deep-size traversal but does not turn units into measured physical
+RSS. Unbounded `new(ttl_ms)` remains for compatibility and should not receive
+untrusted-cardinality keys without an external limit.
+
+`data_store.sapp` applies those bounds to process memory and enforces equivalent
+per-namespace entry/unit admission in SQLite. Its Redis backend uses bounded
+RESP2 framing without shell execution. Redis-wide maxmemory, durability,
+replication, ACLs, and eviction remain server-side policy; the client does not
+claim to enforce them. See `docs/Data_Storage.md` for the full trust boundary.
+
+`cdn_cache.sapp` adds a separate bounded public-response layer. It includes the
+host, path, sorted query, and configured Vary dimensions in a SHA-256 key;
+bypasses Authorization/Cookie/Range by default; rejects private/no-store,
+Set-Cookie, unsafe Vary, oversized, and hostile-header responses; and bounds
+edge/regional entries, units, key memoization, objects, queries, and tags.
+Sensitive bypasses are marked `private, no-store`. Purge scans are bounded by
+cache capacity. Geographic POP placement, provider credentials, TLS termination,
+DDoS controls, and cross-node consistency remain external trust boundaries.
+See `docs/CDN_Caching.md`.
+
+`render_cache.sapp` caps queued dirty regions (128 by default, 512 hard maximum),
+deduplicates identical invalidations, normalizes non-finite geometry/FPS input,
+and promotes excess region streams to one full repaint. This bounds retained
+region metadata and avoids eager coalescing after every mark. It improves CPU
+render scheduling but is not GPU memory isolation; native graphics backends and
+drivers remain separate trust boundaries.
+
+---
+
 ## Quick Reference
 
 | Need | pblang Solution |
@@ -467,6 +602,16 @@ The runtime's memory safety (no leaks, no cycles) is already handled by the RC +
 | Validate input | `validate.check(schema, data)` |
 | Type-safe result | `result.ok(val)` / `result.err(msg)` |
 | Safe channel send | `safety.safe_send(ch.sender, val)` |
+| Bounded worker supervision | `thread.supervisor()` + cooperative cancellation token |
+| Result-safe index | `safety.checked_index(arr, i)` |
+| Bounded arena | `memory_safety.bounded_arena(name, allocations, units)` |
+| Speculative rollback | `arena_checkpoint` + `arena_rewind` |
+| Hot-loop quota | `resource_budget.ledger_try_reserve(...)` |
+| Product operation guard | `product_runtime.run(...)` / `run_once(...)` |
+| Bounded in-memory cache | `cache.bounded(...)` + `cache.stats(...)` |
+| Bounded dirty regions | `render_cache.new(w, h, max_rects)` |
+| Device allowlist | `device.policy(...)` + `device.decide(...)` |
+| Failure-safe secret cleanup | `harden.with_secret_result(...)` |
 
 ---
 
@@ -474,8 +619,8 @@ The runtime's memory safety (no leaks, no cycles) is already handled by the RC +
 
 | Guarantee | Mechanism |
 |-----------|-----------|
-| **No VM crashes** from pblang code | Rust runtime, `Result`-based error propagation |
-| **No memory leaks** | RC + cycle-breaking GC |
+| **Core managed-memory protection** | Safe runtime paths plus checked ownership/borrow APIs |
+| **Cycle-leak reduction** | RC + cycle-breaking collection; native handles still require lifecycle discipline |
 | **No data races** | VM-per-thread isolation |
 | **No unhandled nil** | `?.` operator, `safety.non_null()` |
 | **No accidental mutation** | `const` keyword, `freeze()` |
@@ -485,5 +630,7 @@ The runtime's memory safety (no leaks, no cycles) is already handled by the RC +
 | **No out-of-bounds** | `?.` operator, `bounds_check()` |
 | **No broken invariants** | `safety.invariant()` |
 
-pblang gives you the tools to write code as safe as Rust at the language level.
-Use them, especially in production code and when self-hosting.
+pblang provides strong runtime checks and fail-closed libraries, but safety is a
+system property rather than a universal language claim. Production code must
+combine these APIs with capability isolation, backend verification, resource
+limits, driver/firmware review, and tests on each supported target.

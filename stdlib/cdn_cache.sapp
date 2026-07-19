@@ -1,0 +1,991 @@
+// stdlib/cdn_cache.sapp -- bounded, provider-neutral HTTP CDN cache semantics.
+//
+// This module is the cache/control layer that can run at an edge process, an
+// origin shield, or in-process during development. It does not pretend that one
+// process creates globally distributed POPs. Deploy the same handler at real
+// edge/regional nodes, or adapt its policy and purge contracts to a CDN provider.
+//
+// High level:
+//   let cdn = import("stdlib:cdn_cache.sapp");
+//   let site = cdn.static_site("public");
+//   let response = site.handle(request);
+//
+// Advanced:
+//   let layer = cdn.create(map{ allowed_hosts: ["example.com"] });
+//   let response = cdn.fetch(layer, request, origin_handler);
+//
+// Security defaults: GET/HEAD only, Authorization/Cookie/Range bypass, bounded
+// keys/objects/tags, no Set-Cookie storage, response Vary must be in the
+// configured key dimensions, and private/no-store responses are never shared.
+
+let CACHE = import("stdlib:cache.sapp");
+let HTTP = import("stdlib:http_server.sapp");
+let SHA = import("stdlib:sha256_pb.sapp");
+
+let MAX_SAFE_INTEGER = 9007199254740991;
+let DEFAULT_TTL_MS = 300000;
+let DEFAULT_IMMUTABLE_TTL_MS = 31536000000;
+let DEFAULT_EDGE_ENTRIES = 4096;
+let DEFAULT_REGIONAL_ENTRIES = 16384;
+let DEFAULT_EDGE_UNITS = 268435456;
+let DEFAULT_REGIONAL_UNITS = 1073741824;
+let DEFAULT_OBJECT_UNITS = 16777216;
+
+fn _option(options, name, fallback) {
+    if type(options) == "map" and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _quantity(value, fallback, minimum, maximum = nil) {
+    if maximum == nil { maximum = MAX_SAFE_INTEGER; }
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or str_contains(text, "inf") { return fallback; }
+    let n = try parse_number(text) catch fallback;
+    if n == nil { n = fallback; }
+    n = num_floor(n);
+    if n < minimum { n = minimum; }
+    if n > maximum { n = maximum; }
+    return n;
+}
+
+fn _copy_map(source) {
+    let out = map{};
+    if type(source) != "map" { return out; }
+    let keys = map_keys(source);
+    let i = 0;
+    while i < len(keys) { out[keys[i]] = source[keys[i]]; i = i + 1; }
+    return out;
+}
+
+fn _copy_array(source) {
+    let out = [];
+    if not is_array(source) { return out; }
+    let i = 0;
+    while i < len(source) { push(out, source[i]); i = i + 1; }
+    return out;
+}
+
+fn _contains(values, wanted) {
+    let i = 0;
+    while i < len(values) { if values[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _header(headers, name) {
+    if type(headers) != "map" { return nil; }
+    let wanted = str_lower(str(name));
+    let keys = map_keys(headers);
+    let i = 0;
+    while i < len(keys) {
+        if str_lower(str(keys[i])) == wanted { return headers[keys[i]]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _request_header(req, name) { return _header(try req.headers catch map{}, name); }
+
+fn _control_free(value) {
+    let s = str(value);
+    return not str_contains(s, "\r") and not str_contains(s, "\n") and not str_contains(s, "\x00");
+}
+
+fn _header_name_safe(value) {
+    let s = str(value);
+    if s == "" or len(s) > 128 { return false; }
+    let allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-";
+    let i = 0;
+    while i < len(s) {
+        if not str_contains(allowed, str_slice(s, i, i + 1)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _hop_by_hop_header(name) {
+    let lower = str_lower(str(name));
+    return lower == "connection" or lower == "keep-alive" or
+           lower == "proxy-authenticate" or lower == "proxy-authorization" or
+           lower == "te" or lower == "trailer" or lower == "transfer-encoding" or
+           lower == "upgrade" or lower == "content-length";
+}
+
+fn _safe_headers(source) {
+    let out = map{};
+    if type(source) != "map" { return out; }
+    let keys = map_keys(source);
+    let i = 0;
+    while i < len(keys) {
+        let name = str(keys[i]);
+        let value = str(source[keys[i]]);
+        if _header_name_safe(name) and not _hop_by_hop_header(name) and
+           _control_free(value) and len(str_to_bytes(value)) <= 8192 {
+            _set_header(out, name, value);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _headers_valid(source) {
+    if type(source) != "map" { return source == nil; }
+    let keys = map_keys(source);
+    let i = 0;
+    while i < len(keys) {
+        if not _header_name_safe(keys[i]) or not _control_free(source[keys[i]]) or
+           len(str_to_bytes(str(source[keys[i]]))) > 8192 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _set_header(headers, name, value) {
+    let keys = map_keys(headers);
+    let wanted = str_lower(str(name));
+    let i = 0;
+    while i < len(keys) {
+        if str_lower(str(keys[i])) == wanted { map_remove(headers, keys[i]); }
+        i = i + 1;
+    }
+    headers[name] = str(value);
+    return headers;
+}
+
+fn _deadline(now, duration) {
+    duration = _quantity(duration, 0, 0);
+    if duration <= 0 { return now; }
+    if duration > MAX_SAFE_INTEGER - now { return MAX_SAFE_INTEGER; }
+    return now + duration;
+}
+
+fn _max3(a, b, c) {
+    let out = a;
+    if b > out { out = b; }
+    if c > out { out = c; }
+    return out;
+}
+
+// ── Cache-Control policy ─────────────────────────────────────────────────────
+
+fn policy(options = nil) {
+    if options == nil { options = map{}; }
+    let scope = str_lower(str(_option(options, "scope", "public")));
+    if scope != "public" and scope != "private" and scope != "no-store" { throw "cdn_cache.policy: scope must be public, private, or no-store"; }
+    let browser_ttl = _quantity(_option(options, "browser_ttl_ms", _option(options, "ttl_ms", DEFAULT_TTL_MS)), DEFAULT_TTL_MS, 0);
+    let shared_ttl = _quantity(_option(options, "shared_ttl_ms", _option(options, "ttl_ms", browser_ttl)), browser_ttl, 0);
+    let out = map{
+        format: "pblang.cdn.policy.v1", scope: scope,
+        browser_ttl_ms: browser_ttl, shared_ttl_ms: shared_ttl,
+        stale_while_revalidate_ms: _quantity(_option(options, "stale_while_revalidate_ms", 0), 0, 0),
+        stale_if_error_ms: _quantity(_option(options, "stale_if_error_ms", 0), 0, 0),
+        immutable: _option(options, "immutable", false) == true,
+        must_revalidate: _option(options, "must_revalidate", false) == true,
+        no_cache: _option(options, "no_cache", false) == true,
+        tags: _copy_array(_option(options, "tags", []))
+    };
+    // RFC shared-cache semantics: must-revalidate forbids stale reuse when the
+    // origin cannot be reached, so contradictory stale windows fail closed.
+    if out.must_revalidate { out.stale_while_revalidate_ms = 0; out.stale_if_error_ms = 0; }
+    return out;
+}
+
+fn public_policy(ttl_ms = 300000, options = nil) {
+    if options == nil { options = map{}; }
+    let next = _copy_map(options);
+    next.scope = "public";
+    next.ttl_ms = ttl_ms;
+    return policy(next);
+}
+
+fn immutable_policy(ttl_ms = 31536000000, options = nil) {
+    if options == nil { options = map{}; }
+    let next = _copy_map(options);
+    next.scope = "public";
+    next.ttl_ms = ttl_ms;
+    next.immutable = true;
+    return policy(next);
+}
+
+fn private_policy(ttl_ms = 0, options = nil) {
+    if options == nil { options = map{}; }
+    let next = _copy_map(options);
+    next.scope = "private";
+    next.ttl_ms = ttl_ms;
+    return policy(next);
+}
+
+fn no_store_policy() { return policy(map{ scope: "no-store", ttl_ms: 0 }); }
+
+fn _seconds(ms) { return num_floor(_quantity(ms, 0, 0) / 1000); }
+
+fn cache_control(cache_policy) {
+    let p = if (try cache_policy.format catch "") == "pblang.cdn.policy.v1" { cache_policy } else { policy(cache_policy) };
+    if p.scope == "no-store" { return "no-store"; }
+    let parts = [];
+    push(parts, if p.scope == "private" { "private" } else { "public" });
+    push(parts, "max-age=" + str(_seconds(p.browser_ttl_ms)));
+    if p.scope == "public" { push(parts, "s-maxage=" + str(_seconds(p.shared_ttl_ms))); }
+    if p.no_cache { push(parts, "no-cache"); }
+    if p.must_revalidate { push(parts, "must-revalidate"); }
+    if p.immutable { push(parts, "immutable"); }
+    if p.stale_while_revalidate_ms > 0 { push(parts, "stale-while-revalidate=" + str(_seconds(p.stale_while_revalidate_ms))); }
+    if p.stale_if_error_ms > 0 { push(parts, "stale-if-error=" + str(_seconds(p.stale_if_error_ms))); }
+    return str_join(parts, ", ");
+}
+
+fn _unquote(value) {
+    let s = str_trim(str(value));
+    if len(s) >= 2 and str_starts_with(s, "\"") and str_ends_with(s, "\"") { return str_slice(s, 1, len(s) - 1); }
+    return s;
+}
+
+fn _directive_ms(value) {
+    let s = _unquote(value);
+    let n = _quantity(s, -1, -1, num_floor(MAX_SAFE_INTEGER / 1000));
+    if n < 0 { return nil; }
+    return n * 1000;
+}
+
+fn parse_cache_control(value) {
+    let out = map{
+        format: "pblang.cdn.cache_control.v1", public: false, private: false,
+        no_store: false, no_cache: false, immutable: false, must_revalidate: false,
+        max_age_ms: nil, s_maxage_ms: nil, stale_while_revalidate_ms: nil,
+        stale_if_error_ms: nil, unknown: []
+    };
+    let raw = str(value);
+    if len(str_to_bytes(raw)) > 8192 or not _control_free(raw) { out.invalid = true; return out; }
+    let parts = str_split(raw, ",");
+    let seen = map{};
+    let i = 0;
+    while i < len(parts) {
+        let item = str_trim(parts[i]);
+        let eq = str_index_of(item, "=");
+        let name = str_lower(if eq >= 0 { str_trim(str_slice(item, 0, eq)) } else { item });
+        let argument = if eq >= 0 { str_slice(item, eq + 1, len(item)) } else { "" };
+        let recognized = name == "public" or name == "private" or name == "no-store" or
+            name == "no-cache" or name == "immutable" or name == "must-revalidate" or
+            name == "proxy-revalidate" or name == "max-age" or name == "s-maxage" or
+            name == "stale-while-revalidate" or name == "stale-if-error";
+        if recognized and map_has(seen, name) { out.invalid = true; }
+        if recognized { seen[name] = true; }
+        if name == "public" { out.public = true; }
+        elif name == "private" { out.private = true; }
+        elif name == "no-store" { out.no_store = true; }
+        elif name == "no-cache" { out.no_cache = true; }
+        elif name == "immutable" { out.immutable = true; }
+        elif name == "must-revalidate" or name == "proxy-revalidate" { out.must_revalidate = true; }
+        elif name == "max-age" { out.max_age_ms = _directive_ms(argument); if out.max_age_ms == nil { out.invalid = true; } }
+        elif name == "s-maxage" { out.s_maxage_ms = _directive_ms(argument); if out.s_maxage_ms == nil { out.invalid = true; } }
+        elif name == "stale-while-revalidate" { out.stale_while_revalidate_ms = _directive_ms(argument); if out.stale_while_revalidate_ms == nil { out.invalid = true; } }
+        elif name == "stale-if-error" { out.stale_if_error_ms = _directive_ms(argument); if out.stale_if_error_ms == nil { out.invalid = true; } }
+        elif name != "" { push(out.unknown, name); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _response_policy(base, response) {
+    let explicit = try response.cdn_policy catch nil;
+    let p = if explicit != nil { policy(explicit) } else { policy(base) };
+    let raw = _header(try response.headers catch map{}, "Cache-Control");
+    if raw == nil { return p; }
+    let parsed = parse_cache_control(raw);
+    if try parsed.invalid catch false { p.scope = "no-store"; return p; }
+    if parsed.no_store { p.scope = "no-store"; }
+    elif parsed.private { p.scope = "private"; }
+    elif parsed.public { p.scope = "public"; }
+    if parsed.max_age_ms != nil { p.browser_ttl_ms = parsed.max_age_ms; p.shared_ttl_ms = parsed.max_age_ms; }
+    if parsed.s_maxage_ms != nil { p.shared_ttl_ms = parsed.s_maxage_ms; }
+    if parsed.stale_while_revalidate_ms != nil { p.stale_while_revalidate_ms = parsed.stale_while_revalidate_ms; }
+    if parsed.stale_if_error_ms != nil { p.stale_if_error_ms = parsed.stale_if_error_ms; }
+    p.no_cache = parsed.no_cache;
+    p.must_revalidate = parsed.must_revalidate;
+    p.immutable = parsed.immutable;
+    if p.no_cache { p.shared_ttl_ms = 0; p.stale_while_revalidate_ms = 0; }
+    if p.must_revalidate { p.stale_while_revalidate_ms = 0; p.stale_if_error_ms = 0; }
+    return p;
+}
+
+// ── Hierarchy and safe cache keys ────────────────────────────────────────────
+
+fn _normalized_names(values, maximum) {
+    let out = [];
+    if not is_array(values) { return out; }
+    let i = 0;
+    while i < len(values) and len(out) < maximum {
+        let name = str_lower(str_trim(str(values[i])));
+        if _header_name_safe(name) and not _contains(out, name) { push(out, name); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _host_safe(value) {
+    let host = str(value);
+    if host == "" or len(str_to_bytes(host)) > 255 or not _control_free(host) { return false; }
+    let allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._:[]";
+    let i = 0;
+    while i < len(host) {
+        if not str_contains(allowed, str_slice(host, i, i + 1)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _normalized_statuses(values) {
+    let out = [];
+    if not is_array(values) { values = [200, 203, 204, 301, 404, 410]; }
+    let i = 0;
+    while i < len(values) and len(out) < 64 {
+        let status = _quantity(values[i], 0, 0, 599);
+        if status >= 100 and not _contains(out, status) { push(out, status); }
+        i = i + 1;
+    }
+    if len(out) == 0 { out = [200]; }
+    return out;
+}
+
+fn create(options = nil) {
+    if options == nil { options = map{}; }
+    let edge_entries = _quantity(_option(options, "edge_max_entries", DEFAULT_EDGE_ENTRIES), DEFAULT_EDGE_ENTRIES, 1, 1000000);
+    let regional_entries = _quantity(_option(options, "regional_max_entries", DEFAULT_REGIONAL_ENTRIES), DEFAULT_REGIONAL_ENTRIES, 1, 1000000);
+    let edge_units = _quantity(_option(options, "edge_max_units", DEFAULT_EDGE_UNITS), DEFAULT_EDGE_UNITS, 1);
+    let regional_units = _quantity(_option(options, "regional_max_units", DEFAULT_REGIONAL_UNITS), DEFAULT_REGIONAL_UNITS, 1);
+    let replacement = str_lower(str(_option(options, "replacement_policy", "fifo")));
+    let allowed_hosts = [];
+    let raw_hosts = _option(options, "allowed_hosts", []);
+    if is_array(raw_hosts) {
+        let i = 0;
+        while i < len(raw_hosts) {
+            let host = str_lower(str_trim(str(raw_hosts[i])));
+            if _host_safe(host) and not _contains(allowed_hosts, host) { push(allowed_hosts, host); }
+            i = i + 1;
+        }
+    }
+    return map{
+        format: "pblang.cdn.hierarchy.v1",
+        edge: CACHE.bounded_policy(0, edge_entries, edge_units, replacement),
+        regional: CACHE.bounded_policy(0, regional_entries, regional_units, replacement),
+        // Pure-PBLang SHA-256 is portable but intentionally expensive. Cache
+        // canonical->digest mappings under hard quotas so hot edge requests do
+        // not hash the same canonical key on every lookup.
+        key_hashes: CACHE.bounded_policy(0,
+            _quantity(_option(options, "key_memo_entries", 4096), 4096, 1, 1000000),
+            _quantity(_option(options, "key_memo_units", 16777216), 16777216, 1024),
+            "fifo"),
+        default_policy: policy(_option(options, "policy", map{
+            scope: "public", ttl_ms: DEFAULT_TTL_MS,
+            stale_while_revalidate_ms: 30000, stale_if_error_ms: 300000
+        })),
+        max_object_units: _quantity(_option(options, "max_object_units", DEFAULT_OBJECT_UNITS), DEFAULT_OBJECT_UNITS, 1, edge_units),
+        max_key_units: _quantity(_option(options, "max_key_units", 16384), 16384, 256, 1048576),
+        max_query_pairs: _quantity(_option(options, "max_query_pairs", 128), 128, 0, 4096),
+        max_tags: _quantity(_option(options, "max_tags", 32), 32, 0, 256),
+        vary_headers: _normalized_names(_option(options, "vary_headers", ["Accept-Encoding", "Accept-Language"]), 32),
+        allowed_hosts: allowed_hosts,
+        allow_authorized: _option(options, "allow_authorized", false) == true,
+        allow_cookies: _option(options, "allow_cookies", false) == true,
+        ignore_query: _option(options, "ignore_query", false) == true,
+        cache_statuses: _normalized_statuses(_option(options, "cache_statuses", [200, 203, 204, 301, 404, 410])),
+        metrics: map{
+            requests: 0, bypasses: 0, edge_hits: 0, regional_hits: 0,
+            origin_fetches: 0, stores: 0, rejected: 0, stale_served: 0,
+            stale_if_error_served: 0, revalidations: 0, purges: 0,
+            origin_errors: 0, bytes_served: 0, key_hash_hits: 0, key_hash_misses: 0
+        }
+    };
+}
+
+fn _component(value) {
+    let s = str(value);
+    return str(len(str_to_bytes(s))) + ":" + s;
+}
+
+fn _path_and_query(req, cdn) {
+    let raw = try req.raw_path catch try req.path catch "/";
+    if not _control_free(raw) { return map{ ok: false, reason: "unsafe path" }; }
+    let hash = str_index_of(raw, "#");
+    if hash >= 0 { raw = str_slice(raw, 0, hash); }
+    let q = str_index_of(raw, "?");
+    let path = if q >= 0 { str_slice(raw, 0, q) } else { raw };
+    let query = if q >= 0 { str_slice(raw, q + 1, len(raw)) } else { "" };
+    if path == "" { path = "/"; }
+    if not str_starts_with(path, "/") or len(str_to_bytes(path)) > 4096 { return map{ ok: false, reason: "invalid path" }; }
+    if cdn.ignore_query or query == "" { return map{ ok: true, path: path, query: "" }; }
+    let pairs = str_split(query, "&");
+    if len(pairs) > cdn.max_query_pairs { return map{ ok: false, reason: "too many query parameters" }; }
+    pairs = array_sort(pairs);
+    return map{ ok: true, path: path, query: str_join(pairs, "&") };
+}
+
+fn _unique_header(headers, name) {
+    if type(headers) != "map" { return map{ ok: true, value: nil }; }
+    let wanted = str_lower(str(name));
+    let keys = map_keys(headers);
+    let found = nil;
+    let count = 0;
+    let i = 0;
+    while i < len(keys) {
+        if str_lower(str(keys[i])) == wanted { found = headers[keys[i]]; count = count + 1; }
+        i = i + 1;
+    }
+    return map{ ok: count <= 1, value: found };
+}
+
+fn request_key(cdn, req) {
+    if type(cdn) != "map" or (try cdn.format catch "") != "pblang.cdn.hierarchy.v1" { return map{ ok: false, reason: "invalid CDN hierarchy" }; }
+    let method = str_upper(str(try req.method catch "GET"));
+    if method != "GET" and method != "HEAD" { return map{ ok: false, reason: "method is not cacheable" }; }
+    if not cdn.allow_authorized and _request_header(req, "Authorization") != nil { return map{ ok: false, reason: "authorized request bypass" }; }
+    if not cdn.allow_cookies and _request_header(req, "Cookie") != nil { return map{ ok: false, reason: "cookie request bypass" }; }
+    if _request_header(req, "Range") != nil or _request_header(req, "If-Range") != nil { return map{ ok: false, reason: "range request bypass" }; }
+    let request_cc = parse_cache_control(try _request_header(req, "Cache-Control") catch "");
+    if request_cc.no_store { return map{ ok: false, reason: "request no-store", no_store: true }; }
+
+    let scheme = str_lower(str(try req.scheme catch "https"));
+    if scheme != "http" and scheme != "https" { return map{ ok: false, reason: "unsupported scheme" }; }
+    let host_header = _request_header(req, "Host");
+    let explicit_host = try req.host catch nil;
+    if explicit_host != nil and host_header != nil and str_lower(str_trim(str(explicit_host))) != str_lower(str_trim(str(host_header))) {
+        return map{ ok: false, reason: "request host disagreement" };
+    }
+    let host_value = if explicit_host != nil { explicit_host } else { host_header };
+    let host = if host_value == nil or str_trim(str(host_value)) == "" { "localhost" } else { str_lower(str_trim(str(host_value))) };
+    if not _host_safe(host) { return map{ ok: false, reason: "unsafe host" }; }
+    if len(cdn.allowed_hosts) > 0 and not _contains(cdn.allowed_hosts, host) { return map{ ok: false, reason: "host is not allowed" }; }
+    let pq = _path_and_query(req, cdn);
+    if not pq.ok { return pq; }
+
+    let canonical = _component("GET") + _component(scheme) + _component(host) + _component(pq.path) + _component(pq.query);
+    let i = 0;
+    while i < len(cdn.vary_headers) {
+        let selected = _unique_header(try req.headers catch map{}, cdn.vary_headers[i]);
+        if not selected.ok { return map{ ok: false, reason: "duplicate Vary request header" }; }
+        let value = selected.value;
+        if value != nil and (not _control_free(value) or len(str_to_bytes(str(value))) > 8192) {
+            return map{ ok: false, reason: "unsafe Vary request header" };
+        }
+        canonical = canonical + _component(cdn.vary_headers[i]) + _component(if value == nil { "" } else { value });
+        i = i + 1;
+    }
+    if len(str_to_bytes(canonical)) > cdn.max_key_units { return map{ ok: false, reason: "cache key exceeds limit" }; }
+    let memo = CACHE.get_entry(cdn.key_hashes, canonical);
+    let digest = nil;
+    if memo.found {
+        digest = memo.value;
+        cdn.metrics.key_hash_hits = cdn.metrics.key_hash_hits + 1;
+    } else {
+        digest = SHA.sha256_hex("pblang-cdn-cache-key-v1\x00" + canonical);
+        cdn.metrics.key_hash_misses = cdn.metrics.key_hash_misses + 1;
+        CACHE.try_set_sized(cdn.key_hashes, canonical, digest, len(str_to_bytes(canonical)) + 64);
+    }
+    return map{
+        ok: true, key: digest,
+        canonical: canonical, method: method, scheme: scheme, host: host,
+        path: pq.path, query: pq.query, force_revalidate: request_cc.no_cache or
+            (try request_cc.max_age_ms catch nil) == 0 or
+            str_lower(str(try _request_header(req, "Pragma") catch "")) == "no-cache"
+    };
+}
+
+// ── Entry admission, lookup, and response handling ──────────────────────────
+
+fn _normalize_response(raw) {
+    if type(raw) == "string" { raw = map{ status: 200, body: raw, content_type: "text/plain" }; }
+    if type(raw) != "map" { return map{ ok: false, error: "origin returned an unsupported response" }; }
+    let status = _quantity(try raw.status catch 200, 200, 100, 599);
+    let raw_headers = try raw.headers catch map{};
+    let headers = _safe_headers(raw_headers);
+    let body = "";
+    let content_type = try raw.content_type catch _header(headers, "Content-Type");
+    let json_value = try raw.json catch nil;
+    if json_value != nil {
+        body = json_stringify(json_value);
+        if content_type == nil { content_type = "application/json; charset=utf-8"; }
+    } else {
+        body = str(try raw.body catch "");
+    }
+    if content_type == nil { content_type = "text/plain"; }
+    if not _control_free(content_type) { content_type = "text/plain"; }
+    let out = map{ ok: true, status: status, body: body, content_type: content_type, headers: headers,
+                   cache_unsafe: not _headers_valid(raw_headers) };
+    let explicit = try raw.cdn_policy catch nil;
+    if explicit != nil { out.cdn_policy = explicit; }
+    return out;
+}
+
+fn _safe_tag(value) {
+    let s = str(value);
+    if len(str_to_bytes(s)) < 1 or len(str_to_bytes(s)) > 128 { return nil; }
+    let allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.:";
+    let i = 0;
+    while i < len(s) {
+        if not str_contains(allowed, str_slice(s, i, i + 1)) { return nil; }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn _entry_tags(cdn, p, response) {
+    let tags = [];
+    let sources = [_copy_array(try p.tags catch []), str_split(str(try _header(response.headers, "Surrogate-Key") catch ""), " "), str_split(str(try _header(response.headers, "Cache-Tag") catch ""), ",")];
+    let si = 0;
+    while si < len(sources) and len(tags) < cdn.max_tags {
+        let j = 0;
+        while j < len(sources[si]) and len(tags) < cdn.max_tags {
+            let tag = _safe_tag(str_trim(str(sources[si][j])));
+            if tag != nil and not _contains(tags, tag) { push(tags, tag); }
+            j = j + 1;
+        }
+        si = si + 1;
+    }
+    return tags;
+}
+
+fn _vary_allowed(cdn, response) {
+    let raw = _header(response.headers, "Vary");
+    if raw == nil or str_trim(str(raw)) == "" { return true; }
+    let names = str_split(str(raw), ",");
+    let i = 0;
+    while i < len(names) {
+        let name = str_lower(str_trim(names[i]));
+        if name == "*" or not _contains(cdn.vary_headers, name) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _status_allowed(cdn, status) {
+    let i = 0;
+    while i < len(cdn.cache_statuses) { if cdn.cache_statuses[i] == status { return true; } i = i + 1; }
+    return false;
+}
+
+fn _entry_units(response) {
+    let units = len(str_to_bytes(response.body)) + len(str_to_bytes(response.content_type)) + 256;
+    let keys = map_keys(response.headers);
+    let i = 0;
+    while i < len(keys) {
+        units = units + len(str_to_bytes(str(keys[i]))) + len(str_to_bytes(str(response.headers[keys[i]]))) + 4;
+        i = i + 1;
+    }
+    return units;
+}
+
+fn _etag_for(response) {
+    let existing = _header(response.headers, "ETag");
+    if existing != nil and _control_free(existing) and len(str_to_bytes(str(existing))) <= 256 { return str(existing); }
+    return "\"pb-" + SHA.sha256_hex(response.body) + "\"";
+}
+
+fn _make_entry(cdn, key_info, req, response, now) {
+    let p = _response_policy(cdn.default_policy, response);
+    let units = _entry_units(response);
+    if response.cache_unsafe { return map{ ok: false, reason: "origin headers are unsafe" }; }
+    if key_info.method == "HEAD" { return map{ ok: false, reason: "HEAD misses are not stored" }; }
+    if p.scope != "public" { return map{ ok: false, reason: "response is not public" }; }
+    if p.shared_ttl_ms <= 0 and p.stale_if_error_ms <= 0 { return map{ ok: false, reason: "response has no shared retention" }; }
+    if not _status_allowed(cdn, response.status) { return map{ ok: false, reason: "status is not cacheable" }; }
+    if _header(response.headers, "Set-Cookie") != nil { return map{ ok: false, reason: "Set-Cookie response bypass" }; }
+    if not _vary_allowed(cdn, response) { return map{ ok: false, reason: "Vary is not represented in the cache key" }; }
+    if units > cdn.max_object_units { return map{ ok: false, reason: "response exceeds object limit", units: units }; }
+    let fresh_until = _deadline(now, p.shared_ttl_ms);
+    let stale_until = _deadline(fresh_until, p.stale_while_revalidate_ms);
+    let error_until = _deadline(fresh_until, p.stale_if_error_ms);
+    let retain_until = _max3(fresh_until, stale_until, error_until);
+    let headers = _copy_map(response.headers);
+    _set_header(headers, "Cache-Control", cache_control(p));
+    let etag = _etag_for(response);
+    _set_header(headers, "ETag", etag);
+    return map{
+        ok: true,
+        entry: map{
+            format: "pblang.cdn.entry.v1", key: key_info.key,
+            canonical: key_info.canonical, scheme: key_info.scheme, host: key_info.host,
+            path: key_info.path, query: key_info.query, status: response.status,
+            body: response.body, content_type: response.content_type, headers: headers,
+            etag: etag, tags: _entry_tags(cdn, p, response), stored_ms: now,
+            fresh_until_ms: fresh_until, stale_until_ms: stale_until,
+            error_until_ms: error_until, retain_until_ms: retain_until,
+            units: units, policy: p
+        }
+    };
+}
+
+fn _store_level(cache_obj, entry, now) {
+    let ttl = entry.retain_until_ms - now;
+    if ttl < 1 { ttl = 1; }
+    return CACHE.try_set_sized(cache_obj, entry.key, entry, entry.units, ttl);
+}
+
+fn _store(cdn, entry, now) {
+    let regional = _store_level(cdn.regional, entry, now);
+    let edge = _store_level(cdn.edge, entry, now);
+    if regional or edge { cdn.metrics.stores = cdn.metrics.stores + 1; }
+    return map{ regional: regional, edge: edge, stored: regional or edge };
+}
+
+fn _lookup(cache_obj, key, now) {
+    let found = CACHE.get_entry(cache_obj, key);
+    if not found.found { return map{ found: false }; }
+    let entry = found.value;
+    if type(entry) != "map" or (try entry.format catch "") != "pblang.cdn.entry.v1" or entry.key != key {
+        CACHE.delete(cache_obj, key);
+        return map{ found: false, corrupt: true };
+    }
+    if now < entry.fresh_until_ms { return map{ found: true, state: "fresh", entry: entry }; }
+    if now < entry.stale_until_ms { return map{ found: true, state: "stale-while-revalidate", entry: entry }; }
+    if now < entry.error_until_ms { return map{ found: true, state: "stale-if-error", entry: entry }; }
+    CACHE.delete(cache_obj, key);
+    return map{ found: false, expired: true };
+}
+
+fn _weak_etag(value) {
+    let s = str_trim(str(value));
+    if str_starts_with(str_lower(s), "w/") { return str_trim(str_slice(s, 2, len(s))); }
+    return s;
+}
+
+fn _etag_matches(req, etag) {
+    let raw = _request_header(req, "If-None-Match");
+    if raw == nil or len(str_to_bytes(str(raw))) > 8192 or not _control_free(raw) { return false; }
+    let values = str_split(str(raw), ",");
+    let wanted = _weak_etag(etag);
+    let i = 0;
+    while i < len(values) {
+        let candidate = str_trim(values[i]);
+        if candidate == "*" or _weak_etag(candidate) == wanted { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _serve(cdn, req, entry, source, state, now, needs_revalidate = false) {
+    let headers = _copy_map(entry.headers);
+    let age = now - entry.stored_ms;
+    if age < 0 { age = 0; }
+    _set_header(headers, "Age", str(num_floor(age / 1000)));
+    _set_header(headers, "X-PBLang-CDN-Cache", source);
+    if state != "fresh" { _set_header(headers, "Warning", "110 - Response is stale"); }
+    let status = entry.status;
+    let body = if str_upper(str(try req.method catch "GET")) == "HEAD" { "" } else { entry.body };
+    if _etag_matches(req, entry.etag) { status = 304; body = ""; }
+    cdn.metrics.bytes_served = cdn.metrics.bytes_served + len(str_to_bytes(body));
+    return map{
+        status: status, body: body, content_type: entry.content_type, headers: headers,
+        cdn: map{
+            format: "pblang.cdn.result.v1", source: source, state: state,
+            cache_key: entry.key, age_ms: age, needs_revalidate: needs_revalidate,
+            revalidation: if needs_revalidate { map{ format: "pblang.cdn.revalidation.v1", cache_key: entry.key, requested_ms: now } } else { nil }
+        }
+    };
+}
+
+fn _serve_uncached(cdn, req, response, state, reason) {
+    let headers = _copy_map(response.headers);
+    _set_header(headers, "X-PBLang-CDN-Cache", state);
+    if state == "BYPASS" and (reason == "authorized request bypass" or reason == "cookie request bypass" or reason == "method is not cacheable" or reason == "request no-store") {
+        _set_header(headers, "Cache-Control", "private, no-store");
+    }
+    let body = if str_upper(str(try req.method catch "GET")) == "HEAD" { "" } else { response.body };
+    cdn.metrics.bytes_served = cdn.metrics.bytes_served + len(str_to_bytes(body));
+    return map{
+        status: response.status, body: body, content_type: response.content_type,
+        headers: headers,
+        cdn: map{ format: "pblang.cdn.result.v1", source: str_lower(state), state: str_lower(state), reason: reason }
+    };
+}
+
+fn _refresh_entry(cdn, candidate, response, now) {
+    let merged = map{
+        status: candidate.status, body: candidate.body, content_type: candidate.content_type,
+        headers: _copy_map(candidate.headers), cdn_policy: candidate.policy
+    };
+    let keys = map_keys(response.headers);
+    let i = 0;
+    while i < len(keys) { merged.headers[keys[i]] = response.headers[keys[i]]; i = i + 1; }
+    let info = map{
+        key: candidate.key, canonical: candidate.canonical, method: "GET",
+        scheme: candidate.scheme, host: candidate.host, path: candidate.path, query: candidate.query
+    };
+    let made = _make_entry(cdn, info, map{ method: "GET" }, merged, now);
+    if not made.ok { return map{ ok: false, error: made.reason }; }
+    let stored = _store(cdn, made.entry, now);
+    return map{ ok: stored.stored, entry: made.entry };
+}
+
+fn _origin(cdn, req, key_info, origin_fn, now, candidate = nil) {
+    cdn.metrics.origin_fetches = cdn.metrics.origin_fetches + 1;
+    let raw = try origin_fn(req) catch nil;
+    if raw == nil {
+        cdn.metrics.origin_errors = cdn.metrics.origin_errors + 1;
+        if candidate != nil and candidate.policy.stale_if_error_ms > 0 and now < candidate.error_until_ms {
+            cdn.metrics.stale_if_error_served = cdn.metrics.stale_if_error_served + 1;
+            return _serve(cdn, req, candidate, "STALE-IF-ERROR", "stale-if-error", now, true);
+        }
+        return map{ status: 502, body: "Bad Gateway", content_type: "text/plain", headers: map{ "Cache-Control": "no-store", "X-PBLang-CDN-Cache": "ERROR" }, cdn: map{ format: "pblang.cdn.result.v1", source: "error", state: "origin-error" } };
+    }
+    let response = _normalize_response(raw);
+    if not response.ok {
+        cdn.metrics.origin_errors = cdn.metrics.origin_errors + 1;
+        return map{ status: 502, body: "Bad Gateway", content_type: "text/plain", headers: map{ "Cache-Control": "no-store", "X-PBLang-CDN-Cache": "ERROR" }, cdn: map{ format: "pblang.cdn.result.v1", source: "error", state: "invalid-origin-response" } };
+    }
+    if response.status == 304 and candidate != nil {
+        let refreshed = _refresh_entry(cdn, candidate, response, now);
+        if refreshed.ok { return _serve(cdn, req, refreshed.entry, "REVALIDATED", "fresh", now); }
+    } elif response.status == 304 {
+        cdn.metrics.origin_errors = cdn.metrics.origin_errors + 1;
+        return map{ status: 502, body: "Bad Gateway", content_type: "text/plain", headers: map{ "Cache-Control": "no-store", "X-PBLang-CDN-Cache": "ERROR" }, cdn: map{ format: "pblang.cdn.result.v1", source: "error", state: "unexpected-origin-304" } };
+    }
+    if response.status >= 500 {
+        cdn.metrics.origin_errors = cdn.metrics.origin_errors + 1;
+        if candidate != nil and candidate.policy.stale_if_error_ms > 0 and now < candidate.error_until_ms {
+            cdn.metrics.stale_if_error_served = cdn.metrics.stale_if_error_served + 1;
+            return _serve(cdn, req, candidate, "STALE-IF-ERROR", "stale-if-error", now, true);
+        }
+    }
+    let made = _make_entry(cdn, key_info, req, response, now);
+    if made.ok {
+        _store(cdn, made.entry, now);
+        return _serve(cdn, req, made.entry, "MISS", "fresh", now);
+    }
+    cdn.metrics.rejected = cdn.metrics.rejected + 1;
+    return _serve_uncached(cdn, req, response, "MISS", made.reason);
+}
+
+fn fetch(cdn, req, origin_fn, options = nil) {
+    if options == nil { options = map{}; }
+    cdn.metrics.requests = cdn.metrics.requests + 1;
+    let key_info = request_key(cdn, req);
+    if not key_info.ok {
+        cdn.metrics.bypasses = cdn.metrics.bypasses + 1;
+        let raw = try origin_fn(req) catch nil;
+        let response = _normalize_response(raw);
+        if not response.ok { return map{ status: 502, body: "Bad Gateway", content_type: "text/plain", headers: map{ "Cache-Control": "no-store" } }; }
+        return _serve_uncached(cdn, req, response, "BYPASS", key_info.reason);
+    }
+    let now = _quantity(_option(options, "now_ms", now_ms()), now_ms(), 0);
+    let stale_mode = str_lower(str(_option(options, "stale_mode", "serve")));
+    if stale_mode != "serve" and stale_mode != "blocking" { throw "cdn_cache.fetch: stale_mode must be serve or blocking"; }
+
+    let edge = _lookup(cdn.edge, key_info.key, now);
+    let error_candidate = nil;
+    if edge.found {
+        error_candidate = edge.entry;
+        if edge.state == "fresh" and not key_info.force_revalidate {
+            cdn.metrics.edge_hits = cdn.metrics.edge_hits + 1;
+            return _serve(cdn, req, edge.entry, "EDGE-HIT", "fresh", now);
+        }
+        if edge.state == "stale-while-revalidate" and not key_info.force_revalidate and stale_mode == "serve" {
+            cdn.metrics.edge_hits = cdn.metrics.edge_hits + 1;
+            cdn.metrics.stale_served = cdn.metrics.stale_served + 1;
+            return _serve(cdn, req, edge.entry, "EDGE-STALE", edge.state, now, true);
+        }
+        if edge.state != "fresh" or key_info.force_revalidate {
+            cdn.metrics.revalidations = cdn.metrics.revalidations + 1;
+            return _origin(cdn, req, key_info, origin_fn, now, edge.entry);
+        }
+    }
+
+    let regional = _lookup(cdn.regional, key_info.key, now);
+    if regional.found {
+        error_candidate = regional.entry;
+        if regional.state == "fresh" and not key_info.force_revalidate {
+            cdn.metrics.regional_hits = cdn.metrics.regional_hits + 1;
+            _store_level(cdn.edge, regional.entry, now);
+            return _serve(cdn, req, regional.entry, "REGIONAL-HIT", "fresh", now);
+        }
+        if regional.state == "stale-while-revalidate" and not key_info.force_revalidate and stale_mode == "serve" {
+            cdn.metrics.regional_hits = cdn.metrics.regional_hits + 1;
+            cdn.metrics.stale_served = cdn.metrics.stale_served + 1;
+            return _serve(cdn, req, regional.entry, "REGIONAL-STALE", regional.state, now, true);
+        }
+        cdn.metrics.revalidations = cdn.metrics.revalidations + 1;
+    }
+    return _origin(cdn, req, key_info, origin_fn, now, error_candidate);
+}
+
+// Explicit revalidation consumes a stale result's token. A server can enqueue
+// this call on its own task system for true background SWR; single-threaded
+// callers use the deterministic blocking form instead.
+fn revalidate(cdn, req, origin_fn, options = nil) {
+    if options == nil { options = map{}; }
+    let key_info = request_key(cdn, req);
+    if not key_info.ok { return map{ ok: false, error: key_info.reason }; }
+    let now = _quantity(_option(options, "now_ms", now_ms()), now_ms(), 0);
+    let candidate = nil;
+    let edge = _lookup(cdn.edge, key_info.key, now);
+    if edge.found { candidate = edge.entry; }
+    else {
+        let regional = _lookup(cdn.regional, key_info.key, now);
+        if regional.found { candidate = regional.entry; }
+    }
+    cdn.metrics.revalidations = cdn.metrics.revalidations + 1;
+    let response = _origin(cdn, req, key_info, origin_fn, now, candidate);
+    return map{ ok: response.status < 500, response: response };
+}
+
+// ── Bounded invalidation ─────────────────────────────────────────────────────
+
+fn _purge_path_level(cache_obj, wanted, use_prefix) {
+    let keys = CACHE.keys(cache_obj);
+    let removed = 0;
+    let i = 0;
+    while i < len(keys) {
+        let entry = CACHE.peek(cache_obj, keys[i]);
+        let matches = false;
+        if entry != nil {
+            if use_prefix { matches = str_starts_with(entry.path, wanted); }
+            else { matches = entry.path == wanted; }
+        }
+        if matches { CACHE.delete(cache_obj, keys[i]); removed = removed + 1; }
+        i = i + 1;
+    }
+    return removed;
+}
+
+fn _purge_tag_level(cache_obj, wanted) {
+    let keys = CACHE.keys(cache_obj);
+    let removed = 0;
+    let i = 0;
+    while i < len(keys) {
+        let entry = CACHE.peek(cache_obj, keys[i]);
+        if entry != nil and _contains(try entry.tags catch [], wanted) {
+            CACHE.delete(cache_obj, keys[i]); removed = removed + 1;
+        }
+        i = i + 1;
+    }
+    return removed;
+}
+
+fn purge_request(cdn, req) {
+    let info = request_key(cdn, req);
+    if not info.ok { return map{ ok: false, error: info.reason, removed: 0 }; }
+    let removed = 0;
+    if CACHE.has(cdn.edge, info.key) { CACHE.delete(cdn.edge, info.key); removed = removed + 1; }
+    if CACHE.has(cdn.regional, info.key) { CACHE.delete(cdn.regional, info.key); removed = removed + 1; }
+    cdn.metrics.purges = cdn.metrics.purges + 1;
+    return map{ ok: true, removed: removed, cache_key: info.key };
+}
+
+fn purge_path(cdn, path, prefix = false) {
+    path = str(path);
+    if path == "" or not str_starts_with(path, "/") or not _control_free(path) or len(str_to_bytes(path)) > 4096 { return map{ ok: false, error: "invalid purge path", removed: 0 }; }
+    let edge = _purge_path_level(cdn.edge, path, prefix);
+    let regional = _purge_path_level(cdn.regional, path, prefix);
+    cdn.metrics.purges = cdn.metrics.purges + 1;
+    return map{ ok: true, removed: edge + regional, edge: edge, regional: regional };
+}
+
+fn purge_tag(cdn, value) {
+    let tag = _safe_tag(value);
+    if tag == nil { return map{ ok: false, error: "invalid purge tag", removed: 0 }; }
+    let edge = _purge_tag_level(cdn.edge, tag);
+    let regional = _purge_tag_level(cdn.regional, tag);
+    cdn.metrics.purges = cdn.metrics.purges + 1;
+    return map{ ok: true, removed: edge + regional, edge: edge, regional: regional, tag: tag };
+}
+
+fn purge_all(cdn) {
+    let edge = CACHE.size(cdn.edge);
+    let regional = CACHE.size(cdn.regional);
+    CACHE.clear(cdn.edge); CACHE.clear(cdn.regional);
+    cdn.metrics.purges = cdn.metrics.purges + 1;
+    return map{ ok: true, removed: edge + regional, edge: edge, regional: regional };
+}
+
+fn stats(cdn) {
+    return map{
+        format: "pblang.cdn.stats.v1", metrics: _copy_map(cdn.metrics),
+        edge: CACHE.stats(cdn.edge), regional: CACHE.stats(cdn.regional),
+        key_memo: CACHE.stats(cdn.key_hashes),
+        policy: cdn.default_policy, limits: map{
+            max_object_units: cdn.max_object_units, max_key_units: cdn.max_key_units,
+            max_query_pairs: cdn.max_query_pairs, max_tags: cdn.max_tags
+        }
+    };
+}
+
+// ── Static-site high-level API ───────────────────────────────────────────────
+
+fn is_hashed_asset(path) {
+    let clean = str(path);
+    let q = str_index_of(clean, "?");
+    if q >= 0 { clean = str_slice(clean, 0, q); }
+    let slash_parts = str_split(clean, "/");
+    let filename = try slash_parts[len(slash_parts) - 1] catch "";
+    let parts = str_split(filename, ".");
+    if len(parts) < 3 { return false; }
+    let i = 1;
+    while i < len(parts) - 1 {
+        let candidate = parts[i];
+        if len(candidate) >= 8 and len(candidate) <= 64 {
+            let hex = true;
+            let j = 0;
+            while j < len(candidate) {
+                let code = strcharcodeat(candidate, j);
+                let digit = code >= 48 and code <= 57;
+                let lower = code >= 97 and code <= 102;
+                let upper = code >= 65 and code <= 70;
+                if not digit and not lower and not upper { hex = false; }
+                j = j + 1;
+            }
+            if hex { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn static_asset_policy(path, normal_policy = nil, options = nil) {
+    if options == nil { options = map{}; }
+    let normal = if normal_policy == nil { public_policy(DEFAULT_TTL_MS) } else { policy(normal_policy) };
+    if _option(options, "auto_immutable", true) == true and is_hashed_asset(path) {
+        return immutable_policy(_quantity(_option(options, "immutable_ttl_ms", DEFAULT_IMMUTABLE_TTL_MS), DEFAULT_IMMUTABLE_TTL_MS, 1000), map{
+            stale_while_revalidate_ms: normal.stale_while_revalidate_ms,
+            stale_if_error_ms: normal.stale_if_error_ms,
+            tags: normal.tags
+        });
+    }
+    return normal;
+}
+
+fn static_origin(root, cache_policy = nil, options = nil) {
+    if options == nil { options = map{}; }
+    let p = if cache_policy == nil { public_policy(DEFAULT_TTL_MS, map{ stale_while_revalidate_ms: 30000, stale_if_error_ms: 300000 }) } else { policy(cache_policy) };
+    return fn(req) {
+        let response = HTTP.static_file_response(root, try req.path catch "/");
+        if response.status == 200 { response.cdn_policy = static_asset_policy(try req.path catch "/", p, options); }
+        else { response.cdn_policy = no_store_policy(); }
+        return response;
+    };
+}
+
+fn static_site(root, options = nil) {
+    if options == nil { options = map{}; }
+    let layer = create(options);
+    let origin = static_origin(root, _option(options, "policy", layer.default_policy), options);
+    return map{
+        format: "pblang.cdn.static_site.v1", cdn: layer, origin: origin,
+        handle: fn(req) { return fetch(layer, req, origin); },
+        purge_path: fn(path, prefix = false) { return purge_path(layer, path, prefix); },
+        purge_all: fn() { return purge_all(layer); },
+        stats: fn() { return stats(layer); }
+    };
+}
+
+fn static_files(root, options = nil) {
+    let site = static_site(root, options);
+    return fn(req) {
+        if str_upper(str(try req.method catch "GET")) != "GET" and str_upper(str(try req.method catch "GET")) != "HEAD" { return nil; }
+        let response = site.handle(req);
+        if response.status == 404 { return nil; }
+        return response;
+    };
+}
+
+export policy, public_policy, private_policy, immutable_policy, no_store_policy;
+export cache_control, parse_cache_control, create, request_key, fetch, revalidate;
+export purge_request, purge_path, purge_tag, purge_all, stats;
+export is_hashed_asset, static_asset_policy, static_origin, static_site, static_files;

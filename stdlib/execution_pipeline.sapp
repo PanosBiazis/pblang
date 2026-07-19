@@ -1,0 +1,250 @@
+// stdlib/execution_pipeline.sapp -- one bounded pblang-only facade for the
+// shared register IR, native backends, portable C99, WASM, and platform plans.
+// Backends are lazy-loaded so planning and reference execution stay small.
+
+let _IR = import("stdlib:codegen_ir.sapp");
+let _X64 = nil; let _X86 = nil; let _ARM64 = nil; let _WASM = nil; let _C99 = nil; let _FRONT = nil; let _PLATFORM = nil;
+
+fn _x64() { if _X64 == nil { _X64 = import("stdlib:codegen_x64.sapp"); } return _X64; }
+fn _x86() { if _X86 == nil { _X86 = import("stdlib:codegen_x86.sapp"); } return _X86; }
+fn _arm64() { if _ARM64 == nil { _ARM64 = import("stdlib:codegen_arm64.sapp"); } return _ARM64; }
+fn _wasm() { if _WASM == nil { _WASM = import("stdlib:codegen_wasm.sapp"); } return _WASM; }
+fn _c99() { if _C99 == nil { _C99 = import("stdlib:compiler/ctranspile.sapp"); } return _C99; }
+fn _front() { if _FRONT == nil { _FRONT = import("stdlib:compiler/selfhost_frontend.sapp"); } return _FRONT; }
+fn _platform() { if _PLATFORM == nil { _PLATFORM = import("stdlib:platform_emulator.sapp"); } return _PLATFORM; }
+
+let FORMAT = "pblang.execution.pipeline.v1";
+
+fn _option(options, key, fallback) {
+    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+fn _limit(options, key, fallback, hard_max) {
+    let value = _option(options, key, fallback);
+    if not is_number(value) or value < 1 or value != num_floor(value) or value > hard_max {
+        throw "execution_pipeline: " + key + " must be a positive integer <= " + str(hard_max);
+    }
+    return value;
+}
+fn limits(options = nil) {
+    if options != nil and not is_map(options) { throw "execution_pipeline: options must be a map"; }
+    return map{
+        max_source_bytes: _limit(options, "max_source_bytes", 1048576, 16777216),
+        max_ir_instructions: _limit(options, "max_ir_instructions", 10000, 1000000),
+        max_artifact_bytes: _limit(options, "max_artifact_bytes", 16777216, 67108864),
+        max_eval_steps: _limit(options, "max_eval_steps", 1000000, 100000000),
+        max_frames: _limit(options, "max_frames", 256, 4096),
+        max_stack: _limit(options, "max_stack", 4096, 1048576),
+        max_locals: _limit(options, "max_locals", 65536, 1048576),
+        max_output: _limit(options, "max_output", 65536, 1048576),
+        max_value_items: _limit(options, "max_value_items", 1048576, 16777216),
+        max_modules: _limit(options, "max_modules", 256, 4096),
+        max_module_depth: _limit(options, "max_module_depth", 64, 256),
+        max_module_source_bytes: _limit(options, "max_module_source_bytes", 1048576, 16777216),
+        max_total_source_bytes: _limit(options, "max_total_source_bytes", 8388608, 67108864),
+        max_linked_source_bytes: _limit(options, "max_linked_source_bytes", 16777216, 134217728),
+        max_path_bytes: _limit(options, "max_path_bytes", 1024, 4096),
+        allow_syscalls: _option(options, "allow_syscalls", false) == true
+    };
+}
+
+fn targets() {
+    return [
+        map{ name: "eval", input: "register-ir", artifact: "result", executable: true, sandbox: "bounded-reference" },
+        map{ name: "x86_64-linux", input: "register-ir", artifact: "elf64", executable: true, sandbox: "build-only" },
+        map{ name: "i386-linux", input: "register-ir", artifact: "elf32", executable: true, sandbox: "build-only" },
+        map{ name: "arm64-linux", input: "register-ir", artifact: "elf64", executable: true, sandbox: "build-only" },
+        map{ name: "c99", input: "register-ir", artifact: "portable-c-source", executable: false, sandbox: "build-only" },
+        map{ name: "interpreter", input: "pblang-source", artifact: "checked-bytecode", executable: false, sandbox: "compile-only" },
+        map{ name: "interpreter-bounded", input: "pblang-source", artifact: "result", executable: true, sandbox: "bounded-vm" },
+        map{ name: "c99-hosted", input: "pblang-source", artifact: "portable-c-source", executable: false, sandbox: "build-only" },
+        map{ name: "wasm32", input: "pblang-source", artifact: "webassembly", executable: false, sandbox: "build-only" }
+    ];
+}
+
+fn run_source(source, options = nil) {
+    let lim = limits(options);
+    if not is_string(source) { throw "execution_pipeline: source must be text"; }
+    if len(source) > lim.max_source_bytes { throw "execution_pipeline: source limit exceeded"; }
+    let result = _front().frontend_run_bounded(source, map{
+        max_source_bytes: lim.max_source_bytes, max_steps: lim.max_eval_steps,
+        max_frames: lim.max_frames, max_stack: lim.max_stack, max_locals: lim.max_locals,
+        max_output: lim.max_output, max_value_items: lim.max_value_items,
+        max_modules: lim.max_modules
+    });
+    if not result.ok { return map{ ok: false, format: FORMAT, target: "interpreter-bounded", error: result.error, diagnostics: result.diagnostics }; }
+    return map{
+        ok: true, format: FORMAT, target: "interpreter-bounded", input: "pblang-source",
+        kind: "result", executed: true, output: result.output, globals: result.globals,
+        runtime: result.runtime, optimization: result.optimization, limits: lim
+    };
+}
+
+fn _has_op(ir, wanted) {
+    let i = 0;
+    while i < len(ir) {
+        let op = ir[i][0];
+        if op == wanted { return true; }
+        if op == "loop" and _has_op(ir[i][2], wanted) { return true; }
+        if op == "ifnz" and (_has_op(ir[i][2], wanted) or _has_op(ir[i][3], wanted)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+fn _artifact_size(value) {
+    if is_array(value) or is_string(value) { return len(value); }
+    return len(str(value));
+}
+fn _check_artifact(artifact, cap) {
+    let size = _artifact_size(artifact);
+    if size > cap { throw "execution_pipeline: artifact limit exceeded"; }
+    return size;
+}
+
+fn build_ir(ir, target = "eval", options = nil) {
+    let lim = limits(options);
+    _IR.assert_valid(ir);
+    let input_count = _IR.instruction_count(ir);
+    if input_count > lim.max_ir_instructions { throw "execution_pipeline: IR instruction limit exceeded"; }
+    if _has_op(ir, "syscall") and not lim.allow_syscalls {
+        throw "execution_pipeline: syscalls require allow_syscalls: true";
+    }
+    let report = if _option(options, "optimize", true) { _IR.optimize_report(ir) }
+                 else { map{ ir: ir, mode: "disabled", before: input_count, after: input_count, removed: 0 }; };
+    let clean = report.ir;
+    let artifact = nil; let kind = ""; let executed = false; let evaluation = nil;
+    if target == "eval" {
+        evaluation = _IR.eval_bounded(clean, map{
+            max_steps: lim.max_eval_steps, max_stack: lim.max_stack, max_locals: lim.max_locals
+        });
+        artifact = evaluation.value; kind = "result"; executed = true;
+    } elif target == "x86_64-linux" {
+        artifact = _x64().compile_program(clean); kind = "elf64";
+    } elif target == "i386-linux" {
+        artifact = _x86().compile_program(clean); kind = "elf32";
+    } elif target == "arm64-linux" {
+        artifact = _arm64().compile_program(clean); kind = "elf64";
+    } elif target == "c99" {
+        artifact = _IR.emit_c(clean); kind = "portable-c-source";
+    } else {
+        throw "execution_pipeline: target requires pblang source or is unknown: " + str(target);
+    }
+    let size = _check_artifact(artifact, lim.max_artifact_bytes);
+    return map{
+        ok: true, format: FORMAT, target: target, input: "register-ir", kind: kind,
+        artifact: artifact, artifact_bytes: size, executed: executed, evaluation: evaluation,
+        optimization: report, limits: lim
+    };
+}
+
+fn _size_metric(target, kind, raw, optimized, cap) {
+    let before = _check_artifact(raw, cap);
+    let after = _check_artifact(optimized, cap);
+    return map{
+        target: target, kind: kind, before_bytes: before, after_bytes: after,
+        saved_bytes: before - after,
+        saved_percent: if before == 0 { 0 } else { ((before - after) * 100) / before }
+    };
+}
+
+// optimization_matrix validates one common register-IR program against the
+// bounded reference evaluator, then measures all implemented classical
+// backends. Native files are generated in memory and never executed.
+fn optimization_matrix(ir, options = nil) {
+    let lim = limits(options);
+    _IR.assert_valid(ir);
+    let input_count = _IR.instruction_count(ir);
+    if input_count > lim.max_ir_instructions { throw "execution_pipeline: IR instruction limit exceeded"; }
+    if _has_op(ir, "syscall") { throw "execution_pipeline: optimization matrix does not permit syscalls"; }
+    let report = _IR.optimize_report(ir); let clean = report.ir;
+    let raw_eval = _IR.eval_bounded(ir, map{
+        max_steps: lim.max_eval_steps, max_stack: lim.max_stack, max_locals: lim.max_locals
+    });
+    let clean_eval = _IR.eval_bounded(clean, map{
+        max_steps: lim.max_eval_steps, max_stack: lim.max_stack, max_locals: lim.max_locals
+    });
+    if raw_eval.value != clean_eval.value {
+        throw "execution_pipeline: optimizer reference mismatch";
+    }
+    let metrics = [];
+    array_push(metrics, _size_metric("x86_64-linux", "elf64",
+        _x64().compile_program(ir), _x64().compile_program(clean), lim.max_artifact_bytes));
+    array_push(metrics, _size_metric("i386-linux", "elf32",
+        _x86().compile_program(ir), _x86().compile_program(clean), lim.max_artifact_bytes));
+    array_push(metrics, _size_metric("arm64-linux", "elf64",
+        _arm64().compile_program(ir), _arm64().compile_program(clean), lim.max_artifact_bytes));
+    array_push(metrics, _size_metric("c99", "portable-c-source",
+        _IR.emit_c(ir), _IR.emit_c(clean), lim.max_artifact_bytes));
+    return map{
+        ok: true, format: "pblang.execution.optimization_matrix.v1",
+        reference_value: raw_eval.value, raw_evaluation: raw_eval,
+        optimized_evaluation: clean_eval, optimization: report, backends: metrics,
+        native_executed: false, limits: lim
+    };
+}
+
+fn build_source(source, target = "interpreter", options = nil) {
+    let lim = limits(options);
+    if not is_string(source) { throw "execution_pipeline: source must be text"; }
+    if len(source) > lim.max_source_bytes { throw "execution_pipeline: source limit exceeded"; }
+    let artifact = nil; let kind = ""; let link = nil;
+    let modules = _option(options, "modules", nil);
+    if modules != nil and target != "c99-hosted" {
+        return map{ ok: false, format: FORMAT, target: target,
+            error: "in-memory module snapshots are currently supported only by c99-hosted", diagnostics: [] };
+    }
+    if target == "interpreter" {
+        let compiled = _front().frontend_compile(source);
+        if not compiled.ok { return map{ ok: false, format: FORMAT, target: target, error: "compilation failed", diagnostics: compiled.diagnostics }; }
+        artifact = compiled.chunk; kind = "checked-bytecode";
+    } elif target == "c99-hosted" {
+        if modules != nil {
+            let linked = _c99().transpile_program_linked(source, modules, map{
+                entry_path: _option(options, "entry_path", "main.sapp"),
+                numeric: _option(options, "numeric", "float"), max_modules: lim.max_modules,
+                max_module_depth: lim.max_module_depth, max_module_source_bytes: lim.max_module_source_bytes,
+                max_total_source_bytes: lim.max_total_source_bytes,
+                max_linked_source_bytes: lim.max_linked_source_bytes, max_path_bytes: lim.max_path_bytes
+            });
+            if not linked.ok {
+                return map{ ok: false, format: FORMAT, target: target,
+                    error: "C99 module linking or translation failed", reason: linked.reason, diagnostics: [] };
+            }
+            artifact = linked.source; link = linked.link;
+        } else {
+            artifact = try _c99().transpile_program(source) catch nil;
+        }
+        if artifact == nil {
+            return map{ ok: false, format: FORMAT, target: target,
+                error: "C99 translation rejected unsupported or invalid source", diagnostics: [] };
+        }
+        kind = "portable-c-source";
+    } elif target == "wasm32" {
+        artifact = _wasm().compile_wasm(source); kind = "webassembly";
+    } else {
+        throw "execution_pipeline: target requires register IR or is unknown: " + str(target);
+    }
+    let size = _check_artifact(artifact, lim.max_artifact_bytes);
+    return map{
+        ok: true, format: FORMAT, target: target, input: "pblang-source", kind: kind,
+        artifact: artifact, artifact_bytes: size, executed: false, link: link, limits: lim
+    };
+}
+
+fn plan_platform(os, version, arch, options = nil) {
+    let profile = _platform().resolve(os, version, arch, options);
+    if not profile.ok { return map{ ok: false, format: FORMAT, profile: profile, error: profile.error }; }
+    let target = "c99"; let native = false;
+    if profile.os == "linux" and profile.arch == "x86_64" { target = "x86_64-linux"; native = true; }
+    elif profile.os == "linux" and profile.arch == "x86" { target = "i386-linux"; native = true; }
+    elif profile.os == "linux" and profile.arch == "arm64" { target = "arm64-linux"; native = true; }
+    elif profile.arch == "wasm32" { target = "wasm32"; native = true; }
+    let isa = _platform().isa_model(profile);
+    return map{
+        ok: true, format: FORMAT, profile: profile, target: target, direct_native: native,
+        isa: isa, fallback: if native { "none" } else { "portable C99 toolchain for target ABI" },
+        boundary: "build plan only; kernel, driver, firmware, DMA, and physical-device isolation remain platform responsibilities"
+    };
+}
+
+export limits, targets, build_ir, optimization_matrix, build_source, run_source, plan_platform;

@@ -1,0 +1,241 @@
+// Verified persistent cache for self-hosted PBLang module bytecode.
+// Cached chunks are an incremental compilation surface, never trusted input.
+
+let PBCK = import("stdlib/selfhost_pbck.sapp");
+
+let FORMAT = "pblang.selfhost.module-cache.v1";
+let MAX_SOURCE_BYTES = 16777216;
+let MAX_DEPENDENCIES = 32;
+let MAX_DEPENDENCY_BYTES = 4194304;
+let MAX_TOTAL_DEPENDENCY_BYTES = 33554432;
+let MAX_ARTIFACT_BYTES = 16777216;
+let MAX_METADATA_BYTES = 8192;
+
+let DEFAULT_DEPENDENCIES = [
+    "stdlib/compiler/tokenizer.sapp",
+    "stdlib/compiler/parser.sapp",
+    "stdlib/compiler/typeck.sapp",
+    "stdlib/compiler/codegen.sapp",
+    "stdlib/compiler/selfhost_frontend.sapp",
+    "stdlib/compiler/guard_preprocessor.sapp",
+    "stdlib/compiler/vm.sapp",
+    "stdlib/compiler/vm_builtins.sapp",
+    "stdlib/compiler/builtins_list.sapp",
+    "stdlib/compiler/diagnostic_suggestions.sapp",
+    "stdlib/compiler/module_cache.sapp",
+    "stdlib/selfhost_pbck.sapp"
+];
+let _default_toolchain_revision = "";
+
+fn _safe_digest(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < 64 {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _nonce() { return str_slice(sha256(str(now_ms()) + ":" + str(random_bytes(16))), 0, 24); }
+
+fn _replace(staged, destination) {
+    if try { fs_rename(staged, destination); true } catch false { return true; }
+    let backup = destination + ".bak-" + _nonce();
+    let moved = false;
+    if try fs_exists(destination) catch false {
+        moved = try { fs_rename(destination, backup); true } catch false;
+        if not moved { return false; }
+    }
+    let installed = try { fs_rename(staged, destination); true } catch false;
+    if not installed {
+        if moved { try fs_rename(backup, destination) catch nil; }
+        return false;
+    }
+    if moved { try fs_remove(backup) catch nil; }
+    return true;
+}
+
+fn default_root() {
+    let override = try env_get("PBLANG_MODULE_CACHE") catch nil;
+    if type(override) == "string" and override != "" { return override; }
+    let home = try env_get("HOME") catch nil;
+    if type(home) != "string" or home == "" { home = try env_get("USERPROFILE") catch nil; }
+    if type(home) == "string" and home != "" {
+        return path_join(home, ".pblang", "cache", "selfhost-modules-v1");
+    }
+    let temp = try env_get("TMPDIR") catch nil;
+    if type(temp) != "string" or temp == "" { temp = try env_get("TEMP") catch nil; }
+    if type(temp) != "string" or temp == "" { temp = "/tmp"; }
+    return path_join(temp, "pblang-cache", "selfhost-modules-v1");
+}
+
+fn toolchain_revision(dependency_paths = nil) {
+    let using_default = dependency_paths == nil;
+    if using_default and _default_toolchain_revision != "" { return _default_toolchain_revision; }
+    let paths = dependency_paths;
+    if paths == nil { paths = DEFAULT_DEPENDENCIES; }
+    if type(paths) != "array" or len(paths) == 0 or len(paths) > MAX_DEPENDENCIES {
+        throw "module_cache: invalid dependency list";
+    }
+    let material = FORMAT;
+    let total = 0; let i = 0;
+    while i < len(paths) {
+        let path = paths[i];
+        if type(path) != "string" or path == "" or len(path) > 4096 { throw "module_cache: invalid dependency path"; }
+        let source = try fs_read(path) catch nil;
+        if type(source) != "string" { throw "module_cache: cannot read dependency " + path; }
+        let size = len(str_to_bytes(source));
+        if size > MAX_DEPENDENCY_BYTES { throw "module_cache: dependency limit exceeded"; }
+        total = total + size;
+        if total > MAX_TOTAL_DEPENDENCY_BYTES { throw "module_cache: total dependency limit exceeded"; }
+        material = material + "\n" + path + ":" + str(size) + ":" + sha256(source);
+        i = i + 1;
+    }
+    let revision = sha256(material);
+    // Imported compiler modules are immutable for the life of this process.
+    // Re-hashing them on every cache lookup adds I/O without observing a newer
+    // implementation; a new process recomputes the revision after an upgrade.
+    if using_default { _default_toolchain_revision = revision; }
+    return revision;
+}
+
+fn context(root = nil, dependency_paths = nil) {
+    if root == nil { root = default_root(); }
+    if type(root) != "string" or root == "" or len(root) > 4096 { throw "module_cache: invalid root"; }
+    return map{
+        format: FORMAT,
+        root: root,
+        toolchain: toolchain_revision(dependency_paths),
+        hits: 0,
+        misses: 0,
+        stores: 0,
+        corruptions: 0,
+        store_failures: 0,
+        last_error: ""
+    };
+}
+
+fn cache_key(cache, module_path, processed_source) {
+    if type(cache) != "map" or (try cache.format catch nil) != FORMAT or not _safe_digest(try cache.toolchain catch nil) {
+        throw "module_cache: invalid context";
+    }
+    if type(module_path) != "string" or module_path == "" or len(module_path) > 4096 { throw "module_cache: invalid module path"; }
+    if type(processed_source) != "string" { throw "module_cache: source must be text"; }
+    let size = len(str_to_bytes(processed_source));
+    if size > MAX_SOURCE_BYTES { throw "module_cache: source limit exceeded"; }
+    return sha256(FORMAT + "\n" + cache.toolchain + "\n" + str(len(module_path)) + ":" + module_path
+        + "\n" + str(size) + ":" + processed_source);
+}
+
+fn _paths(cache, key) {
+    if not _safe_digest(key) { throw "module_cache: invalid key"; }
+    return map{
+        artifact: path_join(cache.root, key + ".pbcs"),
+        metadata: path_join(cache.root, key + ".json")
+    };
+}
+
+fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+
+fn _load(cache, key, account) {
+    let paths = _paths(cache, key);
+    let raw = try fs_read(paths.metadata) catch nil;
+    if type(raw) != "string" or len(raw) == 0 or len(str_to_bytes(raw)) > MAX_METADATA_BYTES {
+        if account { cache.misses = cache.misses + 1; }
+        return map{ hit: false, reason: "metadata-miss" };
+    }
+    let meta = try json_parse(raw) catch nil;
+    if type(meta) != "map" or (try meta.format catch nil) != FORMAT
+        or (try meta.cache_key catch nil) != key or (try meta.toolchain catch nil) != cache.toolchain {
+        if account { cache.misses = cache.misses + 1; cache.corruptions = cache.corruptions + 1; }
+        return map{ hit: false, reason: "metadata-invalid" };
+    }
+    let size = try meta.byte_len catch nil;
+    let expected = try meta.artifact_sha256 catch nil;
+    if type(size) != "number" or size != num_floor(size) or size < 9 or size > MAX_ARTIFACT_BYTES or not _safe_digest(expected) {
+        if account { cache.misses = cache.misses + 1; cache.corruptions = cache.corruptions + 1; }
+        return map{ hit: false, reason: "metadata-invalid" };
+    }
+    let bytes = try fs_read_bytes(paths.artifact) catch nil;
+    if type(bytes) != "array" or len(bytes) != size or _digest(bytes) != expected {
+        if account { cache.misses = cache.misses + 1; cache.corruptions = cache.corruptions + 1; }
+        return map{ hit: false, reason: "artifact-invalid" };
+    }
+    let chunk = try PBCK.deserialize_chunk(bytes) catch nil;
+    if chunk == nil {
+        if account { cache.misses = cache.misses + 1; cache.corruptions = cache.corruptions + 1; }
+        return map{ hit: false, reason: "bytecode-invalid" };
+    }
+    if account { cache.hits = cache.hits + 1; }
+    return map{ hit: true, chunk: chunk, byte_len: size, artifact_sha256: expected };
+}
+
+fn load(cache, key) { return _load(cache, key, true); }
+
+fn _store_error(cache, error) {
+    cache.store_failures = cache.store_failures + 1;
+    cache.last_error = error;
+    return map{ ok: false, error: error };
+}
+
+fn store(cache, key, chunk) {
+    let paths = _paths(cache, key);
+    let bytes = try PBCK.serialize_chunk(chunk) catch nil;
+    if type(bytes) != "array" or len(bytes) > MAX_ARTIFACT_BYTES {
+        return _store_error(cache, "module bytecode is invalid or too large");
+    }
+    let existing = _load(cache, key, false);
+    if existing.hit { return map{ ok: true, reused: true, byte_len: existing.byte_len }; }
+    if not (try { fs_mkdirs(cache.root); true } catch false) {
+        return _store_error(cache, "module cache directory creation failed");
+    }
+    let digest = _digest(bytes);
+    let meta = json_stringify(map{
+        format: FORMAT, cache_key: key, toolchain: cache.toolchain,
+        byte_len: len(bytes), artifact_sha256: digest
+    });
+    let suffix = ".tmp-" + _nonce();
+    let staged_artifact = paths.artifact + suffix;
+    let staged_metadata = paths.metadata + suffix;
+    let wrote_artifact = try { fs_write_bytes(staged_artifact, bytes); true } catch false;
+    let wrote_metadata = wrote_artifact and (try { fs_write(staged_metadata, meta); true } catch false);
+    if not wrote_metadata {
+        try fs_remove(staged_artifact) catch nil; try fs_remove(staged_metadata) catch nil;
+        return _store_error(cache, "module cache stage write failed");
+    }
+    let staged = try fs_read_bytes(staged_artifact) catch nil;
+    let verified = type(staged) == "array" and len(staged) == len(bytes) and _digest(staged) == digest
+        and (try { PBCK.deserialize_chunk(staged); true } catch false);
+    if not verified {
+        try fs_remove(staged_artifact) catch nil; try fs_remove(staged_metadata) catch nil;
+        return _store_error(cache, "module cache stage verification failed");
+    }
+    if not _replace(staged_artifact, paths.artifact) {
+        try fs_remove(staged_artifact) catch nil; try fs_remove(staged_metadata) catch nil;
+        return _store_error(cache, "module cache artifact publish failed");
+    }
+    if not _replace(staged_metadata, paths.metadata) {
+        try fs_remove(staged_metadata) catch nil;
+        return _store_error(cache, "module cache metadata publish failed");
+    }
+    cache.stores = cache.stores + 1;
+    return map{ ok: true, reused: false, byte_len: len(bytes), artifact_sha256: digest };
+}
+
+fn snapshot(cache) {
+    return map{
+        enabled: cache != nil,
+        format: if cache == nil { FORMAT } else { cache.format },
+        hits: if cache == nil { 0 } else { cache.hits },
+        misses: if cache == nil { 0 } else { cache.misses },
+        stores: if cache == nil { 0 } else { cache.stores },
+        corruptions: if cache == nil { 0 } else { cache.corruptions },
+        store_failures: if cache == nil { 0 } else { cache.store_failures },
+        last_error: if cache == nil { "" } else { cache.last_error }
+    };
+}
+
+export FORMAT, DEFAULT_DEPENDENCIES, default_root, toolchain_revision, context;
+export cache_key, load, store, snapshot;

@@ -18,6 +18,7 @@ use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureCreator};
 use sdl2::video::{Window, WindowContext};
+use sdl2::{EventPump, Sdl};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -32,7 +33,8 @@ pub fn use_sdl2() -> bool {
 pub(crate) struct Sdl2Window {
     canvas: Canvas<Window>,
     texture_creator: TextureCreator<WindowContext>,
-    sdl: sdl2::Sdl,
+    _sdl: Sdl,
+    event_pump: EventPump,
     w: u32,
     h: u32,
     buf: Vec<u32>,
@@ -75,12 +77,16 @@ pub(crate) fn create(
         .build()
         .map_err(|e| host.err(format!("sdl2 canvas: {e}")))?;
     let texture_creator = canvas.texture_creator();
+    let event_pump = sdl
+        .event_pump()
+        .map_err(|e| host.err(format!("sdl2 event pump: {e}")))?;
     let buf = vec![0u32; (width * height) as usize];
 
     let win = Sdl2Window {
         canvas,
         texture_creator,
-        sdl,
+        _sdl: sdl,
+        event_pump,
         w: width,
         h: height,
         buf,
@@ -135,6 +141,24 @@ pub fn remove(id: usize) {
     });
 }
 
+fn write_argb8888_rows(out: &mut [u8], pitch: usize, buf: &[u32], width: usize, height: usize) {
+    let min_pitch = width.saturating_mul(4);
+    if width == 0 || height == 0 || pitch < min_pitch {
+        return;
+    }
+    let rows = height.min(buf.len() / width).min(out.len() / pitch);
+    for row in 0..rows {
+        let src_row = &buf[row * width..(row + 1) * width];
+        let dst_row = &mut out[row * pitch..row * pitch + min_pitch];
+        for (dst, &pixel) in dst_row.chunks_exact_mut(4).zip(src_row.iter()) {
+            dst[0] = (pixel & 0xff) as u8;
+            dst[1] = ((pixel >> 8) & 0xff) as u8;
+            dst[2] = ((pixel >> 16) & 0xff) as u8;
+            dst[3] = ((pixel >> 24) & 0xff) as u8;
+        }
+    }
+}
+
 impl Sdl2Window {
     pub fn is_open(&self) -> bool {
         self.open
@@ -154,15 +178,21 @@ impl Sdl2Window {
     }
 
     pub fn draw_rect(&mut self, x: i64, y: i64, rw: i64, rh: i64, color: u32) {
-        let x0 = x.max(0) as u32;
-        let y0 = y.max(0) as u32;
-        let x1 = (x + rw).min(self.w as i64).max(0) as u32;
-        let y1 = (y + rh).min(self.h as i64).max(0) as u32;
-        for yy in y0..y1 {
-            let row = (yy * self.w) as usize;
-            for xx in x0..x1 {
-                self.buf[row + xx as usize] = color;
-            }
+        crate::graphics::fill_rect_into(
+            &mut self.buf,
+            self.w as usize,
+            self.h as usize,
+            x,
+            y,
+            rw,
+            rh,
+            color,
+        );
+    }
+
+    pub fn draw_rects(&mut self, rects: &[(i64, i64, i64, i64)], color: u32) {
+        for &(x, y, rw, rh) in rects {
+            self.draw_rect(x, y, rw, rh, color);
         }
     }
 
@@ -203,6 +233,7 @@ impl Sdl2Window {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_aa(
         &mut self,
         x: i64,
@@ -240,17 +271,7 @@ impl Sdl2Window {
             })?;
         texture
             .with_lock(None, |out: &mut [u8], pitch: usize| {
-                for (i, &pixel) in self.buf.iter().enumerate() {
-                    let y = i / self.w as usize;
-                    let x = i % self.w as usize;
-                    let offset = y * pitch + x * 4;
-                    if offset + 4 <= out.len() {
-                        out[offset] = (pixel & 0xff) as u8;
-                        out[offset + 1] = ((pixel >> 8) & 0xff) as u8;
-                        out[offset + 2] = ((pixel >> 16) & 0xff) as u8;
-                        out[offset + 3] = ((pixel >> 24) & 0xff) as u8;
-                    }
-                }
+                write_argb8888_rows(out, pitch, &self.buf, self.w as usize, self.h as usize);
             })
             .map_err(|e| RuntimeError {
                 message: format!("sdl2 lock: {e}"),
@@ -279,15 +300,8 @@ impl Sdl2Window {
         alloc_map: impl Fn(HashMap<String, Value>) -> Value,
     ) -> Result<Value, RuntimeError> {
         let mut out: Vec<Value> = Vec::new();
-        let mut event_pump = self.sdl.event_pump().map_err(|e| RuntimeError {
-            message: format!("sdl2 event pump: {e}"),
-            span: None,
-            source_name: None,
-            source: None,
-            stack: vec![],
-        })?;
 
-        for event in event_pump.poll_iter() {
+        while let Some(event) = self.event_pump.poll_event() {
             match event {
                 Event::Quit { .. } => {
                     self.open = false;
@@ -423,5 +437,40 @@ impl Sdl2Window {
 
     pub fn size(&self) -> (usize, usize) {
         (self.w as usize, self.h as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_argb8888_rows;
+
+    #[test]
+    fn write_argb8888_rows_preserves_byte_order() {
+        let pixels = [0x11223344, 0xAABBCCDD];
+        let mut out = [0u8; 8];
+        write_argb8888_rows(&mut out, 8, &pixels, 2, 1);
+        assert_eq!(out, [0x44, 0x33, 0x22, 0x11, 0xDD, 0xCC, 0xBB, 0xAA]);
+    }
+
+    #[test]
+    fn write_argb8888_rows_respects_pitch_padding() {
+        let pixels = [0x01020304, 0x05060708, 0x11121314, 0x15161718];
+        let mut out = [0xEEu8; 24];
+        write_argb8888_rows(&mut out, 12, &pixels, 2, 2);
+        assert_eq!(
+            out,
+            [
+                0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0xEE, 0xEE, 0xEE, 0xEE, 0x14, 0x13,
+                0x12, 0x11, 0x18, 0x17, 0x16, 0x15, 0xEE, 0xEE, 0xEE, 0xEE
+            ]
+        );
+    }
+
+    #[test]
+    fn write_argb8888_rows_ignores_invalid_pitch() {
+        let pixels = [0x01020304, 0x05060708];
+        let mut out = [0xEEu8; 6];
+        write_argb8888_rows(&mut out, 6, &pixels, 2, 1);
+        assert_eq!(out, [0xEE; 6]);
     }
 }

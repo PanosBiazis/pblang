@@ -1,0 +1,86 @@
+// tests/semantics/security_2fa_test.sapp — PBKDF2, HOTP/TOTP, and base32 in
+// stdlib/security.sapp.
+//
+// STANDARDS: PBKDF2-HMAC-SHA256 (RFC 2898/8018), HOTP (RFC 4226), TOTP (RFC 6238),
+// base32 (RFC 4648).
+//
+// TEST-VECTOR NOTE: the RFC 4226/6238 published test vectors assume HMAC-SHA1, and
+// the RFC 2898 vectors assume raw-byte messages. This stdlib has only the
+// hmac_sha256 builtin (which hashes a STRING's UTF-8 bytes), so HOTP/TOTP use
+// HMAC-SHA256 and both PBKDF2 and HOTP carry their binary inputs in hex-string form.
+// The outputs are therefore deterministic and internally consistent but do NOT match
+// the SHA-1 / raw-byte reference vectors. Accordingly these tests assert
+// SELF-CONSISTENCY (determinism, round-trips, digit shape, skew behaviour) plus one
+// known-answer base32 vector, rather than the RFC's SHA-1 vectors.
+
+let sec = import("stdlib/security.sapp");
+
+fn fail(m) { throw "FAIL " + m; }
+fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+
+// ── base32: known-answer vector (RFC 4648) + round-trip ──────────────────────────
+// "foobar" -> "MZXW6YTBOI======" (RFC 4648 §10).
+eq(sec.base32_encode(str_to_bytes("foobar")), "MZXW6YTBOI======", "base32_encode(foobar) known answer");
+// base32_decode of that string yields the bytes of "foobar".
+let want = str_to_bytes("foobar");
+let got = sec.base32_decode("MZXW6YTBOI======");
+eq(len(got), len(want), "base32_decode length");
+let bi = 0; while bi < len(want) { eq(got[bi], want[bi], "base32_decode byte " + str(bi)); bi = bi + 1; }
+// Round-trip through encode/decode.
+eq(bytes_to_str(sec.base32_decode(sec.base32_encode(str_to_bytes("Hello 2FA!")))), "Hello 2FA!", "base32 round-trip");
+// Lowercase + whitespace tolerated.
+eq(bytes_to_str(sec.base32_decode("mzxw 6ytb oi")), "foobar", "base32_decode lowercase/whitespace");
+
+// ── PBKDF2: determinism, salt-sensitivity, iteration-sensitivity ─────────────────
+let d1 = sec.pbkdf2_sha256("password", "saltsalt", 1000, 32);
+let d2 = sec.pbkdf2_sha256("password", "saltsalt", 1000, 32);
+eq(d1, d2, "pbkdf2 deterministic");
+eq(len(d1), 64, "pbkdf2 dklen=32 -> 64 hex chars");
+if sec.pbkdf2_sha256("password", "different", 1000, 32) == d1 { fail("pbkdf2 must depend on salt"); }
+if sec.pbkdf2_sha256("password", "saltsalt", 2000, 32) == d1 { fail("pbkdf2 must depend on iterations"); }
+if sec.pbkdf2_sha256("wrongpw", "saltsalt", 1000, 32) == d1 { fail("pbkdf2 must depend on password"); }
+// Longer dklen spanning multiple 32-byte blocks.
+eq(len(sec.pbkdf2_sha256("password", "saltsalt", 100, 48)), 96, "pbkdf2 dklen=48 -> 96 hex chars");
+
+// ── PBKDF2 password hashing: round-trip true / wrong password false ──────────────
+let ph = sec.hash_password_pbkdf2("hunter2", 1000);
+if not str_starts_with(ph, "pbkdf2_sha256$") { fail("hash_password_pbkdf2 self-describing prefix"); }
+eq(sec.verify_password_pbkdf2("hunter2", ph), true, "pbkdf2 verify correct password");
+eq(sec.verify_password_pbkdf2("wrong", ph), false, "pbkdf2 verify wrong password");
+// Two hashes of the same password differ (random salt).
+if sec.hash_password_pbkdf2("hunter2", 1000) == ph { fail("pbkdf2 hashes must use a random salt"); }
+
+// ── HOTP: determinism, digit count, counter-sensitivity ──────────────────────────
+let secret = "3132333435363738";   // hex secret ("12345678")
+let c0 = sec.hotp(secret, 0, 6);
+eq(sec.hotp(secret, 0, 6), c0, "hotp deterministic (same secret+counter)");
+eq(len(c0), 6, "hotp 6 digits");
+eq(len(sec.hotp(secret, 0, 8)), 8, "hotp 8 digits");
+if sec.hotp(secret, 1, 6) == c0 { fail("hotp must depend on the counter"); }
+// Every character is a digit.
+let di = 0; while di < len(c0) { if str_index_of("0123456789", str_slice(c0, di, di + 1)) < 0 { fail("hotp non-digit"); } di = di + 1; }
+// Byte-array secret and its hex form agree.
+eq(sec.hotp([49, 50, 51, 52, 53, 54, 55, 56], 0, 6), c0, "hotp accepts byte-array secret == hex secret");
+
+// ── TOTP: equals HOTP over the time step; determinism ────────────────────────────
+let t0 = 59;          // arbitrary fixed epoch second
+let step = 30;
+eq(sec.totp(secret, t0, step, 6), sec.hotp(secret, num_floor(t0 / step), 6), "totp == hotp(floor(time/step))");
+eq(sec.totp(secret, t0, step, 6), sec.totp(secret, t0, step, 6), "totp deterministic");
+// Same step window -> same code; next window -> (almost always) different code.
+eq(sec.totp(secret, 30, step, 6), sec.totp(secret, 59, step, 6), "totp stable within a step window");
+
+// ── totp_verify: accepts a fresh code, rejects a wrong one, honours skew ─────────
+let now = 1000000;
+let code = sec.totp(secret, now, step, 6);
+eq(sec.totp_verify(secret, code, now, step, 6, 1), true, "totp_verify accepts current code");
+eq(sec.totp_verify(secret, "000000", now, step, 6, 1), false, "totp_verify rejects a wrong code");
+// A code from the previous step is accepted within skew=1 but rejected at skew=0.
+let prev_code = sec.totp(secret, now - step, step, 6);
+eq(sec.totp_verify(secret, prev_code, now, step, 6, 1), true, "totp_verify accepts prev window at skew=1");
+eq(sec.totp_verify(secret, prev_code, now, step, 6, 0), false, "totp_verify rejects prev window at skew=0");
+// A code two steps away is outside skew=1.
+let far_code = sec.totp(secret, now - step * 2, step, 6);
+eq(sec.totp_verify(secret, far_code, now, step, 6, 1), false, "totp_verify rejects a code 2 windows away at skew=1");
+
+print "security_2fa_pass";

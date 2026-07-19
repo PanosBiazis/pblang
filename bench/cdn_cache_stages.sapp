@@ -1,0 +1,96 @@
+// Correctness-gated microbenchmark for the local CDN cache/control layer.
+// It measures one PBLang process; it does not claim global POP latency.
+let B = import("stdlib:benchmark.sapp");
+let CDN = import("stdlib:cdn_cache.sapp");
+let CACHE = import("stdlib:cache.sapp");
+
+fn phase(name, operations, samples, work) {
+    let warm = 0;
+    while warm < 2 {
+        let i = 0; while i < operations { work(i); i = i + 1; }
+        warm = warm + 1;
+    }
+    let times = [];
+    let sample = 0;
+    while sample < samples {
+        let started = now_ms();
+        let i = 0; while i < operations { work(i); i = i + 1; }
+        push(times, now_ms() - started);
+        sample = sample + 1;
+    }
+    let result = B.stats(name, times);
+    result.operations_per_sample = operations;
+    result.ns_per_operation = (result.median_ms * 1000000.0) / operations;
+    print "CDN_PHASE|" + name + "|" + json_stringify(result);
+    return result;
+}
+
+let layer = CDN.create(map{
+    allowed_hosts: ["bench.local"], edge_max_entries: 4096,
+    regional_max_entries: 4096, edge_max_units: 67108864,
+    regional_max_units: 67108864,
+    policy: map{ scope: "public", ttl_ms: 600000 }
+});
+let request = map{
+    method: "GET", scheme: "https", host: "bench.local", path: "/asset.js?v=1",
+    headers: map{ "Accept-Encoding": "gzip", "Accept-Language": "en" }
+};
+let origin_calls = 0;
+let origin = fn(req) {
+    origin_calls = origin_calls + 1;
+    return map{ status: 200, body: "benchmark-asset", content_type: "application/javascript", headers: map{ "Cache-Tag": "bench" } };
+};
+let seeded = CDN.fetch(layer, request, origin);
+assert(seeded.status == 200 and origin_calls == 1, "benchmark seed is correct");
+let info = CDN.request_key(layer, request);
+let sink = 0;
+
+phase("direct_origin", 1000, 9, fn(index) {
+    let response = origin(request);
+    sink = sink + len(response.body);
+});
+
+phase("edge_hit", 1000, 9, fn(index) {
+    let response = CDN.fetch(layer, request, origin);
+    assert(response.cdn.source == "EDGE-HIT", "edge benchmark must remain a hit");
+    sink = sink + len(response.body);
+});
+
+phase("regional_hit_and_promotion", 300, 9, fn(index) {
+    CACHE.delete(layer.edge, info.key);
+    let response = CDN.fetch(layer, request, origin);
+    assert(response.cdn.source == "REGIONAL-HIT", "regional benchmark must remain shielded");
+    sink = sink + len(response.body);
+});
+
+let conditional = map{
+    method: "GET", scheme: "https", host: "bench.local", path: request.path,
+    headers: map{
+        "Accept-Encoding": "gzip", "Accept-Language": "en",
+        "If-None-Match": seeded.headers.ETag
+    }
+};
+phase("conditional_304", 1000, 9, fn(index) {
+    let response = CDN.fetch(layer, conditional, origin);
+    assert(response.status == 304 and response.body == "", "conditional benchmark must remain 304");
+    sink = sink + response.status;
+});
+
+let miss_layer = CDN.create(map{
+    allowed_hosts: ["bench.local"], edge_max_entries: 4096,
+    regional_max_entries: 4096, edge_max_units: 67108864,
+    regional_max_units: 67108864,
+    policy: map{ scope: "public", ttl_ms: 600000 }
+});
+phase("origin_miss_and_store", 200, 9, fn(index) {
+    let miss_req = map{ method: "GET", scheme: "https", host: "bench.local", path: "/item/" + str(index), headers: map{} };
+    CDN.purge_request(miss_layer, miss_req);
+    let response = CDN.fetch(miss_layer, miss_req, origin);
+    assert(response.cdn.source == "MISS", "origin benchmark must remain a miss");
+    sink = sink + len(response.body);
+});
+
+let purged = CDN.purge_tag(layer, "bench");
+assert(purged.ok and purged.removed >= 2, "benchmark closes with verified tag invalidation");
+if sink <= 0 { throw "CDN benchmark sink was not exercised"; }
+print "CDN_SUITE|ok|origin_calls=" + str(origin_calls);

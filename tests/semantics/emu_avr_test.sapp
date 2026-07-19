@@ -1,0 +1,84 @@
+// emu_avr_test.sapp — a verified AVR (ATmega) execution model in pblang (the microcontroller end of the suite).
+//
+// AVR is the 8-bit chip inside the Arduino Uno (ATmega328) and countless appliances, toys, calculators, and
+// toasters — 32 registers r0..r31, a status flag Z, 16-bit instruction words with split register fields. This
+// models the subset a codegen would emit and verifies by COMPUTED RESULT, so a future pblang AVR backend
+// (Arduino/embedded) can be RUN-tested here with no hardware. `HALT` (the BREAK opcode) exits with r24 — the
+// register the Arts/AVR calling convention uses for a byte return value.
+
+fn fail(m) { throw "FAIL emu-avr: " + m; }
+fn _cat(a, b) { let i = 0; while i < len(b) { push(a, b[i]); i = i + 1; } return a; }
+fn _le16(w) { return [w % 256, num_floor(w / 256) % 256]; }
+// register-pair split used by ADD/SUB/CP/MOV/MUL: `...... rd dddd rrrr`  (r hi = bit9, d hi = bit8)
+fn _split(rr, rd) { return (num_floor(rr / 16) % 2) * 512 + (num_floor(rd / 16) % 2) * 256 + (rd % 16) * 16 + (rr % 16); }
+
+// ── encoder ──
+fn LDI(rd, k) { return _le16(57344 + (num_floor(k / 16) % 16) * 256 + (rd - 16) * 16 + (k % 16)); }  // 0xE000
+fn CPI(rd, k) { return _le16(12288 + (num_floor(k / 16) % 16) * 256 + (rd - 16) * 16 + (k % 16)); }  // 0x3000
+fn ADD(rd, rr) { return _le16(3072 + _split(rr, rd)); }    // 0x0C00
+fn SUB(rd, rr) { return _le16(6144 + _split(rr, rd)); }    // 0x1800
+fn CP(rd, rr)  { return _le16(5120 + _split(rr, rd)); }    // 0x1400
+fn MOV(rd, rr) { return _le16(11264 + _split(rr, rd)); }   // 0x2C00
+fn MUL(rd, rr) { return _le16(39936 + _split(rr, rd)); }   // 0x9C00 -> r1:r0
+fn INC(rd) { return _le16(37891 + rd * 16); }              // 0x9403
+fn DEC(rd) { return _le16(37898 + rd * 16); }              // 0x940A
+fn BRNE(k) { let kk = k; if kk < 0 { kk = kk + 128; } return _le16(62465 + kk * 8); }  // 0xF401
+fn BREQ(k) { let kk = k; if kk < 0 { kk = kk + 128; } return _le16(61441 + kk * 8); }  // 0xF001
+fn RJMP(k) { let kk = k; if kk < 0 { kk = kk + 4096; } return _le16(49152 + kk); }     // 0xC000
+fn HALT() { return _le16(38296); }                         // 0x9598 BREAK -> exit r24
+
+// ── interpreter ──
+fn _z(v) { if v == 0 { return 1; } return 0; }
+fn _w8(v) { let r = v % 256; if r < 0 { r = r + 256; } return r; }
+fn _s7(v) { if v >= 64 { return v - 128; } return v; }
+fn avr_run(code) {
+    let R = []; let i = 0; while i < 32 { push(R, 0); i = i + 1; } let zf = 0;
+    let nw = num_floor(len(code) / 2); let pc = 0; let guard = 0; let halted = false;
+    while pc >= 0 and pc < nw and guard < 1000000 and not halted {
+        guard = guard + 1;
+        let word = code[pc * 2] + code[pc * 2 + 1] * 256;
+        let rd5 = num_floor(word / 256) % 2 * 16 + num_floor(word / 16) % 16;     // ADD/etc d
+        let rr5 = num_floor(word / 512) % 2 * 16 + word % 16;                     // ADD/etc r
+        let rdL = 16 + num_floor(word / 16) % 16;                                 // LDI/CPI d (16..31)
+        let kimm = (num_floor(word / 256) % 16) * 16 + word % 16;                 // LDI/CPI K
+        let rd9 = num_floor(word / 16) % 32;                                      // INC/DEC d
+        let next = pc + 1;
+        if word == 38296 { halted = true; }                                                   // HALT (BREAK)
+        else if (word & 64519) == 62465 { let k = _s7(num_floor(word / 8) % 128); if zf == 0 { next = pc + 1 + k; } }  // BRNE
+        else if (word & 64519) == 61441 { let k = _s7(num_floor(word / 8) % 128); if zf == 1 { next = pc + 1 + k; } }  // BREQ
+        else if (word & 65039) == 37891 { R[rd9] = _w8(R[rd9] + 1); zf = _z(R[rd9]); }         // INC
+        else if (word & 65039) == 37898 { R[rd9] = _w8(R[rd9] - 1); zf = _z(R[rd9]); }         // DEC
+        else if (word & 64512) == 39936 { let p = R[rd5] * R[rr5]; R[0] = p % 256; R[1] = num_floor(p / 256) % 256; zf = _z(p); } // MUL
+        else if (word & 61440) == 57344 { R[rdL] = kimm; }                                     // LDI
+        else if (word & 61440) == 12288 { zf = _z(R[rdL] - kimm); }                            // CPI
+        else if (word & 61440) == 49152 { let k = word % 4096; if k >= 2048 { k = k - 4096; } next = pc + 1 + k; } // RJMP
+        else if (word & 64512) == 3072  { R[rd5] = _w8(R[rd5] + R[rr5]); zf = _z(R[rd5]); }     // ADD
+        else if (word & 64512) == 6144  { R[rd5] = _w8(R[rd5] - R[rr5]); zf = _z(R[rd5]); }     // SUB
+        else if (word & 64512) == 5120  { zf = _z(_w8(R[rd5] - R[rr5])); }                      // CP
+        else if (word & 64512) == 11264 { R[rd5] = R[rr5]; }                                    // MOV
+        else { throw "avr_run: unmodeled word " + str(word); }
+        pc = next;
+    }
+    if not halted { if guard >= 1000000 { fail("instruction budget exceeded"); } fail("ran off the end without HALT"); }
+    return R[24];
+}
+
+// ── encoder spec-checks (canonical AVR encodings) ──
+fn eqw(bytes, want, m) { let w = bytes[0] + bytes[1] * 256; if w != want { fail(m + ": got " + str(w) + " want " + str(want)); } }
+eqw(LDI(16, 255), 61199, "LDI r16,0xFF = 0xEF0F");   // 0xEF0F = 61199
+eqw(ADD(16, 17), 3841, "ADD r16,r17 = 0x0F01");      // 0x0F01 = 3841
+
+// ── programs verified by result (exit = r24) ──
+fn prog(insns) { let c = []; let i = 0; while i < len(insns) { _cat(c, insns[i]); i = i + 1; } return c; }
+fn eq(g, w, m) { if g != w { fail(m + ": got " + str(g) + " want " + str(w)); } }
+
+eq(avr_run(prog([LDI(24, 42), HALT()])),                                           42, "LDI const");
+eq(avr_run(prog([LDI(24, 5), LDI(25, 7), ADD(24, 25), HALT()])),                   12, "ADD 5+7");
+eq(avr_run(prog([LDI(24, 20), LDI(25, 8), SUB(24, 25), HALT()])),                  12, "SUB 20-8");
+eq(avr_run(prog([LDI(24, 250), LDI(25, 20), ADD(24, 25), HALT()])),                14, "ADD wraps 270&255");
+eq(avr_run(prog([LDI(24, 6), LDI(25, 7), MUL(24, 25), MOV(24, 0), HALT()])),       42, "MUL 6*7 (r1:r0 -> r24)");
+// loop: r24 += r18(=3) for r16=5 iterations -> 15.  BRNE k=-3 (back to the ADD)
+eq(avr_run(prog([LDI(24, 0), LDI(18, 3), LDI(16, 5),
+                 ADD(24, 18), DEC(16), BRNE(0 - 3), HALT()])),                     15, "loop 3*5 via ADD/DEC/BRNE");
+
+print "emu_avr: 8-bit ATmega (Arduino) — encoder matches spec, arithmetic/wrap/MUL/loop all computed correctly";

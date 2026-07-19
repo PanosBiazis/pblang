@@ -1,0 +1,161 @@
+// stdlib/target_artifact.sapp -- fail-closed executable target planner.
+//
+// Platform profiles describe userspace contracts. This module separately lists
+// executable backends that really emit bytes. A profile is never treated as a
+// compiler backend merely because an OS or architecture appears in the catalog.
+
+let Platform = import("stdlib:platform_emulator.sapp");
+let Cross = import("stdlib:codegen_cross.sapp");
+let DOS = import("stdlib:codegen_dos.sapp");
+let CPM = import("stdlib:codegen_cpm.sapp");
+let WASM = import("stdlib:codegen_wasm.sapp");
+let IR = import("stdlib:codegen_ir.sapp");
+
+let ARTIFACT_FORMAT = "pblang.target-artifact.v1";
+
+fn _row(os, arch, format, extension, min_os, min_cpu, input, status, backend, requirements) {
+    return map{
+        os: os, arch: arch, format: format, extension: extension,
+        min_os: min_os, min_cpu: min_cpu, input: input, status: status,
+        backend: backend, requirements: requirements
+    };
+}
+
+fn _build_backends() {
+    return [
+        _row("dos", "x86", "com", ".com", "2.0", "8086", "ir", "execution-model-verified", "dos-com16", []),
+        _row("cpm", "z80", "com", ".com", "2.2", "z80", "ir", "execution-model-verified", "cpm-z80-com", []),
+        _row("linux", "x86", "elf", "", "2.6", "i386", "ir", "run-verified", "linux-elf32", []),
+        _row("linux", "x86_64", "elf", "", "2.6", "x86-64", "ir", "run-verified", "linux-elf64", []),
+        _row("linux", "arm64", "elf", "", "3.7", "armv8-a", "ir", "execution-model-verified", "linux-elf64-arm", []),
+        _row("freebsd", "x86_64", "elf", "", "12", "x86-64", "ir", "format-and-syscall-abi-verified", "freebsd-elf64", ["verify on target FreeBSD version"]),
+        _row("windows", "x86", "pe", ".exe", "5.1", "i386", "ir", "format-and-import-verified", "windows-pe32", ["verify on target Windows version"]),
+        _row("windows", "x86_64", "pe", ".exe", "5.2", "x86-64", "ir", "format-and-import-verified", "windows-pe32plus", ["verify on target Windows version"]),
+        _row("macos", "x86_64", "macho", "", "10.6", "x86-64", "ir", "format-verified", "macos-macho64", ["codesign on target", "verify on target macOS version"]),
+        _row("wasi", "wasm32", "wasm", ".wasm", "1", "wasm32", "source", "runtime-verified", "wasi-wasm32", ["WASI-compatible runtime for WASI imports"])
+    ];
+}
+
+let _BACKENDS = _build_backends();
+let _INDEX = map{};
+let _bi = 0;
+while _bi < len(_BACKENDS) {
+    _INDEX[_BACKENDS[_bi].os + ":" + _BACKENDS[_bi].arch] = _BACKENDS[_bi];
+    _bi = _bi + 1;
+}
+
+fn backends() { return _BACKENDS; }
+
+fn _failure(os, version, arch, reason, profile = nil) {
+    return map{
+        ok: false, format: ARTIFACT_FORMAT, os: os, version: str(version), arch: arch,
+        error: reason, profile: profile,
+        portable_fallbacks: ["c99-source"],
+        note: "a portable fallback is source, not a target-native executable"
+    };
+}
+
+// plan() is intentionally fail-closed. `ok` means an emitter exists, not that an
+// untested foreign artifact has magically been run on the current host.
+fn plan(os_value, version_value, arch_value, options = nil) {
+    let profile = Platform.resolve(os_value, version_value, arch_value, options);
+    if not profile.ok {
+        return _failure(profile.os, profile.version, profile.arch, profile.error, profile);
+    }
+    let key = profile.os + ":" + profile.arch;
+    if not map_has(_INDEX, key) {
+        return _failure(profile.os, profile.version, profile.arch,
+            "no verified native artifact backend for this OS/architecture", profile);
+    }
+    let backend = _INDEX[key];
+    if Platform.compare_versions(profile.version, backend.min_os) < 0 {
+        return _failure(profile.os, profile.version, profile.arch,
+            "backend requires OS version " + backend.min_os + " or newer", profile);
+    }
+    return map{
+        ok: true, format: ARTIFACT_FORMAT, os: profile.os, version: profile.version,
+        arch: profile.arch, executable_format: backend.format,
+        extension: backend.extension, min_os: backend.min_os, min_cpu: backend.min_cpu,
+        input: backend.input, status: backend.status, backend: backend.backend,
+        requirements: backend.requirements, profile: profile
+    };
+}
+
+fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+fn _artifact(target, bytes) {
+    let detected = target.executable_format;
+    if target.executable_format != "com" and target.executable_format != "wasm" {
+        detected = Cross.format_of(bytes);
+        if detected != target.executable_format {
+            throw "target_artifact: backend emitted " + detected + ", expected " + target.executable_format;
+        }
+    }
+    if target.executable_format == "wasm" and
+       (len(bytes) < 8 or bytes[0] != 0 or bytes[1] != 0x61 or bytes[2] != 0x73 or bytes[3] != 0x6D) {
+        throw "target_artifact: invalid WebAssembly magic";
+    }
+    return map{
+        ok: true, format: ARTIFACT_FORMAT, target: target, bytes: bytes,
+        size: len(bytes), sha256: _digest(bytes), detected_format: detected
+    };
+}
+
+fn build_ir(target, ir) {
+    if not is_map(target) or not (try target.ok catch false) { throw "target_artifact: a successful plan is required"; }
+    if target.input != "ir" { throw "target_artifact: target requires " + target.input + " input"; }
+    IR.assert_valid(ir);
+    let bytes = nil;
+    if target.backend == "dos-com16" { bytes = DOS.compile_program(ir); }
+    elif target.backend == "cpm-z80-com" { bytes = CPM.compile_program(ir); }
+    elif target.backend == "linux-elf32" { bytes = Cross.build("linux", "x86", ir); }
+    elif target.backend == "linux-elf64" { bytes = Cross.build("linux", "x86_64", ir); }
+    elif target.backend == "linux-elf64-arm" { bytes = Cross.build("linux", "arm64", ir); }
+    elif target.backend == "freebsd-elf64" { bytes = Cross.build("freebsd", "x86_64", ir); }
+    elif target.backend == "windows-pe32" { bytes = Cross.build("windows", "x86", ir); }
+    elif target.backend == "windows-pe32plus" { bytes = Cross.build("windows", "x86_64", ir); }
+    elif target.backend == "macos-macho64" { bytes = Cross.build("macos", "x86_64", ir); }
+    else { throw "target_artifact: unknown IR backend " + target.backend; }
+    return _artifact(target, bytes);
+}
+
+fn build_source(target, source) {
+    if not is_map(target) or not (try target.ok catch false) { throw "target_artifact: a successful plan is required"; }
+    if target.backend != "wasi-wasm32" or target.input != "source" {
+        throw "target_artifact: target does not accept PBLang source input";
+    }
+    return _artifact(target, WASM.compile_wasm(source));
+}
+
+fn emit_c99(ir) {
+    IR.assert_valid(ir);
+    return map{
+        ok: true, format: "pblang.portable-source.v1", language: "c99",
+        source: IR.emit_c(ir), note: "requires a target C99 compiler and platform runtime"
+    };
+}
+
+fn write(path, artifact) {
+    if not is_string(path) or len(path) == 0 or str_contains(path, "\x00") { throw "target_artifact: invalid output path"; }
+    if not is_map(artifact) or not (try artifact.ok catch false) or not is_array(artifact.bytes) {
+        throw "target_artifact: validated artifact required";
+    }
+    fs_write_bytes(path, artifact.bytes);
+    return map{ ok: true, path: path, size: artifact.size, sha256: artifact.sha256 };
+}
+
+fn coverage() {
+    let profiles = Platform.catalog(); let covered = map{}; let i = 0;
+    while i < len(_BACKENDS) { covered[_BACKENDS[i].os] = true; i = i + 1; }
+    let missing = []; i = 0;
+    while i < len(profiles) {
+        if not map_has(covered, profiles[i].os) { array_push(missing, profiles[i].os); }
+        i = i + 1;
+    }
+    return map{
+        platform_families: len(profiles), native_backend_pairs: len(_BACKENDS),
+        covered_families: len(map_keys(covered)), missing_families: missing,
+        complete: len(missing) == 0
+    };
+}
+
+export backends, plan, build_ir, build_source, emit_c99, write, coverage;

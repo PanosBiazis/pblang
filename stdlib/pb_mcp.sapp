@@ -10,9 +10,12 @@ let WATCH = import("stdlib:watch.sapp");
 let TUNE = import("stdlib:sampling_tune.sapp");     // context-adaptive sampling params (cycle-free)
 let NORM = import("stdlib:text_normalize.sapp");    // reply output normalizer (cycle-free)
 let DEOB = import("stdlib:deobfuscate.sapp");       // adversarial input de-obfuscation (cycle-free)
+let KG = import("stdlib:knowledge_graph.sapp");     // graphify + Obsidian: notes → knowledge graph
+let CG = import("stdlib:code_graph.sapp");          // graphify for CODE: .sapp structure → module graph
 
 let MAX_READ_CHARS = 20000;
 let MAX_FILES = 400;
+let MAX_FIND_SCAN = 10000;
 let MAX_GREP = 80;
 
 fn _safe_path(path) {
@@ -254,7 +257,10 @@ fn find_files(name, dir = ".", max_results = nil) {
     if name == nil { name = ""; }
     dir = _safe_path(dir);
     let needle = str_lower(name);
-    let files = list_files(dir, MAX_FILES);
+    // The result limit must be applied after filtering. Using MAX_FILES here
+    // truncated large directories before a matching filename was visited.
+    // Keep discovery bounded with a separate, explicit traversal ceiling.
+    let files = list_files(dir, MAX_FIND_SCAN);
     let out = [];
     for i len(files) {
         if len(out) >= max_results { return out; }
@@ -444,9 +450,9 @@ fn tool_info(name) {
 
 // Required argument names per tool, for validate_call's dry-run check. Tools not
 // listed here have no required args (all-default or zero-arg).
-let _REQ = nil;
+let _REQ = map{};
 fn _required_args() {
-    if _REQ != nil { return _REQ; }
+    if len(map_keys(_REQ)) > 0 { return _REQ; }
     _REQ = map{
         read_file: ["path"], read_file_tail: ["path"], head_file: ["path"],
         file_exists: ["path"], file_stats: ["path"], file_hash: ["path"], outline: ["path"],
@@ -501,13 +507,13 @@ fn outline(path) {
     let out = [];
     for i len(lines) {
         let t = str_trim(lines[i]);
-        let kind = nil;
+        let kind = "";
         let rest = "";
         if str_starts_with(t, "fn ") { kind = "fn"; rest = str_slice(t, 3, len(t)); }
         else if str_starts_with(t, "struct ") { kind = "struct"; rest = str_slice(t, 7, len(t)); }
         else if str_starts_with(t, "class ") { kind = "class"; rest = str_slice(t, 6, len(t)); }
         else if str_starts_with(t, "enum ") { kind = "enum"; rest = str_slice(t, 5, len(t)); }
-        if kind != nil {
+        if kind != "" {
             let name = _ident_head(str_trim(rest));
             if name != "" { array_push(out, map{ kind: kind, name: name, line: i + 1 }); }
         }
@@ -630,6 +636,99 @@ fn _count_call(tool) {
     return nil;
 }
 
+// ── graphify: notes → knowledge graph (Obsidian-style [[wikilinks]] + backlinks) ─────────────────
+// Build a knowledge graph from the .md/.txt notes under `dir` and return a compact, agent-friendly
+// summary: counts, community count, top hubs, orphans, and the plain-language report. Lets pbAI answer
+// "how are these notes connected / what links to X" without leaving the workspace.
+fn _stem_of(f) {
+    let last = 0 - 1; let i = 0;
+    while i < len(f) { if strcharcodeat(f, i) == 46 { last = i; } i = i + 1; }   // 46 = '.'
+    if last >= 0 { return str_slice(f, 0, last); }
+    return f;
+}
+fn _is_note(f) {
+    if len(f) > 3 and str_slice(f, len(f) - 3, len(f)) == ".md" { return true; }
+    if len(f) > 4 and str_slice(f, len(f) - 4, len(f)) == ".txt" { return true; }
+    return false;
+}
+fn graphify(dir = ".") {
+    let d = _safe_path(dir);
+    let files = try FS.listdir(d) catch [];
+    let corpus = map{};
+    let n = 0; let i = 0;
+    while i < len(files) and n < MAX_FILES {
+        let f = files[i];
+        if _is_note(f) {
+            let text = try FS.read(d + "/" + f) catch nil;
+            if text != nil { corpus[_stem_of(f)] = text; n = n + 1; }
+        }
+        i = i + 1;
+    }
+    if n == 0 { return map{ notes: 0, note: "no .md/.txt notes found under '" + dir + "'" }; }
+    let g = KG.build(corpus);
+    let cm = KG.communities(g);
+    return map{
+        notes: n, links: len(g.edges), communities: cm.count,
+        hubs: KG.hubs(g, 5), orphans: KG.orphans(g),
+        unresolved: KG.unresolved(g), report: KG.report(g)
+    };
+}
+// graphify_backlinks(dir, note) — who links TO `note` across the workspace's notes.
+fn graphify_backlinks(dir, note) {
+    let d = _safe_path(dir);
+    let files = try FS.listdir(d) catch [];
+    let corpus = map{};
+    let i = 0;
+    while i < len(files) {
+        let f = files[i];
+        if _is_note(f) { let t = try FS.read(d + "/" + f) catch nil; if t != nil { corpus[_stem_of(f)] = t; } }
+        i = i + 1;
+    }
+    let g = KG.build(corpus);
+    return map{ note: note, backlinks: KG.backlinks(g, note), outlinks: KG.outlinks(g, note) };
+}
+
+// ── codegraph: pblang CODE → module knowledge graph (functions / imports / architecture) ─────────
+// Recursively read every .sapp under `dir` and return a compact understanding of the project: file/
+// function/loc counts, module communities, the hub modules (most depended-on by imports), and the plain-
+// language CODE_REPORT. Lets pbAI answer "what is this project's structure / which modules are central"
+// without leaving the workspace. Bounded by MAX_FILES; only extensionless names are probed as directories.
+fn _cg_has_dot(name) { let i = 0; while i < len(name) { if strcharcodeat(name, i) == 46 { return true; } i = i + 1; } return false; }
+fn _cg_collect(d, acc, cnt, cap) {
+    if cnt[0] >= cap { return nil; }
+    let entries = try FS.listdir(d) catch nil;
+    if entries == nil { return nil; }
+    let i = 0;
+    while i < len(entries) {
+        if cnt[0] >= cap { return nil; }
+        let name = entries[i];
+        let p = d + "/" + name;
+        if len(name) > 5 and str_slice(name, len(name) - 5, len(name)) == ".sapp" {
+            let t = try FS.read(p) catch nil;
+            if t != nil { acc[p] = t; cnt[0] = cnt[0] + 1; }
+        } elif not _cg_has_dot(name) and name != "graphify-out" and name != "target" and name != "node_modules" {
+            _cg_collect(p, acc, cnt, cap);
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+fn codegraph(dir = ".") {
+    let d = _safe_path(dir);
+    let files = map{};
+    let cnt = [0];
+    _cg_collect(d, files, cnt, MAX_FILES);
+    if len(map_keys(files)) == 0 { return map{ files: 0, note: "no .sapp files under '" + dir + "'" }; }
+    let an = CG.analyze_all(files);
+    let s = CG.project_stats(an);
+    let g = CG.module_graph(an);
+    let cm = KG.communities(g);
+    return map{
+        files: s.files, functions: s.functions, loc: s.loc, import_edges: s.imports,
+        communities: cm.count, hubs: KG.hubs(g, 6), report: CG.report(an)
+    };
+}
+
 fn call(tool, args = nil) {
     if args == nil { args = map{}; }
     _count_call(tool);
@@ -668,6 +767,9 @@ fn call(tool, args = nil) {
     if tool == "file_hash" { return file_hash(try args.path catch ""); }
     if tool == "tool_info" { return tool_info(try args.name catch ""); }
     if tool == "validate_call" { return validate_call(try args.tool catch "", try args.args catch nil); }
+    if tool == "graphify" { return graphify(try args.dir catch "."); }
+    if tool == "graphify_backlinks" { return graphify_backlinks(try args.dir catch ".", try args.note catch ""); }
+    if tool == "codegraph" { return codegraph(try args.dir catch "."); }
     throw "pb_mcp: unknown tool '" + str(tool) + "'";
 }
 
@@ -714,6 +816,7 @@ fn tools_by_profile(profile) {
 }
 
 export tool_catalog, workspace_context, read_file, read_file_tail, list_files, project_tree, grep_code, find_files, file_stats, call;
+export graphify, graphify_backlinks, codegraph;
 export suggest_tool, call_batch, call_stats, reset_call_stats;
 export watch_capture, watch_disasm, watch_bytecode, watch_inspect, watch_folder, watch_binary, watch_hardware, watch_probe;
 export tool_names, has_tool, tools_by_profile, profiles;

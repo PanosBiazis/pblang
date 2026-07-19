@@ -1,190 +1,366 @@
-// stdlib/selfhost_pbck.sapp — bytecode container for the SELF-HOSTED compiler.
+// Bounded bytecode container for the PBLang-written compiler and VM.
 //
-// Serializes/deserializes the pblang-written compiler's chunk-maps
-//   chunk = { instructions: [ {op:int, operand:int} ], constants: [ value... ] }
-//   value = number | string | bool | nil | function{ arity, chunk, upvalues }
-//   upvalue = { index:int, is_local:bool }
-// to/from a flat byte array, so the pblang toolchain can compile, PERSIST
-// bytecode to disk (fs_write_bytes), reload, and run it on the self-hosted VM —
-// all in pblang, with no Rust front-end involved.
-//
-// This is the self-hosted-IR container. It is intentionally SEPARATE from the
-// Rust `.pbck` (crates/pblang-ir) which uses the Rust VM's opcode numbering;
-// unifying the two (so self-hosted output runs on the Rust VM) requires aligning
-// the opcode sets and is a documented future step.
-//
-// Format: magic "PBCS", u8 version=1, then one <chunk>. Integers are 4-byte LE;
-// strings are u32 length + UTF-8 bytes; numbers are stored as their decimal
-// string (exact for integers; simple decimals round-trip via parse_number).
+// PBCS v2 preserves the numeric operands used by v1 and adds explicit encodings
+// for optimizer-produced local superinstructions. The reader remains compatible
+// with v1 artifacts, validates the complete structure, and rejects trailing data.
 
-let _MAGIC = [80, 66, 67, 83];   // "PBCS"
-let _VERSION = 1;
+let MAGIC = [80, 66, 67, 83]; // "PBCS"
+let VERSION = 2;
+let MAX_ARTIFACT_BYTES = 67108864;
+let MAX_TOTAL_INSTRUCTIONS = 1048576;
+let MAX_TOTAL_CONSTANTS = 1048576;
+let MAX_STRING_BYTES = 16777216;
+let MAX_TOTAL_STRING_BYTES = 33554432;
+let MAX_NESTING = 64;
+let MAX_UPVALUES = 1048576;
+let MAX_LOCAL_INDEX = 1048575;
+let MAX_OPCODE = 42;
 
-// ── writers ──────────────────────────────────────────────────────────────────
-fn _w_u8(out, b) { array_push(out, bit_and(b, 255)); }
-fn _w_u32(out, v) {
-    _w_u8(out, v);
-    _w_u8(out, bit_shr(v, 8));
-    _w_u8(out, bit_shr(v, 16));
-    _w_u8(out, bit_shr(v, 24));
-}
-fn _w_str(out, s) {
-    let b = str_to_bytes(s);
-    _w_u32(out, len(b));
-    let i = 0;
-    while i < len(b) { array_push(out, b[i]); i = i + 1; }
+fn _uint(value, max_value, label) {
+    if type(value) != "number" or value != num_floor(value) or value < 0 or value > max_value {
+        throw "selfhost_pbck: invalid " + label;
+    }
+    return value;
 }
 
-fn _w_value(out, v) {
-    if v == nil { _w_u8(out, 2); return; }
-    let t = type(v);
-    if t == "number" { _w_u8(out, 0); _w_str(out, str(v)); return; }
-    if t == "bool" { _w_u8(out, 1); _w_u8(out, if v { 1 } else { 0 }); return; }
-    if t == "string" { _w_u8(out, 3); _w_str(out, v); return; }
-    if t == "map" and map_has(v, "try_chunk") and map_has(v, "catch_chunk") {
-        // OP_TRY descriptor {try_chunk, catch_chunk}: the body and handler sub-chunks
-        // the VM runs. Must be serialized — it was silently dropped to nil, which
-        // broke try/catch on reload (OP_TRY then read nil).
-        _w_u8(out, 5);
-        _w_chunk(out, v.try_chunk);
-        _w_chunk(out, v.catch_chunk);
+fn _budget() {
+    return map{ instructions: 0, constants: 0, string_bytes: 0 };
+}
+
+fn _add_budget(budget, key, amount, maximum, label) {
+    budget[key] = budget[key] + amount;
+    if budget[key] > maximum { throw "selfhost_pbck: " + label + " limit exceeded"; }
+}
+
+fn _const_operand(op) {
+    return op == 0 or op == 13 or op == 14 or op == 15 or op == 24
+        or op == 29 or op == 30 or op == 35;
+}
+
+fn _jump_operand(op) {
+    return op == 20 or op == 21 or op == 22 or op == 33 or op == 34
+        or op == 36 or op == 37;
+}
+
+fn _local_operand(op) {
+    return op == 16 or op == 17 or op == 38 or op == 39;
+}
+
+fn _validate_value(value, depth, budget) {
+    if depth > MAX_NESTING { throw "selfhost_pbck: nesting limit exceeded"; }
+    if value == nil or type(value) == "bool" { return; }
+    let kind = type(value);
+    if kind == "number" {
+        if value != value or value < 0 - 9000000000000000 or value > 9000000000000000 {
+            throw "selfhost_pbck: invalid numeric constant";
+        }
         return;
     }
-    if t == "map" and map_has(v, "chunk") {
-        // function constant {arity, chunk, upvalues}
-        _w_u8(out, 4);
-        _w_u32(out, try v.arity catch 0);
-        let ups = try v.upvalues catch [];
-        _w_u32(out, len(ups));
+    if kind == "string" {
+        let size = len(str_to_bytes(value));
+        if size > MAX_STRING_BYTES { throw "selfhost_pbck: string limit exceeded"; }
+        _add_budget(budget, "string_bytes", size, MAX_TOTAL_STRING_BYTES, "total string bytes");
+        return;
+    }
+    if kind == "map" and map_has(value, "try_chunk") and map_has(value, "catch_chunk") {
+        _validate_chunk(value.try_chunk, depth + 1, budget);
+        _validate_chunk(value.catch_chunk, depth + 1, budget);
+        return;
+    }
+    if kind == "map" and map_has(value, "chunk") {
+        _uint(try value.arity catch nil, MAX_LOCAL_INDEX, "function arity");
+        let upvalues = try value.upvalues catch [];
+        if type(upvalues) != "array" or len(upvalues) > MAX_UPVALUES {
+            throw "selfhost_pbck: invalid function upvalues";
+        }
         let i = 0;
-        while i < len(ups) {
-            _w_u32(out, try ups[i].index catch 0);
-            _w_u8(out, if (try ups[i].is_local catch false) { 1 } else { 0 });
+        while i < len(upvalues) {
+            let up = upvalues[i];
+            if type(up) != "map" or type(try up.is_local catch nil) != "bool" {
+                throw "selfhost_pbck: invalid upvalue";
+            }
+            _uint(try up.index catch nil, MAX_LOCAL_INDEX, "upvalue index");
             i = i + 1;
         }
-        _w_chunk(out, v.chunk);
+        _validate_chunk(value.chunk, depth + 1, budget);
         return;
     }
-    // Unsupported constant kind (should not occur in self-hosted output) -> nil.
-    _w_u8(out, 2);
+    throw "selfhost_pbck: unsupported constant kind " + kind;
 }
 
-fn _w_chunk(out, chunk) {
-    let ins = chunk.instructions;
-    _w_u32(out, len(ins));
+fn _validate_instruction(ins, instruction_count, constants) {
+    if type(ins) != "map" { throw "selfhost_pbck: invalid instruction"; }
+    let op = _uint(try ins.op catch nil, MAX_OPCODE, "opcode");
+    let operand = try ins.operand catch nil;
+    if op == 41 or op == 42 {
+        if type(operand) != "map" { throw "selfhost_pbck: invalid fused operand"; }
+        _uint(try operand.slot catch nil, MAX_LOCAL_INDEX, "fused local slot");
+        if op == 41 {
+            let constant = _uint(try operand.constant catch nil, 4294967295, "fused constant index");
+            if constant >= len(constants) { throw "selfhost_pbck: constant index out of range"; }
+        } else {
+            _uint(try operand.rhs catch nil, MAX_LOCAL_INDEX, "fused rhs slot");
+        }
+        return;
+    }
+
+    let number_operand = _uint(operand, 4294967295, "instruction operand");
+    if _const_operand(op) and number_operand >= len(constants) {
+        throw "selfhost_pbck: constant index out of range";
+    }
+    if _jump_operand(op) and number_operand > instruction_count {
+        throw "selfhost_pbck: jump target out of range";
+    }
+    if _local_operand(op) and number_operand > MAX_LOCAL_INDEX {
+        throw "selfhost_pbck: local index out of range";
+    }
+    if (op == 18 or op == 25 or op == 26) and number_operand > MAX_LOCAL_INDEX {
+        throw "selfhost_pbck: allocation/arity operand out of range";
+    }
+    if (op == 13 or op == 14 or op == 15 or op == 29 or op == 30)
+        and type(constants[number_operand]) != "string" {
+        throw "selfhost_pbck: name operand is not a string";
+    }
+    if op == 24 {
+        let fn_value = constants[number_operand];
+        if type(fn_value) != "map" or not map_has(fn_value, "chunk") {
+            throw "selfhost_pbck: closure operand is not a function";
+        }
+    }
+    if op == 35 {
+        let try_value = constants[number_operand];
+        if type(try_value) != "map" or not map_has(try_value, "try_chunk") or not map_has(try_value, "catch_chunk") {
+            throw "selfhost_pbck: try operand is invalid";
+        }
+    }
+}
+
+fn _validate_chunk(chunk, depth, budget) {
+    if depth > MAX_NESTING { throw "selfhost_pbck: nesting limit exceeded"; }
+    if type(chunk) != "map" { throw "selfhost_pbck: chunk must be a map"; }
+    let instructions = try chunk.instructions catch nil;
+    let constants = try chunk.constants catch nil;
+    if type(instructions) != "array" or type(constants) != "array" {
+        throw "selfhost_pbck: invalid chunk arrays";
+    }
+    _add_budget(budget, "instructions", len(instructions), MAX_TOTAL_INSTRUCTIONS, "instruction count");
+    _add_budget(budget, "constants", len(constants), MAX_TOTAL_CONSTANTS, "constant count");
+    let ci = 0;
+    while ci < len(constants) { _validate_value(constants[ci], depth + 1, budget); ci = ci + 1; }
+    let ii = 0;
+    while ii < len(instructions) {
+        _validate_instruction(instructions[ii], len(instructions), constants);
+        ii = ii + 1;
+    }
+}
+
+fn validate_chunk(chunk) {
+    _validate_chunk(chunk, 0, _budget());
+    return true;
+}
+
+// Writers --------------------------------------------------------------------
+fn _w_u8(out, byte) { array_push(out, bit_and(_uint(byte, 255, "byte"), 255)); }
+
+fn _w_u32(out, value) {
+    let v = _uint(value, 4294967295, "u32");
+    _w_u8(out, bit_and(v, 255));
+    _w_u8(out, bit_and(bit_shr(v, 8), 255));
+    _w_u8(out, bit_and(bit_shr(v, 16), 255));
+    _w_u8(out, bit_and(bit_shr(v, 24), 255));
+}
+
+fn _w_str(out, value) {
+    let bytes = str_to_bytes(value);
+    _w_u32(out, len(bytes));
     let i = 0;
-    while i < len(ins) {
-        _w_u32(out, try ins[i].op catch 0);
-        _w_u32(out, try ins[i].operand catch 0);
+    while i < len(bytes) { _w_u8(out, bytes[i]); i = i + 1; }
+}
+
+fn _w_operand(out, op, operand) {
+    if type(operand) == "number" {
+        _w_u8(out, 0); _w_u32(out, operand); return;
+    }
+    if op == 41 and type(operand) == "map" {
+        _w_u8(out, 1); _w_u32(out, operand.slot); _w_u32(out, operand.constant); return;
+    }
+    if op == 42 and type(operand) == "map" {
+        _w_u8(out, 2); _w_u32(out, operand.slot); _w_u32(out, operand.rhs); return;
+    }
+    throw "selfhost_pbck: unsupported instruction operand";
+}
+
+fn _w_value(out, value, depth) {
+    if depth > MAX_NESTING { throw "selfhost_pbck: nesting limit exceeded"; }
+    if value == nil { _w_u8(out, 2); return; }
+    let kind = type(value);
+    if kind == "number" { _w_u8(out, 0); _w_str(out, str(value)); return; }
+    if kind == "bool" { _w_u8(out, 1); _w_u8(out, if value { 1 } else { 0 }); return; }
+    if kind == "string" { _w_u8(out, 3); _w_str(out, value); return; }
+    if kind == "map" and map_has(value, "try_chunk") and map_has(value, "catch_chunk") {
+        _w_u8(out, 5);
+        _w_chunk(out, value.try_chunk, depth + 1);
+        _w_chunk(out, value.catch_chunk, depth + 1);
+        return;
+    }
+    if kind == "map" and map_has(value, "chunk") {
+        _w_u8(out, 4);
+        _w_u32(out, value.arity);
+        let upvalues = try value.upvalues catch [];
+        _w_u32(out, len(upvalues));
+        let i = 0;
+        while i < len(upvalues) {
+            _w_u32(out, upvalues[i].index);
+            _w_u8(out, if upvalues[i].is_local { 1 } else { 0 });
+            i = i + 1;
+        }
+        _w_chunk(out, value.chunk, depth + 1);
+        return;
+    }
+    throw "selfhost_pbck: unsupported constant kind " + kind;
+}
+
+fn _w_chunk(out, chunk, depth) {
+    _w_u32(out, len(chunk.instructions));
+    let i = 0;
+    while i < len(chunk.instructions) {
+        let ins = chunk.instructions[i];
+        _w_u32(out, ins.op);
+        _w_operand(out, ins.op, ins.operand);
         i = i + 1;
     }
-    let cs = chunk.constants;
-    _w_u32(out, len(cs));
+    _w_u32(out, len(chunk.constants));
     let j = 0;
-    while j < len(cs) {
-        _w_value(out, cs[j]);
-        j = j + 1;
-    }
+    while j < len(chunk.constants) { _w_value(out, chunk.constants[j], depth + 1); j = j + 1; }
 }
 
 fn serialize_chunk(chunk) {
+    validate_chunk(chunk);
     let out = [];
-    let m = 0;
-    while m < len(_MAGIC) { array_push(out, _MAGIC[m]); m = m + 1; }
-    _w_u8(out, _VERSION);
-    _w_chunk(out, chunk);
+    let i = 0;
+    while i < len(MAGIC) { _w_u8(out, MAGIC[i]); i = i + 1; }
+    _w_u8(out, VERSION);
+    _w_chunk(out, chunk, 0);
+    if len(out) > MAX_ARTIFACT_BYTES { throw "selfhost_pbck: artifact limit exceeded"; }
     return out;
 }
 
-// ── readers ──────────────────────────────────────────────────────────────────
-fn _mk_reader(bytes) { return map{ buf: bytes, pos: 0 }; }
-
-fn _r_u8(r) {
-    if r.pos >= len(r.buf) { throw "selfhost_pbck: unexpected end of input"; }
-    let b = r.buf[r.pos];
-    r.pos = r.pos + 1;
-    return b;
+// Readers --------------------------------------------------------------------
+fn _reader(bytes, version) {
+    return map{ buf: bytes, pos: 5, version: version, instructions: 0, constants: 0, string_bytes: 0 };
 }
-fn _r_u32(r) {
-    let a = _r_u8(r);
-    let b = _r_u8(r);
-    let c = _r_u8(r);
-    let d = _r_u8(r);
+
+fn _remaining(reader) { return len(reader.buf) - reader.pos; }
+
+fn _r_u8(reader) {
+    if reader.pos >= len(reader.buf) { throw "selfhost_pbck: unexpected end of input"; }
+    let byte = reader.buf[reader.pos]; reader.pos = reader.pos + 1;
+    return _uint(byte, 255, "encoded byte");
+}
+
+fn _r_u32(reader) {
+    let a = _r_u8(reader); let b = _r_u8(reader);
+    let c = _r_u8(reader); let d = _r_u8(reader);
     return a + b * 256 + c * 65536 + d * 16777216;
 }
-fn _r_str(r) {
-    let n = _r_u32(r);
-    let arr = [];
-    let i = 0;
-    while i < n { array_push(arr, _r_u8(r)); i = i + 1; }
-    return bytes_to_str(arr);
+
+fn _r_str(reader) {
+    let size = _r_u32(reader);
+    if size > MAX_STRING_BYTES or size > _remaining(reader) { throw "selfhost_pbck: invalid string length"; }
+    reader.string_bytes = reader.string_bytes + size;
+    if reader.string_bytes > MAX_TOTAL_STRING_BYTES { throw "selfhost_pbck: total string bytes limit exceeded"; }
+    let bytes = []; let i = 0;
+    while i < size { array_push(bytes, _r_u8(reader)); i = i + 1; }
+    return bytes_to_str(bytes);
 }
 
-fn _r_value(r) {
-    let tag = _r_u8(r);
-    if tag == 0 { return parse_number(_r_str(r)); }
-    if tag == 1 { return _r_u8(r) == 1; }
+fn _r_operand(reader, op) {
+    if reader.version == 1 { return _r_u32(reader); }
+    let tag = _r_u8(reader);
+    if tag == 0 { return _r_u32(reader); }
+    if tag == 1 and op == 41 { return map{ slot: _r_u32(reader), constant: _r_u32(reader) }; }
+    if tag == 2 and op == 42 { return map{ slot: _r_u32(reader), rhs: _r_u32(reader) }; }
+    throw "selfhost_pbck: invalid operand encoding";
+}
+
+fn _r_value(reader, depth) {
+    if depth > MAX_NESTING { throw "selfhost_pbck: nesting limit exceeded"; }
+    let tag = _r_u8(reader);
+    if tag == 0 {
+        let text = _r_str(reader);
+        let value = try parse_number(text) catch nil;
+        if value == nil or value != value { throw "selfhost_pbck: invalid numeric constant"; }
+        return value;
+    }
+    if tag == 1 {
+        let value = _r_u8(reader);
+        if value != 0 and value != 1 { throw "selfhost_pbck: invalid boolean constant"; }
+        return value == 1;
+    }
     if tag == 2 { return nil; }
-    if tag == 3 { return _r_str(r); }
+    if tag == 3 { return _r_str(reader); }
     if tag == 4 {
-        let arity = _r_u32(r);
-        let nup = _r_u32(r);
-        let ups = [];
-        let i = 0;
-        while i < nup {
-            let idx = _r_u32(r);
-            let isl = _r_u8(r) == 1;
-            array_push(ups, map{ index: idx, is_local: isl });
-            i = i + 1;
+        let arity = _r_u32(reader); let count = _r_u32(reader);
+        if count > MAX_UPVALUES { throw "selfhost_pbck: upvalue limit exceeded"; }
+        let upvalues = []; let i = 0;
+        while i < count {
+            let index = _r_u32(reader); let local = _r_u8(reader);
+            if local != 0 and local != 1 { throw "selfhost_pbck: invalid upvalue flag"; }
+            array_push(upvalues, map{ index: index, is_local: local == 1 }); i = i + 1;
         }
-        let ch = _r_chunk(r);
-        return map{ arity: arity, chunk: ch, upvalues: ups };
+        return map{ arity: arity, chunk: _r_chunk(reader, depth + 1), upvalues: upvalues };
     }
     if tag == 5 {
-        // OP_TRY descriptor: body + handler sub-chunks.
-        let tc = _r_chunk(r);
-        let cc = _r_chunk(r);
-        return map{ try_chunk: tc, catch_chunk: cc };
+        return map{ try_chunk: _r_chunk(reader, depth + 1), catch_chunk: _r_chunk(reader, depth + 1) };
     }
     throw "selfhost_pbck: unknown value tag " + str(tag);
 }
 
-fn _r_chunk(r) {
-    let nins = _r_u32(r);
-    let ins = [];
-    let i = 0;
-    while i < nins {
-        let op = _r_u32(r);
-        let operand = _r_u32(r);
-        array_push(ins, map{ op: op, operand: operand });
+fn _r_chunk(reader, depth) {
+    if depth > MAX_NESTING { throw "selfhost_pbck: nesting limit exceeded"; }
+    let instruction_count = _r_u32(reader);
+    reader.instructions = reader.instructions + instruction_count;
+    if reader.instructions > MAX_TOTAL_INSTRUCTIONS { throw "selfhost_pbck: instruction count limit exceeded"; }
+    // Every instruction needs at least op + operand. Reject impossible counts
+    // before allocating or entering the loop.
+    let minimum = if reader.version == 1 { 8 } else { 9 };
+    if instruction_count > num_floor(_remaining(reader) / minimum) { throw "selfhost_pbck: truncated instruction table"; }
+    let instructions = []; let i = 0;
+    while i < instruction_count {
+        let op = _r_u32(reader);
+        if op > MAX_OPCODE { throw "selfhost_pbck: invalid opcode"; }
+        array_push(instructions, map{ op: op, operand: _r_operand(reader, op) });
         i = i + 1;
     }
-    let nc = _r_u32(r);
-    let cs = [];
-    let j = 0;
-    while j < nc {
-        array_push(cs, _r_value(r));
-        j = j + 1;
-    }
-    return map{ instructions: ins, constants: cs };
+    let constant_count = _r_u32(reader);
+    reader.constants = reader.constants + constant_count;
+    if reader.constants > MAX_TOTAL_CONSTANTS { throw "selfhost_pbck: constant count limit exceeded"; }
+    if constant_count > _remaining(reader) { throw "selfhost_pbck: truncated constant table"; }
+    let constants = []; let j = 0;
+    while j < constant_count { array_push(constants, _r_value(reader, depth + 1)); j = j + 1; }
+    return map{ instructions: instructions, constants: constants };
 }
 
 fn deserialize_chunk(bytes) {
-    if len(bytes) < 5 { throw "selfhost_pbck: too short"; }
+    if type(bytes) != "array" or len(bytes) < 9 or len(bytes) > MAX_ARTIFACT_BYTES {
+        throw "selfhost_pbck: invalid artifact size";
+    }
     let i = 0;
-    while i < len(_MAGIC) {
-        if bytes[i] != _MAGIC[i] { throw "selfhost_pbck: bad magic"; }
+    while i < len(MAGIC) {
+        if bytes[i] != MAGIC[i] { throw "selfhost_pbck: bad magic"; }
         i = i + 1;
     }
-    let ver = bytes[4];
-    if ver != _VERSION { throw "selfhost_pbck: unsupported version " + str(ver); }
-    let r = _mk_reader(bytes);
-    r.pos = 5;
-    return _r_chunk(r);
+    let version = bytes[4];
+    if version != 1 and version != VERSION { throw "selfhost_pbck: unsupported version " + str(version); }
+    let reader = _reader(bytes, version);
+    let chunk = _r_chunk(reader, 0);
+    if reader.pos != len(bytes) { throw "selfhost_pbck: trailing bytes"; }
+    validate_chunk(chunk);
+    return chunk;
 }
 
-// Convenience: write/read a chunk to/from a file (requires fs capability).
 fn write_file(path, chunk) { return fs_write_bytes(path, serialize_chunk(chunk)); }
 fn read_file(path) { return deserialize_chunk(fs_read_bytes(path)); }
 
-export serialize_chunk, deserialize_chunk, write_file, read_file;
+export MAGIC, VERSION, MAX_ARTIFACT_BYTES, serialize_chunk, deserialize_chunk;
+export validate_chunk, write_file, read_file;

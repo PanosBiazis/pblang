@@ -1,6 +1,6 @@
 # pblang
 
-**A fast, secure, embeddable programming language built in Rust.**
+**A fast, secure, embeddable programming language with a pblang-written self-hosted toolchain.**
 
 [![Version](https://img.shields.io/badge/version-0.5.7-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 
@@ -16,15 +16,19 @@ pblang is a general-purpose programming language and bytecode VM designed for em
 - **Parser, compiler, type checker, linter, formatter, and CLI**.
 - **Capability-based embedding controls** through `StdlibConfig`, `VmLimits`, and `FfiPolicy`.
 - **Package manager** with manifests, lockfiles, local and registry dependencies, checksums, and HMAC helpers.
-- **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, SQLite, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more.
+- **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, bounded memory/SQLite/Redis data stores, provider-neutral edge/regional CDN caching, native SQLite, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more. See [data storage](docs/Data_Storage.md) and [CDN caching](docs/CDN_Caching.md).
 - **LSP server** with diagnostics, completions, hover, goto-definition, workspace symbols, and semantic tokens.
 - **Native pblang IDE** via `pblang --ide`: code editor, terminal, visual designer, pbAI panel, and pblang-native browser panel.
 - **Self-hosted compiler pipeline** under `stdlib/compiler/`, including tokenizer, parser, semantic analysis, type checking, IR, optimizer, codegen, and a pblang bytecode interpreter.
+- **Pure-pblang tree interpreter** with prepared AST metadata, cached lexical
+  depth, specialized small-arity calls, and compact fixed-slot closures.
 
 ### Experimental / preview surface
 
 - **Cranelift JIT** for eligible numeric functions, with fallback to the bytecode VM.
-- **C99 transpiler, LLVM IR emitter, and WAT/WASM backend**. These are useful development backends, but not all language features are fully covered.
+- **C99 transpilers, LLVM IR emitter, and WAT/WASM backend**. The pblang-written
+  C99 numeric subset now emits complete hosted programs and can build/run them;
+  dynamic language features are still outside that backend subset.
 - **AI and quantum integrations**. These are bridges and helpers, not the minimal core language.
 - **Polyglot execution**. Useful for trusted workflows; keep it behind `exec` capability.
 
@@ -70,6 +74,64 @@ Run it:
 cargo run -- run hello.sapp
 ```
 
+### One-line applications
+
+The pblang-only `stdlib/app.sapp` facade builds CLI, native GUI, hardened web,
+or composed full-stack
+applications from one declarative entry point. A complete CLI application fits
+on one physical source line:
+
+```pblang
+let app = import("stdlib/app.sapp"); app.run(map{ kind: "cli", handler: fn(ctx) { return "Hello from pblang"; } });
+```
+
+The compact helpers remove the envelope as well:
+
+```pblang
+import("stdlib/app.sapp").cli("Hello from pblang");
+```
+
+Use `kind: "gui"` with a `widgets` array, `kind: "web"` with `routes`, or
+`kind: "fullstack"` with `cli`, `gui`, and `web` component maps. Full-stack
+`start` explicitly selects the live blocking surface; the other surfaces use
+their real preview builders.
+`preview: true` builds and exercises the real form/router without opening a
+window or socket. Runnable examples are under `examples/one_line_apps/` and are
+included in the PBIDE Examples catalog.
+
+### One-line CDN-backed static site
+
+The pure-PBLang CDN control layer combines a safe static origin with bounded
+edge and regional caches, ETag/304 handling, SWR, stale-if-error, and purge:
+
+```pblang
+let site = import("stdlib:cdn_cache.sapp").static_site("public");
+```
+
+This is executable cache behavior for an edge/origin-shield process; actual
+geographic POP deployment remains an infrastructure concern. See
+[`docs/CDN_Caching.md`](docs/CDN_Caching.md) and `examples/cdn_cache/`.
+
+### Self-hosted hosted C99
+
+`stdlib/compiler/ctranspile.sapp` can now produce a complete userspace
+translation unit and an optimized executable without using the Rust
+transpiler:
+
+```pblang
+let c99 = import("stdlib/compiler/ctranspile.sapp");
+let result = c99.build_program("fn sq(x) { return x*x; } print sq(9);", "square", map{ profile: "speed" });
+```
+
+`run_program(...)` adds a bounded watchdog and temporary-artifact cleanup.
+Normal mode preserves f64 arithmetic. `numeric: "integer"` is explicit and
+opt-in because integer division is not equivalent to normal pblang semantics.
+
+Adapters load lazily by application kind. On the recorded development host,
+twenty cold CLI processes fell from 1,182 ms with eager GUI/web imports to 77 ms
+with lazy loading. Reproduce the warm component costs with
+`pblang run bench/app_facade_stages.sapp --allow-all`.
+
 ---
 
 ## Common commands
@@ -77,6 +139,7 @@ cargo run -- run hello.sapp
 | Command | Description |
 |---|---|
 | `pblang run <file|dir>` | Run a script or package. |
+| `pblang <file|dir>` | Short `run` alias; recognized source/bytecode paths never enter the REPL. |
 | `pblang test [dir]` | Run pblang tests. |
 | `pblang fmt [files...]` | Format source files. |
 | `pblang lint [files...]` | Parse, type-check, and lint files. |
@@ -258,10 +321,10 @@ use pblang_core::parse;
 use pblang_compiler::compile;
 use pblang_vm::{StdlibConfig, VmLimits, VM};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = r#"print "Hello from embedded pblang!";"#;
-    let ast = parse(source).unwrap();
-    let chunk = compile(ast).unwrap();
+    let ast = parse(source)?;
+    let chunk = compile(ast)?;
 
     let config = StdlibConfig {
         core: true,
@@ -285,7 +348,8 @@ fn main() {
         ..Default::default()
     }));
 
-    vm.run(&chunk).unwrap();
+    vm.run(&chunk)?;
+    Ok(())
 }
 ```
 
@@ -303,6 +367,7 @@ Use `fs`, `net`, `http`, `exec`, `ffi`, and `env` only for trusted scripts or in
 - [`docs/Capability_model.md`](docs/Capability_model.md)
 - [`docs/PB_IDE.md`](docs/PB_IDE.md)
 - [`docs/Visual_Designer.md`](docs/Visual_Designer.md)
+- [`docs/Performance_Contracts.md`](docs/Performance_Contracts.md)
 - [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md)
 - [`docs/Tasks.md`](docs/Tasks.md)
 

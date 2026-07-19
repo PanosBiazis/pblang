@@ -26,12 +26,12 @@ without a path back to a working compiler. Treat this document as the
 |---|---|---|
 | **1. Rust reference is never deleted, only deprecated.** | A working compiler from a clean checkout, no matter what. | ~0 — just don't delete code. |
 | **2. Differential testing** every Rust↔pblang twin. | Drift is caught the moment it appears, not months later. | One test per moved feature. |
-| **3. Pre-compiled `.pbck` artifacts** of every self-hosted module live in `git`. | A working binary today even if the source-form pblang parser broke yesterday. | One CI step + a few MB in the repo. |
+| **3. Pre-compiled `.pbck` artifacts** of every self-hosted module are reproducibly checked into `git`. | Target recovery path if the source-form parser breaks. The runtime cache exists; checked-in snapshots and freshness CI do not yet. | Generator + deterministic snapshot gate. |
 | **4. `pblang transpile → C → cc`** as the universal floor. | If both Rust *and* pblang fall over, C still bootstraps. | The transpiler already exists; just keep it working. |
 | **5. A monthly "fresh-checkout build" CI job.** | Catches drift in the Rust reference path itself. | One scheduled workflow. |
 
-Each layer survives the failure of the layers above it. You'd have to
-lose **all five** to be in a recovery scenario you can't dig out of.
+These rows are the required safety contract, not a claim that every layer is
+already complete. Layer 3 is explicitly partial below.
 
 ---
 
@@ -96,17 +96,19 @@ The pattern in pseudo-code:
 
 ```rust
 #[test]
-fn parser_drift_smoke() {
+fn parser_drift_smoke() -> Result<(), Box<dyn std::error::Error>> {
     for snippet in CORPUS {
-        let rust_ast = pblang_core::parse_strict(snippet).unwrap();
+        let rust_ast = pblang_core::parse_strict(snippet)?;
         let pblang_ast = run_pblang_script(&format!(
             "let f = import(\"stdlib:compiler/selfhost_frontend.sapp\");
              let r = f.frontend_parse_full({:?});
              print json_stringify(map{{stmts: len(r.ast.stmts)}});",
             snippet,
         ));
-        assert_eq!(rust_ast.stmts.len(), pblang_ast["stmts"].as_u64().unwrap());
+        let pblang_stmt_count = pblang_ast["stmts"].as_u64().ok_or("missing stmts")?;
+        assert_eq!(rust_ast.stmts.len(), pblang_stmt_count);
     }
+    Ok(())
 }
 ```
 
@@ -118,17 +120,23 @@ and compare *those*.
 
 ---
 
-## Layer 3 — Checked-in `.pbck` artifacts
+## Layer 3 — Verified `.pbck` artifacts (partial)
 
-Self-hosted compiler modules live in two places in `git`:
+**Current status (2026-07-19):** PBCS v2 has a bounded reader/writer, v1 reader
+compatibility, strict structural validation, and bounded loader execution. The
+opt-in module cache verifies toolchain/source keys, metadata, digest, size, and
+PBCS structure before reuse. However, `stdlib/compiler/_pbck/` does not exist in
+this checkout, and no deterministic checked-in snapshot/freshness CI gate has
+been implemented. The runtime cache is an optimization, not a bootstrap backup.
+
+The target completed layer stores self-hosted modules in two places in `git`:
 
 1. **Source form**: `stdlib/compiler/*.sapp`
 2. **Compiled form**: `stdlib/compiler/_pbck/*.pbck` (binary chunks)
 
-The compiled `.pbck` files are produced by `pblang compile` and checked
-in. They are **never edited by hand** — a pre-commit hook regenerates
-them from source. They are intentionally a small additional commit:
-the `.pbck` format is compact (a few KB per module).
+The compiled files must be generated deterministically, never edited by hand,
+and verified against source and toolchain fingerprints. This remains follow-up
+work; do not use cache files under `~/.pblang/cache/` as release artifacts.
 
 **Why this matters:** suppose the pblang parser breaks badly enough
 that `stdlib/compiler/parser.sapp` will no longer parse itself. The
@@ -137,14 +145,14 @@ Rust frontend rebuilt from `git` can still load the pre-compiled
 a chunk file — and continue running. You diagnose the breakage with a
 working `pblang` in hand, not from a cold boot.
 
-**CI gate:** a workflow that (a) deletes every `.pbck` under
+**Required CI gate:** a workflow that (a) deletes every `.pbck` under
 `stdlib/compiler/`, (b) rebuilds them from source, (c) confirms the
 new `.pbck` files match what was committed. If they diverge, the PR
 fails: either the source changed without re-checking the chunk, or
 the chunk was hand-edited.
 
-**Storage cost:** the entire `stdlib/compiler/` tree compiled today
-would be on the order of 30-80 KB total. Negligible.
+**Storage cost:** measure the generated snapshot set before adoption; no current
+size is claimed because the checked-in set does not yet exist.
 
 ---
 
@@ -218,30 +226,27 @@ You are never stranded.
 
 ---
 
-## Known gap: pblang-parser perf
+## Full-parser drift status
 
 The differential test `tests/selfhost_drift.rs` includes a
 `selfhost_drift_full_parser_matches_statement_count` case that drives
 `stdlib/compiler/parser.sapp` (not just the lightweight whitespace
 analyzer in `frontend_analyze`) and compares its statement count
-against the Rust reference parser. It is currently `#[ignore]`-marked
-because the pblang-written parser, running on the VM interpreter,
-takes >60 seconds per snippet — too slow to default-on in CI.
+against the Rust reference parser. Its historical `#[ignore]` text says the
+pblang parser takes more than 60 seconds per snippet; that measurement is now
+obsolete. On 2026-07-14 the complete five-snippet oracle passed in 0.96 seconds.
 
-This is a **perf** problem, not a correctness one. When one of these
-lands the `#[ignore]` should be removed:
+The default pblang suite now runs
+`tests/semantics/selfhost_full_parser_drift_test.sapp`, which checks the same
+five sources with strict statement counts. Parser AST constructors use direct
+single-allocation map literals; the exported `make_node` helper remains for
+backward compatibility but is no longer on the parser's internal hot path.
 
-1. The pblang JIT becomes the default execution path for stdlib
-   modules, so the self-host parser runs as native code.
-2. The self-host modules are loaded from pre-compiled `.pbck` chunks
-   (Layer 3 above) instead of being re-parsed every test invocation.
-3. The pblang parser implementation in `stdlib/compiler/parser.sapp`
-   gets a non-trivial algorithmic improvement (the current
-   implementation has at least one quadratic loop).
-
-Until then, run the heavy drift check manually with
-`cargo test --test selfhost_drift -- --ignored` whenever you touch
-either parser, and treat any output divergence as a release blocker.
+When either parser changes, run both the default pblang drift test and the Rust
+oracle explicitly with `cargo test --test selfhost_drift
+selfhost_drift_full_parser_matches_statement_count -- --ignored --exact`. Any
+output divergence remains a release gate. The remaining self-host performance
+priority is interpreter execution (calls/scopes/builtin dispatch), not parsing.
 
 ## What this does **not** solve
 

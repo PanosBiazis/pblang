@@ -1,0 +1,303 @@
+// stdlib/linux_uinput.sapp -- real Linux uinput ABI encoder and native helper builder.
+//
+// Pure PBLang emits a static x86-64 ELF that opens /dev/uinput and performs the
+// required ioctls/writes directly. Building is inert; running the artifact can
+// inject input and therefore belongs behind input_control/master_control approval.
+
+let X = import("stdlib:codegen_x64.sapp");
+let A64 = import("stdlib:codegen_arm64.sapp");
+let Events = import("stdlib:input_events.sapp");
+
+let EV_SYN = 0; let EV_KEY = 1; let EV_REL = 2; let EV_ABS = 3;
+let SYN_REPORT = 0; let REL_X = 0; let REL_Y = 1; let ABS_X = 0; let ABS_Y = 1;
+let KEY_LEFTSHIFT = 42; let MAX_NATIVE_TEXT = 1024;
+let BTN_LEFT = 0x110; let BTN_RIGHT = 0x111; let BTN_MIDDLE = 0x112;
+let BUS_USB = 3;
+
+fn _app(dst, src) { let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; } return dst; }
+fn _zeros(n) { let out = []; let i = 0; while i < n { array_push(out, 0); i = i + 1; } return out; }
+fn _u32(n) { if n < 0 { n = 4294967296 + n; } return n; }
+fn _set32(dst, pos, n) { let b = X.le32(_u32(n)); let i = 0; while i < 4 { dst[pos + i] = b[i]; i = i + 1; } }
+
+// Linux asm-generic ioctl encoding. dir=1 is userspace->kernel (_IOW).
+fn ioc(dir, type_code, nr, size) {
+    if dir < 0 or dir > 3 or type_code < 0 or type_code > 255 or nr < 0 or nr > 255 or size < 0 or size > 16383 {
+        throw "linux_uinput.ioc: field outside Linux ioctl encoding range";
+    }
+    return dir * 1073741824 + size * 65536 + type_code * 256 + nr;
+}
+fn io(name) {
+    if name == "UI_DEV_CREATE" { return ioc(0, 0x55, 1, 0); }
+    if name == "UI_DEV_DESTROY" { return ioc(0, 0x55, 2, 0); }
+    if name == "UI_DEV_SETUP" { return ioc(1, 0x55, 3, 92); }
+    if name == "UI_SET_EVBIT" { return ioc(1, 0x55, 100, 4); }
+    if name == "UI_SET_KEYBIT" { return ioc(1, 0x55, 101, 4); }
+    if name == "UI_SET_RELBIT" { return ioc(1, 0x55, 102, 4); }
+    if name == "UI_SET_ABSBIT" { return ioc(1, 0x55, 103, 4); }
+    if name == "UI_ABS_SETUP" { return ioc(1, 0x55, 4, 28); }
+    throw "linux_uinput: unknown ioctl " + str(name);
+}
+
+fn _key_code(key) {
+    if key == "Escape" { return 1; } if key == "Backspace" { return 14; }
+    if key == "Tab" { return 15; } if key == "Enter" { return 28; }
+    if key == "Space" { return 57; } if key == "Home" { return 102; }
+    if key == "Up" { return 103; } if key == "PageUp" { return 104; }
+    if key == "Left" { return 105; } if key == "Right" { return 106; }
+    if key == "End" { return 107; } if key == "Down" { return 108; }
+    if key == "PageDown" { return 109; } if key == "Delete" { return 111; }
+    throw "linux_uinput: key has no Linux evdev code";
+}
+fn _button_code(button) { if button == 1 { return BTN_LEFT; } if button == 2 { return BTN_MIDDLE; } return BTN_RIGHT; }
+
+fn _ascii_key(code) {
+    let letters = [30,48,46,32,18,33,34,35,23,36,37,38,50,49,24,25,16,19,31,20,22,47,17,45,21,44];
+    if code >= 97 and code <= 122 { return map{ code: letters[code - 97], shift: false }; }
+    if code >= 65 and code <= 90 { return map{ code: letters[code - 65], shift: true }; }
+    if code >= 48 and code <= 57 { return map{ code: if code == 48 { 11 } else { code - 47 }, shift: false }; }
+    if code == 32 { return map{ code: 57, shift: false }; }
+    if code == 10 or code == 13 { return map{ code: 28, shift: false }; }
+    if code == 9 { return map{ code: 15, shift: false }; }
+    let plain_chars = [45,61,91,93,59,39,96,92,44,46,47];
+    let plain_keys =  [12,13,26,27,39,40,41,43,51,52,53];
+    let shifted_chars = [33,64,35,36,37,94,38,42,40,41,95,43,123,125,58,34,126,124,60,62,63];
+    let shifted_keys =  [2, 3, 4, 5, 6, 7, 8, 9, 10,11,12,13,26, 27,39,40,41, 43,51,52,53];
+    let i = 0; while i < len(plain_chars) { if code == plain_chars[i] { return map{ code: plain_keys[i], shift: false }; } i = i + 1; }
+    i = 0; while i < len(shifted_chars) { if code == shifted_chars[i] { return map{ code: shifted_keys[i], shift: true }; } i = i + 1; }
+    return nil;
+}
+
+fn _cap_add(caps, name, value) {
+    let i = 0; while i < len(caps) { if caps[i][0] == name and caps[i][1] == value { return; } i = i + 1; }
+    array_push(caps, [name, value]);
+}
+fn _key_change(packet, code, value) { _app(packet, input_event64(EV_KEY, code, value)); _sync(packet); }
+
+fn abs_setup_bytes(code, maximum) {
+    if (code != ABS_X and code != ABS_Y) or maximum < 1 or maximum > 32767 { throw "linux_uinput: invalid absolute axis setup"; }
+    let out = []; _app(out, X.le16(code)); _app(out, X.le16(0));
+    _app(out, X.le32(0)); _app(out, X.le32(0)); _app(out, X.le32(maximum));
+    _app(out, X.le32(0)); _app(out, X.le32(0)); _app(out, X.le32(0));
+    if len(out) != 28 { throw "linux_uinput: internal uinput_abs_setup size mismatch"; }
+    return out;
+}
+
+fn input_event64(type_code, code, value) {
+    if type_code < 0 or type_code > 65535 or code < 0 or code > 65535 or value < -2147483648 or value > 2147483647 {
+        throw "linux_uinput: invalid input_event field";
+    }
+    let out = _zeros(16);                      // timeval: kernel fills zero timestamps
+    _app(out, X.le16(type_code)); _app(out, X.le16(code)); _app(out, X.le32(_u32(value)));
+    return out;
+}
+fn _sync(packet) { _app(packet, input_event64(EV_SYN, SYN_REPORT, 0)); return packet; }
+
+fn event_packet(event) {
+    let checked = Events.validate(event); if not checked.ok { return checked; }
+    let e = checked.event; let packet = []; let caps = []; let abs_setups = [];
+    if e.kind == "key" {
+        let code = _key_code(e.key); caps = [["UI_SET_EVBIT", EV_KEY], ["UI_SET_KEYBIT", code]];
+        _app(packet, input_event64(EV_KEY, code, 1)); _sync(packet);
+        _app(packet, input_event64(EV_KEY, code, 0)); _sync(packet);
+    } elif e.kind == "click" {
+        let code = _button_code(e.button); caps = [["UI_SET_EVBIT", EV_KEY], ["UI_SET_KEYBIT", code]];
+        _app(packet, input_event64(EV_KEY, code, 1)); _sync(packet);
+        _app(packet, input_event64(EV_KEY, code, 0)); _sync(packet);
+    } elif e.kind == "pointer_delta" {
+        caps = [["UI_SET_EVBIT", EV_REL], ["UI_SET_RELBIT", REL_X], ["UI_SET_RELBIT", REL_Y]];
+        if e.dx != 0 { _app(packet, input_event64(EV_REL, REL_X, e.dx)); }
+        if e.dy != 0 { _app(packet, input_event64(EV_REL, REL_Y, e.dy)); }
+        _sync(packet);
+    } elif e.kind == "pointer" {
+        caps = [["UI_SET_EVBIT", EV_ABS], ["UI_SET_ABSBIT", ABS_X], ["UI_SET_ABSBIT", ABS_Y]];
+        array_push(abs_setups, abs_setup_bytes(ABS_X, 32767));
+        array_push(abs_setups, abs_setup_bytes(ABS_Y, 32767));
+        _app(packet, input_event64(EV_ABS, ABS_X, e.x));
+        _app(packet, input_event64(EV_ABS, ABS_Y, e.y)); _sync(packet);
+    } elif e.kind == "type" {
+        if len(e.text) > MAX_NATIVE_TEXT { return map{ ok: false, error: "native uinput text exceeds 1024 characters" }; }
+        _cap_add(caps, "UI_SET_EVBIT", EV_KEY);
+        let i = 0;
+        while i < len(e.text) {
+            let mapped = _ascii_key(strcharcodeat(e.text, i));
+            if mapped == nil { return map{ ok: false, error: "native uinput text currently accepts ASCII only", index: i }; }
+            _cap_add(caps, "UI_SET_KEYBIT", mapped.code);
+            if mapped.shift { _cap_add(caps, "UI_SET_KEYBIT", KEY_LEFTSHIFT); _key_change(packet, KEY_LEFTSHIFT, 1); }
+            _key_change(packet, mapped.code, 1); _key_change(packet, mapped.code, 0);
+            if mapped.shift { _key_change(packet, KEY_LEFTSHIFT, 0); }
+            i = i + 1;
+        }
+    } else {
+        return map{ ok: false, error: "native uinput event kind is unsupported" };
+    }
+    return map{ ok: true, event: e, bytes: packet, capabilities: caps,
+                abs_setups: abs_setups, event_count: len(packet) / 24 };
+}
+
+fn setup_bytes(name = "PBLang Virtual Input") {
+    if type(name) != "string" or len(str_to_bytes(name)) == 0 or len(str_to_bytes(name)) >= 80 or str_contains(name, "\x00") {
+        throw "linux_uinput: device name must be 1..79 non-NUL bytes";
+    }
+    let out = [];
+    _app(out, X.le16(BUS_USB)); _app(out, X.le16(0x5042)); _app(out, X.le16(1)); _app(out, X.le16(1));
+    let nb = str_to_bytes(name); _app(out, nb); array_push(out, 0);
+    while len(out) < 88 { array_push(out, 0); }
+    _app(out, X.le32(0));                       // ff_effects_max
+    if len(out) != 92 { throw "linux_uinput: internal uinput_setup size mismatch"; }
+    return out;
+}
+
+fn _check(code, fixups) {
+    _app(code, [0x48, 0x85, 0xC0, 0x0F, 0x88]); // test rax,rax; js rel32
+    array_push(fixups, len(code)); _app(code, [0, 0, 0, 0]);
+}
+fn _check_equal(code, expected, fixups) {
+    _app(code, [0x48, 0x3D]); _app(code, X.le32(expected)); // cmp rax, expected
+    _app(code, [0x0F, 0x85]); array_push(fixups, len(code)); _app(code, [0, 0, 0, 0]);
+}
+fn _fd_arg(code) { _app(code, [0x48, 0x89, 0xDF]); } // mov rdi,rbx
+fn _ioctl(code, request, arg, pointer, fixups) {
+    _app(code, X.mov_imm32("rax", 16)); _fd_arg(code);
+    _app(code, X.mov_imm32("rsi", request));
+    if pointer { _app(code, X.movabs_imm64("rdx", arg)); } else { _app(code, X.mov_imm32("rdx", arg)); }
+    _app(code, X.syscall()); _check(code, fixups);
+}
+fn _native_code(path_addr, setup_addr, packet_addr, packet_len, caps, abs_addrs) {
+    let code = []; let fixups = [];
+    _app(code, X.mov_imm32("rax", 2)); _app(code, X.movabs_imm64("rdi", path_addr));
+    _app(code, X.mov_imm32("rsi", 2049)); _app(code, X.mov_imm32("rdx", 0)); _app(code, X.syscall());
+    _check(code, fixups); _app(code, [0x48, 0x89, 0xC3]); // fd -> rbx
+    let i = 0; while i < len(caps) { _ioctl(code, io(caps[i][0]), caps[i][1], false, fixups); i = i + 1; }
+    _ioctl(code, io("UI_DEV_SETUP"), setup_addr, true, fixups);
+    i = 0; while i < len(abs_addrs) { _ioctl(code, io("UI_ABS_SETUP"), abs_addrs[i], true, fixups); i = i + 1; }
+    _ioctl(code, io("UI_DEV_CREATE"), 0, false, fixups);
+    _app(code, X.mov_imm32("rax", 1)); _fd_arg(code); _app(code, X.movabs_imm64("rsi", packet_addr));
+    _app(code, X.mov_imm32("rdx", packet_len)); _app(code, X.syscall()); _check(code, fixups); _check_equal(code, packet_len, fixups);
+    _ioctl(code, io("UI_DEV_DESTROY"), 0, false, fixups);
+    _app(code, X.mov_imm32("rax", 3)); _fd_arg(code); _app(code, X.syscall());
+    _app(code, X.mov_imm32("rax", 60)); _app(code, X.mov_imm32("rdi", 0)); _app(code, X.syscall());
+    let error_pos = len(code);
+    _app(code, X.mov_imm32("rax", 60)); _app(code, X.mov_imm32("rdi", 111)); _app(code, X.syscall());
+    i = 0; while i < len(fixups) { _set32(code, fixups[i], error_pos - (fixups[i] + 4)); i = i + 1; }
+    return code;
+}
+
+// AArch64 direct-syscall helper. Fixed two-instruction 32-bit loads keep the
+// code/data layout stable while absolute addresses are resolved.
+fn _a64_w(n) { return X.le32(n); }
+fn _a64_ld32(rd, n) {
+    if rd < 0 or rd > 30 or n < 0 or n > 4294967295 { throw "linux_uinput: invalid AArch64 immediate"; }
+    let lo = n % 65536; let hi = num_floor(n / 65536) % 65536;
+    let out = _a64_w(0xD2800000 + lo * 32 + rd);       // movz xd,#lo
+    _app(out, _a64_w(0xF2A00000 + hi * 32 + rd));      // movk xd,#hi,lsl#16
+    return out;
+}
+fn _a64_mov(dst, src) { return _a64_w(0xAA0003E0 + src * 65536 + dst); }
+fn _a64_syscall(code, nr) { _app(code, _a64_ld32(8, nr)); _app(code, A64.svc0()); }
+fn _a64_check(code, fixups, kind = "negative") {
+    array_push(fixups, map{ pos: len(code), kind: kind }); _app(code, [0, 0, 0, 0]);
+}
+fn _a64_ioctl(code, request, arg, fixups) {
+    _app(code, _a64_mov(0, 19)); _app(code, _a64_ld32(1, request)); _app(code, _a64_ld32(2, arg));
+    _a64_syscall(code, 29); _a64_check(code, fixups);
+}
+fn _a64_native_code(path_addr, setup_addr, packet_addr, packet_len, caps, abs_addrs) {
+    let code = []; let fixups = [];
+    _app(code, _a64_w(0x92800000 + 99 * 32));          // movn x0,#99 => AT_FDCWD (-100)
+    _app(code, _a64_ld32(1, path_addr)); _app(code, _a64_ld32(2, 2049)); _app(code, _a64_ld32(3, 0));
+    _a64_syscall(code, 56); _a64_check(code, fixups); _app(code, _a64_mov(19, 0));
+    let i = 0;
+    while i < len(caps) { _a64_ioctl(code, io(caps[i][0]), caps[i][1], fixups); i = i + 1; }
+    _a64_ioctl(code, io("UI_DEV_SETUP"), setup_addr, fixups);
+    i = 0; while i < len(abs_addrs) { _a64_ioctl(code, io("UI_ABS_SETUP"), abs_addrs[i], fixups); i = i + 1; }
+    _a64_ioctl(code, io("UI_DEV_CREATE"), 0, fixups);
+    _app(code, _a64_mov(0, 19)); _app(code, _a64_ld32(1, packet_addr)); _app(code, _a64_ld32(2, packet_len));
+    _a64_syscall(code, 64); _a64_check(code, fixups);
+    _app(code, _a64_ld32(2, packet_len)); _app(code, _a64_w(0xEB02001F)); // cmp x0,x2
+    _a64_check(code, fixups, "not-equal");
+    _a64_ioctl(code, io("UI_DEV_DESTROY"), 0, fixups);
+    _app(code, _a64_mov(0, 19)); _a64_syscall(code, 57);
+    _app(code, _a64_ld32(0, 0)); _a64_syscall(code, 93);
+    let error_pos = len(code);
+    _app(code, _a64_ld32(0, 111)); _a64_syscall(code, 93);
+    i = 0;
+    while i < len(fixups) {
+        let f = fixups[i]; let off = num_floor((error_pos - f.pos) / 4);
+        if off < 0 or off > 262143 { throw "linux_uinput: AArch64 error branch out of range"; }
+        let word = if f.kind == "not-equal" { 0x54000001 + off * 32 }
+                   else { 0xB7F80000 + off * 32 };     // tbnz x0,#63,error
+        _set32(code, f.pos, word); i = i + 1;
+    }
+    return code;
+}
+
+fn build_event(event, options = nil) {
+    let packet = event_packet(event); if not packet.ok { return packet; }
+    let name = "PBLang Virtual Input";
+    if options != nil and is_map(options) and map_has(options, "name") { name = options.name; }
+    let path = str_to_bytes("/dev/uinput"); array_push(path, 0);
+    let setup = setup_bytes(name);
+    let probe_abs = []; let ai = 0; while ai < len(packet.abs_setups) { array_push(probe_abs, 0); ai = ai + 1; }
+    let probe = _native_code(0, 0, 0, len(packet.bytes), packet.capabilities, probe_abs);
+    let base = 0x400000 + 120 + len(probe);
+    let path_addr = base; let setup_addr = path_addr + len(path); let next_addr = setup_addr + len(setup);
+    let abs_addrs = []; ai = 0;
+    while ai < len(packet.abs_setups) { array_push(abs_addrs, next_addr); next_addr = next_addr + len(packet.abs_setups[ai]); ai = ai + 1; }
+    let packet_addr = next_addr;
+    let code = _native_code(path_addr, setup_addr, packet_addr, len(packet.bytes), packet.capabilities, abs_addrs);
+    if len(code) != len(probe) { throw "linux_uinput: unstable native layout"; }
+    let data = []; _app(data, path); _app(data, setup);
+    ai = 0; while ai < len(packet.abs_setups) { _app(data, packet.abs_setups[ai]); ai = ai + 1; }
+    _app(data, packet.bytes);
+    let elf = X.elf64_exec_rx(code, data);
+    return map{
+        ok: true, format: "pblang.linux-uinput.artifact.v1", arch: "x86_64",
+        executable_format: "elf", bytes: elf, size: len(elf), packet: packet,
+        requires: ["Linux uinput", "/dev/uinput write permission", "explicit input-control approval"],
+        live_actuation: true, exit_error: 111
+    };
+}
+
+fn build_event_arm64(event, options = nil) {
+    let packet = event_packet(event); if not packet.ok { return packet; }
+    let name = "PBLang Virtual Input";
+    if options != nil and is_map(options) and map_has(options, "name") { name = options.name; }
+    let path = str_to_bytes("/dev/uinput"); array_push(path, 0); let setup = setup_bytes(name);
+    let probe_abs = []; let ai = 0; while ai < len(packet.abs_setups) { array_push(probe_abs, 0); ai = ai + 1; }
+    let probe = _a64_native_code(0, 0, 0, len(packet.bytes), packet.capabilities, probe_abs);
+    let base = 0x400000 + 120 + len(probe); let path_addr = base; let setup_addr = path_addr + len(path);
+    let next_addr = setup_addr + len(setup); let abs_addrs = []; ai = 0;
+    while ai < len(packet.abs_setups) { array_push(abs_addrs, next_addr); next_addr = next_addr + len(packet.abs_setups[ai]); ai = ai + 1; }
+    let packet_addr = next_addr;
+    let code = _a64_native_code(path_addr, setup_addr, packet_addr, len(packet.bytes), packet.capabilities, abs_addrs);
+    if len(code) != len(probe) { throw "linux_uinput: unstable AArch64 native layout"; }
+    let data = []; _app(data, path); _app(data, setup);
+    ai = 0; while ai < len(packet.abs_setups) { _app(data, packet.abs_setups[ai]); ai = ai + 1; }
+    _app(data, packet.bytes); _app(code, data);
+    let elf = A64.elf64_exec(code);
+    return map{
+        ok: true, format: "pblang.linux-uinput.artifact.v1", arch: "arm64",
+        executable_format: "elf", bytes: elf, size: len(elf), packet: packet,
+        requires: ["Linux uinput", "/dev/uinput write permission", "explicit input-control approval"],
+        live_actuation: true, exit_error: 111
+    };
+}
+
+fn build_event_for_arch(event, arch, options = nil) {
+    let a = str_lower(str(arch));
+    if a == "x86_64" or a == "x64" or a == "amd64" { return build_event(event, options); }
+    if a == "arm64" or a == "aarch64" { return build_event_arm64(event, options); }
+    return map{ ok: false, error: "native uinput backend supports x86_64 and arm64" };
+}
+
+fn capabilities() {
+    return map{
+        format: "pblang.linux-uinput.capabilities.v1", native_x86_64: true, native_arm64: true,
+        key: true, click: true, relative_pointer: true, absolute_pointer: true,
+        text_ascii: true, text_unicode: false, daemon: false, external_xdotool_required: false,
+        external_ydotool_required: false
+    };
+}
+
+export ioc, io, input_event64, event_packet, abs_setup_bytes, setup_bytes,
+       build_event, build_event_arm64, build_event_for_arch, capabilities;

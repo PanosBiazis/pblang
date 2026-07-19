@@ -1,0 +1,93 @@
+let PBCK = import("stdlib/selfhost_pbck.sapp");
+let FE = import("stdlib/compiler/selfhost_frontend.sapp");
+let OPT = import("stdlib/compiler/optimizer.sapp");
+let VM = import("stdlib/compiler/vm.sapp");
+let LOADER = import("stdlib/selfhost_loader.sapp");
+
+fn fail(message) { throw "FAIL selfhost_pbck_hardening: " + message; }
+fn rejected(value, message) { if value != "rejected" { fail(message); } }
+
+let base = map{
+    instructions: [map{ op: 0, operand: 0 }],
+    constants: [42]
+};
+let bytes = PBCK.serialize_chunk(base);
+
+// Exact consumption prevents valid-prefix smuggling.
+let trailing = [];
+let bi = 0; while bi < len(bytes) { array_push(trailing, bytes[bi]); bi = bi + 1; }
+array_push(trailing, 0);
+rejected(try PBCK.deserialize_chunk(trailing) catch "rejected", "trailing bytes accepted");
+
+// An impossible count must fail before allocating or iterating over it.
+let huge_count = [80, 66, 67, 83, 2, 255, 255, 255, 255];
+rejected(try PBCK.deserialize_chunk(huge_count) catch "rejected", "huge instruction count accepted");
+
+rejected(try PBCK.serialize_chunk(map{
+    instructions: [map{ op: 43, operand: 0 }], constants: []
+}) catch "rejected", "unknown opcode accepted");
+rejected(try PBCK.serialize_chunk(map{
+    instructions: [map{ op: 0, operand: 1 }], constants: [7]
+}) catch "rejected", "out-of-range constant accepted");
+rejected(try PBCK.serialize_chunk(map{
+    instructions: [map{ op: 20, operand: 2 }], constants: []
+}) catch "rejected", "out-of-range jump accepted");
+rejected(try PBCK.serialize_chunk(map{
+    instructions: [], constants: [map{ arbitrary: true }]
+}) catch "rejected", "unsupported constant silently serialized");
+
+// Multi-byte u32 counts must encode correctly, not fail at the byte boundary.
+let many_instructions = [];
+let mi = 0; while mi < 300 { array_push(many_instructions, map{ op: 2, operand: 0 }); mi = mi + 1; }
+let many_roundtrip = PBCK.deserialize_chunk(PBCK.serialize_chunk(map{
+    instructions: many_instructions, constants: []
+}));
+if len(many_roundtrip.instructions) != 300 { fail("u32 instruction count round-trip"); }
+
+// PBCS v1 remains readable: one OP_CONSTANT instruction and numeric constant 42.
+let v1 = [
+    80, 66, 67, 83, 1,
+    1, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 0, 0,
+    0, 2, 0, 0, 0, 52, 50
+];
+let old = PBCK.deserialize_chunk(v1);
+if old.instructions[0].op != 0 or old.instructions[0].operand != 0 or old.constants[0] != 42 {
+    fail("v1 compatibility");
+}
+
+fn has_fused(chunk) {
+    let i = 0;
+    while i < len(chunk.instructions) {
+        if chunk.instructions[i].op == 41 or chunk.instructions[i].op == 42 { return true; }
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(chunk.constants) {
+        let value = chunk.constants[j];
+        if type(value) == "map" and map_has(value, "chunk") and has_fused(value.chunk) { return true; }
+        j = j + 1;
+    }
+    return false;
+}
+
+let source = "fn sum(n) { let i = 0; let total = 0; while i < n { total = total + i; i = i + 1; } return total; } let answer = sum(10);";
+let compiled = FE.frontend_compile(source);
+if not compiled.ok { fail("frontend compilation"); }
+let optimized = OPT.optimize_safe(compiled.chunk);
+if optimized.stats.locals_fused < 2 or not has_fused(optimized.chunk) { fail("fused opcodes not produced"); }
+let restored = PBCK.deserialize_chunk(PBCK.serialize_chunk(optimized.chunk));
+if not has_fused(restored) { fail("fused operand encoding did not round-trip"); }
+let run = VM.run_seeded_bounded(restored, map{}, map{ max_steps: 10000 });
+if run.globals.answer != 45 { fail("restored optimized bytecode result"); }
+
+// Public loaders are bounded by default and expose explicit tighter budgets.
+let infinite = FE.frontend_compile("let i = 0; while true { i = i + 1; }");
+if not infinite.ok { fail("infinite fixture compilation"); }
+let limited = LOADER.run_pbck_bytes_with_options(PBCK.serialize_chunk(infinite.chunk), map{ max_steps: 100 });
+if limited.ok { fail("loader instruction budget was bypassed"); }
+let normal = LOADER.run_pbck_bytes_with_options(PBCK.serialize_chunk(base), map{ max_steps: 10 });
+if not normal.ok or normal.runtime.steps < 1 or normal.runtime.steps > 10 { fail("loader runtime accounting"); }
+
+print "selfhost_pbck_hardening_pass";
