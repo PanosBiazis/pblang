@@ -99,6 +99,20 @@ their real preview builders.
 window or socket. Runnable examples are under `examples/one_line_apps/` and are
 included in the PBIDE Examples catalog.
 
+For responsive, themeable applications, `stdlib/modern_ui.sapp` adds
+row/column/grid/card layouts and modern controls while retaining access to the
+lower-level GUI form:
+
+```pblang
+let ui = import("stdlib/modern_ui.sapp"); import("stdlib/app.sapp").surface("Tasks", ui.screen([ui.heading("Tasks"), ui.button("Add")]), map{ mode: "auto" });
+```
+
+The same validated view tree runs on native desktop and builds a signed Android
+APK from PBLang-generated JVM bytecode and hardened responsive Web artifacts
+through the same shared components and selectable `app.surface(...)` mode.
+iOS, Web and embedded remain explicit adapter contracts and fail clearly until
+their real runtimes are linked. See [`docs/MODERN_UI.md`](docs/MODERN_UI.md).
+
 ### One-line CDN-backed static site
 
 The pure-PBLang CDN control layer combines a safe static origin with bounded
@@ -144,6 +158,7 @@ with lazy loading. Reproduce the warm component costs with
 | `pblang fmt [files...]` | Format source files. |
 | `pblang lint [files...]` | Parse, type-check, and lint files. |
 | `pblang build [path]` | Generate lockfile and type-check the package entry. |
+| `pblang run tools/pbbuild.sapp --allow-all -- SOURCE OUTPUT` | Plan and run a cached adaptive native build with explicit fallbacks. |
 | `pblang init` | Create a `pblang.toml`. |
 | `pblang new <name>` | Scaffold a new project. |
 | `pblang install` | Install dependencies. |

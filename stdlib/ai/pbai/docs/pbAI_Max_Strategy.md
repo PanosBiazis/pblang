@@ -199,6 +199,11 @@ repeated prompt -> cached ranked generation
 heavy tensor work -> optimized tensor backend
 ```
 
+`pbai_streaming.sapp` now uses pblang's `llm_tiered_store.sapp` for verified
+layer/MoE shards, bounded RAM caching, learned hot-expert pinning, look-ahead prefetch,
+and weighted storage mirrors. Portable asynchronous read-at, checkpoint-format
+adapters, and tensor/GPU upload remain measured follow-up milestones.
+
 ## 9. Safety And Control
 
 More capable pbAI-Max needs stronger control:

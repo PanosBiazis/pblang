@@ -1,0 +1,96 @@
+// Build an import-free, optimized PBCK artifact using only PBLang compiler code.
+// The host VM loads the result directly, avoiding source parsing and module
+// imports on every invocation. Publication is staged and verified atomically.
+
+let LINK = import("stdlib:source_inliner.sapp");
+let FRONT = import("stdlib:compiler/selfhost_frontend.sapp");
+let PBCK = import("stdlib:selfhost_to_pbck.sapp");
+
+let FORMAT = "pblang.freeze.v1";
+let MAX_SOURCE_BYTES = 16777216;
+let MAX_ARTIFACT_BYTES = 67108864;
+
+fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+
+fn _valid_pbck(bytes) {
+    return type(bytes) == "array" and len(bytes) >= 5 and len(bytes) <= MAX_ARTIFACT_BYTES
+        and bytes[0] == 80 and bytes[1] == 66 and bytes[2] == 67 and bytes[3] == 75
+        and bytes[4] == 1;
+}
+
+fn _publish(path, bytes) {
+    if type(path) != "string" or path == "" or len(path) > 4096 {
+        return map{ ok: false, error: "invalid output path" };
+    }
+    if not _valid_pbck(bytes) { return map{ ok: false, error: "invalid PBCK artifact" }; }
+    let parent = path_dirname(path);
+    if parent != "" and not (try { fs_mkdirs(parent); true } catch false) {
+        return map{ ok: false, error: "output directory creation failed" };
+    }
+    let staged = path + ".tmp-" + str_slice(sha256(path + ":" + str(now_ms()) + ":" + str(random_bytes(16))), 0, 24);
+    if not (try { fs_write_bytes(staged, bytes); true } catch false) {
+        return map{ ok: false, error: "artifact staging failed" };
+    }
+    let check = try fs_read_bytes(staged) catch nil;
+    if not _valid_pbck(check) or len(check) != len(bytes) or _digest(check) != _digest(bytes) {
+        try fs_remove(staged) catch nil;
+        return map{ ok: false, error: "staged artifact verification failed" };
+    }
+    if not (try { fs_rename(staged, path); true } catch false) {
+        try fs_remove(staged) catch nil;
+        return map{ ok: false, error: "atomic artifact publication failed" };
+    }
+    return map{ ok: true, bytes: len(bytes), sha256: _digest(bytes) };
+}
+
+fn build(source_path, output_path) {
+    let started = now_ms();
+    let source = try fs_read(source_path) catch nil;
+    if type(source) != "string" { return map{ ok: false, stage: "read", error: "cannot read source" }; }
+    if len(str_to_bytes(source)) > MAX_SOURCE_BYTES {
+        return map{ ok: false, stage: "read", error: "source limit exceeded" };
+    }
+
+    let link_started = now_ms();
+    let linked = LINK.inline_file_prefixed(source_path);
+    let link_ms = now_ms() - link_started;
+    if not linked.ok {
+        return map{ ok: false, stage: "link", error: linked.reason, link_ms: link_ms };
+    }
+    if len(str_to_bytes(linked.source)) > MAX_SOURCE_BYTES {
+        return map{ ok: false, stage: "link", error: "linked source limit exceeded", modules: linked.modules, link_ms: link_ms };
+    }
+
+    let compile_started = now_ms();
+    let compiled = FRONT.frontend_compile(linked.source);
+    let compile_ms = now_ms() - compile_started;
+    if not compiled.ok {
+        return map{ ok: false, stage: "compile", error: "self-hosted compilation failed",
+            diagnostics: try compiled.diagnostics catch [], modules: linked.modules,
+            link_ms: link_ms, compile_ms: compile_ms };
+    }
+
+    let serialize_started = now_ms();
+    let bytes = try PBCK.translate_optimized(compiled.chunk) catch nil;
+    let serialize_ms = now_ms() - serialize_started;
+    if not _valid_pbck(bytes) {
+        return map{ ok: false, stage: "serialize", error: "PBCK translation failed",
+            modules: linked.modules, link_ms: link_ms, compile_ms: compile_ms,
+            serialize_ms: serialize_ms };
+    }
+
+    let publish_started = now_ms();
+    let published = _publish(output_path, bytes);
+    let publish_ms = now_ms() - publish_started;
+    if not published.ok {
+        return map{ ok: false, stage: "publish", error: published.error,
+            modules: linked.modules, link_ms: link_ms, compile_ms: compile_ms,
+            serialize_ms: serialize_ms, publish_ms: publish_ms };
+    }
+    return map{ ok: true, format: FORMAT, source: source_path, output: output_path,
+        modules: linked.modules, bytes: published.bytes, sha256: published.sha256,
+        link_ms: link_ms, compile_ms: compile_ms, serialize_ms: serialize_ms,
+        publish_ms: publish_ms, total_ms: now_ms() - started };
+}
+
+export FORMAT, MAX_SOURCE_BYTES, MAX_ARTIFACT_BYTES, build;

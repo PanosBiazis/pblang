@@ -1,0 +1,171 @@
+// Safe, read-only inspection of native-runtime PBCK-v1 artifacts.
+// This format is distinct from the self-hosted PBCS-v2 container. Inspection
+// never executes code and retains only aggregate requirements.
+
+let MAX_ARTIFACT_BYTES = 67108864;
+let MAX_DEPTH = 64;
+let MAX_TOTAL_INSTRUCTIONS = 4000000;
+let MAX_TOTAL_CONSTANTS = 1000000;
+let MAX_TOTAL_STRING_BYTES = 33554432;
+let MAX_CAPTURE_COUNT = 65535;
+let MAX_PARAMETER_COUNT = 65535;
+
+let OPCODE_NAMES = [
+    "constant", "add", "sub", "mul", "div", "eq", "not_eq", "gt", "ge", "lt", "le",
+    "pop", "print", "define_global", "get_global", "set_global", "get_attr", "set_attr",
+    "export", "make_array", "make_map", "get_index", "set_index", "try", "end_try",
+    "get_local", "set_local", "closure", "get_upvalue", "set_upvalue", "close_upvalue",
+    "call", "tail_call", "return", "defer", "jump", "jump_if_false", "jump_if_true",
+    "not", "negate", "mod", "pow", "safe_get_attr", "safe_index", "result_unwrap",
+    "is_nil", "dup", "throw"
+];
+
+fn _remaining(reader) { return len(reader.bytes) - reader.pos; }
+fn _need(reader, count, label) {
+    if count < 0 or count > _remaining(reader) { throw "host_pbck: truncated " + label; }
+}
+fn _u8(reader) { _need(reader, 1, "u8"); let v = reader.bytes[reader.pos]; reader.pos = reader.pos + 1; return v; }
+fn _u32(reader) {
+    _need(reader, 4, "u32"); let p = reader.pos; let b = reader.bytes;
+    let value = b[p] + b[p + 1] * 256 + b[p + 2] * 65536 + b[p + 3] * 16777216;
+    reader.pos = p + 4; return value;
+}
+fn _skip(reader, count, label) { _need(reader, count, label); reader.pos = reader.pos + count; }
+fn _string(reader) {
+    let size = _u32(reader); _need(reader, size, "string");
+    reader.string_bytes = reader.string_bytes + size;
+    if reader.string_bytes > MAX_TOTAL_STRING_BYTES { throw "host_pbck: total string bytes limit exceeded"; }
+    let bytes = []; let i = 0;
+    while i < size { array_push(bytes, reader.bytes[reader.pos + i]); i = i + 1; }
+    reader.pos = reader.pos + size;
+    return try bytes_to_str(bytes) catch { throw "host_pbck: invalid UTF-8 string"; };
+}
+fn _inc(counts, key) {
+    if map_has(counts, key) { counts[key] = counts[key] + 1; }
+    else { counts[key] = 1; }
+}
+fn _max(a, b) { return if b > a { b } else { a }; }
+
+fn _operand_opcode(op) {
+    return op == 0 or (op >= 13 and op <= 20) or op == 23 or op == 25 or op == 26
+        or op == 28 or op == 29 or op == 31 or op == 32 or (op >= 35 and op <= 37)
+        or op == 42;
+}
+
+fn _instruction(reader, instruction_count) {
+    let op = _u8(reader);
+    if op >= len(OPCODE_NAMES) { throw "host_pbck: unknown opcode " + str(op); }
+    _inc(reader.stats.opcode_counts, str(op));
+    if op == 27 {
+        _u32(reader); // function constant index; validated by the native loader
+        let captures = _u32(reader);
+        if captures > MAX_CAPTURE_COUNT or captures > num_floor(_remaining(reader) / 5) {
+            throw "host_pbck: invalid closure capture count";
+        }
+        reader.stats.max_captures = _max(reader.stats.max_captures, captures);
+        let i = 0;
+        while i < captures {
+            let local = _u8(reader);
+            if local != 0 and local != 1 { throw "host_pbck: invalid closure capture flag"; }
+            let slot = _u32(reader); reader.stats.max_slot = _max(reader.stats.max_slot, slot); i = i + 1;
+        }
+        return;
+    }
+    if not _operand_opcode(op) { return; }
+    let operand = _u32(reader);
+    if op == 25 or op == 26 or op == 28 or op == 29 { reader.stats.max_slot = _max(reader.stats.max_slot, operand); }
+    elif op == 31 or op == 32 { reader.stats.max_call_arity = _max(reader.stats.max_call_arity, operand); }
+    elif op == 19 or op == 20 { reader.stats.max_collection_items = _max(reader.stats.max_collection_items, operand); }
+    elif op == 23 or (op >= 35 and op <= 37) {
+        if operand > instruction_count { throw "host_pbck: jump target out of range"; }
+    }
+}
+
+fn _value(reader, depth) {
+    let tag = _u8(reader);
+    if tag == 0 { _skip(reader, 8, "f64 constant"); _inc(reader.stats.constant_kinds, "number"); return; }
+    if tag == 1 {
+        let value = _u8(reader); if value != 0 and value != 1 { throw "host_pbck: invalid boolean constant"; }
+        _inc(reader.stats.constant_kinds, "bool"); return;
+    }
+    if tag == 2 { _inc(reader.stats.constant_kinds, "nil"); return; }
+    if tag == 3 { _string(reader); _inc(reader.stats.constant_kinds, "string"); return; }
+    if tag == 4 { _string(reader); _inc(reader.stats.constant_kinds, "bigint"); return; }
+    if tag == 5 { _string(reader); _inc(reader.stats.constant_kinds, "rational"); return; }
+    if tag == 6 { throw "host_pbck: decimal constants are unsupported in PBCK-v1"; }
+    if tag != 7 { throw "host_pbck: unknown value tag " + str(tag); }
+    _inc(reader.stats.constant_kinds, "function"); reader.stats.functions = reader.stats.functions + 1;
+    let named = _u8(reader); if named != 0 and named != 1 { throw "host_pbck: invalid function-name flag"; }
+    if named == 1 { _string(reader); }
+    let arity = _u32(reader); let min_arity = _u32(reader);
+    if arity > MAX_PARAMETER_COUNT or min_arity > arity { throw "host_pbck: invalid function arity"; }
+    reader.stats.max_arity = _max(reader.stats.max_arity, arity);
+    let defaults = _u32(reader);
+    if defaults > arity or defaults > _remaining(reader) { throw "host_pbck: invalid default count"; }
+    let i = 0; while i < defaults { _value(reader, depth + 1); i = i + 1; }
+    let vararg = _u8(reader); if vararg != 0 and vararg != 1 { throw "host_pbck: invalid vararg flag"; }
+    let typed = _u8(reader); if typed != 0 and typed != 1 { throw "host_pbck: invalid parameter-type flag"; }
+    if typed == 1 {
+        let count = _u32(reader);
+        if count > MAX_PARAMETER_COUNT or count > _remaining(reader) { throw "host_pbck: invalid parameter-type count"; }
+        i = 0; while i < count { if _u8(reader) > 2 { throw "host_pbck: invalid parameter type"; } i = i + 1; }
+    }
+    _chunk(reader, depth + 1);
+}
+
+fn _chunk(reader, depth) {
+    if depth > MAX_DEPTH { throw "host_pbck: function nesting limit exceeded"; }
+    reader.stats.chunks = reader.stats.chunks + 1;
+    reader.stats.max_depth = _max(reader.stats.max_depth, depth);
+    let instruction_count = _u32(reader);
+    reader.stats.instructions = reader.stats.instructions + instruction_count;
+    if reader.stats.instructions > MAX_TOTAL_INSTRUCTIONS or instruction_count > _remaining(reader) {
+        throw "host_pbck: instruction count limit exceeded";
+    }
+    let i = 0; while i < instruction_count { _instruction(reader, instruction_count); i = i + 1; }
+    let constant_count = _u32(reader);
+    reader.stats.constants = reader.stats.constants + constant_count;
+    if reader.stats.constants > MAX_TOTAL_CONSTANTS or constant_count > _remaining(reader) {
+        throw "host_pbck: constant count limit exceeded";
+    }
+    i = 0; while i < constant_count { _value(reader, depth); i = i + 1; }
+    let span_count = _u32(reader);
+    if span_count != instruction_count or span_count > num_floor(_remaining(reader) / 8) {
+        throw "host_pbck: invalid source span table";
+    }
+    _skip(reader, span_count * 8, "source spans");
+    let source = _u8(reader); if source != 0 and source != 1 { throw "host_pbck: invalid source-name flag"; }
+    if source == 1 { _string(reader); }
+}
+
+fn inspect_bytes(bytes) {
+    if type(bytes) != "array" or len(bytes) < 9 or len(bytes) > MAX_ARTIFACT_BYTES {
+        throw "host_pbck: invalid artifact size";
+    }
+    if bytes[0] != 80 or bytes[1] != 66 or bytes[2] != 67 or bytes[3] != 75 or bytes[4] != 1 {
+        throw "host_pbck: bad magic or unsupported version";
+    }
+    let stats = map{
+        format: "pblang.host-pbck.requirements.v1", version: 1, artifact_bytes: len(bytes),
+        chunks: 0, instructions: 0, constants: 0, functions: 0, max_depth: 0,
+        max_arity: 0, max_captures: 0, max_slot: 0, max_call_arity: 0,
+        max_collection_items: 0, opcode_counts: map{}, constant_kinds: map{}
+    };
+    let reader = map{ bytes: bytes, pos: 5, string_bytes: 0, stats: stats };
+    _chunk(reader, 0);
+    if reader.pos != len(bytes) { throw "host_pbck: trailing bytes"; }
+    let opcodes = []; let op = 0;
+    while op < len(OPCODE_NAMES) {
+        let key = str(op);
+        if map_has(stats.opcode_counts, key) {
+            array_push(opcodes, map{ opcode: op, name: OPCODE_NAMES[op], count: stats.opcode_counts[key] });
+        }
+        op = op + 1;
+    }
+    stats.opcodes = opcodes; stats.string_bytes = reader.string_bytes;
+    return stats;
+}
+
+fn inspect_file(path) { return inspect_bytes(fs_read_bytes(path)); }
+
+export MAX_ARTIFACT_BYTES, OPCODE_NAMES, inspect_bytes, inspect_file;

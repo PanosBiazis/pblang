@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Runtime-responsive cross-surface modern UI
+- Changed PBLang-generated Android Activities to query the actual
+  `screenWidthDp` instead of freezing the build-time preview width.
+- Responsive rows now stack and grids collapse at a bounded runtime breakpoint,
+  including after orientation-driven Activity recreation. Interactive controls
+  default to 48dp touch targets and retain scroll/keyboard resize fallbacks.
+- Hardened Web output for 360px-class screens, short landscape displays,
+  notched safe areas, dynamic viewport height, long text and horizontal
+  overflow. Added focused Android/Web tests and a multi-viewport benchmark.
+- No Rust source was added.
+
 ### Native input and FreeBSD target verification
 - Extended the PBLang-native X11/XTest adapter with modifier-correct ASCII text
   and current-keymap Unicode keysym injection, plus an isolated Xephyr live test.

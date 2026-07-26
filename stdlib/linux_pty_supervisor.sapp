@@ -1,0 +1,267 @@
+// Linux x86-64 PTY supervisor generated entirely by PBLang.
+//
+// The emitted static ELF starts a private util-linux script(1) PTY under a
+// bounded coreutils timeout. Input arrives through a caller-created mode-0600
+// FIFO, output is flushed to a private transcript, and the supervisor writes
+// its process-group id and final wait status to O_EXCL|O_NOFOLLOW files. The
+// caller launches it with `setsid --fork`; no shell command is constructed and
+// every execve argument is a fixed, separately encoded string.
+
+let X = import("stdlib:codegen_x64.sapp");
+
+let LOAD_BASE = 0x400000;
+let ELF_HEADER_BYTES = 120;
+let MAX_PATH_BYTES = 4096;
+let MAX_SECONDS = 3600;
+let MAX_OUTPUT_BYTES = 1048576;
+let MAX_WRITE_BYTES = 4096;
+
+fn _append(dst, src) {
+    let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+
+fn _cstring_any(value, label) {
+    if type(value) != "string" or value == "" or len(str_to_bytes(value)) >= MAX_PATH_BYTES
+       or str_contains(value, "\x00") {
+        throw "linux_pty_supervisor: invalid " + label;
+    }
+    let out = str_to_bytes(value); array_push(out, 0); return out;
+}
+
+fn _cstring(value, label) {
+    if type(value) != "string" or not str_starts_with(value, "/") {
+        throw "linux_pty_supervisor: invalid " + label;
+    }
+    return _cstring_any(value, label);
+}
+
+fn _positive_integer(value, label, maximum) {
+    if not is_number(value) or value != num_floor(value) or value < 1 or value > maximum {
+        throw "linux_pty_supervisor: " + label + " must be an integer in 1.." + str(maximum);
+    }
+    return value;
+}
+
+fn _set_rel32(code, pos, target) {
+    let delta = target - (pos + 4);
+    if delta < -2147483648 or delta > 2147483647 { throw "linux_pty_supervisor: branch exceeds rel32"; }
+    if delta < 0 { delta = 4294967296 + delta; }
+    let bytes = X.le32(delta); let i = 0;
+    while i < 4 { code[pos + i] = bytes[i]; i = i + 1; }
+}
+
+fn _branch(code, opcode, fixups) {
+    _append(code, opcode); array_push(fixups, len(code)); _append(code, [0, 0, 0, 0]);
+}
+
+fn _check_nonnegative(code, errors) {
+    _append(code, [0x48, 0x85, 0xC0]);
+    _branch(code, [0x0F, 0x88], errors);
+}
+
+fn _write_stack_all(code, offset, count, errors) {
+    // fd is in rbp; payload is stack-backed and therefore writable.
+    _append(code, [0x48, 0x89, 0xEF, 0x48, 0x8D, 0x74, 0x24, offset]);
+    _append(code, X.mov_imm32("rdx", count));
+    let loop = len(code);
+    _append(code, X.mov_imm32("rax", 1)); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x85, 0xC0]); _branch(code, [0x0F, 0x84], errors);
+    _append(code, [0x48, 0x01, 0xC6, 0x48, 0x29, 0xC2, 0x48, 0x85, 0xD2, 0x0F, 0x85]);
+    let back = len(code); _append(code, [0, 0, 0, 0]); _set_rel32(code, back, loop);
+}
+
+fn _code(layout) {
+    let code = []; let errors = [];
+    // Preserve the original environment for script and the selected shell.
+    _append(code, [0x49, 0x89, 0xE4, 0x4D, 0x8B, 0x2C, 0x24]);
+    _append(code, [0x4F, 0x8D, 0x74, 0xEC, 0x10]); // r14 = envp
+
+    // Refuse to run unless setsid(1) made this process its own process-group
+    // leader. Signals can then target the PTY tree without touching PBRemote.
+    _append(code, X.mov_imm32("rax", 39)); _append(code, X.syscall());
+    _check_nonnegative(code, errors); _append(code, [0x49, 0x89, 0xC7]);
+    _append(code, X.mov_imm32("rax", 111)); _append(code, X.syscall());
+    _check_nonnegative(code, errors); _append(code, [0x4C, 0x39, 0xF8]);
+    _branch(code, [0x0F, 0x85], errors);
+
+    // Allocate writable stack state. RLIMIT_FSIZE bounds the transcript even
+    // when the client stops polling it.
+    _append(code, [0x48, 0x83, 0xEC, 0x30]);
+    _append(code, [0x48, 0xC7, 0x04, 0x24]); _append(code, X.le32(layout.max_output));
+    _append(code, [0x48, 0xC7, 0x44, 0x24, 0x08]); _append(code, X.le32(layout.max_output));
+    _append(code, X.mov_imm32("rax", 160)); _append(code, X.mov_imm32("rdi", 1));
+    _append(code, [0x48, 0x89, 0xE6]); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+
+    // Open the private FIFO read/write so short-lived writers do not produce
+    // EOF between input frames. O_NOFOLLOW refuses a substituted symlink.
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.fifo));
+    _append(code, X.mov_imm32("rdx", 131074)); _append(code, [0x45, 0x31, 0xD2]);
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC3]);
+    _append(code, X.mov_imm32("rax", 33)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.mov_imm32("rsi", 0)); _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xDF]); _append(code, X.syscall());
+
+    // Keep utility diagnostics out of the protocol transcript.
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.devnull));
+    _append(code, X.mov_imm32("rdx", 655361)); _append(code, [0x45, 0x31, 0xD2]);
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC3]);
+    let fd = 1;
+    while fd <= 2 {
+        _append(code, X.mov_imm32("rax", 33)); _append(code, [0x48, 0x89, 0xDF]);
+        _append(code, X.mov_imm32("rsi", fd)); _append(code, X.syscall()); _check_nonnegative(code, errors);
+        fd = fd + 1;
+    }
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xDF]); _append(code, X.syscall());
+
+    // Publish a fixed-width decimal process-group id atomically after the FIFO
+    // is ready. The final path appears only after all bytes are written.
+    _append(code, [0x4C, 0x89, 0xF8]);
+    _append(code, [0x48, 0x8D, 0x7C, 0x24, 0x19]);
+    _append(code, X.mov_imm32("rcx", 10)); _append(code, [0x41, 0xB8]); _append(code, X.le32(10));
+    let digits = len(code);
+    _append(code, [0x48, 0x31, 0xD2, 0x49, 0xF7, 0xF0, 0x80, 0xC2, 0x30, 0x88, 0x17]);
+    _append(code, [0x48, 0xFF, 0xCF, 0x48, 0xFF, 0xC9, 0x0F, 0x85]);
+    let digits_back = len(code); _append(code, [0, 0, 0, 0]); _set_rel32(code, digits_back, digits);
+    _append(code, [0xC6, 0x44, 0x24, 0x1A, 0x0A]);
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.pid_stage));
+    _append(code, X.mov_imm32("rdx", 131265)); _append(code, [0x41, 0xBA]); _append(code, X.le32(384));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC5]); _write_stack_all(code, 16, 11, errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xEF]); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 82));
+    _append(code, X.movabs_imm64("rdi", layout.pid_stage));
+    _append(code, X.movabs_imm64("rsi", layout.pid));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+
+    // Keep a monitor as the process-group leader. It records wait4 status while
+    // the child executes the bounded PTY tree.
+    _append(code, X.mov_imm32("rax", 57)); _append(code, X.syscall());
+    _check_nonnegative(code, errors); _append(code, [0x48, 0x85, 0xC0]);
+    let parent_branch = []; _branch(code, [0x0F, 0x85], parent_branch);
+
+    // Child: execve(timeout, argv, envp). timeout bounds the whole PTY process
+    // group; script allocates the PTY and flushes every transcript write.
+    _append(code, X.mov_imm32("rax", 59)); _append(code, X.movabs_imm64("rdi", layout.timeout));
+    _append(code, X.movabs_imm64("rsi", layout.argv)); _append(code, [0x4C, 0x89, 0xF2]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 126)); _append(code, X.syscall());
+
+    // Parent: wait, atomically publish the raw Linux wait status, then exit.
+    let parent = len(code); _set_rel32(code, parent_branch[0], parent);
+    _append(code, [0x48, 0x89, 0xC7, 0x48, 0x8D, 0x74, 0x24, 0x20]);
+    _append(code, X.mov_imm32("rdx", 0)); _append(code, [0x45, 0x31, 0xD2]);
+    _append(code, X.mov_imm32("rax", 61)); _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.status_stage));
+    _append(code, X.mov_imm32("rdx", 131265)); _append(code, [0x41, 0xBA]); _append(code, X.le32(384));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC5]); _write_stack_all(code, 32, 4, errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xEF]); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 82));
+    _append(code, X.movabs_imm64("rdi", layout.status_stage));
+    _append(code, X.movabs_imm64("rsi", layout.status));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 0)); _append(code, X.syscall());
+
+    let error = len(code);
+    _append(code, X.mov_imm32("rax", 87)); _append(code, X.movabs_imm64("rdi", layout.pid)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 87)); _append(code, X.movabs_imm64("rdi", layout.status)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 87)); _append(code, X.movabs_imm64("rdi", layout.pid_stage)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 87)); _append(code, X.movabs_imm64("rdi", layout.status_stage)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 126)); _append(code, X.syscall());
+    let i = 0; while i < len(errors) { _set_rel32(code, errors[i], error); i = i + 1; }
+    return code;
+}
+
+fn build(options) {
+    if options == nil or not is_map(options) { throw "linux_pty_supervisor: options must be a map"; }
+    let fifo = _cstring(try options.fifo catch nil, "fifo path");
+    let pid = _cstring(try options.pid_file catch nil, "pid path");
+    let status = _cstring(try options.status_file catch nil, "status path");
+    let output = _cstring(try options.output catch nil, "output path");
+    let shell = _cstring(try options.shell catch "/bin/sh", "shell path");
+    let script = _cstring(try options.script catch "/usr/bin/script", "script path");
+    let timeout = _cstring(try options.timeout catch "/usr/bin/timeout", "timeout path");
+    let seconds = _positive_integer(try options.max_seconds catch 60, "max_seconds", MAX_SECONDS);
+    let max_output = _positive_integer(try options.max_output_bytes catch 65536,
+        "max_output_bytes", MAX_OUTPUT_BYTES);
+    let duration = str_to_bytes(str(seconds) + "s"); array_push(duration, 0);
+    let pid_stage = _cstring((try options.pid_file catch nil) + ".pending", "pid staging path");
+    let status_stage = _cstring((try options.status_file catch nil) + ".pending", "status staging path");
+    let raw = [fifo, pid, status, pid_stage, status_stage, _cstring("/dev/null", "null path"), timeout,
+        _cstring_any("timeout", "argv0"), _cstring_any("--foreground", "timeout option"),
+        _cstring_any("--signal=TERM", "timeout option"), _cstring_any("--kill-after=1s", "timeout option"),
+        duration, script, _cstring_any("-q", "script option"), _cstring_any("-f", "script option"),
+        _cstring_any("-e", "script option"), _cstring_any("-c", "script option"), shell, output];
+    let probe = map{ fifo: 0, pid: 0, status: 0, pid_stage: 0, status_stage: 0,
+        devnull: 0, timeout: 0, argv: 0, max_output: max_output };
+    let code_len = len(_code(probe));
+    let cursor = LOAD_BASE + ELF_HEADER_BYTES + code_len; let addresses = [];
+    let i = 0;
+    while i < len(raw) { array_push(addresses, cursor); cursor = cursor + len(raw[i]); i = i + 1; }
+    let argv_address = cursor;
+    let layout = map{ fifo: addresses[0], pid: addresses[1], status: addresses[2],
+        pid_stage: addresses[3], status_stage: addresses[4], devnull: addresses[5],
+        timeout: addresses[6], argv: argv_address, max_output: max_output };
+    let code = _code(layout); let data = [];
+    i = 0; while i < len(raw) { _append(data, raw[i]); i = i + 1; }
+    // timeout argv: options, duration, script command, script options, shell,
+    // transcript, null terminator.
+    let argv_indices = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+    i = 0; while i < len(argv_indices) { _append(data, X.le64(addresses[argv_indices[i]])); i = i + 1; }
+    _append(data, X.le64(0));
+    return X.elf64_exec_rx(code, data);
+}
+
+fn _writer_code(layout) {
+    let code = []; let errors = [];
+    // openat(AT_FDCWD, fifo, O_WRONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC, 0)
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.fifo));
+    _append(code, X.mov_imm32("rdx", 657409)); _append(code, [0x45, 0x31, 0xD2]);
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC7]);
+    // A <= PIPE_BUF nonblocking FIFO write is all-or-nothing. Reject any short
+    // result instead of retrying and risking protocol-frame interleaving.
+    _append(code, X.mov_imm32("rax", 1));
+    _append(code, X.movabs_imm64("rsi", layout.payload));
+    _append(code, X.mov_imm32("rdx", layout.payload_len));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x3D]); _append(code, X.le32(layout.payload_len));
+    _branch(code, [0x0F, 0x85], errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 60)); _append(code, [0x48, 0x31, 0xFF]); _append(code, X.syscall());
+    let error = len(code);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 75)); _append(code, X.syscall());
+    let i = 0; while i < len(errors) { _set_rel32(code, errors[i], error); i = i + 1; }
+    return code;
+}
+
+fn build_writer(fifo_path, payload) {
+    let fifo = _cstring(fifo_path, "fifo path");
+    if type(payload) != "string" or payload == "" or str_contains(payload, "\x00") {
+        throw "linux_pty_supervisor: writer payload must be non-empty text";
+    }
+    let payload_bytes = str_to_bytes(payload);
+    if len(payload_bytes) > MAX_WRITE_BYTES {
+        throw "linux_pty_supervisor: writer payload exceeds PIPE_BUF";
+    }
+    let probe = map{ fifo: 0, payload: 0, payload_len: len(payload_bytes) };
+    let code_len = len(_writer_code(probe));
+    let fifo_address = LOAD_BASE + ELF_HEADER_BYTES + code_len;
+    let payload_address = fifo_address + len(fifo);
+    let code = _writer_code(map{ fifo: fifo_address, payload: payload_address,
+        payload_len: len(payload_bytes) });
+    let data = []; _append(data, fifo); _append(data, payload_bytes);
+    return X.elf64_exec_rx(code, data);
+}
+
+export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MAX_WRITE_BYTES, build, build_writer;

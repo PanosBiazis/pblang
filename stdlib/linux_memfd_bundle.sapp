@@ -1,0 +1,230 @@
+// Linux x86-64 in-memory application bundle launcher.
+//
+// The generated ELF contains a verified PBLang runtime and PBCK program. At
+// launch it copies the runtime into an anonymous memfd and uses
+// execveat(AT_EMPTY_PATH). The current host selects the PBCK loader by filename
+// suffix, so the core is staged with O_EXCL|O_NOFOLLOW inside a mode-0700,
+// per-process directory. A monitor waits for the runtime, removes that file and
+// directory, and propagates the child exit status. No executable is extracted.
+
+let X = import("stdlib:codegen_x64.sapp");
+
+let LOAD_BASE = 0x400000;
+let ELF_HEADER_BYTES = 120;
+let MAX_PAYLOAD_BYTES = 268435456;
+
+fn _append(dst, src) {
+    let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+
+fn _cstring(value, label) {
+    if type(value) != "string" or value == "" or str_contains(value, "\x00") {
+        throw "linux_memfd_bundle: invalid " + label;
+    }
+    let out = str_to_bytes(value); array_push(out, 0); return out;
+}
+
+fn _set_rel32(code, pos, target) {
+    let delta = target - (pos + 4);
+    if delta < -2147483648 or delta > 2147483647 { throw "linux_memfd_bundle: branch exceeds rel32"; }
+    if delta < 0 { delta = 4294967296 + delta; }
+    let bytes = X.le32(delta); let i = 0;
+    while i < 4 { code[pos + i] = bytes[i]; i = i + 1; }
+}
+
+fn _branch(code, opcode, fixups) {
+    _append(code, opcode); array_push(fixups, len(code)); _append(code, [0, 0, 0, 0]);
+}
+
+fn _check_nonnegative(code, errors) {
+    _append(code, [0x48, 0x85, 0xC0]);       // test rax,rax
+    _branch(code, [0x0F, 0x88], errors);     // js error
+}
+
+fn _write_all(code, fd_reg, address, count, errors) {
+    if fd_reg == "rbx" { _append(code, [0x48, 0x89, 0xDF]); }       // mov rdi,rbx
+    elif fd_reg == "r8" { _append(code, [0x4C, 0x89, 0xC7]); }     // mov rdi,r8
+    elif fd_reg == "rbp" { _append(code, [0x48, 0x89, 0xEF]); }    // mov rdi,rbp
+    else { throw "linux_memfd_bundle: unsupported file descriptor register"; }
+    _append(code, X.movabs_imm64("rsi", address));
+    _append(code, X.movabs_imm64("rdx", count));
+    let loop = len(code);
+    _append(code, X.mov_imm32("rax", 1)); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x85, 0xC0]);       // a zero write cannot make progress
+    _branch(code, [0x0F, 0x84], errors);     // jz error
+    _append(code, [0x48, 0x01, 0xC6]);       // add rsi,rax
+    _append(code, [0x48, 0x29, 0xC2]);       // sub rdx,rax
+    _append(code, [0x48, 0x85, 0xD2]);       // test rdx,rdx
+    _append(code, [0x0F, 0x85]);
+    let back = len(code); _append(code, [0, 0, 0, 0]); _set_rel32(code, back, loop);
+}
+
+fn _launcher_code(layout) {
+    let code = []; let fatal_errors = []; let cleanup_errors = [];
+    // Preserve the initial process stack and derive envp from argc/argv.
+    _append(code, [0x49, 0x89, 0xE4]);                       // mov r12,rsp
+    _append(code, [0x4D, 0x8B, 0x2C, 0x24]);                 // mov r13,[r12] (argc)
+    _append(code, [0x4F, 0x8D, 0x74, 0xEC, 0x10]);           // lea r14,[r12+r13*8+16]
+
+    // Copy the path template to writable stack storage and replace its ten
+    // zeroes with a fixed-width decimal PID. The resulting directory name is
+    // unique for the lifetime of this process and cannot be redirected.
+    _append(code, [0x48, 0x81, 0xEC]); _append(code, X.le32(64));   // sub rsp,64
+    _append(code, [0x49, 0x89, 0xE7]);                             // r15=rsp
+    _append(code, X.movabs_imm64("rsi", layout.path_template));
+    _append(code, [0x4C, 0x89, 0xFF]);                             // rdi=r15
+    _append(code, X.mov_imm32("rcx", layout.path_bytes)); _append(code, [0xF3, 0xA4]);
+    _append(code, X.mov_imm32("rax", 39)); _append(code, X.syscall()); // getpid
+    _check_nonnegative(code, fatal_errors);
+    _append(code, [0x49, 0x8D, 0x7F, layout.digit_end]);            // last digit
+    _append(code, X.mov_imm32("rcx", 10));
+    _append(code, [0x41, 0xB8]); _append(code, X.le32(10));         // r8=10
+    let digit_loop = len(code);
+    _append(code, [0x48, 0x31, 0xD2, 0x49, 0xF7, 0xF0]);           // xor rdx,rdx; div r8
+    _append(code, [0x80, 0xC2, 0x30, 0x88, 0x17, 0x48, 0xFF, 0xCF, 0x48, 0xFF, 0xC9]);
+    _append(code, [0x0F, 0x85]); let digit_back = len(code); _append(code, [0, 0, 0, 0]);
+    _set_rel32(code, digit_back, digit_loop);
+
+    // Temporarily terminate at the separator and create the private directory.
+    _append(code, [0x41, 0xC6, 0x47, layout.dir_end, 0]);
+    _append(code, X.mov_imm32("rax", 83)); _append(code, [0x4C, 0x89, 0xFF]);
+    _append(code, X.mov_imm32("rsi", 448)); _append(code, X.syscall()); // mkdir 0700
+    _check_nonnegative(code, fatal_errors);
+    _append(code, [0x41, 0xC6, 0x47, layout.dir_end, 47]);           // restore '/'
+
+    // Create the core atomically and refuse symlinks or pre-existing paths.
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, [0x4C, 0x89, 0xFE]);                              // rsi=r15
+    _append(code, X.mov_imm32("rdx", 131265));                     // WRONLY|CREAT|EXCL|NOFOLLOW
+    _append(code, [0x41, 0xBA]); _append(code, X.le32(384));        // r10=0600
+    _append(code, X.syscall()); _check_nonnegative(code, cleanup_errors);
+    _append(code, [0x48, 0x89, 0xC5]);                             // core fd -> rbp
+    _write_all(code, "rbp", layout.core, layout.core_bytes, cleanup_errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xEF]); _append(code, X.syscall());
+    _check_nonnegative(code, cleanup_errors);
+
+    // Runtime memfd.
+    _append(code, X.mov_imm32("rax", 319));
+    _append(code, X.movabs_imm64("rdi", layout.runtime_name));
+    _append(code, X.mov_imm32("rsi", 0)); _append(code, X.syscall());
+    _check_nonnegative(code, cleanup_errors); _append(code, [0x48, 0x89, 0xC3]); // fd -> rbx
+    _append(code, X.mov_imm32("rax", 91)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.mov_imm32("rsi", 448)); _append(code, X.syscall()); // fchmod 0700
+    _check_nonnegative(code, cleanup_errors);
+    _write_all(code, "rbx", layout.runtime, layout.runtime_bytes, cleanup_errors);
+
+    // The original process becomes a cleanup monitor. The child replaces
+    // itself with the runtime, while the monitor waits and propagates status.
+    _append(code, X.mov_imm32("rax", 57)); _append(code, X.syscall()); // fork
+    _check_nonnegative(code, cleanup_errors);
+    _append(code, [0x48, 0x85, 0xC0]);
+    let parent_branch = []; _branch(code, [0x0F, 0x85], parent_branch);
+
+    // Child: build argv = [pblang, run, core.pbck, --allow-all, --, user args...].
+    _append(code, [0x4C, 0x89, 0xE8]);                       // mov rax,r13
+    _append(code, [0x48, 0x83, 0xC0, 0x05]);                 // argc + five slots
+    _append(code, [0x48, 0xC1, 0xE0, 0x03]);                 // * 8
+    _append(code, [0x48, 0x29, 0xC4, 0x48, 0x83, 0xE4, 0xF0]); // allocate, align
+    _append(code, [0x49, 0x89, 0xE1]);                       // r9 = new argv
+    let fixed = [layout.arg0, layout.run_arg, 0, layout.allow_all, layout.separator];
+    let i = 0;
+    while i < len(fixed) {
+        if i == 2 { _append(code, [0x4C, 0x89, 0xF8]); }            // core path = r15
+        else { _append(code, X.movabs_imm64("rax", fixed[i])); }
+        if i == 0 { _append(code, [0x49, 0x89, 0x01]); }
+        else { _append(code, [0x49, 0x89, 0x41, i * 8]); }
+        i = i + 1;
+    }
+    _append(code, [0x49, 0x8D, 0x74, 0x24, 0x10]);           // rsi = old argv + 1
+    _append(code, [0x49, 0x8D, 0x79, 0x28]);                 // rdi = new argv + 5
+    _append(code, [0x4C, 0x89, 0xE9, 0x48, 0xFF, 0xC9]);     // rcx = argc - 1
+    _append(code, [0x48, 0x85, 0xC9]);
+    let skip_copy = []; _branch(code, [0x0F, 0x84], skip_copy);
+    let copy_loop = len(code);
+    _append(code, [0x48, 0x8B, 0x06, 0x48, 0x89, 0x07]);
+    _append(code, [0x48, 0x83, 0xC6, 0x08, 0x48, 0x83, 0xC7, 0x08]);
+    _append(code, [0x48, 0xFF, 0xC9, 0x0F, 0x85]);
+    let copy_back = len(code); _append(code, [0, 0, 0, 0]); _set_rel32(code, copy_back, copy_loop);
+    let copy_done = len(code); _set_rel32(code, skip_copy[0], copy_done);
+    _append(code, [0x48, 0xC7, 0x07, 0, 0, 0, 0]);           // terminating null
+
+    // execveat(runtime_fd, "", argv, envp, AT_EMPTY_PATH).
+    _append(code, X.mov_imm32("rax", 322)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.movabs_imm64("rsi", layout.empty));
+    _append(code, [0x4C, 0x89, 0xCA, 0x4D, 0x89, 0xF2]);     // rdx=r9, r10=r14
+    _append(code, [0x41, 0xB8]); _append(code, X.le32(0x1000));
+    _append(code, X.syscall());
+    _branch(code, [0xE9], cleanup_errors);                    // execveat returned: fail closed
+
+    // Parent: wait for the runtime, remove the PBCK and directory, and return
+    // the same normal exit code. A signal is reported as 128+signal.
+    let parent = len(code); _set_rel32(code, parent_branch[0], parent);
+    _append(code, [0x48, 0x89, 0xC7]);                             // rdi=child pid
+    _append(code, [0x49, 0x8D, 0x77, 0x30]);                       // rsi=&status
+    _append(code, X.mov_imm32("rdx", 0)); _append(code, [0x45, 0x31, 0xD2]); // r10=0
+    _append(code, X.mov_imm32("rax", 61)); _append(code, X.syscall());
+    _check_nonnegative(code, cleanup_errors);
+    let cleanup_ok = len(code);
+    _append(code, X.mov_imm32("rax", 87)); _append(code, [0x4C, 0x89, 0xFF]); _append(code, X.syscall());
+    _append(code, [0x41, 0xC6, 0x47, layout.dir_end, 0]);
+    _append(code, X.mov_imm32("rax", 84)); _append(code, [0x4C, 0x89, 0xFF]); _append(code, X.syscall());
+    _append(code, [0x41, 0x8B, 0x47, 0x30, 0x89, 0xC7, 0x83, 0xE7, 0x7F]);
+    _append(code, [0x85, 0xFF]); let signaled = []; _branch(code, [0x0F, 0x85], signaled);
+    _append(code, [0xC1, 0xE8, 0x08, 0x25, 0xFF, 0, 0, 0, 0x89, 0xC7]);
+    let exit_now = []; _branch(code, [0xE9], exit_now);
+    let signal_exit = len(code); _set_rel32(code, signaled[0], signal_exit);
+    _append(code, [0x81, 0xC7]); _append(code, X.le32(128));
+    let exit_pos = len(code); _set_rel32(code, exit_now[0], exit_pos);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.syscall());
+
+    // Cleanup-error path is used only after the private directory exists.
+    let cleanup_error = len(code);
+    _append(code, X.mov_imm32("rax", 87)); _append(code, [0x4C, 0x89, 0xFF]); _append(code, X.syscall());
+    _append(code, [0x41, 0xC6, 0x47, layout.dir_end, 0]);
+    _append(code, X.mov_imm32("rax", 84)); _append(code, [0x4C, 0x89, 0xFF]); _append(code, X.syscall());
+    let fatal = len(code);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 126)); _append(code, X.syscall());
+    i = 0; while i < len(fatal_errors) { _set_rel32(code, fatal_errors[i], fatal); i = i + 1; }
+    i = 0; while i < len(cleanup_errors) { _set_rel32(code, cleanup_errors[i], cleanup_error); i = i + 1; }
+    return code;
+}
+
+fn build(runtime_bytes, core_bytes) {
+    if type(runtime_bytes) != "array" or len(runtime_bytes) < 4 or len(runtime_bytes) > MAX_PAYLOAD_BYTES {
+        throw "linux_memfd_bundle: invalid runtime payload";
+    }
+    if type(core_bytes) != "array" or len(core_bytes) < 5 or len(core_bytes) > MAX_PAYLOAD_BYTES {
+        throw "linux_memfd_bundle: invalid PBCK payload";
+    }
+    if runtime_bytes[0] != 0x7F or runtime_bytes[1] != 0x45 or runtime_bytes[2] != 0x4C or runtime_bytes[3] != 0x46 {
+        throw "linux_memfd_bundle: runtime is not ELF";
+    }
+    if core_bytes[0] != 80 or core_bytes[1] != 66 or core_bytes[2] != 67 or core_bytes[3] != 75 or core_bytes[4] != 1 {
+        throw "linux_memfd_bundle: core is not PBCK v1";
+    }
+
+    let path_template = _cstring("/tmp/pbremote-0000000000/core.pbck", "temporary core path");
+    let names = [_cstring("pbremote-runtime", "runtime memfd name"), [0],
+        _cstring("pblang", "argv0"), _cstring("run", "run argument"),
+        _cstring("--allow-all", "capability argument"), _cstring("--", "argument separator"), path_template];
+    let probe_layout = map{ runtime_name: 0, empty: 0, arg0: 0, run_arg: 0,
+        allow_all: 0, separator: 0, path_template: 0, path_bytes: len(path_template),
+        digit_end: 23, dir_end: 24, runtime: 0, core: 0,
+        runtime_bytes: len(runtime_bytes), core_bytes: len(core_bytes) };
+    let code_len = len(_launcher_code(probe_layout));
+    let cursor = LOAD_BASE + ELF_HEADER_BYTES + code_len; let addresses = [];
+    let i = 0; while i < len(names) { array_push(addresses, cursor); cursor = cursor + len(names[i]); i = i + 1; }
+    let layout = map{ runtime_name: addresses[0], empty: addresses[1],
+        arg0: addresses[2], run_arg: addresses[3], allow_all: addresses[4], separator: addresses[5],
+        path_template: addresses[6], path_bytes: len(path_template), digit_end: 23, dir_end: 24,
+        runtime: cursor, core: cursor + len(runtime_bytes),
+        runtime_bytes: len(runtime_bytes), core_bytes: len(core_bytes) };
+    let code = _launcher_code(layout); let data = [];
+    i = 0; while i < len(names) { _append(data, names[i]); i = i + 1; }
+    _append(data, runtime_bytes); _append(data, core_bytes);
+    return X.elf64_exec_rx(code, data);
+}
+
+export MAX_PAYLOAD_BYTES, build;
