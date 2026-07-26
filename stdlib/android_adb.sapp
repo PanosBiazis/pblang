@@ -1,0 +1,800 @@
+// Bounded Android Debug Bridge orchestration for real-device verification.
+//
+// Application code remains PBLang. adb is the Android platform boundary and is
+// always invoked with validated argv through an external timeout. This module
+// never takes screenshots and never enables, revokes, or bypasses USB trust.
+
+let Benchmark = import("stdlib:benchmark.sapp");
+
+let MAX_DEVICES = 64;
+let MAX_OUTPUT_CHARS = 1048576;
+let MAX_RUNS = 10;
+let MAX_SAFE_BATTERY_TEMPERATURE_TENTHS_C = 450;
+let THERMAL_STATUS_SEVERE = 3;
+
+fn _tokens(text) {
+    let out = []; let current = ""; let i = 0; let value = str(text);
+    while i < len(value) {
+        let ch = str_slice(value, i, i + 1);
+        if str_index_of(" \t\r\n", ch) >= 0 {
+            if current != "" { array_push(out, current); current = ""; }
+        } else { current = current + ch; }
+        i = i + 1;
+    }
+    if current != "" { array_push(out, current); }
+    return out;
+}
+
+fn _safe_atom(value, label, max_chars = 160) {
+    let atom = str(value);
+    if atom == "" or len(atom) > max_chars { throw "android_adb: invalid " + label; }
+    let i = 0;
+    while i < len(atom) {
+        let ch = str_slice(atom, i, i + 1);
+        if str_index_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-/$", ch) < 0 {
+            throw "android_adb: invalid " + label;
+        }
+        i = i + 1;
+    }
+    return atom;
+}
+
+fn _safe_serial(value) {
+    let serial = str(value);
+    if serial == "" or len(serial) > 128 { throw "android_adb: invalid serial"; }
+    let i = 0;
+    while i < len(serial) {
+        let ch = str_slice(serial, i, i + 1);
+        if str_index_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-", ch) < 0 {
+            throw "android_adb: invalid serial";
+        }
+        i = i + 1;
+    }
+    return serial;
+}
+
+fn _number(value) {
+    let clean = ""; let i = 0; let text = str(value);
+    while i < len(text) {
+        let ch = str_slice(text, i, i + 1);
+        if ch != "," { clean = clean + ch; }
+        i = i + 1;
+    }
+    let number = try parse_number(clean) catch nil;
+    if number == nil or number < 0 or num_floor(number) != number { return nil; }
+    return number;
+}
+
+fn discover_adb() {
+    let roots = [];
+    let configured = try env_get("ANDROID_SDK_ROOT") catch "";
+    if type(configured) == "string" and configured != "" { array_push(roots, configured); }
+    configured = try env_get("ANDROID_HOME") catch "";
+    if type(configured) == "string" and configured != "" { array_push(roots, configured); }
+    let home = try env_get("HOME") catch "";
+    if home != "" { array_push(roots, home + "/Android/Sdk"); }
+    let i = 0;
+    while i < len(roots) {
+        let candidate = roots[i] + "/platform-tools/adb";
+        if fs_exists(candidate) { return candidate; }
+        i = i + 1;
+    }
+    if fs_exists("/usr/bin/adb") { return "/usr/bin/adb"; }
+    if fs_exists("/bin/adb") { return "/bin/adb"; }
+    return nil;
+}
+
+fn run_bounded(adb, args, seconds = 15) {
+    let executable = str(adb);
+    if not str_starts_with(executable, "/") or not fs_exists(executable) {
+        return map{ ok: false, exit_code: 127, stdout: "", stderr: "adb executable is unavailable" };
+    }
+    if type(args) != "array" or len(args) > 64 { throw "android_adb: invalid argv"; }
+    let duration = _number(seconds);
+    if duration == nil or duration < 1 or duration > 180 { throw "android_adb: invalid timeout"; }
+    let timeout = if fs_exists("/usr/bin/timeout") { "/usr/bin/timeout" } else { "/bin/timeout" };
+    if not fs_exists(timeout) {
+        return map{ ok: false, exit_code: 127, stdout: "", stderr: "timeout executable is unavailable" };
+    }
+    let argv = ["--signal=TERM", "--kill-after=2s", str(duration) + "s", executable];
+    let i = 0;
+    while i < len(args) {
+        let item = str(args[i]);
+        if len(item) > 4096 or str_contains(item, "\x00") { throw "android_adb: unsafe argv"; }
+        array_push(argv, item); i = i + 1;
+    }
+    let result = try proc_spawn_wait(timeout, argv) catch nil;
+    if result == nil { return map{ ok: false, exit_code: 127, stdout: "", stderr: "could not start adb" }; }
+    let stdout = str(try result.stdout catch ""); let stderr = str(try result.stderr catch "");
+    if len(stdout) > MAX_OUTPUT_CHARS or len(stderr) > MAX_OUTPUT_CHARS {
+        return map{ ok: false, exit_code: 74, stdout: "", stderr: "adb output exceeded limit" };
+    }
+    return map{ ok: (try result.exit_code catch 1) == 0,
+        exit_code: try result.exit_code catch 1, stdout: stdout, stderr: stderr };
+}
+
+fn result_error(result, operation) {
+    let detail = str_trim(str(try result.stdout catch "") + str(try result.stderr catch ""));
+    if detail != "" { return detail; }
+    let exit_code = try result.exit_code catch 1;
+    if exit_code == 124 or exit_code == 137 {
+        return str(operation) + " timed out and was terminated";
+    }
+    return str(operation) + " failed with exit code " + str(exit_code);
+}
+
+fn parse_devices(text) {
+    let value = str(text);
+    if len(value) > 65536 { throw "android_adb: devices output exceeds limit"; }
+    let lines = str_split(value, "\n");
+    if len(lines) > 256 { throw "android_adb: too many device lines"; }
+    let devices = []; let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]);
+        if line != "" and not str_starts_with(line, "List of devices") and not str_starts_with(line, "*") {
+            let fields = _tokens(line);
+            if len(fields) >= 2 {
+                let serial = try _safe_serial(fields[0]) catch nil;
+                if serial != nil {
+                    let entry = map{ serial: serial, state: fields[1], product: "", model: "",
+                        device: "", transport_id: "" };
+                    let j = 2;
+                    while j < len(fields) {
+                        let pair = str_split(fields[j], ":");
+                        if len(pair) == 2 {
+                            if pair[0] == "product" { entry.product = pair[1]; }
+                            elif pair[0] == "model" { entry.model = pair[1]; }
+                            elif pair[0] == "device" { entry.device = pair[1]; }
+                            elif pair[0] == "transport_id" { entry.transport_id = pair[1]; }
+                        }
+                        j = j + 1;
+                    }
+                    array_push(devices, entry);
+                    if len(devices) > MAX_DEVICES { throw "android_adb: device limit exceeded"; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return devices;
+}
+
+fn select_device(devices, requested = "") {
+    let wanted = str(requested);
+    if wanted != "" { wanted = _safe_serial(wanted); }
+    let selected = nil; let authorized = 0; let unauthorized = 0; let i = 0;
+    while i < len(devices) {
+        let device = devices[i];
+        if device.state == "device" { authorized = authorized + 1; }
+        elif device.state == "unauthorized" { unauthorized = unauthorized + 1; }
+        if wanted != "" and device.serial == wanted { selected = device; }
+        i = i + 1;
+    }
+    if wanted != "" {
+        if selected == nil { return map{ ok: false, error: "requested Android device was not found" }; }
+        if selected.state == "unauthorized" { return map{ ok: false, error: "accept the USB debugging authorization on the device" }; }
+        if selected.state != "device" { return map{ ok: false, error: "requested Android device is " + selected.state }; }
+        return map{ ok: true, device: selected };
+    }
+    if authorized == 1 {
+        i = 0; while i < len(devices) { if devices[i].state == "device" { return map{ ok: true, device: devices[i] }; } i = i + 1; }
+    }
+    if authorized > 1 { return map{ ok: false, error: "multiple authorized devices; set PBREMOTE_ANDROID_SERIAL" }; }
+    if unauthorized > 0 { return map{ ok: false, error: "accept the USB debugging authorization on the device" }; }
+    return map{ ok: false, error: "no authorized Android device is connected" };
+}
+
+fn parse_start_wait(text) {
+    let lines = str_split(str(text), "\n");
+    let report = map{ ok: false, status: "", activity: "", this_time_ms: nil,
+        total_time_ms: nil, wait_time_ms: nil, complete: false };
+    let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]); let split = str_index_of(line, ":");
+        if split > 0 {
+            let key = str_trim(str_slice(line, 0, split));
+            let value = str_trim(str_slice(line, split + 1, len(line)));
+            if key == "Status" { report.status = str_lower(value); }
+            elif key == "Activity" { report.activity = value; }
+            elif key == "ThisTime" { report.this_time_ms = _number(value); }
+            elif key == "TotalTime" { report.total_time_ms = _number(value); }
+            elif key == "WaitTime" { report.wait_time_ms = _number(value); }
+            elif key == "Complete" { report.complete = str_lower(value) == "true"; }
+        }
+        i = i + 1;
+    }
+    report.ok = report.status == "ok" and report.total_time_ms != nil and report.wait_time_ms != nil;
+    return report;
+}
+
+fn parse_meminfo(text) {
+    let lines = str_split(str(text), "\n"); let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]);
+        if str_starts_with(line, "TOTAL PSS:") {
+            let fields = _tokens(str_slice(line, len("TOTAL PSS:"), len(line)));
+            if len(fields) > 0 { return _number(fields[0]); }
+        } elif str_starts_with(line, "TOTAL:") {
+            let fields = _tokens(str_slice(line, len("TOTAL:"), len(line)));
+            if len(fields) > 0 { return _number(fields[0]); }
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _field_value(text, field) {
+    let lines = str_split(str(text), "\n"); let wanted = str_lower(str(field)); let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]); let split = str_index_of(line, ":");
+        if split > 0 and str_lower(str_trim(str_slice(line, 0, split))) == wanted {
+            return str_trim(str_slice(line, split + 1, len(line)));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn parse_battery(text) {
+    let level = _number(_field_value(text, "level"));
+    let scale = _number(_field_value(text, "scale"));
+    let temperature = _number(_field_value(text, "temperature"));
+    let voltage = _number(_field_value(text, "voltage"));
+    let status = _number(_field_value(text, "status"));
+    let health = _number(_field_value(text, "health"));
+    let ac = str_lower(_field_value(text, "AC powered")) == "true";
+    let usb = str_lower(_field_value(text, "USB powered")) == "true";
+    let wireless = str_lower(_field_value(text, "Wireless powered")) == "true";
+    return map{
+        available: level != nil and scale != nil and temperature != nil,
+        level_percent: if level != nil and scale != nil and scale > 0 { (level / scale) * 100.0 } else { nil },
+        temperature_tenths_c: temperature,
+        temperature_c: if temperature != nil { temperature / 10.0 } else { nil },
+        voltage_mv: voltage, status: status, health: health,
+        powered: ac or usb or wireless, ac_powered: ac,
+        usb_powered: usb, wireless_powered: wireless
+    };
+}
+
+fn parse_thermal_status(text) {
+    let status = _number(_field_value(text, "Thermal Status"));
+    let pressure = "unknown";
+    if status == 0 { pressure = "none"; }
+    elif status == 1 { pressure = "light"; }
+    elif status == 2 { pressure = "moderate"; }
+    elif status == 3 { pressure = "severe"; }
+    elif status == 4 { pressure = "critical"; }
+    elif status == 5 { pressure = "emergency"; }
+    elif status != nil { pressure = "shutdown"; }
+    return map{ available: status != nil, status: status, pressure: pressure };
+}
+
+fn _numbers_in(text) {
+    let values = []; let current = ""; let i = 0; let source = str(text);
+    while i < len(source) {
+        let ch = str_slice(source, i, i + 1);
+        if str_index_of("0123456789", ch) >= 0 { current = current + ch; }
+        else {
+            if current != "" { array_push(values, parse_number(current)); current = ""; }
+        }
+        i = i + 1;
+    }
+    if current != "" { array_push(values, parse_number(current)); }
+    return values;
+}
+
+fn parse_storage(text) {
+    let lines = str_split(str(text), "\n"); let selected = nil; let i = 0;
+    while i < len(lines) {
+        let fields = _tokens(str_trim(lines[i]));
+        if len(fields) >= 5 and _number(fields[1]) != nil and _number(fields[2]) != nil
+            and _number(fields[3]) != nil {
+            selected = fields;
+        }
+        i = i + 1;
+    }
+    if selected == nil {
+        return map{ available: false, total_kib: nil, used_kib: nil,
+            available_kib: nil, used_percent: nil };
+    }
+    let percent_values = _numbers_in(selected[4]);
+    return map{ available: true, total_kib: _number(selected[1]),
+        used_kib: _number(selected[2]), available_kib: _number(selected[3]),
+        used_percent: if len(percent_values) > 0 { percent_values[0] } else { nil } };
+}
+
+fn parse_device_memory(text) {
+    let total_values = _numbers_in(_field_value(text, "MemTotal"));
+    let available_values = _numbers_in(_field_value(text, "MemAvailable"));
+    let total = if len(total_values) > 0 { total_values[0] } else { nil };
+    let available = if len(available_values) > 0 { available_values[0] } else { nil };
+    return map{ available: total != nil, total_kib: total, available_kib: available };
+}
+
+fn parse_display(size_text, density_text) {
+    let size = _numbers_in(size_text); let density = _numbers_in(density_text);
+    return map{ available: len(size) >= 2, width_px: if len(size) >= 2 { size[len(size) - 2] } else { nil },
+        height_px: if len(size) >= 2 { size[len(size) - 1] } else { nil },
+        density_dpi: if len(density) > 0 { density[len(density) - 1] } else { nil } };
+}
+
+fn scroll_plan(width_value, height_value) {
+    let width = _number(width_value); let height = _number(height_value);
+    if width == nil or height == nil or width < 240 or height < 320
+        or width > 16384 or height > 16384 {
+        return map{ ok: false, error: "invalid display dimensions" };
+    }
+    return map{
+        ok: true,
+        center_x: num_floor(width / 2),
+        start_y: num_floor(height * 0.78),
+        end_y: num_floor(height * 0.28),
+        duration_ms: 250
+    };
+}
+
+fn horizontal_navigation_plan(width_value, height_value) {
+    let width = _number(width_value); let height = _number(height_value);
+    if width == nil or height == nil or width < 240 or height < 320
+        or width > 16384 or height > 16384 {
+        return map{ ok: false, error: "invalid display dimensions" };
+    }
+    let navigation_y = num_floor(height * 0.10);
+    if navigation_y < 96 { navigation_y = 96; }
+    if navigation_y > 192 { navigation_y = 192; }
+    return map{
+        ok: true,
+        start_x: num_floor(width * 0.86),
+        end_x: num_floor(width * 0.14),
+        center_y: navigation_y,
+        duration_ms: 250
+    };
+}
+
+fn find_accessibility_bounds(xml, content_description) {
+    let source = str(xml); let description = str(content_description);
+    if len(source) > MAX_OUTPUT_CHARS or description == "" or len(description) > 512 {
+        return map{ ok: false, error: "invalid UI hierarchy request" };
+    }
+    let marker = "content-desc=\"" + description + "\"";
+    let at = str_index_of(source, marker);
+    if at < 0 { return map{ ok: false, error: "accessibility node was not found" }; }
+    let finish = at + 2048; if finish > len(source) { finish = len(source); }
+    let tail = str_slice(source, at, finish); let bounds_at = str_index_of(tail, "bounds=\"");
+    if bounds_at < 0 { return map{ ok: false, error: "accessibility node has no bounds" }; }
+    let quote_end = str_index_of(str_slice(tail, bounds_at + 8, len(tail)), "\"");
+    if quote_end < 0 { return map{ ok: false, error: "accessibility bounds are truncated" }; }
+    let raw = str_slice(tail, bounds_at + 8, bounds_at + 8 + quote_end);
+    let numbers = _numbers_in(raw);
+    if len(numbers) != 4 or numbers[2] <= numbers[0] or numbers[3] <= numbers[1] {
+        return map{ ok: false, error: "accessibility bounds are invalid" };
+    }
+    return map{ ok: true, left: numbers[0], top: numbers[1], right: numbers[2], bottom: numbers[3],
+        center_x: num_floor((numbers[0] + numbers[2]) / 2),
+        center_y: num_floor((numbers[1] + numbers[3]) / 2) };
+}
+
+fn ui_has_action_result(xml, expected_text) {
+    let source = str(xml); let expected = str(expected_text);
+    return expected != "" and len(expected) <= 512
+        and len(source) <= MAX_OUTPUT_CHARS and str_contains(source, expected);
+}
+
+fn parse_gfxinfo(text) {
+    let report = map{ total_frames: nil, janky_frames: nil, p50_ms: nil,
+        p90_ms: nil, p95_ms: nil, p99_ms: nil };
+    let lines = str_split(str(text), "\n"); let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]); let numbers = _numbers_in(line);
+        if len(numbers) > 0 {
+            if str_starts_with(line, "Total frames rendered:") { report.total_frames = numbers[0]; }
+            elif str_starts_with(line, "Janky frames:") { report.janky_frames = numbers[0]; }
+            elif str_starts_with(line, "50th percentile:") { report.p50_ms = numbers[1]; }
+            elif str_starts_with(line, "90th percentile:") { report.p90_ms = numbers[1]; }
+            elif str_starts_with(line, "95th percentile:") { report.p95_ms = numbers[1]; }
+            elif str_starts_with(line, "99th percentile:") { report.p99_ms = numbers[1]; }
+        }
+        i = i + 1;
+    }
+    report.available = report.total_frames != nil;
+    report.janky_percent = if report.total_frames != nil and report.total_frames > 0 and report.janky_frames != nil {
+        (report.janky_frames / report.total_frames) * 100.0
+    } else { nil };
+    return report;
+}
+
+fn scan_crashes(text, package_name) {
+    let value = str(text);
+    if len(value) > MAX_OUTPUT_CHARS { return map{ ok: false, crashed: true, reason: "log output exceeded limit" }; }
+    let lower = str_lower(value); let package = str_lower(str(package_name));
+    let fatal = str_contains(lower, "fatal exception") or str_contains(lower, "fatal signal")
+        or str_contains(lower, "anr in ") or str_contains(lower, "am_crash");
+    let related = str_contains(lower, package) or str_contains(lower, "process: " + package);
+    return map{ ok: not (fatal and related), crashed: fatal and related,
+        reason: if fatal and related { "Android runtime crash/ANR marker found" } else { "" } };
+}
+
+fn parse_device_state(power_text, policy_text) {
+    let power = str_lower(str(power_text));
+    let policy = str_lower(str(policy_text));
+    let awake = str_contains(power, "mwakefulness=awake")
+        or str_contains(power, "wakefulness: awake");
+    let keyguard_showing = str_contains(policy, "showing=true")
+        and not str_contains(policy, "mkeyguardoccluded=true");
+    let error = "";
+    if not awake { error = "Android device screen is asleep; wake and unlock it before UI verification"; }
+    elif keyguard_showing { error = "Android device is locked; unlock it before UI verification"; }
+    return map{ ok: awake and not keyguard_showing, awake: awake,
+        keyguard_showing: keyguard_showing, error: error };
+}
+
+fn _device_arg(serial, rest) {
+    let out = ["-s", _safe_serial(serial)]; let i = 0;
+    while i < len(rest) { array_push(out, rest[i]); i = i + 1; }
+    return out;
+}
+
+fn _property(adb, serial, name) {
+    let result = run_bounded(adb, _device_arg(serial, ["shell", "getprop", _safe_atom(name, "property")]), 10);
+    if not result.ok { return ""; }
+    return str_trim(result.stdout);
+}
+
+fn _device_state(adb, serial) {
+    let power = run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "power"]), 15);
+    let policy = run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "window", "policy"]), 15);
+    if not power.ok or not policy.ok {
+        return map{ ok: false, awake: false, keyguard_showing: false,
+            error: "could not determine Android screen/keyguard state" };
+    }
+    return parse_device_state(power.stdout, policy.stdout);
+}
+
+fn install_plan(sdk_value, package_name) {
+    let sdk = _number(sdk_value);
+    let package = _safe_atom(package_name, "package");
+    if sdk == nil { throw "android_adb: invalid Android SDK"; }
+    let staged = sdk < 30;
+    return map{ format: "pblang.android.install-plan.v1",
+        mode: if staged { "staged-pm" } else { "streaming-adb" },
+        staged: staged, temporary_path: "/data/local/tmp/pblang-" + package + ".apk" };
+}
+
+fn install_apk(adb, serial, apk, package_name, sdk_value) {
+    let plan = install_plan(sdk_value, package_name);
+    if plan.staged {
+        let pushed = run_bounded(adb, _device_arg(serial, ["push", apk, plan.temporary_path]), 60);
+        if not pushed.ok {
+            run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", plan.temporary_path]), 10);
+            return map{ ok: false, mode: plan.mode, error: result_error(pushed, "APK staging") };
+        }
+        let installed = run_bounded(adb, _device_arg(serial,
+            ["shell", "pm", "install", "-r", "-t", plan.temporary_path]), 120);
+        run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", plan.temporary_path]), 10);
+        if not installed.ok or not str_contains(installed.stdout + installed.stderr, "Success") {
+            return map{ ok: false, mode: plan.mode, error: result_error(installed, "staged APK install") };
+        }
+        return map{ ok: true, mode: plan.mode, error: "" };
+    }
+    let installed = run_bounded(adb, _device_arg(serial, ["install", "-r", apk]), 120);
+    if not installed.ok or not str_contains(installed.stdout + installed.stderr, "Success") {
+        return map{ ok: false, mode: plan.mode, error: result_error(installed, "APK install") };
+    }
+    return map{ ok: true, mode: plan.mode, error: "" };
+}
+
+fn _resource_snapshot(adb, serial, sdk) {
+    let battery_result = run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "battery"]), 15);
+    let thermal_result = if sdk >= 29 {
+        run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "thermalservice"]), 15)
+    } else { map{ ok: false, stdout: "", stderr: "" } };
+    return map{
+        battery: if battery_result.ok { parse_battery(battery_result.stdout) }
+            else { map{ available: false } },
+        thermal: if thermal_result.ok { parse_thermal_status(thermal_result.stdout) }
+            else { map{ available: false, status: nil, pressure: "unavailable" } }
+    };
+}
+
+fn _resource_safe(snapshot) {
+    let temperature = try snapshot.battery.temperature_tenths_c catch nil;
+    let thermal = try snapshot.thermal.status catch nil;
+    return (temperature == nil or temperature < MAX_SAFE_BATTERY_TEMPERATURE_TENTHS_C)
+        and (thermal == nil or thermal < THERMAL_STATUS_SEVERE);
+}
+
+fn _hardware_profile(adb, serial) {
+    let storage = run_bounded(adb, _device_arg(serial, ["shell", "df", "-k", "/data"]), 15);
+    let memory = run_bounded(adb, _device_arg(serial, ["shell", "cat", "/proc/meminfo"]), 15);
+    let size = run_bounded(adb, _device_arg(serial, ["shell", "wm", "size"]), 10);
+    let density = run_bounded(adb, _device_arg(serial, ["shell", "wm", "density"]), 10);
+    return map{
+        storage: if storage.ok { parse_storage(storage.stdout) } else { map{ available: false } },
+        memory: if memory.ok { parse_device_memory(memory.stdout) } else { map{ available: false } },
+        display: if size.ok and density.ok { parse_display(size.stdout, density.stdout) }
+            else { map{ available: false } }
+    };
+}
+
+fn _dump_ui_hierarchy(adb, serial, ui_path) {
+    let attempts = 3; let i = 0; let last_error = "";
+    while i < attempts {
+        run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+        let dumped = run_bounded(adb, _device_arg(serial,
+            ["shell", "uiautomator", "dump", "--compressed", ui_path]), 30);
+        if dumped.ok {
+            let hierarchy = run_bounded(adb, _device_arg(serial, ["shell", "cat", ui_path]), 15);
+            if hierarchy.ok and str_contains(hierarchy.stdout, "<hierarchy")
+                and str_contains(hierarchy.stdout, "</hierarchy>") {
+                return hierarchy;
+            }
+            last_error = result_error(hierarchy, "UI hierarchy read");
+        } else {
+            last_error = result_error(dumped, "UI hierarchy dump");
+        }
+        let pause = channel(); recv_timeout(pause.receiver, 500 * (i + 1));
+        i = i + 1;
+    }
+    return map{ ok: false, exit_code: 1, stdout: "",
+        stderr: if last_error != "" { last_error } else { "uiautomator produced no complete hierarchy" } };
+}
+
+fn verify_application(options) {
+    let adb = try options.adb catch discover_adb();
+    if adb == nil { return map{ ok: false, stage: "toolchain", error: "adb is unavailable" }; }
+    let requested = str(try options.serial catch "");
+    let listed = run_bounded(adb, ["devices", "-l"], 15);
+    if not listed.ok { return map{ ok: false, stage: "devices", error: str_trim(listed.stderr) }; }
+    let chosen = select_device(parse_devices(listed.stdout), requested);
+    if not chosen.ok { return map{ ok: false, stage: "authorization", error: chosen.error }; }
+    let serial = chosen.device.serial;
+    let apk = str(try options.apk catch "");
+    let package = _safe_atom(try options.package catch "", "package");
+    let activity = _safe_atom(try options.activity catch "", "activity");
+    if not str_starts_with(apk, "/") or not fs_exists(apk) {
+        return map{ ok: false, stage: "artifact", error: "APK must be an existing absolute path" };
+    }
+    let runs = _number(try options.runs catch 5);
+    if runs == nil or runs < 1 or runs > MAX_RUNS { return map{ ok: false, stage: "options", error: "runs must be 1..10" }; }
+    let sdk = _number(_property(adb, serial, "ro.build.version.sdk"));
+    let profile = map{ serial: serial, model: _property(adb, serial, "ro.product.model"),
+        device: _property(adb, serial, "ro.product.device"), android: _property(adb, serial, "ro.build.version.release"),
+        sdk: sdk, abi: _property(adb, serial, "ro.product.cpu.abi") };
+    if sdk == nil or sdk < 21 { return map{ ok: false, stage: "compatibility", error: "device API is below the package minimum of 21", device: profile }; }
+    let initial_state = _device_state(adb, serial);
+    if not initial_state.ok {
+        return map{ ok: false, stage: "device-state", error: initial_state.error, device: profile };
+    }
+    let resources_before = _resource_snapshot(adb, serial, sdk);
+    if not _resource_safe(resources_before) {
+        return map{ ok: false, stage: "thermal-safety",
+            error: "device is already too hot or under severe thermal pressure", device: profile,
+            resources_before: resources_before };
+    }
+    let hardware = _hardware_profile(adb, serial);
+
+    let installed = install_apk(adb, serial, apk, package, sdk);
+    if not installed.ok {
+        return map{ ok: false, stage: "install", error: installed.error,
+            install_mode: installed.mode, device: profile };
+    }
+    let package_info = run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "package", package]), 20);
+    if not package_info.ok or not str_contains(package_info.stdout, "targetSdk=34") {
+        return map{ ok: false, stage: "package", error: "installed package metadata does not expose targetSdk=34", device: profile };
+    }
+    run_bounded(adb, _device_arg(serial, ["shell", "am", "force-stop", package]), 10);
+    run_bounded(adb, _device_arg(serial, ["logcat", "-c"]), 10);
+    run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "gfxinfo", package, "reset"]), 15);
+    let starts = []; let i = 0;
+    while i < runs {
+        let launched = run_bounded(adb, _device_arg(serial,
+            ["shell", "am", "start", "-W", "-S", "-n", activity]), 30);
+        let parsed = parse_start_wait(launched.stdout);
+        if not launched.ok or not parsed.ok {
+            return map{ ok: false, stage: "launch", error: str_trim(launched.stdout + launched.stderr),
+                run: i + 1, device: profile };
+        }
+        array_push(starts, parsed.total_time_ms); i = i + 1;
+    }
+    let pid_result = run_bounded(adb, _device_arg(serial, ["shell", "pidof", package]), 10);
+    let pid = if pid_result.ok { str_trim(pid_result.stdout) } else { "" };
+    if pid == "" { return map{ ok: false, stage: "process", error: "application process is not running", device: profile }; }
+    let activities = run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "activity", "activities"]), 20);
+    if not activities.ok or not str_contains(activities.stdout, package) {
+        return map{ ok: false, stage: "foreground", error: "application activity is not present", device: profile };
+    }
+    let log_args = ["logcat", "-d", "-t", "500", "--pid", _safe_atom(pid, "pid", 32)];
+    let logs = run_bounded(adb, _device_arg(serial, log_args), 20);
+    let crash = scan_crashes(logs.stdout + logs.stderr, package);
+    if not logs.ok or not crash.ok { return map{ ok: false, stage: "runtime", error: crash.reason, device: profile }; }
+    let memory = run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "meminfo", package]), 20);
+    let pss = if memory.ok { parse_meminfo(memory.stdout) } else { nil };
+
+    let ui_state = _device_state(adb, serial);
+    if not ui_state.ok {
+        return map{ ok: false, stage: "device-state", error: ui_state.error, device: profile };
+    }
+    let ui_path = "/data/local/tmp/pbremote-ui.xml";
+    let hierarchy = _dump_ui_hierarchy(adb, serial, ui_path);
+    let accessible = hierarchy.ok and str_contains(hierarchy.stdout, "package=\"" + package + "\"")
+        and str_contains(hierarchy.stdout, "PBRemote") and str_contains(hierarchy.stdout, "content-desc=");
+    let render_attempt = 0;
+    while not accessible and render_attempt < 3 {
+        let pause = channel(); recv_timeout(pause.receiver, 250 * (render_attempt + 1));
+        hierarchy = _dump_ui_hierarchy(adb, serial, ui_path);
+        accessible = hierarchy.ok
+            and str_contains(hierarchy.stdout, "package=\"" + package + "\"")
+            and str_contains(hierarchy.stdout, "PBRemote")
+            and str_contains(hierarchy.stdout, "content-desc=");
+        render_attempt = render_attempt + 1;
+    }
+    if not accessible {
+        run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+        return map{ ok: false, stage: "accessibility", error: "PBRemote UI hierarchy contract failed", device: profile };
+    }
+    let startup_gfx_result = run_bounded(adb,
+        _device_arg(serial, ["shell", "dumpsys", "gfxinfo", package]), 20);
+    let startup_graphics = if startup_gfx_result.ok { parse_gfxinfo(startup_gfx_result.stdout) }
+        else { map{ available: false } };
+    run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "gfxinfo", package, "reset"]), 15);
+    let interaction_verified = false;
+    let navigation_verified = false;
+    let action_navigation_description = str(
+        try options.action_navigation_description catch "");
+    let action_description = str(try options.action_description catch "");
+    let action_result_text = str(try options.action_result_text catch "");
+    if action_navigation_description != "" and action_description == "" {
+        run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+        return map{ ok: false, stage: "interaction",
+            error: "action navigation requires an action description", device: profile };
+    }
+    if action_description != "" or action_result_text != "" {
+        if action_description == "" or action_result_text == "" {
+            run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+            return map{ ok: false, stage: "interaction", error: "action description/result must be provided together", device: profile };
+        }
+        if action_navigation_description != "" {
+            let navigation_bounds = find_accessibility_bounds(
+                hierarchy.stdout, action_navigation_description);
+            let display = try hardware.display catch map{};
+            let navigation_plan = horizontal_navigation_plan(
+                try display.width_px catch 720, try display.height_px catch 1280);
+            let navigation_scroll_attempt = 0;
+            while not navigation_bounds.ok and navigation_plan.ok
+                and navigation_scroll_attempt < 4 {
+                let navigation_swiped = run_bounded(adb, _device_arg(serial, [
+                    "shell", "input", "swipe", str(navigation_plan.start_x),
+                    str(navigation_plan.center_y), str(navigation_plan.end_x),
+                    str(navigation_plan.center_y), str(navigation_plan.duration_ms)
+                ]), 10);
+                if not navigation_swiped.ok { navigation_scroll_attempt = 4; }
+                else {
+                    let pause = channel(); recv_timeout(pause.receiver, 150);
+                    hierarchy = _dump_ui_hierarchy(adb, serial, ui_path);
+                    if hierarchy.ok and str_contains(
+                        hierarchy.stdout, "package=\"" + package + "\"") {
+                        navigation_bounds = find_accessibility_bounds(
+                            hierarchy.stdout, action_navigation_description);
+                    }
+                    navigation_scroll_attempt = navigation_scroll_attempt + 1;
+                }
+            }
+            if not navigation_bounds.ok {
+                run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+                return map{ ok: false, stage: "navigation",
+                    error: navigation_bounds.error, device: profile };
+            }
+            let navigation_tapped = run_bounded(adb, _device_arg(serial, [
+                "shell", "input", "tap", str(navigation_bounds.center_x),
+                str(navigation_bounds.center_y)
+            ]), 10);
+            let navigation_attempt = 0;
+            let navigated_hierarchy = map{ ok: false, stdout: "" };
+            while navigation_tapped.ok and navigation_attempt < 4
+                and not (navigated_hierarchy.ok and str_contains(
+                    navigated_hierarchy.stdout, action_description)) {
+                let pause = channel();
+                recv_timeout(pause.receiver, 150 * (navigation_attempt + 1));
+                navigated_hierarchy = _dump_ui_hierarchy(adb, serial, ui_path);
+                navigation_attempt = navigation_attempt + 1;
+            }
+            navigation_verified = navigation_tapped.ok and navigated_hierarchy.ok
+                and str_contains(navigated_hierarchy.stdout, action_description);
+            if not navigation_verified {
+                run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+                return map{ ok: false, stage: "navigation",
+                    error: "accessible section navigation did not reveal the requested action",
+                    device: profile };
+            }
+            hierarchy = navigated_hierarchy;
+        }
+        let bounds = find_accessibility_bounds(hierarchy.stdout, action_description);
+        let display = try hardware.display catch map{};
+        let plan = scroll_plan(try display.width_px catch 720,
+            try display.height_px catch 1280);
+        let scroll_attempt = 0;
+        while not bounds.ok and plan.ok and scroll_attempt < 6 {
+            let swiped = run_bounded(adb, _device_arg(serial, [
+                "shell", "input", "swipe", str(plan.center_x), str(plan.start_y),
+                str(plan.center_x), str(plan.end_y), str(plan.duration_ms)
+            ]), 10);
+            if not swiped.ok { scroll_attempt = 6; }
+            else {
+                let pause = channel(); recv_timeout(pause.receiver, 200);
+                hierarchy = _dump_ui_hierarchy(adb, serial, ui_path);
+                if hierarchy.ok and str_contains(
+                    hierarchy.stdout, "package=\"" + package + "\"") {
+                    bounds = find_accessibility_bounds(
+                        hierarchy.stdout, action_description);
+                }
+                scroll_attempt = scroll_attempt + 1;
+            }
+        }
+        if not bounds.ok {
+            run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+            return map{ ok: false, stage: "interaction", error: bounds.error, device: profile };
+        }
+        let tapped = run_bounded(adb, _device_arg(serial,
+            ["shell", "input", "tap", str(bounds.center_x), str(bounds.center_y)]), 10);
+        // Device speed, storage pressure and cryptographic self-tests vary.
+        // Poll a bounded number of times instead of treating one fixed 500 ms
+        // delay as a correctness contract.
+        let changed = map{ ok: false, stdout: "" }; let attempt = 0;
+        while tapped.ok and attempt < 6 and not (changed.ok
+            and ui_has_action_result(changed.stdout, action_result_text)) {
+            let pause = channel(); recv_timeout(pause.receiver, 250 * (attempt + 1));
+            changed = _dump_ui_hierarchy(adb, serial, ui_path);
+            attempt = attempt + 1;
+        }
+        interaction_verified = tapped.ok and changed.ok
+            and ui_has_action_result(changed.stdout, action_result_text);
+        if not interaction_verified {
+            run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+            return map{ ok: false, stage: "interaction", error: "accessible action did not produce its expected state", device: profile };
+        }
+    }
+    run_bounded(adb, _device_arg(serial, ["shell", "rm", "-f", ui_path]), 10);
+    let gfx_result = run_bounded(adb, _device_arg(serial, ["shell", "dumpsys", "gfxinfo", package]), 20);
+    let graphics = if gfx_result.ok { parse_gfxinfo(gfx_result.stdout) } else { map{ available: false } };
+    let resources_after = _resource_snapshot(adb, serial, sdk);
+    if not _resource_safe(resources_after) {
+        return map{ ok: false, stage: "thermal-safety",
+            error: "device reached severe thermal pressure during verification",
+            device: profile, resources_before: resources_before, resources_after: resources_after };
+    }
+    let before_temperature = try resources_before.battery.temperature_tenths_c catch nil;
+    let after_temperature = try resources_after.battery.temperature_tenths_c catch nil;
+    let before_level = try resources_before.battery.level_percent catch nil;
+    let after_level = try resources_after.battery.level_percent catch nil;
+    let efficiency = map{ format: "pblang.android.energy-thermal.v1", safe: true,
+        battery_level_delta_percent: if before_level != nil and after_level != nil {
+            after_level - before_level
+        } else { nil },
+        battery_temperature_delta_c: if before_temperature != nil and after_temperature != nil {
+            (after_temperature - before_temperature) / 10.0
+        } else { nil },
+        before: resources_before, after: resources_after };
+
+    let steady_starts = []; i = 1;
+    while i < len(starts) { array_push(steady_starts, starts[i]); i = i + 1; }
+    return map{ ok: true, format: "pblang.android.device-verification.v1", device: profile,
+        package: package, activity: activity, installed: true, foreground: true,
+        accessible_ui: true, interaction_verified: interaction_verified,
+        navigation_verified: navigation_verified,
+        crash_free: true, pid: pid, startup_ms: starts, graphics: graphics,
+        startup_graphics: startup_graphics,
+        graphics_scope: "post-reset interaction; startup_graphics contains cold launches and verification",
+        install_mode: installed.mode, hardware: hardware, efficiency: efficiency,
+        first_post_install_launch_ms: starts[0],
+        cold_restart: Benchmark.stats("android-cold-restart", steady_starts),
+        startup_all: Benchmark.stats("android-launch-all", starts), total_pss_kib: pss,
+        screenshot_collected: false };
+}
+
+export MAX_DEVICES, MAX_OUTPUT_CHARS, MAX_RUNS;
+export discover_adb, run_bounded, result_error, parse_devices, select_device, parse_start_wait,
+       parse_meminfo, parse_battery, parse_thermal_status, parse_storage,
+       parse_device_memory, parse_display, scroll_plan, horizontal_navigation_plan,
+       find_accessibility_bounds,
+       ui_has_action_result, parse_gfxinfo,
+       scan_crashes, parse_device_state, install_plan, install_apk, verify_application;

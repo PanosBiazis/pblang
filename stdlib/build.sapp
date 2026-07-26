@@ -1,141 +1,473 @@
-// pblang build system module
-// Provides native compilation and transpilation utilities
+// stdlib/build.sapp - safe, adaptive PBLang build orchestration.
+//
+// The planner is deterministic and inspectable. Execution prefers the native
+// PBLang x86-64 backend when it is compatible, reuses its verified artifact
+// cache, and falls back to hosted C99 only when policy permits. Portable PBCK
+// fallback is explicit because it requires a PBLang runtime.
+
+let MAX_SOURCE_BYTES = 16777216;
+let MAX_BATCH_JOBS = 256;
+let PLAN_FORMAT = "pblang.smart_build.plan.v1";
+let REPORT_FORMAT = "pblang.smart_build.report.v1";
+let _HOST_ARCH_CACHE = "";
+let _HOST_PLATFORM_CACHE = "";
+let SESSION = import("stdlib:native/compile_session.sapp");
+let CACHE = import("stdlib:native/artifact_cache.sapp");
+
+fn _get(options, key, fallback) {
+    if options == nil or type(options) != "map" or not map_has(options, key) { return fallback; }
+    let value = options[key];
+    if value == nil { return fallback; }
+    return value;
+}
+
+fn _valid_path(path) {
+    return type(path) == "string" and path != "" and len(path) <= 4096
+        and not str_contains(path, "\0") and not str_contains(path, "\n")
+        and not str_contains(path, "\r");
+}
+
+fn _safe_relative(path) {
+    if not _valid_path(path) or str_starts_with(path, "/") or str_contains(path, ":")
+        or str_contains(path, "\\") { return false; }
+    let parts = str_split(path, "/");
+    let i = 0;
+    while i < len(parts) {
+        if parts[i] == ".." { return false; }
+        i = i + 1;
+    }
+    return true;
+}
 
 fn host_platform() {
-    let osm = import("stdlib:os.sapp");
-    return osm.platform();
+    if _HOST_PLATFORM_CACHE != "" { return _HOST_PLATFORM_CACHE; }
+    let OS = import("stdlib:os.sapp");
+    _HOST_PLATFORM_CACHE = OS.platform();
+    return _HOST_PLATFORM_CACHE;
 }
 
-/// Check if native compilation is supported on this system.
-/// Returns true if a C compiler (cc/gcc/clang) is available.
-fn is_native_supported() {
-    let result = exec("cc --version 2>/dev/null || gcc --version 2>/dev/null || clang --version 2>/dev/null || echo NOTFOUND");
-    return !str_contains(result, "NOTFOUND") and !str_contains(result, "pblang: error");
+fn _normalize_arch(raw) {
+    let value = str_lower(str_trim(str(raw)));
+    if value == "x86_64" or value == "amd64" or value == "x64" { return "x86_64"; }
+    if value == "aarch64" or value == "arm64" { return "aarch64"; }
+    if value == "i386" or value == "i486" or value == "i586" or value == "i686" or value == "x86" { return "x86"; }
+    return "unknown";
 }
 
-/// Get the host target triple (e.g. "x86_64-unknown-linux-gnu").
+fn host_arch() {
+    if _HOST_ARCH_CACHE != "" { return _HOST_ARCH_CACHE; }
+    let candidates = [
+        try env_get("HOSTTYPE") catch nil,
+        try env_get("PROCESSOR_ARCHITECTURE") catch nil,
+        try env_get("MACHTYPE") catch nil
+    ];
+    let i = 0;
+    while i < len(candidates) {
+        let arch = _normalize_arch(candidates[i]);
+        if arch != "unknown" { _HOST_ARCH_CACHE = arch; return arch; }
+        i = i + 1;
+    }
+    let result = try proc_spawn_wait("uname", ["-m"]) catch nil;
+    if result != nil and (try result.exit_code catch 1) == 0 {
+        let detected = _normalize_arch(try result.stdout catch "");
+        if detected != "unknown" { _HOST_ARCH_CACHE = detected; }
+        return detected;
+    }
+    return "unknown";
+}
+
 fn target_triple() {
-    let p = host_platform();
-    if p == "windows" {
-        return "x86_64-pc-windows-msvc";
+    let platform = host_platform();
+    let arch = host_arch();
+    if platform == "windows" {
+        if arch == "x86" { return "i686-pc-windows-msvc"; }
+        return (if arch == "unknown" { "x86_64" } else { arch }) + "-pc-windows-msvc";
     }
-    if p == "macos" {
-        return "x86_64-apple-darwin";
+    if platform == "macos" {
+        return (if arch == "unknown" { "x86_64" } else { arch }) + "-apple-darwin";
     }
-    return "x86_64-unknown-linux-gnu";
+    return (if arch == "unknown" { "x86_64" } else { arch }) + "-unknown-linux-gnu";
 }
 
-/// Compile a .sapp source file to a native executable.
-/// Uses the pblang → C transpiler + system C compiler.
-/// Returns a map with { success: bool, output: string, error: string }.
-fn compile(source_path, output_path) {
-    let result = map{
-        success: false,
-        output: output_path,
-        error: ""
-    };
-
-    let src = fs_read(source_path);
-    if src == nil {
-        result.error = "cannot read source file: " + source_path;
-        return result;
-    }
-
-    let c_path = output_path + ".c";
-    let write_result = fs_write(c_path, src);
-    if write_result != nil {
-        result.error = "cannot write temp C file";
-        return result;
-    }
-
-    let cc = "cc";
-    let cc_check = exec("which cc 2>/dev/null || which gcc 2>/dev/null || which clang 2>/dev/null || echo NOTFOUND");
-    if str_contains(cc_check, "gcc") {
-        cc = "gcc";
-    } else if str_contains(cc_check, "clang") {
-        cc = "clang";
-    } else if str_contains(cc_check, "NOTFOUND") {
-        result.error = "no C compiler found (install gcc or clang)";
-        return result;
-    }
-
-    let compile_cmd = cc + " -O2 -o " + output_path + " " + c_path + " -lm";
-    let compile_output = exec(compile_cmd);
-
-    if fs_exists(output_path) {
-        result.success = true;
-        fs_remove(c_path);
-    } else {
-        result.error = "compilation failed: " + compile_output;
-    }
-
-    return result;
+fn _host_target_name() {
+    let platform = host_platform();
+    let arch = host_arch();
+    if platform == "linux" and arch == "x86_64" { return "linux-x64"; }
+    if platform == "linux" and arch == "aarch64" { return "linux-arm64"; }
+    if platform == "windows" and arch == "x86_64" { return "windows-x64"; }
+    if platform == "windows" and arch == "x86" { return "windows-x86"; }
+    if platform == "macos" and arch == "x86_64" { return "macos-x64"; }
+    if platform == "macos" and arch == "aarch64" { return "macos-arm64"; }
+    return "unknown";
 }
 
-/// Transpile a .sapp source to C99.
-/// Returns a map with { success: bool, c_source: string, error: string }.
-fn transpile(source_path, output_path) {
-    let result = map{
-        success: false,
-        c_source: "",
-        error: ""
-    };
-
-    let src = fs_read(source_path);
-    if src == nil {
-        result.error = "cannot read source file: " + source_path;
-        return result;
+fn _which_any(names) {
+    let i = 0;
+    while i < len(names) {
+        let path = try os_which(names[i]) catch nil;
+        if path != nil and path != "" { return map{ name: names[i], path: path }; }
+        i = i + 1;
     }
-
-    let cmd = "pblang transpile " + source_path + " -o " + output_path;
-    let output = exec(cmd);
-
-    if fs_exists(output_path) {
-        result.success = true;
-        result.c_source = fs_read(output_path);
-    } else {
-        result.error = output;
-    }
-
-    return result;
+    return nil;
 }
 
-/// Get information about the build environment.
-fn info() {
-    let result = map{
-        os: "",
-        arch: "",
-        cc: "none",
-        target: target_triple(),
-        native_supported: false
-    };
+fn is_native_supported() { return _which_any(["cc", "gcc", "clang"]) != nil; }
 
-    let p = host_platform();
-    if p == "windows" {
-        result.os = "windows";
-    } else if p == "macos" {
-        result.os = "macos";
+fn _goal(value) {
+    let goal = str_lower(str(value));
+    if goal == "speed" or goal == "size" or goal == "debug" or goal == "portable" or goal == "balanced" { return goal; }
+    return "balanced";
+}
+
+fn _backend(value) {
+    let backend = str_lower(str(value));
+    if backend == "auto" or backend == "direct-x64" or backend == "c99" or backend == "pbck" { return backend; }
+    return "invalid";
+}
+
+fn smart_plan(source_path, output_path, options = nil) {
+    let errors = [];
+    if not _valid_path(source_path) { array_push(errors, "invalid source path"); }
+    if not _valid_path(output_path) { array_push(errors, "invalid output path"); }
+    if options != nil and type(options) != "map" { array_push(errors, "options must be a map"); options = map{}; }
+
+    let goal = _goal(_get(options, "goal", "balanced"));
+    let requested = _backend(_get(options, "backend", "auto"));
+    if requested == "invalid" { array_push(errors, "backend must be auto, direct-x64, c99, or pbck"); }
+    let host_target = _host_target_name();
+    let target = str(_get(options, "target", host_target));
+    let fallback = _get(options, "fallback", true) == true;
+    let runtime_fallback = _get(options, "runtime_fallback", goal == "portable") == true;
+    let cache = _get(options, "cache", true) != false;
+    let strategies = [];
+    let reasons = [];
+
+    if requested != "invalid" and requested != "auto" {
+        array_push(strategies, requested);
+        array_push(reasons, "explicit backend request");
     } else {
-        result.os = "linux";
-    }
-
-    result.native_supported = is_native_supported();
-
-    if result.native_supported {
-        let cc_check = exec("which cc 2>/dev/null || which gcc 2>/dev/null || which clang 2>/dev/null || echo none");
-        if str_contains(cc_check, "gcc") {
-            result.cc = "gcc";
-        } else if str_contains(cc_check, "clang") {
-            result.cc = "clang";
-        } else if str_contains(cc_check, "cc") {
-            result.cc = "cc";
+        let direct_compatible = host_platform() == "linux" and host_arch() == "x86_64"
+            and target == "linux-x64" and goal != "debug" and goal != "portable";
+        if direct_compatible {
+            array_push(strategies, "direct-x64");
+            array_push(reasons, "host-native safety-certified x86-64 backend");
+        }
+        if target != "unknown" {
+            array_push(strategies, "c99");
+            array_push(reasons, "portable hosted C99 fallback or cross-target path");
+        }
+        if runtime_fallback {
+            array_push(strategies, "pbck");
+            array_push(reasons, "explicit runtime-portable fallback");
         }
     }
+    if len(strategies) == 0 { array_push(errors, "no compatible build strategy"); }
 
+    return map{
+        ok: len(errors) == 0,
+        format: PLAN_FORMAT,
+        source: source_path,
+        output: output_path,
+        host: map{ os: host_platform(), arch: host_arch(), target: host_target, triple: target_triple() },
+        target: target,
+        goal: goal,
+        backend: requested,
+        strategies: strategies,
+        reasons: reasons,
+        fallback: fallback,
+        runtime_fallback: runtime_fallback,
+        cache: cache,
+        errors: errors
+    };
+}
+
+fn _attempt(backend, ok, detail) { return map{ backend: backend, ok: ok, detail: detail }; }
+
+fn _read_source(path) {
+    let bytes = try fs_read_bytes(path) catch nil;
+    if type(bytes) != "array" { return map{ ok: false, error: "cannot read source file" }; }
+    if len(bytes) > MAX_SOURCE_BYTES { return map{ ok: false, error: "source exceeds " + str(MAX_SOURCE_BYTES) + " bytes" }; }
+    let source = try bytes_to_str(bytes) catch nil;
+    if source == nil { return map{ ok: false, error: "source is not valid UTF-8" }; }
+    return map{ ok: true, source: source, bytes: len(bytes) };
+}
+
+fn _linked_source(source_path, source) {
+    if not str_contains(source, "import(") { return map{ ok: true, source: source, modules: 0 }; }
+    let INLINER = import("stdlib:source_inliner.sapp");
+    let linked = INLINER.inline_file_prefixed(source_path);
+    if not linked.ok { return map{ ok: false, error: try linked.reason catch "source linking failed" }; }
+    return map{ ok: true, source: linked.source, modules: linked.modules };
+}
+
+fn _artifact_meta(path) {
+    let bytes = try fs_read_bytes(path) catch nil;
+    if type(bytes) != "array" { return map{ ok: false, bytes: 0, digest: nil }; }
+    return map{
+        ok: true, bytes: len(bytes), digest: sha256(base64_encode_bytes(bytes)),
+        digest_format: "sha256-base64-content-v1"
+    };
+}
+
+fn _direct_build(source_path, output_path, source, plan, options, shared_session = nil) {
+    let linked = _linked_source(source_path, source);
+    if not linked.ok { return map{ ok: false, error: linked.error }; }
+    let state = shared_session;
+    if state == nil {
+        state = SESSION.session(map{
+            cache: plan.cache,
+            cache_root: _get(options, "cache_root", CACHE.default_root()),
+            profile: SESSION.DEFAULT_PROFILE + ";smart-goal=" + plan.goal
+        });
+    }
+    let hits_before = state.hits;
+    let misses_before = state.misses;
+    let compiled_before = state.compiled;
+    let built = SESSION.compile_one(state, linked.source, output_path);
+    if not built.ok { return map{ ok: false, error: built.error, session: state }; }
+    let chmod = try proc_spawn_wait("chmod", ["700", output_path]) catch nil;
+    if chmod == nil or (try chmod.exit_code catch 1) != 0 {
+        try fs_remove(output_path) catch nil;
+        return map{ ok: false, error: "artifact published but executable permission could not be set", session: state };
+    }
+    let meta = _artifact_meta(output_path);
+    if not meta.ok { return map{ ok: false, error: "published artifact verification failed", session: state }; }
+    return map{
+        ok: true, output: output_path, kind: "native-elf-x86-64", standalone: true,
+        runtime_required: false, modules: linked.modules, bytes: meta.bytes,
+        digest: meta.digest, digest_format: meta.digest_format,
+        cache_hits: state.hits - hits_before, cache_misses: state.misses - misses_before,
+        compiled: state.compiled - compiled_before,
+        session_totals: map{ cache_hits: state.hits, cache_misses: state.misses,
+            compiled: state.compiled, published: state.published }
+    };
+}
+
+fn _c99_options(goal, options) {
+    let DIST = import("stdlib:dist.sapp");
+    let cfg = DIST.default_opts();
+    if goal == "size" { cfg.opt = "size"; cfg.lto = true; }
+    elif goal == "speed" { cfg.opt = "max"; cfg.lto = true; }
+    elif goal == "debug" { cfg.opt = "debug"; cfg.strip = false; }
+    cfg.static = _get(options, "static", false) == true;
+    cfg.compress = _get(options, "compress", false) == true;
+    cfg.keep_intermediates = _get(options, "keep_intermediates", false) == true;
+    return cfg;
+}
+
+fn _c99_build(source_path, output_path, plan, options) {
+    let DIST = import("stdlib:dist.sapp");
+    let result = DIST.native(source_path, output_path, _c99_options(plan.goal, options), plan.target);
+    if not result.ok { return map{ ok: false, error: try result.reason catch (try result.stderr catch "C99 build failed") }; }
+    let meta = _artifact_meta(result.output);
+    if not meta.ok { return map{ ok: false, error: "C99 artifact verification failed" }; }
+    return map{
+        ok: true, output: result.output, kind: "native-c99", standalone: try result.standalone catch false,
+        runtime_required: false, compiler: try result.compiler catch nil, bytes: meta.bytes,
+        digest: meta.digest, digest_format: meta.digest_format, inlined: try result.inlined catch false
+    };
+}
+
+fn _without_suffix(value, suffix) {
+    if str_ends_with(value, suffix) { return str_slice(value, 0, len(value) - len(suffix)); }
+    return value;
+}
+
+fn _pbck_build(source_path, output_path) {
+    let DIST = import("stdlib:dist.sapp");
+    let result = DIST.bundle_pbck(source_path, _without_suffix(output_path, ".pbck"), map{ optimize: true });
+    if not result.ok { return map{ ok: false, error: try result.reason catch "PBCK build failed" }; }
+    let meta = _artifact_meta(result.out);
+    if not meta.ok { return map{ ok: false, error: "PBCK artifact verification failed" }; }
+    return map{
+        ok: true, output: result.out, kind: "portable-pbck", standalone: false,
+        runtime_required: true, modules: result.modules, bytes: meta.bytes,
+        digest: meta.digest, digest_format: meta.digest_format,
+        optimized: result.optimized
+    };
+}
+
+fn _run_plan(plan, source, options, shared_session = nil) {
+    let attempts = [];
+    let i = 0;
+    while i < len(plan.strategies) {
+        let backend = plan.strategies[i];
+        let result = nil;
+        if backend == "direct-x64" {
+            result = _direct_build(plan.source, plan.output, source.source, plan, options, shared_session);
+        } elif backend == "c99" {
+            result = _c99_build(plan.source, plan.output, plan, options);
+        } else {
+            result = _pbck_build(plan.source, plan.output);
+        }
+        array_push(attempts, _attempt(backend, result.ok, if result.ok { "built" } else { result.error }));
+        if result.ok {
+            result.format = REPORT_FORMAT;
+            result.automated = true;
+            result.backend = backend;
+            result.goal = plan.goal;
+            result.target = plan.target;
+            result.source_bytes = source.bytes;
+            result.attempts = attempts;
+            result.plan = plan;
+            return result;
+        }
+        if not plan.fallback { break; }
+        i = i + 1;
+    }
+    return map{
+        ok: false, format: REPORT_FORMAT, automated: true, output: plan.output,
+        goal: plan.goal, target: plan.target, attempts: attempts, plan: plan,
+        error: if len(attempts) == 0 { "no build attempt was made" } else { attempts[len(attempts) - 1].detail }
+    };
+}
+
+fn smart_build(source_path, output_path, options = nil) {
+    let build_session = smart_session(options);
+    return smart_build_in_session(build_session, source_path, output_path, options);
+}
+
+fn smart_session(options = nil) {
+    let goal = _goal(_get(options, "goal", "balanced"));
+    return map{
+        format: "pblang.smart_build.session.v1",
+        goal: goal,
+        direct: SESSION.session(map{
+            cache: _get(options, "cache", true) != false,
+            cache_root: _get(options, "cache_root", CACHE.default_root()),
+            profile: SESSION.DEFAULT_PROFILE + ";smart-goal=" + goal
+        })
+    };
+}
+
+fn _valid_smart_session(build_session) {
+    return type(build_session) == "map"
+        and (try build_session.format catch "") == "pblang.smart_build.session.v1"
+        and type(try build_session.direct catch nil) == "map";
+}
+
+fn smart_build_in_session(build_session, source_path, output_path, options = nil) {
+    if not _valid_smart_session(build_session) {
+        return map{ ok: false, format: REPORT_FORMAT, error: "invalid smart build session" };
+    }
+    let plan = smart_plan(source_path, output_path, options);
+    if not plan.ok { return map{ ok: false, format: REPORT_FORMAT, plan: plan, error: str_join(plan.errors, "; ") }; }
+    let source = _read_source(source_path);
+    if not source.ok { return map{ ok: false, format: REPORT_FORMAT, plan: plan, error: source.error }; }
+    return _run_plan(plan, source, options, build_session.direct);
+}
+
+fn smart_build_many(jobs, options = nil) {
+    return smart_build_many_in_session(smart_session(options), jobs, options);
+}
+
+fn smart_build_many_in_session(build_session, jobs, options = nil) {
+    if not _valid_smart_session(build_session) {
+        return map{ ok: false, error: "invalid smart build session" };
+    }
+    if type(jobs) != "array" or len(jobs) == 0 or len(jobs) > MAX_BATCH_JOBS {
+        return map{ ok: false, error: "jobs must contain 1.." + str(MAX_BATCH_JOBS) + " entries" };
+    }
+    let state = build_session.direct;
+    let hits_before = state.hits;
+    let misses_before = state.misses;
+    let compiled_before = state.compiled;
+    let published_before = state.published;
+    let results = [];
+    let all_ok = true;
+    let i = 0;
+    while i < len(jobs) {
+        let job = jobs[i];
+        if type(job) != "map" or not map_has(job, "source") or not map_has(job, "output") {
+            array_push(results, map{ ok: false, error: "invalid build job", index: i });
+            all_ok = false;
+        } else {
+            let plan = smart_plan(job.source, job.output, options);
+            let source = if plan.ok { _read_source(job.source) } else { map{ ok: false, error: str_join(plan.errors, "; ") } };
+            let result = if source.ok { _run_plan(plan, source, options, state) }
+                else { map{ ok: false, format: REPORT_FORMAT, plan: plan, error: source.error } };
+            result.index = i;
+            array_push(results, result);
+            if not result.ok { all_ok = false; }
+        }
+        i = i + 1;
+    }
+    return map{
+        ok: all_ok, format: REPORT_FORMAT, automated: true, jobs: len(jobs), results: results,
+        cache_hits: state.hits - hits_before, cache_misses: state.misses - misses_before,
+        compiled: state.compiled - compiled_before, published: state.published - published_before,
+        session_totals: map{ cache_hits: state.hits, cache_misses: state.misses,
+            compiled: state.compiled, published: state.published }
+    };
+}
+
+fn smart_project(project_dir, output_path, options = nil) {
+    if not _valid_path(project_dir) { return map{ ok: false, error: "invalid project directory" }; }
+    let manifest_path = path_join(project_dir, "pblang.toml");
+    let entry = "";
+    if fs_exists(manifest_path) {
+        let MV = import("stdlib:manifest_validate.sapp");
+        let checked = MV.validate_manifest_file(manifest_path);
+        if not checked.ok { return map{ ok: false, error: "invalid pblang.toml: " + str_join(checked.errors, "; ") }; }
+        entry = checked.package.entry;
+        if entry != nil and entry != "" and not _safe_relative(entry) { return map{ ok: false, error: "manifest entry must stay inside the project" }; }
+    }
+    if entry == nil or entry == "" {
+        let candidates = ["main.sapp", "main.sap", "src/main.sapp", "src/main.sap"];
+        let i = 0;
+        while i < len(candidates) {
+            if fs_exists(path_join(project_dir, candidates[i])) { entry = candidates[i]; break; }
+            i = i + 1;
+        }
+    }
+    if entry == nil or entry == "" { return map{ ok: false, error: "project has no build entry" }; }
+    let result = smart_build(path_join(project_dir, entry), output_path, options);
+    result.project = project_dir;
+    result.entry = entry;
     return result;
 }
 
-// arch() — CPU architecture component of the host target triple (e.g. "x86_64").
+// Backward-compatible APIs now delegate to real, safe build paths.
+fn compile(source_path, output_path) {
+    let result = smart_build(source_path, output_path, map{ goal: "balanced", fallback: true });
+    return map{
+        success: result.ok,
+        output: if result.ok { result.output } else { output_path },
+        error: if result.ok { "" } else { try result.error catch "build failed" },
+        report: result
+    };
+}
+
+fn _pblang_bin() {
+    return import("stdlib:dist.sapp").runtime_binary().path;
+}
+
+fn transpile(source_path, output_path) {
+    if not _valid_path(source_path) or not _valid_path(output_path) {
+        return map{ success: false, c_source: "", error: "invalid source or output path" };
+    }
+    let result = try proc_spawn_wait(_pblang_bin(), ["transpile", source_path, "-o", output_path]) catch nil;
+    if result == nil or (try result.exit_code catch 1) != 0 or not fs_exists(output_path) {
+        return map{ success: false, c_source: "", error: if result == nil { "could not run pblang transpile" } else { try result.stderr catch "transpile failed" } };
+    }
+    return map{ success: true, c_source: try fs_read(output_path) catch "", error: "" };
+}
+
+fn info() {
+    let cc = _which_any(["cc", "gcc", "clang"]);
+    return map{
+        os: host_platform(), arch: host_arch(), cc: if cc == nil { "none" } else { cc.name },
+        target: target_triple(), host_target: _host_target_name(), native_supported: cc != nil,
+        smart_build: true, direct_x64: host_platform() == "linux" and host_arch() == "x86_64",
+        plan_format: PLAN_FORMAT
+    };
+}
+
+// Preserve the historical no-capability behavior: target_triple has a bounded
+// compatibility fallback when host discovery is unavailable.
 fn arch() { return str_split(target_triple(), "-")[0]; }
 
-export is_native_supported, target_triple, compile, transpile, info, arch;
+export MAX_SOURCE_BYTES, MAX_BATCH_JOBS, PLAN_FORMAT, REPORT_FORMAT;
+export is_native_supported, target_triple, compile, transpile, info, arch, host_arch;
+export smart_plan, smart_session, smart_build, smart_build_in_session;
+export smart_build_many, smart_build_many_in_session, smart_project;

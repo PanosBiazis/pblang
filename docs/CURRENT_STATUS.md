@@ -1,8 +1,8 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-07-19
-**Status**: v0.5.7 — Production-Ready Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 313 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
-The latest complete pblang semantic run on 2026-07-19 passed **698/698 tests**
+**Last Updated**: 2026-07-21
+**Status**: v0.5.7 — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 344 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+The latest complete pblang semantic run on 2026-07-21 passed **723/723 tests**
 with zero failures, ignored tests, or filtered tests. The separate release Rust
 semantics harness passed 203 tests with zero failures and one documented
 security ignore; these runner counts are not combined.
@@ -15,6 +15,150 @@ more than 90 seconds), pbOS 17/17, and pb-mcp-server 11/11. The Rust
 ---
 
 Canonical status is the top summary and `Test Results` section in this file. Older milestone snapshots below are kept for historical context and may reflect prior counts/plans.
+
+## 2026-07-21 - PBLang-native SHA3-256
+
+`stdlib:sha3.sapp` implements FIPS 202 SHA3-256 entirely in PBLang. It stores
+each Keccak lane as exact low/high 32-bit halves and performs potentially large
+left shifts in masked 8-bit steps so no intermediate exceeds the exact integer
+range used by the runtime value model. Empty, `abc`, 200-byte multi-block and
+byte-array vectors pass. PBRemote consumes this primitive for cryptographic Tor
+v3 onion-address checksum validation; this does not by itself constitute a full
+Tor client.
+
+## 2026-07-21 - Android TLS 1.3 capability accuracy
+
+`stdlib:android_emulator.sapp` no longer labels every API 21+ network plan as
+TLS 1.3. `tls13_status(...)` models the Android platform guarantee at API 29+;
+older modeled runtimes fail closed, and `network_plan(...)` rejects secure plans
+when that provider is unavailable. Plans expose their provider and state that no
+external transport installation is required. Current, legacy-negative and
+cleartext-negative semantic cases pass as part of the 723/723 suite.
+
+## 2026-07-21 - Typed JVM emitters and Android control-flow VM
+
+`stdlib:jvm_classfile.sapp` now validates and emits compact integer/reference
+local loads and stores, signed `iinc`, and primitive `newarray` instructions.
+PBRemote consumes these APIs in its generated Android PBCS-v2 VM, whose packaged
+231-byte loop exercises arithmetic, locals, globals and forward/backward control
+flow with explicit resource limits. PBLang semantics passed 719/719 after the
+change. This remains a bounded JVM emitter, not a claim of a complete JVM backend.
+
+## 2026-07-20 - Bounded JVM branch assembly and Android VM consumer
+
+`stdlib:jvm_classfile.sapp` now has a PBLang-native label assembler for signed
+16-bit JVM branches. It resolves forward and backward edges deterministically
+and fails closed on invalid opcodes, duplicate/unresolved labels, corrupt patch
+metadata, invalid targets and bytecode-size overflow. PBRemote uses it to emit a
+bounded PBCS-v2 numeric/global decoder and executor directly as Android DEX
+input. The complete PBLang semantics suite passed 719/719 in 44.08 seconds on
+the verification host; this is a correctness result, not a universal JVM or
+Android-runtime claim.
+
+## 2026-07-20 - Bounded Android userspace emulator and PBCS execution
+
+`stdlib:android_emulator.sapp` now composes the PBLang platform/device models,
+self-hosted PBCS v2 container and bounded PBLang VM into an executable Android
+userspace model. It verifies application/package contracts, create/start/resume
+and pause/stop/destroy lifecycle transitions, system-owned permission grants,
+explicit exported-component policy, per-package private storage, protected
+services, foreground input, TLS-only network plans and budgeted PBCS execution.
+Lifecycle mutations preflight their event capacity so quota failure cannot leave
+an application in a partially advanced state. Uninstall removes package-private
+data, and service payloads fail closed when they are not bounded JSON values.
+The device signal model also now
+accepts the canonical runtime `bool` type instead of the nonexistent `boolean`
+type label.
+
+The semantic suite passed 719/719. A nine-sample PBLang benchmark measured a
+0.240 ms median for an install plus complete Activity lifecycle and 42.183 ms
+for a 1,000-iteration PBCS integer workload; the latter had 2.15% CV and used a
+238-byte artifact. These are userspace-emulator measurements on this host, not
+ART, kernel, GPU-driver or physical-device performance claims. PBRemote 0.4.2
+uses the model as a mandatory pre-signing runtime-probe gate while preserving an
+explicit `full_protocol_runtime=false` boundary for the Android package. No Rust
+source was added.
+
+The physical-device verifier now distinguishes asleep and securely locked
+devices before accessibility work. A semantic test that previously compressed
+the growing 86 MiB standard-library tree was replaced by a deterministic
+recursive fixture: isolated runtime fell below the 30-second timeout to 0.43 s,
+and the full 719-test suite fell from 176.76 s to 62.60 s on this host.
+
+## 2026-07-19 - Lazy direct-codegen sessions and bounded source macros
+
+The canonical smart-worker semantic run passed 719/719 tests with zero failed,
+ignored, measured, or filtered tests. A fresh `cargo audit` of the retained Rust
+bootstrap found `crossbeam-epoch 0.9.18` and `anyhow 1.0.102`; the dependency
+lock was updated to the patched `0.9.20` and `1.0.103` releases without adding
+Rust source. The refreshed advisory scan reports zero known vulnerabilities and
+zero unsound advisories. Four unmaintained and one yanked transitive dependency
+warnings remain migration work and prevent an unqualified production-ready
+security claim.
+
+The refreshed phase benchmark measured 1.480 ms process startup, 37.404 ms
+backend import, 1.652 ms in-process emission, 42.357 ms full uncached
+publication, and 9.342 ms verified warm publication. Six-artifact sessions
+measured 249.950 ms for independent processes, 55.485 ms for one cold session,
+and 10.653 ms for a warm session (1.776 ms per artifact and 23.46x faster than
+independent processes). These are compiler pipeline measurements, not generated
+program runtime.
+
+`stdlib:build.sapp` now replaces its old shell-string/fake-C compile path with
+a bounded adaptive builder. It exposes deterministic plans, manifest-confined
+project entry discovery, direct x86-64 plus hosted-C99 selection, explicit PBCK
+runtime fallback, content digests, argv-only subprocesses, and reusable smart
+sessions. The companion `tools/pbbuild.sapp` supports dry-run plans and explicit
+goal/backend/target policies. A session benchmark measured 13.01 microseconds
+per plan, 5.084 ms setup, 35.700 ms cold direct compile, 0.752 ms warm verified
+publication, and 4.566 ms for a six-artifact warm batch (0.761 ms/artifact).
+Warm numbers require the same session snapshot and are not cross-process claims.
+Hosted C99 builds resolve the current command directly on Linux before checking
+`PATH`, with `PBLANG_BIN` as an explicit operator override. This prevents a
+stale system installation from silently compiling a project with different or
+slower compiler behavior.
+
+The new bounded `stdlib:jvm_classfile.sapp` emitter generates deterministic JVM
+class bytes directly from PBLang and is used by PBRemote's Android 14 companion
+packager. Its current strict ASCII constant-pool and small-launcher scope is
+documented rather than presented as a complete JVM backend. The defensive
+secret scanner also now rejects common artifact-name false positives while
+retaining named-token and 24+ character high-entropy credential detection.
+
+`stdlib:android_adb.sapp` adds bounded real-device verification without adding
+foreign application code. It validates device serials and authorization,
+invokes the official ADB tool with fixed argv and external deadlines, separates
+post-install launch from cold restarts, scans package-scoped crashes, and
+collects memory, accessibility interaction and GPU frame metrics without screen
+capture. PBRemote passed this gate on Android 14/API 34 ARM64.
+
+The fixed 24-row competitor matrix completed with 22 available successful rows,
+two explicit Zig-unavailable rows, and no failures. The integer-kernel direct
+x86-64 artifact ran in 1.963 ms median with 264 KiB RSS and 507 bytes on disk,
+versus C at 3.973 ms, 1,496 KiB and 14,472 bytes. PBLang direct warm compilation
+remained slower at 42.760 ms versus C at 25.005 ms. The separate 90-row
+interpreter category matrix completed with 54 available successes, 36 explicit
+unavailable rows, and no failures; its integer loop remained slower than Python
+and Lua. No universal fastest-language claim follows from these workloads.
+
+The PBLang-only direct x86-64 compile session now imports its 270 KB backend
+only on the first actual cache miss. On this host, six-artifact warm builds
+moved from 98.504 ms to 22.392 ms median (4.40x faster, 77.27% lower latency),
+or from 16.417 to 3.732 ms per artifact. A cold session measured 119.208 ms
+versus 531.297 ms for six independent compiler processes (4.46x faster).
+
+The phase benchmark now separates process startup (3.569 ms), backend import
+(78.930 ms), in-process machine-code emission (3.823 ms), full uncached
+publication (88.861 ms), and verified warm publication (18.367 ms). The emitter
+is 4.30% of the uncached latency; cold source import remains the single-file
+bottleneck and is not mislabeled as machine-code generation time.
+
+`stdlib:macro.sapp` adds bounded callable expanders, recursive expansion budgets
+and an inspectable `@record` convenience inspired by Crystal metaprogramming.
+`stdlib:freeze.sapp` provides deterministic import linking and atomic verified
+PBCK publication for normal-sized projects. Compiler-sized self-hosted
+flattening remains too slow in the current interpreter and is not claimed as a
+production cold-compiler cache. No Rust code was added.
 
 ## 2026-07-19 - Verified compiler caches and batch direct codegen
 
@@ -35,7 +179,7 @@ for one cold-artifact session (4.33x) and 81.758 ms for verified warm artifacts
 (5.45x). A 300-function imported module measured 128.271 ms uncached, 84.549 ms
 warm (1.52x), and 271.464 ms for its first verified store. The cold store is
 therefore an explicit cost, not hidden as an improvement. Build, all phase
-suites, 698/698 PBLang semantics, and 203/0/1 release Rust oracle tests pass.
+suites, 712/712 PBLang semantics, and 203/0/1 release Rust oracle tests pass.
 Checked-in bootstrap snapshots and their freshness CI gate remain unimplemented;
 the runtime cache is not represented as a substitute. No Rust code was added.
 
@@ -654,7 +798,7 @@ and product suites in pbAI, pbOS, and pb-mcp-server.
 ## ✅ Test Results
 
 ```
-pblang test tests/semantics --allow-all --jobs 8 --quiet → 685 passed; 0 failed; 0 ignored; 0 filtered (265.61 s, 1,727,616 KiB process peak RSS; complete .sapp corpus including cost-aware CPU/accelerator/storage routing, bounded channel-backed thread supervision, PBIDE render-policy caching, non-executing polyglot tool discovery, controlled polyglot/FFI/parallel/device execution, PBLang-only migration, hosted self-C99, GUI/GPU, pbAI, MCP, security, ten ISA/quantum emulator tests, and the platform/ABI emulator; 2026-07-18)
+pblang test semantics --jobs smart --quiet → 714 passed; 0 failed; 0 ignored; 0 measured; 0 filtered (complete current semantic corpus; 2026-07-19)
 pblang test tests/semantics --allow-all --quiet → same suite with script print output captured/suppressed for faster, cleaner CI logs
 pblang test tests/semantics --allow-all --jobs auto --quiet → run independent test files in isolated VM workers
 pblang test semantics → shorthand for tests/semantics + allow-all + quiet + resource-aware jobs

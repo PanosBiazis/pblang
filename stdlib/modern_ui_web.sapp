@@ -1,0 +1,532 @@
+// Browser renderer for stdlib/modern_ui.sapp, authored in PBLang.
+//
+// Applications provide only a validated modern_ui view tree. This adapter emits
+// the browser artifacts required by the platform, serves them through the
+// PBLang web stack, and can export the same deterministic files for static
+// hosting. User data is never inserted into executable source.
+
+let Web = import("stdlib:web_framework.sapp");
+let Security = import("stdlib:web_security.sapp");
+let GUI = import("stdlib/gui.sapp");
+
+let MAX_WEB_NODES = 1024;
+let MAX_WEB_ACTIONS = 128;
+let MAX_OUTPUT_PATH = 1024;
+
+fn _copy(value) {
+    let out = map{};
+    if value == nil { return out; }
+    if type(value) != "map" { throw "modern_ui_web options must be a map"; }
+    for key in map_keys(value) { out[key] = value[key]; }
+    return out;
+}
+
+fn _escape(value) {
+    let out = str(value);
+    out = str_replace_all(out, "&", "&amp;");
+    out = str_replace_all(out, "<", "&lt;");
+    out = str_replace_all(out, ">", "&gt;");
+    out = str_replace_all(out, "\"", "&quot;");
+    out = str_replace_all(out, "'", "&#39;");
+    return out;
+}
+
+fn _name(node, path) {
+    let explicit = str(try node.name catch "");
+    if explicit != "" { return explicit; }
+    return node.kind + "_" + path;
+}
+
+fn _container(kind) {
+    return kind == "screen" or kind == "column" or kind == "row"
+    or kind == "grid" or kind == "card";
+}
+
+fn _text_control(kind) {
+    return kind == "heading" or kind == "text" or kind == "button"
+    or kind == "input" or kind == "area" or kind == "toggle";
+}
+
+fn _num(value, fallback, minimum, maximum) {
+    if value == nil or not is_number(value) { return fallback; }
+    let out = num_floor(value);
+    if out < minimum { return minimum; }
+    if out > maximum { return maximum; }
+    return out;
+}
+
+fn _decimal(value, fallback, minimum, maximum) {
+    if value == nil or not is_number(value) { return fallback; }
+    if value < minimum { return minimum; }
+    if value > maximum { return maximum; }
+    return value;
+}
+
+fn _channel(value) { return _num(value, 0, 0, 255); }
+
+fn _color(value) {
+    if type(value) == "array" and (len(value) == 3 or len(value) == 4) {
+        let r = _channel(value[0]); let g = _channel(value[1]); let b = _channel(value[2]);
+        if len(value) == 4 and _channel(value[3]) < 255 {
+            return "rgba(" + str(r) + "," + str(g) + "," + str(b) + ","
+            + str(_channel(value[3]) / 255.0) + ")";
+        }
+        return "rgb(" + str(r) + "," + str(g) + "," + str(b) + ")";
+    }
+    if is_number(value) {
+        let packed = _num(value, 0, 0, 16777215);
+        if packed <= 255 {
+            return "rgb(" + str(packed) + "," + str(packed) + "," + str(packed) + ")";
+        }
+        let r = num_mod(num_floor(packed / 65536), 256);
+        let g = num_mod(num_floor(packed / 256), 256);
+        let b = num_mod(packed, 256);
+        return "rgb(" + str(r) + "," + str(g) + "," + str(b) + ")";
+    }
+    throw "modern_ui_web expected an RGB/RGBA palette color";
+}
+
+fn _theme(options) {
+    let name = str_lower(str(try options.theme catch "dark"));
+    if name != "dark" and name != "light" { throw "modern_ui_web theme must be dark or light"; }
+    let colors = GUI.custom_palette(name, try options.palette catch nil);
+    return map{
+        name: name,
+        bg: _color(colors.bg), panel: _color(colors.panel),
+        field: _color(colors.field), border: _color(colors.border),
+        accent: _color(colors.accent), text: _color(colors.text),
+        muted: _color(colors.muted)
+    };
+}
+
+fn _safe_image_source(value) {
+    let source = str(value);
+    if source == "" { return ""; }
+    if len(source) > 4096 or str_contains(source, "\x00") { return ""; }
+    if str_starts_with(source, "/") or str_starts_with(source, "./")
+    or str_starts_with(source, "../") or str_starts_with(source, "data:image/") {
+        return source;
+    }
+    return "";
+}
+
+fn _input_type(value) {
+    let kind = str_lower(str(value));
+    for allowed in ["text", "email", "password", "search", "url", "tel", "number"] {
+        if kind == allowed { return kind; }
+    }
+    return "text";
+}
+
+fn _enabled(node) {
+    return try node.enabled catch true;
+}
+
+fn _disabled(node) {
+    if _enabled(node) { return ""; }
+    return " disabled aria-disabled=\"true\"";
+}
+
+fn _readonly(node) {
+    if try node.readonly catch false { return " readonly"; }
+    return "";
+}
+
+fn _label(node, fallback) {
+    let value = str(try node.accessibility_label catch "");
+    if value == "" { value = str(try node.placeholder catch fallback); }
+    if value == "" { value = fallback; }
+    return value;
+}
+
+fn _node_rule(node, class_name, state) {
+    let rule = "." + class_name + "{";
+    let gap = try node.gap catch nil;
+    let padding = try node.padding catch nil;
+    let grow = try node.grow catch nil;
+    let min_w = try node.min_w catch nil;
+    let min_h = try node.min_h catch nil;
+    if gap != nil { rule = rule + "gap:" + str(_num(gap, 12, 0, 8192)) + "px;"; }
+    if padding != nil { rule = rule + "padding:" + str(_num(padding, 0, 0, 8192)) + "px;"; }
+    if grow != nil { rule = rule + "flex-grow:" + str(_num(grow, 0, 0, 64)) + ";"; }
+    if min_w != nil { rule = rule + "min-width:" + str(_num(min_w, 0, 0, 8192)) + "px;"; }
+    if min_h != nil { rule = rule + "min-height:" + str(_num(min_h, 0, 0, 8192)) + "px;"; }
+    if node.kind == "grid" {
+        let columns = _num(try node.columns catch 2, 2, 1, 12);
+        rule = rule + "--pb-columns:" + str(columns)
+            + ";grid-template-columns:repeat(var(--pb-columns),minmax(0,1fr));";
+    }
+    if node.kind == "spacer" {
+        rule = rule + "height:" + str(_num(try node.size catch 12, 12, 0, 8192)) + "px;";
+    }
+    state.rules = state.rules + rule + "}\n";
+}
+
+fn _action_id(action, state) {
+    let id = "a" + str(state.action_count);
+    state.action_count = state.action_count + 1;
+    if state.action_count > MAX_WEB_ACTIONS { throw "modern_ui_web action limit exceeded"; }
+    state.actions[id] = action;
+    return id;
+}
+
+fn _children(node, path, state) {
+    let out = "";
+    let i = 0;
+    while i < len(node.children) {
+        out = out + _render(node.children[i], path + "_" + str(i), state);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _render(node, path, state) {
+    state.node_count = state.node_count + 1;
+    if state.node_count > MAX_WEB_NODES { throw "modern_ui_web node limit exceeded"; }
+    let index = state.node_count;
+    let kind = node.kind;
+    let name = _name(node, path);
+    let local = "pb-n-" + str(index);
+    let classes = "pb-" + kind + " " + local;
+    if kind == "row" and (try node.responsive catch true) {
+        classes = classes + " pb-responsive";
+    }
+    _node_rule(node, local, state);
+
+    if _container(kind) {
+        let content = _children(node, path, state);
+        if kind == "card" {
+            let title = str(try node.title catch "");
+            let header = "";
+            if title != "" { header = "<h2 class=\"pb-card-title\">" + _escape(title) + "</h2>"; }
+            return "<section class=\"" + classes + "\" data-pb-name=\"" + _escape(name)
+            + "\">" + header + content + "</section>";
+        }
+        return "<div class=\"" + classes + "\" data-pb-name=\"" + _escape(name)
+        + "\">" + content + "</div>";
+    }
+
+    let value = str(try node.value catch "");
+    let text = str(try node.text catch "");
+    let common = " class=\"" + classes + "\" data-pb-name=\"" + _escape(name) + "\"";
+    if kind == "heading" {
+        let tag = "h2";
+        if state.heading_count == 0 { tag = "h1"; }
+        state.heading_count = state.heading_count + 1;
+        return "<" + tag + common + ">" + _escape(text) + "</" + tag + ">";
+    }
+    if kind == "text" { return "<p" + common + ">" + _escape(text) + "</p>"; }
+    if kind == "button" {
+        let action = try node.action catch nil;
+        let action_attr = "";
+        if action != nil {
+            action_attr = " data-pb-action=\"" + _action_id(action, state) + "\"";
+        }
+        return "<button type=\"button\"" + common + action_attr + _disabled(node)
+        + "><span data-pb-value>" + _escape(text) + "</span></button>";
+    }
+    if kind == "input" {
+        let max_chars = _num(try node.max_chars catch 65536, 65536, 1, 1048576);
+        return "<input type=\"" + _input_type(try node.input_type catch "text") + "\""
+        + common + " value=\"" + _escape(value) + "\" placeholder=\""
+        + _escape(str(try node.placeholder catch "")) + "\" aria-label=\""
+        + _escape(_label(node, name)) + "\" maxlength=\"" + str(max_chars) + "\""
+        + _readonly(node) + _disabled(node) + ">";
+    }
+    if kind == "area" {
+        let max_chars = _num(try node.max_chars catch 65536, 65536, 1, 1048576);
+        return "<textarea" + common + " placeholder=\""
+        + _escape(str(try node.placeholder catch "")) + "\" aria-label=\""
+        + _escape(_label(node, name)) + "\" maxlength=\"" + str(max_chars) + "\""
+        + _readonly(node) + _disabled(node) + ">" + _escape(value) + "</textarea>";
+    }
+    if kind == "toggle" {
+        let checked = "";
+        if try node.checked catch false { checked = " checked"; }
+        return "<label" + common + "><input type=\"checkbox\"" + checked + _disabled(node)
+        + "><span data-pb-value>" + _escape(text) + "</span></label>";
+    }
+    if kind == "choice" {
+        let selected = _num(try node.selected catch 0, 0, 0, 511);
+        let options = try node.options catch [];
+        let body = "";
+        let i = 0;
+        while i < len(options) {
+            let selected_attr = "";
+            if i == selected { selected_attr = " selected"; }
+            body = body + "<option value=\"" + str(i) + "\"" + selected_attr + ">"
+            + _escape(str(options[i])) + "</option>";
+            i = i + 1;
+        }
+        return "<select" + common + " aria-label=\"" + _escape(_label(node, name)) + "\""
+        + _disabled(node) + ">" + body + "</select>";
+    }
+    if kind == "slider" {
+        let minimum = _decimal(try node.min catch 0, 0, -1000000000, 1000000000);
+        let maximum = _decimal(try node.max catch 100, 100, minimum, 1000000000);
+        let current = _decimal(try node.value catch minimum, minimum, minimum, maximum);
+        return "<input type=\"range\"" + common + " min=\"" + str(minimum)
+        + "\" max=\"" + str(maximum) + "\" value=\"" + str(current)
+        + "\" aria-label=\"" + _escape(_label(node, name)) + "\"" + _disabled(node) + ">";
+    }
+    if kind == "progress" {
+        let current = _decimal(try node.value catch 0, 0, 0, 1);
+        return "<progress" + common + " max=\"1\" value=\"" + str(current)
+        + "\" aria-label=\"" + _escape(_label(node, name)) + "\"></progress>";
+    }
+    if kind == "image" {
+        let source = _safe_image_source(try node.src catch "");
+        let alt = _label(node, "");
+        if source != "" {
+            return "<img" + common + " src=\"" + _escape(source) + "\" alt=\"" + _escape(alt) + "\">";
+        }
+        return "<div" + common + " role=\"img\" aria-label=\"" + _escape(alt)
+        + "\"><span>" + _escape(if alt == "" { "Image" } else { alt }) + "</span></div>";
+    }
+    if kind == "separator" { return "<hr" + common + ">"; }
+    return "<div" + common + " aria-hidden=\"true\"></div>";
+}
+
+fn _base_css(theme, rules) {
+    return "*,*::before,*::after{box-sizing:border-box}\n"
+    + ":root{color-scheme:" + theme.name + ";font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;"
+    + "--pb-bg:" + theme.bg + ";--pb-panel:" + theme.panel + ";--pb-field:" + theme.field
+    + ";--pb-border:" + theme.border + ";--pb-accent:" + theme.accent
+    + ";--pb-text:" + theme.text + ";--pb-muted:" + theme.muted + "}\n"
+    + "html,body{margin:0;min-width:0;min-height:100%;background:var(--pb-bg);color:var(--pb-text);-webkit-text-size-adjust:100%}\n"
+    + "body{min-height:100vh;min-height:100dvh;overflow-x:hidden;line-height:1.5}button,input,textarea,select{font:inherit;color:inherit}\n"
+    + ".pb-app{width:min(100%,1120px);min-width:0;min-height:100vh;min-height:100dvh;margin:0 auto;padding:clamp(16px,3vw,32px);display:flex;flex-direction:column;gap:16px;overflow-wrap:anywhere}\n"
+    + ".pb-screen,.pb-column{display:flex;min-width:0;flex-direction:column;gap:12px}.pb-row{display:flex;min-width:0;align-items:stretch;gap:12px}.pb-grid{display:grid;min-width:0;gap:12px}\n"
+    + ".pb-card{display:flex;min-width:0;flex-direction:column;gap:12px;padding:16px;border:1px solid var(--pb-border);border-radius:8px;background:var(--pb-panel);box-shadow:0 10px 28px rgba(0,0,0,.12)}\n"
+    + ".pb-card-title{margin:0;font-size:1rem}.pb-heading{margin:0;line-height:1.2;letter-spacing:0}.pb-text{margin:0;color:var(--pb-muted)}\n"
+    + ".pb-button,.pb-input,.pb-area,.pb-choice{width:100%;min-width:0;min-height:48px;border:1px solid var(--pb-border);border-radius:7px;background:var(--pb-field);padding:9px 12px}\n"
+    + ".pb-button{width:auto;min-width:96px;border-color:var(--pb-accent);background:var(--pb-accent);color:white;font-weight:650;cursor:pointer}\n"
+    + ".pb-button:hover{filter:brightness(1.08)}.pb-button:active{transform:translateY(1px)}button:disabled,input:disabled,textarea:disabled,select:disabled{cursor:not-allowed;opacity:.55}\n"
+    + ".pb-area{min-height:104px;resize:vertical}.pb-toggle{display:flex;min-height:48px;align-items:center;gap:10px}.pb-toggle input{width:20px;height:20px;accent-color:var(--pb-accent)}\n"
+    + ".pb-slider{width:100%;accent-color:var(--pb-accent)}.pb-progress{width:100%;height:14px;accent-color:var(--pb-accent)}\n"
+    + ".pb-image{display:grid;min-height:160px;place-items:center;overflow:hidden;border:1px dashed var(--pb-border);border-radius:7px;background:var(--pb-field);color:var(--pb-muted)}.pb-image img,img.pb-image{width:100%;height:auto;object-fit:contain}\n"
+    + ".pb-separator{width:100%;margin:4px 0;border:0;border-top:1px solid var(--pb-border)}\n"
+    + ".pb-live{position:fixed;left:16px;bottom:16px;z-index:10;max-width:min(420px,calc(100vw - 32px));padding:10px 12px;border-radius:7px;background:var(--pb-text);color:var(--pb-bg);box-shadow:0 8px 24px rgba(0,0,0,.24)}.pb-live:empty{display:none}\n"
+    + ":focus-visible{outline:3px solid var(--pb-accent);outline-offset:2px}\n"
+    + "@supports(padding:max(0px)){.pb-app{padding-left:max(clamp(16px,3vw,32px),env(safe-area-inset-left));padding-right:max(clamp(16px,3vw,32px),env(safe-area-inset-right));padding-bottom:max(clamp(16px,3vw,32px),env(safe-area-inset-bottom))}}\n"
+    + "@media(max-width:900px){.pb-grid{grid-template-columns:repeat(min(var(--pb-columns),2),minmax(0,1fr))}}\n"
+    + "@media(max-width:640px){.pb-app{padding-top:14px;gap:12px}.pb-row.pb-responsive{flex-direction:column}.pb-grid{grid-template-columns:minmax(0,1fr)!important}.pb-button{width:100%}.pb-card{padding:14px}}\n"
+    + "@media(max-width:360px){.pb-app{padding-top:10px}.pb-card{padding:10px}.pb-row,.pb-grid,.pb-column,.pb-screen{gap:8px}}\n"
+    + "@media(max-height:480px) and (orientation:landscape){.pb-app{padding-top:8px;padding-bottom:8px}.pb-card{padding-top:10px;padding-bottom:10px}}\n"
+    + "@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}\n"
+    + rules;
+}
+
+fn _runtime(actions) {
+    let encoded = json_stringify(actions);
+    encoded = str_replace_all(encoded, "<", "\\u003c");
+    encoded = str_replace_all(encoded, ">", "\\u003e");
+    encoded = str_replace_all(encoded, "&", "\\u0026");
+    let action_source = "\"use strict\";globalThis.PBLangUIActions=" + encoded + ";\n";
+    let runtime = "\"use strict\";\n"
+    + "(()=>{const actions=globalThis.PBLangUIActions||{};const live=document.getElementById(\"pb-live\");"
+    + "const named=n=>{for(const e of document.querySelectorAll(\"[data-pb-name]\")){if(e.getAttribute(\"data-pb-name\")===n)return e;}return null;};"
+    + "const apply=(a,d=0)=>{if(!a||d>8)return;if(a.kind===\"set_text\"){const e=named(String(a.target));if(!e)return;"
+    + "if(e.matches(\"input,textarea\"))e.value=String(a.value);else{const v=e.querySelector(\"[data-pb-value]\");(v||e).textContent=String(a.value);}}"
+    + "else if(a.kind===\"message\"){live.textContent=String(a.value);}"
+    + "else if(a.kind===\"sequence\"&&Array.isArray(a.actions)){for(const x of a.actions)apply(x,d+1);}};"
+    + "document.addEventListener(\"click\",e=>{const b=e.target.closest(\"[data-pb-action]\");if(!b||b.disabled)return;apply(actions[b.getAttribute(\"data-pb-action\")]);});})();\n";
+    return map{ actions: action_source, runtime: runtime };
+}
+
+fn _lang_char(c) {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+        or (c >= 48 and c <= 57) or c == 45;
+}
+
+fn _lang(value) {
+    let lang = str(value);
+    if lang == "" or len(lang) > 35 { return "en"; }
+    let i = 0;
+    while i < len(lang) {
+        if not _lang_char(strcharcodeat(lang, i)) {
+            return "en";
+        }
+        i = i + 1;
+    }
+    return lang;
+}
+
+fn _check_action(action, fields) {
+    if action.kind == "set_text" and not map_has(fields, action.target) {
+        throw "modern_ui_web action target is not text-capable: " + action.target;
+    }
+    if action.kind == "sequence" {
+        for child in action.actions { _check_action(child, fields); }
+    }
+}
+
+fn _preflight(bundle) {
+    if type(bundle) != "map"
+    or (try bundle.format catch "") != "pblang.modern-ui.bundle.v1"
+    or (try bundle.target catch "") != "web" {
+        throw "modern_ui_web expected a Web modern UI bundle";
+    }
+    if len(bundle.records) > MAX_WEB_NODES { throw "modern_ui_web node limit exceeded"; }
+    let fields = map{};
+    for record in bundle.records {
+        let source = record.source;
+        let onclick = try source.onclick catch nil;
+        let onchange = try source.onchange catch nil;
+        if onclick != nil {
+            throw "modern_ui_web native onclick callback on " + record.name
+            + " is not portable; use a modern_ui action";
+        }
+        if onchange != nil {
+            throw "modern_ui_web native onchange callback on " + record.name
+            + " is not portable in the browser adapter";
+        }
+        if _text_control(record.kind) { fields[record.name] = record.kind; }
+        if (try source.action catch nil) != nil and record.kind != "button" {
+            throw "modern_ui_web portable actions currently require a button trigger";
+        }
+    }
+    for record in bundle.records {
+        let action = try record.source.action catch nil;
+        if action != nil { _check_action(action, fields); }
+    }
+}
+
+fn generate(name, bundle, options = nil) {
+    _preflight(bundle);
+    let opts = _copy(options);
+    let state = map{
+        node_count: 0, action_count: 0, heading_count: 0,
+        actions: map{}, rules: ""
+    };
+    let title = str(name);
+    if title == "" { title = "PBLang application"; }
+    if len(title) > 256 { throw "modern_ui_web title is too long"; }
+    let body = _render(bundle.view, "0", state);
+    let theme = _theme(opts);
+    let css = _base_css(theme, state.rules);
+    let scripts = _runtime(state.actions);
+    let html = "<!doctype html><html lang=\"" + _escape(_lang(try opts.lang catch "en"))
+    + "\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">"
+    + "<meta name=\"color-scheme\" content=\"" + theme.name + "\"><title>" + _escape(title)
+    + "</title><link rel=\"stylesheet\" href=\"./pblang-ui.css\"></head><body><main class=\"pb-app\">"
+    + body + "</main><div id=\"pb-live\" class=\"pb-live\" role=\"status\" aria-live=\"polite\"></div>"
+    + "<script defer src=\"./pblang-ui.actions.js\"></script><script defer src=\"./pblang-ui.js\"></script></body></html>";
+    return map{
+        format: "pblang.modern-ui.web.v1",
+        name: title, html: html, css: css,
+        actions_js: scripts.actions, runtime_js: scripts.runtime,
+        nodes: state.node_count, actions: state.action_count,
+        theme: theme.name,
+        digest: sha256(html + "\n" + css + "\n" + scripts.actions + "\n" + scripts.runtime)
+    };
+}
+
+fn _response(body, content_type, security, cache_control) {
+    return Security.harden(map{
+        status: 200, body: body, content_type: content_type,
+        headers: map{ "Cache-Control": cache_control }
+    }, security);
+}
+
+fn build(name, bundle, options = nil) {
+    let opts = _copy(options);
+    let generated = generate(name, bundle, opts);
+    let security = try opts.security catch Security.strict();
+    let app = Web.create_app(map{
+        host: try opts.host catch "127.0.0.1",
+        port: try opts.port catch 8080
+    });
+    Web.use(app, Security.shield(security));
+    Web.use(app, Security.rate_guard(security));
+    Web.get(app, "/", fn(_ctx) {
+        return _response(generated.html, "text/html; charset=utf-8", security, "no-cache");
+    });
+    Web.get(app, "/pblang-ui.css", fn(_ctx) {
+        return _response(generated.css, "text/css; charset=utf-8", security, "no-cache");
+    });
+    Web.get(app, "/pblang-ui.actions.js", fn(_ctx) {
+        return _response(generated.actions_js, "text/javascript; charset=utf-8", security, "no-cache");
+    });
+    Web.get(app, "/pblang-ui.js", fn(_ctx) {
+        return _response(generated.runtime_js, "text/javascript; charset=utf-8", security, "no-cache");
+    });
+    let handle = fn(request) {
+        return Security.harden(Web.handle(app, request), security);
+    };
+    return map{
+        format: "pblang.modern-ui.web-app.v1",
+        app: app, handle: handle, web: Web, security: security,
+        generated: generated,
+        config: map{ host: app.config.host, port: app.config.port }
+    };
+}
+
+fn _preview_request(path) {
+    return map{
+        method: "GET", path: path,
+        headers: map{ "user-agent": "Mozilla/5.0 pblang-modern-ui-preview" },
+        body: ""
+    };
+}
+
+fn preview(name, bundle, options = nil) {
+    let built = build(name, bundle, options);
+    let response = built.handle(_preview_request("/"));
+    return map{
+        kind: "modern-ui-web", name: str(name), preview: true,
+        response: response, app: built.app, handle: built.handle,
+        generated: built.generated
+    };
+}
+
+fn serve(name, bundle, options = nil) {
+    let built = build(name, bundle, options);
+    Web.listen(built.app);
+    return map{
+        kind: "modern-ui-web", name: str(name), preview: false,
+        app: built.app, generated: built.generated
+    };
+}
+
+fn _safe_output(path) {
+    let value = str(path);
+    if value == "" or len(value) > MAX_OUTPUT_PATH or str_starts_with(value, "/")
+    or str_starts_with(value, "\\") or str_contains(value, "\\")
+    or str_contains(value, ":") or str_contains(value, "\x00") {
+        return false;
+    }
+    for part in str_split(value, "/") {
+        if part == "" or part == "." or part == ".." { return false; }
+    }
+    return true;
+}
+
+fn export_static(name, bundle, output, options = nil) {
+    let out = str(output);
+    if not _safe_output(out) {
+        throw "modern_ui_web output must be a safe relative directory";
+    }
+    let generated = generate(name, bundle, options);
+    fs_mkdirs(out);
+    fs_write(out + "/index.html", generated.html);
+    fs_write(out + "/pblang-ui.css", generated.css);
+    fs_write(out + "/pblang-ui.actions.js", generated.actions_js);
+    fs_write(out + "/pblang-ui.js", generated.runtime_js);
+    let manifest = map{
+        format: "pblang.modern-ui.web-export.v1",
+        name: generated.name, files: [
+        "index.html", "pblang-ui.css", "pblang-ui.actions.js", "pblang-ui.js"
+        ],
+        nodes: generated.nodes, actions: generated.actions,
+        digest: generated.digest
+    };
+    fs_write(out + "/pblang-ui.manifest.json", json_stringify(manifest));
+    return map{
+        ok: true, output: out, files: manifest.files,
+        manifest: out + "/pblang-ui.manifest.json",
+        digest: generated.digest, generated: generated
+    };
+}
+
+export generate, build, preview, serve, export_static;

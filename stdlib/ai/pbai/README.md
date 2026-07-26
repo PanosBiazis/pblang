@@ -37,6 +37,7 @@ keeping current-vs-roadmap claims honest.
 | `stdlib/pbai_brain.sapp` | Cognitive loop: perception, memory, planning, critique, verification, reflection. |
 | `stdlib/pbai_ingest.sapp` | Bounded local file/folder ingestion into live learning, with shared pblang `llm_data` secret-line sanitization before persistence. |
 | `stdlib/pbai_cache.sapp` | pblang-only persistent cache for derived pbAI data: verified SHA-256 keys, TTL, quotas, recovery-safe publication, training summaries, retrieval, and generation metadata. |
+| `stdlib/pbai_streaming.sapp` | High-level facade over pblang's integrity-checked low-memory LLM store: on-demand layer/MoE shards, bounded RAM cache, learned hot experts, bounded look-ahead prefetch, weighted disk mirrors, exact-length/SHA-256 verification, and explicit precision semantics. |
 | `stdlib/pbai_max.sapp` | pbAI-Max tier policy/orchestration, checkpointing, continuation, and prompt-level regression evaluation (delegates heavy LLM math to pblang `stdlib:llm_*`). |
 | `stdlib/pbai_assets.sapp` | Inventory of external data/reference assets discoverable from pblang. |
 | `stdlib/pbai_tools.sapp` | Local capability/source map. |

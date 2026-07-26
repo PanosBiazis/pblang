@@ -1,0 +1,105 @@
+let Store = import("stdlib:llm_tiered_store.sapp");
+
+fn require(value, message) {
+    if value != true { throw "FAIL llm_tiered_store: " + message; }
+}
+fn digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+
+let suffix = str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
+let primary = "/tmp/pblang-tiered-primary-" + suffix;
+let mirror = "/tmp/pblang-tiered-mirror-" + suffix;
+fs_mkdirs(primary);
+fs_mkdirs(mirror);
+
+let layer0 = [1, 2, 3, 4];
+let layer1 = [5, 6, 7, 8];
+let expert0 = [9, 10, 11, 12];
+let expert1 = [13, 14, 15, 16];
+let fixtures = map{
+    "layer0.bin": layer0, "layer1.bin": layer1,
+    "expert0.bin": expert0, "expert1.bin": expert1
+};
+let names = map_keys(fixtures);
+let i = 0;
+while i < len(names) {
+    fs_write_bytes(primary + "/" + names[i], fixtures[names[i]]);
+    fs_write_bytes(mirror + "/" + names[i], fixtures[names[i]]);
+    i = i + 1;
+}
+
+let shards = [
+    Store.model_part("layer-0", "layer0.bin", 4, digest(layer0), "layer", 0, -1, "int4"),
+    Store.model_part("layer-1", "layer1.bin", 4, digest(layer1), "layer", 1, -1, "int4"),
+    Store.model_part("expert-0-0", "expert0.bin", 4, digest(expert0), "expert", 0, 0, "int4"),
+    Store.model_part("expert-0-1", "expert1.bin", 4, digest(expert1), "expert", 0, 1, "int4")
+];
+let cfg = Store.config(12, map{
+    max_shard_bytes: 8,
+    max_cache_entries: 3,
+    prefetch_capacity: 2,
+    hot_slots: 1,
+    expected_precision: "int4",
+    primary_weight: 1,
+    mirrors: [Store.mirror(mirror, 3)]
+});
+let store = Store.create(primary, shards, cfg);
+require(store.ok, "valid manifest opens");
+require(Store.capability().placement_changes_semantics == false,
+    "placement cannot silently change model semantics");
+
+let first = Store.load(store, "layer-0", true);
+require(first.ok and first.bytes == layer0 and first.verified and first.cached,
+    "first shard is verified, loaded and pinned");
+let hit = Store.load(store, "layer-0");
+require(hit.ok and hit.cache_hit and hit.source_root == "ram", "second load is a RAM hit");
+
+require(Store.load(store, "expert-0-0").ok, "first expert loads");
+let route = Store.record_routes(store, 0, [1, 1, 1, 0]);
+require(route.ok and len(route.accepted) == 4, "router heat records every valid expert choice");
+require(Store.predict_experts(store, 0, 1) == ["expert-0-1"],
+    "hot expert prediction follows measured routing");
+require(Store.load(store, "expert-0-1").ok, "hot expert loads");
+let hot = Store.rebalance_hot(store);
+require(hot.ok and hot.hot_pinned == ["expert-0-1"], "hottest resident shard is pinned");
+
+// Corrupt the deterministically preferred copy. Verified mirror failover must
+// recover the exact bytes from the other root without caching corrupt data.
+let preferred = Store.weighted_root_for(store, "layer-1");
+fs_write_bytes(preferred + "/layer1.bin", [0, 0, 0, 0]);
+let fallback = Store.load(store, "layer-1");
+require(fallback.ok and fallback.bytes == layer1 and fallback.verified,
+    "checksum failure falls back to another verified root");
+require(Store.status(store).stats.mirror_failovers == 1,
+    "verified mirror failover is observable");
+
+// The manual layer pin and learned hot pin force bounded cache bypass rather
+// than unbounded growth or eviction of protected entries.
+let st = Store.status(store);
+require(st.resident_bytes <= st.ram_budget_bytes and st.pinned_shards == 2,
+    "RAM usage stays bounded with manual and learned pins");
+
+require(Store.unpin(store, "layer-0"), "manual pin can be released");
+Store.rebalance_hot(store);
+let queued = Store.queue_prefetch(store, ["expert-0-0", "layer-0", "missing"]);
+require(queued.ok and len(queued.accepted) <= 2 and len(queued.rejected) >= 1,
+    "prefetch queue is bounded and rejects unknown work");
+let prefetched = Store.run_prefetch(store, 2);
+require(prefetched.ok and len(prefetched.completed) > 0, "prefetch queue executes verified loads");
+let prefetched_hit = Store.load(store, prefetched.completed[0]);
+require(prefetched_hit.ok and prefetched_hit.cache_hit,
+    "demand load reuses a prefetched resident shard");
+
+let bad_precision = Store.create(primary, [
+    Store.model_part("bad", "layer0.bin", 4, digest(layer0), "layer", 0, -1, "f16")
+], cfg);
+require(not bad_precision.ok and bad_precision.code == "manifest",
+    "precision mismatch fails closed");
+let traversal = Store.create(primary, [
+    Store.model_part("escape", "../layer0.bin", 4, digest(layer0), "layer", 0, -1, "int4")
+], cfg);
+require(not traversal.ok and traversal.code == "manifest", "path traversal fails closed");
+
+require(Store.close(store), "store closes held directory handles");
+require(not Store.close(store), "store close is idempotent");
+try proc_spawn_wait("/bin/rm", ["-rf", "--", primary, mirror]) catch nil;
+print "llm_tiered_store_pass";
