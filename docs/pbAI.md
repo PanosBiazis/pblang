@@ -159,12 +159,19 @@ program orchestrating these kernels.
   vector search with online add, stable ids, filtered search, removal, and manifest
   metadata; `stdlib/llm_binary.sapp` adds the bit-level token substrate: token-id bit
   width, ID<->bits round-trips, token bitstreams, binary LM example views, byte-bit
-  conversion, and hamming/transition features; `stdlib/llm_offload.sapp` adds an
-  AirLLM-style low-memory inference planner: KV-cache reservation, compressed KV-cache
-  sizing, resident-layer selection, layer streaming, prefetch hints, offload manifests,
-  and bounded microbatch sizing. This is the planning layer for future shard/device execution,
-  not a claim that full GPU kernels are implemented in pblang today. Locked by
-  `tests/semantics/llm_max_foundation_test.sapp`. These are generic pblang libraries;
+  conversion, and hamming/transition features; `stdlib/llm_offload.sapp` adds a
+  low-memory inference planner: KV-cache reservation, compressed KV-cache sizing,
+  resident-layer selection, layer sequencing, prefetch hints, offload manifests, and
+  bounded microbatch sizing. `stdlib/llm_tiered_store.sapp` is the corresponding
+  executable storage substrate: it reads layer and MoE-expert shards on demand,
+  verifies exact length and SHA-256, confines Linux reads beneath no-follow directory
+  handles, enforces an explicit precision contract and RAM/entry budgets, evicts with
+  LFU-recency, learns hot experts from routing events, queues look-ahead prefetches,
+  and fails over across deterministic weighted mirrors. Placement never changes model
+  precision or router semantics. Prefetch I/O is synchronous and tensor/GPU transfer
+  remains a separate backend; this is not a claim that full GPU inference is complete.
+  Locked by `tests/semantics/llm_max_foundation_test.sapp` and
+  `tests/semantics/llm_tiered_store_test.sapp`. These are generic pblang libraries;
   the pbAI-Max product lives outside pblang in `AAP/ai/pbai`.
 - **Resource use note (today)** — pbAI-Max continuation now uses pblang `spawn`/`join`
   to evaluate independent candidates in parallel: quick screening workers run first,
@@ -354,7 +361,8 @@ format, weight format, decoder block interface, sampling API, model metadata, be
 suite, and golden tests. This has started in pblang with `llm_core.sapp`,
 `llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, and the scale-up modules
 listed above, including the new `llm_binary.sapp` bit-level token substrate,
-`llm_offload.sapp` low-memory inference planning, and live-mutable architecture hooks.
+`llm_offload.sapp` low-memory inference planning, the integrity-checked
+`llm_tiered_store.sapp` layer/MoE shard runtime, and live-mutable architecture hooks.
 pblang keeps the reusable foundation and Nano path; the
 pbAI-Max product module, training policy, corpora, and tier metadata live in
 `AAP/ai/pbai`. Existing checkpoints are used only to compare quality and speed.
@@ -363,7 +371,7 @@ pbAI-Max product module, training policy, corpora, and tier metadata live in
 
 | Phase | Goal |
 |-------|------|
-| **P0 — Fresh inference contract** | Started: `llm_core.sapp`, `llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, `llm_attention.sapp`, `llm_train.sapp`, `llm_stream.sapp`, `llm_weights.sapp`, `llm_tokenizer_train.sapp`, `llm_eval.sapp`, `llm_quant.sapp`, `llm_binary.sapp`, `llm_offload.sapp`, and semantic tests define tokenizer/data/decoder/sampling/checkpoint/training/eval/binary-token/live-architecture/feedback/guessing-loop/low-memory-offload primitives. No old checkpoint defines this contract. |
+| **P0 — Fresh inference contract** | Started: `llm_core.sapp`, `llm_tokenizer.sapp`, `llm_data.sapp`, `llm_transformer.sapp`, `llm_attention.sapp`, `llm_train.sapp`, `llm_stream.sapp`, `llm_weights.sapp`, `llm_tokenizer_train.sapp`, `llm_eval.sapp`, `llm_quant.sapp`, `llm_binary.sapp`, `llm_offload.sapp`, `llm_tiered_store.sapp`, and semantic tests define tokenizer/data/decoder/sampling/checkpoint/training/eval/binary-token/live-architecture/feedback/guessing-loop/low-memory layer and MoE shard primitives. No old checkpoint defines this contract. |
 | **P1 — pbAI-Nano/-Mini** | Train the first fresh tiny + small models for pblang completion/debugging on pblang/code data plus selected external corpora; benchmark accuracy, latency, memory, and tokens/sec; lock with drift tests. |
 | **P2 — Agent loop + tools** | Wire the plan→act→verify loop to `frontend_run`, the lint/typeck oracles, and the pb-mcp-server tool catalog. |
 | **P3 — pbAI-Max + distillation** | Train/assemble the new flagship on the full curated corpus; stand up the distillation pipeline that produces consistent Pro/Mini/Nano sub-models from pbAI-Max. |

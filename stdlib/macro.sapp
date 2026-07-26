@@ -36,6 +36,41 @@ fn define_template(reg, name, params, body) {
     return reg;
 }
 
+fn _valid_ident(name) {
+    if type(name) != "string" or name == "" or len(name) > 128 { return false; }
+    let i = 0;
+    while i < len(name) {
+        let code = strcharcodeat(name, i);
+        let alpha = (code >= 97 and code <= 122) or (code >= 65 and code <= 90) or code == 95;
+        let digit = code >= 48 and code <= 57;
+        if not alpha and not (i > 0 and digit) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _callable(value) {
+    let kind = type(value);
+    return kind == "fn" or kind == "closure" or kind == "function" or kind == "builtin";
+}
+
+// Custom compile-time source expander. This is the library-level equivalent of
+// Crystal's macro methods: the callback receives immutable argument text plus a
+// hygienic gensym context and returns generated PBLang source.
+fn define_expander(reg, name, min_args, max_args, expander) {
+    if reg == nil { reg = registry(); }
+    if not _valid_ident(name) { throw "macro.define_expander: invalid name"; }
+    if type(min_args) != "number" or type(max_args) != "number" or min_args < 0
+        or min_args != num_floor(min_args) or max_args < min_args or max_args > 64
+        or max_args != num_floor(max_args) {
+        throw "macro.define_expander: argument bounds must satisfy 0 <= min <= max <= 64";
+    }
+    if not _callable(expander) { throw "macro.define_expander: expander must be callable"; }
+    reg.rules[name] = map{ kind: "expander", name: name, min_args: min_args,
+        max_args: max_args, expander: expander };
+    return reg;
+}
+
 fn has_macro(reg, name) {
     if reg == nil { return false; }
     let rule = try reg.rules[name] catch nil;
@@ -73,6 +108,20 @@ fn expand_call(reg, name, args = nil) {
         args = [];
     }
 
+    if rule.kind == "expander" {
+        if len(args) < rule.min_args or len(args) > rule.max_args {
+            return error("macro.expand_call: '" + name + "' expects " + str(rule.min_args)
+                + ".." + str(rule.max_args) + " arguments, got " + str(len(args)));
+        }
+        let clean = [];
+        let i = 0;
+        while i < len(args) { array_push(clean, str_trim(args[i])); i = i + 1; }
+        let generated = try rule.expander(clean, map{ gensym: gensym(reg, "__pb_macro"), name: name }) catch nil;
+        if type(generated) != "string" { return error("macro.expand_call: expander '" + name + "' failed"); }
+        if len(str_to_bytes(generated)) > 1048576 { return error("macro.expand_call: generated source exceeds 1 MiB"); }
+        return generated;
+    }
+
     let ctx = map{};
     for i len(rule.params) {
         let value = "";
@@ -83,6 +132,29 @@ fn expand_call(reg, name, args = nil) {
     }
     ctx["gensym"] = gensym(reg, "__pb_macro");
     return expand_template(rule.body, ctx);
+}
+
+fn _record_expander(args, context) {
+    let constructor = args[0];
+    if not _valid_ident(constructor) { throw "record macro: invalid constructor name"; }
+    let seen = map{}; let fields = []; let i = 1;
+    while i < len(args) {
+        let field = args[i];
+        if not _valid_ident(field) or map_has(seen, field) { throw "record macro: invalid or duplicate field"; }
+        seen[field] = true; array_push(fields, field); i = i + 1;
+    }
+    let out = ["fn ", constructor, "(", str_join(fields, ", "), ") { return map{ __type: \"",
+        constructor, "\""];
+    i = 0;
+    while i < len(fields) { array_push(out, ", " + fields[i] + ": " + fields[i]); i = i + 1; }
+    array_push(out, " }; }");
+    return str_join(out, "");
+}
+
+// Install @record(constructor, field...) generation. It produces a lightweight,
+// typed-by-tag map constructor while retaining normal map interoperability.
+fn install_record_macro(reg, name = "record") {
+    return define_expander(reg, name, 2, 64, _record_expander);
 }
 
 fn parse_args(s) {
@@ -210,26 +282,64 @@ fn _read_macro_call(line) {
     };
 }
 
-fn expand_source(reg, source) {
+fn _expand_once(reg, source, max_output_bytes) {
     if source == nil or source == "" {
-        return "";
+        return map{ source: "", expansions: 0 };
     }
 
     let lines = str_split(source, "\n");
-    let out = "";
+    let out = [];
+    let expansions = 0;
     for i len(lines) {
         let line = lines[i];
         let call = _read_macro_call(line);
         if call != nil and has_macro(reg, call.name) {
-            out = out + expand_call(reg, call.name, call.args);
+            let generated = expand_call(reg, call.name, call.args);
+            if type(generated) != "string" { throw "macro expansion failed: " + call.name; }
+            array_push(out, generated); expansions = expansions + 1;
         } else {
-            out = out + line;
+            array_push(out, line);
         }
         if i + 1 < len(lines) {
-            out = out + "\n";
+            array_push(out, "\n");
         }
     }
-    return out;
+    let result = str_join(out, "");
+    if len(str_to_bytes(result)) > max_output_bytes { throw "macro expansion output limit exceeded"; }
+    return map{ source: result, expansions: expansions };
+}
+
+// Re-expand generated macro calls until stable, with strict source/output/pass
+// budgets. This enables macro composition without unbounded recursive expansion.
+fn expand_source_bounded(reg, source, options = nil) {
+    if reg == nil { throw "macro.expand_source_bounded: registry is nil"; }
+    if type(source) != "string" { throw "macro.expand_source_bounded: source must be text"; }
+    if options != nil and type(options) != "map" { throw "macro.expand_source_bounded: options must be a map"; }
+    let max_source = if options != nil and map_has(options, "max_source_bytes") { options.max_source_bytes } else { 1048576 };
+    let max_output = if options != nil and map_has(options, "max_output_bytes") { options.max_output_bytes } else { 1048576 };
+    let max_passes = if options != nil and map_has(options, "max_passes") { options.max_passes } else { 8 };
+    if type(max_source) != "number" or max_source < 1 or max_source > 16777216 or max_source != num_floor(max_source)
+        or type(max_output) != "number" or max_output < 1 or max_output > 16777216 or max_output != num_floor(max_output)
+        or type(max_passes) != "number" or max_passes < 1 or max_passes > 32 or max_passes != num_floor(max_passes) {
+        throw "macro.expand_source_bounded: invalid resource limits";
+    }
+    if len(str_to_bytes(source)) > max_source { throw "macro expansion source limit exceeded"; }
+    let current = source; let pass = 0; let total = 0;
+    while pass < max_passes {
+        let result = _expand_once(reg, current, max_output);
+        total = total + result.expansions; pass = pass + 1;
+        if result.expansions == 0 or result.source == current {
+            return map{ source: result.source, passes: pass, expansions: total, stable: true };
+        }
+        current = result.source;
+    }
+    let probe = _expand_once(reg, current, max_output);
+    if probe.expansions > 0 and probe.source != current { throw "macro expansion did not converge within max_passes"; }
+    return map{ source: current, passes: pass, expansions: total, stable: true };
+}
+
+fn expand_source(reg, source) {
+    return expand_source_bounded(reg, source).source;
 }
 
 fn analyze_generated(source) {
@@ -237,5 +347,6 @@ fn analyze_generated(source) {
     return frontend.frontend_parse_full(source);
 }
 
-export registry, gensym, define_template, has_macro, macro_names,
-       expand_template, expand_call, parse_args, expand_source, analyze_generated;
+export registry, gensym, define_template, define_expander, install_record_macro,
+       has_macro, macro_names, expand_template, expand_call, parse_args,
+       expand_source, expand_source_bounded, analyze_generated;

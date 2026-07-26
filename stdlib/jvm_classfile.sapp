@@ -1,0 +1,434 @@
+// Minimal, bounded JVM class-file emitter written in PBLang.
+//
+// This is intentionally a binary construction library, not a Java source
+// generator. It is sufficient for small Android/JVM launchers while keeping
+// every authored implementation in PBLang. Version 49 class files avoid
+// mandatory StackMapTable attributes and are accepted by Android D8.
+
+let MAX_POOL_ENTRIES = 4096;
+let MAX_FIELDS = 256;
+let MAX_METHODS = 256;
+let MAX_CODE_BYTES = 1048576;
+let MAX_UTF8_BYTES = 65535;
+let MAX_EXCEPTION_HANDLERS = 256;
+
+fn _need_uint(value, max, label) {
+    if type(value) != "number" or value < 0 or value > max or num_floor(value) != value {
+        throw "jvm_classfile: invalid " + label;
+    }
+    return value;
+}
+
+fn _u1(value) { return [_need_uint(value, 255, "u1")]; }
+fn _u2(value) {
+    let n = _need_uint(value, 65535, "u2");
+    return [num_floor(n / 256), num_mod(n, 256)];
+}
+fn _u4(value) {
+    let n = _need_uint(value, 4294967295, "u4");
+    return [num_floor(n / 16777216), num_mod(num_floor(n / 65536), 256),
+            num_mod(num_floor(n / 256), 256), num_mod(n, 256)];
+}
+fn _append(dst, src) {
+    let i = 0;
+    while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+
+fn _continuation(value) { return value >= 128 and value <= 191; }
+
+fn _modified_utf8(value, label) {
+    if type(value) != "string" { throw "jvm_classfile: " + label + " must be a string"; }
+    let source = str_to_bytes(value); let out = []; let i = 0;
+    while i < len(source) {
+        let first = source[i]; let scalar = 0; let width = 0;
+        if first <= 127 {
+            scalar = first; width = 1;
+        } elif first >= 194 and first <= 223 and i + 1 < len(source)
+            and _continuation(source[i + 1]) {
+            scalar = (first - 192) * 64 + source[i + 1] - 128; width = 2;
+        } elif first >= 224 and first <= 239 and i + 2 < len(source)
+            and _continuation(source[i + 1]) and _continuation(source[i + 2]) {
+            scalar = (first - 224) * 4096 + (source[i + 1] - 128) * 64
+                + source[i + 2] - 128;
+            if scalar < 2048 or (scalar >= 55296 and scalar <= 57343) {
+                throw "jvm_classfile: " + label + " contains invalid UTF-8";
+            }
+            width = 3;
+        } elif first >= 240 and first <= 244 and i + 3 < len(source)
+            and _continuation(source[i + 1]) and _continuation(source[i + 2])
+            and _continuation(source[i + 3]) {
+            scalar = (first - 240) * 262144 + (source[i + 1] - 128) * 4096
+                + (source[i + 2] - 128) * 64 + source[i + 3] - 128;
+            if scalar < 65536 or scalar > 1114111 {
+                throw "jvm_classfile: " + label + " contains invalid UTF-8";
+            }
+            width = 4;
+        } else {
+            throw "jvm_classfile: " + label + " contains invalid UTF-8";
+        }
+        if scalar == 0 {
+            _append(out, [192, 128]);
+        } elif scalar <= 127 {
+            array_push(out, scalar);
+        } elif scalar <= 2047 {
+            _append(out, [192 + num_floor(scalar / 64), 128 + num_mod(scalar, 64)]);
+        } elif scalar <= 65535 {
+            _append(out, [224 + num_floor(scalar / 4096),
+                128 + num_mod(num_floor(scalar / 64), 64),
+                128 + num_mod(scalar, 64)]);
+        } else {
+            let pair = scalar - 65536;
+            let high = 55296 + num_floor(pair / 1024);
+            let low = 56320 + num_mod(pair, 1024);
+            _append(out, [224 + num_floor(high / 4096),
+                128 + num_mod(num_floor(high / 64), 64),
+                128 + num_mod(high, 64),
+                224 + num_floor(low / 4096),
+                128 + num_mod(num_floor(low / 64), 64),
+                128 + num_mod(low, 64)]);
+        }
+        if len(out) > MAX_UTF8_BYTES {
+            throw "jvm_classfile: invalid " + label + " length";
+        }
+        i = i + width;
+    }
+    return out;
+}
+
+fn _intern(builder, key, entry) {
+    if map_has(builder.index, key) { return builder.index[key]; }
+    if len(builder.pool) >= MAX_POOL_ENTRIES { throw "jvm_classfile: constant pool limit exceeded"; }
+    array_push(builder.pool, entry);
+    let idx = len(builder.pool);
+    builder.index[key] = idx;
+    return idx;
+}
+
+fn utf8(builder, value) {
+    let bytes = _modified_utf8(value, "constant-pool UTF-8");
+    return _intern(builder, "u|" + value, map{ kind: 1, bytes: bytes });
+}
+
+fn class_ref(builder, name) {
+    let ni = utf8(builder, name);
+    return _intern(builder, "c|" + name, map{ kind: 7, name: ni });
+}
+
+fn string_ref(builder, value) {
+    let si = utf8(builder, value);
+    return _intern(builder, "s|" + value, map{ kind: 8, string: si });
+}
+
+fn integer_ref(builder, value) {
+    if type(value) != "number" or num_floor(value) != value
+        or value < -2147483648 or value > 2147483647 {
+        throw "jvm_classfile: invalid signed 32-bit integer";
+    }
+    let encoded = if value < 0 { 4294967296 + value } else { value };
+    return _intern(builder, "i|" + str(value), map{ kind: 3, value: encoded });
+}
+
+fn name_type(builder, name, descriptor) {
+    let ni = utf8(builder, name); let di = utf8(builder, descriptor);
+    return _intern(builder, "n|" + name + "|" + descriptor,
+        map{ kind: 12, name: ni, descriptor: di });
+}
+
+fn method_ref(builder, owner, name, descriptor) {
+    let ci = class_ref(builder, owner); let nti = name_type(builder, name, descriptor);
+    return _intern(builder, "m|" + owner + "|" + name + "|" + descriptor,
+        map{ kind: 10, class_index: ci, name_type: nti });
+}
+
+fn field_ref(builder, owner, name, descriptor) {
+    let ci = class_ref(builder, owner); let nti = name_type(builder, name, descriptor);
+    return _intern(builder, "f|" + owner + "|" + name + "|" + descriptor,
+        map{ kind: 9, class_index: ci, name_type: nti });
+}
+
+fn new_class(name, super_name = "java/lang/Object") {
+    let builder = map{ format: "pblang.jvm.class.v1", pool: [], index: map{}, interfaces: [], fields: [], methods: [],
+        access: 33, major: 49, minor: 0, this_class: 0, super_class: 0, code_name: 0 };
+    builder.this_class = class_ref(builder, name);
+    builder.super_class = class_ref(builder, super_name);
+    builder.code_name = utf8(builder, "Code");
+    return builder;
+}
+
+fn add_field(builder, access, name, descriptor) {
+    if type(builder) != "map" or (try builder.format catch "") != "pblang.jvm.class.v1" {
+        throw "jvm_classfile: invalid builder";
+    }
+    if len(builder.fields) >= MAX_FIELDS { throw "jvm_classfile: field limit exceeded"; }
+    _need_uint(access, 65535, "field access");
+    array_push(builder.fields, map{ access: access, name: utf8(builder, name),
+        descriptor: utf8(builder, descriptor) });
+    return len(builder.fields) - 1;
+}
+
+fn add_interface(builder, name) {
+    if type(builder) != "map" or (try builder.format catch "") != "pblang.jvm.class.v1" {
+        throw "jvm_classfile: invalid builder";
+    }
+    if len(builder.interfaces) >= 256 { throw "jvm_classfile: interface limit exceeded"; }
+    let reference = class_ref(builder, name);
+    let i = 0;
+    while i < len(builder.interfaces) {
+        if builder.interfaces[i] == reference { return reference; }
+        i = i + 1;
+    }
+    array_push(builder.interfaces, reference);
+    return reference;
+}
+
+fn add_method(builder, access, name, descriptor, max_stack, max_locals, code) {
+    if len(builder.methods) >= MAX_METHODS { throw "jvm_classfile: method limit exceeded"; }
+    _need_uint(access, 65535, "method access");
+    _need_uint(max_stack, 65535, "max stack");
+    _need_uint(max_locals, 65535, "max locals");
+    let exceptions = [];
+    if type(code) == "map" and (try code.format catch "") == "pblang.jvm.method-code.v1" {
+        exceptions = code.exceptions;
+        code = code.code;
+    }
+    if type(code) != "array" or len(code) > MAX_CODE_BYTES { throw "jvm_classfile: invalid method code"; }
+    let i = 0; while i < len(code) { _need_uint(code[i], 255, "opcode byte"); i = i + 1; }
+    if type(exceptions) != "array" or len(exceptions) > MAX_EXCEPTION_HANDLERS {
+        throw "jvm_classfile: invalid exception table";
+    }
+    let normalized = []; i = 0;
+    while i < len(exceptions) {
+        let item = exceptions[i];
+        if type(item) != "map" { throw "jvm_classfile: invalid exception handler"; }
+        let start_pc = _need_uint(try item.start_pc catch nil, 65535, "exception start");
+        let end_pc = _need_uint(try item.end_pc catch nil, 65535, "exception end");
+        let handler_pc = _need_uint(try item.handler_pc catch nil, 65535, "exception handler");
+        if start_pc >= end_pc or end_pc > len(code) or handler_pc >= len(code) {
+            throw "jvm_classfile: invalid exception handler range";
+        }
+        let catch_name = try item.catch_type catch nil;
+        let catch_index = 0;
+        if catch_name != nil {
+            if type(catch_name) != "string" or catch_name == "" {
+                throw "jvm_classfile: invalid exception catch type";
+            }
+            catch_index = class_ref(builder, catch_name);
+        }
+        array_push(normalized, map{ start_pc: start_pc, end_pc: end_pc,
+            handler_pc: handler_pc, catch_type: catch_index });
+        i = i + 1;
+    }
+    array_push(builder.methods, map{ access: access, name: utf8(builder, name),
+        descriptor: utf8(builder, descriptor), max_stack: max_stack,
+        max_locals: max_locals, code: code, exceptions: normalized });
+    return len(builder.methods) - 1;
+}
+
+fn insn_u2(opcode, operand) {
+    let out = _u1(opcode); _append(out, _u2(operand)); return out;
+}
+
+fn code_builder() {
+    return map{ format: "pblang.jvm.code.v1", bytes: [], labels: map{}, patches: [] };
+}
+
+fn _code(code) {
+    if type(code) != "map" or (try code.format catch "") != "pblang.jvm.code.v1" {
+        throw "jvm_classfile: invalid code builder";
+    }
+}
+
+fn emit(code, bytes) {
+    _code(code);
+    if type(bytes) == "number" {
+        if len(code.bytes) >= MAX_CODE_BYTES { throw "jvm_classfile: method code limit exceeded"; }
+        array_push(code.bytes, _need_uint(bytes, 255, "opcode byte"));
+        return code;
+    }
+    if type(bytes) != "array" { throw "jvm_classfile: emitted code must be a byte or byte array"; }
+    if len(code.bytes) > MAX_CODE_BYTES - len(bytes) { throw "jvm_classfile: method code limit exceeded"; }
+    let i = 0;
+    while i < len(bytes) { array_push(code.bytes, _need_uint(bytes[i], 255, "opcode byte")); i = i + 1; }
+    return code;
+}
+
+fn _local(code, slot, compact_base, opcode, label) {
+    let index = _need_uint(slot, 255, label + " local slot");
+    if index <= 3 { emit(code, compact_base + index); }
+    else { emit(code, [opcode, index]); }
+    return code;
+}
+
+// Typed JVM instruction helpers keep backend code from hand-encoding local
+// slots and signed operands. The narrow form is deliberate: WIDE locals are
+// excluded so generated launcher methods retain a small, predictable frame.
+fn emit_iload(code, slot) { return _local(code, slot, 26, 21, "iload"); }
+fn emit_istore(code, slot) { return _local(code, slot, 59, 54, "istore"); }
+fn emit_aload(code, slot) { return _local(code, slot, 42, 25, "aload"); }
+fn emit_astore(code, slot) { return _local(code, slot, 75, 58, "astore"); }
+
+fn emit_iinc(code, slot, amount) {
+    let index = _need_uint(slot, 255, "iinc local slot");
+    if type(amount) != "number" or num_floor(amount) != amount or amount < -128 or amount > 127 {
+        throw "jvm_classfile: invalid signed iinc amount";
+    }
+    emit(code, [132, index, if amount < 0 { 256 + amount } else { amount }]);
+    return code;
+}
+
+fn emit_newarray(code, atype) {
+    let kind = _need_uint(atype, 255, "newarray type");
+    // JVM primitive-array type tags: boolean, char, float, double, byte,
+    // short, int and long. Reference arrays use anewarray instead.
+    if kind < 4 or kind > 11 { throw "jvm_classfile: invalid primitive newarray type"; }
+    emit(code, [188, kind]);
+    return code;
+}
+
+fn mark(code, name) {
+    _code(code);
+    let label = str(name);
+    if label == "" or len(label) > 128 { throw "jvm_classfile: invalid branch label"; }
+    if map_has(code.labels, label) { throw "jvm_classfile: duplicate branch label " + label; }
+    code.labels[label] = len(code.bytes);
+    return code;
+}
+
+fn branch(code, opcode, label_value) {
+    _code(code);
+    let branch_opcode = _need_uint(opcode, 255, "branch opcode");
+    if not ((branch_opcode >= 153 and branch_opcode <= 168)
+        or branch_opcode == 198 or branch_opcode == 199) {
+        throw "jvm_classfile: opcode does not use a signed 16-bit branch offset";
+    }
+    let label = str(label_value);
+    if label == "" or len(label) > 128 { throw "jvm_classfile: invalid branch label"; }
+    let position = len(code.bytes);
+    emit(code, [branch_opcode, 0, 0]);
+    array_push(code.patches, map{ position: position, label: label });
+    return code;
+}
+
+fn finish_code(code) {
+    _code(code);
+    let out = []; _append(out, code.bytes);
+    let i = 0;
+    while i < len(code.patches) {
+        let patch = code.patches[i];
+        if type(patch) != "map" or type(try patch.position catch nil) != "number"
+            or patch.position < 0 or num_floor(patch.position) != patch.position
+            or patch.position + 2 >= len(out) or type(try patch.label catch nil) != "string" {
+            throw "jvm_classfile: invalid branch patch";
+        }
+        if not map_has(code.labels, patch.label) { throw "jvm_classfile: unresolved branch label " + patch.label; }
+        let target = code.labels[patch.label];
+        if type(target) != "number" or target < 0 or target > len(out)
+            or num_floor(target) != target {
+            throw "jvm_classfile: invalid branch target";
+        }
+        let offset = target - patch.position;
+        if offset < -32768 or offset > 32767 { throw "jvm_classfile: branch offset exceeds signed 16-bit range"; }
+        let encoded = if offset < 0 { 65536 + offset } else { offset };
+        out[patch.position + 1] = num_floor(encoded / 256);
+        out[patch.position + 2] = num_mod(encoded, 256);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn finish_method_code(code, handlers = nil) {
+    _code(code);
+    if handlers == nil { handlers = []; }
+    if type(handlers) != "array" or len(handlers) > MAX_EXCEPTION_HANDLERS {
+        throw "jvm_classfile: invalid exception handlers";
+    }
+    let bytes = finish_code(code); let exceptions = []; let i = 0;
+    while i < len(handlers) {
+        let item = handlers[i];
+        if type(item) != "map" { throw "jvm_classfile: invalid exception handler"; }
+        let start_label = str(try item.start catch "");
+        let end_label = str(try item.end catch "");
+        let handler_label = str(try item.handler catch "");
+        if not map_has(code.labels, start_label) or not map_has(code.labels, end_label)
+            or not map_has(code.labels, handler_label) {
+            throw "jvm_classfile: unresolved exception handler label";
+        }
+        let start_pc = code.labels[start_label]; let end_pc = code.labels[end_label];
+        let handler_pc = code.labels[handler_label];
+        if start_pc >= end_pc or end_pc > len(bytes) or handler_pc >= len(bytes) {
+            throw "jvm_classfile: invalid exception handler range";
+        }
+        let catch_type = try item.catch_type catch nil;
+        if catch_type != nil and (type(catch_type) != "string" or catch_type == "") {
+            throw "jvm_classfile: invalid exception catch type";
+        }
+        array_push(exceptions, map{ start_pc: start_pc, end_pc: end_pc,
+            handler_pc: handler_pc, catch_type: catch_type });
+        i = i + 1;
+    }
+    return map{ format: "pblang.jvm.method-code.v1", code: bytes,
+        exceptions: exceptions };
+}
+
+fn _emit_pool_entry(out, entry) {
+    _append(out, _u1(entry.kind));
+    if entry.kind == 1 { _append(out, _u2(len(entry.bytes))); _append(out, entry.bytes); }
+    elif entry.kind == 3 { _append(out, _u4(entry.value)); }
+    elif entry.kind == 7 { _append(out, _u2(entry.name)); }
+    elif entry.kind == 8 { _append(out, _u2(entry.string)); }
+    elif entry.kind == 9 or entry.kind == 10 { _append(out, _u2(entry.class_index)); _append(out, _u2(entry.name_type)); }
+    elif entry.kind == 12 { _append(out, _u2(entry.name)); _append(out, _u2(entry.descriptor)); }
+    else { throw "jvm_classfile: unsupported constant-pool entry"; }
+}
+
+fn finish(builder) {
+    if type(builder) != "map" or (try builder.format catch "") != "pblang.jvm.class.v1" {
+        throw "jvm_classfile: invalid builder";
+    }
+    let out = [202, 254, 186, 190];
+    _append(out, _u2(builder.minor)); _append(out, _u2(builder.major));
+    _append(out, _u2(len(builder.pool) + 1));
+    let i = 0; while i < len(builder.pool) { _emit_pool_entry(out, builder.pool[i]); i = i + 1; }
+    _append(out, _u2(builder.access)); _append(out, _u2(builder.this_class));
+    _append(out, _u2(builder.super_class));
+    _append(out, _u2(len(builder.interfaces)));
+    let ii = 0;
+    while ii < len(builder.interfaces) { _append(out, _u2(builder.interfaces[ii])); ii = ii + 1; }
+    _append(out, _u2(len(builder.fields)));
+    i = 0;
+    while i < len(builder.fields) {
+        let field = builder.fields[i];
+        _append(out, _u2(field.access)); _append(out, _u2(field.name));
+        _append(out, _u2(field.descriptor)); _append(out, _u2(0));
+        i = i + 1;
+    }
+    _append(out, _u2(len(builder.methods)));
+    i = 0;
+    while i < len(builder.methods) {
+        let m = builder.methods[i];
+        _append(out, _u2(m.access)); _append(out, _u2(m.name)); _append(out, _u2(m.descriptor));
+        _append(out, _u2(1)); _append(out, _u2(builder.code_name));
+        _append(out, _u4(12 + len(m.code) + len(m.exceptions) * 8));
+        _append(out, _u2(m.max_stack)); _append(out, _u2(m.max_locals));
+        _append(out, _u4(len(m.code))); _append(out, m.code);
+        _append(out, _u2(len(m.exceptions)));
+        let ei = 0;
+        while ei < len(m.exceptions) {
+            let exception = m.exceptions[ei];
+            _append(out, _u2(exception.start_pc)); _append(out, _u2(exception.end_pc));
+            _append(out, _u2(exception.handler_pc)); _append(out, _u2(exception.catch_type));
+            ei = ei + 1;
+        }
+        _append(out, _u2(0)); // nested code attributes
+        i = i + 1;
+    }
+    _append(out, _u2(0)); // class attributes
+    return out;
+}
+
+export MAX_POOL_ENTRIES, MAX_FIELDS, MAX_METHODS, MAX_CODE_BYTES, MAX_EXCEPTION_HANDLERS;
+export new_class, utf8, class_ref, string_ref, integer_ref, name_type, method_ref, field_ref;
+export add_interface, add_field, add_method, insn_u2, finish;
+export code_builder, emit, mark, branch, finish_code, finish_method_code;
+export emit_iload, emit_istore, emit_aload, emit_astore, emit_iinc, emit_newarray;

@@ -253,16 +253,45 @@ fn inline_source(main_src, resolve) {
 // _read_module(p) — read a module's source, resolving the `stdlib:X` alias (an import of the
 // pblang stdlib) to a real file. The direct path is tried first; on a `stdlib:` prefix we try
 // $PBLANG_STDLIB_DIR then the usual sibling-checkout relative layouts. nil if unresolvable.
+fn _safe_stdlib_rest(rest) {
+    if rest == "" or str_starts_with(rest, "/") or _contains(rest, "\\") or _contains(rest, ":") {
+        return false;
+    }
+    let parts = str_split(rest, "/"); let i = 0;
+    while i < len(parts) {
+        if parts[i] == "" or parts[i] == "." or parts[i] == ".." { return false; }
+        let j = 0;
+        while j < len(parts[i]) {
+            let code = strcharcodeat(parts[i], j);
+            if code < 32 or code == 127 { return false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _stdlib_candidates(rest) {
+    if not _safe_stdlib_rest(rest) { return []; }
+    let cands = [];
+    let dir = try env_get("PBLANG_STDLIB_DIR") catch nil;
+    if dir != nil and dir != "" { push(cands, str(dir) + "/" + rest); }
+    // Common AAP layouts: caller in products/<product>, products/pblang itself,
+    // or an older pl-dev checkout. All candidates are fixed roots plus a
+    // traversal-free stdlib-relative suffix.
+    push(cands, "../pblang/stdlib/" + rest);
+    push(cands, "../../pblang/stdlib/" + rest);
+    push(cands, "../../pl-dev/pblang/stdlib/" + rest);
+    push(cands, "../../../pl-dev/pblang/stdlib/" + rest);
+    return cands;
+}
+
 fn _read_module(p) {
     let direct = try bytes_to_str(fs_read_bytes(p)) catch nil;
     if direct != nil { return direct; }
     if len(p) > 7 and str_slice(p, 0, 7) == "stdlib:" {
         let rest = str_slice(p, 7, len(p));
-        let cands = [];
-        let dir = try env_get("PBLANG_STDLIB_DIR") catch nil;
-        if dir != nil and dir != "" { push(cands, str(dir) + "/" + rest); }
-        push(cands, "../../pl-dev/pblang/stdlib/" + rest);
-        push(cands, "../../../pl-dev/pblang/stdlib/" + rest);
+        let cands = _stdlib_candidates(rest);
         let i = 0;
         while i < len(cands) {
             let s = try bytes_to_str(fs_read_bytes(cands[i])) catch nil;
@@ -275,11 +304,7 @@ fn _read_module(p) {
     // stdlib dir, exactly like the interpreter roots bare `stdlib/...` there.
     if len(p) > 7 and str_slice(p, 0, 7) == "stdlib/" {
         let rest = str_slice(p, 7, len(p));
-        let cands = [];
-        let dir = try env_get("PBLANG_STDLIB_DIR") catch nil;
-        if dir != nil and dir != "" { push(cands, str(dir) + "/" + rest); }
-        push(cands, "../../pl-dev/pblang/stdlib/" + rest);
-        push(cands, "../../../pl-dev/pblang/stdlib/" + rest);
+        let cands = _stdlib_candidates(rest);
         let i = 0;
         while i < len(cands) {
             let s = try bytes_to_str(fs_read_bytes(cands[i])) catch nil;
@@ -405,29 +430,35 @@ fn _in_scopes(scopes, id) {
 // that references a top-level const is left unprefixed and would fail to COMPILE loudly (not a
 // silent miscompile) — acceptable, and absent in the target code.
 fn _transform_prefixed(src, prefix, var2pref, tl) {
-    let out = ""; let n = len(src); let i = 0; let depth = 0;
+    // Appending to one immutable string for every token/character makes this
+    // pass quadratic on compiler-sized modules. Accumulate slices and join once.
+    let out = []; let n = len(src); let i = 0; let depth = 0;
     let scopes = [ map{} ];
     let pending = map{}; let have_pending = false;
+    let preserve_builtin_alias = "";
     while i < n {
         let c = str_slice(src, i, i + 1);
         let c2 = ""; if i + 1 < n { c2 = str_slice(src, i + 1, i + 2); }
         if c == "\"" {
-            out = out + c; i = i + 1; let go = true;
+            let chunk_start = i; i = i + 1; let go = true;
             while go and i < n {
                 let d = str_slice(src, i, i + 1);
-                if d == "\\" and i + 1 < n { out = out + d + str_slice(src, i + 1, i + 2); i = i + 2; }
-                else { out = out + d; i = i + 1; if d == "\"" { go = false; } }
+                if d == "\\" and i + 1 < n { i = i + 2; }
+                else { i = i + 1; if d == "\"" { go = false; } }
             }
+            array_push(out, str_slice(src, chunk_start, i));
         } else if c == "/" and c2 == "/" {
-            let go = true;
-            while go and i < n { let d = str_slice(src, i, i + 1); out = out + d; i = i + 1; if d == "\n" { go = false; } }
+            let chunk_start = i;
+            while i < n and str_slice(src, i, i + 1) != "\n" { i = i + 1; }
+            if i < n { i = i + 1; }
+            array_push(out, str_slice(src, chunk_start, i));
         } else if c == "/" and c2 == "*" {
-            out = out + c + c2; i = i + 2; let go = true;
+            let chunk_start = i; i = i + 2; let go = true;
             while go and i < n {
-                let d = str_slice(src, i, i + 1);
-                if d == "*" and i + 1 < n and str_slice(src, i + 1, i + 2) == "/" { out = out + "*/"; i = i + 2; go = false; }
-                else { out = out + d; i = i + 1; }
+                if str_slice(src, i, i + 1) == "*" and i + 1 < n and str_slice(src, i + 1, i + 2) == "/" { i = i + 2; go = false; }
+                else { i = i + 1; }
             }
+            array_push(out, str_slice(src, chunk_start, i));
         } else if _is_alpha(c) {
             let start = i;
             let member = false;
@@ -442,20 +473,20 @@ fn _transform_prefixed(src, prefix, var2pref, tl) {
                 // named or anonymous fn: prefix a TOP-LEVEL name; collect params (verbatim) as locals.
                 let k = _skip_spaces(src, i);
                 if k < n and str_slice(src, k, k + 1) == "(" {
-                    out = out + "fn"; i = k;                                  // anonymous
+                    array_push(out, "fn"); i = k;                                  // anonymous
                 } else {
                     let nm = _read_ident(src, k);
-                    if depth == 0 { out = out + "fn " + prefix + nm; }
-                    else { out = out + "fn " + nm; scopes[len(scopes) - 1][nm] = true; }
+                    if depth == 0 { array_push(out, "fn " + prefix + nm); }
+                    else { array_push(out, "fn " + nm); scopes[len(scopes) - 1][nm] = true; }
                     i = k + len(nm);
                 }
                 let pk = _skip_spaces(src, i);
                 if pk < n and str_slice(src, pk, pk + 1) == "(" {
-                    out = out + str_slice(src, i, pk);                        // spaces before '('
+                    array_push(out, str_slice(src, i, pk));                   // spaces before '('
                     pending = map{};
                     let ep = _collect_params(src, pk, pending);              // fills params, returns index past ')'
                     have_pending = true;
-                    out = out + str_slice(src, pk, ep);                       // emit param list verbatim
+                    array_push(out, str_slice(src, pk, ep));                  // emit param list verbatim
                     i = ep;
                 }
             } else if (id == "let" or id == "const") and (not member) {
@@ -469,30 +500,42 @@ fn _transform_prefixed(src, prefix, var2pref, tl) {
                 }
                 if depth == 0 {
                     if is_imp { i = _to_semi(src, i); }
-                    else { out = out + id + " " + prefix + nm; i = k + len(nm); }
+                    else {
+                        // `let cwd = cwd` exports a host builtin under a module
+                        // member. Prefix the binding, but never turn its RHS
+                        // into a self-reference (`let __pbi_cwd = __pbi_cwd`).
+                        let eq = _skip_spaces(src, k + len(nm));
+                        if _blt.is_builtin_name(nm) and eq < n and str_slice(src, eq, eq + 1) == "=" {
+                            let rhs = _skip_spaces(src, eq + 1);
+                            if _read_ident(src, rhs) == nm { preserve_builtin_alias = nm; }
+                        }
+                        array_push(out, id + " " + prefix + nm); i = k + len(nm);
+                    }
                 } else {
                     // local let: name stays as-is and shadows any top-level with that name.
                     if nm != "" { scopes[len(scopes) - 1][nm] = true; }
-                    out = out + id + " " + nm; i = k + len(nm);
+                    array_push(out, id + " " + nm); i = k + len(nm);
                 }
+            } else if preserve_builtin_alias != "" and id == preserve_builtin_alias {
+                array_push(out, id); preserve_builtin_alias = "";
             } else if (not member) and map_has(var2pref, id) and (not _in_scopes(scopes, id)) {
                 let k = _skip_spaces(src, i);
                 if k < n and str_slice(src, k, k + 1) == "." {
                     let mk = _skip_spaces(src, k + 1);
                     let mnm = _read_ident(src, mk);
-                    out = out + var2pref[id] + mnm; i = mk + len(mnm);
+                    array_push(out, var2pref[id] + mnm); i = mk + len(mnm);
                 } else {
-                    out = out + "\x00BARE\x00";
+                    array_push(out, "\x00BARE\x00");
                 }
             } else if (not member) and map_has(tl, id) and (not _in_scopes(scopes, id)) {
                 let k = _skip_spaces(src, i);
-                if k < n and str_slice(src, k, k + 1) == ":" { out = out + id; }   // map key
-                else { out = out + prefix + id; }
+                if k < n and str_slice(src, k, k + 1) == ":" { array_push(out, id); }   // map key
+                else { array_push(out, prefix + id); }
             } else {
-                out = out + id;
+                array_push(out, id);
             }
         } else if c == "{" {
-            depth = depth + 1; out = out + c; i = i + 1;
+            depth = depth + 1; array_push(out, c); i = i + 1;
             let sc = map{};
             if have_pending {
                 let pk = map_keys(pending); let pj = 0;
@@ -501,11 +544,21 @@ fn _transform_prefixed(src, prefix, var2pref, tl) {
             }
             array_push(scopes, sc);
         } else if c == "}" {
-            depth = depth - 1; out = out + c; i = i + 1;
+            depth = depth - 1; array_push(out, c); i = i + 1;
             if len(scopes) > 1 { pop(scopes); }
-        } else { out = out + c; i = i + 1; }
+        } else {
+            // Copy punctuation and whitespace as one slice. Only identifiers,
+            // braces, quotes and comments can affect renaming or scope state.
+            let chunk_start = i; i = i + 1; let scanning = true;
+            while scanning and i < n {
+                let d = str_slice(src, i, i + 1);
+                if d == "\"" or d == "{" or d == "}" or d == "/" or _is_alpha(d) { scanning = false; }
+                else { i = i + 1; }
+            }
+            array_push(out, str_slice(src, chunk_start, i));
+        }
     }
-    return out;
+    return str_join(out, "");
 }
 
 // _prep_module(path→prefix): build var2pref for a module from its import bindings.
@@ -522,13 +575,7 @@ fn _var2pref(src, path2pref) {
 
 // inline_source_prefixed(main_src, resolve) — like inline_source but with per-module prefixing,
 // so modules with colliding top-level names link cleanly. Same { ok, source, modules } contract.
-fn inline_source_prefixed(main_src, resolve) {
-    let errbox = map{ err: nil };
-    let reg = map{}; let visiting = map{}; let order = [];
-    for imp in _find_import_bindings(main_src) {
-        _collect(imp.path, resolve, reg, visiting, order, errbox);
-        if errbox.err != nil { return _err(errbox.err); }
-    }
+fn _inline_prefixed_collected(main_src, reg, order) {
     // assign a prefix per module path (dep order)
     let path2pref = map{};
     let idx = 0;
@@ -567,7 +614,17 @@ fn inline_source_prefixed(main_src, resolve) {
     let mbody = _transform_prefixed(main_src, "", _var2pref(main_src, path2pref), mtl);
     if _contains(mbody, "\x00BARE\x00") { return _err("import variable used without .member access (unsupported, in <main>)"); }
     array_push(pieces, mbody);
-    return map{ ok: true, source: str_join(pieces, "\n"), modules: len(order) };
+    return map{ ok: true, source: str_join(pieces, "\n"), modules: len(order), module_order: order };
+}
+
+fn inline_source_prefixed(main_src, resolve) {
+    let errbox = map{ err: nil };
+    let reg = map{}; let visiting = map{}; let order = [];
+    for imp in _find_import_bindings(main_src) {
+        _collect(imp.path, resolve, reg, visiting, order, errbox);
+        if errbox.err != nil { return _err(errbox.err); }
+    }
+    return _inline_prefixed_collected(main_src, reg, order);
 }
 
 fn inline_file_prefixed(main_path) {
@@ -575,6 +632,30 @@ fn inline_file_prefixed(main_path) {
     if src == nil { return _err("cannot read main: " + str(main_path)); }
     fn resolve(p) { return _read_module(p); }
     return inline_source_prefixed(src, resolve);
+}
+
+// Recompute a prior file graph's content identity without running the expensive
+// rename/link pass. Any edit to main or to a previously imported module changes
+// the fingerprint; an added/removed import necessarily changes one of those
+// source hashes and forces graph rediscovery on the next full link.
+fn file_graph_fingerprint(main_path, module_order) {
+    if not is_array(module_order) or len(module_order) > 4096 {
+        return _err("invalid cached module order");
+    }
+    let main_src = _read_module(main_path);
+    if main_src == nil { return _err("cannot read main: " + str(main_path)); }
+    let parts = ["pblang.source.graph.v1", str(main_path), sha256(main_src)];
+    let i = 0;
+    while i < len(module_order) {
+        let path = module_order[i];
+        if not is_string(path) or path == "" { return _err("invalid cached module path"); }
+        let src = _read_module(path);
+        if src == nil { return _err("cannot resolve cached import: " + path); }
+        array_push(parts, path); array_push(parts, sha256(src));
+        i = i + 1;
+    }
+    return map{ ok: true, fingerprint: sha256(str_join(parts, "\n")),
+        modules: len(module_order), module_order: module_order };
 }
 
 // ═══ Bounded product linker ═══════════════════════════════════════════════════
@@ -789,4 +870,4 @@ fn link_modules(main_source, modules, options = nil) {
 }
 
 export inline_source, inline_file, inline_source_prefixed, inline_file_prefixed;
-export link_limits, link_modules;
+export file_graph_fingerprint, link_limits, link_modules;

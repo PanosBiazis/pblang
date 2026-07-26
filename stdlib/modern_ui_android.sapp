@@ -1,0 +1,687 @@
+// Android renderer for stdlib/modern_ui.sapp, authored entirely in PBLang.
+//
+// The renderer emits JVM class bytes directly. Android SDK tools are used only
+// to convert/package/sign the platform artifact; no Java or Kotlin source is
+// generated.
+
+let JVM = import("stdlib:jvm_classfile.sapp");
+
+let MAX_ANDROID_WIDGETS = 96;
+let MAX_ANDROID_BUTTONS = 32;
+let MAX_ANDROID_TEXT = 4096;
+let DEFAULT_COMPACT_BREAKPOINT_DP = 600;
+let MIN_TOUCH_TARGET_DP = 48;
+
+fn _append(dst, src) {
+    let i = 0;
+    while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+}
+
+fn _ref(code, opcode, index) { JVM.emit(code, JVM.insn_u2(opcode, index)); }
+
+fn _ldc(code, index) {
+    if index < 1 or index > 65535 {
+        throw "modern_ui_android: invalid constant-pool index";
+    }
+    if index <= 255 { JVM.emit(code, [18, index]); }
+    else { JVM.emit(code, JVM.insn_u2(19, index)); }
+}
+
+fn _push_int(code, builder, value) {
+    if type(value) != "number" or num_floor(value) != value
+        or value < -2147483648 or value > 2147483647 {
+        throw "modern_ui_android: expected a signed 32-bit integer constant";
+    }
+    if value == -1 { JVM.emit(code, 2); return; }
+    if value >= 0 and value <= 5 { JVM.emit(code, 3 + value); return; }
+    if value >= -128 and value <= 127 {
+        JVM.emit(code, [16, if value < 0 { 256 + value } else { value }]);
+        return;
+    }
+    if value >= -32768 and value <= 32767 {
+        let encoded = if value < 0 { 65536 + value } else { value };
+        JVM.emit(code, [17, num_floor(encoded / 256), num_mod(encoded, 256)]);
+        return;
+    }
+    let index = JVM.integer_ref(builder, value);
+    _ldc(code, index);
+}
+
+fn _integer(value, fallback) {
+    if type(value) != "number" { return fallback; }
+    return num_floor(value);
+}
+
+fn _clamp(value, minimum, maximum) {
+    if value < minimum { return minimum; }
+    if value > maximum { return maximum; }
+    return value;
+}
+
+fn _ascii_identifier(value, dots) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 180 {
+        return false;
+    }
+    let segment_start = true; let segments = 1; let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if dots and c == 46 {
+            if segment_start { return false; }
+            segment_start = true; segments = segments + 1;
+        } else {
+            let letter = (c >= 97 and c <= 122) or (c >= 65 and c <= 90);
+            let valid = letter or (not segment_start and c >= 48 and c <= 57)
+                or (not segment_start and c == 95);
+            if not valid { return false; }
+            segment_start = false;
+        }
+        i = i + 1;
+    }
+    return not segment_start and (not dots or segments >= 2);
+}
+
+fn _class_name(package_name) {
+    let parts = str_split(package_name, ".");
+    return str_join(parts, "/") + "/MainActivity";
+}
+
+fn _text(value) {
+    let out = str(value);
+    if len(out) > MAX_ANDROID_TEXT {
+        throw "modern_ui_android: widget text exceeds Android adapter limit";
+    }
+    return out;
+}
+
+fn _resolved_name(node, path) {
+    let explicit = str(try node.name catch "");
+    if explicit != "" { return explicit; }
+    return node.kind + "_" + path;
+}
+
+fn _container(kind) {
+    return kind == "screen" or kind == "column" or kind == "row"
+        or kind == "grid" or kind == "card";
+}
+
+fn _text_control(kind) {
+    return kind == "heading" or kind == "text" or kind == "button"
+        or kind == "input" or kind == "area" or kind == "toggle";
+}
+
+fn _descriptor(kind) {
+    if kind == "button" { return "Landroid/widget/Button;"; }
+    if kind == "input" or kind == "area" { return "Landroid/widget/EditText;"; }
+    if kind == "toggle" { return "Landroid/widget/CheckBox;"; }
+    return "Landroid/widget/TextView;";
+}
+
+fn _validate_action(action, fields) {
+    if action.kind == "set_text" {
+        if not map_has(fields, action.target) {
+            throw "modern_ui_android: action target is not text-capable: " + action.target;
+        }
+    } elif action.kind == "sequence" {
+        for item in action.actions { _validate_action(item, fields); }
+    }
+}
+
+fn _preflight(bundle, class_name) {
+    if type(bundle) != "map"
+        or (try bundle.format catch "") != "pblang.modern-ui.bundle.v1"
+        or (try bundle.target catch "") != "android" {
+        throw "modern_ui_android: expected an Android modern UI bundle";
+    }
+    if len(bundle.records) > MAX_ANDROID_WIDGETS {
+        throw "modern_ui_android: Android widget limit exceeded";
+    }
+    let fields = map{}; let field_list = []; let buttons = []; let button_count = 0;
+    for record in bundle.records {
+        let source = record.source;
+        if try source.onclick catch nil != nil {
+            throw "modern_ui_android: native onclick callback on " + record.name
+                + " is not portable; use action_set_text/action_message";
+        }
+        if try source.onchange catch nil != nil {
+            throw "modern_ui_android: native onchange callback on " + record.name
+                + " is not portable in this Android adapter";
+        }
+        if _text_control(record.kind) {
+            let info = map{ name: record.name, field: "view" + str(len(field_list)),
+                descriptor: _descriptor(record.kind), kind: record.kind };
+            fields[record.name] = info;
+            array_push(field_list, info);
+        }
+        if record.kind == "button" and (try source.action catch nil) != nil {
+            button_count = button_count + 1;
+            if button_count > MAX_ANDROID_BUTTONS {
+                throw "modern_ui_android: interactive button limit exceeded";
+            }
+            array_push(buttons, map{ name: record.name, action: source.action });
+        }
+    }
+    for button in buttons { _validate_action(button.action, fields); }
+    return map{ class_name: class_name, fields: fields,
+        field_list: field_list, buttons: buttons };
+}
+
+fn _refs(c, class_name) {
+    return map{
+        activity_init: JVM.method_ref(c, "android/app/Activity", "<init>", "()V"),
+        activity_create: JVM.method_ref(c, "android/app/Activity", "onCreate",
+            "(Landroid/os/Bundle;)V"),
+        set_content: JVM.method_ref(c, "android/app/Activity", "setContentView",
+            "(Landroid/view/View;)V"),
+        resources: JVM.method_ref(c, "android/content/Context", "getResources",
+            "()Landroid/content/res/Resources;"),
+        configuration: JVM.method_ref(c, "android/content/res/Resources", "getConfiguration",
+            "()Landroid/content/res/Configuration;"),
+        screen_width_dp: JVM.field_ref(c, "android/content/res/Configuration",
+            "screenWidthDp", "I"),
+        metrics: JVM.method_ref(c, "android/content/res/Resources", "getDisplayMetrics",
+            "()Landroid/util/DisplayMetrics;"),
+        density: JVM.field_ref(c, "android/util/DisplayMetrics", "densityDpi", "I"),
+        scroll_class: JVM.class_ref(c, "android/widget/ScrollView"),
+        scroll_init: JVM.method_ref(c, "android/widget/ScrollView", "<init>",
+            "(Landroid/content/Context;)V"),
+        linear_class: JVM.class_ref(c, "android/widget/LinearLayout"),
+        linear_init: JVM.method_ref(c, "android/widget/LinearLayout", "<init>",
+            "(Landroid/content/Context;)V"),
+        linear_orientation: JVM.method_ref(c, "android/widget/LinearLayout",
+            "setOrientation", "(I)V"),
+        grid_class: JVM.class_ref(c, "android/widget/GridLayout"),
+        grid_init: JVM.method_ref(c, "android/widget/GridLayout", "<init>",
+            "(Landroid/content/Context;)V"),
+        grid_columns: JVM.method_ref(c, "android/widget/GridLayout", "setColumnCount", "(I)V"),
+        text_class: JVM.class_ref(c, "android/widget/TextView"),
+        text_init: JVM.method_ref(c, "android/widget/TextView", "<init>",
+            "(Landroid/content/Context;)V"),
+        button_class: JVM.class_ref(c, "android/widget/Button"),
+        button_init: JVM.method_ref(c, "android/widget/Button", "<init>",
+            "(Landroid/content/Context;)V"),
+        edit_class: JVM.class_ref(c, "android/widget/EditText"),
+        edit_init: JVM.method_ref(c, "android/widget/EditText", "<init>",
+            "(Landroid/content/Context;)V"),
+        check_class: JVM.class_ref(c, "android/widget/CheckBox"),
+        check_init: JVM.method_ref(c, "android/widget/CheckBox", "<init>",
+            "(Landroid/content/Context;)V"),
+        spinner_class: JVM.class_ref(c, "android/widget/Spinner"),
+        spinner_init: JVM.method_ref(c, "android/widget/Spinner", "<init>",
+            "(Landroid/content/Context;)V"),
+        string_class: JVM.class_ref(c, "java/lang/String"),
+        adapter_class: JVM.class_ref(c, "android/widget/ArrayAdapter"),
+        adapter_init: JVM.method_ref(c, "android/widget/ArrayAdapter", "<init>",
+            "(Landroid/content/Context;I[Ljava/lang/Object;)V"),
+        adapter_dropdown: JVM.method_ref(c, "android/widget/ArrayAdapter",
+            "setDropDownViewResource", "(I)V"),
+        spinner_adapter: JVM.method_ref(c, "android/widget/Spinner", "setAdapter",
+            "(Landroid/widget/SpinnerAdapter;)V"),
+        spinner_selection: JVM.method_ref(c, "android/widget/AdapterView",
+            "setSelection", "(I)V"),
+        seek_class: JVM.class_ref(c, "android/widget/SeekBar"),
+        seek_init: JVM.method_ref(c, "android/widget/SeekBar", "<init>",
+            "(Landroid/content/Context;)V"),
+        progress_class: JVM.class_ref(c, "android/widget/ProgressBar"),
+        progress_init: JVM.method_ref(c, "android/widget/ProgressBar", "<init>",
+            "(Landroid/content/Context;Landroid/util/AttributeSet;I)V"),
+        image_class: JVM.class_ref(c, "android/widget/ImageView"),
+        image_init: JVM.method_ref(c, "android/widget/ImageView", "<init>",
+            "(Landroid/content/Context;)V"),
+        view_class: JVM.class_ref(c, "android/view/View"),
+        view_init: JVM.method_ref(c, "android/view/View", "<init>",
+            "(Landroid/content/Context;)V"),
+        space_class: JVM.class_ref(c, "android/widget/Space"),
+        space_init: JVM.method_ref(c, "android/widget/Space", "<init>",
+            "(Landroid/content/Context;)V"),
+        add_view: JVM.method_ref(c, "android/view/ViewGroup", "addView",
+            "(Landroid/view/View;)V"),
+        set_text: JVM.method_ref(c, "android/widget/TextView", "setText",
+            "(Ljava/lang/CharSequence;)V"),
+        set_hint: JVM.method_ref(c, "android/widget/TextView", "setHint",
+            "(Ljava/lang/CharSequence;)V"),
+        set_text_color: JVM.method_ref(c, "android/widget/TextView", "setTextColor", "(I)V"),
+        set_background: JVM.method_ref(c, "android/view/View", "setBackgroundColor", "(I)V"),
+        set_padding: JVM.method_ref(c, "android/view/View", "setPadding", "(IIII)V"),
+        set_min_height: JVM.method_ref(c, "android/view/View", "setMinimumHeight", "(I)V"),
+        set_content_description: JVM.method_ref(c, "android/view/View",
+            "setContentDescription", "(Ljava/lang/CharSequence;)V"),
+        set_enabled: JVM.method_ref(c, "android/view/View", "setEnabled", "(Z)V"),
+        set_single_line: JVM.method_ref(c, "android/widget/TextView", "setSingleLine", "(Z)V"),
+        set_min_lines: JVM.method_ref(c, "android/widget/TextView", "setMinLines", "(I)V"),
+        set_checked: JVM.method_ref(c, "android/widget/CompoundButton", "setChecked", "(Z)V"),
+        set_max: JVM.method_ref(c, "android/widget/ProgressBar", "setMax", "(I)V"),
+        set_progress: JVM.method_ref(c, "android/widget/ProgressBar", "setProgress", "(I)V"),
+        set_listener: JVM.method_ref(c, "android/view/View", "setOnClickListener",
+            "(Landroid/view/View$OnClickListener;)V"),
+        toast_make: JVM.method_ref(c, "android/widget/Toast", "makeText",
+            "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;"),
+        toast_show: JVM.method_ref(c, "android/widget/Toast", "show", "()V"),
+        dp: JVM.method_ref(c, class_name, "dp", "(I)I")
+    };
+}
+
+fn _new_context_view(code, state, class_ref, init_ref, slot) {
+    _ref(code, 187, class_ref); JVM.emit(code, 89); JVM.emit_aload(code, 0);
+    _ref(code, 183, init_ref); JVM.emit_astore(code, slot);
+}
+
+fn _dp(code, state, value) {
+    JVM.emit_aload(code, 0); _push_int(code, state.class, value);
+    _ref(code, 182, state.refs.dp);
+}
+
+fn _padding(code, state, slot, value) {
+    JVM.emit_aload(code, slot);
+    _dp(code, state, value); _dp(code, state, value);
+    _dp(code, state, value); _dp(code, state, value);
+    _ref(code, 182, state.refs.set_padding);
+}
+
+fn _minimum_height(code, state, slot, value) {
+    if value < 1 { return; }
+    if value > 240 { value = 240; }
+    JVM.emit_aload(code, slot); _dp(code, state, value);
+    _ref(code, 182, state.refs.set_min_height);
+}
+
+fn _responsive_int(code, state, compact_value, wide_value) {
+    let index = state.responsive_branch;
+    state.responsive_branch = index + 1;
+    let wide = "responsive_wide_" + str(index);
+    let done = "responsive_done_" + str(index);
+    JVM.emit_aload(code, 0);
+    _ref(code, 182, state.refs.resources);
+    _ref(code, 182, state.refs.configuration);
+    _ref(code, 180, state.refs.screen_width_dp);
+    _push_int(code, state.class, state.compact_breakpoint_dp);
+    JVM.branch(code, 162, wide);
+    _push_int(code, state.class, compact_value);
+    JVM.branch(code, 167, done);
+    JVM.mark(code, wide);
+    _push_int(code, state.class, wide_value);
+    JVM.mark(code, done);
+}
+
+fn _attach(code, state, parent_slot, child_slot) {
+    JVM.emit_aload(code, parent_slot); JVM.emit_aload(code, child_slot);
+    _ref(code, 182, state.refs.add_view);
+}
+
+fn _put_field(code, state, node, path, slot) {
+    let name = _resolved_name(node, path);
+    if not map_has(state.model.fields, name) { return; }
+    let info = state.model.fields[name];
+    let field = JVM.field_ref(state.class, state.class_name, info.field, info.descriptor);
+    JVM.emit_aload(code, 0); JVM.emit_aload(code, slot); _ref(code, 181, field);
+}
+
+fn _label(code, state, slot, value, color) {
+    JVM.emit_aload(code, slot); _ldc(code, JVM.string_ref(state.class, _text(value)));
+    _ref(code, 182, state.refs.set_text);
+    JVM.emit_aload(code, slot); _push_int(code, state.class, color);
+    _ref(code, 182, state.refs.set_text_color);
+}
+
+fn _accessibility(code, state, slot, node, fallback) {
+    let label = str(try node.accessibility_label catch fallback);
+    if label == "" { return; }
+    JVM.emit_aload(code, slot); _ldc(code, JVM.string_ref(state.class, _text(label)));
+    _ref(code, 182, state.refs.set_content_description);
+}
+
+fn _emit_leaf(code, state, node, parent_slot, depth, path) {
+    let slot = parent_slot + 1; let kind = node.kind;
+    if kind == "heading" or kind == "text" {
+        _new_context_view(code, state, state.refs.text_class, state.refs.text_init, slot);
+        _label(code, state, slot, try node.text catch "", if kind == "heading" {
+            state.accent
+        } else { state.foreground });
+        _padding(code, state, slot, if kind == "heading" { 12 } else { 8 });
+    } elif kind == "button" {
+        _new_context_view(code, state, state.refs.button_class, state.refs.button_init, slot);
+        _label(code, state, slot, try node.text catch "", state.foreground);
+        _padding(code, state, slot, 10);
+        if (try node.action catch nil) != nil {
+            JVM.emit_aload(code, slot); JVM.emit_aload(code, 0);
+            _ref(code, 182, state.refs.set_listener);
+        }
+    } elif kind == "input" or kind == "area" {
+        _new_context_view(code, state, state.refs.edit_class, state.refs.edit_init, slot);
+        _label(code, state, slot, try node.value catch "", state.foreground);
+        let hint = str(try node.placeholder catch try node.label catch try node.name catch "");
+        if hint != "" {
+            JVM.emit_aload(code, slot); _ldc(code, JVM.string_ref(state.class, _text(hint)));
+            _ref(code, 182, state.refs.set_hint);
+        }
+        JVM.emit_aload(code, slot); _push_int(code, state.class, if kind == "input" { 1 } else { 0 });
+        _ref(code, 182, state.refs.set_single_line);
+        if kind == "area" {
+            JVM.emit_aload(code, slot); _push_int(code, state.class, 4);
+            _ref(code, 182, state.refs.set_min_lines);
+        }
+        _padding(code, state, slot, 10);
+    } elif kind == "toggle" {
+        _new_context_view(code, state, state.refs.check_class, state.refs.check_init, slot);
+        _label(code, state, slot, try node.text catch "", state.foreground);
+        JVM.emit_aload(code, slot); _push_int(code, state.class,
+            if try node.checked catch false { 1 } else { 0 });
+        _ref(code, 182, state.refs.set_checked);
+        _padding(code, state, slot, 8);
+    } elif kind == "choice" {
+        _new_context_view(code, state, state.refs.spinner_class, state.refs.spinner_init, slot);
+        let values = try node.options catch []; let selected = try node.selected catch 0;
+        let array_slot = slot + 1; let adapter_slot = slot + 2;
+        _push_int(code, state.class, len(values));
+        _ref(code, 189, state.refs.string_class); JVM.emit_astore(code, array_slot);
+        let option_index = 0;
+        while option_index < len(values) {
+            JVM.emit_aload(code, array_slot);
+            _push_int(code, state.class, option_index);
+            _ldc(code, JVM.string_ref(state.class, _text(values[option_index])));
+            JVM.emit(code, 83);
+            option_index = option_index + 1;
+        }
+        _ref(code, 187, state.refs.adapter_class); JVM.emit(code, 89);
+        JVM.emit_aload(code, 0); _push_int(code, state.class, 17367048);
+        JVM.emit_aload(code, array_slot); _ref(code, 183, state.refs.adapter_init);
+        JVM.emit_astore(code, adapter_slot);
+        JVM.emit_aload(code, adapter_slot); _push_int(code, state.class, 17367049);
+        _ref(code, 182, state.refs.adapter_dropdown);
+        JVM.emit_aload(code, slot); JVM.emit_aload(code, adapter_slot);
+        _ref(code, 182, state.refs.spinner_adapter);
+        if selected < 0 or selected >= len(values) { selected = 0; }
+        JVM.emit_aload(code, slot); _push_int(code, state.class, selected);
+        _ref(code, 182, state.refs.spinner_selection);
+    } elif kind == "slider" {
+        _new_context_view(code, state, state.refs.seek_class, state.refs.seek_init, slot);
+        let minimum = _integer(try node.min catch 0, 0);
+        let maximum = _integer(try node.max catch 100, 100);
+        let span = maximum - minimum;
+        if span < 1 { span = 1; }
+        let slider_value = _integer(try node.value catch minimum, minimum) - minimum;
+        slider_value = _clamp(slider_value, 0, span);
+        JVM.emit_aload(code, slot); _push_int(code, state.class, span);
+        _ref(code, 182, state.refs.set_max);
+        JVM.emit_aload(code, slot); _push_int(code, state.class, slider_value);
+        _ref(code, 182, state.refs.set_progress);
+    } elif kind == "progress" {
+        _ref(code, 187, state.refs.progress_class); JVM.emit(code, 89);
+        JVM.emit_aload(code, 0); JVM.emit(code, 1);
+        _push_int(code, state.class, 16842872);
+        _ref(code, 183, state.refs.progress_init); JVM.emit_astore(code, slot);
+        JVM.emit_aload(code, slot); _push_int(code, state.class, 100);
+        _ref(code, 182, state.refs.set_max);
+        let progress_value = try node.value catch 0;
+        if type(progress_value) != "number" { progress_value = 0; }
+        if progress_value >= 0 and progress_value <= 1 {
+            progress_value = progress_value * 100;
+        }
+        progress_value = _clamp(num_floor(progress_value), 0, 100);
+        JVM.emit_aload(code, slot); _push_int(code, state.class, progress_value);
+        _ref(code, 182, state.refs.set_progress);
+    } elif kind == "image" {
+        _new_context_view(code, state, state.refs.image_class, state.refs.image_init, slot);
+        JVM.emit_aload(code, slot); _push_int(code, state.class, state.surface);
+        _ref(code, 182, state.refs.set_background);
+    } elif kind == "separator" {
+        _new_context_view(code, state, state.refs.view_class, state.refs.view_init, slot);
+        JVM.emit_aload(code, slot); _push_int(code, state.class, state.accent);
+        _ref(code, 182, state.refs.set_background);
+    } else {
+        _new_context_view(code, state, state.refs.space_class, state.refs.space_init, slot);
+    }
+    let enabled = try node.enabled catch true;
+    if enabled == false {
+        JVM.emit_aload(code, slot); _push_int(code, state.class, 0);
+        _ref(code, 182, state.refs.set_enabled);
+    }
+    let height = try node.h catch nil;
+    if height == nil {
+        height = 40;
+        if kind == "button" or kind == "input" or kind == "area"
+            or kind == "toggle" or kind == "choice" or kind == "slider" {
+            height = MIN_TOUCH_TARGET_DP;
+        }
+        if kind == "separator" { height = 1; }
+        elif kind == "spacer" { height = try node.size catch 12; }
+    }
+    _minimum_height(code, state, slot, num_floor(height));
+    _accessibility(code, state, slot, node, str(try node.text catch try node.name catch ""));
+    _put_field(code, state, node, path, slot);
+    _attach(code, state, parent_slot, slot);
+}
+
+fn _emit_container(code, state, node, parent_slot, depth, path) {
+    let slot = parent_slot + 1; let grid = node.kind == "grid";
+    if grid {
+        _new_context_view(code, state, state.refs.grid_class, state.refs.grid_init, slot);
+        let columns = try node.columns catch 2;
+        if columns < 1 { columns = 1; }
+        if columns > 6 { columns = 6; }
+        JVM.emit_aload(code, slot);
+        _responsive_int(code, state, 1, columns);
+        _ref(code, 182, state.refs.grid_columns);
+    } else {
+        _new_context_view(code, state, state.refs.linear_class, state.refs.linear_init, slot);
+        JVM.emit_aload(code, slot);
+        if node.kind != "row" {
+            _push_int(code, state.class, 1);
+        } elif (try node.responsive catch true) == false {
+            _push_int(code, state.class, 0);
+        } else {
+            // LinearLayout.HORIZONTAL=0, VERTICAL=1. The actual device width
+            // is evaluated on every Activity creation, including orientation
+            // changes, instead of freezing the preview width into the APK.
+            _responsive_int(code, state, 1, 0);
+        }
+        _ref(code, 182, state.refs.linear_orientation);
+    }
+    _padding(code, state, slot, if node.kind == "card" { 14 } else {
+        try node.padding catch 6
+    });
+    if node.kind == "card" {
+        JVM.emit_aload(code, slot); _push_int(code, state.class, state.surface);
+        _ref(code, 182, state.refs.set_background);
+    }
+    _attach(code, state, parent_slot, slot);
+    let title = str(try node.title catch "");
+    if title != "" {
+        let title_node = map{ kind: "heading", text: title,
+            accessibility_label: title };
+        _emit_leaf(code, state, title_node, slot, depth + 1, path + "_title");
+    }
+    let i = 0;
+    while i < len(node.children) {
+        _emit_node(code, state, node.children[i], slot, depth + 1,
+            path + "_" + str(i));
+        i = i + 1;
+    }
+}
+
+fn _emit_node(code, state, node, parent_slot, depth, path) {
+    if depth > 24 { throw "modern_ui_android: nesting depth exceeded"; }
+    if _container(node.kind) {
+        _emit_container(code, state, node, parent_slot, depth, path);
+    } else {
+        _emit_leaf(code, state, node, parent_slot, depth, path);
+    }
+}
+
+fn _emit_action(code, state, action) {
+    if action.kind == "set_text" {
+        let info = state.model.fields[action.target];
+        let field = JVM.field_ref(state.class, state.class_name, info.field, info.descriptor);
+        JVM.emit_aload(code, 0); _ref(code, 180, field);
+        _ldc(code, JVM.string_ref(state.class, _text(action.value)));
+        _ref(code, 182, state.refs.set_text);
+    } elif action.kind == "message" {
+        JVM.emit_aload(code, 0);
+        _ldc(code, JVM.string_ref(state.class, _text(action.value)));
+        _push_int(code, state.class, 0);
+        _ref(code, 184, state.refs.toast_make);
+        _ref(code, 182, state.refs.toast_show);
+    } else {
+        for item in action.actions { _emit_action(code, state, item); }
+    }
+}
+
+fn _argb(r, g, b) {
+    let unsigned = 4278190080 + r * 65536 + g * 256 + b;
+    return unsigned - 4294967296;
+}
+
+fn activity_class(bundle, options = nil) {
+    if options == nil { options = map{}; }
+    let package_name = str(try options.package catch "org.pblang.modernapp");
+    if not _ascii_identifier(package_name, true) {
+        throw "modern_ui_android: package must contain safe dotted identifiers";
+    }
+    let class_name = _class_name(package_name);
+    let model = _preflight(bundle, class_name);
+    let c = JVM.new_class(class_name, "android/app/Activity");
+    JVM.add_interface(c, "android/view/View$OnClickListener");
+    for info in model.field_list { JVM.add_field(c, 2, info.field, info.descriptor); }
+    let refs = _refs(c, class_name);
+    let breakpoint = _integer(
+        try options.compact_breakpoint_dp catch DEFAULT_COMPACT_BREAKPOINT_DP,
+        DEFAULT_COMPACT_BREAKPOINT_DP);
+    breakpoint = _clamp(breakpoint, 320, 1200);
+    let dark = str_lower(str(try options.theme catch "dark")) != "light";
+    let state = map{ class: c, class_name: class_name, model: model, refs: refs,
+        compact_breakpoint_dp: breakpoint, responsive_branch: 0,
+        background: if dark { _argb(18, 22, 29) } else { _argb(246, 248, 251) },
+        surface: if dark { _argb(36, 43, 54) } else { _argb(229, 234, 241) },
+        foreground: if dark { _argb(238, 242, 247) } else { _argb(25, 31, 40) },
+        accent: if dark { _argb(77, 182, 172) } else { _argb(0, 121, 107) } };
+
+    let init = JVM.code_builder();
+    JVM.emit_aload(init, 0); _ref(init, 183, refs.activity_init); JVM.emit(init, 177);
+    JVM.add_method(c, 1, "<init>", "()V", 1, 1, JVM.finish_code(init));
+
+    let dp = JVM.code_builder();
+    JVM.emit_aload(dp, 0); _ref(dp, 182, refs.resources); _ref(dp, 182, refs.metrics);
+    _ref(dp, 180, refs.density); JVM.emit_iload(dp, 1); JVM.emit(dp, 104);
+    _push_int(dp, c, 160); JVM.emit(dp, 108); JVM.emit(dp, 172);
+    JVM.add_method(c, 2, "dp", "(I)I", 2, 2, JVM.finish_code(dp));
+
+    let create = JVM.code_builder();
+    JVM.emit_aload(create, 0); JVM.emit_aload(create, 1);
+    _ref(create, 183, refs.activity_create);
+    _new_context_view(create, state, refs.scroll_class, refs.scroll_init, 2);
+    _new_context_view(create, state, refs.linear_class, refs.linear_init, 3);
+    JVM.emit_aload(create, 3); _push_int(create, c, 1);
+    _ref(create, 182, refs.linear_orientation);
+    _padding(create, state, 3, 12);
+    JVM.emit_aload(create, 3); _push_int(create, c, state.background);
+    _ref(create, 182, refs.set_background);
+    let root = bundle.view;
+    if root.kind == "screen" {
+        let i = 0;
+        while i < len(root.children) {
+            _emit_node(create, state, root.children[i], 3, 0, "0_" + str(i));
+            i = i + 1;
+        }
+    } else {
+        _emit_node(create, state, root, 3, 0, "0");
+    }
+    _attach(create, state, 2, 3);
+    JVM.emit_aload(create, 0); JVM.emit_aload(create, 2);
+    _ref(create, 182, refs.set_content); JVM.emit(create, 177);
+    JVM.add_method(c, 4, "onCreate", "(Landroid/os/Bundle;)V", 8, 32,
+        JVM.finish_code(create));
+
+    let click = JVM.code_builder(); let i = 0;
+    while i < len(model.buttons) {
+        let button = model.buttons[i]; let info = model.fields[button.name];
+        let field = JVM.field_ref(c, class_name, info.field, info.descriptor);
+        JVM.emit_aload(click, 1); JVM.emit_aload(click, 0); _ref(click, 180, field);
+        JVM.branch(click, 166, "next_" + str(i));
+        _emit_action(click, state, button.action); JVM.emit(click, 177);
+        JVM.mark(click, "next_" + str(i)); i = i + 1;
+    }
+    JVM.emit(click, 177);
+    JVM.add_method(c, 1, "onClick", "(Landroid/view/View;)V", 4, 2,
+        JVM.finish_code(click));
+    return JVM.finish(c);
+}
+
+fn _xml(value) {
+    let out = ""; let i = 0;
+    while i < len(value) {
+        let c = str_slice(value, i, i + 1);
+        if c == "&" { out = out + "&amp;"; }
+        elif c == "<" { out = out + "&lt;"; }
+        elif c == ">" { out = out + "&gt;"; }
+        elif c == "\"" { out = out + "&quot;"; }
+        elif c == "'" { out = out + "&apos;"; }
+        else { out = out + c; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn manifest(name, options = nil) {
+    if options == nil { options = map{}; }
+    let package_name = str(try options.package catch "org.pblang.modernapp");
+    if not _ascii_identifier(package_name, true) {
+        throw "modern_ui_android: invalid Android package";
+    }
+    let min_sdk = num_floor(try options.min_sdk catch 21);
+    let target_sdk = num_floor(try options.target_sdk catch 34);
+    if min_sdk < 21 or min_sdk > target_sdk or target_sdk < 34 or target_sdk > 999 {
+        throw "modern_ui_android: invalid Android SDK range";
+    }
+    return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        + "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" package=\""
+        + package_name + "\" android:versionCode=\""
+        + str(num_floor(try options.version_code catch 1)) + "\" android:versionName=\""
+        + _xml(str(try options.version catch "1.0.0")) + "\">\n"
+        + "  <uses-sdk android:minSdkVersion=\"" + str(min_sdk)
+        + "\" android:targetSdkVersion=\"" + str(target_sdk) + "\"/>\n"
+        + "  <application android:allowBackup=\"false\" android:debuggable=\"true\" "
+        + "android:hardwareAccelerated=\"true\" android:largeHeap=\"false\" android:label=\""
+        + _xml(name) + "\" android:usesCleartextTraffic=\"false\" "
+        + "android:theme=\"@android:style/Theme.Material.Light.NoActionBar\">\n"
+        + "    <activity android:name=\".MainActivity\" android:exported=\"true\" "
+        + "android:screenOrientation=\"unspecified\" android:windowSoftInputMode=\"adjustResize\">\n"
+        + "      <intent-filter><action android:name=\"android.intent.action.MAIN\"/>"
+        + "<category android:name=\"android.intent.category.LAUNCHER\"/></intent-filter>\n"
+        + "    </activity>\n"
+        + "  </application>\n"
+        + "</manifest>\n";
+}
+
+fn generate(name, bundle, options = nil) {
+    if options == nil { options = map{}; }
+    let package_name = str(try options.package catch "org.pblang.modernapp");
+    let bytes = activity_class(bundle, options);
+    let breakpoint = _integer(
+        try options.compact_breakpoint_dp catch DEFAULT_COMPACT_BREAKPOINT_DP,
+        DEFAULT_COMPACT_BREAKPOINT_DP);
+    breakpoint = _clamp(breakpoint, 320, 1200);
+    return map{ format: "pblang.modern-ui.android.v1", name: name,
+        package: package_name, activity: package_name + ".MainActivity",
+        class_name: _class_name(package_name), class_bytes: bytes,
+        manifest: manifest(name, options), widgets: len(bundle.records),
+        min_sdk: num_floor(try options.min_sdk catch 21),
+        target_sdk: num_floor(try options.target_sdk catch 34),
+        responsive: map{
+            format: "pblang.modern-ui.android-responsive.v1",
+            runtime_screen_width_dp: true,
+            compact_breakpoint_dp: breakpoint,
+            orientation_recreates_layout: true,
+            scroll_fallback: true,
+            minimum_touch_target_dp: MIN_TOUCH_TARGET_DP,
+            keyboard_adjust_resize: true
+        } };
+}
+
+fn build(name, bundle, options = nil) {
+    if options == nil { options = map{}; }
+    let generated = generate(name, bundle, options);
+    let Toolchain = import("stdlib:android_toolchain.sapp");
+    return Toolchain.build(generated, options);
+}
+
+export MAX_ANDROID_WIDGETS, MAX_ANDROID_BUTTONS, DEFAULT_COMPACT_BREAKPOINT_DP,
+       MIN_TOUCH_TARGET_DP, activity_class, manifest, generate, build;

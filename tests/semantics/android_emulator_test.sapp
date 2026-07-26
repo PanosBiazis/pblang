@@ -1,0 +1,106 @@
+let A = import("stdlib:android_emulator.sapp");
+let E = import("stdlib:input_events.sapp");
+
+fn app_spec(package_name, activity_name, exported, permissions) {
+    return map{
+        package: package_name, min_sdk: 26, target_sdk: 34,
+        activities: [map{ name: activity_name, exported: exported }],
+        main_activity: activity_name, permissions: permissions, allow_cleartext: false
+    };
+}
+
+let em = A.new(34, "arm64", map{ width: 1440, height: 3200, max_events: 128 });
+assert(em.api == 34 and em.arch == "arm64", "Android 14 arm64 emulator profile");
+assert(str_contains(em.boundary, "no kernel"), "emulator boundary remains explicit");
+
+let owner = "org.pblang.pbremote";
+let peer = "org.pblang.peer";
+let secure_permission = "org.pblang.permission.SECURE_REMOTE";
+assert(A.install(em, app_spec(owner, ".MainActivity", true,
+    ["android.permission.INTERNET", secure_permission])).ok, "install PBRemote contract");
+assert(A.install(em, app_spec(peer, ".PeerActivity", false, [secure_permission])).ok, "install peer contract");
+assert(A.has_permission(em, owner, "android.permission.INTERNET"), "normal INTERNET permission auto-granted");
+assert(not A.has_permission(em, peer, secure_permission), "custom permission starts denied");
+assert(not A.grant_permission(em, peer, peer, secure_permission).ok, "application cannot self-grant");
+assert(A.grant_permission(em, "system", peer, secure_permission).ok, "system grant");
+
+let launched = A.start_activity(em, "system", owner);
+assert(launched.ok and launched.state == "resumed" and launched.pid >= 1000, "create/start/resume lifecycle");
+assert(A.app_status(em, owner).launches == 1, "launch accounting");
+assert(not A.start_activity(em, owner, peer, ".PeerActivity").ok, "non-exported cross-package Activity denied");
+assert(A.input_apply(em, owner, E.pointer_event(20, 30).event).ok, "foreground touch input");
+assert(not A.input_apply(em, peer, E.pointer_event(1, 1).event).ok, "background package cannot receive input");
+
+assert(A.write_private(em, owner, owner, "state/session.json", "{\"ready\":true}").ok, "private storage write");
+assert(A.read_private(em, owner, owner, "state/session.json").data == "{\"ready\":true}", "private storage read");
+assert(not A.read_private(em, peer, owner, "state/session.json").ok, "cross-package private storage denied");
+assert(not A.write_private(em, owner, owner, "../escape", "bad").ok, "storage traversal denied");
+
+assert(A.register_service(em, owner, map{ name: "secure-control", exported: true,
+    permission: secure_permission, response: map{ status: "ready" } }).ok, "register protected service");
+assert(not A.register_service(em, owner, map{ name: "invalid-response", exported: false,
+    response: fn() { return true; } }).ok, "non-serializable service response rejected");
+let service = A.call_service(em, peer, owner, "secure-control", map{ command: "status" });
+assert(service.ok and service.response.status == "ready", "granted caller reaches exported service");
+assert(not A.call_service(em, owner, owner, "secure-control", fn() { return true; }).ok,
+       "non-serializable service request rejected");
+assert(A.revoke_permission(em, "system", peer, secure_permission).ok, "system revoke");
+assert(not A.call_service(em, peer, owner, "secure-control", map{}).ok, "revoked service permission denied");
+
+let net = A.network_plan(em, owner, "relay.example", 443);
+assert(net.ok and net.tls and net.transport == "tls-1.3"
+       and net.provider == "android-platform" and not net.external_install_required,
+       "secure network plan");
+let tls_status = A.tls13_status(em);
+assert(tls_status.ok and tls_status.available and tls_status.guaranteed_by_platform
+       and tls_status.source == "android-platform" and not tls_status.external_install_required,
+       "current Android TLS 1.3 provider status");
+assert(not A.network_plan(em, owner, "relay.example", 80, map{ tls: false }).ok, "cleartext denied by default");
+assert(not A.network_plan(em, owner, "user@relay.example", 443).ok, "ambiguous host rejected");
+
+let legacy = A.new(21, "armv7");
+assert(A.install(legacy, map{ package: "org.example.legacy", min_sdk: 21, target_sdk: 21,
+    activities: [map{ name: ".MainActivity", exported: true }], main_activity: ".MainActivity",
+    permissions: ["android.permission.INTERNET"], allow_cleartext: false }).ok,
+    "legacy package install");
+assert(not A.tls13_status(legacy).available
+       and not A.network_plan(legacy, "org.example.legacy", "relay.example", 443).ok,
+       "legacy Android without TLS 1.3 fails closed");
+
+let source = "let total = 0; let i = 0; while i < 100 { total = total + i; i = i + 1; } let android_result = total;";
+let run = A.compile_and_run(em, owner, source, nil,
+    map{ max_steps: 5000, max_frames: 16, max_stack: 256, max_locals: 256, max_output: 32, max_value_items: 1024 });
+assert(run.ok and run.globals.android_result == 4950, "self-hosted PBCS executes inside Android model");
+assert(run.globals.android_api == 34 and run.globals.android_package == owner, "protected Android globals seeded");
+assert(run.runtime.steps > 0 and run.runtime.steps <= 5000, "bytecode execution is budgeted");
+assert(A.run_pbcs(em, owner, run.artifact, nil, map{ max_steps: 5000 }).ok, "serialized PBCS re-executes");
+assert(not A.run_pbcs(em, owner, [1, 2, 3, 4, 5, 6, 7, 8, 9]).ok, "invalid bytecode rejected");
+
+assert(A.background(em, owner).state == "stopped", "pause/stop lifecycle");
+assert(A.destroy(em, owner).state == "destroyed", "destroy lifecycle");
+assert(not A.run_pbcs(em, owner, run.artifact).ok, "destroyed process cannot execute bytecode");
+assert(A.start_activity(em, "system", owner).ok, "destroyed app can be recreated");
+
+let stats = A.stats(em);
+assert(stats.ok and stats.packages == 2 and stats.events > 0 and stats.service_calls == 1,
+       "bounded emulator stats");
+assert(not A.install(em, app_spec("bad/package", ".Main", true, [])).ok, "invalid package rejected");
+assert(not A.install(em, app_spec("org.pblang.badflag", ".Main", "yes", [])).ok, "non-boolean exported flag rejected");
+
+let tiny = A.new(34, "x86_64", map{ max_events: 1 });
+assert(A.install(tiny, app_spec("org.pblang.tiny", ".Main", true, [])).ok, "tiny event queue install");
+assert(not A.start_activity(tiny, "system", "org.pblang.tiny").ok,
+       "multi-step lifecycle rejects atomically when event capacity is insufficient");
+assert(A.app_status(tiny, "org.pblang.tiny").state == "installed", "failed lifecycle leaves state unchanged");
+
+let removal = A.new(34, "arm64");
+assert(A.install(removal, app_spec("org.pblang.removal", ".Main", false, [])).ok, "removal app install");
+assert(A.write_private(removal, "org.pblang.removal", "org.pblang.removal", "cache/value", "secret").ok,
+       "removal app private data write");
+let removed = A.uninstall(removal, "org.pblang.removal");
+assert(removed.ok and removed.removed_private_files == 1, "uninstall purges private app data");
+assert(A.install(removal, app_spec("org.pblang.removal", ".Main", false, [])).ok, "removal app reinstall");
+assert(not A.read_private(removal, "org.pblang.removal", "org.pblang.removal", "cache/value").ok,
+       "reinstalled app cannot recover prior private data");
+
+print "android_emulator_pass";

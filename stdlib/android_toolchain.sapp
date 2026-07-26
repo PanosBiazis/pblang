@@ -1,0 +1,224 @@
+// Bounded Android APK packaging for PBLang-generated JVM classes.
+//
+// This module does not compile Java/Kotlin. D8, aapt2, zipalign and apksigner
+// are platform format/signing tools discovered from the local Android SDK.
+
+fn _run(path, args, stage) {
+    let result = try proc_spawn_wait(path, args) catch nil;
+    if result == nil { throw "android_toolchain: could not start " + stage; }
+    if (try result.exit_code catch 1) != 0 {
+        throw "android_toolchain: " + stage + " failed: "
+            + str(try result.stderr catch result.stdout);
+    }
+    return result;
+}
+
+fn _sdk_root(options) {
+    let configured = str(try options.sdk_root catch "");
+    if configured != "" { return configured; }
+    let sdk_root = try env_get("ANDROID_SDK_ROOT") catch nil;
+    if type(sdk_root) == "string" and sdk_root != "" { return str(sdk_root); }
+    let android_home = try env_get("ANDROID_HOME") catch nil;
+    if type(android_home) == "string" and android_home != "" { return str(android_home); }
+    let home = try env_get("HOME") catch nil;
+    if type(home) != "string" or home == "" {
+        throw "android_toolchain: HOME and Android SDK environment are unavailable";
+    }
+    return str(home) + "/Android/Sdk";
+}
+
+fn _version_score(name) {
+    let parts = str_split(name, ".");
+    if len(parts) < 1 or len(parts) > 3 { return nil; }
+    let values = [0, 0, 0]; let i = 0;
+    while i < len(parts) {
+        if parts[i] == "" { return nil; }
+        let value = try parse_number(parts[i]) catch nil;
+        if value == nil or value < 0 or value > 999
+            or num_floor(value) != value { return nil; }
+        values[i] = value; i = i + 1;
+    }
+    return values[0] * 1000000 + values[1] * 1000 + values[2];
+}
+
+fn _api_level(name, minimum) {
+    let parts = str_split(name, "-");
+    if len(parts) != 2 or parts[0] != "android" { return nil; }
+    let value = try parse_number(parts[1]) catch nil;
+    if value == nil or value < minimum or value > 999
+        or num_floor(value) != value { return nil; }
+    return value;
+}
+
+fn discover(options = nil) {
+    if options == nil { options = map{}; }
+    let sdk = _sdk_root(options);
+    let bt_root = sdk + "/build-tools"; let platform_root = sdk + "/platforms";
+    let bt_entries = try fs_listdir(bt_root) catch [];
+    let platform_entries = try fs_listdir(platform_root) catch [];
+    if len(bt_entries) > 256 or len(platform_entries) > 256 {
+        return map{ ok: false, error: "Android SDK discovery limit exceeded" };
+    }
+    let bt_name = ""; let bt_score = -1; let i = 0;
+    while i < len(bt_entries) {
+        let score = _version_score(bt_entries[i]);
+        let root = bt_root + "/" + bt_entries[i];
+        if score != nil and score > bt_score and fs_exists(root + "/aapt2")
+            and fs_exists(root + "/d8") and fs_exists(root + "/zipalign")
+            and fs_exists(root + "/apksigner") {
+            bt_name = bt_entries[i]; bt_score = score;
+        }
+        i = i + 1;
+    }
+    let requested = num_floor(try options.target_sdk catch 34);
+    let platform_name = ""; let platform_api = -1; i = 0;
+    while i < len(platform_entries) {
+        let api = _api_level(platform_entries[i], requested);
+        let jar = platform_root + "/" + platform_entries[i] + "/android.jar";
+        if api != nil and api > platform_api and fs_exists(jar) {
+            platform_name = platform_entries[i]; platform_api = api;
+        }
+        i = i + 1;
+    }
+    if bt_name == "" {
+        return map{ ok: false, error: "no complete Android build-tools installation found" };
+    }
+    if platform_name == "" {
+        return map{ ok: false, error: "no compatible Android platform found" };
+    }
+    return map{ ok: true, sdk: sdk, compile_sdk: platform_api,
+        build_tools_version: bt_name, build_tools: bt_root + "/" + bt_name,
+        platform: platform_root + "/" + platform_name + "/android.jar" };
+}
+
+fn _slug(package_name) { return str_join(str_split(package_name, "."), "-"); }
+
+fn _reset_stage(path) {
+    let prefix = path_join(cwd(), "build/modern-android/");
+    let absolute = path_join(cwd(), path);
+    if not str_starts_with(absolute, prefix) or len(absolute) <= len(prefix) {
+        throw "android_toolchain: refusing unsafe staging path";
+    }
+    let rm = if fs_exists("/usr/bin/rm") { "/usr/bin/rm" } else { "/bin/rm"; };
+    _run(rm, ["-rf", "--", absolute], "staging cleanup");
+    fs_mkdirs(path);
+}
+
+fn _keytool() {
+    let found = try os_which("keytool") catch nil;
+    if type(found) == "string" and found != "" { return found; }
+    let fixed = "/usr/lib/jvm/java-21-openjdk-amd64/bin/keytool";
+    if fs_exists(fixed) { return fixed; }
+    return nil;
+}
+
+fn _sha256(path) {
+    let executable = if fs_exists("/usr/bin/sha256sum") {
+        "/usr/bin/sha256sum"
+    } else { "/bin/sha256sum" };
+    let result = _run(executable, [path], "SHA-256");
+    let fields = str_split(str_trim(result.stdout), " ");
+    if len(fields) < 1 or len(fields[0]) != 64 {
+        throw "android_toolchain: invalid SHA-256 output";
+    }
+    return str_lower(fields[0]);
+}
+
+fn build(generated, options = nil) {
+    if options == nil { options = map{}; }
+    if type(generated) != "map"
+        or (try generated.format catch "") != "pblang.modern-ui.android.v1" {
+        throw "android_toolchain: invalid generated Android application";
+    }
+    let tools = discover(options);
+    if not tools.ok { return map{ ok: false, stage: "toolchain", error: tools.error }; }
+    if not fs_exists("/usr/bin/zip") {
+        return map{ ok: false, stage: "toolchain", error: "missing /usr/bin/zip" };
+    }
+    let stage = "build/modern-android/" + _slug(generated.package);
+    _reset_stage(stage);
+    let class_dir = stage + "/classes/" + path_dirname(generated.class_name);
+    let class_path = stage + "/classes/" + generated.class_name + ".class";
+    let dex_dir = stage + "/dex"; let dex_path = dex_dir + "/classes.dex";
+    let manifest_path = stage + "/AndroidManifest.xml";
+    let unsigned = stage + "/unsigned.apk"; let aligned = stage + "/aligned.apk";
+    fs_mkdirs(class_dir); fs_mkdirs(dex_dir);
+    fs_write_bytes(class_path, generated.class_bytes);
+    fs_write(manifest_path, generated.manifest);
+
+    let output = str(try options.output catch "");
+    if output == "" {
+        output = "build/modern-android/" + _slug(generated.package) + "/"
+            + _slug(generated.package) + "-debug.apk";
+    }
+    fs_mkdirs(path_dirname(output));
+    let bt = tools.build_tools;
+    _run(bt + "/d8", ["--min-api", str(generated.min_sdk), "--output", dex_dir,
+        class_path], "D8 conversion");
+    _run(bt + "/aapt2", ["link", "-I", tools.platform, "--manifest", manifest_path,
+        "--min-sdk-version", str(generated.min_sdk),
+        "--target-sdk-version", str(generated.target_sdk),
+        "-o", unsigned], "AAPT2 link");
+    _run("/usr/bin/zip", ["-q", "-j", unsigned, dex_path], "DEX packaging");
+    _run(bt + "/zipalign", ["-f", "-p", "4", unsigned, aligned], "ZIP alignment");
+
+    let home = str(try env_get("HOME") catch "");
+    let key_dir = home + "/.config/pblang/android";
+    let key = key_dir + "/debug.keystore";
+    if not fs_exists(key) {
+        let keytool = _keytool();
+        if keytool == nil {
+            return map{ ok: false, stage: "signing", error: "keytool is unavailable" };
+        }
+        fs_mkdirs(key_dir);
+        _run(keytool, ["-genkeypair", "-keystore", key, "-storepass", "android",
+            "-alias", "androiddebugkey", "-keypass", "android", "-dname",
+            "CN=PBLang Android Debug,O=PBLang,C=GR", "-keyalg", "RSA",
+            "-keysize", "2048", "-validity", "10000"], "debug key generation");
+        let chmod = if fs_exists("/usr/bin/chmod") { "/usr/bin/chmod" } else { "/bin/chmod"; };
+        _run(chmod, ["600", key], "debug key permissions");
+    }
+    _run(bt + "/apksigner", ["sign", "--ks", key, "--ks-key-alias",
+        "androiddebugkey", "--ks-pass", "pass:android", "--key-pass",
+        "pass:android", "--out", output, aligned], "APK signing");
+    _run(bt + "/apksigner", ["verify", "--verbose", "--print-certs", output],
+        "signature verification");
+    _run(bt + "/zipalign", ["-c", "-p", "4", output], "alignment verification");
+    let badging = _run(bt + "/aapt2", ["dump", "badging", output],
+        "manifest verification").stdout;
+    if not str_contains(badging, "package: name='" + generated.package + "'")
+        or not str_contains(badging, "launchable-activity: name='"
+            + generated.activity + "'") {
+        try fs_remove(output) catch nil;
+        return map{ ok: false, stage: "metadata",
+            error: "generated APK metadata does not match the requested application" };
+    }
+    let digest = _sha256(output);
+    let sidecar = output + ".sha256";
+    let report_path = output + ".manifest.json";
+    fs_write(sidecar, digest + "  " + path_basename(output) + "\n");
+    fs_write(report_path, json_stringify(map{
+        format: "pblang.android.apk.manifest.v1",
+        package: generated.package,
+        activity: generated.activity,
+        sha256: digest,
+        bytes: len(fs_read_bytes(output)),
+        widgets: generated.widgets,
+        min_sdk: generated.min_sdk,
+        target_sdk: generated.target_sdk,
+        compile_sdk: tools.compile_sdk,
+        build_tools: tools.build_tools_version,
+        implementation: "pblang-jvm-bytecode"
+    }));
+    let chmod = if fs_exists("/usr/bin/chmod") { "/usr/bin/chmod" } else { "/bin/chmod"; };
+    _run(chmod, ["644", output, sidecar, report_path], "artifact permissions");
+    return map{ ok: true, format: "pblang.android.apk.v1", output: output,
+        package: generated.package, activity: generated.activity,
+        widgets: generated.widgets, bytes: len(fs_read_bytes(output)),
+        sha256: digest, sha256_file: sidecar, manifest: report_path,
+        min_sdk: generated.min_sdk,
+        target_sdk: generated.target_sdk, compile_sdk: tools.compile_sdk,
+        build_tools: tools.build_tools_version, implementation: "pblang-jvm-bytecode" };
+}
+
+export discover, build;

@@ -16,6 +16,7 @@ let AT_FDCWD = -100;
 let AT_REMOVEDIR = 512;
 let O_RDONLY = 0; let O_WRONLY = 1;
 let O_CREAT = 64; let O_EXCL = 128;
+let O_NONBLOCK = 2048;
 let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
 let MODE_FILE = 384; let MODE_DIR = 448;
 let MAX_PATH = 4096; let MAX_COMPONENT = 255;
@@ -43,6 +44,21 @@ fn _components(path, allow_root = true) {
         if part == "" or part == "." or part == ".." or len(part) > MAX_COMPONENT { return nil; }
         array_push(out, part); i = i + 1;
     }
+    return out;
+}
+
+fn _absolute_components(path) {
+    if type(path) != "string" or len(path) < 2 or len(path) > MAX_PATH
+        or not str_starts_with(path, "/") or str_contains(path, strfromcharcode(0)) {
+        return nil;
+    }
+    let raw = str_split(path, "/"); let out = []; let i = 1;
+    while i < len(raw) {
+        let part = raw[i];
+        if part == "" or part == "." or part == ".." or len(part) > MAX_COMPONENT { return nil; }
+        array_push(out, part); i = i + 1;
+    }
+    if len(out) == 0 { return nil; }
     return out;
 }
 
@@ -96,6 +112,34 @@ fn open(root, create = true) {
                 libc: libc, libc_path: host.libc, closed: false };
 }
 
+// Open a trusted absolute application-data root component-by-component. No
+// component may be a symlink, and newly created directories are private from
+// their first observable state. The final root is forced to mode 0700.
+fn open_absolute(root, create = true) {
+    let host = available(); if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
+    let parts = _absolute_components(root); if parts == nil { return _error("root must be a safe absolute path"); }
+    let libc = try ffi_load(host.libc) catch nil;
+    if libc == nil { return _error("trusted libc cannot be loaded"); }
+    let holder = map{ libc: libc };
+    let current = _openat(holder, AT_FDCWD, "/", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+    if current < 0 { ffi_close(libc); return _error("filesystem root cannot be opened"); }
+    let i = 0;
+    while i < len(parts) {
+        let next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        if next < 0 and create {
+            let made = _mkdirat(holder, current, parts[i], MODE_DIR);
+            if made == 0 { next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0); }
+        }
+        _close_fd(holder, current);
+        if next < 0 { ffi_close(libc); return _error("absolute path component is missing, not a directory, or a symbolic link"); }
+        current = next; i = i + 1;
+    }
+    let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
+    if protected != 0 { _close_fd(holder, current); ffi_close(libc); return _error("application root permissions cannot be protected"); }
+    return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
+                libc: libc, libc_path: host.libc, closed: false, absolute: true };
+}
+
 fn close(fs) {
     if fs == nil or not is_map(fs) or (try fs.closed catch true) { return false; }
     _close_fd(fs, fs.root_fd); ffi_close(fs.libc); fs.closed = true; fs.root_fd = -1; return true;
@@ -145,12 +189,22 @@ fn list(fs, path = "root", max_entries = 512) {
 
 fn read_bytes(fs, path, max_bytes = 4194304) {
     let parent = _parent(fs, path, false); if not parent.ok { return parent; }
-    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NOFOLLOW + O_CLOEXEC, 0);
+    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
     _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be opened without following links"); }
     let bytes = try fs_read_bytes(_fd_path(fd)) catch nil; _close_fd(fs, fd);
     if not is_array(bytes) { return _error("path is not a readable regular file"); }
     if len(bytes) > max_bytes { return _error("file exceeds byte limit"); }
     return map{ ok: true, path: path, bytes: bytes, size: len(bytes) };
+}
+
+fn protect_file(fs, path) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be protected without following links"); }
+    let protected = _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE]));
+    _close_fd(fs, fd);
+    if protected != 0 { return _error("file permissions cannot be protected"); }
+    return map{ ok: true, path: path, mode: MODE_FILE };
 }
 
 fn _stage_name() { return ".pblang-stage-" + str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32); }
@@ -197,4 +251,4 @@ fn status(fs) {
                 atomic_renameat: true, libc: try fs.libc_path catch nil };
 }
 
-export available, open, close, mkdir, list, read_bytes, write_atomic, remove, move, status;
+export available, open, open_absolute, close, mkdir, list, read_bytes, protect_file, write_atomic, remove, move, status;

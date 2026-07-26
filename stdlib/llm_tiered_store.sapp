@@ -1,0 +1,640 @@
+// Bounded, integrity-checked LLM shard streaming across disk and RAM tiers.
+//
+// This is the executable storage substrate behind low-memory layer and MoE
+// inference. It keeps model precision and routing semantics explicit: placement
+// may change latency, but it never silently rewrites weights or router choices.
+
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+
+let FORMAT = "pblang.llm.tiered_store.v1";
+let MAX_SHARDS = 65536;
+let DEFAULT_MAX_SHARD_BYTES = 268435456;
+
+fn _error(code, message) {
+    return map{ ok: false, format: FORMAT, code: code, error: message };
+}
+
+fn _int(value, fallback, minimum, maximum) {
+    if type(value) != "number" or value != value { return fallback; }
+    let n = num_floor(value);
+    if n < minimum { return minimum; }
+    if n > maximum { return maximum; }
+    return n;
+}
+
+fn _safe_relative(path) {
+    if type(path) != "string" or path == "" or len(path) > 4096
+        or str_starts_with(path, "/") or str_contains(path, "\\")
+        or str_contains(path, strfromcharcode(0)) {
+        return false;
+    }
+    let parts = str_split(path, "/");
+    let i = 0;
+    while i < len(parts) {
+        if parts[i] == "" or parts[i] == "." or parts[i] == ".." or len(parts[i]) > 255 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _hex_digest(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < 64 {
+        let c = strcharcodeat(value, i);
+        let digit = c >= 48 and c <= 57;
+        let lower = c >= 97 and c <= 102;
+        if not digit and not lower { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+
+fn _stable_hash(text) {
+    let h = 2166136261;
+    let i = 0;
+    while i < len(text) {
+        h = num_mod((h * 16777619) + strcharcodeat(text, i), 2147483647);
+        i = i + 1;
+    }
+    if h < 0 { h = 0 - h; }
+    return h;
+}
+
+fn model_part(a, b, c, d, e = "layer", f = nil, g = nil, h = "native") {
+    if f == nil { f = 0 - 1; }
+    if g == nil { g = 0 - 1; }
+    return map{
+        format: "pblang.llm.shard.v1",
+        id: str(a),
+        path: b,
+        bytes: c,
+        sha256: str_lower(str(d)),
+        kind: str_lower(str(e)),
+        layer_index: f,
+        expert_index: g,
+        precision: str(h)
+    };
+}
+
+fn mirror(root, weight = 1) {
+    return map{ format: "pblang.llm.mirror.v1", root: root, weight: weight };
+}
+
+fn config(ram_budget_bytes, options = nil) {
+    if options == nil { options = map{}; }
+    return map{
+        format: "pblang.llm.tiered_store.config.v1",
+        ram_budget_bytes: _int(ram_budget_bytes, 0, 0, 1099511627776),
+        max_shard_bytes: _int(try options.max_shard_bytes catch DEFAULT_MAX_SHARD_BYTES,
+                              DEFAULT_MAX_SHARD_BYTES, 1, 1073741824),
+        max_cache_entries: _int(try options.max_cache_entries catch 256, 256, 1, 65536),
+        prefetch_capacity: _int(try options.prefetch_capacity catch 4, 4, 0, 1024),
+        hot_slots: _int(try options.hot_slots catch 0, 0, 0, 4096),
+        heat_decay_interval: _int(try options.heat_decay_interval catch 4096, 4096, 32, 1000000000),
+        primary_weight: _int(try options.primary_weight catch 1, 1, 1, 1000000),
+        mirrors: try options.mirrors catch [],
+        expected_precision: str(try options.expected_precision catch "native"),
+        verify_sha256: (try options.verify_sha256 catch true) == true,
+        require_linux_confinement: (try options.require_linux_confinement catch true) == true
+    };
+}
+
+fn _valid_shard(value, cfg) {
+    if type(value) != "map" or (try value.format catch "") != "pblang.llm.shard.v1" {
+        return "invalid shard record";
+    }
+    if type(value.id) != "string" or value.id == "" or len(value.id) > 256 {
+        return "invalid shard id";
+    }
+    if not _safe_relative(value.path) { return "unsafe shard path"; }
+    if type(value.bytes) != "number" or value.bytes < 0
+        or num_floor(value.bytes) != value.bytes or value.bytes > cfg.max_shard_bytes {
+        return "invalid or oversized shard length";
+    }
+    if cfg.verify_sha256 and not _hex_digest(value.sha256) { return "invalid shard SHA-256"; }
+    if value.kind != "layer" and value.kind != "expert" and value.kind != "dense"
+        and value.kind != "embedding" and value.kind != "head" {
+        return "unsupported shard kind";
+    }
+    if value.precision != cfg.expected_precision { return "shard precision mismatch"; }
+    return "";
+}
+
+fn _open_root(root, weight, cfg) {
+    let entry = map{
+        root: root, weight: weight, available: false, confined: false, handle: nil
+    };
+    if type(root) != "string" or root == "" or len(root) > 4096
+        or str_contains(root, strfromcharcode(0)) {
+        return entry;
+    }
+
+    if platform() == "linux" and DIRFS.available().ok {
+        let opened = if str_starts_with(root, "/") {
+            DIRFS.open_absolute(root, false)
+        } else {
+            DIRFS.open(root, false)
+        };
+        if opened.ok {
+            entry.available = true;
+            entry.confined = true;
+            entry.handle = opened;
+            return entry;
+        }
+        if cfg.require_linux_confinement { return entry; }
+    }
+
+    if try fs_exists(root) catch false {
+        entry.available = true;
+    }
+    return entry;
+}
+
+fn create(root, shards, cfg = nil) {
+    if cfg == nil { cfg = config(536870912); }
+    if type(cfg) != "map" or (try cfg.format catch "") != "pblang.llm.tiered_store.config.v1" {
+        return _error("config", "invalid tiered-store configuration");
+    }
+    if type(shards) != "array" or len(shards) == 0 or len(shards) > MAX_SHARDS {
+        return _error("manifest", "shard manifest must be non-empty and bounded");
+    }
+
+    let by_id = map{};
+    let i = 0;
+    while i < len(shards) {
+        let problem = _valid_shard(shards[i], cfg);
+        if problem != "" { return _error("manifest", problem + " at index " + str(i)); }
+        if map_has(by_id, shards[i].id) { return _error("manifest", "duplicate shard id"); }
+        by_id[shards[i].id] = shards[i];
+        i = i + 1;
+    }
+
+    let roots = [];
+    let primary = _open_root(root, cfg.primary_weight, cfg);
+    if not primary.available {
+        return _error("root", "primary shard root is unavailable or not safely confined");
+    }
+    array_push(roots, primary);
+
+    let mirrors = cfg.mirrors;
+    if type(mirrors) != "array" { return _error("config", "mirrors must be an array"); }
+    i = 0;
+    while i < len(mirrors) {
+        let m = mirrors[i];
+        let mr = try m.root catch nil;
+        let mw = _int(try m.weight catch 1, 1, 1, 1000000);
+        let opened_mirror = _open_root(mr, mw, cfg);
+        if opened_mirror.available { array_push(roots, opened_mirror); }
+        i = i + 1;
+    }
+
+    return map{
+        ok: true,
+        format: FORMAT,
+        root: root,
+        config: cfg,
+        shards: shards,
+        shard_by_id: by_id,
+        roots: roots,
+        cache: map{},
+        resident_bytes: 0,
+        prefetch_queue: [],
+        heat: map{},
+        last: map{},
+        clock: 0,
+        closed: false,
+        stats: map{
+            loads: 0, hits: 0, misses: 0, evictions: 0, bypasses: 0,
+            verified_reads: 0, rejected_reads: 0, mirror_failovers: 0,
+            prefetched: 0, prefetch_hits: 0, route_events: 0
+        }
+    };
+}
+
+fn _touch(store, id) {
+    store.clock = store.clock + 1;
+    let heat = if map_has(store.heat, id) { store.heat[id] } else { 0 };
+    if heat < 2147483647 { store.heat[id] = heat + 1; }
+    store.last[id] = store.clock;
+
+    if num_mod(store.clock, store.config.heat_decay_interval) == 0 {
+        let keys = map_keys(store.heat);
+        let i = 0;
+        while i < len(keys) {
+            store.heat[keys[i]] = num_floor(store.heat[keys[i]] / 2);
+            i = i + 1;
+        }
+    }
+}
+
+fn _score(store, id) {
+    let heat = if map_has(store.heat, id) { store.heat[id] } else { 0 };
+    let last = if map_has(store.last, id) { store.last[id] } else { 0 };
+    return heat * 1048576 + last;
+}
+
+fn _preferred_root(store, id) {
+    let total = 0;
+    let i = 0;
+    while i < len(store.roots) { total = total + store.roots[i].weight; i = i + 1; }
+    if total <= 0 { return 0; }
+    let slot = num_mod(_stable_hash(id), total);
+    let cumulative = 0;
+    i = 0;
+    while i < len(store.roots) {
+        cumulative = cumulative + store.roots[i].weight;
+        if slot < cumulative { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn weighted_root_for(store, id) {
+    if store == nil or not (try store.ok catch false) or len(store.roots) == 0 { return nil; }
+    return store.roots[_preferred_root(store, id)].root;
+}
+
+fn _read_root(store, root_entry, shard_value) {
+    let bytes = nil;
+    if root_entry.confined {
+        let result = DIRFS.read_bytes(root_entry.handle, shard_value.path, store.config.max_shard_bytes);
+        if result.ok { bytes = result.bytes; }
+    } else {
+        bytes = try fs_read_bytes(path_join(root_entry.root, shard_value.path)) catch nil;
+    }
+    if type(bytes) != "array" { return _error("read", "shard is not readable"); }
+    if len(bytes) != shard_value.bytes or len(bytes) > store.config.max_shard_bytes {
+        return _error("size", "shard length does not match the manifest");
+    }
+    if store.config.verify_sha256 and _digest(bytes) != shard_value.sha256 {
+        return _error("integrity", "shard SHA-256 mismatch");
+    }
+    return map{ ok: true, bytes: bytes, root: root_entry.root, confined: root_entry.confined };
+}
+
+fn _read_verified(store, shard_value) {
+    let preferred = _preferred_root(store, shard_value.id);
+    let attempt = 0;
+    let last_error = _error("read", "no shard root is readable");
+    while attempt < len(store.roots) {
+        let index = num_mod(preferred + attempt, len(store.roots));
+        let root_entry = store.roots[index];
+        if root_entry.available {
+            let result = _read_root(store, root_entry, shard_value);
+            if result.ok {
+                if attempt > 0 { store.stats.mirror_failovers = store.stats.mirror_failovers + 1; }
+                store.stats.verified_reads = store.stats.verified_reads + 1;
+                return result;
+            }
+            last_error = result;
+        }
+        attempt = attempt + 1;
+    }
+    store.stats.rejected_reads = store.stats.rejected_reads + 1;
+    return last_error;
+}
+
+fn _evict_one(store) {
+    let keys = map_keys(store.cache);
+    let victim = "";
+    let victim_score = 0;
+    let found = false;
+    let i = 0;
+    while i < len(keys) {
+        let entry = store.cache[keys[i]];
+        if not entry.pinned {
+            let score = _score(store, keys[i]);
+            if not found or score < victim_score {
+                found = true;
+                victim = keys[i];
+                victim_score = score;
+            }
+        }
+        i = i + 1;
+    }
+    if not found { return false; }
+    store.resident_bytes = store.resident_bytes - store.cache[victim].bytes;
+    map_remove(store.cache, victim);
+    store.stats.evictions = store.stats.evictions + 1;
+    return true;
+}
+
+fn _make_room(store, bytes) {
+    while (store.resident_bytes + bytes > store.config.ram_budget_bytes
+           or len(map_keys(store.cache)) >= store.config.max_cache_entries)
+          and _evict_one(store) {
+    }
+    return store.resident_bytes + bytes <= store.config.ram_budget_bytes
+        and len(map_keys(store.cache)) < store.config.max_cache_entries;
+}
+
+fn _cache_insert(store, shard_value, bytes, pin, prefetched) {
+    if shard_value.bytes > store.config.ram_budget_bytes or not _make_room(store, shard_value.bytes) {
+        store.stats.bypasses = store.stats.bypasses + 1;
+        return false;
+    }
+    store.cache[shard_value.id] = map{
+        data: bytes,
+        bytes: shard_value.bytes,
+        manual_pinned: pin,
+        hot_pinned: false,
+        pinned: pin,
+        prefetched: prefetched
+    };
+    store.resident_bytes = store.resident_bytes + shard_value.bytes;
+    return true;
+}
+
+fn load(store, id, pin = false) {
+    if store == nil or not (try store.ok catch false) or (try store.closed catch true) {
+        return _error("closed", "tiered store is not open");
+    }
+    id = str(id);
+    if not map_has(store.shard_by_id, id) { return _error("missing", "unknown shard id"); }
+    store.stats.loads = store.stats.loads + 1;
+    _touch(store, id);
+
+    if map_has(store.cache, id) {
+        let entry = store.cache[id];
+        store.stats.hits = store.stats.hits + 1;
+        if entry.prefetched {
+            store.stats.prefetch_hits = store.stats.prefetch_hits + 1;
+            entry.prefetched = false;
+        }
+        if pin {
+            entry.manual_pinned = true;
+            entry.pinned = true;
+        }
+        return map{
+            ok: true, format: "pblang.llm.shard_load.v1", id: id,
+            bytes: entry.data, size: entry.bytes, cache_hit: true,
+            cached: true, verified: true, source_root: "ram"
+        };
+    }
+
+    store.stats.misses = store.stats.misses + 1;
+    let shard_value = store.shard_by_id[id];
+    let read = _read_verified(store, shard_value);
+    if not read.ok { return read; }
+    let cached = _cache_insert(store, shard_value, read.bytes, pin, false);
+    return map{
+        ok: true, format: "pblang.llm.shard_load.v1", id: id,
+        bytes: read.bytes, size: len(read.bytes), cache_hit: false,
+        cached: cached, verified: true, source_root: read.root,
+        confined: read.confined
+    };
+}
+
+fn unpin(store, id) {
+    id = str(id);
+    if not map_has(store.cache, id) { return false; }
+    let entry = store.cache[id];
+    entry.manual_pinned = false;
+    entry.pinned = entry.hot_pinned;
+    return true;
+}
+
+fn rebalance_hot(store) {
+    let keys = map_keys(store.cache);
+    let i = 0;
+    while i < len(keys) {
+        let entry = store.cache[keys[i]];
+        entry.hot_pinned = false;
+        entry.pinned = entry.manual_pinned;
+        i = i + 1;
+    }
+
+    let selected = map{};
+    let wanted = store.config.hot_slots;
+    let count = 0;
+    while count < wanted and count < len(keys) {
+        let best = "";
+        let best_score = 0;
+        let found = false;
+        i = 0;
+        while i < len(keys) {
+            let id = keys[i];
+            if not map_has(selected, id) {
+                let score = _score(store, id);
+                if not found or score > best_score {
+                    best = id;
+                    best_score = score;
+                    found = true;
+                }
+            }
+            i = i + 1;
+        }
+        if not found { break; }
+        selected[best] = true;
+        store.cache[best].hot_pinned = true;
+        store.cache[best].pinned = true;
+        count = count + 1;
+    }
+    return map{ ok: true, hot_pinned: map_keys(selected), slots: wanted };
+}
+
+fn _queued(store, id) {
+    let i = 0;
+    while i < len(store.prefetch_queue) {
+        if store.prefetch_queue[i] == id { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn queue_prefetch(store, ids) {
+    if type(ids) != "array" { return _error("prefetch", "prefetch ids must be an array"); }
+    let accepted = [];
+    let rejected = [];
+    let i = 0;
+    while i < len(ids) {
+        let id = str(ids[i]);
+        if not map_has(store.shard_by_id, id) {
+            array_push(rejected, map{ id: id, reason: "unknown" });
+        } else if map_has(store.cache, id) or _queued(store, id) {
+            array_push(rejected, map{ id: id, reason: "resident-or-queued" });
+        } else if len(store.prefetch_queue) >= store.config.prefetch_capacity {
+            array_push(rejected, map{ id: id, reason: "queue-full" });
+        } else {
+            array_push(store.prefetch_queue, id);
+            array_push(accepted, id);
+        }
+        i = i + 1;
+    }
+    return map{
+        ok: true, format: "pblang.llm.prefetch_queue.v1",
+        accepted: accepted, rejected: rejected, queued: len(store.prefetch_queue)
+    };
+}
+
+fn run_prefetch(store, max_items = 1) {
+    let limit = _int(max_items, 1, 0, store.config.prefetch_capacity);
+    let completed = [];
+    let failed = [];
+    let processed = 0;
+    while processed < limit and processed < len(store.prefetch_queue) {
+        let id = store.prefetch_queue[processed];
+        let loaded = load(store, id, false);
+        if loaded.ok {
+            if map_has(store.cache, id) {
+                store.cache[id].prefetched = true;
+                store.stats.prefetched = store.stats.prefetched + 1;
+            }
+            array_push(completed, id);
+        } else {
+            array_push(failed, map{ id: id, code: loaded.code, error: loaded.error });
+        }
+        processed = processed + 1;
+    }
+    let remaining = [];
+    let i = processed;
+    while i < len(store.prefetch_queue) {
+        array_push(remaining, store.prefetch_queue[i]);
+        i = i + 1;
+    }
+    store.prefetch_queue = remaining;
+    return map{
+        ok: len(failed) == 0,
+        format: "pblang.llm.prefetch_run.v1",
+        completed: completed,
+        failed: failed,
+        queued: len(remaining)
+    };
+}
+
+fn _expert_id(store, layer_index, expert_index) {
+    let i = 0;
+    while i < len(store.shards) {
+        let s = store.shards[i];
+        if s.kind == "expert" and s.layer_index == layer_index and s.expert_index == expert_index {
+            return s.id;
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn record_routes(store, layer_index, expert_indices) {
+    if type(expert_indices) != "array" { return _error("router", "expert indices must be an array"); }
+    let accepted = [];
+    let i = 0;
+    while i < len(expert_indices) {
+        let id = _expert_id(store, layer_index, expert_indices[i]);
+        if id != nil {
+            _touch(store, id);
+            store.stats.route_events = store.stats.route_events + 1;
+            array_push(accepted, id);
+        }
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        format: "pblang.llm.route_heat.v1",
+        layer_index: layer_index,
+        accepted: accepted
+    };
+}
+
+fn predict_experts(store, layer_index, limit = 2) {
+    let candidates = [];
+    let i = 0;
+    while i < len(store.shards) {
+        let s = store.shards[i];
+        if s.kind == "expert" and s.layer_index == layer_index { array_push(candidates, s.id); }
+        i = i + 1;
+    }
+    let wanted = _int(limit, 2, 0, len(candidates));
+    let selected = map{};
+    let out = [];
+    while len(out) < wanted {
+        let best = "";
+        let best_score = 0;
+        let found = false;
+        i = 0;
+        while i < len(candidates) {
+            let id = candidates[i];
+            if not map_has(selected, id) {
+                let score = _score(store, id);
+                if not found or score > best_score {
+                    best = id;
+                    best_score = score;
+                    found = true;
+                }
+            }
+            i = i + 1;
+        }
+        if not found { break; }
+        selected[best] = true;
+        array_push(out, best);
+    }
+    return out;
+}
+
+fn queue_expert_prefetch(store, layer_index, limit = 2) {
+    return queue_prefetch(store, predict_experts(store, layer_index, limit));
+}
+
+fn status(store) {
+    let cache_keys = map_keys(store.cache);
+    let pinned = 0;
+    let i = 0;
+    while i < len(cache_keys) {
+        if store.cache[cache_keys[i]].pinned { pinned = pinned + 1; }
+        i = i + 1;
+    }
+    return map{
+        ok: not store.closed,
+        format: "pblang.llm.tiered_store.status.v1",
+        shards: len(store.shards),
+        roots: len(store.roots),
+        cached_shards: len(cache_keys),
+        pinned_shards: pinned,
+        resident_bytes: store.resident_bytes,
+        ram_budget_bytes: store.config.ram_budget_bytes,
+        queued_prefetch: len(store.prefetch_queue),
+        precision: store.config.expected_precision,
+        semantics_preserved: true,
+        stats: store.stats
+    };
+}
+
+fn close(store) {
+    if store == nil or (try store.closed catch true) { return false; }
+    let i = 0;
+    while i < len(store.roots) {
+        if store.roots[i].handle != nil { DIRFS.close(store.roots[i].handle); }
+        i = i + 1;
+    }
+    store.cache = map{};
+    store.prefetch_queue = [];
+    store.resident_bytes = 0;
+    store.closed = true;
+    return true;
+}
+
+fn capability() {
+    return map{
+        format: "pblang.llm.tiered_store.capability.v1",
+        implemented: [
+            "layer and MoE expert shards", "bounded RAM cache", "LFU-recency eviction",
+            "learned hot pinning", "look-ahead prefetch queue", "weighted disk mirrors",
+            "SHA-256 and exact-length verification", "Linux no-follow directory confinement",
+            "explicit precision contract", "routing heat and expert prediction"
+        ],
+        placement_changes_semantics: false,
+        asynchronous_io: false,
+        gpu_transfer_backend: false,
+        note: "Prefetch execution is synchronous until PBLang gains portable async read-at handles."
+    };
+}
+
+export FORMAT, MAX_SHARDS, DEFAULT_MAX_SHARD_BYTES;
+export model_part, mirror, config, create, load, unpin, rebalance_hot;
+export weighted_root_for, queue_prefetch, run_prefetch;
+export record_routes, predict_experts, queue_expert_prefetch;
+export status, close, capability;

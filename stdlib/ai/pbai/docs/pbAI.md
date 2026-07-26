@@ -209,6 +209,21 @@ The split is deliberate:
 pblang's `stdlib:llm_*` foundation, but the tier metadata and checkpoint contract remain
 owned here.
 
+### Low-memory model streaming
+
+`stdlib/pbai_streaming.sapp` exposes `stdlib:llm_tiered_store.sapp` through the
+product facade. It validates bounded layer/MoE manifests, verifies exact length and
+SHA-256 before use, enforces RAM and entry budgets, learns hot experts from router
+events, performs bounded look-ahead prefetch, and fails over across weighted storage
+mirrors. The architecture adopts useful layer-streaming and expert-hierarchy ideas from
+[AirLLM](https://github.com/lyogavin/airllm) and
+[Colibri](https://github.com/JustVugg/colibri) without importing their implementation
+code or silently changing model precision/router semantics.
+
+Current boundary: file prefetch is synchronous, loaded data remains verified byte
+arrays rather than GPU tensors, and external checkpoint formats require adapters before
+end-to-end transformer execution.
+
 ---
 
 ## 3. Why pbAI is written in pblang
@@ -736,7 +751,7 @@ checkpoints are used only to compare quality and speed.
 
 | Phase | Goal |
 |-------|------|
-| **P0 — Fresh inference contract** | Started: pblang `llm_*` foundation + `AAP/ai/pbai/stdlib/pbai_max.sapp` define tokenizer, decoder, sampling, checkpoint, persistence, eval, benchmark, prompt regression, binary-token, live-architecture, feedback-loop, and guessing-loop contracts. No old checkpoint defines this contract. |
+| **P0 — Fresh inference contract** | Started: pblang `llm_*` foundation + `AAP/ai/pbai/stdlib/pbai_max.sapp` define tokenizer, decoder, sampling, checkpoint, persistence, eval, benchmark, prompt regression, binary-token, live-architecture, feedback-loop, guessing-loop, and integrity-checked low-memory layer/MoE streaming contracts. No old checkpoint defines this contract. |
 | **P1 — pbAI-Nano/-Mini** | Train the first fresh tiny + small models for pblang completion/debugging on pblang/code data plus selected external corpora; benchmark accuracy, latency, memory, and tokens/sec; lock with drift tests. |
 | **P2 — Agent loop + tools** | Wire the plan→act→verify loop to `frontend_run`, the lint/typeck oracles, and the pb-mcp-server tool catalog. |
 | **P3 — pbAI-Max + distillation** | Train/assemble the new flagship on the full curated corpus; scale the implemented saved Pro/Mini/Nano student-family checkpoints from bounded semantic-test data into larger curated teacher datasets. |

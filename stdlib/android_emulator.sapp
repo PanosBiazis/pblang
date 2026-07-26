@@ -1,0 +1,510 @@
+// Bounded Android userspace/runtime emulator written in PBLang.
+//
+// This composes the platform and device models with the self-hosted PBCS VM.
+// It models application isolation, lifecycle, permissions, explicit intents,
+// private storage, service calls and secure network plans. It does not emulate
+// Linux kernel drivers, Binder wire encoding, ART internals or vendor firmware.
+
+let Platform = import("stdlib:platform_emulator.sapp");
+let Device = import("stdlib:device_emulator.sapp");
+let PBCK = import("stdlib:selfhost_pbck.sapp");
+let VM = import("stdlib/compiler/vm.sapp");
+let Frontend = import("stdlib/compiler/selfhost_frontend.sapp");
+
+let FORMAT = "pblang.android.emulator.v1";
+let APP_FORMAT = "pblang.android.app.v1";
+let MAX_API = 100;
+let MAX_PACKAGE_BYTES = 255;
+let MAX_PERMISSION_BYTES = 256;
+
+fn _option(options, key, fallback) {
+    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+
+fn _bounded_int(value, label, low, high) {
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw "android_emulator: " + label + " must be " + str(low) + ".." + str(high);
+    }
+    return value;
+}
+
+fn _ascii_letter(code) { return (code >= 65 and code <= 90) or (code >= 97 and code <= 122); }
+fn _ascii_digit(code) { return code >= 48 and code <= 57; }
+
+fn _valid_package(value) {
+    if type(value) != "string" or len(value) < 3 or len(value) > MAX_PACKAGE_BYTES { return false; }
+    let parts = str_split(value, ".");
+    if len(parts) < 2 or len(parts) > 32 { return false; }
+    let i = 0;
+    while i < len(parts) {
+        let part = parts[i];
+        if len(part) == 0 or len(part) > 63 or not _ascii_letter(strcharcodeat(part, 0)) { return false; }
+        let j = 1;
+        while j < len(part) {
+            let code = strcharcodeat(part, j);
+            if not _ascii_letter(code) and not _ascii_digit(code) and code != 95 { return false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _valid_atom(value, maximum = 256) {
+    if type(value) != "string" or len(value) == 0 or len(value) > maximum { return false; }
+    let i = 0;
+    while i < len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 33 or code > 126 or code == 47 or code == 92 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _activity_name(package_name, value) {
+    if type(value) != "string" or len(value) == 0 or len(value) > 255 { return nil; }
+    let out = value;
+    if str_starts_with(value, ".") { out = package_name + value; }
+    elif not str_contains(value, ".") { out = package_name + "." + value; }
+    let parts = str_split(out, ".");
+    let i = 0;
+    while i < len(parts) {
+        if not _valid_atom(parts[i], 80) { return nil; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _normal_permission(name) {
+    return name == "android.permission.INTERNET"
+        or name == "android.permission.ACCESS_NETWORK_STATE"
+        or name == "android.permission.FOREGROUND_SERVICE"
+        or name == "android.permission.WAKE_LOCK"
+        or name == "android.permission.VIBRATE";
+}
+
+fn _event(emulator, package_name, kind, detail = "") {
+    if len(emulator.events) >= emulator.limits.max_events {
+        return map{ ok: false, error: "event queue limit exceeded" };
+    }
+    emulator.event_seq = emulator.event_seq + 1;
+    array_push(emulator.events, map{
+        seq: emulator.event_seq, time_ms: emulator.device.clock_ms,
+        package: package_name, kind: kind, detail: str(detail)
+    });
+    return map{ ok: true, seq: emulator.event_seq };
+}
+
+fn _event_capacity(emulator, additional) {
+    return len(emulator.events) <= emulator.limits.max_events - additional;
+}
+
+fn _app(emulator, package_name) {
+    if emulator == nil or (try emulator.format catch "") != FORMAT { return nil; }
+    if type(package_name) != "string" or not map_has(emulator.packages, package_name) { return nil; }
+    return emulator.packages[package_name];
+}
+
+fn new(api = 34, arch = "arm64", options = nil) {
+    let level = _bounded_int(api, "api", 21, MAX_API);
+    let width = _bounded_int(_option(options, "width", 1080), "width", 1, 32768);
+    let height = _bounded_int(_option(options, "height", 2400), "height", 1, 32768);
+    let memory_bytes = _bounded_int(_option(options, "memory_bytes", 1048576), "memory_bytes", 4096, 16777216);
+    let profile = Device.resolve("smartphone", "android", str(level), arch,
+        map{ memory_bytes: memory_bytes, width: width, height: height });
+    if not profile.ok { throw "android_emulator: " + profile.error; }
+    let machine = Device.machine(profile, map{
+        max_files: _bounded_int(_option(options, "max_files", 512), "max_files", 1, 4096),
+        max_output_bytes: _bounded_int(_option(options, "max_output_bytes", 1048576), "max_output_bytes", 1, 16777216),
+        max_input_events: _bounded_int(_option(options, "max_input_events", 10000), "max_input_events", 1, 1000000)
+    });
+    return map{
+        format: FORMAT, api: level, arch: profile.platform.arch,
+        platform: profile.platform, device: machine, packages: map{}, package_count: 0,
+        foreground: nil, next_pid: 1000, events: [], event_seq: 0,
+        service_calls: 0, network_plans: 0,
+        limits: map{
+            max_packages: _bounded_int(_option(options, "max_packages", 32), "max_packages", 1, 1024),
+            max_events: _bounded_int(_option(options, "max_events", 10000), "max_events", 1, 1000000),
+            max_services_per_app: _bounded_int(_option(options, "max_services_per_app", 128), "max_services_per_app", 1, 4096),
+            max_service_calls: _bounded_int(_option(options, "max_service_calls", 100000), "max_service_calls", 1, 1000000),
+            max_network_plans: _bounded_int(_option(options, "max_network_plans", 100000), "max_network_plans", 1, 1000000),
+            max_bytecode_bytes: _bounded_int(_option(options, "max_bytecode_bytes", 16777216), "max_bytecode_bytes", 1024, PBCK.MAX_ARTIFACT_BYTES)
+        },
+        boundary: "Android userspace/runtime conformance model; no kernel, ART, radio, GPU-driver or vendor-framework emulation"
+    };
+}
+
+fn install(emulator, spec) {
+    if emulator == nil or (try emulator.format catch "") != FORMAT { return map{ ok: false, error: "invalid emulator" }; }
+    if spec == nil or not is_map(spec) { return map{ ok: false, error: "application spec must be a map" }; }
+    let package_name = try spec.package catch "";
+    if not _valid_package(package_name) { return map{ ok: false, error: "invalid Android package name" }; }
+    if map_has(emulator.packages, package_name) { return map{ ok: false, error: "package already installed" }; }
+    if emulator.package_count >= emulator.limits.max_packages { return map{ ok: false, error: "package limit exceeded" }; }
+    let min_sdk = try spec.min_sdk catch 21;
+    let target_sdk = try spec.target_sdk catch emulator.api;
+    if type(min_sdk) != "number" or type(target_sdk) != "number" or min_sdk != num_floor(min_sdk)
+        or target_sdk != num_floor(target_sdk) or min_sdk < 21 or min_sdk > emulator.api
+        or target_sdk < min_sdk or target_sdk > MAX_API {
+        return map{ ok: false, error: "invalid or incompatible SDK contract" };
+    }
+    let activity_specs = try spec.activities catch [];
+    if not is_array(activity_specs) or len(activity_specs) == 0 or len(activity_specs) > 256 {
+        return map{ ok: false, error: "application requires 1..256 activities" };
+    }
+    let activities = map{}; let i = 0;
+    while i < len(activity_specs) {
+        let row = activity_specs[i];
+        if not is_map(row) { return map{ ok: false, error: "invalid activity spec" }; }
+        let name = _activity_name(package_name, try row.name catch "");
+        if name == nil or map_has(activities, name) { return map{ ok: false, error: "invalid or duplicate activity" }; }
+        let exported = try row.exported catch false;
+        if type(exported) != "bool" { return map{ ok: false, error: "activity exported flag must be boolean" }; }
+        activities[name] = map{ name: name, exported: exported };
+        i = i + 1;
+    }
+    let main_activity = _activity_name(package_name, try spec.main_activity catch "");
+    if main_activity == nil or not map_has(activities, main_activity) {
+        return map{ ok: false, error: "main activity is not declared" };
+    }
+    let requested_list = try spec.permissions catch [];
+    if not is_array(requested_list) or len(requested_list) > 128 { return map{ ok: false, error: "invalid permission list" }; }
+    let requested = map{}; let grants = map{}; i = 0;
+    while i < len(requested_list) {
+        let permission = requested_list[i];
+        if not _valid_atom(permission, MAX_PERMISSION_BYTES) { return map{ ok: false, error: "invalid permission" }; }
+        requested[permission] = true;
+        if _normal_permission(permission) { grants[permission] = true; }
+        i = i + 1;
+    }
+    let allow_cleartext = try spec.allow_cleartext catch false;
+    if type(allow_cleartext) != "bool" { return map{ ok: false, error: "allow_cleartext must be boolean" }; }
+    let app = map{
+        format: APP_FORMAT, package: package_name, min_sdk: min_sdk, target_sdk: target_sdk,
+        activities: activities, main_activity: main_activity, permissions: requested, grants: grants,
+        allow_cleartext: allow_cleartext,
+        state: "installed", activity: "", pid: 0, launches: 0,
+        services: map{}, service_count: 0, storage_prefix: "apps/" + package_name
+    };
+    let recorded = _event(emulator, package_name, "package-installed", str(target_sdk));
+    if not recorded.ok { return recorded; }
+    emulator.packages[package_name] = app; emulator.package_count = emulator.package_count + 1;
+    return map{ ok: true, package: package_name, main_activity: main_activity, auto_grants: map_keys(grants) };
+}
+
+fn _purge_private(emulator, app) {
+    let listed = Platform.syscall(emulator.device.platform, "list_files");
+    if not listed.ok { return listed; }
+    let prefix = emulator.platform.root + "/" + app.storage_prefix + "/";
+    let remove = []; let i = 0;
+    while i < len(listed.paths) {
+        if str_starts_with(listed.paths[i], prefix) { array_push(remove, listed.paths[i]); }
+        i = i + 1;
+    }
+    let machine = emulator.device.platform;
+    if machine.syscall_count > machine.limits.max_syscalls - len(remove) {
+        return map{ ok: false, error: "syscall budget cannot complete private-data purge" };
+    }
+    i = 0;
+    while i < len(remove) {
+        let deleted = Platform.syscall(machine, "delete_file", map{ path: remove[i] });
+        if not deleted.ok { return deleted; }
+        i = i + 1;
+    }
+    return map{ ok: true, files: len(remove) };
+}
+
+fn uninstall(emulator, package_name) {
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    if not _event_capacity(emulator, 1) { return map{ ok: false, error: "event queue limit exceeded" }; }
+    let purged = _purge_private(emulator, app);
+    if not purged.ok { return purged; }
+    if emulator.foreground != nil and emulator.foreground.package == package_name { emulator.foreground = nil; }
+    let recorded = _event(emulator, package_name, "package-removed");
+    if not recorded.ok { return recorded; }
+    map_remove(emulator.packages, package_name); emulator.package_count = emulator.package_count - 1;
+    return map{ ok: true, removed_private_files: purged.files };
+}
+
+fn grant_permission(emulator, authority, package_name, permission) {
+    if authority != "system" { return map{ ok: false, error: "only the system authority can grant permissions" }; }
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    if not map_has(app.permissions, permission) { return map{ ok: false, error: "permission was not requested" }; }
+    app.grants[permission] = true;
+    let recorded = _event(emulator, package_name, "permission-granted", permission);
+    if not recorded.ok { map_remove(app.grants, permission); return recorded; }
+    return map{ ok: true };
+}
+
+fn revoke_permission(emulator, authority, package_name, permission) {
+    if authority != "system" { return map{ ok: false, error: "only the system authority can revoke permissions" }; }
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    let existed = map_has(app.grants, permission);
+    if existed { map_remove(app.grants, permission); }
+    let recorded = _event(emulator, package_name, "permission-revoked", permission);
+    if not recorded.ok { if existed { app.grants[permission] = true; } return recorded; }
+    return map{ ok: true, existed: existed };
+}
+
+fn has_permission(emulator, package_name, permission) {
+    let app = _app(emulator, package_name);
+    return app != nil and map_has(app.grants, permission) and app.grants[permission] == true;
+}
+
+fn _transition(emulator, app, next_state) {
+    let current = app.state;
+    let valid = false;
+    if (current == "installed" or current == "destroyed") and next_state == "created" { valid = true; }
+    elif current == "created" and next_state == "started" { valid = true; }
+    elif (current == "started" or current == "paused") and next_state == "resumed" { valid = true; }
+    elif current == "resumed" and next_state == "paused" { valid = true; }
+    elif current == "paused" and next_state == "stopped" { valid = true; }
+    elif current == "stopped" and (next_state == "started" or next_state == "destroyed") { valid = true; }
+    if not valid { return map{ ok: false, error: "invalid lifecycle transition " + current + " -> " + next_state }; }
+    let recorded = _event(emulator, app.package, "activity-" + next_state, app.activity);
+    if not recorded.ok { return recorded; }
+    app.state = next_state;
+    return map{ ok: true, state: next_state };
+}
+
+fn start_activity(emulator, caller_package, target_package, activity_value = "") {
+    let app = _app(emulator, target_package);
+    if app == nil { return map{ ok: false, error: "target package not installed" }; }
+    if caller_package != "system" and _app(emulator, caller_package) == nil {
+        return map{ ok: false, error: "caller package not installed" };
+    }
+    let activity = if activity_value == "" { app.main_activity } else { _activity_name(target_package, activity_value) };
+    if activity == nil or not map_has(app.activities, activity) { return map{ ok: false, error: "activity not declared" }; }
+    if caller_package != "system" and caller_package != target_package and not app.activities[activity].exported {
+        return map{ ok: false, error: "activity is not exported" };
+    }
+    let needed_events = 0;
+    if emulator.foreground != nil and emulator.foreground.package != target_package {
+        let prior_for_budget = _app(emulator, emulator.foreground.package);
+        if prior_for_budget != nil and prior_for_budget.state == "resumed" { needed_events = needed_events + 2; }
+        elif prior_for_budget != nil and prior_for_budget.state == "paused" { needed_events = needed_events + 1; }
+    }
+    if app.state == "installed" or app.state == "destroyed" { needed_events = needed_events + 3; }
+    elif app.state == "created" or app.state == "stopped" { needed_events = needed_events + 2; }
+    elif app.state == "started" or app.state == "paused" { needed_events = needed_events + 1; }
+    if not _event_capacity(emulator, needed_events) { return map{ ok: false, error: "event queue limit exceeded" }; }
+    if emulator.foreground != nil and emulator.foreground.package != target_package {
+        let prior = _app(emulator, emulator.foreground.package);
+        if prior != nil and prior.state == "resumed" { let paused = _transition(emulator, prior, "paused"); if not paused.ok { return paused; } }
+        if prior != nil and prior.state == "paused" { let stopped = _transition(emulator, prior, "stopped"); if not stopped.ok { return stopped; } }
+    }
+    app.activity = activity;
+    if app.pid == 0 { app.pid = emulator.next_pid; emulator.next_pid = emulator.next_pid + 1; }
+    if app.state == "installed" or app.state == "destroyed" { let created = _transition(emulator, app, "created"); if not created.ok { return created; } }
+    if app.state == "created" or app.state == "stopped" { let started = _transition(emulator, app, "started"); if not started.ok { return started; } }
+    if app.state == "started" or app.state == "paused" { let resumed = _transition(emulator, app, "resumed"); if not resumed.ok { return resumed; } }
+    app.launches = app.launches + 1;
+    emulator.foreground = map{ package: target_package, activity: activity, pid: app.pid };
+    return map{ ok: true, package: target_package, activity: activity, pid: app.pid, state: app.state };
+}
+
+fn background(emulator, package_name) {
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    if app.state != "resumed" { return map{ ok: false, error: "application is not resumed" }; }
+    if not _event_capacity(emulator, 2) { return map{ ok: false, error: "event queue limit exceeded" }; }
+    let paused = _transition(emulator, app, "paused"); if not paused.ok { return paused; }
+    let stopped = _transition(emulator, app, "stopped"); if not stopped.ok { return stopped; }
+    if emulator.foreground != nil and emulator.foreground.package == package_name { emulator.foreground = nil; }
+    return map{ ok: true, state: app.state };
+}
+
+fn destroy(emulator, package_name) {
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    let needed_events = 0;
+    if app.state == "resumed" { needed_events = 3; }
+    elif app.state == "paused" { needed_events = 2; }
+    elif app.state == "stopped" { needed_events = 1; }
+    if needed_events > 0 and not _event_capacity(emulator, needed_events) { return map{ ok: false, error: "event queue limit exceeded" }; }
+    if app.state == "resumed" { let bg = background(emulator, package_name); if not bg.ok { return bg; } }
+    elif app.state == "paused" { let stopped = _transition(emulator, app, "stopped"); if not stopped.ok { return stopped; } }
+    if app.state != "stopped" { return map{ ok: false, error: "application cannot be destroyed from " + app.state }; }
+    let result = _transition(emulator, app, "destroyed");
+    if result.ok { app.pid = 0; }
+    return result;
+}
+
+fn _private_path(app, relative) {
+    if type(relative) != "string" or len(relative) == 0 or len(relative) > 1024
+        or str_starts_with(relative, "/") or str_contains(relative, "\\") or str_contains(relative, "\x00") {
+        return nil;
+    }
+    let parts = str_split(relative, "/"); let i = 0;
+    while i < len(parts) {
+        if parts[i] == "" or parts[i] == "." or parts[i] == ".." { return nil; }
+        i = i + 1;
+    }
+    return app.storage_prefix + "/" + relative;
+}
+
+fn write_private(emulator, caller_package, target_package, relative, data) {
+    if caller_package != target_package { return map{ ok: false, error: "cross-package private storage denied" }; }
+    let app = _app(emulator, target_package);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    let path = _private_path(app, relative); if path == nil { return map{ ok: false, error: "invalid private path" }; }
+    return Platform.syscall(emulator.device.platform, "write_file", map{ path: path, data: data });
+}
+
+fn read_private(emulator, caller_package, target_package, relative) {
+    if caller_package != target_package { return map{ ok: false, error: "cross-package private storage denied" }; }
+    let app = _app(emulator, target_package);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    let path = _private_path(app, relative); if path == nil { return map{ ok: false, error: "invalid private path" }; }
+    return Platform.syscall(emulator.device.platform, "read_file", map{ path: path });
+}
+
+fn register_service(emulator, package_name, spec) {
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    if spec == nil or not is_map(spec) { return map{ ok: false, error: "service spec must be a map" }; }
+    let name = try spec.name catch "";
+    if not _valid_atom(name, 128) or map_has(app.services, name) { return map{ ok: false, error: "invalid or duplicate service" }; }
+    if app.service_count >= emulator.limits.max_services_per_app { return map{ ok: false, error: "service limit exceeded" }; }
+    let permission = try spec.permission catch "";
+    if permission != "" and not _valid_atom(permission, MAX_PERMISSION_BYTES) { return map{ ok: false, error: "invalid service permission" }; }
+    let exported = try spec.exported catch false;
+    if type(exported) != "bool" { return map{ ok: false, error: "service exported flag must be boolean" }; }
+    let response = try spec.response catch map{ status: "ok" };
+    let encoded_response = try map{ value: json_stringify(response) } catch nil;
+    if encoded_response == nil { return map{ ok: false, error: "service response is not JSON serializable" }; }
+    if len(encoded_response.value) > 65536 { return map{ ok: false, error: "service response exceeds limit" }; }
+    app.services[name] = map{ name: name, exported: exported, permission: permission, response: response };
+    app.service_count = app.service_count + 1;
+    return map{ ok: true };
+}
+
+fn call_service(emulator, caller_package, target_package, name, request = nil) {
+    let caller = _app(emulator, caller_package); let target = _app(emulator, target_package);
+    if caller == nil or target == nil { return map{ ok: false, error: "caller or target package not installed" }; }
+    if not map_has(target.services, name) { return map{ ok: false, error: "service not registered" }; }
+    if emulator.service_calls >= emulator.limits.max_service_calls { return map{ ok: false, error: "service call budget exceeded" }; }
+    let service = target.services[name];
+    if caller_package != target_package and not service.exported { return map{ ok: false, error: "service is not exported" }; }
+    if service.permission != "" and not has_permission(emulator, caller_package, service.permission) {
+        return map{ ok: false, error: "required service permission denied" };
+    }
+    let encoded_request = try map{ value: json_stringify(request) } catch nil;
+    if encoded_request == nil { return map{ ok: false, error: "service request is not JSON serializable" }; }
+    if len(encoded_request.value) > 65536 { return map{ ok: false, error: "service request exceeds limit" }; }
+    emulator.service_calls = emulator.service_calls + 1;
+    let recorded = _event(emulator, target_package, "service-call", name);
+    if not recorded.ok { emulator.service_calls = emulator.service_calls - 1; return recorded; }
+    return map{ ok: true, response: service.response, call: emulator.service_calls };
+}
+
+fn network_plan(emulator, package_name, host_value, port_value, options = nil) {
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    if not has_permission(emulator, package_name, "android.permission.INTERNET") {
+        return map{ ok: false, error: "INTERNET permission denied" };
+    }
+    if emulator.network_plans >= emulator.limits.max_network_plans { return map{ ok: false, error: "network plan budget exceeded" }; }
+    let host = str_lower(str_trim(str(host_value ?? "")));
+    if not _valid_atom(host, 253) or str_contains(host, "@") or str_contains(host, "..") {
+        return map{ ok: false, error: "invalid network host" };
+    }
+    let port = port_value;
+    if type(port) != "number" or port != num_floor(port) or port < 1 or port > 65535 { return map{ ok: false, error: "invalid network port" }; }
+    let tls = _option(options, "tls", true);
+    if tls != true and not app.allow_cleartext { return map{ ok: false, error: "cleartext traffic denied by application policy" }; }
+    let tls_state = tls13_status(emulator);
+    if tls == true and not tls_state.available {
+        return map{ ok: false, error: "TLS 1.3 provider unavailable on this Android runtime" };
+    }
+    emulator.network_plans = emulator.network_plans + 1;
+    return map{ ok: true, host: host, port: port, tls: tls == true, transport: if tls == true { "tls-1.3" } else { "cleartext" },
+        provider: if tls == true { tls_state.source } else { "none" }, external_install_required: false,
+        boundary: "validated deterministic plan; host networking is intentionally outside the emulator" };
+}
+
+fn tls13_status(emulator) {
+    if emulator == nil or (try emulator.format catch "") != FORMAT {
+        return map{ ok: false, error: "invalid emulator" };
+    }
+    let available = emulator.api > 28;
+    return map{ ok: true, format: "pblang.android.tls13-status.v1",
+        available: available, guaranteed_by_platform: available,
+        source: if available { "android-platform" } else { "unavailable" },
+        external_install_required: false };
+}
+
+fn input_apply(emulator, package_name, event) {
+    if emulator.foreground == nil or emulator.foreground.package != package_name {
+        return map{ ok: false, error: "input target is not foreground" };
+    }
+    return Device.input_apply(emulator.device, event);
+}
+
+fn run_pbcs(emulator, package_name, bytes, globals = nil, options = nil) {
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    if app.pid == 0 or app.state == "destroyed" or app.state == "installed" {
+        return map{ ok: false, error: "application process is not running" };
+    }
+    if not is_array(bytes) or len(bytes) < 9 or len(bytes) > emulator.limits.max_bytecode_bytes {
+        return map{ ok: false, error: "invalid or oversized PBCS artifact" };
+    }
+    let decoded = try map{ value: PBCK.deserialize_chunk(bytes) } catch nil;
+    if decoded == nil { return map{ ok: false, error: "PBCS validation failed" }; }
+    let seeded = map{};
+    if globals != nil {
+        if not is_map(globals) { return map{ ok: false, error: "globals must be a map" }; }
+        let keys = map_keys(globals); let i = 0;
+        while i < len(keys) { seeded[keys[i]] = globals[keys[i]]; i = i + 1; }
+    }
+    seeded.android_api = emulator.api; seeded.android_arch = emulator.arch;
+    seeded.android_package = package_name; seeded.android_target_sdk = app.target_sdk;
+    seeded.android_storage_root = emulator.platform.root + "/apps/" + package_name;
+    seeded.android_width = emulator.device.profile.width; seeded.android_height = emulator.device.profile.height;
+    let executed = try map{ value: VM.run_seeded_bounded(decoded.value, seeded, options) } catch nil;
+    if executed == nil { return map{ ok: false, error: "PBCS execution failed or exceeded its runtime budget" }; }
+    let recorded = _event(emulator, package_name, "pbcs-executed", str(executed.value.runtime.steps));
+    if not recorded.ok { return recorded; }
+    return map{ ok: true, output: executed.value.output, globals: executed.value.globals,
+        value: executed.value.value, runtime: executed.value.runtime, artifact_bytes: len(bytes) };
+}
+
+fn compile_and_run(emulator, package_name, source, globals = nil, options = nil) {
+    if type(source) != "string" or len(source) == 0 or len(source) > 4194304 {
+        return map{ ok: false, error: "source must contain 1..4194304 characters" };
+    }
+    let compiled = Frontend.frontend_compile(source);
+    if not compiled.ok { return map{ ok: false, error: "self-hosted compilation failed", diagnostics: compiled.diagnostics }; }
+    let bytes = PBCK.serialize_chunk(compiled.chunk);
+    let result = run_pbcs(emulator, package_name, bytes, globals, options);
+    result.compiled = true; result.artifact = bytes;
+    return result;
+}
+
+fn app_status(emulator, package_name) {
+    let app = _app(emulator, package_name);
+    if app == nil { return map{ ok: false, error: "package not installed" }; }
+    return map{ ok: true, package: app.package, state: app.state, activity: app.activity,
+        running: app.pid != 0, launches: app.launches, target_sdk: app.target_sdk,
+        permissions: map_keys(app.grants), services: app.service_count };
+}
+
+fn stats(emulator) {
+    if emulator == nil or (try emulator.format catch "") != FORMAT { return map{ ok: false, error: "invalid emulator" }; }
+    return map{ ok: true, format: "pblang.android.emulator.stats.v1", api: emulator.api, arch: emulator.arch,
+        packages: emulator.package_count, foreground: if emulator.foreground == nil { "" } else { emulator.foreground.package },
+        events: len(emulator.events), service_calls: emulator.service_calls, network_plans: emulator.network_plans,
+        device: Device.stats(emulator.device), boundary: emulator.boundary };
+}
+
+export FORMAT, APP_FORMAT, new, install, uninstall;
+export grant_permission, revoke_permission, has_permission;
+export start_activity, background, destroy, write_private, read_private;
+export register_service, call_service, network_plan, tls13_status, input_apply;
+export run_pbcs, compile_and_run, app_status, stats;

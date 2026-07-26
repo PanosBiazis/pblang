@@ -1,0 +1,57 @@
+let PTY = import("stdlib:linux_pty_supervisor.sapp");
+let Process = import("stdlib:process.sapp");
+
+fn require(condition, message) { if not condition { throw "FAIL linux_pty_supervisor: " + message; } }
+
+let token = str_trim(fs_read("/proc/sys/kernel/random/uuid"));
+let root = "/tmp/pblang-pty-test-" + token;
+let fifo = root + "/input.fifo";
+let pid_file = root + "/pid";
+let status_file = root + "/status";
+let output = root + "/output.log";
+let helper = root + "/supervisor";
+fs_mkdirs(root);
+require(Process.run("/usr/bin/chmod", ["0700", root]).ok, "private directory");
+require(Process.run("/usr/bin/mkfifo", ["-m", "0600", fifo]).ok, "private fifo");
+let bytes = PTY.build(map{ fifo: fifo, pid_file: pid_file, status_file: status_file, output: output,
+    shell: "/bin/sh", max_seconds: 5, max_output_bytes: 4096 });
+require(len(bytes) > 512 and bytes[0] == 0x7F and bytes[1] == 0x45, "ELF encoding");
+fs_write_bytes(helper, bytes);
+require(Process.run("/usr/bin/chmod", ["0700", helper]).ok, "executable mode");
+
+require(Process.run("/usr/bin/setsid", ["--fork", helper]).ok, "detached session launch");
+let wait = channel(); let deadline = now_ms() + 3000;
+while not fs_exists(pid_file) and now_ms() < deadline { recv_timeout(wait.receiver, 10); }
+require(fs_exists(pid_file), "readiness pid file");
+require(not fs_exists(pid_file + ".pending"), "pid staging file is atomically retired");
+let pid_text = str_trim(fs_read(pid_file));
+require(len(pid_text) == 10 and parse_number(pid_text) > 1, "fixed-width process id");
+let writer = root + "/writer";
+fs_write_bytes(writer, PTY.build_writer(fifo, "printf 'PBREMOTE_PTY_OK\\n'; exit\n"));
+require(Process.run("/usr/bin/chmod", ["0700", writer]).ok, "writer executable mode");
+require(Process.run(writer, []).ok, "nonblocking writer sends PTY input");
+deadline = now_ms() + 5000;
+while not fs_exists(status_file) and now_ms() < deadline { recv_timeout(wait.receiver, 10); }
+require(fs_exists(status_file), "bounded PTY completion status");
+require(not fs_exists(status_file + ".pending"), "status staging file is atomically retired");
+let status = fs_read_bytes(status_file);
+require(len(status) == 4 and status[0] == 0 and status[1] == 0, "zero child wait status");
+require(fs_exists(output) and str_contains(fs_read(output), "PBREMOTE_PTY_OK"), "PTY transcript");
+
+try fs_remove(writer) catch nil; try fs_remove(helper) catch nil; try fs_remove(pid_file) catch nil;
+try fs_remove(status_file) catch nil; try fs_remove(output) catch nil;
+try fs_remove(fifo) catch nil; try fs_remove(root) catch nil;
+
+let rejected = try { PTY.build(map{ fifo: "relative", pid_file: "/tmp/p", status_file: "/tmp/s", output: "/tmp/o" }); false } catch true;
+require(rejected, "relative paths fail closed");
+
+let orphan_root = "/tmp/pblang-pty-writer-test-" + token;
+let orphan_fifo = orphan_root + "/input.fifo"; let orphan_writer = orphan_root + "/writer";
+fs_mkdirs(orphan_root); require(Process.run("/usr/bin/chmod", ["0700", orphan_root]).ok, "orphan private directory");
+require(Process.run("/usr/bin/mkfifo", ["-m", "0600", orphan_fifo]).ok, "orphan fifo");
+fs_write_bytes(orphan_writer, PTY.build_writer(orphan_fifo, "x"));
+require(Process.run("/usr/bin/chmod", ["0700", orphan_writer]).ok, "orphan writer mode");
+let orphan = Process.run(orphan_writer, []);
+require(not orphan.ok and orphan.exit_code == 75, "writer without reader fails immediately");
+try fs_remove(orphan_writer) catch nil; try fs_remove(orphan_fifo) catch nil; try fs_remove(orphan_root) catch nil;
+print "linux_pty_supervisor_pass";
