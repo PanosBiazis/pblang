@@ -1,0 +1,474 @@
+// Canonical bounded lowering from recursive PBCK-v1 chunks to flat function,
+// instruction, constant and capture tables. Platform generators can consume
+// this plan without reimplementing the recursive artifact decoder.
+
+let Decode = import("stdlib:host_pbck_decode.sapp");
+let Inspect = import("stdlib:host_pbck_inspect.sapp");
+
+let FORMAT = "pblang.host-pbck.frame-plan.v1";
+
+fn _fault(message) { throw "host_pbck_frame_plan: " + message; }
+
+fn _option(options, name, fallback) {
+    if options != nil and is_map(options) and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _limit(options, name, fallback, hard_max) {
+    let value = _option(options, name, fallback);
+    if not is_number(value) or value < 1 or value != num_floor(value) or value > hard_max {
+        _fault("invalid " + name);
+    }
+    return value;
+}
+
+fn limits(options = nil) {
+    if options != nil and not is_map(options) { _fault("options must be a map"); }
+    return map{
+        max_functions: _limit(options, "max_functions", 65536, 1000000),
+        max_instructions: _limit(options, "max_instructions", 4000000, 4000000),
+        max_constants: _limit(options, "max_constants", 1000000, 1000000),
+        max_captures: _limit(options, "max_captures", 1000000, 4000000),
+        max_parameters: _limit(options, "max_parameters", 65535, 1000000),
+        max_depth: _limit(options, "max_depth", 64, 256)
+    };
+}
+
+fn _has_operand(op) {
+    return op == 0 or (op >= 13 and op <= 20) or op == 23 or op == 25 or op == 26
+        or op == 28 or op == 29 or op == 31 or op == 32 or (op >= 35 and op <= 37)
+        or op == 42;
+}
+
+fn _constant_operand(op) {
+    return op == 0 or (op >= 13 and op <= 18) or op == 42;
+}
+
+fn _instruction_count(chunk) {
+    if map_has(chunk, "compact") and chunk.compact { return len(chunk.opcodes); }
+    return len(chunk.instructions);
+}
+
+fn _instruction_at(chunk, index) {
+    if not (map_has(chunk, "compact") and chunk.compact) { return chunk.instructions[index]; }
+    let op = chunk.opcodes[index];
+    if op == 27 {
+        let captures = [];
+        if map_has(chunk.closures, str(index)) { captures = chunk.closures[str(index)]; }
+        return map{ op: op, fn_const: chunk.operands[index], captures: captures };
+    }
+    if chunk.operands[index] >= 0 { return map{ op: op, operand: chunk.operands[index] }; }
+    return map{ op: op };
+}
+
+fn _state(options) {
+    return map{
+        limits: limits(options), functions: [], opcodes: [], operands: [],
+        instruction_capture_starts: [], instruction_capture_counts: [],
+        capture_is_local: [], capture_indices: [],
+        constant_kinds: [], constant_numbers: [], constant_texts: [],
+        constant_functions: [], constant_slots: [], default_slots: [],
+        parameter_types: [], max_depth_seen: 0
+    };
+}
+
+fn _append_value(state, value, depth) {
+    if len(state.constant_kinds) >= state.limits.max_constants {
+        _fault("constant limit exceeded");
+    }
+    let kind = 0 - 1; let number = 0; let text = ""; let function_id = 0 - 1;
+    if is_number(value) { kind = 0; number = value; }
+    elif is_bool(value) { kind = 1; if value { number = 1; } }
+    elif value == nil { kind = 2; }
+    elif is_string(value) { kind = 3; text = value; }
+    elif is_map(value) and map_has(value, "__pbck_numeric") {
+        if value.__pbck_numeric == "bigint" { kind = 4; }
+        elif value.__pbck_numeric == "rational" { kind = 5; }
+        else { _fault("unsupported numeric constant"); }
+        if not map_has(value, "text") or not is_string(value.text) {
+            _fault("invalid numeric constant text");
+        }
+        text = value.text;
+    }
+    elif is_map(value) and map_has(value, "__pbck_function") {
+        kind = 7; function_id = _add_function(state, value, depth + 1);
+    }
+    else { _fault("unsupported constant type " + type(value)); }
+    let slot = len(state.constant_kinds);
+    array_push(state.constant_kinds, kind);
+    array_push(state.constant_numbers, number);
+    array_push(state.constant_texts, text);
+    array_push(state.constant_functions, function_id);
+    return slot;
+}
+
+fn _function_field(function, name, fallback) {
+    if map_has(function, name) { return function[name]; }
+    return fallback;
+}
+
+fn _add_function(state, function, depth) {
+    if depth > state.limits.max_depth { _fault("function nesting limit exceeded"); }
+    if depth > state.max_depth_seen { state.max_depth_seen = depth; }
+    if len(state.functions) >= state.limits.max_functions { _fault("function limit exceeded"); }
+    if not is_map(function) or not map_has(function, "chunk") { _fault("invalid function"); }
+
+    let arity = _function_field(function, "arity", 0);
+    let min_arity = _function_field(function, "min_arity", arity);
+    let defaults = _function_field(function, "defaults", []);
+    let is_vararg = _function_field(function, "is_vararg", false);
+    let parameter_types = _function_field(function, "parameter_types", []);
+    if not is_number(arity) or arity < 0 or arity != num_floor(arity)
+        or not is_number(min_arity) or min_arity < 0 or min_arity > arity
+        or min_arity != num_floor(min_arity) or not is_array(defaults)
+        or len(defaults) > arity or not is_bool(is_vararg)
+        or not is_array(parameter_types) or len(parameter_types) > state.limits.max_parameters {
+        _fault("invalid function signature");
+    }
+
+    let function_id = len(state.functions);
+    array_push(state.functions, nil);
+
+    let local_default_slots = [];
+    let di = 0;
+    while di < len(defaults) {
+        array_push(local_default_slots, _append_value(state, defaults[di], depth));
+        di = di + 1;
+    }
+    let default_start = len(state.default_slots);
+    di = 0;
+    while di < len(local_default_slots) {
+        array_push(state.default_slots, local_default_slots[di]); di = di + 1;
+    }
+
+    let parameter_start = len(state.parameter_types);
+    if parameter_start + len(parameter_types) > state.limits.max_parameters {
+        _fault("parameter type limit exceeded");
+    }
+    let pi = 0;
+    while pi < len(parameter_types) {
+        let parameter_type = parameter_types[pi];
+        if not is_number(parameter_type) or parameter_type < 0 or parameter_type > 2
+            or parameter_type != num_floor(parameter_type) {
+            _fault("invalid parameter type");
+        }
+        array_push(state.parameter_types, parameter_type); pi = pi + 1;
+    }
+
+    let chunk = function.chunk;
+    if not is_map(chunk) or not map_has(chunk, "constants") or not is_array(chunk.constants) {
+        _fault("invalid function chunk");
+    }
+    let local_constant_slots = [];
+    let ci = 0;
+    while ci < len(chunk.constants) {
+        array_push(local_constant_slots, _append_value(state, chunk.constants[ci], depth));
+        ci = ci + 1;
+    }
+    let constant_start = len(state.constant_slots);
+    ci = 0;
+    while ci < len(local_constant_slots) {
+        array_push(state.constant_slots, local_constant_slots[ci]); ci = ci + 1;
+    }
+
+    let instruction_start = len(state.opcodes);
+    let instruction_count = _instruction_count(chunk);
+    if instruction_count < 1
+        or len(state.opcodes) + instruction_count > state.limits.max_instructions {
+        _fault("instruction limit exceeded");
+    }
+    let max_local = arity;
+    let max_upvalue = 0;
+    let ii = 0;
+    while ii < instruction_count {
+        let instruction = _instruction_at(chunk, ii);
+        let op = instruction.op;
+        if not is_number(op) or op < 0 or op >= len(Inspect.OPCODE_NAMES)
+            or op != num_floor(op) { _fault("invalid opcode"); }
+        let operand = 0 - 1;
+        let capture_start = len(state.capture_indices);
+        let capture_count = 0;
+        if op == 27 {
+            if not map_has(instruction, "fn_const")
+                or instruction.fn_const < 0 or instruction.fn_const >= len(local_constant_slots) {
+                _fault("closure function constant out of range");
+            }
+            let function_slot = local_constant_slots[instruction.fn_const];
+            if state.constant_kinds[function_slot] != 7 { _fault("closure constant is not a function"); }
+            operand = state.constant_functions[function_slot];
+            let captures = _function_field(instruction, "captures", []);
+            if not is_array(captures)
+                or len(state.capture_indices) + len(captures) > state.limits.max_captures {
+                _fault("capture limit exceeded");
+            }
+            let capture_i = 0;
+            while capture_i < len(captures) {
+                let capture = captures[capture_i];
+                if not is_map(capture) or not map_has(capture, "is_local")
+                    or not is_bool(capture.is_local) or not map_has(capture, "index")
+                    or not is_number(capture.index) or capture.index < 0
+                    or capture.index != num_floor(capture.index) {
+                    _fault("invalid capture descriptor");
+                }
+                array_push(state.capture_is_local, capture.is_local);
+                array_push(state.capture_indices, capture.index);
+                capture_count = capture_count + 1;
+                if capture.is_local and capture.index + 1 > max_local {
+                    max_local = capture.index + 1;
+                }
+                capture_i = capture_i + 1;
+            }
+        } elif _has_operand(op) {
+            if not map_has(instruction, "operand") or not is_number(instruction.operand)
+                or instruction.operand < 0 or instruction.operand != num_floor(instruction.operand) {
+                _fault("invalid instruction operand");
+            }
+            operand = instruction.operand;
+            if _constant_operand(op) {
+                if operand >= len(local_constant_slots) { _fault("constant operand out of range"); }
+                operand = local_constant_slots[operand];
+            } elif op == 23 or (op >= 35 and op <= 37) {
+                if operand > instruction_count { _fault("jump target out of range"); }
+            } elif (op == 25 or op == 26) and operand + 1 > max_local {
+                max_local = operand + 1;
+            } elif (op == 28 or op == 29) and operand + 1 > max_upvalue {
+                max_upvalue = operand + 1;
+            }
+        }
+        array_push(state.opcodes, op);
+        array_push(state.operands, operand);
+        array_push(state.instruction_capture_starts, capture_start);
+        array_push(state.instruction_capture_counts, capture_count);
+        ii = ii + 1;
+    }
+
+    let name = _function_field(function, "name", nil);
+    if name != nil and not is_string(name) { _fault("invalid function name"); }
+    state.functions[function_id] = map{
+        id: function_id, name: name, arity: arity, min_arity: min_arity,
+        is_vararg: is_vararg, max_local: max_local, max_upvalue: max_upvalue,
+        instruction_start: instruction_start, instruction_count: instruction_count,
+        constant_start: constant_start, constant_count: len(local_constant_slots),
+        default_start: default_start, default_count: len(local_default_slots),
+        parameter_start: parameter_start, parameter_count: len(parameter_types)
+    };
+    return function_id;
+}
+
+fn _require_plan_shape(plan) {
+    if not is_map(plan) or not map_has(plan, "format") or plan.format != FORMAT
+        or not map_has(plan, "version") or plan.version != 1 {
+        _fault("invalid plan header");
+    }
+    let instruction_count = len(plan.opcodes);
+    if len(plan.operands) != instruction_count
+        or len(plan.instruction_capture_starts) != instruction_count
+        or len(plan.instruction_capture_counts) != instruction_count {
+        _fault("instruction table length mismatch");
+    }
+    let value_count = len(plan.constant_kinds);
+    if len(plan.constant_numbers) != value_count or len(plan.constant_texts) != value_count
+        or len(plan.constant_functions) != value_count {
+        _fault("constant table length mismatch");
+    }
+    if len(plan.capture_is_local) != len(plan.capture_indices) { _fault("capture table length mismatch"); }
+    if len(plan.functions) < 1 or plan.root_function != 0 { _fault("root function is missing"); }
+    return true;
+}
+
+fn _validate_plan(plan) {
+    _require_plan_shape(plan);
+    let instruction_count = len(plan.opcodes);
+    let value_count = len(plan.constant_kinds);
+
+    let fi = 0;
+    while fi < len(plan.functions) {
+        let function = plan.functions[fi];
+        if function.id != fi or function.instruction_start < 0
+            or function.instruction_start + function.instruction_count > instruction_count
+            or function.constant_start < 0
+            or function.constant_start + function.constant_count > len(plan.constant_slots)
+            or function.default_start < 0
+            or function.default_start + function.default_count > len(plan.default_slots)
+            or function.parameter_start < 0
+            or function.parameter_start + function.parameter_count > len(plan.parameter_types) {
+            _fault("function table range mismatch");
+        }
+        let local_i = 0;
+        while local_i < function.instruction_count {
+            let ii = function.instruction_start + local_i;
+            let op = plan.opcodes[ii];
+            let operand = plan.operands[ii];
+            if _constant_operand(op) and (operand < 0 or operand >= value_count) {
+                _fault("instruction constant slot out of range");
+            }
+            if (op == 23 or (op >= 35 and op <= 37))
+                and (operand < 0 or operand > function.instruction_count) {
+                _fault("instruction jump target out of range");
+            }
+            if (op == 25 or op == 26) and (operand < 0 or operand >= function.max_local) {
+                _fault("instruction local slot out of range");
+            }
+            if _has_operand(op) and operand < 0 { _fault("instruction operand is missing"); }
+            local_i = local_i + 1;
+        }
+        fi = fi + 1;
+    }
+    let ci = 0;
+    while ci < len(plan.constant_slots) {
+        if plan.constant_slots[ci] < 0 or plan.constant_slots[ci] >= value_count {
+            _fault("constant slot out of range");
+        }
+        ci = ci + 1;
+    }
+    ci = 0;
+    while ci < len(plan.default_slots) {
+        if plan.default_slots[ci] < 0 or plan.default_slots[ci] >= value_count {
+            _fault("default slot out of range");
+        }
+        ci = ci + 1;
+    }
+    let ii = 0;
+    while ii < instruction_count {
+        let op = plan.opcodes[ii];
+        if op < 0 or op >= len(Inspect.OPCODE_NAMES) { _fault("opcode table value out of range"); }
+        let capture_start = plan.instruction_capture_starts[ii];
+        let capture_count = plan.instruction_capture_counts[ii];
+        if capture_start < 0 or capture_count < 0
+            or capture_start + capture_count > len(plan.capture_indices) {
+            _fault("instruction capture range mismatch");
+        }
+        if op == 27 and (plan.operands[ii] < 0 or plan.operands[ii] >= len(plan.functions)) {
+            _fault("closure function id out of range");
+        }
+        if op == 27 and capture_count < plan.functions[plan.operands[ii]].max_upvalue {
+            _fault("closure does not provide required upvalues");
+        }
+        if op != 27 and capture_count != 0 { _fault("captures attached to non-closure opcode"); }
+        ii = ii + 1;
+    }
+    return true;
+}
+
+fn validate(plan) {
+    return try {
+        _validate_plan(plan);
+        map{ ok: true, format: FORMAT }
+    } catch map{ ok: false, error: "invalid frame plan" };
+}
+
+fn build_decoded(decoded, options = nil) {
+    if not is_map(decoded) or not map_has(decoded, "chunk") { _fault("decoded artifact required"); }
+    let state = _state(options);
+    let root = map{
+        __pbck_function: true, name: "<root>", arity: 0, min_arity: 0,
+        defaults: [], is_vararg: false, parameter_types: [], chunk: decoded.chunk
+    };
+    let root_id = _add_function(state, root, 0);
+    let plan = map{
+        format: FORMAT, version: 1, root_function: root_id,
+        functions: state.functions, opcodes: state.opcodes, operands: state.operands,
+        instruction_capture_starts: state.instruction_capture_starts,
+        instruction_capture_counts: state.instruction_capture_counts,
+        capture_is_local: state.capture_is_local, capture_indices: state.capture_indices,
+        constant_kinds: state.constant_kinds, constant_numbers: state.constant_numbers,
+        constant_texts: state.constant_texts, constant_functions: state.constant_functions,
+        constant_slots: state.constant_slots, default_slots: state.default_slots,
+        parameter_types: state.parameter_types,
+        max_depth: state.max_depth_seen, artifact_bytes: _function_field(decoded, "artifact_bytes", 0)
+    };
+    _validate_plan(plan);
+    return plan;
+}
+
+fn build_bytes(bytes, options = nil) { return build_decoded(Decode.decode_bytes_compact(bytes), options); }
+fn build_file(path, options = nil) { return build_decoded(Decode.decode_file_compact(path), options); }
+
+fn _index(value, count, label) {
+    if not is_number(value) or value != num_floor(value) or value < 0 or value >= count {
+        _fault(label + " out of range");
+    }
+    return value;
+}
+
+fn function_at(plan, function_id) {
+    _require_plan_shape(plan);
+    return plan.functions[_index(function_id, len(plan.functions), "function id")];
+}
+
+fn instruction_at(plan, function_id, instruction_index) {
+    let function = function_at(plan, function_id);
+    _index(instruction_index, function.instruction_count, "instruction index");
+    let index = function.instruction_start + instruction_index;
+    let captures = [];
+    let ci = 0;
+    while ci < plan.instruction_capture_counts[index] {
+        let capture_index = plan.instruction_capture_starts[index] + ci;
+        array_push(captures, map{
+            is_local: plan.capture_is_local[capture_index],
+            index: plan.capture_indices[capture_index]
+        });
+        ci = ci + 1;
+    }
+    return map{ op: plan.opcodes[index], operand: plan.operands[index], captures: captures };
+}
+
+fn capture_at(plan, function_id, instruction_index, capture_index) {
+    let function = function_at(plan, function_id);
+    _index(instruction_index, function.instruction_count, "instruction index");
+    let instruction = function.instruction_start + instruction_index;
+    _index(capture_index, plan.instruction_capture_counts[instruction], "capture index");
+    let slot = plan.instruction_capture_starts[instruction] + capture_index;
+    return map{ is_local: plan.capture_is_local[slot], index: plan.capture_indices[slot] };
+}
+
+fn _value_at(plan, slot) {
+    if slot < 0 or slot >= len(plan.constant_kinds) { _fault("value slot out of range"); }
+    let kind = plan.constant_kinds[slot];
+    if kind == 0 { return plan.constant_numbers[slot]; }
+    if kind == 1 { return plan.constant_numbers[slot] == 1; }
+    if kind == 2 { return nil; }
+    if kind == 3 { return plan.constant_texts[slot]; }
+    if kind == 4 { return map{ __pbck_numeric: "bigint", text: plan.constant_texts[slot] }; }
+    if kind == 5 { return map{ __pbck_numeric: "rational", text: plan.constant_texts[slot] }; }
+    if kind == 7 { return map{ __pbck_function_id: plan.constant_functions[slot] }; }
+    _fault("unknown value kind");
+}
+
+fn value_at(plan, slot) {
+    _require_plan_shape(plan);
+    _index(slot, len(plan.constant_kinds), "value slot");
+    return _value_at(plan, slot);
+}
+
+fn constant_at(plan, function_id, constant_index) {
+    let function = function_at(plan, function_id);
+    _index(constant_index, function.constant_count, "constant index");
+    return _value_at(plan, plan.constant_slots[function.constant_start + constant_index]);
+}
+
+fn default_at(plan, function_id, default_index) {
+    let function = function_at(plan, function_id);
+    _index(default_index, function.default_count, "default index");
+    return _value_at(plan, plan.default_slots[function.default_start + default_index]);
+}
+
+fn parameter_type_at(plan, function_id, parameter_index) {
+    let function = function_at(plan, function_id);
+    _index(parameter_index, function.parameter_count, "parameter index");
+    return plan.parameter_types[function.parameter_start + parameter_index];
+}
+
+fn stats(plan) {
+    _require_plan_shape(plan);
+    return map{
+        format: FORMAT, functions: len(plan.functions), instructions: len(plan.opcodes),
+        constants: len(plan.constant_kinds), captures: len(plan.capture_indices),
+        parameter_types: len(plan.parameter_types), max_depth: plan.max_depth,
+        artifact_bytes: plan.artifact_bytes
+    };
+}
+
+export FORMAT, limits, validate, build_decoded, build_bytes, build_file;
+export function_at, instruction_at, capture_at, value_at, constant_at;
+export default_at, parameter_type_at, stats;

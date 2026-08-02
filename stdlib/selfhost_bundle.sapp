@@ -29,7 +29,23 @@ let OP_CALL = 18;
 let OP_MAKE_ARRAY = 25;
 let OP_MAKE_MAP = 26;
 
-// ── source scan: import("PATH") paths, in source order, de-duplicated ─────────
+fn _is_ident_char(c) {
+    if c == "" { return false; }
+    let code = strcharcodeat(c, 0);
+    return (code >= 48 and code <= 57) or (code >= 65 and code <= 90)
+        or (code >= 97 and code <= 122) or code == 95 or code >= 128;
+}
+
+fn _canonical_path(path) {
+    if str_starts_with(path, "stdlib:") {
+        return "stdlib/" + str_slice(path, 7, len(path));
+    }
+    return path;
+}
+
+// Source scan for real import("PATH") expressions. Comments and unrelated
+// string literals are skipped, so documentation examples cannot create fake
+// dependency cycles. Paths are canonicalized before de-duplication.
 fn _find_imports(src) {
     let out = [];
     let seen = map{};
@@ -37,11 +53,53 @@ fn _find_imports(src) {
     let n = len(src);
     let i = 0;
     while i < n {
-        if i + len(marker) <= n and str_slice(src, i, i + len(marker)) == marker {
+        let c = str_slice(src, i, i + 1);
+        let next = if i + 1 < n { str_slice(src, i + 1, i + 2) } else { "" };
+        if c == "/" and next == "/" {
+            i = i + 2;
+            while i < n and str_slice(src, i, i + 1) != "\n" { i = i + 1; }
+        } else if c == "/" and next == "*" {
+            i = i + 2;
+            while i + 1 < n and not (
+                str_slice(src, i, i + 1) == "*"
+                and str_slice(src, i + 1, i + 2) == "/"
+            ) {
+                i = i + 1;
+            }
+            if i + 1 < n { i = i + 2; }
+        } else if c == "\"" {
+            i = i + 1;
+            let escaped = false;
+            while i < n {
+                let sc = str_slice(src, i, i + 1);
+                if escaped {
+                    escaped = false;
+                } else if sc == "\\" {
+                    escaped = true;
+                } else if sc == "\"" {
+                    i = i + 1;
+                    break;
+                }
+                i = i + 1;
+            }
+        } else if i + len(marker) <= n
+           and (i == 0 or not _is_ident_char(str_slice(src, i - 1, i)))
+           and str_slice(src, i, i + len(marker)) == marker {
             let j = i + len(marker);
             let start = j;
-            while j < n and str_slice(src, j, j + 1) != "\"" { j = j + 1; }
-            let path = str_slice(src, start, j);
+            let escaped = false;
+            while j < n {
+                let pc = str_slice(src, j, j + 1);
+                if escaped {
+                    escaped = false;
+                } else if pc == "\\" {
+                    escaped = true;
+                } else if pc == "\"" {
+                    break;
+                }
+                j = j + 1;
+            }
+            let path = _canonical_path(str_slice(src, start, j));
             if not map_has(seen, path) { seen[path] = true; array_push(out, path); }
             i = j + 1;
         } else {
@@ -177,8 +235,9 @@ fn _append(merged, chunk, bundle_map, nil_idx) {
            and i + 2 < n and ins[i + 1].op == OP_CONSTANT and ins[i + 2].op == OP_CALL
            and ins[i + 2].operand == 1 {
             let path = chunk.constants[ins[i + 1].operand];
-            if type(path) == "string" and map_has(bundle_map, path) {
-                let bn_idx = bundle_map[path];
+            let canonical = if type(path) == "string" { _canonical_path(path) } else { path };
+            if type(canonical) == "string" and map_has(bundle_map, canonical) {
+                let bn_idx = bundle_map[canonical];
                 array_push(merged.instructions, map{ op: OP_CONSTANT, operand: nil_idx });   // push nil
                 array_push(merged.instructions, map{ op: OP_POP, operand: 0 });               // drop nil
                 array_push(merged.instructions, map{ op: OP_GET_GLOBAL, operand: bn_idx });   // push bundle map
@@ -221,6 +280,7 @@ fn _err(reason) { return map{ ok: false, reason: reason }; }
 // imports. Cycles and resolve/compile errors are reported via `errbox.err`
 // (pblang `catch` doesn't bind the error, so we thread errors through a box).
 fn _collect(path, resolve, reg, visiting, order, errbox) {
+    path = _canonical_path(path);
     if errbox.err != nil { return; }
     if map_has(reg, path) { return; }
     if map_has(visiting, path) { errbox.err = "import cycle at " + str(path); return; }
@@ -228,7 +288,11 @@ fn _collect(path, resolve, reg, visiting, order, errbox) {
     let src = try resolve(path) catch nil;
     if src == nil { errbox.err = "cannot resolve import: " + str(path); return; }
     let cr = _fe.frontend_compile(src);
-    if not cr.ok { errbox.err = "module failed to compile: " + str(path); return; }
+    if not cr.ok {
+        errbox.err = "module failed to compile: " + str(path)
+            + " diagnostics=" + str(cr.diagnostics);
+        return;
+    }
     if _has_nested_import(cr.chunk) { errbox.err = "import inside a function/block not supported (use a top-level import) in " + str(path); return; }
     let deps = _find_imports(src);
     let i = 0;
@@ -319,7 +383,22 @@ fn bundle(main_src, resolve) {
 }
 
 // ── convenience: filesystem-backed end-to-end API ────────────────────────────
-fn _fs_resolve(p) { return try bytes_to_str(fs_read_bytes(p)) catch nil; }
+fn _fs_resolve(p) {
+    if type(p) != "string" or p == "" or str_contains(p, strfromcharcode(0))
+        or str_contains(p, "\\") or str_contains(p, "/../")
+        or str_starts_with(p, "../") or str_ends_with(p, "/..") {
+        return nil;
+    }
+    let path = _canonical_path(p);
+    if str_starts_with(path, "stdlib/") {
+        let module = str_slice(path, 7, len(path));
+        if module == "" or str_starts_with(module, "/")
+            or str_contains(module, ":") or str_contains(module, "..") {
+            return nil;
+        }
+    }
+    return try bytes_to_str(fs_read_bytes(path)) catch nil;
+}
 
 // Bundle the program at `main_path`, resolving imports from the filesystem.
 fn bundle_file(main_path) {

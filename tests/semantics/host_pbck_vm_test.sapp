@@ -1,0 +1,219 @@
+let VM = import("stdlib:host_pbck_vm.sapp");
+let Decode = import("stdlib:host_pbck_decode.sapp");
+let Translate = import("stdlib:selfhost_to_pbck.sapp");
+
+fn fail(message) { throw "FAIL host_pbck_vm: " + message; }
+
+// add(delta) captures and mutates outer local 0. Calling the same closure twice
+// proves that upvalue cells outlive the creating frame and are shared by calls.
+let add_chunk = map{
+    instructions: [
+        map{ op: 38, operand: 0 }, map{ op: 16, operand: 0 },
+        map{ op: 1, operand: 0 }, map{ op: 39, operand: 0 },
+        map{ op: 38, operand: 0 }, map{ op: 19, operand: 0 }
+    ], constants: []
+};
+let add_function = map{
+    arity: 1, min_arity: 1, chunk: add_chunk,
+    upvalues: [map{ index: 0, is_local: true }]
+};
+let root = map{
+    instructions: [
+        map{ op: 0, operand: 0 }, map{ op: 17, operand: 0 },
+        map{ op: 24, operand: 1 }, map{ op: 17, operand: 1 },
+        map{ op: 16, operand: 1 }, map{ op: 0, operand: 2 }, map{ op: 18, operand: 1 }, map{ op: 11, operand: 0 },
+        map{ op: 16, operand: 1 }, map{ op: 0, operand: 3 }, map{ op: 18, operand: 1 }, map{ op: 19, operand: 0 }
+    ], constants: [40, add_function, 2, 3]
+};
+let bytes = Translate.translate(root);
+let first = VM.run_bytes(bytes, map{ max_steps: 1000 });
+if first.value != 45 or first.runtime.steps < 10 or first.runtime.peak_frames != 2 {
+    fail("closure call or mutable upvalue semantics mismatch");
+}
+let compact = VM.run_decoded(Decode.decode_bytes_compact(bytes), map{ max_steps: 1000 });
+if compact.value != 45 or compact.runtime.steps != first.runtime.steps {
+    fail("compact execution parity mismatch");
+}
+
+// The translator can now request the native tail-call trampoline directly.
+let direct_tail_root = root;
+direct_tail_root.instructions[10].tail = true;
+let direct_tail = VM.run_bytes(Translate.translate(direct_tail_root), map{ max_steps: 1000 });
+if direct_tail.value != 45 or direct_tail.runtime.tail_calls != 1 {
+    fail("direct tail-call lowering mismatch");
+}
+
+// Replace the final host call with a tail call. The trampoline must return the
+// same value while recording reuse instead of growing PBLang recursion depth.
+let decoded = Decode.decode_bytes(bytes);
+let i = len(decoded.chunk.instructions) - 1;
+while i >= 0 and decoded.chunk.instructions[i].op != 31 { i = i - 1; }
+if i < 0 { fail("translated call not found"); }
+decoded.chunk.instructions[i].op = 32;
+let tail = VM.run_decoded(decoded, map{ max_steps: 1000 });
+if tail.value != 45 or tail.runtime.tail_calls != 1 or tail.runtime.peak_frames != 2 {
+    fail("tail-call trampoline mismatch");
+}
+
+// A guest throw in a child frame is routed to the caller's host-PBCK handler.
+let throw_function = map{
+    __pbck_function: true, name: "thrower", arity: 0, min_arity: 0,
+    defaults: [], is_vararg: false, parameter_types_present: false,
+    parameter_types: [], chunk: map{
+        instructions: [map{ op: 0, operand: 0 }, map{ op: 47 }],
+        constants: ["expected"], source_name: nil
+    }
+};
+let caught_program = map{
+    format: "host-pbck-v1", version: 1,
+    chunk: map{
+        instructions: [
+            map{ op: 23, operand: 4 },
+            map{ op: 27, fn_const: 0, captures: [] },
+            map{ op: 31, operand: 0 }, map{ op: 24 },
+            map{ op: 33 }
+        ], constants: [throw_function], source_name: nil
+    }
+};
+let caught = VM.run_decoded(caught_program, map{ max_steps: 100 });
+if caught.value != "expected" { fail("cross-frame exception handler mismatch"); }
+
+// Explicit host adapters are capability-injected callables. They receive one
+// bounded argument vector, execute exactly once, and expose no host exception
+// detail to guest code.
+let adapter_program = map{
+    format: "host-pbck-v1", version: 1,
+    chunk: map{
+        instructions: [
+            map{ op: 14, operand: 0 }, map{ op: 0, operand: 1 },
+            map{ op: 31, operand: 1 }, map{ op: 33 }
+        ], constants: ["double", 21], source_name: nil
+    }
+};
+let adapter_calls = 0;
+let adapted = VM.run_decoded(adapter_program, map{
+    max_steps: 100,
+    adapters: map{ double: fn(args) {
+        adapter_calls = adapter_calls + 1;
+        if len(args) != 1 { throw "unexpected adapter arity"; }
+        return args[0] * 2;
+    } }
+});
+if adapted.value != 42 or adapted.runtime.host_calls != 1 or adapter_calls != 1 {
+    fail("injected host adapter dispatch mismatch");
+}
+
+let builtin_program = map{
+    format: "host-pbck-v1", version: 1,
+    chunk: map{
+        instructions: [
+            map{ op: 14, operand: 0 }, map{ op: 0, operand: 1 },
+            map{ op: 31, operand: 1 }, map{ op: 33 }
+        ], constants: ["len", [1, 2, 3]], source_name: nil
+    }
+};
+let builtin = VM.run_decoded(builtin_program, map{ max_steps: 100 });
+if builtin.value != 3 or builtin.runtime.host_calls != 1 {
+    fail("built-in host adapter resolution mismatch");
+}
+
+fn builtin_program(name, args) {
+    let constants = [name];
+    let instructions = [map{ op: 14, operand: 0 }];
+    let arg_i = 0;
+    while arg_i < len(args) {
+        array_push(constants, args[arg_i]);
+        array_push(instructions, map{ op: 0, operand: arg_i + 1 });
+        arg_i = arg_i + 1;
+    }
+    array_push(instructions, map{ op: 31, operand: len(args) });
+    array_push(instructions, map{ op: 33 });
+    return map{
+        format: "host-pbck-v1", version: 1,
+        chunk: map{ instructions: instructions, constants: constants, source_name: nil }
+    };
+}
+
+let split = VM.run_decoded(builtin_program("str_split", ["a,b,c", ","]), map{ max_steps: 100 });
+if len(split.value) != 3 or split.value[2] != "c" { fail("pure string adapter mismatch"); }
+
+let flattened = VM.run_decoded(builtin_program("array_flatten", [[[1], [2, [3]]]]), map{
+    max_steps: 100, max_collection_items: 3
+});
+if len(flattened.value) != 3 or flattened.value[2] != 3 { fail("bounded flatten adapter mismatch"); }
+
+let encoded = VM.run_decoded(builtin_program("base64_encode", ["Hello"]), map{ max_steps: 100 });
+if encoded.value != "SGVsbG8=" { fail("encoding adapter mismatch"); }
+
+let request = VM.run_decoded(builtin_program("http_parse_request", [
+    "GET /ready HTTP/1.1\r\nHost: local\r\n\r\n"
+]), map{ max_steps: 100 });
+if request.value.method != "GET" or request.value.path != "/ready" {
+    fail("pure HTTP adapter mismatch");
+}
+
+let caught_builtin = map{
+    format: "host-pbck-v1", version: 1,
+    chunk: map{
+        instructions: [
+            map{ op: 23, operand: 5 }, map{ op: 14, operand: 0 },
+            map{ op: 0, operand: 1 }, map{ op: 31, operand: 1 }, map{ op: 24 },
+            map{ op: 33 }
+        ], constants: ["error", "expected"], source_name: nil
+    }
+};
+let caught_builtin_result = VM.run_decoded(caught_builtin, map{ max_steps: 100 });
+if caught_builtin_result.value != "builtin failed: error" {
+    fail("pure builtin failure did not enter the guest exception path");
+}
+
+if not (try {
+    VM.run_decoded(builtin_program("str_repeat", ["ab", 4]), map{
+        max_steps: 100, max_collection_items: 7
+    });
+    false
+} catch true) { fail("pure builtin result budget did not fail closed"); }
+
+if not (try {
+    VM.run_decoded(adapter_program, map{ adapters: map{ double: 42 } });
+    false
+} catch true) { fail("non-callable host adapter did not fail closed"); }
+
+let adapter_detail_leaked = false;
+try {
+    VM.run_decoded(adapter_program, map{ adapters: map{
+        double: fn(_args) { throw "secret-adapter-detail"; }
+    } });
+} catch error {
+    adapter_detail_leaked = str_contains(str(error), "secret-adapter-detail");
+}
+if adapter_detail_leaked { fail("host adapter error detail leaked into guest failure"); }
+
+let caught_adapter = map{
+    format: "host-pbck-v1", version: 1,
+    chunk: map{
+        instructions: [
+            map{ op: 23, operand: 5 }, map{ op: 14, operand: 0 },
+            map{ op: 0, operand: 1 }, map{ op: 31, operand: 1 }, map{ op: 24 },
+            map{ op: 33 }
+        ], constants: ["bounded", 1], source_name: nil
+    }
+};
+let caught_adapter_result = VM.run_decoded(caught_adapter, map{ adapters: map{
+    bounded: fn(_args) { throw "private-provider-detail"; }
+} });
+if caught_adapter_result.value != "host adapter failed: bounded" {
+    fail("host adapter failure did not enter the guest exception path");
+}
+
+if not (try { VM.run_bytes(bytes, map{ max_steps: 2 }); false } catch true) {
+    fail("step budget did not fail closed");
+}
+if not (try {
+    let broken = Decode.decode_bytes(bytes);
+    broken.chunk.instructions[5].captures[0].index = 999999;
+    VM.run_decoded(broken, map{ max_locals: 16 });
+    false
+} catch true) { fail("capture slot budget did not fail closed"); }
+
+print "host_pbck_vm_pass";

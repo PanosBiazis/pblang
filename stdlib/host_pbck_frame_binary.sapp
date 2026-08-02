@@ -1,0 +1,403 @@
+// Deterministic, integrity-bound binary transport for flat host-PBCK frame
+// plans. The format is designed for generated platform runtimes: it avoids
+// JVM method-size limits and can be decoded with bounded allocations.
+
+let Plan = import("stdlib:host_pbck_frame_plan.sapp");
+
+let FORMAT = "pblang.host-pbck.frame-binary.v1";
+let VERSION = 1;
+let MAGIC = [80, 66, 70, 80]; // PBFP
+let DIGEST_BYTES = 64;
+let DEFAULT_MAX_ASSET_BYTES = 33554432;
+let HARD_MAX_ASSET_BYTES = 67108864;
+let DEFAULT_MAX_TEXT_BYTES = 16777216;
+let HARD_MAX_TEXT_BYTES = 33554432;
+let DEFAULT_MAX_SLOTS = 65536;
+let HARD_MAX_SLOTS = 1000000;
+
+fn _fault(message) { throw "host_pbck_frame_binary: " + message; }
+
+fn _option(options, name, fallback) {
+    if options != nil and is_map(options) and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _limit(options, name, fallback, hard_max) {
+    let value = _option(options, name, fallback);
+    if not is_number(value) or value < 1 or value != num_floor(value) or value > hard_max {
+        _fault("invalid " + name);
+    }
+    return value;
+}
+
+fn limits(options = nil) {
+    if options != nil and not is_map(options) { _fault("options must be a map"); }
+    let plan = Plan.limits(options);
+    plan.max_asset_bytes = _limit(options, "max_asset_bytes",
+        DEFAULT_MAX_ASSET_BYTES, HARD_MAX_ASSET_BYTES);
+    plan.max_text_bytes = _limit(options, "max_text_bytes",
+        DEFAULT_MAX_TEXT_BYTES, HARD_MAX_TEXT_BYTES);
+    plan.max_slots = _limit(options, "max_slots", DEFAULT_MAX_SLOTS, HARD_MAX_SLOTS);
+    return plan;
+}
+
+fn _u32(value, label) {
+    if not is_number(value) or value < 0 or value > 4294967295
+        or value != num_floor(value) { _fault("invalid " + label); }
+    return value;
+}
+
+fn _w_u8(out, value) {
+    if not is_number(value) or value < 0 or value > 255 or value != num_floor(value) {
+        _fault("invalid byte");
+    }
+    array_push(out, value);
+}
+
+fn _w_u32(out, value, label = "u32") {
+    let v = _u32(value, label);
+    _w_u8(out, bit_and(v, 255));
+    _w_u8(out, bit_and(bit_shr(v, 8), 255));
+    _w_u8(out, bit_and(bit_shr(v, 16), 255));
+    _w_u8(out, bit_and(bit_shr(v, 24), 255));
+}
+
+fn _w_operand(out, value) {
+    if value == 0 - 1 { _w_u32(out, 4294967295, "operand sentinel"); return; }
+    _w_u32(out, value, "operand");
+}
+
+fn _append(out, bytes) {
+    let i = 0;
+    while i < len(bytes) { _w_u8(out, bytes[i]); i = i + 1; }
+}
+
+// Base64 is a canonical, one-to-one representation of the byte payload. Using
+// the runtime's optimized SHA-256 over that representation avoids the large
+// pure-PBLang hashing cost while preserving collision resistance.
+fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+
+fn _w_string(out, value, budget) {
+    if not is_string(value) { _fault("string value required"); }
+    let bytes = str_to_bytes(value);
+    budget.text_bytes = budget.text_bytes + len(bytes);
+    if budget.text_bytes > budget.max_text_bytes { _fault("text byte limit exceeded"); }
+    _w_u32(out, len(bytes), "string length");
+    _append(out, bytes);
+}
+
+fn _w_function(out, function, index, budget, lim) {
+    if not is_map(function) or function.id != index { _fault("invalid function table entry"); }
+    if function.arity > lim.max_parameters or function.min_arity > function.arity
+        or function.max_local < function.arity or function.max_local > lim.max_slots
+        or function.max_upvalue > lim.max_slots
+        or function.default_count > function.arity {
+        _fault("function frame limit exceeded");
+    }
+    if function.name == nil { _w_u8(out, 0); }
+    else { _w_u8(out, 1); _w_string(out, function.name, budget); }
+    _w_u32(out, function.arity, "function arity");
+    _w_u32(out, function.min_arity, "function minimum arity");
+    if not is_bool(function.is_vararg) { _fault("invalid function vararg flag"); }
+    _w_u8(out, if function.is_vararg { 1 } else { 0 });
+    _w_u32(out, function.max_local, "function local count");
+    _w_u32(out, function.max_upvalue, "function upvalue count");
+    _w_u32(out, function.instruction_start, "function instruction start");
+    _w_u32(out, function.instruction_count, "function instruction count");
+    _w_u32(out, function.constant_start, "function constant start");
+    _w_u32(out, function.constant_count, "function constant count");
+    _w_u32(out, function.default_start, "function default start");
+    _w_u32(out, function.default_count, "function default count");
+    _w_u32(out, function.parameter_start, "function parameter start");
+    _w_u32(out, function.parameter_count, "function parameter count");
+}
+
+fn _w_constant(out, plan, index, budget) {
+    let kind = plan.constant_kinds[index];
+    if not is_number(kind) or kind != num_floor(kind)
+        or not (kind == 0 or kind == 1 or kind == 2 or kind == 3
+            or kind == 4 or kind == 5 or kind == 7) {
+        _fault("invalid constant kind");
+    }
+    _w_u8(out, kind);
+    if kind == 0 {
+        if not is_number(plan.constant_numbers[index]) { _fault("invalid numeric constant"); }
+        _append(out, num_to_le_bytes(plan.constant_numbers[index]));
+    } elif kind == 1 {
+        let value = plan.constant_numbers[index];
+        if value != 0 and value != 1 { _fault("invalid boolean constant"); }
+        _w_u8(out, value);
+    } elif kind == 3 or kind == 4 or kind == 5 {
+        _w_string(out, plan.constant_texts[index], budget);
+    } elif kind == 7 {
+        if plan.constant_functions[index] < 0
+            or plan.constant_functions[index] >= len(plan.functions) {
+            _fault("constant function id out of range");
+        }
+        _w_u32(out, plan.constant_functions[index], "constant function id");
+    }
+}
+
+fn _payload(plan, options) {
+    let valid = Plan.validate(plan);
+    if not valid.ok { _fault("invalid frame plan"); }
+    let lim = limits(options);
+    if len(plan.functions) > lim.max_functions or len(plan.opcodes) > lim.max_instructions
+        or len(plan.constant_kinds) > lim.max_constants
+        or len(plan.capture_indices) > lim.max_captures
+        or len(plan.parameter_types) > lim.max_parameters
+        or plan.max_depth > lim.max_depth {
+        _fault("plan exceeds configured limits");
+    }
+
+    let out = [];
+    _w_u32(out, plan.root_function, "root function");
+    _w_u32(out, plan.max_depth, "maximum depth");
+    _w_u32(out, plan.artifact_bytes, "artifact bytes");
+    _w_u32(out, len(plan.functions), "function count");
+    _w_u32(out, len(plan.opcodes), "instruction count");
+    _w_u32(out, len(plan.capture_indices), "capture count");
+    _w_u32(out, len(plan.constant_kinds), "constant count");
+    _w_u32(out, len(plan.constant_slots), "constant slot count");
+    _w_u32(out, len(plan.default_slots), "default slot count");
+    _w_u32(out, len(plan.parameter_types), "parameter type count");
+
+    let budget = map{ text_bytes: 0, max_text_bytes: lim.max_text_bytes };
+    let i = 0;
+    while i < len(plan.functions) {
+        _w_function(out, plan.functions[i], i, budget, lim); i = i + 1;
+    }
+    i = 0;
+    while i < len(plan.opcodes) {
+        _w_u8(out, plan.opcodes[i]);
+        _w_operand(out, plan.operands[i]);
+        _w_u32(out, plan.instruction_capture_starts[i], "instruction capture start");
+        _w_u32(out, plan.instruction_capture_counts[i], "instruction capture count");
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(plan.capture_indices) {
+        if not is_bool(plan.capture_is_local[i]) { _fault("invalid capture locality flag"); }
+        _w_u8(out, if plan.capture_is_local[i] { 1 } else { 0 });
+        _w_u32(out, plan.capture_indices[i], "capture index");
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(plan.constant_kinds) { _w_constant(out, plan, i, budget); i = i + 1; }
+    i = 0; while i < len(plan.constant_slots) {
+        _w_u32(out, plan.constant_slots[i], "constant slot"); i = i + 1;
+    }
+    i = 0; while i < len(plan.default_slots) {
+        _w_u32(out, plan.default_slots[i], "default slot"); i = i + 1;
+    }
+    i = 0; while i < len(plan.parameter_types) {
+        let parameter = plan.parameter_types[i];
+        if parameter < 0 or parameter > 2 or parameter != num_floor(parameter) {
+            _fault("invalid parameter type");
+        }
+        _w_u8(out, parameter); i = i + 1;
+    }
+    if len(out) > lim.max_asset_bytes { _fault("payload byte limit exceeded"); }
+    return out;
+}
+
+fn encode_plan(plan, options = nil) {
+    let lim = limits(options);
+    let payload = _payload(plan, options);
+    let out = [];
+    _append(out, MAGIC); _w_u8(out, VERSION);
+    _w_u32(out, len(payload), "payload length");
+    _append(out, payload);
+    _append(out, str_to_bytes(_digest(payload)));
+    if len(out) > lim.max_asset_bytes { _fault("asset byte limit exceeded"); }
+    return out;
+}
+
+fn encode_bytes(bytes, options = nil) { return encode_plan(Plan.build_bytes(bytes, options), options); }
+fn encode_file(path, options = nil) { return encode_plan(Plan.build_file(path, options), options); }
+
+fn _need(reader, count, label) {
+    if count < 0 or reader.pos + count > len(reader.bytes) {
+        _fault("truncated " + label);
+    }
+}
+
+fn _r_u8(reader) {
+    _need(reader, 1, "u8"); let value = reader.bytes[reader.pos];
+    reader.pos = reader.pos + 1; return value;
+}
+
+fn _r_u32(reader) {
+    _need(reader, 4, "u32"); let p = reader.pos; let b = reader.bytes;
+    let value = b[p] + b[p + 1] * 256 + b[p + 2] * 65536 + b[p + 3] * 16777216;
+    reader.pos = p + 4; return value;
+}
+
+fn _r_operand(reader) {
+    let value = _r_u32(reader);
+    if value == 4294967295 { return 0 - 1; }
+    return value;
+}
+
+fn _r_string(reader) {
+    let count = _r_u32(reader);
+    _need(reader, count, "string");
+    reader.text_bytes = reader.text_bytes + count;
+    if reader.text_bytes > reader.max_text_bytes { _fault("text byte limit exceeded"); }
+    let bytes = []; let i = 0;
+    while i < count { array_push(bytes, reader.bytes[reader.pos + i]); i = i + 1; }
+    reader.pos = reader.pos + count;
+    return try bytes_to_str(bytes) catch { _fault("invalid UTF-8 string"); };
+}
+
+fn _r_number(reader) {
+    _need(reader, 8, "f64"); let bytes = []; let i = 0;
+    while i < 8 { array_push(bytes, reader.bytes[reader.pos + i]); i = i + 1; }
+    reader.pos = reader.pos + 8;
+    return num_from_le_bytes(bytes);
+}
+
+fn _count(reader, name, maximum) {
+    let value = _r_u32(reader);
+    if value > maximum { _fault(name + " limit exceeded"); }
+    return value;
+}
+
+fn _r_function(reader, index, lim) {
+    let named = _r_u8(reader);
+    if named != 0 and named != 1 { _fault("invalid function-name flag"); }
+    let name = nil; if named == 1 { name = _r_string(reader); }
+    let function = map{
+        id: index, name: name, arity: _r_u32(reader), min_arity: _r_u32(reader),
+        is_vararg: false, max_local: 0, max_upvalue: 0,
+        instruction_start: 0, instruction_count: 0, constant_start: 0,
+        constant_count: 0, default_start: 0, default_count: 0,
+        parameter_start: 0, parameter_count: 0
+    };
+    let vararg = _r_u8(reader);
+    if vararg != 0 and vararg != 1 { _fault("invalid function vararg flag"); }
+    function.is_vararg = vararg == 1;
+    function.max_local = _r_u32(reader); function.max_upvalue = _r_u32(reader);
+    function.instruction_start = _r_u32(reader); function.instruction_count = _r_u32(reader);
+    function.constant_start = _r_u32(reader); function.constant_count = _r_u32(reader);
+    function.default_start = _r_u32(reader); function.default_count = _r_u32(reader);
+    function.parameter_start = _r_u32(reader); function.parameter_count = _r_u32(reader);
+    if function.arity > lim.max_parameters or function.min_arity > function.arity
+        or function.max_local < function.arity or function.max_local > lim.max_slots
+        or function.max_upvalue > lim.max_slots
+        or function.default_count > function.arity {
+        _fault("function frame limit exceeded");
+    }
+    return function;
+}
+
+fn _r_constant(reader, plan) {
+    let kind = _r_u8(reader); let number = 0; let text = ""; let function_id = 0 - 1;
+    if kind == 0 { number = _r_number(reader); }
+    elif kind == 1 {
+        number = _r_u8(reader); if number != 0 and number != 1 { _fault("invalid boolean constant"); }
+    }
+    elif kind == 2 { nil; }
+    elif kind == 3 or kind == 4 or kind == 5 { text = _r_string(reader); }
+    elif kind == 7 { function_id = _r_u32(reader); }
+    else { _fault("invalid constant kind"); }
+    array_push(plan.constant_kinds, kind); array_push(plan.constant_numbers, number);
+    array_push(plan.constant_texts, text); array_push(plan.constant_functions, function_id);
+}
+
+fn _copy_range(bytes, start, count) {
+    let out = []; let i = 0;
+    while i < count { array_push(out, bytes[start + i]); i = i + 1; }
+    return out;
+}
+
+fn decode(bytes, options = nil) {
+    let lim = limits(options);
+    if not is_array(bytes) or len(bytes) < 9 + DIGEST_BYTES
+        or len(bytes) > lim.max_asset_bytes { _fault("invalid asset size"); }
+    let i = 0; while i < len(MAGIC) {
+        if bytes[i] != MAGIC[i] { _fault("bad magic"); } i = i + 1;
+    }
+    if bytes[4] != VERSION { _fault("unsupported version"); }
+    let envelope = map{ bytes: bytes, pos: 5 };
+    let payload_size = _r_u32(envelope);
+    if payload_size > lim.max_asset_bytes
+        or 9 + payload_size + DIGEST_BYTES != len(bytes) { _fault("invalid payload length"); }
+    let payload = _copy_range(bytes, 9, payload_size);
+    let digest_bytes = _copy_range(bytes, 9 + payload_size, DIGEST_BYTES);
+    let digest = try bytes_to_str(digest_bytes) catch { _fault("invalid digest encoding"); };
+    if digest != _digest(payload) { _fault("integrity check failed"); }
+
+    let reader = map{ bytes: payload, pos: 0, text_bytes: 0,
+        max_text_bytes: lim.max_text_bytes };
+    let root_function = _r_u32(reader); let max_depth = _r_u32(reader);
+    let artifact_bytes = _r_u32(reader);
+    if max_depth > lim.max_depth { _fault("maximum depth limit exceeded"); }
+    if artifact_bytes > HARD_MAX_ASSET_BYTES { _fault("source artifact byte limit exceeded"); }
+    let function_count = _count(reader, "function count", lim.max_functions);
+    let instruction_count = _count(reader, "instruction count", lim.max_instructions);
+    let capture_count = _count(reader, "capture count", lim.max_captures);
+    let constant_count = _count(reader, "constant count", lim.max_constants);
+    let constant_slot_count = _count(reader, "constant slot count", lim.max_constants);
+    let default_slot_count = _count(reader, "default slot count", lim.max_constants);
+    let parameter_count = _count(reader, "parameter type count", lim.max_parameters);
+    if function_count < 1 { _fault("root function is missing"); }
+
+    let plan = map{
+        format: Plan.FORMAT, version: 1, root_function: root_function,
+        functions: [], opcodes: [], operands: [], instruction_capture_starts: [],
+        instruction_capture_counts: [], capture_is_local: [], capture_indices: [],
+        constant_kinds: [], constant_numbers: [], constant_texts: [],
+        constant_functions: [], constant_slots: [], default_slots: [],
+        parameter_types: [], max_depth: max_depth, artifact_bytes: artifact_bytes
+    };
+    i = 0; while i < function_count {
+        array_push(plan.functions, _r_function(reader, i, lim)); i = i + 1;
+    }
+    i = 0; while i < instruction_count {
+        array_push(plan.opcodes, _r_u8(reader)); array_push(plan.operands, _r_operand(reader));
+        array_push(plan.instruction_capture_starts, _r_u32(reader));
+        array_push(plan.instruction_capture_counts, _r_u32(reader)); i = i + 1;
+    }
+    i = 0; while i < capture_count {
+        let local = _r_u8(reader);
+        if local != 0 and local != 1 { _fault("invalid capture locality flag"); }
+        array_push(plan.capture_is_local, local == 1);
+        array_push(plan.capture_indices, _r_u32(reader)); i = i + 1;
+    }
+    i = 0; while i < constant_count { _r_constant(reader, plan); i = i + 1; }
+    i = 0; while i < constant_count {
+        if plan.constant_kinds[i] == 7 and (plan.constant_functions[i] < 0
+            or plan.constant_functions[i] >= function_count) {
+            _fault("constant function id out of range");
+        }
+        i = i + 1;
+    }
+    i = 0; while i < constant_slot_count { array_push(plan.constant_slots, _r_u32(reader)); i = i + 1; }
+    i = 0; while i < default_slot_count { array_push(plan.default_slots, _r_u32(reader)); i = i + 1; }
+    i = 0; while i < parameter_count {
+        let parameter = _r_u8(reader);
+        if parameter > 2 { _fault("invalid parameter type"); }
+        array_push(plan.parameter_types, parameter); i = i + 1;
+    }
+    if reader.pos != len(payload) { _fault("trailing payload bytes"); }
+    if not Plan.validate(plan).ok { _fault("decoded frame plan is invalid"); }
+    return plan;
+}
+
+fn decode_file(path, options = nil) { return decode(fs_read_bytes(path), options); }
+
+fn inspect(bytes, options = nil) {
+    let plan = decode(bytes, options); let stats = Plan.stats(plan);
+    return map{ ok: true, format: FORMAT, version: VERSION, bytes: len(bytes),
+        integrity: "sha256-canonical-base64-payload",
+        payload_digest: _digest(_copy_range(bytes, 9, len(bytes) - 9 - DIGEST_BYTES)),
+        asset_base64_sha256: _digest(bytes), payload_bytes: len(bytes) - 9 - DIGEST_BYTES,
+        functions: stats.functions, instructions: stats.instructions,
+        constants: stats.constants, captures: stats.captures, max_depth: stats.max_depth,
+        artifact_bytes: plan.artifact_bytes };
+}
+
+export FORMAT, VERSION, MAGIC, DIGEST_BYTES, DEFAULT_MAX_ASSET_BYTES,
+       HARD_MAX_ASSET_BYTES, DEFAULT_MAX_SLOTS, limits, encode_plan, encode_bytes, encode_file,
+       decode, decode_file, inspect;

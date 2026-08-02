@@ -1,0 +1,346 @@
+// Bounded PNG decoding in pure PBLang.
+//
+// This decoder intentionally supports the portable subset needed by native GUI
+// surfaces: 8-bit, non-interlaced grayscale, RGB, grayscale-alpha and RGBA PNG.
+// It validates every chunk CRC, the zlib checksum, dimensions and output bounds.
+
+let Flate = import("stdlib:flate.sapp");
+let FORMAT = "pblang.png.image.v1";
+let DEFAULT_MAX_INPUT_BYTES = 8388608;
+let DEFAULT_MAX_PIXELS = 4194304;
+let DEFAULT_MAX_OUTPUT_WIDTH = 4096;
+let DEFAULT_MAX_OUTPUT_HEIGHT = 4096;
+
+fn _result_error(message) {
+    return map{ ok: false, format: FORMAT, error: "png: " + message };
+}
+
+fn _u32(bytes, at) {
+    if at < 0 or at + 4 > len(bytes) { return nil; }
+    return bytes[at] * 16777216 + bytes[at + 1] * 65536
+        + bytes[at + 2] * 256 + bytes[at + 3];
+}
+
+fn _append_range(out, bytes, start, count) {
+    let i = 0;
+    while i < count {
+        array_push(out, bytes[start + i]);
+        i = i + 1;
+    }
+}
+
+fn _chunk_crc(bytes, type_at, data_at, size) {
+    return Flate.crc32_range(bytes, type_at, size + 4);
+}
+
+fn _int_option(options, key, fallback, minimum, maximum) {
+    let value = try options[key] catch fallback;
+    if type(value) != "number" or num_floor(value) != value
+        or value < minimum or value > maximum {
+        return nil;
+    }
+    return value;
+}
+
+fn _channels(color_type) {
+    if color_type == 0 { return 1; }
+    if color_type == 2 { return 3; }
+    if color_type == 3 { return 1; }
+    if color_type == 4 { return 2; }
+    if color_type == 6 { return 4; }
+    return 0;
+}
+
+fn _paeth(a, b, c) {
+    let p = a + b - c;
+    let pa = num_abs(p - a);
+    let pb = num_abs(p - b);
+    let pc = num_abs(p - c);
+    if pa <= pb and pa <= pc { return a; }
+    if pb <= pc { return b; }
+    return c;
+}
+
+fn _unfilter_row(raw, offset, stride, filter, previous, channels) {
+    if filter < 0 or filter > 4 { return nil; }
+    let row = [];
+    let x = 0;
+    if filter == 0 {
+        _append_range(row, raw, offset, stride);
+        return row;
+    }
+    if filter == 1 {
+        let seed = channels;
+        if seed > stride { seed = stride; }
+        _append_range(row, raw, offset, seed);
+        x = seed;
+        while x < stride {
+            let value = raw[offset + x] + row[x - channels];
+            if value >= 256 { value = value - 256; }
+            array_push(row, value);
+            x = x + 1;
+        }
+        return row;
+    }
+    if filter == 2 {
+        if previous == nil {
+            _append_range(row, raw, offset, stride);
+            return row;
+        }
+        while x < stride {
+            let value = raw[offset + x] + previous[x];
+            if value >= 256 { value = value - 256; }
+            array_push(row, value);
+            x = x + 1;
+        }
+        return row;
+    }
+    while x < stride {
+        let encoded = raw[offset + x];
+        let left = if x >= channels { row[x - channels] } else { 0 };
+        let up = if previous == nil { 0 } else { previous[x] };
+        let upper_left = if previous == nil or x < channels {
+            0
+        } else { previous[x - channels] };
+        let value = encoded;
+        if filter == 3 { value = encoded + num_floor((left + up) / 2); }
+        else { value = encoded + _paeth(left, up, upper_left); }
+        if value >= 256 { value = value - 256; }
+        array_push(row, value);
+        x = x + 1;
+    }
+    return row;
+}
+
+fn _output_size(width, height, max_width, max_height) {
+    let out_width = width;
+    let out_height = height;
+    if out_width > max_width {
+        out_height = num_max(1, num_floor(out_height * max_width / out_width));
+        out_width = max_width;
+    }
+    if out_height > max_height {
+        out_width = num_max(1, num_floor(out_width * max_height / out_height));
+        out_height = max_height;
+    }
+    return map{ width: out_width, height: out_height };
+}
+
+fn _pixel(row, x, color_type, palette, alpha) {
+    if color_type == 0 {
+        let gray = row[x];
+        return [gray, gray, gray, 255];
+    }
+    if color_type == 2 {
+        let at = x * 3;
+        return [row[at], row[at + 1], row[at + 2], 255];
+    }
+    if color_type == 3 {
+        let index = row[x];
+        if index >= len(palette) { return nil; }
+        let opacity = if index < len(alpha) { alpha[index] } else { 255 };
+        return [palette[index][0], palette[index][1],
+            palette[index][2], opacity];
+    }
+    if color_type == 4 {
+        let at = x * 2;
+        return [row[at], row[at], row[at], row[at + 1]];
+    }
+    let at = x * 4;
+    return [row[at], row[at + 1], row[at + 2], row[at + 3]];
+}
+
+fn decode(bytes, options = nil) {
+    if options == nil { options = map{}; }
+    if not is_map(options) { return _result_error("options must be a map"); }
+    let max_input = _int_option(options, "max_input_bytes",
+        DEFAULT_MAX_INPUT_BYTES, 64, 67108864);
+    let max_pixels = _int_option(options, "max_pixels",
+        DEFAULT_MAX_PIXELS, 1, 16777216);
+    let max_width = _int_option(options, "max_output_width",
+        DEFAULT_MAX_OUTPUT_WIDTH, 1, 8192);
+    let max_height = _int_option(options, "max_output_height",
+        DEFAULT_MAX_OUTPUT_HEIGHT, 1, 8192);
+    if max_input == nil or max_pixels == nil or max_width == nil or max_height == nil {
+        return _result_error("invalid decode bounds");
+    }
+    if not is_array(bytes) or len(bytes) < 45 or len(bytes) > max_input {
+        return _result_error("input exceeds bounded size or is truncated");
+    }
+    let signature = [137, 80, 78, 71, 13, 10, 26, 10];
+    let i = 0;
+    while i < 8 {
+        if bytes[i] != signature[i] { return _result_error("invalid signature"); }
+        i = i + 1;
+    }
+
+    let at = 8;
+    let width = 0; let height = 0; let color_type = -1;
+    let channels = 0; let seen_ihdr = false; let seen_idat = false;
+    let seen_iend = false; let compressed = [];
+    let palette = []; let alpha = [];
+    while at < len(bytes) {
+        if at + 12 > len(bytes) { return _result_error("truncated chunk"); }
+        let size = _u32(bytes, at);
+        if size == nil or size > max_input or at + 12 + size > len(bytes) {
+            return _result_error("chunk exceeds bounded input");
+        }
+        let type_at = at + 4;
+        let data_at = at + 8;
+        let expected_crc = _u32(bytes, data_at + size);
+        if expected_crc != _chunk_crc(bytes, type_at, data_at, size) {
+            return _result_error("chunk CRC mismatch");
+        }
+        let is_ihdr = bytes[type_at] == 73 and bytes[type_at + 1] == 72
+            and bytes[type_at + 2] == 68 and bytes[type_at + 3] == 82;
+        let is_idat = bytes[type_at] == 73 and bytes[type_at + 1] == 68
+            and bytes[type_at + 2] == 65 and bytes[type_at + 3] == 84;
+        let is_plte = bytes[type_at] == 80 and bytes[type_at + 1] == 76
+            and bytes[type_at + 2] == 84 and bytes[type_at + 3] == 69;
+        let is_trns = bytes[type_at] == 116 and bytes[type_at + 1] == 82
+            and bytes[type_at + 2] == 78 and bytes[type_at + 3] == 83;
+        let is_iend = bytes[type_at] == 73 and bytes[type_at + 1] == 69
+            and bytes[type_at + 2] == 78 and bytes[type_at + 3] == 68;
+        if is_ihdr {
+            if seen_ihdr or at != 8 or size != 13 {
+                return _result_error("invalid IHDR");
+            }
+            width = _u32(bytes, data_at);
+            height = _u32(bytes, data_at + 4);
+            let bit_depth = bytes[data_at + 8];
+            color_type = bytes[data_at + 9];
+            channels = _channels(color_type);
+            if width < 1 or height < 1 or width > 32768 or height > 32768
+                or width * height > max_pixels {
+                return _result_error("dimensions exceed safe bounds");
+            }
+            if bit_depth != 8 or channels == 0 {
+                return _result_error("only 8-bit grayscale, RGB, grayscale-alpha and RGBA are supported");
+            }
+            if bytes[data_at + 10] != 0 or bytes[data_at + 11] != 0
+                or bytes[data_at + 12] != 0 {
+                return _result_error("unsupported compression, filter or interlace mode");
+            }
+            seen_ihdr = true;
+        } elif is_plte {
+            if not seen_ihdr or seen_idat or size < 3 or size > 768
+                or num_mod(size, 3) != 0 {
+                return _result_error("invalid PLTE");
+            }
+            palette = [];
+            let pi = 0;
+            while pi < size {
+                array_push(palette, [
+                    bytes[data_at + pi], bytes[data_at + pi + 1],
+                    bytes[data_at + pi + 2]
+                ]);
+                pi = pi + 3;
+            }
+        } elif is_trns {
+            if not seen_ihdr or seen_idat or color_type != 3
+                or len(palette) < 1 or size > len(palette) {
+                return _result_error("invalid indexed transparency");
+            }
+            alpha = [];
+            _append_range(alpha, bytes, data_at, size);
+        } elif is_idat {
+            if not seen_ihdr or seen_iend {
+                return _result_error("IDAT appears outside the image body");
+            }
+            if len(compressed) + size > max_input {
+                return _result_error("compressed image exceeds safe bounds");
+            }
+            _append_range(compressed, bytes, data_at, size);
+            seen_idat = true;
+        } elif is_iend {
+            if not seen_ihdr or not seen_idat or size != 0 {
+                return _result_error("invalid IEND");
+            }
+            seen_iend = true;
+        } else {
+            // Unknown critical chunks have an uppercase first type byte.
+            if bit_and(bytes[type_at], 32) == 0 {
+                return _result_error("unsupported critical chunk");
+            }
+        }
+        at = at + 12 + size;
+        if seen_iend { break; }
+    }
+    if not seen_iend or at != len(bytes) {
+        return _result_error("missing IEND or trailing data");
+    }
+    if color_type == 3 and len(palette) < 1 {
+        return _result_error("indexed image is missing its palette");
+    }
+
+    let stride = width * channels;
+    let expected_raw = (stride + 1) * height;
+    let raw = try Flate.zlib_decode(compressed, expected_raw, true) catch nil;
+    if raw == nil or len(raw) != expected_raw {
+        return _result_error("invalid or oversized compressed pixels");
+    }
+
+    let output = _output_size(width, height, max_width, max_height);
+    if output.width * output.height > max_pixels {
+        return _result_error("decoded output exceeds safe bounds");
+    }
+    let image = [];
+    let source_columns = [];
+    let column = 0;
+    while column < output.width {
+        array_push(source_columns,
+            num_floor(column * width / output.width));
+        column = column + 1;
+    }
+    let previous = nil;
+    let source_y = 0;
+    let output_y = 0;
+    let raw_at = 0;
+    while source_y < height {
+        let row = _unfilter_row(raw, raw_at + 1, stride,
+            raw[raw_at], previous, channels);
+        if row == nil { return _result_error("unsupported scanline filter"); }
+        while output_y < output.height
+            and num_floor(output_y * height / output.height) == source_y {
+            let pixels = [];
+            let output_x = 0;
+            while output_x < output.width {
+                let source_x = source_columns[output_x];
+                if color_type == 6 {
+                    let pixel_at = source_x * 4;
+                    array_push(pixels, [
+                        row[pixel_at], row[pixel_at + 1],
+                        row[pixel_at + 2], row[pixel_at + 3]
+                    ]);
+                } else {
+                    let pixel = _pixel(row, source_x, color_type, palette, alpha);
+                    if pixel == nil {
+                        return _result_error("indexed pixel exceeds its palette");
+                    }
+                    array_push(pixels, pixel);
+                }
+                output_x = output_x + 1;
+            }
+            array_push(image, pixels);
+            output_y = output_y + 1;
+        }
+        previous = row;
+        raw_at = raw_at + stride + 1;
+        source_y = source_y + 1;
+    }
+    if len(image) != output.height {
+        return _result_error("decoded row count mismatch");
+    }
+    return map{
+        ok: true, format: FORMAT, image: image,
+        width: width, height: height,
+        output_width: output.width, output_height: output.height,
+        color_type: color_type, channels: channels,
+        input_bytes: len(bytes), decoded_bytes: expected_raw,
+        crc_verified: true, checksum_verified: true,
+        interlaced: false
+    };
+}
+
+export FORMAT, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_PIXELS;
+export DEFAULT_MAX_OUTPUT_WIDTH, DEFAULT_MAX_OUTPUT_HEIGHT, decode;

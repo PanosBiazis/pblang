@@ -1,0 +1,207 @@
+// Full PBFP-v1 execution bridge. A validated flat frame plan is reconstructed
+// once into the canonical recursive PBCK shape and then executed by the single
+// complete host-PBCK VM. Host capabilities remain explicitly injected.
+
+let Binary = import("stdlib:host_pbck_frame_binary.sapp");
+let Plan = import("stdlib:host_pbck_frame_plan.sapp");
+let VM = import("stdlib:host_pbck_vm.sapp");
+
+let FORMAT = "pblang.host-pbck.frame-vm.v1";
+
+fn _fault(message) { throw "host_pbck_frame_vm: " + message; }
+
+fn _has_operand(op) {
+    return op == 0 or (op >= 13 and op <= 20) or op == 23 or op == 25 or op == 26
+        or op == 28 or op == 29 or op == 31 or op == 32 or (op >= 35 and op <= 37)
+        or op == 42;
+}
+
+fn _constant_operand(op) {
+    return op == 0 or (op >= 13 and op <= 18) or op == 42;
+}
+
+fn _zeros(count) {
+    let values = []; let i = 0;
+    while i < count { array_push(values, 0); i = i + 1; }
+    return values;
+}
+
+fn _empty(count) {
+    let values = []; let i = 0;
+    while i < count { array_push(values, nil); i = i + 1; }
+    return values;
+}
+
+fn _require_bounded_plan(plan, options) {
+    if not Plan.validate(plan).ok { _fault("invalid frame plan"); }
+    let limits = Plan.limits(options);
+    if len(plan.functions) > limits.max_functions { _fault("function limit exceeded"); }
+    if len(plan.opcodes) > limits.max_instructions { _fault("instruction limit exceeded"); }
+    if len(plan.constant_kinds) > limits.max_constants { _fault("constant limit exceeded"); }
+    if len(plan.capture_indices) > limits.max_captures { _fault("capture limit exceeded"); }
+    if len(plan.parameter_types) > limits.max_parameters { _fault("parameter limit exceeded"); }
+    if plan.max_depth < 0 or plan.max_depth > limits.max_depth { _fault("function depth limit exceeded"); }
+    let root = plan.functions[plan.root_function];
+    if root.arity != 0 or root.min_arity != 0 or root.is_vararg
+        or root.default_count != 0 or root.parameter_count != 0
+        or root.max_upvalue != 0 {
+        _fault("invalid root function signature");
+    }
+    return limits;
+}
+
+fn _lookup(index, value, message) {
+    let key = str(value);
+    if not map_has(index, key) { _fault(message); }
+    return index[key];
+}
+
+fn _captures(plan, instruction) {
+    let captures = []; let i = 0;
+    let start = plan.instruction_capture_starts[instruction];
+    let count = plan.instruction_capture_counts[instruction];
+    while i < count {
+        array_push(captures, map{
+            is_local: plan.capture_is_local[start + i],
+            index: plan.capture_indices[start + i]
+        });
+        i = i + 1;
+    }
+    return captures;
+}
+
+fn _value(state, slot, depth) {
+    let plan = state.plan;
+    let kind = plan.constant_kinds[slot];
+    if kind == 0 { return plan.constant_numbers[slot]; }
+    if kind == 1 { return plan.constant_numbers[slot] == 1; }
+    if kind == 2 { return nil; }
+    if kind == 3 { return plan.constant_texts[slot]; }
+    if kind == 4 { return map{ __pbck_numeric: "bigint", text: plan.constant_texts[slot] }; }
+    if kind == 5 { return map{ __pbck_numeric: "rational", text: plan.constant_texts[slot] }; }
+    if kind == 7 { return _function(state, plan.constant_functions[slot], depth + 1); }
+    _fault("unsupported constant kind");
+}
+
+fn _function(state, function_id, depth) {
+    if depth > state.limits.max_depth { _fault("function depth limit exceeded"); }
+    if function_id < 0 or function_id >= len(state.plan.functions) {
+        _fault("function id out of range");
+    }
+    if state.status[function_id] == 2 { return state.functions[function_id]; }
+    if state.status[function_id] == 1 { _fault("cyclic function constants are not allowed"); }
+    state.status[function_id] = 1;
+
+    let plan = state.plan;
+    let frame = plan.functions[function_id];
+    let defaults = []; let i = 0;
+    while i < frame.default_count {
+        let slot = plan.default_slots[frame.default_start + i];
+        array_push(defaults, _value(state, slot, depth)); i = i + 1;
+    }
+    let parameter_types = []; i = 0;
+    while i < frame.parameter_count {
+        array_push(parameter_types, plan.parameter_types[frame.parameter_start + i]); i = i + 1;
+    }
+    let constants = []; let local_slots = map{}; let closure_functions = map{}; i = 0;
+    while i < frame.constant_count {
+        let slot = plan.constant_slots[frame.constant_start + i];
+        let slot_key = str(slot);
+        if map_has(local_slots, slot_key) { _fault("ambiguous local constant slot"); }
+        local_slots[slot_key] = i;
+        if plan.constant_kinds[slot] == 7 {
+            let function_key = str(plan.constant_functions[slot]);
+            if map_has(closure_functions, function_key) {
+                _fault("ambiguous closure function constant");
+            }
+            closure_functions[function_key] = i;
+        }
+        array_push(constants, _value(state, slot, depth)); i = i + 1;
+    }
+    let opcodes = []; let operands = []; let closures = map{}; i = 0;
+    while i < frame.instruction_count {
+        let instruction = frame.instruction_start + i;
+        let op = plan.opcodes[instruction];
+        let operand = plan.operands[instruction];
+        array_push(opcodes, op);
+        if op == 27 {
+            array_push(operands, _lookup(closure_functions, operand,
+                "closure references a foreign function"));
+            closures[str(i)] = _captures(plan, instruction);
+        } elif _constant_operand(op) {
+            array_push(operands, _lookup(local_slots, operand,
+                "instruction references a foreign constant slot"));
+        } elif _has_operand(op) {
+            array_push(operands, operand);
+        } else { array_push(operands, 0 - 1); }
+        i = i + 1;
+    }
+
+    let function = map{
+        __pbck_function: true, name: frame.name, arity: frame.arity,
+        min_arity: frame.min_arity, defaults: defaults, is_vararg: frame.is_vararg,
+        parameter_types_present: frame.parameter_count > 0,
+        parameter_types: parameter_types,
+        chunk: map{
+            compact: true, opcodes: opcodes, operands: operands, closures: closures,
+            constants: constants, source_name: nil
+        }
+    };
+    state.functions[function_id] = function;
+    state.status[function_id] = 2;
+    return function;
+}
+
+fn prepare(plan, options = nil) {
+    let limits = _require_bounded_plan(plan, options);
+    let state = map{
+        plan: plan, limits: limits, functions: _empty(len(plan.functions)),
+        status: _zeros(len(plan.functions))
+    };
+    let root = _function(state, plan.root_function, 0);
+    let i = 0;
+    while i < len(plan.functions) {
+        if state.status[i] == 0 { _function(state, i, 0); }
+        i = i + 1;
+    }
+    return freeze(map{
+        format: FORMAT, version: 1,
+        decoded: map{
+            format: "host-pbck-v1", version: 1,
+            artifact_bytes: plan.artifact_bytes, chunk: root.chunk
+        },
+        functions: len(plan.functions), instructions: len(plan.opcodes),
+        constants: len(plan.constant_kinds), captures: len(plan.capture_indices),
+        max_depth: plan.max_depth, artifact_bytes: plan.artifact_bytes
+    });
+}
+
+fn _require_prepared(program) {
+    if not is_map(program) or not map_has(program, "format") or program.format != FORMAT
+        or not map_has(program, "version") or program.version != 1
+        or not map_has(program, "decoded") or not is_map(program.decoded)
+        or not map_has(program.decoded, "format") or program.decoded.format != "host-pbck-v1"
+        or not map_has(program.decoded, "version") or program.decoded.version != 1
+        or not map_has(program.decoded, "chunk") or not is_map(program.decoded.chunk) {
+        _fault("invalid prepared program");
+    }
+}
+
+fn run_prepared(program, options = nil, globals = nil) {
+    _require_prepared(program);
+    return VM.run_decoded(program.decoded, options, globals);
+}
+
+fn run(plan, options = nil, globals = nil) {
+    return run_prepared(prepare(plan, options), options, globals);
+}
+
+fn run_bytes(bytes, options = nil, globals = nil) {
+    return run(Binary.decode(bytes, options), options, globals);
+}
+
+fn run_file(path, options = nil, globals = nil) {
+    return run(Binary.decode_file(path, options), options, globals);
+}
+
+export FORMAT, prepare, run_prepared, run, run_bytes, run_file;

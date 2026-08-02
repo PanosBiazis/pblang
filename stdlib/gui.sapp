@@ -114,9 +114,11 @@ fn sphere3d(name, x, y, w, h, text) {
     return map{ kind: "sphere3d", name: name, x: x, y: y, w: w, h: h, text: text };
 }
 // image widget — img is a 2D pixel array (img[y][x] = packed gfx color), or nil for a
-// placeholder. Nearest-neighbour scaled to the widget box at draw time.
-fn image(name, x, y, w, h, img) {
-    return map{ kind: "image", name: name, x: x, y: y, w: w, h: h, img: img };
+// placeholder. Nearest-neighbour scaled to the widget box at draw time. An optional
+// callback receives (form, local_x, local_y) and enables coordinate-accurate canvases.
+fn image(name, x, y, w, h, img, onclick = nil) {
+    return map{ kind: "image", name: name, x: x, y: y, w: w, h: h,
+                img: img, onclick: onclick, enabled: true };
 }
 // radio button: radios sharing `group` are mutually exclusive (selecting one clears its
 // siblings). Auto-sized like checkbox.
@@ -144,6 +146,7 @@ fn form(title, w, h) {
                 pressed_keys: map{},
                 palette: palette("dark"),
                 layout_fn: nil, layout_options: nil, onresize: nil,
+                ontick: nil, tick_interval_ms: 0, next_tick_ms: 0,
                 resize_count: 0, viewport: map{ width: w, height: h }, dirty: true };
 }
 fn add(f, w) { array_push(f.widgets, w); _pull(f, w); f.dirty = true; return f; }
@@ -406,6 +409,9 @@ fn _click_at(f, x, y) {
     else if w.kind == "button" {
         if w.onclick != nil { w.onclick(f); }
     }
+    else if w.kind == "image" {
+        if w.onclick != nil { w.onclick(f, x - w.x, y - w.y); }
+    }
     return 0;
 }
 
@@ -629,19 +635,70 @@ fn _draw_widget(win, f, w) {
     } else if w.kind == "image" {
         win.rect(w.x, w.y, w.w, w.h, c.field);
         let img = try w.img catch nil;
-        if img != nil and len(img) > 0 and len(img[0]) > 0 {
-            let ih = len(img);
-            let iw = len(img[0]);
-            let py = 0;
-            while py < w.h {
-                let sy = num_floor(py * ih / w.h);
-                let px = 0;
-                while px < w.w {
-                    let sx = num_floor(px * iw / w.w);
-                    win.point(w.x + px, w.y + py, img[sy][sx]);
-                    px = px + 1;
+        let packed = is_map(img)
+            and (try img.format catch "") == "pblang.image.rgba8.v1"
+            and type(try img.width catch nil) == "number"
+            and type(try img.height catch nil) == "number"
+            and num_floor(img.width) == img.width
+            and num_floor(img.height) == img.height
+            and img.width > 0 and img.height > 0
+            and is_array(try img.bytes catch nil)
+            and type(try img.offset catch 0) == "number"
+            and num_floor(try img.offset catch 0) == (try img.offset catch 0)
+            and (try img.offset catch 0) >= 0
+            and type(try img.stride catch nil) == "number"
+            and num_floor(img.stride) == img.stride
+            and img.stride >= img.width * 4
+            and len(img.bytes) == (try img.offset catch 0)
+                + img.height * img.stride;
+        let planar = not packed and is_array(img) and len(img) > 0
+            and is_array(img[0]) and len(img[0]) > 0;
+        if packed or planar {
+            let ih = if packed { img.height } else { len(img) };
+            let iw = if packed { img.width } else { len(img[0]) };
+            if iw <= w.w and ih <= w.h {
+                // Upscaling is proportional to source pixels, not viewport
+                // pixels. This keeps remote previews responsive on HiDPI and
+                // ultrawide displays while preserving nearest-neighbour output.
+                let sy = 0;
+                while sy < ih {
+                    let y0 = num_floor(sy * w.h / ih);
+                    let y1 = num_floor((sy + 1) * w.h / ih);
+                    let sx = 0;
+                    while sx < iw {
+                        let x0 = num_floor(sx * w.w / iw);
+                        let x1 = num_floor((sx + 1) * w.w / iw);
+                        let color = if packed {
+                            let at = (try img.offset catch 0)
+                                + sy * img.stride + sx * 4;
+                            [img.bytes[at], img.bytes[at + 1],
+                                img.bytes[at + 2], img.bytes[at + 3]]
+                        } else { img[sy][sx] };
+                        win.rect(w.x + x0, w.y + y0,
+                            num_max(1, x1 - x0), num_max(1, y1 - y0),
+                            color);
+                        sx = sx + 1;
+                    }
+                    sy = sy + 1;
                 }
-                py = py + 1;
+            } else {
+                let py = 0;
+                while py < w.h {
+                    let sy = num_floor(py * ih / w.h);
+                    let px = 0;
+                    while px < w.w {
+                        let sx = num_floor(px * iw / w.w);
+                        let color = if packed {
+                            let at = (try img.offset catch 0)
+                                + sy * img.stride + sx * 4;
+                            [img.bytes[at], img.bytes[at + 1],
+                                img.bytes[at + 2], img.bytes[at + 3]]
+                        } else { img[sy][sx] };
+                        win.point(w.x + px, w.y + py, color);
+                        px = px + 1;
+                    }
+                    py = py + 1;
+                }
             }
         } else {
             _text(win, w.x + 6, w.y + 6, "(no frame)", c.muted);
@@ -667,6 +724,7 @@ fn run(f) {
     gfx.run(win, f,
         fn(s, evs) {
             let i = 0; while i < len(evs) { handle_event(s, evs[i]); i = i + 1; }
+            poll_tick(s);
             return try s.dirty catch true;
         },
         fn(s, w2) { draw(w2, s); },
@@ -726,6 +784,40 @@ fn set_layout(f, layout_fn, options = nil) {
 
 fn set_layout_options(f, options = nil) { f.layout_options = options; return f; }
 fn set_resize_handler(f, handler = nil) { f.onresize = handler; return f; }
+
+// A tick handler must remain non-blocking. It is intended for draining worker
+// channels and advancing small state machines, never for network or disk I/O.
+fn set_tick_handler(f, handler = nil, interval_ms = 50) {
+    if handler == nil {
+        f.ontick = nil; f.tick_interval_ms = 0; f.next_tick_ms = 0;
+        return f;
+    }
+    if type(interval_ms) != "number" or num_floor(interval_ms) != interval_ms
+        or interval_ms < 10 or interval_ms > 60000 {
+        throw "gui tick interval must be an integer from 10 to 60000 milliseconds";
+    }
+    f.ontick = handler;
+    f.tick_interval_ms = interval_ms;
+    f.next_tick_ms = 0;
+    return f;
+}
+
+// poll_tick is public so headless tests and alternative GUI backends can drive
+// exactly the same deterministic polling contract.
+fn poll_tick(f, at_ms = nil) {
+    if (try f.ontick catch nil) == nil or (try f.tick_interval_ms catch 0) <= 0 {
+        return false;
+    }
+    if at_ms == nil { at_ms = now_ms(); }
+    if type(at_ms) != "number" or num_floor(at_ms) != at_ms or at_ms < 0 {
+        throw "gui tick time must be a non-negative integer";
+    }
+    if at_ms < (try f.next_tick_ms catch 0) { return false; }
+    f.next_tick_ms = at_ms + f.tick_interval_ms;
+    let changed = f.ontick(f);
+    if changed == true { f.dirty = true; }
+    return changed == true;
+}
 
 fn set_visible(f, name, visible) {
     let widget = get(f, name);
@@ -799,5 +891,6 @@ export theme, palette, custom_palette, set_palette,
        form, add, fit_form, get, bind, set_model, sync, hit_test, handle_event, draw, run,
        progress_bar, widget_count, remove_widget,
        divider, spacer, textarea, layout_profile, set_layout, set_layout_options,
-       set_resize_handler, set_visible, set_enabled, relayout, focus_next,
+       set_resize_handler, set_tick_handler, poll_tick,
+       set_visible, set_enabled, relayout, focus_next,
        has_widget, set_prop, widget_kinds;

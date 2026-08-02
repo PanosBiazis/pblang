@@ -1,0 +1,256 @@
+let Plan = import("stdlib:host_pbck_frame_plan.sapp");
+let Calls = import("stdlib:host_pbck_frame_calls.sapp");
+let VM = import("stdlib:host_pbck_vm.sapp");
+
+fn fail(message) { throw "FAIL host_pbck_frame_calls: " + message; }
+
+fn decoded(instructions, constants) {
+    return map{
+        format: "host-pbck-v1", version: 1,
+        chunk: map{ instructions: instructions, constants: constants, source_name: nil }
+    };
+}
+
+fn guest(name, arity, min_arity, defaults, instructions, constants) {
+    return map{
+        __pbck_function: true, name: name, arity: arity, min_arity: min_arity,
+        defaults: defaults, is_vararg: false, parameter_types: [],
+        chunk: map{ instructions: instructions, constants: constants, source_name: nil }
+    };
+}
+
+// One closure mutates the same captured cell across a normal and a tail call.
+let add = guest("add", 1, 1, [], [
+map{ op: 28, operand: 0 }, map{ op: 25, operand: 0 }, map{ op: 1 },
+map{ op: 29, operand: 0 }, map{ op: 28, operand: 0 }, map{ op: 33 }
+], []);
+let unused_unsupported = guest("unused_unsupported", 0, 0, [], [
+map{ op: 0, operand: 0 }, map{ op: 12 }, map{ op: 33 }
+], [999]);
+let shared = decoded([
+map{ op: 0, operand: 0 }, map{ op: 26, operand: 0 },
+map{ op: 27, fn_const: 1, captures: [map{ is_local: true, index: 0 }] },
+map{ op: 26, operand: 1 },
+map{ op: 25, operand: 1 }, map{ op: 0, operand: 2 }, map{ op: 31, operand: 1 }, map{ op: 11 },
+map{ op: 25, operand: 1 }, map{ op: 0, operand: 3 }, map{ op: 32, operand: 1 }
+], [40, add, 2, 3, unused_unsupported]);
+let plan = Plan.build_decoded(shared);
+let prepared = Calls.prepare(plan);
+let report = Calls.run_prepared(prepared, 0, [], map{ require_i32: true, max_steps: 1000 });
+let generic = VM.run_decoded(shared, map{ max_steps: 1000 });
+if report.value != 45 or report.value != generic.value or report.tail_calls != 1
+or report.peak_frames != 2 or report.closures != 2 or report.peak_locals != 3 {
+    fail("shared upvalue, call or tail-call parity mismatch: " + str(report));
+}
+let whole_contract = Calls.inspect_all(plan);
+let reachable_contract = Calls.inspect(plan, 0);
+if whole_contract.ok or not reachable_contract.ok
+or reachable_contract.reachable_function_count != 2
+or reachable_contract.call_instructions != 2
+or reachable_contract.closure_instructions != 1 {
+    fail("reachable call subgraph selection mismatch");
+}
+let selected_probe = Calls.find_i32_call_probe(plan);
+if not selected_probe.ok or selected_probe.function_id != 0 or selected_probe.value != 45
+or selected_probe.tail_calls != 1 or selected_probe.reachable_functions != [0, 1] {
+    fail("deterministic call-frame probe selection mismatch: " + str(selected_probe));
+}
+let verified = Calls.verify_i32(plan, 0, [], map{ max_steps: 1000 });
+if verified.format != Calls.VERIFIED_I32_FORMAT or not verified.ok
+or verified.value != 45 or verified.reachable_function_count != 2
+or verified.reachable_instructions != 17 or verified.captures != 1
+or verified.closure_instructions != 1 or verified.call_instructions != 2
+or verified.tail_call_instructions != 1 or verified.max_arity != 1
+or verified.max_locals != 2 or verified.max_upvalues != 1
+or verified.observed_steps != report.steps
+or verified.observed_peak_frames != 2 or verified.observed_tail_calls != 1 {
+    fail("verified i32 call graph contract mismatch: " + str(verified));
+}
+let verified_again = Calls.verify_i32_prepared(prepared, 0, [], map{ max_steps: 1000 });
+if verified_again.used_opcodes != verified.used_opcodes
+or verified_again.reachable_instructions != verified.reachable_instructions
+or verified_again.value != verified.value {
+    fail("verified i32 call graph is not deterministic");
+}
+
+// Compiler-emitted locals occupy frame stack slots directly. Declarations do
+// not require OpSetLocal; closures capture the original slot cell.
+let emitted_add = guest("emitted_add", 1, 1, [], [
+map{ op: 28, operand: 0 }, map{ op: 25, operand: 0 }, map{ op: 1 },
+map{ op: 29, operand: 0 }, map{ op: 28, operand: 0 }, map{ op: 33 },
+map{ op: 0, operand: 0 }, map{ op: 33 }
+], [nil]);
+let emitted = decoded([
+map{ op: 0, operand: 0 },
+map{ op: 27, fn_const: 1, captures: [map{ is_local: true, index: 0 }] },
+map{ op: 25, operand: 1 }, map{ op: 0, operand: 2 }, map{ op: 31, operand: 1 }, map{ op: 11 },
+map{ op: 25, operand: 1 }, map{ op: 0, operand: 3 }, map{ op: 32, operand: 1 },
+map{ op: 33 }, map{ op: 11 }, map{ op: 11 }, map{ op: 0, operand: 4 }, map{ op: 33 }
+], [40, emitted_add, 1, 1, nil]);
+let emitted_plan = Plan.build_decoded(emitted);
+let emitted_probe = Calls.find_i32_call_probe(emitted_plan);
+if not emitted_probe.ok or emitted_probe.value != 42 or emitted_probe.function_id != 0
+or Calls.run(emitted_plan, 0, [], map{ require_i32: true }).value != 42
+or VM.run_decoded(emitted).value != 42 {
+    fail("compiler-emitted stack-local call semantics mismatch: " + str(emitted_probe));
+}
+
+// A nested closure captures its parent's upvalue cell, not a copied value.
+let reader = guest("reader", 0, 0, [], [
+map{ op: 28, operand: 0 }, map{ op: 33 }
+], []);
+let factory = guest("factory", 0, 0, [], [
+map{ op: 27, fn_const: 0, captures: [map{ is_local: false, index: 0 }] },
+map{ op: 33 }
+], [reader]);
+let nested = decoded([
+map{ op: 0, operand: 0 }, map{ op: 26, operand: 0 },
+map{ op: 27, fn_const: 1, captures: [map{ is_local: true, index: 0 }] },
+map{ op: 31, operand: 0 }, map{ op: 31, operand: 0 }, map{ op: 33 }
+], [73, factory]);
+let nested_plan = Plan.build_decoded(nested);
+let nested_report = Calls.run(nested_plan, 0, [], map{ require_i32: true });
+if nested_report.value != 73 or nested_report.peak_frames != 2 or nested_report.closures != 3 {
+    fail("nested non-local capture mismatch");
+}
+let nested_verified = Calls.verify_i32(nested_plan, 0, [], map{ max_steps: 1000 });
+if nested_verified.value != 73 or nested_verified.reachable_function_count != 3
+or nested_verified.captures != 2 or nested_verified.max_upvalues != 1
+or nested_verified.closure_instructions != 2 or nested_verified.call_instructions != 2 {
+    fail("three-function shared-cell graph verification mismatch: " + str(nested_verified));
+}
+let nested_selected = Calls.find_i32_call_probe(nested_plan, map{
+    min_reachable_functions: 3, max_reachable_functions: 3,
+    max_probe_instructions: 64, max_probe_steps: 1000
+});
+if not nested_selected.ok or nested_selected.function_id != 0
+or nested_selected.value != 73 or nested_selected.peak_frames != 2
+or nested_selected.reachable_functions != [0, 1, 2] {
+    fail("three-function constrained selector mismatch: " + str(nested_selected));
+}
+if not (try { Calls.find_i32_call_probe(nested_plan, map{
+        min_reachable_functions: 4, max_reachable_functions: 3
+    }); false } catch true) {
+    fail("invalid reachable-function selector bounds were accepted");
+}
+
+let defaulted = guest("defaulted", 2, 1, [5], [
+map{ op: 25, operand: 0 }, map{ op: 25, operand: 1 }, map{ op: 1 }, map{ op: 33 }
+], []);
+let defaults = Plan.build_decoded(decoded([map{ op: 33 }], [defaulted]));
+if Calls.run(defaults, 1, [37], map{ require_i32: true }).value != 42 {
+    fail("default argument mismatch");
+}
+if not (try { Calls.run(defaults, 1, []); false } catch true)
+or not (try { Calls.run(defaults, 1, [1, 2, 3]); false } catch true) {
+    fail("arity bounds were not enforced");
+}
+
+// Function references loaded as constants are callable without a closure when
+// the target needs no upvalues. Opcode 30 consumes its stack value exactly once.
+let direct = guest("direct", 0, 0, [], [
+map{ op: 0, operand: 0 }, map{ op: 30 },
+map{ op: 0, operand: 1 }, map{ op: 33 }
+], [999, 42]);
+let direct_plan = Plan.build_decoded(decoded([
+map{ op: 0, operand: 0 }, map{ op: 31, operand: 0 }, map{ op: 33 }
+], [direct]));
+if Calls.run(direct_plan, 0, [], map{ require_i32: true }).value != 42 {
+    fail("direct function or close-upvalue stack semantics mismatch");
+}
+
+// A self-referential closure reaches the bounded frame limit deterministically.
+let recurse = guest("recurse", 0, 0, [], [
+map{ op: 28, operand: 0 }, map{ op: 31, operand: 0 }, map{ op: 33 }
+], []);
+let recursive = Plan.build_decoded(decoded([
+map{ op: 0, operand: 0 }, map{ op: 26, operand: 0 },
+map{ op: 27, fn_const: 1, captures: [map{ is_local: true, index: 0 }] },
+map{ op: 46 }, map{ op: 26, operand: 0 }, map{ op: 31, operand: 0 }, map{ op: 33 }
+], [nil, recurse]));
+if not (try { Calls.run(recursive, 0, [], map{ max_frames: 4, max_steps: 100 }); false } catch true) {
+    fail("frame limit was not enforced");
+}
+
+let tail_recurse = guest("tail_recurse", 0, 0, [], [
+map{ op: 28, operand: 0 }, map{ op: 32, operand: 0 }
+], []);
+let tail_recursive = Plan.build_decoded(decoded([
+map{ op: 0, operand: 0 }, map{ op: 26, operand: 0 },
+map{ op: 27, fn_const: 1, captures: [map{ is_local: true, index: 0 }] },
+map{ op: 46 }, map{ op: 26, operand: 0 }, map{ op: 32, operand: 0 }
+], [nil, tail_recurse]));
+if not (try { Calls.run(tail_recursive, 0, [], map{ max_frames: 2, max_steps: 20 }); false } catch true) {
+    fail("tail-call step limit was not enforced");
+}
+
+let overflow = guest("overflow", 0, 0, [], [
+map{ op: 0, operand: 0 }, map{ op: 0, operand: 1 }, map{ op: 1 }, map{ op: 33 }
+], [2147483647, 1]);
+let overflow_plan = Plan.build_decoded(decoded([map{ op: 33 }], [overflow]));
+if not (try { Calls.run(overflow_plan, 1, [], map{ require_i32: true }); false } catch true) {
+    fail("i32 overflow was accepted");
+}
+
+let unsupported = Plan.build_decoded(decoded([
+map{ op: 0, operand: 0 }, map{ op: 12 }, map{ op: 33 }
+], [1]));
+let unsupported_report = Calls.inspect_all(unsupported);
+if unsupported_report.ok or unsupported_report.unsupported[0] != 12
+or unsupported_report.unsupported_counts[12] != 1 {
+    fail("unsupported opcode inspection mismatch");
+}
+if not (try { Calls.run(unsupported); false } catch true) {
+    fail("unsupported plan did not fail closed");
+}
+let fractional = Plan.build_decoded(decoded([
+map{ op: 0, operand: 0 }, map{ op: 33 }
+], [1.5]));
+if not (try { Calls.verify_i32(fractional); false } catch true) {
+    fail("fractional result was accepted by exact i32 graph verification");
+}
+
+let vararg = map{
+    __pbck_function: true, name: "vararg", arity: 0, min_arity: 0,
+    defaults: [], is_vararg: true, parameter_types: [],
+    chunk: map{ instructions: [map{ op: 0, operand: 0 }, map{ op: 33 }], constants: [1] }
+};
+let vararg_plan = Plan.build_decoded(decoded([map{ op: 33 }], [vararg]));
+if Calls.inspect_all(vararg_plan).ok or not (try { Calls.run(vararg_plan); false } catch true) {
+    fail("vararg function was accepted");
+}
+let typed = map{
+    __pbck_function: true, name: "typed", arity: 1, min_arity: 1,
+    defaults: [], is_vararg: false, parameter_types: [1],
+    chunk: map{ instructions: [map{ op: 25, operand: 0 }, map{ op: 33 }], constants: [] }
+};
+let typed_plan = Plan.build_decoded(decoded([map{ op: 33 }], [typed]));
+if Calls.inspect_all(typed_plan).ok or not (try { Calls.run(typed_plan); false } catch true) {
+    fail("typed parameter function was accepted without portable type checks");
+}
+
+if not (try { Calls.run(plan, 0, [], map{ max_closures: 1 }); false } catch true)
+or not (try { Calls.run(plan, 0, [], map{ max_total_locals: 1 }); false } catch true)
+or not (try { Calls.run(plan, 0, [], map{ max_stack: 1 }); false } catch true)
+or not (try { Calls.runtime_limits(map{ max_frames: 0 }); false } catch true) {
+    fail("runtime quotas were not enforced");
+}
+let corrupt = map{
+    format: Calls.FORMAT, version: 1, functions: [], opcodes: [], operands: [],
+    instruction_capture_starts: [], instruction_capture_counts: [],
+    capture_is_local: [], capture_indices: [], values: [], default_slots: [],
+    entry_function: 0, reachable_functions: [], reachable_mask: []
+};
+if not (try { Calls.run_prepared(corrupt); false } catch true) {
+    fail("corrupt prepared program was accepted");
+}
+if len(Calls.SUPPORTED_OPCODES) != 30 { fail("call-frame opcode contract changed"); }
+let oi = 0;
+while oi < len(Calls.SUPPORTED_OPCODES) {
+    if not Calls.supports_opcode(Calls.SUPPORTED_OPCODES[oi]) {
+        fail("declared opcode is not supported");
+    }
+    oi = oi + 1;
+}
+
+print "host_pbck_frame_calls_pass";

@@ -154,6 +154,23 @@ the chunk was hand-edited.
 **Storage cost:** measure the generated snapshot set before adoption; no current
 size is claimed because the checked-in set does not yet exist.
 
+**Local refresh gate (2026-07-29):** `tools/pbbootstrap_refresh.sapp` regenerates
+one verified PBCS snapshot for every source module under `stdlib/compiler/`,
+plus `dist/bootstrap/pblang-selfhost-compiler.pbck` for the PBLang-native
+compiler CLI. Per-module snapshots deliberately preserve module namespaces:
+flattening the compiler into a shared global namespace is unsafe because
+backend modules intentionally use the same opcode constants. The tool also
+emits a real x86-64 ELF probe through `stdlib/native/codegen_x64.sapp`, executes
+it, and writes a digest-bound manifest. `tools/pbselfc.sapp` exposes the
+source-to-PBCS workflow. This closes the reproducible local snapshot step, but
+not the checked-in freshness CI criterion above. The 32 MiB host executable
+remains the bootstrap VM because the native x86-64 backend does not yet cover
+the complete compiler CLI/runtime; the refresh tool records that boundary
+rather than replacing the host with a non-equivalent probe. The bundle resolver
+normalizes canonical `stdlib:` imports to traversal-free paths below `stdlib/`,
+ignores apparent imports inside comments and strings, and fails closed for
+malformed or escaping module URIs.
+
 ---
 
 ## Layer 4 — The C-transpiler as the universal floor

@@ -21,7 +21,8 @@
 // try-in-try, closures, loops — composes without manual offset bookkeeping.
 //
 // Constructs with no native opcode, lowered here:
-//   - short-circuit / nil-coalescing *_PEEK jumps -> OpDup(+OpIsNil)+OpJumpIf*
+//   - consuming branches and *_PEEK/nil branches -> explicit stack-compatible
+//     native control flow (native conditional jumps always retain the condition)
 //   - OP_LEN -> stash in a scratch local, OpGetGlobal "len", reload, OpCall 1
 //   - OP_TRY (try/catch) -> inline OpTry/OpEndTry with the body & handler
 //     sub-chunks lowered into the same frame (they share enclosing locals)
@@ -144,6 +145,37 @@ fn _w_function(out, fc) {
 
 fn _fresh(ctx) { ctx.n = ctx.n + 1; return ctx.n; }
 
+// Native PBCK conditional jumps inspect the top value without consuming it.
+// Self-hosted ordinary branches consume their condition, so both the taken and
+// fallthrough paths need an explicit pop. `branch_op` is native 36/37.
+fn _lower_consuming_branch(code, ctx, branch_op, target) {
+    let taken = _fresh(ctx);
+    let done = _fresh(ctx);
+    array_push(code, map{ op: branch_op, jmp: taken });
+    array_push(code, map{ op: 11 });                   // fallthrough: consume condition
+    array_push(code, map{ op: 35, jmp: done });
+    array_push(code, map{ label: taken });
+    array_push(code, map{ op: 11 });                   // taken: consume condition
+    array_push(code, map{ op: 35, jmp: target });
+    array_push(code, map{ label: done });
+}
+
+// Nil-peek branches preserve the original value. OpIsNil consumes the duplicate
+// and produces a boolean; remove only that boolean on both paths.
+fn _lower_nil_peek_branch(code, ctx, branch_op, target) {
+    let taken = _fresh(ctx);
+    let done = _fresh(ctx);
+    array_push(code, map{ op: 46 });                   // original, duplicate
+    array_push(code, map{ op: 45 });                   // original, is_nil(duplicate)
+    array_push(code, map{ op: branch_op, jmp: taken });
+    array_push(code, map{ op: 11 });                   // discard predicate
+    array_push(code, map{ op: 35, jmp: done });
+    array_push(code, map{ label: taken });
+    array_push(code, map{ op: 11 });                   // discard predicate
+    array_push(code, map{ op: 35, jmp: target });
+    array_push(code, map{ label: done });
+}
+
 // Highest local slot referenced anywhere in `ins` (incl. inlined OP_TRY
 // sub-chunks, which share the enclosing frame's slots), or -1.
 fn _max_local_slot(ins, consts) {
@@ -177,6 +209,15 @@ fn _max_local_slot(ins, consts) {
 fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx) {
     let op = inst.op;
 
+    // A tail-position call uses the native trampoline opcode. Keeping this as
+    // instruction metadata avoids adding a second call opcode to the
+    // self-hosted IR while allowing codegen and conformance probes to request
+    // bounded frame reuse explicitly.
+    if op == 18 and (try inst.tail catch false) {
+        array_push(code, map{ op: 32, n: try inst.operand catch 0 });
+        return;
+    }
+
     // Optimizer-only superinstructions are expanded to the established native
     // VM sequence. This preserves .pbck compatibility without requiring a new
     // container version or native opcode.
@@ -207,26 +248,28 @@ fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx) {
         array_push(code, map{ op: 31, n: 1 });         // OpCall 1
         return;
     }
+    if op == 21 {                                      // consuming JUMP_IF_FALSE
+        _lower_consuming_branch(code, ctx, 36, lbl_at[str(inst.operand)]);
+        return;
+    }
+    if op == 22 {                                      // consuming JUMP_IF_TRUE
+        _lower_consuming_branch(code, ctx, 37, lbl_at[str(inst.operand)]);
+        return;
+    }
     if op == 33 {                                      // JUMP_IF_FALSE_PEEK
-        array_push(code, map{ op: 46 });               // OpDup
         array_push(code, map{ op: 36, jmp: lbl_at[str(inst.operand)] });
         return;
     }
     if op == 34 {                                      // JUMP_IF_TRUE_PEEK
-        array_push(code, map{ op: 46 });
         array_push(code, map{ op: 37, jmp: lbl_at[str(inst.operand)] });
         return;
     }
     if op == 36 {                                      // JUMP_IF_NIL_PEEK
-        array_push(code, map{ op: 46 });               // OpDup
-        array_push(code, map{ op: 45 });               // OpIsNil
-        array_push(code, map{ op: 37, jmp: lbl_at[str(inst.operand)] });
+        _lower_nil_peek_branch(code, ctx, 37, lbl_at[str(inst.operand)]);
         return;
     }
     if op == 37 {                                      // JUMP_IF_NOT_NIL_PEEK
-        array_push(code, map{ op: 46 });
-        array_push(code, map{ op: 45 });
-        array_push(code, map{ op: 36, jmp: lbl_at[str(inst.operand)] });
+        _lower_nil_peek_branch(code, ctx, 36, lbl_at[str(inst.operand)]);
         return;
     }
     if op == 35 {                                      // OP_TRY -> inline try/catch
