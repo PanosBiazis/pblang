@@ -86,7 +86,7 @@ native multi-module builds), `linker.sapp`, `dist.sapp`
 - **Crypto / Security:** crypto, crypto_advanced, crypto_quantum, jwt, tls, security,
   securelayer, safety, memory_safety
 - **Graphics / GUI / Game:** graphics, gui, gui_parse, ui_parse, game, ecs, color,
-  colors, bitmap_font, image_processing, img_load, browser, browser_render,
+  colors, bitmap_font, image_processing, img_load, png, browser, browser_render,
   design_engine, visual_engine, html, syntax_hl
 - **Quantum:** quantum, quantum_sim, quantum_viz, quantum_protocol
 - **System / OS:** os, fs, path, process, env, hwinfo, systems, time, date, datetime,

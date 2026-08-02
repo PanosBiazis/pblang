@@ -1,0 +1,257 @@
+// Build and verify a content-addressed PBCK driver for direct x86-64 codegen.
+// The tool itself is PBLang. The current compiler's emit-pbck command remains
+// an explicit bootstrap boundary until compiler-sized self-hosted freeze is
+// fast enough; no system-installed compiler is selected silently.
+
+let LINK = import("stdlib:source_inliner.sapp");
+let CACHE = import("stdlib/native/artifact_cache.sapp");
+
+let FORMAT = "pblang.codegen-driver-cache.v2";
+let DRIVER = "bench/drivers/repro_codegen_x64.sapp";
+let ROOT = "target/cache/codegen-x64-driver";
+
+fn _progress(stage) {
+    let enabled = try env_get("PBLANG_CODEGEN_CACHE_PROGRESS") catch "";
+    if enabled == "1" { print "PBCODEGEN_CACHE_STAGE|" + stage + "|" + str(now_ms()); }
+}
+
+fn _runtime_binary() {
+    let configured = try env_get("PBLANG_BIN") catch nil;
+    if type(configured) == "string" and configured != "" and len(configured) <= 4096
+        and not str_contains(configured, "\n") and not str_contains(configured, "\r") {
+        return map{ path: configured, source: "PBLANG_BIN" };
+    }
+    if fs_exists("/proc/self/cmdline") {
+        let raw = try fs_read_bytes("/proc/self/cmdline") catch nil;
+        if type(raw) == "array" {
+            let first = []; let i = 0;
+            while i < len(raw) and i < 4096 and raw[i] != 0 {
+                array_push(first, raw[i]); i = i + 1;
+            }
+            let path = try bytes_to_str(first) catch "";
+            if path != "" { return map{ path: path, source: "current-command" }; }
+        }
+    }
+    return map{ path: "pblang", source: "PATH-fallback" };
+}
+
+fn _valid_pbck(bytes) {
+    return type(bytes) == "array" and len(bytes) >= 9 and len(bytes) <= 67108864
+        and bytes[0] == 80 and bytes[1] == 66 and bytes[2] == 67
+        and bytes[3] == 75 and bytes[4] == 1;
+}
+
+fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+
+fn _hex_digest(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < 64 {
+        let c = str_slice(value, i, i + 1);
+        if len(c) != 1 or not str_contains("0123456789abcdef", c) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _compiler_digest(path) {
+    if type(path) != "string" or path == "" or not fs_exists(path) {
+        return map{ ok: false, error: "compiler executable cannot be fingerprinted" };
+    }
+    if fs_exists("/usr/bin/sha256sum") {
+        let result = try proc_spawn_wait("/usr/bin/sha256sum", [path]) catch nil;
+        let first = if result == nil { "" } else {
+            try str_split(str_trim(result.stdout), " ")[0] catch ""
+        };
+        if result != nil and (try result.exit_code catch 1) == 0 and _hex_digest(first) {
+            return map{ ok: true, sha256: first, method: "sha256sum-argv" };
+        }
+    }
+    let bytes = try fs_read_bytes(path) catch nil;
+    if type(bytes) != "array" or len(bytes) < 1 or len(bytes) > 134217728 {
+        return map{ ok: false, error: "compiler executable digest failed" };
+    }
+    return map{ ok: true, sha256: _digest(bytes), method: "pblang-bytes" };
+}
+
+fn _cleanup(paths) {
+    let i = 0;
+    while i < len(paths) { try fs_remove(paths[i]) catch nil; i = i + 1; }
+}
+
+fn _execution_gate(compiler, artifact, fingerprint) {
+    let nonce = str_slice(sha256(fingerprint + ":" + str(now_ms())
+        + ":" + str(random_bytes(16))), 0, 20);
+    let source = "/tmp/pblang-codegen-cache-" + nonce + ".sapp";
+    let output = "/tmp/pblang-codegen-cache-" + nonce + ".elf";
+    fs_write(source, "let n = 0; let total = 0; while n < 32 { total = total + n; n = n + 1; } print total;");
+    let child = try proc_spawn_wait(compiler,
+        ["run", artifact, "--allow-all", "--", source, output]) catch nil;
+    let binary = try fs_read_bytes(output) catch nil;
+    let valid = child != nil and (try child.exit_code catch 1) == 0
+        and CACHE.valid_x64_elf(binary);
+    _cleanup([source, output]);
+    if not valid {
+        return map{ ok: false, error: if child == nil {
+            "cached driver launch failed"
+        } else { try child.stderr catch "cached driver execution failed" } };
+    }
+    return map{ ok: true, artifact_bytes: len(binary) };
+}
+
+fn build() {
+    let started = now_ms();
+    _progress("start");
+    let compiler = _runtime_binary();
+    let version = try proc_spawn_wait(compiler.path, ["--version"]) catch nil;
+    if version == nil or (try version.exit_code catch 1) != 0 {
+        return map{ ok: false, stage: "compiler", error: "current compiler is unavailable" };
+    }
+    let compiler_version = str_trim(try version.stdout catch "");
+    let compiler_identity = _compiler_digest(compiler.path);
+    if not compiler_identity.ok {
+        return map{ ok: false, stage: "compiler-fingerprint",
+            error: compiler_identity.error };
+    }
+    fs_mkdirs(ROOT);
+    let index_path = ROOT + "/index.json";
+    let index = try json_parse(fs_read(index_path)) catch nil;
+    if type(index) == "map" and (try index.format catch "") == FORMAT
+        and (try index.compiler_version catch "") == compiler_version
+        and (try index.compiler_sha256 catch "") == compiler_identity.sha256
+        and type(try index.module_order catch nil) == "array" {
+        let graph = LINK.file_graph_fingerprint(DRIVER, index.module_order);
+        let artifact = try index.artifact catch "";
+        let bytes = try fs_read_bytes(artifact) catch nil;
+        if graph.ok and graph.fingerprint == (try index.input_graph_sha256 catch "")
+            and _valid_pbck(bytes) and _digest(bytes) == (try index.sha256 catch "")
+            and (try index.execution_gate catch false) {
+            return map{
+                ok: true, format: FORMAT, artifact: artifact,
+                fingerprint: index.fingerprint, sha256: index.sha256,
+                bytes: len(bytes), linked_source_bytes: index.linked_source_bytes,
+                modules: index.modules, module_order: index.module_order,
+                input_graph_sha256: graph.fingerprint,
+                compiler: compiler.source, compiler_version: compiler_version,
+                compiler_sha256: compiler_identity.sha256,
+                compiler_digest_method: compiler_identity.method,
+                execution_gate: true, cached: true,
+                build_ms: now_ms() - started
+            };
+        }
+    }
+    _progress("link-start");
+    let linked = LINK.inline_file_prefixed(DRIVER);
+    if not linked.ok {
+        return map{ ok: false, stage: "link",
+            error: try linked.reason catch "codegen driver link failed" };
+    }
+    let linked_bytes = len(str_to_bytes(linked.source));
+    if linked_bytes < 1024 or linked_bytes > 16777216 {
+        return map{ ok: false, stage: "link", error: "linked driver size is invalid" };
+    }
+    _progress("link-complete");
+    let graph = LINK.file_graph_fingerprint(DRIVER, linked.module_order);
+    if not graph.ok {
+        return map{ ok: false, stage: "fingerprint",
+            error: try graph.reason catch "driver graph fingerprint failed" };
+    }
+    let fingerprint = sha256(FORMAT + "\n" + compiler_version + "\n"
+        + compiler_identity.sha256 + "\n" + linked.source);
+    let artifact = ROOT + "/" + fingerprint + ".pbck";
+    let metadata = ROOT + "/" + fingerprint + ".json";
+
+    let existing = try fs_read_bytes(artifact) catch nil;
+    let prior = try json_parse(fs_read(metadata)) catch nil;
+    if _valid_pbck(existing) and type(prior) == "map"
+        and (try prior.fingerprint catch "") == fingerprint
+        and (try prior.sha256 catch "") == _digest(existing)
+        and (try prior.execution_gate catch false) {
+        let cached_report = map{
+            ok: true, format: FORMAT, artifact: artifact,
+            fingerprint: fingerprint, sha256: prior.sha256,
+            bytes: len(existing), linked_source_bytes: linked_bytes,
+            modules: linked.modules, module_order: linked.module_order,
+            input_graph_sha256: graph.fingerprint, compiler: compiler.source,
+            compiler_version: compiler_version,
+            compiler_sha256: compiler_identity.sha256,
+            compiler_digest_method: compiler_identity.method,
+            execution_gate: true, cached: true,
+            build_ms: now_ms() - started
+        };
+        let index_nonce = str_slice(sha256(fingerprint + ":index:"
+            + str(random_bytes(16))), 0, 20);
+        let staged_index = index_path + ".tmp-" + index_nonce;
+        fs_write(staged_index, json_stringify(cached_report));
+        if not (try { fs_rename(staged_index, index_path); true } catch false) {
+            try fs_remove(staged_index) catch nil;
+            return map{ ok: false, stage: "index",
+                error: "cache index publication failed" };
+        }
+        return cached_report;
+    }
+
+    let nonce = str_slice(sha256(fingerprint + ":" + str(random_bytes(16))), 0, 20);
+    let staged_source = ROOT + "/source-" + nonce + ".sapp";
+    let staged_artifact = ROOT + "/artifact-" + nonce + ".pbck";
+    fs_write(staged_source, linked.source);
+    _progress("emit-start");
+    let emitted = try proc_spawn_wait(compiler.path,
+        ["emit-pbck", staged_source, "-o", staged_artifact]) catch nil;
+    try fs_remove(staged_source) catch nil;
+    if emitted == nil or (try emitted.exit_code catch 1) != 0 {
+        try fs_remove(staged_artifact) catch nil;
+        return map{ ok: false, stage: "emit", error: if emitted == nil {
+            "bootstrap emitter launch failed"
+        } else { try emitted.stderr catch "bootstrap emitter failed" } };
+    }
+    _progress("emit-complete");
+    let bytes = try fs_read_bytes(staged_artifact) catch nil;
+    if not _valid_pbck(bytes) {
+        try fs_remove(staged_artifact) catch nil;
+        return map{ ok: false, stage: "validate", error: "emitter published invalid PBCK" };
+    }
+    let gate = _execution_gate(compiler.path, staged_artifact, fingerprint);
+    if not gate.ok {
+        try fs_remove(staged_artifact) catch nil;
+        return map{ ok: false, stage: "execution-gate", error: gate.error };
+    }
+    _progress("gate-complete");
+    if not (try { fs_rename(staged_artifact, artifact); true } catch false) {
+        try fs_remove(staged_artifact) catch nil;
+        return map{ ok: false, stage: "publish", error: "atomic PBCK publication failed" };
+    }
+    let digest = _digest(bytes);
+    let report = map{
+        ok: true, format: FORMAT, artifact: artifact,
+        fingerprint: fingerprint, sha256: digest, bytes: len(bytes),
+        linked_source_bytes: linked_bytes, modules: linked.modules,
+        module_order: linked.module_order, input_graph_sha256: graph.fingerprint,
+        compiler: compiler.source, compiler_version: compiler_version,
+        compiler_sha256: compiler_identity.sha256,
+        compiler_digest_method: compiler_identity.method,
+        execution_gate: true, gate_artifact_bytes: gate.artifact_bytes,
+        cached: false, build_ms: now_ms() - started
+    };
+    let staged_metadata = metadata + ".tmp-" + nonce;
+    fs_write(staged_metadata, json_stringify(report));
+    if not (try { fs_rename(staged_metadata, metadata); true } catch false) {
+        try fs_remove(staged_metadata) catch nil;
+        return map{ ok: false, stage: "metadata", error: "metadata publication failed" };
+    }
+    let staged_index = index_path + ".tmp-" + nonce;
+    fs_write(staged_index, json_stringify(report));
+    if not (try { fs_rename(staged_index, index_path); true } catch false) {
+        try fs_remove(staged_index) catch nil;
+        return map{ ok: false, stage: "index", error: "cache index publication failed" };
+    }
+    return report;
+}
+
+let report = build();
+print json_stringify(report);
+if not report.ok { throw "pbcodegen_cache failed at " + report.stage + ": " + report.error; }
+
+export FORMAT, build;

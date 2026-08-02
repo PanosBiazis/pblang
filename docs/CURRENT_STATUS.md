@@ -1,8 +1,8 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-07-21
-**Status**: v0.5.7 — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 344 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
-The latest complete pblang semantic run on 2026-07-21 passed **723/723 tests**
+**Last Updated**: 2026-08-02
+**Status**: v0.5.7 — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+The latest complete pblang semantic run on 2026-08-02 passed **748/748 tests**
 with zero failures, ignored tests, or filtered tests. The separate release Rust
 semantics harness passed 203 tests with zero failures and one documented
 security ignore; these runner counts are not combined.
@@ -12,9 +12,280 @@ more than 90 seconds), pbOS 17/17, and pb-mcp-server 11/11. The Rust
 `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit;
 `std::env::set_var` is unsound in multi-threaded programs).
 
+## 2026-08-02 - Canonical exact-i32 call-frame lowering
+
+`stdlib:host_pbck_frame_lowering.sapp` converts a frozen verified call graph
+into one deterministic dense image made only of bounded scalar fields and
+primitive arrays. Function IDs, constants, direct function references,
+defaults, captures and entry arguments are remapped once. The builder
+re-executes the source verifier and compares its value, reachable graph and
+resource observations before publishing a checksum-bound frozen image.
+
+The independent validator rejects fractional table values, duplicate function
+IDs, non-canonical operands or capture ranges, invalid arity, references or
+signed-i32 payloads, quota inconsistencies and checksum tampering. Tests cover
+three active frames with a shared local-to-nonlocal cell, direct functions,
+defaults, arguments and negative mutations. The runnable example is
+`examples/host_pbck_frame_lowering/main.sapp`; the benchmark is
+`bench/host_pbck_frame_lowering_stages.sapp`, with results in
+`bench/results/2026-08-02-host-pbck-frame-lowering/REPORT.md`. Median cost was
+0.466 ms/image to reverify and build and 0.179 ms/image to validate for the
+three-function, ten-instruction fixture. This is a backend input contract, not
+an executor by itself. The complete semantic suite passed 748/748. No foreign
+source was added.
+
+## 2026-08-02 - Bounded call-graph selection
+
+`host_pbck_frame_calls.find_i32_call_probe()` now accepts positive bounded
+`min_reachable_functions` and `max_reachable_functions` options. This lets a
+platform lowering request an exact graph-size class without relying on the
+first smaller compatible candidate. Inverted limits and values outside
+`1..4096` fail closed. A nested three-function/non-local-capture regression
+selects `[0, 1, 2]` deterministically and returns `73`; the complete semantic
+suite passed 747/747. No Rust source was added.
+
+## 2026-08-02 - Verified portable i32 call graphs
+
+The existing generic flat call-frame engine now exposes
+`verify_i32_prepared()` and `verify_i32()` as platform-lowering gates. They run
+the selected reachable graph under caller-supplied step/frame/stack/local and
+closure quotas, then validate all reachable constants, defaults, local and
+upvalue operands, closure targets and captures, call arities and jump targets.
+The frozen result records the exact reachable functions/instructions/opcodes,
+capture requirements and observed resource peaks for a backend to consume.
+
+Upvalue requirements are derived from the actual instructions and non-local
+captures instead of trusting legacy `max_upvalue` metadata as a count. Tests
+cover shared mutation with ordinary plus tail calls, deterministic revalidation,
+a nested three-function non-local capture and malformed/fractional rejection.
+The runnable example is `examples/host_pbck_frame_calls/main.sapp`; the staged
+benchmark is `bench/host_pbck_frame_calls_stages.sapp`. Verification of the
+15-instruction example measured 0.195 ms. Warm execution remained 0.122 ms/run
+for the flat engine versus 0.099 ms/run for the generic VM, so no speed claim is
+made for this slice. The complete semantic suite passed 747/747. No Rust source
+was added.
+
+## 2026-08-02 - Complete PBFP execution bridge
+
+`stdlib:host_pbck_frame_vm.sapp` now turns a validated `PBFP-v1` frame plan back
+into the canonical recursive PBCK program once and delegates execution to the
+single complete `host_pbck_vm.sapp` implementation. This provides semantic
+execution for all 48 opcodes, nested functions, defaults, captures, exceptions,
+dynamic values and explicitly injected host adapters without maintaining a
+second opcode engine. Prepared programs are frozen and retain VM step, frame,
+stack, local, output and collection limits.
+
+The bridge rejects malformed plans, configured resource excess, cyclic function
+graphs, closure references outside a function's constant table, foreign value
+slots and invalid prepared objects. Per-function slot and closure indexes make
+preparation O(constants + instructions), which is required for large generated
+applications. Reconstructed functions retain compact opcode/operand arrays and
+allocate capture maps only for closure instructions, avoiding one map allocation
+per instruction. Its semantic test checks deterministic
+PBFP reconstruction across every canonical opcode and adapter error redaction.
+The runnable example is `examples/host_pbck_frame_vm.sapp`; the reproducible
+staged benchmark is `bench/host_pbck_frame_vm_stages.sapp`, with results in
+`bench/results/2026-08-02-host-pbck-frame-vm/REPORT.md`. The prepared bridge
+measured 0.144235 ms/run versus 0.125993 ms/run for direct VM execution on the
+four-step fixture. This completes the
+shared PBLang execution oracle for flat Android assets. Generated Android code
+still requires equivalent dynamic-value lowering and Android capability
+bindings before whole-program device execution can be claimed. No Rust source
+was added.
+
 ---
 
 Canonical status is the top summary and `Test Results` section in this file. Older milestone snapshots below are kept for historical context and may reflect prior counts/plans.
+
+## 2026-08-02 - Bounded flat PBCK call frames
+
+`stdlib:host_pbck_frame_calls.sapp` adds a PBLang-native execution contract for
+30 flat PBCK-v1 opcodes: the existing scalar/local/control subset plus closure
+creation, local and non-local captures, shared mutable upvalue cells, normal
+calls, close-upvalue stack cleanup and a tail-call trampoline. Runtime limits
+bound steps, active frames, per-frame and aggregate locals, operand stacks and
+closure allocations. `prepare()` validates and decodes constants once into a
+frozen flat program; `run_prepared()` avoids repeated plan validation on the hot
+path, while `run()` remains the validate-and-execute convenience API. Optional
+exact-i32 execution rejects fractional values and overflow instead of inheriting
+target-specific wrapping behavior.
+
+The call-frame engine and the full `stdlib:host_pbck_vm.sapp` now use the
+canonical PBCK frame model: arguments and local declarations occupy stack slots,
+`GetLocal` addresses those slots, and closures retain the original slot cell.
+`SetLocal` may replace an existing slot or initialize exactly the next slot, so
+older explicit-store fixtures remain valid without permitting sparse locals.
+This fixed a real compatibility defect hidden by hand-authored tests. The
+compiler-emitted PBRemote probe now executes in the flat engine as function 1918
+with result 42, 21 steps, two frames, two closures and one tail call. The
+function ID is artifact-specific and selected at build time, not hard-coded.
+
+The module rejects unsupported opcodes before execution and also rejects varargs
+and typed parameters until their portable semantics are implemented. The test
+`tests/semantics/host_pbck_frame_calls_test.sapp` checks generic-VM parity,
+nested captures, shared mutation, compiler-emitted stack locals, unused
+unsupported functions outside the selected reachable graph, deterministic probe
+selection, defaults, arity, frame/step/allocation quotas and exact-i32 overflow.
+A runnable example is in
+`examples/host_pbck_frame_calls/main.sapp`; the reproducible comparison with the
+generic VM is `bench/host_pbck_frame_calls_stages.sapp`. This is the completed
+PBLang call-frame prerequisite for generated Android execution; it does not yet
+bind Android host capabilities or execute arbitrary whole PBRemote artifacts.
+No Rust source was added.
+
+On the correctness-gated 21-step compiler-shaped closure workload, 9 samples of
+500 warm runs measured a prepared flat median of 0.124265 ms/run and a generic
+VM median of 0.103290 ms/run. The flat path is therefore still 20.31% slower on this small
+workload; the result and limitations are recorded without a performance claim in
+`bench/results/2026-08-02-host-pbck-frame-calls/REPORT.md`.
+
+## 2026-08-02 - Prepared scalar PBCK frame execution
+
+The exact-i32 contract now has explicit regression coverage for signed remainder,
+fractional and overflowing division, add/subtract/multiply/negate overflow,
+positive power overflow and exact negative powers. These cases define the
+portable behavior required by generated JVM runtimes instead of relying on
+Java's wrapping integer operations or platform-specific `Math` APIs.
+
+`stdlib:host_pbck_frame_scalar.sapp` provides a bounded flat-frame execution
+contract for 24 scalar, local, stack and control-flow PBCK-v1 opcodes. It
+preserves the generic VM's truthiness, arithmetic, comparison, default argument,
+conditional-jump peek and return semantics. Unsupported globals, calls,
+collections, exceptions, closures and host capabilities are detected before
+execution and fail closed instead of silently changing behavior.
+
+`prepare()` performs full frame-plan validation once and copies a compact frozen
+program; `run_prepared()` retains per-step opcode, local, jump, stack and
+instruction-budget guards. `run()` remains the validate-and-execute convenience
+path. `find_i32_probe()` validates a whole plan once and deterministically selects
+a zero-argument function whose executed values remain exact signed i32 values;
+fractional arithmetic, overflow, non-scalar values and resource failures are
+rejected. The semantic test checks parity with `host_pbck_vm.sapp`, all 24 declared
+opcodes, defaults and negative resource/corruption cases. The runnable example is
+`examples/host_pbck_frame_scalar/main.sapp`; the reproducible benchmark is
+`bench/host_pbck_frame_scalar_stages.sapp`. This completes the shared scalar
+frame subset, not calls, platform capability bindings or Android whole-program
+execution. No Rust source was added.
+
+On the correctness-gated 21-instruction sum workload, 9 samples measured a
+prepared scalar median of 2.858 ms/run versus 4.048 ms/run for the generic VM,
+29.38% lower. One-time preparation measured 0.129 ms/run. The complete method,
+p95 values and limitations are recorded in
+`bench/results/2026-08-02-host-pbck-frame-scalar/REPORT.md`.
+
+## 2026-08-02 - Exhaustive host-PBCK frame dispatch contract
+
+`stdlib:host_pbck_frame_dispatch.sapp` defines the canonical structural dispatch
+contract for all 48 PBCK-v1 opcodes. It provides allocation-free integer family
+and operand-kind lookup on the scan hot path, fail-closed metadata access and a
+deterministic bounded whole-plan scan with fixed-size counters and checksum.
+This is execution-shape coverage, not a claim that platform semantic execution
+is complete. `tests/semantics/host_pbck_frame_dispatch_test.sapp` exhaustively
+checks every opcode plus invalid IDs and positive/negative frame-plan scans.
+
+## 2026-08-02 - Bounded host-PBCK frame-program access
+
+`stdlib:host_pbck_frame_plan.sapp` now exposes checked function, instruction,
+capture, constant, default and parameter metadata accessors. Every public index
+must be a non-negative integer inside the validated local range; malformed
+function IDs, value slots and nested table indices fail closed. The semantic
+test covers positive closure/default/parameter lookups and negative type/range
+cases. This completes the shared platform frame-access contract, not opcode
+execution or platform host adapters. No Rust source was added.
+
+## 2026-08-01 - Integrity-bound host-PBCK frame binary
+
+`stdlib:host_pbck_frame_binary.sapp` serializes a validated canonical frame plan
+to deterministic `PBFP-v1` bytes for generated platform runtimes. The bounded
+decoder rejects bad magic/version, truncation, trailing data, invalid UTF-8,
+count/range violations and integrity failures before returning a plan. Function
+metadata, instructions, captures, all supported constant kinds, constant/default
+slots and parameter types survive byte-identical encode/decode/re-encode tests.
+
+The envelope uses SHA-256 over the canonical Base64 representation of the payload.
+This permits the existing optimized runtime primitive to hash arbitrary binary
+without adding a native implementation. The small-fixture benchmark measured
+0.430 ms encode and 0.201 ms decode per iteration over 100 iterations. This is a
+portable frame transport prerequisite, not an Android whole-program executor.
+No Rust source was added.
+
+## 2026-08-01 - Canonical host-PBCK frame plan
+
+`stdlib:host_pbck_frame_plan.sapp` now converts bounded compact PBCK-v1 input
+into a stable flat IR for platform code generators. It preserves every function
+signature, local instruction range, constant/default/parameter range and closure
+capture while normalizing recursive function constants to integer function IDs.
+The builder and explicit validator reject invalid opcodes, jumps, local slots,
+constant slots, captures, signatures, nesting and configured resource budgets.
+
+The semantic contract includes nested mutable-upvalue metadata, compact decoding
+parity and corruption tests. The microbenchmark measured 0.354 ms per compact
+decode+flatten and 0.00465 ms per safe instruction lookup on an 18-instruction
+fixture. This module is a platform-lowering prerequisite; it is not itself an
+Android JVM executor.
+
+## 2026-08-01 - Complete PBLang-native PBCK-v1 opcode runtime
+
+`stdlib:host_pbck_vm.sapp` now executes every opcode in the canonical 48-entry
+PBCK-v1 contract. The completed surface adds exports, LIFO deferred calls,
+exponentiation, safe attribute/index access and result unwrapping. Result
+failures use the existing guest exception path, invalid safe-access key types
+fail closed, and pending deferred calls prevent tail-frame reuse so cleanup is
+not skipped. The VM remains bounded by the existing instruction, frame, stack,
+local, output and collection limits.
+
+`tests/semantics/host_pbck_vm_full_test.sapp` verifies the complete registry,
+positive and negative behavior for every newly implemented operation, LIFO
+cleanup, return-value preservation and defer-aware tail calls. The runnable
+example is `examples/host_pbck_full_runtime.sapp`; the reproducible warm phase
+benchmark is `bench/host_pbck_full_runtime_stages.sapp`. This completes the
+generic PBLang host VM contract, not the platform-specific Android adapters or
+whole-program PBRemote execution on Android.
+
+The final clean-load warm benchmark ran 9 samples of 1,000 executions: median
+108.533 ms per sample (0.108533 ms per execution) and p95 113.079 ms. The full
+semantic suite passed 740/740 after the final native-compatibility correction.
+These are local host measurements and do not claim Android or cross-language
+performance.
+
+## 2026-08-01 - Bounded pure host-PBCK runtime adapters
+
+`stdlib:host_pbck_pure.sapp` now provides 65 deterministic, PBLang-native
+adapters for collections, maps, strings, numbers, bit operations, JSON,
+Base64, hashing/HMAC, constant-time comparison, URL encoding and pure HTTP
+message helpers. Every registry entry has a real dispatch path and a
+table-driven semantic test. Arity, collection growth, expansion and output
+limits fail closed. Pure builtin failures enter the guest exception path so a
+PBCK `try` handler can process them without terminating the host VM.
+
+Filesystem, process execution, FFI, sockets, graphics, clocks, entropy and OS
+state remain explicit injected capabilities. They are not silently exposed by
+the pure runtime. Against the current PBRemote portable artifact this reduces
+the statically unresolved host surface from 128 to 67 names while retaining
+100% coverage of its 147,653 instruction instances. This is a shared host
+runtime improvement; generated Android still needs platform adapters and
+whole-program dynamic-value lowering before it can execute the complete core.
+
+## 2026-07-31 - PBLang-native host-PBCK decoder and VM
+
+`stdlib:host_pbck_vm.sapp` now executes explicitly injected host adapters
+instead of only recognizing their names. Adapters receive one argument array,
+must be callable, and fail with redacted adapter-name-only diagnostics. Runtime
+metrics include the exact host-call count. `stdlib:host_pbck_link.sapp` adds a
+bounded, non-executing whole-artifact analysis of global definitions, reads,
+exports and unresolved host dependencies. This closes the generic adapter
+dispatch correctness defect; it does not claim that platform-specific Android
+adapters have been implemented.
+
+`stdlib:host_pbck_decode.sapp` now decodes native PBCK-v1 without the retained
+Rust loader and rejects malformed versions, counts, nesting, strings, captures,
+constants, jumps, spans and trailing bytes under explicit budgets.
+`stdlib:host_pbck_vm.sapp` originally executed the 40 opcodes used by the current PBRemote
+portable artifact, including shared mutable upvalues, nested calls, cross-frame
+guest exceptions and trampolined tail calls. Compact decoding reduced the full
+PBRemote benchmark from 391,140 to 201,092 KiB peak RSS and from 819.470 to
+742.830 ms median decode latency. This is host-side PBLang evidence; it does not
+claim that generated Android DEX already executes the complete portable core.
 
 ## 2026-07-21 - PBLang-native SHA3-256
 
@@ -140,6 +411,20 @@ remained slower at 42.760 ms versus C at 25.005 ms. The separate 90-row
 interpreter category matrix completed with 54 available successes, 36 explicit
 unavailable rows, and no failures; its integer loop remained slower than Python
 and Lua. No universal fastest-language claim follows from these workloads.
+
+## 2026-07-29 - Precompiled direct x86-64 driver
+
+The PBLang source linker now scans compiler-sized ASCII syntax through UTF-8
+byte indexes. A dedicated PBLang-only cache links the direct x86-64 tokenizer,
+parser, ELF writer and code generator once, freezes them to verified PBCK and
+binds reuse to the exact compiler binary plus dependency graph.
+
+The current phase suite measured 43.804 ms median source-import publication and
+7.169 ms precompiled publication (6.11x), with peak RSS reduced from 19,472 to
+12,720 KiB (34.68%). Initial cache publication validates PBCK structure and a
+generated ELF before atomic rename. The cached driver occupies 716,463 bytes,
+and host `emit-pbck` remains a documented bootstrap boundary. Focused linker,
+cache-contract and phase tests pass; no Rust source was added.
 
 The PBLang-only direct x86-64 compile session now imports its 270 KB backend
 only on the first actual cache miss. On this host, six-artifact warm builds

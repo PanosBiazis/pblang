@@ -7,6 +7,195 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Canonical exact-i32 call-frame lowering image
+- Added `stdlib:host_pbck_frame_lowering.sapp`, a PBLang-only dense primitive-
+  array image for any bounded call graph accepted by
+  `host_pbck_frame_calls.verify_i32_prepared()`. It remaps reachable functions,
+  constants, defaults, captures and entry arguments, re-executes the verifier
+  before publication and binds the complete image to a deterministic checksum.
+- Added independent fail-closed validation for exact integer tables, canonical
+  sentinel operands and capture ranges, function/default/argument arity,
+  signed-i32 values and observed resource quotas. Tests cover three active
+  frames, local-to-nonlocal shared capture, a non-zero original entry ID,
+  direct function constants, defaults, entry arguments and tampering.
+- Added a runnable example and a nine-sample staged benchmark. The three-frame,
+  ten-instruction fixture measured `0.466 ms/image` median build and
+  `0.179 ms/image` median validation. The complete suite passed 748/748. No
+  Rust, Java, Kotlin or C source was added.
+
+### Bounded call-graph selection
+- Added validated `min_reachable_functions` and `max_reachable_functions`
+  options to `host_pbck_frame_calls.find_i32_call_probe()`. Platform backends
+  can now select a graph shape deliberately instead of accepting the first
+  smaller compatible probe; invalid and inverted bounds fail closed.
+- Added deterministic three-function selector coverage over a nested non-local
+  capture graph. The complete PBLang semantic suite remains 747/747 and no Rust
+  source was added.
+
+### Verified portable i32 call graphs
+- Extended `stdlib:host_pbck_frame_calls.sapp` with deterministic
+  `verify_i32_prepared()` and `verify_i32()` lowering gates. They execute the
+  selected graph under explicit quotas and statically validate every reachable
+  constant, default, local/upvalue operand, closure target/capture, call arity
+  and jump target before a platform backend consumes it.
+- Required upvalue cells are derived from actual upvalue operations and
+  non-local captures, preserving compatibility with older frame metadata while
+  keeping malformed graphs fail closed. Two-function mutation/tail-call and
+  three-function nested shared-cell tests pass. No Rust source was added.
+
+### Deterministic securelayer tamper regression
+- Corrected the authenticated-envelope test so it always flips the final hex
+  digit. The previous fixture could replace an existing `00` suffix with the
+  same bytes and intermittently ask a valid envelope to fail authentication.
+  The production securelayer implementation was not changed; the corrected
+  fixture passed 100/100 focused repetitions and the complete 747-test suite.
+
+### Complete PBFP execution bridge
+- Added `stdlib:host_pbck_frame_vm.sapp`, a bounded PBLang-only bridge from
+  integrity-checked flat PBFP assets to the complete 48-opcode host PBCK VM.
+  Preparation reconstructs and freezes canonical functions, constants,
+  captures, defaults and operands once; repeated execution retains explicit
+  capability injection and the VM's runtime quotas.
+- Added exhaustive 48-opcode reconstruction parity, host-adapter isolation,
+  malformed graph, foreign-slot, resource-limit and redaction tests, plus a
+  runnable example and a staged benchmark. Per-function value-slot and closure
+  indexes keep preparation linear in constants plus instructions instead of
+  rescanning a function's constant table for every instruction. Prepared chunks
+  retain compact opcode/operand arrays rather than allocating one map per
+  instruction. Preparation reads validated flat instruction arrays directly and
+  allocates capture descriptors only for closure opcodes. No Rust source was
+  added.
+
+### Bounded virtual environments
+- Added isolated `stdlib:env.sapp` virtual stores with portable key validation,
+  deterministic snapshots, explicit entry/value/aggregate-byte quotas and no
+  fallback to ambient host variables.
+- Fixed `.env` loading to publish a validated local map atomically instead of
+  calling the deliberately disabled process-wide `env_set` builtin. Empty
+  values remain distinguishable from missing values.
+- Added positive, isolation, quota, invalid-input and failed-write regression
+  coverage plus a runnable virtual-environment example. No Rust source was
+  added.
+
+### Bounded host-PBCK decoder and call-frame engine
+- Corrected both PBLang-native PBCK executors to use canonical VM stack-slot
+  locals. Arguments and declarations now share frame slots, captures retain the
+  original mutable slot cell, and sparse `SetLocal` writes fail closed. A
+  compiler-emitted closure/call regression and the real PBRemote portable call
+  probe now return the same result as the native PBCK runtime.
+- Added reachable-call-graph preparation and deterministic exact-i32 call-probe
+  selection. Unsupported functions outside the selected entry subgraph no
+  longer block a safe probe, while every reachable opcode and function
+  signature is still validated before execution.
+- Defined exact signed-i32 edge behavior for platform frame executors with
+  tests for overflow, fractional division, signed remainder and negative
+  powers. This prevents generated Android/JVM runtimes from silently adopting
+  Java integer wraparound semantics.
+- Added `stdlib:host_pbck_frame_binary.sapp`, a deterministic bounded `PBFP-v1`
+  transport for complete canonical frame plans. It uses compact typed payloads,
+  explicit resource limits and SHA-256 over canonical Base64 payload bytes, and
+  rejects malformed, truncated, extended or tampered assets.
+- Added closure/capture, rich-constant, metadata, deterministic round-trip and
+  negative integrity tests, a runnable example and an encode/decode benchmark.
+- Added `stdlib:host_pbck_frame_plan.sapp`, a bounded canonical lowering from
+  recursive PBCK chunks to flat function, instruction, constant and capture
+  tables. Closure operands become stable function IDs, constant operands become
+  global value slots, and platform generators no longer need their own
+  recursive decoder. Full validation remains at build boundaries while hot
+  instruction and constant access performs only constant-time shape checks.
+- Added fail-closed `function_at`, `capture_at`, `default_at` and
+  `parameter_type_at` accessors and hardened existing instruction, constant and
+  value lookups with integral range validation. Platform runtimes can now share
+  one bounded frame-program access contract instead of indexing raw tables.
+- Added compact byte/file construction, positive and fail-closed nested closure
+  tests, a runnable example and a two-stage microbenchmark. No Rust source was
+  added.
+- Completed the PBLang-native PBCK-v1 execution contract for all 48 opcodes.
+  The VM now implements exports, LIFO deferred calls, exponentiation, safe
+  attribute/index access and result unwrapping with guest-exception routing.
+  Tail-call frame reuse is conservatively disabled while a frame owns pending
+  deferred calls, preserving cleanup and return-value semantics.
+- Fixed capability-injected host adapter dispatch: `options.adapters` is now
+  validated and invoked exactly once with a bounded argument vector instead of
+  being recognized by `get_global` and then rejected by the hard-coded host
+  call path. Adapter failures are redacted and non-callable entries fail closed.
+- Added `stdlib:host_pbck_link.sapp`, a non-executing recursive link analyzer
+  that deterministically inventories internal globals, exports, built-ins and
+  unresolved host dependencies across every nested PBCK function.
+- Added a PBLang-native PBCK-v1 decoder with strict artifact, depth,
+  instruction, constant, string, parameter and capture budgets, exact trailing
+  data rejection and full nested-function metadata validation.
+- Added a bounded execution engine for the full 48-opcode PBCK-v1 contract.
+  Closures retain shared mutable upvalue cells,
+  cross-frame guest throws unwind to caller handlers, and tail calls use a
+  constant-depth trampoline.
+- Added a compact parallel-array representation for large artifacts. On the
+  2,416,020-byte PBRemote core it reduced benchmark peak RSS from 391,140 to
+  201,092 KiB (48.59%) and median decode latency from 819.470 to 742.830 ms
+  (9.35%). A 1,000-call microbenchmark measured 43.740 ms median. No Rust source
+  was added.
+- Added explicit self-hosted `tail: true` call lowering to native PBCK
+  `OpTailCall`, with direct translator/VM regression coverage. This lets
+  PBLang-generated Android conformance artifacts exercise the same trampoline
+  contract without mutating decoded bytecode after translation.
+
+### Verified precompiled x86-64 codegen driver
+- Replaced compiler-sized source-link scans that allocated per codepoint with a
+  bounded UTF-8 byte-indexed scanner while preserving strings and comments.
+- Added a PBLang-only content-addressed PBCK driver cache with dependency-graph,
+  exact compiler-binary SHA-256, PBCK integrity and generated-ELF execution
+  gates before atomic publication.
+- The phase benchmark measured 43.804 ms source-import publication versus
+  7.169 ms precompiled publication (6.11x), and 19,472 versus 12,720 KiB peak
+  RSS (34.68% lower). No Rust source was added.
+
+### Unicode character classification example
+- Completed Panos Biazis's `check_char_type` example from its original C school
+  exercise without recursion, undefined indexes or non-advancing loops.
+- Extended `stdlib/unicode.sapp` with bounded scalar classification, Unicode
+  whitespace, decimal digits from multiple scripts, cased-letter detection and
+  ordered text analysis.
+- Added Greek, Arabic-Indic digit, emoji, mathematical-symbol, punctuation,
+  empty-input and multi-character regressions. No Rust source was added.
+
+### Verified PBLang-native bootstrap refresh
+- Added a PBLang-native source-to-PBCS compiler CLI and a bounded bootstrap
+  refresh tool that snapshots all 19 compiler modules, verifies each artifact
+  structurally and publishes a digest-bound manifest.
+- Added a real 202-byte static Linux x86-64 probe generated by
+  `stdlib/native/codegen_x64.sapp`; the refresh gate executes it and requires
+  exit code 42 before publication.
+- Hardened the self-host bundle dependency scanner to ignore comments and
+  strings, normalize canonical `stdlib:` module paths and reject traversal.
+- Fixed optional-value type mismatches in the guard preprocessor and C99 modulo
+  lowering found by compiling the compiler modules through the self-hosted type
+  checker. The complete semantic suite passes 733/733. No Rust was added.
+
+### Bounded DEFLATE and PNG hot paths
+- Added a 9-bit canonical-Huffman lookup fast path with the existing bitwise
+  decoder retained as a deterministic fallback for longer codes.
+- Changed RFC 1950 Adler-32 to the bounded NMAX=5552 reduction schedule,
+  replacing two modulo operations per byte with two per block. A same-process
+  PBLang benchmark measured 3.199 ms versus 1.603 ms for 12,000 bytes
+  (1.996x, 49.90% lower latency).
+- Moved output-cap checks from every copied match byte to bounded block/match
+  growth checks and added zero-copy `crc32_range`.
+- Specialized all PNG scanline filters, removed per-pixel RGBA function
+  dispatch, cached downsample columns and now rejects trailing zlib bytes.
+- Added CRC-range, strict-stream, cross-block Adler and malformed-range
+  regression tests. On the current PBRemote 320x200 fixture, repeated final
+  stage medians were 150.330-152.826 ms for zlib and 287.491-295.023 ms for
+  integrity/decode/publish. No Rust source was added.
+
+### Bounded PNG and interactive image surfaces
+- Added a pure-PBLang PNG decoder with chunk CRC, zlib checksum, source/output
+  quotas, scanline filters and 8-bit grayscale/RGB/indexed/alpha support.
+- Added optional local-coordinate click callbacks to GUI image widgets.
+- Optimized nearest-neighbour upscaling to draw source-sized blocks instead of
+  issuing one point operation for every destination pixel.
+- Added focused malformed-image, palette, transparency, bomb-bound and image
+  input tests. No Rust source was added.
+
 ### Runtime-responsive cross-surface modern UI
 - Changed PBLang-generated Android Activities to query the actual
   `screenWidthDp` instead of freezing the build-time preview width.
