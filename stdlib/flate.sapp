@@ -37,16 +37,28 @@ fn _build_crc_table() {
 }
 let _CRC_T = _build_crc_table();
 
-fn crc32(data) {
+fn crc32_range(data, start, count) {
     let b = _as_bytes(data);
+    if type(start) != "number" or num_floor(start) != start or start < 0
+        or start > len(b) {
+        error("flate: invalid CRC32 range start");
+    }
+    if type(count) != "number" or num_floor(count) != count or count < 0
+        or count > len(b) - start {
+        error("flate: invalid CRC32 range length");
+    }
     let c = 4294967295;
-    let i = 0;
-    let n = len(b);
-    while i < n {
+    let i = start;
+    let end = start + count;
+    while i < end {
         c = bit_xor(bit_shr(c, 8), _CRC_T[bit_and(bit_xor(c, b[i]), 255)]);
         i = i + 1;
     }
     return bit_xor(c, 4294967295);
+}
+fn crc32(data) {
+    let b = _as_bytes(data);
+    return crc32_range(b, 0, len(b));
 }
 
 // ── adler32 (RFC 1950) ───────────────────────────────────────────────────────
@@ -57,9 +69,17 @@ fn adler32(data) {
     let i = 0;
     let n = len(b);
     while i < n {
-        a = (a + b[i]) % 65521;
-        s = (s + a) % 65521;
-        i = i + 1;
+        // RFC 1950's NMAX=5552 keeps both sums bounded while avoiding two
+        // modulo operations for every byte.
+        let end = i + 5552;
+        if end > n { end = n; }
+        while i < end {
+            a = a + b[i];
+            s = s + a;
+            i = i + 1;
+        }
+        a = a % 65521;
+        s = s % 65521;
     }
     return s * 65536 + a;
 }
@@ -88,6 +108,43 @@ fn _bits(st, k) {
 fn _consumed(st) { return st.pos - (st.nb - (st.nb % 8)) / 8; }
 
 // ── canonical Huffman decoding (puff-style: count[] + sorted symbols[]) ──────
+let _HUFF_FAST_BITS = 9;
+let _HUFF_FAST_SIZE = 512;
+
+fn _huff_fast_table(count, symbols) {
+    let fast_symbols = [];
+    let fast_lengths = [];
+    let prefix = 0;
+    while prefix < _HUFF_FAST_SIZE {
+        let code = 0;
+        let first = 0;
+        let index = 0;
+        let resolved_symbol = -1;
+        let resolved_length = 0;
+        let l = 1;
+        while l <= _HUFF_FAST_BITS and resolved_length == 0 {
+            code = code + bit_and(bit_shr(prefix, l - 1), 1);
+            let c = count[l];
+            if code - first < c {
+                let symbol_at = index + code - first;
+                if symbol_at >= 0 and symbol_at < len(symbols) {
+                    resolved_symbol = symbols[symbol_at];
+                    resolved_length = l;
+                }
+            } else {
+                index = index + c;
+                first = (first + c) * 2;
+                code = code * 2;
+            }
+            l = l + 1;
+        }
+        array_push(fast_symbols, resolved_symbol);
+        array_push(fast_lengths, resolved_length);
+        prefix = prefix + 1;
+    }
+    return map{ symbols: fast_symbols, lengths: fast_lengths };
+}
+
 fn _huff_build(lengths) {
     let count = [];
     let l = 0;
@@ -107,9 +164,22 @@ fn _huff_build(lengths) {
         }
         l = l + 1;
     }
-    return map{ count: count, symbols: symbols };
+    let fast = _huff_fast_table(count, symbols);
+    return map{ count: count, symbols: symbols,
+        fast_symbols: fast.symbols, fast_lengths: fast.lengths };
 }
 fn _huff_decode(st, h) {
+    if st.nb + (st.n - st.pos) * 8 >= _HUFF_FAST_BITS {
+        _need(st, _HUFF_FAST_BITS);
+        let key = bit_and(st.acc, _HUFF_FAST_SIZE - 1);
+        let used = h.fast_lengths[key];
+        if used > 0 {
+            let symbol = h.fast_symbols[key];
+            st.acc = bit_shr(st.acc, used);
+            st.nb = st.nb - used;
+            return symbol;
+        }
+    }
     let code = 0;
     let first = 0;
     let index = 0;
@@ -155,16 +225,19 @@ fn _fixed_tables() {
 }
 
 // ── inflate core ─────────────────────────────────────────────────────────────
-fn _check_cap(out, max_out) {
-    if max_out != nil and len(out) > max_out { error("flate: output exceeds max_out cap"); }
+fn _check_growth(out, additional, max_out) {
+    if additional < 0
+        or (max_out >= 0 and len(out) + additional > max_out) {
+        error("flate: output exceeds max_out cap");
+    }
 }
 
 fn _inflate_block_codes(st, out, lit, dist, max_out) {
     while true {
         let sym = _huff_decode(st, lit);
         if sym < 256 {
+            _check_growth(out, 1, max_out);
             array_push(out, sym);
-            _check_cap(out, max_out);
         } else {
             if sym == 256 { return nil; }
             if sym > 285 { error("flate: invalid length symbol"); }
@@ -174,13 +247,13 @@ fn _inflate_block_codes(st, out, lit, dist, max_out) {
             if ds > 29 { error("flate: invalid distance symbol"); }
             let d = _DBASE[ds] + _bits(st, _DEXTRA[ds]);
             if d > len(out) { error("flate: distance beyond output start"); }
+            _check_growth(out, length, max_out);
             let src = len(out) - d;
             let k = 0;
             while k < length {
                 array_push(out, out[src + k]);
                 k = k + 1;
             }
-            _check_cap(out, max_out);
         }
     }
     return nil;
@@ -218,11 +291,16 @@ fn _read_dynamic_tables(st) {
     }
     if len(lengths) != hlit + hdist { error("flate: code length overflow"); }
     let ll = slice(lengths, 0, hlit);
-    let dl = slice(lengths, hlit, nil);
+    let dl = slice(lengths, hlit, len(lengths));
     return map{ lit: _huff_build(ll), dist: _huff_build(dl) };
 }
 
-fn _inflate_stream(st, max_out) {
+fn _output_cap(max_out) {
+    if max_out == nil { return -1; }
+    return max_out;
+}
+
+fn _inflate_stream(st, output_cap) {
     let out = [];
     let done = false;
     while not done {
@@ -233,20 +311,20 @@ fn _inflate_stream(st, max_out) {
             let length = _bits(st, 16);
             let nlen = _bits(st, 16);
             if bit_xor(length, 65535) != nlen { error("flate: stored block LEN/NLEN mismatch"); }
+            _check_growth(out, length, output_cap);
             let k = 0;
             while k < length {
                 array_push(out, _bits(st, 8));
                 k = k + 1;
             }
-            _check_cap(out, max_out);
         } else {
             if btype == 1 {
                 let f = _fixed_tables();
-                _inflate_block_codes(st, out, f.lit, f.dist, max_out);
+                _inflate_block_codes(st, out, f.lit, f.dist, output_cap);
             } else {
                 if btype != 2 { error("flate: invalid block type"); }
                 let t = _read_dynamic_tables(st);
-                _inflate_block_codes(st, out, t.lit, t.dist, max_out);
+                _inflate_block_codes(st, out, t.lit, t.dist, output_cap);
             }
         }
     }
@@ -256,7 +334,7 @@ fn _inflate_stream(st, max_out) {
 // inflate(data, max_out?) — decode a raw DEFLATE stream to a byte array.
 fn inflate(data, max_out = nil) {
     let b = _as_bytes(data);
-    return _inflate_stream(_mk_reader(b, 0), max_out);
+    return _inflate_stream(_mk_reader(b, 0), _output_cap(max_out));
 }
 
 // ── bit writer + fixed-Huffman encoder ───────────────────────────────────────
@@ -737,7 +815,7 @@ fn gzip_decode(data, max_out = nil) {
     if bit_and(flg, 2) != 0 { p = p + 2; }   // FHCRC
     if p >= len(b) { error("flate: truncated gzip header"); }
     let st = _mk_reader(b, p);
-    let out = _inflate_stream(st, max_out);
+    let out = _inflate_stream(st, _output_cap(max_out));
     let tp = _consumed(st);
     if tp + 8 > len(b) { error("flate: truncated gzip trailer"); }
     if _le32(b, tp) != crc32(out) { error("flate: gzip CRC32 mismatch"); }
@@ -760,16 +838,17 @@ fn zlib_encode(data) {
     return out;
 }
 
-fn zlib_decode(data, max_out = nil) {
+fn zlib_decode(data, max_out = nil, exact = false) {
     let b = _as_bytes(data);
     if len(b) < 6 { error("flate: zlib data too short"); }
     if bit_and(b[0], 15) != 8 { error("flate: unsupported zlib method"); }
     if (b[0] * 256 + b[1]) % 31 != 0 { error("flate: bad zlib header check"); }
     if bit_and(b[1], 32) != 0 { error("flate: zlib preset dictionary unsupported"); }
     let st = _mk_reader(b, 2);
-    let out = _inflate_stream(st, max_out);
+    let out = _inflate_stream(st, _output_cap(max_out));
     let tp = _consumed(st);
     if tp + 4 > len(b) { error("flate: truncated zlib trailer"); }
+    if exact and tp + 4 != len(b) { error("flate: trailing zlib data"); }
     let want = b[tp] * 16777216 + b[tp + 1] * 65536 + b[tp + 2] * 256 + b[tp + 3];
     if want != adler32(out) { error("flate: zlib adler32 mismatch"); }
     return out;
@@ -785,5 +864,5 @@ fn gzip_write_file(path, data) {
     return len(blob);
 }
 
-export crc32, adler32, inflate, deflate, gzip_encode, gzip_decode,
+export crc32, crc32_range, adler32, inflate, deflate, gzip_encode, gzip_decode,
        zlib_encode, zlib_decode, gzip_read_file, gzip_write_file;

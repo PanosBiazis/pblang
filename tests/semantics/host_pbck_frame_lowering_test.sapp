@@ -1,0 +1,135 @@
+let Plan = import("stdlib:host_pbck_frame_plan.sapp");
+let Calls = import("stdlib:host_pbck_frame_calls.sapp");
+let Lowering = import("stdlib:host_pbck_frame_lowering.sapp");
+
+fn fail(message) { throw "FAIL host_pbck_frame_lowering: " + message; }
+
+fn decoded(instructions, constants) {
+    return map{
+        format: "host-pbck-v1", version: 1,
+        chunk: map{ instructions: instructions, constants: constants, source_name: nil }
+    };
+}
+
+fn guest(name, arity, min_arity, defaults, instructions, constants) {
+    return map{
+        __pbck_function: true, name: name, arity: arity, min_arity: min_arity,
+        defaults: defaults, is_vararg: false, parameter_types: [],
+        chunk: map{ instructions: instructions, constants: constants, source_name: nil }
+    };
+}
+
+fn mutable_copy(value) {
+    let encoded = json_stringify(value);
+    encoded = str_replace_all(encoded, "\"__frozen\":true,", "");
+    encoded = str_replace_all(encoded, ",\"__frozen\":true", "");
+    return json_parse(encoded);
+}
+
+// Three simultaneously active frames share one cell through a local capture
+// followed by a non-local capture.
+let leaf = guest("leaf", 0, 0, [], [
+map{ op: 28, operand: 0 }, map{ op: 33 }
+], []);
+let middle = guest("middle", 0, 0, [], [
+map{ op: 27, fn_const: 0, captures: [map{ is_local: false, index: 0 }] },
+map{ op: 31, operand: 0 }, map{ op: 33 }
+], [leaf]);
+let nested = Plan.build_decoded(decoded([
+map{ op: 0, operand: 0 }, map{ op: 26, operand: 0 },
+map{ op: 27, fn_const: 1, captures: [map{ is_local: true, index: 0 }] },
+map{ op: 31, operand: 0 }, map{ op: 33 }
+], [73, middle]));
+let probe = Calls.find_i32_call_probe(nested, map{
+    min_reachable_functions: 3, max_reachable_functions: 3,
+    max_probe_instructions: 64, max_probe_steps: 1000
+});
+let verified = Calls.verify_i32_prepared(probe.program, probe.function_id, [],
+    map{ max_steps: probe.steps });
+let image = Lowering.build(verified);
+let report = Lowering.validate(image);
+if not report.ok or image.format != Lowering.FORMAT or image.entry_function != 0
+or image.function_count != 3 or image.instruction_count != 10
+or image.entry_arg_count != 0 or image.entry_arg_constants != []
+or image.constant_count != 1 or image.capture_count != 2 or image.default_count != 0
+or image.expected_value != 73 or image.observed_peak_frames != 3
+or image.original_function_ids != [0, 1, 2]
+or image.function_upvalue_count != [0, 1, 1]
+or image.function_instruction_start != [0, 5, 8]
+or image.function_instruction_count != [5, 3, 2]
+or image.opcodes != [0, 26, 27, 31, 33, 27, 31, 33, 28, 33]
+or image.operands != [0, 0, 1, 0, -1, 2, 0, -1, 0, -1]
+or image.instruction_capture_start != [-1, -1, 0, -1, -1, 1, -1, -1, -1, -1]
+or image.instruction_capture_count != [0, 0, 1, 0, 0, 1, 0, 0, 0, 0]
+or image.capture_is_local != [1, 0] or image.capture_indices != [0, 0]
+or image.constant_kinds != [1] or image.constant_i32 != [73]
+or image.constant_functions != [-1] {
+    fail("nested canonical image mismatch: " + str(image));
+}
+let image_again = Lowering.build(verified);
+if json_stringify(image_again) != json_stringify(image) {
+    fail("lowering image is not deterministic");
+}
+
+// A non-zero original entry ID is remapped to canonical dense entry zero. The
+// direct function constant and default remain explicit canonical entries.
+let defaulted = guest("defaulted", 1, 0, [42], [
+map{ op: 25, operand: 0 }, map{ op: 33 }
+], []);
+let root = guest("root", 0, 0, [], [
+map{ op: 0, operand: 0 }, map{ op: 31, operand: 0 }, map{ op: 33 }
+], [defaulted]);
+let direct_plan = Plan.build_decoded(decoded([map{ op: 33 }], [defaulted, root]));
+let direct_verified = Calls.verify_i32(direct_plan, 2, [], map{ max_steps: 100 });
+let direct = Lowering.build(direct_verified);
+if direct.entry_function != 0 or direct.original_function_ids != [2, 3]
+or direct.function_arity != [0, 1] or direct.function_min_arity != [0, 0]
+or direct.constant_kinds != [3, 1] or direct.constant_functions != [1, -1]
+or direct.constant_i32 != [0, 42] or direct.default_constants != [1]
+or direct.default_count != 1 or direct.expected_value != 42 {
+    fail("direct function/default lowering mismatch: " + str(direct));
+}
+
+let argument_function = guest("argument_function", 1, 1, [], [
+map{ op: 25, operand: 0 }, map{ op: 33 }
+], []);
+let argument_plan = Plan.build_decoded(decoded([map{ op: 33 }], [argument_function]));
+let argument_verified = Calls.verify_i32(argument_plan, 1, [91], map{ max_steps: 100 });
+let argument_image = Lowering.build(argument_verified);
+if argument_image.entry_arg_count != 1 or argument_image.entry_arg_constants != [0]
+or argument_image.constant_kinds != [1] or argument_image.constant_i32 != [91]
+or argument_image.expected_value != 91 {
+    fail("entry argument lowering mismatch: " + str(argument_image));
+}
+
+let tampered = mutable_copy(image);
+tampered.opcodes[0] = 47;
+tampered.checksum = Lowering.checksum(tampered);
+if not (try { Lowering.validate(tampered); false } catch true) {
+    fail("unsupported opcode tampering was accepted");
+}
+tampered = mutable_copy(image);
+tampered.expected_value = 72;
+if not (try { Lowering.validate(tampered); false } catch true) {
+    fail("checksum tampering was accepted");
+}
+tampered = mutable_copy(image);
+tampered.operands[4] = 0;
+tampered.checksum = Lowering.checksum(tampered);
+if not (try { Lowering.validate(tampered); false } catch true) {
+    fail("non-canonical sentinel operand was accepted");
+}
+tampered = mutable_copy(image);
+tampered.capture_indices[0] = 0.5;
+tampered.checksum = Lowering.checksum(tampered);
+if not (try { Lowering.validate(tampered); false } catch true) {
+    fail("fractional table value was accepted");
+}
+if not (try { Lowering.build(verified, map{ max_functions: 2 }); false } catch true)
+or not (try { Lowering.build(map{ format: Calls.VERIFIED_I32_FORMAT, ok: true }); false }
+catch true)
+or not (try { Lowering.validate(map{}); false } catch true) {
+    fail("invalid input or bounded limit was accepted");
+}
+
+print "host_pbck_frame_lowering_pass";

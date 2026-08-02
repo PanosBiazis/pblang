@@ -529,6 +529,23 @@ cache-warm publication. The initial same-turn uncached median improved from
 motivated the verified module cache and batch session described below; artifact
 reuse is still not mislabeled as cold compilation.
 
+## Precompiled direct-driver cache (2026-07-29)
+
+`tools/pbcodegen_cache.sapp` now links and freezes the PBLang-written x86-64
+driver as a content-addressed PBCK. Its v2 identity binds the exact compiler
+executable SHA-256, compiler version, linked source and complete dependency
+graph. Reuse verifies the graph, PBCK digest and format; initial publication
+also requires the cached driver to generate a structurally valid ELF.
+
+The source linker now uses UTF-8 byte indexes for ASCII syntax scanning instead
+of allocating a one-codepoint string at every input position. A compiler-sized
+link that previously exceeded a 120-second bound completed in about one second.
+The complete phase suite measured 43.804 ms median source-import publication
+versus 7.169 ms through the precompiled driver (6.11x), with peak RSS reduced
+from 19,472 to 12,720 KiB. The 716,463-byte cached driver is a storage tradeoff,
+and `emit-pbck` remains an explicit host bootstrap boundary. Full evidence is in
+`bench/results/2026-07-29-cold-codegen-driver/REPORT.md`.
+
 ## One-process x86-64 builds and verified module bytecode (2026-07-19)
 
 `stdlib/native/compile_session.sapp` now imports the direct backend once,

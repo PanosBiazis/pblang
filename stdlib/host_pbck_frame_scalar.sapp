@@ -1,0 +1,302 @@
+// Allocation-bounded scalar executor over canonical flat PBCK frame plans.
+// Calls, globals, collections, exceptions and host adapters are rejected by
+// inspection so platform runtimes can adopt this closed semantic subset first.
+
+let Plan = import("stdlib:host_pbck_frame_plan.sapp");
+
+let FORMAT = "pblang.host-pbck.frame-scalar.v1";
+let SUPPORTED_OPCODES = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    25, 26, 33, 35, 36, 37, 38, 39, 40, 41, 45, 46
+];
+let OPCODE_MASK = [];
+let _mask_i = 0;
+while _mask_i < 48 { array_push(OPCODE_MASK, false); _mask_i = _mask_i + 1; }
+_mask_i = 0;
+while _mask_i < len(SUPPORTED_OPCODES) {
+    OPCODE_MASK[SUPPORTED_OPCODES[_mask_i]] = true;
+    _mask_i = _mask_i + 1;
+}
+
+fn _fault(message) { throw "host_pbck_frame_scalar: " + message; }
+
+fn _option(options, key, fallback) {
+    if options != nil and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+
+fn _positive_limit(options, key, fallback, hard_max) {
+    let value = _option(options, key, fallback);
+    if not is_number(value) or value != num_floor(value)
+        or value < 1 or value > hard_max {
+        _fault("invalid " + key);
+    }
+    return value;
+}
+
+fn runtime_limits(options = nil) {
+    if options != nil and not is_map(options) { _fault("options must be a map"); }
+    return map{
+        max_steps: _positive_limit(options, "max_steps", 1000000, 100000000),
+        max_stack: _positive_limit(options, "max_stack", 4096, 1048576),
+        max_locals: _positive_limit(options, "max_locals", 65536, 1048576)
+    };
+}
+
+fn supports_opcode(op) {
+    return is_number(op) and op == num_floor(op)
+        and op >= 0 and op < len(OPCODE_MASK) and OPCODE_MASK[op];
+}
+
+fn _inspect_validated(plan, function_id) {
+    let function = Plan.function_at(plan, function_id);
+    let unsupported = [];
+    let unsupported_counts = [];
+    let op = 0;
+    while op < 48 { array_push(unsupported_counts, 0); op = op + 1; }
+
+    let ii = 0;
+    while ii < function.instruction_count {
+        let absolute = function.instruction_start + ii;
+        op = plan.opcodes[absolute];
+        if not supports_opcode(op) {
+            if unsupported_counts[op] == 0 { array_push(unsupported, op); }
+            unsupported_counts[op] = unsupported_counts[op] + 1;
+        }
+        ii = ii + 1;
+    }
+    if function.is_vararg { array_push(unsupported, "vararg"); }
+    return map{
+        format: FORMAT, ok: len(unsupported) == 0, function_id: function_id,
+        instructions: function.instruction_count,
+        supported_opcodes: len(SUPPORTED_OPCODES), unsupported: unsupported,
+        unsupported_counts: unsupported_counts
+    };
+}
+
+fn inspect(plan, function_id = 0) {
+    if not Plan.validate(plan).ok { _fault("invalid frame plan"); }
+    return _inspect_validated(plan, function_id);
+}
+
+fn _truthy(value) { return value != nil and value != false and value != 0; }
+
+fn _pop(stack) {
+    if len(stack) == 0 { _fault("stack underflow"); }
+    return array_pop(stack);
+}
+
+fn _peek(stack) {
+    if len(stack) == 0 { _fault("stack underflow"); }
+    return stack[len(stack) - 1];
+}
+
+fn _push(state, stack, value) {
+    if len(stack) >= state.limits.max_stack { _fault("stack limit exceeded"); }
+    if state.require_i32 and not is_bool(value) {
+        if not is_number(value) or value != num_floor(value)
+            or value < -2147483648 or value > 2147483647 {
+            _fault("value is outside exact i32 contract");
+        }
+    }
+    array_push(stack, value);
+    if len(stack) > state.peak_stack { state.peak_stack = len(stack); }
+}
+
+fn _binary(state, stack, op) {
+    let b = _pop(stack); let a = _pop(stack);
+    if op == 1 { _push(state, stack, a + b); }
+    elif op == 2 { _push(state, stack, a - b); }
+    elif op == 3 { _push(state, stack, a * b); }
+    elif op == 4 {
+        if b == 0 { _fault("division by zero"); }
+        _push(state, stack, a / b);
+    }
+    elif op == 5 { _push(state, stack, a == b); }
+    elif op == 6 { _push(state, stack, a != b); }
+    elif op == 7 { _push(state, stack, a > b); }
+    elif op == 8 { _push(state, stack, a >= b); }
+    elif op == 9 { _push(state, stack, a < b); }
+    elif op == 10 { _push(state, stack, a <= b); }
+    elif op == 40 {
+        if b == 0 { _fault("modulo by zero"); }
+        _push(state, stack, num_mod(a, b));
+    }
+    elif op == 41 { _push(state, stack, num_pow(a, b)); }
+    else { _fault("invalid binary opcode"); }
+}
+
+fn _prepare_validated(plan, function_id) {
+    let contract = _inspect_validated(plan, function_id);
+    if not contract.ok { _fault("function uses unsupported scalar operations"); }
+    let function = plan.functions[function_id];
+    let opcodes = []; let operands = []; let constants = [];
+    let ii = 0;
+    while ii < function.instruction_count {
+        let absolute = function.instruction_start + ii;
+        let op = plan.opcodes[absolute];
+        array_push(opcodes, op);
+        array_push(operands, plan.operands[absolute]);
+        if op == 0 { array_push(constants, Plan.value_at(plan, plan.operands[absolute])); }
+        else { array_push(constants, nil); }
+        ii = ii + 1;
+    }
+    let defaults = [];
+    ii = 0;
+    while ii < function.default_count {
+        array_push(defaults, Plan.default_at(plan, function_id, ii));
+        ii = ii + 1;
+    }
+    return freeze(map{
+        format: FORMAT, version: 1, function_id: function_id,
+        arity: function.arity, min_arity: function.min_arity,
+        max_local: function.max_local, instruction_count: function.instruction_count,
+        opcodes: opcodes, operands: operands, constants: constants, defaults: defaults
+    });
+}
+
+fn prepare(plan, function_id = 0) {
+    if not Plan.validate(plan).ok { _fault("invalid frame plan"); }
+    return _prepare_validated(plan, function_id);
+}
+
+fn _require_program(program) {
+    if not is_map(program) or not map_has(program, "format") or program.format != FORMAT
+        or not map_has(program, "version") or program.version != 1
+        or not is_array(program.opcodes) or not is_array(program.operands)
+        or not is_array(program.constants) or not is_array(program.defaults)
+        or len(program.opcodes) != program.instruction_count
+        or len(program.operands) != program.instruction_count
+        or len(program.constants) != program.instruction_count
+        or program.arity < 0 or program.min_arity < 0
+        or program.min_arity > program.arity or len(program.defaults) > program.arity
+        or program.max_local < program.arity {
+        _fault("invalid prepared program");
+    }
+}
+
+fn _locals(program, args, limits) {
+    if not is_array(args) { _fault("arguments must be an array"); }
+    let argc = len(args);
+    if argc < program.min_arity { _fault("too few call arguments"); }
+    if argc > program.arity { _fault("too many call arguments"); }
+    if program.max_local > limits.max_locals { _fault("locals limit exceeded"); }
+
+    let locals = [];
+    let i = 0;
+    while i < program.max_local { array_push(locals, nil); i = i + 1; }
+    i = 0;
+    while i < program.arity {
+        if i < argc { locals[i] = args[i]; }
+        else {
+            let default_start = program.arity - len(program.defaults);
+            if i >= default_start {
+                locals[i] = program.defaults[i - default_start];
+            }
+        }
+        i = i + 1;
+    }
+    return locals;
+}
+
+fn run_prepared(program, args = nil, options = nil) {
+    _require_program(program);
+    if args == nil { args = []; }
+    let limits = runtime_limits(options);
+    let locals = _locals(program, args, limits);
+    let stack = [];
+    let state = map{
+        limits: limits, steps: 0, peak_stack: 0,
+        require_i32: _option(options, "require_i32", false) == true
+    };
+    let ip = 0;
+    let returned = false;
+    let value = nil;
+
+    while ip < program.instruction_count and not returned {
+        if state.steps >= limits.max_steps { _fault("step limit exceeded"); }
+        state.steps = state.steps + 1;
+        let instruction = ip;
+        let op = program.opcodes[instruction];
+        let operand = program.operands[instruction];
+        ip = ip + 1;
+
+        if not supports_opcode(op) { _fault("unsupported opcode " + str(op)); }
+        if op == 0 { _push(state, stack, program.constants[instruction]); }
+        elif op >= 1 and op <= 10 { _binary(state, stack, op); }
+        elif op == 11 { _pop(stack); }
+        elif op == 25 {
+            if operand < 0 or operand >= len(locals) { _fault("local slot out of range"); }
+            _push(state, stack, locals[operand]);
+        }
+        elif op == 26 {
+            if operand < 0 or operand >= len(locals) { _fault("local slot out of range"); }
+            locals[operand] = _pop(stack);
+        }
+        elif op == 33 { value = _pop(stack); returned = true; }
+        elif op == 35 {
+            if operand < 0 or operand > program.instruction_count { _fault("jump target out of range"); }
+            ip = operand;
+        }
+        elif op == 36 {
+            if operand < 0 or operand > program.instruction_count { _fault("jump target out of range"); }
+            if not _truthy(_peek(stack)) { ip = operand; }
+        }
+        elif op == 37 {
+            if operand < 0 or operand > program.instruction_count { _fault("jump target out of range"); }
+            if _truthy(_peek(stack)) { ip = operand; }
+        }
+        elif op == 38 { _push(state, stack, not _truthy(_pop(stack))); }
+        elif op == 39 { _push(state, stack, 0 - _pop(stack)); }
+        elif op == 40 or op == 41 { _binary(state, stack, op); }
+        elif op == 45 { _push(state, stack, _pop(stack) == nil); }
+        elif op == 46 { _push(state, stack, _peek(stack)); }
+        else { _fault("unsupported opcode " + str(op)); }
+    }
+    return map{
+        format: FORMAT, ok: true, function_id: program.function_id, value: value,
+        steps: state.steps, peak_stack: state.peak_stack,
+        peak_locals: len(locals), returned: returned
+    };
+}
+
+fn run(plan, function_id = 0, args = nil, options = nil) {
+    return run_prepared(prepare(plan, function_id), args, options);
+}
+
+fn find_i32_probe(plan, options = nil) {
+    if not Plan.validate(plan).ok { _fault("invalid frame plan"); }
+    let max_instructions = _positive_limit(options, "max_probe_instructions", 512, 65536);
+    let max_steps = _positive_limit(options, "max_probe_steps", 10000, 1000000);
+    let function_id = 0;
+    while function_id < len(plan.functions) {
+        let function = plan.functions[function_id];
+        let contract = _inspect_validated(plan, function_id);
+        if contract.ok and function.arity == 0 and function.min_arity == 0
+            and function.instruction_count >= 2
+            and function.instruction_count <= max_instructions {
+            let program = try _prepare_validated(plan, function_id) catch nil;
+            if program != nil {
+                let result = try run_prepared(program, [], map{
+                    max_steps: max_steps, max_stack: 4096, max_locals: 65536,
+                    require_i32: true
+                }) catch nil;
+                if result != nil and result.returned and is_number(result.value)
+                    and result.value == num_floor(result.value)
+                    and result.value >= -2147483648 and result.value <= 2147483647 {
+                    return map{
+                        ok: true, format: FORMAT, function_id: function_id,
+                        value: result.value, steps: result.steps,
+                        peak_stack: result.peak_stack, peak_locals: result.peak_locals,
+                        instructions: function.instruction_count, program: program
+                    };
+                }
+            }
+        }
+        function_id = function_id + 1;
+    }
+    return map{ ok: false, format: FORMAT, function_id: -1 };
+}
+
+export FORMAT, SUPPORTED_OPCODES;
+export runtime_limits, supports_opcode, inspect, prepare, run_prepared, run, find_i32_probe;

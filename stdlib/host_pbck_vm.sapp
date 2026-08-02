@@ -1,0 +1,553 @@
+// Bounded PBLang-native execution engine for host PBCK-v1 chunks.
+// It is intentionally independent of the bootstrap/native VM. Captured locals
+// are shared cells and tail calls use a trampoline, preserving mutation and
+// constant PBLang call depth for the function opcodes used by portable apps.
+
+let Decode = import("stdlib:host_pbck_decode.sapp");
+let Pure = import("stdlib:host_pbck_pure.sapp");
+
+let SUPPORTED_OPCODES = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+    18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47
+];
+let BUILTIN_ADAPTERS = [];
+let _builtin_i = 0;
+while _builtin_i < len(Pure.NAMES) {
+    array_push(BUILTIN_ADAPTERS, Pure.NAMES[_builtin_i]);
+    _builtin_i = _builtin_i + 1;
+}
+array_push(BUILTIN_ADAPTERS, "print");
+
+fn _option(options, key, fallback) {
+    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+
+fn _positive_limit(options, key, fallback, hard_max) {
+    let n = _option(options, key, fallback);
+    if not is_number(n) or n < 1 or n != num_floor(n) or n > hard_max {
+        throw "host_pbck_vm: invalid " + key;
+    }
+    return n;
+}
+
+fn runtime_limits(options = nil) {
+    if options != nil and not is_map(options) { throw "host_pbck_vm: options must be a map"; }
+    return map{
+        max_steps: _positive_limit(options, "max_steps", 1000000, 100000000),
+        max_frames: _positive_limit(options, "max_frames", 256, 4096),
+        max_stack: _positive_limit(options, "max_stack", 4096, 1048576),
+        max_locals: _positive_limit(options, "max_locals", 65536, 1048576),
+        max_output: _positive_limit(options, "max_output", 65536, 1048576),
+        max_collection_items: _positive_limit(options, "max_collection_items", 1048576, 16777216)
+    };
+}
+
+fn _state(options, globals) {
+    let limits = runtime_limits(options);
+    let adapters = map{};
+    if options != nil and map_has(options, "adapters") {
+        if not is_map(options.adapters) { throw "host_pbck_vm: adapters must be a map"; }
+        adapters = options.adapters;
+    }
+    return map{
+        limits: limits, globals: globals, exports: map{}, adapters: adapters,
+        output: [], steps: 0, frames: 0, peak_frames: 0, peak_stack: 0,
+        peak_locals: 0, tail_calls: 0, host_calls: 0
+    };
+}
+
+fn _fault(message) { throw "host_pbck_vm: " + message; }
+
+fn _tick(state, stack) {
+    if state.steps >= state.limits.max_steps { _fault("step limit exceeded"); }
+    state.steps = state.steps + 1;
+    if len(stack) > state.limits.max_stack { _fault("stack limit exceeded"); }
+    if len(stack) > state.limits.max_locals { _fault("locals/stack limit exceeded"); }
+    if len(stack) > state.peak_stack { state.peak_stack = len(stack); }
+    if len(stack) > state.peak_locals { state.peak_locals = len(stack); }
+}
+
+fn _pop(stack) {
+    if len(stack) == 0 { _fault("stack underflow"); }
+    return array_pop(stack).value;
+}
+
+fn _peek(stack) {
+    if len(stack) == 0 { _fault("stack underflow"); }
+    return stack[len(stack) - 1].value;
+}
+
+fn _push(state, stack, value) {
+    if len(stack) >= state.limits.max_stack { _fault("stack limit exceeded"); }
+    array_push(stack, _cell(value));
+}
+
+fn _cell(value) { return map{ value: value }; }
+
+fn _ensure_local(state, stack, slot) {
+    if slot < 0 or slot >= len(stack) or slot >= state.limits.max_locals {
+        _fault("local slot out of bounds");
+    }
+}
+
+fn _truthy(value) { return value != nil and value != false and value != 0; }
+fn _callable(value) {
+    let kind = type(value);
+    return kind == "fn" or kind == "function" or kind == "closure" or kind == "builtin";
+}
+fn _builtin_adapter(name) {
+    let i = 0;
+    while i < len(BUILTIN_ADAPTERS) {
+        if BUILTIN_ADAPTERS[i] == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+fn _normal(value) { return map{ kind: "value", value: value }; }
+fn _raised(value) { return map{ kind: "throw", value: value }; }
+fn _tail(callee, args) { return map{ kind: "tail", callee: callee, args: args }; }
+
+fn _truncate(stack, size) {
+    while len(stack) > size { array_pop(stack); }
+}
+
+fn _raise_in_frame(handlers, stack, value) {
+    if len(handlers) == 0 { return _raised(value); }
+    let handler = array_pop(handlers);
+    _truncate(stack, handler.stack_size);
+    array_push(stack, _cell(value));
+    return map{ kind: "handled", target: handler.target };
+}
+
+fn _index_get(obj, index, safe) {
+    if obj == nil and safe { return nil; }
+    if is_array(obj) {
+        if not is_number(index) or index != num_floor(index) or index < 0 or index >= len(obj) {
+            if safe { return nil; }
+            _fault("array index out of bounds");
+        }
+        return obj[index];
+    }
+    if is_map(obj) {
+        if not is_string(index) { if safe { return nil; } _fault("map key must be a string"); }
+        if map_has(obj, index) { return obj[index]; }
+        if safe { return nil; }
+        _fault("map key not found");
+    }
+    if is_string(obj) {
+        if not is_number(index) or index != num_floor(index) or index < 0 or index >= len(obj) {
+            if safe { return nil; }
+            _fault("string index out of bounds");
+        }
+        return str_slice(obj, index, index + 1);
+    }
+    if safe { return nil; }
+    _fault("value is not indexable");
+}
+
+fn _safe_index(obj, index) {
+    if obj == nil { return nil; }
+    if is_array(obj) {
+        if not is_number(index) { _fault("array index must be a number"); }
+        let slot = num_floor(index);
+        if index < 0 { slot = 0 - num_floor(0 - index); }
+        if slot < 0 or slot >= len(obj) { return nil; }
+        return obj[slot];
+    }
+    if is_map(obj) {
+        if not is_string(index) { _fault("map key must be a string"); }
+        if map_has(obj, index) { return obj[index]; }
+        return nil;
+    }
+    if is_string(obj) {
+        if not is_number(index) { _fault("string index must be a number"); }
+        let slot = num_floor(index);
+        if index < 0 { slot = 0 - num_floor(0 - index); }
+        if slot < 0 or slot >= len(obj) { return nil; }
+        return str_slice(obj, slot, slot + 1);
+    }
+    return nil;
+}
+
+fn _host_call(state, name, args) {
+    state.host_calls = state.host_calls + 1;
+    if map_has(state.adapters, name) {
+        let adapter = state.adapters[name];
+        if not _callable(adapter) { _fault("host adapter is not callable: " + name); }
+        // Adapters receive one bounded argument vector. Guest-controlled data
+        // never changes the host callable or its arity, and adapter exception
+        // details are intentionally not exposed to guest code.
+        let attempted = try map{ ok: true, value: adapter(args) } catch map{ ok: false };
+        if not attempted.ok { return _raised("host adapter failed: " + name); }
+        return _normal(attempted.value);
+    }
+    if name == "print" {
+        let i = 0;
+        while i < len(args) {
+            if len(state.output) >= state.limits.max_output { _fault("output limit exceeded"); }
+            array_push(state.output, args[i]); i = i + 1;
+        }
+        return _normal(nil);
+    }
+    if Pure.has(name) {
+        let attempted = try map{
+            ok: true,
+            value: Pure.call(name, args, state.limits.max_collection_items)
+        } catch map{ ok: false };
+        if not attempted.ok { return _raised("builtin failed: " + name); }
+        return _normal(attempted.value);
+    }
+    _fault("host adapter is unavailable: " + name);
+}
+
+fn _call_value(state, callee, args, depth) {
+    if is_map(callee) and map_has(callee, "__pbck_closure") {
+        return _invoke(state, callee, args, depth + 1);
+    }
+    if is_map(callee) and map_has(callee, "__pbck_function") {
+        return _invoke(state, map{
+            __pbck_closure: true, function: callee, upvalues: [], globals: state.globals
+        }, args, depth + 1);
+    }
+    if is_map(callee) and map_has(callee, "__pbck_adapter") {
+        return _host_call(state, callee.__pbck_adapter, args);
+    }
+    _fault("value is not callable");
+}
+
+fn _normalized_stack(state, function, args) {
+    let argc = len(args);
+    if argc < function.min_arity { _fault("too few call arguments"); }
+    if not function.is_vararg and argc > function.arity { _fault("too many call arguments"); }
+    let stack = [];
+    let fixed = function.arity;
+    let i = 0;
+    while i < fixed {
+        let value = nil;
+        if i < argc { value = args[i]; }
+        else {
+            let default_start = fixed - len(function.defaults);
+            if i >= default_start { value = function.defaults[i - default_start]; }
+        }
+        array_push(stack, _cell(value));
+        i = i + 1;
+    }
+    if function.is_vararg {
+        let extra = [];
+        i = fixed;
+        while i < argc {
+            if len(extra) >= state.limits.max_collection_items { _fault("vararg limit exceeded"); }
+            array_push(extra, args[i]); i = i + 1;
+        }
+        array_push(stack, _cell(extra));
+    }
+    return stack;
+}
+
+fn _binary(state, stack, op) {
+    let b = _pop(stack); let a = _pop(stack);
+    if op == 1 { _push(state, stack, a + b); }
+    elif op == 2 { _push(state, stack, a - b); }
+    elif op == 3 { _push(state, stack, a * b); }
+    elif op == 4 { if b == 0 { _fault("division by zero"); } _push(state, stack, a / b); }
+    elif op == 5 { _push(state, stack, a == b); }
+    elif op == 6 { _push(state, stack, a != b); }
+    elif op == 7 { _push(state, stack, a > b); }
+    elif op == 8 { _push(state, stack, a >= b); }
+    elif op == 9 { _push(state, stack, a < b); }
+    elif op == 10 { _push(state, stack, a <= b); }
+    elif op == 40 { if b == 0 { _fault("modulo by zero"); } _push(state, stack, num_mod(a, b)); }
+    elif op == 41 { _push(state, stack, num_pow(a, b)); }
+}
+
+fn _instruction_count(chunk) {
+    if map_has(chunk, "compact") and chunk.compact { return len(chunk.opcodes); }
+    return len(chunk.instructions);
+}
+
+fn _instruction_at(chunk, index) {
+    if not (map_has(chunk, "compact") and chunk.compact) { return chunk.instructions[index]; }
+    let op = chunk.opcodes[index];
+    if op == 27 {
+        let captures = [];
+        if map_has(chunk.closures, str(index)) { captures = chunk.closures[str(index)]; }
+        return map{ op: op, fn_const: chunk.operands[index], captures: captures };
+    }
+    if chunk.operands[index] >= 0 { return map{ op: op, operand: chunk.operands[index] }; }
+    return map{ op: op };
+}
+
+fn _run_defers(state, defers, depth) {
+    while len(defers) > 0 {
+        let deferred = array_pop(defers);
+        let result = _call_value(state, deferred, [], depth);
+        if result.kind == "throw" { return result; }
+    }
+    return _normal(nil);
+}
+
+fn _finish_frame(state, defers, value, depth) {
+    let cleanup = _run_defers(state, defers, depth);
+    if cleanup.kind == "throw" { return cleanup; }
+    return _normal(value);
+}
+
+fn _frame(state, closure, args, depth) {
+    if depth > state.limits.max_frames { _fault("frame limit exceeded"); }
+    let function = closure.function;
+    let chunk = function.chunk;
+    let constants = chunk.constants;
+    let stack = _normalized_stack(state, function, args);
+    let upvalues = closure.upvalues;
+    let handlers = [];
+    let defers = [];
+    let ip = 0;
+    let instruction_count = _instruction_count(chunk);
+    while ip < instruction_count {
+        _tick(state, stack);
+        let ins = _instruction_at(chunk, ip);
+        let op = ins.op;
+        ip = ip + 1;
+
+        if op == 0 { _push(state, stack, constants[ins.operand]); }
+        elif op >= 1 and op <= 10 { _binary(state, stack, op); }
+        elif op == 11 { _pop(stack); }
+        elif op == 12 {
+            if len(state.output) >= state.limits.max_output { _fault("output limit exceeded"); }
+            array_push(state.output, _pop(stack));
+        }
+        elif op == 13 { state.globals[constants[ins.operand]] = _pop(stack); }
+        elif op == 14 {
+            let name = constants[ins.operand];
+            if map_has(state.globals, name) { _push(state, stack, state.globals[name]); }
+            elif map_has(state.adapters, name) or _builtin_adapter(name) {
+                _push(state, stack, map{ __pbck_adapter: name });
+            }
+            else { _push(state, stack, nil); }
+        }
+        elif op == 15 { state.globals[constants[ins.operand]] = _pop(stack); }
+        elif op == 16 {
+            let obj = _pop(stack); let name = constants[ins.operand];
+            if is_map(obj) and map_has(obj, name) { _push(state, stack, obj[name]); }
+            else { _fault("attribute not found"); }
+        }
+        elif op == 17 {
+            let value = _pop(stack); let obj = _pop(stack);
+            if not is_map(obj) { _fault("attribute target must be a map"); }
+            obj[constants[ins.operand]] = value; _push(state, stack, value);
+        }
+        elif op == 18 {
+            let name = constants[ins.operand];
+            if not is_string(name) { _fault("export name must be a string"); }
+            if not map_has(state.globals, name) { _fault("cannot export undefined global: " + name); }
+            state.exports[name] = state.globals[name];
+        }
+        elif op == 19 {
+            if ins.operand > state.limits.max_collection_items or ins.operand > len(stack) {
+                _fault("array allocation limit exceeded");
+            }
+            let array = []; let n = ins.operand; let i = 0;
+            while i < n { array_push(array, nil); i = i + 1; }
+            i = n - 1; while i >= 0 { array[i] = _pop(stack); i = i - 1; }
+            _push(state, stack, array);
+        }
+        elif op == 20 {
+            if ins.operand > state.limits.max_collection_items or ins.operand * 2 > len(stack) {
+                _fault("map allocation limit exceeded");
+            }
+            let pairs = []; let n = ins.operand; let i = 0;
+            while i < n * 2 { array_push(pairs, nil); i = i + 1; }
+            i = n * 2 - 1; while i >= 0 { pairs[i] = _pop(stack); i = i - 1; }
+            let value = map{}; i = 0;
+            while i < len(pairs) {
+                if not is_string(pairs[i]) { _fault("map key must be a string"); }
+                value[pairs[i]] = pairs[i + 1]; i = i + 2;
+            }
+            _push(state, stack, value);
+        }
+        elif op == 21 { let index = _pop(stack); let obj = _pop(stack); _push(state, stack, _index_get(obj, index, false)); }
+        elif op == 22 {
+            let value = _pop(stack); let index = _pop(stack); let obj = _pop(stack);
+            if is_array(obj) {
+                if not is_number(index) or index != num_floor(index) or index < 0 or index >= len(obj) { _fault("array index out of bounds"); }
+                obj[index] = value;
+            } elif is_map(obj) {
+                if not is_string(index) { _fault("map key must be a string"); }
+                obj[index] = value;
+            } else { _fault("value is not indexable"); }
+            _push(state, stack, value);
+        }
+        elif op == 23 {
+            if len(handlers) >= state.limits.max_frames { _fault("handler limit exceeded"); }
+            array_push(handlers, map{ target: ins.operand, stack_size: len(stack) });
+        }
+        elif op == 24 { if len(handlers) == 0 { _fault("handler stack underflow"); } array_pop(handlers); }
+        elif op == 25 {
+            _ensure_local(state, stack, ins.operand);
+            _push(state, stack, stack[ins.operand].value);
+        }
+        elif op == 26 {
+            let value = _pop(stack);
+            if ins.operand < 0 or ins.operand > len(stack)
+                or ins.operand >= state.limits.max_locals {
+                _fault("local slot out of bounds");
+            }
+            if ins.operand == len(stack) { array_push(stack, _cell(value)); }
+            else { stack[ins.operand].value = value; }
+        }
+        elif op == 27 {
+            let captured = []; let i = 0;
+            while i < len(ins.captures) {
+                let descriptor = ins.captures[i];
+                if descriptor.is_local {
+                    _ensure_local(state, stack, descriptor.index);
+                    array_push(captured, stack[descriptor.index]);
+                } else {
+                    if descriptor.index >= len(upvalues) { _fault("upvalue capture out of range"); }
+                    array_push(captured, upvalues[descriptor.index]);
+                }
+                i = i + 1;
+            }
+            _push(state, stack, map{
+                __pbck_closure: true, function: constants[ins.fn_const],
+                upvalues: captured, globals: state.globals
+            });
+        }
+        elif op == 28 {
+            if ins.operand >= len(upvalues) { _fault("upvalue slot out of range"); }
+            _push(state, stack, upvalues[ins.operand].value);
+        }
+        elif op == 29 {
+            if ins.operand >= len(upvalues) { _fault("upvalue slot out of range"); }
+            upvalues[ins.operand].value = _pop(stack);
+        }
+        elif op == 30 { _pop(stack); }
+        elif op == 31 or op == 32 {
+            let argc = ins.operand;
+            if argc + 1 > len(stack) { _fault("call stack underflow"); }
+            let call_args = []; let i = 0;
+            while i < argc { array_push(call_args, nil); i = i + 1; }
+            i = argc - 1; while i >= 0 { call_args[i] = _pop(stack); i = i - 1; }
+            let callee = _pop(stack);
+            if op == 32 and len(defers) == 0 { return _tail(callee, call_args); }
+            let call_result = _call_value(state, callee, call_args, depth);
+            if call_result.kind == "throw" {
+                let routed = _raise_in_frame(handlers, stack, call_result.value);
+                if routed.kind == "throw" { return routed; }
+                ip = routed.target;
+            } else { _push(state, stack, call_result.value); }
+        }
+        elif op == 33 { return _finish_frame(state, defers, _pop(stack), depth); }
+        elif op == 34 { array_push(defers, _pop(stack)); }
+        elif op == 35 { ip = ins.operand; }
+        elif op == 36 { if not _truthy(_peek(stack)) { ip = ins.operand; } }
+        elif op == 37 { if _truthy(_peek(stack)) { ip = ins.operand; } }
+        elif op == 38 { _push(state, stack, not _truthy(_pop(stack))); }
+        elif op == 39 { _push(state, stack, 0 - _pop(stack)); }
+        elif op == 40 or op == 41 { _binary(state, stack, op); }
+        elif op == 42 {
+            let obj = _pop(stack); let name = constants[ins.operand];
+            if not is_string(name) { _fault("safe attribute name must be a string"); }
+            if obj == nil { _push(state, stack, nil); }
+            elif not is_map(obj) { _fault("safe attribute target must be a map or nil"); }
+            elif map_has(obj, name) { _push(state, stack, obj[name]); }
+            else { _push(state, stack, nil); }
+        }
+        elif op == 43 {
+            let index = _pop(stack); let obj = _pop(stack);
+            _push(state, stack, _safe_index(obj, index));
+        }
+        elif op == 44 {
+            let wrapped = _pop(stack);
+            let failed = wrapped == nil;
+            let failure = "? operator: cannot unwrap nil (use if/else or unwrap_or)";
+            if is_map(wrapped) and map_has(wrapped, "ok") and is_bool(wrapped.ok) {
+                if wrapped.ok {
+                    if map_has(wrapped, "value") { _push(state, stack, wrapped.value); }
+                    else { _push(state, stack, nil); }
+                } else {
+                    failed = true;
+                    failure = "error (from ? operator)";
+                    if map_has(wrapped, "error") and is_string(wrapped.error) { failure = wrapped.error; }
+                }
+            } elif not failed { _push(state, stack, wrapped); }
+            if failed {
+                let routed = _raise_in_frame(handlers, stack, failure);
+                if routed.kind == "throw" { return routed; }
+                ip = routed.target;
+            }
+        }
+        elif op == 45 { _push(state, stack, _pop(stack) == nil); }
+        elif op == 46 { _push(state, stack, _peek(stack)); }
+        elif op == 47 {
+            let routed = _raise_in_frame(handlers, stack, _pop(stack));
+            if routed.kind == "throw" { return routed; }
+            ip = routed.target;
+        }
+        else { _fault("unsupported opcode " + str(op)); }
+    }
+    return _finish_frame(state, defers, nil, depth);
+}
+
+fn _invoke(state, initial_closure, initial_args, depth) {
+    if depth > state.limits.max_frames { _fault("frame limit exceeded"); }
+    state.frames = state.frames + 1;
+    if state.frames > state.peak_frames { state.peak_frames = state.frames; }
+    let closure = initial_closure;
+    let args = initial_args;
+    let result = _normal(nil);
+    while true {
+        result = _frame(state, closure, args, depth);
+        if result.kind != "tail" { state.frames = state.frames - 1; return result; }
+        state.tail_calls = state.tail_calls + 1;
+        let next = result.callee;
+        if is_map(next) and map_has(next, "__pbck_closure") { closure = next; }
+        elif is_map(next) and map_has(next, "__pbck_function") {
+            closure = map{ __pbck_closure: true, function: next, upvalues: [], globals: state.globals };
+        } else {
+            let fallback = _call_value(state, next, result.args, depth);
+            state.frames = state.frames - 1;
+            return fallback;
+        }
+        args = result.args;
+    }
+}
+
+fn run_decoded(decoded, options = nil, globals = nil) {
+    if not is_map(decoded) or not map_has(decoded, "chunk") { _fault("decoded artifact required"); }
+    let seeded = map{};
+    if globals != nil {
+        if not is_map(globals) { _fault("globals must be a map"); }
+        seeded = globals;
+    }
+    let state = _state(options, seeded);
+    let root_function = map{
+        __pbck_function: true, name: "<root>", arity: 0, min_arity: 0,
+        defaults: [], is_vararg: false, parameter_types_present: false,
+        parameter_types: [], chunk: decoded.chunk
+    };
+    let root = map{ __pbck_closure: true, function: root_function, upvalues: [], globals: seeded };
+    let result = _invoke(state, root, [], 0);
+    if result.kind == "throw" { _fault("uncaught guest exception: " + str(result.value)); }
+    return map{
+        value: result.value, output: state.output, globals: state.globals,
+        exports: state.exports, runtime: map{
+            steps: state.steps, peak_frames: state.peak_frames,
+            peak_stack: state.peak_stack, peak_locals: state.peak_locals,
+            tail_calls: state.tail_calls, host_calls: state.host_calls
+        }
+    };
+}
+
+fn run_bytes(bytes, options = nil, globals = nil) {
+    return run_decoded(Decode.decode_bytes(bytes), options, globals);
+}
+
+fn run_file(path, options = nil, globals = nil) {
+    return run_decoded(Decode.decode_file(path), options, globals);
+}
+
+export SUPPORTED_OPCODES, BUILTIN_ADAPTERS, runtime_limits;
+export run_decoded, run_bytes, run_file;

@@ -92,6 +92,8 @@ Pure-pblang interpreter microbenchmarks can also be run independently:
 
 ```sh
 ./bench/pipeline_bench.sh
+target/release/pblang run bench/host_pbck_frame_scalar_stages.sapp
+target/release/pblang run bench/host_pbck_frame_vm_stages.sapp
 target/release/pblang run bench/selfhost_vm_stages.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/selfhost_vm_builtin_dispatch.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/selfhost_vm_direct_builtin_stages.sapp --allow-all

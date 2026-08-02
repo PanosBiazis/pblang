@@ -1,0 +1,110 @@
+// Refresh reproducible PBLang-native bootstrap artifacts after parity gates pass.
+
+let Compiler = import("stdlib/compiler/selfhost_cli.sapp");
+let Loader = import("stdlib/selfhost_loader.sapp");
+let Native = import("stdlib/native/codegen_x64.sapp");
+
+let OUTPUT = "dist/bootstrap";
+let SELFHOST = OUTPUT + "/pblang-selfhost-compiler.pbck";
+let MODULE_OUTPUT = OUTPUT + "/compiler";
+let NATIVE_PROBE = OUTPUT + "/pblang-codegen-x86_64-check";
+let MANIFEST = OUTPUT + "/manifest.json";
+
+fn fail(stage, message) {
+    throw "pbbootstrap_refresh[" + stage + "]: " + str(message);
+}
+
+fs_mkdirs(OUTPUT);
+fs_mkdirs(MODULE_OUTPUT);
+
+// Snapshot every PBLang compiler module independently. Keeping module namespace
+// boundaries is required: compiler backends intentionally share opcode names,
+// so flattening them into one global namespace would be unsound.
+let compiler_files = array_sort(fs_listdir("stdlib/compiler"));
+let snapshots = [];
+let fi = 0;
+while fi < len(compiler_files) {
+    let name = compiler_files[fi];
+    if str_ends_with(name, ".sapp") {
+        let source = "stdlib/compiler/" + name;
+        let output = MODULE_OUTPUT + "/" + name + ".pbck";
+        let compiled = Compiler.compile_file(source, output);
+        if not compiled.ok {
+            fail("module-" + name, compiled.stage + ": " + compiled.error
+                + " diagnostics=" + str(try compiled.diagnostics catch []));
+        }
+        let module_info = Loader.inspect_pbck(output);
+        if not module_info.ok { fail("module-verify-" + name, module_info.error); }
+        array_push(snapshots, map{
+            source: source, path: output, bytes: compiled.byte_count,
+            digest: compiled.digest, instructions: module_info.instructions,
+            constants: module_info.constants, functions: module_info.functions
+        });
+    }
+    fi = fi + 1;
+}
+
+let selfhost_result = Compiler.compile_file("tools/pbselfc.sapp", SELFHOST);
+if not selfhost_result.ok {
+    fail("selfhost", selfhost_result.stage + ": " + selfhost_result.error
+        + " diagnostics=" + str(try selfhost_result.diagnostics catch []));
+}
+let inspected = Loader.inspect_pbck(SELFHOST);
+if not inspected.ok { fail("selfhost-verify", inspected.error); }
+
+// compile_fns executes top-level statements as the ELF entrypoint. A named
+// function is emitted but not called implicitly, so the verification return
+// must be top-level.
+let probe_source = "return 42;";
+let native_bytes = try Native.compile_fns(probe_source) catch nil;
+if not is_array(native_bytes) or len(native_bytes) < 120 {
+    fail("x86-64-codegen", "native backend did not produce a bounded ELF");
+}
+let native_tmp = NATIVE_PROBE + ".tmp";
+try fs_remove(native_tmp) catch nil;
+if not (try { fs_write_bytes(native_tmp, native_bytes); true } catch false) {
+    fail("x86-64-write", "cannot stage native probe");
+}
+let chmod = proc_spawn_wait("/usr/bin/chmod", ["0755", native_tmp]);
+if (try chmod.exit_code catch 1) != 0 {
+    try fs_remove(native_tmp) catch nil;
+    fail("x86-64-permission", "cannot mark native probe executable");
+}
+let executed = proc_spawn_wait(native_tmp, []);
+if (try executed.exit_code catch -1) != 42 {
+    try fs_remove(native_tmp) catch nil;
+    fail("x86-64-execute", "native probe did not return 42");
+}
+if not (try { fs_rename(native_tmp, NATIVE_PROBE); true } catch false) {
+    try fs_remove(native_tmp) catch nil;
+    fail("x86-64-publish", "atomic rename failed");
+}
+
+let selfhost_bytes = fs_read_bytes(SELFHOST);
+let manifest = map{
+    format: "pblang.bootstrap.refresh.v1",
+    generated_by: "PBLang self-host toolchain",
+    host_runtime_boundary:
+        "The current host executable remains the bootstrap VM; full CLI native x86-64 parity is not yet available.",
+    selfhost_compiler: map{
+        path: SELFHOST, bytes: len(selfhost_bytes),
+        digest: sha256(base64_encode_bytes(selfhost_bytes)),
+        module_snapshots: len(snapshots),
+        instructions: inspected.instructions,
+        constants: inspected.constants,
+        functions: inspected.functions
+    },
+    compiler_modules: snapshots,
+    codegen_x86_64: map{
+        path: NATIVE_PROBE, bytes: len(native_bytes),
+        digest: sha256(base64_encode_bytes(native_bytes)),
+        executed: true, exit_code: 42
+    }
+};
+let manifest_tmp = MANIFEST + ".tmp";
+fs_write(manifest_tmp, json_stringify(manifest));
+if not (try { fs_rename(manifest_tmp, MANIFEST); true } catch false) {
+    try fs_remove(manifest_tmp) catch nil;
+    fail("manifest-publish", "atomic rename failed");
+}
+print json_stringify(manifest);
