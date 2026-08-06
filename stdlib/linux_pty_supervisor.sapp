@@ -12,9 +12,10 @@ let X = import("stdlib:codegen_x64.sapp");
 let LOAD_BASE = 0x400000;
 let ELF_HEADER_BYTES = 120;
 let MAX_PATH_BYTES = 4096;
-let MAX_SECONDS = 3600;
-let MAX_OUTPUT_BYTES = 1048576;
+let MAX_SECONDS = 10800;
+let MAX_OUTPUT_BYTES = 67108864;
 let MAX_WRITE_BYTES = 4096;
+let MAX_PROCESS_GROUP_ID = 4194304;
 
 fn _append(dst, src) {
     let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; }
@@ -34,6 +35,23 @@ fn _cstring(value, label) {
         throw "linux_pty_supervisor: invalid " + label;
     }
     return _cstring_any(value, label);
+}
+
+fn _command(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) >= MAX_PATH_BYTES
+        or not str_starts_with(value, "/") or str_trim(value) != value {
+        throw "linux_pty_supervisor: invalid command";
+    }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        let safe = (c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+            or (c >= 97 and c <= 122) or c == 32 or c == 45 or c == 46
+            or c == 47 or c == 58 or c == 95;
+        if not safe { throw "linux_pty_supervisor: unsafe command character"; }
+        i = i + 1;
+    }
+    return _cstring_any(value, "command");
 }
 
 fn _positive_integer(value, label, maximum) {
@@ -106,10 +124,15 @@ fn _code(layout) {
     _append(code, X.mov_imm32("rsi", 0)); _append(code, X.syscall()); _check_nonnegative(code, errors);
     _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xDF]); _append(code, X.syscall());
 
-    // Keep utility diagnostics out of the protocol transcript.
+    // PTY mode keeps utility diagnostics out of the transcript. Bounded command
+    // mode instead captures stdout/stderr in a private O_NOFOLLOW file without
+    // allocating a terminal or creating a foreground job-control process group.
     _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
-    _append(code, X.movabs_imm64("rsi", layout.devnull));
-    _append(code, X.mov_imm32("rdx", 655361)); _append(code, [0x45, 0x31, 0xD2]);
+    _append(code, X.movabs_imm64("rsi",
+        if layout.command_mode { layout.output } else { layout.devnull }));
+    _append(code, X.mov_imm32("rdx", if layout.command_mode { 131649 } else { 655361 }));
+    if layout.command_mode { _append(code, [0x41, 0xBA]); _append(code, X.le32(384)); }
+    else { _append(code, [0x45, 0x31, 0xD2]); }
     _append(code, X.syscall()); _check_nonnegative(code, errors);
     _append(code, [0x48, 0x89, 0xC3]);
     let fd = 1;
@@ -188,6 +211,10 @@ fn build(options) {
     let status = _cstring(try options.status_file catch nil, "status path");
     let output = _cstring(try options.output catch nil, "output path");
     let shell = _cstring(try options.shell catch "/bin/sh", "shell path");
+    let command_mode = map_has(options, "command");
+    let command = if command_mode {
+        _command(options.command)
+    } else { shell };
     let script = _cstring(try options.script catch "/usr/bin/script", "script path");
     let timeout = _cstring(try options.timeout catch "/usr/bin/timeout", "timeout path");
     let seconds = _positive_integer(try options.max_seconds catch 60, "max_seconds", MAX_SECONDS);
@@ -200,9 +227,11 @@ fn build(options) {
         _cstring_any("timeout", "argv0"), _cstring_any("--foreground", "timeout option"),
         _cstring_any("--signal=TERM", "timeout option"), _cstring_any("--kill-after=1s", "timeout option"),
         duration, script, _cstring_any("-q", "script option"), _cstring_any("-f", "script option"),
-        _cstring_any("-e", "script option"), _cstring_any("-c", "script option"), shell, output];
+        _cstring_any("-e", "script option"), _cstring_any("-c", "script option"), command, output,
+        _cstring("/bin/sh", "command shell"), _cstring_any("-c", "command shell option")];
     let probe = map{ fifo: 0, pid: 0, status: 0, pid_stage: 0, status_stage: 0,
-        devnull: 0, timeout: 0, argv: 0, max_output: max_output };
+        devnull: 0, output: 0, timeout: 0, argv: 0,
+        max_output: max_output, command_mode: command_mode };
     let code_len = len(_code(probe));
     let cursor = LOAD_BASE + ELF_HEADER_BYTES + code_len; let addresses = [];
     let i = 0;
@@ -210,12 +239,15 @@ fn build(options) {
     let argv_address = cursor;
     let layout = map{ fifo: addresses[0], pid: addresses[1], status: addresses[2],
         pid_stage: addresses[3], status_stage: addresses[4], devnull: addresses[5],
-        timeout: addresses[6], argv: argv_address, max_output: max_output };
+        output: addresses[18], timeout: addresses[6], argv: argv_address,
+        max_output: max_output, command_mode: command_mode };
     let code = _code(layout); let data = [];
     i = 0; while i < len(raw) { _append(data, raw[i]); i = i + 1; }
     // timeout argv: options, duration, script command, script options, shell,
     // transcript, null terminator.
-    let argv_indices = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+    let argv_indices = if command_mode {
+        [7, 8, 9, 10, 11, 19, 20, 17]
+    } else { [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] };
     i = 0; while i < len(argv_indices) { _append(data, X.le64(addresses[argv_indices[i]])); i = i + 1; }
     _append(data, X.le64(0));
     return X.elf64_exec_rx(code, data);
@@ -264,4 +296,41 @@ fn build_writer(fifo_path, payload) {
     return X.elf64_exec_rx(code, data);
 }
 
-export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MAX_WRITE_BYTES, build, build_writer;
+fn _signal_number(name) {
+    if name == "STOP" { return 19; }
+    if name == "CONT" { return 18; }
+    if name == "TERM" { return 15; }
+    if name == "KILL" { return 9; }
+    throw "linux_pty_supervisor: unsupported process-group signal";
+}
+
+// Emit a tiny static ELF that signals exactly one validated process group.
+// A negative kill(2) pid targets the group without involving a shell, parsing
+// command text, or exposing a reusable arbitrary-PID signalling primitive.
+fn build_group_signal(process_group_id, signal_name) {
+    let pgid = _positive_integer(process_group_id, "process_group_id",
+        MAX_PROCESS_GROUP_ID);
+    if pgid <= 1 {
+        throw "linux_pty_supervisor: process_group_id must be greater than one";
+    }
+    let signal = _signal_number(signal_name);
+    let code = []; let errors = [];
+    _append(code, X.mov_imm32("rax", 62));
+    _append(code, X.mov_imm32("rdi", 0 - pgid));
+    _append(code, X.mov_imm32("rsi", signal));
+    _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 60));
+    _append(code, X.mov_imm32("rdi", 0));
+    _append(code, X.syscall());
+    let failed = len(code);
+    _append(code, X.mov_imm32("rax", 60));
+    _append(code, X.mov_imm32("rdi", 1));
+    _append(code, X.syscall());
+    let i = 0;
+    while i < len(errors) { _set_rel32(code, errors[i], failed); i = i + 1; }
+    return X.elf64_exec_rx(code, []);
+}
+
+export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MAX_WRITE_BYTES,
+    MAX_PROCESS_GROUP_ID, build, build_writer, build_group_signal;

@@ -78,16 +78,23 @@ the status can be upgraded to run-verified. Native uinput text intentionally
 rejects non-ASCII input because evdev keycodes do not encode Unicode or a keyboard
 layout.
 
-`stdlib:x11_input.sapp` replaces `xdotool` for key, click, relative-pointer and
-text events through
-trusted absolute-path `libX11`/`libXtst` system APIs. It does not dynamically
-search attacker-controlled library paths. Text injection handles common ASCII
-modifiers directly and maps other Unicode scalars to standard X11 `Uxxxx`
-keysyms. A Unicode scalar succeeds only if the current server keymap has a
-keycode for it; the adapter never mutates the user's keyboard layout. Absolute
-pointer movement still uses a reviewed external fallback because the current
-bounded typed FFI supports at most four arguments while
-`XTestFakeMotionEvent` requires five.
+`stdlib:x11_input.sapp` replaces `xdotool` for key, click, relative/absolute
+pointer and text events through trusted absolute-path `libX11`/`libXtst` system
+APIs. It does not dynamically search attacker-controlled library paths. For a
+text event, PBLang discovers only already-empty X11 keycodes, maps bounded
+batches to numeric Unicode keysyms through trusted `xmodmap` argv, injects them
+with XTest, synchronizes the server, and restores every keycode to empty before
+returning success. This preserves Latin upper/lower case, punctuation and
+non-Latin scalars independently of the active keyboard layout. Mapping or
+restoration failure is fail-closed. Tab and Return remain semantic keys. Raw
+Linux uinput still rejects non-ASCII because evdev carries physical keys rather
+than text; Wayland and additional OS semantic-text adapters require their own
+implementations. Temporary mapping windows are serialized across cooperating
+PBLang processes by a bounded nonblocking Linux `flock` on a mode-0600 per-user
+file. The kernel releases the lock if a process crashes, and every normal path
+unlocks and closes it. X11 mappings remain server-global, so an unrelated client
+that changes the keymap without using this lock can still race; this is not
+presented as per-client X11 isolation.
 
 `stdlib:input_daemon.sapp` adds a persistent, bounded loopback service contract
 with HMAC-SHA256 authentication, constant-time tag checks, strictly increasing
@@ -103,11 +110,11 @@ daemon and a blocking process API would wait forever. The module classifies such
 services as daemons and fails closed until the runtime exposes a pre-emptive
 process timeout and kill handle.
 
-Live input was verified only inside a disposable Xephyr server, never on the
-active desktop. The pointer moved from `(320,240)` to `(357,269)`, and independent
-`xev` output recorded 11 key presses for `PBLang!`, including Shift state. The
-default Xephyr keymap had no Greek alpha keycode, and the backend correctly
-reported that Unicode request as unavailable. Semantic tests additionally cover
+Live input was verified only inside disposable Xephyr servers, never on the
+active desktop. Independent `xev` output observed exact keysyms for Latin
+uppercase, punctuation, Greek upper/lower case, emoji and a mathematical
+symbol. A focused isolated `zenity` field returned `AΑα😀≤` byte-for-byte, and
+all 19 initially empty keycodes remained empty after actuation. Semantic tests additionally cover
 ABI bytes, ARM64 execution, capability rejection, ELF permissions, authenticated
 daemon tamper/replay/quota behavior, planner behavior, and approval gates.
 

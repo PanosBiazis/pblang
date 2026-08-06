@@ -42,6 +42,25 @@ fn _tool_path(name) {
 fn _has_tool(name) {
     return _tool_path(name) != nil;
 }
+fn _backend_request(requested = nil) {
+    let raw = requested;
+    if raw == nil { raw = try env_get("PB_INPUT_BACKEND") catch "auto"; }
+    if raw == nil or raw == "" { raw = "auto"; }
+    if type(raw) != "string" { return map{ ok: false, error: "input backend must be a string" }; }
+    let name = str_lower(str_trim(raw));
+    if name == "" { name = "auto"; }
+    if name == "x11" or name == "pblang-x11" or name == "pblang-x11-xtest" {
+        return map{ ok: true, name: "pblang-x11-xtest", explicit: true };
+    }
+    if name == "uinput" or name == "pblang-uinput" {
+        return map{ ok: true, name: "pblang-uinput", explicit: true };
+    }
+    if name == "xdotool" or name == "ydotool" {
+        return map{ ok: true, name: name, explicit: true };
+    }
+    if name == "auto" { return map{ ok: true, name: "auto", explicit: false }; }
+    return map{ ok: false, error: "unsupported PB_INPUT_BACKEND: " + name };
+}
 fn _native_arch() {
     let b = try fs_read_bytes("/proc/self/exe") catch nil;
     if not is_array(b) or len(b) < 20 or b[0] != 0x7F or b[1] != 0x45 or b[2] != 0x4C or b[3] != 0x46 { return nil; }
@@ -66,25 +85,94 @@ fn _tool() {
     if _has_tool("xdotool") { return "xdotool"; }
     return nil;
 }
-fn backends() {
+fn select_backend(requested = nil) {
+    let choice = _backend_request(requested);
+    if not choice.ok { return choice; }
+    if choice.name == "auto" {
+        if _native_uinput_available() {
+            return map{ ok: true, selected: "pblang-uinput", explicit: false };
+        }
+        if x11input.available().ok {
+            return map{ ok: true, selected: "pblang-x11-xtest", explicit: false };
+        }
+        let fallback = _tool();
+        if fallback != nil { return map{ ok: true, selected: fallback, explicit: false }; }
+        return map{ ok: false, selected: nil, explicit: false,
+            error: "no trusted input backend is available" };
+    }
+    let available = false;
+    if choice.name == "pblang-uinput" { available = _native_uinput_available(); }
+    elif choice.name == "pblang-x11-xtest" { available = x11input.available().ok; }
+    elif choice.name == "xdotool" { available = _has_tool("xdotool"); }
+    elif choice.name == "ydotool" {
+        available = _has_tool("ydotool") and (try fs_exists("/tmp/.ydotool_socket") catch false);
+    }
+    if not available {
+        return map{ ok: false, selected: choice.name, explicit: true,
+            error: "requested input backend is unavailable: " + choice.name };
+    }
+    return map{ ok: true, selected: choice.name, explicit: true };
+}
+
+fn select_event_backend(event, requested = nil) {
+    let checked = events.validate(event);
+    if not checked.ok { return checked; }
+    let selection = select_backend(requested);
+    if not selection.ok { return selection; }
+    // Raw uinput text uses physical key codes and therefore cannot preserve
+    // characters across arbitrary active layouts. In automatic mode prefer
+    // the keysym-aware X11 path for all text, not only non-ASCII text.
+    if checked.event.kind == "type" and not selection.explicit
+        and selection.selected == "pblang-uinput" and x11input.available().ok {
+        selection.selected = "pblang-x11-xtest";
+        selection.reason = "keysym-aware text routing";
+        selection.layout_aware = true;
+    }
+    if checked.event.kind == "type" and selection.selected == "pblang-uinput" {
+        let i = 0;
+        while i < len(checked.event.text) {
+            if strcharcodeat(checked.event.text, i) >= 128 {
+                return map{ ok: false, selected: "pblang-uinput",
+                    explicit: selection.explicit,
+                    error: "native uinput cannot preserve non-ASCII text across keyboard layouts" };
+            }
+            i = i + 1;
+        }
+    }
+    return selection;
+}
+fn backends(requested = nil) {
     let socket = try fs_exists("/tmp/.ydotool_socket") catch false;
+    let selection = select_backend(requested);
     return map{ xdotool: _has_tool("xdotool"), ydotool: _has_tool("ydotool"),
                 ydotoold: _has_tool("ydotoold"), ydotool_socket: socket,
                 pblang_uinput: _native_uinput_available(),
                 pblang_uinput_arch: _native_arch(),
                 pblang_x11: x11input.available().ok,
+                pblang_x11_layout_independent_unicode:
+                    x11input.available().ok and x11input.capabilities().text_unicode_layout_independent,
+                pblang_x11_semantic_text_boundary: "X11/XTest+xmodmap+flock",
                 unicode_compose_enabled: _unicode_compose_enabled(),
-                selected: if _native_uinput_available() { "pblang-uinput" } else { _tool() },
-                available: _native_uinput_available() or _tool() != nil, enabled: _input_enabled(),
+                selected: try selection.selected catch nil,
+                selection_error: try selection.error catch nil,
+                explicit_selection: try selection.explicit catch false,
+                available: selection.ok, enabled: _input_enabled(),
                 pblang_event_contract: true,
                 pblang_native_syscalls: true,
+                text_auto_prefers_keysym_backend: true,
                 trusted_system_paths: true,
                 pointer: map{ absolute_xdotool: true, absolute_ydotool: false, relative: true } };
 }
 
 // ── actuation backends (run inside an approved master-control execute) ────────
 fn _execute_event(event) {
-    if _native_uinput_available() and (event.kind == "key" or event.kind == "click" or event.kind == "pointer_delta" or event.kind == "pointer" or event.kind == "type") {
+    let selection = select_event_backend(event);
+    if not selection.ok {
+        return map{ available: false, tool: try selection.selected catch nil,
+            note: selection.error };
+    }
+    let selected = selection.selected;
+    if selected == "pblang-uinput" and (event.kind == "key" or event.kind == "click" or event.kind == "pointer_delta" or event.kind == "pointer" or event.kind == "type") {
         let artifact = uinput.build_event_for_arch(event, _native_arch());
         if not artifact.ok { return map{ available: false, tool: "pblang-uinput", note: artifact.error }; }
         let token = str_slice(sha256(base64_encode_bytes(random_bytes(16))), 0, 24);
@@ -99,12 +187,23 @@ fn _execute_event(event) {
         }
         return map{ available: true, tool: "pblang-uinput", event: event.kind, native: true };
     }
-    if x11input.available().ok and (event.kind == "key" or event.kind == "click" or event.kind == "pointer_delta" or event.kind == "type") {
+    if selected == "pblang-x11-xtest" and (event.kind == "key" or event.kind == "click" or event.kind == "pointer" or event.kind == "pointer_delta" or event.kind == "type") {
         let native_x11 = x11input.execute(event, map{ unicode_compose: _unicode_compose_enabled() });
-        if native_x11.ok { return map{ available: true, tool: native_x11.backend, event: event.kind, native: true }; }
+        if native_x11.ok { return map{ available: true, tool: native_x11.backend,
+            event: event.kind, native: true,
+            server_synchronized: try native_x11.server_synchronized catch false,
+            layout_independent_unicode:
+                try native_x11.layout_independent_unicode catch false,
+            semantic_unicode_scalars:
+                try native_x11.semantic_unicode_scalars catch 0,
+            keymap_restored: try native_x11.keymap_restored catch false }; }
+        return map{ available: false, tool: selected, note: native_x11.error };
     }
-    let t = _tool();
-    if t == nil { return map{ available: false, note: "no input tool (xdotool/ydotool)" }; }
+    let t = selected;
+    if t != "xdotool" and t != "ydotool" {
+        return map{ available: false, tool: t,
+            note: "selected backend does not support this input event" };
+    }
     let plan = events.backend_plan(t, event);
     if not plan.ok { return map{ available: false, tool: t, note: plan.error }; }
     let executable = _tool_path(plan.command);
@@ -218,5 +317,5 @@ fn run(id, nonce) {
     return r;
 }
 
-export backends, type_text, key, mouse_move, mouse_move_relative, click, safe_keys,
+export backends, select_backend, select_event_backend, type_text, key, mouse_move, mouse_move_relative, click, safe_keys,
        execute_approved, run;
