@@ -4,6 +4,7 @@
 
 let Events = import("stdlib:input_events.sapp");
 let Unicode = import("stdlib:unicode.sapp");
+let Tools = import("stdlib:tool_probe.sapp");
 
 let X11_PATHS = [
     "/usr/lib/x86_64-linux-gnu/libX11.so.6", "/usr/lib64/libX11.so.6",
@@ -13,6 +14,13 @@ let XTST_PATHS = [
     "/usr/lib/x86_64-linux-gnu/libXtst.so.6", "/usr/lib64/libXtst.so.6",
     "/usr/lib/aarch64-linux-gnu/libXtst.so.6", "/usr/lib/libXtst.so.6"
 ];
+let LIBC_PATHS = [
+    "/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "/lib/aarch64-linux-gnu/libc.so.6", "/usr/lib/aarch64-linux-gnu/libc.so.6",
+    "/lib64/libc.so.6", "/lib/libc.so.6"
+];
+let LOCK_ATTEMPTS = 100;
+let LOCK_RETRY_MS = 10;
 
 fn _first_existing(paths) {
     let i = 0; while i < len(paths) { if try fs_exists(paths[i]) catch false { return paths[i]; } i = i + 1; }
@@ -28,6 +36,18 @@ fn _padded_hex(cp) {
     let value = Unicode.hex_codepoint(cp);
     while len(value) < 4 { value = "0" + value; }
     return value;
+}
+
+fn _keysym_literal(cp) {
+    // X11 preserves Latin-1 keysyms directly. Other Unicode scalars use the
+    // protocol's 0x01000000 prefix. Numeric expressions avoid xmodmap's
+    // case-insensitive symbolic-name folding (for example U0050 -> p).
+    if cp >= 0x20 and cp <= 0xFF { return "0x" + Unicode.hex_codepoint(cp); }
+    return "0x" + Unicode.hex_codepoint(0x01000000 + cp);
+}
+
+fn _mapping_needs_shift(cp) {
+    return Unicode.classify_character(strfromcharcode(cp)) == "uppercase";
 }
 
 // Convert one Unicode scalar to an X11 keysym plus the modifier needed for
@@ -101,6 +121,170 @@ fn _keycode(x11, display, name) {
     return try ffi_call_typed(x11, "XKeysymToKeycode", "ptr,i64->i64", [display, sym]) catch 0;
 }
 
+fn _exit_code(result) {
+    if result == nil { return 1; }
+    return try result.exit_code catch 1;
+}
+
+fn _xmodmap_path() { return Tools.trusted_path("xmodmap"); }
+
+fn _i32(value) {
+    if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; }
+    return value;
+}
+
+fn _libc_call(libc, symbol, signature, args) {
+    return try ffi_call_typed(libc, symbol, signature, args) catch -1;
+}
+
+fn _mapping_lock_acquire() {
+    let libc_path = _first_existing(LIBC_PATHS);
+    if libc_path == nil { return map{ ok: false, error: "trusted libc is unavailable" }; }
+    let libc = try ffi_load(libc_path) catch nil;
+    if libc == nil { return map{ ok: false, error: "cannot load trusted libc" }; }
+    let uid = _i32(_libc_call(libc, "getuid", "->i32", []));
+    if uid < 0 { ffi_close(libc); return map{ ok: false, error: "cannot resolve local uid" }; }
+    let private_root = "/run/user/" + str(uid);
+    let path = if try fs_exists(private_root) catch false {
+        private_root + "/pblang-x11-input.lock"
+    } else { "/tmp/pblang-x11-input-" + str(uid) + ".lock" };
+    let path_ptr = _libc_call(libc, "strdup", "string->ptr", [path]);
+    if path_ptr == nil or path_ptr == 0 {
+        ffi_close(libc); return map{ ok: false, error: "cannot allocate X11 mapping lock path" };
+    }
+    // Linux openat(AT_FDCWD, path, O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW, 0600).
+    // The fixed four-argument API avoids the variadic open ABI at the FFI edge.
+    let fd = _i32(_libc_call(libc, "openat", "i32,ptr,i32,i32->i32",
+        [-100, path_ptr, 655426, 384]));
+    _libc_call(libc, "free", "ptr->void", [path_ptr]);
+    if fd < 0 { ffi_close(libc); return map{ ok: false, error: "cannot open secure X11 mapping lock" }; }
+    let protected = _i32(_libc_call(libc, "fchmod", "i32,i32->i32", [fd, 384]));
+    if protected != 0 {
+        _i32(_libc_call(libc, "close", "i32->i32", [fd]));
+        ffi_close(libc); return map{ ok: false, error: "cannot protect X11 mapping lock permissions" };
+    }
+    let attempt = 0;
+    while attempt < LOCK_ATTEMPTS {
+        // LOCK_EX|LOCK_NB keeps contention bounded; close releases the lock on
+        // every normal or exceptional path and the kernel releases it on crash.
+        let locked = _i32(_libc_call(libc, "flock", "i32,i32->i32", [fd, 6]));
+        if locked == 0 {
+            return map{ ok: true, libc: libc, fd: fd, path: path,
+                bounded_wait_ms: LOCK_ATTEMPTS * LOCK_RETRY_MS };
+        }
+        sleep_ms(LOCK_RETRY_MS); attempt = attempt + 1;
+    }
+    _i32(_libc_call(libc, "close", "i32->i32", [fd]));
+    ffi_close(libc);
+    return map{ ok: false, error: "X11 mapping lock remained busy", timeout: true };
+}
+
+fn _mapping_lock_release(lock) {
+    if type(lock) != "map" or not (try lock.ok catch false) { return false; }
+    let unlocked = _i32(_libc_call(lock.libc, "flock", "i32,i32->i32", [lock.fd, 8]));
+    let closed = _i32(_libc_call(lock.libc, "close", "i32->i32", [lock.fd]));
+    ffi_close(lock.libc);
+    return unlocked == 0 and closed == 0;
+}
+
+// Locate a keycode that has no assigned keysyms. Reusing a populated keycode
+// could alter a physical key or modifier, so semantic Unicode actuation refuses
+// to proceed unless the server exposes an actually empty slot.
+fn _empty_keycodes(xmodmap, display_name) {
+    let listed = try proc_spawn_wait(xmodmap, ["-display", display_name, "-pke"]) catch nil;
+    if _exit_code(listed) != 0 { return []; }
+    let out = [];
+    let lines = str_split(try listed.stdout catch "", "\n"); let i = 0;
+    while i < len(lines) {
+        let line = str_trim(lines[i]);
+        if str_starts_with(line, "keycode") and str_ends_with(line, "=") {
+            let equal = str_index_of(line, "=");
+            let raw = if equal > 7 { str_trim(str_slice(line, 7, equal)) } else { "" };
+            let code = try parse_number(raw) catch 0;
+            if code >= 8 and code <= 255 and num_floor(code) == code and len(out) < 32 {
+                array_push(out, code);
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _set_empty_mappings(xmodmap, display_name, codes, scalars, restore) {
+    if len(codes) == 0 or len(codes) != len(scalars) { return false; }
+    let args = ["-display", display_name]; let i = 0;
+    while i < len(codes) {
+        let expression = "keycode " + str(codes[i]) + " =";
+        if not restore { expression = expression + " " + _keysym_literal(scalars[i]); }
+        array_push(args, "-e"); array_push(args, expression); i = i + 1;
+    }
+    let changed = try proc_spawn_wait(xmodmap, args) catch nil;
+    return _exit_code(changed) == 0;
+}
+
+fn _semantic_batch(x11, xtst, display, display_name, xmodmap, codes, scalars) {
+    if not _set_empty_mappings(xmodmap, display_name, codes, scalars, false) {
+        // A valid generated expression should be atomic in practice, but still
+        // attempt cleanup in case the X11 tool applied a strict prefix.
+        _set_empty_mappings(xmodmap, display_name, codes, scalars, true);
+        return map{ ok: false, error: "temporary Unicode keymap batch assignment failed" };
+    }
+    try ffi_call_typed(x11, "XSync", "ptr,i64->i64", [display, 0]) catch nil;
+    let injected = true; let i = 0; let shift = _keycode(x11, display, "Shift_L");
+    while i < len(codes) and injected {
+        let shifted = _mapping_needs_shift(scalars[i]);
+        if shifted and shift == 0 { injected = false; }
+        if injected and shifted { injected = _fake_key(xtst, display, shift, 1); }
+        if injected { injected = _tap(xtst, display, codes[i]); }
+        if shifted {
+            let released = shift != 0 and _fake_key(xtst, display, shift, 0);
+            injected = injected and released;
+        }
+        i = i + 1;
+    }
+    try ffi_call_typed(x11, "XSync", "ptr,i64->i64", [display, 0]) catch nil;
+    let restored = _set_empty_mappings(xmodmap, display_name, codes, scalars, true);
+    try ffi_call_typed(x11, "XSync", "ptr,i64->i64", [display, 0]) catch nil;
+    if not restored { return map{ ok: false, error: "temporary Unicode keymap batch restoration failed", restoration_failed: true }; }
+    if not injected { return map{ ok: false, error: "XTest Unicode batch injection failed" }; }
+    return map{ ok: true, scalars: len(scalars), restored: true };
+}
+
+fn _semantic_text(x11, xtst, display, display_name, text) {
+    let xmodmap = _xmodmap_path();
+    if xmodmap == nil { return map{ ok: false, error: "trusted xmodmap is unavailable", unavailable: true }; }
+    let slots = _empty_keycodes(xmodmap, display_name);
+    if len(slots) == 0 { return map{ ok: false, error: "X11 keymap has no empty keycode for reversible Unicode mapping" }; }
+    let total = 0; let index = 0;
+    while index < len(text) {
+        let cp = strcharcodeat(text, index);
+        if cp == 9 or cp == 10 or cp == 13 {
+            let name = if cp == 9 { "Tab" } else { "Return" };
+            if not _tap(xtst, display, _keycode(x11, display, name)) {
+                return map{ ok: false, error: "XTest semantic control-key injection failed" };
+            }
+            index = index + 1;
+        } else {
+            let codes = []; let scalars = [];
+            while index < len(text) and len(codes) < len(slots) {
+                cp = strcharcodeat(text, index);
+                if cp == 9 or cp == 10 or cp == 13 { break; }
+                if not Unicode.is_valid_scalar(cp) or Unicode.is_control(cp) {
+                    return map{ ok: false, error: "semantic text contains an unsupported control character", index: index };
+                }
+                array_push(codes, slots[len(codes)]); array_push(scalars, cp);
+                index = index + 1;
+            }
+            let batch = _semantic_batch(x11, xtst, display, display_name,
+                xmodmap, codes, scalars);
+            if not batch.ok { return batch; }
+            total = total + batch.scalars;
+        }
+    }
+    return map{ ok: true, scalars: total, restored: true,
+        layout_independent: true, batches_bounded_by_empty_keycodes: true };
+}
+
 fn _fake_key(xtst, display, code, down) {
     return (try ffi_call_typed(xtst, "XTestFakeKeyEvent", "ptr,i64,i64,i64->i64", [display, code, down, 0]) catch 0) != 0;
 }
@@ -110,7 +294,8 @@ fn available() {
     let x11 = _first_existing(X11_PATHS); let xtst = _first_existing(XTST_PATHS);
     return map{
         ok: platform() == "linux" and type(display) == "string" and display != "" and x11 != nil and xtst != nil,
-        display: display, x11: x11, xtst: xtst, trusted_absolute_paths: true
+        display: display, x11: x11, xtst: xtst, trusted_absolute_paths: true,
+        semantic_unicode: _xmodmap_path() != nil
     };
 }
 
@@ -129,15 +314,35 @@ fn plan(event) {
         return map{ ok: true, backend: "pblang-x11-xtest", event: e,
                     calls: ["XOpenDisplay", "XTestFakeRelativeMotionEvent", "XFlush", "XCloseDisplay"] };
     }
+    if e.kind == "pointer" {
+        return map{ ok: true, backend: "pblang-x11-xtest", event: e,
+                    absolute_strategy: "bounded-relative-origin-anchor",
+                    calls: ["XOpenDisplay", "XTestFakeRelativeMotionEvent",
+                        "XTestFakeRelativeMotionEvent", "XFlush", "XSync", "XCloseDisplay"] };
+    }
     if e.kind == "type" {
         let text = text_plan(e.text); if not text.ok { return text; }
         return map{ ok: true, backend: "pblang-x11-xtest", event: e, text: text,
                     calls: ["XOpenDisplay", "XStringToKeysym", "XKeysymToKeycode", "XTestFakeKeyEvent", "XFlush", "XCloseDisplay"] };
     }
-    return map{ ok: false, error: "native X11 adapter supports key, click, relative pointer, and current-keymap text events" };
+    return map{ ok: false, error: "native X11 adapter supports key, click, absolute or relative pointer, and current-keymap text events" };
 }
 
 fn _tap(xtst, display, code) { return code != 0 and _fake_key(xtst, display, code, 1) and _fake_key(xtst, display, code, 0); }
+
+fn execution_options(options = nil) {
+    let semantic_unicode = true;
+    let unicode_compose = false;
+    if type(options) == "map" {
+        if map_has(options, "semantic_unicode") and type(options.semantic_unicode) == "bool" {
+            semantic_unicode = options.semantic_unicode;
+        }
+        if map_has(options, "unicode_compose") and type(options.unicode_compose) == "bool" {
+            unicode_compose = options.unicode_compose;
+        }
+    }
+    return map{ semantic_unicode: semantic_unicode, unicode_compose: unicode_compose };
+}
 
 fn _compose_scalar(x11, xtst, display, cp) {
     let control = _keycode(x11, display, "Control_L"); let shift = _keycode(x11, display, "Shift_L");
@@ -158,8 +363,10 @@ fn execute(event, options = nil) {
     if xtst == nil { ffi_close(x11); return map{ ok: false, error: "cannot load trusted libXtst" }; }
     let display = try ffi_call_typed(x11, "XOpenDisplay", "string->ptr", [host.display]) catch 0;
     if display == 0 { ffi_close(xtst); ffi_close(x11); return map{ ok: false, error: "XOpenDisplay failed" }; }
-    let ok = false; let e = p.event;
-    let allow_compose = try options.unicode_compose catch false;
+    let ok = false; let e = p.event; let semantic_scalars = 0; let failure = "";
+    let policy = execution_options(options);
+    let allow_compose = policy.unicode_compose;
+    let allow_semantic = policy.semantic_unicode;
     if e.kind == "key" {
         let code = _keycode(x11, display, _keysym_name(e.key));
         if code != 0 {
@@ -171,37 +378,87 @@ fn execute(event, options = nil) {
         ok = down != 0 and up != 0;
     } elif e.kind == "pointer_delta" {
         ok = (try ffi_call_typed(xtst, "XTestFakeRelativeMotionEvent", "ptr,i64,i64,i64->i64", [display, e.dx, e.dy, 0]) catch 0) != 0;
+    } elif e.kind == "pointer" {
+        // XTestFakeMotionEvent needs five native arguments, while the bounded
+        // bootstrap FFI intentionally permits four. Anchor at the X desktop's
+        // clipped origin, then apply the validated target coordinates. Both
+        // calls use the fully verified four-argument relative-motion ABI.
+        let anchored = try ffi_call_typed(xtst, "XTestFakeRelativeMotionEvent",
+            "ptr,i64,i64,i64->i64", [display, -2147480000, -2147480000, 0]) catch 0;
+        let positioned = 0;
+        if anchored != 0 {
+            positioned = try ffi_call_typed(xtst, "XTestFakeRelativeMotionEvent",
+                "ptr,i64,i64,i64->i64", [display, e.x, e.y, 0]) catch 0;
+        }
+        ok = anchored != 0 and positioned != 0;
     } elif e.kind == "type" {
-        ok = true;
-        let shift_code = _keycode(x11, display, "Shift_L"); let i = 0;
-        while i < len(p.text.strokes) and ok {
-            let stroke = p.text.strokes[i]; let code = _keycode(x11, display, stroke.keysym);
-            if code == 0 and allow_compose and strcharcodeat(e.text, i) >= 128 {
-                ok = _compose_scalar(x11, xtst, display, strcharcodeat(e.text, i));
-            } else if code == 0 or (stroke.shift and shift_code == 0) { ok = false; }
-            else {
-                if stroke.shift { ok = _fake_key(xtst, display, shift_code, 1); }
-                if ok { ok = _fake_key(xtst, display, code, 1) and _fake_key(xtst, display, code, 0); }
-                if stroke.shift {
-                    let released = _fake_key(xtst, display, shift_code, 0);
-                    ok = ok and released;
+        if allow_semantic and host.semantic_unicode {
+            // X11 mappings are server-global. A bounded kernel advisory lock
+            // serializes temporary mapping windows across PBRemote processes.
+            let mapping_lock = _mapping_lock_acquire();
+            let semantic = if mapping_lock.ok {
+                try _semantic_text(x11, xtst, display, host.display, e.text)
+                    catch map{ ok: false, error: "semantic Unicode mapping failed" }
+            } else { mapping_lock };
+            let lock_released = if mapping_lock.ok {
+                _mapping_lock_release(mapping_lock)
+            } else { true };
+            ok = semantic.ok and lock_released;
+            if ok { semantic_scalars = semantic.scalars; }
+            else if not semantic.ok { failure = try semantic.error catch "semantic Unicode mapping failed"; }
+            else { failure = "X11 mapping lock release failed"; }
+        } else {
+            ok = true;
+            let shift_code = _keycode(x11, display, "Shift_L"); let i = 0;
+            while i < len(p.text.strokes) and ok {
+                let stroke = p.text.strokes[i]; let code = _keycode(x11, display, stroke.keysym);
+                if code == 0 and allow_compose and strcharcodeat(e.text, i) >= 128 {
+                    ok = _compose_scalar(x11, xtst, display, strcharcodeat(e.text, i));
+                } else if code == 0 or (stroke.shift and shift_code == 0) { ok = false; }
+                else {
+                    if stroke.shift { ok = _fake_key(xtst, display, shift_code, 1); }
+                    if ok { ok = _fake_key(xtst, display, code, 1) and _fake_key(xtst, display, code, 0); }
+                    if stroke.shift {
+                        let released = _fake_key(xtst, display, shift_code, 0);
+                        ok = ok and released;
+                    }
                 }
+                i = i + 1;
             }
-            i = i + 1;
         }
     }
     try ffi_call_typed(x11, "XFlush", "ptr->i64", [display]) catch nil;
+    // Force the trusted X server to process every queued XTest request before
+    // reporting success. This makes physical soak evidence about server-accepted
+    // actuation rather than merely client-side queueing.
+    try ffi_call_typed(x11, "XSync", "ptr,i64->i64", [display, 0]) catch nil;
     try ffi_call_typed(x11, "XCloseDisplay", "ptr->i64", [display]) catch nil;
     ffi_close(xtst); ffi_close(x11);
-    if not ok { return map{ ok: false, error: "XTest request failed" }; }
-    return map{ ok: true, backend: "pblang-x11-xtest", event: e.kind };
+    if not ok { return map{ ok: false, error: if failure != "" { failure } else { "XTest request failed" } }; }
+    return map{ ok: true, backend: "pblang-x11-xtest", event: e.kind,
+                server_synchronized: true,
+                semantic_unicode_scalars: semantic_scalars,
+                layout_independent_unicode: semantic_scalars > 0,
+                keymap_restored: semantic_scalars > 0,
+                absolute_strategy: if e.kind == "pointer" {
+                    "bounded-relative-origin-anchor"
+                } else { nil } };
 }
 
 fn capabilities() {
-    return map{ key: true, click: true, relative_pointer: true, absolute_pointer: false,
+    return map{ key: true, click: true, relative_pointer: true, absolute_pointer: true,
+                absolute_pointer_strategy: "bounded-relative-origin-anchor",
+                absolute_pointer_multi_screen_origin_limited: true,
                 text: true, text_ascii: true, text_unicode_current_keymap: true,
+                text_unicode_layout_independent: _xmodmap_path() != nil,
+                unicode_reversible_empty_keycode_mapping: true,
+                unicode_mapping_process_serialized: true,
+                unicode_mapping_cross_process_serialized: true,
+                unicode_mapping_lock_crash_released: true,
+                unicode_mapping_lock_bounded_wait_ms: LOCK_ATTEMPTS * LOCK_RETRY_MS,
                 unicode_compose_opt_in: true, unicode_compose_application_dependent: true,
-                changes_keyboard_layout: false, external_xdotool_required: false, system_api: "X11/XTest" };
+                temporary_keyboard_mapping: true, mapping_restore_required: true,
+                external_xdotool_required: false, system_api: "X11/XTest+xmodmap+flock" };
 }
 
-export available, plan, text_plan, compose_plan, execute, capabilities;
+export available, plan, text_plan, compose_plan, execution_options, execute, capabilities;
