@@ -93,11 +93,15 @@ provided.
 implementation. `stdlib:linux_uinput.sapp` now emits an RX-only x86-64 ELF that
 uses the real Linux uinput ioctl/write ABI, replacing ydotoold for approved key,
 click, and relative-pointer actions. `stdlib:x11_input.sapp` uses trusted-path
-libX11/libXtst APIs for the same X11 subset without xdotool. Text and absolute
-movement retain reviewed xdotool/ydotool fallback where the native bounded API
-does not yet cover the operation. The external adapter emits structured argv,
-never shell commands. Every real action still passes the existing human opt-in,
-approval, audit, and kill switch in `input_control.sapp`.
+libX11/libXtst APIs for the same X11 subset without xdotool. Its text path uses
+reversible empty-keycode batches via trusted `xmodmap` argv and XTest, providing
+layout-independent Unicode on X11; mapping restoration is mandatory before
+success. A bounded per-user kernel `flock` serializes mapping batches across
+cooperating processes and is released automatically on process death. The
+external boundary emits structured argv, never shell commands. Raw
+uinput remains a physical-key backend, not a Unicode text backend. Every real
+action still passes the existing human opt-in, approval, audit, and kill switch
+in `input_control.sapp`.
 
 Executable platform coverage is tracked separately in
 `docs/Executable_targets.md`. A new DOS COM backend emits an 8086-compatible
