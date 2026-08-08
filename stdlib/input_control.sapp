@@ -16,15 +16,36 @@ let mc = import("stdlib:master_control.sapp");
 let events = import("stdlib:input_events.sapp");
 let uinput = import("stdlib:linux_uinput.sapp");
 let x11input = import("stdlib:x11_input.sapp");
+let wininput = import("stdlib:windows_unicode_input.sapp");
+let waylandinput = import("stdlib:wayland_unicode_input.sapp");
+let macinput = import("stdlib:macos_unicode_input.sapp");
 let tool_probe = import("stdlib:tool_probe.sapp");
 
 let _execs = map{};
 let MAX_TEXT = events.MAX_TEXT;
 let _SAFE_KEYS = events.safe_keys();
+let _wayland_probe_cache = map{ socket: nil, checked_ms: 0, ok: false };
+
+fn _android_semantic_status() {
+    let adapter = map{ __pbck_adapter: "android_semantic_input_status" };
+    return try adapter() catch false;
+}
+
+fn _android_semantic_text(text) {
+    let adapter = map{ __pbck_adapter: "android_semantic_input_text" };
+    return try adapter(text) catch -100;
+}
 
 fn _input_enabled() {
     let v = try env_get("PB_INPUT_CONTROL") catch nil;
-    return v == "1" or v == "true" or v == "on";
+    if v == "1" or v == "true" or v == "on" { return true; }
+    // On Android, enabling PBRemote's private AccessibilityService is the
+    // operating-system-enforced local opt-in. The host adapter remains absent
+    // on every other runtime and any lookup failure denies input.
+    if (try platform() catch "") == "android" {
+        return _android_semantic_status();
+    }
+    return false;
 }
 fn _unicode_compose_enabled() {
     let v = try env_get("PB_INPUT_UNICODE_COMPOSE") catch nil;
@@ -55,6 +76,22 @@ fn _backend_request(requested = nil) {
     if name == "uinput" or name == "pblang-uinput" {
         return map{ ok: true, name: "pblang-uinput", explicit: true };
     }
+    if name == "android" or name == "android-semantic"
+        or name == "pblang-android-semantic" {
+        return map{ ok: true, name: "pblang-android-semantic", explicit: true };
+    }
+    if name == "windows" or name == "windows-semantic"
+        or name == "pblang-windows-sendinput" {
+        return map{ ok: true, name: "pblang-windows-sendinput", explicit: true };
+    }
+    if name == "wayland" or name == "wayland-semantic"
+        or name == "pblang-wayland-virtual-keyboard" {
+        return map{ ok: true, name: "pblang-wayland-virtual-keyboard", explicit: true };
+    }
+    if name == "macos" or name == "macos-semantic"
+        or name == "pblang-macos-coregraphics" {
+        return map{ ok: true, name: "pblang-macos-coregraphics", explicit: true };
+    }
     if name == "xdotool" or name == "ydotool" {
         return map{ ok: true, name: name, explicit: true };
     }
@@ -71,6 +108,24 @@ fn _native_arch() {
 }
 fn _native_uinput_available() {
     return platform() == "linux" and _native_arch() != nil and (try fs_exists("/dev/uinput") catch false);
+}
+fn _android_semantic_available() {
+    if (try platform() catch "") != "android" { return false; }
+    return _android_semantic_status();
+}
+fn _wayland_semantic_available() {
+    let candidate = waylandinput.candidate();
+    if not candidate.ok { return false; }
+    let current = now_ms();
+    if _wayland_probe_cache.socket == candidate.socket
+        and current - _wayland_probe_cache.checked_ms < 1000 {
+        return _wayland_probe_cache.ok;
+    }
+    let status = try waylandinput.probe(150) catch map{ ok: false };
+    _wayland_probe_cache.socket = candidate.socket;
+    _wayland_probe_cache.checked_ms = current;
+    _wayland_probe_cache.ok = status.ok;
+    return status.ok;
 }
 fn _stage_native(path, bytes) {
     return try { fs_write_bytes(path, bytes); true } catch false;
@@ -89,6 +144,15 @@ fn select_backend(requested = nil) {
     let choice = _backend_request(requested);
     if not choice.ok { return choice; }
     if choice.name == "auto" {
+        if _android_semantic_available() {
+            return map{ ok: true, selected: "pblang-android-semantic", explicit: false };
+        }
+        if wininput.available().ok {
+            return map{ ok: true, selected: "pblang-windows-sendinput", explicit: false };
+        }
+        if macinput.available().ok {
+            return map{ ok: true, selected: "pblang-macos-coregraphics", explicit: false };
+        }
         if _native_uinput_available() {
             return map{ ok: true, selected: "pblang-uinput", explicit: false };
         }
@@ -102,6 +166,18 @@ fn select_backend(requested = nil) {
     }
     let available = false;
     if choice.name == "pblang-uinput" { available = _native_uinput_available(); }
+    elif choice.name == "pblang-android-semantic" {
+        available = _android_semantic_available();
+    }
+    elif choice.name == "pblang-windows-sendinput" {
+        available = wininput.available().ok;
+    }
+    elif choice.name == "pblang-wayland-virtual-keyboard" {
+        available = _wayland_semantic_available();
+    }
+    elif choice.name == "pblang-macos-coregraphics" {
+        available = macinput.available().ok;
+    }
     elif choice.name == "pblang-x11-xtest" { available = x11input.available().ok; }
     elif choice.name == "xdotool" { available = _has_tool("xdotool"); }
     elif choice.name == "ydotool" {
@@ -119,6 +195,12 @@ fn select_event_backend(event, requested = nil) {
     if not checked.ok { return checked; }
     let selection = select_backend(requested);
     if not selection.ok { return selection; }
+    if checked.event.kind == "type" and not selection.explicit
+        and _wayland_semantic_available() {
+        selection.selected = "pblang-wayland-virtual-keyboard";
+        selection.reason = "layout-independent native Wayland text routing";
+        selection.layout_aware = false;
+    }
     // Raw uinput text uses physical key codes and therefore cannot preserve
     // characters across arbitrary active layouts. In automatic mode prefer
     // the keysym-aware X11 path for all text, not only non-ASCII text.
@@ -139,6 +221,30 @@ fn select_event_backend(event, requested = nil) {
             i = i + 1;
         }
     }
+    if selection.selected == "pblang-android-semantic"
+        and checked.event.kind != "type" {
+        return map{ ok: false, selected: selection.selected,
+            explicit: selection.explicit,
+            error: "Android semantic input supports complete text events only" };
+    }
+    if selection.selected == "pblang-windows-sendinput"
+        and checked.event.kind != "type" {
+        return map{ ok: false, selected: selection.selected,
+            explicit: selection.explicit,
+            error: "Windows semantic input supports complete text events only" };
+    }
+    if selection.selected == "pblang-wayland-virtual-keyboard"
+        and checked.event.kind != "type" {
+        return map{ ok: false, selected: selection.selected,
+            explicit: selection.explicit,
+            error: "Wayland semantic input supports complete text events only" };
+    }
+    if selection.selected == "pblang-macos-coregraphics"
+        and checked.event.kind != "type" {
+        return map{ ok: false, selected: selection.selected,
+            explicit: selection.explicit,
+            error: "macOS semantic input supports complete text events only" };
+    }
     return selection;
 }
 fn backends(requested = nil) {
@@ -148,6 +254,28 @@ fn backends(requested = nil) {
                 ydotoold: _has_tool("ydotoold"), ydotool_socket: socket,
                 pblang_uinput: _native_uinput_available(),
                 pblang_uinput_arch: _native_arch(),
+                pblang_android_semantic: _android_semantic_available(),
+                pblang_android_semantic_layout_independent_unicode: true,
+                pblang_android_semantic_boundary:
+                    "private user-enabled AccessibilityService ACTION_SET_TEXT",
+                pblang_windows_semantic: wininput.available().ok,
+                pblang_windows_layout_independent_unicode:
+                    wininput.available().ok and wininput.capabilities().text_unicode_layout_independent,
+                pblang_windows_semantic_text_boundary:
+                    "generated PE32+ user32!SendInput/KEYEVENTF_UNICODE",
+                pblang_wayland_candidate: waylandinput.candidate().ok,
+                pblang_wayland_semantic: _wayland_semantic_available(),
+                pblang_wayland_layout_independent_unicode:
+                    _wayland_semantic_available()
+                        and waylandinput.capabilities().text_unicode_layout_independent,
+                pblang_wayland_semantic_text_boundary:
+                    "native virtual-keyboard-v1 wire protocol with compositor authorization",
+                pblang_macos_semantic: macinput.available().ok,
+                pblang_macos_layout_independent_unicode:
+                    macinput.available().ok
+                        and macinput.capabilities().text_unicode_layout_independent,
+                pblang_macos_semantic_text_boundary:
+                    "ApplicationServices CGEvent Unicode with permission preflight",
                 pblang_x11: x11input.available().ok,
                 pblang_x11_layout_independent_unicode:
                     x11input.available().ok and x11input.capabilities().text_unicode_layout_independent,
@@ -172,6 +300,52 @@ fn _execute_event(event) {
             note: selection.error };
     }
     let selected = selection.selected;
+    if selected == "pblang-android-semantic" and event.kind == "type" {
+        let applied = _android_semantic_text(event.text);
+        if type(applied) != "number" or applied < 0 or applied != len(event.text) {
+            return map{ available: false, tool: selected,
+                note: "Android semantic text actuation failed", result_code: applied };
+        }
+        return map{ available: true, tool: selected, event: event.kind,
+            native: true, layout_independent_unicode: true,
+            semantic_unicode_scalars: applied, keymap_restored: true };
+    }
+    if selected == "pblang-windows-sendinput" and event.kind == "type" {
+        let applied = wininput.execute(event);
+        if not applied.ok {
+            return map{ available: false, tool: selected,
+                note: try applied.error catch "Windows semantic text actuation failed",
+                result_code: try applied.exit_code catch nil };
+        }
+        return map{ available: true, tool: selected, event: event.kind,
+            native: true, layout_independent_unicode: true,
+            semantic_unicode_scalars: applied.semantic_unicode_scalars,
+            keymap_restored: true };
+    }
+    if selected == "pblang-wayland-virtual-keyboard" and event.kind == "type" {
+        let applied = waylandinput.execute(event);
+        if not applied.ok {
+            return map{ available: false, tool: selected,
+                note: try applied.error catch "Wayland semantic text actuation failed" };
+        }
+        return map{ available: true, tool: selected, event: event.kind,
+            native: true, layout_independent_unicode: true,
+            semantic_unicode_scalars: applied.semantic_unicode_scalars,
+            keymap_batches: applied.keymap_batches, compositor_authorized: true,
+            keymap_restored: true };
+    }
+    if selected == "pblang-macos-coregraphics" and event.kind == "type" {
+        let applied = macinput.execute(event);
+        if not applied.ok {
+            return map{ available: false, tool: selected,
+                note: try applied.error catch "macOS semantic text actuation failed" };
+        }
+        return map{ available: true, tool: selected, event: event.kind,
+            native: true, layout_independent_unicode: true,
+            semantic_unicode_scalars: applied.semantic_unicode_scalars,
+            permission_preflight: true, permission_api: applied.permission_api,
+            keymap_restored: true };
+    }
     if selected == "pblang-uinput" and (event.kind == "key" or event.kind == "click" or event.kind == "pointer_delta" or event.kind == "pointer" or event.kind == "type") {
         let artifact = uinput.build_event_for_arch(event, _native_arch());
         if not artifact.ok { return map{ available: false, tool: "pblang-uinput", note: artifact.error }; }
