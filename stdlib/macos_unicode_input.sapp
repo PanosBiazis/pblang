@@ -1,0 +1,170 @@
+// Layout-independent macOS text actuation through CoreGraphics. Native calls
+// are available only after the local operator grants Accessibility/PostEvent
+// permission; unavailable APIs and denied permission fail closed.
+
+let Events = import("stdlib:input_events.sapp");
+let Unicode = import("stdlib:unicode.sapp");
+
+let FORMAT = "pblang.macos.unicode-input.v1";
+let MAX_UTF16_UNITS = 8192;
+let APPLICATION_SERVICES =
+    "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices";
+let CORE_FOUNDATION =
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+let LIB_SYSTEM = "/usr/lib/libSystem.B.dylib";
+
+fn _stroke(cp, units, keycode) {
+    return map{ codepoint: cp, units: units, keycode: keycode,
+        semantic_key: keycode >= 0 };
+}
+fn text_plan(text) {
+    let checked = Events.type_event(text); if not checked.ok { return checked; }
+    if len(text) == 0 { return map{ ok: false, error: "macOS Unicode input text is empty" }; }
+    let strokes = []; let unit_count = 0; let i = 0;
+    while i < len(text) {
+        let cp = strcharcodeat(text, i); let units = []; let keycode = -1;
+        if not Unicode.is_valid_scalar(cp) or cp == 0 {
+            return map{ ok: false, error: "macOS Unicode input rejects invalid scalars and NUL", index: i };
+        }
+        if cp == 9 { keycode = 48; }
+        elif cp == 10 or cp == 13 { keycode = 36; }
+        elif Unicode.is_control(cp) {
+            return map{ ok: false, error: "macOS Unicode input rejects unsupported controls", index: i };
+        } elif cp <= 0xFFFF {
+            array_push(units, cp);
+        } else {
+            let value = cp - 0x10000;
+            array_push(units, 0xD800 + num_floor(value / 1024));
+            array_push(units, 0xDC00 + value % 1024);
+        }
+        unit_count = unit_count + len(units);
+        if unit_count > MAX_UTF16_UNITS {
+            return map{ ok: false, error: "macOS Unicode input exceeds the UTF-16 unit limit" };
+        }
+        array_push(strokes, _stroke(cp, units, keycode)); i = i + 1;
+    }
+    return map{ ok: true, format: FORMAT + ".plan", text: checked.event.text,
+        strokes: strokes, scalar_count: len(strokes), utf16_units: unit_count,
+        layout_independent_unicode: true };
+}
+fn available() {
+    let host = try platform() catch "unknown";
+    let libraries = host == "macos"
+        and (try fs_exists(APPLICATION_SERVICES) catch false)
+        and (try fs_exists(CORE_FOUNDATION) catch false)
+        and (try fs_exists(LIB_SYSTEM) catch false);
+    return map{ ok: libraries, format: FORMAT,
+        backend: "pblang-macos-coregraphics", platform: host,
+        system_api: "CGEventKeyboardSetUnicodeString/CGEventPost",
+        permission_api: "CGPreflightPostEventAccess or AXIsProcessTrusted",
+        accessibility_permission_required: true,
+        layout_independent_unicode: true, external_tool_required: false };
+}
+fn _call(runtime, library, name, signature, args) {
+    return try ffi_call_typed(library, name, signature, args) catch -1;
+}
+fn _memset(runtime, pointer, value, count) {
+    return _call(runtime, runtime.libc, "memset", "ptr,i32,i64->ptr",
+        [pointer, value, count]);
+}
+fn _free(runtime, pointer) {
+    if pointer != nil and pointer != 0 {
+        _call(runtime, runtime.libc, "free", "ptr->void", [pointer]);
+    }
+}
+fn _permission(runtime) {
+    let post = _call(runtime, runtime.app, "CGPreflightPostEventAccess", "->i64", []);
+    if post >= 0 {
+        return map{ ok: post != 0, api: "CGPreflightPostEventAccess" };
+    }
+    let accessibility = _call(runtime, runtime.app, "AXIsProcessTrusted", "->i64", []);
+    return map{ ok: accessibility > 0, api: "AXIsProcessTrusted" };
+}
+fn _event(runtime, keycode, down) {
+    return _call(runtime, runtime.app, "CGEventCreateKeyboardEvent",
+        "ptr,i64,i64->ptr", [0, keycode, if down { 1 } else { 0 }]);
+}
+fn _release(runtime, event) {
+    if event != nil and event != 0 {
+        _call(runtime, runtime.cf, "CFRelease", "ptr->void", [event]);
+    }
+}
+fn _post_pair(runtime, stroke) {
+    let down = _event(runtime, if stroke.semantic_key { stroke.keycode } else { 0 }, true);
+    let up = _event(runtime, if stroke.semantic_key { stroke.keycode } else { 0 }, false);
+    if down == nil or down == 0 or up == nil or up == 0 {
+        _release(runtime, down); _release(runtime, up);
+        return map{ ok: false, error: "CoreGraphics keyboard event allocation failed" };
+    }
+    let buffer = 0;
+    if not stroke.semantic_key {
+        buffer = _call(runtime, runtime.libc, "calloc", "i64,i64->ptr",
+            [len(stroke.units), 2]);
+        if buffer == nil or buffer == 0 {
+            _release(runtime, down); _release(runtime, up);
+            return map{ ok: false, error: "macOS UTF-16 allocation failed" };
+        }
+        let i = 0;
+        while i < len(stroke.units) {
+            _memset(runtime, buffer + i * 2, stroke.units[i] % 256, 1);
+            _memset(runtime, buffer + i * 2 + 1, num_floor(stroke.units[i] / 256), 1);
+            i = i + 1;
+        }
+        _call(runtime, runtime.app, "CGEventKeyboardSetUnicodeString",
+            "ptr,i64,ptr->void", [down, len(stroke.units), buffer]);
+        _call(runtime, runtime.app, "CGEventKeyboardSetUnicodeString",
+            "ptr,i64,ptr->void", [up, len(stroke.units), buffer]);
+    }
+    _call(runtime, runtime.app, "CGEventPost", "i64,ptr->void", [0, down]);
+    _call(runtime, runtime.app, "CGEventPost", "i64,ptr->void", [0, up]);
+    _free(runtime, buffer); _release(runtime, down); _release(runtime, up);
+    return map{ ok: true };
+}
+fn execute(event) {
+    let checked = Events.validate(event); if not checked.ok { return checked; }
+    if checked.event.kind != "type" {
+        return map{ ok: false, error: "macOS semantic input supports complete text events only" };
+    }
+    let host = available();
+    let plan = nil;
+    if host.ok { plan = text_plan(checked.event.text); }
+    else { return map{ ok: false, error: "macOS CoreGraphics input backend is unavailable" }; }
+    if not plan.ok { return plan; }
+    let app = try ffi_load(APPLICATION_SERVICES) catch nil;
+    let cf = try ffi_load(CORE_FOUNDATION) catch nil;
+    let libc = try ffi_load(LIB_SYSTEM) catch nil;
+    if app == nil or cf == nil or libc == nil {
+        try ffi_close(app) catch nil; try ffi_close(cf) catch nil; try ffi_close(libc) catch nil;
+        return map{ ok: false, error: "trusted macOS frameworks could not be loaded" };
+    }
+    let runtime = map{ app: app, cf: cf, libc: libc };
+    let permission = _permission(runtime);
+    if not permission.ok {
+        ffi_close(libc); ffi_close(cf); ffi_close(app);
+        return map{ ok: false,
+            error: "macOS Accessibility/PostEvent permission is not granted",
+            permission_api: permission.api };
+    }
+    let i = 0; let ok = true; let failure = "";
+    while i < len(plan.strokes) and ok {
+        let posted = _post_pair(runtime, plan.strokes[i]);
+        ok = posted.ok; if not ok { failure = posted.error; } i = i + 1;
+    }
+    ffi_close(libc); ffi_close(cf); ffi_close(app);
+    if not ok { return map{ ok: false, error: failure }; }
+    return map{ ok: true, format: FORMAT + ".result",
+        backend: "pblang-macos-coregraphics", event: "type", native: true,
+        semantic_unicode_scalars: plan.scalar_count, utf16_units: plan.utf16_units,
+        layout_independent_unicode: true, permission_preflight: true,
+        permission_api: permission.api, external_tool_required: false };
+}
+fn capabilities() {
+    return map{ format: FORMAT + ".capabilities", text: true,
+        text_unicode_layout_independent: true, supplementary_planes: true,
+        controls: ["Tab", "Return"], backend: "pblang-macos-coregraphics",
+        system_api: "CGEventKeyboardSetUnicodeString/CGEventPost",
+        accessibility_permission_required: true, permission_preflight: true,
+        source_language: "pblang", external_tool_required: false };
+}
+
+export text_plan, available, execute, capabilities;

@@ -88,8 +88,11 @@ returning success. This preserves Latin upper/lower case, punctuation and
 non-Latin scalars independently of the active keyboard layout. Mapping or
 restoration failure is fail-closed. Tab and Return remain semantic keys. Raw
 Linux uinput still rejects non-ASCII because evdev carries physical keys rather
-than text; Wayland and additional OS semantic-text adapters require their own
-implementations. Temporary mapping windows are serialized across cooperating
+than text. `stdlib:wayland_unicode_input.sapp` provides the corresponding native
+Wayland semantic-text path when the compositor explicitly advertises
+`zwp_virtual_keyboard_manager_v1`; see `docs/Wayland_unicode_input.md`.
+Additional operating systems still require their own semantic adapters.
+Temporary mapping windows are serialized across cooperating
 PBLang processes by a bounded nonblocking Linux `flock` on a mode-0600 per-user
 file. The kernel releases the lock if a process crashes, and every normal path
 unlocks and closes it. X11 mappings remain server-global, so an unrelated client

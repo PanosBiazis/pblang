@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Expression-level `elif` in the self-hosted frontend
+- Extended the PBLang-written parser so value-producing conditionals accept
+  `if ... elif ... else`, lowering to the same right-nested `if_expr` AST as the
+  backward-compatible `else if` spelling.
+- Parsing is iterative and capped at 256 arms. AST shape, first-match behavior,
+  final fallback, existing no-else nil behavior, bytecode compilation and C99
+  conditional lowering are covered by an end-to-end semantic test and example.
+- No Rust source or new runtime opcode was added. The retained bootstrap host
+  parser still requires the equivalent `else if` spelling until it is replaced
+  by the PBLang-native frontend.
+- Added a self-hosted runtime regression proving that nested value-producing
+  conditionals resolve enclosing function locals in every selected arm. The
+  retained bootstrap VM still has this specific scope bug, so release scripts
+  use an equivalent flat assignment until that bootstrap is retired; no Rust
+  workaround was added.
+- The complete semantic regression suite passes 759/759 after this change.
+- Refreshed all 19 PBLang-native compiler-module PBCK snapshots. The resulting
+  self-host compiler is 1,336 bytes (SHA-256
+  `76cf23d66f13d3bdc9614aecdeb97495bcb26b8793c48fb22554842ec40d8704`),
+  and the 202-byte x86-64 bootstrap probe executed with exit code 42.
+
+### Native Wayland semantic Unicode input
+- Added `stdlib:wayland_unicode_input.sapp`, a PBLang-only bounded Wayland wire
+  client for compositor-authorized `virtual-keyboard-unstable-v1`. It discovers
+  `wl_seat` and `zwp_virtual_keyboard_manager_v1`, passes private XKB keymaps by
+  `SCM_RIGHTS`, sends semantic Unicode key events and requires a final compositor
+  round-trip before reporting success.
+- Unicode scalars are compacted into at most 247 unique keys per keymap and
+  automatically split across bounded batches. Unsupported controls, malformed
+  registry frames, absent globals, partial writes, protocol errors and deadlines
+  fail closed. No external input utility or host-language source was added.
+- Added selector integration, deterministic fragmented-wire and multi-script
+  tests, a runnable example and an independent `xkbcomp` syntax verifier. The
+  complete semantic suite passes 758/758. Live compositor actuation still
+  requires a Wayland session that explicitly advertises the privileged protocol.
+
+### Native macOS semantic Unicode input
+- Added `stdlib:macos_unicode_input.sapp`, a PBLang-only CoreGraphics adapter
+  using absolute-path ApplicationServices/CoreFoundation APIs. It lowers Unicode
+  scalars to checked UTF-16, preserves supplementary planes, maps Tab/Return to
+  semantic keys and releases every native buffer and event object.
+- Execution requires `CGPreflightPostEventAccess` or the legacy
+  `AXIsProcessTrusted` gate before posting any event. Missing frameworks, denied
+  permission, malformed scalars and unsupported controls fail closed. Focused
+  Linux-host planning/selection tests pass; live actuation still requires a
+  permissioned macOS target.
+
+### Deadline-bound native TCP
+- Added `stdlib:native_tcp.sapp`, a PBLang-only nonblocking IPv4 text socket
+  adapter for Linux x86, x86-64 and ARM64. Connect completion uses `poll` and
+  `getpeername`; connect/accept/read/write deadlines, close-on-exec descriptors, a
+  1 MiB frame bound, UTF-8 validation and explicit native cleanup are enforced.
+- Added nonblocking listeners, kernel-assigned-port verification and accepted
+  sockets with independent FFI ownership. Real two-client listener lifecycle,
+  accept/read timeout, refused-port and invalid-input semantics are covered by
+  the runnable example and tests. No timeout worker or host-language source was
+  added.
+
 ### Canonical exact-i32 call-frame lowering image
 - Added `stdlib:host_pbck_frame_lowering.sapp`, a PBLang-only dense primitive-
   array image for any bounded call graph accepted by

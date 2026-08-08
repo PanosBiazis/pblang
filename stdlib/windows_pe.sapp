@@ -1,0 +1,240 @@
+// stdlib/windows_pe.sapp -- bounded PE32+ executable construction in PBLang.
+//
+// This module is intentionally small: it builds an x86-64 Windows executable
+// with an RX code section and a separate RW import/data section. It supports
+// multiple explicitly named DLLs and symbols without consulting PATH.
+
+let X = import("stdlib:codegen_x64.sapp");
+
+let IMAGE_BASE = 5368709120; // 0x140000000
+let TEXT_RVA = 0x1000;
+let MIN_DATA_RVA = 0x2000;
+let FILE_ALIGN = 0x200;
+let MAX_CODE_BYTES = 16 * 1024 * 1024;
+let MAX_DATA_BYTES = 16 * 1024 * 1024;
+let MAX_DLLS = 32;
+let MAX_SYMBOLS = 256;
+
+fn _app(dst, src) {
+    let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+fn _zeros(n) { let out = []; let i = 0; while i < n { array_push(out, 0); i = i + 1; } return out; }
+fn _round_to(n, alignment) { return num_floor((n + alignment - 1) / alignment) * alignment; }
+fn _setle(out, offset, bytes) {
+    let i = 0; while i < len(bytes) { out[offset + i] = bytes[i]; i = i + 1; }
+}
+fn _pad_even(bytes) { if num_mod(len(bytes), 2) == 1 { array_push(bytes, 0); } return bytes; }
+
+fn _valid_name(value, dll) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 128 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        let alpha = (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+        let digit = c >= 48 and c <= 57;
+        if not alpha and not digit and c != 46 and c != 95 and c != 45 { return false; }
+        i = i + 1;
+    }
+    if dll and not str_ends_with(str_lower(value), ".dll") { return false; }
+    return true;
+}
+
+fn _validated_imports(imports) {
+    if type(imports) != "array" or len(imports) < 1 or len(imports) > MAX_DLLS {
+        throw "windows_pe: imports must contain 1..32 DLL descriptors";
+    }
+    let rows = []; let symbol_count = 0; let seen = map{}; let i = 0;
+    while i < len(imports) {
+        let item = imports[i];
+        if type(item) != "map" or not map_has(item, "dll") or not map_has(item, "symbols")
+            or not _valid_name(item.dll, true) or type(item.symbols) != "array"
+            or len(item.symbols) < 1 {
+            throw "windows_pe: invalid DLL import descriptor";
+        }
+        let dll_key = str_lower(item.dll);
+        if map_has(seen, dll_key) { throw "windows_pe: duplicate DLL import"; }
+        seen[dll_key] = true;
+        let symbols = []; let local = map{}; let j = 0;
+        while j < len(item.symbols) {
+            let symbol = item.symbols[j];
+            if not _valid_name(symbol, false) { throw "windows_pe: invalid import symbol"; }
+            if map_has(local, symbol) { throw "windows_pe: duplicate import symbol"; }
+            local[symbol] = true; array_push(symbols, symbol);
+            symbol_count = symbol_count + 1;
+            if symbol_count > MAX_SYMBOLS { throw "windows_pe: too many import symbols"; }
+            j = j + 1;
+        }
+        array_push(rows, map{ dll: item.dll, symbols: symbols }); i = i + 1;
+    }
+    return rows;
+}
+
+// layout_x64() is the first phase. Callers use its stable IAT RVAs to emit
+// RIP-relative calls and then pass the same immutable layout to build_x64().
+fn layout_x64(imports, extra_len = 0, code_capacity = 0) {
+    if not is_number(extra_len) or extra_len != num_floor(extra_len)
+        or extra_len < 0 or extra_len > MAX_DATA_BYTES {
+        throw "windows_pe: extra data length is out of range";
+    }
+    if not is_number(code_capacity) or code_capacity != num_floor(code_capacity)
+        or code_capacity < 0 or code_capacity > MAX_CODE_BYTES {
+        throw "windows_pe: code capacity is out of range";
+    }
+    let data_rva = MIN_DATA_RVA;
+    let required_data_rva = TEXT_RVA + _round_to(code_capacity, 0x1000);
+    if required_data_rva > data_rva { data_rva = required_data_rva; }
+    let rows = _validated_imports(imports); let idt_size = 20 * (len(rows) + 1);
+    let offset = idt_size; let i = 0;
+    while i < len(rows) {
+        rows[i].ilt_off = offset; offset = offset + 8 * (len(rows[i].symbols) + 1); i = i + 1;
+    }
+    let first_iat = offset; i = 0;
+    while i < len(rows) {
+        rows[i].iat_off = offset; offset = offset + 8 * (len(rows[i].symbols) + 1); i = i + 1;
+    }
+    let after_iat = offset; i = 0;
+    while i < len(rows) {
+        rows[i].hint_offsets = []; let j = 0;
+        while j < len(rows[i].symbols) {
+            array_push(rows[i].hint_offsets, offset);
+            let entry = [0, 0]; _app(entry, str_to_bytes(rows[i].symbols[j])); array_push(entry, 0); _pad_even(entry);
+            offset = offset + len(entry); j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(rows) {
+        rows[i].dll_off = offset;
+        let dll = str_to_bytes(rows[i].dll); array_push(dll, 0); _pad_even(dll);
+        offset = offset + len(dll); i = i + 1;
+    }
+    let imports_len = offset;
+    if imports_len + extra_len > MAX_DATA_BYTES { throw "windows_pe: import/data section is too large"; }
+    let bytes = _zeros(imports_len); let iat = map{}; i = 0;
+    while i < len(rows) {
+        let row = rows[i]; let descriptor = i * 20;
+        _setle(bytes, descriptor, X.le32(data_rva + row.ilt_off));
+        _setle(bytes, descriptor + 12, X.le32(data_rva + row.dll_off));
+        _setle(bytes, descriptor + 16, X.le32(data_rva + row.iat_off));
+        let j = 0;
+        while j < len(row.symbols) {
+            let hint_rva = data_rva + row.hint_offsets[j];
+            _setle(bytes, row.ilt_off + j * 8, X.le64(hint_rva));
+            _setle(bytes, row.iat_off + j * 8, X.le64(hint_rva));
+            let entry = [0, 0]; _app(entry, str_to_bytes(row.symbols[j])); array_push(entry, 0); _pad_even(entry);
+            _setle(bytes, row.hint_offsets[j], entry);
+            iat[str_lower(row.dll) + "!" + row.symbols[j]] = data_rva + row.iat_off + j * 8;
+            j = j + 1;
+        }
+        let dll = str_to_bytes(row.dll); array_push(dll, 0); _pad_even(dll);
+        _setle(bytes, row.dll_off, dll); i = i + 1;
+    }
+    return map{
+        format: "pblang.windows.pe64-layout.v1", imports: imports, import_bytes: bytes,
+        iat: iat, text_rva: TEXT_RVA, data_rva: data_rva,
+        code_capacity: code_capacity,
+        idt_rva: data_rva, idt_size: idt_size,
+        iat_rva: data_rva + first_iat, iat_size: after_iat - first_iat,
+        extra_len: extra_len, extra_rva: data_rva + imports_len,
+        data_len: imports_len + extra_len,
+    };
+}
+
+fn iat_rva(layout, dll, symbol) {
+    if type(layout) != "map" or (try layout.format catch "") != "pblang.windows.pe64-layout.v1" {
+        throw "windows_pe: invalid layout";
+    }
+    let key = str_lower(dll) + "!" + symbol;
+    if not map_has(layout.iat, key) { throw "windows_pe: undeclared import " + key; }
+    return layout.iat[key];
+}
+
+fn call_iat_x64(layout, dll, symbol, code_offset) {
+    if not is_number(code_offset) or code_offset != num_floor(code_offset) or code_offset < 0 {
+        throw "windows_pe: invalid code offset";
+    }
+    let target = iat_rva(layout, dll, symbol);
+    let displacement = target - (layout.text_rva + code_offset + 6);
+    if displacement < -2147483648 or displacement > 2147483647 {
+        throw "windows_pe: IAT call displacement is out of range";
+    }
+    let out = [0xFF, 0x15]; _app(out, X.le32(displacement)); return out;
+}
+
+fn _headers(code_len, data_len, layout) {
+    let text_raw = _round_to(code_len, FILE_ALIGN); let data_raw = _round_to(data_len, FILE_ALIGN);
+    let out = [];
+    _app(out, [0x4D, 0x5A]); _app(out, _zeros(0x3C - 2)); _app(out, X.le32(0x40));
+    _app(out, [0x50, 0x45, 0, 0]);
+    _app(out, X.le16(0x8664)); _app(out, X.le16(2)); _app(out, X.le32(0)); _app(out, X.le32(0));
+    _app(out, X.le32(0)); _app(out, X.le16(240)); _app(out, X.le16(0x22));
+    let optional = _zeros(240);
+    _setle(optional, 0, X.le16(0x20B)); _setle(optional, 4, X.le32(text_raw));
+    _setle(optional, 8, X.le32(data_raw)); _setle(optional, 16, X.le32(layout.text_rva));
+    _setle(optional, 20, X.le32(layout.text_rva)); _setle(optional, 24, X.le64(IMAGE_BASE));
+    _setle(optional, 32, X.le32(0x1000)); _setle(optional, 36, X.le32(FILE_ALIGN));
+    _setle(optional, 40, X.le16(5)); _setle(optional, 42, X.le16(2));
+    _setle(optional, 48, X.le16(5)); _setle(optional, 50, X.le16(2));
+    _setle(optional, 56, X.le32(layout.data_rva + _round_to(data_len, 0x1000)));
+    _setle(optional, 60, X.le32(0x200)); _setle(optional, 68, X.le16(3));
+    _setle(optional, 70, X.le16(0x0500)); // NX_COMPAT | NO_SEH; no false ASLR claim without relocations.
+    _setle(optional, 72, X.le64(0x100000)); _setle(optional, 80, X.le64(0x1000));
+    _setle(optional, 88, X.le64(0x100000)); _setle(optional, 96, X.le64(0x1000));
+    _setle(optional, 108, X.le32(16));
+    _setle(optional, 120, X.le32(layout.idt_rva)); _setle(optional, 124, X.le32(layout.idt_size));
+    _setle(optional, 208, X.le32(layout.iat_rva)); _setle(optional, 212, X.le32(layout.iat_size));
+    _app(out, optional);
+    let text = _zeros(40); _setle(text, 0, str_to_bytes(".text"));
+    _setle(text, 8, X.le32(code_len)); _setle(text, 12, X.le32(layout.text_rva));
+    _setle(text, 16, X.le32(text_raw)); _setle(text, 20, X.le32(0x200));
+    _setle(text, 36, X.le32(0x60000020)); _app(out, text);
+    let data = _zeros(40); _setle(data, 0, str_to_bytes(".idata"));
+    _setle(data, 8, X.le32(data_len)); _setle(data, 12, X.le32(layout.data_rva));
+    _setle(data, 16, X.le32(data_raw)); _setle(data, 20, X.le32(0x200 + text_raw));
+    _setle(data, 36, X.le32(0xC0000040)); _app(out, data);
+    while len(out) < 0x200 { array_push(out, 0); }
+    return map{ bytes: out, text_raw: text_raw, data_raw: data_raw };
+}
+
+fn _valid_bytes(bytes, maximum) {
+    if type(bytes) != "array" or len(bytes) < 1 or len(bytes) > maximum { return false; }
+    let i = 0; while i < len(bytes) {
+        if not is_number(bytes[i]) or bytes[i] != num_floor(bytes[i]) or bytes[i] < 0 or bytes[i] > 255 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn assemble_x64(payload, layout, extra_data = nil) {
+    if not _valid_bytes(payload, MAX_CODE_BYTES) { throw "windows_pe: invalid x86-64 code bytes"; }
+    if type(layout) != "map" or (try layout.format catch "") != "pblang.windows.pe64-layout.v1"
+        or type(layout.import_bytes) != "array" { throw "windows_pe: invalid layout"; }
+    if len(payload) > layout.data_rva - layout.text_rva {
+        throw "windows_pe: code exceeds the page-aligned layout capacity";
+    }
+    if extra_data == nil { extra_data = []; }
+    if type(extra_data) != "array" or len(extra_data) != layout.extra_len {
+        throw "windows_pe: extra data length does not match layout";
+    }
+    if len(extra_data) > 0 and not _valid_bytes(extra_data, MAX_DATA_BYTES) {
+        throw "windows_pe: invalid extra data bytes";
+    }
+    let data = []; _app(data, layout.import_bytes); _app(data, extra_data);
+    if len(data) != layout.data_len { throw "windows_pe: data layout mismatch"; }
+    let headers = _headers(len(payload), len(data), layout); let out = headers.bytes;
+    _app(out, payload); while len(out) < 0x200 + headers.text_raw { array_push(out, 0); }
+    _app(out, data); while len(out) < 0x200 + headers.text_raw + headers.data_raw { array_push(out, 0); }
+    return out;
+}
+
+fn inspect_x64(bytes) {
+    let ok = type(bytes) == "array" and len(bytes) >= 0x200
+        and bytes[0] == 0x4D and bytes[1] == 0x5A
+        and bytes[0x40] == 0x50 and bytes[0x41] == 0x45
+        and bytes[0x44] == 0x64 and bytes[0x45] == 0x86;
+    return map{ ok: ok, format: if ok { "pe32+" } else { "unknown" },
+        machine: if ok { "x86_64" } else { "unknown" }, wx_split: ok, nx_compatible: ok };
+}
+
+export layout_x64, iat_rva, call_iat_x64, assemble_x64, inspect_x64;

@@ -1,0 +1,159 @@
+// stdlib/windows_unicode_input.sapp -- layout-independent Windows text input.
+//
+// PBLang emits a short PE32+ helper for each approved text event. The helper
+// calls user32!SendInput with KEYEVENTF_UNICODE and exits non-zero if Windows
+// accepts fewer than all requested events (including UIPI rejection). No C,
+// Rust, PowerShell, shell interpolation, PATH lookup, or persistent helper is
+// involved.
+
+let Events = import("stdlib:input_events.sapp");
+let Unicode = import("stdlib:unicode.sapp");
+let PE = import("stdlib:windows_pe.sapp");
+
+let MAX_UTF16_UNITS = 8192;
+let IMPORTS = [
+    map{ dll: "USER32.dll", symbols: ["SendInput"] },
+    map{ dll: "KERNEL32.dll", symbols: ["ExitProcess"] },
+];
+
+fn _app(dst, src) { let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; } return dst; }
+fn _le16(value) { return [num_mod(value, 256), num_mod(num_floor(value / 256), 256)]; }
+fn _le32(value) {
+    if value < 0 { value = 4294967296 + value; }
+    return [num_mod(value, 256), num_mod(num_floor(value / 256), 256),
+        num_mod(num_floor(value / 65536), 256), num_mod(num_floor(value / 16777216), 256)];
+}
+
+fn _stroke(vk, scan, flags, scalar) {
+    return map{ vk: vk, scan: scan, flags: flags, scalar: scalar };
+}
+
+fn text_plan(text) {
+    let checked = Events.type_event(text); if not checked.ok { return checked; }
+    let strokes = []; let scalars = 0; let i = 0;
+    while i < len(text) {
+        let cp = strcharcodeat(text, i);
+        if not Unicode.is_valid_scalar(cp) or cp == 0 {
+            return map{ ok: false, error: "Windows Unicode input rejects invalid scalars and NUL", index: i };
+        }
+        if cp == 9 { array_push(strokes, _stroke(9, 0, 0, cp)); }
+        elif cp == 10 or cp == 13 { array_push(strokes, _stroke(13, 0, 0, cp)); }
+        elif cp <= 0xFFFF { array_push(strokes, _stroke(0, cp, 4, cp)); }
+        else {
+            let value = cp - 0x10000;
+            let high = 0xD800 + num_floor(value / 1024);
+            let low = 0xDC00 + num_mod(value, 1024);
+            array_push(strokes, _stroke(0, high, 4, cp));
+            array_push(strokes, _stroke(0, low, 4, cp));
+        }
+        if len(strokes) > MAX_UTF16_UNITS {
+            return map{ ok: false, error: "Windows Unicode input exceeds the UTF-16 unit limit" };
+        }
+        scalars = scalars + 1; i = i + 1;
+    }
+    return map{ ok: true, format: "pblang.windows.unicode-input-plan.v1",
+        text: checked.event.text, strokes: strokes, scalar_count: scalars,
+        utf16_units: len(strokes), layout_independent: true };
+}
+
+fn _iat_call(payload, layout, dll, symbol) {
+    _app(payload, PE.call_iat_x64(layout, dll, symbol, len(payload)));
+}
+
+fn _input_record(stroke, key_up) {
+    let flags = stroke.flags;
+    if key_up { flags = flags + 2; }
+    let out = []; let i = 0; while i < 40 { array_push(out, 0); i = i + 1; }
+    let type_bytes = _le32(1); i = 0; while i < 4 { out[i] = type_bytes[i]; i = i + 1; }
+    let vk = _le16(stroke.vk); out[8] = vk[0]; out[9] = vk[1];
+    let scan = _le16(stroke.scan); out[10] = scan[0]; out[11] = scan[1];
+    let flag_bytes = _le32(flags); i = 0; while i < 4 { out[12 + i] = flag_bytes[i]; i = i + 1; }
+    return out;
+}
+
+fn artifact(text) {
+    let plan = text_plan(text); if not plan.ok { return plan; }
+    let records = []; let i = 0;
+    while i < len(plan.strokes) {
+        _app(records, _input_record(plan.strokes[i], false));
+        _app(records, _input_record(plan.strokes[i], true)); i = i + 1;
+    }
+    let event_count = plan.utf16_units * 2;
+    if event_count < 1 { return map{ ok: false, error: "Windows Unicode input text is empty" }; }
+    let layout = PE.layout_x64(IMPORTS, len(records), 128); let machine_bytes = [];
+    _app(machine_bytes, [0x48, 0x83, 0xEC, 0x28]);           // Win64 shadow space + alignment
+    _app(machine_bytes, [0xB9]); _app(machine_bytes, _le32(event_count)); // ecx = INPUT count
+    let data_disp = layout.extra_rva - (layout.text_rva + len(machine_bytes) + 7);
+    _app(machine_bytes, [0x48, 0x8D, 0x15]); _app(machine_bytes, _le32(data_disp)); // rdx = INPUT[]
+    _app(machine_bytes, [0x41, 0xB8, 40, 0, 0, 0]);         // r8d = sizeof(INPUT)
+    _iat_call(machine_bytes, layout, "USER32.dll", "SendInput");
+    _app(machine_bytes, [0x3D]); _app(machine_bytes, _le32(event_count)); // exact accepted count
+    _app(machine_bytes, [0x74, 0x0B]);                       // accepted: skip local failure exit
+    _app(machine_bytes, [0xB9, 1, 0, 0, 0]);                // failure exit code
+    _iat_call(machine_bytes, layout, "KERNEL32.dll", "ExitProcess");
+    _app(machine_bytes, [0x31, 0xC9]);                       // success exit code
+    _iat_call(machine_bytes, layout, "KERNEL32.dll", "ExitProcess");
+    let bytes = PE.assemble_x64(machine_bytes, layout, records);
+    return map{ ok: true, format: "pblang.windows.unicode-input-artifact.v1",
+        architecture: "x86_64", bytes: bytes, code_bytes: len(machine_bytes),
+        artifact_bytes: len(bytes), scalar_count: plan.scalar_count,
+        utf16_units: plan.utf16_units, input_events: event_count,
+        input_data_bytes: len(records), send_input_calls: 1,
+        text_rva: layout.text_rva, data_rva: layout.data_rva,
+        imports: IMPORTS, layout_independent_unicode: true,
+        partial_injection_fails_closed: true, source_language: "pblang" };
+}
+
+fn _host_arch() {
+    let arch = str_lower(str(try env_get("PROCESSOR_ARCHITEW6432") catch ""));
+    if arch == "" { arch = str_lower(str(try env_get("PROCESSOR_ARCHITECTURE") catch "")); }
+    if str_contains(arch, "amd64") or str_contains(arch, "x86_64") { return "x86_64"; }
+    return arch;
+}
+
+fn available() {
+    let host = try platform() catch "unknown"; let arch = _host_arch();
+    return map{ ok: host == "windows" and arch == "x86_64", platform: host,
+        architecture: arch, backend: "pblang-windows-sendinput",
+        system_api: "user32!SendInput/KEYEVENTF_UNICODE",
+        generated_pe: true, external_tool_required: false };
+}
+
+fn execute(event) {
+    let checked = Events.validate(event); if not checked.ok { return checked; }
+    if checked.event.kind != "type" {
+        return map{ ok: false, error: "Windows semantic input supports complete text events only" };
+    }
+    let host = available();
+    if not host.ok { return map{ ok: false, error: "Windows x86-64 SendInput backend is unavailable" }; }
+    let built = artifact(checked.event.text); if not built.ok { return built; }
+    let root = try env_get("TEMP") catch "."; if type(root) != "string" or root == "" { root = "."; }
+    let token = str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32);
+    let separator = "\\";
+    if str_ends_with(root, "\\") or str_ends_with(root, "/") { separator = ""; }
+    let path = root + separator + "pblang-input-" + token + ".exe";
+    let staged = try { fs_write_bytes(path, built.bytes); true } catch false;
+    if not staged { return map{ ok: false, error: "cannot stage private Windows input helper" }; }
+    let result = try proc_spawn_wait(path, []) catch nil;
+    try fs_remove(path) catch nil;
+    let exit_code = -1;
+    if result != nil { exit_code = try result.exit_code catch -1; }
+    if exit_code != 0 {
+        return map{ ok: false, error: "SendInput rejected or partially accepted the approved text event",
+            exit_code: exit_code };
+    }
+    return map{ ok: true, backend: "pblang-windows-sendinput", event: "type",
+        semantic_unicode_scalars: built.scalar_count,
+        utf16_units: built.utf16_units, layout_independent_unicode: true,
+        keymap_restored: true, native: true };
+}
+
+fn capabilities() {
+    return map{ text: true, text_unicode_layout_independent: true,
+        supplementary_planes: true, controls: ["Tab", "Return"],
+        backend: "pblang-windows-sendinput", system_api: "SendInput",
+        partial_injection_fails_closed: true, uipi_enforced_by_os: true,
+        generated_pe: true, source_language: "pblang", external_tool_required: false };
+}
+
+export text_plan, artifact, available, execute, capabilities;

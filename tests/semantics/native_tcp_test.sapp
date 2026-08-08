@@ -1,0 +1,119 @@
+let TCP = import("stdlib:native_tcp.sapp");
+
+fn fail(message) { throw "FAIL native_tcp: " + message; }
+fn require(value, message) { if not value { fail(message); } }
+
+let support = TCP.available();
+if platform() == "linux" {
+    require(support.ok and support.explicit_connect_deadline
+        and support.explicit_accept_deadline and support.explicit_read_deadline
+        and support.nonblocking and support.cloexec,
+        "supported Linux host must expose bounded native TCP");
+} else {
+    require(not support.ok, "unsupported hosts must fail closed");
+    print "native_tcp_unsupported_pass";
+    return;
+}
+
+require(not TCP.connect_ipv4("not-an-ip", 80, 50).ok
+    and not TCP.connect_ipv4("127.0.0.1", 0, 50).ok
+    and not TCP.connect_ipv4("127.0.0.1", 80, 0).ok,
+    "invalid address, port and timeout are rejected before FFI");
+require(not TCP.listen_ipv4("not-an-ip", 0, 8).ok
+    and not TCP.listen_ipv4("127.0.0.1", -1, 8).ok
+    and not TCP.listen_ipv4("127.0.0.1", 0, 0).ok,
+    "invalid native listener options are rejected before FFI");
+
+let native_listener = TCP.listen_ipv4("127.0.0.1", 0, 8);
+require(native_listener.ok and native_listener.port > 0
+    and native_listener.nonblocking and native_listener.cloexec,
+    "native listener must bind an observable ephemeral port");
+let empty_started = now_ms();
+let empty_accept = TCP.accept_bounded(native_listener, 15);
+let empty_elapsed = now_ms() - empty_started;
+require(not empty_accept.ok and empty_accept.timeout
+    and empty_elapsed >= 5 and empty_elapsed < 250,
+    "empty native accept must terminate at its deadline");
+
+let native_endpoint = "127.0.0.1:" + str(native_listener.port);
+let native_done = channel();
+let native_worker = spawn(fn() {
+    let first = tcp_connect(native_endpoint);
+    tcp_write(first, "native-one\n");
+    let first_reply = tcp_read_until(first, "\n", 1024);
+    tcp_close(first);
+    let second = tcp_connect(native_endpoint);
+    tcp_write(second, "native-two\n");
+    let second_reply = tcp_read_until(second, "\n", 1024);
+    tcp_close(second);
+    send(native_done.sender, [first_reply, second_reply]);
+});
+let accepted_first = TCP.accept_bounded(native_listener, 250);
+require(accepted_first.ok and accepted_first.accepted,
+    "native listener did not accept its first client");
+let native_first = TCP.read_until(accepted_first, "\n", 1024, 250);
+require(native_first.ok and native_first.text == "native-one\n"
+    and TCP.write_text(accepted_first, "accepted-one\n", 250).ok,
+    "first accepted socket round trip failed");
+TCP.close(accepted_first);
+let accepted_second = TCP.accept_bounded(native_listener, 250);
+require(accepted_second.ok,
+    "closing an accepted socket must not invalidate its listener");
+let native_second = TCP.read_until(accepted_second, "\n", 1024, 250);
+require(native_second.ok and native_second.text == "native-two\n"
+    and TCP.write_text(accepted_second, "accepted-two\n", 250).ok,
+    "second accepted socket round trip failed");
+TCP.close(accepted_second);
+let native_replies = recv_timeout(native_done.receiver, 2000);
+join(native_worker);
+require(native_replies[0] == "accepted-one\n"
+    and native_replies[1] == "accepted-two\n",
+    "portable clients did not receive native listener replies");
+TCP.close(native_listener);
+require(native_listener.closed and not TCP.accept_bounded(native_listener, 10).ok,
+    "closed listener must reject later accepts");
+
+let listener = tcp_listen("127.0.0.1:0");
+let endpoint = tcp_local_addr(listener);
+let port = parse_number(str_slice(endpoint, str_index_of(endpoint, ":") + 1, len(endpoint)));
+let worker = spawn(fn() {
+    let first = tcp_accept(listener);
+    let request = tcp_read_until(first, "\n", 1024);
+    if request == "hello\n" { tcp_write(first, "world\n"); }
+    tcp_close(first);
+
+    let second = tcp_accept(listener);
+    let hold_until = now_ms() + 120;
+    while now_ms() < hold_until {}
+    try tcp_write(second, "late\n") catch nil;
+    tcp_close(second);
+});
+
+let client = TCP.connect_ipv4("127.0.0.1", port, 250);
+require(client.ok and client.connect_elapsed_ms <= 250,
+    "loopback connection must complete inside its deadline: " + json_stringify(client));
+let wrote = TCP.write_text(client, "hello\n", 250);
+let response = TCP.read_until(client, "\n", 1024, 250);
+require(wrote.ok and wrote.count == 6 and response.ok and response.text == "world\n",
+    "bounded nonblocking text round trip failed: " + json_stringify(map{
+        wrote: wrote, response: response }));
+TCP.close(client);
+require(client.closed, "close must release the native descriptor and library");
+
+let silent = TCP.connect_ipv4("127.0.0.1", port, 250);
+require(silent.ok, "second loopback connection failed");
+let started = now_ms();
+let timed = TCP.read_until(silent, "\n", 1024, 30);
+let elapsed = now_ms() - started;
+require(not timed.ok and timed.timeout and elapsed >= 20 and elapsed < 250,
+    "read deadline must fail promptly without a retained worker");
+TCP.close(silent);
+join(worker);
+tcp_close(listener);
+
+let refused_started = now_ms();
+require(not TCP.connect_ipv4("127.0.0.1", port, 100).ok
+    and now_ms() - refused_started < 500,
+    "closed loopback endpoint must fail inside the connection bound");
+
+print "native_tcp_pass";

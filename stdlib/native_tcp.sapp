@@ -1,0 +1,435 @@
+// Deadline-bound Linux TCP text sockets implemented entirely in PBLang.
+//
+// The VM's portable tcp_connect currently uses the operating system's blocking
+// connect deadline. This adapter provides an explicit per-operation deadline
+// for bounded discovery/control-plane work without adding host-language code.
+// It supports little-endian Linux x86/x86-64/ARM64 libc ABIs and fails closed
+// everywhere else.
+
+let LIBC = [
+    map{ path: "/usr/lib/x86_64-linux-gnu/libc.so.6", arch: "x86_64" },
+    map{ path: "/lib/x86_64-linux-gnu/libc.so.6", arch: "x86_64" },
+    map{ path: "/usr/lib/aarch64-linux-gnu/libc.so.6", arch: "aarch64" },
+    map{ path: "/lib/aarch64-linux-gnu/libc.so.6", arch: "aarch64" },
+    map{ path: "/usr/lib/i386-linux-gnu/libc.so.6", arch: "x86" },
+    map{ path: "/lib/i386-linux-gnu/libc.so.6", arch: "x86" }
+];
+let CRYPTO = [
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/i386-linux-gnu/libcrypto.so.3",
+    "/lib/i386-linux-gnu/libcrypto.so.3",
+    "/usr/lib/libcrypto.so.3",
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so",
+    "/lib/x86_64-linux-gnu/libcrypto.so"
+];
+let FORMAT = "pblang.native-tcp-text.v1";
+let LISTENER_FORMAT = "pblang.native-tcp-listener.v1";
+let MAX_TEXT_BYTES = 1048576;
+let AF_INET = 2;
+let SOCK_STREAM_NONBLOCK_CLOEXEC = 526337;
+let ACCEPT_NONBLOCK_CLOEXEC = 526336;
+let POLLIN = 1;
+let POLLOUT = 4;
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and num_floor(value) == value
+        and value >= minimum and value <= maximum;
+}
+
+fn _support() {
+    if platform() != "linux" {
+        return map{ ok: false, error: "native deadline TCP currently requires Linux" };
+    }
+    let i = 0;
+    while i < len(LIBC) {
+        if try fs_exists(LIBC[i].path) catch false {
+            let j = 0;
+            while j < len(CRYPTO) {
+                if try fs_exists(CRYPTO[j]) catch false {
+                    return map{ ok: true, path: LIBC[i].path,
+                        crypto_path: CRYPTO[j], arch: LIBC[i].arch,
+                        little_endian: true };
+                }
+                j = j + 1;
+            }
+            return map{ ok: false,
+                error: "libcrypto is unavailable for binary-safe native reads" };
+        }
+        i = i + 1;
+    }
+    return map{ ok: false, error: "supported Linux libc ABI is unavailable" };
+}
+
+fn available() {
+    let support = _support();
+    return map{ ok: support.ok, format: FORMAT, platform: platform(),
+        arch: try support.arch catch "unsupported",
+        libc: try support.path catch nil,
+        libcrypto: try support.crypto_path catch nil,
+        explicit_connect_deadline: support.ok,
+        explicit_accept_deadline: support.ok,
+        explicit_read_deadline: support.ok,
+        explicit_write_deadline: support.ok,
+        cloexec: support.ok, nonblocking: support.ok,
+        max_text_bytes: MAX_TEXT_BYTES,
+        error: try support.error catch nil };
+}
+
+fn _call(socket, name, signature, args) {
+    return try ffi_call_typed(socket.libc, name, signature, args) catch -1;
+}
+
+fn _i32(value) {
+    if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; }
+    return value;
+}
+
+fn _memset(socket, pointer, value, count) {
+    return _call(socket, "memset", "ptr,i32,i64->ptr", [pointer, value, count]);
+}
+
+fn _free(socket, pointer) {
+    if pointer != nil and pointer != 0 { _call(socket, "free", "ptr->void", [pointer]); }
+}
+
+fn _free_crypto(socket, pointer) {
+    if pointer != nil and pointer != 0 {
+        try ffi_call_typed(socket.crypto, "CRYPTO_free", "ptr,ptr,i32->void",
+            [pointer, 0, 0]) catch nil;
+    }
+}
+
+fn _write_le(socket, pointer, value, count) {
+    let remaining = value; let i = 0;
+    while i < count {
+        _memset(socket, pointer + i, remaining % 256, 1);
+        remaining = num_floor(remaining / 256); i = i + 1;
+    }
+}
+
+fn _ipv4(value) {
+    let parts = str_split(str(value), ".");
+    if len(parts) != 4 { return nil; }
+    let out = []; let i = 0;
+    while i < 4 {
+        let item = try parse_number(parts[i]) catch nil;
+        if item == nil or not _integer(item, 0, 255) { return nil; }
+        array_push(out, item); i = i + 1;
+    }
+    return out;
+}
+
+fn _close_handles(socket) {
+    if (try socket.fd catch -1) >= 0 {
+        _i32(_call(socket, "close", "i32->i32", [socket.fd])); socket.fd = -1;
+    }
+    try ffi_close(socket.crypto) catch nil;
+    try ffi_close(socket.libc) catch nil;
+    socket.closed = true;
+}
+
+fn _poll(socket, events, timeout_ms) {
+    if not _integer(timeout_ms, 1, 60000) { return -1; }
+    let record = _call(socket, "calloc", "i64,i64->ptr", [1, 8]);
+    if record == nil or record == 0 { return -1; }
+    _write_le(socket, record, socket.fd, 4);
+    _write_le(socket, record + 4, events, 2);
+    let result = _i32(_call(socket, "poll", "ptr,i64,i32->i32",
+        [record, 1, timeout_ms]));
+    _free(socket, record);
+    return result;
+}
+
+fn _peer_connected(socket) {
+    let address = _call(socket, "calloc", "i64,i64->ptr", [1, 128]);
+    let length = _call(socket, "calloc", "i64,i64->ptr", [1, 4]);
+    if address == nil or address == 0 or length == nil or length == 0 {
+        _free(socket, address); _free(socket, length); return false;
+    }
+    _write_le(socket, length, 128, 4);
+    let result = _i32(_call(socket, "getpeername", "i32,ptr,ptr->i32",
+        [socket.fd, address, length]));
+    _free(socket, address); _free(socket, length);
+    return result == 0;
+}
+
+fn _pointer_bytes(socket, pointer, count) {
+    if pointer == nil or pointer == 0 or not _integer(count, 0, MAX_TEXT_BYTES) {
+        return map{ ok: false, error: "invalid native byte copy" };
+    }
+    if count == 0 { return map{ ok: true, bytes: [], count: 0 }; }
+    let encoded = try ffi_call_typed(socket.crypto, "OPENSSL_buf2hexstr",
+        "ptr,i64->ptr", [pointer, count]) catch nil;
+    if encoded == nil or encoded == 0 {
+        return map{ ok: false, error: "native byte encoding failed" };
+    }
+    let hex = try ffi_call_typed(socket.libc, "basename", "ptr->string",
+        [encoded]) catch nil;
+    _free_crypto(socket, encoded);
+    if type(hex) != "string" {
+        return map{ ok: false, error: "native bytes could not be copied safely" };
+    }
+    let clean = str_lower(str_replace_all(hex, ":", ""));
+    if len(clean) != count * 2 {
+        return map{ ok: false, error: "native byte count mismatch" };
+    }
+    let bytes = []; let i = 0;
+    while i < len(clean) {
+        let high = str_index_of("0123456789abcdef",
+            str_slice(clean, i, i + 1));
+        let low = str_index_of("0123456789abcdef",
+            str_slice(clean, i + 1, i + 2));
+        if high < 0 or low < 0 {
+            return map{ ok: false, error: "native byte encoding was invalid" };
+        }
+        array_push(bytes, high * 16 + low); i = i + 2;
+    }
+    return map{ ok: true, bytes: bytes, count: count };
+}
+
+fn _open_handles(support, format) {
+    let libc = try ffi_load(support.path) catch nil;
+    if libc == nil { return map{ ok: false, error: "trusted libc could not be loaded" }; }
+    let crypto = try ffi_load(support.crypto_path) catch nil;
+    if crypto == nil {
+        try ffi_close(libc) catch nil;
+        return map{ ok: false, error: "trusted libcrypto could not be loaded" };
+    }
+    return map{ ok: true, format: format, libc: libc, crypto: crypto,
+        libc_path: support.path, crypto_path: support.crypto_path,
+        arch: support.arch, fd: -1, closed: false,
+        nonblocking: true, cloexec: true };
+}
+
+fn _sockaddr(socket, address, port) {
+    let value = _call(socket, "calloc", "i64,i64->ptr", [1, 16]);
+    if value == nil or value == 0 { return nil; }
+    _write_le(socket, value, AF_INET, 2);
+    _memset(socket, value + 2, num_floor(port / 256), 1);
+    _memset(socket, value + 3, port % 256, 1);
+    let i = 0;
+    while i < 4 { _memset(socket, value + 4 + i, address[i], 1); i = i + 1; }
+    return value;
+}
+
+fn _local_port(listener) {
+    let address = _call(listener, "calloc", "i64,i64->ptr", [1, 16]);
+    let length = _call(listener, "calloc", "i64,i64->ptr", [1, 4]);
+    if address == nil or address == 0 or length == nil or length == 0 {
+        _free(listener, address); _free(listener, length); return nil;
+    }
+    _write_le(listener, length, 16, 4);
+    let result = _i32(_call(listener, "getsockname", "i32,ptr,ptr->i32",
+        [listener.fd, address, length]));
+    let copied = if result == 0 { _pointer_bytes(listener, address, 16) }
+        else { map{ ok: false } };
+    _free(listener, address); _free(listener, length);
+    if not copied.ok or len(copied.bytes) != 16 { return nil; }
+    return copied.bytes[2] * 256 + copied.bytes[3];
+}
+
+fn listen_ipv4(host = "127.0.0.1", port = 0, backlog = 16) {
+    let address = _ipv4(host);
+    if address == nil or not _integer(port, 0, 65535)
+        or not _integer(backlog, 1, 128) {
+        return map{ ok: false, error: "invalid bounded IPv4 listener options" };
+    }
+    let support = _support();
+    if not support.ok { return support; }
+    let listener = _open_handles(support, LISTENER_FORMAT);
+    if not listener.ok { return listener; }
+    let fd = _i32(_call(listener, "socket", "i32,i32,i32->i32",
+        [AF_INET, SOCK_STREAM_NONBLOCK_CLOEXEC, 0]));
+    if fd < 0 { _close_handles(listener);
+        return map{ ok: false, error: "nonblocking listener creation failed" }; }
+    listener.fd = fd;
+    let sockaddr = _sockaddr(listener, address, port);
+    if sockaddr == nil { _close_handles(listener);
+        return map{ ok: false, error: "listener address allocation failed" }; }
+    let bound = _i32(_call(listener, "bind", "i32,ptr,i32->i32",
+        [fd, sockaddr, 16]));
+    _free(listener, sockaddr);
+    if bound != 0 { _close_handles(listener);
+        return map{ ok: false, error: "listener bind failed" }; }
+    if _i32(_call(listener, "listen", "i32,i32->i32", [fd, backlog])) != 0 {
+        _close_handles(listener);
+        return map{ ok: false, error: "listener activation failed" };
+    }
+    let actual_port = _local_port(listener);
+    if actual_port == nil or not _integer(actual_port, 1, 65535) {
+        _close_handles(listener);
+        return map{ ok: false, error: "listener address verification failed" };
+    }
+    listener.host = str(host); listener.port = actual_port;
+    listener.backlog = backlog; listener.ok = true;
+    return listener;
+}
+
+fn accept_bounded(listener, timeout_ms = 50) {
+    if type(listener) != "map"
+        or (try listener.format catch "") != LISTENER_FORMAT
+        or (try listener.closed catch true)
+        or not _integer(timeout_ms, 1, 60000) {
+        return map{ ok: false, error: "invalid bounded accept" };
+    }
+    let started = now_ms();
+    let ready = _poll(listener, POLLIN, timeout_ms);
+    if ready <= 0 {
+        return map{ ok: false,
+            error: if ready == 0 { "accept deadline expired" }
+                else { "listener poll failed" },
+            timeout: ready == 0, elapsed_ms: now_ms() - started };
+    }
+    let fd = _i32(_call(listener, "accept4", "i32,ptr,ptr,i32->i32",
+        [listener.fd, 0, 0, ACCEPT_NONBLOCK_CLOEXEC]));
+    if fd < 0 {
+        return map{ ok: false, error: "nonblocking accept failed",
+            elapsed_ms: now_ms() - started };
+    }
+    let support = map{ ok: true, path: listener.libc_path,
+        crypto_path: listener.crypto_path, arch: listener.arch };
+    let socket = _open_handles(support, FORMAT);
+    if not socket.ok {
+        _i32(_call(listener, "close", "i32->i32", [fd]));
+        return socket;
+    }
+    socket.fd = fd; socket.ok = true; socket.accepted = true;
+    socket.accept_elapsed_ms = now_ms() - started;
+    return socket;
+}
+
+fn connect_ipv4(host, port, timeout_ms = 250) {
+    let address = _ipv4(host);
+    if address == nil or not _integer(port, 1, 65535)
+        or not _integer(timeout_ms, 1, 60000) {
+        return map{ ok: false, error: "invalid bounded IPv4 connection options" };
+    }
+    let support = _support();
+    if not support.ok { return support; }
+    let socket = _open_handles(support, FORMAT);
+    if not socket.ok { return socket; }
+    let fd = _i32(_call(socket, "socket", "i32,i32,i32->i32",
+        [AF_INET, SOCK_STREAM_NONBLOCK_CLOEXEC, 0]));
+    if fd < 0 { _close_handles(socket);
+        return map{ ok: false, error: "nonblocking socket creation failed" }; }
+    socket.fd = fd;
+    let sockaddr = _sockaddr(socket, address, port);
+    if sockaddr == nil or sockaddr == 0 { _close_handles(socket);
+        return map{ ok: false, error: "socket address allocation failed" }; }
+    let started = now_ms();
+    let connected = _i32(_call(socket, "connect", "i32,ptr,i32->i32",
+        [fd, sockaddr, 16]));
+    _free(socket, sockaddr);
+    if connected != 0 {
+        let ready = _poll(socket, POLLOUT, timeout_ms);
+        if ready <= 0 or not _peer_connected(socket) {
+            _close_handles(socket);
+            return map{ ok: false,
+                error: if ready == 0 { "connection deadline expired" }
+                    else { "connection was refused or failed" },
+                timeout: ready == 0, elapsed_ms: now_ms() - started };
+        }
+    }
+    socket.ok = true; socket.host = str(host); socket.port = port;
+    socket.connect_timeout_ms = timeout_ms;
+    socket.connect_elapsed_ms = now_ms() - started;
+    return socket;
+}
+
+fn write_text(socket, value, timeout_ms = 500) {
+    if type(socket) != "map" or (try socket.format catch "") != FORMAT
+        or (try socket.closed catch true) or type(value) != "string"
+        or len(value) > MAX_TEXT_BYTES or str_contains(value, "\x00")
+        or not _integer(timeout_ms, 1, 60000) {
+        return map{ ok: false, error: "invalid bounded text write" };
+    }
+    let offset = 0; let started = now_ms();
+    while offset < len(value) {
+        let remaining = timeout_ms - num_floor(now_ms() - started);
+        if remaining < 1 or _poll(socket, POLLOUT, remaining) <= 0 {
+            return map{ ok: false, error: "write deadline expired", timeout: true };
+        }
+        let part = str_slice(value, offset, len(value));
+        let buffer = _call(socket, "strdup", "string->ptr", [part]);
+        if buffer == nil or buffer == 0 {
+            return map{ ok: false, error: "text write allocation failed" };
+        }
+        let count = _call(socket, "write", "i32,ptr,i64->i64",
+            [socket.fd, buffer, len(part)]);
+        _free(socket, buffer);
+        if count < 1 or count > len(part) {
+            return map{ ok: false, error: "nonblocking text write failed", native_count: count };
+        }
+        offset = offset + count;
+    }
+    return map{ ok: true, count: offset, elapsed_ms: now_ms() - started };
+}
+
+fn _read_chunk(socket, maximum) {
+    let buffer = _call(socket, "calloc", "i64,i64->ptr", [maximum + 1, 1]);
+    if buffer == nil or buffer == 0 {
+        return map{ ok: false, error: "text read allocation failed" };
+    }
+    let count = _call(socket, "read", "i32,ptr,i64->i64",
+        [socket.fd, buffer, maximum]);
+    if count <= 0 {
+        _free(socket, buffer);
+        return map{ ok: false, error: if count == 0 { "text socket reached EOF" }
+            else { "nonblocking text read failed" }, eof: count == 0 };
+    }
+    let copied = _pointer_bytes(socket, buffer, count);
+    _free(socket, buffer);
+    if not copied.ok { return copied; }
+    let text = try bytes_to_str(copied.bytes) catch nil;
+    if type(text) != "string" or len(str_to_bytes(text)) != count {
+        return map{ ok: false, error: "native read was not valid UTF-8 text" };
+    }
+    return map{ ok: true, text: text, count: count };
+}
+
+fn read_until(socket, delimiter, maximum, timeout_ms = 500) {
+    if type(socket) != "map" or (try socket.format catch "") != FORMAT
+        or (try socket.closed catch true) or type(delimiter) != "string"
+        or len(delimiter) < 1 or len(delimiter) > 16
+        or not _integer(maximum, 1, MAX_TEXT_BYTES)
+        or not _integer(timeout_ms, 1, 60000) {
+        return map{ ok: false, error: "invalid bounded text read" };
+    }
+    let output = ""; let started = now_ms();
+    while len(output) < maximum and not str_contains(output, delimiter) {
+        let remaining = timeout_ms - num_floor(now_ms() - started);
+        if remaining < 1 or _poll(socket, POLLIN, remaining) <= 0 {
+            return map{ ok: false, error: "read deadline expired", timeout: true,
+                elapsed_ms: now_ms() - started };
+        }
+        let chunk_size = maximum - len(output);
+        if chunk_size > 4096 { chunk_size = 4096; }
+        let chunk = _read_chunk(socket, chunk_size);
+        if not chunk.ok { return chunk; }
+        output = output + chunk.text;
+    }
+    let position = str_index_of(output, delimiter);
+    if position < 0 {
+        return map{ ok: false, error: "text delimiter was not found within bound" };
+    }
+    return map{ ok: true,
+        text: str_slice(output, 0, position + len(delimiter)),
+        count: position + len(delimiter), elapsed_ms: now_ms() - started };
+}
+
+fn close(socket) {
+    let format = try socket.format catch "";
+    if type(socket) == "map" and (format == FORMAT or format == LISTENER_FORMAT)
+        and not (try socket.closed catch true) {
+        _call(socket, "shutdown", "i32,i32->i32", [socket.fd, 2]);
+        _close_handles(socket);
+    }
+    return map{ ok: true };
+}
+
+export FORMAT, LISTENER_FORMAT, MAX_TEXT_BYTES;
+export available, listen_ipv4, accept_bounded, connect_ipv4;
+export write_text, read_until, close;
