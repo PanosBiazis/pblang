@@ -146,6 +146,12 @@ twenty cold CLI processes fell from 1,182 ms with eager GUI/web imports to 77 ms
 with lazy loading. Reproduce the warm component costs with
 `pblang run bench/app_facade_stages.sapp --allow-all`.
 
+For bounded Linux control-plane connections, `stdlib:native_tcp.sapp` provides
+nonblocking IPv4 connect/accept/read/write deadlines, ephemeral listeners,
+independently owned accepted sockets, close-on-exec descriptors and
+binary-safe UTF-8 copying. Unsupported ABIs fail closed; this is not a TLS
+layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
+
 ---
 
 ## Common commands
@@ -200,6 +206,21 @@ let result = match 200 {
 
 print result;
 ```
+
+The PBLang-native compiler also accepts value-producing `elif` chains:
+
+```pblang
+let class_name = if score >= 90 { "excellent" }
+    elif score >= 75 { "good" }
+    elif score >= 50 { "pass" }
+    else { "retry" };
+```
+
+`elif` and the older `else if` spelling lower to the same conditional AST, so
+branch selection, type widening, bytecode and C99 output remain compatible.
+Chains are bounded to 256 arms. During bootstrap migration, compile this exact
+expression spelling through the PBLang-native `tools/pbselfc.sapp`; the retained
+host parser continues to accept the equivalent `else if` spelling.
 
 ---
 

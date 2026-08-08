@@ -74,6 +74,10 @@ if x > 10 {
     print "small";
 }
 
+let size = if x < 10 { "small" }
+    elif x < 100 { "medium" }
+    else { "large" };
+
 for i 5 {
     print i;
 }
@@ -82,6 +86,12 @@ for v in arr {
     print v;
 }
 ```
+
+Expression-level `elif` is a PBLang-native self-hosted frontend feature. It is
+desugared to nested `if` expressions, supports the compatible `else if`
+spelling, and has a 256-arm parser bound. Until the legacy bootstrap frontend is
+retired, use `tools/pbselfc.sapp` for source containing expression-level
+`elif`; ordinary statement-level `elif` remains available in both frontends.
 
 Match:
 

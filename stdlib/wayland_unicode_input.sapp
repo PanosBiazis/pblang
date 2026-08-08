@@ -1,0 +1,530 @@
+// Layout-independent Wayland text actuation through the virtual-keyboard-v1
+// protocol. The implementation speaks the Wayland wire protocol directly from
+// PBLang and fails closed when the compositor does not advertise the privileged
+// manager. No external input utility or host-language helper is used.
+
+let Events = import("stdlib:input_events.sapp");
+let Unicode = import("stdlib:unicode.sapp");
+
+let FORMAT = "pblang.wayland.unicode-input.v1";
+let AF_UNIX = 1;
+let SOCK_STREAM_NONBLOCK_CLOEXEC = 526337;
+let POLLIN = 1;
+let POLLOUT = 4;
+let SOL_SOCKET = 1;
+let SCM_RIGHTS = 1;
+let MSG_NOSIGNAL = 16384;
+let MAX_REGISTRY_BYTES = 262144;
+let MAX_UNIQUE_KEYS = 247;
+let MAX_KEYMAP_BYTES = 1048576;
+let LIBC = [
+    map{ path: "/usr/lib/x86_64-linux-gnu/libc.so.6", arch: "x86_64" },
+    map{ path: "/lib/x86_64-linux-gnu/libc.so.6", arch: "x86_64" },
+    map{ path: "/usr/lib/aarch64-linux-gnu/libc.so.6", arch: "aarch64" },
+    map{ path: "/lib/aarch64-linux-gnu/libc.so.6", arch: "aarch64" }
+];
+let CRYPTO = [
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/lib/aarch64-linux-gnu/libcrypto.so.3"
+];
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and num_floor(value) == value
+        and value >= minimum and value <= maximum;
+}
+fn _app(dst, src) {
+    let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+fn _u32(value) {
+    if not _integer(value, 0, 4294967295) { throw "wayland input: invalid uint32"; }
+    return [value % 256, num_floor(value / 256) % 256,
+        num_floor(value / 65536) % 256, num_floor(value / 16777216) % 256];
+}
+fn _read_u32(bytes, offset) {
+    if not is_array(bytes) or offset < 0 or offset + 4 > len(bytes) {
+        throw "wayland input: truncated uint32";
+    }
+    return bytes[offset] + bytes[offset + 1] * 256
+        + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216;
+}
+fn _pad4(value) { return num_floor((value + 3) / 4) * 4; }
+fn _message(object_id, opcode, body = nil) {
+    if body == nil { body = []; }
+    let size = 8 + len(body);
+    if not _integer(object_id, 1, 4294967295) or not _integer(opcode, 0, 65535)
+        or size > 65535 or size % 4 != 0 {
+        throw "wayland input: invalid wire message";
+    }
+    let out = []; _app(out, _u32(object_id));
+    _app(out, _u32(size * 65536 + opcode)); _app(out, body); return out;
+}
+fn _string_arg(value) {
+    if type(value) != "string" or str_contains(value, "\x00") {
+        throw "wayland input: invalid protocol string";
+    }
+    let bytes = str_to_bytes(value); let out = [];
+    _app(out, _u32(len(bytes) + 1)); _app(out, bytes); array_push(out, 0);
+    while len(out) % 4 != 0 { array_push(out, 0); }
+    return out;
+}
+
+fn _support() {
+    if (try platform() catch "") != "linux" {
+        return map{ ok: false, error: "native Wayland input requires Linux" };
+    }
+    let i = 0;
+    while i < len(LIBC) {
+        if try fs_exists(LIBC[i].path) catch false {
+            let j = 0;
+            while j < len(CRYPTO) {
+                if try fs_exists(CRYPTO[j]) catch false {
+                    return map{ ok: true, libc: LIBC[i].path,
+                        crypto: CRYPTO[j], arch: LIBC[i].arch };
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return map{ ok: false, error: "supported libc/libcrypto ABI is unavailable" };
+}
+fn _socket_path() {
+    let runtime = try env_get("XDG_RUNTIME_DIR") catch nil;
+    let display = try env_get("WAYLAND_DISPLAY") catch nil;
+    if type(runtime) != "string" or type(display) != "string"
+        or runtime == "" or display == "" {
+        return map{ ok: false, error: "WAYLAND_DISPLAY or XDG_RUNTIME_DIR is unavailable" };
+    }
+    if str_contains(runtime, "\x00") or str_contains(display, "\x00")
+        or str_contains(display, "/") or display == "." or display == ".." {
+        return map{ ok: false, error: "unsafe Wayland socket path" };
+    }
+    let path = str(runtime) + "/" + str(display);
+    if len(str_to_bytes(path)) > 107 {
+        return map{ ok: false, error: "Wayland socket path exceeds sockaddr_un" };
+    }
+    return map{ ok: true, path: path, display: display, runtime_dir: runtime };
+}
+fn candidate() {
+    let support = _support(); let socket = _socket_path();
+    let arch = "unsupported"; let path = nil; let error = nil;
+    if support.ok { arch = support.arch; } else { error = support.error; }
+    if socket.ok { path = socket.path; } elif error == nil { error = socket.error; }
+    return map{ ok: support.ok and socket.ok, format: FORMAT,
+        backend: "pblang-wayland-virtual-keyboard", platform: platform(),
+        arch: arch, socket: path,
+        compositor_authorization_required: true,
+        required_global: "zwp_virtual_keyboard_manager_v1",
+        layout_independent_unicode: true, external_tool_required: false,
+        error: error };
+}
+
+fn _key_name(index) {
+    let n = str(index);
+    while len(n) < 3 { n = "0" + n; }
+    return "K" + n;
+}
+fn _keysym(cp) {
+    if cp == 9 { return "Tab"; }
+    if cp == 10 or cp == 13 { return "Return"; }
+    if Unicode.is_control(cp) { return nil; }
+    let value = Unicode.hex_codepoint(cp);
+    while len(value) < 4 { value = "0" + value; }
+    return "U" + value;
+}
+fn _keymap(assignments) {
+    let codes = "xkb_keycodes \"pblang\" { minimum = 8; maximum = 255;\n";
+    let symbols = "xkb_symbols \"pblang\" {\n"; let i = 0;
+    while i < len(assignments) {
+        let name = _key_name(i); let xkb_code = assignments[i].key + 8;
+        codes = codes + "  <" + name + "> = " + str(xkb_code) + ";\n";
+        symbols = symbols + "  key <" + name
+            + "> { type=\"ONE_LEVEL\", [ " + assignments[i].keysym + " ] };\n";
+        i = i + 1;
+    }
+    let result = "xkb_keymap {\n" + codes + "};\n"
+        + "xkb_types \"pblang\" { include \"complete\" };\n"
+        + "xkb_compatibility \"pblang\" { include \"complete\" };\n"
+        + symbols + "};\n};\n";
+    if len(str_to_bytes(result)) + 1 > MAX_KEYMAP_BYTES {
+        throw "wayland input: generated keymap exceeds bound";
+    }
+    return result;
+}
+fn _finish_batch(batches, assignments, keys) {
+    if len(keys) == 0 { return; }
+    array_push(batches, map{ assignments: assignments, keys: keys,
+        keymap: _keymap(assignments), scalar_count: len(keys) });
+}
+fn text_plan(text) {
+    let checked = Events.type_event(text); if not checked.ok { return checked; }
+    if len(text) == 0 { return map{ ok: false, error: "Wayland Unicode input text is empty" }; }
+    let batches = []; let assignments = []; let by_scalar = map{}; let keys = [];
+    let i = 0;
+    while i < len(text) {
+        let cp = strcharcodeat(text, i); let symbol = _keysym(cp);
+        if not Unicode.is_valid_scalar(cp) or cp == 0 or symbol == nil {
+            return map{ ok: false, error: "Wayland Unicode input rejects unsupported controls",
+                index: i, codepoint: cp };
+        }
+        let token = str(cp);
+        if not map_has(by_scalar, token) and len(assignments) >= MAX_UNIQUE_KEYS {
+            _finish_batch(batches, assignments, keys);
+            assignments = []; by_scalar = map{}; keys = [];
+        }
+        if not map_has(by_scalar, token) {
+            let key = len(assignments) + 1;
+            by_scalar[token] = key;
+            array_push(assignments, map{ codepoint: cp, keysym: symbol, key: key });
+        }
+        array_push(keys, by_scalar[token]); i = i + 1;
+    }
+    _finish_batch(batches, assignments, keys);
+    return map{ ok: true, format: FORMAT + ".plan", text: checked.event.text,
+        scalar_count: len(text), batch_count: len(batches), batches: batches,
+        max_unique_keys_per_batch: MAX_UNIQUE_KEYS,
+        layout_independent_unicode: true };
+}
+
+fn _call(client, name, signature, args) {
+    return try ffi_call_typed(client.libc, name, signature, args) catch -1;
+}
+fn _i32(value) {
+    if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; }
+    return value;
+}
+fn _memset(client, pointer, value, count) {
+    return _call(client, "memset", "ptr,i32,i64->ptr", [pointer, value, count]);
+}
+fn _free(client, pointer) {
+    if pointer != nil and pointer != 0 { _call(client, "free", "ptr->void", [pointer]); }
+}
+fn _free_crypto(client, pointer) {
+    if pointer != nil and pointer != 0 {
+        try ffi_call_typed(client.crypto, "CRYPTO_free", "ptr,ptr,i32->void",
+            [pointer, 0, 0]) catch nil;
+    }
+}
+fn _write_le(client, pointer, value, count) {
+    let remaining = value; let i = 0;
+    while i < count {
+        _memset(client, pointer + i, remaining % 256, 1);
+        remaining = num_floor(remaining / 256); i = i + 1;
+    }
+}
+fn _alloc_bytes(client, bytes) {
+    let pointer = _call(client, "calloc", "i64,i64->ptr", [len(bytes) + 1, 1]);
+    if pointer == nil or pointer == 0 { return 0; }
+    let i = 0; while i < len(bytes) { _memset(client, pointer + i, bytes[i], 1); i = i + 1; }
+    return pointer;
+}
+fn _pointer_bytes(client, pointer, count) {
+    if pointer == nil or pointer == 0 or not _integer(count, 0, MAX_REGISTRY_BYTES) {
+        return map{ ok: false, error: "invalid native byte copy" };
+    }
+    if count == 0 { return map{ ok: true, bytes: [] }; }
+    let encoded = try ffi_call_typed(client.crypto, "OPENSSL_buf2hexstr",
+        "ptr,i64->ptr", [pointer, count]) catch nil;
+    if encoded == nil or encoded == 0 { return map{ ok: false, error: "native byte encoding failed" }; }
+    let hex = try ffi_call_typed(client.libc, "basename", "ptr->string", [encoded]) catch nil;
+    _free_crypto(client, encoded);
+    if type(hex) != "string" { return map{ ok: false, error: "native byte copy failed" }; }
+    let clean = str_lower(str_replace_all(hex, ":", ""));
+    if len(clean) != count * 2 { return map{ ok: false, error: "native byte count mismatch" }; }
+    let out = []; let i = 0;
+    while i < len(clean) {
+        let hi = str_index_of("0123456789abcdef", str_slice(clean, i, i + 1));
+        let lo = str_index_of("0123456789abcdef", str_slice(clean, i + 1, i + 2));
+        if hi < 0 or lo < 0 { return map{ ok: false, error: "invalid native byte encoding" }; }
+        array_push(out, hi * 16 + lo); i = i + 2;
+    }
+    return map{ ok: true, bytes: out };
+}
+fn _poll(client, events, timeout_ms) {
+    let record = _call(client, "calloc", "i64,i64->ptr", [1, 8]);
+    if record == nil or record == 0 { return -1; }
+    _write_le(client, record, client.fd, 4); _write_le(client, record + 4, events, 2);
+    let result = _i32(_call(client, "poll", "ptr,i64,i32->i32", [record, 1, timeout_ms]));
+    _free(client, record); return result;
+}
+fn _close(client) {
+    if type(client) == "map" and (try client.fd catch -1) >= 0 {
+        _i32(_call(client, "close", "i32->i32", [client.fd])); client.fd = -1;
+    }
+    try ffi_close(client.crypto) catch nil; try ffi_close(client.libc) catch nil;
+    client.closed = true;
+}
+fn _connect(timeout_ms) {
+    let support = _support(); let socket = _socket_path();
+    if not support.ok { return support; } if not socket.ok { return socket; }
+    let libc = try ffi_load(support.libc) catch nil;
+    if libc == nil { return map{ ok: false, error: "trusted libc could not be loaded" }; }
+    let crypto = try ffi_load(support.crypto) catch nil;
+    if crypto == nil { try ffi_close(libc) catch nil;
+        return map{ ok: false, error: "trusted libcrypto could not be loaded" }; }
+    let client = map{ ok: false, format: FORMAT + ".client", libc: libc, crypto: crypto,
+        fd: -1, closed: false, rx: [], socket: socket.path, arch: support.arch };
+    let fd = _i32(_call(client, "socket", "i32,i32,i32->i32",
+        [AF_UNIX, SOCK_STREAM_NONBLOCK_CLOEXEC, 0]));
+    if fd < 0 { _close(client); return map{ ok: false, error: "Wayland socket creation failed" }; }
+    client.fd = fd;
+    let address = _call(client, "calloc", "i64,i64->ptr", [1, 110]);
+    if address == nil or address == 0 { _close(client); return map{ ok: false, error: "Wayland address allocation failed" }; }
+    _write_le(client, address, AF_UNIX, 2); let path_bytes = str_to_bytes(socket.path); let i = 0;
+    while i < len(path_bytes) { _memset(client, address + 2 + i, path_bytes[i], 1); i = i + 1; }
+    let connected = _i32(_call(client, "connect", "i32,ptr,i32->i32",
+        [fd, address, len(path_bytes) + 3]));
+    _free(client, address);
+    if connected != 0 and _poll(client, POLLOUT, timeout_ms) <= 0 {
+        _close(client); return map{ ok: false, error: "Wayland connection deadline expired" };
+    }
+    client.ok = true; return client;
+}
+fn _write_all(client, bytes, timeout_ms) {
+    let pointer = _alloc_bytes(client, bytes);
+    if pointer == 0 { return map{ ok: false, error: "Wayland write allocation failed" }; }
+    let offset = 0; let started = now_ms();
+    while offset < len(bytes) {
+        let remaining = timeout_ms - num_floor(now_ms() - started);
+        if remaining < 1 or _poll(client, POLLOUT, remaining) <= 0 {
+            _free(client, pointer); return map{ ok: false, error: "Wayland write deadline expired" };
+        }
+        let count = _call(client, "write", "i32,ptr,i64->i64",
+            [client.fd, pointer + offset, len(bytes) - offset]);
+        if count < 1 or count > len(bytes) - offset {
+            _free(client, pointer); return map{ ok: false, error: "Wayland write failed" };
+        }
+        offset = offset + count;
+    }
+    _free(client, pointer); return map{ ok: true, count: offset };
+}
+fn _read_more(client, timeout_ms) {
+    if _poll(client, POLLIN, timeout_ms) <= 0 {
+        return map{ ok: false, error: "Wayland read deadline expired" };
+    }
+    let buffer = _call(client, "calloc", "i64,i64->ptr", [4096, 1]);
+    if buffer == nil or buffer == 0 { return map{ ok: false, error: "Wayland read allocation failed" }; }
+    let count = _call(client, "read", "i32,ptr,i64->i64", [client.fd, buffer, 4096]);
+    if count <= 0 { _free(client, buffer); return map{ ok: false, error: "Wayland socket closed" }; }
+    let copied = _pointer_bytes(client, buffer, count); _free(client, buffer);
+    if not copied.ok { return copied; }
+    if len(client.rx) + len(copied.bytes) > MAX_REGISTRY_BYTES {
+        return map{ ok: false, error: "Wayland response exceeds bound" };
+    }
+    _app(client.rx, copied.bytes); return map{ ok: true, count: count };
+}
+
+fn parse_registry(bytes, registry_id = 2, callback_id = 3) {
+    let result = map{ ok: true, complete: false, consumed: 0,
+        manager_name: 0, manager_version: 0, seat_name: 0, seat_version: 0 };
+    let offset = 0;
+    while offset + 8 <= len(bytes) {
+        let object_id = _read_u32(bytes, offset); let word = _read_u32(bytes, offset + 4);
+        let opcode = word % 65536; let size = num_floor(word / 65536);
+        if size < 8 or size % 4 != 0 or size > 65535 {
+            return map{ ok: false, error: "invalid Wayland message size", consumed: offset };
+        }
+        if offset + size > len(bytes) { break; }
+        if object_id == 1 and opcode == 0 {
+            return map{ ok: false, error: "Wayland display reported a protocol error", consumed: offset + size };
+        }
+        if object_id == callback_id and opcode == 0 {
+            result.complete = true;
+        }
+        if object_id == registry_id and opcode == 0 {
+            if size < 20 { return map{ ok: false, error: "truncated registry global", consumed: offset + size }; }
+            let name = _read_u32(bytes, offset + 8); let string_len = _read_u32(bytes, offset + 12);
+            let padded = _pad4(string_len);
+            if string_len < 1 or 16 + padded + 4 > size {
+                return map{ ok: false, error: "invalid registry interface string", consumed: offset + size };
+            }
+            let chars = []; let i = 0;
+            while i + 1 < string_len { array_push(chars, bytes[offset + 16 + i]); i = i + 1; }
+            let interface = try bytes_to_str(chars) catch "";
+            let version = _read_u32(bytes, offset + 16 + padded);
+            if interface == "zwp_virtual_keyboard_manager_v1" {
+                result.manager_name = name; result.manager_version = version;
+            } elif interface == "wl_seat" {
+                result.seat_name = name; result.seat_version = version;
+            }
+        }
+        offset = offset + size; result.consumed = offset;
+    }
+    return result;
+}
+fn _registry(client, timeout_ms) {
+    let sent = _write_all(client, _message(1, 1, _u32(2)), timeout_ms);
+    if not sent.ok { return sent; }
+    sent = _write_all(client, _message(1, 0, _u32(3)), timeout_ms);
+    if not sent.ok { return sent; }
+    let started = now_ms(); let state = nil;
+    while now_ms() - started < timeout_ms {
+        state = parse_registry(client.rx, 2, 3);
+        if not state.ok or state.complete { break; }
+        let remaining = timeout_ms - num_floor(now_ms() - started);
+        let wait_ms = remaining; if wait_ms < 1 { wait_ms = 1; }
+        let read = _read_more(client, wait_ms);
+        if not read.ok { return read; }
+    }
+    if state == nil or not state.ok { return state ?? map{ ok: false, error: "Wayland registry unavailable" }; }
+    if not state.complete { return map{ ok: false, error: "Wayland registry sync deadline expired" }; }
+    if state.manager_name == 0 or state.seat_name == 0 {
+        return map{ ok: false,
+            error: "compositor does not authorize virtual-keyboard-v1 and wl_seat",
+            manager_advertised: state.manager_name != 0, seat_advertised: state.seat_name != 0 };
+    }
+    state.ok = true; return state;
+}
+fn _callback_state(bytes, callback_id) {
+    let offset = 0;
+    while offset + 8 <= len(bytes) {
+        let object_id = _read_u32(bytes, offset); let word = _read_u32(bytes, offset + 4);
+        let opcode = word % 65536; let size = num_floor(word / 65536);
+        if size < 8 or size % 4 != 0 or size > 65535 {
+            return map{ ok: false, error: "invalid Wayland message size" };
+        }
+        if offset + size > len(bytes) { return map{ ok: true, complete: false }; }
+        if object_id == 1 and opcode == 0 {
+            return map{ ok: false, error: "Wayland display reported a protocol error" };
+        }
+        if object_id == callback_id and opcode == 0 { return map{ ok: true, complete: true }; }
+        offset = offset + size;
+    }
+    return map{ ok: true, complete: false };
+}
+fn _roundtrip(client, callback_id, timeout_ms) {
+    let sent = _write_all(client, _message(1, 0, _u32(callback_id)), timeout_ms);
+    if not sent.ok { return sent; }
+    let started = now_ms();
+    while now_ms() - started < timeout_ms {
+        let state = _callback_state(client.rx, callback_id);
+        if not state.ok or state.complete { return state; }
+        let remaining = timeout_ms - num_floor(now_ms() - started);
+        let wait_ms = remaining; if wait_ms < 1 { wait_ms = 1; }
+        let read = _read_more(client, wait_ms);
+        if not read.ok { return read; }
+    }
+    return map{ ok: false, error: "Wayland compositor acknowledgement deadline expired" };
+}
+fn probe(timeout_ms = 200) {
+    if not _integer(timeout_ms, 10, 5000) { return map{ ok: false, error: "invalid Wayland probe deadline" }; }
+    let client = _connect(timeout_ms); if not client.ok { return client; }
+    let registry = _registry(client, timeout_ms); _close(client);
+    let manager_name = try registry.manager_name catch 0;
+    let seat_name = try registry.seat_name catch 0;
+    return map{ ok: registry.ok, format: FORMAT + ".probe",
+        backend: "pblang-wayland-virtual-keyboard",
+        manager_advertised: manager_name != 0,
+        seat_advertised: seat_name != 0,
+        layout_independent_unicode: registry.ok,
+        error: try registry.error catch nil };
+}
+
+fn _bind(registry_id, name, interface, version, new_id) {
+    let body = []; _app(body, _u32(name)); _app(body, _string_arg(interface));
+    _app(body, _u32(version)); _app(body, _u32(new_id));
+    return _message(registry_id, 0, body);
+}
+fn _send_fd(client, bytes, fd, timeout_ms) {
+    if _poll(client, POLLOUT, timeout_ms) <= 0 {
+        return map{ ok: false, error: "Wayland FD write deadline expired" };
+    }
+    let data = _alloc_bytes(client, bytes); let iov = _call(client, "calloc", "i64,i64->ptr", [1, 16]);
+    let control = _call(client, "calloc", "i64,i64->ptr", [1, 24]);
+    let header = _call(client, "calloc", "i64,i64->ptr", [1, 56]);
+    if data == 0 or iov == 0 or control == 0 or header == 0 {
+        _free(client, data); _free(client, iov); _free(client, control); _free(client, header);
+        return map{ ok: false, error: "Wayland FD message allocation failed" };
+    }
+    _write_le(client, iov, data, 8); _write_le(client, iov + 8, len(bytes), 8);
+    _write_le(client, control, 20, 8); _write_le(client, control + 8, SOL_SOCKET, 4);
+    _write_le(client, control + 12, SCM_RIGHTS, 4); _write_le(client, control + 16, fd, 4);
+    _write_le(client, header + 16, iov, 8); _write_le(client, header + 24, 1, 8);
+    _write_le(client, header + 32, control, 8); _write_le(client, header + 40, 24, 8);
+    let count = _call(client, "sendmsg", "i32,ptr,i32->i64", [client.fd, header, MSG_NOSIGNAL]);
+    _free(client, data); _free(client, iov); _free(client, control); _free(client, header);
+    if count != len(bytes) { return map{ ok: false, error: "Wayland FD message was partially sent" }; }
+    return map{ ok: true, count: count };
+}
+fn _send_keymap(client, keyboard_id, keymap, timeout_ms) {
+    let bytes = str_to_bytes(keymap); array_push(bytes, 0);
+    let fd = _i32(_call(client, "memfd_create", "string,i32->i32", ["pblang-wayland-keymap", 1]));
+    if fd < 0 { return map{ ok: false, error: "cannot create private Wayland keymap" }; }
+    let pointer = _alloc_bytes(client, bytes);
+    if pointer == 0 { _call(client, "close", "i32->i32", [fd]);
+        return map{ ok: false, error: "Wayland keymap allocation failed" }; }
+    let count = _call(client, "write", "i32,ptr,i64->i64", [fd, pointer, len(bytes)]);
+    _free(client, pointer);
+    if count != len(bytes) { _call(client, "close", "i32->i32", [fd]);
+        return map{ ok: false, error: "Wayland keymap write failed" }; }
+    _call(client, "lseek", "i32,i64,i32->i64", [fd, 0, 0]);
+    let body = []; _app(body, _u32(1)); _app(body, _u32(len(bytes)));
+    let sent = _send_fd(client, _message(keyboard_id, 0, body), fd, timeout_ms);
+    _call(client, "close", "i32->i32", [fd]); return sent;
+}
+fn _send_keys(client, keyboard_id, keys, timeout_ms) {
+    let i = 0;
+    while i < len(keys) {
+        let time = num_floor(now_ms()) % 4294967296; let body = [];
+        _app(body, _u32(time)); _app(body, _u32(keys[i])); _app(body, _u32(1));
+        let down = _write_all(client, _message(keyboard_id, 1, body), timeout_ms);
+        if not down.ok { return down; }
+        body = []; _app(body, _u32(time)); _app(body, _u32(keys[i])); _app(body, _u32(0));
+        let up = _write_all(client, _message(keyboard_id, 1, body), timeout_ms);
+        if not up.ok { return up; } i = i + 1;
+    }
+    return map{ ok: true, key_events: len(keys) * 2 };
+}
+fn execute(event, timeout_ms = 1000) {
+    let checked = Events.validate(event); if not checked.ok { return checked; }
+    if checked.event.kind != "type" {
+        return map{ ok: false, error: "Wayland semantic input supports complete text events only" };
+    }
+    if not _integer(timeout_ms, 50, 10000) { return map{ ok: false, error: "invalid Wayland execution deadline" }; }
+    let plan = text_plan(checked.event.text); if not plan.ok { return plan; }
+    let client = _connect(timeout_ms); if not client.ok { return client; }
+    let registry = _registry(client, timeout_ms);
+    if not registry.ok { _close(client); return registry; }
+    let seat_id = 4; let manager_id = 5; let keyboard_id = 6;
+    let sent = _write_all(client, _bind(2, registry.seat_name, "wl_seat", 1, seat_id), timeout_ms);
+    if not sent.ok { _close(client); return sent; }
+    sent = _write_all(client, _bind(2, registry.manager_name,
+        "zwp_virtual_keyboard_manager_v1", 1, manager_id), timeout_ms);
+    if not sent.ok { _close(client); return sent; }
+    let create = []; _app(create, _u32(keyboard_id)); _app(create, _u32(seat_id));
+    sent = _write_all(client, _message(manager_id, 0, create), timeout_ms);
+    if not sent.ok { _close(client); return sent; }
+    let total_events = 0; let i = 0;
+    while i < len(plan.batches) {
+        sent = _send_keymap(client, keyboard_id, plan.batches[i].keymap, timeout_ms);
+        if not sent.ok { _close(client); return sent; }
+        let keys = _send_keys(client, keyboard_id, plan.batches[i].keys, timeout_ms);
+        if not keys.ok { _close(client); return keys; }
+        total_events = total_events + keys.key_events; i = i + 1;
+    }
+    sent = _write_all(client, _message(keyboard_id, 3, []), timeout_ms);
+    if not sent.ok { _close(client); return sent; }
+    let acknowledged = _roundtrip(client, 7, timeout_ms); _close(client);
+    if not acknowledged.ok or not acknowledged.complete { return acknowledged; }
+    return map{ ok: true, format: FORMAT + ".result",
+        backend: "pblang-wayland-virtual-keyboard", event: "type", native: true,
+        semantic_unicode_scalars: plan.scalar_count, key_events: total_events,
+        keymap_batches: plan.batch_count, layout_independent_unicode: true,
+        compositor_authorized: true, compositor_acknowledged: true,
+        external_tool_required: false };
+}
+fn capabilities() {
+    return map{ format: FORMAT + ".capabilities", text: true,
+        text_unicode_layout_independent: true, supplementary_planes: true,
+        controls: ["Tab", "Return"], max_unique_keys_per_batch: MAX_UNIQUE_KEYS,
+        backend: "pblang-wayland-virtual-keyboard",
+        system_api: "Wayland virtual-keyboard-unstable-v1 wire protocol",
+        compositor_authorization_required: true, privileged_protocol_fail_closed: true,
+        bounded_registry_bytes: MAX_REGISTRY_BYTES, bounded_keymap_bytes: MAX_KEYMAP_BYTES,
+        native_pblang_wire_client: true, external_tool_required: false };
+}
+
+export candidate, probe, text_plan, parse_registry, execute, capabilities;
