@@ -22,6 +22,17 @@ fn _positive(value, fallback, maximum, label) {
 
 fn _smaller(a, b) { return if a < b { a } else { b }; }
 
+fn _number(options, key, fallback) {
+    let value = _option(options, key, fallback);
+    if type(value) != "number" { return fallback; }
+    return value;
+}
+
+fn _bool(options, key, fallback) {
+    let value = _option(options, key, fallback);
+    return if type(value) == "bool" { value } else { fallback };
+}
+
 fn linux_available_mb() {
     if OS.platform() != "linux" { return nil; }
     let text = try fs_read("/proc/meminfo") catch nil;
@@ -47,12 +58,19 @@ fn linux_available_mb() {
 
 fn plan(options = nil) {
     let profile = str_lower(str(_option(options, "profile", "standard")));
-    if profile != "standard" and profile != "large-product" {
+    if profile != "standard" and profile != "large-product"
+        and profile != "physical-device" and profile != "sustained-soak" {
         throw "test_scheduler: unknown workload profile";
     }
     let cpus = _positive(_option(options, "cpu_count", OS.cpu_count()), 1, 1024, "CPU count");
-    let max_jobs = _positive(_option(options, "max_jobs", cpus), cpus, 1024, "maximum jobs");
-    let default_worker = if profile == "large-product" { 1536 } else { 512 };
+    let serialized = profile == "physical-device" or profile == "sustained-soak";
+    let default_max_jobs = if serialized { 1 } else { cpus };
+    let max_jobs = _positive(
+        _option(options, "max_jobs", default_max_jobs), default_max_jobs, 1024, "maximum jobs");
+    let default_worker = 512;
+    if profile == "large-product" { default_worker = 1536; }
+    elif profile == "physical-device" { default_worker = 256; }
+    elif profile == "sustained-soak" { default_worker = 384; }
     let worker_mb = _positive(_option(options, "worker_mb", default_worker), nil, 1048576, "worker memory");
     let reserve_mb = _positive(_option(options, "reserve_mb", 1024), nil, 1048576, "memory reserve");
     let available = _option(options, "available_mb", linux_available_mb());
@@ -64,15 +82,74 @@ fn plan(options = nil) {
         memory_limited = memory_jobs < cpus;
     } else {
         // Unknown memory must not silently expand a large suite to every CPU.
-        memory_jobs = if profile == "large-product" { 2 } else { cpus };
-        memory_limited = profile == "large-product";
+        memory_jobs = if profile == "large-product" { 2 }
+            else { if serialized { 1 } else { cpus } };
+        memory_limited = profile == "large-product" or serialized;
     }
     let jobs = _smaller(_smaller(cpus, max_jobs), memory_jobs);
     if jobs < 1 { jobs = 1; }
-    return map{ format: "pblang.test-scheduler.plan.v1", profile: profile,
+    let target_cpu_percent = 90;
+    if profile == "large-product" { target_cpu_percent = 75; }
+    elif profile == "physical-device" { target_cpu_percent = 40; }
+    elif profile == "sustained-soak" { target_cpu_percent = 30; }
+    return map{ format: "pblang.test-scheduler.plan.v2", profile: profile,
         jobs: jobs, cpu_count: cpus, available_mb: available,
         reserve_mb: reserve_mb, worker_mb: worker_mb,
-        memory_cap: memory_jobs, memory_limited: memory_limited };
+        memory_cap: memory_jobs, memory_limited: memory_limited,
+        target_cpu_percent: target_cpu_percent,
+        device_lane_serialized: serialized,
+        recommendation: if serialized {
+            "serialize access to each physical device; parallelize only independent host-only tests"
+        } else { "run independent files in isolated workers and reuse unchanged passing results" } };
 }
 
-export linux_available_mb, plan;
+// Convert a live device sample into deterministic pacing and admission limits.
+// Product verifiers pass their own sampled values, so this remains portable and
+// testable without probing private device state from the language runtime.
+fn device_policy(sample = nil, options = nil) {
+    let value = if type(sample) == "map" { sample } else { map{} };
+    let maximum_temperature_c = _number(options, "maximum_temperature_c", 45);
+    let warning_temperature_c = _number(options, "warning_temperature_c", 40);
+    let minimum_battery_percent = _number(options, "minimum_battery_percent", 10);
+    let maximum_pss_kib = _number(options, "maximum_pss_kib", 131072);
+    if maximum_temperature_c <= warning_temperature_c
+        or warning_temperature_c < -20 or maximum_temperature_c > 100
+        or minimum_battery_percent < 0 or minimum_battery_percent > 100
+        or maximum_pss_kib < 1024 {
+        throw "test_scheduler: invalid physical-device safety limits";
+    }
+
+    let temperature_c = _number(value, "temperature_c", nil);
+    let battery_percent = _number(value, "battery_percent", nil);
+    let pss_kib = _number(value, "pss_kib", nil);
+    let powered = _bool(value, "powered", false);
+    let power_save = _bool(value, "power_save", false);
+    let allowed = true; let reason = "within-budget"; let pressure = "normal";
+    if temperature_c != nil and temperature_c >= maximum_temperature_c {
+        allowed = false; pressure = "critical"; reason = "temperature-limit";
+    } elif pss_kib != nil and pss_kib > maximum_pss_kib {
+        allowed = false; pressure = "critical"; reason = "memory-limit";
+    } elif battery_percent != nil and battery_percent <= minimum_battery_percent and not powered {
+        allowed = false; pressure = "critical"; reason = "battery-limit";
+    } elif (temperature_c != nil and temperature_c >= warning_temperature_c)
+        or (pss_kib != nil and pss_kib * 100 >= maximum_pss_kib * 85)
+        or power_save {
+        pressure = "elevated"; reason = "adaptive-throttle";
+    }
+
+    let loop_pause_ms = if pressure == "elevated" { 20 } else { 5 };
+    let health_probe_interval_ms = if pressure == "elevated" { 5000 } else { 2000 };
+    let host_poll_batch = if pressure == "elevated" { 8 } else { 32 };
+    return map{ format: "pblang.test-scheduler.device-policy.v1",
+        allowed: allowed, reason: reason, pressure: pressure,
+        loop_pause_ms: loop_pause_ms,
+        health_probe_interval_ms: health_probe_interval_ms,
+        host_poll_batch: host_poll_batch,
+        device_jobs: 1, device_lane_serialized: true,
+        maximum_temperature_c: maximum_temperature_c,
+        warning_temperature_c: warning_temperature_c,
+        minimum_battery_percent: minimum_battery_percent,
+        maximum_pss_kib: maximum_pss_kib };
+}
+
+export linux_available_mb, plan, device_policy;

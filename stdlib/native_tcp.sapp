@@ -201,7 +201,7 @@ fn _open_handles(support, format) {
     return map{ ok: true, format: format, libc: libc, crypto: crypto,
         libc_path: support.path, crypto_path: support.crypto_path,
         arch: support.arch, fd: -1, closed: false,
-        nonblocking: true, cloexec: true };
+        nonblocking: true, cloexec: true, pending_bytes: [] };
 }
 
 fn _sockaddr(socket, address, port) {
@@ -339,33 +339,66 @@ fn connect_ipv4(host, port, timeout_ms = 250) {
     return socket;
 }
 
-fn write_text(socket, value, timeout_ms = 500) {
+fn _valid_bytes(value, maximum) {
+    if not is_array(value) or len(value) > maximum { return false; }
+    let i = 0;
+    while i < len(value) {
+        if not _integer(value[i], 0, 255) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _hex_bytes(value) {
+    let digits = "0123456789abcdef";
+    let out = ""; let i = 0;
+    while i < len(value) {
+        let high = num_floor(value[i] / 16);
+        let low = num_mod(value[i], 16);
+        out = out + str_slice(digits, high, high + 1)
+            + str_slice(digits, low, low + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn write_bytes(socket, value, timeout_ms = 500) {
     if type(socket) != "map" or (try socket.format catch "") != FORMAT
-        or (try socket.closed catch true) or type(value) != "string"
-        or len(value) > MAX_TEXT_BYTES or str_contains(value, "\x00")
+        or (try socket.closed catch true) or not _valid_bytes(value, MAX_TEXT_BYTES)
         or not _integer(timeout_ms, 1, 60000) {
-        return map{ ok: false, error: "invalid bounded text write" };
+        return map{ ok: false, error: "invalid bounded byte write" };
+    }
+    if len(value) == 0 { return map{ ok: true, count: 0, elapsed_ms: 0 }; }
+    let encoded = _hex_bytes(value);
+    let buffer = try ffi_call_typed(socket.crypto, "OPENSSL_hexstr2buf",
+        "string,ptr->ptr", [encoded, 0]) catch nil;
+    if buffer == nil or buffer == 0 {
+        return map{ ok: false, error: "native byte write allocation failed" };
     }
     let offset = 0; let started = now_ms();
     while offset < len(value) {
         let remaining = timeout_ms - num_floor(now_ms() - started);
         if remaining < 1 or _poll(socket, POLLOUT, remaining) <= 0 {
+            _free_crypto(socket, buffer);
             return map{ ok: false, error: "write deadline expired", timeout: true };
         }
-        let part = str_slice(value, offset, len(value));
-        let buffer = _call(socket, "strdup", "string->ptr", [part]);
-        if buffer == nil or buffer == 0 {
-            return map{ ok: false, error: "text write allocation failed" };
-        }
         let count = _call(socket, "write", "i32,ptr,i64->i64",
-            [socket.fd, buffer, len(part)]);
-        _free(socket, buffer);
-        if count < 1 or count > len(part) {
+            [socket.fd, buffer + offset, len(value) - offset]);
+        if count < 1 or count > len(value) - offset {
+            _free_crypto(socket, buffer);
             return map{ ok: false, error: "nonblocking text write failed", native_count: count };
         }
         offset = offset + count;
     }
+    _free_crypto(socket, buffer);
     return map{ ok: true, count: offset, elapsed_ms: now_ms() - started };
+}
+
+fn write_text(socket, value, timeout_ms = 500) {
+    if type(value) != "string" or len(str_to_bytes(value)) > MAX_TEXT_BYTES {
+        return map{ ok: false, error: "invalid bounded text write" };
+    }
+    return write_bytes(socket, str_to_bytes(value), timeout_ms);
 }
 
 fn _read_chunk(socket, maximum) {
@@ -383,41 +416,122 @@ fn _read_chunk(socket, maximum) {
     let copied = _pointer_bytes(socket, buffer, count);
     _free(socket, buffer);
     if not copied.ok { return copied; }
-    let text = try bytes_to_str(copied.bytes) catch nil;
-    if type(text) != "string" or len(str_to_bytes(text)) != count {
-        return map{ ok: false, error: "native read was not valid UTF-8 text" };
-    }
-    return map{ ok: true, text: text, count: count };
+    return map{ ok: true, bytes: copied.bytes, count: count };
 }
 
-fn read_until(socket, delimiter, maximum, timeout_ms = 500) {
+fn _append_bytes(target, source) {
+    let i = 0;
+    while i < len(source) { array_push(target, source[i]); i = i + 1; }
+}
+
+fn _find_bytes(haystack, needle) {
+    if len(needle) == 0 { return 0; }
+    let i = 0;
+    while i + len(needle) <= len(haystack) {
+        let j = 0; let matched = true;
+        while j < len(needle) and matched {
+            if haystack[i + j] != needle[j] { matched = false; }
+            j = j + 1;
+        }
+        if matched { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _take_pending(socket) {
+    let pending = try socket.pending_bytes catch [];
+    if not is_array(pending) { pending = []; }
+    socket.pending_bytes = [];
+    return pending;
+}
+
+fn read_until_bytes(socket, delimiter, maximum, timeout_ms = 500) {
     if type(socket) != "map" or (try socket.format catch "") != FORMAT
-        or (try socket.closed catch true) or type(delimiter) != "string"
-        or len(delimiter) < 1 or len(delimiter) > 16
+        or (try socket.closed catch true) or not _valid_bytes(delimiter, 16)
+        or len(delimiter) < 1
         or not _integer(maximum, 1, MAX_TEXT_BYTES)
         or not _integer(timeout_ms, 1, 60000) {
-        return map{ ok: false, error: "invalid bounded text read" };
+        return map{ ok: false, error: "invalid bounded byte read" };
     }
-    let output = ""; let started = now_ms();
-    while len(output) < maximum and not str_contains(output, delimiter) {
+    let output = _take_pending(socket); let started = now_ms();
+    let position = _find_bytes(output, delimiter);
+    while len(output) < maximum and position < 0 {
         let remaining = timeout_ms - num_floor(now_ms() - started);
         if remaining < 1 or _poll(socket, POLLIN, remaining) <= 0 {
+            socket.pending_bytes = output;
             return map{ ok: false, error: "read deadline expired", timeout: true,
                 elapsed_ms: now_ms() - started };
         }
         let chunk_size = maximum - len(output);
         if chunk_size > 4096 { chunk_size = 4096; }
         let chunk = _read_chunk(socket, chunk_size);
-        if not chunk.ok { return chunk; }
-        output = output + chunk.text;
+        if not chunk.ok { socket.pending_bytes = output; return chunk; }
+        _append_bytes(output, chunk.bytes);
+        position = _find_bytes(output, delimiter);
     }
-    let position = str_index_of(output, delimiter);
     if position < 0 {
+        socket.pending_bytes = output;
         return map{ ok: false, error: "text delimiter was not found within bound" };
     }
-    return map{ ok: true,
-        text: str_slice(output, 0, position + len(delimiter)),
-        count: position + len(delimiter), elapsed_ms: now_ms() - started };
+    let finish = position + len(delimiter);
+    let result = slice(output, 0, finish);
+    socket.pending_bytes = slice(output, finish, len(output));
+    return map{ ok: true, bytes: result, count: len(result),
+        elapsed_ms: now_ms() - started };
+}
+
+fn read_exact_bytes(socket, count, timeout_ms = 500) {
+    if type(socket) != "map" or (try socket.format catch "") != FORMAT
+        or (try socket.closed catch true) or not _integer(count, 0, MAX_TEXT_BYTES)
+        or not _integer(timeout_ms, 1, 60000) {
+        return map{ ok: false, error: "invalid bounded exact byte read" };
+    }
+    let output = _take_pending(socket); let started = now_ms();
+    if len(output) > count {
+        socket.pending_bytes = slice(output, count, len(output));
+        output = slice(output, 0, count);
+    }
+    while len(output) < count {
+        let remaining = timeout_ms - num_floor(now_ms() - started);
+        if remaining < 1 or _poll(socket, POLLIN, remaining) <= 0 {
+            socket.pending_bytes = output;
+            return map{ ok: false, error: "exact read deadline expired", timeout: true,
+                elapsed_ms: now_ms() - started };
+        }
+        let chunk_size = count - len(output);
+        if chunk_size > 4096 { chunk_size = 4096; }
+        let chunk = _read_chunk(socket, chunk_size);
+        if not chunk.ok { socket.pending_bytes = output; return chunk; }
+        _append_bytes(output, chunk.bytes);
+    }
+    return map{ ok: true, bytes: output, count: len(output),
+        elapsed_ms: now_ms() - started };
+}
+
+fn read_until(socket, delimiter, maximum, timeout_ms = 500) {
+    if type(delimiter) != "string" {
+        return map{ ok: false, error: "invalid bounded text read" };
+    }
+    let result = read_until_bytes(socket, str_to_bytes(delimiter), maximum, timeout_ms);
+    if not result.ok { return result; }
+    let text = try bytes_to_str(result.bytes) catch nil;
+    if type(text) != "string" {
+        return map{ ok: false, error: "native read was not valid UTF-8 text" };
+    }
+    result.text = text;
+    return result;
+}
+
+fn read_exact_text(socket, count, timeout_ms = 500) {
+    let result = read_exact_bytes(socket, count, timeout_ms);
+    if not result.ok { return result; }
+    let text = try bytes_to_str(result.bytes) catch nil;
+    if type(text) != "string" {
+        return map{ ok: false, error: "native exact read was not valid UTF-8 text" };
+    }
+    result.text = text;
+    return result;
 }
 
 fn close(socket) {
@@ -432,4 +546,5 @@ fn close(socket) {
 
 export FORMAT, LISTENER_FORMAT, MAX_TEXT_BYTES;
 export available, listen_ipv4, accept_bounded, connect_ipv4;
-export write_text, read_until, close;
+export write_bytes, write_text, read_until_bytes, read_exact_bytes,
+       read_until, read_exact_text, close;

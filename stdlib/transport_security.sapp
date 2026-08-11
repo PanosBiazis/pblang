@@ -1,0 +1,318 @@
+// Carrier-independent transport risk guard.
+//
+// USB, chargers, Wi-Fi, Bluetooth and relays are treated as untrusted carriers,
+// not automatically malicious. Cryptographic identity, channel binding,
+// downgrade and replay failures block; mutable radio/network signals warn and
+// require explicit baseline approval.
+
+let Crypto = import("stdlib:crypto.sapp");
+
+let FORMAT = "pblang.transport-security.v1";
+let SNAPSHOT_FORMAT = "pblang.transport-security.snapshot.v1";
+let TRANSPORTS = ["usb", "charger", "wifi", "bluetooth", "ethernet",
+    "vpn", "cellular", "tor", "relay", "loopback", "unknown"];
+let PURPOSES = ["connectivity", "charging"];
+let PROTOCOLS = ["none", "legacy", "tls12", "pbremote-e2e", "tls13", "tor-v3"];
+let SIGNAL_FIELDS = ["gateway_fingerprint", "access_point_fingerprint",
+    "peer_address_fingerprint", "accessory_fingerprint"];
+let MAX_NONCES = 1024;
+
+fn _contains(values, wanted) {
+    let i = 0; while i < len(values) { if values[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _hex64(value, optional = false) {
+    if optional and (value == nil or value == "") { return ""; }
+    if type(value) != "string" or len(value) != 64 { return nil; }
+    let lower = str_lower(value); let i = 0;
+    while i < 64 {
+        let c = str_slice(lower, i, i + 1);
+        if not str_contains("0123456789abcdef", c) { return nil; }
+        i = i + 1;
+    }
+    return lower;
+}
+
+fn _protocol_level(value) {
+    let i = 0; while i < len(PROTOCOLS) { if PROTOCOLS[i] == value { return i; } i = i + 1; }
+    return -1;
+}
+
+fn signal_fingerprint(kind, value) {
+    if not _contains(["gateway", "access-point", "peer-address", "accessory"], kind)
+        or type(value) != "string" or len(value) < 1 or len(value) > 1024
+        or str_contains(value, "\x00") {
+        throw "transport_security: invalid signal input";
+    }
+    return Crypto.hash("pblang:transport-signal:v1|" + kind + "|" + value);
+}
+
+fn new(options = nil) {
+    if options == nil { options = map{}; }
+    if not is_map(options) { throw "transport_security: options must be a map"; }
+    let identity = _hex64(try options.expected_identity catch "", true);
+    let certificate = _hex64(try options.expected_certificate_sha256 catch "", true);
+    let binding = _hex64(try options.expected_channel_binding_sha256 catch "", true);
+    let minimum = str_lower(str(try options.minimum_protocol catch "pbremote-e2e"));
+    let max_nonces = try options.max_nonces catch 256;
+    let require_app = try options.require_application_authentication catch true;
+    let require_certificate = try options.require_certificate_evidence catch false;
+    let require_binding = try options.require_channel_binding catch false;
+    if identity == nil or certificate == nil or binding == nil
+        or _protocol_level(minimum) < 0 or type(max_nonces) != "number"
+        or num_floor(max_nonces) != max_nonces or max_nonces < 16
+        or max_nonces > MAX_NONCES or type(require_app) != "bool"
+        or type(require_certificate) != "bool" or type(require_binding) != "bool" {
+        throw "transport_security: invalid guard options";
+    }
+    return map{ format: FORMAT, expected_identity: identity,
+        expected_certificate_sha256: certificate,
+        expected_channel_binding_sha256: binding,
+        minimum_protocol: minimum, require_application_authentication: require_app,
+        require_certificate_evidence: require_certificate,
+        require_channel_binding: require_binding,
+        max_nonces: max_nonces, seen_nonces: map{}, nonce_order: [],
+        last_sequence: -1, transport_baseline: "", signal_baseline: map{}, observations: 0,
+        blocked: 0, warnings: 0, last_risk: "none" };
+}
+
+fn _valid_guard(guard) { return is_map(guard) and (try guard.format catch "") == FORMAT; }
+
+fn _observation(value) {
+    if not is_map(value) { return map{ ok: false, error: "observation must be a map" }; }
+    let allowed = ["transport", "purpose", "protocol", "application_authenticated",
+        "identity_fingerprint", "certificate_sha256", "channel_binding_sha256",
+        "sequence", "nonce", "data_enabled", "charging",
+        "gateway_fingerprint", "access_point_fingerprint",
+        "peer_address_fingerprint", "accessory_fingerprint"];
+    let keys = map_keys(value); let k = 0;
+    while k < len(keys) {
+        if not _contains(allowed, keys[k]) {
+            return map{ ok: false, error: "unknown observation field" };
+        }
+        k = k + 1;
+    }
+    let transport = str_lower(str(try value.transport catch "unknown"));
+    let purpose = str_lower(str(try value.purpose catch "connectivity"));
+    let protocol = str_lower(str(try value.protocol catch "none"));
+    let authenticated = try value.application_authenticated catch false;
+    let identity = _hex64(try value.identity_fingerprint catch "", true);
+    let certificate = _hex64(try value.certificate_sha256 catch "", true);
+    let binding = _hex64(try value.channel_binding_sha256 catch "", true);
+    let sequence = try value.sequence catch -1;
+    let nonce = try value.nonce catch "";
+    let data_enabled = try value.data_enabled catch false;
+    let charging = try value.charging catch false;
+    if not _contains(TRANSPORTS, transport) or not _contains(PURPOSES, purpose)
+        or _protocol_level(protocol) < 0 or type(authenticated) != "bool"
+        or identity == nil or certificate == nil or binding == nil
+        or type(sequence) != "number" or num_floor(sequence) != sequence
+        or sequence < 0 or sequence > 9007199254740991
+        or type(nonce) != "string" or len(nonce) < 16 or len(nonce) > 128
+        or str_contains(nonce, "\x00") or type(data_enabled) != "bool"
+        or type(charging) != "bool" {
+        return map{ ok: false, error: "invalid transport observation" };
+    }
+    let signals = map{}; let i = 0;
+    while i < len(SIGNAL_FIELDS) {
+        let raw = try value[SIGNAL_FIELDS[i]] catch "";
+        let checked = _hex64(raw, true);
+        if checked == nil { return map{ ok: false, error: "invalid signal fingerprint" }; }
+        signals[SIGNAL_FIELDS[i]] = checked; i = i + 1;
+    }
+    return map{ ok: true, transport: transport, purpose: purpose,
+        protocol: protocol, protocol_level: _protocol_level(protocol),
+        application_authenticated: authenticated, identity_fingerprint: identity,
+        certificate_sha256: certificate, channel_binding_sha256: binding,
+        sequence: sequence, nonce_digest: Crypto.hash("pblang:transport-nonce:v1|" + nonce),
+        data_enabled: data_enabled, charging: charging, signals: signals };
+}
+
+fn _block(guard, reason) {
+    guard.blocked = guard.blocked + 1; guard.last_risk = "blocked";
+    return map{ ok: false, blocked: true, fail_closed: true, error: reason,
+        cryptographic_failure: true };
+}
+
+fn observe(guard, value) {
+    if not _valid_guard(guard) { return map{ ok: false, blocked: true, error: "invalid guard" }; }
+    let item = _observation(value);
+    if not item.ok { return _block(guard, item.error); }
+    if item.purpose == "charging" and item.data_enabled {
+        return _block(guard, "charging-only policy detected an active data path");
+    }
+    if item.purpose == "connectivity" and guard.require_application_authentication
+        and not item.application_authenticated {
+        return _block(guard, "carrier has no authenticated application channel");
+    }
+    if item.protocol_level < _protocol_level(guard.minimum_protocol) {
+        return _block(guard, "transport protocol downgrade rejected");
+    }
+    if guard.expected_identity != "" and (item.identity_fingerprint == ""
+        or not Crypto.constant_time_compare(guard.expected_identity, item.identity_fingerprint)) {
+        return _block(guard, "trusted peer identity changed");
+    }
+    if guard.expected_certificate_sha256 != "" and (item.certificate_sha256 == ""
+        or not Crypto.constant_time_compare(guard.expected_certificate_sha256,
+            item.certificate_sha256)) {
+        return _block(guard, "pinned certificate changed");
+    }
+    if guard.require_certificate_evidence and item.certificate_sha256 == "" {
+        return _block(guard, "required certificate evidence is missing");
+    }
+    if guard.expected_channel_binding_sha256 != "" and
+        (item.channel_binding_sha256 == "" or not Crypto.constant_time_compare(
+            guard.expected_channel_binding_sha256, item.channel_binding_sha256)) {
+        return _block(guard, "channel binding changed");
+    }
+    if guard.require_channel_binding and item.channel_binding_sha256 == "" {
+        return _block(guard, "required channel binding is missing");
+    }
+    if item.sequence <= guard.last_sequence or map_has(guard.seen_nonces, item.nonce_digest) {
+        return _block(guard, "transport replay rejected");
+    }
+
+    let warnings = [];
+    if guard.last_sequence >= 0 and item.sequence != guard.last_sequence + 1 {
+        array_push(warnings, "sequence_gap");
+    }
+    if item.data_enabled and (item.transport == "usb" or item.transport == "charger") {
+        array_push(warnings, "physical_data_path_active");
+    }
+    let changed = []; let i = 0;
+    if guard.transport_baseline != "" and item.transport != guard.transport_baseline {
+        array_push(changed, "transport");
+        array_push(warnings, "transport_changed");
+    }
+    while i < len(SIGNAL_FIELDS) {
+        let key = SIGNAL_FIELDS[i]; let current = item.signals[key];
+        let baseline = try guard.signal_baseline[key] catch "";
+        if current != "" and baseline != "" and
+            not Crypto.constant_time_compare(current, baseline) {
+            array_push(changed, key); array_push(warnings, "signal_changed:" + key);
+        }
+        i = i + 1;
+    }
+
+    // Commit only after all fail-closed checks pass.
+    guard.last_sequence = item.sequence;
+    guard.seen_nonces[item.nonce_digest] = true;
+    array_push(guard.nonce_order, item.nonce_digest);
+    while len(guard.nonce_order) > guard.max_nonces {
+        let oldest = guard.nonce_order[0]; let shift = 1;
+        while shift < len(guard.nonce_order) {
+            guard.nonce_order[shift - 1] = guard.nonce_order[shift]; shift = shift + 1;
+        }
+        array_pop(guard.nonce_order); map_remove(guard.seen_nonces, oldest);
+    }
+    if guard.expected_identity == "" and item.identity_fingerprint != "" {
+        guard.expected_identity = item.identity_fingerprint;
+    }
+    if guard.expected_certificate_sha256 == "" and item.certificate_sha256 != "" {
+        guard.expected_certificate_sha256 = item.certificate_sha256;
+    }
+    if guard.expected_channel_binding_sha256 == "" and item.channel_binding_sha256 != "" {
+        guard.expected_channel_binding_sha256 = item.channel_binding_sha256;
+    }
+    guard.observations = guard.observations + 1;
+    guard.warnings = guard.warnings + len(warnings);
+    guard.last_risk = if len(changed) > 0 { "warning" } else { "none" };
+    return map{ ok: true, blocked: false, authenticated: item.application_authenticated,
+        warnings: warnings, signal_changes: changed,
+        needs_signal_confirmation: len(changed) > 0,
+        carrier_trusted: false, identity_verified: item.identity_fingerprint != "" };
+}
+
+fn approve_signal_baseline(guard, value) {
+    if not _valid_guard(guard) { return map{ ok: false, error: "invalid guard" }; }
+    let item = _observation(value);
+    if not item.ok or not item.application_authenticated
+        or item.protocol_level < _protocol_level(guard.minimum_protocol)
+        or (guard.expected_identity != "" and (item.identity_fingerprint == ""
+            or not Crypto.constant_time_compare(guard.expected_identity,
+                item.identity_fingerprint)))
+        or (guard.expected_certificate_sha256 != "" and
+            (item.certificate_sha256 == "" or not Crypto.constant_time_compare(
+                guard.expected_certificate_sha256, item.certificate_sha256)))
+        or (guard.expected_channel_binding_sha256 != "" and
+            (item.channel_binding_sha256 == "" or not Crypto.constant_time_compare(
+                guard.expected_channel_binding_sha256, item.channel_binding_sha256)))
+        or (guard.require_certificate_evidence and item.certificate_sha256 == "")
+        or (guard.require_channel_binding and item.channel_binding_sha256 == "") {
+        return map{ ok: false,
+            error: "only the verified peer channel can update the transport baseline" };
+    }
+    guard.transport_baseline = item.transport;
+    let i = 0; while i < len(SIGNAL_FIELDS) {
+        let key = SIGNAL_FIELDS[i];
+        if item.signals[key] != "" { guard.signal_baseline[key] = item.signals[key]; }
+        i = i + 1;
+    }
+    return map{ ok: true, updated: true, redacted: true };
+}
+
+fn status(guard) {
+    if not _valid_guard(guard) { return map{ ok: false, error: "invalid guard" }; }
+    return map{ ok: true, format: FORMAT, observations: guard.observations,
+        blocked: guard.blocked, warnings: guard.warnings,
+        last_risk: guard.last_risk, pinned_identity: guard.expected_identity != "",
+        pinned_certificate: guard.expected_certificate_sha256 != "",
+        pinned_channel_binding: guard.expected_channel_binding_sha256 != "",
+        transport_baseline_set: guard.transport_baseline != "",
+        retained_replay_nonces: len(guard.nonce_order), max_nonces: guard.max_nonces,
+        raw_identifiers_exposed: false,
+        boundary: "cryptographic violations block; carrier signal anomalies warn and require confirmation" };
+}
+
+fn _copy_signal_baseline(source) {
+    let out = map{}; let i = 0;
+    while i < len(SIGNAL_FIELDS) {
+        let value = try source[SIGNAL_FIELDS[i]] catch "";
+        if value != "" { out[SIGNAL_FIELDS[i]] = value; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn trusted_snapshot(guard) {
+    if not _valid_guard(guard) { return map{ ok: false, error: "invalid guard" }; }
+    return map{ ok: true, format: SNAPSHOT_FORMAT,
+        expected_identity: guard.expected_identity,
+        expected_certificate_sha256: guard.expected_certificate_sha256,
+        expected_channel_binding_sha256: guard.expected_channel_binding_sha256,
+        minimum_protocol: guard.minimum_protocol,
+        require_application_authentication: guard.require_application_authentication,
+        require_certificate_evidence: guard.require_certificate_evidence,
+        require_channel_binding: guard.require_channel_binding,
+        max_nonces: guard.max_nonces,
+        transport_baseline: guard.transport_baseline,
+        signal_baseline: _copy_signal_baseline(guard.signal_baseline) };
+}
+
+fn restore_trusted(snapshot) {
+    if not is_map(snapshot) or (try snapshot.format catch "") != SNAPSHOT_FORMAT {
+        return map{ ok: false, error: "invalid transport-security snapshot" };
+    }
+    let guard = try new(snapshot) catch nil;
+    let transport_baseline = try snapshot.transport_baseline catch "";
+    if guard == nil or not is_map(try snapshot.signal_baseline catch nil)
+        or type(transport_baseline) != "string"
+        or (transport_baseline != "" and not _contains(TRANSPORTS, transport_baseline)) {
+        return map{ ok: false, error: "invalid transport-security snapshot" };
+    }
+    guard.transport_baseline = transport_baseline;
+    let keys = map_keys(snapshot.signal_baseline); let i = 0;
+    while i < len(keys) {
+        if not _contains(SIGNAL_FIELDS, keys[i])
+            or _hex64(snapshot.signal_baseline[keys[i]], false) == nil {
+            return map{ ok: false, error: "invalid transport-security snapshot" };
+        }
+        guard.signal_baseline[keys[i]] = str_lower(snapshot.signal_baseline[keys[i]]); i = i + 1;
+    }
+    return map{ ok: true, guard: guard };
+}
+
+export FORMAT, SNAPSHOT_FORMAT, TRANSPORTS, PURPOSES, PROTOCOLS, MAX_NONCES;
+export signal_fingerprint, new, observe, approve_signal_baseline, status;
+export trusted_snapshot, restore_trusted;

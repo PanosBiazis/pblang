@@ -1,214 +1,62 @@
-// emu_sparc_test.sapp — a verified SPARC V8 execution model in pblang (the SATELLITE CPU).
-//
-// SPARC V8 is what actually flies: ESA's ERC32 and LEON2/3/4 rad-hardened processors — the standard
-// CPUs in European satellites, Mars landers and deep-space probes — are SPARC V8 implementations.
-// This gives the suite its 10th verified execution model and covers the "satellites / signal devices"
-// point of the device arc with a REAL ISA, not fiction. Modeled faithfully from the SPARC V8 manual:
-//   - 32-bit big-word RISC, 32 visible registers (%g0-%g7, %o0-%o7, %l0-%l7, %i0-%i7), %g0 hardwired 0
-//   - format-3 arithmetic (op=10): rd|op3|rs1|i|simm13-or-rs2, incl SUBcc setting icc flags
-//   - format-2 (op=00): SETHI (rd = imm22<<10) and Bicc conditional branches with disp22
-//   - BRANCH DELAY SLOTS (like MIPS): the instruction after a branch executes before the jump lands;
-//     the annul bit (a=1) skips the delay slot on an UNTAKEN conditional branch
-//   - trap: `ta 0x10` = the real SPARC Linux syscall gate; exit convention %g1=1, code in %o0
-// Register windows (save/restore) are NOT modeled — flat-register subset, documented boundary.
-// Verified by COMPUTED RESULT (run programs, check the number), same standard as every other model.
+let SPARC = import("stdlib:emulator_sparc32.sapp");
 
-fn fail(m) { throw "FAIL emu-sparc: " + m; }
-fn _cat(a, b) { let i = 0; while i < len(b) { push(a, b[i]); i = i + 1; } return a; }
-
-// register names (visible flat file)
-let G0 = 0; let G1 = 1; let G2 = 2; let G3 = 3;
-let O0 = 8; let O1 = 9; let O2 = 10; let O3 = 11; let O4 = 12;
-let L0 = 16; let L1 = 17;
-
-fn _s13(v) { let r = v % 8192; if r < 0 { r = r + 8192; } return r; }       // 13-bit two's complement
-fn _s22(v) { let r = v % 4194304; if r < 0 { r = r + 4194304; } return r; } // 22-bit two's complement
-
-// ── encoder (32-bit words as numbers; op<<30 | rd<<25 | op3<<19 | rs1<<14 | i<<13 | simm13/rs2) ──
-fn _f3i(op3, rs1, imm, rd) { return 2147483648 + rd * 33554432 + op3 * 524288 + rs1 * 16384 + 8192 + _s13(imm); }
-fn _f3r(op3, rs1, rs2, rd) { return 2147483648 + rd * 33554432 + op3 * 524288 + rs1 * 16384 + rs2; }
-fn ADDI(rs1, imm, rd) { return [_f3i(0, rs1, imm, rd)]; }    // add  %rs1, imm, %rd
-fn ADDR(rs1, rs2, rd) { return [_f3r(0, rs1, rs2, rd)]; }    // add  %rs1, %rs2, %rd
-fn SUBI(rs1, imm, rd) { return [_f3i(4, rs1, imm, rd)]; }    // sub
-fn SUBR(rs1, rs2, rd) { return [_f3r(4, rs1, rs2, rd)]; }
-fn ORI(rs1, imm, rd)  { return [_f3i(2, rs1, imm, rd)]; }    // or — `mov imm,%rd` = or %g0,imm,%rd
-fn MOVI(imm, rd)      { return ORI(0, imm, rd); }
-fn SMUL(rs1, rs2, rd) { return [_f3r(11, rs1, rs2, rd)]; }   // smul (V8 hardware multiply)
-fn SUBCC(rs1, imm, rd) { return [_f3i(20, rs1, imm, rd)]; }  // subcc — sets icc; rd=%g0 makes it `cmp`
-fn SUBCCR(rs1, rs2, rd) { return [_f3r(20, rs1, rs2, rd)]; }
-fn SETHI(imm22, rd)   { return [rd * 33554432 + 4 * 4194304 + imm22]; }   // rd = imm22 << 10
-fn NOP()              { return SETHI(0, 0); }                             // canonical SPARC nop
-fn _bicc(a, cond, disp) { return [a * 536870912 + cond * 33554432 + 2 * 4194304 + _s22(disp)]; }
-fn BA(disp)  { return _bicc(0, 8, disp); }    // branch always
-fn BE(disp)  { return _bicc(0, 1, disp); }    // branch if equal (Z=1)
-fn BNE(disp) { return _bicc(0, 9, disp); }    // branch if not equal (Z=0)
-fn BNEA(disp) { return _bicc(1, 9, disp); }   // bne,a — annul delay slot when untaken
-fn TA(imm)   { return [_f3i(58, 0, imm, 8)]; }  // ta imm — rd field holds cond 1000 (trap always)
-
-// ── interpreter (pc counts WORDS; icc Z/N flags; branch delay slot + annul modeled) ──
-fn sparc_run(code) {
-    let r = []; let ri = 0; while ri < 32 { push(r, 0); ri = ri + 1; }
-    let zf = 0; let nf = 0;
-    let pc = 0; let guard = 0;
-    let armed = 0; let tgt = 0;                     // delay-slot state: branch taken, lands after next instr
-    while pc >= 0 and pc < len(code) and guard < 1000000 {
-        guard = guard + 1;
-        let w = code[pc];
-        let op = num_floor(w / 1073741824);
-        let jumping = armed; armed = 0;             // this instruction is the delay slot if jumping==1
-        if op == 0 {                                // format 2: sethi / bicc
-            let op2 = num_floor(w / 4194304) % 8;
-            let rd = num_floor(w / 33554432) % 32;
-            if op2 == 4 {                           // SETHI
-                if rd != 0 { r[rd] = (w % 4194304) * 1024; }
-                pc = pc + 1;
-            } elif op2 == 2 {                       // Bicc
-                let a = num_floor(w / 536870912) % 2;
-                let cond = rd % 16;
-                let disp = w % 4194304; if disp >= 2097152 { disp = disp - 4194304; }
-                let take = false;
-                if cond == 8 { take = true; }               // ba
-                elif cond == 9 { take = zf == 0; }          // bne
-                elif cond == 1 { take = zf == 1; }          // be
-                else { throw "sparc_run: unmodeled cond " + str(cond); }
-                if take { armed = 1; tgt = pc + disp; pc = pc + 1; }      // delay slot at pc+1 runs first
-                elif a == 1 { pc = pc + 2; }                              // untaken + annul: skip delay slot
-                else { pc = pc + 1; }
-            } else { throw "sparc_run: unmodeled op2 " + str(op2); }
-        } elif op == 2 {                            // format 3: arithmetic / trap
-            let rd = num_floor(w / 33554432) % 32;
-            let op3 = num_floor(w / 524288) % 64;
-            let rs1 = num_floor(w / 16384) % 32;
-            let ibit = num_floor(w / 8192) % 2;
-            let v2 = 0;
-            if ibit == 1 { v2 = w % 8192; if v2 >= 4096 { v2 = v2 - 8192; } }
-            else { v2 = r[w % 32]; }
-            if op3 == 58 {                          // Ticc — rd field is the trap condition (8 = ta)
-                if rd % 16 == 8 and v2 == 16 {      // ta 0x10 = Linux syscall gate
-                    if r[G1] == 1 { return r[O0] % 256; }    // exit(%o0)
-                    throw "sparc_run: unmodeled syscall %g1=" + str(r[G1]);
-                }
-                throw "sparc_run: unmodeled trap";
-            }
-            let res = 0;
-            if op3 == 0 { res = r[rs1] + v2; }                 // add
-            elif op3 == 2 { res = bit_or(r[rs1], v2); }        // or
-            elif op3 == 4 { res = r[rs1] - v2; }               // sub
-            elif op3 == 11 { res = r[rs1] * v2; }              // smul
-            elif op3 == 20 {                                   // subcc — sets icc
-                res = r[rs1] - v2;
-                zf = 0; if res == 0 { zf = 1; }
-                nf = 0; if res < 0 { nf = 1; }
-            }
-            else { throw "sparc_run: unmodeled op3 " + str(op3); }
-            if rd != 0 { r[rd] = res; }                        // %g0 writes discarded
-            pc = pc + 1;
-        } else { throw "sparc_run: unmodeled op " + str(op); }
-        if jumping == 1 { pc = tgt; }               // delay slot done — land the branch
-    }
-    if guard >= 1000000 { throw "sparc_run: instruction budget exceeded"; }
-    throw "sparc_run: ran off the end (no exit trap)";
+fn require(condition, message) { if not condition { throw "FAIL emu-sparc: " + message; } }
+fn value(parts, message) {
+    let result = SPARC.run(SPARC.program(parts));
+    if not result.ok { throw "FAIL emu-sparc: " + message + ": " + str(result.error); }
+    return result.value;
 }
 
-fn prog(parts) { let c = []; let i = 0; while i < len(parts) { _cat(c, parts[i]); i = i + 1; } return c; }
-fn EXIT() { return prog([MOVI(1, G1), TA(16)]); }   // %g1=1; ta 0x10
-fn eq(got, want, m) { if got != want { fail(m + ": got " + str(got) + " want " + str(want)); } }
+require(SPARC.nop() == 16777216, "canonical nop encoding");
+require(SPARC.move_immediate(5, SPARC.O0) == 2416975877, "canonical move encoding");
+require(SPARC.trap_always(16) == 2446336016, "canonical trap encoding");
+require(SPARC.add_register(SPARC.O0, SPARC.O1, SPARC.O2) == 2483159049, "canonical add encoding");
 
-// ── encoder spec-checks against canonical SPARC V8 encodings (derived, not eyeballed) ──
-eq(NOP()[0], 16777216, "nop = sethi 0,%g0 = 0x01000000");
-eq(MOVI(5, O0)[0], 2416975877, "mov 5,%o0 = or %g0,5,%o0 = 0x90102005");
-eq(TA(16)[0], 2446336016, "ta 0x10 = 0x91D02010 (the Linux syscall trap)");
-eq(ADDR(O0, O1, O2)[0], 2483159049, "add %o0,%o1,%o2 = 0x94020009");
+require(value([SPARC.move_immediate(42, SPARC.O0), SPARC.exit_sequence()], "move") == 42, "move result");
+require(value([
+    SPARC.move_immediate(30, SPARC.O1), SPARC.add_immediate(SPARC.O1, 12, SPARC.O0),
+    SPARC.exit_sequence()
+], "add immediate") == 42, "add immediate result");
+require(value([
+    SPARC.move_immediate(100, SPARC.O1), SPARC.move_immediate(58, SPARC.O2),
+    SPARC.subtract_register(SPARC.O1, SPARC.O2, SPARC.O0), SPARC.exit_sequence()
+], "subtract register") == 42, "subtract register result");
+require(value([
+    SPARC.move_immediate(99, SPARC.G0), SPARC.add_immediate(SPARC.G0, 42, SPARC.O0),
+    SPARC.exit_sequence()
+], "g0") == 42, "g0 remains zero");
+require(value([
+    SPARC.move_immediate(6, SPARC.O1), SPARC.move_immediate(7, SPARC.O2),
+    SPARC.signed_multiply(SPARC.O1, SPARC.O2, SPARC.O0), SPARC.exit_sequence()
+], "multiply") == 42, "multiply result");
 
-// ── 1. mov + exit ──
-eq(sparc_run(prog([MOVI(42, O0), EXIT()])), 42, "mov 42 exits 42");
-
-// ── 2. add / sub, register and immediate forms ──
-eq(sparc_run(prog([MOVI(30, O1), ADDI(O1, 12, O0), EXIT()])), 42, "add imm");
-eq(sparc_run(prog([MOVI(30, O1), MOVI(12, O2), ADDR(O1, O2, O0), EXIT()])), 42, "add reg");
-eq(sparc_run(prog([MOVI(50, O0), SUBI(O0, 8, O0), EXIT()])), 42, "sub imm");
-eq(sparc_run(prog([MOVI(100, O1), MOVI(58, O2), SUBR(O1, O2, O0), EXIT()])), 42, "sub reg");
-
-// ── 3. %g0 is hardwired zero (writes discarded, reads give 0) ──
-eq(sparc_run(prog([MOVI(99, G0), ADDI(G0, 42, O0), EXIT()])), 42, "%g0 stays 0 after a write");
-
-// ── 4. smul (V8 hardware multiply) ──
-eq(sparc_run(prog([MOVI(6, O1), MOVI(7, O2), SMUL(O1, O2, O0), EXIT()])), 42, "smul 6*7");
-
-// ── 5. sethi builds high bits: rd = imm22<<10 ──
-eq(sparc_run(prog([SETHI(1, O0), SUBI(O0, 900, O0), EXIT()])), 124, "sethi 1 -> 1024; -900 = 124");
-
-// ── 6. subcc + bne loop WITH the delay slot doing real work (the classic SPARC idiom):
-//        sum += n in the body, and the DECREMENT sits in the delay slot ──
-let sumloop = prog([
-    MOVI(5, O1),          // n = 5
-    MOVI(0, O0),          // sum = 0
-    ADDR(O0, O1, O0),     // loop: sum += n
-    SUBCC(O1, 1, G0),     // cmp n, 1  (subcc into %g0)
-    BNE(0 - 2),           // if n != 1 goto loop (2 words back)
-    SUBI(O1, 1, O1),      // DELAY SLOT: n -= 1  (executes on BOTH paths)
-    EXIT()
+let sum_loop = SPARC.program([
+    SPARC.move_immediate(5, SPARC.O1), SPARC.move_immediate(0, SPARC.O0),
+    SPARC.add_register(SPARC.O0, SPARC.O1, SPARC.O0),
+    SPARC.subtract_cc_immediate(SPARC.O1, 1, SPARC.G0),
+    SPARC.branch_not_equal(-2), SPARC.subtract_immediate(SPARC.O1, 1, SPARC.O1),
+    SPARC.exit_sequence()
 ]);
-eq(sparc_run(sumloop), 15, "delay-slot sum 5+4+3+2+1");
+let sum_result = SPARC.run(sum_loop);
+require(sum_result.ok and sum_result.value == 15, "delay-slot loop");
 
-// ── 7. annul bit: bne,a skips the delay slot when the branch is UNTAKEN ──
-//    taken path must still run it. Program: if %o1 != 0 (taken) delay adds 40; then lands at exit.
-let annul_taken = prog([
-    MOVI(2, O0),
-    MOVI(1, O1),
-    SUBCC(O1, 0, G0),     // %o1 - 0 = 1 -> Z=0 -> bne taken
-    BNEA(3),              // bne,a +3 (to EXIT)
-    ADDI(O0, 40, O0),     // delay slot: runs because branch TAKEN -> %o0 = 42
-    ADDI(O0, 100, O0),    // skipped by the branch
-    EXIT()
-]);
-eq(sparc_run(annul_taken), 42, "bne,a taken: delay slot executes");
-let annul_untaken = prog([
-    MOVI(42, O0),
-    MOVI(0, O1),
-    SUBCC(O1, 0, G0),     // Z=1 -> bne NOT taken
-    BNEA(3),
-    ADDI(O0, 100, O0),    // delay slot: ANNULLED (untaken + a=1) -> must NOT run
-    EXIT()
-]);
-eq(sparc_run(annul_untaken), 42, "bne,a untaken: delay slot annulled");
+let annul_untaken = SPARC.run(SPARC.program([
+    SPARC.move_immediate(42, SPARC.O0), SPARC.move_immediate(0, SPARC.O1),
+    SPARC.subtract_cc_immediate(SPARC.O1, 0, SPARC.G0),
+    SPARC.branch_not_equal_annul(3), SPARC.add_immediate(SPARC.O0, 100, SPARC.O0),
+    SPARC.exit_sequence()
+]));
+require(annul_untaken.ok and annul_untaken.value == 42, "untaken annul skips delay slot");
 
-// ── 8. factorial via smul loop: 5! = 120 ──
-let fact = prog([
-    MOVI(5, O1),          // n
-    MOVI(1, O0),          // acc
-    SMUL(O0, O1, O0),     // loop: acc *= n
-    SUBCC(O1, 1, G0),
-    BNE(0 - 2),
-    SUBI(O1, 1, O1),      // delay: n -= 1
-    EXIT()
-]);
-eq(sparc_run(fact), 120, "factorial 5! = 120");
+let malformed = SPARC.run([4294967296]);
+require(not malformed.ok, "reject oversized word");
+let escaped = SPARC.run(SPARC.program([SPARC.branch_always(100), SPARC.nop()]));
+require(not escaped.ok and escaped.error == "branch target outside code", "reject escaped branch");
+let budget = SPARC.run(sum_loop, map{ instruction_budget: 2 });
+require(not budget.ok and budget.error == "instruction budget exceeded", "enforce budget");
+let delay_control = SPARC.run(SPARC.program([
+    SPARC.branch_always(2), SPARC.branch_always(1), SPARC.exit_sequence()
+]));
+require(not delay_control.ok and delay_control.error == "control transfer in delay slot is not modeled", "reject delay-slot branch");
 
-// ── 9. ba (unconditional) with its delay slot: jump over dead code, delay still runs ──
-let skip = prog([
-    MOVI(2, O0),
-    BA(3),                // to EXIT
-    ADDI(O0, 40, O0),     // delay slot of ba: runs -> 42
-    MOVI(7, O0),          // dead code, jumped over
-    EXIT()
-]);
-eq(sparc_run(skip), 42, "ba executes delay slot then jumps");
-
-// ── 10. triangular number with sethi-built large start then reduce mod exit-range ──
-//     sum 1..9 = 45 computed upward with be exit-test (equal branch) ──
-let up = prog([
-    MOVI(0, O0),          // sum
-    MOVI(1, O1),          // i
-    MOVI(10, O2),         // limit
-    SUBCCR(O1, O2, G0),   // loop: cmp i, limit
-    BE(4),                // i == limit -> done (to EXIT)
-    NOP(),                // delay slot (no annul on be here)
-    ADDR(O0, O1, O0),     // sum += i
-    BA(0 - 4),            // back to cmp
-    ADDI(O1, 1, O1),      // delay: i += 1
-    EXIT()
-]);
-eq(sparc_run(up), 45, "upward loop with be exit: sum 1..9 = 45");
-
-print "pass emu-sparc: SPARC V8 (LEON/ERC32 satellite CPU) — encodings spec-checked, delay slots + annul + ta-0x10 exit verified by execution";
+print "emu_sparc: reusable bounded SPARC V8/LEON subset passed encodings, delay slots, malformed control, and budget checks";

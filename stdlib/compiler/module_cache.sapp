@@ -2,6 +2,7 @@
 // Cached chunks are an incremental compilation surface, never trusted input.
 
 let PBCK = import("stdlib/selfhost_pbck.sapp");
+let SecureFile = import("stdlib:secure_file.sapp");
 
 let FORMAT = "pblang.selfhost.module-cache.v1";
 let MAX_SOURCE_BYTES = 16777216;
@@ -55,6 +56,37 @@ fn _replace(staged, destination) {
     }
     if moved { try fs_remove(backup) catch nil; }
     return true;
+}
+
+fn _read_text(path, limit) {
+    if platform() == "linux" {
+        let result = SecureFile.read_text(path, limit, true);
+        return if result.ok { result.text } else { nil };
+    }
+    return try fs_read(path) catch nil;
+}
+
+fn _read_bytes(path, limit) {
+    if platform() == "linux" {
+        let result = SecureFile.read_bytes(path, limit, true);
+        return if result.ok { result.bytes } else { nil };
+    }
+    return try fs_read_bytes(path) catch nil;
+}
+
+fn _write_bytes(path, bytes) {
+    if platform() == "linux" { return SecureFile.write_atomic(path, bytes, true, true).ok; }
+    return try { fs_write_bytes(path, bytes); true } catch false;
+}
+
+fn _write_text(path, value) {
+    if platform() == "linux" { return SecureFile.write_text_atomic(path, value, true, true).ok; }
+    return try { fs_write(path, value); true } catch false;
+}
+
+fn _remove(path) {
+    if platform() == "linux" { return try SecureFile.remove(path, true).ok catch false; }
+    return try { fs_remove(path); true } catch false;
 }
 
 fn default_root() {
@@ -141,7 +173,7 @@ fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
 
 fn _load(cache, key, account) {
     let paths = _paths(cache, key);
-    let raw = try fs_read(paths.metadata) catch nil;
+    let raw = _read_text(paths.metadata, MAX_METADATA_BYTES);
     if type(raw) != "string" or len(raw) == 0 or len(str_to_bytes(raw)) > MAX_METADATA_BYTES {
         if account { cache.misses = cache.misses + 1; }
         return map{ hit: false, reason: "metadata-miss" };
@@ -158,7 +190,7 @@ fn _load(cache, key, account) {
         if account { cache.misses = cache.misses + 1; cache.corruptions = cache.corruptions + 1; }
         return map{ hit: false, reason: "metadata-invalid" };
     }
-    let bytes = try fs_read_bytes(paths.artifact) catch nil;
+    let bytes = _read_bytes(paths.artifact, MAX_ARTIFACT_BYTES);
     if type(bytes) != "array" or len(bytes) != size or _digest(bytes) != expected {
         if account { cache.misses = cache.misses + 1; cache.corruptions = cache.corruptions + 1; }
         return map{ hit: false, reason: "artifact-invalid" };
@@ -188,14 +220,31 @@ fn store(cache, key, chunk) {
     }
     let existing = _load(cache, key, false);
     if existing.hit { return map{ ok: true, reused: true, byte_len: existing.byte_len }; }
-    if not (try { fs_mkdirs(cache.root); true } catch false) {
-        return _store_error(cache, "module cache directory creation failed");
-    }
     let digest = _digest(bytes);
     let meta = json_stringify(map{
         format: FORMAT, cache_key: key, toolchain: cache.toolchain,
         byte_len: len(bytes), artifact_sha256: digest
     });
+    if platform() == "linux" {
+        if not _write_bytes(paths.artifact, bytes) {
+            return _store_error(cache, "secure module artifact publish failed");
+        }
+        let staged = _read_bytes(paths.artifact, MAX_ARTIFACT_BYTES);
+        let verified = type(staged) == "array" and len(staged) == len(bytes)
+            and _digest(staged) == digest and (try { PBCK.deserialize_chunk(staged); true } catch false);
+        if not verified {
+            _remove(paths.artifact); return _store_error(cache, "secure module artifact verification failed");
+        }
+        if not _write_text(paths.metadata, meta) {
+            _remove(paths.artifact); return _store_error(cache, "secure module metadata publish failed");
+        }
+        cache.stores = cache.stores + 1;
+        return map{ ok: true, reused: false, byte_len: len(bytes), artifact_sha256: digest,
+                    race_free_publication: true };
+    }
+    if not (try { fs_mkdirs(cache.root); true } catch false) {
+        return _store_error(cache, "module cache directory creation failed");
+    }
     let suffix = ".tmp-" + _nonce();
     let staged_artifact = paths.artifact + suffix;
     let staged_metadata = paths.metadata + suffix;
