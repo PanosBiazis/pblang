@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Carrier-independent transport security
+
+- Added `stdlib:transport_security.sapp` for bounded end-to-end identity,
+  certificate/channel pin, downgrade, replay and charging-only data-path
+  enforcement across current and future carriers. Mutable gateway, access-point,
+  accessory and peer-address signals produce redacted confirmation warnings
+  instead of false-positive carrier blocks.
+
+### Android device verification reliability
+
+- Added a bounded two-tap activation policy for accessibility-driven section
+  navigation. This handles Android 9 OEM builds where the first injected tap
+  only transfers focus, while preserving strict retry and delay limits.
+
+### Reusable bounded ISA emulators
+
+- Moved the MOS 6502, Z80, AVR/ATmega, MSP430, MIPS32, PowerPC32, SPARC V8/LEON,
+  RISC-V, and WebAssembly execution-model subsets out of
+  semantic-test-local code into PBLang stdlib modules backed by shared bounded
+  validation and instruction-budget helpers.
+- Added whole-stream byte/word validation, strict encoder register and branch
+  ranges, structured fail-closed errors for truncated or unknown instructions,
+  program-counter escape detection, and observable register/flag results.
+- Expanded semantic regressions for malformed streams, invalid operands,
+  branch escapes, and non-terminating programs. These remain documented ISA
+  subsets, not claims of complete machines, kernels, drivers, or vendor
+  frameworks.
+- Added exact-release conformance evidence to the platform model. Family
+  profiles no longer imply that a particular OS release was physically tested;
+  target-matched digests and complete bounded checks are required before the
+  userspace release contract becomes publishable.
+- Made virtual output, environment and file-storage limits account for encoded
+  UTF-8 bytes instead of Unicode scalar counts, with constant-time output-byte
+  accounting and NUL rejection for portable environment entries. Hardened the
+  Android model so a full event queue cannot revoke an existing permission and
+  service results are decoded from canonical JSON per call instead of exposing
+  mutable aliases to registered service state.
+
+### Dependency-wide semantic security analysis
+
+- Replaced entry-only build scanning with bounded token-resolved dependency traversal, per-module policy checks, linked whole-program interprocedural taint/control-flow analysis, explicit completeness fields, and post-codegen source snapshot verification.
+- Added `security_taint.sapp`, `security_dependency_analysis.sapp`, standalone dependency-aware `pbsecure`/`pbanalyze` behavior, regression tests, and stage benchmarks.
+- Added module-by-module repository auditing and `pbmoduletriage`; a bounded summary index no longer stops later modules or files from being scanned. Atomic per-module checkpoints can resume after interruption, but only unchanged modules with revalidated complete content snapshots are reused. Linux source/report reads are bounded and no-follow, and module reports retain finding fingerprints rather than raw source lines.
+- Improved audit precision for detector/catalog literals and defensive comments while preserving transparent suppression reasons and real capability/reliability findings.
+- Triaged the PBLang module report's three source/security/high matches as defensive FFI-policy documentation and missing-TLS-key errors. Added narrow regression-backed suppressions while retaining real capability escalation and private-key material as high severity.
+- Fixed stale module-audit resume after analyzer changes by binding checkpoints to a versioned analyzer revision as well as roots, limits, policy, and source snapshots.
+- Expanded repository-audit eligibility from the original narrow PBLang/Rust/C/web set to common JVM, .NET, mobile, systems, scripting, assembly, database, build, and configuration text formats. Binary artifacts remain explicitly outside the source scanner.
+- Added capped exact-path `pbaudit --exclude` entries for generated reports and separately audited artifacts; exclusions are included in checkpoint identity and do not support broad hiding patterns.
+- Canonicalized Linux report paths before descriptor-relative atomic operations and replaced ordinary checkpoint reads with bounded no-follow reads, including regression coverage for normalized parent components.
+- Canonicalized caller-approved audit roots before inventory so safe parent-relative roots work without weakening the inventory path policy; the regression now covers parent components in both module roots and report paths.
+- Canonicalized `pbmoduletriage` report paths before bounded no-follow reads so reports outside the current checkout retain the same secure handling.
+- Clamped the optional aggregate finding index for large module sets to its 100,000-row hard cap; exact per-module counts and full traversal remain independent of this summary bound.
+- Enforced the per-module deadline across file analysis as well as inventory, and excluded vendored virtual environments/package trees from first-party heuristics. Dependency/SBOM and data/artifact analysis remain separate explicit scopes.
+- Extended `pbmoduletriage` with bounded redacted incomplete-module reasons so oversized roots can be split deterministically instead of inferred from missing output.
+
+### Default-on PBLang-native build security analysis
+- Added bounded data-driven security analysis to `pbbuild`. The default
+  `protect` mode blocks high-severity source findings before publication and
+  reports lower severities; `strict`, `audit` and explicit `off` modes are
+  available without adding Rust source.
+- Added reason-bearing next-line and bounded block suppressions. Unknown rule
+  IDs, malformed directives, duplicate blocks, unmatched ends and unterminated
+  blocks fail closed, while every accepted suppression remains in the report.
+- Added bounded JSON rule configuration, per-invocation rule disabling,
+  `pbsecure`, and opt-in `pbanalyze` categories for security, quality,
+  performance, completeness and roadmap analysis. Added semantic and build-gate
+  regressions plus the canonical `docs/Security_Analysis.md` contract.
+- Hardened `secscan.detect_secrets()` and `cli_scan()` so public structured
+  results never retain raw credential values. Raw matches now exist only inside
+  the private redaction operation.
+- Hardened Linux static-file serving with descriptor-relative `openat`,
+  no-follow path components, a 16 MiB hard ceiling and no `exists`/`read`
+  check-use sequence. Symlink escapes and oversized responses now fail closed.
+- Made project audits deadline-bound and line-scoped for credential detection.
+  Security-detector literals and ordered encoding alphabets are retained as
+  explicit suppression evidence instead of false high findings, while real
+  named credentials and mixed high-entropy values remain findings.
+
+### Semantic GUI action hierarchy
+- Added backward-compatible `primary`, `secondary`, `navigation`, `ghost` and
+  `danger` button variants plus selected, focus, danger and on-accent palette
+  roles to the PBLang-native GUI toolkit.
+- Existing `button(...)` calls default to `primary`; custom palettes can
+  override the new roles without changing older layout or callback behavior.
+- Added rendering and semantic regressions for default and custom themes. No
+  Rust source or runtime opcode was added.
+
+### Resource-aware product and physical-device tests
+- Extended the PBLang-native scheduler with serialized `physical-device` and
+  `sustained-soak` profiles plus deterministic battery, temperature, power-save
+  and PSS admission policy.
+- Normal and elevated pressure select bounded health-probe and polling cadences;
+  critical temperature, battery or memory samples fail closed.
+- Preserved existing standard and large-product behavior and added semantic
+  regressions for normal, throttled and rejected device states. No Rust source
+  was added.
+
 ### Expression-level `elif` in the self-hosted frontend
 - Extended the PBLang-written parser so value-producing conditionals accept
   `if ... elif ... else`, lowering to the same right-nested `if_expr` AST as the

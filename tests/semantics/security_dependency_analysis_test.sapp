@@ -1,0 +1,139 @@
+let DEP = import("stdlib:security_dependency_analysis.sapp");
+let TAINT = import("stdlib:security_taint.sapp");
+
+fn fail(message) { throw "FAIL security_dependency_analysis: " + message; }
+fn require(value, message) { if value != true { fail(message); } }
+fn unique() { return "/tmp/pblang_security_deps_" + str_slice(sha256(str(now_ms()) + str(random_bytes(12))), 0, 20); }
+
+let direct = TAINT.analyze(
+    "let requested = env_get(\"OUTPUT\");\nfs_write(requested, \"unsafe\");",
+    "direct.sapp");
+require(direct.ok and not direct.passed and direct.finding_count == 1,
+    "direct untrusted path reaches file sink");
+require(direct.findings[0].id == "taint.path-traversal"
+    and direct.findings[0].sources[0] == "env_get"
+    and direct.findings[0].line == 2,
+    "taint source, sink class and source line are retained");
+
+let controlled = TAINT.analyze(
+    "let requested = env_get(\"MODE\");\nif requested == \"run\" { exec(\"fixed-command\"); }",
+    "control.sapp");
+require(controlled.ok and controlled.finding_count == 1
+    and controlled.findings[0].control_flow, "tainted control dependency reaches sink");
+
+let sanitized = TAINT.analyze(
+    "let requested = sanitize_path(env_get(\"OUTPUT\"));\nfs_write(requested, \"safe\");",
+    "sanitized.sapp");
+require(sanitized.ok and sanitized.passed and sanitized.finding_count == 0,
+    "configured sanitizer terminates taint");
+
+let local_sanitized = TAINT.analyze(
+    "fn checked_path(value) { return value; }\nlet requested = checked_path(env_get(\"OUTPUT\"));\nfs_write(requested, \"safe\");",
+    "local-sanitized.sapp", map{ taint_sanitizers: ["checked_path"] });
+require(local_sanitized.ok and local_sanitized.passed and local_sanitized.finding_count == 0,
+    "configured local sanitizer terminates return-value taint");
+let unsafe_local_sanitizer = TAINT.analyze(
+    "fn checked_path(value) { fs_write(value, \"side effect\"); return value; }\nchecked_path(env_get(\"OUTPUT\"));",
+    "unsafe-local-sanitizer.sapp", map{ taint_sanitizers: ["checked_path"] });
+require(unsafe_local_sanitizer.ok and not unsafe_local_sanitizer.passed
+    and unsafe_local_sanitizer.finding_count == 1,
+    "local sanitizer side effects remain subject to taint analysis");
+
+let interprocedural = TAINT.analyze(
+    "fn save(path) { fs_write(path, \"unsafe\"); }\nlet requested = env_get(\"OUTPUT\");\nsave(requested);",
+    "interprocedural.sapp");
+require(interprocedural.ok and not interprocedural.passed
+    and interprocedural.interprocedural_complete and interprocedural.call_expansions >= 1,
+    "taint crosses a real function call into a sink");
+
+let aggregate_field = TAINT.analyze(
+    "let request = map{path: \"safe\"};\nrequest.path = env_get(\"OUTPUT\");\nfs_write(request.path, \"unsafe\");",
+    "aggregate_field.sapp");
+require(aggregate_field.ok and not aggregate_field.passed and aggregate_field.finding_count == 1,
+    "member assignment propagates taint through the aggregate root");
+
+let aggregate_sibling = TAINT.analyze(
+    "let request = map{ safe: \"fixed\", user: env_get(\"OUTPUT\") };\nfs_write(request.safe, \"safe\");",
+    "aggregate_sibling.sapp");
+require(aggregate_sibling.ok and aggregate_sibling.passed
+    and aggregate_sibling.finding_count == 0,
+    "taint in one map field does not contaminate an independent fixed field");
+let aggregate_tainted_member = TAINT.analyze(
+    "let request = map{ safe: \"fixed\", user: env_get(\"OUTPUT\") };\nfs_write(request.user, \"unsafe\");",
+    "aggregate_tainted_member.sapp");
+require(aggregate_tainted_member.ok and not aggregate_tainted_member.passed
+    and aggregate_tainted_member.finding_count == 1,
+    "a tainted map field remains tainted at a member sink");
+
+let aggregate_index = TAINT.analyze(
+    "let paths = [\"safe\"];\npaths[0] = env_get(\"OUTPUT\");\nfs_write(paths[0], \"unsafe\");",
+    "aggregate_index.sapp");
+require(aggregate_index.ok and not aggregate_index.passed and aggregate_index.finding_count == 1,
+    "index assignment propagates taint through the aggregate root");
+
+let aggregate_push = TAINT.analyze(
+    "let paths = [];\narray_push(paths, env_get(\"OUTPUT\"));\nfs_write(paths[0], \"unsafe\");",
+    "aggregate_push.sapp");
+require(aggregate_push.ok and not aggregate_push.passed and aggregate_push.finding_count == 1,
+    "collection mutation propagates taint into later reads");
+
+let root = unique();
+let main_path = root + "/main.sapp";
+let dep_path = root + "/dep.sapp";
+fs_mkdirs(root);
+fs_write(main_path,
+    "// import(\"ignored.sapp\")\nlet D = import(\"dep.sapp\");\nlet requested = env_get(\"OUTPUT\");\nD.save(requested);");
+fs_write(dep_path,
+    "fn save(path) { fs_write(path, \"unsafe\"); }\nexport save;");
+
+let report = DEP.analyze_entry(main_path, map{ project_root: root, security_mode: "protect" });
+require(report.ok and not report.passed and report.graph_complete
+    and report.module_count == 2, "reachable dependency graph is complete and blocks taint: "
+        + json_stringify(map{ ok: report.ok, passed: report.passed,
+            graph_complete: report.graph_complete, module_count: report.module_count,
+            unresolved_count: report.unresolved_count, blocking: report.blocking,
+            unresolved: report.unresolved,
+            whole_program_taint: report.whole_program_taint }));
+require(report.modules[1].taint.finding_count == 0
+    and report.whole_program_taint.finding_count >= 1,
+    "whole-program pass propagates taint into imported function sink");
+require(report.unresolved_count == 0 and report.semantic_complete,
+    "comment import is ignored and both modules parse semantically");
+require(report.interprocedural_complete and report.whole_program_linked,
+    "dependency-wide interprocedural analysis completes");
+
+let stable = DEP.verify_snapshot(report);
+require(stable.ok and stable.stable and stable.checked == 2, "unchanged graph snapshot verifies");
+fs_write(dep_path, "fn value() { return 8; }\nexport value;");
+let changed = DEP.verify_snapshot(report);
+require(not changed.ok and not changed.stable and len(changed.changed) == 1,
+    "dependency replacement after analysis is detected");
+
+fs_write(main_path, "let M = import(\"missing.sapp\");\nprint 1;");
+let unresolved = DEP.analyze_entry(main_path, map{ project_root: root, security_mode: "audit" });
+require(unresolved.ok and not unresolved.passed and not unresolved.graph_complete
+    and unresolved.unresolved_count == 1, "unresolved imports fail closed even in audit graph coverage");
+
+let stdlib_root = root + "/stdlib";
+let std_main = stdlib_root + "/main.sapp";
+let std_dep = stdlib_root + "/dep.sapp";
+fs_mkdirs(stdlib_root);
+fs_write(std_main,
+    "let Dep = import(\"stdlib/dep.sapp\");\nlet value = Dep.value();");
+fs_write(std_dep, "fn value() { return 42; }\nexport value;");
+let nested_stdlib = DEP.analyze_entry(std_main, map{
+    project_root: root, stdlib_root: stdlib_root, security_mode: "audit"
+});
+require(nested_stdlib.ok and nested_stdlib.passed
+    and nested_stdlib.graph_complete and nested_stdlib.module_count == 2
+    and nested_stdlib.unresolved_count == 0,
+    "nested stdlib/ imports canonicalize through the configured stdlib root: "
+        + json_stringify(nested_stdlib));
+
+try fs_remove(main_path) catch nil;
+try fs_remove(dep_path) catch nil;
+try fs_remove(std_main) catch nil;
+try fs_remove(std_dep) catch nil;
+try fs_remove(stdlib_root) catch nil;
+try fs_remove(root) catch nil;
+print "security_dependency_analysis_pass";

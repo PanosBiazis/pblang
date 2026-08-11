@@ -1,0 +1,226 @@
+// stdlib/emulator_wasm.sapp -- bounded WebAssembly i32/control subset.
+
+let Support = import("stdlib:emulator_support.sapp");
+let FORMAT = "pblang.emulator.wasm.v1";
+let DEFAULT_BUDGET = 1000000;
+let MAX_CODE_BYTES = 1048576;
+let MAX_LOCALS = 65536;
+let MAX_STACK = 1048576;
+let MAX_CONTROL = 65536;
+
+fn _require(value, low, high, name) {
+    if not Support.integer(value, low, high) {
+        throw "emulator_wasm: " + name + " must be " + str(low) + ".." + str(high);
+    }
+    return value;
+}
+fn _append(out, values) { let i = 0; while i < len(values) { array_push(out, values[i]); i = i + 1; } return out; }
+fn _i32(value) {
+    let result = value % 4294967296; if result < 0 { result = result + 4294967296; }
+    if result >= 2147483648 { result = result - 4294967296; } return result;
+}
+
+fn _encode_unsigned(value) {
+    _require(value, 0, 4294967295, "unsigned LEB128 value");
+    let out = []; let remaining = value;
+    while true {
+        let byte = remaining % 128; remaining = num_floor(remaining / 128);
+        if remaining == 0 { array_push(out, byte); return out; }
+        array_push(out, byte + 128);
+    }
+}
+fn _encode_signed(value) {
+    _require(value, -2147483648, 2147483647, "signed LEB128 value");
+    let out = []; let remaining = value;
+    while true {
+        let byte = remaining % 128; if byte < 0 { byte = byte + 128; }
+        remaining = num_floor(remaining / 128); let sign = num_floor(byte / 64) % 2;
+        if (remaining == 0 and sign == 0) or (remaining == -1 and sign == 1) {
+            array_push(out, byte); return out;
+        }
+        array_push(out, byte + 128);
+    }
+}
+
+fn i32_const(value) { return _append([65], _encode_signed(value)); }
+fn local_get(index) { return _append([32], _encode_unsigned(_require(index, 0, MAX_LOCALS - 1, "local index"))); }
+fn local_set(index) { return _append([33], _encode_unsigned(_require(index, 0, MAX_LOCALS - 1, "local index"))); }
+fn block() { return [2, 64]; }
+fn loop() { return [3, 64]; }
+fn end() { return [11]; }
+fn branch(depth) { return _append([12], _encode_unsigned(_require(depth, 0, MAX_CONTROL - 1, "branch depth"))); }
+fn branch_if(depth) { return _append([13], _encode_unsigned(_require(depth, 0, MAX_CONTROL - 1, "branch depth"))); }
+fn add_i32() { return [106]; }
+fn subtract_i32() { return [107]; }
+fn multiply_i32() { return [108]; }
+fn equal_zero_i32() { return [69]; }
+fn not_equal_i32() { return [71]; }
+fn return_instruction() { return [15]; }
+fn program(instructions) { return Support.program(instructions, MAX_CODE_BYTES); }
+
+fn _decode_unsigned(code, start) {
+    let result = 0; let scale = 1; let pc = start; let count = 0;
+    while count < 5 {
+        if pc >= len(code) { return map{ ok: false, error: "truncated unsigned LEB128" }; }
+        let byte = code[pc]; pc = pc + 1; count = count + 1;
+        result = result + (byte % 128) * scale;
+        if byte < 128 {
+            if result > 4294967295 { return map{ ok: false, error: "unsigned LEB128 overflow" }; }
+            return map{ ok: true, value: result, next: pc };
+        }
+        scale = scale * 128;
+    }
+    return map{ ok: false, error: "unsigned LEB128 exceeds five bytes" };
+}
+fn _decode_signed(code, start) {
+    let result = 0; let scale = 1; let pc = start; let count = 0; let last = 0;
+    while count < 5 {
+        if pc >= len(code) { return map{ ok: false, error: "truncated signed LEB128" }; }
+        let byte = code[pc]; pc = pc + 1; count = count + 1; last = byte;
+        result = result + (byte % 128) * scale; scale = scale * 128;
+        if byte < 128 {
+            if byte % 128 >= 64 { result = result - scale; }
+            if result < -2147483648 or result > 2147483647 { return map{ ok: false, error: "signed LEB128 overflow" }; }
+            return map{ ok: true, value: result, next: pc };
+        }
+    }
+    return map{ ok: false, error: "signed LEB128 exceeds five bytes" };
+}
+
+fn _instruction(code, pc) {
+    if pc < 0 or pc >= len(code) { return map{ ok: false, error: "instruction offset outside code" }; }
+    let opcode = code[pc];
+    if opcode == 2 or opcode == 3 {
+        if pc + 1 >= len(code) { return map{ ok: false, error: "truncated block type" }; }
+        if code[pc + 1] != 64 { return map{ ok: false, error: "only void block type is modeled" }; }
+        return map{ ok: true, opcode: opcode, immediate: 64, next: pc + 2 };
+    }
+    if opcode == 12 or opcode == 13 or opcode == 32 or opcode == 33 {
+        let decoded = _decode_unsigned(code, pc + 1); if not decoded.ok { return decoded; }
+        return map{ ok: true, opcode: opcode, immediate: decoded.value, next: decoded.next };
+    }
+    if opcode == 65 {
+        let decoded = _decode_signed(code, pc + 1); if not decoded.ok { return decoded; }
+        return map{ ok: true, opcode: opcode, immediate: decoded.value, next: decoded.next };
+    }
+    if opcode == 11 or opcode == 15 or opcode == 69 or opcode == 71
+        or opcode == 106 or opcode == 107 or opcode == 108 {
+        return map{ ok: true, opcode: opcode, immediate: 0, next: pc + 1 };
+    }
+    return map{ ok: false, error: "unmodeled opcode " + str(opcode) + " at offset " + str(pc) };
+}
+
+fn _match_ends(code) {
+    let ends = []; let i = 0; while i < len(code) { array_push(ends, -1); i = i + 1; }
+    let open = []; let pc = 0;
+    while pc < len(code) {
+        let instruction = _instruction(code, pc); if not instruction.ok { return instruction; }
+        if instruction.opcode == 2 or instruction.opcode == 3 {
+            if len(open) >= MAX_CONTROL { return map{ ok: false, error: "control stack limit exceeded" }; }
+            array_push(open, pc);
+        }
+        elif instruction.opcode == 11 {
+            if len(open) == 0 { return map{ ok: false, error: "unmatched end at offset " + str(pc) }; }
+            let opener = array_pop(open); ends[opener] = pc;
+        }
+        pc = instruction.next;
+    }
+    if len(open) != 0 { return map{ ok: false, error: "unterminated structured control block" }; }
+    return map{ ok: true, ends: ends };
+}
+
+fn _failure(reason, pc, instructions) { return Support.failure(FORMAT, reason, pc, instructions); }
+
+fn run(code, local_count = 0, options = nil) {
+    let invalid = Support.validate_bytes(code, MAX_CODE_BYTES);
+    if invalid != nil { return _failure(invalid, 0, 0); }
+    if not Support.integer(local_count, 0, MAX_LOCALS) { return _failure("local count must be 0..65536", 0, 0); }
+    let matched = _match_ends(code); if not matched.ok { return _failure(matched.error, 0, 0); }
+    let budget_result = Support.instruction_budget(options, DEFAULT_BUDGET);
+    if not budget_result.ok { return _failure(budget_result.error, 0, 0); }
+
+    let locals = []; let i = 0; while i < local_count { array_push(locals, 0); i = i + 1; }
+    let values = []; let kinds = []; let continuations = []; let heights = [];
+    let pc = 0; let count = 0;
+    while count < budget_result.value {
+        if pc == len(code) {
+            let result = if len(values) == 0 { 0 } else { values[len(values) - 1] };
+            return map{ ok: true, format: FORMAT, halted: false, pc: pc,
+                instructions: count, locals: locals, value: result,
+                boundary: "verified WebAssembly i32/local/structured-control subset; not a full runtime" };
+        }
+        let instruction = _instruction(code, pc);
+        if not instruction.ok { return _failure(instruction.error, pc, count); }
+        let opcode = instruction.opcode; let immediate = instruction.immediate;
+        let next = instruction.next; count = count + 1;
+        if opcode == 65 {
+            if len(values) >= MAX_STACK { return _failure("operand stack limit exceeded", pc, count); }
+            array_push(values, immediate); pc = next;
+        }
+        elif opcode == 32 {
+            if immediate >= len(locals) { return _failure("local.get index outside locals", pc, count); }
+            if len(values) >= MAX_STACK { return _failure("operand stack limit exceeded", pc, count); }
+            array_push(values, locals[immediate]); pc = next;
+        }
+        elif opcode == 33 {
+            if immediate >= len(locals) { return _failure("local.set index outside locals", pc, count); }
+            if len(values) < 1 { return _failure("operand stack underflow", pc, count); }
+            locals[immediate] = array_pop(values); pc = next;
+        }
+        elif opcode == 106 or opcode == 107 or opcode == 108 or opcode == 71 {
+            if len(values) < 2 { return _failure("operand stack underflow", pc, count); }
+            let right = array_pop(values); let left = array_pop(values); let result = 0;
+            if opcode == 106 { result = _i32(left + right); }
+            elif opcode == 107 { result = _i32(left - right); }
+            elif opcode == 108 { result = _i32(left * right); }
+            else { result = if left != right { 1 } else { 0 }; }
+            array_push(values, result); pc = next;
+        }
+        elif opcode == 69 {
+            if len(values) < 1 { return _failure("operand stack underflow", pc, count); }
+            let value = array_pop(values); array_push(values, if value == 0 { 1 } else { 0 }); pc = next;
+        }
+        elif opcode == 2 or opcode == 3 {
+            if len(kinds) >= MAX_CONTROL { return _failure("control stack limit exceeded", pc, count); }
+            array_push(kinds, opcode);
+            array_push(continuations, if opcode == 3 { next } else { matched.ends[pc] + 1 });
+            array_push(heights, len(values)); pc = next;
+        }
+        elif opcode == 11 {
+            if len(kinds) < 1 { return _failure("control stack underflow", pc, count); }
+            array_pop(kinds); array_pop(continuations); array_pop(heights); pc = next;
+        }
+        elif opcode == 12 or opcode == 13 {
+            let take = true;
+            if opcode == 13 {
+                if len(values) < 1 { return _failure("operand stack underflow", pc, count); }
+                take = array_pop(values) != 0;
+            }
+            if take {
+                if immediate >= len(kinds) { return _failure("branch depth outside control stack", pc, count); }
+                let target = len(kinds) - 1 - immediate; let kind = kinds[target];
+                let continuation = continuations[target];
+                while len(values) > heights[target] { array_pop(values); }
+                if kind == 3 {
+                    while len(kinds) > target + 1 { array_pop(kinds); array_pop(continuations); array_pop(heights); }
+                } else {
+                    while len(kinds) > target { array_pop(kinds); array_pop(continuations); array_pop(heights); }
+                }
+                pc = continuation;
+            } else { pc = next; }
+        }
+        elif opcode == 15 {
+            let result = if len(values) == 0 { 0 } else { values[len(values) - 1] };
+            return map{ ok: true, format: FORMAT, halted: true, pc: pc,
+                instructions: count, locals: locals, value: result,
+                boundary: "verified WebAssembly i32/local/structured-control subset; not a full runtime" };
+        }
+        else { return _failure("unmodeled opcode " + str(opcode), pc, count); }
+    }
+    return _failure("instruction budget exceeded", pc, count);
+}
+
+export FORMAT, DEFAULT_BUDGET, MAX_CODE_BYTES, MAX_LOCALS;
+export i32_const, local_get, local_set, block, loop, end, branch, branch_if;
+export add_i32, subtract_i32, multiply_i32, equal_zero_i32, not_equal_i32;
+export return_instruction, program, run;

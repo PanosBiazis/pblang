@@ -3,11 +3,19 @@
 // Usage:
 //   pblang run tools/pbaudit.sapp --project=pbide .
 //   pblang run tools/pbaudit.sapp --project=pbai --max-files=80 --backlog-limit=24 ../pbai
+//   pblang run tools/pbaudit.sapp --module-by-module --resume --json-output=audit.json roots...
 //
 // This reads only capped text-like files from caller-approved roots, skips
 // sensitive/cache/build paths, and prints summaries without echoing raw lines.
 
 let TA = import("stdlib:project_text_audit.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let PATH = import("stdlib:path.sapp");
+
+fn _report_path(path) {
+    if path == "" or platform() != "linux" { return path; }
+    return PATH.normalize(PATH.absolute(path));
+}
 
 fn user_args() {
     let a = os_args();
@@ -42,6 +50,45 @@ fn _value_after_prefix(arg, prefix, fallback) {
     return fallback;
 }
 
+fn _write_report(path, report) {
+    if path == "" { return map{ ok: true }; }
+    let text = json_stringify(report);
+    if platform() == "linux" { return SECURE.write_text_atomic(_report_path(path), text, true, false); }
+    return try { fs_write(path, text); map{ ok: true } }
+        catch map{ ok: false, error: "cannot write report" };
+}
+
+fn _load_checkpoint(path, audit_id) {
+    if path == "" or not (try fs_exists(path) catch false) {
+        return map{ ok: true, modules: [] };
+    }
+    let text = "";
+    if platform() == "linux" {
+        let loaded = SECURE.read_optional_text(_report_path(path), 67108864, false);
+        if not loaded.ok { return map{ ok: false, error: "checkpoint cannot be read securely" }; }
+        if try loaded.missing catch false { return map{ ok: true, modules: [] }; }
+        text = loaded.text;
+    } else {
+        let bytes = try fs_read_bytes(path) catch nil;
+        if type(bytes) != "array" { return map{ ok: false, error: "checkpoint cannot be read" }; }
+        if len(bytes) > 67108864 { return map{ ok: false, error: "checkpoint exceeds 64 MiB" }; }
+        text = try bytes_to_str(bytes) catch "";
+    }
+    if len(text) == 0 { return map{ ok: true, modules: [] }; }
+    let report = try json_parse(text) catch nil;
+    if type(report) != "map" or (try report.format catch "") != "pblang.module_audit.v1" {
+        return map{ ok: false, error: "checkpoint format is invalid" };
+    }
+    if (try report.audit_id catch "") != audit_id {
+        return map{ ok: false, error: "checkpoint options or roots do not match this audit" };
+    }
+    let modules = try report.modules catch nil;
+    if type(modules) != "array" or len(modules) > 256 {
+        return map{ ok: false, error: "checkpoint module index is invalid" };
+    }
+    return map{ ok: true, modules: modules };
+}
+
 let args = user_args();
 let roots = [];
 let project = "pblang";
@@ -53,14 +100,19 @@ let max_file_bytes = 20000;
 let max_findings = 160;
 let backlog_limit = 12;
 let lines_limit = 20;
+let max_runtime_ms = 30000;
 let source_only_blockers = true;
+let module_by_module = false;
+let resume = false;
+let json_output = "";
+let excluded_paths = [];
 
 let i = 0;
 while i < len(args) {
     let a = args[i];
     if a == "--help" or a == "-h" {
         print "pbaudit: bounded safe-text project audit";
-        print "usage: pblang run tools/pbaudit.sapp [--project=name] [--source-gate|--strict-gate] [--max-depth=N] [--max-files=N] [--max-file-bytes=N] [--max-findings=N] [--backlog-limit=N] [--lines=N] [roots...]";
+        print "usage: pblang run tools/pbaudit.sapp [--project=name] [--module-by-module] [--resume] [--json-output=FILE] [--exclude=PATH ...] [--source-gate|--strict-gate] [--max-depth=N] [--max-files=N] [--max-file-bytes=N] [--max-runtime-ms=N] [--max-findings=N] [--backlog-limit=N] [--lines=N] [roots...]";
         os_exit(0);
     } else if str_starts_with(a, "--project=") {
         project = _value_after_prefix(a, "--project=", project);
@@ -68,6 +120,18 @@ while i < len(args) {
         source_only_blockers = true;
     } else if a == "--strict-gate" {
         source_only_blockers = false;
+    } else if a == "--module-by-module" {
+        module_by_module = true;
+    } else if a == "--resume" {
+        resume = true;
+    } else if str_starts_with(a, "--json-output=") {
+        json_output = _value_after_prefix(a, "--json-output=", "");
+    } else if str_starts_with(a, "--exclude=") {
+        let excluded = _value_after_prefix(a, "--exclude=", "");
+        if excluded == "" or len(excluded_paths) >= 31 {
+            print "pbaudit: --exclude requires a path and is capped at 31 entries"; os_exit(2);
+        }
+        array_push(excluded_paths, excluded);
     } else if str_starts_with(a, "--max-depth=") {
         max_depth = _num_after_prefix(a, "--max-depth=", max_depth);
     } else if str_starts_with(a, "--max-entries=") {
@@ -80,6 +144,8 @@ while i < len(args) {
         max_file_bytes = _num_after_prefix(a, "--max-file-bytes=", max_file_bytes);
     } else if str_starts_with(a, "--max-findings=") {
         max_findings = _num_after_prefix(a, "--max-findings=", max_findings);
+    } else if str_starts_with(a, "--max-runtime-ms=") {
+        max_runtime_ms = _num_after_prefix(a, "--max-runtime-ms=", max_runtime_ms);
     } else if str_starts_with(a, "--backlog-limit=") {
         backlog_limit = _num_after_prefix(a, "--backlog-limit=", backlog_limit);
     } else if str_starts_with(a, "--lines=") {
@@ -91,24 +157,116 @@ while i < len(args) {
 }
 
 if len(roots) == 0 { roots = ["."]; }
+let normalized_roots = []; let root_i = 0;
+while root_i < len(roots) {
+    let normalized = try PATH.normalize(PATH.absolute(roots[root_i])) catch "";
+    if normalized == "" { print "pbaudit: invalid audit root"; os_exit(2); }
+    array_push(normalized_roots, normalized); root_i = root_i + 1;
+}
+roots = normalized_roots;
+if resume and (not module_by_module or json_output == "") {
+    print "pbaudit: --resume requires --module-by-module and --json-output"; os_exit(2);
+}
 
-let report = TA.audit_roots(project, roots, map{
-    max_depth: max_depth,
-    max_entries: max_entries,
-    max_children_per_dir: max_children,
-    max_files: max_files,
-    max_file_bytes: max_file_bytes,
-    max_findings: max_findings,
-    suppress_test_fixtures: true,
-    source_only_blockers: source_only_blockers,
-    backlog_limit: backlog_limit
-});
+// Do not ingest an older copy of the report when its parent directory is one
+// of the audited modules. Removal happens before inventory; failure is fatal
+// only when the path still exists afterward.
+if json_output != "" and not resume {
+    if platform() == "linux" { try SECURE.remove(_report_path(json_output), false) catch nil; }
+    else { try fs_remove(json_output) catch nil; }
+    if try fs_exists(json_output) catch false {
+        print "pbaudit: previous report cannot be removed safely"; os_exit(2);
+    }
+}
 
-let lines = TA.audit_lines(report, lines_limit);
+let report = nil;
+if module_by_module {
+    if json_output != "" { array_push(excluded_paths, json_output); }
+    let aggregate_index_limit = try max_findings * len(roots) catch max_findings;
+    if aggregate_index_limit > 100000 { aggregate_index_limit = 100000; }
+    let module_options = map{
+        max_depth: max_depth, max_entries_per_module: max_entries,
+        max_children_per_dir: max_children, max_files_per_module: max_files,
+        max_file_bytes: max_file_bytes, max_runtime_ms_per_module: max_runtime_ms,
+        max_findings_per_file: max_findings, suppress_test_fixtures: true,
+        source_only_blockers: source_only_blockers,
+        max_finding_index: aggregate_index_limit,
+        excluded_paths: excluded_paths
+    };
+    let engine_revision = TA.module_audit_engine_revision();
+    let identity_options = map{ project: project, engine_revision: engine_revision,
+        roots: roots, max_depth: max_depth,
+        max_entries: max_entries, max_children: max_children, max_files: max_files,
+        max_file_bytes: max_file_bytes, max_runtime_ms: max_runtime_ms,
+        max_findings: max_findings, source_only_blockers: source_only_blockers,
+        excluded_paths: excluded_paths };
+    let audit_id = sha256(json_stringify(identity_options));
+    module_options.audit_id = audit_id; module_options.engine_revision = engine_revision;
+    module_options.requested_roots = roots;
+    let checkpoint = if resume { _load_checkpoint(json_output, audit_id) }
+        else { map{ ok: true, modules: [] } };
+    if not checkpoint.ok { print "pbaudit: " + checkpoint.error; os_exit(2); }
+    let completed = map{}; let previous = checkpoint.modules; let pi = 0;
+    while pi < len(previous) {
+        if (try previous[pi].complete catch false) {
+            let stable = TA.verify_module_snapshot(previous[pi], module_options);
+            if stable.ok and stable.stable { completed[previous[pi].root] = previous[pi]; }
+            else { print "pbaudit: checkpoint module changed; rescanning " + str(previous[pi].root); }
+        }
+        pi = pi + 1;
+    }
+    let modules = []; let ri = 0; let module_started_ms = now_ms();
+    let resumed_modules = 0; let scanned_modules = 0;
+    report = TA.combine_module_reports(project, modules, module_options);
+    report.resumed_modules = 0; report.scanned_modules = 0;
+    if json_output != "" and len(previous) == 0 {
+        let initial = _write_report(json_output, report);
+        if not initial.ok { print "pbaudit: " + str(try initial.error catch "cannot write initial checkpoint"); os_exit(2); }
+    }
+    while ri < len(roots) {
+        let module = nil;
+        if map_has(completed, roots[ri]) {
+            module = completed[roots[ri]]; resumed_modules = resumed_modules + 1;
+        }
+        else {
+            let one = TA.audit_modules(project, [roots[ri]], module_options);
+            if not one.ok or len(try one.modules catch []) != 1 {
+                print "pbaudit: module audit failed for " + roots[ri]; os_exit(2);
+            }
+            module = one.modules[0];
+            scanned_modules = scanned_modules + 1;
+        }
+        array_push(modules, module);
+        report = TA.combine_module_reports(project, modules, module_options);
+        report.duration_ms = now_ms() - module_started_ms;
+        report.resumed_modules = resumed_modules; report.scanned_modules = scanned_modules;
+        if json_output != "" {
+            let saved = _write_report(json_output, report);
+            if not saved.ok { print "pbaudit: " + str(try saved.error catch "cannot write checkpoint"); os_exit(2); }
+        }
+        ri = ri + 1;
+    }
+} else {
+    report = TA.audit_roots(project, roots, map{
+        max_depth: max_depth, max_entries: max_entries,
+        max_children_per_dir: max_children, max_files: max_files,
+        max_file_bytes: max_file_bytes, max_runtime_ms: max_runtime_ms,
+        max_findings: max_findings, suppress_test_fixtures: true,
+        source_only_blockers: source_only_blockers, backlog_limit: backlog_limit
+    });
+}
+
+let lines = if module_by_module { TA.module_audit_lines(report, lines_limit) }
+    else { TA.audit_lines(report, lines_limit) };
 let j = 0;
 while j < len(lines) {
     print lines[j];
     j = j + 1;
 }
 
+if json_output != "" {
+    let written = _write_report(json_output, report);
+    if not written.ok { print "pbaudit: " + str(try written.error catch "cannot write report"); os_exit(2); }
+}
+if module_by_module and not report.complete { os_exit(1); }
 if report.quality_gate.passed != true { os_exit(1); }

@@ -1,0 +1,366 @@
+// Dependency-wide security analysis for PBLang projects.
+//
+// Imports are extracted from tokenizer output, not raw text, so comments and
+// string examples cannot manufacture dependencies. Every reachable module is
+// read with bounded, no-follow file operations on Linux, then receives both
+// policy-pattern analysis and flow-sensitive AST taint/control-flow analysis.
+// The content snapshot can be verified after code generation to detect source
+// replacement between analysis and artifact publication.
+
+let TOKENIZER = import("stdlib:compiler/tokenizer.sapp");
+let PATTERN = import("stdlib:security_analysis.sapp");
+let TAINT = import("stdlib:security_taint.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let PATH = import("stdlib:path.sapp");
+let LINKER = import("stdlib:source_inliner.sapp");
+
+let FORMAT = "pblang.security-dependencies.v1";
+let MAX_MODULES = 4096;
+let MAX_DEPTH = 256;
+let MAX_MODULE_BYTES = 16777216;
+let MAX_TOTAL_BYTES = 67108864;
+let MAX_PATH_BYTES = 4096;
+let MAX_AGGREGATE_FINDINGS = 16384;
+
+fn _option(options, key, fallback) {
+    if options == nil or type(options) != "map" or not map_has(options, key) { return fallback; }
+    let value = options[key]; if value == nil { return fallback; } return value;
+}
+
+fn _limit(options, key, fallback, hard_max) {
+    let value = _option(options, key, fallback);
+    if type(value) != "number" or value < 1 or value != num_floor(value) or value > hard_max {
+        return map{ ok: false, error: key + " must be an integer in 1.." + str(hard_max) };
+    }
+    return map{ ok: true, value: value };
+}
+
+fn limits(options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return map{ ok: false, error: "dependency analysis options must be a map" }; }
+    let modules = _limit(options, "max_modules", 256, MAX_MODULES); if not modules.ok { return modules; }
+    let depth = _limit(options, "max_depth", 64, MAX_DEPTH); if not depth.ok { return depth; }
+    let module_bytes = _limit(options, "max_module_bytes", 1048576, MAX_MODULE_BYTES); if not module_bytes.ok { return module_bytes; }
+    let total_bytes = _limit(options, "max_total_bytes", 8388608, MAX_TOTAL_BYTES); if not total_bytes.ok { return total_bytes; }
+    let path_bytes = _limit(options, "max_path_bytes", 1024, MAX_PATH_BYTES); if not path_bytes.ok { return path_bytes; }
+    let aggregate = _limit(options, "max_aggregate_findings", 4096, MAX_AGGREGATE_FINDINGS); if not aggregate.ok { return aggregate; }
+    return map{ ok: true, max_modules: modules.value, max_depth: depth.value,
+        max_module_bytes: module_bytes.value, max_total_bytes: total_bytes.value,
+        max_path_bytes: path_bytes.value, max_aggregate_findings: aggregate.value };
+}
+
+fn _invalid_path(path, maximum) {
+    if type(path) != "string" or path == "" or len(path) > maximum
+        or str_contains(path, strfromcharcode(0)) or str_contains(path, "\n")
+        or str_contains(path, "\r") or str_contains(path, "\\") { return true; }
+    let i = 0;
+    while i < len(path) {
+        let code = strcharcodeat(path, i);
+        if code < 32 or code == 127 { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _absolute(path) { return PATH.normalize(PATH.absolute(path)); }
+
+fn _inside(root, path) {
+    root = PATH.normalize(root); path = PATH.normalize(path);
+    if root == "/" { return str_starts_with(path, "/"); }
+    return path == root or str_starts_with(path, root + "/");
+}
+
+fn _read_text(path, maximum) {
+    if platform() == "linux" {
+        let loaded = SECURE.read_text(path, maximum, false);
+        if loaded.ok { return loaded; }
+        return map{ ok: false, error: "secure module read rejected: " + str(try loaded.error catch "unavailable") };
+    }
+    let bytes = try fs_read_bytes(path) catch nil;
+    if type(bytes) != "array" { return map{ ok: false, error: "module cannot be read" }; }
+    if len(bytes) > maximum { return map{ ok: false, error: "module source limit exceeded" }; }
+    let source = try bytes_to_str(bytes) catch nil;
+    if source == nil { return map{ ok: false, error: "module is not valid UTF-8" }; }
+    return map{ ok: true, text: source, size: len(bytes) };
+}
+
+fn _import_tokens(source) {
+    let tokens = try TOKENIZER.tokenize(source) catch nil;
+    if type(tokens) != "array" { return map{ ok: false, imports: [], errors: ["tokenizer failed"] }; }
+    let imports = []; let errors = []; let i = 0;
+    while i < len(tokens) {
+        let token = tokens[i];
+        if token.kind == "keyword" and token.text == "import" {
+            let at = i + 1;
+            while at < len(tokens) and tokens[at].kind == "comment" { at = at + 1; }
+            let path_token = nil;
+            if at < len(tokens) and tokens[at].kind == "string" { path_token = tokens[at]; }
+            elif at + 1 < len(tokens) and tokens[at].kind == "punct" and tokens[at].text == "("
+                and tokens[at + 1].kind == "string" { path_token = tokens[at + 1]; }
+            if path_token == nil or (try path_token.unterminated catch false) {
+                array_push(errors, "malformed import at line " + str(token.line));
+            } else {
+                array_push(imports, map{ path: path_token.text, line: token.line });
+            }
+        }
+        i = i + 1;
+    }
+    return map{ ok: len(errors) == 0, imports: imports, errors: errors };
+}
+
+fn _stdlib_candidates(rest, stdlib_root) {
+    let out = [];
+    if stdlib_root != "" { array_push(out, _absolute(stdlib_root + "/" + rest)); }
+    let configured = try env_get("PBLANG_STDLIB_DIR") catch nil;
+    if configured != nil and configured != "" { array_push(out, _absolute(str(configured) + "/" + rest)); }
+    array_push(out, _absolute("stdlib/" + rest));
+    array_push(out, _absolute("../pblang/stdlib/" + rest));
+    array_push(out, _absolute("../../pblang/stdlib/" + rest));
+    return out;
+}
+
+fn _safe_virtual(raw) {
+    if _invalid_path(raw, MAX_PATH_BYTES) or str_starts_with(raw, "/") { return false; }
+    let value = raw;
+    if str_starts_with(value, "stdlib:") { value = str_slice(value, 7, len(value)); }
+    if value == "" { return false; }
+    if str_contains(value, ":") { return false; }
+    return true;
+}
+
+fn _resolve(raw, importer, project_root, stdlib_root, maximum) {
+    if _invalid_path(raw, maximum) or not _safe_virtual(raw) {
+        return map{ ok: false, error: "invalid import path: " + str(raw) };
+    }
+    if str_starts_with(raw, "stdlib:") or str_starts_with(raw, "stdlib/") {
+        let rest = str_slice(raw, 7, len(raw));
+        let parts = str_split(rest, "/"); let p = 0;
+        while p < len(parts) { if parts[p] == "" or parts[p] == "." or parts[p] == ".." { return map{ ok: false, error: "escaping stdlib import" }; } p = p + 1; }
+        let candidates = _stdlib_candidates(rest, stdlib_root); p = 0;
+        while p < len(candidates) {
+            if fs_exists(candidates[p]) { return map{ ok: true, path: candidates[p], virtual: "stdlib:" + rest }; }
+            p = p + 1;
+        }
+        return map{ ok: false, error: "cannot resolve stdlib import: " + rest };
+    }
+    let candidate = "";
+    if str_starts_with(raw, "./") or str_starts_with(raw, "../") {
+        candidate = _absolute(path_dirname(importer) + "/" + raw);
+    } else {
+        candidate = _absolute(project_root + "/" + raw);
+    }
+    if not _inside(project_root, candidate) { return map{ ok: false, error: "import escapes project root: " + raw }; }
+    if not fs_exists(candidate) { return map{ ok: false, error: "cannot resolve import: " + raw }; }
+    return map{ ok: true, path: candidate, virtual: PATH.relative_to(project_root, candidate) };
+}
+
+fn _pattern_options(options, mode) {
+    let policy = _option(options, "security", map{}); if type(policy) != "map" { policy = map{}; }
+    return map{
+        custom_rules: _option(policy, "custom_rules", _option(options, "security_custom_rules", [])),
+        disabled_rule_ids: _option(policy, "disabled_rule_ids", _option(options, "security_disabled_rule_ids", [])),
+        allow_high_suppressions: _option(policy, "allow_high_suppressions", _option(options, "security_allow_high_suppressions", false)) == true,
+        minimum_blocking_severity: if mode == "strict" { "info" } else { "high" }
+    };
+}
+
+fn _taint_options(options) {
+    let out = map{
+        max_taint_findings: _option(options, "max_taint_findings", TAINT.MAX_FINDINGS),
+        max_taint_steps: _option(options, "max_taint_steps", TAINT.MAX_AST_STEPS),
+        max_call_expansions: _option(options, "max_call_expansions", TAINT.MAX_CALL_EXPANSIONS)
+    };
+    let sources = _option(options, "taint_sources", nil);
+    let sanitizers = _option(options, "taint_sanitizers", nil);
+    let sinks = _option(options, "taint_sinks", nil);
+    if sources != nil { out.taint_sources = sources; }
+    if sanitizers != nil { out.taint_sanitizers = sanitizers; }
+    if sinks != nil { out.taint_sinks = sinks; }
+    return out;
+}
+
+fn _compact_module(path, virtual, source, pattern, taint, imports) {
+    return map{ path: path, virtual_path: virtual, bytes: len(str_to_bytes(source)),
+        sha256: sha256(source), imports: imports, import_count: len(imports),
+        pattern: pattern, taint: taint };
+}
+
+fn analyze_entry(entry_path, options = nil) {
+    if options == nil { options = map{}; }
+    let bounded = limits(options); if not bounded.ok { bounded.passed = false; bounded.format = FORMAT; return bounded; }
+    if _invalid_path(entry_path, bounded.max_path_bytes) { return map{ ok: false, passed: false, format: FORMAT, error: "invalid entry path" }; }
+    let mode = str_lower(str(_option(options, "security_mode", "protect")));
+    if mode != "audit" and mode != "protect" and mode != "strict" { return map{ ok: false, passed: false, format: FORMAT, error: "invalid security mode" }; }
+    let entry = _absolute(entry_path);
+    let project_root = _absolute(str(_option(options, "project_root", cwd())));
+    if not _inside(project_root, entry) { project_root = path_dirname(entry); }
+    let stdlib_root = str(_option(options, "stdlib_root", "stdlib"));
+    let queue = [map{ path: entry, virtual: PATH.relative_to(project_root, entry), depth: 0, entry: true }];
+    let visited = map{}; let modules = []; let unresolved = []; let parser_incomplete = [];
+    let analysis_incomplete = []; let findings = []; let finding_index_truncated = false;
+    let module_sources = map{}; let entry_source_used = ""; let entry_virtual = "";
+    let total_bytes = 0; let total_findings = 0; let blocking = 0; let q = 0; let limit_exceeded = false;
+    let high = 0; let medium = 0; let low = 0;
+    let pattern_policy = _pattern_options(options, mode); let taint_policy = _taint_options(options);
+    while q < len(queue) and not limit_exceeded {
+        let item = queue[q]; q = q + 1;
+        if item.depth > bounded.max_depth { limit_exceeded = true; array_push(unresolved, map{ path: item.virtual, error: "dependency depth limit exceeded" }); continue; }
+        if map_has(visited, item.path) { continue; }
+        if len(modules) >= bounded.max_modules { limit_exceeded = true; array_push(unresolved, map{ path: item.virtual, error: "dependency module limit exceeded" }); continue; }
+        let source = ""; let bytes = 0;
+        if item.entry and map_has(options, "entry_source") {
+            source = options.entry_source;
+            if type(source) != "string" { return map{ ok: false, passed: false, format: FORMAT, error: "entry_source must be text" }; }
+            bytes = len(str_to_bytes(source));
+        } else {
+            let loaded = _read_text(item.path, bounded.max_module_bytes);
+            if not loaded.ok { array_push(unresolved, map{ path: item.virtual, error: loaded.error }); visited[item.path] = true; continue; }
+            source = loaded.text; bytes = loaded.size;
+        }
+        visited[item.path] = true;
+        if item.entry { entry_source_used = source; entry_virtual = item.virtual; }
+        else { module_sources[item.virtual] = source; }
+        if bytes > bounded.max_module_bytes { limit_exceeded = true; array_push(unresolved, map{ path: item.virtual, error: "module source limit exceeded" }); continue; }
+        total_bytes = total_bytes + bytes;
+        if total_bytes > bounded.max_total_bytes { limit_exceeded = true; array_push(unresolved, map{ path: item.virtual, error: "dependency source byte limit exceeded" }); continue; }
+        let imports = _import_tokens(source);
+        if not imports.ok { let ie = 0; while ie < len(imports.errors) { array_push(unresolved, map{ path: item.virtual, error: imports.errors[ie] }); ie = ie + 1; } }
+        let resolved_imports = []; let ii = 0;
+        while ii < len(imports.imports) {
+            let resolved = _resolve(imports.imports[ii].path, item.path, project_root, stdlib_root, bounded.max_path_bytes);
+            if resolved.ok {
+                array_push(resolved_imports, map{ requested: imports.imports[ii].path, path: resolved.virtual, line: imports.imports[ii].line });
+                if not map_has(visited, resolved.path) { array_push(queue, map{ path: resolved.path, virtual: resolved.virtual, depth: item.depth + 1, entry: false }); }
+            } else { array_push(unresolved, map{ path: item.virtual, import: imports.imports[ii].path, line: imports.imports[ii].line, error: resolved.error }); }
+            ii = ii + 1;
+        }
+        let pattern = PATTERN.analyze(source, item.virtual, pattern_policy);
+        let taint = TAINT.analyze(source, item.virtual, taint_policy);
+        if not taint.ok { array_push(parser_incomplete, map{ path: item.virtual, error: try taint.error catch "taint analysis failed", parser_errors: try taint.parser_errors catch [] }); }
+        if (try pattern.truncated catch false) or (try taint.truncated catch false)
+            or (try taint.limit_exceeded catch false) {
+            array_push(analysis_incomplete, map{ path: item.virtual,
+                pattern_truncated: try pattern.truncated catch false,
+                taint_truncated: try taint.truncated catch false,
+                taint_limit_exceeded: try taint.limit_exceeded catch false });
+        }
+        let pf = try pattern.findings catch []; let pfi = 0;
+        while pfi < len(pf) {
+            if len(findings) < bounded.max_aggregate_findings { array_push(findings, pf[pfi]); }
+            else { finding_index_truncated = true; }
+            pfi = pfi + 1;
+        }
+        let tf = try taint.findings catch []; let tfi = 0;
+        while tfi < len(tf) {
+            if len(findings) < bounded.max_aggregate_findings { array_push(findings, tf[tfi]); }
+            else { finding_index_truncated = true; }
+            tfi = tfi + 1;
+        }
+        total_findings = total_findings + (try pattern.finding_count catch 0) + (try taint.finding_count catch 0);
+        blocking = blocking + (try pattern.blocking catch 1) + (if taint.ok { try taint.blocking catch 1 } else { 0 });
+        high = high + (try pattern.high catch 0); medium = medium + (try pattern.medium catch 0);
+        low = low + (try pattern.low catch 0);
+        if taint.ok {
+            let fi = 0;
+            while fi < len(taint.findings) {
+                if taint.findings[fi].severity == "high" { high = high + 1; }
+                elif taint.findings[fi].severity == "medium" { medium = medium + 1; }
+                else { low = low + 1; }
+                fi = fi + 1;
+            }
+        }
+        array_push(modules, _compact_module(item.path, item.virtual, source, pattern, taint, resolved_imports));
+    }
+    let graph_complete = not limit_exceeded and len(unresolved) == 0 and q >= len(queue);
+    let whole_program_taint = map{ ok: false, passed: false,
+        error: "whole-program analysis requires a complete dependency graph",
+        interprocedural_complete: false, finding_count: 0, findings: [] };
+    let linked = map{ ok: false, modules: 0 };
+    if graph_complete {
+        let linked_limit = bounded.max_total_bytes * 4;
+        if linked_limit > 134217728 { linked_limit = 134217728; }
+        linked = LINKER.link_modules(entry_source_used, module_sources, map{
+            entry_path: entry_virtual, max_modules: bounded.max_modules,
+            max_module_depth: bounded.max_depth, max_module_source_bytes: bounded.max_module_bytes,
+            max_total_source_bytes: bounded.max_total_bytes,
+            max_linked_source_bytes: linked_limit,
+            max_path_bytes: bounded.max_path_bytes
+        });
+        if linked.ok {
+            whole_program_taint = TAINT.analyze(linked.source, "[whole-program]", taint_policy);
+        } else {
+            whole_program_taint = map{ ok: false, passed: false,
+                error: try linked.reason catch "whole-program source linking failed",
+                interprocedural_complete: false, finding_count: 0, findings: [] };
+        }
+    }
+    if not whole_program_taint.ok or not (try whole_program_taint.interprocedural_complete catch false) {
+        array_push(analysis_incomplete, map{ path: "[whole-program]",
+            reason: try whole_program_taint.error catch "interprocedural call analysis incomplete",
+            call_limit_exceeded: try whole_program_taint.call_limit_exceeded catch false,
+            recursion_skips: try whole_program_taint.recursion_skips catch 0 });
+    }
+    if whole_program_taint.ok {
+        let wf = whole_program_taint.findings; let wi = 0;
+        while wi < len(wf) {
+            if len(findings) < bounded.max_aggregate_findings { array_push(findings, wf[wi]); }
+            else { finding_index_truncated = true; }
+            if wf[wi].severity == "high" { high = high + 1; }
+            elif wf[wi].severity == "medium" { medium = medium + 1; }
+            else { low = low + 1; }
+            wi = wi + 1;
+        }
+        total_findings = total_findings + whole_program_taint.finding_count;
+        blocking = blocking + whole_program_taint.blocking;
+    }
+    let semantic_complete = graph_complete and len(parser_incomplete) == 0 and len(analysis_incomplete) == 0;
+    if not graph_complete { blocking = blocking + 1; }
+    if mode == "strict" and not semantic_complete { blocking = blocking + 1; }
+    let identity = [FORMAT, entry, str(len(modules))]; let mi = 0;
+    while mi < len(modules) { array_push(identity, modules[mi].path + "\x00" + modules[mi].sha256); mi = mi + 1; }
+    let passed = blocking == 0;
+    if mode == "audit" {
+        passed = graph_complete and semantic_complete;
+        blocking = if passed { 0 } else { 1 };
+    }
+    let report = map{ ok: true, passed: passed, format: FORMAT, mode: mode, entry: entry,
+        project_root: project_root, modules: modules, module_count: len(modules),
+        total_source_bytes: total_bytes, findings: findings, finding_count: total_findings,
+        finding_index_count: len(findings), finding_index_truncated: finding_index_truncated,
+        blocking: blocking,
+        high: high, medium: medium, low: low,
+        unresolved: unresolved, unresolved_count: len(unresolved), parser_incomplete: parser_incomplete,
+        parser_incomplete_count: len(parser_incomplete), analysis_incomplete: analysis_incomplete,
+        analysis_incomplete_count: len(analysis_incomplete), graph_complete: graph_complete,
+        whole_program_taint: whole_program_taint,
+        whole_program_linked: try linked.ok catch false,
+        whole_program_modules: try linked.modules catch 0,
+        semantic_complete: semantic_complete, limit_exceeded: limit_exceeded, truncated: not graph_complete,
+        dependency_wide: true, flow_sensitive: true,
+        interprocedural_complete: semantic_complete and whole_program_taint.interprocedural_complete,
+        graph_sha256: sha256(str_join(identity, "\n")), limits: bounded,
+        coverage: "all reachable modules plus linked whole-program flow-sensitive interprocedural AST data/control flow" };
+    if (try options.retain_linked_source catch false) and (try linked.ok catch false) {
+        report.linked_source = linked.source;
+    }
+    return report;
+}
+
+fn verify_snapshot(report) {
+    if type(report) != "map" or (try report.format catch "") != FORMAT or type(try report.modules catch nil) != "array" {
+        return map{ ok: false, stable: false, error: "invalid dependency security report" };
+    }
+    let changed = []; let i = 0;
+    while i < len(report.modules) {
+        let module = report.modules[i]; let loaded = _read_text(module.path, try report.limits.max_module_bytes catch 1048576);
+        if not loaded.ok or sha256(try loaded.text catch "") != module.sha256 {
+            array_push(changed, map{ path: module.virtual_path, error: if loaded.ok { "content changed" } else { loaded.error } });
+        }
+        i = i + 1;
+    }
+    return map{ ok: len(changed) == 0, stable: len(changed) == 0,
+        format: "pblang.security-dependencies.snapshot.v1", checked: len(report.modules), changed: changed };
+}
+
+export FORMAT, MAX_MODULES, MAX_DEPTH, MAX_MODULE_BYTES, MAX_TOTAL_BYTES, MAX_AGGREGATE_FINDINGS;
+export limits, analyze_entry, verify_snapshot;

@@ -1,6 +1,8 @@
 // Verified, content-addressed cache for PBLang-generated x86-64 ELF artifacts.
 // Cache hits are incremental builds, never substitutes for cold-compile metrics.
 
+let SecureFile = import("stdlib:secure_file.sapp");
+
 let FORMAT = "pblang.native.x64-cache.v2";
 let MAX_SOURCE_BYTES = 16777216;
 let MAX_DEPENDENCIES = 32;
@@ -120,9 +122,40 @@ fn _replace(staged, final_path) {
     return true;
 }
 
+fn _read_text(path, limit, private_parent = false) {
+    if platform() == "linux" {
+        let result = SecureFile.read_text(path, limit, private_parent);
+        return if result.ok { result.text } else { nil };
+    }
+    return try fs_read(path) catch nil;
+}
+
+fn _read_bytes(path, limit, private_parent = false) {
+    if platform() == "linux" {
+        let result = SecureFile.read_bytes(path, limit, private_parent);
+        return if result.ok { result.bytes } else { nil };
+    }
+    return try fs_read_bytes(path) catch nil;
+}
+
+fn _write_bytes(path, bytes, private_parent = false) {
+    if platform() == "linux" { return SecureFile.write_atomic(path, bytes, true, private_parent).ok; }
+    return try { fs_write_bytes(path, bytes); true } catch false;
+}
+
+fn _write_text(path, value, private_parent = false) {
+    if platform() == "linux" { return SecureFile.write_text_atomic(path, value, true, private_parent).ok; }
+    return try { fs_write(path, value); true } catch false;
+}
+
+fn _remove(path, private_parent = false) {
+    if platform() == "linux" { return try SecureFile.remove(path, private_parent).ok catch false; }
+    return try { fs_remove(path); true } catch false;
+}
+
 fn load(root, key) {
     let paths = _paths(root, key);
-    let raw_meta = try fs_read(paths.meta) catch nil;
+    let raw_meta = _read_text(paths.meta, MAX_META_BYTES, true);
     if type(raw_meta) != "string" or len(raw_meta) == 0 or _utf8_len(raw_meta) > MAX_META_BYTES {
         return map{ hit: false, reason: "metadata-miss" };
     }
@@ -136,7 +169,7 @@ fn load(root, key) {
         or expected_len != num_floor(expected_len) or not _safe_digest(expected_digest) {
         return map{ hit: false, reason: "metadata-invalid" };
     }
-    let bytes = try fs_read_bytes(paths.binary) catch nil;
+    let bytes = _read_bytes(paths.binary, MAX_ARTIFACT_BYTES, true);
     if type(bytes) != "array" or len(bytes) != expected_len or not valid_x64_elf(bytes) {
         return map{ hit: false, reason: "artifact-invalid" };
     }
@@ -149,11 +182,24 @@ fn store(root, key, bytes) {
     if not valid_x64_elf(bytes) { return map{ ok: false, error: "invalid x86-64 ELF" }; }
     let existing = load(root, key);
     if existing.hit { return map{ ok: true, reused: true, artifact_sha256: existing.artifact_sha256 }; }
-    let made = try { fs_mkdirs(root); true } catch false;
-    if not made { return map{ ok: false, error: "cache directory creation failed" }; }
 
     let digest = artifact_digest(bytes);
     let meta = json_stringify(map{ format: FORMAT, cache_key: key, byte_len: len(bytes), artifact_sha256: digest });
+    if platform() == "linux" {
+        if not _write_bytes(paths.binary, bytes, true) { return map{ ok: false, error: "secure cache artifact publish failed" }; }
+        let staged = _read_bytes(paths.binary, MAX_ARTIFACT_BYTES, true);
+        if type(staged) != "array" or len(staged) != len(bytes) or not valid_x64_elf(staged)
+            or artifact_digest(staged) != digest {
+            _remove(paths.binary, true); return map{ ok: false, error: "secure cache artifact verification failed" };
+        }
+        if not _write_text(paths.meta, meta, true) {
+            _remove(paths.binary, true); return map{ ok: false, error: "secure cache metadata publish failed" };
+        }
+        return map{ ok: true, reused: false, artifact_sha256: digest,
+                    race_free_publication: true };
+    }
+    let made = try { fs_mkdirs(root); true } catch false;
+    if not made { return map{ ok: false, error: "cache directory creation failed" }; }
     let nonce = _nonce();
     let staged_bin = paths.binary + ".tmp-" + nonce;
     let staged_meta = paths.meta + ".tmp-" + nonce;
@@ -182,6 +228,15 @@ fn store(root, key, bytes) {
 fn publish(output_path, bytes) {
     if type(output_path) != "string" or output_path == "" or len(output_path) > 4096 { return map{ ok: false, error: "invalid output path" }; }
     if not valid_x64_elf(bytes) { return map{ ok: false, error: "invalid x86-64 ELF" }; }
+    if platform() == "linux" {
+        if not _write_bytes(output_path, bytes) { return map{ ok: false, error: "secure output publish failed" }; }
+        let check = _read_bytes(output_path, MAX_ARTIFACT_BYTES);
+        if type(check) != "array" or len(check) != len(bytes) or not valid_x64_elf(check)
+            or artifact_digest(check) != artifact_digest(bytes) {
+            _remove(output_path); return map{ ok: false, error: "secure output verification failed" };
+        }
+        return map{ ok: true, byte_len: len(bytes), race_free_publication: true };
+    }
     let parent = path_dirname(output_path);
     if parent != "" and not (try { fs_mkdirs(parent); true } catch false) { return map{ ok: false, error: "output directory creation failed" }; }
     let staged = output_path + ".tmp-" + _nonce();
