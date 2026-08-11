@@ -8,15 +8,15 @@ of monopolizing the host; the quantum checks use finite, fixed circuits.
 
 | Model | Representative systems | Verified surface |
 |---|---|---|
-| MOS 6502 | Apple II, C64, NES | 8-bit arithmetic, flags, branches, loops |
-| Z80 | calculators, CP/M, retro systems | loads, arithmetic, relative branches |
-| AVR/ATmega | Arduino, appliances | register encoding, arithmetic, multiply, loops |
-| MSP430 | sensors, low-power controllers | word operations, jumps, CPUOFF halt |
-| MIPS32 | routers, SGI, PlayStation | arithmetic, multiply, branch delay slots |
-| PowerPC32 | classic Macs, consoles, embedded and space systems | canonical encodings, arithmetic, multiply, CR branch, syscall |
+| MOS 6502 | Apple II, C64, NES | reusable bounded stdlib model; immediate arithmetic, flags, branches, malformed-stream rejection |
+| Z80 | calculators, CP/M, retro systems | reusable bounded stdlib model; loads, arithmetic, flags, relative branches, malformed-stream rejection |
+| AVR/ATmega | Arduino, appliances | reusable bounded stdlib model; checked register encoding, arithmetic, multiply, branches, malformed-stream rejection |
+| MSP430 | sensors, low-power controllers | reusable bounded stdlib model; checked word operations, immediate mode, jumps, CPUOFF halt, malformed-stream rejection |
+| MIPS32 | routers, SGI, PlayStation | reusable bounded stdlib model; checked arithmetic, multiply, branch delay slots, malformed-control rejection |
+| PowerPC32 | classic Macs, consoles, embedded and space systems | reusable bounded stdlib model; checked encodings, arithmetic, multiply, CR branch, syscall, malformed-control rejection |
 | SPARC V8 | workstations, LEON/ERC32 satellites | arithmetic, traps, delay slots, annul |
-| RISC-V RV64I+M subset | open embedded through server CPUs | arithmetic, branches, jump, ecall |
-| WebAssembly | browsers and portable runtimes | LEB128, stack/local arithmetic, structured control flow |
+| RISC-V RV64I+M subset | open embedded through server CPUs | reusable bounded stdlib safe-integer model; checked arithmetic, branches, jump, ecall, malformed-control rejection |
+| WebAssembly | browsers and portable runtimes | reusable bounded stdlib model; checked LEB128, i32 stack/local arithmetic, structured control, malformed-stream rejection |
 | Quantum state vector | QASM-oriented simulation | gates, superposition, Bell/GHZ state checks |
 
 Run the matrix with:
@@ -61,6 +61,15 @@ arithmetic. `machine_stats()` exposes these counters, while `unsetenv`,
 `delete_file`, `listenv`, and `list_files` provide quota-safe lifecycle APIs.
 Mobile and WASI paths are confined beneath a virtual sandbox root.
 
+Output, environment and virtual-file quotas are measured in encoded UTF-8
+bytes, not character counts, so multibyte text cannot bypass memory/storage
+limits. The output byte counter is maintained in O(1); overwrites and deletes
+release the exact encoded-byte amount. Portable environment keys and values
+reject embedded NUL. The Android composition preserves an already granted
+permission when event publication cannot proceed and returns a fresh decoded
+service response for every call, preventing callers from mutating registered
+service state through a shared map alias.
+
 Run the contract and performance matrix with:
 
 ```sh
@@ -77,6 +86,28 @@ contract only when they meet the documented version and architecture gates.
 Biological, protein, analog-signal, FPGA, NPU, and other non-ISA substrates
 require a defined operation/protocol contract before executable emulation can
 be honest.
+
+The 6502, Z80, AVR, MSP430, MIPS32, PowerPC32, SPARC V8/LEON, RISC-V, and
+WebAssembly subsets
+are available to applications as `stdlib:emulator_6502.sapp`,
+`stdlib:emulator_z80.sapp`, `stdlib:emulator_avr.sapp`,
+`stdlib:emulator_msp430.sapp`, `stdlib:emulator_mips32.sapp`,
+`stdlib:emulator_powerpc32.sapp`, `stdlib:emulator_sparc32.sapp`,
+`stdlib:emulator_riscv64.sapp`, and `stdlib:emulator_wasm.sapp`; they are
+no longer test-local code. `run()`
+validates the complete byte/word stream before execution, rejects truncated or
+unknown instructions with structured errors, enforces each model's address
+and operand limits, and applies a caller-selectable instruction budget. Each
+module documents the unimplemented machine surfaces that remain outside its
+verified subset.
+
+`platform_emulator.release_conformance()` separates family-level userspace/ABI
+modeling from exact OS-release evidence. An exact claim requires matching
+OS/version/architecture, artifact and report SHA-256 digests, a named backend
+and runner, bounded duration, and successful loader, ABI, memory, filesystem,
+process, negative-path, quota, and cleanup checks. Missing or mismatched
+evidence fails closed. Even successful exact evidence deliberately does not
+claim complete kernel, driver, firmware, or proprietary-framework emulation.
 
 ## Device contracts and portable input
 
@@ -121,6 +152,8 @@ target/release/pblang run tests/semantics/device_emulator_test.sapp --allow-all
 target/release/pblang run tests/semantics/input_events_test.sapp --allow-all
 target/release/pblang run bench/device_emulator_stages.sapp --allow-all
 target/release/pblang run examples/device_emulation/main.sapp --allow-all
+target/release/pblang run examples/android_emulator_security/main.sapp --allow-all
+target/release/pblang run examples/isa_emulation/main.sapp --allow-all
 target/release/pblang run tools/pbinput.sapp --allow-all -- status
 target/release/pblang run tools/pbinput.sapp --allow-all -- plan-delta ydotool 10 -5
 ```

@@ -1,0 +1,174 @@
+// stdlib/emulator_sparc32.sapp -- bounded SPARC V8/LEON execution-model subset.
+
+let Support = import("stdlib:emulator_support.sapp");
+let FORMAT = "pblang.emulator.sparc32.v1";
+let DEFAULT_BUDGET = 1000000;
+let MAX_CODE_WORDS = 1048576;
+let MAX_WORD = 4294967295;
+
+let G0 = 0; let G1 = 1;
+let O0 = 8; let O1 = 9; let O2 = 10; let O3 = 11; let O4 = 12;
+let L0 = 16; let L1 = 17;
+
+fn _require(value, low, high, name) {
+    if not Support.integer(value, low, high) {
+        throw "emulator_sparc32: " + name + " must be " + str(low) + ".." + str(high);
+    }
+    return value;
+}
+fn _register(value, name) { return _require(value, 0, 31, name); }
+fn _signed13(value, name) { return _require(value, -4096, 4095, name); }
+fn _signed22(value, name) { return _require(value, -2097152, 2097151, name); }
+fn _encode_signed(value, modulus) { if value < 0 { return value + modulus; } return value; }
+fn _decode_signed(value, midpoint, modulus) { if value >= midpoint { return value - modulus; } return value; }
+fn _u32(value) { let result = value % 4294967296; if result < 0 { result = result + 4294967296; } return result; }
+fn _s32(value) { let result = _u32(value); if result >= 2147483648 { return result - 4294967296; } return result; }
+fn _mul32(left, right) {
+    let a = _u32(left); let b = _u32(right);
+    let a0 = a % 65536; let a1 = num_floor(a / 65536);
+    let b0 = b % 65536; let b1 = num_floor(b / 65536);
+    let low = a0 * b0;
+    let cross = (a0 * b1 + a1 * b0) % 65536;
+    return _u32(low + cross * 65536);
+}
+
+fn _format3_immediate(op3, source, immediate, destination) {
+    _require(op3, 0, 63, "format-3 opcode"); _register(source, "source");
+    _signed13(immediate, "immediate"); _register(destination, "destination");
+    return 2147483648 + destination * 33554432 + op3 * 524288 + source * 16384 + 8192 + _encode_signed(immediate, 8192);
+}
+fn _format3_register(op3, source, target, destination) {
+    _require(op3, 0, 63, "format-3 opcode"); _register(source, "source");
+    _register(target, "target"); _register(destination, "destination");
+    return 2147483648 + destination * 33554432 + op3 * 524288 + source * 16384 + target;
+}
+fn add_immediate(source, immediate, destination) { return _format3_immediate(0, source, immediate, destination); }
+fn add_register(source, target, destination) { return _format3_register(0, source, target, destination); }
+fn subtract_immediate(source, immediate, destination) { return _format3_immediate(4, source, immediate, destination); }
+fn subtract_register(source, target, destination) { return _format3_register(4, source, target, destination); }
+fn or_immediate(source, immediate, destination) { return _format3_immediate(2, source, immediate, destination); }
+fn move_immediate(immediate, destination) { return or_immediate(G0, immediate, destination); }
+fn signed_multiply(source, target, destination) { return _format3_register(11, source, target, destination); }
+fn subtract_cc_immediate(source, immediate, destination) { return _format3_immediate(20, source, immediate, destination); }
+fn subtract_cc_register(source, target, destination) { return _format3_register(20, source, target, destination); }
+fn set_high(immediate22, destination) {
+    _require(immediate22, 0, 4194303, "SETHI immediate"); _register(destination, "SETHI destination");
+    return destination * 33554432 + 4 * 4194304 + immediate22;
+}
+fn nop() { return set_high(0, G0); }
+fn _branch(annul, condition, displacement) {
+    _require(annul, 0, 1, "branch annul"); _require(condition, 0, 15, "branch condition");
+    _signed22(displacement, "branch displacement");
+    return annul * 536870912 + condition * 33554432 + 2 * 4194304 + _encode_signed(displacement, 4194304);
+}
+fn branch_always(displacement) { return _branch(0, 8, displacement); }
+fn branch_equal(displacement) { return _branch(0, 1, displacement); }
+fn branch_not_equal(displacement) { return _branch(0, 9, displacement); }
+fn branch_not_equal_annul(displacement) { return _branch(1, 9, displacement); }
+fn trap_always(immediate) { return _format3_immediate(58, G0, immediate, O0); }
+fn exit_sequence() { return [move_immediate(1, G1), trap_always(16)]; }
+fn program(instructions) {
+    if not is_array(instructions) { throw "emulator_sparc32.program: instructions must be an array"; }
+    let code = []; let i = 0;
+    while i < len(instructions) {
+        let item = instructions[i];
+        if is_array(item) {
+            let j = 0;
+            while j < len(item) {
+                if not Support.integer(item[j], 0, MAX_WORD) { throw "emulator_sparc32.program: invalid word"; }
+                if len(code) >= MAX_CODE_WORDS { throw "emulator_sparc32.program: code size limit exceeded"; }
+                array_push(code, item[j]); j = j + 1;
+            }
+        } else {
+            if not Support.integer(item, 0, MAX_WORD) { throw "emulator_sparc32.program: invalid word"; }
+            if len(code) >= MAX_CODE_WORDS { throw "emulator_sparc32.program: code size limit exceeded"; }
+            array_push(code, item);
+        }
+        i = i + 1;
+    }
+    return code;
+}
+fn _failure(reason, pc, instructions) { return Support.failure(FORMAT, reason, pc, instructions); }
+
+fn run(code, options = nil) {
+    let invalid = Support.validate_units(code, MAX_CODE_WORDS, MAX_WORD, "word");
+    if invalid != nil { return _failure(invalid, 0, 0); }
+    let budget_result = Support.instruction_budget(options, DEFAULT_BUDGET);
+    if not budget_result.ok { return _failure(budget_result.error, 0, 0); }
+    let registers = []; let i = 0; while i < 32 { array_push(registers, 0); i = i + 1; }
+    let zero = false; let negative = false; let pc = 0; let count = 0;
+    let delayed = false; let delayed_target = 0;
+    while count < budget_result.value {
+        if pc < 0 or pc >= len(code) { return _failure("program counter outside code", pc, count); }
+        let word = code[pc]; let opcode = num_floor(word / 1073741824);
+        let in_delay_slot = delayed; let next_delayed = false; let next_target = 0;
+        count = count + 1;
+        if opcode == 0 {
+            let opcode2 = num_floor(word / 4194304) % 8;
+            let destination = num_floor(word / 33554432) % 32;
+            if opcode2 == 4 {
+                if destination != G0 { registers[destination] = _u32((word % 4194304) * 1024); }
+                pc = pc + 1;
+            } elif opcode2 == 2 {
+                if in_delay_slot { return _failure("control transfer in delay slot is not modeled", pc, count); }
+                let annul = num_floor(word / 536870912) % 2;
+                let condition = destination % 16;
+                let displacement = _decode_signed(word % 4194304, 2097152, 4194304);
+                let take = false;
+                if condition == 8 { take = true; }
+                elif condition == 9 { take = not zero; }
+                elif condition == 1 { take = zero; }
+                else { return _failure("unmodeled branch condition " + str(condition), pc, count); }
+                if take {
+                    let target = pc + displacement;
+                    if pc + 1 >= len(code) { return _failure("branch has no delay-slot instruction", pc, count); }
+                    if target < 0 or target >= len(code) { return _failure("branch target outside code", pc, count); }
+                    next_delayed = true; next_target = target; pc = pc + 1;
+                } elif annul == 1 { pc = pc + 2; }
+                else { pc = pc + 1; }
+            } else { return _failure("unmodeled format-2 opcode " + str(opcode2), pc, count); }
+        } elif opcode == 2 {
+            let destination = num_floor(word / 33554432) % 32;
+            let opcode3 = num_floor(word / 524288) % 64;
+            let source = num_floor(word / 16384) % 32;
+            let immediate_mode = num_floor(word / 8192) % 2;
+            let value2 = 0;
+            if immediate_mode == 1 { value2 = _decode_signed(word % 8192, 4096, 8192); }
+            else { value2 = registers[word % 32]; }
+            if opcode3 == 58 {
+                if in_delay_slot { return _failure("trap in delay slot is not modeled", pc, count); }
+                if destination % 16 != 8 or value2 != 16 { return _failure("unmodeled trap", pc, count); }
+                if registers[G1] != 1 { return _failure("unmodeled syscall " + str(registers[G1]), pc, count); }
+                return map{
+                    ok: true, format: FORMAT, halted: true, pc: pc,
+                    instructions: count, registers: registers, value: registers[O0] % 256,
+                    branch_delay_slots: true,
+                    boundary: "verified SPARC V8 flat-register arithmetic/branch-delay/Linux-exit subset; not a full machine"
+                };
+            }
+            let result = 0;
+            if opcode3 == 0 { result = _u32(registers[source] + value2); }
+            elif opcode3 == 2 { result = _u32(bit_or(registers[source], value2)); }
+            elif opcode3 == 4 { result = _u32(registers[source] - value2); }
+            elif opcode3 == 11 { result = _mul32(registers[source], value2); }
+            elif opcode3 == 20 {
+                result = _u32(registers[source] - value2);
+                zero = result == 0; negative = _s32(result) < 0;
+            } else { return _failure("unmodeled format-3 opcode " + str(opcode3), pc, count); }
+            if destination != G0 { registers[destination] = result; }
+            pc = pc + 1;
+        } else { return _failure("unmodeled primary opcode " + str(opcode), pc, count); }
+        registers[G0] = 0;
+        if in_delay_slot { delayed = false; pc = delayed_target; }
+        elif next_delayed { delayed = true; delayed_target = next_target; }
+    }
+    return _failure("instruction budget exceeded", pc, count);
+}
+
+export FORMAT, DEFAULT_BUDGET, MAX_CODE_WORDS;
+export G0, G1, O0, O1, O2, O3, O4, L0, L1;
+export add_immediate, add_register, subtract_immediate, subtract_register;
+export or_immediate, move_immediate, signed_multiply;
+export subtract_cc_immediate, subtract_cc_register, set_high, nop;
+export branch_always, branch_equal, branch_not_equal, branch_not_equal_annul;
+export trap_always, exit_sequence, program, run;

@@ -1,0 +1,134 @@
+// stdlib/emulator_riscv64.sapp -- bounded RV64I+M safe-integer subset.
+
+let Support = import("stdlib:emulator_support.sapp");
+let FORMAT = "pblang.emulator.riscv64.v1";
+let DEFAULT_BUDGET = 1000000;
+let MAX_CODE_BYTES = 4194304;
+let MAX_SAFE_INTEGER = 9007199254740991;
+
+fn _require(value, low, high, name) {
+    if not Support.integer(value, low, high) {
+        throw "emulator_riscv64: " + name + " must be " + str(low) + ".." + str(high);
+    }
+    return value;
+}
+fn _register(value, name) { return _require(value, 0, 31, name); }
+fn _le32(word) { return [word % 256, num_floor(word / 256) % 256, num_floor(word / 65536) % 256, num_floor(word / 16777216) % 256]; }
+fn _encoded(value, modulus) { let result = value % modulus; if result < 0 { result = result + modulus; } return result; }
+fn _signed(value, bits) {
+    let half = 1; let i = 0; while i < bits - 1 { half = half * 2; i = i + 1; }
+    if value >= half { return value - half * 2; } return value;
+}
+fn _safe(value) { return is_number(value) and value >= 0 - MAX_SAFE_INTEGER and value <= MAX_SAFE_INTEGER and num_floor(value) == value; }
+
+fn add_immediate(destination, source, immediate) {
+    _register(destination, "ADDI destination"); _register(source, "ADDI source"); _require(immediate, -2048, 2047, "ADDI immediate");
+    return _le32(_encoded(immediate, 4096) * 1048576 + source * 32768 + destination * 128 + 19);
+}
+fn add(destination, source_a, source_b) { return _register_op(destination, source_a, source_b, 0, "ADD"); }
+fn subtract(destination, source_a, source_b) { return _register_op(destination, source_a, source_b, 32, "SUB"); }
+fn multiply(destination, source_a, source_b) { return _register_op(destination, source_a, source_b, 1, "MUL"); }
+fn _register_op(destination, source_a, source_b, function7, name) {
+    _register(destination, name + " destination"); _register(source_a, name + " source A"); _register(source_b, name + " source B");
+    return _le32(function7 * 33554432 + source_b * 1048576 + source_a * 32768 + destination * 128 + 51);
+}
+fn load_upper_immediate(destination, immediate20) {
+    _register(destination, "LUI destination"); _require(immediate20, 0, 1048575, "LUI immediate");
+    return _le32(immediate20 * 4096 + destination * 128 + 55);
+}
+fn _branch(source_a, source_b, function3, byte_offset, name) {
+    _register(source_a, name + " source A"); _register(source_b, name + " source B");
+    _require(byte_offset, -4096, 4094, name + " offset");
+    if byte_offset % 4 != 0 { throw "emulator_riscv64: modeled branches must be word aligned"; }
+    let immediate = _encoded(byte_offset, 8192);
+    let bit12 = num_floor(immediate / 4096) % 2; let bit11 = num_floor(immediate / 2048) % 2;
+    let bits10_5 = num_floor(immediate / 32) % 64; let bits4_1 = num_floor(immediate / 2) % 16;
+    return _le32(bit12 * 2147483648 + bits10_5 * 33554432 + source_b * 1048576 +
+        source_a * 32768 + function3 * 4096 + bits4_1 * 256 + bit11 * 128 + 99);
+}
+fn branch_equal(source_a, source_b, byte_offset) { return _branch(source_a, source_b, 0, byte_offset, "BEQ"); }
+fn branch_not_equal(source_a, source_b, byte_offset) { return _branch(source_a, source_b, 1, byte_offset, "BNE"); }
+fn jump_and_link(destination, byte_offset) {
+    _register(destination, "JAL destination"); _require(byte_offset, -1048576, 1048574, "JAL offset");
+    if byte_offset % 4 != 0 { throw "emulator_riscv64: modeled JAL must be word aligned"; }
+    let immediate = _encoded(byte_offset, 2097152);
+    let bit20 = num_floor(immediate / 1048576) % 2; let bits19_12 = num_floor(immediate / 4096) % 256;
+    let bit11 = num_floor(immediate / 2048) % 2; let bits10_1 = num_floor(immediate / 2) % 1024;
+    return _le32(bit20 * 2147483648 + bits10_1 * 2097152 + bit11 * 1048576 +
+        bits19_12 * 4096 + destination * 128 + 111);
+}
+fn environment_call() { return _le32(115); }
+fn program(instructions) { return Support.program(instructions, MAX_CODE_BYTES); }
+fn _word(code, offset) { return code[offset] + code[offset + 1] * 256 + code[offset + 2] * 65536 + code[offset + 3] * 16777216; }
+fn _failure(reason, pc, instructions) { return Support.failure(FORMAT, reason, pc, instructions); }
+
+fn run(code, options = nil) {
+    let invalid = Support.validate_bytes(code, MAX_CODE_BYTES);
+    if invalid != nil { return _failure(invalid, 0, 0); }
+    if len(code) % 4 != 0 { return _failure("RISC-V code must contain complete 32-bit words", 0, 0); }
+    let budget_result = Support.instruction_budget(options, DEFAULT_BUDGET);
+    if not budget_result.ok { return _failure(budget_result.error, 0, 0); }
+    let registers = []; let i = 0; while i < 32 { array_push(registers, 0); i = i + 1; }
+    let word_count = num_floor(len(code) / 4); let pc = 0; let count = 0;
+    while count < budget_result.value {
+        if pc < 0 or pc >= word_count { return _failure("program counter outside code", pc, count); }
+        let word = _word(code, pc * 4); let opcode = word % 128;
+        let destination = num_floor(word / 128) % 32; let function3 = num_floor(word / 4096) % 8;
+        let source_a = num_floor(word / 32768) % 32; let source_b = num_floor(word / 1048576) % 32;
+        let function7 = num_floor(word / 33554432) % 128; let next = pc + 1; let value = 0;
+        count = count + 1;
+        if opcode == 19 {
+            if function3 != 0 { return _failure("unmodeled OP-IMM function " + str(function3), pc, count); }
+            value = registers[source_a] + _signed(num_floor(word / 1048576) % 4096, 12);
+            if not _safe(value) { return _failure("safe-integer overflow", pc, count); }
+            if destination != 0 { registers[destination] = value; }
+        }
+        elif opcode == 51 {
+            if function3 != 0 { return _failure("unmodeled OP function " + str(function3), pc, count); }
+            if function7 == 0 { value = registers[source_a] + registers[source_b]; }
+            elif function7 == 32 { value = registers[source_a] - registers[source_b]; }
+            elif function7 == 1 { value = registers[source_a] * registers[source_b]; }
+            else { return _failure("unmodeled OP function7 " + str(function7), pc, count); }
+            if not _safe(value) { return _failure("safe-integer overflow", pc, count); }
+            if destination != 0 { registers[destination] = value; }
+        }
+        elif opcode == 55 {
+            value = num_floor(word / 4096) % 1048576 * 4096;
+            if destination != 0 { registers[destination] = value; }
+        }
+        elif opcode == 99 {
+            if function3 != 0 and function3 != 1 { return _failure("unmodeled branch function " + str(function3), pc, count); }
+            let bit12 = num_floor(word / 2147483648) % 2; let bit11 = num_floor(word / 128) % 2;
+            let bits10_5 = num_floor(word / 33554432) % 64; let bits4_1 = num_floor(word / 256) % 16;
+            let offset = _signed(bit12 * 4096 + bit11 * 2048 + bits10_5 * 32 + bits4_1 * 2, 13);
+            let take = if function3 == 0 { registers[source_a] == registers[source_b] }
+                else { registers[source_a] != registers[source_b] };
+            if take { next = pc + num_floor(offset / 4); }
+        }
+        elif opcode == 111 {
+            let bit20 = num_floor(word / 2147483648) % 2; let bits19_12 = num_floor(word / 4096) % 256;
+            let bit11 = num_floor(word / 1048576) % 2; let bits10_1 = num_floor(word / 2097152) % 1024;
+            let offset = _signed(bit20 * 1048576 + bits19_12 * 4096 + bit11 * 2048 + bits10_1 * 2, 21);
+            if destination != 0 { registers[destination] = (pc + 1) * 4; }
+            next = pc + num_floor(offset / 4);
+        }
+        elif opcode == 115 {
+            if word != 115 { return _failure("unmodeled SYSTEM instruction", pc, count); }
+            if registers[17] != 93 { return _failure("unmodeled environment call " + str(registers[17]), pc, count); }
+            let result = registers[10] % 256; if result < 0 { result = result + 256; }
+            return map{
+                ok: true, format: FORMAT, halted: true, pc: pc,
+                instructions: count, registers: registers, value: result,
+                exact_integer_limit: MAX_SAFE_INTEGER,
+                boundary: "verified RV64I+M safe-integer arithmetic/control/Linux-exit subset; not full-width RV64"
+            };
+        }
+        else { return _failure("unmodeled opcode " + str(opcode), pc, count); }
+        registers[0] = 0; pc = next;
+    }
+    return _failure("instruction budget exceeded", pc, count);
+}
+
+export FORMAT, DEFAULT_BUDGET, MAX_CODE_BYTES, MAX_SAFE_INTEGER;
+export add_immediate, add, subtract, multiply, load_upper_immediate;
+export branch_equal, branch_not_equal, jump_and_link, environment_call, program, run;

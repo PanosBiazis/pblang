@@ -15,8 +15,17 @@ pblang is a general-purpose programming language and bytecode VM designed for em
 - **Stack-based bytecode VM** with closures, modules, errors, arrays/maps, GC support, and runtime diagnostics.
 - **Parser, compiler, type checker, linter, formatter, and CLI**.
 - **Capability-based embedding controls** through `StdlibConfig`, `VmLimits`, and `FfiPolicy`.
+- **Default-on PBLang-native build security analysis** with audited scoped
+  suppressions, `protect`/`strict`/`audit` modes, bounded custom rules and an
+  explicit opt-out. Selectable quality/performance/completeness analysis is
+  available separately through `pbanalyze`; see
+  [source security and analysis](docs/Security_Analysis.md).
 - **Package manager** with manifests, lockfiles, local and registry dependencies, checksums, and HMAC helpers.
 - **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, bounded memory/SQLite/Redis data stores, provider-neutral edge/regional CDN caching, native SQLite, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more. See [data storage](docs/Data_Storage.md) and [CDN caching](docs/CDN_Caching.md).
+- **Carrier-independent transport guard** through
+  `stdlib:transport_security.sapp`: identity/certificate/channel pins,
+  downgrade and replay rejection, charge-only USB data blocking, and redacted
+  anomaly signals without blanket distrust of a carrier type.
 - **LSP server** with diagnostics, completions, hover, goto-definition, workspace symbols, and semantic tokens.
 - **Native pblang IDE** via `pblang --ide`: code editor, terminal, visual designer, pbAI panel, and pblang-native browser panel.
 - **Self-hosted compiler pipeline** under `stdlib/compiler/`, including tokenizer, parser, semantic analysis, type checking, IR, optimizer, codegen, and a pblang bytecode interpreter.
@@ -111,7 +120,11 @@ The same validated view tree runs on native desktop and builds a signed Android
 APK from PBLang-generated JVM bytecode and hardened responsive Web artifacts
 through the same shared components and selectable `app.surface(...)` mode.
 iOS, Web and embedded remain explicit adapter contracts and fail clearly until
-their real runtimes are linked. See [`docs/MODERN_UI.md`](docs/MODERN_UI.md).
+their real runtimes are linked. Native `gui.button(...)` controls also accept
+semantic `primary`, `secondary`, `navigation`, `ghost` and `danger` variants;
+older calls remain primary by default and custom palettes can override the
+corresponding selected, focus, danger and on-accent roles.
+See [`docs/MODERN_UI.md`](docs/MODERN_UI.md).
 
 ### One-line CDN-backed static site
 
@@ -165,6 +178,8 @@ layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
 | `pblang lint [files...]` | Parse, type-check, and lint files. |
 | `pblang build [path]` | Generate lockfile and type-check the package entry. |
 | `pblang run tools/pbbuild.sapp --allow-all -- SOURCE OUTPUT` | Plan and run a cached adaptive native build with explicit fallbacks. |
+| `pblang run tools/pbsecure.sapp --allow-all -- SOURCE` | Dependency-wide policy and interprocedural semantic taint/control-flow audit. |
+| `pblang run tools/pbaudit.sapp --allow-all -- --module-by-module --resume --json-output=audit.json roots...` | Atomic resumable per-module repository triage without a shared finding early-stop or raw source lines in reports. |
 | `pblang init` | Create a `pblang.toml`. |
 | `pblang new <name>` | Scaffold a new project. |
 | `pblang install` | Install dependencies. |
@@ -176,6 +191,13 @@ layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
 | `pblang --check <file>` | Parse and type-check only. |
 | `pblang --dump-bytecode <file>` | Print bytecode disassembly. |
 | `pblang --cfg <file>` | Dump a control-flow graph. |
+
+Large product test runners can use `stdlib:test_scheduler.sapp` to cap workers
+by CPU and available memory. Physical-device and sustained-soak profiles always
+serialize access to each device and expose adaptive, fail-closed battery,
+temperature and memory policy. Warm test caches remain an optimization, not an
+evidence substitute; product runners must invalidate them from the complete
+import/source graph.
 
 ---
 

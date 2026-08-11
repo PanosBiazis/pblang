@@ -1,0 +1,305 @@
+// Default-on, bounded source security analysis for PBLang-native build tools.
+// Rules are transparent data. Suppressions are scoped, require a reason and are
+// always retained in the report; high-severity suppressions remain blocking
+// unless the caller explicitly enables them.
+
+let FORMAT = "pblang.security-analysis.v1";
+let MAX_RULES = 128;
+let MAX_FINDINGS = 512;
+let MAX_BLOCK_LINES = 200;
+let MAX_CONFIG_BYTES = 262144;
+
+fn _defaults() {
+    return [
+        map{ id: "capability.allow-all", severity: "high", needle: "PBLANG_ALLOW_ALL=1",
+             message: "broad host capabilities are enabled" },
+        map{ id: "capability.allow-exec", severity: "high", needle: "PBLANG_ALLOW_EXEC=1",
+             message: "host process execution is enabled" },
+        map{ id: "capability.allow-ffi", severity: "high", needle: "PBLANG_ALLOW_FFI=1",
+             message: "raw native FFI is enabled" },
+        map{ id: "tls.verification-disabled", severity: "high", needle: "danger_accept_invalid_certs",
+             message: "TLS certificate verification appears disabled" },
+        map{ id: "tls.node-verification-disabled", severity: "high", needle: "NODE_TLS_REJECT_UNAUTHORIZED=0",
+             message: "Node TLS verification is disabled" },
+        map{ id: "process.shell-command", severity: "medium", needle: "bash -lc",
+             message: "shell-mediated process execution requires review" },
+        map{ id: "process.sh-command", severity: "medium", needle: "sh -c",
+             message: "shell-mediated process execution requires review" },
+        map{ id: "network.plaintext-http", severity: "medium", needle: "http://",
+             message: "plaintext HTTP endpoint requires an explicit trust boundary" },
+        map{ id: "code.dynamic-eval", severity: "medium", needle: "eval(",
+             message: "dynamic evaluation requires strict input confinement" }
+    ];
+}
+
+fn _valid_id(value) {
+    if type(value) != "string" or len(value) < 3 or len(value) > 96 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        let ok = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or
+            (c >= 97 and c <= 122) or c == 45 or c == 46 or c == 95;
+        if not ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _valid_severity(value) {
+    return value == "high" or value == "medium" or value == "low" or value == "info";
+}
+
+fn _severity_rank(value) {
+    if value == "high" { return 4; }
+    if value == "medium" { return 3; }
+    if value == "low" { return 2; }
+    return 1;
+}
+
+fn _rule(value) {
+    if not is_map(value) { return nil; }
+    let id = try value.id catch "";
+    let severity = str_lower(str(try value.severity catch "medium"));
+    let needle = try value.needle catch "";
+    let message = try value.message catch "custom security rule matched";
+    if not _valid_id(id) or not _valid_severity(severity) or type(needle) != "string"
+        or len(needle) < 2 or len(needle) > 256 or type(message) != "string"
+        or len(message) < 1 or len(message) > 256 {
+        return nil;
+    }
+    return map{ id: id, severity: severity, needle: needle, message: message };
+}
+
+fn _contains(values, wanted) {
+    let i = 0; while i < len(values) { if values[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _starts_with_at(value, needle, at) {
+    if at < 0 or at + len(needle) > len(value) { return false; }
+    return str_slice(value, at, at + len(needle)) == needle;
+}
+
+fn _http_host_boundary(value, at) {
+    if at >= len(value) { return true; }
+    let c = strcharcodeat(value, at);
+    return c == 34 or c == 39 or c == 47 or c == 58 or c == 63 or c == 35
+        or c == 32 or c == 9 or c == 41 or c == 44 or c == 59;
+}
+
+fn _only_literal_loopback_http(line) {
+    let marker = "http://";
+    let offset = 0;
+    let matched = false;
+    while offset < len(line) {
+        let relative = str_index_of(str_slice(line, offset, len(line)), marker);
+        if relative < 0 { return matched; }
+        let host_at = offset + relative + len(marker);
+        let host_len = 0;
+        if _starts_with_at(line, "127.0.0.1", host_at) { host_len = 9; }
+        elif _starts_with_at(line, "localhost", host_at) { host_len = 9; }
+        elif _starts_with_at(line, "[::1]", host_at) { host_len = 5; }
+        if host_len == 0 or not _http_host_boundary(line, host_at + host_len) { return false; }
+        matched = true;
+        offset = host_at + host_len;
+    }
+    return matched;
+}
+
+fn _configuration_errors(options) {
+    let errors = [];
+    let disabled = try options.disabled_rule_ids catch [];
+    if not is_array(disabled) or len(disabled) > MAX_RULES {
+        array_push(errors, "disabled_rule_ids must be a bounded array");
+    } else {
+        let i = 0; while i < len(disabled) {
+            if not _valid_id(disabled[i]) { array_push(errors, "invalid disabled rule id at index " + str(i)); }
+            i = i + 1;
+        }
+    }
+    let custom = try options.custom_rules catch [];
+    if not is_array(custom) or len(custom) > MAX_RULES {
+        array_push(errors, "custom_rules must be a bounded array");
+    } else {
+        let i = 0; while i < len(custom) {
+            if _rule(custom[i]) == nil { array_push(errors, "invalid custom rule at index " + str(i)); }
+            i = i + 1;
+        }
+    }
+    let allow_high = try options.allow_high_suppressions catch false;
+    if type(allow_high) != "bool" { array_push(errors, "allow_high_suppressions must be boolean"); }
+    let minimum = str_lower(str(try options.minimum_blocking_severity catch "info"));
+    if not _valid_severity(minimum) { array_push(errors, "invalid minimum_blocking_severity"); }
+    return errors;
+}
+
+fn rules(options = nil) {
+    if options == nil { options = map{}; }
+    let disabled = try options.disabled_rule_ids catch [];
+    if not is_array(disabled) { disabled = []; }
+    let merged = map{}; let order = []; let base = _defaults(); let i = 0;
+    while i < len(base) { merged[base[i].id] = base[i]; array_push(order, base[i].id); i = i + 1; }
+    let custom = try options.custom_rules catch [];
+    if not is_array(custom) or len(custom) > MAX_RULES { custom = []; }
+    i = 0;
+    while i < len(custom) {
+        let checked = _rule(custom[i]);
+        if checked != nil {
+            if not map_has(merged, checked.id) { array_push(order, checked.id); }
+            merged[checked.id] = checked;
+        }
+        i = i + 1;
+    }
+    let out = []; i = 0;
+    while i < len(order) and len(out) < MAX_RULES {
+        if not _contains(disabled, order[i]) { array_push(out, merged[order[i]]); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn load_config(path, max_bytes = 262144) {
+    if type(path) != "string" or path == "" or len(path) > 4096
+        or str_contains(path, "\0") or str_contains(path, "\n") or str_contains(path, "\r") {
+        return map{ ok: false, error: "invalid security config path" };
+    }
+    if max_bytes < 1 or max_bytes > MAX_CONFIG_BYTES { max_bytes = MAX_CONFIG_BYTES; }
+    let bytes = try fs_read_bytes(path) catch nil;
+    if type(bytes) != "array" { return map{ ok: false, error: "cannot read security config" }; }
+    if len(bytes) > max_bytes { return map{ ok: false, error: "security config exceeds byte limit" }; }
+    let text = try bytes_to_str(bytes) catch nil;
+    if text == nil { return map{ ok: false, error: "security config is not valid UTF-8" }; }
+    let value = try json_parse(text) catch nil;
+    if type(value) != "map" { return map{ ok: false, error: "security config must be a JSON object" }; }
+    return map{ ok: true, value: value, bytes: len(bytes) };
+}
+
+fn _directive(line, marker, require_reason = true) {
+    let at = str_index_of(line, marker); if at < 0 { return nil; }
+    let tail = str_trim(str_slice(line, at + len(marker), len(line)));
+    let parts = str_split(tail, " "); if len(parts) < 1 or not _valid_id(parts[0]) { return nil; }
+    if not require_reason { return map{ id: parts[0], reason: "" }; }
+    let reason_at = str_index_of(tail, "reason=");
+    if reason_at < 0 { return nil; }
+    let reason = str_trim(str_slice(tail, reason_at + 7, len(tail)));
+    if len(reason) < 3 or len(reason) > 256 { return nil; }
+    return map{ id: parts[0], reason: reason };
+}
+
+fn _finding(rule, path, line, suppressed, reason) {
+    return map{ format: "pblang.security-analysis.finding.v1", id: rule.id,
+        severity: rule.severity, path: path, line: line, message: rule.message,
+        suppressed: suppressed, suppression_reason: reason };
+}
+
+fn analyze(source, path = "[source]", options = nil) {
+    if options == nil { options = map{}; }
+    if type(source) != "string" { return map{ ok: false, passed: false, error: "security source must be text" }; }
+    if type(options) != "map" { return map{ ok: false, passed: false, error: "security options must be a map" }; }
+    let configuration_errors = _configuration_errors(options);
+    if len(configuration_errors) > 0 {
+        return map{ ok: false, passed: false, format: FORMAT,
+            error: "invalid security analysis configuration", configuration_errors: configuration_errors };
+    }
+    let configured = rules(options);
+    let configured_ids = []; let configured_i = 0;
+    while configured_i < len(configured) { array_push(configured_ids, configured[configured_i].id); configured_i = configured_i + 1; }
+    let lines = str_split(source, "\n");
+    let active = map{}; let active_age = map{}; let pending = map{};
+    let findings = []; let suppressions = []; let malformed = [];
+    let high = 0; let medium = 0; let low = 0; let blocking = 0;
+    let allow_high = try options.allow_high_suppressions catch false;
+    let minimum_blocking = str_lower(str(try options.minimum_blocking_severity catch "info"));
+    if not _valid_severity(minimum_blocking) { minimum_blocking = "info"; }
+    let i = 0;
+    while i < len(lines) and len(findings) < MAX_FINDINGS {
+        let line = lines[i];
+        // A next-line suppression is consumed only by the following source line.
+        let line_pending = pending; pending = map{};
+        let begin = _directive(line, "pblang-security-ignore-begin:");
+        let next = _directive(line, "pblang-security-ignore-next-line:");
+        let end = _directive(line, "pblang-security-ignore-end:", false);
+        let directive_count = 0;
+        if begin != nil { directive_count = directive_count + 1; }
+        if next != nil { directive_count = directive_count + 1; }
+        if end != nil { directive_count = directive_count + 1; }
+        if directive_count > 1 {
+            array_push(malformed, map{ line: i + 1, error: "multiple suppression directives on one line" });
+            begin = nil; next = nil; end = nil;
+        }
+        if begin != nil and not _contains(configured_ids, begin.id) {
+            array_push(malformed, map{ line: i + 1, error: "suppression names an unavailable rule", id: begin.id }); begin = nil;
+        }
+        if next != nil and not _contains(configured_ids, next.id) {
+            array_push(malformed, map{ line: i + 1, error: "suppression names an unavailable rule", id: next.id }); next = nil;
+        }
+        if end != nil and not _contains(configured_ids, end.id) {
+            array_push(malformed, map{ line: i + 1, error: "suppression names an unavailable rule", id: end.id }); end = nil;
+        }
+        if str_contains(line, "pblang-security-ignore-") and begin == nil and next == nil and end == nil
+            and directive_count == 0 {
+            array_push(malformed, map{ line: i + 1, error: "malformed suppression directive" });
+        }
+        if begin != nil {
+            if map_has(active, begin.id) {
+                array_push(malformed, map{ line: i + 1, error: "duplicate suppression block", id: begin.id });
+            } else {
+                active[begin.id] = begin.reason; active_age[begin.id] = 0;
+            }
+        }
+        if next != nil { pending[next.id] = next.reason; }
+        if end != nil {
+            if not map_has(active, end.id) {
+                array_push(malformed, map{ line: i + 1, error: "suppression block end has no matching begin", id: end.id });
+            } else {
+                map_remove(active, end.id); map_remove(active_age, end.id);
+            }
+        }
+
+        let r = 0;
+        while r < len(configured) {
+            let rule = configured[r];
+            if str_contains(line, rule.needle)
+                and not (rule.id == "network.plaintext-http" and rule.needle == "http://"
+                    and _only_literal_loopback_http(line))
+                and begin == nil and next == nil and end == nil {
+                let reason = "";
+                if map_has(active, rule.id) { reason = active[rule.id]; }
+                elif map_has(line_pending, rule.id) { reason = line_pending[rule.id]; }
+                let suppressed = reason != "";
+                let finding = _finding(rule, path, i + 1, suppressed, reason);
+                array_push(findings, finding);
+                if rule.severity == "high" { high = high + 1; }
+                elif rule.severity == "medium" { medium = medium + 1; }
+                else { low = low + 1; }
+                if suppressed { array_push(suppressions, finding); }
+                let suppression_blocks = suppressed and rule.severity == "high" and not allow_high;
+                let severity_blocks = _severity_rank(rule.severity) >= _severity_rank(minimum_blocking);
+                if severity_blocks and (not suppressed or suppression_blocks) { blocking = blocking + 1; }
+            }
+            r = r + 1;
+        }
+        let keys = map_keys(active); let k = 0;
+        while k < len(keys) {
+            active_age[keys[k]] = active_age[keys[k]] + 1;
+            if active_age[keys[k]] > MAX_BLOCK_LINES {
+                array_push(malformed, map{ line: i + 1, error: "suppression block exceeded line limit", id: keys[k] });
+                map_remove(active, keys[k]); map_remove(active_age, keys[k]);
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    let open_blocks = map_keys(active);
+    if len(open_blocks) > 0 { array_push(malformed, map{ line: len(lines), error: "unterminated suppression block" }); }
+    blocking = blocking + len(malformed);
+    return map{ ok: true, format: FORMAT, passed: blocking == 0, path: path,
+        rules: len(configured), lines: len(lines), findings: findings,
+        finding_count: len(findings), high: high, medium: medium, low: low,
+        blocking: blocking, suppressions: suppressions, suppression_count: len(suppressions),
+        malformed_suppressions: malformed, allow_high_suppressions: allow_high,
+        minimum_blocking_severity: minimum_blocking,
+        truncated: len(findings) >= MAX_FINDINGS };
+}
+
+export FORMAT, MAX_CONFIG_BYTES, rules, load_config, analyze;

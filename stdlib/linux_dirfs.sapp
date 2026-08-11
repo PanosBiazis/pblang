@@ -47,6 +47,11 @@ fn _components(path, allow_root = true) {
     return out;
 }
 
+fn _root_components(root) {
+    if root == "." { return []; }
+    return _components(root, false);
+}
+
 fn _absolute_components(path) {
     if type(path) != "string" or len(path) < 2 or len(path) > MAX_PATH
         or not str_starts_with(path, "/") or str_contains(path, strfromcharcode(0)) {
@@ -99,23 +104,43 @@ fn _renameat(fs, from_fd, from_name, to_fd, to_name) {
     _free(fs, to_pointer); _free(fs, from_pointer); return result;
 }
 
-fn open(root, create = true) {
+fn open(root, create = true, protect_root = false) {
     let host = available(); if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
-    let parts = _components(root, false); if parts == nil { return _error("root must be a safe relative path"); }
-    if create { try fs_mkdirs(root) catch nil; }
+    let parts = _root_components(root); if parts == nil { return _error("root must be a safe relative path"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc };
-    let fd = _openat(holder, AT_FDCWD, root, O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
-    if fd < 0 { ffi_close(libc); return _error("root cannot be opened without following links"); }
-    return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: fd,
+    // Hold the current directory first, then resolve every caller-controlled
+    // component relative to a held descriptor. O_NOFOLLOW on one multi-part
+    // open protects only its final component and would leave intermediate
+    // symlinks vulnerable to a check/use race.
+    let current = _openat(holder, AT_FDCWD, ".", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+    if current < 0 { ffi_close(libc); return _error("current directory cannot be opened"); }
+    let i = 0;
+    while i < len(parts) {
+        let next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        if next < 0 and create {
+            _mkdirat(holder, current, parts[i], MODE_DIR);
+            // Always retry: another process may have won the mkdir race. The
+            // descriptor open still rejects links and non-directories.
+            next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        }
+        _close_fd(holder, current);
+        if next < 0 { ffi_close(libc); return _error("root component is missing, not a directory, or a symbolic link"); }
+        current = next; i = i + 1;
+    }
+    if protect_root and len(parts) > 0 {
+        let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
+        if protected != 0 { _close_fd(holder, current); ffi_close(libc); return _error("relative root permissions cannot be protected"); }
+    }
+    return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
                 libc: libc, libc_path: host.libc, closed: false };
 }
 
 // Open a trusted absolute application-data root component-by-component. No
 // component may be a symlink, and newly created directories are private from
 // their first observable state. The final root is forced to mode 0700.
-fn open_absolute(root, create = true) {
+fn open_absolute(root, create = true, protect_root = true) {
     let host = available(); if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
     let parts = _absolute_components(root); if parts == nil { return _error("root must be a safe absolute path"); }
     let libc = try ffi_load(host.libc) catch nil;
@@ -127,15 +152,17 @@ fn open_absolute(root, create = true) {
     while i < len(parts) {
         let next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
         if next < 0 and create {
-            let made = _mkdirat(holder, current, parts[i], MODE_DIR);
-            if made == 0 { next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0); }
+            _mkdirat(holder, current, parts[i], MODE_DIR);
+            next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
         }
         _close_fd(holder, current);
         if next < 0 { ffi_close(libc); return _error("absolute path component is missing, not a directory, or a symbolic link"); }
         current = next; i = i + 1;
     }
-    let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
-    if protected != 0 { _close_fd(holder, current); ffi_close(libc); return _error("application root permissions cannot be protected"); }
+    if protect_root {
+        let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
+        if protected != 0 { _close_fd(holder, current); ffi_close(libc); return _error("application root permissions cannot be protected"); }
+    }
     return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
                 libc: libc, libc_path: host.libc, closed: false, absolute: true };
 }
@@ -153,8 +180,8 @@ fn _walk_dir(fs, parts, create) {
     while i < len(parts) {
         let next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
         if next < 0 and create {
-            let made = _mkdirat(fs, current, parts[i], MODE_DIR);
-            if made == 0 { next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0); }
+            _mkdirat(fs, current, parts[i], MODE_DIR);
+            next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
         }
         _close_fd(fs, current);
         if next < 0 { return _error("path component is missing, not a directory, or a symbolic link"); }
@@ -248,7 +275,8 @@ fn move(fs, from, to, create_parents = true) {
 fn status(fs) {
     return map{ format: "pblang.linux-dirfs.status.v1", available: fs != nil and not (try fs.closed catch true),
                 component_openat: true, nofollow: true, cloexec: true, stable_proc_fd_io: true,
-                atomic_renameat: true, libc: try fs.libc_path catch nil };
+                atomic_renameat: true, relative_root_component_walk: true,
+                mkdir_race_reopen: true, libc: try fs.libc_path catch nil };
 }
 
 export available, open, open_absolute, close, mkdir, list, read_bytes, protect_file, write_atomic, remove, move, status;

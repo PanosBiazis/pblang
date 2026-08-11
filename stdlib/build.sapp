@@ -13,6 +13,8 @@ let _HOST_ARCH_CACHE = "";
 let _HOST_PLATFORM_CACHE = "";
 let SESSION = import("stdlib:native/compile_session.sapp");
 let CACHE = import("stdlib:native/artifact_cache.sapp");
+let SECURITY = import("stdlib:security_analysis.sapp");
+let DEP_SECURITY = import("stdlib:security_dependency_analysis.sapp");
 
 fn _get(options, key, fallback) {
     if options == nil or type(options) != "map" or not map_has(options, key) { return fallback; }
@@ -125,6 +127,66 @@ fn _backend(value) {
     return "invalid";
 }
 
+fn _security_mode(options) {
+    if _get(options, "security_analysis", true) == false { return "off"; }
+    let mode = str_lower(str(_get(options, "security_mode", "protect")));
+    if mode == "off" or mode == "audit" or mode == "protect" or mode == "strict" { return mode; }
+    return "invalid";
+}
+
+fn _security_options(options, mode) {
+    let policy = _get(options, "security", map{});
+    if type(policy) != "map" { policy = map{}; }
+    return map{
+        custom_rules: _get(policy, "custom_rules", _get(options, "security_custom_rules", [])),
+        disabled_rule_ids: _get(policy, "disabled_rule_ids", _get(options, "security_disabled_rule_ids", [])),
+        allow_high_suppressions: _get(policy, "allow_high_suppressions",
+            _get(options, "security_allow_high_suppressions", false)) == true,
+        minimum_blocking_severity: if mode == "strict" { "info" } else { "high" }
+    };
+}
+
+fn _security_gate(source, path, options) {
+    let mode = _security_mode(options);
+    if mode == "off" {
+        return map{ ok: true, passed: true, enabled: false, mode: "off", finding_count: 0,
+            blocking: 0, format: SECURITY.FORMAT };
+    }
+    if mode == "invalid" {
+        return map{ ok: false, passed: false, enabled: true, mode: mode,
+            error: "security mode must be off, audit, protect, or strict" };
+    }
+    let scope = str_lower(str(_get(options, "security_scope", "dependencies")));
+    if scope != "entry" and scope != "dependencies" {
+        return map{ ok: false, passed: false, enabled: true, mode: mode,
+            error: "security_scope must be entry or dependencies" };
+    }
+    let report = nil;
+    if scope == "entry" {
+        report = SECURITY.analyze(source, path, _security_options(options, mode));
+        report.dependency_wide = false;
+        report.semantic_complete = false;
+        report.scope = "entry";
+    } else {
+        let dependency_options = map{};
+        if type(options) == "map" {
+            let keys = map_keys(options); let oi = 0;
+            while oi < len(keys) { dependency_options[keys[oi]] = options[keys[oi]]; oi = oi + 1; }
+        }
+        dependency_options.entry_source = source;
+        dependency_options.security_mode = mode;
+        dependency_options.retain_linked_source = true;
+        report = DEP_SECURITY.analyze_entry(path, dependency_options);
+        report.scope = "dependencies";
+    }
+    report.enabled = true;
+    report.mode = mode;
+    // Audit mode records every result but never blocks publication by itself.
+    report.enforced = mode != "audit";
+    if mode == "audit" and scope == "entry" { report.passed = report.ok; report.blocking = 0; }
+    return report;
+}
+
 fn smart_plan(source_path, output_path, options = nil) {
     let errors = [];
     if not _valid_path(source_path) { array_push(errors, "invalid source path"); }
@@ -134,6 +196,12 @@ fn smart_plan(source_path, output_path, options = nil) {
     let goal = _goal(_get(options, "goal", "balanced"));
     let requested = _backend(_get(options, "backend", "auto"));
     if requested == "invalid" { array_push(errors, "backend must be auto, direct-x64, c99, or pbck"); }
+    let security_mode = _security_mode(options);
+    if security_mode == "invalid" { array_push(errors, "security mode must be off, audit, protect, or strict"); }
+    let security_scope = str_lower(str(_get(options, "security_scope", "dependencies")));
+    if security_scope != "entry" and security_scope != "dependencies" {
+        array_push(errors, "security_scope must be entry or dependencies");
+    }
     let host_target = _host_target_name();
     let target = str(_get(options, "target", host_target));
     let fallback = _get(options, "fallback", true) == true;
@@ -177,6 +245,8 @@ fn smart_plan(source_path, output_path, options = nil) {
         fallback: fallback,
         runtime_fallback: runtime_fallback,
         cache: cache,
+        security_analysis: security_mode != "off",
+        security_mode: security_mode, security_scope: security_scope,
         errors: errors
     };
 }
@@ -192,7 +262,12 @@ fn _read_source(path) {
     return map{ ok: true, source: source, bytes: len(bytes) };
 }
 
-fn _linked_source(source_path, source) {
+fn _linked_source(source_path, source, security_report = nil) {
+    if security_report != nil and (try security_report.format catch "") == DEP_SECURITY.FORMAT
+        and type(try security_report.linked_source catch nil) == "string" {
+        return map{ ok: true, source: security_report.linked_source,
+            modules: try security_report.whole_program_modules catch 0 };
+    }
     if not str_contains(source, "import(") { return map{ ok: true, source: source, modules: 0 }; }
     let INLINER = import("stdlib:source_inliner.sapp");
     let linked = INLINER.inline_file_prefixed(source_path);
@@ -209,8 +284,9 @@ fn _artifact_meta(path) {
     };
 }
 
-fn _direct_build(source_path, output_path, source, plan, options, shared_session = nil) {
-    let linked = _linked_source(source_path, source);
+fn _direct_build(source_path, output_path, source, plan, options, shared_session = nil,
+    security_report = nil) {
+    let linked = _linked_source(source_path, source, security_report);
     if not linked.ok { return map{ ok: false, error: linked.error }; }
     let state = shared_session;
     if state == nil {
@@ -294,7 +370,8 @@ fn _run_plan(plan, source, options, shared_session = nil) {
         let backend = plan.strategies[i];
         let result = nil;
         if backend == "direct-x64" {
-            result = _direct_build(plan.source, plan.output, source.source, plan, options, shared_session);
+            result = _direct_build(plan.source, plan.output, source.source, plan, options,
+                shared_session, source.security_analysis);
         } elif backend == "c99" {
             result = _c99_build(plan.source, plan.output, plan, options);
         } else {
@@ -302,12 +379,28 @@ fn _run_plan(plan, source, options, shared_session = nil) {
         }
         array_push(attempts, _attempt(backend, result.ok, if result.ok { "built" } else { result.error }));
         if result.ok {
+            if (try source.security_analysis.format catch "") == DEP_SECURITY.FORMAT {
+                let snapshot = DEP_SECURITY.verify_snapshot(source.security_analysis);
+                result.security_snapshot = snapshot;
+                if not snapshot.ok {
+                    try fs_remove(result.output) catch nil;
+                    return map{ ok: false, format: REPORT_FORMAT, automated: true,
+                        output: result.output, goal: plan.goal, target: plan.target,
+                        backend: backend, attempts: attempts, plan: plan,
+                        security_analysis: source.security_analysis, security_snapshot: snapshot,
+                        error: "source dependency changed after security analysis; artifact removed" };
+                }
+                if map_has(source.security_analysis, "linked_source") {
+                    map_remove(source.security_analysis, "linked_source");
+                }
+            }
             result.format = REPORT_FORMAT;
             result.automated = true;
             result.backend = backend;
             result.goal = plan.goal;
             result.target = plan.target;
             result.source_bytes = source.bytes;
+            result.security_analysis = source.security_analysis;
             result.attempts = attempts;
             result.plan = plan;
             return result;
@@ -354,6 +447,12 @@ fn smart_build_in_session(build_session, source_path, output_path, options = nil
     if not plan.ok { return map{ ok: false, format: REPORT_FORMAT, plan: plan, error: str_join(plan.errors, "; ") }; }
     let source = _read_source(source_path);
     if not source.ok { return map{ ok: false, format: REPORT_FORMAT, plan: plan, error: source.error }; }
+    source.security_analysis = _security_gate(source.source, source_path, options);
+    if not source.security_analysis.ok or not source.security_analysis.passed {
+        return map{ ok: false, format: REPORT_FORMAT, plan: plan,
+            security_analysis: source.security_analysis,
+            error: try source.security_analysis.error catch "security analysis blocked artifact publication" };
+    }
     return _run_plan(plan, source, options, build_session.direct);
 }
 
@@ -384,8 +483,16 @@ fn smart_build_many_in_session(build_session, jobs, options = nil) {
         } else {
             let plan = smart_plan(job.source, job.output, options);
             let source = if plan.ok { _read_source(job.source) } else { map{ ok: false, error: str_join(plan.errors, "; ") } };
+            if source.ok {
+                source.security_analysis = _security_gate(source.source, job.source, options);
+                if not source.security_analysis.ok or not source.security_analysis.passed {
+                    source.ok = false;
+                    source.error = try source.security_analysis.error catch "security analysis blocked artifact publication";
+                }
+            }
             let result = if source.ok { _run_plan(plan, source, options, state) }
                 else { map{ ok: false, format: REPORT_FORMAT, plan: plan, error: source.error } };
+            if map_has(source, "security_analysis") { result.security_analysis = source.security_analysis; }
             result.index = i;
             array_push(results, result);
             if not result.ok { all_ok = false; }
@@ -421,7 +528,13 @@ fn smart_project(project_dir, output_path, options = nil) {
         }
     }
     if entry == nil or entry == "" { return map{ ok: false, error: "project has no build entry" }; }
-    let result = smart_build(path_join(project_dir, entry), output_path, options);
+    let project_options = map{};
+    if type(options) == "map" {
+        let keys = map_keys(options); let oi = 0;
+        while oi < len(keys) { project_options[keys[oi]] = options[keys[oi]]; oi = oi + 1; }
+    }
+    if not map_has(project_options, "project_root") { project_options.project_root = project_dir; }
+    let result = smart_build(path_join(project_dir, entry), output_path, project_options);
     result.project = project_dir;
     result.entry = entry;
     return result;
@@ -459,7 +572,7 @@ fn info() {
         os: host_platform(), arch: host_arch(), cc: if cc == nil { "none" } else { cc.name },
         target: target_triple(), host_target: _host_target_name(), native_supported: cc != nil,
         smart_build: true, direct_x64: host_platform() == "linux" and host_arch() == "x86_64",
-        plan_format: PLAN_FORMAT
+        security_analysis_default: true, security_mode_default: "protect", plan_format: PLAN_FORMAT
     };
 }
 
