@@ -18,6 +18,7 @@ let O_RDONLY = 0; let O_WRONLY = 1;
 let O_CREAT = 64; let O_EXCL = 128;
 let O_NONBLOCK = 2048;
 let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
+let MFD_CLOEXEC = 1;
 let MODE_FILE = 384; let MODE_DIR = 448;
 let MAX_PATH = 4096; let MAX_COMPONENT = 255;
 
@@ -104,6 +105,70 @@ fn _renameat(fs, from_fd, from_name, to_fd, to_name) {
     _free(fs, to_pointer); _free(fs, from_pointer); return result;
 }
 
+fn _mode_verified(fs, fd, expected) {
+    let pid = _i32(_call(fs, "getpid", "->i32", []));
+    if pid <= 0 { return false; }
+    let stat = try os_which("stat") catch nil;
+    if stat == nil { return false; }
+    let path = "/proc/" + str(pid) + "/fd/" + str(fd);
+    let checked = try proc_spawn_wait(stat, ["-L", "-c", "%a", path]) catch nil;
+    return checked != nil and checked.exit_code == 0 and str_trim(checked.stdout) == expected;
+}
+
+fn _decimal(value) {
+    if type(value) != "string" or len(value) == 0 { return nil; }
+    let negative = false; let i = 0;
+    if strcharcodeat(value, 0) == 45 { negative = true; i = 1; }
+    if i >= len(value) { return nil; }
+    let out = 0;
+    while i < len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 48 or code > 57 { return nil; }
+        out = out * 10 + code - 48; i = i + 1;
+    }
+    return if negative { 0 - out } else { out };
+}
+
+fn _hex(value) {
+    if type(value) != "string" or len(value) == 0 { return nil; }
+    let out = 0;
+    for i len(value) {
+        let code = strcharcodeat(value, i); let digit = -1;
+        if code >= 48 and code <= 57 { digit = code - 48; }
+        elif code >= 65 and code <= 70 { digit = code - 55; }
+        elif code >= 97 and code <= 102 { digit = code - 87; }
+        if digit < 0 { return nil; }
+        out = out * 16 + digit;
+    }
+    return out;
+}
+
+fn _descriptor_metadata(fs, fd, path) {
+    let pid = _i32(_call(fs, "getpid", "->i32", []));
+    if pid <= 0 { return _error("process identity is unavailable"); }
+    let stat = try os_which("stat") catch nil;
+    if stat == nil { return _error("descriptor metadata requires the stat utility"); }
+    let held = "/proc/" + str(pid) + "/fd/" + str(fd);
+    let checked = try proc_spawn_wait(stat, ["-L", "-c", "%f|%s|%Y", held]) catch nil;
+    if checked == nil or checked.exit_code != 0 { return _error("held descriptor metadata is unavailable"); }
+    let fields = str_split(str_trim(checked.stdout), "|");
+    if len(fields) != 3 { return _error("held descriptor metadata is malformed"); }
+    let mode = _hex(fields[0]); let size = _decimal(fields[1]); let modified = _decimal(fields[2]);
+    if mode == nil or size == nil or size < 0 or modified == nil {
+        return _error("held descriptor metadata contains invalid numeric fields");
+    }
+    if modified < 0 { modified = 0; }
+    let file_type = bit_and(mode, 61440);
+    let kind = "other";
+    if file_type == 32768 { kind = "file"; }
+    elif file_type == 16384 { kind = "directory"; }
+    return map{
+        ok: true, path: path, kind: kind, size: size,
+        mtime_unix: modified, mtime_ms: modified * 1000,
+        mode: mode, race_resistant: true, descriptor_bound: true
+    };
+}
+
 fn open(root, create = true, protect_root = false) {
     let host = available(); if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
     let parts = _root_components(root); if parts == nil { return _error("root must be a safe relative path"); }
@@ -131,7 +196,10 @@ fn open(root, create = true, protect_root = false) {
     }
     if protect_root and len(parts) > 0 {
         let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
-        if protected != 0 { _close_fd(holder, current); ffi_close(libc); return _error("relative root permissions cannot be protected"); }
+        if protected != 0 or not _mode_verified(holder, current, "700") {
+            _close_fd(holder, current); ffi_close(libc);
+            return _error("relative root permissions cannot be protected and verified");
+        }
     }
     return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
                 libc: libc, libc_path: host.libc, closed: false };
@@ -161,7 +229,10 @@ fn open_absolute(root, create = true, protect_root = true) {
     }
     if protect_root {
         let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
-        if protected != 0 { _close_fd(holder, current); ffi_close(libc); return _error("application root permissions cannot be protected"); }
+        if protected != 0 or not _mode_verified(holder, current, "700") {
+            _close_fd(holder, current); ffi_close(libc);
+            return _error("application root permissions cannot be protected and verified");
+        }
     }
     return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
                 libc: libc, libc_path: host.libc, closed: false, absolute: true };
@@ -170,6 +241,18 @@ fn open_absolute(root, create = true, protect_root = true) {
 fn close(fs) {
     if fs == nil or not is_map(fs) or (try fs.closed catch true) { return false; }
     _close_fd(fs, fs.root_fd); ffi_close(fs.libc); fs.closed = true; fs.root_fd = -1; return true;
+}
+
+// Expose only the kernel path of the already-held root. This is suitable for
+// argv-only subprocess cwd arguments while the caller keeps the handle open;
+// it never re-resolves the original caller-controlled namespace path.
+fn descriptor_path(fs) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) or (try fs.root_fd catch -1) < 0 {
+        return _error("directory root is closed");
+    }
+    let pid = _i32(_call(fs, "getpid", "->i32", []));
+    if pid <= 0 { return _error("process identity is unavailable"); }
+    return map{ ok: true, path: "/proc/" + str(pid) + "/fd/" + str(fs.root_fd), descriptor_bound: true };
 }
 
 fn _walk_dir(fs, parts, create) {
@@ -215,13 +298,125 @@ fn list(fs, path = "root", max_entries = 512) {
 }
 
 fn read_bytes(fs, path, max_bytes = 4194304) {
+    if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes)
+        or max_bytes > 67108864 {
+        return _error("invalid bounded read limit");
+    }
     let parent = _parent(fs, path, false); if not parent.ok { return parent; }
     let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
     _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be opened without following links"); }
-    let bytes = try fs_read_bytes(_fd_path(fd)) catch nil; _close_fd(fs, fd);
+
+    // fs_read_bytes has no length parameter. Reading the held source directly
+    // would allocate the whole file before the post-read quota check. Copy at
+    // most max_bytes+1 into an anonymous kernel file first; the VM can then
+    // load only that bounded snapshot. This also remains bounded if another
+    // process grows the source inode concurrently.
+    let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-bounded-read", MFD_CLOEXEC]));
+    if snapshot < 0 { _close_fd(fs, fd); return _error("bounded snapshot is unavailable"); }
+    let ceiling = max_bytes + 1; let copied = 0; let failed = false;
+    while copied < ceiling and not failed {
+        let count = _call(fs, "sendfile", "i32,i32,ptr,i64->i64",
+            [snapshot, fd, 0, ceiling - copied]);
+        if count < 0 { failed = true; }
+        else if count == 0 { copied = ceiling; }
+        else { copied = copied + count; }
+    }
+    _close_fd(fs, fd);
+    if failed { _close_fd(fs, snapshot); return _error("bounded file snapshot failed"); }
+    let snapshot_size = _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 2]);
+    if snapshot_size < 0 { _close_fd(fs, snapshot); return _error("bounded snapshot size is unavailable"); }
+    if snapshot_size > max_bytes {
+        _close_fd(fs, snapshot); return _error("file exceeds byte limit");
+    }
+    _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]);
+    let bytes = try fs_read_bytes(_fd_path(snapshot)) catch nil;
+    _close_fd(fs, snapshot);
     if not is_array(bytes) { return _error("path is not a readable regular file"); }
-    if len(bytes) > max_bytes { return _error("file exceeds byte limit"); }
+    if len(bytes) != snapshot_size { return _error("bounded snapshot size changed"); }
     return map{ ok: true, path: path, bytes: bytes, size: len(bytes) };
+}
+
+// Snapshot at most max_bytes from a held regular-file descriptor. Unlike
+// read_bytes, this operation intentionally succeeds for larger files and
+// reports truncation. Size discovery and copying use the same descriptor, so
+// replacing the path cannot make the size refer to a different inode.
+fn read_prefix_bytes(fs, path, max_bytes = 1048576) {
+    if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes)
+        or max_bytes > 67108864 {
+        return _error("invalid bounded prefix limit");
+    }
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be opened without following links"); }
+    let source_size = _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]);
+    if source_size < 0 { _close_fd(fs, fd); return _error("path is not a seekable regular file"); }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 0]) < 0 {
+        _close_fd(fs, fd); return _error("regular file cannot be rewound");
+    }
+
+    let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-prefix-read", MFD_CLOEXEC]));
+    if snapshot < 0 { _close_fd(fs, fd); return _error("bounded prefix snapshot is unavailable"); }
+    let ceiling = source_size;
+    if ceiling > max_bytes { ceiling = max_bytes; }
+    let copied = 0; let failed = false;
+    while copied < ceiling and not failed {
+        let count = _call(fs, "sendfile", "i32,i32,ptr,i64->i64",
+            [snapshot, fd, 0, ceiling - copied]);
+        if count < 0 { failed = true; }
+        else if count == 0 { copied = ceiling; }
+        else { copied = copied + count; }
+    }
+    _close_fd(fs, fd);
+    if failed { _close_fd(fs, snapshot); return _error("bounded prefix snapshot failed"); }
+    let snapshot_size = _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 2]);
+    if snapshot_size < 0 or snapshot_size > max_bytes {
+        _close_fd(fs, snapshot); return _error("bounded prefix snapshot size is invalid");
+    }
+    _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]);
+    let bytes = try fs_read_bytes(_fd_path(snapshot)) catch nil;
+    _close_fd(fs, snapshot);
+    if not is_array(bytes) or len(bytes) != snapshot_size {
+        return _error("bounded prefix snapshot cannot be loaded consistently");
+    }
+    return map{
+        ok: true, path: path, bytes: bytes, size: len(bytes),
+        source_size: source_size, truncated: source_size > len(bytes),
+        race_resistant: true
+    };
+}
+
+// Return the size of a held regular file without loading its contents. The
+// final component is opened with O_NOFOLLOW relative to its held parent, and
+// lseek operates on that descriptor, so path replacement cannot redirect the
+// probe after validation. Directories and non-seekable special files fail.
+fn file_size(fs, path) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be opened without following links"); }
+    let size = _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]);
+    _close_fd(fs, fd);
+    if size < 0 { return _error("path is not a seekable regular file"); }
+    return map{ ok: true, path: path, size: size, race_resistant: true };
+}
+
+// Resolve a path component-by-component and obtain type, size and mtime from
+// that same held object. The fixed-argv stat probe sees the parent's descriptor
+// through /proc/<pid>/fd; no caller-controlled pathname reaches the subprocess.
+fn metadata(fs, path) {
+    let parts = _components(path, true); if parts == nil { return _error("invalid metadata path"); }
+    let dir = _walk_dir(fs, parts, false);
+    if dir.ok {
+        let result = _descriptor_metadata(fs, dir.fd, path);
+        _close_fd(fs, dir.fd); return result;
+    }
+    if len(parts) == 0 { return _error("root metadata cannot be resolved"); }
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    _close_fd(fs, parent.fd); if fd < 0 { return _error("metadata target cannot be opened without following links"); }
+    let result = _descriptor_metadata(fs, fd, path);
+    _close_fd(fs, fd); return result;
 }
 
 fn protect_file(fs, path) {
@@ -229,8 +424,11 @@ fn protect_file(fs, path) {
     let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
     _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be protected without following links"); }
     let protected = _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE]));
+    let verified = protected == 0 and _mode_verified(fs, fd, "600");
     _close_fd(fs, fd);
-    if protected != 0 { return _error("file permissions cannot be protected"); }
+    if not verified {
+        return _error("file permissions cannot be protected and verified");
+    }
     return map{ ok: true, path: path, mode: MODE_FILE };
 }
 
@@ -275,8 +473,13 @@ fn move(fs, from, to, create_parents = true) {
 fn status(fs) {
     return map{ format: "pblang.linux-dirfs.status.v1", available: fs != nil and not (try fs.closed catch true),
                 component_openat: true, nofollow: true, cloexec: true, stable_proc_fd_io: true,
-                atomic_renameat: true, relative_root_component_walk: true,
-                mkdir_race_reopen: true, libc: try fs.libc_path catch nil };
+                atomic_renameat: true, bounded_memfd_snapshot_reads: true,
+                bounded_prefix_snapshot_reads: true,
+                descriptor_metadata: true,
+                relative_root_component_walk: true,
+                mkdir_race_reopen: true, permission_postcondition_verified: true,
+                libc: try fs.libc_path catch nil };
 }
 
-export available, open, open_absolute, close, mkdir, list, read_bytes, protect_file, write_atomic, remove, move, status;
+export available, open, open_absolute, close, descriptor_path, mkdir, list, read_bytes, read_prefix_bytes, file_size, metadata,
+       protect_file, write_atomic, remove, move, status;

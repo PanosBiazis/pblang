@@ -66,9 +66,15 @@ rules with an existing ID replace that rule; new IDs add rules. IDs listed in
     }
   ],
   "disabled_rule_ids": ["network.plaintext-http"],
+  "taint_sanitizers": ["checked_project_path"],
   "allow_high_suppressions": false
 }
 ```
+
+`taint_sources`, `taint_sanitizers`, and `taint_sinks` in the same policy are
+forwarded to dependency-wide semantic analysis. A configured local sanitizer
+terminates taint only on its return value; its body is still analyzed with
+tainted arguments, so it cannot hide a security-sensitive side effect.
 
 One rule can also be disabled for one invocation with
 `--disable-security-rule=RULE_ID`. Configuration is limited to 256 KiB, 128
