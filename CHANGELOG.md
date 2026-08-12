@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased
+
+- Added pure-PBLang binary SHA-1, MD5, and full tree-mode BLAKE3 in
+  `stdlib/digest.sapp`, with shared SHA-256 dispatch. Official BLAKE3 vectors
+  cover empty, single-block, chunk-boundary, asymmetric three-chunk and
+  multi-level trees; SHA-1/MD5 include multi-block vectors and all three new
+  algorithms pass a generated C99 differential gate.
+- Added pure-PBLang `stdlib/aes_gcm.sapp` with SHA-256 HMAC,
+  PBKDF2-HMAC-SHA256 and AES-256-GCM, locked by official and independently
+  generated known-answer vectors plus a native C99 differential test.
+- Hardened `linux_dirfs` permission protection so `fchmod` success is not
+  accepted unless the held descriptor's actual mode is verified through
+  `/proc`. Filesystems that ignore Unix mode changes now fail closed instead
+  of being described as private.
+- Added descriptor-bound Linux metadata for regular files and directories.
+  Type, size, and second-resolution mtime come from the same held
+  `openat`/`O_NOFOLLOW` object, including after visible namespace replacement;
+  caller-controlled paths never reach the fixed-argv `stat` probe.
+- Added `linux_dirfs.descriptor_path` for passing a still-held directory object
+  to bounded fixed-argv tools through `/proc/<pid>/fd/<fd>`. Closed handles fail
+  explicitly, and namespace replacement cannot retarget the descriptor.
+- Forwarded nested dependency-analysis taint source, sanitizer, sink and limit
+  policy into the whole-program analyzer. Explicit C99 builds also avoid
+  unnecessary direct-x64 session initialization, and `pbbuild` can retain
+  intermediates only when explicitly requested.
+- Added `linux_dirfs.read_prefix_bytes`, a bounded Linux regular-file prefix
+  snapshot that discovers size and copies bytes through the same held
+  `openat`/`O_NOFOLLOW` descriptor. It reports exact source size, copied size,
+  truncation, and race-resistant namespace handling without allocating the
+  complete source merely to enforce a post-read limit.
+- Hardened Linux directory-handle reads with a `max_bytes + 1` anonymous
+  `memfd` snapshot. Oversized or concurrently growing files are rejected before
+  the VM performs any unbounded whole-source allocation.
+- The hardened read result now carries the byte size from the same held
+  descriptor snapshot, allowing callers to avoid a second pathname lookup.
+
+## 2026-08-11 - MCP HTTP response status parity
+
+- `stdlib/http_server.sapp` now emits the correct reason phrases for HTTP 202,
+  406, and 415 responses. This supports PBLang-native MCP Streamable HTTP
+  notification, content-negotiation, and media-type contracts.
+
+## 2026-08-12 - bounded legacy Android accessibility recovery
+
+- Made the shared PBLang Android verifier tolerate the observed Android 9 OEM
+  `UiTestAutomationBridge` null-root condition without weakening its UI
+  contract. API 21-28 now use at most six uncompressed hierarchy attempts;
+  newer devices retain three compressed attempts.
+- Added bounded hierarchy-file polling, wake/keyguard recovery, cleanup on every
+  path and semantic coverage for both legacy and modern retry plans.
+
+## 2026-08-12 - C99-safe standard-library source
+
+- Renamed JSON fallback parameters that used the valid PBLang identifier
+  `default`, preventing the legacy bootstrap C99 emitter from producing the
+  reserved C token while preserving the public positional API and behavior.
+- Constructed keymap backslash entries from Unicode scalar 92 instead of a
+  trailing-backslash literal. All direct, `Backslash` and `IntlBackslash`
+  mappings retain their previous unshifted/shifted results.
+- Added semantic regressions for JSON fallbacks and all backslash key aliases.
+  The self-hosted C99 backend already mangles every C keyword through `_cid`;
+  the remaining full-product portability gap is hosted-runtime builtin
+  coverage, not these source-level syntax cases.
+
 All notable changes to **pblang** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)

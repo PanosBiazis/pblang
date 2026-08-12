@@ -7,16 +7,64 @@ let root = ".pblang-dirfs-test"; let moved = ".pblang-dirfs-test-held"; let outs
 try proc_spawn_wait("/bin/rm", ["-rf", "--", root, moved, outside]) catch nil;
 fs_mkdirs(outside); fs_write_bytes(outside + "/sentinel", [9, 8, 7]);
 
+let private_relative = ".pblang-dirfs-private-relative";
+try proc_spawn_wait("/bin/rm", ["-rf", "--", private_relative]) catch nil;
+fs_mkdirs(private_relative);
+let private_handle = D.open(private_relative, false, true);
+let private_mode = try proc_spawn_wait("/usr/bin/stat", ["-c", "%a", private_relative]) catch nil;
+if private_handle.ok {
+    require(D.close(private_handle), "protected relative root closes");
+    require(private_mode != nil and private_mode.exit_code == 0 and str_trim(private_mode.stdout) == "700",
+        "successful relative protection has a verified mode-0700 postcondition");
+} else {
+    require(str_contains(try private_handle.error catch "", "cannot be protected and verified"),
+        "filesystems that ignore mode bits fail closed instead of claiming protection");
+}
+try proc_spawn_wait("/bin/rm", ["-rf", "--", private_relative]) catch nil;
+
 let fs = D.open(root, true);
 require(fs.ok, "root opens through trusted libc: " + str(fs));
+let held_root_path = D.descriptor_path(fs);
+require(held_root_path.ok and held_root_path.descriptor_bound and fs_exists(held_root_path.path),
+    "held root exposes a live kernel descriptor path for argv-only subprocesses");
 require(D.status(fs).component_openat and D.status(fs).nofollow, "security properties are observable");
 require(D.status(fs).relative_root_component_walk and D.status(fs).mkdir_race_reopen,
     "relative roots are resolved component-by-component");
+require(D.status(fs).permission_postcondition_verified,
+    "permission-changing operations expose verified postconditions");
 require(D.mkdir(fs, "docs/nested").ok, "recursive mkdirat");
 require(D.write_atomic(fs, "docs/nested/a.bin", [1, 2, 3, 4]).ok, "atomic write");
+let file_meta = D.metadata(fs, "docs/nested/a.bin");
+let dir_meta = D.metadata(fs, "docs/nested");
+require(file_meta.ok and file_meta.kind == "file" and file_meta.size == 4 and
+        file_meta.mtime_unix > 0 and file_meta.mtime_ms == file_meta.mtime_unix * 1000 and
+        file_meta.race_resistant and file_meta.descriptor_bound,
+    "regular-file metadata comes from one held descriptor");
+require(dir_meta.ok and dir_meta.kind == "directory" and dir_meta.size >= 0 and
+        dir_meta.mtime_unix > 0 and dir_meta.race_resistant,
+    "directory metadata comes from one held descriptor");
+require(D.status(fs).descriptor_metadata, "descriptor metadata support is observable");
 let read = D.read_bytes(fs, "docs/nested/a.bin", 4);
 require(read.ok and read.bytes == [1, 2, 3, 4], "stable descriptor read");
 require(not D.read_bytes(fs, "docs/nested/a.bin", 3).ok, "read quota enforced");
+let oversized = [];
+for oi 65536 { oversized[len(oversized)] = oi % 251; }
+require(D.write_atomic(fs, "docs/nested/oversized.bin", oversized).ok,
+    "large bounded-read fixture published");
+oversized = nil;
+require(not D.read_bytes(fs, "docs/nested/oversized.bin", 1024).ok,
+    "large source is rejected through a bounded snapshot");
+let prefix = D.read_prefix_bytes(fs, "docs/nested/oversized.bin", 1024);
+require(prefix.ok and prefix.size == 1024 and prefix.source_size == 65536 and
+        prefix.truncated and prefix.bytes[0] == 0 and prefix.bytes[1023] == 19 and
+        prefix.race_resistant,
+    "large source exposes only an exact descriptor-bound prefix");
+require(D.status(fs).bounded_memfd_snapshot_reads,
+    "bounded snapshot protection is observable");
+require(D.status(fs).bounded_prefix_snapshot_reads,
+    "bounded prefix snapshot protection is observable");
+require(D.remove(fs, "docs/nested/oversized.bin").ok,
+    "bounded-read fixture removed");
 require(D.list(fs, "docs/nested", 8).entries == ["a.bin"], "directory listing");
 require(D.move(fs, "docs/nested/a.bin", "docs/moved.bin").ok, "renameat move");
 require(D.remove(fs, "docs/moved.bin").ok, "unlinkat file");
@@ -47,8 +95,12 @@ if symlinks {
 require(D.write_atomic(fs, "held.bin", [5, 6]).ok, "write survives root namespace replacement");
 require((try fs_exists(moved + "/held.bin") catch false), "write lands in held root");
 require(not (try fs_exists(outside + "/held.bin") catch false), "replacement target remains untouched");
+let held_meta = D.metadata(fs, "held.bin");
+require(held_meta.ok and held_meta.kind == "file" and held_meta.size == 2,
+    "metadata remains bound to the held root after namespace replacement");
 
 require(D.close(fs), "directory root closes once");
+require(not D.descriptor_path(fs).ok, "closed roots cannot expose stale descriptor paths");
 require(not D.close(fs), "second close is safe");
 try proc_spawn_wait("/bin/rm", ["-rf", "--", root, moved, outside]) catch nil;
 
