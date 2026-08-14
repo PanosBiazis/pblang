@@ -1,0 +1,156 @@
+let P = import("stdlib:linux_process.sapp");
+
+fn require(condition, message) {
+    if not condition { throw "FAIL linux_process: " + message; }
+}
+
+let caps = P.status();
+require(caps.available and caps.argv_exec and caps.shell_free and caps.bounded_output
+    and caps.process_group_cancel and caps.termination_verified
+    and caps.address_space_limit and caps.descendant_memory_limit
+    and caps.fixed_executable_descriptor_handoff
+    and caps.output_limit_separate_from_child_files
+    and caps.child_file_write_ceiling_bytes == 67108864
+    and caps.configurable_child_file_ceiling,
+    "Linux process capabilities");
+
+let literal = "literal;touch /tmp/pblang-process-injection-marker";
+try fs_remove("/tmp/pblang-process-injection-marker") catch nil;
+let echo = P.run("/usr/bin/printf", ["%s", literal], map{
+    timeout_secs: 3, max_output_bytes: 4096
+});
+require(echo.ok and echo.command_ok and echo.exit_code == 0, "direct argv command");
+require(echo.stdout == literal and echo.stderr == "", "literal argv and split output");
+require(not fs_exists("/tmp/pblang-process-injection-marker") and echo.shell_used == false
+    and echo.argv_encoded and echo.process_group_terminated,
+    "shell metacharacters never execute");
+let empty_argument = P.run("/usr/bin/printf", ["<%s>", ""], map{
+    timeout_secs: 3, max_output_bytes: 4096
+});
+require(empty_argument.ok and empty_argument.command_ok and empty_argument.stdout == "<>",
+    "execve preserves an explicit empty argv entry");
+
+let fixed = P.run_fixed(["/definitely-missing-pblang-program", "/usr/bin/printf"],
+    ["%s", "held-executable"], map{ timeout_secs: 3, max_output_bytes: 4096 });
+require(fixed.ok and fixed.command_ok and fixed.stdout == "held-executable"
+    and fixed.fixed_candidate == "/usr/bin/printf"
+    and fixed.executable_descriptor_held and fixed.executable_nofollow
+    and not fixed.check_then_exec_race,
+    "fixed candidate fallback executes the descriptor-held object");
+let fixed_missing = P.run_fixed(["/definitely-missing-pblang-program"], [], map{});
+require(not fixed_missing.ok and fixed_missing.candidates_checked == 1
+    and not fixed_missing.check_then_exec_race,
+    "missing fixed candidates fail closed without check-then-exec");
+require((try { P.run_fixed(["relative"], [], map{}); false } catch true),
+    "relative fixed candidates are rejected");
+
+let split = P.run("/usr/bin/ls", ["/definitely-missing-pblang-process-test"], map{
+    timeout_secs: 3, max_output_bytes: 32
+});
+require(split.ok and not split.command_ok and split.stdout == ""
+    and split.stderr != "" and split.returned_output_bytes <= 32,
+    "aggregate output ceiling");
+
+let noisy = P.run("/usr/bin/seq", ["1", "100000"], map{
+    timeout_secs: 3, max_output_bytes: 128
+});
+require(noisy.ok and noisy.returned_output_bytes <= 128 and noisy.output_truncated,
+    "large output is bounded before VM loading");
+
+let artifact_path = "/tmp/pblang-linux-process-artifact-" +
+    str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
+let artifact = P.run("/usr/bin/truncate", ["-s", "1048576", artifact_path], map{
+    timeout_secs: 3, max_output_bytes: 32, max_memory_bytes: 67108864
+});
+require(artifact.ok and artifact.command_ok and fs_exists(artifact_path),
+    "small retained output must not prevent a larger bounded child artifact");
+let artifact_size = try proc_spawn_wait("/usr/bin/stat", ["-c", "%s", artifact_path]).stdout catch "";
+require(artifact_size == "1048576\n", "child artifact preserves its requested size");
+try fs_remove(artifact_path) catch nil;
+
+let limited_artifact_path = "/tmp/pblang-linux-process-limited-artifact-" +
+    str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
+let limited_artifact = P.run("/usr/bin/truncate", ["-s", "8192", limited_artifact_path], map{
+    timeout_secs: 3, max_output_bytes: 32, max_file_bytes: 4096,
+    max_memory_bytes: 67108864
+});
+let limited_size = try {
+    parse_number(str_trim(proc_spawn_wait("/usr/bin/stat", ["-c", "%s", limited_artifact_path]).stdout))
+} catch -1;
+require(limited_artifact.ok and not limited_artifact.command_ok
+    and limited_artifact.max_file_bytes == 4096 and limited_size <= 4096,
+    "caller-selected RLIMIT_FSIZE prevents oversized child artifacts");
+try fs_remove(limited_artifact_path) catch nil;
+
+let D = import("stdlib:linux_dirfs.sapp");
+let cwd_root = "/tmp/pblang-process-cwd-" + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
+let cwd_handle = D.open_absolute(cwd_root, true, true);
+require(cwd_handle.ok, "descriptor cwd fixture opens");
+let cwd_handoff = D.child_descriptor(cwd_handle);
+require(cwd_handoff.ok, "descriptor cwd handoff");
+let pwd = P.run("/usr/bin/pwd", [], map{
+    timeout_secs: 3, max_output_bytes: 4096, cwd_fd: cwd_handoff.fd
+});
+require(D.close_child_descriptor(cwd_handle, cwd_handoff), "cwd handoff closes");
+require(pwd.ok and pwd.command_ok and str_trim(pwd.stdout) == cwd_root,
+    "child changes to held cwd object");
+D.close(cwd_handle); try fs_remove(cwd_root) catch nil;
+
+let binary = [0, 1, 2, 10, 255];
+let stdin = P.run("/usr/bin/wc", ["-c"], map{
+    timeout_secs: 3, max_output_bytes: 4096, stdin_bytes: binary
+});
+require(stdin.ok and stdin.command_ok and parse_number(str_trim(stdin.stdout)) == len(binary),
+    "binary stdin is bounded and delivered exactly");
+
+let explicit_environment = P.run("/usr/bin/env", [], map{
+    timeout_secs: 3, max_output_bytes: 4096,
+    environment: map{ DISPLAY: ":77", PB_SCREEN_TEST: "bounded" }
+});
+require(explicit_environment.ok and explicit_environment.command_ok
+    and str_contains(explicit_environment.stdout, "DISPLAY=:77")
+    and str_contains(explicit_environment.stdout, "PB_SCREEN_TEST=bounded")
+    and not str_contains(explicit_environment.stdout, "PATH=")
+    and not str_contains(explicit_environment.stdout, "HOME="),
+    "explicit child environment does not inherit ambient values");
+let invalid_environment = P.run("/usr/bin/env", [], map{
+    environment: map{ "BAD-NAME": "x" }
+});
+require(not invalid_environment.ok,
+    "invalid explicit environment fails closed before child execution");
+
+let runtime = cwd() + "/target/release/pblang";
+require(fs_exists(runtime), "current PBLang executable path is available");
+let memory = P.run(runtime, ["run", "tests/fixtures/linux_process_memory_pressure.sapp", "--allow-all"], map{
+    timeout_secs: 10, max_output_bytes: 4096, max_memory_bytes: 100663296
+});
+require(memory.ok and not memory.command_ok and memory.memory_limit_enforced
+    and memory.max_memory_bytes == 100663296 and memory.process_group_terminated,
+    "descendant allocation is stopped by the inherited address-space ceiling");
+let after_memory = P.run("/usr/bin/printf", ["%s", "parent-alive"], map{
+    timeout_secs: 3, max_output_bytes: 4096, max_memory_bytes: 100663296
+});
+require(after_memory.ok and after_memory.command_ok and after_memory.stdout == "parent-alive",
+    "memory-pressure child cannot damage the parent runner");
+
+// The target timeout creates a descendant sleep process. Cancelling the outer
+// supervisor must remove the complete process group, not only its direct child.
+let active = P.start("/usr/bin/timeout", ["30s", "/usr/bin/sleep", "30"], map{
+    timeout_secs: 30, max_output_bytes: 1024
+});
+require(active.ok and P.poll(active).active, "asynchronous process starts");
+let cancelled = P.cancel(active, 100);
+require(cancelled.ok and cancelled.terminated, "descendant process group terminates");
+let finished = P.finish(active, 1500);
+require(finished.ok and finished.process_group_terminated and finished.signaled
+    and finished.cancelled and finished.status_unavailable_after_cancel,
+    "cancelled lifecycle finishes with verified termination");
+
+require((try { P.run("relative", [], map{}); false } catch true) == false,
+    "invalid process request returns a structured error");
+let invalid = P.run("relative", [], map{});
+require(not invalid.ok, "relative executable fails closed");
+let nul = P.run("/usr/bin/printf", ["bad" + strfromcharcode(0) + "arg"], map{});
+require(not nul.ok, "NUL argument fails closed");
+
+print "linux_process_pass";

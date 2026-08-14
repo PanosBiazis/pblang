@@ -1,0 +1,465 @@
+// Portable POSIX directory-handle confinement implemented in PBLang.
+//
+// Linux keeps the richer linux_dirfs backend. This smaller core exists for
+// platforms such as macOS that expose openat/unlinkat and a descriptor view at
+// /dev/fd. Every caller path is walked one component at a time with
+// O_DIRECTORY and O_NOFOLLOW. Bounded reads copy from the held source FD into
+// an anonymous tmpfile before the VM loads bytes through the descriptor view.
+
+let MAX_PATH = 4096; let MAX_COMPONENT = 255; let MAX_BYTES = 67108864;
+let MODE_FILE = 384; let MODE_DIR = 448;
+let O_RDWR = 2; let LOCK_EX = 2; let LOCK_NB = 4; let LOCK_UN = 8;
+
+fn _error(message) { return map{ ok: false, error: message }; }
+
+fn profile(name = nil) {
+    if name == nil { name = platform(); }
+    name = str_lower(str(name));
+    if name == "linux" {
+        return map{ ok: true, platform: name, format: "pblang.posix-dirfs.profile.v1",
+            libraries: ["/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+                "/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6",
+                "/usr/lib/i386-linux-gnu/libc.so.6", "/lib/i386-linux-gnu/libc.so.6",
+                "/usr/lib/libc.so.6", "/lib/libc.so.6"],
+            fd_root: "/proc/self/fd", at_fdcwd: -100, at_removedir: 512,
+            o_rdonly: 0, o_wronly: 1, o_creat: 64, o_excl: 128,
+            o_nonblock: 2048, o_directory: 65536, o_nofollow: 131072,
+            o_cloexec: 524288 };
+    }
+    if name == "macos" {
+        return map{ ok: true, platform: name, format: "pblang.posix-dirfs.profile.v1",
+            libraries: ["/usr/lib/libSystem.B.dylib", "/usr/lib/libc.dylib"],
+            fd_root: "/dev/fd", at_fdcwd: -2, at_removedir: 128,
+            o_rdonly: 0, o_wronly: 1, o_creat: 512, o_excl: 2048,
+            o_nonblock: 4, o_directory: 1048576, o_nofollow: 256,
+            o_cloexec: 16777216 };
+    }
+    return map{ ok: false, platform: name,
+        error: "portable POSIX directory handles support Linux and macOS only" };
+}
+
+fn _first_existing(paths) {
+    for i len(paths) { if try fs_exists(paths[i]) catch false { return paths[i]; } }
+    return nil;
+}
+
+fn available() {
+    let p = profile();
+    if not p.ok { return map{ ok: false, format: "pblang.posix-dirfs.available.v1",
+        platform: p.platform, error: p.error }; }
+    let library = _first_existing(p.libraries);
+    let fd_view = try fs_exists(p.fd_root) catch false;
+    return map{ ok: library != nil and fd_view,
+        format: "pblang.posix-dirfs.available.v1", platform: p.platform,
+        library: library, descriptor_view: p.fd_root, descriptor_view_available: fd_view,
+        component_openat: true, nofollow: true, pathname_fallback: false };
+}
+
+fn _i32(value) {
+    if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; }
+    return value;
+}
+
+fn _call(fs, symbol, signature, args) {
+    if symbol == "close" and signature == "i32->i32" {
+        return try ffi_call_typed(fs.libc, "close", "i32->i32", args) catch -1;
+    }
+    if symbol == "strdup" and signature == "string->ptr" {
+        return try ffi_call_typed(fs.libc, "strdup", "string->ptr", args) catch 0;
+    }
+    if symbol == "free" and signature == "ptr->void" {
+        return try ffi_call_typed(fs.libc, "free", "ptr->void", args) catch nil;
+    }
+    if symbol == "calloc" and signature == "i64,i64->ptr" {
+        return try ffi_call_typed(fs.libc, "calloc", "i64,i64->ptr", args) catch 0;
+    }
+    if symbol == "read" and signature == "i32,ptr,i64->i64" {
+        return try ffi_call_typed(fs.libc, "read", "i32,ptr,i64->i64", args) catch -1;
+    }
+    if symbol == "write" and signature == "i32,ptr,i64->i64" {
+        return try ffi_call_typed(fs.libc, "write", "i32,ptr,i64->i64", args) catch -1;
+    }
+    if symbol == "openat" and signature == "i32,ptr,i32,i32->i32" {
+        return try ffi_call_typed(fs.libc, "openat", "i32,ptr,i32,i32->i32", args) catch -1;
+    }
+    if symbol == "mkdirat" and signature == "i32,ptr,i32->i32" {
+        return try ffi_call_typed(fs.libc, "mkdirat", "i32,ptr,i32->i32", args) catch -1;
+    }
+    if symbol == "unlinkat" and signature == "i32,ptr,i32->i32" {
+        return try ffi_call_typed(fs.libc, "unlinkat", "i32,ptr,i32->i32", args) catch -1;
+    }
+    if symbol == "renameat" and signature == "i32,ptr,i32,ptr->i32" {
+        return try ffi_call_typed(fs.libc, "renameat", "i32,ptr,i32,ptr->i32", args) catch -1;
+    }
+    if symbol == "dup" and signature == "i32->i32" {
+        return try ffi_call_typed(fs.libc, "dup", "i32->i32", args) catch -1;
+    }
+    if symbol == "lseek" and signature == "i32,i64,i32->i64" {
+        return try ffi_call_typed(fs.libc, "lseek", "i32,i64,i32->i64", args) catch -1;
+    }
+    if symbol == "tmpfile" and signature == "->ptr" {
+        return try ffi_call_typed(fs.libc, "tmpfile", "->ptr", args) catch 0;
+    }
+    if symbol == "fileno" and signature == "ptr->i32" {
+        return try ffi_call_typed(fs.libc, "fileno", "ptr->i32", args) catch -1;
+    }
+    if symbol == "fclose" and signature == "ptr->i32" {
+        return try ffi_call_typed(fs.libc, "fclose", "ptr->i32", args) catch -1;
+    }
+    if symbol == "fchmod" and signature == "i32,i32->i32" {
+        return try ffi_call_typed(fs.libc, "fchmod", "i32,i32->i32", args) catch -1;
+    }
+    if symbol == "flock" and signature == "i32,i32->i32" {
+        return try ffi_call_typed(fs.libc, "flock", "i32,i32->i32", args) catch -1;
+    }
+    return -1;
+}
+
+fn _cstring(fs, value) { return _call(fs, "strdup", "string->ptr", [value]); }
+fn _free(fs, pointer) { if pointer != nil and pointer != 0 { _call(fs, "free", "ptr->void", [pointer]); } }
+fn _close_fd(fs, fd) { if fd >= 0 { _i32(_call(fs, "close", "i32->i32", [fd])); } }
+fn _fd_path(fs, fd) { return fs.profile.fd_root + "/" + str(fd); }
+
+fn _openat(fs, dirfd, name, flags, mode = 0) {
+    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let result = _i32(_call(fs, "openat", "i32,ptr,i32,i32->i32", [dirfd, pointer, flags, mode]));
+    _free(fs, pointer); return result;
+}
+fn _mkdirat(fs, dirfd, name, mode) {
+    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let result = _i32(_call(fs, "mkdirat", "i32,ptr,i32->i32", [dirfd, pointer, mode]));
+    _free(fs, pointer); return result;
+}
+fn _unlinkat(fs, dirfd, name, flags) {
+    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let result = _i32(_call(fs, "unlinkat", "i32,ptr,i32->i32", [dirfd, pointer, flags]));
+    _free(fs, pointer); return result;
+}
+fn _renameat(fs, from_fd, from_name, to_fd, to_name) {
+    let from_pointer = _cstring(fs, from_name); if from_pointer == nil or from_pointer == 0 { return -1; }
+    let to_pointer = _cstring(fs, to_name);
+    if to_pointer == nil or to_pointer == 0 { _free(fs, from_pointer); return -1; }
+    let result = _i32(_call(fs, "renameat", "i32,ptr,i32,ptr->i32",
+        [from_fd, from_pointer, to_fd, to_pointer]));
+    _free(fs, to_pointer); _free(fs, from_pointer); return result;
+}
+
+fn _components(path, allow_root = true) {
+    if type(path) != "string" or len(path) > MAX_PATH or str_starts_with(path, "/")
+       or str_starts_with(path, "\\") or str_contains(path, strfromcharcode(0)) { return nil; }
+    if path == "" or path == "." or path == "root" { return if allow_root { [] } else { nil }; }
+    let raw = str_split(str_replace_all(path, "\\", "/"), "/"); let out = [];
+    for i len(raw) {
+        if raw[i] == "" or raw[i] == "." or raw[i] == ".." or len(raw[i]) > MAX_COMPONENT {
+            return nil;
+        }
+        out[len(out)] = raw[i];
+    }
+    return out;
+}
+
+fn open(root = ".", create = false) {
+    let host = available(); if not host.ok { return _error("portable POSIX backend is unavailable"); }
+    let parts = _components(root, true); if parts == nil { return _error("root must be a safe relative path"); }
+    let libc = try ffi_load(host.library) catch nil;
+    if libc == nil { return _error("trusted system library cannot be loaded"); }
+    let fs = map{ ok: true, format: "pblang.posix-dirfs.v1", profile: profile(), libc: libc,
+        libc_path: host.library, closed: false, root_fd: -1, lock_fds: map{} };
+    let flags = fs.profile.o_rdonly + fs.profile.o_directory + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let current = _openat(fs, fs.profile.at_fdcwd, ".", flags, 0);
+    if current < 0 { ffi_close(libc); return _error("current directory cannot be held"); }
+    for i len(parts) {
+        let next = _openat(fs, current, parts[i], flags, 0);
+        if next < 0 and create {
+            _mkdirat(fs, current, parts[i], MODE_DIR);
+            next = _openat(fs, current, parts[i], flags, 0);
+        }
+        _close_fd(fs, current);
+        if next < 0 { ffi_close(libc); return _error("root component is missing, not a directory, or a symbolic link"); }
+        current = next;
+    }
+    fs.root = root; fs.root_fd = current; return fs;
+}
+
+fn close(fs) {
+    if fs == nil or type(fs) != "map" or (try fs.closed catch true) { return false; }
+    let locks = try fs.lock_fds catch map{};
+    let keys = map_keys(locks);
+    for i len(keys) {
+        let fd = try parse_number(keys[i]) catch -1;
+        if fd >= 0 {
+            _i32(_call(fs, "flock", "i32,i32->i32", [fd, LOCK_UN]));
+            _close_fd(fs, fd);
+        }
+    }
+    fs.lock_fds = map{};
+    _close_fd(fs, fs.root_fd); ffi_close(fs.libc); fs.root_fd = -1; fs.closed = true; return true;
+}
+
+// Serialize cooperating writers with a kernel-owned descriptor lock. The lock
+// file is resolved beneath the held root and cannot be replaced by a symlink.
+fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10) {
+    if fs == nil or type(fs) != "map" or (try fs.closed catch true) {
+        return _error("directory root is closed");
+    }
+    if type(timeout_ms) != "number" or timeout_ms != num_floor(timeout_ms)
+       or timeout_ms < 0 or timeout_ms > 300000 {
+        return _error("lock timeout_ms must be an integer in 0..300000");
+    }
+    if type(poll_ms) != "number" or poll_ms != num_floor(poll_ms)
+       or poll_ms < 1 or poll_ms > 2000 {
+        return _error("lock poll_ms must be an integer in 1..2000");
+    }
+    let parent = _parent(fs, path, true); if not parent.ok { return parent; }
+    let flags = O_RDWR + fs.profile.o_creat + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let fd = _openat(fs, parent.fd, parent.name, flags, MODE_FILE);
+    _close_fd(fs, parent.fd);
+    if fd < 0 { return _error("lock file cannot be opened without following links"); }
+    if _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE])) != 0 {
+        _close_fd(fs, fd); return _error("lock file permissions cannot be protected");
+    }
+    let started = try now_ms() catch 0; let attempts = 0;
+    while true {
+        attempts = attempts + 1;
+        if _i32(_call(fs, "flock", "i32,i32->i32", [fd, LOCK_EX + LOCK_NB])) == 0 {
+            fs.lock_fds[str(fd)] = true;
+            let finished = try now_ms() catch started;
+            return map{ ok: true, format: "pblang.posix-dirfs.lock.v1", path: path,
+                fd: fd, owner_fd: fs.root_fd, active: true, exclusive: true,
+                descriptor_bound: true, attempts: attempts,
+                waited_ms: if finished >= started { finished - started } else { 0 } };
+        }
+        let current = try now_ms() catch started + timeout_ms;
+        let elapsed = if current >= started { current - started } else { timeout_ms };
+        if elapsed >= timeout_ms {
+            _close_fd(fs, fd);
+            return map{ ok: false, error: "exclusive lock remained busy", timeout: true,
+                path: path, attempts: attempts, waited_ms: elapsed };
+        }
+        let delay = poll_ms; if delay > timeout_ms - elapsed { delay = timeout_ms - elapsed; }
+        if delay > 0 { sleep_ms(delay); }
+    }
+}
+
+fn release_lock(fs, lock) {
+    if fs == nil or type(fs) != "map" or (try fs.closed catch true)
+       or lock == nil or type(lock) != "map" or not (try lock.active catch false)
+       or (try lock.owner_fd catch -1) != (try fs.root_fd catch -2)
+       or (try lock.fd catch -1) < 0
+       or not map_has(try fs.lock_fds catch map{}, str(try lock.fd catch -1)) {
+        return false;
+    }
+    let fd = lock.fd;
+    let unlocked = _i32(_call(fs, "flock", "i32,i32->i32", [fd, LOCK_UN]));
+    _close_fd(fs, fd); map_remove(fs.lock_fds, str(fd));
+    lock.active = false; lock.fd = -1; return unlocked == 0;
+}
+
+fn _walk_dir(fs, parts, create) {
+    if fs == nil or (try fs.closed catch true) { return _error("directory root is closed"); }
+    let current = _i32(_call(fs, "dup", "i32->i32", [fs.root_fd]));
+    if current < 0 { return _error("root directory handle cannot be duplicated"); }
+    let flags = fs.profile.o_rdonly + fs.profile.o_directory + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    for i len(parts) {
+        let next = _openat(fs, current, parts[i], flags, 0);
+        if next < 0 and create {
+            _mkdirat(fs, current, parts[i], MODE_DIR);
+            next = _openat(fs, current, parts[i], flags, 0);
+        }
+        _close_fd(fs, current);
+        if next < 0 { return _error("path component is missing, not a directory, or a symbolic link"); }
+        current = next;
+    }
+    return map{ ok: true, fd: current };
+}
+
+fn _parent(fs, path, create) {
+    let parts = _components(path, false);
+    if parts == nil or len(parts) == 0 { return _error("a non-root path is required"); }
+    let dirs = []; for i len(parts) - 1 { dirs[len(dirs)] = parts[i]; }
+    let parent = _walk_dir(fs, dirs, create); if not parent.ok { return parent; }
+    parent.name = parts[len(parts) - 1]; return parent;
+}
+
+fn list(fs, path = "root", max_entries = 512) {
+    let parts = _components(path, true); if parts == nil { return _error("invalid directory path"); }
+    let dir = _walk_dir(fs, parts, false); if not dir.ok { return dir; }
+    let entries = try fs_listdir(_fd_path(fs, dir.fd)) catch nil; _close_fd(fs, dir.fd);
+    if type(entries) != "array" { return _error("directory cannot be listed through its held descriptor"); }
+    if type(max_entries) != "number" or max_entries != num_floor(max_entries) or max_entries < 1 { return _error("invalid list bound"); }
+    if max_entries > 4096 { max_entries = 4096; }
+    let out = []; let stop = len(entries); if stop > max_entries { stop = max_entries; }
+    for i stop { out[len(out)] = entries[i]; }
+    return map{ ok: true, path: path, entries: out, truncated: len(entries) > stop,
+        descriptor_bound: true, race_resistant: true };
+}
+
+fn _bounded_snapshot(fs, fd, offset, maximum) {
+    if type(offset) != "number" or offset != num_floor(offset) or offset < 0
+       or type(maximum) != "number" or maximum != num_floor(maximum) or maximum < 0
+       or maximum > MAX_BYTES { return _error("invalid bounded snapshot range"); }
+    let source_size = _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]);
+    if source_size < 0 { return _error("source is not a seekable regular file"); }
+    let start = offset; if start > source_size { start = source_size; }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [fd, start, 0]) < 0 {
+        return _error("source range cannot be selected");
+    }
+    let stream = _call(fs, "tmpfile", "->ptr", []);
+    if stream == nil or stream == 0 { return _error("anonymous bounded snapshot is unavailable"); }
+    let snapshot_fd = _i32(_call(fs, "fileno", "ptr->i32", [stream]));
+    if snapshot_fd < 0 { _call(fs, "fclose", "ptr->i32", [stream]); return _error("snapshot descriptor is unavailable"); }
+    let available_bytes = source_size - start; let ceiling = available_bytes;
+    if ceiling > maximum { ceiling = maximum; }
+    let buffer_size = 65536; let buffer = _call(fs, "calloc", "i64,i64->ptr", [1, buffer_size]);
+    if buffer == nil or buffer == 0 { _call(fs, "fclose", "ptr->i32", [stream]); return _error("bounded snapshot buffer is unavailable"); }
+    let copied = 0; let failed = false;
+    while copied < ceiling and not failed {
+        let wanted = ceiling - copied; if wanted > buffer_size { wanted = buffer_size; }
+        let count = _call(fs, "read", "i32,ptr,i64->i64", [fd, buffer, wanted]);
+        if count <= 0 { if count < 0 { failed = true; } else { copied = ceiling; } }
+        else {
+            let written = 0;
+            while written < count and not failed {
+                let n = _call(fs, "write", "i32,ptr,i64->i64",
+                    [snapshot_fd, buffer + written, count - written]);
+                if n <= 0 { failed = true; } else { written = written + n; }
+            }
+            copied = copied + written;
+        }
+    }
+    _free(fs, buffer);
+    if failed or _call(fs, "lseek", "i32,i64,i32->i64", [snapshot_fd, 0, 0]) < 0 {
+        _call(fs, "fclose", "ptr->i32", [stream]); return _error("bounded snapshot copy failed");
+    }
+    let bytes = try fs_read_bytes(_fd_path(fs, snapshot_fd)) catch nil;
+    _call(fs, "fclose", "ptr->i32", [stream]);
+    if type(bytes) != "array" or len(bytes) != copied { return _error("bounded snapshot cannot be loaded consistently"); }
+    return map{ ok: true, bytes: bytes, size: len(bytes), source_size: source_size,
+        requested_offset: offset, offset: start, available_bytes: available_bytes,
+        truncated: available_bytes > len(bytes), offset_past_end: offset > source_size,
+        descriptor_bound: true, race_resistant: true, anonymous_snapshot: true };
+}
+
+fn read_prefix_bytes(fs, path, max_bytes = 1048576) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let flags = fs.profile.o_rdonly + fs.profile.o_nonblock + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let fd = _openat(fs, parent.fd, parent.name, flags, 0); _close_fd(fs, parent.fd);
+    if fd < 0 { return _error("file cannot be opened without following links"); }
+    let result = _bounded_snapshot(fs, fd, 0, max_bytes); _close_fd(fs, fd);
+    if result.ok { result.path = path; }
+    return result;
+}
+
+fn read_range_bytes(fs, path, offset, max_bytes = 65536) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let flags = fs.profile.o_rdonly + fs.profile.o_nonblock + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let fd = _openat(fs, parent.fd, parent.name, flags, 0); _close_fd(fs, parent.fd);
+    if fd < 0 { return _error("file cannot be opened without following links"); }
+    let result = _bounded_snapshot(fs, fd, offset, max_bytes); _close_fd(fs, fd);
+    if result.ok { result.path = path; }
+    return result;
+}
+
+fn read_bytes(fs, path, max_bytes = 4194304) {
+    let result = read_prefix_bytes(fs, path, max_bytes); if not result.ok { return result; }
+    if result.truncated { return _error("file exceeds byte limit"); }
+    return map{ ok: true, path: path, bytes: result.bytes, size: result.size,
+        descriptor_bound: true, race_resistant: true };
+}
+
+fn file_size(fs, path) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let flags = fs.profile.o_rdonly + fs.profile.o_nonblock + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let fd = _openat(fs, parent.fd, parent.name, flags, 0); _close_fd(fs, parent.fd);
+    if fd < 0 { return _error("file cannot be opened without following links"); }
+    let size = _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]); _close_fd(fs, fd);
+    if size < 0 { return _error("path is not a seekable regular file"); }
+    return map{ ok: true, path: path, size: size, kind: "file",
+        descriptor_bound: true, race_resistant: true };
+}
+
+fn metadata(fs, path) {
+    let parts = _components(path, true); if parts == nil { return _error("invalid metadata path"); }
+    let dir = _walk_dir(fs, parts, false);
+    if dir.ok {
+        _close_fd(fs, dir.fd);
+        return map{ ok: true, path: path, kind: "directory", size: 0,
+            mtime_ms: 0, mtime_available: false,
+            descriptor_bound: true, race_resistant: true };
+    }
+    let result = file_size(fs, path); if not result.ok { return result; }
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let flags = fs.profile.o_rdonly + fs.profile.o_nonblock + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let fd = _openat(fs, parent.fd, parent.name, flags, 0); _close_fd(fs, parent.fd);
+    if fd < 0 { return _error("metadata target cannot be held"); }
+    result.mtime_ms = 0; result.mtime_available = false; _close_fd(fs, fd);
+    return result;
+}
+
+fn mkdir(fs, path) {
+    let parts = _components(path, false); if parts == nil or len(parts) == 0 { return _error("invalid directory path"); }
+    let dir = _walk_dir(fs, parts, true); if not dir.ok { return dir; }
+    _close_fd(fs, dir.fd); return map{ ok: true, path: path,
+        descriptor_bound: true, nofollow: true };
+}
+
+fn _stage_name() {
+    return ".pblang-posix-stage-" + str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32);
+}
+
+fn write_atomic(fs, path, bytes, create_parents = true) {
+    if type(bytes) != "array" or len(bytes) > MAX_BYTES { return _error("bytes must be a bounded array"); }
+    let parent = _parent(fs, path, create_parents); if not parent.ok { return parent; }
+    let stage = _stage_name();
+    let flags = fs.profile.o_wronly + fs.profile.o_creat + fs.profile.o_excl
+        + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let fd = _openat(fs, parent.fd, stage, flags, MODE_FILE);
+    if fd < 0 { _close_fd(fs, parent.fd); return _error("exclusive staging file cannot be created"); }
+    let wrote = try { fs_write_bytes(_fd_path(fs, fd), bytes); true } catch false; _close_fd(fs, fd);
+    if not wrote { _unlinkat(fs, parent.fd, stage, 0); _close_fd(fs, parent.fd); return _error("staged bytes cannot be written"); }
+    let published = _renameat(fs, parent.fd, stage, parent.fd, parent.name);
+    if published != 0 { _unlinkat(fs, parent.fd, stage, 0); }
+    _close_fd(fs, parent.fd);
+    if published != 0 { return _error("staged file cannot be published atomically"); }
+    return map{ ok: true, path: path, size: len(bytes), atomic: true,
+        descriptor_bound_parent: true, nofollow: true };
+}
+
+fn write_new_exclusive(fs, path, bytes, create_parents = true) {
+    if type(bytes) != "array" or len(bytes) > MAX_BYTES { return _error("bytes must be a bounded array"); }
+    let parent = _parent(fs, path, create_parents); if not parent.ok { return parent; }
+    let flags = fs.profile.o_wronly + fs.profile.o_creat + fs.profile.o_excl
+        + fs.profile.o_nofollow + fs.profile.o_cloexec;
+    let fd = _openat(fs, parent.fd, parent.name, flags, MODE_FILE);
+    if fd < 0 { _close_fd(fs, parent.fd); return _error("destination exists or cannot be created exclusively"); }
+    let wrote = try { fs_write_bytes(_fd_path(fs, fd), bytes); true } catch false; _close_fd(fs, fd);
+    if not wrote { _unlinkat(fs, parent.fd, parent.name, 0); }
+    _close_fd(fs, parent.fd);
+    if not wrote { return _error("exclusive destination write failed"); }
+    return map{ ok: true, path: path, size: len(bytes), no_replace: true,
+        atomic_namespace_admission: true, atomic_visibility: false,
+        descriptor_bound_parent: true, nofollow: true };
+}
+
+fn remove_file(fs, path) {
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let rc = _unlinkat(fs, parent.fd, parent.name, 0); _close_fd(fs, parent.fd);
+    if rc != 0 { return _error("file entry cannot be removed"); }
+    return map{ ok: true, path: path, directory_removal: false,
+        descriptor_bound_parent: true, symlink_target_followed: false };
+}
+
+fn status(fs = nil) {
+    let host = available();
+    return map{ format: "pblang.posix-dirfs.status.v1", platform: platform(),
+        available: host.ok and (fs == nil or not (try fs.closed catch true)),
+        component_openat: true, nofollow: true, cloexec: true,
+        descriptor_view_io: true, anonymous_bounded_snapshots: true,
+        advisory_descriptor_locks: true,
+        atomic_renameat: true, exclusive_no_replace_openat: true,
+        pathname_fallback: false, windows_backend: false };
+}
+
+export profile, available, open, close, list, read_bytes, read_prefix_bytes,
+       read_range_bytes, file_size, metadata, mkdir, write_atomic,
+       write_new_exclusive, remove_file, acquire_lock, release_lock, status;

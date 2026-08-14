@@ -1,0 +1,349 @@
+//! Bounded, dependency-free Parquet reader for PBLang.
+//!
+//! The decoder reads the real Thrift Compact footer and page headers. It
+//! intentionally accepts only flat REQUIRED columns encoded as PLAIN in
+//! uncompressed DATA_PAGE/DATA_PAGE_V2 pages. Unsupported nesting, repetition,
+//! dictionaries, encodings, or codecs fail closed instead of invoking external
+//! Python/SQL processes or returning partial rows as if they were complete.
+
+let MAX_SAFE_INTEGER = 9007199254740991;
+let DEFAULT_LIMITS = map{
+    max_file_bytes: 4194304, max_footer_bytes: 1048576,
+    max_rows: 10000, max_columns: 256, max_thrift_items: 100000,
+    max_thrift_depth: 32, max_binary_bytes: 1048576
+};
+
+fn _integer(value, minimum, maximum, label) {
+    if type(value) != "number" or num_floor(value) != value or value < minimum or value > maximum {
+        throw label + " must be an integer in " + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _limits(options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "parquet options must be a map"; }
+    return map{
+        max_file_bytes: _integer(try options.max_file_bytes catch DEFAULT_LIMITS.max_file_bytes,
+            12, 67108864, "max_file_bytes"),
+        max_footer_bytes: _integer(try options.max_footer_bytes catch DEFAULT_LIMITS.max_footer_bytes,
+            1, 16777216, "max_footer_bytes"),
+        max_rows: _integer(try options.max_rows catch DEFAULT_LIMITS.max_rows,
+            0, 100000, "max_rows"),
+        max_columns: _integer(try options.max_columns catch DEFAULT_LIMITS.max_columns,
+            1, 4096, "max_columns"),
+        max_thrift_items: _integer(try options.max_thrift_items catch DEFAULT_LIMITS.max_thrift_items,
+            1, 1000000, "max_thrift_items"),
+        max_thrift_depth: _integer(try options.max_thrift_depth catch DEFAULT_LIMITS.max_thrift_depth,
+            1, 64, "max_thrift_depth"),
+        max_binary_bytes: _integer(try options.max_binary_bytes catch DEFAULT_LIMITS.max_binary_bytes,
+            0, 16777216, "max_binary_bytes")
+    };
+}
+
+fn _bytes(value, limits) {
+    if type(value) != "array" { throw "parquet input must be a byte array"; }
+    if len(value) < 12 { throw "parquet input is shorter than the minimum file size"; }
+    if len(value) > limits.max_file_bytes { throw "parquet input exceeds max_file_bytes"; }
+    for i len(value) {
+        if type(value[i]) != "number" or num_floor(value[i]) != value[i] or value[i] < 0 or value[i] > 255 {
+            throw "parquet input contains a non-byte value";
+        }
+    }
+    return value;
+}
+
+fn _u32le(bytes, offset) {
+    if offset < 0 or offset + 4 > len(bytes) { throw "parquet truncated u32"; }
+    return bytes[offset] + bytes[offset + 1] * 256 + bytes[offset + 2] * 65536 +
+           bytes[offset + 3] * 16777216;
+}
+
+fn _signed32(value) { if value >= 2147483648 { return value - 4294967296; } return value; }
+
+fn _i64le(bytes, offset) {
+    if offset < 0 or offset + 8 > len(bytes) { throw "parquet truncated i64"; }
+    let value = bigint(0); let factor = bigint(1);
+    for i 8 { value = value + bigint(bytes[offset + i]) * factor; factor = factor * bigint(256); }
+    if bytes[offset + 7] >= 128 { value = value - bigint("18446744073709551616"); }
+    if value >= bigint("-9007199254740991") and value <= bigint("9007199254740991") {
+        return parse_number(str(value));
+    }
+    return str(value);
+}
+
+fn _float32(bytes, offset) {
+    let bits = _u32le(bytes, offset);
+    let sign = 1;
+    if bit_and(bits, 2147483648) != 0 { sign = -1; }
+    let exponent = bit_and(bit_shr(bits, 23), 255);
+    let fraction = bit_and(bits, 8388607);
+    if exponent == 255 { throw "parquet non-finite FLOAT values are not JSON-safe"; }
+    if exponent == 0 {
+        if fraction == 0 { return 0.0 * sign; }
+        return sign * (fraction / 8388608.0) * num_pow(2.0, -126);
+    }
+    return sign * (1.0 + fraction / 8388608.0) * num_pow(2.0, exponent - 127);
+}
+
+fn _float64(bytes, offset) {
+    let low = _u32le(bytes, offset); let high = _u32le(bytes, offset + 4);
+    let sign = 1;
+    if bit_and(high, 2147483648) != 0 { sign = -1; }
+    let exponent = bit_and(bit_shr(high, 20), 2047);
+    let fraction = bit_and(high, 1048575) * 4294967296.0 + low;
+    if exponent == 2047 { throw "parquet non-finite DOUBLE values are not JSON-safe"; }
+    if exponent == 0 {
+        if fraction == 0 { return 0.0 * sign; }
+        return sign * (fraction / 4503599627370496.0) * num_pow(2.0, -1022);
+    }
+    return sign * (1.0 + fraction / 4503599627370496.0) * num_pow(2.0, exponent - 1023);
+}
+
+fn _ascii(bytes, start, count) {
+    if start < 0 or count < 0 or start + count > len(bytes) { throw "parquet truncated magic"; }
+    return bytes_to_str(slice(bytes, start, start + count));
+}
+
+fn _state(bytes, start, end, limits) {
+    return map{ bytes: bytes, pos: start, end: end, depth: 0, items: 0, limits: limits };
+}
+
+fn _need(state, count, label) {
+    if count < 0 or state.pos + count > state.end { throw "parquet truncated " + label; }
+}
+
+fn _byte(state) { _need(state, 1, "Thrift value"); let v = state.bytes[state.pos]; state.pos = state.pos + 1; return v; }
+
+fn _varuint(state) {
+    let result = 0; let shift = 0; let count = 0;
+    while count < 10 {
+        let byte = _byte(state);
+        let part = bit_and(byte, 127);
+        if shift >= 53 and part != 0 { throw "parquet Thrift integer exceeds the safe numeric range"; }
+        result = result + part * num_pow(2, shift);
+        if result > MAX_SAFE_INTEGER { throw "parquet Thrift integer exceeds the safe numeric range"; }
+        if bit_and(byte, 128) == 0 { return result; }
+        shift = shift + 7; count = count + 1;
+    }
+    throw "parquet malformed Thrift varint";
+}
+
+fn _zigzag(value) { if value % 2 == 0 { return value / 2; } return 0 - ((value + 1) / 2); }
+
+fn _account(state, amount) {
+    state.items = state.items + amount;
+    if state.items > state.limits.max_thrift_items { throw "parquet Thrift item limit exceeded"; }
+}
+
+fn _read_value(state, compact_type) {
+    if compact_type == 1 { return true; }
+    if compact_type == 2 { return false; }
+    if compact_type == 3 { let v = _byte(state); if v >= 128 { return v - 256; } return v; }
+    if compact_type == 4 or compact_type == 5 or compact_type == 6 { return _zigzag(_varuint(state)); }
+    if compact_type == 7 {
+        _need(state, 8, "Thrift double"); let v = _float64(state.bytes, state.pos); state.pos = state.pos + 8; return v;
+    }
+    if compact_type == 8 {
+        let size = _varuint(state);
+        if size > state.limits.max_binary_bytes { throw "parquet Thrift binary value exceeds its byte limit"; }
+        _need(state, size, "Thrift binary");
+        let value = slice(state.bytes, state.pos, state.pos + size); state.pos = state.pos + size;
+        _account(state, size); return value;
+    }
+    if compact_type == 9 or compact_type == 10 {
+        let header = _byte(state); let size = bit_shr(header, 4); let item_type = bit_and(header, 15);
+        if size == 15 { size = _varuint(state); }
+        _account(state, size); let out = [];
+        for i size { out[i] = _read_value(state, item_type); }
+        return out;
+    }
+    if compact_type == 11 {
+        let size = _varuint(state); _account(state, size * 2); let out = [];
+        if size == 0 { return out; }
+        let types = _byte(state); let key_type = bit_shr(types, 4); let value_type = bit_and(types, 15);
+        for i size { out[i] = map{ key: _read_value(state, key_type), value: _read_value(state, value_type) }; }
+        return out;
+    }
+    if compact_type == 12 { return _read_struct(state); }
+    throw "parquet unsupported Thrift compact type " + str(compact_type);
+}
+
+fn _read_struct(state) {
+    state.depth = state.depth + 1;
+    if state.depth > state.limits.max_thrift_depth { throw "parquet Thrift nesting limit exceeded"; }
+    let out = map{}; let last_field = 0;
+    while true {
+        let header = _byte(state);
+        if header == 0 { state.depth = state.depth - 1; return out; }
+        let compact_type = bit_and(header, 15); let delta = bit_shr(header, 4);
+        let field_id = if delta == 0 { _zigzag(_varuint(state)) } else { last_field + delta };
+        if field_id <= 0 { throw "parquet invalid Thrift field id"; }
+        last_field = field_id; _account(state, 1);
+        out[str(field_id)] = _read_value(state, compact_type);
+    }
+}
+
+fn _field(value, id, fallback = nil) {
+    let key = str(id); if type(value) == "map" and map_has(value, key) { return value[key]; }
+    return fallback;
+}
+
+fn _text(value, label) {
+    if type(value) != "array" { throw "parquet " + label + " is not binary text"; }
+    return try bytes_to_str(value) catch { throw "parquet " + label + " is not valid UTF-8"; };
+}
+
+fn _type_name(code) {
+    let names = ["BOOLEAN", "INT32", "INT64", "INT96", "FLOAT", "DOUBLE", "BYTE_ARRAY", "FIXED_LEN_BYTE_ARRAY"];
+    if type(code) != "number" or code < 0 or code >= len(names) { throw "parquet unsupported physical type"; }
+    return names[code];
+}
+
+fn _schema(metadata, limits) {
+    let raw = _field(metadata, 2, nil);
+    if type(raw) != "array" or len(raw) < 2 { throw "parquet schema must contain a root and at least one column"; }
+    if len(raw) - 1 > limits.max_columns { throw "parquet schema exceeds max_columns"; }
+    let root = raw[0]; let child_count = _field(root, 5, nil);
+    if child_count != len(raw) - 1 { throw "parquet nested schemas are not supported by this bounded reader"; }
+    let columns = [];
+    for i child_count {
+        let element = raw[i + 1];
+        if _field(element, 5, 0) != 0 { throw "parquet nested columns are not supported"; }
+        if _field(element, 3, nil) != 0 { throw "parquet only flat REQUIRED columns are supported"; }
+        let physical = _field(element, 1, nil); let name = _text(_field(element, 4, nil), "column name");
+        if name == "" or len(name) > 1024 { throw "parquet column names must contain 1..1024 characters"; }
+        for j len(columns) { if columns[j].name == name { throw "parquet duplicate column name: " + name; } }
+        let type_length = _field(element, 2, nil);
+        if physical == 7 and (type(type_length) != "number" or type_length < 1 or type_length > 1048576) {
+            throw "parquet FIXED_LEN_BYTE_ARRAY requires a bounded type_length";
+        }
+        columns[i] = map{ name: name, physical_type: physical, type: _type_name(physical),
+            type_length: type_length, converted_type: _field(element, 6, nil) };
+    }
+    return columns;
+}
+
+fn _plain_values(bytes, start, end, column, count) {
+    let values = []; let pos = start; let kind = column.physical_type;
+    if kind == 0 {
+        let needed = num_floor((count + 7) / 8); if pos + needed > end { throw "parquet truncated PLAIN boolean page"; }
+        for i count { values[i] = bit_and(bit_shr(bytes[pos + num_floor(i / 8)], i % 8), 1) == 1; }
+        return values;
+    }
+    for i count {
+        if kind == 1 { if pos + 4 > end { throw "parquet truncated PLAIN INT32"; } values[i] = _signed32(_u32le(bytes, pos)); pos = pos + 4; }
+        elif kind == 2 { if pos + 8 > end { throw "parquet truncated PLAIN INT64"; } values[i] = _i64le(bytes, pos); pos = pos + 8; }
+        elif kind == 3 { if pos + 12 > end { throw "parquet truncated PLAIN INT96"; } values[i] = base64_encode_bytes(slice(bytes, pos, pos + 12)); pos = pos + 12; }
+        elif kind == 4 { if pos + 4 > end { throw "parquet truncated PLAIN FLOAT"; } values[i] = _float32(bytes, pos); pos = pos + 4; }
+        elif kind == 5 { if pos + 8 > end { throw "parquet truncated PLAIN DOUBLE"; } values[i] = _float64(bytes, pos); pos = pos + 8; }
+        elif kind == 6 {
+            if pos + 4 > end { throw "parquet truncated PLAIN BYTE_ARRAY length"; }
+            let size = _u32le(bytes, pos); pos = pos + 4;
+            if size > 1048576 or pos + size > end { throw "parquet invalid PLAIN BYTE_ARRAY length"; }
+            let raw = slice(bytes, pos, pos + size); pos = pos + size;
+            values[i] = if column.converted_type == 0 { _text(raw, "UTF8 value") } else { base64_encode_bytes(raw) };
+        } else {
+            let size = column.type_length;
+            if pos + size > end { throw "parquet truncated PLAIN FIXED_LEN_BYTE_ARRAY"; }
+            values[i] = base64_encode_bytes(slice(bytes, pos, pos + size)); pos = pos + size;
+        }
+    }
+    return values;
+}
+
+fn _column_values(bytes, chunk, column, wanted, limits) {
+    let meta = _field(chunk, 3, nil); if type(meta) != "map" { throw "parquet column metadata is missing"; }
+    if _field(meta, 1, nil) != column.physical_type { throw "parquet column physical type disagrees with schema"; }
+    if _field(meta, 4, nil) != 0 { throw "parquet compressed column codec is not supported"; }
+    let encodings = _field(meta, 2, []);
+    for i len(encodings) { if encodings[i] != 0 and encodings[i] != 3 { throw "parquet column uses an unsupported encoding"; } }
+    let path = _field(meta, 3, []);
+    if len(path) != 1 or _text(path[0], "column path") != column.name { throw "parquet column path does not match its flat schema"; }
+    let total_values = _field(meta, 5, nil);
+    if type(total_values) != "number" or total_values < wanted { throw "parquet column has fewer values than its row group"; }
+    let offset = _field(meta, 9, nil);
+    if type(offset) != "number" or offset < 4 or offset >= len(bytes) - 8 { throw "parquet invalid data page offset"; }
+    let values = []; let seen = 0; let pos = offset;
+    while seen < total_values and len(values) < wanted {
+        let page_state = _state(bytes, pos, len(bytes) - 8, limits);
+        let header = _read_struct(page_state); let payload_start = page_state.pos;
+        let page_type = _field(header, 1, nil); let compressed_size = _field(header, 3, nil);
+        if type(compressed_size) != "number" or compressed_size < 0 or payload_start + compressed_size > len(bytes) - 8 {
+            throw "parquet invalid page size";
+        }
+        let page_values = 0; let encoding = nil; let value_start = payload_start;
+        if page_type == 0 {
+            let data_header = _field(header, 5, nil); page_values = _field(data_header, 1, nil); encoding = _field(data_header, 2, nil);
+        } elif page_type == 3 {
+            let data_header = _field(header, 8, nil); page_values = _field(data_header, 1, nil); encoding = _field(data_header, 4, nil);
+            let definitions = _field(data_header, 5, 0); let repetitions = _field(data_header, 6, 0);
+            let compressed = _field(data_header, 7, true);
+            if definitions != 0 or repetitions != 0 or compressed != false { throw "parquet DATA_PAGE_V2 levels/compression are unsupported"; }
+        } else { throw "parquet dictionary/index pages are not supported"; }
+        if type(page_values) != "number" or page_values < 0 or seen + page_values > total_values { throw "parquet invalid page value count"; }
+        if encoding != 0 { throw "parquet data page is not PLAIN encoded"; }
+        let take = page_values;
+        if len(values) + take > wanted { take = wanted - len(values); }
+        let decoded = _plain_values(bytes, value_start, payload_start + compressed_size, column, take);
+        for i len(decoded) { values[len(values)] = decoded[i]; }
+        seen = seen + page_values; pos = payload_start + compressed_size;
+    }
+    if len(values) != wanted { throw "parquet column could not supply the requested row count"; }
+    return values;
+}
+
+fn read(bytes, options = nil) {
+    let limits = _limits(options); bytes = _bytes(bytes, limits);
+    if _ascii(bytes, 0, 4) != "PAR1" or _ascii(bytes, len(bytes) - 4, 4) != "PAR1" { throw "parquet magic PAR1 is missing"; }
+    let footer_size = _u32le(bytes, len(bytes) - 8);
+    if footer_size < 1 or footer_size > limits.max_footer_bytes or footer_size > len(bytes) - 12 { throw "parquet footer size is invalid or exceeds max_footer_bytes"; }
+    let footer_start = len(bytes) - 8 - footer_size;
+    let footer_state = _state(bytes, footer_start, len(bytes) - 8, limits);
+    let metadata = _read_struct(footer_state);
+    if footer_state.pos != len(bytes) - 8 { throw "parquet footer contains trailing bytes"; }
+    let version = _field(metadata, 1, nil); if version != 1 and version != 2 { throw "parquet unsupported metadata version"; }
+    let total_rows = _field(metadata, 3, nil);
+    if type(total_rows) != "number" or total_rows < 0 or total_rows > MAX_SAFE_INTEGER { throw "parquet invalid total row count"; }
+    let columns = _schema(metadata, limits); let groups = _field(metadata, 4, nil);
+    if type(groups) != "array" { throw "parquet row groups are missing"; }
+    let target = total_rows; if target > limits.max_rows { target = limits.max_rows; }
+    let column_values = []; for c len(columns) { column_values[c] = []; }
+    let consumed_rows = 0;
+    for group_index len(groups) {
+        let group = groups[group_index]; let group_rows = _field(group, 3, nil); let chunks = _field(group, 1, nil);
+        if type(group_rows) != "number" or group_rows < 0 or type(chunks) != "array" or len(chunks) != len(columns) {
+            throw "parquet row group shape is invalid";
+        }
+        let wanted = group_rows;
+        if consumed_rows + wanted > target { wanted = target - consumed_rows; }
+        if wanted > 0 {
+            for c len(columns) {
+                let values = _column_values(bytes, chunks[c], columns[c], wanted, limits);
+                for v len(values) { column_values[c][len(column_values[c])] = values[v]; }
+            }
+            consumed_rows = consumed_rows + wanted;
+        }
+        if consumed_rows >= target { break; }
+    }
+    if consumed_rows != target { throw "parquet row groups do not cover the declared row count"; }
+    let rows = [];
+    for row_index target {
+        let row = map{}; for c len(columns) { row[columns[c].name] = column_values[c][row_index]; }
+        rows[row_index] = row;
+    }
+    let schema = [];
+    for c len(columns) { schema[c] = map{ name: columns[c].name, type: columns[c].type,
+        required: true, converted_type: columns[c].converted_type, type_length: columns[c].type_length }; }
+    return map{
+        format: "pblang.parquet.rows.v1", metadata_version: version,
+        schema: schema, rows: rows, total_rows: total_rows, returned_rows: len(rows),
+        truncated: len(rows) < total_rows, row_groups: len(groups),
+        reader: "pblang-native-thrift-compact/plain-v1",
+        supported_contract: map{ flat_required: true, plain: true, uncompressed: true,
+            data_page_v1: true, data_page_v2: true, nested: false, optional: false,
+            repeated: false, dictionary: false, compressed_codecs: false }
+    };
+}
+
+export read, DEFAULT_LIMITS;

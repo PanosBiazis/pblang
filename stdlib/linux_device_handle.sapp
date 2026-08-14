@@ -1,0 +1,261 @@
+// Safe bounded Linux device handles implemented entirely in PBLang.
+//
+// This is the reusable low-level boundary for character devices that need
+// openat/read/write/ioctl. Paths are class-specific, opened beneath a held
+// /dev directory with O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK, and every operation is
+// bounded. Unknown ioctl requests fail closed.
+
+let LIBC = [
+    "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6", "/lib/i386-linux-gnu/libc.so.6"
+];
+let CRYPTO = [
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3", "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/aarch64-linux-gnu/libcrypto.so.3", "/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/i386-linux-gnu/libcrypto.so.3", "/lib/i386-linux-gnu/libcrypto.so.3"
+];
+
+let FORMAT = "pblang.linux-device-handle.v1";
+let MAX_IO_BYTES = 65536;
+let AT_FDCWD = -100;
+let O_RDONLY = 0; let O_RDWR = 2; let O_NONBLOCK = 2048;
+let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
+let POLLIN = 1; let POLLOUT = 4;
+let I2C_SMBUS = 0x0720; let I2C_SMBUS_READ = 1;
+let I2C_SMBUS_WRITE = 0; let I2C_SMBUS_QUICK = 0;
+let I2C_SMBUS_BYTE = 1;
+
+let IOCTLS = map{
+    test: map{ FIONREAD: 0x541B },
+    i2c: map{ I2C_FUNCS: 0x0705, I2C_SLAVE: 0x0703 },
+    gpio: map{}
+};
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+fn _path(values) { for i len(values) { if fs_exists(values[i]) { return values[i]; } } return ""; }
+fn _i32(value) { if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; } return value; }
+fn _call(state, name, signature, args) { return try ffi_call_typed(state.libc, name, signature, args) catch -1; }
+fn _free(state, pointer) { if pointer != nil and pointer != 0 { _call(state, "free", "ptr->void", [pointer]); } }
+fn _free_crypto(state, pointer) {
+    if pointer != nil and pointer != 0 {
+        try ffi_call_typed(state.crypto, "CRYPTO_free", "ptr,ptr,i32->void", [pointer,0,0]) catch nil;
+    }
+}
+fn _cstring(state, value) { return _call(state, "strdup", "string->ptr", [value]); }
+fn _openat(state, dirfd, name, flags) {
+    let pointer = _cstring(state, name); if pointer == nil or pointer == 0 { return -1; }
+    let result = _i32(_call(state, "openat", "i32,ptr,i32,i32->i32", [dirfd,pointer,flags,0]));
+    _free(state, pointer); return result;
+}
+fn _write_le(state, pointer, value, count) {
+    let remaining = value;
+    for i count {
+        _call(state, "memset", "ptr,i32,i64->ptr", [pointer+i,num_mod(remaining,256),1]);
+        remaining = num_floor(remaining / 256);
+    }
+}
+fn _poll(state, events, timeout_ms) {
+    if not _integer(timeout_ms, 0, 60000) { return -1; }
+    let record = _call(state, "calloc", "i64,i64->ptr", [1,8]);
+    if record == nil or record == 0 { return -1; }
+    _write_le(state, record, state.fd, 4); _write_le(state, record+4, events, 2);
+    let result = _i32(_call(state, "poll", "ptr,i64,i32->i32", [record,1,timeout_ms]));
+    _free(state, record); return result;
+}
+fn _hex(bytes) {
+    let digits = "0123456789abcdef"; let out = "";
+    for i len(bytes) {
+        let high = num_floor(bytes[i] / 16); let low = num_mod(bytes[i], 16);
+        out = out + str_slice(digits, high, high+1) + str_slice(digits, low, low+1);
+    }
+    return out;
+}
+fn _valid_bytes(value) {
+    if type(value) != "array" or len(value) > MAX_IO_BYTES { return false; }
+    for i len(value) { if not _integer(value[i], 0, 255) { return false; } }
+    return true;
+}
+fn _pointer_bytes(state, pointer, count) {
+    if pointer == nil or pointer == 0 or not _integer(count, 0, MAX_IO_BYTES) {
+        return map{ ok: false, error: "invalid device byte copy" };
+    }
+    if count == 0 { return map{ ok: true, bytes: [], count: 0 }; }
+    let encoded = try ffi_call_typed(state.crypto, "OPENSSL_buf2hexstr", "ptr,i64->ptr",
+        [pointer,count]) catch nil;
+    if encoded == nil or encoded == 0 { return map{ ok: false, error: "device byte encoding failed" }; }
+    let text = try ffi_call_typed(state.libc, "basename", "ptr->string", [encoded]) catch nil;
+    _free_crypto(state, encoded);
+    if type(text) != "string" { return map{ ok: false, error: "device bytes unavailable" }; }
+    let clean = str_lower(str_replace_all(text, ":", ""));
+    if len(clean) != count * 2 { return map{ ok: false, error: "device byte count mismatch" }; }
+    let out = [];
+    for i count {
+        let at = i * 2;
+        let high = str_index_of("0123456789abcdef", str_slice(clean,at,at+1));
+        let low = str_index_of("0123456789abcdef", str_slice(clean,at+1,at+2));
+        if high < 0 or low < 0 { return map{ ok: false, error: "device byte encoding invalid" }; }
+        out[len(out)] = high * 16 + low;
+    }
+    return map{ ok: true, bytes: out, count: count };
+}
+
+fn available() {
+    let libc = _path(LIBC); let crypto = _path(CRYPTO);
+    return map{ ok: platform() == "linux" and libc != "" and crypto != "",
+        format: FORMAT, platform: platform(), libc: libc, crypto: crypto,
+        nofollow: true, cloexec: true, nonblocking: true,
+        max_io_bytes: MAX_IO_BYTES, ioctl_allowlisted: true };
+}
+
+fn _device(value, class_name) {
+    let path = str(value); let class_value = str_lower(str(class_name));
+    if class_value == "i2c" and regex_match(path, "^/dev/i2c-[0-9]{1,3}$") {
+        return map{ ok: true, class: "i2c", root: "/dev", name: str_slice(path,5,len(path)), path: path };
+    }
+    if class_value == "gpio" and regex_match(path, "^/dev/gpiochip[0-9]{1,3}$") {
+        return map{ ok: true, class: "gpio", root: "/dev", name: str_slice(path,5,len(path)), path: path };
+    }
+    if class_value == "test" and (try env_get("PB_PROJECT_TEST_ENABLE") catch "") == "1"
+        and regex_match(path, "^/dev/pts/[0-9]{1,8}$") {
+        return map{ ok: true, class: "test", root: "/dev/pts", name: str_slice(path,9,len(path)), path: path };
+    }
+    return map{ ok: false, error: "device path is outside its exact class namespace" };
+}
+
+fn open_device(path, class_name, mode = "read") {
+    let parsed = _device(path, class_name); if not parsed.ok { return parsed; }
+    if mode != "read" and mode != "read-write" { return map{ ok: false, error: "invalid device access mode" }; }
+    let support = available(); if not support.ok { return map{ ok: false, error: "Linux device backend unavailable" }; }
+    let libc = try ffi_load(support.libc) catch nil; let crypto = try ffi_load(support.crypto) catch nil;
+    if libc == nil or crypto == nil {
+        try ffi_close(libc) catch nil; try ffi_close(crypto) catch nil;
+        return map{ ok: false, error: "trusted device libraries unavailable" };
+    }
+    let state = map{ ok: false, format: FORMAT, libc: libc, crypto: crypto,
+        fd: -1, closed: false, class: parsed.class, path: parsed.path, mode: mode };
+    let root = _openat(state, AT_FDCWD, parsed.root, O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC);
+    if root < 0 { close(state); return map{ ok: false, error: "device parent directory cannot be held" }; }
+    let access = if mode == "read" { O_RDONLY } else { O_RDWR };
+    state.fd = _openat(state, root, parsed.name, access + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC);
+    _call(state, "close", "i32->i32", [root]);
+    if state.fd < 0 { close(state); return map{ ok: false, error: "device cannot be opened without following links" }; }
+    state.ok = true; state.descriptor_bound = true; state.nofollow = true;
+    state.cloexec = true; state.nonblocking = true;
+    return state;
+}
+
+fn read_bytes(state, maximum = 4096, timeout_ms = 1000) {
+    if type(state) != "map" or (try state.format catch "") != FORMAT or (try state.closed catch true)
+        or not _integer(maximum,1,MAX_IO_BYTES) or not _integer(timeout_ms,1,60000) {
+        return map{ ok: false, error: "invalid bounded device read" };
+    }
+    let buffer = _call(state, "calloc", "i64,i64->ptr", [maximum,1]);
+    if buffer == nil or buffer == 0 { return map{ ok: false, error: "device read allocation failed" }; }
+    if _poll(state, POLLIN, timeout_ms) <= 0 { _free(state,buffer); return map{ ok:false,error:"device read deadline expired",timeout:true }; }
+    let count = _call(state, "read", "i32,ptr,i64->i64", [state.fd,buffer,maximum]);
+    if count < 0 or count > maximum { _free(state,buffer); return map{ ok:false,error:"bounded device read failed" }; }
+    let copied = _pointer_bytes(state,buffer,count); _free(state,buffer);
+    if not copied.ok { return copied; }
+    return map{ ok:true,format:FORMAT,bytes:copied.bytes,bytes_read:count,
+        truncated:count==maximum,descriptor_bound:true,nonblocking:true };
+}
+
+fn write_bytes(state, bytes, timeout_ms = 1000) {
+    if type(state) != "map" or (try state.format catch "") != FORMAT or (try state.closed catch true)
+        or (try state.mode catch "read") != "read-write" or not _valid_bytes(bytes)
+        or not _integer(timeout_ms,1,60000) {
+        return map{ ok:false,error:"invalid bounded device write" };
+    }
+    if len(bytes) == 0 { return map{ok:true,bytes_sent:0}; }
+    let buffer = try ffi_call_typed(state.crypto,"OPENSSL_hexstr2buf","string,ptr->ptr",[_hex(bytes),0]) catch nil;
+    if buffer == nil or buffer == 0 { return map{ok:false,error:"device write allocation failed"}; }
+    if _poll(state,POLLOUT,timeout_ms) <= 0 { _free_crypto(state,buffer); return map{ok:false,error:"device write deadline expired",timeout:true}; }
+    let count = _call(state,"write","i32,ptr,i64->i64",[state.fd,buffer,len(bytes)]);
+    _free_crypto(state,buffer);
+    if count != len(bytes) { return map{ok:false,error:"device write was not complete",bytes_sent:if count<0{0}else{count}}; }
+    return map{ok:true,format:FORMAT,bytes_sent:count,descriptor_bound:true,nonblocking:true};
+}
+
+fn ioctl_scalar(state, request_name, argument = 0) {
+    if type(state) != "map" or (try state.format catch "") != FORMAT or (try state.closed catch true) {
+        return map{ok:false,error:"invalid device handle"};
+    }
+    let allowed = try IOCTLS[state.class] catch map{};
+    if not map_has(allowed,request_name) { return map{ok:false,error:"ioctl is not allowed for this device class"}; }
+    if not _integer(argument,0,2147483647) { return map{ok:false,error:"invalid ioctl scalar argument"}; }
+    let result = _i32(_call(state,"ioctl","i32,i64,i64->i32",[state.fd,allowed[request_name],argument]));
+    return map{ok:result==0,format:FORMAT,request:request_name,result:result,
+        descriptor_bound:true,allowlisted:true};
+}
+
+fn ioctl_u64(state, request_name) {
+    if type(state) != "map" or (try state.format catch "") != FORMAT or (try state.closed catch true) {
+        return map{ok:false,error:"invalid device handle"};
+    }
+    let allowed = try IOCTLS[state.class] catch map{};
+    if not map_has(allowed,request_name) { return map{ok:false,error:"ioctl is not allowed for this device class"}; }
+    let pointer = _call(state,"calloc","i64,i64->ptr",[1,8]);
+    if pointer == nil or pointer == 0 { return map{ok:false,error:"ioctl result allocation failed"}; }
+    let result = _i32(_call(state,"ioctl","i32,i64,ptr->i32",[state.fd,allowed[request_name],pointer]));
+    let copied = if result == 0 { _pointer_bytes(state,pointer,8) } else { map{ok:false} };
+    _free(state,pointer);
+    if result != 0 or not copied.ok { return map{ok:false,error:"allowlisted ioctl failed",native_result:result}; }
+    let value = 0; let scale = 1;
+    for i 8 { value = value + copied.bytes[i] * scale; scale = scale * 256; }
+    return map{ok:true,format:FORMAT,request:request_name,value:value,
+        descriptor_bound:true,allowlisted:true};
+}
+
+fn i2c_probe(state, address, mode = "receive-byte") {
+    if type(state) != "map" or (try state.format catch "") != FORMAT
+        or (try state.closed catch true) or (try state.class catch "") != "i2c"
+        or (try state.mode catch "read") != "read-write" {
+        return map{ok:false,error:"invalid I2C device handle"};
+    }
+    if not _integer(address,3,119) {
+        return map{ok:false,error:"I2C address must be an unreserved 7-bit address from 3 to 119"};
+    }
+    if mode != "receive-byte" and mode != "quick-write" {
+        return map{ok:false,error:"I2C probe mode must be receive-byte or quick-write"};
+    }
+    let selected=ioctl_scalar(state,"I2C_SLAVE",address);
+    if not selected.ok {
+        return map{ok:false,responded:false,address:address,error:"I2C address selection failed"};
+    }
+    let request=_call(state,"calloc","i64,i64->ptr",[1,16]);
+    if request==nil or request==0{return map{ok:false,error:"I2C probe allocation failed"};}
+    let data=0;let read_write=I2C_SMBUS_WRITE;let size=I2C_SMBUS_QUICK;
+    if mode=="receive-byte" {
+        read_write=I2C_SMBUS_READ;size=I2C_SMBUS_BYTE;
+        data=_call(state,"calloc","i64,i64->ptr",[1,34]);
+        if data==nil or data==0{_free(state,request);return map{ok:false,error:"I2C response allocation failed"};}
+        _write_le(state,request+8,data,8);
+    }
+    _write_le(state,request,read_write,1);_write_le(state,request+1,0,1);
+    _write_le(state,request+4,size,4);
+    let result=_i32(_call(state,"ioctl","i32,i64,ptr->i32",[state.fd,I2C_SMBUS,request]));
+    let value=nil;
+    if result==0 and data!=0 {
+        let copied=_pointer_bytes(state,data,1);
+        if copied.ok{value=copied.bytes[0];}
+    }
+    _free(state,data);_free(state,request);
+    return map{ok:true,format:FORMAT,address:address,mode:mode,responded:result==0,
+        value:value,native_result:result,descriptor_bound:true,allowlisted:true};
+}
+
+fn close(state) {
+    if type(state) == "map" and not (try state.closed catch true) {
+        if (try state.fd catch -1) >= 0 { _call(state,"close","i32->i32",[state.fd]); state.fd=-1; }
+        try ffi_close(state.crypto) catch nil; try ffi_close(state.libc) catch nil;
+        state.closed=true;
+    }
+    return map{ok:true,closed:true};
+}
+
+export FORMAT, MAX_IO_BYTES, available, open_device, read_bytes, write_bytes,
+       ioctl_scalar, ioctl_u64, i2c_probe, close;

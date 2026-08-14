@@ -1,0 +1,524 @@
+// stdlib/windows_dirfs.sapp -- Windows root-handle filesystem confinement.
+//
+// All caller paths are relative to one held directory handle. NtCreateFile is
+// invoked with RootDirectory plus OBJ_DONT_REPARSE and
+// FILE_OPEN_REPARSE_POINT, so child resolution rejects reparse traversal. Reads
+// are bounded while the file handle is held; writes use exclusive creation or
+// a same-directory stage followed by handle-relative atomic rename. No lexical
+// CreateFileW fallback is used.
+
+let ABI = import("stdlib:windows_native_abi.sapp");
+
+let MAX_PATH = 32767; let MAX_COMPONENT = 255; let MAX_BYTES = 67108864;
+let MAX_LIST_ENTRIES = 4096; let DIRECTORY_BUFFER_BYTES = 65536;
+let INVALID_HANDLE = -1;
+let SYNCHRONIZE = 0x00100000; let DELETE_ACCESS = 0x00010000;
+let FILE_READ_DATA = 0x0001; let FILE_WRITE_DATA = 0x0002;
+let FILE_LIST_DIRECTORY = 0x0001; let FILE_TRAVERSE = 0x0020; let FILE_READ_ATTRIBUTES = 0x0080;
+let SHARE_ALL = 7; let FILE_ATTRIBUTE_NORMAL = 0x80; let FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+let FILE_OPEN = 1; let FILE_CREATE = 2; let FILE_OPEN_IF = 3;
+let FILE_DIRECTORY_FILE = 0x000001; let FILE_SYNCHRONOUS_IO_NONALERT = 0x000020;
+let FILE_NON_DIRECTORY_FILE = 0x000040; let FILE_OPEN_REPARSE_POINT = 0x200000;
+let OBJ_CASE_INSENSITIVE = 0x40; let OBJ_DONT_REPARSE = 0x1000;
+let FILE_FLAG_BACKUP_SEMANTICS = 0x02000000; let FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+let OPEN_EXISTING = 3; let FILE_ATTRIBUTE_TAG_INFO = 9;
+let FILE_ID_BOTH_DIRECTORY_INFO = 10; let FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11;
+let FILE_RENAME_INFO = 3; let FILE_DISPOSITION_INFO = 4;
+let FILE_BEGIN = 0;
+let ERROR_NO_MORE_FILES = 18; let LOCKFILE_FAIL_IMMEDIATELY = 1; let LOCKFILE_EXCLUSIVE_LOCK = 2;
+let STATUS_OBJECT_NAME_NOT_FOUND = -1073741772; let STATUS_OBJECT_PATH_NOT_FOUND = -1073741766;
+let STATUS_OBJECT_NAME_COLLISION = -1073741771;
+
+fn _error(message, code = nil) {
+    let out = map{ ok: false, error: message, backend: "windows-nt-dirfs" };
+    if code != nil { out.os_error = code; } return out;
+}
+fn _integer(value, minimum, maximum) {
+    return is_number(value) and value == num_floor(value) and value >= minimum and value <= maximum;
+}
+fn _i32(value) {
+    let normalized = num_mod(value, 4294967296);
+    if normalized >= 2147483648 { return normalized - 4294967296; }
+    return normalized;
+}
+fn _bridge_path() {
+    let explicit = try env_get("PBLANG_WINDOWS_ABI_BRIDGE") catch nil;
+    if type(explicit) == "string" and explicit != "" { return explicit; }
+    let stdlib = try env_get("PBLANG_STDLIB_DIR") catch nil;
+    if type(stdlib) == "string" and stdlib != "" {
+        let separator = if str_ends_with(stdlib, "\\") or str_ends_with(stdlib, "/") { "" } else { "\\" };
+        return str(stdlib) + separator + "native\\" + "pblang-win64-abi.dll";
+    }
+    return nil;
+}
+
+fn profile() {
+    return map{ format: "pblang.windows-dirfs.profile.v1", platform: "windows", architecture: "x86_64",
+        bridge_sha256: ABI.expected_sha256(), root_api: "CreateFileW",
+        relative_api: "NtCreateFile", object_attributes: OBJ_CASE_INSENSITIVE + OBJ_DONT_REPARSE,
+        open_options: FILE_OPEN_REPARSE_POINT, max_path: MAX_PATH, max_bytes: MAX_BYTES };
+}
+fn available() {
+    let path = _bridge_path(); let host = try platform() catch "unknown";
+    return map{ ok: host == "windows" and path != nil and (try fs_exists(path) catch false),
+        format: "pblang.windows-dirfs.available.v1", platform: host,
+        backend: "windows-nt-dirfs", bridge_path: path, bridge_sha256: ABI.expected_sha256(),
+        root_handle: true, obj_dont_reparse: true, pathname_fallback: false };
+}
+
+fn _pad11(arguments) {
+    if type(arguments) != "array" or len(arguments) > 11 { return nil; }
+    let out = []; let i = 0; while i < len(arguments) { array_push(out, arguments[i]); i = i + 1; }
+    while len(out) < 11 { array_push(out, 0); } return out;
+}
+fn _call(fs, symbol, arguments) {
+    if not map_has(fs.api, symbol) or fs.api[symbol] <= 0 { return map{ ok: false, error: "missing API " + symbol }; }
+    let padded = _pad11(arguments); if padded == nil { return map{ ok: false, error: "too many Win64 arguments" }; }
+    return ABI.call_u64x11(fs.abi, fs.api[symbol], padded);
+}
+fn _value(fs, symbol, arguments, fallback) {
+    let result = _call(fs, symbol, arguments); return if result.ok { result.value } else { fallback };
+}
+fn _last_error(fs) { return _i32(_value(fs, "GetLastError", [], -1)); }
+fn _close_handle(fs, handle) {
+    if handle != 0 and handle != INVALID_HANDLE { return _value(fs, "CloseHandle", [handle], 0) != 0; }
+    return true;
+}
+
+fn _components(path, allow_root = true) {
+    if type(path) != "string" or len(path) > MAX_PATH or str_contains(path, strfromcharcode(0))
+        or str_starts_with(path, "\\") or str_starts_with(path, "/") or str_contains(path, ":") { return nil; }
+    if path == "" or path == "." or path == "root" { return if allow_root { [] } else { nil }; }
+    let raw = str_split(str_replace_all(path, "\\", "/"), "/"); let out = [];
+    let i = 0; while i < len(raw) {
+        if raw[i] == "" or raw[i] == "." or raw[i] == ".." or len(raw[i]) > MAX_COMPONENT
+            or str_ends_with(raw[i], ".") or str_ends_with(raw[i], " ") { return nil; }
+        array_push(out, raw[i]); i = i + 1;
+    }
+    return out;
+}
+fn _join(parts, separator) {
+    let out = ""; let i = 0;
+    while i < len(parts) { if i > 0 { out = out + separator; } out = out + str(parts[i]); i = i + 1; }
+    return out;
+}
+fn _relative(path, allow_root = true) {
+    let parts = _components(path, allow_root); if parts == nil { return nil; }
+    return _join(parts, "\\");
+}
+
+fn _wide(fs, text) {
+    if type(text) != "string" or str_contains(text, strfromcharcode(0)) { return _error("invalid UTF-8 path"); }
+    let bytes = str_to_bytes(text); let source = ABI.allocate(fs.abi, len(bytes) + 1);
+    if source == 0 { return _error("UTF-8 path allocation failed"); }
+    if ABI.copy_cstr(fs.abi, source, 0, text, len(bytes) + 1) != len(bytes) {
+        ABI.free(fs.abi, source); return _error("UTF-8 path copy failed");
+    }
+    let capacity = len(bytes) + 1; let wide = ABI.allocate(fs.abi, capacity * 2);
+    if wide == 0 { ABI.free(fs.abi, source); return _error("UTF-16 path allocation failed"); }
+    let converted = _value(fs, "MultiByteToWideChar", [65001, 8, source, -1, wide, capacity], 0);
+    ABI.free(fs.abi, source);
+    if converted < 1 or converted > capacity {
+        ABI.free(fs.abi, wide); return _error("path is not valid UTF-8 or exceeds UTF-16 bounds");
+    }
+    return map{ ok: true, pointer: wide, units: converted - 1, bytes: (converted - 1) * 2,
+        capacity_bytes: converted * 2 };
+}
+fn _free_wide(fs, wide) { if wide != nil and (try wide.pointer catch 0) > 0 { ABI.free(fs.abi, wide.pointer); } }
+
+fn _symbols(abi, kernel_module, ntdll_module) {
+    let api = map{};
+    let kernel = ["CloseHandle", "CreateFileW", "FlushFileBuffers", "GetFileInformationByHandleEx",
+        "GetFileSizeEx", "GetLastError", "LockFileEx", "MultiByteToWideChar", "ReadFile",
+        "SetFileInformationByHandle", "SetFilePointerEx", "UnlockFileEx", "WriteFile"];
+    let i = 0; while i < len(kernel) { api[kernel[i]] = ABI.symbol(abi, kernel_module, kernel[i]); i = i + 1; }
+    api.NtCreateFile = ABI.symbol(abi, ntdll_module, "NtCreateFile"); return api;
+}
+fn _all_symbols(api) { let keys = map_keys(api); let i = 0; while i < len(keys) { if api[keys[i]] <= 0 { return false; } i = i + 1; } return true; }
+
+fn open(root = ".", create = false) {
+    if create { return _error("Windows secure roots must exist before they are trusted"); }
+    if type(root) != "string" or root == "" or len(root) > MAX_PATH or str_contains(root, strfromcharcode(0)) {
+        return _error("invalid Windows root path");
+    }
+    let bridge = _bridge_path(); if bridge == nil { return _error("packaged Win64 ABI bridge is not configured"); }
+    let abi = ABI.load_packaged(bridge); if not abi.ok { return _error(abi.error); }
+    let kernel_module = ABI.load_system_library(abi, "kernel32.dll");
+    let ntdll_module = ABI.load_system_library(abi, "ntdll.dll");
+    if kernel_module == 0 or ntdll_module == 0 { ABI.close(abi); return _error("Windows system modules cannot be held"); }
+    let fs = map{ ok: true, format: "pblang.windows-dirfs.v1", abi: abi, api: map{}, root_handle: 0,
+        root: root, closed: false, lock_handles: map{} };
+    fs.api = _symbols(abi, kernel_module, ntdll_module);
+    if not _all_symbols(fs.api) { ABI.close(abi); return _error("required Windows filesystem API is unavailable"); }
+    let wide = _wide(fs, root); if not wide.ok { ABI.close(abi); return wide; }
+    let access = SYNCHRONIZE + FILE_LIST_DIRECTORY + FILE_TRAVERSE + FILE_READ_ATTRIBUTES;
+    let handle = _value(fs, "CreateFileW", [wide.pointer, access, SHARE_ALL, 0, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS + FILE_FLAG_OPEN_REPARSE_POINT, 0], INVALID_HANDLE);
+    _free_wide(fs, wide);
+    if handle == INVALID_HANDLE or handle == 0 { let code = _last_error(fs); ABI.close(abi); return _error("Windows root directory cannot be held", code); }
+    fs.root_handle = handle;
+    let tag = _tag_info(fs, handle);
+    if not tag.ok or num_mod(num_floor(tag.attributes / FILE_ATTRIBUTE_REPARSE_POINT), 2) == 1 {
+        _close_handle(fs, handle); ABI.close(abi); return _error("Windows root must be a non-reparse directory");
+    }
+    return fs;
+}
+
+fn _tag_info(fs, handle) {
+    let info = ABI.allocate(fs.abi, 8); if info == 0 { return _error("attribute buffer allocation failed"); }
+    let ok = _value(fs, "GetFileInformationByHandleEx", [handle, FILE_ATTRIBUTE_TAG_INFO, info, 8], 0);
+    let attributes = if ok != 0 { ABI.read_uint(fs.abi, info, 0, 4) } else { nil };
+    let tag = if ok != 0 { ABI.read_uint(fs.abi, info, 4, 4) } else { nil }; ABI.free(fs.abi, info);
+    if ok == 0 or attributes == nil or tag == nil { return _error("file attributes cannot be read", _last_error(fs)); }
+    return map{ ok: true, attributes: attributes, reparse_tag: tag };
+}
+
+fn _open_relative(fs, path, access, disposition, options) {
+    if fs == nil or type(fs) != "map" or (try fs.closed catch true) { return _error("directory root is closed"); }
+    let relative = _relative(path, false); if relative == nil or relative == "" { return _error("invalid relative Windows path"); }
+    let wide = _wide(fs, relative); if not wide.ok { return wide; }
+    let unicode = ABI.allocate(fs.abi, 16); let object = ABI.allocate(fs.abi, 48);
+    let iosb = ABI.allocate(fs.abi, 16); let output = ABI.allocate(fs.abi, 8);
+    if unicode == 0 or object == 0 or iosb == 0 or output == 0 {
+        if unicode > 0 { ABI.free(fs.abi, unicode); } if object > 0 { ABI.free(fs.abi, object); }
+        if iosb > 0 { ABI.free(fs.abi, iosb); } if output > 0 { ABI.free(fs.abi, output); }
+        _free_wide(fs, wide); return _error("NtCreateFile structure allocation failed");
+    }
+    let prepared = ABI.write_uint(fs.abi, unicode, 0, wide.bytes, 2)
+        and ABI.write_uint(fs.abi, unicode, 2, wide.capacity_bytes, 2)
+        and ABI.write_uint(fs.abi, unicode, 8, wide.pointer, 8)
+        and ABI.write_uint(fs.abi, object, 0, 48, 4)
+        and ABI.write_uint(fs.abi, object, 8, fs.root_handle, 8)
+        and ABI.write_uint(fs.abi, object, 16, unicode, 8)
+        and ABI.write_uint(fs.abi, object, 24, OBJ_CASE_INSENSITIVE + OBJ_DONT_REPARSE, 4);
+    let result = map{ ok: false, error: "NtCreateFile structure initialization failed" };
+    if prepared {
+        let called = _call(fs, "NtCreateFile", [output, access, object, iosb, 0, FILE_ATTRIBUTE_NORMAL,
+            SHARE_ALL, disposition, options + FILE_OPEN_REPARSE_POINT, 0, 0]);
+        let status = -1; if called.ok { status = _i32(called.value); }
+        let handle = if status >= 0 { ABI.read_uint(fs.abi, output, 0, 8) } else { nil };
+        if status >= 0 and handle != nil and handle != 0 and handle != INVALID_HANDLE {
+            result = map{ ok: true, handle: handle, path: path, ntstatus: status,
+                root_relative: true, obj_dont_reparse: true, nofollow: true };
+        } else {
+            result = _error("relative path cannot be opened without reparse traversal", status);
+            result.missing = status == STATUS_OBJECT_NAME_NOT_FOUND or status == STATUS_OBJECT_PATH_NOT_FOUND;
+            result.exists = status == STATUS_OBJECT_NAME_COLLISION;
+        }
+    }
+    ABI.free(fs.abi, output); ABI.free(fs.abi, iosb); ABI.free(fs.abi, object);
+    ABI.free(fs.abi, unicode); _free_wide(fs, wide); return result;
+}
+
+fn _size_handle(fs, handle) {
+    let output = ABI.allocate(fs.abi, 8); if output == 0 { return _error("size buffer allocation failed"); }
+    let ok = _value(fs, "GetFileSizeEx", [handle, output], 0);
+    let size = if ok != 0 { ABI.read_uint(fs.abi, output, 0, 8) } else { nil }; ABI.free(fs.abi, output);
+    if ok == 0 or size == nil or size < 0 or size > 9007199254740991 { return _error("file size cannot be represented safely", _last_error(fs)); }
+    return map{ ok: true, size: size };
+}
+fn _read_handle(fs, handle, maximum, prefix) {
+    if not _integer(maximum, 0, MAX_BYTES) { return _error("invalid bounded read size"); }
+    let before = _size_handle(fs, handle); if not before.ok { return before; }
+    if not prefix and before.size > maximum { return _error("file exceeds byte limit"); }
+    let requested = maximum;
+    if requested < MAX_BYTES { requested = requested + 1; }
+    let buffer = ABI.allocate(fs.abi, if requested < 1 { 1 } else { requested });
+    let count = ABI.allocate(fs.abi, 4);
+    if buffer == 0 or count == 0 {
+        if buffer > 0 { ABI.free(fs.abi, buffer); } if count > 0 { ABI.free(fs.abi, count); }
+        return _error("bounded read allocation failed");
+    }
+    let ok = _value(fs, "ReadFile", [handle, buffer, requested, count, 0], 0);
+    let got = if ok != 0 { ABI.read_uint(fs.abi, count, 0, 4) } else { nil };
+    let bytes = nil;
+    if got != nil { let retained = got; if retained > maximum { retained = maximum; } bytes = ABI.read_bytes(fs.abi, buffer, 0, retained); }
+    ABI.free(fs.abi, count); ABI.free(fs.abi, buffer);
+    if ok == 0 or got == nil or bytes == nil { return _error("bounded handle read failed", _last_error(fs)); }
+    if not prefix and got > maximum { return _error("file changed beyond byte limit during read"); }
+    return map{ ok: true, bytes: bytes, source_size: before.size, size: if prefix { before.size } else { len(bytes) },
+        returned_bytes: len(bytes), truncated: prefix and (got > maximum or before.size > maximum),
+        descriptor_bound: true, race_resistant: true };
+}
+fn read_prefix_bytes(fs, path, max_bytes = 4194304) {
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_READ_DATA + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let result = _read_handle(fs, opened.handle, max_bytes, true); _close_handle(fs, opened.handle);
+    if result.ok { result.path = path; } return result;
+}
+fn read_range_bytes(fs, path, offset, max_bytes = 65536) {
+    if not _integer(offset, 0, 9007199254740991) { return _error("invalid bounded range offset"); }
+    if not _integer(max_bytes, 0, MAX_BYTES) { return _error("invalid bounded range limit"); }
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_READ_DATA + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let source = _size_handle(fs, opened.handle);
+    if not source.ok { _close_handle(fs, opened.handle); return source; }
+    let start = offset; if start > source.size { start = source.size; }
+    if _value(fs, "SetFilePointerEx", [opened.handle, start, 0, FILE_BEGIN], 0) == 0 {
+        let code = _last_error(fs); _close_handle(fs, opened.handle);
+        return _error("regular file range cannot be selected", code);
+    }
+    let available = source.size - start; let ceiling = available;
+    if ceiling > max_bytes { ceiling = max_bytes; }
+    let buffer = ABI.allocate(fs.abi, if ceiling < 1 { 1 } else { ceiling });
+    let count = ABI.allocate(fs.abi, 4);
+    if buffer == 0 or count == 0 {
+        if buffer > 0 { ABI.free(fs.abi, buffer); } if count > 0 { ABI.free(fs.abi, count); }
+        _close_handle(fs, opened.handle); return _error("bounded range allocation failed");
+    }
+    let ok = _value(fs, "ReadFile", [opened.handle, buffer, ceiling, count, 0], 0);
+    let code = if ok == 0 { _last_error(fs) } else { 0 };
+    let got = if ok != 0 { ABI.read_uint(fs.abi, count, 0, 4) } else { nil };
+    let bytes = if got != nil and got <= ceiling { ABI.read_bytes(fs.abi, buffer, 0, got) } else { nil };
+    ABI.free(fs.abi, count); ABI.free(fs.abi, buffer); _close_handle(fs, opened.handle);
+    if ok == 0 or got == nil or bytes == nil { return _error("bounded range read failed", code); }
+    return map{ ok: true, path: path, bytes: bytes, size: len(bytes), source_size: source.size,
+        requested_offset: offset, offset: start, available_bytes: available,
+        truncated: available > len(bytes), offset_past_end: offset > source.size,
+        descriptor_bound: true, race_resistant: true };
+}
+fn read_bytes(fs, path, max_bytes = 4194304) {
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_READ_DATA + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let result = _read_handle(fs, opened.handle, max_bytes, false); _close_handle(fs, opened.handle);
+    if result.ok { result.path = path; result.size = len(result.bytes); } return result;
+}
+fn file_size(fs, path) {
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let size = _size_handle(fs, opened.handle); _close_handle(fs, opened.handle);
+    if not size.ok { return size; }
+    return map{ ok: true, path: path, kind: "file", size: size.size,
+        descriptor_bound: true, race_resistant: true };
+}
+
+fn _directory_handle(fs, path, create) {
+    if path == "" or path == "." or path == "root" {
+        return map{ ok: true, handle: fs.root_handle, owned: false, path: path };
+    }
+    let disposition = if create { FILE_OPEN_IF } else { FILE_OPEN };
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_LIST_DIRECTORY + FILE_TRAVERSE + FILE_READ_ATTRIBUTES,
+        disposition, FILE_SYNCHRONOUS_IO_NONALERT + FILE_DIRECTORY_FILE);
+    if opened.ok { opened.owned = true; } return opened;
+}
+fn mkdir(fs, path) {
+    let opened = _directory_handle(fs, path, true); if not opened.ok { return opened; }
+    if opened.owned { _close_handle(fs, opened.handle); }
+    return map{ ok: true, path: path, descriptor_bound: true, nofollow: true };
+}
+
+fn _decode_utf16(fs, pointer, byte_length) {
+    if num_mod(byte_length, 2) != 0 or byte_length < 0 or byte_length > MAX_COMPONENT * 4 { return nil; }
+    let text = ""; let offset = 0;
+    while offset < byte_length {
+        let first = ABI.read_uint(fs.abi, pointer, offset, 2); if first == nil { return nil; }
+        let scalar = first;
+        if first >= 0xD800 and first <= 0xDBFF {
+            if offset + 3 >= byte_length { return nil; }
+            let second = ABI.read_uint(fs.abi, pointer, offset + 2, 2);
+            if second == nil or second < 0xDC00 or second > 0xDFFF { return nil; }
+            scalar = 0x10000 + (first - 0xD800) * 1024 + (second - 0xDC00); offset = offset + 2;
+        } elif first >= 0xDC00 and first <= 0xDFFF { return nil; }
+        text = text + strfromcharcode(scalar); offset = offset + 2;
+    }
+    return text;
+}
+fn list(fs, path = "root", max_entries = 1024) {
+    if not _integer(max_entries, 0, MAX_LIST_ENTRIES) { return _error("invalid directory entry limit"); }
+    let opened = _directory_handle(fs, path, false); if not opened.ok { return opened; }
+    let buffer = ABI.allocate(fs.abi, DIRECTORY_BUFFER_BYTES);
+    if buffer == 0 { if opened.owned { _close_handle(fs, opened.handle); } return _error("directory buffer allocation failed"); }
+    let entries = []; let restart = true; let done = false; let failed = nil;
+    while not done and len(entries) < max_entries {
+        let info_class = if restart { FILE_ID_BOTH_DIRECTORY_RESTART_INFO } else { FILE_ID_BOTH_DIRECTORY_INFO };
+        restart = false;
+        let ok = _value(fs, "GetFileInformationByHandleEx", [opened.handle, info_class, buffer, DIRECTORY_BUFFER_BYTES], 0);
+        if ok == 0 {
+            let code = _last_error(fs); if code != ERROR_NO_MORE_FILES { failed = _error("directory enumeration failed", code); }
+            done = true;
+        } else {
+            let cursor = 0; let records = 0;
+            while not done and cursor + 104 <= DIRECTORY_BUFFER_BYTES and len(entries) < max_entries {
+                let next = ABI.read_uint(fs.abi, buffer, cursor, 4);
+                let name_bytes = ABI.read_uint(fs.abi, buffer, cursor + 60, 4);
+                if next == nil or name_bytes == nil or num_mod(name_bytes, 2) != 0
+                    or name_bytes > MAX_COMPONENT * 4 or cursor + 104 + name_bytes > DIRECTORY_BUFFER_BYTES {
+                    failed = _error("invalid Windows directory information record"); done = true;
+                } else {
+                    let name = _decode_utf16(fs, buffer + cursor + 104, name_bytes);
+                    if name == nil { failed = _error("invalid UTF-16 directory name"); done = true; }
+                    elif name != "." and name != ".." { array_push(entries, name); }
+                    records = records + 1;
+                    if next == 0 { done = true; }
+                    elif next < 104 or cursor + next <= cursor or cursor + next >= DIRECTORY_BUFFER_BYTES {
+                        failed = _error("invalid Windows directory continuation offset"); done = true;
+                    } else { cursor = cursor + next; }
+                }
+            }
+            // A zero continuation ends this buffer. A subsequent call advances
+            // the kernel enumeration; keep going unless the caller bound is hit.
+            if failed == nil and records > 0 and len(entries) < max_entries { done = false; }
+        }
+    }
+    ABI.free(fs.abi, buffer); if opened.owned { _close_handle(fs, opened.handle); }
+    if failed != nil { return failed; }
+    return map{ ok: true, path: path, entries: entries, truncated: len(entries) >= max_entries,
+        descriptor_bound: true, race_resistant: true };
+}
+
+fn metadata(fs, path) {
+    let directory = _directory_handle(fs, path, false);
+    if directory.ok {
+        let tag = _tag_info(fs, directory.handle); if directory.owned { _close_handle(fs, directory.handle); }
+        if not tag.ok { return tag; }
+        return map{ ok: true, path: path, kind: "directory", size: 0, attributes: tag.attributes,
+            reparse_tag: tag.reparse_tag, descriptor_bound: true, race_resistant: true };
+    }
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let size = _size_handle(fs, opened.handle); let tag = _tag_info(fs, opened.handle); _close_handle(fs, opened.handle);
+    if not size.ok { return size; } if not tag.ok { return tag; }
+    return map{ ok: true, path: path, kind: "file", size: size.size, attributes: tag.attributes,
+        reparse_tag: tag.reparse_tag, descriptor_bound: true, race_resistant: true };
+}
+
+fn _write_handle(fs, handle, bytes) {
+    if type(bytes) != "array" or len(bytes) > MAX_BYTES { return _error("bytes must be a bounded array"); }
+    let buffer = ABI.allocate(fs.abi, if len(bytes) < 1 { 1 } else { len(bytes) });
+    let count = ABI.allocate(fs.abi, 4);
+    if buffer == 0 or count == 0 or not ABI.write_bytes(fs.abi, buffer, 0, bytes) {
+        if buffer > 0 { ABI.free(fs.abi, buffer); } if count > 0 { ABI.free(fs.abi, count); }
+        return _error("bounded write buffer preparation failed");
+    }
+    let ok = _value(fs, "WriteFile", [handle, buffer, len(bytes), count, 0], 0);
+    let wrote = if ok != 0 { ABI.read_uint(fs.abi, count, 0, 4) } else { nil };
+    ABI.free(fs.abi, count); ABI.free(fs.abi, buffer);
+    if ok == 0 or wrote != len(bytes) { return _error("complete handle write failed", _last_error(fs)); }
+    if _value(fs, "FlushFileBuffers", [handle], 0) == 0 { return _error("file flush failed", _last_error(fs)); }
+    return map{ ok: true, size: wrote };
+}
+fn _delete_handle(fs, handle) {
+    let info = ABI.allocate(fs.abi, 1); if info == 0 { return false; }
+    let prepared = ABI.write_uint(fs.abi, info, 0, 1, 1);
+    let ok = prepared and _value(fs, "SetFileInformationByHandle", [handle, FILE_DISPOSITION_INFO, info, 1], 0) != 0;
+    ABI.free(fs.abi, info); return ok;
+}
+fn _rename_handle(fs, handle, destination, replace) {
+    let relative = _relative(destination, false); if relative == nil { return false; }
+    let wide = _wide(fs, relative); if not wide.ok { return false; }
+    let size = 20 + wide.bytes; let info = ABI.allocate(fs.abi, size);
+    if info == 0 { _free_wide(fs, wide); return false; }
+    let bytes = ABI.read_bytes(fs.abi, wide.pointer, 0, wide.bytes);
+    let prepared = bytes != nil and ABI.write_uint(fs.abi, info, 0, if replace { 1 } else { 0 }, 4)
+        and ABI.write_uint(fs.abi, info, 8, fs.root_handle, 8)
+        and ABI.write_uint(fs.abi, info, 16, wide.bytes, 4)
+        and ABI.write_bytes(fs.abi, info, 20, bytes);
+    let ok = prepared and _value(fs, "SetFileInformationByHandle", [handle, FILE_RENAME_INFO, info, size], 0) != 0;
+    ABI.free(fs.abi, info); _free_wide(fs, wide); return ok;
+}
+fn _parent_stage(path) {
+    let parts = _components(path, false); if parts == nil or len(parts) < 1 { return nil; }
+    let parent = []; let i = 0; while i + 1 < len(parts) { array_push(parent, parts[i]); i = i + 1; }
+    let stage = ".pblang-win-stage-" + str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32);
+    if len(parent) == 0 { return stage; } return _join(parent, "\\") + "\\" + stage;
+}
+fn write_new_exclusive(fs, path, bytes, create_parents = true) {
+    if create_parents {
+        let parts = _components(path, false); if parts == nil { return _error("invalid write path"); }
+        let current = []; let i = 0; while i + 1 < len(parts) {
+            array_push(current, parts[i]); let made = mkdir(fs, _join(current, "\\"));
+            if not made.ok { return made; } i = i + 1;
+        }
+    }
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_WRITE_DATA + FILE_READ_ATTRIBUTES,
+        FILE_CREATE, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return _error("destination exists or cannot be created exclusively", try opened.os_error catch nil); }
+    let result = _write_handle(fs, opened.handle, bytes);
+    if not result.ok { _delete_handle(fs, opened.handle); }
+    _close_handle(fs, opened.handle); if not result.ok { return result; }
+    return map{ ok: true, path: path, size: result.size, no_replace: true,
+        atomic_namespace_admission: true, atomic_visibility: false,
+        descriptor_bound_parent: true, nofollow: true };
+}
+fn write_atomic(fs, path, bytes, create_parents = true) {
+    if type(bytes) != "array" or len(bytes) > MAX_BYTES { return _error("bytes must be a bounded array"); }
+    if create_parents {
+        let parts = _components(path, false); if parts == nil { return _error("invalid write path"); }
+        let current = []; let i = 0; while i + 1 < len(parts) {
+            array_push(current, parts[i]); let made = mkdir(fs, _join(current, "\\"));
+            if not made.ok { return made; } i = i + 1;
+        }
+    }
+    let stage = _parent_stage(path); if stage == nil { return _error("invalid atomic write path"); }
+    let opened = _open_relative(fs, stage, SYNCHRONIZE + FILE_WRITE_DATA + FILE_READ_ATTRIBUTES + DELETE_ACCESS,
+        FILE_CREATE, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return _error("exclusive staging file cannot be created"); }
+    let wrote = _write_handle(fs, opened.handle, bytes);
+    let published = wrote.ok and _rename_handle(fs, opened.handle, path, true);
+    if not published { _delete_handle(fs, opened.handle); }
+    _close_handle(fs, opened.handle);
+    if not wrote.ok { return wrote; } if not published { return _error("staged file cannot be published atomically", _last_error(fs)); }
+    return map{ ok: true, path: path, size: len(bytes), atomic: true,
+        descriptor_bound_parent: true, nofollow: true };
+}
+fn remove_file(fs, path) {
+    let opened = _open_relative(fs, path, SYNCHRONIZE + DELETE_ACCESS + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let removed = _delete_handle(fs, opened.handle); let code = if removed { 0 } else { _last_error(fs) };
+    _close_handle(fs, opened.handle);
+    if not removed { return _error("file entry cannot be removed", code); }
+    return map{ ok: true, path: path, directory_removal: false,
+        descriptor_bound_parent: true, symlink_target_followed: false };
+}
+
+fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10) {
+    if not _integer(timeout_ms, 0, 300000) or not _integer(poll_ms, 1, 2000) { return _error("invalid lock deadline"); }
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_READ_DATA + FILE_WRITE_DATA,
+        FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let overlapped = ABI.allocate(fs.abi, 32); if overlapped == 0 { _close_handle(fs, opened.handle); return _error("lock state allocation failed"); }
+    let started = now_ms(); let locked = false; let code = 0;
+    while not locked and now_ms() - started <= timeout_ms {
+        locked = _value(fs, "LockFileEx", [opened.handle, LOCKFILE_EXCLUSIVE_LOCK + LOCKFILE_FAIL_IMMEDIATELY,
+            0, 0xFFFFFFFF, 0xFFFFFFFF, overlapped], 0) != 0;
+        if not locked { code = _last_error(fs); if now_ms() - started <= timeout_ms { let wait = channel(); recv_timeout(wait.receiver, poll_ms); } }
+    }
+    if not locked { ABI.free(fs.abi, overlapped); _close_handle(fs, opened.handle); return _error("descriptor lock deadline expired", code); }
+    let token = "winlock-" + str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32);
+    fs.lock_handles[token] = map{ handle: opened.handle, overlapped: overlapped, path: path };
+    return map{ ok: true, format: "pblang.windows-dirfs.lock.v1", token: token, path: path,
+        descriptor_lock: true, elapsed_ms: now_ms() - started };
+}
+fn release_lock(fs, lock) {
+    let token = try lock.token catch ""; if token == "" or not map_has(fs.lock_handles, token) { return false; }
+    let held = fs.lock_handles[token];
+    let unlocked = _value(fs, "UnlockFileEx", [held.handle, 0, 0xFFFFFFFF, 0xFFFFFFFF, held.overlapped], 0) != 0;
+    _close_handle(fs, held.handle); ABI.free(fs.abi, held.overlapped); map_remove(fs.lock_handles, token); return unlocked;
+}
+fn close(fs) {
+    if fs == nil or type(fs) != "map" or (try fs.closed catch true) { return false; }
+    let tokens = map_keys(fs.lock_handles); let i = 0;
+    while i < len(tokens) { release_lock(fs, map{ token: tokens[i] }); i = i + 1; }
+    _close_handle(fs, fs.root_handle); fs.root_handle = 0; fs.closed = true; ABI.close(fs.abi); return true;
+}
+fn status(fs = nil) {
+    let host = available();
+    return map{ format: "pblang.windows-dirfs.status.v1", platform: try platform() catch "unknown",
+        available: host.ok and (fs == nil or not (try fs.closed catch true)),
+        root_handle: true, root_relative_ntcreatefile: true, obj_dont_reparse: true,
+        component_nofollow: true, bounded_snapshot_reads: true, bounded_range_snapshot_reads: true,
+        descriptor_advisory_locks: true,
+        atomic_handle_relative_rename: true, exclusive_no_replace_create: true,
+        pathname_fallback: false, generated_pblang_abi_bridge: true,
+        bridge_sha256: ABI.expected_sha256(), physical_windows_verified: false };
+}
+
+export profile, available, open, close, list, read_bytes, read_prefix_bytes, read_range_bytes;
+export file_size, metadata, mkdir, write_atomic, write_new_exclusive, remove_file;
+export acquire_lock, release_lock, status;

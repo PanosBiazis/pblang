@@ -1,0 +1,325 @@
+// Bounded MQTT 3.1.1 codec and native IPv4 client implemented in PBLang.
+// Transport policy and DNS pinning belong to the calling product boundary.
+
+let TCP = import("stdlib:native_tcp.sapp");
+
+let FORMAT = "pblang.mqtt311.v1";
+let MAX_PACKET_BYTES = 262144;
+let MAX_PAYLOAD_BYTES = 65536;
+let MAX_MESSAGES = 64;
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _append(target, values) {
+    for i len(values) { array_push(target, values[i]); }
+    return target;
+}
+
+fn _contains(values, value) {
+    for i len(values) { if values[i] == value { return true; } }
+    return false;
+}
+
+fn _slice(values, start, finish) {
+    let out = [];
+    let at = start;
+    while at < finish { array_push(out, values[at]); at = at + 1; }
+    return out;
+}
+
+fn _u16(value) {
+    if not _integer(value, 0, 65535) { throw "MQTT u16 value is invalid"; }
+    return [num_floor(value / 256), num_mod(value, 256)];
+}
+
+fn _read_u16(bytes, offset) {
+    if type(bytes) != "array" or offset < 0 or offset + 2 > len(bytes) {
+        throw "MQTT u16 field is truncated";
+    }
+    return bytes[offset] * 256 + bytes[offset + 1];
+}
+
+fn _valid_utf8(value, maximum, allow_empty = false) {
+    if type(value) != "string" or (not allow_empty and value == "") { return false; }
+    let bytes = try str_to_bytes(value) catch nil;
+    if type(bytes) != "array" or len(bytes) > maximum { return false; }
+    for i len(bytes) { if bytes[i] == 0 { return false; } }
+    return true;
+}
+
+fn valid_topic_name(value) {
+    if not _valid_utf8(value, 65535) { return false; }
+    return not str_contains(value, "+") and not str_contains(value, "#");
+}
+
+fn valid_topic_filter(value) {
+    if not _valid_utf8(value, 65535) { return false; }
+    let levels = str_split(value, "/");
+    for i len(levels) {
+        let level = levels[i];
+        if str_contains(level, "#") and (level != "#" or i != len(levels) - 1) {
+            return false;
+        }
+        if str_contains(level, "+") and level != "+" { return false; }
+    }
+    return true;
+}
+
+fn encode_remaining_length(value) {
+    if not _integer(value, 0, 268435455) { throw "MQTT remaining length is invalid"; }
+    let out = []; let remaining = value;
+    while true {
+        let byte = num_mod(remaining, 128); remaining = num_floor(remaining / 128);
+        if remaining > 0 { byte = byte + 128; }
+        array_push(out, byte);
+        if remaining == 0 { break; }
+    }
+    return out;
+}
+
+fn decode_remaining_length(bytes, offset = 0) {
+    if type(bytes) != "array" or not _integer(offset, 0, len(bytes)) {
+        return map{ ok: false, error: "invalid MQTT remaining-length input" };
+    }
+    let value = 0; let multiplier = 1; let count = 0;
+    while count < 4 {
+        if offset + count >= len(bytes) {
+            return map{ ok: false, error: "truncated MQTT remaining length" };
+        }
+        let byte = bytes[offset + count];
+        if not _integer(byte, 0, 255) {
+            return map{ ok: false, error: "invalid MQTT remaining-length byte" };
+        }
+        value = value + bit_and(byte, 127) * multiplier; count = count + 1;
+        if bit_and(byte, 128) == 0 {
+            if count > 1 and value < num_pow(128, count - 1) {
+                return map{ ok: false, error: "non-canonical MQTT remaining length" };
+            }
+            return map{ ok: true, value: value, bytes_used: count };
+        }
+        multiplier = multiplier * 128;
+    }
+    return map{ ok: false, error: "MQTT remaining length exceeds four bytes" };
+}
+
+fn _utf8_field(value) {
+    if not _valid_utf8(value, 65535, true) { throw "invalid MQTT UTF-8 field"; }
+    let bytes = str_to_bytes(value); let out = _u16(len(bytes));
+    return _append(out, bytes);
+}
+
+fn _packet(header, body) {
+    if type(body) != "array" or len(body) > MAX_PACKET_BYTES {
+        throw "MQTT packet exceeds configured bound";
+    }
+    let out = [header]; _append(out, encode_remaining_length(len(body)));
+    _append(out, body); return out;
+}
+
+fn connect_packet(client_id, keep_alive_secs = 30) {
+    if not _valid_utf8(client_id, 23) or not _integer(keep_alive_secs, 0, 65535) {
+        throw "invalid MQTT client identity or keep-alive";
+    }
+    let body = [0,4,77,81,84,84,4,2];
+    _append(body, _u16(keep_alive_secs)); _append(body, _utf8_field(client_id));
+    return _packet(16, body);
+}
+
+fn publish_packet(topic, payload, qos = 0, packet_id = 1, retain = false) {
+    if not valid_topic_name(topic) or type(payload) != "array" or len(payload) > MAX_PAYLOAD_BYTES {
+        throw "invalid MQTT publish topic or payload";
+    }
+    for i len(payload) { if not _integer(payload[i], 0, 255) { throw "invalid MQTT payload byte"; } }
+    if not _integer(qos, 0, 2) or (qos > 0 and not _integer(packet_id, 1, 65535))
+        or type(retain) != "bool" { throw "invalid MQTT publish options"; }
+    let body = _utf8_field(topic); if qos > 0 { _append(body, _u16(packet_id)); }
+    _append(body, payload);
+    return _packet(48 + qos * 2 + (if retain { 1 } else { 0 }), body);
+}
+
+fn subscribe_packet(topic_filter, qos = 0, packet_id = 1) {
+    if not valid_topic_filter(topic_filter) or not _integer(qos, 0, 2)
+        or not _integer(packet_id, 1, 65535) { throw "invalid MQTT subscribe options"; }
+    let body = _u16(packet_id); _append(body, _utf8_field(topic_filter));
+    array_push(body, qos); return _packet(130, body);
+}
+
+fn acknowledgement_packet(kind, packet_id) {
+    if not _integer(packet_id, 1, 65535) { throw "invalid MQTT packet identifier"; }
+    let headers = map{ puback:64, pubrec:80, pubrel:98, pubcomp:112 };
+    let header = try headers[str_lower(str(kind))] catch nil;
+    if header == nil { throw "unsupported MQTT acknowledgement packet"; }
+    return _packet(header, _u16(packet_id));
+}
+
+fn read_packet(socket, maximum, timeout_ms) {
+    if not _integer(maximum, 2, MAX_PACKET_BYTES) or not _integer(timeout_ms, 1, 60000) {
+        return map{ ok: false, error: "invalid bounded MQTT packet read" };
+    }
+    let first = TCP.read_exact_bytes(socket, 1, timeout_ms);
+    if not first.ok { return first; }
+    let length_bytes = [];
+    for _i 4 {
+        let next = TCP.read_exact_bytes(socket, 1, timeout_ms);
+        if not next.ok { return next; }
+        array_push(length_bytes, next.bytes[0]);
+        if bit_and(next.bytes[0], 128) == 0 { break; }
+    }
+    let decoded = decode_remaining_length(length_bytes);
+    if not decoded.ok { return decoded; }
+    if decoded.value + 1 + decoded.bytes_used > maximum {
+        return map{ ok: false, error: "MQTT packet exceeds configured receive bound",
+            output_truncated: true };
+    }
+    let body = if decoded.value == 0 { map{ ok: true, bytes: [] } }
+        else { TCP.read_exact_bytes(socket, decoded.value, timeout_ms) };
+    if not body.ok { return body; }
+    return map{ ok: true, format: FORMAT, header: first.bytes[0],
+        packet_type: num_floor(first.bytes[0] / 16), flags: num_mod(first.bytes[0], 16),
+        body: body.bytes, remaining_length: decoded.value,
+        packet_bytes: 1 + decoded.bytes_used + decoded.value };
+}
+
+fn parse_connack(packet) {
+    if type(packet) != "map" or not (try packet.ok catch false)
+        or packet.header != 32 or packet.body != [0,0] {
+        return map{ ok: false, error: "MQTT broker rejected or malformed CONNACK" };
+    }
+    return map{ ok: true, session_present: false, return_code: 0 };
+}
+
+fn parse_publish(packet) {
+    if type(packet) != "map" or not (try packet.ok catch false) or packet.packet_type != 3
+        or len(packet.body) < 2 { return map{ ok: false, error: "invalid MQTT PUBLISH packet" }; }
+    let qos = bit_and(bit_shr(packet.header, 1), 3);
+    if qos == 3 { return map{ ok: false, error: "reserved MQTT publish QoS" }; }
+    let topic_length = try _read_u16(packet.body, 0) catch -1;
+    if topic_length < 1 or 2 + topic_length > len(packet.body) {
+        return map{ ok: false, error: "truncated MQTT publish topic" };
+    }
+    let topic = try bytes_to_str(_slice(packet.body, 2, 2 + topic_length)) catch nil;
+    if type(topic) != "string" or not valid_topic_name(topic) {
+        return map{ ok: false, error: "invalid MQTT publish topic" };
+    }
+    let at = 2 + topic_length; let packet_id = nil;
+    if qos > 0 {
+        if at + 2 > len(packet.body) { return map{ ok: false, error: "missing MQTT packet identifier" }; }
+        packet_id = _read_u16(packet.body, at); at = at + 2;
+        if packet_id == 0 { return map{ ok: false, error: "zero MQTT packet identifier" }; }
+    }
+    let payload = _slice(packet.body, at, len(packet.body));
+    let text = try bytes_to_str(payload) catch nil;
+    return map{ ok: true, format: FORMAT, topic: topic, qos: qos, packet_id: packet_id,
+        duplicate: bit_and(packet.header, 8) != 0, retain: bit_and(packet.header, 1) != 0,
+        payload: payload, payload_base64: base64_encode_bytes(payload),
+        text: text, encoding: if text == nil { "base64" } else { "utf-8" } };
+}
+
+fn _packet_id() {
+    let entropy = random_bytes(2); let value = entropy[0] * 256 + entropy[1];
+    return if value == 0 { 1 } else { value };
+}
+
+fn _client_id() {
+    let entropy = random_bytes(8); let digits = "0123456789abcdef"; let out = "pb-";
+    for i len(entropy) { out = out + str_slice(digits, num_floor(entropy[i] / 16), num_floor(entropy[i] / 16) + 1)
+        + str_slice(digits, num_mod(entropy[i], 16), num_mod(entropy[i], 16) + 1); }
+    return out;
+}
+
+fn _connect(address, port, timeout_ms) {
+    let socket = TCP.connect_ipv4(address, port, timeout_ms);
+    if not socket.ok { return socket; }
+    let wrote = TCP.write_bytes(socket, connect_packet(_client_id()), timeout_ms);
+    if not wrote.ok { TCP.close(socket); return wrote; }
+    let response = read_packet(socket, 16, timeout_ms);
+    let accepted = parse_connack(response);
+    if not accepted.ok { TCP.close(socket); return accepted; }
+    return map{ ok: true, socket: socket };
+}
+
+fn publish_ipv4(address, port, topic, payload, options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return map{ ok: false, error: "MQTT publish options must be an object" }; }
+    let allowed = ["qos","retain","timeout_ms"];
+    for key in map_keys(options) { if not _contains(allowed,key) { return map{ ok: false, error: "unknown MQTT publish option: "+key }; } }
+    let qos = try options.qos catch 0; let retain = try options.retain catch false;
+    let timeout = try options.timeout_ms catch 3000;
+    if not _integer(timeout, 25, 30000) { return map{ ok: false, error: "invalid MQTT publish timeout" }; }
+    let id = _packet_id(); let frame = try publish_packet(topic,payload,qos,id,retain) catch nil;
+    if frame == nil { return map{ ok: false, error: "invalid MQTT publish request" }; }
+    let connected = _connect(address,port,timeout); if not connected.ok { return connected; }
+    let socket = connected.socket; let wrote = TCP.write_bytes(socket,frame,timeout);
+    if not wrote.ok { TCP.close(socket); return wrote; }
+    if qos == 1 {
+        let ack = read_packet(socket,16,timeout);
+        if not ack.ok or ack.header != 64 or ack.body != _u16(id) { TCP.close(socket);
+            return map{ ok:false,error:"invalid MQTT PUBACK" }; }
+    } elif qos == 2 {
+        let received = read_packet(socket,16,timeout);
+        if not received.ok or received.header != 80 or received.body != _u16(id) { TCP.close(socket);
+            return map{ ok:false,error:"invalid MQTT PUBREC" }; }
+        let released = TCP.write_bytes(socket,acknowledgement_packet("pubrel",id),timeout);
+        let complete = if released.ok { read_packet(socket,16,timeout) } else { released };
+        if not complete.ok or (try complete.header catch -1) != 112 or (try complete.body catch []) != _u16(id) {
+            TCP.close(socket); return map{ ok:false,error:"invalid MQTT PUBCOMP" };
+        }
+    }
+    try TCP.write_bytes(socket,[224,0],timeout) catch nil; TCP.close(socket);
+    return map{ ok:true,format:FORMAT,published:true,qos:qos,retain:retain,
+        packet_id:if qos==0{nil}else{id},payload_bytes:len(payload),
+        acknowledged:qos>0,native_nonblocking:true,deadline_bounded:true,shell_used:false };
+}
+
+fn subscribe_ipv4(address, port, topic_filter, options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return map{ ok:false,error:"MQTT subscribe options must be an object" }; }
+    let allowed = ["qos","timeout_ms","max_messages","max_payload_bytes"];
+    for key in map_keys(options) { if not _contains(allowed,key) { return map{ok:false,error:"unknown MQTT subscribe option: "+key}; } }
+    let qos=try options.qos catch 0;let timeout=try options.timeout_ms catch 5000;
+    let maximum=try options.max_messages catch 10;let payload_max=try options.max_payload_bytes catch MAX_PAYLOAD_BYTES;
+    if not _integer(timeout,25,30000) or not _integer(maximum,1,MAX_MESSAGES)
+        or not _integer(payload_max,1,MAX_PAYLOAD_BYTES) {return map{ok:false,error:"invalid MQTT subscribe bounds"};}
+    let id=_packet_id();let frame=try subscribe_packet(topic_filter,qos,id) catch nil;
+    if frame==nil{return map{ok:false,error:"invalid MQTT subscribe request"};}
+    let connected=_connect(address,port,timeout);if not connected.ok{return connected;}
+    let socket=connected.socket;let wrote=TCP.write_bytes(socket,frame,timeout);
+    if not wrote.ok{TCP.close(socket);return wrote;}
+    let suback=read_packet(socket,16,timeout);
+    if not suback.ok or suback.header!=144 or len(suback.body)!=3 or _read_u16(suback.body,0)!=id
+        or suback.body[2]==128 or suback.body[2]>qos {TCP.close(socket);return map{ok:false,error:"invalid MQTT SUBACK"};}
+    let messages=[];let started=now_ms();let timed_out=false;
+    while len(messages)<maximum {
+        let remaining=timeout-num_floor(now_ms()-started);if remaining<1{timed_out=true;break;}
+        let packet=read_packet(socket,payload_max+65542,remaining);
+        if not packet.ok {if try packet.timeout catch false{timed_out=true;break;} TCP.close(socket);return packet;}
+        if packet.packet_type==3 {
+            let message=parse_publish(packet);if not message.ok{TCP.close(socket);return message;}
+            if len(message.payload)>payload_max{TCP.close(socket);return map{ok:false,error:"MQTT payload exceeds configured bound"};}
+            if message.qos==1{let ack=TCP.write_bytes(socket,acknowledgement_packet("puback",message.packet_id),remaining);
+                if not ack.ok{TCP.close(socket);return ack;}}
+            elif message.qos==2{
+                let received=TCP.write_bytes(socket,acknowledgement_packet("pubrec",message.packet_id),remaining);
+                if not received.ok{TCP.close(socket);return received;}
+                let released=read_packet(socket,16,remaining);
+                if not released.ok or released.header!=98 or released.body!=_u16(message.packet_id){
+                    TCP.close(socket);return map{ok:false,error:"invalid MQTT PUBREL"};
+                }
+                let complete=TCP.write_bytes(socket,acknowledgement_packet("pubcomp",message.packet_id),remaining);
+                if not complete.ok{TCP.close(socket);return complete;}
+            }
+            array_push(messages,message);
+        }
+    }
+    try TCP.write_bytes(socket,[224,0],100) catch nil;TCP.close(socket);
+    return map{ok:true,format:FORMAT,messages:messages,count:len(messages),timed_out:timed_out,
+        requested_qos:qos,max_messages:maximum,native_nonblocking:true,deadline_bounded:true,shell_used:false};
+}
+
+export FORMAT, MAX_PACKET_BYTES, MAX_PAYLOAD_BYTES, MAX_MESSAGES;
+export valid_topic_name, valid_topic_filter, encode_remaining_length, decode_remaining_length;
+export connect_packet, publish_packet, subscribe_packet, acknowledgement_packet;
+export read_packet, parse_connack, parse_publish, publish_ipv4, subscribe_ipv4;

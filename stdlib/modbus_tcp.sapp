@@ -1,0 +1,119 @@
+// Bounded Modbus TCP read client implemented in PBLang.
+// Supports read coils/discrete inputs/holding registers/input registers only.
+
+let TCP = import("stdlib:native_tcp.sapp");
+
+let FORMAT = "pblang.modbus-tcp.v1";
+let FUNCTIONS = map{ coil: 1, discrete: 2, holding: 3, input: 4 };
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _u16(value) { return [num_floor(value / 256), num_mod(value, 256)]; }
+fn _read_u16(bytes, offset) { return bytes[offset] * 256 + bytes[offset + 1]; }
+
+fn function_code(name) {
+    let key = str_lower(str_trim(str(name)));
+    let code = try FUNCTIONS[key] catch nil;
+    if code == nil { throw "Modbus function must be coil, discrete, holding, or input"; }
+    return code;
+}
+
+fn request(transaction_id, unit_id, function_name, address, count) {
+    if not _integer(transaction_id, 0, 65535) { throw "invalid Modbus transaction id"; }
+    if not _integer(unit_id, 1, 247) { throw "invalid Modbus unit id"; }
+    if not _integer(address, 0, 65535) { throw "invalid Modbus address"; }
+    let code = function_code(function_name);
+    let maximum = if code <= 2 { 2000 } else { 125 };
+    if not _integer(count, 1, maximum) { throw "invalid Modbus read count"; }
+    let tx = _u16(transaction_id); let start = _u16(address); let quantity = _u16(count);
+    return [tx[0], tx[1], 0, 0, 0, 6, unit_id, code,
+        start[0], start[1], quantity[0], quantity[1]];
+}
+
+fn parse_response(header, body, transaction_id, unit_id, function_name, count) {
+    if type(header) != "array" or len(header) != 7 or type(body) != "array" {
+        return map{ ok: false, error: "invalid Modbus frame shape" };
+    }
+    if _read_u16(header, 0) != transaction_id {
+        return map{ ok: false, error: "Modbus transaction id mismatch" };
+    }
+    if _read_u16(header, 2) != 0 { return map{ ok: false, error: "invalid Modbus protocol id" }; }
+    let length = _read_u16(header, 4);
+    if length < 3 or length > 254 or len(body) != length - 1 {
+        return map{ ok: false, error: "invalid Modbus response length" };
+    }
+    if header[6] != unit_id { return map{ ok: false, error: "Modbus unit id mismatch" }; }
+    let expected = function_code(function_name);
+    if len(body) >= 2 and body[0] == expected + 128 {
+        return map{ ok: false, exception: true, exception_code: body[1],
+            error: "Modbus exception response" };
+    }
+    if len(body) < 2 or body[0] != expected {
+        return map{ ok: false, error: "Modbus function code mismatch" };
+    }
+    let byte_count = body[1];
+    if byte_count != len(body) - 2 { return map{ ok: false, error: "Modbus byte count mismatch" }; }
+    let values = [];
+    if expected == 3 or expected == 4 {
+        if byte_count != count * 2 { return map{ ok: false, error: "Modbus register payload size mismatch" }; }
+        let i = 0; while i < byte_count {
+            array_push(values, body[2 + i] * 256 + body[3 + i]); i = i + 2;
+        }
+    } else {
+        let expected_bytes = num_floor((count + 7) / 8);
+        if byte_count != expected_bytes { return map{ ok: false, error: "Modbus bit payload size mismatch" }; }
+        for bit count {
+            let byte = body[2 + num_floor(bit / 8)];
+            array_push(values, bit_and(byte, num_pow(2, num_mod(bit, 8))) != 0);
+        }
+    }
+    return map{ ok: true, format: FORMAT, transaction_id: transaction_id,
+        unit_id: unit_id, function: str_lower(str(function_name)),
+        function_code: expected, values: values, count: len(values),
+        response_bytes: len(header) + len(body), exception: false };
+}
+
+fn read_ipv4(host, port, options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return map{ ok: false, error: "Modbus options must be an object" }; }
+    let allowed = ["transaction_id", "unit_id", "function", "address", "count", "timeout_ms"];
+    for key in map_keys(options) {
+        let known = false; for i len(allowed) { if allowed[i] == key { known = true; } }
+        if not known { return map{ ok: false, error: "unknown Modbus option: " + key }; }
+    }
+    if not _integer(port, 1, 65535) { return map{ ok: false, error: "invalid Modbus TCP port" }; }
+    let transaction = try options.transaction_id catch nil;
+    if transaction == nil {
+        let entropy = random_bytes(2); transaction = entropy[0] * 256 + entropy[1];
+    }
+    let unit = try options.unit_id catch 1;
+    let function_name = try options.function catch "holding";
+    let address = try options.address catch 0;
+    let count = try options.count catch 1;
+    let timeout = try options.timeout_ms catch 1000;
+    if not _integer(timeout, 25, 30000) { return map{ ok: false, error: "invalid Modbus timeout" }; }
+    let frame = try request(transaction, unit, function_name, address, count) catch nil;
+    if frame == nil { return map{ ok: false, error: "invalid Modbus request" }; }
+    let socket = TCP.connect_ipv4(host, port, timeout);
+    if not socket.ok { return map{ ok: false, error: socket.error,
+        timeout: try socket.timeout catch false }; }
+    let wrote = TCP.write_bytes(socket, frame, timeout);
+    if not wrote.ok { TCP.close(socket); return wrote; }
+    let header = TCP.read_exact_bytes(socket, 7, timeout);
+    if not header.ok { TCP.close(socket); return header; }
+    let length = _read_u16(header.bytes, 4);
+    if length < 3 or length > 254 { TCP.close(socket);
+        return map{ ok: false, error: "invalid Modbus MBAP length" }; }
+    let body = TCP.read_exact_bytes(socket, length - 1, timeout);
+    TCP.close(socket);
+    if not body.ok { return body; }
+    let parsed = parse_response(header.bytes, body.bytes, transaction, unit, function_name, count);
+    parsed.native_nonblocking = true; parsed.deadline_bounded = true;
+    parsed.shell_used = false; parsed.target_address = host; parsed.port = port;
+    return parsed;
+}
+
+export FORMAT, function_code, request, parse_response, read_ipv4;

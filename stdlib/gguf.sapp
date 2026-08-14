@@ -1,0 +1,220 @@
+// Deterministic Safetensors -> GGUF v3 container conversion in PBLang.
+// Supports dense F32, F16, and BF16 tensors. Model-specific tensor renaming
+// and metadata are explicit inputs; no Python, pickle, or foreign converter is
+// executed.
+
+let MAX_FILE_BYTES = 67108864;
+let MAX_HEADER_BYTES = 1048576;
+let MAX_TENSORS = 4096;
+let MAX_METADATA = 256;
+let ALIGNMENT = 32;
+
+fn _fail(message) { throw "gguf: " + message; }
+fn _append(out, bytes) { for i len(bytes) { out[len(out)] = bytes[i]; } return out; }
+fn _contains(values, wanted) { for i len(values) { if values[i] == wanted { return true; } } return false; }
+fn _uint(value, bytes, label) {
+    if type(value) != "number" or num_floor(value) != value or value < 0 or value > 9007199254740991 { _fail(label + " must be a non-negative safe integer"); }
+    let out = []; let n = value; for i bytes { out[i] = n % 256; n = num_floor(n / 256); }
+    if n != 0 { _fail(label + " exceeds its encoded width"); } return out;
+}
+fn _u32(value) { return _uint(value, 4, "uint32"); }
+fn _u64(value) { return _uint(value, 8, "uint64"); }
+fn _read_u64(bytes, offset) {
+    if offset < 0 or offset + 8 > len(bytes) { _fail("truncated uint64"); }
+    let value = 0; let scale = 1; for i 8 { value = value + bytes[offset + i] * scale; scale = scale * 256; }
+    if value > 9007199254740991 { _fail("uint64 exceeds exact PBLang range"); } return value;
+}
+fn _string(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 4096 or str_contains(value, "\x00") { _fail("invalid string"); }
+    let raw = str_to_bytes(value); let out = _u64(len(raw)); return _append(out, raw);
+}
+fn _align(out, alignment = 32) { while len(out) % alignment != 0 { out[len(out)] = 0; } }
+fn _valid_name(name, label) {
+    if type(name) != "string" or len(name) < 1 or len(name) > 127 or str_contains(name, "\x00") { _fail("invalid " + label); }
+    return name;
+}
+fn _product(shape) {
+    if type(shape) != "array" or len(shape) < 1 or len(shape) > 4 { _fail("tensor shape rank must be 1..4"); }
+    let n = 1; for i len(shape) {
+        let d = shape[i]; if type(d) != "number" or num_floor(d) != d or d < 1 or d > 1000000000 { _fail("invalid tensor dimension"); }
+        n = n * d; if n > 9007199254740991 { _fail("tensor element count overflow"); }
+    } return n;
+}
+fn _dtype(name) {
+    if name == "F32" { return map{ bytes: 4, ggml: 0 }; }
+    if name == "F16" { return map{ bytes: 2, ggml: 1 }; }
+    if name == "BF16" { return map{ bytes: 2, ggml: 30 }; }
+    _fail("supported Safetensors dtypes are F32, F16, and BF16");
+}
+fn _sort_ranges(values) {
+    let out = [];
+    for i len(values) {
+        out[len(out)] = values[i]; let j = len(out) - 1;
+        while j > 0 and out[j].start < out[j - 1].start {
+            let prior = out[j - 1]; out[j - 1] = out[j]; out[j] = prior; j = j - 1;
+        }
+    }
+    return out;
+}
+
+fn parse_safetensors(bytes) {
+    if type(bytes) != "array" or len(bytes) < 10 or len(bytes) > MAX_FILE_BYTES { _fail("Safetensors input exceeds bounded file limits"); }
+    let header_len = _read_u64(bytes, 0);
+    if header_len < 2 or header_len > MAX_HEADER_BYTES or 8 + header_len > len(bytes) { _fail("invalid Safetensors header length"); }
+    let header_raw = slice(bytes, 8, 8 + header_len);
+    if header_raw[0] != 123 { _fail("Safetensors header must begin with an object"); }
+    let header_text = try bytes_to_str(header_raw) catch nil; if header_text == nil { _fail("Safetensors header is not UTF-8"); }
+    let header = try json_parse(header_text) catch nil; if type(header) != "map" { _fail("Safetensors header is not valid JSON object"); }
+    let names = array_sort(map_keys(header)); let tensors = []; let ranges = [];
+    for i len(names) {
+        let name = names[i]; if name == "__metadata__" { continue; }
+        _valid_name(name, "tensor name"); let spec = header[name];
+        if type(spec) != "map" { _fail("tensor metadata must be an object"); }
+        let dtype = _dtype(try spec.dtype catch nil); let shape = try spec.shape catch nil; let count = _product(shape);
+        let offsets = try spec.data_offsets catch nil;
+        if type(offsets) != "array" or len(offsets) != 2 { _fail("tensor data_offsets must contain start and end"); }
+        let start = offsets[0]; let finish = offsets[1];
+        if type(start) != "number" or type(finish) != "number" or num_floor(start) != start or num_floor(finish) != finish or start < 0 or finish < start { _fail("invalid tensor data offsets"); }
+        if finish - start != count * dtype.bytes or 8 + header_len + finish > len(bytes) { _fail("tensor byte range does not match dtype and shape"); }
+        ranges[len(ranges)] = map{ start: start, finish: finish, name: name };
+        tensors[len(tensors)] = map{ name: name, shape: shape, dtype: try spec.dtype catch "", ggml_type: dtype.ggml,
+            source_start: 8 + header_len + start, source_end: 8 + header_len + finish };
+        if len(tensors) > MAX_TENSORS { _fail("tensor count limit exceeded"); }
+    }
+    if len(tensors) < 1 { _fail("Safetensors file contains no tensors"); }
+    ranges = _sort_ranges(ranges);
+    let expected = 0; for i len(ranges) { if ranges[i].start != expected { _fail("Safetensors ranges must be contiguous and non-overlapping"); } expected = ranges[i].finish; }
+    if 8 + header_len + expected != len(bytes) { _fail("Safetensors data area has trailing or unreferenced bytes"); }
+    return map{ format: "pblang.safetensors.v1", tensors: tensors, header_bytes: header_len, bytes: len(bytes) };
+}
+
+fn _metadata_entries(architecture, model_name, metadata) {
+    _valid_name(architecture, "architecture"); _valid_name(model_name, "model name");
+    if type(metadata) == "nil" { metadata = map{}; } if type(metadata) != "map" { _fail("metadata must be an object"); }
+    let base = map{
+        "general.architecture": map{ type: "string", value: architecture },
+        "general.name": map{ type: "string", value: model_name },
+        "general.alignment": map{ type: "uint32", value: ALIGNMENT },
+        "general.source_format": map{ type: "string", value: "safetensors" }
+    };
+    let keys = map_keys(metadata); if len(keys) > MAX_METADATA - len(map_keys(base)) { _fail("metadata entry limit exceeded"); }
+    for i len(keys) {
+        let key = keys[i]; _valid_name(key, "metadata key"); if map_has(base, key) { _fail("reserved metadata key cannot be replaced: " + key); }
+        let raw = metadata[key];
+        if type(raw) == "string" { base[key] = map{ type: "string", value: raw }; }
+        else if type(raw) == "bool" { base[key] = map{ type: "bool", value: raw }; }
+        else if type(raw) == "number" and raw == num_floor(raw) and raw >= 0 and raw <= 4294967295 { base[key] = map{ type: "uint32", value: raw }; }
+        else if type(raw) == "array" { for j len(raw) { if type(raw[j]) != "string" { _fail("metadata arrays must contain strings"); } } base[key] = map{ type: "strings", value: raw }; }
+        else { _fail("metadata values support string, bool, uint32, or string array"); }
+    }
+    let out = []; let sorted = array_sort(map_keys(base)); for i len(sorted) { out[i] = map{ key: sorted[i], type: base[sorted[i]].type, value: base[sorted[i]].value }; } return out;
+}
+fn _write_metadata(out, entry) {
+    _append(out, _string(entry.key));
+    if entry.type == "string" { _append(out, _u32(8)); _append(out, _string(entry.value)); }
+    else if entry.type == "uint32" { _append(out, _u32(4)); _append(out, _u32(entry.value)); }
+    else if entry.type == "bool" { _append(out, _u32(7)); out[len(out)] = if entry.value { 1 } else { 0 }; }
+    else if entry.type == "strings" { _append(out, _u32(9)); _append(out, _u32(8)); _append(out, _u64(len(entry.value))); for i len(entry.value) { _append(out, _string(entry.value[i])); } }
+    else { _fail("internal metadata type error"); }
+}
+
+fn convert_safetensors(bytes, options) {
+    if type(options) != "map" { _fail("conversion options are required"); }
+    let parsed = parse_safetensors(bytes); let architecture = try options.architecture catch nil;
+    let model_name = architecture; if map_has(options, "model_name") { model_name = options.model_name; }
+    let supplied_metadata: any = map{}; if map_has(options, "metadata") { supplied_metadata = options.metadata; }
+    let metadata = _metadata_entries(architecture, model_name, supplied_metadata);
+    let rename: any = map{}; if map_has(options, "tensor_name_map") { rename = options.tensor_name_map; }
+    if type(rename) != "map" { _fail("tensor_name_map must be an object"); }
+    let tensors = []; let names_seen = map{};
+    for i len(parsed.tensors) {
+        let source = parsed.tensors[i]; let name = try rename[source.name] catch source.name; _valid_name(name, "GGUF tensor name");
+        if map_has(names_seen, name) { _fail("duplicate output tensor name: " + name); } names_seen[name] = true;
+        tensors[i] = map{ source: source, name: name, offset: 0 };
+    }
+    let unknown_renames = map_keys(rename); for i len(unknown_renames) { let found = false; for j len(parsed.tensors) { if parsed.tensors[j].name == unknown_renames[i] { found = true; } } if not found { _fail("tensor_name_map contains unknown source: " + unknown_renames[i]); } }
+    let data = [];
+    for i len(tensors) { _align(data); tensors[i].offset = len(data); _append(data, slice(bytes, tensors[i].source.source_start, tensors[i].source.source_end)); }
+    let out = str_to_bytes("GGUF"); _append(out, _u32(3)); _append(out, _u64(len(tensors))); _append(out, _u64(len(metadata)));
+    for i len(metadata) { _write_metadata(out, metadata[i]); }
+    for i len(tensors) {
+        let t = tensors[i]; _append(out, _string(t.name)); _append(out, _u32(len(t.source.shape)));
+        let d = len(t.source.shape) - 1; while d >= 0 { _append(out, _u64(t.source.shape[d])); d = d - 1; }
+        _append(out, _u32(t.source.ggml_type)); _append(out, _u64(t.offset));
+    }
+    _align(out); let data_offset = len(out); _append(out, data);
+    if len(out) > MAX_FILE_BYTES { _fail("GGUF output exceeds bounded file limit"); }
+    return map{ format: "pblang.gguf.v3", bytes: out, tensor_count: len(tensors), metadata_count: len(metadata),
+        data_offset: data_offset, output_bytes: len(out), architecture: architecture, model_name: model_name,
+        alignment: ALIGNMENT, deterministic: true, source_format: "safetensors" };
+}
+
+fn _cursor(bytes) { return map{ bytes: bytes, pos: 0 }; }
+fn _take(cursor, count) { if count < 0 or cursor.pos + count > len(cursor.bytes) { _fail("truncated GGUF structure"); } let out = slice(cursor.bytes, cursor.pos, cursor.pos + count); cursor.pos = cursor.pos + count; return out; }
+fn _take_u32(cursor) { let b = _take(cursor, 4); return b[0] + b[1] * 256 + b[2] * 65536 + b[3] * 16777216; }
+fn _take_u64(cursor) { let value = _read_u64(cursor.bytes, cursor.pos); cursor.pos = cursor.pos + 8; return value; }
+fn _take_string(cursor) { let count = _take_u64(cursor); if count > 4096 { _fail("GGUF string exceeds limit"); } let value = try bytes_to_str(_take(cursor, count)) catch nil; if type(value) != "string" or str_contains(value, "\x00") { _fail("invalid GGUF UTF-8 string"); } return value; }
+fn _scalar_width(value_type) {
+    if value_type == 0 or value_type == 1 or value_type == 7 { return 1; }
+    if value_type == 2 or value_type == 3 { return 2; }
+    if value_type == 4 or value_type == 5 or value_type == 6 { return 4; }
+    if value_type == 10 or value_type == 11 or value_type == 12 { return 8; }
+    return 0;
+}
+fn _skip_value(cursor, value_type, in_array = false) {
+    if value_type == 8 { _take_string(cursor); return; }
+    if value_type == 9 {
+        if in_array { _fail("nested GGUF arrays are invalid"); }
+        let item_type = _take_u32(cursor); if item_type == 9 { _fail("nested GGUF arrays are invalid"); }
+        let count = _take_u64(cursor); if count > 1000000 { _fail("GGUF array exceeds limit"); }
+        for i count { _skip_value(cursor, item_type, true); } return;
+    }
+    let width = _scalar_width(value_type); if width == 0 { _fail("unknown GGUF metadata type"); } _take(cursor, width);
+}
+fn _ggml_width(value_type) {
+    if value_type == 0 { return 4; } if value_type == 1 or value_type == 30 { return 2; }
+    _fail("inspector supports emitted F32, F16, and BF16 tensor types");
+}
+fn inspect(bytes) {
+    if type(bytes) != "array" or len(bytes) < 24 or len(bytes) > MAX_FILE_BYTES { _fail("invalid bounded GGUF input"); }
+    let cursor = _cursor(bytes); if bytes_to_str(_take(cursor, 4)) != "GGUF" { _fail("invalid GGUF magic"); }
+    let version = _take_u32(cursor); if version != 3 { _fail("only GGUF v3 is supported"); }
+    let tensor_count = _take_u64(cursor); let metadata_count = _take_u64(cursor);
+    if tensor_count < 1 or tensor_count > MAX_TENSORS or metadata_count > MAX_METADATA { _fail("GGUF count limit exceeded"); }
+    let metadata_keys = []; let alignment = ALIGNMENT;
+    for i metadata_count {
+        let key = _take_string(cursor); if _contains(metadata_keys, key) { _fail("duplicate GGUF metadata key"); } metadata_keys[i] = key;
+        let value_type = _take_u32(cursor);
+        if key == "general.alignment" {
+            if value_type != 4 { _fail("general.alignment must be uint32"); }
+            alignment = _take_u32(cursor);
+        } else { _skip_value(cursor, value_type); }
+    }
+    if alignment < 1 or alignment > 4096 or bit_and(alignment, alignment - 1) != 0 { _fail("GGUF alignment must be a bounded power of two"); }
+    let tensors = []; let tensor_names = map{};
+    for i tensor_count {
+        let name = _take_string(cursor); if map_has(tensor_names, name) { _fail("duplicate GGUF tensor name"); } tensor_names[name] = true;
+        let rank = _take_u32(cursor); if rank < 1 or rank > 4 { _fail("GGUF tensor rank must be 1..4"); }
+        let shape = []; for d rank { shape[d] = _take_u64(cursor); if shape[d] < 1 { _fail("zero-sized GGUF tensor is unsupported"); } }
+        let tensor_type = _take_u32(cursor); let offset = _take_u64(cursor);
+        if offset % alignment != 0 { _fail("GGUF tensor offset is misaligned"); }
+        tensors[i] = map{ name: name, shape: shape, type: tensor_type, offset: offset, bytes: _product(shape) * _ggml_width(tensor_type) };
+    }
+    while cursor.pos % alignment != 0 { if _take(cursor, 1)[0] != 0 { _fail("non-zero GGUF alignment padding"); } }
+    let data_offset = cursor.pos; let previous_end = 0;
+    for i len(tensors) {
+        if i > 0 and tensors[i].offset % alignment != 0 { _fail("GGUF tensor offset is misaligned"); }
+        let gap_start = previous_end; let gap_end = tensors[i].offset;
+        while gap_start < gap_end { if bytes[data_offset + gap_start] != 0 { _fail("non-zero inter-tensor alignment padding"); } gap_start = gap_start + 1; }
+        if tensors[i].offset < previous_end or data_offset + tensors[i].offset + tensors[i].bytes > len(bytes) { _fail("GGUF tensor data range is invalid"); }
+        previous_end = tensors[i].offset + tensors[i].bytes;
+    }
+    if data_offset + previous_end != len(bytes) { _fail("GGUF has trailing or unreferenced tensor bytes"); }
+    return map{ format: "pblang.gguf.inspect.v1", version: version, tensor_count: tensor_count,
+        metadata_count: metadata_count, metadata_keys: metadata_keys, tensors: tensors,
+        alignment: alignment, data_offset: data_offset, bytes: len(bytes), valid_header: true,
+        valid_directory: true, valid_data_ranges: true };
+}
+
+export MAX_FILE_BYTES, MAX_HEADER_BYTES, MAX_TENSORS, ALIGNMENT, parse_safetensors,
+       convert_safetensors, inspect;

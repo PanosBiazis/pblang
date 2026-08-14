@@ -1,0 +1,210 @@
+// Bounded RSS 2.0 and Atom feed parser.
+// External declarations are rejected: this parser never resolves XML entities,
+// reads files, performs network I/O, or expands user-defined entity graphs.
+
+let MAX_INPUT_BYTES = 524288;
+let MAX_ITEMS = 100;
+let MAX_FIELD_CHARS = 8192;
+
+fn _hex(code) {
+    if code >= 48 and code <= 57 { return code - 48; }
+    if code >= 65 and code <= 70 { return code - 55; }
+    if code >= 97 and code <= 102 { return code - 87; }
+    return -1;
+}
+
+fn _digit(code, radix) {
+    if radix == 16 { return _hex(code); }
+    if code >= 48 and code <= 57 { return code - 48; }
+    return -1;
+}
+
+fn _entity(value) {
+    if value == "amp" { return "&"; }
+    if value == "lt" { return "<"; }
+    if value == "gt" { return ">"; }
+    if value == "quot" { return "\""; }
+    if value == "apos" { return "'"; }
+    if str_starts_with(value, "#") {
+        let radix = 10; let start = 1;
+        if len(value) > 2 and (str_slice(value, 1, 2) == "x" or str_slice(value, 1, 2) == "X") {
+            radix = 16; start = 2;
+        }
+        if start >= len(value) { return nil; }
+        let number = 0; let i = start;
+        while i < len(value) {
+            let digit = _digit(strcharcodeat(value, i), radix);
+            if digit < 0 { return nil; }
+            number = number * radix + digit;
+            if number > 1114111 { return nil; }
+            i = i + 1;
+        }
+        if number == 0 or (number >= 55296 and number <= 57343) { return nil; }
+        return strfromcharcode(number);
+    }
+    return nil;
+}
+
+fn _decode(value) {
+    let out = ""; let i = 0;
+    while i < len(value) and len(out) < MAX_FIELD_CHARS {
+        if strcharcodeat(value, i) == 38 {
+            let rest = str_slice(value, i + 1, len(value));
+            let semi = str_index_of(rest, ";");
+            if semi >= 1 and semi <= 16 {
+                let decoded = _entity(str_slice(rest, 0, semi));
+                if decoded != nil { out = out + decoded; i = i + semi + 2; continue; }
+            }
+        }
+        out = out + strfromcharcode(strcharcodeat(value, i)); i = i + 1;
+    }
+    return out;
+}
+
+fn _collapse(value) {
+    let out = ""; let space = false; let i = 0;
+    while i < len(value) and len(out) < MAX_FIELD_CHARS {
+        let code = strcharcodeat(value, i);
+        if code == 9 or code == 10 or code == 13 or code == 32 {
+            if len(out) > 0 { space = true; }
+        } else {
+            if space { out = out + " "; space = false; }
+            out = out + strfromcharcode(code);
+        }
+        i = i + 1;
+    }
+    return str_trim(out);
+}
+
+fn _strip_tags(value) {
+    let out = ""; let inside = false; let i = 0;
+    while i < len(value) and len(out) < MAX_FIELD_CHARS {
+        let code = strcharcodeat(value, i);
+        if code == 60 { inside = true; }
+        elif code == 62 { if inside { inside = false; out = out + " "; } }
+        elif not inside { out = out + strfromcharcode(code); }
+        i = i + 1;
+    }
+    return _collapse(_decode(out));
+}
+
+fn _content(value) {
+    let trimmed = str_trim(value);
+    if str_starts_with(trimmed, "<![CDATA[") and str_ends_with(trimmed, "]]>") {
+        trimmed = str_slice(trimmed, 9, len(trimmed) - 3);
+    }
+    return _strip_tags(trimmed);
+}
+
+fn _tag(block, tag) {
+    let lower = str_lower(block); let open = "<" + str_lower(tag);
+    let start = str_index_of(lower, open);
+    if start < 0 { return ""; }
+    let boundary = start + len(open);
+    if boundary >= len(lower) { return ""; }
+    let boundary_code = strcharcodeat(lower, boundary);
+    if boundary_code != 32 and boundary_code != 9 and boundary_code != 10 and
+       boundary_code != 13 and boundary_code != 62 { return ""; }
+    let tail = str_slice(lower, boundary, len(lower)); let gt_rel = str_index_of(tail, ">");
+    if gt_rel < 0 { return ""; }
+    let body_start = boundary + gt_rel + 1;
+    let close = "</" + str_lower(tag) + ">";
+    let close_rel = str_index_of(str_slice(lower, body_start, len(lower)), close);
+    if close_rel < 0 { return ""; }
+    return _content(str_slice(block, body_start, body_start + close_rel));
+}
+
+fn _attribute(tag_text, name) {
+    let lower = str_lower(tag_text); let needle = str_lower(name) + "=";
+    let at = str_index_of(lower, needle);
+    if at < 0 { return ""; }
+    let start = at + len(needle);
+    if start >= len(tag_text) { return ""; }
+    let quote = str_slice(tag_text, start, start + 1);
+    if quote != "\"" and quote != "'" { return ""; }
+    let rest = str_slice(tag_text, start + 1, len(tag_text));
+    let stop = str_index_of(rest, quote);
+    if stop < 0 or stop > MAX_FIELD_CHARS { return ""; }
+    return _decode(str_slice(rest, 0, stop));
+}
+
+fn _atom_link(block) {
+    let lower = str_lower(block); let rest = block; let lower_rest = lower;
+    let fallback = ""; let attempts = 0;
+    while attempts < 16 {
+        let at = str_index_of(lower_rest, "<link");
+        if at < 0 { break; }
+        let after = str_slice(rest, at, len(rest)); let gt = str_index_of(after, ">");
+        if gt < 0 or gt > 4096 { break; }
+        let tag_text = str_slice(after, 0, gt + 1);
+        let href = _attribute(tag_text, "href"); let rel = str_lower(_attribute(tag_text, "rel"));
+        if href != "" and (rel == "" or rel == "alternate") { return href; }
+        if href != "" and fallback == "" { fallback = href; }
+        rest = str_slice(after, gt + 1, len(after)); lower_rest = str_lower(rest);
+        attempts = attempts + 1;
+    }
+    return fallback;
+}
+
+fn _blocks(xml, tag, maximum) {
+    let out = []; let rest = xml; let lower = str_lower(rest);
+    let open = "<" + tag; let close = "</" + tag + ">";
+    while len(out) < maximum {
+        let start = str_index_of(lower, open); if start < 0 { break; }
+        let boundary = start + len(open);
+        if boundary >= len(lower) { throw "unterminated feed item"; }
+        let code = strcharcodeat(lower, boundary);
+        if code != 32 and code != 9 and code != 10 and code != 13 and code != 62 {
+            rest = str_slice(rest, boundary, len(rest)); lower = str_lower(rest); continue;
+        }
+        let close_rel = str_index_of(str_slice(lower, boundary, len(lower)), close);
+        if close_rel < 0 { throw "unterminated feed item"; }
+        let stop = boundary + close_rel + len(close);
+        out[len(out)] = str_slice(rest, start, stop);
+        rest = str_slice(rest, stop, len(rest)); lower = str_lower(rest);
+    }
+    return out;
+}
+
+fn parse(xml, max_items = 20) {
+    if type(xml) != "string" or len(str_to_bytes(xml)) > MAX_INPUT_BYTES {
+        throw "feed input must be UTF-8 text within 524288 bytes";
+    }
+    if type(max_items) != "number" or max_items != num_floor(max_items) or
+       max_items < 1 or max_items > MAX_ITEMS { throw "max_items must be an integer in 1..100"; }
+    let lower = str_lower(xml);
+    if str_contains(lower, "<!doctype") or str_contains(lower, "<!entity") {
+        throw "DTD and entity declarations are not allowed in feeds";
+    }
+    let kind = "";
+    if str_contains(lower, "<feed") { kind = "atom"; }
+    elif str_contains(lower, "<rss") or str_contains(lower, "<channel") { kind = "rss"; }
+    else { throw "input is not a supported RSS or Atom feed"; }
+    let item_tag = "item"; if kind == "atom" { item_tag = "entry"; }
+    let blocks = _blocks(xml, item_tag, max_items);
+    let items = [];
+    for i len(blocks) {
+        let block = blocks[i];
+        let link = _tag(block, "link"); if kind == "atom" { link = _atom_link(block); }
+        let summary_tag = "description"; if kind == "atom" { summary_tag = "summary"; }
+        let summary = _tag(block, summary_tag);
+        let content = summary; if summary == "" { content = _tag(block, "content"); }
+        let id_tag = "guid"; if kind == "atom" { id_tag = "id"; }
+        let id = _tag(block, id_tag);
+        let published_tag = "pubdate"; if kind == "atom" { published_tag = "published"; }
+        let published = _tag(block, published_tag);
+        let updated = _tag(block, "updated");
+        items[len(items)] = map{ title: _tag(block, "title"), link: link,
+            id: id, published: published, updated: updated,
+            summary: content };
+    }
+    let feed_title = _tag(xml, "title");
+    return map{ ok: true, format: "pblang.feed.v1", kind: kind,
+        title: feed_title, items: items, item_count: len(items),
+        truncated: len(items) == max_items and
+            len(_blocks(xml, item_tag, max_items + 1)) > max_items,
+        external_entities_allowed: false, max_input_bytes: MAX_INPUT_BYTES,
+        max_field_chars: MAX_FIELD_CHARS };
+}
+
+export parse, MAX_INPUT_BYTES, MAX_ITEMS, MAX_FIELD_CHARS;

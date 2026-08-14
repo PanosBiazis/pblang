@@ -8,7 +8,8 @@
 //
 // Security: extract() refuses zip-slip names (absolute paths, `..` segments,
 // backslash tricks, NUL bytes) and read()/extract() take an optional per-entry
-// max_out byte cap as a decompression-bomb guard.
+// max_out byte cap as a decompression-bomb guard. Parsing also rejects ZIP64,
+// encryption, trailing data, and inconsistent central/local headers.
 //
 //   let Z = import("stdlib:zipfile.sapp");
 //   Z.entries(bytes);                 // [{name,size,csize,method,crc,offset}]
@@ -48,18 +49,32 @@ fn _find_eocd(b) {
     let stop = n - 22 - 65535;
     if stop < 0 { stop = 0; }
     while i >= stop {
-        if b[i] == 80 and b[i + 1] == 75 and b[i + 2] == 5 and b[i + 3] == 6 { return i; }
+        if b[i] == 80 and b[i + 1] == 75 and b[i + 2] == 5 and b[i + 3] == 6 and
+           i + 22 <= n and i + 22 + _u16(b, i + 20) == n { return i; }
         i = i - 1;
     }
     return error("zipfile: end-of-central-directory not found (not a zip?)");
 }
 
 // entries(data) — list the archive's central-directory entries.
-fn entries(data) {
+fn entries_bounded(data, max_entries) {
     let b = _as_bytes(data);
     let e = _find_eocd(b);
     let count = _u16(b, e + 10);
+    if type(max_entries) != "number" or num_floor(max_entries) != max_entries or
+       max_entries < 0 or max_entries > 65535 { error("zipfile: invalid max_entries cap"); }
+    if count > max_entries { error("zipfile: entry count exceeds max_entries cap"); }
+    if _u16(b, e + 4) != 0 or _u16(b, e + 6) != 0 or _u16(b, e + 8) != count {
+        error("zipfile: multi-disk archives are unsupported");
+    }
+    let central_size = _u32(b, e + 12);
     let p = _u32(b, e + 16);
+    if count == 65535 or central_size == 4294967295 or p == 4294967295 {
+        error("zipfile: ZIP64 archives are unsupported");
+    }
+    if p + central_size > e or p + central_size > len(b) {
+        error("zipfile: central directory range is invalid");
+    }
     let out = [];
     let k = 0;
     while k < count {
@@ -70,8 +85,12 @@ fn entries(data) {
         let nlen = _u16(b, p + 28);
         let elen = _u16(b, p + 30);
         let clen = _u16(b, p + 32);
+        if p + 46 + nlen + elen + clen > len(b) or p + 46 + nlen + elen + clen > e {
+            error("zipfile: truncated central directory entry");
+        }
         array_push(out, map{
             name: _name_at(b, p + 46, nlen),
+            flags: _u16(b, p + 8),
             method: _u16(b, p + 10),
             crc: _u32(b, p + 16),
             csize: _u32(b, p + 20),
@@ -85,6 +104,10 @@ fn entries(data) {
     return out;
 }
 
+// entries(data) preserves the original API while entries_bounded lets servers
+// reject adversarial entry counts before allocating the result array.
+fn entries(data) { return entries_bounded(data, 65535); }
+
 fn _read_entry(b, ent, max_out) {
     if max_out != nil and ent.size > max_out { error("zipfile: entry exceeds max_out cap"); }
     let p = ent.offset;
@@ -92,8 +115,17 @@ fn _read_entry(b, ent, max_out) {
     if b[p] != 80 or b[p + 1] != 75 or b[p + 2] != 3 or b[p + 3] != 4 {
         error("zipfile: bad local header signature");
     }
+    let local_flags = _u16(b, p + 6);
+    let flags = try ent.flags catch 0;
+    if bit_and(flags, 1) != 0 or bit_and(local_flags, 1) != 0 {
+        error("zipfile: encrypted entries are unsupported");
+    }
+    if local_flags != flags { error("zipfile: local/central flag mismatch"); }
+    if _u16(b, p + 8) != ent.method { error("zipfile: local/central method mismatch"); }
     let nlen = _u16(b, p + 26);
     let elen = _u16(b, p + 28);
+    if p + 30 + nlen + elen > len(b) { error("zipfile: truncated local header fields"); }
+    if _name_at(b, p + 30, nlen) != ent.name { error("zipfile: local/central name mismatch"); }
     let dp = p + 30 + nlen + elen;
     if dp + ent.csize > len(b) { error("zipfile: truncated entry data"); }
     let out = nil;
@@ -120,6 +152,22 @@ fn read(data, name, max_out = nil) {
         i = i + 1;
     }
     return error("zipfile: no entry named " + name);
+}
+
+// read_entry(data, entry, max_out?) avoids a second name lookup after callers
+// have already performed a bounded central-directory pass. The supplied entry
+// is still validated against the local header, exact size and CRC32.
+fn read_entry(data, entry, max_out = nil) {
+    if type(entry) != "map" or type(try entry.name catch nil) != "string" or
+       type(try entry.offset catch nil) != "number" or
+       type(try entry.size catch nil) != "number" or
+       type(try entry.csize catch nil) != "number" or
+       type(try entry.flags catch nil) != "number" or
+       type(try entry.method catch nil) != "number" or
+       type(try entry.crc catch nil) != "number" {
+        error("zipfile: invalid entry descriptor");
+    }
+    return _read_entry(_as_bytes(data), entry, max_out);
 }
 
 // read_all(data, max_each?) — map of name -> bytes for every file entry.
@@ -278,4 +326,4 @@ fn extract_file(path, dest_dir, max_each = nil) {
 // list_file(path) — entries() of a zip file on disk.
 fn list_file(path) { return entries(fs_read_bytes(path)); }
 
-export entries, read, read_all, extract, create, create_file, extract_file, list_file;
+export entries, entries_bounded, read, read_entry, read_all, extract, create, create_file, extract_file, list_file;

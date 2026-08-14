@@ -237,4 +237,123 @@ fn inspect_x64(bytes) {
         machine: if ok { "x86_64" } else { "unknown" }, wx_split: ok, nx_compatible: ok };
 }
 
+fn _valid_exports(exports, code_len) {
+    if type(exports) != "map" { throw "windows_pe: DLL exports must be a map"; }
+    let names = array_sort(map_keys(exports));
+    if len(names) < 1 or len(names) > MAX_SYMBOLS {
+        throw "windows_pe: DLL must export 1..256 symbols";
+    }
+    let i = 0;
+    while i < len(names) {
+        let name = names[i]; let offset = exports[name];
+        if not _valid_name(name, false) or not is_number(offset)
+            or offset != num_floor(offset) or offset < 0 or offset >= code_len {
+            throw "windows_pe: invalid DLL export";
+        }
+        i = i + 1;
+    }
+    return names;
+}
+
+// Build a deterministic PE export directory. Name pointers are sorted as
+// required by the Windows loader; ordinals and function RVAs use the same
+// ordering so every exported name resolves to its declared code offset.
+fn _export_blob(dll_name, exports, code_len, data_rva) {
+    if not _valid_name(dll_name, true) { throw "windows_pe: invalid DLL name"; }
+    let names = _valid_exports(exports, code_len); let count = len(names);
+    let eat_off = 40;
+    let names_off = eat_off + count * 4;
+    let ordinals_off = names_off + count * 4;
+    let strings_off = ordinals_off + count * 2;
+    let dll_bytes = str_to_bytes(dll_name); array_push(dll_bytes, 0);
+    let dll_off = strings_off; let offset = dll_off + len(dll_bytes);
+    let symbol_offsets = []; let i = 0;
+    while i < count {
+        array_push(symbol_offsets, offset);
+        offset = offset + len(str_to_bytes(names[i])) + 1; i = i + 1;
+    }
+    if offset > MAX_DATA_BYTES { throw "windows_pe: DLL export table is too large"; }
+    let bytes = _zeros(offset);
+    _setle(bytes, 12, X.le32(data_rva + dll_off));
+    _setle(bytes, 16, X.le32(1));
+    _setle(bytes, 20, X.le32(count)); _setle(bytes, 24, X.le32(count));
+    _setle(bytes, 28, X.le32(data_rva + eat_off));
+    _setle(bytes, 32, X.le32(data_rva + names_off));
+    _setle(bytes, 36, X.le32(data_rva + ordinals_off));
+    _setle(bytes, dll_off, dll_bytes); i = 0;
+    while i < count {
+        _setle(bytes, eat_off + i * 4, X.le32(TEXT_RVA + exports[names[i]]));
+        _setle(bytes, names_off + i * 4, X.le32(data_rva + symbol_offsets[i]));
+        _setle(bytes, ordinals_off + i * 2, X.le16(i));
+        let symbol = str_to_bytes(names[i]); array_push(symbol, 0);
+        _setle(bytes, symbol_offsets[i], symbol); i = i + 1;
+    }
+    return map{ bytes: bytes, names: names, directory_rva: data_rva,
+        directory_size: len(bytes), function_count: count };
+}
+
+fn _dll_headers(code_len, data_len, data_rva, export_size) {
+    let text_raw = _round_to(code_len, FILE_ALIGN);
+    let data_raw = _round_to(data_len, FILE_ALIGN); let out = [];
+    _app(out, [0x4D, 0x5A]); _app(out, _zeros(0x3C - 2)); _app(out, X.le32(0x40));
+    _app(out, [0x50, 0x45, 0, 0]);
+    _app(out, X.le16(0x8664)); _app(out, X.le16(2)); _app(out, X.le32(0));
+    _app(out, X.le32(0)); _app(out, X.le32(0)); _app(out, X.le16(240));
+    _app(out, X.le16(0x2022)); // executable, large-address-aware DLL
+    let optional = _zeros(240);
+    _setle(optional, 0, X.le16(0x20B)); _setle(optional, 4, X.le32(text_raw));
+    _setle(optional, 8, X.le32(data_raw)); _setle(optional, 16, X.le32(0));
+    _setle(optional, 20, X.le32(TEXT_RVA)); _setle(optional, 24, X.le64(IMAGE_BASE));
+    _setle(optional, 32, X.le32(0x1000)); _setle(optional, 36, X.le32(FILE_ALIGN));
+    _setle(optional, 40, X.le16(5)); _setle(optional, 42, X.le16(2));
+    _setle(optional, 48, X.le16(5)); _setle(optional, 50, X.le16(2));
+    _setle(optional, 56, X.le32(data_rva + _round_to(data_len, 0x1000)));
+    _setle(optional, 60, X.le32(0x200)); _setle(optional, 68, X.le16(3));
+    _setle(optional, 70, X.le16(0x0500)); // NX_COMPAT | NO_SEH
+    _setle(optional, 72, X.le64(0x100000)); _setle(optional, 80, X.le64(0x1000));
+    _setle(optional, 88, X.le64(0x100000)); _setle(optional, 96, X.le64(0x1000));
+    _setle(optional, 108, X.le32(16));
+    _setle(optional, 112, X.le32(data_rva)); _setle(optional, 116, X.le32(export_size));
+    _app(out, optional);
+    let text = _zeros(40); _setle(text, 0, str_to_bytes(".text"));
+    _setle(text, 8, X.le32(code_len)); _setle(text, 12, X.le32(TEXT_RVA));
+    _setle(text, 16, X.le32(text_raw)); _setle(text, 20, X.le32(0x200));
+    _setle(text, 36, X.le32(0x60000020)); _app(out, text);
+    let data = _zeros(40); _setle(data, 0, str_to_bytes(".rdata"));
+    _setle(data, 8, X.le32(data_len)); _setle(data, 12, X.le32(data_rva));
+    _setle(data, 16, X.le32(data_raw)); _setle(data, 20, X.le32(0x200 + text_raw));
+    _setle(data, 36, X.le32(0x40000040)); _app(out, data);
+    while len(out) < 0x200 { array_push(out, 0); }
+    return map{ bytes: out, text_raw: text_raw, data_raw: data_raw };
+}
+
+// assemble_dll_x64 emits a dependency-free x86-64 Windows DLL. Exported
+// functions must be position-independent because no relocation section is
+// emitted. This is sufficient for the small PBLang-generated ABI bridges that
+// contain only register/memory operations and relative control flow.
+fn assemble_dll_x64(dll_name, payload, exports) {
+    if not _valid_bytes(payload, MAX_CODE_BYTES) { throw "windows_pe: invalid DLL code bytes"; }
+    let data_rva = TEXT_RVA + _round_to(len(payload), 0x1000);
+    if data_rva < MIN_DATA_RVA { data_rva = MIN_DATA_RVA; }
+    let table = _export_blob(dll_name, exports, len(payload), data_rva);
+    let headers = _dll_headers(len(payload), len(table.bytes), data_rva, table.directory_size);
+    let out = headers.bytes; _app(out, payload);
+    while len(out) < 0x200 + headers.text_raw { array_push(out, 0); }
+    _app(out, table.bytes);
+    while len(out) < 0x200 + headers.text_raw + headers.data_raw { array_push(out, 0); }
+    return map{ format: "pblang.windows.pe64-dll.v1", bytes: out,
+        exports: table.names, export_count: table.function_count,
+        code_bytes: len(payload), artifact_bytes: len(out),
+        text_rva: TEXT_RVA, data_rva: data_rva, no_imports: true,
+        position_independent_code_required: true };
+}
+
+fn inspect_dll_x64(bytes) {
+    let base = inspect_x64(bytes);
+    let dll = base.ok and len(bytes) > 0x57 and num_mod(num_floor(bytes[0x57] / 32), 2) == 1;
+    return map{ ok: base.ok and dll, format: if base.ok and dll { "pe32+-dll" } else { base.format },
+        machine: base.machine, dll: dll, wx_split: base.wx_split, nx_compatible: base.nx_compatible };
+}
+
 export layout_x64, iat_rva, call_iat_x64, assemble_x64, inspect_x64;
+export assemble_dll_x64, inspect_dll_x64;

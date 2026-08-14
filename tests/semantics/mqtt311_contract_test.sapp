@@ -1,0 +1,66 @@
+let MQTT=import("stdlib:mqtt311.sapp");let TCP=import("stdlib:native_tcp.sapp");
+let PROCESS=import("stdlib:linux_process.sapp");
+fn expect(value,message){if not value{throw "FAIL MQTT 3.1.1: "+message;}}
+fn u16(bytes,at){return bytes[at]*256+bytes[at+1];}
+
+expect(MQTT.encode_remaining_length(0)==[0]
+    and MQTT.encode_remaining_length(127)==[127]
+    and MQTT.encode_remaining_length(128)==[128,1]
+    and MQTT.encode_remaining_length(16384)==[128,128,1],"canonical remaining lengths");
+expect(MQTT.decode_remaining_length([255,255,255,127]).value==268435455
+    and not MQTT.decode_remaining_length([128,0]).ok
+    and not MQTT.decode_remaining_length([128,128,128,128]).ok,"strict remaining-length decode");
+expect(MQTT.valid_topic_name("devices/status") and not MQTT.valid_topic_name("devices/+")
+    and MQTT.valid_topic_filter("devices/+/state") and MQTT.valid_topic_filter("devices/#")
+    and not MQTT.valid_topic_filter("devices/a+b") and not MQTT.valid_topic_filter("devices/#/x"),
+    "topic and filter grammar");
+expect(MQTT.connect_packet("pb-test")==[16,19,0,4,77,81,84,84,4,2,0,30,0,7,112,98,45,116,101,115,116],
+    "MQTT 3.1.1 CONNECT wire vector");
+expect(MQTT.publish_packet("a",[120],1,7,false)==[50,6,0,1,97,0,7,120]
+    and MQTT.subscribe_packet("a/+",1,9)==[130,8,0,9,0,3,97,47,43,1],
+    "publish and subscribe wire vectors");
+
+if platform()=="linux"{
+    let runtime=path_join(cwd(),"target/release/pblang");
+    for qos in [0,1,2]{
+        let listener=TCP.listen_ipv4("127.0.0.1",0,2);expect(listener.ok,"publish listener");
+        let child=PROCESS.start(runtime,["run","tests/fixtures/mqtt311_publish_client_fixture.sapp","--allow-all"],map{
+            timeout_secs:10,startup_timeout_ms:5000,max_output_bytes:16384,max_memory_bytes:805306368,
+            inherit_environment:false,environment:map{PB_MQTT_TEST_PORT:str(listener.port),PB_MQTT_TEST_QOS:str(qos)}});
+        expect(child.ok,"publish client starts");let peer=TCP.accept_bounded(listener,5000);expect(peer.ok,"publish accept");
+        let connect=MQTT.read_packet(peer,128,2000);expect(connect.ok and connect.header==16,"CONNECT received");
+        expect(TCP.write_bytes(peer,[32,2,0,0],1000).ok,"CONNACK sent");
+        let published=MQTT.read_packet(peer,128,2000);let message=MQTT.parse_publish(published);
+        expect(message.ok and message.topic=="devices/status" and message.payload==[0,65,255]
+            and message.qos==qos,"exact PUBLISH QoS "+str(qos));
+        if qos==1{expect(TCP.write_bytes(peer,MQTT.acknowledgement_packet("puback",message.packet_id),1000).ok,"PUBACK");}
+        elif qos==2{
+            expect(TCP.write_bytes(peer,MQTT.acknowledgement_packet("pubrec",message.packet_id),1000).ok,"PUBREC");
+            let rel=MQTT.read_packet(peer,16,1000);expect(rel.ok and rel.header==98 and u16(rel.body,0)==message.packet_id,"PUBREL");
+            expect(TCP.write_bytes(peer,MQTT.acknowledgement_packet("pubcomp",message.packet_id),1000).ok,"PUBCOMP");
+        }
+        try MQTT.read_packet(peer,8,500) catch nil;TCP.close(peer);TCP.close(listener);
+        let done=PROCESS.finish(child,5000);let result=json_parse(str_trim(done.stdout));
+        expect(done.ok and done.exit_code==0 and done.process_group_terminated and result.ok
+            and result.published and result.qos==qos and result.acknowledged==(qos>0),"publish client result");
+    }
+
+    let listener=TCP.listen_ipv4("127.0.0.1",0,2);expect(listener.ok,"subscribe listener");
+    let child=PROCESS.start(runtime,["run","tests/fixtures/mqtt311_subscribe_client_fixture.sapp","--allow-all"],map{
+        timeout_secs:10,startup_timeout_ms:5000,max_output_bytes:16384,max_memory_bytes:805306368,
+        inherit_environment:false,environment:map{PB_MQTT_TEST_PORT:str(listener.port)}});
+    expect(child.ok,"subscribe client starts");let peer=TCP.accept_bounded(listener,5000);expect(peer.ok,"subscribe accept");
+    expect(MQTT.read_packet(peer,128,2000).header==16 and TCP.write_bytes(peer,[32,2,0,0],1000).ok,"subscribe CONNACK");
+    let subscribe=MQTT.read_packet(peer,128,2000);expect(subscribe.ok and subscribe.header==130,"SUBSCRIBE frame");
+    let id=u16(subscribe.body,0);expect(TCP.write_bytes(peer,[144,3,num_floor(id/256),num_mod(id,256),2],1000).ok,"SUBACK");
+    expect(TCP.write_bytes(peer,MQTT.publish_packet("devices/one",[104,105],2,77,false),1000).ok,"inbound QoS2 PUBLISH");
+    let rec=MQTT.read_packet(peer,16,1000);expect(rec.ok and rec.header==80 and u16(rec.body,0)==77,"subscriber PUBREC");
+    expect(TCP.write_bytes(peer,MQTT.acknowledgement_packet("pubrel",77),1000).ok,"broker PUBREL");
+    let comp=MQTT.read_packet(peer,16,1000);expect(comp.ok and comp.header==112 and u16(comp.body,0)==77,"subscriber PUBCOMP");
+    try MQTT.read_packet(peer,8,500) catch nil;TCP.close(peer);TCP.close(listener);
+    let done=PROCESS.finish(child,5000);let result=json_parse(str_trim(done.stdout));
+    expect(done.ok and done.exit_code==0 and done.process_group_terminated and result.ok and result.count==1
+        and result.messages[0].topic=="devices/one" and result.messages[0].text=="hi"
+        and result.messages[0].qos==2,"subscribe QoS2 receiver state");
+}
+print "mqtt311_contract_pass";

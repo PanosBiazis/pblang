@@ -1,0 +1,217 @@
+// Race-resistant bounded Linux serial/TTY I/O implemented in PBLang.
+
+let LIBC = [
+    "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6", "/lib/i386-linux-gnu/libc.so.6"
+];
+let CRYPTO = [
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3", "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/aarch64-linux-gnu/libcrypto.so.3", "/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/i386-linux-gnu/libcrypto.so.3", "/lib/i386-linux-gnu/libcrypto.so.3"
+];
+let FORMAT = "pblang.linux-serial.v1";
+let TEST_FORMAT = "pblang.linux-serial-test-pty.v1";
+let MAX_IO_BYTES = 65536;
+let AT_FDCWD = -100;
+let O_RDWR = 2; let O_NOCTTY = 256; let O_NONBLOCK = 2048;
+let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
+let POLLIN = 1; let POLLOUT = 4; let TCSANOW = 0; let TERMIOS_BYTES = 64;
+let BAUD = map{
+    "50":1,"75":2,"110":3,"134":4,"150":5,"200":6,"300":7,"600":8,
+    "1200":9,"1800":10,"2400":11,"4800":12,"9600":13,"19200":14,"38400":15,
+    "57600":4097,"115200":4098,"230400":4099,"460800":4100,"500000":4101,
+    "576000":4102,"921600":4103,"1000000":4104,"1152000":4105,
+    "1500000":4106,"2000000":4107,"2500000":4108,"3000000":4109,
+    "3500000":4110,"4000000":4111
+};
+
+fn _integer(value, minimum, maximum) {
+    return type(value)=="number" and value==num_floor(value)
+        and value>=minimum and value<=maximum;
+}
+fn _path(values) { for i len(values) { if fs_exists(values[i]) { return values[i]; } } return ""; }
+fn available() {
+    let libc=_path(LIBC); let crypto=_path(CRYPTO);
+    return map{ok:platform()=="linux" and libc!="" and crypto!="",format:FORMAT,
+        platform:platform(),libc:libc,crypto:crypto,nonblocking:true,cloexec:true,
+        nofollow:true,termios_restore:true,max_io_bytes:MAX_IO_BYTES,
+        baud_rates:array_sort(map_keys(BAUD))};
+}
+fn _i32(value) { if value>=2147483648 and value<=4294967295{return value-4294967296;} return value; }
+fn _call(state,name,signature,args){return try ffi_call_typed(state.libc,name,signature,args) catch -1;}
+fn _free(state,pointer){if pointer!=nil and pointer!=0{_call(state,"free","ptr->void",[pointer]);}}
+fn _cstring(state,value){return _call(state,"strdup","string->ptr",[value]);}
+fn _openat(state,dirfd,name,flags){
+    let pointer=_cstring(state,name);if pointer==nil or pointer==0{return -1;}
+    let result=_i32(_call(state,"openat","i32,ptr,i32,i32->i32",[dirfd,pointer,flags,0]));
+    _free(state,pointer);return result;
+}
+fn _free_crypto(state,pointer){if pointer!=nil and pointer!=0{try ffi_call_typed(state.crypto,
+    "CRYPTO_free","ptr,ptr,i32->void",[pointer,0,0]) catch nil;}}
+fn _write_le(state,pointer,value,count){let remaining=value;for i count{
+    _call(state,"memset","ptr,i32,i64->ptr",[pointer+i,num_mod(remaining,256),1]);
+    remaining=num_floor(remaining/256);
+}}
+fn _poll(state,events,timeout_ms){
+    if not _integer(timeout_ms,0,60000){return -1;}
+    let record=_call(state,"calloc","i64,i64->ptr",[1,8]);if record==nil or record==0{return -1;}
+    _write_le(state,record,state.fd,4);_write_le(state,record+4,events,2);
+    let result=_i32(_call(state,"poll","ptr,i64,i32->i32",[record,1,timeout_ms]));
+    _free(state,record);return result;
+}
+fn _hex(bytes){let digits="0123456789abcdef";let out="";for i len(bytes){
+    let high=num_floor(bytes[i]/16);let low=num_mod(bytes[i],16);
+    out=out+str_slice(digits,high,high+1)+str_slice(digits,low,low+1);
+}return out;}
+fn _valid_bytes(value){if type(value)!="array" or len(value)>MAX_IO_BYTES{return false;}
+    for i len(value){if not _integer(value[i],0,255){return false;}}return true;}
+fn _pointer_bytes(state,pointer,count){
+    if pointer==nil or pointer==0 or not _integer(count,0,MAX_IO_BYTES){return map{ok:false,error:"invalid serial byte copy"};}
+    if count==0{return map{ok:true,bytes:[],count:0};}
+    let encoded=try ffi_call_typed(state.crypto,"OPENSSL_buf2hexstr","ptr,i64->ptr",[pointer,count]) catch nil;
+    if encoded==nil or encoded==0{return map{ok:false,error:"serial byte encoding failed"};}
+    let hex=try ffi_call_typed(state.libc,"basename","ptr->string",[encoded]) catch nil;
+    _free_crypto(state,encoded);if type(hex)!="string"{return map{ok:false,error:"serial bytes unavailable"};}
+    let clean=str_lower(str_replace_all(hex,":",""));if len(clean)!=count*2{return map{ok:false,error:"serial byte count mismatch"};}
+    let out=[];for i count{let at=i*2;let high=str_index_of("0123456789abcdef",str_slice(clean,at,at+1));
+        let low=str_index_of("0123456789abcdef",str_slice(clean,at+1,at+2));
+        if high<0 or low<0{return map{ok:false,error:"serial hex encoding invalid"};}
+        array_push(out,high*16+low);
+    }return map{ok:true,bytes:out,count:count};
+}
+fn _port(value){
+    let port=str(value);let root="";let name="";
+    if regex_match(port,"^/dev/(ttyUSB|ttyACM|ttyS|ttyAMA|ttyAP|rfcomm)[0-9]{1,3}$"){
+        root="/dev";name=str_slice(port,5,len(port));
+    } else if (try env_get("PB_PROJECT_TEST_ENABLE") catch "") == "1"
+        and regex_match(port,"^/dev/pts/[0-9]{1,8}$") {
+        root="/dev/pts";name=str_slice(port,9,len(port));
+    } else {return map{ok:false,error:"serial port is outside the allowed /dev namespace"};}
+    return map{ok:true,path:port,root:root,name:name};
+}
+fn _handles(){let support=available();if not support.ok{return map{ok:false,error:"Linux serial backend unavailable"};}
+    let libc=try ffi_load(support.libc) catch nil;let crypto=try ffi_load(support.crypto) catch nil;
+    if libc==nil or crypto==nil{try ffi_close(libc) catch nil;try ffi_close(crypto) catch nil;
+        return map{ok:false,error:"trusted serial libraries unavailable"};}
+    return map{ok:true,format:FORMAT,libc:libc,crypto:crypto,fd:-1,closed:false,
+        original:0,working:0,configured:false};
+}
+fn open_port(port,baud=9600){
+    let parsed=_port(port);if not parsed.ok{return parsed;}
+    if not map_has(BAUD,str(baud)){return map{ok:false,error:"unsupported serial baud rate"};}
+    let state=_handles();if not state.ok{return state;}
+    let root=_openat(state,AT_FDCWD,parsed.root,O_DIRECTORY+O_NOFOLLOW+O_CLOEXEC);
+    if root<0{close(state);return map{ok:false,error:"serial parent directory cannot be held"};}
+    state.fd=_openat(state,root,parsed.name,
+        O_RDWR+O_NOCTTY+O_NONBLOCK+O_NOFOLLOW+O_CLOEXEC);
+    _call(state,"close","i32->i32",[root]);
+    if state.fd<0{close(state);return map{ok:false,error:"serial device cannot be opened without following links"};}
+    if _i32(_call(state,"isatty","i32->i32",[state.fd]))!=1{close(state);
+        return map{ok:false,error:"serial target is not a TTY character device"};}
+    state.original=_call(state,"calloc","i64,i64->ptr",[1,TERMIOS_BYTES]);
+    state.working=_call(state,"calloc","i64,i64->ptr",[1,TERMIOS_BYTES]);
+    if state.original==nil or state.original==0 or state.working==nil or state.working==0
+        or _i32(_call(state,"tcgetattr","i32,ptr->i32",[state.fd,state.original]))!=0 {
+        close(state);return map{ok:false,error:"serial termios state cannot be read"};
+    }
+    _call(state,"memcpy","ptr,ptr,i64->ptr",[state.working,state.original,TERMIOS_BYTES]);
+    _call(state,"cfmakeraw","ptr->void",[state.working]);
+    let speed=BAUD[str(baud)];
+    if _i32(_call(state,"cfsetispeed","ptr,i32->i32",[state.working,speed]))!=0
+        or _i32(_call(state,"cfsetospeed","ptr,i32->i32",[state.working,speed]))!=0
+        or _i32(_call(state,"tcsetattr","i32,i32,ptr->i32",[state.fd,TCSANOW,state.working]))!=0 {
+        close(state);return map{ok:false,error:"serial raw mode or baud configuration failed"};
+    }
+    state.ok=true;state.configured=true;state.path=parsed.path;state.baud=baud;
+    state.descriptor_bound=true;state.nofollow=true;state.nonblocking=true;state.cloexec=true;
+    return state;
+}
+fn read_bytes(state,maximum=4096,timeout_ms=3000){
+    if type(state)!="map" or (try state.format catch "")!=FORMAT or (try state.closed catch true)
+        or not _integer(maximum,1,MAX_IO_BYTES) or not _integer(timeout_ms,1,60000){
+        return map{ok:false,error:"invalid bounded serial read"};
+    }
+    let buffer=_call(state,"calloc","i64,i64->ptr",[maximum,1]);
+    if buffer==nil or buffer==0{return map{ok:false,error:"serial read allocation failed"};}
+    let count=0;let started=now_ms();let timed_out=false;
+    while count<maximum {
+        let remaining=timeout_ms-num_floor(now_ms()-started);
+        if remaining<1{timed_out=true;break;}
+        let wait=remaining;
+        if count>0 and wait>5{wait=5;}
+        let ready=_poll(state,POLLIN,wait);
+        if ready==0{if count==0{timed_out=true;}break;}
+        if ready<0{_free(state,buffer);return map{ok:false,error:"serial poll failed"};}
+        let got=_call(state,"read","i32,ptr,i64->i64",[state.fd,buffer+count,maximum-count]);
+        if got>0{count=count+got;}
+        if got==0{break;}
+        if got<0{_free(state,buffer);return map{ok:false,error:"serial nonblocking read failed"};}
+    }
+    let copied=_pointer_bytes(state,buffer,count);_free(state,buffer);if not copied.ok{return copied;}
+    return map{ok:true,format:FORMAT,bytes:copied.bytes,count:count,bytes_read:count,
+        timed_out:timed_out,elapsed_ms:now_ms()-started,truncated:count==maximum,
+        descriptor_bound:true,nonblocking:true};
+}
+fn write_bytes(state,bytes,timeout_ms=3000){
+    if type(state)!="map" or (try state.format catch "")!=FORMAT or (try state.closed catch true)
+        or not _valid_bytes(bytes) or not _integer(timeout_ms,1,60000){return map{ok:false,error:"invalid bounded serial write"};}
+    if len(bytes)==0{return map{ok:true,count:0,bytes_sent:0,elapsed_ms:0};}
+    let buffer=try ffi_call_typed(state.crypto,"OPENSSL_hexstr2buf","string,ptr->ptr",[_hex(bytes),0]) catch nil;
+    if buffer==nil or buffer==0{return map{ok:false,error:"serial write allocation failed"};}
+    let offset=0;let started=now_ms();
+    while offset<len(bytes){let remaining=timeout_ms-num_floor(now_ms()-started);
+        if remaining<1 or _poll(state,POLLOUT,remaining)<=0{_free_crypto(state,buffer);
+            return map{ok:false,error:"serial write deadline expired",timeout:true,bytes_sent:offset};}
+        let wrote=_call(state,"write","i32,ptr,i64->i64",[state.fd,buffer+offset,len(bytes)-offset]);
+        if wrote<=0 or wrote>len(bytes)-offset{_free_crypto(state,buffer);
+            return map{ok:false,error:"serial nonblocking write failed",bytes_sent:offset};}
+        offset=offset+wrote;
+    }
+    _free_crypto(state,buffer);return map{ok:true,format:FORMAT,count:offset,bytes_sent:offset,
+        elapsed_ms:now_ms()-started,descriptor_bound:true,nonblocking:true};
+}
+fn close(state){
+    let restored=true;
+    if type(state)=="map" and not (try state.closed catch true){
+        if (try state.configured catch false) and (try state.fd catch -1)>=0
+            and (try state.original catch 0)!=0 {
+            restored=_i32(_call(state,"tcsetattr","i32,i32,ptr->i32",
+                [state.fd,TCSANOW,state.original]))==0;
+        }
+        if (try state.fd catch -1)>=0{_call(state,"close","i32->i32",[state.fd]);state.fd=-1;}
+        _free(state,try state.original catch 0);_free(state,try state.working catch 0);
+        try ffi_close(state.crypto) catch nil;try ffi_close(state.libc) catch nil;
+        state.closed=true;state.original=0;state.working=0;
+    }return map{ok:restored,termios_restored:restored};
+}
+fn _test_enabled(){return (try env_get("PB_PROJECT_TEST_ENABLE") catch "")=="1";}
+fn test_pty_pair(){
+    if not _test_enabled(){return map{ok:false,error:"PTY fixture is test-only"};}
+    let state=_handles();if not state.ok{return state;}state.format=TEST_FORMAT;
+    state.fd=_i32(_call(state,"posix_openpt","i32->i32",[O_RDWR+O_NOCTTY+O_NONBLOCK+O_CLOEXEC]));
+    if state.fd<0 or _i32(_call(state,"grantpt","i32->i32",[state.fd]))!=0
+        or _i32(_call(state,"unlockpt","i32->i32",[state.fd]))!=0{close_test_pty(state);
+        return map{ok:false,error:"test PTY allocation failed"};}
+    let path=try ffi_call_typed(state.libc,"ptsname","i32->string",[state.fd]) catch nil;
+    if type(path)!="string" or not regex_match(path,"^/dev/pts/[0-9]{1,8}$"){close_test_pty(state);
+        return map{ok:false,error:"test PTY path was invalid"};}
+    state.ok=true;state.path=path;state.closed=false;return state;
+}
+fn test_write_master(state,bytes,timeout_ms=500){
+    if not _test_enabled() or (try state.format catch "")!=TEST_FORMAT{return map{ok:false,error:"invalid test PTY"};}
+    let original=state.format;state.format=FORMAT;let result=write_bytes(state,bytes,timeout_ms);state.format=original;return result;
+}
+fn test_read_master(state,maximum=4096,timeout_ms=500){
+    if not _test_enabled() or (try state.format catch "")!=TEST_FORMAT{return map{ok:false,error:"invalid test PTY"};}
+    let original=state.format;state.format=FORMAT;let result=read_bytes(state,maximum,timeout_ms);state.format=original;return result;
+}
+fn close_test_pty(state){
+    if type(state)=="map" and not (try state.closed catch true){if (try state.fd catch -1)>=0{
+        _call(state,"close","i32->i32",[state.fd]);state.fd=-1;}
+        try ffi_close(state.crypto) catch nil;try ffi_close(state.libc) catch nil;state.closed=true;}
+    return map{ok:true};
+}
+
+export FORMAT, MAX_IO_BYTES, available, open_port, read_bytes, write_bytes, close;
+export test_pty_pair, test_write_master, test_read_master, close_test_pty;

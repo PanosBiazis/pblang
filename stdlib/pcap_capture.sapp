@@ -1,0 +1,197 @@
+// Bounded classic-PCAP parsing and Linux packet capture through fixed tcpdump.
+//
+// The capture stream uses the child's already-open binary stdout and the
+// supervisor's private descriptor-held spool, so tcpdump may drop privileges
+// before capture without reopening a parent procfs descriptor. Callers receive
+// only packet metadata, never payload bytes or a filesystem pathname. Filters are a
+// closed enum rather than caller-supplied BPF source. The kernel still requires
+// CAP_NET_RAW/CAP_NET_ADMIN (or an equivalent capture broker); absence of that
+// privilege is reported without an unsafe fallback.
+
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+
+let FORMAT = "pblang.pcap-capture.v1";
+let MAX_PACKETS = 256;
+let MAX_SNAPLEN = 256;
+let MAX_CAPTURE_BYTES = 69656;
+
+fn _error(message) { return map{ ok: false, executed: false, error: message }; }
+fn _integer(value, fallback, minimum, maximum, label) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw "pcap_capture: " + label + " must be an integer in "
+            + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+fn _u16(bytes, at, little) {
+    if little { return bytes[at] + bytes[at + 1] * 256; }
+    return bytes[at] * 256 + bytes[at + 1];
+}
+fn _u32(bytes, at, little) {
+    if little {
+        return bytes[at] + bytes[at + 1] * 256 + bytes[at + 2] * 65536
+            + bytes[at + 3] * 16777216;
+    }
+    return bytes[at] * 16777216 + bytes[at + 1] * 65536
+        + bytes[at + 2] * 256 + bytes[at + 3];
+}
+fn _byte_array(bytes) {
+    if type(bytes) != "array" or len(bytes) > MAX_CAPTURE_BYTES { return false; }
+    for i len(bytes) {
+        if type(bytes[i]) != "number" or bytes[i] != num_floor(bytes[i])
+           or bytes[i] < 0 or bytes[i] > 255 { return false; }
+    }
+    return true;
+}
+
+fn parse(bytes, maximum_packets = nil) {
+    maximum_packets = _integer(maximum_packets, MAX_PACKETS, 1, MAX_PACKETS,
+        "maximum_packets");
+    if not _byte_array(bytes) or len(bytes) < 24 {
+        return _error("classic PCAP input is missing, malformed, or exceeds its byte ceiling");
+    }
+    let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    let little = false; let resolution = "microseconds";
+    if magic == [212,195,178,161] { little = true; }
+    elif magic == [161,178,195,212] { little = false; }
+    elif magic == [77,60,178,161] { little = true; resolution = "nanoseconds"; }
+    elif magic == [161,178,60,77] { little = false; resolution = "nanoseconds"; }
+    else { return _error("unsupported classic PCAP magic"); }
+    let major = _u16(bytes,4,little); let minor = _u16(bytes,6,little);
+    let snaplen = _u32(bytes,16,little); let link_type = _u32(bytes,20,little);
+    if major != 2 or minor != 4 or snaplen < 1 or snaplen > MAX_SNAPLEN
+       or link_type > 65535 {
+        return _error("unsupported or unsafe classic PCAP global header");
+    }
+    let records = []; let at = 24; let total_original = 0; let truncated = false;
+    while at < len(bytes) {
+        if len(records) >= maximum_packets { truncated = true; break; }
+        if at + 16 > len(bytes) { return _error("truncated classic PCAP record header"); }
+        let seconds = _u32(bytes,at,little); let fraction = _u32(bytes,at+4,little);
+        let captured = _u32(bytes,at+8,little); let original = _u32(bytes,at+12,little);
+        if captured > snaplen or original < captured or original > 16777216
+           or at + 16 + captured > len(bytes)
+           or (resolution == "microseconds" and fraction >= 1000000)
+           or (resolution == "nanoseconds" and fraction >= 1000000000) {
+            return _error("unsafe or truncated classic PCAP packet record");
+        }
+        array_push(records, map{ timestamp_seconds: seconds,
+            timestamp_fraction: fraction, captured_length: captured,
+            original_length: original, payload_exposed: false });
+        total_original = total_original + original; at = at + 16 + captured;
+    }
+    if not truncated and at != len(bytes) { return _error("classic PCAP trailing bytes are malformed"); }
+    return map{ ok: true, format: FORMAT, version: "2.4", byte_order: if little { "little" } else { "big" },
+        timestamp_resolution: resolution, snaplen: snaplen, link_type: link_type,
+        packets: records, packet_count: len(records), capture_bytes: len(bytes),
+        total_original_bytes: total_original, records_truncated: truncated,
+        payloads_exposed: false, raw_capture_exposed: false };
+}
+
+fn _interfaces() {
+    let root = DIRFS.open_absolute("/sys/class/net",false,false);
+    if not root.ok { return root; }
+    let listed = DIRFS.list(root,"root",256); let closed = DIRFS.close(root);
+    if not listed.ok or not closed { return _error("network interface inventory is unavailable"); }
+    let names = [];
+    for i len(listed.entries) {
+        let name = str(listed.entries[i]);
+        if regex_match(name,"^[A-Za-z0-9_.:-]{1,64}$") { array_push(names,name); }
+    }
+    return map{ ok: true, names: names, entries_truncated: listed.truncated,
+        descriptor_held: true, interface_symlinks_followed: false };
+}
+
+fn _filter(protocol, port) {
+    protocol = str_lower(str(protocol));
+    if not (protocol == "all" or protocol == "tcp" or protocol == "udp"
+       or protocol == "icmp" or protocol == "arp") {
+        throw "pcap_capture: protocol must be all, tcp, udp, icmp, or arp";
+    }
+    let argv = [];
+    if protocol != "all" { array_push(argv,protocol); }
+    if port != nil {
+        port = _integer(port,nil,1,65535,"port");
+        if protocol == "icmp" or protocol == "arp" {
+            throw "pcap_capture: port is incompatible with icmp or arp";
+        }
+        if len(argv) > 0 { array_push(argv,"and"); }
+        array_push(argv,"port"); array_push(argv,str(port));
+    }
+    return map{ protocol: protocol, port: port, argv: argv };
+}
+
+fn _isolated_test_namespace(interface) {
+    if interface != "lo" or (try env_get("PBLANG_PCAP_ISOLATED_TEST") catch "") != "1" {
+        return false;
+    }
+    let mapping = try str_trim(fs_read("/proc/self/uid_map")) catch "";
+    let fields = str_split(mapping," "); let compact = [];
+    for i len(fields) { if str_trim(fields[i]) != "" { array_push(compact,str_trim(fields[i])); } }
+    if len(compact) != 3 { return false; }
+    let inside = try parse_number(compact[0]) catch -1;
+    let outside = try parse_number(compact[1]) catch 0;
+    let count = try parse_number(compact[2]) catch 0;
+    return inside == 0 and outside > 0 and count == 1;
+}
+
+fn capture(options) {
+    if type(options) != "map" { throw "pcap_capture: options must be a map"; }
+    let interface = str(try options.interface catch "");
+    if not regex_match(interface,"^[A-Za-z0-9_.:-]{1,64}$") {
+        throw "pcap_capture: invalid interface";
+    }
+    let count = _integer(try options.count catch nil,100,1,MAX_PACKETS,"count");
+    let timeout = _integer(try options.timeout_secs catch nil,10,1,60,"timeout_secs");
+    let snaplen = _integer(try options.snaplen catch nil,96,64,MAX_SNAPLEN,"snaplen");
+    let filter = _filter(try options.protocol catch "all",try options.port catch nil);
+    let inventory = _interfaces(); if not inventory.ok { return inventory; }
+    let found = false; for i len(inventory.names) { if inventory.names[i] == interface { found = true; } }
+    if not found { return _error("network interface does not exist in this network namespace"); }
+    let argv = ["-nn","-U","-q","-i",interface,"-c",str(count),"-s",str(snaplen),
+        "-w","-"];
+    let isolated_test = _isolated_test_namespace(interface);
+    if isolated_test { array_push(argv,"-Z"); array_push(argv,"root"); }
+    for i len(filter.argv) { array_push(argv,filter.argv[i]); }
+    let expected = 24 + count * (16 + snaplen);
+    let output_ceiling = expected + 65536;
+    let run = PROCESS.run_fixed(["/usr/bin/tcpdump","/usr/sbin/tcpdump"],argv,map{
+        timeout_secs:timeout,startup_timeout_ms:5000,max_output_bytes:output_ceiling,
+        max_file_bytes:output_ceiling,max_memory_bytes:134217728,
+        inherit_environment:false,environment:map{LC_ALL:"C",HOME:"/nonexistent"}
+    });
+    let bytes = try run.stdout_bytes catch nil;
+    let parsed = if is_array(bytes) and len(bytes) >= 24 { parse(bytes,count) }
+        else { _error("no valid PCAP header was produced") };
+    if not parsed.ok or not (try run.command_ok catch false) {
+        if parsed.ok { parsed.ok = false; parsed.error = "packet capture process did not complete successfully"; }
+        parsed.executed = try run.completed catch false; parsed.exit_code = try run.exit_code catch -1;
+        parsed.stderr = try run.stderr catch try run.error catch "";
+        parsed.privilege_required = str_contains(str_lower(parsed.stderr),"permission")
+            or str_contains(str_lower(parsed.stderr),"operation not permitted");
+        parsed.cleanup_verified = try run.process_group_terminated catch false;
+        return parsed;
+    }
+    parsed.executed = true; parsed.interface = interface; parsed.requested_count = count;
+    parsed.timeout_secs = timeout; parsed.protocol = filter.protocol; parsed.port = filter.port;
+    parsed.exit_code = try run.exit_code catch -1; parsed.deadline_reached = try run.timed_out catch false;
+    parsed.process_group_terminated = try run.process_group_terminated catch false;
+    parsed.output_truncated = try run.output_truncated catch false;
+    parsed.cleanup_verified = try run.process_group_terminated catch false;
+    parsed.anonymous_capture = false; parsed.private_descriptor_spool = true;
+    parsed.isolated_namespace_test_override = isolated_test;
+    parsed.shell_used = false; parsed.arbitrary_bpf_enabled = false;
+    parsed.ok = (try run.command_ok catch false) and parsed.cleanup_verified
+        and parsed.process_group_terminated and not parsed.output_truncated;
+    return parsed;
+}
+
+fn status() { return map{ format:FORMAT,available:platform()=="linux" and PROCESS.status().available,
+    classic_pcap:true,max_packets:MAX_PACKETS,max_snaplen:MAX_SNAPLEN,max_capture_bytes:MAX_CAPTURE_BYTES,
+    private_descriptor_spool:true,payloads_exposed:false,arbitrary_bpf_enabled:false,
+    privilege_model:"CAP_NET_RAW/CAP_NET_ADMIN or equivalent capture broker" }; }
+
+export parse, capture, status, FORMAT, MAX_PACKETS, MAX_SNAPLEN, MAX_CAPTURE_BYTES;

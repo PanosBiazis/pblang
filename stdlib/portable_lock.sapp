@@ -1,0 +1,221 @@
+// Portable publication for content-addressed pblang.lock files.
+//
+// The bootstrap package manager hashes the canonical dependency tree correctly,
+// but currently serializes local dependency roots as host-absolute paths. This
+// module preserves every digest and rewrites only those local paths back to the
+// relative paths declared by pblang.toml, after bounded structural validation.
+
+let PATH = import("stdlib:path.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let SER = import("stdlib:serialization.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+
+let FORMAT = "pblang.portable-lock.v1";
+let MAX_DOCUMENT_BYTES = 1048576;
+let MAX_DEPENDENCIES = 1024;
+
+fn _fail(message) { throw "portable_lock: " + message; }
+
+fn _quoted(value) {
+    let out = "\"";
+    let i = 0;
+    while i < len(value) {
+        let ch = str_slice(value, i, i + 1);
+        if ch == "\\" { out = out + "\\\\"; }
+        else if ch == "\"" { out = out + "\\\""; }
+        else if ch == "\n" or ch == "\r" or ch == "\x00" { _fail("path contains a control character"); }
+        else { out = out + ch; }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+fn _unquote(value) {
+    let text = str_trim(value);
+    if len(text) < 2 or str_slice(text, 0, 1) != "\"" or str_slice(text, len(text) - 1, len(text)) != "\"" {
+        _fail("expected a double-quoted TOML string");
+    }
+    let out = "";
+    let i = 1;
+    while i < len(text) - 1 {
+        let ch = str_slice(text, i, i + 1);
+        if ch == "\\" {
+            if i + 1 >= len(text) - 1 { _fail("unterminated path escape"); }
+            let next = str_slice(text, i + 1, i + 2);
+            if next != "\\" and next != "\"" { _fail("unsupported path escape"); }
+            out = out + next;
+            i = i + 2;
+        } else {
+            out = out + ch;
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _absolute(value) {
+    let path = str_trim(value);
+    if PATH.is_absolute(path) or str_starts_with(path, "\\\\") or
+       str_starts_with(path, "~/") or str_starts_with(path, "~\\") { return true; }
+    return regex_match(path, "^[A-Za-z]:[\\\\/]");
+}
+
+fn _strip_comment(line) {
+    let quoted = false;
+    let escaped = false;
+    let i = 0;
+    while i < len(line) {
+        let ch = str_slice(line, i, i + 1);
+        if escaped { escaped = false; }
+        else if quoted and ch == "\\" { escaped = true; }
+        else if ch == "\"" { quoted = not quoted; }
+        else if ch == "#" and not quoted { return str_slice(line, 0, i); }
+        i = i + 1;
+    }
+    return line;
+}
+
+fn _unquoted_equals(line) {
+    let quoted = false;
+    let escaped = false;
+    let i = 0;
+    while i < len(line) {
+        let ch = str_slice(line, i, i + 1);
+        if escaped { escaped = false; }
+        else if quoted and ch == "\\" { escaped = true; }
+        else if ch == "\"" { quoted = not quoted; }
+        else if ch == "=" and not quoted { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _inline_path(spec) {
+    let text = str_trim(spec);
+    if not str_starts_with(text, "{") or not str_ends_with(text, "}") { return nil; }
+    let inner = str_slice(text, 1, len(text) - 1);
+    let fields = str_split(inner, ",");
+    let found = nil;
+    let i = 0;
+    while i < len(fields) {
+        let field = str_trim(fields[i]);
+        let eq = _unquoted_equals(field);
+        if eq > 0 {
+            let key = str_trim(str_slice(field, 0, eq));
+            if key == "path" {
+                if found != nil { _fail("dependency declares path more than once"); }
+                found = _unquote(str_trim(str_slice(field, eq + 1, len(field))));
+            }
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn manifest_paths(text) {
+    if type(text) != "string" or len(text) > MAX_DOCUMENT_BYTES { _fail("manifest exceeds the input bound"); }
+    let out = map{};
+    let in_dependencies = false;
+    let lines = str_split(text, "\n");
+    let i = 0;
+    while i < len(lines) {
+        let line = str_trim(_strip_comment(lines[i]));
+        if str_starts_with(line, "[") {
+            in_dependencies = line == "[dependencies]";
+        } else if in_dependencies and line != "" {
+            let eq = _unquoted_equals(line);
+            if eq <= 0 { _fail("malformed dependencies entry on line " + str(i + 1)); }
+            let name = str_trim(str_slice(line, 0, eq));
+            if str_starts_with(name, "\"") { name = _unquote(name); }
+            if name == "" or len(name) > 256 { _fail("invalid dependency name"); }
+            let path = _inline_path(str_trim(str_slice(line, eq + 1, len(line))));
+            if path != nil {
+                if path == "" or len(path) > 4096 or _absolute(path) { _fail("dependency '" + name + "' path must be relative"); }
+                out[name] = PATH.normalize(path);
+                if len(map_keys(out)) > MAX_DEPENDENCIES { _fail("dependency count exceeds the bound"); }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolved(base, value) {
+    if _absolute(value) { return PATH.normalize(value); }
+    return PATH.normalize(PATH.join(PATH.normalize(PATH.absolute(base)), value));
+}
+
+fn normalize_text(manifest_text, lock_text, manifest_dir = ".") {
+    if type(lock_text) != "string" or len(lock_text) > MAX_DOCUMENT_BYTES { _fail("lock exceeds the input bound"); }
+    let declared = manifest_paths(manifest_text);
+    let parsed = try SER.toml_parse(lock_text) catch nil;
+    if parsed == nil or type(parsed) != "map" or type(try parsed.dependencies catch nil) != "map" {
+        _fail("lock is not valid supported TOML");
+    }
+    let lines = str_split(lock_text, "\n");
+    let output = [];
+    let section = "";
+    let replaced = map{};
+    let i = 0;
+    while i < len(lines) {
+        let raw = lines[i];
+        let trimmed = str_trim(raw);
+        if str_starts_with(trimmed, "[dependencies.") and str_ends_with(trimmed, "]") {
+            section = str_slice(trimmed, 14, len(trimmed) - 1);
+            if str_starts_with(section, "\"") { section = _unquote(section); }
+        }
+        if str_starts_with(trimmed, "path = ") and map_has(declared, section) {
+            let eq = _unquoted_equals(trimmed);
+            let locked_path = _unquote(str_trim(str_slice(trimmed, eq + 1, len(trimmed))));
+            let expected = _resolved(manifest_dir, declared[section]);
+            if _resolved(manifest_dir, locked_path) != expected {
+                _fail("dependency '" + section + "' lock path does not match its manifest path");
+            }
+            raw = "path = " + _quoted(declared[section]);
+            replaced[section] = true;
+        }
+        array_push(output, raw);
+        i = i + 1;
+    }
+    let names = map_keys(declared);
+    let n = 0;
+    while n < len(names) {
+        let name = names[n];
+        if not map_has(replaced, name) { _fail("dependency '" + name + "' is absent from the lock"); }
+        let dep = try parsed.dependencies[name] catch nil;
+        let digest = try dep.sha256 catch "";
+        if type(digest) != "string" or not regex_match(digest, "^[0-9a-f]{64}$") {
+            _fail("dependency '" + name + "' has no valid content digest");
+        }
+        n = n + 1;
+    }
+    return map{ ok: true, format: FORMAT, text: str_join(output, "\n"), rewritten: len(names) };
+}
+
+fn publish(project_dir = ".") {
+    let backend = SECURE.available();
+    if not backend.ok { _fail("secure file backend unavailable; run this trusted maintenance tool with --allow-ffi or --allow-all on Linux"); }
+    let root = PATH.normalize(PATH.absolute(project_dir));
+    let manifest_path = PATH.join(root, "pblang.toml");
+    let lock_path = PATH.join(root, "pblang.lock");
+    let manifest = SECURE.read_text(manifest_path, MAX_DOCUMENT_BYTES, false);
+    if not manifest.ok { _fail("cannot securely read pblang.toml: " + str(try manifest.error catch "read failed")); }
+    let lock = SECURE.read_text(lock_path, MAX_DOCUMENT_BYTES, false);
+    if not lock.ok { _fail("cannot securely read pblang.lock: " + str(try lock.error catch "read failed")); }
+    let declared = manifest_paths(manifest.text);
+    let names = map_keys(declared);
+    let i = 0;
+    while i < len(names) {
+        let dependency_root = _resolved(root, declared[names[i]]);
+        let held = DIRFS.open_absolute(dependency_root, false, false);
+        if not held.ok { _fail("dependency '" + names[i] + "' is not an accessible no-follow directory"); }
+        DIRFS.close(held);
+        i = i + 1;
+    }
+    let result = normalize_text(manifest.text, lock.text, root);
+    let written = SECURE.write_text_atomic(lock_path, result.text, false, false);
+    if not written.ok { _fail("cannot atomically publish pblang.lock: " + str(try written.error catch "write failed")); }
+    return map{ ok: true, format: FORMAT, path: lock_path, rewritten: result.rewritten };
+}
+
+export manifest_paths, normalize_text, publish;
