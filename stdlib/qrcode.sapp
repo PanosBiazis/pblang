@@ -1,0 +1,431 @@
+// Bounded QR Code Model 2 encoder and renderers implemented in PBLang.
+// Byte mode, UTF-8 payloads, versions 1..10, all standard error correction levels.
+
+let Flate = import("stdlib:flate.sapp");
+let MAX_INPUT_BYTES = 271;
+let TOTAL_CODEWORDS = [0,26,44,70,100,134,172,196,242,292,346];
+let DATA_L = [0,19,34,55,80,108,136,156,194,232,274];
+let ECC_L = [0,7,10,15,20,26,18,20,24,30,18];
+let BLOCKS_L = [0,1,1,1,1,1,2,2,2,2,4];
+let DATA_M = [0,16,28,44,64,86,108,124,154,182,216];
+let ECC_M = [0,10,16,26,18,24,16,18,22,22,26];
+let BLOCKS_M = [0,1,1,1,2,2,4,4,4,5,5];
+let DATA_Q = [0,13,22,34,48,62,76,88,110,132,154];
+let ECC_Q = [0,13,22,18,26,18,24,18,22,20,24];
+let BLOCKS_Q = [0,1,1,2,2,4,4,6,6,8,8];
+let DATA_H = [0,9,16,26,36,46,60,66,86,100,122];
+let ECC_H = [0,17,28,22,16,22,28,26,26,24,28];
+let BLOCKS_H = [0,1,1,2,4,4,4,5,6,8,8];
+
+fn _error(message) { return map{ ok: false, format: "pblang.qrcode.v1", error: message }; }
+fn _append(dst, src) { for i len(src) { dst[len(dst)] = src[i]; } return dst; }
+fn _be32(n) { return [num_mod(num_floor(n / 16777216),256), num_mod(num_floor(n / 65536),256), num_mod(num_floor(n / 256),256), num_mod(n,256)]; }
+fn _bit(value, index) { return bit_and(bit_shr(value, index), 1); }
+fn _abs(n) { return if n < 0 { 0 - n } else { n }; }
+
+fn _new_matrix(size, value) {
+    let out = [];
+    for y size { let row = []; for x size { row[x] = value; } out[y] = row; }
+    return out;
+}
+
+fn _append_bits(bits, value, count) {
+    let i = count - 1;
+    while i >= 0 { bits[len(bits)] = _bit(value, i); i = i - 1; }
+}
+
+fn _params(level, version) {
+    if level == "L" { return map{ data: DATA_L[version], ecc: ECC_L[version], blocks: BLOCKS_L[version], format_bits: 1 }; }
+    if level == "M" { return map{ data: DATA_M[version], ecc: ECC_M[version], blocks: BLOCKS_M[version], format_bits: 0 }; }
+    if level == "Q" { return map{ data: DATA_Q[version], ecc: ECC_Q[version], blocks: BLOCKS_Q[version], format_bits: 3 }; }
+    if level == "H" { return map{ data: DATA_H[version], ecc: ECC_H[version], blocks: BLOCKS_H[version], format_bits: 2 }; }
+    return nil;
+}
+
+fn _select_version(byte_count, level) {
+    for version 10 {
+        let v = version + 1; let p = _params(level, v);
+        let count_bits = if v <= 9 { 8 } else { 16 };
+        if 4 + count_bits + byte_count * 8 <= p.data * 8 { return v; }
+    }
+    return 0;
+}
+
+fn _data_codewords(bytes, version, params) {
+    let bits = []; _append_bits(bits, 4, 4);
+    _append_bits(bits, len(bytes), if version <= 9 { 8 } else { 16 });
+    for i len(bytes) { _append_bits(bits, bytes[i], 8); }
+    let capacity = params.data * 8; let terminator = capacity - len(bits);
+    if terminator > 4 { terminator = 4; }
+    for i terminator { bits[len(bits)] = 0; }
+    while num_mod(len(bits), 8) != 0 { bits[len(bits)] = 0; }
+    let out = [];
+    let i = 0;
+    while i < len(bits) {
+        let value = 0; for j 8 { value = value * 2 + bits[i + j]; }
+        out[len(out)] = value; i = i + 8;
+    }
+    let pad = 236;
+    while len(out) < params.data { out[len(out)] = pad; pad = if pad == 236 { 17 } else { 236 }; }
+    return out;
+}
+
+fn _gf_mul(x, y) {
+    let z = 0; let a = x; let b = y;
+    for i 8 {
+        if bit_and(b, 1) != 0 { z = bit_xor(z, a); }
+        b = bit_shr(b, 1); let carry = bit_and(a, 128) != 0;
+        a = bit_and(bit_shl(a, 1), 255); if carry { a = bit_xor(a, 29); }
+    }
+    return z;
+}
+
+fn _generator(degree) {
+    let result = []; for i degree { result[i] = 0; }
+    result[degree - 1] = 1; let root = 1;
+    for i degree {
+        for j degree {
+            result[j] = _gf_mul(result[j], root);
+            if j + 1 < degree { result[j] = bit_xor(result[j], result[j + 1]); }
+        }
+        root = _gf_mul(root, 2);
+    }
+    return result;
+}
+
+fn _remainder(data, divisor) {
+    let result = []; for i len(divisor) { result[i] = 0; }
+    for i len(data) {
+        let factor = bit_xor(data[i], result[0]);
+        let j = 0; while j + 1 < len(result) { result[j] = result[j + 1]; j = j + 1; }
+        result[len(result) - 1] = 0;
+        for k len(result) { result[k] = bit_xor(result[k], _gf_mul(divisor[k], factor)); }
+    }
+    return result;
+}
+
+fn _all_codewords(data, version, params) {
+    let total = TOTAL_CODEWORDS[version]; let blocks = params.blocks; let ecc_len = params.ecc;
+    let short_block_len = num_floor(total / blocks);
+    let short_blocks = blocks - num_mod(total, blocks);
+    let short_data_len = short_block_len - ecc_len;
+    let divisor = _generator(ecc_len); let rows = []; let offset = 0;
+    for i blocks {
+        let data_len = short_data_len + if i >= short_blocks { 1 } else { 0 };
+        let block = slice(data, offset, offset + data_len); offset = offset + data_len;
+        rows[i] = map{ data: block, ecc: _remainder(block, divisor) };
+    }
+    if offset != len(data) { throw "qrcode: internal data block mismatch"; }
+    let out = [];
+    let max_data = short_data_len + if short_blocks < blocks { 1 } else { 0 };
+    for i max_data { for j blocks { if i < len(rows[j].data) { out[len(out)] = rows[j].data[i]; } } }
+    for i ecc_len { for j blocks { out[len(out)] = rows[j].ecc[i]; } }
+    if len(out) != total { throw "qrcode: internal interleave mismatch"; }
+    return out;
+}
+
+fn _set(modules, function_modules, x, y, dark) {
+    modules[y][x] = dark; function_modules[y][x] = true;
+}
+
+fn _finder(modules, function_modules, cx, cy) {
+    let dy = -4;
+    while dy <= 4 {
+        let dx = -4;
+        while dx <= 4 {
+            let x = cx + dx; let y = cy + dy;
+            if x >= 0 and x < len(modules) and y >= 0 and y < len(modules) {
+                let dist = num_max(_abs(dx), _abs(dy));
+                _set(modules, function_modules, x, y, dist != 2 and dist != 4);
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+}
+
+fn _alignment(modules, function_modules, cx, cy) {
+    let dy = -2;
+    while dy <= 2 {
+        let dx = -2;
+        while dx <= 2 {
+            _set(modules, function_modules, cx + dx, cy + dy,
+                num_max(_abs(dx), _abs(dy)) != 1);
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+}
+
+fn _alignment_positions(version, size) {
+    if version == 1 { return []; }
+    let count = num_floor(version / 7) + 2;
+    let step = 0;
+    if version == 32 { step = 26; }
+    else {
+        let numerator = version * 4 + count * 2 + 1;
+        let denominator = count * 2 - 2;
+        step = num_floor(numerator / denominator) * 2;
+    }
+    let out = [6]; let pos = size - 7;
+    let i = 1; while i < count { out[len(out)] = pos; pos = pos - step; i = i + 1; }
+    array_sort(out); return out;
+}
+
+fn _format_bits(level_bits, mask) {
+    let data = bit_or(bit_shl(level_bits, 3), mask); let rem = bit_shl(data, 10);
+    let i = 14; while i >= 10 {
+        if _bit(rem, i) != 0 { rem = bit_xor(rem, bit_shl(0x537, i - 10)); }
+        i = i - 1;
+    }
+    return bit_xor(bit_or(bit_shl(data, 10), rem), 0x5412);
+}
+
+fn _draw_format(modules, function_modules, level_bits, mask) {
+    let size = len(modules); let bits = _format_bits(level_bits, mask);
+    for i 6 { _set(modules, function_modules, 8, i, _bit(bits, i) != 0); }
+    _set(modules, function_modules, 8, 7, _bit(bits, 6) != 0);
+    _set(modules, function_modules, 8, 8, _bit(bits, 7) != 0);
+    _set(modules, function_modules, 7, 8, _bit(bits, 8) != 0);
+    let i = 9; while i < 15 { _set(modules, function_modules, 14 - i, 8, _bit(bits, i) != 0); i = i + 1; }
+    for i 8 { _set(modules, function_modules, size - 1 - i, 8, _bit(bits, i) != 0); }
+    let j = 8; while j < 15 { _set(modules, function_modules, 8, size - 15 + j, _bit(bits, j) != 0); j = j + 1; }
+    _set(modules, function_modules, 8, size - 8, true);
+}
+
+fn _reserve_format(modules, function_modules) {
+    let size = len(modules);
+    for i 6 { _set(modules, function_modules, 8, i, false); }
+    _set(modules, function_modules, 8, 7, false);
+    _set(modules, function_modules, 8, 8, false);
+    _set(modules, function_modules, 7, 8, false);
+    let i = 9; while i < 15 { _set(modules, function_modules, 14 - i, 8, false); i = i + 1; }
+    for i 8 { _set(modules, function_modules, size - 1 - i, 8, false); }
+    let j = 8; while j < 15 { _set(modules, function_modules, 8, size - 15 + j, false); j = j + 1; }
+    _set(modules, function_modules, 8, size - 8, false);
+}
+
+fn _draw_version(modules, function_modules, version) {
+    if version < 7 { return; }
+    let rem = bit_shl(version, 12); let i = 17;
+    while i >= 12 {
+        if _bit(rem, i) != 0 { rem = bit_xor(rem, bit_shl(0x1F25, i - 12)); }
+        i = i - 1;
+    }
+    let bits = bit_or(bit_shl(version, 12), rem); let size = len(modules);
+    for i 18 {
+        let a = size - 11 + num_mod(i, 3); let b = num_floor(i / 3);
+        _set(modules, function_modules, a, b, _bit(bits, i) != 0);
+        _set(modules, function_modules, b, a, _bit(bits, i) != 0);
+    }
+}
+
+fn _function_patterns(version) {
+    let size = version * 4 + 17;
+    let modules = _new_matrix(size, false); let function_modules = _new_matrix(size, false);
+    _finder(modules, function_modules, 3, 3);
+    _finder(modules, function_modules, size - 4, 3);
+    _finder(modules, function_modules, 3, size - 4);
+    let positions = _alignment_positions(version, size);
+    for i len(positions) { for j len(positions) {
+        if not function_modules[positions[j]][positions[i]] {
+            _alignment(modules, function_modules, positions[i], positions[j]);
+        }
+    } }
+    for i size {
+        if not function_modules[6][i] { _set(modules, function_modules, i, 6, num_mod(i,2) == 0); }
+        if not function_modules[i][6] { _set(modules, function_modules, 6, i, num_mod(i,2) == 0); }
+    }
+    _reserve_format(modules, function_modules);
+    _draw_version(modules, function_modules, version);
+    return map{ modules: modules, functions: function_modules };
+}
+
+fn _mask(mask, x, y) {
+    if mask == 0 { return num_mod(x + y, 2) == 0; }
+    if mask == 1 { return num_mod(y, 2) == 0; }
+    if mask == 2 { return num_mod(x, 3) == 0; }
+    if mask == 3 { return num_mod(x + y, 3) == 0; }
+    if mask == 4 { return num_mod(num_floor(x / 3) + num_floor(y / 2), 2) == 0; }
+    if mask == 5 { return num_mod(x * y, 2) + num_mod(x * y, 3) == 0; }
+    if mask == 6 { return num_mod(num_mod(x * y, 2) + num_mod(x * y, 3), 2) == 0; }
+    return num_mod(num_mod(x + y, 2) + num_mod(x * y, 3), 2) == 0;
+}
+
+fn _draw_codewords(base, codewords, mask) {
+    let modules = []; for y len(base.modules) { modules[y] = slice(base.modules[y], 0, len(base.modules[y])); }
+    let bit_index = 0; let right = len(modules) - 1; let upward = true;
+    while right >= 1 {
+        if right == 6 { right = right - 1; }
+        for vert len(modules) {
+            let y = if upward { len(modules) - 1 - vert } else { vert };
+            for j 2 {
+                let x = right - j;
+                if not base.functions[y][x] {
+                    let dark = false;
+                    if bit_index < len(codewords) * 8 {
+                        dark = _bit(codewords[num_floor(bit_index / 8)], 7 - num_mod(bit_index, 8)) != 0;
+                        bit_index = bit_index + 1;
+                    }
+                    modules[y][x] = dark != _mask(mask, x, y);
+                }
+            }
+        }
+        upward = not upward; right = right - 2;
+    }
+    return modules;
+}
+
+fn _penalty(modules) {
+    let size = len(modules); let score = 0;
+    let axis = 0;
+    while axis < 2 {
+      let line = 0;
+      while line < size {
+        let run_color = if axis == 0 { modules[line][0] } else { modules[0][line] };
+        let run_len = 1;
+        let i = 1; while i < size {
+            let color = if axis == 0 { modules[line][i] } else { modules[i][line] };
+            if color == run_color { run_len = run_len + 1; }
+            else { if run_len >= 5 { score = score + 3 + run_len - 5; } run_color = color; run_len = 1; }
+            i = i + 1;
+        }
+        if run_len >= 5 { score = score + 3 + run_len - 5; }
+        line = line + 1;
+      }
+      axis = axis + 1;
+    }
+    let y = 0;
+    while y < size - 1 {
+      let x = 0;
+      while x < size - 1 {
+        let c = modules[y][x];
+        if modules[y][x+1] == c and modules[y+1][x] == c and modules[y+1][x+1] == c { score = score + 3; }
+        x = x + 1;
+      }
+      y = y + 1;
+    }
+    let patterns = ["10111010000", "00001011101"];
+    axis = 0;
+    while axis < 2 {
+      let line = 0;
+      while line < size {
+        let s = ""; let i = 0;
+        while i < size {
+            let value = if axis == 0 { modules[line][i] } else { modules[i][line] };
+            s = s + if value { "1" } else { "0" }; i = i + 1;
+        }
+        let p = 0;
+        while p < len(patterns) {
+            let start = 0; while start + 11 <= len(s) {
+                if str_slice(s,start,start+11) == patterns[p] { score = score + 40; }
+                start = start + 1;
+            }
+            p = p + 1;
+        }
+        line = line + 1;
+      }
+      axis = axis + 1;
+    }
+    let dark = 0; y = 0;
+    while y < size { let x = 0; while x < size { if modules[y][x] { dark = dark + 1; } x = x + 1; } y = y + 1; }
+    score = score + num_floor(_abs(dark * 20 - size * size * 10) / (size * size)) * 10;
+    return score;
+}
+
+fn encode(text, level = "M") {
+    if type(text) != "string" or text == "" { return _error("text must not be empty"); }
+    level = str_upper(str_trim(str(level)));
+    if level != "L" and level != "M" and level != "Q" and level != "H" {
+        return _error("error correction must be L, M, Q, or H");
+    }
+    let bytes = str_to_bytes(text);
+    if len(bytes) > MAX_INPUT_BYTES { return _error("UTF-8 payload exceeds the 271-byte bound"); }
+    let version = _select_version(len(bytes), level);
+    if version == 0 { return _error("payload does not fit QR versions 1..10 at this error-correction level"); }
+    let params = _params(level, version);
+    let data = _data_codewords(bytes, version, params);
+    let codewords = _all_codewords(data, version, params);
+    let base = _function_patterns(version); let best = nil; let best_score = nil; let best_mask = -1;
+    for mask 8 {
+        let candidate = _draw_codewords(base, codewords, mask);
+        // ISO/IEC 18004 mask evaluation uses blank test format modules. The
+        // selected mask's real format bits are written only after scoring.
+        let score = _penalty(candidate);
+        if best == nil or score < best_score { best = candidate; best_score = score; best_mask = mask; }
+    }
+    _draw_format(best, base.functions, params.format_bits, best_mask);
+    return map{ ok: true, format: "pblang.qrcode.v1", text: text,
+        utf8_bytes: len(bytes), version: version, size: len(best), level: level,
+        mask: best_mask, penalty: best_score, data_codewords: len(data),
+        total_codewords: len(codewords), modules: best, quiet_zone: 4 };
+}
+
+fn _xml(text) {
+    let s = str_replace_all(text, "&", "&amp;"); s = str_replace_all(s, "<", "&lt;");
+    s = str_replace_all(s, ">", "&gt;"); s = str_replace_all(s, "\"", "&quot;"); return s;
+}
+
+fn _color(value, name) {
+    if type(value) != "string" or not regex_match(value, "^#[0-9A-Fa-f]{6}$") {
+        throw "qrcode: " + name + " must be a six-digit hexadecimal color";
+    }
+    return value;
+}
+
+fn to_svg(qr, scale = 4, dark = "#000000", light = "#ffffff") {
+    if type(qr) != "map" or not (try qr.ok catch false) { throw "qrcode: valid encoded QR is required"; }
+    if type(scale) != "number" or scale != num_floor(scale) or scale < 1 or scale > 64 { throw "qrcode: SVG scale must be 1..64"; }
+    dark = _color(dark, "dark color"); light = _color(light, "light color");
+    let border = qr.quiet_zone; let side = (qr.size + border * 2) * scale;
+    let path = "";
+    for y qr.size { for x qr.size { if qr.modules[y][x] {
+        path = path + "M" + str((x+border)*scale) + " " + str((y+border)*scale)
+            + "h" + str(scale) + "v" + str(scale) + "h-" + str(scale) + "z";
+    } } }
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + str(side)
+        + "\" height=\"" + str(side) + "\" viewBox=\"0 0 " + str(side) + " " + str(side)
+        + "\" role=\"img\" aria-label=\"QR code\"><rect width=\"100%\" height=\"100%\" fill=\""
+        + _xml(light) + "\"/><path d=\"" + path + "\" fill=\"" + _xml(dark) + "\"/></svg>";
+}
+
+fn to_text(qr) {
+    if type(qr) != "map" or not (try qr.ok catch false) { throw "qrcode: valid encoded QR is required"; }
+    let border = qr.quiet_zone; let out = "";
+    let y = 0 - border;
+    while y < qr.size + border {
+        let line = ""; let x = 0 - border;
+        while x < qr.size + border {
+            let dark = x >= 0 and y >= 0 and x < qr.size and y < qr.size and qr.modules[y][x];
+            line = line + if dark { "██" } else { "  " }; x = x + 1;
+        }
+        out = out + line + if y + 1 < qr.size + border { "\n" } else { "" }; y = y + 1;
+    }
+    return out;
+}
+
+fn _chunk(kind, data) {
+    let type_bytes = str_to_bytes(kind); let body = []; _append(body, type_bytes); _append(body, data);
+    let out = []; _append(out, _be32(len(data))); _append(out, body); _append(out, _be32(Flate.crc32(body))); return out;
+}
+
+fn to_png(qr, scale = 4) {
+    if type(qr) != "map" or not (try qr.ok catch false) { throw "qrcode: valid encoded QR is required"; }
+    if type(scale) != "number" or scale != num_floor(scale) or scale < 1 or scale > 32 { throw "qrcode: PNG scale must be 1..32"; }
+    let border = qr.quiet_zone; let side = (qr.size + border * 2) * scale; let raw = [];
+    for py side {
+        raw[len(raw)] = 0;
+        let my = num_floor(py / scale) - border;
+        for px side {
+            let mx = num_floor(px / scale) - border;
+            let dark = mx >= 0 and my >= 0 and mx < qr.size and my < qr.size and qr.modules[my][mx];
+            raw[len(raw)] = if dark { 0 } else { 255 };
+        }
+    }
+    let ihdr = []; _append(ihdr, _be32(side)); _append(ihdr, _be32(side));
+    _append(ihdr, [8,0,0,0,0]);
+    let out = [137,80,78,71,13,10,26,10]; _append(out, _chunk("IHDR", ihdr));
+    _append(out, _chunk("IDAT", Flate.zlib_encode(raw))); _append(out, _chunk("IEND", [])); return out;
+}
+
+export encode, to_svg, to_text, to_png;

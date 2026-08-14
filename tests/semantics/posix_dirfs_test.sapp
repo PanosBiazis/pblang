@@ -1,0 +1,82 @@
+let D = import("stdlib:posix_dirfs.sapp");
+
+fn require(condition, message) {
+    if not condition { throw "FAIL posix_dirfs: " + message; }
+}
+
+let linux = D.profile("linux");
+let macos = D.profile("macos");
+let windows = D.profile("windows");
+require(linux.ok and linux.at_fdcwd == -100 and linux.o_nofollow == 131072
+    and linux.o_directory == 65536 and linux.o_cloexec == 524288,
+    "Linux ABI profile changed");
+require(macos.ok and macos.at_fdcwd == -2 and macos.at_removedir == 128
+    and macos.o_nofollow == 256 and macos.o_directory == 1048576
+    and macos.o_cloexec == 16777216,
+    "macOS ABI profile differs from Darwin fcntl.h");
+require(not windows.ok, "non-POSIX platform received an unsafe profile");
+
+if platform() == "linux" {
+    let token = str_slice(sha256(str(now_ms()) + base64_encode_bytes(random_bytes(16))), 0, 20);
+    let root = ".pblang-posix-dirfs-" + token;
+    fs_mkdirs(root + "/safe");
+    fs_write(root + "/safe/data.txt", "abcdef");
+    fs_write(root + "/outside.txt", "outside");
+    let symlink = proc_spawn_wait("/bin/ln", ["-s", "../outside.txt", root + "/safe/link.txt"]);
+    let component_link = proc_spawn_wait("/bin/ln", ["-s", "safe", root + "/alias"]);
+    let symlink_fixtures = symlink.exit_code == 0 and component_link.exit_code == 0;
+
+    let fs = D.open(root, false);
+    require(fs.ok and D.status(fs).component_openat and D.status(fs).pathname_fallback == false,
+        "portable root was not held with the advertised boundary");
+    let prefix = D.read_prefix_bytes(fs, "safe/data.txt", 3);
+    require(prefix.ok and bytes_to_str(prefix.bytes) == "abc" and prefix.source_size == 6
+        and prefix.truncated and prefix.anonymous_snapshot,
+        "bounded prefix did not use a consistent anonymous snapshot");
+    let range = D.read_range_bytes(fs, "safe/data.txt", 2, 3);
+    require(range.ok and bytes_to_str(range.bytes) == "cde" and range.offset == 2,
+        "bounded range is incorrect");
+    if symlink_fixtures {
+        require(not D.read_prefix_bytes(fs, "safe/link.txt", 32).ok,
+            "final symlink was followed");
+        require(not D.read_prefix_bytes(fs, "alias/data.txt", 32).ok,
+            "component symlink was followed");
+    } else {
+        require(str_contains(symlink.stderr + component_link.stderr, "Operation not permitted"),
+            "symlink lane failed for an unexpected reason");
+    }
+    let replaced = D.write_atomic(fs, "safe/data.txt", str_to_bytes("new"), false);
+    require(replaced.ok and D.read_bytes(fs, "safe/data.txt", 8).ok
+        and bytes_to_str(D.read_bytes(fs, "safe/data.txt", 8).bytes) == "new",
+        "atomic descriptor-bound publication failed");
+    let created = D.write_new_exclusive(fs, "safe/new.txt", str_to_bytes("one"), false);
+    require(created.ok and not D.write_new_exclusive(fs, "safe/new.txt", str_to_bytes("two"), false).ok,
+        "exclusive no-replace admission failed");
+    require(D.remove_file(fs, "safe/new.txt").ok, "file-only removal failed");
+    let lock = D.acquire_lock(fs, "safe/update.lock", 100, 2);
+    require(lock.ok and lock.active and lock.descriptor_bound,
+        "descriptor-bound advisory lock was not acquired");
+    let competing_root = D.open(root, false);
+    require(competing_root.ok, "competing root handle was not opened");
+    let blocked = D.acquire_lock(competing_root, "safe/update.lock", 8, 2);
+    require(not blocked.ok and blocked.timeout,
+        "a competing descriptor acquired an already-held exclusive lock");
+    require(not D.release_lock(competing_root, lock),
+        "a foreign root released another root's lock");
+    require(D.release_lock(fs, lock) and not lock.active,
+        "the owning root did not release its lock exactly once");
+    require(not D.release_lock(fs, lock), "a released lock was accepted twice");
+    let after = D.acquire_lock(competing_root, "safe/update.lock", 100, 2);
+    require(after.ok and D.release_lock(competing_root, after),
+        "lock could not be reacquired after release");
+    require(D.close(competing_root), "competing root did not close");
+    require(D.close(fs), "portable directory root did not close");
+
+    fs_remove(root + "/safe/data.txt");
+    if symlink_fixtures { fs_remove(root + "/safe/link.txt"); fs_remove(root + "/alias"); }
+    fs_remove(root + "/outside.txt");
+    fs_remove(root + "/safe/update.lock");
+    fs_remove(root + "/safe"); fs_remove(root);
+}
+
+print "posix_dirfs_pass";

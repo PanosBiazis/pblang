@@ -1,89 +1,338 @@
-// stdlib/ollama.sapp — real local-ollama integration (no Rust, no FFI: pure pblang over the
-// http builtins). Talks to the ollama daemon's native REST API:
-//   GET  {host}/api/tags               -> installed models
-//   POST {host}/api/generate           -> {model, prompt, stream:false} => {response, ...}
-// The HTTP transport is injectable everywhere so the parsing/abstain logic is unit-testable
-// offline; the defaults use the real http_get/http_post builtins.
+// Bounded local Ollama integration implemented entirely in PBLang.
 //
-//   let oll = import("stdlib/ollama.sapp");
-//   if oll.available() { print oll.generate(oll.default_model(), "say hi"); }
+// The default transport uses a plain TCP connection only to a loopback Ollama
+// daemon. HTTP/1.0 plus Connection: close gives the client a deterministic end
+// of response while the explicit byte ceilings prevent an unbounded allocation.
+// Callers may inject get/post functions for deterministic offline tests.
 
 let json = import("stdlib/json.sapp");
+let http_client = import("stdlib/http_client.sapp");
+let net = import("stdlib/net.sapp");
 let PR = import("stdlib/provider_registry.sapp");
 
-let _HOST = "http://localhost:11434";
-fn host() { return _HOST; }
-fn set_host(h) { _HOST = h; return _HOST; }
+let MAX_MODEL_CHARS = 128;
+let MAX_PROMPT_CHARS = 65536;
+let MAX_REQUEST_BYTES = 262144;
+let MAX_RESPONSE_BYTES = 1048576;
+let MAX_EMBEDDING_DIMENSIONS = 8192;
+let MAX_MODELS = 4096;
+let MAX_TOKEN_IDS = 131072;
+let MAX_HEADER_BYTES = 16384;
 
-fn _post_default(u, b) { return http_post(u, b); }
-fn _get_default(u) { return http_get(u); }
+let _HOST = "http://127.0.0.1:11434";
 
-// _is_error(text) — the http builtins signal failure by returning "error: ..." (no throw).
-fn _is_error(text) { return (not is_string(text)) or str_starts_with(str_trim(text), "error"); }
-
-// generate(model, prompt, post_fn) — single-turn completion. Returns the trimmed response
-// text, or nil on ANY failure (transport error, unparseable body, missing field).
-fn generate(model, prompt, post_fn = nil) {
-    if post_fn == nil { post_fn = _post_default; }
-    let body = json.stringify(map{ model: model, prompt: prompt, stream: false });
-    let raw = try post_fn(_HOST + "/api/generate", body) catch nil;
-    if _is_error(raw) { return nil; }
-    let obj = try json.parse(raw) catch nil;
-    if not is_map(obj) { return nil; }
-    if not map_has(obj, "response") { return nil; }
-    let t = obj.response;
-    if not is_string(t) { return nil; }
-    return str_trim(t);
+fn _finite_number(v) {
+    if type(v) != "number" { return false; }
+    let text = str_lower(str(v));
+    return v == v and text != "nan" and not str_contains(text, "inf");
 }
 
-// voter_caller(model, post_fn) — a fn(message)->text, exactly the shape pbai.llm_voter wants
-// as its injectable `caller`. Abstains (nil) on failure.
+fn _host_parts(value) {
+    if type(value) != "string" or len(value) < 10 or len(value) > 80 {
+        throw "Ollama host must be a bounded loopback HTTP URL";
+    }
+    let prefix = "";
+    let address_host = "";
+    let header_host = "";
+    if str_starts_with(value, "http://127.0.0.1:") {
+        prefix = "http://127.0.0.1:"; address_host = "127.0.0.1"; header_host = "127.0.0.1";
+    } else if str_starts_with(value, "http://localhost:") {
+        prefix = "http://localhost:"; address_host = "127.0.0.1"; header_host = "localhost";
+    } else if str_starts_with(value, "http://[::1]:") {
+        prefix = "http://[::1]:"; address_host = "[::1]"; header_host = "[::1]";
+    } else {
+        throw "Ollama host must use 127.0.0.1, localhost, or [::1] over HTTP";
+    }
+    let port_text = str_slice(value, len(prefix), len(value));
+    if not regex_match(port_text, "^[0-9]{1,5}$") { throw "Ollama host has an invalid port"; }
+    let port = parse_number(port_text);
+    if port < 1 or port > 65535 { throw "Ollama host port must be in 1..65535"; }
+    return map{
+        url: value, address: address_host + ":" + str(port),
+        host_header: header_host + ":" + str(port), port: port
+    };
+}
+
+fn host() { return _HOST; }
+
+// set_host remains source-compatible, but arbitrary remote URLs are no longer
+// accepted: a local-model helper must not become an SSRF primitive.
+fn set_host(value) {
+    let parts = _host_parts(value);
+    _HOST = parts.url;
+    return _HOST;
+}
+
+fn _response_error(message) {
+    return map{ ok: false, status: 0, error: message, body: "", bounded: true };
+}
+
+fn _request_on_socket(socket, parts, method, path, body, max_response_bytes) {
+    if type(path) != "string" or not str_starts_with(path, "/api/") or
+       len(path) > 128 or str_contains(path, "?") or str_contains(path, "#") {
+        return _response_error("refused non-Ollama API path");
+    }
+    let body_bytes = len(str_to_bytes(body));
+    if body_bytes > MAX_REQUEST_BYTES { return _response_error("request body exceeds byte limit"); }
+    let request = method + " " + path + " HTTP/1.0\r\n" +
+        "Host: " + parts.host_header + "\r\n" +
+        "Accept: application/json\r\n" +
+        "Content-Type: application/json\r\n" +
+        "Connection: close\r\n";
+    if method == "POST" { request = request + "Content-Length: " + str(body_bytes) + "\r\n"; }
+    request = request + "\r\n" + body;
+    let wrote = try net.write(socket, request) catch nil;
+    if wrote == nil { return _response_error("could not write request to local Ollama"); }
+
+    let header = try net.read_until(socket, "\r\n\r\n", MAX_HEADER_BYTES) catch nil;
+    if header == nil or len(str_to_bytes(header)) > MAX_HEADER_BYTES or
+       not str_contains(header, "\r\n\r\n") {
+        return _response_error("missing or oversized HTTP response header");
+    }
+    let parsed_head = http_client.parse_response(header);
+    let transfer_encoding = http_client.header_get(parsed_head, "Transfer-Encoding");
+    if transfer_encoding != nil and str_trim(str(transfer_encoding)) != "" {
+        return _response_error("chunked/encoded Ollama responses are refused by bounded HTTP/1.0 transport");
+    }
+    let content_type = http_client.header_get(parsed_head, "Content-Type");
+    if content_type != nil and not str_contains(str_lower(str(content_type)), "application/json") {
+        return _response_error("Ollama returned a non-JSON content type");
+    }
+    let declared = nil;
+    let declared_raw = http_client.header_get(parsed_head, "Content-Length");
+    if declared_raw != nil {
+        declared = try parse_number(str_trim(str(declared_raw))) catch nil;
+        if declared == nil or not _finite_number(declared) or num_floor(declared) != declared or declared < 0 {
+            return _response_error("invalid Content-Length from Ollama");
+        }
+        if declared > max_response_bytes { return _response_error("Ollama response exceeds byte limit"); }
+    }
+    let read_limit = if declared == nil { max_response_bytes + 1 } else { declared };
+    let response_body = try net.read(socket, read_limit) catch nil;
+    if response_body == nil { return _response_error("could not read Ollama response body"); }
+    let actual_bytes = len(str_to_bytes(response_body));
+    if actual_bytes > max_response_bytes { return _response_error("Ollama response exceeds byte limit"); }
+    if declared != nil and actual_bytes != declared {
+        return _response_error("truncated Ollama response body");
+    }
+    if parsed_head.status < 200 or parsed_head.status >= 300 {
+        return map{ ok: false, status: parsed_head.status, error: "Ollama returned HTTP " + str(parsed_head.status),
+                    body: response_body, bounded: true, response_bytes: actual_bytes };
+    }
+    return map{ ok: true, status: parsed_head.status, body: response_body,
+                bounded: true, response_bytes: actual_bytes };
+}
+
+fn _bounded_request(a, b, body = "", max_response_bytes = nil) {
+    if max_response_bytes == nil { max_response_bytes = MAX_RESPONSE_BYTES; }
+    if type(max_response_bytes) != "number" or num_floor(max_response_bytes) != max_response_bytes or
+       max_response_bytes < 1 or max_response_bytes > MAX_RESPONSE_BYTES {
+        throw "max_response_bytes must be an integer in 1..1048576";
+    }
+    let parts = _host_parts(_HOST);
+    let socket = try net.connect(parts.address) catch nil;
+    if socket == nil { return _response_error("local Ollama is unreachable"); }
+    let result = try _request_on_socket(socket, parts, a, b, body, max_response_bytes)
+                 catch _response_error("local Ollama transport failed");
+    try net.close(socket) catch nil;
+    return result;
+}
+
+fn _post_default(url, body) {
+    if url != _HOST + "/api/generate" and url != _HOST + "/api/embed" and
+       url != _HOST + "/api/tokenize" {
+        return "error: refused Ollama endpoint";
+    }
+    let path = str_slice(url, len(_HOST), len(url));
+    let result = _bounded_request("POST", path, body, MAX_RESPONSE_BYTES);
+    if not result.ok { return "error: " + result.error; }
+    return result.body;
+}
+
+fn _get_default(url) {
+    if url != _HOST + "/api/tags" { return "error: refused Ollama endpoint"; }
+    let result = _bounded_request("GET", "/api/tags", "", MAX_RESPONSE_BYTES);
+    if not result.ok { return "error: " + result.error; }
+    return result.body;
+}
+
+fn _is_error(text) {
+    return (not is_string(text)) or str_starts_with(str_lower(str_trim(text)), "error:");
+}
+
+fn _valid_model(model, local_only = true) {
+    if type(model) != "string" or len(model) < 1 or len(model) > MAX_MODEL_CHARS or
+       not regex_match(model, "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$") {
+        throw "model must be a valid 1..128 character Ollama model name";
+    }
+    if local_only and str_contains(str_lower(model), ":cloud") {
+        throw "cloud Ollama models are refused by local-only mode";
+    }
+    return model;
+}
+
+fn _valid_text(text, label) {
+    if type(text) != "string" or len(text) < 1 or len(text) > MAX_PROMPT_CHARS {
+        throw label + " must contain 1..65536 characters";
+    }
+    if len(str_to_bytes(text)) > MAX_REQUEST_BYTES { throw label + " exceeds the UTF-8 byte limit"; }
+    return text;
+}
+
+fn _validate_options(options, allowed, label) {
+    let keys = map_keys(options);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; } }
+        if not found { throw "unknown " + label + " option: " + str(keys[i]); }
+    }
+    let local_only = try options.local_only catch true;
+    if type(local_only) != "bool" { throw "local_only must be boolean"; }
+    return local_only;
+}
+
+fn generate_result(model, prompt, options = nil, post_fn = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "Ollama generation options must be an object"; }
+    let local_only = _validate_options(options,
+        ["local_only", "max_tokens", "num_predict", "temperature", "system_prompt"], "generation");
+    model = _valid_model(model, local_only);
+    prompt = _valid_text(prompt, "prompt");
+    let system_prompt = try options.system_prompt catch "";
+    if type(system_prompt) != "string" or len(system_prompt) > 32768 or
+       len(str_to_bytes(system_prompt)) > 131072 {
+        throw "system_prompt must contain at most 32768 characters and 131072 UTF-8 bytes";
+    }
+    let num_predict = try options.max_tokens catch try options.num_predict catch 512;
+    if type(num_predict) != "number" or num_floor(num_predict) != num_predict or
+       num_predict < 1 or num_predict > 8192 { throw "max_tokens must be an integer in 1..8192"; }
+    let temperature = try options.temperature catch 0.2;
+    if not _finite_number(temperature) or temperature < 0 or temperature > 2 {
+        throw "temperature must be a finite number in 0..2";
+    }
+    if post_fn == nil { post_fn = _post_default; }
+    let payload = map{
+        model: model, prompt: prompt, stream: false,
+        options: map{ num_predict: num_predict, temperature: temperature }
+    };
+    if system_prompt != "" { payload.system = system_prompt; }
+    let body = json.stringify(payload);
+    if len(str_to_bytes(body)) > MAX_REQUEST_BYTES { throw "encoded generation request exceeds byte limit"; }
+    let raw = try post_fn(_HOST + "/api/generate", body) catch nil;
+    if _is_error(raw) { return map{ ok: false, error: "local Ollama generation failed" }; }
+    if len(str_to_bytes(raw)) > MAX_RESPONSE_BYTES { return map{ ok: false, error: "generation response exceeds byte limit" }; }
+    let obj = try json.parse(raw) catch nil;
+    if not is_map(obj) or not map_has(obj, "response") or not is_string(obj.response) {
+        return map{ ok: false, error: "invalid Ollama generation response" };
+    }
+    let text = str_trim(obj.response);
+    return map{ ok: true, model: str(try obj.model catch model), text: text,
+                response: text, done: try obj.done catch true,
+                prompt_chars: len(prompt), response_chars: len(text), bounded: true };
+}
+
+// Backward-compatible text-or-nil facade used by pbAI voters.
+fn generate(model, prompt, post_fn = nil) {
+    let result = try generate_result(model, prompt, map{}, post_fn) catch nil;
+    if result == nil or not result.ok { return nil; }
+    return result.text;
+}
+
+fn embed_result(model, text, options = nil, post_fn = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "Ollama embedding options must be an object"; }
+    let local_only = _validate_options(options, ["local_only"], "embedding");
+    model = _valid_model(model, local_only);
+    text = _valid_text(text, "text");
+    if post_fn == nil { post_fn = _post_default; }
+    let body = json.stringify(map{ model: model, input: text });
+    let raw = try post_fn(_HOST + "/api/embed", body) catch nil;
+    if _is_error(raw) { return map{ ok: false, error: "local Ollama embedding failed" }; }
+    if len(str_to_bytes(raw)) > MAX_RESPONSE_BYTES { return map{ ok: false, error: "embedding response exceeds byte limit" }; }
+    let obj = try json.parse(raw) catch nil;
+    if not is_map(obj) { return map{ ok: false, error: "invalid Ollama embedding response" }; }
+    let vector = try obj.embeddings[0] catch try obj.embedding catch nil;
+    if not is_array(vector) or len(vector) < 1 or len(vector) > MAX_EMBEDDING_DIMENSIONS {
+        return map{ ok: false, error: "embedding dimensions must be in 1..8192" };
+    }
+    let out = [];
+    for i len(vector) {
+        if not _finite_number(vector[i]) { return map{ ok: false, error: "embedding contains a non-finite value" }; }
+        out[len(out)] = vector[i];
+    }
+    return map{ ok: true, model: str(try obj.model catch model), embedding: out,
+                dimensions: len(out), input_chars: len(text), bounded: true };
+}
+
+fn tokenize_result(model, text, options = nil, post_fn = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "Ollama tokenization options must be an object"; }
+    let local_only = _validate_options(options, ["local_only"], "tokenization");
+    model = _valid_model(model, local_only); text = _valid_text(text, "text");
+    if post_fn == nil { post_fn = _post_default; }
+    let body = json.stringify(map{ model: model, prompt: text });
+    let raw = try post_fn(_HOST + "/api/tokenize", body) catch nil;
+    if _is_error(raw) { return map{ ok: false, error: "local Ollama tokenization failed" }; }
+    if len(str_to_bytes(raw)) > MAX_RESPONSE_BYTES { return map{ ok: false, error: "tokenization response exceeds byte limit" }; }
+    let obj = try json.parse(raw) catch nil;
+    let tokens = try obj.tokens catch nil;
+    if not is_array(tokens) or len(tokens) > MAX_TOKEN_IDS {
+        return map{ ok: false, error: "token count must be in 0..131072" };
+    }
+    let out = [];
+    for i len(tokens) {
+        let id = tokens[i];
+        if type(id) != "number" or num_floor(id) != id or id < 0 or id > 9223372036854775807 {
+            return map{ ok: false, error: "tokenization response contains an invalid token id" };
+        }
+        out[len(out)] = id;
+    }
+    return map{ ok: true, model: str(try obj.model catch model), tokens: out,
+        token_count: len(out), input_chars: len(text), bounded: true };
+}
+
 fn voter_caller(model, post_fn = nil) {
     return fn(message) { return generate(model, message, post_fn); };
 }
 
-// models(get_fn) — list of installed model names ([] if the daemon is unreachable).
 fn models(get_fn = nil) {
     if get_fn == nil { get_fn = _get_default; }
     let raw = try get_fn(_HOST + "/api/tags") catch nil;
-    if _is_error(raw) { return []; }
+    if _is_error(raw) or len(str_to_bytes(raw)) > MAX_RESPONSE_BYTES { return []; }
     let obj = try json.parse(raw) catch nil;
-    if not is_map(obj) or not map_has(obj, "models") { return []; }
-    let arr = obj.models;
+    if not is_map(obj) or not map_has(obj, "models") or not is_array(obj.models) { return []; }
     let out = [];
-    let i = 0;
-    while i < len(arr) {
-        let m = arr[i];
-        if is_map(m) and map_has(m, "name") { array_push(out, m.name); }
-        i = i + 1;
+    let seen = map{};
+    let count = len(obj.models); if count > MAX_MODELS { count = MAX_MODELS; }
+    for i count {
+        let name = try obj.models[i].name catch nil;
+        if is_string(name) and len(name) <= MAX_MODEL_CHARS and
+           regex_match(name, "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$") and
+           not map_has(seen, name) {
+            seen[name] = true; out[len(out)] = name;
+        }
     }
     return out;
 }
 
-// available(get_fn) — is a reachable ollama daemon serving the tags endpoint?
 fn available(get_fn = nil) {
     if get_fn == nil { get_fn = _get_default; }
     let raw = try get_fn(_HOST + "/api/tags") catch nil;
-    if _is_error(raw) { return false; }
+    if _is_error(raw) or len(str_to_bytes(raw)) > MAX_RESPONSE_BYTES { return false; }
     let obj = try json.parse(raw) catch nil;
-    return is_map(obj) and map_has(obj, "models");
+    return is_map(obj) and map_has(obj, "models") and is_array(obj.models);
 }
 
-// default_model(get_fn) — a sensible model to use: the first LOCAL (non ":cloud") model, else
-// the first model, else nil. Cloud models need ollama.com auth so we don't pick them blindly.
 fn default_model(get_fn = nil) {
     let ms = models(get_fn);
-    if len(ms) == 0 { return nil; }
-    let i = 0;
-    while i < len(ms) { if not str_contains(ms[i], ":cloud") { return ms[i]; } i = i + 1; }
-    return ms[0];
+    for i len(ms) { if not str_contains(str_lower(ms[i]), ":cloud") { return ms[i]; } }
+    return nil;
 }
 
-// register(name) — register ollama's OpenAI-compatible endpoint into the provider_registry so
-// it participates in routing/discovery. (call_provider posts the OpenAI chat shape, which the
-// /v1/chat/completions endpoint accepts.) The voter path above uses the native /api/generate.
 fn register(name = "ollama") {
     return PR.register(name, _HOST + "/v1/chat/completions", "");
 }
 
-export host, set_host, generate, voter_caller, models, available, default_model, register;
+export MAX_MODEL_CHARS, MAX_PROMPT_CHARS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+       MAX_EMBEDDING_DIMENSIONS, MAX_TOKEN_IDS, host, set_host, generate_result, generate,
+       embed_result, tokenize_result, voter_caller, models, available, default_model, register;

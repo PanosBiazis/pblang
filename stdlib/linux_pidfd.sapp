@@ -1,0 +1,77 @@
+// Race-resistant Linux process identity and signalling via pidfd.
+// No PID-based fallback is provided: kernels/libcs without pidfd support fail closed.
+
+let MAX_PID = 4194304;
+let SIGNALS = map{ HUP: 1, INT: 2, TERM: 15, CONT: 18, STOP: 19, KILL: 9 };
+
+fn _i32(value) { if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; } return value; }
+
+fn _pid(value) {
+    if type(value) != "number" or value != num_floor(value) or value <= 1 or value > MAX_PID {
+        throw "linux_pidfd: pid must be an integer in 2..4194304";
+    }
+    return value;
+}
+
+fn _signal(value) {
+    if type(value) != "string" { throw "linux_pidfd: signal must be text"; }
+    let name = str_upper(str_trim(value)); if str_starts_with(name, "SIG") { name = str_slice(name, 3, len(name)); }
+    if not map_has(SIGNALS, name) { throw "linux_pidfd: signal must be HUP, INT, TERM, CONT, STOP, or KILL"; }
+    return map{ name: name, number: SIGNALS[name] };
+}
+
+fn _libc() {
+    if platform() != "linux" { return map{ ok: false, error: "pidfd requires Linux" }; }
+    let candidates = ["libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/x86_64-linux-gnu/libc.so.6"];
+    for i len(candidates) { let handle = try ffi_load(candidates[i]) catch nil;
+        if handle != nil { return map{ ok: true, handle: handle }; }
+    }
+    return map{ ok: false, error: "trusted libc is unavailable" };
+}
+
+fn current_pid() {
+    let libc = _libc(); if not libc.ok { return map{ ok: false, error: libc.error }; }
+    let pid = _i32(try ffi_call_typed(libc.handle, "getpid", "->i32", []) catch -1);
+    ffi_close(libc.handle); return map{ ok: pid > 1, pid: pid };
+}
+
+fn open(pid) {
+    pid = _pid(pid); let libc = _libc(); if not libc.ok { return libc; }
+    let fd = _i32(try ffi_call_typed(libc.handle, "pidfd_open", "i32,i32->i32", [pid, 0]) catch -1);
+    if fd < 0 { ffi_close(libc.handle); return map{ ok: false, error: "process is unavailable or pidfd is unsupported", pid: pid }; }
+    return map{ ok: true, format: "pblang.linux-pidfd.v1", pid: pid, fd: fd,
+        libc: libc.handle, closed: false, race_resistant_identity: true };
+}
+
+fn send(handle, signal) {
+    if type(handle) != "map" or not (try handle.ok catch false) or (try handle.closed catch true) {
+        throw "linux_pidfd: invalid or closed handle";
+    }
+    let sig = _signal(signal);
+    let rc = _i32(try ffi_call_typed(handle.libc, "pidfd_send_signal", "i32,i32,ptr,i32->i32",
+        [handle.fd, sig.number, 0, 0]) catch -1);
+    return map{ ok: rc == 0, signal_sent: rc == 0, pid: handle.pid,
+        signal: sig.name, signal_number: sig.number, race_resistant_identity: true };
+}
+
+fn exists(handle) {
+    if type(handle) != "map" or not (try handle.ok catch false) or (try handle.closed catch true) { return false; }
+    let rc = _i32(try ffi_call_typed(handle.libc, "pidfd_send_signal", "i32,i32,ptr,i32->i32",
+        [handle.fd, 0, 0, 0]) catch -1);
+    return rc == 0;
+}
+
+fn close(handle) {
+    if type(handle) != "map" or (try handle.closed catch true) { return false; }
+    let rc = _i32(try ffi_call_typed(handle.libc, "close", "i32->i32", [handle.fd]) catch -1);
+    ffi_close(handle.libc); handle.closed = true; handle.fd = -1; return rc == 0;
+}
+
+fn signal_once(pid, signal) {
+    let handle = open(pid); if not handle.ok { return handle; }
+    let result = send(handle, signal); let still_exists = exists(handle); let closed = close(handle);
+    result.process_still_exists = still_exists; result.terminated = result.signal_sent and not still_exists;
+    result.handle_closed = closed; return result;
+}
+
+export MAX_PID, current_pid, open, send, exists, close, signal_once;

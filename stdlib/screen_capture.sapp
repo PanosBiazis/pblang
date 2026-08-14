@@ -1,0 +1,296 @@
+// Bounded Linux screen capture adapters implemented in PBLang.
+// Every host command is a fixed descriptor-held executable with literal argv,
+// a minimal explicit environment, process-group supervision, and byte limits.
+
+let PROCESS = import("stdlib:linux_process.sapp");
+
+let MAX_IMAGE_BYTES = 16777216;
+let MAX_RECORD_BYTES = 67108864;
+let MAX_TEXT_BYTES = 1048576;
+
+fn _valid_env_value(value, label) {
+    if type(value) != "string" or len(str_to_bytes(value)) > 4096
+       or str_contains(value, strfromcharcode(0)) {
+        throw "screen_capture: invalid " + label;
+    }
+    return value;
+}
+
+fn display_environment() {
+    let out = map{ LC_ALL: "C" };
+    for name in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"] {
+        let value = try env_get(name) catch nil;
+        if value != nil and str(value) != "" { out[name] = _valid_env_value(value, name); }
+    }
+    return out;
+}
+
+fn _run(candidates, argv, environment, timeout_secs, max_output_bytes, max_memory_bytes) {
+    return PROCESS.run_fixed(candidates, argv, map{
+        timeout_secs: timeout_secs, startup_timeout_ms: 5000,
+        max_output_bytes: max_output_bytes, max_memory_bytes: max_memory_bytes,
+        inherit_environment: false, environment: environment
+    });
+}
+
+fn _result(result, operation) {
+    if not result.ok or not (try result.command_ok catch false) {
+        return map{ ok: false, executed: try result.completed catch false,
+            operation: operation, tool_available: (try result.fixed_candidate catch "") != "",
+            error: try result.stderr catch try result.error catch "screen backend failed",
+            exit_code: try result.exit_code catch -1,
+            timed_out: try result.timed_out catch false,
+            output_truncated: try result.output_truncated catch false };
+    }
+    if result.output_truncated { return map{ ok: false, executed: true,
+        operation: operation, error: "screen backend output exceeded its byte limit",
+        output_truncated: true }; }
+    return map{ ok: true, executed: true, operation: operation,
+        bytes: result.stdout_bytes, text: result.stdout,
+        returned_bytes: result.returned_output_bytes,
+        executable: result.fixed_candidate, shell_used: false,
+        environment_inherited: false, environment_keys: array_sort(map_keys(display_environment())),
+        descriptor_bound_executable: result.executable_descriptor_held,
+        process_group_terminated: result.process_group_terminated,
+        memory_limit_enforced: result.memory_limit_enforced };
+}
+
+fn _geometry(x, y, width, height) {
+    for value in [x, y, width, height] {
+        if type(value) != "number" or value != num_floor(value) or value < 0 or value > 16384 {
+            throw "screen_capture: geometry must use integers in 0..16384";
+        }
+    }
+    if width < 1 or height < 1 or width * height > 16777216 {
+        throw "screen_capture: capture dimensions exceed bounds";
+    }
+    return str(width) + "x" + str(height) + "+" + str(x) + "+" + str(y);
+}
+
+fn capture(environment = nil) {
+    if environment == nil { environment = display_environment(); }
+    if map_has(environment, "WAYLAND_DISPLAY") {
+        let wayland = _run(["/usr/bin/grim", "/usr/local/bin/grim"], ["-"],
+            environment, 15, MAX_IMAGE_BYTES, 536870912);
+        if wayland.ok and wayland.command_ok {
+            return _result(wayland, "capture");
+        }
+    }
+    return _result(_run(["/usr/bin/import", "/usr/local/bin/import"],
+        ["-silent", "-window", "root", "PNG32:-"], environment,
+        15, MAX_IMAGE_BYTES, 536870912), "capture");
+}
+
+fn region(x, y, width, height, environment = nil) {
+    if environment == nil { environment = display_environment(); }
+    let geometry = _geometry(x, y, width, height);
+    return _result(_run(["/usr/bin/import", "/usr/local/bin/import"],
+        ["-silent", "-window", "root", "-crop", geometry, "+repage", "PNG32:-"],
+        environment, 15, MAX_IMAGE_BYTES, 536870912), "region");
+}
+
+fn _window_id(name, environment) {
+    if type(name) != "string" or str_trim(name) == "" or len(str_to_bytes(name)) > 256
+       or str_contains(name, strfromcharcode(0)) {
+        throw "screen_capture: window name must be 1..256 UTF-8 bytes";
+    }
+    let found = _result(_run(["/usr/bin/xdotool", "/usr/local/bin/xdotool"],
+        ["search", "--onlyvisible", "--limit", "2", "--name", name], environment,
+        5, 256, 67108864), "window-search");
+    if not found.ok { return found; }
+    let ids = []; let lines = str_split(str_trim(found.text), "\n");
+    for i len(lines) {
+        let id = try parse_number(str_trim(lines[i])) catch nil;
+        if id != nil and id == num_floor(id) and id > 0 { array_push(ids, id); }
+    }
+    if len(ids) != 1 { return map{ ok: false, executed: true,
+        error: if len(ids) == 0 { "no visible window matched" } else { "window name is ambiguous" },
+        match_count: len(ids) }; }
+    return map{ ok: true, id: ids[0] };
+}
+
+fn window(name, environment = nil) {
+    if environment == nil { environment = display_environment(); }
+    let selected = _window_id(name, environment); if not selected.ok { return selected; }
+    let result = _result(_run(["/usr/bin/import", "/usr/local/bin/import"],
+        ["-silent", "-window", str(selected.id), "PNG32:-"], environment,
+        15, MAX_IMAGE_BYTES, 536870912), "window");
+    result.window_id = selected.id; return result;
+}
+
+fn monitor_info(environment = nil) {
+    if environment == nil { environment = display_environment(); }
+    let raw = _result(_run(["/usr/bin/xrandr", "/usr/local/bin/xrandr"], ["--query"],
+        environment, 5, MAX_TEXT_BYTES, 134217728), "monitor-info");
+    if not raw.ok { return raw; }
+    let monitors = []; let lines = str_split(raw.text, "\n");
+    for i len(lines) {
+        let line = str_trim(lines[i]);
+        if str_contains(line, " connected") {
+            let parts = str_split(line, " "); let compact = [];
+            for p len(parts) { if parts[p] != "" { array_push(compact, parts[p]); } }
+            let geometry = ""; let primary = false;
+            for p len(compact) {
+                if compact[p] == "primary" { primary = true; }
+                if str_contains(compact[p], "x") and str_contains(compact[p], "+") {
+                    geometry = compact[p];
+                }
+            }
+            array_push(monitors, map{ name: if len(compact) > 0 { compact[0] } else { "unknown" },
+                primary: primary, geometry: geometry });
+        }
+    }
+    return map{ ok: true, executed: true, operation: "monitor-info",
+        monitors: monitors, monitor_count: len(monitors), executable: raw.executable,
+        shell_used: false, environment_inherited: false,
+        descriptor_bound_executable: raw.descriptor_bound_executable,
+        process_group_terminated: raw.process_group_terminated };
+}
+
+fn _ocr_language(language) {
+    if type(language) != "string" or len(language) < 2 or len(language) > 32 {
+        throw "screen_capture: invalid OCR language";
+    }
+    for i len(language) {
+        let c = str_slice(language, i, i + 1);
+        if not str_contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+-", c) {
+            throw "screen_capture: invalid OCR language";
+        }
+    }
+    return language;
+}
+
+fn ocr_png(bytes, language = "eng", mode = "text", environment = nil) {
+    if type(bytes) != "array" or len(bytes) < 1 or len(bytes) > MAX_IMAGE_BYTES {
+        throw "screen_capture: OCR input must be 1..16777216 bytes";
+    }
+    language = _ocr_language(language); mode = str_lower(str(mode));
+    if mode != "text" and mode != "tsv" and mode != "boxes" {
+        throw "screen_capture: OCR mode must be text, tsv, or boxes";
+    }
+    if environment == nil { environment = display_environment(); }
+    let argv = ["stdin", "stdout", "-l", language];
+    if mode == "tsv" { array_push(argv, "tsv"); }
+    elif mode == "boxes" { array_push(argv, "makebox"); }
+    let result = PROCESS.run_fixed(["/usr/bin/tesseract", "/usr/local/bin/tesseract"],
+        argv, map{
+            timeout_secs: 60, startup_timeout_ms: 5000, max_output_bytes: MAX_TEXT_BYTES,
+            max_memory_bytes: 536870912, inherit_environment: false,
+            environment: environment, stdin_bytes: bytes
+        });
+    let out = _result(result, "ocr-" + mode); out.mode = mode; out.language = language; return out;
+}
+
+fn ocr_languages(environment = nil) {
+    if environment == nil { environment = display_environment(); }
+    let raw = _result(_run(["/usr/bin/tesseract", "/usr/local/bin/tesseract"],
+        ["--list-langs"], environment, 10, 65536, 268435456), "ocr-languages");
+    if not raw.ok { return raw; }
+    let languages = []; let lines = str_split(raw.text, "\n");
+    for i len(lines) {
+        let value = str_trim(lines[i]);
+        if value != "" and not str_starts_with(value, "List of available languages") {
+            if len(value) <= 32 { array_push(languages, value); }
+        }
+    }
+    return map{ ok: true, executed: true, operation: "ocr-languages",
+        languages: array_sort(languages), count: len(languages), executable: raw.executable,
+        shell_used: false, environment_inherited: false,
+        descriptor_bound_executable: raw.descriptor_bound_executable,
+        process_group_terminated: raw.process_group_terminated };
+}
+
+fn clipboard_png(environment = nil) {
+    if environment == nil { environment = display_environment(); }
+    let result = nil;
+    if map_has(environment, "WAYLAND_DISPLAY") {
+        result = _run(["/usr/bin/wl-paste", "/usr/local/bin/wl-paste"],
+            ["--no-newline", "--type", "image/png"], environment,
+            10, MAX_IMAGE_BYTES, 268435456);
+    } else {
+        result = _run(["/usr/bin/xclip", "/usr/local/bin/xclip"],
+            ["-selection", "clipboard", "-t", "image/png", "-o"], environment,
+            10, MAX_IMAGE_BYTES, 268435456);
+    }
+    return _result(result, "clipboard-png");
+}
+
+fn pdf_page_png(bytes, page, environment = nil) {
+    if type(bytes) != "array" or len(bytes) < 5 or len(bytes) > 4194304 {
+        throw "screen_capture: PDF input must be 5..4194304 bytes";
+    }
+    if type(page) != "number" or page != num_floor(page) or page < 1 or page > 10000 {
+        throw "screen_capture: PDF page must be an integer in 1..10000";
+    }
+    if environment == nil { environment = display_environment(); }
+    let result = PROCESS.run_fixed(["/usr/bin/pdftocairo", "/usr/local/bin/pdftocairo"],
+        ["-q", "-f", str(page), "-l", str(page), "-singlefile", "-scale-to", "2048",
+         "-png", "-", "-"], map{
+            timeout_secs: 60, startup_timeout_ms: 5000, max_output_bytes: MAX_IMAGE_BYTES,
+            max_memory_bytes: 536870912, inherit_environment: false,
+            environment: environment, stdin_bytes: bytes
+        });
+    return _result(result, "pdf-page");
+}
+
+fn pdf_info(bytes, environment = nil) {
+    if type(bytes) != "array" or len(bytes) < 5 or len(bytes) > 4194304 {
+        throw "screen_capture: PDF input must be 5..4194304 bytes";
+    }
+    if environment == nil { environment = display_environment(); }
+    let result = PROCESS.run_fixed(["/usr/bin/pdfinfo", "/usr/local/bin/pdfinfo"],
+        ["-"], map{
+            timeout_secs: 15, startup_timeout_ms: 5000, max_output_bytes: 65536,
+            max_memory_bytes: 268435456, inherit_environment: false,
+            environment: environment, stdin_bytes: bytes
+        });
+    let raw = _result(result, "pdf-info"); if not raw.ok { return raw; }
+    let pages = 0; let lines = str_split(raw.text, "\n");
+    for i len(lines) {
+        let line = str_trim(lines[i]);
+        if str_starts_with(line, "Pages:") {
+            pages = try parse_number(str_trim(str_slice(line, 6, len(line)))) catch 0;
+        }
+    }
+    if pages < 1 or pages != num_floor(pages) or pages > 10000 {
+        return map{ ok: false, executed: true, operation: "pdf-info",
+            error: "pdfinfo returned an invalid page count" };
+    }
+    return map{ ok: true, executed: true, operation: "pdf-info", pages: pages,
+        executable: raw.executable, shell_used: false, environment_inherited: false,
+        descriptor_bound_executable: raw.descriptor_bound_executable,
+        process_group_terminated: raw.process_group_terminated };
+}
+
+fn record(duration_secs, fps, environment = nil) {
+    if type(duration_secs) != "number" or duration_secs != num_floor(duration_secs)
+       or duration_secs < 1 or duration_secs > 600 {
+        throw "screen_capture: duration_secs must be an integer in 1..600";
+    }
+    if type(fps) != "number" or fps != num_floor(fps) or fps < 1 or fps > 60 {
+        throw "screen_capture: fps must be an integer in 1..60";
+    }
+    if environment == nil { environment = display_environment(); }
+    let display = try environment.DISPLAY catch "";
+    if display == "" { return map{ ok: false, executed: false,
+        error: "recording currently requires an X11 DISPLAY" }; }
+    let argv = ["-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "2",
+        "-f", "x11grab", "-framerate", str(fps), "-i", display + "+0,0",
+        "-t", str(duration_secs), "-an", "-c:v", "libx264", "-preset", "ultrafast",
+        "-tune", "zerolatency", "-movflags", "frag_keyframe+empty_moov",
+        "-f", "mp4", "pipe:1"];
+    return _result(_run(["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"], argv,
+        environment, duration_secs + 15, MAX_RECORD_BYTES, 1073741824), "record");
+}
+
+fn status() {
+    return map{ format: "pblang.screen-capture.status.v1",
+        platform: platform(), available: platform() == "linux" and PROCESS.status().available,
+        shell_free: true, fixed_executables: true, explicit_environment: true,
+        process_group_supervision: true, bounded_image_bytes: MAX_IMAGE_BYTES,
+        bounded_record_bytes: MAX_RECORD_BYTES };
+}
+
+export MAX_IMAGE_BYTES, MAX_RECORD_BYTES, display_environment, capture, region,
+       window, monitor_info, ocr_png, ocr_languages, clipboard_png, pdf_info, pdf_page_png,
+       record, status;

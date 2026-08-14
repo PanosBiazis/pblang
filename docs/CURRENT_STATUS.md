@@ -1,7 +1,14 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-08-02
+**Last Updated**: 2026-08-13
 **Status**: v0.5.7 — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+
+`stdlib:speech_catalog.sapp` adds deterministic bounded discovery of installed
+Whisper model artifacts and eSpeak voice data. It reads only fixed system roots
+through held directory descriptors, distinguishes callable engines from
+data-only installations, caps results at 512 entries, and exposes neither
+absolute paths nor model/voice file contents. It is inventory infrastructure,
+not a speech recognition or synthesis engine.
 The latest complete pblang semantic run on 2026-08-02 passed **748/748 tests**
 with zero failures, ignored tests, or filtered tests. The separate release Rust
 semantics harness passed 203 tests with zero failures and one documented
@@ -11,6 +18,44 @@ more than 90 seconds), pbOS 17/17, and pb-mcp-server 11/11. The Rust
 `cargo test --test semantics` harness keeps exactly **one** ignored test —
 `os_env_set_pass` (`env_set` was disabled in the v0.5 security audit;
 `std::env::set_var` is unsound in multi-threaded programs).
+
+## 2026-08-13 - Native bounded Linux serial I/O
+
+`stdlib:linux_serial.sapp` provides a PBLang-owned Linux serial backend without
+new Rust or serial subprocesses. It accepts only explicit `/dev` serial-device
+families, resolves devices relative to a held directory descriptor with
+`O_NOFOLLOW`, verifies the opened descriptor with `isatty`, supports an exact
+bounded baud-rate set, uses raw nonblocking termios plus poll deadlines, and
+caps reads and writes at 65,536 bytes. Closing restores the original termios
+state and reports the real restoration result.
+
+The semantic contract performs exact binary round trips in both directions on
+a test-only PTY, checks timeout and restoration behavior, and passed. The MCP
+consumer exposes four independently capability-gated serial aliases; their
+isolated focused release gate also passed. Windows and macOS remain honestly
+unsupported until equivalent native handle-based confinement is implemented.
+No physical serial hardware was accessed by automated tests.
+
+## 2026-08-13 - Native bounded MQTT 3.1.1
+
+`stdlib:mqtt311.sapp` adds a PBLang-native binary MQTT 3.1.1 codec and client
+over `stdlib:native_tcp.sapp`. It validates canonical packet lengths and topic
+grammar, bounds packets/payloads/messages/deadlines, and implements complete
+QoS 0/1/2 publish and receive acknowledgement state machines. Semantic tests
+exercise real loopback broker dialogues for publisher and subscriber paths,
+including QoS 2. The pb-mcp-server consumer adds DNS pinning and intentionally
+restricts plaintext MQTT to explicitly approved private trusted networks or
+authenticated tunnels. This is not an MQTT-over-TLS implementation.
+
+## 2026-08-13 - Bounded available-byte TCP reads
+
+`stdlib:native_tcp.sapp` now exposes `read_available_bytes()` for bounded
+passive protocol/banner reads. It returns already received bytes after an idle
+window without requiring EOF, while retaining total deadline, byte ceiling,
+nonblocking and pending-buffer semantics. The loopback contract verifies a
+banner returned while the peer remains connected. pb-mcp-server uses this
+primitive for its single-host quick service scanner; the stdlib primitive does
+not itself perform network discovery.
 
 ## 2026-08-02 - Canonical exact-i32 call-frame lowering
 
@@ -1690,3 +1735,33 @@ cargo run -- doc examples/
 **Last Updated**: 2026  
 **Next Review**: rolling  
 **Status**: Historical snapshot section ends here; use the top summary as canonical.
+
+## 2026-08-13 OpenSSH process-boundary slice
+
+- `stdlib:openssh_client.sapp` provides strict SSH execution and binary SFTP
+  upload/download through fixed system OpenSSH while all admission, argv policy,
+  DNS pinning, resource bounds and cleanup orchestration remain in PBLang.
+- Private key and known-host bytes are handed to the child through verified
+  mode-0600 sealed anonymous descriptors. Passwords, agents, proxy commands,
+  forwarding, tunnels, local commands and interactive prompts are disabled.
+- `linux_process.sapp` now supports a caller-bounded child file-size ceiling and
+  preserves explicit empty argv elements. `linux_dirfs.sapp` supports immutable
+  and mutable inheritable anonymous file handoff with stable parent-PID paths.
+- Temporary OpenSSH descriptors and their exact private root must be removed for
+  a successful operation; cleanup is no longer best-effort.
+- The focused runtime and isolated real-`sshd` contracts pass. OpenSSH supplies
+  the SSH cryptography; this status does not claim a PBLang-native SSH protocol
+  or cryptographic implementation.
+
+## 2026-08-13 bounded classic-PCAP slice
+
+- `stdlib:pcap_capture.sapp` validates closed protocol/port filters, captures
+  through fixed system `tcpdump`, and parses bounded classic PCAP into metadata.
+- Binary capture output stays in the PBLang supervisor's private descriptor-held
+  spool. Raw PCAP, packet payloads and network addresses are not published.
+- Count, snaplen, record length, original length, total file, process output,
+  memory and wall time all have explicit ceilings. Failed capture exit status
+  cannot be hidden by a valid empty PCAP header.
+- A real two-packet loopback contract passes inside an isolated user/network
+  namespace. Normal live capture still requires least-privilege OS capture
+  provisioning; there is no unsafe unprivileged fallback.

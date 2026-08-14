@@ -112,7 +112,13 @@ taskset -c 3 target/release/pblang run bench/app_facade_stages.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/polyglot_control_plane_stages.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/ecosystem_vertical_stages.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/stdlib_hotpaths_stages.sapp --allow-all
+target/release/pblang run bench/linux_process_stages.sapp --allow-all
 ```
+
+`linux_process_stages.sapp` measures the complete warm supervised-process path,
+including generation of argv/supervisor ELF images, private-directory setup,
+launch, wait, bounded output loading, process-group verification and cleanup.
+It does not report compiler startup or module-import time as subprocess latency.
 
 The first measures tokenize, parse, tree interpretation, and direct x86-64
 generation. The second compiles once and averages five executions on the

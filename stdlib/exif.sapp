@@ -1,0 +1,292 @@
+// Bounded TIFF/JPEG EXIF metadata parser written in PBLang.
+//
+// This parser accepts an already-bounded byte snapshot. It never opens paths,
+// decodes pixels, executes a process, or returns raw GPS/device identifiers.
+
+let MAX_IFDS = 8;
+let MAX_ENTRIES_PER_IFD = 128;
+let MAX_TAGS = 256;
+let MAX_ASCII_BYTES = 1024;
+let MAX_VALUES = 16;
+
+fn _error(message) {
+    return map{ ok: false, format: "unknown", tags: [], tag_count: 0,
+                redacted_count: 0, error: message };
+}
+
+fn _range(bytes, offset, count) {
+    return type(offset) == "number" and type(count) == "number" and
+        offset >= 0 and count >= 0 and offset == num_floor(offset) and
+        count == num_floor(count) and offset <= len(bytes) and
+        count <= len(bytes) - offset;
+}
+
+fn _u16(bytes, offset, little) {
+    if not _range(bytes, offset, 2) { return nil; }
+    if little { return bytes[offset] + bytes[offset + 1] * 256; }
+    return bytes[offset] * 256 + bytes[offset + 1];
+}
+
+fn _u32(bytes, offset, little) {
+    if not _range(bytes, offset, 4) { return nil; }
+    if little {
+        return bytes[offset] + bytes[offset + 1] * 256 +
+            bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216;
+    }
+    return bytes[offset] * 16777216 + bytes[offset + 1] * 65536 +
+        bytes[offset + 2] * 256 + bytes[offset + 3];
+}
+
+fn _signed32(value) {
+    if value >= 2147483648 { return value - 4294967296; }
+    return value;
+}
+
+fn _ascii(bytes, offset, count) {
+    if not _range(bytes, offset, count) { return nil; }
+    let out = "";
+    let limit = count;
+    if limit > MAX_ASCII_BYTES { limit = MAX_ASCII_BYTES; }
+    for i limit {
+        let b = bytes[offset + i];
+        if b == 0 { return out; }
+        if b == 9 or b == 10 or b == 13 { out = out + " "; }
+        elif b >= 32 and b <= 126 { out = out + strfromcharcode(b); }
+        else { out = out + "?"; }
+    }
+    return out;
+}
+
+fn _type_size(kind) {
+    if kind == 1 or kind == 2 or kind == 7 { return 1; }
+    if kind == 3 { return 2; }
+    if kind == 4 or kind == 9 { return 4; }
+    if kind == 5 or kind == 10 { return 8; }
+    return 0;
+}
+
+fn _type_name(kind) {
+    if kind == 1 { return "BYTE"; }
+    if kind == 2 { return "ASCII"; }
+    if kind == 3 { return "SHORT"; }
+    if kind == 4 { return "LONG"; }
+    if kind == 5 { return "RATIONAL"; }
+    if kind == 7 { return "UNDEFINED"; }
+    if kind == 9 { return "SLONG"; }
+    if kind == 10 { return "SRATIONAL"; }
+    return "UNKNOWN";
+}
+
+fn _tag_name(tag) {
+    if tag == 256 { return "ImageWidth"; }
+    if tag == 257 { return "ImageLength"; }
+    if tag == 258 { return "BitsPerSample"; }
+    if tag == 269 { return "DocumentName"; }
+    if tag == 270 { return "ImageDescription"; }
+    if tag == 271 { return "Make"; }
+    if tag == 272 { return "Model"; }
+    if tag == 274 { return "Orientation"; }
+    if tag == 282 { return "XResolution"; }
+    if tag == 283 { return "YResolution"; }
+    if tag == 296 { return "ResolutionUnit"; }
+    if tag == 305 { return "Software"; }
+    if tag == 306 { return "DateTime"; }
+    if tag == 315 { return "Artist"; }
+    if tag == 316 { return "HostComputer"; }
+    if tag == 33432 { return "Copyright"; }
+    if tag == 33434 { return "ExposureTime"; }
+    if tag == 33437 { return "FNumber"; }
+    if tag == 34850 { return "ExposureProgram"; }
+    if tag == 34855 { return "ISOSpeedRatings"; }
+    if tag == 36864 { return "ExifVersion"; }
+    if tag == 36867 { return "DateTimeOriginal"; }
+    if tag == 36868 { return "DateTimeDigitized"; }
+    if tag == 37500 { return "MakerNote"; }
+    if tag == 37510 { return "UserComment"; }
+    if tag == 37377 { return "ShutterSpeedValue"; }
+    if tag == 37378 { return "ApertureValue"; }
+    if tag == 37385 { return "Flash"; }
+    if tag == 37386 { return "FocalLength"; }
+    if tag == 40962 { return "PixelXDimension"; }
+    if tag == 40963 { return "PixelYDimension"; }
+    if tag == 41986 { return "ExposureMode"; }
+    if tag == 41987 { return "WhiteBalance"; }
+    if tag == 41989 { return "FocalLengthIn35mmFilm"; }
+    if tag == 42016 { return "ImageUniqueID"; }
+    if tag == 42032 { return "CameraOwnerName"; }
+    if tag == 42033 { return "BodySerialNumber"; }
+    if tag == 42036 { return "LensModel"; }
+    if tag == 42037 { return "LensSerialNumber"; }
+    if tag == 34665 { return "ExifIFDPointer"; }
+    if tag == 34853 { return "GPSInfoIFDPointer"; }
+    if tag == 40965 { return "InteroperabilityIFDPointer"; }
+    return "Tag" + str(tag);
+}
+
+fn _sensitive(tag, scope) {
+    if scope == "gps" { return true; }
+    return tag == 269 or tag == 270 or tag == 306 or tag == 315 or tag == 316 or
+        tag == 33432 or tag == 36867 or tag == 36868 or tag == 37500 or tag == 37510 or
+        tag == 42016 or tag == 42032 or
+        tag == 42033 or tag == 42037 or tag == 50735;
+}
+
+fn _value_offset(bytes, entry, base, little, kind, count) {
+    let size = _type_size(kind);
+    if size == 0 or count < 0 or count > 1048576 { return nil; }
+    let total = size * count;
+    if total < 0 or total > 4194304 { return nil; }
+    if total <= 4 { return map{ offset: entry + 8, bytes: total }; }
+    let relative = _u32(bytes, entry + 8, little);
+    if relative == nil or relative > len(bytes) - base { return nil; }
+    let absolute = base + relative;
+    if not _range(bytes, absolute, total) { return nil; }
+    return map{ offset: absolute, bytes: total };
+}
+
+fn _values(bytes, offset, kind, count, little) {
+    if kind == 2 { return _ascii(bytes, offset, count); }
+    if kind == 1 or kind == 7 {
+        let out = [];
+        let n = count; if n > MAX_VALUES { n = MAX_VALUES; }
+        for i n { out[len(out)] = bytes[offset + i]; }
+        return out;
+    }
+    let out = [];
+    let n = count; if n > MAX_VALUES { n = MAX_VALUES; }
+    for i n {
+        if kind == 3 { out[len(out)] = _u16(bytes, offset + i * 2, little); }
+        elif kind == 4 { out[len(out)] = _u32(bytes, offset + i * 4, little); }
+        elif kind == 9 { out[len(out)] = _signed32(_u32(bytes, offset + i * 4, little)); }
+        elif kind == 5 or kind == 10 {
+            let numerator = _u32(bytes, offset + i * 8, little);
+            let denominator = _u32(bytes, offset + i * 8 + 4, little);
+            if kind == 10 { numerator = _signed32(numerator); denominator = _signed32(denominator); }
+            out[len(out)] = map{ numerator: numerator, denominator: denominator,
+                value: if denominator == 0 { nil } else { numerator / denominator } };
+        }
+    }
+    if len(out) == 1 { return out[0]; }
+    return out;
+}
+
+fn _parse_tiff(bytes, base, container, xmp_present) {
+    if not _range(bytes, base, 8) { return _error("truncated TIFF header"); }
+    let little = bytes[base] == 73 and bytes[base + 1] == 73;
+    let big = bytes[base] == 77 and bytes[base + 1] == 77;
+    if not little and not big { return _error("invalid TIFF byte order"); }
+    if _u16(bytes, base + 2, little) != 42 { return _error("invalid TIFF magic"); }
+    let first = _u32(bytes, base + 4, little);
+    if first == nil or first < 8 { return _error("invalid first IFD offset"); }
+
+    let queue = [map{ offset: first, scope: "ifd0" }];
+    let queue_index = 0;
+    let visited = map{};
+    let tags = [];
+    let redacted = [];
+    let ifds = 0;
+    while queue_index < len(queue) {
+        if ifds >= MAX_IFDS { return _error("EXIF IFD limit exceeded"); }
+        let item = queue[queue_index]; queue_index = queue_index + 1;
+        let key = str(item.offset);
+        if map_has(visited, key) { return _error("cyclic EXIF IFD graph"); }
+        visited[key] = true; ifds = ifds + 1;
+        let absolute = base + item.offset;
+        let count = _u16(bytes, absolute, little);
+        if count == nil or count > MAX_ENTRIES_PER_IFD {
+            return _error("invalid or excessive EXIF entry count");
+        }
+        let table_bytes = count * 12;
+        if not _range(bytes, absolute + 2, table_bytes + 4) {
+            return _error("truncated EXIF IFD table");
+        }
+        for i count {
+            if len(tags) >= MAX_TAGS { return _error("EXIF tag limit exceeded"); }
+            let entry = absolute + 2 + i * 12;
+            let tag = _u16(bytes, entry, little);
+            let kind = _u16(bytes, entry + 2, little);
+            let item_count = _u32(bytes, entry + 4, little);
+            if tag == nil or kind == nil or item_count == nil {
+                return _error("truncated EXIF entry");
+            }
+            let located = _value_offset(bytes, entry, base, little, kind, item_count);
+            if located == nil { return _error("invalid EXIF value bounds for tag " + str(tag)); }
+            // Undefined vendor payloads may contain serials, faces, locations, or
+            // private maker data. ExifVersion is the only safe standardized value.
+            let is_sensitive = _sensitive(tag, item.scope) or (kind == 7 and tag != 36864);
+            let value = if is_sensitive { "[redacted]" }
+                        else { _values(bytes, located.offset, kind, item_count, little) };
+            let record = map{
+                id: tag, name: _tag_name(tag), scope: item.scope,
+                type: _type_name(kind), count: item_count,
+                value: value, redacted: is_sensitive,
+                value_truncated: if kind == 2 { item_count > MAX_ASCII_BYTES }
+                    else { item_count > MAX_VALUES }
+            };
+            tags[len(tags)] = record;
+            if is_sensitive { redacted[len(redacted)] = record.name; }
+
+            if (tag == 34665 or tag == 34853 or tag == 40965) and kind == 4 and item_count == 1 {
+                let child = _u32(bytes, located.offset, little);
+                if child == nil or child < 8 { return _error("invalid child IFD pointer"); }
+                let scope = if tag == 34853 { "gps" }
+                            elif tag == 40965 { "interop" } else { "exif" };
+                queue[len(queue)] = map{ offset: child, scope: scope };
+            }
+        }
+        let next = _u32(bytes, absolute + 2 + table_bytes, little);
+        if next != nil and next != 0 { queue[len(queue)] = map{ offset: next, scope: "ifd-next" }; }
+    }
+    return map{
+        ok: true, format: "EXIF", container: container,
+        byte_order: if little { "little-endian" } else { "big-endian" },
+        tags: tags, tag_count: len(tags), ifd_count: ifds,
+        redacted_tags: redacted, redacted_count: len(redacted),
+        privacy_policy: "gps-timestamps-free-text-owner-artist-copyright-serial-unique-id-vendor-data-redacted",
+        xmp_present: xmp_present,
+        limits: map{ max_ifds: MAX_IFDS, max_entries_per_ifd: MAX_ENTRIES_PER_IFD,
+                     max_tags: MAX_TAGS, max_ascii_bytes: MAX_ASCII_BYTES }
+    };
+}
+
+fn parse(bytes) {
+    if not is_array(bytes) or len(bytes) < 4 { return _error("EXIF input is too short"); }
+    if (bytes[0] == 73 and bytes[1] == 73) or (bytes[0] == 77 and bytes[1] == 77) {
+        return _parse_tiff(bytes, 0, "TIFF", false);
+    }
+    if bytes[0] != 255 or bytes[1] != 216 { return _error("input is not TIFF or JPEG"); }
+    let offset = 2;
+    let xmp_present = false;
+    let exif_base = nil;
+    while offset + 4 <= len(bytes) {
+        if bytes[offset] != 255 { return _error("invalid JPEG marker stream"); }
+        let marker = bytes[offset + 1];
+        if marker == 217 or marker == 218 { break; }
+        if marker == 216 or marker == 1 { offset = offset + 2; }
+        else {
+            let size = _u16(bytes, offset + 2, false);
+            if size == nil or size < 2 or not _range(bytes, offset + 2, size) {
+                return _error("truncated JPEG segment");
+            }
+            let data = offset + 4;
+            let payload = size - 2;
+            if marker == 225 and payload >= 6 and bytes[data] == 69 and
+               bytes[data + 1] == 120 and bytes[data + 2] == 105 and
+               bytes[data + 3] == 102 and bytes[data + 4] == 0 and bytes[data + 5] == 0 {
+                if exif_base != nil { return _error("JPEG contains duplicate EXIF APP1 segments"); }
+                exif_base = data + 6;
+            }
+            if marker == 225 and payload >= 29 and
+               str_starts_with(_ascii(bytes, data, 29), "http://ns.adobe.com/xap/1.0/") {
+                xmp_present = true;
+            }
+            offset = offset + 2 + size;
+        }
+    }
+    if exif_base != nil { return _parse_tiff(bytes, exif_base, "JPEG", xmp_present); }
+    let out = _error("JPEG contains no EXIF APP1 segment");
+    out.format = "JPEG"; out.xmp_present = xmp_present;
+    return out;
+}
+
+export parse;

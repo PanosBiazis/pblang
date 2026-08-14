@@ -518,9 +518,12 @@ rejects streaming `/dev` reads from the high-level safe reader.
 These mechanisms are portable policy code, but they do **not** prove every
 physical device or native driver safe. Raw FFI, generated syscalls, `ioctl`,
 `mmap`, DMA, vendor GPU/NPU libraries, kernels, firmware, and hardware remain
-separate trust boundaries. The current file builtin also obtains a finite file
-before the pblang policy can inspect its returned length; genuinely bounded
-streaming-device reads require a sized native read backend.
+separate trust boundaries. On Linux, `stdlib:linux_device_handle.sapp` provides
+the sized native boundary for exact I2C/GPIO character-device namespaces: held
+parent descriptors, no-follow/nonblocking opens, bounded reads and writes,
+deadlines, and a per-class ioctl allowlist. It does not make arbitrary ioctls or
+active hardware probing safe; each higher-level protocol still needs its own
+capability, limits, tests, and physical-device verification.
 
 `product_runtime.sapp` supplies shared profiles for pblang compile/codegen,
 PBIDE preview/run, pbAI inference/learning, pbOS services/restarts, and

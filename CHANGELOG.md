@@ -1,7 +1,41 @@
 # Changelog
 
+- `linux_dirfs.open_absolute("/", false, false)` can now hold the filesystem
+  root as one no-follow descriptor. Fixed-path security audits can reuse that
+  handle for component-safe metadata and bounded reads instead of repeatedly
+  loading libc and reopening every parent directory.
+- Added `linux_dirfs.open_current_process_net()` for descriptor-bound procfs
+  socket-table inspection without traversing the `/proc/self` magic symlink or
+  accepting a caller-controlled PID/path.
+- Added `linux_dirfs.read_stream_bytes()` for bounded descriptor reads from
+  non-seekable procfs-style pseudo-files, with a hard `max_bytes + 1` ceiling
+  and explicit truncation instead of whole-source allocation.
+
 ## Unreleased
 
+- Added `stdlib/linux_device_handle.sapp`, a PBLang-only Linux character-device
+  boundary with exact device-class paths, held-parent `openat`, no-follow,
+  close-on-exec and nonblocking descriptors, bounded read/write deadlines, and
+  per-class ioctl allowlists. A real PTY lifecycle test covers binary I/O,
+  cross-class rejection, ioctl gating, ceilings, and final close semantics.
+- Added `stdlib/linux_can.sapp`, a direct bounded Classic CAN receiver using a
+  nonblocking/cloexec `PF_CAN` socket. It validates interface names, caps frame
+  count and deadlines, parses standard/extended/RTR/error metadata, and removes
+  the need for `candump` or shell execution.
+- Replaced the unbounded HTTP-builtin path in `stdlib/ollama.sapp` with a
+  PBLang-only bounded loopback HTTP/1.0 client. Added structured generation and
+  embedding results, strict local-model/options/vector validation, deterministic
+  offline tests, and opt-in live-model verification while preserving the
+  existing text-or-nil generation facade.
+- Added `linux_dirfs.move_new_exclusive`, backed by a sealed static x86-64
+  `renameat2(RENAME_NOREPLACE)` syscall helper emitted entirely by PBLang. The
+  operation inherits only held parent-directory descriptors, performs no shell
+  parsing or compilation, and proves that destination collisions preserve both
+  namespace entries.
+- Added `linux_dirfs.sealed_child_bytes`, a PBLang-only, kernel-memory-backed
+  handoff for fixed-argv child processes. It validates arbitrary binary input,
+  applies and verifies Linux write/grow/shrink/further-seal locks, verifies
+  descriptor inheritance, and never creates a mutable filesystem pathname.
 - Added pure-PBLang binary SHA-1, MD5, and full tree-mode BLAKE3 in
   `stdlib/digest.sapp`, with shared SHA-256 dispatch. Official BLAKE3 vectors
   cover empty, single-block, chunk-boundary, asymmetric three-chunk and

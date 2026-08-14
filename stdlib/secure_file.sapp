@@ -1,20 +1,35 @@
-// Race-resistant single-file operations for Linux, implemented in PBLang.
+// Race-resistant single-file operations for Linux and macOS, implemented in PBLang.
 //
 // The parent path is opened component-by-component through linux_dirfs and the
-// final file is accessed relative to that held directory descriptor. Callers on
-// Linux must not fall back to ordinary path I/O when one of these operations
+// final file is accessed relative to that held directory descriptor. Callers
+// must not fall back to ordinary path I/O when one of these operations
 // fails: failure can mean a symlink or namespace race was rejected.
 
-let DirFS = import("stdlib:linux_dirfs.sapp");
+let LinuxDirFS = import("stdlib:linux_dirfs.sapp");
+let PosixDirFS = import("stdlib:posix_dirfs.sapp");
+let WindowsDirFS = import("stdlib:windows_dirfs.sapp");
 
 let MAX_PATH = 4096;
 
 fn _error(message) { return map{ ok: false, error: message }; }
 
+fn _backend() {
+    if platform() == "linux" { return LinuxDirFS; }
+    if platform() == "macos" { return PosixDirFS; }
+    if platform() == "windows" { return WindowsDirFS; }
+    return nil;
+}
+
 fn available() {
-    let status = DirFS.available();
-    return map{ ok: platform() == "linux" and status.ok,
-                format: "pblang.secure-file.v1", backend: "linux-dirfs" };
+    let backend = _backend();
+    if backend == nil { return map{ ok: false, format: "pblang.secure-file.v1",
+        backend: "unavailable", platform: platform() }; }
+    let state = backend.available();
+    return map{ ok: state.ok, format: "pblang.secure-file.v1",
+        backend: if platform() == "linux" { "linux-dirfs" } else {
+            if platform() == "windows" { "windows-nt-dirfs" } else { "posix-dirfs" }
+        },
+        platform: platform() };
 }
 
 fn _parts(path) {
@@ -35,20 +50,32 @@ fn _parts(path) {
 fn _open_parent(path, create, private_parent) {
     let parts = _parts(path);
     if parts == nil { return _error("invalid secure file path"); }
-    let fs = if parts.absolute { DirFS.open_absolute(parts.parent, create, private_parent) }
-        else { DirFS.open(parts.parent, create, private_parent) };
+    if platform() == "windows" {
+        if parts.absolute { return _error("absolute secure roots require an explicit WindowsDirFS root handle"); }
+        let fs = WindowsDirFS.open(".", false);
+        if not fs.ok { return _error("secure Windows root directory is unavailable"); }
+        return map{ ok: true, fs: fs, name: str_replace_all(path, "/", "\\") };
+    }
+    if parts.absolute and platform() != "linux" {
+        return _error("absolute secure roots are not supported by this platform backend");
+    }
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
+    let fs = nil;
+    if parts.absolute { fs = LinuxDirFS.open_absolute(parts.parent, create, private_parent); }
+    elif platform() == "linux" { fs = LinuxDirFS.open(parts.parent, create, private_parent); }
+    else { fs = PosixDirFS.open(parts.parent, create); }
     if not fs.ok { return _error("secure parent directory is unavailable"); }
     return map{ ok: true, fs: fs, name: parts.name };
 }
 
 fn read_bytes(path, max_bytes, private_parent = false) {
-    if platform() != "linux" { return _error("secure file backend requires Linux"); }
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
     if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes) {
         return _error("invalid secure read limit");
     }
     let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
-    let result = DirFS.read_bytes(parent.fs, parent.name, max_bytes);
-    DirFS.close(parent.fs); return result;
+    let result = backend.read_bytes(parent.fs, parent.name, max_bytes);
+    backend.close(parent.fs); return result;
 }
 
 fn read_text(path, max_bytes, private_parent = false) {
@@ -58,19 +85,85 @@ fn read_text(path, max_bytes, private_parent = false) {
     return map{ ok: true, text: text, size: result.size };
 }
 
+fn _incomplete_utf8_suffix(bytes, start) {
+    let remaining = len(bytes) - start;
+    if remaining < 1 or remaining > 3 { return false; }
+    let lead = bytes[start]; let expected = 0;
+    if lead >= 194 and lead <= 223 { expected = 2; }
+    elif lead >= 224 and lead <= 239 { expected = 3; }
+    elif lead >= 240 and lead <= 244 { expected = 4; }
+    else { return false; }
+    if remaining >= expected { return false; }
+    let i = start + 1;
+    while i < len(bytes) {
+        if bytes[i] < 128 or bytes[i] > 191 { return false; }
+        i = i + 1;
+    }
+    if remaining >= 2 {
+        let second = bytes[start + 1];
+        if lead == 224 and second < 160 { return false; }
+        if lead == 237 and second > 159 { return false; }
+        if lead == 240 and second < 144 { return false; }
+        if lead == 244 and second > 143 { return false; }
+    }
+    return true;
+}
+
+// Read at most max_bytes from one held regular-file descriptor. A UTF-8 code
+// point can straddle the byte ceiling, so discard only a proven incomplete
+// scalar suffix. Any malformed byte sequence still fails closed.
+fn read_text_prefix(path, max_bytes, private_parent = false) {
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
+    if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes) {
+        return _error("invalid secure prefix limit");
+    }
+    let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
+    let result = backend.read_prefix_bytes(parent.fs, parent.name, max_bytes);
+    backend.close(parent.fs); if not result.ok { return result; }
+    let bytes = result.bytes; let text = try bytes_to_str(bytes) catch nil; let trimmed = 0;
+    if text == nil and result.truncated {
+        let candidate_trim = 1;
+        while candidate_trim <= 3 and candidate_trim <= len(bytes) and text == nil {
+            let start = len(bytes) - candidate_trim;
+            if _incomplete_utf8_suffix(bytes, start) {
+                let candidate = slice(bytes, 0, start);
+                let decoded = try bytes_to_str(candidate) catch nil;
+                if decoded != nil { bytes = candidate; text = decoded; trimmed = candidate_trim; }
+            }
+            candidate_trim = candidate_trim + 1;
+        }
+    }
+    if text == nil { return _error("secure file prefix is not valid UTF-8"); }
+    return map{
+        ok: true, text: text, size: result.source_size,
+        source_size: result.source_size, returned_bytes: len(bytes),
+        truncated: result.truncated or trimmed > 0,
+        utf8_boundary_trimmed_bytes: trimmed,
+        race_resistant: true
+    };
+}
+
 fn read_optional_text(path, max_bytes, private_parent = false) {
-    if platform() != "linux" { return _error("secure file backend requires Linux"); }
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
     if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes) {
         return _error("invalid secure read limit");
     }
     let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
-    let listed = DirFS.list(parent.fs, "root", 4096);
-    if not listed.ok { DirFS.close(parent.fs); return _error("secure parent directory cannot be listed"); }
+    if platform() == "windows" {
+        let loaded = backend.read_bytes(parent.fs, parent.name, max_bytes); backend.close(parent.fs);
+        if not loaded.ok and (try loaded.missing catch false) { return map{ ok: true, missing: true }; }
+        if not loaded.ok { return loaded; }
+        let text = try bytes_to_str(loaded.bytes) catch nil;
+        if text == nil { return _error("secure file is not valid UTF-8"); }
+        return map{ ok: true, missing: false, text: text, size: loaded.size };
+    }
+    let listed = backend.list(parent.fs, "root", 4096);
+    if not listed.ok { backend.close(parent.fs); return _error("secure parent directory cannot be listed"); }
     let found = false; let i = 0;
     while i < len(listed.entries) { if listed.entries[i] == parent.name { found = true; } i = i + 1; }
-    if not found { DirFS.close(parent.fs); return map{ ok: true, missing: true }; }
-    let loaded = DirFS.read_bytes(parent.fs, parent.name, max_bytes);
-    DirFS.close(parent.fs);
+    if not found { backend.close(parent.fs); return map{ ok: true, missing: true }; }
+    let loaded = backend.read_bytes(parent.fs, parent.name, max_bytes);
+    backend.close(parent.fs);
     if not loaded.ok { return loaded; }
     let text = try bytes_to_str(loaded.bytes) catch nil;
     if text == nil { return _error("secure file is not valid UTF-8"); }
@@ -78,11 +171,11 @@ fn read_optional_text(path, max_bytes, private_parent = false) {
 }
 
 fn write_atomic(path, bytes, create_parent = true, private_parent = false) {
-    if platform() != "linux" { return _error("secure file backend requires Linux"); }
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
     if type(bytes) != "array" { return _error("secure file bytes must be an array"); }
     let parent = _open_parent(path, create_parent, private_parent); if not parent.ok { return parent; }
-    let result = DirFS.write_atomic(parent.fs, parent.name, bytes, false);
-    DirFS.close(parent.fs); return result;
+    let result = backend.write_atomic(parent.fs, parent.name, bytes, false);
+    backend.close(parent.fs); return result;
 }
 
 fn write_text_atomic(path, text, create_parent = true, private_parent = false) {
@@ -90,17 +183,46 @@ fn write_text_atomic(path, text, create_parent = true, private_parent = false) {
     return write_atomic(path, str_to_bytes(text), create_parent, private_parent);
 }
 
+fn write_new_exclusive(path, bytes, create_parent = true, private_parent = false) {
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
+    if type(bytes) != "array" { return _error("secure file bytes must be an array"); }
+    let parent = _open_parent(path, create_parent, private_parent); if not parent.ok { return parent; }
+    let result = backend.write_new_exclusive(parent.fs, parent.name, bytes, false);
+    backend.close(parent.fs); return result;
+}
+
+fn write_text_new_exclusive(path, text, create_parent = true, private_parent = false) {
+    if type(text) != "string" { return _error("secure file text must be a string"); }
+    return write_new_exclusive(path, str_to_bytes(text), create_parent, private_parent);
+}
+
 fn remove(path, private_parent = false) {
-    if platform() != "linux" { return _error("secure file backend requires Linux"); }
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
     let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
-    let result = DirFS.remove(parent.fs, parent.name);
-    DirFS.close(parent.fs); return result;
+    let result = if platform() == "linux" { LinuxDirFS.remove(parent.fs, parent.name) }
+        else { if platform() == "windows" { WindowsDirFS.remove_file(parent.fs, parent.name) }
+            else { PosixDirFS.remove_file(parent.fs, parent.name) } };
+    backend.close(parent.fs); return result;
+}
+
+fn remove_file(path, private_parent = false) {
+    let backend = _backend(); if backend == nil { return _error("secure file backend is unavailable"); }
+    let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
+    let result = backend.remove_file(parent.fs, parent.name);
+    backend.close(parent.fs); return result;
 }
 
 fn status() {
     return map{ format: "pblang.secure-file.status.v1", available: available().ok,
                 component_openat: true, nofollow: true, exclusive_stage: true,
-                atomic_renameat: true, path_fallback_on_linux: false };
+                atomic_renameat: true, exclusive_no_replace_openat: true,
+                path_fallback: false, path_fallback_on_linux: false,
+                backend: available().backend,
+                linux_backend: platform() == "linux", macos_backend: platform() == "macos",
+                windows_backend: platform() == "windows",
+                global_handle_backends: ["linux", "macos", "windows"] };
 }
 
-export available, read_bytes, read_text, read_optional_text, write_atomic, write_text_atomic, remove, status;
+export available, read_bytes, read_text, read_text_prefix, read_optional_text,
+       write_atomic, write_text_atomic, write_new_exclusive, write_text_new_exclusive,
+       remove, remove_file, status;
