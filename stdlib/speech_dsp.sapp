@@ -1,0 +1,99 @@
+// Bounded speech-oriented PCM16 DSP implemented entirely in PBLang.
+
+let PCM=import("stdlib:audio_pcm.sapp");
+let FORMAT="pblang.speech-dsp.v1";
+
+fn _sample(value){value=num_floor(value);if value< -32768{return -32768;}
+    if value>32767{return 32767;}return value;}
+fn _finite(value,minimum,maximum){return type(value)=="number" and value==value
+    and value>=minimum and value<=maximum;}
+
+fn enhance(audio,noise_gate_db,clarity,target_db){
+    let info=PCM.validate(audio);
+    if not _finite(noise_gate_db,-90,-6){throw "speech_dsp: noise_gate_db must be in -90..-6";}
+    if not _finite(clarity,0,1){throw "speech_dsp: clarity must be in 0..1";}
+    if not _finite(target_db,-30,-0.1){throw "speech_dsp: target_db must be in -30..-0.1";}
+    let means=[];for channel audio.channels{array_push(means,0);}
+    for frame info.frames{for channel audio.channels{
+        means[channel]=means[channel]+audio.samples[frame*audio.channels+channel];
+    }}
+    for channel audio.channels{means[channel]=means[channel]/num_max(1,info.frames);}
+    let previous=[];for channel audio.channels{array_push(previous,0);}
+    let gain=1.0;let threshold=32768*num_pow(10,noise_gate_db/20.0);let out=[];
+    for frame info.frames{
+        let peak=0;for channel audio.channels{
+            peak=num_max(peak,num_abs(audio.samples[frame*audio.channels+channel]-means[channel]));
+        }
+        let wanted=if peak<threshold{0.08}else{1.0};
+        let smoothing=if wanted>gain{0.2}else{0.01};gain=gain+(wanted-gain)*smoothing;
+        for channel audio.channels{
+            let centered=audio.samples[frame*audio.channels+channel]-means[channel];
+            let high=centered-previous[channel]*0.95;previous[channel]=centered;
+            let clarified=centered*(1-clarity)+high*clarity;
+            array_push(out,_sample(clarified*gain));
+        }
+    }
+    let processed=map{format:PCM.FORMAT,sample_rate:audio.sample_rate,
+        channels:audio.channels,samples:out};
+    processed=PCM.normalize(processed,target_db);
+    let result_info=PCM.validate(processed);
+    return map{ok:true,executed:true,format:FORMAT,audio:processed,
+        frames:result_info.frames,duration_secs:result_info.duration_secs,
+        noise_gate_db:noise_gate_db,clarity:clarity,target_db:target_db,
+        dc_removed:true,smoothed_gate:true,high_pass:true,normalized:true};
+}
+
+fn _window_features(samples,first,last,sample_rate){
+    let count=last-first;if count<2{return [0,0,0,0,0];}
+    let energy=0;let crossings=0;let slope=0;let corr80=0;let corr160=0;
+    for i count{let value=samples[first+i];energy=energy+value*value;
+        if i>0{let previous=samples[first+i-1];if (value>=0)!=(previous>=0){crossings=crossings+1;}
+            slope=slope+num_abs(value-previous);}
+        if i>=80{corr80=corr80+value*samples[first+i-80];}
+        if i>=160{corr160=corr160+value*samples[first+i-160];}}
+    let rms=num_sqrt(energy/count)/32768.0;
+    return [rms,crossings/count,(slope/count)/65536.0,
+        corr80/(energy+1),corr160/(energy+1)];
+}
+fn _distance(a,b){let total=0;for i len(a){let delta=a[i]-b[i];total=total+delta*delta;}
+    return num_sqrt(total);}
+fn diarize(audio,max_speakers,window_ms,hop_ms,silence_db,cluster_threshold){
+    let info=PCM.validate(audio);
+    if type(max_speakers)!="number" or max_speakers!=num_floor(max_speakers)
+        or max_speakers<1 or max_speakers>8{throw "speech_dsp: max_speakers must be 1..8";}
+    if type(window_ms)!="number" or window_ms!=num_floor(window_ms) or window_ms<100 or window_ms>2000
+        or type(hop_ms)!="number" or hop_ms!=num_floor(hop_ms) or hop_ms<50 or hop_ms>window_ms{
+        throw "speech_dsp: invalid diarization window or hop";}
+    if not _finite(silence_db,-90,-6) or not _finite(cluster_threshold,0.01,1){
+        throw "speech_dsp: invalid diarization thresholds";}
+    let mono=[];for frame info.frames{let sum=0;for channel audio.channels{
+        sum=sum+audio.samples[frame*audio.channels+channel];}array_push(mono,_sample(sum/audio.channels));}
+    let window=num_max(1,num_floor(audio.sample_rate*window_ms/1000));
+    let hop=num_max(1,num_floor(audio.sample_rate*hop_ms/1000));
+    let silence=32768*num_pow(10,silence_db/20.0);let centroids=[];let counts=[];let windows=[];
+    let first=0;while first<len(mono){let last=num_min(len(mono),first+window);
+        let features=_window_features(mono,first,last,audio.sample_rate);
+        if features[0]*32768>silence{let nearest=-1;let best=1000000;
+            for i len(centroids){let distance=_distance(features,centroids[i]);if distance<best{best=distance;nearest=i;}}
+            if nearest<0 or (best>cluster_threshold and len(centroids)<max_speakers){
+                nearest=len(centroids);array_push(centroids,features);array_push(counts,1);
+            } else {counts[nearest]=counts[nearest]+1;for f len(features){
+                centroids[nearest][f]=centroids[nearest][f]+(features[f]-centroids[nearest][f])/counts[nearest];}}
+            array_push(windows,map{speaker:nearest+1,start_secs:first/audio.sample_rate,
+                end_secs:last/audio.sample_rate,features:features});}
+        first=first+hop;}
+    let turns=[];for i len(windows){let current=windows[i];
+        if len(turns)>0 and turns[len(turns)-1].speaker==current.speaker
+            and current.start_secs<=turns[len(turns)-1].end_secs+hop_ms/1000.0{
+            turns[len(turns)-1].end_secs=num_max(turns[len(turns)-1].end_secs,current.end_secs);
+        } else {array_push(turns,map{speaker:current.speaker,label:"speaker_"+str(current.speaker),
+            start_secs:current.start_secs,end_secs:current.end_secs});}}
+    for i len(turns){turns[i].duration_secs=turns[i].end_secs-turns[i].start_secs;}
+    return map{ok:true,executed:true,format:"pblang.speech-diarization.v1",turns:turns,
+        turn_count:len(turns),speaker_count:len(centroids),window_count:len(windows),
+        window_ms:window_ms,hop_ms:hop_ms,silence_db:silence_db,
+        cluster_threshold:cluster_threshold,method:"bounded-acoustic-clustering",
+        identity_recognition:false};
+}
+
+export FORMAT, enhance, diarize;

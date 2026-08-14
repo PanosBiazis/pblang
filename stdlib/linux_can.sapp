@@ -1,0 +1,153 @@
+// Bounded Linux Classic CAN receiver implemented entirely in PBLang.
+// Uses PF_CAN/SOCK_RAW directly; no shell or can-utils dependency.
+
+let LIBC = [
+    "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6", "/lib/i386-linux-gnu/libc.so.6"
+];
+let CRYPTO = [
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3", "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/aarch64-linux-gnu/libcrypto.so.3", "/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/i386-linux-gnu/libcrypto.so.3", "/lib/i386-linux-gnu/libcrypto.so.3"
+];
+
+let FORMAT = "pblang.linux-can.v1";
+let AF_CAN = 29; let SOCK_RAW = 3; let SOCK_NONBLOCK = 2048; let SOCK_CLOEXEC = 524288;
+let CAN_RAW = 1; let POLLIN = 1; let FRAME_BYTES = 16; let MAX_FRAMES = 1000;
+let CAN_EFF_FLAG = 2147483648; let CAN_RTR_FLAG = 1073741824; let CAN_ERR_FLAG = 536870912;
+let CAN_EFF_MASK = 536870911; let CAN_SFF_MASK = 2047;
+
+fn _path(values) { for i len(values) { if fs_exists(values[i]) { return values[i]; } } return ""; }
+fn _i32(value) { if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; } return value; }
+fn _call(state,name,signature,args) { return try ffi_call_typed(state.libc,name,signature,args) catch -1; }
+fn _free(state,pointer) { if pointer != nil and pointer != 0 { _call(state,"free","ptr->void",[pointer]); } }
+fn _free_crypto(state,pointer) {
+    if pointer != nil and pointer != 0 {
+        try ffi_call_typed(state.crypto,"CRYPTO_free","ptr,ptr,i32->void",[pointer,0,0]) catch nil;
+    }
+}
+fn _write_le(state,pointer,value,count) {
+    let remaining=value;
+    for i count {
+        _call(state,"memset","ptr,i32,i64->ptr",[pointer+i,num_mod(remaining,256),1]);
+        remaining=num_floor(remaining/256);
+    }
+}
+fn _pointer_bytes(state,pointer,count) {
+    let encoded=try ffi_call_typed(state.crypto,"OPENSSL_buf2hexstr","ptr,i64->ptr",[pointer,count]) catch nil;
+    if encoded==nil or encoded==0{return map{ok:false,error:"CAN frame encoding failed"};}
+    let text=try ffi_call_typed(state.libc,"basename","ptr->string",[encoded]) catch nil;
+    _free_crypto(state,encoded);
+    if type(text)!="string"{return map{ok:false,error:"CAN frame bytes unavailable"};}
+    let clean=str_lower(str_replace_all(text,":",""));
+    if len(clean)!=count*2{return map{ok:false,error:"CAN frame byte count mismatch"};}
+    let out=[];
+    for i count {
+        let at=i*2;let high=str_index_of("0123456789abcdef",str_slice(clean,at,at+1));
+        let low=str_index_of("0123456789abcdef",str_slice(clean,at+1,at+2));
+        if high<0 or low<0{return map{ok:false,error:"CAN frame hex is invalid"};}
+        out[len(out)]=high*16+low;
+    }
+    return map{ok:true,bytes:out};
+}
+fn _u32le(bytes,offset) {
+    return bytes[offset]+bytes[offset+1]*256+bytes[offset+2]*65536+bytes[offset+3]*16777216;
+}
+fn _hex(bytes) {
+    let digits="0123456789ABCDEF";let out="";
+    for i len(bytes) {
+        if i>0{out=out+" ";}let value=bytes[i];
+        out=out+str_slice(digits,num_floor(value/16),num_floor(value/16)+1)
+            +str_slice(digits,num_mod(value,16),num_mod(value,16)+1);
+    }
+    return out;
+}
+fn _number_hex(value) {
+    let digits="0123456789ABCDEF";if value==0{return "0";}let out="";let remaining=value;
+    while remaining>0 {
+        let digit=num_mod(remaining,16);out=str_slice(digits,digit,digit+1)+out;
+        remaining=num_floor(remaining/16);
+    }
+    return out;
+}
+
+fn parse_classic_frame(bytes) {
+    if type(bytes)!="array" or len(bytes)!=FRAME_BYTES{return map{ok:false,error:"classic CAN frame must contain exactly 16 bytes"};}
+    for i len(bytes) { if type(bytes[i])!="number" or bytes[i]!=num_floor(bytes[i]) or bytes[i]<0 or bytes[i]>255{return map{ok:false,error:"CAN frame contains an invalid byte"};} }
+    let raw_id=_u32le(bytes,0);let extended=bit_and(raw_id,CAN_EFF_FLAG)!=0;
+    let remote=bit_and(raw_id,CAN_RTR_FLAG)!=0;let error_frame=bit_and(raw_id,CAN_ERR_FLAG)!=0;
+    let identifier=bit_and(raw_id,if extended{CAN_EFF_MASK}else{CAN_SFF_MASK});
+    let dlc=bytes[4];if dlc>8{dlc=8;}
+    let data=[];if not remote { for i dlc { data[len(data)]=bytes[8+i]; } }
+    return map{ok:true,format:FORMAT,id:identifier,id_hex:"0x"+_number_hex(identifier),
+        extended:extended,remote_request:remote,error_frame:error_frame,dlc:dlc,
+        data:data,data_hex:_hex(data),classic_can:true};
+}
+
+fn available() {
+    let libc=_path(LIBC);let crypto=_path(CRYPTO);
+    return map{ok:platform()=="linux" and libc!="" and crypto!="",format:FORMAT,
+        platform:platform(),libc:libc,crypto:crypto,classic_can:true,can_fd:false,
+        nonblocking:true,cloexec:true,max_frames:MAX_FRAMES};
+}
+
+fn open_interface(interface) {
+    if type(interface)!="string" or not regex_match(interface,"^[A-Za-z0-9_.:-]{1,15}$") {
+        return map{ok:false,error:"invalid CAN interface name"};
+    }
+    let support=available();if not support.ok{return map{ok:false,error:"Linux CAN backend unavailable"};}
+    let libc=try ffi_load(support.libc) catch nil;let crypto=try ffi_load(support.crypto) catch nil;
+    if libc==nil or crypto==nil{try ffi_close(libc) catch nil;try ffi_close(crypto) catch nil;return map{ok:false,error:"trusted CAN libraries unavailable"};}
+    let state=map{ok:false,format:FORMAT,libc:libc,crypto:crypto,fd:-1,closed:false,interface:interface};
+    let index=_call(state,"if_nametoindex","string->i32",[interface]);
+    if index<=0{close(state);return map{ok:false,error:"CAN interface does not exist"};}
+    state.fd=_i32(_call(state,"socket","i32,i32,i32->i32",[AF_CAN,SOCK_RAW+SOCK_NONBLOCK+SOCK_CLOEXEC,CAN_RAW]));
+    if state.fd<0{close(state);return map{ok:false,error:"PF_CAN socket open failed"};}
+    let address=_call(state,"calloc","i64,i64->ptr",[1,16]);
+    if address==nil or address==0{close(state);return map{ok:false,error:"CAN address allocation failed"};}
+    _write_le(state,address,AF_CAN,2);_write_le(state,address+4,index,4);
+    let bound=_i32(_call(state,"bind","i32,ptr,i32->i32",[state.fd,address,16]));_free(state,address);
+    if bound!=0{close(state);return map{ok:false,error:"CAN interface bind failed"};}
+    state.ok=true;state.interface_index=index;state.nonblocking=true;state.cloexec=true;
+    return state;
+}
+
+fn _poll(state,timeout_ms) {
+    let record=_call(state,"calloc","i64,i64->ptr",[1,8]);if record==nil or record==0{return -1;}
+    _write_le(state,record,state.fd,4);_write_le(state,record+4,POLLIN,2);
+    let result=_i32(_call(state,"poll","ptr,i64,i32->i32",[record,1,timeout_ms]));_free(state,record);return result;
+}
+
+fn read_frames(state,count=20,timeout_ms=1000) {
+    if type(state)!="map" or (try state.format catch "")!=FORMAT or (try state.closed catch true)
+        or type(count)!="number" or count!=num_floor(count) or count<1 or count>MAX_FRAMES
+        or type(timeout_ms)!="number" or timeout_ms!=num_floor(timeout_ms) or timeout_ms<20 or timeout_ms>30000 {
+        return map{ok:false,error:"invalid bounded CAN read"};
+    }
+    let frames=[];let started=now_ms();let timed_out=false;
+    while len(frames)<count {
+        let elapsed=now_ms()-started;let remaining=timeout_ms-elapsed;
+        if remaining<=0{timed_out=true;break;}
+        if _poll(state,num_floor(remaining))<=0{timed_out=true;break;}
+        let buffer=_call(state,"calloc","i64,i64->ptr",[1,FRAME_BYTES]);
+        if buffer==nil or buffer==0{return map{ok:false,error:"CAN frame allocation failed"};}
+        let received=_call(state,"read","i32,ptr,i64->i64",[state.fd,buffer,FRAME_BYTES]);
+        let copied=if received==FRAME_BYTES{_pointer_bytes(state,buffer,FRAME_BYTES)}else{map{ok:false}};_free(state,buffer);
+        if received!=FRAME_BYTES or not copied.ok{return map{ok:false,error:"bounded classic CAN frame read failed"};}
+        let frame=parse_classic_frame(copied.bytes);if not frame.ok{return frame;}frames[len(frames)]=frame;
+    }
+    return map{ok:true,format:FORMAT,interface:state.interface,frames:frames,count_read:len(frames),
+        requested_count:count,timed_out:timed_out,elapsed_ms:now_ms()-started,
+        executed:true,shell_used:false,nonblocking:true,cloexec:true};
+}
+
+fn close(state) {
+    if type(state)=="map" and not (try state.closed catch true) {
+        if (try state.fd catch -1)>=0{_call(state,"close","i32->i32",[state.fd]);state.fd=-1;}
+        try ffi_close(state.crypto) catch nil;try ffi_close(state.libc) catch nil;state.closed=true;
+    }
+    return map{ok:true,closed:true};
+}
+
+export FORMAT,MAX_FRAMES,available,parse_classic_frame,open_interface,read_frames,close;

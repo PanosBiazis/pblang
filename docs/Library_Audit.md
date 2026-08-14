@@ -5,6 +5,56 @@ development directive. It separates verified implementations from file-name
 coverage: the presence of a module is not evidence that every API is complete,
 safe, or standards compliant.
 
+## 2026-08-13 descriptor-held fixed process execution
+
+`stdlib/linux_process.sapp` now exposes `run_fixed` for optional host adapters.
+Each absolute candidate is opened relative to a held no-follow parent directory,
+then that same object is executed through an inheritable descriptor. This
+removes exists-then-exec races while preserving output, timeout, address-space,
+process-group, and deterministic candidate-order guarantees.
+
+## 2026-08-13 bounded local Ollama transport
+
+`stdlib/ollama.sapp` now performs generation, embedding, model discovery, and
+availability checks through a PBLang-only HTTP/1.0 loopback transport. It
+accepts only `127.0.0.1`, `localhost`, or `[::1]`, validates the port and API
+path, caps headers at 16 KiB, requests at 256 KiB, responses at 1 MiB, model
+names at 128 characters, prompts at 65,536 characters, and embedding vectors
+at 8,192 finite dimensions. Every socket is closed after success or failure.
+Unknown options, cloud tags, malformed JSON, encoded/chunked responses,
+inconsistent lengths, non-JSON content, and non-finite vectors fail closed.
+
+The old `generate(model, prompt, post_fn)` text-or-nil API remains compatible;
+new callers can use structured `generate_result` and `embed_result`. Offline
+transport injection tests pass, and an opt-in live generation smoke passed
+against the local Ollama daemon. This module is deliberately not a general HTTP
+client and does not make remote model traffic safe or permitted.
+
+## 2026-08-13 identity and organization policy
+
+`stdlib/iam.sapp` adds a bounded, storage-independent users and organizations
+domain implemented only in PBLang. It supports canonical identifiers, active
+accounts, organizations, memberships, system administrators,
+`owner`/`admin`/`member`/`viewer` roles, explicit permissions, deterministic
+principal-scoped listings, role-escalation checks, and protection for the last
+organization owner and system administrator. Unknown permission names fail
+closed.
+
+The module deliberately does not issue or verify passwords, tokens, sessions,
+or certificates. Products must authenticate a principal at their transport
+boundary and own durable storage. The PBLang pb-mcp-server is the first product
+adapter: it uses a private descriptor-held Linux directory, verifiable
+`0700`/`0600` modes, bounded locks, validated atomic publication, and a
+server-owned HTTP principal. Its semantic contract covers bootstrap, tenant
+isolation, authorization, default-deny capabilities, concurrent writers, and
+transport propagation.
+
+The hot authorization path originally performed O(users) capacity checks per
+decision. Keeping those checks at load/publication validation while mutations
+retain explicit capacity admission reduced 512 decisions from `221.3335 ms`
+median to `37.3557 ms` (`5.93x`, `83.12%` lower latency) without weakening the
+persisted-state gate.
+
 ## 2026-08-12 confined prefix reads
 
 `stdlib/digest.sapp` supplies binary-safe SHA-1, MD5 and BLAKE3 plus unified
@@ -129,7 +179,7 @@ existing implementation surfaces for:
 | Database/storage | `db`, `orm`, `storage`, `cache`, `data_store`, `redis`, `render_cache` | Unified memory/SQLite/Redis KV contract is verified; continue bounded query-result and streaming large-object work |
 | Security/crypto | `crypto`, `crypto_advanced`, `crypto_quantum`, `security`, `jwt`, `web_security` | Separate primitives, protocol policy, and convenience APIs; require vectors and misuse-resistant defaults |
 | Math/science/AI | `math`, `stat`, `matrix`, `tensor`, `science`, `ml`, `nn*`, `llm*`, `pbai*` | Gate accelerators by measured workload size and preserve deterministic CPU reference paths |
-| System/device | `fs`, `path`, `process`, `device`, `platform_emulator` | Continue capability and path-boundary review; emulation claims require executable conformance tests |
+| System/device | `fs`, `path`, `process`, `device`, `linux_device_handle`, `platform_emulator` | Linux character-device opens and I/O are descriptor-confined and bounded; add protocol-specific I2C/GPIO/CAN adapters and physical conformance tests before promoting effectful tools |
 | Testing/performance | `testing`, `proptest`, `fuzz`, `mock`, `snapshot`, `benchmark`, `profiler`, `language_benchmark` | Reuse these foundations for every library slice instead of creating per-module test runners |
 
 Audio/video do not currently appear as dedicated top-level library modules in

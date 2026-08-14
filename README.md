@@ -21,7 +21,18 @@ pblang is a general-purpose programming language and bytecode VM designed for em
   available separately through `pbanalyze`; see
   [source security and analysis](docs/Security_Analysis.md).
 - **Package manager** with manifests, lockfiles, local and registry dependencies, checksums, and HMAC helpers.
-- **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, bounded memory/SQLite/Redis data stores, provider-neutral edge/regional CDN caching, native SQLite, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more. See [data storage](docs/Data_Storage.md) and [CDN caching](docs/CDN_Caching.md).
+- **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, bounded memory/SQLite/Redis data stores, provider-neutral edge/regional CDN caching, native SQLite, bounded native Parquet metadata/PLAIN-page reading, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more. `stdlib:onnx.sapp` provides bounded deterministic ONNX protobuf decoding and PBLang-native CPU inference for a documented operator subset, failing closed on unsupported models without Python or ONNX Runtime. `stdlib:command_argv.sapp` converts legacy command text to bounded literal argv without shell evaluation and rejects operators, redirects, substitutions, comments and controls; new APIs should accept structured argv directly. See [data storage](docs/Data_Storage.md) and [CDN caching](docs/CDN_Caching.md).
+- **Bounded identity and organization policy** through `stdlib:iam.sapp`:
+  users, organizations, memberships, system administrators,
+  `owner`/`admin`/`member`/`viewer` RBAC, explicit permissions, tenant-scoped
+  queries, and last-owner/last-admin invariants. Authentication and persistence
+  remain product-owned trust boundaries; the library never accepts a
+  caller-asserted principal as proof of identity.
+- **PBLang-native Linux x86-64 process supervision** through `stdlib:linux_process.sapp`: direct `execve(argv)` without shell parsing, private process groups, wall/address-space limits, an independent 64 MiB child-file ceiling, separately bounded retained stdout/stderr, asynchronous `start/poll/cancel/finish`, descriptor-held fixed executable fallback through `run_fixed`, and verified process-group termination. See `examples/bounded_process/main.sapp`. A child that is permitted to create a new session leaves this generic group boundary; sandbox such workloads in a PID namespace.
+- **Strict cron expressions** through `stdlib:cron.sapp`: complete bounded
+  five-field grammar/domain validation, field-specific diagnostics, Sunday
+  `0`/`7` compatibility and deterministic matching. Invalid list members,
+  ranges, values and steps fail closed.
 - **Carrier-independent transport guard** through
   `stdlib:transport_security.sapp`: identity/certificate/channel pins,
   downgrade and replay rejection, charge-only USB data blocking, and redacted
@@ -368,6 +379,15 @@ pblang/
 └── benches/                 # benchmarks
 ```
 
+`tools/pblock.sapp` is the PBLang-native publication step for local path
+dependencies while the retained bootstrap package manager remains available.
+It validates `pblang.toml`, preserves content digests, rejects absolute or
+mismatched dependency roots, and atomically rewrites only local lock paths. Run
+it as trusted maintenance code with
+`pblang run tools/pblock.sapp --allow-all -- <project>`. Nested source
+dependencies should not ship their own bootstrap lock
+until the self-hosted loader owns nested relative-path resolution end to end.
+
 See [`STRUCTURE.md`](STRUCTURE.md) for the crate map and [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md) for the current test/status snapshot.
 
 ---
@@ -412,6 +432,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Use `fs`, `net`, `http`, `exec`, `ffi`, and `env` only for trusted scripts or inside an OS-level sandbox.
+
+The standard library also includes bounded native model-container support:
+`stdlib/onnx.sapp` executes a deterministic CPU subset of ONNX without Python
+or ONNX Runtime, while `stdlib/gguf.sapp` converts dense F32/F16/BF16
+Safetensors snapshots to deterministic GGUF v3 and validates the complete
+published container. Unsupported operators, tensor types, dynamic shapes,
+malformed offsets, and exceeded resource budgets fail closed.
+
+`stdlib/linux_pidfd.sapp` provides race-resistant Linux process identity and
+signalling through `pidfd_open` and `pidfd_send_signal`. It exposes no classic
+PID-based fallback: unsupported kernels/libcs, PID 1, invalid signals, stale
+handles, and closed handles fail closed.
 
 ---
 

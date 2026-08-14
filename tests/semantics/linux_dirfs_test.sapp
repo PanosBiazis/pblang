@@ -1,4 +1,5 @@
 let D = import("stdlib:linux_dirfs.sapp");
+let Secure = import("stdlib:secure_file.sapp");
 
 fn fail(message) { throw "FAIL linux_dirfs: " + message; }
 fn require(value, message) { if value != true { fail(message); } }
@@ -17,13 +18,21 @@ if private_handle.ok {
     require(private_mode != nil and private_mode.exit_code == 0 and str_trim(private_mode.stdout) == "700",
         "successful relative protection has a verified mode-0700 postcondition");
 } else {
-    require(str_contains(try private_handle.error catch "", "cannot be protected and verified"),
-        "filesystems that ignore mode bits fail closed instead of claiming protection");
+    require(not private_handle.ok and type(try private_handle.error catch nil) == "string" and
+            len(private_handle.error) > 0,
+        "filesystems that cannot establish the private-root postcondition fail closed with a diagnostic");
 }
 try proc_spawn_wait("/bin/rm", ["-rf", "--", private_relative]) catch nil;
 
 let fs = D.open(root, true);
 require(fs.ok, "root opens through trusted libc: " + str(fs));
+let filesystem_root = D.open_absolute("/", false, false);
+require(filesystem_root.ok and filesystem_root.absolute,
+    "trusted filesystem root can be held once for component-safe fixed-path inspection");
+let etc_metadata = D.metadata(filesystem_root, "etc");
+require(etc_metadata.ok and etc_metadata.kind == "directory",
+    "held filesystem root resolves child metadata without reopening libc");
+require(D.close(filesystem_root), "held filesystem root closes cleanly");
 let held_root_path = D.descriptor_path(fs);
 require(held_root_path.ok and held_root_path.descriptor_bound and fs_exists(held_root_path.path),
     "held root exposes a live kernel descriptor path for argv-only subprocesses");
@@ -32,8 +41,138 @@ require(D.status(fs).relative_root_component_walk and D.status(fs).mkdir_race_re
     "relative roots are resolved component-by-component");
 require(D.status(fs).permission_postcondition_verified,
     "permission-changing operations expose verified postconditions");
+let first_lock = D.acquire_lock(fs, "locks/state.lock", 50, 5);
+require(first_lock.ok and first_lock.active and first_lock.exclusive and
+        first_lock.descriptor_bound and first_lock.attempts >= 1,
+    "descriptor-bound exclusive lock is acquired with bounded accounting: " + str(first_lock));
+let second_fs = D.open(root, false);
+require(second_fs.ok, "independent contender opens the same held root");
+let blocked_lock = D.acquire_lock(second_fs, "locks/state.lock", 20, 5);
+require(not blocked_lock.ok and blocked_lock.timeout and blocked_lock.attempts >= 1,
+    "second process handle cannot bypass an active exclusive lock");
+let forged_lock = map{ fd: fs.root_fd, owner_fd: fs.root_fd, active: true };
+require(not D.release_lock(fs, forged_lock) and forged_lock.active,
+    "lock release rejects unregistered descriptors");
+require(D.release_lock(fs, first_lock) and not first_lock.active,
+    "owned lock releases explicitly");
+require(not D.release_lock(fs, first_lock), "owned lock cannot be released twice");
+let reacquired_lock = D.acquire_lock(second_fs, "locks/state.lock", 50, 5);
+require(reacquired_lock.ok, "released lock is immediately reusable by another handle");
+require(D.release_lock(second_fs, reacquired_lock), "reacquired lock releases cleanly");
+require(D.close(second_fs), "independent contender closes cleanly");
+require(D.status(fs).bounded_descriptor_locks,
+    "bounded descriptor locking is observable");
+let child_handoff = D.child_descriptor(fs);
+require(child_handoff.ok and child_handoff.inheritable and child_handoff.descriptor_bound,
+    "held root can be handed to one argv-only child without path re-resolution");
+let child_probe = try proc_spawn_wait("/usr/bin/test", ["-d", "/proc/self/fd/" + str(child_handoff.fd)]) catch nil;
+require(child_probe != nil and child_probe.exit_code == 0,
+    "child process inherits the duplicated root descriptor");
+let adopted_root = D.adopt_inherited_directory(child_handoff.fd, false);
+require(adopted_root.ok and adopted_root.inherited_descriptor and
+        adopted_root.source_descriptor == child_handoff.fd and
+        adopted_root.descriptor_bound and adopted_root.no_path_reopen,
+    "inherited directory descriptor is adopted without namespace re-resolution: " + str(adopted_root));
+require(D.close_child_descriptor(fs, child_handoff) and not child_handoff.active,
+    "child descriptor handoff closes explicitly");
+let adopted_metadata = D.metadata(adopted_root, "locks/state.lock");
+require(adopted_metadata.ok and adopted_metadata.kind == "file",
+    "adopted root remains independently usable after the source handoff closes");
+require(D.close(adopted_root), "adopted root closes through normal ownership semantics");
+require(not D.adopt_inherited_directory(-1, false).ok,
+    "invalid inherited descriptors fail closed");
+require(not D.close_child_descriptor(fs, child_handoff),
+    "child descriptor handoff cannot be closed twice");
+let foreign_handle = map{ fd: fs.root_fd, owner_fd: fs.root_fd, active: true };
+require(not D.close_child_descriptor(fs, foreign_handle) and foreign_handle.active,
+    "child descriptor closer rejects unregistered descriptors");
+require(D.status(fs).verified_child_descriptor_handoff,
+    "verified child descriptor handoff is observable");
+require(D.status(fs).inherited_directory_adoption,
+    "inherited directory adoption is observable");
+let sealed_payload = [0, 1, 2, 3, 255, 10];
+let sealed_handoff = D.sealed_child_bytes(fs, "immutable-test", sealed_payload);
+require(sealed_handoff.ok and sealed_handoff.immutable and sealed_handoff.write_sealed and
+        sealed_handoff.grow_sealed and sealed_handoff.shrink_sealed and
+        sealed_handoff.further_seals_locked and sealed_handoff.inheritable and
+        sealed_handoff.kernel_memory_backed and sealed_handoff.size == len(sealed_payload) and
+        sealed_handoff.mode == "600" and sealed_handoff.permission_private,
+    "kernel-backed child payload is sealed and its postconditions are observable: " + str(sealed_handoff));
+require(fs_read_bytes(sealed_handoff.path) == sealed_payload,
+    "sealed child payload remains byte-exact in the parent");
+let mutate_sealed = try { fs_write_bytes(sealed_handoff.path, [9]); true } catch false;
+require(not mutate_sealed and fs_read_bytes(sealed_handoff.path) == sealed_payload,
+    "sealed child payload rejects mutation without changing bytes");
+let sealed_probe = try proc_spawn_wait("/usr/bin/test", ["-r", sealed_handoff.path]) catch nil;
+require(sealed_probe != nil and sealed_probe.exit_code == 0,
+    "sealed descriptor survives a child exec handoff");
+require(D.close_child_descriptor(fs, sealed_handoff) and not sealed_handoff.active,
+    "sealed child descriptor closes through the owned handoff API");
+require(D.status(fs).sealed_immutable_child_handoff,
+    "sealed immutable child handoff is observable");
+let mutable_source = [1, 2, 3, 4];
+let mutable_handoff = D.mutable_snapshot_bytes(fs, "mutable-test", mutable_source);
+require(mutable_handoff.ok and mutable_handoff.active and mutable_handoff.anonymous and
+        mutable_handoff.descriptor_bound and mutable_handoff.kernel_memory_backed and
+        mutable_handoff.mutable_private_copy and not mutable_handoff.source_aliased and
+        mutable_handoff.size == len(mutable_source) and mutable_handoff.inheritable and
+        mutable_handoff.mode == "600" and mutable_handoff.permission_private,
+    "anonymous mutable snapshot exposes bounded private-copy postconditions: " + str(mutable_handoff));
+require(fs_read_bytes(mutable_handoff.path) == mutable_source,
+    "anonymous mutable snapshot starts byte-exact");
+fs_write_bytes(mutable_handoff.path, [9, 8]);
+require(fs_read_bytes(mutable_handoff.path) == [9, 8] and mutable_source == [1, 2, 3, 4],
+    "mutable snapshot can change without aliasing its source payload");
+require(not D.mutable_snapshot_bytes(fs, "../escape", [1]).ok,
+    "mutable snapshot rejects unsafe names");
+require(not D.mutable_snapshot_bytes(fs, "invalid-byte", [256]).ok,
+    "mutable snapshot rejects invalid byte values");
+require(D.close_child_descriptor(fs, mutable_handoff) and not mutable_handoff.active,
+    "mutable snapshot descriptor closes explicitly");
+require(not D.close_child_descriptor(fs, mutable_handoff),
+    "mutable snapshot descriptor cannot close twice");
+require(D.status(fs).anonymous_mutable_snapshot,
+    "anonymous mutable snapshots are observable");
+require(D.status(fs).anonymous_mutable_child_handoff,
+    "mutable snapshots are explicitly inheritable child handoffs");
 require(D.mkdir(fs, "docs/nested").ok, "recursive mkdirat");
+let exclusive_dir = D.mkdir_new(fs, "docs/exclusive-dir", true);
+require(exclusive_dir.ok and exclusive_dir.exclusive_create and
+        exclusive_dir.descriptor_bound_parent and exclusive_dir.nofollow and
+        type(exclusive_dir.permission_private) == "bool",
+    "exclusive descriptor-bound directory creation");
+require(not D.mkdir_new(fs, "docs/exclusive-dir", true).ok,
+    "exclusive directory creation refuses an existing final component");
+require(D.remove(fs, "docs/exclusive-dir").ok, "exclusive directory fixture removed");
 require(D.write_atomic(fs, "docs/nested/a.bin", [1, 2, 3, 4]).ok, "atomic write");
+let created_once = D.write_new_exclusive(fs, "docs/nested/new-only.bin", [9, 8, 7]);
+require(created_once.ok and created_once.no_replace and created_once.exclusive_create and
+        created_once.atomic_namespace_admission and not created_once.atomic_visibility,
+    "exclusive no-replace write creates an absent destination without overclaiming visibility");
+let refused_replace = D.write_new_exclusive(fs, "docs/nested/new-only.bin", [1]);
+require(not refused_replace.ok and D.read_bytes(fs, "docs/nested/new-only.bin", 16).bytes == [9, 8, 7],
+    "exclusive no-replace write preserves an existing destination");
+let atomic_new = D.write_new_atomic(fs, "docs/nested/atomic-new.bin", [6, 7, 8]);
+require(atomic_new.ok and atomic_new.no_replace and atomic_new.atomic
+        and atomic_new.atomic_visibility and atomic_new.exclusive_stage
+        and atomic_new.generated_pblang_syscall_helper,
+    "atomic-new publication exposes only complete no-replace content");
+let refused_atomic_new = D.write_new_atomic(fs, "docs/nested/atomic-new.bin", [0]);
+require(not refused_atomic_new.ok
+        and D.read_bytes(fs, "docs/nested/atomic-new.bin", 16).bytes == [6, 7, 8],
+    "atomic-new collision preserves the published destination");
+require(D.write_atomic(fs, "docs/nested/tool", [0x7F, 0x45, 0x4C, 0x46]).ok,
+    "staged executable bytes");
+let executable_mode = D.protect_executable(fs, "docs/nested/tool");
+let executable_stat = proc_spawn_wait("/usr/bin/stat", ["-c", "%a", held_root_path.path + "/docs/nested/tool"]);
+if executable_mode.ok {
+    require(executable_mode.mode == 448 and executable_stat.exit_code == 0
+        and str_trim(executable_stat.stdout) == "700",
+        "successful descriptor-bound executable protection verifies mode 0700");
+} else {
+    require(executable_stat.exit_code == 0 and str_trim(executable_stat.stdout) != "700",
+        "filesystems without Unix executable modes fail closed");
+}
 let file_meta = D.metadata(fs, "docs/nested/a.bin");
 let dir_meta = D.metadata(fs, "docs/nested");
 require(file_meta.ok and file_meta.kind == "file" and file_meta.size == 4 and
@@ -51,7 +190,7 @@ let oversized = [];
 for oi 65536 { oversized[len(oversized)] = oi % 251; }
 require(D.write_atomic(fs, "docs/nested/oversized.bin", oversized).ok,
     "large bounded-read fixture published");
-oversized = nil;
+oversized = [];
 require(not D.read_bytes(fs, "docs/nested/oversized.bin", 1024).ok,
     "large source is rejected through a bounded snapshot");
 let prefix = D.read_prefix_bytes(fs, "docs/nested/oversized.bin", 1024);
@@ -59,15 +198,79 @@ require(prefix.ok and prefix.size == 1024 and prefix.source_size == 65536 and
         prefix.truncated and prefix.bytes[0] == 0 and prefix.bytes[1023] == 19 and
         prefix.race_resistant,
     "large source exposes only an exact descriptor-bound prefix");
+let range = D.read_range_bytes(fs, "docs/nested/oversized.bin", 65000, 1000);
+require(range.ok and range.size == 536 and range.source_size == 65536 and
+        range.requested_offset == 65000 and range.offset == 65000 and
+        range.available_bytes == 536 and not range.truncated and
+        not range.offset_past_end and range.bytes[0] == 242 and
+        range.bytes[535] == 24 and range.race_resistant,
+    "bounded range reads only the requested descriptor-held suffix");
+let clipped_range = D.read_range_bytes(fs, "docs/nested/oversized.bin", 1024, 257);
+require(clipped_range.ok and clipped_range.size == 257 and clipped_range.truncated and
+        clipped_range.bytes[0] == 20 and clipped_range.bytes[256] == 25,
+    "bounded range reports remaining data without loading it");
+let past_end = D.read_range_bytes(fs, "docs/nested/oversized.bin", 70000, 32);
+require(past_end.ok and past_end.size == 0 and past_end.offset == 65536 and
+        past_end.requested_offset == 70000 and past_end.offset_past_end and not past_end.truncated,
+    "offsets beyond EOF return an explicit empty range");
+let utf8_text = "123456789012345" + strfromcharcode(8364) + "tail";
+require(D.write_atomic(fs, "docs/nested/utf8.txt", str_to_bytes(utf8_text)).ok,
+    "UTF-8 prefix fixture published");
+let utf8_prefix = Secure.read_text_prefix(root + "/docs/nested/utf8.txt", 17, false);
+require(utf8_prefix.ok and utf8_prefix.text == "123456789012345" and
+        utf8_prefix.source_size == len(str_to_bytes(utf8_text)) and
+        utf8_prefix.returned_bytes == 15 and utf8_prefix.truncated and
+        utf8_prefix.utf8_boundary_trimmed_bytes == 2 and utf8_prefix.race_resistant,
+    "secure text prefix never returns a split UTF-8 scalar");
+require(D.write_atomic(fs, "docs/nested/invalid-utf8.bin", [65, 255]).ok,
+    "invalid UTF-8 fixture published");
+require(not Secure.read_text_prefix(root + "/docs/nested/invalid-utf8.bin", 2, false).ok,
+    "invalid terminal byte is not mistaken for a truncated UTF-8 scalar");
+require(D.write_atomic(fs, "docs/nested/incomplete-utf8.bin", [65, 194]).ok,
+    "incomplete UTF-8 fixture published");
+require(not Secure.read_text_prefix(root + "/docs/nested/incomplete-utf8.bin", 2, false).ok,
+    "incomplete scalar at real EOF is rejected rather than clipped");
 require(D.status(fs).bounded_memfd_snapshot_reads,
     "bounded snapshot protection is observable");
 require(D.status(fs).bounded_prefix_snapshot_reads,
     "bounded prefix snapshot protection is observable");
+require(D.status(fs).bounded_range_snapshot_reads,
+    "bounded range snapshot protection is observable");
 require(D.remove(fs, "docs/nested/oversized.bin").ok,
     "bounded-read fixture removed");
+require(D.remove(fs, "docs/nested/utf8.txt").ok,
+    "UTF-8 prefix fixture removed");
+require(D.remove(fs, "docs/nested/invalid-utf8.bin").ok,
+    "invalid UTF-8 fixture removed");
+require(D.remove(fs, "docs/nested/incomplete-utf8.bin").ok,
+    "incomplete UTF-8 fixture removed");
+require(D.remove(fs, "docs/nested/tool").ok, "executable fixture removed");
+require(D.remove(fs, "docs/nested/new-only.bin").ok, "no-replace fixture removed");
+require(D.remove(fs, "docs/nested/atomic-new.bin").ok, "atomic-new fixture removed");
 require(D.list(fs, "docs/nested", 8).entries == ["a.bin"], "directory listing");
 require(D.move(fs, "docs/nested/a.bin", "docs/moved.bin").ok, "renameat move");
 require(D.remove(fs, "docs/moved.bin").ok, "unlinkat file");
+require(D.write_atomic(fs, "docs/no-replace-source.bin", [4, 3, 2, 1]).ok,
+    "no-replace rename source fixture");
+require(D.write_atomic(fs, "docs/no-replace-destination.bin", [9, 9]).ok,
+    "no-replace rename destination fixture");
+let collision_move = D.move_new_exclusive(fs, "docs/no-replace-source.bin",
+    "docs/no-replace-destination.bin", false);
+require(not collision_move.ok
+        and D.read_bytes(fs, "docs/no-replace-source.bin", 16).bytes == [4, 3, 2, 1]
+        and D.read_bytes(fs, "docs/no-replace-destination.bin", 16).bytes == [9, 9],
+    "atomic no-replace rename preserves both entries on collision");
+let exclusive_move = D.move_new_exclusive(fs, "docs/no-replace-source.bin",
+    "docs/no-replace-moved.bin", false);
+require(exclusive_move.ok and exclusive_move.atomic and exclusive_move.no_replace
+        and exclusive_move.descriptor_bound_parents
+        and exclusive_move.generated_pblang_syscall_helper
+        and exclusive_move.helper_sealed_before_execution
+        and D.read_bytes(fs, "docs/no-replace-moved.bin", 16).bytes == [4, 3, 2, 1],
+    "PBLang-generated renameat2 helper performs a descriptor-bound no-replace move");
+require(D.remove_file(fs, "docs/no-replace-destination.bin").ok
+        and D.remove_file(fs, "docs/no-replace-moved.bin").ok,
+    "no-replace rename fixtures removed");
 
 // Final and intermediate symbolic links must never be followed.
 let linked = try proc_spawn_wait("/bin/ln", ["-s", "../" + outside, root + "/escape"]) catch nil;
@@ -99,7 +302,34 @@ let held_meta = D.metadata(fs, "held.bin");
 require(held_meta.ok and held_meta.kind == "file" and held_meta.size == 2,
     "metadata remains bound to the held root after namespace replacement");
 
+// File-only removal must never fall back to AT_REMOVEDIR. This protects
+// higher-level APIs whose contract is explicitly limited to files.
+let remove_only_dir = D.mkdir(fs, "file-only-dir");
+require(remove_only_dir.ok, "file-only removal fixture directory");
+let refused_dir = D.remove_file(fs, "file-only-dir");
+require(not refused_dir.ok, "remove_file must refuse directories");
+let removed_dir = D.remove(fs, "file-only-dir");
+require(removed_dir.ok, "general remove retains previous empty-directory behavior");
+let file_only_write = D.write_atomic(fs, "file-only.txt", str_to_bytes("x"), false);
+require(file_only_write.ok, "file-only removal fixture file");
+let removed_file = D.remove_file(fs, "file-only.txt");
+require(removed_file.ok and not removed_file.directory_removal and
+        removed_file.descriptor_bound_parent and not removed_file.symlink_target_followed,
+    "remove_file must unlink a file through its held parent without following links");
+
+let leaked_handoff = D.child_descriptor(fs);
+let leaked_path = "/proc/self/fd/" + str(leaked_handoff.fd);
+require(leaked_handoff.ok and fs_exists(leaked_path),
+    "automatic-cleanup fixture owns one live child descriptor");
+let leaked_lock = D.acquire_lock(fs, "locks/leaked.lock", 50, 5);
+let leaked_lock_path = "/proc/self/fd/" + str(leaked_lock.fd);
+require(leaked_lock.ok and fs_exists(leaked_lock_path),
+    "automatic-cleanup fixture owns one live lock descriptor");
 require(D.close(fs), "directory root closes once");
+require(not fs_exists(leaked_path),
+    "closing the root automatically closes every outstanding child handoff");
+require(not fs_exists(leaked_lock_path),
+    "closing the root automatically releases every outstanding lock");
 require(not D.descriptor_path(fs).ok, "closed roots cannot expose stale descriptor paths");
 require(not D.close(fs), "second close is safe");
 try proc_spawn_wait("/bin/rm", ["-rf", "--", root, moved, outside]) catch nil;
@@ -121,6 +351,18 @@ try proc_spawn_wait("/bin/rm", ["-rf", "--", nested_parent, nested_outside]) cat
 let cwd = D.open(".", false);
 require(cwd.ok, "current directory can be held as a secure relative root");
 require(D.close(cwd), "current-directory root closes cleanly");
+
+let proc_net = D.open_current_process_net();
+require(proc_net.ok and proc_net.procfs_current_process and not proc_net.pid_exposed,
+    "current process procfs network root avoids the /proc/self symlink");
+let tcp_meta = D.metadata(proc_net, "tcp");
+require(tcp_meta.ok and tcp_meta.kind == "file" and tcp_meta.descriptor_bound,
+    "procfs TCP metadata remains descriptor-bound");
+let tcp_prefix = D.read_stream_bytes(proc_net, "tcp", 4096);
+require(tcp_prefix.ok and tcp_prefix.descriptor_bound and tcp_prefix.bounded_stream
+        and tcp_prefix.dynamic_source and len(tcp_prefix.bytes) > 0,
+    "procfs TCP data has a bounded held stream snapshot");
+require(D.close(proc_net), "current process procfs network root closes cleanly");
 
 let absolute_root = "/tmp/pblang-dirfs-absolute-" + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
 let absolute = D.open_absolute(absolute_root, true);

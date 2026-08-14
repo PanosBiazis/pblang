@@ -1,0 +1,357 @@
+// Linux bounded process supervision implemented entirely in PBLang.
+//
+// Commands are encoded as an execve argv image, launched in a private process
+// group, bounded by wall time and an independent 64 MiB RLIMIT_FSIZE safety
+// ceiling. Returned stdout/stderr use their own smaller caller-selected cap.
+// Output and lifecycle
+// files live under a held mode-0700 directory. Cancellation signals the whole
+// group and verifies kernel disappearance before reporting success.
+
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let NATIVE = import("stdlib:linux_pty_supervisor.sapp");
+let Process = import("stdlib:process.sapp");
+
+let MAX_STARTUP_MS = 5000;
+let MAX_FINISH_MS = 10805000;
+
+fn _error(message) { return map{ ok: false, error: message }; }
+
+fn _integer(value, fallback, minimum, maximum, label) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw "linux_process: " + label + " must be an integer in "
+            + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _fixed_path(candidates) {
+    for i len(candidates) { if try fs_exists(candidates[i]) catch false { return candidates[i]; } }
+    return "";
+}
+
+fn _contains_entry(fs, name) {
+    let listed = DIRFS.list(fs, "root", 32);
+    if not listed.ok { return false; }
+    for i len(listed.entries) { if listed.entries[i] == name { return true; } }
+    return false;
+}
+
+fn _sleep(waiter, milliseconds) { recv_timeout(waiter.receiver, milliseconds); }
+
+fn _write_executable(fs, name, bytes) {
+    let wrote = DIRFS.write_atomic(fs, name, bytes, false);
+    if not wrote.ok { return wrote; }
+    let protected = DIRFS.protect_executable(fs, name);
+    if not protected.ok { return _error("cannot protect generated executable"); }
+    let base = DIRFS.descriptor_path(fs); if not base.ok { return base; }
+    return map{ ok: true, path: base.path + "/" + name };
+}
+
+fn _cleanup(state) {
+    if state == nil or not is_map(state) or (try state.cleaned catch true) { return false; }
+    let names = ["argv-exec", "supervisor", "group-probe", "group-term", "group-kill",
+        "pid", "pid.pending", "status", "status.pending", "stdout", "stderr", "stdin", "input.fifo"];
+    for i len(names) { try DIRFS.remove(state.fs, names[i]) catch nil; }
+    DIRFS.close(state.fs); state.cleaned = true; state.active = false;
+    let parent = DIRFS.open_absolute("/tmp", false, false);
+    if parent.ok {
+        DIRFS.remove(parent, path_basename(state.root));
+        DIRFS.close(parent);
+    }
+    return true;
+}
+
+fn _raw_wait_status(bytes) {
+    if type(bytes) != "array" or len(bytes) != 4 { return _error("invalid wait status"); }
+    let raw = bytes[0] + bytes[1] * 256 + bytes[2] * 65536 + bytes[3] * 16777216;
+    let signal = bit_and(raw, 127); let exit_code = 0;
+    if signal == 0 { exit_code = bit_and(num_floor(raw / 256), 255); }
+    else { exit_code = 128 + signal; }
+    return map{ ok: true, raw: raw, exit_code: exit_code, signal: signal,
+        signaled: signal != 0, core_dumped: bit_and(raw, 128) != 0 };
+}
+
+fn _read_output(state, name, budget) {
+    if not _contains_entry(state.fs, name) {
+        return map{ bytes: [], text: "", returned_bytes: 0, truncated: false, utf8: true };
+    }
+    let loaded = DIRFS.read_prefix_bytes(state.fs, name, budget);
+    if not loaded.ok { return map{ bytes: [], text: "", returned_bytes: 0,
+        truncated: false, utf8: false, error: loaded.error }; }
+    let text = try bytes_to_str(loaded.bytes) catch nil;
+    return map{ bytes: loaded.bytes, text: if text == nil { "" } else { text },
+        returned_bytes: len(loaded.bytes), truncated: loaded.truncated,
+        utf8: text != nil, source_size: loaded.source_size };
+}
+
+fn _group_alive(state) {
+    if state == nil or not is_map(state) or (try state.cleaned catch true)
+       or (try state.process_group_id catch 0) <= 1 { return false; }
+    let base = DIRFS.descriptor_path(state.fs); if not base.ok { return false; }
+    return Process.run(base.path + "/group-probe", []).ok;
+}
+
+fn start(program, args, options) {
+    if platform() != "linux" or not DIRFS.available().ok {
+        return _error("Linux directory handles are unavailable");
+    }
+    let machine = try Process.output("/usr/bin/uname", ["-m"]) catch "";
+    if machine != "x86_64" and machine != "amd64" {
+        return _error("linux_process currently requires Linux x86-64");
+    }
+    if type(options) != "map" { throw "linux_process: options must be a map"; }
+    let seconds = _integer(try options.timeout_secs catch nil, 30, 1, NATIVE.MAX_SECONDS, "timeout_secs");
+    let output_limit = _integer(try options.max_output_bytes catch nil, 1048576,
+        1, NATIVE.MAX_OUTPUT_BYTES, "max_output_bytes");
+    let file_limit = _integer(try options.max_file_bytes catch nil, NATIVE.MAX_OUTPUT_BYTES,
+        1, NATIVE.MAX_OUTPUT_BYTES, "max_file_bytes");
+    let memory_limit = nil;
+    if map_has(options, "max_memory_bytes") {
+        memory_limit = _integer(options.max_memory_bytes, nil, 33554432,
+            68719476736, "max_memory_bytes");
+    }
+    let startup_ms = _integer(try options.startup_timeout_ms catch nil, 3000,
+        50, MAX_STARTUP_MS, "startup_timeout_ms");
+    let setsid = _fixed_path(["/usr/bin/setsid", "/bin/setsid"]);
+    let mkfifo = _fixed_path(["/usr/bin/mkfifo", "/bin/mkfifo"]);
+    if setsid == "" or mkfifo == "" { return _error("setsid and mkfifo are required"); }
+
+    let token = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + str(now_ms())), 0, 32);
+    let root = "/tmp/pblang-process-" + token;
+    let fs = DIRFS.open_absolute(root, true, true);
+    if not fs.ok { return _error("private process directory cannot be created"); }
+    let state = map{ ok: false, format: "pblang.linux-process.v1", root: root, fs: fs,
+        cleaned: false, active: false, started_ms: now_ms(), timeout_secs: seconds,
+        max_output_bytes: output_limit, max_file_bytes: file_limit, max_memory_bytes: memory_limit,
+        process_group_id: 0, program: program, args: args };
+    let base = DIRFS.descriptor_path(fs);
+    if not base.ok { _cleanup(state); return base; }
+    let fifo = Process.run(mkfifo, ["-m", "0600", base.path + "/input.fifo"]);
+    if not fifo.ok { _cleanup(state); return _error("private control fifo cannot be created"); }
+    let cwd_fd = _integer(try options.cwd_fd catch nil, -1, -1,
+        NATIVE.MAX_PROCESS_GROUP_ID, "cwd_fd");
+    let stdin_fd = -1; let stdin_handoff = nil;
+    let stdin_bytes = try options.stdin_bytes catch nil;
+    if stdin_bytes != nil {
+        if type(stdin_bytes) != "array" or len(stdin_bytes) > 16777216 {
+            _cleanup(state); return _error("stdin_bytes must be an array up to 16777216 bytes");
+        }
+        let wrote_stdin = DIRFS.write_atomic(fs, "stdin", stdin_bytes, false);
+        if not wrote_stdin.ok { _cleanup(state); return _error("private stdin cannot be written"); }
+        stdin_handoff = DIRFS.child_file_descriptor(fs, "stdin");
+        if not stdin_handoff.ok { _cleanup(state); return _error("private stdin descriptor is unavailable"); }
+        stdin_fd = stdin_handoff.fd;
+    }
+    let environment = try options.environment catch map{};
+    let inherit_environment = try options.inherit_environment catch false;
+    let exec = nil;
+    if type(environment) == "map" and len(map_keys(environment)) > 0 and not inherit_environment {
+        exec = try NATIVE.build_argv_exec_env(program, args, environment, cwd_fd, stdin_fd) catch nil;
+    } elif type(environment) == "map" and not inherit_environment {
+        exec = try NATIVE.build_argv_exec(program, args, false, cwd_fd, stdin_fd) catch nil;
+    } elif type(environment) == "map" and len(map_keys(environment)) == 0 {
+        exec = try NATIVE.build_argv_exec(program, args, true, cwd_fd, stdin_fd) catch nil;
+    }
+    if exec == nil {
+        if stdin_handoff != nil { DIRFS.close_child_descriptor(fs, stdin_handoff); }
+        _cleanup(state); return _error("program or argv failed validation");
+    }
+    let exec_file = _write_executable(fs, "argv-exec", exec);
+    if not exec_file.ok { _cleanup(state); return exec_file; }
+    let supervisor_options = map{
+        fifo: base.path + "/input.fifo", pid_file: base.path + "/pid",
+        status_file: base.path + "/status", output: base.path + "/stdout",
+        stderr_output: base.path + "/stderr", argv_exec: base.path + "/argv-exec",
+        max_seconds: seconds, max_output_bytes: output_limit, max_file_bytes: file_limit
+    };
+    if memory_limit != nil { supervisor_options.max_memory_bytes = memory_limit; }
+    let supervisor = NATIVE.build(supervisor_options);
+    let supervisor_file = _write_executable(fs, "supervisor", supervisor);
+    if not supervisor_file.ok { _cleanup(state); return supervisor_file; }
+    let launched = Process.run(setsid, ["--fork", base.path + "/supervisor"]);
+    if stdin_handoff != nil { DIRFS.close_child_descriptor(fs, stdin_handoff); }
+    if not launched.ok { _cleanup(state); return _error("private process group could not start"); }
+
+    let waiter = channel(); let deadline = now_ms() + startup_ms;
+    while not _contains_entry(fs, "pid") and now_ms() < deadline { _sleep(waiter, 5); }
+    if not _contains_entry(fs, "pid") { _cleanup(state); return _error("process supervisor readiness timed out"); }
+    let pid = DIRFS.read_bytes(fs, "pid", 16);
+    let pid_text = if pid.ok { try str_trim(bytes_to_str(pid.bytes)) catch "" } else { "" };
+    let pgid = try parse_number(pid_text) catch 0;
+    if len(pid_text) != 10 or pgid <= 1 or pgid > NATIVE.MAX_PROCESS_GROUP_ID {
+        _cleanup(state); return _error("process supervisor published an invalid process group");
+    }
+    state.process_group_id = pgid;
+    let probe = _write_executable(fs, "group-probe", NATIVE.build_group_probe(pgid));
+    let term = _write_executable(fs, "group-term", NATIVE.build_group_signal(pgid, "TERM"));
+    let kill = _write_executable(fs, "group-kill", NATIVE.build_group_signal(pgid, "KILL"));
+    if not probe.ok or not term.ok or not kill.ok {
+        _cleanup(state); return _error("process lifecycle helpers could not be generated");
+    }
+    state.ok = true; state.active = true; state.deadline_ms = state.started_ms + seconds * 1000 + 2000;
+    return state;
+}
+
+fn poll(state) {
+    if state == nil or not is_map(state) or (try state.cleaned catch true) {
+        return _error("process state is closed");
+    }
+    let complete = _contains_entry(state.fs, "status");
+    return map{ ok: true, complete: complete, active: not complete and _group_alive(state),
+        elapsed_ms: now_ms() - state.started_ms, process_group_id: state.process_group_id };
+}
+
+fn cancel(state, grace_ms = 500) {
+    grace_ms = _integer(grace_ms, 500, 0, 10000, "grace_ms");
+    if state == nil or not is_map(state) or (try state.cleaned catch true) {
+        return _error("process state is closed");
+    }
+    let base = DIRFS.descriptor_path(state.fs); if not base.ok { return base; }
+    let term_sent = Process.run(base.path + "/group-term", []).ok;
+    let waiter = channel(); let deadline = now_ms() + grace_ms;
+    while _group_alive(state) and now_ms() < deadline { _sleep(waiter, 5); }
+    let kill_sent = false;
+    if _group_alive(state) { kill_sent = Process.run(base.path + "/group-kill", []).ok; }
+    deadline = now_ms() + 1000;
+    while _group_alive(state) and now_ms() < deadline { _sleep(waiter, 5); }
+    let terminated = not _group_alive(state);
+    if terminated { state.cancelled = true; state.cancel_signal = if kill_sent { 9 } else { 15 }; }
+    return map{ ok: terminated, terminated: terminated, term_sent: term_sent,
+        kill_sent: kill_sent, process_group_id: state.process_group_id };
+}
+
+fn finish(state, wait_ms = nil) {
+    if state == nil or not is_map(state) or (try state.cleaned catch true) {
+        return _error("process state is closed");
+    }
+    let maximum = if wait_ms == nil { state.timeout_secs * 1000 + 2500 }
+        else { _integer(wait_ms, 0, 0, MAX_FINISH_MS, "wait_ms") };
+    let waiter = channel(); let deadline = now_ms() + maximum;
+    while not _contains_entry(state.fs, "status") and now_ms() < deadline { _sleep(waiter, 5); }
+    if not _contains_entry(state.fs, "status") {
+        if (try state.cancelled catch false) and not _group_alive(state) {
+            let signal = try state.cancel_signal catch 15;
+            let elapsed = now_ms() - state.started_ms;
+            let result = map{ ok: true, completed: true, command_ok: false,
+                exit_code: 128 + signal, signal: signal, signaled: true,
+                core_dumped: false, timed_out: false, cancelled: true,
+                status_unavailable_after_cancel: true, stdout: "", stderr: "",
+                stdout_bytes: [], stderr_bytes: [], stdout_utf8: true, stderr_utf8: true,
+                output_truncated: false, returned_output_bytes: 0,
+                max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
+                max_file_bytes: state.max_file_bytes,
+                max_memory_bytes: try state.max_memory_bytes catch nil,
+                memory_limit_enforced: (try state.max_memory_bytes catch nil) != nil,
+                process_group_id: state.process_group_id, process_group_terminated: true,
+                shell_used: false, argv_encoded: true, private_process_group: true,
+                filesystem_output_bounded: true,
+                child_file_write_ceiling_bytes: NATIVE.MAX_OUTPUT_BYTES };
+            _cleanup(state); return result;
+        }
+        let stopped = cancel(state, 250);
+        _cleanup(state);
+        return map{ ok: false, timed_out: true, terminated: try stopped.terminated catch false,
+            error: "process completion deadline expired" };
+    }
+    let raw_status = DIRFS.read_bytes(state.fs, "status", 4);
+    let decoded = if raw_status.ok { _raw_wait_status(raw_status.bytes) }
+        else { _error("wait status cannot be read") };
+    let stdout = _read_output(state, "stdout", state.max_output_bytes);
+    let remaining = state.max_output_bytes - stdout.returned_bytes;
+    let stderr = _read_output(state, "stderr", remaining);
+    let alive = _group_alive(state);
+    if alive { cancel(state, 250); }
+    let elapsed = now_ms() - state.started_ms;
+    let result = map{
+        ok: decoded.ok, completed: decoded.ok, command_ok: decoded.ok and decoded.exit_code == 0,
+        exit_code: try decoded.exit_code catch -1, signal: try decoded.signal catch 0,
+        signaled: try decoded.signaled catch false, core_dumped: try decoded.core_dumped catch false,
+        timed_out: (try decoded.exit_code catch -1) == 124,
+        stdout: stdout.text, stderr: stderr.text, stdout_bytes: stdout.bytes, stderr_bytes: stderr.bytes,
+        stdout_utf8: stdout.utf8, stderr_utf8: stderr.utf8,
+        output_truncated: stdout.truncated or stderr.truncated
+            or (try decoded.signal catch 0) == 25,
+        returned_output_bytes: stdout.returned_bytes + stderr.returned_bytes,
+        max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
+        max_file_bytes: state.max_file_bytes,
+        max_memory_bytes: try state.max_memory_bytes catch nil,
+        memory_limit_enforced: (try state.max_memory_bytes catch nil) != nil,
+        process_group_id: state.process_group_id, process_group_terminated: not _group_alive(state),
+        shell_used: false, argv_encoded: true, private_process_group: true,
+        filesystem_output_bounded: true,
+        child_file_write_ceiling_bytes: NATIVE.MAX_OUTPUT_BYTES
+    };
+    _cleanup(state); return result;
+}
+
+fn run(program, args, options) {
+    let state = start(program, args, options); if not state.ok { return state; }
+    return finish(state);
+}
+
+// Execute the first safely opened absolute candidate through its held file
+// descriptor. This removes the exists-then-exec namespace race from optional
+// fixed host adapters while retaining the normal process supervision bounds.
+fn run_fixed(candidates, args, options) {
+    if type(candidates) != "array" or len(candidates) < 1 or len(candidates) > 16 {
+        throw "linux_process: candidates must contain 1..16 absolute paths";
+    }
+    if type(args) != "array" or type(options) != "map" {
+        throw "linux_process: run_fixed requires argv and options";
+    }
+    for i len(candidates) {
+        let candidate = candidates[i];
+        if type(candidate) != "string" or len(candidate) < 2 or len(candidate) > 4096
+           or not str_starts_with(candidate, "/")
+           or str_contains(candidate, strfromcharcode(0)) {
+            throw "linux_process: fixed executable path must be bounded and absolute";
+        }
+        let parent_path = path_dirname(candidate);
+        let name = path_basename(candidate);
+        if parent_path == candidate or name == "" or name == "." or name == ".." {
+            throw "linux_process: fixed executable path is malformed";
+        }
+        let parent = DIRFS.open_absolute(parent_path, false, false);
+        if parent.ok {
+            let executable = DIRFS.child_file_descriptor(parent, name);
+            if executable.ok {
+                let result = run("/proc/self/fd/" + str(executable.fd), args, options);
+                let handoff_closed = DIRFS.close_child_descriptor(parent, executable);
+                let parent_closed = DIRFS.close(parent);
+                if not handoff_closed or not parent_closed {
+                    return _error("held executable cleanup failed");
+                }
+                result.fixed_candidate = candidate;
+                result.executable_descriptor_held = true;
+                result.executable_nofollow = true;
+                result.check_then_exec_race = false;
+                return result;
+            }
+            DIRFS.close(parent);
+        }
+    }
+    return map{ ok: false, error: "no fixed executable candidate could be opened safely",
+        candidates_checked: len(candidates), executable_descriptor_held: false,
+        check_then_exec_race: false };
+}
+
+fn status() {
+    let machine = try Process.output("/usr/bin/uname", ["-m"]) catch "";
+    let ready = platform() == "linux" and DIRFS.available().ok
+        and (machine == "x86_64" or machine == "amd64");
+    return map{ format: "pblang.linux-process.status.v1", available: ready,
+        architecture: machine, argv_exec: true, shell_free: true, bounded_output: true,
+        timeout: true, descriptor_cwd: true, bounded_stdin: true,
+        explicit_environment: true,
+        address_space_limit: true, descendant_memory_limit: true,
+        process_group_cancel: true, termination_verified: true,
+        async_lifecycle: true, stdout_stderr_split: true,
+        fixed_executable_descriptor_handoff: true,
+        output_limit_separate_from_child_files: true,
+        child_file_write_ceiling_bytes: NATIVE.MAX_OUTPUT_BYTES,
+        configurable_child_file_ceiling: true };
+}
+
+export start, poll, cancel, finish, run, run_fixed, status;

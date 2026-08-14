@@ -1,0 +1,287 @@
+// Hardened OpenSSH adapter implemented in PBLang.
+//
+// This is intentionally an adapter to a fixed system OpenSSH binary, not an
+// SSH protocol reimplementation. Credentials and known-hosts data are copied
+// into mode-0600 anonymous kernel files. The server address is supplied as a
+// pre-resolved IP while host-key identity remains bound to the caller's host
+// name. Passwords, agents, proxy commands, forwarding and interactive prompts
+// are disabled. Every child runs under the PBLang process-group, output,
+// memory, wall-time and file-size bounds.
+
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+let MAX_KEY_BYTES = 65536;
+let MAX_KNOWN_HOSTS_BYTES = 1048576;
+let MAX_COMMAND_BYTES = 16384;
+let MAX_TRANSFER_BYTES = 67108864;
+
+fn _error(message) { return map{ ok: false, executed: false, error: message }; }
+
+fn _integer(value, fallback, minimum, maximum, label) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw "openssh_client: " + label + " must be an integer in "
+            + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _bytes(value, maximum, label) {
+    if type(value) != "array" or len(value) < 1 or len(value) > maximum {
+        throw "openssh_client: " + label + " must contain 1.." + str(maximum) + " bytes";
+    }
+    for i len(value) {
+        if type(value[i]) != "number" or value[i] != num_floor(value[i])
+           or value[i] < 0 or value[i] > 255 {
+            throw "openssh_client: " + label + " contains a non-byte value";
+        }
+    }
+    return value;
+}
+
+fn _ipv4(value) {
+    let text = str_trim(str(value)); let parts = str_split(text, ".");
+    if len(parts) != 4 { throw "openssh_client: pinned_address must be an IPv4 literal"; }
+    for i 4 {
+        if parts[i] == "" or len(parts[i]) > 3 { throw "openssh_client: malformed IPv4 address"; }
+        if len(parts[i]) > 1 and str_starts_with(parts[i], "0") {
+            throw "openssh_client: IPv4 address must be canonical";
+        }
+        for j len(parts[i]) {
+            let c = strcharcodeat(parts[i], j);
+            if c < 48 or c > 57 { throw "openssh_client: malformed IPv4 address"; }
+        }
+        let octet = parse_number(parts[i]);
+        if octet < 0 or octet > 255 { throw "openssh_client: malformed IPv4 address"; }
+    }
+    return text;
+}
+
+fn _identity(value, label, maximum, pattern) {
+    let text = str_trim(str(value));
+    if len(text) < 1 or len(text) > maximum or not regex_match(text, pattern) {
+        throw "openssh_client: invalid " + label;
+    }
+    return text;
+}
+
+fn _remote_path(value) {
+    let text = str(value);
+    if len(text) < 1 or len(str_to_bytes(text)) > 4096
+       or str_contains(text, strfromcharcode(0))
+       or str_contains(text, "\n") or str_contains(text, "\r") {
+        throw "openssh_client: remote_path is empty, too long, or contains a control separator";
+    }
+    return text;
+}
+
+fn _batch_quote(value) {
+    let escaped = str_replace_all(str(value), "\\", "\\\\");
+    escaped = str_replace_all(escaped, "\"", "\\\"");
+    return "\"" + escaped + "\"";
+}
+
+fn _remove_private_root(root_path) {
+    let name = path_basename(str(root_path));
+    if not regex_match(name, "^pblang-openssh-[0-9a-f]{32}$")
+       or root_path != "/tmp/" + name {
+        return false;
+    }
+    let tmp = DIRFS.open_absolute("/tmp", false, false);
+    if not tmp.ok { return false; }
+    let removed = DIRFS.remove(tmp, name);
+    let closed = DIRFS.close(tmp);
+    return removed.ok and closed;
+}
+
+fn _open_material(options) {
+    if type(options) != "map" { throw "openssh_client: options must be a map"; }
+    let key = _bytes(try options.key_bytes catch nil, MAX_KEY_BYTES, "key_bytes");
+    let known = _bytes(try options.known_hosts_bytes catch nil,
+        MAX_KNOWN_HOSTS_BYTES, "known_hosts_bytes");
+    let token = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + str(now_ms())), 0, 32);
+    let root_path = "/tmp/pblang-openssh-" + token;
+    let root = DIRFS.open_absolute(root_path, true, true);
+    if not root.ok { return _error("private OpenSSH state cannot be created"); }
+    let key_fd = DIRFS.sealed_child_bytes(root, "identity", key);
+    let known_fd = DIRFS.sealed_child_bytes(root, "known-hosts", known);
+    if not key_fd.ok or not known_fd.ok {
+        if key_fd.ok { DIRFS.close_child_descriptor(root, key_fd); }
+        if known_fd.ok { DIRFS.close_child_descriptor(root, known_fd); }
+        DIRFS.close(root); _remove_private_root(root_path);
+        return _error("OpenSSH credential material cannot be sealed");
+    }
+    return map{ ok: true, root: root, root_path: root_path,
+        key: key_fd, known_hosts: known_fd };
+}
+
+fn _close_material(material, extra = nil) {
+    if material == nil or not (try material.ok catch false) { return false; }
+    let extra_closed = true;
+    if extra != nil and (try extra.ok catch false) {
+        extra_closed = DIRFS.close_child_descriptor(material.root, extra);
+    }
+    let key_closed = DIRFS.close_child_descriptor(material.root, material.key);
+    let known_closed = DIRFS.close_child_descriptor(material.root, material.known_hosts);
+    let closed = DIRFS.close(material.root);
+    let removed = _remove_private_root(material.root_path);
+    return extra_closed and key_closed and known_closed and closed and removed;
+}
+
+fn _cleanup_result(result, cleaned) {
+    result.cleanup_verified = cleaned;
+    if result.ok and not cleaned {
+        result.ok = false;
+        result.error = "temporary OpenSSH material cleanup could not be verified";
+    }
+    return result;
+}
+
+fn _spec(options) {
+    let host = _identity(try options.host catch "", "host", 253,
+        "^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$");
+    let user = _identity(try options.user catch "", "user", 64,
+        "^[A-Za-z_][A-Za-z0-9_.-]{0,63}$");
+    let address = _ipv4(try options.pinned_address catch "");
+    let port = _integer(try options.port catch nil, 22, 1, 65535, "port");
+    let timeout = _integer(try options.timeout_secs catch nil, 15, 1, 120, "timeout_secs");
+    let maximum = _integer(try options.max_output_bytes catch nil, 1048576,
+        1, 4194304, "max_output_bytes");
+    return map{ host: host, user: user, pinned_address: address, port: port,
+        timeout_secs: timeout, max_output_bytes: maximum };
+}
+
+fn _base_args(spec, material) {
+    return ["-F", "/dev/null", "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes", "-o", "CheckHostIP=no",
+        "-o", "UserKnownHostsFile=" + material.known_hosts.stable_path,
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
+        "-o", "GSSAPIAuthentication=no", "-o", "PubkeyAuthentication=yes",
+        "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+        "-o", "IdentityFile=" + material.key.stable_path,
+        "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes",
+        "-o", "PermitLocalCommand=no", "-o", "ProxyCommand=none",
+        "-o", "RequestTTY=no", "-o", "ConnectionAttempts=1",
+        "-o", "ConnectTimeout=" + str(spec.timeout_secs),
+        "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+        "-o", "LogLevel=ERROR", "-o", "HostName=" + spec.pinned_address];
+}
+
+fn _run(candidates, argv, spec, stdin_bytes = nil, max_file_bytes = 67108864) {
+    let options = map{ timeout_secs: spec.timeout_secs + 3, startup_timeout_ms: 5000,
+        max_output_bytes: spec.max_output_bytes, max_file_bytes: max_file_bytes,
+        max_memory_bytes: 268435456, inherit_environment: false,
+        environment: map{ LC_ALL: "C", HOME: "/nonexistent" } };
+    if stdin_bytes != nil { options.stdin_bytes = stdin_bytes; }
+    return PROCESS.run_fixed(candidates, argv, options);
+}
+
+fn _result(run, spec, operation) {
+    return map{ ok: run.ok and run.command_ok and not run.output_truncated,
+        executed: try run.completed catch false, operation: operation,
+        host: spec.host, target_address: spec.pinned_address, port: spec.port,
+        exit_code: try run.exit_code catch -1, stdout: try run.stdout catch "",
+        stderr: try run.stderr catch try run.error catch "",
+        timed_out: try run.timed_out catch false,
+        output_truncated: try run.output_truncated catch false,
+        process_group_terminated: try run.process_group_terminated catch false,
+        shell_used_locally: false, argv_encoded: true,
+        host_key_verification: "strict", dns_pinned: true,
+        password_authentication: false, agent_authentication: false,
+        proxy_command_enabled: false, forwarding_enabled: false,
+        credential_storage: "sealed-anonymous-kernel-memory" };
+}
+
+fn execute(options) {
+    let spec = _spec(options);
+    let command = str(try options.command catch "");
+    if len(str_to_bytes(command)) < 1 or len(str_to_bytes(command)) > MAX_COMMAND_BYTES
+       or str_contains(command, strfromcharcode(0)) {
+        throw "openssh_client: command must contain 1..16384 UTF-8 bytes without NUL";
+    }
+    let material = _open_material(options); if not material.ok { return material; }
+    let argv = _base_args(spec, material);
+    array_push(argv, "-p"); array_push(argv, str(spec.port));
+    array_push(argv, spec.user + "@" + spec.host); array_push(argv, command);
+    let run = _run(["/usr/bin/ssh", "/bin/ssh"], argv, spec);
+    let cleaned = _close_material(material);
+    let result = _result(run, spec, "exec");
+    result.remote_shell_command = true;
+    return _cleanup_result(result, cleaned);
+}
+
+fn upload(options, payload) {
+    let spec = _spec(options); let remote = _remote_path(try options.remote_path catch "");
+    payload = _bytes(payload, MAX_TRANSFER_BYTES, "payload");
+    let material = _open_material(options); if not material.ok { return material; }
+    let source = DIRFS.sealed_child_bytes(material.root, "upload", payload);
+    if not source.ok { _close_material(material); return _error("upload payload cannot be sealed"); }
+    let argv = _base_args(spec, material);
+    array_push(argv, "-P"); array_push(argv, str(spec.port));
+    array_push(argv, "-b"); array_push(argv, "-"); array_push(argv, "-B"); array_push(argv, "32768");
+    array_push(argv, spec.user + "@" + spec.host);
+    let batch = "put " + _batch_quote(source.stable_path) + " " + _batch_quote(remote) + "\n";
+    let run = _run(["/usr/bin/sftp", "/bin/sftp"], argv, spec, str_to_bytes(batch));
+    let cleaned = _close_material(material, source);
+    let result = _result(run, spec, "upload");
+    result.remote_path = remote; result.bytes = len(payload);
+    result.payload_digest = SHA256.sha256_hex_bytes(payload); result.protocol = "sftp";
+    return _cleanup_result(result, cleaned);
+}
+
+fn download(options, maximum = 16777216) {
+    let spec = _spec(options); let remote = _remote_path(try options.remote_path catch "");
+    maximum = _integer(maximum, 16777216, 1, MAX_TRANSFER_BYTES, "maximum");
+    let material = _open_material(options); if not material.ok { return material; }
+    let destination = DIRFS.mutable_snapshot_bytes(material.root, "download", []);
+    if not destination.ok { _close_material(material); return _error("download snapshot cannot be created"); }
+    let argv = _base_args(spec, material);
+    array_push(argv, "-P"); array_push(argv, str(spec.port));
+    array_push(argv, "-b"); array_push(argv, "-"); array_push(argv, "-B"); array_push(argv, "32768");
+    array_push(argv, spec.user + "@" + spec.host);
+    let batch = "get " + _batch_quote(remote) + " " + _batch_quote(destination.stable_path) + "\n";
+    // RLIMIT_FSIZE also applies to the supervisor's already-open diagnostic
+    // files. Keep that kernel ceiling large enough for the retained output,
+    // then enforce the caller's smaller payload limit on the anonymous target.
+    let process_file_ceiling = maximum;
+    if process_file_ceiling < spec.max_output_bytes {
+        process_file_ceiling = spec.max_output_bytes;
+    }
+    let run = _run(["/usr/bin/sftp", "/bin/sftp"], argv, spec,
+        str_to_bytes(batch), process_file_ceiling);
+    let bytes = [];
+    if run.ok and run.command_ok and not run.output_truncated {
+        bytes = try fs_read_bytes(destination.path) catch nil;
+    }
+    let valid = is_array(bytes) and len(bytes) <= maximum;
+    let cleaned = _close_material(material, destination);
+    let result = _result(run, spec, "download");
+    if result.ok and not valid {
+        result.ok = false; result.error = "downloaded payload cannot be read within its byte ceiling";
+    }
+    result.remote_path = remote; result.protocol = "sftp";
+    result.max_bytes = maximum; result.bytes = if valid { len(bytes) } else { 0 };
+    result.process_file_ceiling_bytes = process_file_ceiling;
+    result.payload_ceiling_postcondition = true;
+    result.payload = if valid { bytes } else { [] };
+    result.payload_digest = if valid { SHA256.sha256_hex_bytes(bytes) } else { nil };
+    return _cleanup_result(result, cleaned);
+}
+
+fn status() {
+    return map{ format: "pblang.openssh-client.status.v1",
+        available: platform() == "linux" and PROCESS.status().available,
+        strict_host_key_verification: true, dns_pin_required: true,
+        anonymous_credential_storage: true, passwords_disabled: true,
+        agents_disabled: true, proxies_disabled: true, forwarding_disabled: true,
+        process_group_bounded: true, output_bounded: true,
+        download_file_size_bounded: true, temporary_cleanup_verified: true,
+        sftp_not_scp: true };
+}
+
+export execute, upload, download, status,
+       MAX_KEY_BYTES, MAX_KNOWN_HOSTS_BYTES, MAX_COMMAND_BYTES, MAX_TRANSFER_BYTES;

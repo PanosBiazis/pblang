@@ -1,0 +1,163 @@
+// Deadline-bound single-datagram IPv4 sender implemented in PBLang.
+
+let LIBC = [
+    "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6", "/lib/i386-linux-gnu/libc.so.6"
+];
+let CRYPTO = [
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3", "/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/aarch64-linux-gnu/libcrypto.so.3", "/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/i386-linux-gnu/libcrypto.so.3", "/lib/i386-linux-gnu/libcrypto.so.3"
+];
+let FORMAT = "pblang.native-udp.v1";
+let MAX_DATAGRAM_BYTES = 65507;
+let AF_INET = 2; let SOCK_DGRAM_NONBLOCK_CLOEXEC = 526338;
+let SOL_SOCKET = 1; let SO_BROADCAST = 6; let POLLIN = 1; let POLLOUT = 4;
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+fn _path(candidates) { for i len(candidates) { if fs_exists(candidates[i]) { return candidates[i]; } } return ""; }
+fn available() {
+    let libc = _path(LIBC); let crypto = _path(CRYPTO);
+    return map{ ok: platform() == "linux" and libc != "" and crypto != "",
+        format: FORMAT, platform: platform(), libc: libc, crypto: crypto,
+        nonblocking: true, cloexec: true, max_datagram_bytes: MAX_DATAGRAM_BYTES };
+}
+fn _i32(value) { if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; } return value; }
+fn _call(state, name, signature, args) { return try ffi_call_typed(state.libc, name, signature, args) catch -1; }
+fn _memset(state, pointer, value, count) { return _call(state, "memset", "ptr,i32,i64->ptr", [pointer,value,count]); }
+fn _free(state, pointer) { if pointer != nil and pointer != 0 { _call(state,"free","ptr->void",[pointer]); } }
+fn _free_crypto(state, pointer) {
+    if pointer != nil and pointer != 0 { try ffi_call_typed(state.crypto,
+        "CRYPTO_free", "ptr,ptr,i32->void", [pointer,0,0]) catch nil; }
+}
+fn _write_le(state, pointer, value, count) {
+    let remaining = value; for i count { _memset(state,pointer+i,num_mod(remaining,256),1); remaining=num_floor(remaining/256); }
+}
+fn _ipv4(value) {
+    let parts=str_split(str(value),"."); if len(parts)!=4 { return nil; } let out=[];
+    for i 4 { let n=try parse_number(parts[i]) catch nil;
+        if n==nil or not _integer(n,0,255) { return nil; } array_push(out,n); }
+    return out;
+}
+fn _bytes(value) {
+    if type(value)!="array" or len(value)<1 or len(value)>MAX_DATAGRAM_BYTES { return false; }
+    for i len(value) { if not _integer(value[i],0,255) { return false; } } return true;
+}
+fn _hex(value) {
+    let digits="0123456789abcdef"; let out="";
+    for i len(value) { let h=num_floor(value[i]/16); let l=num_mod(value[i],16);
+        out=out+str_slice(digits,h,h+1)+str_slice(digits,l,l+1); } return out;
+}
+fn _sockaddr(state,address,port) {
+    let p=_call(state,"calloc","i64,i64->ptr",[1,16]); if p==nil or p==0{return nil;}
+    _write_le(state,p,AF_INET,2); _memset(state,p+2,num_floor(port/256),1); _memset(state,p+3,num_mod(port,256),1);
+    for i 4 { _memset(state,p+4+i,address[i],1); } return p;
+}
+fn _poll_for(state,events,timeout_ms) {
+    let p=_call(state,"calloc","i64,i64->ptr",[1,8]); if p==nil or p==0{return -1;}
+    _write_le(state,p,state.fd,4); _write_le(state,p+4,events,2);
+    let result=_i32(_call(state,"poll","ptr,i64,i32->i32",[p,1,timeout_ms])); _free(state,p); return result;
+}
+fn _pointer_bytes(state,pointer,count) {
+    if pointer==nil or pointer==0 or not _integer(count,0,MAX_DATAGRAM_BYTES) {
+        return map{ok:false,error:"invalid UDP byte copy"};
+    }
+    if count==0 { return map{ok:true,bytes:[],count:0}; }
+    let encoded=try ffi_call_typed(state.crypto,"OPENSSL_buf2hexstr","ptr,i64->ptr",[pointer,count]) catch nil;
+    if encoded==nil or encoded==0 { return map{ok:false,error:"UDP byte encoding failed"}; }
+    let hex=try ffi_call_typed(state.libc,"basename","ptr->string",[encoded]) catch nil;
+    _free_crypto(state,encoded); if type(hex)!="string" { return map{ok:false,error:"UDP bytes unavailable"}; }
+    let clean=str_lower(str_replace_all(hex,":","")); if len(clean)!=count*2 { return map{ok:false,error:"UDP byte count mismatch"}; }
+    let bytes=[]; for i count { let at=i*2;
+        let high=str_index_of("0123456789abcdef",str_slice(clean,at,at+1));
+        let low=str_index_of("0123456789abcdef",str_slice(clean,at+1,at+2));
+        if high<0 or low<0 { return map{ok:false,error:"UDP byte encoding invalid"}; }
+        array_push(bytes,high*16+low); }
+    return map{ok:true,bytes:bytes,count:count};
+}
+fn _local_port(state) {
+    let address=_call(state,"calloc","i64,i64->ptr",[1,16]); let length=_call(state,"calloc","i64,i64->ptr",[1,4]);
+    if address==nil or address==0 or length==nil or length==0 { _free(state,address); _free(state,length); return nil; }
+    _write_le(state,length,16,4); let result=_i32(_call(state,"getsockname","i32,ptr,ptr->i32",[state.fd,address,length]));
+    let copied=if result==0 {_pointer_bytes(state,address,16)} else {map{ok:false}};
+    _free(state,address); _free(state,length); if not copied.ok{return nil;}
+    return copied.bytes[2]*256+copied.bytes[3];
+}
+fn _close(state) {
+    if state.fd>=0 { _i32(_call(state,"close","i32->i32",[state.fd])); state.fd=-1; }
+    try ffi_close(state.crypto) catch nil; try ffi_close(state.libc) catch nil;
+}
+fn send_ipv4(host, port, payload, options=nil) {
+    if options==nil { options=map{}; } if type(options)!="map" { return map{ok:false,error:"UDP options must be an object"}; }
+    for key in map_keys(options) { if key!="timeout_ms" and key!="broadcast" { return map{ok:false,error:"unknown UDP option: "+key}; } }
+    let address=_ipv4(host); let timeout=try options.timeout_ms catch 500; let broadcast=try options.broadcast catch false;
+    if address==nil or not _integer(port,1,65535) or not _bytes(payload)
+        or not _integer(timeout,1,60000) or type(broadcast)!="bool" {
+        return map{ok:false,error:"invalid bounded UDP datagram options"};
+    }
+    let support=available(); if not support.ok { return map{ok:false,error:"native UDP backend unavailable"}; }
+    let libc=try ffi_load(support.libc) catch nil; let crypto=try ffi_load(support.crypto) catch nil;
+    if libc==nil or crypto==nil { try ffi_close(libc) catch nil; try ffi_close(crypto) catch nil;
+        return map{ok:false,error:"trusted UDP libraries unavailable"}; }
+    let state=map{libc:libc,crypto:crypto,fd:-1};
+    state.fd=_i32(_call(state,"socket","i32,i32,i32->i32",[AF_INET,SOCK_DGRAM_NONBLOCK_CLOEXEC,0]));
+    if state.fd<0 { _close(state); return map{ok:false,error:"UDP socket creation failed"}; }
+    if broadcast {
+        let enabled=_call(state,"calloc","i64,i64->ptr",[1,4]); _write_le(state,enabled,1,4);
+        let set=_i32(_call(state,"setsockopt","i32,i32,i32,ptr,i32->i32",[state.fd,SOL_SOCKET,SO_BROADCAST,enabled,4]));
+        _free(state,enabled); if set!=0 { _close(state); return map{ok:false,error:"UDP broadcast option failed"}; }
+    }
+    let buffer=try ffi_call_typed(state.crypto,"OPENSSL_hexstr2buf","string,ptr->ptr",[_hex(payload),0]) catch nil;
+    let target=_sockaddr(state,address,port);
+    if buffer==nil or buffer==0 or target==nil { _free_crypto(state,buffer); _free(state,target); _close(state);
+        return map{ok:false,error:"UDP datagram allocation failed"}; }
+    let connected=_i32(_call(state,"connect","i32,ptr,i32->i32",[state.fd,target,16])); _free(state,target);
+    if connected!=0 { _free_crypto(state,buffer); _close(state);
+        return map{ok:false,error:"UDP destination connect failed"}; }
+    if _poll_for(state,POLLOUT,timeout)<=0 { _free_crypto(state,buffer); _close(state);
+        return map{ok:false,error:"UDP send deadline expired",timeout:true}; }
+    let started=now_ms(); let count=_call(state,"send","i32,ptr,i64,i32->i64",
+        [state.fd,buffer,len(payload),0]);
+    _free_crypto(state,buffer); _close(state);
+    if count!=len(payload) { return map{ok:false,error:"UDP datagram was not sent atomically",native_count:count}; }
+    return map{ok:true,format:FORMAT,host:host,port:port,bytes:count,broadcast:broadcast,
+        elapsed_ms:now_ms()-started,nonblocking:true,cloexec:true,shell_used:false};
+}
+
+fn listen_ipv4(host="127.0.0.1",port=0) {
+    let address=_ipv4(host); if address==nil or not _integer(port,0,65535) {
+        return map{ok:false,error:"invalid bounded UDP listener options"};
+    }
+    let support=available(); if not support.ok{return map{ok:false,error:"native UDP backend unavailable"};}
+    let libc=try ffi_load(support.libc) catch nil; let crypto=try ffi_load(support.crypto) catch nil;
+    if libc==nil or crypto==nil {try ffi_close(libc) catch nil;try ffi_close(crypto) catch nil;return map{ok:false,error:"trusted UDP libraries unavailable"};}
+    let state=map{ok:false,format:FORMAT,libc:libc,crypto:crypto,fd:-1,closed:false,host:host};
+    state.fd=_i32(_call(state,"socket","i32,i32,i32->i32",[AF_INET,SOCK_DGRAM_NONBLOCK_CLOEXEC,0]));
+    if state.fd<0 {_close(state);return map{ok:false,error:"UDP listener socket creation failed"};}
+    let target=_sockaddr(state,address,port); if target==nil {_close(state);return map{ok:false,error:"UDP listener allocation failed"};}
+    let bound=_i32(_call(state,"bind","i32,ptr,i32->i32",[state.fd,target,16])); _free(state,target);
+    if bound!=0 {_close(state);return map{ok:false,error:"UDP listener bind failed"};}
+    let actual=_local_port(state); if actual==nil or not _integer(actual,1,65535) {_close(state);return map{ok:false,error:"UDP listener port verification failed"};}
+    state.port=actual;state.ok=true;state.nonblocking=true;state.cloexec=true;return state;
+}
+
+fn receive(listener,maximum=nil,timeout_ms=500) {
+    if maximum==nil {maximum=MAX_DATAGRAM_BYTES;}
+    if type(listener)!="map" or (try listener.format catch "")!=FORMAT
+        or (try listener.closed catch true) or not _integer(maximum,1,MAX_DATAGRAM_BYTES)
+        or not _integer(timeout_ms,1,60000) {return map{ok:false,error:"invalid bounded UDP receive"};}
+    let ready=_poll_for(listener,POLLIN,timeout_ms); if ready<=0{return map{ok:false,error:"UDP receive deadline expired",timeout:ready==0};}
+    let buffer=_call(listener,"calloc","i64,i64->ptr",[maximum,1]);if buffer==nil or buffer==0{return map{ok:false,error:"UDP receive allocation failed"};}
+    let count=_call(listener,"recv","i32,ptr,i64,i32->i64",[listener.fd,buffer,maximum,0]);
+    let copied=if count>=0 and count<=maximum {_pointer_bytes(listener,buffer,count)} else {map{ok:false,error:"UDP receive failed"}};
+    _free(listener,buffer);if not copied.ok{return copied;}
+    return map{ok:true,format:FORMAT,bytes:copied.bytes,count:copied.count,datagram_complete:true};
+}
+
+fn close(state) { if type(state)=="map" and not (try state.closed catch true) {_close(state);state.closed=true;} return map{ok:true}; }
+
+export FORMAT, MAX_DATAGRAM_BYTES, available, send_ipv4, listen_ipv4, receive, close;

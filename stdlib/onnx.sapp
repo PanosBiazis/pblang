@@ -1,0 +1,506 @@
+// Bounded, deterministic ONNX inference implemented in PBLang.
+//
+// This module intentionally executes a documented CPU operator subset instead
+// of delegating to Python or a foreign ONNX runtime. Unsupported protobuf wire
+// forms, tensor types, dynamic dimensions, operators, and resource demands fail
+// closed before graph execution.
+
+let F = import("stdlib:floatn.sapp");
+
+let MAX_MODEL_BYTES = 4194304;
+let MAX_FIELDS = 200000;
+let MAX_NODES = 2048;
+let MAX_TENSORS = 4096;
+let MAX_ELEMENTS = 1000000;
+let MAX_OPERATIONS = 50000000;
+let SUPPORTED_OPS = ["Identity", "Add", "Sub", "Mul", "Div", "Relu", "Sigmoid", "Tanh",
+                     "MatMul", "Gemm", "Softmax", "Reshape", "Flatten", "Transpose", "Concat", "Constant"];
+
+fn _fail(message) { throw "onnx: " + message; }
+fn _finite(value) {
+    if type(value) != "number" or value != value { return false; }
+    if value != 0 and value == value * 2 { return false; }
+    return num_abs(value) <= 1000000000000000;
+}
+fn _integer(value, minimum, maximum, label) {
+    if type(value) != "number" or num_floor(value) != value or value < minimum or value > maximum {
+        _fail(label + " must be an integer in " + str(minimum) + ".." + str(maximum));
+    }
+    return value;
+}
+fn _product(shape) {
+    let total = 1;
+    for i len(shape) {
+        _integer(shape[i], 0, MAX_ELEMENTS, "shape dimension");
+        total = total * shape[i];
+        if total > MAX_ELEMENTS { _fail("tensor exceeds the element limit"); }
+    }
+    return total;
+}
+fn _tensor(shape, data, dtype = "f32") {
+    if type(shape) != "array" or len(shape) > 16 { _fail("tensor rank exceeds 16"); }
+    if type(data) != "array" or len(data) != _product(shape) { _fail("tensor data/shape mismatch"); }
+    let out = [];
+    for i len(data) {
+        if not _finite(data[i]) { _fail("tensor contains a non-finite or unbounded number"); }
+        out[len(out)] = data[i] * 1.0;
+    }
+    return map{ shape: shape, data: out, dtype: dtype };
+}
+fn _state(bytes, counter = nil) {
+    if type(bytes) != "array" or len(bytes) < 1 or len(bytes) > MAX_MODEL_BYTES {
+        _fail("model must contain 1.." + str(MAX_MODEL_BYTES) + " bytes");
+    }
+    if counter == nil { counter = map{ fields: 0 }; }
+    return map{ bytes: bytes, pos: 0, end: len(bytes), counter: counter };
+}
+fn _substate(parent, payload) {
+    return map{ bytes: payload, pos: 0, end: len(payload), counter: parent.counter };
+}
+fn _byte(state) {
+    if state.pos >= state.end { _fail("truncated protobuf field"); }
+    let value = state.bytes[state.pos]; state.pos = state.pos + 1;
+    if type(value) != "number" or value < 0 or value > 255 or num_floor(value) != value { _fail("invalid byte value"); }
+    return value;
+}
+fn _read_varint(state) {
+    let value: any = 0; let scale = 1; let count = 0;
+    let raw = [];
+    while count < 10 {
+        let b = _byte(state); raw[len(raw)] = b;
+        if value != nil {
+            let part = (b % 128) * scale;
+            if part > 9007199254740991 - value { value = nil; }
+            else { value = value + part; }
+        }
+        if b < 128 {
+            return map{ value: value, bytes: raw };
+        }
+        scale = scale * 128; count = count + 1;
+    }
+    _fail("overlong varint");
+}
+fn _varint(state) {
+    let decoded = _read_varint(state);
+    if decoded.value == nil { _fail("unsigned varint exceeds exact numeric range"); }
+    return decoded.value;
+}
+fn _signed_varint(decoded) {
+    if decoded.value != nil and len(decoded.bytes) < 10 { return decoded.value; }
+    if len(decoded.bytes) != 10 or decoded.bytes[9] != 1 { _fail("signed int64 exceeds the exact supported range"); }
+    // Recover the small negative magnitude from the two's-complement bits
+    // without first materializing an inexact unsigned 64-bit number.
+    let magnitude_minus_one = 0; let scale = 1; let bit = 0;
+    while bit < 64 {
+        let byte_index = num_floor(bit / 7); let within = bit % 7;
+        let original = num_floor((decoded.bytes[byte_index] % 128) / num_pow(2, within)) % 2;
+        if original == 0 {
+            if magnitude_minus_one > 9007199254740990 - scale { _fail("negative int64 magnitude exceeds the exact supported range"); }
+            magnitude_minus_one = magnitude_minus_one + scale;
+        }
+        scale = scale * 2; bit = bit + 1;
+    }
+    return 0 - (magnitude_minus_one + 1);
+}
+fn _bytes(state, count) {
+    _integer(count, 0, MAX_MODEL_BYTES, "field length");
+    if state.pos + count > state.end { _fail("truncated length-delimited field"); }
+    let out = slice(state.bytes, state.pos, state.pos + count); state.pos = state.pos + count; return out;
+}
+fn _field(state) {
+    if state.pos >= state.end { return nil; }
+    state.counter.fields = state.counter.fields + 1;
+    if state.counter.fields > MAX_FIELDS { _fail("protobuf field limit exceeded"); }
+    let tag = _varint(state); let number = num_floor(tag / 8); let wire = tag % 8;
+    if number < 1 { _fail("invalid protobuf field number"); }
+    let value: any = nil;
+    let varint_info: any = nil;
+    if wire == 0 { varint_info = _read_varint(state); value = varint_info.value; }
+    else if wire == 1 { value = _bytes(state, 8); }
+    else if wire == 2 { value = _bytes(state, _varint(state)); }
+    else if wire == 5 { value = _bytes(state, 4); }
+    else { _fail("unsupported protobuf wire type " + str(wire)); }
+    return map{ number: number, wire: wire, value: value, varint: varint_info };
+}
+fn _text(bytes, label) {
+    let value = try bytes_to_str(bytes) catch nil;
+    if value == nil or len(value) > 4096 or str_contains(value, "\x00") { _fail("invalid " + label); }
+    return value;
+}
+fn _packed_varints(bytes) {
+    let state = _state(if len(bytes) == 0 { [0] } else { bytes });
+    if len(bytes) == 0 { state.end = 0; }
+    let out = [];
+    while state.pos < state.end { out[len(out)] = _varint(state); }
+    return out;
+}
+fn _packed_signed_varints(bytes) {
+    let state = _state(if len(bytes) == 0 { [0] } else { bytes });
+    if len(bytes) == 0 { state.end = 0; }
+    let out = [];
+    while state.pos < state.end { out[len(out)] = _signed_varint(_read_varint(state)); }
+    return out;
+}
+fn _f32(bytes) {
+    if len(bytes) != 4 { _fail("invalid float32 payload"); }
+    return F.decode_code(bytes[0] + bytes[1] * 256 + bytes[2] * 65536 + bytes[3] * 16777216, "f32");
+}
+fn _f64(bytes) {
+    if len(bytes) != 8 { _fail("invalid float64 payload"); }
+    let reversed = [];
+    let i = 7; while i >= 0 { reversed[len(reversed)] = bytes[i]; i = i - 1; }
+    return F.unpack(reversed, 1, "f64")[0];
+}
+fn _packed_fixed(bytes, width, decoder) {
+    if len(bytes) % width != 0 { _fail("misaligned packed floating-point payload"); }
+    let out = []; let i = 0;
+    while i < len(bytes) { out[len(out)] = decoder(slice(bytes, i, i + width)); i = i + width; }
+    return out;
+}
+fn _append(target, values) { for i len(values) { target[len(target)] = values[i]; } }
+fn _contains(values, wanted) { for i len(values) { if values[i] == wanted { return true; } } return false; }
+
+fn _parse_dimension(payload, counter = nil) {
+    let state = _state(payload, counter); let value: any = nil; let symbolic = "";
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 0 { value = f.value; }
+        else if f.number == 2 and f.wire == 2 { symbolic = _text(f.value, "symbolic dimension"); }
+    }
+    if value == nil { _fail("dynamic ONNX dimension '" + symbolic + "' requires an explicit input shape"); }
+    return _integer(value, 0, MAX_ELEMENTS, "dimension");
+}
+fn _parse_shape(payload, counter = nil) {
+    let state = _state(payload, counter); let shape = [];
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 2 { shape[len(shape)] = _parse_dimension(f.value, state.counter); }
+    }
+    return shape;
+}
+fn _parse_tensor_type(payload, counter = nil) {
+    let state = _state(payload, counter); let dtype: any = nil; let shape: any = nil;
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 0 { dtype = f.value; }
+        else if f.number == 2 and f.wire == 2 { shape = _parse_shape(f.value, state.counter); }
+    }
+    return map{ dtype: dtype, shape: shape };
+}
+fn _parse_type(payload, counter = nil) {
+    let state = _state(payload, counter); let result: any = nil;
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 2 { result = _parse_tensor_type(f.value, state.counter); }
+    }
+    if result == nil { _fail("only tensor ValueInfo types are supported"); }
+    return result;
+}
+fn _parse_value_info(payload, counter = nil) {
+    let state = _state(payload, counter); let name = ""; let info: any = nil;
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 2 { name = _text(f.value, "value name"); }
+        else if f.number == 2 and f.wire == 2 { info = _parse_type(f.value, state.counter); }
+    }
+    if name == "" { _fail("ValueInfo name is required"); }
+    return map{ name: name, type: info };
+}
+
+fn _parse_tensor(payload, counter = nil) {
+    let state = _state(payload, counter); let dims = []; let dtype: any = nil; let name = "";
+    let float_data = []; let double_data = []; let int_data = []; let raw: any = nil;
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 {
+            if f.wire == 0 { dims[len(dims)] = f.value; }
+            else if f.wire == 2 { _append(dims, _packed_varints(f.value)); }
+        } else if f.number == 2 and f.wire == 0 { dtype = f.value; }
+        else if f.number == 4 {
+            if f.wire == 5 { float_data[len(float_data)] = _f32(f.value); }
+            else if f.wire == 2 { _append(float_data, _packed_fixed(f.value, 4, _f32)); }
+        } else if f.number == 5 or f.number == 7 or f.number == 11 {
+            if f.wire == 0 { int_data[len(int_data)] = _signed_varint(f.varint); }
+            else if f.wire == 2 { _append(int_data, _packed_signed_varints(f.value)); }
+        } else if f.number == 8 and f.wire == 2 { name = _text(f.value, "tensor name"); }
+        else if f.number == 9 and f.wire == 2 { raw = f.value; }
+        else if f.number == 10 {
+            if f.wire == 1 { double_data[len(double_data)] = _f64(f.value); }
+            else if f.wire == 2 { _append(double_data, _packed_fixed(f.value, 8, _f64)); }
+        }
+    }
+    if dtype == nil { _fail("TensorProto data_type is required"); }
+    let data = [];
+    if raw != nil {
+        let width = 0;
+        if dtype == 1 or dtype == 6 { width = 4; }
+        else if dtype == 7 or dtype == 11 { width = 8; }
+        if width == 0 or len(raw) % width != 0 { _fail("unsupported or malformed raw tensor type " + str(dtype)); }
+        let i = 0;
+        while i < len(raw) {
+            if dtype == 1 { data[len(data)] = _f32(slice(raw, i, i + 4)); }
+            else if dtype == 11 { data[len(data)] = _f64(slice(raw, i, i + 8)); }
+            else {
+                let value = 0; let scale = 1; let j = 0;
+                while j < width { value = value + raw[i + j] * scale; scale = scale * 256; j = j + 1; }
+                data[len(data)] = value;
+            }
+            i = i + width;
+        }
+    } else if dtype == 1 { _append(data, float_data); }
+    else if dtype == 11 { _append(data, double_data); }
+    else if dtype == 6 or dtype == 7 { _append(data, int_data); }
+    else { _fail("unsupported TensorProto data type " + str(dtype)); }
+    let dtype_name = "i64";
+    if dtype == 1 { dtype_name = "f32"; }
+    else if dtype == 11 { dtype_name = "f64"; }
+    else if dtype == 6 { dtype_name = "i32"; }
+    return map{ name: name, tensor: _tensor(dims, data, dtype_name) };
+}
+
+fn _parse_attribute(payload, counter = nil) {
+    let state = _state(payload, counter); let name = ""; let value: any = nil; let values = [];
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 2 { name = _text(f.value, "attribute name"); }
+        else if f.number == 2 and f.wire == 5 { value = _f32(f.value); }
+        else if f.number == 3 and f.wire == 0 { value = _signed_varint(f.varint); }
+        else if f.number == 4 and f.wire == 2 { value = f.value; }
+        else if f.number == 5 and f.wire == 2 { value = _parse_tensor(f.value, state.counter).tensor; }
+        else if f.number == 7 {
+            if f.wire == 5 { values[len(values)] = _f32(f.value); }
+            else if f.wire == 2 { _append(values, _packed_fixed(f.value, 4, _f32)); }
+        } else if f.number == 8 {
+            if f.wire == 0 { values[len(values)] = _signed_varint(f.varint); }
+            else if f.wire == 2 { _append(values, _packed_signed_varints(f.value)); }
+        }
+    }
+    if name == "" { _fail("attribute name is required"); }
+    if len(values) > 0 { value = values; }
+    return map{ name: name, value: value };
+}
+fn _parse_node(payload, counter = nil) {
+    let state = _state(payload, counter); let inputs = []; let outputs = []; let name = ""; let op = ""; let attrs = map{}; let domain = "";
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 2 { inputs[len(inputs)] = _text(f.value, "node input"); }
+        else if f.number == 2 and f.wire == 2 { outputs[len(outputs)] = _text(f.value, "node output"); }
+        else if f.number == 3 and f.wire == 2 { name = _text(f.value, "node name"); }
+        else if f.number == 4 and f.wire == 2 { op = _text(f.value, "operator type"); }
+        else if f.number == 5 and f.wire == 2 { let a = _parse_attribute(f.value, state.counter); attrs[a.name] = a.value; }
+        else if f.number == 7 and f.wire == 2 { domain = _text(f.value, "operator domain"); }
+    }
+    if op == "" or len(outputs) < 1 { _fail("node operator and output are required"); }
+    if domain != "" and domain != "ai.onnx" { _fail("custom operator domain is unsupported: " + domain); }
+    if not _contains(SUPPORTED_OPS, op) { _fail("unsupported operator: " + op); }
+    return map{ name: name, op: op, inputs: inputs, outputs: outputs, attrs: attrs };
+}
+fn _parse_graph(payload, counter = nil) {
+    let state = _state(payload, counter); let nodes = []; let initializers = map{}; let inputs = []; let outputs = [];
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 2 {
+            if len(nodes) >= MAX_NODES { _fail("node limit exceeded"); }
+            nodes[len(nodes)] = _parse_node(f.value, state.counter);
+        } else if f.number == 5 and f.wire == 2 {
+            if len(map_keys(initializers)) >= MAX_TENSORS { _fail("initializer limit exceeded"); }
+            let init = _parse_tensor(f.value, state.counter); if init.name == "" { _fail("initializer name is required"); }
+            if map_has(initializers, init.name) { _fail("duplicate initializer: " + init.name); }
+            initializers[init.name] = init.tensor;
+        } else if f.number == 11 and f.wire == 2 { inputs[len(inputs)] = _parse_value_info(f.value, state.counter); }
+        else if f.number == 12 and f.wire == 2 { outputs[len(outputs)] = _parse_value_info(f.value, state.counter); }
+    }
+    if len(outputs) < 1 { _fail("graph has no declared output"); }
+    return map{ nodes: nodes, initializers: initializers, inputs: inputs, outputs: outputs };
+}
+fn decode(bytes) {
+    let state = _state(bytes); let graph: any = nil; let ir_version: any = nil; let opset = 0;
+    while state.pos < state.end {
+        let f = _field(state);
+        if f.number == 1 and f.wire == 0 { ir_version = f.value; }
+        else if f.number == 7 and f.wire == 2 { if graph != nil { _fail("duplicate graph"); } graph = _parse_graph(f.value, state.counter); }
+        else if f.number == 8 and f.wire == 2 {
+            let os = _substate(state, f.value); let domain = ""; let version = 0;
+            while os.pos < os.end { let of = _field(os); if of.number == 1 and of.wire == 2 { domain = _text(of.value, "opset domain"); } else if of.number == 2 and of.wire == 0 { version = of.value; } }
+            if domain == "" or domain == "ai.onnx" { opset = version; }
+        }
+    }
+    if graph == nil { _fail("ModelProto graph is required"); }
+    if ir_version == nil or ir_version < 3 or ir_version > 10 { _fail("unsupported ONNX IR version"); }
+    if opset < 7 or opset > 21 { _fail("supported default-domain opsets are 7..21"); }
+    return map{ format: "pblang.onnx.model.v1", ir_version: ir_version, opset: opset, graph: graph };
+}
+
+fn _same_shape(a, b) { return a == b; }
+fn _broadcast_shape(a, b) {
+    let rank = num_max(len(a), len(b)); let out = []; let i = 0;
+    while i < rank {
+        let ai = len(a) - rank + i; let bi = len(b) - rank + i;
+        let av = 1; let bv = 1;
+        if ai >= 0 { av = a[ai]; }
+        if bi >= 0 { bv = b[bi]; }
+        if av != bv and av != 1 and bv != 1 { _fail("incompatible broadcast shapes"); }
+        out[len(out)] = num_max(av, bv); i = i + 1;
+    }
+    return out;
+}
+fn _broadcast_offset(index, output_shape, input_shape) {
+    let coord = []; for z len(output_shape) { coord[z] = 0; }
+    let remaining = index; let i = len(output_shape) - 1;
+    while i >= 0 { coord[i] = remaining % output_shape[i]; remaining = num_floor(remaining / output_shape[i]); i = i - 1; }
+    let offset = 0; let stride = 1; let oi = len(output_shape) - 1; let ii = len(input_shape) - 1;
+    while ii >= 0 { let c = 0; if input_shape[ii] != 1 { c = coord[oi]; } offset = offset + c * stride; stride = stride * input_shape[ii]; oi = oi - 1; ii = ii - 1; }
+    return offset;
+}
+fn _binary(a, b, op) {
+    let shape = _broadcast_shape(a.shape, b.shape); let total = _product(shape); let data = [];
+    for i total { data[i] = op(a.data[_broadcast_offset(i, shape, a.shape)], b.data[_broadcast_offset(i, shape, b.shape)]); }
+    return _tensor(shape, data);
+}
+fn _unary(a, op) { let data = []; for i len(a.data) { data[i] = op(a.data[i]); } return _tensor(a.shape, data); }
+fn _matmul(a, b, budget) {
+    if len(a.shape) != 2 or len(b.shape) != 2 or a.shape[1] != b.shape[0] { _fail("MatMul currently requires compatible rank-2 tensors"); }
+    let m = a.shape[0]; let k = a.shape[1]; let n = b.shape[1]; budget.ops = budget.ops + m * k * n * 2;
+    if budget.ops > budget.max_ops { _fail("operation budget exceeded"); }
+    let data = [];
+    for row m { for col n { let sum = 0.0; for p k { sum = sum + a.data[row * k + p] * b.data[p * n + col]; } data[len(data)] = sum; } }
+    return _tensor([m, n], data);
+}
+fn _transpose2(a) {
+    if len(a.shape) != 2 { _fail("Gemm transpose requires rank-2 tensor"); }
+    let data = []; for c a.shape[1] { for r a.shape[0] { data[len(data)] = a.data[r * a.shape[1] + c]; } }
+    return _tensor([a.shape[1], a.shape[0]], data, a.dtype);
+}
+fn _transpose(a, perm) {
+    let rank = len(a.shape); if perm == nil { perm = []; let i = rank - 1; while i >= 0 { perm[len(perm)] = i; i = i - 1; } }
+    if type(perm) != "array" or len(perm) != rank { _fail("Transpose perm rank mismatch"); }
+    let seen = map{}; let out_shape = [];
+    for i rank { let p = _integer(perm[i], 0, rank - 1, "transpose axis"); if map_has(seen, str(p)) { _fail("duplicate transpose axis"); } seen[str(p)] = true; out_shape[i] = a.shape[p]; }
+    let total = _product(out_shape); let data = [];
+    for out_index total {
+        let coords = []; let source_coords = [];
+        for z rank { coords[z] = 0; source_coords[z] = 0; }
+        let rem = out_index; let d = rank - 1;
+        while d >= 0 { coords[d] = rem % out_shape[d]; rem = num_floor(rem / out_shape[d]); d = d - 1; }
+        for k rank { source_coords[perm[k]] = coords[k]; }
+        let source = 0; let stride = 1; d = rank - 1;
+        while d >= 0 { source = source + source_coords[d] * stride; stride = stride * a.shape[d]; d = d - 1; }
+        data[out_index] = a.data[source];
+    }
+    return _tensor(out_shape, data, a.dtype);
+}
+fn _axis(value, rank, fallback) {
+    let axis = fallback; if value != nil { axis = value; }
+    if axis < 0 { axis = rank + axis; }
+    return _integer(axis, 0, rank - 1, "axis");
+}
+fn _softmax(a, axis) {
+    axis = _axis(axis, len(a.shape), len(a.shape) - 1);
+    let outer = 1; for i axis { outer = outer * a.shape[i]; }
+    let width = a.shape[axis]; let inner = 1; let j = axis + 1; while j < len(a.shape) { inner = inner * a.shape[j]; j = j + 1; }
+    let data = []; for z len(a.data) { data[z] = 0.0; }
+    for o outer { for q inner {
+        let maximum = a.data[(o * width) * inner + q];
+        for w width { maximum = num_max(maximum, a.data[(o * width + w) * inner + q]); }
+        let total = 0.0; for w width { let e = num_exp(a.data[(o * width + w) * inner + q] - maximum); data[(o * width + w) * inner + q] = e; total = total + e; }
+        for w width { data[(o * width + w) * inner + q] = data[(o * width + w) * inner + q] / total; }
+    } }
+    return _tensor(a.shape, data);
+}
+fn _reshape(a, shape_tensor, allow_zero) {
+    let requested = []; let infer: any = nil; let known = 1;
+    for i len(shape_tensor.data) {
+        let dim = shape_tensor.data[i]; if num_floor(dim) != dim { _fail("Reshape shape values must be integers"); }
+        if dim == 0 - 1 { if infer != nil { _fail("Reshape permits one inferred dimension"); } infer = i; requested[i] = 1; }
+        else if dim == 0 and not allow_zero { if i >= len(a.shape) { _fail("Reshape copied dimension is out of range"); } requested[i] = a.shape[i]; known = known * requested[i]; }
+        else { requested[i] = _integer(dim, 0, MAX_ELEMENTS, "reshape dimension"); known = known * requested[i]; }
+    }
+    if infer != nil { if known == 0 or len(a.data) % known != 0 { _fail("Reshape inferred dimension is not integral"); } requested[infer] = len(a.data) / known; }
+    if _product(requested) != len(a.data) { _fail("Reshape element count mismatch"); }
+    return _tensor(requested, a.data, a.dtype);
+}
+fn _concat(tensors, axis) {
+    if len(tensors) < 1 { _fail("Concat requires input tensors"); }
+    let rank = len(tensors[0].shape); axis = _axis(axis, rank, 0); let shape = slice(tensors[0].shape, 0, rank); shape[axis] = 0;
+    for i len(tensors) { if len(tensors[i].shape) != rank { _fail("Concat rank mismatch"); } for d rank { if d != axis and tensors[i].shape[d] != tensors[0].shape[d] { _fail("Concat shape mismatch"); } } shape[axis] = shape[axis] + tensors[i].shape[axis]; }
+    let inner = 1; let d = axis + 1; while d < rank { inner = inner * shape[d]; d = d + 1; }
+    let outer = 1; for d axis { outer = outer * shape[d]; }
+    let data = [];
+    for o outer { for ti len(tensors) { let count = tensors[ti].shape[axis] * inner; let start = o * count; for k count { data[len(data)] = tensors[ti].data[start + k]; } } }
+    return _tensor(shape, data);
+}
+fn _input(node, values, index) {
+    if index >= len(node.inputs) or node.inputs[index] == "" or not map_has(values, node.inputs[index]) { _fail(node.op + " missing input " + str(index)); }
+    return values[node.inputs[index]];
+}
+fn _execute_node(node, values, budget) {
+    let op = node.op; let a: any = nil; let result: any = nil;
+    if op == "Constant" { result = try node.attrs.value catch nil; if result == nil or type(result) != "map" { _fail("Constant requires tensor attribute value"); } }
+    else {
+        a = _input(node, values, 0);
+        if op == "Identity" { result = a; }
+        else if op == "Relu" { result = _unary(a, fn(x) { return num_max(0.0, x); }); }
+        else if op == "Sigmoid" { result = _unary(a, fn(x) { return 1.0 / (1.0 + num_exp(0.0 - x)); }); }
+        else if op == "Tanh" { result = _unary(a, fn(x) { if x > 20 { return 1.0; } if x < -20 { return -1.0; } let e = num_exp(2.0 * x); return (e - 1.0) / (e + 1.0); }); }
+        else if op == "Add" { result = _binary(a, _input(node, values, 1), fn(x, y) { return x + y; }); }
+        else if op == "Sub" { result = _binary(a, _input(node, values, 1), fn(x, y) { return x - y; }); }
+        else if op == "Mul" { result = _binary(a, _input(node, values, 1), fn(x, y) { return x * y; }); }
+        else if op == "Div" { result = _binary(a, _input(node, values, 1), fn(x, y) { if y == 0 { _fail("division by zero"); } return x / y; }); }
+        else if op == "MatMul" { result = _matmul(a, _input(node, values, 1), budget); }
+        else if op == "Gemm" {
+            let b = _input(node, values, 1); if (try node.attrs.transA catch 0) != 0 { a = _transpose2(a); } if (try node.attrs.transB catch 0) != 0 { b = _transpose2(b); }
+            result = _matmul(a, b, budget); result = _unary(result, fn(x) { return x * (try node.attrs.alpha catch 1.0); });
+            if len(node.inputs) > 2 and node.inputs[2] != "" { let c = _unary(_input(node, values, 2), fn(x) { return x * (try node.attrs.beta catch 1.0); }); result = _binary(result, c, fn(x, y) { return x + y; }); }
+        }
+        else if op == "Softmax" { result = _softmax(a, try node.attrs.axis catch nil); }
+        else if op == "Reshape" { result = _reshape(a, _input(node, values, 1), (try node.attrs.allowzero catch 0) != 0); }
+        else if op == "Flatten" { let axis = _axis(try node.attrs.axis catch 1, len(a.shape) + 1, 1); let left = 1; for i axis { left = left * a.shape[i]; } result = _tensor([left, len(a.data) / left], a.data, a.dtype); }
+        else if op == "Transpose" { result = _transpose(a, try node.attrs.perm catch nil); }
+        else if op == "Concat" { let all = []; for i len(node.inputs) { all[i] = _input(node, values, i); } result = _concat(all, try node.attrs.axis catch nil); }
+    }
+    if result == nil { _fail("operator did not produce a tensor: " + op); }
+    if len(node.outputs) != 1 { _fail(op + " currently requires exactly one output"); }
+    budget.ops = budget.ops + len(result.data); if budget.ops > budget.max_ops { _fail("operation budget exceeded"); }
+    values[node.outputs[0]] = result;
+}
+
+fn run(model, inputs, options = nil) {
+    if type(model) != "map" { _fail("decoded model is required"); }
+    let model_format = try model.format catch "";
+    if model_format != "pblang.onnx.model.v1" { _fail("decoded model is required"); }
+    if type(inputs) != "map" { _fail("inputs must be a name-to-tensor object"); }
+    if options == nil { options = map{}; }
+    let max_ops = _integer(try options.max_operations catch MAX_OPERATIONS, 1, MAX_OPERATIONS, "max_operations");
+    let graph = model.graph; let values = map{}; let initializer_names = map_keys(graph.initializers);
+    for i len(initializer_names) { values[initializer_names[i]] = graph.initializers[initializer_names[i]]; }
+    let expected = map{};
+    for i len(graph.inputs) { expected[graph.inputs[i].name] = graph.inputs[i]; }
+    let supplied = map_keys(inputs);
+    for i len(supplied) { if not map_has(expected, supplied[i]) or map_has(graph.initializers, supplied[i]) { _fail("unexpected input: " + supplied[i]); } }
+    for i len(graph.inputs) {
+        let info = graph.inputs[i]; if map_has(graph.initializers, info.name) { continue; }
+        if not map_has(inputs, info.name) { _fail("required input is missing: " + info.name); }
+        let raw = inputs[info.name]; let shape: any = nil; let data: any = nil;
+        if type(raw) == "array" { data = raw; shape = try info.type.shape catch nil; if shape == nil { _fail("input " + info.name + " needs an explicit shape"); } }
+        else if type(raw) == "map" { data = try raw.data catch nil; shape = try raw.shape catch try info.type.shape catch nil; }
+        else { _fail("input " + info.name + " must be an array or tensor object"); }
+        let tensor = _tensor(shape, data);
+        let declared = try info.type.shape catch nil; if declared != nil and not _same_shape(declared, tensor.shape) { _fail("input shape does not match model declaration: " + info.name); }
+        values[info.name] = tensor;
+    }
+    let budget = map{ ops: 0, max_ops: max_ops };
+    for i len(graph.nodes) { _execute_node(graph.nodes[i], values, budget); if len(map_keys(values)) > MAX_TENSORS { _fail("runtime tensor limit exceeded"); } }
+    let outputs = map{}; let output_tensors = map{};
+    for i len(graph.outputs) {
+        let name = graph.outputs[i].name; if not map_has(values, name) { _fail("declared output was not produced: " + name); }
+        outputs[name] = values[name].data; output_tensors[name] = values[name];
+    }
+    return map{ format: "pblang.onnx.inference.v1", ok: true, outputs: outputs, tensors: output_tensors,
+                nodes_executed: len(graph.nodes), operations: budget.ops, deterministic: true,
+                backend: "pblang-cpu", supported_ops: SUPPORTED_OPS };
+}
+
+fn infer(bytes, inputs, options = nil) { return run(decode(bytes), inputs, options); }
+
+export MAX_MODEL_BYTES, MAX_NODES, MAX_TENSORS, MAX_ELEMENTS, MAX_OPERATIONS, SUPPORTED_OPS,
+       decode, run, infer;

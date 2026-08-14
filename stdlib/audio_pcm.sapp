@@ -1,0 +1,225 @@
+// Bounded PCM16/WAV processing primitives implemented in PBLang.
+
+let FORMAT = "pblang.audio-pcm16.v1";
+let MAX_INPUT_BYTES = 4194304;
+let MAX_SAMPLES = 1048576;
+
+fn _u16(bytes, offset) { return bytes[offset] + bytes[offset + 1] * 256; }
+fn _u32(bytes, offset) {
+    return bytes[offset] + bytes[offset + 1] * 256 + bytes[offset + 2] * 65536
+        + bytes[offset + 3] * 16777216;
+}
+fn _push_u16(out, value) {
+    array_push(out, num_mod(value, 256)); array_push(out, num_mod(num_floor(value / 256), 256));
+}
+fn _push_u32(out, value) {
+    _push_u16(out, num_mod(value, 65536)); _push_u16(out, num_floor(value / 65536));
+}
+fn _append(out, values) { for i len(values) { array_push(out, values[i]); } }
+fn _tag(bytes, offset) { return bytes_to_str(slice(bytes, offset, offset + 4)); }
+fn _sample(value) {
+    value = num_floor(value);
+    if value < -32768 { return -32768; }
+    if value > 32767 { return 32767; }
+    return value;
+}
+
+fn validate(audio) {
+    if type(audio) != "map" or type(audio.samples) != "array"
+       or type(audio.sample_rate) != "number" or audio.sample_rate != num_floor(audio.sample_rate)
+       or audio.sample_rate < 8000 or audio.sample_rate > 384000
+       or type(audio.channels) != "number" or audio.channels != num_floor(audio.channels)
+       or audio.channels < 1 or audio.channels > 8 or len(audio.samples) > MAX_SAMPLES
+       or num_mod(len(audio.samples), audio.channels) != 0 {
+        throw "audio_pcm: malformed or oversized PCM16 audio";
+    }
+    for i len(audio.samples) {
+        if type(audio.samples[i]) != "number" or audio.samples[i] != num_floor(audio.samples[i])
+           or audio.samples[i] < -32768 or audio.samples[i] > 32767 {
+            throw "audio_pcm: sample is outside signed PCM16";
+        }
+    }
+    return map{ frames: len(audio.samples) / audio.channels,
+        duration_secs: len(audio.samples) / (audio.channels * audio.sample_rate) };
+}
+
+fn decode_wav(bytes) {
+    if type(bytes) != "array" or len(bytes) < 44 or len(bytes) > MAX_INPUT_BYTES
+       or _tag(bytes, 0) != "RIFF" or _tag(bytes, 8) != "WAVE" {
+        throw "audio_pcm: input is not a bounded RIFF/WAVE file";
+    }
+    let offset = 12; let channels = 0; let sample_rate = 0; let bits = 0;
+    let encoding = 0; let data_offset = -1; let data_size = 0; let chunks = 0;
+    while offset + 8 <= len(bytes) and chunks < 128 {
+        let kind = _tag(bytes, offset); let size = _u32(bytes, offset + 4);
+        let start = offset + 8; let finish = start + size;
+        if size < 0 or finish > len(bytes) { throw "audio_pcm: truncated WAV chunk"; }
+        if kind == "fmt " {
+            if size < 16 { throw "audio_pcm: short WAV format chunk"; }
+            encoding = _u16(bytes, start); channels = _u16(bytes, start + 2);
+            sample_rate = _u32(bytes, start + 4); bits = _u16(bytes, start + 14);
+        } elif kind == "data" and data_offset < 0 {
+            data_offset = start; data_size = size;
+        }
+        offset = finish + num_mod(size, 2); chunks = chunks + 1;
+    }
+    if encoding != 1 or bits != 16 or channels < 1 or channels > 8
+       or sample_rate < 8000 or sample_rate > 384000 or data_offset < 0
+       or num_mod(data_size, channels * 2) != 0 or data_size / 2 > MAX_SAMPLES {
+        throw "audio_pcm: only bounded interleaved PCM16 WAV is accepted";
+    }
+    let samples = []; let at = data_offset;
+    while at < data_offset + data_size {
+        let value = _u16(bytes, at); if value >= 32768 { value = value - 65536; }
+        array_push(samples, value); at = at + 2;
+    }
+    let audio = map{ format: FORMAT, sample_rate: sample_rate, channels: channels, samples: samples };
+    let info = validate(audio); audio.frames = info.frames; audio.duration_secs = info.duration_secs;
+    return audio;
+}
+
+fn encode_wav(audio) {
+    validate(audio); let data_size = len(audio.samples) * 2; let out = [];
+    _append(out, str_to_bytes("RIFF")); _push_u32(out, 36 + data_size);
+    _append(out, str_to_bytes("WAVEfmt ")); _push_u32(out, 16); _push_u16(out, 1);
+    _push_u16(out, audio.channels); _push_u32(out, audio.sample_rate);
+    _push_u32(out, audio.sample_rate * audio.channels * 2);
+    _push_u16(out, audio.channels * 2); _push_u16(out, 16);
+    _append(out, str_to_bytes("data")); _push_u32(out, data_size);
+    for i len(audio.samples) {
+        let value = _sample(audio.samples[i]); if value < 0 { value = value + 65536; }
+        _push_u16(out, value);
+    }
+    return out;
+}
+
+fn compatible(a, b) {
+    validate(a); validate(b);
+    return a.sample_rate == b.sample_rate and a.channels == b.channels;
+}
+
+fn _frame_at(seconds, sample_rate) {
+    // Decimal timestamps such as 0.075 may land just below an integral frame
+    // in binary floating point. A tiny fixed tolerance prevents dropping the
+    // boundary frame without rounding genuinely fractional positions upward.
+    return num_floor(seconds * sample_rate + 0.000000001);
+}
+
+fn segment(audio, start_secs, duration_secs) {
+    let info = validate(audio);
+    if type(start_secs) != "number" or start_secs < 0 or type(duration_secs) != "number"
+       or duration_secs <= 0 { throw "audio_pcm: invalid segment range"; }
+    let first = num_min(info.frames, _frame_at(start_secs, audio.sample_rate));
+    let last = num_min(info.frames, _frame_at(start_secs + duration_secs, audio.sample_rate));
+    return map{ format: FORMAT, sample_rate: audio.sample_rate, channels: audio.channels,
+        samples: slice(audio.samples, first * audio.channels, last * audio.channels) };
+}
+
+fn volume(audio, multiplier) {
+    validate(audio);
+    if type(multiplier) != "number" or multiplier != multiplier or multiplier < 0 or multiplier > 16 {
+        throw "audio_pcm: volume must be finite in 0..16";
+    }
+    let out = [];
+    for i len(audio.samples) { array_push(out, _sample(audio.samples[i] * multiplier)); }
+    return map{ format: FORMAT, sample_rate: audio.sample_rate, channels: audio.channels, samples: out };
+}
+
+fn reverse(audio) {
+    let info = validate(audio); let out = [];
+    let frame = info.frames - 1;
+    while frame >= 0 {
+        for channel audio.channels { array_push(out, audio.samples[frame * audio.channels + channel]); }
+        frame = frame - 1;
+    }
+    return map{ format: FORMAT, sample_rate: audio.sample_rate, channels: audio.channels, samples: out };
+}
+
+fn speed(audio, multiplier) {
+    let info = validate(audio);
+    if type(multiplier) != "number" or multiplier != multiplier or multiplier < 0.125 or multiplier > 8 {
+        throw "audio_pcm: speed must be finite in 0.125..8";
+    }
+    let frames = num_max(1, num_floor(info.frames / multiplier)); let out = [];
+    for target frames {
+        let source = num_min(info.frames - 1, num_floor(target * multiplier));
+        for channel audio.channels { array_push(out, audio.samples[source * audio.channels + channel]); }
+    }
+    return map{ format: FORMAT, sample_rate: audio.sample_rate, channels: audio.channels, samples: out };
+}
+
+fn normalize(audio, target_db) {
+    validate(audio);
+    if type(target_db) != "number" or target_db != target_db or target_db < -60 or target_db > -0.1 {
+        throw "audio_pcm: target_db must be finite in -60..-0.1";
+    }
+    let peak = 0; for i len(audio.samples) { peak = num_max(peak, num_abs(audio.samples[i])); }
+    if peak == 0 { return audio; }
+    let target = 32767 * num_pow(10, target_db / 20.0);
+    return volume(audio, num_min(16, target / peak));
+}
+
+fn merge(items) {
+    if type(items) != "array" or len(items) < 2 or len(items) > 32 { throw "audio_pcm: merge needs 2..32 inputs"; }
+    let first = items[0]; validate(first); let out = [];
+    for i len(items) {
+        if not compatible(first, items[i]) { throw "audio_pcm: merge formats are incompatible"; }
+        if len(out) + len(items[i].samples) > MAX_SAMPLES { throw "audio_pcm: merged output exceeds sample limit"; }
+        _append(out, items[i].samples);
+    }
+    return map{ format: FORMAT, sample_rate: first.sample_rate, channels: first.channels, samples: out };
+}
+
+fn mix(a, b, volume_a = 1.0, volume_b = 1.0) {
+    if not compatible(a, b) { throw "audio_pcm: mix formats are incompatible"; }
+    if volume_a < 0 or volume_a > 16 or volume_b < 0 or volume_b > 16 { throw "audio_pcm: mix volume exceeds 0..16"; }
+    let count = num_max(len(a.samples), len(b.samples)); if count > MAX_SAMPLES { throw "audio_pcm: mixed output exceeds sample limit"; }
+    let out = [];
+    for i count {
+        let av = if i < len(a.samples) { a.samples[i] * volume_a } else { 0 };
+        let bv = if i < len(b.samples) { b.samples[i] * volume_b } else { 0 };
+        array_push(out, _sample(av + bv));
+    }
+    return map{ format: FORMAT, sample_rate: a.sample_rate, channels: a.channels, samples: out };
+}
+
+fn waveform(audio, points = 80) {
+    let info = validate(audio);
+    if type(points) != "number" or points != num_floor(points) or points < 1 or points > 500 { throw "audio_pcm: points must be 1..500"; }
+    points = num_min(points, num_max(1, info.frames)); let values = [];
+    for point points {
+        let first = num_floor(point * info.frames / points);
+        let last = num_max(first + 1, num_floor((point + 1) * info.frames / points));
+        let peak = 0; let frame = first;
+        while frame < last { for channel audio.channels {
+            peak = num_max(peak, num_abs(audio.samples[frame * audio.channels + channel]));
+        } frame = frame + 1; }
+        array_push(values, peak / 32768.0);
+    }
+    return map{ samples: values, sample_count: len(values), duration_secs: info.duration_secs };
+}
+
+fn silence_regions(pcm_audio, min_duration, threshold_db) {
+    let info = validate(pcm_audio);
+    if min_duration < 0 or min_duration > 3600 or threshold_db < -120 or threshold_db > 0 {
+        throw "audio_pcm: silence parameters exceed bounds";
+    }
+    let threshold = 32768 * num_pow(10, threshold_db / 20.0);
+    let minimum = num_floor(min_duration * pcm_audio.sample_rate); let regions = [];
+    let start = -1;
+    for frame info.frames {
+        let peak = 0; for channel pcm_audio.channels { peak = num_max(peak, num_abs(pcm_audio.samples[frame * pcm_audio.channels + channel])); }
+        if peak <= threshold and start < 0 { start = frame; }
+        if peak > threshold and start >= 0 {
+            if frame - start >= minimum { array_push(regions, map{ start_secs: start / pcm_audio.sample_rate, end_secs: frame / pcm_audio.sample_rate, duration_secs: (frame - start) / pcm_audio.sample_rate }); }
+            start = -1;
+        }
+    }
+    if start >= 0 and info.frames - start >= minimum { array_push(regions, map{ start_secs: start / pcm_audio.sample_rate, end_secs: info.frames / pcm_audio.sample_rate, duration_secs: (info.frames - start) / pcm_audio.sample_rate }); }
+    return map{ regions: regions, region_count: len(regions), threshold_db: threshold_db,
+        min_duration: min_duration, duration_secs: info.duration_secs };
+}
+
+export FORMAT, MAX_INPUT_BYTES, MAX_SAMPLES, validate, decode_wav, encode_wav,
+       compatible, segment, volume, reverse, speed, normalize, merge, mix,
+       waveform, silence_regions;

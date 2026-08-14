@@ -14,8 +14,13 @@ let ELF_HEADER_BYTES = 120;
 let MAX_PATH_BYTES = 4096;
 let MAX_SECONDS = 10800;
 let MAX_OUTPUT_BYTES = 67108864;
+let MIN_MEMORY_BYTES = 33554432;
+let MAX_MEMORY_BYTES = 68719476736;
 let MAX_WRITE_BYTES = 4096;
 let MAX_PROCESS_GROUP_ID = 4194304;
+let MAX_EXEC_ARGS = 64;
+let MAX_EXEC_ARG_BYTES = 4096;
+let MAX_EXEC_TOTAL_BYTES = 32768;
 
 fn _append(dst, src) {
     let i = 0; while i < len(src) { array_push(dst, src[i]); i = i + 1; }
@@ -61,6 +66,140 @@ fn _positive_integer(value, label, maximum) {
     return value;
 }
 
+fn _exec_string(value, label) {
+    if type(value) != "string" or len(str_to_bytes(value)) > MAX_EXEC_ARG_BYTES
+       or str_contains(value, "\x00") {
+        throw "linux_pty_supervisor: invalid " + label;
+    }
+    if value == "" { return [0]; }
+    return _cstring_any(value, label);
+}
+
+fn _environment_name(value) {
+    if type(value) != "string" or value == "" or len(value) > 128 {
+        throw "linux_pty_supervisor: invalid environment name";
+    }
+    for i len(value) {
+        let c = strcharcodeat(value, i);
+        let alpha = (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95;
+        let digit = c >= 48 and c <= 57;
+        if not alpha and (i == 0 or not digit) {
+            throw "linux_pty_supervisor: invalid environment name";
+        }
+    }
+    return value;
+}
+
+// Emit a static argv/environment trampoline. Caller-controlled values become
+// separate execve entries and are never parsed by a shell or reconstructed as text.
+fn _build_argv_exec(program, args, inherit_environment, cwd_fd, stdin_fd, environment) {
+    if type(program) != "string" or not str_starts_with(program, "/") {
+        throw "linux_pty_supervisor: program must be an absolute path";
+    }
+    if type(args) != "array" or len(args) > MAX_EXEC_ARGS {
+        throw "linux_pty_supervisor: args must contain at most 64 strings";
+    }
+    let raw = [_exec_string(program, "program")]; let total = len(str_to_bytes(program));
+    let i = 0;
+    while i < len(args) {
+        let encoded = _exec_string(args[i], "argument");
+        total = total + len(encoded) - 1;
+        if total > MAX_EXEC_TOTAL_BYTES {
+            throw "linux_pty_supervisor: argv exceeds 32768 UTF-8 bytes";
+        }
+        array_push(raw, encoded); i = i + 1;
+    }
+    let argv_count = len(raw);
+    if environment == nil { environment = map{}; }
+    if type(environment) != "map" or len(map_keys(environment)) > 32 {
+        throw "linux_pty_supervisor: environment must contain at most 32 entries";
+    }
+    let names = array_sort(map_keys(environment));
+    if inherit_environment and len(names) > 0 {
+        throw "linux_pty_supervisor: explicit and inherited environment are mutually exclusive";
+    }
+    for j len(names) {
+        let name = _environment_name(names[j]); let value = environment[name];
+        if type(value) != "string" { throw "linux_pty_supervisor: environment values must be strings"; }
+        let encoded = _exec_string(name + "=" + value, "environment value");
+        total = total + len(encoded) - 1;
+        if total > MAX_EXEC_TOTAL_BYTES {
+            throw "linux_pty_supervisor: argv and environment exceed 32768 UTF-8 bytes";
+        }
+        array_push(raw, encoded);
+    }
+    if type(cwd_fd) != "number" or cwd_fd != num_floor(cwd_fd) or cwd_fd < -1
+       or cwd_fd > MAX_PROCESS_GROUP_ID {
+        throw "linux_pty_supervisor: cwd_fd must be -1 or a valid descriptor";
+    }
+    if type(stdin_fd) != "number" or stdin_fd != num_floor(stdin_fd) or stdin_fd < -1
+       or stdin_fd > MAX_PROCESS_GROUP_ID {
+        throw "linux_pty_supervisor: stdin_fd must be -1 or a valid descriptor";
+    }
+    let probe = map{ program: 0, argv: 0, envp: 0,
+        inherit_environment: inherit_environment, cwd_fd: cwd_fd, stdin_fd: stdin_fd };
+    fn emit(layout) {
+        let code = [];
+        // Recover envp from the initial Linux process stack before execve.
+        _append(code, [0x49, 0x89, 0xE4, 0x4D, 0x8B, 0x2C, 0x24]);
+        _append(code, [0x4F, 0x8D, 0x74, 0xEC, 0x10]);
+        if layout.cwd_fd >= 0 {
+            _append(code, X.mov_imm32("rax", 81));
+            _append(code, X.mov_imm32("rdi", layout.cwd_fd));
+            _append(code, X.syscall());
+            _append(code, [0x48, 0x85, 0xC0]);
+            let cwd_ok = []; _branch(code, [0x0F, 0x89], cwd_ok);
+            _append(code, X.mov_imm32("rax", 60));
+            _append(code, X.mov_imm32("rdi", 125));
+            _append(code, X.syscall());
+            _set_rel32(code, cwd_ok[0], len(code));
+        }
+        if layout.stdin_fd >= 0 {
+            _append(code, X.mov_imm32("rax", 33));
+            _append(code, X.mov_imm32("rdi", layout.stdin_fd));
+            _append(code, X.mov_imm32("rsi", 0));
+            _append(code, X.syscall());
+            _append(code, [0x48, 0x85, 0xC0]);
+            let stdin_ok = []; _branch(code, [0x0F, 0x89], stdin_ok);
+            _append(code, X.mov_imm32("rax", 60));
+            _append(code, X.mov_imm32("rdi", 125));
+            _append(code, X.syscall());
+            _set_rel32(code, stdin_ok[0], len(code));
+        }
+        _append(code, X.mov_imm32("rax", 59));
+        _append(code, X.movabs_imm64("rdi", layout.program));
+        _append(code, X.movabs_imm64("rsi", layout.argv));
+        if layout.inherit_environment { _append(code, [0x4C, 0x89, 0xF2]); }
+        else { _append(code, X.movabs_imm64("rdx", layout.envp)); }
+        _append(code, X.syscall());
+        _append(code, X.mov_imm32("rax", 60));
+        _append(code, X.mov_imm32("rdi", 126));
+        _append(code, X.syscall());
+        return code;
+    }
+    let code_len = len(emit(probe)); let cursor = LOAD_BASE + ELF_HEADER_BYTES + code_len;
+    let addresses = []; i = 0;
+    while i < len(raw) { array_push(addresses, cursor); cursor = cursor + len(raw[i]); i = i + 1; }
+    let argv_address = cursor; let envp_address = argv_address + (argv_count + 1) * 8;
+    let code = emit(map{ program: addresses[0], argv: argv_address, envp: envp_address,
+        inherit_environment: inherit_environment, cwd_fd: cwd_fd, stdin_fd: stdin_fd });
+    let data = []; i = 0;
+    while i < len(raw) { _append(data, raw[i]); i = i + 1; }
+    i = 0; while i < argv_count { _append(data, X.le64(addresses[i])); i = i + 1; }
+    _append(data, X.le64(0));
+    i = argv_count; while i < len(addresses) { _append(data, X.le64(addresses[i])); i = i + 1; }
+    _append(data, X.le64(0));
+    return X.elf64_exec_rx(code, data);
+}
+
+fn build_argv_exec(program, args, inherit_environment, cwd_fd, stdin_fd) {
+    return _build_argv_exec(program, args, inherit_environment, cwd_fd, stdin_fd, map{});
+}
+
+fn build_argv_exec_env(program, args, environment, cwd_fd, stdin_fd) {
+    return _build_argv_exec(program, args, false, cwd_fd, stdin_fd, environment);
+}
+
 fn _set_rel32(code, pos, target) {
     let delta = target - (pos + 4);
     if delta < -2147483648 or delta > 2147483647 { throw "linux_pty_supervisor: branch exceeds rel32"; }
@@ -104,14 +243,25 @@ fn _code(layout) {
     _check_nonnegative(code, errors); _append(code, [0x4C, 0x39, 0xF8]);
     _branch(code, [0x0F, 0x85], errors);
 
-    // Allocate writable stack state. RLIMIT_FSIZE bounds the transcript even
-    // when the client stops polling it.
+    // Allocate writable stack state. RLIMIT_FSIZE is an independent hard cap
+    // for child-created regular files. It must not reuse the smaller retained
+    // stdout/stderr budget because bounded compilers legitimately create
+    // artifacts larger than their logs. An optional RLIMIT_AS is installed
+    // before fork, so the entire descendant process tree inherits one kernel-
+    // enforced virtual-memory ceiling instead of relying on parent sampling.
     _append(code, [0x48, 0x83, 0xEC, 0x30]);
-    _append(code, [0x48, 0xC7, 0x04, 0x24]); _append(code, X.le32(layout.max_output));
-    _append(code, [0x48, 0xC7, 0x44, 0x24, 0x08]); _append(code, X.le32(layout.max_output));
+    _append(code, [0x48, 0xC7, 0x04, 0x24]); _append(code, X.le32(layout.max_file));
+    _append(code, [0x48, 0xC7, 0x44, 0x24, 0x08]); _append(code, X.le32(layout.max_file));
     _append(code, X.mov_imm32("rax", 160)); _append(code, X.mov_imm32("rdi", 1));
     _append(code, [0x48, 0x89, 0xE6]); _append(code, X.syscall());
     _check_nonnegative(code, errors);
+    if layout.max_memory > 0 {
+        _append(code, X.movabs_imm64("rax", layout.max_memory));
+        _append(code, [0x48, 0x89, 0x04, 0x24, 0x48, 0x89, 0x44, 0x24, 0x08]);
+        _append(code, X.mov_imm32("rax", 160)); _append(code, X.mov_imm32("rdi", 9));
+        _append(code, [0x48, 0x89, 0xE6]); _append(code, X.syscall());
+        _check_nonnegative(code, errors);
+    }
 
     // Open the private FIFO read/write so short-lived writers do not produce
     // EOF between input frames. O_NOFOLLOW refuses a substituted symlink.
@@ -135,13 +285,22 @@ fn _code(layout) {
     else { _append(code, [0x45, 0x31, 0xD2]); }
     _append(code, X.syscall()); _check_nonnegative(code, errors);
     _append(code, [0x48, 0x89, 0xC3]);
-    let fd = 1;
-    while fd <= 2 {
+    _append(code, X.mov_imm32("rax", 33)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.mov_imm32("rsi", 1)); _append(code, X.syscall()); _check_nonnegative(code, errors);
+    if not layout.split_output {
         _append(code, X.mov_imm32("rax", 33)); _append(code, [0x48, 0x89, 0xDF]);
-        _append(code, X.mov_imm32("rsi", fd)); _append(code, X.syscall()); _check_nonnegative(code, errors);
-        fd = fd + 1;
+        _append(code, X.mov_imm32("rsi", 2)); _append(code, X.syscall()); _check_nonnegative(code, errors);
     }
     _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xDF]); _append(code, X.syscall());
+    if layout.split_output {
+        _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+        _append(code, X.movabs_imm64("rsi", layout.stderr_output));
+        _append(code, X.mov_imm32("rdx", 131649)); _append(code, [0x41, 0xBA]); _append(code, X.le32(384));
+        _append(code, X.syscall()); _check_nonnegative(code, errors); _append(code, [0x48, 0x89, 0xC3]);
+        _append(code, X.mov_imm32("rax", 33)); _append(code, [0x48, 0x89, 0xDF]);
+        _append(code, X.mov_imm32("rsi", 2)); _append(code, X.syscall()); _check_nonnegative(code, errors);
+        _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xDF]); _append(code, X.syscall());
+    }
 
     // Publish a fixed-width decimal process-group id atomically after the FIFO
     // is ready. The final path appears only after all bytes are written.
@@ -210,16 +369,33 @@ fn build(options) {
     let pid = _cstring(try options.pid_file catch nil, "pid path");
     let status = _cstring(try options.status_file catch nil, "status path");
     let output = _cstring(try options.output catch nil, "output path");
+    let split_output = map_has(options, "stderr_output");
+    let stderr_output = if split_output {
+        _cstring(options.stderr_output, "stderr output path")
+    } else { output };
     let shell = _cstring(try options.shell catch "/bin/sh", "shell path");
-    let command_mode = map_has(options, "command");
-    let command = if command_mode {
-        _command(options.command)
-    } else { shell };
+    if map_has(options, "argv_exec") and map_has(options, "command") {
+        throw "linux_pty_supervisor: provide argv_exec or command, not both";
+    }
+    let command_mode = map_has(options, "argv_exec") or map_has(options, "command");
+    let command = shell;
+    if map_has(options, "argv_exec") { command = _cstring(options.argv_exec, "argv trampoline"); }
+    elif map_has(options, "command") { command = _command(options.command); }
     let script = _cstring(try options.script catch "/usr/bin/script", "script path");
     let timeout = _cstring(try options.timeout catch "/usr/bin/timeout", "timeout path");
     let seconds = _positive_integer(try options.max_seconds catch 60, "max_seconds", MAX_SECONDS);
     let max_output = _positive_integer(try options.max_output_bytes catch 65536,
         "max_output_bytes", MAX_OUTPUT_BYTES);
+    let max_file = _positive_integer(try options.max_file_bytes catch MAX_OUTPUT_BYTES,
+        "max_file_bytes", MAX_OUTPUT_BYTES);
+    let max_memory = 0;
+    if map_has(options, "max_memory_bytes") {
+        max_memory = _positive_integer(options.max_memory_bytes,
+            "max_memory_bytes", MAX_MEMORY_BYTES);
+        if max_memory < MIN_MEMORY_BYTES {
+            throw "linux_pty_supervisor: max_memory_bytes must be at least 33554432";
+        }
+    }
     let duration = str_to_bytes(str(seconds) + "s"); array_push(duration, 0);
     let pid_stage = _cstring((try options.pid_file catch nil) + ".pending", "pid staging path");
     let status_stage = _cstring((try options.status_file catch nil) + ".pending", "status staging path");
@@ -228,10 +404,11 @@ fn build(options) {
         _cstring_any("--signal=TERM", "timeout option"), _cstring_any("--kill-after=1s", "timeout option"),
         duration, script, _cstring_any("-q", "script option"), _cstring_any("-f", "script option"),
         _cstring_any("-e", "script option"), _cstring_any("-c", "script option"), command, output,
-        _cstring("/bin/sh", "command shell"), _cstring_any("-c", "command shell option")];
+        _cstring("/bin/sh", "command shell"), _cstring_any("-c", "command shell option"), stderr_output];
     let probe = map{ fifo: 0, pid: 0, status: 0, pid_stage: 0, status_stage: 0,
-        devnull: 0, output: 0, timeout: 0, argv: 0,
-        max_output: max_output, command_mode: command_mode };
+        devnull: 0, output: 0, stderr_output: 0, timeout: 0, argv: 0,
+        max_output: max_output, max_file: max_file, max_memory: max_memory,
+        command_mode: command_mode, split_output: split_output };
     let code_len = len(_code(probe));
     let cursor = LOAD_BASE + ELF_HEADER_BYTES + code_len; let addresses = [];
     let i = 0;
@@ -239,15 +416,17 @@ fn build(options) {
     let argv_address = cursor;
     let layout = map{ fifo: addresses[0], pid: addresses[1], status: addresses[2],
         pid_stage: addresses[3], status_stage: addresses[4], devnull: addresses[5],
-        output: addresses[18], timeout: addresses[6], argv: argv_address,
-        max_output: max_output, command_mode: command_mode };
+        output: addresses[18], stderr_output: addresses[21], timeout: addresses[6], argv: argv_address,
+        max_output: max_output, max_file: max_file, max_memory: max_memory,
+        command_mode: command_mode, split_output: split_output };
     let code = _code(layout); let data = [];
     i = 0; while i < len(raw) { _append(data, raw[i]); i = i + 1; }
     // timeout argv: options, duration, script command, script options, shell,
     // transcript, null terminator.
-    let argv_indices = if command_mode {
-        [7, 8, 9, 10, 11, 19, 20, 17]
-    } else { [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] };
+    let argv_indices = [];
+    if map_has(options, "argv_exec") { argv_indices = [7, 8, 9, 10, 11, 17]; }
+    elif map_has(options, "command") { argv_indices = [7, 8, 9, 10, 11, 19, 20, 17]; }
+    else { argv_indices = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]; }
     i = 0; while i < len(argv_indices) { _append(data, X.le64(addresses[argv_indices[i]])); i = i + 1; }
     _append(data, X.le64(0));
     return X.elf64_exec_rx(code, data);
@@ -332,5 +511,28 @@ fn build_group_signal(process_group_id, signal_name) {
     return X.elf64_exec_rx(code, []);
 }
 
-export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MAX_WRITE_BYTES,
-    MAX_PROCESS_GROUP_ID, build, build_writer, build_group_signal;
+// Exit zero only while at least one member of the validated process group
+// exists. EPERM also means the group exists; the generated helper exits one in
+// that case because PBRemote owns every group it probes under the same uid.
+fn build_group_probe(process_group_id) {
+    let pgid = _positive_integer(process_group_id, "process_group_id",
+        MAX_PROCESS_GROUP_ID);
+    if pgid <= 1 {
+        throw "linux_pty_supervisor: process_group_id must be greater than one";
+    }
+    let code = [];
+    _append(code, X.mov_imm32("rax", 62));
+    _append(code, X.mov_imm32("rdi", 0 - pgid));
+    _append(code, X.mov_imm32("rsi", 0));
+    _append(code, X.syscall());
+    _append(code, [0x48, 0x85, 0xC0]);
+    let missing = []; _branch(code, [0x0F, 0x88], missing);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 0)); _append(code, X.syscall());
+    let failed = len(code); _set_rel32(code, missing[0], failed);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 1)); _append(code, X.syscall());
+    return X.elf64_exec_rx(code, []);
+}
+
+export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MIN_MEMORY_BYTES, MAX_MEMORY_BYTES, MAX_WRITE_BYTES,
+    MAX_PROCESS_GROUP_ID, MAX_EXEC_ARGS, MAX_EXEC_ARG_BYTES, MAX_EXEC_TOTAL_BYTES,
+    build, build_argv_exec, build_argv_exec_env, build_writer, build_group_signal, build_group_probe;

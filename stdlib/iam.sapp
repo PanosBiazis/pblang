@@ -1,0 +1,654 @@
+// Bounded users, organizations, memberships, and role-based authorization.
+//
+// This module is storage and transport independent. Products own persistence,
+// authentication, and the trusted principal passed into these operations.
+
+let FORMAT = "pblang.iam.v1";
+let MAX_USERS = 4096;
+let MAX_ORGANIZATIONS = 1024;
+let MAX_MEMBERS_PER_ORGANIZATION = 4096;
+let MAX_CREDENTIALS = 16384;
+let MAX_CREDENTIALS_PER_USER = 16;
+let ROLES = ["owner", "admin", "member", "viewer"];
+let PERMISSIONS = ["organization.read", "organization.update", "organization.delete",
+    "members.read", "members.manage", "tools.read", "tools.execute", "audit.read"];
+
+fn _integer(value, name) {
+    if type(value) != "number" or value != num_floor(value) or
+       value < 0 or value > 9007199254740991 {
+        throw name + " must be a safe non-negative integer";
+    }
+    return value;
+}
+
+fn _id(value, name) {
+    if type(value) != "string" or not regex_match(value, "^[a-z][a-z0-9_-]{2,63}$") {
+        throw name + " must match ^[a-z][a-z0-9_-]{2,63}$";
+    }
+    return value;
+}
+
+fn _name(value, name) {
+    if type(value) != "string" { throw name + " must be a string"; }
+    let out = str_trim(value);
+    if len(out) < 1 or len(out) > 128 or str_contains(out, "\r") or
+       str_contains(out, "\n") or str_contains(out, strfromcharcode(0)) {
+        throw name + " must contain 1 to 128 single-line characters";
+    }
+    return out;
+}
+
+fn _role(value) {
+    if type(value) != "string" { throw "role must be a string"; }
+    for i len(ROLES) { if ROLES[i] == value { return value; } }
+    throw "role must be owner, admin, member, or viewer";
+}
+
+fn _state(state) {
+    if type(state) != "map" or (try state.format catch "") != FORMAT or
+       type(try state.users catch nil) != "map" or
+       type(try state.organizations catch nil) != "map" or
+       type(try state.memberships catch nil) != "map" or
+       type(try state.system_admins catch nil) != "map" {
+        throw "invalid IAM state";
+    }
+    _integer(try state.revision catch nil, "IAM revision");
+    return state;
+}
+
+fn new_state() {
+    return map{ format: FORMAT, revision: 0, users: map{},
+        organizations: map{}, memberships: map{}, system_admins: map{},
+        credentials: map{} };
+}
+
+fn _credential_id(value) {
+    if type(value) != "string" or not regex_match(value, "^key_[a-f0-9]{24}$") {
+        throw "credential_id must match ^key_[a-f0-9]{24}$";
+    }
+    return value;
+}
+
+fn _secret_digest(value) {
+    if type(value) != "string" or not regex_match(value, "^[a-f0-9]{64}$") {
+        throw "credential secret digest must be lowercase SHA-256 hex";
+    }
+    return value;
+}
+
+fn _credentials(state) {
+    _state(state);
+    if not map_has(state, "credentials") { state.credentials = map{}; }
+    if type(state.credentials) != "map" { throw "invalid IAM credential index"; }
+    return state.credentials;
+}
+
+fn issue_credential(state, principal, organization_id, credential_id, label, secret_sha256, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    credential_id = _credential_id(credential_id);
+    label = _name(label, "credential label");
+    secret_sha256 = _secret_digest(secret_sha256);
+    current_ms = _integer(current_ms, "current_ms");
+    let account = try state.users[principal] catch nil;
+    if account == nil or (try account.status catch "disabled") != "active" {
+        throw "credential owner must be an active user";
+    }
+    if role_for(state, principal, organization_id) == nil {
+        throw "credential owner must be an organization member";
+    }
+    if not is_active_organization(state, organization_id) {
+        throw "credential organization must be active";
+    }
+    let credentials = _credentials(state);
+    if map_has(credentials, credential_id) { throw "credential already exists"; }
+    if len(map_keys(credentials)) >= MAX_CREDENTIALS { throw "credential capacity reached"; }
+    let owned = 0; let ids = map_keys(credentials);
+    for i len(ids) {
+        if credentials[ids[i]].user_id == principal and credentials[ids[i]].status == "active" {
+            owned = owned + 1;
+        }
+    }
+    if owned >= MAX_CREDENTIALS_PER_USER { throw "user credential capacity reached"; }
+    credentials[credential_id] = map{ id: credential_id, user_id: principal,
+        organization_id: organization_id,
+        label: label, secret_sha256: secret_sha256, status: "active",
+        created_ms: current_ms, updated_ms: current_ms };
+    state.revision = state.revision + 1;
+    return map{ id: credential_id, user_id: principal,
+        organization_id: organization_id, label: label,
+        status: "active", created_ms: current_ms, updated_ms: current_ms };
+}
+
+fn authenticate_credential(state, credential_id, secret_sha256) {
+    _state(state);
+    credential_id = try _credential_id(credential_id) catch nil;
+    secret_sha256 = try _secret_digest(secret_sha256) catch nil;
+    if credential_id == nil or secret_sha256 == nil { return nil; }
+    let credentials = try state.credentials catch map{};
+    if type(credentials) != "map" { return nil; }
+    let row = try credentials[credential_id] catch nil;
+    if not constant_time_eq(secret_sha256,
+        if type(row) == "map" { try row.secret_sha256 catch str_repeat("0", 64) }
+        else { str_repeat("0", 64) }) or type(row) != "map" or
+       (try row.status catch "revoked") != "active" {
+        return nil;
+    }
+    let account = try state.users[row.user_id] catch nil;
+    if account == nil or (try account.status catch "disabled") != "active" { return nil; }
+    if not is_active_organization(state, row.organization_id) or
+       role_for(state, row.user_id, row.organization_id) == nil { return nil; }
+    return map{ user_id: row.user_id, organization_id: row.organization_id,
+        credential_id: row.id };
+}
+
+fn list_credentials(state, principal) {
+    _state(state); principal = _id(principal, "principal");
+    let credentials = try state.credentials catch map{};
+    if type(credentials) != "map" { throw "invalid IAM credential index"; }
+    let ids = array_sort(map_keys(credentials)); let out = [];
+    for i len(ids) {
+        let row = credentials[ids[i]];
+        if row.user_id == principal {
+            out[len(out)] = map{ id: row.id, user_id: row.user_id,
+                organization_id: row.organization_id, label: row.label,
+                status: row.status, created_ms: row.created_ms, updated_ms: row.updated_ms };
+        }
+    }
+    return out;
+}
+
+fn revoke_credential(state, principal, credential_id, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    credential_id = _credential_id(credential_id);
+    current_ms = _integer(current_ms, "current_ms");
+    let credentials = _credentials(state);
+    let row = try credentials[credential_id] catch nil;
+    if type(row) != "map" or row.user_id != principal { throw "credential does not exist"; }
+    if row.status != "active" { throw "credential is already revoked"; }
+    row.status = "revoked"; row.updated_ms = current_ms;
+    state.revision = state.revision + 1;
+    return map{ id: row.id, user_id: row.user_id,
+        organization_id: row.organization_id, label: row.label,
+        status: row.status, created_ms: row.created_ms, updated_ms: row.updated_ms };
+}
+
+fn bootstrap_system_admin(state, user_id) {
+    _state(state); user_id = _id(user_id, "user_id");
+    if len(map_keys(state.system_admins)) != 0 { throw "system administrator is already bootstrapped"; }
+    if len(map_keys(state.users)) != 1 or not map_has(state.users, user_id) {
+        throw "first system administrator must be the only registered user";
+    }
+    state.system_admins[user_id] = true; state.revision = state.revision + 1;
+    return map{ user_id: user_id, system_admin: true };
+}
+
+fn is_system_admin(state, principal) {
+    _state(state); principal = _id(principal, "principal");
+    return (try state.system_admins[principal] catch false) and
+        (try state.users[principal].status catch "disabled") == "active";
+}
+
+fn create_user(state, user_id, display_name, current_ms = 0) {
+    _state(state); user_id = _id(user_id, "user_id");
+    display_name = _name(display_name, "display_name");
+    current_ms = _integer(current_ms, "current_ms");
+    if map_has(state.users, user_id) { throw "user already exists"; }
+    if len(map_keys(state.users)) >= MAX_USERS { throw "user capacity reached"; }
+    state.users[user_id] = map{ id: user_id, display_name: display_name,
+        status: "active", created_ms: current_ms, updated_ms: current_ms };
+    state.revision = state.revision + 1;
+    return state.users[user_id];
+}
+
+fn user(state, user_id) {
+    _state(state); user_id = _id(user_id, "user_id");
+    return try state.users[user_id] catch nil;
+}
+
+fn is_active_user(state, user_id) {
+    let account = try user(state, user_id) catch nil;
+    return type(account) == "map" and (try account.status catch "disabled") == "active";
+}
+
+fn update_user(state, principal, user_id, display_name, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    user_id = _id(user_id, "user_id");
+    display_name = _name(display_name, "display_name");
+    current_ms = _integer(current_ms, "current_ms");
+    let account = try state.users[user_id] catch nil;
+    if type(account) != "map" or (try account.status catch "disabled") != "active" {
+        throw "active user does not exist";
+    }
+    if principal != user_id and not is_system_admin(state, principal) {
+        throw "only the user or a system administrator may update the profile";
+    }
+    let changed = account.display_name != display_name;
+    if changed {
+        account.display_name = display_name; account.updated_ms = current_ms;
+        state.revision = state.revision + 1;
+    }
+    return map{ user: account, changed: changed };
+}
+
+fn organization(state, organization_id) {
+    _state(state); organization_id = _id(organization_id, "organization_id");
+    return try state.organizations[organization_id] catch nil;
+}
+
+fn role_for(state, principal, organization_id) {
+    _state(state); principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    let members = try state.memberships[organization_id] catch nil;
+    if type(members) != "map" { return nil; }
+    return try members[principal] catch nil;
+}
+
+fn is_active_organization(state, organization_id) {
+    let row = try organization(state, organization_id) catch nil;
+    return type(row) == "map" and (try row.status catch "disabled") == "active";
+}
+
+fn _permission(role, permission) {
+    let known = false;
+    for pi len(PERMISSIONS) { if PERMISSIONS[pi] == permission { known = true; } }
+    if not known { return false; }
+    if role == "owner" { return true; }
+    if role == "admin" {
+        return permission == "organization.read" or permission == "organization.update" or permission == "members.read" or
+            permission == "members.manage" or permission == "tools.read" or
+            permission == "tools.execute" or permission == "audit.read";
+    }
+    if role == "member" {
+        return permission == "organization.read" or permission == "members.read" or
+            permission == "tools.read" or permission == "tools.execute";
+    }
+    if role == "viewer" {
+        return permission == "organization.read" or permission == "members.read" or
+            permission == "tools.read";
+    }
+    return false;
+}
+
+fn can(state, principal, organization_id, permission) {
+    if type(permission) != "string" or len(permission) < 1 or len(permission) > 64 {
+        return false;
+    }
+    if not (try { _state(state); true } catch false) { return false; }
+    principal = try _id(principal, "principal") catch nil;
+    organization_id = try _id(organization_id, "organization_id") catch nil;
+    if principal == nil or organization_id == nil { return false; }
+    let organization_row = try state.organizations[organization_id] catch nil;
+    if type(organization_row) != "map" or
+       (try organization_row.status catch "disabled") != "active" { return false; }
+    let members = try state.memberships[organization_id] catch nil;
+    let role = if type(members) == "map" { try members[principal] catch nil } else { nil };
+    if role == nil { return false; }
+    let account = try state.users[principal] catch nil;
+    if account == nil or (try account.status catch "disabled") != "active" { return false; }
+    return _permission(role, permission);
+}
+
+fn _revoke_credentials(state, user_id, organization_id, current_ms) {
+    let revoked = 0;
+    let credentials = _credentials(state); let ids = map_keys(credentials);
+    for i len(ids) {
+        let row = credentials[ids[i]];
+        let user_matches = user_id == nil or row.user_id == user_id;
+        let organization_matches = organization_id == nil or row.organization_id == organization_id;
+        if user_matches and organization_matches and row.status == "active" {
+            row.status = "revoked"; row.updated_ms = current_ms; revoked = revoked + 1;
+        }
+    }
+    return revoked;
+}
+
+fn _active_system_admin_count(state) {
+    let count = 0; let ids = map_keys(state.system_admins);
+    for i len(ids) { if is_system_admin(state, ids[i]) { count = count + 1; } }
+    return count;
+}
+
+fn set_system_admin(state, principal, user_id, enabled, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    user_id = _id(user_id, "user_id"); current_ms = _integer(current_ms, "current_ms");
+    if type(enabled) != "bool" { throw "enabled must be a boolean"; }
+    if not is_system_admin(state, principal) { throw "system administrator role is required"; }
+    if not is_active_user(state, user_id) { throw "system administrator must be an active user"; }
+    let previous = try state.system_admins[user_id] catch false;
+    if not enabled and previous and _active_system_admin_count(state) <= 1 {
+        throw "the last active system administrator cannot be removed";
+    }
+    if enabled { state.system_admins[user_id] = true; }
+    elif previous { map_remove(state.system_admins, user_id); }
+    let changed = previous != enabled;
+    if changed { state.users[user_id].updated_ms = current_ms; state.revision = state.revision + 1; }
+    return map{ user_id: user_id, system_admin: enabled, changed: changed };
+}
+
+fn set_user_status(state, principal, user_id, status, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    user_id = _id(user_id, "user_id"); current_ms = _integer(current_ms, "current_ms");
+    if status != "active" and status != "disabled" { throw "status must be active or disabled"; }
+    if not is_system_admin(state, principal) { throw "system administrator role is required"; }
+    let account = try state.users[user_id] catch nil;
+    if type(account) != "map" { throw "user does not exist"; }
+    let previous = account.status;
+    if previous == status { return map{ user: account, previous_status: previous,
+        changed: false, credentials_revoked: 0 }; }
+    if status == "disabled" {
+        if (try state.system_admins[user_id] catch false) and _active_system_admin_count(state) <= 1 {
+            throw "the last active system administrator cannot be disabled";
+        }
+        let organization_ids = map_keys(state.memberships);
+        for oi len(organization_ids) {
+            let members = state.memberships[organization_ids[oi]];
+            if (try members[user_id] catch nil) == "owner" and
+               is_active_organization(state, organization_ids[oi]) and
+               _active_owner_count(state, members) <= 1 {
+                throw "a user who is the last owner of an active organization cannot be disabled";
+            }
+        }
+    }
+    let system_admin_removed = false;
+    if status == "disabled" and (try state.system_admins[user_id] catch false) {
+        map_remove(state.system_admins, user_id); system_admin_removed = true;
+    }
+    account.status = status; account.updated_ms = current_ms;
+    let revoked = if status == "disabled" { _revoke_credentials(state, user_id, nil, current_ms) } else { 0 };
+    state.revision = state.revision + 1;
+    return map{ user: account, previous_status: previous, changed: true,
+        credentials_revoked: revoked, system_admin_removed: system_admin_removed };
+}
+
+fn set_organization_status(state, principal, organization_id, status, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    current_ms = _integer(current_ms, "current_ms");
+    if status != "active" and status != "disabled" { throw "status must be active or disabled"; }
+    if not is_system_admin(state, principal) {
+        throw "system administrator role is required for organization lifecycle changes";
+    }
+    let row = try state.organizations[organization_id] catch nil;
+    if type(row) != "map" { throw "organization does not exist"; }
+    let previous = row.status;
+    if previous == status { return map{ organization: row, previous_status: previous,
+        changed: false, credentials_revoked: 0 }; }
+    if status == "active" and _active_owner_count(state, state.memberships[organization_id]) < 1 {
+        throw "an organization requires an active owner before reactivation";
+    }
+    row.status = status; row.updated_ms = current_ms;
+    let revoked = if status == "disabled" {
+        _revoke_credentials(state, nil, organization_id, current_ms)
+    } else { 0 };
+    state.revision = state.revision + 1;
+    return map{ organization: row, previous_status: previous, changed: true,
+        credentials_revoked: revoked };
+}
+
+fn require_permission(state, principal, organization_id, permission) {
+    if not can(state, principal, organization_id, permission) {
+        throw "principal is not authorized for " + permission;
+    }
+    return true;
+}
+
+fn create_organization(state, principal, organization_id, name, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    name = _name(name, "organization name"); current_ms = _integer(current_ms, "current_ms");
+    let account = try state.users[principal] catch nil;
+    if account == nil or (try account.status catch "disabled") != "active" {
+        throw "organization owner must be an active user";
+    }
+    if map_has(state.organizations, organization_id) { throw "organization already exists"; }
+    if len(map_keys(state.organizations)) >= MAX_ORGANIZATIONS {
+        throw "organization capacity reached";
+    }
+    state.organizations[organization_id] = map{ id: organization_id, name: name,
+        status: "active", created_ms: current_ms, updated_ms: current_ms };
+    let members = map{}; members[principal] = "owner";
+    state.memberships[organization_id] = members;
+    state.revision = state.revision + 1;
+    return state.organizations[organization_id];
+}
+
+fn update_organization(state, principal, organization_id, name, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    name = _name(name, "organization name");
+    current_ms = _integer(current_ms, "current_ms");
+    require_permission(state, principal, organization_id, "organization.update");
+    let organization = try state.organizations[organization_id] catch nil;
+    if type(organization) != "map" or (try organization.status catch "disabled") != "active" {
+        throw "active organization does not exist";
+    }
+    let changed = organization.name != name;
+    if changed {
+        organization.name = name; organization.updated_ms = current_ms;
+        state.revision = state.revision + 1;
+    }
+    return map{ organization: organization, changed: changed };
+}
+
+fn _owner_count(members) {
+    let count = 0; let ids = map_keys(members);
+    for i len(ids) { if members[ids[i]] == "owner" { count = count + 1; } }
+    return count;
+}
+
+fn _active_owner_count(state, members) {
+    let count = 0; let ids = map_keys(members);
+    for i len(ids) {
+        if members[ids[i]] == "owner" and is_active_user(state, ids[i]) { count = count + 1; }
+    }
+    return count;
+}
+
+fn set_member(state, principal, organization_id, user_id, role, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    user_id = _id(user_id, "user_id"); role = _role(role);
+    current_ms = _integer(current_ms, "current_ms");
+    require_permission(state, principal, organization_id, "members.manage");
+    let actor_role = role_for(state, principal, organization_id);
+    let account = try state.users[user_id] catch nil;
+    if account == nil or (try account.status catch "disabled") != "active" {
+        throw "member must be an active user";
+    }
+    let members = state.memberships[organization_id];
+    let previous = try members[user_id] catch nil;
+    if previous == nil and len(map_keys(members)) >= MAX_MEMBERS_PER_ORGANIZATION {
+        throw "organization member capacity reached";
+    }
+    if actor_role != "owner" and (role == "owner" or previous == "owner" or role == "admin") {
+        throw "only an owner may manage owner or admin roles";
+    }
+    if previous == "owner" and role != "owner" and is_active_user(state, user_id) and
+       _active_owner_count(state, members) <= 1 {
+        throw "the last organization owner cannot be demoted";
+    }
+    members[user_id] = role;
+    state.organizations[organization_id].updated_ms = current_ms;
+    state.revision = state.revision + 1;
+    return map{ organization_id: organization_id, user_id: user_id,
+        role: role, previous_role: previous, changed: previous != role };
+}
+
+fn remove_member(state, principal, organization_id, user_id, current_ms = 0) {
+    _state(state); principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    user_id = _id(user_id, "user_id"); current_ms = _integer(current_ms, "current_ms");
+    require_permission(state, principal, organization_id, "members.manage");
+    let members = state.memberships[organization_id];
+    let previous = try members[user_id] catch nil;
+    if previous == nil { throw "organization member does not exist"; }
+    let actor_role = role_for(state, principal, organization_id);
+    if previous == "owner" and actor_role != "owner" { throw "only an owner may remove an owner"; }
+    if previous == "owner" and is_active_user(state, user_id) and
+       _active_owner_count(state, members) <= 1 {
+        throw "the last organization owner cannot be removed";
+    }
+    map_remove(members, user_id);
+    let credentials = try state.credentials catch map{};
+    if type(credentials) == "map" {
+        let credential_ids = map_keys(credentials);
+        for ci len(credential_ids) {
+            let credential = credentials[credential_ids[ci]];
+            if credential.user_id == user_id and credential.organization_id == organization_id and
+               credential.status == "active" {
+                credential.status = "revoked"; credential.updated_ms = current_ms;
+            }
+        }
+    }
+    state.organizations[organization_id].updated_ms = current_ms;
+    state.revision = state.revision + 1;
+    return map{ organization_id: organization_id, user_id: user_id,
+        previous_role: previous, removed: true };
+}
+
+fn list_users(state) {
+    _state(state); let ids = array_sort(map_keys(state.users)); let out = [];
+    for i len(ids) { out[len(out)] = state.users[ids[i]]; }
+    return out;
+}
+
+fn list_organizations(state, principal) {
+    _state(state); principal = _id(principal, "principal");
+    let ids = array_sort(map_keys(state.organizations)); let out = [];
+    for i len(ids) {
+        let role = role_for(state, principal, ids[i]);
+        if role != nil {
+            out[len(out)] = map{ organization: state.organizations[ids[i]], role: role };
+        }
+    }
+    return out;
+}
+
+fn list_members(state, principal, organization_id) {
+    require_permission(state, principal, organization_id, "members.read");
+    let members = state.memberships[organization_id]; let ids = array_sort(map_keys(members)); let out = [];
+    for i len(ids) {
+        out[len(out)] = map{ user: state.users[ids[i]], role: members[ids[i]] };
+    }
+    return out;
+}
+
+fn validate(state) {
+    if not (try { _state(state); true } catch false) {
+        return map{ ok: false, error: "invalid IAM envelope" };
+    }
+    let user_ids = map_keys(state.users); let organization_ids = map_keys(state.organizations);
+    if len(user_ids) > MAX_USERS or len(organization_ids) > MAX_ORGANIZATIONS {
+        return map{ ok: false, error: "IAM state exceeds its bounded capacity" };
+    }
+    if array_sort(map_keys(state.memberships)) != array_sort(organization_ids) {
+        return map{ ok: false, error: "membership index does not match organizations" };
+    }
+    let admin_ids = map_keys(state.system_admins);
+    if len(user_ids) > 0 and len(admin_ids) < 1 {
+        return map{ ok: false, error: "IAM state has users but no system administrator" };
+    }
+    for ai len(admin_ids) {
+        if not map_has(state.users, admin_ids[ai]) or not state.system_admins[admin_ids[ai]] or
+           (try state.users[admin_ids[ai]].status catch "disabled") != "active" {
+            return map{ ok: false, error: "invalid persisted system administrator" };
+        }
+    }
+    for ui len(user_ids) {
+        let id = try _id(user_ids[ui], "persisted user id") catch nil;
+        let row = state.users[user_ids[ui]];
+        if id == nil or type(row) != "map" or (try row.id catch "") != id or
+           ((try row.status catch "") != "active" and (try row.status catch "") != "disabled") or
+           (try _integer(row.created_ms, "persisted user created_ms") catch nil) == nil or
+           (try _integer(row.updated_ms, "persisted user updated_ms") catch nil) == nil or
+           row.updated_ms < row.created_ms {
+            return map{ ok: false, error: "invalid persisted user" };
+        }
+        let display = try _name(row.display_name, "persisted display name") catch nil;
+        if display == nil { return map{ ok: false, error: "invalid persisted display name" }; }
+    }
+    for oi len(organization_ids) {
+        let id = try _id(organization_ids[oi], "persisted organization id") catch nil;
+        let row = state.organizations[organization_ids[oi]];
+        let members = try state.memberships[organization_ids[oi]] catch nil;
+        if id == nil or type(row) != "map" or (try row.id catch "") != id or
+           ((try row.status catch "") != "active" and (try row.status catch "") != "disabled") or
+           (try _name(row.name, "persisted organization name") catch nil) == nil or
+           (try _integer(row.created_ms, "persisted organization created_ms") catch nil) == nil or
+           (try _integer(row.updated_ms, "persisted organization updated_ms") catch nil) == nil or
+           row.updated_ms < row.created_ms or type(members) != "map" or
+           len(map_keys(members)) < 1 or len(map_keys(members)) > MAX_MEMBERS_PER_ORGANIZATION or
+           _owner_count(members) < 1 or
+           ((try row.status catch "") == "active" and _active_owner_count(state, members) < 1) {
+            return map{ ok: false, error: "invalid persisted organization" };
+        }
+        let member_ids = map_keys(members);
+        for mi len(member_ids) {
+            if (try _id(member_ids[mi], "persisted member id") catch nil) == nil or
+               not map_has(state.users, member_ids[mi]) or
+               (try _role(members[member_ids[mi]]) catch nil) == nil {
+                return map{ ok: false, error: "invalid persisted membership" };
+            }
+        }
+    }
+    let credentials = try state.credentials catch map{};
+    if type(credentials) != "map" or len(map_keys(credentials)) > MAX_CREDENTIALS {
+        return map{ ok: false, error: "invalid or oversized credential index" };
+    }
+    let credential_ids = map_keys(credentials); let per_user = map{};
+    for ci len(credential_ids) {
+        let id = try _credential_id(credential_ids[ci]) catch nil;
+        let row = credentials[credential_ids[ci]];
+        let credential_status = try row.status catch "";
+        if id == nil or type(row) != "map" or (try row.id catch "") != id or
+           (try _id(row.user_id, "persisted credential user") catch nil) == nil or
+           (try _id(row.organization_id, "persisted credential organization") catch nil) == nil or
+           not map_has(state.users, try row.user_id catch "") or
+           not map_has(state.organizations, try row.organization_id catch "") or
+           ((try row.status catch "") == "active" and
+                not is_active_user(state, row.user_id)) or
+           ((try row.status catch "") == "active" and
+                role_for(state, row.user_id, row.organization_id) == nil) or
+           ((try row.status catch "") == "active" and
+                not is_active_organization(state, row.organization_id)) or
+           (try _name(row.label, "persisted credential label") catch nil) == nil or
+           (try _secret_digest(row.secret_sha256) catch nil) == nil or
+           (credential_status != "active" and credential_status != "revoked") or
+           (try _integer(row.created_ms, "persisted credential created_ms") catch nil) == nil or
+           (try _integer(row.updated_ms, "persisted credential updated_ms") catch nil) == nil {
+            return map{ ok: false, error: "invalid persisted credential" };
+        }
+        if credential_status == "active" {
+            let count = try per_user[row.user_id] catch 0; count = count + 1;
+            if count > MAX_CREDENTIALS_PER_USER {
+                return map{ ok: false, error: "persisted active-user credential capacity exceeded" };
+            }
+            per_user[row.user_id] = count;
+        }
+    }
+    return map{ ok: true, users: len(user_ids), organizations: len(organization_ids),
+        credentials: len(credential_ids), revision: state.revision };
+}
+
+fn status(state) {
+    let checked = validate(state);
+    if not checked.ok { return checked; }
+    return map{ ok: true, format: FORMAT, revision: state.revision,
+        users: checked.users, organizations: checked.organizations,
+        credentials: checked.credentials,
+        system_admins: len(map_keys(state.system_admins)),
+        roles: ROLES, permissions: PERMISSIONS, max_users: MAX_USERS,
+        max_organizations: MAX_ORGANIZATIONS,
+        max_members_per_organization: MAX_MEMBERS_PER_ORGANIZATION,
+        max_credentials: MAX_CREDENTIALS,
+        max_credentials_per_user: MAX_CREDENTIALS_PER_USER,
+        last_owner_protected: true, caller_asserted_principal_accepted: false };
+}
+
+export FORMAT, new_state, create_user, update_user, bootstrap_system_admin, is_system_admin,
+       set_system_admin, set_user_status, set_organization_status,
+       user, is_active_user, organization, is_active_organization, role_for, can,
+       require_permission, create_organization, update_organization, set_member, remove_member,
+       issue_credential, authenticate_credential, list_credentials, revoke_credential,
+       list_users, list_organizations, list_members, validate, status;

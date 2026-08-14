@@ -1,0 +1,115 @@
+// Bounded PocketSphinx speech recognition implemented through PBLang FFI.
+// Model paths must be held /proc descriptor paths supplied by the caller.
+
+let PCM=import("stdlib:audio_pcm.sapp");
+let FORMAT="pblang.speech-stt.v1";
+let MAX_WORDS=4096;
+let POCKET=["/usr/lib/x86_64-linux-gnu/libpocketsphinx.so.3",
+    "/lib/x86_64-linux-gnu/libpocketsphinx.so.3"];
+let SPHINX=["/usr/lib/x86_64-linux-gnu/libsphinxbase.so.3",
+    "/lib/x86_64-linux-gnu/libsphinxbase.so.3"];
+let LIBC=["/usr/lib/x86_64-linux-gnu/libc.so.6","/lib/x86_64-linux-gnu/libc.so.6"];
+let CRYPTO=["/usr/lib/x86_64-linux-gnu/libcrypto.so.3","/lib/x86_64-linux-gnu/libcrypto.so.3"];
+
+fn _path(values){for i len(values){if fs_exists(values[i]){return values[i];}}return "";}
+fn available(){let pocket=_path(POCKET);let sphinx=_path(SPHINX);let libc=_path(LIBC);let crypto=_path(CRYPTO);
+    return map{ok:platform()=="linux" and pocket!="" and sphinx!="" and libc!="" and crypto!="",
+        format:FORMAT,pocket:pocket,sphinx:sphinx,libc:libc,crypto:crypto};}
+fn _descriptor_path(value){return type(value)=="string"
+    and regex_match(value,"^/proc/[0-9]{1,12}/fd/[0-9]{1,8}$");}
+fn _sample(value){value=num_floor(value);if value< -32768{return -32768;}
+    if value>32767{return 32767;}return value;}
+fn normalize_audio(audio){let info=PCM.validate(audio);let mono=[];
+    for frame info.frames{let sum=0;for channel audio.channels{
+        sum=sum+audio.samples[frame*audio.channels+channel];}
+        array_push(mono,_sample(sum/audio.channels));}
+    if audio.sample_rate==16000{return map{format:PCM.FORMAT,sample_rate:16000,channels:1,samples:mono};}
+    let frames=num_floor(len(mono)*16000/audio.sample_rate);let out=[];
+    for i frames{let source=num_min(len(mono)-1,num_floor(i*audio.sample_rate/16000));
+        array_push(out,mono[source]);}
+    return map{format:PCM.FORMAT,sample_rate:16000,channels:1,samples:out};}
+fn _raw_bytes(audio){let normalized=normalize_audio(audio);let out=[];
+    for i len(normalized.samples){let value=normalized.samples[i];if value<0{value=value+65536;}
+        array_push(out,num_mod(value,256));array_push(out,num_floor(value/256));}
+    return map{audio:normalized,bytes:out};}
+fn _hex(bytes){let digits="0123456789abcdef";let out="";for i len(bytes){let high=num_floor(bytes[i]/16);
+    let low=num_mod(bytes[i],16);out=out+str_slice(digits,high,high+1)+str_slice(digits,low,low+1);}return out;}
+fn _free(libc,pointer){if pointer!=nil and pointer!=0{try ffi_call_typed(libc,"free","ptr->void",[pointer]) catch nil;}}
+fn _free_crypto(crypto,pointer){if pointer!=nil and pointer!=0{try ffi_call_typed(crypto,
+    "CRYPTO_free","ptr,ptr,i32->void",[pointer,0,0]) catch nil;}}
+fn _i32_bytes(libc,crypto,pointer){let encoded=try ffi_call_typed(crypto,"OPENSSL_buf2hexstr",
+    "ptr,i64->ptr",[pointer,4]) catch nil;if encoded==nil or encoded==0{return 0;}
+    let text=try ffi_call_typed(libc,"basename","ptr->string",[encoded]) catch "";
+    _free_crypto(crypto,encoded);let clean=str_lower(str_replace_all(text,":",""));
+    if len(clean)!=8{return 0;}let value=0;let scale=1;for i 4{let at=i*2;
+        let high=str_index_of("0123456789abcdef",str_slice(clean,at,at+1));
+        let low=str_index_of("0123456789abcdef",str_slice(clean,at+1,at+2));
+        if high<0 or low<0{return 0;}value=value+(high*16+low)*scale;scale=scale*256;}
+    if value>=2147483648{return value-4294967296;}return value;}
+fn _cleanup(state){if try state.file catch 0{try ffi_call_typed(state.libc,"fclose","ptr->i32",[state.file]) catch nil;state.file=0;}
+    if try state.decoder catch 0{try ffi_call_typed(state.pocket,"ps_free","ptr->i32",[state.decoder]) catch nil;state.decoder=0;}
+    if try state.config catch 0{try ffi_call_typed(state.sphinx,"cmd_ln_free_r","ptr->i32",[state.config]) catch nil;state.config=0;}
+    try ffi_close(state.pocket) catch nil;try ffi_close(state.sphinx) catch nil;
+    try ffi_close(state.libc) catch nil;try ffi_close(state.crypto) catch nil;}
+
+fn native_decode(audio,model){
+    if type(model)!="map" or not _descriptor_path(try model.acoustic_model catch "")
+        or not _descriptor_path(try model.language_model catch "")
+        or not _descriptor_path(try model.dictionary catch ""){
+        return map{ok:false,executed:false,error:"STT model paths must be held process descriptors"};}
+    let support=available();if not support.ok{return map{ok:false,executed:false,error:"PocketSphinx ABI unavailable"};}
+    let state=map{pocket:try ffi_load(support.pocket) catch nil,sphinx:try ffi_load(support.sphinx) catch nil,
+        libc:try ffi_load(support.libc) catch nil,crypto:try ffi_load(support.crypto) catch nil,
+        config:0,decoder:0,file:0};
+    if state.pocket==nil or state.sphinx==nil or state.libc==nil or state.crypto==nil{
+        _cleanup(state);return map{ok:false,executed:false,error:"STT libraries could not be loaded"};}
+    let definitions=try ffi_call_typed(state.pocket,"ps_args","->ptr",[]) catch 0;
+    state.config=try ffi_call_typed(state.sphinx,"cmd_ln_init","ptr,ptr,i32,ptr->ptr",
+        [0,definitions,1,0]) catch 0;
+    if state.config==0{_cleanup(state);return map{ok:false,executed:false,error:"STT configuration failed"};}
+    let configured=true;for pair in [["-hmm",model.acoustic_model],["-lm",model.language_model],
+        ["-dict",model.dictionary],["-logfn","/dev/null"]]{
+        let status=try ffi_call_typed(state.sphinx,"cmd_ln_set_str_r","ptr,string,string->i32",
+            [state.config,pair[0],pair[1]]) catch -1;if status<0{configured=false;}}
+    if not configured{_cleanup(state);return map{ok:false,executed:false,error:"STT model configuration rejected"};}
+    try ffi_call_typed(state.pocket,"ps_default_search_args","ptr->void",[state.config]) catch nil;
+    state.decoder=try ffi_call_typed(state.pocket,"ps_init","ptr->ptr",[state.config]) catch 0;
+    if state.decoder==0{_cleanup(state);return map{ok:false,executed:false,error:"STT decoder initialization failed"};}
+    let raw=_raw_bytes(audio);state.file=try ffi_call_typed(state.libc,"tmpfile","->ptr",[]) catch 0;
+    if state.file==0{_cleanup(state);return map{ok:false,executed:false,error:"anonymous PCM stream unavailable"};}
+    let buffer=try ffi_call_typed(state.crypto,"OPENSSL_hexstr2buf","string,ptr->ptr",[_hex(raw.bytes),0]) catch 0;
+    if buffer==0{_cleanup(state);return map{ok:false,executed:false,error:"PCM buffer allocation failed"};}
+    let wrote=try ffi_call_typed(state.libc,"fwrite","ptr,i64,i64,ptr->i64",
+        [buffer,1,len(raw.bytes),state.file]) catch 0;_free_crypto(state.crypto,buffer);
+    try ffi_call_typed(state.libc,"rewind","ptr->void",[state.file]) catch nil;
+    if wrote!=len(raw.bytes){_cleanup(state);return map{ok:false,executed:false,error:"anonymous PCM stream write failed"};}
+    let frames=try ffi_call_typed(state.pocket,"ps_decode_raw","ptr,ptr,string,i64->i32",
+        [state.decoder,state.file,"pb-mcp",len(raw.audio.samples)]) catch -1;
+    if frames<0{_cleanup(state);return map{ok:false,executed:true,error:"STT decode failed"};}
+    let transcript=try ffi_call_typed(state.pocket,"ps_get_hyp","ptr,ptr->string",[state.decoder,0]) catch "";
+    transcript=str_trim(str(transcript));let words=[];
+    let segment=try ffi_call_typed(state.pocket,"ps_seg_iter","ptr,ptr->ptr",[state.decoder,0]) catch 0;
+    while segment!=0 and len(words)<MAX_WORDS{
+        let first=try ffi_call_typed(state.libc,"calloc","i64,i64->ptr",[1,4]) catch 0;
+        let last=try ffi_call_typed(state.libc,"calloc","i64,i64->ptr",[1,4]) catch 0;
+        let word=try ffi_call_typed(state.pocket,"ps_seg_word","ptr->string",[segment]) catch "";
+        if first!=0 and last!=0{try ffi_call_typed(state.pocket,"ps_seg_frames","ptr,ptr,ptr->void",
+            [segment,first,last]) catch nil;let a=_i32_bytes(state.libc,state.crypto,first);
+            let b=_i32_bytes(state.libc,state.crypto,last);if word!="" and not str_starts_with(word,"<"){
+                array_push(words,map{word:word,start_secs:a/100.0,end_secs:(b+1)/100.0});}}
+        _free(state.libc,first);_free(state.libc,last);
+        segment=try ffi_call_typed(state.pocket,"ps_seg_next","ptr->ptr",[segment]) catch 0;
+    }
+    let probability=try ffi_call_typed(state.pocket,"ps_get_prob","ptr->i32",[state.decoder]) catch 0;
+    _cleanup(state);return map{ok:true,executed:true,format:FORMAT,transcript:transcript,
+        words:words,word_count:len(words),probability:probability,decoded_frames:frames,
+        sample_rate:16000,channels:1,model_language:try model.language catch "unknown",
+        descriptor_bound_models:true,anonymous_pcm:true,shell_used:false};
+}
+
+fn transcribe_with_backend(audio,model,backend){let result=backend.decode(audio,model);
+    if try result.ok catch false{result.format=FORMAT;}return result;}
+fn native_backend(){return map{decode:fn(audio,model){return native_decode(audio,model);}};}
+
+export FORMAT, MAX_WORDS, available, normalize_audio, native_decode, native_backend,
+       transcribe_with_backend;
