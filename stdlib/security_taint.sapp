@@ -19,6 +19,24 @@ fn _contains(values, wanted) {
     return false;
 }
 
+fn _linked_original(name) {
+    if type(name) != "string" or not str_starts_with(name, "__pbi") { return ""; }
+    let i = 5; let digits = 0;
+    while i < len(name) {
+        let code = strcharcodeat(name, i);
+        if code < 48 or code > 57 { break; }
+        digits = digits + 1; i = i + 1;
+    }
+    if digits == 0 or i >= len(name) or strcharcodeat(name, i) != 95 { return ""; }
+    return str_slice(name, i + 1, len(name));
+}
+
+fn _is_sanitizer(config, name, full) {
+    if _contains(config.sanitizers, name) or _contains(config.sanitizers, full) { return true; }
+    let original = _linked_original(name);
+    return original != "" and _contains(config.sanitizers, original);
+}
+
 fn _copy_map(value) {
     let out = map{};
     let keys = map_keys(value); let i = 0;
@@ -34,10 +52,10 @@ fn _merge_names(a, b) {
     return out;
 }
 
-fn _clean() { return map{ tainted: false, sources: [], control: false, fields: map{} }; }
+fn _clean() { return map{ tainted: false, data: false, sources: [], control: false, fields: map{} }; }
 fn _tainted(source, control = false) {
     return map{ tainted: true, sources: if source == "" { [] } else { [source] },
-        control: control, fields: map{} };
+        data: not control, control: control, fields: map{} };
 }
 
 fn _fields(flow) {
@@ -64,9 +82,14 @@ fn _merge(a, b) {
     if a == nil { return b; }
     if b == nil { return a; }
     return map{ tainted: a.tainted or b.tainted,
+        data: (try a.data catch a.tainted) or (try b.data catch b.tainted),
         sources: _merge_names(a.sources, b.sources),
         control: a.control or b.control,
         fields: _merge_fields(a, b) };
+}
+
+fn _active(flow) {
+    return flow != nil and ((try flow.tainted catch false) or (try flow.control catch false));
 }
 
 fn _defaults() {
@@ -76,17 +99,17 @@ fn _defaults() {
         sanitizers: ["safe_rel_path", "sanitize_path", "validate_url", "parse_number",
             "parse_bool", "constant_time_eq"],
         sinks: map{
-            exec: map{ severity: "high", args: [0], class: "command-injection" },
-            proc_spawn_wait: map{ severity: "high", args: [0, 1], class: "command-injection" },
-            polyglot_exec: map{ severity: "high", args: [0, 1], class: "code-injection" },
-            ffi_load: map{ severity: "high", args: [0], class: "native-library-injection" },
-            ffi_call: map{ severity: "high", args: [1], class: "native-symbol-injection" },
-            ffi_call_typed: map{ severity: "high", args: [1], class: "native-symbol-injection" },
-            fs_write: map{ severity: "high", args: [0], class: "path-traversal" },
-            fs_write_bytes: map{ severity: "high", args: [0], class: "path-traversal" },
-            fs_remove: map{ severity: "high", args: [0], class: "path-traversal" },
-            fs_rename: map{ severity: "high", args: [0, 1], class: "path-traversal" },
-            fs_copy: map{ severity: "high", args: [0, 1], class: "path-traversal" },
+            exec: map{ severity: "high", args: [0], class: "command-injection", control_flow: true },
+            proc_spawn_wait: map{ severity: "high", args: [0, 1], class: "command-injection", control_flow: false },
+            polyglot_exec: map{ severity: "high", args: [0, 1], class: "code-injection", control_flow: true },
+            ffi_load: map{ severity: "high", args: [0], class: "native-library-injection", control_flow: false },
+            ffi_call: map{ severity: "high", args: [1], class: "native-symbol-injection", control_flow: false },
+            ffi_call_typed: map{ severity: "high", args: [1], class: "native-symbol-injection", control_flow: false },
+            fs_write: map{ severity: "high", args: [0], class: "path-traversal", control_flow: true },
+            fs_write_bytes: map{ severity: "high", args: [0], class: "path-traversal", control_flow: true },
+            fs_remove: map{ severity: "high", args: [0], class: "path-traversal", control_flow: true },
+            fs_rename: map{ severity: "high", args: [0, 1], class: "path-traversal", control_flow: true },
+            fs_copy: map{ severity: "high", args: [0, 1], class: "path-traversal", control_flow: true },
             sqlite_exec: map{ severity: "high", args: [1], class: "sql-injection" },
             sqlite_query: map{ severity: "high", args: [1], class: "sql-injection" },
             http_get: map{ severity: "medium", args: [0], class: "server-side-request" },
@@ -144,6 +167,11 @@ fn _step(state) {
 
 fn _finding(state, sink, spec, arg_index, flow, node, control_only) {
     if len(state.findings) >= state.max_findings { state.truncated = true; return; }
+    let identity = str(spec.class) + "\x00" + sink + "\x00" + str(arg_index)
+        + "\x00" + str(_line(node)) + "\x00" + json_stringify(flow.sources)
+        + "\x00" + str(control_only or flow.control);
+    if map_has(state.finding_keys, identity) { return; }
+    state.finding_keys[identity] = true;
     array_push(state.findings, map{
         format: "pblang.security-taint.finding.v1",
         id: "taint." + str(spec.class),
@@ -181,12 +209,17 @@ fn _expr(node, env, state, control_flow) {
         let function_key = "";
         if map_has(state.functions, full) { function_key = full; }
         elif map_has(state.functions, name) { function_key = name; }
-        let sanitizes = _contains(state.config.sanitizers, name)
-            or _contains(state.config.sanitizers, full);
+        let sanitizes = _is_sanitizer(state.config, name, full);
         if sanitizes {
             // Analyze a local sanitizer with tainted arguments so its side
             // effects remain visible, but terminate taint on its return value.
             if function_key != "" {
+                let cache_key = "sanitizer:" + function_key;
+                if not _active(combined) and not _active(control_flow)
+                    and map_has(state.clean_summaries, cache_key) { return _clean(); }
+                let control_call = not (try combined.data catch combined.tainted)
+                    and _active(control_flow);
+                if control_call and map_has(state.control_summaries, cache_key) { return _clean(); }
                 if (try state.call_stack[function_key] catch false) {
                     state.recursion_skips = state.recursion_skips + 1;
                     return _clean();
@@ -205,12 +238,33 @@ fn _expr(node, env, state, control_flow) {
                 state.call_expansions = state.call_expansions + 1;
                 _block(target.body, call_env, state, control_flow);
                 state.call_stack[function_key] = false;
+                state.analyzed_functions[function_key] = true;
+                if not _active(combined) and not _active(control_flow) {
+                    state.clean_summaries[cache_key] = _clean();
+                }
+                if control_call { state.control_summaries[cache_key] = _clean(); }
             }
             return _clean();
         }
         if function_key != "" {
+            let flow_key = "flow:" + function_key + ":"
+                + sha256(json_stringify(map{ values: values, control: control_flow }));
+            if map_has(state.flow_summaries, flow_key) {
+                return state.flow_summaries[flow_key];
+            }
+            let clean_call = not _active(combined) and not _active(control_flow);
+            if clean_call and map_has(state.clean_summaries, function_key) {
+                return state.clean_summaries[function_key];
+            }
+            let control_call = not (try combined.data catch combined.tainted)
+                and _active(control_flow);
+            if control_call and map_has(state.control_summaries, function_key) {
+                return state.control_summaries[function_key];
+            }
             if (try state.call_stack[function_key] catch false) {
                 state.recursion_skips = state.recursion_skips + 1;
+                // The active frame still walks every branch and sink. Returning
+                // the incoming flow is a conservative recursive-call summary.
                 return combined;
             }
             if state.call_expansions >= state.max_call_expansions {
@@ -227,6 +281,10 @@ fn _expr(node, env, state, control_flow) {
             state.call_expansions = state.call_expansions + 1;
             let returned = _block(target.body, call_env, state, control_flow);
             state.call_stack[function_key] = false;
+            state.analyzed_functions[function_key] = true;
+            if clean_call { state.clean_summaries[function_key] = returned; }
+            if control_call { state.control_summaries[function_key] = returned; }
+            state.flow_summaries[flow_key] = returned;
             return returned;
         }
         if map_has(state.config.sinks, name) or map_has(state.config.sinks, full) {
@@ -235,9 +293,10 @@ fn _expr(node, env, state, control_flow) {
             i = 0;
             while i < len(indexes) {
                 let index = indexes[i];
-                if index >= 0 and index < len(values) and values[index].tainted {
+                if index >= 0 and index < len(values)
+                    and (try values[index].data catch values[index].tainted) {
                     _finding(state, full, spec, index, values[index], node, false);
-                } elif control_flow.tainted {
+                } elif control_flow.tainted and (try spec.control_flow catch false) {
                     _finding(state, full, spec, index, control_flow, node, true);
                 }
                 i = i + 1;
@@ -345,7 +404,7 @@ fn _stmt(node, env, state, control_flow) {
     if kind == "let" or kind == "const" {
         let value = _expr(node.value, env, state, control_flow);
         if control_flow.tainted { value = _merge(value, map{ tainted: true,
-            sources: control_flow.sources, control: true, fields: map{} }); }
+            data: false, sources: control_flow.sources, control: true, fields: map{} }); }
         env[node.name] = value; return _clean();
     }
     if kind == "expr_stmt" { _expr(node.expr, env, state, control_flow); return _clean(); }
@@ -425,7 +484,9 @@ fn analyze(source, path = "[source]", options = nil) {
         max_steps: max_steps, max_findings: max_findings, limit_exceeded: false,
         truncated: false, functions: functions, call_stack: map{}, call_expansions: 0,
         max_call_expansions: max_call_expansions, call_limit_exceeded: false,
-        recursion_skips: 0 };
+        recursion_skips: 0, clean_summaries: map{}, control_summaries: map{},
+        flow_summaries: map{}, finding_keys: map{},
+        analyzed_functions: map{} };
     let top = map{}; let clean_control = _clean(); let i = 0;
     // Top-level initialization and every declared function get isolated flow
     // environments. Parameters are clean unless the source explicitly reaches
@@ -437,10 +498,13 @@ fn analyze(source, path = "[source]", options = nil) {
         }
         i = i + 1;
     }
+    let entry_flow_only = (try options.entry_flow_only catch false) == true;
     i = 0;
-    while i < len(function_names) and not state.limit_exceeded {
+    while not entry_flow_only and i < len(function_names) and not state.limit_exceeded {
         let fn_node = functions[function_names[i]];
-        if not (try state.call_stack[function_names[i]] catch false) {
+        if not map_has(state.analyzed_functions, function_names[i])
+            and not map_has(state.clean_summaries, function_names[i])
+            and not (try state.call_stack[function_names[i]] catch false) {
             let env = map{}; let pi = 0;
             while pi < len(fn_node.params) {
                 let name = if type(fn_node.params[pi]) == "map" { fn_node.params[pi].name }
@@ -448,8 +512,12 @@ fn analyze(source, path = "[source]", options = nil) {
                 env[name] = _clean(); pi = pi + 1;
             }
             state.call_stack[function_names[i]] = true;
-            _block(fn_node.body, env, state, clean_control);
+            let summary = _block(fn_node.body, env, state, clean_control);
             state.call_stack[function_names[i]] = false;
+            state.analyzed_functions[function_names[i]] = true;
+            if not map_has(state.clean_summaries, function_names[i]) {
+                state.clean_summaries[function_names[i]] = summary;
+            }
         }
         i = i + 1;
     }
@@ -460,15 +528,19 @@ fn analyze(source, path = "[source]", options = nil) {
     }
     if state.limit_exceeded { blocking = blocking + 1; }
     if state.call_limit_exceeded { blocking = blocking + 1; }
-    let interprocedural_complete = not state.call_limit_exceeded and state.recursion_skips == 0;
+    let interprocedural_complete = not state.call_limit_exceeded;
     return map{ ok: true, passed: blocking == 0, format: FORMAT, path: path,
         findings: state.findings, finding_count: len(state.findings), blocking: blocking,
         ast_steps: state.steps, parser_complete: true,
         limit_exceeded: state.limit_exceeded, truncated: state.truncated,
         function_count: len(function_names), call_expansions: state.call_expansions,
         call_limit_exceeded: state.call_limit_exceeded, recursion_skips: state.recursion_skips,
+        recursion_summaries: state.recursion_skips,
         interprocedural_complete: interprocedural_complete,
-        coverage: "flow-sensitive interprocedural AST data/control flow with bounded call expansion" };
+        entry_flow_only: entry_flow_only,
+        coverage: if entry_flow_only {
+            "entry-reachable flow-sensitive interprocedural AST data/control flow with bounded call expansion"
+        } else { "all-functions flow-sensitive interprocedural AST data/control flow with bounded call expansion" } };
 }
 
 export FORMAT, MAX_FINDINGS, MAX_AST_STEPS, MAX_CALL_EXPANSIONS, analyze;

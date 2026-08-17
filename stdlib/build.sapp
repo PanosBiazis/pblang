@@ -128,7 +128,7 @@ fn _backend(value) {
 }
 
 fn _security_mode(options) {
-    if _get(options, "security_analysis", true) == false { return "off"; }
+    if not _get(options, "security_analysis", true) { return "off"; }
     let mode = str_lower(str(_get(options, "security_mode", "protect")));
     if mode == "off" or mode == "audit" or mode == "protect" or mode == "strict" { return mode; }
     return "invalid";
@@ -141,7 +141,7 @@ fn _security_options(options, mode) {
         custom_rules: _get(policy, "custom_rules", _get(options, "security_custom_rules", [])),
         disabled_rule_ids: _get(policy, "disabled_rule_ids", _get(options, "security_disabled_rule_ids", [])),
         allow_high_suppressions: _get(policy, "allow_high_suppressions",
-            _get(options, "security_allow_high_suppressions", false)) == true,
+            _get(options, "security_allow_high_suppressions", false)),
         minimum_blocking_severity: if mode == "strict" { "info" } else { "high" }
     };
 }
@@ -204,9 +204,9 @@ fn smart_plan(source_path, output_path, options = nil) {
     }
     let host_target = _host_target_name();
     let target = str(_get(options, "target", host_target));
-    let fallback = _get(options, "fallback", true) == true;
-    let runtime_fallback = _get(options, "runtime_fallback", goal == "portable") == true;
-    let cache = _get(options, "cache", true) != false;
+    let fallback = _get(options, "fallback", true);
+    let runtime_fallback = _get(options, "runtime_fallback", goal == "portable");
+    let cache = _get(options, "cache", true);
     let strategies = [];
     let reasons = [];
 
@@ -325,9 +325,9 @@ fn _c99_options(goal, options) {
     if goal == "size" { cfg.opt = "size"; cfg.lto = true; }
     elif goal == "speed" { cfg.opt = "max"; cfg.lto = true; }
     elif goal == "debug" { cfg.opt = "debug"; cfg.strip = false; }
-    cfg.static = _get(options, "static", false) == true;
-    cfg.compress = _get(options, "compress", false) == true;
-    cfg.keep_intermediates = _get(options, "keep_intermediates", false) == true;
+    cfg.static = _get(options, "static", false);
+    cfg.compress = _get(options, "compress", false);
+    cfg.keep_intermediates = _get(options, "keep_intermediates", false);
     return cfg;
 }
 
@@ -423,10 +423,10 @@ fn smart_build(source_path, output_path, options = nil) {
 fn smart_session(options = nil) {
     let goal = _goal(_get(options, "goal", "balanced"));
     let backend = _backend(_get(options, "backend", "auto"));
-    let direct = nil;
+    let direct = map{};
     if backend == "auto" or backend == "direct-x64" or backend == "invalid" {
         direct = SESSION.session(map{
-            cache: _get(options, "cache", true) != false,
+            cache: _get(options, "cache", true),
             cache_root: _get(options, "cache_root", CACHE.default_root()),
             profile: SESSION.DEFAULT_PROFILE + ";smart-goal=" + goal
         });
@@ -471,6 +471,27 @@ fn smart_build_many(jobs, options = nil) {
     return smart_build_many_in_session(smart_session(options), jobs, options);
 }
 
+fn _execute_many_plan(plan, job, options, state) {
+    let source = if plan.ok { _read_source(job.source) }
+        else { map{ ok: false, error: str_join(plan.errors, "; ") } };
+    if source.ok {
+        source.security_analysis = _security_gate(source.source, job.source, options);
+        if not source.security_analysis.ok or not source.security_analysis.passed {
+            source.ok = false;
+            source.error = try source.security_analysis.error catch
+                "security analysis blocked artifact publication";
+        }
+    }
+    let result = if source.ok { _run_plan(plan, source, options, state) }
+        else { map{ ok: false, format: REPORT_FORMAT, plan: plan, error: source.error } };
+    if map_has(source, "security_analysis") { result.security_analysis = source.security_analysis; }
+    return result;
+}
+
+fn _build_many_job(job, options, state) {
+    return _execute_many_plan(smart_plan(job.source, job.output, options), job, options, state);
+}
+
 fn smart_build_many_in_session(build_session, jobs, options = nil) {
     if not _valid_smart_session(build_session) {
         return map{ ok: false, error: "invalid smart build session" };
@@ -492,18 +513,7 @@ fn smart_build_many_in_session(build_session, jobs, options = nil) {
             array_push(results, map{ ok: false, error: "invalid build job", index: i });
             all_ok = false;
         } else {
-            let plan = smart_plan(job.source, job.output, options);
-            let source = if plan.ok { _read_source(job.source) } else { map{ ok: false, error: str_join(plan.errors, "; ") } };
-            if source.ok {
-                source.security_analysis = _security_gate(source.source, job.source, options);
-                if not source.security_analysis.ok or not source.security_analysis.passed {
-                    source.ok = false;
-                    source.error = try source.security_analysis.error catch "security analysis blocked artifact publication";
-                }
-            }
-            let result = if source.ok { _run_plan(plan, source, options, state) }
-                else { map{ ok: false, format: REPORT_FORMAT, plan: plan, error: source.error } };
-            if map_has(source, "security_analysis") { result.security_analysis = source.security_analysis; }
+            let result = _build_many_job(job, options, state);
             result.index = i;
             array_push(results, result);
             if not result.ok { all_ok = false; }
@@ -548,6 +558,24 @@ fn smart_project(project_dir, output_path, options = nil) {
     let result = smart_build(path_join(project_dir, entry), output_path, project_options);
     result.project = project_dir;
     result.entry = entry;
+    let lock_path = path_join(project_dir, "pblang.lock");
+    if result.ok and fs_exists(lock_path) and _get(project_options, "portable_lock", true) {
+        let LOCK = import("stdlib:portable_lock.sapp");
+        let published = try LOCK.publish(project_dir) catch map{
+            ok: false, error: "portable lock publication failed"
+        };
+        if not published.ok {
+            try fs_remove(output_path) catch nil;
+            return map{ ok: false, format: REPORT_FORMAT, project: project_dir,
+                entry: entry, output_removed: true,
+                error: try published.error catch "portable lock publication failed" };
+        }
+        result.portable_lock = map{ ok: true, rewritten: published.rewritten,
+            absolute_paths_exposed: false };
+    } else {
+        result.portable_lock = map{ ok: true, rewritten: 0, skipped: true,
+            absolute_paths_exposed: false };
+    }
     return result;
 }
 

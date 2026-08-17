@@ -1,0 +1,356 @@
+// Bounded, deterministic circuit/controller state shared by emulators and
+// physical transports. Wired mutations become explicit pending intents until
+// a transport acknowledges them; the model never reports unverified hardware
+// state as applied.
+
+let Targets = import("stdlib:embedded_targets.sapp");
+let Linux = import("stdlib:embedded_linux.sapp");
+
+let FORMAT = "pblang.embedded-circuit.v1";
+let MAX_DEVICES = 32;
+let MAX_PENDING = 256;
+let MAX_TICK_MS = 60000;
+let MAX_DURATION_MS = 86400000;
+let MIN_INTERVAL_MS = 10;
+let MAX_INTERVAL_MS = 60000;
+
+fn _error(message, code = "invalid-request") {
+    return map{ ok:false, format:FORMAT, code:code, error:message };
+}
+
+fn _integer(value, minimum, maximum, name) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw "embedded_circuit: " + name + " must be a whole "
+            + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _mode(value) {
+    let out = str_lower(str(value));
+    if out != "emulator" and out != "wired" {
+        throw "embedded_circuit: mode must be emulator or wired";
+    }
+    return out;
+}
+
+fn _position(value, fallback_x, fallback_y) {
+    let source = if value == nil { map{} } else { value };
+    if type(source) != "map" { throw "embedded_circuit: position must be a map"; }
+    return map{
+        x:_integer(try source.x catch fallback_x, 0, 100000, "position x"),
+        y:_integer(try source.y catch fallback_y, 0, 100000, "position y")
+    };
+}
+
+fn new(options = nil) {
+    let opts = if options == nil { map{} } else { options };
+    if type(opts) != "map" { throw "embedded_circuit: options must be a map"; }
+    return map{
+        format:FORMAT,
+        name:str(try opts.name catch "Embedded LED Lab"),
+        mode:_mode(try opts.mode catch "emulator"),
+        devices:map{}, order:[], pending:map{}, next_intent:1,
+        elapsed_ms:0, revision:0,
+        automatic_mapping:try opts.automatic_mapping catch true,
+        limits:map{ devices:MAX_DEVICES, pending:MAX_PENDING,
+            maximum_tick_ms:MAX_TICK_MS, maximum_duration_ms:MAX_DURATION_MS }
+    };
+}
+
+fn _valid(circuit) {
+    return circuit != nil and type(circuit) == "map"
+        and (try circuit.format catch "") == FORMAT;
+}
+
+fn _find(circuit, device_id) {
+    if not _valid(circuit) { return nil; }
+    let key = str_lower(str(device_id));
+    if not map_has(circuit.devices, key) { return nil; }
+    return circuit.devices[key];
+}
+
+fn add_device(circuit, device_id, board_id, options = nil) {
+    if not _valid(circuit) { return _error("invalid circuit", "invalid-circuit"); }
+    if len(circuit.order) >= MAX_DEVICES { return _error("device limit reached", "device-limit"); }
+    let id = str_lower(str(device_id));
+    if not regex_match(id, "^[a-z][a-z0-9-]{0,47}$") {
+        return _error("invalid device id", "invalid-device-id");
+    }
+    if map_has(circuit.devices, id) { return _error("device id already exists", "duplicate-device"); }
+    let board = Targets.board(board_id);
+    if board == nil { return _error("unknown embedded board", "unknown-board"); }
+    let opts = if options == nil { map{} } else { options };
+    if type(opts) != "map" { return _error("device options must be a map"); }
+    let mode = str_lower(str(try opts.mode catch circuit.mode));
+    if mode != "emulator" and mode != "wired" { return _error("invalid device mode"); }
+    let index = len(circuit.order);
+    let position_source = try opts.position catch map{};
+    if position_source == nil { position_source = map{}; }
+    if type(position_source) != "map" { return _error("invalid device position", "invalid-position"); }
+    let px = try position_source.x catch 24 + (index % 4) * 220;
+    let py = try position_source.y catch 24 + num_floor(index / 4) * 180;
+    if type(px) != "number" or px != num_floor(px) or px < 0 or px > 100000
+       or type(py) != "number" or py != num_floor(py) or py < 0 or py > 100000 {
+        return _error("invalid device position", "invalid-position");
+    }
+    let position = map{x:px,y:py};
+    let port = str(try opts.port catch "");
+    if port != "" and not regex_match(port, "^/dev/(ttyUSB|ttyACM)[0-9]{1,3}$") {
+        return _error("invalid wired port", "invalid-port");
+    }
+    if mode == "emulator" and port != "" {
+        return _error("emulator devices cannot own a physical port", "mode-port-conflict");
+    }
+    if mode == "wired" and port == "" {
+        return _error("wired devices require an explicit or discovered port", "missing-port");
+    }
+    let selected_pin = Targets.pin(board, try opts.pin catch "status-led-test");
+    if selected_pin == nil or selected_pin.reserved or selected_pin.input_only
+       or not Targets.has_capability(selected_pin, "digital-out") {
+        return _error("selected LED pin is not a safe digital output", "unsafe-pin");
+    }
+    let device = map{
+        id:id, board:board.id, board_name:board.name, mcu:board.mcu,
+        mode:mode, port:port, position:position,
+        pin:selected_pin.alias, gpio:selected_pin.gpio,
+        desired_on:false, observed_on:if mode == "emulator" { false } else { nil },
+        state_verified:mode == "emulator", connected:mode == "emulator",
+        blink:map{ enabled:false, interval_ms:500, remaining_ms:0,
+            phase_elapsed_ms:0 },
+        last_error:"", revision:0
+    };
+    circuit.devices[id] = device; array_push(circuit.order, id);
+    circuit.revision = circuit.revision + 1;
+    return map{ ok:true, format:FORMAT, device:device, revision:circuit.revision };
+}
+
+fn remove_device(circuit, device_id) {
+    let device = _find(circuit, device_id);
+    if device == nil { return _error("unknown device", "unknown-device"); }
+    let next = [];
+    for i len(circuit.order) { if circuit.order[i] != device.id { array_push(next, circuit.order[i]); } }
+    map_remove(circuit.devices, device.id); circuit.order = next;
+    circuit.revision = circuit.revision + 1;
+    return map{ ok:true, format:FORMAT, removed:device.id, revision:circuit.revision };
+}
+
+fn _intent(circuit, device, kind) {
+    if len(map_keys(circuit.pending)) >= MAX_PENDING {
+        return _error("pending hardware intent limit reached", "pending-limit");
+    }
+    let item = map{ id:circuit.next_intent, device:device.id, kind:kind,
+        desired_on:device.desired_on, interval_ms:device.blink.interval_ms,
+        remaining_ms:device.blink.remaining_ms, created_at_ms:circuit.elapsed_ms,
+        acknowledged:false };
+    circuit.next_intent = circuit.next_intent + 1;
+    circuit.pending[str(item.id)] = item;
+    return map{ ok:true, format:FORMAT, applied:false, pending:true, intent:item };
+}
+
+fn _commit(circuit, device, kind) {
+    device.revision = device.revision + 1; circuit.revision = circuit.revision + 1;
+    if device.mode == "emulator" {
+        device.observed_on = device.desired_on; device.state_verified = true;
+        return map{ ok:true, format:FORMAT, applied:true, pending:false,
+            kind:kind, device:device.id, on:device.observed_on,
+            revision:circuit.revision };
+    }
+    let queued = _intent(circuit, device, kind);
+    if not queued.ok { return queued; }
+    queued.device = device.id; queued.revision = circuit.revision; return queued;
+}
+
+fn set_led(circuit, device_id, on) {
+    let device = _find(circuit, device_id);
+    if device == nil { return _error("unknown device", "unknown-device"); }
+    if type(on) != "bool" { return _error("LED state must be boolean", "invalid-state"); }
+    device.desired_on = on; device.blink.enabled = false;
+    device.blink.remaining_ms = 0; device.blink.phase_elapsed_ms = 0;
+    return _commit(circuit, device, "set-led");
+}
+
+fn toggle_led(circuit, device_id) {
+    let device = _find(circuit, device_id);
+    if device == nil { return _error("unknown device", "unknown-device"); }
+    return set_led(circuit, device.id, not device.desired_on);
+}
+
+fn set_blink(circuit, device_id, enabled, interval_ms = 500, duration_ms = 0) {
+    let device = _find(circuit, device_id);
+    if device == nil { return _error("unknown device", "unknown-device"); }
+    if type(enabled) != "bool" { return _error("blink enabled must be boolean", "invalid-blink"); }
+    if type(interval_ms) != "number" or interval_ms != num_floor(interval_ms)
+       or interval_ms < MIN_INTERVAL_MS or interval_ms > MAX_INTERVAL_MS {
+        return _error("invalid blink interval", "invalid-interval");
+    }
+    if type(duration_ms) != "number" or duration_ms != num_floor(duration_ms)
+       or duration_ms < 0 or duration_ms > MAX_DURATION_MS {
+        return _error("invalid blink duration", "invalid-duration");
+    }
+    let interval = interval_ms;
+    device.blink.enabled = enabled; device.blink.interval_ms = interval;
+    device.blink.remaining_ms = if enabled { duration_ms } else { 0 };
+    device.blink.phase_elapsed_ms = 0;
+    if enabled { device.desired_on = true; }
+    return _commit(circuit, device, if enabled { "start-blink" } else { "stop-blink" });
+}
+
+fn tick(circuit, elapsed_ms) {
+    if not _valid(circuit) { return _error("invalid circuit", "invalid-circuit"); }
+    if type(elapsed_ms) != "number" or elapsed_ms != num_floor(elapsed_ms)
+       or elapsed_ms < 0 or elapsed_ms > MAX_TICK_MS {
+        return _error("invalid tick duration", "invalid-tick");
+    }
+    let elapsed = elapsed_ms;
+    circuit.elapsed_ms = circuit.elapsed_ms + elapsed;
+    let changed = [];
+    for i len(circuit.order) {
+        let device = circuit.devices[circuit.order[i]];
+        if device.blink.enabled {
+            let active = elapsed;
+            if device.blink.remaining_ms > 0 and active > device.blink.remaining_ms {
+                active = device.blink.remaining_ms;
+            }
+            let accumulated = device.blink.phase_elapsed_ms + active;
+            let flips = num_floor(accumulated / device.blink.interval_ms);
+            device.blink.phase_elapsed_ms = accumulated % device.blink.interval_ms;
+            if flips % 2 == 1 { device.desired_on = not device.desired_on; }
+            if device.blink.remaining_ms > 0 {
+                device.blink.remaining_ms = device.blink.remaining_ms - active;
+                if device.blink.remaining_ms == 0 {
+                    device.blink.enabled = false; device.desired_on = false;
+                    device.blink.phase_elapsed_ms = 0;
+                }
+            }
+            if flips > 0 or not device.blink.enabled {
+                let committed = _commit(circuit, device, "blink-tick");
+                array_push(changed, map{ device:device.id, desired_on:device.desired_on,
+                    applied:try committed.applied catch false, pending:try committed.pending catch false });
+            }
+        }
+    }
+    return map{ ok:true, format:FORMAT, elapsed_ms:circuit.elapsed_ms,
+        changed:changed, revision:circuit.revision };
+}
+
+fn acknowledge(circuit, intent_id, observed_on, success = true, error = "") {
+    if not _valid(circuit) { return _error("invalid circuit", "invalid-circuit"); }
+    if type(intent_id) != "number" or intent_id != num_floor(intent_id)
+       or intent_id < 1 or intent_id > 2147483647 {
+        return _error("invalid intent id", "invalid-intent");
+    }
+    let id = intent_id;
+    if type(success) != "bool" or (success and type(observed_on) != "bool") {
+        return _error("invalid acknowledgement", "invalid-acknowledgement");
+    }
+    let key = str(id);
+    if not map_has(circuit.pending, key) {
+        return _error("unknown pending intent", "unknown-intent");
+    }
+    let item = circuit.pending[key];
+    let device = _find(circuit, item.device);
+    item.acknowledged = true; item.success = success; item.error = str(error);
+    if success {
+        device.observed_on = observed_on; device.state_verified = true;
+        device.connected = true; device.last_error = "";
+    } else {
+        device.state_verified = false; device.connected = false; device.last_error = str(error);
+    }
+    map_remove(circuit.pending, key); circuit.revision = circuit.revision + 1;
+    return map{ ok:success, format:FORMAT, intent:id, device:device.id,
+        observed_on:device.observed_on, state_verified:device.state_verified,
+        error:device.last_error, revision:circuit.revision };
+}
+
+fn observe(circuit, device_id, response) {
+    let device = _find(circuit, device_id);
+    if device == nil { return _error("unknown device", "unknown-device"); }
+    if type(response) != "map" or type(try response.on catch nil) != "bool"
+       or type(try response.blinking catch nil) != "bool" {
+        return _error("invalid observed device state", "invalid-observation");
+    }
+    let interval = try response.interval_ms catch 500;
+    let remaining = try response.remaining_ms catch 0;
+    if type(interval) != "number" or interval != num_floor(interval)
+       or interval < MIN_INTERVAL_MS or interval > MAX_INTERVAL_MS
+       or type(remaining) != "number" or remaining != num_floor(remaining)
+       or remaining < 0 or remaining > MAX_DURATION_MS {
+        return _error("observed timing is outside circuit limits", "invalid-observation");
+    }
+    device.observed_on = response.on; device.desired_on = response.on;
+    device.blink.enabled = response.blinking; device.blink.interval_ms = interval;
+    device.blink.remaining_ms = remaining; device.blink.phase_elapsed_ms = 0;
+    device.state_verified = true; device.connected = true; device.last_error = "";
+    device.revision = device.revision + 1; circuit.revision = circuit.revision + 1;
+    return map{ok:true, format:FORMAT, device:device.id, observed_on:device.observed_on,
+        blinking:device.blink.enabled, state_verified:true, revision:circuit.revision};
+}
+
+fn move_device(circuit, device_id, position) {
+    let device = _find(circuit, device_id);
+    if device == nil { return _error("unknown device", "unknown-device"); }
+    if type(position) != "map" { return _error("invalid device position", "invalid-position"); }
+    let px = try position.x catch device.position.x; let py = try position.y catch device.position.y;
+    if type(px) != "number" or px != num_floor(px) or px < 0 or px > 100000
+       or type(py) != "number" or py != num_floor(py) or py < 0 or py > 100000 {
+        return _error("invalid device position", "invalid-position");
+    }
+    let next = map{x:px,y:py};
+    device.position = next; device.revision = device.revision + 1;
+    circuit.revision = circuit.revision + 1;
+    return map{ ok:true, format:FORMAT, device:device.id, position:next,
+        revision:circuit.revision };
+}
+
+fn auto_discover(circuit, options = nil) {
+    if not _valid(circuit) { return _error("invalid circuit", "invalid-circuit"); }
+    if not circuit.automatic_mapping {
+        return _error("automatic mapping is disabled", "automatic-mapping-disabled");
+    }
+    let opts = if options == nil { map{} } else { options };
+    let inventory = try opts.inventory catch Linux.devices(map{include_serial:false});
+    if inventory == nil or not is_map(inventory) or not (try inventory.ok catch false)
+       or type(try inventory.devices catch nil) != "array" {
+        return _error("device discovery failed", "discovery-failed");
+    }
+    let added = []; let ambiguous = []; let skipped = [];
+    for i len(inventory.devices) {
+        let row = inventory.devices[i]; let candidates = try row.candidates catch [];
+        if len(candidates) == 1 {
+            let id = "device-" + str(i + 1);
+            while map_has(circuit.devices, id) { id = id + "x"; }
+            let result = add_device(circuit, id, candidates[0].board,
+                map{ mode:"wired", port:row.port });
+            if result.ok { array_push(added, result.device.id); }
+            else { array_push(skipped, map{port:row.port,error:result.error}); }
+        } elif len(candidates) > 1 {
+            array_push(ambiguous, map{ port:row.port, candidates:candidates });
+        } else { array_push(skipped, map{port:try row.port catch "",error:"unknown USB identity"}); }
+    }
+    return map{ ok:true, format:FORMAT, added:added, ambiguous:ambiguous,
+        skipped:skipped, serials_persisted:false, revision:circuit.revision };
+}
+
+fn snapshot(circuit) {
+    if not _valid(circuit) { return _error("invalid circuit", "invalid-circuit"); }
+    let devices = [];
+    for i len(circuit.order) {
+        let source = circuit.devices[circuit.order[i]];
+        array_push(devices, map{ id:source.id, board:source.board,
+            board_name:source.board_name, mcu:source.mcu, mode:source.mode,
+            port:source.port, position:source.position, pin:source.pin, gpio:source.gpio,
+            desired_on:source.desired_on, observed_on:source.observed_on,
+            state_verified:source.state_verified, connected:source.connected,
+            blink:source.blink, last_error:source.last_error, revision:source.revision });
+    }
+    return map{ ok:true, format:FORMAT, name:circuit.name, mode:circuit.mode,
+        devices:devices, device_count:len(devices), pending_intents:len(map_keys(circuit.pending)),
+        elapsed_ms:circuit.elapsed_ms, revision:circuit.revision,
+        automatic_mapping:circuit.automatic_mapping };
+}
+
+export FORMAT, MAX_DEVICES, MAX_PENDING, MAX_TICK_MS, MAX_DURATION_MS;
+export new, add_device, remove_device, set_led, toggle_led, set_blink, tick;
+export acknowledge, observe, move_device, auto_discover, snapshot;

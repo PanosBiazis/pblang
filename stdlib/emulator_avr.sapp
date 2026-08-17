@@ -27,6 +27,36 @@ fn compare_immediate(destination, value) {
     _require(destination, 16, 31, "CPI destination"); _require(value, 0, 255, "CPI immediate");
     return _le16(12288 + num_floor(value / 16) * 256 + (destination - 16) * 16 + value % 16);
 }
+fn and_immediate(destination, value) {
+    _require(destination, 16, 31, "ANDI destination"); _require(value, 0, 255, "ANDI immediate");
+    return _le16(28672 + num_floor(value / 16) * 256 + (destination - 16) * 16 + value % 16);
+}
+fn or_immediate(destination, value) {
+    _require(destination, 16, 31, "ORI destination"); _require(value, 0, 255, "ORI immediate");
+    return _le16(24576 + num_floor(value / 16) * 256 + (destination - 16) * 16 + value % 16);
+}
+fn subtract_immediate(destination, value) {
+    _require(destination, 16, 31, "SUBI destination"); _require(value, 0, 255, "SUBI immediate");
+    return _le16(20480 + num_floor(value / 16) * 256 + (destination - 16) * 16 + value % 16);
+}
+fn subtract_immediate_carry(destination, value) {
+    _require(destination, 16, 31, "SBCI destination"); _require(value, 0, 255, "SBCI immediate");
+    return _le16(16384 + num_floor(value / 16) * 256 + (destination - 16) * 16 + value % 16);
+}
+fn exclusive_or(destination, source) {
+    _require(destination, 0, 31, "EOR destination"); _require(source, 0, 31, "EOR source");
+    return _le16(9216 + _split(source, destination));
+}
+fn load_direct(destination, address) {
+    _require(destination, 0, 31, "LDS destination"); _require(address, 0, 2303, "LDS address");
+    let bytes = _le16(36864 + destination * 16); let address_bytes = _le16(address);
+    return [bytes[0], bytes[1], address_bytes[0], address_bytes[1]];
+}
+fn store_direct(address, source) {
+    _require(source, 0, 31, "STS source"); _require(address, 0, 2303, "STS address");
+    let bytes = _le16(37376 + source * 16); let address_bytes = _le16(address);
+    return [bytes[0], bytes[1], address_bytes[0], address_bytes[1]];
+}
 fn add(destination, source) {
     _require(destination, 0, 31, "ADD destination"); _require(source, 0, 31, "ADD source");
     return _le16(3072 + _split(source, destination));
@@ -57,9 +87,27 @@ fn branch_equal(offset) {
     _require(offset, -64, 63, "BREQ offset"); let encoded = offset; if encoded < 0 { encoded = encoded + 128; }
     return _le16(61441 + encoded * 8);
 }
+fn branch_carry_set(offset) {
+    _require(offset, -64, 63, "BRCS offset"); let encoded = offset; if encoded < 0 { encoded = encoded + 128; }
+    return _le16(61440 + encoded * 8);
+}
+fn branch_carry_clear(offset) {
+    _require(offset, -64, 63, "BRCC offset"); let encoded = offset; if encoded < 0 { encoded = encoded + 128; }
+    return _le16(62464 + encoded * 8);
+}
 fn jump_relative(offset) {
     _require(offset, -2048, 2047, "RJMP offset"); let encoded = offset; if encoded < 0 { encoded = encoded + 4096; }
     return _le16(49152 + encoded);
+}
+fn nop() { return _le16(0); }
+fn clear_interrupts() { return _le16(38136); }
+fn set_io_bit(address, bit) {
+    _require(address, 0, 31, "SBI I/O address"); _require(bit, 0, 7, "SBI bit");
+    return _le16(39424 + address * 8 + bit);
+}
+fn clear_io_bit(address, bit) {
+    _require(address, 0, 31, "CBI I/O address"); _require(bit, 0, 7, "CBI bit");
+    return _le16(38912 + address * 8 + bit);
 }
 fn halt() { return _le16(38296); }
 fn program(instructions) { return Support.program(instructions, MAX_CODE_BYTES); }
@@ -69,6 +117,33 @@ fn _wrap(value) { let result = value % 256; if result < 0 { result = result + 25
 fn _signed7(value) { if value >= 64 { return value - 128; } return value; }
 fn _failure(reason, pc, instructions) { return Support.failure(FORMAT, reason, pc, instructions); }
 
+fn _trace_address(options, address) {
+    let wanted = try options.trace_io_addresses catch [];
+    if type(wanted) != "array" { return false; }
+    for i len(wanted) { if wanted[i] == address { return true; } }
+    return false;
+}
+
+fn _stop_events(options) {
+    let value = try options.stop_after_events catch 0;
+    if not Support.integer(value, 0, 1024) { return 0; }
+    return value;
+}
+
+fn _success(pc, count, cycles, registers, zero, carry, io, events, uart_tx, halted, boundary) {
+    return map{
+        ok:true, format:FORMAT, halted:halted, pc:pc, instructions:count,
+        cycles:cycles, registers:registers, flags:map{zero:zero,carry:carry}, value:registers[24],
+        io:io, io_events:events, uart_tx:uart_tx, boundary:boundary
+    };
+}
+
+fn _option_integer(options, name, minimum, maximum, fallback) {
+    let value = try options[name] catch fallback;
+    if not Support.integer(value, minimum, maximum) { return fallback; }
+    return value;
+}
+
 fn run(code, options = nil) {
     let invalid = Support.validate_bytes(code, MAX_CODE_BYTES);
     if invalid != nil { return _failure(invalid, 0, 0); }
@@ -76,8 +151,24 @@ fn run(code, options = nil) {
     let budget_result = Support.instruction_budget(options, DEFAULT_BUDGET);
     if not budget_result.ok { return _failure(budget_result.error, 0, 0); }
 
+    if options == nil { options = map{}; }
     let registers = []; let i = 0; while i < 32 { array_push(registers, 0); i = i + 1; }
-    let zero = 0; let word_count = num_floor(len(code) / 2); let pc = 0; let count = 0;
+    let io = []; i = 0; while i < 64 { array_push(io, 0); i = i + 1; }
+    let data = []; i = 0; while i < 2304 { array_push(data, 0); i = i + 1; }
+    let uart_rx = try options.uart_rx_bytes catch [];
+    if type(uart_rx) != "array" or len(uart_rx) > 4096 {
+        return _failure("invalid AVR UART input size", 0, 0);
+    }
+    if len(uart_rx) > 0 {
+        let invalid_uart = Support.validate_bytes(uart_rx, 4096);
+        if invalid_uart != nil { return _failure("invalid AVR UART input: " + invalid_uart, 0, 0); }
+    }
+    let uart_cursor = 0; let uart_tx = [];
+    let stop_uart = _option_integer(options, "stop_after_uart_bytes", 0, 4096, 0);
+    let timer_period = _option_integer(options, "timer1_tick_every_cycles", 0, 1000000, 0);
+    let next_timer_cycle = timer_period;
+    let events = []; let stop_events = _stop_events(options); let interrupts_enabled = true;
+    let zero = 0; let carry = 0; let word_count = num_floor(len(code) / 2); let pc = 0; let count = 0; let cycles = 0;
     while count < budget_result.value {
         if pc < 0 or pc >= word_count { return _failure("program counter outside code", pc, count); }
         let word = code[pc * 2] + code[pc * 2 + 1] * 256;
@@ -88,34 +179,126 @@ fn run(code, options = nil) {
         let destination9 = num_floor(word / 16) % 32;
         let next = pc + 1; count = count + 1;
         if word == 38296 {
-            return map{
-                ok: true, format: FORMAT, halted: true, pc: pc, instructions: count,
-                registers: registers, flags: map{ zero: zero }, value: registers[24],
-                boundary: "verified AVR arithmetic/control subset; not a full MCU"
-            };
+            cycles = cycles + 1;
+            return _success(pc, count, cycles, registers, zero, carry, io, events, uart_tx, true,
+                "verified AVR arithmetic/control/GPIO subset; not a full MCU");
+        }
+        elif word == 0 { cycles = cycles + 1; }
+        elif word == 38136 { interrupts_enabled = false; cycles = cycles + 1; }
+        elif (word & 65280) == 39424 or (word & 65280) == 38912 {
+            let address = num_floor(word / 8) % 32; let bit = word % 8;
+            let before = io[address]; let mask = 1 << bit;
+            if (word & 65280) == 39424 { io[address] = before | mask; }
+            else { io[address] = before & (255 - mask); }
+            cycles = cycles + 2;
+            if _trace_address(options, address) and io[address] != before {
+                array_push(events, map{ address:address, bit:bit,
+                    value:if (io[address] & mask) != 0 { 1 } else { 0 },
+                    cycles:cycles, pc:pc });
+                if stop_events > 0 and len(events) >= stop_events {
+                    let result = _success(pc, count, cycles, registers, zero, carry, io, events, uart_tx, false,
+                        "stopped after requested AVR I/O events");
+                    result.flags.interrupts_enabled = interrupts_enabled;
+                    return result;
+                }
+            }
         }
         elif (word & 64519) == 62465 {
-            let offset = _signed7(num_floor(word / 8) % 128); if zero == 0 { next = pc + 1 + offset; }
+            let offset = _signed7(num_floor(word / 8) % 128);
+            if zero == 0 { next = pc + 1 + offset; cycles = cycles + 2; }
+            else { cycles = cycles + 1; }
         }
         elif (word & 64519) == 61441 {
-            let offset = _signed7(num_floor(word / 8) % 128); if zero == 1 { next = pc + 1 + offset; }
+            let offset = _signed7(num_floor(word / 8) % 128);
+            if zero == 1 { next = pc + 1 + offset; cycles = cycles + 2; }
+            else { cycles = cycles + 1; }
         }
-        elif (word & 65039) == 37891 { registers[destination9] = _wrap(registers[destination9] + 1); zero = _zero(registers[destination9]); }
-        elif (word & 65039) == 37898 { registers[destination9] = _wrap(registers[destination9] - 1); zero = _zero(registers[destination9]); }
+        elif (word & 64519) == 61440 {
+            let offset = _signed7(num_floor(word / 8) % 128);
+            if carry == 1 { next = pc + 1 + offset; cycles = cycles + 2; }
+            else { cycles = cycles + 1; }
+        }
+        elif (word & 64519) == 62464 {
+            let offset = _signed7(num_floor(word / 8) % 128);
+            if carry == 0 { next = pc + 1 + offset; cycles = cycles + 2; }
+            else { cycles = cycles + 1; }
+        }
+        elif (word & 65039) == 37891 { registers[destination9] = _wrap(registers[destination9] + 1); zero = _zero(registers[destination9]); cycles = cycles + 1; }
+        elif (word & 65039) == 37898 { registers[destination9] = _wrap(registers[destination9] - 1); zero = _zero(registers[destination9]); cycles = cycles + 1; }
         elif (word & 64512) == 39936 {
             let product = registers[destination5] * registers[source5];
-            registers[0] = product % 256; registers[1] = num_floor(product / 256) % 256; zero = _zero(product);
+            registers[0] = product % 256; registers[1] = num_floor(product / 256) % 256; zero = _zero(product); cycles = cycles + 2;
         }
-        elif (word & 61440) == 57344 { registers[destination_ldi] = immediate; }
-        elif (word & 61440) == 12288 { zero = _zero(registers[destination_ldi] - immediate); }
+        elif (word & 61440) == 57344 { registers[destination_ldi] = immediate; cycles = cycles + 1; }
+        elif (word & 65039) == 36864 {
+            if pc + 1 >= word_count { return _failure("truncated LDS address", pc, count); }
+            let address = code[(pc + 1) * 2] + code[(pc + 1) * 2 + 1] * 256;
+            if address >= len(data) { return _failure("LDS address outside data space", pc, count); }
+            if address == 192 {
+                data[address] = data[address] | 32;
+                if uart_cursor < len(uart_rx) { data[address] = data[address] | 128; }
+                else { data[address] = data[address] & 127; }
+            }
+            if address == 198 and uart_cursor < len(uart_rx) {
+                data[address] = uart_rx[uart_cursor]; uart_cursor = uart_cursor + 1;
+                if uart_cursor >= len(uart_rx) { data[192] = data[192] & 127; }
+            }
+            registers[destination9] = data[address]; next = pc + 2; cycles = cycles + 2;
+        }
+        elif (word & 65039) == 37376 {
+            if pc + 1 >= word_count { return _failure("truncated STS address", pc, count); }
+            let address = code[(pc + 1) * 2] + code[(pc + 1) * 2 + 1] * 256;
+            if address >= len(data) { return _failure("STS address outside data space", pc, count); }
+            if address == 54 { data[address] = data[address] & (255 - registers[destination9]); }
+            else { data[address] = registers[destination9]; }
+            if address == 198 {
+                array_push(uart_tx, registers[destination9]);
+                if stop_uart > 0 and len(uart_tx) >= stop_uart {
+                    return _success(pc, count, cycles + 2, registers, zero, carry, io, events,
+                        uart_tx, false, "stopped after requested AVR UART bytes");
+                }
+            }
+            next = pc + 2; cycles = cycles + 2;
+        }
+        elif (word & 61440) == 12288 {
+            let result = registers[destination_ldi] - immediate;
+            zero = _zero(_wrap(result)); carry = if result < 0 {1}else{0}; cycles = cycles + 1;
+        }
+        elif (word & 61440) == 28672 {
+            registers[destination_ldi] = registers[destination_ldi] & immediate;
+            zero = _zero(registers[destination_ldi]); cycles = cycles + 1;
+        }
+        elif (word & 61440) == 24576 {
+            registers[destination_ldi] = registers[destination_ldi] | immediate;
+            zero = _zero(registers[destination_ldi]); cycles = cycles + 1;
+        }
+        elif (word & 61440) == 20480 {
+            let result = registers[destination_ldi] - immediate;
+            registers[destination_ldi] = _wrap(result); zero = _zero(registers[destination_ldi]);
+            carry = if result < 0 {1}else{0}; cycles = cycles + 1;
+        }
+        elif (word & 61440) == 16384 {
+            let result = registers[destination_ldi] - immediate - carry;
+            registers[destination_ldi] = _wrap(result);
+            if registers[destination_ldi] != 0 { zero = 0; }
+            carry = if result < 0 {1}else{0}; cycles = cycles + 1;
+        }
         elif (word & 61440) == 49152 {
-            let offset = word % 4096; if offset >= 2048 { offset = offset - 4096; } next = pc + 1 + offset;
+            let offset = word % 4096; if offset >= 2048 { offset = offset - 4096; } next = pc + 1 + offset; cycles = cycles + 2;
         }
-        elif (word & 64512) == 3072 { registers[destination5] = _wrap(registers[destination5] + registers[source5]); zero = _zero(registers[destination5]); }
-        elif (word & 64512) == 6144 { registers[destination5] = _wrap(registers[destination5] - registers[source5]); zero = _zero(registers[destination5]); }
-        elif (word & 64512) == 5120 { zero = _zero(_wrap(registers[destination5] - registers[source5])); }
-        elif (word & 64512) == 11264 { registers[destination5] = registers[source5]; }
+        elif (word & 64512) == 3072 { registers[destination5] = _wrap(registers[destination5] + registers[source5]); zero = _zero(registers[destination5]); cycles = cycles + 1; }
+        elif (word & 64512) == 6144 { registers[destination5] = _wrap(registers[destination5] - registers[source5]); zero = _zero(registers[destination5]); cycles = cycles + 1; }
+        elif (word & 64512) == 5120 { zero = _zero(_wrap(registers[destination5] - registers[source5])); cycles = cycles + 1; }
+        elif (word & 64512) == 11264 { registers[destination5] = registers[source5]; cycles = cycles + 1; }
+        elif (word & 64512) == 9216 {
+            registers[destination5] = registers[destination5] ^ registers[source5];
+            zero = _zero(registers[destination5]); cycles = cycles + 1;
+        }
         else { return _failure("unmodeled word " + str(word) + " at pc " + str(pc), pc, count); }
+        if timer_period > 0 and cycles >= next_timer_cycle {
+            data[54] = data[54] | 2;
+            while cycles >= next_timer_cycle { next_timer_cycle = next_timer_cycle + timer_period; }
+        }
         pc = next;
     }
     return _failure("instruction budget exceeded", pc, count);
@@ -123,5 +306,9 @@ fn run(code, options = nil) {
 
 export FORMAT, DEFAULT_BUDGET, MAX_CODE_BYTES;
 export load_immediate, compare_immediate, add, subtract, compare, move, multiply;
+export and_immediate, or_immediate, subtract_immediate, subtract_immediate_carry;
+export exclusive_or, load_direct, store_direct;
 export increment, decrement, branch_not_equal, branch_equal, jump_relative, halt;
+export branch_carry_set, branch_carry_clear;
+export nop, clear_interrupts, set_io_bit, clear_io_bit;
 export program, run;
