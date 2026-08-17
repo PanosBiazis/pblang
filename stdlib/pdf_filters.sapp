@@ -1,0 +1,279 @@
+// Bounded pure-PBLang decoders for PDF stream filters.
+//
+// These codecs are used only after the structural parser has established exact
+// stream boundaries. Every stage enforces the caller's output ceiling so a
+// compressed PDF cannot turn into an unbounded allocation.
+
+let Flate = import("stdlib:flate.sapp");
+
+let FORMAT = "pblang.pdf-filters.v1";
+let DEFAULT_MAX_OUTPUT_BYTES = 67108864;
+
+fn _error(message) { return map{ ok: false, format: FORMAT, error: message }; }
+
+fn _white(value) {
+    return value == 0 or value == 9 or value == 10 or value == 12
+        or value == 13 or value == 32;
+}
+
+fn _integer(value, fallback, minimum, maximum) {
+    if value == nil { value = fallback; }
+    if type(value) != "number" or num_floor(value) != value
+        or value < minimum or value > maximum { return nil; }
+    return value;
+}
+
+fn _hex(value) {
+    if value >= 48 and value <= 57 { return value - 48; }
+    if value >= 65 and value <= 70 { return value - 55; }
+    if value >= 97 and value <= 102 { return value - 87; }
+    return -1;
+}
+
+fn ascii_hex_decode(input, max_output_bytes) {
+    let out = []; let high = -1; let ended = false;
+    for value in input {
+        if _white(value) { continue; }
+        if value == 62 { ended = true; break; }
+        let nibble = _hex(value);
+        if nibble < 0 { throw "PDF ASCIIHexDecode contains a non-hexadecimal byte"; }
+        if high < 0 { high = nibble; }
+        else {
+            if len(out) >= max_output_bytes { throw "PDF filter output exceeds configured limit"; }
+            array_push(out, high * 16 + nibble); high = -1;
+        }
+    }
+    if not ended { throw "PDF ASCIIHexDecode has no end marker"; }
+    if high >= 0 {
+        if len(out) >= max_output_bytes { throw "PDF filter output exceeds configured limit"; }
+        array_push(out, high * 16);
+    }
+    return out;
+}
+
+fn _ascii85_emit(out, digits, count, max_output_bytes) {
+    let value = 0;
+    for digit in digits { value = value * 85 + digit; }
+    let bytes = [num_floor(value / 16777216) % 256,
+        num_floor(value / 65536) % 256, num_floor(value / 256) % 256, value % 256];
+    let wanted = count - 1; let i = 0;
+    while i < wanted {
+        if len(out) >= max_output_bytes { throw "PDF filter output exceeds configured limit"; }
+        array_push(out, bytes[i]); i = i + 1;
+    }
+}
+
+fn ascii85_decode(input, max_output_bytes) {
+    let out = []; let digits = []; let at = 0; let ended = false;
+    while at < len(input) and _white(input[at]) { at = at + 1; }
+    if at + 1 < len(input) and input[at] == 60 and input[at + 1] == 126 { at = at + 2; }
+    while at < len(input) {
+        let value = input[at]; at = at + 1;
+        if _white(value) { continue; }
+        if value == 126 {
+            while at < len(input) and _white(input[at]) { at = at + 1; }
+            if at >= len(input) or input[at] != 62 { throw "PDF ASCII85Decode has malformed end marker"; }
+            ended = true; break;
+        }
+        if value == 122 {
+            if len(digits) != 0 { throw "PDF ASCII85Decode uses z inside a tuple"; }
+            if len(out) + 4 > max_output_bytes { throw "PDF filter output exceeds configured limit"; }
+            for ignored 4 { array_push(out, 0); }
+            continue;
+        }
+        if value < 33 or value > 117 { throw "PDF ASCII85Decode contains an invalid byte"; }
+        array_push(digits, value - 33);
+        if len(digits) == 5 { _ascii85_emit(out, digits, 5, max_output_bytes); digits = []; }
+    }
+    if not ended { throw "PDF ASCII85Decode has no end marker"; }
+    if len(digits) == 1 { throw "PDF ASCII85Decode has an incomplete one-byte tuple"; }
+    if len(digits) > 1 {
+        let count = len(digits); while len(digits) < 5 { array_push(digits, 84); }
+        _ascii85_emit(out, digits, count, max_output_bytes);
+    }
+    return out;
+}
+
+fn run_length_decode(input, max_output_bytes) {
+    let out = []; let at = 0; let ended = false;
+    while at < len(input) {
+        let control = input[at]; at = at + 1;
+        if control == 128 { ended = true; break; }
+        if control <= 127 {
+            let count = control + 1;
+            if at + count > len(input) { throw "PDF RunLengthDecode literal exceeds input"; }
+            if len(out) + count > max_output_bytes { throw "PDF filter output exceeds configured limit"; }
+            let i = 0; while i < count { array_push(out, input[at + i]); i = i + 1; }
+            at = at + count;
+        } else {
+            let count = 257 - control;
+            if at >= len(input) { throw "PDF RunLengthDecode repeat has no byte"; }
+            if len(out) + count > max_output_bytes { throw "PDF filter output exceeds configured limit"; }
+            let value = input[at]; at = at + 1;
+            for ignored count { array_push(out, value); }
+        }
+    }
+    if not ended { throw "PDF RunLengthDecode has no end marker"; }
+    return out;
+}
+
+fn _lzw_reader(bytes) { return map{ bytes: bytes, bit: 0 }; }
+
+fn _lzw_code(reader, width) {
+    if reader.bit + width > len(reader.bytes) * 8 { throw "PDF LZWDecode is truncated"; }
+    let value = 0; let i = 0;
+    while i < width {
+        let absolute = reader.bit + i;
+        let byte = reader.bytes[num_floor(absolute / 8)];
+        value = value * 2 + bit_and(bit_shr(byte, 7 - (absolute % 8)), 1);
+        i = i + 1;
+    }
+    reader.bit = reader.bit + width; return value;
+}
+
+fn _lzw_dictionary() {
+    let dictionary = []; let value = 0;
+    while value < 256 { array_push(dictionary, [value]); value = value + 1; }
+    array_push(dictionary, nil); array_push(dictionary, nil);
+    return dictionary;
+}
+
+fn _append_checked(out, values, maximum) {
+    if len(out) + len(values) > maximum { throw "PDF filter output exceeds configured limit"; }
+    for value in values { array_push(out, value); }
+}
+
+fn lzw_decode(input, early_change, max_output_bytes) {
+    early_change = _integer(early_change, 1, 0, 1);
+    if early_change == nil { throw "PDF LZWDecode EarlyChange must be 0 or 1"; }
+    let reader = _lzw_reader(input); let dictionary = _lzw_dictionary();
+    let width = 9; let previous = nil; let out = []; let ended = false;
+    while reader.bit + width <= len(input) * 8 {
+        let code = _lzw_code(reader, width);
+        if code == 256 {
+            dictionary = _lzw_dictionary(); width = 9; previous = nil; continue;
+        }
+        if code == 257 { ended = true; break; }
+        let entry = nil;
+        if code < len(dictionary) and dictionary[code] != nil { entry = dictionary[code]; }
+        elif code == len(dictionary) and previous != nil {
+            entry = slice(previous, 0, len(previous)); array_push(entry, previous[0]);
+        } else { throw "PDF LZWDecode references an invalid dictionary code"; }
+        _append_checked(out, entry, max_output_bytes);
+        if previous != nil and len(dictionary) < 4096 {
+            let added = slice(previous, 0, len(previous)); array_push(added, entry[0]);
+            array_push(dictionary, added);
+            let threshold = bit_shl(1, width) - early_change;
+            if len(dictionary) >= threshold and width < 12 { width = width + 1; }
+        }
+        previous = entry;
+    }
+    if not ended { throw "PDF LZWDecode has no end-of-data code"; }
+    return out;
+}
+
+fn _paeth(left, above, upper_left) {
+    let estimate = left + above - upper_left;
+    let dl = num_abs(estimate - left); let da = num_abs(estimate - above);
+    let du = num_abs(estimate - upper_left);
+    if dl <= da and dl <= du { return left; }
+    if da <= du { return above; }
+    return upper_left;
+}
+
+fn _predictor(decoded, parameters, max_output_bytes) {
+    let predictor = _integer(try parameters.Predictor catch nil, 1, 1, 15);
+    let colors = _integer(try parameters.Colors catch nil, 1, 1, 32);
+    let bits = _integer(try parameters.BitsPerComponent catch nil, 8, 1, 16);
+    let columns = _integer(try parameters.Columns catch nil, 1, 1, 1048576);
+    if predictor == nil or colors == nil or bits == nil or columns == nil {
+        throw "PDF stream predictor parameters are invalid";
+    }
+    if predictor == 1 { return decoded; }
+    let row_bytes = num_ceil(colors * bits * columns / 8);
+    let pixel_bytes = num_ceil(colors * bits / 8);
+    if row_bytes < 1 or row_bytes > max_output_bytes { throw "PDF predictor row exceeds configured limit"; }
+    if predictor == 2 {
+        if bits != 8 or len(decoded) % row_bytes != 0 {
+            throw "PDF TIFF predictor currently requires complete 8-bit rows";
+        }
+        let out = slice(decoded, 0, len(decoded)); let row = 0;
+        while row < len(out) {
+            let i = pixel_bytes;
+            while i < row_bytes { out[row + i] = (out[row + i] + out[row + i - pixel_bytes]) % 256; i = i + 1; }
+            row = row + row_bytes;
+        }
+        return out;
+    }
+    if predictor < 10 or predictor > 15 { throw "unsupported PDF predictor"; }
+    if len(decoded) % (row_bytes + 1) != 0 { throw "PDF PNG predictor rows are truncated"; }
+    let rows = len(decoded) / (row_bytes + 1);
+    if rows * row_bytes > max_output_bytes { throw "PDF predictor output exceeds configured limit"; }
+    let out = []; let previous = []; for ignored row_bytes { array_push(previous, 0); }
+    let at = 0;
+    while at < len(decoded) {
+        let filter = decoded[at]; at = at + 1;
+        if predictor != 15 { filter = predictor - 10; }
+        if filter < 0 or filter > 4 { throw "PDF PNG predictor filter is invalid"; }
+        let current = []; let i = 0;
+        while i < row_bytes {
+            let raw = decoded[at + i]; let left = if i < pixel_bytes { 0 } else { current[i - pixel_bytes] };
+            let above = previous[i]; let upper_left = if i < pixel_bytes { 0 } else { previous[i - pixel_bytes] };
+            let value = raw;
+            if filter == 1 { value = (raw + left) % 256; }
+            elif filter == 2 { value = (raw + above) % 256; }
+            elif filter == 3 { value = (raw + num_floor((left + above) / 2)) % 256; }
+            elif filter == 4 { value = (raw + _paeth(left, above, upper_left)) % 256; }
+            array_push(current, value); array_push(out, value); i = i + 1;
+        }
+        previous = current; at = at + row_bytes;
+    }
+    return out;
+}
+
+fn _name(value) {
+    let text = str(value); if str_starts_with(text, "/") { text = str_slice(text, 1, len(text)); }
+    return text;
+}
+
+fn decode(input, filters, parameters = nil, max_output_bytes = nil) {
+    if type(input) != "array" { return _error("PDF filter input must be bytes"); }
+    max_output_bytes = _integer(max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES, 1, 268435456);
+    if max_output_bytes == nil { return _error("invalid PDF filter output limit"); }
+    if filters == nil { filters = []; }
+    if type(filters) == "string" { filters = [filters]; }
+    if type(filters) != "array" or len(filters) > 8 { return _error("PDF filter chain must contain at most eight filters"); }
+    if parameters == nil { parameters = []; }
+    if type(parameters) == "map" { parameters = [parameters]; }
+    if type(parameters) != "array" { return _error("PDF DecodeParms must be a map or array"); }
+    let output = slice(input, 0, len(input)); let applied = []; let index = 0;
+    while index < len(filters) {
+        let filter = _name(filters[index]); let parms = if index < len(parameters) and parameters[index] != nil { parameters[index] } else { map{} };
+        if type(parms) != "map" { return _error("PDF filter parameters must be maps"); }
+        let next = nil;
+        if filter == "FlateDecode" or filter == "Fl" {
+            next = try Flate.zlib_decode(output, max_output_bytes, true) catch nil;
+            if next == nil { return _error("PDF FlateDecode failed validation"); }
+            next = try _predictor(next, parms, max_output_bytes) catch nil;
+            if next == nil { return _error("PDF FlateDecode predictor failed validation"); }
+        } elif filter == "LZWDecode" or filter == "LZW" {
+            next = try lzw_decode(output, try parms.EarlyChange catch 1, max_output_bytes) catch nil;
+            if next == nil { return _error("PDF LZWDecode failed validation"); }
+            next = try _predictor(next, parms, max_output_bytes) catch nil;
+            if next == nil { return _error("PDF LZWDecode predictor failed validation"); }
+        } elif filter == "ASCIIHexDecode" or filter == "AHx" {
+            next = try ascii_hex_decode(output, max_output_bytes) catch nil;
+        } elif filter == "ASCII85Decode" or filter == "A85" {
+            next = try ascii85_decode(output, max_output_bytes) catch nil;
+        } elif filter == "RunLengthDecode" or filter == "RL" {
+            next = try run_length_decode(output, max_output_bytes) catch nil;
+        } else { return _error("unsupported PDF stream filter: " + filter); }
+        if next == nil { return _error("PDF stream filter failed: " + filter); }
+        output = next; array_push(applied, filter); index = index + 1;
+    }
+    return map{ ok: true, format: FORMAT, bytes: output, filters: applied,
+        input_bytes: len(input), output_bytes: len(output), bounded: true };
+}
+
+export FORMAT, DEFAULT_MAX_OUTPUT_BYTES;
+export ascii_hex_decode, ascii85_decode, run_length_decode, lzw_decode, decode;

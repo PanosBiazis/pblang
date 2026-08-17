@@ -1,0 +1,162 @@
+// Bounded PBLang-native classic ESP32 ROM RAM loader. It deliberately exposes
+// no flash erase/write, eFuse, register-write, or arbitrary-address operation.
+
+let Serial = import("stdlib:linux_serial.sapp");
+let ESP32 = import("stdlib:codegen_esp32_embedded.sapp");
+
+let FORMAT = "pblang.esp32-rom-loader.v1";
+let SLIP_END = 0xc0; let SLIP_ESC = 0xdb; let SLIP_ESC_END = 0xdc; let SLIP_ESC_ESC = 0xdd;
+let OP_MEM_BEGIN = 0x05; let OP_MEM_END = 0x06; let OP_MEM_DATA = 0x07; let OP_SYNC = 0x08;
+let MAX_PACKET_BYTES = 8192; let MAX_WIRE_BYTES = 16384; let MAX_BLOCK_BYTES = 6144;
+let MAX_RESPONSE_BYTES = 4096; let MAX_SYNC_ATTEMPTS = 5;
+
+fn _error(message, code = "loader-error") {
+    return map{ok:false,format:FORMAT,code:code,error:message};
+}
+fn _integer(value,minimum,maximum){return type(value)=="number" and value==num_floor(value)
+    and value>=minimum and value<=maximum;}
+fn _append(target,source){for i len(source){array_push(target,source[i]);}}
+fn _u16(value){return [num_mod(value,256),num_mod(num_floor(value/256),256)];}
+fn _u32(value){return [num_mod(value,256),num_mod(num_floor(value/256),256),
+    num_mod(num_floor(value/65536),256),num_mod(num_floor(value/16777216),256)];}
+fn _read_u16(bytes,offset){return bytes[offset]+bytes[offset+1]*256;}
+fn _read_u32(bytes,offset){return bytes[offset]+bytes[offset+1]*256
+    +bytes[offset+2]*65536+bytes[offset+3]*16777216;}
+fn _valid_bytes(bytes,maximum){
+    if type(bytes)!="array" or len(bytes)>maximum{return false;}
+    let cursor=0;while cursor<len(bytes){
+        if not _integer(bytes[cursor],0,255){return false;}
+        cursor=cursor+1;
+    }return true;
+}
+
+fn slip_encode(payload){
+    if not _valid_bytes(payload,MAX_PACKET_BYTES){throw "esp32 loader: invalid bounded SLIP payload";}
+    let out=[SLIP_END];for i len(payload){let value=payload[i];
+        if value==SLIP_END{_append(out,[SLIP_ESC,SLIP_ESC_END]);}
+        elif value==SLIP_ESC{_append(out,[SLIP_ESC,SLIP_ESC_ESC]);}
+        else {array_push(out,value);}
+        if len(out)>MAX_WIRE_BYTES{throw "esp32 loader: escaped SLIP packet exceeds limit";}
+    }array_push(out,SLIP_END);return out;
+}
+fn new_decoder(){return map{format:FORMAT,buffer:[],started:false,escaped:false,
+    discarded:0,malformed:0};}
+fn slip_feed(decoder,bytes){
+    if type(decoder)!="map" or (try decoder.format catch "")!=FORMAT
+       or not _valid_bytes(bytes,MAX_RESPONSE_BYTES){return _error("invalid bounded SLIP feed","slip-input");}
+    let frames=[];for i len(bytes){let value=bytes[i];
+        if value==SLIP_END{
+            if decoder.started and len(decoder.buffer)>0{array_push(frames,decoder.buffer);}
+            decoder.buffer=[];decoder.started=true;decoder.escaped=false;
+        } elif not decoder.started{decoder.discarded=decoder.discarded+1;}
+        elif decoder.escaped{
+            if value==SLIP_ESC_END{array_push(decoder.buffer,SLIP_END);}
+            elif value==SLIP_ESC_ESC{array_push(decoder.buffer,SLIP_ESC);}
+            else {decoder.buffer=[];decoder.started=false;decoder.malformed=decoder.malformed+1;}
+            decoder.escaped=false;
+        } elif value==SLIP_ESC{decoder.escaped=true;}
+        else {array_push(decoder.buffer,value);}
+        if len(decoder.buffer)>MAX_PACKET_BYTES{return _error("SLIP frame exceeds packet limit","slip-limit");}
+    }return map{ok:true,format:FORMAT,frames:frames,discarded:decoder.discarded,
+        malformed:decoder.malformed};
+}
+fn checksum(bytes){if not _valid_bytes(bytes,MAX_PACKET_BYTES){throw "esp32 loader: invalid checksum bytes";}
+    let value=0xef;for i len(bytes){value=bit_xor(value,bytes[i]);}return value;}
+fn command_packet(opcode,data,data_checksum){
+    if not _integer(opcode,0,255) or not _valid_bytes(data,MAX_PACKET_BYTES) or len(data)>65535
+       or not _integer(data_checksum,0,255){throw "esp32 loader: invalid ROM command";}
+    let packet=[0,opcode];_append(packet,_u16(len(data)));_append(packet,_u32(data_checksum));
+    _append(packet,data);return packet;
+}
+fn parse_response(packet,expected_opcode){
+    if not _valid_bytes(packet,MAX_PACKET_BYTES) or len(packet)<12{return _error("truncated ROM response","response-shape");}
+    if packet[0]!=1 or packet[1]!=expected_opcode{return _error("unmatched ROM response","response-command");}
+    let size=_read_u16(packet,2);if size<4 or 8+size!=len(packet){return _error("invalid ROM response length","response-length");}
+    let status_at=8+size-4;let status=packet[status_at];let error=packet[status_at+1];
+    return map{ok:status==0,format:FORMAT,opcode:packet[1],size:size,
+        value:_read_u32(packet,4),status:status,rom_error:error,
+        error:if status==0{""}else{"ESP32 ROM command failed with error "+str(error)}};
+}
+fn sync_payload(){let data=[0x07,0x07,0x12,0x20];let count=0;
+    while count<32{array_push(data,0x55);count=count+1;}return data;}
+fn mem_begin_payload(total,blocks,block_size,address){let out=[];
+    _append(out,_u32(total));_append(out,_u32(blocks));_append(out,_u32(block_size));
+    _append(out,_u32(address));return out;}
+fn mem_data_payload(block,sequence){if not _valid_bytes(block,MAX_BLOCK_BYTES){throw "esp32 loader: invalid RAM block";}
+    let out=[];_append(out,_u32(len(block)));_append(out,_u32(sequence));
+    _append(out,[0,0,0,0,0,0,0,0]);_append(out,block);return out;}
+fn mem_end_payload(entry){let out=[0,0,0,0];_append(out,_u32(entry));return out;}
+fn align_ram_data(bytes){
+    if not _valid_bytes(bytes,MAX_PACKET_BYTES){throw "esp32 loader: invalid RAM data";}
+    let out=[];_append(out,bytes);while num_mod(len(out),4)!=0{array_push(out,0);}return out;
+}
+
+fn _exchange(serial,opcode,data,checksum_value,timeout_ms){
+    let wire=slip_encode(command_packet(opcode,data,checksum_value));
+    let wrote=Serial.write_bytes(serial,wire,timeout_ms);if not wrote.ok{return _error(wrote.error,"serial-write");}
+    let decoder=new_decoder();let received=0;let started=now_ms();
+    while now_ms()-started<timeout_ms and received<MAX_RESPONSE_BYTES{
+        let remaining=timeout_ms-num_floor(now_ms()-started);if remaining<1{remaining=1;}
+        let read=Serial.read_bytes(serial,MAX_RESPONSE_BYTES-received,remaining);
+        if not read.ok{return _error(read.error,"serial-read");}received=received+read.bytes_read;
+        let decoded=slip_feed(decoder,read.bytes);if not decoded.ok{return decoded;}
+        for i len(decoded.frames){let response=parse_response(decoded.frames[i],opcode);
+            if response.ok or response.code!="response-command"{response.bytes_received=received;return response;}}
+        if read.bytes_read==0{break;}
+    }return _error("ESP32 ROM response deadline expired","response-timeout");
+}
+fn _enter_bootloader(serial){
+    let first=Serial.set_modem_lines(serial,false,true);if not first.ok{return first;}sleep_ms(100);
+    let second=Serial.set_modem_lines(serial,true,false);if not second.ok{return second;}sleep_ms(50);
+    let release=Serial.set_modem_lines(serial,false,false);if not release.ok{return release;}sleep_ms(50);
+    return Serial.flush_input(serial);
+}
+fn _sync(serial,timeout_ms){let attempt=0;let last=_error("ESP32 ROM synchronization failed","sync");
+    while attempt<MAX_SYNC_ATTEMPTS{attempt=attempt+1;
+        let result=_exchange(serial,OP_SYNC,sync_payload(),0,timeout_ms);
+        if result.ok{result.attempts=attempt;return result;}last=result;sleep_ms(50);
+    }last.attempts=attempt;return last;
+}
+fn load_ram(artifact,request=nil){
+    let options=if request==nil{map{}}else{request};
+    if type(options)!="map"{return _error("loader options must be a map","invalid-options");}
+    if (try env_get("PB_EMBEDDED_RAM_LOAD_ENABLE") catch "")!="1"
+       or not (try options.confirm_ram_load catch false){
+        return _error("RAM loading requires PB_EMBEDDED_RAM_LOAD_ENABLE=1 and explicit confirmation","permission");
+    }
+    if type(artifact)!="map" or not (try artifact.ok catch false)
+       or (try artifact.board catch "")!="esp32-devkitc-v4" or not (try artifact.ram_only catch false){
+        return _error("verified classic ESP32 RAM artifact required","artifact");
+    }
+    let parsed=try ESP32.parse_image(artifact.image) catch nil;
+    if parsed==nil or not parsed.ok{return _error("ESP32 image validation failed","artifact");}
+    let port=str(try options.port catch "");let timeout=try options.timeout_ms catch 1000;
+    if port=="" or not _integer(timeout,100,5000){return _error("invalid port or bounded timeout","invalid-options");}
+    let serial=Serial.open_port(port,115200);if not serial.ok{return serial;}
+    let stage="bootloader-reset";let result=_enter_bootloader(serial);
+    if result.ok{stage="sync";result=_sync(serial,timeout);}
+    let transfer=align_ram_data(parsed.segment);let transfer_bytes=len(transfer);
+    let block_size=MAX_BLOCK_BYTES;let blocks=num_floor((transfer_bytes+block_size-1)/block_size);
+    if result.ok{stage="mem-begin";result=_exchange(serial,OP_MEM_BEGIN,
+        mem_begin_payload(transfer_bytes,blocks,block_size,parsed.load_address),0,timeout);}
+    let sequence=0;let offset=0;
+    while result.ok and sequence<blocks{let count=block_size;if transfer_bytes-offset<count{count=transfer_bytes-offset;}
+        let block=[];for i count{array_push(block,transfer[offset+i]);}
+        stage="mem-data-"+str(sequence);
+        result=_exchange(serial,OP_MEM_DATA,mem_data_payload(block,sequence),checksum(block),timeout);
+        sequence=sequence+1;offset=offset+count;
+    }
+    if result.ok{stage="mem-end";result=_exchange(serial,OP_MEM_END,mem_end_payload(parsed.entry_address),0,timeout);}
+    let closed=Serial.close(serial);
+    if not result.ok{result.stage=stage;result.termios_restored=closed.termios_restored;return result;}
+    return map{ok:closed.ok,format:FORMAT,board:artifact.board,transport:"esp32-rom-uart",
+        native_source_language:"pblang",ram_only:true,flash_written:false,efuse_written:false,
+        segment_bytes:parsed.segment_bytes,transfer_bytes:transfer_bytes,blocks:blocks,load_address:parsed.load_address,
+        entry_address:parsed.entry_address,termios_restored:closed.termios_restored,
+        error:if closed.ok{""}else{"serial state restoration failed"}};
+}
+
+export FORMAT, SLIP_END, SLIP_ESC, SLIP_ESC_END, SLIP_ESC_ESC;
+export OP_MEM_BEGIN, OP_MEM_END, OP_MEM_DATA, OP_SYNC, MAX_PACKET_BYTES, MAX_BLOCK_BYTES;
+export slip_encode, new_decoder, slip_feed, checksum, command_packet, parse_response;
+export sync_payload, mem_begin_payload, mem_data_payload, mem_end_payload, align_ram_data, load_ram;

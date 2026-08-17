@@ -1,0 +1,226 @@
+// Bounded Linux discovery, mapping, flashing and monitoring for embedded boards.
+// Application/compiler/HAL code remains PBLang. avrdude is a temporary fixed
+// flashing transport only; it never compiles or lowers source.
+
+let Targets = import("stdlib:embedded_targets.sapp");
+let Secure = import("stdlib:secure_file.sapp");
+let Serial = import("stdlib:linux_serial.sapp");
+let FORMAT = "pblang.embedded-linux.v1";
+let MAX_TOOL_OUTPUT = 1048576;
+let MAX_DEVICES = 64;
+
+fn _enabled(name) { return (try env_get(name) catch "") == "1"; }
+
+fn _run(executable, args, seconds = 10) {
+    if type(executable) != "string" or not str_starts_with(executable, "/") or not fs_exists(executable) {
+        return map{ ok:false, exit_code:127, stdout:"", stderr:"tool is unavailable" };
+    }
+    if type(args) != "array" or len(args) > 64 or seconds < 1 or seconds > 120 {
+        throw "embedded_linux: invalid bounded process request";
+    }
+    for i len(args) {
+        if type(args[i]) != "string" or len(args[i]) > 4096 or str_contains(args[i], "\x00") {
+            throw "embedded_linux: invalid process argument";
+        }
+    }
+    let timeout = if fs_exists("/usr/bin/timeout") { "/usr/bin/timeout" } else { "/bin/timeout" };
+    if not fs_exists(timeout) { return map{ ok:false, exit_code:127, stdout:"", stderr:"timeout is unavailable" }; }
+    let argv = ["--signal=TERM", "--kill-after=2s", str(seconds) + "s", executable];
+    for i len(args) { array_push(argv, args[i]); }
+    let result = try proc_spawn_wait(timeout, argv) catch nil;
+    if result == nil { return map{ ok:false, exit_code:127, stdout:"", stderr:"could not start tool" }; }
+    let stdout = str(try result.stdout catch ""); let stderr = str(try result.stderr catch "");
+    if len(stdout) > MAX_TOOL_OUTPUT or len(stderr) > MAX_TOOL_OUTPUT {
+        return map{ ok:false, exit_code:74, stdout:"", stderr:"tool output exceeded limit" };
+    }
+    return map{ ok:(try result.exit_code catch 1)==0, exit_code:try result.exit_code catch 1,
+        stdout:stdout, stderr:stderr };
+}
+
+fn _properties(text) {
+    let out = map{}; let lines = str_split(str(text), "\n");
+    if len(lines) > 512 { throw "embedded_linux: udev property output exceeds line limit"; }
+    for i len(lines) {
+        let at = str_index_of(lines[i], "=");
+        if at > 0 {
+            let key = str_slice(lines[i], 0, at); let value = str_slice(lines[i], at + 1, len(lines[i]));
+            if len(key) <= 96 and len(value) <= 4096 { out[key] = value; }
+        }
+    }
+    return out;
+}
+
+fn _match_boards(vid, pid) {
+    let matches = []; let boards = Targets.boards();
+    for i len(boards) {
+        for j len(boards[i].usb_matches) {
+            let usb = boards[i].usb_matches[j];
+            if str_lower(usb.vid) == str_lower(vid) and str_lower(usb.pid) == str_lower(pid) {
+                array_push(matches, map{ board:boards[i].id, confidence:usb.confidence });
+            }
+        }
+    }
+    return matches;
+}
+
+fn inspect_port(port, include_serial = false) {
+    let path = str(port);
+    if not regex_match(path, "^/dev/(ttyUSB|ttyACM)[0-9]{1,3}$") or not fs_exists(path) {
+        return map{ ok:false, format:FORMAT, error:"port is not an existing USB serial TTY", port:path };
+    }
+    let probe = _run("/usr/bin/udevadm", ["info","--query=property","--name=" + path], 5);
+    if not probe.ok { return map{ ok:false, format:FORMAT, error:"udev inspection failed", port:path }; }
+    let props = _properties(probe.stdout);
+    let vid = str_lower(str(try props.ID_VENDOR_ID catch ""));
+    let pid = str_lower(str(try props.ID_MODEL_ID catch ""));
+    let serial_value = str(try props.ID_SERIAL_SHORT catch "");
+    let links = str(try props.DEVLINKS catch ""); let stable = "";
+    let candidates = str_split(links, " ");
+    for i len(candidates) { if str_starts_with(candidates[i], "/dev/serial/by-id/") { stable = candidates[i]; } }
+    return map{ ok:true, format:FORMAT, port:path,
+        stable_path:if include_serial { stable } else { "" },
+        stable_path_present:stable!="", stable_path_redacted:not include_serial,
+        vid:vid, pid:pid,
+        transport:str(try props.ID_USB_DRIVER catch ""),
+        vendor:str(try props.ID_VENDOR_FROM_DATABASE catch try props.ID_VENDOR catch ""),
+        model:str(try props.ID_MODEL_FROM_DATABASE catch try props.ID_MODEL catch ""),
+        serial_present:serial_value!="", serial:if include_serial { serial_value } else { "" },
+        serial_redacted:not include_serial, candidates:_match_boards(vid,pid),
+        exact_board:false, discovery_only:true };
+}
+
+fn devices(options = nil) {
+    if platform() != "linux" { return map{ ok:false, format:FORMAT, error:"Linux discovery backend required", devices:[] }; }
+    let include_serial = try options.include_serial catch false;
+    let names = try fs_listdir("/sys/class/tty") catch [];
+    let rows = [];
+    for i len(names) {
+        if len(rows) < MAX_DEVICES and regex_match(names[i], "^(ttyUSB|ttyACM)[0-9]{1,3}$") {
+            let row = inspect_port("/dev/" + names[i], include_serial);
+            if row.ok { array_push(rows, row); }
+        }
+    }
+    return map{ ok:true, format:FORMAT, devices:rows, count:len(rows),
+        serials_included:include_serial, auto_detection_is_transport_level:true };
+}
+
+fn _candidate(device, board_id) {
+    for i len(device.candidates) { if device.candidates[i].board == board_id { return device.candidates[i]; } }
+    return nil;
+}
+
+fn _verified_uno_probe(device, probe_result) {
+    if not probe_result.ok { return map{ ok:false, format:FORMAT,
+        error:"ATmega328P probe transport failed", port:device.port, transport:device.transport }; }
+    if not str_contains(str_lower(probe_result.stdout + probe_result.stderr), "device signature = 0x1e950f") {
+        return map{ ok:false, format:FORMAT, error:"ATmega328P signature was not verified",
+            port:device.port, transport:device.transport };
+    }
+    return map{ ok:true, format:FORMAT, board:"arduino-uno", mcu:"atmega328p",
+        signature:"0x1e950f", port:device.port, exact_board:false,
+        exact_mcu:true, read_only_probe:true, reset_may_occur:true };
+}
+
+fn probe_uno(port) {
+    if not _enabled("PB_EMBEDDED_PROBE_ENABLE") {
+        return map{ ok:false, format:FORMAT, error:"read-only hardware probing is disabled" };
+    }
+    let device = inspect_port(port, false); if not device.ok { return device; }
+    return _verified_uno_probe(device, _run("/usr/bin/avrdude",
+        ["-p","atmega328p","-c","arduino","-P",device.port,"-b","115200","-n","-v"], 15));
+}
+
+fn resolve_mapping(board_id, port = nil, options = nil) {
+    let board = Targets.board(board_id);
+    if board == nil { return map{ ok:false, format:FORMAT, error:"unknown board" }; }
+    let rows = devices(map{include_serial:false}); if not rows.ok { return rows; }
+    let explicit = port != nil and str(port) != ""; let selected = nil;
+    for i len(rows.devices) {
+        if explicit and rows.devices[i].port == str(port) { selected = rows.devices[i]; }
+        elif not explicit and _candidate(rows.devices[i], board.id) != nil {
+            if selected != nil { return map{ ok:false, format:FORMAT,
+                error:"multiple transport-compatible devices require an explicit port", board:board.id }; }
+            selected = rows.devices[i];
+        }
+    }
+    if selected == nil { return map{ ok:false, format:FORMAT,
+        error:if explicit { "selected port is not available" } else { "no compatible wired device detected" }, board:board.id }; }
+    let candidate_match = _candidate(selected, board.id);
+    if candidate_match == nil { return map{ ok:false, format:FORMAT,
+        error:"selected port USB identity is incompatible with requested board", board:board.id, port:selected.port }; }
+    let result = map{ ok:true, format:FORMAT, board:board.id, port:selected.port,
+        stable_path:selected.stable_path, vid:selected.vid, pid:selected.pid,
+        confidence:candidate_match.confidence, user_override:explicit, exact_mcu:false };
+    if board.id == "arduino-uno" and (try options.probe catch false) {
+        let verified = probe_uno(selected.port);
+        if not verified.ok { return verified; }
+        result.exact_mcu = true; result.signature = verified.signature;
+    }
+    return result;
+}
+
+fn doctor(options = nil) {
+    let rows = devices(map{include_serial:false});
+    return map{ ok:platform()=="linux" and rows.ok, format:FORMAT, platform:platform(),
+        devices:if rows.ok { rows.devices } else { [] },
+        avrdude:fs_exists("/usr/bin/avrdude"),
+        esp_transport:fs_exists("/usr/bin/esptool") or fs_exists("/usr/bin/esptool.py"),
+        serial_backend:Serial.available(), probe_enabled:_enabled("PB_EMBEDDED_PROBE_ENABLE"),
+        flash_enabled:_enabled("PB_EMBEDDED_FLASH_ENABLE"),
+        monitor_enabled:_enabled("PB_EMBEDDED_MONITOR_ENABLE"),
+        include_serial:try options.include_serial catch false };
+}
+
+fn publish_artifact(artifact, output_path) {
+    if artifact == nil or not is_map(artifact) or not (try artifact.ok catch false) {
+        return map{ ok:false, format:FORMAT, error:"successful embedded artifact required" };
+    }
+    let path = str(output_path);
+    if not regex_match(path, "^[A-Za-z0-9._/-]{1,512}$") or str_starts_with(path, "/")
+       or str_contains(path, "../") or str_contains(path, "//") {
+        return map{ ok:false, format:FORMAT, error:"output path must be a safe project-relative path" };
+    }
+    let bytes = if artifact.firmware_format == "ihex" { artifact.intel_hex_bytes } else { try artifact.image catch nil };
+    if type(bytes) != "array" { return map{ ok:false, format:FORMAT, error:"artifact has no publishable firmware bytes" }; }
+    let written = Secure.write_atomic(path, bytes, true, false);
+    if not written.ok { return map{ ok:false, format:FORMAT, error:try written.error catch "firmware publication failed" }; }
+    return map{ ok:true, format:FORMAT, path:path, bytes:len(bytes), artifact_sha256:artifact.sha256,
+        atomic:try written.atomic catch true };
+}
+
+fn flash(artifact, request) {
+    if not _enabled("PB_EMBEDDED_FLASH_ENABLE") {
+        return map{ ok:false, format:FORMAT, error:"flashing is disabled; set PB_EMBEDDED_FLASH_ENABLE=1" };
+    }
+    if request == nil or not is_map(request) or not (try request.confirm_device_write catch false)
+       or str(try request.confirm_board catch "") != str(try artifact.board catch "") {
+        return map{ ok:false, format:FORMAT, error:"explicit device-write and exact board confirmation are required" };
+    }
+    let mapping = resolve_mapping(artifact.board, try request.port catch nil, map{probe:true});
+    if not mapping.ok { return mapping; }
+    if artifact.board != "arduino-uno" or artifact.firmware_format != "ihex" {
+        return map{ ok:false, format:FORMAT, error:"native flashing transport is not implemented for this artifact",
+            board:artifact.board };
+    }
+    let output_path = str(try request.artifact_path catch "build/embedded/arduino-uno/firmware.hex");
+    let published = publish_artifact(artifact, output_path); if not published.ok { return published; }
+    let result = _run("/usr/bin/avrdude", ["-p","atmega328p","-c","arduino","-P",mapping.port,
+        "-b","115200","-D","-U","flash:w:" + output_path + ":i"], 45);
+    return map{ ok:result.ok, format:FORMAT, board:artifact.board, port:mapping.port,
+        exact_mcu:mapping.exact_mcu, artifact_path:output_path, artifact_sha256:artifact.sha256,
+        verified_by_transport:result.ok, exit_code:result.exit_code,
+        error:if result.ok { "" } else { "flashing or read-back verification failed" } };
+}
+
+fn monitor(port, maximum = 4096, timeout_ms = 3000, baud = 9600) {
+    if not _enabled("PB_EMBEDDED_MONITOR_ENABLE") {
+        return map{ ok:false, format:FORMAT, error:"serial monitoring is disabled" };
+    }
+    let inspected = inspect_port(port, false); if not inspected.ok { return inspected; }
+    let serial = Serial.open_port(inspected.port, baud); if not serial.ok { return serial; }
+    let result = Serial.read_bytes(serial, maximum, timeout_ms); let closed = Serial.close(serial);
+    result.termios_restored = closed.termios_restored; return result;
+}
+
+export FORMAT, inspect_port, devices, probe_uno, resolve_mapping, doctor;
+export publish_artifact, flash, monitor;

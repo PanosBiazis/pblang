@@ -1,0 +1,233 @@
+// Shared bounded LED controller for deterministic emulators and direct wired
+// serial devices. Serial responses are corruption-checked and sequence-bound;
+// this direct-device protocol is intentionally not exposed as a network API.
+
+let Protocol = import("stdlib:embedded_protocol.sapp");
+let Circuit = import("stdlib:embedded_circuit.sapp");
+let Serial = import("stdlib:linux_serial.sapp");
+
+let FORMAT = "pblang.embedded-controller.v1";
+let MAX_RETRIES = 3;
+let MAX_RESPONSE_BYTES = 96;
+let MIN_TIMEOUT_MS = 20;
+let MAX_TIMEOUT_MS = 10000;
+let MAX_RESET_WAIT_MS = 5000;
+
+fn _error(message, code = "controller-error") {
+    return map{ok:false, format:FORMAT, code:code, error:message};
+}
+
+fn limits() {
+    return map{max_retries:MAX_RETRIES, max_response_bytes:MAX_RESPONSE_BYTES,
+        minimum_timeout_ms:MIN_TIMEOUT_MS, maximum_timeout_ms:MAX_TIMEOUT_MS,
+        maximum_reset_wait_ms:MAX_RESET_WAIT_MS};
+}
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _device(circuit, device_id) {
+    let state = Circuit.snapshot(circuit);
+    if not state.ok { return nil; }
+    let wanted = str_lower(str(device_id));
+    for i len(state.devices) { if state.devices[i].id == wanted { return state.devices[i]; } }
+    return nil;
+}
+
+fn _next(sequence) { if sequence == 255 { return 1; } return sequence + 1; }
+
+fn _command(sequence, opcode, value = 0, interval_ms = 500, duration_ms = 0) {
+    return map{sequence:sequence, opcode:opcode, value:value,
+        interval_ms:interval_ms, duration_ms:duration_ms};
+}
+
+fn _local_exchange(session, command) {
+    let parsed = Protocol.decode_command(Protocol.encode_command(command));
+    let result = Protocol.execute(session.protocol_device, parsed);
+    if not result.ok { return result; }
+    let wire = Protocol.encode_response(result.response);
+    let response = Protocol.decode_response(wire);
+    if not response.ok { return response; }
+    return map{ok:true, format:FORMAT, response:response, attempts:1,
+        bytes_sent:Protocol.FRAME_BYTES, bytes_received:Protocol.FRAME_BYTES,
+        transport:"emulator"};
+}
+
+fn _read_response(session, sequence, deadline_ms) {
+    let decoder = Protocol.new_decoder("response");
+    let started = now_ms(); let received = 0;
+    while now_ms() - started < deadline_ms and received < MAX_RESPONSE_BYTES {
+        let remaining = deadline_ms - num_floor(now_ms() - started);
+        if remaining < 1 { remaining = 1; }
+        let maximum = MAX_RESPONSE_BYTES - received;
+        let read = Serial.read_bytes(session.serial, maximum, remaining);
+        if not read.ok { return _error(try read.error catch "serial response read failed", "serial-read"); }
+        received = received + read.bytes_read;
+        let parsed = Protocol.feed(decoder, read.bytes);
+        if not parsed.ok { return _error(parsed.error, "protocol-decode"); }
+        for i len(parsed.frames) {
+            if parsed.frames[i].sequence == sequence {
+                return map{ok:true, format:FORMAT, response:parsed.frames[i],
+                    bytes_received:received, discarded_bytes:decoder.discarded_bytes};
+            }
+        }
+        if read.bytes_read == 0 { break; }
+    }
+    return _error("device response deadline expired", "response-timeout");
+}
+
+fn _wired_exchange(session, command) {
+    let frame = try Protocol.encode_command(command) catch nil;
+    if frame == nil { return _error("command could not be encoded", "protocol-encode"); }
+    let attempt = 0; let last = _error("device did not respond", "response-timeout");
+    while attempt < session.retries {
+        attempt = attempt + 1;
+        let wrote = Serial.write_bytes(session.serial, frame, session.timeout_ms);
+        if not wrote.ok {
+            last = _error(try wrote.error catch "serial command write failed", "serial-write");
+        } else {
+            let read = _read_response(session, command.sequence, session.timeout_ms);
+            if read.ok {
+                read.attempts = attempt; read.bytes_sent = wrote.bytes_sent;
+                read.transport = "wired-serial"; return read;
+            }
+            last = read;
+        }
+    }
+    last.attempts = attempt; return last;
+}
+
+fn _exchange(session, command) {
+    if type(session) != "map" or (try session.format catch "") != FORMAT
+       or not (try session.connected catch false) or (try session.closed catch true) {
+        return _error("controller session is not connected", "not-connected");
+    }
+    if session.mode == "emulator" { return _local_exchange(session, command); }
+    return _wired_exchange(session, command);
+}
+
+fn connect(circuit, device_id, options = nil) {
+    let device = _device(circuit, device_id);
+    if device == nil { return _error("unknown circuit device", "unknown-device"); }
+    let opts = if options == nil { map{} } else { options };
+    if type(opts) != "map" { return _error("controller options must be a map", "invalid-options"); }
+    let timeout = try opts.timeout_ms catch 800;
+    let retries = try opts.retries catch 2;
+    let reset_wait = try opts.reset_wait_ms catch if device.board == "arduino-uno" {1600}else{50};
+    let baud = try opts.baud catch 115200;
+    if not _integer(timeout, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
+       or not _integer(retries, 1, MAX_RETRIES)
+       or not _integer(reset_wait, 0, MAX_RESET_WAIT_MS)
+       or not _integer(baud, 50, 4000000) {
+        return _error("controller timing or baud options are outside limits", "invalid-options");
+    }
+    let session = map{ok:true, format:FORMAT, circuit:circuit, device_id:device.id,
+        board:device.board, mode:device.mode, port:device.port, baud:baud,
+        timeout_ms:timeout, retries:retries, sequence:1, connected:false,
+        synchronized:false, closed:false, serial:nil, protocol_device:nil};
+    if device.mode == "emulator" {
+        session.protocol_device = Protocol.new_device(); session.connected = true;
+    } else {
+        if platform() != "linux" { return _error("wired serial controller is implemented on Linux only", "platform-unsupported"); }
+        let serial = Serial.open_port(device.port, baud);
+        if not serial.ok { return _error(try serial.error catch "serial device open failed", "serial-open"); }
+        session.serial = serial; session.connected = true;
+        if reset_wait > 0 { sleep_ms(reset_wait); }
+        let flushed = Serial.flush_input(serial);
+        if not flushed.ok { Serial.close(serial); return _error(flushed.error, "serial-flush"); }
+    }
+    let hello = _exchange(session, _command(session.sequence, Protocol.OP_STATUS));
+    if not hello.ok or hello.response.status != Protocol.STATUS_OK {
+        close(session);
+        return _error(if hello.ok {"device rejected synchronization"}else{hello.error}, "handshake-failed");
+    }
+    session.synchronized = true; session.sequence = _next(session.sequence);
+    session.last_response = hello.response;
+    if session.mode == "wired" { Circuit.observe(circuit, device.id, hello.response); }
+    return session;
+}
+
+fn _send(session, opcode, value = 0, interval_ms = 500, duration_ms = 0) {
+    let sequence = session.sequence;
+    let result = _exchange(session, _command(sequence, opcode, value, interval_ms, duration_ms));
+    if not result.ok { return result; }
+    if result.response.status != Protocol.STATUS_OK
+       and result.response.status != Protocol.STATUS_DUPLICATE {
+        return _error("device rejected command with status " + str(result.response.status), "device-rejected");
+    }
+    session.sequence = _next(sequence); session.last_response = result.response;
+    result.applied = result.response.status == Protocol.STATUS_OK and opcode != Protocol.OP_STATUS;
+    return result;
+}
+
+fn status(session) {
+    let result = _send(session, Protocol.OP_STATUS);
+    if result.ok { result.circuit = Circuit.observe(session.circuit, session.device_id, result.response); }
+    return result;
+}
+
+fn _acknowledge(session, pending, exchange) {
+    if not pending.ok { return pending; }
+    if session.mode == "emulator" { return exchange; }
+    if not exchange.ok {
+        return Circuit.acknowledge(session.circuit, pending.intent.id, false, false,
+            try exchange.error catch "device command failed");
+    }
+    let acknowledged = Circuit.acknowledge(session.circuit, pending.intent.id,
+        exchange.response.on, true, "");
+    exchange.circuit = acknowledged; return exchange;
+}
+
+fn set_led(session, on) {
+    if type(on) != "bool" { return _error("LED state must be boolean", "invalid-state"); }
+    let pending = Circuit.set_led(session.circuit, session.device_id, on);
+    let exchanged = _send(session, Protocol.OP_SET, if on {1}else{0});
+    return _acknowledge(session, pending, exchanged);
+}
+
+fn toggle_led(session) {
+    let pending = Circuit.toggle_led(session.circuit, session.device_id);
+    let exchanged = _send(session, Protocol.OP_TOGGLE);
+    return _acknowledge(session, pending, exchanged);
+}
+
+fn set_blink(session, enabled, interval_ms = 500, duration_ms = 0) {
+    if type(enabled) != "bool" { return _error("blink enabled must be boolean", "invalid-blink"); }
+    if not _integer(interval_ms, Protocol.MIN_INTERVAL_MS, Protocol.MAX_INTERVAL_MS)
+       or not _integer(duration_ms, 0, Protocol.MAX_DURATION_MS) {
+        return _error("blink timing is outside physical protocol limits", "invalid-timing");
+    }
+    let pending = Circuit.set_blink(session.circuit, session.device_id,
+        enabled, interval_ms, duration_ms);
+    let exchanged = if enabled {
+        _send(session, Protocol.OP_BLINK, 0, interval_ms, duration_ms)
+    } else { _send(session, Protocol.OP_STOP) };
+    return _acknowledge(session, pending, exchanged);
+}
+
+fn tick(session, elapsed_ms) {
+    if session.mode != "emulator" {
+        return _error("wired timing is owned by device firmware", "device-owned-time");
+    }
+    let protocol = Protocol.tick(session.protocol_device, elapsed_ms);
+    let circuit = Circuit.tick(session.circuit, elapsed_ms);
+    return map{ok:protocol.ok and circuit.ok, format:FORMAT,
+        protocol:protocol, circuit:circuit};
+}
+
+fn close(session) {
+    let restored = true;
+    if type(session) == "map" and (try session.format catch "") == FORMAT
+       and not (try session.closed catch true) {
+        if session.mode == "wired" and session.serial != nil {
+            let result = Serial.close(session.serial); restored = result.termios_restored;
+        }
+        session.connected = false; session.synchronized = false; session.closed = true;
+    }
+    return map{ok:restored, format:FORMAT, termios_restored:restored};
+}
+
+export FORMAT, MAX_RETRIES, MAX_RESPONSE_BYTES, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS;
+export limits, connect, status, set_led, toggle_led, set_blink, tick, close;

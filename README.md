@@ -22,6 +22,11 @@ pblang is a general-purpose programming language and bytecode VM designed for em
   [source security and analysis](docs/Security_Analysis.md).
 - **Package manager** with manifests, lockfiles, local and registry dependencies, checksums, and HMAC helpers.
 - **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, bounded memory/SQLite/Redis data stores, provider-neutral edge/regional CDN caching, native SQLite, bounded native Parquet metadata/PLAIN-page reading, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more. `stdlib:onnx.sapp` provides bounded deterministic ONNX protobuf decoding and PBLang-native CPU inference for a documented operator subset, failing closed on unsupported models without Python or ONNX Runtime. `stdlib:command_argv.sapp` converts legacy command text to bounded literal argv without shell evaluation and rejects operators, redirects, substitutions, comments and controls; new APIs should accept structured argv directly. See [data storage](docs/Data_Storage.md) and [CDN caching](docs/CDN_Caching.md).
+- **Portable coding-agent skills** through `stdlib:agent_skills.sapp`: bounded
+  `SKILL.md` frontmatter/body parsing, strict portable names and metadata,
+  Codex/Claude Code/OpenCode compatibility reports, effect-indicator review,
+  and deterministic in-memory bundles. It performs no discovery, file access,
+  placeholder expansion, plugin loading, hook registration, or command execution.
 - **Bounded identity and organization policy** through `stdlib:iam.sapp`:
   users, organizations, memberships, system administrators,
   `owner`/`admin`/`member`/`viewer` RBAC, explicit permissions, tenant-scoped
@@ -136,6 +141,26 @@ semantic `primary`, `secondary`, `navigation`, `ghost` and `danger` variants;
 older calls remain primary by default and custom palettes can override the
 corresponding selected, focus, danger and on-accent roles.
 See [`docs/MODERN_UI.md`](docs/MODERN_UI.md).
+
+### Native embedded programming
+
+`stdlib/embedded.sapp` provides capability-checked portable GPIO/time IR,
+board/MCU/architecture descriptors, deterministic circuit emulation, and a
+native AVR8 backend. PBLang currently emits a compact ATmega328P firmware body
+and Intel HEX directly, without a C/C++/Rust source fallback:
+
+```pblang
+let embedded = import("stdlib:embedded.sapp");
+let firmware = embedded.build(embedded.blink("status-led-test", 500), "arduino-uno");
+```
+
+The ESP32 RAM-only GPIO23 blink path has physical timing evidence, while its
+persistent/general backend and the RP2040/RP2350, Renesas and broader MCU
+backends remain fail-closed. `pbembed manual`, `inspect`, and `inspect-pin`
+publish technical data without confusing hardware capability with compiler
+support. See [`docs/Embedded_Programming.md`](docs/Embedded_Programming.md) and
+the runnable `examples/embedded_blink/`, `examples/embedded_circuit/`, and
+`examples/embedded_inspector/`.
 
 ### One-line CDN-backed static site
 
@@ -387,6 +412,10 @@ it as trusted maintenance code with
 `pblang run tools/pblock.sapp --allow-all -- <project>`. Nested source
 dependencies should not ship their own bootstrap lock
 until the self-hosted loader owns nested relative-path resolution end to end.
+The PBLang-native `pbbuild --project` path now performs this publication
+automatically after a successful build and removes the produced artifact if
+portable lock publication fails. Direct retained-bootstrap `pblang build`
+still requires `pblock` as its explicit final publication step.
 
 See [`STRUCTURE.md`](STRUCTURE.md) for the crate map and [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md) for the current test/status snapshot.
 

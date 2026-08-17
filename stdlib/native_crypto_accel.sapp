@@ -1,0 +1,173 @@
+// Optional bounded SHA-2/AES-CBC acceleration through the operating system's
+// OpenSSL 3 libcrypto. The implementation is PBLang source, loads only fixed
+// trusted library paths, wipes secret-bearing native buffers, and has no
+// unsandboxed fallback. Callers retain a pure-PBLang fallback.
+
+let AES=import("stdlib:aes_gcm.sapp");
+let FORMAT="pblang.native-crypto-accel.v1";
+let LIBC=[
+    "/usr/lib/x86_64-linux-gnu/libc.so.6","/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6","/lib/aarch64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6","/lib/i386-linux-gnu/libc.so.6"
+];
+let CRYPTO=[
+    "/usr/lib/x86_64-linux-gnu/libcrypto.so.3","/lib/x86_64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/aarch64-linux-gnu/libcrypto.so.3","/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "/usr/lib/i386-linux-gnu/libcrypto.so.3","/lib/i386-linux-gnu/libcrypto.so.3",
+    "/usr/lib/libcrypto.so.3"
+];
+let MAX_BYTES=1048576;
+
+fn _fixed_path(candidates) { for path in candidates { if try fs_exists(path) catch false { return path; } } return nil; }
+fn _integer(value,minimum,maximum) { return type(value)=="number" and num_floor(value)==value and value>=minimum and value<=maximum; }
+fn _valid_bytes_limit(value,limit) {
+    if type(value)!="array" or len(value)>limit { return false; }
+    for byte in value { if not _integer(byte,0,255) { return false; } } return true;
+}
+fn _valid_bytes(value) { return _valid_bytes_limit(value,MAX_BYTES); }
+fn _call(session,library,name,signature,args) { return try ffi_call_typed(library,name,signature,args) catch nil; }
+fn _calloc(session,count) { return _call(session,session.libc,"calloc","i64,i64->ptr",[1,count]); }
+fn _free(session,pointer) { if pointer!=nil and pointer!=0 { _call(session,session.libc,"free","ptr->void",[pointer]); } }
+fn _crypto_free(session,pointer) {
+    if pointer!=nil and pointer!=0 { _call(session,session.crypto,"CRYPTO_free","ptr,ptr,i32->void",[pointer,0,0]); }
+}
+fn _clean(session,pointer,count) {
+    if pointer!=nil and pointer!=0 and count>0 { _call(session,session.crypto,"OPENSSL_cleanse","ptr,i64->void",[pointer,count]); }
+}
+fn _clean_free(session,pointer,count,crypto_owned=false) {
+    _clean(session,pointer,count); if crypto_owned { _crypto_free(session,pointer); } else { _free(session,pointer); }
+}
+fn _native_bytes(session,bytes) {
+    if not _valid_bytes(bytes) { return nil; }
+    let length=_calloc(session,8); if length==nil or length==0 { return nil; }
+    let pointer=_call(session,session.crypto,"OPENSSL_hexstr2buf","string,ptr->ptr",[AES.bytes_hex(bytes),length]);
+    _free(session,length); if pointer==nil or pointer==0 { return nil; }
+    return map{pointer:pointer,length:len(bytes),crypto_owned:true};
+}
+fn _copy_bytes(session,pointer,count) {
+    if pointer==nil or pointer==0 or not _integer(count,0,MAX_BYTES) { return nil; }
+    if count==0 { return []; }
+    let encoded=_call(session,session.crypto,"OPENSSL_buf2hexstr","ptr,i64->ptr",[pointer,count]);
+    if encoded==nil or encoded==0 { return nil; }
+    let text=_call(session,session.libc,"basename","ptr->string",[encoded]); _crypto_free(session,encoded);
+    if type(text)!="string" { return nil; }
+    let compact=str_lower(str_replace_all(text,":",""));
+    if len(compact)!=count*2 { return nil; }
+    return try AES.hex_bytes(compact) catch nil;
+}
+
+fn open() {
+    if platform()!="linux" { return map{ok:false,format:FORMAT,error:"native crypto accelerator is unavailable on this platform"}; }
+    let libc_path=_fixed_path(LIBC); let crypto_path=_fixed_path(CRYPTO);
+    if libc_path==nil or crypto_path==nil { return map{ok:false,format:FORMAT,error:"trusted OpenSSL 3 libraries are unavailable"}; }
+    let libc=try ffi_load(libc_path) catch nil; if libc==nil { return map{ok:false,format:FORMAT,error:"trusted libc could not be loaded"}; }
+    let crypto=try ffi_load(crypto_path) catch nil;
+    if crypto==nil { try ffi_close(libc) catch nil; return map{ok:false,format:FORMAT,error:"trusted libcrypto could not be loaded"}; }
+    return map{ok:true,format:FORMAT,libc:libc,crypto:crypto,closed:false};
+}
+fn close(session) {
+    if type(session)=="map" and (try session.ok catch false) and not (try session.closed catch true) {
+        try ffi_close(session.crypto) catch nil; try ffi_close(session.libc) catch nil; session.closed=true;
+    }
+    return nil;
+}
+fn digest(session,bits,bytes) {
+    if not (try session.ok catch false) or session.closed or not _valid_bytes(bytes)
+        or (bits!=256 and bits!=384 and bits!=512) {
+        return map{ok:false,format:FORMAT,error:"invalid native digest request"};
+    }
+    let input=_native_bytes(session,bytes); if input==nil { return map{ok:false,format:FORMAT,error:"native digest input allocation failed"}; }
+    let output=_calloc(session,64);
+    if output==nil or output==0 {
+        _clean_free(session,input.pointer,input.length,true); _free(session,output);
+        return map{ok:false,format:FORMAT,error:"native digest output allocation failed"};
+    }
+    let name="SHA256"; if bits==384 { name="SHA384"; } elif bits==512 { name="SHA512"; }
+    let status=_call(session,session.crypto,name,"ptr,i64,ptr->ptr",[input.pointer,input.length,output]);
+    let count=bits/8; let result=nil; if status!=nil and status!=0 { result=_copy_bytes(session,output,count); }
+    _clean_free(session,input.pointer,input.length,true); _clean_free(session,output,64);
+    if result==nil { return map{ok:false,format:FORMAT,error:"native digest failed"}; }
+    return map{ok:true,format:FORMAT,bytes:result,bits:bits};
+}
+fn aes_cbc_encrypt_blocks(session,data,key,iv) {
+    if not (try session.ok catch false) or session.closed or not _valid_bytes(data)
+        or len(data)%16!=0 or not _valid_bytes_limit(key,32) or (len(key)!=16 and len(key)!=32)
+        or not _valid_bytes_limit(iv,16) or len(iv)!=16 {
+        return map{ok:false,format:FORMAT,error:"invalid native AES-CBC request"};
+    }
+    let input=_native_bytes(session,data); let native_key=_native_bytes(session,key); let native_iv=_native_bytes(session,iv);
+    let output=_calloc(session,len(data)+16); let context=_call(session,session.crypto,"EVP_CIPHER_CTX_new","->ptr",[]);
+    if input==nil or native_key==nil or native_iv==nil or output==nil or output==0 or context==nil or context==0 {
+        if input!=nil {_clean_free(session,input.pointer,input.length,true);} if native_key!=nil {_clean_free(session,native_key.pointer,native_key.length,true);}
+        if native_iv!=nil {_clean_free(session,native_iv.pointer,native_iv.length,true);} _clean_free(session,output,len(data)+16);
+        if context!=nil {_call(session,session.crypto,"EVP_CIPHER_CTX_free","ptr->void",[context]);}
+        return map{ok:false,format:FORMAT,error:"native AES-CBC allocation failed"};
+    }
+    let cipher_name="EVP_aes_128_cbc"; if len(key)==32 { cipher_name="EVP_aes_256_cbc"; }
+    let cipher=_call(session,session.crypto,cipher_name,"->ptr",[]); let status=0; let stage="cipher";
+    if cipher!=nil and cipher!=0 {
+        status=_call(session,session.crypto,"EVP_EncryptInit","ptr,ptr,ptr,ptr->i32",
+            [context,cipher,native_key.pointer,native_iv.pointer]); stage="init";
+    }
+    if status==1 { status=_call(session,session.crypto,"EVP_CIPHER_CTX_set_padding","ptr,i32->i32",[context,0]); stage="padding"; }
+    if status==1 { status=_call(session,session.crypto,"EVP_Cipher","ptr,ptr,ptr,i32->i32",[context,output,input.pointer,len(data)]); stage="cipher-data"; }
+    let result=nil; if status==len(data) { result=_copy_bytes(session,output,len(data)); }
+    _call(session,session.crypto,"EVP_CIPHER_CTX_free","ptr->void",[context]);
+    _clean_free(session,input.pointer,input.length,true); _clean_free(session,native_key.pointer,native_key.length,true);
+    _clean_free(session,native_iv.pointer,native_iv.length,true); _clean_free(session,output,len(data)+16);
+    if result==nil { return map{ok:false,format:FORMAT,error:"native AES-CBC encryption failed",stage:stage,status:status}; }
+    return map{ok:true,format:FORMAT,bytes:result};
+}
+
+// One complete ISO 32000 Algorithm 2.B round. Large E buffers stay native:
+// only the next digest and termination byte cross back into the VM.
+fn r6_round(session,unit,key) {
+    if not (try session.ok catch false) or session.closed or not _valid_bytes_limit(unit,512)
+        or len(unit)<32 or not _valid_bytes_limit(key,64) or len(key)<32 {
+        return map{ok:false,format:FORMAT,error:"invalid native R6 round request"};
+    }
+    let native_unit=_native_bytes(session,unit); let repeated_count=len(unit)*64;
+    let repeated=_calloc(session,repeated_count); let native_key=_native_bytes(session,slice(key,0,16));
+    let native_iv=_native_bytes(session,slice(key,16,32)); let encrypted=_calloc(session,repeated_count+16);
+    let context=_call(session,session.crypto,"EVP_CIPHER_CTX_new","->ptr",[]);
+    if native_unit==nil or repeated==nil or repeated==0 or native_key==nil or native_iv==nil
+        or encrypted==nil or encrypted==0 or context==nil or context==0 {
+        if native_unit!=nil {_clean_free(session,native_unit.pointer,native_unit.length,true);}
+        if native_key!=nil {_clean_free(session,native_key.pointer,native_key.length,true);}
+        if native_iv!=nil {_clean_free(session,native_iv.pointer,native_iv.length,true);}
+        _clean_free(session,repeated,repeated_count); _clean_free(session,encrypted,repeated_count+16);
+        if context!=nil {_call(session,session.crypto,"EVP_CIPHER_CTX_free","ptr->void",[context]);}
+        return map{ok:false,format:FORMAT,error:"native R6 allocation failed"};
+    }
+    let copied=true; for index 64 {
+        let destination=repeated+index*len(unit);
+        let value=_call(session,session.libc,"memcpy","ptr,ptr,i64->ptr",[destination,native_unit.pointer,len(unit)]);
+        if value==nil or value==0 { copied=false; }
+    }
+    let cipher=_call(session,session.crypto,"EVP_aes_128_cbc","->ptr",[]); let status=0;
+    if copied and cipher!=nil and cipher!=0 {
+        status=_call(session,session.crypto,"EVP_EncryptInit","ptr,ptr,ptr,ptr->i32",
+            [context,cipher,native_key.pointer,native_iv.pointer]);
+    }
+    if status==1 { status=_call(session,session.crypto,"EVP_CIPHER_CTX_set_padding","ptr,i32->i32",[context,0]); }
+    if status==1 { status=_call(session,session.crypto,"EVP_Cipher","ptr,ptr,ptr,i32->i32",
+        [context,encrypted,repeated,repeated_count]); }
+    let first=nil; let last=nil;
+    if status==repeated_count { first=_copy_bytes(session,encrypted,16); last=_copy_bytes(session,encrypted+repeated_count-1,1); }
+    let remainder=0; if first!=nil { for byte in first { remainder=(remainder+byte)%3; } }
+    let bits=256; if remainder==1 { bits=384; } elif remainder==2 { bits=512; }
+    let digest_output=_calloc(session,64); let digest_pointer=nil;
+    if first!=nil and last!=nil and digest_output!=nil and digest_output!=0 {
+        let digest_name="SHA256"; if bits==384 { digest_name="SHA384"; } elif bits==512 { digest_name="SHA512"; }
+        digest_pointer=_call(session,session.crypto,digest_name,"ptr,i64,ptr->ptr",[encrypted,repeated_count,digest_output]);
+    }
+    let digest=nil; if digest_pointer!=nil and digest_pointer!=0 { digest=_copy_bytes(session,digest_output,bits/8); }
+    _call(session,session.crypto,"EVP_CIPHER_CTX_free","ptr->void",[context]);
+    _clean_free(session,native_unit.pointer,native_unit.length,true); _clean_free(session,native_key.pointer,native_key.length,true);
+    _clean_free(session,native_iv.pointer,native_iv.length,true); _clean_free(session,repeated,repeated_count);
+    _clean_free(session,encrypted,repeated_count+16); _clean_free(session,digest_output,64);
+    if digest==nil or last==nil { return map{ok:false,format:FORMAT,error:"native R6 round failed"}; }
+    return map{ok:true,format:FORMAT,digest:digest,last_byte:last[0],hash_bits:bits};
+}
+
+export FORMAT,MAX_BYTES,open,close,digest,aes_cbc_encrypt_blocks,r6_round;

@@ -13,6 +13,12 @@
 
 ## Unreleased
 
+- Added the PBLang-native embedded architecture/MCU/board/pin model, portable
+  GPIO/time/ADC/DAC/PWM IR validation, a direct AVR8/Intel HEX backend, a
+  RAM-only classic ESP32 image backend, privacy-safe Linux discovery, bounded
+  flashing/monitoring, circuit emulation, technical manuals and pin inspector.
+  Physical UNO flash/read-back and ESP32 GPIO23 timing are verified; all other
+  native MCU backends remain explicit fail-closed contracts.
 - Added `stdlib/linux_device_handle.sapp`, a PBLang-only Linux character-device
   boundary with exact device-class paths, held-parent `openat`, no-follow,
   close-on-exec and nonblocking descriptors, bounded read/write deadlines, and

@@ -17,6 +17,9 @@ let AT_FDCWD = -100;
 let O_RDWR = 2; let O_NOCTTY = 256; let O_NONBLOCK = 2048;
 let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
 let POLLIN = 1; let POLLOUT = 4; let TCSANOW = 0; let TERMIOS_BYTES = 64;
+let TCIFLUSH = 0;
+let TIOCMGET = 0x5415; let TIOCMSET = 0x5418;
+let TIOCM_DTR = 0x0002; let TIOCM_RTS = 0x0004;
 let BAUD = map{
     "50":1,"75":2,"110":3,"134":4,"150":5,"200":6,"300":7,"600":8,
     "1200":9,"1800":10,"2400":11,"4800":12,"9600":13,"19200":14,"38400":15,
@@ -53,6 +56,21 @@ fn _write_le(state,pointer,value,count){let remaining=value;for i count{
     _call(state,"memset","ptr,i32,i64->ptr",[pointer+i,num_mod(remaining,256),1]);
     remaining=num_floor(remaining/256);
 }}
+fn _read_le_bytes(bytes){let value=0;let multiplier=1;for i len(bytes){
+    value=value+bytes[i]*multiplier;multiplier=multiplier*256;}return value;}
+fn _modem_get(state){
+    let pointer=_call(state,"calloc","i64,i64->ptr",[1,4]);if pointer==nil or pointer==0{return -1;}
+    let result=_i32(_call(state,"ioctl","i32,i64,ptr->i32",[state.fd,TIOCMGET,pointer]));
+    if result!=0{_free(state,pointer);return -1;}
+    let copied=_pointer_bytes(state,pointer,4);_free(state,pointer);
+    if not copied.ok{return -1;}return _read_le_bytes(copied.bytes);
+}
+fn _modem_set(state,value){
+    let pointer=_call(state,"calloc","i64,i64->ptr",[1,4]);if pointer==nil or pointer==0{return false;}
+    _write_le(state,pointer,value,4);
+    let result=_i32(_call(state,"ioctl","i32,i64,ptr->i32",[state.fd,TIOCMSET,pointer]));
+    _free(state,pointer);return result==0;
+}
 fn _poll(state,events,timeout_ms){
     if not _integer(timeout_ms,0,60000){return -1;}
     let record=_call(state,"calloc","i64,i64->ptr",[1,8]);if record==nil or record==0{return -1;}
@@ -65,7 +83,8 @@ fn _hex(bytes){let digits="0123456789abcdef";let out="";for i len(bytes){
     out=out+str_slice(digits,high,high+1)+str_slice(digits,low,low+1);
 }return out;}
 fn _valid_bytes(value){if type(value)!="array" or len(value)>MAX_IO_BYTES{return false;}
-    for i len(value){if not _integer(value[i],0,255){return false;}}return true;}
+    let cursor=0;while cursor<len(value){if not _integer(value[cursor],0,255){return false;}
+        cursor=cursor+1;}return true;}
 fn _pointer_bytes(state,pointer,count){
     if pointer==nil or pointer==0 or not _integer(count,0,MAX_IO_BYTES){return map{ok:false,error:"invalid serial byte copy"};}
     if count==0{return map{ok:true,bytes:[],count:0};}
@@ -95,7 +114,7 @@ fn _handles(){let support=available();if not support.ok{return map{ok:false,erro
     if libc==nil or crypto==nil{try ffi_close(libc) catch nil;try ffi_close(crypto) catch nil;
         return map{ok:false,error:"trusted serial libraries unavailable"};}
     return map{ok:true,format:FORMAT,libc:libc,crypto:crypto,fd:-1,closed:false,
-        original:0,working:0,configured:false};
+        original:0,working:0,configured:false,original_modem:-1,modem_captured:false};
 }
 fn open_port(port,baud=9600){
     let parsed=_port(port);if not parsed.ok{return parsed;}
@@ -124,8 +143,28 @@ fn open_port(port,baud=9600){
         close(state);return map{ok:false,error:"serial raw mode or baud configuration failed"};
     }
     state.ok=true;state.configured=true;state.path=parsed.path;state.baud=baud;
+    state.original_modem=_modem_get(state);state.modem_captured=state.original_modem>=0;
     state.descriptor_bound=true;state.nofollow=true;state.nonblocking=true;state.cloexec=true;
     return state;
+}
+fn modem_lines(state){
+    if type(state)!="map" or (try state.format catch "")!=FORMAT or (try state.closed catch true){
+        return map{ok:false,error:"invalid serial modem-line query"};
+    }
+    let value=_modem_get(state);if value<0{return map{ok:false,error:"serial modem lines unavailable"};}
+    return map{ok:true,format:FORMAT,dtr:bit_and(value,TIOCM_DTR)!=0,
+        rts:bit_and(value,TIOCM_RTS)!=0,raw:value};
+}
+fn set_modem_lines(state,dtr,rts){
+    if type(state)!="map" or (try state.format catch "")!=FORMAT or (try state.closed catch true)
+        or type(dtr)!="bool" or type(rts)!="bool"{
+        return map{ok:false,error:"invalid serial modem-line update"};
+    }
+    let value=_modem_get(state);if value<0{return map{ok:false,error:"serial modem lines unavailable"};}
+    value=bit_and(value,4294967295-TIOCM_DTR-TIOCM_RTS);
+    if dtr{value=bit_or(value,TIOCM_DTR);}if rts{value=bit_or(value,TIOCM_RTS);}
+    if not _modem_set(state,value){return map{ok:false,error:"serial modem-line update failed"};}
+    return map{ok:true,format:FORMAT,dtr:dtr,rts:rts};
 }
 fn read_bytes(state,maximum=4096,timeout_ms=3000){
     if type(state)!="map" or (try state.format catch "")!=FORMAT or (try state.closed catch true)
@@ -171,9 +210,20 @@ fn write_bytes(state,bytes,timeout_ms=3000){
     _free_crypto(state,buffer);return map{ok:true,format:FORMAT,count:offset,bytes_sent:offset,
         elapsed_ms:now_ms()-started,descriptor_bound:true,nonblocking:true};
 }
+fn flush_input(state){
+    if type(state)!="map" or (try state.format catch "")!=FORMAT or (try state.closed catch true){
+        return map{ok:false,error:"invalid serial input flush"};
+    }
+    let flushed=_i32(_call(state,"tcflush","i32,i32->i32",[state.fd,TCIFLUSH]))==0;
+    return map{ok:flushed,format:FORMAT,input_flushed:flushed,
+        error:if flushed{""}else{"serial input flush failed"}};
+}
 fn close(state){
     let restored=true;
     if type(state)=="map" and not (try state.closed catch true){
+        if (try state.modem_captured catch false) and (try state.fd catch -1)>=0{
+            restored=_modem_set(state,state.original_modem) and restored;
+        }
         if (try state.configured catch false) and (try state.fd catch -1)>=0
             and (try state.original catch 0)!=0 {
             restored=_i32(_call(state,"tcsetattr","i32,i32,ptr->i32",
@@ -213,5 +263,6 @@ fn close_test_pty(state){
     return map{ok:true};
 }
 
-export FORMAT, MAX_IO_BYTES, available, open_port, read_bytes, write_bytes, close;
+export FORMAT, MAX_IO_BYTES, available, open_port, modem_lines, set_modem_lines;
+export read_bytes, write_bytes, flush_input, close;
 export test_pty_pair, test_write_master, test_read_master, close_test_pty;

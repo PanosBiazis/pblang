@@ -1,0 +1,400 @@
+// Bounded deterministic media generation and credential-free model handoffs.
+//
+// Native generators create procedural media. Semantic model generation is a
+// separate request/response hook so callers cannot confuse a handoff with an
+// executed model or silently send content to an external service.
+
+let MATH = import("stdlib:math.sapp");
+let PCM = import("stdlib:audio_pcm.sapp");
+let IMAGE = import("stdlib:image_pipeline.sapp");
+
+let FORMAT = "pblang.media-generation.v1";
+let HOOK_FORMAT = "pblang.media-generation-hook.v1";
+let MAX_PROMPT_CHARS = 4096;
+let MAX_IMAGE_PIXELS = 1048576;
+let MAX_AUDIO_SECONDS = 30;
+let MAX_VIDEO_BYTES = 16777216;
+let MAX_HOOK_INPUT_BYTES = 4194304;
+let MAX_HOOK_OUTPUT_BYTES = 16777216;
+
+fn _text(value, label, maximum) {
+    if type(value) != "string" or len(value) < 1 or len(value) > maximum {
+        throw label + " must contain 1.." + str(maximum) + " characters";
+    }
+    return value;
+}
+
+fn _integer(value, label, minimum, maximum) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw label + " must be an integer in " + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _number(value, label, minimum, maximum) {
+    let encoded = try json_stringify(value) catch "";
+    if type(value) != "number" or encoded == "" or encoded == "null"
+       or value < minimum or value > maximum {
+        throw label + " must be a finite number in " + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _enum(value, label, values) {
+    if type(value) != "string" { throw label + " must be a string"; }
+    for i len(values) { if value == values[i] { return value; } }
+    throw label + " is unsupported";
+}
+
+fn _seed(text) {
+    let value = 2166136261;
+    for i len(text) {
+        value = num_mod(value * 16777619 + strcharcodeat(text, i), 2147483647);
+    }
+    return value;
+}
+
+fn _next(value) { return num_mod(value * 1103515245 + 12345, 2147483647); }
+fn _byte(value) { return num_min(255, num_max(0, num_floor(value))); }
+fn _sample(value) { return num_min(32767, num_max(-32768, num_floor(value))); }
+
+fn _palette(seed) {
+    return [
+        [48 + num_mod(seed, 160), 32 + num_mod(num_floor(seed / 7), 176),
+            48 + num_mod(num_floor(seed / 31), 160)],
+        [32 + num_mod(num_floor(seed / 13), 192), 48 + num_mod(num_floor(seed / 43), 160),
+            32 + num_mod(num_floor(seed / 97), 192)],
+        [64 + num_mod(num_floor(seed / 19), 160), 64 + num_mod(num_floor(seed / 59), 160),
+            64 + num_mod(num_floor(seed / 127), 160)]
+    ];
+}
+
+fn _blend(a, b, amount) {
+    return _byte(a * (1.0 - amount) + b * amount);
+}
+
+fn generate_image(prompt, width = 512, height = 512, style = "gradient") {
+    prompt = _text(prompt, "prompt", MAX_PROMPT_CHARS);
+    width = _integer(width, "width", 16, 1024);
+    height = _integer(height, "height", 16, 1024);
+    if width * height > MAX_IMAGE_PIXELS { throw "image exceeds the one-megapixel generation limit"; }
+    style = _enum(style, "style", ["gradient", "checker", "mosaic", "noise", "waves"]);
+    let seed = _seed(prompt + ":" + style); let palette = _palette(seed); let state = seed;
+    let image = [];
+    for y height {
+        let row = [];
+        for x width {
+            let tx = x / num_max(1, width - 1); let ty = y / num_max(1, height - 1);
+            let mix = (tx + ty) / 2.0; let r = _blend(palette[0][0], palette[1][0], mix);
+            let g = _blend(palette[0][1], palette[1][1], mix);
+            let b = _blend(palette[0][2], palette[1][2], mix);
+            if style == "checker" {
+                let cell = 8 + num_mod(seed, 24);
+                let alternate = num_mod(num_floor(x / cell) + num_floor(y / cell), 2) == 1;
+                let color = palette[0]; if alternate { color = palette[2]; }
+                r = color[0]; g = color[1]; b = color[2];
+            } elif style == "mosaic" {
+                let cell = 6 + num_mod(seed, 18);
+                let block = _next(seed + num_floor(x / cell) * 131 + num_floor(y / cell) * 977);
+                r = _byte(palette[0][0] + num_mod(block, 97) - 48);
+                g = _byte(palette[1][1] + num_mod(num_floor(block / 11), 97) - 48);
+                b = _byte(palette[2][2] + num_mod(num_floor(block / 31), 97) - 48);
+            } elif style == "noise" {
+                state = _next(state); let grain = num_mod(state, 256);
+                r = _blend(r, grain, 0.42); g = _blend(g, num_mod(grain + 73, 256), 0.32);
+                b = _blend(b, num_mod(grain + 151, 256), 0.38);
+            } elif style == "waves" {
+                let band = num_mod(x * (3 + num_mod(seed, 9)) + y * (5 + num_mod(seed, 7)), 192) / 191.0;
+                r = _blend(palette[0][0], palette[2][0], band);
+                g = _blend(palette[0][1], palette[2][1], band);
+                b = _blend(palette[0][2], palette[2][2], band);
+            }
+            array_push(row, [r, g, b, 255]);
+        }
+        array_push(image, row);
+    }
+    IMAGE.dimensions(image);
+    return map{ ok: true, executed: true, format: FORMAT, media_kind: "image",
+        generation_mode: "procedural", semantic_prompt_interpretation: false,
+        prompt_sha256: sha256(prompt), style: style, width: width, height: height,
+        image: image, deterministic: true, external_process: false };
+}
+
+fn _wave_table(wave, seed, size = 2048) {
+    wave = _enum(wave, "wave", ["sine", "square", "triangle", "saw", "noise"]);
+    let table = []; let state = seed;
+    for i size {
+        let phase = i / size; let value = 0.0;
+        if wave == "sine" { value = MATH.sin(MATH.TAU * phase); }
+        elif wave == "square" { value = -1.0; if phase < 0.5 { value = 1.0; } }
+        elif wave == "triangle" { value = 1.0 - 4.0 * num_abs(phase - 0.5); }
+        elif wave == "saw" { value = phase * 2.0 - 1.0; }
+        else { state = _next(state); value = num_mod(state, 65536) / 32767.5 - 1.0; }
+        array_push(table, value);
+    }
+    return table;
+}
+
+fn _table_sample(table, frame, frequency, sample_rate) {
+    let phase = num_mod(frame * frequency / sample_rate, 1.0);
+    return table[num_min(len(table) - 1, num_floor(phase * len(table)))];
+}
+
+fn generate_tone(frequency = 440, duration_secs = 1.0, wave = "sine",
+                  sample_rate = 24000, volume = 0.5, channels = 1) {
+    frequency = _number(frequency, "frequency", 20, 20000);
+    duration_secs = _number(duration_secs, "duration_secs", 0.01, MAX_AUDIO_SECONDS);
+    sample_rate = _integer(sample_rate, "sample_rate", 8000, 48000);
+    channels = _integer(channels, "channels", 1, 2);
+    volume = _number(volume, "volume", 0, 1);
+    let frames = num_floor(duration_secs * sample_rate);
+    if frames * channels > PCM.MAX_SAMPLES { throw "tone exceeds the PCM sample limit"; }
+    let table = _wave_table(wave, num_floor(frequency * 1000)); let samples = [];
+    for frame frames {
+        let envelope = num_min(1.0, frame / num_max(1, sample_rate * 0.01));
+        envelope = num_min(envelope, (frames - frame) / num_max(1, sample_rate * 0.02));
+        let value = _sample(_table_sample(table, frame, frequency, sample_rate) * 32767 * volume * envelope);
+        let channel = 0;
+        while channel < channels { array_push(samples, value); channel = channel + 1; }
+    }
+    let audio = map{ format: PCM.FORMAT, sample_rate: sample_rate, channels: channels, samples: samples };
+    let info = PCM.validate(audio);
+    return map{ ok: true, executed: true, format: FORMAT, media_kind: "audio",
+        generation_mode: "oscillator", wave: wave, frequency: frequency,
+        duration_secs: info.duration_secs, audio: audio, deterministic: true,
+        external_process: false };
+}
+
+fn generate_sound_effect(preset = "confirm", duration_secs = 0.6,
+                         sample_rate = 24000, volume = 0.55) {
+    preset = _enum(preset, "preset", ["confirm", "notify", "alert", "error", "click", "sweep"]);
+    duration_secs = _number(duration_secs, "duration_secs", 0.05, 5);
+    sample_rate = _integer(sample_rate, "sample_rate", 8000, 48000);
+    volume = _number(volume, "volume", 0, 1);
+    let frames = num_floor(duration_secs * sample_rate);
+    if frames > PCM.MAX_SAMPLES { throw "sound effect exceeds the PCM sample limit"; }
+    let seed = _seed(preset); let table = _wave_table(if preset == "click" { "noise" } else { "sine" }, seed);
+    let samples = [];
+    for frame frames {
+        let progress = frame / num_max(1, frames - 1); let frequency = 440;
+        if preset == "confirm" { frequency = 659.25; if progress < 0.5 { frequency = 523.25; } }
+        elif preset == "notify" { frequency = 783.99; if progress < 0.5 { frequency = 659.25; } }
+        elif preset == "alert" { frequency = 660; if num_mod(num_floor(progress * 8), 2) == 0 { frequency = 880; } }
+        elif preset == "error" { frequency = 233.08; if progress < 0.5 { frequency = 311.13; } }
+        elif preset == "click" { frequency = 1200; }
+        elif preset == "sweep" { frequency = 220 + progress * 1540; }
+        let envelope = (1.0 - progress) * num_min(1.0, frame / num_max(1, sample_rate * 0.005));
+        array_push(samples, _sample(_table_sample(table, frame, frequency, sample_rate)
+            * 32767 * volume * envelope));
+    }
+    let audio = map{ format: PCM.FORMAT, sample_rate: sample_rate, channels: 1, samples: samples };
+    let info = PCM.validate(audio);
+    return map{ ok: true, executed: true, format: FORMAT, media_kind: "audio",
+        generation_mode: "sound-effect", preset: preset, duration_secs: info.duration_secs,
+        audio: audio, deterministic: true, external_process: false };
+}
+
+fn generate_music(prompt, duration_secs = 8, bpm = 110, style = "ambient",
+                   sample_rate = 24000, volume = 0.45) {
+    prompt = _text(prompt, "prompt", MAX_PROMPT_CHARS);
+    duration_secs = _number(duration_secs, "duration_secs", 1, 20);
+    bpm = _integer(bpm, "bpm", 40, 240);
+    style = _enum(style, "style", ["ambient", "arcade", "minimal", "pulse", "calm"]);
+    sample_rate = _integer(sample_rate, "sample_rate", 8000, 48000);
+    volume = _number(volume, "volume", 0, 1);
+    let frames = num_floor(duration_secs * sample_rate);
+    if frames > PCM.MAX_SAMPLES { throw "music exceeds the PCM sample limit"; }
+    let seed = _seed(prompt + ":" + style); let root = 48 + num_mod(seed, 13);
+    let scale = [0, 3, 5, 7, 10];
+    if style == "calm" or style == "ambient" { scale = [0, 2, 4, 7, 9]; }
+    let wave = "sine";
+    if style == "arcade" { wave = "square"; } elif style == "pulse" { wave = "saw"; }
+    let table = _wave_table(wave, seed); let bass_table = _wave_table("triangle", seed + 1);
+    let samples = []; let beat_secs = 60.0 / bpm;
+    for frame frames {
+        let time = frame / sample_rate; let step = num_floor(time / (beat_secs / 2));
+        let degree = scale[num_mod(step + num_mod(seed, len(scale)), len(scale))];
+        let octave = 0; if num_mod(step, 8) >= 6 { octave = 12; }
+        let midi = root + degree + octave;
+        let frequency = 440.0 * num_pow(2, (midi - 69) / 12.0);
+        let bass = 440.0 * num_pow(2, (root - 24 - 69) / 12.0);
+        let local = num_mod(time, beat_secs / 2) / (beat_secs / 2);
+        let envelope = num_min(1.0, local * 12) * (1.0 - local * 0.55);
+        let value = _table_sample(table, frame, frequency, sample_rate) * 0.72 * envelope
+            + _table_sample(bass_table, frame, bass, sample_rate) * 0.28;
+        array_push(samples, _sample(value * 32767 * volume));
+    }
+    let audio = map{ format: PCM.FORMAT, sample_rate: sample_rate, channels: 1, samples: samples };
+    let info = PCM.validate(audio);
+    return map{ ok: true, executed: true, format: FORMAT, media_kind: "music",
+        generation_mode: "procedural-composition", semantic_prompt_interpretation: false,
+        prompt_sha256: sha256(prompt), style: style, bpm: bpm, duration_secs: info.duration_secs,
+        audio: audio, deterministic: true, external_process: false };
+}
+
+fn _append(out, values) { for i len(values) { array_push(out, values[i]); } return out; }
+
+fn generate_video(prompt, width = 160, height = 90, duration_secs = 2,
+                   fps = 12, style = "motion") {
+    prompt = _text(prompt, "prompt", MAX_PROMPT_CHARS);
+    width = _integer(width, "width", 16, 640); height = _integer(height, "height", 16, 360);
+    fps = _integer(fps, "fps", 1, 30); duration_secs = _number(duration_secs, "duration_secs", 0.1, 10);
+    style = _enum(style, "style", ["motion", "bars", "pulse", "noise"]);
+    let frames = num_floor(duration_secs * fps); if frames < 1 { frames = 1; }
+    if frames > 240 or width * height * frames * 3 > MAX_VIDEO_BYTES - 4096 {
+        throw "video exceeds the bounded frame or byte budget";
+    }
+    let seed = _seed(prompt + ":" + style); let palette = _palette(seed);
+    let bytes = str_to_bytes("YUV4MPEG2 W" + str(width) + " H" + str(height)
+        + " F" + str(fps) + ":1 Ip A1:1 C444\n"); let state = seed;
+    for frame frames {
+        _append(bytes, str_to_bytes("FRAME\n")); let yplane = []; let uplane = []; let vplane = [];
+        for y height { for x width {
+            let phase = num_mod(x * 3 + y * 5 + frame * 11 + seed, 256) / 255.0;
+            if style == "bars" { phase = num_mod(num_floor(x / 16) + frame, 8) / 7.0; }
+            elif style == "pulse" { phase = num_mod(frame * 13 + x + y, 128) / 127.0; }
+            elif style == "noise" { state = _next(state); phase = num_mod(state, 256) / 255.0; }
+            let r = _blend(palette[0][0], palette[1][0], phase);
+            let g = _blend(palette[0][1], palette[2][1], phase);
+            let b = _blend(palette[1][2], palette[2][2], phase);
+            array_push(yplane, _byte(16 + (65.738 * r + 129.057 * g + 25.064 * b) / 256));
+            array_push(uplane, _byte(128 + (-37.945 * r - 74.494 * g + 112.439 * b) / 256));
+            array_push(vplane, _byte(128 + (112.439 * r - 94.154 * g - 18.285 * b) / 256));
+        }}
+        _append(bytes, yplane); _append(bytes, uplane); _append(bytes, vplane);
+    }
+    if len(bytes) > MAX_VIDEO_BYTES { throw "encoded video exceeds 16 MiB"; }
+    return map{ ok: true, executed: true, format: FORMAT, media_kind: "video",
+        generation_mode: "procedural-yuv444", semantic_prompt_interpretation: false,
+        prompt_sha256: sha256(prompt), container: "y4m", style: style,
+        width: width, height: height, fps: fps, frames: frames,
+        duration_secs: frames / fps, bytes: bytes, deterministic: true,
+        external_process: false };
+}
+
+fn _allowed_mimes(kind) {
+    if kind == "image-generate" or kind == "image-edit" { return ["image/png"]; }
+    if kind == "audio-generate" or kind == "music-generate" { return ["audio/wav"]; }
+    return ["video/x-yuv4mpeg", "video/mp4", "video/webm"];
+}
+
+fn _kind(value) {
+    return _enum(value, "kind", ["image-generate", "image-edit", "audio-generate",
+        "music-generate", "video-generate"]);
+}
+
+fn create_hook_request(kind, prompt, options = nil, input_bytes = nil, input_mime = "") {
+    kind = _kind(kind); prompt = _text(prompt, "prompt", MAX_PROMPT_CHARS);
+    if options == nil { options = map{}; }
+    if type(options) != "map" or len(json_stringify(options)) > 32768 {
+        throw "options must be a JSON object no larger than 32768 characters";
+    }
+    if input_bytes != nil {
+        if kind != "image-edit" { throw "input bytes are accepted only for image-edit hooks"; }
+        if type(input_bytes) != "array" or len(input_bytes) < 1 or len(input_bytes) > MAX_HOOK_INPUT_BYTES {
+            throw "hook input must contain 1 byte..4 MiB";
+        }
+        if input_mime != "image/png" { throw "image-edit hook input must be image/png"; }
+        IMAGE.decode_png(input_bytes);
+    } elif kind == "image-edit" { throw "image-edit hooks require an input PNG"; }
+    let payload = map{ format: HOOK_FORMAT, kind: kind, prompt: prompt, options: options,
+        allowed_mime_types: _allowed_mimes(kind), max_output_bytes: MAX_HOOK_OUTPUT_BYTES,
+        input_mime: if input_bytes == nil { nil } else { input_mime },
+        input_data_base64: if input_bytes == nil { nil } else { base64_encode_bytes(input_bytes) } };
+    let payload_json = json_stringify(payload); let digest = sha256(payload_json);
+    let envelope = map{ format: HOOK_FORMAT, payload: payload, request_digest: digest };
+    let encoded = base64_encode_bytes(str_to_bytes(json_stringify(envelope)));
+    return map{ ok: true, executed: true, format: HOOK_FORMAT, kind: kind,
+        request_digest: digest, request_json_base64: encoded,
+        includes_input: input_bytes != nil, external_request_sent: false,
+        credentials_required: false, operator_handoff_required: true };
+}
+
+fn _canonical_json(encoded, label) {
+    if type(encoded) != "string" or len(encoded) < 1 or len(encoded) > 24000000 {
+        throw label + " is missing or oversized";
+    }
+    let bytes = try base64_decode_bytes(encoded) catch nil;
+    if bytes == nil or base64_encode_bytes(bytes) != encoded { throw label + " must be canonical Base64"; }
+    let text = try bytes_to_str(bytes) catch nil;
+    let value = try json_parse(text) catch nil;
+    if value == nil or type(value) != "map" { throw label + " must contain a JSON object"; }
+    return value;
+}
+
+fn _mime_allowed(mime, values) { for i len(values) { if mime == values[i] { return true; } } return false; }
+
+fn _validate_artifact(kind, mime, bytes) {
+    if len(bytes) < 8 { throw "generated artifact is too short"; }
+    if mime == "image/png" { IMAGE.decode_png(bytes); return true; }
+    if mime == "audio/wav" { PCM.decode_wav(bytes); return true; }
+    if mime == "video/x-yuv4mpeg" {
+        if len(bytes) < 10 or bytes_to_str(slice(bytes, 0, 8)) != "YUV4MPEG" { throw "invalid Y4M artifact"; }
+        return true;
+    }
+    if mime == "video/mp4" {
+        if len(bytes) < 12 or bytes_to_str(slice(bytes, 4, 8)) != "ftyp" { throw "invalid MP4 artifact"; }
+        return true;
+    }
+    if mime == "video/webm" {
+        if bytes[0] != 26 or bytes[1] != 69 or bytes[2] != 223 or bytes[3] != 163 {
+            throw "invalid WebM artifact";
+        }
+        return true;
+    }
+    throw "artifact MIME type is unsupported";
+}
+
+fn accept_hook_response(request_json_base64, response_json_base64) {
+    let request = _canonical_json(request_json_base64, "request_json_base64");
+    let request_format = try request.format catch "";
+    let request_payload = try request.payload catch nil;
+    if request_format != HOOK_FORMAT or type(request_payload) != "map" {
+        throw "hook request format is invalid";
+    }
+    let digest = sha256(json_stringify(request_payload));
+    let stored_digest = try request.request_digest catch nil;
+    if type(stored_digest) != "string" or stored_digest != digest {
+        throw "hook request digest mismatch";
+    }
+    let kind = _kind(try request_payload.kind catch "");
+    let response = _canonical_json(response_json_base64, "response_json_base64");
+    let keys = map_keys(response);
+    for i len(keys) {
+        if keys[i] != "request_digest" and keys[i] != "mime_type" and keys[i] != "data_base64" {
+            throw "hook response contains an unknown field";
+        }
+    }
+    let response_digest = try response.request_digest catch "";
+    if response_digest != digest { throw "hook response is not bound to this request"; }
+    let mime = try response.mime_type catch "";
+    if not _mime_allowed(mime, _allowed_mimes(kind)) { throw "hook response MIME type is not allowed for this request"; }
+    let encoded = try response.data_base64 catch nil;
+    if type(encoded) != "string" or len(encoded) < 1 or len(encoded) > 23000000 {
+        throw "hook artifact Base64 is missing or oversized";
+    }
+    let bytes = try base64_decode_bytes(encoded) catch nil;
+    if bytes == nil or len(bytes) < 1 or len(bytes) > MAX_HOOK_OUTPUT_BYTES
+       or base64_encode_bytes(bytes) != encoded { throw "hook artifact must be canonical and at most 16 MiB"; }
+    _validate_artifact(kind, mime, bytes);
+    return map{ ok: true, executed: true, format: HOOK_FORMAT, kind: kind,
+        request_digest: digest, mime_type: mime, bytes: bytes, output_bytes: len(bytes),
+        artifact_validated: true, credentials_consumed: false, prompt_exposed: false };
+}
+
+fn capabilities() {
+    return map{ format: FORMAT, ok: true,
+        native: ["procedural-image", "tone", "sound-effect", "procedural-music", "procedural-y4m-video"],
+        model_hooks: ["image-generate", "image-edit", "audio-generate", "music-generate", "video-generate"],
+        semantic_native_model: false, external_request_automatic: false,
+        credentials_accepted: false, deterministic_native_generation: true,
+        max_prompt_chars: MAX_PROMPT_CHARS, max_image_pixels: MAX_IMAGE_PIXELS,
+        max_audio_seconds: MAX_AUDIO_SECONDS, max_video_bytes: MAX_VIDEO_BYTES,
+        max_hook_input_bytes: MAX_HOOK_INPUT_BYTES, max_hook_output_bytes: MAX_HOOK_OUTPUT_BYTES };
+}
+
+export FORMAT, HOOK_FORMAT, MAX_PROMPT_CHARS, MAX_IMAGE_PIXELS, MAX_AUDIO_SECONDS,
+       MAX_VIDEO_BYTES, MAX_HOOK_INPUT_BYTES, MAX_HOOK_OUTPUT_BYTES,
+       generate_image, generate_tone, generate_sound_effect, generate_music,
+       generate_video, create_hook_request, accept_hook_response, capabilities;
