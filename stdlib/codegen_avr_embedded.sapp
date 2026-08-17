@@ -1,0 +1,219 @@
+// Native AVR/ATmega328P firmware emitter written in PBLang.
+//
+// Input is lowered embedded IR. Output is raw AVR machine code and canonical
+// Intel HEX. No C, assembler, LLVM, Rust, or vendor compiler is invoked.
+
+let AVR = import("stdlib:emulator_avr.sapp");
+let FORMAT = "pblang.embedded-avr-artifact.v1";
+let MAX_FLASH_BYTES = 32768;
+let MAX_RECORD_BYTES = 16;
+let MAX_DELAY_BLOCK_CYCLES = 49939965;
+
+fn _append(target, bytes) { for i len(bytes) { array_push(target, bytes[i]); } }
+fn _word_count(bytes) { return num_floor(len(bytes) / 2); }
+
+fn _byte_hex(value) {
+    let digits = "0123456789ABCDEF";
+    return str_slice(digits, num_floor(value / 16), num_floor(value / 16) + 1)
+        + str_slice(digits, value % 16, value % 16 + 1);
+}
+
+fn _record(address, kind, data) {
+    if len(data) > 255 or address < 0 or address > 65535 { throw "avr codegen: invalid Intel HEX record"; }
+    let values = [len(data), num_floor(address / 256), address % 256, kind];
+    for i len(data) { array_push(values, data[i]); }
+    let sum = 0; let text = ":";
+    for i len(values) { sum = (sum + values[i]) % 256; text = text + _byte_hex(values[i]); }
+    return text + _byte_hex((256 - sum) % 256) + "\n";
+}
+
+fn intel_hex(bytes) {
+    if type(bytes) != "array" or len(bytes) == 0 or len(bytes) > MAX_FLASH_BYTES {
+        throw "avr codegen: firmware must contain 1..32768 bytes";
+    }
+    let out = ""; let offset = 0;
+    while offset < len(bytes) {
+        let count = len(bytes) - offset; if count > MAX_RECORD_BYTES { count = MAX_RECORD_BYTES; }
+        let chunk = [];
+        for i count { array_push(chunk, bytes[offset + i]); }
+        out = out + _record(offset, 0, chunk);
+        offset = offset + count;
+    }
+    return out + _record(0, 1, []);
+}
+
+fn _nibble(character) {
+    return str_index_of("0123456789ABCDEF", str_upper(character));
+}
+
+fn _hex_byte(text, offset) {
+    if offset < 0 or offset + 2 > len(text) { throw "avr codegen: truncated Intel HEX byte"; }
+    let high = _nibble(str_slice(text, offset, offset + 1));
+    let low = _nibble(str_slice(text, offset + 1, offset + 2));
+    if high < 0 or low < 0 { throw "avr codegen: non-hexadecimal Intel HEX digit"; }
+    return high * 16 + low;
+}
+
+fn parse_intel_hex(text) {
+    if type(text) != "string" or len(text) > 262144 { throw "avr codegen: invalid Intel HEX text"; }
+    let lines = str_split(str_replace_all(text, "\r\n", "\n"), "\n");
+    let bytes = []; let expected = 0; let ended = false;
+    for li len(lines) {
+        let line = lines[li];
+        if line != "" {
+            if ended { throw "avr codegen: data after Intel HEX EOF"; }
+            if len(line) < 11 or str_slice(line, 0, 1) != ":" or (len(line) - 1) % 2 != 0 {
+                throw "avr codegen: malformed Intel HEX record";
+            }
+            let count = _hex_byte(line, 1); let address = _hex_byte(line, 3) * 256 + _hex_byte(line, 5);
+            let kind = _hex_byte(line, 7); let required = 11 + count * 2;
+            if len(line) != required { throw "avr codegen: Intel HEX record length mismatch"; }
+            let sum = count + num_floor(address / 256) + address % 256 + kind;
+            let data = [];
+            for i count {
+                let value = _hex_byte(line, 9 + i * 2); sum = (sum + value) % 256;
+                array_push(data, value);
+            }
+            sum = (sum + _hex_byte(line, 9 + count * 2)) % 256;
+            if sum != 0 { throw "avr codegen: Intel HEX checksum mismatch"; }
+            if kind == 0 {
+                if address != expected { throw "avr codegen: non-contiguous Intel HEX data"; }
+                _append(bytes, data); expected = expected + count;
+            } elif kind == 1 {
+                if count != 0 or address != 0 { throw "avr codegen: malformed Intel HEX EOF"; }
+                ended = true;
+            } else { throw "avr codegen: unsupported Intel HEX record type"; }
+        }
+    }
+    if not ended or len(bytes) == 0 { throw "avr codegen: Intel HEX EOF or data missing"; }
+    return bytes;
+}
+
+fn _delay_shape(target_cycles) {
+    let best = map{ outer:1, middle:1, inner:1, cycles:9, error:num_abs(target_cycles - 9) };
+    for outer 255 {
+        let o = outer + 1;
+        for middle 255 {
+            let m = middle + 1;
+            let estimate = num_floor(((target_cycles / (3 * o) - 1) / m) - 1 + 0.5);
+            if estimate < 1 { estimate = 1; }
+            if estimate > 255 { estimate = 255; }
+            let cycles = 3 * o * (m * (estimate + 1) + 1);
+            let error = num_abs(target_cycles - cycles);
+            if error < best.error {
+                best = map{ outer:o, middle:m, inner:estimate, cycles:cycles, error:error };
+            }
+        }
+    }
+    return best;
+}
+
+fn _delay_block(code, target_cycles) {
+    let shape = _delay_shape(target_cycles);
+    _append(code, AVR.load_immediate(18, shape.outer));
+    _append(code, AVR.load_immediate(19, shape.middle));
+    _append(code, AVR.load_immediate(20, shape.inner));
+    _append(code, AVR.decrement(20));
+    _append(code, AVR.branch_not_equal(0 - 2));
+    _append(code, AVR.decrement(19));
+    _append(code, AVR.branch_not_equal(0 - 5));
+    _append(code, AVR.decrement(18));
+    _append(code, AVR.branch_not_equal(0 - 8));
+    return shape;
+}
+
+fn _delay(code, milliseconds, clock_hz) {
+    let requested = num_floor(clock_hz * milliseconds / 1000);
+    let blocks = num_floor((requested + MAX_DELAY_BLOCK_CYCLES - 1) / MAX_DELAY_BLOCK_CYCLES);
+    if blocks < 1 { blocks = 1; }
+    let emitted = 0; let shapes = [];
+    for i blocks {
+        let remaining = requested - emitted; let left = blocks - i;
+        let target = num_floor((remaining + left - 1) / left);
+        if target > MAX_DELAY_BLOCK_CYCLES { target = MAX_DELAY_BLOCK_CYCLES; }
+        let shape = _delay_block(code, target); emitted = emitted + shape.cycles;
+        array_push(shapes, shape);
+    }
+    return map{ requested_ms:milliseconds, requested_cycles:requested,
+        emitted_cycles:emitted, error_cycles:emitted-requested,
+        actual_ms:emitted*1000/clock_hz, blocks:shapes };
+}
+
+fn _io_register(board, selected_pin, purpose) {
+    let registers = board.mcu_info.registers;
+    if not map_has(registers, selected_pin.port) { throw "avr codegen: unknown AVR port"; }
+    let row = registers[selected_pin.port];
+    if purpose == "direction" { return row.direction; }
+    if purpose == "output" { return row.output; }
+    if purpose == "pin" { return row.pin; }
+    throw "avr codegen: unknown I/O register purpose";
+}
+
+fn compile(lowered) {
+    if lowered == nil or not is_map(lowered) or not (try lowered.ok catch false) {
+        throw "avr codegen: successful lowered embedded IR required";
+    }
+    let board = lowered.board;
+    if board.mcu != "atmega328p" or board.architecture_info.backend != "native-avr8" {
+        throw "avr codegen: target is not an implemented ATmega328P board";
+    }
+    let code = []; let timing = []; let loop_start = 0; let loop_open = false; let loop_count = 0;
+    _append(code, AVR.clear_interrupts());
+    for i len(lowered.operations) {
+        let op = lowered.operations[i];
+        if op.kind == "pin-mode" {
+            let address = _io_register(board, op.pin, "direction");
+            if op.mode == "output" { _append(code, AVR.set_io_bit(address, op.pin.bit)); }
+            elif op.mode == "input" { _append(code, AVR.clear_io_bit(address, op.pin.bit)); }
+            elif op.mode == "input-pullup" {
+                _append(code, AVR.clear_io_bit(address, op.pin.bit));
+                _append(code, AVR.set_io_bit(_io_register(board, op.pin, "output"), op.pin.bit));
+            }
+        } elif op.kind == "digital-write" {
+            let address = _io_register(board, op.pin, "output");
+            if op.value == 1 { _append(code, AVR.set_io_bit(address, op.pin.bit)); }
+            else { _append(code, AVR.clear_io_bit(address, op.pin.bit)); }
+        } elif op.kind == "digital-read" {
+            throw "avr codegen: digital-read lowering is not implemented in this slice";
+        } elif op.kind == "delay-ms" {
+            array_push(timing, _delay(code, op.value, board.clock_hz));
+        } elif op.kind == "loop-begin" {
+            if loop_open { throw "avr codegen: nested/incremental loops are not supported"; }
+            loop_start = _word_count(code); loop_open = true; loop_count = loop_count + 1;
+        } elif op.kind == "loop-end" {
+            if not loop_open or loop_count != 1 { throw "avr codegen: unmatched loop"; }
+            let offset = loop_start - (_word_count(code) + 1);
+            _append(code, AVR.jump_relative(offset));
+            loop_open = false;
+        } else {
+            throw "avr codegen: operation is validated but not implemented by this backend";
+        }
+    }
+    if loop_open or loop_count != 1 { throw "avr codegen: one complete forever loop is required"; }
+    if len(code) > board.mcu_info.flash_bytes or len(code) > MAX_FLASH_BYTES {
+        throw "avr codegen: generated firmware exceeds target flash";
+    }
+    let hex = intel_hex(code); let roundtrip = parse_intel_hex(hex);
+    if roundtrip != code { throw "avr codegen: Intel HEX roundtrip mismatch"; }
+    return map{
+        ok:true, format:FORMAT, board:board.id, mcu:board.mcu, architecture:"avr8",
+        backend:"native-avr8", firmware_format:"ihex", binary:code, bytes:len(code),
+        intel_hex:hex, intel_hex_bytes:str_to_bytes(hex), timing:timing,
+        sha256:sha256(base64_encode_bytes(code)), native_source_language:"pblang",
+        c_fallback:false, assembler_dependency:false, compiler_dependency:false
+    };
+}
+
+fn verify_io(artifact, address, minimum_events = 3, budget = 1000000) {
+    if artifact == nil or not is_map(artifact) or (try artifact.format catch "") != FORMAT {
+        return map{ ok:false, error:"invalid AVR artifact" };
+    }
+    let result = AVR.run(artifact.binary, map{ instruction_budget:budget,
+        trace_io_addresses:[address], stop_after_events:minimum_events });
+    if not result.ok { return result; }
+    return map{ ok:len(result.io_events)>=minimum_events, format:"pblang.embedded-avr-verification.v1",
+        artifact_sha256:artifact.sha256, events:result.io_events, instructions:result.instructions,
+        cycles:result.cycles, execution_model:"verified-subset", physical_hardware:false };
+}
+
+export FORMAT, MAX_FLASH_BYTES, intel_hex, parse_intel_hex, compile, verify_io;

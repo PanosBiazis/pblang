@@ -1,0 +1,309 @@
+// Bounded wired command protocol shared by embedded firmware, host adapters,
+// and deterministic circuit emulators. It detects serial corruption; it is not
+// an authenticated network transport.
+
+let FORMAT = "pblang.embedded-wire.v1";
+let DECODER_FORMAT = "pblang.embedded-wire-decoder.v1";
+let DEVICE_FORMAT = "pblang.embedded-wire-device.v1";
+let MAGIC_COMMAND = [80, 66]; // PB
+let MAGIC_RESPONSE = [80, 82]; // PR
+let VERSION = 1;
+let FRAME_BYTES = 12;
+let MAX_FEED_BYTES = 4096;
+let MIN_INTERVAL_MS = 10;
+let MAX_INTERVAL_MS = 60000;
+let MAX_DURATION_MS = 60000;
+
+let OP_STATUS = 1;
+let OP_SET = 2;
+let OP_TOGGLE = 3;
+let OP_BLINK = 4;
+let OP_STOP = 5;
+
+let STATUS_OK = 0;
+let STATUS_INVALID = 1;
+let STATUS_DUPLICATE = 2;
+let STATUS_NOT_SYNCHRONIZED = 3;
+let STATUS_OUT_OF_ORDER = 4;
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _valid_bytes(value, bound) {
+    if type(value) != "array" or len(value) > bound { return false; }
+    let cursor = 0;
+    while cursor < len(value) {
+        if not _integer(value[cursor], 0, 255) { return false; }
+        cursor = cursor + 1;
+    }
+    return true;
+}
+
+fn _checksum(bytes, count) {
+    let sum = 0; let cursor = 0;
+    while cursor < count {
+        sum = (sum + bytes[cursor]) % 256; cursor = cursor + 1;
+    }
+    return sum;
+}
+
+fn _u16(bytes, offset) { return bytes[offset] + bytes[offset + 1] * 256; }
+fn _put_u16(bytes, value) {
+    array_push(bytes, value % 256);
+    array_push(bytes, num_floor(value / 256) % 256);
+}
+
+fn _next_sequence(sequence) { if sequence == 255 { return 1; } return sequence + 1; }
+
+fn _command_values(command) {
+    if type(command) != "map" { throw "embedded_protocol: command must be a map"; }
+    let sequence = try command.sequence catch 0;
+    let opcode = try command.opcode catch 0;
+    let value = try command.value catch 0;
+    let interval = try command.interval_ms catch 500;
+    let duration = try command.duration_ms catch 0;
+    if not _integer(sequence, 1, 255) { throw "embedded_protocol: sequence must be 1..255"; }
+    if not _integer(opcode, OP_STATUS, OP_STOP) { throw "embedded_protocol: unsupported opcode"; }
+    if not _integer(value, 0, 1) { throw "embedded_protocol: value must be 0 or 1"; }
+    if not _integer(interval, MIN_INTERVAL_MS, MAX_INTERVAL_MS) {
+        throw "embedded_protocol: interval is outside the physical protocol limit";
+    }
+    if not _integer(duration, 0, MAX_DURATION_MS) {
+        throw "embedded_protocol: duration is outside the physical protocol limit";
+    }
+    if opcode != OP_SET { value = 0; }
+    if opcode != OP_BLINK { interval = 500; duration = 0; }
+    return map{sequence:sequence, opcode:opcode, value:value,
+        interval_ms:interval, duration_ms:duration};
+}
+
+fn encode_command(command) {
+    let row = _command_values(command);
+    let bytes = [MAGIC_COMMAND[0], MAGIC_COMMAND[1], VERSION,
+        row.sequence, row.opcode, row.value];
+    _put_u16(bytes, row.interval_ms); _put_u16(bytes, row.duration_ms);
+    array_push(bytes, 0); array_push(bytes, _checksum(bytes, FRAME_BYTES - 1));
+    return bytes;
+}
+
+fn _decode(bytes, response) {
+    if not _valid_bytes(bytes, FRAME_BYTES) or len(bytes) != FRAME_BYTES {
+        return map{ok:false, format:FORMAT, code:"frame-size", error:"frame must contain exactly 12 bytes"};
+    }
+    let magic = if response { MAGIC_RESPONSE } else { MAGIC_COMMAND };
+    if bytes[0] != magic[0] or bytes[1] != magic[1] {
+        return map{ok:false, format:FORMAT, code:"frame-magic", error:"frame magic mismatch"};
+    }
+    if bytes[2] != VERSION {
+        return map{ok:false, format:FORMAT, code:"frame-version", error:"unsupported protocol version"};
+    }
+    if bytes[3] < 1 {
+        return map{ok:false, format:FORMAT, code:"frame-sequence", error:"zero sequence is reserved"};
+    }
+    if bytes[11] != _checksum(bytes, FRAME_BYTES - 1) {
+        return map{ok:false, format:FORMAT, code:"frame-checksum", error:"frame checksum mismatch"};
+    }
+    if bytes[10] != 0 {
+        return map{ok:false, format:FORMAT, code:"frame-reserved", error:"reserved byte must be zero"};
+    }
+    if response {
+        if not _integer(bytes[4], STATUS_OK, STATUS_OUT_OF_ORDER) or bytes[5] > 3 {
+            return map{ok:false, format:FORMAT, code:"response-fields", error:"invalid response status or flags"};
+        }
+        return map{ok:true, format:FORMAT, kind:"response", sequence:bytes[3],
+            status:bytes[4], on:(bytes[5] & 1) != 0, blinking:(bytes[5] & 2) != 0,
+            interval_ms:_u16(bytes, 6), remaining_ms:_u16(bytes, 8)};
+    }
+    if not _integer(bytes[4], OP_STATUS, OP_STOP) or bytes[5] > 1 {
+        return map{ok:false, format:FORMAT, code:"command-fields", error:"invalid command opcode or value"};
+    }
+    let interval = _u16(bytes, 6); let duration = _u16(bytes, 8);
+    if interval < MIN_INTERVAL_MS or interval > MAX_INTERVAL_MS or duration > MAX_DURATION_MS {
+        return map{ok:false, format:FORMAT, code:"command-range", error:"command timing is outside protocol limits"};
+    }
+    if bytes[4] != OP_SET and bytes[5] != 0 {
+        return map{ok:false, format:FORMAT, code:"command-value", error:"value is reserved for set command"};
+    }
+    if bytes[4] != OP_BLINK and (interval != 500 or duration != 0) {
+        return map{ok:false, format:FORMAT, code:"command-timing", error:"timing is reserved for blink command"};
+    }
+    return map{ok:true, format:FORMAT, kind:"command", sequence:bytes[3],
+        opcode:bytes[4], value:bytes[5], interval_ms:interval, duration_ms:duration};
+}
+
+fn decode_command(bytes) { return _decode(bytes, false); }
+fn decode_response(bytes) { return _decode(bytes, true); }
+
+fn encode_response(response) {
+    if type(response) != "map" { throw "embedded_protocol: response must be a map"; }
+    let sequence = try response.sequence catch 0;
+    let status = try response.status catch STATUS_INVALID;
+    let interval = try response.interval_ms catch 500;
+    let remaining = try response.remaining_ms catch 0;
+    if not _integer(sequence, 1, 255) or not _integer(status, STATUS_OK, STATUS_OUT_OF_ORDER)
+       or not _integer(interval, MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+       or not _integer(remaining, 0, MAX_DURATION_MS) {
+        throw "embedded_protocol: invalid response fields";
+    }
+    let flags = 0;
+    if try response.on catch false { flags = flags | 1; }
+    if try response.blinking catch false { flags = flags | 2; }
+    let bytes = [MAGIC_RESPONSE[0], MAGIC_RESPONSE[1], VERSION, sequence, status, flags];
+    _put_u16(bytes, interval); _put_u16(bytes, remaining);
+    array_push(bytes, 0); array_push(bytes, _checksum(bytes, FRAME_BYTES - 1));
+    return bytes;
+}
+
+fn new_decoder(kind = "command") {
+    let value = str_lower(str(kind));
+    if value != "command" and value != "response" {
+        throw "embedded_protocol: decoder kind must be command or response";
+    }
+    return map{format:DECODER_FORMAT, kind:value, buffer:[], accepted:0,
+        rejected:0, discarded_bytes:0, max_feed_bytes:MAX_FEED_BYTES};
+}
+
+fn _drop_prefix(buffer, count) {
+    let next = [];
+    let i = count; while i < len(buffer) { array_push(next, buffer[i]); i = i + 1; }
+    return next;
+}
+
+fn feed(decoder, bytes) {
+    if type(decoder) != "map" or (try decoder.format catch "") != DECODER_FORMAT
+       or not _valid_bytes(bytes, try decoder.max_feed_bytes catch 0) {
+        return map{ok:false, format:FORMAT, error:"invalid bounded decoder input", frames:[]};
+    }
+    let input_cursor = 0;
+    while input_cursor < len(bytes) {
+        array_push(decoder.buffer, bytes[input_cursor]); input_cursor = input_cursor + 1;
+    }
+    let frames = []; let magic = if decoder.kind == "response" { MAGIC_RESPONSE } else { MAGIC_COMMAND };
+    let running = true;
+    while running {
+        let at = -1; let scan_cursor = 0;
+        while scan_cursor + 1 < len(decoder.buffer) and at < 0 {
+            if decoder.buffer[scan_cursor] == magic[0]
+               and decoder.buffer[scan_cursor + 1] == magic[1] { at = scan_cursor; }
+            scan_cursor = scan_cursor + 1;
+        }
+        if at < 0 {
+            let retained = 0;
+            if len(decoder.buffer) > 0 and decoder.buffer[len(decoder.buffer) - 1] == magic[0] {
+                retained = 1;
+            }
+            decoder.discarded_bytes = decoder.discarded_bytes + len(decoder.buffer) - retained;
+            if retained == 1 { decoder.buffer = [magic[0]]; } else { decoder.buffer = []; }
+            running = false;
+        } else {
+            if at > 0 { decoder.discarded_bytes = decoder.discarded_bytes + at; decoder.buffer = _drop_prefix(decoder.buffer, at); }
+            if len(decoder.buffer) < FRAME_BYTES { running = false; }
+            else {
+                let candidate = [];
+                for j FRAME_BYTES { array_push(candidate, decoder.buffer[j]); }
+                let parsed = if decoder.kind == "response" { decode_response(candidate) } else { decode_command(candidate) };
+                if parsed.ok {
+                    array_push(frames, parsed); decoder.accepted = decoder.accepted + 1;
+                    decoder.buffer = _drop_prefix(decoder.buffer, FRAME_BYTES);
+                } else {
+                    decoder.rejected = decoder.rejected + 1; decoder.discarded_bytes = decoder.discarded_bytes + 1;
+                    decoder.buffer = _drop_prefix(decoder.buffer, 1);
+                }
+            }
+        }
+    }
+    return map{ok:true, format:FORMAT, frames:frames, accepted:len(frames),
+        buffered_bytes:len(decoder.buffer), rejected:decoder.rejected,
+        discarded_bytes:decoder.discarded_bytes};
+}
+
+fn new_device() {
+    return map{format:DEVICE_FORMAT, synchronized:false, last_sequence:0,
+        expected_sequence:0, on:false, blinking:false, interval_ms:500,
+        phase_remaining_ms:500, remaining_ms:0, revision:0};
+}
+
+fn _response(device, sequence, status) {
+    return map{sequence:sequence, status:status, on:device.on,
+        blinking:device.blinking, interval_ms:device.interval_ms,
+        remaining_ms:device.remaining_ms, revision:device.revision};
+}
+
+fn execute(device, command) {
+    if type(device) != "map" or (try device.format catch "") != DEVICE_FORMAT {
+        return map{ok:false, format:FORMAT, error:"invalid protocol device"};
+    }
+    let cmd = if type(command) == "array" { decode_command(command) } else { command };
+    if type(cmd) != "map" or not (try cmd.ok catch false) or (try cmd.kind catch "command") != "command" {
+        return map{ok:false, format:FORMAT, error:try cmd.error catch "invalid command"};
+    }
+    if cmd.opcode == OP_STATUS {
+        device.synchronized = true; device.last_sequence = cmd.sequence;
+        device.expected_sequence = _next_sequence(cmd.sequence);
+        return map{ok:true, format:FORMAT, applied:false,
+            response:_response(device, cmd.sequence, STATUS_OK)};
+    }
+    if not device.synchronized {
+        return map{ok:true, format:FORMAT, applied:false,
+            response:_response(device, cmd.sequence, STATUS_NOT_SYNCHRONIZED)};
+    }
+    if cmd.sequence == device.last_sequence {
+        return map{ok:true, format:FORMAT, applied:false,
+            response:_response(device, cmd.sequence, STATUS_DUPLICATE)};
+    }
+    if cmd.sequence != device.expected_sequence {
+        return map{ok:true, format:FORMAT, applied:false,
+            response:_response(device, cmd.sequence, STATUS_OUT_OF_ORDER)};
+    }
+    let valid = true;
+    if cmd.opcode == OP_SET {
+        device.on = cmd.value == 1; device.blinking = false; device.remaining_ms = 0;
+    } elif cmd.opcode == OP_TOGGLE {
+        device.on = not device.on; device.blinking = false; device.remaining_ms = 0;
+    } elif cmd.opcode == OP_BLINK {
+        device.on = true; device.blinking = true; device.interval_ms = cmd.interval_ms;
+        device.phase_remaining_ms = cmd.interval_ms; device.remaining_ms = cmd.duration_ms;
+    } elif cmd.opcode == OP_STOP {
+        device.on = false; device.blinking = false; device.remaining_ms = 0;
+    } else { valid = false; }
+    if valid {
+        device.last_sequence = cmd.sequence; device.expected_sequence = _next_sequence(cmd.sequence);
+        device.revision = device.revision + 1;
+    }
+    return map{ok:true, format:FORMAT, applied:valid,
+        response:_response(device, cmd.sequence, if valid {STATUS_OK}else{STATUS_INVALID})};
+}
+
+fn tick(device, elapsed_ms) {
+    if type(device) != "map" or (try device.format catch "") != DEVICE_FORMAT
+       or not _integer(elapsed_ms, 0, MAX_DURATION_MS) {
+        return map{ok:false, format:FORMAT, error:"invalid bounded device tick"};
+    }
+    if not device.blinking or elapsed_ms == 0 {
+        return map{ok:true, format:FORMAT, changed:false, on:device.on};
+    }
+    let active = elapsed_ms;
+    if device.remaining_ms > 0 and active > device.remaining_ms { active = device.remaining_ms; }
+    let phase = device.interval_ms - device.phase_remaining_ms + active;
+    let flips = num_floor(phase / device.interval_ms);
+    device.phase_remaining_ms = device.interval_ms - (phase % device.interval_ms);
+    if device.phase_remaining_ms == 0 { device.phase_remaining_ms = device.interval_ms; }
+    if flips % 2 == 1 { device.on = not device.on; }
+    if device.remaining_ms > 0 {
+        device.remaining_ms = device.remaining_ms - active;
+        if device.remaining_ms == 0 { device.blinking = false; device.on = false; }
+    }
+    if flips > 0 or not device.blinking { device.revision = device.revision + 1; }
+    return map{ok:true, format:FORMAT, changed:flips>0 or not device.blinking,
+        flips:flips, on:device.on, blinking:device.blinking,
+        remaining_ms:device.remaining_ms, revision:device.revision};
+}
+
+export FORMAT, DECODER_FORMAT, DEVICE_FORMAT, VERSION, FRAME_BYTES, MAX_FEED_BYTES;
+export MIN_INTERVAL_MS, MAX_INTERVAL_MS, MAX_DURATION_MS;
+export OP_STATUS, OP_SET, OP_TOGGLE, OP_BLINK, OP_STOP;
+export STATUS_OK, STATUS_INVALID, STATUS_DUPLICATE, STATUS_NOT_SYNCHRONIZED, STATUS_OUT_OF_ORDER;
+export encode_command, decode_command, encode_response, decode_response;
+export new_decoder, feed, new_device, execute, tick;

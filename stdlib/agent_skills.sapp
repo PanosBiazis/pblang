@@ -1,0 +1,347 @@
+// Portable Agent Skills parsing, compatibility, rendering, and bounded risk review.
+//
+// This module is deliberately effect-free. It never discovers directories,
+// reads bundled resources, expands placeholders, or executes skill content.
+
+let SER = import("stdlib:serialization.sapp");
+
+let MAX_DOCUMENT_CHARS = 131072;
+let MAX_FRONTMATTER_CHARS = 16384;
+let MAX_FRONTMATTER_LINES = 128;
+let MAX_DOCUMENT_LINES = 4096;
+let MAX_METADATA_ENTRIES = 32;
+
+fn _join(items, separator) {
+    let out = "";
+    for i len(items) {
+        if i > 0 { out = out + separator; }
+        out = out + str(items[i]);
+    }
+    return out;
+}
+
+fn _contains(value, needle) {
+    return str_contains(str_lower(str(value)), str_lower(str(needle)));
+}
+
+fn _name_valid(name) {
+    if type(name) != "string" or len(name) < 1 or len(name) > 64 { return false; }
+    let previous_hyphen = false;
+    for i len(name) {
+        let code = strcharcodeat(name, i);
+        let hyphen = code == 45;
+        if not (code >= 97 and code <= 122) and not (code >= 48 and code <= 57)
+           and not hyphen { return false; }
+        if hyphen and (i == 0 or i == len(name) - 1 or previous_hyphen) { return false; }
+        previous_hyphen = hyphen;
+    }
+    return true;
+}
+
+fn _bounded_text(value, label, maximum, required = false) {
+    if value == nil { value = ""; }
+    if type(value) != "string" { throw label + " must be a string"; }
+    value = str_trim(value);
+    if required and value == "" { throw label + " must not be empty"; }
+    if len(value) > maximum { throw label + " exceeds " + str(maximum) + " characters"; }
+    for i len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 32 or code == 127 { throw label + " contains control characters"; }
+    }
+    return value;
+}
+
+fn _bounded_body(value) {
+    if type(value) != "string" { throw "body must be a string"; }
+    value = str_trim(value);
+    if value == "" { throw "body must not be empty"; }
+    if len(value) > 100000 { throw "body exceeds 100000 characters"; }
+    for i len(value) {
+        let code = strcharcodeat(value, i);
+        if (code < 32 and code != 9 and code != 10) or code == 127 {
+            throw "body contains unsupported control characters";
+        }
+    }
+    return value;
+}
+
+fn _field_allowed(field, fields) {
+    for i len(fields) { if field == fields[i] { return true; } }
+    return false;
+}
+
+fn _field_difference(actual, supported) {
+    let out = [];
+    for i len(actual) {
+        if not _field_allowed(actual[i], supported) { out[len(out)] = actual[i]; }
+    }
+    return out;
+}
+
+fn _metadata_validate(value, errors) {
+    if value == nil { return map{}; }
+    if type(value) != "map" {
+        errors[len(errors)] = "metadata must be a string-to-string object";
+        return map{};
+    }
+    let keys = map_keys(value);
+    if len(keys) > MAX_METADATA_ENTRIES {
+        errors[len(errors)] = "metadata exceeds " + str(MAX_METADATA_ENTRIES) + " entries";
+    }
+    let out = map{};
+    let stop = len(keys); if stop > MAX_METADATA_ENTRIES { stop = MAX_METADATA_ENTRIES; }
+    for i stop {
+        let key = try { _bounded_text(keys[i], "metadata key", 128, true) } catch "";
+        let item = try value[keys[i]] catch nil;
+        if key == "" or type(item) != "string" {
+            errors[len(errors)] = "metadata entries must have bounded string keys and values";
+        } else {
+            let clean = try { _bounded_text(item, "metadata value", 1024) } catch "";
+            if clean == "" and str_trim(item) != "" {
+                errors[len(errors)] = "metadata value is invalid";
+            } else { out[key] = clean; }
+        }
+    }
+    return out;
+}
+
+fn _string_or_list(value, label, errors) {
+    if value == nil { return []; }
+    let values = value;
+    if type(value) == "string" {
+        values = str_split(str_replace_all(value, ",", " "), " ");
+    }
+    if type(values) != "array" {
+        errors[len(errors)] = label + " must be text or an array";
+        return [];
+    }
+    if len(values) > 128 { errors[len(errors)] = label + " exceeds 128 entries"; }
+    let out = []; let seen = map{};
+    let stop = len(values); if stop > 128 { stop = 128; }
+    for i stop {
+        let item = try { _bounded_text(values[i], label + " item", 512, true) } catch "";
+        if item == "" { continue; }
+        if not (try seen[item] catch false) { seen[item] = true; out[len(out)] = item; }
+    }
+    return out;
+}
+
+fn _normalize_document(document) {
+    if type(document) != "string" { throw "skill document must be a string"; }
+    if len(document) < 1 or len(document) > MAX_DOCUMENT_CHARS {
+        throw "skill document must contain 1.." + str(MAX_DOCUMENT_CHARS) + " characters";
+    }
+    let clean = str_replace_all(str_replace_all(document, "\r\n", "\n"), "\r", "\n");
+    if str_starts_with(clean, "\uFEFF") { clean = str_slice(clean, 1, len(clean)); }
+    let lines = str_split(clean, "\n");
+    if len(lines) > MAX_DOCUMENT_LINES { throw "skill document exceeds line limit"; }
+    return map{ text: clean, lines: lines };
+}
+
+fn parse_document(document, directory_name = "") {
+    let normalized = _normalize_document(document);
+    let lines = normalized.lines;
+    let errors = []; let warnings = [];
+    if len(lines) < 3 or str_trim(lines[0]) != "---" {
+        return map{ format: "pblang.agent_skill.v1", valid: false,
+            errors: ["SKILL.md must begin with YAML frontmatter"], warnings: [],
+            frontmatter: map{}, body: "", name: "", description: "",
+            fields: [], body_chars: 0, line_count: len(lines) };
+    }
+
+    let close = -1; let front_chars = 0; let i = 1;
+    while i < len(lines) and i <= MAX_FRONTMATTER_LINES {
+        if str_trim(lines[i]) == "---" { close = i; break; }
+        if str_contains(lines[i], "\t") { errors[len(errors)] = "frontmatter tabs are not allowed"; }
+        front_chars = front_chars + len(lines[i]) + 1;
+        if front_chars > MAX_FRONTMATTER_CHARS { break; }
+        i = i + 1;
+    }
+    if close < 0 {
+        errors[len(errors)] = "frontmatter is not closed within its bounds";
+        return map{ format: "pblang.agent_skill.v1", valid: false,
+            errors: errors, warnings: warnings, frontmatter: map{}, body: "",
+            name: "", description: "", fields: [], body_chars: 0,
+            line_count: len(lines) };
+    }
+
+    let front_lines = [];
+    for fi close - 1 { front_lines[len(front_lines)] = lines[fi + 1]; }
+    let front_text = _join(front_lines, "\n");
+    let parsed = try SER.yaml_parse(front_text) catch nil;
+    if type(parsed) != "map" {
+        errors[len(errors)] = "frontmatter must be a valid YAML object in the supported subset";
+        parsed = map{};
+    }
+    let fields = map_keys(parsed);
+    if len(fields) > 32 { errors[len(errors)] = "frontmatter exceeds 32 fields"; }
+
+    let body_lines = [];
+    let bi = close + 1;
+    while bi < len(lines) { body_lines[len(body_lines)] = lines[bi]; bi = bi + 1; }
+    let body = str_trim(_join(body_lines, "\n"));
+    if body == "" { errors[len(errors)] = "skill body must not be empty"; }
+
+    let name = try { _bounded_text(try parsed.name catch "", "name", 64, true) } catch "";
+    if name == "" { errors[len(errors)] = "name is required"; }
+    elif not _name_valid(name) { errors[len(errors)] = "name must match ^[a-z0-9]+(-[a-z0-9]+)*$"; }
+    let description = try { _bounded_text(try parsed.description catch "", "description", 1024, true) } catch "";
+    if description == "" { errors[len(errors)] = "description is required"; }
+    if directory_name != "" {
+        let directory = try { _bounded_text(directory_name, "directory_name", 64, true) } catch "";
+        if directory == "" or not _name_valid(directory) {
+            errors[len(errors)] = "directory_name is invalid";
+        } elif name != "" and directory != name {
+            errors[len(errors)] = "name must match its skill directory";
+        }
+    }
+    let metadata = _metadata_validate(try parsed.metadata catch nil, errors);
+    let compatibility = try { _bounded_text(try parsed.compatibility catch "", "compatibility", 500) } catch "";
+    if map_has(parsed, "compatibility") and compatibility == "" and str_trim(str(parsed.compatibility)) != "" {
+        errors[len(errors)] = "compatibility must be bounded text";
+    }
+    let license = try { _bounded_text(try parsed.license catch "", "license", 256) } catch "";
+    let allowed_tools = _string_or_list(try parsed["allowed-tools"] catch nil, "allowed-tools", errors);
+    if len(body) > 50000 { warnings[len(warnings)] = "skill body is large; split detail into referenced files"; }
+
+    return map{ format: "pblang.agent_skill.v1", valid: len(errors) == 0,
+        errors: errors, warnings: warnings, frontmatter: parsed, body: body,
+        name: name, description: description, license: license,
+        compatibility: compatibility, metadata: metadata, allowed_tools: allowed_tools,
+        fields: fields, body_chars: len(body), line_count: len(lines) };
+}
+
+fn _profile(platform, fields, parsed) {
+    let ignored = _field_difference(parsed.fields, fields);
+    let blockers = [];
+    if not parsed.valid { blockers[len(blockers)] = "document validation failed"; }
+    let loads = parsed.valid;
+    return map{ platform: platform, loads: loads,
+        lossless: loads and len(ignored) == 0, ignored_fields: ignored,
+        blockers: blockers };
+}
+
+fn compatibility_matrix(document, directory_name = "") {
+    let parsed = parse_document(document, directory_name);
+    let portable = ["name", "description", "license", "compatibility", "metadata", "allowed-tools"];
+    let claude = ["name", "description", "when_to_use", "argument-hint", "arguments",
+        "disable-model-invocation", "user-invocable", "allowed-tools", "disallowed-tools",
+        "model", "effort", "context", "agent", "background", "hooks", "paths", "shell",
+        "metadata", "license", "compatibility"];
+    let rows = [
+        _profile("agent-skills", portable, parsed),
+        _profile("codex", ["name", "description", "metadata"], parsed),
+        _profile("claude-code", claude, parsed),
+        _profile("opencode", ["name", "description", "license", "compatibility", "metadata"], parsed)
+    ];
+    rows[0].discovery_paths = [".agents/skills/<name>/SKILL.md"];
+    rows[1].discovery_paths = ["$CODEX_HOME/skills/<name>/SKILL.md"];
+    rows[2].discovery_paths = [".claude/skills/<name>/SKILL.md", "~/.claude/skills/<name>/SKILL.md"];
+    rows[3].discovery_paths = [".opencode/skills/<name>/SKILL.md", ".claude/skills/<name>/SKILL.md", ".agents/skills/<name>/SKILL.md"];
+    rows[1].note = "Codex selection uses name and description; bundled resources remain tool-controlled.";
+    rows[2].note = "Claude Code extensions are local-only unless restricted to portable upload fields.";
+    rows[3].note = "OpenCode ignores unknown skill fields; ignored fields are reported here to prevent silent semantic loss.";
+    return map{ format: "pblang.agent_skill.compatibility.v1", valid: parsed.valid,
+        skill: parsed.name, platforms: rows, parsed: parsed,
+        executed: false, filesystem_access: false };
+}
+
+fn _finding(findings, severity, code, message) {
+    findings[len(findings)] = map{ severity: severity, code: code, message: message };
+}
+
+fn security_review(document, directory_name = "") {
+    let parsed = parse_document(document, directory_name);
+    let findings = [];
+    if not parsed.valid { _finding(findings, "high", "invalid-document", "Invalid skills must not be loaded or executed."); }
+    let body = str_lower(parsed.body);
+    if str_contains(body, "!`") or str_contains(body, "```!") {
+        _finding(findings, "high", "dynamic-shell", "Skill body contains dynamic command injection syntax.");
+    }
+    if map_has(parsed.frontmatter, "hooks") {
+        _finding(findings, "high", "session-hooks", "Skill declares lifecycle hooks with effects beyond instruction loading.");
+    }
+    if map_has(parsed.frontmatter, "allowed-tools") {
+        let raw = str_lower(str(try parsed.frontmatter["allowed-tools"] catch ""));
+        let severity = "medium";
+        if str_contains(raw, "bash") or str_contains(raw, "powershell") or str_contains(raw, "*") {
+            severity = "high";
+        }
+        _finding(findings, severity, "preapproved-tools", "Skill requests temporary tool pre-approval; review the exact grant before use.");
+    }
+    if _contains(body, "rm -rf") or _contains(body, "git push") or _contains(body, "sudo ")
+       or _contains(body, "curl ") or _contains(body, "wget ") {
+        _finding(findings, "high", "effectful-instructions", "Skill contains destructive, publishing, privileged, or network command indicators.");
+    }
+    if _contains(body, "api key") or _contains(body, "password") or _contains(body, "secret")
+       or _contains(body, "credential") {
+        _finding(findings, "medium", "sensitive-data", "Skill mentions sensitive data; verify redaction and non-persistence boundaries.");
+    }
+    if map_has(parsed.frontmatter, "model") or map_has(parsed.frontmatter, "agent")
+       or map_has(parsed.frontmatter, "context") {
+        _finding(findings, "low", "execution-routing", "Skill changes model, agent, or context routing and may alter permission assumptions.");
+    }
+    let high = 0; let medium = 0; let low = 0;
+    for i len(findings) {
+        if findings[i].severity == "high" { high = high + 1; }
+        elif findings[i].severity == "medium" { medium = medium + 1; }
+        else { low = low + 1; }
+    }
+    let risk = "low";
+    if high > 0 { risk = "high"; }
+    elif medium > 0 { risk = "review"; }
+    return map{ format: "pblang.agent_skill.security_review.v1",
+        valid: parsed.valid, skill: parsed.name, risk: risk,
+        safe_to_auto_load: parsed.valid and high == 0 and medium == 0,
+        findings: findings, high: high, medium: medium, low: low,
+        analysis: "bounded-pattern", semantic_complete: false,
+        executed: false, filesystem_access: false };
+}
+
+fn _portable_frontmatter(manifest) {
+    let out = map{};
+    let fields = ["name", "description", "license", "compatibility", "metadata", "allowed-tools"];
+    for i len(fields) { if map_has(manifest, fields[i]) { out[fields[i]] = manifest[fields[i]]; } }
+    return out;
+}
+
+fn _valid_result(value) { return try value.valid catch false; }
+
+fn render_document(manifest, body) {
+    if type(manifest) != "map" { throw "manifest must be an object"; }
+    body = _bounded_body(body);
+    let front = _portable_frontmatter(manifest);
+    let document = "---\n" + SER.yaml_stringify(front) + "---\n\n" + body + "\n";
+    if not _valid_result(parse_document(document, try front.name catch "")) {
+        throw "generated skill did not pass validation";
+    }
+    return document;
+}
+
+fn bundle_generate(manifest, body, targets = nil) {
+    let document = render_document(manifest, body);
+    let parsed = parse_document(document, try manifest.name catch "");
+    if targets == nil { targets = ["codex", "claude-code", "opencode", "agent-skills"]; }
+    if type(targets) != "array" or len(targets) < 1 or len(targets) > 4 { throw "targets must contain 1..4 platforms"; }
+    let paths = map{
+        codex: "$CODEX_HOME/skills/" + parsed.name + "/SKILL.md",
+        "claude-code": ".claude/skills/" + parsed.name + "/SKILL.md",
+        opencode: ".opencode/skills/" + parsed.name + "/SKILL.md",
+        "agent-skills": ".agents/skills/" + parsed.name + "/SKILL.md"
+    };
+    let files = []; let seen = map{};
+    for i len(targets) {
+        let target = str_lower(str_trim(str(targets[i])));
+        if not map_has(paths, target) { throw "unsupported skill target: " + target; }
+        if not (try seen[target] catch false) {
+            seen[target] = true;
+            files[len(files)] = map{ target: target, path: paths[target], content: document };
+        }
+    }
+    return map{ format: "pblang.agent_skill.bundle.v1", skill: parsed.name,
+        files: files, file_count: len(files), portable: true,
+        writes_performed: 0, executed: false };
+}
+
+export parse_document, compatibility_matrix, security_review, render_document,
+       bundle_generate;

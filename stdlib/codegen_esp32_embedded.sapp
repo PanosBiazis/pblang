@@ -1,0 +1,139 @@
+// Experimental native classic-ESP32 image emitter written in PBLang.
+//
+// This first artifact is deliberately RAM-only. It drives GPIO23 and emits
+// alternating H/L bytes through the ROM-configured UART. Persistent flash is
+// not enabled until RAM execution, timing and reset recovery are verified.
+
+let FORMAT = "pblang.embedded-esp32-artifact.v1";
+let IMAGE_FORMAT = "pblang.esp-image.v1";
+let IRAM_ADDRESS = 0x40080000;
+let ENTRY_ADDRESS = 0x40080014;
+let MAX_IMAGE_BYTES = 262144;
+
+fn _append(target, bytes) { for i len(bytes) { array_push(target, bytes[i]); } }
+
+fn _u32(value) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < 0 or value > 4294967295 {
+        throw "esp32 codegen: expected unsigned 32-bit integer";
+    }
+    return [value % 256, num_floor(value / 256) % 256,
+        num_floor(value / 65536) % 256, num_floor(value / 16777216) % 256];
+}
+
+fn _read_u32(bytes, offset) {
+    if offset < 0 or offset + 4 > len(bytes) { throw "esp32 image: truncated u32"; }
+    return bytes[offset] + bytes[offset + 1] * 256
+        + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216;
+}
+
+fn image(segment, load_address, entry_address) {
+    if type(segment) != "array" or len(segment) == 0 or len(segment) > MAX_IMAGE_BYTES {
+        throw "esp32 image: segment must contain 1..262144 bytes";
+    }
+    let out = [0xe9, 1, 2, 0x20];
+    _append(out, _u32(entry_address));
+    // Extended ESP32 header: disabled custom WP, chip ID 0, no digest.
+    _append(out, [0xee,0,0,0, 0,0, 0, 0,0, 0,0, 0,0,0,0, 0]);
+    _append(out, _u32(load_address)); _append(out, _u32(len(segment)));
+    _append(out, segment);
+    let checksum = 0xef;
+    for i len(segment) { checksum = bit_xor(checksum, segment[i]); }
+    while (len(out) + 1) % 16 != 0 { array_push(out, 0); }
+    array_push(out, checksum);
+    return out;
+}
+
+fn parse_image(bytes) {
+    if type(bytes) != "array" or len(bytes) < 48 or len(bytes) > MAX_IMAGE_BYTES + 64
+       or bytes[0] != 0xe9 {
+        throw "esp32 image: invalid bounded image";
+    }
+    let segments = bytes[1];
+    if segments != 1 { throw "esp32 image: this backend requires one RAM segment"; }
+    let entry = _read_u32(bytes, 4); let offset = 24;
+    let address = _read_u32(bytes, offset); let count = _read_u32(bytes, offset + 4);
+    if count < 1 or count > MAX_IMAGE_BYTES or offset + 8 + count >= len(bytes) {
+        throw "esp32 image: invalid segment size";
+    }
+    let data = []; let checksum = 0xef;
+    for i count {
+        let value = bytes[offset + 8 + i]; array_push(data, value);
+        checksum = bit_xor(checksum, value);
+    }
+    let checksum_offset = len(bytes) - 1;
+    if (checksum_offset + 1) % 16 != 0 or bytes[checksum_offset] != checksum {
+        throw "esp32 image: checksum mismatch";
+    }
+    let padding_start = offset + 8 + count;
+    let cursor = padding_start;
+    while cursor < checksum_offset {
+        if bytes[cursor] != 0 { throw "esp32 image: non-zero alignment padding"; }
+        cursor = cursor + 1;
+    }
+    return map{ ok:true, format:IMAGE_FORMAT, entry_address:entry,
+        load_address:address, segment:data, segment_bytes:len(data),
+        checksum:checksum, image_bytes:len(bytes), ram_only:true };
+}
+
+fn _blink_500ms_gpio23() {
+    // Xtensa LX6 base instructions with no stack or ROM call dependency. The
+    // bounded loop is calibrated for the connected 240 MHz classic ESP32.
+    // Memory barriers make peripheral writes observable in program order.
+    return [
+        0x24,0x40,0xf4,0x3f, 0x08,0x40,0xf4,0x3f,
+        0x0c,0x40,0xf4,0x3f, 0x00,0x00,0x80,0x00,
+        0x00,0x00,0xf4,0x3f,
+        0x21,0xfb,0xff, 0x31,0xfd,0xff, 0x71,0xfa,0xff,
+        0x81,0xfa,0xff, 0x91,0xfc,0xff,
+        0x39,0x02, 0xc0,0x20,0x00,
+        0x39,0x07, 0xc0,0x20,0x00,
+        0xb2,0xa0,0x48, 0xb2,0x69,0x00, 0xc0,0x20,0x00,
+        0x42,0xa0,0x37, 0x52,0xa0,0xc8, 0x62,0xa1,0x2c,
+        0x0b,0x66, 0x56,0xa6,0xff, 0x0b,0x55, 0x56,0x25,0xff,
+        0x0b,0x44, 0x56,0xa4,0xfe,
+        0x39,0x08, 0xc0,0x20,0x00,
+        0x4c,0xcb, 0xb9,0x09, 0xc0,0x20,0x00,
+        0x42,0xa0,0x37, 0x52,0xa0,0xc8, 0x62,0xa1,0x2c,
+        0x0b,0x66, 0x56,0xa6,0xff, 0x0b,0x55, 0x56,0x25,0xff,
+        0x0b,0x44, 0x56,0xa4,0xfe, 0x86,0xec,0xff
+    ];
+}
+
+fn compile(lowered) {
+    if lowered == nil or not is_map(lowered) or not (try lowered.ok catch false)
+       or lowered.board.id != "esp32-devkitc-v4" {
+        throw "esp32 codegen: successful ESP32 DevKitC lowering required";
+    }
+    if len(lowered.operations) != 7
+       or lowered.operations[0].kind != "pin-mode"
+       or lowered.operations[0].pin.gpio != 23
+       or lowered.operations[1].kind != "loop-begin"
+       or lowered.operations[2].kind != "digital-write"
+       or lowered.operations[2].value != 1
+       or lowered.operations[3].kind != "delay-ms"
+       or lowered.operations[3].value != 500
+       or lowered.operations[4].kind != "digital-write"
+       or lowered.operations[4].value != 0
+       or lowered.operations[5].kind != "delay-ms"
+       or lowered.operations[5].value != 500
+       or lowered.operations[6].kind != "loop-end" {
+        throw "esp32 codegen: RAM validation currently accepts only GPIO23 500 ms blink";
+    }
+    let code = _blink_500ms_gpio23(); let binary = image(code, IRAM_ADDRESS, ENTRY_ADDRESS);
+    let checked = parse_image(binary);
+    if checked.segment != code { throw "esp32 codegen: image roundtrip mismatch"; }
+    return map{ ok:true, format:FORMAT, board:lowered.board.id, mcu:"esp32",
+        architecture:"xtensa-lx6", backend:"native-xtensa-lx6-experimental",
+        firmware_format:"esp-image", image:binary, binary:code, bytes:len(code),
+        image_bytes:len(binary), load_address:IRAM_ADDRESS, entry_address:ENTRY_ADDRESS,
+        sha256:sha256(base64_encode_bytes(binary)), native_source_language:"pblang",
+        ram_only:true, persistent_flash_ready:false, uart_evidence:"alternating H/L markers",
+        hardware_evidence:map{board:"esp32-devkitc-v4",gpio:23,requested_ms:500,
+            measured_phase_ms_min:495.338134765625,measured_phase_ms_max:495.834716796875,
+            samples:8,verified_date:"2026-08-17",persistent_flash:false},
+        c_fallback:false, assembler_dependency:false, compiler_dependency:false };
+}
+
+export FORMAT, IMAGE_FORMAT, IRAM_ADDRESS, ENTRY_ADDRESS, MAX_IMAGE_BYTES;
+export image, parse_image, compile;

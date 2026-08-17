@@ -1,0 +1,247 @@
+// PDF Standard Security Handler primitives implemented in pure PBLang.
+//
+// Revisions 2..4 are supported for compatibility when reading user-owned
+// documents. RC4 is intentionally exposed only through the PDF compatibility
+// contract and must not be used for new encryption.
+
+let Digest = import("stdlib:digest.sapp");
+let AES = import("stdlib:aes_gcm.sapp");
+let SHA2_64 = import("stdlib:sha512_pb.sapp");
+let NativeCrypto = import("stdlib:native_crypto_accel.sapp");
+
+let FORMAT = "pblang.pdf-security.v1";
+let PASSWORD_PADDING = [
+    0x28,0xbf,0x4e,0x5e,0x4e,0x75,0x8a,0x41,0x64,0x00,0x4e,0x56,0xff,0xfa,0x01,0x08,
+    0x2e,0x2e,0x00,0xb6,0xd0,0x68,0x3e,0x80,0x2f,0x0c,0xa9,0xfe,0x64,0x53,0x69,0x7a
+];
+
+fn _error(message) { return map{ ok: false, format: FORMAT, error: message }; }
+fn _copy(values) { let out=[]; for value in values { array_push(out,value); } return out; }
+fn _append(out,values) { for value in values { array_push(out,value); } return out; }
+fn _bytes(value,label) {
+    if type(value)!="array" { throw label+" must be bytes"; }
+    for byte in value { if type(byte)!="number" or num_floor(byte)!=byte or byte<0 or byte>255 { throw label+" contains an invalid byte"; } }
+    return value;
+}
+fn _password(value) {
+    if type(value)=="string" { value=str_to_bytes(value); }
+    _bytes(value,"PDF password"); if len(value)>127 { throw "PDF password exceeds the bounded 127-byte limit"; }
+    return value;
+}
+fn _md5(value) { return AES.hex_bytes(Digest.md5_hex_bytes(value)); }
+fn _sha2(bits,value,accelerator=nil) {
+    if accelerator!=nil and (try accelerator.ok catch false) {
+        let accelerated=NativeCrypto.digest(accelerator,bits,value);
+        if accelerated.ok { return accelerated.bytes; }
+    }
+    if bits==256 { return AES.sha256_bytes(value); }
+    if bits==384 { return AES.hex_bytes(SHA2_64.sha384_hex_bytes(value)); }
+    if bits==512 { return AES.hex_bytes(SHA2_64.sha512_hex_bytes(value)); }
+    throw "unsupported SHA-2 width";
+}
+fn _equal_prefix(left,right,count) {
+    if len(left)<count or len(right)<count { return false; }
+    let diff=0; for i count { diff=bit_or(diff,bit_xor(left[i],right[i])); } return diff==0;
+}
+fn _pad_password(value) {
+    value=_password(value); let out=[]; let i=0;
+    while i<32 and i<len(value) { array_push(out,value[i]); i=i+1; }
+    i=0; while len(out)<32 { array_push(out,PASSWORD_PADDING[i]); i=i+1; }
+    return out;
+}
+fn _le32(value) {
+    value=value%4294967296; if value<0 { value=value+4294967296; }
+    return [value%256,num_floor(value/256)%256,num_floor(value/65536)%256,num_floor(value/16777216)%256];
+}
+fn _zeros(count) { let out=[]; for ignored count { array_push(out,0); } return out; }
+
+// ISO 32000 Algorithm 2.B. At round 287, round-32 is 255, so the final-byte
+// termination condition is necessarily true. The explicit bound prevents
+// malformed documents from causing unbounded password-validation work.
+fn _modern_hash(password,salt,user_data,revision,accelerator) {
+    password=_password(password); _bytes(salt,"PDF password salt"); _bytes(user_data,"PDF user data");
+    if len(salt)!=8 or (len(user_data)!=0 and len(user_data)!=48) or (revision!=5 and revision!=6) {
+        throw "PDF R5/R6 hash inputs are invalid";
+    }
+    let input=_copy(password); _append(input,salt); _append(input,user_data); let key=_sha2(256,input,accelerator);
+    if revision==5 { return key; }
+    let round=0;
+    while true {
+        round=round+1; let unit=_copy(password); _append(unit,key); _append(unit,user_data);
+        let encrypted=nil; let last_byte=nil;
+        if accelerator!=nil and (try accelerator.ok catch false) {
+            let accelerated=NativeCrypto.r6_round(accelerator,unit,key);
+            if accelerated.ok { key=accelerated.digest; last_byte=accelerated.last_byte; }
+        }
+        if last_byte==nil {
+            let repeated=[]; for ignored 64 { _append(repeated,unit); }
+            encrypted=AES.aes_cbc_encrypt_blocks(repeated,slice(key,0,16),slice(key,16,32));
+            let remainder=0; for i 16 { remainder=(remainder+encrypted[i])%3; }
+            let hash_bits=256; if remainder==1 { hash_bits=384; } elif remainder==2 { hash_bits=512; }
+            key=_sha2(hash_bits,encrypted,accelerator); last_byte=encrypted[len(encrypted)-1];
+        }
+        if round>=64 and last_byte<=round-32 { return slice(key,0,32); }
+        if round>=287 { throw "PDF R6 hash failed its bounded termination invariant"; }
+    }
+}
+fn modern_hash(password,salt,user_data,revision) {
+    let accelerator=NativeCrypto.open();
+    let result=_modern_hash(password,salt,user_data,revision,accelerator);
+    NativeCrypto.close(accelerator); return result;
+}
+
+fn _modern_authenticate_with_accel(config,password,accelerator) {
+    let revision=try config.revision catch nil; let owner=try config.owner catch nil;
+    let user=try config.user catch nil; let oe=try config.owner_encrypted_key catch nil;
+    let ue=try config.user_encrypted_key catch nil; let perms=try config.encrypted_permissions catch nil;
+    let permissions=try config.permissions catch nil; let encrypt_metadata=try config.encrypt_metadata catch true;
+    if (revision!=5 and revision!=6) or type(owner)!="array" or len(owner)!=48
+        or type(user)!="array" or len(user)!=48 or type(oe)!="array" or len(oe)!=32
+        or type(ue)!="array" or len(ue)!=32 or type(perms)!="array" or len(perms)!=16
+        or type(permissions)!="number" or num_floor(permissions)!=permissions or type(encrypt_metadata)!="bool" {
+        return _error("PDF AES-256 encryption dictionary is incomplete");
+    }
+    password=_password(password); let role=nil; let key_salt=nil; let encrypted_key=nil; let user_data=[];
+    let user_validation=_modern_hash(password,slice(user,32,40),[],revision,accelerator);
+    if _equal_prefix(user_validation,user,32) {
+        role="user"; key_salt=slice(user,40,48); encrypted_key=ue;
+    } else {
+        let owner_validation=_modern_hash(password,slice(owner,32,40),user,revision,accelerator);
+        if _equal_prefix(owner_validation,owner,32) {
+            role="owner"; key_salt=slice(owner,40,48); encrypted_key=oe; user_data=user;
+        }
+    }
+    if role==nil { return _error("PDF password is invalid"); }
+    let intermediate=_modern_hash(password,key_salt,user_data,revision,accelerator);
+    let file_key=try AES.aes_cbc_decrypt_blocks(encrypted_key,intermediate,_zeros(16)) catch nil;
+    if file_key==nil or len(file_key)!=32 { return _error("PDF encrypted file key is invalid"); }
+    let clear_perms=try AES.aes_cbc_decrypt_blocks(perms,file_key,_zeros(16)) catch nil;
+    if clear_perms==nil or len(clear_perms)!=16 { return _error("PDF encrypted permissions are invalid"); }
+    let metadata_flag=if encrypt_metadata {84} else {70};
+    let expected=_le32(permissions); _append(expected,[255,255,255,255,metadata_flag,97,100,98]);
+    if not _equal_prefix(clear_perms,expected,12) { return _error("PDF encrypted permissions validation failed"); }
+    return map{ok:true,format:FORMAT,key:file_key,revision:revision,length_bits:256,
+        password_role:role,weak_legacy_crypto:false,permissions_valid:true};
+}
+fn _modern_authenticate(config,password) {
+    let accelerator=NativeCrypto.open();
+    let result=_modern_authenticate_with_accel(config,password,accelerator);
+    NativeCrypto.close(accelerator); return result;
+}
+
+fn rc4_compat(data,key) {
+    _bytes(data,"RC4 data"); _bytes(key,"RC4 key");
+    if len(key)<1 or len(key)>256 { throw "RC4 key length is outside compatibility bounds"; }
+    let state=[]; for i 256 { array_push(state,i); }
+    let j=0; for i 256 { j=(j+state[i]+key[i%len(key)])%256; let swap=state[i]; state[i]=state[j]; state[j]=swap; }
+    let out=[]; let i=0; j=0;
+    for byte in data {
+        i=(i+1)%256; j=(j+state[i])%256; let swap=state[i]; state[i]=state[j]; state[j]=swap;
+        array_push(out,bit_xor(byte,state[(state[i]+state[j])%256]));
+    }
+    return out;
+}
+
+fn _xor_key(key,round) { let out=[]; for byte in key { array_push(out,bit_xor(byte,round)); } return out; }
+
+fn owner_entry(user_password,owner_password,revision,key_bytes) {
+    if owner_password==nil or len(_password(owner_password))==0 { owner_password=user_password; }
+    let digest=_md5(_pad_password(owner_password));
+    if revision>=3 { for ignored 50 { digest=_md5(digest); } }
+    let key=slice(digest,0,key_bytes); let result=rc4_compat(_pad_password(user_password),key);
+    if revision>=3 { let round=1; while round<=19 { result=rc4_compat(result,_xor_key(key,round)); round=round+1; } }
+    return result;
+}
+
+fn file_key(config,password) {
+    let revision=try config.revision catch nil; let bits=try config.length_bits catch nil;
+    if revision==2 { bits=40; }
+    if (revision!=2 and revision!=3 and revision!=4) or type(bits)!="number"
+        or num_floor(bits)!=bits or bits<40 or bits>128 or bits%8!=0 {
+        return _error("PDF security revision or key length is unsupported");
+    }
+    let owner=try config.owner catch nil; let permissions=try config.permissions catch nil;
+    let id0=try config.id0 catch nil;
+    if type(owner)!="array" or len(owner)!=32 or type(permissions)!="number"
+        or num_floor(permissions)!=permissions or type(id0)!="array" or len(id0)<1 or len(id0)>1024 {
+        return _error("PDF encryption dictionary is incomplete");
+    }
+    let key_bytes=bits/8; let material=_pad_password(password); _append(material,owner);
+    _append(material,_le32(permissions)); _append(material,id0);
+    if revision>=4 and (try config.encrypt_metadata catch true)==false { _append(material,[255,255,255,255]); }
+    let digest=_md5(material);
+    if revision>=3 { for ignored 50 { digest=_md5(slice(digest,0,key_bytes)); } }
+    return map{ ok:true,format:FORMAT,key:slice(digest,0,key_bytes),revision:revision,
+        length_bits:bits,weak_legacy_crypto:revision<4 };
+}
+
+fn _user_entry(file_key_bytes,id0,revision) {
+    if revision==2 { return rc4_compat(PASSWORD_PADDING,file_key_bytes); }
+    let material=_copy(PASSWORD_PADDING); _append(material,id0); let result=rc4_compat(_md5(material),file_key_bytes);
+    let round=1; while round<=19 { result=rc4_compat(result,_xor_key(file_key_bytes,round)); round=round+1; }
+    _append(result,[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]); return result;
+}
+fn user_entry(file_key_bytes,id0,revision) { return _user_entry(file_key_bytes,id0,revision); }
+
+fn authenticate(config,password) {
+    let user=try config.user catch nil; let revision=try config.revision catch nil;
+    if revision==5 or revision==6 { return _modern_authenticate(config,password); }
+    if type(user)!="array" or len(user)!=32 { return _error("PDF encryption dictionary has invalid /U"); }
+    let direct=file_key(config,password);
+    if direct.ok {
+        let expected=_user_entry(direct.key,config.id0,revision); let count=if revision==2 {32}else{16};
+        if _equal_prefix(expected,user,count) { direct.password_role="user"; return direct; }
+    }
+    let owner=try config.owner catch nil; let bits=if revision==2 {40}else{try config.length_bits catch nil};
+    if type(owner)!="array" or len(owner)!=32 or bits==nil { return _error("PDF password is invalid"); }
+    let digest=_md5(_pad_password(password)); if revision>=3 { for ignored 50 { digest=_md5(digest); } }
+    let owner_key=slice(digest,0,bits/8); let recovered=_copy(owner);
+    if revision==2 { recovered=rc4_compat(recovered,owner_key); }
+    else { let round=19; while round>=0 { recovered=rc4_compat(recovered,_xor_key(owner_key,round)); round=round-1; } }
+    let through_owner=file_key(config,recovered);
+    if through_owner.ok {
+        let expected=_user_entry(through_owner.key,config.id0,revision);
+        let count=if revision==2 {32}else{16};
+        if _equal_prefix(expected,user,count) { through_owner.password_role="owner"; return through_owner; }
+    }
+    return _error("PDF password is invalid");
+}
+
+fn object_key(file_key_bytes,number,generation,aes=false) {
+    _bytes(file_key_bytes,"PDF file key");
+    if type(number)!="number" or num_floor(number)!=number or number<0 or number>16777215
+        or type(generation)!="number" or num_floor(generation)!=generation or generation<0 or generation>65535 {
+        throw "PDF object identifier is invalid";
+    }
+    let material=_copy(file_key_bytes);
+    _append(material,[number%256,num_floor(number/256)%256,num_floor(number/65536)%256,
+        generation%256,num_floor(generation/256)%256]);
+    if aes { _append(material,[0x73,0x41,0x6c,0x54]); }
+    let digest=_md5(material); return slice(digest,0,num_min(len(file_key_bytes)+5,16));
+}
+
+fn decrypt_object(data,file_key_bytes,number,generation,method) {
+    _bytes(data,"PDF encrypted object data"); method=str_lower(str(method));
+    if method=="identity" or method=="none" { return map{ok:true,format:FORMAT,bytes:_copy(data),method:"identity"}; }
+    if method=="rc4" or method=="v2" {
+        return map{ok:true,format:FORMAT,bytes:rc4_compat(data,object_key(file_key_bytes,number,generation,false)),method:"rc4"};
+    }
+    if method=="aes128" or method=="aesv2" {
+        if len(data)<32 or (len(data)-16)%16!=0 { return _error("PDF AESV2 object has invalid IV/ciphertext length"); }
+        let iv=slice(data,0,16); let ciphertext=slice(data,16,len(data));
+        let plain=try AES.aes_cbc_decrypt_pkcs7(ciphertext,object_key(file_key_bytes,number,generation,true),iv) catch nil;
+        if plain==nil { return _error("PDF AESV2 object padding validation failed"); }
+        return map{ok:true,format:FORMAT,bytes:plain,method:"aes128"};
+    }
+    if method=="aes256" or method=="aesv3" {
+        if len(file_key_bytes)!=32 { return _error("PDF AESV3 file key has invalid length"); }
+        if len(data)<32 or (len(data)-16)%16!=0 { return _error("PDF AESV3 object has invalid IV/ciphertext length"); }
+        let plain=try AES.aes_cbc_decrypt_pkcs7(slice(data,16,len(data)),file_key_bytes,slice(data,0,16)) catch nil;
+        if plain==nil { return _error("PDF AESV3 object padding validation failed"); }
+        return map{ok:true,format:FORMAT,bytes:plain,method:"aes256"};
+    }
+    return _error("unsupported PDF object crypt filter method");
+}
+
+export FORMAT,PASSWORD_PADDING,rc4_compat,owner_entry,user_entry,file_key,modern_hash,
+       authenticate,object_key,decrypt_object;
