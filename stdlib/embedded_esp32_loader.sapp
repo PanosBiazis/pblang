@@ -1,14 +1,23 @@
-// Bounded PBLang-native classic ESP32 ROM RAM loader. It deliberately exposes
-// no flash erase/write, eFuse, register-write, or arbitrary-address operation.
+// Bounded PBLang-native classic ESP32 ROM loader. Persistent writes are limited
+// to one verified boot image at 0x1000; eFuse and arbitrary-address writes are
+// deliberately not exposed.
 
 let Serial = import("stdlib:linux_serial.sapp");
 let ESP32 = import("stdlib:codegen_esp32_embedded.sapp");
+let Digest = import("stdlib:digest.sapp");
 
 let FORMAT = "pblang.esp32-rom-loader.v1";
 let SLIP_END = 0xc0; let SLIP_ESC = 0xdb; let SLIP_ESC_END = 0xdc; let SLIP_ESC_ESC = 0xdd;
+let OP_FLASH_BEGIN = 0x02; let OP_FLASH_DATA = 0x03; let OP_FLASH_END = 0x04;
 let OP_MEM_BEGIN = 0x05; let OP_MEM_END = 0x06; let OP_MEM_DATA = 0x07; let OP_SYNC = 0x08;
+let OP_READ_REG = 0x0a; let OP_SPI_SET_PARAMS = 0x0b; let OP_SPI_ATTACH = 0x0d;
+let OP_READ_FLASH_SLOW = 0x0e; let OP_SPI_FLASH_MD5 = 0x13;
 let MAX_PACKET_BYTES = 8192; let MAX_WIRE_BYTES = 16384; let MAX_BLOCK_BYTES = 6144;
 let MAX_RESPONSE_BYTES = 4096; let MAX_SYNC_ATTEMPTS = 5;
+let FLASH_BYTES = 4194304; let FLASH_SECTOR_BYTES = 4096; let FLASH_BLOCK_BYTES = 1024;
+let BOOT_OFFSET = 0x1000; let PARTITION_TABLE_OFFSET = 0x8000; let FACTORY_APP_OFFSET = 0x10000;
+let CHIP_MAGIC_REGISTER = 0x40001000; let ESP32_MAGIC = 0x00f01d83;
+let EFUSE_BASE = 0x3ff5a000; let EFUSE_SECURITY_REGISTER = 0x3ff5a018;
 
 fn _error(message, code = "loader-error") {
     return map{ok:false,format:FORMAT,code:code,error:message};
@@ -73,8 +82,10 @@ fn parse_response(packet,expected_opcode){
     if packet[0]!=1 or packet[1]!=expected_opcode{return _error("unmatched ROM response","response-command");}
     let size=_read_u16(packet,2);if size<4 or 8+size!=len(packet){return _error("invalid ROM response length","response-length");}
     let status_at=8+size-4;let status=packet[status_at];let error=packet[status_at+1];
-    return map{ok:status==0,format:FORMAT,opcode:packet[1],size:size,
+    let data=[];let cursor=8;while cursor<status_at{array_push(data,packet[cursor]);cursor=cursor+1;}
+    return map{ok:status==0,format:FORMAT,code:if status==0{""}else{"rom-error"},opcode:packet[1],size:size,
         value:_read_u32(packet,4),status:status,rom_error:error,
+        data:data,
         error:if status==0{""}else{"ESP32 ROM command failed with error "+str(error)}};
 }
 fn sync_payload(){let data=[0x07,0x07,0x12,0x20];let count=0;
@@ -90,32 +101,163 @@ fn align_ram_data(bytes){
     if not _valid_bytes(bytes,MAX_PACKET_BYTES){throw "esp32 loader: invalid RAM data";}
     let out=[];_append(out,bytes);while num_mod(len(out),4)!=0{array_push(out,0);}return out;
 }
+fn flash_layout(artifact){
+    if type(artifact)!="map" or not (try artifact.ok catch false)
+       or (try artifact.board catch "")!="esp32-devkitc-v4"{
+        return _error("verified ESP32 DevKitC artifact required","artifact");
+    }
+    let image=try artifact.image catch nil;
+    let parsed=try ESP32.parse_image(image) catch nil;
+    if parsed==nil or not parsed.ok or len(image)>FLASH_SECTOR_BYTES{
+        return _error("boot image must fit one protected flash sector","layout");
+    }
+    if image[0]!=0xe9 or image[2]!=2 or image[3]!=0x20{
+        return _error("boot image must declare DIO, 4 MB and 40 MHz flash","layout");
+    }
+    return map{ok:true,format:"pblang.esp32-flash-layout.v1",flash_bytes:FLASH_BYTES,
+        boot:map{offset:BOOT_OFFSET,bytes:len(image),sector_end:BOOT_OFFSET+FLASH_SECTOR_BYTES},
+        reserved:map{partition_table_offset:PARTITION_TABLE_OFFSET,factory_app_offset:FACTORY_APP_OFFSET},
+        overlap:false,partition_table_written:false,nvs_written:false,ota_written:false};
+}
+fn spi_attach_payload(){return [0,0,0,0,0,0,0,0];}
+fn spi_params_payload(){let out=[];for value in [0,FLASH_BYTES,65536,FLASH_SECTOR_BYTES,256,65535]{_append(out,_u32(value));}return out;}
+fn flash_begin_payload(size,offset){let blocks=num_floor((size+FLASH_BLOCK_BYTES-1)/FLASH_BLOCK_BYTES);let out=[];
+    _append(out,_u32(size));_append(out,_u32(blocks));_append(out,_u32(FLASH_BLOCK_BYTES));
+    _append(out,_u32(offset));return out;}
+fn flash_data_payload(block,sequence){if not _valid_bytes(block,FLASH_BLOCK_BYTES) or len(block)!=FLASH_BLOCK_BYTES{
+        throw "esp32 loader: flash block must be exactly 1024 bytes";}
+    let out=[];_append(out,_u32(len(block)));_append(out,_u32(sequence));
+    _append(out,[0,0,0,0,0,0,0,0]);_append(out,block);return out;}
+fn flash_end_payload(reboot){return _u32(if reboot{0}else{1});}
+fn flash_md5_payload(offset,size){let out=[];_append(out,_u32(offset));_append(out,_u32(size));
+    _append(out,[0,0,0,0,0,0,0,0]);return out;}
+fn _flash_block(image,offset){let block=[];let cursor=0;while cursor<FLASH_BLOCK_BYTES{
+    if offset+cursor<len(image){array_push(block,image[offset+cursor]);}
+    else {array_push(block,255);}cursor=cursor+1;}return block;}
+fn _bit_count(value){let count=0;let remaining=value;while remaining>0{
+    count=count+num_mod(remaining,2);remaining=num_floor(remaining/2);}return count;}
 
 fn _exchange(serial,opcode,data,checksum_value,timeout_ms){
     let wire=slip_encode(command_packet(opcode,data,checksum_value));
     let wrote=Serial.write_bytes(serial,wire,timeout_ms);if not wrote.ok{return _error(wrote.error,"serial-write");}
-    let decoder=new_decoder();let received=0;let started=now_ms();
+    let decoder=new_decoder();let received=0;let started=now_ms();let malformed_frames=0;
     while now_ms()-started<timeout_ms and received<MAX_RESPONSE_BYTES{
         let remaining=timeout_ms-num_floor(now_ms()-started);if remaining<1{remaining=1;}
         let read=Serial.read_bytes(serial,MAX_RESPONSE_BYTES-received,remaining);
         if not read.ok{return _error(read.error,"serial-read");}received=received+read.bytes_read;
         let decoded=slip_feed(decoder,read.bytes);if not decoded.ok{return decoded;}
         for i len(decoded.frames){let response=parse_response(decoded.frames[i],opcode);
-            if response.ok or response.code!="response-command"{response.bytes_received=received;return response;}}
+            if response.code=="response-shape" or response.code=="response-length"{
+                malformed_frames=malformed_frames+1;
+                if malformed_frames>32{return _error("too many malformed ESP32 ROM frames","response-noise");}
+            } elif response.ok or response.code!="response-command"{
+                response.bytes_received=received;response.malformed_frames=malformed_frames;return response;
+            }}
         if read.bytes_read==0{break;}
-    }return _error("ESP32 ROM response deadline expired","response-timeout");
+    }let failure=_error("ESP32 ROM response deadline expired","response-timeout");
+    failure.malformed_frames=malformed_frames;failure.bytes_received=received;return failure;
 }
 fn _enter_bootloader(serial){
-    let first=Serial.set_modem_lines(serial,false,true);if not first.ok{return first;}sleep_ms(100);
-    let second=Serial.set_modem_lines(serial,true,false);if not second.ok{return second;}sleep_ms(50);
-    let release=Serial.set_modem_lines(serial,false,false);if not release.ok{return release;}sleep_ms(50);
+    let first=Serial.set_modem_lines(serial,false,true);if not first.ok{return first;}sleep_ms(200);
+    let second=Serial.set_modem_lines(serial,true,false);if not second.ok{return second;}sleep_ms(200);
+    let release=Serial.set_modem_lines(serial,false,false);if not release.ok{return release;}sleep_ms(100);
     return Serial.flush_input(serial);
+}
+fn _normal_reset(serial,settle_ms=250){
+    if not _integer(settle_ms,0,2000){return _error("invalid reset settling time","invalid-options");}
+    // DevKitC auto-reset circuit: keep GPIO0 released while pulsing EN low.
+    let asserted=Serial.set_modem_lines(serial,false,true);if not asserted.ok{return asserted;}sleep_ms(100);
+    let released=Serial.set_modem_lines(serial,false,false);if not released.ok{return released;}sleep_ms(settle_ms);
+    return map{ok:true,format:FORMAT,reset:"normal-boot",gpio0_released:true};
+}
+fn sanitize_boot_bytes(bytes){
+    if not _valid_bytes(bytes,2048){throw "esp32 loader: invalid bounded boot transcript";}
+    let text="";for i len(bytes){let value=bytes[i];
+        if value==10 or value==13 or (value>=32 and value<=126){text=text+bytes_to_str([value]);}
+        else {text=text+".";}
+    }return text;
 }
 fn _sync(serial,timeout_ms){let attempt=0;let last=_error("ESP32 ROM synchronization failed","sync");
     while attempt<MAX_SYNC_ATTEMPTS{attempt=attempt+1;
         let result=_exchange(serial,OP_SYNC,sync_payload(),0,timeout_ms);
         if result.ok{result.attempts=attempt;return result;}last=result;sleep_ms(50);
     }last.attempts=attempt;return last;
+}
+fn _read_register(serial,address,timeout_ms){return _exchange(serial,OP_READ_REG,_u32(address),0,timeout_ms);}
+fn _read_register_consistent(serial,address,timeout_ms){
+    let first=_read_register(serial,address,timeout_ms);if not first.ok{return first;}
+    let second=_read_register(serial,address,timeout_ms);if not second.ok{return second;}
+    if first.value!=second.value{return map{ok:false,format:FORMAT,code:"register-read-mismatch",
+        error:"ESP32 ROM register read was not stable",first_value:first.value,second_value:second.value};}
+    return map{ok:true,format:FORMAT,value:first.value};
+}
+fn _probe_classic_esp32(serial,timeout_ms){
+    let magic=_read_register_consistent(serial,CHIP_MAGIC_REGISTER,timeout_ms);
+    if not magic.ok{return magic;}
+    if magic.value!=ESP32_MAGIC{return map{ok:false,format:FORMAT,code:"chip-mismatch",
+        error:"connected target is not the expected classic ESP32",observed_magic:magic.value};}
+    let crypt=_read_register_consistent(serial,EFUSE_BASE,timeout_ms);if not crypt.ok{return crypt;}
+    let secure=_read_register_consistent(serial,EFUSE_SECURITY_REGISTER,timeout_ms);if not secure.ok{return secure;}
+    let crypt_count=bit_and(bit_shr(crypt.value,20),0x7f);
+    return map{ok:true,format:FORMAT,chip:"classic-esp32",magic_verified:true,
+        flash_encryption_enabled:num_mod(_bit_count(crypt_count),2)==1,
+        secure_boot_enabled:bit_and(secure.value,0x30)!=0};
+}
+fn _read_back(serial,offset,size,timeout_ms){let out=[];let cursor=0;
+    while cursor<size{let count=64;if size-cursor<count{count=size-cursor;}
+        let payload=[];_append(payload,_u32(offset+cursor));_append(payload,_u32(count));
+        let response=_exchange(serial,OP_READ_FLASH_SLOW,payload,0,timeout_ms);
+        if not response.ok{return response;}if len(response.data)<64{return _error("short ROM flash read-back","readback");}
+        for i count{array_push(out,response.data[i]);}cursor=cursor+count;
+    }return map{ok:true,format:FORMAT,bytes:out,bytes_read:len(out)};
+}
+fn probe(port,confirm=false){
+    if (try env_get("PB_EMBEDDED_PROBE_ENABLE") catch "")!="1" or not confirm{
+        return _error("ESP32 probe requires explicit read-only permission","permission");
+    }
+    let serial=Serial.open_port(str(port),115200);if not serial.ok{return serial;}
+    let stage="bootloader-reset";let result=_enter_bootloader(serial);
+    if result.ok{stage="sync";result=_sync(serial,1000);}
+    if result.ok{stage="chip-security-probe";result=_probe_classic_esp32(serial,1000);}
+    let closed=Serial.close(serial);if not result.ok{result.stage=stage;return result;}
+    result.termios_restored=closed.termios_restored;return result;
+}
+fn reset_normal(port,confirm=false){
+    if (try env_get("PB_EMBEDDED_RESET_ENABLE") catch "")!="1" or not confirm{
+        return _error("ESP32 reset requires explicit normal-boot permission","permission");
+    }
+    let serial=Serial.open_port(str(port),115200);if not serial.ok{return serial;}
+    let result=_normal_reset(serial);let closed=Serial.close(serial);
+    if not result.ok{result.stage="normal-reset";result.termios_restored=closed.termios_restored;return result;}
+    return map{ok:closed.ok,format:FORMAT,board:"esp32-devkitc-v4",reset:"normal-boot",
+        gpio0_released:true,flash_written:false,efuse_written:false,
+        termios_restored:closed.termios_restored,
+        error:if closed.ok{""}else{"serial state restoration failed"}};
+}
+fn diagnose_boot(port,confirm=false){
+    if (try env_get("PB_EMBEDDED_MONITOR_ENABLE") catch "")!="1" or not confirm{
+        return _error("ESP32 boot diagnosis requires explicit monitor permission","permission");
+    }
+    let serial=Serial.open_port(str(port),115200);if not serial.ok{return serial;}
+    let state=Serial.flush_input(serial);
+    if state.ok{state=_normal_reset(serial,0);}
+    let reading=state;
+    if state.ok{
+        let bytes=[];let started=now_ms();let read_error="";
+        while len(bytes)<2048 and now_ms()-started<3000 and read_error==""{
+            let part=Serial.read_bytes(serial,2048-len(bytes),250);
+            if not part.ok{read_error=part.error;}
+            else {for i len(part.bytes){array_push(bytes,part.bytes[i]);}}
+        }
+        reading=if read_error==""{map{ok:true,bytes:bytes,bytes_read:len(bytes),truncated:len(bytes)==2048}}
+            else{_error(read_error,"serial-read")};
+    }
+    let closed=Serial.close(serial);
+    if not reading.ok{reading.stage="boot-diagnosis";reading.termios_restored=closed.termios_restored;return reading;}
+    return map{ok:closed.ok,format:FORMAT,board:"esp32-devkitc-v4",bytes_read:reading.bytes_read,
+        truncated:reading.truncated,transcript:sanitize_boot_bytes(reading.bytes),
+        termios_restored:closed.termios_restored,
+        error:if closed.ok{""}else{"serial state restoration failed"}};
 }
 fn load_ram(artifact,request=nil){
     let options=if request==nil{map{}}else{request};
@@ -125,7 +267,8 @@ fn load_ram(artifact,request=nil){
         return _error("RAM loading requires PB_EMBEDDED_RAM_LOAD_ENABLE=1 and explicit confirmation","permission");
     }
     if type(artifact)!="map" or not (try artifact.ok catch false)
-       or (try artifact.board catch "")!="esp32-devkitc-v4" or not (try artifact.ram_only catch false){
+       or (try artifact.board catch "")!="esp32-devkitc-v4"
+       or not ((try artifact.ram_loadable catch false) or (try artifact.ram_only catch false)){
         return _error("verified classic ESP32 RAM artifact required","artifact");
     }
     let parsed=try ESP32.parse_image(artifact.image) catch nil;
@@ -155,8 +298,68 @@ fn load_ram(artifact,request=nil){
         entry_address:parsed.entry_address,termios_restored:closed.termios_restored,
         error:if closed.ok{""}else{"serial state restoration failed"}};
 }
+fn flash_boot(artifact,request=nil){
+    let options=if request==nil{map{}}else{request};
+    if type(options)!="map"{return _error("flash options must be a map","invalid-options");}
+    if (try env_get("PB_EMBEDDED_ESP32_FLASH_ENABLE") catch "")!="1"
+       or not (try options.confirm_flash catch false)
+       or (try options.confirm_board catch "")!="esp32-devkitc-v4"{
+        return _error("ESP32 flash requires the dedicated environment gate and exact board confirmation","permission");
+    }
+    let layout=flash_layout(artifact);if not layout.ok{return layout;}
+    let image=artifact.image;let port=str(try options.port catch "");let timeout=try options.timeout_ms catch 5000;
+    if port=="" or not _integer(timeout,1000,10000){return _error("invalid flash port or timeout","invalid-options");}
+    let serial=Serial.open_port(port,115200);if not serial.ok{return serial;}
+    let stage="bootloader-reset";let result=_enter_bootloader(serial);
+    if result.ok{stage="sync";result=_sync(serial,timeout);}
+    let probe=nil;if result.ok{stage="chip-security-probe";probe=_probe_classic_esp32(serial,timeout);
+        if not probe.ok{result=probe;}
+        elif probe.flash_encryption_enabled or probe.secure_boot_enabled{
+            result=_error("unsigned plaintext image is incompatible with enabled secure boot or flash encryption","security-policy");}}
+    if result.ok{stage="spi-attach";result=_exchange(serial,OP_SPI_ATTACH,spi_attach_payload(),0,timeout);}
+    if result.ok{stage="spi-parameters";result=_exchange(serial,OP_SPI_SET_PARAMS,spi_params_payload(),0,timeout);}
+    let blocks=num_floor((len(image)+FLASH_BLOCK_BYTES-1)/FLASH_BLOCK_BYTES);
+    if result.ok{stage="flash-begin";result=_exchange(serial,OP_FLASH_BEGIN,
+        flash_begin_payload(len(image),BOOT_OFFSET),0,timeout);}
+    let sequence=0;while result.ok and sequence<blocks{let block=_flash_block(image,sequence*FLASH_BLOCK_BYTES);
+        stage="flash-data-"+str(sequence);let attempt=0;let written=_error("flash block write failed","flash-data");
+        while attempt<2 and not written.ok{attempt=attempt+1;
+            written=_exchange(serial,OP_FLASH_DATA,flash_data_payload(block,sequence),checksum(block),timeout);}
+        result=written;sequence=sequence+1;
+    }
+    let byte_readback=nil;if result.ok{stage="byte-readback";byte_readback=_read_back(serial,BOOT_OFFSET,len(image),timeout);
+        if not byte_readback.ok{result=byte_readback;}
+        elif byte_readback.bytes!=image{result=_error("flash byte-for-byte read-back mismatch","readback-mismatch");}}
+    let expected_md5=Digest.md5_hex_bytes(image);let device_md5="";
+    if result.ok{stage="md5-readback";let md5=_exchange(serial,OP_SPI_FLASH_MD5,
+        flash_md5_payload(BOOT_OFFSET,len(image)),0,timeout);
+        if not md5.ok{result=md5;}
+        else {device_md5=try str_lower(bytes_to_str(md5.data)) catch "";
+            if not regex_match(device_md5,"^[0-9a-f]{32}$") or not constant_time_eq(device_md5,expected_md5){
+                result=_error("flash ROM digest mismatch","digest-mismatch");}}
+    }
+    let reboot_acknowledged=false;let reboot_error="";
+    if result.ok{stage="reboot";let reboot=_exchange(serial,OP_FLASH_END,flash_end_payload(true),0,timeout);
+        reboot_acknowledged=reboot.ok;
+        if not reboot.ok{reboot_error=try reboot.error catch "ESP32 ROM reboot was not acknowledged";}
+    }
+    let closed=Serial.close(serial);
+    if not result.ok{result.stage=stage;result.termios_restored=closed.termios_restored;return result;}
+    return map{ok:closed.ok,format:FORMAT,board:artifact.board,transport:"esp32-rom-uart",
+        native_source_language:"pblang",persistent:true,flash_written:true,efuse_written:false,
+        chip_magic_verified:probe.magic_verified,secure_boot_enabled:false,flash_encryption_enabled:false,
+        offset:BOOT_OFFSET,image_bytes:len(image),blocks:blocks,byte_readback_verified:true,
+        md5_verified:true,device_md5:device_md5,expected_md5:expected_md5,layout:layout,
+        reboot_acknowledged:reboot_acknowledged,reboot_error:reboot_error,boot_verified:false,
+        termios_restored:closed.termios_restored,error:if closed.ok{""}else{"serial state restoration failed"}};
+}
 
 export FORMAT, SLIP_END, SLIP_ESC, SLIP_ESC_END, SLIP_ESC_ESC;
-export OP_MEM_BEGIN, OP_MEM_END, OP_MEM_DATA, OP_SYNC, MAX_PACKET_BYTES, MAX_BLOCK_BYTES;
+export OP_FLASH_BEGIN, OP_FLASH_DATA, OP_FLASH_END, OP_MEM_BEGIN, OP_MEM_END, OP_MEM_DATA, OP_SYNC;
+export OP_READ_REG, OP_SPI_SET_PARAMS, OP_SPI_ATTACH, OP_READ_FLASH_SLOW, OP_SPI_FLASH_MD5;
+export MAX_PACKET_BYTES, MAX_BLOCK_BYTES, FLASH_BYTES, FLASH_SECTOR_BYTES, FLASH_BLOCK_BYTES;
+export BOOT_OFFSET, PARTITION_TABLE_OFFSET, FACTORY_APP_OFFSET, CHIP_MAGIC_REGISTER, ESP32_MAGIC;
 export slip_encode, new_decoder, slip_feed, checksum, command_packet, parse_response;
-export sync_payload, mem_begin_payload, mem_data_payload, mem_end_payload, align_ram_data, load_ram;
+export sync_payload, mem_begin_payload, mem_data_payload, mem_end_payload, align_ram_data, sanitize_boot_bytes;
+export flash_layout, spi_attach_payload, spi_params_payload, flash_begin_payload;
+export flash_data_payload, flash_end_payload, flash_md5_payload, probe, reset_normal, diagnose_boot, load_ram, flash_boot;

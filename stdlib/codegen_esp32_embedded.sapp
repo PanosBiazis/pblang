@@ -1,14 +1,17 @@
-// Experimental native classic-ESP32 image emitter written in PBLang.
-//
-// This first artifact is deliberately RAM-only. It drives GPIO23 and emits
-// alternating H/L bytes through the ROM-configured UART. Persistent flash is
-// not enabled until RAM execution, timing and reset recovery are verified.
+// Narrow native classic-ESP32 image emitter written in PBLang. The same bounded
+// GPIO23 image can be loaded into RAM or written to the fixed boot offset.
 
 let FORMAT = "pblang.embedded-esp32-artifact.v1";
 let IMAGE_FORMAT = "pblang.esp-image.v1";
-let IRAM_ADDRESS = 0x40080000;
-let ENTRY_ADDRESS = 0x40080014;
+let IRAM_ADDRESS = 0x40078000;
+let ENTRY_ADDRESS = 0x40078034;
 let MAX_IMAGE_BYTES = 262144;
+let RTC_WDT_CONFIG0 = 0x3ff4808c;
+let RTC_WDT_FEED = 0x3ff480a0;
+let RTC_WDT_WRITE_PROTECT = 0x3ff480a4;
+let RTC_WDT_WRITE_KEY = 0x50d83aa1;
+let TG0_WDT_CONFIG0 = 0x3ff5f048;
+let TG0_WDT_WRITE_PROTECT = 0x3ff5f064;
 
 fn _append(target, bytes) { for i len(bytes) { array_push(target, bytes[i]); } }
 
@@ -26,6 +29,33 @@ fn _read_u32(bytes, offset) {
     return bytes[offset] + bytes[offset + 1] * 256
         + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216;
 }
+
+fn _l32r(register, instruction_offset, literal_offset) {
+    if register < 0 or register > 15 or register != num_floor(register)
+       or instruction_offset < 0 or literal_offset < 0 {
+        throw "esp32 codegen: invalid l32r operands";
+    }
+    let aligned = num_floor((instruction_offset + 3) / 4) * 4;
+    let delta = literal_offset - aligned;
+    if num_mod(delta, 4) != 0 { throw "esp32 codegen: unaligned l32r literal"; }
+    let immediate = delta / 4;
+    if immediate < -32768 or immediate > 32767 { throw "esp32 codegen: l32r literal is out of range"; }
+    if immediate < 0 { immediate = immediate + 65536; }
+    return [register * 16 + 1, num_mod(immediate, 256), num_floor(immediate / 256)];
+}
+
+fn _load_literal(code, register, literal_offset) {
+    _append(code, _l32r(register, len(code), literal_offset));
+}
+
+fn _store_word(code, source, base) {
+    if source < 0 or source > 15 or base < 0 or base > 15 {
+        throw "esp32 codegen: invalid compact store operands";
+    }
+    _append(code, [source * 16 + 9, base]);
+}
+
+fn _memory_barrier(code) { _append(code, [0xc0,0x20,0x00]); }
 
 fn image(segment, load_address, entry_address) {
     if type(segment) != "array" or len(segment) == 0 or len(segment) > MAX_IMAGE_BYTES {
@@ -73,31 +103,54 @@ fn parse_image(bytes) {
     }
     return map{ ok:true, format:IMAGE_FORMAT, entry_address:entry,
         load_address:address, segment:data, segment_bytes:len(data),
-        checksum:checksum, image_bytes:len(bytes), ram_only:true };
+        checksum:checksum, image_bytes:len(bytes), ram_loadable:true, flash_bootable:true };
 }
 
 fn _blink_500ms_gpio23() {
+    // Literal pool: RTC watchdog startup, GPIO23 and UART0. The startup is
+    // required for direct ROM boot from flash; serial RAM download has already
+    // disabled the RTC watchdog and therefore did not expose this requirement.
+    let code=[];
+    for value in [RTC_WDT_WRITE_PROTECT,RTC_WDT_FEED,RTC_WDT_CONFIG0,
+        RTC_WDT_WRITE_KEY,0,0x80000000,TG0_WDT_WRITE_PROTECT,TG0_WDT_CONFIG0,
+        0x3ff44024,0x00800000,0x3ff44008,0x3ff4400c,0x3ff40000]{
+        _append(code,_u32(value));
+    }
+    if IRAM_ADDRESS+len(code)!=ENTRY_ADDRESS{throw "esp32 codegen: entry point does not follow literal pool";}
+
+    // Emit one startup marker before touching watchdog state. It makes a boot
+    // failure distinguishable from a watchdog race without exposing identity.
+    _load_literal(code,9,48);_append(code,[0xb2,0xa0,0x53,0xb2,0x69,0x00]);_memory_barrier(code);
+
+    // Unlock, feed and disable RTC WDT, then restore write protection.
+    _load_literal(code,2,0);_load_literal(code,3,12);_store_word(code,3,2);_memory_barrier(code);
+    _load_literal(code,2,4);_load_literal(code,3,20);_store_word(code,3,2);_memory_barrier(code);
+    _load_literal(code,2,8);_load_literal(code,3,16);_store_word(code,3,2);_memory_barrier(code);
+    _load_literal(code,2,0);_store_word(code,3,2);_memory_barrier(code);
+
+    // The ROM flash path also leaves Timer Group 0 WDT active. Disable it with
+    // the same write key and restore its write protection before application I/O.
+    _load_literal(code,2,24);_load_literal(code,3,12);_store_word(code,3,2);_memory_barrier(code);
+    _load_literal(code,2,28);_load_literal(code,3,16);_store_word(code,3,2);_memory_barrier(code);
+    _load_literal(code,2,24);_store_word(code,3,2);_memory_barrier(code);
+
     // Xtensa LX6 base instructions with no stack or ROM call dependency. The
     // bounded loop is calibrated for the connected 240 MHz classic ESP32.
-    // Memory barriers make peripheral writes observable in program order.
-    return [
-        0x24,0x40,0xf4,0x3f, 0x08,0x40,0xf4,0x3f,
-        0x0c,0x40,0xf4,0x3f, 0x00,0x00,0x80,0x00,
-        0x00,0x00,0xf4,0x3f,
-        0x21,0xfb,0xff, 0x31,0xfd,0xff, 0x71,0xfa,0xff,
-        0x81,0xfa,0xff, 0x91,0xfc,0xff,
-        0x39,0x02, 0xc0,0x20,0x00,
-        0x39,0x07, 0xc0,0x20,0x00,
+    _load_literal(code,2,32);_load_literal(code,3,36);_load_literal(code,7,40);
+    _load_literal(code,8,44);_load_literal(code,9,48);
+    _store_word(code,3,2);_memory_barrier(code);
+    _store_word(code,3,7);_memory_barrier(code);
+    _append(code,[
         0xb2,0xa0,0x48, 0xb2,0x69,0x00, 0xc0,0x20,0x00,
-        0x42,0xa0,0x37, 0x52,0xa0,0xc8, 0x62,0xa1,0x2c,
+        0x42,0xa0,0x42, 0x52,0xa0,0xc8, 0x62,0xa1,0x2c,
         0x0b,0x66, 0x56,0xa6,0xff, 0x0b,0x55, 0x56,0x25,0xff,
         0x0b,0x44, 0x56,0xa4,0xfe,
         0x39,0x08, 0xc0,0x20,0x00,
         0x4c,0xcb, 0xb9,0x09, 0xc0,0x20,0x00,
-        0x42,0xa0,0x37, 0x52,0xa0,0xc8, 0x62,0xa1,0x2c,
+        0x42,0xa0,0x42, 0x52,0xa0,0xc8, 0x62,0xa1,0x2c,
         0x0b,0x66, 0x56,0xa6,0xff, 0x0b,0x55, 0x56,0x25,0xff,
         0x0b,0x44, 0x56,0xa4,0xfe, 0x86,0xec,0xff
-    ];
+    ]);return code;
 }
 
 fn compile(lowered) {
@@ -118,9 +171,11 @@ fn compile(lowered) {
        or lowered.operations[5].kind != "delay-ms"
        or lowered.operations[5].value != 500
        or lowered.operations[6].kind != "loop-end" {
-        throw "esp32 codegen: RAM validation currently accepts only GPIO23 500 ms blink";
+        throw "esp32 codegen: the verified backend currently accepts only GPIO23 500 ms blink";
     }
-    let code = _blink_500ms_gpio23(); let binary = image(code, IRAM_ADDRESS, ENTRY_ADDRESS);
+    let code = _blink_500ms_gpio23();
+    while num_mod(len(code),4)!=0{array_push(code,0);}
+    let binary = image(code, IRAM_ADDRESS, ENTRY_ADDRESS);
     let checked = parse_image(binary);
     if checked.segment != code { throw "esp32 codegen: image roundtrip mismatch"; }
     return map{ ok:true, format:FORMAT, board:lowered.board.id, mcu:"esp32",
@@ -128,10 +183,15 @@ fn compile(lowered) {
         firmware_format:"esp-image", image:binary, binary:code, bytes:len(code),
         image_bytes:len(binary), load_address:IRAM_ADDRESS, entry_address:ENTRY_ADDRESS,
         sha256:sha256(base64_encode_bytes(binary)), native_source_language:"pblang",
-        ram_only:true, persistent_flash_ready:false, uart_evidence:"alternating H/L markers",
+        ram_only:false, ram_loadable:true, flash_bootable:true, persistent_flash_ready:true,
+        uart_evidence:"alternating H/L markers",
+        startup:map{marker:"S",rtc_watchdog_fed:true,rtc_watchdog_disabled:true,
+            tg0_watchdog_disabled:true,write_protection_restored:true},
         hardware_evidence:map{board:"esp32-devkitc-v4",gpio:23,requested_ms:500,
-            measured_phase_ms_min:495.338134765625,measured_phase_ms_max:495.834716796875,
-            samples:8,verified_date:"2026-08-17",persistent_flash:false},
+            measured_phase_ms_min:496.08349609375,measured_phase_ms_max:496.644287109375,
+            complete_phase_samples:18,reset_runs:2,verified_date:"2026-08-17",
+            persistent_flash:true,flash_offset:4096,byte_readback_verified:true,
+            md5_verified:true,efuse_written:false},
         c_fallback:false, assembler_dependency:false, compiler_dependency:false };
 }
 

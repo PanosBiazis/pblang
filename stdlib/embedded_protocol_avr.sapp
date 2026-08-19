@@ -14,7 +14,13 @@ let UCSR0A = 192; let UCSR0B = 193; let UCSR0C = 194;
 let UBRR0L = 196; let UBRR0H = 197; let UDR0 = 198;
 let TIFR1 = 54; let TCCR1A = 128; let TCCR1B = 129;
 let TCNT1L = 132; let TCNT1H = 133; let OCR1AL = 136; let OCR1AH = 137;
-let DDRD_IO = 10; let PORTD_IO = 11; let LED_BIT = 7;
+let TCCR0A = 68; let TCCR0B = 69; let OCR0A = 71;
+let PWM_TIMER0_FAST_NONINVERTING = 131; let PWM_TIMER0_CLOCK_DIV64 = 3;
+let ADCL = 120; let ADCH = 121; let ADCSRA = 122; let ADMUX = 124; let DIDR0 = 126;
+let PRR = 100; let DDRC_IO = 7; let PORTC_IO = 8; let ADC0_BIT = 0;
+let PIND_DATA = 41; let DDRD_IO = 10; let PORTD_IO = 11; let LED_BIT = 7;
+let LOOPBACK_OUTPUT_BIT = 6; let LOOPBACK_INPUT_BIT = 2;
+let BUTTON_INPUT_BIT = 4; let BUTTON_DEBOUNCE_TICKS = 12;
 
 let RAM_STAGE = 256; let RAM_CHECKSUM = 257; let RAM_SEQUENCE = 258;
 let RAM_OPCODE = 259; let RAM_VALUE = 260; let RAM_INTERVAL_L = 261;
@@ -23,6 +29,13 @@ let RAM_STATE = 265; let RAM_LAST_SEQUENCE = 266; let RAM_EXPECTED = 267;
 let RAM_PHASE_L = 268; let RAM_PHASE_H = 269;
 let RAM_REMAINING_L = 270; let RAM_REMAINING_H = 271;
 let RAM_RESPONSE_STATUS = 272;
+let RAM_PAYLOAD0_L = 273; let RAM_PAYLOAD0_H = 274;
+let RAM_PAYLOAD1_L = 275; let RAM_PAYLOAD1_H = 276;
+let RAM_BLINK_INTERVAL_L = 277; let RAM_BLINK_INTERVAL_H = 278;
+let RAM_BUTTON_LATCH = 279; let RAM_BUTTON_COUNT = 280;
+let RAM_ANALOG_FOLLOW = 281; let RAM_ADC_REFRESH_COUNT = 282;
+let RAM_ANALOG_DUTY = 283; let ADC_REFRESH_TICKS = 4;
+let ADC_FOLLOW_MAXIMUM = 650;
 
 fn _append(target, bytes) { for i len(bytes) { array_push(target, bytes[i]); } }
 fn _words(code) { return num_floor(len(code) / 2); }
@@ -76,10 +89,16 @@ fn _stop_blink(state) {
     _clear_ram(state, RAM_REMAINING_H); _led_off(state);
 }
 
-fn _initialize(state) {
+fn _initialize(state, adc_mux, follow_enabled) {
     _emit(state, AVR.clear_interrupts());
     _emit(state, AVR.set_io_bit(DDRD_IO, LED_BIT));
     _emit(state, AVR.clear_io_bit(PORTD_IO, LED_BIT));
+    _emit(state, AVR.set_io_bit(DDRD_IO, LOOPBACK_OUTPUT_BIT));
+    _emit(state, AVR.clear_io_bit(PORTD_IO, LOOPBACK_OUTPUT_BIT));
+    _emit(state, AVR.clear_io_bit(DDRD_IO, LOOPBACK_INPUT_BIT));
+    _emit(state, AVR.clear_io_bit(PORTD_IO, LOOPBACK_INPUT_BIT));
+    _emit(state, AVR.clear_io_bit(DDRD_IO, BUTTON_INPUT_BIT));
+    _emit(state, AVR.clear_io_bit(PORTD_IO, BUTTON_INPUT_BIT));
     _store_value(state, UCSR0A, 2); // U2X0
     _store_value(state, UBRR0H, 0); _store_value(state, UBRR0L, 16);
     _store_value(state, UCSR0B, 24); _store_value(state, UCSR0C, 6);
@@ -87,16 +106,61 @@ fn _initialize(state) {
     _store_value(state, TCNT1H, 0); _store_value(state, TCNT1L, 0);
     _store_value(state, OCR1AH, 0); _store_value(state, OCR1AL, 249);
     _store_value(state, TIFR1, 2); _store_value(state, TCCR1B, 11);
+    _store_value(state, TCCR0A, if follow_enabled {PWM_TIMER0_FAST_NONINVERTING}else{3});
+    _store_value(state, TCCR0B, PWM_TIMER0_CLOCK_DIV64); _store_value(state, OCR0A, 0);
+    // Deterministically power ADC0, select input mode without pull-up, then use
+    // AVcc reference with a 125 kHz ADC clock and disable the digital receiver.
+    _load(state, 16, PRR); _emit(state, AVR.and_immediate(16, 254)); _store(state, PRR, 16);
+    _emit(state, AVR.clear_io_bit(DDRC_IO, ADC0_BIT));
+    _emit(state, AVR.clear_io_bit(PORTC_IO, ADC0_BIT));
+    _store_value(state, ADMUX, 64 | adc_mux); _store_value(state, ADCSRA, 135);
+    _store_value(state, DIDR0, 1);
     let address = RAM_STAGE;
-    while address <= RAM_RESPONSE_STATUS { _clear_ram(state, address); address = address + 1; }
+    while address <= RAM_ANALOG_DUTY { _clear_ram(state, address); address = address + 1; }
     _store_value(state, RAM_INTERVAL_L, 244); _store_value(state, RAM_INTERVAL_H, 1);
+    _store_value(state, RAM_BLINK_INTERVAL_L, 244); _store_value(state, RAM_BLINK_INTERVAL_H, 1);
     _store_value(state, RAM_PHASE_L, 244); _store_value(state, RAM_PHASE_H, 1);
+    _store_value(state, RAM_ANALOG_FOLLOW, if follow_enabled {1}else{0});
+}
+
+fn _button_service(state) {
+    let released = _unique(state, "button_released_");
+    let done = _unique(state, "button_done_");
+    let stable_pressed = _unique(state, "button_stable_pressed_");
+    let stable_released = _unique(state, "button_stable_released_");
+    let turn_on = _unique(state, "button_turn_on_");
+    let toggled = _unique(state, "button_toggled_");
+    _load(state, 16, PIND_DATA); _emit(state, AVR.and_immediate(16, 1 << BUTTON_INPUT_BIT));
+    _emit(state, AVR.compare_immediate(16, 0)); _if_equal(state, released);
+    _load(state, 16, RAM_BUTTON_LATCH); _emit(state, AVR.compare_immediate(16, 0));
+    _if_not_equal(state, stable_pressed);
+    _load(state, 16, RAM_BUTTON_COUNT); _emit(state, AVR.increment(16));
+    _store(state, RAM_BUTTON_COUNT, 16);
+    _emit(state, AVR.compare_immediate(16, BUTTON_DEBOUNCE_TICKS)); _if_carry(state, done);
+    _store_value(state, RAM_BUTTON_LATCH, 1); _clear_ram(state, RAM_BUTTON_COUNT);
+    _set_state_bits(state, 0, 2); _clear_ram(state, RAM_REMAINING_L);
+    _clear_ram(state, RAM_REMAINING_H);
+    _load(state, 16, RAM_STATE); _emit(state, AVR.and_immediate(16, 1));
+    _emit(state, AVR.compare_immediate(16, 0)); _if_equal(state, turn_on);
+    _led_off(state); _jump(state, toggled);
+    _label(state, turn_on); _led_on(state); _label(state, toggled); _jump(state, done);
+    _label(state, stable_pressed); _clear_ram(state, RAM_BUTTON_COUNT); _jump(state, done);
+    _label(state, released);
+    _load(state, 16, RAM_BUTTON_LATCH); _emit(state, AVR.compare_immediate(16, 0));
+    _if_equal(state, stable_released);
+    _load(state, 16, RAM_BUTTON_COUNT); _emit(state, AVR.increment(16));
+    _store(state, RAM_BUTTON_COUNT, 16);
+    _emit(state, AVR.compare_immediate(16, BUTTON_DEBOUNCE_TICKS)); _if_carry(state, done);
+    _clear_ram(state, RAM_BUTTON_LATCH); _clear_ram(state, RAM_BUTTON_COUNT); _jump(state, done);
+    _label(state, stable_released); _clear_ram(state, RAM_BUTTON_COUNT); _label(state, done);
 }
 
 fn _timer_service(state) {
     _load(state, 16, TIFR1); _emit(state, AVR.and_immediate(16, 2));
     _emit(state, AVR.compare_immediate(16, 0)); _if_equal(state, "uart_poll");
     _store_value(state, TIFR1, 2);
+    _button_service(state);
+    _adc_follow_service(state);
     _load(state, 16, RAM_STATE); _emit(state, AVR.and_immediate(16, 2));
     _emit(state, AVR.compare_immediate(16, 0)); _if_equal(state, "uart_poll");
 
@@ -108,8 +172,8 @@ fn _timer_service(state) {
     let phase_nonzero = _unique(state, "phase_nonzero_");
     _if_not_equal(state, phase_nonzero);
     _emit(state, AVR.compare_immediate(17, 0)); _if_not_equal(state, phase_nonzero);
-    _load(state, 16, RAM_INTERVAL_L); _store(state, RAM_PHASE_L, 16);
-    _load(state, 16, RAM_INTERVAL_H); _store(state, RAM_PHASE_H, 16);
+    _load(state, 16, RAM_BLINK_INTERVAL_L); _store(state, RAM_PHASE_L, 16);
+    _load(state, 16, RAM_BLINK_INTERVAL_H); _store(state, RAM_PHASE_H, 16);
     _load(state, 16, RAM_STATE); _emit(state, AVR.and_immediate(16, 1));
     _emit(state, AVR.compare_immediate(16, 0));
     let turn_on = _unique(state, "turn_on_"); let toggled = _unique(state, "toggled_");
@@ -157,13 +221,8 @@ fn _parser(state) {
     _label(state, "stage3"); _emit(state, AVR.compare_immediate(16, 0));
     _if_equal(state, "reset_parser"); _store(state, RAM_SEQUENCE, 16);
     _add_checksum(state, 16); _set_stage(state, 4);
-    _label(state, "stage4"); _emit(state, AVR.compare_immediate(16, 1));
-    _if_carry(state, "reset_parser"); _emit(state, AVR.compare_immediate(16, 6));
-    _if_no_carry(state, "reset_parser"); _store(state, RAM_OPCODE, 16);
-    _add_checksum(state, 16); _set_stage(state, 5);
-    _label(state, "stage5"); _emit(state, AVR.compare_immediate(16, 2));
-    _if_no_carry(state, "reset_parser"); _store(state, RAM_VALUE, 16);
-    _add_checksum(state, 16); _set_stage(state, 6);
+    _parser_stage(state, 4, RAM_OPCODE, 5);
+    _parser_stage(state, 5, RAM_VALUE, 6);
     _parser_stage(state, 6, RAM_INTERVAL_L, 7); _parser_stage(state, 7, RAM_INTERVAL_H, 8);
     _parser_stage(state, 8, RAM_DURATION_L, 9); _parser_stage(state, 9, RAM_DURATION_H, 10);
     _label(state, "stage10"); _emit(state, AVR.compare_immediate(16, 0));
@@ -171,7 +230,11 @@ fn _parser(state) {
     _label(state, "stage11"); _load(state, 18, RAM_CHECKSUM);
     _emit(state, AVR.compare(16, 18)); _if_not_equal(state, "reset_parser");
     _jump(state, "execute");
-    _label(state, "reset_parser"); _clear_ram(state, RAM_STAGE); _jump(state, "main");
+    _label(state, "reset_parser"); _emit(state, AVR.compare_immediate(16, 80));
+    let retain_magic = _unique(state, "retain_magic_");
+    _if_equal(state, retain_magic); _clear_ram(state, RAM_STAGE); _jump(state, "main");
+    _label(state, retain_magic); _store(state, RAM_CHECKSUM, 16);
+    _store_value(state, RAM_STAGE, 1); _jump(state, "main");
 }
 
 fn _set_expected(state) {
@@ -194,8 +257,132 @@ fn _validate_blink_interval(state) {
     _label(state, "blink_range_ok");
 }
 
+fn _validate_duration(state) {
+    _load(state, 16, RAM_DURATION_H); _emit(state, AVR.compare_immediate(16, 234));
+    _if_carry(state, "duration_range_ok"); _if_not_equal(state, "invalid_command");
+    _load(state, 16, RAM_DURATION_L); _emit(state, AVR.compare_immediate(16, 97));
+    _if_no_carry(state, "invalid_command"); _label(state, "duration_range_ok");
+}
+fn _validate_zero_value(state) {
+    _load(state, 16, RAM_VALUE); _emit(state, AVR.compare_immediate(16, 0));
+    _if_not_equal(state, "invalid_command");
+}
+fn _validate_reserved_timing(state) {
+    _load(state, 16, RAM_INTERVAL_L); _emit(state, AVR.compare_immediate(16, 244));
+    _if_not_equal(state, "invalid_command");
+    _load(state, 16, RAM_INTERVAL_H); _emit(state, AVR.compare_immediate(16, 1));
+    _if_not_equal(state, "invalid_command");
+    _load(state, 16, RAM_DURATION_L); _emit(state, AVR.compare_immediate(16, 0));
+    _if_not_equal(state, "invalid_command");
+    _load(state, 16, RAM_DURATION_H); _emit(state, AVR.compare_immediate(16, 0));
+    _if_not_equal(state, "invalid_command");
+}
+
+fn _loopback_test(state) {
+    let low_done = _unique(state, "loopback_low_done_");
+    let high_done = _unique(state, "loopback_high_done_");
+    _store_value(state, TCCR0A, 3);
+    _emit(state, AVR.clear_io_bit(PORTD_IO, LOOPBACK_OUTPUT_BIT));
+    _emit(state, AVR.nop()); _load(state, 16, PIND_DATA);
+    _emit(state, AVR.and_immediate(16, 1 << LOOPBACK_INPUT_BIT));
+    _emit(state, AVR.compare_immediate(16, 0)); _if_not_equal(state, low_done);
+    _set_state_bits(state, 4, 0); _label(state, low_done);
+
+    _emit(state, AVR.set_io_bit(PORTD_IO, LOOPBACK_OUTPUT_BIT));
+    _emit(state, AVR.nop()); _load(state, 16, PIND_DATA);
+    _emit(state, AVR.and_immediate(16, 1 << LOOPBACK_INPUT_BIT));
+    _emit(state, AVR.compare_immediate(16, 0)); _if_equal(state, high_done);
+    _set_state_bits(state, 8, 0); _label(state, high_done);
+    _emit(state, AVR.clear_io_bit(PORTD_IO, LOOPBACK_OUTPUT_BIT));
+    _load(state, 16, RAM_ANALOG_FOLLOW); _emit(state, AVR.compare_immediate(16, 0));
+    let follow_disabled = _unique(state, "loopback_follow_disabled_");
+    _if_equal(state, follow_disabled);
+    _store_value(state, TCCR0A, PWM_TIMER0_FAST_NONINVERTING);
+    _label(state, follow_disabled);
+}
+
+fn _button_read(state) {
+    let done = _unique(state, "button_read_done_");
+    _clear_ram(state, RAM_PAYLOAD0_L); _clear_ram(state, RAM_PAYLOAD0_H);
+    _clear_ram(state, RAM_PAYLOAD1_L); _clear_ram(state, RAM_PAYLOAD1_H);
+    _load(state, 16, PIND_DATA); _emit(state, AVR.and_immediate(16, 1 << BUTTON_INPUT_BIT));
+    _emit(state, AVR.compare_immediate(16, 0)); _if_equal(state, done);
+    _set_state_bits(state, 4, 0); _store_value(state, RAM_PAYLOAD0_L, 1); _label(state, done);
+}
+
+fn _prepare_payload(state) {
+    _load(state, 16, RAM_BLINK_INTERVAL_L); _store(state, RAM_PAYLOAD0_L, 16);
+    _load(state, 16, RAM_BLINK_INTERVAL_H); _store(state, RAM_PAYLOAD0_H, 16);
+    _load(state, 16, RAM_REMAINING_L); _store(state, RAM_PAYLOAD1_L, 16);
+    _load(state, 16, RAM_REMAINING_H); _store(state, RAM_PAYLOAD1_H, 16);
+}
+
+fn _adc_conversion(state, retain, failure = "invalid_command") {
+    let wait = _unique(state, "adc_wait_"); let done = _unique(state, "adc_done_");
+    _load(state, 16, ADCSRA); _emit(state, AVR.or_immediate(16, 64));
+    _store(state, ADCSRA, 16);
+    _emit(state, AVR.load_immediate(20, 255)); _emit(state, AVR.load_immediate(21, 32));
+    _label(state, wait); _load(state, 16, ADCSRA); _emit(state, AVR.and_immediate(16, 64));
+    _emit(state, AVR.compare_immediate(16, 0)); _if_equal(state, done);
+    _emit(state, AVR.decrement(20)); _emit(state, AVR.compare_immediate(20, 0));
+    _if_not_equal(state, wait); _emit(state, AVR.load_immediate(20, 255));
+    _emit(state, AVR.decrement(21)); _emit(state, AVR.compare_immediate(21, 0));
+    _if_not_equal(state, wait); _jump(state, failure);
+    _label(state, done);
+    if retain {
+        // ADCL must be read before ADCH on ATmega328P.
+        _load(state, 16, ADCL); _store(state, RAM_PAYLOAD0_L, 16);
+        _load(state, 16, ADCH); _store(state, RAM_PAYLOAD0_H, 16);
+    }
+}
+
+fn _adc_read(state) {
+    // Discard the first conversion after enable/reference selection.
+    _adc_conversion(state, false); _adc_conversion(state, true);
+    _store_value(state, RAM_PAYLOAD1_L, 255); _store_value(state, RAM_PAYLOAD1_H, 3);
+}
+
+fn _adc_follow_service(state) {
+    let done=_unique(state,"adc_follow_done_");
+    let sample=_unique(state,"adc_follow_sample_");
+    let scale=_unique(state,"adc_follow_scale_");
+    let saturated=_unique(state,"adc_follow_saturated_");
+    let store=_unique(state,"adc_follow_store_");
+    let failed=_unique(state,"adc_follow_failed_");
+    _load(state,16,RAM_ANALOG_FOLLOW);_emit(state,AVR.compare_immediate(16,0));
+    _if_equal(state,done);
+    _load(state,16,RAM_ADC_REFRESH_COUNT);_emit(state,AVR.increment(16));
+    _store(state,RAM_ADC_REFRESH_COUNT,16);
+    _emit(state,AVR.compare_immediate(16,ADC_REFRESH_TICKS));_if_no_carry(state,sample);
+    _jump(state,done);
+    _label(state,sample);_clear_ram(state,RAM_ADC_REFRESH_COUNT);
+    _adc_conversion(state,false,failed);_adc_conversion(state,true,failed);
+    // floor(raw / 8) * 3.125 closely approximates raw * 255 / 650 for the
+    // shared 3.3 V potentiometer. Fixed shifts keep button and UART latency
+    // independent of ADC input while still reaching full duty near raw 650.
+    _load(state,16,RAM_PAYLOAD0_L);_load(state,17,RAM_PAYLOAD0_H);
+    _emit(state,AVR.logical_shift_right(17));_emit(state,AVR.rotate_right_carry(16));
+    _emit(state,AVR.logical_shift_right(17));_emit(state,AVR.rotate_right_carry(16));
+    _emit(state,AVR.logical_shift_right(17));_emit(state,AVR.rotate_right_carry(16));
+    _emit(state,AVR.compare_immediate(16,81));_if_carry(state,scale);
+    _label(state,saturated);_emit(state,AVR.load_immediate(16,255));_jump(state,store);
+    _label(state,scale);_emit(state,AVR.move(18,16));
+    _emit(state,AVR.add(16,18));_emit(state,AVR.add(16,18));
+    _emit(state,AVR.move(19,18));
+    _emit(state,AVR.logical_shift_right(19));
+    _emit(state,AVR.logical_shift_right(19));
+    _emit(state,AVR.logical_shift_right(19));
+    _emit(state,AVR.add(16,19));
+    _label(state,store);_store(state,OCR0A,16);_store(state,RAM_ANALOG_DUTY,16);
+    _jump(state,done);
+    _label(state,failed);_clear_ram(state,RAM_ANALOG_FOLLOW);
+    _store_value(state,TCCR0A,3);_emit(state,AVR.clear_io_bit(PORTD_IO,LOOPBACK_OUTPUT_BIT));
+    _label(state,done);
+}
+
 fn _execute(state) {
-    _label(state, "execute"); _load(state, 16, RAM_OPCODE);
+    _label(state, "execute"); _set_state_bits(state, 0, 12); _prepare_payload(state);
+    _load(state, 16, RAM_OPCODE);
     _emit(state, AVR.compare_immediate(16, Protocol.OP_STATUS)); _if_equal(state, "do_status");
     _load(state, 17, RAM_EXPECTED); _emit(state, AVR.compare_immediate(17, 0));
     _if_equal(state, "not_synchronized");
@@ -209,30 +396,81 @@ fn _execute(state) {
     _emit(state, AVR.compare_immediate(16, Protocol.OP_TOGGLE)); _if_equal(state, "do_toggle");
     _emit(state, AVR.compare_immediate(16, Protocol.OP_BLINK)); _if_equal(state, "do_blink");
     _emit(state, AVR.compare_immediate(16, Protocol.OP_STOP)); _if_equal(state, "do_stop");
+    _emit(state, AVR.compare_immediate(16, Protocol.OP_CAPABILITIES)); _if_equal(state, "do_capabilities");
+    _emit(state, AVR.compare_immediate(16, Protocol.OP_LOOPBACK)); _if_equal(state, "do_loopback");
+    _emit(state, AVR.compare_immediate(16, Protocol.OP_ADC_READ)); _if_equal(state, "do_adc_read");
+    _emit(state, AVR.compare_immediate(16, Protocol.OP_BUTTON_READ)); _if_equal(state, "do_button_read");
+    _emit(state, AVR.compare_immediate(16, Protocol.OP_OUTPUT_TEST)); _if_equal(state, "do_output_test");
+    _emit(state, AVR.compare_immediate(16, Protocol.OP_ANALOG_FOLLOW)); _if_equal(state, "do_analog_follow");
     _jump(state, "invalid_command");
 
-    _label(state, "do_status"); _set_expected(state); _store_value(state, RAM_RESPONSE_STATUS, Protocol.STATUS_OK);
+    _label(state, "do_status"); _validate_zero_value(state); _validate_reserved_timing(state);
+    _set_expected(state); _store_value(state, RAM_RESPONSE_STATUS, Protocol.STATUS_OK);
     _jump(state, "respond");
-    _label(state, "do_set"); _set_state_bits(state, 0, 2);
+    _label(state, "do_set"); _load(state, 16, RAM_VALUE); _emit(state, AVR.compare_immediate(16, 2));
+    _if_no_carry(state, "invalid_command"); _validate_reserved_timing(state); _set_state_bits(state, 0, 2);
     _clear_ram(state, RAM_REMAINING_L); _clear_ram(state, RAM_REMAINING_H);
     _load(state, 16, RAM_VALUE); _emit(state, AVR.compare_immediate(16, 0));
     let set_off = _unique(state, "set_off_"); let set_done = _unique(state, "set_done_");
     _if_equal(state, set_off); _led_on(state); _jump(state, set_done);
     _label(state, set_off); _led_off(state); _label(state, set_done); _jump(state, "command_ok");
-    _label(state, "do_toggle"); _set_state_bits(state, 0, 2);
+    _label(state, "do_toggle"); _validate_zero_value(state); _validate_reserved_timing(state);
+    _set_state_bits(state, 0, 2);
     _clear_ram(state, RAM_REMAINING_L); _clear_ram(state, RAM_REMAINING_H);
     _load(state, 16, RAM_STATE); _emit(state, AVR.and_immediate(16, 1));
     _emit(state, AVR.compare_immediate(16, 0));
     let toggle_on = _unique(state, "toggle_on_"); let toggle_done = _unique(state, "toggle_done_");
     _if_equal(state, toggle_on); _led_off(state); _jump(state, toggle_done);
     _label(state, toggle_on); _led_on(state); _label(state, toggle_done); _jump(state, "command_ok");
-    _label(state, "do_blink"); _validate_blink_interval(state);
+    _label(state, "do_blink"); _validate_zero_value(state); _validate_blink_interval(state); _validate_duration(state);
     _load(state, 16, RAM_INTERVAL_L); _store(state, RAM_PHASE_L, 16);
     _load(state, 16, RAM_INTERVAL_H); _store(state, RAM_PHASE_H, 16);
+    _load(state, 16, RAM_INTERVAL_L); _store(state, RAM_BLINK_INTERVAL_L, 16);
+    _load(state, 16, RAM_INTERVAL_H); _store(state, RAM_BLINK_INTERVAL_H, 16);
+    _load(state, 16, RAM_INTERVAL_L); _store(state, RAM_PAYLOAD0_L, 16);
+    _load(state, 16, RAM_INTERVAL_H); _store(state, RAM_PAYLOAD0_H, 16);
     _load(state, 16, RAM_DURATION_L); _store(state, RAM_REMAINING_L, 16);
     _load(state, 16, RAM_DURATION_H); _store(state, RAM_REMAINING_H, 16);
     _set_state_bits(state, 2, 0); _led_on(state); _jump(state, "command_ok");
-    _label(state, "do_stop"); _stop_blink(state); _jump(state, "command_ok");
+    _label(state, "do_stop"); _validate_zero_value(state); _validate_reserved_timing(state);
+    _stop_blink(state); _jump(state, "command_ok");
+    _label(state, "do_capabilities"); _validate_zero_value(state); _validate_reserved_timing(state);
+    _set_state_bits(state, 12, 0);
+    _store_value(state,RAM_PAYLOAD0_L,
+        Protocol.CAP_DIGITAL_LOOPBACK|Protocol.CAP_ADC_READ|Protocol.CAP_ANALOG_FOLLOW);
+    _clear_ram(state,RAM_PAYLOAD0_H);_clear_ram(state,RAM_PAYLOAD1_L);_clear_ram(state,RAM_PAYLOAD1_H);
+    _jump(state, "command_ok");
+    _label(state, "do_loopback"); _validate_zero_value(state); _validate_reserved_timing(state);
+    _loopback_test(state); _jump(state, "command_ok");
+    _label(state, "do_adc_read"); _validate_zero_value(state); _validate_reserved_timing(state);
+    _adc_read(state); _jump(state, "command_ok");
+    _label(state, "do_button_read"); _validate_zero_value(state); _validate_reserved_timing(state);
+    _button_read(state); _jump(state, "command_ok");
+    _label(state, "do_output_test");
+    _load(state, 16, RAM_VALUE); _emit(state, AVR.compare_immediate(16, 2));
+    _if_no_carry(state, "invalid_command"); _validate_reserved_timing(state);
+    _clear_ram(state,RAM_ANALOG_FOLLOW);_store_value(state,TCCR0A,3);
+    _set_state_bits(state, 0, 2); _clear_ram(state, RAM_REMAINING_L);
+    _clear_ram(state, RAM_REMAINING_H); _load(state, 16, RAM_VALUE);
+    _emit(state, AVR.compare_immediate(16, 0));
+    let outputs_off = _unique(state, "outputs_off_"); let outputs_done = _unique(state, "outputs_done_");
+    _if_equal(state, outputs_off); _led_on(state);
+    _emit(state, AVR.set_io_bit(PORTD_IO, LOOPBACK_OUTPUT_BIT)); _jump(state, outputs_done);
+    _label(state, outputs_off); _led_off(state);
+    _emit(state, AVR.clear_io_bit(PORTD_IO, LOOPBACK_OUTPUT_BIT));
+    _label(state, outputs_done); _jump(state, "command_ok");
+    _label(state,"do_analog_follow");_validate_reserved_timing(state);
+    _load(state,16,RAM_VALUE);_emit(state,AVR.compare_immediate(16,2));
+    _if_no_carry(state,"invalid_command");
+    let follow_off=_unique(state,"analog_follow_off_");let follow_done=_unique(state,"analog_follow_done_");
+    _emit(state,AVR.compare_immediate(16,0));_if_equal(state,follow_off);
+    _store_value(state,RAM_ANALOG_FOLLOW,1);_clear_ram(state,RAM_ADC_REFRESH_COUNT);
+    _store_value(state,TCCR0A,PWM_TIMER0_FAST_NONINVERTING);_jump(state,follow_done);
+    _label(state,follow_off);_clear_ram(state,RAM_ANALOG_FOLLOW);_store_value(state,TCCR0A,3);
+    _emit(state,AVR.clear_io_bit(PORTD_IO,LOOPBACK_OUTPUT_BIT));_clear_ram(state,OCR0A);
+    _label(state,follow_done);_load(state,16,RAM_ANALOG_FOLLOW);_store(state,RAM_PAYLOAD0_L,16);
+    _clear_ram(state,RAM_PAYLOAD0_H);_load(state,16,RAM_ANALOG_DUTY);_store(state,RAM_PAYLOAD1_L,16);
+    _clear_ram(state,RAM_PAYLOAD1_H);_jump(state,"command_ok");
     _label(state, "command_ok"); _set_expected(state);
     _store_value(state, RAM_RESPONSE_STATUS, Protocol.STATUS_OK); _jump(state, "respond");
     _label(state, "invalid_command"); _store_value(state, RAM_RESPONSE_STATUS, Protocol.STATUS_INVALID); _jump(state, "respond");
@@ -260,14 +498,22 @@ fn _respond(state) {
     _send_value(state, 80, true); _send_value(state, 82, true);
     _send_value(state, Protocol.VERSION, true); _send_memory(state, RAM_SEQUENCE, true);
     _send_memory(state, RAM_RESPONSE_STATUS, true); _send_memory(state, RAM_STATE, true);
-    _send_memory(state, RAM_INTERVAL_L, true); _send_memory(state, RAM_INTERVAL_H, true);
-    _send_memory(state, RAM_REMAINING_L, true); _send_memory(state, RAM_REMAINING_H, true);
+    _send_memory(state, RAM_PAYLOAD0_L, true); _send_memory(state, RAM_PAYLOAD0_H, true);
+    _send_memory(state, RAM_PAYLOAD1_L, true); _send_memory(state, RAM_PAYLOAD1_H, true);
     _send_value(state, 0, true); _send_memory(state, RAM_CHECKSUM, false);
     _clear_ram(state, RAM_STAGE); _jump(state, "main");
 }
 
-fn compile() {
-    let state = _asm(); _initialize(state); _label(state, "main");
+fn compile(options = nil) {
+    let opts = if options == nil { map{} } else { options };
+    if type(opts) != "map" { throw "embedded_protocol_avr: options must be a map"; }
+    let adc_source = str_lower(str(try opts.adc_source catch "a0"));
+    let adc_mux = 0; let adc_pin = "A0";
+    if adc_source == "internal-1v1" { adc_mux = 14; adc_pin = "internal-1.1V"; }
+    elif adc_source == "internal-ground" { adc_mux = 15; adc_pin = "internal-GND"; }
+    elif adc_source != "a0" { throw "embedded_protocol_avr: unsupported ADC diagnostic source"; }
+    let follow_enabled=adc_source=="a0";
+    let state = _asm(); _initialize(state, adc_mux, follow_enabled); _label(state, "main");
     _timer_service(state); _parser(state); _execute(state); _respond(state);
     let code = _finish(state);
     if len(code) > 32768 { throw "embedded_protocol_avr: firmware exceeds ATmega328P flash"; }
@@ -278,28 +524,77 @@ fn compile() {
         binary:code, bytes:len(code), intel_hex:hex, intel_hex_bytes:str_to_bytes(hex),
         sha256:sha256(base64_encode_bytes(code)), baud:BAUD, clock_hz:CLOCK_HZ,
         protocol:Protocol.FORMAT, protocol_version:Protocol.VERSION,
+        loopback:map{output:"D6",input:"D2",expected_result_bits:3},
+        button:map{pin:"D4",active_high:true,debounce_ticks:BUTTON_DEBOUNCE_TICKS,
+            release_debounce_ticks:BUTTON_DEBOUNCE_TICKS,symmetric_debounce:true,
+            action:"stop-blink-and-toggle-led"},
+        adc:map{pin:adc_pin,channel:adc_mux,bits:10,maximum:1023,
+            reference:"AVcc",source:adc_source},
+        analog_follow:map{enabled_at_boot:follow_enabled,input:"A0",output:"D6",
+            method:"timer0-fast-pwm",pwm_bits:8,pwm_hz:976,
+            calibrated_maximum:ADC_FOLLOW_MAXIMUM,refresh_ms:ADC_REFRESH_TICKS},
         persistent_command_loop:true, c_fallback:false, assembler_dependency:false,
         compiler_dependency:false, native_source_language:"pblang"};
 }
 
+fn _verify_input(input, expected_frames, options) {
+    let artifact = compile(); let expected = expected_frames * Protocol.FRAME_BYTES;
+    let links = try options.gpio_links catch [map{output_io:PORTD_IO,
+        output_bit:LOOPBACK_OUTPUT_BIT,input_data:PIND_DATA,input_bit:LOOPBACK_INPUT_BIT}];
+    let result = AVR.run(artifact.binary, map{instruction_budget:try options.instruction_budget catch 1000000,
+        uart_rx_bytes:input, stop_after_uart_bytes:expected,
+        timer1_tick_every_cycles:try options.timer1_tick_every_cycles catch 0,
+        adc0_value:try options.adc0_value catch 512,
+        adc_stuck:try options.adc_stuck catch false,
+        gpio_inputs:try options.gpio_inputs catch [],
+        gpio_links:links,
+        trace_io_addresses:[PORTD_IO]});
+    if not result.ok { return result; }
+    let decoder = Protocol.new_decoder("response"); let decoded = Protocol.feed(decoder, result.uart_tx);
+    return map{ok:decoded.ok and len(decoded.frames)==expected_frames, format:FORMAT,
+        artifact_sha256:artifact.sha256, artifact_bytes:artifact.bytes,
+        responses:decoded.frames, uart_tx:result.uart_tx, io_events:result.io_events,
+        instructions:result.instructions, cycles:result.cycles,
+        execution_model:"verified AVR UART/timer/GPIO subset", physical_hardware:false};
+}
 fn verify(commands, options = nil) {
     if type(commands) != "array" or len(commands) < 1 or len(commands) > 32 {
         return map{ok:false, format:FORMAT, error:"verification requires 1..32 commands"};
     }
     let input = [];
     for i len(commands) { _append(input, Protocol.encode_command(commands[i])); }
-    let artifact = compile(); let expected = len(commands) * Protocol.FRAME_BYTES;
-    let result = AVR.run(artifact.binary, map{instruction_budget:try options.instruction_budget catch 1000000,
-        uart_rx_bytes:input, stop_after_uart_bytes:expected,
-        timer1_tick_every_cycles:try options.timer1_tick_every_cycles catch 0,
-        trace_io_addresses:[PORTD_IO]});
-    if not result.ok { return result; }
-    let decoder = Protocol.new_decoder("response"); let decoded = Protocol.feed(decoder, result.uart_tx);
-    return map{ok:decoded.ok and len(decoded.frames)==len(commands), format:FORMAT,
-        artifact_sha256:artifact.sha256, artifact_bytes:artifact.bytes,
-        responses:decoded.frames, uart_tx:result.uart_tx, io_events:result.io_events,
-        instructions:result.instructions, cycles:result.cycles,
-        execution_model:"verified AVR UART/timer/GPIO subset", physical_hardware:false};
+    return _verify_input(input,len(commands),if options==nil{map{}}else{options});
+}
+fn verify_frames(frames, options = nil) {
+    if type(frames)!="array" or len(frames)<1 or len(frames)>32{
+        return map{ok:false,format:FORMAT,error:"verification requires 1..32 wire frames"};
+    }
+    let input=[];for i len(frames){
+        if type(frames[i])!="array" or len(frames[i])!=Protocol.FRAME_BYTES{
+            return map{ok:false,format:FORMAT,error:"wire frames must contain exactly 12 bytes"};
+        }
+        for j len(frames[i]){let value=frames[i][j];
+            if type(value)!="number" or value!=num_floor(value) or value<0 or value>255{
+                return map{ok:false,format:FORMAT,error:"wire frame contains an invalid byte"};
+            }array_push(input,value);
+        }
+    }
+    return _verify_input(input,len(frames),if options==nil{map{}}else{options});
 }
 
-export FORMAT, MCU, CLOCK_HZ, BAUD, compile, verify;
+fn verify_bytes(input, expected_frames, options = nil) {
+    if type(input)!="array" or len(input)<1 or len(input)>384
+       or type(expected_frames)!="number" or expected_frames!=num_floor(expected_frames)
+       or expected_frames<1 or expected_frames>32 {
+        return map{ok:false,format:FORMAT,error:"verification requires bounded bytes and 1..32 responses"};
+    }
+    for i len(input) { let value=input[i];
+        if type(value)!="number" or value!=num_floor(value) or value<0 or value>255 {
+            return map{ok:false,format:FORMAT,error:"verification input contains an invalid byte"};
+        }
+    }
+    return _verify_input(input,expected_frames,if options==nil{map{}}else{options});
+}
+
+export FORMAT, MCU, CLOCK_HZ, BAUD, BUTTON_DEBOUNCE_TICKS, ADC_FOLLOW_MAXIMUM,
+    compile, verify, verify_frames, verify_bytes;

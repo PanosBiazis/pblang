@@ -77,6 +77,12 @@ fn multiply(destination, source) {
     _require(destination, 0, 31, "MUL destination"); _require(source, 0, 31, "MUL source");
     return _le16(39936 + _split(source, destination));
 }
+fn logical_shift_right(register) {
+    return _le16(37894 + _require(register, 0, 31, "LSR register") * 16);
+}
+fn rotate_right_carry(register) {
+    return _le16(37895 + _require(register, 0, 31, "ROR register") * 16);
+}
 fn increment(register) { return _le16(37891 + _require(register, 0, 31, "INC register") * 16); }
 fn decrement(register) { return _le16(37898 + _require(register, 0, 31, "DEC register") * 16); }
 fn branch_not_equal(offset) {
@@ -144,6 +150,80 @@ fn _option_integer(options, name, minimum, maximum, fallback) {
     return value;
 }
 
+fn _gpio_links(options) {
+    let links = try options.gpio_links catch [];
+    if type(links) != "array" or len(links) > 16 {
+        return map{ok:false,error:"AVR gpio_links must be an array with at most 16 entries"};
+    }
+    for i len(links) {
+        let link = links[i];
+        if type(link) != "map"
+           or not Support.integer(try link.output_io catch -1, 0, 63)
+           or not Support.integer(try link.output_bit catch -1, 0, 7)
+           or not Support.integer(try link.input_data catch -1, 0, 2303)
+           or not Support.integer(try link.input_bit catch -1, 0, 7)
+           or type(try link.invert catch false) != "bool" {
+            return map{ok:false,error:"AVR gpio_links contains an invalid bounded pin link"};
+        }
+    }
+    return map{ok:true,value:links};
+}
+
+fn _gpio_inputs(options) {
+    let inputs = try options.gpio_inputs catch [];
+    if type(inputs) != "array" or len(inputs) > 16 {
+        return map{ok:false,error:"AVR gpio_inputs must be an array with at most 16 entries"};
+    }
+    for i len(inputs) {
+        let input = inputs[i];
+        if type(input) != "map"
+           or not Support.integer(try input.input_data catch -1, 0, 2303)
+           or not Support.integer(try input.input_bit catch -1, 0, 7)
+           or type(try input.value catch nil) != "bool" {
+            return map{ok:false,error:"AVR gpio_inputs contains an invalid bounded pin fixture"};
+        }
+    }
+    return map{ok:true,value:inputs};
+}
+
+fn _gpio_input_events(options) {
+    let events = try options.gpio_input_events catch [];
+    if type(events) != "array" or len(events) > 128 {
+        return map{ok:false,error:"AVR gpio_input_events must be an array with at most 128 entries"};
+    }
+    let previous_tick = -1;
+    for i len(events) {
+        let event = events[i]; let tick = try event.tick catch -1;
+        if type(event) != "map" or not Support.integer(tick, 0, 1000000)
+           or tick < previous_tick
+           or not Support.integer(try event.input_data catch -1, 0, 2303)
+           or not Support.integer(try event.input_bit catch -1, 0, 7)
+           or type(try event.value catch nil) != "bool" {
+            return map{ok:false,error:"AVR gpio_input_events contains an invalid or unordered fixture"};
+        }
+        previous_tick = tick;
+    }
+    return map{ok:true,value:events};
+}
+
+fn _apply_gpio_inputs(inputs, data) {
+    for i len(inputs) {
+        let input = inputs[i]; let mask = 1 << input.input_bit;
+        if input.value { data[input.input_data] = data[input.input_data] | mask; }
+        else { data[input.input_data] = data[input.input_data] & (255 - mask); }
+    }
+}
+
+fn _apply_gpio_links(links, io, data) {
+    for i len(links) {
+        let link = links[i]; let value = (io[link.output_io] & (1 << link.output_bit)) != 0;
+        if try link.invert catch false { value = not value; }
+        let mask = 1 << link.input_bit;
+        if value { data[link.input_data] = data[link.input_data] | mask; }
+        else { data[link.input_data] = data[link.input_data] & (255 - mask); }
+    }
+}
+
 fn run(code, options = nil) {
     let invalid = Support.validate_bytes(code, MAX_CODE_BYTES);
     if invalid != nil { return _failure(invalid, 0, 0); }
@@ -152,9 +232,19 @@ fn run(code, options = nil) {
     if not budget_result.ok { return _failure(budget_result.error, 0, 0); }
 
     if options == nil { options = map{}; }
+    let link_result = _gpio_links(options);
+    if not link_result.ok { return _failure(link_result.error, 0, 0); }
+    let gpio_links = link_result.value;
+    let input_result = _gpio_inputs(options);
+    if not input_result.ok { return _failure(input_result.error, 0, 0); }
+    let gpio_inputs = input_result.value;
+    let event_result = _gpio_input_events(options);
+    if not event_result.ok { return _failure(event_result.error, 0, 0); }
+    let gpio_input_events = event_result.value;
     let registers = []; let i = 0; while i < 32 { array_push(registers, 0); i = i + 1; }
     let io = []; i = 0; while i < 64 { array_push(io, 0); i = i + 1; }
     let data = []; i = 0; while i < 2304 { array_push(data, 0); i = i + 1; }
+    _apply_gpio_inputs(gpio_inputs, data);
     let uart_rx = try options.uart_rx_bytes catch [];
     if type(uart_rx) != "array" or len(uart_rx) > 4096 {
         return _failure("invalid AVR UART input size", 0, 0);
@@ -166,7 +256,21 @@ fn run(code, options = nil) {
     let uart_cursor = 0; let uart_tx = [];
     let stop_uart = _option_integer(options, "stop_after_uart_bytes", 0, 4096, 0);
     let timer_period = _option_integer(options, "timer1_tick_every_cycles", 0, 1000000, 0);
+    if len(gpio_input_events) > 0 and timer_period == 0 {
+        return _failure("AVR gpio_input_events require timer1_tick_every_cycles", 0, 0);
+    }
+    let adc0_value = try options.adc0_value catch 512;
+    let adc_stuck = try options.adc_stuck catch false;
+    if not Support.integer(adc0_value, 0, 1023) or type(adc_stuck) != "bool" {
+        return _failure("invalid bounded AVR ADC fixture", 0, 0);
+    }
     let next_timer_cycle = timer_period;
+    let timer_ticks = 0; let gpio_event_cursor = 0;
+    while gpio_event_cursor < len(gpio_input_events)
+          and gpio_input_events[gpio_event_cursor].tick == 0 {
+        _apply_gpio_inputs([gpio_input_events[gpio_event_cursor]], data);
+        gpio_event_cursor = gpio_event_cursor + 1;
+    }
     let events = []; let stop_events = _stop_events(options); let interrupts_enabled = true;
     let zero = 0; let carry = 0; let word_count = num_floor(len(code) / 2); let pc = 0; let count = 0; let cycles = 0;
     while count < budget_result.value {
@@ -190,6 +294,7 @@ fn run(code, options = nil) {
             let before = io[address]; let mask = 1 << bit;
             if (word & 65280) == 39424 { io[address] = before | mask; }
             else { io[address] = before & (255 - mask); }
+            _apply_gpio_links(gpio_links, io, data);
             cycles = cycles + 2;
             if _trace_address(options, address) and io[address] != before {
                 array_push(events, map{ address:address, bit:bit,
@@ -223,6 +328,16 @@ fn run(code, options = nil) {
             if carry == 0 { next = pc + 1 + offset; cycles = cycles + 2; }
             else { cycles = cycles + 1; }
         }
+        elif (word & 65039) == 37894 {
+            let previous=registers[destination9];carry=previous & 1;
+            registers[destination9]=num_floor(previous/2);zero=_zero(registers[destination9]);
+            cycles=cycles+1;
+        }
+        elif (word & 65039) == 37895 {
+            let previous=registers[destination9];let incoming=carry;carry=previous & 1;
+            registers[destination9]=num_floor(previous/2)+incoming*128;
+            zero=_zero(registers[destination9]);cycles=cycles+1;
+        }
         elif (word & 65039) == 37891 { registers[destination9] = _wrap(registers[destination9] + 1); zero = _zero(registers[destination9]); cycles = cycles + 1; }
         elif (word & 65039) == 37898 { registers[destination9] = _wrap(registers[destination9] - 1); zero = _zero(registers[destination9]); cycles = cycles + 1; }
         elif (word & 64512) == 39936 {
@@ -251,6 +366,11 @@ fn run(code, options = nil) {
             if address >= len(data) { return _failure("STS address outside data space", pc, count); }
             if address == 54 { data[address] = data[address] & (255 - registers[destination9]); }
             else { data[address] = registers[destination9]; }
+            if address == 122 and (registers[destination9] & 64) != 0 and not adc_stuck {
+                data[120] = adc0_value % 256;
+                data[121] = num_floor(adc0_value / 256);
+                data[122] = (data[122] & (255 - 64)) | 16;
+            }
             if address == 198 {
                 array_push(uart_tx, registers[destination9]);
                 if stop_uart > 0 and len(uart_tx) >= stop_uart {
@@ -297,7 +417,15 @@ fn run(code, options = nil) {
         else { return _failure("unmodeled word " + str(word) + " at pc " + str(pc), pc, count); }
         if timer_period > 0 and cycles >= next_timer_cycle {
             data[54] = data[54] | 2;
-            while cycles >= next_timer_cycle { next_timer_cycle = next_timer_cycle + timer_period; }
+            while cycles >= next_timer_cycle {
+                timer_ticks = timer_ticks + 1;
+                while gpio_event_cursor < len(gpio_input_events)
+                      and gpio_input_events[gpio_event_cursor].tick <= timer_ticks {
+                    _apply_gpio_inputs([gpio_input_events[gpio_event_cursor]], data);
+                    gpio_event_cursor = gpio_event_cursor + 1;
+                }
+                next_timer_cycle = next_timer_cycle + timer_period;
+            }
         }
         pc = next;
     }
@@ -306,6 +434,7 @@ fn run(code, options = nil) {
 
 export FORMAT, DEFAULT_BUDGET, MAX_CODE_BYTES;
 export load_immediate, compare_immediate, add, subtract, compare, move, multiply;
+export logical_shift_right, rotate_right_carry;
 export and_immediate, or_immediate, subtract_immediate, subtract_immediate_carry;
 export exclusive_or, load_direct, store_direct;
 export increment, decrement, branch_not_equal, branch_equal, jump_relative, halt;

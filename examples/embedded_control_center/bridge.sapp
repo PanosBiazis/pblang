@@ -1,0 +1,163 @@
+// Authenticated loopback bridge shared by the browser and Android WebView UI.
+
+let UI = import("stdlib:modern_ui.sapp");
+let WebAdapter = import("stdlib:modern_ui_web.sapp");
+let Web = import("stdlib:web_framework.sapp");
+let Security = import("stdlib:security.sapp");
+let WebSecurity = import("stdlib:web_security.sapp");
+let Linux = import("stdlib:embedded_linux.sapp");
+let Model = import("examples/embedded_control_center/model.sapp");
+let View = import("examples/embedded_control_center/view.sapp");
+let Runtime = import("examples/embedded_control_center/web_runtime.sapp");
+
+let FORMAT = "pblang.embedded-control-center.bridge.v1";
+let MAX_BODY = 4096;
+let MAX_DEVICES = 16;
+let ACTIONS = ["on","off","toggle","blink","stop","adc","button","loopback","status","refresh","follow"];
+
+fn _response(body, content_type, security, status = 200) {
+    return WebSecurity.harden(map{status:status,body:body,content_type:content_type,
+        headers:map{"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"}},security);
+}
+
+fn _json(data, security, status = 200) { return _response(json_stringify(data), "application/json; charset=utf-8", security, status); }
+
+fn _authorized(ctx, state) {
+    let supplied = try ctx.header("x-pblang-session") catch nil;
+    if supplied == nil or len(str(supplied)) > 128 { return false; }
+    return constant_time_eq(str(supplied), state.token);
+}
+
+fn _guard(ctx, state) {
+    if not _authorized(ctx,state) { return _json(map{ok:false,error:"unauthorized"},state.security,401); }
+    if len(str(try ctx.body catch "")) > MAX_BODY { return _json(map{ok:false,error:"request body exceeds limit"},state.security,413); }
+    return nil;
+}
+
+fn _finish(result, state) {
+    if result == nil { return _json(map{ok:false,error:"bridge operation failed"},state.security,500); }
+    return _json(result,state.security,if try result.ok catch false{200}else{400});
+}
+
+fn _label(device) {
+    let detail = str(try device.model catch "");
+    if detail == "" { detail = str(try device.vendor catch "USB serial device"); }
+    if len(detail) > 48 { detail = str_slice(detail,0,48); }
+    return device.port + " - " + detail;
+}
+
+fn _discover() {
+    let found = Linux.devices(map{include_serial:false});
+    if not found.ok { return map{ok:false,error:found.error,devices:[]}; }
+    let devices=[];
+    for device in found.devices {
+        if len(devices)<MAX_DEVICES {
+            array_push(devices,map{port:device.port,label:_label(device),candidates:try device.candidates catch []});
+        }
+    }
+    return map{ok:true,format:FORMAT,devices:devices};
+}
+
+fn _known_board(value) {
+    let board=str_lower(str(value));
+    return board=="arduino-uno" or board=="esp32-devkitc-v4";
+}
+
+fn _port_available(port,board) {
+    let found=_discover();if not found.ok{return false;}
+    for device in found.devices {
+        if device.port==port {
+            for candidate in device.candidates { if (try candidate.board catch "")==board{return true;} }
+            // USB serial identity can be ambiguous; explicit selection remains
+            // valid only for the two bounded ttyUSB ports discovered now.
+            return str_starts_with(port,"/dev/ttyUSB");
+        }
+    }
+    return false;
+}
+
+fn _close(state) {
+    if state.controller!=nil { try Model.close(state.controller) catch nil; }
+    state.controller=nil;state.board="";state.port="";
+    return map{ok:true,format:FORMAT,connected:false};
+}
+
+fn _telemetry(state) {
+    if state.controller==nil{return map{ok:false,error:"not connected"};}
+    let sampled=Model.refresh_now(state.controller);
+    if not sampled.ok{return sampled;}
+    return map{ok:true,format:FORMAT,telemetry:sampled.telemetry};
+}
+
+fn _connect(state,body) {
+    if type(body)!="map"{return map{ok:false,error:"JSON object required"};}
+    let board=str_lower(str(try body.board catch ""));let port=str(try body.port catch "");
+    if not _known_board(board){return map{ok:false,error:"unsupported board"};}
+    if not _port_available(port,board){return map{ok:false,error:"selected board and port are not currently available"};}
+    _close(state);
+    let controller=Model.create(map{mode:"wired",board:board,port:port});
+    if not controller.ok{return controller;}
+    state.controller=controller;state.board=board;state.port=port;
+    let telemetry=_telemetry(state);
+    if not telemetry.ok{_close(state);return telemetry;}
+    return map{ok:true,format:FORMAT,connected:true,board:board,port:port,telemetry:telemetry.telemetry};
+}
+
+fn _command(state,body) {
+    if state.controller==nil{return map{ok:false,error:"connect a board first"};}
+    if type(body)!="map"{return map{ok:false,error:"JSON object required"};}
+    let action=str_lower(str(try body.action catch ""));let allowed=false;
+    for candidate in ACTIONS{if action==candidate{allowed=true;}}
+    if not allowed{return map{ok:false,error:"unsupported command"};}
+    let options=try body.options catch map{};if type(options)!="map"{return map{ok:false,error:"command options must be a map"};}
+    let result=Model.command(state.controller,action,options);
+    if not result.ok{return result;}
+    if action=="refresh" or action=="status" {
+        let telemetry=_telemetry(state);if telemetry.ok{return telemetry;}
+    }
+    return map{ok:true,format:FORMAT,result:try result.result catch result};
+}
+
+fn _inspect(state) {
+    if state.controller==nil{return map{ok:true,format:FORMAT,text:"No board is connected."};}
+    let snap=Model.snapshot(state.controller);let lines=["Board: "+state.board,"Port: "+state.port,"Connection: connected"];
+    if snap.telemetry!=nil {
+        array_push(lines,"ADC raw: "+str(snap.telemetry.adc.raw)+" / "+str(snap.telemetry.adc.maximum));
+        array_push(lines,"LED output: "+str(snap.telemetry.led_percent)+"%");
+        array_push(lines,"Button: "+if snap.telemetry.button.pressed{"pressed"}else{"released"});
+    }
+    return map{ok:true,format:FORMAT,text:str_join(lines,"\n")};
+}
+
+fn create(options=nil) {
+    if options==nil{options=map{};}
+    let port=try options.port catch 8766;
+    if type(port)!="number" or port!=num_floor(port) or port<1024 or port>65535{throw "bridge port must be 1024..65535";}
+    let token=Security.generate_token(32);let security=WebSecurity.strict();
+    let bundle=UI.compile(View.create(),map{target:"web",theme:"dark",width:1280,height:800});
+    let generated=WebAdapter.generate("Embedded Control Center",bundle,map{theme:"dark",lang:"en"});
+    generated.runtime_js=Runtime.source(token);
+    let app=Web.create_app(map{host:"127.0.0.1",port:port});
+    let state=map{format:FORMAT,token:token,security:security,controller:nil,board:"",port:"",generated:generated};
+    Web.use(app,Web.rate_limit(900,60000));
+    Web.get(app,"/",fn(_ctx){return _response(generated.html,"text/html; charset=utf-8",security);});
+    Web.get(app,"/pblang-ui.css",fn(_ctx){return _response(generated.css,"text/css; charset=utf-8",security);});
+    Web.get(app,"/pblang-ui.actions.js",fn(_ctx){return _response(generated.actions_js,"text/javascript; charset=utf-8",security);});
+    Web.get(app,"/pblang-ui.js",fn(_ctx){return _response(generated.runtime_js,"text/javascript; charset=utf-8",security);});
+    Web.get(app,"/api/devices",fn(ctx){let denied=_guard(ctx,state);if denied!=nil{return denied;}return _finish(_discover(),state);});
+    Web.post(app,"/api/connect",fn(ctx){let denied=_guard(ctx,state);if denied!=nil{return denied;}return _finish(_connect(state,ctx.body_json),state);});
+    Web.post(app,"/api/disconnect",fn(ctx){let denied=_guard(ctx,state);if denied!=nil{return denied;}return _finish(_close(state),state);});
+    Web.post(app,"/api/command",fn(ctx){let denied=_guard(ctx,state);if denied!=nil{return denied;}return _finish(_command(state,ctx.body_json),state);});
+    Web.get(app,"/api/inspect",fn(ctx){let denied=_guard(ctx,state);if denied!=nil{return denied;}return _finish(_inspect(state),state);});
+    return map{ok:true,format:FORMAT,app:app,state:state,host:"127.0.0.1",port:port,url:"http://127.0.0.1:"+str(port)+"/"};
+}
+
+fn handle(bridge,request){return Web.handle(bridge.app,request);}
+fn listen(bridge){Web.listen(bridge.app);}
+fn bind(bridge){return Web.bind_listener(bridge.app);}
+fn listen_bound(bridge,listener,max_connections=nil){
+    return Web.listen_bound(bridge.app,listener,max_connections);
+}
+fn close(bridge){return _close(bridge.state);}
+
+export FORMAT,create,handle,listen,bind,listen_bound,close;
