@@ -1,0 +1,184 @@
+// Shared application model for emulator and explicitly selected wired devices.
+// Rendering adapters consume snapshots; they never receive raw serial handles.
+
+let Embedded = import("stdlib:embedded.sapp");
+
+let FORMAT = "pblang.embedded-control-center.v1";
+let BOARDS = ["arduino-uno", "esp32-devkitc-v4"];
+let LIVE_MIN_MS = 100;
+let LIVE_MAX_MS = 5000;
+let PERIODIC_MIN_MS = 250;
+let PERIODIC_MAX_MS = 3600000;
+
+fn _error(message, code = "invalid-request") {
+    return map{ok:false, format:FORMAT, code:code, error:message};
+}
+
+fn _board(value) {
+    let board = str_lower(str(value));
+    for candidate in BOARDS { if board == candidate { return board; } }
+    return "";
+}
+
+fn create(options = nil) {
+    let opts = if options == nil { map{} } else { options };
+    if type(opts) != "map" { return _error("options must be a map"); }
+    let mode = str_lower(str(try opts.mode catch "emulator"));
+    if mode != "emulator" and mode != "wired" {
+        return _error("mode must be emulator or wired", "invalid-mode");
+    }
+    let board = _board(try opts.board catch "arduino-uno");
+    if board == "" { return _error("unsupported example board", "unsupported-board"); }
+    let port = str(try opts.port catch "");
+    if mode == "wired" and port == "" {
+        return _error("wired mode requires an explicit discovered port", "missing-port");
+    }
+    let circuit = Embedded.new_circuit(map{
+        name:"Embedded Control Center", mode:mode, automatic_mapping:true
+    });
+    let added = Embedded.Circuit.add_device(circuit, "target", board,
+        map{mode:mode, port:port});
+    if not added.ok { return added; }
+    let session = Embedded.Controller.connect(circuit, "target", map{
+        timeout_ms:800, retries:2
+    });
+    if not session.ok { return session; }
+    let following=Embedded.Controller.set_analog_follow(session,true);
+    if not following.ok { Embedded.Controller.close(session);return following; }
+    return map{ok:true, format:FORMAT, board:board, mode:mode, port:port,
+        circuit:circuit, session:session, last_result:nil, telemetry:nil,
+        analog_follow:true,
+        refresh:map{mode:"manual",interval_ms:0,next_due_ms:0,active:true,
+            polling:false,polls:0,failures:0}};
+}
+
+fn configure_refresh(app, mode, interval_ms = nil) {
+    if type(app)!="map" or (try app.format catch "")!=FORMAT or not (try app.ok catch false) {
+        return _error("application is not connected", "not-connected");
+    }
+    let selected=str_lower(str(mode));let interval=0;
+    if selected=="manual" { interval=0; }
+    elif selected=="live" {
+        interval=if interval_ms==nil{250}else{interval_ms};
+        if type(interval)!="number" or interval!=num_floor(interval)
+           or interval<LIVE_MIN_MS or interval>LIVE_MAX_MS {
+            return _error("live refresh interval must be 100..5000 ms", "invalid-refresh-interval");
+        }
+    } elif selected=="periodic" {
+        interval=if interval_ms==nil{1000}else{interval_ms};
+        if type(interval)!="number" or interval!=num_floor(interval)
+           or interval<PERIODIC_MIN_MS or interval>PERIODIC_MAX_MS {
+            return _error("periodic refresh interval must be 250..3600000 ms", "invalid-refresh-interval");
+        }
+    } else { return _error("refresh mode must be manual, live, or periodic", "invalid-refresh-mode"); }
+    app.refresh.mode=selected;app.refresh.interval_ms=interval;
+    app.refresh.next_due_ms=if selected=="manual"{0}else{num_floor(now_ms())};
+    return map{ok:true,format:FORMAT,refresh:app.refresh};
+}
+
+fn set_active(app, active) {
+    if type(active)!="bool" { return _error("active state must be boolean", "invalid-active-state"); }
+    if type(app)!="map" or (try app.format catch "")!=FORMAT {
+        return _error("invalid application", "invalid-application");
+    }
+    app.refresh.active=active;
+    if active and app.refresh.mode!="manual" { app.refresh.next_due_ms=num_floor(now_ms()); }
+    return map{ok:true,format:FORMAT,active:active};
+}
+
+fn _sample(app, timestamp) {
+    if app.refresh.polling { return _error("refresh is already in progress", "refresh-overlap"); }
+    app.refresh.polling=true;
+    let status=Embedded.Controller.status(app.session);
+    let adc=if status.ok{Embedded.Controller.read_adc(app.session)}else{status};
+    let button=if status.ok and adc.ok{Embedded.Controller.read_button(app.session)}else{adc};
+    app.refresh.polling=false;app.refresh.polls=app.refresh.polls+1;
+    app.refresh.next_due_ms=if app.refresh.mode=="manual"{0}else{timestamp+app.refresh.interval_ms};
+    if not status.ok or not adc.ok or not button.ok {
+        app.refresh.failures=app.refresh.failures+1;
+        let failed=button;
+        if not status.ok { failed=status; }
+        elif not adc.ok { failed=adc; }
+        app.last_result=failed;return failed;
+    }
+    app.telemetry=map{sampled_at_ms:timestamp,on:status.response.on,
+        blinking:status.response.blinking,adc:adc.result,button:button.result,
+        analog_follow:app.analog_follow,led_percent:adc.result.led_percent,
+        led_duty:adc.result.led_duty};
+    app.last_result=map{ok:true,format:FORMAT,telemetry:app.telemetry};
+    return map{ok:true,format:FORMAT,polled:true,telemetry:app.telemetry,
+        next_due_ms:app.refresh.next_due_ms};
+}
+
+fn refresh_now(app, timestamp = nil) {
+    let current=if timestamp==nil{num_floor(now_ms())}else{timestamp};
+    if type(current)!="number" or current!=num_floor(current) or current<0 {
+        return _error("refresh timestamp must be a non-negative integer", "invalid-refresh-time");
+    }
+    return _sample(app,current);
+}
+
+fn poll(app, timestamp = nil) {
+    let current=if timestamp==nil{num_floor(now_ms())}else{timestamp};
+    if type(current)!="number" or current!=num_floor(current) or current<0 {
+        return _error("poll timestamp must be a non-negative integer", "invalid-refresh-time");
+    }
+    if not app.refresh.active { return map{ok:true,format:FORMAT,polled:false,reason:"inactive"}; }
+    if app.refresh.mode=="manual" { return map{ok:true,format:FORMAT,polled:false,reason:"manual"}; }
+    if current<app.refresh.next_due_ms {
+        return map{ok:true,format:FORMAT,polled:false,reason:"not-due",next_due_ms:app.refresh.next_due_ms};
+    }
+    return _sample(app,current);
+}
+
+fn command(app, name, options = nil) {
+    if type(app) != "map" or (try app.format catch "") != FORMAT
+       or not (try app.ok catch false) {
+        return _error("application is not connected", "not-connected");
+    }
+    let opts = if options == nil { map{} } else { options };
+    if type(opts) != "map" { return _error("command options must be a map"); }
+    let action = str_lower(str(name));
+    let result = nil;
+    if action == "on" { result = Embedded.Controller.set_led(app.session, true); }
+    elif action == "off" { result = Embedded.Controller.set_led(app.session, false); }
+    elif action == "toggle" { result = Embedded.Controller.toggle_led(app.session); }
+    elif action == "stop" { result = Embedded.Controller.set_blink(app.session, false); }
+    elif action == "blink" {
+        result = Embedded.Controller.set_blink(app.session, true,
+            try opts.interval_ms catch 500, try opts.duration_ms catch 0);
+    } elif action == "adc" { result = Embedded.Controller.read_adc(app.session); }
+    elif action == "follow" {
+        let enabled=try opts.enabled catch true;
+        if type(enabled)!="bool" { return _error("follow enabled must be boolean","invalid-state"); }
+        result=Embedded.Controller.set_analog_follow(app.session,enabled);
+        if result.ok { app.analog_follow=enabled; }
+    }
+    elif action == "button" { result = Embedded.Controller.read_button(app.session); }
+    elif action == "loopback" { result = Embedded.Controller.verify_loopback(app.session); }
+    elif action == "status" { result = Embedded.Controller.status(app.session); }
+    elif action == "refresh" { result = refresh_now(app); }
+    else { return _error("unsupported command", "unsupported-command"); }
+    app.last_result = result;
+    return result;
+}
+
+fn snapshot(app) {
+    if type(app) != "map" or (try app.format catch "") != FORMAT {
+        return _error("invalid application", "invalid-application");
+    }
+    return map{ok:true, format:FORMAT, board:app.board, mode:app.mode,
+        port:app.port, circuit:Embedded.Circuit.snapshot(app.circuit),
+        last_result:app.last_result,telemetry:app.telemetry,refresh:app.refresh,
+        analog_follow:app.analog_follow};
+}
+
+fn close(app) {
+    if type(app) != "map" or (try app.format catch "") != FORMAT {
+        return _error("invalid application", "invalid-application");
+    }
+    return Embedded.Controller.close(app.session);
+}
+
+export FORMAT, BOARDS, LIVE_MIN_MS, LIVE_MAX_MS, PERIODIC_MIN_MS, PERIODIC_MAX_MS;
+export create, configure_refresh, set_active, refresh_now, poll, command, snapshot, close;

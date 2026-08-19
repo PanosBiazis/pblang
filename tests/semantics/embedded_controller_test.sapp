@@ -1,11 +1,16 @@
 let Circuit = import("stdlib:embedded_circuit.sapp");
 let Controller = import("stdlib:embedded_controller.sapp");
+let Embedded = import("stdlib:embedded.sapp");
 
 let circuit = Circuit.new(map{name:"Controller test", mode:"emulator"});
 assert(Circuit.add_device(circuit, "uno", "arduino-uno").ok, "emulated UNO added");
 let session = Controller.connect(circuit, "uno", map{timeout_ms:100,retries:1,reset_wait_ms:0});
-assert(session.ok and session.connected and session.synchronized,
-    "controller performs status handshake");
+assert(session.ok and session.connected and session.synchronized
+    and session.capability_negotiated
+    and (session.capability_bits & Embedded.Protocol.CAP_DIGITAL_LOOPBACK)!=0
+    and (session.capability_bits & Embedded.Protocol.CAP_ADC_READ)!=0
+    and (session.capability_bits & Embedded.Protocol.CAP_ANALOG_FOLLOW)!=0,
+    "controller performs status handshake and capability negotiation");
 let status = Controller.status(session);
 assert(status.ok and not status.applied and status.circuit.state_verified,
     "status observes state without claiming a mutation");
@@ -28,6 +33,38 @@ assert(not session.protocol_device.blinking
     and not Circuit.snapshot(circuit).devices[0].blink.enabled,
     "both emulators finish finite blink off");
 
+let loopback = Controller.verify_loopback(session);
+assert(loopback.ok and loopback.result.pass and loopback.result.low_phase_ok
+    and loopback.result.high_phase_ok,
+    "controller exposes both bounded digital loopback phases");
+let adc = Controller.read_adc(session);
+assert(adc.ok and adc.result.raw == 512 and adc.result.maximum == 1023
+    and adc.result.percent > 50 and adc.result.percent < 51,
+    "controller normalizes a capability-gated ADC sample");
+assert(adc.result.led_percent>78 and adc.result.led_percent<79
+    and adc.result.calibrated_maximum==650,
+    "controller publishes the shared 3.3 V potentiometer LED calibration");
+let analog_follow=Controller.set_analog_follow(session,true);
+assert(analog_follow.ok and analog_follow.result.enabled
+    and analog_follow.result.output=="D6" and analog_follow.result.method=="hardware-pwm",
+    "controller capability-gates portable analog LED following");
+session.protocol_device.button_pressed=true;
+let button=Controller.read_button(session);
+assert(button.ok and not button.applied and button.result.pressed
+    and button.result.pin=="D4",
+    "controller exposes a read-only board-specific button sample");
+let outputs=Controller.set_test_outputs(session,true);
+assert(outputs.ok and outputs.applied and outputs.result.main_output=="D7"
+    and outputs.result.loopback_output=="D6",
+    "controller exposes bounded diagnostic outputs");
+let input_diagnostic=Controller.diagnose_inputs(session,3,10);
+assert(input_diagnostic.ok and input_diagnostic.samples==3
+    and input_diagnostic.adc.minimum==512 and input_diagnostic.adc.maximum==512
+    and input_diagnostic.button.high_seen,
+    "bounded input diagnostic reuses one controller session");
+assert(not Controller.diagnose_inputs(session,201,10).ok,
+    "input diagnostic rejects excessive sampling");
+
 let stopped = Controller.set_blink(session, false, 500, 0);
 assert(stopped.ok and not stopped.response.blinking and not stopped.response.on,
     "explicit stop is idempotent");
@@ -37,6 +74,54 @@ assert(Controller.close(session).ok and session.closed,
     "session closes deterministically");
 assert(not Controller.set_led(session, true).ok,
     "closed session rejects mutation");
+
+let legacy_circuit=Circuit.new(map{name:"Legacy controller",mode:"emulator"});
+assert(Circuit.add_device(legacy_circuit,"uno","arduino-uno").ok,"legacy fixture device");
+let legacy=Controller.connect(legacy_circuit,"uno",map{timeout_ms:100,retries:1,
+    reset_wait_ms:0,emulate_legacy_silent_capabilities:true});
+assert(legacy.ok and legacy.legacy_protocol and not legacy.capability_negotiated
+       and legacy.capability_bits==0,"silent legacy capability query resynchronizes safely");
+assert(Controller.set_led(legacy,true).ok,"legacy required commands remain available");
+let unsupported_loopback=Controller.verify_loopback(legacy);
+assert(not unsupported_loopback.ok and unsupported_loopback.code=="capability-unavailable",
+    "legacy mode cannot invoke an unadvertised optional command");
+assert(not Controller.read_adc(legacy).ok,
+    "legacy mode cannot invoke an unadvertised ADC command");
+Controller.close(legacy);
+
+let esp_circuit=Circuit.new(map{name:"ESP inspector",mode:"emulator"});
+assert(Circuit.add_device(esp_circuit,"esp","esp32-devkitc-v4").ok,
+    "ESP inspector fixture device");
+let esp_session=Controller.connect(esp_circuit,"esp",map{timeout_ms:100,retries:1,reset_wait_ms:0});
+esp_session.protocol_device.gpio_input_low=0x1234;
+esp_session.protocol_device.gpio_input_high=0x0800;
+let gpio_snapshot=Controller.read_gpio_snapshot(esp_session);
+assert(gpio_snapshot.ok and not gpio_snapshot.applied
+    and gpio_snapshot.result.raw==0x08001234 and gpio_snapshot.result.gpio27_high,
+    "controller reconstructs a read-only ESP32 GPIO register snapshot");
+let gpio27_self_test=Controller.self_test_gpio27(esp_session);
+assert(gpio27_self_test.ok and gpio27_self_test.result.pass
+    and gpio27_self_test.result.input_only
+    and gpio27_self_test.result.output_disabled_after_test,
+    "controller exposes a bounded input-only GPIO27 safety self-test");
+Controller.close(esp_session);
+
+let esp_artifact=Embedded.build_controller("esp32-devkitc-v4");
+assert(esp_artifact.ok and esp_artifact.backend=="native-xtensa-lx6"
+       and esp_artifact.protocol==Embedded.Protocol.FORMAT
+       and esp_artifact.persistent_command_loop,
+       "public embedded facade builds the persistent ESP32 controller");
+let uno_profile=Embedded.controller_profile("arduino-uno");
+let esp_profile=Embedded.controller_profile("esp32-devkitc-v4");
+assert(uno_profile.ok and uno_profile.reset_wait_ms==1600 and uno_profile.baud==115200,
+    "UNO controller timing comes from board profile");
+assert(esp_profile.ok and esp_profile.reset_wait_ms==50
+    and esp_profile.protocol==Embedded.Protocol.FORMAT
+    and str(esp_profile.artifact_sha256)!=""
+    and esp_profile.identity_attestation=="transport-and-mcu-probe-not-cryptographic",
+    "ESP32 controller timing comes from board profile");
+assert(not Embedded.controller_profile("raspberry-pi-pico").ok,
+    "planned boards do not claim a physical controller backend");
 
 let wired = Circuit.new(map{mode:"wired"});
 assert(Circuit.add_device(wired, "uno", "arduino-uno", map{port:"/dev/ttyUSB99"}).ok,

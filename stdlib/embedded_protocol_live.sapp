@@ -1,0 +1,215 @@
+// Bounded physical conformance verifier for embedded_protocol.sapp devices.
+
+let Protocol = import("stdlib:embedded_protocol.sapp");
+let Serial = import("stdlib:linux_serial.sapp");
+
+let FORMAT = "pblang.embedded-wire-live-verifier.v1";
+let MAX_RESPONSE_BYTES = 96;
+let TIMEOUT_MS = 800;
+
+fn _error(message, code = "verification-failed") {
+    return map{ok:false, format:FORMAT, code:code, error:message};
+}
+fn _checksum(frame) {
+    let sum = 0; for i 11 { sum = num_mod(sum + frame[i], 256); } return sum;
+}
+fn _copy(frame) { let out=[]; for i len(frame){array_push(out,frame[i]);} return out; }
+fn _command(sequence, opcode, value = 0, interval = 500, duration = 0) {
+    return map{sequence:sequence,opcode:opcode,value:value,
+        interval_ms:interval,duration_ms:duration};
+}
+fn _invalid_opcode(sequence) {
+    let frame=_copy(Protocol.encode_command(_command(sequence,Protocol.OP_STATUS)));
+    frame[4]=250; frame[11]=_checksum(frame); return frame;
+}
+fn _invalid_interval(sequence) {
+    let frame=_copy(Protocol.encode_command(_command(sequence,Protocol.OP_BLINK,0,10,0)));
+    frame[6]=0; frame[7]=0; frame[11]=_checksum(frame); return frame;
+}
+fn _corrupt_checksum(sequence) {
+    let frame=_copy(Protocol.encode_command(_command(sequence,Protocol.OP_STATUS)));
+    frame[11]=num_mod(frame[11]+1,256); return frame;
+}
+fn _overlapping_magic(sequence) {
+    let frame=[80];let command=Protocol.encode_command(_command(sequence,Protocol.OP_STATUS));
+    for i len(command){array_push(frame,command[i]);}return frame;
+}
+fn cases() {
+    return map{invalid_opcode:_invalid_opcode(102),invalid_interval:_invalid_interval(102),
+        corrupt_checksum:_corrupt_checksum(199),overlapping_magic:_overlapping_magic(200)};
+}
+fn _read_response(link_state, sequence, timeout_ms) {
+    let decoder=Protocol.new_decoder("response");let started=now_ms();let received=0;
+    while now_ms()-started<timeout_ms and received<MAX_RESPONSE_BYTES {
+        let remaining=timeout_ms-num_floor(now_ms()-started);if remaining<1{remaining=1;}
+        let read=Serial.read_bytes(link_state,MAX_RESPONSE_BYTES-received,remaining);
+        if not read.ok{return _error(read.error,"serial-read");}
+        received=received+read.bytes_read;let parsed=Protocol.feed(decoder,read.bytes);
+        if not parsed.ok{return _error(parsed.error,"protocol-decode");}
+        for i len(parsed.frames){if parsed.frames[i].sequence==sequence{
+            return map{ok:true,format:FORMAT,response:parsed.frames[i],bytes_received:received};
+        }}
+        if read.bytes_read==0{break;}
+    }
+    return _error("device response deadline expired","response-timeout");
+}
+fn _send_frame(link_state, wire_bytes, wanted_sequence, timeout_ms) {
+    let flushed=Serial.flush_input(link_state);if not flushed.ok{return _error(flushed.error,"serial-flush");}
+    let wrote=Serial.write_bytes(link_state,wire_bytes,timeout_ms);if not wrote.ok{return _error(wrote.error,"serial-write");}
+    let read=_read_response(link_state,wanted_sequence,timeout_ms);if read.ok{read.bytes_sent=wrote.bytes_sent;}return read;
+}
+fn _status(link_state, sequence) {
+    return _send_frame(link_state,Protocol.encode_command(_command(sequence,Protocol.OP_STATUS)),sequence,TIMEOUT_MS);
+}
+fn _synchronize(link_state, sequence) {
+    let attempt=0;let result=_error("status synchronization failed","handshake");
+    while attempt<3 and not result.ok{attempt=attempt+1;result=_status(link_state,sequence);}
+    result.attempts=attempt;return result;
+}
+fn _result_status(exchange, expected) {
+    return exchange.ok and exchange.response.status==expected;
+}
+fn _passed(evidence) {
+    let count=0;for i len(evidence){if evidence[i].pass{count=count+1;}}return count;
+}
+fn _named_pass(evidence,name) {
+    for i len(evidence){if (try evidence[i].name catch "")==name{return try evidence[i].pass catch false;}}
+    return false;
+}
+fn conformance_report(profile,identity,evidence,failure="") {
+    if type(profile)!="map" or type(identity)!="map" or type(evidence)!="array"
+       or len(evidence)<1 or len(evidence)>32 or type(failure)!="string" {
+        return _error("invalid bounded conformance report input","invalid-report");
+    }
+    for i len(evidence){if type(evidence[i])!="map" or type(try evidence[i].pass catch nil)!="bool"{
+        return _error("conformance evidence must contain boolean pass fields","invalid-report");
+    }}
+    let passed=_passed(evidence);let conforming=failure=="" and passed==len(evidence);
+    return map{ok:conforming,format:FORMAT,protocol:Protocol.FORMAT,
+        requested_board:profile.board,identity:identity,
+        expected_artifact_sha256_unverified:profile.artifact_sha256,
+        firmware_digest_observed:false,exact_board_observed:false,
+        protocol_conformance:conforming,
+        cryptographic_device_attestation:false,authenticated_protocol:false,
+        checks:len(evidence),passed:passed,evidence:evidence,
+        safe_final_state:_named_pass(evidence,"safe-final-state"),
+        termios_restored:_named_pass(evidence,"termios-restored"),error:failure};
+}
+fn verify(port, confirm, reset_wait_ms, profile = nil, identity = nil) {
+    if platform()!="linux"{return _error("physical serial verification is implemented on Linux only","platform");}
+    if type(reset_wait_ms)!="number" or reset_wait_ms!=num_floor(reset_wait_ms)
+       or reset_wait_ms<0 or reset_wait_ms>5000{return _error("reset wait must be 0..5000 ms","invalid-options");}
+    if (try env_get("PB_EMBEDDED_PROTOCOL_VERIFY_ENABLE") catch "")!="1" or not confirm{
+        return _error("physical protocol verification requires explicit environment and command confirmation","permission");
+    }
+    if type(profile)!="map" or not (try profile.ok catch false)
+       or str(try profile.board catch "")==""
+       or str(try profile.artifact_sha256 catch "")=="" {
+        return _error("verified board profile and controller artifact are required","identity-profile");
+    }
+    if type(identity)!="map" or not (try identity.ok catch false)
+       or not (try identity.exact_mcu catch false)
+       or str(try identity.mcu catch "")!=str(profile.mcu) {
+        return _error("physical MCU identity does not match the controller profile","identity-mismatch");
+    }
+    let link_state=Serial.open_port(str(port),115200);if not link_state.ok{return link_state;}
+    if reset_wait_ms>0{sleep_ms(reset_wait_ms);}
+    let evidence=[];let failure="";
+
+    let hello=_synchronize(link_state,100);array_push(evidence,map{name:"synchronize",
+        pass:_result_status(hello,Protocol.STATUS_OK),attempts:hello.attempts});
+    if not evidence[len(evidence)-1].pass{failure="status synchronization failed";}
+
+    if failure==""{
+        let capabilities=_send_frame(link_state,
+            Protocol.encode_command(_command(101,Protocol.OP_CAPABILITIES)),101,TIMEOUT_MS);
+        array_push(evidence,map{name:"capability-negotiation",
+            pass:_result_status(capabilities,Protocol.STATUS_OK)
+                and (capabilities.response.result_bits & Protocol.CAP_DIGITAL_LOOPBACK)!=0
+                and (capabilities.response.result_bits & Protocol.CAP_ADC_READ)!=0,
+            capability_bits:if capabilities.ok{capabilities.response.result_bits}else{0}});
+        if not evidence[len(evidence)-1].pass{failure="firmware did not advertise digital loopback";}
+    }
+    if failure==""{
+        let skipped=_send_frame(link_state,Protocol.encode_command(_command(103,Protocol.OP_SET,1)),103,TIMEOUT_MS);
+        array_push(evidence,map{name:"out-of-order",pass:_result_status(skipped,Protocol.STATUS_OUT_OF_ORDER)});
+        if not evidence[len(evidence)-1].pass{failure="out-of-order command was not rejected";}
+    }
+    if failure==""{
+        let set_on=_send_frame(link_state,Protocol.encode_command(_command(102,Protocol.OP_SET,1)),102,TIMEOUT_MS);
+        array_push(evidence,map{name:"ordered-command",pass:_result_status(set_on,Protocol.STATUS_OK) and set_on.response.on});
+        if not evidence[len(evidence)-1].pass{failure="ordered command did not apply";}
+    }
+    if failure==""{
+        let replay=_send_frame(link_state,Protocol.encode_command(_command(102,Protocol.OP_SET,0)),102,TIMEOUT_MS);
+        array_push(evidence,map{name:"duplicate-replay",pass:_result_status(replay,Protocol.STATUS_DUPLICATE) and replay.response.on});
+        if not evidence[len(evidence)-1].pass{failure="duplicate command changed state or was not rejected";}
+    }
+    if failure==""{
+        let opcode=_send_frame(link_state,_invalid_opcode(103),103,TIMEOUT_MS);
+        array_push(evidence,map{name:"unsupported-opcode",pass:_result_status(opcode,Protocol.STATUS_INVALID)});
+        if not evidence[len(evidence)-1].pass{failure="unsupported opcode was not rejected";}
+    }
+    if failure==""{
+        let interval=_send_frame(link_state,_invalid_interval(103),103,TIMEOUT_MS);
+        array_push(evidence,map{name:"invalid-interval",pass:_result_status(interval,Protocol.STATUS_INVALID)});
+        if not evidence[len(evidence)-1].pass{failure="invalid interval was not rejected";}
+    }
+    if failure==""{
+        let loopback=_send_frame(link_state,
+            Protocol.encode_command(_command(103,Protocol.OP_LOOPBACK)),103,TIMEOUT_MS);
+        array_push(evidence,map{name:"digital-loopback",
+            pass:_result_status(loopback,Protocol.STATUS_OK)
+                and loopback.response.result_bits==3,
+            result_bits:if loopback.ok{loopback.response.result_bits}else{0}});
+        if not evidence[len(evidence)-1].pass{failure="digital loopback did not reproduce LOW and HIGH";}
+    }
+    if failure==""{
+        let adc=_send_frame(link_state,
+            Protocol.encode_command(_command(104,Protocol.OP_ADC_READ)),104,TIMEOUT_MS);
+        let expected_max=try profile.adc.maximum catch 0;
+        array_push(evidence,map{name:"adc-read",
+            pass:_result_status(adc,Protocol.STATUS_OK) and expected_max>0
+                and adc.response.payload1==expected_max
+                and adc.response.payload0>=0 and adc.response.payload0<=expected_max,
+            raw:if adc.ok{adc.response.payload0}else{-1},
+            maximum:if adc.ok{adc.response.payload1}else{0}});
+        if not evidence[len(evidence)-1].pass{failure="ADC sample or converter range was invalid";}
+    }
+    if failure==""{
+        let button=_send_frame(link_state,
+            Protocol.encode_command(_command(105,Protocol.OP_BUTTON_READ)),105,TIMEOUT_MS);
+        let bits=if button.ok{button.response.result_bits}else{-1};
+        let payload=if button.ok{button.response.payload0}else{-1};
+        array_push(evidence,map{name:"button-read",
+            pass:_result_status(button,Protocol.STATUS_OK)
+                and (bits==0 or bits==1) and payload==bits,
+            pressed:bits==1,electrical_high:bits==1});
+        if not evidence[len(evidence)-1].pass{failure="button input sample was invalid";}
+    }
+    if failure==""{
+        if Serial.flush_input(link_state).ok
+           and Serial.write_bytes(link_state,_corrupt_checksum(199),TIMEOUT_MS).ok {
+            let silent=_read_response(link_state,199,100);
+            array_push(evidence,map{name:"checksum-corruption",pass:not silent.ok and silent.code=="response-timeout"});
+            if not evidence[len(evidence)-1].pass{failure="corrupt checksum produced a response";}
+        } else {
+            array_push(evidence,map{name:"checksum-corruption",pass:false});
+            failure="corruption probe I/O failed";
+        }
+    }
+    let recovery=_send_frame(link_state,_overlapping_magic(200),200,TIMEOUT_MS);
+    array_push(evidence,map{name:"overlapping-magic-recovery",pass:_result_status(recovery,Protocol.STATUS_OK)});
+    if failure=="" and not evidence[len(evidence)-1].pass{failure="parser did not retain an overlapping magic prefix";}
+    let rollover=_status(link_state,255);
+    array_push(evidence,map{name:"sequence-rollover",pass:_result_status(rollover,Protocol.STATUS_OK)});
+    if failure=="" and not evidence[len(evidence)-1].pass{failure="sequence rollover synchronization failed";}
+    let stop=_send_frame(link_state,Protocol.encode_command(_command(1,Protocol.OP_STOP)),1,TIMEOUT_MS);
+    array_push(evidence,map{name:"safe-final-state",pass:_result_status(stop,Protocol.STATUS_OK) and not stop.response.on});
+    if failure=="" and not evidence[len(evidence)-1].pass{failure="device could not be left in safe off state";}
+    array_push(evidence,map{name:"termios-restored",pass:Serial.close(link_state).termios_restored});
+    if failure=="" and not evidence[len(evidence)-1].pass{failure="serial state restoration failed";}
+    return conformance_report(profile,identity,evidence,failure);
+}
+
+export FORMAT, MAX_RESPONSE_BYTES, TIMEOUT_MS, cases, conformance_report, verify;

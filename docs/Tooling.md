@@ -16,6 +16,17 @@ cases.
 
 ## CLI commands
 
+The PBLang-native `tools/pbembed.sapp` controller supports `status`, `on`,
+`off`, `toggle`, `blink`, `stop`, and `loopback`. The loopback action performs
+bounded LOW/HIGH read-back on board-declared pins and returns phase-specific
+evidence; `examples/embedded_loopback/main.sapp` demonstrates the same API in
+the deterministic circuit emulator. Connection performs a capability query
+before optional commands. A bounded status resynchronization keeps required
+commands usable with legacy firmware that silently ignores that query, while
+optional commands remain disabled. Physical verification requires an exact MCU
+probe and reports explicitly that exact board and running firmware identity are
+not attested.
+
 - **`pblang init`** — Create `pblang.toml` in the current directory (package name `my-app`, version `0.1.0`, empty dependencies). Fails if the file already exists.
 - **`pblang run [file.sapp|dir] [-- arg1 arg2 ...]`** — Execute a script and exit. Arguments after `--` are passed to the script and available via `os.args()` (from `stdlib:os.sapp`). If you pass a directory (or run `pblang run` from inside a manifest dir), pblang resolves the package entry from `pblang.toml`: first `[package].entry`, otherwise `main.sap`, `main.sapp`, `src/main.sap`, `src/main.sapp`.
 - **`pblang compile <file.sapp> [--out <name>] [--opt <level>] [--llvm|--wasm]`** — Compile through backend flows. Default is C99 transpiler + native compiler; `--llvm` uses LLVM backend with compatibility fallback, `--wasm` emits `.wat`. `--llvm` and `--wasm` are mutually exclusive.
@@ -572,16 +583,32 @@ All hover responses are rendered as Markdown fenced code blocks.
 - `manual`, `inspect`, and `inspect-pin` publish portable technical data and
   ambiguity-safe board/port/pin resolution;
 - `build-blink` emits native firmware for an implemented backend;
-- `build-esp32-ram` emits the experimental PBLang-native classic-ESP32
-  RAM-validation image without enabling persistent flash;
+- `build-esp32-boot` emits the bounded PBLang-native classic-ESP32 GPIO23
+  image; `build-esp32-ram` remains a compatible alias for RAM validation;
+- `build-controller-uno` and `build-controller-esp32` emit persistent firmware
+  implementing the same bounded wire contract; `load-controller-esp32` permits
+  RAM-only validation before any flash write;
+- `probe-esp32`, `flash-esp32-boot`, `reset-esp32`, and
+  `diagnose-esp32-boot` provide separately gated chip/security inspection,
+  fixed-offset persistent write, normal reset, and bounded boot diagnostics;
 - `simulate-blink` verifies AVR GPIO events in the PBLang AVR emulator;
 - `probe-uno` performs an opt-in, read-only ATmega328P signature check;
 - `flash-blink` requires a separate opt-in flag and exact device-write/board confirmation;
+- `flash-controller-uno` and `flash-controller-esp32` use separate explicit
+  write gates and exact board/device checks;
+- `flash-controller-uno-diagnostic` emits only the bounded internal-1.1V or
+  internal-ground ADC diagnostic and requires a distinct temporary-write confirmation;
+- `control BOARD PORT status|on|off|toggle|blink|stop|loopback|adc|button|outputs-on|outputs-off|diagnose-inputs ... --confirm-control`
+  performs acknowledged physical operations through the shared controller;
+- `verify-controller-protocol BOARD PORT --confirm-protocol-test`, together
+  with `PB_EMBEDDED_PROTOCOL_VERIFY_ENABLE=1`, runs the bounded corruption,
+  ordering, replay, recovery, safe-state and serial-restoration matrix;
 - `monitor` provides bounded, opt-in serial reads;
-- `verify-esp32-markers` performs bounded H/L alternation and timing evidence
-  collection for the experimental RAM-only image.
+- `verify-esp32-markers` drains bounded USB-UART backlog and performs H/L
+  alternation and timing evidence collection for RAM or persistent boot.
 
-External `avrdude` is currently a fixed flashing transport boundary only. It
-does not compile source. Unsupported boards return explicit incomplete-backend
-results with no C fallback. Full usage and hardware status are documented in
+External `avrdude` remains the fixed UNO flashing transport boundary and does
+not compile source. The classic-ESP32 ROM UART load/flash/reset path is native
+PBLang. Unsupported boards return explicit incomplete-backend results with no
+C fallback. Full usage and hardware status are documented in
 `docs/Embedded_Programming.md`.
