@@ -5,6 +5,7 @@
 let Protocol = import("stdlib:embedded_protocol.sapp");
 let Circuit = import("stdlib:embedded_circuit.sapp");
 let Serial = import("stdlib:linux_serial.sapp");
+let Targets = import("stdlib:embedded_targets.sapp");
 
 let FORMAT = "pblang.embedded-controller.v1";
 let MAX_RETRIES = 3;
@@ -44,6 +45,10 @@ fn _command(sequence, opcode, value = 0, interval_ms = 500, duration_ms = 0) {
 }
 
 fn _local_exchange(session, command) {
+    if session.legacy_silent_capabilities
+       and command.opcode == Protocol.OP_CAPABILITIES {
+        return _error("legacy firmware ignored capability query", "response-timeout");
+    }
     let parsed = Protocol.decode_command(Protocol.encode_command(command));
     let result = Protocol.execute(session.protocol_device, parsed);
     if not result.ok { return result; }
@@ -113,20 +118,29 @@ fn connect(circuit, device_id, options = nil) {
     if device == nil { return _error("unknown circuit device", "unknown-device"); }
     let opts = if options == nil { map{} } else { options };
     if type(opts) != "map" { return _error("controller options must be a map", "invalid-options"); }
+    let board = Targets.board(device.board);
+    if device.mode == "wired" and (board == nil
+       or (try board.controller_protocol catch "") != Protocol.FORMAT) {
+        return _error("target has no verified physical controller protocol", "controller-protocol-unavailable");
+    }
     let timeout = try opts.timeout_ms catch 800;
     let retries = try opts.retries catch 2;
-    let reset_wait = try opts.reset_wait_ms catch if device.board == "arduino-uno" {1600}else{50};
-    let baud = try opts.baud catch 115200;
+    let reset_wait = try opts.reset_wait_ms catch try board.controller_reset_wait_ms catch 0;
+    let baud = try opts.baud catch try board.controller_baud catch 115200;
+    let legacy_silent = try opts.emulate_legacy_silent_capabilities catch false;
     if not _integer(timeout, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
        or not _integer(retries, 1, MAX_RETRIES)
        or not _integer(reset_wait, 0, MAX_RESET_WAIT_MS)
-       or not _integer(baud, 50, 4000000) {
+       or not _integer(baud, 50, 4000000) or type(legacy_silent)!="bool"
+       or (legacy_silent and device.mode!="emulator") {
         return _error("controller timing or baud options are outside limits", "invalid-options");
     }
     let session = map{ok:true, format:FORMAT, circuit:circuit, device_id:device.id,
         board:device.board, mode:device.mode, port:device.port, baud:baud,
         timeout_ms:timeout, retries:retries, sequence:1, connected:false,
-        synchronized:false, closed:false, serial:nil, protocol_device:nil};
+        synchronized:false, capability_bits:0, capability_negotiated:false,
+        legacy_protocol:false,legacy_silent_capabilities:legacy_silent,
+        closed:false, serial:nil, protocol_device:nil};
     if device.mode == "emulator" {
         session.protocol_device = Protocol.new_device(); session.connected = true;
     } else {
@@ -145,6 +159,35 @@ fn connect(circuit, device_id, options = nil) {
     }
     session.synchronized = true; session.sequence = _next(session.sequence);
     session.last_response = hello.response;
+    let capabilities = _exchange(session,
+        _command(session.sequence, Protocol.OP_CAPABILITIES));
+    if capabilities.ok and capabilities.response.status == Protocol.STATUS_OK {
+        session.capability_bits = try capabilities.response.payload0 catch 0;
+        if not _integer(session.capability_bits, 1, 65535) {
+            session.capability_bits = capabilities.response.result_bits;
+        }
+        session.capability_negotiated = true;
+        session.sequence = _next(session.sequence);
+        session.last_response = capabilities.response;
+    } elif capabilities.ok and capabilities.response.status == Protocol.STATUS_INVALID {
+        session.legacy_protocol = true;
+    } elif not capabilities.ok {
+        // Previously deployed AVR firmware silently discarded unknown opcodes.
+        // A bounded status resynchronization distinguishes that behavior from
+        // a dead transport without granting optional capabilities.
+        let legacy_status=_exchange(session,_command(session.sequence,Protocol.OP_STATUS));
+        if legacy_status.ok and legacy_status.response.status==Protocol.STATUS_OK {
+            session.legacy_protocol=true;session.sequence=_next(session.sequence);
+            session.last_response=legacy_status.response;
+        } else {
+            close(session);
+            return _error("capability query and legacy resynchronization failed",
+                "capability-negotiation-failed");
+        }
+    } else {
+        close(session);
+        return _error("device rejected capability negotiation", "capability-negotiation-failed");
+    }
     if session.mode == "wired" { Circuit.observe(circuit, device.id, hello.response); }
     return session;
 }
@@ -158,7 +201,10 @@ fn _send(session, opcode, value = 0, interval_ms = 500, duration_ms = 0) {
         return _error("device rejected command with status " + str(result.response.status), "device-rejected");
     }
     session.sequence = _next(sequence); session.last_response = result.response;
-    result.applied = result.response.status == Protocol.STATUS_OK and opcode != Protocol.OP_STATUS;
+    result.applied = result.response.status == Protocol.STATUS_OK
+        and (opcode == Protocol.OP_SET or opcode == Protocol.OP_TOGGLE
+            or opcode == Protocol.OP_BLINK or opcode == Protocol.OP_STOP
+            or opcode == Protocol.OP_OUTPUT_TEST or opcode == Protocol.OP_ANALOG_FOLLOW);
     return result;
 }
 
@@ -207,6 +253,187 @@ fn set_blink(session, enabled, interval_ms = 500, duration_ms = 0) {
     return _acknowledge(session, pending, exchanged);
 }
 
+fn verify_loopback(session) {
+    if (session.capability_bits & Protocol.CAP_DIGITAL_LOOPBACK) == 0 {
+        return _error("device firmware does not advertise digital loopback", "capability-unavailable");
+    }
+    let exchange = _send(session, Protocol.OP_LOOPBACK);
+    if not exchange.ok { return exchange; }
+    let bits = try exchange.response.result_bits catch 0;
+    exchange.result = map{bits:bits, expected_bits:3,
+        low_phase_ok:(bits & 1) != 0,
+        high_phase_ok:(bits & 2) != 0,
+        pass:bits == 3};
+    if not exchange.result.pass {
+        exchange.ok = false; exchange.code = "loopback-mismatch";
+        exchange.error = "wired digital loopback did not reproduce both LOW and HIGH";
+    }
+    return exchange;
+}
+
+fn read_adc(session) {
+    if (session.capability_bits & Protocol.CAP_ADC_READ) == 0 {
+        return _error("device firmware does not advertise ADC read", "capability-unavailable");
+    }
+    let exchange = _send(session, Protocol.OP_ADC_READ);
+    if not exchange.ok { return exchange; }
+    let raw = try exchange.response.payload0 catch -1;
+    let maximum = try exchange.response.payload1 catch 0;
+    if not _integer(maximum, 1, 65535) or not _integer(raw, 0, maximum) {
+        exchange.ok = false; exchange.code = "adc-invalid-result";
+        exchange.error = "device returned an invalid bounded ADC sample";
+        return exchange;
+    }
+    let calibrated_maximum=maximum;let calibration="converter-range";
+    if session.board=="arduino-uno" {
+        // The shared physical example drives A0 from 3.3 V while AVcc is the
+        // ADC reference. The measured 650 endpoint prevents a dim artificial
+        // ceiling without changing the raw converter result.
+        calibrated_maximum=650;calibration="shared-3v3-potentiometer";
+    }
+    let calibrated_raw=raw;if calibrated_raw>calibrated_maximum{calibrated_raw=calibrated_maximum;}
+    exchange.result = map{raw:raw, maximum:maximum,
+        ratio:raw / maximum, percent:(raw * 100) / maximum,
+        led_ratio:calibrated_raw/calibrated_maximum,
+        led_percent:(calibrated_raw*100)/calibrated_maximum,
+        led_duty:num_floor((calibrated_raw*255)/calibrated_maximum),
+        calibrated_maximum:calibrated_maximum,calibration:calibration};
+    return exchange;
+}
+
+fn set_analog_follow(session, enabled) {
+    if type(enabled)!="bool" {
+        return _error("analog-follow state must be boolean", "invalid-state");
+    }
+    if (session.capability_bits & Protocol.CAP_ANALOG_FOLLOW)==0 {
+        return _error("device firmware does not advertise analog LED following",
+            "capability-unavailable");
+    }
+    let exchange=_send(session,Protocol.OP_ANALOG_FOLLOW,if enabled{1}else{0});
+    if exchange.ok {
+        exchange.result=map{enabled:enabled,
+            input:if session.board=="arduino-uno"{"A0"}else{"GPIO34"},
+            output:if session.board=="arduino-uno"{"D6"}else{"GPIO25"},
+            method:if session.board=="arduino-uno"{"hardware-pwm"}else{"hardware-dac"}};
+    }
+    return exchange;
+}
+
+fn read_button(session) {
+    let exchange = _send(session, Protocol.OP_BUTTON_READ);
+    if not exchange.ok { return exchange; }
+    let bits = try exchange.response.result_bits catch -1;
+    let payload = try exchange.response.payload0 catch -1;
+    if not _integer(bits, 0, 1) or not _integer(payload, 0, 1) or bits != payload {
+        exchange.ok = false; exchange.code = "button-invalid-result";
+        exchange.error = "device returned an inconsistent button sample";
+        return exchange;
+    }
+    let pin = "unknown";
+    if session.board == "arduino-uno" { pin = "D4"; }
+    elif session.board == "esp32-devkitc-v4" { pin = "GPIO27"; }
+    exchange.result = map{pin:pin, active_high:true,
+        electrical_high:bits==1, pressed:bits==1};
+    return exchange;
+}
+
+fn read_gpio_snapshot(session) {
+    if session.board != "esp32-devkitc-v4" {
+        return _error("raw GPIO snapshot is unavailable for this controller backend",
+            "capability-unavailable");
+    }
+    let exchange = _send(session, Protocol.OP_GPIO_SNAPSHOT);
+    if not exchange.ok { return exchange; }
+    let low = try exchange.response.payload0 catch -1;
+    let high = try exchange.response.payload1 catch -1;
+    if not _integer(low, 0, 65535) or not _integer(high, 0, 65535) {
+        exchange.ok = false; exchange.code = "gpio-snapshot-invalid-result";
+        exchange.error = "device returned an invalid bounded GPIO snapshot";
+        return exchange;
+    }
+    let raw = low + high * 65536;
+    let high_pins = []; let pin = 0;
+    while pin < 32 {
+        if (raw & (1 << pin)) != 0 { array_push(high_pins, pin); }
+        pin = pin + 1;
+    }
+    exchange.result = map{register:"GPIO_IN",low16:low,high16:high,raw:raw,
+        high_pins:high_pins,gpio27_high:(raw & 0x08000000)!=0};
+    return exchange;
+}
+
+fn self_test_gpio27(session) {
+    if session.board != "esp32-devkitc-v4" {
+        return _error("GPIO27 self-test is unavailable for this controller backend",
+            "capability-unavailable");
+    }
+    let exchange = _send(session, Protocol.OP_GPIO27_SELF_TEST);
+    if not exchange.ok { return exchange; }
+    let bits = try exchange.response.result_bits catch 0;
+    let electrical = try exchange.response.payload1 catch -1;
+    if not _integer(electrical, 0, 1) {
+        exchange.ok=false;exchange.code="gpio27-self-test-invalid-result";
+        exchange.error="GPIO27 input-only self-test returned an invalid sample";
+        return exchange;
+    }
+    exchange.result = map{pin:"GPIO27",input_only:true,
+        output_disabled:(bits & 1)!=0,input_sampled:(bits & 2)!=0,
+        electrical_high:electrical==1,pass:bits==3,
+        output_disabled_after_test:(bits & 1)!=0};
+    if not exchange.result.pass {
+        exchange.ok=false;exchange.code="gpio27-self-test-failed";
+        exchange.error="GPIO27 output-disable or input-only verification failed";
+    }
+    return exchange;
+}
+
+fn set_test_outputs(session, on) {
+    if type(on) != "bool" {
+        return _error("diagnostic output state must be boolean", "invalid-state");
+    }
+    let exchange = _send(session, Protocol.OP_OUTPUT_TEST, if on {1}else{0});
+    if exchange.ok {
+        exchange.result = map{on:on,
+            main_output:if session.board=="arduino-uno"{"D7"}else{"GPIO23"},
+            loopback_output:if session.board=="arduino-uno"{"D6"}else{"GPIO25"}};
+        exchange.circuit = Circuit.observe(session.circuit, session.device_id, exchange.response);
+    }
+    return exchange;
+}
+
+fn diagnose_inputs(session, samples = 50, interval_ms = 100) {
+    if not _integer(samples, 1, 200) or not _integer(interval_ms, 10, 1000) {
+        return _error("input diagnostic requires 1..200 samples and 10..1000 ms interval",
+            "invalid-diagnostic-bounds");
+    }
+    let adc_min = 65535; let adc_max = 0;
+    let button_low = false; let button_high = false;
+    let button_transitions = 0; let previous_button = -1; let completed = 0;
+    let started = num_floor(now_ms()); let index = 0;
+    while index < samples {
+        let adc = read_adc(session);
+        if not adc.ok { return adc; }
+        let button = read_button(session);
+        if not button.ok { return button; }
+        let raw = adc.result.raw; let pressed = 0;
+        if button.result.pressed { pressed = 1; }
+        if raw < adc_min { adc_min = raw; }
+        if raw > adc_max { adc_max = raw; }
+        if pressed == 0 { button_low = true; }
+        else { button_high = true; }
+        if previous_button >= 0 and previous_button != pressed {
+            button_transitions = button_transitions + 1;
+        }
+        previous_button = pressed; completed = completed + 1; index = index + 1;
+        if index < samples { sleep_ms(interval_ms); }
+    }
+    return map{ok:true,format:FORMAT,samples:completed,interval_ms:interval_ms,
+        elapsed_ms:num_floor(now_ms())-started,
+        adc:map{minimum:adc_min,maximum:adc_max,span:adc_max-adc_min,varied:adc_max>adc_min},
+        button:map{low_seen:button_low,high_seen:button_high,
+            transitions:button_transitions,both_levels_seen:button_low and button_high}};
+}
+
 fn tick(session, elapsed_ms) {
     if session.mode != "emulator" {
         return _error("wired timing is owned by device firmware", "device-owned-time");
@@ -230,4 +457,4 @@ fn close(session) {
 }
 
 export FORMAT, MAX_RETRIES, MAX_RESPONSE_BYTES, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS;
-export limits, connect, status, set_led, toggle_led, set_blink, tick, close;
+export limits, connect, status, set_led, toggle_led, set_blink, verify_loopback, read_adc, set_analog_follow, read_button, read_gpio_snapshot, self_test_gpio27, set_test_outputs, diagnose_inputs, tick, close;

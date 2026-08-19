@@ -1,8 +1,12 @@
-// Bounded live evidence collection for the PBLang-native ESP32 RAM backend.
+// Bounded live evidence collection for the PBLang-native ESP32 RAM and
+// persistent-boot paths.
 
 let Linux = import("stdlib:embedded_linux.sapp");
 let Serial = import("stdlib:linux_serial.sapp");
 let FORMAT = "pblang.embedded-esp32-live-verification.v1";
+let MAX_BOOT_NOISE_BYTES = 4096;
+let MAX_BACKLOG_BYTES = 65536;
+let MIN_MARKER_IDLE_MS = 20;
 
 fn _enabled() { return (try env_get("PB_EMBEDDED_MONITOR_ENABLE") catch "") == "1"; }
 
@@ -11,6 +15,10 @@ fn _candidate(device) {
         if device.candidates[i].board == "esp32-devkitc-v4" { return true; }
     }
     return false;
+}
+fn marker_after_idle(value,idle_ms){
+    return type(value)=="number" and (value==72 or value==76)
+        and type(idle_ms)=="number" and idle_ms>=MIN_MARKER_IDLE_MS and idle_ms<=60000;
 }
 
 fn verify_markers(request) {
@@ -35,23 +43,44 @@ fn verify_markers(request) {
     if not serial.ok { return serial; }
     let flushed = Serial.flush_input(serial);
     if not flushed.ok { Serial.close(serial); return flushed; }
+    let backlog_bytes = 0; let backlog_idle = false; let backlog_error = "";
+    while backlog_bytes < MAX_BACKLOG_BYTES and not backlog_idle and backlog_error == "" {
+        let maximum = 4096;
+        if MAX_BACKLOG_BYTES-backlog_bytes < maximum { maximum=MAX_BACKLOG_BYTES-backlog_bytes; }
+        let part = Serial.read_bytes(serial,maximum,100);
+        if not part.ok { backlog_error=part.error; }
+        elif part.bytes_read==0 { backlog_idle=true; }
+        else { backlog_bytes=backlog_bytes+part.bytes_read; }
+    }
+    if backlog_error!="" or not backlog_idle {
+        Serial.close(serial);
+        return map{ok:false,format:FORMAT,error:if backlog_error!=""{backlog_error}
+            else{"serial marker backlog exceeded bounded drain"},drained_backlog_bytes:backlog_bytes};
+    }
     let markers = []; let intervals = []; let error = ""; let sample_index = 0;
-    let discarded = 0; let phase_started = now_ms();
+    let discarded = 0; let burst_markers = 0; let phase_started = now_ms();
+    let last_byte_at = phase_started;
     while sample_index < samples and error == "" {
         let reading = Serial.read_bytes(serial, 1, expected_ms + tolerance_ms + 1000);
         if not reading.ok or reading.count != 1 { error = "marker read timed out"; }
         else {
-            let value = reading.bytes[0];
+            let value = reading.bytes[0]; let received_at = now_ms();
             if value != 72 and value != 76 {
+                last_byte_at = received_at;
                 discarded = discarded + 1;
-                if discarded > 64 { error = "serial boot noise exceeded limit"; }
-            } else {
+                if discarded > MAX_BOOT_NOISE_BYTES { error = "serial boot noise exceeded limit"; }
+            } elif marker_after_idle(value,received_at-last_byte_at) {
+                last_byte_at = received_at;
                 if len(markers) > 0 and markers[len(markers) - 1] == value {
                     error = "serial markers did not alternate";
                 }
                 array_push(markers, value);
                 array_push(intervals, now_ms() - phase_started);
                 phase_started = now_ms(); sample_index = sample_index + 1;
+            } else {
+                last_byte_at = received_at;
+                discarded = discarded + 1; burst_markers = burst_markers + 1;
+                if discarded > MAX_BOOT_NOISE_BYTES { error = "serial boot noise exceeded limit"; }
             }
         }
     }
@@ -69,7 +98,9 @@ fn verify_markers(request) {
         format:FORMAT,port:inspected.port,samples:len(markers),markers:markers,
         intervals_ms:intervals,expected_ms:expected_ms,tolerance_ms:tolerance_ms,
         alternating:error=="",timing_ok:timing_ok,discarded_boot_bytes:discarded,
+        discarded_burst_markers:burst_markers,minimum_marker_idle_ms:MIN_MARKER_IDLE_MS,
+        drained_backlog_bytes:backlog_bytes,
         termios_restored:closed.termios_restored,error:message};
 }
 
-export FORMAT, verify_markers;
+export FORMAT, MAX_BOOT_NOISE_BYTES, MAX_BACKLOG_BYTES, MIN_MARKER_IDLE_MS, marker_after_idle, verify_markers;

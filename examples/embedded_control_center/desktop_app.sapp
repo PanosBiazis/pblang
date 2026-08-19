@@ -1,0 +1,305 @@
+// Native PBLang desktop application for the shared embedded-control model.
+// Serial identities remain inside this controller and are never persisted.
+
+let UI = import("stdlib:modern_ui.sapp");
+let GUI = import("stdlib:gui.sapp");
+let Linux = import("stdlib:embedded_linux.sapp");
+let Model = import("examples/embedded_control_center/model.sapp");
+let View = import("examples/embedded_control_center/view.sapp");
+
+let FORMAT = "pblang.embedded-control-center.desktop.v1";
+let BOARD_IDS = ["arduino-uno", "esp32-devkitc-v4"];
+let BOARD_NAMES = ["Arduino UNO", "ESP32 DevKitC V4"];
+let MAX_DISCOVERED_PORTS = 16;
+
+fn _bounded_index(value, maximum) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < 0 or value >= maximum { return 0; }
+    return value;
+}
+
+fn _selected(form, name, maximum) {
+    let widget = GUI.get(form, name);
+    if widget == nil { return 0; }
+    return _bounded_index(try widget.selected catch 0, maximum);
+}
+
+fn _board_id(form) { return BOARD_IDS[_selected(form, "board", len(BOARD_IDS))]; }
+
+fn _status(form, message) {
+    GUI.set_prop(form, "connection_status", "text", str(message));
+    return 0;
+}
+
+fn _display_name(device) {
+    let detail = str(try device.model catch "");
+    if detail == "" { detail = str(try device.vendor catch "USB serial device"); }
+    if len(detail) > 42 { detail = str_slice(detail, 0, 42); }
+    return device.port + " - " + detail;
+}
+
+fn _discover(mode) {
+    if mode == "emulator" {
+        return map{ok:true, displays:["Built-in circuit emulator"], values:[""], devices:[]};
+    }
+    let found = Linux.devices(map{include_serial:false});
+    if not found.ok {
+        return map{ok:false, error:found.error,
+            displays:["No wired device available"], values:[""], devices:[]};
+    }
+    let displays = []; let values = []; let devices = [];
+    for device in found.devices {
+        if len(values) < MAX_DISCOVERED_PORTS {
+            array_push(displays, _display_name(device));
+            array_push(values, device.port);
+            array_push(devices, device);
+        }
+    }
+    if len(values) == 0 {
+        return map{ok:true, displays:["No wired device available"], values:[""], devices:[]};
+    }
+    return map{ok:true, displays:displays, values:values, devices:devices};
+}
+
+fn _candidate_matches(device, board) {
+    for candidate in (try device.candidates catch []) {
+        if (try candidate.board catch "") == board { return true; }
+    }
+    return false;
+}
+
+fn _recommended_port(runtime, board) {
+    let fallback = 0;
+    let i = 0;
+    while i < len(runtime.discovery.devices) {
+        let device = runtime.discovery.devices[i];
+        if _candidate_matches(device, board) {
+            if board == "esp32-devkitc-v4" and len(device.candidates) == 1 { return i; }
+            fallback = i;
+            if board == "arduino-uno" { return i; }
+        }
+        i = i + 1;
+    }
+    return fallback;
+}
+
+fn _port(form) {
+    let values = form.desktop_app.discovery.values;
+    if len(values) == 0 { return ""; }
+    return values[_selected(form, "port", len(values))];
+}
+
+fn _disconnect(form, message = "Disconnected") {
+    let runtime = form.desktop_app;
+    if runtime.app != nil {
+        let closed = Model.close(runtime.app);
+        runtime.last_close_ok = try closed.ok catch false;
+    }
+    runtime.app = nil; runtime.connected = false;
+    GUI.set_prop(form, "device_status", "text", BOARD_NAMES[_selected(form,"board",2)] + " - offline");
+    _status(form, message);
+    return map{ok:true, format:FORMAT, connected:false};
+}
+
+fn _result_error(result) {
+    if result == nil { return "No result was returned"; }
+    let message = str(try result.error catch "Device operation failed");
+    let code = str(try result.code catch "");
+    if code != "" { return message + " (" + code + ")"; }
+    return message;
+}
+
+fn _apply_adc(form, result) {
+    let percent = try result.led_percent catch try result.percent catch 0;
+    if type(percent) != "number" { percent = 0; }
+    if percent < 0 { percent = 0; } if percent > 100 { percent = 100; }
+    GUI.set_prop(form, "adc_level", "value", percent / 100);
+    GUI.set_prop(form, "adc_value", "text", "Input " + str(num_floor(percent)) + "%");
+    GUI.set_prop(form, "brightness_level", "value", percent / 100);
+    GUI.set_prop(form, "brightness_value", "text", "LED " + str(num_floor(percent)) + "%");
+    return percent;
+}
+
+fn _apply_telemetry(form, telemetry) {
+    if telemetry == nil or type(telemetry) != "map" { return false; }
+    _apply_adc(form, telemetry.adc);
+    GUI.set_prop(form, "analog_follow", "checked", try telemetry.analog_follow catch true);
+    let state = "off";
+    if try telemetry.blinking catch false { state = "blinking"; }
+    elif try telemetry.on catch false { state = "on"; }
+    let pressed = try telemetry.button.pressed catch false;
+    let button_state = "released";
+    if pressed { button_state = "pressed"; }
+    _status(form, "Connected - LED " + state + ", button " + button_state);
+    return true;
+}
+
+fn _inspector_text(form) {
+    let runtime = form.desktop_app;
+    let lines = [
+        "Board: " + _board_id(form),
+        "Mode: " + runtime.mode,
+        "Port: " + if runtime.mode == "emulator" { "built-in emulator" } else { _port(form) },
+        "Connection: " + if runtime.connected { "connected" } else { "offline" }
+    ];
+    if runtime.app != nil {
+        let snap = Model.snapshot(runtime.app);
+        array_push(lines, "Refresh: " + str(snap.refresh.mode) + " / " + str(snap.refresh.interval_ms) + " ms");
+        array_push(lines, "Polls: " + str(snap.refresh.polls));
+        array_push(lines, "Failures: " + str(snap.refresh.failures));
+        if snap.telemetry != nil {
+            array_push(lines, "ADC raw: " + str(snap.telemetry.adc.raw) + " / " + str(snap.telemetry.adc.maximum));
+            array_push(lines, "LED output: " + str(snap.telemetry.led_percent) + "%");
+            array_push(lines, "Button: " + if snap.telemetry.button.pressed { "pressed" } else { "released" });
+        }
+    }
+    return str_join(lines, "\n");
+}
+
+fn _show_inspector(form) {
+    GUI.set_prop(form, "inspector_output", "value", _inspector_text(form));
+    _status(form, "Inspector updated");
+    return 0;
+}
+
+fn _refresh(form) {
+    if form.desktop_app.app == nil { _status(form, "Connect a board first"); return false; }
+    let result = Model.refresh_now(form.desktop_app.app);
+    if not result.ok { _status(form, _result_error(result)); return false; }
+    _apply_telemetry(form, result.telemetry);
+    return true;
+}
+
+fn _connect(form) {
+    _disconnect(form, "Opening selected device...");
+    let runtime = form.desktop_app;
+    let board = _board_id(form); let port = _port(form);
+    if runtime.mode == "wired" and port == "" {
+        _status(form, "No serial device is selected. Connect it and press Rescan.");
+        return map{ok:false, format:FORMAT, error:"missing port"};
+    }
+    let app = Model.create(map{mode:runtime.mode, board:board, port:port});
+    if not app.ok { _status(form, _result_error(app)); return app; }
+    runtime.app = app; runtime.connected = true;
+    GUI.set_prop(form, "device_status", "text", BOARD_NAMES[_selected(form,"board",2)] + " - connected");
+    _status(form, "Connected to " + if runtime.mode == "emulator" { "emulator" } else { port });
+    _refresh(form);
+    return map{ok:true, format:FORMAT, connected:true, board:board, port:port};
+}
+
+fn _run_command(form, name, options = nil) {
+    let app = form.desktop_app.app;
+    if app == nil { _status(form, "Connect a board first"); return nil; }
+    let result = Model.command(app, name, if options == nil { map{} } else { options });
+    if not result.ok { _status(form, _result_error(result)); return result; }
+    if name == "adc" { _apply_adc(form, result.result); }
+    elif name == "button" {
+        _status(form, "Button is " + if result.result.pressed { "pressed" } else { "released" });
+    } elif name == "loopback" {
+        _status(form, if result.result.pass { "Loopback passed" } else { "Loopback failed" });
+    } else { _status(form, "Command completed: " + name); }
+    return result;
+}
+
+fn _refresh_policy(form) {
+    let index = _selected(form, "refresh_mode", 3);
+    let mode = "manual"; let label = "Manual";
+    if index == 1 { mode = "live"; label = "Live"; }
+    elif index == 2 { mode = "periodic"; label = "Periodic"; }
+    let interval = num_floor(try GUI.get(form,"refresh_interval").value catch 1000);
+    let result = Model.configure_refresh(form.desktop_app.app, mode, interval);
+    if not result.ok { _status(form, _result_error(result)); return result; }
+    let refresh_text = label;
+    if mode != "manual" { refresh_text = refresh_text + " / " + str(interval) + " ms"; }
+    GUI.set_prop(form, "refresh_status", "text", refresh_text);
+    _status(form, "Refresh mode changed to " + mode);
+    return result;
+}
+
+fn _selection_changed(form) {
+    if form.desktop_app.connected { _disconnect(form, "Selection changed. Press Connect when ready."); }
+    let board = _board_id(form);
+    let index = _recommended_port(form.desktop_app, board);
+    GUI.set_prop(form, "port", "selected", index);
+    GUI.set_prop(form, "device_status", "text", BOARD_NAMES[_selected(form,"board",2)] + " - offline");
+    return 0;
+}
+
+fn _rescan(form) {
+    _disconnect(form, "Scanning wired devices...");
+    let discovery = _discover(form.desktop_app.mode);
+    form.desktop_app.discovery = discovery;
+    GUI.set_prop(form, "port", "options", discovery.displays);
+    GUI.set_prop(form, "port", "selected", _recommended_port(form.desktop_app, _board_id(form)));
+    if discovery.ok { _status(form, str(len(discovery.values)) + " device choice(s) available"); }
+    else { _status(form, discovery.error); }
+    return discovery;
+}
+
+fn _tick(form) {
+    let app = form.desktop_app.app;
+    if app == nil { return false; }
+    let result = Model.poll(app);
+    if not result.ok { _status(form, _result_error(result)); return true; }
+    if not result.polled { return false; }
+    return _apply_telemetry(form, result.telemetry);
+}
+
+fn create(options = nil) {
+    let opts = if options == nil { map{} } else { options };
+    let mode = str_lower(str(try opts.mode catch "wired"));
+    if mode != "wired" and mode != "emulator" { throw "desktop mode must be wired or emulator"; }
+    let discovery = _discover(mode);
+    let runtime = map{format:FORMAT, mode:mode, discovery:discovery,
+        app:nil, connected:false, last_close_ok:true};
+    let initial_port = _recommended_port(runtime, "arduino-uno");
+    let handlers = map{
+        connect:fn(form){ _connect(form); },
+        disconnect:fn(form){ _disconnect(form); },
+        rescan:fn(form){ _rescan(form); },
+        board_change:fn(form){ _selection_changed(form); },
+        port_change:fn(form){ if form.desktop_app.connected { _disconnect(form,"Port changed. Press Connect when ready."); } },
+        on:fn(form){ _run_command(form,"on"); },
+        off:fn(form){ _run_command(form,"off"); },
+        toggle:fn(form){ _run_command(form,"toggle"); },
+        blink:fn(form){ _run_command(form,"blink",map{
+            interval_ms:num_floor(GUI.get(form,"interval").value),
+            duration_ms:num_floor(GUI.get(form,"duration").value)}); },
+        stop:fn(form){ _run_command(form,"stop"); },
+        adc:fn(form){ _run_command(form,"adc"); },
+        loopback:fn(form){ _run_command(form,"loopback"); },
+        button:fn(form){ _run_command(form,"button"); },
+        inspector:fn(form){ _show_inspector(form); },
+        follow_change:fn(form){ _run_command(form,"follow",map{enabled:GUI.get(form,"analog_follow").checked}); },
+        refresh_mode_change:fn(form){ if form.desktop_app.app != nil { _refresh_policy(form); } },
+        refresh_now:fn(form){ _refresh(form); }
+    };
+    let view = View.create(map{board:"Arduino UNO", ports:discovery.displays,
+        port_index:initial_port, adc_percent:0, led_percent:0, analog_follow:true}, handlers);
+    let form = UI.build("Embedded Control Center", view, map{
+        target:"desktop", theme:"dark", width:1100, height:820,
+        min_width:320, min_height:480
+    });
+    form.desktop_app = runtime;
+    GUI.set_tick_handler(form, fn(current){ return _tick(current); }, 100);
+    if not discovery.ok { _status(form, discovery.error); }
+    elif mode == "wired" and len(discovery.devices) == 0 {
+        _status(form, "No board found. Connect USB and press Rescan.");
+    } else { _status(form, "Select a board and press Connect."); }
+    return form;
+}
+
+fn run(options = nil) {
+    let form = create(options);
+    GUI.run(form);
+    _disconnect(form, "Application closed");
+    return map{ok:true, format:FORMAT, closed:true, last_close_ok:form.desktop_app.last_close_ok};
+}
+
+fn close(form) {
+    _disconnect(form, "Application closed");
+    GUI.request_close(form);
+    return map{ok:true, format:FORMAT, closed:true, last_close_ok:form.desktop_app.last_close_ok};
+}
+
+export FORMAT, create, run, close;

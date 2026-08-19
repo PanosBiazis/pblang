@@ -385,6 +385,48 @@ fn idle_frame_delay(frame_ms, idle_frames) {
     return delay;
 }
 
+fn idle_event_pump_due(elapsed_ms, interval_ms = 120) {
+    if type(elapsed_ms) != "number" or elapsed_ms < 0 { return false; }
+    if type(interval_ms) != "number" or interval_ms < 16 { interval_ms = 16; }
+    if interval_ms > 1000 { interval_ms = 1000; }
+    return elapsed_ms >= interval_ms;
+}
+
+fn window_size_changed(previous, current) {
+    if previous == nil or current == nil { return true; }
+    let pw = try previous.w catch 0; let ph = try previous.h catch 0;
+    let cw = try current.w catch 0; let ch = try current.h catch 0;
+    return pw != cw or ph != ch;
+}
+
+fn has_resize_event(events) {
+    let i = 0;
+    while i < len(events) {
+        if str(try events[i].type catch "") == "resize" { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Keep one authoritative resize record per frame. Window managers can emit a
+// burst while maximizing, and the native backend can also observe a resize
+// between event polling and presentation. The live size always wins.
+fn coalesce_resize_events(events, live_size, force = false) {
+    let out = [];
+    let saw_resize = false;
+    let i = 0;
+    while i < len(events) {
+        if str(try events[i].type catch "") == "resize" { saw_resize = true; }
+        else { array_push(out, events[i]); }
+        i = i + 1;
+    }
+    let w = try live_size.w catch 0; let h = try live_size.h catch 0;
+    if (force or saw_resize) and type(w) == "number" and type(h) == "number" and w > 0 and h > 0 {
+        array_push(out, map{ type: "resize", w: w, h: h });
+    }
+    return out;
+}
+
 fn run(win, state, updateFn, drawFn, fps) {
     if fps == nil or fps <= 0 { fps = 60; }
     let frameMs = 1000 / fps;
@@ -393,6 +435,10 @@ fn run(win, state, updateFn, drawFn, fps) {
     let idleFrames = 0;
     let maxMs = _env_number("PBLANG_GRAPHICS_MAX_MS", 0);
     let maxFrames = _env_number("PBLANG_GRAPHICS_MAX_FRAMES", 0);
+    let idlePumpMs = _env_number("PBLANG_GRAPHICS_IDLE_PUMP_MS", 120);
+    let knownSize = win.size();
+    let pendingResize = false;
+    let lastPresent = clock();
     while win.isOpen() {
         if maxMs > 0 and (clock() - started) * 1000 >= maxMs {
             win.close();
@@ -404,25 +450,54 @@ fn run(win, state, updateFn, drawFn, fps) {
         }
         let t0 = clock();
         let events = win.pollEvents();
+        let polledSize = win.size();
+        let observedResize = pendingResize or window_size_changed(knownSize, polledSize);
+        events = coalesce_resize_events(events, polledSize, observedResize);
+        let frameResize = observedResize or has_resize_event(events);
+        knownSize = polledSize;
+        pendingResize = false;
         let shouldDraw = true;
         if updateFn != nil {
             let updateResult = updateFn(state, events);
             if updateResult == false { shouldDraw = false; }
         }
-        let shouldPresent = shouldDraw;
+        // A resize invalidates every framebuffer pixel even when an app's
+        // update callback normally skips unchanged frames.
+        if frameResize { shouldDraw = true; }
+        // GUI backends can observe that the window manager already destroyed
+        // the native window. Stop without issuing a second native close.
+        if try state.graphics_stop catch false { break; }
+        let shouldPresent = shouldDraw or idle_event_pump_due((clock() - lastPresent) * 1000, idlePumpMs);
         if shouldDraw and drawFn != nil {
             let drawResult = drawFn(state, win);
             if drawResult == false {
                 shouldPresent = false;
             }
         }
+        // A resize can happen while a large frame is being drawn. gfxsize
+        // synchronizes the native buffer; never present that newly allocated,
+        // not-yet-drawn buffer as a black frame.
+        let drawnSize = win.size();
+        if window_size_changed(knownSize, drawnSize) {
+            knownSize = drawnSize;
+            pendingResize = true;
+            shouldPresent = false;
+        }
         if shouldPresent {
             win.present();
+            lastPresent = clock();
+            // The final race window is inside present itself. Detect a resize
+            // consumed there and force an immediate full redraw next frame.
+            let presentedSize = win.size();
+            if window_size_changed(knownSize, presentedSize) {
+                knownSize = presentedSize;
+                pendingResize = true;
+            }
         }
         if len(events) == 0 and not shouldDraw { idleFrames = idleFrames + 1; }
         else { idleFrames = 0; }
         let elapsedMs = (clock() - t0) * 1000;
-        let waitMs = idle_frame_delay(frameMs, idleFrames);
+        let waitMs = if pendingResize { 0 } else { idle_frame_delay(frameMs, idleFrames) };
         if elapsedMs < waitMs {
             _frame_wait(waitMs - elapsedMs);
         }
@@ -1083,5 +1158,5 @@ export bezier_point, bezier_points, draw_polyline, polygon, bezier, draw_text, d
 export draw_text_aa, text_font_candidates, text_font_path, text_profile, text_render_plan, text_render_status;
 export Window, run, runGameLoop, backend_profile, backend_status, backend_event_status, render_route_plan, render_route_status, cpu_render_status, render_acceleration_plan, render_device_policy, render_device_policy_status, render_startup_profile, render_startup_env_lines, render_startup_profile_status;
 export dirty_region_plan, render_batch_plan, frame_schedule, frame_schedule_status,
-       idle_frame_delay;
+       idle_frame_delay, idle_event_pump_due, window_size_changed, coalesce_resize_events;
 

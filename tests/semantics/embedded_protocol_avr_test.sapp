@@ -1,5 +1,6 @@
 let Firmware = import("stdlib:embedded_protocol_avr.sapp");
 let P = import("stdlib:embedded_protocol.sapp");
+let AVR = import("stdlib:emulator_avr.sapp");
 
 fn command(sequence, opcode, value = 0, interval = 500, duration = 0) {
     return map{sequence:sequence, opcode:opcode, value:value,
@@ -12,6 +13,36 @@ assert(artifact.ok and artifact.persistent_command_loop and artifact.baud == 115
 assert(artifact.bytes < 4096 and not artifact.c_fallback
     and not artifact.assembler_dependency and not artifact.compiler_dependency,
     "compact PBLang-native firmware has no source fallback");
+assert(artifact.button.pin=="D4" and artifact.button.debounce_ticks==12
+    and artifact.button.release_debounce_ticks==12 and artifact.button.symmetric_debounce,
+    "UNO firmware publishes its active-high debounced button contract");
+assert(artifact.analog_follow.enabled_at_boot and artifact.analog_follow.input=="A0"
+    and artifact.analog_follow.output=="D6"
+    and artifact.analog_follow.method=="timer0-fast-pwm"
+    and artifact.analog_follow.calibrated_maximum==650,
+    "UNO firmware publishes calibrated hardware PWM following");
+
+let button_press=AVR.run(artifact.binary,map{instruction_budget:1000000,
+    timer1_tick_every_cycles:100,gpio_inputs:[map{input_data:41,input_bit:4,value:true}],
+    trace_io_addresses:[11],stop_after_events:1});
+assert(button_press.ok and len(button_press.io_events)==1
+    and button_press.io_events[0].bit==7 and button_press.io_events[0].value==1,
+    "one stable D4 press toggles D7 on after bounded debounce");
+
+let bounced_repress=AVR.run(artifact.binary,map{instruction_budget:1000000,
+    timer1_tick_every_cycles:100,
+    gpio_input_events:[
+        map{tick:1,input_data:41,input_bit:4,value:true},
+        map{tick:40,input_data:41,input_bit:4,value:false},
+        map{tick:41,input_data:41,input_bit:4,value:true},
+        map{tick:60,input_data:41,input_bit:4,value:false},
+        map{tick:95,input_data:41,input_bit:4,value:true}],
+    trace_io_addresses:[11],stop_after_events:2});
+let second_event_min=(95+Firmware.BUTTON_DEBOUNCE_TICKS-1)*100;
+assert(bounced_repress.ok and len(bounced_repress.io_events)==2
+    and bounced_repress.io_events[0].value==1 and bounced_repress.io_events[1].value==0
+    and bounced_repress.io_events[1].cycles>=second_event_min,
+    "one-sample release bounce cannot rearm D4 before a fully debounced release");
 
 let set_flow = Firmware.verify([
     command(40, P.OP_STATUS),
@@ -35,4 +66,94 @@ assert(blink_flow.ok and blink_flow.responses[1].blinking
     and blink_flow.responses[1].on and blink_flow.responses[1].interval_ms == 10,
     "bounded blink command reaches firmware state");
 
+let loopback_flow = Firmware.verify([
+    command(1, P.OP_STATUS), command(2, P.OP_CAPABILITIES), command(3, P.OP_LOOPBACK)
+]);
+assert(loopback_flow.ok
+    and loopback_flow.responses[1].result_bits == (P.CAP_DIGITAL_LOOPBACK | P.CAP_ADC_READ)
+    and loopback_flow.responses[2].result_bits == 3,
+    "AVR firmware reads LOW and HIGH through the declared D6 to D2 wire");
+assert(loopback_flow.io_events[len(loopback_flow.io_events)-1].value == 0,
+    "AVR loopback output returns to LOW");
+
+let disconnected=Firmware.verify([
+    command(1,P.OP_STATUS),command(2,P.OP_LOOPBACK)
+],map{gpio_links:[]});
+assert(disconnected.ok and disconnected.responses[1].result_bits!=3,
+    "disconnected loopback fails instead of reporting fabricated success");
+
+let adc_flow=Firmware.verify([
+    command(1,P.OP_STATUS),command(2,P.OP_ADC_READ)
+],map{adc0_value:731});
+assert(adc_flow.ok and adc_flow.responses[1].status==P.STATUS_OK
+    and adc_flow.responses[1].payload0==731 and adc_flow.responses[1].payload1==1023,
+    "AVR firmware performs a modeled ADC0 conversion and publishes its 10-bit range");
+let adc_low=Firmware.verify([command(1,P.OP_STATUS),command(2,P.OP_ADC_READ)],map{adc0_value:0});
+let adc_high=Firmware.verify([command(1,P.OP_STATUS),command(2,P.OP_ADC_READ)],map{adc0_value:1023});
+assert(adc_low.ok and adc_low.responses[1].payload0==0
+    and adc_high.ok and adc_high.responses[1].payload0==1023,
+    "AVR ADC model preserves both converter boundaries");
+let adc_stuck=Firmware.verify([command(1,P.OP_STATUS),command(2,P.OP_ADC_READ)],
+    map{adc_stuck:true,instruction_budget:1000000});
+assert(adc_stuck.ok and adc_stuck.responses[1].status==P.STATUS_INVALID,
+    "AVR ADC timeout fails closed instead of hanging firmware");
+let button_low=Firmware.verify([command(1,P.OP_STATUS),command(2,P.OP_BUTTON_READ)]);
+let button_high=Firmware.verify([command(1,P.OP_STATUS),command(2,P.OP_BUTTON_READ)],
+    map{gpio_inputs:[map{input_data:41,input_bit:4,value:true}]});
+assert(button_low.ok and button_low.responses[1].result_bits==0
+    and button_low.responses[1].payload0==0
+    and button_high.ok and button_high.responses[1].result_bits==1
+    and button_high.responses[1].payload0==1,
+    "AVR button query reports both physical D4 levels without mutating the LED");
+let output_test=Firmware.verify([
+    command(1,P.OP_STATUS),command(2,P.OP_OUTPUT_TEST,1)
+]);
+assert(output_test.ok and output_test.responses[1].status==P.STATUS_OK
+    and output_test.responses[1].on,
+    "AVR diagnostic command holds D7 and D6 HIGH");
+let analog_follow=Firmware.verify([
+    command(1,P.OP_STATUS),command(2,P.OP_ANALOG_FOLLOW,0),
+    command(3,P.OP_ANALOG_FOLLOW,1)
+]);
+assert(analog_follow.ok and analog_follow.responses[1].payload0==0
+    and analog_follow.responses[2].payload0==1,
+    "AVR analog-follow control is ordered and explicitly acknowledged");
+
+let rollover=Firmware.verify([
+    command(255,P.OP_STATUS),command(1,P.OP_STOP)
+]);
+assert(rollover.ok and rollover.responses[1].status==P.STATUS_OK,
+    "AVR firmware accepts sequence one after 255");
+
+let overlap_command=P.encode_command(command(17,P.OP_STATUS));let overlap=[80];
+for overlap_index len(overlap_command){array_push(overlap,overlap_command[overlap_index]);}
+let overlap_result=Firmware.verify_bytes(overlap,1);
+assert(overlap_result.ok and overlap_result.responses[0].sequence==17,
+    "AVR parser retains P when the next byte starts a valid PB frame");
+
+fn mutate(command_value, index, value) {
+    let frame=P.encode_command(command_value);frame[index]=value;let sum=0;
+    let cursor=0;while cursor<11{sum=(sum+frame[cursor])%256;cursor=cursor+1;}
+    frame[11]=sum;return frame;
+}
+let invalid_flow=Firmware.verify_frames([
+    P.encode_command(command(1,P.OP_STATUS)),
+    mutate(command(2,P.OP_STATUS),4,11),
+    mutate(command(2,P.OP_SET,1),5,2),
+    mutate(command(2,P.OP_TOGGLE),6,245),
+    mutate(command(2,P.OP_BLINK,0,10,0),6,0),
+    mutate(command(2,P.OP_BLINK,0,500,60000),8,255),
+    P.encode_command(command(2,P.OP_STOP))
+]);
+assert(invalid_flow.ok and len(invalid_flow.responses)==7,"invalid frames receive bounded responses");
+for invalid_index 5{assert(invalid_flow.responses[invalid_index+1].status==P.STATUS_INVALID,
+    "invalid command is rejected without sequence advance");}
+assert(invalid_flow.responses[6].status==P.STATUS_OK and not invalid_flow.responses[6].on,
+    "valid command applies after invalid frames");
+
 print "embedded_protocol_avr_pass";
+let internal = Firmware.compile(map{adc_source:"internal-1v1"});
+assert(internal.adc.source=="internal-1v1" and internal.adc.channel==14,
+    "AVR diagnostic artifact selects only the bounded internal reference");
+let rejected = try { Firmware.compile(map{adc_source:"unsafe"}); false } catch { true };
+assert(rejected, "unknown AVR ADC mux selections fail closed");
