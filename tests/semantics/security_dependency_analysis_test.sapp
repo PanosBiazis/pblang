@@ -2,8 +2,16 @@ let DEP = import("stdlib:security_dependency_analysis.sapp");
 let TAINT = import("stdlib:security_taint.sapp");
 
 fn fail(message) { throw "FAIL security_dependency_analysis: " + message; }
-fn require(value, message) { if value != true { fail(message); } }
+fn require(value, message) { if not value { fail(message); } }
 fn unique() { return "/tmp/pblang_security_deps_" + str_slice(sha256(str(now_ms()) + str(random_bytes(12))), 0, 20); }
+fn has_finding(findings, wanted) {
+    let i = 0;
+    while i < len(findings) {
+        if findings[i].id == wanted { return true; }
+        i = i + 1;
+    }
+    return false;
+}
 
 let direct = TAINT.analyze(
     "let requested = env_get(\"OUTPUT\");\nfs_write(requested, \"unsafe\");",
@@ -31,6 +39,46 @@ let injected_ffi = TAINT.analyze(
     "injected-ffi.sapp");
 require(injected_ffi.ok and injected_ffi.finding_count == 1,
     "untrusted FFI symbol data remains a native-symbol-injection finding");
+
+let tainted_polyglot = TAINT.analyze(
+    "let IO = import(\"stdlib:interop.sapp\");\n"
+        + "let REG = import(\"stdlib:polyglot_registry.sapp\");\n"
+        + "let source = env_get(\"PLUGIN_SOURCE\");\n"
+        + "IO.run_filter(\"python\", source, nil, 5, map{trusted_source:true});\n"
+        + "IO.call(\"python\", source, [], map{trusted_source:true});\n"
+        + "IO.pipe(\"python\", source, \"python\", source, nil, map{trusted_source:true});\n"
+        + "IO.benchmark_compare(\"python\", source, [], 1, map{trusted_source:true});\n"
+        + "IO.cross_call(\"python\", source, \"python\", \"main\", [], map{trusted_source:true});\n"
+        + "REG.run(\"python\", source, map{trusted_source:true});\n"
+        + "REG.run_with_input(\"python\", source, \"\", map{trusted_source:true});\n"
+        + "REG.compile(\"c\", source, \"out\", map{trusted_source:true,allow_toolchain_effects:true});\n"
+        + "REG.json_bridge(\"python\", source, \"null\", map{trusted_source:true});\n"
+        + "let execute = IO.run_filter;\n"
+        + "execute(\"python\", source, nil, 5, map{trusted_source:true});\n"
+        + "IO?.run_filter(\"python\", source, nil, 5, map{trusted_source:true});\n"
+        + "IO[\"run_filter\"](\"python\", source, nil, 5, map{trusted_source:true});",
+    "tainted-polyglot.sapp");
+require(tainted_polyglot.ok and not tainted_polyglot.passed
+    and tainted_polyglot.finding_count == 13,
+    "direct, optional, indexed and aliased executors retain tainted-source coverage");
+let polyglot_finding_index = 0;
+while polyglot_finding_index < len(tainted_polyglot.findings) {
+    require(tainted_polyglot.findings[polyglot_finding_index].id == "taint.code-injection",
+        "imported executor findings retain the code-injection class");
+    polyglot_finding_index = polyglot_finding_index + 1;
+}
+
+let unrelated_methods = TAINT.analyze(
+    "let object = map{};\nlet source = env_get(\"PLUGIN_SOURCE\");\n"
+        + "object.run_filter(\"python\", source);\nobject.call(\"python\", source);\n"
+        + "object.pipe(\"python\", source, \"python\", source);\n"
+        + "object.benchmark_compare(\"python\", source);\nobject.cross_call(\"python\", source);\n"
+        + "object.run(\"python\", source);\nobject.run_with_input(\"python\", source);\n"
+        + "object.compile(\"c\", source);\nobject.json_bridge(\"python\", source);",
+    "unrelated-methods.sapp");
+require(unrelated_methods.ok and unrelated_methods.passed
+    and unrelated_methods.finding_count == 0,
+    "unrelated objects with matching method names do not become polyglot sinks");
 
 let sanitized = TAINT.analyze(
     "let requested = sanitize_path(env_get(\"OUTPUT\"));\nfs_write(requested, \"safe\");",
@@ -127,6 +175,7 @@ require(fake_suffix.ok and fake_suffix.finding_count == 1,
 let root = unique();
 let main_path = root + "/main.sapp";
 let dep_path = root + "/dep.sapp";
+let nested_path = root + "/nested.sapp";
 fs_mkdirs(root);
 fs_write(main_path,
     "// import(\"ignored.sapp\")\nlet D = import(\"dep.sapp\");\nlet requested = env_get(\"OUTPUT\");\nD.save(requested);");
@@ -148,6 +197,39 @@ require(report.unresolved_count == 0 and report.semantic_complete,
     "comment import is ignored and both modules parse semantically");
 require(report.interprocedural_complete and report.whole_program_linked,
     "dependency-wide interprocedural analysis completes");
+
+fs_write(dep_path, "fn unsafe_bridge() { polyglot_exec(\"python\", \"print(1)\"); }\nexport unsafe_bridge;");
+let raw_dependency = DEP.analyze_entry(main_path, map{
+    project_root: root, security_mode: "protect",
+    security: map{ disabled_rule_ids: ["polyglot.raw-vm-builtin-reference"],
+        allow_high_suppressions: true }
+});
+require(raw_dependency.ok and not raw_dependency.passed
+    and raw_dependency.modules[1].pattern.mandatory_violation_count == 1,
+    "a reachable dependency cannot disable or suppress the raw polyglot invariant");
+fs_write(dep_path,
+    "let Nested = import(\"nested.sapp\");\nfn unsafe_bridge() { return Nested.value(); }\nexport unsafe_bridge;");
+fs_write(nested_path, "gc_collect();\nfn value() { return 1; }\nexport value;");
+let nested_gc_dependency = DEP.analyze_entry(main_path, map{
+    project_root: root, security_mode: "protect",
+    security: map{ disabled_rule_ids: ["runtime.unisolated-host-cycle-gc"],
+        allow_high_suppressions: true }
+});
+require(nested_gc_dependency.ok and not nested_gc_dependency.passed
+    and nested_gc_dependency.graph_complete and nested_gc_dependency.module_count == 3
+    and nested_gc_dependency.mandatory_blocking == 1
+    and has_finding(nested_gc_dependency.findings, "runtime.unisolated-host-cycle-gc"),
+    "a nested dependency cannot disable or suppress the host GC invariant");
+let audited_nested_gc = DEP.analyze_entry(main_path, map{
+    project_root: root, security_mode: "audit",
+    security: map{ disabled_rule_ids: ["runtime.unisolated-host-cycle-gc"],
+        allow_high_suppressions: true }
+});
+require(audited_nested_gc.ok and not audited_nested_gc.passed
+    and audited_nested_gc.mandatory_blocking == 1,
+    "audit mode cannot publish a nested mandatory runtime violation");
+fs_write(dep_path, "fn save(path) { fs_write(path, \"unsafe\"); }\nexport save;");
+try fs_remove(nested_path) catch nil;
 
 let stable = DEP.verify_snapshot(report);
 require(stable.ok and stable.stable and stable.checked == 2, "unchanged graph snapshot verifies");

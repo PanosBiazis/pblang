@@ -1,0 +1,181 @@
+let IO = import("stdlib:interop.sapp");
+let PROCESS = import("stdlib:process.sapp");
+let SERIALIZATION = import("stdlib:serialization.sapp");
+
+fn fail(message) { throw "FAIL interop_security: " + message; }
+fn require(condition, message) { if not condition { fail(message); } }
+fn rejected(result) { return not result.ok and not result.executed; }
+fn failed_attempt(result) { return not result.ok; }
+fn require_pre_spawn_benchmark(result) {
+    require(not result.ok and not result.executed and not result.bounded,
+        "benchmark metadata preserves pre-spawn rejection truthfully");
+}
+fn item_limit_report() {
+    return SERIALIZATION.stringify_safe(map{ a: 1, b: 2, c: 3 }, "json",
+        map{ max_items: 2, max_output_bytes: 1024, max_line_bytes: 1024 });
+}
+
+let TRUSTED = map{ trusted_source: true };
+fn require_execution_denied(options, label) {
+    require(rejected(IO.run_filter("python", "__result__=1", nil, 1, options)),
+        label + " run_filter");
+    require(rejected(IO.call("python", "__result__=1", [], options)), label + " call");
+    require(rejected(IO.pipe("python", "__result__=input_data", "python",
+        "__result__=input_data", nil, options)), label + " pipe");
+    require_pre_spawn_benchmark(IO.benchmark_compare("python", "__result__=1", [], 1, options));
+    require(rejected(IO.cross_call("python", "def main(x): return x", "python",
+        "main", [1], options)), label + " cross_call");
+}
+
+require_execution_denied(nil, "missing trust rejects");
+require_execution_denied(map{ trusted_source: false }, "false trust rejects");
+require_execution_denied(map{ trusted_source: "yes" }, "string trust rejects");
+require_execution_denied(map{ trusted_source: 1 }, "numeric trust rejects");
+let authorized_invalid_timeout = IO.run_filter("python", "__result__=1", nil, 0, TRUSTED);
+require(rejected(authorized_invalid_timeout)
+    and authorized_invalid_timeout.trusted_source_acknowledged
+    and not authorized_invalid_timeout.trusted_source_authorized
+    and authorized_invalid_timeout.trust_is_acknowledgement,
+    "caller trust acknowledgement remains visible without claiming runtime authority");
+
+let hostile = "quote=\" slash=\\ newline=\n control=" + strfromcharcode(1);
+let value = map{ "bad\"key\n": hostile, nested: [true, nil, 7] };
+let encoded = IO.to_json(value);
+let decoded = json_parse(encoded);
+require(decoded["bad\"key\n"] == hostile, "canonical JSON escapes hostile strings and map keys");
+require(IO.to_php(value) == encoded and IO.to_lua(value) == encoded and IO.to_r(value) == encoded,
+    "compatibility serializers publish one canonical data representation");
+require(not IO.format_details().executable_literals, "serialized data is never advertised as executable source");
+
+let parsed_null = IO.parse_from("python", "null");
+require(parsed_null.ok and parsed_null.value == nil and not parsed_null.input_evaluated,
+    "valid JSON null is distinct from parse failure and remains inert");
+let expression = IO.parse_from("python", "__import__('os').system('false')");
+require(rejected(expression), "Python expression input is never evaluated");
+require(not IO.parse_from("unknown", "{}").ok, "unknown parse language fails closed");
+
+let bad_name = IO.cross_call("python", "def safe(x): return x", "python",
+    "safe;raise Exception('injected')", [1], TRUSTED);
+require(rejected(bad_name), "dynamic function-name injection is rejected before execution");
+let bad_pair = IO.cross_call("python", "def main(x): return x", "javascript", "main", [1], TRUSTED);
+require(rejected(bad_pair), "unsupported language pair fails closed");
+let ambient_eval = IO.cross_call("python", "pass", "python", "eval", ["1+1"], TRUSTED);
+require(rejected(ambient_eval), "ambient callable names are not accepted as exported targets");
+
+let too_many = [];
+let i = 0;
+while i < 65 { array_push(too_many, i); i = i + 1; }
+let arg_limit = IO.cross_call("python", "def main(*xs): return len(xs)", "python", "main", too_many, TRUSTED);
+require(rejected(arg_limit), "argument count is bounded before execution");
+let bench_limit = IO.benchmark_compare("python", "__result__=1", [], 21, TRUSTED);
+require(not bench_limit.ok and not bench_limit.executed and bench_limit.attempted == 0,
+    "benchmark iteration limit rejects without spawning a process");
+require_pre_spawn_benchmark(IO.benchmark_compare("unknown", "__result__=1", [], 1, TRUSTED));
+
+let live = PROCESS.bounded_status().available and fs_exists("/usr/bin/python3");
+if live {
+    let call_result = IO.cross_call("python", "def main(a,b): return [a,b]", "python", "main",
+        [hostile, value], TRUSTED);
+    require(call_result.ok and call_result.complete and call_result.bounded,
+        "Python call completes through bounded execution: " + str(call_result));
+    require(call_result.value[0] == hostile and call_result.value[1]["bad\"key\n"] == hostile,
+        "private-stdin arguments preserve hostile data exactly");
+    require(call_result.transport == "private-stdin" and not call_result.input_embedded_in_source
+        and not call_result.shell_used and not call_result.raw_fallback,
+        "live call publishes its security boundary truthfully");
+    require(call_result.memory_limit_enforced and call_result.executable_descriptor_held
+        and call_result.executable_nofollow and not call_result.check_then_exec_race,
+        "live call enforces memory bounds and descriptor-held executable identity");
+    require(call_result.trusted_source_acknowledged and not call_result.trusted_source_authorized
+        and call_result.execution_capability_observed,
+        "live call separates source acknowledgement from observed host execution capability");
+
+    let isolated = IO.run_filter("python",
+        "import sys\n__result__={'isolated':sys.flags.isolated,'no_site':sys.flags.no_site,'path':sys.path}",
+        nil, 3, TRUSTED);
+    require(isolated.ok and isolated.value.isolated == 1 and isolated.value.no_site == 1,
+        "Python interop runs in isolated no-site mode");
+    let path_i = 0;
+    while path_i < len(isolated.value.path) {
+        require(isolated.value.path[path_i] != "", "isolated Python excludes current directory from sys.path");
+        path_i = path_i + 1;
+    }
+
+    let no_args = IO.call("python", "__result__={'ok': True}", [], TRUSTED);
+    require(no_args.ok and no_args.value.ok, "legacy no-argument call uses a bounded JSON result");
+
+    let failed = IO.benchmark_compare("python", "raise Exception('expected')\n__result__=1", [], 2, TRUSTED);
+    require(not failed.ok and not failed.complete and failed.attempted == 1
+        and failed.successes == 0 and failed.failures == 1 and failed.average_ns == 0,
+        "all-failed benchmark cannot claim success or a zero-time successful sample");
+
+    let measured = IO.benchmark_compare("python", "def main(a,b): return a+b", [2, 3], 2, TRUSTED);
+    require(measured.ok and measured.complete and measured.args_used
+        and measured.successes == 2 and not measured.comparison_performed,
+        "bounded benchmark uses arguments and does not claim a PBLang comparison");
+
+    let failed_process = IO.run_filter("python", "raise Exception('expected')\n__result__=1", nil, 2, TRUSTED);
+    require(not failed_process.ok and failed_process.executed and failed_process.bounded,
+        "a started process remains executed when the command exits nonzero");
+    let timed = IO.run_filter("python", "while True: pass\n__result__=1", nil, 1, TRUSTED);
+    require(not timed.ok and timed.executed and timed.timed_out,
+        "nonterminating foreign source is terminated and reported truthfully");
+    let truncated = IO.run_filter("python", "print('x'*1100000)\n__result__=1", nil, 3, TRUSTED);
+    require(not truncated.ok and truncated.executed and truncated.output_truncated,
+        "foreign output is capped and truncation cannot claim success");
+    let near_argv = IO.run_filter("python", "#" + str_repeat("x", 3500) + "\n__result__=1", nil, 3, TRUSTED);
+    require(near_argv.ok and near_argv.bounded,
+        "near-limit source executes without crossing the bounded argv contract: " + str(near_argv));
+
+    let stage_b_rejected = IO.pipe("python", "__result__=input_data", "unknown",
+        "__result__=input_data", 7, TRUSTED);
+    require(not stage_b_rejected.ok and stage_b_rejected.stage == "B"
+        and stage_b_rejected.result_a.ok and stage_b_rejected.executed
+        and stage_b_rejected.result_a.trusted_source_acknowledged
+        and not stage_b_rejected.result_a.trusted_source_authorized
+        and stage_b_rejected.result_b.trusted_source_acknowledged
+        and not stage_b_rejected.result_b.trusted_source_authorized,
+        "pipe reports stage-A execution even when stage B rejects before spawn");
+} else {
+    print "interop_security_python_skip: bounded Python runtime unavailable";
+}
+
+let oversized_source = IO.run_filter("python", str_repeat("x", 3585), nil, 1, TRUSTED);
+require(rejected(oversized_source), "oversized source fails before execution");
+let deep = map{};
+let cursor = deep;
+i = 0;
+while i < 66 {
+    let child = map{};
+    cursor.next = child;
+    cursor = child;
+    i = i + 1;
+}
+let deep_result = try { IO.to_json(deep); map{ ok: true } } catch map{ ok: false };
+require(failed_attempt(deep_result), "deep values fail before JSON construction");
+let huge_key = str_repeat("k", 1048577);
+let huge_map = map{};
+huge_map[huge_key] = 1;
+let huge_key_result = try { IO.to_json(huge_map); map{ ok: true } } catch map{ ok: false };
+require(failed_attempt(huge_key_result), "oversized map keys fail before JSON construction");
+require(not item_limit_report().ok,
+    "map item limits are checked before key materialization");
+let long_scalar = str_repeat("q", 200000);
+let long_encoded = IO.to_json(long_scalar);
+require(len(str_to_bytes(long_encoded)) == 200002,
+    "large scalar estimation remains byte-accurate without character slicing");
+let cyclic = map{};
+cyclic.self = cyclic;
+let cycle_result = try { IO.to_json(cyclic); map{ ok: true } } catch map{ ok: false };
+require(failed_attempt(cycle_result), "cyclic values stop at the depth boundary");
+
+if live and fs_exists("/usr/bin/node") {
+    let piped = IO.pipe("python", "__result__=input_data+1",
+        "javascript", "const __result__=input_data*2;", 10, TRUSTED);
+    require(piped.ok and piped.complete and piped.value_a == 11 and piped.value_b == 22,
+        "cross-runtime pipe exchanges bounded JSON values");
+} else {
+    print "interop_security_node_skip: bounded Node runtime unavailable";
+}
+
+print "interop_security_pass";

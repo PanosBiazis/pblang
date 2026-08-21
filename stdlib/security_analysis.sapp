@@ -3,11 +3,27 @@
 // always retained in the report; high-severity suppressions remain blocking
 // unless the caller explicitly enables them.
 
+let TOKENIZER = import("stdlib:compiler/tokenizer.sapp");
+let SECURE_FILE = import("stdlib:secure_file.sapp");
 let FORMAT = "pblang.security-analysis.v1";
 let MAX_RULES = 128;
 let MAX_FINDINGS = 512;
 let MAX_BLOCK_LINES = 200;
 let MAX_CONFIG_BYTES = 262144;
+let MAX_MANDATORY_FINDINGS = 128;
+
+// These retained VM bootstrap builtins bypass the bounded stdlib polyglot
+// facade. They are reserved identifiers in application source. This invariant
+// is deliberately outside configurable rules and source-level suppressions.
+let RAW_POLYGLOT_BUILTINS = map{
+    "polyglot_exec": true,
+    "polyglot_exec_with_input": true,
+    "polyglot_exec_compiled": true,
+    "polyglot_compile_cached": true,
+    "polyglot_cache_clear": true,
+    "polyglot_cache_info": true,
+    "polyglot_detect": true
+};
 
 fn _defaults() {
     return [
@@ -32,14 +48,16 @@ fn _defaults() {
     ];
 }
 
+fn _valid_id_char(c) {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or
+        (c >= 97 and c <= 122) or c == 45 or c == 46 or c == 95;
+}
+
 fn _valid_id(value) {
     if type(value) != "string" or len(value) < 3 or len(value) > 96 { return false; }
     let i = 0;
     while i < len(value) {
-        let c = strcharcodeat(value, i);
-        let ok = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or
-            (c >= 97 and c <= 122) or c == 45 or c == 46 or c == 95;
-        if not ok { return false; }
+        if not _valid_id_char(strcharcodeat(value, i)) { return false; }
         i = i + 1;
     }
     return true;
@@ -80,26 +98,39 @@ fn _starts_with_at(value, needle, at) {
     return str_slice(value, at, at + len(needle)) == needle;
 }
 
-fn _http_host_boundary(value, at) {
+fn _bytes_start_with_at(value, needle, at) {
+    if at < 0 or at + len(needle) > len(value) { return false; }
+    let i = 0;
+    while i < len(needle) {
+        if value[at + i] != needle[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _http_byte_boundary(value, at) {
     if at >= len(value) { return true; }
-    let c = strcharcodeat(value, at);
+    let c = value[at];
     return c == 34 or c == 39 or c == 47 or c == 58 or c == 63 or c == 35
         or c == 32 or c == 9 or c == 41 or c == 44 or c == 59;
 }
 
 fn _only_literal_loopback_http(line) {
-    let marker = "http://";
+    let value = str_to_bytes(line);
+    let marker = str_to_bytes("http://");
+    let ipv4 = str_to_bytes("127.0.0.1");
+    let localhost = str_to_bytes("localhost");
+    let ipv6 = str_to_bytes("[::1]");
     let offset = 0;
     let matched = false;
-    while offset < len(line) {
-        let relative = str_index_of(str_slice(line, offset, len(line)), marker);
-        if relative < 0 { return matched; }
-        let host_at = offset + relative + len(marker);
+    while offset + len(marker) <= len(value) {
+        if not _bytes_start_with_at(value, marker, offset) { offset = offset + 1; continue; }
+        let host_at = offset + len(marker);
         let host_len = 0;
-        if _starts_with_at(line, "127.0.0.1", host_at) { host_len = 9; }
-        elif _starts_with_at(line, "localhost", host_at) { host_len = 9; }
-        elif _starts_with_at(line, "[::1]", host_at) { host_len = 5; }
-        if host_len == 0 or not _http_host_boundary(line, host_at + host_len) { return false; }
+        if _bytes_start_with_at(value, ipv4, host_at) { host_len = len(ipv4); }
+        elif _bytes_start_with_at(value, localhost, host_at) { host_len = len(localhost); }
+        elif _bytes_start_with_at(value, ipv6, host_at) { host_len = len(ipv6); }
+        if host_len == 0 or not _http_byte_boundary(value, host_at + host_len) { return false; }
         matched = true;
         offset = host_at + host_len;
     }
@@ -128,8 +159,9 @@ fn _configuration_errors(options) {
     }
     let allow_high = try options.allow_high_suppressions catch false;
     if type(allow_high) != "bool" { array_push(errors, "allow_high_suppressions must be boolean"); }
-    let minimum = str_lower(str(try options.minimum_blocking_severity catch "info"));
-    if not _valid_severity(minimum) { array_push(errors, "invalid minimum_blocking_severity"); }
+    if not _valid_severity(str_lower(str(try options.minimum_blocking_severity catch "info"))) {
+        array_push(errors, "invalid minimum_blocking_severity");
+    }
     return errors;
 }
 
@@ -160,18 +192,15 @@ fn rules(options = nil) {
 
 fn load_config(path, max_bytes = 262144) {
     if type(path) != "string" or path == "" or len(path) > 4096
-        or str_contains(path, "\0") or str_contains(path, "\n") or str_contains(path, "\r") {
+        or str_contains(path, strfromcharcode(0)) or str_contains(path, "\n") or str_contains(path, "\r") {
         return map{ ok: false, error: "invalid security config path" };
     }
     if max_bytes < 1 or max_bytes > MAX_CONFIG_BYTES { max_bytes = MAX_CONFIG_BYTES; }
-    let bytes = try fs_read_bytes(path) catch nil;
-    if type(bytes) != "array" { return map{ ok: false, error: "cannot read security config" }; }
-    if len(bytes) > max_bytes { return map{ ok: false, error: "security config exceeds byte limit" }; }
-    let text = try bytes_to_str(bytes) catch nil;
-    if text == nil { return map{ ok: false, error: "security config is not valid UTF-8" }; }
-    let value = try json_parse(text) catch nil;
+    let loaded = SECURE_FILE.read_text(path, max_bytes, false);
+    if not loaded.ok { return map{ ok: false, error: "cannot securely read security config" }; }
+    let value = try json_parse(loaded.text) catch nil;
     if type(value) != "map" { return map{ ok: false, error: "security config must be a JSON object" }; }
-    return map{ ok: true, value: value, bytes: len(bytes) };
+    return map{ ok: true, value: value, bytes: loaded.size, sha256: sha256(loaded.text) };
 }
 
 fn _directive(line, marker, require_reason = true) {
@@ -192,6 +221,88 @@ fn _finding(rule, path, line, suppressed, reason) {
         suppressed: suppressed, suppression_reason: reason };
 }
 
+fn _mandatory_finding(path, token, finding_id, message) {
+    return map{ format: "pblang.security-analysis.finding.v1",
+        id: finding_id, severity: "high",
+        path: path, line: token.line, column: token.col,
+        message: message,
+        builtin: token.text, suppressed: false, suppression_reason: "",
+        mandatory: true, source_suppression_allowed: false };
+}
+
+fn _next_significant(tokens, at) {
+    let i = at + 1;
+    while i < len(tokens) {
+        if tokens[i].kind != "comment" and tokens[i].kind != "eof" { return tokens[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _raw_identifier_is_reference(previous, next) {
+    if previous != nil
+        and ((previous.kind == "punct" and previous.text == ".")
+            or (previous.kind == "operator" and previous.text == "?.")) { return false; }
+    return true;
+}
+
+// Token-based structural scan. Comments and strings are distinct token kinds,
+// whitespace is absent, and exact identifier matching prevents substring
+// ambiguity. A preceding `.` is a member access, not a bare VM builtin lookup.
+fn _scan_mandatory_tokens(tokens, path, lines) {
+    let findings = []; let violation_count = 0; let previous = nil;
+    let directive_comments = map{}; let malformed_directives = [];
+    let complete = true; let i = 0;
+    while i < len(tokens) {
+        let token = tokens[i];
+        if try token.unterminated catch false { complete = false; }
+        if token.kind == "comment" {
+            let source_line = if token.line > 0 and token.line <= len(lines) { lines[token.line - 1] } else { "" };
+            let marker_at = token.col - 1;
+            let line_comment = _starts_with_at(source_line, "//", marker_at);
+            let standalone = line_comment and str_trim(str_slice(source_line, 0, marker_at)) == "";
+            if standalone {
+                directive_comments[str(token.line)] = token.text;
+            } elif str_contains(token.text, "pblang-security-ignore-") {
+                array_push(malformed_directives, map{ line: token.line,
+                    error: "suppression directive must be a standalone // comment" });
+            }
+        } elif token.kind == "ident" and map_has(RAW_POLYGLOT_BUILTINS, token.text)
+            and _raw_identifier_is_reference(previous, _next_significant(tokens, i)) {
+            violation_count = violation_count + 1;
+            if len(findings) < MAX_MANDATORY_FINDINGS {
+                array_push(findings, _mandatory_finding(path, token,
+                    "polyglot.raw-vm-builtin-reference",
+                    "raw VM polyglot builtin is reserved; use stdlib:polyglot.sapp"));
+            }
+        } elif token.kind == "ident" and token.text == "gc_collect"
+            and _raw_identifier_is_reference(previous, _next_significant(tokens, i)) {
+            violation_count = violation_count + 1;
+            if len(findings) < MAX_MANDATORY_FINDINGS {
+                array_push(findings, _mandatory_finding(path, token,
+                    "runtime.unisolated-host-cycle-gc",
+                    "host cycle collection is not isolated across same-thread VMs; use stdlib:runtime_gc.sapp"));
+            }
+        }
+        if token.kind != "comment" and token.kind != "eof" { previous = token; }
+        i = i + 1;
+    }
+    return map{ complete: complete, findings: findings,
+        violation_count: violation_count, retained_count: len(findings),
+        truncated: violation_count > len(findings), directive_comments: directive_comments,
+        malformed_directives: malformed_directives };
+}
+
+fn _mandatory_structure(source, path, lines) {
+    let tokens = try TOKENIZER.tokenize(source) catch nil;
+    if type(tokens) != "array" {
+        return map{ complete: false, findings: [], violation_count: 0,
+            retained_count: 0, truncated: false, directive_comments: map{},
+            malformed_directives: [map{ line: 0, error: "mandatory tokenizer failed" }] };
+    }
+    return _scan_mandatory_tokens(tokens, path, lines);
+}
+
 fn analyze(source, path = "[source]", options = nil) {
     if options == nil { options = map{}; }
     if type(source) != "string" { return map{ ok: false, passed: false, error: "security source must be text" }; }
@@ -205,20 +316,28 @@ fn analyze(source, path = "[source]", options = nil) {
     let configured_ids = []; let configured_i = 0;
     while configured_i < len(configured) { array_push(configured_ids, configured[configured_i].id); configured_i = configured_i + 1; }
     let lines = str_split(source, "\n");
+    let mandatory = _mandatory_structure(source, path, lines);
     let active = map{}; let active_age = map{}; let pending = map{};
-    let findings = []; let suppressions = []; let malformed = [];
-    let high = 0; let medium = 0; let low = 0; let blocking = 0;
+    let findings = []; let mandatory_i = 0;
+    while mandatory_i < len(mandatory.findings) {
+        array_push(findings, mandatory.findings[mandatory_i]); mandatory_i = mandatory_i + 1;
+    }
+    let suppressions = []; let suppression_count = 0; let malformed = mandatory.malformed_directives;
+    let finding_count = mandatory.violation_count;
+    let high = mandatory.violation_count; let medium = 0; let low = 0;
+    let blocking = mandatory.violation_count + (if mandatory.complete { 0 } else { 1 });
     let allow_high = try options.allow_high_suppressions catch false;
     let minimum_blocking = str_lower(str(try options.minimum_blocking_severity catch "info"));
     if not _valid_severity(minimum_blocking) { minimum_blocking = "info"; }
     let i = 0;
-    while i < len(lines) and len(findings) < MAX_FINDINGS {
+    while i < len(lines) {
         let line = lines[i];
+        let directive_line = try mandatory.directive_comments[str(i + 1)] catch "";
         // A next-line suppression is consumed only by the following source line.
         let line_pending = pending; pending = map{};
-        let begin = _directive(line, "pblang-security-ignore-begin:");
-        let next = _directive(line, "pblang-security-ignore-next-line:");
-        let end = _directive(line, "pblang-security-ignore-end:", false);
+        let begin = _directive(directive_line, "pblang-security-ignore-begin:");
+        let next = _directive(directive_line, "pblang-security-ignore-next-line:");
+        let end = _directive(directive_line, "pblang-security-ignore-end:", false);
         let directive_count = 0;
         if begin != nil { directive_count = directive_count + 1; }
         if next != nil { directive_count = directive_count + 1; }
@@ -236,7 +355,7 @@ fn analyze(source, path = "[source]", options = nil) {
         if end != nil and not _contains(configured_ids, end.id) {
             array_push(malformed, map{ line: i + 1, error: "suppression names an unavailable rule", id: end.id }); end = nil;
         }
-        if str_contains(line, "pblang-security-ignore-") and begin == nil and next == nil and end == nil
+        if str_contains(directive_line, "pblang-security-ignore-") and begin == nil and next == nil and end == nil
             and directive_count == 0 {
             array_push(malformed, map{ line: i + 1, error: "malformed suppression directive" });
         }
@@ -268,11 +387,15 @@ fn analyze(source, path = "[source]", options = nil) {
                 elif map_has(line_pending, rule.id) { reason = line_pending[rule.id]; }
                 let suppressed = reason != "";
                 let finding = _finding(rule, path, i + 1, suppressed, reason);
-                array_push(findings, finding);
+                finding_count = finding_count + 1;
+                if len(findings) < MAX_FINDINGS { array_push(findings, finding); }
                 if rule.severity == "high" { high = high + 1; }
                 elif rule.severity == "medium" { medium = medium + 1; }
                 else { low = low + 1; }
-                if suppressed { array_push(suppressions, finding); }
+                if suppressed {
+                    suppression_count = suppression_count + 1;
+                    if len(suppressions) < MAX_FINDINGS { array_push(suppressions, finding); }
+                }
                 let suppression_blocks = suppressed and rule.severity == "high" and not allow_high;
                 let severity_blocks = _severity_rank(rule.severity) >= _severity_rank(minimum_blocking);
                 if severity_blocks and (not suppressed or suppression_blocks) { blocking = blocking + 1; }
@@ -295,11 +418,17 @@ fn analyze(source, path = "[source]", options = nil) {
     blocking = blocking + len(malformed);
     return map{ ok: true, format: FORMAT, passed: blocking == 0, path: path,
         rules: len(configured), lines: len(lines), findings: findings,
-        finding_count: len(findings), high: high, medium: medium, low: low,
+        finding_count: finding_count, high: high, medium: medium, low: low,
         blocking: blocking, suppressions: suppressions, suppression_count: len(suppressions),
         malformed_suppressions: malformed, allow_high_suppressions: allow_high,
         minimum_blocking_severity: minimum_blocking,
-        truncated: len(findings) >= MAX_FINDINGS };
+        mandatory_complete: mandatory.complete,
+        mandatory_blocking: mandatory.violation_count + (if mandatory.complete { 0 } else { 1 }),
+        mandatory_violation_count: mandatory.violation_count,
+        mandatory_retained_count: mandatory.retained_count,
+        mandatory_truncated: mandatory.truncated,
+        suppression_total: suppression_count,
+        truncated: mandatory.truncated or finding_count > len(findings) };
 }
 
 export FORMAT, MAX_CONFIG_BYTES, rules, load_config, analyze;

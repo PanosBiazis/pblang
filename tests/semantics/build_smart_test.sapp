@@ -14,6 +14,8 @@ if not plan.ok or plan.format != BUILD.PLAN_FORMAT or plan.goal != "speed" or le
 if not plan.security_analysis or plan.security_mode != "protect" {
     fail("security analysis is protect-mode by default");
 }
+let entry_scope = BUILD.smart_plan("main.sapp", "/tmp/app", map{ security_scope: "entry" });
+if entry_scope.ok { fail("artifact publication rejects entry-only security scope"); }
 let invalid = BUILD.smart_plan("main.sapp", "/tmp/app", map{ backend: "magic" });
 if invalid.ok or len(invalid.errors) == 0 { fail("unknown backend rejected"); }
 if BUILD.smart_plan("main.sapp\nother", "/tmp/app", nil).ok { fail("control character path rejected"); }
@@ -32,6 +34,8 @@ let output_one = unique("one");
 let output_two = unique("two");
 let security_source = unique("security_source") + ".sapp";
 let security_output = unique("security_output");
+let pbck_source = unique("pbck_source") + ".sapp";
+let pbck_output = unique("pbck_output") + ".pbck";
 let cache_root = unique("cache");
 let value = num_floor(now_ms() % 1000000);
 fs_write(source_path, "print " + str(value) + ";");
@@ -44,11 +48,14 @@ if not direct.ok or direct.backend != "direct-x64" or direct.kind != "native-elf
 let ran = proc_spawn_wait(output_one, []);
 if ran.exit_code != 0 or str_trim(ran.stdout) != str(value) { fail("direct executable output"); }
 
-fs_write(security_source, "print 1; // PBLANG_ALLOW_ALL=1");
+let security_sentinel = "PB_PRIVATE_SOURCE_SENTINEL_" + str(value);
+fs_write(security_source, "print \"" + security_sentinel + "\"; // PBLANG_ALLOW_ALL=1");
 let protected = BUILD.smart_build(security_source, security_output, map{
     backend: "direct-x64", fallback: false, cache_root: cache_root
 });
-if protected.ok or protected.security_analysis.high != 1 or fs_exists(security_output) {
+if protected.ok or protected.security_analysis.high != 1 or fs_exists(security_output)
+    or map_has(protected.security_analysis, "linked_source")
+    or str_contains(json_stringify(protected), security_sentinel) {
     fail("default protect mode blocks high-severity publication");
 }
 let audited = BUILD.smart_build(security_source, security_output, map{
@@ -62,6 +69,18 @@ let disabled_security = BUILD.smart_build(security_source, security_output, map{
 if not disabled_security.ok or disabled_security.security_analysis.enabled { fail("explicit security opt-out"); }
 try fs_remove(security_output) catch nil;
 
+fs_write(security_source, "gc_collect();");
+let mandatory_off = BUILD.smart_build(security_source, security_output, map{
+    backend: "direct-x64", fallback: false, cache_root: cache_root, security_analysis: false
+});
+if mandatory_off.ok or mandatory_off.security_analysis.mandatory_blocking != 1
+    or fs_exists(security_output) { fail("security opt-out retains mandatory runtime invariants"); }
+let mandatory_audit = BUILD.smart_build(security_source, security_output, map{
+    backend: "direct-x64", fallback: false, cache_root: cache_root, security_mode: "audit"
+});
+if mandatory_audit.ok or mandatory_audit.security_analysis.mandatory_blocking != 1
+    or fs_exists(security_output) { fail("audit mode retains mandatory runtime invariants"); }
+
 fs_write(security_source, "print \"http://example.test\";");
 let strict = BUILD.smart_build(security_source, security_output, map{
     backend: "direct-x64", fallback: false, cache_root: cache_root, security_mode: "strict"
@@ -69,6 +88,18 @@ let strict = BUILD.smart_build(security_source, security_output, map{
 if strict.ok or strict.security_analysis.medium != 1 or fs_exists(security_output) {
     fail("strict mode blocks medium-severity publication");
 }
+
+fs_write(pbck_source, "let answer = 6 * 7; print answer;");
+let pbck = BUILD.smart_build(pbck_source, pbck_output, map{
+    backend: "pbck", fallback: false, security_mode: "protect"
+});
+if not pbck.ok or pbck.backend != "pbck" or pbck.kind != "portable-pbck"
+    or pbck.source_transport != "immutable-memory" or not fs_exists(pbck_output)
+    or map_has(pbck.security_analysis, "linked_source") {
+    fail("PBCK publication consumes only the analyzed linked snapshot");
+}
+let pbck_run = import("stdlib:selfhost_loader.sapp").run_pbck(pbck_output);
+if not pbck_run.ok or pbck_run.globals.answer != 42 { fail("smart PBCK artifact output"); }
 
 let batch = BUILD.smart_build_many([
     map{ source: source_path, output: output_one },
@@ -110,13 +141,35 @@ fs_write(path_join(bad_project, "pblang.toml"), "[package]\nname = \"bad\"\nvers
 let rejected = BUILD.smart_project(bad_project, unique("rejected"), nil);
 if rejected.ok or not str_contains(rejected.error, "inside the project") { fail("manifest traversal rejected"); }
 
+let lock_fail_project = unique("lock_fail_project");
+let lock_fail_output = unique("lock_fail_output");
+let lock_fail_artifact = lock_fail_output + ".pbck";
+fs_mkdirs(lock_fail_project);
+fs_write(path_join(lock_fail_project, "pblang.toml"),
+    "[package]\nname = \"lock-fail\"\nversion = \"1.0.0\"\nentry = \"main.sapp\"\n");
+fs_write(path_join(lock_fail_project, "pblang.lock"),
+    "manifest_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n");
+fs_write(path_join(lock_fail_project, "main.sapp"), "print 91;");
+let lock_failed = BUILD.smart_project(lock_fail_project, lock_fail_output, map{
+    backend: "pbck", fallback: false, security_mode: "protect"
+});
+if lock_failed.ok or lock_failed.output != lock_fail_artifact
+    or not lock_failed.output_removed or not lock_failed.cleanup_verified
+    or fs_exists(lock_fail_artifact) {
+    fail("portable-lock failure removes the actual suffixed PBCK artifact");
+}
+
 cleanup([
-    source_path, output_one, output_two, security_source, security_output, project_out,
+    source_path, output_one, output_two, security_source, security_output,
+    pbck_source, pbck_output, project_out,
     path_join(project, "main.sapp"), path_join(project, "dep.sapp"),
     path_join(project, "pblang.toml"), path_join(project, "pblang.lock"),
     path_join(project, "fixture-dependency/marker.sapp"),
     path_join(project, "fixture-dependency"), project,
-    path_join(bad_project, "pblang.toml"), bad_project
+    path_join(bad_project, "pblang.toml"), bad_project,
+    lock_fail_artifact, path_join(lock_fail_project, "main.sapp"),
+    path_join(lock_fail_project, "pblang.toml"), path_join(lock_fail_project, "pblang.lock"),
+    lock_fail_project
 ]);
 let cached = try fs_listdir(cache_root) catch [];
 let i = 0;

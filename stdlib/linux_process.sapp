@@ -9,12 +9,24 @@
 
 let DIRFS = import("stdlib:linux_dirfs.sapp");
 let NATIVE = import("stdlib:linux_pty_supervisor.sapp");
-let Process = import("stdlib:process.sapp");
+let PIDFD = import("stdlib:linux_pidfd.sapp");
 
 let MAX_STARTUP_MS = 5000;
 let MAX_FINISH_MS = 10805000;
 
 fn _error(message) { return map{ ok: false, error: message }; }
+
+fn _run(program, args) {
+    let result = try proc_spawn_wait(program, args) catch nil;
+    if result == nil {
+        return map{ ok: false, exit_code: -1, stdout: "", stderr: "process launch failed" };
+    }
+    let exit_code = try result.exit_code catch 1;
+    return map{ ok: exit_code == 0, exit_code: exit_code,
+        stdout: try result.stdout catch "", stderr: try result.stderr catch "" };
+}
+
+fn _output(program, args) { return str_trim(_run(program, args).stdout); }
 
 fn _integer(value, fallback, minimum, maximum, label) {
     if value == nil { return fallback; }
@@ -51,10 +63,28 @@ fn _write_executable(fs, name, bytes) {
 
 fn _cleanup(state) {
     if state == nil or not is_map(state) or (try state.cleaned catch true) { return false; }
-    let names = ["argv-exec", "supervisor", "group-probe", "group-term", "group-kill",
+    let names = ["argv-exec", "supervisor", "group-probe", "group-term", "group-kill", "group-cont",
+        "session-launcher", "launcher-pid", "launcher-pid.pending",
         "pid", "pid.pending", "status", "status.pending", "stdout", "stderr", "stdin", "input.fifo"];
     for i len(names) { try DIRFS.remove(state.fs, names[i]) catch nil; }
-    DIRFS.close(state.fs); state.cleaned = true; state.active = false;
+    DIRFS.close(state.fs);
+    if (try state.pidfd catch nil) != nil {
+        try PIDFD.close(state.pidfd) catch nil;
+        state.pidfd = nil;
+    }
+    if (try state.held_executable_parent catch nil) != nil {
+        try DIRFS.close_child_descriptor(state.held_executable_parent,
+            state.held_executable_handoff) catch nil;
+        try DIRFS.close(state.held_executable_parent) catch nil;
+        state.held_executable_parent = nil; state.held_executable_handoff = nil;
+    }
+    if (try state.held_input_parent catch nil) != nil {
+        try DIRFS.close_child_descriptor(state.held_input_parent,
+            state.held_input_handoff) catch nil;
+        try DIRFS.close(state.held_input_parent) catch nil;
+        state.held_input_parent = nil; state.held_input_handoff = nil;
+    }
+    state.cleaned = true; state.active = false;
     let parent = DIRFS.open_absolute("/tmp", false, false);
     if parent.ok {
         DIRFS.remove(parent, path_basename(state.root));
@@ -86,22 +116,150 @@ fn _read_output(state, name, budget) {
         utf8: text != nil, source_size: loaded.source_size };
 }
 
-fn _group_alive(state) {
+fn _group_liveness(state) {
     if state == nil or not is_map(state) or (try state.cleaned catch true)
-       or (try state.process_group_id catch 0) <= 1 { return false; }
-    let base = DIRFS.descriptor_path(state.fs); if not base.ok { return false; }
-    return Process.run(base.path + "/group-probe", []).ok;
+       or (try state.process_group_id catch 0) <= 1 {
+        return map{ state: "indeterminate", alive: false, absent: false,
+            error: "process group identity is unavailable" };
+    }
+    let base = DIRFS.descriptor_path(state.fs);
+    if not base.ok {
+        return map{ state: "indeterminate", alive: false, absent: false,
+            error: "process group probe path is unavailable" };
+    }
+    let probe = _run(base.path + "/group-probe", []);
+    if probe.exit_code == 0 {
+        let identity = try state.pidfd catch nil;
+        if identity != nil and not PIDFD.exists(identity) {
+            return map{ state: "indeterminate", alive: false, absent: false,
+                identity_stale: true,
+                error: "process group exists after its held leader identity exited" };
+        }
+        return map{ state: "alive", alive: true, absent: false,
+            race_resistant_identity: identity != nil };
+    }
+    if probe.exit_code == 1 { return map{ state: "absent", alive: false, absent: true }; }
+    return map{ state: "indeterminate", alive: false, absent: false,
+        error: "process group probe could not establish kernel state",
+        probe_exit_code: probe.exit_code };
 }
 
-fn start(program, args, options) {
+fn _signal_group(state, signal_name) {
+    let identity = try state.pidfd catch nil;
+    if identity == nil {
+        return map{ ok: false, signal_sent: false,
+            identity_stale: false,
+            error: "process-group leader identity is unavailable" };
+    }
+    // Pin the exact leader generation while the separate process-group helper
+    // runs. An uncatchable STOP prevents leader exit and numeric PGID reuse
+    // between the pidfd check and kill(2).
+    let stopped = PIDFD.send(identity, "STOP");
+    if not stopped.ok or not PIDFD.exists(identity) {
+        return map{ ok: false, signal_sent: false, identity_stale: true,
+            error: "process-group leader identity cannot be pinned" };
+    }
+    let base = DIRFS.descriptor_path(state.fs);
+    if not base.ok {
+        try PIDFD.send(identity, "CONT") catch nil;
+        return base;
+    }
+    let helper = if signal_name == "TERM" { "group-term" } else { "group-kill" };
+    let sent = _run(base.path + "/" + helper, []);
+    let resumed = nil;
+    if not sent.ok {
+        resumed = try PIDFD.send(identity, "CONT") catch nil;
+    }
+    return map{ ok: sent.ok, signal_sent: sent.ok,
+        leader_pinned_until_kill: sent.ok and signal_name == "TERM",
+        recovery_resume_verified: sent.ok or (resumed != nil and resumed.ok),
+        leader_pinned_during_group_signal: true,
+        race_resistant_identity: true, identity_stale: false };
+}
+
+fn _pidfd_supported() {
+    let current = PIDFD.current_pid();
+    if not (try current.ok catch false) { return false; }
+    let held = PIDFD.open(current.pid);
+    if not (try held.ok catch false) { return false; }
+    return PIDFD.close(held);
+}
+
+fn _adopt_stopped_launcher(state) {
+    let launcher_pid = DIRFS.read_bytes(state.fs, "launcher-pid", 16);
+    let launcher_pid_text = if launcher_pid.ok {
+        try str_trim(bytes_to_str(launcher_pid.bytes)) catch ""
+    } else { "" };
+    let launcher_pgid = try parse_number(launcher_pid_text) catch 0;
+    if len(launcher_pid_text) != 10 or launcher_pgid <= 1 or
+       launcher_pgid > NATIVE.MAX_PROCESS_GROUP_ID {
+        return map{ ok: false, pending: true,
+            error: "session launcher identity publication is not readable yet" };
+    }
+    state.process_group_id = launcher_pgid;
+    let held_pidfd = PIDFD.open(launcher_pgid);
+    if try held_pidfd.ok catch false {
+        state.pidfd = held_pidfd; state.race_resistant_identity = true;
+    } else {
+        state.pidfd = nil; state.race_resistant_identity = false;
+    }
+    let fs = state.fs;
+    let probe = _write_executable(fs, "group-probe", NATIVE.build_group_probe(launcher_pgid));
+    let term = _write_executable(fs, "group-term", NATIVE.build_group_signal(launcher_pgid, "TERM"));
+    let kill = _write_executable(fs, "group-kill", NATIVE.build_group_signal(launcher_pgid, "KILL"));
+    let cont = _write_executable(fs, "group-cont", NATIVE.build_group_signal(launcher_pgid, "CONT"));
+    if not probe.ok or not term.ok or not kill.ok or not cont.ok or
+       ((try state.require_pidfd catch false) and state.pidfd == nil) {
+        let base = DIRFS.descriptor_path(fs);
+        if base.ok and kill.ok { try _run(base.path + "/group-kill", []) catch nil; }
+        let liveness = _group_liveness(state);
+        state.active = not liveness.absent; state.requires_recovery = not liveness.absent;
+        state.launch_identity_pending = false;
+        state.error = "race-resistant process ownership could not be established";
+        if liveness.absent { _cleanup(state); }
+        return map{ ok: false, pending: false, error: state.error };
+    }
+    let resumed = if state.pidfd != nil {
+        PIDFD.send(state.pidfd, "CONT")
+    } else {
+        let base = DIRFS.descriptor_path(fs);
+        if base.ok { _run(base.path + "/group-cont", []) }
+        else { map{ ok: false } }
+    };
+    if not (try resumed.ok catch false) {
+        let base = DIRFS.descriptor_path(fs);
+        if base.ok { try _run(base.path + "/group-kill", []) catch nil; }
+        let liveness = _group_liveness(state);
+        state.active = not liveness.absent; state.requires_recovery = not liveness.absent;
+        state.launch_identity_pending = false;
+        state.error = "stopped process leader could not be resumed";
+        if liveness.absent { _cleanup(state); }
+        return map{ ok: false, pending: false, error: state.error };
+    }
+    state.launch_identity_pending = false;
+    return map{ ok: true, pending: false,
+        race_resistant_identity: state.race_resistant_identity };
+}
+
+fn start_deferred(program, args, options) {
     if platform() != "linux" or not DIRFS.available().ok {
         return _error("Linux directory handles are unavailable");
     }
-    let machine = try Process.output("/usr/bin/uname", ["-m"]) catch "";
+    let machine = try _output("/usr/bin/uname", ["-m"]) catch "";
     if machine != "x86_64" and machine != "amd64" {
         return _error("linux_process currently requires Linux x86-64");
     }
     if type(options) != "map" { throw "linux_process: options must be a map"; }
+    let require_pidfd = try options._require_pidfd catch true;
+    if type(require_pidfd) != "bool" {
+        throw "linux_process: _require_pidfd must be boolean";
+    }
+    if not require_pidfd {
+        return _error("race-resistant pidfd process identity is mandatory");
+    }
+    if not _pidfd_supported() {
+        return _error("race-resistant pidfd process identity is unavailable");
+    }
     let seconds = _integer(try options.timeout_secs catch nil, 30, 1, NATIVE.MAX_SECONDS, "timeout_secs");
     let output_limit = _integer(try options.max_output_bytes catch nil, 1048576,
         1, NATIVE.MAX_OUTPUT_BYTES, "max_output_bytes");
@@ -112,11 +270,21 @@ fn start(program, args, options) {
         memory_limit = _integer(options.max_memory_bytes, nil, 33554432,
             68719476736, "max_memory_bytes");
     }
+    // Keep the default CPU backstop just beyond the requested wall deadline.
+    // Otherwise a CPU-bound child can hit the hard RLIMIT_CPU first and surface
+    // as an ambiguous SIGKILL instead of the supervisor's deterministic 124.
+    let default_cpu_limit = if seconds < NATIVE.MAX_SECONDS { seconds + 1 } else { seconds };
+    let cpu_limit = _integer(try options.max_cpu_seconds catch nil, default_cpu_limit,
+        1, NATIVE.MAX_SECONDS, "max_cpu_seconds");
+    let cpu_limit_explicit = map_has(options, "max_cpu_seconds");
+    let open_file_limit = _integer(try options.max_open_files catch nil, 64,
+        8, NATIVE.MAX_OPEN_FILES, "max_open_files");
+    let process_limit = _integer(try options.max_processes catch nil, 2048,
+        1, NATIVE.MAX_PROCESSES, "max_processes");
     let startup_ms = _integer(try options.startup_timeout_ms catch nil, 3000,
         50, MAX_STARTUP_MS, "startup_timeout_ms");
-    let setsid = _fixed_path(["/usr/bin/setsid", "/bin/setsid"]);
     let mkfifo = _fixed_path(["/usr/bin/mkfifo", "/bin/mkfifo"]);
-    if setsid == "" or mkfifo == "" { return _error("setsid and mkfifo are required"); }
+    if mkfifo == "" { return _error("mkfifo is required"); }
 
     let token = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + str(now_ms())), 0, 32);
     let root = "/tmp/pblang-process-" + token;
@@ -125,10 +293,14 @@ fn start(program, args, options) {
     let state = map{ ok: false, format: "pblang.linux-process.v1", root: root, fs: fs,
         cleaned: false, active: false, started_ms: now_ms(), timeout_secs: seconds,
         max_output_bytes: output_limit, max_file_bytes: file_limit, max_memory_bytes: memory_limit,
-        process_group_id: 0, program: program, args: args };
+        max_cpu_seconds: cpu_limit, cpu_limit_explicit: cpu_limit_explicit,
+        max_open_files: open_file_limit,
+        max_processes: process_limit,
+        process_group_id: 0, program: program, args: args,
+        require_pidfd: require_pidfd, launch_identity_pending: false };
     let base = DIRFS.descriptor_path(fs);
     if not base.ok { _cleanup(state); return base; }
-    let fifo = Process.run(mkfifo, ["-m", "0600", base.path + "/input.fifo"]);
+    let fifo = _run(mkfifo, ["-m", "0600", base.path + "/input.fifo"]);
     if not fifo.ok { _cleanup(state); return _error("private control fifo cannot be created"); }
     let cwd_fd = _integer(try options.cwd_fd catch nil, -1, -1,
         NATIVE.MAX_PROCESS_GROUP_ID, "cwd_fd");
@@ -144,6 +316,22 @@ fn start(program, args, options) {
         if not stdin_handoff.ok { _cleanup(state); return _error("private stdin descriptor is unavailable"); }
         stdin_fd = stdin_handoff.fd;
     }
+    let executable_handoff = nil;
+    let held_parent = try options._held_executable_parent catch nil;
+    let held_executable = try options._held_executable catch nil;
+    if (held_parent == nil) != (held_executable == nil) {
+        if stdin_handoff != nil { DIRFS.close_child_descriptor(fs, stdin_handoff); }
+        _cleanup(state); return _error("prepared executable handoff policy is incomplete");
+    }
+    if held_parent != nil {
+        executable_handoff = DIRFS.duplicate_child_file_descriptor(held_parent,
+            held_executable);
+        if not executable_handoff.ok {
+            if stdin_handoff != nil { DIRFS.close_child_descriptor(fs, stdin_handoff); }
+            _cleanup(state); return executable_handoff;
+        }
+        program = "/proc/self/fd/" + str(executable_handoff.fd);
+    }
     let environment = try options.environment catch map{};
     let inherit_environment = try options.inherit_environment catch false;
     let exec = nil;
@@ -156,10 +344,18 @@ fn start(program, args, options) {
     }
     if exec == nil {
         if stdin_handoff != nil { DIRFS.close_child_descriptor(fs, stdin_handoff); }
+        if executable_handoff != nil {
+            DIRFS.close_child_descriptor(held_parent, executable_handoff);
+        }
         _cleanup(state); return _error("program or argv failed validation");
     }
     let exec_file = _write_executable(fs, "argv-exec", exec);
-    if not exec_file.ok { _cleanup(state); return exec_file; }
+    if not exec_file.ok {
+        if executable_handoff != nil {
+            DIRFS.close_child_descriptor(held_parent, executable_handoff);
+        }
+        _cleanup(state); return exec_file;
+    }
     let supervisor_options = map{
         fifo: base.path + "/input.fifo", pid_file: base.path + "/pid",
         status_file: base.path + "/status", output: base.path + "/stdout",
@@ -167,30 +363,121 @@ fn start(program, args, options) {
         max_seconds: seconds, max_output_bytes: output_limit, max_file_bytes: file_limit
     };
     if memory_limit != nil { supervisor_options.max_memory_bytes = memory_limit; }
+    supervisor_options.max_cpu_seconds = cpu_limit;
+    supervisor_options.max_open_files = open_file_limit;
+    supervisor_options.max_processes = process_limit;
     let supervisor = NATIVE.build(supervisor_options);
     let supervisor_file = _write_executable(fs, "supervisor", supervisor);
-    if not supervisor_file.ok { _cleanup(state); return supervisor_file; }
-    let launched = Process.run(setsid, ["--fork", base.path + "/supervisor"]);
+    if not supervisor_file.ok {
+        if executable_handoff != nil {
+            DIRFS.close_child_descriptor(held_parent, executable_handoff);
+        }
+        _cleanup(state); return supervisor_file;
+    }
+    let session_launcher = try NATIVE.build_session_launcher(
+        base.path + "/supervisor", base.path + "/launcher-pid") catch nil;
+    if type(session_launcher) != "array" {
+        if executable_handoff != nil {
+            DIRFS.close_child_descriptor(held_parent, executable_handoff);
+        }
+        _cleanup(state); return _error("session launcher could not be generated");
+    }
+    let launcher_file = _write_executable(fs, "session-launcher", session_launcher);
+    if not launcher_file.ok {
+        if executable_handoff != nil {
+            DIRFS.close_child_descriptor(held_parent, executable_handoff);
+        }
+        _cleanup(state); return launcher_file;
+    }
+    let launched = _run(base.path + "/session-launcher", []);
     if stdin_handoff != nil { DIRFS.close_child_descriptor(fs, stdin_handoff); }
+    let handoff_closed = true;
+    if executable_handoff != nil {
+        handoff_closed = DIRFS.close_child_descriptor(held_parent, executable_handoff);
+    }
     if not launched.ok { _cleanup(state); return _error("private process group could not start"); }
 
-    let waiter = channel(); let deadline = now_ms() + startup_ms;
-    while not _contains_entry(fs, "pid") and now_ms() < deadline { _sleep(waiter, 5); }
-    if not _contains_entry(fs, "pid") { _cleanup(state); return _error("process supervisor readiness timed out"); }
+    state.active = true; state.startup_pending = true;
+    state.startup_ready = false; state.startup_failed = false;
+    state.startup_deadline_ms = now_ms() + startup_ms;
+    state.deadline_ms = state.started_ms + seconds * 1000 + 2000;
+    if held_executable != nil {
+        state.per_launch_descriptor_duplicate = true;
+        state.parent_handoff_closed = handoff_closed;
+    }
+    state.launch_identity_pending = true;
+    let adopted = _adopt_stopped_launcher(state);
+    if not adopted.ok {
+        state.active = not (try state.cleaned catch false);
+        state.requires_recovery = state.active;
+        state.error = adopted.error;
+        return state;
+    }
+
+    state.ok = true;
+    return state;
+}
+
+fn _startup_failure(state, message) {
+    state.startup_pending = false; state.startup_ready = false;
+    state.startup_failed = true; state.startup_error = message;
+    state.cancel_requested = true; state.cancel_requested_ms = now_ms();
+    state.cancel_grace_ms = 100; state.kill_sent = false;
+    state.term_sent = (try _signal_group(state, "TERM").signal_sent catch false);
+    state.active = true;
+    return map{ ok: true, ready: false, pending: false,
+        failed: true, error: message };
+}
+
+fn _advance_startup(state) {
+    if not (try state.startup_pending catch false) {
+        return map{ ok: true, ready: try state.startup_ready catch false,
+            pending: false, failed: try state.startup_failed catch false,
+            error: try state.startup_error catch nil };
+    }
+    if not _contains_entry(state.fs, "pid") {
+        if now_ms() >= state.startup_deadline_ms {
+            return _startup_failure(state, "process supervisor readiness timed out");
+        }
+        return map{ ok: true, ready: false, pending: true, failed: false };
+    }
+    let fs = state.fs;
     let pid = DIRFS.read_bytes(fs, "pid", 16);
     let pid_text = if pid.ok { try str_trim(bytes_to_str(pid.bytes)) catch "" } else { "" };
     let pgid = try parse_number(pid_text) catch 0;
-    if len(pid_text) != 10 or pgid <= 1 or pgid > NATIVE.MAX_PROCESS_GROUP_ID {
-        _cleanup(state); return _error("process supervisor published an invalid process group");
+    if len(pid_text) != 10 or pgid <= 1 or pgid > NATIVE.MAX_PROCESS_GROUP_ID or
+       pgid != state.process_group_id {
+        return _startup_failure(state,
+            "process supervisor published a mismatched process group");
     }
-    state.process_group_id = pgid;
-    let probe = _write_executable(fs, "group-probe", NATIVE.build_group_probe(pgid));
-    let term = _write_executable(fs, "group-term", NATIVE.build_group_signal(pgid, "TERM"));
-    let kill = _write_executable(fs, "group-kill", NATIVE.build_group_signal(pgid, "KILL"));
-    if not probe.ok or not term.ok or not kill.ok {
-        _cleanup(state); return _error("process lifecycle helpers could not be generated");
+    state.startup_pending = false; state.startup_ready = true;
+    return map{ ok: true, ready: true, pending: false, failed: false };
+}
+
+// Compatibility wrapper for existing callers that require a process which is
+// fully ready when start returns. Event-loop integrations use start_deferred
+// and advance readiness through poll instead.
+fn start(program, args, options) {
+    let state = start_deferred(program, args, options);
+    if not state.ok { return state; }
+    let waiter = channel(); let observed = poll(state);
+    while observed.ok and (try observed.startup_pending catch false) {
+        _sleep(waiter, 5); observed = poll(state);
     }
-    state.ok = true; state.active = true; state.deadline_ms = state.started_ms + seconds * 1000 + 2000;
+    if not observed.ok or (try observed.startup_failed catch false) {
+        let message = try state.startup_error catch "process supervisor startup failed";
+        let terminal_deadline = now_ms() + 1500;
+        while observed.ok and not (try observed.terminated catch false) and
+              now_ms() < terminal_deadline {
+            _sleep(waiter, 5); observed = poll(state);
+        }
+        if observed.ok and (try observed.terminated catch false) {
+            _cleanup(state); return _error(message);
+        }
+        state.ok = false; state.active = true; state.requires_recovery = true;
+        state.error = message + "; process-group termination is indeterminate";
+        return state;
+    }
     return state;
 }
 
@@ -198,62 +485,217 @@ fn poll(state) {
     if state == nil or not is_map(state) or (try state.cleaned catch true) {
         return _error("process state is closed");
     }
+    if try state.launch_identity_pending catch false {
+        let adopted = _adopt_stopped_launcher(state);
+        if not adopted.ok {
+            return map{ ok: true, complete: false,
+                active: try state.active catch true,
+                terminated: try state.cleaned catch false,
+                startup_pending: adopted.pending,
+                startup_failed: not adopted.pending,
+                requires_recovery: true,
+                error: adopted.error, process_group_id: state.process_group_id };
+        }
+        state.ok = true; state.requires_recovery = false;
+    }
+    let startup = _advance_startup(state);
+    if startup.failed {
+        let liveness = _group_liveness(state);
+        if liveness.alive and not (try state.kill_sent catch false) and
+           now_ms() - state.cancel_requested_ms >= state.cancel_grace_ms {
+            state.kill_sent = (try _signal_group(state, "KILL").signal_sent catch false);
+            liveness = _group_liveness(state);
+        }
+        let terminated = liveness.absent;
+        return map{ ok: true, complete: terminated, active: not terminated,
+            terminated: terminated,
+            startup_pending: false, startup_failed: true,
+            liveness: liveness.state,
+            liveness_error: try liveness.error catch nil,
+            error: startup.error, process_group_id: state.process_group_id };
+    }
+    if startup.pending {
+        if try state.cancel_requested catch false {
+            let liveness = _group_liveness(state);
+            if liveness.alive and not (try state.kill_sent catch false) and
+               now_ms() - state.cancel_requested_ms >= state.cancel_grace_ms {
+                state.kill_sent = (try _signal_group(state, "KILL").signal_sent catch false);
+                liveness = _group_liveness(state);
+            }
+            let terminated = liveness.absent;
+            return map{ ok: true, complete: terminated, active: not terminated,
+                terminated: terminated, startup_pending: true,
+                startup_failed: false, cancel_requested: true,
+                term_sent: try state.term_sent catch false,
+                kill_sent: try state.kill_sent catch false,
+                liveness: liveness.state,
+                liveness_error: try liveness.error catch nil,
+                elapsed_ms: now_ms() - state.started_ms,
+                process_group_id: state.process_group_id };
+        }
+        return map{ ok: true, complete: false, active: true, terminated: false,
+            startup_pending: true, startup_failed: false,
+            elapsed_ms: now_ms() - state.started_ms, process_group_id: 0 };
+    }
+    if (try state.cancel_requested catch false) and
+       not (try state.term_sent catch false) {
+        state.term_sent = (try _signal_group(state, "TERM").signal_sent catch false);
+    }
     let complete = _contains_entry(state.fs, "status");
-    return map{ ok: true, complete: complete, active: not complete and _group_alive(state),
+    let alive = not complete;
+    let liveness = nil;
+    if try state.cancel_requested catch false {
+        liveness = _group_liveness(state);
+        // A completed direct child can still leave descendants in its process
+        // group. Cancellation therefore follows group liveness, not status.
+        alive = not liveness.absent;
+    }
+    if (try state.cancel_requested catch false) and alive
+       and not (try state.kill_sent catch false)
+       and now_ms() - state.cancel_requested_ms >= state.cancel_grace_ms {
+        state.kill_sent = (try _signal_group(state, "KILL").signal_sent catch false);
+        liveness = _group_liveness(state); alive = not liveness.absent;
+    }
+    let terminated = (try state.cancel_requested catch false) and
+        liveness != nil and liveness.absent;
+    if terminated {
+        state.cancelled = true;
+        state.cancel_signal = if try state.kill_sent catch false { 9 } else { 15 };
+    }
+    return map{ ok: true, complete: complete, active: alive,
+        cancel_requested: try state.cancel_requested catch false,
+        term_sent: try state.term_sent catch false,
+        kill_sent: try state.kill_sent catch false,
+        terminated: terminated,
+        liveness: if liveness == nil { "not-probed" } else { liveness.state },
+        liveness_error: if liveness == nil { nil } else { try liveness.error catch nil },
         elapsed_ms: now_ms() - state.started_ms, process_group_id: state.process_group_id };
 }
 
-fn cancel(state, grace_ms = 500) {
+fn request_cancel(state, grace_ms = 500) {
     grace_ms = _integer(grace_ms, 500, 0, 10000, "grace_ms");
     if state == nil or not is_map(state) or (try state.cleaned catch true) {
         return _error("process state is closed");
     }
-    let base = DIRFS.descriptor_path(state.fs); if not base.ok { return base; }
-    let term_sent = Process.run(base.path + "/group-term", []).ok;
-    let waiter = channel(); let deadline = now_ms() + grace_ms;
-    while _group_alive(state) and now_ms() < deadline { _sleep(waiter, 5); }
-    let kill_sent = false;
-    if _group_alive(state) { kill_sent = Process.run(base.path + "/group-kill", []).ok; }
-    deadline = now_ms() + 1000;
-    while _group_alive(state) and now_ms() < deadline { _sleep(waiter, 5); }
-    let terminated = not _group_alive(state);
-    if terminated { state.cancelled = true; state.cancel_signal = if kill_sent { 9 } else { 15 }; }
-    return map{ ok: terminated, terminated: terminated, term_sent: term_sent,
-        kill_sent: kill_sent, process_group_id: state.process_group_id };
+    if not (try state.cancel_requested catch false) {
+        let sent = _signal_group(state, "TERM");
+        state.term_sent = try sent.signal_sent catch false;
+        state.cancel_requested = true; state.cancel_requested_ms = now_ms();
+        state.cancel_grace_ms = grace_ms; state.kill_sent = false;
+    }
+    let status = poll(state);
+    return map{ ok: status.ok, requested: true, terminated: status.terminated,
+        term_sent: status.term_sent, kill_sent: status.kill_sent,
+        liveness: try status.liveness catch "indeterminate",
+        liveness_error: try status.liveness_error catch nil,
+        process_group_id: state.process_group_id };
+}
+
+fn cancel(state, grace_ms = 500) {
+    let requested = request_cancel(state, grace_ms);
+    if not requested.ok { return requested; }
+    let waiter = channel(); let deadline = now_ms() + grace_ms + 1000;
+    let status = poll(state);
+    while status.ok and not status.terminated and now_ms() < deadline {
+        _sleep(waiter, 5); status = poll(state);
+    }
+    return map{ ok: status.ok and status.terminated,
+        terminated: try status.terminated catch false,
+        term_sent: try status.term_sent catch false,
+        kill_sent: try status.kill_sent catch false,
+        liveness: try status.liveness catch "indeterminate",
+        liveness_error: try status.liveness_error catch nil,
+        process_group_id: state.process_group_id };
+}
+
+fn _cancelled_finish_result(state) {
+    let signal = try state.cancel_signal catch 15;
+    let elapsed = now_ms() - state.started_ms;
+    let result = map{ ok: true, completed: true, command_ok: false,
+        exit_code: 128 + signal, signal: signal, signaled: true,
+        core_dumped: false, timed_out: false, cancelled: true,
+        status_unavailable_after_cancel: true, stdout: "", stderr: "",
+        stdout_bytes: [], stderr_bytes: [], stdout_utf8: true, stderr_utf8: true,
+        output_truncated: false, returned_output_bytes: 0,
+        max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
+        max_file_bytes: state.max_file_bytes,
+        max_memory_bytes: try state.max_memory_bytes catch nil,
+        memory_limit_enforced: (try state.max_memory_bytes catch nil) != nil,
+        max_cpu_seconds: state.max_cpu_seconds,
+        cpu_limit_explicit: state.cpu_limit_explicit,
+        max_open_files: state.max_open_files,
+        max_processes: state.max_processes,
+        cpu_limit_enforced: true, open_file_limit_enforced: true,
+        process_limit_enforced: true,
+        process_group_id: state.process_group_id, process_group_terminated: true,
+        shell_used: false, argv_encoded: true, private_process_group: true,
+        fixed_candidate: try state.fixed_candidate catch nil,
+        executable_descriptor_held: try state.executable_descriptor_held catch false,
+        executable_nofollow: try state.executable_nofollow catch false,
+        executable_sha256: try state.executable_sha256 catch nil,
+        executable_digest_verified: try state.executable_digest_verified catch false,
+        check_then_exec_race: try state.check_then_exec_race catch nil,
+        filesystem_output_bounded: true,
+        child_file_write_ceiling_bytes: NATIVE.MAX_OUTPUT_BYTES };
+    _cleanup(state); return result;
 }
 
 fn finish(state, wait_ms = nil) {
     if state == nil or not is_map(state) or (try state.cleaned catch true) {
         return _error("process state is closed");
     }
+    if try state.startup_failed catch false {
+        let message = try state.startup_error catch "process supervisor startup failed";
+        let liveness = _group_liveness(state);
+        if not liveness.absent {
+            return map{ ok: false, completed: false, command_ok: false,
+                startup_failed: true, process_group_terminated: false,
+                liveness: liveness.state,
+                liveness_error: try liveness.error catch nil,
+                executable_digest_verified: try state.executable_digest_verified catch false,
+                output_truncated: false, stderr: "", error: message };
+        }
+        _cleanup(state);
+        return map{ ok: false, completed: false, command_ok: false,
+            startup_failed: true, process_group_terminated: true,
+            executable_digest_verified: try state.executable_digest_verified catch false,
+            output_truncated: false, stderr: "", error: message };
+    }
     let maximum = if wait_ms == nil { state.timeout_secs * 1000 + 2500 }
         else { _integer(wait_ms, 0, 0, MAX_FINISH_MS, "wait_ms") };
     let waiter = channel(); let deadline = now_ms() + maximum;
     while not _contains_entry(state.fs, "status") and now_ms() < deadline { _sleep(waiter, 5); }
     if not _contains_entry(state.fs, "status") {
-        if (try state.cancelled catch false) and not _group_alive(state) {
-            let signal = try state.cancel_signal catch 15;
-            let elapsed = now_ms() - state.started_ms;
-            let result = map{ ok: true, completed: true, command_ok: false,
-                exit_code: 128 + signal, signal: signal, signaled: true,
-                core_dumped: false, timed_out: false, cancelled: true,
-                status_unavailable_after_cancel: true, stdout: "", stderr: "",
-                stdout_bytes: [], stderr_bytes: [], stdout_utf8: true, stderr_utf8: true,
-                output_truncated: false, returned_output_bytes: 0,
-                max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
-                max_file_bytes: state.max_file_bytes,
-                max_memory_bytes: try state.max_memory_bytes catch nil,
-                memory_limit_enforced: (try state.max_memory_bytes catch nil) != nil,
-                process_group_id: state.process_group_id, process_group_terminated: true,
-                shell_used: false, argv_encoded: true, private_process_group: true,
-                filesystem_output_bounded: true,
-                child_file_write_ceiling_bytes: NATIVE.MAX_OUTPUT_BYTES };
-            _cleanup(state); return result;
+        let cancelled_liveness = _group_liveness(state);
+        if (try state.cancelled catch false) and cancelled_liveness.absent {
+            return _cancelled_finish_result(state);
         }
         let stopped = cancel(state, 250);
-        _cleanup(state);
+        if try stopped.terminated catch false {
+            state.cancelled = true;
+            state.cancel_signal = if try stopped.kill_sent catch false { 9 } else { 15 };
+            return _cancelled_finish_result(state);
+        }
         return map{ ok: false, timed_out: true, terminated: try stopped.terminated catch false,
+            process_group_terminated: false,
+            cleanup_deferred: not (try stopped.terminated catch false),
+            liveness: try stopped.liveness catch "indeterminate",
             error: "process completion deadline expired" };
+    }
+    let final_liveness = _group_liveness(state);
+    if final_liveness.alive {
+        let quiesce_waiter = channel(); let quiesce_deadline = now_ms() + 250;
+        while final_liveness.alive and now_ms() < quiesce_deadline {
+            _sleep(quiesce_waiter, 5); final_liveness = _group_liveness(state);
+        }
+    }
+    if final_liveness.alive { cancel(state, 250); final_liveness = _group_liveness(state); }
+    if not final_liveness.absent {
+        return map{ ok: false, completed: false, command_ok: false,
+            process_group_terminated: false, cleanup_deferred: true,
+            liveness: final_liveness.state,
+            liveness_error: try final_liveness.error catch nil,
+            error: "process group termination could not be verified" };
     }
     let raw_status = DIRFS.read_bytes(state.fs, "status", 4);
     let decoded = if raw_status.ok { _raw_wait_status(raw_status.bytes) }
@@ -261,8 +703,6 @@ fn finish(state, wait_ms = nil) {
     let stdout = _read_output(state, "stdout", state.max_output_bytes);
     let remaining = state.max_output_bytes - stdout.returned_bytes;
     let stderr = _read_output(state, "stderr", remaining);
-    let alive = _group_alive(state);
-    if alive { cancel(state, 250); }
     let elapsed = now_ms() - state.started_ms;
     let result = map{
         ok: decoded.ok, completed: decoded.ok, command_ok: decoded.ok and decoded.exit_code == 0,
@@ -278,8 +718,25 @@ fn finish(state, wait_ms = nil) {
         max_file_bytes: state.max_file_bytes,
         max_memory_bytes: try state.max_memory_bytes catch nil,
         memory_limit_enforced: (try state.max_memory_bytes catch nil) != nil,
-        process_group_id: state.process_group_id, process_group_terminated: not _group_alive(state),
+        max_cpu_seconds: state.max_cpu_seconds,
+        cpu_limit_explicit: state.cpu_limit_explicit,
+        max_open_files: state.max_open_files,
+        max_processes: state.max_processes,
+        cpu_limit_enforced: true, open_file_limit_enforced: true,
+        process_limit_enforced: true,
+        process_group_id: state.process_group_id, process_group_terminated: true,
+        supervisor_forced_group_teardown: true,
+        background_descendant_output_may_be_truncated: true,
+        power_loss_durable_status: false,
+        cgroup_enforced: false, pid_namespace_enforced: false,
+        detached_descendant_confinement: false,
         shell_used: false, argv_encoded: true, private_process_group: true,
+        fixed_candidate: try state.fixed_candidate catch nil,
+        executable_descriptor_held: try state.executable_descriptor_held catch false,
+        executable_nofollow: try state.executable_nofollow catch false,
+        executable_sha256: try state.executable_sha256 catch nil,
+        executable_digest_verified: try state.executable_digest_verified catch false,
+        check_then_exec_race: try state.check_then_exec_race catch nil,
         filesystem_output_bounded: true,
         child_file_write_ceiling_bytes: NATIVE.MAX_OUTPUT_BYTES
     };
@@ -291,15 +748,12 @@ fn run(program, args, options) {
     return finish(state);
 }
 
-// Execute the first safely opened absolute candidate through its held file
-// descriptor. This removes the exists-then-exec namespace race from optional
-// fixed host adapters while retaining the normal process supervision bounds.
-fn run_fixed(candidates, args, options) {
+fn start_fixed(candidates, args, options) {
     if type(candidates) != "array" or len(candidates) < 1 or len(candidates) > 16 {
         throw "linux_process: candidates must contain 1..16 absolute paths";
     }
     if type(args) != "array" or type(options) != "map" {
-        throw "linux_process: run_fixed requires argv and options";
+        throw "linux_process: start_fixed requires argv and options";
     }
     for i len(candidates) {
         let candidate = candidates[i];
@@ -308,8 +762,7 @@ fn run_fixed(candidates, args, options) {
            or str_contains(candidate, strfromcharcode(0)) {
             throw "linux_process: fixed executable path must be bounded and absolute";
         }
-        let parent_path = path_dirname(candidate);
-        let name = path_basename(candidate);
+        let parent_path = path_dirname(candidate); let name = path_basename(candidate);
         if parent_path == candidate or name == "" or name == "." or name == ".." {
             throw "linux_process: fixed executable path is malformed";
         }
@@ -317,17 +770,18 @@ fn run_fixed(candidates, args, options) {
         if parent.ok {
             let executable = DIRFS.child_file_descriptor(parent, name);
             if executable.ok {
-                let result = run("/proc/self/fd/" + str(executable.fd), args, options);
-                let handoff_closed = DIRFS.close_child_descriptor(parent, executable);
-                let parent_closed = DIRFS.close(parent);
-                if not handoff_closed or not parent_closed {
-                    return _error("held executable cleanup failed");
+                let state = start("/proc/self/fd/" + str(executable.fd), args, options);
+                if state.ok {
+                    state.fixed_candidate = candidate;
+                    state.executable_descriptor_held = true;
+                    state.executable_nofollow = true;
+                    state.check_then_exec_race = false;
+                    state.held_executable_parent = parent;
+                    state.held_executable_handoff = executable;
+                    return state;
                 }
-                result.fixed_candidate = candidate;
-                result.executable_descriptor_held = true;
-                result.executable_nofollow = true;
-                result.check_then_exec_race = false;
-                return result;
+                DIRFS.close_child_descriptor(parent, executable); DIRFS.close(parent);
+                return state;
             }
             DIRFS.close(parent);
         }
@@ -337,21 +791,196 @@ fn run_fixed(candidates, args, options) {
         check_then_exec_race: false };
 }
 
+// Descriptor-bound variant for release artifacts. Verification and exec use
+// the same open file description, eliminating check-then-exec path races.
+fn start_fixed_verified(candidates, expected_sha256, args, options) {
+    if type(candidates) != "array" or len(candidates) < 1 or len(candidates) > 16 {
+        throw "linux_process: candidates must contain 1..16 absolute paths";
+    }
+    if type(expected_sha256) != "string" or
+       not regex_match(expected_sha256, "^[0-9a-f]{64}$") or
+       type(args) != "array" or type(options) != "map" {
+        throw "linux_process: verified fixed launch requires a digest, argv and options";
+    }
+    let maximum = try options.max_executable_bytes catch 268435456;
+    if type(maximum) != "number" or maximum != num_floor(maximum) or
+       maximum < 1 or maximum > 268435456 {
+        throw "linux_process: max_executable_bytes must be in 1..268435456";
+    }
+    let launch_options = map{};
+    for key in map_keys(options) {
+        if key != "max_executable_bytes" { launch_options[key] = options[key]; }
+    }
+    for i len(candidates) {
+        let candidate = candidates[i];
+        if type(candidate) != "string" or len(candidate) < 2 or len(candidate) > 4096
+           or not str_starts_with(candidate, "/") or
+           str_contains(candidate, strfromcharcode(0)) {
+            throw "linux_process: fixed executable path must be bounded and absolute";
+        }
+        let parent_path = path_dirname(candidate); let name = path_basename(candidate);
+        if parent_path == candidate or name == "" or name == "." or name == ".." {
+            throw "linux_process: fixed executable path is malformed";
+        }
+        let parent = DIRFS.open_absolute(parent_path, false, false);
+        if parent.ok {
+            let executable = DIRFS.verified_child_file_descriptor(parent, name,
+                expected_sha256, maximum);
+            if executable.ok {
+                let state = start("/proc/self/fd/" + str(executable.fd), args, launch_options);
+                if state.ok {
+                    state.fixed_candidate = candidate;
+                    state.executable_descriptor_held = true;
+                    state.executable_nofollow = true;
+                    state.executable_sha256 = expected_sha256;
+                    state.executable_digest_verified = true;
+                    state.check_then_exec_race = false;
+                    state.held_executable_parent = parent;
+                    state.held_executable_handoff = executable;
+                    return state;
+                }
+                DIRFS.close_child_descriptor(parent, executable); DIRFS.close(parent);
+                return state;
+            }
+            DIRFS.close(parent);
+        }
+    }
+    return map{ ok: false, error: "no fixed executable matched the verified release digest",
+        candidates_checked: len(candidates), executable_descriptor_held: false,
+        executable_digest_verified: false, check_then_exec_race: false };
+}
+
+// Verify one release executable once and retain the exact open file
+// description for repeated bounded launches. This moves large digest work out
+// of request/event loops without reopening the mutable namespace path.
+fn prepare_fixed_verified(candidates, expected_sha256, max_executable_bytes = 268435456) {
+    if type(candidates) != "array" or len(candidates) < 1 or len(candidates) > 16 or
+       type(expected_sha256) != "string" or
+       not regex_match(expected_sha256, "^[0-9a-f]{64}$") or
+       type(max_executable_bytes) != "number" or
+       max_executable_bytes != num_floor(max_executable_bytes) or
+       max_executable_bytes < 1 or max_executable_bytes > 268435456 {
+        throw "linux_process: prepared verified launch policy is invalid";
+    }
+    for i len(candidates) {
+        let candidate = candidates[i];
+        if type(candidate) != "string" or len(candidate) < 2 or len(candidate) > 4096 or
+           not str_starts_with(candidate, "/") or
+           str_contains(candidate, strfromcharcode(0)) {
+            throw "linux_process: prepared executable path must be bounded and absolute";
+        }
+        let parent_path = path_dirname(candidate); let name = path_basename(candidate);
+        if parent_path == candidate or name == "" or name == "." or name == ".." {
+            throw "linux_process: prepared executable path is malformed";
+        }
+        let parent = DIRFS.open_absolute(parent_path, false, false);
+        if parent.ok {
+            let executable = DIRFS.verified_child_file_descriptor(parent, name,
+                expected_sha256, max_executable_bytes, false);
+            if executable.ok {
+                return map{ ok: true,
+                    format: "pblang.linux-process.prepared-verified.v1",
+                    active: true, parent: parent, executable: executable,
+                    candidate: candidate, sha256: expected_sha256,
+                    size: executable.size, descriptor_bound: true,
+                    nofollow: true, path_reopened: false,
+                    canonical_cloexec: true };
+            }
+            DIRFS.close(parent);
+        }
+    }
+    return map{ ok: false,
+        error: "no fixed executable matched the prepared release digest",
+        candidates_checked: len(candidates), executable_digest_verified: false };
+}
+
+fn start_prepared_verified(prepared, args, options) {
+    if type(prepared) != "map" or
+       (try prepared.format catch "") != "pblang.linux-process.prepared-verified.v1" or
+       not (try prepared.ok catch false) or not (try prepared.active catch false) or
+       type(try prepared.executable catch nil) != "map" or
+       not (try prepared.executable.active catch false) or
+       type(args) != "array" or type(options) != "map" {
+        throw "linux_process: prepared verified descriptor is invalid or closed";
+    }
+    let launch_options = map{};
+    for key in map_keys(options) {
+        if key != "max_executable_bytes" { launch_options[key] = options[key]; }
+    }
+    launch_options._held_executable_parent = prepared.parent;
+    launch_options._held_executable = prepared.executable;
+    let state = start_deferred("/proc/self/fd/deferred", args, launch_options);
+    if state.ok {
+        state.fixed_candidate = prepared.candidate;
+        state.executable_descriptor_held = true;
+        state.executable_nofollow = true;
+        state.executable_sha256 = prepared.sha256;
+        state.executable_digest_verified = true;
+        state.check_then_exec_race = false;
+        state.shared_preverified_descriptor = true;
+        state.per_launch_descriptor_duplicate = true;
+        state.startup_nonblocking = true;
+    }
+    return state;
+}
+
+fn close_prepared_verified(prepared) {
+    if type(prepared) != "map" or
+       (try prepared.format catch "") != "pblang.linux-process.prepared-verified.v1" {
+        return _error("prepared verified descriptor is invalid");
+    }
+    if not (try prepared.active catch false) {
+        return map{ ok: true, closed: true, already_closed: true };
+    }
+    let child_close_ok = try DIRFS.close_child_descriptor(prepared.parent,
+        prepared.executable) catch false;
+    let parent_close_ok = try DIRFS.close(prepared.parent) catch false;
+    prepared.active = false; prepared.close_attempted = true;
+    return map{ ok: child_close_ok and parent_close_ok, closed: true,
+        ownership_consumed: true, retryable: false,
+        child_close_ok: child_close_ok, parent_close_ok: parent_close_ok };
+}
+
+// Execute the first safely opened absolute candidate through its held file
+// descriptor. This removes the exists-then-exec namespace race from optional
+// fixed host adapters while retaining the normal process supervision bounds.
+fn run_fixed(candidates, args, options) {
+    let state = start_fixed(candidates, args, options);
+    if not state.ok { return state; }
+    return finish(state);
+}
+
 fn status() {
-    let machine = try Process.output("/usr/bin/uname", ["-m"]) catch "";
-    let ready = platform() == "linux" and DIRFS.available().ok
+    let machine = try _output("/usr/bin/uname", ["-m"]) catch "";
+    let platform_ready = platform() == "linux" and DIRFS.available().ok
         and (machine == "x86_64" or machine == "amd64");
+    let pidfd_ready = platform_ready and _pidfd_supported();
+    let ready = platform_ready and pidfd_ready;
     return map{ format: "pblang.linux-process.status.v1", available: ready,
         architecture: machine, argv_exec: true, shell_free: true, bounded_output: true,
         timeout: true, descriptor_cwd: true, bounded_stdin: true,
         explicit_environment: true,
         address_space_limit: true, descendant_memory_limit: true,
-        process_group_cancel: true, termination_verified: true,
-        async_lifecycle: true, stdout_stderr_split: true,
+        cpu_time_limit: true, open_file_limit: true, process_count_limit: true,
+        process_group_cancel: pidfd_ready, termination_verified: pidfd_ready,
+        async_lifecycle: pidfd_ready, nonblocking_cancel_request: pidfd_ready,
+        stdout_stderr_split: true,
         fixed_executable_descriptor_handoff: true,
+        async_fixed_executable_descriptor_handoff: true,
+        verified_executable_digest_handoff: true,
+        startup_preverified_descriptor_reuse: true,
+        deferred_startup_polling: true,
+        per_launch_inheritable_descriptor_duplicate: true,
+        status_file_only_normal_polling: true,
+        tri_state_process_group_liveness: true,
+        pidfd_process_identity: pidfd_ready,
+        pidfd_required_for_start: true,
+        stale_process_group_signal_blocked: true,
         output_limit_separate_from_child_files: true,
         child_file_write_ceiling_bytes: NATIVE.MAX_OUTPUT_BYTES,
         configurable_child_file_ceiling: true };
 }
 
-export start, poll, cancel, finish, run, run_fixed, status;
+export start, start_deferred, start_fixed, start_fixed_verified,
+       prepare_fixed_verified, start_prepared_verified, close_prepared_verified,
+       poll, request_cancel, cancel, finish, run, run_fixed, status;

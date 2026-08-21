@@ -1,7 +1,7 @@
 let S = import("stdlib:security_analysis.sapp");
 
 fn fail(message) { throw "FAIL security_analysis: " + message; }
-fn require(value, message) { if value != true { fail(message); } }
+fn require(value, message) { if not value { fail(message); } }
 
 let clean = S.analyze("let url = \"https://example.test\";", "clean.sapp");
 require(clean.ok and clean.passed and clean.finding_count == 0, "clean source passes");
@@ -20,6 +20,112 @@ require(not dynamic_http.passed and dynamic_http.finding_count == 1,
 
 let risky = S.analyze("env_set(\"PBLANG_ALLOW_ALL\", \"1\"); // PBLANG_ALLOW_ALL=1", "risky.sapp");
 require(not risky.passed and risky.high == 1 and risky.blocking == 1, "high capability escalation blocks");
+
+let raw_names = ["polyglot_exec", "polyglot_exec_with_input", "polyglot_exec_compiled",
+    "polyglot_compile_cached", "polyglot_cache_clear", "polyglot_cache_info", "polyglot_detect"];
+let raw_i = 0;
+while raw_i < len(raw_names) {
+    let raw = S.analyze("let alias = (" + raw_names[raw_i] + ");", "raw.sapp",
+        map{ disabled_rule_ids: ["polyglot.raw-vm-builtin-reference"], allow_high_suppressions: true });
+    require(not raw.passed and raw.mandatory_violation_count == 1
+        and raw.findings[0].builtin == raw_names[raw_i]
+        and raw.findings[0].mandatory,
+        "raw polyglot VM identifier is an immutable blocking invariant: " + raw_names[raw_i]);
+    raw_i = raw_i + 1;
+}
+let raw_whitespace = S.analyze("polyglot_exec /* gap */\n (\"python\", \"print(1)\");", "gap.sapp");
+require(not raw_whitespace.passed and raw_whitespace.mandatory_violation_count == 1,
+    "comments and whitespace cannot hide a raw builtin reference");
+let inert_raw = S.analyze(
+    "// polyglot_exec(\"python\", \"ignored\")\n"
+    + "let text = \"polyglot_compile_cached(cached)\";\n"
+    + "POLY.polyglot_exec(\"safe-member\");\n"
+    + "POLY?.polyglot_detect(\"safe-optional-member\");\n"
+    + "let labels = map{\"polyglot_cache_clear\": \"safe-quoted-map-key\"};",
+    "inert.sapp");
+require(inert_raw.passed and inert_raw.mandatory_violation_count == 0,
+    "comments, strings, member calls, and quoted map keys do not impersonate bare VM builtins");
+let leaked_raw_policy = try S.RAW_POLYGLOT_BUILTINS catch nil;
+require(leaked_raw_policy == nil,
+    "the immutable raw-builtin policy is not a caller-mutable module export");
+let raw_map_value = S.analyze("let callbacks = map{alias: polyglot_exec};", "map-value.sapp");
+require(not raw_map_value.passed and raw_map_value.mandatory_violation_count == 1,
+    "a raw builtin stored as a map value remains a blocking callable alias");
+let raw_map_call = S.analyze("let result = map{alias: polyglot_exec(\"x\")};", "map-call.sapp");
+require(not raw_map_call.passed and raw_map_call.mandatory_violation_count == 1,
+    "a raw builtin called directly in a map value remains blocking");
+let raw_colon_receiver = S.analyze("polyglot_exec:invoke();", "colon-receiver.sapp");
+require(not raw_colon_receiver.passed and raw_colon_receiver.mandatory_violation_count == 1,
+    "colon syntax cannot hide a raw builtin receiver");
+let raw_gc = S.analyze("gc_collect();", "raw-gc.sapp",
+    map{ disabled_rule_ids: ["runtime.unisolated-host-cycle-gc"], allow_high_suppressions: true });
+require(not raw_gc.passed and raw_gc.mandatory_violation_count == 1
+    and raw_gc.mandatory_blocking == 1
+    and raw_gc.findings[0].id == "runtime.unisolated-host-cycle-gc",
+    "unisolated host collection is an immutable blocking invariant");
+let raw_gc_alias = S.analyze("let collect_now = gc_collect; collect_now();", "raw-gc-alias.sapp");
+require(not raw_gc_alias.passed and raw_gc_alias.mandatory_violation_count == 1,
+    "aliasing the unisolated collector is blocked");
+let raw_gc_gap = S.analyze("gc_collect /* hidden call */\n ();", "raw-gc-gap.sapp");
+require(not raw_gc_gap.passed and raw_gc_gap.mandatory_violation_count == 1,
+    "comments and whitespace cannot hide host collection");
+let local_gc = S.analyze(
+    "fn gc_collect(g) { return g; }\nlet result = gc_collect(7);",
+    "kernel-gc.sapp");
+require(not local_gc.passed and local_gc.mandatory_violation_count >= 1,
+    "the host builtin name remains reserved even when a declaration follows");
+let renamed_kernel_gc = S.analyze(
+    "fn kernel_gc_collect(g) { return g; }\nlet result = kernel_gc_collect(7);",
+    "renamed-kernel-gc.sapp");
+require(renamed_kernel_gc.passed and renamed_kernel_gc.mandatory_violation_count == 0,
+    "the explicitly named freestanding kernel collector remains valid");
+let nested_gc_declaration = S.analyze(
+    "fn wrapper() { fn gc_collect(g) { return g; } return gc_collect(1); }\ngc_collect();",
+    "nested-gc-declaration.sapp");
+require(not nested_gc_declaration.passed and nested_gc_declaration.mandatory_violation_count >= 1,
+    "a nested collector declaration cannot exempt an outer host call");
+let class_gc_method = S.analyze(
+    "class Collector { fn gc_collect(g) { return g; } }\ngc_collect();",
+    "class-gc-method.sapp");
+require(not class_gc_method.passed and class_gc_method.mandatory_violation_count >= 1,
+    "a class method cannot exempt a module-level host call");
+let member_gc = S.analyze("collector.gc_collect();", "member-gc.sapp");
+require(member_gc.passed and member_gc.mandatory_violation_count == 0,
+    "a member method does not impersonate the host collector");
+let fake_directive = S.analyze(
+    "let text = \"pblang-security-ignore-next-line: capability.allow-all reason=fake string\";\n// PBLANG_ALLOW_ALL=1",
+    "fake-directive.sapp");
+require(not fake_directive.passed and fake_directive.suppression_count == 0,
+    "suppression text inside a string is inert");
+let inline_directive = S.analyze(
+    "let value = 1; // pblang-security-ignore-next-line: capability.allow-all reason=inline bypass\n// PBLANG_ALLOW_ALL=1",
+    "inline-directive.sapp");
+require(not inline_directive.passed and len(inline_directive.malformed_suppressions) == 1,
+    "suppression directives must be standalone comments");
+let flood_lines = []; let flood_i = 0;
+while flood_i < 520 {
+    array_push(flood_lines, "let u" + str(flood_i) + " = \"http://remote.invalid\";\n");
+    flood_i = flood_i + 1;
+}
+array_push(flood_lines, "polyglot_detect();\n");
+let flood = str_join(flood_lines, "");
+let flooded = S.analyze(flood, "flood.sapp", map{ minimum_blocking_severity: "high" });
+require(not flooded.passed and flooded.mandatory_violation_count == 1,
+    "the mandatory decision survives ordinary finding-index exhaustion");
+let configurable_lines = []; let configurable_i = 0;
+while configurable_i < 520 {
+    array_push(configurable_lines, "let u" + str(configurable_i)
+        + " = \"http://remote.invalid\";\n");
+    configurable_i = configurable_i + 1;
+}
+array_push(configurable_lines, "// PBLANG_ALLOW_ALL=1\n");
+let configurable_flood = str_join(configurable_lines, "");
+let configured_flooded = S.analyze(configurable_flood, "configured-flood.sapp",
+    map{ minimum_blocking_severity: "high" });
+require(not configured_flooded.passed and configured_flooded.high == 1
+    and configured_flooded.blocking == 1 and configured_flooded.finding_count == 521
+    and configured_flooded.truncated,
+    "finding storage exhaustion cannot hide a later configurable high finding");
 
 let suppressed_medium = S.analyze(
     "// pblang-security-ignore-next-line: network.plaintext-http reason=isolated remote fixture\nlet url = \"http://fixture.invalid\";",
@@ -55,10 +161,9 @@ let unknown_rule = S.analyze(
 require(not unknown_rule.passed and len(unknown_rule.malformed_suppressions) >= 1,
     "unknown suppression rule fails closed");
 
-let invalid_config = S.analyze("let value = 1;", "config.sapp", map{ custom_rules: [
+require(not S.analyze("let value = 1;", "config.sapp", map{ custom_rules: [
     map{ id: "bad id", severity: "high", needle: "value", message: "invalid id" }
-] });
-require(not invalid_config.ok and not invalid_config.passed,
+]}).ok,
     "invalid custom configuration fails closed");
 
 let custom = S.analyze("unsafe_device_mode();", "custom.sapp", map{ custom_rules: [

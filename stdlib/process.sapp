@@ -2,6 +2,170 @@
 // proc_spawn_wait(cmd, args) returns map{ exit_code, stdout, stderr }. All wrappers
 // require --allow-exec.
 
+let _LINUX_PROCESS = import("stdlib:linux_process.sapp");
+let BOUNDED_HANDLE_FORMAT = "pblang.process.bounded-handle.v1";
+let MAX_BOUNDED_HANDLES = 128;
+let _BOUNDED_HANDLES = map{};
+let BOUNDED_RECOVERY_GRACE_MS = 5000;
+let BOUNDED_TERMINAL_RETENTION_MS = 60000;
+let MAX_BOUNDED_TERMINAL_BYTES = 16777216;
+let BOUNDED_TERMINAL_OVERHEAD_BYTES = 4096;
+
+fn _bounded_token() {
+    for attempt 8 {
+        let id = sha256(base64_encode_bytes(random_bytes(32)) + ":"
+            + str(now_ms()) + ":" + str(attempt));
+        if not map_has(_BOUNDED_HANDLES, id) { return id; }
+    }
+    throw "process: bounded lifecycle identity allocation failed";
+}
+
+fn _reserve_bounded() {
+    if len(map_keys(_BOUNDED_HANDLES)) >= MAX_BOUNDED_HANDLES {
+        throw "process: bounded lifecycle capacity reached";
+    }
+    let id = _bounded_token(); let current = num_floor(now_ms());
+    _BOUNDED_HANDLES[id] = map{ raw: nil, created_ms: current,
+        last_used_ms: current, launching: true, cancel_requested: false,
+        recovery_after_ms: current + BOUNDED_RECOVERY_GRACE_MS };
+    return id;
+}
+
+fn _bounded_state(handle) {
+    if type(handle) != "map"
+       or (try handle.format catch "") != BOUNDED_HANDLE_FORMAT
+       or type(try handle.id catch nil) != "string"
+       or not map_has(_BOUNDED_HANDLES, handle.id) {
+        throw "process: invalid or closed bounded lifecycle handle";
+    }
+    let state = _BOUNDED_HANDLES[handle.id];
+    state.last_used_ms = num_floor(now_ms()); return state;
+}
+
+fn _bounded_poll_view(status) {
+    return map{ format: "pblang.process.bounded-poll.v1",
+        ok: try status.ok catch false,
+        complete: try status.complete catch false,
+        active: try status.active catch false,
+        terminated: try status.terminated catch false,
+        startup_pending: try status.startup_pending catch false,
+        startup_failed: try status.startup_failed catch false,
+        cancel_requested: try status.cancel_requested catch false,
+        term_sent: try status.term_sent catch false,
+        kill_sent: try status.kill_sent catch false,
+        liveness: try status.liveness catch "not-probed",
+        elapsed_ms: try status.elapsed_ms catch 0,
+        race_resistant_identity: try status.race_resistant_identity catch false,
+        raw_state_exposed: false };
+}
+
+fn _bounded_terminal_result(result) {
+    if result == nil { return false; }
+    return (try result.process_group_terminated catch false)
+        or ((try result.terminated catch false)
+            and not (try result.cleanup_deferred catch false));
+}
+
+fn _terminal_result_bytes(result) {
+    let stdout_bytes = try len(str_to_bytes(result.stdout)) catch 0;
+    let stderr_bytes = try len(str_to_bytes(result.stderr)) catch 0;
+    return stdout_bytes + stderr_bytes + BOUNDED_TERMINAL_OVERHEAD_BYTES;
+}
+
+fn _terminal_reservation_bytes(state) {
+    let output = try state.raw.max_output_bytes catch 0;
+    if type(output) != "number" or output < 0 { output = 0; }
+    return output + BOUNDED_TERMINAL_OVERHEAD_BYTES;
+}
+
+fn _terminal_cache_usage(current) {
+    let bytes = 0; let entries = 0; let expired = 0;
+    let ids = map_keys(_BOUNDED_HANDLES);
+    for i len(ids) {
+        let id = ids[i];
+        if map_has(_BOUNDED_HANDLES, id) {
+            let state = _BOUNDED_HANDLES[id];
+            if (try state.terminal_result catch nil) != nil {
+                if current >= (try state.terminal_expires_ms catch 0) {
+                    state.terminal_result = nil; map_remove(_BOUNDED_HANDLES, id);
+                    expired = expired + 1;
+                } else {
+                    bytes = bytes + (try state.terminal_bytes catch 0);
+                    entries = entries + 1;
+                }
+            }
+        }
+    }
+    return map{ bytes: bytes, entries: entries, expired: expired };
+}
+
+fn _cache_terminal(state, result, current) {
+    let bytes = _terminal_result_bytes(result);
+    state.raw = nil; state.terminal_result = result; state.terminal_bytes = bytes;
+    state.terminal_cached_ms = current;
+    state.terminal_expires_ms = current + BOUNDED_TERMINAL_RETENTION_MS;
+    state.launching = false; state.cancel_requested = false;
+    return bytes;
+}
+
+fn maintain_bounded() {
+    let examined = 0; let closed = 0; let recovery_required = 0;
+    let results_cached = 0; let claim_required = 0;
+    let current = num_floor(now_ms());
+    let usage = _terminal_cache_usage(current); let cached_bytes = usage.bytes;
+    let ids = map_keys(_BOUNDED_HANDLES);
+    for i len(ids) {
+        let id = ids[i];
+        if map_has(_BOUNDED_HANDLES, id) {
+            let state = _BOUNDED_HANDLES[id]; examined = examined + 1;
+            if (try state.terminal_result catch nil) != nil {
+                continue;
+            }
+            if not (try state.launching catch false) and state.raw != nil {
+                let observed = try _LINUX_PROCESS.poll(state.raw) catch nil;
+                if observed != nil and (try observed.complete catch false) {
+                    let reservation = _terminal_reservation_bytes(state);
+                    if cached_bytes + reservation <= MAX_BOUNDED_TERMINAL_BYTES {
+                        let result = try _LINUX_PROCESS.finish(state.raw, 0) catch nil;
+                        if _bounded_terminal_result(result) {
+                            cached_bytes = cached_bytes + _cache_terminal(state, result, current);
+                            closed = closed + 1; results_cached = results_cached + 1;
+                        }
+                    } else {
+                        claim_required = claim_required + 1;
+                    }
+                }
+                if state.raw != nil and current >= state.recovery_after_ms {
+                    if not (try state.cancel_requested catch false) {
+                        let requested = try _LINUX_PROCESS.request_cancel(state.raw, 250) catch nil;
+                        state.cancel_requested = requested != nil;
+                    }
+                    let reservation = _terminal_reservation_bytes(state);
+                    if cached_bytes + reservation <= MAX_BOUNDED_TERMINAL_BYTES {
+                        let result = try _LINUX_PROCESS.finish(state.raw, 0) catch nil;
+                        if _bounded_terminal_result(result) {
+                            cached_bytes = cached_bytes + _cache_terminal(state, result, current);
+                            closed = closed + 1; results_cached = results_cached + 1;
+                        } else { recovery_required = recovery_required + 1; }
+                    } else {
+                        claim_required = claim_required + 1;
+                        recovery_required = recovery_required + 1;
+                    }
+                }
+            }
+        }
+    }
+    return map{ format: "pblang.process.bounded-maintenance.v1",
+        examined: examined, closed: closed,
+        active: len(map_keys(_BOUNDED_HANDLES)),
+        terminal_cached: usage.entries + results_cached,
+        terminal_expired: usage.expired, terminal_cached_bytes: cached_bytes,
+        terminal_cache_limit_bytes: MAX_BOUNDED_TERMINAL_BYTES,
+        results_cached: results_cached, claim_required: claim_required,
+        recovery_required: recovery_required,
+        raw_state_exposed: false };
+}
+
 fn spawn_wait(cmd, args) {
     return proc_spawn_wait(cmd, args);
 }
@@ -41,4 +205,164 @@ fn which(cmd) {
     return out;
 }
 
+// Portable facade for process implementations that provide actual lifecycle
+// and resource bounds. Unsupported platforms fail closed and never fall back to
+// proc_spawn_wait implicitly.
+fn bounded_status() {
+    if platform() != "linux" {
+        return map{ format: "pblang.process.bounded-status.v1", available: false,
+            platform: platform(), backend: "unsupported", raw_fallback: false,
+            reason: "no bounded process backend is available for this platform" };
+    }
+    let status = try _LINUX_PROCESS.status() catch nil;
+    if status == nil or not (try status.available catch false) {
+        return map{ format: "pblang.process.bounded-status.v1", available: false,
+            platform: platform(), backend: "unavailable", raw_fallback: false,
+            reason: "the platform process backend is not ready", detail: status };
+    }
+    return map{ format: "pblang.process.bounded-status.v1", available: true,
+        platform: platform(), backend: "linux-process", raw_fallback: false,
+        capabilities: status };
+}
+
+fn _bounded_unavailable() {
+    let status = bounded_status();
+    return map{ ok: false, command_ok: false, exit_code: -1, stdout: "", stderr: "",
+        error: status.reason, unsupported: true, bounded: false,
+        raw_fallback: false, process_status: status };
+}
+
+fn run_bounded(program, args, options) {
+    if type(program) != "string" or type(args) != "array" or type(options) != "map" {
+        throw "process.run_bounded requires a program, argv array, and options map";
+    }
+    if not bounded_status().available { return _bounded_unavailable(); }
+    let result = _LINUX_PROCESS.run(program, args, options);
+    result.bounded = true;
+    result.raw_fallback = false;
+    result.process_backend = "linux-process";
+    return result;
+}
+
+fn run_fixed_bounded(candidates, args, options) {
+    if type(candidates) != "array" or type(args) != "array" or type(options) != "map" {
+        throw "process.run_fixed_bounded requires candidates, argv, and options";
+    }
+    if not bounded_status().available { return _bounded_unavailable(); }
+    let result = _LINUX_PROCESS.run_fixed(candidates, args, options);
+    result.bounded = true;
+    result.raw_fallback = false;
+    result.process_backend = "linux-process";
+    return result;
+}
+
+fn start_fixed_bounded(candidates, args, options) {
+    if type(candidates) != "array" or type(args) != "array" or type(options) != "map" {
+        throw "process.start_fixed_bounded requires candidates, argv, and options";
+    }
+    if not bounded_status().available { return _bounded_unavailable(); }
+    maintain_bounded();
+    let id = _reserve_bounded();
+    let launch_options = map{};
+    for key in map_keys(options) { launch_options[key] = options[key]; }
+    launch_options._require_pidfd = true;
+    let raw = try _LINUX_PROCESS.start_fixed(candidates, args, launch_options) catch nil;
+    if raw == nil {
+        map_remove(_BOUNDED_HANDLES, id);
+        return map{ format: "pblang.process.bounded-start.v1", ok: false,
+            started: false, bounded: true, raw_fallback: false,
+            raw_state_exposed: false, error: "bounded process start failed" };
+    }
+    if not (try raw.ok catch false) {
+        if (try raw.requires_recovery catch false) or (try raw.active catch false) {
+            let current = num_floor(now_ms());
+            _BOUNDED_HANDLES[id] = map{ raw: raw, created_ms: current,
+                last_used_ms: current, launching: false, cancel_requested: false,
+                recovery_after_ms: current + BOUNDED_RECOVERY_GRACE_MS };
+            return map{ format: BOUNDED_HANDLE_FORMAT, id: id, ok: false,
+                started: true, bounded: true, raw_fallback: false,
+                requires_recovery: true, raw_state_exposed: false,
+                error: try raw.error catch "bounded process ownership requires recovery" };
+        }
+        map_remove(_BOUNDED_HANDLES, id);
+        return map{ format: "pblang.process.bounded-start.v1", ok: false,
+            started: false, bounded: true, raw_fallback: false,
+            raw_state_exposed: false,
+            error: try raw.error catch "bounded process start failed" };
+    }
+    let current = num_floor(now_ms());
+    _BOUNDED_HANDLES[id] = map{ raw: raw, created_ms: current,
+        last_used_ms: current, launching: false, cancel_requested: false,
+        recovery_after_ms: current + raw.timeout_secs * 1000
+            + BOUNDED_RECOVERY_GRACE_MS };
+    return map{ format: BOUNDED_HANDLE_FORMAT, id: id, ok: true,
+        started: true, bounded: true, raw_fallback: false,
+        raw_state_exposed: false };
+}
+
+fn poll_bounded(handle) {
+    let state = _bounded_state(handle);
+    if (try state.terminal_result catch nil) != nil {
+        return map{ format: "pblang.process.bounded-poll.v1", ok: true,
+            complete: true, active: false, terminated: true,
+            startup_pending: false, startup_failed: false,
+            cancel_requested: false, term_sent: false, kill_sent: false,
+            liveness: "absent", elapsed_ms: 0,
+            race_resistant_identity: true, terminal_cached: true,
+            raw_state_exposed: false };
+    }
+    let view = _bounded_poll_view(_LINUX_PROCESS.poll(state.raw));
+    view.race_resistant_identity = try state.raw.race_resistant_identity catch false;
+    return view;
+}
+
+fn request_cancel_bounded(handle, grace_ms = 500) {
+    let state = _bounded_state(handle);
+    if (try state.terminal_result catch nil) != nil {
+        return map{ format: "pblang.process.bounded-cancel.v1",
+            ok: true, requested: false, terminated: true,
+            term_sent: false, kill_sent: false, liveness: "absent",
+            race_resistant_identity: true, terminal_cached: true,
+            raw_state_exposed: false };
+    }
+    let result = _LINUX_PROCESS.request_cancel(state.raw, grace_ms);
+    state.cancel_requested = true;
+    return map{ format: "pblang.process.bounded-cancel.v1",
+        ok: try result.ok catch false, requested: try result.requested catch false,
+        terminated: try result.terminated catch false,
+        term_sent: try result.term_sent catch false,
+        kill_sent: try result.kill_sent catch false,
+        liveness: try result.liveness catch "indeterminate",
+        race_resistant_identity: try state.raw.race_resistant_identity catch false,
+        raw_state_exposed: false };
+}
+
+fn finish_bounded(handle, wait_ms = nil) {
+    let state = _bounded_state(handle);
+    let result = nil; let result_was_cached = false;
+    if (try state.terminal_result catch nil) != nil {
+        result = state.terminal_result; state.terminal_result = nil;
+        result_was_cached = true;
+    } else {
+        result = _LINUX_PROCESS.finish(state.raw, wait_ms);
+    }
+    let terminal = _bounded_terminal_result(result);
+    if terminal { map_remove(_BOUNDED_HANDLES, handle.id); }
+    result.format = "pblang.process.bounded-result.v1";
+    result.bounded = true; result.raw_fallback = false;
+    result.race_resistant_identity = try state.raw.race_resistant_identity catch false;
+    result.raw_state_exposed = false; result.handle_closed = terminal;
+    result.requires_recovery = not terminal;
+    result.result_was_cached = result_was_cached;
+    return result;
+}
+
+fn close_bounded(handle, grace_ms = 250, wait_ms = 1500) {
+    request_cancel_bounded(handle, grace_ms);
+    return finish_bounded(handle, wait_ms);
+}
+
 export spawn_wait, run, output, success, check_output, which;
+export BOUNDED_HANDLE_FORMAT, bounded_status, run_bounded, run_fixed_bounded,
+       start_fixed_bounded, poll_bounded, request_cancel_bounded,
+       finish_bounded, close_bounded, maintain_bounded;

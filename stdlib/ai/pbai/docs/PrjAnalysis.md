@@ -58,7 +58,7 @@ The second normalization pass after top-k truncation lacks the `s2 > 0` fallback
 
 ## 4. Sensitive data
 
-**No secrets** (no keys/tokens/passwords anywhere in tracked files or history). **Personal-topology leak**: the user's drive layout (`/opt/app`, `./local_media phone MTP path) is hardcoded in `docs/pbAI.md:372-376`, `docs/pbAI_source_audit.md:70-78`, and `tools/pbai_feed.sapp:24-30` (drive roots in code, not config). Redact/parameterize before any public release. Also: `target/pbai-max-test/**` checkpoint JSONs are **git-tracked build outputs** (show as modified in `git status`) — `target/` should be ignored; keep only `checkpoints/pbai-max/` (220 KB, fine) as the published artifact.
+**No secrets** (no keys/tokens/passwords were confirmed in the reviewed files). The previously recorded personal-topology examples were replaced with generic fixture roots such as `/home/example-user` and `/media/example-user/TestDrive/workspace`; future tests and reports must retain that convention. The separate tracked-output concern remains: `target/pbai-max-test/**` checkpoint JSONs should be treated as generated evidence, while only intentionally published checkpoints belong in release source.
 
 ## 5. Partial implementations / not implemented
 

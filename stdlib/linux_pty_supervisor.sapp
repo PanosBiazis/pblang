@@ -16,6 +16,8 @@ let MAX_SECONDS = 10800;
 let MAX_OUTPUT_BYTES = 67108864;
 let MIN_MEMORY_BYTES = 33554432;
 let MAX_MEMORY_BYTES = 68719476736;
+let MAX_OPEN_FILES = 4096;
+let MAX_PROCESSES = 4096;
 let MAX_WRITE_BYTES = 4096;
 let MAX_PROCESS_GROUP_ID = 4194304;
 let MAX_EXEC_ARGS = 64;
@@ -230,7 +232,7 @@ fn _write_stack_all(code, offset, count, errors) {
 }
 
 fn _code(layout) {
-    let code = []; let errors = [];
+    let code = []; let errors = []; let terminal_errors = [];
     // Preserve the original environment for script and the selected shell.
     _append(code, [0x49, 0x89, 0xE4, 0x4D, 0x8B, 0x2C, 0x24]);
     _append(code, [0x4F, 0x8D, 0x74, 0xEC, 0x10]); // r14 = envp
@@ -262,6 +264,23 @@ fn _code(layout) {
         _append(code, [0x48, 0x89, 0xE6]); _append(code, X.syscall());
         _check_nonnegative(code, errors);
     }
+    // Bound CPU time, descriptors and descendant creation before fork. The
+    // same stack-backed rlimit pair is reused for each setrlimit syscall.
+    _append(code, [0x48, 0xC7, 0x04, 0x24]); _append(code, X.le32(layout.max_cpu));
+    _append(code, [0x48, 0xC7, 0x44, 0x24, 0x08]); _append(code, X.le32(layout.max_cpu));
+    _append(code, X.mov_imm32("rax", 160)); _append(code, X.mov_imm32("rdi", 0));
+    _append(code, [0x48, 0x89, 0xE6]); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, [0x48, 0xC7, 0x04, 0x24]); _append(code, X.le32(layout.max_processes));
+    _append(code, [0x48, 0xC7, 0x44, 0x24, 0x08]); _append(code, X.le32(layout.max_processes));
+    _append(code, X.mov_imm32("rax", 160)); _append(code, X.mov_imm32("rdi", 6));
+    _append(code, [0x48, 0x89, 0xE6]); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, [0x48, 0xC7, 0x04, 0x24]); _append(code, X.le32(layout.max_open_files));
+    _append(code, [0x48, 0xC7, 0x44, 0x24, 0x08]); _append(code, X.le32(layout.max_open_files));
+    _append(code, X.mov_imm32("rax", 160)); _append(code, X.mov_imm32("rdi", 7));
+    _append(code, [0x48, 0x89, 0xE6]); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
 
     // Open the private FIFO read/write so short-lived writers do not produce
     // EOF between input frames. O_NOFOLLOW refuses a substituted symlink.
@@ -340,18 +359,37 @@ fn _code(layout) {
     let parent = len(code); _set_rel32(code, parent_branch[0], parent);
     _append(code, [0x48, 0x89, 0xC7, 0x48, 0x8D, 0x74, 0x24, 0x20]);
     _append(code, X.mov_imm32("rdx", 0)); _append(code, [0x45, 0x31, 0xD2]);
-    _append(code, X.mov_imm32("rax", 61)); _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 61)); _append(code, X.syscall());
+    _check_nonnegative(code, terminal_errors);
     _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
     _append(code, X.movabs_imm64("rsi", layout.status_stage));
     _append(code, X.mov_imm32("rdx", 131265)); _append(code, [0x41, 0xBA]); _append(code, X.le32(384));
-    _append(code, X.syscall()); _check_nonnegative(code, errors);
-    _append(code, [0x48, 0x89, 0xC5]); _write_stack_all(code, 32, 4, errors);
-    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xEF]); _append(code, X.syscall());
+    _append(code, X.syscall()); _check_nonnegative(code, terminal_errors);
+    _append(code, [0x48, 0x89, 0xC5]);
+    _write_stack_all(code, 32, 4, terminal_errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xEF]);
+    _append(code, X.syscall()); _check_nonnegative(code, terminal_errors);
     _append(code, X.mov_imm32("rax", 82));
     _append(code, X.movabs_imm64("rdi", layout.status_stage));
     _append(code, X.movabs_imm64("rsi", layout.status));
-    _append(code, X.syscall()); _check_nonnegative(code, errors);
-    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 0)); _append(code, X.syscall());
+    _append(code, X.syscall()); _check_nonnegative(code, terminal_errors);
+
+    // Status is now atomically visible. kill(0, SIGKILL) targets this current
+    // process group without carrying a numeric PGID across operations. It
+    // intentionally terminates this monitor and every surviving descendant.
+    let terminal_teardown = len(code);
+    _append(code, X.mov_imm32("rax", 62)); _append(code, X.mov_imm32("rdi", 0));
+    _append(code, X.mov_imm32("rsi", 9)); _append(code, X.syscall());
+    // A successful SIGKILL cannot return. Reaching exit 125 means teardown was
+    // not established and the caller must retain recovery ownership.
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 125));
+    _append(code, X.syscall());
+
+    let terminal_i = 0;
+    while terminal_i < len(terminal_errors) {
+        _set_rel32(code, terminal_errors[terminal_i], terminal_teardown);
+        terminal_i = terminal_i + 1;
+    }
 
     let error = len(code);
     _append(code, X.mov_imm32("rax", 87)); _append(code, X.movabs_imm64("rdi", layout.pid)); _append(code, X.syscall());
@@ -396,6 +434,18 @@ fn build(options) {
             throw "linux_pty_supervisor: max_memory_bytes must be at least 33554432";
         }
     }
+    let max_cpu = _positive_integer(try options.max_cpu_seconds catch seconds,
+        "max_cpu_seconds", MAX_SECONDS);
+    let max_open_files = _positive_integer(try options.max_open_files catch 64,
+        "max_open_files", MAX_OPEN_FILES);
+    if max_open_files < 8 {
+        throw "linux_pty_supervisor: max_open_files must be at least 8";
+    }
+    // RLIMIT_NPROC counts every task owned by the real uid, not only this
+    // process tree. Keep the default above normal desktop thread counts while
+    // allowing service deployments to select a tighter dedicated-user limit.
+    let max_processes = _positive_integer(try options.max_processes catch 2048,
+        "max_processes", MAX_PROCESSES);
     let duration = str_to_bytes(str(seconds) + "s"); array_push(duration, 0);
     let pid_stage = _cstring((try options.pid_file catch nil) + ".pending", "pid staging path");
     let status_stage = _cstring((try options.status_file catch nil) + ".pending", "status staging path");
@@ -408,6 +458,8 @@ fn build(options) {
     let probe = map{ fifo: 0, pid: 0, status: 0, pid_stage: 0, status_stage: 0,
         devnull: 0, output: 0, stderr_output: 0, timeout: 0, argv: 0,
         max_output: max_output, max_file: max_file, max_memory: max_memory,
+        max_cpu: max_cpu, max_open_files: max_open_files,
+        max_processes: max_processes,
         command_mode: command_mode, split_output: split_output };
     let code_len = len(_code(probe));
     let cursor = LOAD_BASE + ELF_HEADER_BYTES + code_len; let addresses = [];
@@ -418,6 +470,8 @@ fn build(options) {
         pid_stage: addresses[3], status_stage: addresses[4], devnull: addresses[5],
         output: addresses[18], stderr_output: addresses[21], timeout: addresses[6], argv: argv_address,
         max_output: max_output, max_file: max_file, max_memory: max_memory,
+        max_cpu: max_cpu, max_open_files: max_open_files,
+        max_processes: max_processes,
         command_mode: command_mode, split_output: split_output };
     let code = _code(layout); let data = [];
     i = 0; while i < len(raw) { _append(data, raw[i]); i = i + 1; }
@@ -429,6 +483,139 @@ fn build(options) {
     else { argv_indices = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]; }
     i = 0; while i < len(argv_indices) { _append(data, X.le64(addresses[argv_indices[i]])); i = i + 1; }
     _append(data, X.le64(0));
+    return X.elf64_exec_rx(code, data);
+}
+
+// Launch one supervisor as a new session/process-group leader and return only
+// after a pipe handshake proves that its fixed-width PGID was atomically
+// published. This gives the parent a cancellable kernel identity before the
+// supervisor performs readiness setup.
+fn _session_launcher_code(layout) {
+    let code = []; let errors = []; let parent_branch = [];
+    _append(code, [0x49, 0x89, 0xE4, 0x4D, 0x8B, 0x2C, 0x24]);
+    _append(code, [0x4F, 0x8D, 0x74, 0xEC, 0x10]);
+    _append(code, [0x48, 0x83, 0xEC, 0x40]);
+    _append(code, X.mov_imm32("rax", 293)); _append(code, [0x48, 0x89, 0xE7]);
+    _append(code, X.mov_imm32("rsi", 524288)); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, [0x44, 0x8B, 0x24, 0x24]);
+    _append(code, [0x44, 0x8B, 0x6C, 0x24, 0x04]);
+    _append(code, X.mov_imm32("rax", 57)); _append(code, X.syscall());
+    _check_nonnegative(code, errors); _append(code, [0x48, 0x85, 0xC0]);
+    _branch(code, [0x0F, 0x85], parent_branch);
+
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xE7]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 112)); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 39)); _append(code, X.syscall());
+    _check_nonnegative(code, errors); _append(code, [0x49, 0x89, 0xC7]);
+    _append(code, [0x48, 0x8D, 0x7C, 0x24, 0x29]);
+    _append(code, X.mov_imm32("rcx", 10)); _append(code, [0x41, 0xB8]);
+    _append(code, X.le32(10));
+    let digits = len(code);
+    _append(code, [0x48, 0x31, 0xD2, 0x49, 0xF7, 0xF0, 0x80, 0xC2, 0x30, 0x88, 0x17]);
+    _append(code, [0x48, 0xFF, 0xCF, 0x48, 0xFF, 0xC9, 0x0F, 0x85]);
+    let digits_back = len(code); _append(code, [0, 0, 0, 0]);
+    _set_rel32(code, digits_back, digits);
+    _append(code, [0xC6, 0x44, 0x24, 0x2A, 0x0A]);
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.pid_stage));
+    _append(code, X.mov_imm32("rdx", 131265)); _append(code, [0x41, 0xBA]);
+    _append(code, X.le32(384)); _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC5]); _write_stack_all(code, 32, 11, errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xEF]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 82));
+    _append(code, X.movabs_imm64("rdi", layout.pid_stage));
+    _append(code, X.movabs_imm64("rsi", layout.pid));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    // The launcher parent is captured by proc_spawn_wait. Replace this child's
+    // inherited capture writers with /dev/null before self-stop so parent
+    // completion produces EOF while descriptors 1 and 2 remain occupied for
+    // the supervisor's later open/dup2/close sequence.
+    _append(code, X.mov_imm32("rax", 3)); _append(code, X.mov_imm32("rdi", 1));
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 3)); _append(code, X.mov_imm32("rdi", 2));
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.devnull));
+    _append(code, X.mov_imm32("rdx", 131074)); _append(code, [0x45, 0x31, 0xD2]);
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC3]);
+    _append(code, X.mov_imm32("rax", 33)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.mov_imm32("rsi", 1)); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 33)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.mov_imm32("rsi", 2)); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xEF]);
+    _append(code, X.syscall());
+    // Pin this exact session-leader generation before exec. The PBLang parent
+    // opens a pidfd and explicitly resumes us only after lifecycle ownership
+    // and fixed group helpers are installed.
+    _append(code, X.mov_imm32("rax", 62)); _append(code, [0x44, 0x89, 0xFF]);
+    _append(code, X.mov_imm32("rsi", 19)); _append(code, X.syscall());
+    _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 59));
+    _append(code, X.movabs_imm64("rdi", layout.supervisor));
+    _append(code, X.movabs_imm64("rsi", layout.argv));
+    _append(code, [0x4C, 0x89, 0xF2]); _append(code, X.syscall());
+    _branch(code, [0xE9], errors);
+
+    let parent = len(code); _set_rel32(code, parent_branch[0], parent);
+    // The launcher parent owns the readiness handshake. It reports success only
+    // after wait4 observes this exact fork child in a stopped state, closing the
+    // write-before-SIGSTOP scheduling race.
+    _append(code, [0x49, 0x89, 0xC6]);
+    _append(code, X.mov_imm32("rax", 61)); _append(code, [0x4C, 0x89, 0xF7]);
+    _append(code, [0x48, 0x8D, 0x74, 0x24, 0x30]);
+    _append(code, X.mov_imm32("rdx", 2)); _append(code, [0x45, 0x31, 0xD2]);
+    _append(code, X.syscall()); _append(code, [0x4C, 0x39, 0xF0]);
+    _branch(code, [0x0F, 0x85], errors);
+    _append(code, [0x8B, 0x44, 0x24, 0x30, 0x25, 0xFF, 0x00, 0x00, 0x00]);
+    _append(code, [0x3D, 0x7F, 0x00, 0x00, 0x00]);
+    _branch(code, [0x0F, 0x85], errors);
+    _append(code, [0xC6, 0x44, 0x24, 0x20, 0x01]);
+    _append(code, X.mov_imm32("rax", 1)); _append(code, [0x44, 0x89, 0xEF]);
+    _append(code, [0x48, 0x8D, 0x74, 0x24, 0x20]);
+    _append(code, X.mov_imm32("rdx", 1)); _append(code, X.syscall());
+    _append(code, [0x48, 0x83, 0xF8, 0x01]); _branch(code, [0x0F, 0x85], errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xE7]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xEF]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 60)); _append(code, [0x48, 0x31, 0xFF]);
+    _append(code, X.syscall());
+
+    let error = len(code);
+    _append(code, X.mov_imm32("rax", 87));
+    _append(code, X.movabs_imm64("rdi", layout.pid_stage)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 126));
+    _append(code, X.syscall());
+    let i = 0; while i < len(errors) { _set_rel32(code, errors[i], error); i = i + 1; }
+    return code;
+}
+
+fn build_session_launcher(supervisor_path, pid_path) {
+    let supervisor = _cstring(supervisor_path, "session supervisor path");
+    let pid = _cstring(pid_path, "session pid path");
+    let pid_stage = _cstring(pid_path + ".pending", "session pid staging path");
+    let devnull = _cstring("/dev/null", "null path");
+    let probe = map{ supervisor: 0, pid: 0, pid_stage: 0, devnull: 0, argv: 0 };
+    let code_len = len(_session_launcher_code(probe));
+    let base = LOAD_BASE + ELF_HEADER_BYTES + code_len;
+    let supervisor_address = base;
+    let pid_address = supervisor_address + len(supervisor);
+    let stage_address = pid_address + len(pid);
+    let devnull_address = stage_address + len(pid_stage);
+    let argv_address = devnull_address + len(devnull);
+    let layout = map{ supervisor: supervisor_address, pid: pid_address,
+        pid_stage: stage_address, devnull: devnull_address, argv: argv_address };
+    let code = _session_launcher_code(layout); let data = [];
+    _append(data, supervisor); _append(data, pid); _append(data, pid_stage);
+    _append(data, devnull);
+    _append(data, X.le64(supervisor_address)); _append(data, X.le64(0));
     return X.elf64_exec_rx(code, data);
 }
 
@@ -511,9 +698,9 @@ fn build_group_signal(process_group_id, signal_name) {
     return X.elf64_exec_rx(code, []);
 }
 
-// Exit zero only while at least one member of the validated process group
-// exists. EPERM also means the group exists; the generated helper exits one in
-// that case because PBRemote owns every group it probes under the same uid.
+// Exit zero while the group exists, one only for ESRCH (confirmed absence),
+// and two for every other kernel error. The caller must treat exit two as an
+// indeterminate liveness result rather than as permission to clean up state.
 fn build_group_probe(process_group_id) {
     let pgid = _positive_integer(process_group_id, "process_group_id",
         MAX_PROCESS_GROUP_ID);
@@ -526,13 +713,19 @@ fn build_group_probe(process_group_id) {
     _append(code, X.mov_imm32("rsi", 0));
     _append(code, X.syscall());
     _append(code, [0x48, 0x85, 0xC0]);
-    let missing = []; _branch(code, [0x0F, 0x88], missing);
+    let failed = []; _branch(code, [0x0F, 0x88], failed);
     _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 0)); _append(code, X.syscall());
-    let failed = len(code); _set_rel32(code, missing[0], failed);
+    let failure = len(code); _set_rel32(code, failed[0], failure);
+    _append(code, [0x48, 0x83, 0xF8, 0xFD]);
+    let missing = []; _branch(code, [0x0F, 0x84], missing);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 2)); _append(code, X.syscall());
+    let absent = len(code); _set_rel32(code, missing[0], absent);
     _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 1)); _append(code, X.syscall());
     return X.elf64_exec_rx(code, []);
 }
 
-export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MIN_MEMORY_BYTES, MAX_MEMORY_BYTES, MAX_WRITE_BYTES,
+export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MIN_MEMORY_BYTES, MAX_MEMORY_BYTES,
+    MAX_OPEN_FILES, MAX_PROCESSES, MAX_WRITE_BYTES,
     MAX_PROCESS_GROUP_ID, MAX_EXEC_ARGS, MAX_EXEC_ARG_BYTES, MAX_EXEC_TOTAL_BYTES,
-    build, build_argv_exec, build_argv_exec_env, build_writer, build_group_signal, build_group_probe;
+    build, build_session_launcher, build_argv_exec, build_argv_exec_env,
+    build_writer, build_group_signal, build_group_probe;

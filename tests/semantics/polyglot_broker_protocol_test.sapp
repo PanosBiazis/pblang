@@ -1,0 +1,193 @@
+let PB = import("stdlib:polyglot_broker_protocol.sapp");
+let IAM = import("stdlib:iam.sapp");
+let SHA = import("stdlib:sha256_pb.sapp");
+
+fn require(condition, message) {
+    if not condition { throw "FAIL polyglot broker: " + message; }
+}
+
+fn rejected(work) { return try { work(); false } catch true; }
+
+fn key_bytes() {
+    let out = []; let value = 11;
+    while len(out) < 32 { array_push(out, value); value = (value + 17) % 256; }
+    return out;
+}
+
+fn intent(language = "python") {
+    return map{ operation: "polyglot.execute.v1", language: language,
+        source: "print('bounded')", input: "input-data", timeout_secs: 5,
+        max_output_bytes: 4096, max_memory_bytes: 67108864 };
+}
+
+fn require_effect_free(result, message) {
+    require(not result.executable and not result.executed
+        and not result.effects_applied, message);
+}
+
+let iam = IAM.new_state();
+IAM.create_user(iam, "alice", "Alice", 10);
+IAM.bootstrap_system_admin(iam, "alice");
+IAM.create_organization(iam, "alice", "acme", "Acme", 11);
+let key = key_bytes();
+let credential_id = "key_0123456789abcdef01234567";
+IAM.issue_credential(iam, "alice", "acme", credential_id,
+    "Broker test key", SHA.sha256_hex_bytes(key), 12);
+
+let broker = PB.new(iam, map{ audience: "pblang-test-broker", max_bindings: 2,
+    max_attempts: 8, idle_timeout_ms: 600000,
+    absolute_lifetime_ms: 3600000 });
+let dispatch = PB.dispatch_handle(broker);
+let binding = PB.bind_credential(broker, credential_id,
+    "alice", "acme", key);
+let desc = PB.descriptor(broker);
+let base = num_floor(now_ms());
+let forged_handle = map{ format: broker.format, id: desc.broker_instance };
+require(desc.broker_instance != broker.id
+    and rejected(fn() { PB.describe(forged_handle); })
+    and rejected(fn() { PB.close(forged_handle); })
+    and rejected(fn() { PB.unbind_credential(forged_handle, credential_id); })
+    and rejected(fn() { PB.dispatch_handle(forged_handle); }),
+    "public descriptor identity cannot be forged into a privileged broker handle");
+require(dispatch.format == PB.DISPATCH_FORMAT and dispatch.id != broker.id
+    and rejected(fn() { PB.describe(dispatch); })
+    and rejected(fn() { PB.close(dispatch); })
+    and rejected(fn() { PB.unbind_credential(dispatch, credential_id); }),
+    "dispatch capability cannot invoke administrative operations");
+
+require(not desc.executable and not desc.executed and not desc.effects_applied,
+    "descriptor is explicitly effect-free");
+let exposed = PB.descriptor(broker);
+let original_epoch_byte = desc.epoch[0];
+exposed.epoch[0] = (exposed.epoch[0] + 1) % 256;
+require(PB.descriptor(broker).epoch[0] == original_epoch_byte,
+    "public descriptor mutation cannot alter private broker state");
+let public_handle = map{ format: broker.format, id: broker.id };
+public_handle.extra = key;
+require(not PB.describe(broker).secret_material_exposed,
+    "public handle additions cannot expose private key state");
+
+let client = PB.new_client(desc, binding, key);
+let outbound = PB.client_make_request(client, intent(), base, base + 10000);
+require(rejected(fn() { PB.client_make_request(client, intent(), base, base + 10000); }),
+    "client permits only one pending request");
+
+let bad_request = [];
+for i len(outbound.frame) { array_push(bad_request, outbound.frame[i]); }
+bad_request[len(bad_request) - 1] = bit_xor(bad_request[len(bad_request) - 1], 1);
+require(rejected(fn() { PB.handle_request(broker, bad_request); }),
+    "administrative handle cannot dispatch requests");
+let silent = PB.handle_request(dispatch, bad_request);
+require(not silent.ok and not silent.authenticated and silent.response_frame == nil
+    and not silent.consumed, "tampered request is silent and unconsumed");
+require_effect_free(silent, "tampered request remains effect-free");
+
+let retry = PB.client_retry_pending(client);
+require(retry.frame == outbound.frame and retry.sequence == outbound.sequence,
+    "retry reproduces the exact pending frame");
+let accepted = PB.handle_request(dispatch, retry.frame);
+require(accepted.ok and accepted.authenticated and accepted.consumed
+    and accepted.status == "authorized_no_effect" and accepted.authorized,
+    "valid request is authenticated, authorized, and consumed");
+require_effect_free(accepted, "authorized protocol response does not execute effects");
+
+let bad_response = [];
+for i len(accepted.response_frame) { array_push(bad_response, accepted.response_frame[i]); }
+bad_response[len(bad_response) - 1] = bit_xor(bad_response[len(bad_response) - 1], 1);
+require(not PB.client_verify_response(client, bad_response).ok,
+    "tampered response is rejected without clearing pending state");
+let verified = PB.client_verify_response(client, accepted.response_frame);
+require(verified.ok and verified.authenticated
+    and verified.status == "authorized_no_effect" and verified.expected_seq == 1,
+    "client authenticates the original response and advances once");
+require_effect_free(verified, "verified response preserves effect-free contract");
+require(not PB.client_verify_response(client, accepted.response_frame).ok,
+    "response replay is rejected after pending state is cleared");
+
+let pending_one = PB.make_request(desc, binding, key, intent(), 1, base, base + 10000,
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]);
+let one = PB.handle_request(dispatch, pending_one.frame);
+require(one.ok and one.expected_seq == 2
+    and PB.verify_response(desc, key, pending_one, one.response_frame).ok,
+    "stateless request and response codec round-trip");
+let replay = nil; let replay_count = 0;
+while replay_count < 12 {
+    replay = PB.handle_request(dispatch, pending_one.frame);
+    require(replay.status == "sequence_replay" and replay.expected_seq == 2,
+        "replay flood remains synchronized without retiring the credential");
+    replay_count = replay_count + 1;
+}
+let replay_verified = PB.verify_response(desc, key, pending_one, replay.response_frame);
+require(not replay.ok and replay.authenticated and not replay.consumed
+    and replay.status == "sequence_replay" and replay.expected_seq == 2
+    and replay_verified.ok and replay_verified.status == "sequence_replay",
+    "authenticated replay receives a signed non-advancing response");
+
+let gap_pending = PB.make_request(desc, binding, key, intent(), 7, base, base + 10000,
+    [7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]);
+let gap = PB.handle_request(dispatch, gap_pending.frame);
+require(not gap.ok and gap.authenticated and not gap.consumed
+    and gap.status == "sequence_gap" and gap.expected_seq == 2
+    and PB.verify_response(desc, key, gap_pending, gap.response_frame).ok,
+    "sequence gaps are signed but do not advance broker state");
+
+let expired_pending = PB.make_request(desc, binding, key, intent(), 2,
+    base - 100, base - 1,
+    [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]);
+let expired = PB.handle_request(dispatch, expired_pending.frame);
+let expired_verified = PB.verify_response(desc, key, expired_pending,
+    expired.response_frame);
+require(not expired.ok and expired.authenticated and expired.consumed
+    and expired.status == "expired" and expired.expected_seq == 3
+    and expired_verified.ok and expired_verified.status == "expired",
+    "expired exact-sequence request is consumed and signed");
+
+let language_pending = PB.make_request(desc, binding, key, intent("javascript"),
+    3, base, base + 10000, [3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3]);
+let language = PB.handle_request(dispatch, language_pending.frame);
+require(not language.ok and language.consumed
+    and language.status == "unsupported_language" and language.expected_seq == 4
+    and PB.verify_response(desc, key, language_pending, language.response_frame).ok,
+    "unsupported language fails closed after exact sequence consumption");
+
+IAM.revoke_credential(iam, "alice", credential_id, base);
+let revoked_pending = PB.make_request(desc, binding, key, intent(), 4,
+    base, base + 10000,
+    [4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4]);
+let revoked = PB.handle_request(dispatch, revoked_pending.frame);
+let revoked_verified = PB.verify_response(desc, key, revoked_pending,
+    revoked.response_frame);
+require(not revoked.ok and revoked.authenticated and revoked.consumed
+    and revoked.status == "authorization_denied" and revoked.expected_seq == 5
+    and revoked.binding_retired
+    and revoked_verified.ok and not revoked_verified.authorized,
+    "IAM revocation is rechecked per exact request and signed without effects");
+
+let malformed = [];
+for i len(revoked_pending.frame) { array_push(malformed, revoked_pending.frame[i]); }
+array_push(malformed, 0);
+let malformed_result = PB.handle_request(dispatch, malformed);
+require(malformed_result.response_frame == nil and not malformed_result.authenticated,
+    "trailing bytes are rejected before authentication");
+require(not PB.verify_response(desc, key, revoked_pending, revoked_pending.frame).ok,
+    "request-direction frame cannot verify as a response");
+require(rejected(fn() { PB.make_request(desc, binding, key,
+        map{ language: "python", source: str_repeat("x", 3585) },
+        5, base, base + 10000); }),
+    "oversized source is rejected before framing");
+
+let description = PB.describe(broker);
+require(description.bindings == 0 and description.requests == 18
+    and description.rejected == 2 and not description.listener_configured
+    and not description.runner_configured and not description.production_execution_ready,
+    "bounded counters and incomplete execution posture remain explicit");
+let linked_client = PB.new_client(desc, binding, key);
+require(PB.close(broker).closed, "broker closes explicitly");
+require(rejected(fn() { PB.describe(broker); }), "closed broker handle is invalid");
+require(rejected(fn() { PB.handle_request(dispatch, malformed); }),
+    "broker close retires its dispatch capability");
+require(rejected(fn() { PB.client_make_request(client, intent(), base, base + 10000); })
+    and rejected(fn() { PB.client_make_request(linked_client, intent(), base, base + 10000); }),
+    "broker close retires every client linked to its opaque instance");
+
+print "polyglot_broker_protocol_pass";

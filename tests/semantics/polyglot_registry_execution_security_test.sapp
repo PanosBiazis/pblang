@@ -1,0 +1,159 @@
+let REG = import("stdlib:polyglot_registry.sapp");
+let BUILD = import("stdlib:polyglot_build.sapp");
+
+fn expect(value, message) {
+    if not value { throw "FAIL polyglot registry execution security: " + message; }
+}
+
+fn denied(result) {
+    return not result.ok and not result.executed and not result.raw_fallback;
+}
+
+fn deny_all_ffi_policy() {
+    return map{ format: "pblang.ffi.policy.v1", libraries: [], symbols: [],
+        max_args: 0, allow_pointers: false };
+}
+
+let implicit = REG.run("python", "print('must not run')");
+expect(denied(implicit) and implicit.trusted_source_required,
+    "foreign source execution must require an explicit trust decision");
+expect(denied(REG.run("python", "print('must not run')", map{ trusted_source: "yes" })),
+    "string trust decisions must not authorize execution");
+expect(denied(REG.run("python", "print('must not run')", map{ trusted_source: 1 })),
+    "numeric trust decisions must not authorize execution");
+
+expect(denied(REG.run("not-a-language", "print(1)", map{ trusted_source: true })),
+    "unknown languages must fail before process execution");
+expect(denied(REG.run("python", 42, map{ trusted_source: true })),
+    "non-string source must fail before process execution");
+let acknowledged_bad_source = REG.run("python", 42, map{ trusted_source: true });
+expect(acknowledged_bad_source.trusted_source_acknowledged
+    and not acknowledged_bad_source.trusted_source_authorized
+    and acknowledged_bad_source.trust_is_acknowledgement,
+    "registry records caller acknowledgement without inventing execution authority");
+expect(denied(REG.run("python", "x" + strfromcharcode(0), map{ trusted_source: true })),
+    "NUL-bearing source must fail before process execution");
+expect(denied(REG.run("python", str_repeat("x", 3585), map{ trusted_source: true })),
+    "oversized argv source must fail before process execution");
+expect(denied(REG.run("python", "print(1)", map{ trusted_source: true, timeout_secs: 0 })),
+    "invalid timeout policy must fail before process execution");
+expect(denied(REG.run("go", "package main", map{ trusted_source: true })),
+    "languages without a bounded direct adapter must not fall back to raw execution");
+expect(REG._tmp_path("python") == nil,
+    "legacy shared temporary path generation must remain disabled");
+
+let first = REG._lang_db();
+first.python.run_cmd = "attacker-controlled";
+first.rust.run_args_template[0] = "poisoned";
+let second = REG._lang_db();
+expect(second.python.run_cmd == "python3" and second.rust.run_args_template[0] == "script",
+    "exported registry snapshots must not mutate executable metadata");
+
+let ffi = REG.ffi_bridge("c", "/tmp/untrusted.so", "entry", []);
+expect(denied(ffi) and ffi.policy_required and ffi.broker_required,
+    "generic in-process FFI must remain disabled");
+
+let raw_load = BUILD.load_artifact("/tmp/untrusted.so");
+expect(not raw_load.ok and not raw_load.executed and raw_load.policy_required,
+    "legacy artifact loading must fail closed without an exact policy");
+expect(not BUILD.load_artifact_checked(deny_all_ffi_policy(), "/tmp/untrusted.so").ok,
+    "checked artifact loading must deny unlisted libraries before host loading");
+expect(not BUILD.load_artifact_checked(deny_all_ffi_policy(), "/tmp/untrusted.py").ok,
+    "script artifacts must use the bounded execution API instead of raw loading");
+
+let compile_denied = REG.compile("c", "int x(void) { return 1; }", "/tmp");
+expect(denied(compile_denied),
+    "toolchain execution must require explicit source and effect decisions");
+expect(denied(REG.compile("c", "int x(void) { return 1; }", "/tmp",
+    map{ trusted_source: "yes", allow_toolchain_effects: true })),
+    "compile rejects non-boolean source trust");
+expect(denied(REG.compile("c", "int x(void) { return 1; }", "/tmp",
+    map{ trusted_source: true, allow_toolchain_effects: 1 })),
+    "compile rejects non-boolean effect authorization");
+let compile_path_denied = REG.compile("c", "int x(void) { return 1; }", "bad\nroot",
+    map{ trusted_source: true, allow_toolchain_effects: true });
+expect(denied(compile_path_denied),
+    "invalid output roots must fail before toolchain execution");
+expect(compile_path_denied.trusted_source_acknowledged
+    and compile_path_denied.toolchain_effects_acknowledged
+    and not compile_path_denied.trusted_source_authorized
+    and not compile_path_denied.toolchain_effects_authorized,
+    "compile acknowledgements remain visible without being represented as authority");
+
+let process = BUILD.process_status();
+if process.available and REG.is_available("python") {
+    let ok = REG.run("python", "print('bounded-registry-ok')",
+        map{ trusted_source: true, timeout_secs: 5 });
+    expect(ok.ok and ok.complete and ok.bounded and not ok.sandboxed
+        and ok.executable_descriptor_held and ok.executable_nofollow
+        and not ok.check_then_exec_race and str_contains(ok.stdout, "bounded-registry-ok")
+        and ok.trusted_source_acknowledged and not ok.trusted_source_authorized
+        and ok.authority_scope == "vm_capability" and not ok.multi_principal_safe
+        and ok.principal_isolation_required
+        and ok.execution_capability_observed,
+        "successful execution must use a fixed descriptor-held bounded runtime");
+
+    let timed = REG.run("python", "while True: pass",
+        map{ trusted_source: true, timeout_secs: 1 });
+    expect(not timed.ok and timed.executed and timed.bounded and timed.timed_out
+        and timed.error != "",
+        "non-terminating source must hit the bounded timeout");
+
+    let noisy = REG.run("python", "print('x'*1100000)",
+        map{ trusted_source: true, timeout_secs: 5 });
+    expect(not noisy.ok and noisy.executed and noisy.bounded and noisy.output_truncated,
+        "oversized process output must be truncated and must not count as complete");
+}
+
+if process.available and len(BUILD.tool_candidates("cc")) > 0 {
+    let root = "/tmp/pblang-registry-build-" + str(now_ms());
+    let compiled = REG.compile("c", "int registry_value(void) { return 17; }", root,
+        map{ trusted_source: true, allow_toolchain_effects: true });
+    expect(compiled.ok and compiled.compiled and compiled.bounded
+        and compiled.executed and compiled.toolchain_executed
+        and compiled.artifact_verified and compiled.artifact_size > 0
+        and len(compiled.artifact_sha256) == 64 and compiled.output_is_root
+        and compiled.trusted_source_acknowledged and compiled.toolchain_effects_acknowledged
+        and not compiled.trusted_source_authorized and not compiled.toolchain_effects_authorized,
+        "direct compilation must return one verified private artifact");
+    let session = path_dirname(compiled.artifact);
+    try fs_remove(compiled.artifact) catch nil;
+    try fs_remove(session + "/registry_build.c") catch nil;
+    try fs_remove(session + "/.session") catch nil;
+    try fs_remove(session) catch nil;
+    try fs_remove(root) catch nil;
+
+    let bad_root = "/tmp/pblang-registry-bad-build-" + str(now_ms());
+    let failed = REG.compile("c", "this is not valid C", bad_root,
+        map{ trusted_source: true, allow_toolchain_effects: true });
+    expect(not failed.ok and not failed.compiled and failed.executed
+        and failed.toolchain_executed and failed.execution_capability_observed
+        and failed.bounded and failed.cleanup_required,
+        "failed compilation preserves bounded toolchain execution evidence");
+    let failed_source = failed.artifact;
+    let failed_session = path_dirname(failed_source);
+    try fs_remove(failed_source) catch nil;
+    try fs_remove(failed_session + "/.session") catch nil;
+    try fs_remove(failed_session) catch nil;
+    try fs_remove(bad_root) catch nil;
+}
+
+let source_root = "/tmp/pblang-registry-source-build-" + str(now_ms());
+let source_only = REG.compile("python", "print('source-only')", source_root,
+    map{ trusted_source: true, allow_toolchain_effects: true });
+expect(source_only.ok and source_only.complete and source_only.published
+    and not source_only.compiled and not source_only.executed
+    and not source_only.toolchain_executed
+    and not source_only.execution_capability_observed
+    and source_only.bounded and source_only.artifact_kind == "source"
+    and source_only.authority_scope == "vm_capability"
+    and not source_only.multi_principal_safe and source_only.principal_isolation_required
+    and source_only.artifact_verified,
+    "source publication cannot be mislabeled as compilation or toolchain execution");
+let source_session = path_dirname(source_only.artifact);
+try fs_remove(source_only.artifact) catch nil;
+try fs_remove(source_session + "/.session") catch nil;
+try fs_remove(source_session) catch nil;
+try fs_remove(source_root) catch nil;
+
+print "polyglot_registry_execution_security_pass";

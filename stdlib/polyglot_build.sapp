@@ -12,9 +12,260 @@
 //   let pb = import("stdlib:polyglot_build.sapp");
 //   let artifacts = pb.build_file("my_project/main.sapp");
 
+let SECURE_FILE = import("stdlib:secure_file.sapp");
+let PROCESS = import("stdlib:process.sapp");
+let FFI = import("stdlib:ffi_universal.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+let MAX_BLOCK_NAME_BYTES = 64;
+let MAX_SOURCE_BYTES = 4194304;
+let MAX_PATH_BYTES = 4096;
+let MAX_BLOCKS = 256;
+let MAX_BLOCK_DEPTH = 256;
+let MAX_PROJECT_DEPTH = 32;
+let MAX_PROJECT_FILES = 10000;
+let _TOOL_CANDIDATE_CACHE = map{};
+
+fn _valid_block_name(value) {
+    if type(value) != "string" or len(value) < 1
+       or len(str_to_bytes(value)) > MAX_BLOCK_NAME_BYTES { return false; }
+    let i = 0;
+    while i < len(value) {
+        if not ((strcharcodeat(value, i) >= 65 and strcharcodeat(value, i) <= 90)
+            or (strcharcodeat(value, i) >= 97 and strcharcodeat(value, i) <= 122)
+            or (i > 0 and strcharcodeat(value, i) >= 48 and strcharcodeat(value, i) <= 57)
+            or strcharcodeat(value, i) == 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _validate_build_input(block_name, code, out_dir) {
+    if not _valid_block_name(block_name) {
+        throw "polyglot_build: block name must be a bounded ASCII identifier";
+    }
+    if type(code) != "string" or len(str_to_bytes(code)) > MAX_SOURCE_BYTES {
+        throw "polyglot_build: source exceeds 4 MiB";
+    }
+    if type(out_dir) != "string" or len(out_dir) < 1
+       or len(str_to_bytes(out_dir)) > MAX_PATH_BYTES or str_contains(out_dir, strfromcharcode(0))
+       or str_contains(out_dir, "\n") or str_contains(out_dir, "\r") {
+        throw "polyglot_build: invalid output directory";
+    }
+    return true;
+}
+
+fn validate_build_request(block_name, code, out_dir) {
+    let valid = try _validate_build_input(block_name, code, out_dir) catch false;
+    return map{ ok: valid, format: "pblang.polyglot-build-request.v1",
+        shell_evaluated: false, source_limit: MAX_SOURCE_BYTES,
+        path_limit: MAX_PATH_BYTES };
+}
+
+fn _valid_tool_name(program) {
+    if type(program) != "string" or len(program) < 1 or len(program) > 128 { return false; }
+    let i = 0;
+    while i < len(program) {
+        if not ((strcharcodeat(program, i) >= 65 and strcharcodeat(program, i) <= 90)
+            or (strcharcodeat(program, i) >= 97 and strcharcodeat(program, i) <= 122)
+            or (strcharcodeat(program, i) >= 48 and strcharcodeat(program, i) <= 57)
+            or strcharcodeat(program, i) == 43 or strcharcodeat(program, i) == 45
+            or strcharcodeat(program, i) == 46 or strcharcodeat(program, i) == 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _contains_value(values, wanted) {
+    let i = 0;
+    while i < len(values) {
+        if values[i] == wanted { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _trusted_tool_candidates(program) {
+    if not _valid_tool_name(program) { return []; }
+    if map_has(_TOOL_CANDIDATE_CACHE, program) { return _TOOL_CANDIDATE_CACHE[program]; }
+    let dirs = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin"];
+    let candidates = [];
+    for i len(dirs) {
+        let candidate = dirs[i] + "/" + program;
+        let path = try str_trim(PROCESS.run_fixed_bounded(
+            ["/usr/bin/readlink", "/bin/readlink"], ["-f", "--", candidate], map{
+                timeout_secs: 2, startup_timeout_ms: 1000, max_output_bytes: 8192,
+                max_file_bytes: 1048576, max_memory_bytes: 67108864,
+                environment: map{ PATH: "/usr/bin:/bin", HOME: "/nonexistent",
+                    TMPDIR: "/tmp", LANG: "C", LC_ALL: "C" }
+            }).stdout) catch "";
+        let confined = false;
+        if path != "" and not str_contains(path, strfromcharcode(0))
+           and not str_contains(path, "\n") and not str_contains(path, "\r") {
+            for j len(dirs) {
+                if str_starts_with(path, dirs[j] + "/") { confined = true; }
+            }
+        }
+        if confined and not _contains_value(candidates, path) { array_push(candidates, path); }
+    }
+    _TOOL_CANDIDATE_CACHE[program] = candidates;
+    return candidates;
+}
+
+fn process_status() { return PROCESS.bounded_status(); }
+
+fn verify_artifact(path, max_bytes = 67108864) {
+    if type(path) != "string" or len(path) < 1 or len(str_to_bytes(path)) > MAX_PATH_BYTES
+       or type(max_bytes) != "number" or max_bytes != num_floor(max_bytes)
+       or max_bytes < 1 or max_bytes > 67108864 {
+        return map{ ok: false, verified: false, error: "invalid artifact verification request" };
+    }
+    let loaded = SECURE_FILE.read_bytes(path, max_bytes);
+    if not loaded.ok {
+        return map{ ok: false, verified: false,
+            error: try loaded.error catch "artifact is unavailable or exceeds the byte limit" };
+    }
+    return map{ ok: true, verified: true, size: loaded.size,
+        sha256: SHA256.sha256_hex_bytes(loaded.bytes), bytes_retained: false };
+}
+
+// Return a detached copy so callers cannot mutate the executable-identity
+// cache used by later build and execution requests.
+fn tool_candidates(program) {
+    let trusted = _trusted_tool_candidates(program);
+    let copied = [];
+    let i = 0;
+    while i < len(trusted) {
+        array_push(copied, trusted[i]);
+        i = i + 1;
+    }
+    return copied;
+}
+
+fn _run_argv(program, args, failure) {
+    let status = PROCESS.bounded_status();
+    if not status.available {
+        return map{ exit_code: -1, stdout: "", stderr: failure + ": " + status.reason,
+            executed: false, completed: false, bounded: false,
+            unsupported: true, raw_fallback: false };
+    }
+    let candidates = _trusted_tool_candidates(program);
+    if len(candidates) == 0 {
+        return map{ exit_code: -1, stdout: "", stderr: failure + ": invalid compiler name",
+            executed: false, completed: false, bounded: true,
+            unsupported: true, raw_fallback: false };
+    }
+    let result = PROCESS.run_fixed_bounded(candidates, args, map{
+        timeout_secs: 120, startup_timeout_ms: 3000,
+        max_output_bytes: 1048576, max_file_bytes: 67108864,
+        max_memory_bytes: 2147483648,
+        environment: map{
+            PATH: "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin",
+            HOME: "/nonexistent", TMPDIR: "/tmp", LANG: "C.UTF-8", LC_ALL: "C.UTF-8"
+        }
+    });
+    if not result.ok {
+        return map{ exit_code: -1, stdout: try result.stdout catch "",
+            stderr: failure + ": " + (try result.error catch "bounded process failed"),
+            executed: try result.completed catch false,
+            completed: try result.completed catch false,
+            bounded: try result.bounded catch true, raw_fallback: false,
+            process_group_terminated: try result.process_group_terminated catch false,
+            executable_descriptor_held: try result.executable_descriptor_held catch false,
+            executable_nofollow: try result.executable_nofollow catch false,
+            check_then_exec_race: try result.check_then_exec_race catch false };
+    }
+    return map{ exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr,
+        executed: try result.completed catch true,
+        completed: try result.completed catch true,
+        bounded: try result.bounded catch true,
+        raw_fallback: false, output_truncated: result.output_truncated,
+        process_group_terminated: result.process_group_terminated,
+        executable_descriptor_held: try result.executable_descriptor_held catch false,
+        executable_nofollow: try result.executable_nofollow catch false,
+        check_then_exec_race: try result.check_then_exec_race catch false };
+}
+
+fn _write_text_secure(path, text) {
+    if not SECURE_FILE.write_text_atomic(path, text, true, false).ok {
+        throw "polyglot_build: secure source publication failed";
+    }
+    return true;
+}
+
+fn _require_private_output(result) {
+    if not result.ok {
+        throw "polyglot_build: private no-follow output root unavailable: "
+            + (try result.error catch "secure publication rejected");
+    }
+    return result;
+}
+
+fn _private_build_output(parent, context) {
+    let token = str_slice(sha256(base64_encode_bytes(random_bytes(32))
+        + str(now_ms()) + str(context)), 0, 32);
+    let output = parent + "/build-" + token;
+    _require_private_output(SECURE_FILE.write_text_new_exclusive(output + "/.session",
+        "pblang.polyglot.output.v1\n", true, true));
+    return output;
+}
+
+fn _source_fallback(language, artifact, warning, process = nil) {
+    return map{
+        ok: true,
+        build_ok: false,
+        status: "fallback",
+        artifact: artifact,
+        artifact_kind: "source",
+        language: language,
+        compiled: false,
+        executed: if process == nil { false } else { try process.executed catch false },
+        toolchain_executed: if process == nil { false } else { try process.executed catch false },
+        bounded: if process == nil { true } else { try process.bounded catch false },
+        artifact_publication_bounded: true,
+        warning: warning,
+    };
+}
+
+fn _source_artifact(language, artifact) {
+    return map{ ok: true, build_ok: true, status: "source",
+        artifact: artifact, artifact_kind: "source", language: language,
+        compiled: false, executed: false, toolchain_executed: false,
+        bounded: true, artifact_publication_bounded: true };
+}
+
+fn _compile_error(language, message, process, cleanup_artifact = "") {
+    return map{ ok: false, build_ok: false, status: "failed",
+        language: language, compiled: false,
+        executed: try process.executed catch false,
+        toolchain_executed: try process.executed catch false,
+        bounded: try process.bounded catch false,
+        process_group_terminated: try process.process_group_terminated catch false,
+        executable_descriptor_held: try process.executable_descriptor_held catch false,
+        executable_nofollow: try process.executable_nofollow catch false,
+        check_then_exec_race: try process.check_then_exec_race catch false,
+        artifact: cleanup_artifact, cleanup_required: cleanup_artifact != "",
+        error: message + ": " + (try process.stderr catch "toolchain failed") };
+}
+
+fn _compiled_artifact(language, artifact, process) {
+    return map{ ok: true, build_ok: true, status: "compiled",
+        artifact: artifact, artifact_kind: "binary", language: language,
+        compiled: true, executed: try process.executed catch false,
+        toolchain_executed: try process.executed catch false,
+        bounded: try process.bounded catch false,
+        process_group_terminated: try process.process_group_terminated catch false,
+        executable_descriptor_held: try process.executable_descriptor_held catch false,
+        executable_nofollow: try process.executable_nofollow catch false,
+        check_then_exec_race: try process.check_then_exec_race catch false };
+}
+
 // ── Block Extraction ──────────────────────────────────────────────────────────
 
 fn extract_blocks(source) {
+    if type(source) != "string" or len(str_to_bytes(source)) > MAX_SOURCE_BYTES {
+        throw "polyglot_build: source must be UTF-8 text at most 4 MiB";
+    }
     let lines = str_split(source, "\n");
     let blocks = [];
     let i = 0;
@@ -23,6 +274,7 @@ fn extract_blocks(source) {
         if str_starts_with(line, "@") {
             let brace_pos = str_index_of(line, "{");
             if brace_pos > 1 {
+                if len(blocks) >= MAX_BLOCKS { throw "polyglot_build: block limit exceeded"; }
                 let lang = str_trim(str_slice(line, 1, brace_pos));
                 let code_lines = [];
                 let depth = 1;
@@ -34,6 +286,7 @@ fn extract_blocks(source) {
                         let ch = str_slice(cl, j, j + 1);
                         if ch == "{" { depth = depth + 1; }
                         if ch == "}" { depth = depth - 1; }
+                        if depth > MAX_BLOCK_DEPTH { throw "polyglot_build: block nesting limit exceeded"; }
                         j = j + 1;
                     }
                     if depth > 0 {
@@ -41,11 +294,15 @@ fn extract_blocks(source) {
                     }
                     i = i + 1;
                 }
+                if depth != 0 { throw "polyglot_build: unterminated polyglot block"; }
                 array_push(blocks, map{
                     language: lang,
                     code: str_join(code_lines, "\n"),
                     line: i,
                 });
+                // The inner loop already advanced to the line after the
+                // closing brace. Do not skip an immediately adjacent block.
+                continue;
             }
         }
         i = i + 1;
@@ -56,523 +313,556 @@ fn extract_blocks(source) {
 // ── Compile Language: Rust ────────────────────────────────────────────────────
 
 fn build_rust(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let proj_dir = out_dir + "/rust_" + block_name;
-    fs_mkdirs(proj_dir);
-    fs_write(proj_dir + "/Cargo.toml",
+    _write_text_secure(proj_dir + "/Cargo.toml",
         "[package]\nname = \"" + block_name + "\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = \"lib.rs\"\n");
-    fs_write(proj_dir + "/lib.rs", code);
-    let result = try {
-        let r = exec("cargo build --release --manifest-path " + proj_dir + "/Cargo.toml");
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "cargo build failed" };
+    _write_text_secure(proj_dir + "/lib.rs", code);
+    let result = _run_argv("cargo",
+        ["build", "--release", "--manifest-path", proj_dir + "/Cargo.toml"],
+        "cargo build failed");
     if result.exit_code != 0 {
-        return map{ error: "rust build failed: " + result.stderr };
+        return _compile_error("rust", "rust build failed", result,
+            proj_dir + "/lib.rs");
     }
     let ext = _shared_lib_ext();
     let lib_name = _lib_prefix() + block_name + ext;
-    return map{
-        ok: true,
-        artifact: proj_dir + "/target/release/" + lib_name,
-        language: "rust",
-    };
+    return _compiled_artifact("rust",
+        proj_dir + "/target/release/" + lib_name, result);
 }
 
 // ── Compile Language: C ───────────────────────────────────────────────────────
 
 fn build_c(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let src_file = out_dir + "/" + block_name + ".c";
-    fs_write(src_file, code);
+    _write_text_secure(src_file, code);
     let ext = _shared_lib_ext();
     let out_file = out_dir + "/" + _lib_prefix() + block_name + ext;
-    let result = try {
-        let r = exec("cc -shared -fPIC -o " + out_file + " " + src_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "cc build failed" };
+    let result = _run_argv("cc", ["-shared", "-fPIC", "-o", out_file, src_file],
+        "cc build failed");
     if result.exit_code != 0 {
-        return map{ error: "c build failed: " + result.stderr };
+        return _compile_error("c", "c build failed", result, src_file);
     }
-    return map{ ok: true, artifact: out_file, language: "c" };
+    return _compiled_artifact("c", out_file, result);
 }
 
 // ── Compile Language: C++ ─────────────────────────────────────────────────────
 
 fn build_cpp(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let src_file = out_dir + "/" + block_name + ".cpp";
-    fs_write(src_file, code);
+    _write_text_secure(src_file, code);
     let ext = _shared_lib_ext();
     let out_file = out_dir + "/" + _lib_prefix() + block_name + ext;
-    let result = try {
-        let r = exec("c++ -shared -fPIC -std=c++17 -o " + out_file + " " + src_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "c++ build failed" };
+    let result = _run_argv("c++", ["-shared", "-fPIC", "-std=c++17", "-o", out_file, src_file],
+        "c++ build failed");
     if result.exit_code != 0 {
-        return map{ error: "cpp build failed: " + result.stderr };
+        return _compile_error("cpp", "cpp build failed", result, src_file);
     }
-    return map{ ok: true, artifact: out_file, language: "cpp" };
+    return _compiled_artifact("cpp", out_file, result);
 }
 
 // ── Compile Language: Go ─────────────────────────────────────────────────────
 
 fn build_go(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let proj_dir = out_dir + "/go_" + block_name;
-    fs_mkdirs(proj_dir);
-    fs_write(proj_dir + "/main.go", code);
-    fs_write(proj_dir + "/go.mod", "module " + block_name + "\n\ngo 1.21\n");
+    _write_text_secure(proj_dir + "/main.go", code);
+    _write_text_secure(proj_dir + "/go.mod", "module " + block_name + "\n\ngo 1.21\n");
     let ext = _shared_lib_ext();
     let out_file = proj_dir + "/" + block_name + ext;
-    let result = try {
-        let r = exec("go build -buildmode=c-shared -o " + out_file + " " + proj_dir + "/main.go");
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "go build failed" };
+    let result = _run_argv("go",
+        ["build", "-buildmode=c-shared", "-o", out_file, proj_dir + "/main.go"],
+        "go build failed");
     if result.exit_code != 0 {
-        return map{ error: "go build failed: " + result.stderr };
+        return _compile_error("go", "go build failed", result, proj_dir + "/main.go");
     }
-    return map{ ok: true, artifact: out_file, language: "go" };
+    return _compiled_artifact("go", out_file, result);
 }
 
 // ── Compile Language: Python ─────────────────────────────────────────────────
 
 fn build_python(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let py_file = out_dir + "/" + block_name + ".py";
-    fs_write(py_file, code);
-    return map{ ok: true, artifact: py_file, language: "python" };
+    _write_text_secure(py_file, code);
+    return _source_artifact("python", py_file);
 }
 
 // ── Compile Language: JavaScript ─────────────────────────────────────────────
 
 fn build_js(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let js_file = out_dir + "/" + block_name + ".js";
-    fs_write(js_file, code);
-    return map{ ok: true, artifact: js_file, language: "javascript" };
+    _write_text_secure(js_file, code);
+    return _source_artifact("javascript", js_file);
 }
 
 // ── Compile Language: TypeScript ─────────────────────────────────────────────
 
 fn build_typescript(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let ts_file = out_dir + "/" + block_name + ".ts";
-    fs_write(ts_file, code);
-    let result = try {
-        let r = exec("npx tsc " + ts_file + " --outDir " + out_dir);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "tsc build failed" };
+    _write_text_secure(ts_file, code);
+    // Invoke the installed compiler directly. Package runners may resolve or
+    // download mutable packages, which is outside this bounded build contract.
+    let result = _run_argv("tsc", [ts_file, "--outDir", out_dir],
+        "tsc build failed");
     if result.exit_code != 0 {
-        return map{ ok: true, artifact: ts_file, language: "typescript", warning: "tsc unavailable, .ts file saved" };
+        return _source_fallback("typescript", ts_file,
+            "tsc unavailable, .ts file saved", result);
     }
     let js_file = out_dir + "/" + block_name + ".js";
-    return map{ ok: true, artifact: js_file, language: "typescript" };
+    return _compiled_artifact("typescript", js_file, result);
 }
 
 // ── Compile Language: Java ───────────────────────────────────────────────────
 
 fn build_java(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let java_file = out_dir + "/" + block_name + ".java";
-    fs_write(java_file, code);
-    let result = try {
-        let r = exec("javac " + java_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "javac build failed" };
+    _write_text_secure(java_file, code);
+    let result = _run_argv("javac", [java_file], "javac build failed");
     if result.exit_code != 0 {
-        return map{ error: "java build failed: " + result.stderr };
+        return _compile_error("java", "java build failed", result, java_file);
     }
-    return map{ ok: true, artifact: out_dir, language: "java" };
+    return _compiled_artifact("java", out_dir + "/" + block_name + ".class", result);
 }
 
 // ── Compile Language: Kotlin ─────────────────────────────────────────────────
 
 fn build_kotlin(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let kt_file = out_dir + "/" + block_name + ".kt";
-    fs_write(kt_file, code);
-    let result = try {
-        let r = exec("kotlinc " + kt_file + " -d " + out_dir);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "kotlinc build failed" };
+    _write_text_secure(kt_file, code);
+    let jar_file = out_dir + "/" + block_name + ".jar";
+    let result = _run_argv("kotlinc", [kt_file, "-include-runtime", "-d", jar_file],
+        "kotlinc build failed");
     if result.exit_code != 0 {
-        return map{ error: "kotlin build failed: " + result.stderr };
+        return _compile_error("kotlin", "kotlin build failed", result, kt_file);
     }
-    return map{ ok: true, artifact: out_dir, language: "kotlin" };
+    return _compiled_artifact("kotlin", jar_file, result);
 }
 
 // ── Compile Language: Swift ──────────────────────────────────────────────────
 
 fn build_swift(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let swift_file = out_dir + "/" + block_name + ".swift";
-    fs_write(swift_file, code);
+    _write_text_secure(swift_file, code);
     let ext = _shared_lib_ext();
     let out_file = out_dir + "/" + _lib_prefix() + block_name + ext;
-    let result = try {
-        let r = exec("swiftc -emit-library -o " + out_file + " " + swift_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "swiftc build failed" };
+    let result = _run_argv("swiftc", ["-emit-library", "-o", out_file, swift_file],
+        "swiftc build failed");
     if result.exit_code != 0 {
-        return map{ error: "swift build failed: " + result.stderr };
+        return _compile_error("swift", "swift build failed", result, swift_file);
     }
-    return map{ ok: true, artifact: out_file, language: "swift" };
+    return _compiled_artifact("swift", out_file, result);
 }
 
 // ── Compile Language: Zig ────────────────────────────────────────────────────
 
 fn build_zig(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let zig_file = out_dir + "/" + block_name + ".zig";
-    fs_write(zig_file, code);
+    _write_text_secure(zig_file, code);
     let ext = _shared_lib_ext();
     let out_file = out_dir + "/" + block_name + ext;
-    let result = try {
-        let r = exec("zig build-lib -dynamic " + zig_file + " --name " + block_name + " -fPIC");
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "zig build failed" };
+    let result = _run_argv("zig",
+        ["build-lib", zig_file, "-dynamic", "-fPIC", "-femit-bin=" + out_file],
+        "zig build failed");
     if result.exit_code != 0 {
-        return map{ error: "zig build failed: " + result.stderr };
+        return _compile_error("zig", "zig build failed", result, zig_file);
     }
-    return map{ ok: true, artifact: out_file, language: "zig" };
+    return _compiled_artifact("zig", out_file, result);
 }
 
 // ── Compile Language: Nim ────────────────────────────────────────────────────
 
 fn build_nim(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let nim_file = out_dir + "/" + block_name + ".nim";
-    fs_write(nim_file, code);
+    _write_text_secure(nim_file, code);
     let out_file = out_dir + "/" + _lib_prefix() + block_name + _shared_lib_ext();
-    let result = try {
-        let r = exec("nim c --app:lib -o:" + out_file + " " + nim_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "nim build failed" };
+    let result = _run_argv("nim", ["c", "--app:lib", "-o:" + out_file, nim_file],
+        "nim build failed");
     if result.exit_code != 0 {
-        return map{ error: "nim build failed: " + result.stderr };
+        return _compile_error("nim", "nim build failed", result, nim_file);
     }
-    return map{ ok: true, artifact: out_file, language: "nim" };
+    return _compiled_artifact("nim", out_file, result);
 }
 
 // ── Compile Language: Lua ────────────────────────────────────────────────────
 
 fn build_lua(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let lua_file = out_dir + "/" + block_name + ".lua";
-    fs_write(lua_file, code);
-    return map{ ok: true, artifact: lua_file, language: "lua" };
+    _write_text_secure(lua_file, code);
+    return _source_artifact("lua", lua_file);
 }
 
 // ── Compile Language: Ruby ───────────────────────────────────────────────────
 
 fn build_ruby(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let rb_file = out_dir + "/" + block_name + ".rb";
-    fs_write(rb_file, code);
-    return map{ ok: true, artifact: rb_file, language: "ruby" };
+    _write_text_secure(rb_file, code);
+    return _source_artifact("ruby", rb_file);
 }
 
 // ── Compile Language: PHP ────────────────────────────────────────────────────
 
 fn build_php(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let php_file = out_dir + "/" + block_name + ".php";
-    fs_write(php_file, code);
-    return map{ ok: true, artifact: php_file, language: "php" };
+    _write_text_secure(php_file, code);
+    return _source_artifact("php", php_file);
 }
 
 // ── Compile Language: R ──────────────────────────────────────────────────────
 
 fn build_r(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let r_file = out_dir + "/" + block_name + ".r";
-    fs_write(r_file, code);
-    return map{ ok: true, artifact: r_file, language: "r" };
+    _write_text_secure(r_file, code);
+    return _source_artifact("r", r_file);
 }
 
 // ── Compile Language: Dart ───────────────────────────────────────────────────
 
 fn build_dart(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let dart_file = out_dir + "/" + block_name + ".dart";
-    fs_write(dart_file, code);
-    let result = try {
-        let r = exec("dart compile exe " + dart_file + " -o " + out_dir + "/" + block_name);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "dart build failed" };
+    _write_text_secure(dart_file, code);
+    let result = _run_argv("dart",
+        ["compile", "exe", dart_file, "-o", out_dir + "/" + block_name],
+        "dart build failed");
     if result.exit_code != 0 {
-        return map{ error: "dart build failed: " + result.stderr };
+        return _compile_error("dart", "dart build failed", result, dart_file);
     }
-    return map{ ok: true, artifact: out_dir + "/" + block_name, language: "dart" };
+    return _compiled_artifact("dart", out_dir + "/" + block_name, result);
 }
 
 // ── Compile Language: Bash ───────────────────────────────────────────────────
 
 fn build_bash(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let sh_file = out_dir + "/" + block_name + ".sh";
-    fs_write(sh_file, code);
-    return map{ ok: true, artifact: sh_file, language: "bash" };
+    _write_text_secure(sh_file, code);
+    return _source_artifact("bash", sh_file);
 }
 
 // ── Compile Language: Perl ───────────────────────────────────────────────────
 
 fn build_perl(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let pl_file = out_dir + "/" + block_name + ".pl";
-    fs_write(pl_file, code);
-    return map{ ok: true, artifact: pl_file, language: "perl" };
+    _write_text_secure(pl_file, code);
+    return _source_artifact("perl", pl_file);
 }
 
 // ── Compile Language: Haskell ────────────────────────────────────────────────
 
 fn build_haskell(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let hs_file = out_dir + "/" + block_name + ".hs";
-    fs_write(hs_file, code);
+    _write_text_secure(hs_file, code);
     let ext = _shared_lib_ext();
     let out_file = out_dir + "/" + block_name + ext;
-    let result = try {
-        let r = exec("ghc -shared -o " + out_file + " " + hs_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "ghc build failed" };
+    let result = _run_argv("ghc", ["-shared", "-o", out_file, hs_file],
+        "ghc build failed");
     if result.exit_code != 0 {
-        return map{ error: "haskell build failed: " + result.stderr };
+        return _compile_error("haskell", "haskell build failed", result, hs_file);
     }
-    return map{ ok: true, artifact: out_file, language: "haskell" };
+    return _compiled_artifact("haskell", out_file, result);
 }
 
 // ── Compile Language: Crystal ────────────────────────────────────────────────
 
 fn build_crystal(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let cr_file = out_dir + "/" + block_name + ".cr";
-    fs_write(cr_file, code);
+    _write_text_secure(cr_file, code);
     let ext = _shared_lib_ext();
     let out_file = out_dir + "/" + block_name + ext;
-    let result = try {
-        let r = proc_spawn_wait("crystal", ["build", "--link-flags=-shared", "-o", out_file, cr_file]);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "crystal build failed" };
+    let result = _run_argv("crystal",
+        ["build", "--link-flags=-shared", "-o", out_file, cr_file],
+        "crystal build failed");
     if result.exit_code != 0 {
-        return map{ error: "crystal build failed: " + result.stderr };
+        return _compile_error("crystal", "crystal build failed", result, cr_file);
     }
-    return map{ ok: true, artifact: out_file, language: "crystal" };
+    return _compiled_artifact("crystal", out_file, result);
 }
 
 // ── Compile Language: D ──────────────────────────────────────────────────────
 
 fn build_d(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let d_file = out_dir + "/" + block_name + ".d";
-    fs_write(d_file, code);
+    _write_text_secure(d_file, code);
     let ext = _shared_lib_ext();
     let out_file = out_dir + "/" + _lib_prefix() + block_name + ext;
-    let result = try {
-        let r = exec("dmd -shared -of=" + out_file + " " + d_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "dmd build failed" };
+    let result = _run_argv("dmd", ["-shared", "-of=" + out_file, d_file],
+        "dmd build failed");
     if result.exit_code != 0 {
-        return map{ error: "d build failed: " + result.stderr };
+        return _compile_error("d", "d build failed", result, d_file);
     }
-    return map{ ok: true, artifact: out_file, language: "d" };
+    return _compiled_artifact("d", out_file, result);
 }
 
 // ── Compile Language: Wasm ───────────────────────────────────────────────────
 
 fn build_wasm(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let src_file = out_dir + "/" + block_name + ".wat";
-    fs_write(src_file, code);
+    _write_text_secure(src_file, code);
     let out_file = out_dir + "/" + block_name + ".wasm";
-    let result = try {
-        let r = exec("wat2wasm " + src_file + " -o " + out_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "wat2wasm build failed" };
+    let result = _run_argv("wat2wasm", [src_file, "-o", out_file],
+        "wat2wasm build failed");
     if result.exit_code != 0 {
-        return map{ error: "wasm build failed: " + result.stderr };
+        return _compile_error("wasm", "wasm build failed", result, src_file);
     }
-    return map{ ok: true, artifact: out_file, language: "wasm" };
+    return _compiled_artifact("wasm", out_file, result);
 }
 
 
 // ── Compile Language: Q# ────────────────────────────────────────────────────
 
 fn build_qsharp(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let qs_file = out_dir + "/" + block_name + ".qs";
-    fs_write(qs_file, code);
-    // Q# runs via the Python `qsharp` package. Reference the already-written .qs
-    // FILE (like every other build_* function) instead of inlining `code` into the
-    // shell command — that avoids both the quoting breakage that made this whole
-    // module fail to parse and a command-injection hole.
-    let result = try {
-        let r = exec("python3 -c \"import qsharp; qsharp.eval(open('" + qs_file + "').read())\"");
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "qsharp execution failed" };
-    if result.exit_code != 0 {
-        return map{ ok: true, artifact: qs_file, language: "qsharp", warning: "qsharp via python3 failed, .qs file saved" };
-    }
-    return map{ ok: true, artifact: qs_file, language: "qsharp" };
+    _write_text_secure(qs_file, code);
+    // Source publication is not compilation. In particular, build must never
+    // evaluate caller-supplied Q# through a language host as a side effect.
+    return _source_fallback("qsharp", qs_file,
+        "Q# compiler backend unavailable; source saved without execution");
 }
 
 // ── Compile Language: HTML ───────────────────────────────────────────────────
 
 fn build_html(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let html_file = out_dir + "/" + block_name + ".html";
-    fs_write(html_file, "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>pblang</title></head><body>\n" + code + "\n</body></html>");
-    return map{ ok: true, artifact: html_file, language: "html" };
+    _write_text_secure(html_file, "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>pblang</title></head><body>\n" + code + "\n</body></html>");
+    return _source_artifact("html", html_file);
 }
 
 // ── Compile Language: CSS ────────────────────────────────────────────────────
 
 fn build_css(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let css_file = out_dir + "/" + block_name + ".css";
-    fs_write(css_file, code);
-    return map{ ok: true, artifact: css_file, language: "css" };
+    _write_text_secure(css_file, code);
+    return _source_artifact("css", css_file);
 }
 
 // ── Compile Language: SCSS/Sass ──────────────────────────────────────────────
 
 fn build_sass(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let scss_file = out_dir + "/" + block_name + ".scss";
-    fs_write(scss_file, code);
+    _write_text_secure(scss_file, code);
     let css_file = out_dir + "/" + block_name + ".css";
-    let result = try {
-        let r = exec("sass --stdin " + scss_file + " " + css_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "sass build failed" };
+    let result = _run_argv("sass", [scss_file, css_file], "sass build failed");
     if result.exit_code != 0 {
-        return map{ ok: true, artifact: scss_file, language: "scss", warning: "sass unavailable, .scss file saved" };
+        return _source_fallback("scss", scss_file,
+            "sass unavailable, .scss file saved", result);
     }
-    return map{ ok: true, artifact: css_file, language: "scss" };
+    return _compiled_artifact("scss", css_file, result);
 }
 
 // ── Compile Language: Less ───────────────────────────────────────────────────
 
 fn build_less(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let less_file = out_dir + "/" + block_name + ".less";
-    fs_write(less_file, code);
+    _write_text_secure(less_file, code);
     let css_file = out_dir + "/" + block_name + ".css";
-    let result = try {
-        let r = exec("lessc " + less_file + " " + css_file);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "lessc build failed" };
+    let result = _run_argv("lessc", [less_file, css_file], "lessc build failed");
     if result.exit_code != 0 {
-        return map{ ok: true, artifact: less_file, language: "less", warning: "lessc unavailable, .less file saved" };
+        return _source_fallback("less", less_file,
+            "lessc unavailable, .less file saved", result);
     }
-    return map{ ok: true, artifact: css_file, language: "less" };
+    return _compiled_artifact("less", css_file, result);
 }
 
 // ── Compile Language: SQL ────────────────────────────────────────────────────
 
-// sql_result_ok(result) — sqlite3 exit 0 is valid SQL; a nonzero exit is a
-// REAL syntax error; exit -1 is our own "sqlite3 not found" sentinel and
-// skips validation (tool absence is not a code error).
+// Compatibility helper for callers that already hold a non-executing parser
+// result. Tool absence is never equivalent to successful validation.
 fn sql_result_ok(result) {
     let code = try result.exit_code catch 0;
     if code == 0 { return true; }
-    if code == 0 - 1 { return true; }
     return false;
 }
 
 fn build_sql(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let sql_file = out_dir + "/" + block_name + ".sql";
-    fs_write(sql_file, code);
-    // Run against in-memory SQLite to validate syntax (result was IGNORED
-    // before — invalid SQL still came back ok:true)
-    let result = try {
-        let r = exec("sqlite3 :memory: \".read " + sql_file + "\"");
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "sqlite3 not found" };
-    let valid = sql_result_ok(result);
-    let out = map{ ok: valid, artifact: sql_file, language: "sql" };
-    if not valid { out.error = try result.stderr catch "sqlite3 rejected the script"; }
-    return out;
+    _write_text_secure(sql_file, code);
+    // Build never executes caller SQL. A future backend may attach a bounded,
+    // non-executing parser report; until then publication is explicitly
+    // source-only and unvalidated.
+    return _source_fallback("sql", sql_file,
+        "SQL source saved without execution; non-executing parser unavailable");
 }
 
 // ── Compile Language: MATLAB/Octave ──────────────────────────────────────────
 
 fn build_matlab(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let m_file = out_dir + "/" + block_name + ".m";
-    fs_write(m_file, code);
-    return map{ ok: true, artifact: m_file, language: "matlab" };
+    _write_text_secure(m_file, code);
+    return _source_artifact("matlab", m_file);
 }
 
 // ── Compile Language: Prolog ─────────────────────────────────────────────────
 
 fn build_prolog(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let pl_file = out_dir + "/" + block_name + ".pl";
-    fs_write(pl_file, code);
-    return map{ ok: true, artifact: pl_file, language: "prolog" };
+    _write_text_secure(pl_file, code);
+    return _source_artifact("prolog", pl_file);
 }
 
 // ── Compile Language: Forth ──────────────────────────────────────────────────
 
 fn build_forth(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let fth_file = out_dir + "/" + block_name + ".fth";
-    fs_write(fth_file, code);
-    return map{ ok: true, artifact: fth_file, language: "forth" };
+    _write_text_secure(fth_file, code);
+    return _source_artifact("forth", fth_file);
 }
 
 // ── Compile Language: Solidity ───────────────────────────────────────────────
 
 fn build_solidity(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let sol_file = out_dir + "/" + block_name + ".sol";
-    fs_write(sol_file, code);
-    let result = try {
-        let r = exec("solc --bin " + sol_file + " -o " + out_dir);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "solc build failed" };
+    _write_text_secure(sol_file, code);
+    let result = _run_argv("solc", ["--bin", sol_file, "-o", out_dir],
+        "solc build failed");
     if result.exit_code != 0 {
-        return map{ ok: true, artifact: sol_file, language: "solidity", warning: "solc unavailable, .sol file saved" };
+        return _source_fallback("solidity", sol_file,
+            "solc unavailable, .sol file saved", result);
     }
-    return map{ ok: true, artifact: sol_file, language: "solidity" };
+    // solc may emit multiple files whose names depend on contract declarations;
+    // do not mislabel the input source as the compiled artifact.
+    return _source_fallback("solidity", sol_file,
+        "solc completed, but a single deterministic artifact is not available", result);
 }
 
 // ── Compile Language: Odin ──────────────────────────────────────────────────
 
 fn build_odin(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let odin_file = out_dir + "/" + block_name + ".odin";
-    fs_write(odin_file, code);
-    return map{ ok: true, artifact: odin_file, language: "odin" };
+    _write_text_secure(odin_file, code);
+    return _source_artifact("odin", odin_file);
 }
 
 // ── Compile Language: Carbon ─────────────────────────────────────────────────
 
 fn build_carbon(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let carbon_file = out_dir + "/" + block_name + ".carbon";
-    fs_write(carbon_file, code);
-    return map{ ok: true, artifact: carbon_file, language: "carbon" };
+    _write_text_secure(carbon_file, code);
+    return _source_artifact("carbon", carbon_file);
 }
 
 // ── Compile Language: Mojo ───────────────────────────────────────────────────
 
 fn build_mojo(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let mojo_file = out_dir + "/" + block_name + ".mojo";
-    fs_write(mojo_file, code);
-    let result = try {
-        let r = exec("mojo build " + mojo_file + " -o " + out_dir + "/" + block_name);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "mojo build failed" };
+    _write_text_secure(mojo_file, code);
+    let result = _run_argv("mojo",
+        ["build", mojo_file, "-o", out_dir + "/" + block_name], "mojo build failed");
     if result.exit_code != 0 {
-        return map{ ok: true, artifact: mojo_file, language: "mojo", warning: "mojo unavailable, .mojo file saved" };
+        return _source_fallback("mojo", mojo_file,
+            "mojo unavailable, .mojo file saved", result);
     }
-    return map{ ok: true, artifact: out_dir + "/" + block_name, language: "mojo" };
+    return _compiled_artifact("mojo", out_dir + "/" + block_name, result);
 }
 
 // ── Compile Language: Chapel ─────────────────────────────────────────────────
 
 fn build_chapel(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let chpl_file = out_dir + "/" + block_name + ".chpl";
-    fs_write(chpl_file, code);
-    let result = try {
-        let r = exec("chpl " + chpl_file + " -o " + out_dir + "/" + block_name);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "chpl build failed" };
+    _write_text_secure(chpl_file, code);
+    let result = _run_argv("chpl",
+        [chpl_file, "-o", out_dir + "/" + block_name], "chpl build failed");
     if result.exit_code != 0 {
-        return map{ ok: true, artifact: chpl_file, language: "chapel", warning: "chpl unavailable, .chpl file saved" };
+        return _source_fallback("chapel", chpl_file,
+            "chpl unavailable, .chpl file saved", result);
     }
-    return map{ ok: true, artifact: out_dir + "/" + block_name, language: "chapel" };
+    return _compiled_artifact("chapel", out_dir + "/" + block_name, result);
 }
 
 // ── Compile Language: Factor ─────────────────────────────────────────────────
 
 fn build_factor(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let factor_file = out_dir + "/" + block_name + ".factor";
-    fs_write(factor_file, code);
-    return map{ ok: true, artifact: factor_file, language: "factor" };
+    _write_text_secure(factor_file, code);
+    return _source_artifact("factor", factor_file);
 }
 
 // ── Compile Language: PureScript ──────────────────────────────────────────────
 
 fn build_purescript(block_name, code, out_dir) {
+    _validate_build_input(block_name, code, out_dir);
+    out_dir = _private_build_output(out_dir, block_name);
     let purs_file = out_dir + "/" + block_name + ".purs";
-    fs_write(purs_file, code);
-    let result = try {
-        let r = exec("purs compile " + purs_file + " -o " + out_dir);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "purs build failed" };
+    _write_text_secure(purs_file, code);
+    let result = _run_argv("purs", ["compile", purs_file, "-o", out_dir],
+        "purs build failed");
     if result.exit_code != 0 {
-        return map{ ok: true, artifact: purs_file, language: "purescript", warning: "purs unavailable, .purs file saved" };
+        return _source_fallback("purescript", purs_file,
+            "purs unavailable, .purs file saved", result);
     }
-    return map{ ok: true, artifact: out_dir, language: "purescript" };
+    return _source_fallback("purescript", purs_file,
+        "purs completed, but a single deterministic artifact is not available", result);
 }
 // ── Platform Helpers ──────────────────────────────────────────────────────────
 
@@ -592,107 +882,85 @@ fn _lib_prefix() {
 
 // ── Project Builder ───────────────────────────────────────────────────────────
 
+// Canonical language dispatch used by both direct registry builds and
+// extracted @language blocks. Keeping one dispatch table prevents security and
+// correctness fixes from drifting between the two public entrypoints.
+fn build_language(language, block_name, code, out_dir) {
+    let lang = str_lower(str_trim(str(language)));
+    if lang == "rust" or lang == "rs" { return build_rust(block_name, code, out_dir); }
+    if lang == "c" { return build_c(block_name, code, out_dir); }
+    if lang == "cpp" or lang == "c++" or lang == "cxx" { return build_cpp(block_name, code, out_dir); }
+    if lang == "go" { return build_go(block_name, code, out_dir); }
+    if lang == "python" or lang == "py" { return build_python(block_name, code, out_dir); }
+    if lang == "js" or lang == "javascript" { return build_js(block_name, code, out_dir); }
+    if lang == "typescript" or lang == "ts" { return build_typescript(block_name, code, out_dir); }
+    if lang == "java" { return build_java(block_name, code, out_dir); }
+    if lang == "kotlin" or lang == "kt" { return build_kotlin(block_name, code, out_dir); }
+    if lang == "swift" { return build_swift(block_name, code, out_dir); }
+    if lang == "zig" { return build_zig(block_name, code, out_dir); }
+    if lang == "nim" { return build_nim(block_name, code, out_dir); }
+    if lang == "lua" { return build_lua(block_name, code, out_dir); }
+    if lang == "ruby" or lang == "rb" { return build_ruby(block_name, code, out_dir); }
+    if lang == "php" { return build_php(block_name, code, out_dir); }
+    if lang == "r" { return build_r(block_name, code, out_dir); }
+    if lang == "dart" { return build_dart(block_name, code, out_dir); }
+    if lang == "bash" or lang == "sh" { return build_bash(block_name, code, out_dir); }
+    if lang == "perl" or lang == "pl" { return build_perl(block_name, code, out_dir); }
+    if lang == "haskell" or lang == "hs" { return build_haskell(block_name, code, out_dir); }
+    if lang == "crystal" or lang == "cr" { return build_crystal(block_name, code, out_dir); }
+    if lang == "d" { return build_d(block_name, code, out_dir); }
+    if lang == "wasm" or lang == "wat" { return build_wasm(block_name, code, out_dir); }
+    if lang == "qsharp" or lang == "qs" or lang == "q#" { return build_qsharp(block_name, code, out_dir); }
+    if lang == "html" { return build_html(block_name, code, out_dir); }
+    if lang == "css" { return build_css(block_name, code, out_dir); }
+    if lang == "scss" or lang == "sass" { return build_sass(block_name, code, out_dir); }
+    if lang == "less" { return build_less(block_name, code, out_dir); }
+    if lang == "sql" or lang == "sqlite" { return build_sql(block_name, code, out_dir); }
+    if lang == "matlab" or lang == "octave" or lang == "m" { return build_matlab(block_name, code, out_dir); }
+    if lang == "prolog" or lang == "plg" { return build_prolog(block_name, code, out_dir); }
+    if lang == "forth" or lang == "fth" { return build_forth(block_name, code, out_dir); }
+    if lang == "solidity" or lang == "sol" { return build_solidity(block_name, code, out_dir); }
+    if lang == "odin" { return build_odin(block_name, code, out_dir); }
+    if lang == "carbon" { return build_carbon(block_name, code, out_dir); }
+    if lang == "mojo" { return build_mojo(block_name, code, out_dir); }
+    if lang == "chapel" or lang == "chpl" { return build_chapel(block_name, code, out_dir); }
+    if lang == "factor" { return build_factor(block_name, code, out_dir); }
+    if lang == "purescript" or lang == "purs" { return build_purescript(block_name, code, out_dir); }
+    return map{ ok: false, build_ok: false, compiled: false, executed: false,
+        error: "unsupported language: " + lang, language: lang };
+}
+
 fn build_file(filepath) {
-    let source = fs_read(filepath);
-    if source == nil { return map{ error: "cannot read: " + filepath }; }
+    if type(filepath) != "string" or len(filepath) < 1
+       or len(str_to_bytes(filepath)) > MAX_PATH_BYTES
+       or str_contains(filepath, strfromcharcode(0)) { return map{ error: "invalid source path" }; }
+    let loaded = SECURE_FILE.read_text(filepath, MAX_SOURCE_BYTES);
+    if not loaded.ok { return map{ error: "cannot securely read bounded source" }; }
+    let source = loaded.text;
 
     let blocks = extract_blocks(source);
     let out_dir = path_dirname(filepath) + "/.pblang_polyglot";
-    fs_mkdirs(out_dir);
 
     let results = [];
+    let ready = 0; let fallbacks = 0; let failed = 0;
     for i len(blocks) {
         let block = blocks[i];
         let block_name = "block_" + str(i);
 
-        let result = nil;
-        if block.language == "rust" or block.language == "rs" {
-            result = build_rust(block_name, block.code, out_dir);
-        } else if block.language == "c" {
-            result = build_c(block_name, block.code, out_dir);
-        } else if block.language == "cpp" or block.language == "c++" or block.language == "cxx" {
-            result = build_cpp(block_name, block.code, out_dir);
-        } else if block.language == "go" {
-            result = build_go(block_name, block.code, out_dir);
-        } else if block.language == "python" or block.language == "py" {
-            result = build_python(block_name, block.code, out_dir);
-        } else if block.language == "js" or block.language == "javascript" {
-            result = build_js(block_name, block.code, out_dir);
-        } else if block.language == "typescript" or block.language == "ts" {
-            result = build_typescript(block_name, block.code, out_dir);
-        } else if block.language == "java" {
-            result = build_java(block_name, block.code, out_dir);
-        } else if block.language == "kotlin" or block.language == "kt" {
-            result = build_kotlin(block_name, block.code, out_dir);
-        } else if block.language == "swift" {
-            result = build_swift(block_name, block.code, out_dir);
-        } else if block.language == "zig" {
-            result = build_zig(block_name, block.code, out_dir);
-        } else if block.language == "nim" {
-            result = build_nim(block_name, block.code, out_dir);
-        } else if block.language == "lua" {
-            result = build_lua(block_name, block.code, out_dir);
-        } else if block.language == "ruby" or block.language == "rb" {
-            result = build_ruby(block_name, block.code, out_dir);
-        } else if block.language == "php" {
-            result = build_php(block_name, block.code, out_dir);
-        } else if block.language == "r" {
-            result = build_r(block_name, block.code, out_dir);
-        } else if block.language == "dart" {
-            result = build_dart(block_name, block.code, out_dir);
-        } else if block.language == "bash" or block.language == "sh" {
-            result = build_bash(block_name, block.code, out_dir);
-        } else if block.language == "perl" or block.language == "pl" {
-            result = build_perl(block_name, block.code, out_dir);
-        } else if block.language == "haskell" or block.language == "hs" {
-            result = build_haskell(block_name, block.code, out_dir);
-        } else if block.language == "crystal" or block.language == "cr" {
-            result = build_crystal(block_name, block.code, out_dir);
-        } else if block.language == "d" {
-            result = build_d(block_name, block.code, out_dir);
-        } else if block.language == "wasm" or block.language == "wat" {
-            result = build_wasm(block_name, block.code, out_dir);
-        } else if block.language == "qsharp" or block.language == "qs" or block.language == "q#" {
-            result = build_qsharp(block_name, block.code, out_dir);
-        } else if block.language == "html" {
-            result = build_html(block_name, block.code, out_dir);
-        } else if block.language == "css" {
-            result = build_css(block_name, block.code, out_dir);
-        } else if block.language == "scss" or block.language == "sass" {
-            result = build_sass(block_name, block.code, out_dir);
-        } else if block.language == "less" {
-            result = build_less(block_name, block.code, out_dir);
-        } else if block.language == "sql" or block.language == "sqlite" {
-            result = build_sql(block_name, block.code, out_dir);
-        } else if block.language == "matlab" or block.language == "octave" or block.language == "m" {
-            result = build_matlab(block_name, block.code, out_dir);
-        } else if block.language == "prolog" or block.language == "plg" {
-            result = build_prolog(block_name, block.code, out_dir);
-        } else if block.language == "forth" or block.language == "fth" {
-            result = build_forth(block_name, block.code, out_dir);
-        } else if block.language == "solidity" or block.language == "sol" {
-            result = build_solidity(block_name, block.code, out_dir);
-        } else if block.language == "odin" {
-            result = build_odin(block_name, block.code, out_dir);
-        } else if block.language == "carbon" {
-            result = build_carbon(block_name, block.code, out_dir);
-        } else if block.language == "mojo" {
-            result = build_mojo(block_name, block.code, out_dir);
-        } else if block.language == "chapel" or block.language == "chpl" {
-            result = build_chapel(block_name, block.code, out_dir);
-        } else if block.language == "factor" {
-            result = build_factor(block_name, block.code, out_dir);
-        } else if block.language == "purescript" or block.language == "purs" {
-            result = build_purescript(block_name, block.code, out_dir);
-        } else {
-            result = map{ error: "unsupported language: " + block.language };
-        }
+        let result = build_language(block.language, block_name, block.code, out_dir);
 
         array_push(results, result);
+        if try result.status catch "" == "fallback" { fallbacks = fallbacks + 1; }
+        elif try result.ok catch false { ready = ready + 1; }
+        else { failed = failed + 1; }
     }
 
     return map{
-        ok: true,
+        ok: failed == 0,
+        complete: failed == 0 and fallbacks == 0,
+        ready: ready,
+        fallbacks: fallbacks,
+        failed: failed,
         file: filepath,
         blocks: len(blocks),
         artifacts: results,
@@ -700,28 +968,32 @@ fn build_file(filepath) {
     };
 }
 
-// Recursively list all files under a directory. No fs builtin exists for this, so we
-// recurse with fs_listdir: an entry that itself lists as a directory is descended,
-// otherwise it is a file. Returns nil only if the top directory is unreadable.
-fn fs_list_dir_recursive(dir) {
-    let entries = try fs_listdir(dir) catch nil;
-    if entries == nil { return nil; }
-    let out = [];
+// Recursively list through held no-follow directory roots. A symbolic-link
+// directory cannot be opened by list_directory and is treated as a non-directory;
+// build_file then rejects a link masquerading as a source through secure read.
+fn _collect_files(dir, out, depth) {
+    if depth > MAX_PROJECT_DEPTH { throw "polyglot_build: project depth limit exceeded"; }
+    let listed = SECURE_FILE.list_directory(dir, 4096);
+    if not listed.ok { return false; }
+    if listed.truncated { throw "polyglot_build: directory entry limit exceeded"; }
+    let entries = listed.entries;
     let i = 0;
     while i < len(entries) {
+        if len(out) >= MAX_PROJECT_FILES { throw "polyglot_build: project file limit exceeded"; }
         let full = path_join(dir, entries[i]);
-        let sub = try fs_listdir(full) catch nil;
-        if sub == nil {
+        if not SECURE_FILE.list_directory(full, 4096).ok {
             array_push(out, full);
         } else {
-            let rec = fs_list_dir_recursive(full);
-            if rec != nil {
-                let j = 0;
-                while j < len(rec) { array_push(out, rec[j]); j = j + 1; }
-            }
+            _collect_files(full, out, depth + 1);
         }
         i = i + 1;
     }
+    return true;
+}
+
+fn fs_list_dir_recursive(dir) {
+    let out = [];
+    if not _collect_files(dir, out, 0) { return nil; }
     return out;
 }
 
@@ -729,34 +1001,70 @@ fn build_project(project_dir) {
     let files = fs_list_dir_recursive(project_dir);
     if files == nil { return map{ error: "cannot read directory: " + project_dir }; }
 
-    let results = [];
+    let results = []; let failed = 0;
     for i len(files) {
         let file = files[i];
         if str_ends_with(file, ".sapp") or str_ends_with(file, ".sap") {
-            let full_path = project_dir + "/" + file;
-            let r = build_file(full_path);
+            let r = build_file(file);
             array_push(results, r);
+            if not (try r.ok catch false) { failed = failed + 1; }
         }
     }
 
     return map{
-        ok: true,
+        ok: failed == 0,
         project: project_dir,
         files_processed: len(results),
+        failed: failed,
         results: results,
     };
 }
 
 // ── Artifact Loading ──────────────────────────────────────────────────────────
 
+fn _artifact_load_failure(message, artifact_path = "") {
+    return map{ format: "pblang.polyglot-artifact-load.v2", ok: false,
+        complete: false, executed: false, policy_required: true,
+        raw_fallback: false, artifact: artifact_path, error: message };
+}
+
+// Loading a native library may execute constructors. It therefore requires an
+// exact ffi_universal policy even before a symbol is called.
+fn load_artifact_checked(policy, artifact_path) {
+    if type(artifact_path) != "string" or len(artifact_path) < 1
+       or len(str_to_bytes(artifact_path)) > MAX_PATH_BYTES
+       or str_contains(artifact_path, strfromcharcode(0))
+       or str_contains(artifact_path, "\n") or str_contains(artifact_path, "\r") {
+        return _artifact_load_failure("invalid artifact path", str(artifact_path));
+    }
+    if str_ends_with(artifact_path, ".py") or str_ends_with(artifact_path, ".js") {
+        return _artifact_load_failure(
+            "executable script artifacts require the bounded polyglot execution API",
+            artifact_path);
+    }
+    if not str_ends_with(artifact_path, ".so")
+       and not str_ends_with(artifact_path, ".dylib")
+       and not str_ends_with(artifact_path, ".dll") {
+        return _artifact_load_failure("unsupported executable artifact type", artifact_path);
+    }
+    let loaded = FFI.load_checked(policy, artifact_path);
+    if not (try loaded.ok catch false) {
+        return map{ format: "pblang.polyglot-artifact-load.v2", ok: false,
+            complete: false, executed: false, policy_required: true,
+            raw_fallback: false, artifact: artifact_path,
+            decision: try loaded.decision catch nil,
+            error: try loaded.reason catch "artifact policy denied loading" };
+    }
+    return map{ format: "pblang.polyglot-artifact-load.v2", ok: true,
+        complete: true, executed: true, policy_required: true,
+        raw_fallback: false, artifact: artifact_path,
+        library: loaded.library, decision: loaded.decision };
+}
+
+// Compatibility entrypoint: raw loading is intentionally disabled. Callers
+// must migrate to load_artifact_checked with an exact library allowlist.
 fn load_artifact(artifact_path) {
-    if str_ends_with(artifact_path, ".py") {
-        return polyglot_exec("python", fs_read(artifact_path));
-    }
-    if str_ends_with(artifact_path, ".js") {
-        return polyglot_exec("node", fs_read(artifact_path));
-    }
-    return ffi_load(artifact_path);
+    return _artifact_load_failure("explicit FFI policy is required", str(artifact_path));
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -781,6 +1089,9 @@ fn str_slice_arr(arr, start_idx, end_idx) {
 }
 
 export extract_blocks;
+export validate_build_request;
+export process_status, tool_candidates, verify_artifact;
+export build_language;
 export sql_result_ok;
 export build_rust, build_c, build_cpp, build_go, build_python, build_js;
 export build_typescript, build_java, build_kotlin, build_swift, build_zig;
@@ -790,4 +1101,4 @@ export build_qsharp, build_html, build_css, build_sass, build_less;
 export build_sql, build_matlab, build_prolog, build_forth, build_solidity;
 export build_odin, build_carbon, build_mojo, build_chapel, build_factor, build_purescript;
 export build_file, build_project;
-export load_artifact;
+export load_artifact, load_artifact_checked;

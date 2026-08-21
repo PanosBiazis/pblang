@@ -1,0 +1,326 @@
+let H = import("stdlib:http_server.sapp");
+let TCP = import("stdlib:native_tcp.sapp");
+
+fn fail(message) { throw "FAIL http_server_bounded: " + message; }
+fn expect(value, message) { if not value { fail(message); } }
+
+let support = TCP.available();
+if not support.ok {
+    let rejected = try H.bounded_server_policy(map{ request_timeout_ms: 100 }) catch "unsupported";
+    expect(rejected == "unsupported", "unsupported platform must fail before binding");
+    print "http_server_bounded_unsupported_pass";
+    return;
+}
+
+expect((try H.bounded_server_policy(map{ request_timeout_ms: 0 }) catch "invalid") == "invalid",
+    "zero request deadline must fail closed");
+expect((try H.bounded_server_policy(map{ max_inflight: 0 }) catch "invalid") == "invalid",
+    "zero inflight capacity must fail closed");
+expect(H.bounded_server_policy().request_timeout_ms == 2000,
+    "omitted options must select the documented bounded defaults");
+expect((try H.bounded_server_policy(map{ max_infligth: 2 }) catch "invalid") == "invalid",
+    "unknown security-policy keys must fail closed");
+expect((try H.bounded_server_policy(map{ executor: map{} }) catch "invalid") == "invalid",
+    "incomplete executor contracts must fail closed");
+
+let listener = TCP.listen_ipv4("127.0.0.1", 0, 8);
+expect(listener.ok, "bounded listener must bind loopback");
+let endpoint_port = listener.port;
+let endpoint = "127.0.0.1:" + str(endpoint_port);
+let replies = channel();
+let worker = spawn(fn() {
+    let slow = tcp_connect(endpoint);
+    tcp_write(slow, "GET /slow HTTP/1.1\r\nHost: localhost\r\n");
+
+    let fast = tcp_connect(endpoint);
+    tcp_write(fast,
+        "GET /ready HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    let fast_reply = tcp_read_until(fast, "ready", 4096);
+    tcp_close(fast);
+
+    let slow_reply = try tcp_read(slow, 1) catch "";
+    tcp_close(slow);
+    send(replies.sender, map{
+        fast_reply: fast_reply, slow_reply: slow_reply,
+    });
+});
+
+let handler_calls = 0;
+let started = now_ms();
+let served = H.serve_bounded_listener(listener, fn(req) {
+    handler_calls = handler_calls + 1;
+    return map{ status: 200, body: "ready", content_type: "text/plain" };
+}, map{
+    request_timeout_ms: 120, write_timeout_ms: 250, accept_poll_ms: 1,
+    max_inflight: 2, max_connections: 2, max_header_bytes: 4096,
+    max_body_bytes: 4096, max_response_bytes: 4096,
+});
+let elapsed = now_ms() - started;
+TCP.close(listener);
+let observed = recv_timeout(replies.receiver, 2000);
+join(worker);
+
+expect(served.accepted == 2 and served.completed == 2,
+    "both connections must leave the bounded table");
+expect(handler_calls == 1, "incomplete request must never reach the handler");
+expect(str_contains(observed.fast_reply, "200 OK")
+    and str_contains(observed.fast_reply, "ready"),
+    "valid peer must complete while an incomplete peer is pending");
+expect(observed.slow_reply == "",
+    "incomplete peer must be closed without an application response");
+expect(elapsed >= 80 and elapsed < 1000,
+    "absolute request deadline must be observed without hanging the test");
+
+fn exchange(request, marker, options) {
+    let case_listener = TCP.listen_ipv4("127.0.0.1", 0, 4);
+    expect(case_listener.ok, "negative-case listener must bind loopback");
+    let case_endpoint = "127.0.0.1:" + str(case_listener.port);
+    let case_done = channel();
+    let case_worker = spawn(fn() {
+        let client = tcp_connect(case_endpoint);
+        tcp_write(client, request);
+        let response = tcp_read_until(client, marker, 8192);
+        tcp_close(client);
+        send(case_done.sender, response);
+    });
+    let calls = 0;
+    options.max_connections = 1;
+    let result = H.serve_bounded_listener(case_listener, fn(req) {
+        calls = calls + 1;
+        return map{ status: 200, body: "unexpected", content_type: "text/plain" };
+    }, options);
+    TCP.close(case_listener);
+    let response = recv_timeout(case_done.receiver, 2000);
+    join(case_worker);
+    return map{ response: response, calls: calls, served: result };
+}
+
+let oversized_header = exchange(
+    "GET / HTTP/1.1\r\nX-Fill: " + str_repeat("a", 1100), "bound",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096 });
+expect(str_contains(oversized_header.response, "431 Request Header Fields Too Large")
+    and oversized_header.calls == 0,
+    "oversized headers must return 431 without reaching the handler");
+
+let oversized_body = exchange(
+    "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n", "Large",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 4, max_response_bytes: 4096 });
+expect(str_contains(oversized_body.response, "413 Request Entity Too Large")
+    and oversized_body.calls == 0,
+    "declared oversized bodies must return 413 before body reads or handler dispatch");
+
+let chunked = exchange(
+    "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", "enabled",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096 });
+expect(str_contains(chunked.response, "501 Not Implemented") and chunked.calls == 0,
+    "unsupported transfer framing must fail closed before handler dispatch");
+
+let invalid_length = exchange(
+    "POST / HTTP/1.1\r\nContent-Length: +1\r\n\r\n", "Content-Length",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096 });
+expect(str_contains(invalid_length.response, "400 Bad Request")
+    and invalid_length.calls == 0,
+    "non-decimal Content-Length must fail closed before handler dispatch");
+
+let preflight_calls = 0;
+let preflight = exchange(
+    "POST /private HTTP/1.1\r\nContent-Length: 64\r\n\r\n" + str_repeat("x", 64),
+    "required",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096,
+        preflight: fn(req) {
+            preflight_calls = preflight_calls + 1;
+            expect(req.body == "", "preflight must receive a header-only request");
+            return map{ allowed: false, response: map{
+                status: 401, body: "authentication required",
+                content_type: "text/plain" } };
+        } });
+expect(str_contains(preflight.response, "401 Unauthorized")
+    and preflight.calls == 0 and preflight_calls == 1,
+    "header preflight must reject coalesced unauthenticated bodies before dispatch");
+
+let duplicate_length = exchange(
+    "POST / HTTP/1.1\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n", "Malformed",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096 });
+expect(str_contains(duplicate_length.response, "400 Bad Request")
+    and duplicate_length.calls == 0,
+    "case-insensitive duplicate framing headers must be rejected");
+
+let duplicate_auth = exchange(
+    "GET / HTTP/1.1\r\nAuthorization: Bearer one\r\naUtHoRiZaTiOn: Bearer two\r\n\r\n",
+    "Malformed", map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096 });
+expect(str_contains(duplicate_auth.response, "400 Bad Request")
+    and duplicate_auth.calls == 0,
+    "case-insensitive duplicate authentication headers must be rejected");
+
+let malformed_line = exchange(
+    "GET / missing-version\r\nHost: localhost\r\n\r\n", "Malformed",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096 });
+expect(str_contains(malformed_line.response, "400 Bad Request")
+    and malformed_line.calls == 0,
+    "malformed request lines must fail before handler dispatch");
+
+let preflight_exception = exchange(
+    "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", "closed",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096,
+        preflight: fn(req) { throw "fixture"; } });
+expect(str_contains(preflight_exception.response, "500 Internal Server Error")
+    and preflight_exception.calls == 0,
+    "preflight exceptions must fail closed without dispatch");
+
+let malformed_preflight = exchange(
+    "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", "closed",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096,
+        preflight: fn(req) { return nil; } });
+expect(str_contains(malformed_preflight.response, "500 Internal Server Error")
+    and malformed_preflight.calls == 0,
+    "implicit or malformed preflight decisions must fail closed without dispatch");
+
+let allowed = exchange(
+    "POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nok", "unexpected",
+    map{ request_timeout_ms: 250, max_header_bytes: 1024,
+        max_body_bytes: 64, max_response_bytes: 4096,
+        preflight: fn(req) { return map{ allowed: true }; } });
+expect(str_contains(allowed.response, "200 OK") and allowed.calls == 1,
+    "explicit preflight approval must preserve normal body and handler flow");
+
+let capacity_listener = TCP.listen_ipv4("127.0.0.1", 0, 4);
+expect(capacity_listener.ok, "capacity listener must bind loopback");
+let capacity_endpoint = "127.0.0.1:" + str(capacity_listener.port);
+let capacity_done = channel();
+let capacity_worker = spawn(fn() {
+    let occupied = tcp_connect(capacity_endpoint);
+    tcp_write(occupied, "GET /hold HTTP/1.1\r\nHost: localhost\r\n");
+    let overflow = tcp_connect(capacity_endpoint);
+    tcp_write(overflow, "GET /overflow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let response = tcp_read_until(overflow, "capacity", 4096);
+    tcp_close(overflow);
+    let occupied_closed = try tcp_read(occupied, 1) catch "";
+    tcp_close(occupied);
+    send(capacity_done.sender, map{ response: response, occupied: occupied_closed });
+});
+let capacity_calls = 0;
+let capacity_result = H.serve_bounded_listener(capacity_listener, fn(req) {
+    capacity_calls = capacity_calls + 1;
+    return map{ status: 200, body: "unexpected", content_type: "text/plain" };
+}, map{ request_timeout_ms: 120, write_timeout_ms: 250, accept_poll_ms: 1,
+    max_inflight: 1, max_connections: 2, max_header_bytes: 1024,
+    max_body_bytes: 64, max_response_bytes: 4096 });
+TCP.close(capacity_listener);
+let capacity_observed = recv_timeout(capacity_done.receiver, 2000);
+join(capacity_worker);
+expect(capacity_result.accepted == 2 and capacity_result.completed == 2
+    and capacity_calls == 0 and capacity_observed.occupied == ""
+    and str_contains(capacity_observed.response, "503 Service Unavailable"),
+    "connection capacity must return 503 without evicting or dispatching pending peers");
+
+let trickle_listener = TCP.listen_ipv4("127.0.0.1", 0, 4);
+expect(trickle_listener.ok, "trickle listener must bind loopback");
+let trickle_endpoint = "127.0.0.1:" + str(trickle_listener.port);
+let trickle_done = channel();
+let trickle_worker = spawn(fn() {
+    let client = tcp_connect(trickle_endpoint);
+    let pause = channel();
+    let pieces = ["G", "E", "T", " "];
+    let i = 0;
+    while i < len(pieces) {
+        try tcp_write(client, pieces[i]) catch nil;
+        recv_timeout(pause.receiver, 35); i = i + 1;
+    }
+    let closed = try tcp_read(client, 1) catch "";
+    tcp_close(client); send(trickle_done.sender, closed);
+});
+let trickle_calls = 0; let trickle_started = now_ms();
+let trickle_result = H.serve_bounded_listener(trickle_listener, fn(req) {
+    trickle_calls = trickle_calls + 1; return "unexpected";
+}, map{ request_timeout_ms: 90, write_timeout_ms: 250, accept_poll_ms: 1,
+    max_inflight: 1, max_connections: 1, max_header_bytes: 1024,
+    max_body_bytes: 64, max_response_bytes: 4096 });
+let trickle_elapsed = now_ms() - trickle_started;
+TCP.close(trickle_listener);
+let trickle_closed = recv_timeout(trickle_done.receiver, 2000); join(trickle_worker);
+expect(trickle_result.completed == 1 and trickle_calls == 0 and trickle_closed == ""
+    and trickle_elapsed >= 70 and trickle_elapsed < 500,
+    "one-byte trickling must not reset the absolute request deadline");
+
+// A delayed executor job must not prevent an independent request from
+// completing. The timed-out job remains accounted for until cancellation and
+// cleanup are observed through the executor contract.
+let async_listener = TCP.listen_ipv4("127.0.0.1", 0, 4);
+expect(async_listener.ok, "executor listener must bind loopback");
+let async_endpoint = "127.0.0.1:" + str(async_listener.port);
+let async_done = channel();
+let async_client = spawn(fn() {
+    let slow = tcp_connect(async_endpoint);
+    tcp_write(slow, "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let fast = tcp_connect(async_endpoint);
+    tcp_write(fast, "GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let fast_reply = tcp_read_until(fast, "fast-ready", 4096); tcp_close(fast);
+    let slow_reply = tcp_read_until(slow, "completed", 4096); tcp_close(slow);
+    send(async_done.sender, map{ fast: fast_reply, slow: slow_reply });
+});
+let executor_starts = 0; let executor_finishes = 0; let executor_cancels = 0;
+let executor_closes = 0;
+let executor_deadlines_canonical = true;
+let executor = map{
+    start: fn(req, deadline_ms) {
+        executor_starts = executor_starts + 1;
+        if type(deadline_ms) != "number" or deadline_ms != num_floor(deadline_ms) {
+            executor_deadlines_canonical = false;
+        }
+        return map{ ok: true, job: map{ path: req.path, started_ms: now_ms(),
+            deadline_ms: deadline_ms, cancelled: false, cancel_ms: 0 } };
+    },
+    poll: fn(job) {
+        if job.cancelled {
+            return map{ ok: true, complete: false,
+                terminated: now_ms() - job.cancel_ms >= 10 };
+        }
+        return map{ ok: true, complete: job.path == "/fast", terminated: false };
+    },
+    cancel: fn(job) {
+        executor_cancels = executor_cancels + 1;
+        job.cancelled = true; job.cancel_ms = now_ms();
+        return map{ ok: true, requested: true };
+    },
+    finish: fn(job) {
+        executor_finishes = executor_finishes + 1;
+        return map{ ok: true, output: map{ status: 200,
+            body: if job.path == "/fast" { "fast-ready" } else { "slow-finished" },
+            content_type: "text/plain" } };
+    },
+    close: fn() {
+        executor_closes = executor_closes + 1;
+        return map{ ok: true, closed: true };
+    }
+};
+let sync_handler_calls = 0;
+let async_result = H.serve_bounded_listener(async_listener, fn(req) {
+    sync_handler_calls = sync_handler_calls + 1; return "unexpected";
+}, map{ request_timeout_ms: 100, write_timeout_ms: 250, accept_poll_ms: 1,
+    max_inflight: 2, max_connections: 2, max_header_bytes: 1024,
+    max_body_bytes: 64, max_response_bytes: 4096, executor: executor });
+TCP.close(async_listener);
+let async_observed = recv_timeout(async_done.receiver, 2000); join(async_client);
+expect(async_result.completed == 2 and executor_starts == 2
+    and executor_finishes == 2 and executor_cancels == 1 and sync_handler_calls == 0
+    and executor_deadlines_canonical and executor_closes == 1
+    and async_result.executor_closed.ok,
+    "executor jobs must be independently polled, cancelled and reaped before one close");
+expect(str_contains(async_observed.fast, "200 OK")
+    and str_contains(async_observed.fast, "fast-ready"),
+    "fast executor request must complete while the slow job remains active");
+expect(str_contains(async_observed.slow, "504 Gateway Timeout")
+    and str_contains(async_observed.slow, "may have completed"),
+    "timed-out executor request must report ambiguous effect state honestly");
+
+print "http_server_bounded_pass";

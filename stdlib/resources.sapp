@@ -1,8 +1,8 @@
 // stdlib/resources.sapp — memory & resource introspection for any pblang
 // program (its own or an embedding host project). Unifies the VM's allocation
-// counters (gc_stats), the memory-safety tracker (memory_stats), the GC
-// (gc_collect), and the clocks (now_ms/clock) into one snapshot/diff/capture
-// API, with live sampling, per-operation tracking, and a leak check.
+// counters (gc_stats), the memory-safety tracker (memory_stats), and the clocks
+// (now_ms/clock) into one snapshot/diff/capture API. Destructive host collection
+// is fail-closed until every VM has an owner-scoped heap.
 //
 //   let res = import("stdlib:resources.sapp");
 //   let s = res.snapshot();
@@ -15,6 +15,8 @@
 //   // track one operation's allocation & time cost
 //   let t = res.track(fn() { let m = map{ a: 1, b: 2 }; return m; });
 //   print res.format_diff(t);
+
+let RUNTIME_GC = import("stdlib:runtime_gc.sapp");
 
 fn _num(x) { if x == nil { return 0; } return x; }
 
@@ -41,14 +43,15 @@ fn _parse_kv(s) {
 
 // snapshot() — a unified point-in-time view of memory + resources.
 fn snapshot() {
-    let gc = _parse_kv(gc_stats());
+    let runtime_gc = RUNTIME_GC.status();
+    let gc = _parse_kv(RUNTIME_GC.host_thread_stats_text());
     let mem = memory_stats();
     let sa = _num(try gc["string_allocs"] catch 0);
     let aa = _num(try gc["array_allocs"] catch 0);
     let ma = _num(try gc["map_allocs"] catch 0);
     let mo = _num(try gc["module_allocs"] catch 0);
     return map{
-        format: "pblang.resources.snapshot.v1",
+        format: "pblang.resources.snapshot.v2",
         ts_ms: now_ms(),
         clock_s: clock(),
         platform: platform(),
@@ -60,7 +63,10 @@ fn snapshot() {
         total_locations: _num(mem["total_locations"]),
         active_borrows: _num(mem["active_borrows"]),
         lifetime_depth: _num(mem["lifetime_depth"]),
-        ref_count_total: _num(mem["ref_count_total"])
+        ref_count_total: _num(mem["ref_count_total"]),
+        heap_scope: runtime_gc.heap_scope,
+        owner_isolation: runtime_gc.owner_isolation,
+        collection_allowed: runtime_gc.collection_allowed
     };
 }
 
@@ -80,14 +86,10 @@ fn diff(a, b) {
     };
 }
 
-// gc() — force a cycle-collecting GC pass; returns what it reclaimed.
+// gc() — request a cycle-collecting pass. The retained host runtime refuses it
+// because same-thread nested VMs do not yet have owner-isolated heaps.
 fn gc() {
-    let r = _parse_kv(gc_collect());
-    return map{
-        arrays_cleared: _num(r["arrays"]),
-        maps_cleared: _num(r["maps"]),
-        modules_cleared: _num(r["modules"])
-    };
+    return RUNTIME_GC.collect();
 }
 
 // measure(label, work_fn) — run work_fn(), returning a diff annotated with the
@@ -106,14 +108,18 @@ fn track(work_fn) { return measure("", work_fn); }
 // gc_measure(label, work_fn) — like measure, but GCs before and after so the
 // reading isolates this operation's net effect.
 fn gc_measure(label, work_fn) {
-    gc();
+    let before_collection = gc();
     let before = snapshot();
     let result = work_fn();
-    gc();
+    let after_collection = gc();
     let after = snapshot();
     let d = diff(before, after);
     d["label"] = label;
     d["result"] = result;
+    d["collection_before"] = before_collection;
+    d["collection_after"] = after_collection;
+    d["collection_performed"] = before_collection.performed and after_collection.performed;
+    d["conclusive"] = d["collection_performed"];
     return d;
 }
 
@@ -167,12 +173,20 @@ fn summary(timeline) {
 fn leak_check(work_fn, rounds) {
     rounds = bounded_steps(rounds, 10000);
     if rounds == 0 {
-        return map{ rounds: 0, first_locations: 0, last_locations: 0, growth: 0, leaking: false, samples: [] };
+        return map{ rounds: 0, first_locations: 0, last_locations: 0, growth: 0,
+            leaking: nil, conclusive: false, collection_performed: false, samples: [],
+            reason: "no rounds were sampled" };
     }
     let samples = [];
+    let collection_performed = true;
+    let collection_reason = "";
     for i in 0 to rounds - 1 {
         work_fn(i);
-        gc();
+        let collection = gc();
+        if not collection.performed {
+            collection_performed = false;
+            collection_reason = collection.error;
+        }
         array_push(samples, snapshot()["total_locations"]);
     }
     let first = samples[0];
@@ -183,7 +197,10 @@ fn leak_check(work_fn, rounds) {
         first_locations: first,
         last_locations: last,
         growth: growth,
-        leaking: growth > 0,
+        leaking: if collection_performed { growth > 0 } else { nil },
+        conclusive: collection_performed,
+        collection_performed: collection_performed,
+        reason: collection_reason,
         samples: samples
     };
 }

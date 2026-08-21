@@ -1,0 +1,384 @@
+// stdlib/polyglot_isolate.sapp -- Linux namespace isolation for foreign source.
+//
+// This module is an execution substrate for a dedicated authenticated broker.
+// It is not an authorization API: callers still need a separate principal
+// boundary, and client VMs must not receive the exec capability.
+
+let PROCESS = import("stdlib:process.sapp");
+let BUILD = import("stdlib:polyglot_build.sapp");
+
+let FORMAT = "pblang.polyglot-isolate.v1";
+let MAX_CODE_BYTES = 3584;
+let MAX_INPUT_BYTES = 1048576;
+let MAX_OUTPUT_BYTES = 1048576;
+let MAX_MEMORY_BYTES = 536870912;
+let SCRATCH_BYTES = 8388608;
+let CONTROL_RESERVE_BYTES = 128;
+
+// Fixed bootstrap code, not caller source, is the only program text exposed in
+// argv. It enables no-new-privileges before loading the bounded request file.
+let PYTHON_WRAPPER = "import ctypes,io,json,os,sys\n"
+    + "libc=ctypes.CDLL(None,use_errno=True)\n"
+    + "if libc.prctl(38,1,0,0,0)!=0: raise OSError(ctypes.get_errno(),'prctl')\n"
+    + "with open('/tmp/request.json','r',encoding='utf-8') as stream:\n request=json.load(stream)\n"
+    + "for inherited_fd in os.listdir('/proc/self/fd'):\n"
+    + " try:\n  number=int(inherited_fd)\n  if number not in (1,2): os.close(number)\n"
+    + " except (OSError,ValueError):\n  pass\n"
+    + "source=request.get('code')\ninput_text=request.get('input')\nmarker=request.get('marker')\n"
+    + "if not isinstance(source,str) or not isinstance(input_text,str) or not isinstance(marker,str) or len(marker)!=32: raise ValueError('invalid request')\n"
+    + "sys.stdin=io.StringIO(input_text)\n"
+    + "program=compile(source,'<pblang-isolate>','exec')\n"
+    + "sys.stderr.write('PBLANG_ISOLATE_READY:'+marker+'\\n')\nsys.stderr.flush()\n"
+    + "exec(program,{'__name__':'__main__'})";
+
+fn _error(message, language = "") {
+    return map{ format: FORMAT, ok: false, complete: false,
+        command_ok: false, process_completed: false,
+        executed: false, execution_confirmed: false,
+        source_dispatch_reached: false, bounded: false,
+        sandbox_verified: false, namespace_isolated: false,
+        network_isolated: false, filesystem_isolated: false,
+        namespace_configuration_requested: false,
+        runtime_identity_verified: false, source_absent_from_argv: false,
+        seccomp_filtered: false, cgroup_enforced: false,
+        language: language, stdout: "", stderr: "", error: message };
+}
+
+fn _utf8_prefix(text, maximum) {
+    if len(str_to_bytes(text)) <= maximum {
+        return map{ text: text, truncated: false };
+    }
+    let low = 0; let high = len(text);
+    while low < high {
+        let middle = num_floor((low + high + 1) / 2);
+        if len(str_to_bytes(str_slice(text, 0, middle))) <= maximum {
+            low = middle;
+        } else { high = middle - 1; }
+    }
+    return map{ text: str_slice(text, 0, low), truncated: true };
+}
+
+fn _int(value, fallback, minimum, maximum, name) {
+    let selected = if value == nil { fallback } else { value };
+    if type(selected) != "number" or selected != num_floor(selected)
+       or selected < minimum or selected > maximum {
+        throw "polyglot_isolate: " + name + " must be an integer in "
+            + str(minimum) + ".." + str(maximum);
+    }
+    return selected;
+}
+
+fn _options(value) {
+    if value == nil { value = map{}; }
+    if type(value) != "map" { throw "polyglot_isolate: options must be a map"; }
+    let allowed = ["timeout_secs", "max_output_bytes", "max_memory_bytes"];
+    let keys = map_keys(value);
+    for i len(keys) {
+        let known = false;
+        for j len(allowed) { if keys[i] == allowed[j] { known = true; } }
+        if not known { throw "polyglot_isolate: unknown option '" + str(keys[i]) + "'"; }
+    }
+    return map{
+        timeout_secs: _int(try value.timeout_secs catch nil, 10, 1, 30, "timeout_secs"),
+        max_output_bytes: _int(try value.max_output_bytes catch nil,
+            MAX_OUTPUT_BYTES, 1, MAX_OUTPUT_BYTES, "max_output_bytes"),
+        max_memory_bytes: _int(try value.max_memory_bytes catch nil,
+            268435456, 33554432, MAX_MEMORY_BYTES, "max_memory_bytes")
+    };
+}
+
+fn _runtime(language) {
+    let lang = str_lower(str_trim(language));
+    if lang == "python" or lang == "python3" {
+        return map{ language: "python", tool: "python3",
+            argv: ["-I", "-S", "-c", PYTHON_WRAPPER] };
+    }
+    // Other language runtimes stay fail-closed until they have fixed wrappers
+    // with the same no-source-in-argv and bounded-input properties.
+    return nil;
+}
+
+fn _system_candidate(tool) {
+    let candidates = BUILD.tool_candidates(tool);
+    for i len(candidates) {
+        if str_starts_with(candidates[i], "/usr/bin/") or
+           str_starts_with(candidates[i], "/bin/") {
+            return candidates[i];
+        }
+    }
+    return "";
+}
+
+fn _append_read_only(argv, source, destination) {
+    if try fs_exists(source) catch false {
+        array_push(argv, "--ro-bind"); array_push(argv, source); array_push(argv, destination);
+    }
+}
+
+fn _sandbox_argv(runtime) {
+    let argv = [
+        "--unshare-user", "--uid", "65534", "--gid", "65534",
+        "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts",
+        "--hostname", "pblang-isolate",
+        "--die-with-parent", "--new-session", "--disable-userns",
+        "--clearenv", "--setenv", "PATH", "/usr/bin",
+        "--setenv", "HOME", "/nonexistent", "--setenv", "TMPDIR", "/tmp",
+        "--setenv", "LANG", "C.UTF-8", "--setenv", "LC_ALL", "C.UTF-8"
+    ];
+    _append_read_only(argv, "/usr", "/usr");
+    _append_read_only(argv, "/lib", "/lib");
+    _append_read_only(argv, "/lib64", "/lib64");
+    array_push(argv, "--proc"); array_push(argv, "/proc");
+    array_push(argv, "--dev"); array_push(argv, "/dev");
+    array_push(argv, "--size"); array_push(argv, str(SCRATCH_BYTES));
+    array_push(argv, "--tmpfs"); array_push(argv, "/tmp");
+    array_push(argv, "--dir"); array_push(argv, "/home");
+    array_push(argv, "--perms"); array_push(argv, "0400");
+    array_push(argv, "--file"); array_push(argv, "0");
+    array_push(argv, "/tmp/request.json");
+    array_push(argv, "--chdir"); array_push(argv, "/tmp");
+    array_push(argv, "--cap-drop"); array_push(argv, "ALL");
+    array_push(argv, "--"); array_push(argv, runtime.path);
+    for i len(runtime.argv) { array_push(argv, runtime.argv[i]); }
+    return argv;
+}
+
+fn status() {
+    let process = PROCESS.bounded_status();
+    let bwrap = if try process.available catch false { _system_candidate("bwrap") } else { "" };
+    let python = if try process.available catch false { _system_candidate("python3") } else { "" };
+    return map{ format: "pblang.polyglot-isolate.status.v1",
+        available: platform() == "linux" and bwrap != "" and python != "",
+        platform: platform(), process_backend: process,
+        supported_languages: ["python"],
+        bwrap_fixed_candidate_available: bwrap != "",
+        bwrap_descriptor_held_on_launch: false,
+        bwrap_descriptor_bound_per_run: true,
+        runtime_identity_verified: false,
+        runtime_update_race_eliminated: false,
+        runtime_root_read_only_configured: true,
+        host_workspace_mount_configured: false,
+        network_namespace_configured: true,
+        uid_configured: 65534, gid_configured: 65534,
+        environment_clear_configured: true,
+        capabilities_drop_configured: true,
+        no_new_privileges_configured: true,
+        nested_user_namespaces_disable_configured: true,
+        source_file_handoff_configured: true,
+        source_absent_from_argv_verified: false,
+        scratch_limit_bytes: SCRATCH_BYTES,
+        broad_runtime_tree_readable: true,
+        seccomp_filtered: false, cgroup_enforced: false,
+        production_untrusted_ready: false };
+}
+
+fn run(language, code, input = "", options = nil) {
+    if type(language) != "string" or len(str_to_bytes(language)) > 64 {
+        return _error("language must be a bounded string");
+    }
+    if type(code) != "string" or len(str_to_bytes(code)) > MAX_CODE_BYTES or
+       str_contains(code, strfromcharcode(0)) {
+        return _error("source must be a NUL-free string within 3584 bytes", language);
+    }
+    if type(input) != "string" or len(str_to_bytes(input)) > MAX_INPUT_BYTES {
+        return _error("input must be a UTF-8 string within 1048576 bytes", language);
+    }
+    let limits = try _options(options) catch nil;
+    if limits == nil { return _error("invalid isolation options", language); }
+    let runtime = _runtime(language);
+    if runtime == nil {
+        return _error("language has no fixed isolated request-file adapter", language);
+    }
+    runtime.path = _system_candidate(runtime.tool);
+    if not status().available or runtime.path == "" {
+        return _error("fixed Linux namespace runtime is unavailable", runtime.language);
+    }
+    let marker = str_slice(sha256(base64_encode_bytes(random_bytes(32))
+        + str(now_ms())), 0, 32);
+    let request = try json_stringify(map{ code: code, input: input,
+        marker: marker }) catch nil;
+    if type(request) != "string" or len(str_to_bytes(request)) > 2097152 {
+        return _error("isolated request envelope exceeds its bound", runtime.language);
+    }
+    let process_options = map{
+        timeout_secs: limits.timeout_secs, startup_timeout_ms: 5000,
+        // Reserve a fixed control prefix outside the caller's application
+        // output budget. Returned stdout/stderr are re-clipped below.
+        max_output_bytes: limits.max_output_bytes + CONTROL_RESERVE_BYTES,
+        max_file_bytes: limits.max_output_bytes + CONTROL_RESERVE_BYTES,
+        max_memory_bytes: limits.max_memory_bytes,
+        // RLIMIT_NPROC is applied before the private user namespace exists and
+        // counts every host-UID thread. A real per-job quota still requires the
+        // separately reported cgroup layer.
+        max_processes: 2048, max_open_files: 64,
+        inherit_environment: false,
+        environment: map{ PATH: "/usr/bin:/bin", HOME: "/nonexistent",
+            TMPDIR: "/tmp", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
+        stdin_bytes: str_to_bytes(request)
+    };
+    let result = PROCESS.run_fixed_bounded(
+        ["/usr/bin/bwrap", "/bin/bwrap"], _sandbox_argv(runtime), process_options);
+    let completed = try result.completed catch false;
+    let command_ok = try result.command_ok catch false;
+    let bounded = try result.bounded catch false;
+    let raw_stderr = try result.stderr catch "";
+    let ready_line = "PBLANG_ISOLATE_READY:" + marker + "\n";
+    let dispatch_reached = str_starts_with(raw_stderr, ready_line);
+    let unbounded_application_stderr = if dispatch_reached {
+        str_slice(raw_stderr, len(ready_line), len(raw_stderr))
+    } else { raw_stderr };
+    let stdout_clipped = _utf8_prefix(try result.stdout catch "",
+        limits.max_output_bytes);
+    let remaining_output = limits.max_output_bytes
+        - len(str_to_bytes(stdout_clipped.text));
+    let stderr_clipped = _utf8_prefix(unbounded_application_stderr,
+        remaining_output);
+    let application_stderr = stderr_clipped.text;
+    let application_output_truncated = stdout_clipped.truncated
+        or stderr_clipped.truncated
+        or (try result.output_truncated catch false);
+    let supervised = completed and command_ok and bounded and dispatch_reached
+        and (try result.process_group_terminated catch false)
+        and (try result.executable_descriptor_held catch false)
+        and not (try result.check_then_exec_race catch true);
+    let final_error = "";
+    if not supervised {
+        final_error = try result.error catch "";
+        if final_error == "" {
+            final_error = if application_stderr != "" {
+                application_stderr
+            } else { "isolated execution failed" };
+        }
+    }
+    return map{ format: FORMAT, ok: supervised, complete: completed,
+        command_ok: command_ok, process_completed: completed,
+        executed: false, execution_confirmed: false,
+        source_dispatch_reached: dispatch_reached,
+        bounded: bounded,
+        sandbox_verified: false,
+        namespace_configuration_requested: true,
+        namespace_isolated: false, network_isolated: false,
+        filesystem_isolated: false,
+        runtime_root_read_only_configured: true,
+        host_workspace_mount_configured: false,
+        environment_clear_configured: true,
+        capabilities_drop_configured: true,
+        no_new_privileges_configured: true,
+        nested_user_namespaces_disable_configured: true,
+        request_file_handoff_configured: true,
+        source_absent_from_argv: false,
+        scratch_limit_bytes: SCRATCH_BYTES,
+        runtime_identity_verified: false,
+        runtime_update_race_eliminated: false,
+        broad_runtime_tree_readable: true,
+        seccomp_filtered: false, cgroup_enforced: false,
+        production_untrusted_ready: false,
+        language: runtime.language, stdout: stdout_clipped.text,
+        stderr: application_stderr, exit_code: try result.exit_code catch -1,
+        timed_out: try result.timed_out catch false,
+        output_truncated: application_output_truncated,
+        process_group_terminated: try result.process_group_terminated catch false,
+        bwrap_descriptor_held: try result.executable_descriptor_held catch false,
+        bwrap_executable_nofollow: try result.executable_nofollow catch false,
+        bwrap_check_then_exec_race: try result.check_then_exec_race catch true,
+        error: final_error };
+}
+
+fn isolation_selftest() {
+    let marker = "PB_SOURCE_ARGV_SENTINEL_7f7d8c92";
+    let code = "import json,os,socket,subprocess,sys\n"
+        + "status={}\n"
+        + "for line in open('/proc/self/status'):\n"
+        + " if ':' in line:\n  k,v=line.split(':',1); status[k]=v.strip()\n"
+        + "tmp=False\n"
+        + "try:\n open('/tmp/pblang-isolate-probe','w').write('ok'); tmp=True\nexcept Exception:\n pass\n"
+        + "host=len(os.listdir('/home'))!=0 or os.path.exists('/media')\n"
+        + "write=True\n"
+        + "try:\n open('/usr/pblang-isolate-probe','w').write('bad')\nexcept Exception:\n write=False\n"
+        + "nested=subprocess.run(['/usr/bin/unshare','-U','/usr/bin/true'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0\n"
+        + "ifs=[x.split(':')[0].strip() for x in open('/proc/net/dev').read().splitlines() if ':' in x]\n"
+        + "cmdline=open('/proc/self/cmdline','rb').read().decode('utf-8','replace')\n"
+        + "fd_targets=[]\n"
+        + "for fd in os.listdir('/proc/self/fd'):\n"
+        + " try:\n  if int(fd)>2: fd_targets.append(os.readlink('/proc/self/fd/'+fd))\n"
+        + " except (OSError,ValueError): pass\n"
+        + "scratch=os.statvfs('/tmp').f_frsize*os.statvfs('/tmp').f_blocks\n"
+        + "probe={'uid':os.getuid(),'gid':os.getgid(),'tmp':tmp,'host':host,'write':write,'nested':nested,'ifs':ifs,'env':sorted(os.environ.keys()),'pwd_env':os.environ.get('PWD'),'nnp':status.get('NoNewPrivs'),'capinh':status.get('CapInh'),'capprm':status.get('CapPrm'),'capeff':status.get('CapEff'),'capbnd':status.get('CapBnd'),'capamb':status.get('CapAmb'),'host_name':socket.gethostname(),'pid':os.getpid(),'source_in_argv':"
+        + json_stringify(marker) + " in cmdline,'host_fd':any('/home/' in x or '/media/' in x or 'pblang-process-' in x for x in fd_targets),'scratch':scratch}\n"
+        + "print(json.dumps(probe,separators=(',',':'),sort_keys=True))\n# " + marker;
+    let result = run("python", code, "", map{ timeout_secs: 5,
+        max_output_bytes: 8192, max_memory_bytes: 134217728 });
+    let probe = try json_parse(str_trim(result.stdout)) catch nil;
+    let probe_available = result.ok and probe != nil;
+    let env_ok = probe_available
+        and try probe.env == ["HOME", "LANG", "LC_ALL", "PATH", "PWD", "TMPDIR"] catch false
+        and try probe.pwd_env == "/tmp" catch false;
+    let probe_complete = probe_available
+        and (try probe.uid catch -1) == 65534 and (try probe.gid catch -1) == 65534
+        and (try probe.tmp catch false) and not (try probe.host catch true)
+        and not (try probe.write catch true) and not (try probe.nested catch true)
+        and (try probe.ifs catch []) == ["lo"] and env_ok
+        and (try probe.nnp catch "") == "1"
+        and (try probe.capinh catch "") == "0000000000000000"
+        and (try probe.capprm catch "") == "0000000000000000"
+        and (try probe.capeff catch "") == "0000000000000000"
+        and (try probe.capbnd catch "") == "0000000000000000"
+        and (try probe.capamb catch "") == "0000000000000000"
+        and (try probe.host_name catch "") == "pblang-isolate"
+        and (try probe.pid catch 999) <= 2
+        and not (try probe.source_in_argv catch true)
+        and not (try probe.host_fd catch true)
+        and (try probe.scratch catch 0) > 0
+        and (try probe.scratch catch SCRATCH_BYTES + 1) <= SCRATCH_BYTES;
+    let identity_ok = probe_available and (try probe.uid catch -1) == 65534
+        and (try probe.gid catch -1) == 65534;
+    let capability_sets_empty = probe_available
+        and (try probe.capinh catch "") == "0000000000000000"
+        and (try probe.capprm catch "") == "0000000000000000"
+        and (try probe.capeff catch "") == "0000000000000000"
+        and (try probe.capbnd catch "") == "0000000000000000"
+        and (try probe.capamb catch "") == "0000000000000000";
+    let tmp_observed = probe_available and (try probe.tmp catch false);
+    let scratch_observed = probe_available
+        and (try probe.scratch catch 0) > 0
+        and (try probe.scratch catch SCRATCH_BYTES + 1) <= SCRATCH_BYTES;
+    let paths_observed = probe_available and not (try probe.host catch true);
+    let fds_observed = probe_available and not (try probe.host_fd catch true);
+    let usr_denied = probe_available and not (try probe.write catch true);
+    let nested_denied = probe_available and not (try probe.nested catch true);
+    let loopback_observed = probe_available and (try probe.ifs catch []) == ["lo"];
+    let nnp_observed = probe_available and (try probe.nnp catch "") == "1";
+    let uts_observed = probe_available
+        and (try probe.host_name catch "") == "pblang-isolate";
+    let observed_pid = try probe.pid catch -1;
+    let payload_pid = -1;
+    if probe_available { payload_pid = observed_pid; }
+    let argv_observed = probe_available
+        and not (try probe.source_in_argv catch true);
+    return map{ format: "pblang.polyglot-isolate.selftest.v1",
+        ok: probe_complete, selftest_complete: probe_complete,
+        sandbox_verified: false, namespace_isolated: false,
+        user_namespace_independently_verified: false,
+        ipc_namespace_independently_verified: false,
+        mount_namespace_independently_verified: false,
+        private_uid_gid_observed: identity_ok,
+        tmp_path_write_observed: tmp_observed,
+        scratch_size_bounded_observed: scratch_observed,
+        home_and_media_paths_absent_observed: paths_observed,
+        selected_host_path_descriptors_absent_observed: fds_observed,
+        usr_write_denied_as_nobody_observed: usr_denied,
+        nested_userns_denied_observed: nested_denied,
+        network_only_loopback_observed: loopback_observed,
+        environment_allowlist_exact_observed: env_ok,
+        capability_sets_empty_observed: capability_sets_empty,
+        no_new_privileges_observed: nnp_observed,
+        uts_hostname_observed: uts_observed,
+        payload_pid_observed: payload_pid,
+        source_absent_from_runtime_argv_observed: argv_observed,
+        runtime_identity_verified: false,
+        seccomp_filtered: false, cgroup_enforced: false,
+        production_untrusted_ready: false,
+        probe: probe, detail: result };
+}
+
+export status, run, isolation_selftest;

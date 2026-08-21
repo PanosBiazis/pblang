@@ -21,18 +21,22 @@
 //   dist.build_all(src, "dist");           // every available target -> dist/
 //   print dist.report_to_string(rep);
 
+let CTRANSPILER = import("stdlib:compiler/ctranspile.sapp");
+let PROCESS = import("stdlib:process.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let SELFHOST_BUNDLE = import("stdlib:selfhost_bundle.sapp");
+let SELFHOST_PBCK = import("stdlib:selfhost_pbck.sapp");
+let SELFHOST_TO_PBCK = import("stdlib:selfhost_to_pbck.sapp");
+let SOURCE_INLINER = import("stdlib:source_inliner.sapp");
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Toolchain detection
 // ─────────────────────────────────────────────────────────────────────────────
 
-// True if `cmd` resolves on PATH. Uses proc_spawn_wait("which", ...) like the
-// rest of stdlib (codec.sapp / browser_render.sapp); falls back to os_which.
+// Non-executing compatibility discovery. Build publication never trusts this
+// PATH result; it selects only allowlisted absolute system executables.
 fn have(cmd) {
-    let r = try proc_spawn_wait("which", [cmd]) catch nil;
-    if r != nil {
-        let code = try r.exit_code catch 1;
-        if code == 0 { return true; }
-    }
     let w = try os_which(cmd) catch nil;
     if w != nil and w != "" { return true; }
     return false;
@@ -90,15 +94,37 @@ fn _pick_recipe(target) {
     return nil;
 }
 
+fn _fixed_compiler_path(name) {
+    let roots = ["/usr/bin/", "/bin/", "/usr/local/bin/"];
+    let i = 0;
+    while i < len(roots) {
+        let candidate = roots[i] + name;
+        if try fs_exists(candidate) catch false { return candidate; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Security-sensitive publication must not probe PATH before selecting a
+// compiler. Return the recipe and its allowlisted absolute executable as one
+// decision so callers cannot accidentally execute a PATH-controlled helper.
+fn _pick_fixed_recipe(target) {
+    for recipe in target.recipes {
+        let program = _fixed_compiler_path(recipe.bin);
+        if program != "" { return map{ recipe: recipe, program: program }; }
+    }
+    return nil;
+}
+
 // Every target this host can build right now, each annotated with the compiler
 // that will be used. Targets with no installed toolchain are omitted.
 fn available_targets() {
     let out = [];
     for t in all_targets() {
-        let r = _pick_recipe(t);
-        if r != nil {
+        let fixed = _pick_fixed_recipe(t);
+        if fixed != nil {
             array_push(out, map{ name: t.name, os: t.os, arch: t.arch,
-                                 ext: t.ext, compiler: r.bin });
+                                 ext: t.ext, compiler: fixed.program });
         }
     }
     return out;
@@ -110,7 +136,7 @@ fn available_targets() {
 fn missing_targets_help() {
     let lines = [];
     for t in all_targets() {
-        if _pick_recipe(t) == nil {
+        if _pick_fixed_recipe(t) == nil {
             let bins = [];
             for r in t.recipes { array_push(bins, r.bin); }
             array_push(lines, "  " + t.name + " — install one of: " + str_join(bins, ", "));
@@ -125,32 +151,21 @@ fn missing_targets_help() {
 // Build pipeline
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Resolve the compiler driving this build without silently preferring an old
-// system installation. PBLANG_BIN is an explicit operator override. On Linux,
-// the first bounded /proc/self/cmdline field identifies the command that started
-// this process. PATH remains a compatibility fallback on other platforms.
+// Resolve the runtime driving this build without consulting ambient PATH.
+// PBLANG_BIN is accepted only as an explicit absolute operator override. Linux
+// normally reuses the current process image through /proc/self/exe; unsupported
+// hosts fail closed until they have an equivalent verified process-image path.
 fn runtime_binary() {
     let configured = try env_get("PBLANG_BIN") catch nil;
-    if type(configured) == "string" and configured != "" and len(configured) <= 4096
-        and not str_contains(configured, "\n") and not str_contains(configured, "\r") {
+    if type(configured) == "string" and str_starts_with(configured, "/") and len(configured) <= 4096
+        and not str_contains(configured, "\n") and not str_contains(configured, "\r")
+        and (try fs_exists(configured) catch false) {
         return map{ path: configured, source: "PBLANG_BIN" };
     }
-    if fs_exists("/proc/self/cmdline") {
-        let raw = try fs_read_bytes("/proc/self/cmdline") catch nil;
-        if type(raw) == "array" {
-            let first = [];
-            let i = 0;
-            while i < len(raw) and i < 4096 and raw[i] != 0 {
-                array_push(first, raw[i]);
-                i = i + 1;
-            }
-            let path = try bytes_to_str(first) catch "";
-            if path != "" { return map{ path: path, source: "current-command" }; }
-        }
+    if platform() == "linux" and fs_exists("/proc/self/exe") {
+        return map{ path: "/proc/self/exe", source: "current-process-image" };
     }
-    let found = try os_which("pblang") catch nil;
-    if found != nil and found != "" { return map{ path: found, source: "PATH" }; }
-    return map{ path: "pblang", source: "unresolved-PATH-fallback" };
+    return map{ path: "", source: "unresolved-fail-closed" };
 }
 
 fn _pblang_bin() { return runtime_binary().path; }
@@ -204,6 +219,21 @@ fn _file_size(path) {
     return len(b);
 }
 
+fn c99_source_admission(source) {
+    if type(source) != "string" {
+        return map{ ok: false, bytes: 0, limit: 10485760,
+            error: "linked source must be text" };
+    }
+    if len(source) > 10485760 {
+        return map{ ok: false, bytes: nil, limit: 10485760,
+            error: "linked source exceeds the 10 MiB immutable-input limit" };
+    }
+    let bytes = len(str_to_bytes(source));
+    return map{ ok: bytes <= 10485760, bytes: bytes, limit: 10485760,
+        error: if bytes <= 10485760 { "" } else {
+            "linked source exceeds the 10 MiB immutable-input limit" } };
+}
+
 // pblang source -> portable C. Returns map{ ok, c_path, stderr }.
 fn transpile(src, c_path) {
     let r = try proc_spawn_wait(_pblang_bin(), ["transpile", src, "-o", c_path]) catch nil;
@@ -223,11 +253,13 @@ fn compile_c(c_path, target_name, out_path, opts = nil) {
         return map{ ok: false, output: out_path, target: target_name,
                     compiler: nil, stderr: "unknown target: " + target_name };
     }
-    let recipe = _pick_recipe(t);
-    if recipe == nil {
+    let fixed = _pick_fixed_recipe(t);
+    if fixed == nil {
         return map{ ok: false, output: out_path, target: target_name, compiler: nil,
                     stderr: "no C toolchain for " + target_name + ". " + missing_targets_help() };
     }
+    let recipe = fixed.recipe;
+    let program = fixed.program;
     let out = out_path + t.ext;
     let args = [];
     for a in recipe.pre { array_push(args, a); }
@@ -237,23 +269,249 @@ fn compile_c(c_path, target_name, out_path, opts = nil) {
     array_push(args, out);
     if t.needs_lm { array_push(args, "-lm"); }
 
-    let r = try proc_spawn_wait(recipe.bin, args) catch nil;
+    let r = try proc_spawn_wait(program, args) catch nil;
     if r == nil {
-        return map{ ok: false, output: out, target: target_name, compiler: recipe.bin,
-                    stderr: "could not run " + recipe.bin };
+        return map{ ok: false, output: out, target: target_name, compiler: program,
+                    stderr: "could not run fixed compiler" };
     }
     let code = try r.exit_code catch 1;
     let ok = code == 0 and fs_exists(out);
 
     // Optional UPX compression for the smallest on-disk binary, if available.
     let compressed = false;
-    if ok and _opt(opts, "compress", false) and have("upx") {
-        let u = try proc_spawn_wait("upx", ["--best", "--lzma", "-q", out]) catch nil;
+    let upx = _fixed_compiler_path("upx");
+    if ok and _opt(opts, "compress", false) and upx != "" {
+        let u = try proc_spawn_wait(upx, ["--best", "--lzma", "-q", out]) catch nil;
         if u != nil and (try u.exit_code catch 1) == 0 { compressed = true; }
     }
 
-    return map{ ok: ok, output: out, target: target_name, compiler: recipe.bin,
+    return map{ ok: ok, output: out, target: target_name, compiler: program,
                 stderr: try r.stderr catch "", size: _file_size(out), compressed: compressed };
+}
+
+// Compile one already-linked PBLang source snapshot without reopening project
+// source or materializing generated C. The compiler receives C from the
+// bounded Linux process backend's private stdin descriptor.
+fn _compile_source_c99_stage(source, target_name, out_path, opts = nil) {
+    let admission = c99_source_admission(source);
+    if not admission.ok {
+        return map{ ok: false, output: out_path, target: target_name, compiler: nil,
+            stderr: admission.error, source_bytes: admission.bytes,
+            source_limit_bytes: admission.limit };
+    }
+    let target = target_by_name(target_name);
+    if target == nil {
+        return map{ ok: false, output: out_path, target: target_name, compiler: nil,
+            stderr: "unknown target: " + target_name };
+    }
+    let fixed = _pick_fixed_recipe(target);
+    if fixed == nil {
+        return map{ ok: false, output: out_path, target: target_name, compiler: nil,
+            stderr: "secure C99 publication found no target compiler in an allowlisted system directory" };
+    }
+    let recipe = fixed.recipe;
+    let program = fixed.program;
+
+    let c_source = try CTRANSPILER.transpile_program(source) catch nil;
+    if type(c_source) != "string" {
+        return map{ ok: false, output: out_path, target: target_name, compiler: program,
+            stderr: "in-memory C99 transpilation failed" };
+    }
+    let stdin_bytes = str_to_bytes(c_source);
+    if len(stdin_bytes) > 16777216 {
+        return map{ ok: false, output: out_path, target: target_name, compiler: program,
+            stderr: "generated C exceeds the 16 MiB immutable-stdin limit" };
+    }
+
+    let output = out_path + target.ext;
+    let args = [];
+    for a in recipe.pre { array_push(args, a); }
+    array_push(args, "-x"); array_push(args, "c"); array_push(args, "-");
+    for flag in _opt_flags(target, opts) { array_push(args, flag); }
+    array_push(args, "-o"); array_push(args, output);
+    if target.needs_lm { array_push(args, "-lm"); }
+
+    let run = PROCESS.run_bounded(program, args, map{
+        timeout_secs: _opt(opts, "timeout_secs", 600),
+        max_output_bytes: 1048576,
+        max_file_bytes: 67108864,
+        max_memory_bytes: _opt(opts, "max_memory_bytes", 2147483648),
+        stdin_bytes: stdin_bytes,
+        environment: map{
+            PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            LANG: "C", LC_ALL: "C", TMPDIR: "/tmp"
+        },
+        inherit_environment: false
+    });
+    let ok = (try run.ok catch false) and (try run.command_ok catch false)
+        and fs_exists(output);
+    return map{
+        ok: ok, output: output, target: target_name, compiler: program,
+        stderr: try run.stderr catch (try run.error catch "bounded compiler failed"),
+        size: if ok { _file_size(output) } else { nil }, compressed: false,
+        source_transport: "private-stdin", generated_c_on_disk: false,
+        bounded_process: try run.bounded catch false,
+        process_group_terminated: try run.process_group_terminated catch false,
+        output_truncated: try run.output_truncated catch false
+    };
+}
+
+fn _private_c99_stage() {
+    if platform() != "linux" {
+        return map{ ok: false, error: "immutable C99 staging requires Linux directory handles" };
+    }
+    let token = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + str(now_ms())), 0, 32);
+    let root = "/tmp/pblang-dist-c99-" + token;
+    let held = DIRFS.open_absolute(root, true, true);
+    if not held.ok { return map{ ok: false, error: "private C99 stage cannot be created" }; }
+    let descriptor = DIRFS.descriptor_path(held);
+    if not descriptor.ok { DIRFS.close(held); return descriptor; }
+    return map{ ok: true, root: root, fs: held, base: descriptor.path };
+}
+
+fn _close_c99_stage(stage, output_path) {
+    if stage == nil or not (try stage.ok catch false) {
+        return map{ ok: false, error: "invalid private C99 stage" };
+    }
+    let output_name = path_basename(output_path);
+    let output_removed = try DIRFS.remove_file(stage.fs, output_name).ok catch false;
+    let stage_closed = try DIRFS.close(stage.fs) catch false;
+    let parent = DIRFS.open_absolute("/tmp", false, false);
+    let directory_removed = false;
+    if parent.ok {
+        let result = try DIRFS.remove(parent, path_basename(stage.root)) catch map{ ok: false };
+        directory_removed = result.ok;
+        if not (try DIRFS.close(parent) catch false) { directory_removed = false; }
+    }
+    if not stage_closed or not directory_removed {
+        return map{ ok: false, error: "private C99 stage teardown could not be verified",
+            expected_output: output_name, output_removed: output_removed,
+            stage_closed: stage_closed,
+            directory_removed: directory_removed };
+    }
+    return map{ ok: true, entries_removed: if output_removed { 1 } else { 0 },
+        expected_output: output_name,
+        stage_closed: true, directory_removed: true };
+}
+
+fn _protect_published_executable(path) {
+    if platform() != "linux" {
+        return map{ ok: false, error: "published executable protection requires Linux" };
+    }
+    let parent = DIRFS.open_absolute(path_dirname(path), false, false);
+    if not parent.ok { return parent; }
+    let protected = DIRFS.protect_executable(parent, path_basename(path));
+    DIRFS.close(parent);
+    return protected;
+}
+
+fn _secure_publish_bytes(path, bytes, executable) {
+    if type(bytes) != "array" or len(bytes) < 1 or len(bytes) > 67108864 {
+        return map{ ok: false, error: "artifact bytes exceed the publication bound" };
+    }
+    let expected = sha256(base64_encode_bytes(bytes));
+    if not (try SECURE.write_atomic(path, bytes, true, false).ok catch false) {
+        return map{ ok: false, output: path, output_removed: false,
+            cleanup_verified: false, error: "atomic artifact publication failed" };
+    }
+    if executable and not (try _protect_published_executable(path).ok catch false) {
+        let cleanup = SECURE.remove_file(path, false);
+        return map{ ok: false, error: "published executable permission failed",
+            output: path, output_removed: try cleanup.namespace_absent catch false,
+            cleanup_verified: try cleanup.namespace_absent catch false };
+    }
+    let loaded = SECURE.read_bytes(path, 67108864, false);
+    if not loaded.ok or len(loaded.bytes) != len(bytes)
+        or sha256(base64_encode_bytes(loaded.bytes)) != expected {
+        let cleanup = SECURE.remove_file(path, false);
+        return map{ ok: false, error: "published artifact digest verification failed",
+            output: path, output_removed: try cleanup.namespace_absent catch false,
+            cleanup_verified: try cleanup.namespace_absent catch false };
+    }
+    return map{ ok: true, output: path, bytes: len(bytes), digest: expected,
+        digest_format: "sha256-base64-content-v1", atomic: true,
+        symlink_target_followed: false };
+}
+
+// Compile an immutable source snapshot to bounded bytes. The compiler can only
+// write inside a private descriptor-held stage and no caller pathname is opened.
+fn compile_source_c99_blob(source, target_name, opts = nil) {
+    let target = target_by_name(target_name);
+    if target == nil {
+        return map{ ok: false, target: target_name, compiler: nil,
+            stderr: "unknown target: " + target_name };
+    }
+    let stage = _private_c99_stage();
+    if not stage.ok {
+        return map{ ok: false, target: target_name, compiler: nil,
+            stderr: stage.error };
+    }
+    let compiled = _compile_source_c99_stage(source, target_name,
+        stage.base + "/artifact", opts);
+    if not compiled.ok {
+        let cleanup = _close_c99_stage(stage, compiled.output);
+        compiled.stage_cleanup_verified = cleanup.ok;
+        compiled.stage_entries_removed = try cleanup.entries_removed catch 0;
+        if not cleanup.ok {
+            compiled.stderr = compiled.stderr + "; " + cleanup.error;
+        }
+        return compiled;
+    }
+    let loaded = DIRFS.read_bytes(stage.fs, path_basename(compiled.output), 67108864);
+    let cleanup = _close_c99_stage(stage, compiled.output);
+    if not cleanup.ok {
+        return map{ ok: false, target: target_name, compiler: compiled.compiler,
+            stderr: cleanup.error, stage_cleanup_verified: false };
+    }
+    if not loaded.ok {
+        return map{ ok: false, target: target_name,
+            compiler: compiled.compiler, stderr: "staged C99 artifact cannot be read safely" };
+    }
+    return map{
+        ok: true, blob: loaded.bytes, target: target_name, compiler: compiled.compiler,
+        stderr: compiled.stderr, size: len(loaded.bytes), compressed: false,
+        source_transport: compiled.source_transport,
+        generated_c_on_disk: false, bounded_process: compiled.bounded_process,
+        process_group_terminated: compiled.process_group_terminated,
+        output_truncated: compiled.output_truncated,
+        stage_cleanup_verified: true, stage_entries_removed: cleanup.entries_removed
+    };
+}
+
+// Public snapshot compilation never lets the compiler open the caller's final
+// pathname. It publishes only the exact bytes returned by the private blob API.
+fn compile_source_c99(source, target_name, out_path, opts = nil) {
+    let target = target_by_name(target_name);
+    if target == nil {
+        return map{ ok: false, output: out_path, target: target_name, compiler: nil,
+            stderr: "unknown target: " + target_name };
+    }
+    let compiled = compile_source_c99_blob(source, target_name, opts);
+    if not compiled.ok {
+        compiled.output = out_path;
+        return compiled;
+    }
+    let output = out_path + target.ext;
+    let published = _secure_publish_bytes(output, compiled.blob, target.os != "windows");
+    if not published.ok {
+        return map{ ok: false, output: output, target: target_name,
+            compiler: compiled.compiler, stderr: published.error,
+            output_removed: try published.output_removed catch false,
+            cleanup_verified: try published.cleanup_verified catch false,
+            stage_cleanup_verified: try compiled.stage_cleanup_verified catch false };
+    }
+    return map{
+        ok: true, output: output, target: target_name, compiler: compiled.compiler,
+        stderr: compiled.stderr, size: published.bytes, compressed: false,
+        source_transport: compiled.source_transport,
+        generated_c_on_disk: false, bounded_process: compiled.bounded_process,
+        process_group_terminated: compiled.process_group_terminated,
+        output_truncated: compiled.output_truncated,
+        stage_cleanup_verified: compiled.stage_cleanup_verified,
+        stage_entries_removed: compiled.stage_entries_removed,
+        atomic_publication: true, symlink_target_followed: false,
+        digest: published.digest, digest_format: published.digest_format
+    };
 }
 
 // Full single-target build: transpile then compile. `out_base` is the output
@@ -369,21 +627,24 @@ fn report_to_string(rep) {
 // { ok:false, reason } from the bundler (collision / builtin-shadow / cycle /
 // unresolvable / nested-import).
 fn bundle_pbck(main_path, out_base, opts = nil) {
-    let sb   = import("stdlib:selfhost_bundle.sapp");
-    let pbck = import("stdlib:selfhost_pbck.sapp");
-    let b = sb.bundle_file(main_path);
+    let b = SELFHOST_BUNDLE.bundle_file(main_path);
     if not b.ok { return b; }
 
     let do_opt = _opt(opts, "optimize", true);
-    let raw_bytes = len(pbck.serialize_chunk(b.chunk));
+    let raw_bytes = len(SELFHOST_PBCK.serialize_chunk(b.chunk));
     let chunk = b.chunk;
     if do_opt {
-        let xl = import("stdlib:selfhost_to_pbck.sapp");
-        chunk = xl.optimize_chunk(b.chunk);   // recursive optimize_safe
+        chunk = SELFHOST_TO_PBCK.optimize_chunk(b.chunk);   // recursive optimize_safe
     }
-    let blob = pbck.serialize_chunk(chunk);
+    let blob = SELFHOST_PBCK.serialize_chunk(chunk);
     let out_path = out_base + ".pbck";
-    fs_write_bytes(out_path, blob);
+    let published = _secure_publish_bytes(out_path, blob, false);
+    if not published.ok {
+        return map{ ok: false, out: out_path,
+            output_removed: try published.output_removed catch false,
+            cleanup_verified: try published.cleanup_verified catch false,
+            reason: try published.error catch "PBCK publication failed" };
+    }
     return map{
         ok: true,
         out: out_path,
@@ -395,6 +656,53 @@ fn bundle_pbck(main_path, out_base, opts = nil) {
     };
 }
 
+// Build portable bytecode from a caller-owned immutable linked-source snapshot.
+// A real import remaining in this source fails because no filesystem resolver
+// is supplied; smart builds must pass the dependency analyzer's linked program.
+fn bundle_pbck_blob(main_source, opts = nil) {
+    if type(main_source) != "string" {
+        return map{ ok: false, reason: "bundle_pbck_blob: source must be text" };
+    }
+    let source_bytes = len(str_to_bytes(main_source));
+    if source_bytes > 16777216 {
+        return map{ ok: false, reason: "bundle_pbck_blob: linked source exceeds 16 MiB" };
+    }
+    let bundled = SELFHOST_BUNDLE.bundle(main_source, fn(path) { return nil; });
+    if not bundled.ok { return bundled; }
+    let do_opt = _opt(opts, "optimize", true);
+    let raw_bytes = len(SELFHOST_PBCK.serialize_chunk(bundled.chunk));
+    let chunk = bundled.chunk;
+    if do_opt {
+        chunk = SELFHOST_TO_PBCK.optimize_chunk(chunk);
+    }
+    let blob = SELFHOST_PBCK.serialize_chunk(chunk);
+    return map{
+        ok: true, blob: blob, bytes: len(blob), bytes_unopt: raw_bytes,
+        saved: raw_bytes - len(blob), modules: bundled.modules,
+        optimized: do_opt, source_transport: "immutable-memory"
+    };
+}
+
+fn bundle_pbck_source(main_source, out_base, opts = nil) {
+    let result = bundle_pbck_blob(main_source, opts);
+    if not result.ok { return result; }
+    let out_path = out_base + ".pbck";
+    let published = _secure_publish_bytes(out_path, result.blob, false);
+    if not published.ok {
+        return map{ ok: false, out: out_path,
+            output_removed: try published.output_removed catch false,
+            cleanup_verified: try published.cleanup_verified catch false,
+            reason: try published.error catch "PBCK snapshot publication failed" };
+    }
+    map_remove(result, "blob");
+    result.out = out_path;
+    result.atomic_publication = true;
+    result.symlink_target_followed = false;
+    result.digest = published.digest;
+    result.digest_format = published.digest_format;
+    return result;
+}
+
 // self_extract(): emit a single self-extracting .pbself file — valid pblang
 // source that embeds the OPTIMIZED PBCS bundle as a base64 line comment after a
 // "//PBSELF1:" sentinel. Running it (`pblang run app.pbself --allow-all`) makes
@@ -404,18 +712,15 @@ fn bundle_pbck(main_path, out_base, opts = nil) {
 // selfhost_loader.extract_payload's reader.
 // Returns { ok, out, bytes, payload_bytes, modules, optimized } or {ok:false}.
 fn self_extract(main_path, out_path, opts = nil) {
-    let sb   = import("stdlib:selfhost_bundle.sapp");
-    let pbck = import("stdlib:selfhost_pbck.sapp");
-    let b = sb.bundle_file(main_path);
+    let b = SELFHOST_BUNDLE.bundle_file(main_path);
     if not b.ok { return b; }
 
     let do_opt = _opt(opts, "optimize", true);
     let chunk = b.chunk;
     if do_opt {
-        let xl = import("stdlib:selfhost_to_pbck.sapp");
-        chunk = xl.optimize_chunk(b.chunk);
+        chunk = SELFHOST_TO_PBCK.optimize_chunk(b.chunk);
     }
-    let b64 = base64_encode_bytes(pbck.serialize_chunk(chunk));
+    let b64 = base64_encode_bytes(SELFHOST_PBCK.serialize_chunk(chunk));
     let launcher = "// pblang self-extracting bundle (PBSELF v1)\n"
         + "// Run: pblang run " + out_path + " --allow-all\n"
         + "let __pbself = import(\"stdlib/selfhost_loader.sapp\");\n"
@@ -453,8 +758,7 @@ fn native(main_path, out_base, opts = nil, target = nil) {
     // so a single-file program with import() only in a comment reports inlined:false
     // and writes no spurious .inlined.sapp.
     if str_index_of(src, "import(") >= 0 {
-        let inl = import("stdlib:source_inliner.sapp");
-        let lk = inl.inline_file_prefixed(main_path);
+        let lk = SOURCE_INLINER.inline_file_prefixed(main_path);
         if not lk.ok {
             return map{ ok: false, multi_module: true,
                 reason: "native: cannot link imports for a single binary: " + lk.reason
@@ -486,7 +790,26 @@ fn native(main_path, out_base, opts = nil, target = nil) {
     return r;
 }
 
+fn native_source(source, out_base, opts = nil, target = nil) {
+    if target == nil {
+        let available = available_targets();
+        if len(available) == 0 {
+            return map{ ok: false, reason: "native_source: no C toolchain on host" };
+        }
+        target = available[0].name;
+    }
+    if opts == nil { opts = release_opts(); }
+    let result = compile_source_c99(source, target, out_base, opts);
+    result.native = true;
+    result.standalone = _opt(opts, "static", false);
+    result.inlined = true;
+    if not result.ok { result.reason = result.stderr; }
+    return result;
+}
+
 export have, all_targets, target_by_name, available_targets, missing_targets_help;
-export default_opts, release_opts, transpile, compile_c, build, build_all, release, report_to_string;
-export bundle_pbck, self_extract, native;
+export default_opts, release_opts, transpile, compile_c, c99_source_admission;
+export compile_source_c99_blob, compile_source_c99;
+export build, build_all, release, report_to_string;
+export bundle_pbck, bundle_pbck_blob, bundle_pbck_source, self_extract, native, native_source;
 export runtime_binary;

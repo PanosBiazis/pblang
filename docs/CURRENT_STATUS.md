@@ -1112,7 +1112,7 @@ and product suites in pbAI, pbOS, and pb-mcp-server.
 | Memory Safety | ✅ Wired | Runtime builtins + `MemoryTracker`; not compile-time for all values |
 | Async/Await | ✅ Added | `async_spawn`, `await`, `await_all`, `await_any`, `map`, `then` via `stdlib/async_await.sapp` |
 | Quantum Computing | ✅ Bridge | `pblang-quantum` crate: Qiskit, Cirq, Braket via Python subprocess; `quantum_run`, `quantum_statevector`, `quantum_backends` builtins |
-| Polyglot Execution | ✅ Bridge | `polyglot_exec(lang, code)` builtin: execute Python, JS, Bash, Ruby, Perl, Lua, PHP, R inline |
+| Polyglot Execution | 🛡️ Bounded bridge | `stdlib:polyglot.sapp` requires explicit trusted-source approval and routes supported interpreters through the bounded registry. Raw `polyglot_*` VM builtins are retained bootstrap internals and are blocked by the PBLang security analyzer. Compile-and-run and in-process cached-library loading remain fail-closed pending isolated brokers. |
 | WASM Backend | ✅ Prototype | `pblang-wasm` crate: compile pblang AST → WAT (.wat); functions, arithmetic, strings, exports |
 | LLVM Backend | ✅ Prototype | `pblang-llvm` crate: LLVM IR text emitter → compile with clang; `pblang compile --llvm`; functions, if/else, while, for, comparisons |
 | Self-Hosting | ✅ **Complete** | `stdlib/compiler/` (tokenizer→parser→semantic→typeck→ir→optimizer→codegen + `selfhost_frontend.sapp` entry + `vm.sapp` interpreter, ~5,300 lines) tokenizes, parses, compiles **and runs** pblang end-to-end. All language features self-host (incl. `match`, `struct`/`enum`, `class`+colon-call, closures, nil-safe ops). Frontier is now breadth/perf |

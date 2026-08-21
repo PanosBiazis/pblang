@@ -9,6 +9,11 @@
 //   let langs = reg.detect_all();
 //   reg.run("python", "print('hello')");
 
+let BOUNDED_INTEROP = import("stdlib:interop.sapp");
+let PROCESS = import("stdlib:process.sapp");
+let POLYGLOT_BUILD = import("stdlib:polyglot_build.sapp");
+let SERIALIZATION = import("stdlib:serialization.sapp");
+
 // Module-level state for caching
 let _registry_which_cache_val = map{};
 let _registry_ext_cache_val = map{};
@@ -16,9 +21,9 @@ let _registry_ext_cache_ready = false;
 
 let _ALIASES = map{
     js: "javascript", node: "javascript", ts: "typescript",
-    py: "python", py3: "python", rb: "ruby", rs: "rust",
+    py: "python", py3: "python", python3: "python", rb: "ruby", rs: "rust",
     golang: "go", cxx: "cpp", cs: "csharp", kt: "kotlin",
-    pl: "perl", sh: "bash",
+    pl: "perl", sh: "bash", shell: "bash",
     "c++": "cpp", "c#": "csharp",
 };
 
@@ -582,7 +587,37 @@ let _LANG_DB = map{
         },
 };
 
-fn _lang_db() { return _LANG_DB; }
+fn _copy_array(value) {
+    if value == nil { return nil; }
+    let copied = [];
+    let i = 0;
+    while i < len(value) { array_push(copied, value[i]); i = i + 1; }
+    return copied;
+}
+
+fn _copy_entry(entry) {
+    return map{
+        name: entry.name, category: entry.category, ext: entry.ext,
+        run_cmd: entry.run_cmd, run_args_template: _copy_array(entry.run_args_template),
+        compile_cmd: entry.compile_cmd,
+        compile_args_template: _copy_array(entry.compile_args_template),
+        bridge: entry.bridge, description: entry.description,
+        use_cases: _copy_array(entry.use_cases)
+    };
+}
+
+// Public compatibility snapshot. Returning detached entries prevents callers
+// from poisoning command names, templates, or bridge classifications.
+fn _lang_db() {
+    let snapshot = map{};
+    let keys = map_keys(_LANG_DB);
+    let i = 0;
+    while i < len(keys) {
+        snapshot[keys[i]] = _copy_entry(_LANG_DB[keys[i]]);
+        i = i + 1;
+    }
+    return snapshot;
+}
 
 // ── Availability Detection ────────────────────────────────────────────────────
 
@@ -594,9 +629,10 @@ fn _which_cache() {
 fn _which_cached(cmd) {
     let cache = _which_cache();
     if cache == nil { cache = map{}; }
+    if type(cmd) != "string" or len(cmd) < 1 { return false; }
     if map_has(cache, cmd) { return cache[cmd]; }
-    let result = try exec("which " + cmd + " > /dev/null 2>&1 && echo yes || echo no") catch "no";
-    let available = str_contains(result, "yes");
+    let candidates = try POLYGLOT_BUILD.tool_candidates(cmd) catch [];
+    let available = len(candidates) > 0;
     cache[cmd] = available;
     _registry_which_cache_val = cache;
     return available;
@@ -604,7 +640,7 @@ fn _which_cached(cmd) {
 
 // is_available(lang) — check if a language runtime is installed
 fn is_available(lang) {
-    let db = _lang_db();
+    let db = _LANG_DB;
     let entry = db[lang];
     if entry == nil { return false; }
     return _which_cached(entry.run_cmd);
@@ -612,7 +648,7 @@ fn is_available(lang) {
 
 // detect_all() — detect all installed languages from the 22 supported
 fn detect_all() {
-    let db = _lang_db();
+    let db = _LANG_DB;
     let keys = map_keys(db);
     let detected = [];
     for i len(keys) {
@@ -639,7 +675,7 @@ fn _all_lang_keys() {
 
 // list_languages() — list all 22 supported languages with metadata
 fn list_languages() {
-    let db = _lang_db();
+    let db = _LANG_DB;
     let all_keys = _all_lang_keys();
     let result = [];
     for i len(all_keys) {
@@ -663,287 +699,389 @@ fn list_languages() {
 
 // ── Code Execution ────────────────────────────────────────────────────────────
 
-// _tmp_path(lang) — generate a temp file path for a language
+// Legacy compatibility helper. Registry execution no longer publishes shared
+// temporary files; callers must not construct their own execution paths.
 fn _tmp_path(lang) {
-    let db = _lang_db();
-    let entry = db[lang];
-    let ext = "txt";
-    if entry != nil { ext = entry.ext; }
-    return "/tmp/pblang_poly_" + lang + "_" + str(random_float()) + "." + ext;
+    return nil;
 }
 
-// run(lang, code) — execute code in any language
-fn run(lang, code) {
-    let db = _lang_db();
-    let entry = db[lang];
-    if entry == nil {
-        return map{ ok: false, stdout: "", stderr: "unsupported language: " + lang, exit_code: -1 };
-    }
+let MAX_RUN_CODE_BYTES = 3584;
+let MAX_RUN_INPUT_BYTES = 1048576;
+let MAX_RUN_OUTPUT_BYTES = 1048576;
 
-    // Check availability
-    if is_available(lang) == false {
-        return map{ ok: false, stdout: "", stderr: lang + " runtime not installed", exit_code: -1 };
+fn _bounded_bytes(value, max_bytes) {
+    if type(value) != "array" or len(value) > max_bytes { return false; }
+    let i = 0;
+    while i < len(value) {
+        let byte = value[i];
+        if type(byte) != "number" or byte != num_floor(byte) or byte < 0 or byte > 255 {
+            return false;
+        }
+        i = i + 1;
     }
+    return true;
+}
 
-    // Write code to temp file
-    let tmp_path = _tmp_path(lang);
-    let wrote = try fs_write(tmp_path, code) catch false;
-    if wrote == false {
-        return map{ ok: false, stdout: "", stderr: "failed to write temp file", exit_code: -1 };
+fn _trusted_source(options) {
+    return type(options) == "map" and map_has(options, "trusted_source")
+        and type(options.trusted_source) == "bool" and options.trusted_source;
+}
+
+fn _toolchain_effects(options) {
+    return type(options) == "map" and map_has(options, "allow_toolchain_effects")
+        and type(options.allow_toolchain_effects) == "bool" and options.allow_toolchain_effects;
+}
+
+fn _run_failure(message, lang = "", acknowledged = false) {
+    return map{ format: "pblang.polyglot-run.v2", ok: false, complete: false,
+        executed: false, bounded: false, sandboxed: false, raw_fallback: false,
+        trusted_source_required: true, trusted_source_acknowledged: acknowledged,
+        trusted_source_authorized: false, trust_is_acknowledgement: true,
+        authority_scope: "vm_capability", multi_principal_safe: false,
+        principal_isolation_required: true,
+        execution_capability_required: true, execution_capability_observed: false,
+        language: lang, stdout: "", stderr: message,
+        error: message, exit_code: -1, timed_out: false, output_truncated: false,
+        executable_descriptor_held: false, executable_nofollow: false,
+        check_then_exec_race: false };
+}
+
+fn _run_argv(lang, code) {
+    if lang == "python" { return ["-I", "-S", "-c", code]; }
+    if lang == "javascript" { return ["-e", code]; }
+    if lang == "ruby" { return ["--disable-gems", "-e", code]; }
+    if lang == "bash" { return ["--noprofile", "--norc", "-c", code]; }
+    if lang == "perl" { return ["-T", "-e", code]; }
+    if lang == "lua" { return ["-e", code]; }
+    if lang == "php" { return ["-n", "-r", code]; }
+    if lang == "r" { return ["--vanilla", "--slave", "-e", code]; }
+    return nil;
+}
+
+// Foreign source is executable authority. Callers must opt in explicitly; the
+// fixed backend bounds resources but is not an OS filesystem/network sandbox.
+fn run(lang, code, options = nil) {
+    let key = alias(str_lower(str_trim(str(lang))));
+    if not _trusted_source(options) {
+        return _run_failure("explicit trusted_source=true is required", key);
     }
-
-    // Build args: append temp file path
-    let args = [];
-    let template = entry.run_args_template;
-    if template != nil {
-        for i len(template) {
-            array_push(args, template[i]);
+    if not map_has(_LANG_DB, key) {
+        return _run_failure("unsupported language: " + key, key, true);
+    }
+    if type(code) != "string" or len(str_to_bytes(code)) > MAX_RUN_CODE_BYTES
+       or str_contains(code, strfromcharcode(0)) {
+        return _run_failure("trusted source must be a NUL-free string within 3584 bytes", key, true);
+    }
+    let timeout_secs = if map_has(options, "timeout_secs") { options.timeout_secs } else { 10 };
+    if type(timeout_secs) != "number" or timeout_secs != num_floor(timeout_secs)
+       or timeout_secs < 1 or timeout_secs > 30 {
+        return _run_failure("timeout_secs must be an integer from 1 to 30", key, true);
+    }
+    let stdin_bytes = nil;
+    if map_has(options, "stdin_bytes") {
+        stdin_bytes = options.stdin_bytes;
+        if not _bounded_bytes(stdin_bytes, MAX_RUN_INPUT_BYTES) {
+            return _run_failure("stdin_bytes must contain at most 1048576 bytes", key, true);
         }
     }
-    array_push(args, tmp_path);
-
-    // Execute
-    let result = try {
-        let r = proc_spawn_wait(entry.run_cmd, args);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "subprocess failed" };
-
-    // Cleanup and return
-    try fs_remove(tmp_path) catch nil;
-
-    return map{
-        ok: result.exit_code == 0,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exit_code: result.exit_code,
-        language: lang,
+    let argv = _run_argv(key, code);
+    if argv == nil {
+        return _run_failure("language has no bounded direct-execution adapter", key, true);
+    }
+    let entry = _LANG_DB[key];
+    let candidates = POLYGLOT_BUILD.tool_candidates(entry.run_cmd);
+    if len(candidates) == 0 {
+        return _run_failure(key + " runtime is unavailable or bounded executable resolution was denied", key, true);
+    }
+    let process_options = map{
+        timeout_secs: timeout_secs, startup_timeout_ms: 3000,
+        max_output_bytes: MAX_RUN_OUTPUT_BYTES, max_file_bytes: MAX_RUN_OUTPUT_BYTES,
+        max_memory_bytes: 536870912, inherit_environment: false,
+        environment: map{ PATH: "/usr/bin:/bin", HOME: "/nonexistent",
+            TMPDIR: "/tmp", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" }
     };
+    if stdin_bytes != nil { process_options.stdin_bytes = stdin_bytes; }
+    let result = PROCESS.run_fixed_bounded(candidates, argv, process_options);
+    let command_ok = try result.command_ok catch false;
+    let bounded = try result.bounded catch false;
+    let timed_out = try result.timed_out catch false;
+    let truncated = try result.output_truncated catch false;
+    let error_message = try result.error catch (try result.stderr catch "bounded execution failed");
+    if command_ok and bounded and not timed_out and not truncated { error_message = ""; }
+    elif error_message == "" {
+        if timed_out { error_message = "bounded foreign execution timed out"; }
+        elif truncated { error_message = "bounded foreign execution exceeded its output limit"; }
+        else { error_message = "bounded foreign execution failed"; }
+    }
+    return map{ format: "pblang.polyglot-run.v2",
+        ok: command_ok and bounded and not timed_out and not truncated,
+        complete: command_ok and bounded and not timed_out and not truncated,
+        executed: try result.completed catch (try result.ok catch false),
+        bounded: bounded, sandboxed: false, effects_confined: false,
+        raw_fallback: false, trusted_source_required: true,
+        trusted_source_acknowledged: true, trusted_source_authorized: false,
+        trust_is_acknowledgement: true, execution_capability_required: true,
+        authority_scope: "vm_capability", multi_principal_safe: false,
+        principal_isolation_required: true,
+        execution_capability_observed: try result.completed catch (try result.ok catch false),
+        language: key,
+        stdin_bounded: stdin_bytes != nil,
+        input_bytes: if stdin_bytes == nil { 0 } else { len(stdin_bytes) },
+        stdout: try result.stdout catch "", stderr: try result.stderr catch "",
+        error: error_message, exit_code: try result.exit_code catch -1,
+        timed_out: timed_out, output_truncated: truncated,
+        memory_limit_enforced: try result.memory_limit_enforced catch false,
+        process_group_terminated: try result.process_group_terminated catch false,
+        executable_descriptor_held: try result.executable_descriptor_held catch false,
+        executable_nofollow: try result.executable_nofollow catch false,
+        check_then_exec_race: try result.check_then_exec_race catch false,
+        fixed_candidate: try result.fixed_candidate catch "" };
+}
+
+// Text-filter compatibility path. Input remains data on a private bounded
+// descriptor and is never interpolated into foreign source or argv.
+fn run_with_input(lang, code, input, options = nil) {
+    let key = alias(str_lower(str_trim(str(lang))));
+    if not _trusted_source(options) {
+        return _run_failure("explicit trusted_source=true is required", key);
+    }
+    if type(input) != "string" {
+        return _run_failure("input must be a UTF-8 string", key, true);
+    }
+    let bytes = str_to_bytes(input);
+    if len(bytes) > MAX_RUN_INPUT_BYTES {
+        return _run_failure("input exceeds the 1048576-byte limit", key, true);
+    }
+    let effective = map{};
+    if options != nil and map_has(options, "trusted_source") {
+        effective.trusted_source = options.trusted_source;
+    }
+    if options != nil and map_has(options, "timeout_secs") {
+        effective.timeout_secs = options.timeout_secs;
+    }
+    effective.stdin_bytes = bytes;
+    return run(key, code, effective);
 }
 
 // ── Compilation ───────────────────────────────────────────────────────────────
 
-// compile(lang, code, output) — compile code to shared library in any language
-fn compile(lang, code, output) {
-    let db = _lang_db();
-    let entry = db[lang];
-    if entry == nil {
-        return map{ error: "unsupported language: " + lang };
-    }
-    if entry.compile_cmd == nil {
-        return map{ error: lang + " does not support compilation" };
-    }
-    if is_available(lang) == false {
-        return map{ error: lang + " not installed" };
-    }
+fn _compile_failure(message, lang = "", source_acknowledged = false,
+    effects_acknowledged = false) {
+    return map{ format: "pblang.polyglot-compile.v2", ok: false,
+        complete: false, compiled: false, executed: false, bounded: false,
+        sandboxed: false, raw_fallback: false, artifact_verified: false,
+        cleanup_complete: true, language: lang, artifact: "", error: message,
+        trusted_source_required: true, trusted_source_acknowledged: source_acknowledged,
+        trusted_source_authorized: false, trust_is_acknowledgement: true,
+        authority_scope: "vm_capability", multi_principal_safe: false,
+        principal_isolation_required: true,
+        toolchain_effects_required: true,
+        toolchain_effects_acknowledged: effects_acknowledged,
+        toolchain_effects_authorized: false, execution_capability_required: true };
+}
 
-    // Handle compiled languages that need a temp file first
-    let src_file = _tmp_path(lang);
-    let wrote = try fs_write(src_file, code) catch false;
-    if wrote == false {
-        return map{ error: "failed to write source file" };
+// `output` is now an approved output root. The concrete artifact remains under
+// an exclusive private session created by polyglot_build.
+fn compile(lang, code, output, options = nil) {
+    let key = alias(str_lower(str_trim(str(lang))));
+    let source_acknowledged = _trusted_source(options);
+    let effects_acknowledged = _toolchain_effects(options);
+    if not source_acknowledged or not effects_acknowledged {
+        return _compile_failure(
+            "explicit trusted_source=true and allow_toolchain_effects=true are required", key,
+            source_acknowledged, effects_acknowledged);
     }
-
-    // Build compile command
-    let platform_ext = ".so";
-    let p = platform();
-    if p == "windows" { platform_ext = ".dll"; }
-    if p == "macos" { platform_ext = ".dylib"; }
-    let out_file = output;
-    if str_ends_with(out_file, platform_ext) == false {
-        out_file = out_file + platform_ext;
+    if not map_has(_LANG_DB, key) {
+        return _compile_failure("unsupported language: " + key, key, true, true);
     }
-
-    // Lang-specific compile logic
-    if lang == "rust" {
-        // Special: cargo needs a project structure
-        try fs_remove(src_file) catch nil;
-        let proj_dir = output + "_rust_proj";
-        fs_mkdirs(proj_dir);
-        fs_write(proj_dir + "/Cargo.toml",
-            "[package]\nname = \"pblang_polyglot\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"cdylib\"]\npath = \"lib.rs\"\n");
-        fs_write(proj_dir + "/lib.rs", code);
-        let result = try {
-            let r = proc_spawn_wait("cargo", ["build", "--release", "--manifest-path", proj_dir + "/Cargo.toml"]);
-            r
-        } catch map{ exit_code: -1, stdout: "", stderr: "cargo build failed" };
-        if result.exit_code != 0 {
-            return map{ error: "rust build failed: " + result.stderr };
-        }
-        let lib_name = if p == "windows" { "pblang_polyglot.dll" } else { "libpblang_polyglot.so" };
-        return map{
-            ok: true,
-            language: lang,
-            artifact: proj_dir + "/target/release/" + lib_name,
-            bridge: "ffi",
-        };
+    if not POLYGLOT_BUILD.validate_build_request("registry_build", code, output).ok {
+        return _compile_failure("invalid bounded build request", key, true, true);
     }
-
-    if lang == "go" {
-        try fs_remove(src_file) catch nil;
-        let src_dir = output + "_go_proj";
-        fs_mkdirs(src_dir);
-        fs_write(src_dir + "/main.go", code);
-        fs_write(src_dir + "/go.mod", "module pblang_polyglot\n\ngo 1.21\n");
-        let result = try {
-            let r = proc_spawn_wait("go", ["build", "-buildmode=c-shared", "-o", out_file, src_dir + "/main.go"]);
-            r
-        } catch map{ exit_code: -1, stdout: "", stderr: "go build failed" };
-        if result.exit_code != 0 {
-            return map{ error: "go build failed: " + result.stderr };
-        }
-        return map{
-            ok: true,
-            language: lang,
-            artifact: out_file,
-            bridge: "ffi",
-        };
+    let built = try POLYGLOT_BUILD.build_language(key, "registry_build", code, output)
+        catch nil;
+    if built == nil { return _compile_failure("bounded build dispatch failed", key, true, true); }
+    let toolchain_executed = try built.toolchain_executed catch false;
+    let operation_bounded = try built.bounded catch false;
+    let artifact_kind = try built.artifact_kind catch "unknown";
+    if not (try built.ok catch false) or (try built.status catch "") == "fallback" {
+        return map{ format: "pblang.polyglot-compile.v2", ok: false,
+            complete: false, compiled: false, published: map_has(built, "artifact"),
+            executed: toolchain_executed, toolchain_executed: toolchain_executed,
+            bounded: operation_bounded, sandboxed: false,
+            raw_fallback: false, artifact_verified: false, cleanup_complete: false,
+            cleanup_required: (try built.cleanup_required catch false)
+                or map_has(built, "artifact"), language: key,
+            artifact: try built.artifact catch "", detail: built,
+            error: try built.error catch (try built.warning catch "toolchain did not produce a compiled artifact"),
+            trusted_source_required: true, trusted_source_acknowledged: true,
+            trusted_source_authorized: false, trust_is_acknowledgement: true,
+            authority_scope: "vm_capability", multi_principal_safe: false,
+            principal_isolation_required: true,
+            toolchain_effects_required: true, toolchain_effects_acknowledged: true,
+            toolchain_effects_authorized: false, execution_capability_required: true,
+            execution_capability_observed: toolchain_executed };
     }
-
-    if lang == "c" or lang == "cpp" {
-        let cxx = "cc";
-        if lang == "cpp" { cxx = "c++"; }
-        let std_flag = "";
-        if lang == "cpp" { std_flag = "-std=c++17"; }
-        let result = try {
-            let r = proc_spawn_wait(cxx, ["-shared", "-fPIC", std_flag, "-o", out_file, src_file]);
-            r
-        } catch map{ exit_code: -1, stdout: "", stderr: "compile failed" };
-        try fs_remove(src_file) catch nil;
-        if result.exit_code != 0 {
-            return map{ error: lang + " build failed: " + result.stderr };
-        }
-        return map{
-            ok: true,
-            language: lang,
-            artifact: out_file,
-            bridge: "ffi",
-        };
+    let artifact = try built.artifact catch "";
+    let verified = if artifact != "" { POLYGLOT_BUILD.verify_artifact(artifact) }
+        else { map{ ok: false } };
+    if not (try verified.ok catch false) {
+        return map{ format: "pblang.polyglot-compile.v2", ok: false,
+            complete: false, compiled: false, published: artifact != "",
+            executed: toolchain_executed, toolchain_executed: toolchain_executed,
+            bounded: operation_bounded, sandboxed: false,
+            raw_fallback: false, artifact_verified: false, cleanup_complete: false,
+            cleanup_required: artifact != "", language: key, artifact: artifact,
+            detail: built, error: "compiler result is not one bounded verified file artifact",
+            trusted_source_required: true, trusted_source_acknowledged: true,
+            trusted_source_authorized: false, trust_is_acknowledgement: true,
+            authority_scope: "vm_capability", multi_principal_safe: false,
+            principal_isolation_required: true,
+            toolchain_effects_required: true, toolchain_effects_acknowledged: true,
+            toolchain_effects_authorized: false, execution_capability_required: true,
+            execution_capability_observed: toolchain_executed };
     }
-
-    // Generic: use compile_cmd + compile_args_template + output + src
-    let cmd_args = [];
-    let template = entry.compile_args_template;
-    if template != nil {
-        for i len(template) {
-            array_push(cmd_args, template[i]);
-        }
-    }
-    array_push(cmd_args, out_file);
-    array_push(cmd_args, src_file);
-
-    let result = try {
-        let r = proc_spawn_wait(entry.compile_cmd, cmd_args);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "compile failed" };
-    try fs_remove(src_file) catch nil;
-
-    if result.exit_code != 0 {
-        return map{ error: lang + " build failed: " + result.stderr };
-    }
-
-    return map{
-        ok: true,
-        language: lang,
-        artifact: out_file,
-        bridge: entry.bridge,
-    };
+    let compiled = try built.compiled catch false;
+    return map{ format: "pblang.polyglot-compile.v2", ok: true,
+        complete: true, compiled: compiled, published: true,
+        executed: toolchain_executed, toolchain_executed: toolchain_executed,
+        bounded: operation_bounded, sandboxed: false,
+        effects_confined: false, raw_fallback: false, artifact_verified: true,
+        artifact_kind: artifact_kind,
+        artifact_size: verified.size, artifact_sha256: verified.sha256,
+        cleanup_complete: false, cleanup_required: true, output_is_root: true,
+        language: key, artifact: artifact, bridge: _LANG_DB[key].bridge,
+        trusted_source_required: true, trusted_source_acknowledged: true,
+        trusted_source_authorized: false, trust_is_acknowledgement: true,
+        authority_scope: "vm_capability", multi_principal_safe: false,
+        principal_isolation_required: true,
+        toolchain_effects_required: true, toolchain_effects_acknowledged: true,
+        toolchain_effects_authorized: false, execution_capability_required: true,
+        execution_capability_observed: toolchain_executed };
 }
 
 // ── Bridging ──────────────────────────────────────────────────────────────────
 
-// ffi_bridge(lang, lib_path, fn_name, args) — call a foreign function via FFI
+// Generic in-process FFI cannot enforce descriptor-held library identity,
+// constructor isolation, ABI safety, or crash containment. Keep this legacy
+// entrypoint fail-closed until a brokered typed FFI process exists.
 fn ffi_bridge(lang, lib_path, fn_name, args) {
-    let db = _lang_db();
-    let entry = db[lang];
-    if entry == nil {
-        return map{ error: "unsupported language: " + lang };
-    }
-    if entry.bridge != "ffi" {
-        return map{ error: lang + " uses " + entry.bridge + " bridge, not ffi" };
-    }
-    let lib = try ffi_load(lib_path) catch nil;
-    if lib == nil {
-        return map{ error: "failed to load library: " + lib_path };
-    }
-    let result = try {
-        let r = ffi_call(lib, fn_name, args);
-        ffi_close(lib);
-        r
-    } catch 0.0;
-    return map{
-        ok: true,
-        result: result,
-        language: lang,
-    };
+    return map{ format: "pblang.polyglot-ffi.v2", ok: false,
+        complete: false, executed: false, bounded: false, sandboxed: false,
+        raw_fallback: false, policy_required: true, broker_required: true,
+        language: str(lang), result: nil,
+        error: "generic in-process FFI is disabled; use a brokered typed FFI capability" };
 }
 
-// json_bridge(lang, code, input_json) — call a language via JSON protocol
-fn json_bridge(lang, code, input_json) {
-    let db = _lang_db();
-    let entry = db[lang];
-    if entry == nil {
-        return map{ error: "unsupported language: " + lang };
+let MAX_JSON_BRIDGE_CODE_BYTES = 3584;
+let MAX_JSON_BRIDGE_WRAPPER_BYTES = 4096;
+let MAX_JSON_BRIDGE_INPUT_BYTES = 1048576;
+
+fn _json_bridge_language(lang) {
+    let value = str_lower(str_trim(str(lang)));
+    if value == "python" or value == "python3" { return "python"; }
+    if value == "javascript" or value == "js" or value == "node" { return "javascript"; }
+    if value == "ruby" { return "ruby"; }
+    return "";
+}
+
+fn _parse_bridge_json(input_json) {
+    return SERIALIZATION.parse_safe(input_json, "json", map{
+        max_input_bytes: MAX_JSON_BRIDGE_INPUT_BYTES,
+        max_output_bytes: MAX_JSON_BRIDGE_INPUT_BYTES,
+        max_depth: 64, max_items: 100000, strict: true
+    });
+}
+
+fn _public_bridge_plan(plan) {
+    if not plan.ok { return plan; }
+    return map{ ok: true, format: plan.format, language: plan.language,
+        wrapper: plan.wrapper, input_bytes: plan.input_bytes,
+        max_input_bytes: plan.max_input_bytes,
+        input_embedded_in_source: false, transport: plan.transport,
+        executed: false, bounded_parse: true };
+}
+
+// Prepare a fixed wrapper while keeping caller JSON on stdin. The validated
+// input is measured but never interpolated into executable foreign source.
+fn _prepare_json_bridge(lang, code, input_json) {
+    let language = _json_bridge_language(lang);
+    if language == "" {
+        return map{ ok: false, error: "json bridge supports python, javascript, and ruby only",
+            language: str(lang), executed: false };
     }
-    if is_available(lang) == false {
-        return map{ error: lang + " not installed" };
+    if type(code) != "string" or len(str_to_bytes(code)) > MAX_JSON_BRIDGE_CODE_BYTES {
+        return map{ ok: false, error: "json bridge code limit exceeded",
+            language: language, executed: false };
+    }
+    if type(input_json) != "string" or len(str_to_bytes(input_json)) > MAX_JSON_BRIDGE_INPUT_BYTES {
+        return map{ ok: false, error: "json bridge input limit exceeded",
+            language: language, executed: false };
+    }
+    let parsed = _parse_bridge_json(input_json);
+    if not parsed.ok {
+        return map{ ok: false, error: "json bridge input is not valid JSON",
+            language: language, executed: false, bounded_parse: true,
+            diagnostics: parsed.diagnostics };
     }
 
-    // Write code to temp file
-    let tmp_path = _tmp_path(lang);
-    let wrapper_code = "";
-    if lang == "python" or lang == "python3" {
-        wrapper_code =
-            "import json, sys\n" +
-            "input_data = json.loads('''" + input_json + "''')\n" +
-            code + "\n";
-        // Append a JSON serialization wrapper
-        if str_contains(code, "__result__") {
-            wrapper_code = wrapper_code +
-                "print(json.dumps(__result__))\n";
-        }
-    } else if lang == "javascript" {
-        wrapper_code =
-            "const input = JSON.parse('" + input_json + "');\n" +
-            code + "\n" +
-            "process.stdout.write(JSON.stringify(__result__));\n";
-    } else if lang == "ruby" {
-        wrapper_code =
-            "require 'json'\n" +
-            "input_data = JSON.parse('" + input_json + "')\n" +
-            code + "\n" +
-            "puts __result__.to_json\n";
+    let wrapper = "";
+    if language == "python" {
+        wrapper = "import json, sys\ninput_data = json.load(sys.stdin)\n" + code + "\n"
+            + "if '__result__' in globals():\n    print(json.dumps(__result__))\n";
+    } elif language == "javascript" {
+        wrapper = "const fs = require('fs');\nconst input_data = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+            + code + "\nprocess.stdout.write(JSON.stringify(__result__));\n";
     } else {
-        // Generic: just append input as last line argument
-        wrapper_code = code;
+        wrapper = "require 'json'\ninput_data = JSON.parse(STDIN.read)\n" + code
+            + "\nputs __result__.to_json\n";
     }
-
-    let wrote = try fs_write(tmp_path, wrapper_code) catch false;
-    if wrote == false {
-        return map{ error: "failed to write temp file" };
+    if len(str_to_bytes(wrapper)) > MAX_JSON_BRIDGE_WRAPPER_BYTES {
+        return map{ ok: false, error: "json bridge wrapper limit exceeded",
+            language: language, executed: false };
     }
+    return map{ ok: true, format: "pblang.polyglot-json-bridge.v2",
+        language: language, wrapper: wrapper, input_bytes: len(str_to_bytes(input_json)),
+        max_input_bytes: MAX_JSON_BRIDGE_INPUT_BYTES, input_embedded_in_source: false,
+        transport: "stdin", executed: false, bounded_parse: true,
+        input_value: parsed.value };
+}
 
-    let args = [];
-    let template = entry.run_args_template;
-    if template != nil {
-        for i len(template) {
-            array_push(args, template[i]);
-        }
+fn prepare_json_bridge(lang, code, input_json) {
+    return _public_bridge_plan(_prepare_json_bridge(lang, code, input_json));
+}
+
+// json_bridge(lang, code, input_json, options) — JSON is data on stdin and can never
+// terminate a generated source literal.
+fn json_bridge(lang, code, input_json, options = nil) {
+    if not _trusted_source(options) {
+        return _run_failure("explicit trusted_source=true is required",
+            _json_bridge_language(lang));
     }
-    array_push(args, tmp_path);
-
-    let result = try {
-        let r = proc_spawn_wait(entry.run_cmd, args);
-        r
-    } catch map{ exit_code: -1, stdout: "", stderr: "subprocess failed" };
-
-    try fs_remove(tmp_path) catch nil;
-
-    return map{
-        ok: result.exit_code == 0,
-        output: result.stdout,
-        error_output: result.stderr,
-        language: lang,
+    let plan = _prepare_json_bridge(lang, code, input_json);
+    if not plan.ok {
+        plan.trusted_source_required = true;
+        plan.trusted_source_acknowledged = true;
+        plan.trusted_source_authorized = false;
+        plan.trust_is_acknowledgement = true;
+        plan.execution_capability_required = true;
+        return plan;
+    }
+    let bounded = BOUNDED_INTEROP.run_filter(plan.language, code, plan.input_value, 10,
+        map{ trusted_source: true });
+    let result = map{
+        ok: bounded.ok, output: bounded.stdout,
+        error_output: if bounded.stderr != "" { bounded.stderr } else { bounded.error },
+        exit_code: bounded.exit_code, language: plan.language,
+        executed: bounded.executed, bounded: bounded.bounded,
+        timed_out: bounded.timed_out, output_truncated: bounded.output_truncated,
+        transport: "private-stdin", input_embedded_in_source: false,
+        raw_fallback: false, bounded_parse: true, trusted_source_required: true,
+        trusted_source_acknowledged: true, trusted_source_authorized: false,
+        trust_is_acknowledgement: true, execution_capability_required: true,
+        execution_capability_observed: bounded.executed
     };
+    result.input_bytes = plan.input_bytes;
+    return result;
 }
 
 // ── Language Recommendation ───────────────────────────────────────────────────
@@ -997,9 +1135,7 @@ fn best_for(task) {
 
 // _ext_for_lang(lang) — file extension for a language
 fn _ext_for_lang(lang) {
-    let db = _lang_db();
-    let entry = db[lang];
-    if entry != nil { return entry.ext; }
+    if map_has(_LANG_DB, lang) { return _LANG_DB[lang].ext; }
     return "txt";
 }
 
@@ -1007,11 +1143,11 @@ fn _ext_for_lang(lang) {
 
 // is_supported(lang) — true if the registry knows this language (toolchain may still
 // be absent — use is_available for that). map_has guard: missing-key read throws.
-fn is_supported(lang) { return map_has(_lang_db(), lang); }
+fn is_supported(lang) { return map_has(_LANG_DB, lang); }
 
 fn _extension_index() {
     if not _registry_ext_cache_ready {
-        let db = _lang_db();
+        let db = _LANG_DB;
         let ks = map_keys(db);
         let i = 0;
         while i < len(ks) {
@@ -1036,9 +1172,8 @@ fn lang_for_ext(ext) {
 
 // category_of(lang) — "compiled"/"interpreted"/... or nil if unknown.
 fn category_of(lang) {
-    let db = _lang_db();
-    if not map_has(db, lang) { return nil; }
-    return db[lang].category;
+    if not map_has(_LANG_DB, lang) { return nil; }
+    return _LANG_DB[lang].category;
 }
 
 // alias(name) — canonicalize a common language alias (js->javascript, py->python …).
@@ -1053,8 +1188,8 @@ fn extensions() {
     return map_keys(_extension_index());
 }
 
-export run, compile, is_available, detect_all;
-export ffi_bridge, json_bridge;
+export run, run_with_input, compile, is_available, detect_all;
+export ffi_bridge, prepare_json_bridge, json_bridge;
 export list_languages, best_for;
 export _lang_db, _ext_for_lang, _tmp_path;
 export is_supported, lang_for_ext, category_of;

@@ -2,13 +2,93 @@
 // Usage: pblang run tools/pbsecure.sapp -- SOURCE [options]
 // Options: --mode=audit|protect|strict --config=FILE --disable-rule=ID
 //          --allow-high-suppressions --entry-only --project-root=DIR
+//          --json-output=FILE
 
 let SECURITY = import("stdlib:security_analysis.sapp");
 let DEP_SECURITY = import("stdlib:security_dependency_analysis.sapp");
+let SECURE_FILE = import("stdlib:secure_file.sapp");
+let PATH = import("stdlib:path.sapp");
 let OS = import("stdlib:os.sapp");
+let MAX_REPORT_BYTES = 67108864;
+let MAX_OUTPUT_PATH_BYTES = 4096;
+
+fn _valid_output_path(path) {
+    return type(path) == "string" and path != "" and len(path) <= MAX_OUTPUT_PATH_BYTES
+        and not str_contains(path, strfromcharcode(0)) and not str_contains(path, "\n")
+        and not str_contains(path, "\r") and not str_ends_with(path, "/")
+        and not str_ends_with(path, "\\");
+}
+
+fn _normalized(path) { return PATH.normalize(PATH.absolute(path)); }
+
+fn _same_path(left, right) {
+    if left == "" or right == "" { return false; }
+    let normalized_left = _normalized(left);
+    let normalized_right = _normalized(right);
+    let host = OS.platform();
+    if host == "windows" or host == "macos" {
+        normalized_left = str_lower(normalized_left);
+        normalized_right = str_lower(normalized_right);
+    }
+    return normalized_left == normalized_right;
+}
+
+fn _publish(report, output, status) {
+    let encoded = json_stringify(report);
+    if output == "" { print encoded; os_exit(status); }
+    let payload = encoded + "\n";
+    if len(str_to_bytes(payload)) > MAX_REPORT_BYTES { os_exit(2); }
+    if not SECURE_FILE.write_text_new_exclusive(output, payload, false, false).ok { os_exit(2); }
+    os_exit(status);
+}
+
+fn _verify_entry_snapshot(path, expected_sha256) {
+    let current = SECURE_FILE.read_text(path, 16777216, false);
+    if not current.ok {
+        return map{ ok: false, stable: false, error: "cannot securely reread entry source" };
+    }
+    let actual = sha256(current.text);
+    return map{ ok: true, stable: actual == expected_sha256,
+        expected_sha256: expected_sha256, actual_sha256: actual };
+}
+
+fn _verify_config_snapshot(path, expected_sha256) {
+    let current = SECURITY.load_config(path);
+    if not current.ok {
+        return map{ ok: false, stable: false, error: "cannot securely reread security config" };
+    }
+    return map{ ok: true, stable: current.sha256 == expected_sha256,
+        expected_sha256: expected_sha256, actual_sha256: current.sha256 };
+}
+
+fn _reject_without_output(message, output) {
+    if output == "" { print json_stringify(map{ ok: false, passed: false, error: message }); }
+    os_exit(2);
+}
+
+fn _collides_with_report(output, report) {
+    if _same_path(output, try report.entry catch "") { return true; }
+    let modules = try report.modules catch [];
+    if type(modules) != "array" { return true; }
+    let i = 0;
+    while i < len(modules) {
+        if _same_path(output, try modules[i].path catch "") { return true; }
+        i = i + 1;
+    }
+    return false;
+}
 
 fn main() {
     let args = OS.script_args();
+    let json_output = ""; let output_count = 0; let pre = 0;
+    while pre < len(args) {
+        if str_starts_with(args[pre], "--json-output=") {
+            output_count = output_count + 1;
+            if output_count == 1 { json_output = str_slice(args[pre], 14, len(args[pre])); }
+        }
+        pre = pre + 1;
+    }
+    if output_count > 1 or (output_count == 1 and not _valid_output_path(json_output)) { os_exit(2); }
     let positional = [];
     let mode = "strict";
     let config_path = "";
@@ -25,19 +105,28 @@ fn main() {
         elif arg == "--allow-high-suppressions" { allow_high = true; }
         elif arg == "--entry-only" { entry_only = true; }
         elif str_starts_with(arg, "--project-root=") { project_root = str_slice(arg, 15, len(arg)); }
-        elif str_starts_with(arg, "--") { print "pbsecure: unknown option " + arg; os_exit(2); }
+        elif str_starts_with(arg, "--json-output=") { }
+        elif str_starts_with(arg, "--") {
+            _publish(map{ ok: false, passed: false, error: "unknown option" }, json_output, 2);
+        }
         else { array_push(positional, arg); }
         i = i + 1;
     }
     if len(positional) != 1 or (mode != "audit" and mode != "protect" and mode != "strict") {
-        print "usage: pbsecure SOURCE [--mode=audit|protect|strict] [--config=FILE] [--disable-rule=ID] [--entry-only] [--project-root=DIR]";
-        os_exit(2);
+        _publish(map{ ok: false, passed: false,
+            error: "usage: pbsecure SOURCE [--mode=audit|protect|strict] [--config=FILE] [--disable-rule=ID] [--entry-only] [--project-root=DIR] [--json-output=FILE]" },
+            json_output, 2);
+    }
+    if _same_path(json_output, positional[0]) or _same_path(json_output, config_path) {
+        _reject_without_output("report output collides with an input", json_output);
     }
     let policy = map{};
+    let config_sha256 = "";
     if config_path != "" {
         let loaded = SECURITY.load_config(config_path);
-        if not loaded.ok { print json_stringify(loaded); os_exit(2); }
+        if not loaded.ok { _publish(loaded, json_output, 2); }
         policy = loaded.value;
+        config_sha256 = loaded.sha256;
     }
     let configured_disabled = try policy.disabled_rule_ids catch [];
     if type(configured_disabled) != "array" { configured_disabled = []; }
@@ -46,11 +135,12 @@ fn main() {
     if allow_high { policy.allow_high_suppressions = true; }
     policy.minimum_blocking_severity = if mode == "strict" { "info" } else { "high" };
 
-    let bytes = try fs_read_bytes(positional[0]) catch nil;
-    if type(bytes) != "array" { print json_stringify(map{ ok: false, error: "cannot read source" }); os_exit(2); }
-    if len(bytes) > 16777216 { print json_stringify(map{ ok: false, error: "source exceeds byte limit" }); os_exit(2); }
-    let source = try bytes_to_str(bytes) catch nil;
-    if source == nil { print json_stringify(map{ ok: false, error: "source is not valid UTF-8" }); os_exit(2); }
+    let loaded_source = SECURE_FILE.read_text(positional[0], 16777216, false);
+    if not loaded_source.ok {
+        _publish(map{ ok: false, passed: false, error: "cannot securely read source" }, json_output, 2);
+    }
+    let source = loaded_source.text;
+    let source_sha256 = sha256(source);
     let report = nil;
     if entry_only {
         report = SECURITY.analyze(source, positional[0], policy);
@@ -64,8 +154,30 @@ fn main() {
     report.mode = mode;
     report.enforced = mode != "audit";
     if mode == "audit" and entry_only { report.passed = report.ok; report.blocking = 0; }
-    print json_stringify(report);
-    if not report.passed { os_exit(1); }
+    if entry_only {
+        let snapshot = _verify_entry_snapshot(positional[0], source_sha256);
+        report.snapshot_verification = snapshot;
+        if not snapshot.ok or not snapshot.stable {
+            report.passed = false; report.blocking = (try report.blocking catch 0) + 1;
+        }
+    } else {
+        let snapshot = DEP_SECURITY.verify_snapshot(report);
+        report.snapshot_verification = snapshot;
+        if not snapshot.ok or not snapshot.stable {
+            report.passed = false; report.blocking = (try report.blocking catch 0) + 1;
+        }
+    }
+    if config_path != "" {
+        let config_snapshot = _verify_config_snapshot(config_path, config_sha256);
+        report.config_snapshot_verification = config_snapshot;
+        if not config_snapshot.ok or not config_snapshot.stable {
+            report.passed = false; report.blocking = (try report.blocking catch 0) + 1;
+        }
+    }
+    if json_output != "" and _collides_with_report(json_output, report) {
+        _reject_without_output("report output collides with analyzed source", json_output);
+    }
+    _publish(report, json_output, if report.passed { 0 } else { 1 });
 }
 
 main();
