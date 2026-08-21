@@ -16,31 +16,47 @@
 // obvious and the obfuscated, and forces a human to look at anything that trips it.
 
 let DEOB = import("stdlib:deobfuscate.sapp");
+let MAX_SCAN_BYTES = 1048576;
+let MAX_LANGUAGE_BYTES = 64;
+let MAX_DEPENDENCIES = 256;
+let MAX_DEPENDENCY_BYTES = 128;
+let MAX_ALLOWLIST_ENTRIES = 1024;
 
 // HIGH: direct code execution, shell-out, network exfil, destructive filesystem.
 // Tables are built once and memoized — scan() is the hot path (may run per snippet).
-let _HIGH = nil;
-let _MED = nil;
-let _KNOWN = nil;
+let _HIGH = ["os.system", "subprocess", "system(", "popen", "exec(", "eval(",
+    "runtime.getruntime", "child_process", "process::command", "/bin/sh", "cmd.exe", "shell=true",
+    "rm -rf", "shutil.rmtree", "os.remove", "unlink(", "fs::remove", "deletefile", "rmdir /",
+    "requests.", "urllib", "urlopen", "socket.", "reqwest", "http.client", "fetch(", "curl ", "wget "];
+let _MED = ["base64", "b64decode", "__import__", "compile(", "marshal.loads", "pickle.loads",
+    "codecs.decode", "fromcharcode", "atob(", "vm.runin"];
+let _KNOWN = ["moderngl", "numpy", "pyopengl", "glfw", "pysdl2", "pygame", "pyglet",
+    "wgpu", "glew", "glad", "sdl2", "vulkan", "opengl", "webgpu", "raylib", "skia",
+    "struct", "sys", "ctypes", "array", "math"];
 fn _high() {
-    if _HIGH != nil { return _HIGH; }
-    _HIGH = ["os.system", "subprocess", "system(", "popen", "exec(", "eval(",
-        "runtime.getruntime", "child_process", "process::command", "/bin/sh", "cmd.exe", "shell=true",
-        "rm -rf", "shutil.rmtree", "os.remove", "unlink(", "fs::remove", "deletefile", "rmdir /",
-        "requests.", "urllib", "urlopen", "socket.", "reqwest", "http.client", "fetch(", "curl ", "wget "];
     return _HIGH;
 }
 // MEDIUM: dynamic evaluation / decoding often used to hide a payload.
 fn _medium() {
-    if _MED != nil { return _MED; }
-    _MED = ["base64", "b64decode", "__import__", "compile(", "marshal.loads", "pickle.loads",
-        "codecs.decode", "fromcharcode", "atob(", "vm.runin"];
     return _MED;
 }
 
 // scan(code, lang) -> { lang, score, findings:[{pattern,severity}], safe }.
 // safe = no HIGH-severity finding AND overall score below the block threshold.
 fn scan(code, lang) {
+    if type(code) != "string" or len(str_to_bytes(code)) > MAX_SCAN_BYTES {
+        return map{ lang: str(lang), score: 1.0,
+            findings: [map{ pattern: "input-boundary", severity: "high" }],
+            safe: false, complete: false, bounded: true,
+            error: "polyglot source must be a string within the scan byte limit",
+            max_scan_bytes: MAX_SCAN_BYTES };
+    }
+    if type(lang) != "string" or lang == "" or len(str_to_bytes(lang)) > MAX_LANGUAGE_BYTES {
+        return map{ lang: "", score: 1.0,
+            findings: [map{ pattern: "language-boundary", severity: "high" }],
+            safe: false, complete: false, bounded: true,
+            error: "polyglot language label is invalid" };
+    }
     let canon = str_lower(DEOB.canonicalize(code));   // undo obfuscation, then case-fold
     let findings = [];
     let score = 0.0;
@@ -66,19 +82,22 @@ fn scan(code, lang) {
     let hasHigh = false;
     i = 0;
     while i < len(findings) { if findings[i].severity == "high" { hasHigh = true; } i = i + 1; }
-    return map{ lang: lang, score: score, findings: findings, safe: (not hasHigh) and (score < 0.5) };
+    return map{ lang: lang, score: score, findings: findings,
+        safe: (not hasHigh) and (score < 0.5), complete: true, bounded: true,
+        max_scan_bytes: MAX_SCAN_BYTES };
 }
 
 fn is_safe(code, lang) { return scan(code, lang).safe; }
 
 // assert_safe(code, lang) — throws unless the code passes the scan.
-fn assert_safe(code, lang) {
-    let r = scan(code, lang);
-    if not r.safe {
-        throw "polyglot_guard: refused unsafe " + str(lang) + " code (" + str(len(r.findings)) + " findings)";
+fn _assert_scan(assessment, lang) {
+    if not assessment.safe {
+        throw "polyglot_guard: refused unsafe " + str(lang) + " code ("
+            + str(len(assessment.findings)) + " findings)";
     }
     return true;
 }
+fn assert_safe(code, lang) { return _assert_scan(scan(code, lang), lang); }
 
 // guarded(runner, lang, code) — assert_safe, THEN hand off to a runner (e.g. POLY.run).
 // Kept decoupled from stdlib/polyglot so this module never itself executes anything.
@@ -90,11 +109,10 @@ fn guarded(runner, lang, code) {
 // ── dependency vetting ──────────────────────────────────────────────────────────────
 // known_libs() — the allowlist for the GPU 2D stack + common safe helpers.
 fn known_libs() {
-    if _KNOWN != nil { return _KNOWN; }
-    _KNOWN = ["moderngl", "numpy", "pyopengl", "glfw", "pysdl2", "pygame", "pyglet",
-        "wgpu", "glew", "glad", "sdl2", "vulkan", "opengl", "webgpu", "raylib", "skia",
-        "struct", "sys", "ctypes", "array", "math"];
-    return _KNOWN;
+    let copied = [];
+    let i = 0;
+    while i < len(_KNOWN) { array_push(copied, _KNOWN[i]); i = i + 1; }
+    return copied;
 }
 fn _in(d, allow) {
     let i = 0;
@@ -106,13 +124,32 @@ fn _in(d, allow) {
 fn check_deps(deps, allow) {
     let ok = [];
     let unknown = [];
+    if type(deps) != "array" or type(allow) != "array"
+       or len(deps) > MAX_DEPENDENCIES or len(allow) > MAX_ALLOWLIST_ENTRIES {
+        return map{ ok: ok, unknown: unknown, ok_all: false, complete: false,
+            bounded: true, error: "dependency or allowlist entry limit exceeded" };
+    }
     let i = 0;
-    while i < len(deps) {
-        if _in(str_lower(deps[i]), allow) { array_push(ok, deps[i]); }
-        else { array_push(unknown, deps[i]); }
+    while i < len(allow) {
+        if type(allow[i]) != "string" or allow[i] == ""
+           or len(str_to_bytes(allow[i])) > MAX_DEPENDENCY_BYTES {
+            return map{ ok: ok, unknown: unknown, ok_all: false, complete: false,
+                bounded: true, error: "allowlist contains an invalid entry" };
+        }
         i = i + 1;
     }
-    return map{ ok: ok, unknown: unknown, ok_all: len(unknown) == 0 };
+    i = 0;
+    while i < len(deps) {
+        let value = deps[i];
+        if type(value) != "string" or value == ""
+           or len(str_to_bytes(value)) > MAX_DEPENDENCY_BYTES {
+            array_push(unknown, value);
+        } elif _in(str_lower(value), allow) { array_push(ok, value); }
+        else { array_push(unknown, value); }
+        i = i + 1;
+    }
+    return map{ ok: ok, unknown: unknown, ok_all: len(unknown) == 0,
+        complete: true, bounded: true };
 }
 
 export scan, is_safe, assert_safe, guarded, known_libs, check_deps;

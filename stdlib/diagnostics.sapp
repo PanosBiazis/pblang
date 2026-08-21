@@ -140,6 +140,117 @@ fn _child_stmt_lists(stmt) {
     return out;
 }
 
+// Conservative structural equality for expressions whose evaluation cannot
+// call user code or mutate state. This deliberately supports only the shapes
+// needed by eq-op; unknown nodes are treated as different.
+fn _pure_expr_equal(a, b, depth = 0) {
+    if a == nil or b == nil or depth > 32 { return false; }
+    let ak = try a.kind catch "";
+    let bk = try b.kind catch "";
+    if ak != bk { return false; }
+    if ak == "ident" { return (try a.name catch "") == (try b.name catch ""); }
+    if ak == "number" or ak == "string" or ak == "bool" {
+        return (try a.value catch nil) == (try b.value catch nil);
+    }
+    if ak == "nil" { return true; }
+    if ak == "member" or ak == "opt_member" {
+        return (try a.name catch "") == (try b.name catch "")
+            and _pure_expr_equal(try a.obj catch nil, try b.obj catch nil, depth + 1);
+    }
+    if ak == "index" or ak == "opt_index" {
+        return _pure_expr_equal(try a.obj catch nil, try b.obj catch nil, depth + 1)
+            and _pure_expr_equal(try a.index catch nil, try b.index catch nil, depth + 1);
+    }
+    if ak == "unary" {
+        return (try a.op catch "") == (try b.op catch "")
+            and _pure_expr_equal(try a.operand catch nil, try b.operand catch nil, depth + 1);
+    }
+    return false;
+}
+
+fn _eq_op_message(op) {
+    if op == "-" { return "subtracting an expression from itself always produces zero for ordinary finite values"; }
+    if op == "/" or op == "%" { return "both operands of this arithmetic expression are identical"; }
+    return "a value cannot be strictly ordered before or after itself";
+}
+
+fn _lint_expr(expr, diags, depth = 0) {
+    if expr == nil or depth > 128 { return; }
+    let k = try expr.kind catch "";
+    if k == "binary" {
+        let op = try expr.op catch "";
+        // Equality and non-strict comparisons are intentionally excluded:
+        // `x != x`, `x == x`, `x <= x`, and `x >= x` are valid IEEE-754 NaN
+        // classification idioms when the static type is not yet precise enough.
+        let suspicious = op == "-" or op == "/" or op == "%" or op == "<" or op == ">";
+        if suspicious and _pure_expr_equal(expr.left, expr.right) {
+            array_push(diags, map{
+                severity: "warning", code: "eq-op", message: _eq_op_message(op),
+                line: try expr.line catch 0,
+                help: "use distinct operands, or document and rewrite the intended calculation",
+                fix: nil,
+            });
+        }
+        _lint_expr(expr.left, diags, depth + 1);
+        _lint_expr(expr.right, diags, depth + 1);
+        return;
+    }
+    if k == "unary" { _lint_expr(try expr.operand catch nil, diags, depth + 1); return; }
+    if k == "call" {
+        _lint_expr(try expr.func catch nil, diags, depth + 1);
+        let args = try expr.args catch []; let ai = 0;
+        while ai < len(args) { _lint_expr(args[ai], diags, depth + 1); ai = ai + 1; }
+        return;
+    }
+    if k == "assign" { _lint_expr(try expr.value catch nil, diags, depth + 1); return; }
+    if k == "assign_to" {
+        _lint_expr(try expr.target catch nil, diags, depth + 1);
+        _lint_expr(try expr.value catch nil, diags, depth + 1);
+        return;
+    }
+    if k == "array" {
+        let items = try expr.items catch []; let ii = 0;
+        while ii < len(items) { _lint_expr(items[ii], diags, depth + 1); ii = ii + 1; }
+        return;
+    }
+    if k == "map" {
+        let entries = try expr.entries catch []; let ei = 0;
+        while ei < len(entries) { _lint_expr(try entries[ei].value catch nil, diags, depth + 1); ei = ei + 1; }
+        return;
+    }
+    if k == "index" or k == "opt_index" {
+        _lint_expr(try expr.obj catch nil, diags, depth + 1);
+        _lint_expr(try expr.index catch nil, diags, depth + 1);
+        return;
+    }
+    if k == "member" or k == "opt_member" { _lint_expr(try expr.obj catch nil, diags, depth + 1); return; }
+    if k == "coalesce" {
+        _lint_expr(try expr.left catch nil, diags, depth + 1);
+        _lint_expr(try expr.right catch nil, diags, depth + 1);
+        return;
+    }
+    if k == "throw" { _lint_expr(try expr.value catch nil, diags, depth + 1); return; }
+    if k == "try" {
+        _lint_expr(try expr.body catch nil, diags, depth + 1);
+        _lint_expr(try expr.handler catch nil, diags, depth + 1);
+    }
+}
+
+fn _lint_stmt_exprs(stmt, diags) {
+    let k = stmt.kind;
+    if k == "let" or k == "const" or k == "return" or k == "print" {
+        _lint_expr(try stmt.value catch nil, diags); return;
+    }
+    if k == "expr_stmt" { _lint_expr(try stmt.expr catch nil, diags); return; }
+    if k == "if" or k == "while" { _lint_expr(try stmt.cond catch nil, diags); return; }
+    if k == "for" { _lint_expr(try stmt.end catch nil, diags); return; }
+    if k == "for_in" { _lint_expr(try stmt.iter catch nil, diags); return; }
+    if k == "for_range" {
+        _lint_expr(try stmt.start catch nil, diags);
+        _lint_expr(try stmt.end catch nil, diags);
+    }
+}
+
 fn _lint_stmt_list(stmts, diags) {
     let terminated = false;
     let reported = false;
@@ -170,6 +281,7 @@ fn _lint_stmt_list(stmts, diags) {
                 });
             }
         }
+        _lint_stmt_exprs(s, diags);
         // return is its own stmt; throw is an expr_stmt wrapping a throw expression.
         if k == "return" or k == "throw" {
             terminated = true;

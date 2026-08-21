@@ -1,292 +1,433 @@
-// stdlib/interop.sapp — Language Interoperability Utilities for pblang
+// Bounded, data-safe language interoperability helpers.
 //
-// High-level utilities for cross-language calls, data pipelining,
-// serialization format conversion, and performance benchmarking.
-//
-// Usage:
-//   let ip = import("stdlib:interop.sapp");
-//   ip.call("python", "print('hello')", []);
-//   ip.pipe("python", py_code, "javascript", js_code, data);
-//   ip.benchmark_compare("python", code, args, 100);
+// Foreign source is always an explicitly trusted executable fragment. Caller
+// values are bounded JSON transported through private stdin and are never
+// interpolated into source. Execution fails closed when the bounded process
+// backend or a fixed interpreter is unavailable.
 
-// ── Imports ───────────────────────────────────────────────────────────────────
+let PROCESS = import("stdlib:process.sapp");
+let SERIALIZATION = import("stdlib:serialization.sapp");
 
-fn _get_registry() {
-    return try import("stdlib:polyglot_registry.sapp") catch nil;
-}
+// The Linux bounded-process backend currently permits at most 4096 UTF-8 bytes
+// in one argv entry. Foreign source is embedded in one generated -c/-e wrapper,
+// so reserve space for the largest wrapper prologue, epilogue, and identifier.
+let MAX_CODE_BYTES = 3584;
+let MAX_WRAPPER_BYTES = 4096;
+let MAX_INPUT_BYTES = 1048576;
+let MAX_OUTPUT_BYTES = 1048576;
+let MAX_ARGUMENTS = 64;
+let MAX_BENCHMARK_ITERATIONS = 20;
+let MAX_BENCHMARK_MS = 30000;
 
-// ── Unified Cross-Language Call ───────────────────────────────────────────────
-
-// call(lang, code_or_fn, args) — unified call to any language
-// If args is empty/nil, runs code; otherwise wraps code as a function call
-fn call(lang, code_or_fn, args) {
-    let reg = _get_registry();
-    if reg == nil { return map{ error: "registry not available" }; }
-
-    if reg.is_available(lang) == false {
-        return map{ error: lang + " not installed" };
-    }
-
-    // If we have args, wrap the code as a callable block
-    let final_code = code_or_fn;
-    if args != nil and len(args) > 0 {
-        let arg_str = _serialize_args(lang, args);
-        final_code = _wrap_function_call(lang, code_or_fn, arg_str);
-    }
-
-    return reg.run(lang, final_code);
-}
-
-// ── Data Pipeline ─────────────────────────────────────────────────────────────
-
-// pipe(lang_a, code_a, lang_b, code_b, data) — pipe data through two languages
-fn pipe(lang_a, code_a, lang_b, code_b, data) {
-    let reg = _get_registry();
-    if reg == nil { return map{ error: "registry not available" }; }
-
-    // Step 1: Run language A with initial data
-    let data_str = _serialize_to_json(data);
-    let result_a = reg.json_bridge(lang_a, code_a, data_str);
-    if result_a.ok == false {
-        return map{ error: "pipe stage A failed: " + result_a.error_output, stage: "A" };
-    }
-
-    // Step 2: Pass result to language B
-    let result_b = reg.json_bridge(lang_b, code_b, result_a.output);
-    if result_b.ok == false {
-        return map{ error: "pipe stage B failed: " + result_b.error_output, stage: "B" };
-    }
-
+fn _failure(message, language = "", executed = false) {
     return map{
-        ok: true,
-        output_a: result_a.output,
-        output_b: result_b.output,
-        language_a: lang_a,
-        language_b: lang_b,
+        ok: false, complete: false, executed: executed, language: language,
+        stdout: "", stderr: message, error: message, exit_code: -1,
+        bounded: false, sandboxed: false, raw_fallback: false,
+        input_embedded_in_source: false, transport: "private-stdin",
+        timed_out: false, output_truncated: false,
+        memory_limit_enforced: false, executable_descriptor_held: false,
+        executable_nofollow: false, check_then_exec_race: false,
+        trusted_source_required: true, trusted_source_acknowledged: false,
+        trusted_source_authorized: false, trust_is_acknowledgement: true,
+        execution_capability_required: true, execution_capability_observed: false
     };
 }
 
-// ── Performance Benchmark ─────────────────────────────────────────────────────
-
-// benchmark_compare(lang, code, args, iterations) — compare pblang vs other lang performance
-fn benchmark_compare(lang, code, args, iterations) {
-    let reg = _get_registry();
-    if reg == nil { return map{ error: "registry not available" }; }
-
-    if iterations <= 0 { iterations = 1; }
-
-    // Benchmark the foreign language
-    let lang_total_ns = 0;
-    let lang_successes = 0;
-    for _i iterations {
-        let start = _now_ns();
-        let result = reg.run(lang, code);
-        let elapsed = _now_ns() - start;
-        if result.ok {
-            lang_total_ns = lang_total_ns + elapsed;
-            lang_successes = lang_successes + 1;
-        }
-    }
-
-    let lang_avg_ns = 0;
-    if lang_successes > 0 {
-        lang_avg_ns = lang_total_ns / lang_successes;
-    }
-
-    // We can't easily run pblang native code from here,
-    // but we can report the benchmark of the foreign language
-    return map{
-        ok: true,
-        language: lang,
-        iterations: iterations,
-        successes: lang_successes,
-        total_ns: lang_total_ns,
-        average_ns: lang_avg_ns,
-        average_ms: lang_avg_ns / 1000000.0,
-        note: "Foreign language performance measurement",
-    };
+fn _trusted(options) {
+    return type(options) == "map" and map_has(options, "trusted_source")
+        and type(options.trusted_source) == "bool" and options.trusted_source;
 }
 
-// ── Serialization Utilities ───────────────────────────────────────────────────
-
-// serialize_to(lang, value) — serialize pblang value to language-native format
-fn serialize_to(lang, value) {
-    if lang == "python" or lang == "javascript" or lang == "typescript" or lang == "ruby" {
-        return _serialize_to_json(value);
+fn _authorize(options, language = "") {
+    if not _trusted(options) {
+        return _failure("explicit trusted_source=true is required", str(language));
     }
-    if lang == "php" {
-        return _serialize_to_php(value);
-    }
-    if lang == "lua" {
-        return _serialize_to_lua(value);
-    }
-    if lang == "r" {
-        return _serialize_to_r(value);
-    }
-    // Default: JSON
-    return _serialize_to_json(value);
+    return nil;
 }
 
-// parse_from(lang, text) — parse language-native format to pblang
-fn parse_from(lang, text) {
-    // Most languages support JSON parsing natively
-    // In pblang we can delegate to their runtime via the registry
-    let reg = _get_registry();
-    if reg == nil { return map{ error: "registry not available" }; }
-
-    if lang == "python" {
-        let code = "import json\nprint(json.dumps(" + text + "))\n";
-        let result = reg.run("python", code);
-        return map{ ok: result.ok, parsed: result.stdout };
-    }
-    if lang == "javascript" {
-        let code = "console.log(JSON.stringify(" + text + "));\n";
-        let result = reg.run("javascript", code);
-        return map{ ok: result.ok, parsed: result.stdout };
-    }
-
-    // Default: return as-is
-    return map{ ok: true, parsed: text, language: lang };
-}
-
-// ── Cross-Language Call ──────────────────────────────────────────────────────
-
-// cross_call(lang_source, source_code, lang_target, target_fn, args) — call from one lang to another
-fn cross_call(lang_source, source_code, lang_target, target_fn, args) {
-    let reg = _get_registry();
-    if reg == nil { return map{ error: "registry not available" }; }
-
-    // Build bridge code based on the target language
-    let bridge_code = _build_cross_bridge(lang_source, lang_target, target_fn, args);
-    let result = reg.run(lang_source, source_code + "\n" + bridge_code);
-
+fn _authorized(result) {
+    result.trusted_source_required = true;
+    result.trusted_source_acknowledged = true;
+    result.trusted_source_authorized = false;
+    result.trust_is_acknowledgement = true;
+    result.execution_capability_required = true;
+    result.execution_capability_observed = result.executed;
     return result;
 }
 
-// ── Internal Helpers ─────────────────────────────────────────────────────────
-
-fn _serialize_args(lang, args) {
-    // Serialize to JSON for most languages
-    let json_parts = [];
-    for i len(args) {
-        array_push(json_parts, _serialize_to_json(args[i]));
-    }
-    return "[" + str_join(json_parts, ", ") + "]";
+fn _language(value) {
+    let lang = str_lower(str_trim(str(value)));
+    if lang == "python" or lang == "python3" or lang == "py" { return "python"; }
+    if lang == "javascript" or lang == "js" or lang == "node" { return "javascript"; }
+    if lang == "ruby" or lang == "rb" { return "ruby"; }
+    return "";
 }
 
-fn _wrap_function_call(lang, code, arg_str) {
+fn _source(value) {
+    if type(value) != "string" or len(str_to_bytes(value)) > MAX_CODE_BYTES
+       or str_contains(value, strfromcharcode(0)) {
+        return map{ ok: false, error: "trusted source must be a NUL-free string within the byte limit" };
+    }
+    return map{ ok: true, value: value };
+}
+
+fn _identifier_alpha(c) { return (c >= 65 and c <= 90) or (c >= 97 and c <= 122); }
+fn _identifier_digit(c) { return c >= 48 and c <= 57; }
+
+fn _identifier(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 128 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if i == 0 {
+            if not _identifier_alpha(c) and c != 95 { return false; }
+        } elif not _identifier_alpha(c) and not _identifier_digit(c) and c != 95 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _json(value) {
+    let encoded = SERIALIZATION.stringify_safe(value, "json", map{
+        max_output_bytes: MAX_INPUT_BYTES, max_depth: 64,
+        max_items: 100000, max_line_bytes: MAX_INPUT_BYTES, strict: true
+    });
+    if not encoded.ok { return encoded; }
+    if len(str_to_bytes(encoded.value)) > MAX_INPUT_BYTES {
+        return map{ ok: false, error: "serialized input exceeds the byte limit" };
+    }
+    return encoded;
+}
+
+fn _args_json(args) {
+    if args == nil { args = []; }
+    if type(args) != "array" { return map{ ok: false, error: "arguments must be an array" }; }
+    if len(args) > MAX_ARGUMENTS { return map{ ok: false, error: "argument count exceeds the limit" }; }
+    return _json(args);
+}
+
+fn _runtime(lang) {
     if lang == "python" {
-        return code + "\n\n__result__ = main(" + arg_str + ")";
+        return map{ candidates: [
+            "/usr/bin/python3.14", "/usr/bin/python3.13", "/usr/bin/python3.12",
+            "/usr/bin/python3.11", "/usr/bin/python3.10", "/usr/bin/python3.9",
+            "/usr/bin/python3.8", "/usr/bin/python3", "/bin/python3"
+        ], prefix: ["-I", "-S", "-c"] };
     }
     if lang == "javascript" {
-        return code + "\n\nconst __result__ = main(" + arg_str + ");";
+        return map{ candidates: ["/usr/bin/node", "/bin/node"], prefix: ["-e"] };
     }
     if lang == "ruby" {
-        return code + "\n\n__result__ = main(" + arg_str + ")";
+        return map{ candidates: [
+            "/usr/bin/ruby3.4", "/usr/bin/ruby3.3", "/usr/bin/ruby3.2",
+            "/usr/bin/ruby3.1", "/usr/bin/ruby3.0", "/usr/bin/ruby", "/bin/ruby"
+        ], prefix: ["-e"] };
     }
-    return code;
+    return nil;
 }
 
-fn _serialize_to_json(value) {
-    if type(value) == "string" { return "\"" + str(value) + "\""; }
-    if type(value) == "number" { return str(value); }
-    if type(value) == "bool" {
-        if value { return "true"; }
-        return "false";
-    }
-    if type(value) == "array" {
-        let parts = [];
-        for i len(value) {
-            array_push(parts, _serialize_to_json(value[i]));
-        }
-        return "[" + str_join(parts, ", ") + "]";
-    }
-    if type(value) == "map" {
-        let parts = [];
-        let keys = map_keys(value);
-        for i len(keys) {
-            let k = keys[i];
-            array_push(parts, "\"" + k + "\": " + _serialize_to_json(value[k]));
-        }
-        return "{" + str_join(parts, ", ") + "}";
-    }
-    return str(value);
+fn _environment() {
+    return map{ PATH: "/usr/bin:/bin", HOME: "/nonexistent", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" };
 }
 
-fn _serialize_to_php(value) {
-    // PHP uses serialize() format — we approximate with JSON
-    if type(value) == "array" {
-        let parts = [];
-        for i len(value) {
-            array_push(parts, _serialize_to_json(value[i]));
-        }
-        return "[" + str_join(parts, ", ") + "]";
+fn _call_wrapper(lang, source, function_name) {
+    if lang == "python" {
+        return "import json,sys\n__pblang_args=json.load(sys.stdin)\n" + source
+            + "\n__pblang_value=" + function_name + "(*__pblang_args)\n"
+            + "sys.stdout.write(json.dumps(__pblang_value,separators=(',',':')))\n";
     }
-    return _serialize_to_json(value);
+    if lang == "javascript" {
+        return "const __pblang_args=JSON.parse(require('fs').readFileSync(0,'utf8'));\n"
+            + source + "\nconst __pblang_value=" + function_name + "(...__pblang_args);\n"
+            + "process.stdout.write(JSON.stringify(__pblang_value));\n";
+    }
+    return "require 'json'\n__pblang_args=JSON.parse(STDIN.read)\n" + source
+        + "\n__pblang_value=" + function_name + "(*__pblang_args)\n"
+        + "STDOUT.write(JSON.generate(__pblang_value))\n";
 }
 
-fn _serialize_to_lua(value) {
-    if type(value) == "map" {
-        let parts = [];
-        let keys = map_keys(value);
-        for i len(keys) {
-            let k = keys[i];
-            array_push(parts, "[\"" + k + "\"] = " + _serialize_to_json(value[k]));
-        }
-        return "{" + str_join(parts, ", ") + "}";
+fn _filter_wrapper(lang, source) {
+    if lang == "python" {
+        return "import json,sys\ninput_data=json.load(sys.stdin)\n" + source
+            + "\nsys.stdout.write(json.dumps(__result__,separators=(',',':')))\n";
     }
-    return _serialize_to_json(value);
+    if lang == "javascript" {
+        return "const input_data=JSON.parse(require('fs').readFileSync(0,'utf8'));\n"
+            + source + "\nprocess.stdout.write(JSON.stringify(__result__));\n";
+    }
+    return "require 'json'\ninput_data=JSON.parse(STDIN.read)\n" + source
+        + "\nSTDOUT.write(JSON.generate(__result__))\n";
 }
 
-fn _serialize_to_r(value) {
-    if type(value) == "array" {
-        let parts = [];
-        for i len(value) {
-            array_push(parts, _serialize_to_json(value[i]));
-        }
-        return "c(" + str_join(parts, ", ") + ")";
+fn _run_wrapper(lang, wrapper, input_json, timeout_secs = 10) {
+    let runtime = _runtime(lang);
+    if runtime == nil { return _failure("unsupported bounded interoperability language", lang); }
+    if len(str_to_bytes(wrapper)) > MAX_WRAPPER_BYTES {
+        return _failure("generated interoperability wrapper exceeds the byte limit", lang);
     }
-    return _serialize_to_json(value);
+    let argv = [];
+    let i = 0;
+    while i < len(runtime.prefix) { array_push(argv, runtime.prefix[i]); i = i + 1; }
+    array_push(argv, wrapper);
+    let result = PROCESS.run_fixed_bounded(runtime.candidates, argv, map{
+        timeout_secs: timeout_secs, startup_timeout_ms: 3000,
+        max_output_bytes: MAX_OUTPUT_BYTES, max_file_bytes: MAX_OUTPUT_BYTES,
+        max_memory_bytes: 536870912, stdin_bytes: str_to_bytes(input_json),
+        environment: _environment(), inherit_environment: false
+    });
+    let command_ok = try result.command_ok catch false;
+    let bounded = try result.bounded catch false;
+    let stdout = try result.stdout catch "";
+    let error_output = try result.stderr catch "";
+    let result_error = try result.error catch error_output;
+    if result_error == "" { result_error = error_output; }
+    if command_ok and bounded { result_error = ""; }
+    elif result_error == "" { result_error = "bounded foreign execution failed"; }
+    let base = map{
+        ok: false, complete: false,
+        executed: try result.completed catch (try result.ok catch false),
+        language: lang, stdout: stdout, stderr: error_output, error: result_error,
+        exit_code: try result.exit_code catch -1, bounded: bounded,
+        sandboxed: false, trusted_source_required: true,
+        trusted_source_acknowledged: true, trusted_source_authorized: false,
+        trust_is_acknowledgement: true, execution_capability_required: true,
+        execution_capability_observed: try result.completed catch (try result.ok catch false),
+        raw_fallback: false, shell_used: false, transport: "private-stdin",
+        input_embedded_in_source: false,
+        timed_out: try result.timed_out catch false,
+        output_truncated: try result.output_truncated catch false,
+        memory_limit_enforced: try result.memory_limit_enforced catch false,
+        executable_descriptor_held: try result.executable_descriptor_held catch false,
+        executable_nofollow: try result.executable_nofollow catch false,
+        check_then_exec_race: try result.check_then_exec_race catch false,
+        fixed_candidate: try result.fixed_candidate catch ""
+    };
+    if not command_ok or not bounded or base.timed_out or base.output_truncated { return base; }
+    let parsed = SERIALIZATION.parse_safe(stdout, "json", map{
+        max_input_bytes: MAX_OUTPUT_BYTES, max_output_bytes: MAX_OUTPUT_BYTES,
+        max_depth: 64, max_items: 100000, strict: true
+    });
+    if not parsed.ok {
+        base.error = "foreign result is not one bounded JSON document";
+        return base;
+    }
+    base.ok = true;
+    base.complete = true;
+    base.value = parsed.value;
+    let canonical = SERIALIZATION.stringify_safe(parsed.value, "json", map{
+        max_output_bytes: MAX_OUTPUT_BYTES, max_depth: 64, max_items: 100000
+    });
+    if not canonical.ok { base.ok = false; base.complete = false; base.error = canonical.error; return base; }
+    base.stdout = canonical.value;
+    return base;
 }
 
-fn _build_cross_bridge(lang_source, lang_target, target_fn, args) {
-    let arg_str = _serialize_args(lang_source, args);
-
-    if lang_target == "python" {
-        if lang_source == "python" {
-            return "\n__result__ = " + target_fn + "(" + arg_str + ")";
-        }
-        return "\n# Cross-call to Python not supported inline";
-    }
-
-    if lang_target == "javascript" {
-        if lang_source == "javascript" {
-            return "\nconst __result__ = " + target_fn + "(" + arg_str + ");";
-        }
-        return "\n// Cross-call to JS not supported inline";
-    }
-
-    // Generic: just invoke target as a call
-    return "\n__result__ = " + target_fn + "(" + arg_str + ")";
+fn _run_function(lang_value, source_value, function_name, args, timeout_secs = 10) {
+    let lang = _language(lang_value);
+    if lang == "" { return _failure("unsupported bounded interoperability language", str(lang_value)); }
+    let source = _source(source_value);
+    if not source.ok { return _failure(source.error, lang); }
+    if not _identifier(function_name) { return _failure("function name must be one simple ASCII identifier", lang); }
+    let encoded = _args_json(args);
+    if not encoded.ok { return _failure(encoded.error, lang); }
+    return _run_wrapper(lang, _call_wrapper(lang, source.value, function_name), encoded.value, timeout_secs);
 }
 
-fn _now_ns() {
-    // Approximate nanoseconds using platform time
-    return clock() * 1000000000.0;
+fn _run_filter(lang_value, source_value, value, timeout_secs = 10) {
+    let lang = _language(lang_value);
+    if lang == "" { return _failure("unsupported bounded interoperability language", str(lang_value)); }
+    let source = _source(source_value);
+    if not source.ok { return _failure(source.error, lang); }
+    let encoded = _json(value);
+    if not encoded.ok { return _failure(encoded.error, lang); }
+    return _run_wrapper(lang, _filter_wrapper(lang, source.value), encoded.value, timeout_secs);
 }
 
-// formats() — languages with a dedicated serializer (others fall back to JSON).
+fn run_filter(lang, source, value, timeout_secs = 10, options = nil) {
+    let denied = _authorize(options, lang);
+    if denied != nil { return denied; }
+    if type(timeout_secs) != "number" or timeout_secs != num_floor(timeout_secs)
+       or timeout_secs < 1 or timeout_secs > 30 {
+        return _authorized(_failure("timeout_secs must be an integer from 1 to 30", str(lang)));
+    }
+    return _authorized(_run_filter(lang, source, value, timeout_secs));
+}
+
+// Preserve the public call shape. No/empty arguments execute a filter that must
+// publish `__result__`; non-empty arguments invoke `main` with spread semantics.
+fn call(lang, code_or_fn, args, options = nil) {
+    let denied = _authorize(options, lang);
+    if denied != nil { return denied; }
+    if args == nil or (type(args) == "array" and len(args) == 0) {
+        return _authorized(_run_filter(lang, code_or_fn, nil));
+    }
+    return _authorized(_run_function(lang, code_or_fn, "main", args));
+}
+
+fn pipe(lang_a, code_a, lang_b, code_b, data, options = nil) {
+    let denied = _authorize(options, lang_a);
+    if denied != nil {
+        return map{ ok: false, complete: false, stage: "authorization",
+            error: denied.error, result_a: denied, executed: false,
+            bounded: false, trusted_source_required: true,
+            trusted_source_acknowledged: false, trusted_source_authorized: false,
+            trust_is_acknowledgement: true, execution_capability_required: true };
+    }
+    let result_a = _authorized(_run_filter(lang_a, code_a, data));
+    if not result_a.ok {
+        return map{ ok: false, complete: false, stage: "A", error: result_a.error,
+            result_a: result_a, executed: result_a.executed,
+            trusted_source_required: true, trusted_source_acknowledged: true,
+            trusted_source_authorized: false, trust_is_acknowledgement: true };
+    }
+    let result_b = _authorized(_run_filter(lang_b, code_b, result_a.value));
+    if not result_b.ok {
+        return map{ ok: false, complete: false, stage: "B", error: result_b.error,
+            result_a: result_a, result_b: result_b,
+            executed: result_a.executed or result_b.executed,
+            trusted_source_required: true, trusted_source_acknowledged: true,
+            trusted_source_authorized: false, trust_is_acknowledgement: true };
+    }
+    return map{ ok: true, complete: true, executed: true,
+        output_a: result_a.stdout, output_b: result_b.stdout,
+        value_a: result_a.value, value_b: result_b.value,
+        language_a: result_a.language, language_b: result_b.language,
+        bounded: result_a.bounded and result_b.bounded,
+        input_embedded_in_source: false, trusted_source_required: true,
+        trusted_source_acknowledged: true, trusted_source_authorized: false,
+        trust_is_acknowledgement: true, execution_capability_required: true,
+        execution_capability_observed: true };
+}
+
+fn benchmark_compare(lang, code, args, iterations, options = nil) {
+    let denied = _authorize(options, lang);
+    if denied != nil {
+        denied.attempted = 0; denied.successes = 0; denied.failures = 0;
+        return denied;
+    }
+    if type(iterations) != "number" or iterations != num_floor(iterations)
+       or iterations < 1 or iterations > MAX_BENCHMARK_ITERATIONS {
+        return map{ ok: false, complete: false, executed: false, attempted: 0,
+            successes: 0, failures: 0, error: "iterations must be an integer from 1 to "
+                + str(MAX_BENCHMARK_ITERATIONS), max_iterations: MAX_BENCHMARK_ITERATIONS,
+            trusted_source_required: true, trusted_source_acknowledged: true,
+            trusted_source_authorized: false, trust_is_acknowledgement: true,
+            execution_capability_required: true };
+    }
+    let start_total = now_ms();
+    let total_ns = 0;
+    let attempted = 0;
+    let successes = 0;
+    let failures = 0;
+    let last_error = "";
+    let any_executed = false;
+    let all_bounded = true;
+    while attempted < iterations and now_ms() - start_total < MAX_BENCHMARK_MS {
+        let started = _now_ns();
+        let result = if args == nil or (type(args) == "array" and len(args) == 0) {
+            _run_filter(lang, code, nil, 5)
+        } else { _run_function(lang, code, "main", args, 5) };
+        let elapsed = _now_ns() - started;
+        attempted = attempted + 1;
+        if result.executed { any_executed = true; }
+        if not result.bounded { all_bounded = false; }
+        if result.ok {
+            successes = successes + 1;
+            total_ns = total_ns + elapsed;
+        } else {
+            failures = failures + 1;
+            last_error = result.error;
+            break;
+        }
+    }
+    let average_ns = if successes > 0 { total_ns / successes } else { 0 };
+    let complete = attempted == iterations and failures == 0;
+    return map{
+        ok: complete, complete: complete, executed: any_executed,
+        language: _language(lang), requested_iterations: iterations,
+        iterations: attempted, attempted: attempted, successes: successes,
+        failures: failures, total_ns: total_ns, average_ns: average_ns,
+        average_ms: average_ns / 1000000.0, elapsed_ms: now_ms() - start_total,
+        max_iterations: MAX_BENCHMARK_ITERATIONS, max_elapsed_ms: MAX_BENCHMARK_MS,
+        args_used: args != nil and type(args) == "array" and len(args) > 0,
+        comparison_performed: false, bounded: attempted > 0 and all_bounded, error: last_error,
+        trusted_source_required: true, trusted_source_acknowledged: true,
+        trusted_source_authorized: false, trust_is_acknowledgement: true,
+        execution_capability_required: true,
+        execution_capability_observed: any_executed,
+        note: "Bounded foreign-runtime measurement; no PBLang comparison is claimed"
+    };
+}
+
+// Compatibility serializers return canonical bounded JSON data, never
+// executable source literals.
+fn serialize_to(lang, value) {
+    let fmt = str_lower(str_trim(str(lang)));
+    if fmt != "json" and fmt != "python" and fmt != "javascript"
+       and fmt != "typescript" and fmt != "ruby" and fmt != "php"
+       and fmt != "lua" and fmt != "r" {
+        throw "interop.serialize_to: unsupported data format: " + fmt;
+    }
+    let encoded = _json(value);
+    if not encoded.ok { throw "interop.serialize_to: " + encoded.error; }
+    return encoded.value;
+}
+
+// Only the JSON subset is accepted for language-labelled input. Parsing is
+// entirely PBLang-native, so expressions and side effects remain inert.
+fn parse_from(lang, text) {
+    let fmt = str_lower(str_trim(str(lang)));
+    if fmt != "json" and _language(fmt) == "" {
+        return map{ ok: false, complete: false, executed: false,
+            language: fmt, error: "unsupported bounded parse format" };
+    }
+    let parsed = SERIALIZATION.parse_safe(text, "json", map{
+        max_input_bytes: MAX_INPUT_BYTES, max_output_bytes: MAX_INPUT_BYTES,
+        max_depth: 64, max_items: 100000, strict: true
+    });
+    if not parsed.ok {
+        return map{ ok: false, complete: false, executed: false,
+            language: fmt, error: parsed.error, diagnostics: parsed.diagnostics };
+    }
+    let canonical = _json(parsed.value);
+    return map{ ok: true, complete: true, executed: false, language: fmt,
+        parsed: canonical.value, value: parsed.value, format: "json",
+        input_evaluated: false };
+}
+
+fn cross_call(lang_source, source_code, lang_target, target_fn, args, options = nil) {
+    let denied = _authorize(options, lang_source);
+    if denied != nil { return denied; }
+    let source = _language(lang_source);
+    let target = _language(lang_target);
+    if source == "" or target == "" or source != target {
+        return _authorized(_failure(
+            "cross-language inline invocation is unsupported; use pipe for data exchange",
+            str(lang_source)));
+    }
+    if target_fn != "main" {
+        return _authorized(_failure("cross_call permits only the explicit main entrypoint", source));
+    }
+    let result = _run_function(source, source_code, "main", args);
+    result.target_language = target;
+    result.target_function = if _identifier(target_fn) { target_fn } else { "" };
+    return _authorized(result);
+}
+
 fn formats() { return ["json", "php", "lua", "r"]; }
-
-// to_json(value) — serialize a pblang value to a JSON string (interop default).
+fn format_details() {
+    return map{ format: "pblang.interop.formats.v2", canonical: "json",
+        aliases: ["python", "javascript", "typescript", "ruby", "php", "lua", "r"],
+        executable_literals: false, bounded: true };
+}
 fn to_json(value) { return serialize_to("json", value); }
-
-// Per-language serializer shortcuts.
 fn to_php(value) { return serialize_to("php", value); }
 fn to_lua(value) { return serialize_to("lua", value); }
-fn to_r(value)   { return serialize_to("r", value); }
+fn to_r(value) { return serialize_to("r", value); }
+
+fn _now_ns() { return clock() * 1000000000.0; }
 
 export call, pipe, benchmark_compare;
-export serialize_to, parse_from;
-export cross_call;
-export formats, to_json, to_php, to_lua, to_r;
+export serialize_to, parse_from, cross_call, run_filter;
+export formats, format_details, to_json, to_php, to_lua, to_r;

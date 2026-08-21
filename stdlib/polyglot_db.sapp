@@ -1,235 +1,447 @@
-// stdlib/polyglot_db.sapp — Database Polyglot Bridge for pblang
+// Bounded database CLI compatibility bridge.
 //
-// Provides unified database connectivity across SQLite, PostgreSQL,
-// MySQL/MariaDB, MongoDB, and Redis. Leverages the polyglot subprocess
-// bridge to execute SQL / NoSQL queries via native CLI tools.
-//
-// Usage:
-//   let db = import("stdlib:polyglot_db.sapp");
-//   let result = db.query("sqlite", "mydb.sqlite", "SELECT * FROM users");
-//   let result = db.query("postgresql", "host=localhost dbname=mydb", "SELECT now()");
-//   let result = db.query("mysql", "-u root mydb", "SHOW TABLES");
-//   let result = db.query("redis", "", "PING");
+// This is not a native driver or connection pool. External adapters use fixed
+// executables, literal argv, private stdin, a minimal environment, and the
+// PBLang process supervisor. Unsupported platforms fail closed.
 
+let PROCESS = import("stdlib:process.sapp");
+let SECURE_FILE = import("stdlib:secure_file.sapp");
 
-// ── Connection string builders ────────────────────────────────────────────────
+let MAX_COMMAND_BYTES = 4194304;
+let MAX_CONNECTION_FIELD_BYTES = 4096;
+let MAX_MIGRATION_FILES = 1024;
+let MAX_MIGRATION_TOTAL_BYTES = 16777216;
+let MAX_EXEC_ARGS = 64;
+let MAX_EXEC_TOTAL_BYTES = 32768;
+let CREDENTIAL_PLACEHOLDER = "/tmp/pblang-db-credential-00000000000000000000000000000000";
 
-fn sqlite_conn(path) {
-    if path == "" or path == ":memory:" { return ":memory:"; }
-    return path;
+fn _failure(language, message) {
+    return map{ ok: false, language: language, stdout: "", stderr: "",
+        error: message, data: nil, exit_code: -1, bounded: false };
 }
 
-fn postgres_conn(host, port, user, password, dbname) {
-    if port == nil or port == "" { port = "5432"; }
-    let conn = "postgresql://";
-    if user != "" { conn = conn + user; }
-    if password != "" { conn = conn + ":" + password; }
-    conn = conn + "@" + host + ":" + port;
-    if dbname != "" { conn = conn + "/" + dbname; }
-    return conn;
-}
-
-fn mysql_conn(host, port, user, password, dbname) {
-    if port == nil or port == "" { port = "3306"; }
-    let conn = "-h " + host;
-    if port != "" { conn = conn + " -P " + port; }
-    if user != "" { conn = conn + " -u " + user; }
-    if password != "" { conn = conn + " -p" + password; }
-    if dbname != "" { conn = conn + " " + dbname; }
-    return conn;
-}
-
-fn mongodb_conn(host, port, dbname) {
-    if port == nil or port == "" { port = "27017"; }
-    let conn = "mongodb://" + host + ":" + port;
-    if dbname != "" { conn = conn + "/" + dbname; }
-    return conn;
-}
-
-fn redis_conn(host, port) {
-    if port == nil or port == "" { port = "6379"; }
-    return "-h " + host + " -p " + port;
-}
-
-// ── Query execution ───────────────────────────────────────────────────────────
-
-fn _escape_sql(s) {
-    let r = str_replace_all(s, "'", "'\\''");
-    return r;
-}
-
-// escape_arg(s) — quote a string as a single, safe POSIX shell token. Wrapping in
-// single quotes neutralizes every metacharacter; an embedded ' becomes '\''.
-fn escape_arg(s) {
-    return "'" + str_replace_all(str(s), "'", "'\\''") + "'";
-}
-
-// escape_sql(s) — single-quote escaping for a value inside a shell `-c '...'` context.
-fn escape_sql(s) { return _escape_sql(s); }
-
-// _has_shell_meta(s) — true if s contains a character that a shell would interpret.
-// Used to reject inputs that cannot be safely passed as multi-token argv (redis).
-fn _has_shell_meta(s) {
-    let meta = [";", "|", "&", "`", "$", ">", "<", "(", ")", "\n", "\r", "\\", "\""];
-    let i = 0;
-    while i < len(meta) {
-        if str_index_of(s, meta[i]) >= 0 { return true; }
-        i = i + 1;
+fn _bounded_text(value, maximum, label, allow_empty = true) {
+    if type(value) != "string" { throw "polyglot_db: " + label + " must be text"; }
+    let bytes = str_to_bytes(value);
+    if len(bytes) > maximum or (not allow_empty and len(bytes) == 0)
+       or str_contains(value, strfromcharcode(0)) {
+        throw "polyglot_db: invalid " + label;
     }
-    return false;
+    return value;
 }
 
-// query(lang, conn_string, sql_or_command) — execute a query against a database
-fn query(lang, conn, command) {
-    if lang == "sqlite" {
-        let code = ".mode json\n" + command + ";";
-        let tmp = "/tmp/pblang_sql_" + str(random_float()) + str(now_ms()) + ".sql";
-        fs_write(tmp, code);
-        // SECURITY: quote the db path (conn) so it is one shell token (was raw).
-        let result = exec("sqlite3 " + escape_arg(conn) + " < " + escape_arg(tmp) + " 2>&1");
-        try fs_remove(tmp) catch nil;
-        return _parse_db_result("sqlite", result);
+fn _port(value, fallback) {
+    if value == nil or value == "" { return fallback; }
+    let parsed = try parse_number(str(value)) catch nil;
+    if parsed == nil or parsed != num_floor(parsed) or parsed < 1 or parsed > 65535 {
+        throw "polyglot_db: port must be an integer in 1..65535";
     }
-
-    if lang == "postgresql" or lang == "psql" or lang == "pg" {
-        // conn is a single conninfo/dbname token → quote it; command stays in -c '...'.
-        let result = exec("psql " + escape_arg(conn) + " -c '" + _escape_sql(command) + "' -t 2>&1");
-        return _parse_db_result("postgresql", result);
-    }
-
-    if lang == "mysql" or lang == "mariadb" {
-        let result = exec("mysql " + escape_arg(conn) + " -e '" + _escape_sql(command) + "' 2>&1");
-        return _parse_db_result("mysql", result);
-    }
-
-    if lang == "mongodb" or lang == "mongo" {
-        let result = exec("mongosh " + escape_arg(conn) + " --eval '" + _escape_sql(command) + "' 2>&1");
-        return _parse_db_result("mongodb", result);
-    }
-
-    if lang == "redis" {
-        // SECURITY: redis-cli takes conn as multi-token flags ("-h h -p p") and the
-        // command as bare words, neither of which can be safely single-quoted as one
-        // token. The previous code concatenated `command` with NO escaping at all
-        // (shell injection). Since safe quoting isn't possible here, reject any input
-        // containing shell metacharacters rather than execute it.
-        if _has_shell_meta(conn) or _has_shell_meta(command) {
-            return map{ ok: false, language: "redis", stdout: "", stderr: "",
-                        error: "unsafe characters in redis conn/command rejected", data: nil,
-                        exit_code: 0 - 1 };
-        }
-        let result = exec("redis-cli " + conn + " " + command + " 2>&1");
-        return _parse_db_result("redis", result);
-    }
-
-    // Fallback: use generic polyglot exec for SQL
-    let code = command;
-    if lang == "sqlite" {
-        code = ".mode json\n" + command + ";";
-    }
-    let result = exec(lang, code);
-    return _parse_db_result(lang, result);
+    return str(parsed);
 }
 
-fn _parse_db_result(lang, result) {
-    let ok = result.ok;
-    let stdout = str_trim(result.stdout);
-    let stderr = str_trim(result.stderr);
-
-    // Try to parse stdout as JSON (for sqlite3 json mode etc.)
-    let parsed = nil;
-    if stdout != "" {
-        parsed = try json_parse(stdout) catch nil;
-    }
-
+fn _network_connection(host, port, user, password, dbname, fallback_port) {
     return map{
-        ok: ok,
-        language: lang,
-        stdout: stdout,
-        stderr: stderr,
-        data: parsed,
-        exit_code: result.exit_code,
+        host: _bounded_text(host, 255, "host", false),
+        port: _port(port, fallback_port),
+        user: _bounded_text(user, 256, "user"),
+        password: _bounded_text(password, 4096, "password"),
+        database: _bounded_text(dbname, 1024, "database")
     };
 }
 
-// ── Convenience: table operations ─────────────────────────────────────────────
+fn sqlite_conn(path) {
+    if path == nil or path == "" { return ":memory:"; }
+    return _bounded_text(path, MAX_CONNECTION_FIELD_BYTES, "SQLite path", false);
+}
 
-// list_tables(lang, conn) — list all tables in the database
+fn postgres_conn(host, port, user, password, dbname) {
+    return _network_connection(host, port, user, password, dbname, "5432");
+}
+
+fn mysql_conn(host, port, user, password, dbname) {
+    return _network_connection(host, port, user, password, dbname, "3306");
+}
+
+fn mongodb_conn(host, port, dbname, user = "", password = "") {
+    return _network_connection(host, port, user, password, dbname, "27017");
+}
+
+fn redis_conn(host, port, password = "", database = "") {
+    return _network_connection(host, port, "", password, database, "6379");
+}
+
+fn _base_environment() {
+    return map{ PATH: "/usr/bin:/bin", HOME: "/nonexistent", LANG: "C", LC_ALL: "C" };
+}
+
+fn _options(stdin_text, environment) {
+    let options = map{
+        timeout_secs: 30,
+        startup_timeout_ms: 3000,
+        max_output_bytes: 1048576,
+        max_file_bytes: 8388608,
+        max_memory_bytes: 536870912,
+        environment: environment,
+        inherit_environment: false
+    };
+    if stdin_text != nil { options.stdin_bytes = str_to_bytes(stdin_text); }
+    return options;
+}
+
+fn _validate_exec_plan(candidates, args, environment) {
+    if len(args) > MAX_EXEC_ARGS or len(map_keys(environment)) > 32 {
+        throw "polyglot_db: execution plan exceeds entry limits";
+    }
+    let program_bytes = 0;
+    for i len(candidates) {
+        let size = len(str_to_bytes(candidates[i]));
+        if size > program_bytes { program_bytes = size; }
+    }
+    let total = program_bytes;
+    for i len(args) {
+        if type(args[i]) != "string" { throw "polyglot_db: argv entries must be text"; }
+        total = total + len(str_to_bytes(args[i]));
+    }
+    let names = map_keys(environment);
+    for i len(names) {
+        total = total + len(str_to_bytes(names[i])) + 1
+            + len(str_to_bytes(environment[names[i]]));
+    }
+    if total > MAX_EXEC_TOTAL_BYTES {
+        throw "polyglot_db: execution plan exceeds the 32768-byte argv/environment limit";
+    }
+    return total;
+}
+
+fn _connection(conn) {
+    if type(conn) != "map" {
+        throw "polyglot_db: network connection must be a typed connection map";
+    }
+    return map{
+        host: _bounded_text(try conn.host catch "", 255, "host", false),
+        port: _port(try conn.port catch "", "1"),
+        user: _bounded_text(try conn.user catch "", 256, "user"),
+        database: _bounded_text(try conn.database catch "", 1024, "database"),
+        password: _bounded_text(try conn.password catch "", 4096, "password")
+    };
+}
+
+fn _build_plan(lang, conn, command) {
+    if type(lang) != "string" { throw "polyglot_db: language must be text"; }
+    let language = str_lower(lang);
+    if language == "psql" or language == "pg" { language = "postgresql"; }
+    if language == "mariadb" { language = "mysql"; }
+    if language == "mongo" { language = "mongodb"; }
+
+    let env = _base_environment();
+    let candidates = [];
+    let args = [];
+    let stdin_text = nil;
+    let secret = "";
+    let credential_kind = "none";
+
+    if language == "sqlite" {
+        candidates = ["/usr/bin/sqlite3", "/bin/sqlite3"];
+        args = [sqlite_conn(conn)];
+        stdin_text = ".bail on\n.mode json\n"
+            + _bounded_text(command, MAX_COMMAND_BYTES, "SQL", false) + "\n";
+    } elif language == "postgresql" {
+        let c = _connection(conn);
+        candidates = ["/usr/bin/psql", "/bin/psql"];
+        args = ["-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+            "-h", c.host, "-p", c.port];
+        if c.user != "" { array_push(args, "-U"); array_push(args, c.user); }
+        if c.database != "" { array_push(args, "-d"); array_push(args, c.database); }
+        if c.password != "" {
+            env.PGPASSFILE = CREDENTIAL_PLACEHOLDER;
+            secret = c.password;
+            credential_kind = "pgpass";
+        }
+        stdin_text = _bounded_text(command, MAX_COMMAND_BYTES, "SQL", false) + "\n";
+    } elif language == "mysql" {
+        let c = _connection(conn);
+        candidates = ["/usr/bin/mysql", "/usr/bin/mariadb", "/bin/mysql"];
+        args = ["--batch", "--raw", "--skip-column-names",
+            "--host", c.host, "--port", c.port];
+        if c.user != "" { array_push(args, "--user"); array_push(args, c.user); }
+        if c.database != "" { array_push(args, "--database"); array_push(args, c.database); }
+        if c.password != "" {
+            let with_defaults = ["--defaults-extra-file=" + CREDENTIAL_PLACEHOLDER];
+            for i len(args) { array_push(with_defaults, args[i]); }
+            args = with_defaults;
+            secret = c.password;
+            credential_kind = "mysql-option";
+        }
+        stdin_text = _bounded_text(command, MAX_COMMAND_BYTES, "SQL", false) + "\n";
+    } elif language == "mongodb" {
+        let c = _connection(conn);
+        if c.password != "" {
+            throw "polyglot_db: MongoDB password transport is unavailable; refusing argv credential exposure";
+        }
+        candidates = ["/usr/bin/mongosh", "/bin/mongosh"];
+        let uri = "mongodb://" + c.host + ":" + c.port;
+        if c.database != "" { uri = uri + "/" + c.database; }
+        args = [uri, "--quiet", "--file", "-"];
+        if c.user != "" { array_push(args, "--username"); array_push(args, c.user); }
+        stdin_text = _bounded_text(command, MAX_COMMAND_BYTES, "MongoDB script", false) + "\n";
+    } elif language == "redis" {
+        let c = _connection(conn);
+        if c.password != "" {
+            throw "polyglot_db: authenticated Redis requires the native redis.sapp client; refusing credential exposure";
+        }
+        if type(command) != "array" or len(command) < 1 or len(command) > 57 {
+            throw "polyglot_db: Redis command must be an argv array with 1..57 entries";
+        }
+        candidates = ["/usr/bin/redis-cli", "/bin/redis-cli"];
+        args = ["--no-auth-warning", "-h", c.host, "-p", c.port];
+        if c.database != "" { array_push(args, "-n"); array_push(args, c.database); }
+        for i len(command) {
+            array_push(args, _bounded_text(command[i], 8192, "Redis argument", true));
+        }
+    } else {
+        throw "polyglot_db: unsupported database adapter: " + language;
+    }
+
+    let exec_bytes = _validate_exec_plan(candidates, args, env);
+    return map{ language: language, candidates: candidates, args: args,
+        options: _options(stdin_text, env), secret: secret,
+        credential_kind: credential_kind, exec_bytes: exec_bytes,
+        stdin_bytes: if stdin_text == nil { 0 } else { len(str_to_bytes(stdin_text)) } };
+}
+
+fn _credential_path() {
+    let token = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + str(now_ms())), 0, 32);
+    return "/tmp/pblang-db-credential-" + token;
+}
+
+fn _pgpass_escape(value) {
+    return str_replace_all(str_replace_all(value, "\\", "\\\\"), ":", "\\:");
+}
+
+fn _mysql_option_escape(value) {
+    let escaped = str_replace_all(value, "\\", "\\\\");
+    escaped = str_replace_all(escaped, "\n", "\\n");
+    escaped = str_replace_all(escaped, "\r", "\\r");
+    escaped = str_replace_all(escaped, "\t", "\\t");
+    return str_replace_all(escaped, "\"", "\\\"");
+}
+
+fn _prepare_credentials(plan) {
+    if plan.credential_kind == "none" { return map{ ok: true, path: "" }; }
+    let path = _credential_path();
+    let content = "";
+    if plan.credential_kind == "pgpass" {
+        content = "*:*:*:*:" + _pgpass_escape(plan.secret) + "\n";
+    } elif plan.credential_kind == "mysql-option" {
+        content = "[client]\npassword=\"" + _mysql_option_escape(plan.secret) + "\"\n";
+    } else {
+        return map{ ok: false, error: "unsupported credential transport" };
+    }
+    if not SECURE_FILE.write_text_new_exclusive(path, content, false, false).ok {
+        return map{ ok: false, error: "private credential file cannot be created" };
+    }
+    for i len(plan.args) {
+        plan.args[i] = str_replace_all(plan.args[i], CREDENTIAL_PLACEHOLDER, path);
+    }
+    let names = map_keys(plan.options.environment);
+    for i len(names) {
+        plan.options.environment[names[i]] = str_replace_all(
+            plan.options.environment[names[i]], CREDENTIAL_PLACEHOLDER, path);
+    }
+    _validate_exec_plan(plan.candidates, plan.args, plan.options.environment);
+    return map{ ok: true, path: path };
+}
+
+fn _cleanup_credentials(path) {
+    if path == "" { return map{ ok: true, secret_scrubbed: true, artifact_removed: true }; }
+    let scrubbed = SECURE_FILE.write_text_atomic(path, "", false, false);
+    let removed = SECURE_FILE.remove_file(path, false);
+    return map{ ok: scrubbed.ok or removed.ok, secret_scrubbed: scrubbed.ok or removed.ok,
+        artifact_removed: removed.ok };
+}
+
+fn plan_query(lang, conn, command) {
+    let plan = try _build_plan(lang, conn, command) catch nil;
+    if plan == nil { return _failure(str(lang), "invalid or unsupported database request"); }
+    return map{ ok: true, language: plan.language, candidates: plan.candidates,
+        args: plan.args, stdin_bytes: plan.stdin_bytes,
+        environment_keys: array_sort(map_keys(plan.options.environment)),
+        credentials_in_argv: false, shell_used: false, bounded: true,
+        raw_fallback: false, exec_bytes: plan.exec_bytes,
+        credential_transport: if plan.credential_kind == "none" { "none" } else { "mode-0600-file" } };
+}
+
+fn _redact(text, secret) {
+    if type(text) != "string" { return ""; }
+    if secret == nil or secret == "" { return text; }
+    return str_replace_all(text, secret, "[REDACTED]");
+}
+
+fn _parse_db_result(lang, result, secret = "") {
+    let stdout = _redact(str_trim(try result.stdout catch ""), secret);
+    let stderr = _redact(str_trim(try result.stderr catch ""), secret);
+    let command_ok = try result.command_ok catch false;
+    let parsed = nil;
+    if stdout != "" { parsed = try json_parse(stdout) catch nil; }
+    return map{ ok: command_ok, language: lang, stdout: stdout, stderr: stderr,
+        error: if command_ok { "" } else { if stderr == "" { "database command failed" } else { stderr } },
+        data: parsed, exit_code: try result.exit_code catch -1,
+        bounded: try result.bounded catch false,
+        output_truncated: try result.output_truncated catch false,
+        timed_out: try result.timed_out catch false,
+        credentials_in_argv: false, shell_used: false };
+}
+
+fn query(lang, conn, command) {
+    let plan = try _build_plan(lang, conn, command) catch nil;
+    if plan == nil { return _failure(str(lang), "invalid or unsupported database request"); }
+    let prepared = _prepare_credentials(plan);
+    if not prepared.ok { return _failure(plan.language, prepared.error); }
+    let result = try PROCESS.run_fixed_bounded(plan.candidates, plan.args, plan.options) catch nil;
+    let cleanup = _cleanup_credentials(prepared.path);
+    if not cleanup.ok {
+        return _failure(plan.language, "database credential cleanup failed; result withheld");
+    }
+    if result == nil { return _failure(plan.language, "bounded database process failed"); }
+    if not (try result.bounded catch false) {
+        return _failure(plan.language, try result.error catch "bounded process backend unavailable");
+    }
+    let parsed = _parse_db_result(plan.language, result, plan.secret);
+    parsed.credential_secret_scrubbed = cleanup.secret_scrubbed;
+    parsed.credential_artifact_removed = cleanup.artifact_removed;
+    return parsed;
+}
+
 fn list_tables(lang, conn) {
-    if lang == "sqlite" {
+    let normalized = str_lower(lang);
+    if normalized == "sqlite" {
         return query(lang, conn, "SELECT name FROM sqlite_master WHERE type='table'");
     }
-    if lang == "postgresql" or lang == "psql" or lang == "pg" {
-        return query(lang, conn, "SELECT table_name FROM information_schema.tables WHERE table_schema='public'");
+    if normalized == "postgresql" or normalized == "psql" or normalized == "pg" {
+        return query(lang, conn,
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'");
     }
-    if lang == "mysql" or lang == "mariadb" {
+    if normalized == "mysql" or normalized == "mariadb" {
         return query(lang, conn, "SHOW TABLES");
     }
-    return map{ ok: false, error: "unsupported database: " + lang };
+    return _failure(normalized, "table listing is unsupported for this adapter");
 }
 
-// describe_table(lang, conn, table) — get column info for a table
+fn _identifier(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 128 { return nil; }
+    let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+    for i len(value) { if str_index_of(allowed, value[i]) < 0 { return nil; } }
+    return value;
+}
+
 fn describe_table(lang, conn, table) {
-    if lang == "sqlite" {
-        return query(lang, conn, "PRAGMA table_info(" + table + ")");
+    let safe = _identifier(table);
+    if safe == nil { return _failure(str(lang), "table name must be a bounded ASCII identifier"); }
+    let normalized = str_lower(lang);
+    if normalized == "sqlite" { return query(lang, conn, "PRAGMA table_info(" + safe + ")"); }
+    if normalized == "postgresql" or normalized == "psql" or normalized == "pg" {
+        return query(lang, conn,
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='" + safe + "'");
     }
-    if lang == "postgresql" or lang == "psql" or lang == "pg" {
-        return query(lang, conn, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='" + table + "'");
+    if normalized == "mysql" or normalized == "mariadb" {
+        return query(lang, conn, "DESCRIBE " + safe);
     }
-    if lang == "mysql" or lang == "mariadb" {
-        return query(lang, conn, "DESCRIBE " + table);
-    }
-    return map{ ok: false, error: "unsupported database: " + lang };
+    return _failure(normalized, "table description is unsupported for this adapter");
 }
 
-// ── Key-Value operations (Redis) ──────────────────────────────────────────────
+fn redis_get(conn, key) { return query("redis", conn, ["GET", str(key)]); }
+fn redis_set(conn, key, value) { return query("redis", conn, ["SET", str(key), str(value)]); }
+fn redis_del(conn, key) { return query("redis", conn, ["DEL", str(key)]); }
 
-fn redis_get(conn, key) {
-    return query("redis", conn, "GET " + key);
-}
-
-fn redis_set(conn, key, value) {
-    return query("redis", conn, "SET " + key + " '" + _escape_sql(value) + "'");
-}
-
-fn redis_del(conn, key) {
-    return query("redis", conn, "DEL " + key);
-}
-
-// ── Batch operations ──────────────────────────────────────────────────────────
-
-// execute file against a database
 fn execute_file(lang, conn, filepath) {
-    let code = fs_read(filepath);
-    if code == nil {
-        return map{ ok: false, error: "cannot read: " + filepath };
-    }
-    return query(lang, conn, code);
+    let loaded = SECURE_FILE.read_text(filepath, MAX_COMMAND_BYTES, false);
+    if not loaded.ok { return _failure(str(lang), "migration file cannot be read safely"); }
+    return query(lang, conn, loaded.text);
 }
 
-// migrate(lang, conn, migrations_dir) — run .sql migration files in order
-fn migrate(lang, conn, migrations_dir) {
-    let files = fs_listdir(migrations_dir);
-    if files == nil {
-        return map{ ok: false, error: "cannot read directory: " + migrations_dir };
+fn _migration_name(file) {
+    if type(file) != "string" or len(str_to_bytes(file)) < 5
+       or len(str_to_bytes(file)) > 255 or not str_ends_with(file, ".sql")
+       or str_contains(file, "/") or str_contains(file, "\\")
+       or str_contains(file, strfromcharcode(0)) or file == "." or file == ".." {
+        return nil;
     }
-    let results = [];
+    return file;
+}
+
+fn _migration_snapshot(migrations_dir, requested_files) {
+    if type(requested_files) != "array" or len(requested_files) < 1
+       or len(requested_files) > MAX_MIGRATION_FILES {
+        return map{ ok: false, error: "migration file list must contain 1..1024 entries" };
+    }
+    let files = array_sort(requested_files);
+    let entries = [];
+    let total_bytes = 0;
     for i len(files) {
-        let file = files[i];
-        if str_ends_with(file, ".sql") {
-            let full_path = migrations_dir + "/" + file;
-            let r = execute_file(lang, conn, full_path);
-            array_push(results, r);
+        let file = _migration_name(files[i]);
+        if file == nil or (i > 0 and files[i] == files[i - 1]) {
+            return map{ ok: false, error: "migration filenames must be unique safe SQL basenames" };
+        }
+        let loaded = SECURE_FILE.read_text(path_join(migrations_dir, file), MAX_COMMAND_BYTES, false);
+        if not loaded.ok {
+            return map{ ok: false, error: "migration file cannot be read safely", failed_file: file };
+        }
+        total_bytes = total_bytes + loaded.size;
+        if total_bytes > MAX_MIGRATION_TOTAL_BYTES {
+            return map{ ok: false, error: "migration snapshot exceeds the total byte limit" };
+        }
+        array_push(entries, map{ name: file, source: loaded.text,
+            sha256: sha256(loaded.text), bytes: loaded.size });
+    }
+    return map{ ok: true, entries: entries, total_bytes: total_bytes,
+        snapshot_bound: true, manifest_required: true };
+}
+
+fn migration_manifest(migrations_dir, requested_files) {
+    let snapshot = _migration_snapshot(migrations_dir, requested_files);
+    if not snapshot.ok { return snapshot; }
+    let entries = [];
+    for i len(snapshot.entries) {
+        let entry = snapshot.entries[i];
+        array_push(entries, map{ name: entry.name, sha256: entry.sha256, bytes: entry.bytes });
+    }
+    return map{ ok: true, format: "pblang.polyglot-db.migrations.v1",
+        entries: entries, total_bytes: snapshot.total_bytes };
+}
+
+fn migrate(lang, conn, migrations_dir, expected_hashes = nil) {
+    if type(expected_hashes) != "map" {
+        return _failure(str(lang), "migration execution requires a pinned SHA-256 manifest");
+    }
+    let requested_files = array_sort(map_keys(expected_hashes));
+    let snapshot = _migration_snapshot(migrations_dir, requested_files);
+    if not snapshot.ok { return _failure(str(lang), snapshot.error); }
+    if len(map_keys(expected_hashes)) != len(snapshot.entries) {
+        return _failure(str(lang), "migration manifest entry count mismatch");
+    }
+    for i len(snapshot.entries) {
+        let entry = snapshot.entries[i];
+        let expected = try expected_hashes[entry.name] catch "";
+        if type(expected) != "string" or len(expected) != 64 or expected != entry.sha256 {
+            return _failure(str(lang), "migration manifest digest mismatch for " + entry.name);
         }
     }
-    return map{ ok: true, migrations: len(results), results: results };
+    let results = [];
+    for i len(snapshot.entries) {
+        let entry = snapshot.entries[i];
+        let result = query(lang, conn, entry.source);
+        array_push(results, result);
+        if not result.ok {
+            return map{ ok: false, language: str(lang), migrations: len(results),
+                failed_file: entry.name, results: results, snapshot_bound: true,
+                manifest_verified: true, error: "migration stopped after the first failure" };
+        }
+    }
+    return map{ ok: true, language: str(lang), migrations: len(results), results: results,
+        snapshot_bound: true, manifest_verified: true };
 }
 
-export query;
-export list_tables;
-export describe_table;
-export execute_file;
-export migrate;
+export query, plan_query;
+export list_tables, describe_table, execute_file, migration_manifest, migrate;
 export redis_get, redis_set, redis_del;
 export sqlite_conn, postgres_conn, mysql_conn, mongodb_conn, redis_conn;
-export escape_arg, escape_sql;

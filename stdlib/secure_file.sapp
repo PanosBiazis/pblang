@@ -115,8 +115,41 @@ fn _open_parent(path, create, private_parent) {
     if parts.absolute { fs = LinuxDirFS.open_absolute(parts.parent, create, private_parent); }
     elif platform() == "linux" { fs = LinuxDirFS.open(parts.parent, create, private_parent); }
     else { fs = PosixDirFS.open(parts.parent, create); }
-    if not fs.ok { return _error("secure parent directory is unavailable"); }
+    if not fs.ok {
+        return _error("secure parent directory is unavailable: "
+            + (try fs.error catch "descriptor backend rejected the root"));
+    }
     return map{ ok: true, fs: fs, name: parts.name };
+}
+
+// List one directory through a held, no-follow root. This is intentionally a
+// directory operation rather than "list parent + trust child": every component
+// of the requested directory is resolved by the platform handle backend.
+fn list_directory(path, max_entries = 512) {
+    if type(path) != "string" or path == "" or len(path) > MAX_PATH
+       or str_contains(path, strfromcharcode(0))
+       or type(max_entries) != "number" or max_entries != num_floor(max_entries)
+       or max_entries < 1 or max_entries > 4096 {
+        return _error("invalid secure directory listing request");
+    }
+    if _backend_name() == "unavailable" { return _error("secure file backend is unavailable"); }
+
+    let fs = nil;
+    if platform() == "linux" {
+        fs = if str_starts_with(path, "/") { LinuxDirFS.open_absolute(path, false, false) }
+            else { LinuxDirFS.open(path, false, false) };
+    } elif platform() == "macos" {
+        if str_starts_with(path, "/") {
+            return _error("absolute secure directory roots are not supported on macOS");
+        }
+        fs = PosixDirFS.open(path, false);
+    } else {
+        fs = WindowsDirFS.open(path, false);
+    }
+    if fs == nil or not fs.ok { return _error("secure directory root is unavailable"); }
+    let result = _list_backend(fs, "root", max_entries);
+    _close(fs);
+    return result;
 }
 
 fn read_bytes(path, max_bytes, private_parent = false) {
@@ -221,6 +254,170 @@ fn read_optional_text(path, max_bytes, private_parent = false) {
     return map{ ok: true, missing: false, text: text, size: loaded.size };
 }
 
+fn _immutable_reader_valid(reader) {
+    return type(reader) == "map"
+        and (try reader.format catch "") == "pblang.secure-file.immutable-reader.v1"
+        and (try reader.ok catch false) and (try reader.active catch false)
+        and type(try reader.fs catch nil) == "map"
+        and type(try reader.snapshot catch nil) == "map"
+        and (try reader.snapshot.active catch false)
+        and (try reader.snapshot.immutable catch false);
+}
+
+// Open one bounded file once and freeze its bytes in a sealed kernel-backed
+// snapshot. This high-level handle is intentionally Linux-only until the
+// Windows and macOS backends can provide equivalent immutable snapshots.
+fn open_immutable_reader(path, max_bytes, private_parent = false) {
+    if platform() != "linux" {
+        return _error("immutable secure readers currently require Linux");
+    }
+    if type(max_bytes) != "number" or max_bytes != num_floor(max_bytes)
+       or max_bytes < 1 or max_bytes > 268435456 {
+        return _error("invalid immutable reader byte limit");
+    }
+    let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
+    let snapshot = LinuxDirFS.sealed_snapshot_file_descriptor(parent.fs,
+        parent.name, max_bytes);
+    if not snapshot.ok { _close(parent.fs); return snapshot; }
+    return map{ok:true,format:"pblang.secure-file.immutable-reader.v1",
+        active:true,fs:parent.fs,snapshot:snapshot,path:path,size:snapshot.size,
+        backend:"linux-sealed-memfd",descriptor_bound:true,nofollow:true,
+        immutable:true,bounded_memory:true,path_reopened:false};
+}
+
+fn immutable_reader_base64_sha256(reader, offset = 0, count = nil) {
+    if not _immutable_reader_valid(reader) {
+        return _error("immutable secure reader is invalid or closed");
+    }
+    return LinuxDirFS.held_base64_sha256(reader.fs, reader.snapshot, offset, count);
+}
+
+fn immutable_reader_range(reader, offset, count) {
+    if not _immutable_reader_valid(reader) {
+        return _error("immutable secure reader is invalid or closed");
+    }
+    return LinuxDirFS.read_held_range_bytes(reader.fs, reader.snapshot, offset, count);
+}
+
+fn immutable_reader_magic_offsets(reader, magic, max_matches = 128) {
+    if not _immutable_reader_valid(reader) {
+        return _error("immutable secure reader is invalid or closed");
+    }
+    return LinuxDirFS.held_magic_offsets(reader.fs, reader.snapshot,
+        magic, max_matches);
+}
+
+fn publish_immutable_reader_range(reader, output, offset, count,
+                                  private_parent = false, executable = false) {
+    if not _immutable_reader_valid(reader) or type(output) != "string"
+       or output == "" or len(output) > MAX_PATH or type(executable) != "bool" {
+        return _error("invalid immutable reader publication request");
+    }
+    let destination = _open_parent(output, false, private_parent);
+    if not destination.ok { return destination; }
+    let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,
+        destination.fs, destination.name, offset, count, false, executable);
+    _close(destination.fs);
+    return result;
+}
+
+fn publish_immutable_reader_range_private(reader, output, offset, count,
+                                          executable = false) {
+    if not _immutable_reader_valid(reader) or type(output) != "string"
+       or output == "" or len(output) > MAX_PATH or type(executable) != "bool"
+       or platform() != "linux" {
+        return _error("invalid private immutable reader publication request");
+    }
+    let destination = _open_parent(output, false, false);
+    if not destination.ok { return destination; }
+    let policy = LinuxDirFS.private_root_status(destination.fs);
+    if type(policy) != "map" or not policy.ok {
+        _close(destination.fs);
+        return _error("output parent must already be current-UID-owned mode 0700");
+    }
+    let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,
+        destination.fs, destination.name, offset, count, false, executable);
+    _close(destination.fs);
+    if type(result) == "map" and result.ok {
+        result.private_parent_verified = true;
+        result.parent_owned_by_current_uid = true;
+        result.parent_mode = "700";
+    }
+    return result;
+}
+
+fn publish_immutable_reader_range_private_temp(reader, output, offset, count,
+                                               executable = false) {
+    let parts = _parts(output);
+    if parts == nil or not parts.absolute or
+       path_dirname(parts.parent) != "/tmp" or path_basename(parts.parent) == "tmp" {
+        return _error("temporary private output must be one dedicated child below /tmp");
+    }
+    let temporary_root = LinuxDirFS.open_absolute("/tmp", false, false);
+    if not temporary_root.ok {
+        return _error("temporary container cannot be opened securely");
+    }
+    let temporary_meta = LinuxDirFS.metadata(temporary_root, "root");
+    let temporary_closed = LinuxDirFS.close(temporary_root);
+    if type(temporary_meta) != "map" or not temporary_meta.ok or
+       temporary_meta.kind != "directory" or bit_and(temporary_meta.mode, 512) == 0 or
+       type(temporary_closed) != "bool" or not temporary_closed {
+        return _error("temporary container must be a held sticky directory");
+    }
+    let result = publish_immutable_reader_range_private(reader, output,
+        offset, count, executable);
+    if type(result) == "map" and result.ok {
+        result.sticky_temporary_container_verified = true;
+        result.temporary_container = "/tmp";
+        result.post_return_other_uid_replacement_blocked = true;
+    }
+    return result;
+}
+
+fn create_private_directory_new(path) {
+    if platform() != "linux" or type(path) != "string" or path == ""
+       or path == "." or path == "/" or len(path) > MAX_PATH
+       or str_contains(path, strfromcharcode(0)) {
+        return _error("invalid private directory path");
+    }
+    let parent = _open_parent(path, false, false);
+    if not parent.ok { return _error("private directory parent is unavailable"); }
+    let created = LinuxDirFS.mkdir_new(parent.fs, parent.name, false);
+    _close(parent.fs);
+    if type(created) != "map" or not created.ok {
+        return _error("private directory must be newly created");
+    }
+    let fs = if str_starts_with(path, "/") {
+        LinuxDirFS.open_absolute(path, false, false)
+    } else { LinuxDirFS.open(path, false, false) };
+    if not fs.ok { return _error("new private directory cannot be reopened securely"); }
+    let policy = LinuxDirFS.private_root_status(fs);
+    let closed = LinuxDirFS.close(fs);
+    if type(policy) != "map" or not policy.ok or
+       type(closed) != "bool" or not closed {
+        return _error("private directory ownership or mode cannot be verified");
+    }
+    return map{ok:true,path:path,created:true,exclusive_create:true,
+        descriptor_bound:true,owned_by_current_uid:true,mode:"700"};
+}
+
+fn close_immutable_reader(reader) {
+    if type(reader) != "map"
+       or (try reader.format catch "") != "pblang.secure-file.immutable-reader.v1" {
+        return _error("immutable secure reader is invalid");
+    }
+    if not (try reader.active catch false) {
+        return map{ok:true,closed:true,already_closed:true};
+    }
+    let snapshot_closed = try LinuxDirFS.close_child_descriptor(reader.fs,
+        reader.snapshot) catch false;
+    let parent_closed = try LinuxDirFS.close(reader.fs) catch false;
+    reader.active = false; reader.close_attempted = true;
+    return map{ok:snapshot_closed and parent_closed,closed:true,
+        ownership_consumed:true,retryable:false,
+        snapshot_close_ok:snapshot_closed,parent_close_ok:parent_closed};
+}
+
 fn write_atomic(path, bytes, create_parent = true, private_parent = false) {
     if _backend_name() == "unavailable" { return _error("secure file backend is unavailable"); }
     if type(bytes) != "array" { return _error("secure file bytes must be an array"); }
@@ -260,7 +457,12 @@ fn remove_file(path, private_parent = false) {
     if _backend_name() == "unavailable" { return _error("secure file backend is unavailable"); }
     let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
     let result = _remove_backend(parent.fs, parent.name);
-    _close(parent.fs); return result;
+    _close(parent.fs);
+    if result.ok {
+        result.namespace_absent = true;
+        result.absence_evidence = "descriptor-held file-only unlink";
+    }
+    return result;
 }
 
 fn status() {
@@ -271,9 +473,19 @@ fn status() {
                 backend: available().backend,
                 linux_backend: platform() == "linux", macos_backend: platform() == "macos",
                 windows_backend: platform() == "windows",
+                immutable_reader_linux: platform() == "linux",
+                immutable_reader_streaming_digest: platform() == "linux",
+                immutable_reader_atomic_range_publication: platform() == "linux",
+                immutable_reader_private_parent_publication: platform() == "linux",
+                immutable_reader_private_sticky_temp_publication: platform() == "linux",
                 global_handle_backends: ["linux", "macos", "windows"] };
 }
 
 export available, read_bytes, read_text, read_text_prefix, read_optional_text,
+       open_immutable_reader, immutable_reader_base64_sha256,
+       immutable_reader_range, immutable_reader_magic_offsets,
+       publish_immutable_reader_range, publish_immutable_reader_range_private,
+       publish_immutable_reader_range_private_temp,
+       create_private_directory_new, close_immutable_reader,
        write_atomic, write_text_atomic, write_new_exclusive, write_text_new_exclusive,
-       remove, remove_file, status;
+       list_directory, remove, remove_file, status;

@@ -16,19 +16,22 @@ pblang run tools/pbbuild.sapp --allow-all -- app.sapp build/app
 
 - `--security-mode=protect`: default; block high severity and report the rest.
 - `--security-mode=strict`: block every enabled severity.
-- `--security-mode=audit`: report findings without blocking publication.
-- `--security-mode=off` or `--no-security-analysis`: explicit full opt-out.
+- `--security-mode=audit`: configurable findings are report-only; mandatory
+  runtime invariants and graph completeness still block publication.
+- `--security-mode=off` or `--no-security-analysis`: disable configurable
+  pattern/taint enforcement while retaining mandatory runtime and graph gates.
 
 Every build result contains a `security_analysis` report. Disabling the gate is
 therefore visible to build automation rather than a silent global setting.
-`security_scope=entry` remains an explicit compatibility option for callers
-that cannot yet provide a resolvable dependency graph; it is never reported as
-dependency-wide or semantically complete.
+Artifact-producing builds require `security_scope=dependencies`. Entry-only
+analysis remains available in the read-only analysis tooling, but cannot publish
+an executable or portable artifact because it cannot inspect imported code.
 
 After code generation, `pbbuild` re-reads every analyzed module and compares its
 SHA-256 identity with the analysis snapshot. If any module changed, the
-artifact is removed and publication fails. This closes the analysis/build
-check-to-use window instead of relying on an earlier path check.
+artifact is removed and publication fails. This detects replacement of the
+analyzed source modules before publication. It does not by itself eliminate
+every filesystem or toolchain TOCTOU boundary outside that retained snapshot.
 
 ## Scoped suppressions
 
@@ -188,6 +191,34 @@ PBLang system-API capability and therefore `pbbuild`, `pbsecure`, and repository
 audits are launched with explicit build-tool capabilities, not inherited by
 the produced application.
 
+For large or automated reports, `pbsecure --json-output=FILE` publishes one
+bounded UTF-8 JSON document through the no-follow secure-file backend and emits
+nothing to stdout. Every platform uses exclusive creation and fails if the
+destination already exists, preventing replacement through alternate path
+spellings, aliases, symlinks, or case-folded mounts. The parent directory must
+already exist; source/config/module collisions are also rejected with
+case-insensitive comparison on Windows/macOS. Entry/dependency source snapshots
+and an optional security-policy config snapshot are reverified immediately
+before publication and their expected/actual digests are retained in the
+report. Exit status remains `0` for a
+passing report, `1` for a successfully published blocking report, and `2` when
+no trustworthy report could be written. Exclusive creation does not yet claim
+atomic visibility or power-loss durability: consumers must parse the complete
+JSON and fail closed on a partial file, which an operator may remove only after
+inspection. Report paths/hashes/suppression reasons should be stored in a
+private directory.
+
+An immutable token-structural policy additionally reserves the seven retained
+raw `polyglot_*` VM builtin identifiers. It runs independently of configurable
+pattern rules, scans every token even after the normal finding index is full,
+and cannot be disabled, replaced, source-suppressed, or mutated through module
+exports. Comments, strings, dot/optional member calls, and quoted map keys are
+inert. Bare calls, aliases, unquoted reserved keys, and ambiguous colon syntax
+are blocking. Tokenization
+failure or an unterminated token makes the mandatory pass incomplete and blocks
+protect/strict publication. Audit mode retains the evidence without claiming
+that the direct bootstrap `run`/`compile` commands enforce this policy.
+
 The reproducible `bench/security_analysis_stages.sapp` benchmark records entry
 pattern, semantic AST, and dependency-wide whole-program costs separately.
 `bench/module_audit_stages.sapp` separately measures a full module scan,
@@ -209,3 +240,92 @@ Engine-v5 focused migration evidence scanned `projects/desktop` completely
 legacy-encoding blockers. Splitting `projects/ai` into eight natural modules
 completed seven; `projects/ai/WEB` remains an explicit deadline-bound shard and
 must be subdivided before the whole-AAP checkpoint can be called complete.
+## Retained host GC isolation
+
+The retained native runtime currently keeps arrays, maps, and modules in
+thread-local registries shared by multiple VM instances. A nested imported VM
+cannot prove that it has marked every suspended caller root before sweeping
+that registry. Therefore `stdlib:runtime_gc.sapp` rejects destructive host
+collection, `resources.sapp` and `debugger.sapp` expose that refusal explicitly,
+and the default security analyzer immutably rejects every bare host `gc_collect`
+reference or declaration. The freestanding collector uses the unambiguous
+`kernel_gc_collect` name, so security does not depend on declaration order.
+
+`audit`, `off`, and `--no-security-analysis` can disable or de-escalate
+configurable pattern and taint policy, but they cannot disable mandatory runtime
+invariants or dependency-graph completeness. This distinction prevents noisy
+policy checks from becoming an all-or-nothing switch for known corruption
+primitives.
+
+This is containment, not owner-scoped heap enforcement. Native `pblang run`
+must not execute untrusted dependency graphs. The complete PBLang-only repair is
+to move execution authority to `stdlib:compiler/vm.sapp`, give each runtime
+instance an owner-scoped heap domain, run imports in the correct domain, and
+retire retained native execution for untrusted programs. A future true-fix gate
+must prove that collection reclaims unreachable cycles while preserving caller
+state across nested imports and two same-thread VM instances.
+
+## Immutable smart-build publication
+
+`stdlib:build.sapp` treats the dependency analyzer's linked program as private
+build state. It removes `linked_source` from the public security report before
+any success or failure return, so blocked and snapshot-failed JSON cannot expose
+the flattened project source.
+
+Direct x86-64 and hosted C99 artifacts are generated under a private mode-0700
+stage and loaded through descriptor-held bounded reads. C99 transpilation is
+performed in memory and generated C reaches a fixed system compiler only via
+the bounded Linux process backend's private stdin descriptor; project source
+and generated C are never reopened by pathname. Secure compiler selection does
+not execute `which`, `os_which`, or another PATH-controlled discovery helper;
+the recipe and executable are selected together from allowlisted absolute
+system directories. Host architecture probing likewise uses only fixed absolute
+`uname` paths before passive environment fallback. PBCK serialization consumes
+the same analyzed linked source entirely in memory and rejects any unresolved
+real import instead of falling back to disk.
+
+No final artifact name becomes visible until dependency hashes pass the final
+snapshot check. Publication then uses the cross-platform secure-file atomic
+writer, executable permissions are applied through a descriptor-held Linux
+parent, and the published bytes are rehashed against the staged digest. If
+portable-lock publication then fails, cleanup targets the canonical output path
+reported by the backend, including `.pbck` or `.exe`, uses descriptor-oriented
+file-only removal, and reports removal only after the held-parent unlink confirms
+namespace removal. It never infers absence from path-following `fs_exists`, which
+cannot distinguish a dangling symlink from a missing directory entry.
+
+The exported immutable-source C99 API also compiles to a private bounded blob
+before opening any caller output path. Its final bytes and the immutable-source
+PBCK APIs use the same atomic secure-file writer and digest recheck, so a
+preplanted output symlink is replaced rather than followed. Tool discovery is
+non-executing; build paths, omitted-target selection, architecture probes, and
+optional compressors execute only allowlisted absolute system binaries.
+
+Before transpilation, immutable C99 source is admitted as valid UTF-8 text with
+a hard 10 MiB byte ceiling aligned with the VM string ceiling. A cheap character
+ceiling precedes the bounded UTF-8 byte conversion. Private C99 cleanup removes
+only the exact allowlisted compiler output through the held directory, verifies
+descriptor closure, and uses final empty-directory removal as proof that no
+unexpected stage entry exists. It performs no unbounded directory enumeration.
+Publication failures expose `output_removed` and `cleanup_verified`; callers
+must treat either false value as an operator-visible cleanup incident.
+When dependency verification fails before publication, the report instead sets
+`publication_attempted=false` and makes no claim that a pre-existing output was
+removed.
+
+Build wrappers never resolve the PBLang runtime through ambient `PATH`. On
+Linux they reuse `/proc/self/exe`; `PBLANG_BIN` is an explicit absolute,
+existing-path operator override. Other hosts currently fail closed until an
+equivalent verified current-process path is available. The override grants the
+named executable compiler authority and must therefore be set only by the
+operator or a protected service configuration.
+
+The immutable C99 transport currently requires the Linux x86-64 bounded process
+backend. Other hosts must use the in-memory PBCK route until they have an
+equivalent descriptor/stdin process backend; the legacy `dist.native(path, ...)`
+API remains a compatibility API and is not the secure smart-build path. The
+PBLang-written in-memory C transpiler also does not yet cover every stdlib
+construct. General dynamic string operations, for-in lowering, and exception
+semantics remain outside its current hosted-numeric subset; unsupported linked
+programs fail before publication and never fall back automatically to the
+retained path.

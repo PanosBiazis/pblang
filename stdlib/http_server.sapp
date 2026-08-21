@@ -14,6 +14,7 @@
 // --- Security & Utility Helpers ---
 
 let SecureFile = import("stdlib:secure_file.sapp");
+let NativeTcp = import("stdlib:native_tcp.sapp");
 let MAX_STATIC_FILE_BYTES = 16777216;
 
 // url_decode(s) — percent-decode a URL-encoded string (e.g. %20 -> space, %3D -> =)
@@ -102,14 +103,18 @@ fn _status_text(code) {
     if code == 403 { return "Forbidden"; }
     if code == 404 { return "Not Found"; }
     if code == 405 { return "Method Not Allowed"; }
+    if code == 408 { return "Request Timeout"; }
     if code == 410 { return "Gone"; }
     if code == 413 { return "Request Entity Too Large"; }
     if code == 415 { return "Unsupported Media Type"; }
     if code == 406 { return "Not Acceptable"; }
     if code == 429 { return "Too Many Requests"; }
+    if code == 431 { return "Request Header Fields Too Large"; }
     if code == 500 { return "Internal Server Error"; }
+    if code == 501 { return "Not Implemented"; }
     if code == 502 { return "Bad Gateway"; }
     if code == 503 { return "Service Unavailable"; }
+    if code == 504 { return "Gateway Timeout"; }
     return "OK";
 }
 
@@ -447,6 +452,469 @@ fn body_read_plan(content_length, have) {
     let read = target - have;
     if read < 0 { read = 0; }
     return map{ read: read, too_large: too_large };
+}
+
+fn _bounded_integer(value, minimum, maximum, label) {
+    if type(value) != "number" or num_floor(value) != value
+        or value < minimum or value > maximum {
+        throw "http bounded server: " + label + " must be an integer in "
+            + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+// Normalize the secure native-server policy before binding. The entire request
+// must fit NativeTcp's bounded text contract; unsupported platforms fail here.
+fn bounded_server_policy(options = nil) {
+    let support = NativeTcp.available();
+    if not support.ok {
+        throw "http bounded server unavailable: " + str(try support.error catch "unsupported platform");
+    }
+    let input = map{};
+    if options == nil { }
+    elif type(options) == "map" { input = options; }
+    else { input = map{ request_timeout_ms: options }; }
+    let allowed = ["request_timeout_ms", "write_timeout_ms", "accept_poll_ms",
+        "max_inflight", "max_header_bytes", "max_body_bytes",
+        "max_response_bytes", "max_connections", "preflight", "executor"];
+    for key in map_keys(input) {
+        let known = false;
+        for name in allowed { if key == name { known = true; } }
+        if not known { throw "http bounded server: unknown option " + str(key); }
+    }
+    let request_timeout = _bounded_integer(
+        try input.request_timeout_ms catch 2000, 10, 60000, "request_timeout_ms");
+    let write_timeout = _bounded_integer(
+        try input.write_timeout_ms catch 1000, 10, 60000, "write_timeout_ms");
+    let accept_poll = _bounded_integer(
+        try input.accept_poll_ms catch 5, 1, 1000, "accept_poll_ms");
+    let max_inflight = _bounded_integer(
+        try input.max_inflight catch 16, 1, 64, "max_inflight");
+    let max_header = _bounded_integer(
+        try input.max_header_bytes catch 65536, 1024, 65536, "max_header_bytes");
+    let body_default = _CFG.max_body;
+    if body_default > NativeTcp.MAX_TEXT_BYTES - max_header {
+        body_default = NativeTcp.MAX_TEXT_BYTES - max_header;
+    }
+    let max_body = _bounded_integer(
+        try input.max_body_bytes catch body_default, 0,
+        NativeTcp.MAX_TEXT_BYTES - max_header, "max_body_bytes");
+    let max_response = _bounded_integer(
+        try input.max_response_bytes catch NativeTcp.MAX_TEXT_BYTES,
+        1024, NativeTcp.MAX_TEXT_BYTES, "max_response_bytes");
+    let max_connections = try input.max_connections catch nil;
+    _validate_connection_limit(max_connections, "bounded server");
+    let preflight = try input.preflight catch nil;
+    if preflight != nil and not is_fn(preflight) {
+        throw "http bounded server: preflight must be callable";
+    }
+    let executor = try input.executor catch nil;
+    if executor != nil {
+        if type(executor) != "map" or not is_fn(try executor.start catch nil)
+           or not is_fn(try executor.poll catch nil)
+           or not is_fn(try executor.cancel catch nil)
+           or not is_fn(try executor.finish catch nil) {
+            throw "http bounded server: executor must provide start, poll, cancel and finish";
+        }
+    }
+    return map{
+        request_timeout_ms: request_timeout, write_timeout_ms: write_timeout,
+        accept_poll_ms: accept_poll, max_inflight: max_inflight,
+        max_header_bytes: max_header, max_body_bytes: max_body,
+        max_response_bytes: max_response, max_connections: max_connections,
+        preflight: preflight, executor: executor,
+        absolute_request_deadline: true, bounded_inflight: true,
+        cancellable_handler_execution: executor != nil,
+        chunked_requests: "fail-closed-not-implemented",
+    };
+}
+
+fn _find_bytes(haystack, needle) {
+    if len(needle) == 0 { return 0; }
+    let i = 0;
+    while i + len(needle) <= len(haystack) {
+        let j = 0; let matched = true;
+        while j < len(needle) and matched {
+            if haystack[i + j] != needle[j] { matched = false; }
+            j = j + 1;
+        }
+        if matched { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _append_bytes(target, source) {
+    let i = 0;
+    while i < len(source) { array_push(target, source[i]); i = i + 1; }
+}
+
+fn _strict_content_length(req) {
+    let raw = req_header(req, "Content-Length");
+    if raw == nil { return map{ ok: true, value: 0 }; }
+    let text = str_trim(str(raw));
+    if text == "" or len(text) > 12 { return map{ ok: false }; }
+    let i = 0;
+    while i < len(text) {
+        let ch = str_slice(text, i, i + 1);
+        if not str_contains("0123456789", ch) { return map{ ok: false }; }
+        i = i + 1;
+    }
+    let value = try parse_number(text) catch nil;
+    if value == nil or num_floor(value) != value or value < 0 {
+        return map{ ok: false };
+    }
+    return map{ ok: true, value: value };
+}
+
+fn _header_text_safe(value) {
+    let i = 0;
+    while i < len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 32 or code == 127 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Parse security-sensitive bounded requests without relying on the permissive
+// compatibility parser. Duplicate names are rejected case-insensitively.
+fn _strict_header_request(header_text) {
+    if type(header_text) != "string" or len(header_text) < 8
+        or not str_ends_with(header_text, "\r\n\r\n") {
+        return map{ ok: false, error: "incomplete header block" };
+    }
+    let wire = str_slice(header_text, 0, len(header_text) - 4);
+    let lines = str_split(wire, "\r\n");
+    if len(lines) < 1 or len(lines) > 129 {
+        return map{ ok: false, error: "invalid header count" };
+    }
+    let request_parts = str_split(lines[0], " ");
+    if len(request_parts) != 3 {
+        return map{ ok: false, error: "malformed request line" };
+    }
+    let method = request_parts[0]; let path = request_parts[1];
+    let version = request_parts[2];
+    if method == "" or len(method) > 32 or str_upper(method) != method
+        or not _header_name_safe(method) {
+        return map{ ok: false, error: "invalid request method" };
+    }
+    if path == "" or len(path) > 4096 or not _header_text_safe(path)
+        or (not str_starts_with(path, "/") and path != "*") {
+        return map{ ok: false, error: "invalid request target" };
+    }
+    if version != "HTTP/1.0" and version != "HTTP/1.1" {
+        return map{ ok: false, error: "unsupported HTTP version" };
+    }
+    let headers = map{}; let i = 1;
+    while i < len(lines) {
+        let line = lines[i];
+        if line == "" or str_starts_with(line, " ") or str_starts_with(line, "\t") {
+            return map{ ok: false, error: "invalid folded or empty header" };
+        }
+        let colon = str_index_of(line, ":");
+        if colon < 1 {
+            return map{ ok: false, error: "malformed header" };
+        }
+        let name = str_lower(str_slice(line, 0, colon));
+        let value = str_trim(str_slice(line, colon + 1, len(line)));
+        if not _header_name_safe(name) or not _header_text_safe(value)
+            or map_has(headers, name) {
+            return map{ ok: false, error: "invalid or duplicate header" };
+        }
+        headers[name] = value; i = i + 1;
+    }
+    return map{ ok: true, request: map{
+        method: method, path: path, version: version, headers: headers, body: ""
+    } };
+}
+
+fn _bounded_output(state, output, fallback_status, policy) {
+    let status = fallback_status;
+    if type(output) == "map" {
+        let supplied = try output.status catch fallback_status;
+        if type(supplied) == "number" and num_floor(supplied) == supplied
+            and supplied >= 100 and supplied <= 599 { status = supplied; }
+    }
+    let response = try _resp_from_handler(output) catch _resp_from_handler(map{
+        status: 500, body: "Internal Server Error", content_type: "text/plain"
+    });
+    if len(str_to_bytes(response)) > policy.max_response_bytes {
+        status = 500;
+        response = _resp_from_handler(map{
+            status: 500, body: "Response exceeded configured bound",
+            content_type: "text/plain", headers: map{
+                "Connection": "close", "Cache-Control": "no-store"
+            }
+        });
+    }
+    let written = try NativeTcp.write_text(state.socket, response,
+        policy.write_timeout_ms) catch map{ ok: false };
+    NativeTcp.close(state.socket); state.done = true;
+    state.response_sent = true;
+    state.status = if written.ok { status } else { 500 };
+}
+
+// Send the client-visible timeout/error while retaining the connection state
+// until the external executor proves that its worker has terminated and its
+// private resources have been reaped.
+fn _bounded_output_pending_cleanup(state, output, fallback_status, policy) {
+    let status = fallback_status;
+    if type(output) == "map" {
+        let supplied = try output.status catch fallback_status;
+        if type(supplied) == "number" and num_floor(supplied) == supplied
+            and supplied >= 100 and supplied <= 599 { status = supplied; }
+    }
+    let response = try _resp_from_handler(output) catch _resp_from_handler(map{
+        status: 500, body: "Internal Server Error", content_type: "text/plain"
+    });
+    if len(str_to_bytes(response)) > policy.max_response_bytes {
+        status = 500;
+        response = _resp_from_handler(map{ status: 500,
+            body: "Response exceeded configured bound", content_type: "text/plain",
+            headers: map{ "Connection": "close", "Cache-Control": "no-store" } });
+    }
+    let written = try NativeTcp.write_text(state.socket, response,
+        policy.write_timeout_ms) catch map{ ok: false };
+    NativeTcp.close(state.socket); state.response_sent = true;
+    state.status = if written.ok { status } else { 500 };
+}
+
+fn _bounded_reply(state, status, message, policy) {
+    _bounded_output(state, map{
+        status: status, body: message, content_type: "text/plain",
+        headers: map{ "Connection": "close", "Cache-Control": "no-store" }
+    }, status, policy);
+}
+
+fn _bounded_cancel_executor(state, policy) {
+    if try state.cancel_requested catch false { return; }
+    state.cancel_requested = true;
+    let requested = try policy.executor.cancel(state.executor_job) catch nil;
+    if type(requested) != "map" or not (try requested.ok catch false) {
+        state.executor_cancel_failed = true;
+    }
+}
+
+fn _bounded_poll_executor(state, policy) {
+    let observed = try policy.executor.poll(state.executor_job) catch nil;
+    if type(observed) != "map" or not (try observed.ok catch false) {
+        if not (try state.response_sent catch false) {
+            _bounded_output_pending_cleanup(state, map{ status: 500,
+                body: "Handler executor failed closed", content_type: "text/plain" }, 500, policy);
+        }
+        _bounded_cancel_executor(state, policy); return;
+    }
+    let terminal = (try observed.complete catch false) or
+        (try observed.terminated catch false);
+    if not terminal { return; }
+    let finished = try policy.executor.finish(state.executor_job) catch nil;
+    state.executor_job = nil;
+    if try state.response_sent catch false {
+        state.done = true; return;
+    }
+    if type(finished) != "map" or not (try finished.ok catch false)
+       or not map_has(finished, "output") {
+        _bounded_reply(state, 500, "Handler executor result failed closed", policy); return;
+    }
+    _bounded_output(state, finished.output, 200, policy);
+}
+
+fn _bounded_complete(state, handler, policy) {
+    if try state.executor_job catch nil != nil {
+        _bounded_poll_executor(state, policy); return;
+    }
+    let body_count = len(state.bytes) - state.header_end;
+    if body_count < state.content_length { return; }
+    if body_count > state.content_length {
+        _bounded_reply(state, 400, "Unexpected bytes after request body", policy); return;
+    }
+    let body_bytes = slice(state.bytes, state.header_end, len(state.bytes));
+    let body = try bytes_to_str(body_bytes) catch nil;
+    if type(body) != "string" {
+        _bounded_reply(state, 400, "Request body must be valid UTF-8", policy); return;
+    }
+    state.request.body = body;
+    if policy.executor != nil {
+        // Executor contracts use canonical integer epoch milliseconds. The
+        // runtime clock may be fractional, so normalize without extending the
+        // caller's deadline.
+        let executor_deadline_ms = num_floor(state.accepted_ms + policy.request_timeout_ms);
+        let launched = try policy.executor.start(state.request,
+            executor_deadline_ms) catch nil;
+        if type(launched) != "map" or not (try launched.ok catch false)
+           or not map_has(launched, "job") {
+            _bounded_reply(state, 503, "Handler executor unavailable", policy); return;
+        }
+        state.executor_job = launched.job; state.executing = true;
+        state.bytes = [];
+        _bounded_poll_executor(state, policy); return;
+    }
+    let output = try handler(state.request) catch map{
+        status: 500, body: "Internal Server Error", content_type: "text/plain"
+    };
+    _bounded_output(state, output, 200, policy);
+}
+
+fn _bounded_parse_header(state, handler, policy) {
+    let marker = [13, 10, 13, 10];
+    let position = _find_bytes(state.bytes, marker);
+    if position < 0 {
+        if len(state.bytes) >= policy.max_header_bytes {
+            _bounded_reply(state, 431, "Request headers exceeded configured bound", policy);
+        }
+        return;
+    }
+    state.header_end = position + 4;
+    if state.header_end > policy.max_header_bytes {
+        _bounded_reply(state, 431, "Request headers exceeded configured bound", policy); return;
+    }
+    let header_text = try bytes_to_str(slice(state.bytes, 0, state.header_end)) catch nil;
+    if type(header_text) != "string" {
+        _bounded_reply(state, 400, "Request headers must be valid UTF-8", policy); return;
+    }
+    let parsed = _strict_header_request(header_text);
+    if not parsed.ok {
+        _bounded_reply(state, 400, "Malformed HTTP request", policy); return;
+    }
+    let request = parsed.request;
+    let transfer = req_header(request, "Transfer-Encoding");
+    if transfer != nil and str_trim(str(transfer)) != "" {
+        _bounded_reply(state, 501, "Chunked requests are not enabled on the bounded server", policy); return;
+    }
+    let length = _strict_content_length(request);
+    if not length.ok {
+        _bounded_reply(state, 400, "Invalid Content-Length", policy); return;
+    }
+    if length.value > policy.max_body_bytes {
+        _bounded_reply(state, 413, "Request Entity Too Large", policy); return;
+    }
+    state.request = request; state.content_length = length.value;
+    if policy.preflight != nil {
+        let decision = try policy.preflight(request) catch nil;
+        if type(decision) != "map" or type(try decision.allowed catch nil) != "bool" {
+            _bounded_reply(state, 500, "Request preflight failed closed", policy); return;
+        }
+        if not decision.allowed {
+            let denied = try decision.response catch nil;
+            if type(denied) != "map" {
+                _bounded_reply(state, 500, "Request preflight failed closed", policy); return;
+            }
+            _bounded_output(state, denied, 403, policy); return;
+        }
+    }
+    _bounded_complete(state, handler, policy);
+}
+
+fn _bounded_step(state, handler, policy) {
+    if state.done { return; }
+    if try state.executor_job catch nil != nil {
+        if now_ms() - state.accepted_ms >= policy.request_timeout_ms {
+            if not (try state.response_sent catch false) {
+                _bounded_output_pending_cleanup(state, map{ status: 504,
+                    body: "Handler deadline exceeded; the operation may have completed",
+                    content_type: "text/plain", headers: map{
+                        "Connection": "close", "Cache-Control": "no-store",
+                        "Retry-After": "0" } }, 504, policy);
+            }
+            _bounded_cancel_executor(state, policy);
+        }
+        _bounded_poll_executor(state, policy); return;
+    }
+    let elapsed = now_ms() - state.accepted_ms;
+    if elapsed >= policy.request_timeout_ms {
+        NativeTcp.close(state.socket); state.done = true; state.status = 408; return;
+    }
+    if state.header_end == nil {
+        let header = NativeTcp.read_until_bytes(state.socket, [13, 10, 13, 10],
+            policy.max_header_bytes, 1);
+        if header.ok {
+            state.bytes = header.bytes;
+            _bounded_parse_header(state, handler, policy);
+            return;
+        }
+        if try header.timeout catch false { return; }
+        if len(try state.socket.pending_bytes catch []) >= policy.max_header_bytes {
+            _bounded_reply(state, 431, "Request headers exceeded configured bound", policy);
+        } else {
+            NativeTcp.close(state.socket); state.done = true; state.status = 400;
+        }
+        return;
+    }
+    let body_count = len(state.bytes) - state.header_end;
+    let maximum = state.content_length - body_count;
+    if maximum < 1 { _bounded_complete(state, handler, policy); return; }
+    if maximum > 4096 { maximum = 4096; }
+    let read = NativeTcp.read_available_bytes(state.socket, maximum, 1, 1);
+    if not read.ok {
+        NativeTcp.close(state.socket); state.done = true; state.status = 400; return;
+    }
+    if read.count == 0 and not read.timed_out {
+        NativeTcp.close(state.socket); state.done = true; state.status = 400; return;
+    }
+    if read.count > 0 { _append_bytes(state.bytes, read.bytes); }
+    _bounded_complete(state, handler, policy);
+}
+
+fn _compact_bounded(states) {
+    let active = []; let completed = 0; let i = 0;
+    while i < len(states) {
+        if states[i].done { completed = completed + 1; }
+        else { array_push(active, states[i]); }
+        i = i + 1;
+    }
+    return map{ active: active, completed: completed };
+}
+
+// Run the secure connection manager over an already-bound NativeTcp listener.
+// The caller owns the listener and may set max_connections for deterministic tests.
+fn serve_bounded_listener(listener, handler, options = nil) {
+    let policy = bounded_server_policy(options);
+    let states = []; let accepted_total = 0; let completed_total = 0;
+    while policy.max_connections == nil or completed_total < policy.max_connections {
+        let can_accept = policy.max_connections == nil or accepted_total < policy.max_connections;
+        if can_accept {
+            let accepted = NativeTcp.accept_bounded(listener, policy.accept_poll_ms);
+            if accepted.ok {
+                accepted_total = accepted_total + 1;
+                if len(states) >= policy.max_inflight {
+                    let overflow = map{ socket: accepted, done: false };
+                    _bounded_reply(overflow, 503, "Server is at connection capacity", policy);
+                    completed_total = completed_total + 1;
+                } else {
+                    array_push(states, map{
+                        socket: accepted, accepted_ms: now_ms(), bytes: [],
+                        header_end: nil, content_length: nil, request: nil,
+                        done: false, response_sent: false, executor_job: nil,
+                        cancel_requested: false, status: nil,
+                    });
+                }
+            } else if not (try accepted.timeout catch false) {
+                throw "http bounded server accept failed: " + str(try accepted.error catch "unknown error");
+            }
+        }
+        let i = 0;
+        while i < len(states) { _bounded_step(states[i], handler, policy); i = i + 1; }
+        let compacted = _compact_bounded(states);
+        states = compacted.active; completed_total = completed_total + compacted.completed;
+        if not can_accept and len(states) == 0 { break; }
+    }
+    let executor_closed = nil;
+    if policy.executor != nil and is_fn(try policy.executor.close catch nil) {
+        executor_closed = try policy.executor.close() catch map{ ok: false };
+    }
+    return map{ accepted: accepted_total, completed: completed_total, policy: policy,
+        executor_closed: executor_closed };
+}
+
+fn _native_addr(addr) {
+    let parts = str_split(str(addr), ":");
+    if len(parts) != 2 { throw "http bounded server currently requires an IPv4 host:port"; }
+    let port = try parse_number(parts[1]) catch nil;
+    if port == nil or num_floor(port) != port or port < 0 or port > 65535 {
+        throw "http bounded server received an invalid port";
+    }
+    return map{ host: parts[0], port: port };
 }
 
 // _recv_request(s) — read a full HTTP request: the header block (via tcp_read_until),
@@ -872,35 +1340,29 @@ fn mw_rate_limit(max_req, window_ms) {
 }
 
 fn serve_once_timeout(addr, handler, timeout_ms) {
-    if timeout_ms != nil and timeout_ms > 0 {
-        throw "serve_once_timeout: per-call TCP timeout is not exposed in pblang yet; set the VM io_timeout_ms host limit or pass 0";
-    }
-    let l = tcp_listen(addr);
-    let actual = tcp_local_addr(l);
-    let s = tcp_accept(l);
-    // Apply per-connection read timeout so slow clients cannot stall the server
-    let req = _recv_request(s);
-    let resp = _serve_response(handler, req);
-    tcp_write(s, resp);
-    tcp_close(s);
-    tcp_close(l);
+    let policy_input = if type(timeout_ms) == "map" { timeout_ms }
+        else { map{ request_timeout_ms: timeout_ms, max_connections: 1 } };
+    policy_input.max_connections = 1;
+    let policy = bounded_server_policy(policy_input);
+    let target = _native_addr(addr);
+    let listener = NativeTcp.listen_ipv4(target.host, target.port, policy.max_inflight * 2);
+    if not listener.ok { throw "serve_once_timeout: " + str(try listener.error catch "bind failed"); }
+    let actual = target.host + ":" + str(listener.port);
+    try serve_bounded_listener(listener, handler, policy_input)
+        catch { NativeTcp.close(listener); throw "serve_once_timeout failed"; };
+    NativeTcp.close(listener);
     return actual;
 }
 
 fn serve_forever_timeout(addr, handler, timeout_ms) {
-    if timeout_ms != nil and timeout_ms > 0 {
-        throw "serve_forever_timeout: per-call TCP timeout is not exposed in pblang yet; set the VM io_timeout_ms host limit or pass 0";
-    }
-    let l = tcp_listen(addr);
-    let actual = tcp_local_addr(l);
-    print actual;
-    while true {
-        let s = tcp_accept(l);
-        let req = _recv_request(s);
-        let resp = _serve_response(handler, req);
-        tcp_write(s, resp);
-        tcp_close(s);
-    }
+    let policy = bounded_server_policy(timeout_ms);
+    let target = _native_addr(addr);
+    let listener = NativeTcp.listen_ipv4(target.host, target.port, policy.max_inflight * 2);
+    if not listener.ok { throw "serve_forever_timeout: " + str(try listener.error catch "bind failed"); }
+    print target.host + ":" + str(listener.port);
+    try serve_bounded_listener(listener, handler, timeout_ms)
+        catch { NativeTcp.close(listener); throw "serve_forever_timeout failed"; };
+    NativeTcp.close(listener);
 }
 
 // Server-Sent Events helpers
@@ -921,4 +1383,4 @@ fn res_sse_headers() {
     };
 }
 
-export app_new, app_use, app_get, app_post, app_put, app_delete, app_patch, app_route, app_route_mw, app_get_mw, app_post_mw, app_handle, res, res_json, res_text, res_html, res_redirect, to_http_response, mw_log, mw_require_header, serve_once, serve_forever, serve_once_app, serve_forever_app, serve_listener, serve_listener_app, receive_request, serve_response, cookies, cookie_get, body_json, form_data, static_file_response, mw_rate_limit, serve_once_timeout, serve_forever_timeout, sse_event, res_sse_headers, url_decode, _path_safe, set_max_body, get_max_body, body_read_plan, req_header, content_type, multipart_boundary, multipart_parse, multipart_form, decode_chunked, is_chunked, MAX_STATIC_FILE_BYTES;
+export app_new, app_use, app_get, app_post, app_put, app_delete, app_patch, app_route, app_route_mw, app_get_mw, app_post_mw, app_handle, res, res_json, res_text, res_html, res_redirect, to_http_response, mw_log, mw_require_header, serve_once, serve_forever, serve_once_app, serve_forever_app, serve_listener, serve_listener_app, receive_request, serve_response, cookies, cookie_get, body_json, form_data, static_file_response, mw_rate_limit, serve_once_timeout, serve_forever_timeout, serve_bounded_listener, bounded_server_policy, sse_event, res_sse_headers, url_decode, _path_safe, set_max_body, get_max_body, body_read_plan, req_header, content_type, multipart_boundary, multipart_parse, multipart_form, decode_chunked, is_chunked, MAX_STATIC_FILE_BYTES;

@@ -17,6 +17,9 @@ let CRYPTO=[
     "/usr/lib/libcrypto.so.3"
 ];
 let MAX_BYTES=1048576;
+let MAX_STREAM_BYTES=268435456;
+let STREAM_CHUNK_BYTES=65535;
+let SCAN_CHUNK_BYTES=65536;
 
 fn _fixed_path(candidates) { for path in candidates { if try fs_exists(path) catch false { return path; } } return nil; }
 fn _integer(value,minimum,maximum) { return type(value)=="number" and num_floor(value)==value and value>=minimum and value<=maximum; }
@@ -88,6 +91,148 @@ fn digest(session,bits,bytes) {
     _clean_free(session,input.pointer,input.length,true); _clean_free(session,output,64);
     if result==nil { return map{ok:false,format:FORMAT,error:"native digest failed"}; }
     return map{ok:true,format:FORMAT,bytes:result,bits:bits};
+}
+
+// Hash base64(range) without materializing either the input range or its
+// encoded representation in the VM. STREAM_CHUNK_BYTES is divisible by three,
+// so only the final block receives RFC 4648 padding and the result is exactly
+// equivalent to sha256(base64_encode_bytes(range)). pread keeps the caller's
+// held descriptor offset unchanged and fails closed on premature EOF.
+fn sha256_base64_fd_range(session,fd,offset,count) {
+    if not (try session.ok catch false) or session.closed
+        or not _integer(fd,0,4194304)
+        or not _integer(offset,0,9007199254740991)
+        or not _integer(count,0,MAX_STREAM_BYTES)
+        or offset+count>9007199254740991 {
+        return map{ok:false,format:FORMAT,error:"invalid streaming digest request"};
+    }
+    let context=_call(session,session.crypto,"EVP_MD_CTX_new","->ptr",[]);
+    let method=_call(session,session.crypto,"EVP_sha256","->ptr",[]);
+    let input=_calloc(session,STREAM_CHUNK_BYTES);
+    let encoded_capacity=4*num_floor((STREAM_CHUNK_BYTES+2)/3)+1;
+    let encoded=_calloc(session,encoded_capacity);
+    let output=_calloc(session,32); let output_length=_calloc(session,4);
+    if context==nil or context==0 or method==nil or method==0
+        or input==nil or input==0 or encoded==nil or encoded==0
+        or output==nil or output==0 or output_length==nil or output_length==0 {
+        if context!=nil and context!=0 {
+            _call(session,session.crypto,"EVP_MD_CTX_free","ptr->void",[context]);
+        }
+        _clean_free(session,input,STREAM_CHUNK_BYTES);
+        _clean_free(session,encoded,encoded_capacity);
+        _clean_free(session,output,32); _free(session,output_length);
+        return map{ok:false,format:FORMAT,error:"streaming digest allocation failed"};
+    }
+    let status=_call(session,session.crypto,"EVP_DigestInit_ex","ptr,ptr,ptr->i32",
+        [context,method,0]);
+    let consumed=0; let failed=status!=1; let failure="streaming digest initialization failed";
+    while consumed<count and not failed {
+        let wanted=count-consumed;
+        if wanted>STREAM_CHUNK_BYTES { wanted=STREAM_CHUNK_BYTES; }
+        let loaded=0;
+        while loaded<wanted and not failed {
+            let got=_call(session,session.libc,"pread","i32,ptr,i64,i64->i64",
+                [fd,input+loaded,wanted-loaded,offset+consumed+loaded]);
+            if type(got)!="number" or got<=0 or got>wanted-loaded {
+                failed=true; failure="streaming digest source ended before the authenticated range";
+            } else { loaded=loaded+got; }
+        }
+        if not failed {
+            let encoded_bytes=_call(session,session.crypto,"EVP_EncodeBlock","ptr,ptr,i32->i32",
+                [encoded,input,wanted]);
+            let expected=4*num_floor((wanted+2)/3);
+            if encoded_bytes!=expected {
+                failed=true; failure="streaming base64 encoding failed";
+            } elif _call(session,session.crypto,"EVP_DigestUpdate","ptr,ptr,i64->i32",
+                [context,encoded,encoded_bytes])!=1 {
+                failed=true; failure="streaming digest update failed";
+            } else { consumed=consumed+wanted; }
+        }
+    }
+    if not failed and _call(session,session.crypto,"EVP_DigestFinal_ex","ptr,ptr,ptr->i32",
+        [context,output,output_length])!=1 {
+        failed=true; failure="streaming digest finalization failed";
+    }
+    let result=nil;
+    if not failed { result=_copy_bytes(session,output,32); }
+    _call(session,session.crypto,"EVP_MD_CTX_free","ptr->void",[context]);
+    _clean_free(session,input,STREAM_CHUNK_BYTES);
+    _clean_free(session,encoded,encoded_capacity);
+    _clean_free(session,output,32); _free(session,output_length);
+    if result==nil {
+        return map{ok:false,format:FORMAT,error:failure,bytes_processed:consumed};
+    }
+    return map{ok:true,format:FORMAT,sha256:AES.bytes_hex(result),bytes:count,
+        offset:offset,digest_encoding:"sha256(base64(bytes))",bounded_memory:true,
+        descriptor_bound:true,chunk_bytes:STREAM_CHUNK_BYTES};
+}
+
+// Find bounded binary magic offsets while the file remains descriptor-held.
+// Input windows and overlap stay native; only the small offset list enters the
+// VM, avoiding cumulative boxed-byte-array retention during legacy scans.
+fn scan_fd_magic(session,fd,total_bytes,magic,max_matches=128) {
+    if not (try session.ok catch false) or session.closed
+        or not _integer(fd,0,4194304)
+        or not _integer(total_bytes,0,MAX_STREAM_BYTES)
+        or not _valid_bytes_limit(magic,32) or len(magic)<1
+        or not _integer(max_matches,1,4096) {
+        return map{ok:false,format:FORMAT,error:"invalid native magic scan request"};
+    }
+    let native_magic=_native_bytes(session,magic);
+    let capacity=SCAN_CHUNK_BYTES+len(magic)-1;
+    let buffer=_calloc(session,capacity);
+    if native_magic==nil or buffer==nil or buffer==0 {
+        if native_magic!=nil {
+            _clean_free(session,native_magic.pointer,native_magic.length,true);
+        }
+        _clean_free(session,buffer,capacity);
+        return map{ok:false,format:FORMAT,error:"native magic scan allocation failed"};
+    }
+    let offsets=[]; let base=0; let failed=false; let failure="native magic scan failed";
+    while base<total_bytes and not failed {
+        let primary=total_bytes-base;
+        if primary>SCAN_CHUNK_BYTES { primary=SCAN_CHUNK_BYTES; }
+        let window=total_bytes-base;
+        if window>primary+len(magic)-1 { window=primary+len(magic)-1; }
+        let loaded=0;
+        while loaded<window and not failed {
+            let got=_call(session,session.libc,"pread","i32,ptr,i64,i64->i64",
+                [fd,buffer+loaded,window-loaded,base+loaded]);
+            if type(got)!="number" or got<=0 or got>window-loaded {
+                failed=true; failure="native magic scan source ended before its bounded window";
+            } else { loaded=loaded+got; }
+        }
+        let cursor=0;
+        while cursor+len(magic)<=window and not failed {
+            let found=_call(session,session.libc,"memmem","ptr,i64,ptr,i64->ptr",
+                [buffer+cursor,window-cursor,native_magic.pointer,len(magic)]);
+            if found==nil or found==0 { cursor=window; }
+            else {
+                let local=found-buffer;
+                if type(local)!="number" or local<cursor or local+len(magic)>window {
+                    failed=true; failure="native magic scan returned an invalid match pointer";
+                } else {
+                    if local<primary {
+                        array_push(offsets,base+local);
+                        if len(offsets)>max_matches {
+                            failed=true; failure="native magic scan match budget exhausted";
+                        }
+                    }
+                    cursor=local+1;
+                }
+            }
+        }
+        if not failed { base=base+primary; }
+    }
+    _clean_free(session,native_magic.pointer,native_magic.length,true);
+    _clean_free(session,buffer,capacity);
+    if failed {
+        return map{ok:false,format:FORMAT,error:failure,bytes_scanned:base,
+            matches_found:len(offsets)};
+    }
+    return map{ok:true,format:FORMAT,offsets:offsets,matches:len(offsets),
+        bytes_scanned:total_bytes,descriptor_bound:true,bounded_memory:true,
+        chunk_bytes:SCAN_CHUNK_BYTES,overlap_bytes:len(magic)-1};
 }
 fn aes_cbc_encrypt_blocks(session,data,key,iv) {
     if not (try session.ok catch false) or session.closed or not _valid_bytes(data)
@@ -170,4 +315,6 @@ fn r6_round(session,unit,key) {
     return map{ok:true,format:FORMAT,digest:digest,last_byte:last[0],hash_bits:bits};
 }
 
-export FORMAT,MAX_BYTES,open,close,digest,aes_cbc_encrypt_blocks,r6_round;
+export FORMAT,MAX_BYTES,MAX_STREAM_BYTES,STREAM_CHUNK_BYTES,SCAN_CHUNK_BYTES,
+       open,close,digest,sha256_base64_fd_range,scan_fd_magic,
+       aes_cbc_encrypt_blocks,r6_round;

@@ -2,6 +2,7 @@
 // fingerprint are loaded once, amortizing cold import work across a project build.
 
 let CACHE = import("stdlib/native/artifact_cache.sapp");
+let X64 = import("stdlib/native/codegen_x64.sapp");
 
 let MAX_JOBS = 256;
 let MAX_SOURCE_BYTES = 16777216;
@@ -15,12 +16,15 @@ let DEFAULT_DEPENDENCIES = [
     "stdlib/native/elf_x64.sapp"
 ];
 
+fn _default_profile() { return DEFAULT_PROFILE; }
+fn _default_dependencies() { return DEFAULT_DEPENDENCIES; }
+
 fn session(options = nil) {
     if options != nil and type(options) != "map" { throw "compile_session: options must be a map"; }
     let root = if options != nil and map_has(options, "cache_root") { options.cache_root } else { CACHE.default_root() };
-    let profile = if options != nil and map_has(options, "profile") { options.profile } else { DEFAULT_PROFILE };
-    let dependencies = if options != nil and map_has(options, "dependencies") { options.dependencies } else { DEFAULT_DEPENDENCIES };
-    let use_cache = not (options != nil and map_has(options, "cache") and options.cache == false);
+    let profile = if options != nil and map_has(options, "profile") { options.profile } else { _default_profile() };
+    let dependencies = if options != nil and map_has(options, "dependencies") { options.dependencies } else { _default_dependencies() };
+    let use_cache = not (options != nil and map_has(options, "cache") and not options.cache);
     if type(root) != "string" or root == "" or len(root) > 4096 { throw "compile_session: invalid cache root"; }
     if type(profile) != "string" or profile == "" or len(profile) > 128 { throw "compile_session: invalid profile"; }
     return map{
@@ -35,6 +39,56 @@ fn session(options = nil) {
 
 fn _fail(index, error, results) {
     return map{ ok: false, index: index, error: error, results: results };
+}
+
+// Compile one source to a verified ELF byte array without publishing a path.
+// Callers that need transactional multi-stage verification can retain these
+// bytes privately and choose when the final artifact name becomes visible.
+fn compile_bytes(state, source) {
+    if type(state) != "map" or type(try state.dependency_fingerprint catch nil) != "string" {
+        throw "compile_session: invalid session";
+    }
+    if type(source) != "string" or len(str_to_bytes(source)) > MAX_SOURCE_BYTES {
+        return map{ ok: false, error: "source limit exceeded" };
+    }
+    let key = CACHE.cache_key_with_fingerprint(
+        source, state.dependency_fingerprint, state.profile);
+    let binary = nil;
+    let mode = "compiled";
+    if state.cache {
+        let cached = try CACHE.load(state.cache_root, key) catch nil;
+        if cached == nil {
+            state.cache_errors = state.cache_errors + 1;
+            state.last_cache_error = "cache load failed";
+            state.misses = state.misses + 1;
+        } elif cached.hit {
+            binary = cached.binary; mode = "cache-hit"; state.hits = state.hits + 1;
+        } else {
+            state.misses = state.misses + 1;
+        }
+    }
+    if binary == nil {
+        let certificate = try X64.compile_safe(source) catch nil;
+        if certificate == nil or not (try certificate.safe catch false)
+            or not CACHE.valid_x64_elf(try certificate.binary catch nil) {
+            return map{ ok: false, error: "x86-64 safety-certified compilation failed" };
+        }
+        binary = certificate.binary;
+        state.compiled = state.compiled + 1;
+        if state.cache {
+            let stored = try CACHE.store(state.cache_root, key, binary) catch map{ ok: false };
+            if stored.ok and not stored.reused { state.stores = state.stores + 1; }
+            if not stored.ok {
+                state.cache_errors = state.cache_errors + 1;
+                state.last_cache_error = try stored.error catch "cache store failed";
+            }
+        }
+    }
+    if len(binary) > MAX_TOTAL_ARTIFACT_BYTES {
+        return map{ ok: false, error: "artifact limit exceeded" };
+    }
+    return map{ ok: true, binary: binary, cache_key: key, mode: mode,
+        byte_len: len(binary) };
 }
 
 fn compile_many(state, jobs) {
@@ -68,9 +122,6 @@ fn compile_many(state, jobs) {
     let prepared = [];
     let summaries = [];
     let total_artifact = 0;
-    // Loading the compiler backend dominates a short build. Keep it out of the
-    // warm-cache path and import it at most once on the first real cache miss.
-    let x64 = nil;
     i = 0;
     while i < len(jobs) {
         let job = jobs[i];
@@ -90,8 +141,7 @@ fn compile_many(state, jobs) {
             }
         }
         if binary == nil {
-            if x64 == nil { x64 = import("stdlib/native/codegen_x64.sapp"); }
-            let certificate = try x64.compile_safe(job.source) catch nil;
+            let certificate = try X64.compile_safe(job.source) catch nil;
             if certificate == nil or not (try certificate.safe catch false)
                 or not CACHE.valid_x64_elf(try certificate.binary catch nil) {
                 return _fail(i, "x86-64 safety-certified compilation failed", summaries);
@@ -134,4 +184,4 @@ fn compile_one(state, source, output) {
 }
 
 export MAX_JOBS, DEFAULT_DEPENDENCIES, DEFAULT_PROFILE;
-export session, compile_one, compile_many;
+export session, compile_bytes, compile_one, compile_many;

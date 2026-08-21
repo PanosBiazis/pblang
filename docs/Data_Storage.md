@@ -15,7 +15,7 @@ for one another, and their guarantees should not be mixed.
 | Relational convenience | `stdlib:orm.sapp` | CRUD, pagination, upsert, batch insert, transactions; developer-authored raw SQL remains trusted input |
 | Redis protocol | `stdlib:redis.sapp` | Shell-free RESP2 client over bounded TCP or certificate-verified TLS, AUTH, SELECT, pipeline, SCAN |
 | Packed file container | `stdlib:storage.sapp` | Per-entry compression, CRC32 integrity, bounds-checked load, traversal-safe unpack |
-| External database CLI bridge | `stdlib:polyglot_db.sapp` | Compatibility bridge for trusted PostgreSQL/MySQL/MongoDB/Redis workflows; not a native driver or connection pool |
+| External database CLI bridge | `stdlib:polyglot_db.sapp` | Bounded, shell-free compatibility bridge with typed connections, fixed executables, private stdin, redacted diagnostics, and fail-closed platform behavior; not a native driver or connection pool |
 | pbAI derived cache | `stdlib/pbai_cache.sapp` inside pbAI | Persistent SHA-256 keyed prompt/training artifacts with metadata verification, TTL, quotas, staged publish, and recovery |
 
 ## Unified key/value API
@@ -65,6 +65,25 @@ overhead; select `policy: "lru"` only when recency eviction is worth that cost.
   streaming large-object API.
 - TCP, SQLite, and Redis handles are explicitly closed. They cannot be shared
   blindly across PBLang VM threads.
+- `polyglot_db` accepts a path only for SQLite. Network adapters require the
+  typed maps returned by `postgres_conn`, `mysql_conn`, `mongodb_conn`, or
+  `redis_conn`; legacy strings containing CLI flags are rejected.
+- PostgreSQL, MySQL, and Redis passwords stay out of argv and returned plans.
+  PostgreSQL and MySQL use random mode-0600 client credential files. After the
+  bounded process, secret content is securely scrubbed and unlink is attempted;
+  result metadata reports both outcomes. A result is withheld if neither scrub
+  nor unlink succeeds. Authenticated Redis and
+  MongoDB CLI paths fail closed because their available CLI contracts cannot
+  provide the same no-argv/no-secret-environment guarantee; use the native
+  `redis.sapp` RESP/TLS client for authenticated Redis.
+- Database scripts use bounded private stdin. Redis commands are arrays such as
+  `["SET", key, value]`, so shell metacharacters remain ordinary data. External
+  adapters are available only where `process.run_fixed_bounded` is available;
+  there is no raw process fallback.
+- Migration discovery and reads use no-follow secure-file operations, enforce
+  entry and byte ceilings without enumerating the directory. Reviewed filenames
+  and caller-pinned SHA-256 hashes define the exact in-memory snapshot; execution
+  runs in deterministic filename order and stops at the first failed migration.
 
 ## pbAI prompt and artifact cache
 
@@ -106,8 +125,14 @@ of truth. See `docs/CDN_Caching.md` for cacheability and invalidation rules.
 ./target/release/pblang tests/semantics/cdn_cache_test.sapp
 ./target/release/pblang run examples/cdn_cache/main.sapp --allow-all
 ./target/release/pblang bench/cdn_cache_stages.sapp
+./target/release/pblang run tests/semantics/polyglot_db_security_test.sapp --allow-all
+./target/release/pblang run tests/semantics/polyglot_db_bounded_test.sapp --allow-all
+./target/release/pblang run tests/semantics/polyglot_hardening_suite.sapp --allow-all
 ```
 
 The Redis semantic test validates the complete RESP2 codec without a service.
 Live connection behavior requires an explicitly provisioned Redis service and
 is therefore an integration condition, not a fake passing unit test.
+The bounded database smoke test performs a real in-memory query when a fixed
+`sqlite3` executable is installed; otherwise it records only the portable
+contract test and does not claim live CLI coverage.
