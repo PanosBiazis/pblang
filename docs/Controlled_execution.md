@@ -77,8 +77,134 @@ implementation only when fallback is enabled. Supported hook classes are
 Every mode, including explicit `unrestricted`, retains the code-size and
 language-allowlist limits. `report` is the only mode that needs no runner.
 `secure` scanning remains defense in depth, not proof that foreign code is
-safe; untrusted execution still needs an OS/container sandbox with explicit
-filesystem, process, and network capabilities.
+safe. The mode now fails closed unless `with_sandbox` supplies an explicit
+runner, and scan-safe code is executed only through that runner. The convenience
+`secure` function treats its runner as the explicit sandbox runner. The caller
+must still provide a real OS/container boundary with explicit filesystem,
+process, and network capabilities; a callback label is not proof of isolation.
+Accordingly, generic callback results report `sandbox_runner_used=true` but keep
+`sandbox_verified`, `sandboxed`, and `effects_confined` false. Policy callbacks,
+mode, limits, and allowlists are held in a bounded private registry behind opaque
+handles; returned descriptions are detached snapshots.
+
+The acknowledgement booleans on direct polyglot APIs record informed caller
+intent; they are not user authorization. Authority is scoped to the VM host's
+capability profile. A service running mutually untrusted principals must use a
+separate least-privilege VM, or an external authenticated execution broker, for
+each principal. Results expose `authority_scope: "vm_capability"`,
+`multi_principal_safe: false`, and `principal_isolation_required: true` so a
+wrapper cannot infer a stronger boundary. Opaque policy handles have a bounded
+idle lease, and one-shot helpers close them on both success and exceptions.
+
+`polyglot_router.plan` is analysis-only. It always reports `allowed=false` and
+`executable=false`. Its legacy `sandbox_ready` argument is accepted only as a
+strict boolean declaration and cannot become authority or verified evidence.
+Execution still requires a separate capability-gated backend.
+
+On current Linux targets, race-resistant secure publication also performs
+owner/mode verification with a fixed `stat` executable against a validated held
+descriptor path. It therefore needs `allow_ffi` and `allow_exec`; no shell or
+caller-selected executable is involved. Removing that exec dependency requires
+a future PBLang-native, ABI-specific `fstat`/`statx` structure decoder rather
+than skipping the ownership check.
+
+`stdlib:polyglot_isolate.sapp` is the Linux namespace substrate for a future
+dedicated authenticated execution broker. Its first complete adapter is Python;
+other languages fail closed until they have equivalent fixed request-file
+wrappers. Caller source and input arrive through a bounded descriptor and a
+mode-0400 request file inside an 8 MiB tmpfs, never through runtime argv. The
+fixed wrapper closes inherited descriptors other than bounded stdout/stderr,
+enables no-new-privileges, compiles the source, and emits a nonce-bound dispatch
+marker immediately before calling Python `exec`. The marker has a separate
+128-byte internal reserve; returned application stdout/stderr are still clipped
+to the caller's exact combined budget. Results distinguish process completion
+from dispatch-point observation. `executed` and `execution_confirmed` remain
+false because this boundary cannot prove that the first caller instruction ran.
+
+The descriptor-held fixed bubblewrap launcher requests private
+user/PID/network/IPC/UTS/mount namespaces, UID/GID 65534, read-only system
+runtime mounts, empty `/home`, a cleared environment, dropped capabilities,
+disabled nested user namespaces, and inherited bounded process limits. It never
+mounts a host workspace or credential store. Ordinary `run` results report
+these as configured rather than verified. The separate live self-test publishes
+granular observations for UID/GID, 8 MiB scratch size, selected host-path
+absence, `/usr` write denial as UID 65534, environment allowlisting, all five
+Linux capability sets, no-new-privileges, payload PID, sandbox hostname,
+loopback-only interfaces, argv privacy, and selected host-path descriptor
+absence above FD 2. The `/usr` result does not independently prove a read-only mount;
+the path checks do not cover every socket or memfd. User, IPC, and mount
+namespace separation therefore remain explicitly unverified by this self-test.
+
+The Python runtime is still selected from a read-only but broad host runtime
+tree and its identity is not descriptor/digest verified. Seccomp and cgroup
+enforcement also remain explicitly false. Therefore
+`production_untrusted_ready` remains false and this module is not yet the
+complete broker boundary.
+
+`stdlib:polyglot_broker_protocol.sapp` now provides the effect-free
+authentication and state-machine layer for that future boundary. It uses a
+canonical length-delimited binary frame, request/response-separated HMAC keys,
+audience and epoch binding, exact principal/organization/credential context,
+strict next-sequence processing, broker-owned time, bounded request lifetimes,
+and per-request reauthorization against the IAM authority pinned when the
+broker is created. Dispatch never accepts a caller-selected IAM state.
+Malformed or unauthenticated requests are
+silent and do not advance state. Authenticated replay and gap responses are
+signed without advancing state or consuming the terminal credential-attempt
+quota; transport rate limiting remains a separate outer-layer responsibility.
+Exact expired, invalid, or unauthorized
+requests consume their sequence. Revocation signs one exact denial and then
+scrubs and removes the binding.
+
+Broker handles and public descriptor identities are separate random values. A
+descriptor cannot be reconstructed into a privileged handle. Broker and client
+registries are bounded; both have idle and non-refreshing absolute lifetimes
+capped at one hour, and broker close/expiry retires linked client keys. Client
+response verification checks the request digest, full context, MAC direction,
+effect flags, and status-specific sequence transition before changing state.
+Administrative and dispatch capabilities are also separate: only the admin
+handle can bind, unbind, describe, mint a dispatch handle, or close; only the
+dispatch handle can process frames.
+
+This protocol module imports no listener, filesystem, process, polyglot, or
+isolation API. Every descriptor and result therefore reports
+`executable=false`, `executed=false`, and `effects_applied=false`. It does not
+yet connect authenticated requests to `polyglot_isolate.sapp`; transport
+framing, worker ownership, cancellation, response output framing, and
+end-to-end deny-exec client profiles remain the next integration slice.
+
+`stdlib:process.sapp` now supplies the opaque asynchronous lifecycle needed by
+that integration. `start_fixed_bounded` reserves one of 128 private registry
+slots before launch, requires a Linux pidfd identity, and returns no PID,
+process-group number, descriptor, directory, or raw supervisor state. `poll`,
+`request_cancel`, `finish`, and `close` accept only the opaque handle. Clean
+launch failures release their reservation; a startup failure that may still
+own a process instead returns a recovery-capable opaque handle. The lower-level
+Linux process API also requires pidfd identity for every start; it has no
+cancellable numeric-PID fallback.
+
+`maintain_bounded` performs one bounded, nonblocking pass over the registry. It
+reaps completed abandoned jobs and requests deadline recovery, but removes an
+entry only after the supervisor proves the process group absent. There is no
+background thread. Cancellation pins the exact leader generation with pidfd
+`SIGSTOP` while the fixed group-signal helper runs, preventing numeric PGID
+reuse between identity validation and signalling. The generated supervisor
+launcher self-stops before exec, while its parent publishes readiness only after
+`wait4(..., WUNTRACED)` observes that exact fork child stopped. The generated
+supervisor atomically publishes direct-child status and then uses
+`kill(0, SIGKILL)` to
+remove itself and any same-group descendants; post-fork status-publication
+errors use the same teardown path. Bounded output is read only after group
+absence is verified.
+
+This remains process supervision, not a complete sandbox. A descendant that
+successfully creates another session/process group is not confined because
+cgroups and a PID namespace are not enforced here. Background-descendant
+userspace buffers may be lost during forced teardown, and status publication
+is not power-loss durable without file and directory `fsync`. The future
+broker worker must combine this lifecycle with `polyglot_isolate.sapp` and keep
+`production_untrusted_ready=false` until runtime identity, seccomp, cgroup or
+equivalent whole-tree confinement, and platform parity have current evidence.
 
 ## Safe FFI control plane
 
@@ -112,6 +238,10 @@ Verification:
 - `tests/semantics/hardware_cost_routing_test.sapp`
 - `tests/semantics/accelerator_test.sapp`
 - `tests/semantics/polyglot_policy_test.sapp`
+- `tests/semantics/polyglot_broker_protocol_test.sapp`
+- `tests/semantics/process_bounded_async_test.sapp`
+- `tests/semantics/linux_pidfd_test.sapp`
+- `tests/semantics/linux_process_test.sapp`
 - `tests/semantics/ffi_universal_enrich2_test.sapp`
 - `bench/controlled_execution_stages.sapp`
 - `bench/hardware_cost_routing_stages.sapp`

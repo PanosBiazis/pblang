@@ -1,7 +1,7 @@
 // tests/semantics/polyglot_policy_test.sapp — stdlib/polyglot_policy.sapp
 //
 // Execution MODES for the polyglot boundary, layered on polyglot_guard:
-//   secure       — scan; run ONLY if safe, else block (the default, malicious-code-proof)
+//   secure       — scan; run safe code only through an explicit sandbox runner
 //   sandbox      — scan; run everything, but through a caller-supplied isolated runner
 //   audit        — run everything, attach the findings (run-but-record)
 //   unrestricted — run everything with NO scan (fast + dangerous; safe AND unsafe)
@@ -13,21 +13,31 @@ let X = import("stdlib/polyglot_policy.sapp");
 
 fn fail(m) { throw "FAIL " + m; }
 fn eq(a, b, m) { if a != b { fail(m + " got=[" + str(a) + "] want=[" + str(b) + "]"); } }
-fn truthy(c, m) { if c != true { fail(m); } }
-fn falsy(c, m) { if c != false { fail(m); } }
+fn truthy(c, m) { if not c { fail(m); } }
+fn falsy(c, m) { if c { fail(m); } }
 
 let SAFE = "import moderngl\nprint('ok')\n";
 let EVIL = "import os\nos.system('rm -rf /')\n";
-fn runner(lang, code) { return "RAN:" + lang; }
+let raw_calls = 0;
+fn runner(lang, code) { raw_calls = raw_calls + 1; return "RAN:" + lang; }
 fn sandbox_runner(lang, code) { return "SANDBOXED:" + lang; }
 
 eq(len(X.modes()), 5, "five execution modes");
 
 // ── secure: runs safe code, BLOCKS malicious code ───────────────────────────────────
-let s1 = X.execute(X.new("secure", runner), "python", SAFE);
+let s1 = X.execute(X.with_sandbox(X.new("secure", runner), sandbox_runner), "python", SAFE);
 truthy(s1.ran, "secure runs safe code"); falsy(s1.blocked, "safe not blocked");
-eq(s1.result, "RAN:python", "secure returns the runner result");
-let s2 = X.execute(X.new("secure", runner), "python", EVIL);
+eq(s1.result, "SANDBOXED:python", "secure uses only the sandbox runner");
+truthy(s1.sandbox_runner_used, "secure records delegated sandbox runner use");
+falsy(s1.sandbox_verified, "generic callback is not verified isolation");
+falsy(s1.sandboxed, "generic callback cannot claim sandboxed execution");
+falsy(s1.effects_confined, "generic callback cannot claim confined effects");
+eq(raw_calls, 0, "secure never invokes the raw runner");
+let no_secure_sandbox = X.execute(X.new("secure", runner), "python", SAFE);
+truthy(no_secure_sandbox.blocked, "secure fails closed without a sandbox");
+eq(no_secure_sandbox.reason, "sandbox_required", "missing sandbox is explicit");
+eq(raw_calls, 0, "missing secure sandbox cannot invoke the raw runner");
+let s2 = X.execute(X.with_sandbox(X.new("secure", runner), sandbox_runner), "python", EVIL);
 falsy(s2.ran, "secure does NOT run malicious code");
 truthy(s2.blocked, "malicious code blocked");
 falsy(s2.safe, "flagged unsafe");
@@ -46,7 +56,9 @@ truthy(len(a.findings) >= 1, "audit keeps the findings");
 
 // ── sandbox: runs everything through the isolated runner ────────────────────────────
 let sb = X.execute(X.with_sandbox(X.new("sandbox", runner), sandbox_runner), "python", EVIL);
-truthy(sb.ran, "sandbox runs"); truthy(sb.sandboxed, "flagged sandboxed");
+truthy(sb.ran, "sandbox delegates execution"); truthy(sb.sandbox_runner_used, "runner use recorded");
+falsy(sb.sandbox_verified, "callback alone is not sandbox verification");
+falsy(sb.sandboxed, "callback alone is not a sandbox attestation");
 eq(sb.result, "SANDBOXED:python", "used the sandbox runner, not the raw one");
 let noSbx = (try X.execute(X.new("sandbox", runner), "python", SAFE) catch "NOSANDBOX");
 eq(noSbx, "NOSANDBOX", "sandbox mode requires an isolated runner");
@@ -57,9 +69,50 @@ falsy(r.ran, "report never runs"); falsy(r.blocked, "report is analysis, not a b
 truthy(len(r.findings) >= 1, "report returns findings");
 
 // convenience one-shots + validation
-truthy(X.secure(runner, "python", SAFE).ran, "secure() helper");
+let secure_helper = X.secure(sandbox_runner, "python", SAFE);
+truthy(secure_helper.ran and secure_helper.sandbox_runner_used and not secure_helper.sandboxed,
+    "secure() helper delegates without inventing sandbox attestation");
 truthy(X.unrestricted(runner, "python", EVIL).ran, "unrestricted() helper");
 let badmode = (try X.execute(X.new("bogus", runner), "python", SAFE) catch "BADMODE");
 eq(badmode, "BADMODE", "unknown mode rejected");
+
+let multibyte = X.execute(X.new("report", nil, map{ max_code_bytes: 4 }), "python", "ééé");
+truthy(multibyte.blocked and multibyte.reason == "code_limit_exceeded",
+    "code limits count UTF-8 bytes instead of characters");
+let non_string = X.execute(X.new("report", nil), "python", map{ source: SAFE });
+truthy(non_string.blocked and non_string.reason == "invalid_code",
+    "non-string code is rejected before conversion");
+
+fn throwing_runner(lang, code) { throw "fixture failure"; }
+let threw = false;
+try { X.unrestricted(throwing_runner, "python", SAFE); } catch { threw = true; }
+truthy(threw, "one-shot runner exceptions remain visible");
+// Exception cleanup must make repeated failures bounded rather than leaking
+// all 1,024 private policy slots.
+let failure_index = 0;
+while failure_index < 1030 {
+    try X.unrestricted(throwing_runner, "python", SAFE) catch nil;
+    failure_index = failure_index + 1;
+}
+truthy(X.report("python", SAFE).safe,
+    "one-shot exceptions close their private policy handles");
+
+let expiring = X.new("report", nil, map{ idle_timeout_ms: 1 });
+let expiry_deadline = now_ms() + 3;
+while now_ms() < expiry_deadline {}
+let expired = try { X.describe(expiring); false } catch { true };
+truthy(expired, "idle policy leases expire and release private registry state");
+
+let private_cfg = X.new("report", nil, map{ allowed_languages: ["python"] });
+private_cfg.mode = "unrestricted";
+private_cfg.allowed_languages = ["rust"];
+let private_desc = X.describe(private_cfg);
+eq(private_desc.mode, "report", "public handle mutation cannot change private policy mode");
+eq(private_desc.allowed_languages[0], "python", "public handle cannot replace private allowlist");
+private_desc.allowed_languages[0] = "rust";
+eq(X.describe(private_cfg).allowed_languages[0], "python", "policy description is detached data");
+truthy(X.close(private_cfg).closed, "policy handle closes explicitly");
+let closed = (try X.describe(private_cfg) catch "CLOSED");
+eq(closed, "CLOSED", "closed policy handles cannot be reused");
 
 print "polyglot_policy_pass";

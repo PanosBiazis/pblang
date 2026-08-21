@@ -43,7 +43,7 @@ Foreign code runs only through:
 - `polyglot_guard.sapp` — scans code for shell/exec/network/destructive/eval patterns
   (canonicalising with `deobfuscate` first, so zero-width/homoglyph tricks can't hide an
   `eval`), plus a dependency allowlist.
-- `polyglot_policy.sapp` — execution **modes**: `secure` (run only if safe), `sandbox`
+- `polyglot_policy.sapp` — execution **modes**: `secure` (scan-safe plus explicit sandbox), `sandbox`
   (run all, isolated runner), `audit` (run all, log findings), `unrestricted` (run all, no
   scan), `report` (analyse only).
 

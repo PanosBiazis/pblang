@@ -1,10 +1,29 @@
 fn fail(message) { throw "FAIL security_tools_cli: " + message; }
-fn require(value, message) { if value != true { fail(message); } }
+fn require(value, message) { if not value { fail(message); } }
+let OS = import("stdlib:os.sapp");
 
-let compiler = if fs_exists("/proc/self/exe") { "/proc/self/exe" } else { "pblang" };
-let root = "/tmp/pblang_security_tools_" + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 12);
+fn compiler_path() {
+    let configured = try env_get("PBLANG_BIN") catch nil;
+    if type(configured) == "string" and configured != "" {
+        let selected = str(configured);
+        if platform() == "windows" and not str_ends_with(str_lower(selected), ".exe") {
+            return selected + ".exe";
+        }
+        return selected;
+    }
+    if fs_exists("/proc/self/exe") { return "/proc/self/exe"; }
+    return "pblang";
+}
+
+let compiler = compiler_path();
+let temporary = OS.temp_dir();
+require(type(temporary) == "string" and temporary != "", "host provides a temporary directory");
+let root = path_join(temporary,
+    "pblang_security_tools_" + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 12));
 let source = root + ".sapp";
 let config = root + ".json";
+let report_path = root + ".report.json";
+let entry_report_path = root + ".entry-report.json";
 fs_write(source, "unsafe_device_mode();\n");
 fs_write(config, json_stringify(map{ custom_rules: [
     map{ id: "device.unsafe-mode", severity: "high", needle: "unsafe_device_mode(",
@@ -23,6 +42,66 @@ let disabled = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", 
 require(disabled.exit_code == 0 and json_parse(str_trim(disabled.stdout)).finding_count == 0,
     "one invocation can disable a configured rule");
 
+let file_report = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+    source, "--mode=protect", "--config=" + config, "--json-output=" + report_path]);
+require(file_report.exit_code == 1 and file_report.stdout == "" and fs_exists(report_path),
+    "file-output mode is stdout-silent and preserves blocking exit status");
+let published = json_parse(fs_read(report_path));
+require(not published.passed and published.snapshot_verification.stable,
+    "file-output report is valid JSON over a verified source snapshot");
+require(published.config_snapshot_verification.ok
+    and published.config_snapshot_verification.stable,
+    "published evidence is bound to a securely reverified policy snapshot");
+let published_text = fs_read(report_path);
+let existing_output = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+    source, "--mode=protect", "--config=" + config, "--json-output=" + report_path]);
+require(existing_output.exit_code == 2 and existing_output.stdout == ""
+    and fs_read(report_path) == published_text,
+    "existing report destinations fail closed without replacing prior evidence");
+
+let entry_file_report = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+    source, "--mode=protect", "--config=" + config, "--entry-only",
+    "--json-output=" + entry_report_path]);
+let entry_published = json_parse(fs_read(entry_report_path));
+require(entry_file_report.exit_code == 1 and entry_file_report.stdout == ""
+    and entry_published.snapshot_verification.ok
+    and entry_published.snapshot_verification.stable
+    and entry_published.config_snapshot_verification.stable,
+    "entry-only publication also verifies the analyzed source snapshot");
+
+let duplicate_output = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+    source, "--json-output=" + report_path, "--json-output=" + report_path]);
+require(duplicate_output.exit_code == 2 and duplicate_output.stdout == "",
+    "duplicate output destinations fail closed and stay stdout-silent");
+let source_before_collision = fs_read(source);
+let source_collision = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+    source, "--json-output=" + source]);
+require(source_collision.exit_code == 2 and source_collision.stdout == ""
+    and fs_read(source) == source_before_collision,
+    "report publication cannot replace the analyzed source");
+if platform() == "windows" or platform() == "macos" {
+    let case_collision = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+        source, "--json-output=" + str_upper(source)]);
+    require(case_collision.exit_code == 2 and case_collision.stdout == "",
+        "case-insensitive hosts reject differently-cased source/report collisions");
+}
+let missing_parent = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+    source, "--json-output=" + root + "/missing/report.json"]);
+require(missing_parent.exit_code == 2 and missing_parent.stdout == "",
+    "file-output mode does not create an unexpected parent directory");
+
+let link_program = if fs_exists("/usr/bin/ln") { "/usr/bin/ln" }
+    else { if fs_exists("/bin/ln") { "/bin/ln" } else { "" } };
+let config_link = root + ".config-link.json";
+if link_program != "" and platform() != "windows" {
+    let linked = proc_spawn_wait(link_program, ["-s", config, config_link]);
+    require(linked.exit_code == 0, "symlink fixture creation succeeds");
+    let linked_config = proc_spawn_wait(compiler, ["tools/pbsecure.sapp", "--allow-all", "--",
+        source, "--mode=protect", "--config=" + config_link]);
+    require(linked_config.exit_code == 2,
+        "security policy config symlinks fail closed at the no-follow boundary");
+}
+
 let selected = proc_spawn_wait(compiler, ["tools/pbanalyze.sapp", "--allow-all", "--",
     source, "--analysis=performance"]);
 require(selected.exit_code == 0 and json_parse(str_trim(selected.stdout)).analyses[0] == "performance",
@@ -30,4 +109,7 @@ require(selected.exit_code == 0 and json_parse(str_trim(selected.stdout)).analys
 
 try fs_remove(source) catch nil;
 try fs_remove(config) catch nil;
+try fs_remove(report_path) catch nil;
+try fs_remove(entry_report_path) catch nil;
+try fs_remove(config_link) catch nil;
 print "security_tools_cli_pass";

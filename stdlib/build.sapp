@@ -7,14 +7,20 @@
 
 let MAX_SOURCE_BYTES = 16777216;
 let MAX_BATCH_JOBS = 256;
+let MAX_ARTIFACT_BYTES = 67108864;
 let PLAN_FORMAT = "pblang.smart_build.plan.v1";
 let REPORT_FORMAT = "pblang.smart_build.report.v1";
 let _HOST_ARCH_CACHE = "";
 let _HOST_PLATFORM_CACHE = "";
 let SESSION = import("stdlib:native/compile_session.sapp");
 let CACHE = import("stdlib:native/artifact_cache.sapp");
-let SECURITY = import("stdlib:security_analysis.sapp");
 let DEP_SECURITY = import("stdlib:security_dependency_analysis.sapp");
+let OS = import("stdlib:os.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let DIST = import("stdlib:dist.sapp");
+let MANIFEST = import("stdlib:manifest_validate.sapp");
+let PORTABLE_LOCK = import("stdlib:portable_lock.sapp");
 
 fn _get(options, key, fallback) {
     if options == nil or type(options) != "map" or not map_has(options, key) { return fallback; }
@@ -43,7 +49,6 @@ fn _safe_relative(path) {
 
 fn host_platform() {
     if _HOST_PLATFORM_CACHE != "" { return _HOST_PLATFORM_CACHE; }
-    let OS = import("stdlib:os.sapp");
     _HOST_PLATFORM_CACHE = OS.platform();
     return _HOST_PLATFORM_CACHE;
 }
@@ -56,8 +61,26 @@ fn _normalize_arch(raw) {
     return "unknown";
 }
 
+fn _fixed_uname_arch() {
+    let paths = ["/usr/bin/uname", "/bin/uname"];
+    let i = 0;
+    while i < len(paths) {
+        if try fs_exists(paths[i]) catch false {
+            let result = try proc_spawn_wait(paths[i], ["-m"]) catch nil;
+            if result != nil and (try result.exit_code catch 1) == 0 {
+                let detected = _normalize_arch(try result.stdout catch "");
+                if detected != "unknown" { return detected; }
+            }
+        }
+        i = i + 1;
+    }
+    return "unknown";
+}
+
 fn host_arch() {
     if _HOST_ARCH_CACHE != "" { return _HOST_ARCH_CACHE; }
+    let detected = _fixed_uname_arch();
+    if detected != "unknown" { _HOST_ARCH_CACHE = detected; return detected; }
     let candidates = [
         try env_get("HOSTTYPE") catch nil,
         try env_get("PROCESSOR_ARCHITECTURE") catch nil,
@@ -68,12 +91,6 @@ fn host_arch() {
         let arch = _normalize_arch(candidates[i]);
         if arch != "unknown" { _HOST_ARCH_CACHE = arch; return arch; }
         i = i + 1;
-    }
-    let result = try proc_spawn_wait("uname", ["-m"]) catch nil;
-    if result != nil and (try result.exit_code catch 1) == 0 {
-        let detected = _normalize_arch(try result.stdout catch "");
-        if detected != "unknown" { _HOST_ARCH_CACHE = detected; }
-        return detected;
     }
     return "unknown";
 }
@@ -148,42 +165,32 @@ fn _security_options(options, mode) {
 
 fn _security_gate(source, path, options) {
     let mode = _security_mode(options);
-    if mode == "off" {
-        return map{ ok: true, passed: true, enabled: false, mode: "off", finding_count: 0,
-            blocking: 0, format: SECURITY.FORMAT };
-    }
     if mode == "invalid" {
         return map{ ok: false, passed: false, enabled: true, mode: mode,
             error: "security mode must be off, audit, protect, or strict" };
     }
+    let analysis_mode = if mode == "off" { "audit" } else { mode };
     let scope = str_lower(str(_get(options, "security_scope", "dependencies")));
-    if scope != "entry" and scope != "dependencies" {
+    if scope != "dependencies" {
         return map{ ok: false, passed: false, enabled: true, mode: mode,
-            error: "security_scope must be entry or dependencies" };
+            error: "artifact publication requires dependency-wide security scope" };
     }
-    let report = nil;
-    if scope == "entry" {
-        report = SECURITY.analyze(source, path, _security_options(options, mode));
-        report.dependency_wide = false;
-        report.semantic_complete = false;
-        report.scope = "entry";
-    } else {
-        let dependency_options = map{};
-        if type(options) == "map" {
-            let keys = map_keys(options); let oi = 0;
-            while oi < len(keys) { dependency_options[keys[oi]] = options[keys[oi]]; oi = oi + 1; }
-        }
-        dependency_options.entry_source = source;
-        dependency_options.security_mode = mode;
-        dependency_options.retain_linked_source = true;
-        report = DEP_SECURITY.analyze_entry(path, dependency_options);
-        report.scope = "dependencies";
+    let dependency_options = map{};
+    if type(options) == "map" {
+        let keys = map_keys(options); let oi = 0;
+        while oi < len(keys) { dependency_options[keys[oi]] = options[keys[oi]]; oi = oi + 1; }
     }
-    report.enabled = true;
+    dependency_options.entry_source = source;
+    dependency_options.security_mode = analysis_mode;
+    dependency_options.retain_linked_source = true;
+    let report = DEP_SECURITY.analyze_entry(path, dependency_options);
+    report.scope = "dependencies";
+    report.enabled = mode != "off";
     report.mode = mode;
-    // Audit mode records every result but never blocks publication by itself.
-    report.enforced = mode != "audit";
-    if mode == "audit" and scope == "entry" { report.passed = report.ok; report.blocking = 0; }
+    // Audit/off modes do not enforce configurable findings, but immutable
+    // runtime invariants and dependency-graph completeness always remain gates.
+    report.enforced = mode == "protect" or mode == "strict";
+    report.mandatory_enforced = true;
     return report;
 }
 
@@ -199,8 +206,8 @@ fn smart_plan(source_path, output_path, options = nil) {
     let security_mode = _security_mode(options);
     if security_mode == "invalid" { array_push(errors, "security mode must be off, audit, protect, or strict"); }
     let security_scope = str_lower(str(_get(options, "security_scope", "dependencies")));
-    if security_scope != "entry" and security_scope != "dependencies" {
-        array_push(errors, "security_scope must be entry or dependencies");
+    if security_scope != "dependencies" {
+        array_push(errors, "artifact publication requires security_scope=dependencies");
     }
     let host_target = _host_target_name();
     let target = str(_get(options, "target", host_target));
@@ -262,17 +269,18 @@ fn _read_source(path) {
     return map{ ok: true, source: source, bytes: len(bytes) };
 }
 
-fn _linked_source(source_path, source, security_report = nil) {
-    if security_report != nil and (try security_report.format catch "") == DEP_SECURITY.FORMAT
-        and type(try security_report.linked_source catch nil) == "string" {
-        return map{ ok: true, source: security_report.linked_source,
-            modules: try security_report.whole_program_modules catch 0 };
+fn _take_linked_source(report) {
+    let linked = try report.linked_source catch nil;
+    if map_has(report, "linked_source") { map_remove(report, "linked_source"); }
+    return linked;
+}
+
+fn _linked_source(source, modules) {
+    if type(source) != "string" {
+        return map{ ok: false,
+            error: "dependency analysis did not retain an immutable linked-source snapshot" };
     }
-    if not str_contains(source, "import(") { return map{ ok: true, source: source, modules: 0 }; }
-    let INLINER = import("stdlib:source_inliner.sapp");
-    let linked = INLINER.inline_file_prefixed(source_path);
-    if not linked.ok { return map{ ok: false, error: try linked.reason catch "source linking failed" }; }
-    return map{ ok: true, source: linked.source, modules: linked.modules };
+    return map{ ok: true, source: source, modules: modules };
 }
 
 fn _artifact_meta(path) {
@@ -284,9 +292,102 @@ fn _artifact_meta(path) {
     };
 }
 
-fn _direct_build(source_path, output_path, source, plan, options, shared_session = nil,
-    security_report = nil) {
-    let linked = _linked_source(source_path, source, security_report);
+fn _artifact_meta_bytes(bytes) {
+    if type(bytes) != "array" or len(bytes) < 1 or len(bytes) > MAX_ARTIFACT_BYTES {
+        return map{ ok: false, bytes: 0, digest: nil };
+    }
+    return map{
+        ok: true, bytes: len(bytes), digest: sha256(base64_encode_bytes(bytes)),
+        digest_format: "sha256-base64-content-v1"
+    };
+}
+
+fn _protect_executable(path) {
+    if platform() != "linux" { return map{ ok: false, error: "executable protection unavailable" }; }
+    let parent = DIRFS.open_absolute(path_dirname(path), false, false);
+    if not parent.ok { return parent; }
+    let protected = DIRFS.protect_executable(parent, path_basename(path));
+    DIRFS.close(parent);
+    return protected;
+}
+
+fn _protect_result_executable(result) {
+    if not (try result.executable catch false) { return map{ ok: true, skipped: true }; }
+    return _protect_executable(result.final_output);
+}
+
+fn _operation_ok(value) { return try value.ok catch false; }
+
+fn _remove_published_artifact(path) {
+    if not _valid_path(path) {
+        return map{ ok: false, path: path, absent: false,
+            error: "published artifact path is invalid" };
+    }
+    let removed = SECURE.remove_file(path, false);
+    let absent = _operation_ok(removed) and (try removed.namespace_absent catch false);
+    return map{
+        ok: absent, path: path, absent: absent,
+        error: if absent { "" } else { try removed.error catch "artifact removal failed" }
+    };
+}
+
+fn _publication_failure(message, path) {
+    let cleanup = _remove_published_artifact(path);
+    let reason = message;
+    if not cleanup.ok {
+        reason = reason + "; published artifact cleanup failed: "
+            + str(try cleanup.error catch "artifact may remain visible");
+    }
+    return map{ ok: false, error: reason, output: path,
+        output_removed: cleanup.ok and cleanup.absent,
+        cleanup_verified: cleanup.ok and cleanup.absent };
+}
+
+fn _with_stage_evidence(failure, backend_result) {
+    if map_has(backend_result, "stage_cleanup_verified") {
+        failure.stage_cleanup_verified = backend_result.stage_cleanup_verified;
+    }
+    if map_has(backend_result, "stage_entries_removed") {
+        failure.stage_entries_removed = backend_result.stage_entries_removed;
+    }
+    return failure;
+}
+
+fn _publish_result(result) {
+    let meta = _artifact_meta_bytes(try result.artifact_bytes catch nil);
+    if not meta.ok {
+        return _with_stage_evidence(
+            map{ ok: false, publication_attempted: false,
+                error: "backend produced an invalid bounded artifact" }, result);
+    }
+    if not _operation_ok(SECURE.write_atomic(
+        result.final_output, result.artifact_bytes, true, false)) {
+        return _with_stage_evidence(
+            map{ ok: false, publication_attempted: true,
+                error: "atomic artifact publication failed",
+                output: result.final_output, output_removed: false, cleanup_verified: false },
+            result);
+    }
+    if not _operation_ok(_protect_result_executable(result)) {
+        return _with_stage_evidence(_publication_failure(
+            "published executable permission could not be set", result.final_output), result);
+    }
+    let verified = _artifact_meta(result.final_output);
+    if not verified.ok or verified.digest != meta.digest or verified.bytes != meta.bytes {
+        return _with_stage_evidence(_publication_failure(
+            "published artifact digest verification failed", result.final_output), result);
+    }
+    result.output = result.final_output;
+    result.bytes = meta.bytes; result.digest = meta.digest;
+    result.digest_format = meta.digest_format;
+    result.atomic_publication = true;
+    result.symlink_target_followed = false;
+    map_remove(result, "artifact_bytes"); map_remove(result, "final_output");
+    return result;
+}
+
+fn _direct_build(output_path, linked_source, modules, plan, options, shared_session = nil) {
+    let linked = _linked_source(linked_source, modules);
     if not linked.ok { return map{ ok: false, error: linked.error }; }
     let state = shared_session;
     if state == nil {
@@ -299,19 +400,12 @@ fn _direct_build(source_path, output_path, source, plan, options, shared_session
     let hits_before = state.hits;
     let misses_before = state.misses;
     let compiled_before = state.compiled;
-    let built = SESSION.compile_one(state, linked.source, output_path);
+    let built = SESSION.compile_bytes(state, linked.source);
     if not built.ok { return map{ ok: false, error: built.error, session: state }; }
-    let chmod = try proc_spawn_wait("chmod", ["700", output_path]) catch nil;
-    if chmod == nil or (try chmod.exit_code catch 1) != 0 {
-        try fs_remove(output_path) catch nil;
-        return map{ ok: false, error: "artifact published but executable permission could not be set", session: state };
-    }
-    let meta = _artifact_meta(output_path);
-    if not meta.ok { return map{ ok: false, error: "published artifact verification failed", session: state }; }
     return map{
-        ok: true, output: output_path, kind: "native-elf-x86-64", standalone: true,
-        runtime_required: false, modules: linked.modules, bytes: meta.bytes,
-        digest: meta.digest, digest_format: meta.digest_format,
+        ok: true, final_output: output_path, artifact_bytes: built.binary, executable: true,
+        kind: "native-elf-x86-64", standalone: true,
+        runtime_required: false, modules: linked.modules,
         cache_hits: state.hits - hits_before, cache_misses: state.misses - misses_before,
         compiled: state.compiled - compiled_before,
         session_totals: map{ cache_hits: state.hits, cache_misses: state.misses,
@@ -320,7 +414,6 @@ fn _direct_build(source_path, output_path, source, plan, options, shared_session
 }
 
 fn _c99_options(goal, options) {
-    let DIST = import("stdlib:dist.sapp");
     let cfg = DIST.default_opts();
     if goal == "size" { cfg.opt = "size"; cfg.lto = true; }
     elif goal == "speed" { cfg.opt = "max"; cfg.lto = true; }
@@ -331,16 +424,29 @@ fn _c99_options(goal, options) {
     return cfg;
 }
 
-fn _c99_build(source_path, output_path, plan, options) {
-    let DIST = import("stdlib:dist.sapp");
-    let result = DIST.native(source_path, output_path, _c99_options(plan.goal, options), plan.target);
-    if not result.ok { return map{ ok: false, error: try result.reason catch (try result.stderr catch "C99 build failed") }; }
-    let meta = _artifact_meta(result.output);
-    if not meta.ok { return map{ ok: false, error: "C99 artifact verification failed" }; }
+fn _c99_build(output_path, linked_source, modules, plan, options) {
+    let linked = _linked_source(linked_source, modules);
+    if not linked.ok { return map{ ok: false, error: linked.error }; }
+    let result = DIST.compile_source_c99_blob(linked.source, plan.target,
+        _c99_options(plan.goal, options));
+    if not result.ok {
+        return map{ ok: false,
+            error: try result.reason catch (try result.stderr catch "C99 build failed"),
+            publication_attempted: false,
+            stage_cleanup_verified: try result.stage_cleanup_verified catch false,
+            stage_entries_removed: try result.stage_entries_removed catch 0 };
+    }
+    let extension = try DIST.target_by_name(plan.target).ext catch "";
     return map{
-        ok: true, output: result.output, kind: "native-c99", standalone: try result.standalone catch false,
-        runtime_required: false, compiler: try result.compiler catch nil, bytes: meta.bytes,
-        digest: meta.digest, digest_format: meta.digest_format, inlined: try result.inlined catch false
+        ok: true, final_output: output_path + extension, artifact_bytes: result.blob, executable: true,
+        kind: "native-c99", standalone: try result.standalone catch false,
+        runtime_required: false, compiler: try result.compiler catch nil,
+        inlined: try result.inlined catch false, modules: linked.modules,
+        source_transport: try result.source_transport catch "private-stdin",
+        bounded_process: try result.bounded_process catch false,
+        compiler_stage_private: true,
+        stage_cleanup_verified: try result.stage_cleanup_verified catch false,
+        stage_entries_removed: try result.stage_entries_removed catch 0
     };
 }
 
@@ -349,50 +455,63 @@ fn _without_suffix(value, suffix) {
     return value;
 }
 
-fn _pbck_build(source_path, output_path) {
-    let DIST = import("stdlib:dist.sapp");
-    let result = DIST.bundle_pbck(source_path, _without_suffix(output_path, ".pbck"), map{ optimize: true });
+fn _pbck_build(output_path, linked_source, modules) {
+    let linked = _linked_source(linked_source, modules);
+    if not linked.ok { return map{ ok: false, error: linked.error }; }
+    let result = DIST.bundle_pbck_blob(linked.source, map{ optimize: true });
     if not result.ok { return map{ ok: false, error: try result.reason catch "PBCK build failed" }; }
-    let meta = _artifact_meta(result.out);
-    if not meta.ok { return map{ ok: false, error: "PBCK artifact verification failed" }; }
     return map{
-        ok: true, output: result.out, kind: "portable-pbck", standalone: false,
-        runtime_required: true, modules: result.modules, bytes: meta.bytes,
-        digest: meta.digest, digest_format: meta.digest_format,
-        optimized: result.optimized
+        ok: true, final_output: _without_suffix(output_path, ".pbck") + ".pbck",
+        artifact_bytes: result.blob, executable: false,
+        kind: "portable-pbck", standalone: false, runtime_required: true,
+        modules: linked.modules, optimized: result.optimized,
+        source_transport: result.source_transport
     };
 }
 
 fn _run_plan(plan, source, options, shared_session = nil) {
     let attempts = [];
+    let last_result = map{};
     let i = 0;
     while i < len(plan.strategies) {
         let backend = plan.strategies[i];
-        let result = nil;
+        let result = map{};
         if backend == "direct-x64" {
-            result = _direct_build(plan.source, plan.output, source.source, plan, options,
-                shared_session, source.security_analysis);
+            result = _direct_build(plan.output, source.linked_source, source.linked_modules,
+                plan, options, shared_session);
         } elif backend == "c99" {
-            result = _c99_build(plan.source, plan.output, plan, options);
+            result = _c99_build(plan.output, source.linked_source, source.linked_modules,
+                plan, options);
         } else {
-            result = _pbck_build(plan.source, plan.output);
+            result = _pbck_build(plan.output, source.linked_source, source.linked_modules);
         }
+        last_result = result;
         array_push(attempts, _attempt(backend, result.ok, if result.ok { "built" } else { result.error }));
         if result.ok {
             if (try source.security_analysis.format catch "") == DEP_SECURITY.FORMAT {
                 let snapshot = DEP_SECURITY.verify_snapshot(source.security_analysis);
                 result.security_snapshot = snapshot;
                 if not snapshot.ok {
-                    try fs_remove(result.output) catch nil;
                     return map{ ok: false, format: REPORT_FORMAT, automated: true,
-                        output: result.output, goal: plan.goal, target: plan.target,
+                        output: plan.output, goal: plan.goal, target: plan.target,
                         backend: backend, attempts: attempts, plan: plan,
                         security_analysis: source.security_analysis, security_snapshot: snapshot,
-                        error: "source dependency changed after security analysis; artifact removed" };
+                        publication_attempted: false,
+                        error: "source dependency changed after security analysis; artifact not published" };
                 }
-                if map_has(source.security_analysis, "linked_source") {
-                    map_remove(source.security_analysis, "linked_source");
-                }
+            }
+            result = _publish_result(result);
+            if not result.ok {
+                return map{ ok: false, format: REPORT_FORMAT, automated: true,
+                    output: try result.output catch plan.output,
+                    output_removed: try result.output_removed catch false,
+                    cleanup_verified: try result.cleanup_verified catch false,
+                    stage_cleanup_verified: try result.stage_cleanup_verified catch nil,
+                    stage_entries_removed: try result.stage_entries_removed catch nil,
+                    goal: plan.goal, target: plan.target,
+                    backend: backend, attempts: attempts, plan: plan,
+                    security_analysis: source.security_analysis,
+                    error: result.error };
             }
             result.format = REPORT_FORMAT;
             result.automated = true;
@@ -411,6 +530,9 @@ fn _run_plan(plan, source, options, shared_session = nil) {
     return map{
         ok: false, format: REPORT_FORMAT, automated: true, output: plan.output,
         goal: plan.goal, target: plan.target, attempts: attempts, plan: plan,
+        publication_attempted: try last_result.publication_attempted catch false,
+        stage_cleanup_verified: try last_result.stage_cleanup_verified catch nil,
+        stage_entries_removed: try last_result.stage_entries_removed catch nil,
         error: if len(attempts) == 0 { "no build attempt was made" } else { attempts[len(attempts) - 1].detail }
     };
 }
@@ -459,6 +581,8 @@ fn smart_build_in_session(build_session, source_path, output_path, options = nil
     let source = _read_source(source_path);
     if not source.ok { return map{ ok: false, format: REPORT_FORMAT, plan: plan, error: source.error }; }
     source.security_analysis = _security_gate(source.source, source_path, options);
+    source.linked_source = _take_linked_source(source.security_analysis);
+    source.linked_modules = try source.security_analysis.whole_program_modules catch 0;
     if not source.security_analysis.ok or not source.security_analysis.passed {
         return map{ ok: false, format: REPORT_FORMAT, plan: plan,
             security_analysis: source.security_analysis,
@@ -476,6 +600,8 @@ fn _execute_many_plan(plan, job, options, state) {
         else { map{ ok: false, error: str_join(plan.errors, "; ") } };
     if source.ok {
         source.security_analysis = _security_gate(source.source, job.source, options);
+        source.linked_source = _take_linked_source(source.security_analysis);
+        source.linked_modules = try source.security_analysis.whole_program_modules catch 0;
         if not source.security_analysis.ok or not source.security_analysis.passed {
             source.ok = false;
             source.error = try source.security_analysis.error catch
@@ -534,8 +660,7 @@ fn smart_project(project_dir, output_path, options = nil) {
     let manifest_path = path_join(project_dir, "pblang.toml");
     let entry = "";
     if fs_exists(manifest_path) {
-        let MV = import("stdlib:manifest_validate.sapp");
-        let checked = MV.validate_manifest_file(manifest_path);
+        let checked = MANIFEST.validate_manifest_file(manifest_path);
         if not checked.ok { return map{ ok: false, error: "invalid pblang.toml: " + str_join(checked.errors, "; ") }; }
         entry = checked.package.entry;
         if entry != nil and entry != "" and not _safe_relative(entry) { return map{ ok: false, error: "manifest entry must stay inside the project" }; }
@@ -560,15 +685,22 @@ fn smart_project(project_dir, output_path, options = nil) {
     result.entry = entry;
     let lock_path = path_join(project_dir, "pblang.lock");
     if result.ok and fs_exists(lock_path) and _get(project_options, "portable_lock", true) {
-        let LOCK = import("stdlib:portable_lock.sapp");
-        let published = try LOCK.publish(project_dir) catch map{
+        let published = try PORTABLE_LOCK.publish(project_dir) catch map{
             ok: false, error: "portable lock publication failed"
         };
         if not published.ok {
-            try fs_remove(output_path) catch nil;
+            let artifact_path = try result.output catch output_path;
+            let cleanup = _remove_published_artifact(artifact_path);
+            let reason = try published.error catch "portable lock publication failed";
+            if not cleanup.ok {
+                reason = reason + "; built artifact removal failed: "
+                    + str(try cleanup.error catch "artifact remains visible");
+            }
             return map{ ok: false, format: REPORT_FORMAT, project: project_dir,
-                entry: entry, output_removed: true,
-                error: try published.error catch "portable lock publication failed" };
+                entry: entry, output: artifact_path,
+                output_removed: cleanup.ok and cleanup.absent,
+                cleanup_verified: cleanup.ok and cleanup.absent,
+                error: reason };
         }
         result.portable_lock = map{ ok: true, rewritten: published.rewritten,
             absolute_paths_exposed: false };
@@ -591,7 +723,7 @@ fn compile(source_path, output_path) {
 }
 
 fn _pblang_bin() {
-    return import("stdlib:dist.sapp").runtime_binary().path;
+    return DIST.runtime_binary().path;
 }
 
 fn transpile(source_path, output_path) {

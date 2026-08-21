@@ -13,6 +13,8 @@ let LIBC_PATHS = [
 ];
 
 let RENAME_NOREPLACE = import("stdlib:linux_rename_noreplace.sapp");
+let LINKAT_HELD = import("stdlib:linux_linkat_held.sapp");
+let NATIVE_CRYPTO = import("stdlib:native_crypto_accel.sapp");
 
 let AT_FDCWD = -100;
 let AT_REMOVEDIR = 512;
@@ -20,6 +22,7 @@ let O_RDONLY = 0; let O_WRONLY = 1; let O_RDWR = 2;
 let O_CREAT = 64; let O_EXCL = 128;
 let O_NONBLOCK = 2048;
 let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
+let O_TMPFILE = 4259840;
 let MFD_CLOEXEC = 1; let MFD_ALLOW_SEALING = 2;
 let F_GETFD = 1; let F_SETFD = 2; let FD_CLOEXEC = 1;
 let F_ADD_SEALS = 1033; let F_GET_SEALS = 1034;
@@ -29,7 +32,8 @@ let IMMUTABLE_SEALS = F_SEAL_SEAL + F_SEAL_SHRINK + F_SEAL_GROW + F_SEAL_WRITE;
 let LOCK_EX = 2; let LOCK_NB = 4; let LOCK_UN = 8;
 let MODE_FILE = 384; let MODE_DIR = 448;
 let MAX_PATH = 4096; let MAX_COMPONENT = 255;
-let _rename_noreplace_x64_cache = nil;
+let _rename_noreplace_x64_cache = map{ known: false, supported: false };
+let _linkat_empty_x64_cache = map{ known: false, supported: false };
 
 fn _error(message) { return map{ ok: false, error: message }; }
 fn _first_existing(paths) {
@@ -78,63 +82,93 @@ fn _absolute_components(path) {
     return out;
 }
 
+// The bootstrap typed-FFI table is process-global and temporarily removes a
+// library handle while dispatching a call. Parallel isolated VMs can therefore
+// observe the shared handle as unavailable. Keep the fast cached path, then use
+// one independently loaded libc handle for this fixed call only.
+fn _typed_call(fs, symbol, signature, args) {
+    let direct = try map{ ok: true,
+        value: ffi_call_typed(fs.libc, symbol, signature, args) }
+        catch map{ ok: false };
+    if direct.ok { return direct.value; }
+    let libc_path = try fs.libc_path catch nil;
+    if type(libc_path) != "string" or libc_path == "" { throw "linux_dirfs: libc handle unavailable"; }
+    let transient = try ffi_load(libc_path) catch nil;
+    if transient == nil { throw "linux_dirfs: transient libc handle unavailable"; }
+    let fallback = try map{ ok: true,
+        value: ffi_call_typed(transient, symbol, signature, args) }
+        catch map{ ok: false };
+    try ffi_close(transient) catch nil;
+    if not fallback.ok { throw "linux_dirfs: typed libc call unavailable"; }
+    return fallback.value;
+}
+
 fn _call(fs, symbol, signature, args) {
     // Keep every native symbol and ABI literal at the FFI boundary. The
     // caller-facing selector is accepted only for internal compatibility and
     // can never become an arbitrary dlsym target through tainted data.
     if symbol == "close" and signature == "i32->i32" {
-        return try ffi_call_typed(fs.libc, "close", "i32->i32", args) catch -1;
+        return try _typed_call(fs, "close", "i32->i32", args) catch -1;
     }
     if symbol == "strdup" and signature == "string->ptr" {
-        return try ffi_call_typed(fs.libc, "strdup", "string->ptr", args) catch -1;
+        return try _typed_call(fs, "strdup", "string->ptr", args) catch -1;
     }
     if symbol == "free" and signature == "ptr->void" {
-        return try ffi_call_typed(fs.libc, "free", "ptr->void", args) catch -1;
+        return try _typed_call(fs, "free", "ptr->void", args) catch -1;
     }
     if symbol == "calloc" and signature == "i64,i64->ptr" {
-        return try ffi_call_typed(fs.libc, "calloc", "i64,i64->ptr", args) catch -1;
+        return try _typed_call(fs, "calloc", "i64,i64->ptr", args) catch -1;
     }
     if symbol == "read" and signature == "i32,ptr,i64->i64" {
-        return try ffi_call_typed(fs.libc, "read", "i32,ptr,i64->i64", args) catch -1;
+        return try _typed_call(fs, "read", "i32,ptr,i64->i64", args) catch -1;
+    }
+    if symbol == "pread" and signature == "i32,ptr,i64,i64->i64" {
+        return try _typed_call(fs, "pread", "i32,ptr,i64,i64->i64", args) catch -1;
     }
     if symbol == "write" and signature == "i32,ptr,i64->i64" {
-        return try ffi_call_typed(fs.libc, "write", "i32,ptr,i64->i64", args) catch -1;
+        return try _typed_call(fs, "write", "i32,ptr,i64->i64", args) catch -1;
+    }
+    if symbol == "fsync" and signature == "i32->i32" {
+        return try _typed_call(fs, "fsync", "i32->i32", args) catch -1;
     }
     if symbol == "openat" and signature == "i32,ptr,i32,i32->i32" {
-        return try ffi_call_typed(fs.libc, "openat", "i32,ptr,i32,i32->i32", args) catch -1;
+        return try _typed_call(fs, "openat", "i32,ptr,i32,i32->i32", args) catch -1;
     }
     if symbol == "mkdirat" and signature == "i32,ptr,i32->i32" {
-        return try ffi_call_typed(fs.libc, "mkdirat", "i32,ptr,i32->i32", args) catch -1;
+        return try _typed_call(fs, "mkdirat", "i32,ptr,i32->i32", args) catch -1;
     }
     if symbol == "unlinkat" and signature == "i32,ptr,i32->i32" {
-        return try ffi_call_typed(fs.libc, "unlinkat", "i32,ptr,i32->i32", args) catch -1;
+        return try _typed_call(fs, "unlinkat", "i32,ptr,i32->i32", args) catch -1;
     }
     if symbol == "renameat" and signature == "i32,ptr,i32,ptr->i32" {
-        return try ffi_call_typed(fs.libc, "renameat", "i32,ptr,i32,ptr->i32", args) catch -1;
+        return try _typed_call(fs, "renameat", "i32,ptr,i32,ptr->i32", args) catch -1;
     }
     if symbol == "getpid" and signature == "->i32" {
-        return try ffi_call_typed(fs.libc, "getpid", "->i32", args) catch -1;
+        return try _typed_call(fs, "getpid", "->i32", args) catch -1;
+    }
+    if symbol == "getuid" and signature == "->i32" {
+        return try _typed_call(fs, "getuid", "->i32", args) catch -1;
     }
     if symbol == "fchmod" and signature == "i32,i32->i32" {
-        return try ffi_call_typed(fs.libc, "fchmod", "i32,i32->i32", args) catch -1;
+        return try _typed_call(fs, "fchmod", "i32,i32->i32", args) catch -1;
     }
     if symbol == "flock" and signature == "i32,i32->i32" {
-        return try ffi_call_typed(fs.libc, "flock", "i32,i32->i32", args) catch -1;
+        return try _typed_call(fs, "flock", "i32,i32->i32", args) catch -1;
     }
     if symbol == "dup" and signature == "i32->i32" {
-        return try ffi_call_typed(fs.libc, "dup", "i32->i32", args) catch -1;
+        return try _typed_call(fs, "dup", "i32->i32", args) catch -1;
     }
     if symbol == "fcntl" and signature == "i32,i32,i32->i32" {
-        return try ffi_call_typed(fs.libc, "fcntl", "i32,i32,i32->i32", args) catch -1;
+        return try _typed_call(fs, "fcntl", "i32,i32,i32->i32", args) catch -1;
     }
     if symbol == "memfd_create" and signature == "string,i32->i32" {
-        return try ffi_call_typed(fs.libc, "memfd_create", "string,i32->i32", args) catch -1;
+        return try _typed_call(fs, "memfd_create", "string,i32->i32", args) catch -1;
     }
     if symbol == "sendfile" and signature == "i32,i32,ptr,i64->i64" {
-        return try ffi_call_typed(fs.libc, "sendfile", "i32,i32,ptr,i64->i64", args) catch -1;
+        return try _typed_call(fs, "sendfile", "i32,i32,ptr,i64->i64", args) catch -1;
     }
     if symbol == "lseek" and signature == "i32,i64,i32->i64" {
-        return try ffi_call_typed(fs.libc, "lseek", "i32,i64,i32->i64", args) catch -1;
+        return try _typed_call(fs, "lseek", "i32,i64,i32->i64", args) catch -1;
     }
     return -1;
 }
@@ -145,7 +179,10 @@ fn _i32(value) {
     if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; }
     return value;
 }
-fn _close_fd(fs, fd) { if fd >= 0 { _i32(_call(fs, "close", "i32->i32", [fd])); } }
+fn _close_fd(fs, fd) {
+    if fd < 0 { return true; }
+    return _i32(_call(fs, "close", "i32->i32", [fd])) == 0;
+}
 fn _fd_path(fd) { return "/proc/self/fd/" + str(fd); }
 fn _stat_program() {
     let candidates = ["/usr/bin/stat", "/bin/stat"];
@@ -192,6 +229,21 @@ fn _mode_verified(fs, fd, expected) {
     let path = sanitize_path("/proc/" + str(pid) + "/fd/" + str(fd));
     let checked = try proc_spawn_wait(stat, ["-L", "-c", "%a", path]) catch nil;
     return checked != nil and checked.exit_code == 0 and str_trim(checked.stdout) == expected;
+}
+
+fn _owner_verified(fs, fd) {
+    let pid = _i32(_call(fs, "getpid", "->i32", []));
+    let uid = _i32(_call(fs, "getuid", "->i32", []));
+    if pid <= 0 or uid < 0 { return map{ok:false}; }
+    let stat = _stat_program(); if stat == nil { return map{ok:false}; }
+    let path = sanitize_path("/proc/" + str(pid) + "/fd/" + str(fd));
+    let checked = try proc_spawn_wait(stat, ["-L", "-c", "%u", path]) catch nil;
+    if type(checked) != "map" { return map{ok:false}; }
+    let observed = if checked.exit_code == 0 {
+        _decimal(str_trim(checked.stdout))
+    } else { nil };
+    return map{ok:observed != nil and observed == uid,
+        current_uid:uid,owner_uid:observed};
 }
 
 fn _decimal(value) {
@@ -253,7 +305,7 @@ fn open(root, create = true, protect_root = false) {
     let parts = _root_components(root); if parts == nil { return _error("root must be a safe relative path"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
-    let holder = map{ libc: libc };
+    let holder = map{ libc: libc, libc_path: host.libc };
     // Hold the current directory first, then resolve every caller-controlled
     // component relative to a held descriptor. O_NOFOLLOW on one multi-part
     // open protects only its final component and would leave intermediate
@@ -293,7 +345,7 @@ fn open_absolute(root, create = true, protect_root = true) {
     let parts = _absolute_components(root); if parts == nil { return _error("root must be a safe absolute path"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
-    let holder = map{ libc: libc };
+    let holder = map{ libc: libc, libc_path: host.libc };
     let current = _openat(holder, AT_FDCWD, "/", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
     if current < 0 { ffi_close(libc); return _error("filesystem root cannot be opened"); }
     let i = 0;
@@ -328,7 +380,7 @@ fn open_current_process_net() {
     let host = available(); if not host.ok { return _error("Linux libc and procfs are required"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
-    let holder = map{ libc: libc };
+    let holder = map{ libc: libc, libc_path: host.libc };
     let pid = _i32(_call(holder, "getpid", "->i32", []));
     ffi_close(libc);
     if pid <= 0 { return _error("current process identity is unavailable"); }
@@ -339,11 +391,12 @@ fn open_current_process_net() {
 
 fn close(fs) {
     if fs == nil or not is_map(fs) or (try fs.closed catch true) { return false; }
+    let closed = true;
     let children = try fs.child_fds catch map{};
     let keys = map_keys(children);
     for i len(keys) {
         let fd = try parse_number(keys[i]) catch -1;
-        if fd >= 0 { _close_fd(fs, fd); }
+        if fd >= 0 and not _close_fd(fs, fd) { closed = false; }
     }
     fs.child_fds = map{};
     let locks = try fs.lock_fds catch map{};
@@ -352,11 +405,14 @@ fn close(fs) {
         let fd = try parse_number(lock_keys[i]) catch -1;
         if fd >= 0 {
             _i32(_call(fs, "flock", "i32,i32->i32", [fd, LOCK_UN]));
-            _close_fd(fs, fd);
+            if not _close_fd(fs, fd) { closed = false; }
         }
     }
     fs.lock_fds = map{};
-    _close_fd(fs, fs.root_fd); ffi_close(fs.libc); fs.closed = true; fs.root_fd = -1; return true;
+    if not _close_fd(fs, fs.root_fd) { closed = false; }
+    let library_closed = try { ffi_close(fs.libc); true } catch false;
+    fs.closed = true; fs.root_fd = -1;
+    return closed and library_closed;
 }
 
 // Acquire an advisory exclusive lock on a descriptor-bound private file.
@@ -390,23 +446,29 @@ fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10) {
     let private_mode_verified = _mode_verified(fs, fd, "600");
     let started = try now_ms() catch 0;
     let attempts = 0;
-    while true {
+    // timeout_ms was admitted in 0..300000 above and remains immutable. Keeping
+    // that contract in the loop condition also lets retained bootstrap linters
+    // walk the body; elapsed time below is still the actual termination bound.
+    while timeout_ms >= 0 {
         attempts = attempts + 1;
         let rc = _i32(_call(fs, "flock", "i32,i32->i32", [fd, LOCK_EX + LOCK_NB]));
         if rc == 0 {
             if not map_has(fs, "lock_fds") or type(fs.lock_fds) != "map" { fs.lock_fds = map{}; }
             fs.lock_fds[str(fd)] = true;
             let finished = try now_ms() catch started;
+            let waited_ms = 0;
+            if finished >= started { waited_ms = finished - started; }
             return map{
                 ok: true, format: "pblang.linux-dirfs.lock.v1", path: path,
                 fd: fd, owner_fd: fs.root_fd, active: true, exclusive: true,
                 descriptor_bound: true, attempts: attempts,
                 private_mode_verified: private_mode_verified,
-                waited_ms: if finished >= started { finished - started } else { 0 }
+                waited_ms: waited_ms
             };
         }
         let current = try now_ms() catch started + timeout_ms;
-        let elapsed = if current >= started { current - started } else { timeout_ms };
+        let elapsed = timeout_ms;
+        if current >= started { elapsed = current - started; }
         if elapsed >= timeout_ms {
             _close_fd(fs, fd);
             return map{ ok: false, error: "exclusive lock remained busy", timeout: true,
@@ -443,6 +505,22 @@ fn descriptor_path(fs) {
     let pid = _i32(_call(fs, "getpid", "->i32", []));
     if pid <= 0 { return _error("process identity is unavailable"); }
     return map{ ok: true, path: "/proc/" + str(pid) + "/fd/" + str(fs.root_fd), descriptor_bound: true };
+}
+
+// Verify the held root without changing an existing caller directory.
+fn private_root_status(fs) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true)
+       or (try fs.root_fd catch -1) < 0 {
+        return _error("directory root is closed");
+    }
+    let owner = _owner_verified(fs, fs.root_fd);
+    let mode_private = _mode_verified(fs, fs.root_fd, "700");
+    return map{ok:type(owner) == "map" and owner.ok and mode_private,
+        format:"pblang.linux-dirfs.private-root.v1",
+        descriptor_bound:true,owned_by_current_uid:try owner.ok catch false,
+        current_uid:try owner.current_uid catch nil,
+        owner_uid:try owner.owner_uid catch nil,
+        mode:"700",mode_private:mode_private};
 }
 
 // Duplicate a held directory descriptor for one child process. dup() clears
@@ -491,7 +569,7 @@ fn adopt_inherited_directory(fd, protect_root = true) {
     if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
-    let holder = map{ libc: libc };
+    let holder = map{ libc: libc, libc_path: host.libc };
     let owned = _i32(_call(holder, "dup", "i32->i32", [fd]));
     if owned < 0 {
         ffi_close(libc); return _error("inherited directory descriptor cannot be duplicated");
@@ -552,6 +630,242 @@ fn child_file_descriptor(fs, path) {
         descriptor_bound: true, path: path };
 }
 
+fn _held_file_valid(fs, held) {
+    return fs != nil and is_map(fs) and not (try fs.closed catch true)
+        and held != nil and is_map(held) and (try held.active catch false)
+        and (try held.owner_fd catch -1) == (try fs.root_fd catch -2)
+        and (try held.fd catch -1) >= 0
+        and map_has(try fs.child_fds catch map{}, str(try held.fd catch -1));
+}
+
+// Snapshot one no-follow regular file into an anonymous memfd, then seal every
+// content mutation before returning it. Subsequent digest, probe and copy
+// operations therefore observe one immutable object even if the namespace or
+// original inode is changed concurrently.
+fn sealed_snapshot_file_descriptor(fs, path, max_bytes = 268435456) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true)
+       or (try fs.root_fd catch -1) < 0
+       or type(max_bytes) != "number" or max_bytes != num_floor(max_bytes)
+       or max_bytes < 1 or max_bytes > 268435456 {
+        return _error("invalid sealed snapshot policy");
+    }
+    let parent = _parent(fs, path, false); if not parent.ok { return parent; }
+    let source = _openat(fs, parent.fd, parent.name,
+        O_RDONLY + O_NOFOLLOW + O_CLOEXEC, 0);
+    _close_fd(fs, parent.fd);
+    if source < 0 { return _error("snapshot source cannot be opened without following links"); }
+    let metadata = _descriptor_metadata(fs, source, path);
+    let size = _call(fs, "lseek", "i32,i64,i32->i64", [source, 0, 2]);
+    if not metadata.ok or (try metadata.kind catch "") != "file"
+       or size < 1 or size > max_bytes
+       or _call(fs, "lseek", "i32,i64,i32->i64", [source, 0, 0]) != 0 {
+        _close_fd(fs, source); return _error("snapshot source is outside the regular-file policy");
+    }
+    let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-sealed-file-snapshot", MFD_CLOEXEC + MFD_ALLOW_SEALING]));
+    if snapshot < 0 {
+        _close_fd(fs, source); return _error("sealed file snapshot is unavailable");
+    }
+    let copied = 0; let failed = false;
+    while copied < size and not failed {
+        let count = _call(fs, "sendfile", "i32,i32,ptr,i64->i64",
+            [snapshot, source, 0, size - copied]);
+        if count <= 0 or count > size - copied { failed = true; }
+        else { copied = copied + count; }
+    }
+    let source_close_ok = _close_fd(fs, source);
+    let protected = not failed and copied == size
+        and _i32(_call(fs, "fchmod", "i32,i32->i32", [snapshot, MODE_FILE])) == 0
+        and _mode_verified(fs, snapshot, "600")
+        and _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 2]) == size
+        and _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) == 0
+        and _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+            [snapshot, F_ADD_SEALS, IMMUTABLE_SEALS])) == 0;
+    let seals = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [snapshot, F_GET_SEALS, 0]));
+    if type(source_close_ok) != "bool" or not source_close_ok {
+        _close_fd(fs, snapshot); return _error("snapshot source descriptor could not be closed");
+    }
+    if type(protected) != "bool" or not protected {
+        _close_fd(fs, snapshot); return _error("file snapshot could not be copied and protected completely");
+    }
+    if seals < 0 or bit_and(seals, IMMUTABLE_SEALS) != IMMUTABLE_SEALS {
+        _close_fd(fs, snapshot); return _error("file snapshot could not be copied and sealed completely");
+    }
+    if not map_has(fs, "child_fds") or type(fs.child_fds) != "map" { fs.child_fds = map{}; }
+    fs.child_fds[str(snapshot)] = true;
+    return map{
+        ok: true, format: "pblang.linux-dirfs.sealed-file-snapshot.v1",
+        fd: snapshot, owner_fd: fs.root_fd, active: true, inheritable: false,
+        cloexec: true, descriptor_bound: true, nofollow: true,
+        path_reopened: false, path: path, size: size, mode: "600",
+        kernel_memory_backed: true, immutable: true, write_sealed: true,
+        grow_sealed: true, shrink_sealed: true, further_seals_locked: true,
+        seals: seals, bounded_memory: true
+    };
+}
+
+fn held_base64_sha256(fs, held, offset = 0, count = nil) {
+    if not _held_file_valid(fs, held) or not (try held.immutable catch false) {
+        return _error("immutable held file descriptor is unavailable");
+    }
+    if count == nil { count = held.size - offset; }
+    if type(offset) != "number" or offset != num_floor(offset) or offset < 0
+       or type(count) != "number" or count != num_floor(count) or count < 0
+       or offset > held.size or count > held.size - offset {
+        return _error("held digest range is outside the immutable snapshot");
+    }
+    let crypto = NATIVE_CRYPTO.open();
+    if not crypto.ok { return _error("trusted streaming crypto backend is unavailable"); }
+    let result = NATIVE_CRYPTO.sha256_base64_fd_range(crypto, held.fd, offset, count);
+    NATIVE_CRYPTO.close(crypto);
+    if not result.ok { return _error(try result.error catch "held streaming digest failed"); }
+    result.immutable_snapshot = true; result.path_reopened = false;
+    return result;
+}
+
+fn held_magic_offsets(fs, held, magic, max_matches = 128) {
+    if not _held_file_valid(fs, held) or not (try held.immutable catch false) {
+        return _error("immutable held file descriptor is unavailable");
+    }
+    let crypto = NATIVE_CRYPTO.open();
+    if not crypto.ok { return _error("trusted native scanner backend is unavailable"); }
+    let result = NATIVE_CRYPTO.scan_fd_magic(crypto, held.fd, held.size,
+        magic, max_matches);
+    NATIVE_CRYPTO.close(crypto);
+    if not result.ok { return _error(try result.error catch "held native scan failed"); }
+    result.immutable_snapshot = true; result.path_reopened = false;
+    return result;
+}
+
+fn read_held_range_bytes(fs, held, offset, count) {
+    if not _held_file_valid(fs, held) or not (try held.immutable catch false)
+       or type(offset) != "number" or offset != num_floor(offset) or offset < 0
+       or type(count) != "number" or count != num_floor(count) or count < 0
+       or count > 1048576 or offset > held.size or count > held.size - offset {
+        return _error("held read range is outside policy");
+    }
+    if count == 0 { return map{ok:true,bytes:[],size:0,offset:offset,
+        descriptor_bound:true,immutable_snapshot:true}; }
+    let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-held-range", MFD_CLOEXEC]));
+    let buffer = _call(fs, "calloc", "i64,i64->ptr", [1, count]);
+    if snapshot < 0 or buffer == nil or buffer == 0 {
+        _close_fd(fs, snapshot); _free(fs, buffer);
+        return _error("held range buffer is unavailable");
+    }
+    let loaded = 0; let failed = false;
+    while loaded < count and not failed {
+        let got = _call(fs, "pread", "i32,ptr,i64,i64->i64",
+            [held.fd, buffer + loaded, count - loaded, offset + loaded]);
+        if got <= 0 or got > count - loaded { failed = true; }
+        else { loaded = loaded + got; }
+    }
+    let written = 0;
+    while written < count and not failed {
+        let n = _call(fs, "write", "i32,ptr,i64->i64",
+            [snapshot, buffer + written, count - written]);
+        if n <= 0 or n > count - written { failed = true; }
+        else { written = written + n; }
+    }
+    _free(fs, buffer);
+    if failed or _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) != 0 {
+        _close_fd(fs, snapshot); return _error("held range could not be copied completely");
+    }
+    let bytes = try fs_read_bytes(_fd_path(snapshot)) catch nil;
+    _close_fd(fs, snapshot);
+    if not is_array(bytes) or len(bytes) != count {
+        return _error("held range could not be loaded consistently");
+    }
+    return map{ok:true,bytes:bytes,size:count,offset:offset,
+        descriptor_bound:true,immutable_snapshot:true,path_reopened:false};
+}
+
+// Open, bound, and measure one exact executable object before handing that
+// same descriptor to a child. The namespace path is never reopened after the
+// digest check, so replacement of the directory entry cannot change what is
+// executed.
+fn verified_child_file_descriptor(fs, path, expected_sha256,
+                                  max_bytes = 268435456, inheritable = true) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true)
+       or (try fs.root_fd catch -1) < 0 {
+        return _error("directory root is closed");
+    }
+    if type(expected_sha256) != "string" or
+       not regex_match(expected_sha256, "^[0-9a-f]{64}$") or
+       type(max_bytes) != "number" or max_bytes != num_floor(max_bytes) or
+       max_bytes < 1 or max_bytes > 268435456 or type(inheritable) != "bool" {
+        return _error("invalid verified child descriptor policy");
+    }
+    let snapshot = sealed_snapshot_file_descriptor(fs, path, max_bytes);
+    if not snapshot.ok { return snapshot; }
+    let measured = held_base64_sha256(fs, snapshot, 0, snapshot.size);
+    if not measured.ok or measured.sha256 != expected_sha256 {
+        close_child_descriptor(fs, snapshot);
+        return _error("verified child digest does not match policy");
+    }
+    let fd = snapshot.fd; let size = snapshot.size;
+    if _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_DIR])) != 0
+       or not _mode_verified(fs, fd, "700") {
+        close_child_descriptor(fs, snapshot);
+        return _error("verified child snapshot cannot be made executable");
+    }
+    let flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [fd, F_GETFD, 0]));
+    let requested_flags = flags;
+    if inheritable { requested_flags = flags - bit_and(flags, FD_CLOEXEC); }
+    elif flags >= 0 and bit_and(flags, FD_CLOEXEC) == 0 {
+        requested_flags = flags + FD_CLOEXEC;
+    }
+    if flags < 0 or _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+        [fd, F_SETFD, requested_flags])) != 0 {
+        close_child_descriptor(fs, snapshot);
+        return _error("verified child descriptor flags cannot be protected");
+    }
+    let verified = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [fd, F_GETFD, 0]));
+    if verified < 0 or (inheritable and bit_and(verified, FD_CLOEXEC) != 0) or
+       (not inheritable and bit_and(verified, FD_CLOEXEC) == 0) {
+        close_child_descriptor(fs, snapshot);
+        return _error("verified child descriptor flag postcondition failed");
+    }
+    return map{ ok: true, format: "pblang.linux-dirfs.verified-child-descriptor.v1",
+        fd: fd, owner_fd: fs.root_fd, active: true, inheritable: inheritable,
+        cloexec: not inheritable,
+        descriptor_bound: true, nofollow: true, path_reopened: false,
+        path: path, size: size, sha256: expected_sha256,
+        immutable: true, kernel_memory_backed: true, snapshot_before_digest: true,
+        digest_encoding: "sha256(base64(bytes))", bounded_memory: true };
+}
+
+// Create one short-lived inheritable duplicate from a canonical CLOEXEC-held
+// file descriptor. The duplicate shares the verified inode but has independent
+// descriptor flags and ownership, so unrelated children cannot inherit the
+// canonical descriptor.
+fn duplicate_child_file_descriptor(fs, held) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) or
+       held == nil or not is_map(held) or not (try held.active catch false) or
+       (try held.owner_fd catch -1) != (try fs.root_fd catch -2) or
+       (try held.fd catch -1) < 0 or
+       not map_has(try fs.child_fds catch map{}, str(try held.fd catch -1)) {
+        return _error("held child descriptor is unavailable");
+    }
+    let fd = _i32(_call(fs, "dup", "i32->i32", [held.fd]));
+    if fd < 0 { return _error("held child descriptor cannot be duplicated"); }
+    let flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [fd, F_GETFD, 0]));
+    let inheritable_flags = flags - bit_and(flags, FD_CLOEXEC);
+    if flags < 0 or _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+        [fd, F_SETFD, inheritable_flags])) != 0 {
+        _close_fd(fs, fd); return _error("child duplicate cannot be made inheritable");
+    }
+    let verified = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [fd, F_GETFD, 0]));
+    if verified < 0 or bit_and(verified, FD_CLOEXEC) != 0 {
+        _close_fd(fs, fd); return _error("child duplicate inheritance postcondition failed");
+    }
+    fs.child_fds[str(fd)] = true;
+    return map{ ok: true, format: "pblang.linux-dirfs.child-file-duplicate.v1",
+        fd: fd, owner_fd: fs.root_fd, active: true, inheritable: true,
+        cloexec: false, descriptor_bound: true, duplicated_from: held.fd,
+        size: try held.size catch nil, sha256: try held.sha256 catch nil };
+}
+
 // Publish caller-supplied bytes to one child as a kernel-backed immutable
 // object. The descriptor is writable only while it is populated; all content
 // and size mutations are then sealed and verified before FD_CLOEXEC is
@@ -578,8 +892,8 @@ fn sealed_child_bytes(fs, name, bytes) {
     let fd = _i32(_call(fs, "memfd_create", "string,i32->i32",
         [name, MFD_CLOEXEC + MFD_ALLOW_SEALING]));
     if fd < 0 { return _error("sealable kernel memory file is unavailable"); }
-    let wrote = try { fs_write_bytes(_fd_path(fd), bytes); true } catch false;
-    if not wrote {
+    let write_failed = try { fs_write_bytes(_fd_path(fd), bytes); false } catch true;
+    if write_failed {
         _close_fd(fs, fd); return _error("sealed child payload cannot be populated");
     }
     if _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE])) != 0
@@ -649,8 +963,8 @@ fn mutable_snapshot_bytes(fs, name, bytes) {
     }
     let fd = _i32(_call(fs, "memfd_create", "string,i32->i32", [name, MFD_CLOEXEC]));
     if fd < 0 { return _error("anonymous mutable snapshot is unavailable"); }
-    let wrote = try { fs_write_bytes(_fd_path(fd), bytes); true } catch false;
-    if not wrote {
+    let write_failed = try { fs_write_bytes(_fd_path(fd), bytes); false } catch true;
+    if write_failed {
         _close_fd(fs, fd); return _error("mutable snapshot cannot be populated");
     }
     if _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE])) != 0
@@ -694,8 +1008,13 @@ fn close_child_descriptor(fs, handoff) {
         return false;
     }
     let fd = handoff.fd;
-    _close_fd(fs, fd); map_remove(fs.child_fds, str(fd));
-    handoff.active = false; handoff.fd = -1; return true;
+    let closed_without_error = _close_fd(fs, fd);
+    map_remove(fs.child_fds, str(fd));
+    // Linux may release the descriptor even when close reports an error. Never
+    // retry the same numeric fd after ownership has been consumed.
+    handoff.active = false; handoff.fd = -1;
+    handoff.close_attempted = true; handoff.close_reported_error = not closed_without_error;
+    return closed_without_error;
 }
 
 fn _walk_dir(fs, parts, create) {
@@ -811,6 +1130,10 @@ fn read_prefix_bytes(fs, path, max_bytes = 1048576) {
     let parent = _parent(fs, path, false); if not parent.ok { return parent; }
     let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
     _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be opened without following links"); }
+    let source_info = _descriptor_metadata(fs, fd, path);
+    if not source_info.ok or (try source_info.kind catch "") != "file" {
+        _close_fd(fs, fd); return _error("path is not a descriptor-held regular file");
+    }
     let source_size = _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]);
     if source_size < 0 { _close_fd(fs, fd); return _error("path is not a seekable regular file"); }
     if _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 0]) < 0 {
@@ -845,7 +1168,8 @@ fn read_prefix_bytes(fs, path, max_bytes = 1048576) {
     return map{
         ok: true, path: path, bytes: bytes, size: len(bytes),
         source_size: source_size, truncated: source_size > len(bytes),
-        race_resistant: true
+        kind: source_info.kind, mode: source_info.mode,
+        descriptor_bound_metadata: true, race_resistant: true
     };
 }
 
@@ -995,10 +1319,8 @@ fn protect_file(fs, path) {
     let protected = _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE]));
     let verified = protected == 0 and _mode_verified(fs, fd, "600");
     _close_fd(fs, fd);
-    if not verified {
-        return _error("file permissions cannot be protected and verified");
-    }
-    return map{ ok: true, path: path, mode: MODE_FILE };
+    if verified { return map{ ok: true, path: path, mode: MODE_FILE }; }
+    return _error("file permissions cannot be protected and verified");
 }
 
 fn protect_executable(fs, path) {
@@ -1008,8 +1330,8 @@ fn protect_executable(fs, path) {
     let protected = _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_DIR]));
     let verified = protected == 0 and _mode_verified(fs, fd, "700");
     _close_fd(fs, fd);
-    if not verified { return _error("executable permissions cannot be protected and verified"); }
-    return map{ ok: true, path: path, mode: MODE_DIR };
+    if verified { return map{ ok: true, path: path, mode: MODE_DIR }; }
+    return _error("executable permissions cannot be protected and verified");
 }
 
 fn _stage_name() { return ".pblang-stage-" + str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32); }
@@ -1020,16 +1342,78 @@ fn write_atomic(fs, path, bytes, create_parents = true) {
     let stage = _stage_name();
     let fd = _openat(fs, parent.fd, stage, O_WRONLY + O_CREAT + O_EXCL + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
     if fd < 0 { _close_fd(fs, parent.fd); return _error("cannot create an exclusive staging file"); }
-    let wrote = try { fs_write_bytes(_fd_path(fd), bytes); true } catch false; _close_fd(fs, fd);
-    if not wrote {
-        _unlinkat(fs, parent.fd, stage, 0);
+    let write_failed = try { fs_write_bytes(_fd_path(fd), bytes); false } catch true;
+    if write_failed {
+        _close_fd(fs, fd); _unlinkat(fs, parent.fd, stage, 0);
         _close_fd(fs, parent.fd); return _error("cannot write staged bytes");
     }
+    let file_synced = _i32(_call(fs, "fsync", "i32->i32", [fd])) == 0;
+    let stage_closed = _close_fd(fs, fd);
+    if type(file_synced) != "bool" or not file_synced {
+        _unlinkat(fs, parent.fd, stage, 0);
+        _close_fd(fs, parent.fd);
+        return _error("cannot synchronize staged bytes");
+    }
+    if type(stage_closed) != "bool" or not stage_closed {
+        _unlinkat(fs, parent.fd, stage, 0);
+        _close_fd(fs, parent.fd);
+        return _error("staging descriptor could not be closed");
+    }
     let published = _renameat(fs, parent.fd, stage, parent.fd, parent.name);
-    if published != 0 { _unlinkat(fs, parent.fd, stage, 0); }
+    if published != 0 {
+        _unlinkat(fs, parent.fd, stage, 0); _close_fd(fs, parent.fd);
+        return _error("cannot publish staged file atomically");
+    }
+    let directory_synced = _i32(_call(fs, "fsync", "i32->i32", [parent.fd])) == 0;
     _close_fd(fs, parent.fd);
-    if published != 0 { return _error("cannot publish staged file atomically"); }
-    return map{ ok: true, path: path, size: len(bytes), atomic: true };
+    if type(directory_synced) != "bool" or not directory_synced {
+        return map{ok:false,error:"published file directory could not be synchronized",
+            published:true,path:path,size:len(bytes),atomic:true,
+            durability_verified:false};
+    }
+    return map{ok:true,path:path,size:len(bytes),atomic:true,
+        fsync_before_publish:true,parent_fsync_after_publish:true,
+        durability_verified:true};
+}
+
+// Append one UTF-8 byte batch while the caller holds any higher-level journal
+// lock. The final file is opened with O_NOFOLLOW and its pre/post sizes are
+// measured through that held descriptor, so the ceiling is a storage bound.
+fn append_bytes_bounded(fs, path, bytes, max_bytes = 1048576, create_parents = true) {
+    if not is_array(bytes) or type(max_bytes) != "number" or max_bytes < 1 or
+       max_bytes != num_floor(max_bytes) or max_bytes > 67108864 {
+        return _error("invalid bounded append arguments");
+    }
+    let text = try bytes_to_str(bytes) catch nil;
+    if text == nil or len(str_to_bytes(text)) != len(bytes) {
+        return _error("bounded append requires valid UTF-8 bytes");
+    }
+    let parent = _parent(fs, path, create_parents); if not parent.ok { return parent; }
+    let fd = _openat(fs, parent.fd, parent.name,
+        O_WRONLY + O_CREAT + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
+    _close_fd(fs, parent.fd); if fd < 0 { return _error("append target cannot be opened without following links"); }
+    let info = _descriptor_metadata(fs, fd, path);
+    if not info.ok or (try info.kind catch "") != "file" {
+        _close_fd(fs, fd); return _error("append target is not a regular file");
+    }
+    let before = _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]);
+    if before < 0 or before + len(bytes) > max_bytes {
+        _close_fd(fs, fd); return _error("append target would exceed its byte limit");
+    }
+    let protected = _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE]));
+    if protected != 0 or not _mode_verified(fs, fd, "600") {
+        _close_fd(fs, fd); return _error("append target permissions cannot be verified");
+    }
+    let write_failed = false;
+    try { fs_append(_fd_path(fd), text); } catch { write_failed = true; }
+    let after = _call(fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]);
+    _close_fd(fs, fd);
+    if write_failed or after != before + len(bytes) {
+        return _error("bounded append did not publish the complete batch");
+    }
+    return map{ ok: true, path: path, appended_bytes: len(bytes),
+        previous_size: before, size: after, mode: MODE_FILE,
+        descriptor_bound: true, race_resistant: true };
 }
 
 // Create a destination exactly once without an exists-then-write race.
@@ -1043,23 +1427,24 @@ fn write_new_exclusive(fs, path, bytes, create_parents = true) {
     let fd = _openat(fs, parent.fd, parent.name,
         O_WRONLY + O_CREAT + O_EXCL + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
     if fd < 0 { _close_fd(fs, parent.fd); return _error("destination already exists or cannot be created exclusively"); }
-    let wrote = try { fs_write_bytes(_fd_path(fd), bytes); true } catch false;
+    let write_failed = try { fs_write_bytes(_fd_path(fd), bytes); false } catch true;
     _close_fd(fs, fd);
-    if not wrote { _unlinkat(fs, parent.fd, parent.name, 0); }
+    if write_failed { _unlinkat(fs, parent.fd, parent.name, 0); }
     _close_fd(fs, parent.fd);
-    if not wrote { return _error("exclusive destination write failed and was removed"); }
+    if write_failed { return _error("exclusive destination write failed and was removed"); }
     return map{ ok: true, path: path, size: len(bytes), no_replace: true,
                 exclusive_create: true, descriptor_bound_parent: true,
                 atomic_namespace_admission: true, atomic_visibility: false };
 }
 
 fn _rename_noreplace_parents(fs, source_fd, source_name, dest_fd, dest_name) {
-    if _rename_noreplace_x64_cache == nil {
+    if not _rename_noreplace_x64_cache.known {
         let machine = try proc_spawn_wait("/usr/bin/uname", ["-m"]) catch nil;
-        _rename_noreplace_x64_cache = machine != nil and machine.exit_code == 0
+        _rename_noreplace_x64_cache.supported = machine != nil and machine.exit_code == 0
             and (str_trim(machine.stdout) == "x86_64" or str_trim(machine.stdout) == "amd64");
+        _rename_noreplace_x64_cache.known = true;
     }
-    if not _rename_noreplace_x64_cache {
+    if not _rename_noreplace_x64_cache.supported {
         return _error("atomic no-replace rename currently requires Linux x86-64");
     }
     let source_child = _i32(_call(fs, "dup", "i32->i32", [source_fd]));
@@ -1070,14 +1455,14 @@ fn _rename_noreplace_parents(fs, source_fd, source_name, dest_fd, dest_name) {
     }
     let source_flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [source_child, F_GETFD, 0]));
     let dest_flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [dest_child, F_GETFD, 0]));
-    let inheritable = source_flags >= 0 and dest_flags >= 0
-        and _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
-            [source_child, F_SETFD, source_flags - bit_and(source_flags, FD_CLOEXEC)])) == 0
-        and _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
-            [dest_child, F_SETFD, dest_flags - bit_and(dest_flags, FD_CLOEXEC)])) == 0;
+    let inheritance_failed = source_flags < 0 or dest_flags < 0
+        or _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+            [source_child, F_SETFD, source_flags - bit_and(source_flags, FD_CLOEXEC)])) != 0
+        or _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+            [dest_child, F_SETFD, dest_flags - bit_and(dest_flags, FD_CLOEXEC)])) != 0;
     let source_verified = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [source_child, F_GETFD, 0]));
     let dest_verified = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [dest_child, F_GETFD, 0]));
-    if not inheritable or source_verified < 0 or dest_verified < 0
+    if inheritance_failed or source_verified < 0 or dest_verified < 0
        or bit_and(source_verified, FD_CLOEXEC) != 0
        or bit_and(dest_verified, FD_CLOEXEC) != 0 {
         _close_fd(fs, source_child); _close_fd(fs, dest_child);
@@ -1119,6 +1504,73 @@ fn _rename_noreplace_parents(fs, source_fd, source_name, dest_fd, dest_name) {
         helper_sealed_before_execution: true };
 }
 
+fn _link_held_tmpfile_noreplace(fs, source_fd, dest_fd, dest_name) {
+    if not _linkat_empty_x64_cache.known {
+        let machine = try proc_spawn_wait("/usr/bin/uname", ["-m"]) catch nil;
+        _linkat_empty_x64_cache.supported = machine != nil and machine.exit_code == 0
+            and (str_trim(machine.stdout) == "x86_64" or str_trim(machine.stdout) == "amd64");
+        _linkat_empty_x64_cache.known = true;
+    }
+    if not _linkat_empty_x64_cache.supported {
+        return _error("exact-inode publication currently requires Linux x86-64");
+    }
+    let source_child = _i32(_call(fs, "dup", "i32->i32", [source_fd]));
+    let dest_child = _i32(_call(fs, "dup", "i32->i32", [dest_fd]));
+    if source_child < 0 or dest_child < 0 {
+        _close_fd(fs, source_child); _close_fd(fs, dest_child);
+        return _error("publication descriptors cannot be duplicated");
+    }
+    let source_flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [source_child, F_GETFD, 0]));
+    let dest_flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [dest_child, F_GETFD, 0]));
+    let inheritance_failed = source_flags < 0 or dest_flags < 0
+        or _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+            [source_child, F_SETFD, source_flags - bit_and(source_flags, FD_CLOEXEC)])) != 0
+        or _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+            [dest_child, F_SETFD, dest_flags - bit_and(dest_flags, FD_CLOEXEC)])) != 0;
+    let source_verified = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [source_child, F_GETFD, 0]));
+    let dest_verified = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [dest_child, F_GETFD, 0]));
+    if inheritance_failed or source_verified < 0 or dest_verified < 0
+       or bit_and(source_verified, FD_CLOEXEC) != 0
+       or bit_and(dest_verified, FD_CLOEXEC) != 0 {
+        _close_fd(fs, source_child); _close_fd(fs, dest_child);
+        return _error("publication descriptors cannot be made inheritable");
+    }
+    let helper_bytes = try LINKAT_HELD.build(source_child, dest_child, dest_name) catch nil;
+    if helper_bytes == nil {
+        _close_fd(fs, source_child); _close_fd(fs, dest_child);
+        return _error("exact-inode publication helper cannot be generated");
+    }
+    let helper_fd = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-linkat-empty", MFD_CLOEXEC + MFD_ALLOW_SEALING]));
+    if helper_fd < 0 {
+        _close_fd(fs, source_child); _close_fd(fs, dest_child);
+        return _error("exact-inode publication helper memfd is unavailable");
+    }
+    let prepared = (try { fs_write_bytes(_fd_path(helper_fd), helper_bytes); true } catch false)
+        and _i32(_call(fs, "fchmod", "i32,i32->i32", [helper_fd, MODE_DIR])) == 0
+        and _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+            [helper_fd, F_ADD_SEALS, IMMUTABLE_SEALS])) == 0;
+    let helper_seals = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [helper_fd, F_GET_SEALS, 0]));
+    let helper_flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [helper_fd, F_GETFD, 0]));
+    let executable = prepared and helper_seals >= 0
+        and bit_and(helper_seals, IMMUTABLE_SEALS) == IMMUTABLE_SEALS
+        and helper_flags >= 0
+        and _i32(_call(fs, "fcntl", "i32,i32,i32->i32",
+            [helper_fd, F_SETFD, helper_flags - bit_and(helper_flags, FD_CLOEXEC)])) == 0;
+    let executable_flags = _i32(_call(fs, "fcntl", "i32,i32,i32->i32", [helper_fd, F_GETFD, 0]));
+    if executable_flags < 0 or bit_and(executable_flags, FD_CLOEXEC) != 0 { executable = false; }
+    let result = nil;
+    if executable { result = try proc_spawn_wait(_fd_path(helper_fd), []) catch nil; }
+    _close_fd(fs, helper_fd); _close_fd(fs, source_child); _close_fd(fs, dest_child);
+    if result == nil or result.exit_code != 0 {
+        return _error("destination exists or exact-inode publication failed");
+    }
+    return map{ ok: true, atomic: true, no_replace: true,
+        exact_held_inode: true, anonymous_source: true,
+        descriptor_bound_parent: true, generated_pblang_syscall_helper: true,
+        helper_sealed_before_execution: true };
+}
+
 // Publish complete bytes atomically while retaining no-replace semantics.
 // A private exclusive stage is fully populated first, then renameat2 commits
 // it only if the final name is absent. No reader can observe partial content.
@@ -1129,31 +1581,122 @@ fn write_new_atomic(fs, path, bytes, create_parents = true) {
     let fd = _openat(fs, parent.fd, stage,
         O_WRONLY + O_CREAT + O_EXCL + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
     if fd < 0 { _close_fd(fs, parent.fd); return _error("cannot create an exclusive atomic-new stage"); }
-    let wrote = try { fs_write_bytes(_fd_path(fd), bytes); true } catch false;
+    let write_failed = try { fs_write_bytes(_fd_path(fd), bytes); false } catch true;
     _close_fd(fs, fd);
-    if not wrote {
+    if write_failed {
         _unlinkat(fs, parent.fd, stage, 0); _close_fd(fs, parent.fd);
         return _error("cannot populate atomic-new stage");
     }
     let published = _rename_noreplace_parents(fs, parent.fd, stage, parent.fd, parent.name);
-    if not published.ok {
+    if published.ok {
+        _close_fd(fs, parent.fd);
+        return map{
+            ok: true, path: path, size: len(bytes), no_replace: true,
+            atomic: true, atomic_visibility: true, exclusive_stage: true,
+            descriptor_bound_parent: true, generated_pblang_syscall_helper: true
+        };
+    } else {
         _unlinkat(fs, parent.fd, stage, 0); _close_fd(fs, parent.fd);
         return _error("destination exists or atomic-new publication failed");
     }
-    _close_fd(fs, parent.fd);
-    return map{
-        ok: true, path: path, size: len(bytes), no_replace: true,
-        atomic: true, atomic_visibility: true, exclusive_stage: true,
-        descriptor_bound_parent: true, generated_pblang_syscall_helper: true
-    };
+}
+
+// Copy one authenticated range from an immutable held snapshot into an
+// anonymous O_TMPFILE inode, then link that exact held inode into the namespace
+// only when the destination is absent. No mutable stage name and no PBLang
+// binary array exist anywhere in the publication path.
+fn copy_held_range_new_atomic(source_fs, held, dest_fs, path, offset, count,
+                              create_parents = true, executable = false) {
+    if not _held_file_valid(source_fs, held) or not (try held.immutable catch false)
+       or dest_fs == nil or not is_map(dest_fs) or (try dest_fs.closed catch true)
+       or type(offset) != "number" or offset != num_floor(offset) or offset < 0
+       or type(count) != "number" or count != num_floor(count)
+       or count < 1 or count > 268435456 or offset > held.size
+       or count > held.size - offset or type(executable) != "bool" {
+        return _error("invalid immutable range publication request");
+    }
+    let parent = _parent(dest_fs, path, create_parents); if not parent.ok { return parent; }
+    let fd = _openat(dest_fs, parent.fd, ".",
+        O_WRONLY + O_TMPFILE + O_CLOEXEC, MODE_FILE);
+    if fd < 0 {
+        _close_fd(dest_fs, parent.fd);
+        return _error("anonymous O_TMPFILE range publication is unavailable");
+    }
+    let chunk = 65536;
+    let buffer = _call(dest_fs, "calloc", "i64,i64->ptr", [1, chunk]);
+    let copied = 0; let failed = buffer == nil or buffer == 0;
+    while copied < count and not failed {
+        let wanted = count - copied; if wanted > chunk { wanted = chunk; }
+        let loaded = 0;
+        while loaded < wanted and not failed {
+            let got = _call(dest_fs, "pread", "i32,ptr,i64,i64->i64",
+                [held.fd, buffer + loaded, wanted - loaded, offset + copied + loaded]);
+            if got <= 0 or got > wanted - loaded { failed = true; }
+            else { loaded = loaded + got; }
+        }
+        let written = 0;
+        while written < wanted and not failed {
+            let n = _call(dest_fs, "write", "i32,ptr,i64->i64",
+                [fd, buffer + written, wanted - written]);
+            if n <= 0 or n > wanted - written { failed = true; }
+            else { written = written + n; }
+        }
+        if not failed { copied = copied + wanted; }
+    }
+    _free(dest_fs, buffer);
+    let requested_mode = if executable { MODE_DIR } else { MODE_FILE };
+    let expected_mode = if executable { "700" } else { "600" };
+    if failed or copied != count {
+        _close_fd(dest_fs, fd);
+        _close_fd(dest_fs, parent.fd);
+        return _error("immutable anonymous range inode could not be populated completely");
+    }
+    if _i32(_call(dest_fs, "fchmod", "i32,i32->i32", [fd, requested_mode])) != 0
+       or not _mode_verified(dest_fs, fd, expected_mode) {
+        _close_fd(dest_fs, fd); _close_fd(dest_fs, parent.fd);
+        return _error("immutable anonymous range inode mode could not be verified");
+    }
+    if _call(dest_fs, "lseek", "i32,i64,i32->i64", [fd, 0, 2]) != count {
+        _close_fd(dest_fs, fd); _close_fd(dest_fs, parent.fd);
+        return _error("immutable anonymous range inode size could not be verified");
+    }
+    if _i32(_call(dest_fs, "fsync", "i32->i32", [fd])) != 0 {
+        _close_fd(dest_fs, fd); _close_fd(dest_fs, parent.fd);
+        return _error("immutable anonymous range inode could not be synchronized");
+    }
+    // Keep the anonymous source inode held until linkat(AT_EMPTY_PATH) has
+    // admitted that exact object into the destination namespace.
+    let published = _link_held_tmpfile_noreplace(dest_fs, fd, parent.fd, parent.name);
+    if type(published) != "map" or not published.ok {
+        _close_fd(dest_fs, fd); _close_fd(dest_fs, parent.fd);
+        return _error("destination exists or immutable range publication failed");
+    }
+    let directory_synced = _i32(_call(dest_fs, "fsync", "i32->i32", [parent.fd])) == 0;
+    if not _close_fd(dest_fs, fd) {
+        _close_fd(dest_fs, parent.fd);
+        return _error("published anonymous range inode could not be closed");
+    }
+    _close_fd(dest_fs, parent.fd);
+    if type(directory_synced) != "bool" or not directory_synced {
+        return map{ok:false,error:"published range directory could not be synchronized",
+            published:true,path:path,size:count,durability_verified:false};
+    }
+    return map{ok:true,path:path,size:count,source_offset:offset,no_replace:true,
+        atomic:true,atomic_visibility:true,anonymous_stage:true,
+        exact_inode_publication:true,
+        descriptor_bound_source:true,descriptor_bound_parent:true,
+        immutable_source:true,bounded_memory:true,chunk_bytes:chunk,
+        executable:executable,mode:expected_mode,fsync_before_publish:true,
+        parent_fsync_after_publish:true,durability_verified:true};
 }
 
 fn remove(fs, path) {
     let parent = _parent(fs, path, false); if not parent.ok { return parent; }
     let rc = _unlinkat(fs, parent.fd, parent.name, 0);
     if rc != 0 { rc = _unlinkat(fs, parent.fd, parent.name, AT_REMOVEDIR); }
-    _close_fd(fs, parent.fd); if rc != 0 { return _error("file or empty directory cannot be removed"); }
-    return map{ ok: true, path: path };
+    let parent_closed = _close_fd(fs, parent.fd);
+    if rc == 0 and parent_closed { return map{ ok: true, path: path }; }
+    return _error("file or empty directory removal could not be fully verified");
 }
 
 // Remove a non-directory entry only. Unlike remove(), this never retries with
@@ -1162,10 +1705,12 @@ fn remove(fs, path) {
 fn remove_file(fs, path) {
     let parent = _parent(fs, path, false); if not parent.ok { return parent; }
     let rc = _unlinkat(fs, parent.fd, parent.name, 0);
-    _close_fd(fs, parent.fd);
-    if rc != 0 { return _error("file entry cannot be removed"); }
-    return map{ ok: true, path: path, directory_removal: false,
-                descriptor_bound_parent: true, symlink_target_followed: false };
+    let parent_closed = _close_fd(fs, parent.fd);
+    if rc == 0 and parent_closed {
+        return map{ ok: true, path: path, directory_removal: false,
+                    descriptor_bound_parent: true, symlink_target_followed: false };
+    }
+    return _error("file entry removal could not be fully verified");
 }
 
 fn move(fs, from, to, create_parents = true) {
@@ -1203,6 +1748,11 @@ fn status(fs) {
                 bounded_memfd_snapshot_reads: true,
                 bounded_prefix_snapshot_reads: true,
                 bounded_range_snapshot_reads: true,
+                immutable_sealed_file_snapshots: true,
+                streaming_base64_sha256_ranges: true,
+                atomic_immutable_range_publication: true,
+                anonymous_exact_inode_publication_x86_64: true,
+                private_root_owner_mode_verification: true,
                 descriptor_metadata: true,
                 verified_child_descriptor_handoff: true,
                 inherited_directory_adoption: true,
@@ -1215,10 +1765,16 @@ fn status(fs) {
                 libc: try fs.libc_path catch nil };
 }
 
-export available, open, open_absolute, open_current_process_net, close, descriptor_path, child_descriptor,
+export available, open, open_absolute, open_current_process_net, close, descriptor_path, private_root_status, child_descriptor,
        adopt_inherited_directory,
-       child_file_descriptor, sealed_child_bytes, mutable_snapshot_bytes, close_child_descriptor,
+       child_file_descriptor, sealed_snapshot_file_descriptor,
+       held_base64_sha256, held_magic_offsets, read_held_range_bytes,
+       verified_child_file_descriptor,
+       duplicate_child_file_descriptor,
+       sealed_child_bytes, mutable_snapshot_bytes, close_child_descriptor,
        acquire_lock, release_lock,
-       mkdir, mkdir_new, list, read_bytes, read_prefix_bytes, read_range_bytes, read_stream_bytes, file_size, metadata,
-       protect_file, protect_executable, write_atomic, write_new_exclusive, write_new_atomic,
+       mkdir, mkdir_new, list,
+       read_bytes, read_prefix_bytes, read_range_bytes, read_stream_bytes, file_size, metadata,
+       protect_file, protect_executable, write_atomic, append_bytes_bounded,
+       write_new_exclusive, write_new_atomic, copy_held_range_new_atomic,
        remove, remove_file, move, move_new_exclusive, status;

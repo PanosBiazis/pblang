@@ -27,6 +27,7 @@
 // literals and comments.
 
 let _blt = import("stdlib/compiler/builtins_list.sapp");
+let _locked_snapshot = import("stdlib:locked_source_snapshot.sapp");
 
 let _ALPHA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
 let _DIGIT = "0123456789";
@@ -55,6 +56,13 @@ fn _b_match(bytes, at, expected) {
         i = i + 1;
     }
     return true;
+}
+fn _b_import_syntax(bytes, start, after) {
+    let previous = start - 1;
+    while previous >= 0 and _b_space(bytes[previous]) { previous = previous - 1; }
+    if previous >= 0 and bytes[previous] == 46 { return false; }
+    let next = _b_skip_spaces(bytes, after);
+    return next < len(bytes) and (bytes[next] == 40 or bytes[next] == 34);
 }
 fn _b_to_semi(bytes, at) {
     while at < len(bytes) and bytes[at] != 59 { at = at + 1; }
@@ -158,6 +166,17 @@ fn _read_ident(src, k) {
     while k < n and _is_alnum(str_slice(src, k, k + 1)) { k = k + 1; }
     return str_slice(src, st, k);
 }
+fn _import_syntax(src, start, after) {
+    let previous = start - 1;
+    while previous >= 0 and _is_space(str_slice(src, previous, previous + 1)) {
+        previous = previous - 1;
+    }
+    if previous >= 0 and str_slice(src, previous, previous + 1) == "." { return false; }
+    let next = _skip_spaces(src, after);
+    if next >= len(src) { return false; }
+    let token = str_slice(src, next, next + 1);
+    return token == "(" or token == "\"";
+}
 fn _to_semi(src, i) {
     let n = len(src);
     while i < n and str_slice(src, i, i + 1) != ";" { i = i + 1; }
@@ -216,7 +235,7 @@ fn _transform(src, varset) {
                 out = out + id;
                 let nm = _read_ident(src, _skip_spaces(src, i));
                 if nm != "" { array_push(names, nm); }
-            } else if id == "import" {
+            } else if id == "import" and _import_syntax(src, start, i) {
                 // A real `import` token that SURVIVED top-level let-import stripping
                 // (the `let v = import(...)` branch consumes those wholesale) — so it
                 // is a nested/non-top-level import. Detected here (not via a text
@@ -226,6 +245,7 @@ fn _transform(src, varset) {
             } else if map_has(varset, id) {
                 let k = _skip_spaces(src, i);
                 if k < n and str_slice(src, k, k + 1) == "." { i = k + 1; }   // var.member -> member
+                else if k < n and str_slice(src, k, k + 1) == ":" { out = out + id; }
                 else { bare = true; bare_name = id; out = out + id; }
             } else {
                 out = out + id;
@@ -259,15 +279,17 @@ fn _process_one(src, tag, all_names) {
 }
 
 // DFS-resolve a module and its transitive imports, deps-first (post-order).
-fn _collect(path, resolve, reg, visiting, order, errbox) {
+fn _collect(raw_path, importer, resolve, reg, visiting, order, errbox) {
     if errbox.err != nil { return; }
+    let path = _canonical_module_path(raw_path, importer);
+    if path == nil { errbox.err = "invalid or escaping import path: " + str(raw_path); return; }
     if map_has(reg, path) { return; }
     if (try visiting[path] catch false) == true { errbox.err = "import cycle at " + path; return; }
     let src = resolve(path);
     if src == nil { errbox.err = "cannot resolve import: " + path; return; }
     visiting[path] = true;
     for imp in _find_import_bindings(src) {
-        _collect(imp.path, resolve, reg, visiting, order, errbox);
+        _collect(imp.path, path, resolve, reg, visiting, order, errbox);
         if errbox.err != nil { return; }
     }
     visiting[path] = false;
@@ -279,7 +301,7 @@ fn inline_source(main_src, resolve) {
     let errbox = map{ err: nil };
     let reg = map{}; let visiting = map{}; let order = [];
     for imp in _find_import_bindings(main_src) {
-        _collect(imp.path, resolve, reg, visiting, order, errbox);
+        _collect(imp.path, "main.sapp", resolve, reg, visiting, order, errbox);
         if errbox.err != nil { return _err(errbox.err); }
     }
     let all_names = map{};
@@ -463,7 +485,7 @@ fn _scan_defs_and_locals(src) {
                     }
                 }
                 else { if nm != "" { locals[nm] = true; } }
-            } else if id == "import" and depth > 0 {
+            } else if id == "import" and depth > 0 and _b_import_syntax(bytes, start, i) {
                 nested = true;
             }
         } else if c == 123 { depth = depth + 1; i = i + 1; }
@@ -590,6 +612,8 @@ fn _transform_prefixed(src, prefix, var2pref, tl) {
                     let member_end = _b_ident_end(bytes, mk);
                     let mnm = _b_text(bytes, mk, member_end);
                     array_push(out, var2pref[id] + mnm); i = member_end;
+                } elif k < n and bytes[k] == 58 {
+                    array_push(out, id);
                 } else {
                     array_push(out, "\x00BARE\x00");
                 }
@@ -643,7 +667,7 @@ fn _var2pref(src, path2pref) {
 
 // inline_source_prefixed(main_src, resolve) — like inline_source but with per-module prefixing,
 // so modules with colliding top-level names link cleanly. Same { ok, source, modules } contract.
-fn _inline_prefixed_collected(main_src, reg, order) {
+fn _inline_prefixed_collected(main_src, reg, order, main_path = "main.sapp") {
     // assign a prefix per module path (dep order)
     let path2pref = map{};
     let idx = 0;
@@ -670,7 +694,8 @@ fn _inline_prefixed_collected(main_src, reg, order) {
             // is what lets the self-hosting compiler modules (tokenizer/parser/...) link natively.
             tl[nm] = true;
         }
-        let body = _transform_prefixed(src, prefix, _var2pref(src, path2pref), tl);
+        let body = _transform_prefixed(src, prefix,
+            _var2pref_canonical(src, p, path2pref), tl);
         if _contains(body, "\x00BARE\x00") { return _err("import variable used without .member access (unsupported, in " + p + ")"); }
         array_push(pieces, body);
         mi = mi + 1;
@@ -679,7 +704,8 @@ fn _inline_prefixed_collected(main_src, reg, order) {
     let msc = _scan_defs_and_locals(main_src);
     if msc.nested { return _err("nested/non-top-level import unsupported (in <main>)"); }
     let mtl = map{};   // empty: main names are not prefixed
-    let mbody = _transform_prefixed(main_src, "", _var2pref(main_src, path2pref), mtl);
+    let mbody = _transform_prefixed(main_src, "",
+        _var2pref_canonical(main_src, main_path, path2pref), mtl);
     if _contains(mbody, "\x00BARE\x00") { return _err("import variable used without .member access (unsupported, in <main>)"); }
     array_push(pieces, mbody);
     return map{ ok: true, source: str_join(pieces, "\n"), modules: len(order), module_order: order };
@@ -689,17 +715,23 @@ fn inline_source_prefixed(main_src, resolve) {
     let errbox = map{ err: nil };
     let reg = map{}; let visiting = map{}; let order = [];
     for imp in _find_import_bindings(main_src) {
-        _collect(imp.path, resolve, reg, visiting, order, errbox);
+        _collect(imp.path, "main.sapp", resolve, reg, visiting, order, errbox);
         if errbox.err != nil { return _err(errbox.err); }
     }
-    return _inline_prefixed_collected(main_src, reg, order);
+    return _inline_prefixed_collected(main_src, reg, order, "main.sapp");
 }
 
 fn inline_file_prefixed(main_path) {
     let src = _read_module(main_path);
     if src == nil { return _err("cannot read main: " + str(main_path)); }
     fn resolve(p) { return _read_module(p); }
-    return inline_source_prefixed(src, resolve);
+    let errbox = map{ err: nil };
+    let reg = map{}; let visiting = map{}; let order = [];
+    for imp in _find_import_bindings(src) {
+        _collect(imp.path, main_path, resolve, reg, visiting, order, errbox);
+        if errbox.err != nil { return _err(errbox.err); }
+    }
+    return _inline_prefixed_collected(src, reg, order, main_path);
 }
 
 // Recompute a prior file graph's content identity without running the expensive
@@ -783,10 +815,22 @@ fn _canonical_module_path(raw, importer) {
         // Slash-form stdlib imports are rooted aliases too, not paths relative
         // to a module already located under stdlib/.
         scheme = "stdlib:"; rel = str_slice(raw, 7, len(raw)); parent = "";
-    } elif str_starts_with(importer, "stdlib:") {
-        scheme = "stdlib:"; parent = str_slice(importer, 7, len(importer));
-    } elif _contains(raw, ":") {
-        return nil;
+    } else {
+        let raw_colon = str_index_of(raw, ":");
+        if raw_colon > 0 {
+            let package = str_slice(raw, 0, raw_colon);
+            if not regex_match(package, "^[A-Za-z][A-Za-z0-9_-]*$") { return nil; }
+            scheme = package + ":"; rel = str_slice(raw, raw_colon + 1, len(raw)); parent = "";
+        } elif raw_colon == 0 { return nil; }
+        else {
+            let importer_colon = str_index_of(importer, ":");
+            if importer_colon > 0 {
+                let package = str_slice(importer, 0, importer_colon);
+                if not regex_match(package, "^[A-Za-z][A-Za-z0-9_-]*$") { return nil; }
+                scheme = package + ":";
+                parent = str_slice(importer, importer_colon + 1, len(importer));
+            }
+        }
     }
     let combined = rel;
     // PBLang bare imports are project-rooted. Only explicit ./ and ../ forms
@@ -954,13 +998,66 @@ fn link_modules(main_source, modules, options = nil) {
     linked_bytes = linked_bytes + len(main_body);
     if linked_bytes > limits.max_linked_source_bytes { return _err("linked source limit exceeded"); }
     array_push(pieces, main_body);
+    let identity = ["pblang.source.graph.v2", entry_path, sha256(main_source)];
+    for path in state.order { array_push(identity, path); array_push(identity, sha256(state.reg[path])); }
     return map{ ok: true, source: str_join(pieces, "\n"), modules: state.module_count,
         module_order: state.order, module_bytes: state.module_bytes,
         module_value_definitions: module_value_definitions,
         input_bytes: state.total_bytes, supplied_bytes: prepared.supplied_bytes,
         output_bytes: linked_bytes, entry_path: entry_path,
+        input_graph_sha256: sha256(str_join(identity, "\n")),
         namespace: "prefixed", limits: limits };
 }
 
+// Build a complete immutable source snapshot from a project plus every locked
+// path dependency, then link only from that in-memory snapshot.
+fn _select_snapshot_module(raw_path, importer, available, selected, state, limits, depth) {
+    if state.error != nil { return; }
+    if depth > limits.max_module_depth { state.error = "module depth limit exceeded"; return; }
+    let path = _resolve_module_path(raw_path, importer, available);
+    if path == nil { state.error = "invalid or escaping import path: " + str(raw_path); return; }
+    if map_has(selected, path) or (try state.visiting[path] catch false) { return; }
+    let source = try available[path] catch nil;
+    if source == nil { state.error = "cannot resolve import: " + path; return; }
+    state.count = state.count + 1; state.bytes = state.bytes + len(source);
+    if state.count > limits.max_modules { state.error = "reachable module count limit exceeded"; return; }
+    if state.bytes > limits.max_total_source_bytes { state.error = "reachable source byte limit exceeded"; return; }
+    state.visiting[path] = true;
+    for binding in _find_import_bindings(source) {
+        _select_snapshot_module(binding.path, path, available, selected, state, limits, depth + 1);
+        if state.error != nil { return; }
+    }
+    state.visiting[path] = false; selected[path] = source;
+}
+
+fn inline_project_file_prefixed(main_path, project_root = ".", options = nil) {
+    let snapshot = _locked_snapshot.load(project_root);
+    if not snapshot.ok { return _err("locked project snapshot failed: " + snapshot.error); }
+    let entry = _canonical_module_path(main_path, "");
+    if entry == nil { return _err("invalid project entry path"); }
+    let source = try snapshot.modules[entry] catch nil;
+    if source == nil { return _err("project entry is absent from the locked snapshot: " + entry); }
+    let opts = if options == nil { map{} } else { options };
+    if not is_map(opts) { return _err("project linker options must be a map"); }
+    opts.entry_path = entry;
+    let limits = link_limits(opts); let selected = map{};
+    let selection = map{ error: nil, visiting: map{}, count: 0, bytes: len(source) };
+    for binding in _find_import_bindings(source) {
+        _select_snapshot_module(binding.path, entry, snapshot.modules, selected, selection, limits, 1);
+        if selection.error != nil { return _err(selection.error); }
+    }
+    let linked = link_modules(source, selected, opts);
+    if linked.ok {
+        linked.lock_verified = true;
+        linked.immutable_snapshot = true;
+        linked.manifest_sha256 = snapshot.manifest_sha256;
+        linked.dependency_digests = snapshot.dependency_digests;
+        linked.available_modules = len(map_keys(snapshot.modules));
+        linked.reachable_modules = selection.count;
+        linked.reachability_pruned = linked.available_modules - linked.reachable_modules;
+    }
+    return linked;
+}
+
 export inline_source, inline_file, inline_source_prefixed, inline_file_prefixed;
-export file_graph_fingerprint, link_limits, link_modules;
+export file_graph_fingerprint, link_limits, link_modules, inline_project_file_prefixed;

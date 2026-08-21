@@ -7,22 +7,36 @@ fn require(condition, message) {
 let caps = P.status();
 require(caps.available and caps.argv_exec and caps.shell_free and caps.bounded_output
     and caps.process_group_cancel and caps.termination_verified
+    and caps.pidfd_process_identity and caps.pidfd_required_for_start
     and caps.address_space_limit and caps.descendant_memory_limit
+    and caps.cpu_time_limit and caps.open_file_limit and caps.process_count_limit
+    and caps.nonblocking_cancel_request
     and caps.fixed_executable_descriptor_handoff
+    and caps.async_fixed_executable_descriptor_handoff
     and caps.output_limit_separate_from_child_files
     and caps.child_file_write_ceiling_bytes == 67108864
     and caps.configurable_child_file_ceiling,
     "Linux process capabilities");
 
+let unsafe_identity = P.start_deferred("/usr/bin/printf", ["%s", "must-not-run"], map{
+    timeout_secs: 3, max_output_bytes: 4096, _require_pidfd: false
+});
+require(not unsafe_identity.ok and not (try unsafe_identity.active catch false),
+    "direct starts cannot disable race-resistant process identity");
+
 let literal = "literal;touch /tmp/pblang-process-injection-marker";
 try fs_remove("/tmp/pblang-process-injection-marker") catch nil;
 let echo = P.run("/usr/bin/printf", ["%s", literal], map{
-    timeout_secs: 3, max_output_bytes: 4096
+    timeout_secs: 3, max_output_bytes: 4096,
+    max_cpu_seconds: 2, max_open_files: 32, max_processes: 2048
 });
 require(echo.ok and echo.command_ok and echo.exit_code == 0, "direct argv command");
 require(echo.stdout == literal and echo.stderr == "", "literal argv and split output");
 require(not fs_exists("/tmp/pblang-process-injection-marker") and echo.shell_used == false
-    and echo.argv_encoded and echo.process_group_terminated,
+    and echo.argv_encoded and echo.process_group_terminated
+    and echo.cpu_limit_enforced and echo.max_cpu_seconds == 2
+    and echo.open_file_limit_enforced and echo.max_open_files == 32
+    and echo.process_limit_enforced and echo.max_processes == 2048,
     "shell metacharacters never execute");
 let empty_argument = P.run("/usr/bin/printf", ["<%s>", ""], map{
     timeout_secs: 3, max_output_bytes: 4096
@@ -43,6 +57,15 @@ require(not fixed_missing.ok and fixed_missing.candidates_checked == 1
     "missing fixed candidates fail closed without check-then-exec");
 require((try { P.run_fixed(["relative"], [], map{}); false } catch true),
     "relative fixed candidates are rejected");
+let fixed_async = P.start_fixed(["/usr/bin/printf"], ["%s", "async-held"], map{
+    timeout_secs: 3, max_output_bytes: 4096
+});
+require(fixed_async.ok and fixed_async.executable_descriptor_held,
+    "async fixed executable remains descriptor-held");
+let fixed_async_result = P.finish(fixed_async, 3000);
+require(fixed_async_result.ok and fixed_async_result.command_ok
+    and fixed_async_result.stdout == "async-held",
+    "async descriptor-held executable finishes and cleans up");
 
 let split = P.run("/usr/bin/ls", ["/definitely-missing-pblang-process-test"], map{
     timeout_secs: 3, max_output_bytes: 32
@@ -56,6 +79,14 @@ let noisy = P.run("/usr/bin/seq", ["1", "100000"], map{
 });
 require(noisy.ok and noisy.returned_output_bytes <= 128 and noisy.output_truncated,
     "large output is bounded before VM loading");
+
+let wall_timeout = P.run("/bin/sh", ["-c", "while :; do :; done"], map{
+    timeout_secs: 1, max_output_bytes: 128
+});
+require(wall_timeout.ok and not wall_timeout.command_ok and wall_timeout.timed_out
+    and wall_timeout.exit_code == 124 and wall_timeout.max_cpu_seconds == 2
+    and not wall_timeout.cpu_limit_explicit and wall_timeout.process_group_terminated,
+    "default CPU backstop preserves deterministic wall-timeout reporting");
 
 let artifact_path = "/tmp/pblang-linux-process-artifact-" +
     str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
@@ -139,12 +170,55 @@ let active = P.start("/usr/bin/timeout", ["30s", "/usr/bin/sleep", "30"], map{
     timeout_secs: 30, max_output_bytes: 1024
 });
 require(active.ok and P.poll(active).active, "asynchronous process starts");
+let requested = P.request_cancel(active, 100);
+require(requested.ok and requested.requested,
+    "nonblocking cancellation request is accepted");
 let cancelled = P.cancel(active, 100);
 require(cancelled.ok and cancelled.terminated, "descendant process group terminates");
 let finished = P.finish(active, 1500);
 require(finished.ok and finished.process_group_terminated and finished.signaled
     and finished.cancelled and finished.status_unavailable_after_cancel,
     "cancelled lifecycle finishes with verified termination");
+
+// Keep the workload alive while it ignores TERM. The pidfd-pinned supervisor
+// remains stopped after TERM so the immutable grace deadline can safely
+// escalate the complete original group to KILL.
+let resistant = P.start("/bin/sh",
+    ["-c", "trap '' TERM; while :; do /usr/bin/sleep 1; done"],
+    map{ timeout_secs: 30, max_output_bytes: 1024 });
+require(resistant.ok and P.poll(resistant).active,
+    "TERM-resistant active process group starts");
+let resistant_cancelled = P.cancel(resistant, 50);
+require(resistant_cancelled.ok and resistant_cancelled.terminated
+    and resistant_cancelled.kill_sent,
+    "TERM-resistant active group reaches bounded KILL escalation");
+let resistant_finished = P.finish(resistant, 1500);
+require(resistant_finished.ok and resistant_finished.process_group_terminated,
+    "TERM-resistant active group retains ownership through verified teardown");
+
+// The direct shell exits after spawning a TERM-resistant descendant. A status
+// file must not suppress KILL escalation for the surviving process group.
+let orphaned = P.start("/bin/sh",
+    ["-c", "trap '' TERM; /usr/bin/sleep 30 &"],
+    map{ timeout_secs: 30, max_output_bytes: 1024 });
+require(orphaned.ok, "TERM-resistant descendant fixture starts");
+let orphan_deadline = now_ms() + 2000;
+let orphan_status = P.poll(orphaned);
+while not orphan_status.complete and now_ms() < orphan_deadline {
+    orphan_status = P.poll(orphaned);
+}
+require(orphan_status.complete,
+    "direct child completes while its descendant remains in the process group");
+let orphan_cancelled = P.cancel(orphaned, 50);
+require(orphan_cancelled.ok and orphan_cancelled.terminated,
+    "completed parent automatically tears down its surviving process group");
+let orphan_finished = P.finish(orphaned, 1500);
+require(orphan_finished.ok and orphan_finished.process_group_terminated
+    and orphan_finished.supervisor_forced_group_teardown
+    and orphan_finished.background_descendant_output_may_be_truncated
+    and not orphan_finished.power_loss_durable_status
+    and not orphan_finished.detached_descendant_confinement,
+    "TERM-resistant descendant leaves no live process group and reports teardown limits");
 
 require((try { P.run("relative", [], map{}); false } catch true) == false,
     "invalid process request returns a structured error");

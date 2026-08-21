@@ -46,11 +46,11 @@
 >
 > - **Native single-binary executable (Stage A)** — `pblang bundle --self-extract` now produces a real self-extracting single binary (pblang-stub + embedded tar.gz, see `crates/pblang-stub/src/main.rs`); a fully runtime-embedded (no extract-to-temp) variant is still TODO.
 > - **Hosted registry (publish/fetch)** — the registry *client* is **done**: `crates/pblang-pm` has `RegistrySource::{GitHub,GitLab,DirectHttp,file}`, HTTP `fetch`/`publish`/`search` (with 401-retry/token-refresh), all tested. What's still open is a **first-party hosted registry *server*** to publish to (GitHub/GitLab/HTTP indexes work today).
-> - **`@rust` / `@python` / etc. polyglot blocks → compiled artifacts** — **runtime done** + **build-time cdylib cache done**. The runtime side spans **50 languages** via two builtins: `polyglot_exec` (interpreters: python, js, deno, bash, zsh, fish, powershell, ruby, perl, raku, lua, php, r, tcl, awk, julia, racket, scheme, clojure, elixir, groovy, fennel, ocaml, scala, csharp via dotnet-script) and `polyglot_exec_compiled` (compilers: rust, go, c, cpp, zig, java, kotlin, typescript, pascal/delphi, nim, crystal, d, haskell, fortran, ada, swift, cobol, erlang, vala, objc, nasm, gas, v, ocaml-compiled, csharp, fsharp, vb — .NET-family scaffolds a temp csproj + `dotnet run`). The build-time path is `polyglot_compile_cached(lang, code)` which produces a content-hashed cdylib under `~/.cache/pblang/polyglot/` and returns an FFI handle — supports **16 languages**: rust, c, cpp, go, pascal, csharp (NativeAOT), fsharp (NativeAOT), zig, d, nim, swift, haskell, fortran, objc, ocaml, **java (GraalVM native-image --shared)**, **kotlin (Kotlin/Native -produce dynamic)** — so a `@rust` or `@csharp` or `@java` snippet becomes a callable module after the first compile. Per-toolchain regression test in `tests/semantics/polyglot_cdylib_per_lang_test.sapp` with skip-on-missing-toolchain. HTML/CSS/JS bundling lives in `stdlib/polyglot_web.sapp`. Remaining: a build-system-level pass that scans `.sapp` files and pre-warms the cache for all `@lang { ... }` blocks at `pblang build` time, plus full ABI-shaped auto-marshaling for high-level types (currently the user writes the C-ABI surface themselves).
+> - **`@rust` / `@python` / etc. polyglot blocks → bounded artifacts** — **partially complete and security-hardened.** The supported PBLang surface is `stdlib:polyglot.sapp` plus `polyglot_registry.sapp`: interpreted execution requires explicit `trusted_source=true`, bounded input/output/time/memory, fixed executable candidates, and no raw fallback. Compilation requires separate toolchain-effect approval and returns a verified private artifact without loading it into the VM. The Linux Python isolation substrate, an effect-free authenticated per-principal broker protocol, and a pidfd-backed opaque asynchronous process lifecycle now exist as separate layers; the protocol does not yet invoke a worker. The process supervisor reserves ownership before launch, reaps abandoned completed handles opportunistically, pins leader identity during group cancellation, and tears down same-group descendants after atomic status publication. It is not cgroup/PID-namespace confinement and therefore is not by itself an untrusted-code sandbox. The old raw `polyglot_*` VM builtins remain bootstrap/reference code, are not called by the stdlib facade, and are immutable high-severity findings in `pbsecure`. Remaining: broker-owned isolated execution wiring, typed-FFI brokers, cross-platform bounded process backends, runtime identity/seccomp/cgroup hardening, and compiler-level hiding/removal of the retained bootstrap names.
 > - **IDE-server → tokio**, **`pblang serve` → axum**, **CLI → clap** — **all done**. The serve handler now uses axum 0.7 on a dedicated tokio runtime; the CLI uses clap 4 derive for 21 subcommands.
 > - **CLI capability flags** — **done**. `pblang run`, `pblang test`, and the REPL accept `--allow-exec` / `--allow-ffi` / `--allow-all` / `--sandbox` / per-cap `--allow-<cap>` / `--deny-<cap>`, plus `PBLANG_ALLOW_EXEC` / `PBLANG_ALLOW_FFI` / `PBLANG_ALLOW_ALL` / `PBLANG_SANDBOX` env-var fallbacks. CLI flags take precedence over env. 6 dedicated CLI tests in `tests/new_cmd.rs::cap_*` cover default-denial, --allow-ffi, --allow-all, --sandbox-overrides-env, env-var-alone, and flag-stripping from script-args.
 > - **JSON ingress caps** — **done**. `VmLimits.max_external_json_bytes` (default 10 MB) + `VmHost::max_external_json_bytes()` trait method + `pblang_vm::bounded_json_parse` helper, applied at the three external-JSON ingress points: pblang-ffi `pblang_call_function` args, vm.rs `ai_chat` options, pblang-pm `parse_registry_index` + `search` response. Caller can override via `VmLimits.max_external_json_bytes = Some(...)`. Regression tests in `tests/install_cli.rs::registry_index_*`.
-> - **`pblang build --warm-polyglot`** — **done**. Walks the package source tree, extracts every `@lang { ... }` block, dedups by `(lang, code)`, filters to the 16 cdylib-cacheable languages (rust/c/cpp/go/pascal/csharp/fsharp/zig/d/nim/swift/haskell/fortran/objc/ocaml/java/kotlin), and pre-warms the cache by calling `polyglot_compile_cached` for each. Idempotent: re-runs hit the cache (ms latency). Missing toolchains report "skipped" cleanly. 3 CLI tests in `tests/new_cmd.rs::build_warm_polyglot_*`.
+> - **`pblang build --warm-polyglot`** — **legacy bootstrap, not a production publication path.** Its historical cache prewarming depended on in-process `polyglot_compile_cached`; the PBLang stdlib now fails that API closed. A replacement must publish only bounded, verified artifacts through `polyglot_registry.compile`, retain cleanup ownership, and never load untrusted native constructors into the compiler process.
 > - **HTTPS for `pblang serve`** — **done**. `--cert <pem>` / `--key <pem>` flags wire the IDE backend through `axum-server 0.7` + `rustls 0.23` (ring provider, process-wide install). Startup banner + CORS allowlist auto-switch scheme. Plain HTTP path unchanged when flags absent. Validation: both flags must be provided together. 2 CLI tests in `tests/new_cmd.rs::serve_https_*` (uses a raw rustls client with accept-any verifier to handshake against the self-signed test cert).
 > - **Polyglot builtins extracted from `vm.rs`** — **done**. 7 fns + 5 helpers moved to `crates/pblang-vm/src/vm/polyglot.rs` (2,156 lines). vm.rs dropped 12,321 → 10,208 (−17%). Same `pub(super)` pattern as `strings.rs`, `db.rs`, `net.rs`. Further extraction candidates remain (math, array, map, http, json, encoding, ai, quantum).
 > - **`pblang-ffi` wire-in** — done; it's a `cdylib` intentionally, consumed by *external* embedders (C/C++/Python/Go). Earlier reports flagging "not reachable from the binary" were a category error.
@@ -3068,7 +3068,7 @@ If you want, I can continue by translating the rest too, but I would need the fi
 Prepared using GPT-5.4 Thinking
 
 
-“Add every capability and feature you can add to this programming language, plus extra capabilities and features, and make it future-proof and quantum/AI-ready, with AI, quantum, and web capabilities. I know this is a lot, but I want it to become the best, most optimal, ultra-powerful, easy, smart programming language possible, with many libraries and many different tools, and to be ready enough that you could use it to build an operating system with it, and also have the ability to use any programming language you want together with its code in the same file.” read again these files [@Future_plans.md](file:///media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang/old/Future_plans.md) , [@Future_plans.md](file:///media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang/docs/Future_plans.md) and choose the best for this project(the best for me is to have everything and be the best programming language we have ever created together) and do what they are saying to this project and continue with what remains from previous session and also do what it is not implemented or partial implemented to the whole project and inrich/improve the current implementation and libraries andd all entities of the project in order to become better
+“Add every capability and feature you can add to this programming language, plus extra capabilities and features, and make it future-proof and quantum/AI-ready, with AI, quantum, and web capabilities. I know this is a lot, but I want it to become the best, most optimal, ultra-powerful, easy, smart programming language possible, with many libraries and many different tools, and to be ready enough that you could use it to build an operating system with it, and also have the ability to use any programming language you want together with its code in the same file.” read again these files [@Future_plans.md](file://$PBLANG_ROOT/old/Future_plans.md) , [@Future_plans.md](file://$PBLANG_ROOT/docs/Future_plans.md) and choose the best for this project(the best for me is to have everything and be the best programming language we have ever created together) and do what they are saying to this project and continue with what remains from previous session and also do what it is not implemented or partial implemented to the whole project and inrich/improve the current implementation and libraries andd all entities of the project in order to become better
 
 Realistically, what happens with “add everything”?
 “All features” — OS building, AI/quantum, a full web stack, polyglot code in the same file, endless libraries and tools — is not one feature but an entire ecosystem. What we can do properly is build it as a platform: a stable runtime/IR, package manager, FFI, stdlib, and tooling, so that libraries can be plugged in afterward.
@@ -3168,7 +3168,7 @@ The answer given is clearly no. The document explains that pblang currently runs
 It argues that this is not just a matter of “missing features,” but a deep architectural mismatch between a safe managed scripting platform and the needs of kernel or driver development. It says pblang could eventually serve as a high-level scripting layer for tools or userland, but not for building the kernel itself.
 
 Overall pending work
-The final overall conclusion in the document is that pblang is currently a strong foundation or early platform, not yet a fully complete production platform. The highest-impact pending items are the package registry, threads, native executables, and the type system, because without those, later goals such as AI integration, quantum tooling, a full IDE + pb-mcp-server + my own ai model inside the ide for pblang coding combined by default, self-hosting, and broader platform ambitions cannot be built correctly.also, i want to add to my project mechanisms like rust mechanism or go or any other programming language mechanism that can improve my project.i'm thinking , now the project was written in rust and it has the memory protection and other mechanisms of rust but if someone write on this language the memory protection and other mechanisms of rust will be gone and the problem will be bigger when the project move from rust to pblang , if all of that is true then i want to solve it if you can .now make the threads safe and enhanced like other programming languages like go,kotlin,rust and more.check my whole project and all the documentation ,check for errors,warnings,bugs,vulnerabilities,sensitive data and more and also tell me what it is imcomplete(partial implemented),not implemented,wrong logic and more.read this whole file (/media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang/docs/Future_plans.md) and continue the improvements and implementations and make a total optimazation on a bit level of the programming language and do what ever it takes to make it the best programming language overall of all categories/topic with tons of features in a way that no one needs to use every other programming language ever agin,"One programming can create anything, no more a lot of programmiing language to create one thing"
+The final overall conclusion in the document is that pblang is currently a strong foundation or early platform, not yet a fully complete production platform. The highest-impact pending items are the package registry, threads, native executables, and the type system, because without those, later goals such as AI integration, quantum tooling, a full IDE + pb-mcp-server + my own ai model inside the ide for pblang coding combined by default, self-hosting, and broader platform ambitions cannot be built correctly.also, i want to add to my project mechanisms like rust mechanism or go or any other programming language mechanism that can improve my project.i'm thinking , now the project was written in rust and it has the memory protection and other mechanisms of rust but if someone write on this language the memory protection and other mechanisms of rust will be gone and the problem will be bigger when the project move from rust to pblang , if all of that is true then i want to solve it if you can .now make the threads safe and enhanced like other programming languages like go,kotlin,rust and more.check my whole project and all the documentation ,check for errors,warnings,bugs,vulnerabilities,sensitive data and more and also tell me what it is imcomplete(partial implemented),not implemented,wrong logic and more.read this whole file ($PBLANG_ROOT/docs/Future_plans.md) and continue the improvements and implementations and make a total optimazation on a bit level of the programming language and do what ever it takes to make it the best programming language overall of all categories/topic with tons of features in a way that no one needs to use every other programming language ever agin,"One programming can create anything, no more a lot of programmiing language to create one thing"
 
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -3269,23 +3269,23 @@ The binary is fully operational. Here is the complete summary of everything done
 
 ● Now the full workspace verification.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       cargo test --workspace --no-fail-fast -- --test-threads=4 2>&1 | grep -E "Running |Doc-tests…)
   ⎿  Running in the background (↓ to manage)
      
-● Bash(until grep -qE "=== exit:" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/bu2f53m9…)
+● Bash(until grep -qE "=== exit:" <temporary-task-dir>/workspace-tests…)
   ⎿  Running in the background (↓ to manage)
   ⎿  (timeout 10m)
 
 ● Waiting on the full workspace run. 
 
-● Bash(until grep -qE "=== exit:" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/bu2f53m9…)
+● Bash(until grep -qE "=== exit:" <temporary-task-dir>/workspace-tests…)
   ⎿  Running in the background (↓ to manage)
   ⎿  (timeout 10m)
 
   Read 1 file (ctrl+o to expand)
 
-● Bash(while ! grep -qE "=== exit:" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/bu2f53…)
+● Bash(while ! grep -qE "=== exit:" <temporary-task-dir>/workspace-tests…)
   ⎿  Running in the background (↓ to manage)
   ⎿  (timeout 10m)
 
@@ -3293,7 +3293,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
   Read 1 file (ctrl+o to expand)
 
-● Bash(while ! grep -qE "=== exit:" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/bu2f53…)
+● Bash(while ! grep -qE "=== exit:" <temporary-task-dir>/workspace-tests…)
   ⎿  Running in the background (↓ to manage)
   ⎿  (timeout 10m)
 
@@ -3351,10 +3351,10 @@ The binary is fully operational. Here is the complete summary of everything done
   continue through the remaining 32 stdlib files or pivot to another language-improvement direction. (disable recaps in /config)
 
 ❯ read these files                                                                                                                                                                               
-  (/media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang/docs/Future_plans.md),(/media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang/docs/Future_plansOLD.md) and         
+  ($PBLANG_ROOT/docs/Future_plans.md),($PBLANG_ROOT/docs/Future_plansOLD.md) and
   continue the imrovements/implementations for this programming language                                                                                                                         
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       wc -l docs/Future_plans.md docs/Future_plansOLD.md)
   ⎿     192 docs/Future_plans.md
        2947 docs/Future_plansOLD.md
@@ -3362,7 +3362,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
   Read 1 file (ctrl+o to expand)
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "### OLD Future_plans.md — section headings ###"…)
   ⎿  ### OLD Future_plans.md — section headings ###
      272:# Local imports (ήδη δουλεύει)
@@ -3373,14 +3373,14 @@ The binary is fully operational. Here is the complete summary of everything done
 
 ● Let me batch a quick audit (TODO/panic/secrets/unsafe/skip patterns) while continuing the stdlib hardening.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "### A) TODO/FIXME/XXX/HACK in Rust src ###"…)
   ⎿  Waiting…
 
 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Bash command
 
-   cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+   cd $PBLANG_ROOT
    echo "### A) TODO/FIXME/XXX/HACK in Rust src ###"
    grep -rnE "TODO|FIXME|XXX|HACK" crates/ src/ --include="*.rs" 2>/dev/null | grep -v "// AUDIT" | wc -l
    echo "  (sample top 5)"
@@ -3389,7 +3389,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
   Read 1 file (ctrl+o to expand)
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "### OLD Future_plans.md — section headings ###"…)
   ⎿  ### OLD Future_plans.md — section headings ###
      272:# Local imports (ήδη δουλεύει)
@@ -3400,7 +3400,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
 ● Let me batch a quick audit (TODO/panic/secrets/unsafe/skip patterns) while continuing the stdlib hardening.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "### A) TODO/FIXME/XXX/HACK in Rust src ###"…)
   ⎿  ### A) TODO/FIXME/XXX/HACK in Rust src ###
      2
@@ -3410,7 +3410,7 @@ The binary is fully operational. Here is the complete summary of everything done
 ● Codebase is remarkably clean overall — only 2 false-positive "TODOs", 3 unwrap in vm.rs, no real hardcoded secrets, 9 well-bounded unsafe blocks, 6 ignored tests. Let me dig into the
   stdlib_parse ignored test and look at the 14 stdlib stubs.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "### stdlib_parse ignored test ###"…)
   ⎿  ### stdlib_parse ignored test ###
          }
@@ -3419,42 +3419,42 @@ The binary is fully operational. Here is the complete summary of everything done
 
   Read 1 file (ctrl+o to expand)
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       cargo test --test stdlib_parse -- --ignored --nocapture 2>&1 | grep -E "panicked|error|fail|…)
   ⎿  Running in the background (↓ to manage)
 
 ● Continuing stdlib hardening with 2-instance modules while the audit test runs.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       for f in stdlib/benchmark.sapp stdlib/colors.sapp stdlib/blockchain.sapp stdlib/bootstrap.sa…)
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "### stdlib_parse ignored test ###"…)
   ⎿  ### stdlib_parse ignored test ###
          }
          Ok(())
      … +29 lines (ctrl+o to expand)
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       cargo test --test stdlib_parse -- --ignored --nocapture 2>&1 | grep -E "panicked|error|fail|…)
   ⎿  Running in the background (↓ to manage)
 
 ● Continuing stdlib hardening with 2-instance modules while the audit test runs.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       for f in stdlib/benchmark.sapp stdlib/colors.sapp stdlib/blockchain.sapp stdlib/bootstrap.sa…)
   ⎿  ###### stdlib/benchmark.sapp ######
      1|fn run(name, fn_to_bench, iterations) {
        -> 2:     if iterations == nil { iterations = 10; }
      … +45 lines (ctrl+o to expand)
 
-● Bash(until grep -qE "=== exit:" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/b0u8rksa…)
+● Bash(until grep -qE "=== exit:" <temporary-task-dir>/stdlib-parse…)
   ⎿  warning: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in ses
-     sion dir `/media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang/target/debug/incremental/pblang_llvm-18zo1ywah5dxe/s-hisc6xfnm6-1jp5zvg-working`
+     sion dir `$PBLANG_ROOT/target/debug/incremental/pblang_llvm-18zo1ywah5dxe/s-hisc6xfnm6-1jp5zvg-working`
      warning: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in ses
      … +8 lines (ctrl+o to expand)
 
 ● Background command "Run the ignored stdlib_parse test to see actual error" completed (exit code 0)
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       cargo test --test stdlib_parse stdlib_graphics_parses_and_typechecks -- --ignored --nocaptur…)
   ⎿  Running in the background (↓ to manage)
 
@@ -3487,7 +3487,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
 ● Not a parse error — a typecheck error: 14 builtins are missing from typeck's prelude (num_floor, num_mod, gfx*, sleep_ms). Let me find the prelude.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       grep -nE "num_pow|seed_builtin|builtin_prelude|num_floor" crates/pblang-typeck/src/lib.rs |…)
   ⎿  309:fn seed_builtin_prelude(env: &mut Env) {
      363:        ("num_pow", fn2(num.clone())),
@@ -3496,7 +3496,7 @@ The binary is fully operational. Here is the complete summary of everything done
 
   Read 1 file (ctrl+o to expand)
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       grep -nE "ExprKind::Call|fn infer_call|Call\(.*args" crates/pblang-typeck/src/lib.rs | head…)
   ⎿  522:        ExprKind::Call(callee, args) => {
 
@@ -3691,19 +3691,19 @@ The binary is fully operational. Here is the complete summary of everything done
 
 ● Now verifying: the typeck additions + the graphics-parse test + all modules tests.
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       cargo test --no-fail-fast --test stdlib_parse --test modules --test semantics 2>&1 | grep -E…)
   ⎿  Running in the background (↓ to manage)
 
 ● While verification runs, let me write the audit findings the user asked for (incomplete / partial / wrong-logic items).
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "=== how many stdlib funcs still have body-side nil defaults ==="…)
   ⎿  === how many stdlib funcs still have body-side nil defaults ===
      36
      … +24 lines (ctrl+o to expand)
 
-● Bash(until grep -qE "=== exit:" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/b09xhyc7…)
+● Bash(until grep -qE "=== exit:" <temporary-task-dir>/semantic-tests…)
   ⎿       Running tests/modules.rs (target/debug/deps/modules-71c2ee10f8a7007a)
      test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.46s
           Running tests/semantics.rs (target/debug/deps/semantics-97daf514c0fe3eb8)
@@ -3744,24 +3744,24 @@ The binary is fully operational. Here is the complete summary of everything done
       534 +    );                                                                                                                                                                         
       535  }
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       cargo test --workspace --no-fail-fast -- --test-threads=4 2>&1 | grep -E "Running |test resu…)
   ⎿  Running in the background (↓ to manage)
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       echo "=== concurrency.rs unwraps (16 of them) — context ==="…)
   ⎿  === concurrency.rs unwraps (16 of them) — context ===
      980:        self.stats.lock().unwrap().spawned += 1;
      990:                    let mut h = handles.lock().unwrap();
      … +31 lines (ctrl+o to expand)
 
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
       # Recount with grep -lE (escape brackets in shell)…)
   ⎿  36
 
   Read 1 file (ctrl+o to expand)
 
-● Bash(until grep -qE "=== exit:" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/b24az3t4…)
+● Bash(until grep -qE "=== exit:" <temporary-task-dir>/full-workspace-tests…)
   ⎿  Running in the background (↓ to manage)
   ⎿  (timeout 10m)
 
@@ -3968,12 +3968,12 @@ The binary is fully operational. Here is the complete summary of everything done
    └ Audit docs + tests + CI · 41 tool uses · 158.1k tokens
      Audit docs + tests + CI · 49 tool uses · 162.1k tokensojec…
         Done
-● Bash(cd /media/panosboy/ExtHD/panag/Documents/projects/AAP/pl-dev/pblang
+● Bash(cd $PBLANG_ROOT
 ●     graphify query "What are the biggest cross-community bridges and most important nodes — whic…)
   ⎿  Waiting…
      Runnl+b in the background (↓ to manage)
 
-● Bash(until grep -qE "^---$|finished in" /tmp/claude-1000/-media-panosboy-ExtHD-panag-Documents-projects-AAP-pl-dev-pblang/24032599-b237-41ab-8090-6d5e70a34561/tasks/…)
+● Bash(until grep -qE "^---$|finished in" <temporary-task-dir>/graph-query…)
   ⎿  EDGE require_pblang_bin() --calls [EXTRACTED context=call]--> manifest_check_valid_manifest_succeeds()
      EDGE require_pblang_bin() --calls [EXTRACTED context=call]--> manifest_check_invalid_manifest_fails()
      EDGE require_pblang_bin() --calls [EXTRACTED context=call]--> lock_strict_manifest_validator_rejects_non_semver_version()

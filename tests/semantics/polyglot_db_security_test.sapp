@@ -1,22 +1,82 @@
-// tests/semantics/polyglot_db_security_test.sapp — injection hardening for polyglot_db.sapp
+let DB = import("stdlib:polyglot_db.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
 
-let DB = import("stdlib/polyglot_db.sapp");
+fn fail(message) { throw "FAIL " + message; }
+fn eq(actual, expected, message) {
+    if actual != expected { fail(message + " got=" + str(actual) + " want=" + str(expected)); }
+}
+fn contains(items, value) {
+    for i len(items) { if items[i] == value { return true; } }
+    return false;
+}
 
-fn fail(m) { throw "FAIL " + m; }
-fn eq(a, b, m) { if a != b { fail(m + " got=" + str(a) + " want=" + str(b)); } }
+let password = "secret;$(touch /tmp/pblang-db-pwned)";
+let pg = DB.postgres_conn("127.0.0.1", "5432", "app", password, "demo");
+eq(type(pg), "map", "PostgreSQL builder returns a typed connection");
+let pg_plan = DB.plan_query("postgresql", pg, "SELECT 1; SELECT 'private'");
+eq(pg_plan.ok, true, "PostgreSQL plan accepted");
+eq(pg_plan.shell_used, false, "PostgreSQL plan is shell-free");
+eq(pg_plan.bounded, true, "PostgreSQL plan is bounded");
+eq(pg_plan.credentials_in_argv, false, "PostgreSQL credentials stay out of argv");
+eq(str_contains(str(pg_plan.args), password), false, "PostgreSQL argv redacts password");
+eq(contains(pg_plan.environment_keys, "PGPASSFILE"), true, "PostgreSQL declares credential-file path");
+eq(pg_plan.credential_transport, "mode-0600-file", "PostgreSQL uses credential file");
+eq(pg_plan.exec_bytes <= 32768, true, "PostgreSQL plan fits supervisor byte limit");
+eq(str_contains(str(pg_plan.args), "SELECT 1"), false, "PostgreSQL SQL uses private stdin");
+eq(pg_plan.stdin_bytes > 0, true, "PostgreSQL stdin is present");
 
-// ── escape_arg: POSIX single-quote escaping (makes any string one safe shell token) ──
-eq(DB.escape_arg("safe"), "'safe'", "plain string quoted");
-eq(DB.escape_arg("a'b"), "'a'\\''b'", "single quote escaped");
-eq(DB.escape_arg("x; rm -rf ~"), "'x; rm -rf ~'", "metachars neutralized by quoting");
+let mysql = DB.mysql_conn("localhost", 3306, "app", password, "demo");
+let mysql_plan = DB.plan_query("mysql", mysql, "SELECT 1");
+eq(mysql_plan.ok, true, "MySQL plan accepted");
+eq(str_contains(str(mysql_plan.args), password), false, "MySQL argv redacts password");
+eq(mysql_plan.credential_transport, "mode-0600-file", "MySQL uses credential file");
+eq(contains(mysql_plan.environment_keys, "MYSQL_PWD"), false, "MySQL secret environment removed");
 
-// ── redis command/conn metachar guard: must reject, NOT execute ───────────────────
-let r = DB.query("redis", "-h localhost", "GET k; touch /tmp/pwned_db");
-eq(r.ok, false, "injection attempt rejected (ok=false)");
-if str_index_of(str(r.error) + str(r.stderr), "unsafe") < 0 { fail("rejection reason mentions 'unsafe': " + str(r)); }
+let redis_secret = DB.redis_conn("127.0.0.1", 6379, password, "0");
+eq(DB.plan_query("redis", redis_secret, ["PING"]).ok, false,
+    "authenticated Redis CLI fails closed in favor of native redis.sapp");
+let redis = DB.redis_conn("127.0.0.1", 6379, "", "0");
+let hostile = "k; touch /tmp/pblang-db-pwned";
+let redis_plan = DB.plan_query("redis", redis, ["GET", hostile]);
+eq(redis_plan.ok, true, "Redis metacharacters remain literal argv data");
+eq(redis_plan.shell_used, false, "Redis plan is shell-free");
+eq(redis_plan.args[len(redis_plan.args) - 1], hostile, "Redis hostile key is one argv entry");
+eq(redis_plan.exec_bytes <= 32768, true, "Redis plan fits supervisor byte limit");
+eq(redis_plan.credential_transport, "none", "unauthenticated Redis needs no credential transport");
 
-// a metachar in the conn is also rejected
-let r2 = DB.query("redis", "-h localhost`reboot`", "GET k");
-eq(r2.ok, false, "unsafe conn rejected");
+eq(DB.plan_query("redis", redis, "GET key").ok, false,
+    "legacy Redis command strings fail closed");
+eq(DB.plan_query("mysql", "-u root -psecret demo", "SELECT 1").ok, false,
+    "legacy multi-token MySQL connection strings fail closed");
+eq(DB.plan_query("unknown", map{}, "SELECT 1").ok, false,
+    "unknown database adapters fail closed");
+
+let bad_table = DB.describe_table("sqlite", ":memory:", "users;DROP_TABLE");
+eq(bad_table.ok, false, "unsafe table identifier is rejected before execution");
+
+let mongo_secret = DB.mongodb_conn("localhost", 27017, "demo", "app", password);
+eq(DB.plan_query("mongodb", mongo_secret, "db.stats()").ok, false,
+    "MongoDB password transport fails closed rather than exposing argv credentials");
+
+let too_many = [];
+while len(too_many) < 58 { array_push(too_many, "x"); }
+eq(DB.plan_query("redis", redis, too_many).ok, false,
+    "Redis argv count exceeding the supervisor contract fails during planning");
+
+let migration_dir = "/tmp/pblang-db-migrations-"
+    + str_slice(sha256(base64_encode_bytes(random_bytes(16))), 0, 16);
+let migration_path = path_join(migration_dir, "001-create.sql");
+let migration_created = SECURE.write_text_new_exclusive(migration_path, "SELECT 1;", true, true);
+eq(migration_created.ok, true,
+    "private migration fixture created: " + (try migration_created.error catch "unknown rejection"));
+let manifest = DB.migration_manifest(migration_dir, ["001-create.sql"]);
+eq(manifest.ok, true, "migration manifest reads a bounded snapshot");
+eq(len(manifest.entries), 1, "migration manifest contains one SQL file");
+eq(DB.migrate("sqlite", ":memory:", migration_dir).ok, false,
+    "migration execution requires an explicit pinned manifest");
+eq(DB.migrate("sqlite", ":memory:", migration_dir, map{ "001-create.sql": "wrong" }).ok, false,
+    "migration digest mismatch fails before execution");
+eq(SECURE.remove_file(migration_path, true).ok, true, "migration fixture removed safely");
+try fs_remove(migration_dir) catch nil;
 
 print "polyglot_db_security_pass";

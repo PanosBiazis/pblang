@@ -1,0 +1,828 @@
+// Authenticated, replay-safe protocol state for a future polyglot broker.
+//
+// This slice is deliberately effect-free. It has no listener, process,
+// polyglot, isolation, filesystem, or execution imports.
+
+let AES = import("stdlib:aes_gcm.sapp");
+let SHA = import("stdlib:sha256_pb.sapp");
+let HARDEN = import("stdlib:harden.sapp");
+let CRYPTO = import("stdlib:crypto.sapp");
+let IAM = import("stdlib:iam.sapp");
+
+let REQUEST_FORMAT = "pblang.exec-broker.request.v1";
+let RESPONSE_FORMAT = "pblang.exec-broker.response.v1";
+let HANDLE_FORMAT = "pblang.exec-broker.handle.v1";
+let DISPATCH_FORMAT = "pblang.exec-broker.dispatch.v1";
+let CLIENT_FORMAT = "pblang.exec-broker.client.v1";
+let DESCRIPTOR_FORMAT = "pblang.exec-broker.descriptor.v1";
+let PENDING_FORMAT = "pblang.exec-broker.pending.v1";
+let OPERATION = "polyglot.execute.v1";
+let MAX_FRAME_BYTES = 131072;
+let MAX_SOURCE_BYTES = 3584;
+let MAX_INPUT_BYTES = 65536;
+let MAX_BROKERS = 64;
+let MAX_CLIENTS = 1024;
+let MAX_BINDINGS = 1024;
+let _BROKERS = map{};
+let _DISPATCHERS = map{};
+let _CLIENTS = map{};
+
+fn _append(out, values) { for value in values { array_push(out, value); } }
+fn _copy(values) { let out = []; _append(out, values); return out; }
+
+fn _validated_octets(value, label, exact_length = nil, maximum = 131072) {
+    if exact_length == nil { exact_length = -1; }
+    if type(value) != "array" or len(value) > maximum
+       or (exact_length >= 0 and len(value) != exact_length) {
+        throw "polyglot_broker_protocol: invalid " + label;
+    }
+    for i len(value) {
+        if type(value[i]) != "number" or value[i] != num_floor(value[i])
+           or value[i] < 0 or value[i] > 255 {
+            throw "polyglot_broker_protocol: invalid " + label + " byte";
+        }
+    }
+    return value;
+}
+
+fn _integer(value, low, high, label) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < low or value > high {
+        throw "polyglot_broker_protocol: invalid " + label;
+    }
+    return value;
+}
+
+fn _u32(value) {
+    _integer(value, 0, 4294967295, "u32");
+    return [num_floor(value / 16777216) % 256,
+        num_floor(value / 65536) % 256,
+        num_floor(value / 256) % 256, value % 256];
+}
+
+fn _u64(value) {
+    _integer(value, 0, 9007199254740991, "u64");
+    let high = num_floor(value / 4294967296);
+    let low = value - high * 4294967296;
+    let out = _u32(high); _append(out, _u32(low)); return out;
+}
+
+fn _read_u32(bytes, at) {
+    if at < 0 or at + 4 > len(bytes) { throw "polyglot_broker_protocol: truncated u32"; }
+    return bytes[at] * 16777216 + bytes[at + 1] * 65536
+        + bytes[at + 2] * 256 + bytes[at + 3];
+}
+
+fn _read_u64(bytes) {
+    _validated_octets(bytes, "u64", 8, 8);
+    let high = _read_u32(bytes, 0); let low = _read_u32(bytes, 4);
+    let value = high * 4294967296 + low;
+    return _integer(value, 0, 9007199254740991, "u64");
+}
+
+fn _field(out, value) {
+    _validated_octets(value, "field");
+    _append(out, _u32(len(value))); _append(out, value);
+}
+
+fn _unsigned(fields) {
+    let out = [];
+    for field in fields { _field(out, field); }
+    return out;
+}
+
+fn _text(value, label, maximum) {
+    if type(value) != "string" or len(str_to_bytes(value)) < 1
+       or len(str_to_bytes(value)) > maximum
+       or str_contains(value, strfromcharcode(0)) {
+        throw "polyglot_broker_protocol: invalid " + label;
+    }
+    return value;
+}
+
+fn _id(value, label) {
+    _text(value, label, 64);
+    if not regex_match(value, "^[a-z][a-z0-9_-]{2,63}$") {
+        throw "polyglot_broker_protocol: invalid " + label;
+    }
+    return value;
+}
+
+fn _audience(value) {
+    _text(value, "audience", 64);
+    if not regex_match(value, "^[a-z][a-z0-9._-]{2,63}$") {
+        throw "polyglot_broker_protocol: invalid audience";
+    }
+    return value;
+}
+
+fn _credential_id(value) {
+    if type(value) != "string" or not regex_match(value, "^key_[a-f0-9]{24}$") {
+        throw "polyglot_broker_protocol: invalid credential_id";
+    }
+    return value;
+}
+
+fn _decode_text(value, label, maximum) {
+    _validated_octets(value, label, -1, maximum);
+    let text = try bytes_to_str(value) catch nil;
+    if type(text) != "string" or len(str_to_bytes(text)) != len(value)
+       or str_contains(text, strfromcharcode(0)) {
+        throw "polyglot_broker_protocol: invalid UTF-8 " + label;
+    }
+    return text;
+}
+
+fn _reader(frame, field_count) {
+    _validated_octets(frame, "frame", -1, MAX_FRAME_BYTES);
+    if len(frame) < 4 or _read_u32(frame, 0) != len(frame) - 4 {
+        throw "polyglot_broker_protocol: frame length mismatch";
+    }
+    let fields = []; let at = 4; let remaining = field_count;
+    while remaining > 0 {
+        if at + 4 > len(frame) { throw "polyglot_broker_protocol: truncated field"; }
+        let count = _read_u32(frame, at); at = at + 4;
+        if count > MAX_FRAME_BYTES or at + count > len(frame) {
+            throw "polyglot_broker_protocol: invalid field length";
+        }
+        let value = []; let end = at + count;
+        while at < end { array_push(value, frame[at]); at = at + 1; }
+        array_push(fields, value);
+        remaining = remaining - 1;
+    }
+    if at + 4 > len(frame) { throw "polyglot_broker_protocol: missing tag"; }
+    let tag_count = _read_u32(frame, at); at = at + 4;
+    if tag_count != 32 or at + 32 != len(frame) {
+        throw "polyglot_broker_protocol: invalid tag framing";
+    }
+    let tag = [];
+    while at < len(frame) { array_push(tag, frame[at]); at = at + 1; }
+    return map{ fields: fields, tag: tag, unsigned: _unsigned(fields) };
+}
+
+fn _direction_key(key, direction, audience, epoch, credential_id, principal, organization_id) {
+    let context = _unsigned([
+        str_to_bytes("pblang.exec-broker.kdf.v1"),
+        str_to_bytes(direction), str_to_bytes(audience), epoch,
+        str_to_bytes(credential_id), str_to_bytes(principal),
+        str_to_bytes(organization_id)
+    ]);
+    return AES.hmac_sha256_bytes(context, key);
+}
+
+fn _tag(unsigned, key, direction, audience, epoch, credential_id, principal, organization_id) {
+    let direction_key = _direction_key(key, direction, audience, epoch,
+        credential_id, principal, organization_id);
+    let message = _u32(len(unsigned)); _append(message, unsigned);
+    let result = AES.hmac_sha256_bytes(message, direction_key);
+    HARDEN.scrub(direction_key);
+    return result;
+}
+
+fn _frame(unsigned, tag) {
+    let body = _copy(unsigned); _field(body, _validated_octets(tag, "tag", 32, 32));
+    if len(body) + 4 > MAX_FRAME_BYTES {
+        throw "polyglot_broker_protocol: frame exceeds 128 KiB";
+    }
+    let out = _u32(len(body)); _append(out, body); return out;
+}
+
+fn _same(left, right) {
+    return type(left) == "array" and type(right) == "array"
+        and len(left) == len(right) and CRYPTO.ct_equal_bytes(left, right);
+}
+
+fn _contains(values, target) {
+    for i len(values) { if values[i] == target { return true; } }
+    return false;
+}
+
+fn _token(registry, maximum, label) {
+    if len(map_keys(registry)) >= maximum {
+        throw "polyglot_broker_protocol: " + label + " registry capacity reached";
+    }
+    for attempt 8 {
+        let seed = random_bytes(32);
+        _append(seed, str_to_bytes(str(now_ms()) + ":" + str(attempt)));
+        let token = SHA.sha256_hex_bytes(seed); HARDEN.scrub(seed);
+        if not map_has(registry, token) { return token; }
+    }
+    throw "polyglot_broker_protocol: identity allocation failed";
+}
+
+fn _public_instance(private_id) {
+    for attempt 8 {
+        let seed = random_bytes(32);
+        _append(seed, str_to_bytes("pblang.exec-broker.public.v1:" + private_id
+            + ":" + str(attempt)));
+        let candidate = SHA.sha256_hex_bytes(seed); HARDEN.scrub(seed);
+        let used = false; let ids = map_keys(_BROKERS);
+        for i len(ids) {
+            if (try _BROKERS[ids[i]].public_instance catch "") == candidate {
+                used = true;
+            }
+        }
+        if candidate != private_id and not used { return candidate; }
+    }
+    throw "polyglot_broker_protocol: public identity allocation failed";
+}
+
+fn _scrub_binding(binding) {
+    if type(binding) == "map" and type(try binding.key catch nil) == "array" {
+        HARDEN.scrub(binding.key);
+    }
+}
+
+fn _scrub_broker(state) {
+    if type(state) == "map" and type(try state.bindings catch nil) == "map" {
+        let ids = map_keys(state.bindings);
+        for i len(ids) { _scrub_binding(state.bindings[ids[i]]); }
+        state.bindings = map{};
+    }
+}
+
+fn _retire_clients(public_instance) {
+    let ids = map_keys(_CLIENTS);
+    for i len(ids) {
+        let state = _CLIENTS[ids[i]];
+        if state.public_instance == public_instance {
+            HARDEN.scrub(state.key); state.pending = nil;
+            map_remove(_CLIENTS, ids[i]);
+        }
+    }
+}
+
+fn _reap() {
+    let current = num_floor(now_ms());
+    let ids = map_keys(_BROKERS);
+    for i len(ids) {
+        let state = _BROKERS[ids[i]];
+        if current - state.last_used_ms > state.idle_timeout_ms
+           or current - state.created_ms > state.absolute_lifetime_ms {
+            _scrub_broker(state); _retire_clients(state.public_instance);
+            map_remove(_DISPATCHERS, state.dispatch_id);
+            map_remove(_BROKERS, ids[i]);
+        }
+    }
+    ids = map_keys(_CLIENTS);
+    for i len(ids) {
+        let state = _CLIENTS[ids[i]];
+        if current - state.last_used_ms > state.idle_timeout_ms
+           or current - state.created_ms > state.absolute_lifetime_ms {
+            HARDEN.scrub(state.key); map_remove(_CLIENTS, ids[i]);
+        }
+    }
+}
+
+fn _broker(handle) {
+    _reap();
+    if type(handle) != "map" or (try handle.format catch "") != HANDLE_FORMAT
+       or type(try handle.id catch nil) != "string"
+       or not map_has(_BROKERS, handle.id) {
+        throw "polyglot_broker_protocol: invalid or closed broker handle";
+    }
+    let state = _BROKERS[handle.id]; state.last_used_ms = num_floor(now_ms()); return state;
+}
+
+fn _client(handle) {
+    _reap();
+    if type(handle) != "map" or (try handle.format catch "") != CLIENT_FORMAT
+       or type(try handle.id catch nil) != "string"
+       or not map_has(_CLIENTS, handle.id) {
+        throw "polyglot_broker_protocol: invalid or closed client handle";
+    }
+    let state = _CLIENTS[handle.id]; state.last_used_ms = num_floor(now_ms()); return state;
+}
+
+fn _dispatcher(handle) {
+    _reap();
+    if type(handle) != "map" or (try handle.format catch "") != DISPATCH_FORMAT
+       or type(try handle.id catch nil) != "string"
+       or not map_has(_DISPATCHERS, handle.id) {
+        throw "polyglot_broker_protocol: invalid or closed dispatch handle";
+    }
+    let broker_id = _DISPATCHERS[handle.id];
+    if not map_has(_BROKERS, broker_id) {
+        map_remove(_DISPATCHERS, handle.id);
+        throw "polyglot_broker_protocol: dispatch broker is closed";
+    }
+    let state = _BROKERS[broker_id];
+    state.last_used_ms = num_floor(now_ms()); return state;
+}
+
+fn _options(value, allowed) {
+    if value == nil { value = map{}; }
+    if type(value) != "map" { throw "polyglot_broker_protocol: options must be a map"; }
+    let keys = map_keys(value);
+    for i len(keys) {
+        let known = false;
+        for j len(allowed) { if keys[i] == allowed[j] { known = true; } }
+        if not known { throw "polyglot_broker_protocol: unknown option"; }
+    }
+    return value;
+}
+
+fn new(iam, options = nil) {
+    if not (try IAM.validate(iam).ok catch false) {
+        throw "polyglot_broker_protocol: invalid IAM authority";
+    }
+    options = _options(options, ["audience", "max_bindings", "max_attempts",
+        "idle_timeout_ms", "absolute_lifetime_ms"]);
+    _reap();
+    let audience = _audience(try options.audience catch "pblang-local-broker");
+    let max_bindings = _integer(try options.max_bindings catch 64,
+        1, MAX_BINDINGS, "max_bindings");
+    let max_attempts = _integer(try options.max_attempts catch 1024,
+        1, 100000, "max_attempts");
+    let idle = _integer(try options.idle_timeout_ms catch 600000,
+        1, 3600000, "idle_timeout_ms");
+    let absolute = _integer(try options.absolute_lifetime_ms catch 3600000,
+        idle, 3600000, "absolute_lifetime_ms");
+    let id = _token(_BROKERS, MAX_BROKERS, "broker");
+    let dispatch_id = _token(_DISPATCHERS, MAX_BROKERS, "dispatch");
+    let public_instance = _public_instance(id);
+    let epoch = random_bytes(16); let current = num_floor(now_ms());
+    _BROKERS[id] = map{ audience: audience, epoch: epoch, iam: iam,
+        dispatch_id: dispatch_id, public_instance: public_instance, bindings: map{},
+        max_bindings: max_bindings, max_attempts: max_attempts,
+        idle_timeout_ms: idle, absolute_lifetime_ms: absolute,
+        created_ms: current, last_used_ms: current, requests: 0, rejected: 0 };
+    _DISPATCHERS[dispatch_id] = id;
+    return map{ format: HANDLE_FORMAT, id: id };
+}
+
+fn dispatch_handle(handle) {
+    let state = _broker(handle);
+    return map{ format: DISPATCH_FORMAT, id: state.dispatch_id };
+}
+
+fn descriptor(handle) {
+    let state = _broker(handle);
+    return map{ format: DESCRIPTOR_FORMAT, audience: state.audience,
+        epoch: _copy(state.epoch), broker_instance: state.public_instance,
+        request_format: REQUEST_FORMAT,
+        response_format: RESPONSE_FORMAT, operation: OPERATION,
+        executable: false, executed: false, effects_applied: false };
+}
+
+fn describe(handle) {
+    let state = _broker(handle);
+    return map{ format: "pblang.exec-broker.description.v1",
+        audience: state.audience, epoch: _copy(state.epoch),
+        bindings: len(map_keys(state.bindings)), max_bindings: state.max_bindings,
+        max_attempts: state.max_attempts, requests: state.requests,
+        rejected: state.rejected, secret_material_exposed: false,
+        listener_configured: false, runner_configured: false,
+        executable: false, executed: false, effects_applied: false,
+        production_execution_ready: false };
+}
+
+fn _key(value) {
+    _validated_octets(value, "credential key", 32, 32); return _copy(value);
+}
+
+fn bind_credential(handle, credential_id, principal, organization_id, key_bytes) {
+    let state = _broker(handle);
+    credential_id = _credential_id(credential_id);
+    principal = _id(principal, "principal");
+    organization_id = _id(organization_id, "organization_id");
+    if map_has(state.bindings, credential_id) {
+        throw "polyglot_broker_protocol: credential is already bound";
+    }
+    if len(map_keys(state.bindings)) >= state.max_bindings {
+        throw "polyglot_broker_protocol: binding capacity reached";
+    }
+    let key = _key(key_bytes);
+    let authenticated_identity = IAM.authenticate_credential(state.iam, credential_id,
+        SHA.sha256_hex_bytes(key));
+    if authenticated_identity == nil
+       or authenticated_identity.user_id != principal
+       or authenticated_identity.organization_id != organization_id {
+        HARDEN.scrub(key);
+        throw "polyglot_broker_protocol: credential binding authorization failed";
+    }
+    if IAM.authorize_credential(state.iam, credential_id, principal,
+        organization_id, "tools.execute") == nil {
+        HARDEN.scrub(key);
+        throw "polyglot_broker_protocol: credential binding authorization failed";
+    }
+    state.bindings[credential_id] = map{ principal: principal,
+        organization_id: organization_id, key: key, expected_seq: 0,
+        authenticated_attempts: 0, accepted_requests: 0,
+        last_broker_time_ms: 0, last_used_ms: num_floor(now_ms()) };
+    return map{ ok: true, credential_id: credential_id,
+        principal: principal, organization_id: organization_id,
+        expected_seq: 0, key_exposed: false };
+}
+
+fn unbind_credential(handle, credential_id) {
+    let state = _broker(handle); credential_id = _credential_id(credential_id);
+    let binding = try state.bindings[credential_id] catch nil;
+    if type(binding) != "map" { return map{ ok: true, removed: false }; }
+    _scrub_binding(binding); map_remove(state.bindings, credential_id);
+    return map{ ok: true, removed: true };
+}
+
+fn close(handle) {
+    let state = _broker(handle); _scrub_broker(state);
+    _retire_clients(state.public_instance);
+    map_remove(_DISPATCHERS, state.dispatch_id); map_remove(_BROKERS, handle.id);
+    return map{ ok: true, closed: true };
+}
+
+fn _request_fields(desc, binding, intent, sequence, issued_at_ms,
+                   deadline_ms, request_id) {
+    if type(desc) != "map" or (try desc.format catch "") != DESCRIPTOR_FORMAT {
+        throw "polyglot_broker_protocol: invalid broker descriptor";
+    }
+    let audience = _audience(try desc.audience catch "");
+    let epoch = _copy(_validated_octets(try desc.epoch catch nil, "epoch", 16, 16));
+    if type(binding) != "map" {
+        throw "polyglot_broker_protocol: invalid client binding";
+    }
+    let credential_id = _credential_id(try binding.credential_id catch "");
+    let principal = _id(try binding.principal catch "", "principal");
+    let organization_id = _id(try binding.organization_id catch "", "organization_id");
+    if type(intent) != "map" { throw "polyglot_broker_protocol: intent must be a map"; }
+    let operation = _text(try intent.operation catch OPERATION, "operation", 64);
+    let language = _text(try intent.language catch "", "language", 64);
+    let source = try intent.source catch nil; let input = try intent.input catch "";
+    if type(source) != "string" or len(str_to_bytes(source)) > MAX_SOURCE_BYTES
+       or str_contains(source, strfromcharcode(0))
+       or type(input) != "string" or len(str_to_bytes(input)) > MAX_INPUT_BYTES
+       or str_contains(input, strfromcharcode(0)) {
+        throw "polyglot_broker_protocol: source or input exceeds framing policy";
+    }
+    let timeout = _integer(try intent.timeout_secs catch 10,
+        0, 9007199254740991, "timeout_secs");
+    let output = _integer(try intent.max_output_bytes catch 1048576,
+        0, 9007199254740991, "max_output_bytes");
+    let memory = _integer(try intent.max_memory_bytes catch 268435456,
+        0, 9007199254740991, "max_memory_bytes");
+    sequence = _integer(sequence, 0, 9007199254740990, "sequence");
+    issued_at_ms = _integer(issued_at_ms, 0, 9007199254740991, "issued_at_ms");
+    deadline_ms = _integer(deadline_ms, 0, 9007199254740991, "deadline_ms");
+    request_id = _copy(_validated_octets(request_id, "request_id", 16, 16));
+    return map{ audience: audience, epoch: epoch, credential_id: credential_id,
+        principal: principal, organization_id: organization_id,
+        sequence: sequence, issued_at_ms: issued_at_ms, deadline_ms: deadline_ms,
+        request_id: request_id, operation: operation, language: language,
+        source: source, input: input, timeout_secs: timeout,
+        max_output_bytes: output, max_memory_bytes: memory,
+        fields: [str_to_bytes(REQUEST_FORMAT), str_to_bytes("request"),
+            str_to_bytes(audience), epoch, str_to_bytes(credential_id),
+            str_to_bytes(principal), str_to_bytes(organization_id), _u64(sequence),
+            _u64(issued_at_ms), _u64(deadline_ms), request_id,
+            str_to_bytes(operation), str_to_bytes(language), str_to_bytes(source),
+            str_to_bytes(input), _u64(timeout), _u64(output), _u64(memory)] };
+}
+
+fn make_request(desc, binding, key_bytes, intent, sequence,
+                issued_at_ms, deadline_ms, request_id = nil) {
+    let key = _key(key_bytes);
+    if request_id == nil { request_id = random_bytes(16); }
+    let request = _request_fields(desc, binding, intent, sequence,
+        issued_at_ms, deadline_ms, request_id);
+    let unsigned = _unsigned(request.fields);
+    let tag = _tag(unsigned, key, "request", request.audience, request.epoch,
+        request.credential_id, request.principal, request.organization_id);
+    let frame = _frame(unsigned, tag); HARDEN.scrub(key); HARDEN.scrub(tag);
+    return map{ ok: true, format: PENDING_FORMAT, frame: frame,
+        sequence: request.sequence, request_id: _copy(request.request_id),
+        request_digest: SHA.sha256_hex_bytes(frame),
+        credential_id: request.credential_id, principal: request.principal,
+        organization_id: request.organization_id,
+        audience: request.audience, epoch: _copy(request.epoch) };
+}
+
+fn _parse_request(frame) {
+    let parsed = _reader(frame, 18); let f = parsed.fields;
+    let request = map{
+        format: _decode_text(f[0], "format", 64),
+        kind: _decode_text(f[1], "kind", 16),
+        audience: _decode_text(f[2], "audience", 64), epoch: _copy(f[3]),
+        credential_id: _decode_text(f[4], "credential_id", 64),
+        principal: _decode_text(f[5], "principal", 64),
+        organization_id: _decode_text(f[6], "organization_id", 64),
+        sequence: _read_u64(f[7]), issued_at_ms: _read_u64(f[8]),
+        deadline_ms: _read_u64(f[9]), request_id: _copy(f[10]),
+        operation_raw: _copy(f[11]), language_raw: _copy(f[12]),
+        source_raw: _copy(f[13]), input_raw: _copy(f[14]),
+        timeout_secs: _read_u64(f[15]),
+        max_output_bytes: _read_u64(f[16]),
+        max_memory_bytes: _read_u64(f[17]),
+        fields: f, unsigned: parsed.unsigned, tag: parsed.tag };
+    if request.format != REQUEST_FORMAT or request.kind != "request"
+       or len(request.epoch) != 16 or len(request.request_id) != 16
+       or request.sequence > 9007199254740990 {
+        throw "polyglot_broker_protocol: invalid request envelope";
+    }
+    _audience(request.audience); _credential_id(request.credential_id);
+    _id(request.principal, "principal"); _id(request.organization_id, "organization_id");
+    return request;
+}
+
+fn _intent_status(request) {
+    let operation = try _decode_text(request.operation_raw, "operation", 64) catch nil;
+    if operation == nil or operation != OPERATION { return "invalid_operation"; }
+    let language = try _decode_text(request.language_raw, "language", 64) catch nil;
+    if language == nil or language != "python" { return "unsupported_language"; }
+    if (try _decode_text(request.source_raw, "source", MAX_SOURCE_BYTES) catch nil) == nil {
+        return "invalid_source";
+    }
+    if (try _decode_text(request.input_raw, "input", MAX_INPUT_BYTES) catch nil) == nil {
+        return "invalid_input";
+    }
+    if request.timeout_secs < 1 or request.timeout_secs > 30 {
+        return "invalid_timeout";
+    }
+    if request.max_output_bytes < 1 or request.max_output_bytes > 1048576 {
+        return "invalid_output_limit";
+    }
+    if request.max_memory_bytes < 33554432
+       or request.max_memory_bytes > 536870912 {
+        return "invalid_memory_limit";
+    }
+    return "authorized_no_effect";
+}
+
+fn _response_fields(state, binding, request, request_digest, broker_time,
+                    status, authorized, iam_revision) {
+    return [str_to_bytes(RESPONSE_FORMAT), str_to_bytes("response"),
+        str_to_bytes(state.audience), state.epoch,
+        str_to_bytes(request.credential_id), str_to_bytes(binding.principal),
+        str_to_bytes(binding.organization_id), _u64(request.sequence),
+        request.request_id, str_to_bytes(request_digest), _u64(broker_time),
+        str_to_bytes(status), _u64(binding.expected_seq), _u64(iam_revision),
+        [if authorized { 1 } else { 0 }], [0], [0], [0]];
+}
+
+fn _signed_response(state, binding, request, frame, broker_time,
+                    status, authorized, iam_revision) {
+    let digest = SHA.sha256_hex_bytes(frame);
+    let fields = _response_fields(state, binding, request, digest,
+        broker_time, status, authorized, iam_revision);
+    let unsigned = _unsigned(fields);
+    let tag = _tag(unsigned, binding.key, "response", state.audience,
+        state.epoch, request.credential_id, binding.principal,
+        binding.organization_id);
+    let response = _frame(unsigned, tag); HARDEN.scrub(tag); return response;
+}
+
+fn _silent(error) {
+    return map{ ok: false, authenticated: false, consumed: false,
+        response_frame: nil, error: error, executable: false,
+        executed: false, effects_applied: false };
+}
+
+fn handle_request(handle, frame) {
+    let state = _dispatcher(handle);
+    let broker_time_ms = num_floor(now_ms());
+    let request = try _parse_request(frame) catch nil;
+    if request == nil { state.rejected = state.rejected + 1; return _silent("malformed request"); }
+    let binding = try state.bindings[request.credential_id] catch nil;
+    if type(binding) != "map" or request.audience != state.audience
+       or not _same(request.epoch, state.epoch)
+       or request.principal != binding.principal
+       or request.organization_id != binding.organization_id {
+        state.rejected = state.rejected + 1; return _silent("request context mismatch");
+    }
+    let expected_tag = _tag(request.unsigned, binding.key, "request",
+        state.audience, state.epoch, request.credential_id,
+        binding.principal, binding.organization_id);
+    if not _same(request.tag, expected_tag) {
+        HARDEN.scrub(expected_tag);
+        state.rejected = state.rejected + 1; return _silent("request authentication failed");
+    }
+    HARDEN.scrub(expected_tag);
+    if IAM.authorize_credential(state.iam, request.credential_id,
+        binding.principal, binding.organization_id, "tools.execute") == nil {
+        if request.sequence == binding.expected_seq {
+            binding.expected_seq = binding.expected_seq + 1;
+            let denied = _signed_response(state, binding, request, frame,
+                broker_time_ms, "authorization_denied", false,
+                try state.iam.revision catch 0);
+            _scrub_binding(binding); map_remove(state.bindings, request.credential_id);
+            state.requests = state.requests + 1;
+            return map{ ok: false, authenticated: true, consumed: true,
+                response_frame: denied, status: "authorization_denied",
+                expected_seq: request.sequence + 1, authorized: false,
+                binding_retired: true, executable: false, executed: false,
+                effects_applied: false };
+        }
+        _scrub_binding(binding); map_remove(state.bindings, request.credential_id);
+        state.rejected = state.rejected + 1;
+        return _silent("credential authorization revoked");
+    }
+    binding.last_used_ms = num_floor(now_ms()); state.requests = state.requests + 1;
+    let status = ""; let consumed = false; let authorized = false;
+    if request.sequence < binding.expected_seq { status = "sequence_replay"; }
+    elif request.sequence > binding.expected_seq { status = "sequence_gap"; }
+    else {
+        if binding.authenticated_attempts >= state.max_attempts {
+            let exhausted = _signed_response(state, binding, request, frame,
+                broker_time_ms, "quota_exhausted", false,
+                try state.iam.revision catch 0);
+            _scrub_binding(binding); map_remove(state.bindings, request.credential_id);
+            return map{ ok: false, authenticated: true, consumed: false,
+                response_frame: exhausted, status: "quota_exhausted",
+                expected_seq: request.sequence, authorized: false,
+                binding_retired: true, executable: false, executed: false,
+                effects_applied: false };
+        }
+        binding.authenticated_attempts = binding.authenticated_attempts + 1;
+        binding.expected_seq = binding.expected_seq + 1; consumed = true;
+        if request.deadline_ms <= request.issued_at_ms
+           or request.deadline_ms - request.issued_at_ms > 30000
+           or broker_time_ms < binding.last_broker_time_ms {
+            status = "invalid_time";
+        } elif request.issued_at_ms > broker_time_ms + 5000 {
+            status = "not_yet_valid";
+        } elif broker_time_ms >= request.deadline_ms {
+            status = "expired";
+        } else {
+            status = _intent_status(request);
+            if status == "authorized_no_effect" {
+                authorized = true;
+                binding.accepted_requests = binding.accepted_requests + 1;
+            }
+        }
+        if broker_time_ms > binding.last_broker_time_ms {
+            binding.last_broker_time_ms = broker_time_ms;
+        }
+    }
+    let response = _signed_response(state, binding, request, frame,
+        broker_time_ms, status, authorized, try state.iam.revision catch 0);
+    return map{ ok: status == "authorized_no_effect", authenticated: true,
+        consumed: consumed, response_frame: response, status: status,
+        expected_seq: binding.expected_seq, authorized: authorized,
+        executable: false, executed: false, effects_applied: false };
+}
+
+fn _parse_response(frame) {
+    let parsed = _reader(frame, 18); let f = parsed.fields;
+    let response = map{
+        format: _decode_text(f[0], "format", 64),
+        kind: _decode_text(f[1], "kind", 16),
+        audience: _decode_text(f[2], "audience", 64), epoch: _copy(f[3]),
+        credential_id: _decode_text(f[4], "credential_id", 64),
+        principal: _decode_text(f[5], "principal", 64),
+        organization_id: _decode_text(f[6], "organization_id", 64),
+        sequence: _read_u64(f[7]), request_id: _copy(f[8]),
+        request_digest: _decode_text(f[9], "request_digest", 64),
+        broker_time_ms: _read_u64(f[10]),
+        status: _decode_text(f[11], "status", 64),
+        expected_seq: _read_u64(f[12]), iam_revision: _read_u64(f[13]),
+        authorized: len(f[14]) == 1 and f[14][0] == 1,
+        executable: len(f[15]) == 1 and f[15][0] == 1,
+        executed: len(f[16]) == 1 and f[16][0] == 1,
+        effects_applied: len(f[17]) == 1 and f[17][0] == 1,
+        fields: f, unsigned: parsed.unsigned, tag: parsed.tag };
+    if response.format != RESPONSE_FORMAT or response.kind != "response"
+       or len(response.epoch) != 16 or len(response.request_id) != 16
+       or not regex_match(response.request_digest, "^[a-f0-9]{64}$")
+       or not _contains(["authorized_no_effect", "authorization_denied",
+            "sequence_replay", "sequence_gap", "invalid_time", "not_yet_valid",
+            "expired", "invalid_operation", "unsupported_language", "invalid_source",
+            "invalid_input", "invalid_timeout", "invalid_output_limit",
+            "invalid_memory_limit", "quota_exhausted"], response.status)
+       or response.authorized != (response.status == "authorized_no_effect")
+       or len(f[14]) != 1 or f[14][0] > 1
+       or len(f[15]) != 1 or f[15][0] > 1
+       or len(f[16]) != 1 or f[16][0] > 1
+       or len(f[17]) != 1 or f[17][0] > 1 {
+        throw "polyglot_broker_protocol: invalid response envelope";
+    }
+    return response;
+}
+
+fn _response_state_valid(response) {
+    if response.status == "sequence_replay" {
+        return response.expected_seq > response.sequence;
+    }
+    if response.status == "sequence_gap" {
+        return response.expected_seq < response.sequence;
+    }
+    if response.status == "quota_exhausted" { return true; }
+    return response.sequence < 9007199254740991
+        and response.expected_seq == response.sequence + 1;
+}
+
+fn verify_response(desc, key_bytes, pending, frame) {
+    let key = _key(key_bytes);
+    if type(desc) != "map" or (try desc.format catch "") != DESCRIPTOR_FORMAT
+       or type(pending) != "map" or (try pending.format catch "") != PENDING_FORMAT {
+        HARDEN.scrub(key); return map{ ok: false, error: "invalid response context" };
+    }
+    let response = try _parse_response(frame) catch nil;
+    if response == nil {
+        HARDEN.scrub(key); return map{ ok: false, error: "malformed response" };
+    }
+    let audience = try desc.audience catch "";
+    let expected = _tag(response.unsigned, key, "response", response.audience,
+        response.epoch, response.credential_id, response.principal,
+        response.organization_id);
+    if response.audience != audience
+       or not _same(response.epoch, try desc.epoch catch [])
+       or response.credential_id != pending.credential_id
+       or response.principal != pending.principal
+       or response.organization_id != pending.organization_id
+       or response.sequence != pending.sequence
+       or not _same(response.request_id, pending.request_id)
+       or response.request_digest != pending.request_digest
+       or not _same(response.tag, expected) {
+        HARDEN.scrub(expected); HARDEN.scrub(key);
+        return map{ ok: false, error: "response authentication failed" };
+    }
+    HARDEN.scrub(expected); HARDEN.scrub(key);
+    if not _response_state_valid(response) {
+        return map{ ok: false, authenticated: true,
+            error: "authenticated response has an invalid sequence transition" };
+    }
+    if response.executable or response.executed or response.effects_applied {
+        return map{ ok: false, authenticated: true,
+            error: "effect-free protocol received effect claims" };
+    }
+    return map{ ok: true, authenticated: true, status: response.status,
+        expected_seq: response.expected_seq, iam_revision: response.iam_revision,
+        authorized: response.authorized, executable: false,
+        executed: false, effects_applied: false };
+}
+
+fn new_client(desc, binding, key_bytes, options = nil) {
+    options = _options(options, ["idle_timeout_ms", "absolute_lifetime_ms"]);
+    if type(desc) != "map" or (try desc.format catch "") != DESCRIPTOR_FORMAT {
+        throw "polyglot_broker_protocol: invalid broker descriptor";
+    }
+    let public_instance = try desc.broker_instance catch "";
+    if type(public_instance) != "string"
+       or not regex_match(public_instance, "^[a-f0-9]{64}$") {
+        throw "polyglot_broker_protocol: invalid broker instance";
+    }
+    let key = _key(key_bytes); let id = _token(_CLIENTS, MAX_CLIENTS, "client");
+    let idle = _integer(try options.idle_timeout_ms catch 600000,
+        1, 3600000, "idle_timeout_ms");
+    let absolute = _integer(try options.absolute_lifetime_ms catch 3600000,
+        idle, 3600000, "absolute_lifetime_ms");
+    let credential_id = _credential_id(try binding.credential_id catch "");
+    let principal = _id(try binding.principal catch "", "principal");
+    let organization_id = _id(try binding.organization_id catch "", "organization_id");
+    let current = num_floor(now_ms());
+    _CLIENTS[id] = map{ public_instance: public_instance,
+        descriptor: map{ format: DESCRIPTOR_FORMAT,
+        audience: _audience(desc.audience),
+        epoch: _copy(_validated_octets(desc.epoch, "epoch", 16, 16)) },
+        binding: map{ credential_id: credential_id, principal: principal,
+            organization_id: organization_id },
+        key: key, next_seq: 0, pending: nil, idle_timeout_ms: idle,
+        absolute_lifetime_ms: absolute, created_ms: current,
+        last_used_ms: current };
+    return map{ format: CLIENT_FORMAT, id: id };
+}
+
+fn client_make_request(client, intent, issued_at_ms, deadline_ms) {
+    let state = _client(client);
+    if state.pending != nil {
+        throw "polyglot_broker_protocol: client already has a pending request";
+    }
+    let pending = make_request(state.descriptor, state.binding, state.key,
+        intent, state.next_seq, issued_at_ms, deadline_ms);
+    state.pending = pending;
+    return map{ ok: true, frame: _copy(pending.frame),
+        sequence: pending.sequence, request_id: _copy(pending.request_id) };
+}
+
+fn client_retry_pending(client) {
+    let state = _client(client);
+    if state.pending == nil { throw "polyglot_broker_protocol: client has no pending request"; }
+    return map{ ok: true, frame: _copy(state.pending.frame),
+        sequence: state.pending.sequence,
+        request_id: _copy(state.pending.request_id) };
+}
+
+fn client_verify_response(client, frame) {
+    let state = _client(client);
+    if state.pending == nil { return map{ ok: false, error: "client has no pending request" }; }
+    let result = verify_response(state.descriptor, state.key, state.pending, frame);
+    if result.ok {
+        state.next_seq = result.expected_seq; state.pending = nil;
+        if result.status == "authorization_denied" or result.status == "quota_exhausted" {
+            HARDEN.scrub(state.key); map_remove(_CLIENTS, client.id);
+            result.retired = true;
+        }
+    }
+    return result;
+}
+
+fn close_client(client) {
+    let state = _client(client); HARDEN.scrub(state.key);
+    state.pending = nil; map_remove(_CLIENTS, client.id);
+    return map{ ok: true, closed: true };
+}
+
+export REQUEST_FORMAT, RESPONSE_FORMAT, DISPATCH_FORMAT,
+       new, dispatch_handle, descriptor, describe,
+       bind_credential, unbind_credential, close,
+       make_request, verify_response, handle_request,
+       new_client, client_make_request, client_retry_pending,
+       client_verify_response, close_client;
