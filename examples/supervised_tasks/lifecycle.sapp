@@ -1,0 +1,146 @@
+let Thread = import("stdlib:thread.sapp");
+
+let FORMAT = "pblang.example.supervised-lifecycle.v1";
+let MIN_DEADLINE_MS = 20;
+let MAX_DEADLINE_MS = 10000;
+let MAX_SHORT_ITERATIONS = 64;
+let MAX_DELAY_MS = 1000;
+
+fn _integer(value, minimum, maximum, name) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw "supervised_tasks: " + name + " must be an integer from "
+            + str(minimum) + " to " + str(maximum);
+    }
+    return value;
+}
+
+fn _options(options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "supervised_tasks: options must be a map"; }
+
+    let short_iterations = _integer(
+        try options.short_iterations catch 5,
+        1, MAX_SHORT_ITERATIONS, "short_iterations");
+    let short_delay_ms = _integer(
+        try options.short_delay_ms catch 2,
+        0, MAX_DELAY_MS, "short_delay_ms");
+    let worker_poll_ms = _integer(
+        try options.worker_poll_ms catch 1,
+        1, MAX_DELAY_MS, "worker_poll_ms");
+    let deadline_ms = _integer(
+        try options.deadline_ms catch 1000,
+        MIN_DEADLINE_MS, MAX_DEADLINE_MS, "deadline_ms");
+    let planned_short_ms = short_iterations * short_delay_ms;
+    if planned_short_ms + 10 > deadline_ms {
+        throw "supervised_tasks: deadline must include at least 10 ms cleanup headroom";
+    }
+    if worker_poll_ms + 10 > deadline_ms {
+        throw "supervised_tasks: deadline must cover one cancellation poll plus cleanup headroom";
+    }
+
+    return map{
+        short_iterations: short_iterations,
+        short_delay_ms: short_delay_ms,
+        worker_poll_ms: worker_poll_ms,
+        deadline_ms: deadline_ms,
+        background_deadline_ms: deadline_ms + worker_poll_ms + 10,
+        planned_short_ms: planned_short_ms
+    };
+}
+
+fn plan(options = nil) {
+    let selected = _options(options);
+    return map{
+        format: FORMAT,
+        execution: "structured",
+        daemon_threads: false,
+        bounded: true,
+        cooperative_cancellation: true,
+        preemptive_kill: false,
+        workers: [
+            map{ role: "short-task", terminal: "completed",
+                iterations: selected.short_iterations,
+                delay_ms: selected.short_delay_ms },
+            map{ role: "background-task", terminal: "cancelled",
+                poll_ms: selected.worker_poll_ms }
+        ],
+        deadline_ms: selected.deadline_ms,
+        background_deadline_ms: selected.background_deadline_ms,
+        planned_short_ms: selected.planned_short_ms
+    };
+}
+
+fn run(options = nil) {
+    let selected = _options(options);
+    let supervisor = Thread.supervisor();
+
+    let background_id = supervisor.spawn_cooperative_with_args(fn(token, values) {
+        let pause = channel_buffered(1);
+        while not token.requested(token) {
+            recv_timeout(pause.receiver, values[0]);
+        }
+        return "cooperative-stop";
+    }, [selected.worker_poll_ms], selected.background_deadline_ms);
+
+    let short_id = supervisor.spawn_with_args(fn(values) {
+        let pause = channel_buffered(1);
+        let index = 0;
+        while index < values[0] {
+            recv_timeout(pause.receiver, values[1]);
+            index = index + 1;
+        }
+        return index;
+    }, [selected.short_iterations, selected.short_delay_ms], selected.deadline_ms);
+
+    let short_status = supervisor.wait(short_id, selected.deadline_ms);
+    if not short_status.reaped {
+        short_status = supervisor.wait(short_id, selected.short_delay_ms + 10);
+    }
+    let cancellation_accepted = supervisor.cancel(
+        background_id, "short-task-terminal:" + short_status.status);
+    let background_status = supervisor.wait(background_id, selected.worker_poll_ms + 10);
+    if not background_status.reaped {
+        background_status = supervisor.wait(background_id, selected.deadline_ms);
+    }
+    let before_reap = supervisor.stats();
+    let reaped = supervisor.reap();
+    let after_reap = supervisor.stats();
+
+    let verified = short_status.status == "completed"
+        and cancellation_accepted
+        and background_status.status == "cancelled"
+        and before_reap.active == 0
+        and before_reap.detached == 0
+        and before_reap.unreaped == 0
+        and reaped == 2
+        and after_reap.tracked == 0;
+
+    return map{
+        format: FORMAT,
+        verified: verified,
+        execution: "structured",
+        daemon_threads: false,
+        short_status: short_status,
+        background_status: background_status,
+        cancellation_accepted: cancellation_accepted,
+        before_reap: before_reap,
+        reaped: reaped,
+        after_reap: after_reap,
+        selected: selected
+    };
+}
+
+fn capabilities() {
+    return map{
+        format: "pblang.example.supervised-lifecycle.capabilities.v1",
+        structured_workers: true,
+        bounded_deadlines: true,
+        cooperative_cancellation: true,
+        deterministic_reaping: true,
+        preemptive_thread_termination: false,
+        blocking_native_call_isolation: false
+    };
+}
+
+export plan, run, capabilities;
