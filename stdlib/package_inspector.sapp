@@ -1,0 +1,226 @@
+// stdlib/package_inspector.sapp -- bounded, non-executing package metadata inspection.
+
+let Manifest = import("stdlib:manifest_validate.sapp");
+let Semver = import("stdlib:semver.sapp");
+
+let MAX_MANIFEST_CHARS = 262144;
+let MAX_CATALOG_ENTRIES = 1024;
+let MAX_QUERY_ITEMS = 128;
+
+fn _fail(message) { throw "package_inspector: " + message; }
+
+fn _option(options, name, fallback) {
+    if type(options) == "map" and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _valid_name(name) {
+    if type(name) != "string" or len(name) == 0 or len(name) > 128
+       or str_contains(name, "..") or str_contains(name, "//")
+       or str_starts_with(name, "/") or str_ends_with(name, "/") {
+        return false;
+    }
+    let slash_count = 0;
+    let i = 0;
+    while i < len(name) {
+        let c = strcharcodeat(name, i);
+        if c == 47 { slash_count = slash_count + 1; }
+        if not (c >= 65 and c <= 90) and not (c >= 97 and c <= 122)
+           and not (c >= 48 and c <= 57) and c != 45 and c != 46 and c != 64
+           and c != 95 and c != 47 { return false; }
+        i = i + 1;
+    }
+    return slash_count <= 1;
+}
+
+fn _source_kind(value) {
+    let kind = str(value);
+    if kind == "local" or kind == "registry" or kind == "path" or kind == "git" {
+        return kind;
+    }
+    _fail("source_kind must be local, registry, path or git");
+}
+
+fn _valid_requirement(requirement) {
+    if type(requirement) != "string" or len(requirement) > 128 { return false; }
+    let value = str_trim(requirement);
+    if value == "" or value == "*" { return true; }
+    let offset = 0;
+    if str_starts_with(value, ">=") or str_starts_with(value, "<=") { offset = 2; }
+    elif str_starts_with(value, ">") or str_starts_with(value, "<")
+       or str_starts_with(value, "=") or str_starts_with(value, "^")
+       or str_starts_with(value, "~") { offset = 1; }
+    return Semver.valid_strict(str_trim(str_slice(value, offset, len(value))));
+}
+
+fn normalize_catalog(entries) {
+    if type(entries) != "array" or len(entries) > MAX_CATALOG_ENTRIES {
+        _fail("catalog must contain at most " + str(MAX_CATALOG_ENTRIES) + " entries");
+    }
+    let out = [];
+    let seen = map{};
+    for item in entries {
+        if type(item) != "map" { _fail("catalog entries must be maps"); }
+        let name = try item.name catch nil;
+        let version = try item.version catch nil;
+        if not _valid_name(name) { _fail("catalog contains an invalid package name"); }
+        if type(version) != "string" or not Semver.valid_strict(version) {
+            _fail("catalog contains an invalid strict semantic version");
+        }
+        let kind = _source_kind(try item.source_kind catch "local");
+        let key = name + "|" + version;
+        if not map_has(seen, key) {
+            seen[key] = true;
+            let parsed = Semver.parse_strict(version);
+            array_push(out, map{
+                name: name, version: version, source_kind: kind,
+                stable: parsed.prerelease == "", prerelease: parsed.prerelease != ""
+            });
+        }
+    }
+    return out;
+}
+
+fn _versions_from_normalized(name, catalog, include_prerelease) {
+    if not _valid_name(name) { _fail("query contains an invalid package name"); }
+    let versions = [];
+    for item in catalog {
+        if item.name == name and (include_prerelease or item.stable) {
+            array_push(versions, item.version);
+        }
+    }
+    return Semver.sort_desc(versions);
+}
+
+fn versions(name, entries, options = nil) {
+    let include_prerelease = _option(options, "include_prerelease", false);
+    if type(include_prerelease) != "bool" { _fail("include_prerelease must be boolean"); }
+    return _versions_from_normalized(name, normalize_catalog(entries), include_prerelease);
+}
+
+fn latest(name, entries, options = nil) {
+    let found = versions(name, entries, options);
+    if len(found) == 0 { return nil; }
+    return found[0];
+}
+
+fn _evaluate_normalized(name, installed, requirement, catalog, include_prerelease) {
+    if not _valid_requirement(requirement) { _fail("requirement is invalid or unsupported"); }
+    let all_versions = _versions_from_normalized(name, catalog, include_prerelease);
+    let matching = [];
+    for version in all_versions {
+        if Semver.satisfies(version, requirement) { array_push(matching, version); }
+    }
+    let newest = if len(matching) > 0 { matching[0] } else { nil };
+    let status = "unknown";
+    let reason = "";
+    if newest == nil {
+        status = "no-compatible-release";
+        reason = "catalog has no release satisfying the requirement";
+    } elif installed == nil or installed == "" {
+        status = "missing";
+        reason = "package is not installed";
+    } elif type(installed) != "string" or not Semver.valid_strict(installed) {
+        status = "invalid-installed-version";
+        reason = "installed version is not strict semantic versioning";
+    } elif not Semver.satisfies(installed, requirement) {
+        status = "incompatible-installed-version";
+        reason = "installed version does not satisfy the requirement";
+    } else {
+        let comparison = Semver.compare(installed, newest);
+        if comparison < 0 { status = "update-available"; reason = "a newer compatible release exists"; }
+        elif comparison == 0 { status = "current"; reason = "installed release is current"; }
+        else { status = "ahead"; reason = "installed release is newer than this catalog"; }
+    }
+    return map{
+        format: "pblang.package-inspection.v1",
+        name: name, installed: installed, requirement: requirement,
+        latest_compatible: newest, available_count: len(matching),
+        status: status, reason: reason,
+        executed: false, dynamic_import_used: false, bounded: true
+    };
+}
+
+fn evaluate(name, installed, requirement, entries, options = nil) {
+    let include_prerelease = _option(options, "include_prerelease", false);
+    if type(include_prerelease) != "bool" { _fail("include_prerelease must be boolean"); }
+    return _evaluate_normalized(name, installed, requirement,
+        normalize_catalog(entries), include_prerelease);
+}
+
+fn inspect_many(queries, entries, options = nil) {
+    if type(queries) != "array" or len(queries) > MAX_QUERY_ITEMS {
+        _fail("queries must contain at most " + str(MAX_QUERY_ITEMS) + " items");
+    }
+    let catalog = normalize_catalog(entries);
+    let include_prerelease = _option(options, "include_prerelease", false);
+    if type(include_prerelease) != "bool" { _fail("include_prerelease must be boolean"); }
+    let out = [];
+    for query in queries {
+        if type(query) != "map" { _fail("queries must be maps"); }
+        array_push(out, _evaluate_normalized(
+            try query.name catch nil,
+            try query.installed catch nil,
+            try query.requirement catch "*",
+            catalog,
+            include_prerelease
+        ));
+    }
+    return out;
+}
+
+fn inspect_manifest_text(text, options = nil) {
+    if type(text) != "string" or str_trim(text) == "" {
+        return map{ ok: false, errors: ["manifest text is empty"], bounded: true };
+    }
+    if len(text) > MAX_MANIFEST_CHARS {
+        return map{ ok: false, errors: ["manifest text exceeds the character budget"], bounded: true };
+    }
+    let checked = Manifest.validate_manifest_text(text);
+    let errors = [];
+    for message in checked.errors { array_push(errors, message); }
+    if checked.ok {
+        if not _valid_name(checked.package.name) {
+            array_push(errors, "[package].name is invalid for inspection");
+        }
+        if not Semver.valid_strict(checked.package.version) {
+            array_push(errors, "[package].version must use strict semantic versioning");
+        }
+    }
+    let kind_counts = map{ version: 0, path: 0, git: 0, detailed: 0 };
+    let dependency_names = [];
+    let include_names = _option(options, "include_dependency_names", false);
+    if type(include_names) != "bool" {
+        return map{ ok: false, errors: ["include_dependency_names must be boolean"], bounded: true };
+    }
+    for item in checked.dependency_items {
+        if map_has(kind_counts, item.kind) { kind_counts[item.kind] = kind_counts[item.kind] + 1; }
+        if include_names { array_push(dependency_names, item.name); }
+    }
+    return map{
+        format: "pblang.package-manifest-inspection.v1",
+        ok: len(errors) == 0,
+        errors: errors,
+        package: try checked.package catch map{ name: nil, version: nil, entry: nil },
+        dependency_count: try checked.dependency_count catch 0,
+        dependency_kind_counts: kind_counts,
+        dependency_names: dependency_names,
+        privacy: map{ dependency_names_included: include_names },
+        executed: false, dynamic_import_used: false, bounded: true
+    };
+}
+
+fn capabilities() {
+    return map{
+        format: "pblang.package-inspector.capabilities.v1",
+        manifest_text: true, strict_semver: true, catalog_lookup: true,
+        requirement_evaluation: true, process_execution: false,
+        dynamic_import: false, arbitrary_path_read: false,
+        max_manifest_chars: MAX_MANIFEST_CHARS,
+        max_catalog_entries: MAX_CATALOG_ENTRIES,
+        max_query_items: MAX_QUERY_ITEMS
+    };
+}
+
+export normalize_catalog, versions, latest, evaluate, inspect_many,
+       inspect_manifest_text, capabilities;

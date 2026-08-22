@@ -1,0 +1,72 @@
+// Execute pblang-generated AArch64 ELF files with an independent QEMU oracle.
+// The QEMU candidates are fixed and argv-only; no command text comes from a
+// manifest.  Every child is bounded by the Linux process supervisor.
+
+let OS=import("stdlib:os.sapp");
+let ARM64=import("stdlib:codegen_arm64.sapp");
+let DIFF=import("stdlib:emulator_diff.sapp");
+let PROCESS=import("stdlib:linux_process.sapp");
+let DIRFS=import("stdlib:linux_dirfs.sapp");
+
+fn cases() {
+    return [
+        map{id:"add",seed:104729,expected:12,ir:[["seti",0,7],["seti",1,5],["add",0,1]]},
+        map{id:"multiply",seed:130363,expected:42,ir:[["seti",0,6],["seti",1,7],["mul",0,1]]},
+        map{id:"bounded-loop",seed:155921,expected:11,
+            ir:[["seti",0,1],["seti",1,5],["loop",1,[["addi",0,2]]]]},
+        map{id:"zero-branch",seed:196613,expected:19,
+            ir:[["seti",2,0],["ifnz",2,[["seti",0,7]],[["seti",0,19]]]]},
+        map{id:"signed-compare",seed:262147,expected:1,
+            ir:[["seti",0,3],["seti",1,9],["cmp",0,1,"lt"]]}
+    ];
+}
+
+fn main() {
+    let root=cwd()+"/target/vm-lab"; fs_mkdirs(root);
+    let artifact_dir=DIRFS.open_absolute(root,false,false);
+    if not artifact_dir.ok { throw "pbemucheck: cannot open artifact directory safely"; }
+    let candidates=[OS.home_dir()+"/VMs/pblang-lab/controller/qemu-user-runtime/usr/bin/qemu-aarch64-static",
+        "/usr/bin/qemu-aarch64-static"];
+    let qemu=nil;
+    for i len(candidates) { if qemu==nil and (try fs_exists(candidates[i]) catch false) { qemu=candidates[i]; } }
+    if qemu==nil { throw "pbemucheck: no allowlisted qemu-aarch64-static executable"; }
+    let comparisons=[]; let started=now_ms(); let rows=cases();
+    for i len(rows) {
+        let row=rows[i]; let artifact=ARM64.compile_program(row.ir);
+        let path=root+"/arm64-"+row.id+"-"+str(row.seed)+".elf";
+        fs_write_bytes(path,artifact);
+        let protected=DIRFS.protect_executable(artifact_dir,path_basename(path));
+        if not protected.ok { DIRFS.close(artifact_dir); throw "pbemucheck: cannot protect generated ELF"; }
+        let case_started=now_ms();
+        let executed=PROCESS.run_fixed(["/usr/bin/timeout"],["--signal=KILL","5s",qemu,path],
+            map{timeout_secs:7,max_output_bytes:4096,
+            max_memory_bytes:536870912,max_cpu_seconds:3,max_open_files:64,max_processes:2048,
+            max_file_bytes:1048576,inherit_environment:false});
+        let actual=map{exit_code:try executed.exit_code catch -1};
+        let compared=DIFF.compare_case(row.id,row.seed,map{exit_code:row.expected},actual,["exit_code"]);
+        compared.artifact_sha256=sha256(base64_encode_bytes(artifact));
+        compared.oracle_exit_code=try executed.exit_code catch -1;
+        compared.oracle_stdout_sha256=sha256(try executed.stdout catch "");
+        compared.oracle_stderr_sha256=sha256(try executed.stderr catch "");
+        compared.duration_ms=now_ms()-case_started;
+        if not (try executed.ok catch false) or (try executed.timed_out catch false)
+           or not (try executed.process_group_terminated catch false) {
+            compared.ok=false;
+            array_push(compared.differences,map{field:"oracle_lifecycle",expected_present:true,
+                actual_present:true,expected:"bounded-clean-exit",actual:try executed.error catch "oracle-failed"});
+        }
+        if compared.ok { try fs_remove(path) catch nil; }
+        else { compared.artifact_path="target/vm-lab/"+path_basename(path); }
+        array_push(comparisons,compared);
+    }
+    let revision=try env_get("PBLANG_SOURCE_REVISION") catch nil;
+    if revision==nil or revision=="" { revision="working-tree"; }
+    let report=DIFF.report(map{backend:"pblang-arm64-v1",oracle:"qemu-aarch64-static",
+        architecture:"arm64",source_revision:revision},comparisons);
+    report.duration_ms=now_ms()-started;
+    DIRFS.close(artifact_dir);
+    print json_stringify(report);
+    if not report.ok { os_exit(1); }
+}
+
+main();

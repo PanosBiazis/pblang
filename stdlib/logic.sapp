@@ -12,8 +12,14 @@ fn pred(name, args = nil) {
     return map{ rel: name, args: args };
 }
 
+// Constraints are ordinary goals so they compose with rule bodies. `not_equal`
+// is intentionally a ground-value constraint: place it after goals that bind
+// its variables. This is deterministic and honest, but not a full dif/2 store.
+fn equal(left, right) { return pred("$equal", [left, right]); }
+fn not_equal(left, right) { return pred("$not_equal", [left, right]); }
+
 fn fact(database, rel, args) {
-    if map_has(database.facts, rel) == false {
+    if not map_has(database.facts, rel) {
         database.facts[rel] = [];
     }
     array_push(database.facts[rel], args);
@@ -51,7 +57,10 @@ fn _copy_subst(subst) {
 fn _resolve(term, subst) {
     let t = term;
     let guard = 0;
-    while is_var(t) and map_has(subst, t) and guard < 64 {
+    // A bounded query can recurse to depth 128 and introduce several renamed
+    // variables per level. Keep a larger finite ceiling so valid substitutions
+    // resolve completely while cyclic substitutions still cannot loop forever.
+    while is_var(t) and map_has(subst, t) and guard < 512 {
         t = subst[t];
         guard = guard + 1;
     }
@@ -99,10 +108,10 @@ fn apply_subst(args, subst) {
 }
 
 fn _rename_term(term, env, salt) {
-    if is_var(term) == false {
+    if not is_var(term) {
         return term;
     }
-    if map_has(env, term) == false {
+    if not map_has(env, term) {
         env[term] = term + "#" + str(salt);
     }
     return env[term];
@@ -132,6 +141,22 @@ fn _rename_rule(r, salt) {
 fn _solve_goal(database, goal, subst, depth) {
     let answers = [];
     if depth <= 0 { return answers; }
+
+    if goal.rel == "$equal" {
+        if len(goal.args) != 2 { return answers; }
+        let next = _unify_term(goal.args[0], goal.args[1], subst);
+        if next != nil { array_push(answers, next); }
+        return answers;
+    }
+    if goal.rel == "$not_equal" {
+        if len(goal.args) != 2 { return answers; }
+        let left = _resolve(goal.args[0], subst);
+        let right = _resolve(goal.args[1], subst);
+        if not is_var(left) and not is_var(right) and left != right {
+            array_push(answers, subst);
+        }
+        return answers;
+    }
 
     let facts = try database.facts[goal.rel] catch [];
     for i len(facts) {
@@ -181,6 +206,157 @@ fn query_depth(database, goal, depth) {
     return _solve_goal(database, goal, map{}, depth);
 }
 
+fn _bounded_integer(value, minimum, maximum, label) {
+    if not is_number(value) or value != num_floor(value)
+        or value < minimum or value > maximum {
+        throw "logic " + label + " must be an integer from "
+            + str(minimum) + " to " + str(maximum);
+    }
+    return value;
+}
+
+fn _bounded_context(options = nil) {
+    if options == nil { options = map{}; }
+    if not is_map(options) { throw "logic bounded options must be a map"; }
+    let max_depth = _bounded_integer(try options.max_depth catch 32,
+        1, 128, "max_depth");
+    let max_steps = _bounded_integer(try options.max_steps catch 10000,
+        1, 1000000, "max_steps");
+    let max_solutions = _bounded_integer(try options.max_solutions catch 1024,
+        1, 65536, "max_solutions");
+    return map{
+        max_depth: max_depth, max_steps: max_steps,
+        max_solutions: max_solutions, steps: 0, truncated: false
+    };
+}
+
+fn _take_step(context) {
+    if context.steps >= context.max_steps {
+        context.truncated = true;
+        return false;
+    }
+    context.steps = context.steps + 1;
+    return true;
+}
+
+fn _push_solution(rows, value, context) {
+    if len(rows) >= context.max_solutions {
+        context.truncated = true;
+        return false;
+    }
+    array_push(rows, value);
+    return true;
+}
+
+fn _solve_goal_bounded(database, goal, subst, depth, context) {
+    let answers = [];
+    if depth <= 0 {
+        context.truncated = true;
+        return answers;
+    }
+    if not _take_step(context) { return answers; }
+
+    if goal.rel == "$equal" {
+        if len(goal.args) != 2 { return answers; }
+        let next = _unify_term(goal.args[0], goal.args[1], subst);
+        if next != nil { _push_solution(answers, next, context); }
+        return answers;
+    }
+    if goal.rel == "$not_equal" {
+        if len(goal.args) != 2 { return answers; }
+        let left = _resolve(goal.args[0], subst);
+        let right = _resolve(goal.args[1], subst);
+        if not is_var(left) and not is_var(right) and left != right {
+            _push_solution(answers, subst, context);
+        }
+        return answers;
+    }
+
+    let facts = try database.facts[goal.rel] catch [];
+    for i len(facts) {
+        if not _take_step(context) { return answers; }
+        let next = _unify_args(goal.args, facts[i], subst);
+        if next != nil and not _push_solution(answers, next, context) {
+            return answers;
+        }
+    }
+
+    for i len(database.rules) {
+        if not _take_step(context) { return answers; }
+        let r = _rename_rule(database.rules[i], depth * 1000 + i);
+        if r.head.rel == goal.rel {
+            let head_subst = _unify_args(goal.args, r.head.args, subst);
+            if head_subst != nil {
+                let body_answers = _solve_all_bounded(
+                    database, r.body, head_subst, depth - 1, context);
+                let body_index = 0;
+                while body_index < len(body_answers) {
+                    if not _push_solution(answers, body_answers[body_index], context) {
+                        return answers;
+                    }
+                    body_index = body_index + 1;
+                }
+            }
+        }
+    }
+    return answers;
+}
+
+fn _solve_all_bounded(database, goals, subst, depth, context) {
+    let rows = [subst];
+    for i len(goals) {
+        let next_rows = [];
+        let row_index = 0;
+        while row_index < len(rows) {
+            let partials = _solve_goal_bounded(
+                database, goals[i], rows[row_index], depth, context);
+            let partial_index = 0;
+            while partial_index < len(partials) {
+                if not _push_solution(next_rows, partials[partial_index], context) {
+                    return next_rows;
+                }
+                partial_index = partial_index + 1;
+            }
+            if context.truncated and context.steps >= context.max_steps {
+                return next_rows;
+            }
+            row_index = row_index + 1;
+        }
+        rows = next_rows;
+        if len(rows) == 0 { return rows; }
+    }
+    return rows;
+}
+
+fn _bounded_result(rows, context) {
+    return map{
+        ok: true, rows: rows, solutions: len(rows), steps: context.steps,
+        truncated: context.truncated, max_depth: context.max_depth,
+        max_steps: context.max_steps, max_solutions: context.max_solutions
+    };
+}
+
+// Bounded query APIs publish their work evidence instead of returning a bare
+// array. A truncated result may contain useful partial rows, but callers must
+// inspect `truncated` before treating it as complete evidence.
+fn query_bounded(database, goal, options = nil) {
+    let context = _bounded_context(options);
+    let rows = _solve_goal_bounded(
+        database, goal, map{}, context.max_depth, context);
+    return _bounded_result(rows, context);
+}
+
+fn where_bounded(database, goals, options = nil) {
+    let context = _bounded_context(options);
+    let rows = _solve_all_bounded(
+        database, goals, map{}, context.max_depth, context);
+    return _bounded_result(rows, context);
+}
+
+fn ask_bounded(database, rel, args, options = nil) {
+    return query_bounded(database, pred(rel, args), options);
+}
+
 fn where(database, goals) {
     return _solve_all(database, goals, map{}, 32);
 }
@@ -226,12 +402,12 @@ fn _args_equal(a, b) {
 
 // retract(database, rel, args) — remove every fact for `rel` that exactly matches.
 fn retract(database, rel, args) {
-    if map_has(database.facts, rel) == false { return database; }
+    if not map_has(database.facts, rel) { return database; }
     let kept = [];
     let facts = database.facts[rel];
     let i = 0;
     while i < len(facts) {
-        if _args_equal(facts[i], args) == false { array_push(kept, facts[i]); }
+        if not _args_equal(facts[i], args) { array_push(kept, facts[i]); }
         i = i + 1;
     }
     database.facts[rel] = kept;
@@ -245,7 +421,7 @@ fn distinct(rows) {
     let i = 0;
     while i < len(rows) {
         let k = str(rows[i]);
-        if map_has(seen, k) == false { seen[k] = true; array_push(out, rows[i]); }
+        if not map_has(seen, k) { seen[k] = true; array_push(out, rows[i]); }
         i = i + 1;
     }
     return out;
@@ -260,6 +436,7 @@ fn select_one(rows, v) {
     return out;
 }
 
-export db, pred, fact, rule, add_rule, var, is_var;
+export db, pred, equal, not_equal, fact, rule, add_rule, var, is_var;
 export query, query_depth, where, ask, first, select, has_solution, apply_subst;
 export count, facts_of, retract, distinct, select_one;
+export query_bounded, where_bounded, ask_bounded;

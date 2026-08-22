@@ -1,0 +1,324 @@
+name: VM Lab Hosted Matrix
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-lab-hosted-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.94.0
+
+jobs:
+  native-hosted:
+    name: Native ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: ubuntu-24.04-x64
+            runner: ubuntu-24.04
+            python: python3
+            binary: target/debug/pblang
+          - target: windows-2025-x64
+            runner: windows-2025
+            python: python
+            binary: target/debug/pblang.exe
+          - target: macos-15-arm64
+            runner: macos-15
+            python: python3
+            binary: target/debug/pblang
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Run native checks and bind their evidence
+        shell: bash
+        env:
+          TARGET_ID: ${{ matrix.target }}
+          PYTHON_CMD: ${{ matrix.python }}
+          PBLANG_BINARY: ${{ matrix.binary }}
+        run: |
+          set -u
+          mkdir -p vm-lab-results/logs
+          : > vm-lab-results/checks
+          run_check() {
+            local name="$1"
+            shift
+            "$@" >"vm-lab-results/logs/${name}.log" 2>&1
+            local status=$?
+            cat "vm-lab-results/logs/${name}.log"
+            printf '%s=%s:%s\n' "$name" "$status" "vm-lab-results/logs/${name}.log" >> vm-lab-results/checks
+          }
+          run_check rust-install rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          run_check rust-select rustup default "$RUST_TOOLCHAIN"
+          run_check source-clean git diff --exit-code --no-ext-diff
+          run_check index-clean git diff --cached --exit-code --no-ext-diff
+          run_check cargo-build cargo build --workspace --locked
+          run_check cargo-test cargo test --workspace --locked
+          run_check semantics cargo run --locked -- test tests/semantics --allow-all --quiet --jobs=1
+          report_args=()
+          while IFS= read -r check; do report_args+=(--check "$check"); done < vm-lab-results/checks
+          "$PYTHON_CMD" tools/vm_lab_hosted_report.py record \
+            --target "$TARGET_ID" --evidence hosted-vm \
+            --output vm-lab-results/native.json \
+            --artifact "pblang=$PBLANG_BINARY" \
+            "${report_args[@]}"
+      - name: Upload native evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pblang-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            vm-lab-results/native.json
+            vm-lab-results/logs/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce native evidence
+        if: always()
+        shell: bash
+        env:
+          PYTHON_CMD: ${{ matrix.python }}
+        run: "$PYTHON_CMD tools/vm_lab_hosted_report.py verify vm-lab-results/native.json"
+
+  ios-simulator:
+    name: iOS simulator contract
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Run iOS checks, clean up, then bind evidence
+        shell: bash
+        run: |
+          set -u
+          mkdir -p vm-lab-results/logs
+          : > vm-lab-results/checks
+          run_check() {
+            local name="$1"
+            shift
+            "$@" >"vm-lab-results/logs/${name}.log" 2>&1
+            local status=$?
+            cat "vm-lab-results/logs/${name}.log"
+            printf '%s=%s:%s\n' "$name" "$status" "vm-lab-results/logs/${name}.log" >> vm-lab-results/checks
+            return 0
+          }
+          run_check rust-install rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          run_check rust-select rustup default "$RUST_TOOLCHAIN"
+          run_check source-clean git diff --exit-code --no-ext-diff
+          run_check index-clean git diff --cached --exit-code --no-ext-diff
+          run_check cargo-build cargo build --workspace --locked
+          run_check modern-ui cargo run --locked -- test tests/semantics --filter modern_ui --allow-all --quiet --jobs=1
+          run_check platform-emulator cargo run --locked -- test tests/semantics --filter platform_emulator --allow-all --quiet --jobs=1
+
+          runtime=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; rows=[r for r in json.load(sys.stdin)["runtimes"] if r.get("isAvailable") and r["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS-")]; print(rows[-1]["identifier"] if rows else "")')
+          device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; rows=[r for r in json.load(sys.stdin)["devicetypes"] if r["name"].startswith("iPhone")]; print(rows[0]["identifier"] if rows else "")')
+          udid=""
+          if [ -n "$runtime" ] && [ -n "$device_type" ]; then
+            udid=$(xcrun simctl create "pblang-ci-${GITHUB_RUN_ID}" "$device_type" "$runtime" 2>vm-lab-results/logs/simulator-create.log)
+            create_status=$?
+          else
+            printf 'No available iOS runtime or iPhone device type\n' > vm-lab-results/logs/simulator-create.log
+            create_status=1
+          fi
+          printf 'simulator-create=%s:%s\n' "$create_status" vm-lab-results/logs/simulator-create.log >> vm-lab-results/checks
+
+          boot_status=1
+          runtime_version="unknown"
+          if [ "$create_status" -eq 0 ]; then
+            xcrun simctl boot "$udid" >vm-lab-results/logs/simulator-boot.log 2>&1
+            boot_status=$?
+            if [ "$boot_status" -eq 0 ]; then
+              xcrun simctl bootstatus "$udid" -b >>vm-lab-results/logs/simulator-boot.log 2>&1
+              boot_status=$?
+            fi
+            if [ "$boot_status" -eq 0 ]; then
+              runtime_version=$(xcrun simctl getenv "$udid" SIMULATOR_RUNTIME_VERSION 2>/dev/null || printf unknown)
+            fi
+          else
+            printf 'Simulator was not created\n' > vm-lab-results/logs/simulator-boot.log
+          fi
+          printf 'simulator-boot=%s:%s\n' "$boot_status" vm-lab-results/logs/simulator-boot.log >> vm-lab-results/checks
+
+          cleanup_required=false
+          cleanup_verified=true
+          if [ -n "$udid" ]; then
+            cleanup_required=true
+            xcrun simctl shutdown "$udid" >vm-lab-results/logs/simulator-cleanup.log 2>&1
+            shutdown_status=$?
+            xcrun simctl delete "$udid" >>vm-lab-results/logs/simulator-cleanup.log 2>&1
+            delete_status=$?
+            if xcrun simctl list devices -j | python3 -c 'import json,sys; wanted=sys.argv[1]; rows=json.load(sys.stdin)["devices"].values(); raise SystemExit(any(d.get("udid")==wanted for group in rows for d in group))' "$udid"; then
+              absent_status=0
+            else
+              absent_status=1
+            fi
+            [ "$delete_status" -eq 0 ] && [ "$absent_status" -eq 0 ] && cleanup_verified=true || cleanup_verified=false
+            printf 'simulator-shutdown=%s:%s\n' "$shutdown_status" vm-lab-results/logs/simulator-cleanup.log >> vm-lab-results/checks
+            printf 'simulator-delete=%s:%s\n' "$delete_status" vm-lab-results/logs/simulator-cleanup.log >> vm-lab-results/checks
+            printf 'simulator-absent=%s:%s\n' "$absent_status" vm-lab-results/logs/simulator-cleanup.log >> vm-lab-results/checks
+          else
+            printf 'No simulator required cleanup\n' > vm-lab-results/logs/simulator-cleanup.log
+          fi
+
+          report_args=()
+          while IFS= read -r check; do report_args+=(--check "$check"); done < vm-lab-results/checks
+          python3 tools/vm_lab_hosted_report.py record \
+            --target ios-hosted --evidence simulator \
+            --output vm-lab-results/ios-simulator.json \
+            --artifact pblang=target/debug/pblang \
+            --metadata "runtime=$runtime_version" --metadata physical-device=false \
+            --cleanup-required "$cleanup_required" --cleanup-verified "$cleanup_verified" \
+            "${report_args[@]}"
+      - name: Upload iOS evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pblang-ios-simulator-${{ github.sha }}
+          path: |
+            vm-lab-results/ios-simulator.json
+            vm-lab-results/logs/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce iOS evidence
+        if: always()
+        run: python3 tools/vm_lab_hosted_report.py verify vm-lab-results/ios-simulator.json
+
+  android-emulator:
+    name: Android API 34 runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Run Android checks, clean up, then bind evidence
+        shell: bash
+        run: |
+          set -u
+          mkdir -p vm-lab-results/logs
+          : > vm-lab-results/checks
+          run_check() {
+            local name="$1"
+            shift
+            "$@" >"vm-lab-results/logs/${name}.log" 2>&1
+            local status=$?
+            cat "vm-lab-results/logs/${name}.log"
+            printf '%s=%s:%s\n' "$name" "$status" "vm-lab-results/logs/${name}.log" >> vm-lab-results/checks
+            return 0
+          }
+          run_check rust-install rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          run_check rust-select rustup default "$RUST_TOOLCHAIN"
+          run_check source-clean git diff --exit-code --no-ext-diff
+          run_check index-clean git diff --cached --exit-code --no-ext-diff
+          run_check cargo-build cargo build --workspace --locked
+          run_check android-model cargo run --locked -- run examples/android_dev_example/emulator_test.sapp --allow-all
+          run_check android-apk cargo run --locked -- run examples/android_dev_example/main.sapp --allow-all
+
+          yes | sdkmanager --install "platform-tools" "emulator" "platforms;android-34" "system-images;android-34;google_apis;x86_64" >vm-lab-results/logs/sdk-install.log 2>&1
+          sdk_status=${PIPESTATUS[1]}
+          cat vm-lab-results/logs/sdk-install.log
+          printf 'sdk-install=%s:%s\n' "$sdk_status" vm-lab-results/logs/sdk-install.log >> vm-lab-results/checks
+          printf 'no\n' | avdmanager create avd --force --name pblang-ci --package "system-images;android-34;google_apis;x86_64" >vm-lab-results/logs/avd-create.log 2>&1
+          avd_status=${PIPESTATUS[1]}
+          printf 'avd-create=%s:%s\n' "$avd_status" vm-lab-results/logs/avd-create.log >> vm-lab-results/checks
+
+          emulator_pid=""
+          boot_status=1
+          if [ "$avd_status" -eq 0 ]; then
+            "$ANDROID_HOME/emulator/emulator" -avd pblang-ci -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect >vm-lab-results/logs/emulator.log 2>&1 &
+            emulator_pid=$!
+            timeout 420 bash -c 'until adb shell getprop sys.boot_completed 2>/dev/null | grep -q 1; do sleep 2; done' >>vm-lab-results/logs/emulator.log 2>&1
+            boot_status=$?
+          else
+            printf 'AVD was not created\n' > vm-lab-results/logs/emulator.log
+          fi
+          printf 'emulator-boot=%s:%s\n' "$boot_status" vm-lab-results/logs/emulator.log >> vm-lab-results/checks
+
+          apk=examples/android_dev_example/release/AndroidDevExample-debug.apk
+          if [ "$boot_status" -eq 0 ]; then
+            run_check apk-install adb install -r "$apk"
+            run_check app-launch adb shell am start -W -n com.example.myapp/.MainActivity
+            adb shell uiautomator dump /sdcard/pblang.xml >vm-lab-results/logs/android-ui.log 2>&1
+            adb pull /sdcard/pblang.xml vm-lab-results/ui-before.xml >>vm-lab-results/logs/android-ui.log 2>&1
+            tap=$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path("vm-lab-results/ui-before.xml").read_text(errors="replace")
+          node = next((x for x in re.findall(r"<node\b[^>]+>", text) if 'text="Continue"' in x), "")
+          match = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', node)
+          print(f"{(int(match[1])+int(match[3]))//2} {(int(match[2])+int(match[4]))//2}" if match else "")
+          PY
+          )
+            if [ -n "$tap" ]; then adb shell input tap $tap >>vm-lab-results/logs/android-ui.log 2>&1; fi
+            sleep 1
+            adb shell uiautomator dump /sdcard/pblang-after.xml >>vm-lab-results/logs/android-ui.log 2>&1
+            adb pull /sdcard/pblang-after.xml vm-lab-results/ui-after.xml >>vm-lab-results/logs/android-ui.log 2>&1
+            grep -q 'Welcome to Android Programming!!!' vm-lab-results/ui-after.xml
+            ui_status=$?
+          else
+            printf 'Emulator did not boot\n' > vm-lab-results/logs/apk-install.log
+            printf 'Emulator did not boot\n' > vm-lab-results/logs/app-launch.log
+            printf 'apk-install=1:%s\n' vm-lab-results/logs/apk-install.log >> vm-lab-results/checks
+            printf 'app-launch=1:%s\n' vm-lab-results/logs/app-launch.log >> vm-lab-results/checks
+            printf 'Emulator did not boot\n' > vm-lab-results/logs/android-ui.log
+            ui_status=1
+          fi
+          printf 'android-ui=%s:%s\n' "$ui_status" vm-lab-results/logs/android-ui.log >> vm-lab-results/checks
+
+          cleanup_required=false
+          cleanup_verified=true
+          if [ -n "$emulator_pid" ]; then
+            cleanup_required=true
+            adb emu kill >vm-lab-results/logs/android-cleanup.log 2>&1
+            kill_status=$?
+            timeout 60 bash -c 'while kill -0 "$1" 2>/dev/null; do sleep 1; done' _ "$emulator_pid"
+            stopped_status=$?
+            if adb devices | grep -q '^emulator-'; then absent_status=1; else absent_status=0; fi
+            [ "$stopped_status" -eq 0 ] && [ "$absent_status" -eq 0 ] && cleanup_verified=true || cleanup_verified=false
+            printf 'emulator-stop=%s:%s\n' "$kill_status" vm-lab-results/logs/android-cleanup.log >> vm-lab-results/checks
+            printf 'emulator-process-absent=%s:%s\n' "$stopped_status" vm-lab-results/logs/android-cleanup.log >> vm-lab-results/checks
+            printf 'emulator-adb-absent=%s:%s\n' "$absent_status" vm-lab-results/logs/android-cleanup.log >> vm-lab-results/checks
+          else
+            printf 'No Android emulator required cleanup\n' > vm-lab-results/logs/android-cleanup.log
+          fi
+
+          report_args=()
+          while IFS= read -r check; do report_args+=(--check "$check"); done < vm-lab-results/checks
+          python3 tools/vm_lab_hosted_report.py record \
+            --target android-api34-x86_64 --evidence simulator \
+            --output vm-lab-results/android.json \
+            --artifact "apk=$apk" --artifact pblang=target/debug/pblang \
+            --metadata api=34 --metadata abi=x86_64 --metadata physical-device=false \
+            --cleanup-required "$cleanup_required" --cleanup-verified "$cleanup_verified" \
+            "${report_args[@]}"
+      - name: Upload Android evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pblang-android-api34-${{ github.sha }}
+          path: |
+            vm-lab-results/android.json
+            vm-lab-results/logs/
+            vm-lab-results/ui-before.xml
+            vm-lab-results/ui-after.xml
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce Android evidence
+        if: always()
+        run: python3 tools/vm_lab_hosted_report.py verify vm-lab-results/android.json
